@@ -304,8 +304,11 @@ pub(crate) mod fake {
         data_dir: Option<Option<(PathBuf, DataDirSource)>>,
         /// Why agent runs cannot be confined; `None`: they can.
         sandbox: Option<SandboxError>,
-        /// Keychain accounts with no secret; every other one has one.
+        /// Keychain accounts with no secret; every other one has one, but a
+        /// GitHub App account ([`Self::app_token_stored`]).
         unstored: Vec<String>,
+        /// Whether a project's GitHub App account holds an entry.
+        app_token_stored: bool,
         /// Why the keychain cannot be read; `None`: it can.
         keychain_error: Option<String>,
         /// What Linear answers for a team's workflow states, the key being
@@ -384,6 +387,14 @@ pub(crate) mod fake {
         #[cfg(unix)]
         pub(crate) fn sentinel_probe_is(mut self, probe: SentinelProbe) -> Self {
             self.sentinel_probe = Some(probe);
+            self
+        }
+
+        /// A project's GitHub App account holds an entry (OWL-382): without
+        /// this, none does, whatever [`Self::unstored`] says, so the faked
+        /// projects use a personal token as before OWL-336.
+        pub(crate) fn app_token_stored(mut self) -> Self {
+            self.app_token_stored = true;
             self
         }
 
@@ -581,7 +592,11 @@ pub(crate) mod fake {
         fn secret_stored(&self, account: &str) -> Result<bool, String> {
             match &self.keychain_error {
                 Some(reason) => Err(reason.clone()),
-                None => Ok(!self.unstored.iter().any(|unstored| unstored == account)),
+                None => {
+                    let app = format!("/{}", crate::forge::GITHUB_APP_ACCOUNT);
+                    Ok(!self.unstored.iter().any(|unstored| unstored == account)
+                        && (self.app_token_stored || !account.ends_with(&app)))
+                }
             }
         }
 

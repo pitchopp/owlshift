@@ -944,6 +944,16 @@ pub struct PersonalConfig {
     /// Whether to keep the machine awake while runs are in flight.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub keep_awake: Option<bool>,
+    /// The client ID of the GitHub App `owlshift init` signs in through, in
+    /// place of Owlshift's own (architecture D13), for a fork or a private
+    /// app: letters, digits, `.`, `_` and `-`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub github_app_client_id: Option<String>,
+    /// That app's slug, which makes the install link
+    /// `https://github.com/apps/<slug>/installations/new`: lowercase letters,
+    /// digits and inner `-`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub github_app_slug: Option<String>,
     /// How this machine tells its operator that they have become the
     /// blocker.
     #[serde(default)]
@@ -1008,6 +1018,29 @@ fn check_repository_key(key: &str) -> Result<(), String> {
             "a repository is written {GITHUB}/<owner>/<name>, as its `origin` remote names it"
         )),
     }
+}
+
+/// The most characters of a GitHub App's client ID or slug in the personal
+/// file.
+const MAX_GITHUB_APP_ID: usize = 100;
+
+/// A GitHub App's client ID, such as `Iv23li5EhBqiuljIPbiK` or the older
+/// `Iv1.0123abcd`.
+fn is_github_app_client_id(id: &str) -> bool {
+    (1..=MAX_GITHUB_APP_ID).contains(&id.len())
+        && id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+}
+
+/// A GitHub App's slug, such as `owl-shift`.
+fn is_github_app_slug(slug: &str) -> bool {
+    (1..=MAX_GITHUB_APP_ID).contains(&slug.len())
+        && !slug.starts_with('-')
+        && !slug.ends_with('-')
+        && slug
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
 }
 
 /// How this machine tells its operator that they have become the blocker: a
@@ -1136,6 +1169,26 @@ impl PersonalConfig {
         })?;
         check_home_folders(&names(&self.allow_caches))
             .map_err(|error| ContractError::invalid(PERSONAL, format!("allow_caches: {error}")))?;
+        if let Some(id) = &self.github_app_client_id
+            && !is_github_app_client_id(id)
+        {
+            return Err(ContractError::invalid(
+                PERSONAL,
+                "github_app_client_id: a GitHub App's client ID holds only letters, digits, \
+                 `.`, `_` and `-`",
+            ));
+        }
+        // The slug goes into the install link: its characters keep the link
+        // on the app's page.
+        if let Some(slug) = &self.github_app_slug
+            && !is_github_app_slug(slug)
+        {
+            return Err(ContractError::invalid(
+                PERSONAL,
+                "github_app_slug: a GitHub App's slug holds only lowercase letters, digits and \
+                 `-`, neither first nor last",
+            ));
+        }
         for (key, settings) in &self.repositories {
             let quoted = toml::Value::String(key.clone());
             check_repository_key(key).map_err(|error| {
@@ -2023,6 +2076,43 @@ mod tests {
             let actual = PersonalConfig::parse(input).unwrap_err().to_string();
             assert!(
                 actual.starts_with(&format!("invalid personal configuration: {error}")),
+                "{input}: {actual}"
+            );
+        }
+    }
+
+    /// OWL-382: the GitHub App's overrides (D13), checked before the slug
+    /// reaches a link.
+    #[test]
+    fn the_github_app_overrides_are_read_and_checked() {
+        let personal = PersonalConfig::parse(
+            "github_app_client_id = \"Iv1.0123abcd\"\ngithub_app_slug = \"my-owlshift2\"\n",
+        )
+        .unwrap();
+        assert_eq!(
+            (
+                personal.github_app_client_id.as_deref(),
+                personal.github_app_slug.as_deref()
+            ),
+            (Some("Iv1.0123abcd"), Some("my-owlshift2"))
+        );
+        let none = PersonalConfig::parse("").unwrap();
+        assert_eq!(
+            (none.github_app_client_id, none.github_app_slug),
+            (None, None)
+        );
+
+        for (input, key) in [
+            ("github_app_client_id = \"\"", "github_app_client_id"),
+            ("github_app_client_id = \"Iv1 x\"", "github_app_client_id"),
+            ("github_app_slug = \"\"", "github_app_slug"),
+            ("github_app_slug = \"My-App\"", "github_app_slug"),
+            ("github_app_slug = \"-app\"", "github_app_slug"),
+            ("github_app_slug = \"app/../x\"", "github_app_slug"),
+        ] {
+            let actual = PersonalConfig::parse(input).unwrap_err().to_string();
+            assert!(
+                actual.starts_with(&format!("invalid personal configuration: {key}:")),
                 "{input}: {actual}"
             );
         }

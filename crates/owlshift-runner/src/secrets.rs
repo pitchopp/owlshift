@@ -13,7 +13,11 @@
 //! from one place, since an app belongs to one workspace: the project's
 //! accounts when any of the three is stored there, otherwise the shared ones
 //! when any of those is, otherwise the project's, which then hold nothing.
-//! The GitHub token is resolved the same way, on its own. Each account is
+//! The GitHub credential is resolved on its own, in the order of "Which
+//! credential a command uses" (build plan, "`init`", OWL-336): the
+//! project's GitHub App token ([`GITHUB_APP_ACCOUNT`]), else the project's
+//! personal token, else the shared personal token. `init` writes project
+//! accounts only, so no shared app account is read. Each account is
 //! looked up once, by a function the caller gives: a read for a command, so
 //! the macOS Keychain asks once per entry, or a presence check for
 //! `owlshift doctor`.
@@ -21,7 +25,7 @@
 use owlshift_adapters::forge::Repo;
 use owlshift_platform::keychain::SERVICE;
 
-use crate::forge::GITHUB_ACCOUNT;
+use crate::forge::{GITHUB_ACCOUNT, GITHUB_APP_ACCOUNT};
 use crate::tracker::{LINEAR_ACCOUNT, LINEAR_APP_ID_ACCOUNT, LINEAR_APP_SECRET_ACCOUNT};
 
 /// Where a set of secrets is read from.
@@ -72,28 +76,58 @@ impl TrackerAccounts {
     }
 }
 
-/// The keychain account of the GitHub token.
+/// Which kind of GitHub credential an account holds (OWL-336).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ForgeKind {
+    /// The user token of Owlshift's GitHub App, with its refresh token and
+    /// expiries, as one entry
+    /// (`owlshift_adapters::forge::github_app::UserToken::to_entry`).
+    App,
+    /// A personal token, the expert option.
+    Personal,
+}
+
+/// The keychain account of a GitHub credential.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ForgeAccount {
+    /// The account's name under [`SERVICE`].
     pub token: String,
+    pub kind: ForgeKind,
     pub source: Source,
 }
 
 impl ForgeAccount {
-    /// The project's own account.
-    pub fn project(repo: &Repo) -> Self {
+    /// The project's own GitHub App account.
+    pub fn project_app(repo: &Repo) -> Self {
         Self {
-            token: project_account(repo, GITHUB_ACCOUNT),
+            token: project_account(repo, GITHUB_APP_ACCOUNT),
+            kind: ForgeKind::App,
             source: Source::Project,
         }
     }
 
-    /// The account every project of this machine shares.
+    /// The project's own personal-token account.
+    pub fn project(repo: &Repo) -> Self {
+        Self {
+            token: project_account(repo, GITHUB_ACCOUNT),
+            kind: ForgeKind::Personal,
+            source: Source::Project,
+        }
+    }
+
+    /// The personal-token account every project of this machine shares.
     pub fn shared() -> Self {
         Self {
             token: GITHUB_ACCOUNT.to_owned(),
+            kind: ForgeKind::Personal,
             source: Source::Shared,
         }
+    }
+
+    /// Every account the GitHub credential of the project of `repo` is read
+    /// from, in order.
+    pub fn in_order(repo: &Repo) -> [Self; 3] {
+        [Self::project_app(repo), Self::project(repo), Self::shared()]
     }
 }
 
@@ -107,11 +141,19 @@ pub struct TrackerSecrets<T> {
     pub app_secret: Option<T>,
 }
 
-/// The GitHub token, as found.
+/// The GitHub credential, as found. With nothing stored, `account` is the
+/// project's personal-token account, where a token can be stored by hand.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ForgeSecret<T> {
     pub account: ForgeAccount,
     pub token: Option<T>,
+}
+
+impl<T> ForgeSecret<T> {
+    /// Which kind of credential was found; `None` when none was.
+    pub fn kind(&self) -> Option<ForgeKind> {
+        self.token.as_ref().map(|_| self.account.kind)
+    }
 }
 
 /// Looks one account up: `None` when nothing is stored there. The error
@@ -139,9 +181,10 @@ pub fn tracker<T>(repo: &Repo, look: &mut Lookup<'_, T>) -> Result<TrackerSecret
     })
 }
 
-/// The GitHub token of the project of `repo`, by the rule of this module.
+/// The GitHub credential of the project of `repo`, by the rule of this
+/// module.
 pub fn forge<T>(repo: &Repo, look: &mut Lookup<'_, T>) -> Result<ForgeSecret<T>, String> {
-    for account in [ForgeAccount::project(repo), ForgeAccount::shared()] {
+    for account in ForgeAccount::in_order(repo) {
         if let Some(token) = look(&account.token)? {
             return Ok(ForgeSecret {
                 account,
@@ -237,8 +280,58 @@ mod tests {
         assert_eq!(tracker.accounts, own);
         assert_eq!((tracker.key, tracker.app_id), (Some(()), None));
         assert_eq!(forge.account.source, Source::Project);
+        assert_eq!(forge.kind(), Some(ForgeKind::Personal));
         // No shared account is even looked up.
-        assert_eq!(asked, [own.key, own.app_id, own.app_secret, token]);
+        let app = ForgeAccount::project_app(&repo()).token;
+        assert_eq!(asked, [own.key, own.app_id, own.app_secret, app, token]);
+    }
+
+    /// OWL-336: the project's app token, else its personal token, else the
+    /// shared one, each account looked up once and none past the one found.
+    #[test]
+    fn the_github_credential_is_the_apps_then_the_projects_then_the_shared_one() {
+        let app = ForgeAccount::project_app(&repo());
+        let own = ForgeAccount::project(&repo());
+        assert_eq!(app.token, "github.com/pitchopp/owlshift/github-app");
+        let found = |stored: &[&str]| {
+            let mut asked = Vec::new();
+            let mut look = |account: &str| {
+                asked.push(account.to_owned());
+                Ok(stored.contains(&account).then_some(()))
+            };
+            let found = forge(&repo(), &mut look).unwrap();
+            let kind = found.kind();
+            (found.account, kind, asked)
+        };
+
+        let every = [app.token.as_str(), own.token.as_str(), GITHUB_ACCOUNT];
+        assert_eq!(
+            found(&every),
+            (app.clone(), Some(ForgeKind::App), vec![app.token.clone()])
+        );
+        assert_eq!(
+            found(&[&own.token, GITHUB_ACCOUNT]),
+            (
+                own.clone(),
+                Some(ForgeKind::Personal),
+                vec![app.token.clone(), own.token.clone()]
+            )
+        );
+        assert_eq!(
+            found(&[GITHUB_ACCOUNT]),
+            (
+                ForgeAccount::shared(),
+                Some(ForgeKind::Personal),
+                vec![
+                    app.token.clone(),
+                    own.token.clone(),
+                    GITHUB_ACCOUNT.to_owned()
+                ]
+            )
+        );
+        // Nothing stored: the project's personal account is named, no kind.
+        assert_eq!(found(&[]).0, own);
+        assert_eq!(found(&[]).1, None);
     }
 
     #[test]

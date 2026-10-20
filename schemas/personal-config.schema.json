@@ -27,6 +27,20 @@
       "format": "uint32",
       "minimum": 1
     },
+    "github_app_client_id": {
+      "description": "The client ID of the GitHub App `owlshift init` signs in through, in\nplace of Owlshift's own (architecture D13), for a fork or a private\napp: letters, digits, `.`, `_` and `-`.",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "github_app_slug": {
+      "description": "That app's slug, which makes the install link\n`https://github.com/apps/<slug>/installations/new`: lowercase letters,\ndigits and inner `-`.",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
     "harnesses": {
       "description": "The installed harnesses.",
       "$ref": "#/$defs/Harnesses",
