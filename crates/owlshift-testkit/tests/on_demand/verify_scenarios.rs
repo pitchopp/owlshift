@@ -248,6 +248,29 @@ fn a_codex_not_ready_at_the_start_drops_its_seat_and_says_why() {
     assert!(report.contains(&format!("- Pass 1: {reason}")), "{report}");
 }
 
+/// OWL-348: a Codex seat whose harness cannot start drops the seat, with
+/// the runner's reason, and the ticket is delivered: no stop.
+#[test]
+fn a_codex_reviewer_that_cannot_start_drops_its_seat_and_never_stops() {
+    let bench = Bench::verifying();
+    *bench.codex.borrow_mut() = Some(Ok(()));
+    bench.codex_unstartable.set(true);
+    let replies = vec![
+        bench.reply(Some("Hello"), Some(DONE)),
+        bench.reviewing(&found(&[])),
+    ];
+    let (outcome, printed) = bench.run(replies, None);
+    outcome.unwrap_or_else(|stop| panic!("{stop}\n{printed}"));
+    let reason = "Codex's run could not start.";
+    let review = bench.record().review.unwrap();
+    assert_eq!(review.passes[0].reviewers.len(), 1);
+    assert_eq!(review.passes[0].dropped.as_ref().unwrap().reason, reason);
+    let report = bench.comments().pop().unwrap();
+    assert!(report.starts_with("[owlshift] DELIVERY"), "{report}");
+    assert!(report.contains(&format!("- Pass 1: {reason}")), "{report}");
+    assert!(!report.contains("login file"), "{report}");
+}
+
 /// OWL-321: `[roles.verify]` is accepted, and its file reaches the brief of
 /// the Verify reviewer after `stack.rules`, and no other role's.
 #[test]

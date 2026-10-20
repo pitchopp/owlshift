@@ -113,8 +113,8 @@ use crate::agent_env::AgentEnv;
 use crate::answer_check::{self, Readiness};
 use crate::events::{Data, EventSink, data};
 use crate::executor::{
-    DEFAULT_GATE_TIMEOUT, Executor, Failure, Git, Harness, Outcome, RESULT_PATH, RUN_DIR,
-    RunReport, RunSpec,
+    DEFAULT_GATE_TIMEOUT, Executor, ExecutorError, Failure, Git, Harness, Outcome, RESULT_PATH,
+    RUN_DIR, RunReport, RunSpec,
 };
 use crate::fix;
 use crate::follow::{self, Following, Look, Seen};
@@ -3909,6 +3909,24 @@ impl OnDemand<'_> {
         attempt: u32,
         sink: &mut EventSink<'_>,
     ) -> Result<Ran, Stop> {
+        self.execute_or_unstarted(p, executor, (harness, setup), brief, attempt, sink)?
+            .map_err(|error| refused("the run could not start", error))
+    }
+
+    /// [`Self::execute`], with a run the executor could not start given
+    /// back with why, its `run_ended` event emitted, rather than refused:
+    /// the opt-in Codex reviewer drops its seat when its own harness cannot
+    /// start (OWL-348). The runner's own faults, the run directory and the
+    /// project's marker, still stop the command.
+    fn execute_or_unstarted(
+        &self,
+        p: &mut Prepared,
+        executor: &Executor,
+        (harness, setup): (&dyn Harness, &[String]),
+        brief: &Brief,
+        attempt: u32,
+        sink: &mut EventSink<'_>,
+    ) -> Result<Result<Ran, ExecutorError>, Stop> {
         let ticket = &p.ticket.clone();
         let (run, run_dir) =
             new_run_dir(&self.dirs.runs(ticket)).map_err(|e| refused("the run directory", e))?;
@@ -3980,7 +3998,7 @@ impl OnDemand<'_> {
                         ("reason", json!(error.to_string())),
                     ]),
                 );
-                return Err(refused("the run could not start", error));
+                return Ok(Err(error));
             }
         };
         // The executor's isolation check starts with the worktree's `.git`
@@ -4033,11 +4051,11 @@ impl OnDemand<'_> {
             );
             sink.emit(ticket, Some(&run), EventKind::Usage, usage);
         }
-        Ok(Ran {
+        Ok(Ok(Ran {
             run,
             report,
             breaches,
-        })
+        }))
     }
 
     /// Moves the ticket's visible stage through the Writer: a `tracker_write`

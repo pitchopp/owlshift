@@ -1239,11 +1239,15 @@ impl OnDemand<'_> {
 
     /// One run of the opt-in Codex reviewer (OWL-348): its result, or why
     /// the pass goes on without it. It is never run again and counts toward
-    /// no failed-run bound: a usage limit, a failure, a refused result, a
-    /// `blocked` result or questions drop the seat for this pass, and a
-    /// usage limit for the command's later passes too. Two guardrails stay
-    /// any run's: the ticket's budget is checked first, and a run that broke
-    /// isolation is a failed review run, which the core parks.
+    /// no failed-run bound: a harness that cannot build its command or
+    /// spawn, a usage limit, a failure, a refused result, a `blocked` result
+    /// or questions drop the seat for this pass, and a usage limit for the
+    /// command's later passes too. Two guardrails stay any run's: the
+    /// ticket's budget is checked first, and a run that broke isolation is a
+    /// failed review run, which the core parks. What every run shares stops
+    /// the command as for any run: a credential within the agent's reach,
+    /// the worktree, the run's files, the run directory, the project's
+    /// marker.
     fn codex_review_run(
         &self,
         p: &mut Prepared,
@@ -1252,15 +1256,20 @@ impl OnDemand<'_> {
         brief: &Brief,
         sink: &mut EventSink<'_>,
     ) -> Result<Result<(Ran, RunResult), String>, Stop> {
-        let (ran, event) = self.run_role_once(
-            p,
-            (harness, &[]),
-            state,
-            brief,
-            1,
-            &mut Gathered::default(),
-            sink,
-        )?;
+        self.within_budget(p, state, sink)?;
+        let ran =
+            match self.execute_or_unstarted(p, self.executor, (harness, &[]), brief, 1, sink)? {
+                Ok(ran) => ran,
+                Err(ExecutorError::Command(_) | ExecutorError::Spawn(_)) => {
+                    return Ok(Err("Codex's run could not start.".to_owned()));
+                }
+                Err(error) => return Err(refused("the run could not start", error)),
+            };
+        let event = if ran.breaches.is_empty() {
+            stage_event(&ran.report.outcome, brief).0
+        } else {
+            Event::Quarantined
+        };
         if let (Event::Completed, Some(result)) = (event, ran.result()) {
             let result = result.clone();
             return Ok(Ok((ran, result)));

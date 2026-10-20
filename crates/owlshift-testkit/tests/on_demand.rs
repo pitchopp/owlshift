@@ -339,6 +339,31 @@ impl Router for Replies {
 /// [`Replies`] given as a routed harness.
 struct Routed<'a>(&'a Replies, RunRouting);
 
+/// A Codex seat whose harness cannot build its command, as when its login
+/// file cannot be copied into the run's home (OWL-348).
+struct Unstartable;
+
+impl Router for Unstartable {
+    fn harness(&self, _routing: RunRouting) -> Box<dyn Harness + '_> {
+        Box::new(Unstartable)
+    }
+}
+
+impl Harness for Unstartable {
+    fn command(&self, _run: &HarnessRun<'_>) -> Result<Command, HarnessError> {
+        Err("the login file could not be copied".into())
+    }
+
+    fn drive(
+        &self,
+        _run: &HarnessRun<'_>,
+        _child: &mut Child,
+        _log: &mut RunLog,
+    ) -> io::Result<HarnessEnd> {
+        unreachable!("an unstartable harness is never spawned")
+    }
+}
+
 impl Harness for Routed<'_> {
     fn command(&self, run: &HarnessRun<'_>) -> Result<Command, HarnessError> {
         self.0.routed.borrow_mut().push(self.1);
@@ -796,6 +821,8 @@ struct Bench {
     /// not ask for it; else what its readiness check answers, a seat that
     /// plays from the bench's reply queue when ready.
     codex: RefCell<Option<Result<(), String>>>,
+    /// The Codex seat's harness cannot start ([`Unstartable`], OWL-348).
+    codex_unstartable: Cell<bool>,
     /// Each line the runner's notifier showed (OWL-368).
     notified: Notified,
 }
@@ -937,6 +964,7 @@ impl Bench {
             routed: Rc::default(),
             verify_plays: Cell::new(false),
             codex: RefCell::new(None),
+            codex_unstartable: Cell::new(false),
             notified: Notified::default(),
         }
     }
@@ -1336,9 +1364,14 @@ impl Bench {
             &clean
         };
         let codex_ready = || self.codex.borrow().clone().unwrap_or(Ok(()));
+        let codex_router: &dyn Router = if self.codex_unstartable.get() {
+            &Unstartable
+        } else {
+            &harness
+        };
         let codex = self.codex.borrow().is_some().then_some(CodexReviewer {
-            design_review: &harness,
-            verify: &harness,
+            design_review: codex_router,
+            verify: codex_router,
             ready: &codex_ready,
         });
         // The executor's credential probes run the real gh on `github.com`.
