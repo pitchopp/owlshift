@@ -81,11 +81,6 @@ use crate::writer::{
 /// alone under `always` (OWL-342).
 pub(crate) const APPROVAL_CATEGORY: &str = "plan_approval";
 
-/// The category of a residue question: a finding two review passes left,
-/// asked before OWL-377, whose decisions a ticket ref may still keep
-/// (OWL-345, [`crate::reversal`]).
-pub(crate) const FINDING_CATEGORY: &str = "review_finding";
-
 /// The first option of the approval question.
 const APPROVE: &str = "Approve the plan as it is";
 
@@ -105,7 +100,7 @@ pub(super) enum Reopened {
     /// A reply was followed at the stage the ticket is at: it runs, given
     /// the reply.
     Stayed,
-    /// The ticket returned to its author stage, in this state.
+    /// The ticket returned to Design, in this state.
     Moved(TicketState),
 }
 
@@ -959,9 +954,9 @@ impl OnDemand<'_> {
         sink: &mut EventSink<'_>,
     ) -> Result<Delivered, Stop> {
         loop {
-            // The decider's replies to the resolver's approval and residue
-            // decisions come first (OWL-345): the ticket returns to its
-            // author stage, or runs on with the reply as `reversed`.
+            // The decider's replies to the resolver's approval come first
+            // (OWL-345): the ticket returns to Design, or runs on with the
+            // reply as `reversed`.
             if let Reopened::Moved(next) = self.reopened(p, state, sink)? {
                 state = next;
             }
@@ -1044,14 +1039,12 @@ impl OnDemand<'_> {
         Ok(Built::Replan(next))
     }
 
-    /// Applies the decider's replies to the resolver's plan approval and
-    /// residue decisions before a stage runs (OWL-345; architecture section
-    /// 5, "A reversed decision"): a reply to the decision kept as the plan's
-    /// approval drops the approval and returns the ticket to Design, one to
-    /// a Design review residue decision returns it to Design, one to a
-    /// Verify residue decision to Build. The reversals are marked followed
-    /// in the same write as the move, so the run that follows is given each
-    /// as `reversed`, with the decider's reply in its thread.
+    /// Applies the decider's replies to the resolver's plan approval before
+    /// a stage runs (OWL-345; architecture section 5, "A reversed
+    /// decision"): a reply to the decision kept as the plan's approval drops
+    /// the approval and returns the ticket to Design. The reversal is marked
+    /// followed in the same write as the move, so the run that follows is
+    /// given it as `reversed`, with the decider's reply in its thread.
     ///
     /// Nothing for a ticket in a review loop: it is delivered, with its pull
     /// request open, and the core has no way back from Design to Watch, so
@@ -1075,7 +1068,7 @@ impl OnDemand<'_> {
             || !questions
                 .decisions
                 .iter()
-                .any(|kept| reversal::reopens(kept, p.plan.as_ref()).is_some())
+                .any(|kept| reversal::reopens(kept, p.plan.as_ref()))
         {
             return Ok(Reopened::Nothing);
         }
@@ -1087,18 +1080,17 @@ impl OnDemand<'_> {
             questions
                 .decisions
                 .get(r.decision)
-                .is_some_and(|kept| reversal::reopens(kept, p.plan.as_ref()).is_some())
+                .is_some_and(|kept| reversal::reopens(kept, p.plan.as_ref()))
         });
-        let Some(reopening) = reversal::reopening(stage, &reversed, &questions, p.plan.as_ref())
-        else {
+        if reversed.is_empty() {
             return Ok(Reopened::Nothing);
-        };
-        reversed.retain(|r| reopening.served.contains(&r.decision));
+        }
         let window = self.config.policy.quiet_window();
         if reversal::counts_at(&reversed, (self.clock)(), window).is_some() {
             return Ok(Reopened::Nothing);
         }
-        let next = match reopening.event {
+        let event = reversal::return_event(stage);
+        let next = match event {
             None => state,
             // A pipeline without the destination does not return.
             Some(event) => match state.apply(p.pipeline, event) {
@@ -1114,9 +1106,7 @@ impl OnDemand<'_> {
             review.last_fix = None;
         }
         let kept_plan = p.plan.clone();
-        if reopening.drops_approval
-            && let Some(plan) = p.plan.as_mut()
-        {
+        if let Some(plan) = p.plan.as_mut() {
             plan.approval = None;
         }
         if let Err(e) = self.store(p, &next, questions.clone()) {
@@ -1135,8 +1125,8 @@ impl OnDemand<'_> {
             data([
                 ("reversed", json!("reopened")),
                 ("from", json!(stage)),
-                ("to", json!(reopening.to)),
-                ("approval_dropped", json!(reopening.drops_approval)),
+                ("to", json!(Stage::Design)),
+                ("approval_dropped", json!(true)),
                 ("questions", question_ids(&ids)),
                 (
                     "replies",
@@ -1149,7 +1139,7 @@ impl OnDemand<'_> {
                 ),
             ]),
         );
-        Ok(if reopening.event.is_some() {
+        Ok(if event.is_some() {
             Reopened::Moved(next)
         } else {
             Reopened::Stayed
@@ -3076,7 +3066,7 @@ Reply `Q1: A`, `ok` to take every recommendation, or in your own words.
         use crate::resolver::Fallback;
         let question = || Question {
             id: QuestionId::nth(1),
-            category: FINDING_CATEGORY.to_owned(),
+            category: APPROVAL_CATEGORY.to_owned(),
             context: String::new(),
             text: String::new(),
             options: vec![QuestionOption::new("x")],

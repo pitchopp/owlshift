@@ -160,7 +160,7 @@ use design::Built;
 use review_loop::{in_review_loop, loop_base, loop_reviews};
 use verify::Verified;
 
-pub(crate) use design::{APPROVAL_CATEGORY, FINDING_CATEGORY};
+pub(crate) use design::APPROVAL_CATEGORY;
 pub(crate) use drain::delivery_followed;
 pub use drain::{DispatchSeen, Taken, still_ready};
 pub use intake::admission;
@@ -2432,15 +2432,16 @@ impl OnDemand<'_> {
                         &questions,
                         reversal::Current::Known(&current),
                     );
-                    // Before delivery, a reply that returns the ticket to an
-                    // earlier stage (OWL-345) is followed by the return, not
-                    // here: one the check left settling stays unfollowed
-                    // rather than be marked followed unserved.
+                    // Before delivery, a reply that returns the ticket to
+                    // Design (OWL-345) is followed by the return, not here:
+                    // one the check left settling stays unfollowed rather
+                    // than be marked followed unserved.
                     if !in_review_loop(p) {
                         reversed.retain(|r| {
-                            questions.decisions.get(r.decision).is_none_or(|kept| {
-                                reversal::reopens(kept, p.plan.as_ref()).is_none()
-                            })
+                            questions
+                                .decisions
+                                .get(r.decision)
+                                .is_none_or(|kept| !reversal::reopens(kept, p.plan.as_ref()))
                         });
                     }
                     reversal::followed(&mut questions, &reversed);
