@@ -514,7 +514,17 @@ mod tests {
 
     impl Bench {
         fn new() -> Self {
-            let tmp = tempfile::tempdir().unwrap();
+            Self::with_root(tempfile::tempdir().unwrap())
+        }
+
+        /// A bench whose data directory lies under `/tmp`, as one that
+        /// `OWLSHIFT_DATA_DIR` puts there, whatever the system temp folder.
+        #[cfg(unix)]
+        fn under_tmp() -> Self {
+            Self::with_root(tempfile::tempdir_in("/tmp").unwrap())
+        }
+
+        fn with_root(tmp: tempfile::TempDir) -> Self {
             // Resolved on Unix, where macOS's temporary folder is a link; not
             // on Windows, where it would take the `\\?\` form git cannot read
             // a configuration file through.
@@ -876,6 +886,21 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn the_gate_is_confined_as_a_builds() {
+        confined_as_a_builds(Bench::new);
+    }
+
+    /// The same with the data directory, and so the worktree and the gate
+    /// log, under `/tmp`, as `OWLSHIFT_DATA_DIR` may put them: inside the
+    /// private `/tmp` bwrap mounts, into which the run's folders are bound
+    /// back (OWL-330).
+    #[cfg(unix)]
+    #[test]
+    fn the_gate_is_confined_as_a_builds_with_its_data_under_tmp() {
+        confined_as_a_builds(Bench::under_tmp);
+    }
+
+    #[cfg(unix)]
+    fn confined_as_a_builds(bench: fn() -> Bench) {
         if let Err(error) = owlshift_platform::sandbox::available() {
             assert!(
                 std::env::var_os("OWLSHIFT_REQUIRE_CONFINEMENT").is_none(),
@@ -884,7 +909,7 @@ mod tests {
             eprintln!("skipped: agent runs cannot be confined here: {error}");
             return;
         }
-        let bench = Bench::new();
+        let bench = bench();
         bench.push("main", None);
         std::fs::write(bench.root.join("home/secret.txt"), "FAKE_owl329\n").unwrap();
         let log = run_dir(&bench.dirs).join(GATE_LOG);
