@@ -5206,6 +5206,51 @@ fn scenario_a_build_whose_session_is_missing_starts_fresh() {
     assert_eq!(bench.record().cost.unwrap().spent_micros, 1_400_000);
 }
 
+/// OWL-394: the session the resolver settled is kept settled in the ticket
+/// ref before the next Build starts, so a Build that cannot start, its run
+/// directory refused, leaves it for the next command, which resumes it.
+#[cfg(unix)]
+#[test]
+fn a_session_the_resolver_settled_outlives_a_build_that_cannot_start() {
+    use std::os::unix::fs::PermissionsExt;
+    let bench = Bench::new(true);
+    bench.sessions.set(true);
+    let runs = bench.dirs().runs(&ticket());
+    let shut = runs.clone();
+    let refuse: During = (
+        2,
+        Box::new(move || {
+            fs::set_permissions(&shut, fs::Permissions::from_mode(0o500)).unwrap();
+        }),
+    );
+    let (stopped, printed) = bench.invoke(
+        false,
+        vec![
+            costing(bench.reply(None, Some(NAMING)), 1_000_000),
+            bench.reply(None, Some(DECIDED_Q1)),
+        ],
+        None,
+        vec![refuse],
+    );
+    fs::set_permissions(&runs, fs::Permissions::from_mode(0o755)).unwrap();
+    assert!(
+        matches!(&stopped, Err(Stop::Refused(why)) if why.contains("run directory")),
+        "{stopped:?}\n{printed}"
+    );
+    let kept = bench.record().session.expect("the settled session is kept");
+    assert!(kept.settled, "{kept:?}");
+
+    let (delivered, printed) = bench.continue_ticket(vec![costing(
+        bench.reply(Some("Hello"), Some(DONE)),
+        200_000,
+    )]);
+    delivered.unwrap_or_else(|stop| panic!("{stop}\n{printed}"));
+    let runs = build_runs(&bench);
+    assert_eq!(runs.len(), 2, "{runs:?}");
+    assert_eq!(runs[1].0.data["resumes"], json!(runs[0].0.run));
+    assert_eq!(runs[1].1.data["resumed"], json!(true));
+}
+
 /// OWL-394: a Build whose round the decider answers resumes its session when
 /// `continue` runs it, the answer check between them, and counts at its own
 /// cost.

@@ -1367,6 +1367,9 @@ impl OnDemand<'_> {
                 match self.resolve(p, &state, &asking, &dispatched.rules, &current, sink)? {
                     Routing::Settled(_) => {
                         settle_session(p, &ran.run);
+                        // Kept now: a next run that cannot start leaves it
+                        // settled for the next command (OWL-394).
+                        self.keep(p, &state)?;
                         continue;
                     }
                     Routing::Ask(round) => {

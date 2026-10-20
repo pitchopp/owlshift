@@ -2331,9 +2331,14 @@ impl OnDemand<'_> {
                 match self.resolve(p, &state, &asking, &dispatched.rules, &current, sink)? {
                     Routing::Settled(_) => {
                         settle_session(p, &ran.run);
+                        // A `replan` keeps it with the move to Design, where
+                        // no Build resumes it.
                         if replan {
                             return self.replanned(p, state, &ran.run, sink);
                         }
+                        // Kept now: a next run that cannot start leaves it
+                        // settled for the next command (OWL-394).
+                        self.keep(p, &state)?;
                         continue;
                     }
                     Routing::Ask(asked) => round = Some(asked),
@@ -7176,7 +7181,7 @@ fn drop_last_fix(p: &mut Prepared) -> bool {
 
 /// Every question of run `run` is decided (OWL-394): the session it left,
 /// when it is the one kept, may be resumed by the next run of its role. The
-/// next write of the ref keeps it so.
+/// caller keeps it so in the ref before that run starts.
 fn settle_session(p: &mut Prepared, run: &str) {
     if let Some(session) = p.session.as_mut().filter(|session| session.run == run) {
         session.settled = true;
