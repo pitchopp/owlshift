@@ -31,7 +31,7 @@ use crate::ids::{TicketId, check_name, is_commit_id};
 use crate::result::{
     self, DECISIONS_ADVICE, Decision, Followup, Question, RefusedChoice, Verdict, check_verdicts,
 };
-use crate::{BasisKind, Role, Stage};
+use crate::{BasisKind, Stage};
 
 /// The namespace of every Owlshift ref.
 pub const REF_NAMESPACE: &str = "refs/owlshift/";
@@ -679,11 +679,6 @@ pub struct KeptDecision {
     /// kept before.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub basis_kind: Option<BasisKind>,
-    /// The role whose run asked the question (format 14, OWL-345), so a
-    /// reversed residue decision returns to the author stage of the review
-    /// that asked it; absent from a decision kept before.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub asked_by: Option<Role>,
     /// Its number in its DECISION comment, `Dn` (format 15, OWL-351), which
     /// holds the decisions of one resolver run: a reply naming it reverses
     /// it alone. Absent from a decision kept before, alone in its comment,
@@ -846,12 +841,13 @@ impl TicketQuestions {
     /// (OWL-343), and a format-13 one, written before it kept its asking
     /// role (OWL-345), and a format-14 one, written before it kept its
     /// number and the decisions document (OWL-351), are read as the
-    /// current format with what they lack empty,
-    /// a format-6 or 7
+    /// current format with what they lack empty, a format-6 or 7
     /// Build refusal upgraded (`LegacyBuildRefusal::upgrade`), a format-8
     /// one's lists kept as text, and every question's options and
     /// recommendation upgraded (`upgrade_question`), and the next write
-    /// gives them the current format.
+    /// gives them the current format. A document of format 14 to 16, which
+    /// kept each decision's asking role as `asked_by` (OWL-345), is read
+    /// without it, as format 17 dropped it (OWL-379).
     pub fn parse(input: &str) -> Result<Self, ContractError> {
         let questions: Self = match Self::from_older_format(input) {
             Some(read) => read?,
@@ -861,7 +857,7 @@ impl TicketQuestions {
         Ok(questions)
     }
 
-    /// A format-2 to 15 document read as the current format, or `None` for
+    /// A format-2 to 16 document read as the current format, or `None` for
     /// any other. Each older format up to 7 is a strict subset of the next,
     /// so a field a later format added is refused in it, whatever its
     /// value; format 8 reshaped Build's refusal, which formats 6 and 7 keep
@@ -871,11 +867,12 @@ impl TicketQuestions {
     /// format keeps as strings, format 13 adds a decision's basis kind and
     /// format 14 its asking role, format 15 its number and the decisions
     /// document, format 16 the runner's `recommendation` basis kind
-    /// (OWL-375).
+    /// (OWL-375); format 17 drops the asking role, which formats 14 to 16
+    /// are read without (OWL-379).
     fn from_older_format(input: &str) -> Option<Result<Self, ContractError>> {
         let mut document: serde_json::Value = serde_json::from_str(input).ok()?;
         let format = document.get("format").and_then(serde_json::Value::as_u64)?;
-        if !(2..=15).contains(&format) {
+        if !(2..=16).contains(&format) {
             return None;
         }
         let kinded = format <= 12
@@ -891,11 +888,12 @@ impl TicketQuestions {
         };
         let asker = format <= 13 && in_a_decision("asked_by");
         let numbered = format <= 14 && in_a_decision("number");
-        let recommended = document["decisions"].as_array().is_some_and(|decisions| {
-            decisions
-                .iter()
-                .any(|decision| decision["basis_kind"] == "recommendation")
-        });
+        let recommended = format <= 15
+            && document["decisions"].as_array().is_some_and(|decisions| {
+                decisions
+                    .iter()
+                    .any(|decision| decision["basis_kind"] == "recommendation")
+            });
         let asked = document["asks"]
             .as_array()
             .into_iter()
@@ -998,6 +996,13 @@ impl TicketQuestions {
                 if let Some(question) = decision.get_mut("question") {
                     upgrade_question(question);
                 }
+            }
+        }
+        // Formats 14 to 16 kept each decision's asking role (OWL-345);
+        // format 17 does not (OWL-379).
+        if let Some(decisions) = document.get_mut("decisions").and_then(|d| d.as_array_mut()) {
+            for decision in decisions.iter_mut().filter_map(|d| d.as_object_mut()) {
+                decision.remove("asked_by");
             }
         }
         document["format"] = QUESTIONS_FORMAT.into();

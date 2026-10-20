@@ -30,7 +30,7 @@ use std::time::Duration;
 
 use owlshift_contracts::BasisKind;
 use owlshift_contracts::brief::{Brief, Relation, ThreadEntry, ToResolve};
-use owlshift_contracts::ids::{FindingId, QuestionId};
+use owlshift_contracts::ids::QuestionId;
 use owlshift_contracts::refs::KeptDecision;
 use owlshift_contracts::result::{
     Decision, Question, QuestionOption, Resolution, Status, option_letter,
@@ -85,20 +85,9 @@ pub fn route(policy: &GatePolicy, questions: &[Question], direct: &[QuestionId])
 /// The questions as the resolver's brief lists them, without the category
 /// the raising run gave them (OWL-144): the resolver labels each question it
 /// decides from its text and context, so its label is its own reading and
-/// not a copy of the one [`decisions`] checks it against. A residue
-/// question names the finding it asks about (`findings`, by the run's
-/// question ids, OWL-343).
-pub fn unlabelled(questions: &[Question], findings: &[(QuestionId, FindingId)]) -> Vec<ToResolve> {
-    questions
-        .iter()
-        .map(|question| ToResolve {
-            finding: findings
-                .iter()
-                .find(|(asked, _)| *asked == question.id)
-                .map(|(_, finding)| finding.clone()),
-            ..ToResolve::from(question)
-        })
-        .collect()
+/// not a copy of the one [`decisions`] checks it against.
+pub fn unlabelled(questions: &[Question]) -> Vec<ToResolve> {
+    questions.iter().map(ToResolve::from).collect()
 }
 
 /// The option the runner adds to every question of a false premise
@@ -1057,7 +1046,6 @@ mod tests {
             decision: format!("decision {n}"),
             basis: format!("basis {n}"),
             basis_kind: kind,
-            asked_by: None,
             number: None,
             reversed: None,
         };

@@ -88,7 +88,7 @@ use owlshift_contracts::config::{Admit, ProjectConfig, States, TrackerKind};
 use owlshift_contracts::drain::{TicketIntake, TicketProposals};
 use owlshift_contracts::event::EventKind;
 use owlshift_contracts::format::Format;
-use owlshift_contracts::ids::{FindingId, QuestionId, RelativePath, TicketId};
+use owlshift_contracts::ids::{QuestionId, RelativePath, TicketId};
 use owlshift_contracts::refs::{
     self, AnsweredReview, Ask, AskDecider, AskKind, BuildRefusal, DeliveredPullRequest,
     KeptDecision, KeptReport, OwedReport, PersistedState, PushKind, Pushing, TicketCost,
@@ -160,7 +160,7 @@ use design::Built;
 use review_loop::{in_review_loop, loop_base, loop_reviews};
 use verify::Verified;
 
-pub(crate) use design::{APPROVAL_CATEGORY, FINDING_CATEGORY};
+pub(crate) use design::APPROVAL_CATEGORY;
 pub(crate) use drain::delivery_followed;
 pub use drain::{DispatchSeen, Taken, still_ready};
 pub use intake::admission;
@@ -932,7 +932,7 @@ struct DecidedOn {
 /// The run whose questions go through the resolver (OWL-342), as
 /// [`OnDemand::resolve`] routes them and tells the resolver of it
 /// ([`owlshift_contracts::brief::AskedBy`]): a role's run, or, for the
-/// residue and approval rounds a review pass asks, the pass's last run.
+/// approval round a review pass asks, the pass's last run.
 struct Asked<'a> {
     role: Role,
     run: &'a str,
@@ -949,8 +949,6 @@ struct Asked<'a> {
     /// Questions the decider answers without a resolver run: the plan's
     /// approval under `plan_approval = "always"`.
     direct: &'a [QuestionId],
-    /// The finding each residue question asks about, by the questions' ids.
-    findings: &'a [(QuestionId, FindingId)],
     /// The asking review pass's findings, with their rulings.
     kept_findings: &'a [KeptFinding],
     /// The ticket's plan, when Design or Design review asks.
@@ -975,7 +973,6 @@ impl<'a> Asked<'a> {
             questions: &result.questions,
             reopened,
             direct: &[],
-            findings: &[],
             kept_findings: &[],
             plan: None,
         }
@@ -2432,15 +2429,16 @@ impl OnDemand<'_> {
                         &questions,
                         reversal::Current::Known(&current),
                     );
-                    // Before delivery, a reply that returns the ticket to an
-                    // earlier stage (OWL-345) is followed by the return, not
-                    // here: one the check left settling stays unfollowed
-                    // rather than be marked followed unserved.
+                    // Before delivery, a reply that returns the ticket to
+                    // Design (OWL-345) is followed by the return, not here:
+                    // one the check left settling stays unfollowed rather
+                    // than be marked followed unserved.
                     if !in_review_loop(p) {
                         reversed.retain(|r| {
-                            questions.decisions.get(r.decision).is_none_or(|kept| {
-                                reversal::reopens(kept, p.plan.as_ref()).is_none()
-                            })
+                            questions
+                                .decisions
+                                .get(r.decision)
+                                .is_none_or(|kept| !reversal::reopens(kept, p.plan.as_ref()))
                         });
                     }
                     reversal::followed(&mut questions, &reversed);
@@ -2812,7 +2810,6 @@ impl OnDemand<'_> {
                 let (decided, unposted) = self.log_decisions(
                     p,
                     state,
-                    asked.role,
                     &sorted.logged,
                     (raised_by, DecidedBy::Recommendation(fallback)),
                     sink,
@@ -2850,7 +2847,7 @@ impl OnDemand<'_> {
         let diff = self.branch_diff(p)?;
         let comments = self.comments(&ticket)?;
         let mut brief = self.brief(p, Role::Resolver, &comments, rules, None, current);
-        brief.resolve = resolver::unlabelled(&routed.to_resolver, asked.findings);
+        brief.resolve = resolver::unlabelled(&routed.to_resolver);
         brief.delegation = Some(level);
         brief.asked_by = Some(AskedBy {
             role: asked.role,
@@ -2919,7 +2916,6 @@ impl OnDemand<'_> {
         let (decided, unposted) = self.log_decisions(
             p,
             state,
-            asked.role,
             &sorted.logged,
             (&ran.run, DecidedBy::Resolver),
             sink,
@@ -2958,7 +2954,7 @@ impl OnDemand<'_> {
 
     /// Posts the decisions `logged` of one run as one DECISION comment
     /// (OWL-351), their reasoning in the ticket's decisions document, then
-    /// keeps them in the ticket ref with the role that asked them: the
+    /// keeps them in the ticket ref: the
     /// resolver's decisions, or, at the resolver's bound at `all`, the asking
     /// run's recommendations (OWL-375), as `by` says; `run` names the run in
     /// the comment's footer and the events. Returns the decisions kept and
@@ -2969,7 +2965,6 @@ impl OnDemand<'_> {
         &self,
         p: &mut Prepared,
         state: &TicketState,
-        role: Role,
         logged: &[resolver::Logged<'_>],
         (run, by): (&str, DecidedBy),
         sink: &mut EventSink<'_>,
@@ -3016,7 +3011,6 @@ impl OnDemand<'_> {
                             decision: shown.decision,
                             basis: shown.basis,
                             basis_kind: shown.kind,
-                            asked_by: Some(role),
                             number: u32::try_from(n + 1).ok().and_then(NonZeroU32::new),
                             reversed: None,
                         });
@@ -7424,7 +7418,6 @@ mod tests {
             decision: decided.into(),
             basis: "the ticket".into(),
             basis_kind: None,
-            asked_by: None,
             number: None,
             reversed: None,
         };
@@ -7580,7 +7573,6 @@ mod tests {
             decision: "Yes, as the ticket says.".into(),
             basis: "The ticket.".into(),
             basis_kind: None,
-            asked_by: None,
             number: None,
             reversed: None,
         };
@@ -8449,7 +8441,7 @@ mod tests {
                     \"Which file\" (recorded: \"config.toml\"); \"Every key\" (recorded: \"yes\")";
         let format_8 = serde_json::json!({ "format": 8, "build_refusal": { "lists": [held] } });
         let questions = TicketQuestions::parse(&format_8.to_string()).unwrap();
-        assert!(questions.render().starts_with("{\n  \"format\": 16,"));
+        assert!(questions.render().starts_with("{\n  \"format\": 17,"));
         let kept = questions.build_refusal.clone().unwrap();
         assert_eq!(
             (&kept.lists[..], kept.choices.len()),

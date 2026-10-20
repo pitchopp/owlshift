@@ -222,7 +222,6 @@ const RESOLVER_BRIEF_FIELDS: &[&str] = &[
     "result_refusal",
     "result_path",
     // The asking run (OWL-343).
-    "resolve.finding",
     "asked_by",
     "asked_by.role",
     "asked_by.summary",

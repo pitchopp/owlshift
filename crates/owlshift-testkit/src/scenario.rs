@@ -979,7 +979,6 @@ impl Driver {
                             decision: shown.decision,
                             basis: shown.basis,
                             basis_kind: shown.kind,
-                            asked_by: Some(asking_role),
                             number: u32::try_from(n + 1).ok().and_then(NonZeroU32::new),
                             reversed: None,
                         });
@@ -1261,7 +1260,7 @@ impl Driver {
                 &current,
             ),
             resolve: if role == Role::Resolver {
-                resolver::unlabelled(&self.resolving, &[])
+                resolver::unlabelled(&self.resolving)
             } else {
                 Vec::new()
             },

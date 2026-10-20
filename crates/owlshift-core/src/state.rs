@@ -139,8 +139,7 @@ impl Status {
 /// | A Build run asked a `replan`, and the resolver decided every question of the run | `ReplanDecided` |
 /// | The resolver decided every question a Design review or Verify pass left for the decider, its findings or the approval (OWL-342); since OWL-377 the approval only | `RoundDecided` |
 /// | A Verify pass left findings for one last Build, `minor` ones at any pass (OWL-356) or any at a last pass; a last Design review pass left `blocker` or `major` findings for Design's last revision (OWL-377) ([`crate::review::PassOutcome::LastFix`]) | `LastFix` |
-/// | Before delivery, the decider reversed a resolver's plan approval or its decision on a Design review residue finding (OWL-345) | `ReversedToDesign` |
-/// | Before delivery, the decider reversed a resolver's decision on a Verify residue finding (OWL-345) | `ReversedToBuild` |
+/// | Before delivery, the decider reversed a resolver's plan approval (OWL-345) | `ReversedToDesign` |
 /// | A design run answered an approval round `approved`, and the runner kept the approval | `PlanApproved` |
 /// | A stage run returned `blocked` | `Blocked` |
 /// | The answer check found every question answered | `Answered` |
@@ -209,19 +208,13 @@ pub enum Event {
     /// Verify.
     LastFix,
     /// The decider reversed, by replying to its DECISION comment, a decision
-    /// the resolver took on the plan's approval or on a Design review
-    /// residue finding (OWL-345), before delivery: the ticket goes back to
-    /// Design, whose new plan is reviewed and approved again. From Design
-    /// review the review pass count is kept, as an answered round keeps it;
-    /// from Build or Verify it restarts, as a `replan` leaves it. No pass is
-    /// counted. Valid at Design review, Build and Verify, and only when the
+    /// the resolver took on the plan's approval (OWL-345), before delivery:
+    /// the ticket goes back to Design, whose new plan is reviewed and
+    /// approved again. From Design review the review pass count is kept, as
+    /// an answered round keeps it; from Build or Verify it restarts, as a
+    /// `replan` leaves it. No pass is counted. Valid at Design review, Build and Verify, and only when the
     /// pipeline has a Design, so it is refused on `trivial`.
     ReversedToDesign,
-    /// The decider reversed a decision the resolver took on a Verify residue
-    /// finding (OWL-345), before delivery: the ticket goes back from Verify
-    /// to Build, whose fix run follows the reply, the pass count kept. No
-    /// pass is counted. Valid only at Verify.
-    ReversedToBuild,
     /// A design run answered an approval round `approved` (OWL-32): the
     /// plan stays as it was and the ticket goes to Build. Valid only at
     /// Design after a review pass of the loop, which the approval round's
@@ -301,7 +294,7 @@ pub enum Event {
 
 impl Event {
     /// Every event.
-    pub const ALL: [Self; 31] = [
+    pub const ALL: [Self; 30] = [
         Self::Dispatched,
         Self::Completed,
         Self::LoopBack,
@@ -311,7 +304,6 @@ impl Event {
         Self::RoundDecided,
         Self::LastFix,
         Self::ReversedToDesign,
-        Self::ReversedToBuild,
         Self::PlanApproved,
         Self::Blocked,
         Self::Answered,
@@ -729,19 +721,14 @@ impl TicketState {
                 let entered = self.enter(Status::Active(target));
                 Transition::To(self.end_review_pass(stage, entered).ok_or(invalid)?)
             }
-            // A decider's reply reversed a resolver's approval or residue
-            // decision before delivery (OWL-345): back to the author stage,
-            // no pass counted, no round opened.
+            // A decider's reply reversed a resolver's approval before
+            // delivery (OWL-345): back to Design, no pass counted, no round
+            // opened.
             (
                 Status::Active(Stage::DesignReview | Stage::Build | Stage::Verify),
                 Event::ReversedToDesign,
             ) if pipeline.contains(Stage::Design) => {
                 Transition::To(self.enter(Status::Active(Stage::Design)))
-            }
-            (Status::Active(Stage::Verify), Event::ReversedToBuild)
-                if pipeline.contains(Stage::Build) =>
-            {
-                Transition::To(self.enter(Status::Active(Stage::Build)))
             }
             // The plan gate is checked on top ([`TicketState::step`]).
             (Status::Active(Stage::Design), Event::PlanApproved) if self.review_passes > 0 => {
@@ -1169,7 +1156,6 @@ mod tests {
             (Status::Active(DesignReview | Build | Verify), Event::ReversedToDesign) => {
                 Expect::To(Status::Active(Design))
             }
-            (Status::Active(Verify), Event::ReversedToBuild) => Expect::To(Status::Active(Build)),
             (Status::Active(stage), Event::Blocked) if stage != Ready => {
                 Expect::Parked(parked(stage, false), ParkReason::Blocked)
             }
@@ -2031,13 +2017,12 @@ mod tests {
         }
     }
 
-    /// A reply reversing a resolver's approval or residue decision before
-    /// delivery (OWL-345) returns the ticket to the author stage, no pass
-    /// counted: to Design from Design review with its count kept, and from
-    /// Build or Verify with the count restarted; from Verify to Build with
-    /// the count kept. `trivial` has no Design to return to.
+    /// A reply reversing a resolver's plan approval before delivery
+    /// (OWL-345) returns the ticket to Design, no pass counted: from Design
+    /// review with its count kept, and from Build or Verify with the count
+    /// restarted. `trivial` has no Design to return to.
     #[test]
-    fn a_reversed_decision_returns_to_the_author_stage_and_counts_no_pass() {
+    fn a_reversed_approval_returns_to_design_and_counts_no_pass() {
         let trivial = Pipeline::new(Variant::Trivial);
         let passes = |stage| {
             state(Status::Active(stage), 1, 0, 1)
@@ -2051,27 +2036,21 @@ mod tests {
             let back = to(passes(stage).apply(STANDARD, Event::ReversedToDesign));
             assert_eq!(at(back), (Status::Active(Stage::Design), 0), "{stage:?}");
         }
-        let fixing = to(passes(Stage::Verify).apply(STANDARD, Event::ReversedToBuild));
-        assert_eq!(at(fixing), (Status::Active(Stage::Build), 1));
 
-        for event in [Event::ReversedToDesign, Event::ReversedToBuild] {
-            for status in all_statuses() {
-                let Some(other) = baseline(status) else {
-                    continue;
-                };
-                let valid = match event {
-                    Event::ReversedToDesign => matches!(
-                        status,
-                        Status::Active(Stage::DesignReview | Stage::Build | Stage::Verify)
-                    ),
-                    _ => status == Status::Active(Stage::Verify),
-                };
-                assert_eq!(
-                    other.apply(STANDARD, event).is_ok(),
-                    valid,
-                    "{status:?} + {event:?}"
-                );
-            }
+        let event = Event::ReversedToDesign;
+        for status in all_statuses() {
+            let Some(other) = baseline(status) else {
+                continue;
+            };
+            let valid = matches!(
+                status,
+                Status::Active(Stage::DesignReview | Stage::Build | Stage::Verify)
+            );
+            assert_eq!(
+                other.apply(STANDARD, event).is_ok(),
+                valid,
+                "{status:?} + {event:?}"
+            );
         }
         for stage in [Stage::Build, Stage::Verify] {
             assert!(

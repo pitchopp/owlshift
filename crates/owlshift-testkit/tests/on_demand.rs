@@ -10882,7 +10882,7 @@ mod drain_scenarios;
 #[path = "on_demand/design_scenarios.rs"]
 mod design_scenarios;
 
-/// A reversed approval or residue decision, before delivery (OWL-345).
+/// A reversed plan approval, before delivery (OWL-345).
 #[path = "on_demand/reversal_scenarios.rs"]
 mod reversal_scenarios;
 
