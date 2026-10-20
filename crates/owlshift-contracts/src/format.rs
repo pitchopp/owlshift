@@ -40,8 +40,9 @@ use crate::Role;
 /// (OWL-377); format 23 Build's `setup_failure`, beside its `gate_failure`
 /// (OWL-389); format 24 intake's `named_resources` and `result_refusal`, and
 /// `zones` and `resources` as what the ticket holds once intake ran
-/// (OWL-402).
-pub const BRIEF_FORMAT: u32 = 24;
+/// (OWL-402); format 25 `pull_request_reviews` in a review loop's verify and
+/// arbiter briefs too (OWL-396).
+pub const BRIEF_FORMAT: u32 = 25;
 /// The format version of `result.json`. Format 4 added the resolver's
 /// `resolutions` (OWL-138); format 5 the resolver's own `category` on each
 /// decision (OWL-144); format 6 refuses `decisions` from the build role

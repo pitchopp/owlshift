@@ -424,6 +424,16 @@ fn brief_quality_pipeline_fields_go_to_their_roles_only() {
         json!([review.clone()]),
     ))
     .unwrap();
+    // A review loop's Verify reviewers and arbiter are given them too
+    // (OWL-396).
+    for role in ["verify", "arbiter"] {
+        parse(&with(
+            brief(role),
+            "pull_request_reviews",
+            json!([review.clone()]),
+        ))
+        .unwrap_or_else(|e| panic!("{role}: {e}"));
+    }
     // The diff of a Verify pass (OWL-302): in verify's review, and with the
     // arbiter's findings to rule on.
     let diff = json!({ "base": "b".repeat(40), "path": ".owlshift/run/diff.patch" });
@@ -557,13 +567,13 @@ fn brief_quality_pipeline_fields_go_to_their_roles_only() {
             "given twice",
         ),
         (
-            "pull request reviews for verify",
+            "pull request reviews for design review",
             with(
-                brief("verify"),
+                brief("design_review"),
                 "pull_request_reviews",
                 json!([review.clone()]),
             ),
-            "pull request reviews: the role is verify",
+            "pull request reviews: the role is design_review",
         ),
         (
             "an empty review",
@@ -589,7 +599,7 @@ fn brief_quality_pipeline_fields_go_to_their_roles_only() {
         ),
         (
             "a newer brief",
-            with(brief("build"), "format", 25.into()),
+            with(brief("build"), "format", 26.into()),
             "upgrade Owlshift",
         ),
     ] {

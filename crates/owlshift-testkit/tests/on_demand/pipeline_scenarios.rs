@@ -106,7 +106,7 @@ impl Bench {
     }
 
     /// The briefs of the runs of `role`, oldest first.
-    fn briefs_of(&self, role: Role) -> Vec<Brief> {
+    pub(super) fn briefs_of(&self, role: Role) -> Vec<Brief> {
         self.briefs()
             .into_iter()
             .filter(|brief| brief.role == role)
@@ -596,6 +596,14 @@ fn scenario_a_standard_ticket_walks_to_its_merge_through_a_review_loop() {
     }
     assert!(builds[0].pull_request_reviews.is_empty());
     assert_eq!(builds[1].pull_request_reviews.len(), 1);
+    // Verify's reviewers are given the loop's review too (OWL-396), and
+    // Design review's none.
+    let verifies = bench.briefs_of(Role::Verify);
+    assert!(verifies[0].pull_request_reviews.is_empty());
+    assert_eq!(verifies.last().unwrap().pull_request_reviews.len(), 1);
+    for brief in bench.briefs_of(Role::DesignReview) {
+        assert!(brief.pull_request_reviews.is_empty());
+    }
     assert_eq!(
         bench.github.created.lock().unwrap().len(),
         1,

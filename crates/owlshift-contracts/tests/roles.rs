@@ -1202,6 +1202,9 @@ fn verify_prompt_matches_the_contracts() {
             "review.since.pass",
             "review.since.diff.base",
             "review.since.diff.path",
+            "pull_request_reviews.author.relation",
+            "pull_request_reviews.body",
+            "pull_request_reviews.comments.path",
             "result_path",
         ],
     );
@@ -1239,6 +1242,9 @@ fn arbiter_prompt_matches_the_contracts() {
             "findings.diff.path",
             "plan.plan",
             "plan.base",
+            "pull_request_reviews.author.relation",
+            "pull_request_reviews.body",
+            "pull_request_reviews.comments.path",
             "result_path",
         ],
     );

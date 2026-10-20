@@ -321,6 +321,70 @@ fn a_review_loops_question_returns_to_build_and_its_answer_delivers() {
     assert_eq!(state_of(&bench).status(), Status::Active(Stage::Watch));
 }
 
+/// OWL-396: a review loop's Verify reviewer and its arbiter are given the
+/// reviews the loop answers, the decider's as the decider's word and the
+/// other listed reviewer's as data, so a finding against the change the
+/// decider asked for is rejected on that review; the Verify pass of the
+/// first delivery, before any review, was given none.
+#[test]
+fn a_review_loops_verify_reviewer_and_arbiter_are_given_the_reviews() {
+    let bench = Bench::reviewed();
+    bench.verify_plays.set(true);
+    bench.reviews_on_github(three_reviews());
+    let grouped = "Nothing in the ticket asks for the greeting in capitals.";
+    let replies = vec![
+        bench.reply(Some("Hello there"), Some(RENAMED)),
+        bench.reviewing(&super::verify_scenarios::found(&[("major", grouped)])),
+        bench.reviewing(
+            &json!({
+                "format": 14,
+                "status": "done",
+                "summary": "Rejected.",
+                "rulings": [{
+                    "finding": "F1",
+                    "outcome": "rejected",
+                    "reason": "The decider's review 5547776064 asks for capitals (GREETING.md:1)."
+                }]
+            })
+            .to_string(),
+        ),
+    ];
+    let (outcomes, lines, printed) = bench.watch(replies, &mut |_| false);
+    assert!(
+        matches!(&outcomes[..], [Ok(_)]),
+        "{outcomes:?}\n{lines}\n{printed}"
+    );
+    let given = |brief: &Brief| -> Vec<(u64, Relation)> {
+        brief
+            .pull_request_reviews
+            .iter()
+            .map(|review| (review.id, review.author.relation))
+            .collect()
+    };
+    let want = [
+        (5_547_776_064, Relation::Decider),
+        (5_547_776_257, Relation::Other),
+    ];
+    assert_eq!(given(&bench.last_of(Role::Verify)), want);
+    assert_eq!(given(&bench.last_of(Role::Arbiter)), want);
+    assert_eq!(given(&bench.last_of(Role::Build)), want);
+    let verifies = bench.briefs_of(Role::Verify);
+    assert!(
+        verifies[0].pull_request_reviews.is_empty(),
+        "the first delivery's Verify pass, before any review"
+    );
+    let kept = bench.review_record();
+    let ruling = kept.passes.last().unwrap().findings[0]
+        .ruling
+        .as_ref()
+        .expect("the arbiter ruled");
+    assert_eq!(
+        ruling.outcome,
+        owlshift_contracts::review::RulingOutcome::Rejected
+    );
+    assert!(ruling.reason.contains("5547776064"), "{}", ruling.reason);
+}
+
 /// The following kept while a loop waits at Build (part J): its pull
 /// request merged meanwhile ends the loop, its round closed unanswered, the
 /// ticket back at Watch with its delivery ended and its review left

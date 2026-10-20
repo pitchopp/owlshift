@@ -1633,6 +1633,11 @@ impl OnDemand<'_> {
             let comments = self.comments(&ticket)?;
             let mut brief = self.brief(p, role, &comments, &dispatched.rules, None, &current);
             brief.plan = plan.clone();
+            // A review loop's Verify pass is given the reviews the loop
+            // answers (OWL-396); Design review and a first delivery's none.
+            if stage == Stage::Verify {
+                brief.pull_request_reviews = loop_reviews(p);
+            }
             brief.review = Some(ReviewBrief {
                 mandates: mandates.to_vec(),
                 pass: pass_id,
@@ -1760,6 +1765,9 @@ impl OnDemand<'_> {
                 &current,
             );
             brief.plan = plan.clone();
+            if stage == Stage::Verify {
+                brief.pull_request_reviews = loop_reviews(p);
+            }
             brief.findings = Some(GivenFindings {
                 mode: FindingsMode::Rule,
                 findings: findings.iter().map(|kept| kept.finding.clone()).collect(),
