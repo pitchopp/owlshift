@@ -333,12 +333,13 @@ pub enum MarkerState {
 }
 
 /// Where the marker of the project at `dirs` stands: read, then, when there
-/// is one, read again under the project's lock, tried and released at once.
+/// is one, read again under the project's lock, tried once and released at
+/// once: a look, which never waits (OWL-414).
 pub fn marker_state(dirs: &ProjectDirs) -> io::Result<MarkerState> {
     if dirs.unverified()?.is_none() {
         return Ok(MarkerState::Clear);
     }
-    let Some(_lock) = dirs.lock()? else {
+    let Some(_lock) = dirs.try_lock()? else {
         return Ok(MarkerState::InFlight);
     };
     Ok(match dirs.unverified()? {
@@ -660,9 +661,23 @@ mod tests {
     }
 
     /// The marker is cleared only by the project's name, typed while the
-    /// project is free; no marker is nothing to clear.
+    /// project is free; no marker is nothing to clear. Run alone
+    /// (`alone::run_alone`, OWL-414): the lock is released and taken again,
+    /// by the test and by `clear`, which another test's child spawned
+    /// meanwhile would make look held.
     #[test]
     fn only_the_projects_name_clears_the_quarantine() {
+        crate::alone::run_alone(
+            "quarantine::tests::helper_only_the_projects_name_clears_the_quarantine",
+        );
+    }
+
+    #[test]
+    #[ignore = "helper, run by the test above"]
+    fn helper_only_the_projects_name_clears_the_quarantine() {
+        if !crate::alone::running_alone() {
+            return;
+        }
         let cases: [(&str, Option<&str>, bool, &str); 5] = [
             ("cleared", Some(BREACH), false, "acme/app\n"),
             ("kept", Some(BREACH), false, "yes\n"),
@@ -773,8 +788,21 @@ mod tests {
         assert!(bench.dirs.unverified().unwrap().is_some());
     }
 
+    /// Run alone, as the clear above: the lock `marker_state` released is
+    /// taken again.
     #[test]
     fn doctor_tells_a_quarantine_from_a_run_in_flight() {
+        crate::alone::run_alone(
+            "quarantine::tests::helper_doctor_tells_a_quarantine_from_a_run_in_flight",
+        );
+    }
+
+    #[test]
+    #[ignore = "helper, run by the test above"]
+    fn helper_doctor_tells_a_quarantine_from_a_run_in_flight() {
+        if !crate::alone::running_alone() {
+            return;
+        }
         let bench = Bench::new();
         assert_eq!(marker_state(&bench.dirs).unwrap(), MarkerState::Clear);
         bench.mark(BREACH);

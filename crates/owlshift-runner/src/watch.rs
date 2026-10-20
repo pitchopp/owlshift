@@ -891,8 +891,9 @@ impl Watch<'_> {
             told: BTreeSet::from([ticket.clone()]),
         };
         let dirs = on_demand.dirs;
+        // Watch never waits for a lock (OWL-414): busy, it is kept for later.
         let kept = matches!(
-            dirs.lock(),
+            dirs.try_lock(),
             Ok(Some(lock)) if told.merge_into(dirs, &lock, &known.marker).is_ok()
         );
         if !kept {
@@ -1736,7 +1737,8 @@ impl Watch<'_> {
             memory.quarantine = None;
             return Ok(Snapshot::default());
         }
-        let lock = match dirs.lock() {
+        // One try: a busy project skips the pass, watch never waits (OWL-414).
+        let lock = match dirs.try_lock() {
             Ok(Some(lock)) => lock,
             Ok(None) => return Err(Project::Busy),
             Err(e) => return Err(Project::Unread(format!("the project's lock: {e}"))),

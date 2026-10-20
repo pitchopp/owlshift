@@ -106,36 +106,20 @@ impl MachineSlots {
 
 #[cfg(test)]
 mod tests {
-    use std::process::Command;
-
     use super::*;
 
-    /// Checked in a fresh copy of this test binary, alone, for the reason
-    /// `project::tests::one_do_at_a_time_per_project` gives: a child forked
+    /// Checked alone, in a fresh copy of this test binary, for the reason
+    /// `project::tests::one_do_at_a_time_per_project` gives: a child spawned
     /// by another test's thread holds a lock until it execs.
     #[test]
     fn slots_are_taken_up_to_the_cap_and_counted() {
-        let output = Command::new(std::env::current_exe().unwrap())
-            .args([
-                "--exact",
-                "slots::tests::helper_slots",
-                "--ignored",
-                "--nocapture",
-                "--test-threads=1",
-            ])
-            .output()
-            .unwrap();
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        assert!(
-            output.status.success() && stdout.contains("running 1 test"),
-            "{output:?}"
-        );
+        crate::alone::run_alone("slots::tests::helper_slots");
     }
 
     #[test]
     #[ignore = "helper, run by the test above"]
     fn helper_slots() {
-        if !std::env::args().any(|arg| arg == "--exact") {
+        if !crate::alone::running_alone() {
             return;
         }
         let dir = tempfile::tempdir().unwrap();
