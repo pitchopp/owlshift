@@ -293,6 +293,7 @@ pub fn run(system: &dyn System, config: &Effective) -> Report {
     checks.extend(proposals_inbox_check(config, facts.as_ref()));
     checks.extend(forge_reviewers_check(config));
     checks.extend(resolver_check(config));
+    checks.extend(codex_reviewer_check(system, config));
     checks.extend(budget_check(config));
     checks.extend(drain_slot_check(system, config));
     checks.extend(quarantine_check(system, config, home));
@@ -810,13 +811,14 @@ const KEYCHAIN_FIX: &str = "Make the system keychain available: unlock it on mac
                             start a Secret Service such as GNOME Keyring";
 
 /// The harnesses doctor checks (scenario S15): Claude Code, which runs every
-/// role, and Codex only when the personal file declares it (OWL-347). Codex
-/// that is not ready is only a warning: see [`codex_not_ready_is_a_warning`].
+/// role, and Codex only when the personal file declares it (OWL-347) or the
+/// project adds the opt-in Codex reviewer (OWL-348). Codex that is not ready
+/// is only a warning: see [`codex_not_ready_is_a_warning`].
 fn required_harnesses(config: &Effective) -> Vec<Harness> {
     let codex = matches!(
         &config.personal,
         FileState::Loaded { config, .. } if config.harnesses.codex.is_some()
-    );
+    ) || codex_reviewer_asked(config);
     let mut harnesses = vec![Harness::Claude];
     if codex {
         harnesses.push(Harness::Codex);
@@ -832,8 +834,9 @@ fn harness_why(harness: Harness) -> &'static str {
              Agent runs log in with the token the `claude agent login` line checks."
         }
         Harness::Codex => {
-            "The personal file declares Codex, yet no role runs on Codex for now: every agent, \
-             the reviewers included, runs in Claude Code."
+            "No role needs Codex: every agent runs in Claude Code. With \
+             `pipeline.codex_reviewer` on, each review pass adds a Codex reviewer while Codex \
+             is ready, and runs without it otherwise."
         }
     }
 }
@@ -879,9 +882,10 @@ fn harness_check(system: &dyn System, harness: Harness, home: Option<&Path>) -> 
 
 /// Codex that is missing, logged out, unreadable or stopped by the machine's
 /// requirements ([`codex_requirements_check`], OWL-314) is a warning, never a
-/// failure: no role runs on Codex (architecture section 5, "Codex",
-/// OWL-347), so it is not a problem to fix before `do` (OWL-102, OWL-299).
-/// The decision is made here and only here.
+/// failure: no role needs Codex (architecture section 5, "Codex", OWL-347),
+/// and the opt-in Codex reviewer only drops its seat (OWL-348), so it is not
+/// a problem to fix before `do` (OWL-102, OWL-299). The decision is made
+/// here and only here.
 fn codex_not_ready_is_a_warning(mut check: Check, harness: Harness) -> Check {
     if harness != Harness::Codex || check.status != Status::Fail {
         return check;
@@ -903,8 +907,7 @@ fn codex_not_ready_is_a_warning(mut check: Check, harness: Harness) -> Check {
         .collect();
     check.status = Status::Warn;
     check.why = Some(format!(
-        "{DOES_NOT_BLOCK} no role runs on Codex for now. To get the Codex the personal file \
-         declares ready: {}.",
+        "{DOES_NOT_BLOCK} no role needs Codex. To get Codex ready: {}.",
         steps.join(", then ")
     ));
     check.fix = Vec::new();
@@ -1291,6 +1294,50 @@ fn resolver_check(config: &Effective) -> Option<Check> {
              decider"
         ),
     ))
+}
+
+/// Whether the project file `owlshift do` reads adds the opt-in Codex
+/// reviewer (OWL-348); not when no project file is loaded.
+fn codex_reviewer_asked(config: &Effective) -> bool {
+    matches!(
+        &config.project,
+        FileState::Loaded { config, .. } if config.pipeline.codex_reviewer()
+    )
+}
+
+/// The opt-in Codex reviewer (OWL-348, `pipeline.codex_reviewer`): when the
+/// project asks for it, whether Codex can serve it here, by the check each
+/// command makes at its start ([`codex_machine::critic_readiness`]). A
+/// warning when it cannot: each review pass then runs without that seat and
+/// says so. None when the key is off or no project file is loaded.
+fn codex_reviewer_check(system: &dyn System, config: &Effective) -> Option<Check> {
+    const SUBJECT: &str = "codex reviewer";
+    if !codex_reviewer_asked(config) {
+        return None;
+    }
+    let ready = codex_machine::critic_readiness(
+        system.locate("codex"),
+        system.codex_login_file(),
+        |path| system.is_file(path),
+        system.read_text_file(Path::new(codex_machine::REQUIREMENTS)),
+    );
+    Some(match ready {
+        Ok(_) => Check::ok(
+            Section::Project,
+            SUBJECT,
+            "on: each Design review and Verify pass adds a Codex reviewer, on the critic's \
+             mandate, beside its Claude Code reviewers",
+        ),
+        Err(why) => Check::warn(
+            Section::Project,
+            SUBJECT,
+            format!("on, but Codex cannot serve it here: {why}"),
+            format!(
+                "{DOES_NOT_BLOCK} each review pass runs with its Claude Code reviewers alone \
+                 and says so on the ticket. The `codex` lines say how to get Codex ready."
+            ),
+        ),
+    })
 }
 
 /// The budget on one ticket's runs (OWL-378, architecture section 4,
@@ -2822,7 +2869,7 @@ mod tests {
             assert_eq!(codex.fix, []);
             let why = codex.why.as_deref().unwrap();
             assert!(why.starts_with(DOES_NOT_BLOCK), "{why}");
-            assert!(why.contains("no role runs on Codex for now"), "{why}");
+            assert!(why.contains("no role needs Codex"), "{why}");
             assert!(why.contains(step), "{why}");
             assert!(report.ready(), "{report}");
             assert_eq!(report.failures(), 0, "{report}");
@@ -2978,7 +3025,7 @@ mod tests {
         #[cfg(unix)]
         assert_eq!(file, "~/.codex/auth.json");
         let why = codex.why.as_deref().unwrap();
-        assert!(why.contains("no role runs on Codex for now"), "{why}");
+        assert!(why.contains("no role needs Codex"), "{why}");
         assert!(
             why.contains("`codex login`") && why.contains("auth.json"),
             "{why}"
@@ -3150,8 +3197,8 @@ mod tests {
         assert_eq!(
             refused.why.as_deref(),
             Some(
-                "Does not block `owlshift do`: no role runs on Codex for now. To get the Codex \
-                 the personal file declares ready: Have the machine's administrator add \
+                "Does not block `owlshift do`: no role needs Codex. To get Codex ready: Have the \
+                 machine's administrator add \
                  \"danger-full-access\" to `allowed_sandbox_modes` in \
                  /etc/codex/requirements.toml."
             )
@@ -3870,6 +3917,68 @@ states = { ready = "Todo", working = "Doing", needs_input = "Asked", review = "R
             assert_eq!(budget.status, Status::Info, "{policy}");
             assert_eq!(budget.detail, detail, "{policy}");
         }
+    }
+
+    /// OWL-348: with `pipeline.codex_reviewer` on, and no `[harnesses.codex]`
+    /// in a personal file, Codex is checked and the `codex reviewer` line
+    /// says whether it can serve, a warning when it cannot; off, neither.
+    #[test]
+    fn the_codex_reviewer_line_says_whether_codex_can_serve_it() {
+        let tracker = r#"kind = "markdown"
+admit = "delegation"
+states = { ready = "Todo", working = "Doing", needs_input = "Asked", review = "Review" }"#;
+        let (_off_dir, off) = project_tracked_with(tracker, "");
+        let (dir, _) = project_tracked_with(tracker, "");
+        let path = dir.path().join("owlshift.toml");
+        let text = std::fs::read_to_string(&path).unwrap().replace(
+            "plan_approval = \"never\"",
+            "plan_approval = \"never\"\ncodex_reviewer = true",
+        );
+        std::fs::write(&path, text).unwrap();
+        let on = Effective {
+            project: FileState::load(path, owlshift_contracts::config::ProjectConfig::parse),
+            personal: FileState::NotApplicable("no configuration directory".into()),
+        };
+        let ready = logged_in(with_harnesses(with_git(FakeSystem::default())));
+        let report = run(&ready, &off);
+        assert!(report.checks.iter().all(|check| check.subject != "codex"));
+        assert!(
+            report
+                .checks
+                .iter()
+                .all(|check| check.subject != "codex reviewer")
+        );
+
+        let report = run(&ready, &on);
+        assert_eq!(line(&report, "codex").status, Status::Ok, "{report}");
+        let reviewer = line(&report, "codex reviewer");
+        assert_eq!(reviewer.status, Status::Ok, "{report}");
+        assert!(
+            reviewer
+                .detail
+                .starts_with("on: each Design review and Verify pass adds a Codex reviewer")
+        );
+
+        let missing = logged_in(with_git(FakeSystem::default()).install("claude").answer(
+            "claude --version",
+            Answer::Exit(0, "2.1.283 (Claude Code)\n", ""),
+        ));
+        let report = run(&missing, &on);
+        assert!(report.ready(), "{report}");
+        assert_eq!(line(&report, "codex").status, Status::Warn, "{report}");
+        let reviewer = line(&report, "codex reviewer");
+        assert_eq!(reviewer.status, Status::Warn, "{report}");
+        assert_eq!(
+            reviewer.detail,
+            "on, but Codex cannot serve it here: `codex` is not on the PATH"
+        );
+        assert!(
+            reviewer
+                .why
+                .as_deref()
+                .is_some_and(|why| why.contains("its Claude Code reviewers alone")),
+            "{report}"
+        );
     }
 
     /// OWL-328: the `resolver` line names the level, the pass limit and the

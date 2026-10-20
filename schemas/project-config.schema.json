@@ -202,6 +202,13 @@
     "Pipeline": {
       "type": "object",
       "properties": {
+        "codex_reviewer": {
+          "description": "Adds a Codex reviewer, on the critic's mandate, to every Design\nreview and Verify pass, beside its Claude Code reviewers (OWL-348,\narchitecture section 5, \"Codex\"): off when absent. A Codex that\ncannot serve a pass drops that seat and the ticket says so; it never\nstops the ticket. A file using it requires an Owlshift that reads it.",
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
         "default": {
           "$ref": "#/$defs/Variant"
         },

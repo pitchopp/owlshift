@@ -21,7 +21,9 @@
 //!   no reviewer runs ([`revision_due`]).
 //! - *Design review.* The roster of the variant ([`roster::roster`]) runs one
 //!   seat after the other on Claude Code, on another model than the
-//!   author's when one is configured (OWL-347); the findings are
+//!   author's when one is configured (OWL-347), then the opt-in Codex
+//!   reviewer when the project adds it and Codex can serve (OWL-348); the
+//!   findings are
 //!   numbered across the seats ([`pass_findings`]), confirmed by one arbiter
 //!   run or left to the author's answers (`pipeline.findings`), and the pass
 //!   is settled by the core ([`settle_pass`]). A pass that asks a revision,
@@ -55,16 +57,18 @@ use owlshift_contracts::result::{
     ApprovalOutcome, MAX_QUESTION_BYTES, QuestionOption, Recommendation,
 };
 use owlshift_contracts::review::{
-    Finding, FindingOutcome, FindingsMode, KeptApproval, KeptFinding, KeptResponse, KeptRuling,
-    MAX_PASS_FINDINGS, Plan, PlanChange, PlanPart, PlanPrint, PublishedPlan, ResponseOutcome,
-    ReviewPass, Reviewer, RulingOutcome, Severity, TicketPlan, TicketReview,
+    DroppedReviewer, Finding, FindingOutcome, FindingsMode, KeptApproval, KeptFinding,
+    KeptResponse, KeptRuling, MAX_PASS_FINDINGS, Mandate, Plan, PlanChange, PlanPart, PlanPrint,
+    PublishedPlan, ResponseOutcome, ReviewPass, Reviewer, RulingOutcome, Severity, TicketPlan,
+    TicketReview,
 };
 use owlshift_core::review::{Fate, PassOutcome, PassVerdict, Standing, settle};
 use owlshift_core::roster;
-use owlshift_core::routing::reviewer_routing;
+use owlshift_core::routing::{codex_reviewer_routing, reviewer_routing};
 use owlshift_core::vocab::Harness as HarnessKind;
 
 use super::*;
+use crate::routing::codex_model;
 use crate::ticket_ref::text_sha256;
 use crate::writer::{
     CONTEXT_CHARS, DocumentPass, PlanComment, PlanDocument, PlanNext, PlanPointer, PlanReviewer,
@@ -401,6 +405,16 @@ pub(crate) fn pass_findings(
 /// walker of a loop's passes (OWL-356): the plan's document logs them
 /// (OWL-350), a later pass is told their findings and what changed since
 /// the last of them, and the DELIVERY report counts them.
+/// The passes of `passes` that ran without the opt-in Codex reviewer, each
+/// with why (OWL-348), as the PLAN comment and the DELIVERY report list
+/// them.
+pub(crate) fn dropped_passes(passes: &[&ReviewPass]) -> Vec<(u32, DroppedReviewer)> {
+    passes
+        .iter()
+        .filter_map(|kept| Some((kept.pass.get(), kept.dropped.clone()?)))
+        .collect()
+}
+
 pub(crate) fn loop_passes(review: &TicketReview, stage: Stage, upto: u32) -> Vec<&ReviewPass> {
     let mut passes: Vec<&ReviewPass> = Vec::new();
     let mut expected = upto;
@@ -1188,32 +1202,78 @@ impl OnDemand<'_> {
                 (Event::Interrupted | Event::Quarantined | Event::Blocked, _) => event,
                 _ => Event::RunFailed,
             };
-            match state.apply(p.pipeline, event) {
-                Ok(Transition::To(next)) => {
-                    *state = next;
-                    self.keep(p, state)?;
-                    if let Outcome::UsageLimit { resets_at } = ran.report.outcome {
-                        return Err(Stop::UsageLimit { resets_at });
-                    }
-                }
-                Ok(Transition::Parked {
-                    state: parked,
-                    reason,
-                }) => {
-                    let questions = p.questions();
-                    return Err(self.park(
-                        p,
-                        &parked,
-                        reason,
-                        &ran,
-                        Some(questions),
-                        Vec::new(),
-                        sink,
-                    ));
-                }
-                other => return Err(core_error(other)),
-            }
+            self.review_run_failed(p, state, event, &ran, sink)?;
         }
+    }
+
+    /// What a review stage's run that gave no result does to the ticket:
+    /// the core's transition for `event`, kept; a usage limit stops the
+    /// command, and the failed-run bound parks the ticket.
+    fn review_run_failed(
+        &self,
+        p: &mut Prepared,
+        state: &mut TicketState,
+        event: Event,
+        ran: &Ran,
+        sink: &mut EventSink<'_>,
+    ) -> Result<(), Stop> {
+        match state.apply(p.pipeline, event) {
+            Ok(Transition::To(next)) => {
+                *state = next;
+                self.keep(p, state)?;
+                if let Outcome::UsageLimit { resets_at } = ran.report.outcome {
+                    return Err(Stop::UsageLimit { resets_at });
+                }
+                Ok(())
+            }
+            Ok(Transition::Parked {
+                state: parked,
+                reason,
+            }) => {
+                let questions = p.questions();
+                Err(self.park(p, &parked, reason, ran, Some(questions), Vec::new(), sink))
+            }
+            other => Err(core_error(other)),
+        }
+    }
+
+    /// One run of the opt-in Codex reviewer (OWL-348): its result, or why
+    /// the pass goes on without it. It is never run again and counts toward
+    /// no failed-run bound: a usage limit, a failure, a refused result, a
+    /// `blocked` result or questions drop the seat for this pass, and a
+    /// usage limit for the command's later passes too. Two guardrails stay
+    /// any run's: the ticket's budget is checked first, and a run that broke
+    /// isolation is a failed review run, which the core parks.
+    fn codex_review_run(
+        &self,
+        p: &mut Prepared,
+        harness: &dyn Harness,
+        state: &mut TicketState,
+        brief: &Brief,
+        sink: &mut EventSink<'_>,
+    ) -> Result<Result<(Ran, RunResult), String>, Stop> {
+        let (ran, event) = self.run_role_once(
+            p,
+            (harness, &[]),
+            state,
+            brief,
+            1,
+            &mut Gathered::default(),
+            sink,
+        )?;
+        if let (Event::Completed, Some(result)) = (event, ran.result()) {
+            let result = result.clone();
+            return Ok(Ok((ran, result)));
+        }
+        if event == Event::Quarantined {
+            self.review_run_failed(p, state, event, &ran, sink)?;
+            return Ok(Err("Codex's run broke isolation.".to_owned()));
+        }
+        let reason = codex_drop_reason(&ran.report.outcome, event);
+        if matches!(ran.report.outcome, Outcome::UsageLimit { .. }) {
+            p.codex = CodexSeat::Dropped(reason.clone());
+        }
+        Ok(Err(reason))
     }
 
     /// Runs the design role at Design until its plan is kept, an approval is
@@ -1468,6 +1528,7 @@ impl OnDemand<'_> {
                     head: None,
                     plan: None,
                     revision: Some(ran.run.clone()),
+                    dropped: None,
                 },
             );
             review.validate().map_err(|e| {
@@ -1517,7 +1578,10 @@ impl OnDemand<'_> {
     /// One review pass at `stage`, Design review or Verify, shared by both
     /// (OWL-303, OWL-304): each seat of the roster on Claude Code, on the
     /// reviewers' routing, another model than the author's when one is
-    /// configured (OWL-347); the arbiter when the pass has findings the project confirms so; the pass settled by the
+    /// configured (OWL-347); then the opt-in Codex reviewer, or the reason
+    /// the pass runs without it, kept as the pass's `dropped` (OWL-348); the
+    /// arbiter when the pass has findings the project confirms so; the pass
+    /// settled by the
     /// core; its `ruling`, `pass` and `residue` events, `next` naming what
     /// each outcome leads to; and the review record with the pass, checked,
     /// not kept yet. The seats read `plan` and, at Verify, `diff`; from pass
@@ -1553,24 +1617,30 @@ impl OnDemand<'_> {
         let model = claude_model(models, routed.routing.tier);
         let seats = roster::roster(p.pipeline.variant(), stage);
         let earlier = earlier_findings(p.review.as_ref(), stage, pass);
-        let mut outputs: Vec<SeatOutput> = Vec::new();
-        let mut last_run = None;
-        let mut cost = Some(0.0_f64);
-        for seat in seats {
-            let harness = router.harness(routed.routing);
+        let seat_brief = |p: &Prepared, mandates: &[Mandate]| -> Result<Brief, Stop> {
             let comments = self.comments(&ticket)?;
             let mut brief = self.brief(p, role, &comments, &dispatched.rules, None, &current);
             brief.plan = plan.clone();
             brief.review = Some(ReviewBrief {
-                mandates: seat.mandates.to_vec(),
+                mandates: mandates.to_vec(),
                 pass: pass_id,
                 diff: diff.clone(),
                 since: since.clone(),
                 earlier: earlier.clone(),
             });
+            Ok(brief)
+        };
+        let mut outputs: Vec<SeatOutput> = Vec::new();
+        let mut routings: Vec<RunRouting> = Vec::new();
+        let mut last_run = None;
+        let mut cost = Some(0.0_f64);
+        for seat in seats {
+            let harness = router.harness(routed.routing);
+            let brief = seat_brief(p, seat.mandates)?;
             let (ran, result) = self.review_run(p, &*harness, state, &brief, sink)?;
             last_run = Some(ran.run.clone());
             cost = cost.zip(run_cost(&ran)).map(|(sum, run)| sum + run);
+            routings.push(routed.routing);
             outputs.push(SeatOutput {
                 reviewer: Reviewer {
                     role,
@@ -1583,6 +1653,87 @@ impl OnDemand<'_> {
                 same_model: routed.same_model,
                 findings: result.findings,
             });
+        }
+        // The opt-in Codex reviewer, after the roster's seats (OWL-348). Its
+        // cost, which Codex does not report, stays out of the pass's sum, so
+        // a Codex seat leaves the chain's figure known (OWL-342).
+        let mut dropped = None;
+        if let Some(codex) = self.codex {
+            let seat = roster::CODEX_REVIEWER;
+            let reason = match p.codex.clone() {
+                CodexSeat::Off => None,
+                CodexSeat::Dropped(why) => Some(why),
+                CodexSeat::Ready => {
+                    let routing = codex_reviewer_routing(dispatched.routing);
+                    let model = codex_model(models, routing.tier);
+                    let router = if stage == Stage::Verify {
+                        codex.verify
+                    } else {
+                        codex.design_review
+                    };
+                    let harness = router.harness(routing);
+                    let brief = seat_brief(p, seat.mandates)?;
+                    match self.codex_review_run(p, &*harness, state, &brief, sink)? {
+                        Ok((ran, result)) => {
+                            let run = ran.run.clone();
+                            let mut findings = result.findings;
+                            // The pass keeps the roster's findings whole:
+                            // Codex's fill the room left.
+                            let room = MAX_PASS_FINDINGS
+                                .saturating_sub(outputs.iter().map(|o| o.findings.len()).sum());
+                            if findings.len() > room {
+                                sink.emit(
+                                    &ticket,
+                                    Some(&run),
+                                    EventKind::Warning,
+                                    data([
+                                        ("what", json!("codex_findings_cut")),
+                                        ("stage", json!(stage_key)),
+                                        ("pass", json!(pass)),
+                                        ("found", json!(findings.len())),
+                                        ("kept", json!(room)),
+                                    ]),
+                                );
+                                findings.truncate(room);
+                            }
+                            last_run = Some(run);
+                            routings.push(routing);
+                            outputs.push(SeatOutput {
+                                reviewer: Reviewer {
+                                    role,
+                                    mandates: seat.mandates.to_vec(),
+                                    harness: routing.harness,
+                                    model: model.unwrap_or("default").to_owned(),
+                                    same_model: false,
+                                },
+                                model: model.map(str::to_owned),
+                                same_model: false,
+                                findings,
+                            });
+                            None
+                        }
+                        Err(why) => Some(why),
+                    }
+                }
+            };
+            if let Some(reason) = reason {
+                sink.emit(
+                    &ticket,
+                    None,
+                    EventKind::Warning,
+                    data([
+                        ("what", json!("codex_reviewer_dropped")),
+                        ("stage", json!(stage_key)),
+                        ("pass", json!(pass)),
+                        ("reason", json!(reason)),
+                    ]),
+                );
+                dropped = Some(DroppedReviewer {
+                    harness: HarnessKind::Codex,
+                    mandates: seat.mandates.to_vec(),
+                    reason,
+                });
+            }
         }
         let confirmation = self.config.pipeline.findings();
         let mut findings = pass_findings(&outputs, None);
@@ -1633,33 +1784,40 @@ impl OnDemand<'_> {
             settle_pass(stage, pass, &mut findings, confirmation).expect("a review stage settles");
         let reviewers_data: Vec<Value> = outputs
             .iter()
-            .map(|output| {
+            .zip(&routings)
+            .map(|(output, routing)| {
                 json!({
                     "mandates": output.reviewer.mandates,
                     "harness": harness_key(output.reviewer.harness),
-                    "tier": routed.routing.tier,
-                    "effort": routed.routing.effort,
+                    "tier": routing.tier,
+                    "effort": routing.effort,
                     "model": output.model,
                     "same_model": output.same_model,
                     "findings": output.findings.len(),
                 })
             })
             .collect();
-        sink.emit(
-            &ticket,
-            last_run.as_deref(),
-            EventKind::Decision,
-            data([
-                ("review", json!("pass")),
-                ("stage", json!(stage_key)),
-                ("pass", json!(pass)),
-                ("outcome", json!(outcome_name(verdict.outcome))),
-                ("next", json!(next(verdict.outcome))),
-                ("findings", json!(findings.len())),
-                ("standing", json!(standing(&findings, confirmation).len())),
-                ("reviewers", json!(reviewers_data)),
-            ]),
-        );
+        let mut pass_data = data([
+            ("review", json!("pass")),
+            ("stage", json!(stage_key)),
+            ("pass", json!(pass)),
+            ("outcome", json!(outcome_name(verdict.outcome))),
+            ("next", json!(next(verdict.outcome))),
+            ("findings", json!(findings.len())),
+            ("standing", json!(standing(&findings, confirmation).len())),
+            ("reviewers", json!(reviewers_data)),
+        ]);
+        if let Some(dropped) = &dropped {
+            pass_data.insert(
+                "dropped".to_owned(),
+                json!({
+                    "harness": harness_key(dropped.harness),
+                    "mandates": dropped.mandates,
+                    "reason": dropped.reason,
+                }),
+            );
+        }
+        sink.emit(&ticket, last_run.as_deref(), EventKind::Decision, pass_data);
         if verdict.outcome != PassOutcome::Revise {
             // Design review notes a `minor` for the Build (OWL-356); what a
             // last pass leaves goes to its author's last run, and Verify's
@@ -1710,6 +1868,7 @@ impl OnDemand<'_> {
                     .filter(|_| stage == Stage::DesignReview)
                     .map(|given| plan_print(&given.plan)),
                 revision: None,
+                dropped,
             },
         );
         review.validate().map_err(|e| {
@@ -1904,6 +2063,7 @@ impl OnDemand<'_> {
             findings: findings.clone(),
             earlier,
             revision,
+            dropped: dropped_passes(&loop_passes(&review, Stage::DesignReview, pass)),
             next: if event == Event::Completed {
                 PlanNext::Build
             } else {
@@ -2093,6 +2253,7 @@ impl OnDemand<'_> {
                     reviewers: kept.reviewers.iter().map(PlanReviewer::from).collect(),
                     findings: kept.findings.clone(),
                     revision: kept.revision.is_some(),
+                    dropped: kept.dropped.clone(),
                 })
                 .collect(),
         };
@@ -2201,6 +2362,33 @@ impl OnDemand<'_> {
             ]),
         );
         Ok(next)
+    }
+}
+
+/// Why the opt-in Codex reviewer's run leaves its pass without it
+/// (OWL-348), in the runner's words: never the harness's output, which the
+/// tracker would publish.
+fn codex_drop_reason(outcome: &Outcome, event: Event) -> String {
+    match outcome {
+        Outcome::UsageLimit { resets_at } => match resets_at {
+            Some(at) => format!("Codex reached its usage limit, until {at}."),
+            None => "Codex reached its usage limit.".to_owned(),
+        },
+        Outcome::Failed(Failure::TimedOut) => "Codex's run outlived its deadline.".to_owned(),
+        Outcome::Failed(Failure::Credentials(_)) => {
+            "Codex's run loaded something that hands it a credential.".to_owned()
+        }
+        Outcome::Failed(Failure::Harness(_) | Failure::Driver(_)) => {
+            "Codex's run failed, or Owlshift stopped it.".to_owned()
+        }
+        Outcome::Failed(Failure::NoResult) => "Codex's run left no result.".to_owned(),
+        Outcome::Failed(_) => "Codex's result was refused.".to_owned(),
+        Outcome::Quarantined(_) => "Codex's run broke isolation.".to_owned(),
+        Outcome::Finished { .. } => match event {
+            Event::Questions => "Codex's run asked questions, which a reviewer may not.".to_owned(),
+            Event::Blocked => "Codex's run ended blocked.".to_owned(),
+            _ => "Codex's run gave no review.".to_owned(),
+        },
     }
 }
 
@@ -2375,6 +2563,7 @@ mod tests {
                     head: None,
                     plan: None,
                     revision: None,
+                    dropped: None,
                 })
                 .collect(),
             ..TicketReview::new()

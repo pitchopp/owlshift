@@ -99,6 +99,35 @@
         "basis"
       ]
     },
+    "DroppedReviewer": {
+      "description": "A reviewer a pass ran without (OWL-348): the opt-in Codex reviewer, when\nCodex could not serve the pass. The reason is the runner's own words,\nnever a harness's output.",
+      "type": "object",
+      "properties": {
+        "harness": {
+          "$ref": "#/$defs/Harness"
+        },
+        "mandates": {
+          "description": "The mandates it would have held, at least one, each once.",
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/Mandate"
+          },
+          "minItems": 1
+        },
+        "reason": {
+          "description": "Why it did not review the pass: not blank, at most\n[`MAX_DROPPED_REASON_CHARS`] characters.",
+          "type": "string",
+          "maxLength": 500,
+          "pattern": "\\S"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "harness",
+        "mandates",
+        "reason"
+      ]
+    },
     "Finding": {
       "description": "A finding of a review run (architecture section 5, \"Design review\").\nEvery text is not blank.",
       "type": "object",
@@ -543,6 +572,17 @@
       "description": "One review pass: the roster's findings on the plan or the diff.",
       "type": "object",
       "properties": {
+        "dropped": {
+          "description": "The opt-in Codex reviewer the pass ran without (OWL-348,\n`pipeline.codex_reviewer`), and why: the PLAN comment and the\nDELIVERY report say so. Never on a pass that names a Codex reviewer.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/DroppedReviewer"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "findings": {
           "description": "The findings of every reviewer of the pass, ids increasing, at most\n[`MAX_PASS_FINDINGS`].",
           "type": "array",

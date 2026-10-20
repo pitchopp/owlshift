@@ -691,6 +691,30 @@ pub struct ReviewPass {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(regex(pattern = r"\S"))]
     pub revision: Option<String>,
+    /// The opt-in Codex reviewer the pass ran without (OWL-348,
+    /// `pipeline.codex_reviewer`), and why: the PLAN comment and the
+    /// DELIVERY report say so. Never on a pass that names a Codex reviewer.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dropped: Option<DroppedReviewer>,
+}
+
+/// The most characters a dropped reviewer's reason holds.
+pub const MAX_DROPPED_REASON_CHARS: usize = 500;
+
+/// A reviewer a pass ran without (OWL-348): the opt-in Codex reviewer, when
+/// Codex could not serve the pass. The reason is the runner's own words,
+/// never a harness's output.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct DroppedReviewer {
+    pub harness: Harness,
+    /// The mandates it would have held, at least one, each once.
+    #[schemars(length(min = 1))]
+    pub mandates: Vec<Mandate>,
+    /// Why it did not review the pass: not blank, at most
+    /// [`MAX_DROPPED_REASON_CHARS`] characters.
+    #[schemars(regex(pattern = r"\S"), length(max = MAX_DROPPED_REASON_CHARS))]
+    pub reason: String,
 }
 
 /// A plan's print (OWL-356): the SHA-256 of each part's
@@ -905,7 +929,10 @@ impl TicketReview {
     /// `head` only at Verify, a full commit id, and its plan print only at
     /// Design review, 9 part hashes and a hash per step in lowercase hex; a
     /// pass's `revision` only at Design review, a name written exactly,
-    /// with no reviewer, finding or print (OWL-377); and `last_fix` names
+    /// with no reviewer, finding or print (OWL-377); a pass's `dropped`
+    /// reviewer with its mandates distinct and a reason neither blank nor
+    /// over [`MAX_DROPPED_REASON_CHARS`], on a pass that keeps no revision
+    /// and names no reviewer on its harness (OWL-348); and `last_fix` names
     /// the record's last pass, at Design review or Verify (OWL-356,
     /// OWL-377).
     ///
@@ -979,6 +1006,26 @@ impl TicketReview {
                     return invalid(format!(
                         "{at} keeps a revision, which no reviewer reviewed, with reviewers, \
                          findings or a plan's print"
+                    ));
+                }
+            }
+            if let Some(dropped) = &pass.dropped {
+                check_mandates(Self::CONTRACT, &dropped.mandates)?;
+                if dropped.reason.trim().is_empty()
+                    || dropped.reason.chars().count() > MAX_DROPPED_REASON_CHARS
+                {
+                    return invalid(format!(
+                        "{at} drops a reviewer with a reason that is blank or longer than \
+                         {MAX_DROPPED_REASON_CHARS} characters"
+                    ));
+                }
+                if pass.revision.is_some() {
+                    return invalid(format!("{at} keeps a revision and drops a reviewer"));
+                }
+                if pass.reviewers.iter().any(|r| r.harness == dropped.harness) {
+                    return invalid(format!(
+                        "{at} drops a reviewer on {:?} and names one",
+                        dropped.harness
                     ));
                 }
             }
@@ -1486,6 +1533,35 @@ mod tests {
         document["passes"][1]["revision"] = " ".into();
         let error = TicketReview::parse(&document.to_string()).unwrap_err();
         assert!(error.to_string().contains("the revision of"), "{error}");
+    }
+
+    /// OWL-348: a pass keeps the opt-in Codex reviewer it ran without, with
+    /// the runner's reason, never beside a Codex reviewer it names.
+    #[test]
+    fn a_pass_keeps_the_codex_reviewer_it_dropped_and_why() {
+        let dropped = |reason: &str, codex_reviewer: bool| {
+            let mut document = ticket_review();
+            document["passes"][0]["dropped"] =
+                json!({ "harness": "codex", "mandates": ["critic"], "reason": reason });
+            if codex_reviewer {
+                document["passes"][0]["reviewers"][0]["harness"] = "codex".into();
+            }
+            TicketReview::parse(&document.to_string()).map_err(|e| e.to_string())
+        };
+        let kept = dropped("Codex reached its usage limit.", false).unwrap();
+        let reviewer = kept.passes[0].dropped.as_ref().unwrap();
+        assert_eq!(
+            (reviewer.harness, reviewer.mandates.as_slice()),
+            (Harness::Codex, &[Mandate::Critic][..])
+        );
+        assert_eq!(TicketReview::parse(&kept.render()).unwrap(), kept);
+        let long = "x".repeat(MAX_DROPPED_REASON_CHARS + 1);
+        for reason in [" ", long.as_str()] {
+            let error = dropped(reason, false).unwrap_err();
+            assert!(error.contains("blank or longer"), "{error}");
+        }
+        let error = dropped("Codex reached its usage limit.", true).unwrap_err();
+        assert!(error.contains("names one"), "{error}");
     }
 
     #[test]

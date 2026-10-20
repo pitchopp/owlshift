@@ -50,7 +50,7 @@ use owlshift_runner::executor::harness::ClaudeHarness;
 use owlshift_runner::executor::{
     Git, Harness, HarnessEnd, HarnessError, HarnessRun, RUN_DIR, RunLog,
 };
-use owlshift_runner::on_demand::{self, Delivered, Landed, OnDemand, Stop};
+use owlshift_runner::on_demand::{self, CodexReviewer, Delivered, Landed, OnDemand, Stop};
 use owlshift_runner::project::{self, ProjectDirs};
 use owlshift_runner::quarantine;
 use owlshift_runner::routing::{ClaudeRouter, Router};
@@ -792,6 +792,10 @@ struct Bench {
     /// The verify seats play from the bench's reply queue, as every other
     /// run does; otherwise they review clean ([`CleanReview`], OWL-304).
     verify_plays: Cell<bool>,
+    /// The opt-in Codex reviewer (OWL-348): `None` when the project does
+    /// not ask for it; else what its readiness check answers, a seat that
+    /// plays from the bench's reply queue when ready.
+    codex: RefCell<Option<Result<(), String>>>,
     /// Each line the runner's notifier showed (OWL-368).
     notified: Notified,
 }
@@ -932,6 +936,7 @@ impl Bench {
             reactions: RefCell::default(),
             routed: Rc::default(),
             verify_plays: Cell::new(false),
+            codex: RefCell::new(None),
             notified: Notified::default(),
         }
     }
@@ -1330,6 +1335,12 @@ impl Bench {
         } else {
             &clean
         };
+        let codex_ready = || self.codex.borrow().clone().unwrap_or(Ok(()));
+        let codex = self.codex.borrow().is_some().then_some(CodexReviewer {
+            design_review: &harness,
+            verify: &harness,
+            ready: &codex_ready,
+        });
         // The executor's credential probes run the real gh on `github.com`.
         gh::warm_up(&self.env.agent_parent());
         let env = self.env.clone();
@@ -1376,6 +1387,7 @@ impl Bench {
             design: &harness,
             design_review: &harness,
             verify,
+            codex,
             arbiter: &harness,
             answer_check: &harness,
             resolver: &harness,
@@ -2624,6 +2636,7 @@ fn a_do_whose_agent_cannot_run_is_refused_before_anything() {
         design: &router,
         design_review: &router,
         verify: &router,
+        codex: None,
         arbiter: &router,
         answer_check: &harness,
         resolver: &router,
@@ -2704,6 +2717,7 @@ fn a_git_older_than_the_floor_is_refused_before_the_lock_and_the_tracker() {
         design: &router,
         design_review: &router,
         verify: &router,
+        codex: None,
         arbiter: &router,
         answer_check: &harness,
         resolver: &router,

@@ -823,6 +823,89 @@ fn a_design_review_pass_with_only_minors_goes_to_build_with_its_notes() {
     );
 }
 
+/// OWL-348: with `pipeline.codex_reviewer` on and Codex ready, each pass
+/// runs its Claude Code seats, then a Codex reviewer on the critic's
+/// mandate, on the standard tier; its finding is numbered after theirs and
+/// ruled with them, and the pass event, the review record, the plan's
+/// document and the DELIVERY report name it on Codex.
+#[test]
+fn the_opt_in_codex_reviewer_joins_each_pass_after_the_claude_code_seats() {
+    let bench = Bench::of("standard");
+    *bench.codex.borrow_mut() = Some(Ok(()));
+    let replies = vec![
+        bench.read(&designed(PLAN)),
+        bench.read(&reviewed(&[])),
+        bench.read(&reviewed(&[])),
+        bench.read(&reviewed(&[("minor", "Codex: name the file's encoding.")])),
+        bench.read(&ruled(&["confirmed"])),
+        bench.built(),
+        // Verify: the critic reviews clean on the bench, then Codex.
+        bench.read(&reviewed(&[])),
+    ];
+    let (outcome, printed) = bench.run(replies, None);
+    outcome.unwrap_or_else(|stop| panic!("{stop}\n{printed}"));
+    use Role::{Arbiter, Build, Design, DesignReview, Verify};
+    assert_eq!(
+        bench.roles(),
+        [
+            Design,
+            DesignReview,
+            DesignReview,
+            DesignReview,
+            Arbiter,
+            Build,
+            Verify,
+            Verify
+        ]
+    );
+    let briefs = bench.briefs();
+    let mandates = |n: usize| briefs[n].review.as_ref().unwrap().mandates.clone();
+    assert_eq!(mandates(3), [Mandate::Critic], "Codex holds the critic's");
+    assert_eq!(mandates(7), [Mandate::Critic]);
+    let codex: Vec<(HarnessKind, Tier)> = bench
+        .routed()
+        .iter()
+        .filter(|routing| routing.harness == HarnessKind::Codex)
+        .map(|routing| (routing.harness, routing.tier))
+        .collect();
+    assert_eq!(
+        codex,
+        [(HarnessKind::Codex, Tier::Standard); 2],
+        "one Codex seat a pass"
+    );
+    let review = bench.record().review.unwrap();
+    let design = &review.passes[0];
+    let harnesses: Vec<HarnessKind> = design.reviewers.iter().map(|r| r.harness).collect();
+    assert_eq!(
+        harnesses,
+        [HarnessKind::Claude, HarnessKind::Claude, HarnessKind::Codex]
+    );
+    assert_eq!(design.reviewers[2].model, "default");
+    assert!(!design.reviewers[2].same_model);
+    assert!(design.dropped.is_none());
+    let found = &design.findings[0];
+    assert_eq!(
+        (found.finding.id.as_str(), found.reviewer.harness),
+        ("F1", HarnessKind::Codex)
+    );
+    let passes = bench.decisions("review");
+    let pass = passes.iter().find(|d| d["review"] == "pass").unwrap();
+    assert_eq!(pass["reviewers"][2]["harness"], "codex");
+    assert_eq!(pass["reviewers"][2]["tier"], "standard");
+    assert!(pass.get("dropped").is_none());
+    let plan = bench.plan_document();
+    assert!(
+        plan.contains("- critic on Codex (its default model)"),
+        "{plan}"
+    );
+    let report = bench.comments().pop().unwrap();
+    assert!(
+        report.contains("- critic on Codex (its default model)"),
+        "{report}"
+    );
+    assert!(!report.contains("without the Codex reviewer"), "{report}");
+}
+
 /// OWL-356: the pass after a revision is told what changed since pass 1,
 /// the step whose text is new and the parts that changed, and pass 1's
 /// findings, the major fixed and the minor noted; the Build gets the note.

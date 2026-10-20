@@ -20,17 +20,20 @@ use owlshift_contracts::ids::TicketId;
 use owlshift_contracts::{Role, Tier};
 use owlshift_platform::keychain::{Keychain, KeychainError};
 use owlshift_runner::agent_env::AgentEnv;
+use owlshift_runner::codex_machine::codex_critic;
 use owlshift_runner::config::{Effective, FileState};
 use owlshift_runner::events::{EventLog, EventSink, printable};
+use owlshift_runner::executor::CodexHarness;
+use owlshift_runner::executor::codex::user_login;
 use owlshift_runner::executor::harness::{CLAUDE_AGENT_ACCOUNT, ClaudeHarness};
 use owlshift_runner::notify::{self, DesktopNotifier};
-use owlshift_runner::on_demand::{self, Delivered, OnDemand, Stop};
+use owlshift_runner::on_demand::{self, CodexReviewer, Delivered, OnDemand, Stop};
 use owlshift_runner::project::{self, ProjectDirs};
 use owlshift_runner::roles::{
     ANSWER_CHECK_ROLE, ARBITER_ROLE, BUILD_ROLE, DESIGN_REVIEW_ROLE, DESIGN_ROLE, INTAKE_ROLE,
     REBASE_ROLE, RESOLVER_ROLE, VERIFY_ROLE,
 };
-use owlshift_runner::routing::{ClaudeRouter, claude_model};
+use owlshift_runner::routing::{ClaudeRouter, CodexRouter, claude_model};
 use owlshift_runner::system::System;
 use owlshift_runner::watch::{POLL_INTERVAL, Watch, drain_refusal};
 use owlshift_runner::{forge, secrets, tracker};
@@ -250,7 +253,37 @@ fn run_with(
     let reviewer = routed(&design_review_prompt);
     let verifier = routed(&verify_prompt);
     let arbiter = routed(&arbiter_prompt);
+    // The opt-in Codex reviewer (OWL-348), with each review stage's prompt,
+    // when the project asks for it: whether Codex can serve is asked again
+    // at each command's start, so a `codex login` made while `owlshift
+    // watch` runs counts at its next command. A `codex` missing now is
+    // missing for this process, its program being found here.
+    let codex_program = system.locate("codex");
+    let codex_login = user_login(&agent).unwrap_or_default();
+    let codex_router = |prompt: &str| CodexRouter {
+        harness: CodexHarness {
+            program: codex_program
+                .clone()
+                .unwrap_or_else(|| PathBuf::from("codex")),
+            prompt: prompt.to_owned(),
+            model: None,
+            effort: None,
+            login: codex_login.clone(),
+        },
+        models: project.models.clone(),
+    };
+    let codex_design_review = codex_router(&design_review_prompt);
+    let codex_verify = codex_router(&verify_prompt);
     let executor = on_demand::executor(git, agent);
+    let codex_ready = || match &codex_program {
+        Some(_) => codex_critic(system, &executor.agent).map(|_| ()),
+        None => Err("`codex` was not on the PATH when this command started".to_owned()),
+    };
+    let codex = project.pipeline.codex_reviewer().then_some(CodexReviewer {
+        design_review: &codex_design_review,
+        verify: &codex_verify,
+        ready: &codex_ready,
+    });
     let dirs = ProjectDirs::new(&data_dir, &repo);
     let desktop = notify::desktop_enabled(&config.personal)
         .then(|| DesktopNotifier::for_this_machine(system))
@@ -265,6 +298,7 @@ fn run_with(
         design: &design,
         design_review: &reviewer,
         verify: &verifier,
+        codex,
         arbiter: &arbiter,
         answer_check: &check,
         resolver: &resolver,

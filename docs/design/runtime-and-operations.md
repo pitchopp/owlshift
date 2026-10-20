@@ -79,7 +79,7 @@ owlshift start --at-login    # plain `start` runs for this session only
 owlshift uninstall --purge   # --purge also removes history and worktrees
 ```
 
-Prerequisites: git 2.39.0 or later (OWL-199; `owlshift doctor` fails below it, `owlshift do` and `continue` refuse before taking the project lock, and the build plan records why), and Claude Code (`claude`) installed, which runs every role, reviewers included (OWL-347). Codex is optional and runs no role for now; a Codex run reuses the login of the user's own subscription. Claude Code only has to be installed: agent runs log in with the token of the user's subscription that `owlshift init` keeps, made with `claude setup-token`; the user's own Claude Code login is not used.
+Prerequisites: git 2.39.0 or later (OWL-199; `owlshift doctor` fails below it, `owlshift do` and `continue` refuse before taking the project lock, and the build plan records why), and Claude Code (`claude`) installed, which runs every role, reviewers included (OWL-347). Codex is optional: it runs the opt-in Codex reviewer when a project sets `pipeline.codex_reviewer` (OWL-348), and no role otherwise; a Codex run reuses the login of the user's own subscription. Claude Code only has to be installed: agent runs log in with the token of the user's subscription that `owlshift init` keeps, made with `claude setup-token`; the user's own Claude Code login is not used.
 
 **Against lingering services:**
 

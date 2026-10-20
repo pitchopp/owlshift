@@ -5,7 +5,9 @@
 //!
 //! The first three layers are here; the machine's changes nothing in P5,
 //! every run being on Claude Code, the reviewers of the roster
-//! ([`crate::roster::roster`]) included (OWL-347). Reading the `tier:` and
+//! ([`crate::roster::roster`]) included (OWL-347), but the opt-in Codex
+//! reviewer ([`codex_reviewer_routing`], OWL-348), which a Codex that
+//! cannot serve drops. Reading the `tier:` and
 //! `effort:` labels off the ticket is the runner's; the core takes their
 //! values.
 
@@ -128,6 +130,19 @@ pub fn reviewer_routing<'a>(
             effort: ticket.effort,
         },
         same_model: other.same_model,
+    }
+}
+
+/// The routing of the opt-in Codex reviewer (OWL-348,
+/// [`crate::roster::CODEX_REVIEWER`]) on a ticket routed `ticket`: Codex on
+/// the standard tier, as the Codex critic ran until OWL-347, at the
+/// ticket's effort, as every reviewer (OWL-301). Another model family than
+/// the author's, so never the author's model.
+pub fn codex_reviewer_routing(ticket: TicketRouting) -> RunRouting {
+    RunRouting {
+        harness: Harness::Codex,
+        tier: Tier::Standard,
+        effort: ticket.effort,
     }
 }
 
@@ -273,6 +288,21 @@ mod tests {
         assert_eq!(
             reviewer_routing(routed, |_| None),
             reviewer(Tier::Standard, true)
+        );
+    }
+
+    /// OWL-348: the Codex reviewer on Codex, on the standard tier whatever
+    /// the ticket's, at the ticket's effort.
+    #[test]
+    fn the_codex_reviewer_runs_on_the_standard_tier_at_the_tickets_effort() {
+        let routed = ticket(Tier::Deep, Some(Effort::High), true);
+        assert_eq!(
+            codex_reviewer_routing(routed),
+            RunRouting {
+                harness: Harness::Codex,
+                tier: Tier::Standard,
+                effort: Some(Effort::High),
+            }
         );
     }
 }

@@ -422,6 +422,10 @@ pub struct OnDemand<'a> {
     /// Runs the reviewers of Verify (`roles/verify.md`) on Claude Code, on
     /// another model than the author's (OWL-304, OWL-347).
     pub verify: &'a dyn Router,
+    /// The opt-in Codex reviewer of Design review and Verify (OWL-348):
+    /// `None` when `pipeline.codex_reviewer` is off, which the command that
+    /// builds this reads.
+    pub codex: Option<CodexReviewer<'a>>,
     /// Runs the arbiter (`roles/arbiter.md`) on its role's routing: the
     /// standard tier, without an effort (OWL-303).
     pub arbiter: &'a dyn Router,
@@ -452,6 +456,36 @@ pub struct OnDemand<'a> {
     /// machine shows no notification. Every other notification is the
     /// command's, from its outcome ([`crate::notify`]).
     pub notifier: Option<&'a dyn Notifier>,
+}
+
+/// The opt-in Codex reviewer (OWL-348, architecture section 5, "Codex"):
+/// one more seat after the roster's at every Design review and Verify pass,
+/// on the critic's mandate ([`owlshift_core::roster::CODEX_REVIEWER`]).
+#[derive(Clone, Copy)]
+pub struct CodexReviewer<'a> {
+    /// Runs it at Design review, with `roles/design_review.md`.
+    pub design_review: &'a dyn Router,
+    /// Runs it at Verify, with `roles/verify.md`.
+    pub verify: &'a dyn Router,
+    /// Whether Codex can run here, asked at each command's start, so a
+    /// Codex logged in while `owlshift watch` runs serves its next command;
+    /// otherwise why not, in the runner's words
+    /// ([`crate::codex_machine::codex_critic`]).
+    pub ready: &'a dyn Fn() -> Result<(), String>,
+}
+
+/// What the opt-in Codex reviewer is for one command of one ticket
+/// (OWL-348).
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum CodexSeat {
+    /// `pipeline.codex_reviewer` is off: no seat, nothing said.
+    Off,
+    /// Codex can run here: each pass adds its seat.
+    Ready,
+    /// Codex cannot serve this command's passes, and why: not ready at the
+    /// command's start, or its usage limit reached in an earlier pass. Each
+    /// pass runs without it and says so.
+    Dropped(String),
 }
 
 /// A ticket delivered.
@@ -1145,6 +1179,8 @@ struct Prepared {
     /// Under `owlshift watch`, the ticket that holds the project's slot when
     /// another does, which the RESUME of an answer check names (OWL-367).
     slot_held_by: Option<TicketId>,
+    /// The opt-in Codex reviewer for this command (OWL-348).
+    codex: CodexSeat,
 }
 
 impl Prepared {
@@ -1678,6 +1714,35 @@ impl OnDemand<'_> {
                 .sandbox_needs(&self.executor.agent)
                 .map_err(|e| Stop::Refused(e.to_string()))?;
         }
+        // The opt-in Codex reviewer only drops its seat when Codex cannot
+        // run here (OWL-348): nothing is refused. Both stages run the same
+        // Codex program and login with their own prompts: one check serves.
+        let codex = match &self.codex {
+            None => CodexSeat::Off,
+            Some(codex) => {
+                let routing = RunRouting {
+                    harness: owlshift_core::vocab::Harness::Codex,
+                    ..PROJECT_DEFAULT
+                };
+                // The harness's own words can name the user's paths: the
+                // reason reaches the ticket, so it says where to look.
+                let usable = (codex.ready)().and_then(|()| {
+                    codex
+                        .design_review
+                        .harness(routing)
+                        .sandbox_needs(&self.executor.agent)
+                        .map_err(|_| {
+                            "its harness cannot run in Owlshift's sandbox on this machine: \
+                             `owlshift doctor` says why"
+                                .to_owned()
+                        })
+                });
+                match usable {
+                    Ok(_) => CodexSeat::Ready,
+                    Err(why) => CodexSeat::Dropped(format!("Codex is not ready here: {why}")),
+                }
+            }
+        };
         // The ticket ref lives in the dedicated checkout: without one,
         // nothing was asked yet, and nothing is cloned to find that out.
         let checkout = self.dirs.checkout();
@@ -1768,6 +1833,7 @@ impl OnDemand<'_> {
                 self.config.pipeline.default,
             )),
             chain: Chain::default(),
+            codex,
             cost: stored
                 .as_ref()
                 .and_then(|stored| stored.record.cost.as_ref())

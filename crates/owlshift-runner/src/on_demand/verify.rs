@@ -32,7 +32,7 @@ use owlshift_contracts::review::{
 };
 use owlshift_core::review::{Fate, PassOutcome};
 
-use super::design::{self, PassRun, loop_passes, settle_pass};
+use super::design::{self, PassRun, dropped_passes, loop_passes, settle_pass};
 use super::*;
 use crate::executor::{DIFF_PATH, SINCE_PATH, write_run_diff};
 use crate::writer::ReportedReview;
@@ -205,6 +205,7 @@ pub(crate) fn reported_review(review: &TicketReview) -> Option<ReportedReview> {
             })
             .collect(),
         last_fixed,
+        dropped: dropped_passes(&passes),
     })
 }
 
@@ -573,6 +574,7 @@ mod tests {
             head: None,
             plan: None,
             revision: None,
+            dropped: None,
         }
     }
 

@@ -409,6 +409,13 @@ pub struct Pipeline {
     /// Owlshift that reads it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub findings: Option<FindingsConfirmation>,
+    /// Adds a Codex reviewer, on the critic's mandate, to every Design
+    /// review and Verify pass, beside its Claude Code reviewers (OWL-348,
+    /// architecture section 5, "Codex"): off when absent. A Codex that
+    /// cannot serve a pass drops that seat and the ticket says so; it never
+    /// stops the ticket. A file using it requires an Owlshift that reads it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub codex_reviewer: Option<bool>,
 }
 
 /// Who confirms a review finding.
@@ -430,6 +437,11 @@ impl Pipeline {
     /// Who confirms a finding: the project's choice, or the author.
     pub fn findings(&self) -> FindingsConfirmation {
         self.findings.unwrap_or_default()
+    }
+
+    /// Whether the review passes add the opt-in Codex reviewer (OWL-348).
+    pub fn codex_reviewer(&self) -> bool {
+        self.codex_reviewer.unwrap_or(false)
     }
 }
 
