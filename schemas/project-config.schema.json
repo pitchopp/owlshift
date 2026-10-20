@@ -109,7 +109,7 @@
           "const": "none"
         },
         {
-          "description": "What the resolver observes offline in the worktree.",
+          "description": "What the resolver checks in the repository and its history.",
           "type": "string",
           "const": "facts"
         },

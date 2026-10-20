@@ -191,7 +191,7 @@
       "description": "What a resolver's decision rests on (OWL-328): the runner allows a kind\nby the project's delegation level ([`DelegationLevel::allows`]).",
       "oneOf": [
         {
-          "description": "Observed in the worktree, offline: a file, an existing pattern, a\ndocumented behaviour.",
+          "description": "Checked in the repository and its history: a file, an existing\npattern, a documented behaviour.",
           "type": "string",
           "const": "fact"
         },
