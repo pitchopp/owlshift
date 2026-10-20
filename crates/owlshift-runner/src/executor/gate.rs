@@ -556,13 +556,6 @@ fn agent_git_args<'a>(args: &[&'a str]) -> Vec<&'a str> {
 
 /// What the project's setup came to before a Build's harness
 /// ([`run_setup`], OWL-330).
-#[cfg_attr(
-    not(test),
-    allow(
-        dead_code,
-        reason = "used by the executor from the next step of OWL-330"
-    )
-)]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct SetupRun {
     /// The setup's report: its steps in `setup`, no gate command, its failure
@@ -584,26 +577,12 @@ impl SetupRun {
     /// 3): only on a worktree that holds the Build's own work, and only for
     /// the command's own failure, the work left as it was. A passed setup
     /// is not recoverable: there is nothing to recover from.
-    #[cfg_attr(
-        not(test),
-        allow(
-            dead_code,
-            reason = "used by the executor from the next step of OWL-330"
-        )
-    )]
     pub(crate) fn recoverable(&self) -> bool {
         self.resumed && self.fault == Some(Fault::Command)
     }
 }
 
 /// Why the setup before a harness stopped short of passing.
-#[cfg_attr(
-    not(test),
-    allow(
-        dead_code,
-        reason = "used by the executor from the next step of OWL-330"
-    )
-)]
 enum SetupStop {
     /// A failure, and whose it is when a command failed.
     Failed(GateFailure, Option<Fault>),
@@ -636,13 +615,6 @@ impl From<Stop> for SetupStop {
 /// a moved HEAD as the gate says it. `base_commit` is the run's base, a
 /// commit id: the worktree holds the Build's own work when status lists an
 /// entry or HEAD is neither it nor an ancestor of it.
-#[cfg_attr(
-    not(test),
-    allow(
-        dead_code,
-        reason = "used by the executor from the next step of OWL-330"
-    )
-)]
 #[allow(
     clippy::too_many_arguments,
     reason = "one setup run's inputs, each its own"
@@ -687,13 +659,6 @@ pub(crate) fn run_setup(
     run
 }
 
-#[cfg_attr(
-    not(test),
-    allow(
-        dead_code,
-        reason = "used by the executor from the next step of OWL-330"
-    )
-)]
 #[allow(clippy::too_many_arguments, reason = "run_setup's inputs, passed on")]
 fn check_and_set_up(
     git: &Git,
@@ -760,13 +725,6 @@ fn check_and_set_up(
 /// What a setup must leave as it found it before a Build's harness
 /// (OWL-330): HEAD, the index, and every path `git status` lists with its
 /// code and its content on disk. Ignored files are outside it.
-#[cfg_attr(
-    not(test),
-    allow(
-        dead_code,
-        reason = "used by the executor from the next step of OWL-330"
-    )
-)]
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct WorktreeState {
     head: String,
@@ -780,13 +738,6 @@ struct WorktreeState {
 impl WorktreeState {
     /// The paths whose index entries, status or content differ between
     /// `self` and `after`, each once, as text.
-    #[cfg_attr(
-        not(test),
-        allow(
-            dead_code,
-            reason = "used by the executor from the next step of OWL-330"
-        )
-    )]
     fn changed(&self, after: &Self) -> Vec<String> {
         let mut paths: BTreeSet<&Vec<u8>> = BTreeSet::new();
         for (one, other) in [(self, after), (after, self)] {
@@ -812,13 +763,6 @@ impl WorktreeState {
 
 /// What is on disk at a path status lists, read by the runner itself, never
 /// through git: no filter, textconv or diff driver the worktree names runs.
-#[cfg_attr(
-    not(test),
-    allow(
-        dead_code,
-        reason = "used by the executor from the next step of OWL-330"
-    )
-)]
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum OnDisk {
     /// A regular file: its content's SHA-256, and whether it is executable
@@ -838,13 +782,6 @@ enum OnDisk {
 /// Reads the worktree's state ([`WorktreeState`]) with git run as the agent,
 /// filter drivers off for the status as the gate reads it, and the index
 /// read as it is: `ls-files` runs no filter and looks into no submodule.
-#[cfg_attr(
-    not(test),
-    allow(
-        dead_code,
-        reason = "used by the executor from the next step of OWL-330"
-    )
-)]
 fn worktree_state(git: &Git, worktree: &Path) -> Result<WorktreeState, GateFailure> {
     let head = head(git, worktree)?;
     let listing = git
@@ -882,13 +819,6 @@ fn worktree_state(git: &Git, worktree: &Path) -> Result<WorktreeState, GateFailu
 
 /// What is on disk at `path`, as status wrote it, in `worktree`: each folder
 /// above it is checked first, and none that is a link is followed.
-#[cfg_attr(
-    not(test),
-    allow(
-        dead_code,
-        reason = "used by the executor from the next step of OWL-330"
-    )
-)]
 fn on_disk(worktree: &Path, path: &[u8]) -> io::Result<OnDisk> {
     let relative = path_from_bytes(path);
     let parts: Vec<_> = relative.components().collect();
@@ -928,13 +858,6 @@ fn on_disk(worktree: &Path, path: &[u8]) -> io::Result<OnDisk> {
 }
 
 /// A path as git printed it: bytes on Unix, UTF-8 elsewhere.
-#[cfg_attr(
-    not(test),
-    allow(
-        dead_code,
-        reason = "used by the executor from the next step of OWL-330"
-    )
-)]
 fn path_from_bytes(path: &[u8]) -> PathBuf {
     #[cfg(unix)]
     {
@@ -949,13 +872,6 @@ fn path_from_bytes(path: &[u8]) -> PathBuf {
 
 /// Whether a file's mode lets its owner, group or others run it; always
 /// false where the system keeps no such bit.
-#[cfg_attr(
-    not(test),
-    allow(
-        dead_code,
-        reason = "used by the executor from the next step of OWL-330"
-    )
-)]
 fn executable(meta: &std::fs::Metadata) -> bool {
     #[cfg(unix)]
     {
@@ -970,13 +886,6 @@ fn executable(meta: &std::fs::Metadata) -> bool {
 }
 
 /// The SHA-256 of the file at `path`, read in chunks.
-#[cfg_attr(
-    not(test),
-    allow(
-        dead_code,
-        reason = "used by the executor from the next step of OWL-330"
-    )
-)]
 fn file_sha256(path: &Path) -> io::Result<[u8; 32]> {
     let mut file = File::open(path)?;
     let mut hasher = Sha256::new();
