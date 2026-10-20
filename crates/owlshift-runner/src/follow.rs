@@ -636,7 +636,9 @@ impl Following {
 fn unread_kind(kind: ErrorKind) -> &'static str {
     match kind {
         ErrorKind::NotFound => "not_found",
-        ErrorKind::Unauthorized => "unauthorized",
+        // A token that can no longer be refreshed is a refused one, in the
+        // warnings' fixed set (OWL-384).
+        ErrorKind::Unauthorized | ErrorKind::SignInAgain => "unauthorized",
         ErrorKind::HeadMoved => "head_moved",
         ErrorKind::RateLimited => "rate_limited",
         ErrorKind::Other => "other",

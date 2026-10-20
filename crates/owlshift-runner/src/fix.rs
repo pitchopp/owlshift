@@ -75,8 +75,10 @@ pub fn check_failure(red: Red<'_>, excerpts: &dyn Excerpts) -> Result<CheckFailu
                     (Some(text), None)
                 }
                 Err(error) => {
-                    if matches!(error.kind, ErrorKind::Unauthorized | ErrorKind::RateLimited)
-                        && refused.is_none()
+                    if matches!(
+                        error.kind,
+                        ErrorKind::Unauthorized | ErrorKind::SignInAgain | ErrorKind::RateLimited
+                    ) && refused.is_none()
                     {
                         refused = Some(error.clone());
                     }

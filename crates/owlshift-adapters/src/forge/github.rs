@@ -28,6 +28,7 @@
 
 use std::fmt;
 use std::io::{self, BufRead, BufReader, Read};
+use std::sync::{Mutex, PoisonError};
 use std::time::Duration;
 
 use serde::Deserialize;
@@ -76,8 +77,8 @@ pub struct Installation {
 }
 
 /// A GitHub token: a fine-grained or classic personal access token, or the
-/// output of `gh auth token`. It never shows in `Debug` output.
-#[derive(Clone)]
+/// access token of Owlshift's GitHub App. It never shows in `Debug` output.
+#[derive(Clone, PartialEq, Eq)]
 pub struct Token(String);
 
 impl Token {
@@ -263,10 +264,109 @@ pub struct NewPullRequest<'a> {
     pub draft: bool,
 }
 
+/// Where the GitHub App's token comes from for each request (OWL-384,
+/// architecture section 8, "The GitHub App's tokens"): the runner's refresh,
+/// which holds the keychain entry and the account lock. A failure is a
+/// forge error with its kind, [`ErrorKind::SignInAgain`] when only a new
+/// sign-in gets past it.
+pub trait TokenSource: Send {
+    /// The token to send now: the one held, refreshed first when it is past
+    /// its stored expiry.
+    fn token(&mut self) -> Result<Token, Error>;
+    /// GitHub answered HTTP 401 to `refused`: the token to send once more,
+    /// refreshed or stored meanwhile by another process; `None` when there
+    /// is none to try, and the 401 stands.
+    fn refused(&mut self, refused: &Token) -> Result<Option<Token>, Error>;
+}
+
+/// Makes the transport that sends with one token: [`HttpTransport::new`]
+/// in production, a script in tests.
+pub type Connect = Box<dyn Fn(Token) -> Box<dyn Transport + Send + Sync> + Send>;
+
+/// How a [`GitHubForge`] reaches GitHub.
+enum Channel {
+    /// A transport that holds its token: a personal token, or a replay.
+    Fixed(Box<dyn Transport + Send + Sync>),
+    /// The GitHub App's token, from its source. The lock is held for the
+    /// whole of a request and its one retry, as the Linear app's
+    /// `AppTransport` holds its own (`tracker::linear::app`): requests go
+    /// one at a time, and a refresh replaces the token once.
+    App(Mutex<AppChannel>),
+}
+
+struct AppChannel {
+    source: Box<dyn TokenSource>,
+    connect: Connect,
+    /// The transport of the token last sent, made again when it changes.
+    current: Option<(Token, Box<dyn Transport + Send + Sync>)>,
+}
+
+/// Why a request through the channel has no answer.
+enum Unanswered {
+    /// The token source failed: its error, kind and words kept.
+    Source(Error),
+    /// The transport had no HTTP answer.
+    Transport(String),
+}
+
+impl AppChannel {
+    fn transport(&mut self, token: Token) -> &dyn Transport {
+        if self.current.as_ref().is_none_or(|(held, _)| *held != token) {
+            let transport = (self.connect)(token.clone());
+            self.current = Some((token, transport));
+        }
+        let (_, transport) = self.current.as_ref().expect("set above");
+        transport.as_ref()
+    }
+
+    /// Makes `call` with the source's token and, when GitHub answers HTTP
+    /// 401 (`status`), once more with the token the source gives for it.
+    /// A 403 is never retried: it refuses a permission, not the token.
+    fn call<A>(
+        &mut self,
+        call: impl Fn(&dyn Transport) -> Result<A, String>,
+        status: impl Fn(&A) -> u16,
+    ) -> Result<A, Unanswered> {
+        let token = self.source.token().map_err(Unanswered::Source)?;
+        let answer = call(self.transport(token.clone())).map_err(Unanswered::Transport)?;
+        if status(&answer) != 401 {
+            return Ok(answer);
+        }
+        match self.source.refused(&token).map_err(Unanswered::Source)? {
+            Some(next) => call(self.transport(next)).map_err(Unanswered::Transport),
+            None => Ok(answer),
+        }
+    }
+}
+
+impl Channel {
+    fn send(&self, request: &Value) -> Result<Response, Unanswered> {
+        match self {
+            Self::Fixed(transport) => transport.send(request).map_err(Unanswered::Transport),
+            // A panic elsewhere while the lock was held leaves a channel
+            // that still works: the lock is taken back.
+            Self::App(channel) => channel
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .call(|transport| transport.send(request), |answer| answer.status),
+        }
+    }
+
+    fn get(&self, path: &str) -> Result<RestAnswer, Unanswered> {
+        match self {
+            Self::Fixed(transport) => transport.get(path).map_err(Unanswered::Transport),
+            Self::App(channel) => channel
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .call(|transport| transport.get(path), |answer| answer.status),
+        }
+    }
+}
+
 /// One GitHub repository, as seen through one token. It can open a pull
 /// request and read one; it cannot merge, close or approve.
 pub struct GitHubForge {
-    transport: Box<dyn Transport + Send + Sync>,
+    channel: Channel,
     repo: Repo,
     check_page: u32,
 }
@@ -299,7 +399,24 @@ impl GitHubForge {
     /// The adapter over another transport, such as a test replay.
     pub fn with_transport(transport: impl Transport + Send + Sync + 'static, repo: Repo) -> Self {
         Self {
-            transport: Box::new(transport),
+            channel: Channel::Fixed(Box::new(transport)),
+            repo,
+            check_page: MAX_PAGE,
+        }
+    }
+
+    /// The adapter on the GitHub App's token from `source` (OWL-384), each
+    /// token sent through the transport `connect` makes for it: a token
+    /// past its stored expiry is refreshed before the request, and a
+    /// request GitHub answers HTTP 401 is made once more with the token the
+    /// source gives for it.
+    pub fn with_app(source: impl TokenSource + 'static, connect: Connect, repo: Repo) -> Self {
+        Self {
+            channel: Channel::App(Mutex::new(AppChannel {
+                source: Box::new(source),
+                connect,
+                current: None,
+            })),
             repo,
             check_page: MAX_PAGE,
         }
@@ -662,9 +779,14 @@ impl GitHubForge {
     /// One REST read: a successful answer, or the error its status says.
     fn rest(&self, path: &str) -> Result<RestAnswer, Error> {
         let mut answer = self
-            .transport
+            .channel
             .get(path)
-            .map_err(|e| invalid(format!("GitHub could not be reached: {}", redact(&e))))?;
+            .map_err(|unanswered| match unanswered {
+                Unanswered::Source(error) => error,
+                Unanswered::Transport(e) => {
+                    invalid(format!("GitHub could not be reached: {}", redact(&e)))
+                }
+            })?;
         if (200..300).contains(&answer.status) {
             return Ok(answer);
         }
@@ -879,9 +1001,12 @@ impl GitHubForge {
     /// Sends one request and returns GitHub's answer, undecoded.
     fn send(&self, query: &str, variables: Value) -> Result<Response, Error> {
         let request = json!({ "query": query, "variables": variables });
-        self.transport
+        self.channel
             .send(&request)
-            .map_err(|e| invalid(format!("GitHub: {e}")))
+            .map_err(|unanswered| match unanswered {
+                Unanswered::Source(error) => error,
+                Unanswered::Transport(e) => invalid(format!("GitHub: {e}")),
+            })
     }
 }
 
@@ -1651,7 +1776,7 @@ impl Context {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Mutex;
+    use std::sync::{Arc, Mutex};
 
     use super::*;
 
@@ -2357,5 +2482,156 @@ mod tests {
         let error = forge.app_installation("owl-shift").unwrap_err();
         assert_eq!(error.kind, ErrorKind::Other);
         assert!(!error.message.contains("SENTINEL"), "{error}");
+    }
+
+    /// What the app channel's fakes saw, shared with the test.
+    #[derive(Default)]
+    struct AppSeen {
+        /// The token of each request, in order.
+        sent_with: Vec<String>,
+        /// The transports made, one per token change.
+        connected: u32,
+        /// The tokens the source was told were refused.
+        refused: Vec<String>,
+    }
+
+    /// A token source that gives `held` and, told of a 401, `next` (or
+    /// nothing, or an error).
+    struct FakeSource {
+        seen: Arc<Mutex<AppSeen>>,
+        held: String,
+        next: Result<Option<String>, ErrorKind>,
+    }
+
+    impl TokenSource for FakeSource {
+        fn token(&mut self) -> Result<Token, Error> {
+            Ok(Token::new(self.held.clone()))
+        }
+
+        fn refused(&mut self, refused: &Token) -> Result<Option<Token>, Error> {
+            self.seen.lock().unwrap().refused.push(refused.0.clone());
+            match self.next.clone() {
+                Ok(next) => {
+                    if let Some(next) = &next {
+                        self.held = next.clone();
+                    }
+                    Ok(next.map(Token::new))
+                }
+                Err(kind) => Err(Error::new(kind, "run `owlshift init`")),
+            }
+        }
+    }
+
+    /// A transport bound to one token: GraphQL and REST answer each
+    /// request with the next status of the shared script.
+    struct Bound {
+        token: String,
+        seen: Arc<Mutex<AppSeen>>,
+        statuses: Arc<Mutex<Vec<u16>>>,
+    }
+
+    impl Bound {
+        fn next(&self) -> u16 {
+            self.seen.lock().unwrap().sent_with.push(self.token.clone());
+            self.statuses.lock().unwrap().remove(0)
+        }
+    }
+
+    impl Transport for Bound {
+        fn send(&self, _: &Value) -> Result<Response, String> {
+            let status = self.next();
+            let readable = format!(
+                r#"{{"data":{{"repository":{{"defaultBranchRef":{{"name":"main","target":{{"oid":"{HEAD}"}}}}}}}}}}"#
+            );
+            let body = if status == 200 {
+                readable
+            } else {
+                r#"{"message":"Bad credentials"}"#.to_owned()
+            };
+            Ok(answer(status, &body))
+        }
+
+        fn get(&self, _: &str) -> Result<RestAnswer, String> {
+            Ok(RestAnswer::new(self.next(), "{}"))
+        }
+    }
+
+    fn app_forge(
+        next: Result<Option<&str>, ErrorKind>,
+        statuses: &[u16],
+    ) -> (GitHubForge, Arc<Mutex<AppSeen>>) {
+        let seen = Arc::new(Mutex::new(AppSeen::default()));
+        let source = FakeSource {
+            seen: seen.clone(),
+            held: "ghu_old".to_owned(),
+            next: next.map(|next| next.map(str::to_owned)),
+        };
+        let statuses = Arc::new(Mutex::new(statuses.to_vec()));
+        let shared = seen.clone();
+        let connect: Connect = Box::new(move |token: Token| {
+            shared.lock().unwrap().connected += 1;
+            Box::new(Bound {
+                token: token.0,
+                seen: shared.clone(),
+                statuses: statuses.clone(),
+            })
+        });
+        let repo = Repo::parse("pitchopp/owlshift").unwrap();
+        (GitHubForge::with_app(source, connect, repo), seen)
+    }
+
+    /// OWL-384: a 401 is told to the source and the request made once more
+    /// with the token it gives, on a transport made for it; the next
+    /// requests keep that token and transport. A 401 to the retry is the
+    /// answer, never a third try.
+    #[test]
+    fn the_app_channel_retries_a_401_once_with_the_sources_token() {
+        let (forge, seen) = app_forge(Ok(Some("ghu_new")), &[401, 200, 200, 401, 401]);
+        assert!(forge.default_branch().is_ok());
+        assert!(forge.default_branch().is_ok());
+        assert_eq!(
+            forge.default_branch().unwrap_err().kind,
+            ErrorKind::Unauthorized
+        );
+        let seen = seen.lock().unwrap();
+        assert_eq!(
+            seen.sent_with,
+            ["ghu_old", "ghu_new", "ghu_new", "ghu_new", "ghu_new"]
+        );
+        assert_eq!(seen.refused, ["ghu_old", "ghu_new"]);
+        assert_eq!(seen.connected, 2);
+    }
+
+    /// No token to try again: the 401 stands. A 403 refuses a permission,
+    /// not the token: the source is not told. REST reads go the same way.
+    #[test]
+    fn the_app_channel_leaves_a_403_and_a_401_with_no_other_token() {
+        let (forge, seen) = app_forge(Ok(None), &[401, 403, 401, 200]);
+        assert_eq!(
+            forge.default_branch().unwrap_err().kind,
+            ErrorKind::Unauthorized
+        );
+        assert_eq!(
+            forge.job_log_excerpt(1).unwrap_err().kind,
+            ErrorKind::Unauthorized
+        );
+        assert_eq!(seen.lock().unwrap().refused, ["ghu_old"]);
+
+        let (forge, seen) = app_forge(Ok(Some("ghu_new")), &[401, 200]);
+        // Whatever the empty answer reads as, it was read with the new token.
+        let _ = forge.check_run_output(7);
+        assert_eq!(seen.lock().unwrap().sent_with, ["ghu_old", "ghu_new"]);
+    }
+
+    /// The source's failure is the request's error, its kind kept: the
+    /// refresh-failure rule reaches the caller typed.
+    #[test]
+    fn the_app_channel_keeps_the_sources_error() {
+        let (forge, seen) = app_forge(Err(ErrorKind::SignInAgain), &[401]);
+        let error = forge.default_branch().unwrap_err();
+        assert_eq!(error.kind, ErrorKind::SignInAgain);
+        assert!(error.message.contains("`owlshift init`"), "{error}");
+        assert_eq!(seen.lock().unwrap().sent_with, ["ghu_old"]);
+        assert!(!format!("{forge:?}").contains("ghu_"), "{forge:?}");
     }
 }

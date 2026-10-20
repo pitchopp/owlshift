@@ -166,16 +166,15 @@ impl ProjectDirs {
     /// them one at a time.
     pub fn lock(&self) -> io::Result<Option<ProjectLock>> {
         fs::create_dir_all(&self.root)?;
-        let file = OpenOptions::new()
-            .create(true)
-            .write(true)
-            .truncate(false)
-            .open(self.lock_file())?;
-        match file.try_lock() {
-            Ok(()) => Ok(Some(ProjectLock { _file: file })),
-            Err(TryLockError::WouldBlock) => Ok(None),
-            Err(TryLockError::Error(error)) => Err(error),
-        }
+        Ok(try_lock_file(&self.lock_file())?.map(|file| ProjectLock { _file: file }))
+    }
+
+    /// The account lock's file beside the project's `lock`: it serialises
+    /// the refresh of the GitHub App's token and its keychain write
+    /// (architecture section 8, "The account lock";
+    /// [`crate::github_token`]).
+    pub fn account_lock_file(&self) -> PathBuf {
+        self.root.join("github-app.lock")
     }
 
     /// What the `unverified` marker says, when there is one.
@@ -209,6 +208,48 @@ impl ProjectDirs {
     /// The marker of a first clone that has not finished (OWL-80).
     pub fn unfinished_clone_file(&self) -> PathBuf {
         self.root.join("unfinished-clone")
+    }
+}
+
+/// Opens the lock file at `path`, creating it, and takes its lock without
+/// waiting: the file while it is held, `None` when another open file
+/// description holds it (`flock` on Unix, `LockFileEx` on Windows). The
+/// project's lock and the account lock share it; see [`ProjectDirs::lock`]
+/// for the window in which a child forked by another thread keeps a lock
+/// just released.
+pub(crate) fn try_lock_file(path: &Path) -> io::Result<Option<File>> {
+    let file = OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(false)
+        .open(path)?;
+    match file.try_lock() {
+        Ok(()) => Ok(Some(file)),
+        Err(TryLockError::WouldBlock) => Ok(None),
+        Err(TryLockError::Error(error)) => Err(error),
+    }
+}
+
+/// [`try_lock_file`], tried again every `poll` until `wait` has passed: a
+/// bounded wait, as a loop over the try, so a holder that crashed (the
+/// kernel drops its lock) or a forked child that has not exec'd yet is
+/// outlasted, and a holder that never lets go is reported. `None` once the
+/// wait is spent.
+pub(crate) fn lock_file_within(
+    path: &Path,
+    wait: Duration,
+    poll: Duration,
+) -> io::Result<Option<File>> {
+    let started = Instant::now();
+    loop {
+        if let Some(file) = try_lock_file(path)? {
+            return Ok(Some(file));
+        }
+        let waited = started.elapsed();
+        if waited >= wait {
+            return Ok(None);
+        }
+        thread::sleep(poll.min(wait - waited));
     }
 }
 
@@ -674,6 +715,35 @@ mod tests {
         assert!(dirs.lock().unwrap().is_none(), "a second lock waits");
         drop(held);
         assert!(dirs.lock().unwrap().is_some(), "free again once released");
+
+        // The account lock (OWL-384): the same helper, waited for within a
+        // bound, never past it, and taken as soon as it is free.
+        let account = dirs.account_lock_file();
+        assert_eq!(account, dirs.root().join("github-app.lock"));
+        let poll = Duration::from_millis(10);
+        let held = lock_file_within(&account, Duration::ZERO, poll)
+            .unwrap()
+            .expect("the account lock is free");
+        let started = Instant::now();
+        let wait = Duration::from_millis(100);
+        assert!(lock_file_within(&account, wait, poll).unwrap().is_none());
+        let waited = started.elapsed();
+        assert!(
+            waited >= wait && waited < Duration::from_secs(5),
+            "{waited:?}"
+        );
+        let release = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(50));
+            drop(held);
+        });
+        assert!(
+            lock_file_within(&account, Duration::from_secs(5), poll)
+                .unwrap()
+                .is_some(),
+            "taken once released"
+        );
+        release.join().unwrap();
+        let _project = dirs.lock().unwrap().expect("the two locks are apart");
     }
 
     #[test]

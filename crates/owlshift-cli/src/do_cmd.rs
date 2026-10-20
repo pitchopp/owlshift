@@ -8,6 +8,7 @@
 use std::io::{self, Write};
 use std::path::PathBuf;
 use std::process::ExitCode;
+use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
@@ -151,7 +152,7 @@ fn run_with(
         .map_err(|error| format!("the agent environment: {error}"))?;
 
     // From here on, the credentials: the runner's own, never an agent's.
-    let keychain = open_keychain().map_err(|error| error.to_string())?;
+    let keychain = Arc::new(open_keychain().map_err(|error| error.to_string())?);
     // The project's own secrets, or the shared ones it has none of its own
     // for, each entry read once (OWL-308).
     let mut read = |account: &str| keychain.read(account).map_err(|error| error.to_string());
@@ -185,7 +186,18 @@ fn run_with(
             "`owlshift watch --drain` needs a tracker that lists admitted tickets".to_owned(),
         );
     }
-    let forge = forge::github(&forge_secret, repo.clone())?;
+    // The GitHub App's token is refreshed under the project's account lock
+    // (OWL-384); one already expired is refreshed here, before any work.
+    let dirs = ProjectDirs::new(&data_dir, &repo);
+    let access = forge::AppAccess {
+        keychain: keychain.clone(),
+        lock: dirs.account_lock_file(),
+        app: forge::GitHubApp::from_personal(match &config.personal {
+            FileState::Loaded { config, .. } => Some(config),
+            _ => None,
+        }),
+    };
+    let forge = forge::github(&forge_secret, repo.clone(), &access)?;
     // The token agent runs log in with (OWL-94), read with the other
     // secrets and set on the harness command alone. None stored refuses the
     // run, with the fix, before anything is cloned.
@@ -284,7 +296,6 @@ fn run_with(
         verify: &codex_verify,
         ready: &codex_ready,
     });
-    let dirs = ProjectDirs::new(&data_dir, &repo);
     let desktop = notify::desktop_enabled(&config.personal)
         .then(|| DesktopNotifier::for_this_machine(system))
         .flatten();

@@ -5,13 +5,17 @@
 //! (architecture section 8). Pushing uses the user's own git credentials,
 //! as in their terminal.
 
+use std::path::PathBuf;
+use std::sync::Arc;
+
 use jiff::Timestamp;
-use owlshift_adapters::forge::github::{GitHubForge, Token};
-use owlshift_adapters::forge::github_app::{self, UserToken};
+use owlshift_adapters::forge::github::{Connect, GitHubForge, HttpTransport, Token, TokenSource};
+use owlshift_adapters::forge::github_app::{self, DeviceFlow, HttpLogin, UserToken};
 use owlshift_adapters::forge::{DefaultBranch, Error, Repo};
 use owlshift_contracts::config::PersonalConfig;
 use owlshift_platform::keychain::{Keychain, SERVICE, Secret};
 
+use crate::github_token::AppToken;
 use crate::secrets::{self, ForgeKind, ForgeSecret};
 
 /// The keychain account, under [`SERVICE`], that every project of a machine
@@ -71,53 +75,90 @@ impl GitHubApp {
 pub const GITHUB_TOKEN_HELP: &str = "a fine-grained token with pull requests (write), contents, \
      checks, commit statuses, actions and metadata (read) on the project's repository";
 
-/// The GitHub adapter for `repo`, with the token `found`: `owlshift do`
-/// opens the pull request and reads the check set the
-/// [writer](crate::writer) reports with it; `owlshift init` stores the
-/// token.
-pub fn github(found: &ForgeSecret<Secret>, repo: Repo) -> Result<GitHubForge, String> {
-    github_at(found, repo, Timestamp::now())
+/// What the GitHub App's token is refreshed with (OWL-384): the keychain it
+/// is stored in, the project's account lock file
+/// ([`ProjectDirs::account_lock_file`](crate::project::ProjectDirs::account_lock_file))
+/// and the app whose client ID the refresh sends.
+#[derive(Clone, Debug)]
+pub struct AppAccess {
+    pub keychain: Arc<Keychain>,
+    pub lock: PathBuf,
+    pub app: GitHubApp,
 }
 
-/// [`github`] at the instant `now`. A GitHub App entry gives its access token
-/// as stored: its refresh under the account lock is GA3's (architecture
-/// section 8). Until then a token past its stored expiry is not sent, and
-/// the error names `owlshift init`, which signs in again. A personal token
-/// is never tried in its place.
-fn github_at(
+/// The GitHub adapter for `repo`, with the credential `found`: `owlshift
+/// do` opens the pull request and reads the check set the
+/// [writer](crate::writer) reports with it, and watch follows it.
+///
+/// A GitHub App entry gives the adapter its token through the Writer's
+/// refresh ([`crate::github_token`]): refreshed when past its stored expiry
+/// or refused with HTTP 401, under the account lock of `access`. A token
+/// already expired is refreshed here, which may wait up to
+/// [`ACCOUNT_LOCK_WAIT`](crate::github_token::ACCOUNT_LOCK_WAIT) for the
+/// lock, so a refresh GitHub refuses stops the command before any work. A
+/// personal token is never tried in the app token's place.
+pub fn github(
     found: &ForgeSecret<Secret>,
     repo: Repo,
-    now: Timestamp,
+    access: &AppAccess,
 ) -> Result<GitHubForge, String> {
-    token_at(found, now).map(|token| GitHubForge::new(token, repo))
+    match (&found.token, found.account.kind) {
+        (Some(entry), ForgeKind::App) => {
+            let flow = DeviceFlow::new(HttpLogin::new(), &access.app.client_id);
+            let mut source = AppToken::new(
+                access.keychain.clone(),
+                found.account.token.clone(),
+                access.lock.clone(),
+                flow,
+                entry,
+            )
+            .map_err(|error| error.message)?;
+            source.token().map_err(|error| error.message)?;
+            let connect: Connect = Box::new(|token| Box::new(HttpTransport::new(token)));
+            Ok(GitHubForge::with_app(source, connect, repo))
+        }
+        (Some(token), ForgeKind::Personal) => {
+            Ok(GitHubForge::new(Token::new(token.expose()), repo))
+        }
+        (None, _) => Err(no_token(found)),
+    }
 }
 
-/// The token [`github`] sends for `found` at the instant `now`, by the same
-/// rules; `owlshift init` tries a stored app token with it (GA2).
-pub(crate) fn token_at(found: &ForgeSecret<Secret>, now: Timestamp) -> Result<Token, String> {
-    let sign_in_again = |what: &str| {
-        format!(
-            "the GitHub App's token under service `{SERVICE}`, account `{}`, {what}: run \
-             `owlshift init` in a terminal to sign in again",
-            found.account.token
-        )
-    };
+/// The token sent for `found` at the instant `now`, without the refresh:
+/// a GitHub App token past its stored expiry is refused, naming `owlshift
+/// init`. Only doctor's forge access probe reads it ([`default_branch`]),
+/// until GA4 puts that probe on the Writer's refresh.
+fn token_at(found: &ForgeSecret<Secret>, now: Timestamp) -> Result<Token, String> {
+    let account = &found.account.token;
     match (&found.token, found.account.kind) {
         (Some(entry), ForgeKind::App) => {
             let token = UserToken::from_entry(entry.expose())
-                .map_err(|_| sign_in_again("does not read"))?;
+                .map_err(|_| sign_in_again(account, "does not read"))?;
             if token.expired(now) {
-                return Err(sign_in_again("has expired"));
+                return Err(sign_in_again(account, "has expired"));
             }
             Ok(Token::new(token.access()))
         }
         (Some(token), ForgeKind::Personal) => Ok(Token::new(token.expose())),
-        (None, _) => Err(format!(
-            "no GitHub token in the system keychain: run `owlshift init` in a terminal, or \
-             store one under service `{SERVICE}`, account `{}`",
-            found.account.token
-        )),
+        (None, _) => Err(no_token(found)),
     }
+}
+
+/// The words of the refresh-failure rule (architecture section 8) for the
+/// app token under `account`, which `what` happened to.
+pub(crate) fn sign_in_again(account: &str, what: &str) -> String {
+    format!(
+        "the GitHub App's token under service `{SERVICE}`, account `{account}`, {what}: run \
+         `owlshift init` in a terminal to sign in again"
+    )
+}
+
+fn no_token(found: &ForgeSecret<Secret>) -> String {
+    format!(
+        "no GitHub token in the system keychain: run `owlshift init` in a terminal, or store \
+         one under service `{SERVICE}`, account `{}`",
+        found.account.token
+    )
 }
 
 /// Why the project's GitHub token could not be tried on its repository
@@ -137,8 +178,8 @@ pub enum TokenTryError {
 pub fn default_branch(keychain: &Keychain, repo: &Repo) -> Result<DefaultBranch, TokenTryError> {
     let mut read = |account: &str| keychain.read(account).map_err(|error| error.to_string());
     let found = secrets::forge(repo, &mut read).map_err(TokenTryError::Credential)?;
-    github(&found, repo.clone())
-        .map_err(TokenTryError::Credential)?
+    let token = token_at(&found, Timestamp::now()).map_err(TokenTryError::Credential)?;
+    GitHubForge::new(token, repo.clone())
         .default_branch()
         .map_err(TokenTryError::Forge)
 }
@@ -149,28 +190,75 @@ mod tests {
 
     use super::*;
 
+    fn access(keychain: Keychain, dir: &std::path::Path) -> AppAccess {
+        AppAccess {
+            keychain: Arc::new(keychain),
+            lock: dir.join("github-app.lock"),
+            app: GitHubApp::from_personal(None),
+        }
+    }
+
     #[test]
     fn the_github_token_is_the_one_found() {
+        let dir = tempfile::tempdir().unwrap();
+        let access = access(Keychain::in_memory(), dir.path());
         let repo = Repo::parse("pitchopp/owlshift").unwrap();
         let mut found = ForgeSecret {
             account: ForgeAccount::project(&repo),
             token: None,
         };
-        let missing = github(&found, repo.clone()).unwrap_err();
+        let missing = github(&found, repo.clone(), &access).unwrap_err();
         assert!(
             missing.contains("service `owlshift`, account `github.com/pitchopp/owlshift/github`"),
             "{missing}"
         );
 
         found.token = Some(Secret::new("ghp_test"));
-        assert_eq!(github(&found, repo.clone()).unwrap().repo(), &repo);
+        assert_eq!(github(&found, repo.clone(), &access).unwrap().repo(), &repo);
     }
 
-    /// OWL-382: an app entry gives its access token, unrefreshed until GA3;
-    /// one expired or unreadable names `owlshift init`, never repeats the
-    /// entry, and no personal token is tried instead.
+    /// OWL-384: an app entry that is not expired builds the adapter on the
+    /// Writer's refresh with no request; one that does not read names
+    /// `owlshift init`, repeats nothing of the entry, and no personal token
+    /// is tried instead. The refresh itself is `github_token`'s tests'.
     #[test]
-    fn the_apps_token_is_sent_until_its_expiry_and_never_replaced() {
+    fn the_apps_token_goes_through_the_refresh_and_is_never_replaced() {
+        let dir = tempfile::tempdir().unwrap();
+        let access = access(Keychain::in_memory(), dir.path());
+        let repo = Repo::parse("pitchopp/owlshift").unwrap();
+        let found = |entry: String| ForgeSecret {
+            account: ForgeAccount::project_app(&repo),
+            token: Some(Secret::new(entry)),
+        };
+        let live = UserToken::new(
+            "ghu_SENTINEL",
+            Some("ghr_SENTINEL".to_owned()),
+            Some(
+                Timestamp::now()
+                    .checked_add(jiff::SignedDuration::from_hours(1))
+                    .unwrap(),
+            ),
+            None,
+        )
+        .to_entry();
+        assert_eq!(
+            github(&found(live), repo.clone(), &access).unwrap().repo(),
+            &repo
+        );
+        let error = github(&found("ghu_SENTINEL".to_owned()), repo.clone(), &access).unwrap_err();
+        assert!(
+            error.contains("account `github.com/pitchopp/owlshift/github-app`, does not read"),
+            "{error}"
+        );
+        assert!(error.contains("`owlshift init`"), "{error}");
+        assert!(!error.contains("SENTINEL"), "{error}");
+    }
+
+    /// The doctor probe's read, until GA4: an app entry gives its access
+    /// token until its stored expiry; one expired or unreadable names
+    /// `owlshift init`, never repeats the entry.
+    #[test]
+    fn the_probes_token_is_sent_until_its_expiry_and_never_replaced() {
         let repo = Repo::parse("pitchopp/owlshift").unwrap();
         let now = Timestamp::from_second(1_760_000_000).unwrap();
         let entry = |expires_at: i64| {
@@ -188,13 +276,13 @@ mod tests {
         };
 
         let live = found(entry(now.as_second() + 1));
-        assert_eq!(github_at(&live, repo.clone(), now).unwrap().repo(), &repo);
+        assert_eq!(token_at(&live, now).unwrap(), Token::new("ghu_SENTINEL"));
 
         for (dead, what) in [
             (found(entry(now.as_second())), "has expired"),
             (found("ghu_SENTINEL".to_owned()), "does not read"),
         ] {
-            let error = github_at(&dead, repo.clone(), now).unwrap_err();
+            let error = token_at(&dead, now).unwrap_err();
             assert!(
                 error.contains(&format!(
                     "account `github.com/pitchopp/owlshift/github-app`, {what}"

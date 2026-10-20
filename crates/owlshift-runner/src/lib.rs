@@ -17,6 +17,7 @@ pub mod forge;
 pub mod forget;
 pub mod gate_once;
 pub mod github_sign_in;
+pub mod github_token;
 pub mod init;
 pub mod notify;
 pub mod on_demand;

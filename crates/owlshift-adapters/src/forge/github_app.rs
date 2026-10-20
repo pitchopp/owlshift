@@ -479,7 +479,8 @@ impl<L: Login> DeviceFlow<L> {
     /// (C13). Any error GitHub answers is [`AppError::Refused`]: it answers
     /// a refusal as HTTP 200 with an `error`, and nothing but a new sign-in
     /// gets past it. A token used by a second refresh at once is refused
-    /// too (`bad_refresh_token`), which the account lock of GA3 prevents.
+    /// too (`bad_refresh_token`), which the account lock prevents
+    /// (`owlshift_runner::github_token`, OWL-384).
     pub fn refresh(&self, refresh_token: &str) -> Result<UserToken, AppError> {
         let form = [
             ("client_id", self.client_id.as_str()),

@@ -1975,6 +1975,11 @@ fn forge_access_check(
                      {GITHUB_TOKEN_HELP}"
                 ),
             ),
+            // The refresh-failure rule (OWL-384): its error names the fix.
+            ForgeErrorKind::SignInAgain => fail(
+                format!("GitHub refused {place}: {error}"),
+                "Run `owlshift init` in a terminal to sign in again.".to_owned(),
+            ),
             ForgeErrorKind::NotFound => fail(
                 format!("{place} does not see github.com/{repo}: {error}"),
                 format!(
