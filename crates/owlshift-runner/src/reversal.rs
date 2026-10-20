@@ -177,10 +177,10 @@ pub fn reopens(kept: &KeptDecision, plan: Option<&TicketPlan>) -> bool {
 
 /// The core event that returns a ticket at `stage` to Design for the
 /// reversed approval: none at Design itself, where the Design run is the
-/// return. Stages the return does not serve (Intake, Watch) are the caller's
-/// to exclude.
+/// return, and none at a stage the return does not serve (Intake, Watch).
 pub fn return_event(stage: Stage) -> Option<Event> {
-    (stage != Stage::Design).then_some(Event::ReversedToDesign)
+    matches!(stage, Stage::DesignReview | Stage::Build | Stage::Verify)
+        .then_some(Event::ReversedToDesign)
 }
 
 /// The brief's correction for `reversals` of the decisions `questions` keeps,
@@ -417,10 +417,13 @@ mod tests {
     }
 
     /// The reversed approval returns the ticket to Design from Design review,
-    /// Build and Verify with the one event, and from Design itself with none.
+    /// Build and Verify with the one event, and from Design itself, Intake
+    /// and Watch with none.
     #[test]
     fn the_approval_reversal_returns_to_design_by_one_event() {
-        assert_eq!(return_event(Stage::Design), None);
+        for stage in [Stage::Design, Stage::Intake, Stage::Watch] {
+            assert_eq!(return_event(stage), None, "{stage:?}");
+        }
         for stage in [Stage::DesignReview, Stage::Build, Stage::Verify] {
             assert_eq!(
                 return_event(stage),
