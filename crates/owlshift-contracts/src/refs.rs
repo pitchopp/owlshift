@@ -32,7 +32,7 @@ use crate::ids::{SessionId, TicketId, check_name, is_commit_id};
 use crate::result::{
     self, DECISIONS_ADVICE, Decision, Followup, Question, RefusedChoice, Verdict, check_verdicts,
 };
-use crate::{BasisKind, Stage};
+use crate::{BasisKind, Role, Stage};
 
 /// The namespace of every Owlshift ref.
 pub const REF_NAMESPACE: &str = "refs/owlshift/";
