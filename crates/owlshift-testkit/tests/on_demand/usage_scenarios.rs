@@ -21,8 +21,9 @@ impl Bench {
     }
 
     /// The machine's usage store, as this bench's commands read it.
-    fn usage_store(&self) -> UsageStore {
+    pub(super) fn usage_store(&self) -> UsageStore {
         UsageStore::new(self.usage.borrow().clone())
+            .with_caps(self.usage_cap.get().map(|cap| (HarnessKind::Claude, cap)))
     }
 
     /// The `usage` decision events, as `usage` and `role`.
@@ -536,4 +537,134 @@ fn a_review_without_a_usable_fallback_waits_and_returns_to_claude_code_after_the
         "{stopped:?}\n{printed}"
     );
     assert!(bench.briefs().is_empty());
+}
+
+/// Something done while a run works: another run, of this project or of
+/// another, reports Claude Code's `window` at `share`, resetting at `reset`
+/// (OWL-405), at the bench's 09:10.
+fn window_elsewhere(bench: &Bench, window: &str, share: f64, reset: &str) -> During {
+    let store = bench.usage_store();
+    let seen: Timestamp = "2026-10-02T09:10:00Z".parse().unwrap();
+    let reported = Reported {
+        windows: vec![(
+            window.to_owned(),
+            usage::Window {
+                share,
+                resets_at_ms: reset.parse::<Timestamp>().unwrap().as_millisecond(),
+                read_at_ms: seen.as_millisecond(),
+            },
+        )],
+        answered: true,
+        ..Reported::default()
+    };
+    (
+        1,
+        Box::new(move || {
+            store
+                .update(HarnessKind::Claude, |state| {
+                    usage::record(state, &reported, "elsewhere", seen.as_millisecond());
+                })
+                .unwrap();
+        }),
+    )
+}
+
+/// OWL-405: a window at the personal file's cap pauses Claude Code until
+/// that window's reset, as a limit does: the next run is refused before it
+/// starts, the operator is told once in the cap's words, and the run goes
+/// on at the reset. A window below the cap, and a harness with no cap,
+/// hold nothing.
+#[test]
+fn a_window_at_the_usage_cap_pauses_the_harness_until_that_windows_reset() {
+    let reset: Timestamp = RESET.parse().unwrap();
+    // The five-hour window at 85% of a cap of 80.
+    let bench = Bench::verifying();
+    bench.usage_cap.set(Some(80));
+    let replies = vec![bench.reply(Some("Hello"), Some(DONE))];
+    let (stopped, printed) = bench.invoke(
+        false,
+        replies,
+        None,
+        vec![window_elsewhere(&bench, "five_hour", 0.85, RESET)],
+    );
+    assert_eq!(
+        stopped.as_ref().err(),
+        Some(&Stop::UsageLimit {
+            resets_at: Some(reset)
+        }),
+        "{printed}"
+    );
+    assert_eq!(bench.roles(), [Role::Build], "the review was refused");
+    let told = bench.notified.0.borrow().clone();
+    assert_eq!(
+        told,
+        [
+            "DEMO-1: Claude Code reached its usage cap: its runs wait until its window resets \
+             at 2026-10-02T12:00:00Z"
+                .to_owned()
+        ],
+        "{told:?}"
+    );
+    let events = bench.usage_events();
+    assert_eq!(
+        events
+            .iter()
+            .map(|(what, _)| what.as_str())
+            .collect::<Vec<_>>(),
+        ["capped", "waits"],
+        "{events:?}"
+    );
+
+    // Refused again before the reset, told nothing more.
+    let (again, _) = bench.continue_ticket(Vec::new());
+    assert!(matches!(&again, Err(Stop::UsageLimit { .. })));
+    assert_eq!(bench.notified.0.borrow().len(), 1);
+    assert_eq!(bench.roles(), [Role::Build]);
+
+    // The reset: the review runs.
+    bench.now_is(reset);
+    let (delivered, printed) = bench.continue_ticket(vec![bench.reviewing(&found(&[]))]);
+    delivered.unwrap_or_else(|stop| panic!("{stop}\n{printed}"));
+    assert_eq!(bench.roles(), [Role::Build, Role::Verify]);
+
+    // Below the cap, or with no cap, nothing is held.
+    for (cap, share) in [(Some(90), 0.85), (None, 0.99)] {
+        let bench = Bench::verifying();
+        bench.usage_cap.set(cap);
+        let replies = vec![
+            bench.reply(Some("Hello"), Some(DONE)),
+            bench.reviewing(&found(&[])),
+        ];
+        let (outcome, printed) = bench.invoke(
+            false,
+            replies,
+            None,
+            vec![window_elsewhere(&bench, "five_hour", share, RESET)],
+        );
+        outcome.unwrap_or_else(|stop| panic!("{stop}\n{printed}"));
+        assert_eq!(bench.roles(), [Role::Build, Role::Verify]);
+    }
+}
+
+/// OWL-405: a review role goes on the declared fallback while a cap holds
+/// Claude Code, as it does at a limit.
+#[test]
+fn a_review_runs_on_the_fallback_while_a_cap_holds_claude_code() {
+    let bench = Bench::verifying();
+    bench.usage_cap.set(Some(80));
+    *bench.review_fallback.borrow_mut() = Some(Ok(()));
+    let replies = vec![
+        bench.reply(Some("Hello"), Some(DONE)),
+        bench.reviewing(&found(&[])),
+    ];
+    let (outcome, printed) = bench.invoke(
+        false,
+        replies,
+        None,
+        vec![window_elsewhere(&bench, "five_hour", 0.8, RESET)],
+    );
+    outcome.unwrap_or_else(|stop| panic!("{stop}\n{printed}"));
+    let harnesses: Vec<HarnessKind> = bench.routed().iter().map(|r| r.harness).collect();
+    assert_eq!(harnesses, [HarnessKind::Claude, HarnessKind::Codex]);
+    assert!(bench.record().review.unwrap().passes[0].reviewers[0].fallback);
 }

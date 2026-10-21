@@ -49,9 +49,7 @@ impl OnDemand<'_> {
     /// be read (`admit_usage` warns of that).
     pub fn usage_standing(&self, harness: HarnessKind) -> Standing {
         let now = machine_usage::ms((self.clock)());
-        self.usage
-            .standing(harness, now)
-            .unwrap_or(Standing::Free)
+        self.usage.standing(harness, now).unwrap_or(Standing::Free)
     }
 
     /// When `harness`'s limit ends, `None` when it is not limited.
