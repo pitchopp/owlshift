@@ -295,6 +295,7 @@ pub fn run(system: &dyn System, config: &Effective) -> Report {
     checks.extend(resolver_check(config));
     checks.extend(codex_reviewer_check(system, config));
     checks.extend(review_fallback_check(system, config));
+    checks.extend(usage_check(system, config));
     checks.extend(budget_check(config));
     checks.extend(drain_slot_check(system, config));
     checks.extend(quarantine_check(system, config, home));
@@ -1392,6 +1393,85 @@ fn review_fallback_check(system: &dyn System, config: &Effective) -> Option<Chec
             ),
         ),
     })
+}
+
+/// Each harness's usage cap and the shares its runs reported of its usage
+/// windows (OWL-405, architecture section 5, "Usage limits"), read from the
+/// machine's usage files: a note, which blocks nothing. A window at the cap
+/// that has not reset holds the harness. None when no harness has a cap or a
+/// window on record.
+fn usage_check(system: &dyn System, config: &Effective) -> Option<Check> {
+    let caps = crate::usage::caps_of(&config.personal);
+    let (dir, _) = system.data_dir()?;
+    let now = crate::usage::ms(jiff::Timestamp::now());
+    let mut lines = Vec::new();
+    for harness in [Harness::Claude, Harness::Codex] {
+        let cap = caps
+            .iter()
+            .find(|(h, _)| *h == harness)
+            .map(|(_, cap)| *cap);
+        let name = harness_name(harness);
+        let file = dir
+            .join("usage")
+            .join(format!("{}.json", crate::usage::key(harness)));
+        let text = match system.read_text_file(&file) {
+            Ok(text) => text,
+            Err(why) => {
+                lines.push(format!("{name}: its usage file was not read: {why}"));
+                continue;
+            }
+        };
+        let windows = match text
+            .as_deref()
+            .map(owlshift_contracts::usage::HarnessUsage::parse)
+        {
+            Some(Ok(usage)) => usage.state().windows,
+            Some(Err(_)) => {
+                lines.push(format!("{name}: its usage file does not read"));
+                continue;
+            }
+            None => Default::default(),
+        };
+        if cap.is_none() && windows.is_empty() {
+            continue;
+        }
+        let cap_text = cap.map_or_else(|| "no cap".to_owned(), |cap| format!("cap {cap}%"));
+        let seen = if windows.is_empty() {
+            "no window reported yet".to_owned()
+        } else {
+            windows
+                .iter()
+                .map(|(window, w)| {
+                    let reset = crate::usage::at(w.resets_at_ms);
+                    let share = (w.share * 100.0).round();
+                    let held = cap.is_some_and(|cap| {
+                        owlshift_core::usage::at_cap(w.share, cap) && w.resets_at_ms > now
+                    });
+                    if w.resets_at_ms <= now {
+                        format!("{window} {share}% (reset at {reset})")
+                    } else if held {
+                        format!("{window} {share}% (holds the harness until it resets at {reset})")
+                    } else {
+                        format!("{window} {share}% (resets at {reset})")
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        lines.push(format!("{name}, {cap_text}: {seen}"));
+    }
+    if lines.is_empty() {
+        return None;
+    }
+    Some(Check::info(
+        Section::Project,
+        "usage",
+        format!(
+            "{}; the latest share each run reported, a harness whose runs report none is never \
+             held by its cap",
+            lines.join("; ")
+        ),
+    ))
 }
 
 /// The budget on one ticket's runs (OWL-378, architecture section 4,
@@ -4090,6 +4170,75 @@ states = { ready = "Todo", working = "Doing", needs_input = "Asked", review = "R
                 .ends_with("but it cannot serve here: `codex` is not on the PATH"),
             "{report}"
         );
+    }
+
+    /// OWL-405: the `usage` line shows each harness's cap and the shares its
+    /// runs reported, and says which window holds the harness; nothing to
+    /// show, no line.
+    #[test]
+    fn the_usage_line_shows_the_cap_and_the_shares_seen() {
+        let personal = |text: &str| Effective {
+            project: FileState::NotApplicable("no project here".into()),
+            personal: FileState::Loaded {
+                path: PathBuf::from("/home/ada/.config/owlshift/config.toml"),
+                config: owlshift_contracts::config::PersonalConfig::parse(text).unwrap(),
+                entries: Vec::new(),
+            },
+        };
+        let file = owlshift_contracts::usage::HarnessUsage::from_state(
+            Harness::Claude,
+            &owlshift_core::usage::State {
+                windows: [("five_hour", 0.85), ("seven_day", 0.3)]
+                    .into_iter()
+                    .map(|(name, share)| {
+                        (
+                            name.to_owned(),
+                            owlshift_core::usage::Window {
+                                share,
+                                resets_at_ms: 4_102_444_800_000,
+                                read_at_ms: 1,
+                            },
+                        )
+                    })
+                    .collect(),
+                ..Default::default()
+            },
+        )
+        .render();
+        // The path as the check joins it, whatever the platform's separator.
+        let path = Path::new("/home/ada/.local/share/owlshift")
+            .join("usage")
+            .join("claude.json");
+        let usage = || {
+            logged_in(with_harnesses(with_git(FakeSystem::default())))
+                .text_file(path.to_str().unwrap(), Ok(&file))
+        };
+        let capped = personal("[harnesses.claude]\nusage_cap_percent = 80\n");
+        let report = run(&usage(), &capped);
+        let shown = line(&report, "usage");
+        assert_eq!(shown.status, Status::Info, "{report}");
+        assert!(
+            shown.detail.starts_with(
+                "Claude Code, cap 80%: five_hour 85% (holds the harness until it resets at \
+                 2100-01-01T00:00:00Z), seven_day 30% (resets at 2100-01-01T00:00:00Z)"
+            ),
+            "{report}"
+        );
+        // No cap: the shares are still shown, none holds.
+        let report = run(&usage(), &personal(""));
+        let shown = line(&report, "usage");
+        assert!(
+            shown
+                .detail
+                .starts_with("Claude Code, no cap: five_hour 85% (resets"),
+            "{report}"
+        );
+        // Nothing on record, no cap: no line.
+        let report = run(
+            &logged_in(with_harnesses(with_git(FakeSystem::default()))),
+            &personal(""),
+        );
+        assert!(report.checks.iter().all(|check| check.subject != "usage"));
     }
 
     /// OWL-328: the `resolver` line names the level, the pass limit and the

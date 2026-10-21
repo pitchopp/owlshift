@@ -351,7 +351,8 @@ fn run_with(
     let desktop = desktop.as_ref().map(|d| d as &dyn Notifier);
     // Every project's commands on this machine share each harness's usage
     // state (OWL-404).
-    let usage = UsageStore::in_data_dir(&data_dir);
+    let usage = UsageStore::in_data_dir(&data_dir)
+        .with_caps(owlshift_runner::usage::caps_of(&config.personal));
     let on_demand = OnDemand {
         executor: &executor,
         tracker: tracker.as_ref(),

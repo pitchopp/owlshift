@@ -14,7 +14,7 @@
 //!   a reset stands or within [`DEADLINE_MS`] of it, and always after a
 //!   deadline, which no run since proved over. A cap's pause
 //!   ([`EpisodeKind::Cap`]) holds the harness until its window's reset;
-//!   OWL-405 opens those.
+//!   [`apply_cap`] opens those (OWL-405).
 //! - *The probe.* Once a deadline without a reset time passes, the first run
 //!   admitted marks itself the probe, with a deadline of its own, and runs;
 //!   every other run waits until it reports or its deadline passes. A probe
@@ -62,8 +62,8 @@ pub enum EpisodeKind {
     /// otherwise a deadline, after which a probe runs.
     Limit { reset: bool },
     /// A cap's pause: the latest share seen of `window` at or above the
-    /// harness's `usage_cap_percent`, until that window's reset. OWL-405
-    /// opens these; this module honours them.
+    /// harness's `usage_cap_percent`, until that window's reset
+    /// ([`apply_cap`]).
     Cap { window: String },
 }
 
@@ -204,6 +204,57 @@ pub enum Recorded {
     /// The probe reported nothing of its harness: its mark is gone, and the
     /// next run probes.
     Unproven,
+}
+
+/// Whether `share` (0 to 1) is at or above a cap of `cap` percent: a share
+/// of 0.29 holds a cap of 29 whatever the float says.
+pub fn at_cap(share: f64, cap: u8) -> bool {
+    share * 100.0 + 1e-6 >= f64::from(cap)
+}
+
+/// Opens, keeps or drops the pauses of a usage cap (OWL-405) at `now`: each
+/// window whose latest share is at or above `cap` and has not reset holds the
+/// harness until its reset, one pause per window. A pause whose window no
+/// longer stands at the cap, or that no cap justifies any more, is dropped.
+/// A window that reset and reaches the cap again in its next cycle gets a
+/// new, untold pause. Returns the pauses opened.
+pub fn apply_cap(state: &mut State, cap: Option<u8>, now: i64) -> Vec<Episode> {
+    let at = |name: &str, windows: &BTreeMap<String, Window>| {
+        cap.is_some_and(|cap| windows.get(name).is_some_and(|w| at_cap(w.share, cap)))
+    };
+    let windows = &state.windows;
+    state.episodes.retain(|episode| match &episode.kind {
+        EpisodeKind::Cap { window } => at(window, windows),
+        EpisodeKind::Limit { .. } => true,
+    });
+    let mut opened = Vec::new();
+    for (name, window) in &state.windows {
+        if !at(name, &state.windows) || window.resets_at_ms <= now {
+            continue;
+        }
+        let held = state.episodes.iter().any(|episode| {
+            matches!(&episode.kind, EpisodeKind::Cap { window: w } if w == name)
+                && episode.until_ms == window.resets_at_ms
+        });
+        if held {
+            continue;
+        }
+        // Another cycle of the window: its old pause is over.
+        state.episodes.retain(
+            |episode| !matches!(&episode.kind, EpisodeKind::Cap { window: w } if w == name),
+        );
+        let episode = Episode {
+            kind: EpisodeKind::Cap {
+                window: name.clone(),
+            },
+            since_ms: now,
+            until_ms: window.resets_at_ms,
+            told: false,
+        };
+        state.episodes.push(episode.clone());
+        opened.push(episode);
+    }
+    opened
 }
 
 /// Records what a run whose token is `probe_id` reported at `now`.
@@ -720,5 +771,86 @@ mod tests {
             effective_harness(Role::Verify, Harness::Claude, Some(Harness::Claude), held),
             Effective::Wait { until_ms: 7 }
         );
+    }
+
+    fn with_windows(windows: &[(&str, Window)]) -> State {
+        State {
+            windows: windows
+                .iter()
+                .map(|(name, w)| ((*name).to_owned(), *w))
+                .collect(),
+            ..State::default()
+        }
+    }
+
+    #[test]
+    fn a_window_at_the_cap_holds_the_harness_until_its_reset() {
+        let mut state = with_windows(&[
+            ("five_hour", window(0.8, 50 * MIN, 1)),
+            ("seven_day", window(0.3, 900 * MIN, 1)),
+        ]);
+        assert!(at_cap(0.29, 29) && at_cap(0.8, 80) && !at_cap(0.799, 80));
+        assert!(apply_cap(&mut state, None, MIN).is_empty());
+        assert_eq!(standing(&state, MIN), Standing::Free);
+        let opened = apply_cap(&mut state, Some(80), MIN);
+        assert_eq!(opened.len(), 1, "the seven-day share is below the cap");
+        assert_eq!(
+            opened[0].kind,
+            EpisodeKind::Cap {
+                window: "five_hour".to_owned()
+            }
+        );
+        assert_eq!(
+            standing(&state, 49 * MIN),
+            Standing::Limited { until_ms: 50 * MIN }
+        );
+        // Applied again, it is the same pause, told mark kept.
+        claim_told(&mut state, 2 * MIN);
+        assert!(apply_cap(&mut state, Some(80), 3 * MIN).is_empty());
+        assert!(state.episodes[0].told);
+        assert_eq!(admit(&mut state, "r", 50 * MIN), Admission::Run);
+    }
+
+    #[test]
+    fn a_pause_ends_with_its_cap_or_its_share_and_a_new_cycle_opens_a_new_one() {
+        let mut state = with_windows(&[("five_hour", window(0.9, 50 * MIN, 1))]);
+        apply_cap(&mut state, Some(80), MIN);
+        claim_told(&mut state, MIN);
+        // A higher cap, or none, ends it.
+        let mut raised = state.clone();
+        apply_cap(&mut raised, Some(95), 2 * MIN);
+        assert_eq!(standing(&raised, 2 * MIN), Standing::Free);
+        let mut none = state.clone();
+        apply_cap(&mut none, None, 2 * MIN);
+        assert_eq!(standing(&none, 2 * MIN), Standing::Free);
+        // A window already reset opens nothing.
+        let mut past = with_windows(&[("five_hour", window(0.9, 50 * MIN, 1))]);
+        assert!(apply_cap(&mut past, Some(80), 60 * MIN).is_empty());
+        // The next cycle of the window, again at the cap: a new, untold pause.
+        record(
+            &mut state,
+            &Reported {
+                windows: vec![("five_hour".to_owned(), window(0.85, 350 * MIN, 60 * MIN))],
+                ..Reported::default()
+            },
+            "",
+            60 * MIN,
+        );
+        let opened = apply_cap(&mut state, Some(80), 60 * MIN);
+        assert_eq!(opened.len(), 1);
+        assert_eq!((opened[0].until_ms, opened[0].told), (350 * MIN, false));
+        assert_eq!(state.episodes.len(), 1);
+        // The next cycle starts low: nothing holds.
+        record(
+            &mut state,
+            &Reported {
+                windows: vec![("five_hour".to_owned(), window(0.1, 650 * MIN, 400 * MIN))],
+                ..Reported::default()
+            },
+            "",
+            400 * MIN,
+        );
+        apply_cap(&mut state, Some(80), 400 * MIN);
+        assert_eq!(state.episodes, Vec::new());
     }
 }

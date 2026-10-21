@@ -961,6 +961,9 @@ struct Bench {
     /// The machine's usage state (OWL-404): the bench's data directory's,
     /// or another bench's to play a second project on the same machine.
     usage: RefCell<PathBuf>,
+    /// Claude Code's `usage_cap_percent`, if the personal file sets one
+    /// (OWL-405).
+    usage_cap: Cell<Option<u8>>,
 }
 
 /// A notifier that records each line instead of showing it.
@@ -1109,6 +1112,7 @@ impl Bench {
             review_fallback: RefCell::new(None),
             notified: Notified::default(),
             usage: RefCell::new(tmp_data.join("usage")),
+            usage_cap: Cell::new(None),
         }
     }
 
@@ -1565,7 +1569,7 @@ impl Bench {
         let dirs = self.dirs();
         let remote_url = self.remote.bare.to_string_lossy().into_owned();
         let now = || self.clock.get().checked_add(self.waited.get()).unwrap();
-        let usage = UsageStore::new(self.usage.borrow().clone());
+        let usage = self.usage_store();
         let on_demand = OnDemand {
             executor: &executor,
             tracker: &tracker,

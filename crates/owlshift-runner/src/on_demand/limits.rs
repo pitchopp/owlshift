@@ -49,9 +49,7 @@ impl OnDemand<'_> {
     /// be read (`admit_usage` warns of that).
     pub fn usage_standing(&self, harness: HarnessKind) -> Standing {
         let now = machine_usage::ms((self.clock)());
-        self.usage
-            .read(harness)
-            .map_or(Standing::Free, |state| usage::standing(&state, now))
+        self.usage.standing(harness, now).unwrap_or(Standing::Free)
     }
 
     /// When `harness`'s limit ends, `None` when it is not limited.
@@ -126,7 +124,7 @@ impl OnDemand<'_> {
             probing: false,
             kept: Cell::new(false),
         };
-        let state = match self.usage.read(kind) {
+        let state = match self.usage.read_at(kind, machine_usage::ms(now)) {
             Ok(state) => state,
             Err(reason) => {
                 self.usage_warning(ticket, "usage_unread", kind, &reason, sink);
@@ -134,14 +132,13 @@ impl OnDemand<'_> {
             }
         };
         let standing_of = |of: HarnessKind| {
-            let read = if of == kind {
-                Ok(state.clone())
-            } else {
-                self.usage.read(of)
-            };
-            read.map_or(Standing::Free, |state| {
+            if of == kind {
                 usage::standing(&state, machine_usage::ms(now))
-            })
+            } else {
+                self.usage
+                    .standing(of, machine_usage::ms(now))
+                    .unwrap_or(Standing::Free)
+            }
         };
         // The harness is already the run's: a review that falls back got its
         // fallback's router before it came here ([`OnDemand::review_fallback`]).
@@ -150,9 +147,15 @@ impl OnDemand<'_> {
         {
             return Ok(Some(admitted));
         }
-        let admission = self.usage.update(kind, |state| {
-            usage::admit(state, &admitted.probe, machine_usage::ms(now))
-        });
+        let admission = self
+            .usage
+            .update_at(kind, machine_usage::ms(now), |state| {
+                usage::admit(state, &admitted.probe, machine_usage::ms(now))
+            })
+            .map(|(admission, opened)| {
+                self.emit_capped(ticket, kind, &opened, None, sink);
+                admission
+            });
         let key = json!(machine_usage::key(kind));
         match admission {
             Ok(Admission::Run) => Ok(Some(admitted)),
@@ -171,26 +174,68 @@ impl OnDemand<'_> {
                 Ok(Some(admitted))
             }
             Ok(Admission::Wait { until_ms }) => {
-                let until = machine_usage::at(until_ms);
-                sink.emit(
-                    ticket,
-                    None,
-                    EventKind::Decision,
-                    data([
-                        ("usage", json!("waits")),
-                        ("harness", key),
-                        ("role", json!(role.as_str())),
-                        ("until", json!(until)),
-                    ]),
-                );
-                Err(Stop::UsageLimit {
-                    resets_at: Some(until),
-                })
+                Err(self.usage_waits(ticket, kind, role, until_ms, sink))
             }
             Err(reason) => {
                 self.usage_warning(ticket, "usage_unread", kind, &reason, sink);
-                Ok(Some(admitted))
+                // A pause the personal file's cap opens needs no write to
+                // hold: the provider would not refuse the run for it.
+                match capped_until(&state, machine_usage::ms(now)) {
+                    Some(until_ms) => Err(self.usage_waits(ticket, kind, role, until_ms, sink)),
+                    None => Ok(Some(admitted)),
+                }
             }
+        }
+    }
+
+    /// The `decision` event `usage` = `waits` for a run of `role` refused
+    /// until `until_ms`, and the stop that ends its step.
+    fn usage_waits(
+        &self,
+        ticket: &TicketId,
+        harness: HarnessKind,
+        role: Role,
+        until_ms: i64,
+        sink: &mut EventSink<'_>,
+    ) -> Stop {
+        let until = machine_usage::at(until_ms);
+        sink.emit(
+            ticket,
+            None,
+            EventKind::Decision,
+            data([
+                ("usage", json!("waits")),
+                ("harness", json!(machine_usage::key(harness))),
+                ("role", json!(role.as_str())),
+                ("until", json!(until)),
+            ]),
+        );
+        Stop::UsageLimit {
+            resets_at: Some(until),
+        }
+    }
+
+    /// The `decision` event `usage` = `capped` for each pause of a usage cap
+    /// `opened` on `harness` (OWL-405), as run `run` of `ticket` reported.
+    fn emit_capped(
+        &self,
+        ticket: &TicketId,
+        harness: HarnessKind,
+        opened: &[usage::Episode],
+        run: Option<&str>,
+        sink: &mut EventSink<'_>,
+    ) {
+        for episode in opened {
+            sink.emit(
+                ticket,
+                run,
+                EventKind::Decision,
+                data([
+                    ("usage", json!("capped")),
+                    ("harness", json!(machine_usage::key(harness))),
+                    ("until", json!(machine_usage::at(episode.until_ms))),
+                ]),
+            );
         }
     }
 
@@ -208,9 +253,15 @@ impl OnDemand<'_> {
         let kind = admitted.harness;
         let now = machine_usage::ms((self.clock)());
         let reported = machine_usage::reported(report);
-        let recorded = self.usage.update(kind, |state| {
-            usage::record(state, &reported, &admitted.probe, now)
-        });
+        let recorded = self
+            .usage
+            .update_at(kind, now, |state| {
+                usage::record(state, &reported, &admitted.probe, now)
+            })
+            .map(|(recorded, opened)| {
+                self.emit_capped(ticket, kind, &opened, Some(run), sink);
+                recorded
+            });
         admitted.kept.set(recorded.is_ok());
         let key = json!(machine_usage::key(kind));
         let event = match recorded {
@@ -251,14 +302,14 @@ impl OnDemand<'_> {
             return;
         };
         let now = (self.clock)();
-        let claimed = self.usage.update(kind, |state| {
+        let claimed = self.usage.update_at(kind, machine_usage::ms(now), |state| {
             let standing = usage::standing(state, machine_usage::ms(now));
             (claim_told(state, machine_usage::ms(now)), standing)
         });
         let line = match claimed {
-            Ok((Some(episode), _)) => machine_usage::episode_line(ticket, kind, &episode),
+            Ok(((Some(episode), _), _)) => machine_usage::episode_line(ticket, kind, &episode),
             // Told already, or over already: a reset time past holds nothing.
-            Ok((None, _)) => return,
+            Ok(((None, _), _)) => return,
             Err(reason) => {
                 self.usage_warning(ticket, "usage_not_kept", kind, &reason, sink);
                 let until = resets_at.filter(|at| *at > now).unwrap_or_else(|| {
@@ -297,4 +348,16 @@ impl OnDemand<'_> {
             ]),
         );
     }
+}
+
+/// When the pauses of a usage cap in `state` end, the latest of them, if one
+/// holds the harness at `now`.
+fn capped_until(state: &usage::State, now: i64) -> Option<i64> {
+    state
+        .episodes
+        .iter()
+        .filter(|episode| matches!(episode.kind, usage::EpisodeKind::Cap { .. }))
+        .map(|episode| episode.until_ms)
+        .filter(|until| *until > now)
+        .max()
 }
