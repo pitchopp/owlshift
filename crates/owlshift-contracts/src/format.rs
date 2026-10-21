@@ -128,6 +128,12 @@ pub const STEP_OUTCOME_FORMAT: u32 = 3;
 /// The format version of what a step carries to the next (`carry.json` in a
 /// ticket's folder, OWL-399).
 pub const CARRY_FORMAT: u32 = 1;
+/// The format version of what the runner knows of a ticket's branch and ref
+/// between its runs (`run.json` in a ticket's folder, OWL-400).
+pub const RUN_FORMAT: u32 = 1;
+/// The format version of a run's obligation (`unverified/<ticket>-<run>` in
+/// a project's folder, OWL-400).
+pub const OBLIGATION_FORMAT: u32 = 1;
 /// The format version of a harness's usage state on one machine
 /// (`<data>/usage/<harness>.json`, OWL-404).
 pub const USAGE_FORMAT: u32 = 1;

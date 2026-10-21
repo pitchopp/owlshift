@@ -13,7 +13,8 @@ use serde::{Deserialize, Serialize};
 use owlshift_core::gate::{Chain, ChainCost};
 
 use crate::format::{
-    self, CARRY_FORMAT, ContractError, Format, STEP_ENVELOPE_FORMAT, STEP_OUTCOME_FORMAT,
+    self, CARRY_FORMAT, ContractError, Format, OBLIGATION_FORMAT, RUN_FORMAT,
+    STEP_ENVELOPE_FORMAT, STEP_OUTCOME_FORMAT,
 };
 use crate::ids::TicketId;
 use crate::{Role, Stage};
@@ -380,6 +381,192 @@ impl TicketCarry {
     }
 }
 
+/// What the runner knows of a ticket's branch and ref between its runs
+/// (OWL-400; architecture section 8, "Isolation among steps", "The run
+/// file"), kept in `run.json` in the ticket's folder, written only under
+/// the ticket's lock: what a sibling's isolation check holds the ticket to
+/// once it ended, and what the ticket's next step must find.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+#[schemars(title = "Owlshift ticket run")]
+pub struct TicketRun {
+    pub format: Format<RUN_FORMAT>,
+    pub ticket: TicketId,
+    /// Raised at every write of the file, so that a sibling's check sees
+    /// that something happened under the ticket's lock since its snapshot.
+    pub generation: u64,
+    /// The commit of the ticket's branch its last check verified, or the
+    /// runner last moved it to; none while the branch does not exist.
+    #[serde(default)]
+    pub tip: Option<String>,
+    /// The commit the runner last wrote as the ticket's ref; none while it
+    /// has none.
+    #[serde(default)]
+    pub ticket_ref: Option<String>,
+    /// The name of the ticket worktree's entry in `worktrees/` of the common
+    /// git folder, once a run recorded it.
+    #[serde(default)]
+    pub entry: Option<String>,
+    /// A write of the ref, or a move of the branch, under way.
+    #[serde(default, skip_serializing_if = "RunWriting::is_empty")]
+    pub writing: RunWriting,
+}
+
+/// The writes under way of a [`TicketRun`]: each value it records may also
+/// be found at its target, and a write cut off between the two is finished
+/// by the next holder of the ticket's lock, whichever the ref or the branch
+/// then shows.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct RunWriting {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ticket_ref: Option<RunTarget>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tip: Option<RunTarget>,
+}
+
+impl RunWriting {
+    /// Whether no write is under way.
+    pub fn is_empty(&self) -> bool {
+        self.ticket_ref.is_none() && self.tip.is_none()
+    }
+}
+
+/// Where a write under way goes.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct RunTarget {
+    /// The commit it moves to; none for a deletion.
+    pub to: Option<String>,
+}
+
+/// The most bytes of a [`RunObligation`]'s description.
+pub const MAX_OBLIGATION_WHAT: usize = 1024;
+
+/// The longest worktree entry name a [`TicketRun`] records, in bytes.
+pub const MAX_ENTRY: usize = 255;
+
+impl TicketRun {
+    const CONTRACT: &str = "ticket run";
+
+    /// The run file of a ticket from nothing: generation 0, which the
+    /// first write raises.
+    pub fn new(ticket: TicketId) -> Self {
+        Self {
+            format: Format,
+            ticket,
+            generation: 0,
+            tip: None,
+            ticket_ref: None,
+            entry: None,
+            writing: RunWriting::default(),
+        }
+    }
+
+    pub fn parse(input: &str) -> Result<Self, ContractError> {
+        let run: Self = format::parse_json(Self::CONTRACT, RUN_FORMAT, input)?;
+        let commits = [
+            run.tip.as_deref(),
+            run.ticket_ref.as_deref(),
+            run.writing.ticket_ref.as_ref().and_then(|t| t.to.as_deref()),
+            run.writing.tip.as_ref().and_then(|t| t.to.as_deref()),
+        ];
+        if let Some(bad) = commits.into_iter().flatten().find(|id| !is_commit_id(id)) {
+            return Err(ContractError::invalid(
+                Self::CONTRACT,
+                format!("{bad:?} is not a full commit id"),
+            ));
+        }
+        if let Some(entry) = &run.entry
+            && !is_component(entry, MAX_ENTRY)
+        {
+            return Err(ContractError::invalid(
+                Self::CONTRACT,
+                format!("the worktree entry {entry:?} is not one plain name"),
+            ));
+        }
+        Ok(run)
+    }
+
+    pub fn render(&self) -> String {
+        format::render_json(self)
+    }
+}
+
+/// A run's promise to have its isolation checked (OWL-400; architecture
+/// section 8, "Isolation among steps", "Obligations and the quarantine"):
+/// written in `unverified/` of the project's folder before the run starts,
+/// removed once its check passed. One left behind by a run that ended
+/// without its check quarantines the project.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+#[schemars(title = "Owlshift run obligation")]
+pub struct RunObligation {
+    pub format: Format<OBLIGATION_FORMAT>,
+    /// The ticket whose run it is; none for `owlshift gate`.
+    #[serde(default)]
+    pub ticket: Option<TicketId>,
+    /// The run's id, unique within its ticket: ASCII letters, digits and
+    /// `-`, at most [`MAX_ATTEMPT`] bytes.
+    #[schemars(regex(pattern = r"^[A-Za-z0-9-]{1,80}$"))]
+    pub run: String,
+    pub started: Timestamp,
+    /// What ran, in the runner's words, on one line of at most
+    /// [`MAX_OBLIGATION_WHAT`] bytes.
+    pub what: String,
+}
+
+impl RunObligation {
+    const CONTRACT: &str = "run obligation";
+
+    pub fn parse(input: &str) -> Result<Self, ContractError> {
+        let obligation: Self = format::parse_json(Self::CONTRACT, OBLIGATION_FORMAT, input)?;
+        if !is_run_id(&obligation.run) {
+            return Err(ContractError::invalid(
+                Self::CONTRACT,
+                format!("{:?} is not a run id", obligation.run),
+            ));
+        }
+        if obligation.what.len() > MAX_OBLIGATION_WHAT
+            || obligation.what.chars().any(char::is_control)
+        {
+            return Err(ContractError::invalid(
+                Self::CONTRACT,
+                "its description is not one short line",
+            ));
+        }
+        Ok(obligation)
+    }
+
+    pub fn render(&self) -> String {
+        format::render_json(self)
+    }
+}
+
+/// Whether `id` is a run's id: ASCII letters, digits and `-`, at most
+/// [`MAX_ATTEMPT`] bytes.
+pub fn is_run_id(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() <= MAX_ATTEMPT
+        && id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
+}
+
+/// Whether `id` is a full commit id as git prints it: 40 or 64 lower-case
+/// hexadecimal digits.
+pub fn is_commit_id(id: &str) -> bool {
+    matches!(id.len(), 40 | 64) && id.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+}
+
+/// Whether `name` is one plain path component of at most `max` bytes.
+fn is_component(name: &str, max: usize) -> bool {
+    !name.is_empty()
+        && name.len() <= max
+        && name != "."
+        && name != ".."
+        && !name.contains(['/', '\\', '\0'])
+        && !name.chars().any(char::is_control)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -556,5 +743,66 @@ mod tests {
             StepOutcome::parse(&no_slot.to_string()).unwrap().end,
             StepEnd::NoSlot
         );
+    }
+
+    /// A run file and an obligation read back as written, a write under way
+    /// included; a newer format, a short commit id, an entry that is a path
+    /// and an obligation's run id that is one are refused.
+    #[test]
+    fn a_run_file_and_an_obligation_read_back_and_refuse_what_is_not_theirs() {
+        let mut run = TicketRun::new(TicketId::new("OWL-3").unwrap());
+        run.generation = 7;
+        run.tip = Some("a".repeat(40));
+        run.ticket_ref = Some("b".repeat(64));
+        run.entry = Some("owl-3".to_owned());
+        assert_eq!(TicketRun::parse(&run.render()).unwrap(), run);
+        assert!(!run.render().contains("writing"), "{}", run.render());
+        run.writing = RunWriting {
+            ticket_ref: Some(RunTarget { to: None }),
+            tip: Some(RunTarget {
+                to: Some("c".repeat(40)),
+            }),
+        };
+        assert_eq!(TicketRun::parse(&run.render()).unwrap(), run);
+
+        let edit = |change: &dyn Fn(&mut serde_json::Value)| {
+            let mut document: serde_json::Value = serde_json::from_str(&run.render()).unwrap();
+            change(&mut document);
+            TicketRun::parse(&document.to_string())
+        };
+        assert!(matches!(
+            edit(&|d| d["format"] = 2.into()),
+            Err(ContractError::NewerFormat { found: 2, .. })
+        ));
+        assert!(edit(&|d| d["tip"] = "abc123".into()).is_err());
+        assert!(edit(&|d| d["writing"]["tip"]["to"] = "A".repeat(40).into()).is_err());
+        for entry in ["../x", "a/b", "", "..", "a\nb"] {
+            assert!(edit(&|d| d["entry"] = entry.into()).is_err(), "{entry:?}");
+        }
+
+        let obligation = RunObligation {
+            format: Format,
+            ticket: Some(TicketId::new("OWL-3").unwrap()),
+            run: "20261021T080318Z-2".to_owned(),
+            started: "2026-10-21T08:03:18Z".parse().unwrap(),
+            what: "run 20261021T080318Z-2 of OWL-3".to_owned(),
+        };
+        assert_eq!(
+            RunObligation::parse(&obligation.render()).unwrap(),
+            obligation
+        );
+        let gate = RunObligation {
+            ticket: None,
+            ..obligation.clone()
+        };
+        assert_eq!(RunObligation::parse(&gate.render()).unwrap(), gate);
+        for (run, what) in [("../x", "w"), ("r", "two\nlines")] {
+            let bad = RunObligation {
+                run: run.to_owned(),
+                what: what.to_owned(),
+                ..obligation.clone()
+            };
+            assert!(RunObligation::parse(&bad.render()).is_err(), "{run:?}");
+        }
     }
 }
