@@ -11418,6 +11418,11 @@ mod verify_scenarios;
 #[path = "on_demand/usage_scenarios.rs"]
 mod usage_scenarios;
 
+/// OWL-400's acceptance through the commands: the obligations, the sticky
+/// quarantine, the start of a step and a cut write.
+#[path = "on_demand/isolation_scenarios.rs"]
+mod isolation_scenarios;
+
 /// OWL-312's acceptance: `[roles.build] rules` reaches Build's brief after
 /// `stack.rules`, and not the resolver's; the `dispatch` event names every
 /// source; a named file the base commit lacks refuses the run.
