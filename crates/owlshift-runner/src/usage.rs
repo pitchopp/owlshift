@@ -390,4 +390,62 @@ mod tests {
             "gave no reset time: its runs wait, and one tries it again at 2026-10-20T14:00:00Z"
         ));
     }
+
+    #[test]
+    fn a_run_that_reports_a_window_at_the_cap_opens_its_pause_in_the_same_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = UsageStore::in_data_dir(dir.path()).with_caps([(Harness::Claude, 80)]);
+        assert_eq!(store.cap(Harness::Claude), Some(80));
+        assert_eq!(store.cap(Harness::Codex), None);
+        let reported = Reported {
+            windows: vec![(
+                "five_hour".to_owned(),
+                Window {
+                    share: 0.9,
+                    resets_at_ms: 5_000_000,
+                    read_at_ms: 1_000,
+                },
+            )],
+            answered: true,
+            ..Reported::default()
+        };
+        let ((), opened) = store
+            .update_at(Harness::Claude, 1_000, |state| {
+                usage::record(state, &reported, "r1", 1_000);
+            })
+            .unwrap();
+        assert_eq!(opened.len(), 1);
+        assert_eq!(
+            store.standing(Harness::Claude, 2_000).unwrap(),
+            Standing::Limited {
+                until_ms: 5_000_000
+            }
+        );
+        // Kept in the file, and no store without caps drops it.
+        let plain = UsageStore::in_data_dir(dir.path());
+        assert_eq!(plain.read(Harness::Claude).unwrap().episodes.len(), 1);
+        assert_eq!(
+            plain.standing(Harness::Claude, 2_000).unwrap(),
+            Standing::Limited {
+                until_ms: 5_000_000
+            }
+        );
+        // The cap raised: the pause ends at the next read.
+        let raised = UsageStore::in_data_dir(dir.path()).with_caps([(Harness::Claude, 95)]);
+        assert_eq!(
+            raised.standing(Harness::Claude, 2_000).unwrap(),
+            Standing::Free
+        );
+    }
+
+    #[test]
+    fn the_operator_reads_a_cap_in_fixed_words() {
+        let ticket = TicketId::new("DEMO-1").unwrap();
+        let until: Timestamp = "2026-10-20T14:00:00Z".parse().unwrap();
+        assert_eq!(
+            cap_line(&ticket, Harness::Claude, until),
+            "DEMO-1: Claude Code reached its usage cap: its runs wait until its window resets at \
+             2026-10-20T14:00:00Z"
+        );
+    }
 }
