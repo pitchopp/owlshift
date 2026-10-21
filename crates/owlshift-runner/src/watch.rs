@@ -134,7 +134,8 @@ use crate::project::{ProjectLock, TicketLock};
 use crate::quarantine::{self, Held, Record};
 use crate::reversal::{self, Current};
 use crate::step::{self, Children};
-use crate::ticket_ref::{self, Progress, RefAt, RefRead, Stored, TicketRecord};
+use crate::ticket_ref::{self, Progress, ProposalsFile, RefAt, RefRead, Stored, TicketRecord};
+use crate::ticket_run;
 use crate::writer::VisibleStage;
 
 mod drain;
@@ -1355,7 +1356,7 @@ impl Watch<'_> {
     /// were never this delivery's to answer. Nothing is written when the
     /// project is busy or the ref moved.
     fn date_delivery(&self, ticket: &TicketId, seen: &str, now: Timestamp) -> Result<(), String> {
-        let Some(_lock) = self.locked_at(ticket, seen)? else {
+        let Some((_project, ticket_lock)) = self.locked_at(ticket, seen)? else {
             return Ok(());
         };
         let git = &self.on_demand.executor.git;
@@ -1368,7 +1369,33 @@ impl Watch<'_> {
             return Ok(());
         };
         delivery.delivered_at = Some(now);
-        ticket_ref::write(git, &checkout, ticket, &record, Some(seen)).map(|_| ())
+        self.write_ref(&ticket_lock, ticket, &record, ProposalsFile::Keep, seen)
+            .map(|_| ())
+    }
+
+    /// Writes `record` as `ticket`'s ref, from `seen`, through its run file
+    /// (OWL-400), under the ticket's lock watch holds: a breach found there
+    /// quarantines the project.
+    fn write_ref(
+        &self,
+        ticket_lock: &TicketLock,
+        ticket: &TicketId,
+        record: &TicketRecord,
+        proposals: ProposalsFile<'_>,
+        seen: &str,
+    ) -> Result<String, String> {
+        let on_demand = self.on_demand;
+        ticket_run::write_ref(
+            &on_demand.executor.git,
+            on_demand.dirs,
+            &on_demand.dirs.checkout(),
+            ticket_lock,
+            ticket,
+            record,
+            proposals,
+            Some(seen),
+        )
+        .map_err(|fault| on_demand.ref_fault(ticket, fault))
     }
 
     /// A ticket in `status`, its round waiting at Watch (OWL-242) or parked
@@ -1460,7 +1487,7 @@ impl Watch<'_> {
     /// request, decided for a ticket in `status` at Build or Verify: its
     /// following ended, or its own push adopted. Under the project's lock
     /// from the start, since a person's `continue` may be running the loop:
-    /// busy, the ref moved or a run left the project unverified, nothing is
+    /// busy, the ref moved or the project is quarantined, nothing is
     /// moved or written (`Ok(None)`), and the next pass reads it again.
     /// Otherwise the stage moves to review, while it shows what `status`
     /// set, then the ref keeps what the read changed; where it is then is
@@ -1476,10 +1503,10 @@ impl Watch<'_> {
         now: Timestamp,
     ) -> Result<Option<RefAt>, String> {
         let on_demand = self.on_demand;
-        let Some(_lock) = self.locked_at(ticket, &stored.commit)? else {
+        let Some((_project, ticket_lock)) = self.locked_at(ticket, &stored.commit)? else {
             return Ok(None);
         };
-        if !matches!(on_demand.dirs.unverified(), Ok(None)) {
+        if !matches!(on_demand.dirs.quarantine(), Ok(None)) {
             return Ok(None);
         }
         let Some(changed) = follow::changed(&stored.record, PIPELINE, seen, now)? else {
@@ -1490,13 +1517,12 @@ impl Watch<'_> {
         } else {
             on_demand.review_after_working(ticket, sink);
         }
-        let git = &on_demand.executor.git;
-        let written = ticket_ref::write(
-            git,
-            &on_demand.dirs.checkout(),
+        let written = self.write_ref(
+            &ticket_lock,
             ticket,
             &changed.record,
-            Some(&stored.commit),
+            ProposalsFile::Keep,
+            &stored.commit,
         )?;
         // Told once the ref keeps it (OWL-239).
         if let Some(replaced) = &changed.replaced {
@@ -1562,7 +1588,7 @@ impl Watch<'_> {
         };
         // A run stopped since the snapshot may have left the project for a
         // person to look at first.
-        if !matches!(on_demand.dirs.unverified(), Ok(None)) {
+        if !matches!(on_demand.dirs.quarantine(), Ok(None)) {
             return;
         }
         match on_demand.unstick(ticket, status, sink) {
@@ -1682,16 +1708,15 @@ impl Watch<'_> {
         seen: &Stored,
         record: &TicketRecord,
     ) -> Result<Option<RefAt>, String> {
-        let Some(_lock) = self.locked_at(ticket, &seen.commit)? else {
+        let Some((_project, ticket_lock)) = self.locked_at(ticket, &seen.commit)? else {
             return Ok(None);
         };
-        let git = &self.on_demand.executor.git;
-        let commit = ticket_ref::write(
-            git,
-            &self.on_demand.dirs.checkout(),
+        let commit = self.write_ref(
+            &ticket_lock,
             ticket,
             record,
-            Some(&seen.commit),
+            ProposalsFile::Keep,
+            &seen.commit,
         )?;
         Ok(Some(RefAt {
             commit,
@@ -1733,7 +1758,10 @@ impl Watch<'_> {
         let dirs = self.on_demand.dirs;
         let checkout = dirs.checkout();
         let checked_out = fs::symlink_metadata(&checkout).is_ok();
-        if !checked_out && fs::symlink_metadata(dirs.unverified_file()).is_err() {
+        if !checked_out
+            && fs::symlink_metadata(dirs.quarantine_file()).is_err()
+            && fs::symlink_metadata(dirs.obligations_dir()).is_err()
+        {
             memory.quarantine = None;
             return Ok(Snapshot::default());
         }
@@ -1743,9 +1771,11 @@ impl Watch<'_> {
             Ok(None) => return Err(Project::Busy),
             Err(e) => return Err(Project::Unread(format!("the project's lock: {e}"))),
         };
-        let quarantine = match dirs.unverified() {
-            Ok(quarantine) => quarantine,
-            Err(e) => return Err(Project::Unread(format!("the project's marker: {e}"))),
+        // The quarantine, or a run left behind, which becomes it (OWL-400).
+        let quarantine = match ticket_run::look(dirs, None) {
+            Ok(ticket_run::Look::Quarantined { text, .. }) => Some(text),
+            Ok(ticket_run::Look::Clear { .. }) => None,
+            Err(e) => return Err(Project::Unread(format!("the project's quarantine: {e}"))),
         };
         match &quarantine {
             Some(marker) => self.keep_quarantine(memory, &lock, marker, sink),
@@ -2275,7 +2305,7 @@ impl Watch<'_> {
                 "a run's isolation check did not pass, so no ticket of the project is continued \
                  or built until a person clears the quarantine: `owlshift unquarantine` shows \
                  what {} says and clears it",
-                self.on_demand.dirs.unverified_file().display()
+                self.on_demand.dirs.quarantine_file().display()
             ),
             Project::Unread(reason) => format!("the ticket refs could not be read: {reason}"),
             Project::Watching { waiting, followed } => {

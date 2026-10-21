@@ -1,5 +1,6 @@
 //! `owlshift forget TICKET` (OWL-202): starts over what Owlshift keeps on a
-//! ticket between commands ([`ticket_ref::forget`]), for a ticket ref that
+//! ticket between commands (`ticket_ref::forget`, through the ticket's run
+//! file, [`ticket_run::forget_ref`]), for a ticket ref that
 //! has no room for its next write or cannot be read, so that neither needs
 //! git run by hand in the dedicated checkout.
 //!
@@ -19,7 +20,9 @@ use crate::events::{EventSink, data};
 use crate::executor::Git;
 use crate::on_demand::Stop;
 use crate::project::ProjectDirs;
-use crate::ticket_ref::{self, Forgot, Previous, TicketRecord};
+use crate::ticket_ref::{Forgot, Previous, TicketRecord};
+use crate::ticket_run::{self, Look, RunFault};
+use jiff::Timestamp;
 
 /// What `owlshift forget` did to a ticket's ref.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -49,7 +52,7 @@ pub fn forget(
     // for the moment of one ref write, so a command typed meanwhile reads
     // that message only for that moment. The ticket's own lock comes first
     // and, declared first, is let go last (OWL-409).
-    let _ticket_lock = match dirs.ticket_lock(ticket) {
+    let ticket_lock = match dirs.ticket_lock(ticket) {
         Ok(Some(lock)) => lock,
         Ok(None) => return Err(Stop::TicketBusy(ticket.clone())),
         Err(error) => return Err(Stop::Refused(format!("the ticket's lock: {error}"))),
@@ -59,9 +62,37 @@ pub fn forget(
         Ok(None) => return Err(Stop::Busy(dirs.root().to_owned())),
         Err(error) => return Err(Stop::Refused(format!("the project's lock: {error}"))),
     };
-    let forgot = ticket_ref::forget(git, &checkout, ticket)
-        .map_err(|e| Stop::Refused(format!("forgetting {ticket}: {e}")))?
-        .ok_or_else(|| nothing_to_forget(ticket))?;
+    // As every command, refused while the project is quarantined, a run left
+    // behind becoming the quarantine (OWL-400).
+    match ticket_run::look(dirs, Some(ticket)) {
+        Ok(Look::Clear { .. }) => {}
+        Ok(Look::Quarantined { path, text }) => {
+            return Err(Stop::Unverified { marker: path, text });
+        }
+        Err(error) => return Err(Stop::Refused(format!("the project's quarantine: {error}"))),
+    }
+    // Through the ticket's run file, as every write of its ref: a ref
+    // changed outside the runner's writes is a breach (OWL-400).
+    let forgot = match ticket_run::forget_ref(git, dirs, &checkout, &ticket_lock, ticket) {
+        Ok(forgot) => forgot.ok_or_else(|| nothing_to_forget(ticket))?,
+        Err(RunFault::Breach(why)) => {
+            let text = format!(
+                "{ticket} was found changed outside its runs at {}: {why}\n",
+                Timestamp::now()
+            );
+            return Err(match dirs.write_quarantine(&text) {
+                Ok(text) => Stop::Unverified {
+                    marker: dirs.quarantine_file(),
+                    text,
+                },
+                Err(error) => Stop::Refused(format!("the project's quarantine: {error}")),
+            });
+        }
+        Err(RunFault::Busy) => return Err(Stop::Busy(dirs.root().to_owned())),
+        Err(RunFault::Failed(why)) => {
+            return Err(Stop::Refused(format!("forgetting {ticket}: {why}")));
+        }
+    };
     let event = match &forgot {
         Forgot::Rewritten {
             previous,

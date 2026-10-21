@@ -1,23 +1,28 @@
 //! Telling a quarantine (OWL-368; architecture section 8, "The quarantine";
 //! build plan, "Telling a quarantine").
 //!
-//! A run that breaks isolation leaves the project's `unverified` marker, and
-//! every command then refuses the whole project on this machine until a
-//! person clears it ([`crate::project`]). This module says so to everyone it
-//! stops, once each:
+//! A run that breaks isolation writes the project's quarantine, and so does
+//! the first command or watch pass that finds a run's obligation left behind
+//! by a crash or a stop (OWL-400, [`crate::ticket_run`]); every command then
+//! refuses the whole project on this machine until a person clears it
+//! ([`crate::project`]). This module says so to everyone it stops, once
+//! each:
 //!
-//! - the operator, by the notifier: as the runner writes a breach marker
-//!   ([`written_line`]), or when watch finds a marker no command notified,
-//!   as a crash, a Ctrl-C or `owlshift gate` leaves ([`found_line`]);
+//! - the operator, by the notifier: as the runner writes a breach
+//!   ([`written_line`]), or when watch finds a quarantine no command
+//!   notified, as a crash, a Ctrl-C or `owlshift gate` leaves
+//!   ([`found_line`]);
 //! - each ticket it holds up, by one [`QuarantineWait`] comment;
-//! - `owlshift doctor`, through [`marker_state`];
+//! - `owlshift doctor`, through [`state`];
 //! - and [`clear`], `owlshift unquarantine`, lifts it once a person types the
 //!   project's name.
 //!
-//! What was told of a marker is its [`Record`], beside it, written only under
-//! the project's lock: so no later pass and no other process tells it again.
-//! Every marker's text is unique (it names its run or the time it was
-//! written), and a record is keyed by that text's hash.
+//! What was told of the quarantine is its [`Record`], beside it, written only
+//! under the project's lock: so no later pass and no other process tells it
+//! again. Every quarantine's text is unique (it names its runs or the time
+//! it was written; a breach while one stands is added to it, a new text),
+//! and a record is keyed by that text's hash. The texts this module calls a
+//! marker are the quarantine's.
 
 use std::collections::BTreeSet;
 use std::fs;
@@ -35,10 +40,12 @@ use owlshift_contracts::format::Format;
 use owlshift_contracts::ids::TicketId;
 
 use crate::events::{EventSink, data, printable};
+use crate::executor::Git;
 use crate::executor::Violation;
 use crate::notify;
 use crate::on_demand;
 use crate::project::{ProjectDirs, ProjectLock};
+use crate::ticket_run::{self, Standing};
 use crate::writer::Writer;
 
 /// The breach of a kept worktree whose `.git` link changed between runs.
@@ -78,7 +85,7 @@ fn marker_hash(marker: &str) -> String {
         .collect()
 }
 
-/// What was told of one marker, kept in `unverified-told` beside it: its
+/// What was told of one quarantine, kept in `quarantine-told` beside it: its
 /// text's hash on the first line, `notified` once the operator was, then a
 /// `told <ticket>` line for each ticket told that it waits.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -120,7 +127,7 @@ impl Record {
         _lock: &ProjectLock,
         marker: &str,
     ) -> io::Result<()> {
-        if dirs.unverified()?.as_deref() != Some(marker) {
+        if dirs.quarantine()?.as_deref() != Some(marker) {
             return Ok(());
         }
         let mut record = Self::read(dirs, marker);
@@ -133,7 +140,7 @@ impl Record {
         for ticket in &record.told {
             text.push_str(&format!("told {ticket}\n"));
         }
-        let partial = dirs.root().join("unverified-told.partial");
+        let partial = dirs.root().join("quarantine-told.partial");
         fs::write(&partial, text)?;
         fs::rename(&partial, dirs.told_file())
     }
@@ -320,45 +327,77 @@ impl QuarantineWait {
     }
 }
 
-/// Where the project's marker stands, for `owlshift doctor`.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum MarkerState {
-    /// No marker: the project is not quarantined.
-    Clear,
-    /// A marker, while another command holds the project's lock: every run
-    /// writes one as it starts, so it may only say that a run is in flight.
-    InFlight,
-    /// A marker with the lock free: the project is quarantined.
-    Marked { path: PathBuf, text: String },
+/// Where the quarantine stands, for `owlshift doctor` and `owlshift
+/// unquarantine` (OWL-400): the quarantine, when one stands, with the file it
+/// is in, and every run's obligation, running or left behind.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct MarkerState {
+    pub quarantine: Option<(PathBuf, String)>,
+    pub obligations: Vec<Standing>,
 }
 
-/// Where the marker of the project at `dirs` stands: read, then, when there
-/// is one, read again under the project's lock, tried once and released at
-/// once: a look, which never waits (OWL-414).
-pub fn marker_state(dirs: &ProjectDirs) -> io::Result<MarkerState> {
-    if dirs.unverified()?.is_none() {
-        return Ok(MarkerState::Clear);
+impl MarkerState {
+    /// The obligations of runs that ended before their check passed: what
+    /// the next command or watch pass turns into the quarantine.
+    pub fn left_behind(&self) -> impl Iterator<Item = &Standing> {
+        self.obligations.iter().filter(|standing| !standing.running)
     }
-    let Some(_lock) = dirs.try_lock()? else {
-        return Ok(MarkerState::InFlight);
-    };
-    Ok(match dirs.unverified()? {
-        None => MarkerState::Clear,
-        Some(text) => MarkerState::Marked {
-            path: dirs.unverified_file(),
-            text,
-        },
+
+    /// The obligations of runs still in flight.
+    pub fn running(&self) -> impl Iterator<Item = &Standing> {
+        self.obligations.iter().filter(|standing| standing.running)
+    }
+
+    /// Whether the project is refused, or will be by the next command: a
+    /// quarantine stands, or an obligation was left behind.
+    pub fn refused(&self) -> bool {
+        self.quarantine.is_some() || self.left_behind().next().is_some()
+    }
+
+    /// The names of the obligations left behind.
+    fn left_names(&self) -> Vec<&str> {
+        self.left_behind()
+            .map(|standing| standing.found.name.as_str())
+            .collect()
+    }
+
+    /// What a clear lifts, as its event records it: the quarantine's text,
+    /// then a line for each obligation left behind that it does not name.
+    fn text(&self, dirs: &ProjectDirs) -> String {
+        let mut text = self
+            .quarantine
+            .as_ref()
+            .map(|(_, text)| text.clone())
+            .unwrap_or_default();
+        for standing in self.left_behind() {
+            let line = ticket_run::describe(dirs, &standing.found);
+            if !text.contains(line.trim_end()) {
+                text.push_str(&line);
+            }
+        }
+        text
+    }
+}
+
+/// Where the quarantine of the project at `dirs` stands, looked at without
+/// waiting on any lock: a lock just released can read as held a moment
+/// longer, showing a run as still in flight (OWL-414).
+pub fn state(dirs: &ProjectDirs) -> io::Result<MarkerState> {
+    Ok(MarkerState {
+        quarantine: dirs.quarantine_at()?,
+        obligations: ticket_run::standing(dirs)?,
     })
 }
 
 /// What [`clear`] did.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Cleared {
-    /// There was no marker.
+    /// There was no quarantine and no obligation left behind.
     Nothing,
     /// The answer was not the project's name: the quarantine stands.
     Kept,
-    /// The marker, whose text this was, is gone.
+    /// The quarantine, whose text this was, and the obligations left behind
+    /// are gone.
     Cleared { marker: String },
 }
 
@@ -367,87 +406,145 @@ fn locked(dirs: &ProjectDirs) -> Result<ProjectLock, String> {
     match dirs.lock() {
         Ok(Some(lock)) => Ok(lock),
         Ok(None) => Err(format!(
-            "another `owlshift` command is working this project ({}), and a run writes the marker \
-             as it starts: run `owlshift unquarantine` again once it ends",
+            "another `owlshift` command is working this project ({}): run `owlshift \
+             unquarantine` again once it ends",
             dirs.root().display()
         )),
         Err(error) => Err(format!("the project's lock: {error}")),
     }
 }
 
-/// `owlshift unquarantine`: shows the marker of the project at `dirs`, whose
-/// name the events record (`sink`), through `ask`, which prints its prompt
-/// and returns the line a person typed, and clears the marker and its record
-/// only if that line is the project's name. The marker is read under the
-/// project's lock, released while the person answers, then taken again: the
-/// marker is cleared only if it is still the one shown. One project-level
-/// `decision` event (`unquarantined`, with the marker's text) records it.
+/// `owlshift unquarantine`: shows the quarantine of the project at `dirs`,
+/// whose name the events record (`sink`), and the obligations of runs left
+/// behind, through `ask`, which prints its prompt and returns the line a
+/// person typed; and clears them only if that line is the project's name
+/// (OWL-400). They are read under the project's lock, released while the
+/// person answers, then taken again: they are cleared only if they are still
+/// the ones shown. Then, in this order, so that a clear cut short leaves the
+/// quarantine for a second one: every ticket's run file is taken afresh from
+/// its refs as they are, the checkout being kept ([`ticket_run::rebaseline`],
+/// never a ticket whose lock is held); the obligations left behind are
+/// removed, never one of a run in flight; and the quarantine with its record
+/// last. One project-level `decision` event (`unquarantined`, with the text
+/// and the obligations' names) records it.
 pub fn clear(
+    git: &Git,
     dirs: &ProjectDirs,
     ask: &mut dyn FnMut(&str) -> io::Result<String>,
     sink: &mut EventSink<'_>,
 ) -> Result<Cleared, String> {
-    let marker_error = |error: io::Error| format!("the project's marker: {error}");
+    let quarantine_error = |error: io::Error| format!("the project's quarantine: {error}");
     // A project never run has no folder, which the lock would make. Only a
-    // marker missing is no quarantine: one that cannot be looked at is.
-    match fs::symlink_metadata(dirs.unverified_file()) {
-        Ok(_) => {}
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Cleared::Nothing),
-        Err(error) => return Err(marker_error(error)),
+    // quarantine missing is none: one that cannot be looked at is one.
+    if dirs.quarantine_at().map_err(quarantine_error)?.is_none()
+        && ticket_run::obligations(dirs)
+            .map_err(quarantine_error)?
+            .is_empty()
+    {
+        return Ok(Cleared::Nothing);
     }
-    let marker = {
+    let shown = {
         let _lock = locked(dirs)?;
-        match dirs.unverified().map_err(marker_error)? {
-            Some(marker) => marker,
-            None => return Ok(Cleared::Nothing),
-        }
+        state(dirs).map_err(quarantine_error)?
     };
+    if !shown.refused() {
+        return Ok(Cleared::Nothing);
+    }
     let project = sink.project().to_owned();
-    let answer = ask(&prompt(dirs, &project, &marker))
+    let answer = ask(&prompt(dirs, &project, &shown))
         .map_err(|error| format!("reading the answer: {error}"))?;
     if answer.trim() != project {
         return Ok(Cleared::Kept);
     }
     let _lock = locked(dirs)?;
-    match dirs.unverified().map_err(marker_error)? {
-        Some(now) if now == marker => {}
-        None => return Ok(Cleared::Nothing),
-        Some(_) => {
-            return Err(
-                "the marker changed while you answered: run `owlshift unquarantine` again to see \
-                 what it says now"
-                    .to_owned(),
-            );
-        }
+    let now = state(dirs).map_err(quarantine_error)?;
+    if !now.refused() {
+        return Ok(Cleared::Nothing);
     }
-    dirs.clear_unverified().map_err(marker_error)?;
-    sink.emit_project(
-        None,
-        EventKind::Decision,
-        data([("unquarantined", json!(marker))]),
-    );
-    Ok(Cleared::Cleared { marker })
+    if now.quarantine != shown.quarantine || now.left_names() != shown.left_names() {
+        return Err(
+            "the quarantine changed while you answered: run `owlshift unquarantine` again to see \
+             what it says now"
+                .to_owned(),
+        );
+    }
+    let skipped = ticket_run::rebaseline(git, dirs).map_err(|why| {
+        format!(
+            "the tickets' run files could not be taken afresh ({why}): the quarantine stands, \
+             run `owlshift unquarantine` again"
+        )
+    })?;
+    let text = now.text(dirs);
+    let names: Vec<&str> = now.left_names();
+    for name in &names {
+        ticket_run::remove_obligation(dirs, name).map_err(|error| {
+            format!(
+                "the obligation {name}: {error}; the quarantine stands, run `owlshift \
+                 unquarantine` again"
+            )
+        })?;
+    }
+    dirs.clear_quarantine().map_err(quarantine_error)?;
+    let mut event = data([
+        ("unquarantined", json!(text)),
+        ("obligations", json!(names)),
+    ]);
+    if !skipped.is_empty() {
+        event.insert("run_files_kept".to_owned(), json!(skipped));
+    }
+    sink.emit_project(None, EventKind::Decision, event);
+    Ok(Cleared::Cleared { marker: text })
 }
 
 /// What `owlshift unquarantine` shows before it asks.
-fn prompt(dirs: &ProjectDirs, project: &str, marker: &str) -> String {
-    let shown = |path: &Path| path.display().to_string();
-    let text: String = marker
-        .trim_end()
-        .lines()
-        .map(|line| format!("  {line}\n"))
+fn prompt(dirs: &ProjectDirs, project: &str, shown: &MarkerState) -> String {
+    let display = |path: &Path| path.display().to_string();
+    let indented = |text: &str| -> String {
+        text.trim_end()
+            .lines()
+            .map(|line| format!("  {line}\n"))
+            .collect()
+    };
+    let mut said = String::new();
+    if let Some((path, text)) = &shown.quarantine {
+        said.push_str(&format!(
+            "Its quarantine, {}, says:\n{}",
+            display(path),
+            indented(text)
+        ));
+    }
+    let left: String = shown
+        .left_behind()
+        .map(|standing| ticket_run::describe(dirs, &standing.found))
         .collect();
+    if !left.is_empty() {
+        said.push_str(&format!(
+            "Runs that ended before their isolation check passed, whose obligations in {} go \
+             with it:\n{}",
+            display(&dirs.obligations_dir()),
+            indented(&left)
+        ));
+    }
+    let running: Vec<&str> = shown
+        .running()
+        .map(|standing| standing.found.name.as_str())
+        .collect();
+    if !running.is_empty() {
+        said.push_str(&format!(
+            "Runs still in flight, whose obligations stay and are checked as usual: {}\n",
+            running.join(", ")
+        ));
+    }
     printable(&format!(
-        "{project} is quarantined: Owlshift refuses it on this machine. Its marker, {}, says:\n\
-         {text}\
+        "{project} is quarantined: Owlshift refuses it on this machine. {said}\
          Clearing it keeps the dedicated checkout ({}) and the worktrees ({}) as they are: \
-         whatever the run changed there stays, and the next runs start from it. To start from a \
-         fresh clone instead, keep the quarantine, delete those two folders (the ticket refs go \
-         with the checkout), then run `owlshift unquarantine` again.\n\
+         whatever the runs changed there stays, and the next runs start from it, each ticket's \
+         run file taken afresh from its refs. To start from a fresh clone instead, keep the \
+         quarantine, delete those two folders (the ticket refs go with the checkout), then run \
+         `owlshift unquarantine` again.\n\
          Type {project} to clear the quarantine, anything else to keep it: ",
-        shown(&dirs.unverified_file()),
-        shown(&dirs.checkout()),
-        shown(&dirs.worktrees()),
+        display(&dirs.checkout()),
+        display(&dirs.worktrees()),
     ))
 }
 
@@ -517,7 +614,7 @@ mod tests {
         }
 
         fn mark(&self, text: &str) {
-            self.dirs.mark_unverified(text).unwrap();
+            fs::write(self.dirs.quarantine_file(), text).unwrap();
         }
 
         fn events(&self) -> Vec<Event> {
@@ -641,7 +738,7 @@ mod tests {
         assert_eq!(Record::read(dirs, BREACH), told(&["OWL-1", "OWL-2"]));
         assert_eq!(Record::read(dirs, "other"), Record::default());
         // A passed check removes both.
-        dirs.clear_unverified().unwrap();
+        dirs.clear_quarantine().unwrap();
         assert!(!dirs.told_file().exists());
     }
 
@@ -704,10 +801,15 @@ mod tests {
             };
             let mut out = Vec::new();
             let mut sink = EventSink::new("acme/app", bench.log.clone(), &mut out);
-            let cleared = clear(&bench.dirs, &mut ask, &mut sink);
+            let cleared = clear(
+                &crate::project::runner_git(),
+                &bench.dirs,
+                &mut ask,
+                &mut sink,
+            );
             drop(sink);
             drop(held);
-            let left = bench.dirs.unverified().unwrap();
+            let left = bench.dirs.quarantine().unwrap();
             match case {
                 "cleared" => {
                     assert_eq!(
@@ -762,13 +864,21 @@ mod tests {
         let mut ask = |_: &str| -> io::Result<String> { unreachable!("nothing is shown") };
         let mut out = Vec::new();
         let mut sink = EventSink::new("acme/app", bench.log.clone(), &mut out);
-        let cleared = clear(&bench.dirs, &mut ask, &mut sink);
+        let cleared = clear(
+            &crate::project::runner_git(),
+            &bench.dirs,
+            &mut ask,
+            &mut sink,
+        );
         fs::set_permissions(root, fs::Permissions::from_mode(0o700)).unwrap();
         if !superuser {
             let refused = cleared.unwrap_err();
-            assert!(refused.starts_with("the project's marker: "), "{refused}");
+            assert!(
+                refused.starts_with("the project's quarantine: "),
+                "{refused}"
+            );
         }
-        assert_eq!(bench.dirs.unverified().unwrap().as_deref(), Some(BREACH));
+        assert_eq!(bench.dirs.quarantine().unwrap().as_deref(), Some(BREACH));
     }
 
     /// A marker the person did not see is never cleared: one written while
@@ -783,13 +893,19 @@ mod tests {
         };
         let mut out = Vec::new();
         let mut sink = EventSink::new("acme/app", bench.log.clone(), &mut out);
-        let refused = clear(&bench.dirs, &mut ask, &mut sink).unwrap_err();
+        let refused = clear(
+            &crate::project::runner_git(),
+            &bench.dirs,
+            &mut ask,
+            &mut sink,
+        )
+        .unwrap_err();
         assert!(refused.contains("changed while you answered"), "{refused}");
-        assert!(bench.dirs.unverified().unwrap().is_some());
+        assert!(bench.dirs.quarantine().unwrap().is_some());
     }
 
-    /// Run alone, as the clear above: the lock `marker_state` released is
-    /// taken again.
+    /// Run alone, as the clear above: the locks `state` tried are taken
+    /// again.
     #[test]
     fn doctor_tells_a_quarantine_from_a_run_in_flight() {
         crate::alone::run_alone(
@@ -804,16 +920,83 @@ mod tests {
             return;
         }
         let bench = Bench::new();
-        assert_eq!(marker_state(&bench.dirs).unwrap(), MarkerState::Clear);
+        let clear = state(&bench.dirs).unwrap();
+        assert!(!clear.refused() && clear.obligations.is_empty());
+        let owl_8 = TicketId::new("OWL-8").unwrap();
+        ticket_run::write_obligation(&bench.dirs, Some(&owl_8), "r8", "Run r8 of OWL-8").unwrap();
+        let held = bench.dirs.ticket_lock(&owl_8).unwrap().unwrap();
+        let running = state(&bench.dirs).unwrap();
+        assert!(!running.refused(), "a run in flight refuses nothing");
+        assert_eq!(running.running().count(), 1);
+        drop(held);
+        let left = state(&bench.dirs).unwrap();
+        assert!(left.refused(), "a run left behind is refused next");
+        assert_eq!(left.left_behind().count(), 1);
         bench.mark(BREACH);
         assert_eq!(
-            marker_state(&bench.dirs).unwrap(),
-            MarkerState::Marked {
-                path: bench.dirs.unverified_file(),
-                text: BREACH.to_owned()
-            }
+            state(&bench.dirs).unwrap().quarantine,
+            Some((bench.dirs.quarantine_file(), BREACH.to_owned()))
         );
-        let _held = bench.dirs.lock().unwrap().unwrap();
-        assert_eq!(marker_state(&bench.dirs).unwrap(), MarkerState::InFlight);
+    }
+
+    /// A clear removes the obligations left behind with the quarantine,
+    /// never one of a run in flight, and takes every run file afresh, so
+    /// the next command runs; with only obligations left behind and no
+    /// quarantine written yet, it clears them too (OWL-400). Run alone:
+    /// locks are taken again.
+    #[test]
+    fn a_clear_retires_the_obligations_left_behind_never_a_running_one() {
+        crate::alone::run_alone(
+            "quarantine::tests::helper_a_clear_retires_the_obligations_left_behind_never_a_running_one",
+        );
+    }
+
+    #[test]
+    #[ignore = "helper, run by the test above"]
+    fn helper_a_clear_retires_the_obligations_left_behind_never_a_running_one() {
+        if !crate::alone::running_alone() {
+            return;
+        }
+        let bench = Bench::new();
+        let dirs = &bench.dirs;
+        let (left, running) = (owl_7(), TicketId::new("OWL-8").unwrap());
+        let gone =
+            ticket_run::write_obligation(dirs, Some(&left), "r7", "Run r7 of OWL-7").unwrap();
+        let kept =
+            ticket_run::write_obligation(dirs, Some(&running), "r8", "Run r8 of OWL-8").unwrap();
+        let _held = dirs.ticket_lock(&running).unwrap().unwrap();
+        let mut shown = Vec::new();
+        let mut ask = |prompt: &str| {
+            shown.push(prompt.to_owned());
+            Ok("acme/app\n".to_owned())
+        };
+        let mut out = Vec::new();
+        let mut sink = EventSink::new("acme/app", bench.log.clone(), &mut out);
+        let cleared = clear(&crate::project::runner_git(), dirs, &mut ask, &mut sink).unwrap();
+        drop(sink);
+        let Cleared::Cleared { marker } = cleared else {
+            panic!("{cleared:?}");
+        };
+        assert!(marker.contains("Run r7 of OWL-7"), "{marker}");
+        assert!(shown[0].contains("Run r7 of OWL-7"), "{shown:?}");
+        assert!(
+            shown[0].contains(&format!(
+                "still in flight, whose obligations stay and are checked as usual: {kept}"
+            )),
+            "{shown:?}"
+        );
+        assert!(!dirs.obligations_dir().join(&gone).exists());
+        assert!(dirs.obligations_dir().join(&kept).exists());
+        assert_eq!(dirs.quarantine().unwrap(), None);
+        let events = bench.events();
+        assert_eq!(events[0].data["obligations"], json!([gone]));
+        // Nothing left to clear: the running one alone refuses nothing.
+        let mut never = |_: &str| -> io::Result<String> { unreachable!("nothing is shown") };
+        let mut out = Vec::new();
+        let mut sink = EventSink::new("acme/app", bench.log.clone(), &mut out);
+        assert_eq!(
+            clear(&crate::project::runner_git(), dirs, &mut never, &mut sink),
+            Ok(Cleared::Nothing)
+        );
     }
 }

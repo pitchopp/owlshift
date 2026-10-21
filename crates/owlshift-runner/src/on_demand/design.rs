@@ -1013,9 +1013,7 @@ impl OnDemand<'_> {
     ) -> Result<Dispatched, Stop> {
         p.base = project::sync_checkout(&self.executor.git, self.dirs, self.remote_url)
             .map_err(Stop::Refused)?;
-        self.executor
-            .start_from_base(&p.checkout, &p.worktree, &p.branch, &p.base.commit)
-            .map_err(|e| refused("starting the ticket's branch from the base", e))?;
+        self.start_from_base(p)?;
         self.dispatch(p, command, sink)
     }
 

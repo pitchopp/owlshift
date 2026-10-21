@@ -159,6 +159,7 @@ impl Bench {
             brief,
             setup: &[],
             session: None,
+            siblings: None,
         };
         executor.run(&spec, harness)
     }
@@ -179,6 +180,7 @@ impl Bench {
             brief: &self.brief,
             setup: &[],
             session: None,
+            siblings: None,
         };
         self.executor
             .run(&spec, &NeverRuns)
@@ -919,6 +921,7 @@ fn a_resume_without_its_transcript_starts_the_runs_own_session() {
             brief: &bench.brief,
             setup: &[],
             session: Some(&plan),
+            siblings: None,
         };
         bench.executor.run(&spec, harness)
     };
@@ -1247,6 +1250,7 @@ mod setup {
                 brief,
                 setup: &setup,
                 session: None,
+                siblings: None,
             };
             executor.run(&spec, harness).unwrap()
         }
@@ -1655,5 +1659,347 @@ mod setup {
         );
         assert!(report.setup.is_none() && report.gate.is_none());
         assert!(!bench.worktree.join(".owlshift/run/count").exists());
+    }
+}
+
+/// Two runs at once through the executor (OWL-400; architecture section 8,
+/// "Isolation among steps"): each ticket's check is told the other from
+/// its run file and its lock, as `owlshift do` tells it.
+mod among {
+    use std::sync::Barrier;
+    use std::thread;
+    use std::time::Instant;
+
+    use owlshift_adapters::forge::Repo;
+    use owlshift_runner::on_demand::branch_for;
+    use owlshift_runner::project::{ProjectDirs, TicketLock};
+    use owlshift_runner::ticket_ref::{self, ProposalsFile, Unguarded};
+    use owlshift_runner::ticket_run::{self, Siblings};
+
+    use super::*;
+
+    /// A harness whose run is `during`, called with the worktree while its
+    /// process (`git --version`) runs; it leaves no result.
+    struct During<F>(F);
+
+    impl<F: Fn(&Path)> Harness for During<F> {
+        fn command(&self, _run: &HarnessRun<'_>) -> Result<Command, HarnessError> {
+            let mut command = Command::new("git");
+            command.arg("--version");
+            Ok(command)
+        }
+
+        fn drive(
+            &self,
+            run: &HarnessRun<'_>,
+            child: &mut Child,
+            log: &mut RunLog,
+        ) -> io::Result<HarnessEnd> {
+            (self.0)(run.worktree);
+            let ended = drive_plain(child, log)?;
+            Ok(HarnessEnd::new(ended.exit_code, HarnessStatus::Completed))
+        }
+    }
+
+    /// The executor's bench with a project folder for the run files, and
+    /// two tickets, each with its worktree and its ticket ref.
+    struct Two {
+        bench: Bench,
+        dirs: ProjectDirs,
+        a: TicketId,
+        b: TicketId,
+    }
+
+    impl Two {
+        fn new() -> Self {
+            let bench = Bench::new();
+            let dirs = ProjectDirs::new(
+                &bench.tmp.path().join("data"),
+                &Repo::parse("acme/app").unwrap(),
+            );
+            let two = Self {
+                bench,
+                dirs,
+                a: TicketId::new("T-1").unwrap(),
+                b: TicketId::new("T-2").unwrap(),
+            };
+            let base = two.at("origin/main");
+            for ticket in [&two.a, &two.b] {
+                let worktree = two.worktree(ticket);
+                two.bench
+                    .env
+                    .run(
+                        &two.bench.main,
+                        &[
+                            "worktree",
+                            "add",
+                            "--quiet",
+                            "-b",
+                            &branch_for(ticket),
+                            worktree.to_str().unwrap(),
+                            &base,
+                        ],
+                    )
+                    .unwrap();
+                ticket_ref::write_proposals_guarded(
+                    &two.bench.executor.git,
+                    &two.bench.main,
+                    ticket,
+                    &ticket_ref::blank(None),
+                    ProposalsFile::Keep,
+                    None,
+                    &mut Unguarded,
+                )
+                .unwrap();
+                let lock = two.lock(ticket);
+                two.open(&lock, ticket);
+            }
+            two
+        }
+
+        fn worktree(&self, ticket: &TicketId) -> PathBuf {
+            self.bench
+                .tmp
+                .path()
+                .join(format!("wt-{}", ticket.as_str().to_lowercase()))
+        }
+
+        fn at(&self, rev: &str) -> String {
+            let out = self
+                .bench
+                .env
+                .run(&self.bench.main, &["rev-parse", rev])
+                .unwrap();
+            String::from_utf8(out).unwrap().trim().to_owned()
+        }
+
+        fn lock(&self, ticket: &TicketId) -> TicketLock {
+            self.dirs
+                .ticket_lock(ticket)
+                .unwrap()
+                .expect("the ticket's lock")
+        }
+
+        /// The start of a step: the run file checked, or made.
+        fn open(&self, lock: &TicketLock, ticket: &TicketId) {
+            let entry = ticket_run::entry_of(&self.bench.main, &self.worktree(ticket));
+            ticket_run::open(
+                &self.bench.executor.git,
+                &self.dirs,
+                &self.bench.main,
+                lock,
+                ticket,
+                entry.as_deref(),
+            )
+            .unwrap();
+        }
+
+        /// A run of `ticket`, under its `lock`, through the executor, told of
+        /// the other ticket; recorded in its run file after, as
+        /// `owlshift do` records it.
+        fn run(&self, lock: &TicketLock, ticket: &TicketId, during: &dyn Fn(&Path)) -> RunReport {
+            let git = &self.bench.executor.git;
+            ticket_run::run_started(git, &self.dirs, &self.bench.main, lock, ticket).unwrap();
+            let siblings = Siblings::new(&self.dirs, ticket);
+            let worktree = self.worktree(ticket);
+            let branch = branch_for(ticket);
+            let run_dir = self
+                .bench
+                .tmp
+                .path()
+                .join(format!("run-{}", ticket.as_str().to_lowercase()));
+            let spec = RunSpec {
+                main: &self.bench.main,
+                worktree: &worktree,
+                branch: &branch,
+                base: "origin/main",
+                run_dir: &run_dir,
+                brief: &self.bench.brief,
+                setup: &[],
+                session: None,
+                siblings: Some(&siblings),
+            };
+            let report = self.bench.executor.run(&spec, &During(during)).unwrap();
+            ticket_run::run_ended(git, &self.dirs, &self.bench.main, lock, ticket, &worktree)
+                .unwrap();
+            report
+        }
+
+        /// A write of `ticket`'s ref through its run file, as the runner
+        /// makes between its runs.
+        fn write_ref(&self, lock: &TicketLock, ticket: &TicketId) {
+            let git = &self.bench.executor.git;
+            let previous = ticket_ref::read(git, &self.bench.main, ticket)
+                .unwrap()
+                .map(|stored| stored.commit);
+            let mut record = ticket_ref::blank(None);
+            record.state.round += 1;
+            ticket_run::write_ref(
+                git,
+                &self.dirs,
+                &self.bench.main,
+                lock,
+                ticket,
+                &record,
+                ProposalsFile::Keep,
+                previous.as_deref(),
+            )
+            .unwrap();
+        }
+
+        /// Waits for `ticket`'s lock to read free: a child spawned while it
+        /// was held can keep it a moment after its release (OWL-414).
+        fn until_free(&self, ticket: &TicketId) {
+            let started = Instant::now();
+            while self.dirs.ticket_lock_held(ticket).unwrap() {
+                assert!(started.elapsed() < Duration::from_secs(5), "still held");
+                thread::sleep(Duration::from_millis(10));
+            }
+        }
+
+        fn commit_in(&self, worktree: &Path, message: &str) {
+            self.bench
+                .env
+                .run(
+                    worktree,
+                    &["commit", "--quiet", "--allow-empty", "-m", message],
+                )
+                .unwrap();
+        }
+    }
+
+    fn quarantined(report: &RunReport) -> Vec<Violation> {
+        match &report.outcome {
+            Outcome::Quarantined(violations) => violations.clone(),
+            _ => Vec::new(),
+        }
+    }
+
+    /// Acceptance: a sibling's ref write and its worktree entry are no
+    /// breach. Both tickets run at once, each in a thread of its own; while
+    /// both runs are in flight each commits in its own worktree, then B's
+    /// runner writes B's ref through its run file, and A's check runs either
+    /// while B's command still holds its lock or once B ended; B's check
+    /// ran while A's run was in flight. Neither is a breach.
+    #[test]
+    fn a_siblings_ref_write_and_worktree_entry_are_no_breach() {
+        for b_ended in [false, true] {
+            let two = Two::new();
+            let both_running = Barrier::new(2);
+            let b_wrote = Barrier::new(2);
+            let a_checked = Barrier::new(2);
+            let (a_report, b_report) = thread::scope(|scope| {
+                let b = scope.spawn(|| {
+                    let lock = two.lock(&two.b);
+                    two.open(&lock, &two.b);
+                    let report = two.run(&lock, &two.b, &|worktree| {
+                        both_running.wait();
+                        two.commit_in(worktree, "B's work");
+                    });
+                    two.write_ref(&lock, &two.b);
+                    if b_ended {
+                        drop(lock);
+                        b_wrote.wait();
+                    } else {
+                        b_wrote.wait();
+                        a_checked.wait();
+                    }
+                    report
+                });
+                let lock = two.lock(&two.a);
+                two.open(&lock, &two.a);
+                let report = two.run(&lock, &two.a, &|worktree| {
+                    both_running.wait();
+                    two.commit_in(worktree, "A's work");
+                    b_wrote.wait();
+                    if b_ended {
+                        two.until_free(&two.b);
+                    }
+                });
+                if !b_ended {
+                    a_checked.wait();
+                }
+                (report, b.join().unwrap())
+            });
+            assert_eq!(quarantined(&a_report), [], "b ended: {b_ended}");
+            assert_eq!(quarantined(&b_report), [], "b ended: {b_ended}");
+        }
+    }
+
+    /// A ticket that ended since a run's snapshot is held to what its run
+    /// file records: a run that moves its branch, or its ref, after that is
+    /// found by the run's check, and at that ticket's next start.
+    #[test]
+    fn an_ended_siblings_branch_or_ref_moved_by_a_run_is_found() {
+        for moved in ["branch", "ticket ref"] {
+            let two = Two::new();
+            let git = &two.bench.executor.git;
+            let lock = two.lock(&two.a);
+            let b_branch = format!("refs/heads/{}", branch_for(&two.b));
+            let b_ref = owlshift_contracts::refs::ticket_ref(&two.b);
+            let report = two.run(&lock, &two.a, &|_| {
+                // B's runner writes its ref during A's run, so B ended since
+                // A's snapshot; then A's run moves B's branch or ref.
+                let b_lock = two.lock(&two.b);
+                two.write_ref(&b_lock, &two.b);
+                drop(b_lock);
+                two.until_free(&two.b);
+                let target = if moved == "branch" { &b_branch } else { &b_ref };
+                let planted = two
+                    .bench
+                    .env
+                    .run(
+                        &two.bench.main,
+                        &["commit-tree", "HEAD^{tree}", "-p", "HEAD", "-m", "planted"],
+                    )
+                    .unwrap();
+                let planted = String::from_utf8(planted).unwrap().trim().to_owned();
+                two.bench
+                    .env
+                    .run(&two.bench.main, &["update-ref", target, &planted])
+                    .unwrap();
+            });
+            let expected = if moved == "branch" { &b_branch } else { &b_ref };
+            assert!(
+                quarantined(&report)
+                    .iter()
+                    .any(|v| matches!(v, Violation::Refs(refs) if refs.contains(expected))),
+                "{moved}: {:?}",
+                report.outcome
+            );
+            drop(lock);
+            let b_lock = two.lock(&two.b);
+            let entry = ticket_run::entry_of(&two.bench.main, &two.worktree(&two.b));
+            let opened = ticket_run::open(
+                git,
+                &two.dirs,
+                &two.bench.main,
+                &b_lock,
+                &two.b,
+                entry.as_deref(),
+            );
+            assert!(
+                matches!(opened, Err(ticket_run::RunFault::Breach(_))),
+                "{moved}: {opened:?}"
+            );
+        }
+    }
+
+    /// A sibling's run file that cannot be read, as a run takes its
+    /// snapshot, is that run's check failing: a lost record never widens
+    /// what a check leaves out.
+    #[test]
+    fn an_unreadable_sibling_run_file_fails_the_check() {
+        let two = Two::new();
+        fs::write(two.dirs.run_file(&two.b), "{").unwrap();
+        let lock = two.lock(&two.a);
+        let report = two.run(&lock, &two.a, &|_| {});
+        assert!(
+            quarantined(&report)
+                .iter()
+                .any(|v| matches!(v, Violation::CheckFailed(why) if why.contains("run.json"))),
+            "{:?}",
+            report.outcome
+        );
     }
 }

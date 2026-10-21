@@ -13,24 +13,29 @@
 //!     worktrees/<ticket>/  one worktree per ticket
 //!     runs/<ticket>/<run>/ brief.json, stdout.log, stderr.log, gate.log
 //!     lock                 held by the one `owlshift do` working the project
-//!     unverified           a run whose isolation check has not passed
+//!     unverified/          the runs whose isolation check has not passed
+//!     quarantine           a breach, or a run left unchecked (OWL-400)
+//!     quarantine-told      what was told of the quarantine (OWL-368)
 //!     unfinished-clone     a first clone that has not finished
-//!     tickets/<ticket>/    carry.json and outcome-<attempt>.json (OWL-399)
+//!     tickets/<ticket>/    lock, run.json (OWL-400), carry.json and
+//!                          outcome-<attempt>.json (OWL-399)
 //! ```
 //!
 //! A first clone stopped part-way, by its deadline, a crash or a Ctrl-C,
 //! leaves a folder that looks like a checkout. So the clone is marked
 //! `unfinished-clone` until it succeeds, and while the marker exists, the
 //! next `owlshift do` removes that folder and clones anew (OWL-80). Unlike
-//! `unverified`, it needs no person: a clone runs nothing of the project's.
+//! the quarantine, it needs no person: a clone runs nothing of the project's.
 //!
 //! A run that breaks isolation may leave something in the clone, such as a
 //! hook or a configuration entry, that the next run's snapshot would take as
-//! the norm and the runner's own git would run. So before each run the
-//! `unverified` marker is written, and it is removed only once the run's
-//! isolation check passed; a quarantine rewrites it with the violations. A
-//! crash or a Ctrl-C in the middle of a run leaves it too. While it exists,
-//! `owlshift do` refuses the project until a person looks.
+//! the norm and the runner's own git would run. So before each run its
+//! obligation is written in `unverified/`, and it is removed only once the
+//! run's isolation check passed; a breach writes the quarantine, and a crash
+//! or a Ctrl-C in the middle of a run leaves the obligation, which the next
+//! command or watch pass turns into the quarantine ([`crate::ticket_run`],
+//! OWL-400). While the quarantine stands, every command refuses the project
+//! until a person looks.
 
 use std::collections::BTreeMap;
 use std::ffi::OsStr;
@@ -174,6 +179,13 @@ impl ProjectDirs {
         self.ticket_lock_within(ticket, LOCK_GRACE)
     }
 
+    /// [`ProjectDirs::ticket_lock`] with a single try: what `owlshift
+    /// unquarantine` takes to bring a ticket's run file up to date, never
+    /// waiting on a command that holds it (OWL-400).
+    pub(crate) fn try_ticket_lock(&self, ticket: &TicketId) -> io::Result<Option<TicketLock>> {
+        self.ticket_lock_within(ticket, Duration::ZERO)
+    }
+
     /// [`ProjectDirs::ticket_lock`] within `wait`: a single try when zero.
     fn ticket_lock_within(
         &self,
@@ -205,9 +217,48 @@ impl ProjectDirs {
             .map(|ticket| (project, ticket)))
     }
 
-    /// The marker of a run whose isolation check has not passed.
-    pub fn unverified_file(&self) -> PathBuf {
+    /// The folder of the runs' obligations (OWL-400): one file per run whose
+    /// isolation check has not passed ([`crate::ticket_run`]). An Owlshift
+    /// before P6 kept a single marker file at this path instead, which
+    /// [`ProjectDirs::quarantine`] reads as the quarantine.
+    pub fn obligations_dir(&self) -> PathBuf {
         self.root.join("unverified")
+    }
+
+    /// The project's quarantine (OWL-400): written by a breach, or by the
+    /// first command or watch pass that finds an obligation left behind,
+    /// and removed only by `owlshift unquarantine`.
+    pub fn quarantine_file(&self) -> PathBuf {
+        self.root.join("quarantine")
+    }
+
+    /// Every ticket's own folder lives here.
+    pub fn tickets(&self) -> PathBuf {
+        self.root.join("tickets")
+    }
+
+    /// The ticket's run file (OWL-400, [`crate::ticket_run`]).
+    pub fn run_file(&self, ticket: &TicketId) -> PathBuf {
+        self.ticket_dir(ticket).join("run.json")
+    }
+
+    /// Whether the lock of the ticket whose folder is `dir` (one of
+    /// [`ProjectDirs::tickets`]) is held elsewhere: one try, let go at once,
+    /// a look that never waits (OWL-400). A lock just released can look
+    /// held a moment longer (see [`ProjectDirs::lock`]), which reads the
+    /// ticket as running for that moment.
+    pub fn ticket_lock_held_in(&self, dir: &Path) -> io::Result<bool> {
+        Ok(try_lock_file(&dir.join("lock"))?.is_none())
+    }
+
+    /// [`ProjectDirs::ticket_lock_held_in`] for `ticket`; a ticket with no
+    /// folder has no holder.
+    pub fn ticket_lock_held(&self, ticket: &TicketId) -> io::Result<bool> {
+        let dir = self.ticket_dir(ticket);
+        if !exists(&dir)? {
+            return Ok(false);
+        }
+        self.ticket_lock_held_in(&dir)
     }
 
     /// Takes the project's lock for a command, held until the returned value
@@ -253,32 +304,77 @@ impl ProjectDirs {
         self.root.join("github-app.lock")
     }
 
-    /// What the `unverified` marker says, when there is one.
-    pub fn unverified(&self) -> io::Result<Option<String>> {
-        match fs::read_to_string(self.unverified_file()) {
-            Ok(text) => Ok(Some(text)),
+    /// Where the quarantine stands: its text, and the file it is in. The
+    /// quarantine file first; else the `unverified` marker an Owlshift
+    /// before P6 left, anything at [`ProjectDirs::obligations_dir`] that is
+    /// not a folder, which only `owlshift unquarantine` removes (OWL-400).
+    /// A file that cannot be read is an error, never taken for none.
+    pub fn quarantine_at(&self) -> io::Result<Option<(PathBuf, String)>> {
+        let file = self.quarantine_file();
+        match fs::read_to_string(&file) {
+            Ok(text) => return Ok(Some((file, text))),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+        let legacy = self.obligations_dir();
+        match fs::symlink_metadata(&legacy) {
+            Ok(meta) if meta.is_dir() => Ok(None),
+            Ok(_) => fs::read_to_string(&legacy).map(|text| Some((legacy, text))),
             Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
             Err(error) => Err(error),
         }
     }
 
-    pub(crate) fn mark_unverified(&self, text: &str) -> io::Result<()> {
-        fs::write(self.unverified_file(), text)
+    /// What the quarantine says, when one stands ([`ProjectDirs::quarantine_at`]).
+    pub fn quarantine(&self) -> io::Result<Option<String>> {
+        Ok(self.quarantine_at()?.map(|(_, text)| text))
     }
 
-    /// Removes the marker, then what was told of it (OWL-368): a record left
-    /// behind names another marker's text, so it is read as empty anyway.
-    pub(crate) fn clear_unverified(&self) -> io::Result<()> {
-        remove_file_if_any(&self.unverified_file())?;
+    /// Writes `text` as the project's quarantine, or adds it to the one that
+    /// stands (OWL-400): a quarantine is never replaced, so a second breach
+    /// keeps the first one's words. Returns the text that stands then.
+    pub(crate) fn write_quarantine(&self, text: &str) -> io::Result<String> {
+        fs::create_dir_all(&self.root)?;
+        let mut file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(self.quarantine_file())?;
+        io::Write::write_all(&mut file, text.as_bytes())?;
+        file.sync_all()?;
+        drop(file);
+        fs::read_to_string(self.quarantine_file())
+    }
+
+    /// Removes the quarantine, the `unverified` marker an Owlshift before P6
+    /// left, then what was told of either (OWL-368): a record left behind
+    /// names another text, so it is read as empty anyway.
+    pub(crate) fn clear_quarantine(&self) -> io::Result<()> {
+        remove_file_if_any(&self.quarantine_file())?;
+        let legacy = self.obligations_dir();
+        if fs::symlink_metadata(&legacy).is_ok_and(|meta| !meta.is_dir()) {
+            fs::remove_file(&legacy)?;
+        }
         let _ = remove_file_if_any(&self.told_file());
+        let _ = remove_file_if_any(&self.root.join("unverified-told"));
         Ok(())
     }
 
-    /// What was told of the current marker: whether the operator was
+    /// What was told of the current quarantine: whether the operator was
     /// notified and which tickets were told (OWL-368,
     /// [`crate::quarantine::Record`]).
     pub fn told_file(&self) -> PathBuf {
-        self.root.join("unverified-told")
+        self.root.join("quarantine-told")
+    }
+
+    /// Whether any obligation stands (OWL-400): any entry in
+    /// [`ProjectDirs::obligations_dir`]. A folder that cannot be listed
+    /// counts as one standing, so the shared checkout's rules for runs in
+    /// flight apply: they only ever write less.
+    pub fn obligations_stand(&self) -> bool {
+        match fs::read_dir(self.obligations_dir()) {
+            Ok(mut entries) => entries.next().is_some(),
+            Err(error) => error.kind() != io::ErrorKind::NotFound,
+        }
     }
 
     /// The marker of a first clone that has not finished (OWL-80).
@@ -382,7 +478,7 @@ pub struct TicketLock {
 /// A path component every platform takes as is, and the same whatever the
 /// case of the name: lower case, with `_` added after a Windows device name
 /// (`con`, `nul`, `com1`…) or a trailing dot.
-fn component(name: &str) -> String {
+pub(crate) fn component(name: &str) -> String {
     let lower = name.to_ascii_lowercase();
     let stem = lower.split('.').next().unwrap_or_default();
     let numbered = |prefix: &str| {
@@ -539,24 +635,44 @@ pub fn sync_checkout_within(
             })?;
         remove_file_if_any(&marker).map_err(|e| io_failed(&marker, e))?;
     } else {
-        let args: [&OsStr; 4] = [
-            "remote".as_ref(),
-            "set-url".as_ref(),
-            "origin".as_ref(),
-            remote_url.as_ref(),
-        ];
-        git.run(&checkout, &args).map_err(|e| {
+        // Runs in flight read what this writes (OWL-400, live check (f)):
+        // `set-url` takes `config.lock`, which a second writer at the same
+        // moment fails on, so it runs only when the address differs; a tag
+        // is a ref their checks guard, so none is fetched while one stands.
+        let in_flight = dirs.obligations_stand();
+        let usable = |e: crate::executor::GitError| {
             format!(
                 "{} is not a usable clone ({}); remove it and run again to clone the project anew",
                 checkout.display(),
                 e.detail
             )
-        })?;
-        git.run(&checkout, &["fetch", "--quiet", "--prune", "origin"])
-            .map_err(failed)?;
+        };
+        let current = git
+            .run(&checkout, &["config", "--get", "remote.origin.url"])
+            .ok()
+            .map(|url| String::from_utf8_lossy(&url).trim_end().to_owned());
+        if current.as_deref() != Some(remote_url) {
+            let args: [&OsStr; 4] = [
+                "remote".as_ref(),
+                "set-url".as_ref(),
+                "origin".as_ref(),
+                remote_url.as_ref(),
+            ];
+            git.run(&checkout, &args).map_err(usable)?;
+        }
+        let fetch: &[&str] = if in_flight {
+            &["fetch", "--quiet", "--no-tags", "--prune", "origin"]
+        } else {
+            &["fetch", "--quiet", "--prune", "origin"]
+        };
+        git.run(&checkout, fetch).map_err(failed)?;
         set_head(git, &checkout)?;
     }
-    git.run(&checkout, &["worktree", "prune"]).map_err(failed)?;
+    // `worktree prune` removes entries a run in flight's check reads: it
+    // waits for a call with no obligation standing (OWL-400).
+    if !dirs.obligations_stand() {
+        git.run(&checkout, &["worktree", "prune"]).map_err(failed)?;
+    }
 
     // The full name: `--short` would answer `remotes/origin/main` when a
     // local branch `origin/main` exists (git 2.54, 2026-09-29). One level
@@ -900,20 +1016,43 @@ mod tests {
         }
     }
 
+    /// The quarantine is written, added to, read and cleared; the marker of
+    /// an Owlshift before P6, a file where the obligations' folder goes,
+    /// reads as the quarantine until the clear removes it (OWL-400).
     #[test]
-    fn the_marker_is_written_read_and_cleared() {
+    fn the_quarantine_is_written_added_to_read_and_cleared() {
         let dir = tempfile::tempdir().unwrap();
         let dirs = ProjectDirs::new(dir.path(), &Repo::parse("demo/project").unwrap());
-        fs::create_dir_all(dirs.root()).unwrap();
-        assert_eq!(dirs.unverified().unwrap(), None);
-        dirs.mark_unverified("run r1 of OWL-1").unwrap();
+        assert_eq!(dirs.quarantine().unwrap(), None);
+        assert!(!dirs.obligations_stand());
+        let first = "Run r1 of OWL-1 broke isolation:\n- x\n";
+        assert_eq!(dirs.write_quarantine(first).unwrap(), first);
+        let both = dirs
+            .write_quarantine("Run r2 of OWL-2 broke isolation:\n- y\n")
+            .unwrap();
+        assert!(both.starts_with(first) && both.ends_with("- y\n"), "{both}");
+        assert_eq!(dirs.quarantine().unwrap().as_deref(), Some(both.as_str()));
+        fs::write(dirs.told_file(), "told").unwrap();
+        dirs.clear_quarantine().unwrap();
+        dirs.clear_quarantine().unwrap();
+        assert_eq!(dirs.quarantine().unwrap(), None);
+        assert!(!dirs.told_file().exists());
+
+        fs::write(dirs.obligations_dir(), "Run r0 of OWL-1 started at …\n").unwrap();
         assert_eq!(
-            dirs.unverified().unwrap().as_deref(),
-            Some("run r1 of OWL-1")
+            dirs.quarantine_at().unwrap(),
+            Some((
+                dirs.obligations_dir(),
+                "Run r0 of OWL-1 started at …\n".to_owned()
+            ))
         );
-        dirs.clear_unverified().unwrap();
-        dirs.clear_unverified().unwrap();
-        assert_eq!(dirs.unverified().unwrap(), None);
+        dirs.clear_quarantine().unwrap();
+        assert_eq!(dirs.quarantine().unwrap(), None);
+        fs::create_dir_all(dirs.obligations_dir()).unwrap();
+        assert!(!dirs.obligations_stand());
+        fs::write(dirs.obligations_dir().join("owl-1-r1"), "{}").unwrap();
+        assert!(dirs.obligations_stand());
+        assert_eq!(dirs.quarantine().unwrap(), None, "a folder is no marker");
     }
 
     /// A partial clone that stays in the way is reported once the budget is

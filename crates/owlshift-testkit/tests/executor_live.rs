@@ -1060,6 +1060,7 @@ fn run_live_seeded(
         brief: &brief,
         setup: &[],
         session: None,
+        siblings: None,
     };
     let report = executor.run(&spec, &harness).unwrap();
     Live {

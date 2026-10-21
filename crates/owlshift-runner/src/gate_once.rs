@@ -3,7 +3,7 @@
 //! than in a Build run and a park.
 //!
 //! [`GateOnce::run`] takes what a Build's preparation takes, in its order:
-//! git's minimum version, the project's lock, the `unverified` marker, the
+//! git's minimum version, the project's lock, the quarantine (OWL-400), the
 //! confinement; then removes what an earlier `owlshift gate` left, brings the
 //! dedicated checkout up to date ([`project::sync_checkout`]) and picks the
 //! commit, origin's default branch or the one `--at` names, read as a run's
@@ -27,6 +27,7 @@ use crate::executor::{Executor, GateRun, GateSpec};
 use owlshift_contracts::config::ProjectConfig;
 
 use crate::project::{self, Base, ProjectDirs};
+use crate::ticket_run::{self, Look};
 
 /// The branch of `owlshift gate`'s worktree: no ticket's branch
 /// (`owlshift/<id>`) can take it.
@@ -217,15 +218,15 @@ impl GateOnce<'_> {
             Ok(None) => return Err(Stop::Busy(dirs.root().to_owned())),
             Err(error) => return Err(Stop::Refused(format!("the project's lock: {error}"))),
         };
-        match dirs.unverified() {
-            Ok(None) => {}
-            Ok(Some(text)) => {
-                return Err(Stop::Unverified {
-                    marker: dirs.unverified_file(),
-                    text,
-                });
+        // The quarantine, or a run left behind, which becomes it (OWL-400).
+        match ticket_run::look(dirs, None) {
+            Ok(Look::Clear { .. }) => {}
+            Ok(Look::Quarantined { path, text }) => {
+                return Err(Stop::Unverified { marker: path, text });
             }
-            Err(error) => return Err(Stop::Refused(format!("the project's marker: {error}"))),
+            Err(error) => {
+                return Err(Stop::Refused(format!("the project's quarantine: {error}")));
+            }
         }
         executor
             .agent
@@ -300,15 +301,19 @@ impl GateOnce<'_> {
         }
 
         // As for a run: from here until the isolation check passes, a stop
-        // leaves the project refused.
-        dirs.mark_unverified(&format!(
-            "`owlshift gate` started at {} on {}; its isolation check has not passed. If it was \
-             stopped, look at {} before removing this file.\n",
-            Timestamp::now(),
-            plan.commit,
-            worktree.display()
-        ))
-        .map_err(|e| Stop::Refused(format!("the project's marker: {e}")))?;
+        // leaves its obligation, which refuses the project (OWL-400).
+        let run = Timestamp::now().strftime("%Y%m%dT%H%M%SZ").to_string();
+        let obligation = ticket_run::write_obligation(
+            dirs,
+            None,
+            &run,
+            &format!(
+                "`owlshift gate` on {}, its worktree at {}",
+                plan.commit,
+                worktree.display()
+            ),
+        )
+        .map_err(|e| Stop::Refused(format!("the gate's obligation: {e}")))?;
         starting(&plan);
         let spec = GateSpec {
             main: &checkout,
@@ -328,8 +333,8 @@ impl GateOnce<'_> {
                 if let Err(e) = discard() {
                     reason.push_str(&format!("; its worktree could not be removed: {e}"));
                 }
-                if let Err(e) = dirs.clear_unverified() {
-                    reason.push_str(&format!("; the project's marker: {e}"));
+                if let Err(e) = ticket_run::remove_obligation(dirs, &obligation) {
+                    reason.push_str(&format!("; the gate's obligation: {e}"));
                 }
                 return Err(Stop::Refused(reason));
             }
@@ -339,8 +344,8 @@ impl GateOnce<'_> {
             if let Err(e) = discard() {
                 warnings.push(format!("the gate's worktree could not be removed: {e}"));
             }
-            if let Err(e) = dirs.clear_unverified() {
-                warnings.push(format!("the project's marker could not be cleared: {e}"));
+            if let Err(e) = ticket_run::remove_obligation(dirs, &obligation) {
+                warnings.push(format!("the gate's obligation could not be removed: {e}"));
             }
             return Ok(checked(Some(run), None, warnings));
         }
@@ -354,10 +359,11 @@ impl GateOnce<'_> {
             worktree.display(),
             lines.join("\n")
         );
-        if let Err(e) = dirs.mark_unverified(&text) {
+        // Its obligation stays until `owlshift unquarantine` (OWL-400).
+        if let Err(e) = dirs.write_quarantine(&text) {
             warnings.push(format!("the breach could not be recorded: {e}"));
         }
-        Ok(checked(Some(run), Some(dirs.unverified_file()), warnings))
+        Ok(checked(Some(run), Some(dirs.quarantine_file()), warnings))
     }
 }
 
@@ -689,7 +695,8 @@ mod tests {
             "{text}"
         );
         assert!(!bench.left_over());
-        assert_eq!(bench.dirs.unverified().unwrap(), None);
+        assert_eq!(bench.dirs.quarantine().unwrap(), None);
+        assert!(!bench.dirs.obligations_stand());
 
         let green = bench.gate(&executor, &[], Some("origin/fixed")).unwrap();
         assert!(green.passed(), "{}", render(&green));
@@ -760,7 +767,8 @@ mod tests {
             "{refused:?}"
         );
         assert!(!bench.left_over());
-        assert_eq!(bench.dirs.unverified().unwrap(), None);
+        assert_eq!(bench.dirs.quarantine().unwrap(), None);
+        assert!(!bench.dirs.obligations_stand());
         bench.git(
             &bench.dirs.checkout(),
             &["config", "--unset", "http.extraHeader"],
@@ -769,10 +777,11 @@ mod tests {
         let breached = bench.gate(&executor, &[], None).unwrap();
         assert!(!breached.passed());
         assert!(!breached.run.as_ref().unwrap().violations.is_empty());
-        assert_eq!(breached.marker, Some(bench.dirs.unverified_file()));
+        assert_eq!(breached.marker, Some(bench.dirs.quarantine_file()));
+        assert!(bench.dirs.obligations_stand(), "its obligation stays");
         assert!(render(&breached).contains("Isolation broken"));
         assert!(bench.left_over());
-        let marker = bench.dirs.unverified().unwrap().unwrap();
+        let marker = bench.dirs.quarantine().unwrap().unwrap();
         assert!(marker.contains("broke isolation"), "{marker}");
 
         let again = bench
@@ -782,7 +791,8 @@ mod tests {
         assert!(bench.left_over());
 
         // The person looked.
-        std::fs::remove_file(bench.dirs.unverified_file()).unwrap();
+        std::fs::remove_file(bench.dirs.quarantine_file()).unwrap();
+        std::fs::remove_dir_all(bench.dirs.obligations_dir()).unwrap();
         let green = bench.gate(&executor, &[], Some("origin/fixed")).unwrap();
         assert!(green.passed(), "{}", render(&green));
         assert!(!bench.left_over());

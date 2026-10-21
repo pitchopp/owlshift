@@ -131,6 +131,7 @@ use crate::reversal;
 use crate::routing::{RouteLabels, Router, claude_model, route_labels, ticket_variant};
 use crate::rules::{self, ProjectRules};
 use crate::ticket_ref::{self, ProposalsFile, RefAt, RefRead, Stored, TicketRecord};
+use crate::ticket_run::{self, RunFault, Siblings};
 use crate::usage::{self as machine_usage, UsageStore};
 use crate::writer::{
     self, Corrected, Decided, DecidedBy, DecisionComment, DecisionGroup, DeliveryReport, FixPass,
@@ -1549,9 +1550,7 @@ impl OnDemand<'_> {
         // one an earlier run, such as the ticket's intake, made at an older
         // base is fast-forwarded when it has no commits of its own. Before
         // the dispatch, so a refused fast-forward dispatches nothing.
-        self.executor
-            .start_from_base(&p.checkout, &p.worktree, &p.branch, &p.base.commit)
-            .map_err(|e| refused("starting the ticket's branch from the base", e))?;
+        self.start_from_base(p)?;
         let dispatched = self.dispatch(p, command, sink)?;
         p.held = Some(self.held_at_dispatch(p, &dispatched.rules));
         self.show_after(ticket, None, Event::Dispatched, sink);
@@ -1840,24 +1839,21 @@ impl OnDemand<'_> {
             Ok(None) => return Err(Stop::TicketBusy(ticket.clone())),
             Err(error) => return Err(refused("the ticket's lock", error)),
         };
-        // The lock before the marker: every run writes the marker when it
-        // starts, so while another `do` works the project the marker only
-        // says a run is in flight. Once the lock is ours, a marker means a
-        // run that ended, or was cut off, before its check passed.
+        // The lock before the quarantine and the obligations: once the lock
+        // is ours, an obligation whose ticket's lock is free, or this
+        // ticket's own, belongs to a run that ended, or was cut off, before
+        // its check passed, and becomes the quarantine (OWL-400).
         let lock = match self.dirs.lock() {
             Ok(Some(lock)) => lock,
             Ok(None) => return Err(Stop::Busy(self.dirs.root().to_owned())),
             Err(error) => return Err(refused("the project's lock", error)),
         };
-        match self.dirs.unverified() {
-            Ok(None) => {}
-            Ok(Some(text)) => {
-                return Err(Stop::Unverified {
-                    marker: self.dirs.unverified_file(),
-                    text,
-                });
+        match ticket_run::look(self.dirs, Some(ticket)) {
+            Ok(ticket_run::Look::Clear { .. }) => {}
+            Ok(ticket_run::Look::Quarantined { path, text }) => {
+                return Err(Stop::Unverified { marker: path, text });
             }
-            Err(error) => return Err(refused("the project's marker", error)),
+            Err(error) => return Err(refused("the project's quarantine", error)),
         }
         // What the executor would refuse at the spawn is refused before
         // anything is cloned or read: a machine where agents cannot be
@@ -1967,26 +1963,37 @@ impl OnDemand<'_> {
         let worktree = self.dirs.worktree(ticket);
         // A worktree kept from an earlier `do` is trusted only while its
         // `.git` still links it to the checkout. The executor refuses such a
-        // worktree too; checked here, under the lock, the project is marked
-        // and refused until a person looks.
-        if fs::symlink_metadata(&worktree).is_ok()
+        // worktree too; checked here, under the lock, the project is
+        // quarantined until a person looks.
+        let kept = fs::symlink_metadata(&worktree).is_ok();
+        if kept
             && let Err(reason) =
                 crate::executor::check_worktree_link(&checkout.join(".git"), &worktree)
         {
-            // Its time makes the marker unique, as a run's are (OWL-368).
-            let text = format!(
+            // Its time makes the quarantine's text unique, as a run's is
+            // (OWL-368). Refused at once, before any run: the terminal says
+            // it, and a watch pass that finds the quarantine notifies it.
+            return Err(self.quarantined(&format!(
                 "The worktree of {ticket} was found changed between runs at {}: {reason}\n",
                 Timestamp::now()
-            );
-            // Refused at once, before any run: the terminal says it, and a
-            // watch pass that finds the marker notifies it.
-            self.dirs
-                .mark_unverified(&text)
-                .map_err(|e| refused("the project's marker", e))?;
-            return Err(Stop::Unverified {
-                marker: self.dirs.unverified_file(),
-                text,
-            });
+            )));
+        }
+        // The start of the step (OWL-400; architecture section 8, "Starting
+        // a step"): its branch, its ticket ref and its kept worktree's entry
+        // as its run file records them; a ticket from before P6 gets its run
+        // file from its refs as they are.
+        let kept_entry = kept
+            .then(|| ticket_run::entry_of(&checkout, &worktree))
+            .flatten();
+        if let Err(fault) = ticket_run::open(
+            git,
+            self.dirs,
+            &checkout,
+            &ticket_lock,
+            ticket,
+            kept_entry.as_deref(),
+        ) {
+            return Err(self.run_fault(ticket, fault));
         }
         let labels = route_labels(found.labels.iter().map(String::as_str));
         Ok(Prepared {
@@ -4176,14 +4183,17 @@ impl OnDemand<'_> {
             return Ok(());
         }
         let previous = p.stored.as_ref().map(|stored| stored.commit.as_str());
-        let commit = ticket_ref::write_proposals(
+        let commit = ticket_run::write_ref(
             &self.executor.git,
+            self.dirs,
             &p.checkout,
+            &p._ticket_lock,
             &p.ticket,
             &record,
             proposals.map_or(ProposalsFile::Keep, ProposalsFile::Write),
             previous,
-        )?;
+        )
+        .map_err(|fault| self.ref_fault(&p.ticket, fault))?;
         p.stored = Some(Stored {
             record,
             commit,
@@ -4228,13 +4238,17 @@ impl OnDemand<'_> {
             },
         };
         let previous = p.stored.as_ref().map(|stored| stored.commit.as_str());
-        let written = ticket_ref::write(
+        let written = ticket_run::write_ref(
             &self.executor.git,
+            self.dirs,
             &p.checkout,
+            &p._ticket_lock,
             &p.ticket,
             &record,
+            ProposalsFile::Keep,
             previous,
-        );
+        )
+        .map_err(|fault| self.ref_fault(&p.ticket, fault));
         match written {
             Ok(commit) => {
                 let proposals = p
@@ -4422,6 +4436,83 @@ impl OnDemand<'_> {
         })
     }
 
+    /// Refuses as a quarantined project does while the quarantine stands
+    /// (OWL-400, decided on 2026-10-21): at a run's boundary and before a
+    /// push, so a step a sibling's breach finds running runs nothing more and
+    /// pushes nothing, its ticket waiting where it is.
+    fn refuse_if_quarantined(&self) -> Result<(), Stop> {
+        match self.dirs.quarantine_at() {
+            Ok(None) => Ok(()),
+            Ok(Some((marker, text))) => Err(Stop::Unverified { marker, text }),
+            Err(error) => Err(refused("the project's quarantine", error)),
+        }
+    }
+
+    /// Writes `text` as a breach found outside a run, adding it to a
+    /// quarantine that stands, and refuses as a quarantined project: the
+    /// terminal says it, and the first watch pass that finds it notifies it.
+    fn quarantined(&self, text: &str) -> Stop {
+        match self.dirs.write_quarantine(text) {
+            Ok(text) => Stop::Unverified {
+                marker: self.dirs.quarantine_file(),
+                text,
+            },
+            Err(error) => refused("the project's quarantine", error),
+        }
+    }
+
+    /// A fault of a write of `ticket`'s ref through its run file, as the
+    /// reason of a failed write (OWL-400): a breach also quarantines the
+    /// project, so the next command is refused.
+    pub(crate) fn ref_fault(&self, ticket: &TicketId, fault: RunFault) -> String {
+        let reason = fault.to_string();
+        if matches!(fault, RunFault::Breach(_)) {
+            let _ = self.quarantined(&format!(
+                "{ticket} was found changed outside its runs at {}: {reason}\n",
+                Timestamp::now()
+            ));
+        }
+        reason
+    }
+
+    /// A fault of `ticket`'s run file as the command's stop (OWL-400): a
+    /// breach quarantines the project, a ticket from before P6 waiting for
+    /// its baseline is busy, any other failure is refused.
+    pub(crate) fn run_fault(&self, ticket: &TicketId, fault: RunFault) -> Stop {
+        match fault {
+            RunFault::Breach(why) => self.quarantined(&format!(
+                "{ticket} was found changed outside its runs at {}: {why}\n",
+                Timestamp::now()
+            )),
+            RunFault::Busy => Stop::Busy(self.dirs.root().to_owned()),
+            RunFault::Failed(why) => Stop::Refused(format!("the ticket's run file: {why}")),
+        }
+    }
+
+    /// [`Executor::start_from_base`] for the ticket of `p`, through its run
+    /// file (OWL-400): the fast-forward to the base is a move of its branch
+    /// outside a run.
+    fn start_from_base(&self, p: &Prepared) -> Result<(), Stop> {
+        let moved = ticket_run::move_branch(
+            &self.executor.git,
+            self.dirs,
+            &p.checkout,
+            &p._ticket_lock,
+            &p.ticket,
+            Some(&p.base.commit),
+            || {
+                self.executor
+                    .start_from_base(&p.checkout, &p.worktree, &p.branch, &p.base.commit)
+            },
+        );
+        match moved {
+            Ok(started) => {
+                started.map_err(|e| refused("starting the ticket's branch from the base", e))
+            }
+            Err(fault) => Err(self.run_fault(&p.ticket, fault)),
+        }
+    }
+
     /// [`Self::execute`], with a run the executor could not start given
     /// back with why, its `run_ended` event emitted, rather than refused:
     /// the opt-in Codex reviewer drops its seat when its own harness cannot
@@ -4443,6 +4534,10 @@ impl OnDemand<'_> {
         sink: &mut EventSink<'_>,
     ) -> Result<Result<Ran, ExecutorError>, Stop> {
         let ticket = &p.ticket.clone();
+        // At each run's boundary: a quarantine that stands, since a sibling's
+        // breach, stops the step before anything runs (OWL-400, decided on
+        // 2026-10-21): the ticket waits where it is.
+        self.refuse_if_quarantined()?;
         let admitted = self.admit_usage(ticket, harness, brief.role, sink)?;
         let (run, run_dir) =
             new_run_dir(&self.dirs.runs(ticket)).map_err(|e| refused("the run directory", e))?;
@@ -4485,13 +4580,28 @@ impl OnDemand<'_> {
                 ]),
             );
         }
-        let marker = format!(
-            "Run {run} of {ticket} started at {}; its isolation check has not passed.\n",
-            Timestamp::now()
-        );
-        self.dirs
-            .mark_unverified(&marker)
-            .map_err(|e| refused("the project's marker", e))?;
+        // The run's own obligation, and its ticket's generation raised, so a
+        // sibling's check that took its snapshot before reads it as ended
+        // since (OWL-400).
+        let obligation = ticket_run::write_obligation(
+            self.dirs,
+            Some(ticket),
+            &run,
+            &format!("Run {run} of {ticket}"),
+        )
+        .map_err(|e| refused("the run's obligation", e))?;
+        let checkout = p.checkout.clone();
+        if let Err(fault) = ticket_run::run_started(
+            &self.executor.git,
+            self.dirs,
+            &checkout,
+            &p._ticket_lock,
+            ticket,
+        ) {
+            let _ = ticket_run::remove_obligation(self.dirs, &obligation);
+            return Err(self.run_fault(ticket, fault));
+        }
+        let siblings = Siblings::new(self.dirs, ticket);
         let widened;
         let spec = RunSpec {
             main: &p.checkout,
@@ -4504,8 +4614,24 @@ impl OnDemand<'_> {
             brief,
             setup,
             session: plan.as_ref().map(|(plan, _)| plan),
+            siblings: Some(&siblings),
         };
-        let report = match executor.run(&spec, harness) {
+        let ran = executor.run(&spec, harness);
+        // Whatever the run did, its branch's head and its worktree's entry,
+        // which its check verified or which the runner's own git made before
+        // a refusal, before anything else is written through the run file:
+        // the writes that keep the run's cost and its park check against it.
+        // One that cannot be kept leaves the obligation, so the project is
+        // refused until a person looks.
+        let recorded = ticket_run::run_ended(
+            &self.executor.git,
+            self.dirs,
+            &checkout,
+            &p._ticket_lock,
+            ticket,
+            &p.worktree,
+        );
+        let report = match ran {
             Ok(report) => {
                 // A resumed run's own cost: the executor counted out what
                 // the session had cost before it (OWL-394).
@@ -4529,10 +4655,12 @@ impl OnDemand<'_> {
                 report
             }
             Err(error) => {
-                // Nothing was spawned: nothing to verify. A probe's mark goes
-                // with `admitted` (OWL-404).
+                // Nothing was spawned: nothing to verify, once what the
+                // runner's own git made is recorded. A probe's mark goes with
+                // `admitted` (OWL-404).
                 drop(admitted);
-                let _ = self.dirs.clear_unverified();
+                recorded.map_err(|e| refused("the ticket's run file", e))?;
+                let _ = ticket_run::remove_obligation(self.dirs, &obligation);
                 sink.emit(
                     ticket,
                     Some(&run),
@@ -4554,18 +4682,22 @@ impl OnDemand<'_> {
             _ => Vec::new(),
         };
         if breaches.is_empty() {
-            self.dirs
-                .clear_unverified()
-                .map_err(|e| refused("the project's marker", e))?;
+            // Only its own obligation, once its check passed and its record
+            // was kept (OWL-400).
+            recorded.map_err(|e| refused("the ticket's run file", e))?;
+            ticket_run::remove_obligation(self.dirs, &obligation)
+                .map_err(|e| refused("the run's obligation", e))?;
         } else {
             let lines: Vec<String> = breaches.iter().map(|b| format!("- {b}")).collect();
-            let marker = format!(
-                "Run {run} of {ticket} broke isolation:\n{}\n",
-                lines.join("\n")
-            );
-            self.dirs
-                .mark_unverified(&marker)
-                .map_err(|e| refused("the project's marker", e))?;
+            // Added to a quarantine that stands; the run's obligation stays
+            // until `owlshift unquarantine` (OWL-400).
+            let marker = self
+                .dirs
+                .write_quarantine(&format!(
+                    "Run {run} of {ticket} broke isolation:\n{}\n",
+                    lines.join("\n")
+                ))
+                .map_err(|e| refused("the project's quarantine", e))?;
             // The operator learns of the quarantine now, once (OWL-368).
             if let Outcome::Quarantined(violations) = &report.outcome {
                 quarantine::notify_written(
@@ -5011,6 +5143,9 @@ impl OnDemand<'_> {
         sink: &mut EventSink<'_>,
     ) -> Result<Delivered, Stop> {
         let ticket = &p.ticket.clone();
+        // No push, so no pull request and no delivery comment, while the
+        // quarantine stands (OWL-400): the ticket waits at Verify.
+        self.refuse_if_quarantined()?;
         let (head, base) = (&dispatched.head, &dispatched.base_branch);
         let built = p
             .review
@@ -5726,10 +5861,22 @@ impl OnDemand<'_> {
             .map(|out| String::from_utf8_lossy(&out).trim().to_owned())
             .filter(|head| !head.is_empty());
         let Some(head) = head else {
-            git.run(
+            // A move of the ticket's branch outside a run (OWL-400).
+            ticket_run::move_branch(
+                git,
+                self.dirs,
                 &p.checkout,
-                &["branch", "--end-of-options", &p.branch, pushed.as_str()],
+                &p._ticket_lock,
+                &p.ticket,
+                Some(pushed.as_str()),
+                || {
+                    git.run(
+                        &p.checkout,
+                        &["branch", "--end-of-options", &p.branch, pushed.as_str()],
+                    )
+                },
             )
+            .map_err(|fault| self.run_fault(&p.ticket, fault))?
             .map_err(|e| refused("making the ticket's branch at its last push", e))?;
             return Ok(Some(pushed.to_string()));
         };
@@ -6148,6 +6295,12 @@ impl OnDemand<'_> {
     /// checkout forgets it and moves the ticket's branch to `pushed`; the
     /// executor adds the worktree again on that branch.
     fn reset_worktree(&self, p: &Prepared, pushed: &CommitId) -> Result<(), Stop> {
+        // `worktree prune` removes entries a run in flight's check reads: it
+        // waits for no obligation to stand, the ticket tried again later,
+        // before anything is removed (OWL-400).
+        if self.dirs.obligations_stand() {
+            return Err(Stop::Busy(self.dirs.root().to_owned()));
+        }
         if fs::symlink_metadata(&p.worktree).is_ok() {
             fs::remove_dir_all(&p.worktree)
                 .map_err(|e| refused("removing the ticket's worktree before a rebase run", e))?;
@@ -6156,8 +6309,17 @@ impl OnDemand<'_> {
         git.run(&p.checkout, &["worktree", "prune"])
             .map_err(|e| refused("pruning the ticket's worktree", e))?;
         let branch = format!("refs/heads/{}", p.branch);
-        git.run(&p.checkout, &["update-ref", &branch, pushed.as_str()])
-            .map_err(|e| refused("moving the ticket's branch to its last push", e))?;
+        ticket_run::move_branch(
+            git,
+            self.dirs,
+            &p.checkout,
+            &p._ticket_lock,
+            &p.ticket,
+            Some(pushed.as_str()),
+            || git.run(&p.checkout, &["update-ref", &branch, pushed.as_str()]),
+        )
+        .map_err(|fault| self.run_fault(&p.ticket, fault))?
+        .map_err(|e| refused("moving the ticket's branch to its last push", e))?;
         Ok(())
     }
 
@@ -6243,6 +6405,8 @@ impl OnDemand<'_> {
         sink: &mut EventSink<'_>,
     ) -> Result<Delivered, Stop> {
         let ticket = p.ticket.clone();
+        // No push while the quarantine stands (OWL-400).
+        self.refuse_if_quarantined()?;
         let what = kind.what();
         let head = Branch::new(&delivery.branch).map_err(|e| refused("the ticket's branch", e))?;
         let base = Branch::new(&delivery.base_branch).map_err(|e| refused("the base branch", e))?;
@@ -6863,10 +7027,10 @@ impl OnDemand<'_> {
         }
         // Watch's write of the ticket's ref: the project's lock, then the
         // ticket's without waiting (OWL-409).
-        let Ok(Some(_locks)) = self.dirs.lock_for_write(ticket) else {
+        let Ok(Some((_project, ticket_lock))) = self.dirs.lock_for_write(ticket) else {
             return Some(at);
         };
-        if !matches!(self.dirs.unverified(), Ok(None)) {
+        if !matches!(self.dirs.quarantine(), Ok(None)) {
             return Some(at);
         }
         let git = &self.executor.git;
@@ -6893,14 +7057,17 @@ impl OnDemand<'_> {
             .proposals
             .as_ref()
             .map_or(ProposalsFile::Keep, ProposalsFile::Write);
-        let written = ticket_ref::write_proposals(
+        let written = ticket_run::write_ref(
             git,
+            self.dirs,
             &checkout,
+            &ticket_lock,
             ticket,
             &record,
             proposals,
             Some(&at.commit),
-        );
+        )
+        .map_err(|fault| self.ref_fault(ticket, fault));
         if settled.moved.is_some() {
             return None;
         }

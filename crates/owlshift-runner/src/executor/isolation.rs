@@ -37,15 +37,18 @@
 //!   branch is still a breach; its violation says so when the branch shares
 //!   a commit with the start (OWL-369).
 //!
-//! Runs in flight at the same time move their own branches, so
-//! [`Snapshot::check_among`] is told which ([`Concurrent`]), just before and
-//! just after it reads the refs: a branch running in either answer is left
-//! out, that run's own check guarding it, and a branch that had already
-//! ended in the first answer must still be at the commit its own check
-//! verified ([`Checked::tip`]). Everything else is checked as for
+//! Runs in flight at the same time move their own branches and ticket refs,
+//! so [`Snapshot::check_among`] is told which ([`Concurrent`], read from the
+//! project's run files and ticket locks since OWL-400), just before and just
+//! after it reads the refs: a ref running in either answer is left out,
+//! that run's own check, or its ticket's next start, guarding it, and a ref
+//! that had already ended in the first answer must still hold one of the
+//! values its run file records. Everything else is checked as for
 //! a run alone, and a breach there quarantines every run that sees it: the
 //! check cannot tell which run did it. [`Snapshot::check`] is the check of a
-//! run alone, told of no other run: it has no exemption.
+//! run alone, told of no other run: it has no exemption. A ref is read with
+//! its target when it is symbolic, so one a run turned into an alias is a
+//! change even at the same commit.
 //!
 //! The entry of a run in flight is left out the same way, by the branch the
 //! entry belonged to when the snapshot was taken (`owner`, read in rounds
@@ -149,37 +152,80 @@ pub struct Snapshot {
     onto: Option<String>,
 }
 
-/// The other runs in flight at any time since a snapshot, as the scheduler
-/// knows them when [`Snapshot::check_among`] asks: just before and just
-/// after it reads the refs.
+/// The project's other tickets in flight at any time since a snapshot, as
+/// their run files and locks tell them when [`Snapshot::check_among`] asks:
+/// just before and just after it reads the refs (OWL-400,
+/// `crate::ticket_run::Siblings`). Refs are full names: a ticket's branch
+/// (`refs/heads/<branch>`) and its ticket ref.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Concurrent {
-    /// The branches of runs still in flight. A change to one is left out:
-    /// that run's own check guards its branch.
+    /// The refs of tickets in flight, their lock held. A change to one is
+    /// left out: that run's own check, or the ticket's next start, guards
+    /// it.
     pub running: BTreeSet<String>,
-    /// The branches of runs that ended since the snapshot, each with the
-    /// commit its own check verified ([`Checked::tip`]). A branch that had
-    /// already ended before the refs were read, and did not run again
-    /// since, must still be there.
-    pub ended: BTreeMap<String, String>,
+    /// The refs of tickets that ended since the snapshot, each with the
+    /// values it may hold: what its run file records and the target of a
+    /// write under way, `None` for no ref. A ref that had already ended
+    /// before the refs were read, and did not change again since, must
+    /// still hold one of them.
+    pub ended: BTreeMap<String, BTreeSet<Option<String>>>,
+    /// The worktree entries, by their names in `worktrees/`, of tickets in
+    /// flight or ended since the snapshot: left out, as the entries of runs
+    /// in flight are.
+    pub entries: BTreeSet<String>,
 }
 
 impl Concurrent {
     /// Whether no run is known: what a run alone is told.
     pub fn is_empty(&self) -> bool {
-        self.running.is_empty() && self.ended.is_empty()
+        self.running.is_empty() && self.ended.is_empty() && self.entries.is_empty()
     }
 
-    /// Whether `branch` is a run in flight or one that ended since the
+    /// Whether `name`, a full ref name, is in flight or ended since the
     /// snapshot, in this answer.
-    pub fn knows(&self, branch: &str) -> bool {
-        self.running.contains(branch) || self.ended.contains_key(branch)
+    pub fn knows(&self, name: &str) -> bool {
+        self.running.contains(name) || self.ended.contains_key(name)
+    }
+
+    /// This answer with the branch `branch` in flight.
+    pub fn running_branch(mut self, branch: &str) -> Self {
+        self.running.insert(format!("refs/heads/{branch}"));
+        self
+    }
+
+    /// This answer with the branch `branch` ended since the snapshot at
+    /// `tip`, the commit its run's own check verified ([`Checked::tip`]).
+    pub fn ended_branch(mut self, branch: &str, tip: &str) -> Self {
+        self.ended.insert(
+            format!("refs/heads/{branch}"),
+            BTreeSet::from([Some(tip.to_owned())]),
+        );
+        self
     }
 }
 
-/// Whether either of the scheduler's two answers knows `branch`.
-fn known(earlier: &Concurrent, later: &Concurrent, branch: &str) -> bool {
-    earlier.knows(branch) || later.knows(branch)
+/// Whether either of the two answers knows `name`, a full ref name.
+fn known(earlier: &Concurrent, later: &Concurrent, name: &str) -> bool {
+    earlier.knows(name) || later.knows(name)
+}
+
+/// Whether a ref that had ended in the earlier answer, where it may hold
+/// `accepted`, is held to those values: running in neither answer, and the
+/// later answer giving the same values when it knows the ref. One whose
+/// values changed between the two answers ran again meanwhile, so the refs
+/// may hold it at any point of that run: it is left out.
+fn settled(
+    name: &str,
+    accepted: &BTreeSet<Option<String>>,
+    earlier: &Concurrent,
+    later: &Concurrent,
+) -> bool {
+    !earlier.running.contains(name)
+        && !later.running.contains(name)
+        && later
+            .ended
+            .get(name)
+            .is_none_or(|later_accepted| later_accepted == accepted)
 }
 
 /// What [`Snapshot::check_among`] found.
@@ -211,7 +257,7 @@ struct MainState {
     /// by entry name; empty after the run (see [`owner`]).
     owners: BTreeMap<String, Owner>,
     /// Every ref but the run's branch and remote-tracking refs, with its
-    /// object.
+    /// object, and `-> <target>` after it for a symbolic ref.
     refs: BTreeMap<String, String>,
 }
 
@@ -484,7 +530,7 @@ impl Snapshot {
     /// when isolation held. It is [`Snapshot::check_among`] told of no other
     /// run, kept as one path so that both stay the same check.
     pub fn check(&self, git: &Git, main: &Path, worktree: &Path, branch: &str) -> Vec<Violation> {
-        self.check_among(git, main, worktree, branch, &Concurrent::default)
+        self.check_among(git, main, worktree, branch, &|| Ok(Concurrent::default()))
             .violations
     }
 
@@ -493,14 +539,16 @@ impl Snapshot {
     /// second answer knows a run registered before it created its branch,
     /// even when it started during the check; the first tells a run that
     /// had already ended from one that ended during the check, after its
-    /// branch was read.
+    /// branch was read. An answer that could not be read is a check that
+    /// could not run, and counts as an empty one: a lost record never widens
+    /// what the check leaves out (OWL-400).
     pub fn check_among(
         &self,
         git: &Git,
         main: &Path,
         worktree: &Path,
         branch: &str,
-        concurrent: &dyn Fn() -> Concurrent,
+        concurrent: &dyn Fn() -> Result<Concurrent, String>,
     ) -> Checked {
         // Nothing the run left in the shared git files, or behind a
         // redirected link, may run in the runner's git: a violation found
@@ -512,10 +560,19 @@ impl Snapshot {
                 tip: None,
             };
         }
-        let earlier = concurrent();
+        let mut unread = Vec::new();
+        let mut ask = || {
+            concurrent().unwrap_or_else(|reason| {
+                unread.push(Violation::CheckFailed(format!(
+                    "the project's other tickets could not be read: {reason}"
+                )));
+                Concurrent::default()
+            })
+        };
+        let earlier = ask();
         let mut violations = match MainState::read(git, main, branch, &self.common, &self.own) {
             Ok(after) => {
-                let later = concurrent();
+                let later = ask();
                 // After the second answer, which knows a run registered
                 // before it made its entry.
                 let owners = self.owners_after(&after, &earlier, &later, &|_| {});
@@ -523,6 +580,8 @@ impl Snapshot {
             }
             Err(error) => vec![Violation::CheckFailed(error.to_string())],
         };
+        unread.dedup();
+        violations.extend(unread);
         let tip = self
             .check_branch(git, worktree, branch, &mut violations)
             .unwrap_or_else(|error| {
@@ -652,13 +711,32 @@ impl MainState {
         let shared = read_shared(common)?;
         let worktree_entries = read_worktree_entries(common, own, &|_| {})?;
 
+        // Each ref with its target when it is symbolic (OWL-400): a ref a
+        // run turned into an alias is a change even at the same commit.
         let own = format!("refs/heads/{branch}");
-        let listed = git.run(main, &["for-each-ref", "--format=%(objectname) %(refname)"])?;
+        let listed = git.run(
+            main,
+            &[
+                "for-each-ref",
+                "--format=%(objectname) %(refname) %(symref)",
+            ],
+        )?;
         let refs = String::from_utf8_lossy(&listed)
             .lines()
-            .filter_map(|line| line.split_once(' '))
-            .filter(|(_, name)| *name != own && !name.starts_with("refs/remotes/"))
-            .map(|(object, name)| (name.to_owned(), object.to_owned()))
+            .filter_map(|line| {
+                let (object, rest) = line.split_once(' ')?;
+                let (name, target) = rest.split_once(' ').unwrap_or((rest, ""));
+                Some((object, name, target))
+            })
+            .filter(|(_, name, _)| *name != own && !name.starts_with("refs/remotes/"))
+            .map(|(object, name, target)| {
+                let value = if target.is_empty() {
+                    object.to_owned()
+                } else {
+                    format!("{object} -> {target}")
+                };
+                (name.to_owned(), value)
+            })
             .collect();
 
         Ok(Self {
@@ -712,13 +790,15 @@ impl MainState {
     }
 
     /// The files of other worktrees' entries that changed, but the entries
-    /// of concurrent runs. An entry is a concurrent run's by the branch it
-    /// belonged to when the snapshot was taken (`owners`), never by a later
-    /// `HEAD` of an existing entry, which a run could forge; an entry the
-    /// snapshot did not see, or caught while it was being made, is judged by
-    /// the owner read after the run (`owners_after`). A branch is a
-    /// concurrent run's when either answer knows it; an entry on no branch
-    /// is never exempt.
+    /// of concurrent runs. An entry is a concurrent ticket's when either
+    /// answer names it, from that ticket's run file (OWL-400); or by the
+    /// branch it belonged to when the snapshot was taken (`owners`), never by
+    /// a later `HEAD` of an existing entry, which a run could forge; an entry
+    /// the snapshot did not see, or caught while it was being made, is judged
+    /// by the owner read after the run (`owners_after`), which is what
+    /// covers a first run's entry before its run file names it. A branch is
+    /// a concurrent run's when either answer knows it; an entry on no branch
+    /// that no answer names is never exempt.
     fn changed_entries(
         &self,
         after: &Self,
@@ -730,6 +810,9 @@ impl MainState {
             let Some(name) = name.to_str() else {
                 return false;
             };
+            if earlier.entries.contains(name) || later.entries.contains(name) {
+                return true;
+            }
             let branch_of = |owner: Option<&Owner>| match owner {
                 Some(Owner::Branch(branch)) => Some(branch.clone()),
                 _ => None,
@@ -738,7 +821,8 @@ impl MainState {
                 Some(Owner::Creating) | None => owners_after.get(name),
                 owner => owner,
             };
-            branch_of(owner).is_some_and(|branch| known(earlier, later, &branch))
+            branch_of(owner)
+                .is_some_and(|branch| known(earlier, later, &format!("refs/heads/{branch}")))
         };
         changed(&self.worktree_entries, &after.worktree_entries)
             .into_iter()
@@ -752,37 +836,29 @@ impl MainState {
             .collect()
     }
 
-    /// The refs that changed, but concurrent runs' branches, known from the
-    /// scheduler's answers just before (`earlier`) and just after (`later`)
-    /// the refs were read. A branch running in either answer is left out,
-    /// and so is one that ran again between them (its tip changed) or that
-    /// only the later answer knows: the refs may hold it at any point of
-    /// that run. A branch that had already ended in the earlier answer
-    /// counts when it is not at its tip, whether it changed since the
-    /// snapshot or not.
+    /// The refs that changed, but concurrent tickets' branches and ticket
+    /// refs, known from the answers just before (`earlier`) and just after
+    /// (`later`) the refs were read. A ref running in either answer is left
+    /// out, and so is one whose values changed between them or that only the
+    /// later answer knows: the refs may hold it at any point of that run. A
+    /// ref that had already ended in the earlier answer counts when it holds
+    /// none of its values ([`settled`]), whether it changed since the
+    /// snapshot or not; a symbolic ref never holds one.
     fn changed_refs(&self, after: &Self, earlier: &Concurrent, later: &Concurrent) -> Vec<String> {
         let mut refs: Vec<String> = changed(&self.refs, &after.refs)
             .into_iter()
-            .filter(|name| {
-                !name
-                    .strip_prefix("refs/heads/")
-                    .is_some_and(|branch| known(earlier, later, branch))
-            })
+            .filter(|name| !known(earlier, later, name))
             .cloned()
             .collect();
-        for (branch, tip) in &earlier.ended {
-            let settled = !earlier.running.contains(branch)
-                && !later.running.contains(branch)
-                && later
-                    .ended
-                    .get(branch)
-                    .is_none_or(|later_tip| later_tip == tip);
-            let name = format!("refs/heads/{branch}");
-            if settled && after.refs.get(&name) != Some(tip) {
-                refs.push(name);
+        for (name, accepted) in &earlier.ended {
+            if settled(name, accepted, earlier, later)
+                && !accepted.contains(&after.refs.get(name).cloned())
+            {
+                refs.push(name.clone());
             }
         }
         refs.sort();
+        refs.dedup();
         refs
     }
 }
@@ -1781,21 +1857,80 @@ mod tests {
     }
 
     #[test]
-    fn a_branch_is_known_in_either_answer() {
-        let running = Concurrent {
-            running: BTreeSet::from(["a".to_owned()]),
-            ended: BTreeMap::new(),
-        };
-        let ended = Concurrent {
-            running: BTreeSet::new(),
-            ended: BTreeMap::from([("b".to_owned(), "tip".to_owned())]),
-        };
-        assert!(running.knows("a") && !running.knows("b"));
-        assert!(ended.knows("b") && !ended.knows("a"));
+    fn a_ref_is_known_in_either_answer() {
+        let running = Concurrent::default().running_branch("a");
+        let ended = Concurrent::default().ended_branch("b", "tip");
+        assert!(running.knows("refs/heads/a") && !running.knows("refs/heads/b"));
+        assert!(ended.knows("refs/heads/b") && !ended.knows("refs/heads/a"));
         let none = Concurrent::default();
-        assert!(known(&running, &none, "a"));
-        assert!(known(&none, &ended, "b"));
-        assert!(!known(&running, &ended, "c"));
+        assert!(known(&running, &none, "refs/heads/a"));
+        assert!(known(&none, &ended, "refs/heads/b"));
+        assert!(!known(&running, &ended, "refs/heads/c"));
+    }
+
+    /// An ended ref is held to its values only when it is running in
+    /// neither answer and the later answer, knowing it, gives the same
+    /// values; and it passes only at one of them, a symbolic ref at the
+    /// same commit never (OWL-400).
+    #[test]
+    fn an_ended_ref_is_held_to_its_values_only_while_settled() {
+        const NAME: &str = "refs/owlshift/tickets/OWL-2";
+        let values = |values: &[Option<&str>]| -> BTreeSet<Option<String>> {
+            values.iter().map(|v| v.map(str::to_owned)).collect()
+        };
+        let ended = |values: BTreeSet<Option<String>>| Concurrent {
+            ended: BTreeMap::from([(NAME.to_owned(), values)]),
+            ..Concurrent::default()
+        };
+        let running = Concurrent {
+            running: BTreeSet::from([NAME.to_owned()]),
+            ..Concurrent::default()
+        };
+        let held = values(&[Some("c1"), Some("c2")]);
+        for (case, later, expected) in [
+            ("unknown later", Concurrent::default(), true),
+            ("same values later", ended(held.clone()), true),
+            ("other values later", ended(values(&[Some("c3")])), false),
+            ("running later", running.clone(), false),
+        ] {
+            assert_eq!(
+                settled(NAME, &held, &ended(held.clone()), &later),
+                expected,
+                "{case}"
+            );
+        }
+        assert!(!settled(NAME, &held, &running, &Concurrent::default()));
+
+        let state = |value: Option<&str>| MainState {
+            refs: value
+                .map(|v| BTreeMap::from([(NAME.to_owned(), v.to_owned())]))
+                .unwrap_or_default(),
+            ..MainState::default()
+        };
+        let before = state(Some("c0"));
+        let earlier = ended(values(&[Some("c1"), Some("c2"), None]));
+        for (after, flagged) in [
+            (Some("c1"), false),
+            (Some("c2"), false),
+            (None, false),
+            (Some("c0"), true),
+            (Some("c1 -> refs/remotes/origin/x"), true),
+        ] {
+            let found = before.changed_refs(&state(after), &earlier, &Concurrent::default());
+            assert_eq!(!found.is_empty(), flagged, "{after:?}: {found:?}");
+        }
+        // Running in either answer, or ended only in the later one: left
+        // out, whatever it holds.
+        for (first, second) in [
+            (running.clone(), Concurrent::default()),
+            (Concurrent::default(), running.clone()),
+            (Concurrent::default(), earlier.clone()),
+        ] {
+            assert_eq!(
+                before.changed_refs(&state(Some("c9")), &first, &second),
+                Vec::<String>::new()
+            );
+        }
     }
 
     const RUNNING: &str = "owlshift/running";
@@ -1956,10 +2091,9 @@ mod tests {
     }
 
     fn concurrent(running: &[&str]) -> Concurrent {
-        Concurrent {
-            running: running.iter().map(|branch| (*branch).to_owned()).collect(),
-            ended: BTreeMap::new(),
-        }
+        running.iter().fold(Concurrent::default(), |known, branch| {
+            known.running_branch(branch)
+        })
     }
 
     /// The violations of the entries between `before` and the folder as it
@@ -1971,6 +2105,38 @@ mod tests {
         };
         let owners = before.owners_after(&after, earlier, later, &|_| {});
         before.main.changed_entries(&after, earlier, later, &owners)
+    }
+
+    /// An entry a ticket's run file names is left out by that name, in either
+    /// answer, even on no branch, as an `--apply` rebase leaves it; one no
+    /// answer names is still checked (OWL-400).
+    #[test]
+    fn an_entry_named_by_a_run_file_is_left_out_on_any_branch() {
+        let dir = tempfile::tempdir().unwrap();
+        let common = dir.path();
+        fake_entry(common, "own", "owlshift/own");
+        let named = fake_entry(common, "named", "owlshift/named");
+        let other = fake_entry(common, "other", "owlshift/other");
+        let before = snapshot_of(common);
+        fs::write(named.join("HEAD"), SHA).unwrap();
+        fs::write(named.join("index"), "staged\n").unwrap();
+        fs::write(other.join("index"), "tampered\n").unwrap();
+        let naming = Concurrent {
+            entries: BTreeSet::from(["named".to_owned()]),
+            ..Concurrent::default()
+        };
+        let none = Concurrent::default();
+        for (earlier, later) in [(&naming, &none), (&none, &naming)] {
+            assert_eq!(judged(&before, earlier, later), ["worktrees/other/index"]);
+        }
+        assert_eq!(
+            judged(&before, &none, &none),
+            [
+                "worktrees/named/HEAD",
+                "worktrees/named/index",
+                "worktrees/other/index"
+            ]
+        );
     }
 
     #[test]

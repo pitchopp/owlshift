@@ -148,6 +148,7 @@ impl Live {
             brief: &brief,
             setup: &[],
             session: None,
+            siblings: None,
         };
         let report = self.executor.run(&spec, harness).unwrap();
         let after = fs::read(&self.login).unwrap();

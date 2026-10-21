@@ -328,24 +328,13 @@ impl Bench {
 fn a_kept_branch_with_commits_of_its_own_is_dispatched_as_it_is() {
     let bench = Bench::new(true);
     let blocked = r#"{"format":14,"status":"blocked","summary":"Waiting."}"#;
-    let (outcome, printed) = bench.run(vec![bench.reply(None, Some(blocked))], None);
+    // The run leaves a commit of its own, then blocks: since OWL-400 a
+    // commit made outside a run is a breach at the ticket's next start.
+    let (outcome, printed) = bench.run(vec![bench.reply(Some("Hi"), Some(blocked))], None);
     assert!(
         matches!(outcome, Err(Stop::Parked { .. })),
         "{outcome:?}\n{printed}"
     );
-    bench
-        .env
-        .run(
-            &bench.worktree(),
-            &[
-                "commit",
-                "--quiet",
-                "--allow-empty",
-                "-m",
-                "A person's commit",
-            ],
-        )
-        .unwrap();
     let own = bench.kept_head();
     let merged = bench.merge_into_main(&[("MERGED.md", "merged\n")]);
 
@@ -1771,11 +1760,13 @@ impl Bench {
     }
 
     /// `owlshift unquarantine`, the project's name typed.
-    fn unquarantine(&self) -> quarantine::Cleared {
+    pub(super) fn unquarantine(&self) -> quarantine::Cleared {
         let mut out = Vec::new();
         let mut sink = EventSink::new(REPO, EventLog::in_dir(&self.data), &mut out);
         let mut ask = |_: &str| Ok(format!("{REPO}\n"));
-        quarantine::clear(&self.dirs(), &mut ask, &mut sink).unwrap()
+        let env = self.env.clone();
+        let git = Git::with_setup("git", move |command| env.apply(command));
+        quarantine::clear(&git, &self.dirs(), &mut ask, &mut sink).unwrap()
     }
 }
 
@@ -1831,8 +1822,8 @@ fn a_quarantine_is_told_once_to_the_operator_and_to_the_ticket_it_holds() {
         4 => assert_eq!(bench.quarantine_told("DEMO-1"), (1, 1, 1)),
         5 => {
             assert_eq!(bench.quarantine_told("DEMO-1"), (1, 1, 1));
-            let state = quarantine::marker_state(&bench.dirs()).unwrap();
-            let quarantine::MarkerState::Marked { text, .. } = state else {
+            let state = quarantine::state(&bench.dirs()).unwrap();
+            let Some((_, text)) = state.quarantine else {
                 panic!("{state:?}");
             };
             assert!(text.contains("of DEMO-2 broke isolation"), "{text}");
@@ -1889,7 +1880,11 @@ fn a_quarantine_is_told_once_to_the_operator_and_to_the_ticket_it_holds() {
     );
     assert!(park.contains("`owlshift unquarantine`"), "{park}");
     // Cleared, DEMO-1 is continued and built; DEMO-2 stays parked.
-    assert_eq!(bench.dirs().unverified().unwrap(), None);
+    assert_eq!(bench.dirs().quarantine().unwrap(), None);
+    assert!(
+        !bench.dirs().obligations_stand(),
+        "cleared with the quarantine"
+    );
     assert!(outcomes.last().unwrap().is_ok(), "{outcomes:?}\n{lines}");
     assert_eq!(
         bench.runs(),
@@ -1938,9 +1933,9 @@ fn a_cut_off_run_is_notified_once_and_the_ready_ticket_told_once() {
                 .run(&checkout, &["config", "core.fsmonitor", &monitor])
                 .unwrap();
             fs::write(
-                bench.dirs().unverified_file(),
-                "Run r1 of DEMO-1 started at 2026-10-19T00:00:00Z; its isolation check has not \
-                 passed.\n",
+                bench.dirs().quarantine_file(),
+                "Run r1 of DEMO-1, started at 2026-10-19T00:00:00Z, ended before its isolation \
+                 check passed (a crash or a stop): nobody checked what it changed.\n",
             )
             .unwrap();
             *before.borrow_mut() = refs();

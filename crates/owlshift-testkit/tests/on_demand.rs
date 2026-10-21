@@ -1317,7 +1317,9 @@ impl Bench {
             .collect()
     }
 
-    /// Writes `record` as the ticket ref, over the one it holds.
+    /// Writes `record` as the ticket ref, over the one it holds, as a
+    /// person's command does: under the ticket's lock, through its run file
+    /// (OWL-400).
     fn write_record(&self, record: &TicketRecord) {
         let env = self.env.clone();
         let git = Git::with_setup("git", move |command| env.apply(command));
@@ -1325,7 +1327,7 @@ impl Bench {
         let previous = ticket_ref::read(&git, &checkout, &ticket())
             .unwrap()
             .map(|stored| stored.commit);
-        ticket_ref::write(&git, &checkout, &ticket(), record, previous.as_deref()).unwrap();
+        write_through_run_file(&git, &self.dirs(), &ticket(), record, previous.as_deref());
     }
 
     /// Another merge into the remote's `main`, writing `files`, from a
@@ -1667,6 +1669,34 @@ fn ticket() -> TicketId {
     TicketId::new(TICKET).unwrap()
 }
 
+/// Writes `record` as `ticket`'s ref from `previous`, as the runner's own
+/// writes do: under the ticket's lock, through its run file (OWL-400), so
+/// the ticket's next step finds the ref where its run file says. Returns
+/// the new commit.
+fn write_through_run_file(
+    git: &Git,
+    dirs: &ProjectDirs,
+    ticket: &TicketId,
+    record: &TicketRecord,
+    previous: Option<&str>,
+) -> String {
+    let lock = dirs
+        .ticket_lock(ticket)
+        .unwrap()
+        .expect("the ticket's lock");
+    owlshift_runner::ticket_run::write_ref(
+        git,
+        dirs,
+        &dirs.checkout(),
+        &lock,
+        ticket,
+        record,
+        ticket_ref::ProposalsFile::Keep,
+        previous,
+    )
+    .unwrap()
+}
+
 fn kinds(events: &[Event]) -> Vec<EventKind> {
     events.iter().map(|event| event.kind).collect()
 }
@@ -1815,7 +1845,26 @@ fn a_ticket_becomes_a_pull_request_with_its_report() {
     );
     assert!(!bench.remote.checkout.join("GREETING.md").exists());
     assert_eq!(bench.person(), person);
-    assert_eq!(dirs.unverified().unwrap(), None);
+    assert_eq!(dirs.quarantine().unwrap(), None);
+    // The run's obligation went with its passed check, and the ticket's run
+    // file holds the branch as the check verified it (OWL-400).
+    assert!(!dirs.obligations_stand());
+    let run = fs::read_to_string(dirs.run_file(&TicketId::new(TICKET).unwrap())).unwrap();
+    let run = owlshift_contracts::step::TicketRun::parse(&run).unwrap();
+    let head = bench
+        .env
+        .run(
+            &dirs.checkout(),
+            &[
+                "rev-parse",
+                &format!("refs/heads/owlshift/{}", TICKET.to_lowercase()),
+            ],
+        )
+        .unwrap();
+    assert_eq!(
+        run.tip.as_deref(),
+        Some(String::from_utf8(head).unwrap().trim())
+    );
 
     // The ticket ref keeps the delivery, and the ticket at Watch: watch
     // follows its pull request (OWL-209).
@@ -2620,8 +2669,11 @@ fn a_quarantined_run_keeps_the_project_refused() {
         .insert(RelativePath::new("planted.txt").unwrap(), "x".to_owned());
     let (outcome, _) = bench.run(vec![reply], None);
     assert!(matches!(outcome, Err(Stop::Parked { .. })), "{outcome:?}");
-    let marker = bench.dirs().unverified().unwrap().expect("a marker");
+    let marker = bench.dirs().quarantine().unwrap().expect("a quarantine");
     assert!(marker.contains("broke isolation"), "{marker}");
+    // The breaching run's obligation stays until a person clears it
+    // (OWL-400).
+    assert!(bench.dirs().obligations_stand());
 
     let (again, _) = bench.run(Vec::new(), None);
     let Err(stop @ Stop::Unverified { .. }) = again else {
@@ -2718,7 +2770,7 @@ fn an_agent_that_redirects_its_git_link_gets_no_hook_and_no_push() {
     assert_eq!(comments.len(), 1, "{comments:?}");
     assert!(comments[0].starts_with("[owlshift] PARKED\n"));
     assert!(!comments[0].contains(".git"), "{}", comments[0]);
-    let marker = bench.dirs().unverified().unwrap().expect("a marker");
+    let marker = bench.dirs().quarantine().unwrap().expect("a quarantine");
     assert!(marker.contains(".git link"), "{marker}");
 }
 
@@ -2805,7 +2857,7 @@ fn a_run_that_moves_origin_main_does_not_choose_the_next_base() {
         "{outcome:?}\n{printed}"
     );
     // Not a breach: the check leaves remote-tracking refs out.
-    assert_eq!(bench.dirs().unverified().unwrap(), None);
+    assert_eq!(bench.dirs().quarantine().unwrap(), None);
     let evil = evil.borrow().clone();
     let checkout = bench.dirs().checkout();
     let at = |dir: &Path, name: &str| {
@@ -2825,6 +2877,9 @@ fn a_run_that_moves_origin_main_does_not_choose_the_next_base() {
     ] {
         bench.env.run(&checkout, &args).unwrap();
     }
+    // A later ticket has no run file yet: it takes its refs as they are
+    // (OWL-400), where the same ticket would find its branch gone.
+    fs::remove_file(bench.dirs().run_file(&ticket())).unwrap();
     let (outcome, printed) = bench.run(vec![bench.reply(Some("Hello"), Some(DONE))], None);
     outcome.unwrap_or_else(|stop| panic!("{stop}\n{printed}"));
     let tip = bench.remote_branch().expect("the branch was pushed");
@@ -3770,7 +3825,6 @@ fn a_ticket_whose_ref_is_full_is_forgotten_and_asks_its_next_round() {
     // `questions.json` 300 bytes short of the cap.
     let env = bench.env.clone();
     let git = Git::with_setup("git", move |command| env.apply(command));
-    let checkout = bench.dirs().checkout();
     let mut record = bench.record();
     record.state = PersistedState::parse(
         r#"{"format":2,"stage":"build","round":1,"reasks":0,"failed_runs":0}"#,
@@ -3782,14 +3836,13 @@ fn a_ticket_whose_ref_is_full_is_forgotten_and_asks_its_next_round() {
         .context
         .push_str(&"x".repeat(pad));
     assert_eq!(record.questions.render().len(), short);
-    let full = ticket_ref::write(
+    let full = write_through_run_file(
         &git,
-        &checkout,
+        &bench.dirs(),
         &ticket(),
         &record,
         Some(&bench.ref_commit()),
-    )
-    .unwrap();
+    );
 
     let (stopped, printed) = bench.run(vec![bench.reply(None, Some(ROUND_1))], None);
     let Err(Stop::NotKept {
@@ -3946,12 +3999,19 @@ fn an_answer_on_the_ticket_resumes_it_under_watch() {
                 bench.waited.set(SignedDuration::from_mins(20));
                 lock = Some(dirs.lock().unwrap().expect("the project is free"));
             }
-            // Skipped. Then a run's isolation check left the project
-            // unverified.
+            // Skipped. Then a run was cut off before its isolation check:
+            // its obligation, its ticket's lock free, which the next pass
+            // turns into the quarantine (OWL-400).
             4 => {
                 assert_eq!(ran(), 1);
                 drop(lock.take());
-                fs::write(dirs.unverified_file(), "A run was cut off.\n").unwrap();
+                owlshift_runner::ticket_run::write_obligation(
+                    &dirs,
+                    Some(&ticket()),
+                    "20261019T000000Z",
+                    "Run 20261019T000000Z of DEMO-1",
+                )
+                .unwrap();
             }
             // Nothing is continued until a person clears it; the operator
             // is notified once, the ticket told once.
@@ -3966,8 +4026,11 @@ fn an_answer_on_the_ticket_resumes_it_under_watch() {
                 let mut out = Vec::new();
                 let mut sink = EventSink::new(REPO, EventLog::in_dir(&bench.data), &mut out);
                 let mut ask = |_: &str| Ok(format!("{REPO}\n"));
-                let cleared = quarantine::clear(&dirs, &mut ask, &mut sink).unwrap();
+                let env = bench.env.clone();
+                let git = Git::with_setup("git", move |command| env.apply(command));
+                let cleared = quarantine::clear(&git, &dirs, &mut ask, &mut sink).unwrap();
                 assert!(matches!(cleared, quarantine::Cleared::Cleared { .. }));
+                assert!(!dirs.obligations_stand(), "cleared for good");
             }
             // Continued: the answer check, then, at the next pass, at once
             // (OWL-367), Build and its Verify pass ran (OWL-304). The next
@@ -4485,7 +4548,7 @@ fn a_failed_check_is_retried_and_a_parked_ticket_restarts_on_continue() {
 
     // A person looked and cleared the project; `continue` restarts the ticket
     // and checks the same answers, with no new comment.
-    fs::remove_file(bench.dirs().unverified_file()).unwrap();
+    bench.unquarantine();
     // A watch that read the ticket before the park never restarts it
     // (OWL-152): the ticket ref is not the one it read, so nothing runs,
     // and nothing records that watch continued it.
@@ -7563,7 +7626,7 @@ fn a_stage_left_at_working_is_moved_only_under_the_lock_and_unchanged() {
     // A run stopped meanwhile, leaving the project for a person to look at.
     let bench = delivered();
     left_working(&bench);
-    let marker = bench.dirs().unverified_file();
+    let marker = bench.dirs().quarantine_file();
     *bench.after_stage_read.borrow_mut() = Some(Box::new(move || {
         fs::write(&marker, "a run stopped\n").unwrap();
     }));
@@ -7575,11 +7638,11 @@ fn a_stage_left_at_working_is_moved_only_under_the_lock_and_unchanged() {
     // The ticket ref moved, as by a command typed meanwhile.
     let bench = delivered();
     left_working(&bench);
-    let (env, checkout) = (bench.env.clone(), bench.dirs().checkout());
+    let (env, dirs) = (bench.env.clone(), bench.dirs());
     let (record, commit) = (bench.record(), bench.ref_commit());
     *bench.after_stage_read.borrow_mut() = Some(Box::new(move || {
         let git = Git::with_setup("git", move |command| env.apply(command));
-        let moved = ticket_ref::write(&git, &checkout, &ticket(), &record, Some(&commit)).unwrap();
+        let moved = write_through_run_file(&git, &dirs, &ticket(), &record, Some(&commit));
         assert_ne!(moved, commit);
     }));
     let from = bench.events().len();
@@ -11354,6 +11417,11 @@ mod verify_scenarios;
 /// Scenario S10's usage part, across two projects (OWL-404).
 #[path = "on_demand/usage_scenarios.rs"]
 mod usage_scenarios;
+
+/// OWL-400's acceptance through the commands: the obligations, the sticky
+/// quarantine, the start of a step and a cut write.
+#[path = "on_demand/isolation_scenarios.rs"]
+mod isolation_scenarios;
 
 /// OWL-312's acceptance: `[roles.build] rules` reaches Build's brief after
 /// `stack.rules`, and not the resolver's; the `dispatch` event names every

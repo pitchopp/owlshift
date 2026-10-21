@@ -12,7 +12,7 @@ use crate::refs::{
 };
 use crate::result::RunResult;
 use crate::review::{TicketPlan, TicketReview};
-use crate::step::{StepEnvelope, StepOutcome, TicketCarry};
+use crate::step::{RunObligation, StepEnvelope, StepOutcome, TicketCarry, TicketRun};
 use crate::usage::HarnessUsage;
 
 /// Every published schema, by file stem: `schemas/<stem>.schema.json`.
@@ -38,6 +38,8 @@ pub fn all() -> Vec<(&'static str, Schema)> {
         ("step-envelope", schema::<StepEnvelope>()),
         ("step-outcome", schema::<StepOutcome>()),
         ("ticket-carry", schema::<TicketCarry>()),
+        ("ticket-run", schema::<TicketRun>()),
+        ("run-obligation", schema::<RunObligation>()),
         ("harness-usage", schema::<HarnessUsage>()),
     ]
 }

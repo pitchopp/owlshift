@@ -309,10 +309,10 @@ pub fn gather(
             Err(why) => notes.push(format!("the ticket refs cannot be read: {why}")),
         }
     }
-    let quarantined = match dirs.unverified() {
+    let quarantined = match dirs.quarantine() {
         Ok(marker) => marker.is_some(),
         Err(error) => {
-            notes.push(format!("the quarantine marker cannot be read: {error}"));
+            notes.push(format!("the quarantine cannot be read: {error}"));
             false
         }
     };
