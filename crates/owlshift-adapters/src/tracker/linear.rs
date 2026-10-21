@@ -146,6 +146,14 @@
 //! - An unknown `issueId` answers `issue not found`, code `INPUT_ERROR`,
 //!   which the adapter reads as [`ErrorKind::NotFound`].
 //!
+//! Checked live on 2026-10-21 (OWL-416), read-only, by
+//! `record_links_fixture` through the key, for intake's links: the `Links`
+//! query (`inverseRelations` and `relations`, both `first: 50,
+//! includeArchived: true`, each issue's `identifier title state { name type
+//! }`) is accepted, and answered for OWL-254 five blockers, one issue it
+//! blocks and one related, and for OWL-267 one issue it blocks, every state
+//! typed (`completed`). The answers are `tests/fixtures/linear/links.json`.
+//!
 //! Checked live on 2026-10-15 (OWL-292; build plan, "P4 · The drain", part
 //! I) through the API key, on two throwaway issues then canceled: Linear
 //! keeps one relation between two issues. `related` then `blocks`, `blocks`

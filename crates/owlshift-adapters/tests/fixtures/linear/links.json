@@ -1,5 +1,5 @@
 {
-  "recorded": "2026-10-21, synthesized until record_links_fixture runs on the Owlshift workspace (OWL-416)",
+  "recorded": "2026-10-21 on the Owlshift workspace, recorded live",
   "exchanges": [
     {
       "request": {
@@ -21,20 +21,53 @@
                       "name": "Done",
                       "type": "completed"
                     },
-                    "title": "A synthesized blocker"
+                    "title": "Give proposals on the Markdown tracker an owner before the scenarios"
                   },
                   "type": "blocks"
                 },
                 {
                   "issue": {
-                    "identifier": "OWL-266",
+                    "identifier": "OWL-253",
                     "state": {
-                      "name": "Todo",
-                      "type": "unstarted"
+                      "name": "Done",
+                      "type": "completed"
                     },
-                    "title": "A synthesized related ticket"
+                    "title": "File runs' follow-ups as deduplicated proposals after delivery"
                   },
-                  "type": "related"
+                  "type": "blocks"
+                },
+                {
+                  "issue": {
+                    "identifier": "OWL-251",
+                    "state": {
+                      "name": "Done",
+                      "type": "completed"
+                    },
+                    "title": "Hold new Builds at the open pull request cap"
+                  },
+                  "type": "blocks"
+                },
+                {
+                  "issue": {
+                    "identifier": "OWL-250",
+                    "state": {
+                      "name": "Done",
+                      "type": "completed"
+                    },
+                    "title": "Pick and dispatch admitted tickets in owlshift watch --drain"
+                  },
+                  "type": "blocks"
+                },
+                {
+                  "issue": {
+                    "identifier": "OWL-249",
+                    "state": {
+                      "name": "Done",
+                      "type": "completed"
+                    },
+                    "title": "Turn intake's dependencies into tracker relations"
+                  },
+                  "type": "blocks"
                 }
               ],
               "pageInfo": {
@@ -47,10 +80,60 @@
                   "relatedIssue": {
                     "identifier": "OWL-255",
                     "state": {
-                      "name": "Backlog",
-                      "type": "backlog"
+                      "name": "Done",
+                      "type": "completed"
                     },
-                    "title": "A synthesized blocked ticket"
+                    "title": "Run the P4 exit gate on real tickets"
+                  },
+                  "type": "blocks"
+                },
+                {
+                  "relatedIssue": {
+                    "identifier": "OWL-244",
+                    "state": {
+                      "name": "Done",
+                      "type": "completed"
+                    },
+                    "title": "Design the drain (P4) in the build plan"
+                  },
+                  "type": "related"
+                }
+              ],
+              "pageInfo": {
+                "hasNextPage": false
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "request": {
+        "query": "query Links($id: String!) { issue(id: $id) { inverseRelations(first: 50, includeArchived: true) { nodes { type issue { identifier title state { name type } } } pageInfo { hasNextPage } } relations(first: 50, includeArchived: true) { nodes { type relatedIssue { identifier title state { name type } } } pageInfo { hasNextPage } } } }",
+        "variables": {
+          "id": "OWL-267"
+        }
+      },
+      "status": 200,
+      "response": {
+        "data": {
+          "issue": {
+            "inverseRelations": {
+              "nodes": [],
+              "pageInfo": {
+                "hasNextPage": false
+              }
+            },
+            "relations": {
+              "nodes": [
+                {
+                  "relatedIssue": {
+                    "identifier": "OWL-254",
+                    "state": {
+                      "name": "Done",
+                      "type": "completed"
+                    },
+                    "title": "Play scenarios S3, S4, S6, S12 and S13 on the test bench"
                   },
                   "type": "blocks"
                 }
@@ -61,8 +144,7 @@
             }
           }
         }
-      },
-      "synthesized": "hand-written in the shape of LINKS_QUERY's answer; replaced by record_links_fixture (OWL-416)"
+      }
     }
   ]
 }
