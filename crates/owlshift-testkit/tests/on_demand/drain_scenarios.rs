@@ -1796,10 +1796,12 @@ impl Bench {
 /// DEMO-1 then counts: two quarantined passes tell it once, one event and
 /// one WAITING comment, and notify nothing more, and what `owlshift doctor`
 /// reads names the run and the breach. Once `owlshift unquarantine` clears
-/// it, the next pass continues DEMO-1 and builds it.
+/// it, the next pass folds DEMO-1's WAITING comment, once, posting none,
+/// then continues DEMO-1 and builds it (OWL-423).
 #[test]
 fn a_quarantine_is_told_once_to_the_operator_and_to_the_ticket_it_holds() {
     let bench = Bench::draining("maintainer");
+    bench.fold.borrow_mut().on = true;
     bench.put_ticket(
         "DEMO-2",
         "maintainer",
@@ -1921,6 +1923,33 @@ fn a_quarantine_is_told_once_to_the_operator_and_to_the_ticket_it_holds() {
         lines.contains("watch: DEMO-1 waits for the quarantine to be cleared"),
         "{lines}"
     );
+    // The clear's next pass folded the WAITING comment, once (OWL-423).
+    let events = bench.events();
+    let on_demo_1 = |e: &&Event| {
+        e.kind == EventKind::TrackerWrite
+            && e.ticket.as_ref().is_some_and(|t| t.as_str() == "DEMO-1")
+    };
+    let waiting = events
+        .iter()
+        .filter(on_demo_1)
+        .find(|e| e.data.get("kind") == Some(&json!("WAITING")))
+        .expect("DEMO-1's WAITING comment")
+        .data["comment"]
+        .clone();
+    let folds: Vec<&Event> = events
+        .iter()
+        .filter(on_demo_1)
+        .filter(|e| e.data["action"] == "resolve" && e.data["comment"] == waiting)
+        .collect();
+    assert_eq!(folds.len(), 1, "{folds:?}");
+    assert_eq!(folds[0].data.get("by"), None);
+    let resolved = &bench.fold.borrow().resolved;
+    assert_eq!(
+        resolved.iter().filter(|id| json!(id) == waiting).count(),
+        1,
+        "{resolved:?}"
+    );
+    assert!(!bench.dirs().quarantine_comments_file().exists());
 }
 
 /// A marker no command notified, as a cut-off run leaves, found by `watch

@@ -8,8 +8,11 @@
 //! started again posts nothing for a reason already shown and folds a
 //! comment whose wait ended meanwhile, and no comment is resolved twice.
 //! Watch's memory caches what each file says.
+//!
+//! The quarantine's WAITING comments, which tell tickets that are not in
+//! flight, are folded once it is cleared ([`QuarantineComments`], OWL-423).
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io;
 use std::path::PathBuf;
@@ -159,6 +162,115 @@ impl WaitComments {
         self.shown.insert(ticket.clone(), shown.clone());
         shown
     }
+}
+
+/// The quarantine's WAITING comments posted and not folded yet, by ticket
+/// (OWL-423; architecture section 8, "The quarantine"): kept in the
+/// project's [`ProjectDirs::quarantine_comments_file`], which watch alone
+/// writes and the clear leaves, read once per watch. So a watch started
+/// again after the clear still folds them, and none is resolved twice.
+#[derive(Debug, Default)]
+pub(super) struct QuarantineComments {
+    /// `None` until the file was read.
+    shown: Option<BTreeMap<TicketId, String>>,
+}
+
+impl QuarantineComments {
+    /// The WAITING comment `comment` was posted on `ticket` for the
+    /// quarantine that stands: recorded, and the one `ticket` had for an
+    /// earlier quarantine's text folded, superseded by it.
+    pub(super) fn posted(&mut self, board: &mut Board<'_, '_>, ticket: &TicketId, comment: &str) {
+        let shown = self.load(board);
+        let before = shown.insert(ticket.clone(), comment.to_owned());
+        let shown = shown.clone();
+        // A record that cannot be written now is written whole by the next.
+        save(board, &shown);
+        if let Some(before) = before {
+            fold(board, ticket, &before, Some(comment));
+        }
+    }
+
+    /// No quarantine stands: every comment recorded is folded, and nothing
+    /// is posted. The record is emptied first, so that a watch stopped
+    /// meanwhile resolves none twice; one that cannot be emptied leaves the
+    /// folds to the next call.
+    pub(super) fn fold_all(&mut self, board: &mut Board<'_, '_>) {
+        if self.load(board).is_empty() || !save(board, &BTreeMap::new()) {
+            return;
+        }
+        for (ticket, comment) in self.shown.take().unwrap_or_default() {
+            fold(board, &ticket, &comment, None);
+        }
+        self.shown = Some(BTreeMap::new());
+    }
+
+    /// What the file says, read once: a file that does not read is a
+    /// `warning` and taken as empty.
+    fn load(&mut self, board: &mut Board<'_, '_>) -> &mut BTreeMap<TicketId, String> {
+        self.shown.get_or_insert_with(|| {
+            read_quarantine(board.dirs).unwrap_or_else(|reason| {
+                board.sink.emit_project(
+                    None,
+                    EventKind::Warning,
+                    data([
+                        ("what", json!("quarantine_comments_unread")),
+                        ("reason", json!(reason)),
+                    ]),
+                );
+                BTreeMap::new()
+            })
+        })
+    }
+}
+
+/// The comments the project's file records: none when it is absent.
+fn read_quarantine(dirs: &ProjectDirs) -> Result<BTreeMap<TicketId, String>, String> {
+    let text = match fs::read_to_string(dirs.quarantine_comments_file()) {
+        Ok(text) => text,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(BTreeMap::new()),
+        Err(error) => return Err(error.to_string()),
+    };
+    let value: BTreeMap<String, String> = serde_json::from_str(&text).map_err(|e| e.to_string())?;
+    value
+        .into_iter()
+        .map(|(ticket, comment)| {
+            TicketId::new(&ticket)
+                .map(|ticket| (ticket, comment))
+                .map_err(|e| format!("{ticket}: {e}"))
+        })
+        .collect()
+}
+
+/// Writes `shown` to the project's file, whole or not at all, or removes it
+/// when empty. Returns whether it did; a failure is a `warning`.
+fn save(board: &mut Board<'_, '_>, shown: &BTreeMap<TicketId, String>) -> bool {
+    let file = board.dirs.quarantine_comments_file();
+    let written = if shown.is_empty() {
+        match fs::remove_file(&file) {
+            Err(error) if error.kind() != io::ErrorKind::NotFound => Err(error),
+            _ => Ok(()),
+        }
+    } else {
+        let text: BTreeMap<&str, &str> = shown
+            .iter()
+            .map(|(ticket, comment)| (ticket.as_str(), comment.as_str()))
+            .collect();
+        let partial = file.with_extension("json.partial");
+        fs::create_dir_all(board.dirs.root())
+            .and_then(|()| fs::write(&partial, json!(text).to_string()))
+            .and_then(|()| fs::rename(&partial, &file))
+    };
+    if let Err(error) = &written {
+        board.sink.emit_project(
+            None,
+            EventKind::Warning,
+            data([
+                ("what", json!("quarantine_comments_not_recorded")),
+                ("reason", json!(error.to_string())),
+            ]),
+        );
+    }
+    written.is_ok()
 }
 
 /// Resolves `comment`, superseded by `by` when one was posted: a
@@ -509,6 +621,64 @@ mod tests {
             ["Warning wait_comment_not_posted", "TrackerWrite resolve"]
         );
         assert!(!path(&bench.dirs, &ticket).exists());
+    }
+
+    /// The quarantine's comments, recorded as posted, are folded by a watch
+    /// started again once it is cleared, each once, nothing posted; a
+    /// second fold, in that watch or another, resolves nothing (OWL-423).
+    #[test]
+    fn a_quarantines_comments_are_folded_once_when_it_is_cleared() {
+        let bench = Bench::new();
+        let tracker = Board2::new(true);
+        let (owl_7, owl_8) = (owl_7(), TicketId::new("OWL-8").unwrap());
+        bench.with(&tracker, |board| {
+            let mut told = QuarantineComments::default();
+            told.posted(board, &owl_7, "q7");
+            told.posted(board, &owl_8, "q8");
+        });
+        let mut again = QuarantineComments::default();
+        let folded = bench.with(&tracker, |board| {
+            again.fold_all(board);
+            again.fold_all(board);
+            QuarantineComments::default().fold_all(board);
+        });
+        assert_eq!(
+            actions(&folded),
+            ["TrackerWrite resolve", "TrackerWrite resolve"]
+        );
+        assert_eq!(*tracker.resolved.borrow(), ["q7", "q8"]);
+        assert!(tracker.posted.borrow().is_empty());
+        assert!(!bench.dirs.quarantine_comments_file().exists());
+    }
+
+    /// A ticket told again, under a new quarantine text, has the comment it
+    /// had folded, superseded by the new one, which alone stays recorded.
+    /// A tracker that cannot fold is asked nothing, and its record goes.
+    #[test]
+    fn a_ticket_told_again_folds_its_quarantine_comment_first() {
+        let bench = Bench::new();
+        let tracker = Board2::new(true);
+        let ticket = owl_7();
+        let mut told = QuarantineComments::default();
+        let again = bench.with(&tracker, |board| {
+            told.posted(board, &ticket, "q1");
+            told.posted(board, &ticket, "q2");
+        });
+        assert_eq!(actions(&again), ["TrackerWrite resolve"]);
+        assert_eq!(again[0].data["comment"], "q1");
+        assert_eq!(again[0].data["by"], "q2");
+        assert_eq!(
+            read_quarantine(&bench.dirs).unwrap(),
+            BTreeMap::from([(ticket.clone(), "q2".to_owned())])
+        );
+
+        let plain = Board2::new(false);
+        let folded = bench.with(&plain, |board| {
+            QuarantineComments::default().fold_all(board);
+        });
+        assert!(folded.is_empty(), "{folded:?}");
+        assert!(plain.resolved.borrow().is_empty());
+        assert!(!bench.dirs.quarantine_comments_file().exists());
     }
 
     /// The comment stays far within a comment's limit, ten holders and a

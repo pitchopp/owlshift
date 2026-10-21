@@ -16,6 +16,7 @@
 //!     unverified/          the runs whose isolation check has not passed
 //!     quarantine           a breach, or a run left unchecked (OWL-400)
 //!     quarantine-told      what was told of the quarantine (OWL-368)
+//!     quarantine-comments.json  its WAITING comments not folded (OWL-423)
 //!     unfinished-clone     a first clone that has not finished
 //!     tickets/<ticket>/    lock, run.json (OWL-400), carry.json and
 //!                          outcome-<attempt>.json (OWL-399)
@@ -392,6 +393,13 @@ impl ProjectDirs {
     /// [`crate::quarantine::Record`]).
     pub fn told_file(&self) -> PathBuf {
         self.root.join("quarantine-told")
+    }
+
+    /// The quarantine's WAITING comments watch posted and has not folded
+    /// yet, by ticket (OWL-423): watch's alone, and kept by
+    /// `owlshift unquarantine`'s clear, so that the next pass folds them.
+    pub fn quarantine_comments_file(&self) -> PathBuf {
+        self.root.join("quarantine-comments.json")
     }
 
     /// Whether any obligation stands (OWL-400): any entry in
