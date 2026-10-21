@@ -204,8 +204,15 @@ impl OnDemand<'_> {
         p.cost.restarted();
         let before = p.stored.as_ref().map(|stored| stored.commit.clone());
         if let Err(stop) = self.keep(p, &state) {
-            if handed.is_some() && shown.is_some() {
-                self.unshow_restart(p, before.as_deref(), sink);
+            if handed.is_some()
+                && let Some(stage) = shown
+                && !self.unshow_restart(p, before.as_deref(), sink)
+            {
+                return Err(Stop::Refused(format!(
+                    "{stop}; {ticket} still shows {}, its ref having moved or not being \
+                     readable: run `owlshift continue {ticket}` once it can be written",
+                    stage.state(&self.config.tracker.states)
+                )));
             }
             return Err(stop);
         }
@@ -227,8 +234,8 @@ impl OnDemand<'_> {
     /// the ref, read again under the ticket's lock this command holds, is
     /// still `before`, the one the command started from: one that moved
     /// anyway (its run file not saved) or cannot be read keeps the stage
-    /// the restart showed.
-    fn unshow_restart(&self, p: &Prepared, before: Option<&str>, sink: &mut EventSink<'_>) {
+    /// the restart showed, and is told by `false`.
+    fn unshow_restart(&self, p: &Prepared, before: Option<&str>, sink: &mut EventSink<'_>) -> bool {
         let ticket = &p.ticket;
         let unchanged = matches!(
             ticket_ref::read(&self.executor.git, &p.checkout, ticket),
@@ -237,6 +244,7 @@ impl OnDemand<'_> {
         if unchanged {
             self.show(ticket, None, VisibleStage::Parked, sink);
         }
+        unchanged
     }
 }
 
