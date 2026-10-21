@@ -60,7 +60,7 @@ impl Bench {
     }
 
     /// What the ticket ref of `id` holds, if it has one.
-    fn record_of(&self, id: &str) -> Option<TicketRecord> {
+    pub(super) fn record_of(&self, id: &str) -> Option<TicketRecord> {
         let env = self.env.clone();
         let git = Git::with_setup("git", move |command| env.apply(command));
         ticket_ref::read(&git, &self.dirs().checkout(), &TicketId::new(id).unwrap())

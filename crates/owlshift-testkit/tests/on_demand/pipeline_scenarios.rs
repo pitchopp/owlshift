@@ -780,14 +780,17 @@ fn slot_waits(events: &[Event]) -> Vec<(String, Value)> {
         .collect()
 }
 
-/// OWL-367's first acceptance: DEMO-2, a drained `trivial` ticket, runs a
-/// Build and Verify loop over three passes, one stage step each, while
-/// DEMO-1's design round waits; DEMO-1's answer counts in the middle of it.
-/// The next pass checks the answer and posts the RESUME, which names DEMO-2
-/// as holding the slot, before DEMO-2's loop ends, and says once that
-/// DEMO-1 waits; DEMO-1's Design runs only at the pass after DEMO-2 frees the
-/// slot, so no two tickets' stage runs interleave. Every pass after a step
-/// comes at once; one with none sleeps the whole interval.
+/// OWL-367's first acceptance, with OWL-401's turn by dispatch time: DEMO-2,
+/// a drained `trivial` ticket, runs a Build and Verify loop, one stage step
+/// a pass, while DEMO-1's design round waits; DEMO-1's answer counts in the
+/// middle of it. The next pass checks the answer and posts the RESUME while
+/// DEMO-2 takes its own step, the turn of that pass, and DEMO-1 is told once
+/// that it waits. DEMO-1, dispatched first, then takes the turn at the next
+/// pass, its Design and Design review running while DEMO-2's last fix waits,
+/// told once: finishing comes before starting. The RESUME names no holder,
+/// since DEMO-1 is the first holder by its dispatch. No two tickets' stage
+/// runs interleave. Every pass after a step comes at once; one with none
+/// sleeps the whole interval.
 #[test]
 fn an_answer_is_checked_while_another_ticket_holds_the_slot() {
     let bench = Bench::draining("maintainer");
@@ -839,14 +842,15 @@ fn an_answer_is_checked_while_another_ticket_holds_the_slot() {
             None,
         )])),
         bench.read(&ruled(&["confirmed"])),
-        // Pass 5: DEMO-2's last fix and its delivery. Pass 6: DEMO-1's
-        // design.
-        answering("Hello.\n"),
+        // Pass 5: DEMO-1's design, its turn by its dispatch. Pass 6: its
+        // design review, to Build.
         bench.read(&designed(PLAN)),
+        bench.read(&reviewed(&[])),
+        bench.read(&reviewed(&[])),
     ];
     let ends = RefCell::new(Vec::new());
     let sleeps = RefCell::new(Vec::new());
-    let (outcomes, lines, printed) = bench.drain_passes(replies, 6, |pass, interval| {
+    let (_, lines, printed) = bench.drain_passes(replies, 6, |pass, interval| {
         ends.borrow_mut().push(bench.events().len());
         sleeps.borrow_mut().push(interval);
         match pass {
@@ -867,27 +871,12 @@ fn an_answer_is_checked_while_another_ticket_holds_the_slot() {
             vec!["intake", "design", "resolver"],
             vec!["build", "verify", "arbiter"],
             vec!["answer_check", "build", "verify", "arbiter"],
-            vec!["build"],
             vec!["design"],
+            vec!["design_review", "design_review"],
         ],
         "{lines}\n{printed}"
     );
-    // DEMO-2's loop ends at pass 5, after DEMO-1's answer check at pass 4;
-    // DEMO-1's Design at pass 6, once DEMO-2 freed the slot.
-    let delivered = outcomes
-        .iter()
-        .position(Result::is_ok)
-        .expect("DEMO-2 delivered");
-    assert!(
-        matches!(
-            outcomes[delivered - 1],
-            Err(Stop::Stepped {
-                stage: Stage::Build,
-                ..
-            })
-        ),
-        "{outcomes:?}"
-    );
+    // DEMO-2 stays at Build, its last fix due, while DEMO-1 holds the turn.
     let briefs = bench.briefs();
     let last_of_demo2 = briefs
         .iter()
@@ -895,29 +884,32 @@ fn an_answer_is_checked_while_another_ticket_holds_the_slot() {
         .unwrap();
     let design_again = briefs.iter().rposition(|b| b.role == Role::Design).unwrap();
     assert!(last_of_demo2 < design_again);
-    // The RESUME says the answer was understood and names the holder.
+    let demo2 = TicketState::try_from(&bench.record_of("DEMO-2").unwrap().state).unwrap();
+    assert_eq!(demo2.status(), Status::Active(Stage::Build));
+    // The RESUME says the answer was understood and names no holder.
     let resume = bench.marked("[owlshift] RESUME");
-    assert!(
-        resume.contains(
-            "DEMO-2 holds the project's one slot: this work starts once DEMO-2 frees it."
-        ),
-        "{resume}"
-    );
-    // Told once, in the answer's pass, with nothing more while it waits.
+    assert!(!resume.contains("holds the project's slot"), "{resume}");
+    // Each told once: DEMO-1 in the answer's pass, DEMO-2 once DEMO-1 took
+    // the turn back.
     assert_eq!(
         slot_waits(&events),
-        [("DEMO-1".to_owned(), json!(["DEMO-2"]))],
+        [
+            ("DEMO-1".to_owned(), json!(["DEMO-2"])),
+            ("DEMO-2".to_owned(), json!(["DEMO-1"]))
+        ],
         "{lines}"
     );
     let passes = by_pass(&events, 0, &ends.borrow());
-    assert_eq!(slot_waits(&passes[3]).len(), 1);
     assert_eq!(
-        lines
-            .matches("DEMO-1 waits: the project's slot is held by DEMO-2")
-            .count(),
-        1,
-        "{lines}"
+        (slot_waits(&passes[3]).len(), slot_waits(&passes[4]).len()),
+        (1, 1)
     );
+    for told in [
+        "DEMO-1 waits: the project's slot is held by DEMO-2",
+        "DEMO-2 waits: the project's slot is held by DEMO-1",
+    ] {
+        assert_eq!(lines.matches(told).count(), 1, "{lines}");
+    }
     // The interval only after passes with no step.
     assert_eq!(
         sleeps.borrow()[..],

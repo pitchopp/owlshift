@@ -3141,7 +3141,7 @@ impl ResumeComment {
             )
         {
             sections.push(format!(
-                "{holder} holds the project's one slot: this work starts once {holder} frees it."
+                "{holder} holds the project's slot first: this work starts once its turn comes."
             ));
         }
         let footer = Footer {
@@ -5659,7 +5659,7 @@ Context.
 
         // Under watch, a round returning to a stage that waits for the slot
         // says so before the footer; Watch needs no slot (OWL-367).
-        let line = "OWL-160 holds the project's one slot: this work starts once OWL-160 frees it.";
+        let line = "OWL-160 holds the project's slot first: this work starts once its turn comes.";
         let waiting = ResumeComment {
             return_to: Stage::Design,
             slot_held_by: Some(TicketId::new("OWL-160").unwrap()),
