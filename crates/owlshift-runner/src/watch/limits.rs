@@ -60,9 +60,19 @@ impl Watch<'_> {
         out: &mut dyn Write,
         role: Option<Role>,
     ) -> bool {
-        let Some(role) = role else {
-            return false;
-        };
+        self.usage_wait(memory, sink, out, role).is_some()
+    }
+
+    /// [`Watch::usage_waits`], giving back the harness the role runs on by
+    /// itself and, in milliseconds, until when the step waits at least.
+    pub(super) fn usage_wait(
+        &self,
+        memory: &mut Memory,
+        sink: &mut EventSink<'_>,
+        out: &mut dyn Write,
+        role: Option<Role>,
+    ) -> Option<(Harness, i64)> {
+        let role = role?;
         let now = (self.on_demand.clock)();
         let own = own_harness(role);
         let standing = self.usage_standing(sink, own, now);
@@ -79,7 +89,10 @@ impl Watch<'_> {
                 .standing(harness, machine_usage::ms(now))
                 .unwrap_or(Standing::Free)
         });
-        matches!(effective, Effective::Wait { .. })
+        match effective {
+            Effective::Wait { until_ms } => Some((own, until_ms)),
+            Effective::Run(_) => None,
+        }
     }
 
     /// Reads, at a pass's start, the standing of each harness a role runs on

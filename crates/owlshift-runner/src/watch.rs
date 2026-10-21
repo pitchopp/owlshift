@@ -133,7 +133,7 @@ use owlshift_core::collision::{Collision, Dispatched, collision};
 use owlshift_core::follow::{Action, Decision};
 use owlshift_core::schedule::{self, Turn};
 use owlshift_core::state::{Status, TicketState};
-use owlshift_core::usage::Standing;
+use owlshift_core::usage::{Standing, own_harness};
 use owlshift_core::vocab::{Harness, Stage};
 
 use crate::answer_check::{self, Readiness};
@@ -149,12 +149,15 @@ use crate::reversal::{self, Current};
 use crate::step::{self, Children};
 use crate::ticket_ref::{self, Progress, ProposalsFile, RefAt, RefRead, Stored, TicketRecord};
 use crate::ticket_run;
+use crate::usage as machine_usage;
+use crate::why;
 use crate::writer::VisibleStage;
 
 mod drain;
 mod limits;
 mod outside;
 mod running;
+mod waiting;
 
 use running::{RunningStep, Then};
 
@@ -515,6 +518,9 @@ struct Memory<'c> {
     stepped: bool,
     /// Each harness's usage standing as last told (OWL-404).
     usage: HashMap<Harness, Standing>,
+    /// The WAITING comments shown on the tickets whose next stage step
+    /// waits (OWL-419).
+    wait_comments: waiting::WaitComments,
 }
 
 /// Why a ticket's next stage step waits, as told once.
@@ -526,6 +532,9 @@ enum StepWait {
     Collision(Collision<String>),
     /// The work in flight outside Owlshift could not be read (OWL-410).
     Unread,
+    /// The harness its first run would use is at its usage limit (OWL-404),
+    /// told on the ticket (OWL-419).
+    Usage(Harness),
 }
 
 /// What watch knows of one marker: what its [`Record`] says, joined with
@@ -822,6 +831,11 @@ impl Watch<'_> {
         memory
             .waits
             .retain(|ticket, _| holding.contains(ticket) || followed.contains(ticket));
+        // A ticket that left the tickets in flight no longer waits: its
+        // WAITING comment is folded (OWL-419). One unread or whose step runs
+        // keeps it until it reads or its step ends.
+        let kept = [&holding[..], &followed[..], &unread[..], &busy[..]].concat();
+        memory.wait_comments.retain(&mut self.board(sink), &kept);
         self.note(
             memory,
             out,
@@ -2016,16 +2030,27 @@ impl Watch<'_> {
                 Some(Turn::Unknown(unread)) => {
                     return self.wait_for_slot(memory, sink, out, ticket, unread);
                 }
-                _ => {
-                    memory.waits.remove(ticket);
-                }
+                // A usage limit's wait ends below, once its harness is free.
+                _ if matches!(memory.waits.get(ticket), Some(StepWait::Usage(_))) => {}
+                _ => self.wait_ended(memory, sink, ticket),
             }
         }
         let seen = Seen::at(at, None);
-        if memory.holds.admit(ticket, &seen, now) != Admit::Go
-            || self.usage_waits(memory, sink, out, limits::resume_role(stage, stored))
-        {
+        if memory.holds.admit(ticket, &seen, now) != Admit::Go {
             return;
+        }
+        match self.usage_wait(memory, sink, out, limits::resume_role(stage, stored)) {
+            // Told on the ticket while it shows working (OWL-419).
+            Some((harness, until_ms)) => {
+                if shown == VisibleStage::Working {
+                    self.wait_for_usage(memory, sink, ticket, harness, until_ms);
+                }
+                return;
+            }
+            None if matches!(memory.waits.get(ticket), Some(StepWait::Usage(_))) => {
+                self.wait_ended(memory, sink, ticket);
+            }
+            None => {}
         }
         let found = match on_demand.tracker.stage(ticket) {
             Ok(found) => found,
@@ -2095,8 +2120,22 @@ impl Watch<'_> {
             progress.as_ref(),
             holds_now,
         ) {
-            // The usage limit's own line says it (OWL-404).
-            Some(Admit::Held { .. }) if usage_held(end, now) => {}
+            // The usage limit's own line says it (OWL-404), and the ticket,
+            // which shows working, a WAITING comment (OWL-419).
+            Some(Admit::Held { .. }) if usage_held(end, now) => {
+                if let (
+                    StepEnd::UsageLimit {
+                        resets_at: Some(until),
+                    },
+                    Some(stored),
+                ) = (end, after.as_ref().filter(|stored| holds(stored)))
+                {
+                    let role = limits::resume_role(stage, stored);
+                    let harness = own_harness(role.unwrap_or(Role::Build));
+                    let until_ms = machine_usage::ms(*until);
+                    self.wait_for_usage(memory, sink, ticket, harness, until_ms);
+                }
+            }
             Some(Admit::Held {
                 until: Until::At(until),
             }) => self.line(out, &held_text(ticket, stage, until)),
@@ -2155,7 +2194,7 @@ impl Watch<'_> {
         match memory.turn.clone().unwrap_or(Turn::Holders(Vec::new())) {
             Turn::Holders(holders) if holders.contains(ticket) => {
                 if holds_now {
-                    memory.waits.remove(ticket);
+                    self.wait_ended(memory, sink, ticket);
                 } else if moved {
                     memory.stepped = true;
                 }
@@ -2164,7 +2203,7 @@ impl Watch<'_> {
                 if holders.len() < self.capacity() as usize {
                     holders.push(ticket.clone());
                     memory.turn = Some(Turn::Holders(holders));
-                    memory.waits.remove(ticket);
+                    self.wait_ended(memory, sink, ticket);
                 } else {
                     self.wait_for_slot(memory, sink, out, ticket, holders);
                 }
@@ -2197,16 +2236,13 @@ impl Watch<'_> {
             unreachable!("made a slot's wait above")
         };
         let names: Vec<&str> = holders.iter().map(TicketId::as_str).collect();
-        sink.emit(
-            ticket,
-            None,
-            EventKind::Decision,
-            data([
-                ("watch", json!("waits")),
-                ("reason", json!("slot")),
-                ("tickets", json!(names)),
-            ]),
-        );
+        let event = data([
+            ("watch", json!("waits")),
+            ("reason", json!("slot")),
+            ("tickets", json!(names)),
+        ]);
+        sink.emit(ticket, None, EventKind::Decision, event.clone());
+        self.show_wait(memory, sink, ticket, "slot", event);
         self.line(
             out,
             &format!(
@@ -2247,7 +2283,8 @@ impl Watch<'_> {
         for (key, value) in holder.data() {
             event.insert(key.to_owned(), value);
         }
-        sink.emit(ticket, None, EventKind::Decision, event);
+        sink.emit(ticket, None, EventKind::Decision, event.clone());
+        self.show_wait(memory, sink, ticket, "collision", event);
         self.line(
             out,
             &format!(
@@ -2257,6 +2294,72 @@ impl Watch<'_> {
             ),
         );
         memory.waits.insert(ticket.clone(), told);
+    }
+
+    /// Tells `ticket`, whose next stage step waits for `harness`'s usage
+    /// limit until `until_ms` at least, on the tracker (OWL-419): one
+    /// WAITING comment per harness, the `decision` event being the
+    /// project's ([`Watch::usage_waits`]).
+    fn wait_for_usage(
+        &self,
+        memory: &mut Memory,
+        sink: &mut EventSink<'_>,
+        ticket: &TicketId,
+        harness: Harness,
+        until_ms: i64,
+    ) {
+        let told = StepWait::Usage(harness);
+        if memory.waits.get(ticket) == Some(&told) {
+            return;
+        }
+        let event = data([
+            ("harness", json!(machine_usage::shown(harness))),
+            ("until", json!(machine_usage::at(until_ms).to_string())),
+        ]);
+        self.show_wait(memory, sink, ticket, "usage_limit", event);
+        memory.waits.insert(ticket.clone(), told);
+    }
+
+    /// Shows on the tracker that `ticket` waits for `reason`, as `event`
+    /// says it, in `owlshift why`'s words (OWL-419): one WAITING comment,
+    /// unless the one shown says the same.
+    fn show_wait(
+        &self,
+        memory: &mut Memory,
+        sink: &mut EventSink<'_>,
+        ticket: &TicketId,
+        reason: &str,
+        event: Data,
+    ) {
+        // A harness's limit is one reason whatever its reset time, so a
+        // probe's next deadline posts nothing.
+        let usage = (reason == "usage_limit").then(|| format!("{reason}: {}", event["harness"]));
+        let phrase = why::phrase(&why::Waiting {
+            at: (self.on_demand.clock)(),
+            ticket: ticket.clone(),
+            reason: reason.to_owned(),
+            data: event,
+        });
+        let key = usage.unwrap_or_else(|| format!("{reason}: {phrase}"));
+        memory
+            .wait_comments
+            .show(&mut self.board(sink), ticket, &key, phrase);
+    }
+
+    /// The wait of `ticket`'s next stage step ended (OWL-403, OWL-419):
+    /// forgotten, and its WAITING comment folded.
+    fn wait_ended(&self, memory: &mut Memory, sink: &mut EventSink<'_>, ticket: &TicketId) {
+        memory.waits.remove(ticket);
+        memory.wait_comments.clear(&mut self.board(sink), ticket);
+    }
+
+    /// Where a WAITING comment is told.
+    fn board<'b, 's>(&'b self, sink: &'b mut EventSink<'s>) -> waiting::Board<'b, 's> {
+        waiting::Board {
+            tracker: self.on_demand.tracker,
+            dirs: self.on_demand.dirs,
+            sink,
+        }
     }
 
     /// The tickets whose next stage step a collision holds back (OWL-403):

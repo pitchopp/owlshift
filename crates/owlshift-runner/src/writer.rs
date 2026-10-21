@@ -3639,6 +3639,40 @@ impl VisibleStage {
     }
 }
 
+/// The WAITING comment of a ticket in flight whose next stage step watch
+/// holds back (OWL-419, architecture section 5, "Told on the ticket"): the
+/// reason in plain words, as `owlshift why` phrases it, and that the ticket
+/// goes on by itself. No mention: nothing is asked of anyone.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WaitComment {
+    pub ticket: TicketId,
+    /// Why it waits, [`crate::why::phrase`]'s words.
+    pub phrase: String,
+}
+
+impl WaitComment {
+    pub fn render(&self) -> String {
+        let header = Header {
+            kind: MarkerKind::Waiting,
+            round: None,
+        };
+        let footer = Footer {
+            format: Format,
+            kind: MarkerKind::Waiting,
+            ticket: self.ticket.clone(),
+            round: None,
+            run: None,
+        };
+        format!(
+            "{}\n\nThis ticket waits: {}. Nothing is needed from you: it goes on by itself once \
+             this wait ends.\n\n{}\n",
+            header.render(),
+            self.phrase,
+            footer.render()
+        )
+    }
+}
+
 /// Writes to the tracker, and later to the forge, after asking the floor.
 pub struct Writer<'a> {
     tracker: &'a dyn Tracker,
@@ -4085,6 +4119,30 @@ impl<'a> Writer<'a> {
         comment: &crate::quarantine::QuarantineWait,
     ) -> Result<Comment, WriteError> {
         self.post(&comment.ticket, &comment.render())
+    }
+
+    /// Posts the WAITING comment of a ticket in flight that watch holds back
+    /// and returns it as the tracker recorded it (OWL-419).
+    pub fn post_wait(&self, comment: &WaitComment) -> Result<Comment, WriteError> {
+        self.post(&comment.ticket, &comment.render())
+    }
+
+    /// Resolves `comment`, a WAITING comment whose wait ended or changed, so
+    /// the tracker shows it folded (OWL-419): `Ok(false)` from a tracker
+    /// without [`Capability::FoldComments`], which is asked nothing.
+    pub fn resolve_wait(&self, comment: &str) -> Result<bool, WriteError> {
+        if !self
+            .tracker
+            .capabilities()
+            .contains(&Capability::FoldComments)
+        {
+            return Ok(false);
+        }
+        floor::check_action(Action::Comment, HumanApproval::Absent).map_err(WriteError::Floor)?;
+        self.tracker
+            .resolve_comment(comment)
+            .map_err(WriteError::Tracker)?;
+        Ok(true)
     }
 
     /// Moves the ticket's visible stage to the state `states` maps `stage`
