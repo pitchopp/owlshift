@@ -461,16 +461,26 @@ fn reply_for(dir: &Path, role: &str, ticket: Option<&str>, result: &str) {
 /// that plays the fake harness with the reply [`reply_for`] wrote in `dir`
 /// for its run's role and ticket, read from its brief. A Build run first
 /// marks itself under way in `dir/running` and arrived in `dir/arrived/
-/// <group>`, waits, up to 30 seconds, until `builds` Build runs of its
-/// group have arrived, then writes how many runs of every group are under
-/// way to `dir/counts` and lasts two seconds more; `typed` is a
-/// command the first Build of DEMO-1 runs once while the others wait for
-/// it, its output in `dir/typed/out`.
+/// <group>`, and waits until `builds` Build runs of its group have arrived;
+/// then it writes how many runs of every group are under way to
+/// `dir/counts`, marks itself counted in `dir/counted/<group>`, and waits
+/// until `builds` of its group have counted, so no Build leaves before
+/// every count of its group is taken (OWL-422). A Build that waits for no
+/// other lasts two seconds more, so the runs of several projects overlap.
+/// No wait has a deadline: a test whose Builds wait for each other writes
+/// `dir/release` when it runs out of passes, so a Build still waiting goes
+/// on, and a harness whose `dir` is gone, or that looked 6000 times, exits
+/// with a failure. `typed` is a command the first Build of DEMO-1 runs
+/// once between its two waits, its output in `dir/typed/out`.
 #[cfg(unix)]
 fn playing_harness(dir: &Path, group: &str, builds: usize, typed: Option<&str>) -> PathBuf {
     use std::os::unix::fs::PermissionsExt;
 
-    for sub in ["running", &format!("arrived/{group}")] {
+    for sub in [
+        "running".to_owned(),
+        format!("arrived/{group}"),
+        format!("counted/{group}"),
+    ] {
         fs::create_dir_all(dir.join(sub)).unwrap();
     }
     let typed = typed.map_or_else(String::new, |command| {
@@ -479,6 +489,7 @@ fn playing_harness(dir: &Path, group: &str, builds: usize, typed: Option<&str>) 
              {command} > \"$dir/typed/out\" 2>&1\n  fi\n"
         )
     });
+    let stay = if builds > 1 { "" } else { "  sleep 2\n" };
     let script = dir.join(format!("harness-{group}.sh"));
     fs::write(
         &script,
@@ -490,11 +501,16 @@ fn playing_harness(dir: &Path, group: &str, builds: usize, typed: Option<&str>) 
              ticket=$(sed -n 's/^    \"id\": \"\\([A-Z0-9-]*\\)\",$/\\1/p' \"$brief\" | head -n 1)\n\
              if [ -f \"$dir/reply-$role-$ticket.toml\" ]; then reply=\"$dir/reply-$role-$ticket.toml\"\n\
              elif [ -f \"$dir/reply-$role.toml\" ]; then reply=\"$dir/reply-$role.toml\"; fi\n\
+             n=0\ngather() {{\n  \
+             while [ \"$(ls \"$dir/$1/{group}\" 2>/dev/null | wc -l)\" -lt {builds} ] \
+             && [ ! -e \"$dir/release\" ]; do\n    \
+             if [ ! -d \"$dir\" ] || [ $n -ge 6000 ]; then\n      \
+             echo \"gave up waiting in $1\" >&2\n      exit 1\n    fi\n    \
+             sleep 0.1\n    n=$((n+1))\n  done\n}}\n\
              if [ \"$role\" = build ]; then\n  mkdir \"$dir/running/$$\"\n  \
-             touch \"$dir/arrived/{group}/$ticket\"\n  n=0\n  \
-             while [ \"$(ls \"$dir/arrived/{group}\" | wc -l)\" -lt {builds} ] && [ $n -lt 300 ]; do\n    \
-             sleep 0.1\n    n=$((n+1))\n  done\n{typed}  \
-             ls \"$dir/running\" | wc -l | tr -d ' ' >> \"$dir/counts\"\n  sleep 2\n  \
+             touch \"$dir/arrived/{group}/$ticket\"\n  gather arrived\n{typed}  \
+             ls \"$dir/running\" | wc -l | tr -d ' ' >> \"$dir/counts\"\n  \
+             touch \"$dir/counted/{group}/$ticket\"\n  gather counted\n{stay}  \
              rmdir \"$dir/running/$$\"\nfi\n\
              exec '{FAKE}' --brief \"$brief\" --reply \"$reply\"\n",
             dir = dir.display(),
@@ -563,10 +579,12 @@ fn asks(project: &ChildProject, id: &str) -> bool {
 /// slots, DEMO-1, DEMO-2 and DEMO-3 declare the zones `a`, `b` and `c` at
 /// intake, one at a time, while DEMO-9 holds them; once it is done, one
 /// pass dispatches the three, and their Builds run at once, each holding
-/// until all three are under way. Meanwhile a person types `owlshift do
-/// DEMO-4`, a ticket with no intake, which would hold the whole repository:
-/// it is refused, DEMO-1 holding `a`. Each Build asks its decider, and the
-/// three wait; no quarantine, no obligation and no outcome record is left.
+/// until all three are under way and none leaving until the three have
+/// counted, however long each takes (OWL-422). Meanwhile a person types
+/// `owlshift do DEMO-4`, a ticket with no intake, which would hold the
+/// whole repository, from within DEMO-1's Build: it is refused, DEMO-1
+/// holding `a`. Each Build asks its decider, and the three wait; no
+/// quarantine, no obligation and no outcome record is left.
 #[cfg(unix)]
 #[test]
 fn three_tickets_build_at_once_and_a_do_typed_meanwhile_waits() {
@@ -594,9 +612,18 @@ fn three_tickets_build_at_once_and_a_do_typed_meanwhile_waits() {
         let all = ["DEMO-1", "DEMO-2", "DEMO-3"]
             .iter()
             .all(|id| asks(&s.project, id));
+        if !all && pass >= 200 {
+            // Out of passes: a Build still waiting goes on, so watch's wait
+            // for its children ends and the test fails below.
+            fs::write(plays.join("release"), "").unwrap();
+        }
         pass < 200 && !all
     });
     let counts = fs::read_to_string(plays.join("counts")).unwrap_or_default();
+    assert!(
+        !plays.join("release").exists(),
+        "out of passes before the three Builds asked, counts {counts:?}\n{lines}"
+    );
     assert_eq!(
         counts.lines().collect::<Vec<_>>(),
         ["3", "3", "3"],
