@@ -675,6 +675,53 @@ impl shared::Tracker for MarkdownTracker {
         })
     }
 
+    /// The ticket's `blocked_by` and `related`, then, from one scan of the
+    /// folder, the tickets whose `blocked_by` names it, which it blocks, and
+    /// those whose `related` names it, related to it too (OWL-416). A
+    /// `blocked_by` or `related` entry the folder lacks has no title and no
+    /// state; one of its own that cannot be read fails the read, as for
+    /// [`relations`](shared::Tracker::relations), while another ticket of
+    /// the scan that cannot be read is left out, since what it says about
+    /// this one is unknown and only informs a role.
+    fn links(&self, id: &TicketId) -> Result<shared::Links, shared::Error> {
+        self.require_ticket_file(id)?;
+        let ticket = MarkdownTracker::ticket(self, id).map_err(other)?;
+        let mut links = shared::Links::default();
+        for (list, ids) in [
+            (&mut links.blocked_by, &ticket.blocked_by),
+            (&mut links.related, &ticket.related),
+        ] {
+            for named in ids {
+                let linked = if self.ticket_file(named).is_file() {
+                    linked(MarkdownTracker::ticket(self, named).map_err(other)?)
+                } else {
+                    shared::Linked {
+                        id: named.clone(),
+                        title: None,
+                        state: None,
+                    }
+                };
+                add_linked(list, linked);
+            }
+        }
+        for scanned in self.ticket_ids().map_err(other)? {
+            if scanned == *id {
+                continue;
+            }
+            let Ok(found) = MarkdownTracker::ticket(self, &scanned) else {
+                continue;
+            };
+            let (blocks, relates) = (found.blocked_by.contains(id), found.related.contains(id));
+            if blocks {
+                add_linked(&mut links.blocks, linked(found.clone()));
+            }
+            if relates {
+                add_linked(&mut links.related, linked(found));
+            }
+        }
+        Ok(links)
+    }
+
     /// Adds `blocker` to `blocked`'s `blocked_by`
     /// ([`MarkdownTracker::add_blocked_by`]).
     fn block(&self, blocker: &TicketId, blocked: &TicketId) -> Result<(), shared::Error> {
@@ -893,6 +940,27 @@ impl MarkdownTracker {
                 format!("{}: no such ticket", path.display()),
             ))
         }
+    }
+}
+
+/// A ticket file as a linked ticket (OWL-416): its title, and its stage,
+/// typed completed at `Done`, as [`MarkdownTracker::state_type`] has it.
+fn linked(ticket: Ticket) -> shared::Linked {
+    let kind = (ticket.stage == MarkdownTracker::DONE).then_some(shared::StateType::Completed);
+    shared::Linked {
+        id: ticket.id,
+        title: Some(ticket.title),
+        state: Some(shared::LinkedState {
+            name: ticket.stage,
+            kind,
+        }),
+    }
+}
+
+/// Adds `linked` to `list` unless it lists that ticket already.
+fn add_linked(list: &mut Vec<shared::Linked>, linked: shared::Linked) {
+    if !list.iter().any(|known| known.id == linked.id) {
+        list.push(linked);
     }
 }
 
@@ -1404,6 +1472,71 @@ mod tests {
             "+++\ntitle = \"t\"\nauthor = \"{author}\"\nstage = \"{stage}\"\n\
              labels = {labels:?}\nblocked_by = {blocked_by:?}\n+++\n"
         )
+    }
+
+    /// Intake's links (OWL-416): `blocked_by` and `related` from the front
+    /// matter, a missing ticket without title or state; the tickets whose
+    /// `blocked_by` names it as `blocks`, whose `related` names it as
+    /// `related`, each once; a ticket of the scan that cannot be read left
+    /// out.
+    #[test]
+    fn links_read_the_front_matter_and_the_other_tickets() {
+        use shared::{Linked, LinkedState, StateType, Tracker as _};
+        let related = |stage: &str, blocked_by: &str, related: &str| {
+            format!(
+                "+++\ntitle = \"t\"\nauthor = \"a\"\nstage = \"{stage}\"\n\
+                 blocked_by = [{blocked_by}]\nrelated = [{related}]\n+++\n"
+            )
+        };
+        let (root, tracker, _) =
+            repository(&related("Todo", "\"DEMO-2\", \"DEMO-9\"", "\"DEMO-3\""));
+        let tickets = root.path().join("tickets");
+        for (id, text) in [
+            ("DEMO-2", ticket_md("a", "Done", &[], &[])),
+            ("DEMO-3", ticket_md("a", "Todo", &[], &[])),
+            ("DEMO-4", ticket_md("a", "Todo", &[], &["DEMO-1"])),
+            ("DEMO-5", related("Doing", "", "\"DEMO-1\", \"DEMO-3\"")),
+            ("DEMO-6", "not a ticket".to_owned()),
+        ] {
+            fs::create_dir_all(tickets.join(id)).unwrap();
+            fs::write(tickets.join(id).join("ticket.md"), text).unwrap();
+        }
+
+        let linked = |id: &str, stage: &str, kind| Linked {
+            id: TicketId::new(id).unwrap(),
+            title: Some("t".to_owned()),
+            state: Some(LinkedState {
+                name: stage.to_owned(),
+                kind,
+            }),
+        };
+        let links = tracker.links(&id()).unwrap();
+        assert_eq!(
+            links.blocked_by,
+            [
+                linked("DEMO-2", "Done", Some(StateType::Completed)),
+                Linked {
+                    id: TicketId::new("DEMO-9").unwrap(),
+                    title: None,
+                    state: None,
+                },
+            ]
+        );
+        assert_eq!(links.blocks, [linked("DEMO-4", "Todo", None)]);
+        assert_eq!(
+            links.related,
+            [
+                linked("DEMO-3", "Todo", None),
+                linked("DEMO-5", "Doing", None)
+            ]
+        );
+        assert_eq!(
+            tracker
+                .links(&TicketId::new("DEMO-7").unwrap())
+                .unwrap_err()
+                .kind,
+            ErrorKind::NotFound
+        );
     }
 
     /// The ready column (OWL-246): the stage, the label for a label gesture,

@@ -80,12 +80,20 @@ pub enum GestureKind {
     State,
 }
 
+/// The quote of a dependency the runner adds to an intake record because a
+/// `blocks` relation on the tracker already held the ticket (OWL-416,
+/// architecture section 5, "Dependencies to relations"): not words of the
+/// ticket, which may name the prerequisite in words only or not at all.
+pub const RELATION_QUOTE: &str = "a blocks relation on the tracker";
+
 /// A dependency intake found, with what became of it.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct KeptDependency {
     pub ticket: TicketId,
-    /// The words of the ticket that name it.
+    /// The words of the ticket that name it; for a ticket that already
+    /// blocked it on the tracker, which the runner adds without the text
+    /// naming it (OWL-416), [`RELATION_QUOTE`].
     #[schemars(regex(pattern = r"\S"))]
     pub quote: String,
     pub outcome: DependencyOutcome,

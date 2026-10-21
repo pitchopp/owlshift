@@ -7,8 +7,8 @@ use std::path::PathBuf;
 
 use owlshift_contracts::ContractError;
 use owlshift_contracts::brief::{
-    Brief, DecidedQuestion, MAX_CHOICE_BYTES, MAX_EXCERPT_BYTES, MAX_REFUSED_CHOICES,
-    MAX_REPLY_BYTES, MAX_RESULT_REFUSAL_BYTES, ThreadEntry,
+    Brief, DecidedQuestion, MAX_CHOICE_BYTES, MAX_EXCERPT_BYTES, MAX_REFUSED_CHOICES, MAX_RELATED,
+    MAX_RELATED_TEXT_BYTES, MAX_REPLY_BYTES, MAX_RESULT_REFUSAL_BYTES, StateKind, ThreadEntry,
 };
 use owlshift_contracts::comment::{Footer, Header, MarkedComment, MarkerKind};
 use owlshift_contracts::config::{Admit, PersonalConfig, ProjectConfig, peek_requires};
@@ -1576,7 +1576,7 @@ fn brief_rejections() {
     );
     rejects(
         "newer format",
-        parse(|v| v["format"] = json!(26)),
+        parse(|v| v["format"] = json!(27)),
         "upgrade Owlshift",
     );
     rejects(
@@ -1907,6 +1907,76 @@ fn brief_rejections() {
         let result = Brief::parse(&input).unwrap_or_else(|e| panic!("{path}: {e}"));
         assert_eq!(result.result_path.as_str(), path);
     }
+}
+
+/// The ticket's relations (brief format 26, OWL-416): in intake's brief
+/// only, each list at most a page, each ticket once, each title and state
+/// name short and on one line.
+#[test]
+fn relations_go_to_intake_alone_within_their_bounds() {
+    let related = |id: &str| json!({ "id": id, "title": "Add the API", "state": { "name": "Done", "type": "completed" } });
+    let parse = |role: &str, edit: &dyn Fn(&mut Value)| {
+        Brief::parse(&edited("brief.json", |v| {
+            v.as_object_mut().unwrap().remove("result_refusal");
+            v["role"] = json!(role);
+            v["relations"] = json!({ "blocked_by": [related("OWL-2"), { "id": "OWL-9" }],
+                "blocks": [related("OWL-3")], "related": [related("OWL-4")] });
+            edit(v);
+        }))
+    };
+    let intake = parse("intake", &|_| {}).unwrap();
+    assert_eq!(intake.relations.blocked_by.len(), 2);
+    assert_eq!(intake.relations.blocked_by[1].title, None);
+    assert_eq!(
+        intake.relations.blocked_by[0].state.as_ref().unwrap().kind,
+        Some(StateKind::Completed)
+    );
+    assert_eq!(Brief::parse(&intake.render()).unwrap(), intake);
+
+    rejects(
+        "relations outside intake",
+        parse("design", &|_| {}),
+        "relations are given but the role is design",
+    );
+    rejects(
+        "a ticket twice",
+        parse("intake", &|v| {
+            let blocks = v["relations"]["blocks"].as_array_mut().unwrap();
+            blocks.push(related("OWL-3"));
+        }),
+        "lists OWL-3 twice",
+    );
+    rejects(
+        "a title on two lines",
+        parse("intake", &|v| {
+            v["relations"]["related"][0]["title"] = json!("a\nb");
+        }),
+        "control character",
+    );
+    rejects(
+        "a long state name",
+        parse("intake", &|v| {
+            v["relations"]["related"][0]["state"]["name"] =
+                json!("s".repeat(MAX_RELATED_TEXT_BYTES + 1));
+        }),
+        "control character",
+    );
+    rejects(
+        "more than a page",
+        parse("intake", &|v| {
+            v["relations"]["related"] = (0..=MAX_RELATED)
+                .map(|n| json!({ "id": format!("OWL-{}", n + 10) }))
+                .collect();
+        }),
+        "more than 50",
+    );
+    rejects(
+        "an unknown state type",
+        parse("intake", &|v| {
+            v["relations"]["blocks"][0]["state"]["type"] = json!("paused");
+        }),
+        "unknown variant `paused`",
+    );
 }
 
 #[test]
