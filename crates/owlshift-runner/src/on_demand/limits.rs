@@ -174,33 +174,44 @@ impl OnDemand<'_> {
                 Ok(Some(admitted))
             }
             Ok(Admission::Wait { until_ms }) => {
-                let until = machine_usage::at(until_ms);
-                sink.emit(
-                    ticket,
-                    None,
-                    EventKind::Decision,
-                    data([
-                        ("usage", json!("waits")),
-                        ("harness", key),
-                        ("role", json!(role.as_str())),
-                        ("until", json!(until)),
-                    ]),
-                );
-                Err(Stop::UsageLimit {
-                    resets_at: Some(until),
-                })
+                Err(self.usage_waits(ticket, kind, role, until_ms, sink))
             }
             Err(reason) => {
                 self.usage_warning(ticket, "usage_unread", kind, &reason, sink);
                 // A pause the personal file's cap opens needs no write to
                 // hold: the provider would not refuse the run for it.
                 match capped_until(&state, machine_usage::ms(now)) {
-                    Some(until_ms) => Err(Stop::UsageLimit {
-                        resets_at: Some(machine_usage::at(until_ms)),
-                    }),
+                    Some(until_ms) => Err(self.usage_waits(ticket, kind, role, until_ms, sink)),
                     None => Ok(Some(admitted)),
                 }
             }
+        }
+    }
+
+    /// The `decision` event `usage` = `waits` for a run of `role` refused
+    /// until `until_ms`, and the stop that ends its step.
+    fn usage_waits(
+        &self,
+        ticket: &TicketId,
+        harness: HarnessKind,
+        role: Role,
+        until_ms: i64,
+        sink: &mut EventSink<'_>,
+    ) -> Stop {
+        let until = machine_usage::at(until_ms);
+        sink.emit(
+            ticket,
+            None,
+            EventKind::Decision,
+            data([
+                ("usage", json!("waits")),
+                ("harness", json!(machine_usage::key(harness))),
+                ("role", json!(role.as_str())),
+                ("until", json!(until)),
+            ]),
+        );
+        Stop::UsageLimit {
+            resets_at: Some(until),
         }
     }
 
