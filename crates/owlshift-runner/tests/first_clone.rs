@@ -229,3 +229,66 @@ fn a_git_older_than_the_floor_is_refused_before_the_checkout_is_touched() {
         "the project's folder was created"
     );
 }
+
+/// The shared checkout's rules while a run is in flight (OWL-400, live
+/// check (f)): with an obligation standing, the fetch writes no tag and no
+/// worktree entry is pruned, since a run's check reads both; once none
+/// stands, both happen again. `remote set-url` runs only when the address
+/// differs, whatever stands.
+#[test]
+fn runs_in_flight_get_no_tag_no_prune_and_no_needless_set_url() {
+    use std::sync::{Arc, Mutex};
+
+    let bench = bench();
+    let calls: Arc<Mutex<Vec<String>>> = Arc::default();
+    let git = {
+        let (calls, config) = (calls.clone(), bench.config.clone());
+        let transport = format!("exec git upload-pack {} #", quoted(&bench.remote));
+        Git::with_setup("git", move |command| {
+            hermetic(command, &config);
+            command
+                .env("GIT_SSH_VARIANT", "simple")
+                .env("GIT_SSH_COMMAND", &transport);
+            let args: Vec<String> = command
+                .get_args()
+                .map(|arg| arg.to_string_lossy().into_owned())
+                .collect();
+            calls.lock().unwrap().push(args.join(" "));
+        })
+    };
+    let ran = |what: &str| calls.lock().unwrap().iter().any(|call| call.contains(what));
+    sync_checkout_within(&git, &bench.dirs, REMOTE_URL, secs(60)).unwrap();
+    let checkout = bench.dirs.checkout();
+    // A worktree whose folder is gone, whose entry `worktree prune` would
+    // remove; and a tag on the remote, which a fetch following tags writes.
+    let entry = checkout.join(".git/worktrees/gone");
+    bench.run_git(&checkout, &["worktree", "add", "--quiet", "--detach", "../gone"]);
+    fs::remove_dir_all(bench.dirs.root().join("gone")).unwrap();
+    bench.run_git(&bench.remote, &["tag", "v1"]);
+    let tag = checkout.join(".git/refs/tags/v1");
+
+    fs::create_dir_all(bench.dirs.obligations_dir()).unwrap();
+    fs::write(bench.dirs.obligations_dir().join("owl-1-r1"), "{}").unwrap();
+    calls.lock().unwrap().clear();
+    sync_checkout_within(&git, &bench.dirs, REMOTE_URL, secs(60)).unwrap();
+    assert!(ran("fetch --quiet --no-tags --prune origin"), "{calls:?}");
+    assert!(!ran("set-url"), "{calls:?}");
+    assert!(!ran("worktree prune"), "{calls:?}");
+    assert!(!tag.exists(), "a tag was fetched while a run is in flight");
+    assert!(entry.exists(), "an entry was pruned while a run is in flight");
+
+    fs::remove_file(bench.dirs.obligations_dir().join("owl-1-r1")).unwrap();
+    calls.lock().unwrap().clear();
+    sync_checkout_within(&git, &bench.dirs, REMOTE_URL, secs(60)).unwrap();
+    assert!(!ran("--no-tags"), "{calls:?}");
+    assert!(ran("worktree prune"), "{calls:?}");
+    assert!(tag.exists(), "no tag once no run is in flight");
+    assert!(!entry.exists());
+
+    calls.lock().unwrap().clear();
+    sync_checkout_within(&git, &bench.dirs, "ssh://example.invalid/moved", secs(60)).unwrap();
+    assert!(
+        ran("remote set-url origin ssh://example.invalid/moved"),
+        "{calls:?}"
+    );
+}
