@@ -20,7 +20,10 @@ impl Bench {
 
     /// The commit `rev` names in the dedicated checkout.
     fn rev(&self, rev: &str) -> String {
-        let out = self.env.run(&self.dirs().checkout(), &["rev-parse", rev]).unwrap();
+        let out = self
+            .env
+            .run(&self.dirs().checkout(), &["rev-parse", rev])
+            .unwrap();
         String::from_utf8(out).unwrap().trim().to_owned()
     }
 }
@@ -35,7 +38,10 @@ impl Bench {
 fn a_run_cut_off_quarantines_the_project_until_a_clear_for_good() {
     let bench = Bench::new(true);
     let (outcome, printed) = bench.run(vec![bench.reply(Some("Hi"), Some(BLOCKED))], None);
-    assert!(matches!(outcome, Err(Stop::Parked { .. })), "{outcome:?}\n{printed}");
+    assert!(
+        matches!(outcome, Err(Stop::Parked { .. })),
+        "{outcome:?}\n{printed}"
+    );
     let dirs = bench.dirs();
     assert!(!dirs.obligations_stand(), "a passed check removes its own");
 
@@ -92,12 +98,18 @@ fn a_run_cut_off_quarantines_the_project_until_a_clear_for_good() {
 fn a_ticket_changed_outside_its_runs_is_caught_at_its_next_start() {
     let bench = Bench::new(true);
     let (outcome, printed) = bench.run(vec![bench.reply(Some("Hi"), Some(BLOCKED))], None);
-    assert!(matches!(outcome, Err(Stop::Parked { .. })), "{outcome:?}\n{printed}");
+    assert!(
+        matches!(outcome, Err(Stop::Parked { .. })),
+        "{outcome:?}\n{printed}"
+    );
     let checkout = bench.dirs().checkout();
     let base = bench.rev("refs/remotes/origin/main");
     bench
         .env
-        .run(&checkout, &["update-ref", "refs/heads/owlshift/demo-1", &base])
+        .run(
+            &checkout,
+            &["update-ref", "refs/heads/owlshift/demo-1", &base],
+        )
         .unwrap();
     let runs = bench.briefs().len();
     let (refused, printed) = bench.run(Vec::new(), None);
@@ -121,7 +133,10 @@ fn a_ticket_changed_outside_its_runs_is_caught_at_its_next_start() {
 fn a_write_cut_between_the_ref_and_the_run_file_is_finished_by_the_next_command() {
     let bench = Bench::new(true);
     let (outcome, printed) = bench.run(vec![bench.reply(Some("Hi"), Some(BLOCKED))], None);
-    assert!(matches!(outcome, Err(Stop::Parked { .. })), "{outcome:?}\n{printed}");
+    assert!(
+        matches!(outcome, Err(Stop::Parked { .. })),
+        "{outcome:?}\n{printed}"
+    );
     let env = bench.env.clone();
     let git = Git::with_setup("git", move |command| env.apply(command));
     let checkout = bench.dirs().checkout();
@@ -171,8 +186,10 @@ fn a_standing_quarantine_stops_a_step_at_its_next_run_and_before_its_push() {
     // A failed run gets one more: that one never starts (one reply only).
     let bench = Bench::new(true);
     let failed = r#"{"format":14,"status":"failed","summary":"Lost."}"#;
-    let (outcome, printed) =
-        bench.run(vec![bench.reply(None, Some(failed))], Some(quarantine(&bench)));
+    let (outcome, printed) = bench.run(
+        vec![bench.reply(None, Some(failed))],
+        Some(quarantine(&bench)),
+    );
     stopped(&outcome, &printed);
     assert_eq!(bench.briefs().len(), 1);
     assert_ne!(bench.record().state.waiting, Some(Waiting::Parked));
@@ -186,7 +203,10 @@ fn a_standing_quarantine_stops_a_step_at_its_next_run_and_before_its_push() {
     stopped(&outcome, &printed);
     assert_eq!(bench.remote_branch(), None, "nothing pushed");
     assert!(
-        bench.comments().iter().all(|c| !c.starts_with("[owlshift] DELIVERY")),
+        bench
+            .comments()
+            .iter()
+            .all(|c| !c.starts_with("[owlshift] DELIVERY")),
         "{:?}",
         bench.comments()
     );

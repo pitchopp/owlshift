@@ -17,7 +17,13 @@ struct Bench {
 impl Bench {
     fn new() -> Self {
         let tmp = tempfile::tempdir().unwrap();
-        let root = fs::canonicalize(tmp.path()).unwrap();
+        // Resolved on Unix, where the temporary folder can be a link; as it
+        // is on Windows, where a resolved path takes a prefix git refuses.
+        let root = if cfg!(unix) {
+            fs::canonicalize(tmp.path()).unwrap()
+        } else {
+            tmp.path().to_owned()
+        };
         fs::write(
             root.join("gitconfig"),
             "[user]\n\tname = Bench\n\temail = bench@example.invalid\n\

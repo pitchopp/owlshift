@@ -253,7 +253,7 @@ pub fn read(git: &Git, checkout: &Path, ticket: &TicketId) -> Result<Option<Stor
 /// it, through a symbolic ref: what the run file protocol compares (OWL-400,
 /// [`crate::ticket_run`]); `None` when there is no ref. A symbolic ticket
 /// ref is refused by [`read`], and every move replaces it rather than its
-/// target ([`move_ref`]).
+/// target.
 pub fn pointed(git: &Git, checkout: &Path, ticket: &TicketId) -> Result<Option<String>, String> {
     Ok(listed(git, checkout, &ticket_ref(ticket))?.map(|listed| listed.oid))
 }

@@ -1765,12 +1765,19 @@ mod among {
         }
 
         fn at(&self, rev: &str) -> String {
-            let out = self.bench.env.run(&self.bench.main, &["rev-parse", rev]).unwrap();
+            let out = self
+                .bench
+                .env
+                .run(&self.bench.main, &["rev-parse", rev])
+                .unwrap();
             String::from_utf8(out).unwrap().trim().to_owned()
         }
 
         fn lock(&self, ticket: &TicketId) -> TicketLock {
-            self.dirs.ticket_lock(ticket).unwrap().expect("the ticket's lock")
+            self.dirs
+                .ticket_lock(ticket)
+                .unwrap()
+                .expect("the ticket's lock")
         }
 
         /// The start of a step: the run file checked, or made.
@@ -1853,7 +1860,10 @@ mod among {
         fn commit_in(&self, worktree: &Path, message: &str) {
             self.bench
                 .env
-                .run(worktree, &["commit", "--quiet", "--allow-empty", "-m", message])
+                .run(
+                    worktree,
+                    &["commit", "--quiet", "--allow-empty", "-m", message],
+                )
                 .unwrap();
         }
     }

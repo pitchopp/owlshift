@@ -326,10 +326,30 @@ fn save(dirs: &ProjectDirs, run: &mut TicketRun) -> io::Result<()> {
     file.write_all(run.render().as_bytes())?;
     file.sync_all()?;
     drop(file);
-    fs::rename(&partial, &path)?;
+    rename_over(&partial, &path)?;
     #[cfg(unix)]
     File::open(&folder)?.sync_all()?;
     Ok(())
+}
+
+/// Renames `from` over `to`. On Windows a rename over a file another
+/// process or thread has open for a moment, a sibling's check reading it, is
+/// refused: it is tried again for up to half a second.
+fn rename_over(from: &Path, to: &Path) -> io::Result<()> {
+    let mut tries = 0;
+    loop {
+        match fs::rename(from, to) {
+            Err(error)
+                if cfg!(windows)
+                    && error.kind() == io::ErrorKind::PermissionDenied
+                    && tries < 50 =>
+            {
+                tries += 1;
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            done => return done,
+        }
+    }
 }
 
 /// What a ticket's branch and ref hold in the dedicated checkout.
