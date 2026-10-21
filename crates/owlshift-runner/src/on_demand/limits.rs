@@ -45,6 +45,58 @@ impl Drop for Admitted<'_> {
 }
 
 impl OnDemand<'_> {
+    /// `harness`'s standing at the clock's time, free when its state cannot
+    /// be read (`admit_usage` warns of that).
+    pub fn usage_standing(&self, harness: HarnessKind) -> Standing {
+        let now = machine_usage::ms((self.clock)());
+        self.usage
+            .read(harness)
+            .map_or(Standing::Free, |state| usage::standing(&state, now))
+    }
+
+    /// When `harness`'s limit ends, `None` when it is not limited.
+    pub(super) fn limited_until(&self, harness: HarnessKind) -> Option<Timestamp> {
+        match self.usage_standing(harness) {
+            Standing::Limited { until_ms } => Some(machine_usage::at(until_ms)),
+            Standing::Free | Standing::ProbeDue => None,
+        }
+    }
+
+    /// The harness a review role (Design review, Verify) falls back to while
+    /// Claude Code is at its usage limit (OWL-406, architecture section 5,
+    /// "The effective harness"): the one the personal file names, when it is
+    /// installed, logged in for agent runs and able to run in the sandbox
+    /// here (the opt-in Codex reviewer's own check, OWL-348) and not itself
+    /// limited. `None` for any other role, when none is named, when Claude
+    /// Code is not limited, or when the fallback cannot serve: the review
+    /// then waits for Claude Code's reset.
+    pub fn review_fallback(&self, role: Role) -> Option<&CodexReviewer<'_>> {
+        let fallback = self.review_fallback.as_ref()?;
+        let own = usage::own_harness(role);
+        // Asked of the machine only once there is a limit to fall back from.
+        if !usage::is_review_role(role)
+            || !matches!(self.usage_standing(own), Standing::Limited { .. })
+        {
+            return None;
+        }
+        let routing = RunRouting {
+            harness: HarnessKind::Codex,
+            ..PROJECT_DEFAULT
+        };
+        let usable = (fallback.ready)().is_ok()
+            && fallback
+                .design_review
+                .harness(routing)
+                .sandbox_needs(&self.executor.agent)
+                .is_ok();
+        let offered = usable.then_some(HarnessKind::Codex);
+        matches!(
+            effective_harness(role, own, offered, |harness| self.usage_standing(harness)),
+            Effective::Run(other) if other != own
+        )
+        .then_some(fallback)
+    }
+
     /// Checks the harness of a run of `role` on `harness` for `ticket`
     /// before anything of the run is made: `Ok(None)` for a harness whose
     /// usage nothing tracks; the run's admission when it may start, a run
@@ -91,7 +143,9 @@ impl OnDemand<'_> {
                 usage::standing(&state, machine_usage::ms(now))
             })
         };
-        if let Effective::Run(own) = effective_harness(role, kind, standing_of)
+        // The harness is already the run's: a review that falls back got its
+        // fallback's router before it came here ([`OnDemand::review_fallback`]).
+        if let Effective::Run(own) = effective_harness(role, kind, None, standing_of)
             && standing_of(own) == Standing::Free
         {
             return Ok(Some(admitted));

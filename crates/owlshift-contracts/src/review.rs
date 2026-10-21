@@ -797,6 +797,11 @@ pub struct Reviewer {
     /// configured (OWL-304): the reports say so.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub same_model: bool,
+    /// A reviewer that ran on the harness declared as Claude Code's
+    /// fallback, Claude Code being at its usage limit (OWL-406): the
+    /// reports say so.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub fallback: bool,
 }
 
 /// What a kept reviewer may say: [`Reviewer`]'s keys, and `stand_in`, which
@@ -828,6 +833,11 @@ struct ReviewerForm {
     /// configured (OWL-304): the reports say so.
     #[serde(default)]
     same_model: bool,
+    /// A reviewer that ran on the harness declared as Claude Code's
+    /// fallback, Claude Code being at its usage limit (OWL-406): the
+    /// reports say so.
+    #[serde(default)]
+    fallback: bool,
 }
 
 impl From<ReviewerForm> for Reviewer {
@@ -838,6 +848,7 @@ impl From<ReviewerForm> for Reviewer {
             harness: form.harness,
             model: form.model,
             same_model: form.same_model,
+            fallback: form.fallback,
         }
     }
 }

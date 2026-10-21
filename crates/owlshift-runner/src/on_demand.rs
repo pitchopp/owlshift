@@ -433,6 +433,11 @@ pub struct OnDemand<'a> {
     /// `None` when `pipeline.codex_reviewer` is off, which the command that
     /// builds this reads.
     pub codex: Option<CodexReviewer<'a>>,
+    /// The harness that takes over the review roles while Claude Code is at
+    /// its usage limit (OWL-406): `None` unless the personal file names a
+    /// `[harnesses.claude].fallback`, whose routers and readiness check are
+    /// these. Only Design review's and Verify's reviewers ever run on it.
+    pub review_fallback: Option<CodexReviewer<'a>>,
     /// Runs the arbiter (`roles/arbiter.md`) on its role's routing: the
     /// standard tier, without an effort (OWL-303).
     pub arbiter: &'a dyn Router,

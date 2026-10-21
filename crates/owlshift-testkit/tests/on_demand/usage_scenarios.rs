@@ -400,3 +400,140 @@ fn a_probe_that_never_starts_leaves_no_mark() {
     assert_eq!(file.probe, None);
     assert_eq!(file.episodes.len(), 1, "the outage stands");
 }
+
+/// Claude Code meets its limit during the Build, at 09:10 on the bench's
+/// clock: the Build goes on, the next run finds it limited.
+fn claude_limited_after_the_build(bench: &Bench) -> During {
+    let seen: Timestamp = "2026-10-02T09:10:00Z".parse().unwrap();
+    limit_elsewhere(bench.usage_store(), HarnessKind::Claude, RESET, seen)
+}
+
+/// OWL-406, scenario S17's fallback part: Claude Code at its limit, the
+/// Verify pass runs its reviewers on the declared fallback, which the
+/// review's line in the DELIVERY report and a `routing` event say; the
+/// Build before it, an authoring role, was not moved.
+#[test]
+fn scenario_s17_a_review_runs_on_the_fallback_while_claude_code_is_at_its_limit() {
+    let bench = Bench::verifying();
+    *bench.review_fallback.borrow_mut() = Some(Ok(()));
+    let replies = vec![
+        bench.reply(Some("Hello"), Some(DONE)),
+        bench.reviewing(&found(&[])),
+    ];
+    let (outcome, printed) = bench.invoke(
+        false,
+        replies,
+        None,
+        vec![claude_limited_after_the_build(&bench)],
+    );
+    outcome.unwrap_or_else(|stop| panic!("{stop}\n{printed}"));
+    assert_eq!(bench.roles(), [Role::Build, Role::Verify]);
+    let harnesses: Vec<HarnessKind> = bench.routed().iter().map(|r| r.harness).collect();
+    assert_eq!(harnesses, [HarnessKind::Claude, HarnessKind::Codex]);
+
+    let review = bench.record().review.unwrap();
+    let reviewer = &review.passes[0].reviewers[0];
+    assert_eq!(
+        (reviewer.harness, reviewer.fallback, reviewer.same_model),
+        (HarnessKind::Codex, true, false)
+    );
+    assert!(review.passes[0].dropped.is_none());
+    let routing: Vec<Value> = data_of(&bench.events(), EventKind::Decision, "routing")
+        .into_iter()
+        .filter(|data| data["routing"] == "fallback")
+        .collect();
+    assert_eq!(routing.len(), 1, "{routing:?}");
+    assert_eq!(
+        routing[0],
+        json!({
+            "routing": "fallback", "reason": "usage_limit", "role": "verify",
+            "stage": "verify", "pass": 1, "harness": "codex", "in_place_of": "claude",
+            "until": RESET
+        })
+    );
+    let report = bench.comments().pop().unwrap();
+    let line = "critic and conformance on Codex (its default model, in place of Claude Code, \
+                at its usage limit)";
+    assert!(report.contains(line), "{report}");
+}
+
+/// OWL-406: without a usable fallback the review waits for the reset like
+/// any run, and goes back to Claude Code once the limit is over; a fallback
+/// that is itself limited, or an authoring role, never takes a run.
+#[test]
+fn a_review_without_a_usable_fallback_waits_and_returns_to_claude_code_after_the_reset() {
+    let reset: Timestamp = RESET.parse().unwrap();
+    // None declared.
+    let bench = Bench::verifying();
+    let replies = vec![bench.reply(Some("Hello"), Some(DONE))];
+    let (stopped, printed) = bench.invoke(
+        false,
+        replies,
+        None,
+        vec![claude_limited_after_the_build(&bench)],
+    );
+    assert_eq!(
+        stopped.as_ref().err(),
+        Some(&Stop::UsageLimit {
+            resets_at: Some(reset)
+        }),
+        "{printed}"
+    );
+    assert_eq!(bench.roles(), [Role::Build]);
+
+    // Declared, but Codex cannot serve here, or is limited itself.
+    for (ready, codex_limited) in [
+        (Err("`codex` is not on the PATH".to_owned()), false),
+        (Ok(()), true),
+    ] {
+        let bench = Bench::verifying();
+        *bench.review_fallback.borrow_mut() = Some(ready);
+        let now: Timestamp = "2026-10-02T09:10:00Z".parse().unwrap();
+        if codex_limited {
+            (limit_elsewhere(bench.usage_store(), HarnessKind::Codex, RESET, now).1)();
+        }
+        let replies = vec![bench.reply(Some("Hello"), Some(DONE))];
+        let (stopped, printed) = bench.invoke(
+            false,
+            replies,
+            None,
+            vec![claude_limited_after_the_build(&bench)],
+        );
+        assert_eq!(
+            stopped.as_ref().err(),
+            Some(&Stop::UsageLimit {
+                resets_at: Some(reset)
+            }),
+            "{printed}"
+        );
+        assert_eq!(bench.roles(), [Role::Build]);
+        assert!(
+            bench
+                .record()
+                .review
+                .is_none_or(|review| review.passes.is_empty())
+        );
+
+        // The reset: the review runs on Claude Code again.
+        *bench.review_fallback.borrow_mut() = Some(Ok(()));
+        bench.now_is(reset);
+        let (delivered, printed) = bench.continue_ticket(vec![bench.reviewing(&found(&[]))]);
+        delivered.unwrap_or_else(|stop| panic!("{stop}\n{printed}"));
+        let harnesses: Vec<HarnessKind> = bench.routed().iter().map(|r| r.harness).collect();
+        assert_eq!(harnesses.last(), Some(&HarnessKind::Claude));
+        let review = bench.record().review.unwrap();
+        assert!(!review.passes[0].reviewers[0].fallback);
+    }
+
+    // An authoring role at the limit waits even with a fallback ready.
+    let bench = Bench::new(true);
+    *bench.review_fallback.borrow_mut() = Some(Ok(()));
+    let now: Timestamp = "2026-10-02T09:10:00Z".parse().unwrap();
+    (limit_elsewhere(bench.usage_store(), HarnessKind::Claude, RESET, now).1)();
+    let (stopped, printed) = bench.run(Vec::new(), None);
+    assert!(
+        matches!(&stopped, Err(Stop::UsageLimit { .. })),
+        "{stopped:?}\n{printed}"
+    );
+    assert!(bench.briefs().is_empty());
+}

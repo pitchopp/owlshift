@@ -952,6 +952,10 @@ struct Bench {
     codex: RefCell<Option<Result<(), String>>>,
     /// The Codex seat's harness cannot start ([`Unstartable`], OWL-348).
     codex_unstartable: Cell<bool>,
+    /// The review roles' fallback (OWL-406): `None` when the personal file
+    /// names none; else what its readiness check answers, a roster that
+    /// plays from the bench's reply queue when ready.
+    review_fallback: RefCell<Option<Result<(), String>>>,
     /// Each line the runner's notifier showed (OWL-368).
     notified: Notified,
     /// The machine's usage state (OWL-404): the bench's data directory's,
@@ -1102,6 +1106,7 @@ impl Bench {
             sessions: Cell::new(false),
             codex: RefCell::new(None),
             codex_unstartable: Cell::new(false),
+            review_fallback: RefCell::new(None),
             notified: Notified::default(),
             usage: RefCell::new(tmp_data.join("usage")),
         }
@@ -1514,6 +1519,16 @@ impl Bench {
             verify: codex_router,
             ready: &codex_ready,
         });
+        let fallback_ready = || self.review_fallback.borrow().clone().unwrap_or(Ok(()));
+        let review_fallback = self
+            .review_fallback
+            .borrow()
+            .is_some()
+            .then_some(CodexReviewer {
+                design_review: &harness,
+                verify: &harness,
+                ready: &fallback_ready,
+            });
         // The executor's credential probes run the real gh on `github.com`.
         gh::warm_up(&self.env.agent_parent());
         let env = self.env.clone();
@@ -1562,6 +1577,7 @@ impl Bench {
             design_review: &harness,
             verify,
             codex,
+            review_fallback,
             arbiter: &harness,
             answer_check: &harness,
             resolver: &harness,
@@ -2857,6 +2873,7 @@ fn a_do_whose_agent_cannot_run_is_refused_before_anything() {
         design_review: &router,
         verify: &router,
         codex: None,
+        review_fallback: None,
         arbiter: &router,
         answer_check: &harness,
         resolver: &router,
@@ -2939,6 +2956,7 @@ fn a_git_older_than_the_floor_is_refused_before_the_lock_and_the_tracker() {
         design_review: &router,
         verify: &router,
         codex: None,
+        review_fallback: None,
         arbiter: &router,
         answer_check: &harness,
         resolver: &router,

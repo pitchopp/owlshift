@@ -1657,23 +1657,61 @@ impl OnDemand<'_> {
         let mut routings: Vec<RunRouting> = Vec::new();
         let mut last_run = None;
         let mut cost = Some(0.0_f64);
+        // Claude Code at its usage limit, the declared fallback takes the
+        // whole roster for this pass (OWL-406): another model family than the
+        // author's, on the opt-in Codex reviewer's routing. The opt-in seat
+        // is then not added, the roster being on that harness already.
+        let fallback = self.review_fallback(role);
+        let (seat_router, seat_routing, seat_model, seat_same) = match fallback {
+            Some(fallback) => {
+                let routing = codex_reviewer_routing(dispatched.routing);
+                let router = if stage == Stage::Verify {
+                    fallback.verify
+                } else {
+                    fallback.design_review
+                };
+                (router, routing, codex_model(models, routing.tier), false)
+            }
+            None => (router, routed.routing, model, routed.same_model),
+        };
+        if fallback.is_some() {
+            let until = self.limited_until(HarnessKind::Claude);
+            sink.emit(
+                &ticket,
+                None,
+                EventKind::Decision,
+                data([
+                    ("routing", json!("fallback")),
+                    ("reason", json!("usage_limit")),
+                    ("role", json!(role.as_str())),
+                    ("stage", json!(stage_key)),
+                    ("pass", json!(pass)),
+                    ("harness", json!(seat_routing.harness)),
+                    ("in_place_of", json!(HarnessKind::Claude)),
+                    ("until", json!(until)),
+                ]),
+            );
+        }
         for seat in seats {
-            let harness = router.harness(routed.routing);
+            let harness = seat_router.harness(seat_routing);
             let brief = seat_brief(p, seat.mandates)?;
             let (ran, result) = self.review_run(p, &*harness, state, &brief, sink)?;
             last_run = Some(ran.run.clone());
-            cost = cost.zip(run_cost(&ran)).map(|(sum, run)| sum + run);
-            routings.push(routed.routing);
+            if fallback.is_none() {
+                cost = cost.zip(run_cost(&ran)).map(|(sum, run)| sum + run);
+            }
+            routings.push(seat_routing);
             outputs.push(SeatOutput {
                 reviewer: Reviewer {
                     role,
                     mandates: seat.mandates.to_vec(),
-                    harness: routed.routing.harness,
-                    model: model.unwrap_or("default").to_owned(),
-                    same_model: routed.same_model,
+                    harness: seat_routing.harness,
+                    model: seat_model.unwrap_or("default").to_owned(),
+                    same_model: seat_same,
+                    fallback: fallback.is_some(),
                 },
-                model: model.map(str::to_owned),
-                same_model: routed.same_model,
+                model: seat_model.map(str::to_owned),
+                same_model: seat_same,
                 findings: result.findings,
             });
         }
@@ -1681,7 +1719,7 @@ impl OnDemand<'_> {
         // cost, which Codex does not report, stays out of the pass's sum, so
         // a Codex seat leaves the chain's figure known (OWL-342).
         let mut dropped = None;
-        if let Some(codex) = self.codex {
+        if let (Some(codex), None) = (self.codex, fallback) {
             let seat = roster::CODEX_REVIEWER;
             let reason = match p.codex.clone() {
                 CodexSeat::Off => None,
@@ -1728,6 +1766,7 @@ impl OnDemand<'_> {
                                     harness: routing.harness,
                                     model: model.unwrap_or("default").to_owned(),
                                     same_model: false,
+                                    fallback: false,
                                 },
                                 model: model.map(str::to_owned),
                                 same_model: false,
@@ -1819,6 +1858,7 @@ impl OnDemand<'_> {
                     "effort": routing.effort,
                     "model": output.model,
                     "same_model": output.same_model,
+                    "fallback": output.reviewer.fallback,
                     "findings": output.findings.len(),
                 })
             })
@@ -2040,6 +2080,7 @@ impl OnDemand<'_> {
                     harness: output.reviewer.harness,
                     model: output.model.clone(),
                     same_model: output.same_model,
+                    fallback: output.reviewer.fallback,
                 })
                 .collect(),
             earlier: earlier_left(&review, pass),
@@ -2444,6 +2485,7 @@ mod tests {
             harness,
             model: "default".to_owned(),
             same_model: false,
+            fallback: false,
         }
     }
 
