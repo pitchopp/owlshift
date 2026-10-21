@@ -860,6 +860,24 @@ fn scenario_s5_collisions_between_owlshifts_tickets() {
         waited.contains(&("DEMO-3".to_owned(), json!(["DEMO-1"]), app.clone())),
         "{waited:?}\n{report}"
     );
+    // The ticket says it once, whatever the passes it waits (OWL-419); one
+    // that waits at Ready, DEMO-2, is told nothing there.
+    let waiting = |id: &str| -> Vec<String> {
+        bench
+            .comments_on(id)
+            .into_iter()
+            .filter(|c| c.starts_with("[owlshift] WAITING\n"))
+            .collect()
+    };
+    let shown = waiting("DEMO-3");
+    assert_eq!(shown.len(), 1, "{shown:?}\n{report}");
+    assert!(
+        shown[0].contains("This ticket waits: DEMO-1 holds zone `app`"),
+        "{}",
+        shown[0]
+    );
+    assert!(shown[0].contains("goes on by itself"), "{}", shown[0]);
+    assert_eq!(waiting("DEMO-2"), Vec::<String>::new(), "{report}");
 
     // DEMO-1 delivers first, then DEMO-3, once DEMO-1's pull request is
     // merged, with no Verify pass after its hold.
