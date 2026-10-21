@@ -679,11 +679,9 @@ impl Executor {
                 &spec.run_dir.join(SETUP_LOG),
                 &|| before.check_files(spec.worktree),
             );
-            let stopped = after_check(
-                &ran.report,
-                check,
-                |failure| (!ran.recoverable()).then_some(Failure::Setup(failure)),
-            );
+            let stopped = after_check(&ran.report, check, |failure| {
+                (!ran.recoverable()).then_some(Failure::Setup(failure))
+            });
             if let Some(outcome) = stopped {
                 log.finish();
                 return Ok(RunReport {
@@ -947,11 +945,9 @@ impl Executor {
                 (spec.setup, &brief.gate),
                 spec.run_dir,
             );
-            if let Some(after_gate) = after_check(
-                &report,
-                check,
-                |failure| Some(Failure::Gate(failure)),
-            ) {
+            if let Some(after_gate) =
+                after_check(&report, check, |failure| Some(Failure::Gate(failure)))
+            {
                 outcome = after_gate;
             }
             gate = Some(report);

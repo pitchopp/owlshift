@@ -4506,7 +4506,9 @@ impl OnDemand<'_> {
             },
         );
         match moved {
-            Ok(started) => started.map_err(|e| refused("starting the ticket's branch from the base", e)),
+            Ok(started) => {
+                started.map_err(|e| refused("starting the ticket's branch from the base", e))
+            }
             Err(fault) => Err(self.run_fault(&p.ticket, fault)),
         }
     }
@@ -4581,13 +4583,21 @@ impl OnDemand<'_> {
         // The run's own obligation, and its ticket's generation raised, so a
         // sibling's check that took its snapshot before reads it as ended
         // since (OWL-400).
-        let obligation =
-            ticket_run::write_obligation(self.dirs, Some(ticket), &run, &format!("Run {run} of {ticket}"))
-                .map_err(|e| refused("the run's obligation", e))?;
+        let obligation = ticket_run::write_obligation(
+            self.dirs,
+            Some(ticket),
+            &run,
+            &format!("Run {run} of {ticket}"),
+        )
+        .map_err(|e| refused("the run's obligation", e))?;
         let checkout = p.checkout.clone();
-        if let Err(fault) =
-            ticket_run::run_started(&self.executor.git, self.dirs, &checkout, &p._ticket_lock, ticket)
-        {
+        if let Err(fault) = ticket_run::run_started(
+            &self.executor.git,
+            self.dirs,
+            &checkout,
+            &p._ticket_lock,
+            ticket,
+        ) {
             let _ = ticket_run::remove_obligation(self.dirs, &obligation);
             return Err(self.run_fault(ticket, fault));
         }

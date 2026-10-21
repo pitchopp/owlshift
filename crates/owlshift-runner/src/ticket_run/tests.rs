@@ -73,7 +73,14 @@ impl Bench {
 
     fn open(&self, ticket: &TicketId) -> Result<TicketRun, RunFault> {
         let lock = self.dirs.ticket_lock(ticket).unwrap().unwrap();
-        open(&self.git, &self.dirs, &self.dirs.checkout(), &lock, ticket, None)
+        open(
+            &self.git,
+            &self.dirs,
+            &self.dirs.checkout(),
+            &lock,
+            ticket,
+            None,
+        )
     }
 }
 
@@ -245,19 +252,18 @@ fn a_ticket_from_before_gets_its_baseline_once_no_run_is_in_flight() {
     let bench = Bench::new();
     let owl = ticket("OWL-3");
     let checkout = bench.dirs.checkout();
-    let written =
-        ticket_ref::write_proposals_guarded(
-            &bench.git,
-            &checkout,
-            &owl,
-            &record(),
-            ProposalsFile::Keep,
-            None,
-            &mut Unguarded,
-        )
-        .unwrap();
-    let name = write_obligation(&bench.dirs, Some(&ticket("OWL-9")), "r1", "run r1 of OWL-9")
-        .unwrap();
+    let written = ticket_ref::write_proposals_guarded(
+        &bench.git,
+        &checkout,
+        &owl,
+        &record(),
+        ProposalsFile::Keep,
+        None,
+        &mut Unguarded,
+    )
+    .unwrap();
+    let name =
+        write_obligation(&bench.dirs, Some(&ticket("OWL-9")), "r1", "run r1 of OWL-9").unwrap();
     assert_eq!(name, "owl-9-r1");
     assert_eq!(bench.open(&owl), Err(RunFault::Busy));
     assert!(read_run(&bench.dirs, &owl).unwrap().is_none());
@@ -272,7 +278,9 @@ fn a_ticket_from_before_gets_its_baseline_once_no_run_is_in_flight() {
 /// leaves the others. Run alone: a lock is probed free.
 #[test]
 fn obligations_left_behind_become_the_quarantine() {
-    crate::alone::run_alone("ticket_run::tests::helper_obligations_left_behind_become_the_quarantine");
+    crate::alone::run_alone(
+        "ticket_run::tests::helper_obligations_left_behind_become_the_quarantine",
+    );
 }
 
 #[test]
@@ -286,12 +294,18 @@ fn helper_obligations_left_behind_become_the_quarantine() {
     let (own, running, ended) = (ticket("OWL-1"), ticket("OWL-2"), ticket("OWL-3"));
     let _held = dirs.ticket_lock(&running).unwrap().unwrap();
     let in_flight = write_obligation(dirs, Some(&running), "r2", "Run r2 of OWL-2").unwrap();
-    assert_eq!(look(dirs, Some(&own)).unwrap(), Look::Clear { running: true });
+    assert_eq!(
+        look(dirs, Some(&own)).unwrap(),
+        Look::Clear { running: true }
+    );
 
     let gone = write_obligation(dirs, Some(&ended), "r3", "Run r3 of OWL-3").unwrap();
     remove_obligation(dirs, &gone).unwrap();
     assert!(dirs.obligations_dir().join(&in_flight).exists());
-    assert_eq!(look(dirs, Some(&own)).unwrap(), Look::Clear { running: true });
+    assert_eq!(
+        look(dirs, Some(&own)).unwrap(),
+        Look::Clear { running: true }
+    );
 
     write_obligation(dirs, Some(&own), "r1", "Run r1 of OWL-1").unwrap();
     write_obligation(dirs, Some(&ended), "r4", "Run r4 of OWL-3").unwrap();
@@ -301,7 +315,12 @@ fn helper_obligations_left_behind_become_the_quarantine() {
         panic!("obligations left behind quarantine the project");
     };
     assert_eq!(path, dirs.quarantine_file());
-    for named in ["Run r1 of OWL-1", "Run r4 of OWL-3", "`owlshift gate` on abc", "owl-5-r5"] {
+    for named in [
+        "Run r1 of OWL-1",
+        "Run r4 of OWL-3",
+        "`owlshift gate` on abc",
+        "owl-5-r5",
+    ] {
         assert!(text.contains(named), "{named}: {text}");
     }
     assert!(!text.contains("Run r2 of OWL-2"), "{text}");
@@ -329,7 +348,9 @@ fn helper_obligations_left_behind_become_the_quarantine() {
 /// file that cannot be read is an error. Run alone: locks are probed free.
 #[test]
 fn siblings_are_read_from_their_run_files_and_locks() {
-    crate::alone::run_alone("ticket_run::tests::helper_siblings_are_read_from_their_run_files_and_locks");
+    crate::alone::run_alone(
+        "ticket_run::tests::helper_siblings_are_read_from_their_run_files_and_locks",
+    );
 }
 
 #[test]
@@ -398,7 +419,9 @@ fn helper_siblings_are_read_from_their_run_files_and_locks() {
 /// as it is; with no checkout, they go. Run alone: locks are taken again.
 #[test]
 fn run_files_are_taken_afresh_from_the_refs_as_they_are() {
-    crate::alone::run_alone("ticket_run::tests::helper_run_files_are_taken_afresh_from_the_refs_as_they_are");
+    crate::alone::run_alone(
+        "ticket_run::tests::helper_run_files_are_taken_afresh_from_the_refs_as_they_are",
+    );
 }
 
 #[test]

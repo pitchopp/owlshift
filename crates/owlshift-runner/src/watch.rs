@@ -134,7 +134,7 @@ use crate::project::{ProjectLock, TicketLock};
 use crate::quarantine::{self, Held, Record};
 use crate::reversal::{self, Current};
 use crate::step::{self, Children};
-use crate::ticket_ref::{self, ProposalsFile, Progress, RefAt, RefRead, Stored, TicketRecord};
+use crate::ticket_ref::{self, Progress, ProposalsFile, RefAt, RefRead, Stored, TicketRecord};
 use crate::ticket_run;
 use crate::writer::VisibleStage;
 

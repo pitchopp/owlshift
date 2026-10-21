@@ -863,11 +863,17 @@ fn a_ticket_parked_at_verify_is_not_resumed_on_a_moved_branch_or_a_late_comment(
     assert_eq!(parked(&bench), (Stage::Verify, Some(Waiting::Parked)));
     let commit = bench.record().review.unwrap().build.unwrap().commit;
     let checkout = bench.dirs().checkout();
+    // A move a person made and accepted, as `owlshift unquarantine` takes
+    // the run files afresh: since OWL-400 a move outside the runner's own
+    // writes is otherwise a breach at the ticket's next start.
     let moves = |to: &str| {
         bench
             .env
             .run(&checkout, &["update-ref", "refs/heads/owlshift/demo-1", to])
             .unwrap();
+        let env = bench.env.clone();
+        let git = Git::with_setup("git", move |command| env.apply(command));
+        owlshift_runner::ticket_run::rebaseline(&git, &bench.dirs()).unwrap();
     };
     let ran = bench.briefs().len();
 

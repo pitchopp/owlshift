@@ -328,24 +328,13 @@ impl Bench {
 fn a_kept_branch_with_commits_of_its_own_is_dispatched_as_it_is() {
     let bench = Bench::new(true);
     let blocked = r#"{"format":14,"status":"blocked","summary":"Waiting."}"#;
-    let (outcome, printed) = bench.run(vec![bench.reply(None, Some(blocked))], None);
+    // The run leaves a commit of its own, then blocks: since OWL-400 a
+    // commit made outside a run is a breach at the ticket's next start.
+    let (outcome, printed) = bench.run(vec![bench.reply(Some("Hi"), Some(blocked))], None);
     assert!(
         matches!(outcome, Err(Stop::Parked { .. })),
         "{outcome:?}\n{printed}"
     );
-    bench
-        .env
-        .run(
-            &bench.worktree(),
-            &[
-                "commit",
-                "--quiet",
-                "--allow-empty",
-                "-m",
-                "A person's commit",
-            ],
-        )
-        .unwrap();
     let own = bench.kept_head();
     let merged = bench.merge_into_main(&[("MERGED.md", "merged\n")]);
 
@@ -1892,7 +1881,10 @@ fn a_quarantine_is_told_once_to_the_operator_and_to_the_ticket_it_holds() {
     assert!(park.contains("`owlshift unquarantine`"), "{park}");
     // Cleared, DEMO-1 is continued and built; DEMO-2 stays parked.
     assert_eq!(bench.dirs().quarantine().unwrap(), None);
-    assert!(!bench.dirs().obligations_stand(), "cleared with the quarantine");
+    assert!(
+        !bench.dirs().obligations_stand(),
+        "cleared with the quarantine"
+    );
     assert!(outcomes.last().unwrap().is_ok(), "{outcomes:?}\n{lines}");
     assert_eq!(
         bench.runs(),

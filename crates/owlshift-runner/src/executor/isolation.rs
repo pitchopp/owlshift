@@ -214,7 +214,12 @@ fn known(earlier: &Concurrent, later: &Concurrent, name: &str) -> bool {
 /// later answer giving the same values when it knows the ref. One whose
 /// values changed between the two answers ran again meanwhile, so the refs
 /// may hold it at any point of that run: it is left out.
-fn settled(name: &str, accepted: &BTreeSet<Option<String>>, earlier: &Concurrent, later: &Concurrent) -> bool {
+fn settled(
+    name: &str,
+    accepted: &BTreeSet<Option<String>>,
+    earlier: &Concurrent,
+    later: &Concurrent,
+) -> bool {
     !earlier.running.contains(name)
         && !later.running.contains(name)
         && later
@@ -711,7 +716,10 @@ impl MainState {
         let own = format!("refs/heads/{branch}");
         let listed = git.run(
             main,
-            &["for-each-ref", "--format=%(objectname) %(refname) %(symref)"],
+            &[
+                "for-each-ref",
+                "--format=%(objectname) %(refname) %(symref)",
+            ],
         )?;
         let refs = String::from_utf8_lossy(&listed)
             .lines()
@@ -2083,11 +2091,9 @@ mod tests {
     }
 
     fn concurrent(running: &[&str]) -> Concurrent {
-        running
-            .iter()
-            .fold(Concurrent::default(), |known, branch| {
-                known.running_branch(branch)
-            })
+        running.iter().fold(Concurrent::default(), |known, branch| {
+            known.running_branch(branch)
+        })
     }
 
     /// The violations of the entries between `before` and the folder as it

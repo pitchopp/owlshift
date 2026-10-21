@@ -13,8 +13,8 @@ use serde::{Deserialize, Serialize};
 use owlshift_core::gate::{Chain, ChainCost};
 
 use crate::format::{
-    self, CARRY_FORMAT, ContractError, Format, OBLIGATION_FORMAT, RUN_FORMAT,
-    STEP_ENVELOPE_FORMAT, STEP_OUTCOME_FORMAT,
+    self, CARRY_FORMAT, ContractError, Format, OBLIGATION_FORMAT, RUN_FORMAT, STEP_ENVELOPE_FORMAT,
+    STEP_OUTCOME_FORMAT,
 };
 use crate::ids::TicketId;
 use crate::{Role, Stage};
@@ -468,7 +468,10 @@ impl TicketRun {
         let commits = [
             run.tip.as_deref(),
             run.ticket_ref.as_deref(),
-            run.writing.ticket_ref.as_ref().and_then(|t| t.to.as_deref()),
+            run.writing
+                .ticket_ref
+                .as_ref()
+                .and_then(|t| t.to.as_deref()),
             run.writing.tip.as_ref().and_then(|t| t.to.as_deref()),
         ];
         if let Some(bad) = commits.into_iter().flatten().find(|id| !is_commit_id(id)) {

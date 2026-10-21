@@ -345,7 +345,13 @@ fn branch_head(git: &Git, checkout: &Path, branch: &str) -> Result<Option<String
     let out = git
         .output(
             checkout,
-            &["rev-parse", "--verify", "--quiet", "--end-of-options", &name],
+            &[
+                "rev-parse",
+                "--verify",
+                "--quiet",
+                "--end-of-options",
+                &name,
+            ],
             None,
         )
         .map_err(|e| e.to_string())?;
@@ -745,8 +751,9 @@ pub fn rebaseline(git: &Git, dirs: &ProjectDirs) -> Result<Vec<String>, String> 
             Ok(run) => run.ticket.clone(),
             Err(_) => match listed.iter().find(|t| component(t.as_str()) == folder) {
                 Some(ticket) => ticket.clone(),
-                None => TicketId::new(folder.clone())
-                    .map_err(|e| format!("{}: {e}", dir.display()))?,
+                None => {
+                    TicketId::new(folder.clone()).map_err(|e| format!("{}: {e}", dir.display()))?
+                }
             },
         };
         let Some(_lock) = dirs
@@ -854,10 +861,9 @@ impl<'a> Siblings<'a> {
             known
                 .ended
                 .insert(branch, values(&run.tip, &run.writing.tip));
-            known.ended.insert(
-                reference,
-                values(&run.ticket_ref, &run.writing.ticket_ref),
-            );
+            known
+                .ended
+                .insert(reference, values(&run.ticket_ref, &run.writing.ticket_ref));
         }
         Ok(known)
     }

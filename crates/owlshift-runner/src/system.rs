@@ -580,7 +580,9 @@ pub(crate) mod fake {
 
         /// As [`Self::quarantine_is`] scripted it; never the disk.
         fn quarantine(&self, _root: &Path) -> Result<MarkerState, String> {
-            self.quarantine.clone().unwrap_or(Ok(MarkerState::default()))
+            self.quarantine
+                .clone()
+                .unwrap_or(Ok(MarkerState::default()))
         }
 
         /// As [`Self::default_branch_file_is`] scripted it; never git.

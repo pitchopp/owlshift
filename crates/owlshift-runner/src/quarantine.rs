@@ -40,10 +40,10 @@ use owlshift_contracts::format::Format;
 use owlshift_contracts::ids::TicketId;
 
 use crate::events::{EventSink, data, printable};
+use crate::executor::Git;
 use crate::executor::Violation;
 use crate::notify;
 use crate::on_demand;
-use crate::executor::Git;
 use crate::project::{ProjectDirs, ProjectLock};
 use crate::ticket_run::{self, Standing};
 use crate::writer::Writer;
@@ -801,7 +801,12 @@ mod tests {
             };
             let mut out = Vec::new();
             let mut sink = EventSink::new("acme/app", bench.log.clone(), &mut out);
-            let cleared = clear(&crate::project::runner_git(), &bench.dirs, &mut ask, &mut sink);
+            let cleared = clear(
+                &crate::project::runner_git(),
+                &bench.dirs,
+                &mut ask,
+                &mut sink,
+            );
             drop(sink);
             drop(held);
             let left = bench.dirs.quarantine().unwrap();
@@ -859,11 +864,19 @@ mod tests {
         let mut ask = |_: &str| -> io::Result<String> { unreachable!("nothing is shown") };
         let mut out = Vec::new();
         let mut sink = EventSink::new("acme/app", bench.log.clone(), &mut out);
-        let cleared = clear(&crate::project::runner_git(), &bench.dirs, &mut ask, &mut sink);
+        let cleared = clear(
+            &crate::project::runner_git(),
+            &bench.dirs,
+            &mut ask,
+            &mut sink,
+        );
         fs::set_permissions(root, fs::Permissions::from_mode(0o700)).unwrap();
         if !superuser {
             let refused = cleared.unwrap_err();
-            assert!(refused.starts_with("the project's quarantine: "), "{refused}");
+            assert!(
+                refused.starts_with("the project's quarantine: "),
+                "{refused}"
+            );
         }
         assert_eq!(bench.dirs.quarantine().unwrap().as_deref(), Some(BREACH));
     }
@@ -880,7 +893,13 @@ mod tests {
         };
         let mut out = Vec::new();
         let mut sink = EventSink::new("acme/app", bench.log.clone(), &mut out);
-        let refused = clear(&crate::project::runner_git(), &bench.dirs, &mut ask, &mut sink).unwrap_err();
+        let refused = clear(
+            &crate::project::runner_git(),
+            &bench.dirs,
+            &mut ask,
+            &mut sink,
+        )
+        .unwrap_err();
         assert!(refused.contains("changed while you answered"), "{refused}");
         assert!(bench.dirs.quarantine().unwrap().is_some());
     }
@@ -941,7 +960,8 @@ mod tests {
         let bench = Bench::new();
         let dirs = &bench.dirs;
         let (left, running) = (owl_7(), TicketId::new("OWL-8").unwrap());
-        let gone = ticket_run::write_obligation(dirs, Some(&left), "r7", "Run r7 of OWL-7").unwrap();
+        let gone =
+            ticket_run::write_obligation(dirs, Some(&left), "r7", "Run r7 of OWL-7").unwrap();
         let kept =
             ticket_run::write_obligation(dirs, Some(&running), "r8", "Run r8 of OWL-8").unwrap();
         let _held = dirs.ticket_lock(&running).unwrap().unwrap();
@@ -959,7 +979,12 @@ mod tests {
         };
         assert!(marker.contains("Run r7 of OWL-7"), "{marker}");
         assert!(shown[0].contains("Run r7 of OWL-7"), "{shown:?}");
-        assert!(shown[0].contains(&format!("still in flight, whose obligations stay and are checked as usual: {kept}")), "{shown:?}");
+        assert!(
+            shown[0].contains(&format!(
+                "still in flight, whose obligations stay and are checked as usual: {kept}"
+            )),
+            "{shown:?}"
+        );
         assert!(!dirs.obligations_dir().join(&gone).exists());
         assert!(dirs.obligations_dir().join(&kept).exists());
         assert_eq!(dirs.quarantine().unwrap(), None);

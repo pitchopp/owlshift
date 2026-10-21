@@ -262,7 +262,10 @@ fn runs_in_flight_get_no_tag_no_prune_and_no_needless_set_url() {
     // A worktree whose folder is gone, whose entry `worktree prune` would
     // remove; and a tag on the remote, which a fetch following tags writes.
     let entry = checkout.join(".git/worktrees/gone");
-    bench.run_git(&checkout, &["worktree", "add", "--quiet", "--detach", "../gone"]);
+    bench.run_git(
+        &checkout,
+        &["worktree", "add", "--quiet", "--detach", "../gone"],
+    );
     fs::remove_dir_all(bench.dirs.root().join("gone")).unwrap();
     bench.run_git(&bench.remote, &["tag", "v1"]);
     let tag = checkout.join(".git/refs/tags/v1");
@@ -275,7 +278,10 @@ fn runs_in_flight_get_no_tag_no_prune_and_no_needless_set_url() {
     assert!(!ran("set-url"), "{calls:?}");
     assert!(!ran("worktree prune"), "{calls:?}");
     assert!(!tag.exists(), "a tag was fetched while a run is in flight");
-    assert!(entry.exists(), "an entry was pruned while a run is in flight");
+    assert!(
+        entry.exists(),
+        "an entry was pruned while a run is in flight"
+    );
 
     fs::remove_file(bench.dirs.obligations_dir().join("owl-1-r1")).unwrap();
     calls.lock().unwrap().clear();

@@ -2353,9 +2353,11 @@ fn quarantine_check(system: &dyn System, config: &Effective, home: Option<&Path>
         Err(_) => format!("{} (unreadable)", standing.found.name),
     };
     let running: Vec<String> = state.running().map(named).collect();
-    let in_flight = (!running.is_empty())
-        .then(|| format!("in flight: {}", running.join("; ")))
-        .unwrap_or_default();
+    let in_flight = if running.is_empty() {
+        String::new()
+    } else {
+        format!("in flight: {}", running.join("; "))
+    };
     let left: Vec<String> = state.left_behind().map(named).collect();
     if state.quarantine.is_none() && left.is_empty() {
         return Some(if running.is_empty() {
@@ -4595,7 +4597,11 @@ states = { ready = "Todo", working = "Doing", needs_input = "Asked", review = "R
         ] {
             let report = run(&system, &config);
             let found = line(&report, "quarantine");
-            assert_eq!((found.status, found.detail.as_str()), (status, detail), "{report}");
+            assert_eq!(
+                (found.status, found.detail.as_str()),
+                (status, detail),
+                "{report}"
+            );
         }
     }
 

@@ -1317,7 +1317,9 @@ impl Bench {
             .collect()
     }
 
-    /// Writes `record` as the ticket ref, over the one it holds.
+    /// Writes `record` as the ticket ref, over the one it holds, as a
+    /// person's command does: under the ticket's lock, through its run file
+    /// (OWL-400).
     fn write_record(&self, record: &TicketRecord) {
         let env = self.env.clone();
         let git = Git::with_setup("git", move |command| env.apply(command));
@@ -1325,7 +1327,7 @@ impl Bench {
         let previous = ticket_ref::read(&git, &checkout, &ticket())
             .unwrap()
             .map(|stored| stored.commit);
-        ticket_ref::write(&git, &checkout, &ticket(), record, previous.as_deref()).unwrap();
+        write_through_run_file(&git, &self.dirs(), &ticket(), record, previous.as_deref());
     }
 
     /// Another merge into the remote's `main`, writing `files`, from a
@@ -1667,6 +1669,34 @@ fn ticket() -> TicketId {
     TicketId::new(TICKET).unwrap()
 }
 
+/// Writes `record` as `ticket`'s ref from `previous`, as the runner's own
+/// writes do: under the ticket's lock, through its run file (OWL-400), so
+/// the ticket's next step finds the ref where its run file says. Returns
+/// the new commit.
+fn write_through_run_file(
+    git: &Git,
+    dirs: &ProjectDirs,
+    ticket: &TicketId,
+    record: &TicketRecord,
+    previous: Option<&str>,
+) -> String {
+    let lock = dirs
+        .ticket_lock(ticket)
+        .unwrap()
+        .expect("the ticket's lock");
+    owlshift_runner::ticket_run::write_ref(
+        git,
+        dirs,
+        &dirs.checkout(),
+        &lock,
+        ticket,
+        record,
+        ticket_ref::ProposalsFile::Keep,
+        previous,
+    )
+    .unwrap()
+}
+
 fn kinds(events: &[Event]) -> Vec<EventKind> {
     events.iter().map(|event| event.kind).collect()
 }
@@ -1825,7 +1855,10 @@ fn a_ticket_becomes_a_pull_request_with_its_report() {
         .env
         .run(
             &dirs.checkout(),
-            &["rev-parse", &format!("refs/heads/owlshift/{}", TICKET.to_lowercase())],
+            &[
+                "rev-parse",
+                &format!("refs/heads/owlshift/{}", TICKET.to_lowercase()),
+            ],
         )
         .unwrap();
     assert_eq!(
@@ -2844,6 +2877,9 @@ fn a_run_that_moves_origin_main_does_not_choose_the_next_base() {
     ] {
         bench.env.run(&checkout, &args).unwrap();
     }
+    // A later ticket has no run file yet: it takes its refs as they are
+    // (OWL-400), where the same ticket would find its branch gone.
+    fs::remove_file(bench.dirs().run_file(&ticket())).unwrap();
     let (outcome, printed) = bench.run(vec![bench.reply(Some("Hello"), Some(DONE))], None);
     outcome.unwrap_or_else(|stop| panic!("{stop}\n{printed}"));
     let tip = bench.remote_branch().expect("the branch was pushed");
@@ -3789,7 +3825,6 @@ fn a_ticket_whose_ref_is_full_is_forgotten_and_asks_its_next_round() {
     // `questions.json` 300 bytes short of the cap.
     let env = bench.env.clone();
     let git = Git::with_setup("git", move |command| env.apply(command));
-    let checkout = bench.dirs().checkout();
     let mut record = bench.record();
     record.state = PersistedState::parse(
         r#"{"format":2,"stage":"build","round":1,"reasks":0,"failed_runs":0}"#,
@@ -3801,14 +3836,13 @@ fn a_ticket_whose_ref_is_full_is_forgotten_and_asks_its_next_round() {
         .context
         .push_str(&"x".repeat(pad));
     assert_eq!(record.questions.render().len(), short);
-    let full = ticket_ref::write(
+    let full = write_through_run_file(
         &git,
-        &checkout,
+        &bench.dirs(),
         &ticket(),
         &record,
         Some(&bench.ref_commit()),
-    )
-    .unwrap();
+    );
 
     let (stopped, printed) = bench.run(vec![bench.reply(None, Some(ROUND_1))], None);
     let Err(Stop::NotKept {
@@ -7604,11 +7638,11 @@ fn a_stage_left_at_working_is_moved_only_under_the_lock_and_unchanged() {
     // The ticket ref moved, as by a command typed meanwhile.
     let bench = delivered();
     left_working(&bench);
-    let (env, checkout) = (bench.env.clone(), bench.dirs().checkout());
+    let (env, dirs) = (bench.env.clone(), bench.dirs());
     let (record, commit) = (bench.record(), bench.ref_commit());
     *bench.after_stage_read.borrow_mut() = Some(Box::new(move || {
         let git = Git::with_setup("git", move |command| env.apply(command));
-        let moved = ticket_ref::write(&git, &checkout, &ticket(), &record, Some(&commit)).unwrap();
+        let moved = write_through_run_file(&git, &dirs, &ticket(), &record, Some(&commit));
         assert_ne!(moved, commit);
     }));
     let from = bench.events().len();
