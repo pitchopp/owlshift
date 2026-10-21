@@ -157,7 +157,8 @@ pub fn blocker_line(ticket: &TicketId, stop: &Stop) -> Option<String> {
         | Stop::Delivery(_)
         | Stop::Watched { .. }
         | Stop::Ready { .. }
-        | Stop::Stepped { .. } => return None,
+        | Stop::Stepped { .. }
+        | Stop::ToWatch { .. } => return None,
     })
 }
 

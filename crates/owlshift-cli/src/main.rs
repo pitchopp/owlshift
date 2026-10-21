@@ -61,6 +61,11 @@ enum Command {
     Continue {
         /// The ticket, such as OWL-12.
         ticket: String,
+        /// Restart a parked ticket and return without running it:
+        /// `owlshift watch` drives it from its next pass. On a ticket that
+        /// is not parked, runs nothing and says what watch does with it.
+        #[arg(long, conflicts_with = "step")]
+        to_watch: bool,
         /// The step `owlshift watch --drain` runs in this process, as its
         /// envelope (OWL-399): watch's own, never typed.
         #[arg(long, hide = true, value_name = "ENVELOPE")]
@@ -196,12 +201,20 @@ fn main() -> ExitCode {
         }
         Command::Init(args) => init_cmd::run(&args, &config),
         Command::Do { ticket } => do_cmd::run(&system, &config, do_cmd::Mode::Do(&ticket)),
-        Command::Continue { ticket, step: None } => {
-            do_cmd::run(&system, &config, do_cmd::Mode::Continue(&ticket))
-        }
+        Command::Continue {
+            ticket,
+            step: None,
+            to_watch: false,
+        } => do_cmd::run(&system, &config, do_cmd::Mode::Continue(&ticket)),
+        Command::Continue {
+            ticket,
+            step: None,
+            to_watch: true,
+        } => do_cmd::run(&system, &config, do_cmd::Mode::ToWatch(&ticket)),
         Command::Continue {
             ticket,
             step: Some(envelope),
+            ..
         } => do_cmd::run(&system, &config, do_cmd::Mode::Step(&ticket, &envelope)),
         Command::Watch { drain: false } => do_cmd::run(&system, &config, do_cmd::Mode::Watch),
         Command::Watch { drain: true } => do_cmd::run(&system, &config, do_cmd::Mode::Drain),

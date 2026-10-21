@@ -162,10 +162,12 @@ mod drain;
 mod intake;
 mod limits;
 mod review_loop;
+mod to_watch;
 mod verify;
 
 use design::Built;
 use review_loop::{in_review_loop, loop_base, loop_reviews};
+pub use to_watch::Takes;
 use verify::Verified;
 
 pub(crate) use design::APPROVAL_CATEGORY;
@@ -703,6 +705,19 @@ pub enum Stop {
         stage: Stage,
         carried: Carried,
     },
+    /// `owlshift continue --to-watch` (OWL-420, architecture section 5, "A
+    /// restart handed to watch"): the ticket, at `stage`, is left to
+    /// `owlshift watch`, which `takes` it from its next pass; `restarted`
+    /// when the command restarted a park, nothing being written otherwise;
+    /// `watching` whether a watch held the project then, `None` when that
+    /// could not be read. Nothing ran; nobody is the blocker.
+    ToWatch {
+        ticket: TicketId,
+        stage: Stage,
+        takes: Takes,
+        restarted: bool,
+        watching: Option<bool>,
+    },
 }
 
 impl Stop {
@@ -907,6 +922,42 @@ impl fmt::Display for Stop {
                  once the project's slot is its turn.",
                 crate::watch::stage_label(*stage)
             ),
+            Self::ToWatch {
+                ticket,
+                stage,
+                takes,
+                restarted,
+                watching,
+            } => {
+                let stage = crate::watch::stage_label(*stage);
+                if *restarted {
+                    write!(
+                        f,
+                        "{ticket} is restarted at {stage}, and nothing runs now: "
+                    )?;
+                } else {
+                    write!(
+                        f,
+                        "{ticket} is not parked, so nothing is restarted or run; it is at \
+                         {stage}: "
+                    )?;
+                }
+                write!(f, "{}", takes.next())?;
+                if !*restarted {
+                    f.write_str(", a hold watch keeps on it standing until its end")?;
+                }
+                f.write_str(".")?;
+                match watching {
+                    Some(true) => Ok(()),
+                    Some(false) => f.write_str(
+                        " No `owlshift watch` runs on this project now: nothing drives the \
+                         ticket until one starts.",
+                    ),
+                    None => f.write_str(
+                        " Whether `owlshift watch` runs on this project could not be read.",
+                    ),
+                }
+            }
         }
     }
 }
@@ -1212,6 +1263,9 @@ struct Prepared {
     /// architecture section 5, "One step a pass"): it stops with
     /// [`Stop::Stepped`] at the next change of stage, its state kept.
     stepping: bool,
+    /// `owlshift continue --to-watch` (OWL-420): the command restarts a
+    /// park and leaves the ticket to watch, running nothing.
+    to_watch: bool,
     /// What the ticket's runs cost (OWL-378), as the ticket ref keeps it,
     /// plus each run of this command as it ends ([`OnDemand::execute`]),
     /// which the ref keeps at once, making the ref of a ticket that has none
@@ -1955,6 +2009,11 @@ impl OnDemand<'_> {
             if !in_review_loop(&p) {
                 return Err(why);
             }
+            // Watch never builds a loop again in place of Verify: the flag
+            // leaves it to plain `continue` (OWL-420).
+            if p.to_watch {
+                return Err(to_watch::rebuild_refused(ticket, &why));
+            }
             state = self.rebuild_loop(&mut p, state, why, sink)?;
         }
         // A ticket that goes on to a dispatch is refused on an empty gate
@@ -1966,34 +2025,15 @@ impl OnDemand<'_> {
         ) {
             self.refuse_empty_gate(&p, Command::Continue)?;
         }
+        // `--to-watch` stops here, the park restarted, and runs nothing
+        // (OWL-420).
+        if p.to_watch {
+            return Err(self.hand_to_watch(&mut p, state, sink));
+        }
         // A person typing `continue` on a parked ticket is the restart the
         // core waits for.
-        if let Status::Parked { at, .. } = state.status() {
-            state = match state.apply(p.pipeline, Event::Restarted) {
-                Ok(Transition::To(state)) => state,
-                other => return Err(core_error(other)),
-            };
-            // The person's restart counts the ticket's budget afresh
-            // (OWL-378), as it resets the breakers' counts.
-            p.cost.restarted();
-            self.keep(&mut p, &state)?;
-            sink.emit(
-                ticket,
-                None,
-                EventKind::Decision,
-                data([("restarted", json!(true)), ("stage", json!(stage_name(at)))]),
-            );
-            // The ticket leaves the parked stage now: whatever stops this
-            // command next, it no longer shows Owlshift stopped on it. A
-            // ticket parked at Intake keeps it while intake runs, out of the
-            // ready column, and goes back there once intake ends at Ready
-            // (OWL-248); one parked while its intake round waited waits
-            // again, and shows it (OWL-269).
-            if state.status() != Status::Active(Stage::Intake)
-                && let Some(stage) = VisibleStage::of(state.status())
-            {
-                self.show(ticket, None, stage, sink);
-            }
+        if let Status::Parked { .. } = state.status() {
+            state = self.restart_park(&mut p, state, None, sink)?;
         }
         if let Status::NeedsInput { .. } = state.status() {
             state = self.check_answers(&mut p, state, sink)?;
@@ -2301,6 +2341,7 @@ impl OnDemand<'_> {
             // The person's project file, as every `[policy]` key (OWL-331).
             policy: self.config.gate_policy(),
             stepping: false,
+            to_watch: false,
             integrated: false,
             slot_held_by: None,
         })
@@ -5274,7 +5315,8 @@ impl OnDemand<'_> {
                 | Stop::Delivery(_)
                 | Stop::Watched { .. }
                 | Stop::Ready { .. }
-                | Stop::Stepped { .. } => false,
+                | Stop::Stepped { .. }
+                | Stop::ToWatch { .. } => false,
             },
         };
         if !moved_itself {

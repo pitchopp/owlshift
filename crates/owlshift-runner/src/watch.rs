@@ -156,6 +156,7 @@ use crate::writer::VisibleStage;
 mod drain;
 mod limits;
 mod outside;
+pub mod presence;
 mod running;
 mod waiting;
 
@@ -222,7 +223,7 @@ pub fn outlived(status: Status, stored: &Stored) -> bool {
 /// leaves every ticket it works there between two passes; so is a `do` or a
 /// drain's dispatch that a stop left at round 0. One parked or waiting needs
 /// `owlshift continue` or an answer.
-fn resumable_stage(state: &TicketState) -> Option<VisibleStage> {
+pub(crate) fn resumable_stage(state: &TicketState) -> Option<VisibleStage> {
     match state.status() {
         Status::Active(Stage::Intake) if state.round() > 0 => Some(VisibleStage::NeedsInput),
         Status::Active(Stage::Design | Stage::DesignReview | Stage::Build | Stage::Verify) => {
