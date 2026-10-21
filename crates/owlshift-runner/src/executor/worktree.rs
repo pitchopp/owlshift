@@ -14,24 +14,36 @@ use super::{BRIEF_PATH, ExecutorError, RUN_DIR, RunSpec};
 /// found is: the root of a linked worktree of the main checkout's
 /// repository, on the branch, at the commit the branch points to there.
 pub(super) fn prepare(git: &Git, spec: &RunSpec<'_>) -> Result<(), ExecutorError> {
-    check_spec(git, spec.main, spec.worktree, spec.branch)?;
-    if fs::symlink_metadata(spec.worktree).is_ok() {
-        return check_kept(git, spec.main, spec.worktree, spec.branch);
+    prepare_at(git, spec.main, spec.worktree, spec.branch, spec.base)
+}
+
+/// [`prepare`] from the paths alone: the worktree `worktree` of `main` on
+/// `branch`, made at `base` when the branch is new.
+pub(super) fn prepare_at(
+    git: &Git,
+    main: &Path,
+    worktree: &Path,
+    branch: &str,
+    base: &str,
+) -> Result<(), ExecutorError> {
+    check_spec(git, main, worktree, branch)?;
+    if fs::symlink_metadata(worktree).is_ok() {
+        return check_kept(git, main, worktree, branch);
     }
 
-    let head_ref = format!("refs/heads/{}", spec.branch);
-    if branch_exists(git, spec.main, &head_ref)? {
+    let head_ref = format!("refs/heads/{branch}");
+    if branch_exists(git, main, &head_ref)? {
         let args: [&OsStr; 5] = [
             "worktree".as_ref(),
             "add".as_ref(),
             "--quiet".as_ref(),
-            spec.worktree.as_os_str(),
-            spec.branch.as_ref(),
+            worktree.as_os_str(),
+            branch.as_ref(),
         ];
-        git.run(spec.main, &args).map_err(worktree_error)?;
+        git.run(main, &args).map_err(worktree_error)?;
         Ok(())
     } else {
-        add_new_branch(git, spec.main, spec.worktree, spec.branch, spec.base)
+        add_new_branch(git, main, worktree, branch, base)
     }
 }
 

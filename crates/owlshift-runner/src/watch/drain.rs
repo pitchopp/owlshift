@@ -45,16 +45,17 @@ use owlshift_contracts::ids::TicketId;
 use owlshift_contracts::refs::EndedWhy;
 use owlshift_contracts::step::{StepEnd, StepKind};
 use owlshift_contracts::{Role, Variant};
+use owlshift_core::collision::{Dispatched, InFlight};
 use owlshift_core::resource::{self, Held as HeldSet, NamedResources};
 use owlshift_core::schedule::{self, Caps, Load, Wait, natural_cmp};
 use owlshift_core::state::{Status, TicketState};
 use owlshift_core::ticket::{Admission, Blocker, BlockerState, Ticket, text_blockers};
 use owlshift_core::vocab::Stage;
 
-use super::{Admit, Continued, Memory as WatchMemory, RETRY_AFTER, Seen, Watch};
+use super::{Admit, Continued, Memory as WatchMemory, RETRY_AFTER, Seen, Then, Watch};
 use crate::events::{EventSink, data};
 use crate::held;
-use crate::in_flight::{self, Kind};
+use crate::in_flight::{self, Outside};
 use crate::on_demand::{self, delivery_followed};
 use crate::quarantine::Held;
 use crate::ticket_ref::{self, RefAt, Stored, text_sha256};
@@ -146,6 +147,11 @@ impl Row {
         self.stored.as_ref().is_some_and(delivery_followed)
     }
 
+    /// Whether its ref holds what its ticket holds ([`held::holds`]).
+    fn holds(&self) -> bool {
+        self.stored.as_ref().is_some_and(held::holds)
+    }
+
     fn excluded(&self, exclude: Option<&str>) -> bool {
         exclude.is_some_and(|label| self.listed.ticket.labels.iter().any(|l| l == label))
     }
@@ -205,55 +211,6 @@ fn text_state(read: Result<Option<StateType>, Error>) -> BlockerState {
         Ok(state) => relation_state(state),
         Err(error) if error.kind == ErrorKind::NotFound => BlockerState::Unknown,
         Err(_) => BlockerState::Open,
-    }
-}
-
-/// What a waiting reason says on watch's line.
-fn said(wait: &Wait<String>, exclude: Option<&str>, kinds: &HashMap<String, Kind>) -> String {
-    let list = |ids: &[String]| ids.join(", ");
-    match wait {
-        Wait::Duplicate => "the column lists it twice; the first is taken".to_owned(),
-        Wait::NotAdmitted => {
-            "its admission gesture is not from an account `[tracker].admitters` lists".to_owned()
-        }
-        Wait::Excluded => format!(
-            "it carries the exclusion label {:?}",
-            exclude.unwrap_or_default()
-        ),
-        Wait::NoDecider => {
-            "it has no decider: give it an assignee, or a `zone:` label whose zone has an owner"
-                .to_owned()
-        }
-        Wait::NoIntake => "its intake has not run yet".to_owned(),
-        Wait::StaleIntake => "its text changed since its intake, which runs again".to_owned(),
-        Wait::NotReady => {
-            "it is being worked, waits for an answer, is parked, or its pull request is followed"
-                .to_owned()
-        }
-        Wait::BlockerCanceled(ids) => format!(
-            "its blocker {} was canceled: it waits until a person removes the relation or the \
-             line",
-            list(ids)
-        ),
-        Wait::BlockerUnknown(ids) => format!(
-            "its \"Blocked by\" line names {}, which the tracker does not know: it waits until a \
-             person corrects the line",
-            list(ids)
-        ),
-        Wait::BlockedBy(ids) => format!("blocked by {}", list(ids)),
-        Wait::PrCap => "the open pull requests reached their cap".to_owned(),
-        Wait::Slot(ids) => format!(
-            "the project's slot is held by {} (`owlshift doctor` says how to clear a stale one)",
-            list(ids)
-        ),
-        Wait::Collision(found) => {
-            let holder = in_flight::named(kinds, &found.holder);
-            format!(
-                "{holder} holds {}, which it would touch: it goes once {holder} no longer holds it",
-                found.resource
-            )
-        }
-        Wait::RunCap => "every run of this machine is taken".to_owned(),
     }
 }
 
@@ -339,6 +296,20 @@ impl Watch<'_> {
             })
             .collect();
         rows.sort_by(Row::order);
+        // The tickets whose step's child runs (OWL-401) are neither taken in
+        // nor dispatched again; a dispatch's holds the slot and what it would
+        // hold, as one of this pass's, until its admission writes its ref.
+        let busy: Vec<TicketId> = memory
+            .running
+            .iter()
+            .map(|running| running.ticket().clone())
+            .collect();
+        let dispatching: Vec<TicketId> = memory
+            .running
+            .iter()
+            .filter(|running| running.dispatch())
+            .map(|running| running.ticket().clone())
+            .collect();
 
         // Under quarantine no intake runs, nor is its candidate told: its
         // gesture is checked at the base commit under the lock, which the
@@ -346,7 +317,7 @@ impl Watch<'_> {
         let taken = if quarantined {
             None
         } else {
-            self.take_in(memory, &rows, sink, out, continued)
+            self.take_in(memory, &rows, &busy, sink, out, continued)
         };
         let exclude = tracker.exclude.as_deref();
         // The project's named resources, by which a zone or a file holds
@@ -355,12 +326,19 @@ impl Watch<'_> {
         let mut reads = HashMap::new();
         let tickets: Vec<Ticket<String>> = rows
             .iter()
-            .filter(|row| Some(row.id()) != taken.as_ref() && row.state.is_some())
+            .filter(|row| {
+                Some(row.id()) != taken.as_ref() && row.state.is_some() && !busy.contains(row.id())
+            })
+            .map(|row| self.core_ticket(memory, row, &refs, exclude, &named, &mut reads))
+            .collect();
+        let started: Vec<Ticket<String>> = rows
+            .iter()
+            .filter(|row| dispatching.contains(row.id()) && !row.holds())
             .map(|row| self.core_ticket(memory, row, &refs, exclude, &named, &mut reads))
             .collect();
         // The slot's holders, named in the reasons (OWL-291): every ref read
-        // that holds it, and every ref that could not be read, which stops
-        // every dispatch below.
+        // that holds it, every ref that could not be read, which stops every
+        // dispatch below, and every dispatch whose child runs.
         let slot_held_by: Vec<String> = refs
             .iter()
             .filter(|(_, stored)| {
@@ -369,6 +347,7 @@ impl Watch<'_> {
             })
             .map(|(ticket, _)| ticket)
             .chain(&unread)
+            .chain(&dispatching)
             .map(|ticket| ticket.as_str().to_owned())
             .collect();
         // The pull requests still followed, from the refs read this pass
@@ -388,14 +367,29 @@ impl Watch<'_> {
             .filter(|(_, stored)| held::holds(stored))
             .map(|(ticket, stored)| held::in_flight(ticket, stored, &named))
             .collect();
+        // A dispatch whose child runs and whose ref does not hold yet, as
+        // dispatched now, before this pass's (OWL-401).
+        let now = (on_demand.clock)().as_millisecond();
+        in_flight.extend(started.into_iter().map(|ticket| InFlight {
+            id: ticket.id,
+            dispatched: Dispatched::At(now),
+            delivered: false,
+            held: ticket.resources,
+        }));
         // The machine's run slots every project's drain shares (OWL-409):
-        // those held now, by a probe, against `concurrent_runs`; a dispatch
-        // that would find none waits. Without slots, or with a count that
-        // cannot be read, the child's own take decides.
-        let (concurrent_runs, runs) = memory
-            .children
-            .and_then(|c| c.slots())
-            .map_or((1, 0), |slots| (slots.count(), slots.held().unwrap_or(0)));
+        // those held now, by a probe, against `concurrent_runs`, this
+        // watch's own children counted while one has not taken its slot yet
+        // (OWL-401); a dispatch that would find none waits. Without slots,
+        // or with a count that cannot be read, the child's own take decides;
+        // in watch's own process, its steps run one after another.
+        let (concurrent_runs, runs) =
+            memory
+                .children
+                .and_then(|c| c.slots())
+                .map_or((u32::MAX, 0), |slots| {
+                    let own = u32::try_from(memory.running.len()).unwrap_or(u32::MAX);
+                    (slots.count(), slots.held().unwrap_or(0).max(own))
+                });
         // The work in flight outside Owlshift (OWL-410), read when a ticket
         // could be dispatched; a failed read dispatches nothing.
         let outside_unread = !tickets.is_empty() && {
@@ -461,7 +455,7 @@ impl Watch<'_> {
                 event.insert("resource".to_owned(), held::resource_data(resource));
             }
             sink.emit(row.id(), None, EventKind::Decision, event);
-            let reason = said(wait, exclude, &memory.outside.kinds);
+            let reason = in_flight::said(wait, exclude, &memory.outside.kinds);
             self.line(out, &format!("{} waits: {reason}", row.id()));
             memory.drain.waits.insert(row.id().clone(), told);
         }
@@ -489,7 +483,16 @@ impl Watch<'_> {
                 self.tell(memory, sink, out, row.id(), Held::Ready);
                 continue;
             }
-            self.dispatch(memory, row.id(), stored.at(), sink, out, continued);
+            let outside = memory.outside.current();
+            self.dispatch(
+                memory,
+                row.id(),
+                stored.at(),
+                outside.as_ref(),
+                sink,
+                out,
+                continued,
+            );
         }
     }
 
@@ -525,19 +528,27 @@ impl Watch<'_> {
     }
 
     /// The pass's intake: the first candidate, in the core's order, that its
-    /// gesture admits and no hold keeps back. Returns the ticket it ran on,
-    /// if any.
+    /// gesture admits and no hold keeps back, none whose step runs. One
+    /// intake runs at a time (OWL-401): none starts while one's child runs.
+    /// Returns the ticket it ran on, or started, if any.
     fn take_in(
         &self,
         memory: &mut WatchMemory,
         rows: &[Row],
+        busy: &[TicketId],
         sink: &mut EventSink<'_>,
         out: &mut dyn Write,
         continued: &mut Continued<'_>,
     ) -> Option<TicketId> {
         let on_demand = self.on_demand;
+        if memory.running.iter().any(|running| running.intake()) {
+            return None;
+        }
         let exclude = on_demand.config.tracker.exclude.as_deref();
-        for row in rows.iter().filter(|row| row.intake_due(exclude)) {
+        for row in rows
+            .iter()
+            .filter(|row| row.intake_due(exclude) && !busy.contains(row.id()))
+        {
             let ticket = row.id();
             let now = (on_demand.clock)();
             if memory
@@ -559,29 +570,52 @@ impl Watch<'_> {
                 return None;
             }
             let envelope = self.envelope(memory, ticket, StepKind::Intake, &seen);
-            match self.step(memory, sink, out, continued, envelope, None) {
+            let then = Then::Intake { seen };
+            match self.step(memory, sink, out, continued, envelope, None, None, then) {
                 // The ref moved, or the ticket left the column: the next
                 // pass reads it again.
-                StepEnd::Stale => return None,
-                StepEnd::NotAdmitted { account, reason } => {
-                    self.not_admitted(memory, ticket, account, &reason, sink, out);
-                }
-                end => {
-                    memory.drain.warned.remove(ticket);
-                    self.ran(memory, ticket, seen, &end, sink, out);
-                    return Some(ticket.clone());
-                }
+                Some(StepEnd::Stale) => return None,
+                // Told: the next candidate is tried.
+                Some(StepEnd::NotAdmitted { .. }) => {}
+                _ => return Some(ticket.clone()),
             }
         }
         None
     }
 
-    /// The dispatch of `ticket`, its ref at `at`, held as a continue is.
+    /// What an intake that ended `end` left: a gesture that does not admit
+    /// is told; any other end is held as a continue is.
+    pub(super) fn taken_in(
+        &self,
+        memory: &mut WatchMemory,
+        ticket: &TicketId,
+        seen: Seen,
+        end: &StepEnd,
+        sink: &mut EventSink<'_>,
+        out: &mut dyn Write,
+    ) {
+        match end {
+            StepEnd::Stale => {}
+            StepEnd::NotAdmitted { account, reason } => {
+                self.not_admitted(memory, ticket, account.clone(), reason, sink, out);
+            }
+            end => {
+                memory.drain.warned.remove(ticket);
+                self.ran(memory, ticket, seen, end, sink, out);
+            }
+        }
+    }
+
+    /// The dispatch of `ticket`, its ref at `at`, held as a continue is, its
+    /// admission weighing `outside`, the work outside Owlshift this pass
+    /// read (OWL-401).
+    #[allow(clippy::too_many_arguments)]
     fn dispatch(
         &self,
         memory: &mut WatchMemory,
         ticket: &TicketId,
         at: RefAt,
+        outside: Option<&Outside>,
         sink: &mut EventSink<'_>,
         out: &mut dyn Write,
         continued: &mut Continued<'_>,
@@ -596,20 +630,38 @@ impl Watch<'_> {
             return;
         }
         let envelope = self.envelope(memory, ticket, StepKind::Dispatch, &seen);
-        match self.step(memory, sink, out, continued, envelope, None) {
+        let then = Then::Dispatch { seen };
+        self.step(memory, sink, out, continued, envelope, None, outside, then);
+    }
+
+    /// What a dispatch that ended `end` left: the open pull requests' cap
+    /// its admission found, told; a gesture that does not admit, told; any
+    /// other end held as a continue is. One its admission held back for the
+    /// project's capacity or a collision ended stale: the next pass reads
+    /// the refs again and tells why it waits.
+    pub(super) fn dispatched(
+        &self,
+        memory: &mut WatchMemory,
+        ticket: &TicketId,
+        seen: Seen,
+        end: &StepEnd,
+        sink: &mut EventSink<'_>,
+        out: &mut dyn Write,
+    ) {
+        match end {
             StepEnd::Stale => {}
             // A pull request delivered since the snapshot (OWL-313): nothing
             // ran, so nothing is held; the next pass counts again.
             StepEnd::Capped {
                 open_prs,
                 max_open_prs,
-            } => self.tell_cap(memory, ticket, open_prs, max_open_prs, sink, out),
+            } => self.tell_cap(memory, ticket, *open_prs, *max_open_prs, sink, out),
             StepEnd::NotAdmitted { account, reason } => {
-                self.not_admitted(memory, ticket, account, &reason, sink, out);
+                self.not_admitted(memory, ticket, account.clone(), reason, sink, out);
             }
             end => {
                 memory.drain.warned.remove(ticket);
-                self.ran(memory, ticket, seen, &end, sink, out);
+                self.ran(memory, ticket, seen, end, sink, out);
             }
         }
     }

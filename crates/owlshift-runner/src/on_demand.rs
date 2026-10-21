@@ -100,7 +100,7 @@ use owlshift_contracts::result::{
 };
 use owlshift_contracts::review::{KeptBuild, KeptFinding, TicketPlan, TicketReview};
 use owlshift_contracts::{BasisKind, DelegationLevel, Role, Stage, Variant};
-use owlshift_core::collision::{Collision, InFlight, collision};
+use owlshift_core::collision::{self, Collision, InFlight, collision};
 use owlshift_core::decider::{self, Decider, NoDecider, ZoneOwners, brief_zones, ticket_zones};
 use owlshift_core::gate::{BudgetReached, Chain, ChainCost, GatePolicy, TicketSpend};
 use owlshift_core::pipeline::Pipeline;
@@ -108,6 +108,7 @@ use owlshift_core::resource::{self, Held, NamedResources, Resource};
 use owlshift_core::routing::{
     PROJECT_DEFAULT, RunRouting, TicketRouting, resolver_routing, role_routing, ticket_routing,
 };
+use owlshift_core::schedule::{self, Caps, Load, Turn, Wait, holds_slot_or_unknown};
 use owlshift_core::state::{Event, MAX_REASKS, ParkReason, Status, TicketState, Transition};
 
 use crate::agent_env::AgentEnv;
@@ -120,7 +121,7 @@ use crate::executor::{
 use crate::fix;
 use crate::follow::{self, Following, Look, Seen};
 use crate::held;
-use crate::in_flight;
+use crate::in_flight::{self, Kind, Outside};
 use crate::project::{self, Base, ProjectDirs, ProjectLock, TicketLock};
 use crate::proposals::{self, Filing};
 use crate::quarantine;
@@ -602,6 +603,16 @@ pub enum Stop {
     TicketBusy(TicketId),
     /// Nothing ran, or nothing more could: the reason and its fix.
     Refused(String),
+    /// The admission holds the ticket back (OWL-401; architecture section
+    /// 5, "Admission, one transaction"): the project's capacity, the open
+    /// pull requests' cap or what another holds, `said` as `owlshift why`
+    /// says it; `cap` the open pull requests and their cap when they are
+    /// the reason. Nothing ran from the admission on.
+    Waits {
+        ticket: TicketId,
+        said: String,
+        cap: Option<(u32, u32)>,
+    },
     /// A previous run's isolation check did not pass, or never ran.
     Unverified { marker: PathBuf, text: String },
     /// The run asked questions, or found the ticket's premise false. `posted`
@@ -718,6 +729,10 @@ impl fmt::Display for Stop {
                  it ends."
             ),
             Self::Refused(reason) => write!(f, "Not run: {reason}"),
+            Self::Waits { ticket, said, .. } => write!(
+                f,
+                "Not run: {ticket} waits: {said}. `owlshift why {ticket}` says why it waits."
+            ),
             Self::NotKept { message, .. } => write!(f, "Not run: {message}"),
             Self::Unverified { marker, text } => write!(
                 f,
@@ -1135,11 +1150,13 @@ fn empty_gate(at: &Base, base: &Base, file: ProjectFile) -> String {
     text
 }
 
-/// What a command holds once the project is its own and the ticket read.
+/// What a command holds once its ticket is its own and read. Since OWL-401
+/// it holds the ticket's lock for its whole length and the project's only
+/// for short sections ([`OnDemand::section`]; architecture section 5,
+/// "Locks").
 struct Prepared {
-    _lock: ProjectLock,
-    /// The ticket's own lock (OWL-409), taken before the project's and,
-    /// declared after it, let go after it.
+    /// The ticket's own lock (OWL-409), taken before the project's in each
+    /// of the command's sections.
     _ticket_lock: TicketLock,
     ticket: TicketId,
     found: Ticket,
@@ -1278,6 +1295,33 @@ struct Dispatched {
     routing: TicketRouting,
     /// The routing of the build role's runs on this ticket.
     build: RunRouting,
+}
+
+/// The forge's part of a dispatch ([`OnDemand::dispatch_open`]).
+struct Opened {
+    head: Branch,
+    base_branch: Branch,
+    /// The number of the branch's open pull request, if any.
+    open: Option<u64>,
+}
+
+/// The rules' part of a dispatch ([`OnDemand::dispatch_rules`]).
+struct Configured {
+    at: Base,
+    rules: ProjectRules,
+    project_file: ProjectFile,
+}
+
+/// What the project's ticket refs, read again in one of its sections, and
+/// the work outside Owlshift hold against a ticket's admission (OWL-401).
+struct Locked {
+    load: Load<String>,
+    /// The other tickets whose ref holds the slot, each with when it was
+    /// dispatched; the refs that cannot be read, which may hold it.
+    holding: Vec<(String, collision::Dispatched)>,
+    unread: Vec<String>,
+    /// How the outside holders are named.
+    kinds: HashMap<String, Kind>,
 }
 
 /// A ticket's routing as read now, and what it was read from: its labels
@@ -1436,7 +1480,7 @@ impl OnDemand<'_> {
     pub fn run(&self, ticket: &TicketId, sink: &mut EventSink<'_>) -> Result<Delivered, Stop> {
         let mut p = self.prepare(ticket, Command::Do)?;
         self.drop_carry(ticket, sink);
-        self.run_prepared(&mut p, Command::Do, sink)
+        self.run_prepared(&mut p, Command::Do, None, sink)
     }
 
     /// The stop of a stage step of watch's whose ticket is now in `state`
@@ -1493,12 +1537,18 @@ impl OnDemand<'_> {
         }
     }
 
-    /// [`Self::run`] once `command`, `do` or the drain's dispatch, holds the
-    /// project.
+    /// [`Self::run`] once `command`, `do` or the drain's dispatch, holds its
+    /// ticket. Its admission (OWL-401; architecture section 5, "Admission,
+    /// one transaction") weighs `outside`, the work outside Owlshift the
+    /// drain's pass read, or a read made now for `do`; then, in one of the
+    /// project's sections, the branch starts from the base, the rules are
+    /// read at the configuring commit and [`Self::admit`] checks and writes
+    /// the ticket ref. The `dispatch` event follows the admission.
     fn run_prepared(
         &self,
         p: &mut Prepared,
         command: Command,
+        outside: Option<Outside>,
         sink: &mut EventSink<'_>,
     ) -> Result<Delivered, Stop> {
         let ticket = &p.ticket.clone();
@@ -1546,15 +1596,203 @@ impl OnDemand<'_> {
             review.build = None;
             review.last_fix = None;
         }
+        // The forge and the tracker before the project's section (OWL-401):
+        // the work outside Owlshift the admission weighs, and the forge's
+        // check of the branch's pull request.
+        let outside = match outside {
+            Some(outside) => outside,
+            None => self.outside_now(ticket)?,
+        };
+        let opened = self.dispatch_open(p)?;
+        let section = self.section()?;
         // The branch starts from the base this command fetched (OWL-274):
         // one an earlier run, such as the ticket's intake, made at an older
         // base is fast-forwarded when it has no commits of its own. Before
         // the dispatch, so a refused fast-forward dispatches nothing.
         self.start_from_base(p)?;
-        let dispatched = self.dispatch(p, command, sink)?;
-        p.held = Some(self.held_at_dispatch(p, &dispatched.rules));
+        let configured = self.dispatch_rules(p, command, sink)?;
+        let held = self.held_at_dispatch(p, &configured.rules);
+        self.admit(p, &state, held, &outside)?;
+        drop(section);
+        let dispatched = self.dispatched(p, command, opened, configured, sink);
         self.show_after(ticket, None, Event::Dispatched, sink);
         self.drive(p, command, dispatched, state, sink)
+    }
+
+    /// The work in flight outside Owlshift, read now for `ticket`'s
+    /// admission (OWL-401): a read that fails holds it back, since what
+    /// cannot be read is never taken as free (OWL-410).
+    fn outside_now(&self, ticket: &TicketId) -> Result<Outside, Stop> {
+        in_flight::read(
+            self.forge,
+            self.tracker,
+            self.config,
+            &mut in_flight::PullCache::default(),
+        )
+        .map_err(|reason| Stop::Waits {
+            ticket: ticket.clone(),
+            said: format!("the work in flight outside Owlshift could not be read ({reason})"),
+            cap: None,
+        })
+    }
+
+    /// What the project's other ticket refs, read again in the project's
+    /// section the caller holds, and `outside` hold against `p`'s ticket
+    /// (OWL-401): the refs that hold the slot, an unreadable one among them;
+    /// the open pull requests Owlshift follows, the ticket's own included;
+    /// and what each ticket holds from its dispatch until its pull request
+    /// ends, an unreadable ref the whole repository, with the outside
+    /// holders joined, all closed with `named`.
+    fn locked_load(
+        &self,
+        p: &Prepared,
+        outside: &Outside,
+        named: &NamedResources,
+    ) -> Result<Locked, Stop> {
+        let others = ticket_ref::others(&self.executor.git, &p.checkout, &p.ticket)
+            .map_err(|e| refused("reading the project's ticket refs for the admission", e))?;
+        let mut locked = Locked {
+            load: Load {
+                open_prs: u32::from(p.stored.as_ref().is_some_and(delivery_followed)),
+                ..Load::default()
+            },
+            holding: Vec::new(),
+            unread: Vec::new(),
+            kinds: HashMap::new(),
+        };
+        for (ticket, read) in &others {
+            let id = ticket.as_str().to_owned();
+            match read {
+                Ok(stored) => {
+                    let state = TicketState::try_from(&stored.record.state).ok();
+                    if holds_slot_or_unknown(state.as_ref()) {
+                        locked.load.slot_held_by.push(id.clone());
+                        locked.holding.push((id, held::dispatched(stored)));
+                    }
+                    if delivery_followed(stored) {
+                        locked.load.open_prs = locked.load.open_prs.saturating_add(1);
+                    }
+                    if held::holds(stored) {
+                        locked
+                            .load
+                            .in_flight
+                            .push(held::in_flight(ticket, stored, named));
+                    }
+                }
+                Err(_) => {
+                    locked.load.slot_held_by.push(id.clone());
+                    locked.unread.push(id);
+                    locked.load.in_flight.push(held::unread(ticket, named));
+                }
+            }
+        }
+        let refs = others
+            .iter()
+            .map(|(ticket, read)| (ticket, read.as_ref().ok()))
+            .chain([(&p.ticket, None)]);
+        let holders = outside.holders(refs, named);
+        holders.join(&mut locked.load.in_flight, named);
+        locked.kinds = holders.kinds;
+        Ok(locked)
+    }
+
+    /// The project's caps for an admission (OWL-401): its open pull
+    /// requests' cap and its capacity; this machine's runs are the drain's
+    /// to count, a step holding its run slot already and a person's command
+    /// taking none.
+    fn admission_caps(&self) -> Caps {
+        Caps {
+            concurrent_runs: u32::MAX,
+            open_prs: Some(u32::from(self.config.policy.max_open_prs())),
+            max_in_flight: u32::from(self.config.policy.max_in_flight()),
+        }
+    }
+
+    /// `ticket` held back by `wait`, as the command's stop.
+    fn waits(&self, ticket: &TicketId, wait: &Wait<String>, locked: &Locked) -> Stop {
+        let exclude = self.config.tracker.exclude.as_deref();
+        let cap = (*wait == Wait::PrCap).then(|| {
+            (
+                locked.load.open_prs,
+                u32::from(self.config.policy.max_open_prs()),
+            )
+        });
+        let said = match (wait, cap) {
+            (Wait::PrCap, Some((open, max))) => {
+                format!("the open pull requests reached their cap ({open} of {max})")
+            }
+            _ => in_flight::said(wait, exclude, &locked.kinds),
+        };
+        Stop::Waits {
+            ticket: ticket.clone(),
+            said,
+            cap,
+        }
+    }
+
+    /// The admission of `p`'s dispatch from Ready (OWL-401; architecture
+    /// section 5, "Admission, one transaction"), in the project's section
+    /// its command holds: the project's other ticket refs read again
+    /// ([`Self::locked_load`]), the open pull requests' cap, the project's
+    /// capacity and the collision rule checked against them and `outside`
+    /// ([`schedule::admission`]), with the named resources of the operator's
+    /// project file, as the drain's pass weighs them; then the ticket ref
+    /// written at `state`, the first stage of its variant, holding `held`
+    /// from its dispatch, through its run file. [`Stop::Waits`] when it must
+    /// wait, nothing written.
+    fn admit(
+        &self,
+        p: &mut Prepared,
+        state: &TicketState,
+        held: TicketHeld,
+        outside: &Outside,
+    ) -> Result<(), Stop> {
+        let named = self.config.stack.named_resources().unwrap_or_default();
+        let locked = self.locked_load(p, outside, &named)?;
+        let own = held::of(&p.ticket, Some(&held), false, &named);
+        if let Some(wait) = schedule::admission(&own, self.admission_caps(), &locked.load) {
+            return Err(self.waits(&p.ticket, &wait, &locked));
+        }
+        p.held = Some(held);
+        let questions = p.questions();
+        self.store(p, state, questions)
+            .map_err(|e| refused("keeping the dispatch in the ticket's ref", e))
+    }
+
+    /// A person's `continue` makes the drain's check before a stage of its
+    /// ticket runs (OWL-401; architecture section 5, "Admission, one
+    /// transaction"): the work outside Owlshift read now, then, in one of
+    /// the project's sections, the ticket among the first holders of the
+    /// project's capacity by dispatch time ([`schedule::slot_turn`]) and
+    /// nothing held conflicting with what it holds ([`collision`]), as watch
+    /// checks its next stage step. [`Stop::Waits`] otherwise, nothing run.
+    /// A review loop's ticket, whose pull request is open, needs neither.
+    fn admit_stage(&self, p: &Prepared) -> Result<(), Stop> {
+        if in_review_loop(p) {
+            return Ok(());
+        }
+        let outside = self.outside_now(&p.ticket)?;
+        let named = self.config.stack.named_resources().unwrap_or_default();
+        let _section = self.section()?;
+        let locked = self.locked_load(p, &outside, &named)?;
+        let own = held::of(
+            &p.ticket,
+            p.held.as_ref(),
+            p.stored.as_ref().is_some_and(delivery_followed),
+            &named,
+        );
+        let mut holding = locked.holding.clone();
+        holding.push((own.id.clone(), own.dispatched));
+        let capacity = u32::from(self.config.policy.max_in_flight());
+        let wait = match schedule::slot_turn(&holding, &locked.unread, capacity) {
+            Turn::Holders(holders) if !holders.contains(&own.id) => Some(Wait::Slot(holders)),
+            Turn::Unknown(unread) => Some(Wait::Slot(unread)),
+            Turn::Holders(_) => collision(&own, &locked.load.in_flight).map(Wait::Collision),
+        };
+        match wait {
+            Some(wait) => Err(self.waits(&p.ticket, &wait, &locked)),
+            None => Ok(()),
+        }
     }
 
     /// What the ticket holds from this dispatch (OWL-403; architecture
@@ -1802,6 +2040,11 @@ impl OnDemand<'_> {
                 stage_name(state.stage())
             )));
         }
+        // A person's `continue` makes the drain's check before the stage runs
+        // (OWL-401): watch checked its own steps from its pass's reads.
+        if !p.stepping {
+            self.admit_stage(&p)?;
+        }
         // A stage's run may ask a new round, which goes to the decider now.
         p.current()?;
         // Watch's step into Build is the dispatch to Build (OWL-367): the
@@ -1820,9 +2063,25 @@ impl OnDemand<'_> {
         self.drive(&mut p, Command::Continue, dispatched, state, sink)
     }
 
-    /// Everything before a run: the lock, the marker, the confinement, the
-    /// ticket and its decider, the dedicated checkout, the kept worktree's
-    /// link, and the ticket ref.
+    /// The project's lock for one of a command's short sections (OWL-401;
+    /// architecture section 5, "Locks"), waited for within its bound
+    /// ([`ProjectDirs::lock`]), the ticket's own lock held already: busy
+    /// once the bound is spent. A section never takes another: a function
+    /// that runs inside one is given its lock.
+    fn section(&self) -> Result<ProjectLock, Stop> {
+        match self.dirs.lock() {
+            Ok(Some(lock)) => Ok(lock),
+            Ok(None) => Err(Stop::Busy(self.dirs.root().to_owned())),
+            Err(error) => Err(refused("the project's lock", error)),
+        }
+    }
+
+    /// Everything before a run: the ticket's lock, the marker, the
+    /// confinement, the ticket and its decider, the dedicated checkout, the
+    /// kept worktree's link, and the ticket ref. Since OWL-401 the project's
+    /// lock is held for two short sections only: the look at the quarantine,
+    /// then the fetch with the reads that follow it, the ticket read on the
+    /// tracker between them.
     fn prepare(&self, ticket: &TicketId, command: Command) -> Result<Prepared, Stop> {
         check_team(self.config, ticket).map_err(Stop::Refused)?;
         // An old git is refused before any side effect: the lock creates the
@@ -1843,11 +2102,7 @@ impl OnDemand<'_> {
         // is ours, an obligation whose ticket's lock is free, or this
         // ticket's own, belongs to a run that ended, or was cut off, before
         // its check passed, and becomes the quarantine (OWL-400).
-        let lock = match self.dirs.lock() {
-            Ok(Some(lock)) => lock,
-            Ok(None) => return Err(Stop::Busy(self.dirs.root().to_owned())),
-            Err(error) => return Err(refused("the project's lock", error)),
-        };
+        let section = self.section()?;
         match ticket_run::look(self.dirs, Some(ticket)) {
             Ok(ticket_run::Look::Clear { .. }) => {}
             Ok(ticket_run::Look::Quarantined { path, text }) => {
@@ -1855,6 +2110,7 @@ impl OnDemand<'_> {
             }
             Err(error) => return Err(refused("the project's quarantine", error)),
         }
+        drop(section);
         // What the executor would refuse at the spawn is refused before
         // anything is cloned or read: a machine where agents cannot be
         // confined, or a harness with no login made for agent runs (OWL-41);
@@ -1925,6 +2181,9 @@ impl OnDemand<'_> {
             .tracker
             .ticket(ticket)
             .map_err(|e| refused(&format!("reading {ticket}"), e))?;
+        // The fetch, the ticket ref, the kept worktree's link and the run
+        // file in the project's second section, let go when this returns.
+        let _section = self.section()?;
         // `do` needs a decider: refused before anything is cloned when the
         // ticket alone says it has none and no ticket ref can add the zones
         // of an intake record: an intake run counts none, and without a
@@ -1997,7 +2256,6 @@ impl OnDemand<'_> {
         }
         let labels = route_labels(found.labels.iter().map(String::as_str));
         Ok(Prepared {
-            _lock: lock,
             _ticket_lock: ticket_lock,
             ticket: ticket.clone(),
             found,
@@ -2166,17 +2424,65 @@ impl OnDemand<'_> {
         command: Command,
         sink: &mut EventSink<'_>,
     ) -> Result<Dispatched, Stop> {
+        let opened = self.dispatch_open(p)?;
+        let configured = self.dispatch_rules(p, command, sink)?;
+        Ok(self.dispatched(p, command, opened, configured, sink))
+    }
+
+    /// The forge's part of [`Self::dispatch`]: the pull request of the
+    /// ticket's branch, if one is open. A call to the forge, so made before
+    /// any of the project's sections (OWL-401).
+    fn dispatch_open(&self, p: &Prepared) -> Result<Opened, Stop> {
         let head = Branch::new(&p.branch).map_err(|e| refused("the ticket's branch", e))?;
         let base_branch = Branch::new(&p.base.branch).map_err(|e| refused("the base branch", e))?;
         let open = self
             .forge
             .find_open_pull_request(&head, &base_branch)
-            .map_err(|e| refused(&format!("GitHub ({})", self.forge.repo()), e))?;
+            .map_err(|e| refused(&format!("GitHub ({})", self.forge.repo()), e))?
+            .map(|pr| pr.number);
+        Ok(Opened {
+            head,
+            base_branch,
+            open,
+        })
+    }
+
+    /// The rules' part of [`Self::dispatch`]: the configuring commit and the
+    /// project's rules and gate there, an empty gate refused. Reads of the
+    /// dedicated checkout alone.
+    fn dispatch_rules(
+        &self,
+        p: &Prepared,
+        command: Command,
+        sink: &mut EventSink<'_>,
+    ) -> Result<Configured, Stop> {
         let at = self.configuring_base(p, command)?;
         let (rules, project_file) = self.rules_at(p, &at, command.briefed_roles(), sink)?;
         if command.refuses_empty_gate() && rules.gate().is_empty() {
             return Err(Stop::Refused(empty_gate(&at, &p.base, project_file)));
         }
+        Ok(Configured {
+            at,
+            rules,
+            project_file,
+        })
+    }
+
+    /// The end of [`Self::dispatch`]: its `dispatch` event, once nothing
+    /// holds it back, then its routing.
+    fn dispatched(
+        &self,
+        p: &Prepared,
+        command: Command,
+        opened: Opened,
+        configured: Configured,
+        sink: &mut EventSink<'_>,
+    ) -> Dispatched {
+        let Configured {
+            at,
+            rules,
+            project_file,
+        } = configured;
         sink.emit(
             &p.ticket,
             None,
@@ -2189,20 +2495,20 @@ impl OnDemand<'_> {
                 ("base_commit", json!(p.base.commit)),
                 ("worktree", path(&p.worktree)),
                 ("checkout", path(&p.checkout)),
-                ("pull_request", json!(open.map(|pr| pr.number))),
+                ("pull_request", json!(opened.open)),
                 ("rules", json!(rules.sources())),
                 ("configured_at", json!(at.commit)),
                 ("project_file", json!(project_file.as_str())),
             ]),
         );
         let (routing, build) = self.route(p, command, sink);
-        Ok(Dispatched {
-            head,
-            base_branch,
+        Dispatched {
+            head: opened.head,
+            base_branch: opened.base_branch,
             rules,
             routing,
             build,
-        })
+        }
     }
 
     /// The commit a run of `command` takes its project file and rules at
@@ -2736,8 +3042,9 @@ impl OnDemand<'_> {
         p: &Prepared,
         rules: &ProjectRules,
     ) -> Result<Option<Vec<(&'static str, Value)>>, Stop> {
-        let others = ticket_ref::others(&self.executor.git, &p.checkout, &p.ticket)
-            .map_err(|e| refused("reading the project's ticket refs before the delivery", e))?;
+        // The forge and the tracker first, then the ticket refs and the
+        // check in one of the project's sections (OWL-401): never a call to
+        // either under the lock.
         let read = in_flight::read(
             self.forge,
             self.tracker,
@@ -2753,6 +3060,9 @@ impl OnDemand<'_> {
                 ]));
             }
         };
+        let _section = self.section()?;
+        let others = ticket_ref::others(&self.executor.git, &p.checkout, &p.ticket)
+            .map_err(|e| refused("reading the project's ticket refs before the delivery", e))?;
         let none = NamedResources::default();
         let named = rules.resources().unwrap_or(&none);
         let refs = others
@@ -4616,6 +4926,17 @@ impl OnDemand<'_> {
             session: plan.as_ref().map(|(plan, _)| plan),
             siblings: Some(&siblings),
         };
+        // A worktree is made in one of the project's sections (OWL-401), so
+        // that no `worktree prune` runs while it is, and once the run's
+        // obligation stands, so that it is the run's own making; the run then
+        // finds it kept. One that cannot be made, or a section that cannot
+        // be had, is left to the run: the obligation standing keeps any
+        // later prune away.
+        if fs::symlink_metadata(&p.worktree).is_err()
+            && let Ok(Some(_section)) = self.dirs.lock()
+        {
+            let _ = executor.prepare_worktree(&p.checkout, &p.worktree, &p.branch, &p.base.commit);
+        }
         let ran = executor.run(&spec, harness);
         // Whatever the run did, its branch's head and its worktree's entry,
         // which its check verified or which the runner's own git made before
@@ -4698,13 +5019,17 @@ impl OnDemand<'_> {
                     lines.join("\n")
                 ))
                 .map_err(|e| refused("the project's quarantine", e))?;
-            // The operator learns of the quarantine now, once (OWL-368).
+            // The operator learns of the quarantine now, once (OWL-368); the
+            // record of it is kept in one of the project's sections
+            // (OWL-401), or not at all when none can be had, a watch pass
+            // then telling it once more.
             if let Outcome::Quarantined(violations) = &report.outcome {
+                let section = self.dirs.lock().ok().flatten();
                 quarantine::notify_written(
                     self.notifier,
                     self.tracker,
                     self.dirs,
-                    &p._lock,
+                    section.as_ref(),
                     &marker,
                     ticket,
                     &run,
@@ -4937,6 +5262,7 @@ impl OnDemand<'_> {
                 Stop::Busy(_)
                 | Stop::TicketBusy(_)
                 | Stop::Refused(_)
+                | Stop::Waits { .. }
                 | Stop::Unverified { .. }
                 | Stop::Waiting { .. }
                 | Stop::Settling { .. }
@@ -5861,7 +6187,9 @@ impl OnDemand<'_> {
             .map(|out| String::from_utf8_lossy(&out).trim().to_owned())
             .filter(|head| !head.is_empty());
         let Some(head) = head else {
-            // A move of the ticket's branch outside a run (OWL-400).
+            // A move of the ticket's branch outside a run (OWL-400), the
+            // branch made in one of the project's sections (OWL-401).
+            let _section = self.section()?;
             ticket_run::move_branch(
                 git,
                 self.dirs,
@@ -6295,6 +6623,9 @@ impl OnDemand<'_> {
     /// checkout forgets it and moves the ticket's branch to `pushed`; the
     /// executor adds the worktree again on that branch.
     fn reset_worktree(&self, p: &Prepared, pushed: &CommitId) -> Result<(), Stop> {
+        // A worktree's removal is one of the project's sections (OWL-401),
+        // so no worktree is made meanwhile.
+        let _section = self.section()?;
         // `worktree prune` removes entries a run in flight's check reads: it
         // waits for no obligation to stand, the ticket tried again later,
         // before anything is removed (OWL-400).

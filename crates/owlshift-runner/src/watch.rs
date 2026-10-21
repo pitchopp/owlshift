@@ -141,6 +141,9 @@ use crate::writer::VisibleStage;
 mod drain;
 mod limits;
 mod outside;
+mod running;
+
+use running::{RunningStep, Then};
 
 pub use drain::refusal as drain_refusal;
 
@@ -446,6 +449,9 @@ struct Memory<'c> {
     /// started since: its steps' attempt ids.
     started_ms: i64,
     attempts: u64,
+    /// The steps whose children run (OWL-401): their tickets are left alone
+    /// until each ends.
+    running: Vec<RunningStep>,
     /// The holds a predecessor's records call for, applied once this pass
     /// has dropped those of the tickets it no longer lists.
     adopted: Vec<(TicketId, Seen, StepHold)>,
@@ -622,13 +628,17 @@ impl Watch<'_> {
                 self.drain(&mut memory, sink, out, continued);
             }
             // The interval is only between idle passes (OWL-367): after a
-            // step, the next stage step is due at once.
+            // step, the next stage step is due at once. While steps'
+            // children run, the wait ends with the first that ends
+            // (OWL-401).
             let interval = if memory.stepped {
                 Duration::ZERO
             } else {
                 self.interval
             };
+            let interval = self.wait_for_children(&mut memory, sink, out, interval);
             if !sleep(interval) {
+                self.wait_for_all(&mut memory, sink, out);
                 return;
             }
         }
@@ -641,6 +651,9 @@ impl Watch<'_> {
         out: &mut dyn Write,
         continued: &mut Continued<'_>,
     ) {
+        // The steps whose children ended since, first, whatever the pass
+        // finds (OWL-401).
+        self.reap(memory, sink, out);
         // The work outside Owlshift is read again at each pass (OWL-410).
         memory.outside.new_pass();
         let read = match self.snapshot(memory, sink) {
@@ -667,6 +680,13 @@ impl Watch<'_> {
         // outside Owlshift (OWL-410).
         let outside = self.step_holders(memory, sink, out, &read);
         memory.collisions = self.collisions(&read, outside.as_ref());
+        // The tickets whose step's child runs (OWL-401): each counts in the
+        // slot's turn as its ref says, and is left alone until it ends.
+        let busy: Vec<TicketId> = memory
+            .running
+            .iter()
+            .map(|running| running.ticket().clone())
+            .collect();
         for (ticket, stored) in read {
             let state = stored.and_then(|stored| {
                 TicketState::try_from(&stored.record.state)
@@ -677,6 +697,9 @@ impl Watch<'_> {
                 && schedule::holds_slot(state)
             {
                 holding.push((ticket.clone(), held::dispatched(stored)));
+            }
+            if busy.contains(&ticket) {
+                continue;
             }
             match state {
                 // A ticket parked at Watch is read for an end alone (OWL-243),
@@ -744,12 +767,14 @@ impl Watch<'_> {
         // not kept (OWL-211), would run again at the next pass.
         // The drain's intakes and dispatches are held there too (OWL-250),
         // and the resumes of tickets left at Intake (OWL-273).
+        // A ticket whose step's child runs keeps its hold (OWL-401).
         memory.holds.retain(
             &[
                 &ids[..],
                 &followed[..],
                 &left[..],
                 &unread[..],
+                &busy[..],
                 &memory.drain.listed[..],
             ]
             .concat(),
@@ -759,15 +784,15 @@ impl Watch<'_> {
         for (ticket, seen, hold) in std::mem::take(&mut memory.adopted) {
             memory.holds.restore(&ticket, seen, &hold);
         }
-        memory
-            .elsewhere
-            .retain(|ticket, _| left.contains(ticket) || unread.contains(ticket));
+        memory.elsewhere.retain(|ticket, _| {
+            left.contains(ticket) || unread.contains(ticket) || busy.contains(ticket)
+        });
         memory
             .following
-            .retain(&[&followed[..], &read[..], &unread[..]].concat());
+            .retain(&[&followed[..], &read[..], &unread[..], &busy[..]].concat());
         memory
             .stale
-            .retain(&[&followed[..], &read[..], &unread[..]].concat());
+            .retain(&[&followed[..], &read[..], &unread[..], &busy[..]].concat());
         // The slot's turn for this pass's stage steps (OWL-367), the first
         // holders by dispatch time up to the project's capacity (OWL-401),
         // among those no collision holds back (OWL-403): one that waits for
@@ -792,6 +817,31 @@ impl Watch<'_> {
                 followed,
             },
         );
+        // The steps of tickets already dispatched, by dispatch time
+        // (OWL-401; architecture section 5, "Order"): repairs at Watch, then
+        // answer checks, then resumes. Finishing comes before starting: the
+        // drain's intake and dispatches come after them.
+        let first = |a: &TicketId, at: &Stored, b: &TicketId, bt: &Stored| {
+            held::dispatched(at)
+                .cmp(&held::dispatched(bt))
+                .then_with(|| schedule::natural_cmp(a.as_str(), b.as_str()))
+        };
+        following.sort_by(|(a, at), (b, bt)| first(a, at, b, bt));
+        waiting.sort_by(|(a, at, ..), (b, bt, ..)| first(a, at, b, bt));
+        resumable.sort_by(|(a, at, ..), (b, bt, ..)| first(a, at, b, bt));
+        for (ticket, stored) in following {
+            // A repair this pass decides moves the stage to working again
+            // once it starts, and back once it ends.
+            self.unstick(
+                memory,
+                sink,
+                out,
+                &ticket,
+                &stored,
+                Status::Active(Stage::Watch),
+            );
+            self.follow(memory, sink, out, continued, &ticket, &stored);
+        }
         for (ticket, stored, status, outlived, resume) in waiting {
             // A stage a stop left at working first (OWL-265): an end then
             // moves the stage it shows to review, which it would not do
@@ -823,19 +873,6 @@ impl Watch<'_> {
         }
         for (ticket, stored, shown, stage) in resumable {
             self.resume_stage(memory, sink, out, continued, &ticket, &stored, shown, stage);
-        }
-        for (ticket, stored) in following {
-            // A repair this pass decides moves the stage to working again
-            // once it starts, and back once it ends.
-            self.unstick(
-                memory,
-                sink,
-                out,
-                &ticket,
-                &stored,
-                Status::Active(Stage::Watch),
-            );
-            self.follow(memory, sink, out, continued, &ticket, &stored);
         }
     }
 
@@ -1100,9 +1137,25 @@ impl Watch<'_> {
             return false;
         }
         let envelope = self.envelope(memory, ticket, kind, &held);
-        let end = self.step(memory, sink, out, continued, envelope, reviews);
-        if end == StepEnd::Stale {
-            return false;
+        let then = Then::Held { seen: held };
+        self.step(memory, sink, out, continued, envelope, reviews, None, then)
+            .is_none_or(|end| end != StepEnd::Stale)
+    }
+
+    /// What a step of [`Self::held_run`] that ended `end` left (since
+    /// OWL-401 applied once its child ends): held as a continue is, from the
+    /// ticket ref read after it.
+    fn held_after(
+        &self,
+        memory: &mut Memory,
+        sink: &mut EventSink<'_>,
+        out: &mut dyn Write,
+        ticket: &TicketId,
+        held: Seen,
+        end: &StepEnd,
+    ) {
+        if *end == StepEnd::Stale {
+            return;
         }
         // A review loop's ref at Build holds the slot from its start, run or
         // refused after it (OWL-367).
@@ -1115,11 +1168,10 @@ impl Watch<'_> {
             out,
             ticket,
             held,
-            &end,
+            end,
             progress.as_ref(),
             holds_now,
         );
-        true
     }
 
     /// The envelope of a step of `kind` of `ticket` from `seen`, what watch
@@ -1151,69 +1203,15 @@ impl Watch<'_> {
         }
     }
 
-    /// Carries out `envelope`'s step (OWL-399): in watch's own process,
-    /// with its memory of the pull requests it follows and `reviews`, the
-    /// outcome told to `continued` as a continue's; or in a child, whose
-    /// record gives back that memory, the child having reported the outcome
-    /// itself. A child that leaves no record, or one that does not read, is
-    /// a `step_unreported` warning, and the step is held as a refusal is.
-    /// Returns how the step ended.
-    fn step(
-        &self,
-        memory: &mut Memory,
-        sink: &mut EventSink<'_>,
-        out: &mut dyn Write,
-        continued: &mut Continued<'_>,
-        envelope: StepEnvelope,
-        reviews: Option<ReviewsRead>,
-    ) -> StepEnd {
-        let on_demand = self.on_demand;
-        let ticket = envelope.ticket.clone();
-        let Some(children) = memory.children else {
-            let stepped = step::run(on_demand, &envelope, &mut memory.following, reviews, sink);
-            if let step::Stepped::Ran(outcome) = &stepped
-                && step::reported(&envelope.step, outcome)
-            {
-                continued(&ticket, outcome, sink);
-            }
-            return step::end(&stepped);
-        };
-        // Every run slot of the machine taken (OWL-409): no child is
-        // started, and a later pass tries again. A count that cannot be
-        // read leaves it to the child, whose own take decides.
-        if children
-            .slots()
-            .is_some_and(|slots| slots.full().unwrap_or(false))
-        {
-            return StepEnd::NoSlot;
-        }
-        match children.run(on_demand.dirs, &envelope, out) {
-            Ok(record) => {
-                memory.following.keep(&ticket, record.kept);
-                record.end
-            }
-            Err(reason) => {
-                sink.emit(
-                    &ticket,
-                    None,
-                    EventKind::Warning,
-                    data([
-                        ("what", json!("step_unreported")),
-                        ("attempt", json!(envelope.attempt)),
-                        ("reason", json!(reason)),
-                    ]),
-                );
-                StepEnd::Other
-            }
-        }
-    }
-
     /// Reads the outcome records a predecessor left (OWL-399) and keeps the
     /// hold each calls for while its ticket's ref is where the record says,
     /// for the first pass to apply; every record is removed. One that does
     /// not read is a `step_unreported` warning of the project.
     fn adopt_leftovers(&self, memory: &mut Memory, sink: &mut EventSink<'_>) {
         let on_demand = self.on_demand;
+        // What a predecessor handed its dispatches and they never took
+        // (OWL-401).
+        step::remove_outside_leftovers(on_demand.dirs);
         for path in step::leftovers(on_demand.dirs) {
             let record = match step::take_outcome(&path) {
                 Ok(Some(record)) => record,
@@ -1874,8 +1872,25 @@ impl Watch<'_> {
             slot_held_by: held_by,
         };
         let envelope = self.envelope(memory, ticket, kind, &seen);
-        let end = self.step(memory, sink, out, continued, envelope, None);
-        if end == StepEnd::Stale {
+        let then = Then::Answer { seen, now };
+        self.step(memory, sink, out, continued, envelope, None, None, then);
+    }
+
+    /// What an answer check that ended `end` left (OWL-367; since OWL-401
+    /// applied once its child ends): held as a continue is, from the ticket
+    /// ref read after it, and told.
+    #[allow(clippy::too_many_arguments)]
+    fn answered(
+        &self,
+        memory: &mut Memory,
+        sink: &mut EventSink<'_>,
+        out: &mut dyn Write,
+        ticket: &TicketId,
+        seen: Seen,
+        now: Timestamp,
+        end: &StepEnd,
+    ) {
+        if *end == StepEnd::Stale {
             // The ticket ref moved since the snapshot: the next pass reads it.
             return;
         }
@@ -1895,12 +1910,12 @@ impl Watch<'_> {
             out,
             ticket,
             seen,
-            &end,
+            end,
             progress.as_ref(),
             holds_now,
         ) {
             // The usage limit's own line says it (OWL-404).
-            Some(Admit::Held { .. }) if usage_held(&end, now) => {}
+            Some(Admit::Held { .. }) if usage_held(end, now) => {}
             Some(Admit::Held {
                 until: Until::At(until),
             }) => self.line(
@@ -2032,8 +2047,24 @@ impl Watch<'_> {
             stage,
         };
         let envelope = self.envelope(memory, ticket, kind, &seen);
-        let end = self.step(memory, sink, out, continued, envelope, None);
-        if end == StepEnd::Stale {
+        let then = Then::Resume { seen, stage, now };
+        self.step(memory, sink, out, continued, envelope, None, None, then);
+    }
+
+    /// What a resume at `stage` that ended `end` left (OWL-340, OWL-367;
+    /// since OWL-401 applied once its child ends): held as a continue is,
+    /// from the ticket ref read after it, and told.
+    #[allow(clippy::too_many_arguments)]
+    fn resumed(
+        &self,
+        memory: &mut Memory,
+        sink: &mut EventSink<'_>,
+        out: &mut dyn Write,
+        ticket: &TicketId,
+        (seen, stage, now): (Seen, Stage, Timestamp),
+        end: &StepEnd,
+    ) {
+        if *end == StepEnd::Stale {
             // The ref moved, or the ticket was moved, since the reads: the
             // next pass reads it again.
             return;
@@ -2047,12 +2078,12 @@ impl Watch<'_> {
             out,
             ticket,
             seen,
-            &end,
+            end,
             progress.as_ref(),
             holds_now,
         ) {
             // The usage limit's own line says it (OWL-404).
-            Some(Admit::Held { .. }) if usage_held(&end, now) => {}
+            Some(Admit::Held { .. }) if usage_held(end, now) => {}
             Some(Admit::Held {
                 until: Until::At(until),
             }) => self.line(out, &held_text(ticket, stage, until)),

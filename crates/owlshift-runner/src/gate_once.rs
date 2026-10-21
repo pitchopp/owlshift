@@ -228,6 +228,17 @@ impl GateOnce<'_> {
                 return Err(Stop::Refused(format!("the project's quarantine: {error}")));
             }
         }
+        // Alone (OWL-401): a step in flight holds its ticket's lock and not
+        // the project's, and this gate's check is a run's alone, so it waits
+        // for none to stand; no step starts meanwhile, every one starting
+        // with the project's lock this gate holds.
+        match ticket_run::ticket_in_flight(dirs) {
+            Ok(None) => {}
+            Ok(Some(_)) => return Err(Stop::Busy(dirs.root().to_owned())),
+            Err(error) => {
+                return Err(Stop::Refused(format!("the project's tickets: {error}")));
+            }
+        }
         executor
             .agent
             .sandbox_ready()
@@ -549,7 +560,10 @@ mod tests {
             let bench = Self {
                 origin: root.join("origin.git"),
                 work: root.join("work"),
-                dirs: ProjectDirs::new(&root.join("data"), &Repo::parse("acme/app").unwrap()),
+                // Another command holding the lock is answered within a
+                // moment rather than the minute a command waits.
+                dirs: ProjectDirs::new(&root.join("data"), &Repo::parse("acme/app").unwrap())
+                    .with_lock_wait(project::LOCK_GRACE),
                 root,
                 _root: tmp,
             };
@@ -754,6 +768,15 @@ mod tests {
             Err(Stop::Busy(_))
         ));
         drop(held);
+        // A step in flight holds its ticket's lock, not the project's
+        // (OWL-401): the gate answers busy all the same.
+        let ticket = owlshift_contracts::ids::TicketId::new("OWL-1").unwrap();
+        let step = bench.dirs.ticket_lock(&ticket).unwrap().unwrap();
+        assert!(matches!(
+            bench.gate(&executor, &[], None),
+            Err(Stop::Busy(_))
+        ));
+        drop(step);
 
         // A header git would send, set in the checkout the worktree shares.
         let header = ["config", "http.extraHeader", "AUTHORIZATION: basic eA=="];

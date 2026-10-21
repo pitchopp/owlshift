@@ -24,7 +24,7 @@
 
 mod children;
 
-pub use children::Children;
+pub use children::{Children, Running};
 
 use std::fs;
 use std::io;
@@ -40,11 +40,12 @@ use owlshift_contracts::format::Format;
 use owlshift_contracts::ids::TicketId;
 use owlshift_contracts::step::{
     KeptChain, LandedKind, RefAfter, Shown, StepEnd, StepEnvelope, StepHold, StepKind, StepOutcome,
-    TicketCarry,
+    StepOutside, TicketCarry,
 };
 
 use crate::events::{Data, EventSink, data};
 use crate::follow::Following;
+use crate::in_flight::Outside;
 use crate::on_demand::{self, Carried, Delivered, DispatchSeen, Landed, OnDemand, Stop, Taken};
 use crate::project::ProjectDirs;
 use crate::slots::{MachineSlots, Slot};
@@ -77,9 +78,10 @@ pub fn run(
     envelope: &StepEnvelope,
     following: &mut Following,
     reviews: Option<ReviewsRead>,
+    outside: Option<Outside>,
     sink: &mut EventSink<'_>,
 ) -> Stepped {
-    let stepped = step(on_demand, envelope, following, reviews, sink);
+    let stepped = step(on_demand, envelope, following, reviews, outside, sink);
     keep_carry(on_demand, envelope, &stepped, sink);
     stepped
 }
@@ -89,6 +91,7 @@ fn step(
     envelope: &StepEnvelope,
     following: &mut Following,
     reviews: Option<ReviewsRead>,
+    outside: Option<Outside>,
     sink: &mut EventSink<'_>,
 ) -> Stepped {
     let ticket = &envelope.ticket;
@@ -116,7 +119,7 @@ fn step(
             decision(envelope),
             sink,
         )),
-        StepKind::Dispatch => match on_demand.dispatch_seen(ticket, commit, sink) {
+        StepKind::Dispatch => match on_demand.dispatch_seen(ticket, commit, outside, sink) {
             None => Stepped::Stale,
             Some(DispatchSeen::Capped {
                 open_prs,
@@ -282,6 +285,7 @@ pub fn end(stepped: &Stepped) -> StepEnd {
         },
         Stop::Stepped { stage, .. } => StepEnd::Stepped { stage: *stage },
         Stop::Refused(_)
+        | Stop::Waits { .. }
         | Stop::Unverified { .. }
         | Stop::NeedsInput { .. }
         | Stop::Waiting { .. }
@@ -464,6 +468,59 @@ pub fn take_outcome(path: &Path) -> Result<Option<StepOutcome>, String> {
         .map_err(|error| error.to_string())
 }
 
+/// The work outside Owlshift handed to `attempt`, a dispatch's step, in
+/// the ticket's folder (OWL-401).
+pub fn outside_file(dirs: &ProjectDirs, ticket: &TicketId, attempt: &str) -> PathBuf {
+    dirs.ticket_dir(ticket)
+        .join(format!("outside-{attempt}.json"))
+}
+
+/// Hands `outside`, what a pass read of the work outside Owlshift, to the
+/// dispatch step `envelope`, before its child starts: written whole or not
+/// at all.
+pub fn write_outside(
+    dirs: &ProjectDirs,
+    envelope: &StepEnvelope,
+    outside: &Outside,
+) -> io::Result<()> {
+    write_atomically(
+        &outside_file(dirs, &envelope.ticket, &envelope.attempt),
+        &outside.to_step().render(),
+    )
+}
+
+/// What a dispatch step `envelope` was handed of the work outside Owlshift,
+/// read and removed; `None` for another step, or when none was handed or
+/// it does not read, the dispatch then reading it afresh.
+pub fn take_outside(dirs: &ProjectDirs, envelope: &StepEnvelope) -> Option<Outside> {
+    if !matches!(envelope.step, StepKind::Dispatch) {
+        return None;
+    }
+    let path = outside_file(dirs, &envelope.ticket, &envelope.attempt);
+    let text = fs::read_to_string(&path).ok();
+    let _ = fs::remove_file(&path);
+    StepOutside::parse(&text?).ok().map(Outside::from_step)
+}
+
+/// Removes what was handed to the steps of the project's tickets and never
+/// taken: by a watch that ended before its child read it.
+pub fn remove_outside_leftovers(dirs: &ProjectDirs) {
+    let Ok(tickets) = fs::read_dir(dirs.tickets()) else {
+        return;
+    };
+    for file in tickets
+        .flatten()
+        .filter_map(|ticket| fs::read_dir(ticket.path()).ok())
+        .flat_map(|files| files.flatten())
+    {
+        let name = file.file_name();
+        let name = name.to_string_lossy();
+        if name.starts_with("outside-") && name.ends_with(".json") {
+            let _ = fs::remove_file(file.path());
+        }
+    }
+}
+
 /// The outcome records left in the project's ticket folders, by a watch
 /// that ended before it reaped its child.
 pub fn leftovers(dirs: &ProjectDirs) -> Vec<PathBuf> {
@@ -532,7 +589,9 @@ pub fn child(
     let ticket = &envelope.ticket;
     let mut following = Following::default();
     following.keep(ticket, envelope.kept.clone());
-    let stepped = run(on_demand, envelope, &mut following, None, sink);
+    // A dispatch weighs the work outside Owlshift its pass read (OWL-401).
+    let outside = take_outside(on_demand.dirs, envelope);
+    let stepped = run(on_demand, envelope, &mut following, None, outside, sink);
     if let Stepped::Ran(outcome) = &stepped
         && reported(&envelope.step, outcome)
     {

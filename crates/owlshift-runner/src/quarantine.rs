@@ -166,18 +166,20 @@ pub fn found_line(project: &str) -> String {
     )
 }
 
-/// Tells the operator that the breach marker `marker`, just written under
-/// the project's lock `lock` after `run` of `ticket`, quarantines the
-/// project, with `kinds`, then records that it did. Nothing is shown, nor
-/// recorded, when this machine shows no notification (`notifier` `None`).
-/// A line that cannot be shown is a `warning` event, and counts as notified
-/// all the same.
+/// Tells the operator that the breach marker `marker`, just written after
+/// `run` of `ticket`, quarantines the project, with `kinds`, then records
+/// that it did under the project's lock `lock`: with none, since OWL-401
+/// a run holds the lock for short sections only, nothing is recorded and a
+/// watch pass may tell it once more. Nothing is shown, nor recorded, when
+/// this machine shows no notification (`notifier` `None`). A line that
+/// cannot be shown is a `warning` event, and counts as notified all the
+/// same.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn notify_written(
     notifier: Option<&dyn Notifier>,
     tracker: &dyn Tracker,
     dirs: &ProjectDirs,
-    lock: &ProjectLock,
+    lock: Option<&ProjectLock>,
     marker: &str,
     ticket: &TicketId,
     run: &str,
@@ -200,7 +202,9 @@ pub(crate) fn notify_written(
         notified: true,
         told: BTreeSet::new(),
     };
-    if let Err(error) = notified.merge_into(dirs, lock, marker) {
+    if let Some(lock) = lock
+        && let Err(error) = notified.merge_into(dirs, lock, marker)
+    {
         sink.emit(ticket, Some(run), EventKind::Warning, not_recorded(&error));
     }
 }
@@ -603,7 +607,8 @@ mod tests {
     impl Bench {
         fn new() -> Self {
             let tmp = tempfile::tempdir().unwrap();
-            let dirs = ProjectDirs::new(tmp.path(), &Repo::parse("acme/app").unwrap());
+            let dirs = ProjectDirs::new(tmp.path(), &Repo::parse("acme/app").unwrap())
+                .with_lock_wait(crate::project::LOCK_GRACE);
             fs::create_dir_all(dirs.root()).unwrap();
             let log = EventLog::in_dir(tmp.path());
             Self {
@@ -679,7 +684,7 @@ mod tests {
             Some(&recording),
             &Linkless,
             dirs,
-            &lock,
+            Some(&lock),
             BREACH,
             &owl_7(),
             "r1",

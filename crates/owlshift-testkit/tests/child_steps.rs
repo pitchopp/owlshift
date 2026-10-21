@@ -176,7 +176,11 @@ fn a_stale_envelope_is_refused_spending_nothing() {
     };
     let dirs = s.project.dirs();
     let mut lines = Vec::new();
-    let record = children(&s.file).run(&dirs, &envelope, &mut lines).unwrap();
+    let record = children(&s.file)
+        .start(&envelope)
+        .unwrap()
+        .wait(&dirs, &mut lines)
+        .unwrap();
     assert_eq!(record.end, StepEnd::Stale);
     assert_eq!(record.hold, None);
     assert_eq!(record.after, RefAfter::Absent);

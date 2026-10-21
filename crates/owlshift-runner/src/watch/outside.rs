@@ -43,6 +43,15 @@ pub(super) struct OutsideMemory {
 }
 
 impl OutsideMemory {
+    /// This pass's read, once made and read: what a dispatch's admission
+    /// weighs (OWL-401).
+    pub(super) fn current(&self) -> Option<Outside> {
+        self.read
+            .as_ref()
+            .and_then(|read| read.as_ref().ok())
+            .cloned()
+    }
+
     /// Forgets the last pass's read: each pass reads again.
     pub(super) fn new_pass(&mut self) {
         self.read = None;

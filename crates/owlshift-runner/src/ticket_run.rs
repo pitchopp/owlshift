@@ -188,6 +188,35 @@ fn in_flight(dirs: &ProjectDirs, found: &Found, own: Option<&TicketId>) -> io::R
     dirs.ticket_lock_held(ticket)
 }
 
+/// The folder of a ticket whose lock is held elsewhere now, the first in
+/// the folders' order: a command or a step works it (OWL-401). What
+/// `owlshift gate`, which holds the project's lock for its whole length and
+/// keeps the check of a run alone, answers busy to, so that its run and a
+/// step's never overlap: every step holds its ticket's lock for its whole
+/// length and starts with one of the project's sections. One try each, let
+/// go at once; a folder with no lock file was never locked.
+pub fn ticket_in_flight(dirs: &ProjectDirs) -> io::Result<Option<PathBuf>> {
+    let listing = match fs::read_dir(dirs.tickets()) {
+        Ok(listing) => listing,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    let mut folders = Vec::new();
+    for entry in listing {
+        let entry = entry?;
+        if entry.file_type()?.is_dir() && entry.path().join("lock").exists() {
+            folders.push(entry.path());
+        }
+    }
+    folders.sort();
+    for folder in folders {
+        if dirs.ticket_lock_held_in(&folder)? {
+            return Ok(Some(folder));
+        }
+    }
+    Ok(None)
+}
+
 /// The line a quarantine, and `owlshift unquarantine`, say of an obligation
 /// left behind.
 pub fn describe(dirs: &ProjectDirs, found: &Found) -> String {
