@@ -12,7 +12,7 @@
 //! refuses a run at its limit, which spends nothing. A file written by a
 //! newer Owlshift is such a file.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -22,9 +22,10 @@ use std::time::Duration;
 use jiff::Timestamp;
 
 use owlshift_adapters::harness::claude::UsageWindow;
+use owlshift_contracts::config::PersonalConfig;
 use owlshift_contracts::ids::TicketId;
 use owlshift_contracts::usage::HarnessUsage;
-use owlshift_core::usage::{Episode, EpisodeKind, Reported, State, Window};
+use owlshift_core::usage::{self, Episode, EpisodeKind, Reported, Standing, State, Window};
 use owlshift_core::vocab::Harness;
 
 use crate::executor::{Outcome, RunReport};
@@ -42,6 +43,10 @@ const LOCK_POLL: Duration = Duration::from_millis(50);
 #[derive(Debug)]
 pub struct UsageStore {
     dir: PathBuf,
+    /// Each harness's `usage_cap_percent`, from the personal file: `None`
+    /// when this store was not told of the caps, which then applies none
+    /// and drops no pause a cap opened (OWL-405).
+    caps: Option<BTreeMap<Harness, u8>>,
     /// The warnings given, once per process.
     warned: Mutex<BTreeSet<String>>,
 }
@@ -51,7 +56,59 @@ impl UsageStore {
     pub fn new(dir: PathBuf) -> Self {
         Self {
             dir,
+            caps: None,
             warned: Mutex::default(),
+        }
+    }
+
+    /// This store told of the caps of the personal file, a harness without
+    /// one having none (OWL-405).
+    #[must_use]
+    pub fn with_caps(mut self, caps: impl IntoIterator<Item = (Harness, u8)>) -> Self {
+        self.caps = Some(caps.into_iter().collect());
+        self
+    }
+
+    /// `harness`'s cap, when this store was told of the caps and it has one.
+    pub fn cap(&self, harness: Harness) -> Option<u8> {
+        self.caps.as_ref()?.get(&harness).copied()
+    }
+
+    /// `harness`'s state at `now_ms` with the cap's pauses applied: what a
+    /// run about to start, watch, `why` and `doctor` all see. Not written.
+    pub fn read_at(&self, harness: Harness, now_ms: i64) -> Result<State, String> {
+        let mut state = self.read(harness)?;
+        self.apply_cap(harness, &mut state, now_ms);
+        Ok(state)
+    }
+
+    /// `harness`'s standing at `now_ms`, the cap's pauses applied.
+    pub fn standing(&self, harness: Harness, now_ms: i64) -> Result<Standing, String> {
+        self.read_at(harness, now_ms)
+            .map(|state| usage::standing(&state, now_ms))
+    }
+
+    /// [`Self::update`] with the cap's pauses applied before `change` and
+    /// after it, so that what a run just reported counts; the pauses opened
+    /// come with `change`'s answer.
+    pub fn update_at<R>(
+        &self,
+        harness: Harness,
+        now_ms: i64,
+        change: impl FnOnce(&mut State) -> R,
+    ) -> Result<(R, Vec<Episode>), String> {
+        self.update(harness, |state| {
+            let mut opened = self.apply_cap(harness, state, now_ms);
+            let answer = change(state);
+            opened.extend(self.apply_cap(harness, state, now_ms));
+            (answer, opened)
+        })
+    }
+
+    fn apply_cap(&self, harness: Harness, state: &mut State, now_ms: i64) -> Vec<Episode> {
+        match &self.caps {
+            Some(caps) => usage::apply_cap(state, caps.get(&harness).copied(), now_ms),
+            None => Vec::new(),
         }
     }
 
@@ -202,8 +259,35 @@ pub fn line(ticket: &TicketId, harness: Harness, until: Timestamp, reset: bool) 
 
 /// [`line()`] for `episode`.
 pub fn episode_line(ticket: &TicketId, harness: Harness, episode: &Episode) -> String {
+    if matches!(episode.kind, EpisodeKind::Cap { .. }) {
+        return cap_line(ticket, harness, at(episode.until_ms));
+    }
     let reset = !matches!(episode.kind, EpisodeKind::Limit { reset: false });
     line(ticket, harness, at(episode.until_ms), reset)
+}
+
+/// The line that tells the operator that `harness`'s runs wait for a usage
+/// window to reset at `until`, the cap the personal file sets reached
+/// (OWL-405). Fixed words, the ticket and a time only: the window's name is
+/// the provider's.
+pub fn cap_line(ticket: &TicketId, harness: Harness, until: Timestamp) -> String {
+    format!(
+        "{ticket}: {} reached its usage cap: its runs wait until its window resets at {until}",
+        shown(harness)
+    )
+}
+
+/// The usage caps of the personal file, each harness's
+/// `usage_cap_percent`, for [`UsageStore::with_caps`] (OWL-405).
+pub fn caps_of(personal: &crate::config::FileState<PersonalConfig>) -> Vec<(Harness, u8)> {
+    match personal {
+        crate::config::FileState::Loaded { config, .. } => config
+            .harnesses
+            .iter()
+            .filter_map(|(harness, settings)| Some((harness, settings.usage_cap_percent?)))
+            .collect(),
+        _ => Vec::new(),
+    }
 }
 
 #[cfg(test)]

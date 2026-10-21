@@ -21,7 +21,7 @@ use jiff::Timestamp;
 use owlshift_contracts::event::{Event, EventKind};
 use owlshift_contracts::ids::TicketId;
 use owlshift_core::state::Status;
-use owlshift_core::usage::{Standing, standing};
+use owlshift_core::usage::Standing;
 use owlshift_core::vocab::{Harness, Stage};
 use serde_json::Value;
 
@@ -285,6 +285,7 @@ pub fn gather(
     project: &str,
     only: Option<TicketId>,
     concurrent_runs: u32,
+    caps: &[(Harness, u8)],
 ) -> io::Result<Report> {
     let (events, bad) = read_events(crate::events::EventLog::in_dir(data_dir).path())?;
     let mut notes = bad;
@@ -320,12 +321,12 @@ pub fn gather(
     if !quarantined {
         folded.current.retain(|_, wait| wait.reason != "quarantine");
     }
-    let store = UsageStore::in_data_dir(data_dir);
+    let store = UsageStore::in_data_dir(data_dir).with_caps(caps.iter().copied());
     let limits = [Harness::Claude, Harness::Codex]
         .into_iter()
         .map(|harness| {
-            let limit = match store.read(harness) {
-                Ok(state) => match standing(&state, machine_usage::ms(Timestamp::now())) {
+            let limit = match store.standing(harness, machine_usage::ms(Timestamp::now())) {
+                Ok(standing) => match standing {
                     Standing::Free => Limit::Free,
                     Standing::ProbeDue => Limit::ProbeDue,
                     Standing::Limited { until_ms } => Limit::Until(machine_usage::at(until_ms)),

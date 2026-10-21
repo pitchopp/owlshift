@@ -19,7 +19,7 @@ use serde_json::json;
 use owlshift_contracts::Role;
 use owlshift_contracts::event::EventKind;
 use owlshift_core::state::TicketState;
-use owlshift_core::usage::{self, Effective, Standing, effective_harness, own_harness};
+use owlshift_core::usage::{Effective, Standing, effective_harness, own_harness};
 use owlshift_core::vocab::{Harness, Stage};
 
 use super::{Memory, Watch};
@@ -75,9 +75,9 @@ impl Watch<'_> {
             if harness == own {
                 return standing;
             }
-            store.read(harness).map_or(Standing::Free, |state| {
-                usage::standing(&state, machine_usage::ms(now))
-            })
+            store
+                .standing(harness, machine_usage::ms(now))
+                .unwrap_or(Standing::Free)
         });
         matches!(effective, Effective::Wait { .. })
     }
@@ -104,8 +104,8 @@ impl Watch<'_> {
         now: Timestamp,
     ) -> Standing {
         let store = self.on_demand.usage;
-        match store.read(harness) {
-            Ok(state) => usage::standing(&state, machine_usage::ms(now)),
+        match store.standing(harness, machine_usage::ms(now)) {
+            Ok(standing) => standing,
             Err(reason) => {
                 let key = machine_usage::key(harness);
                 if store.first_time(format!("usage_unread {key} {reason}")) {
