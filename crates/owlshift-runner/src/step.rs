@@ -49,7 +49,7 @@ use crate::follow::Following;
 use crate::in_flight::Outside;
 use crate::on_demand::{self, Carried, Delivered, DispatchSeen, Landed, OnDemand, Stop, Taken};
 use crate::project::ProjectDirs;
-use crate::slots::{MachineSlots, Slot};
+use crate::slots::{Holder, MachineSlots, Slot};
 use crate::ticket_ref::{self, Progress, RefAt};
 use crate::watch::{self, Seen};
 use crate::writer::VisibleStage;
@@ -625,18 +625,31 @@ pub fn child(
 }
 
 /// Takes one of the machine's run slots for `envelope`'s step (OWL-409),
-/// before anything else of the step: the slot, kept to the step's end;
+/// before anything else of the step: the slot, kept to the step's end and
+/// named after the step's ticket in `project` ([`slot_holder`], OWL-417);
 /// or, when every slot is taken, `None` once the step's "no slot" outcome
 /// record is written ([`no_slot_record`]), its ticket untouched.
 pub fn take_slot(
     slots: &MachineSlots,
     dirs: &ProjectDirs,
+    project: &str,
     envelope: &StepEnvelope,
     now: Timestamp,
 ) -> io::Result<Option<Slot>> {
-    match slots.take()? {
+    match slots.take(&slot_holder(project, envelope, now))? {
         Some(slot) => Ok(Some(slot)),
         None => no_slot_record(dirs, envelope, now).map(|_| None),
+    }
+}
+
+/// Who holds the slot `envelope`'s step takes in `project` at `now`: this
+/// process, for the step's ticket.
+pub fn slot_holder(project: &str, envelope: &StepEnvelope, now: Timestamp) -> Holder {
+    Holder {
+        project: project.to_owned(),
+        ticket: envelope.ticket.clone(),
+        pid: std::process::id(),
+        since: now,
     }
 }
 
@@ -762,6 +775,22 @@ mod tests {
         let carry = read_carry(&dirs, &ticket()).unwrap();
         assert_eq!((carry.commit.as_str(), carry.generation), ("c2", 2));
         assert_eq!(carry.chain.chain(), chain().chain);
+    }
+
+    /// OWL-417: the slot a step takes is named after its project, its
+    /// ticket and this process.
+    #[test]
+    fn a_step_s_slot_is_held_for_its_ticket_by_this_process() {
+        let holder = slot_holder("acme/app", &envelope(StepKind::Dispatch), at(0));
+        assert_eq!(
+            (
+                holder.project.as_str(),
+                &holder.ticket,
+                holder.pid,
+                holder.since
+            ),
+            ("acme/app", &ticket(), std::process::id(), at(0))
+        );
     }
 
     /// A resume goes on from `carry.json` only while its commit and

@@ -9,7 +9,11 @@
 //! while `owlshift watch` does. [`fold`] and [`render`] are pure; [`gather`]
 //! does the reading. The one thing it touches that a writer can notice is
 //! the slot files: counting the slots held tries each free one for a
-//! moment, as watch's own count does (`MachineSlots::held`).
+//! moment, as watch's own count does, and removes a dead holder's record
+//! under it (`MachineSlots::holders`). The holders it names are read from
+//! the slots' holder records (OWL-417), never from the events: a run that
+//! began and never ended may have died, and a slot is held through its
+//! step's gate, when no run is open.
 
 use std::collections::{BTreeMap, HashMap};
 use std::fmt::Write as _;
@@ -27,7 +31,7 @@ use serde_json::Value;
 
 use crate::events::{Data, printable};
 use crate::project::ProjectDirs;
-use crate::slots::MachineSlots;
+use crate::slots::{HeldSlot, MachineSlots};
 use crate::ticket_ref::{self, RefState};
 use crate::usage::{self as machine_usage, UsageStore};
 
@@ -52,29 +56,12 @@ pub struct Folded {
     pub history: BTreeMap<TicketId, Vec<Waiting>>,
     /// People's tickets whose latest event is the `zones_unknown` warning.
     pub people: BTreeMap<TicketId, Timestamp>,
-    /// Runs started and not ended, in every project of the log, oldest
-    /// first: project, ticket, start.
-    pub started: Vec<(String, TicketId, Timestamp)>,
 }
 
 /// Folds `events`, oldest first, for the project `project`.
 pub fn fold(events: &[Event], project: &str) -> Folded {
     let mut folded = Folded::default();
-    let mut runs: Vec<(String, String, TicketId, Timestamp)> = Vec::new();
     for event in events {
-        match event.kind {
-            EventKind::RunStarted => {
-                if let (Some(run), Some(ticket)) = (&event.run, &event.ticket) {
-                    runs.push((event.project.clone(), run.clone(), ticket.clone(), event.at));
-                }
-            }
-            EventKind::RunEnded => {
-                if let Some(run) = &event.run {
-                    runs.retain(|(p, r, _, _)| !(p == &event.project && r == run));
-                }
-            }
-            _ => {}
-        }
         if event.project != project {
             continue;
         }
@@ -102,10 +89,6 @@ pub fn fold(events: &[Event], project: &str) -> Folded {
             folded.current.remove(ticket);
         }
     }
-    folded.started = runs
-        .into_iter()
-        .map(|(project, _, ticket, at)| (project, ticket, at))
-        .collect();
     folded
 }
 
@@ -250,8 +233,9 @@ pub struct Report {
     /// Why part of the picture could not be read.
     pub notes: Vec<String>,
     pub limits: Vec<(Harness, Limit)>,
-    /// `(held, concurrent_runs)`; `None` when the slots cannot be counted.
-    pub slots: Option<(u32, u32)>,
+    /// The machine's slots held now, each with its holder as its record
+    /// says, and `concurrent_runs`; `None` when the slots cannot be probed.
+    pub slots: Option<(Vec<HeldSlot>, u32)>,
 }
 
 /// Reads every event of the log at `path`; the lines that are not events
@@ -337,7 +321,7 @@ pub fn gather(
         })
         .collect();
     let slots = MachineSlots::new(data_dir, concurrent_runs)
-        .held()
+        .holders()
         .ok()
         .map(|held| (held, concurrent_runs));
     Ok(Report {
@@ -453,25 +437,27 @@ pub fn render(report: &Report) -> String {
             );
         }
     }
-    match report.slots {
+    match &report.slots {
         Some((held, count)) => {
-            let _ = writeln!(out, "machine slots: {held} of {count} in use");
+            let _ = writeln!(out, "machine slots: {} of {count} in use", held.len());
+            for HeldSlot { slot, holder } in held {
+                match holder {
+                    Some(holder) => {
+                        let _ = writeln!(
+                            out,
+                            "  slot {slot}: {} {} since {} (pid {})",
+                            holder.project, holder.ticket, holder.since, holder.pid
+                        );
+                    }
+                    None => {
+                        let _ = writeln!(out, "  slot {slot}: held, holder unknown");
+                    }
+                }
+            }
         }
         None => {
             let _ = writeln!(out, "machine slots: cannot be counted");
         }
-    }
-    let running: Vec<_> = folded
-        .started
-        .iter()
-        .rev()
-        .take(report.slots.map_or(0, |(held, _)| held as usize))
-        .collect();
-    for (project, ticket, at) in running.into_iter().rev() {
-        let _ = writeln!(
-            out,
-            "  {project} {ticket} since {at} (from the events: a run that began and never ended)"
-        );
     }
     for (harness, limit) in &report.limits {
         let shown = machine_usage::shown(*harness);
@@ -510,6 +496,7 @@ mod tests {
 
     use super::*;
     use crate::events::data;
+    use crate::slots::Holder;
 
     fn event(at: &str, ticket: Option<&str>, kind: EventKind, details: Data) -> Event {
         Event {
@@ -625,33 +612,40 @@ mod tests {
         assert!(folded.people.contains_key(&TicketId::new("OWL-7").unwrap()));
     }
 
+    /// OWL-417: a run that began and never ended (a step child that died,
+    /// or a person's `do`, which takes no slot) holds no slot, and a dead
+    /// holder's record under a free slot is not a holder.
     #[test]
-    fn started_runs_without_an_end_are_listed_across_projects() {
-        let mut a = event(
-            "2026-10-20T10:00:00Z",
-            Some("OWL-1"),
-            EventKind::RunStarted,
-            Data::new(),
+    fn runs_that_never_ended_and_dead_records_name_no_holder() {
+        let tmp = tempfile::tempdir().unwrap();
+        let log = crate::events::EventLog::in_dir(tmp.path());
+        for (ticket, run) in [("OWL-8", "r1"), ("OWL-9", "r1")] {
+            let mut started = event(
+                "2026-10-13T16:50:59Z",
+                Some(ticket),
+                EventKind::RunStarted,
+                Data::new(),
+            );
+            started.run = Some(run.to_owned());
+            log.append(&started).unwrap();
+        }
+        let slots = tmp.path().join("slots");
+        fs::create_dir_all(&slots).unwrap();
+        fs::write(slots.join("0.lock"), "").unwrap();
+        fs::write(
+            slots.join("0.holder"),
+            r#"{"project":"o/r","ticket":"OWL-8","pid":1,"since":"2026-10-13T16:50:59Z"}"#,
+        )
+        .unwrap();
+        let dirs = ProjectDirs::new(
+            tmp.path(),
+            &owlshift_adapters::forge::Repo::parse("o/r").unwrap(),
         );
-        a.run = Some("r1".to_owned());
-        let mut b = event(
-            "2026-10-20T10:01:00Z",
-            Some("OWL-2"),
-            EventKind::RunStarted,
-            Data::new(),
-        );
-        b.run = Some("r2".to_owned());
-        b.project = "other/p".to_owned();
-        let mut end = event(
-            "2026-10-20T10:02:00Z",
-            Some("OWL-1"),
-            EventKind::RunEnded,
-            Data::new(),
-        );
-        end.run = Some("r1".to_owned());
-        let folded = fold(&[a, b, end], "o/r");
-        assert_eq!(folded.started.len(), 1);
-        assert_eq!(folded.started[0].0, "other/p");
+        let report = gather(tmp.path(), &dirs, "o/r", None, 3, &[]).unwrap();
+        assert_eq!(report.slots, Some((vec![], 3)));
+        let text = render(&report);
+        assert!(text.contains("machine slots: 0 of 3 in use"), "{text}");
+        assert!(!text.contains("OWL-8") && !text.contains("OWL-9"), "{text}");
     }
 
     #[test]
@@ -696,7 +690,7 @@ mod tests {
     #[test]
     fn render_names_the_marker_the_slots_the_limits_and_a_waiting_person() {
         let id = |t| TicketId::new(t).unwrap();
-        let mut report = Report {
+        let report = Report {
             project: "o/r".to_owned(),
             only: None,
             folded: Folded::default(),
@@ -710,30 +704,37 @@ mod tests {
                 ),
                 (Harness::Codex, Limit::ProbeDue),
             ],
-            slots: Some((1, 2)),
+            slots: Some((
+                vec![
+                    HeldSlot {
+                        slot: 0,
+                        holder: Some(Holder {
+                            project: "other/p".to_owned(),
+                            ticket: id("LOC-2"),
+                            pid: 7,
+                            since: "2026-10-20T09:00:00Z".parse().unwrap(),
+                        }),
+                    },
+                    HeldSlot {
+                        slot: 2,
+                        holder: None,
+                    },
+                ],
+                3,
+            )),
         };
-        report.folded.started = vec![
-            (
-                "o/r".to_owned(),
-                id("OWL-8"),
-                "2026-10-20T09:00:00Z".parse().unwrap(),
-            ),
-            (
-                "o/r".to_owned(),
-                id("OWL-9"),
-                "2026-10-20T09:30:00Z".parse().unwrap(),
-            ),
-        ];
         let text = render(&report);
         assert!(text.contains("quarantine: a marker stands"), "{text}");
         assert!(
             text.contains("OWL-4 [verify, parked]: waits for a person"),
             "{text}"
         );
-        assert!(text.contains("machine slots: 1 of 2 in use"), "{text}");
-        // One slot held: the latest started run only.
-        assert!(text.contains("o/r OWL-9 since"), "{text}");
-        assert!(!text.contains("OWL-8"), "{text}");
+        assert!(text.contains("machine slots: 2 of 3 in use"), "{text}");
+        assert!(
+            text.contains("  slot 0: other/p LOC-2 since 2026-10-20T09:00:00Z (pid 7)"),
+            "{text}"
+        );
+        assert!(text.contains("  slot 2: held, holder unknown"), "{text}");
         assert!(text.contains("until 2026-10-20T15:00:00Z"), "{text}");
         assert!(text.contains("deadline passed"), "{text}");
         assert!(text.contains("note: a note"), "{text}");

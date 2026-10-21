@@ -138,7 +138,7 @@ fn run_with(
         Some(envelope) => {
             let dirs = ProjectDirs::new(&data_dir, &repo);
             let now = on_demand::system_clock();
-            match step::take_slot(&slots, &dirs, envelope, now)
+            match step::take_slot(&slots, &dirs, &repo.to_string(), envelope, now)
                 .map_err(|error| format!("the machine's run slots: {error}"))?
             {
                 Some(slot) => Some(slot),
