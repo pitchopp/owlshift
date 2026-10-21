@@ -835,9 +835,7 @@ impl Watch<'_> {
         // WAITING comment is folded (OWL-419). One unread or whose step runs
         // keeps it until it reads or its step ends.
         let kept = [&holding[..], &followed[..], &unread[..], &busy[..]].concat();
-        let mut wait_comments = std::mem::take(&mut memory.wait_comments);
-        wait_comments.retain(&mut self.board(sink), &kept);
-        memory.wait_comments = wait_comments;
+        memory.wait_comments.retain(&mut self.board(sink), &kept);
         self.note(
             memory,
             out,
