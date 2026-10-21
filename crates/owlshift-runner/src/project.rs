@@ -162,30 +162,47 @@ impl ProjectDirs {
         self.ticket_dir(ticket).join("lock")
     }
 
-    /// Takes the lock of `ticket`, held until the returned value is dropped
-    /// or the process ends; `None` when another open file description holds
-    /// it, in this process or another: two commands never work one ticket.
-    /// A command takes it before the project's lock and lets it go after
-    /// ([`ProjectDirs::lock_for_write`] is watch's reverse order). The
-    /// window of [`ProjectDirs::lock`] after a fork applies to it too.
+    /// Takes the lock of `ticket` for a command, held until the returned
+    /// value is dropped or the process ends; `None` when another open file
+    /// description, in this process or another, still holds it once
+    /// [`LOCK_GRACE`] has passed: two commands never work one ticket. A
+    /// command takes it before the project's lock and lets it go after
+    /// ([`ProjectDirs::lock_for_write`] is watch's reverse order, which never
+    /// waits). The bound outlasts the moment a lock just released can still
+    /// look held (see [`ProjectDirs::lock`]).
     pub fn ticket_lock(&self, ticket: &TicketId) -> io::Result<Option<TicketLock>> {
-        fs::create_dir_all(self.ticket_dir(ticket))?;
-        Ok(try_lock_file(&self.ticket_lock_file(ticket))?.map(|file| TicketLock { _file: file }))
+        self.ticket_lock_within(ticket, LOCK_GRACE)
     }
 
-    /// The project's lock, then the lock of `ticket` without waiting: what
-    /// watch holds for a write of that ticket's ref (OWL-409). `None` when
-    /// either is held elsewhere; the project's lock is then let go at once,
-    /// so watch's reverse order never waits on a command. Dropped in order:
-    /// the project's lock first.
+    /// [`ProjectDirs::ticket_lock`] within `wait`: a single try when zero.
+    fn ticket_lock_within(
+        &self,
+        ticket: &TicketId,
+        wait: Duration,
+    ) -> io::Result<Option<TicketLock>> {
+        fs::create_dir_all(self.ticket_dir(ticket))?;
+        Ok(
+            lock_file_within(&self.ticket_lock_file(ticket), wait, LOCK_POLL)?
+                .map(|file| TicketLock { _file: file }),
+        )
+    }
+
+    /// The project's lock, then the lock of `ticket`, each with a single
+    /// try: what watch holds for a write of that ticket's ref (OWL-409).
+    /// `None` when either is held elsewhere; the project's lock is then let
+    /// go at once, so watch's reverse order never waits on a command, and
+    /// watch's own takes never wait (OWL-414). Dropped in order: the
+    /// project's lock first.
     pub fn lock_for_write(
         &self,
         ticket: &TicketId,
     ) -> io::Result<Option<(ProjectLock, TicketLock)>> {
-        let Some(project) = self.lock()? else {
+        let Some(project) = self.try_lock()? else {
             return Ok(None);
         };
-        Ok(self.ticket_lock(ticket)?.map(|ticket| (project, ticket)))
+        Ok(self
+            .ticket_lock_within(ticket, Duration::ZERO)?
+            .map(|ticket| (project, ticket)))
     }
 
     /// The marker of a run whose isolation check has not passed.
@@ -193,21 +210,39 @@ impl ProjectDirs {
         self.root.join("unverified")
     }
 
-    /// Takes the project's lock, held until the returned value is dropped or
-    /// the process ends; `None` when another process holds it.
+    /// Takes the project's lock for a command, held until the returned value
+    /// is dropped or the process ends; `None` when another open file
+    /// description still holds it once [`LOCK_GRACE`] has passed.
     ///
     /// The lock belongs to an open file description (`flock` on Unix), which
-    /// a child forked by any thread of the process shares until it execs.
-    /// The standard library forks, rather than using `posix_spawn`, for a
-    /// command that sets `PATH` and names a bare program, as the gate's
-    /// `sh` and the agent's `git` do. So a lock just released can still look
-    /// held for the few moments a child forked by another thread takes to
-    /// exec. `owlshift do` takes it once per process, so this matters only
-    /// where one process runs several `do` in threads: the tests, which run
-    /// them one at a time.
+    /// a child spawned while it is held shares until it execs, and on macOS
+    /// a moment longer: a child the standard library starts through
+    /// `posix_spawn` can keep the parent's close-on-exec descriptors for
+    /// some milliseconds after the spawn returned, even once it ended
+    /// (OWL-414; architecture section 5, "A lock just released"). So a lock
+    /// whose holder ran git under it can look held a moment after its
+    /// release, and a command waits that out, polling, before it answers
+    /// busy. Watch's own takes never wait ([`ProjectDirs::try_lock`]).
+    ///
+    /// A child forked by another thread of this process holds it until it
+    /// execs too; only the tests spawn beside a thread that locks, so a test
+    /// that takes a lock again runs alone (`alone::run_alone`).
     pub fn lock(&self) -> io::Result<Option<ProjectLock>> {
+        self.lock_within(LOCK_GRACE)
+    }
+
+    /// [`ProjectDirs::lock`] with a single try: watch's snapshot and notes,
+    /// and a look at whether a run is in flight, never wait. A lock just
+    /// released can then look held, which costs watch one pass, as a real
+    /// holder does.
+    pub fn try_lock(&self) -> io::Result<Option<ProjectLock>> {
+        self.lock_within(Duration::ZERO)
+    }
+
+    fn lock_within(&self, wait: Duration) -> io::Result<Option<ProjectLock>> {
         fs::create_dir_all(&self.root)?;
-        Ok(try_lock_file(&self.lock_file())?.map(|file| ProjectLock { _file: file }))
+        Ok(lock_file_within(&self.lock_file(), wait, LOCK_POLL)?
+            .map(|file| ProjectLock { _file: file }))
     }
 
     /// The account lock's file beside the project's `lock`: it serialises
@@ -252,13 +287,32 @@ impl ProjectDirs {
     }
 }
 
+/// How long a command waits for the project's or a ticket's lock before it
+/// answers busy (OWL-414): about six times the longest moment a lock just
+/// released was seen to look held, under load on macOS (see
+/// [`ProjectDirs::lock`]).
+pub const LOCK_GRACE: Duration = Duration::from_millis(250);
+
+/// How often a command tries again within [`LOCK_GRACE`]: the moment it
+/// waits out lasts milliseconds, so a lock freed is taken soon after.
+const LOCK_POLL: Duration = Duration::from_millis(10);
+
+#[cfg(test)]
+thread_local! {
+    /// The tries [`try_lock_file`] made on this thread: what tells a single
+    /// try from a wait in the tests, with no clock.
+    static TRIES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 /// Opens the lock file at `path`, creating it, and takes its lock without
 /// waiting: the file while it is held, `None` when another open file
 /// description holds it (`flock` on Unix, `LockFileEx` on Windows). The
-/// project's lock and the account lock share it; see [`ProjectDirs::lock`]
-/// for the window in which a child forked by another thread keeps a lock
-/// just released.
+/// locks of the project, the tickets, the account and the run slots share
+/// it; see [`ProjectDirs::lock`] for the moment a lock just released can
+/// still look held.
 pub(crate) fn try_lock_file(path: &Path) -> io::Result<Option<File>> {
+    #[cfg(test)]
+    TRIES.with(|tries| tries.set(tries.get() + 1));
     let file = OpenOptions::new()
         .create(true)
         .write(true)
@@ -273,9 +327,10 @@ pub(crate) fn try_lock_file(path: &Path) -> io::Result<Option<File>> {
 
 /// [`try_lock_file`], tried again every `poll` until `wait` has passed: a
 /// bounded wait, as a loop over the try, so a holder that crashed (the
-/// kernel drops its lock) or a forked child that has not exec'd yet is
-/// outlasted, and a holder that never lets go is reported. `None` once the
-/// wait is spent.
+/// kernel drops its lock) or a child that still holds a lock just released
+/// (see [`ProjectDirs::lock`]) is outlasted, and a holder that never lets
+/// go is reported. A single try when `wait` is zero; `None` once the wait
+/// is spent.
 pub(crate) fn lock_file_within(
     path: &Path,
     wait: Duration,
@@ -725,41 +780,39 @@ mod tests {
         }
     }
 
-    /// The lock is checked in a fresh copy of this test binary, running
-    /// [`helper_one_do_at_a_time_per_project`] alone. In this process, other
-    /// tests fork children (`git`, `sh`), and a child forked while the lock
-    /// is held keeps it until it execs (see [`ProjectDirs::lock`]): the
-    /// released lock then looked held (seen once on macOS on 2026-09-29).
-    /// Alone, nothing forks.
+    /// The lock is checked alone, in a fresh copy of this test binary
+    /// (`alone::run_alone`): in this process, other tests spawn children
+    /// (`git`, `sh`), and a child spawned while a lock is held keeps it until
+    /// it execs (see [`ProjectDirs::lock`]), so a lock released then looked
+    /// held (seen on macOS on 2026-09-29). Alone, nothing else spawns.
     #[test]
     fn one_do_at_a_time_per_project() {
-        let output = Command::new(std::env::current_exe().unwrap())
-            .args([
-                "--exact",
-                "project::tests::helper_one_do_at_a_time_per_project",
-                "--ignored",
-                "--nocapture",
-                "--test-threads=1",
-            ])
-            .output()
-            .unwrap();
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        assert!(
-            output.status.success() && stdout.contains("running 1 test"),
-            "{output:?}"
-        );
+        crate::alone::run_alone("project::tests::helper_one_do_at_a_time_per_project");
+    }
+
+    /// The tries [`try_lock_file`] makes on this thread while `take` runs.
+    fn tries<T>(take: impl FnOnce() -> T) -> (T, usize) {
+        let before = TRIES.with(|tries| tries.get());
+        let taken = take();
+        (taken, TRIES.with(|tries| tries.get()) - before)
     }
 
     #[test]
     #[ignore = "helper, run by the test above"]
     fn helper_one_do_at_a_time_per_project() {
-        if !std::env::args().any(|arg| arg == "--exact") {
+        if !crate::alone::running_alone() {
             return;
         }
         let dir = tempfile::tempdir().unwrap();
         let dirs = ProjectDirs::new(dir.path(), &Repo::parse("demo/project").unwrap());
         let held = dirs.lock().unwrap().expect("the first lock is free");
+        // A command waits for the bound before it answers busy (OWL-414);
+        // watch tries once, counted rather than timed.
+        let started = Instant::now();
         assert!(dirs.lock().unwrap().is_none(), "a second lock waits");
+        assert!(started.elapsed() >= LOCK_GRACE);
+        let (second, tried) = tries(|| dirs.try_lock().unwrap());
+        assert!(second.is_none() && tried == 1, "{tried}");
         drop(held);
         assert!(dirs.lock().unwrap().is_some(), "free again once released");
 
@@ -802,37 +855,47 @@ mod tests {
         );
         let held = dirs.ticket_lock(&ticket).unwrap().expect("a free ticket");
         let lower = TicketId::new("owl-1").unwrap();
+        let started = Instant::now();
         assert!(dirs.ticket_lock(&lower).unwrap().is_none(), "one holder");
+        assert!(started.elapsed() >= LOCK_GRACE);
         assert!(dirs.ticket_lock(&other).unwrap().is_some(), "per ticket");
         // Watch's reverse order: nothing while the project or the ticket is
-        // held elsewhere, and the project's lock let go when the ticket's
-        // was busy.
-        assert!(
-            dirs.lock_for_write(&other).unwrap().is_none(),
-            "project held"
-        );
+        // held elsewhere, one try each, and the project's lock let go when
+        // the ticket's was busy.
+        let (busy, tried) = tries(|| dirs.lock_for_write(&other).unwrap());
+        assert!(busy.is_none() && tried == 1, "project held: {tried}");
         drop(project);
-        assert!(
-            dirs.lock_for_write(&ticket).unwrap().is_none(),
-            "ticket held"
-        );
+        let (busy, tried) = tries(|| dirs.lock_for_write(&ticket).unwrap());
+        assert!(busy.is_none() && tried == 2, "ticket held: {tried}");
         assert!(dirs.lock().unwrap().is_some(), "the project's lock let go");
         drop(held);
         let both = dirs.lock_for_write(&ticket).unwrap().expect("both free");
         assert!(dirs.ticket_lock(&ticket).unwrap().is_none());
         assert!(dirs.lock().unwrap().is_none());
         drop(both);
+        // A ticket whose folder is not made yet: watch makes it.
+        let new = TicketId::new("OWL-3").unwrap();
+        assert!(!dirs.ticket_dir(&new).exists());
+        assert!(dirs.lock_for_write(&new).unwrap().is_some(), "made");
 
         // Close-on-exec (architecture section 5, "Locks", check (e)): a
-        // child that execs while the lock is held does not keep it.
+        // child that execs while the lock is held does not keep it. On macOS
+        // a child `posix_spawn` started can keep it a moment after the spawn
+        // returned (OWL-414), so the release is waited for, while the child
+        // still runs: one that inherited the file would hold it to its end.
         #[cfg(unix)]
         {
             let held = dirs.ticket_lock(&ticket).unwrap().expect("free again");
-            let mut child = Command::new("sleep").arg("5").spawn().unwrap();
+            let mut child = Command::new("sleep").arg("30").spawn().unwrap();
             drop(held);
-            let free = dirs.ticket_lock(&ticket).unwrap().is_some();
+            let file = dirs.ticket_lock_file(&ticket);
+            let free = lock_file_within(&file, Duration::from_secs(5), poll)
+                .unwrap()
+                .is_some();
+            let running = child.try_wait().unwrap().is_none();
             let _ = child.kill();
             let _ = child.wait();
+            assert!(running, "the child ended before the check");
             assert!(free, "a child that exec'd kept the ticket's lock");
         }
     }

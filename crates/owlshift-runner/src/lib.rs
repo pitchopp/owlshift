@@ -4,6 +4,8 @@
 //! watch`'s loop over the tickets whose questions wait ([`watch`]).
 
 pub mod agent_env;
+#[cfg(test)]
+mod alone;
 pub mod answer_check;
 pub mod artifact;
 pub mod codex_machine;

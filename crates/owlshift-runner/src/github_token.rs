@@ -46,7 +46,7 @@ use crate::project::lock_file_within;
 
 /// The longest wait for the account lock: past a holder's whole refresh,
 /// whose request times out after 30 s, and its keychain write, and far past
-/// the moments a forked child keeps a lock just released
+/// the moments a child keeps a lock just released
 /// ([`ProjectDirs::lock`](crate::project::ProjectDirs::lock)).
 pub const ACCOUNT_LOCK_WAIT: Duration = Duration::from_secs(60);
 
@@ -694,9 +694,23 @@ mod tests {
     }
 
     /// A refresh with no usable answer may be tried again: it is no
-    /// refusal. A lock held past the wait is reported, nothing sent.
+    /// refusal. A lock held past the wait is reported, nothing sent. Run
+    /// alone (`alone::run_alone`, OWL-414): the test takes at once the lock
+    /// the refreshes released, which another test's child spawned meanwhile
+    /// would make look held.
     #[test]
     fn a_failed_refresh_and_a_held_lock_are_tried_again_later() {
+        crate::alone::run_alone(
+            "github_token::tests::helper_a_failed_refresh_and_a_held_lock_are_tried_again_later",
+        );
+    }
+
+    #[test]
+    #[ignore = "helper, run by the test above"]
+    fn helper_a_failed_refresh_and_a_held_lock_are_tried_again_later() {
+        if !crate::alone::running_alone() {
+            return;
+        }
         let dir = tempfile::tempdir().unwrap();
         let lock = dir.path().join("lock");
         let keychain = Keychain::in_memory();
