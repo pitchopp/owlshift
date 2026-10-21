@@ -50,7 +50,7 @@ impl Bench {
     }
 
     /// The bodies of the comments on `id`, oldest first.
-    fn comments_on(&self, id: &str) -> Vec<String> {
+    pub(super) fn comments_on(&self, id: &str) -> Vec<String> {
         MarkdownTracker::new(&self.remote.checkout)
             .comments(&TicketId::new(id).unwrap())
             .unwrap()
@@ -138,7 +138,7 @@ impl Bench {
 
 /// The ticket of each `dispatch` event of `events`, checking that the drain
 /// made it.
-fn dispatched(events: &[Event]) -> Vec<String> {
+pub(super) fn dispatched(events: &[Event]) -> Vec<String> {
     events
         .iter()
         .filter(|event| event.kind == EventKind::Dispatch)
@@ -162,7 +162,7 @@ pub(super) fn by_pass(events: &[Event], start: usize, ends: &[usize]) -> Vec<Vec
 
 /// Each `waits` decision of `events`: its ticket, reason and the tickets it
 /// names.
-fn waits(events: &[Event]) -> Vec<(String, Value, Value)> {
+pub(super) fn waits(events: &[Event]) -> Vec<(String, Value, Value)> {
     events
         .iter()
         .filter(|e| e.kind == EventKind::Decision && e.data.get("drain") == Some(&json!("waits")))
@@ -591,7 +591,7 @@ fn scenario_s3_questions_at_intake() {
 }
 
 /// An intake result `done` that declares `zones` and `resources` (OWL-402).
-fn intake_declaring(zones: &[&str], resources: &[&str]) -> String {
+pub(super) fn intake_declaring(zones: &[&str], resources: &[&str]) -> String {
     let mut result: Value = serde_json::from_str(&intake_result("done", None, "")).unwrap();
     result["intake"]["zones"] = json!(zones);
     result["intake"]["resources"] = json!(resources);
@@ -718,7 +718,7 @@ fn the_owner_of_a_zone_intake_declared_decides_a_ticket_without_an_assignee() {
 
 /// Each `decision` event of `events` that `key` names `waits` with the reason
 /// `collision`: its ticket, the holder and the resource.
-fn collisions(events: &[Event], key: &str) -> Vec<(String, Value, Value)> {
+pub(super) fn collisions(events: &[Event], key: &str) -> Vec<(String, Value, Value)> {
     events
         .iter()
         .filter(|e| e.kind == EventKind::Decision && e.data.get(key) == Some(&json!("waits")))
