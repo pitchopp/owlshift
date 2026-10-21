@@ -77,7 +77,8 @@ enum Command {
     /// ticket at Intake, Design, Design review, Build or Verify that an
     /// answered round (round > 0) left shown working or needing input, a
     /// refusal after the answer check included. A parked ticket, or one left
-    /// at Build before any question round, still needs `owlshift continue`.
+    /// at Build before any question round, still needs `owlshift continue`;
+    /// `owlshift continue --to-watch` restarts a park and leaves it to watch.
     Watch {
         /// Also take admitted tickets in from the ready column, intake
         /// first, and dispatch them to Build one at a time.
