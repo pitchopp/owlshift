@@ -195,6 +195,29 @@ impl Bench {
     }
 }
 
+/// OWL-415: with the personal file's `web_tools = false`, Design, its
+/// reviewers and Verify get no web tools, `permissions.network` false in
+/// their briefs, which the Claude Code adapter turns into `WebFetch
+/// WebSearch` in `--disallowedTools`.
+#[test]
+fn the_operator_can_take_the_web_tools_away_from_the_review_roles() {
+    let bench = Bench::of("standard");
+    bench.web_tools.set(false);
+    let replies = vec![
+        bench.read(&designed(PLAN)),
+        bench.read(&reviewed(&[])),
+        bench.read(&reviewed(&[])),
+        bench.built(),
+    ];
+    let (outcome, printed) = bench.run(replies, None);
+    outcome.unwrap_or_else(|stop| panic!("{stop}\n{printed}"));
+    let briefs = bench.briefs();
+    assert_eq!(briefs.len(), 5, "{printed}");
+    for brief in &briefs {
+        assert!(!brief.permissions.network, "{:?}", brief.role);
+    }
+}
+
 /// S9's design half: a `standard` ticket's dispatch from Ready goes to
 /// Design; the plan, kept in `plan.json`, is reviewed by the critic and
 /// conformance, both on Claude Code (OWL-347); a clean pass posts the PLAN
@@ -221,10 +244,14 @@ fn a_standard_ticket_is_planned_and_reviewed_before_its_build() {
         ]
     );
     let briefs = bench.briefs();
+    // Design and its reviewers read only, with their web tools (OWL-415);
+    // the Build gets none, Verify gets them.
     for brief in &briefs[..3] {
         assert_eq!(brief.permissions.level, PermissionLevel::ReadOnly);
-        assert!(!brief.permissions.network);
+        assert!(brief.permissions.network, "{:?}", brief.role);
     }
+    assert!(!briefs[3].permissions.network);
+    assert!(briefs[4].permissions.network);
     assert!(briefs[0].plan.is_none(), "a first design revises nothing");
     let mandates: Vec<Vec<Mandate>> = briefs[1..3]
         .iter()

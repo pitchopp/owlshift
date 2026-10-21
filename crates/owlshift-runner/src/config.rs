@@ -86,6 +86,19 @@ impl<T> FileState<T> {
     }
 }
 
+/// Whether the personal file gives the read-only planning and review roles
+/// and the resolver their web tools (OWL-415): yes unless `web_tools =
+/// false`, and yes on a machine without a personal file. An unknown or
+/// invalid file never reaches a run, since `owlshift do` refuses it; it
+/// gives none all the same.
+pub fn web_tools_enabled(personal: &FileState<PersonalConfig>) -> bool {
+    match personal {
+        FileState::Loaded { config, .. } => config.web_tools != Some(false),
+        FileState::Absent(_) | FileState::NotApplicable(_) => true,
+        FileState::Unavailable(_) | FileState::Invalid { .. } => false,
+    }
+}
+
 /// The configuration in effect for a directory.
 #[derive(Debug)]
 pub struct Effective {
@@ -636,6 +649,27 @@ mod tests {
 
         fs::write(&personal, "allow_caches = [\"Library/pnpm\"]\n").unwrap();
         assert!(load().is_valid());
+    }
+
+    /// OWL-415: the web tools are on without a personal file and with one
+    /// that leaves the key out or sets it `true`, off with `web_tools =
+    /// false`, and off for a file that could not be read or parsed.
+    #[test]
+    fn the_web_tools_are_on_unless_the_personal_file_turns_them_off() {
+        let loaded = |text: &str| FileState::Loaded {
+            path: PathBuf::from("config.toml"),
+            config: PersonalConfig::parse(text).unwrap(),
+            entries: Vec::new(),
+        };
+        assert!(web_tools_enabled(&FileState::Absent("config.toml".into())));
+        assert!(web_tools_enabled(&FileState::NotApplicable(String::new())));
+        assert!(web_tools_enabled(&loaded("")));
+        assert!(web_tools_enabled(&loaded("web_tools = true\n")));
+        assert!(!web_tools_enabled(&loaded("web_tools = false\n")));
+        assert!(!web_tools_enabled(&FileState::Invalid {
+            path: PathBuf::from("config.toml"),
+            error: String::new(),
+        }));
     }
 
     /// OWL-75's acceptance: a name the operator allows for one repository

@@ -1279,7 +1279,8 @@ impl Driver {
                 } else {
                     PermissionLevel::ReadOnly
                 },
-                network: false,
+                // The runner's default (OWL-415).
+                network: role.takes_web_tools(),
                 browser: false,
             },
             gate: self.gate.clone(),

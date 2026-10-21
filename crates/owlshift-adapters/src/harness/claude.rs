@@ -170,7 +170,11 @@ const BEYOND_RUN_TOOLS: &[&str] = &[
     "Agent",
 ];
 
-/// The tools removed from a run that has no network access.
+/// The web tools: removed from a run that has no network access, and
+/// allowed by name to a read-only run that has it, since `dontAsk` denies a
+/// call to one that is offered but not allowed. Checked live with Claude
+/// Code 2.1.302 on 2026-10-22 (OWL-415, recorded under the adapter's
+/// "Permissions" in `docs/design/build-plan.md`).
 const NETWORK_TOOLS: &[&str] = &["WebFetch", "WebSearch"];
 
 /// How hard the model thinks, as `claude --effort` names it: the contracts'
@@ -325,7 +329,9 @@ impl std::error::Error for CommandError {}
 ///
 /// The tools that reach beyond the run are always removed and, without network
 /// access, the web tools too, all in one `--disallowedTools` flag; Bash, when
-/// allowed, can still reach the network. No settings file is read, so nothing
+/// allowed, can still reach the network. With network access, a read-only run
+/// allows the web tools in its `--allowedTools` flag, beside its one rule:
+/// `dontAsk` would deny them otherwise. No settings file is read, so nothing
 /// in the worktree grants a permission or runs a hook (`GUARDRAIL_ARGS`), and
 /// no skill, Claude Code's own included, reaches the model (`SKILL_ARGS`).
 /// Messages from the user's other sessions are refused on every launch
@@ -353,12 +359,18 @@ pub fn command(program: &Path, request: &Request) -> Result<Command, CommandErro
     let level = request.permissions.level;
     command.args(["--permission-mode", permission_mode(level)]);
     match (level, request.bash) {
-        (PermissionLevel::ReadOnly, false) => {
-            command.arg("--allowedTools");
-            command.arg(format!("Edit(/{result_path})"));
-        }
-        (PermissionLevel::ReadOnly, true) => {
-            command.args(["--allowedTools", "Bash"]);
+        (PermissionLevel::ReadOnly, bash) => {
+            let first = if bash {
+                "Bash".to_owned()
+            } else {
+                format!("Edit(/{result_path})")
+            };
+            command.arg("--allowedTools").arg(first);
+            // `dontAsk` denies a web tool that is not allowed, even one
+            // that is offered (OWL-415, checked live with 2.1.302).
+            if request.permissions.network {
+                command.args(NETWORK_TOOLS);
+            }
         }
         (PermissionLevel::WriteWorktree, false) => {}
         (PermissionLevel::WriteWorktree, true) => {
@@ -959,15 +971,17 @@ mod tests {
         SKILL_ARGS.join(" ")
     }
 
+    /// With network access, the web tools are allowed beside the result's
+    /// rule, never denied (OWL-415); without it, denied and not allowed.
     #[test]
     fn a_read_only_run_may_write_only_its_result_file() {
-        let request = request(PermissionLevel::ReadOnly);
+        let mut request = request(PermissionLevel::ReadOnly);
         assert_eq!(
             joined(&request),
             format!(
                 "-p --output-format stream-json --verbose \
                  --permission-mode dontAsk --allowedTools Edit(/.owlshift/result.json) \
-                 --permission-prompts none --disallowedTools {} \
+                 WebFetch WebSearch --permission-prompts none --disallowedTools {} \
                  {} {} {} --no-session-persistence",
                 denied(),
                 guardrail(),
@@ -975,6 +989,21 @@ mod tests {
                 inbox()
             )
         );
+        request.permissions.network = false;
+        assert_eq!(
+            joined(&request),
+            format!(
+                "-p --output-format stream-json --verbose \
+                 --permission-mode dontAsk --allowedTools Edit(/.owlshift/result.json) \
+                 --permission-prompts none --disallowedTools {} WebFetch WebSearch \
+                 {} {} {} --no-session-persistence",
+                denied(),
+                guardrail(),
+                skills(),
+                inbox()
+            )
+        );
+        request.permissions.network = true;
         let command = command(Path::new("claude"), &request).unwrap();
         assert_eq!(command.get_current_dir(), Some(Path::new("/work")));
     }

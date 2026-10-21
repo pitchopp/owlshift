@@ -251,6 +251,7 @@ impl ChildProject {
             clock: &on_demand::system_clock,
             notifier: None,
             usage: &usage,
+            web_tools: true,
         };
         let mut sink = EventSink::new(REPO, EventLog::in_dir(&self.data), out);
         act(&on_demand, &mut sink)

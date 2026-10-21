@@ -478,6 +478,10 @@ pub struct OnDemand<'a> {
     /// each run, a limited harness ending the step with nothing spent, and
     /// kept up to date with what each run reported.
     pub usage: &'a UsageStore,
+    /// Whether the roles that take the web tools ([`Role::takes_web_tools`])
+    /// get them, `permissions.network` in their briefs: the personal file's
+    /// `web_tools` ([`crate::config::web_tools_enabled`], OWL-415).
+    pub web_tools: bool,
 }
 
 /// The opt-in Codex reviewer (OWL-348, architecture section 5, "Codex"):
@@ -5423,7 +5427,9 @@ impl OnDemand<'_> {
                 } else {
                     PermissionLevel::ReadOnly
                 },
-                network: false,
+                // The web tools of the planning and review roles and the
+                // resolver, unless the operator turns them off (OWL-415).
+                network: self.web_tools && role.takes_web_tools(),
                 browser: false,
             },
             // From the project file the rules were read from (OWL-331).

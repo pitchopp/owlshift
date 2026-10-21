@@ -968,6 +968,9 @@ struct Bench {
     /// Claude Code's `usage_cap_percent`, if the personal file sets one
     /// (OWL-405).
     usage_cap: Cell<Option<u8>>,
+    /// The personal file's `web_tools` as the runner reads it (OWL-415): on
+    /// by default.
+    web_tools: Cell<bool>,
 }
 
 /// A notifier that records each line instead of showing it.
@@ -1117,6 +1120,7 @@ impl Bench {
             notified: Notified::default(),
             usage: RefCell::new(tmp_data.join("usage")),
             usage_cap: Cell::new(None),
+            web_tools: Cell::new(true),
         }
     }
 
@@ -1599,6 +1603,7 @@ impl Bench {
             clock: &now,
             notifier: Some(&self.notified),
             usage: &usage,
+            web_tools: self.web_tools.get(),
         };
         let mut out = Vec::new();
         let mut sink = EventSink::new(REPO, EventLog::in_dir(&self.data), &mut out);
@@ -2948,6 +2953,7 @@ fn a_do_whose_agent_cannot_run_is_refused_before_anything() {
         clock: &on_demand::system_clock,
         notifier: None,
         usage: &UsageStore::in_data_dir(&bench.data),
+        web_tools: true,
     };
     let mut out = Vec::new();
     let mut sink = EventSink::new(REPO, EventLog::in_dir(&bench.data), &mut out);
@@ -3031,6 +3037,7 @@ fn a_git_older_than_the_floor_is_refused_before_the_lock_and_the_tracker() {
         clock: &on_demand::system_clock,
         notifier: None,
         usage: &UsageStore::in_data_dir(&bench.data),
+        web_tools: true,
     };
     for command in ["do", "continue"] {
         let mut out = Vec::new();
@@ -5190,7 +5197,8 @@ fn a_discoverable_question_is_decided_and_the_round_holds_the_rest() {
     let resolver = &briefs[1];
     assert_eq!(resolver.role, Role::Resolver);
     assert_eq!(resolver.permissions.level, PermissionLevel::ReadOnly);
-    assert!(!resolver.permissions.network);
+    // With its web tools (OWL-415).
+    assert!(resolver.permissions.network);
     assert_eq!(resolver.rules.len(), 1);
     let given: Vec<&str> = resolver.resolve.iter().map(|q| q.text.as_str()).collect();
     assert_eq!(given, ["Which file should hold the greeting?"]);
