@@ -7,7 +7,8 @@
 //! [`ChildProject::with_on_demand`] builds `OnDemand` as the bench does,
 //! with the Markdown tracker, the fake harness playing one reply file for
 //! every role, the agent environment unconfined, the system clock and a
-//! forge that answers nothing: a drain's intake reads none.
+//! forge with no pull request: a drain's intake reads none, and a
+//! dispatch reads that none is open (OWL-401).
 //! `owlshift-step-child` is the child, calling the same entry as
 //! `owlshift continue <TICKET> --step <ENVELOPE>`.
 
@@ -17,7 +18,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{Value, json};
 
 use owlshift_adapters::forge::Repo;
 use owlshift_adapters::forge::github::GitHubForge;
@@ -133,6 +134,49 @@ impl ChildProject {
         toml::from_str(&fs::read_to_string(path).unwrap()).unwrap()
     }
 
+    /// Writes the ticket `id` in the ready column, assigned to its decider,
+    /// labelled `labels`, with `front` added to its front matter (OWL-401).
+    pub fn add_ticket(&self, id: &str, labels: &[&str], front: &str) {
+        let dir = self.checkout.join("tickets").join(id);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            dir.join("ticket.md"),
+            format!(
+                "+++\ntitle = \"Ticket {id}\"\nauthor = \"maintainer\"\nstage = \"Todo\"\n\
+                 assignee = \"maintainer\"\nlabels = {labels:?}\n{front}+++\n\nGreet {id}.\n"
+            ),
+        )
+        .unwrap();
+    }
+
+    /// Moves the ticket `id` to `stage`, its front matter otherwise kept.
+    pub fn move_ticket(&self, id: &str, stage: &str) {
+        let file = self.checkout.join("tickets").join(id).join("ticket.md");
+        let text = fs::read_to_string(&file).unwrap();
+        let moved: Vec<String> = text
+            .lines()
+            .map(|line| {
+                if line.starts_with("stage = ") {
+                    format!("stage = \"{stage}\"")
+                } else {
+                    line.to_owned()
+                }
+            })
+            .collect();
+        fs::write(&file, format!("{}\n", moved.join("\n"))).unwrap();
+    }
+
+    /// Adds `line` to the `[policy]` of the project file the commands load,
+    /// such as `max_in_flight = 3` (OWL-401).
+    pub fn set_policy(&self, line: &str) {
+        let file = self.checkout.join("owlshift.toml");
+        let mut text = fs::read_to_string(&file).unwrap();
+        assert!(text.ends_with("[policy]\nalways_human = []\n"), "{text}");
+        text.push_str(line);
+        text.push('\n');
+        fs::write(&file, text).unwrap();
+    }
+
     /// Writes `reply`, what every run plays from now on; a result it names
     /// is `result`, written beside it.
     pub fn play(&self, mut reply: Reply, result: Option<&str>) {
@@ -213,12 +257,27 @@ impl ChildProject {
     }
 }
 
-/// A forge that answers nothing: no step of these tests reads it.
+/// A forge with no pull request (OWL-401): the open pull requests of the
+/// repository and the one of a ticket's branch, which a dispatch and its
+/// admission read, are none; any other request is refused, so a delivery
+/// stops at its pull request.
 struct NoForge;
 
 impl Transport for NoForge {
-    fn send(&self, _request: &Value) -> Result<Response, String> {
-        Err("this test's forge answers nothing".to_owned())
+    fn send(&self, request: &Value) -> Result<Response, String> {
+        let query = request["query"].as_str().unwrap_or_default();
+        let data = if query.starts_with("query OpenPullRequests") {
+            json!({ "repository": { "pullRequests": { "totalCount": 0, "nodes": [] } } })
+        } else if query.starts_with("query RepositoryPulls") {
+            json!({ "repository": { "pullRequests": {
+                "totalCount": 0,
+                "pageInfo": { "hasNextPage": false, "endCursor": null },
+                "nodes": [],
+            } } })
+        } else {
+            return Err("this test's forge answers nothing else".to_owned());
+        };
+        Ok(Response::new(200, json!({ "data": data }).to_string()))
     }
 }
 

@@ -554,9 +554,17 @@ fn load(
     let read = read_run(dirs, ticket).map_err(|why| {
         RunFault::Breach(format!("the run file of {ticket} cannot be read: {why}"))
     })?;
+    // A ticket of which nothing exists yet, no ref, no branch, no kept
+    // worktree, gets its empty baseline whatever runs (OWL-401): what a run
+    // in flight would make of it is found at its next start. Only a ticket
+    // from before P6 waits for no obligation to stand.
+    let nothing = actual.tip.is_none()
+        && actual.tip_alias.is_none()
+        && actual.ticket_ref.is_none()
+        && entry.is_none();
     let mut run = match read {
         Some(run) => run,
-        None if dirs.obligations_stand() => return Err(RunFault::Busy),
+        None if !nothing && dirs.obligations_stand() => return Err(RunFault::Busy),
         None => {
             alias_breach(ticket, &actual)?;
             let mut run = baseline(ticket, actual, entry.map(str::to_owned));
