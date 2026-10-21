@@ -116,7 +116,7 @@ use owlshift_contracts::event::EventKind;
 use owlshift_contracts::format::Format;
 use owlshift_contracts::ids::TicketId;
 use owlshift_contracts::step::{LandedKind, RefAfter, StepEnd, StepEnvelope, StepHold, StepKind};
-use owlshift_core::collision::{Collision, collision};
+use owlshift_core::collision::{Collision, Dispatched, collision};
 use owlshift_core::follow::{Action, Decision};
 use owlshift_core::schedule::{self, Turn};
 use owlshift_core::state::{Status, TicketState};
@@ -469,11 +469,15 @@ struct Memory<'c> {
     /// What watch knows of the marker that quarantines the project, while
     /// one stands (OWL-368).
     quarantine: Option<Quarantine>,
-    /// Whose turn the project's one slot is for watch's stage steps
-    /// (OWL-367): chosen at each pass by [`schedule::slot_turn`], its holder
-    /// keeping it while its ref holds the slot, and taken during a pass by
-    /// a ticket whose ref came to hold a free slot.
+    /// Whose turn the project's slot is for watch's stage steps (OWL-367,
+    /// OWL-401): chosen at each pass by [`schedule::slot_turn`], the first
+    /// `policy.max_in_flight` holders by dispatch time, and taken during a
+    /// pass by a ticket whose ref came to hold the slot while there is room.
     turn: Option<Turn<TicketId>>,
+    /// The holders the pass chose the turn among, each with its dispatch
+    /// time, and the refs it could not read: what an answer check weighs to
+    /// tell whether its ticket will wait for the turn (OWL-401).
+    holding: (Vec<(TicketId, Dispatched)>, Vec<TicketId>),
     /// The tickets told that their next stage step waits, with what was
     /// told: the slot's holders, or a collision (OWL-403).
     waits: HashMap<TicketId, StepWait>,
@@ -669,10 +673,10 @@ impl Watch<'_> {
                     .map(|state| (stored, state))
                     .map_err(|e| format!("its ticket ref keeps no valid state: {e:?}"))
             });
-            if let Ok((_, state)) = &state
+            if let Ok((stored, state)) = &state
                 && schedule::holds_slot(state)
             {
-                holding.push(ticket.clone());
+                holding.push((ticket.clone(), held::dispatched(stored)));
             }
             match state {
                 // A ticket parked at Watch is read for an end alone (OWL-243),
@@ -764,19 +768,18 @@ impl Watch<'_> {
         memory
             .stale
             .retain(&[&followed[..], &read[..], &unread[..]].concat());
-        // The slot's turn for this pass's stage steps (OWL-367), among the
-        // holders no collision holds back (OWL-403): one that waits for a
-        // ticket that waits for the turn would hold both.
-        let kept = match &memory.turn {
-            Some(Turn::Holder(holder)) => Some(holder),
-            _ => None,
-        };
-        let free: Vec<TicketId> = holding
+        // The slot's turn for this pass's stage steps (OWL-367), the first
+        // holders by dispatch time up to the project's capacity (OWL-401),
+        // among those no collision holds back (OWL-403): one that waits for
+        // a ticket that waits for the turn would hold both.
+        let free: Vec<(TicketId, Dispatched)> = holding
             .iter()
-            .filter(|ticket| !memory.collisions.contains_key(*ticket))
+            .filter(|(ticket, _)| !memory.collisions.contains_key(ticket))
             .cloned()
             .collect();
-        memory.turn = Some(schedule::slot_turn(&free, &unread, kept));
+        memory.turn = Some(schedule::slot_turn(&free, &unread, self.capacity()));
+        memory.holding = (free, unread.clone());
+        let holding: Vec<TicketId> = holding.into_iter().map(|(ticket, _)| ticket).collect();
         memory.resumed.retain(|ticket, _| holding.contains(ticket));
         memory
             .waits
@@ -1326,17 +1329,10 @@ impl Watch<'_> {
         {
             return;
         }
-        // The loop's Build holds the slot: it starts in a free turn only,
-        // read again at a later pass (OWL-367).
-        match memory.turn.clone() {
-            Some(Turn::Holder(holder)) => {
-                return self.wait_for_slot(memory, sink, out, ticket, vec![holder]);
-            }
-            Some(Turn::Unknown(unread)) => {
-                return self.wait_for_slot(memory, sink, out, ticket, unread);
-            }
-            Some(Turn::Free) | None => {}
-        }
+        // A review loop's start is a repair at Watch, which needs no room in
+        // the project's capacity (OWL-401; architecture section 5, "Three
+        // counts"): its Build then holds the slot, and its next step waits
+        // for its turn by dispatch time.
         let held = Seen::at(at, pr_reviews::newest(&due));
         self.held_run(
             memory,
@@ -1860,9 +1856,16 @@ impl Watch<'_> {
             return;
         }
         // The RESUME names the ticket whose turn the slot is (OWL-367).
-        let held_by = match &memory.turn {
-            Some(Turn::Holder(holder)) if holder != ticket => Some(holder.clone()),
-            _ => None,
+        // Since OWL-401, the first holder of the turn when the ticket, once
+        // resumed, would not be among them by its dispatch time.
+        let held_by = {
+            let (holding, unread) = &memory.holding;
+            let mut with = holding.clone();
+            with.push((ticket.clone(), held::dispatched(stored)));
+            match schedule::slot_turn(&with, unread, self.capacity()) {
+                Turn::Holders(holders) if !holders.contains(ticket) => holders.first().cloned(),
+                _ => None,
+            }
         };
         // The step records watch's `decision` event once the ticket ref is
         // confirmed under the lock, so the log never says watch continued a
@@ -1979,8 +1982,8 @@ impl Watch<'_> {
                 return self.wait_for_collision(memory, sink, out, ticket, found);
             }
             match memory.turn.clone() {
-                Some(Turn::Holder(holder)) if holder != *ticket => {
-                    return self.wait_for_slot(memory, sink, out, ticket, vec![holder]);
+                Some(Turn::Holders(holders)) if !holders.contains(ticket) => {
+                    return self.wait_for_slot(memory, sink, out, ticket, holders);
                 }
                 Some(Turn::Unknown(unread)) => {
                     return self.wait_for_slot(memory, sink, out, ticket, unread);
@@ -2101,23 +2104,26 @@ impl Watch<'_> {
         if moved && matches!(outcome, StepEnd::Stepped { .. }) {
             memory.stepped = true;
         }
-        // A ref that holds the slot now takes a free turn, or waits for the
-        // holder's, told in this very pass; a holder that left the slot
-        // gives it at the next pass, at once.
-        match memory.turn.clone().unwrap_or(Turn::Free) {
-            Turn::Free if holds_now => {
-                memory.turn = Some(Turn::Holder(ticket.clone()));
-                memory.waits.remove(ticket);
-            }
-            Turn::Holder(holder) if holder == *ticket => {
+        // A ref that holds the slot now takes the turn while fewer than the
+        // project's capacity hold it, or waits for its holders, told in this
+        // very pass; a holder that left the slot gives its turn at the next
+        // pass, at once (OWL-367, OWL-401).
+        match memory.turn.clone().unwrap_or(Turn::Holders(Vec::new())) {
+            Turn::Holders(holders) if holders.contains(ticket) => {
                 if holds_now {
                     memory.waits.remove(ticket);
                 } else if moved {
                     memory.stepped = true;
                 }
             }
-            Turn::Holder(holder) if holds_now => {
-                self.wait_for_slot(memory, sink, out, ticket, vec![holder]);
+            Turn::Holders(mut holders) if holds_now => {
+                if holders.len() < self.capacity() as usize {
+                    holders.push(ticket.clone());
+                    memory.turn = Some(Turn::Holders(holders));
+                    memory.waits.remove(ticket);
+                } else {
+                    self.wait_for_slot(memory, sink, out, ticket, holders);
+                }
             }
             Turn::Unknown(unread) if holds_now => {
                 self.wait_for_slot(memory, sink, out, ticket, unread);
@@ -2335,6 +2341,11 @@ impl Watch<'_> {
     }
 
     /// One line of watch's own, with this machine's time.
+    /// The project's capacity, `policy.max_in_flight` (OWL-401).
+    fn capacity(&self) -> u32 {
+        u32::from(self.on_demand.config.policy.max_in_flight())
+    }
+
     fn line(&self, out: &mut dyn Write, text: &str) {
         let now = (self.on_demand.clock)();
         let _ = writeln!(out, "{}", printable(&format!("{now} watch: {text}")));

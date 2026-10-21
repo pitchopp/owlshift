@@ -416,6 +416,7 @@ impl Watch<'_> {
             Caps {
                 concurrent_runs,
                 open_prs: Some(cap),
+                max_in_flight: u32::from(on_demand.config.policy.max_in_flight()),
             },
             Load {
                 runs,
@@ -464,30 +465,32 @@ impl Watch<'_> {
             self.line(out, &format!("{} waits: {reason}", row.id()));
             memory.drain.waits.insert(row.id().clone(), told);
         }
-        let Some(id) = ready.dispatch else {
-            return;
-        };
-        let Some(row) = rows.iter().find(|row| row.id().as_str() == id) else {
-            return;
-        };
-        if outside_unread {
-            return self.wait_for_outside(memory, sink, out, row.id());
+        // The pass's dispatches, in the ready set's order (OWL-401).
+        for id in &ready.dispatch {
+            let Some(row) = rows.iter().find(|row| row.id().as_str() == id) else {
+                continue;
+            };
+            if outside_unread {
+                self.wait_for_outside(memory, sink, out, row.id());
+                continue;
+            }
+            // Told again if it waits again for a reason it had before.
+            memory
+                .drain
+                .waits
+                .insert(row.id().clone(), "dispatch".to_owned());
+            if !memory.drain.unread.is_empty() {
+                return;
+            }
+            let Some(stored) = &row.stored else {
+                continue;
+            };
+            if quarantined {
+                self.tell(memory, sink, out, row.id(), Held::Ready);
+                continue;
+            }
+            self.dispatch(memory, row.id(), stored.at(), sink, out, continued);
         }
-        // Told again if it waits again for a reason it had before.
-        memory
-            .drain
-            .waits
-            .insert(row.id().clone(), "dispatch".to_owned());
-        if !memory.drain.unread.is_empty() {
-            return;
-        }
-        let Some(stored) = &row.stored else {
-            return;
-        };
-        if quarantined {
-            return self.tell(memory, sink, out, row.id(), Held::Ready);
-        }
-        self.dispatch(memory, row.id(), stored.at(), sink, out, continued);
     }
 
     /// Tells that `ticket`, which the ready set would dispatch, waits for

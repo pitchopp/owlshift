@@ -20,6 +20,10 @@ pub enum Dispatched {
     Unrecorded,
     /// At this time, in milliseconds since the Unix epoch.
     At(i64),
+    /// Dispatched earlier in the pass the ready set is computed for, the
+    /// `n`th (OWL-401): after every holder read, before the ticket weighed
+    /// now, whatever their identifiers.
+    Pass(u32),
     /// Not yet: the ticket a dispatch from Ready weighs, after every holder.
     Now,
 }
