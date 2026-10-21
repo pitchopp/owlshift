@@ -173,20 +173,27 @@ impl WaitComments {
 pub(super) struct QuarantineComments {
     /// `None` until the file was read.
     shown: Option<BTreeMap<TicketId, String>>,
+    /// The comments a new one superseded while the file, which may still
+    /// name them, could not be written: each with its ticket and the comment
+    /// that superseded it, folded once a write succeeds.
+    superseded: Vec<(TicketId, String, String)>,
 }
 
 impl QuarantineComments {
     /// The WAITING comment `comment` was posted on `ticket` for the
     /// quarantine that stands: recorded, and the one `ticket` had for an
-    /// earlier quarantine's text folded, superseded by it.
+    /// earlier quarantine's text folded, superseded by it, once the file no
+    /// longer names it. A record that cannot be written now is written
+    /// whole by the next, which folds it then.
     pub(super) fn posted(&mut self, board: &mut Board<'_, '_>, ticket: &TicketId, comment: &str) {
         let shown = self.load(board);
-        let before = shown.insert(ticket.clone(), comment.to_owned());
-        let shown = shown.clone();
-        // A record that cannot be written now is written whole by the next.
-        save(board, &shown);
-        if let Some(before) = before {
-            fold(board, ticket, &before, Some(comment));
+        if let Some(before) = shown.insert(ticket.clone(), comment.to_owned()) {
+            self.superseded
+                .push((ticket.clone(), before, comment.to_owned()));
+        }
+        let shown = self.shown.clone().unwrap_or_default();
+        if save(board, &shown) {
+            self.fold_superseded(board);
         }
     }
 
@@ -195,13 +202,23 @@ impl QuarantineComments {
     /// meanwhile resolves none twice; one that cannot be emptied leaves the
     /// folds to the next call.
     pub(super) fn fold_all(&mut self, board: &mut Board<'_, '_>) {
-        if self.load(board).is_empty() || !save(board, &BTreeMap::new()) {
+        if self.load(board).is_empty() && self.superseded.is_empty()
+            || !save(board, &BTreeMap::new())
+        {
             return;
         }
+        self.fold_superseded(board);
         for (ticket, comment) in self.shown.take().unwrap_or_default() {
             fold(board, &ticket, &comment, None);
         }
         self.shown = Some(BTreeMap::new());
+    }
+
+    /// Folds the comments superseded, which the file no longer names.
+    fn fold_superseded(&mut self, board: &mut Board<'_, '_>) {
+        for (ticket, before, by) in std::mem::take(&mut self.superseded) {
+            fold(board, &ticket, &before, Some(&by));
+        }
     }
 
     /// What the file says, read once: a file that does not read is a
@@ -678,6 +695,48 @@ mod tests {
         });
         assert!(folded.is_empty(), "{folded:?}");
         assert!(plain.resolved.borrow().is_empty());
+        assert!(!bench.dirs.quarantine_comments_file().exists());
+    }
+
+    /// A ticket told again while the record cannot be written keeps its
+    /// comment shown, the file still naming it: a watch started again then
+    /// folds it once. The next write that succeeds folds it, superseded,
+    /// and the clear folds the new one; each is resolved once.
+    #[test]
+    fn a_comment_superseded_while_the_record_cannot_be_written_is_folded_once() {
+        let bench = Bench::new();
+        let tracker = Board2::new(true);
+        let ticket = owl_7();
+        let mut told = QuarantineComments::default();
+        bench.with(&tracker, |board| told.posted(board, &ticket, "q1"));
+        // A folder where the temporary file goes makes the write fail.
+        let blocker = bench
+            .dirs
+            .quarantine_comments_file()
+            .with_extension("json.partial");
+        fs::create_dir(&blocker).unwrap();
+        let failed = bench.with(&tracker, |board| told.posted(board, &ticket, "q2"));
+        assert_eq!(
+            actions(&failed),
+            ["Warning quarantine_comments_not_recorded"]
+        );
+        assert!(tracker.resolved.borrow().is_empty());
+        assert_eq!(
+            read_quarantine(&bench.dirs).unwrap(),
+            BTreeMap::from([(ticket.clone(), "q1".to_owned())])
+        );
+        fs::remove_dir(&blocker).unwrap();
+
+        let folded = bench.with(&tracker, |board| {
+            told.fold_all(board);
+            told.fold_all(board);
+        });
+        assert_eq!(
+            actions(&folded),
+            ["TrackerWrite resolve", "TrackerWrite resolve"]
+        );
+        assert_eq!(folded[0].data["by"], "q2");
+        assert_eq!(*tracker.resolved.borrow(), ["q1", "q2"]);
         assert!(!bench.dirs.quarantine_comments_file().exists());
     }
 
