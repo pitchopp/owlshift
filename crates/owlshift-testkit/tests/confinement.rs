@@ -180,6 +180,7 @@ impl Bench {
             brief,
             setup,
             session: None,
+            siblings: None,
         };
         executor.run(&spec, harness)
     }

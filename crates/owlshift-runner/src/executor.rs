@@ -92,6 +92,7 @@ use owlshift_platform::sandbox;
 
 use crate::agent_env::{AgentEnv, CredentialFinding, RunPaths};
 use crate::artifact::{ArtifactContents, ArtifactError, MAX_ARTIFACT_BYTES, read_artifacts};
+use crate::ticket_run::Siblings;
 
 pub use codex::CodexHarness;
 pub use gate::{DEFAULT_GATE_TIMEOUT, GateReport, GateStep, SETUP_LOG, SETUP_PREFIX, SETUP_SHARE};
@@ -218,6 +219,11 @@ pub struct RunSpec<'a> {
     /// The session the run starts or resumes (OWL-394), on a harness that
     /// keeps sessions ([`Harness::session_key`]); `None` keeps none.
     pub session: Option<&'a SessionPlan>,
+    /// The project's other tickets, read from their run files and locks for
+    /// the run's checks (OWL-400, [`isolation::Snapshot::check_among`]):
+    /// their generations just before the snapshot, then each check's two
+    /// reads. `None` checks the run alone ([`isolation::Snapshot::check`]).
+    pub siblings: Option<&'a Siblings<'a>>,
 }
 
 /// The session a run is given (OWL-394, architecture section 4, "Resuming
@@ -623,6 +629,10 @@ impl Executor {
         if !findings.is_empty() {
             return Err(ExecutorError::Credentials(findings));
         }
+        // The other tickets' generations, just before the snapshot (OWL-400):
+        // one that cannot be read is the check failing, the run's outcome a
+        // quarantine, never a run alone's check.
+        let marks = spec.siblings.map(Siblings::marks);
         let before = match onto {
             Some(onto) => isolation::Snapshot::take_rebase(
                 &self.git,
@@ -634,6 +644,20 @@ impl Executor {
             None => isolation::Snapshot::take(&self.git, spec.main, spec.worktree, spec.branch),
         }
         .map_err(|e| ExecutorError::Snapshot(e.to_string()))?;
+        let check = || match (spec.siblings, &marks) {
+            (Some(siblings), Some(marks)) => {
+                let read = || {
+                    marks
+                        .as_ref()
+                        .map_err(Clone::clone)
+                        .and_then(|marks| siblings.concurrent(marks))
+                };
+                before
+                    .check_among(&self.git, spec.main, spec.worktree, spec.branch, &read)
+                    .violations
+            }
+            _ => before.check(&self.git, spec.main, spec.worktree, spec.branch),
+        };
 
         // The project's setup, before anything of the harness is prepared
         // (OWL-330): confined as the gate is, in the run's own temporary
@@ -657,7 +681,7 @@ impl Executor {
             );
             let stopped = after_check(
                 &ran.report,
-                || before.check(&self.git, spec.main, spec.worktree, spec.branch),
+                check,
                 |failure| (!ran.recoverable()).then_some(Failure::Setup(failure)),
             );
             if let Some(outcome) = stopped {
@@ -870,7 +894,7 @@ impl Executor {
             }));
         }
 
-        let violations = before.check(&self.git, spec.main, spec.worktree, spec.branch);
+        let violations = check();
         let result = match &run_files {
             Some(run_files) => (run_files.as_path(), RUN_FILES_RESULT),
             None => (spec.worktree, RESULT_PATH),
@@ -925,7 +949,7 @@ impl Executor {
             );
             if let Some(after_gate) = after_check(
                 &report,
-                || before.check(&self.git, spec.main, spec.worktree, spec.branch),
+                check,
                 |failure| Some(Failure::Gate(failure)),
             ) {
                 outcome = after_gate;

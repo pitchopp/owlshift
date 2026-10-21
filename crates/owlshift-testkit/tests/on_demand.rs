@@ -1815,7 +1815,23 @@ fn a_ticket_becomes_a_pull_request_with_its_report() {
     );
     assert!(!bench.remote.checkout.join("GREETING.md").exists());
     assert_eq!(bench.person(), person);
-    assert_eq!(dirs.unverified().unwrap(), None);
+    assert_eq!(dirs.quarantine().unwrap(), None);
+    // The run's obligation went with its passed check, and the ticket's run
+    // file holds the branch as the check verified it (OWL-400).
+    assert!(!dirs.obligations_stand());
+    let run = fs::read_to_string(dirs.run_file(&TicketId::new(TICKET).unwrap())).unwrap();
+    let run = owlshift_contracts::step::TicketRun::parse(&run).unwrap();
+    let head = bench
+        .env
+        .run(
+            &dirs.checkout(),
+            &["rev-parse", &format!("refs/heads/owlshift/{}", TICKET.to_lowercase())],
+        )
+        .unwrap();
+    assert_eq!(
+        run.tip.as_deref(),
+        Some(String::from_utf8(head).unwrap().trim())
+    );
 
     // The ticket ref keeps the delivery, and the ticket at Watch: watch
     // follows its pull request (OWL-209).
@@ -2620,8 +2636,11 @@ fn a_quarantined_run_keeps_the_project_refused() {
         .insert(RelativePath::new("planted.txt").unwrap(), "x".to_owned());
     let (outcome, _) = bench.run(vec![reply], None);
     assert!(matches!(outcome, Err(Stop::Parked { .. })), "{outcome:?}");
-    let marker = bench.dirs().unverified().unwrap().expect("a marker");
+    let marker = bench.dirs().quarantine().unwrap().expect("a quarantine");
     assert!(marker.contains("broke isolation"), "{marker}");
+    // The breaching run's obligation stays until a person clears it
+    // (OWL-400).
+    assert!(bench.dirs().obligations_stand());
 
     let (again, _) = bench.run(Vec::new(), None);
     let Err(stop @ Stop::Unverified { .. }) = again else {
@@ -2718,7 +2737,7 @@ fn an_agent_that_redirects_its_git_link_gets_no_hook_and_no_push() {
     assert_eq!(comments.len(), 1, "{comments:?}");
     assert!(comments[0].starts_with("[owlshift] PARKED\n"));
     assert!(!comments[0].contains(".git"), "{}", comments[0]);
-    let marker = bench.dirs().unverified().unwrap().expect("a marker");
+    let marker = bench.dirs().quarantine().unwrap().expect("a quarantine");
     assert!(marker.contains(".git link"), "{marker}");
 }
 
@@ -2805,7 +2824,7 @@ fn a_run_that_moves_origin_main_does_not_choose_the_next_base() {
         "{outcome:?}\n{printed}"
     );
     // Not a breach: the check leaves remote-tracking refs out.
-    assert_eq!(bench.dirs().unverified().unwrap(), None);
+    assert_eq!(bench.dirs().quarantine().unwrap(), None);
     let evil = evil.borrow().clone();
     let checkout = bench.dirs().checkout();
     let at = |dir: &Path, name: &str| {
@@ -3946,12 +3965,19 @@ fn an_answer_on_the_ticket_resumes_it_under_watch() {
                 bench.waited.set(SignedDuration::from_mins(20));
                 lock = Some(dirs.lock().unwrap().expect("the project is free"));
             }
-            // Skipped. Then a run's isolation check left the project
-            // unverified.
+            // Skipped. Then a run was cut off before its isolation check:
+            // its obligation, its ticket's lock free, which the next pass
+            // turns into the quarantine (OWL-400).
             4 => {
                 assert_eq!(ran(), 1);
                 drop(lock.take());
-                fs::write(dirs.unverified_file(), "A run was cut off.\n").unwrap();
+                owlshift_runner::ticket_run::write_obligation(
+                    &dirs,
+                    Some(&ticket()),
+                    "20261019T000000Z",
+                    "Run 20261019T000000Z of DEMO-1",
+                )
+                .unwrap();
             }
             // Nothing is continued until a person clears it; the operator
             // is notified once, the ticket told once.
@@ -3966,8 +3992,11 @@ fn an_answer_on_the_ticket_resumes_it_under_watch() {
                 let mut out = Vec::new();
                 let mut sink = EventSink::new(REPO, EventLog::in_dir(&bench.data), &mut out);
                 let mut ask = |_: &str| Ok(format!("{REPO}\n"));
-                let cleared = quarantine::clear(&dirs, &mut ask, &mut sink).unwrap();
+                let env = bench.env.clone();
+                let git = Git::with_setup("git", move |command| env.apply(command));
+                let cleared = quarantine::clear(&git, &dirs, &mut ask, &mut sink).unwrap();
                 assert!(matches!(cleared, quarantine::Cleared::Cleared { .. }));
+                assert!(!dirs.obligations_stand(), "cleared for good");
             }
             // Continued: the answer check, then, at the next pass, at once
             // (OWL-367), Build and its Verify pass ran (OWL-304). The next
@@ -4485,7 +4514,7 @@ fn a_failed_check_is_retried_and_a_parked_ticket_restarts_on_continue() {
 
     // A person looked and cleared the project; `continue` restarts the ticket
     // and checks the same answers, with no new comment.
-    fs::remove_file(bench.dirs().unverified_file()).unwrap();
+    bench.unquarantine();
     // A watch that read the ticket before the park never restarts it
     // (OWL-152): the ticket ref is not the one it read, so nothing runs,
     // and nothing records that watch continued it.
@@ -7563,7 +7592,7 @@ fn a_stage_left_at_working_is_moved_only_under_the_lock_and_unchanged() {
     // A run stopped meanwhile, leaving the project for a person to look at.
     let bench = delivered();
     left_working(&bench);
-    let marker = bench.dirs().unverified_file();
+    let marker = bench.dirs().quarantine_file();
     *bench.after_stage_read.borrow_mut() = Some(Box::new(move || {
         fs::write(&marker, "a run stopped\n").unwrap();
     }));

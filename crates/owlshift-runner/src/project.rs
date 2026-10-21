@@ -179,6 +179,13 @@ impl ProjectDirs {
         self.ticket_lock_within(ticket, LOCK_GRACE)
     }
 
+    /// [`ProjectDirs::ticket_lock`] with a single try: what `owlshift
+    /// unquarantine` takes to bring a ticket's run file up to date, never
+    /// waiting on a command that holds it (OWL-400).
+    pub(crate) fn try_ticket_lock(&self, ticket: &TicketId) -> io::Result<Option<TicketLock>> {
+        self.ticket_lock_within(ticket, Duration::ZERO)
+    }
+
     /// [`ProjectDirs::ticket_lock`] within `wait`: a single try when zero.
     fn ticket_lock_within(
         &self,
@@ -471,7 +478,7 @@ pub struct TicketLock {
 /// A path component every platform takes as is, and the same whatever the
 /// case of the name: lower case, with `_` added after a Windows device name
 /// (`con`, `nul`, `com1`…) or a trailing dot.
-fn component(name: &str) -> String {
+pub(crate) fn component(name: &str) -> String {
     let lower = name.to_ascii_lowercase();
     let stem = lower.split('.').next().unwrap_or_default();
     let numbered = |prefix: &str| {

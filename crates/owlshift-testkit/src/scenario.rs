@@ -1181,6 +1181,7 @@ impl Driver {
             brief: &brief,
             setup: &self.setup,
             session: None,
+            siblings: None,
         };
         let harness = FakeHarness {
             program: self.fake_harness.clone(),

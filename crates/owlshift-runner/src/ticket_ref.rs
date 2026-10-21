@@ -24,7 +24,9 @@
 //! ref moves only from the commit it was read at (`update-ref` with the old
 //! value). The runner writes between runs; a run that touches the ref breaks
 //! the isolation check, which covers every ref but the run's branch and the
-//! remote-tracking refs.
+//! remote-tracking refs. Since OWL-400 every write in production goes
+//! through the ticket's run file ([`crate::ticket_run`], [`RefGuard`]), and
+//! a move never follows a symbolic ref.
 //!
 //! Every git command is the runner's own ([`Git`]): no hook, no file-system
 //! monitor, no filter on the blobs, and no signature on the commits.
@@ -245,6 +247,87 @@ pub fn read(git: &Git, checkout: &Path, ticket: &TicketId) -> Result<Option<Stor
         Ok(stored) => Ok(Some(stored)),
         Err(ReadError::Invalid(why) | ReadError::Git(why)) => Err(why),
     }
+}
+
+/// The object the ticket ref of `ticket` points to, as `for-each-ref` lists
+/// it, through a symbolic ref: what the run file protocol compares (OWL-400,
+/// [`crate::ticket_run`]); `None` when there is no ref. A symbolic ticket
+/// ref is refused by [`read`], and every move replaces it rather than its
+/// target ([`move_ref`]).
+pub fn pointed(git: &Git, checkout: &Path, ticket: &TicketId) -> Result<Option<String>, String> {
+    Ok(listed(git, checkout, &ticket_ref(ticket))?.map(|listed| listed.oid))
+}
+
+/// What a write of a ticket ref tells around its move (OWL-400): the run
+/// file keeps the value the ref moves to before it moves, and the value it
+/// landed at after, so a write cut off between the two is finished by the
+/// next holder of the ticket's lock ([`crate::ticket_run`]). Production code
+/// writes a ticket ref only through `ticket_run`; [`Unguarded`] is for tests
+/// and the test bench, which build refs by hand.
+pub trait RefGuard {
+    /// Just before the ref moves from `from` to `to`, `None` being no ref:
+    /// an error stops the write, nothing moved.
+    fn before(&mut self, from: Option<&str>, to: Option<&str>) -> Result<(), String>;
+    /// Once the move was tried, `moved` whether it landed at `to`.
+    fn after(&mut self, to: Option<&str>, moved: bool) -> Result<(), String>;
+}
+
+/// A write told nothing: tests and the test bench, never production code.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Unguarded;
+
+impl RefGuard for Unguarded {
+    fn before(&mut self, _: Option<&str>, _: Option<&str>) -> Result<(), String> {
+        Ok(())
+    }
+
+    fn after(&mut self, _: Option<&str>, _: bool) -> Result<(), String> {
+        Ok(())
+    }
+}
+
+/// Moves the ref `name` from `previous` to `to` (deleted when `None`)
+/// through `guard`, never following a symbolic ref (OWL-400): a run that
+/// turned the ref into one has its alias replaced, not its target moved.
+fn move_ref(
+    git: &Git,
+    checkout: &Path,
+    name: &str,
+    (previous, to): (Option<&str>, Option<&str>),
+    message: &str,
+    guard: &mut dyn RefGuard,
+) -> Result<(), String> {
+    guard.before(previous, to)?;
+    let moved = match to {
+        Some(to) => git.run(
+            checkout,
+            &[
+                "update-ref",
+                "--no-deref",
+                "-m",
+                message,
+                name,
+                to,
+                previous.unwrap_or(""),
+            ],
+        ),
+        None => git.run(
+            checkout,
+            &[
+                "update-ref",
+                "--no-deref",
+                "-m",
+                message,
+                "-d",
+                name,
+                previous.unwrap_or(""),
+            ],
+        ),
+    };
+    let told = guard.after(to, moved.is_ok());
+    let what = if to.is_some() { "moving" } else { "deleting" };
+    moved.map_err(|e| format!("{what} {name}: {e}"))?;
+    told.map_err(|e| format!("{name} moved, but {e}"))
 }
 
 /// A ref as `for-each-ref` lists it.
@@ -642,6 +725,8 @@ pub fn write(
 /// [`write()`], doing `proposals` with [`PROPOSALS_FILE`] (OWL-253): the
 /// proposals are kept in the very write that keeps the delivery or the
 /// repair that owes them, and as filed in the write after their filing.
+/// Told nothing ([`Unguarded`]): production code writes through
+/// [`crate::ticket_run`], which calls [`write_proposals_guarded`].
 pub fn write_proposals(
     git: &Git,
     checkout: &Path,
@@ -649,6 +734,27 @@ pub fn write_proposals(
     record: &TicketRecord,
     proposals: ProposalsFile<'_>,
     previous: Option<&str>,
+) -> Result<String, String> {
+    write_proposals_guarded(
+        git,
+        checkout,
+        ticket,
+        record,
+        proposals,
+        previous,
+        &mut Unguarded,
+    )
+}
+
+/// [`write_proposals`], the move told to `guard` (OWL-400).
+pub fn write_proposals_guarded(
+    git: &Git,
+    checkout: &Path,
+    ticket: &TicketId,
+    record: &TicketRecord,
+    proposals: ProposalsFile<'_>,
+    previous: Option<&str>,
+    guard: &mut dyn RefGuard,
 ) -> Result<String, String> {
     let name = ticket_ref(ticket);
     let mut files = vec![
@@ -747,18 +853,14 @@ pub fn write_proposals(
         args.extend(["-p", previous]);
     }
     let commit = text(git.run(checkout, &args).map_err(|e| e.to_string())?);
-    git.run(
+    move_ref(
+        git,
         checkout,
-        &[
-            "update-ref",
-            "-m",
-            "owlshift: the ticket's state",
-            &name,
-            &commit,
-            previous.unwrap_or(""),
-        ],
-    )
-    .map_err(|e| format!("moving {name}: {e}"))?;
+        &name,
+        (previous, Some(&commit)),
+        "owlshift: the ticket's state",
+        guard,
+    )?;
     Ok(commit)
 }
 
@@ -811,6 +913,17 @@ pub enum Previous {
 /// or one that points to anything but a commit, is deleted, its target
 /// untouched. A git command that fails changes nothing.
 pub fn forget(git: &Git, checkout: &Path, ticket: &TicketId) -> Result<Option<Forgot>, String> {
+    forget_guarded(git, checkout, ticket, &mut Unguarded)
+}
+
+/// [`forget`], its write or deletion told to `guard` (OWL-400): what
+/// `owlshift forget` runs, through [`crate::ticket_run`].
+pub fn forget_guarded(
+    git: &Git,
+    checkout: &Path,
+    ticket: &TicketId,
+    guard: &mut dyn RefGuard,
+) -> Result<Option<Forgot>, String> {
     let name = ticket_ref(ticket);
     let Some(listed) = listed(git, checkout, &name)? else {
         return Ok(None);
@@ -836,19 +949,14 @@ pub fn forget(git: &Git, checkout: &Path, ticket: &TicketId) -> Result<Option<Fo
         Err(ReadError::Git(error)) => return Err(error),
         Err(ReadError::Invalid(why)) if listed.symref.is_some() || listed.kind != "commit" => {
             // `--no-deref`: a symbolic ref goes, not the ref it points to.
-            git.run(
+            move_ref(
+                git,
                 checkout,
-                &[
-                    "update-ref",
-                    "-m",
-                    "owlshift: forget",
-                    "--no-deref",
-                    "-d",
-                    &name,
-                    &listed.oid,
-                ],
-            )
-            .map_err(|e| format!("deleting {name}: {e}"))?;
+                &name,
+                (Some(&listed.oid), None),
+                "owlshift: forget",
+                guard,
+            )?;
             return Ok(Some(Forgot::Deleted {
                 previous: listed.oid,
                 why,
@@ -864,7 +972,15 @@ pub fn forget(git: &Git, checkout: &Path, ticket: &TicketId) -> Result<Option<Fo
     // 512-byte texts, reasons of 2 KB), and `write` keeps any other entry of
     // the old tree as it is, `proposals.json` included unless it no longer
     // parses, so nothing is filed twice (OWL-245, OWL-253).
-    let commit = write_proposals(git, checkout, ticket, &kept, proposals, Some(&listed.oid))?;
+    let commit = write_proposals_guarded(
+        git,
+        checkout,
+        ticket,
+        &kept,
+        proposals,
+        Some(&listed.oid),
+        guard,
+    )?;
     Ok(Some(Forgot::Rewritten {
         previous: listed.oid,
         commit,

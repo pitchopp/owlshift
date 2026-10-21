@@ -295,6 +295,7 @@ impl Bench {
                     brief: &brief,
                     setup: &self.config.stack.setup,
                     session: None,
+                    siblings: None,
                 },
                 &harness,
             )

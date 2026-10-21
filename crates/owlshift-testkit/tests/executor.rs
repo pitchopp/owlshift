@@ -159,6 +159,7 @@ impl Bench {
             brief,
             setup: &[],
             session: None,
+            siblings: None,
         };
         executor.run(&spec, harness)
     }
@@ -179,6 +180,7 @@ impl Bench {
             brief: &self.brief,
             setup: &[],
             session: None,
+            siblings: None,
         };
         self.executor
             .run(&spec, &NeverRuns)
@@ -919,6 +921,7 @@ fn a_resume_without_its_transcript_starts_the_runs_own_session() {
             brief: &bench.brief,
             setup: &[],
             session: Some(&plan),
+            siblings: None,
         };
         bench.executor.run(&spec, harness)
     };
@@ -1247,6 +1250,7 @@ mod setup {
                 brief,
                 setup: &setup,
                 session: None,
+                siblings: None,
             };
             executor.run(&spec, harness).unwrap()
         }

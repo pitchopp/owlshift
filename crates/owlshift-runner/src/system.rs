@@ -163,8 +163,9 @@ pub trait System {
             .map(Some)
             .map_err(|_| "git could not list them in the dedicated checkout".to_owned())
     }
-    /// Where the `unverified` marker of the project whose repository is at
-    /// `root` stands ([`crate::quarantine::marker_state`], OWL-368), found
+    /// Where the quarantine of the project whose repository is at `root`
+    /// stands, with its runs' obligations ([`crate::quarantine::state`],
+    /// OWL-368, OWL-400), found
     /// in the data directory as `owlshift do` finds it. The error says why
     /// it could not be read, in Owlshift's words only. Only `owlshift
     /// doctor` asks.
@@ -175,8 +176,10 @@ pub trait System {
             .data_dir()
             .ok_or_else(|| "this system has no data directory".to_owned())?;
         let dirs = crate::project::ProjectDirs::new(&data_dir, &repo);
-        crate::quarantine::marker_state(&dirs)
-            .map_err(|_| "the project's marker or its lock could not be read".to_owned())
+        crate::quarantine::state(&dirs).map_err(|_| {
+            "the project's quarantine, its runs' obligations or their locks could not be read"
+                .to_owned()
+        })
     }
     /// The project file at the default branch of the checkout at `root`, as
     /// its last fetch left `refs/remotes/origin/HEAD`
@@ -577,7 +580,7 @@ pub(crate) mod fake {
 
         /// As [`Self::quarantine_is`] scripted it; never the disk.
         fn quarantine(&self, _root: &Path) -> Result<MarkerState, String> {
-            self.quarantine.clone().unwrap_or(Ok(MarkerState::Clear))
+            self.quarantine.clone().unwrap_or(Ok(MarkerState::default()))
         }
 
         /// As [`Self::default_branch_file_is`] scripted it; never git.

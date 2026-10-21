@@ -1,6 +1,6 @@
 //! `owlshift unquarantine` (OWL-368): finds the project of the current
 //! repository from its `origin`, then hands it to
-//! `owlshift_runner::quarantine::clear`, which shows the `unverified`
+//! `owlshift_runner::quarantine::clear`, which shows the quarantine
 //! marker and clears it once a person types the project's name. It reads
 //! no credential and needs no valid `owlshift.toml`, so a broken file does
 //! not keep a project quarantined. It runs only at a terminal: a script or
@@ -31,7 +31,7 @@ pub fn run(config: &Effective) -> ExitCode {
         }
         Ok(Cleared::Cleared { .. }) => {
             println!(
-                "\nCleared: the marker is gone, and the next command or watch pass works the \
+                "\nCleared: the quarantine is gone, and the next command or watch pass works the \
                  project again."
             );
             ExitCode::SUCCESS
@@ -55,7 +55,7 @@ fn run_with(config: &Effective) -> Result<Cleared, String> {
     let dirs = ProjectDirs::new(&data_dir, &repo);
     let mut stdout = io::stdout();
     let mut sink = EventSink::new(repo.to_string(), EventLog::in_dir(&data_dir), &mut stdout);
-    quarantine::clear(&dirs, &mut ask, &mut sink)
+    quarantine::clear(&git, &dirs, &mut ask, &mut sink)
 }
 
 /// The repository the project file is looked for in.

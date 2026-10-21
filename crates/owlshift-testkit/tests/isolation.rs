@@ -604,9 +604,8 @@ fn concurrent_runs_pass_and_every_other_ref_stays_guarded() {
     f.commit_file(&second, "FAREWELL.md", "bye\n");
 
     // The second run ends first, while the first one still runs.
-    let ended = other.check_among(&git, &f.main, &second, SECOND, &|| Concurrent {
-        running: [BRANCH.to_owned()].into(),
-        ..Concurrent::default()
+    let ended = other.check_among(&git, &f.main, &second, SECOND, &|| {
+        Ok(Concurrent::default().running_branch(BRANCH))
     });
     assert_eq!(ended.violations, []);
     let tip = ended.tip.expect("the second worktree is on its branch");
@@ -615,7 +614,7 @@ fn concurrent_runs_pass_and_every_other_ref_stays_guarded() {
         .lock()
         .unwrap()
         .ended
-        .insert(SECOND.to_owned(), tip);
+        .insert(format!("refs/heads/{SECOND}"), [Some(tip)].into());
 
     // Then the first run's check. While it reads the refs, a third run
     // starts (it registers, then creates its branch) and the fourth run
@@ -626,13 +625,17 @@ fn concurrent_runs_pass_and_every_other_ref_stays_guarded() {
     f.env
         .run(&fourth, &["reset", "--quiet", "--hard", "HEAD~1"])
         .unwrap();
-    registry.lock().unwrap().running.insert(FOURTH.to_owned());
+    registry
+        .lock()
+        .unwrap()
+        .running
+        .insert(format!("refs/heads/{FOURTH}"));
     *during_read.lock().unwrap() = Some(Box::new({
         let (env, main, registry) = (f.env.clone(), f.main.clone(), registry.clone());
         let (base, last) = (base.clone(), last.clone());
         move || {
             let mut registry = registry.lock().unwrap();
-            registry.running.insert(THIRD.to_owned());
+            registry.running.insert(format!("refs/heads/{THIRD}"));
             let add = [
                 "worktree",
                 "add",
@@ -643,11 +646,13 @@ fn concurrent_runs_pass_and_every_other_ref_stays_guarded() {
                 &base,
             ];
             env.run(&main, &add).unwrap();
-            registry.running.remove(FOURTH);
-            registry.ended.insert(FOURTH.to_owned(), last);
+            registry.running.remove(&format!("refs/heads/{FOURTH}"));
+            registry
+                .ended
+                .insert(format!("refs/heads/{FOURTH}"), [Some(last)].into());
         }
     }));
-    let scheduler = || registry.lock().unwrap().clone();
+    let scheduler = || Ok(registry.lock().unwrap().clone());
     let checked = first.check_among(&git, &f.main, &f.worktree, BRANCH, &scheduler);
     assert!(
         during_read.lock().unwrap().is_none(),
@@ -705,6 +710,69 @@ fn concurrent_runs_pass_and_every_other_ref_stays_guarded() {
     );
 }
 
+/// A sibling ticket's ref is held as its branch is (OWL-400): left out
+/// while its ticket runs, at one of its run file's values once it ended,
+/// whole against the snapshot otherwise; and a ref a run turned into an
+/// alias of another at the same commit is a change.
+#[test]
+fn a_siblings_ticket_ref_is_held_as_its_branch_and_an_alias_is_a_change() {
+    const SIBLING: &str = "refs/owlshift/tickets/T-2";
+    const ALIASED: &str = "refs/owlshift/tickets/T-3";
+    let f = Fixture::new();
+    let first = f.commit(&f.main, "origin/main");
+    f.main_git(&["update-ref", SIBLING, &first]);
+    f.main_git(&["update-ref", ALIASED, &first]);
+    let before = Snapshot::take(&f.git, &f.main, &f.worktree, BRANCH).unwrap();
+    f.commit_file(&f.worktree, "GREETING.md", "hi\n");
+    let moved = f.commit(&f.worktree, "HEAD");
+    f.main_git(&["update-ref", SIBLING, &moved]);
+    let check = |told: Concurrent| {
+        before
+            .check_among(&f.git, &f.main, &f.worktree, BRANCH, &|| Ok(told.clone()))
+            .violations
+    };
+    let ended = |values: &[&str]| Concurrent {
+        ended: [(
+            SIBLING.to_owned(),
+            values.iter().map(|v| Some((*v).to_owned())).collect(),
+        )]
+        .into(),
+        ..Concurrent::default()
+    };
+    let refs = |names: &[&str]| Violation::Refs(names.iter().map(|n| (*n).to_owned()).collect());
+    let running = Concurrent {
+        running: [SIBLING.to_owned()].into(),
+        ..Concurrent::default()
+    };
+    assert_eq!(check(running), []);
+    assert_eq!(check(ended(&[&moved])), []);
+    assert_eq!(check(ended(&[&first, &moved])), [], "a write under way");
+    assert_eq!(check(ended(&[&first])), [refs(&[SIBLING])]);
+    assert_eq!(check(Concurrent::default()), [refs(&[SIBLING])]);
+
+    // The alias: the same commit, through a remote-tracking ref a run may
+    // move.
+    f.main_git(&["update-ref", "refs/remotes/origin/planted", &first]);
+    f.main_git(&["symbolic-ref", ALIASED, "refs/remotes/origin/planted"]);
+    let running = Concurrent {
+        running: [SIBLING.to_owned()].into(),
+        ..Concurrent::default()
+    };
+    assert_eq!(check(running), [refs(&[ALIASED])]);
+    // An unreadable answer is a check that could not run.
+    let unread = before.check_among(&f.git, &f.main, &f.worktree, BRANCH, &|| {
+        Err("tickets/t-2/run.json: invalid".to_owned())
+    });
+    assert!(
+        unread.violations.iter().any(|violation| matches!(
+            violation,
+            Violation::CheckFailed(why) if why.contains("tickets/t-2/run.json")
+        )),
+        "{:?}",
+        unread.violations
+    );
+}
+
 const OTHER: &str = "other";
 const RUNNING: &str = "owlshift/running";
 
@@ -723,10 +791,11 @@ fn entries(paths: &[&str]) -> Violation {
 }
 
 fn running(branches: &[&str]) -> Concurrent {
-    Concurrent {
-        running: branches.iter().map(|branch| (*branch).to_owned()).collect(),
-        ..Concurrent::default()
-    }
+    branches
+        .iter()
+        .fold(Concurrent::default(), |known, branch| {
+            known.running_branch(branch)
+        })
 }
 
 /// A run's own commit, `add` and rebase change its own entry and nothing of
@@ -911,9 +980,9 @@ fn a_concurrent_runs_entry_is_left_out_when_the_check_is_told_of_it() {
             .check_among(&f.git, &f.main, &f.worktree, BRANCH, &|| {
                 calls.set(calls.get() + 1);
                 if calls.get() == 1 {
-                    first.clone()
+                    Ok(first.clone())
                 } else {
-                    second.clone()
+                    Ok(second.clone())
                 }
             })
             .violations
@@ -931,10 +1000,7 @@ fn a_concurrent_runs_entry_is_left_out_when_the_check_is_told_of_it() {
     // Or of a run that ended, in either answer or both, at the commit its
     // own check verified: the entry it left is its too.
     let tip = f.commit(&other_worktree, "HEAD");
-    let ended = || Concurrent {
-        ended: [(OTHER.to_owned(), tip.clone())].into(),
-        ..Concurrent::default()
-    };
+    let ended = || Concurrent::default().ended_branch(OTHER, &tip);
     assert_eq!(check(&before, ended(), ended()), []);
     assert_eq!(check(&before, Concurrent::default(), ended()), []);
     assert_eq!(check(&before, ended(), Concurrent::default()), []);
@@ -986,7 +1052,7 @@ fn an_entry_made_after_the_snapshot_is_judged_by_the_branch_it_holds() {
     let before = Snapshot::take(&f.git, &f.main, &f.worktree, BRANCH).unwrap();
     make(&f);
     let told = running(&[RUNNING]);
-    let checked = before.check_among(&f.git, &f.main, &f.worktree, BRANCH, &|| told.clone());
+    let checked = before.check_among(&f.git, &f.main, &f.worktree, BRANCH, &|| Ok(told.clone()));
     assert_eq!(checked.violations, []);
     let alone = before.check(&f.git, &f.main, &f.worktree, BRANCH);
     assert!(
@@ -1006,9 +1072,9 @@ fn an_entry_made_after_the_snapshot_is_judged_by_the_branch_it_holds() {
             calls.set(calls.get() + 1);
             if calls.get() == 1 {
                 make(&f);
-                Concurrent::default()
+                Ok(Concurrent::default())
             } else {
-                second.clone()
+                Ok(second.clone())
             }
         });
         assert_eq!(checked.violations.is_empty(), expected_clean, "{checked:?}");

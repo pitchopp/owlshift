@@ -2326,63 +2326,96 @@ fn drain_slot_check(system: &dyn System, config: &Effective) -> Option<Check> {
 }
 
 /// Whether a run's isolation check left the project quarantined (OWL-368):
-/// a failure while its `unverified` marker stands and no command holds the
-/// project's lock, since every command then refuses the project; with the
-/// lock held, information, since every run writes the marker as it starts.
-/// Read for a project file that loads or is invalid: the quarantine does
-/// not depend on it.
+/// a failure while the quarantine stands, or while a run's obligation was
+/// left behind by a crash or a stop, which the next command or watch pass
+/// turns into the quarantine (OWL-400), since every command then refuses the
+/// project; information for the runs still in flight, whose ticket's lock is
+/// held. Read for a project file that loads or is invalid: the quarantine
+/// does not depend on it.
 fn quarantine_check(system: &dyn System, config: &Effective, home: Option<&Path>) -> Option<Check> {
     const SUBJECT: &str = "quarantine";
     let (FileState::Loaded { path, .. } | FileState::Invalid { path, .. }) = &config.project else {
         return None;
     };
     let root = path.parent()?;
-    Some(match system.quarantine(root) {
-        Ok(MarkerState::Clear) => Check::ok(Section::Project, SUBJECT, "not quarantined"),
-        Ok(MarkerState::InFlight) => Check::info(
-            Section::Project,
-            SUBJECT,
-            "a command is working the project, and a run writes the marker as it starts: run \
-             `owlshift doctor` again once it ends",
-        ),
-        Ok(MarkerState::Marked { path, text }) => {
-            let said: Vec<&str> = text
+    let state: MarkerState = match system.quarantine(root) {
+        Ok(state) => state,
+        Err(why) => {
+            return Some(Check::info(
+                Section::Project,
+                SUBJECT,
+                format!("the quarantine was not read: {why}"),
+            ));
+        }
+    };
+    let named = |standing: &crate::ticket_run::Standing| match &standing.found.record {
+        Ok(record) => record.what.clone(),
+        Err(_) => format!("{} (unreadable)", standing.found.name),
+    };
+    let running: Vec<String> = state.running().map(named).collect();
+    let in_flight = (!running.is_empty())
+        .then(|| format!("in flight: {}", running.join("; ")))
+        .unwrap_or_default();
+    let left: Vec<String> = state.left_behind().map(named).collect();
+    if state.quarantine.is_none() && left.is_empty() {
+        return Some(if running.is_empty() {
+            Check::ok(Section::Project, SUBJECT, "not quarantined")
+        } else {
+            Check::info(
+                Section::Project,
+                SUBJECT,
+                format!("not quarantined; runs {in_flight}"),
+            )
+        });
+    }
+    let mut said = Vec::new();
+    let folder = match &state.quarantine {
+        Some((path, text)) => {
+            let lines: Vec<&str> = text
                 .lines()
                 .map(str::trim)
                 .filter(|l| !l.is_empty())
                 .collect();
-            let folder = path.parent().map_or_else(String::new, |p| shown(p, home));
-            Check::fail(
-                Section::Project,
-                SUBJECT,
-                format!("{} says: {}", shown(&path, home), said.join(" ")),
-                "A run's isolation check did not pass, or did not finish, so the project's \
-                 dedicated checkout may hold what it changed outside its worktree. Until a \
-                 person clears the quarantine, Owlshift refuses the whole project on this \
-                 machine: no ticket of it is run, continued, taken in or built.",
-                vec![
-                    Step::act(format!(
-                        "Look at what the marker names, in the project's folder {folder}"
-                    )),
-                    Step::run_noting(
-                        "owlshift unquarantine",
-                        "in the project's repository: it shows the marker, then clears it once \
-                         you type the project's name",
-                    ),
-                    Step::act(
-                        "Or, to start from a fresh clone, delete the `checkout` and `worktrees` \
-                         folders there first, which loses the ticket refs, then run `owlshift \
-                         unquarantine`",
-                    ),
-                ],
-            )
+            said.push(format!("{} says: {}", shown(path, home), lines.join(" ")));
+            path.parent().map_or_else(String::new, |p| shown(p, home))
         }
-        Err(why) => Check::info(
-            Section::Project,
-            SUBJECT,
-            format!("the marker was not read: {why}"),
-        ),
-    })
+        None => String::new(),
+    };
+    if !left.is_empty() {
+        said.push(format!(
+            "runs ended before their isolation check passed: {}",
+            left.join("; ")
+        ));
+    }
+    if !in_flight.is_empty() {
+        said.push(format!("runs {in_flight}"));
+    }
+    let folder = if folder.is_empty() {
+        "".to_owned()
+    } else {
+        format!(", in the project's folder {folder}")
+    };
+    Some(Check::fail(
+        Section::Project,
+        SUBJECT,
+        said.join("; "),
+        "A run's isolation check did not pass, or did not finish, so the project's dedicated \
+         checkout may hold what it changed outside its worktree. Until a person clears the \
+         quarantine, Owlshift refuses the whole project on this machine: no ticket of it is \
+         run, continued, taken in or built.",
+        vec![
+            Step::act(format!("Look at what the quarantine names{folder}")),
+            Step::run_noting(
+                "owlshift unquarantine",
+                "in the project's repository: it shows the quarantine and the runs left behind, \
+                 then clears them once you type the project's name",
+            ),
+            Step::act(
+                "Or, to start from a fresh clone, delete the `checkout` and `worktrees` folders \
+                 there first, which loses the ticket refs, then run `owlshift unquarantine`",
+            ),
+        ],
+    ))
 }
 
 fn data_dir_check(system: &dyn System, home: Option<&Path>) -> Check {
@@ -4474,27 +4507,32 @@ states = { ready = "Todo", working = "Doing", needs_input = "Asked", review = "R
         assert!(report.checks.iter().all(|c| c.subject != "drain slot"));
     }
 
-    /// OWL-368: a marker that stands with the project's lock free fails the
-    /// report, showing what it says and how to clear it; one while a command
-    /// works the project, or one that cannot be read, is information; none
-    /// is ok.
+    /// OWL-368, OWL-400: a quarantine that stands fails the report, showing
+    /// what it says and how to clear it, and so does a run's obligation left
+    /// behind, which the next command turns into one; a run in flight, or a
+    /// quarantine that cannot be read, is information; none is ok.
     #[test]
     fn a_quarantine_fails_with_its_marker_and_how_to_clear_it() {
+        use crate::ticket_run::{Found, Standing};
+        use owlshift_contracts::step::RunObligation;
+
         let ready = || logged_in(with_harnesses(with_git(FakeSystem::default())));
         let (_dir, config) = markdown_project();
         let path =
-            PathBuf::from("/home/ada/.local/share/owlshift/projects/github.com/o/r/unverified");
-        let marked = MarkerState::Marked {
-            path: path.clone(),
-            text: "Run r1 of OWL-160 broke isolation:\n- the main checkout's HEAD moved\n"
-                .to_owned(),
+            PathBuf::from("/home/ada/.local/share/owlshift/projects/github.com/o/r/quarantine");
+        let marked = MarkerState {
+            quarantine: Some((
+                path.clone(),
+                "Run r1 of OWL-160 broke isolation:\n- the main checkout's HEAD moved\n".to_owned(),
+            )),
+            obligations: Vec::new(),
         };
         let report = run(&ready().quarantine_is(Ok(marked)), &config);
         assert!(!report.ready(), "{report}");
         let failed = line(&report, "quarantine");
         assert_eq!(failed.status, Status::Fail);
-        // The marker's path as the report writes every path: `~` for the fake
-        // home where that home is absolute, as on Unix.
+        // The quarantine's path as the report writes every path: `~` for the
+        // fake home where that home is absolute, as on Unix.
         let shown_path = shown(&path, Some(Path::new("/home/ada")));
         assert_eq!(
             failed.detail,
@@ -4506,7 +4544,7 @@ states = { ready = "Todo", working = "Doing", needs_input = "Asked", review = "R
         #[cfg(unix)]
         assert_eq!(
             shown_path,
-            "~/.local/share/owlshift/projects/github.com/o/r/unverified"
+            "~/.local/share/owlshift/projects/github.com/o/r/quarantine"
         );
         assert!(
             failed
@@ -4515,19 +4553,49 @@ states = { ready = "Todo", working = "Doing", needs_input = "Asked", review = "R
                 .any(|step| matches!(step, Step::Run { command, .. } if command == "owlshift unquarantine")),
             "{failed:?}"
         );
-        for (system, status) in [
-            (ready(), Status::Ok),
+        let obligation = |what: &str, running: bool| Standing {
+            found: Found {
+                name: "owl-3-r3".to_owned(),
+                record: Ok(RunObligation {
+                    format: owlshift_contracts::format::Format,
+                    ticket: Some(owlshift_contracts::ids::TicketId::new("OWL-3").unwrap()),
+                    run: "r3".to_owned(),
+                    started: "2026-10-21T08:00:00Z".parse().unwrap(),
+                    what: what.to_owned(),
+                }),
+            },
+            running,
+        };
+        let only = |standing: Standing| MarkerState {
+            quarantine: None,
+            obligations: vec![standing],
+        };
+        let left = run(
+            &ready().quarantine_is(Ok(only(obligation("Run r3 of OWL-3", false)))),
+            &config,
+        );
+        let failed = line(&left, "quarantine");
+        assert_eq!(failed.status, Status::Fail, "{left}");
+        assert_eq!(
+            failed.detail,
+            "runs ended before their isolation check passed: Run r3 of OWL-3"
+        );
+        for (system, status, detail) in [
+            (ready(), Status::Ok, "not quarantined"),
             (
-                ready().quarantine_is(Ok(MarkerState::InFlight)),
+                ready().quarantine_is(Ok(only(obligation("Run r3 of OWL-3", true)))),
                 Status::Info,
+                "not quarantined; runs in flight: Run r3 of OWL-3",
             ),
             (
                 ready().quarantine_is(Err("no remote".to_owned())),
                 Status::Info,
+                "the quarantine was not read: no remote",
             ),
         ] {
             let report = run(&system, &config);
-            assert_eq!(line(&report, "quarantine").status, status, "{report}");
+            let found = line(&report, "quarantine");
+            assert_eq!((found.status, found.detail.as_str()), (status, detail), "{report}");
         }
     }
 
