@@ -19,10 +19,16 @@
 
 use std::collections::HashMap;
 
-use owlshift_adapters::tracker::{ErrorKind, Gesture as TrackerGesture, StateType};
+use owlshift_adapters::tracker::{ErrorKind, Gesture as TrackerGesture, Linked, Links, StateType};
+use owlshift_contracts::brief::{
+    MAX_RELATED, MAX_RELATED_TEXT_BYTES, RelatedState, RelatedTicket, StateKind, TicketRelations,
+};
 use owlshift_contracts::config::Admit;
-use owlshift_contracts::drain::{DependencyOutcome, Gesture, GestureKind, KeptDependency};
-use owlshift_contracts::result::IntakeVerdict;
+use owlshift_contracts::drain::{
+    DependencyOutcome, Gesture, GestureKind, KeptDependency, RELATION_QUOTE,
+};
+use owlshift_contracts::refs::cut_to;
+use owlshift_contracts::result::{IntakeVerdict, MAX_DEPENDENCIES};
 use owlshift_core::dependency::{self, Node};
 
 use super::*;
@@ -300,6 +306,7 @@ impl OnDemand<'_> {
             let comments = self.comments(&p.ticket)?;
             let mut brief = self.brief(p, Role::Intake, &comments, &rules, None, &current);
             brief.result_refusal = told.take();
+            brief.relations = self.brief_relations(&p.ticket, sink);
             let (ran, mut event) = self.run_role_once(
                 p,
                 (self.intake, &[]),
@@ -549,6 +556,29 @@ impl OnDemand<'_> {
         Ok(record)
     }
 
+    /// The ticket's relations for intake's brief (OWL-416), read again for
+    /// each run. They inform the role and decide nothing, so a read that
+    /// fails gives none, as before OWL-416, with a `warning` event
+    /// (`relations_not_read`) giving the reason; the record's blockers come
+    /// from [`Self::relate_dependencies`]'s own read.
+    fn brief_relations(&self, ticket: &TicketId, sink: &mut EventSink<'_>) -> TicketRelations {
+        match self.tracker.links(ticket) {
+            Ok(links) => brief_relations(links),
+            Err(e) => {
+                sink.emit(
+                    ticket,
+                    None,
+                    EventKind::Warning,
+                    data([
+                        ("what", json!("relations_not_read")),
+                        ("reason", json!(e.to_string())),
+                    ]),
+                );
+                TicketRelations::default()
+            }
+        }
+    }
+
     /// Turns the dependencies of the `verdict` intake keeps into relations
     /// (OWL-249, architecture section 5, "Dependencies to relations"): each
     /// one, once, gets the outcome [`dependency::check`] gives on the
@@ -632,6 +662,43 @@ impl OnDemand<'_> {
                 outcome,
             });
         }
+        // The tickets that already blocked it on the tracker are dependencies
+        // without a quote from the text (OWL-416, decided on 2026-10-21):
+        // added after the verdict's, compared by the tracker's identifiers.
+        let listed: Vec<TicketId> = kept.iter().map(|k| read.id(&k.ticket)).collect();
+        let mut left_out = 0usize;
+        for blocker in &blockers {
+            if *blocker == own.id || listed.contains(blocker) {
+                continue;
+            }
+            if kept.len() >= MAX_DEPENDENCIES {
+                left_out += 1;
+                continue;
+            }
+            kept.push(KeptDependency {
+                ticket: blocker.clone(),
+                quote: RELATION_QUOTE.to_owned(),
+                outcome: DependencyOutcome::Existed,
+            });
+        }
+        if left_out > 0 {
+            sink.emit(
+                ticket,
+                Some(&ran.run),
+                EventKind::Warning,
+                data([
+                    ("what", json!("dependencies_cut")),
+                    ("left_out", json!(left_out)),
+                    (
+                        "reason",
+                        json!(format!(
+                            "the record holds {MAX_DEPENDENCIES} dependencies; {left_out} \
+                             blockers already related on the tracker are left out of it"
+                        )),
+                    ),
+                ]),
+            );
+        }
         Ok(kept)
     }
 
@@ -676,6 +743,52 @@ impl OnDemand<'_> {
                 ]),
             );
         }
+    }
+}
+
+/// The tracker's links as intake's brief gives them (OWL-416): each list
+/// cut to [`MAX_RELATED`], each title and state name flattened to one line
+/// and cut to [`MAX_RELATED_TEXT_BYTES`], so that another ticket's text never
+/// makes the brief invalid.
+fn brief_relations(links: Links) -> TicketRelations {
+    let text = |text: String| {
+        let line: String = text
+            .chars()
+            .map(|c| if c.is_control() { ' ' } else { c })
+            .collect();
+        cut_to(&line, MAX_RELATED_TEXT_BYTES)
+    };
+    let list = |linked: Vec<Linked>| {
+        linked
+            .into_iter()
+            .take(MAX_RELATED)
+            .map(|linked| RelatedTicket {
+                id: linked.id,
+                title: linked.title.map(text),
+                state: linked.state.map(|state| RelatedState {
+                    name: text(state.name),
+                    kind: state.kind.map(state_kind),
+                }),
+            })
+            .collect()
+    };
+    TicketRelations {
+        blocked_by: list(links.blocked_by),
+        blocks: list(links.blocks),
+        related: list(links.related),
+    }
+}
+
+/// A tracker's state type as the brief writes it.
+fn state_kind(kind: StateType) -> StateKind {
+    match kind {
+        StateType::Triage => StateKind::Triage,
+        StateType::Backlog => StateKind::Backlog,
+        StateType::Unstarted => StateKind::Unstarted,
+        StateType::Started => StateKind::Started,
+        StateType::Completed => StateKind::Completed,
+        StateType::Canceled => StateKind::Canceled,
+        StateType::Duplicate => StateKind::Duplicate,
     }
 }
 
@@ -771,6 +884,37 @@ mod tests {
             id: id.to_owned(),
             name: name.to_owned(),
         })
+    }
+
+    /// Another ticket's text never makes intake's brief invalid (OWL-416):
+    /// a title flattened to one line and cut, a list cut to a page.
+    #[test]
+    fn brief_relations_keep_the_briefs_bounds() {
+        let linked = |n: usize, title: &str| Linked {
+            id: TicketId::new(format!("OWL-{n}")).unwrap(),
+            title: Some(title.to_owned()),
+            state: Some(owlshift_adapters::tracker::LinkedState {
+                name: "Done".to_owned(),
+                kind: Some(StateType::Completed),
+            }),
+        };
+        let long = "x".repeat(MAX_RELATED_TEXT_BYTES * 2);
+        let relations = brief_relations(Links {
+            blocked_by: vec![linked(1, "Ship\nthe API"), linked(2, &long)],
+            blocks: (1..=MAX_RELATED + 3).map(|n| linked(n, "t")).collect(),
+            related: Vec::new(),
+        });
+        assert_eq!(
+            relations.blocked_by[0].title.as_deref(),
+            Some("Ship the API")
+        );
+        let cut = relations.blocked_by[1].title.as_deref().unwrap();
+        assert!(cut.len() <= MAX_RELATED_TEXT_BYTES && cut.ends_with("[cut]"));
+        assert_eq!(
+            relations.blocked_by[0].state.as_ref().unwrap().kind,
+            Some(StateKind::Completed)
+        );
+        assert_eq!(relations.blocks.len(), MAX_RELATED);
     }
 
     #[test]

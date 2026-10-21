@@ -213,8 +213,8 @@ use owlshift_contracts::ids::TicketId;
 pub use crate::graphql::{Response, Transport};
 use crate::tracker::{
     Author, Blocker, Capability, Column, Comment, Document, Error, ErrorKind, Filed, Found,
-    Gesture, Listed, MAX_DOCUMENT_CHARS, PROPOSED_LABEL, Person, Proposal, Reaction, Relations,
-    StateType, Ticket, Tracker, no_delegation,
+    Gesture, Linked, LinkedState, Links, Listed, MAX_DOCUMENT_CHARS, PROPOSED_LABEL, Person,
+    Proposal, Reaction, Relations, StateType, Ticket, Tracker, no_delegation,
 };
 
 /// Linear's GraphQL endpoint.
@@ -1028,6 +1028,50 @@ impl Tracker for LinearTracker {
         })
     }
 
+    /// One read through the key (OWL-416): the `blocks` and `related`
+    /// relations from other issues (`inverseRelations`) and to them
+    /// (`relations`), archived ones included as the listing reads blockers,
+    /// each issue with its title and its state's name and type. More
+    /// relations than a page in either direction are refused, as the
+    /// listing refuses them; a relation of another type, or answered
+    /// without its issue, is left out, and a state type this adapter does
+    /// not know is shown by its name alone: the result informs a role and
+    /// releases nothing.
+    fn links(&self, id: &TicketId) -> Result<Links, Error> {
+        let data: LinksData = self.call(LINKS_QUERY, json!({ "id": id.as_str() }))?;
+        let issue = data.issue;
+        for (direction, more) in [
+            (
+                "inverseRelations",
+                issue.inverse_relations.page_info.has_next_page,
+            ),
+            ("relations", issue.relations.page_info.has_next_page),
+        ] {
+            if more {
+                return Err(invalid(format!(
+                    "{id} has more than {MAX_PAGE} {direction}, which this adapter does not read"
+                )));
+            }
+        }
+        let mut links = Links::default();
+        let from = (issue.inverse_relations.nodes.into_iter()).map(|r| (r.kind, r.issue, true));
+        let to = (issue.relations.nodes.into_iter()).map(|r| (r.kind, r.related_issue, false));
+        for (kind, other, inverse) in from.chain(to) {
+            let list = match (kind.as_str(), inverse) {
+                ("blocks", true) => &mut links.blocked_by,
+                ("blocks", false) => &mut links.blocks,
+                ("related", _) => &mut links.related,
+                _ => continue,
+            };
+            let Some(other) = other else { continue };
+            let linked = other.into_linked()?;
+            if !list.iter().any(|known| known.id == linked.id) {
+                list.push(linked);
+            }
+        }
+        Ok(links)
+    }
+
     /// `issueRelationCreate` of type `blocks`, `blocker` as `issueId` and
     /// `blocked` as `relatedIssueId`, by their identifiers, through the app
     /// when one is set (check (d), 2026-10-14, above): a relation already
@@ -1257,6 +1301,25 @@ const RELATIONS_QUERY: &str = concat!(
     "query Relations($id: String!) { issue(id: $id) { identifier description state { type } ",
     blocker_fields!(),
     " } }"
+);
+
+/// The fields of an issue on the other side of a relation, for intake's
+/// brief (OWL-416).
+macro_rules! linked_fields {
+    () => {
+        "{ identifier title state { name type } }"
+    };
+}
+
+/// A ticket's relations both ways, for intake's brief (OWL-416).
+const LINKS_QUERY: &str = concat!(
+    "query Links($id: String!) { issue(id: $id) { \
+     inverseRelations(first: 50, includeArchived: true) { nodes { type issue ",
+    linked_fields!(),
+    " } pageInfo { hasNextPage } } \
+     relations(first: 50, includeArchived: true) { nodes { type relatedIssue ",
+    linked_fields!(),
+    " } pageInfo { hasNextPage } } } }"
 );
 
 /// An issue's creation and history, for the admission gesture (OWL-246).
@@ -1569,6 +1632,62 @@ struct RelationsIssue {
     description: Option<String>,
     state: StateOfType,
     inverse_relations: Connection<Relation>,
+}
+
+#[derive(Deserialize)]
+struct LinksData {
+    issue: LinksIssue,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct LinksIssue {
+    inverse_relations: Connection<InverseLink>,
+    relations: Connection<Link>,
+}
+
+/// A relation from another issue, `issue`.
+#[derive(Deserialize)]
+struct InverseLink {
+    #[serde(rename = "type")]
+    kind: String,
+    issue: Option<LinkedIssue>,
+}
+
+/// A relation to another issue, `relatedIssue`.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct Link {
+    #[serde(rename = "type")]
+    kind: String,
+    related_issue: Option<LinkedIssue>,
+}
+
+#[derive(Deserialize)]
+struct LinkedIssue {
+    identifier: String,
+    title: String,
+    state: NamedState,
+}
+
+#[derive(Deserialize)]
+struct NamedState {
+    name: String,
+    #[serde(rename = "type")]
+    kind: String,
+}
+
+impl LinkedIssue {
+    fn into_linked(self) -> Result<Linked, Error> {
+        Ok(Linked {
+            id: TicketId::new(self.identifier).map_err(|e| invalid(e.to_string()))?,
+            title: Some(self.title),
+            state: Some(LinkedState {
+                kind: state_type(&self.state.kind).ok(),
+                name: self.state.name,
+            }),
+        })
+    }
 }
 
 /// Linear's `WorkflowState.type`. A type this adapter does not know is
@@ -3550,6 +3669,74 @@ mod tests {
             ErrorKind::NotFound
         );
         assert_eq!(linear.state_type(&id).unwrap_err().kind, ErrorKind::Other);
+    }
+
+    /// Intake's links (OWL-416): a `blocks` relation from another issue
+    /// blocks the ticket, one to another issue is blocked by it, `related`
+    /// counts both ways; each issue once per list with its title and state,
+    /// an unknown state type shown by its name, other relation types and a
+    /// relation without its issue left out; a second page is refused.
+    #[test]
+    fn a_tickets_links_are_read_both_ways() {
+        let other = |id: &str, name: &str, kind: &str| {
+            json!({ "identifier": id, "title": format!("Title of {id}"),
+                "state": { "name": name, "type": kind } })
+        };
+        let from = |kind: &str, issue: Value| json!({ "type": kind, "issue": issue });
+        let to = |kind: &str, issue: Value| json!({ "type": kind, "relatedIssue": issue });
+        let page = |nodes: Vec<Value>, more: bool| json!({ "nodes": nodes, "pageInfo": { "hasNextPage": more } });
+        let issue = |inverse: Value, relations: Value| json!({ "issue": { "inverseRelations": inverse, "relations": relations } });
+        let key = Scripted::new(vec![
+            (
+                "Links",
+                issue(
+                    page(
+                        vec![
+                            from("blocks", other("OWL-2", "Done", "completed")),
+                            from("blocks", other("OWL-2", "Done", "completed")),
+                            from("related", other("OWL-3", "Todo", "unstarted")),
+                            from("duplicate", other("OWL-8", "Todo", "unstarted")),
+                            json!({ "type": "blocks", "issue": null }),
+                        ],
+                        false,
+                    ),
+                    page(
+                        vec![
+                            to("blocks", other("OWL-4", "Paused", "paused")),
+                            to("related", other("OWL-3", "Todo", "unstarted")),
+                            to("related", other("OWL-5", "In Progress", "started")),
+                        ],
+                        false,
+                    ),
+                ),
+            ),
+            ("Links", issue(page(vec![], false), page(vec![], true))),
+        ]);
+        let sent = key.sent.clone();
+        let linear = LinearTracker::with_transport(key);
+        let id = TicketId::new("OWL-7").unwrap();
+        let linked = |id: &str, name: &str, kind: Option<StateType>| Linked {
+            id: TicketId::new(id).unwrap(),
+            title: Some(format!("Title of {id}")),
+            state: Some(LinkedState {
+                name: name.to_owned(),
+                kind,
+            }),
+        };
+        assert_eq!(
+            linear.links(&id).unwrap(),
+            Links {
+                blocked_by: vec![linked("OWL-2", "Done", Some(StateType::Completed))],
+                blocks: vec![linked("OWL-4", "Paused", None)],
+                related: vec![
+                    linked("OWL-3", "Todo", Some(StateType::Unstarted)),
+                    linked("OWL-5", "In Progress", Some(StateType::Started)),
+                ],
+            }
+        );
+        assert_eq!(sent.lock().unwrap()[0]["id"], json!("OWL-7"));
+        let error = linear.links(&id).unwrap_err();
+        assert!(error.message.contains("more than 50 relations"), "{error}");
     }
 
     /// The dependency check's read (OWL-249): the identifier Linear answers,

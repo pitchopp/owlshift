@@ -5414,6 +5414,8 @@ impl OnDemand<'_> {
                     .collect(),
                 _ => BTreeMap::new(),
             },
+            // Intake's, read by `run_intake` for each run (OWL-416).
+            relations: Default::default(),
             rules: rules.for_role(role),
             permissions: Permissions {
                 level: if build || role == Role::Rebase {

@@ -23,6 +23,7 @@ const TEAM_STATES: &str = "team-states-owl.json";
 const ADMITTED_TODO: &str = "admitted-todo.json";
 const ADMITTED_PAGED: &str = "admitted-agent-paged.json";
 const GESTURES: &str = "gestures.json";
+const LINKS: &str = "links.json";
 
 /// The ready column of the drain's exit gate, for each kind of gesture.
 fn todo_by_state() -> Admit {
@@ -82,6 +83,31 @@ fn lists_the_ready_column_with_its_blockers() {
         .collect();
     assert!(types.contains(&Some(StateType::Completed)), "{types:?}");
     assert!(types.contains(&Some(StateType::Unstarted)), "{types:?}");
+}
+
+/// Intake's links (OWL-416), as `links.json` holds them for each ticket it
+/// asked: every linked issue with its title and its state's name, none
+/// listed twice in a list, and at least one link in the fixture.
+#[test]
+fn reads_a_tickets_links_both_ways() {
+    let fixture = support::load(&support::fixtures_dir(), LINKS);
+    let replay = Replay::new(LINKS);
+    let tracker = LinearTracker::with_transport(replay.clone());
+    let mut seen = 0;
+    for exchange in &fixture.exchanges {
+        let id = TicketId::new(exchange.request["variables"]["id"].as_str().unwrap()).unwrap();
+        let links = tracker.links(&id).unwrap();
+        for list in [&links.blocked_by, &links.blocks, &links.related] {
+            for (n, linked) in list.iter().enumerate() {
+                assert!(linked.title.as_deref().is_some_and(|t| !t.is_empty()));
+                assert!(linked.state.as_ref().is_some_and(|s| !s.name.is_empty()));
+                assert!(list[..n].iter().all(|earlier| earlier.id != linked.id));
+            }
+            seen += list.len();
+        }
+    }
+    replay.assert_done();
+    assert!(seen > 0, "{LINKS} holds no link");
 }
 
 /// A label gesture, read two a page to the last: the five P2 exit gate
@@ -347,4 +373,45 @@ fn record_drain_fixtures() {
         tracker.gesture(&id, &admit).unwrap();
     }
     recorder.write(GESTURES, &recorded);
+}
+
+/// Records intake's links (OWL-416) against the live API, read only, for
+/// each ticket `OWLSHIFT_RECORD_LINKS_TICKETS` names (comma-separated),
+/// which together should hold a `blocks` relation each way and a `related`
+/// one. Prints the date, then per ticket how many links each direction has
+/// and their state types: never the key, nor a title.
+#[test]
+#[ignore = "records against the live Linear API; needs OWLSHIFT_RECORD_LINKS_TICKETS"]
+fn record_links_fixture() {
+    let tickets = std::env::var("OWLSHIFT_RECORD_LINKS_TICKETS")
+        .expect("OWLSHIFT_RECORD_LINKS_TICKETS names the issues to read, comma-separated");
+    let key = support::live_key();
+    support::assert_owlshift_workspace(&key);
+    let date = jiff::Zoned::now().date();
+    let recorder = Recorder::new(&key);
+    let tracker = LinearTracker::with_transport(recorder.clone());
+    println!("links check on {date}, Owlshift workspace");
+    for id in tickets.split(',').map(str::trim) {
+        let links = tracker.links(&TicketId::new(id).unwrap()).unwrap();
+        let shape = |list: &[owlshift_adapters::tracker::Linked]| {
+            let kinds: Vec<String> = list
+                .iter()
+                .map(|l| match l.state.as_ref().and_then(|s| s.kind) {
+                    Some(kind) => format!("{kind:?}"),
+                    None => "untyped".to_owned(),
+                })
+                .collect();
+            format!("{} [{}]", list.len(), kinds.join(", "))
+        };
+        println!(
+            "{id}: blocked_by {}; blocks {}; related {}",
+            shape(&links.blocked_by),
+            shape(&links.blocks),
+            shape(&links.related)
+        );
+    }
+    recorder.write(
+        LINKS,
+        &format!("{date} on the Owlshift workspace, recorded live"),
+    );
 }

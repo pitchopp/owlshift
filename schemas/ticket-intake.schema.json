@@ -164,7 +164,7 @@
           "$ref": "#/$defs/DependencyOutcome"
         },
         "quote": {
-          "description": "The words of the ticket that name it.",
+          "description": "The words of the ticket that name it; for a ticket that already\nblocked it on the tracker, which the runner adds without the text\nnaming it (OWL-416), [`RELATION_QUOTE`].",
           "type": "string",
           "pattern": "\\S"
         },

@@ -33,7 +33,7 @@ use owlshift_contracts::brief::{
 };
 use owlshift_contracts::config::{Admit, ProjectConfig};
 use owlshift_contracts::drain::{
-    DependencyOutcome, Gesture, GestureKind, ProposalOutcome, TicketIntake,
+    DependencyOutcome, Gesture, GestureKind, ProposalOutcome, RELATION_QUOTE, TicketIntake,
 };
 use owlshift_contracts::event::{Event, EventKind};
 use owlshift_contracts::ids::{RelativePath, SessionId, TicketId};
@@ -840,6 +840,10 @@ impl Tracker for Clocked<'_> {
 
     fn relations(&self, id: &TicketId) -> Result<tracker::Relations, tracker::Error> {
         Tracker::relations(&self.inner, id)
+    }
+
+    fn links(&self, id: &TicketId) -> Result<tracker::Links, tracker::Error> {
+        Tracker::links(&self.inner, id)
     }
 
     fn block(&self, blocker: &TicketId, blocked: &TicketId) -> Result<(), tracker::Error> {
@@ -10279,6 +10283,105 @@ fn intake_writes_a_relation_for_each_open_dependency_and_names_the_rest() {
     ] {
         assert!(intake.contains(said), "{said}:\n{intake}");
     }
+}
+
+impl Bench {
+    /// Adds the ticket `id` at `Todo`, related to these.
+    fn add_related(&self, id: &str, related: &[&str]) {
+        let dir = self.remote.checkout.join("tickets").join(id);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            dir.join("ticket.md"),
+            format!(
+                "+++\ntitle = \"{id}\"\nauthor = \"maintainer\"\nstage = \"Todo\"\n\
+                 related = {related:?}\n+++\n"
+            ),
+        )
+        .unwrap();
+    }
+
+    /// The ids of each list of the relations the last intake brief held.
+    fn briefed_relations(&self) -> [Vec<String>; 3] {
+        let brief = self.briefs().pop().expect("an intake brief");
+        assert_eq!(brief.role, Role::Intake);
+        let ids = |list: &[owlshift_contracts::brief::RelatedTicket]| {
+            list.iter().map(|t| t.id.as_str().to_owned()).collect()
+        };
+        [
+            ids(&brief.relations.blocked_by),
+            ids(&brief.relations.blocks),
+            ids(&brief.relations.related),
+        ]
+    }
+}
+
+/// A prerequisite the tracker already relates (OWL-416): DEMO-2 blocks
+/// DEMO-1, whose text names it in words only. Intake's brief lists it with
+/// its title and state, beside the ticket DEMO-1 blocks and the one related
+/// to it; the role asks nothing and records no dependency; the runner adds
+/// DEMO-2 to the record as already related, with the fixed quote, shown on
+/// the INTAKE comment, and writes nothing.
+#[test]
+fn a_prerequisite_the_tracker_relates_is_recorded_without_a_question() {
+    let bench = Bench::drained();
+    bench.add_ticket("DEMO-2", "In Progress", &[]);
+    bench.add_ticket("DEMO-4", "Todo", &["DEMO-1"]);
+    bench.add_related("DEMO-5", &["DEMO-1"]);
+    MarkdownTracker::new(&bench.remote.checkout)
+        .add_blocked_by(&ticket(), &TicketId::new("DEMO-2").unwrap())
+        .unwrap();
+    bench.comment_as("maintainer", "This waits for the export API to land.");
+
+    let done = bench.reply(None, Some(&intake_result("done", None, "")));
+    let record = bench.intake(vec![done], gesture("maintainer")).unwrap();
+    assert_eq!(
+        bench.briefed_relations(),
+        [
+            vec!["DEMO-2".to_owned()],
+            vec!["DEMO-4".to_owned()],
+            vec!["DEMO-5".to_owned()]
+        ]
+    );
+    let brief = bench.briefs().pop().unwrap();
+    let blocker = &brief.relations.blocked_by[0];
+    assert_eq!(blocker.title.as_deref(), Some("DEMO-2"));
+    assert_eq!(blocker.state.as_ref().unwrap().name, "In Progress");
+
+    let dependencies: Vec<(&str, &str, DependencyOutcome)> = record
+        .dependencies
+        .iter()
+        .map(|d| (d.ticket.as_str(), d.quote.as_str(), d.outcome))
+        .collect();
+    assert_eq!(
+        dependencies,
+        [("DEMO-2", RELATION_QUOTE, DependencyOutcome::Existed)]
+    );
+    assert_eq!(bench.record().intake, Some(record));
+    assert!(bench.relations_written().is_empty());
+    let intake = bench.comments().pop().unwrap();
+    let said = "DEMO-2, named by `a blocks relation on the tracker`: relation already there";
+    assert!(intake.contains(said), "{intake}");
+    assert_eq!(bench.stage(), "Todo", "no question round");
+}
+
+/// A ticket whose only links are a ticket it blocks and a related one
+/// (OWL-416): its brief lists them, and its record holds no dependency.
+#[test]
+fn blocks_and_related_links_are_never_dependencies() {
+    let bench = Bench::drained();
+    bench.add_ticket("DEMO-4", "Todo", &["DEMO-1"]);
+    bench.add_related("DEMO-5", &["DEMO-1"]);
+    let done = bench.reply(None, Some(&intake_result("done", None, "")));
+    let record = bench.intake(vec![done], gesture("maintainer")).unwrap();
+    assert_eq!(
+        bench.briefed_relations(),
+        [
+            Vec::new(),
+            vec!["DEMO-4".to_owned()],
+            vec!["DEMO-5".to_owned()]
+        ]
+    );
+    assert!(record.dependencies.is_empty());
 }
 
 /// A dependency the tracker cannot read (OWL-249) is a failed intake run,

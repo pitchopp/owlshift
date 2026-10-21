@@ -1,0 +1,68 @@
+{
+  "recorded": "2026-10-21, synthesized until record_links_fixture runs on the Owlshift workspace (OWL-416)",
+  "exchanges": [
+    {
+      "request": {
+        "query": "query Links($id: String!) { issue(id: $id) { inverseRelations(first: 50, includeArchived: true) { nodes { type issue { identifier title state { name type } } } pageInfo { hasNextPage } } relations(first: 50, includeArchived: true) { nodes { type relatedIssue { identifier title state { name type } } } pageInfo { hasNextPage } } } }",
+        "variables": {
+          "id": "OWL-254"
+        }
+      },
+      "status": 200,
+      "response": {
+        "data": {
+          "issue": {
+            "inverseRelations": {
+              "nodes": [
+                {
+                  "issue": {
+                    "identifier": "OWL-267",
+                    "state": {
+                      "name": "Done",
+                      "type": "completed"
+                    },
+                    "title": "A synthesized blocker"
+                  },
+                  "type": "blocks"
+                },
+                {
+                  "issue": {
+                    "identifier": "OWL-266",
+                    "state": {
+                      "name": "Todo",
+                      "type": "unstarted"
+                    },
+                    "title": "A synthesized related ticket"
+                  },
+                  "type": "related"
+                }
+              ],
+              "pageInfo": {
+                "hasNextPage": false
+              }
+            },
+            "relations": {
+              "nodes": [
+                {
+                  "relatedIssue": {
+                    "identifier": "OWL-255",
+                    "state": {
+                      "name": "Backlog",
+                      "type": "backlog"
+                    },
+                    "title": "A synthesized blocked ticket"
+                  },
+                  "type": "blocks"
+                }
+              ],
+              "pageInfo": {
+                "hasNextPage": false
+              }
+            }
+          }
+        }
+      },
+      "synthesized": "hand-written in the shape of LINKS_QUERY's answer; replaced by record_links_fixture (OWL-416)"
+    }
+  ]
+}

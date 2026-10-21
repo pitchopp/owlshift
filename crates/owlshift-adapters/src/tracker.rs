@@ -9,7 +9,8 @@
 //! the admission gesture with P4 (OWL-246, architecture section 5, "The
 //! drain"), filing proposals and finding them again with P4 too (OWL-252),
 //! publishing a ticket's document with P5 (OWL-350), resolving a comment
-//! with P5 too (OWL-353), a comment's reactions with P5 too (OWL-371).
+//! with P5 too (OWL-353), a comment's reactions with P5 too (OWL-371), a
+//! ticket's links for intake's brief (OWL-416).
 
 pub mod linear;
 pub mod markdown;
@@ -189,6 +190,19 @@ pub trait Tracker {
         ))
     }
 
+    /// The tickets the tracker relates to ticket `id`, with their titles and
+    /// states, for intake's brief (OWL-416, architecture section 5, "The
+    /// run" of intake): those that block it, those it blocks, and those
+    /// related to it without an order, each list once per ticket, in the
+    /// tracker's order. Data for the role only: the dependency walk reads
+    /// [`relations`](Self::relations). An error by default.
+    fn links(&self, _id: &TicketId) -> Result<Links, Error> {
+        Err(Error::new(
+            ErrorKind::Other,
+            "this tracker does not read a ticket's links",
+        ))
+    }
+
     /// Records that `blocker` blocks `blocked`: on Linear a `blocks`
     /// relation, on the Markdown tracker `blocked`'s `blocked_by` (OWL-249).
     /// Writing one already there changes nothing. An error means the
@@ -266,6 +280,40 @@ pub struct Relations {
     pub description: String,
     /// The tickets that block it by the tracker's relations, once each.
     pub blockers: Vec<Blocker>,
+}
+
+/// What [`Tracker::links`] reads of a ticket (OWL-416).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Links {
+    /// The tickets that block it.
+    pub blocked_by: Vec<Linked>,
+    /// The tickets it blocks.
+    pub blocks: Vec<Linked>,
+    /// The tickets related to it without an order between them.
+    pub related: Vec<Linked>,
+}
+
+/// A ticket of [`Links`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Linked {
+    pub id: TicketId,
+    /// `None` when the tracker does not know the ticket (a Markdown
+    /// `blocked_by` naming a folder that is not there).
+    pub title: Option<String>,
+    /// The state it shows; `None` as `title` is.
+    pub state: Option<LinkedState>,
+}
+
+/// The state a [`Linked`] ticket shows.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LinkedState {
+    /// The state's name on the tracker.
+    pub name: String,
+    /// Its type; `None` when the tracker gives it none (a Markdown stage
+    /// other than `Done`) or one this adapter does not know: the brief
+    /// informs, so an unknown type is shown by its name alone, never
+    /// refused.
+    pub kind: Option<StateType>,
 }
 
 /// The label of a proposal on a team without a triage state (architecture

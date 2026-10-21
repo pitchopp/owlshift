@@ -599,7 +599,7 @@ fn brief_quality_pipeline_fields_go_to_their_roles_only() {
         ),
         (
             "a newer brief",
-            with(brief("build"), "format", 26.into()),
+            with(brief("build"), "format", 27.into()),
             "upgrade Owlshift",
         ),
     ] {

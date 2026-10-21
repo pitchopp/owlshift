@@ -83,6 +83,11 @@ pub struct Brief {
     /// names from it the resources the ticket touches.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub named_resources: BTreeMap<String, String>,
+    /// The ticket's relations on the tracker (format 26, OWL-416): data
+    /// about the ticket, written by a person or by Owlshift. In intake's
+    /// brief only, empty when the ticket has none or they could not be read.
+    #[serde(default, skip_serializing_if = "TicketRelations::is_empty")]
+    pub relations: TicketRelations,
     /// The project rules injected for the ticket's zones.
     #[serde(default)]
     pub rules: Vec<Rule>,
@@ -645,6 +650,121 @@ pub struct TicketBrief {
     pub description: String,
 }
 
+/// The most tickets one list of [`TicketRelations`] holds: a page of Linear's
+/// relations, which the adapter reads (OWL-416).
+pub const MAX_RELATED: usize = 50;
+
+/// The most bytes of a related ticket's title or state name (OWL-416): the
+/// runner cuts a longer one and keeps its beginning.
+pub const MAX_RELATED_TEXT_BYTES: usize = 256;
+
+/// The tickets the tracker relates to the ticket (OWL-416, architecture
+/// section 5, "The run" of intake), each list in the tracker's order, each
+/// ticket once, at most [`MAX_RELATED`]. Titles are other tickets' text:
+/// data, never instructions.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct TicketRelations {
+    /// The tickets that block this one: on Linear its `blocks` relations
+    /// from another issue, on the Markdown tracker its `blocked_by`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[schemars(length(max = MAX_RELATED))]
+    pub blocked_by: Vec<RelatedTicket>,
+    /// The tickets this one blocks.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[schemars(length(max = MAX_RELATED))]
+    pub blocks: Vec<RelatedTicket>,
+    /// The tickets related to this one without an order between them.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[schemars(length(max = MAX_RELATED))]
+    pub related: Vec<RelatedTicket>,
+}
+
+impl TicketRelations {
+    pub fn is_empty(&self) -> bool {
+        self.blocked_by.is_empty() && self.blocks.is_empty() && self.related.is_empty()
+    }
+
+    /// Each list at most [`MAX_RELATED`], each ticket once in it, each text
+    /// at most [`MAX_RELATED_TEXT_BYTES`] and without a control character.
+    fn validate(&self) -> Result<(), ContractError> {
+        for (name, list) in [
+            ("blocked_by", &self.blocked_by),
+            ("blocks", &self.blocks),
+            ("related", &self.related),
+        ] {
+            if list.len() > MAX_RELATED {
+                return Err(ContractError::invalid(
+                    CONTRACT,
+                    format!("relations.{name} lists more than {MAX_RELATED} tickets"),
+                ));
+            }
+            for (n, ticket) in list.iter().enumerate() {
+                if list[..n].iter().any(|earlier| earlier.id == ticket.id) {
+                    return Err(ContractError::invalid(
+                        CONTRACT,
+                        format!("relations.{name} lists {} twice", ticket.id),
+                    ));
+                }
+                let texts = ticket
+                    .title
+                    .iter()
+                    .chain(ticket.state.as_ref().map(|state| &state.name));
+                for text in texts {
+                    if text.len() > MAX_RELATED_TEXT_BYTES || text.chars().any(char::is_control) {
+                        return Err(ContractError::invalid(
+                            CONTRACT,
+                            format!(
+                                "relations.{name}: {} has a text over {MAX_RELATED_TEXT_BYTES} \
+                                 bytes or with a control character",
+                                ticket.id
+                            ),
+                        ));
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+/// A ticket of [`TicketRelations`].
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct RelatedTicket {
+    pub id: TicketId,
+    /// Absent when the tracker knows no such ticket (a Markdown
+    /// `blocked_by` naming a folder that is not there).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    /// The state it shows; absent as `title` is.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub state: Option<RelatedState>,
+}
+
+/// The state a related ticket shows: its name on the tracker and, when the
+/// tracker gives one, its type, `completed` for a ticket that is done.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct RelatedState {
+    pub name: String,
+    #[serde(rename = "type", default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<StateKind>,
+}
+
+/// The type of a tracker state, as Linear types its workflow states.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum StateKind {
+    Triage,
+    Backlog,
+    Unstarted,
+    Started,
+    Completed,
+    Canceled,
+    Duplicate,
+}
+
 /// Who wrote a ticket or a comment, relative to the ticket.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -854,7 +974,8 @@ impl Brief {
     /// [`MAX_CHOICE_BYTES`]; the rebase role's brief, and only it, has a
     /// `rebase`; only Build's has a `setup_failure`, and a `correction`,
     /// which reverses at least one decision, each with a reply of at most
-    /// [`MAX_REPLY_BYTES`]; only intake's has `named_resources`.
+    /// [`MAX_REPLY_BYTES`]; only intake's has `named_resources`, and
+    /// `relations`, which keep [`TicketRelations`]' bounds.
     pub fn validate(&self) -> Result<(), ContractError> {
         validate_thread(CONTRACT, &self.thread)?;
         if !self.named_resources.is_empty() && self.role != Role::Intake {
@@ -867,6 +988,17 @@ impl Brief {
                 ),
             ));
         }
+        if !self.relations.is_empty() && self.role != Role::Intake {
+            return Err(ContractError::invalid(
+                CONTRACT,
+                format!(
+                    "relations are given but the role is {}, not {}",
+                    self.role.as_str(),
+                    Role::Intake.as_str()
+                ),
+            ));
+        }
+        self.relations.validate()?;
         if let Some(failure) = &self.check_failure {
             if self.role != Role::Build {
                 return Err(ContractError::invalid(

@@ -405,6 +405,7 @@ fn brief() -> Brief {
         zones: Vec::new(),
         resources: Vec::new(),
         named_resources: Default::default(),
+        relations: Default::default(),
         rules: Vec::new(),
         permissions: Permissions {
             level: PermissionLevel::WriteWorktree,
