@@ -27,10 +27,9 @@
 //!   tickets in flight or ended since its snapshot, from their run files and
 //!   their locks ([`Concurrent`]).
 //!
-//! The project's lock still keeps every step apart until OWL-401 narrows
-//! it, so in production every other ticket's lock is free and its run file
-//! unchanged during a run: the check among steps finds nothing running and
-//! is the check of a run alone.
+//! Since OWL-401 the project's lock is held for short sections only, so
+//! several tickets' runs overlap and the check among steps is what keeps
+//! each from taking a sibling's writes for a breach.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File, OpenOptions};

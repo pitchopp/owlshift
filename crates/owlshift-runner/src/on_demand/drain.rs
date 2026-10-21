@@ -119,7 +119,7 @@ impl OnDemand<'_> {
     /// The drain's dispatch to Build, through `do`'s path: `None`, with
     /// nothing run or recorded, when the ticket ref is no longer `seen`, the
     /// intake record no longer holds the ticket's current text, the ticket
-    /// left the column, or its admission (OWL-401, [`Self::admit`]), against
+    /// left the column, or its admission (OWL-401), against
     /// the project's ticket refs read again and `outside`, the work outside
     /// Owlshift the pass read, holds it back for the project's capacity or a
     /// collision: the next pass reads them again and tells why it waits.

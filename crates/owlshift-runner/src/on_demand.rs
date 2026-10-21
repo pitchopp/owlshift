@@ -2,8 +2,8 @@
 //! a verified pull request, on demand and in the foreground (roadmap P1 and
 //! P2, build plan OWL-20 and "The answer check").
 //!
-//! Both take the project's lock, refuse a project a previous run may have
-//! tampered with ([`crate::project`]), read the ticket, bring the dedicated
+//! Both take the ticket's lock, and the project's for short sections only
+//! (OWL-401), refuse a project a previous run may have tampered with ([`crate::project`]), read the ticket, bring the dedicated
 //! checkout up to date and read the ticket's ref ([`crate::ticket_ref`]).
 //! Before a Build, the forge is checked to answer and the project's rules are
 //! read at the base commit ([`crate::rules`]). The Build runs through the
@@ -1486,7 +1486,7 @@ impl OnDemand<'_> {
     /// The stop of a stage step of watch's whose ticket is now in `state`
     /// (OWL-367): its state is kept, and its next step runs at a later pass.
     /// What it carries to that step is kept in `carry.json` here, while the
-    /// step still holds the project's lock, so that a person's `do` or
+    /// step still holds its ticket's lock, so that a person's `do` or
     /// `continue` after it, which removes the file, always has the last word
     /// (OWL-399): tied to the ticket ref the step left when the step moved
     /// what the ref keeps, removed otherwise. A write or removal that fails
@@ -3084,7 +3084,8 @@ impl OnDemand<'_> {
     /// Whether a delivery of `p`'s ticket, not yet delivered, collides with
     /// what another ticket of the project holds (OWL-403; architecture
     /// section 5, "The collision rule"): every other ticket ref read again
-    /// under the lock this step holds, one that cannot be read holding the
+    /// in one of the project's sections (OWL-401), one that cannot be read
+    /// holding the
     /// whole repository, against what this ticket holds, widened, closed
     /// with the named resources of `rules`. The work in flight outside
     /// Owlshift, `outside`, holds it too, and its pull requests' files join

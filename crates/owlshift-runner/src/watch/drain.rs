@@ -1,9 +1,11 @@
 //! `owlshift watch --drain` (OWL-250; architecture section 5, "The drain";
 //! build plan, "P4 · The drain", part G): once watch's own work of a pass is
 //! done, the drain reads the ticket refs again, then the ready column, takes
-//! at most one admitted ticket in (intake), and dispatches at most one ready
-//! ticket to Build, the core's pick ([`schedule::ready_set`]), through `do`'s
-//! path ([`OnDemand::dispatch_seen`](crate::on_demand::OnDemand::dispatch_seen)).
+//! at most one admitted ticket in (intake), none while one's step runs, and
+//! dispatches the ready tickets the core picks ([`schedule::ready_set`]), a
+//! list since OWL-401, up to the project's capacity, each through `do`'s
+//! path ([`OnDemand::dispatch_seen`](crate::on_demand::OnDemand::dispatch_seen)),
+//! whose admission weighs the work outside Owlshift this pass read.
 //!
 //! The refs are read again after watch's work, so a merge watch read in this
 //! pass releases the ticket it blocked in the same pass ("Unblocked by a
@@ -351,8 +353,7 @@ impl Watch<'_> {
             .map(|ticket| ticket.as_str().to_owned())
             .collect();
         // The pull requests still followed, from the refs read this pass
-        // (an unread ref stops every dispatch below). One project, one run
-        // at a time.
+        // (an unread ref stops every dispatch below).
         let cap = u32::from(on_demand.config.policy.max_open_prs());
         let open_prs = u32::try_from(
             refs.values()

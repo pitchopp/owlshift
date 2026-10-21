@@ -78,6 +78,19 @@
 //! predecessor left call for, while each ticket's ref is where its record
 //! says.
 //!
+//! Since OWL-401 (architecture section 5, "Parallel"), several tickets of a
+//! project work at once, up to `policy.max_in_flight`: the slot's turn goes
+//! to the first holders by dispatch time ([`schedule::slot_turn`]), the
+//! drain dispatches a list of tickets a pass, and `owlshift watch --drain`
+//! starts each step's child without waiting for it. Each pass first applies
+//! the end of every child that ended, then leaves the tickets whose child
+//! runs alone; between two passes watch waits for the first child to end,
+//! or the interval. A pass takes the steps of tickets already dispatched in
+//! the design's order: repairs at Watch, answer checks, resumes, each by
+//! dispatch time; then the drain's one intake, none while one runs, and its
+//! dispatches. Commands hold the project's lock for short sections only, so
+//! a snapshot finds it busy for those moments alone.
+//!
 //! Since OWL-368, a snapshot that finds the `unverified` marker still reads
 //! the ticket refs, through the runner's read-only plumbing, and the pass
 //! then runs nothing: it notifies a marker no command notified, prints the

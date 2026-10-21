@@ -3,9 +3,10 @@
 //!
 //! Watch decides what a step is and writes it as an envelope
 //! ([`StepEnvelope`]); [`run`] carries it out through the entry points of
-//! `continue`'s and the dispatch's own paths, which hold the project's lock
-//! for the step's whole length and refuse, running nothing, a ticket ref or a
-//! visible stage that moved since watch read it. `owlshift watch --drain`
+//! `continue`'s and the dispatch's own paths, which hold the ticket's lock
+//! for the step's whole length, the project's for short sections only since
+//! OWL-401, and refuse, running nothing, a ticket ref or a visible stage
+//! that moved since watch read it. `owlshift watch --drain`
 //! runs it in a child, `owlshift continue <TICKET> --step <envelope>`, whose
 //! [`child`] writes the step's outcome record last ([`StepOutcome`],
 //! `outcome-<attempt>.json` in the ticket's folder), which watch reads when
@@ -17,8 +18,8 @@
 //! `carry.json` beside the records ([`TicketCarry`]), tied to the ticket-ref
 //! commit the step left and a generation; a resume uses it only while both
 //! are those its envelope names. A step that ran nothing leaves it as it is;
-//! one that stopped [`Stop::Stepped`] keeps it while it still holds the
-//! project's lock, written when it moved the ref's progress, so that a
+//! one that stopped [`Stop::Stepped`] keeps it while it still holds its
+//! ticket's lock, written when it moved the ref's progress, so that a
 //! person's `do` or `continue` after it, which removes it, has the last
 //! word; any other removes it.
 

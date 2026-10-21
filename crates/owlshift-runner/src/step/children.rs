@@ -145,7 +145,7 @@ impl Running {
     /// Prints the lines the child wrote since the last poll, its standard
     /// output's on `out` and its standard error's on watch's, each after
     /// the ticket; then, once the child has ended and its output closed, or
-    /// [`GRACE`] after its end while something it left holds the output,
+    /// two seconds after its end while something it left holds the output,
     /// stops what it left, withdraws and reaps it, and returns its outcome
     /// record, read and removed from `dirs`, or why there is none. `None`
     /// while it runs.

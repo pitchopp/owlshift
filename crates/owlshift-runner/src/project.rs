@@ -288,7 +288,7 @@ impl ProjectDirs {
     /// and its run file, an admission, a branch's or a worktree's creation
     /// or removal, the delivery's collision check. So a command waits for
     /// it, a bounded loop over a try, through the helper the account lock
-    /// shares ([`lock_file_within`]): a holder that crashed (the kernel drops
+    /// shares (`lock_file_within`): a holder that crashed (the kernel drops
     /// its lock) or a child that keeps a lock just released a moment is
     /// outlasted, and a holder that never lets go is answered busy. The lock
     /// belongs to an open file description (`flock` on Unix), so a second
