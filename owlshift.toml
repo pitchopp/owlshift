@@ -2,8 +2,13 @@
 # runner of the project read this file. It holds no secret: the tracker and
 # forge credentials live in each machine's system keychain (`owlshift init`
 # stores them), and the model logins stay with each harness CLI.
+#
+# Every key Owlshift reads is listed below. A key left at its default says
+# so; a key with no default is shown commented out. `owlshift config show`
+# prints the effective value of every key and the file it comes from.
 
-# The Owlshift versions that can read this file.
+# The Owlshift versions that can read this file: a semantic version
+# requirement such as ">=0.4".
 requires = ">=0.0"
 
 [tracker]
@@ -11,18 +16,31 @@ requires = ">=0.0"
 # this repository, one folder per ticket under tickets/.
 kind = "linear"
 # The Linear team key: the prefix of its ticket ids, OWL in OWL-12.
+# Required for "linear".
 team = "OWL"
 # How a person admits a ticket to Owlshift's queue: { label = "..." },
-# { state = "..." } or "delegation". `owlshift do TICKET` does not use
-# it: it runs the ticket it is given.
+# { state = "..." } (which must be states.ready), "ready" (the move to
+# states.ready) or "delegation". `owlshift do TICKET` does not use it: it
+# runs the ticket it is given.
 admit = { label = "agent" }
-# The tracker accounts whose admission gesture counts, by Linear user id.
-# `owlshift watch --drain` refuses to start without it. The maintainer's
-# account, for the P4 exit gate (OWL-255).
+# The tracker accounts whose admission gesture counts, by Linear user id,
+# written exactly. `owlshift watch --drain` refuses to start without it.
+# The maintainer's account, for the P4 exit gate (OWL-255).
 admitters = ["782fed6b-e07e-4647-9d70-961856bdf80c"]
-# The tracker states that show where a ticket stands. A parked ticket
-# shows Parked, which only a person's `owlshift continue` restarts.
-states = { ready = "Todo", working = "In Progress", needs_input = "Needs Input", review = "In Review", parked = "Parked" }
+# A label that keeps a ticket out of the drain, whatever else it carries;
+# never the admission label. No default: no ticket is excluded.
+# exclude = "no-agent"
+
+[tracker.states]
+# The tracker states that show where a ticket stands.
+ready = "Todo"
+working = "In Progress"
+needs_input = "Needs Input"
+review = "In Review"
+# The state a parked ticket shows, which only a person's
+# `owlshift continue` restarts. Optional: without it, a parked ticket
+# shows needs_input, its PARKED comment saying why.
+parked = "Parked"
 
 [stack]
 # The project's full gate: lint, formatter and tests, run in order from the
@@ -40,36 +58,98 @@ gate = [
     "cargo nextest run --workspace --locked --no-fail-fast",
     "cargo test --workspace --doc --locked",
 ]
+# Shell commands that install the gate's dependencies, run in order,
+# confined as the gate is and with the network open: before a Build's
+# harness starts and before the gate's commands. They may write only into
+# ignored folders, and share a third of the gate's deadline. Default: none.
+setup = []
+# Names of variables of the runner's environment the gate needs, such as
+# a feature flag; the whole agent run sees them. Credential variables,
+# `GIT_` names and loader variables are refused, and each machine passes
+# only the names its operator lists in `allow_gate_env` in the personal
+# configuration. Default: none.
+gate_env = []
+# Folders of the home, written from the home with `/` (such as
+# "Library/pnpm"), that the setup, the harness and the gate may read, never
+# write. Each must be allowed by the operator in the personal
+# `allow_caches`. Default: none.
+caches = []
+# The files agents receive as the project's rules, taken whole from the
+# default branch: at most 32 files and 64 KiB together. Left out, the root
+# AGENTS.md is used when there is one; once set, every file listed must
+# exist there; [] sends no rule.
+# rules = ["AGENTS.md", "CONTRIBUTING.md"]
+
+[stack.resources]
+# Named resources a ticket can hold, each with the pattern of the paths it
+# covers: a path from the repository root, where a part `*` stands for
+# exactly one part and `**` for any number (`crates/*/src/config.rs`).
+# Intake names the ones a ticket touches, and two tickets holding the same
+# resource never run together. Names: ASCII letters, digits, `.`, `_` and
+# `-`. Default: none.
+# ci = ".github/workflows/**"
 
 [pipeline]
 # A ticket's pipeline variant, unless intake or a label picks another:
-# "trivial", "standard" or "risky". In this version, `owlshift do` runs
-# the build stage only.
+# "trivial", "standard" or "risky".
 default = "standard"
 # When a human approves the plan: "always", "on-fork" or "never".
 plan_approval = "on-fork"
+# Who confirms a review finding before it is acted on: "author" (default:
+# the next design or fix run answers each finding) or "arbiter" (one
+# arbiter run per review pass rules on all its findings).
+findings = "author"
+# Adds a Codex reviewer, on the critic's mandate, to every Design review
+# and Verify pass, beside the Claude Code reviewers: true or false
+# (default). A Codex that cannot serve a pass drops that seat; it never
+# stops the ticket.
+codex_reviewer = false
 
 [models]
-# The model of each tier, per harness; left out, a harness runs its own
-# default model, but `fast` falls back to `standard`. A ticket's Build runs
-# on the tier of its routing verdict, or of its `tier:` label. For example:
+# The model of each tier, per harness (`claude`, `codex`); left out, a
+# harness runs its own default model, but `fast` falls back to `standard`.
+# A ticket's Build runs on the tier of its routing verdict, or of its
+# `tier:` label.
 deep     = { claude = "claude-opus-5-5" }
 standard = { claude = "claude-sonnet-5-5" }
 fast     = { claude = "claude-haiku-5-5" }
 
-
 [policy]
-# Question categories always left to a human, on top of the floor's
-# security, data_loss, money, legal, irreversible and scope.
+# Question categories always left to a human, on top of the floor. The
+# floor sends `security` and `irreversible` to a human at every
+# delegation level; `scope` below "ticket"; `data_loss`, `money` and
+# `legal` below "all". With resolver_delegation = "all", list here the
+# ones you still want to decide, such as ["data_loss", "money", "legal"].
+# A category matches as a whole word: "scope" also matches "scope_change".
 always_human = []
-resolver_delegation = "all"   # none | facts | discoverable (the default) | ticket | all
-resolver_passes = "unlimited"              # 1 to 50, or "unlimited"
-resolver_budget_usd = 100.0        # required with "unlimited"
+# How long the decider's latest comment must stay unedited before their
+# answer counts: whole minutes, 1 to 1440. Default: 10. Ending a comment
+# with `go` counts it at once.
+quiet_window_minutes = 10
+# How many of the project's tickets may be worked at once, between Ready
+# and Watch: 1 to 10. Default: 1, one ticket at a time. The machine-wide
+# `concurrent_runs` of the personal configuration caps it too.
+max_in_flight = 10
+# How many pull requests Owlshift delivered may be open at once before the
+# drain dispatches no new Build: 1 to 20. Default: 3.
+max_open_prs = 20
+# What the resolver may decide without the decider: "none", "facts",
+# "discoverable" (default), "ticket" or "all".
+resolver_delegation = "all"
+# The runs in a row the resolver may unblock in one command: 1 to 50, or
+# "unlimited", which needs resolver_budget_usd. Default: 5.
+resolver_passes = "unlimited"
+# A ceiling, in dollars, on what the resolver runs of one chain cost since
+# the command's last stop; past it, the next questions go to the decider.
+# A positive number; no default, required with resolver_passes =
+# "unlimited".
+resolver_budget_usd = 100.0
 # What one ticket's runs may cost in all, every run counted across its
 # commands; reached, the ticket parks until a person's `owlshift continue`,
-# which counts its runs afresh (OWL-378). 100 USD sits above every ticket's
-# spend measured on 2026-10-20 for the tickets run since 2026-10-14, the
-# most 79 USD (OWL-330, still open).
+# which counts its runs afresh (OWL-378). A positive number; no default:
+# no budget. 100 USD sits above every ticket's spend measured on
+# 2026-10-20 for the tickets run since 2026-10-14, the most 79 USD
+# (OWL-330, still open).
 ticket_budget_usd = 100.0
 
 [forge.reviewers]
@@ -80,3 +160,15 @@ ticket_budget_usd = 100.0
 # table no review is read. The maintainer's account, for the P5 exit gate
 # (OWL-311).
 pitchopp = "782fed6b-e07e-4647-9d70-961856bdf80c"
+
+# Code zones, keyed by their folder from the repository root: the tracker
+# account that decides the tickets without an assignee touching the zone,
+# by its Linear user id. Default: none.
+# [zones."crates/owlshift-core"]
+# owner = "782fed6b-e07e-4647-9d70-961856bdf80c"
+
+# Rules added to one role's brief alone, after stack.rules, by the same
+# limits. Roles: build, resolver, intake, design, design_review, verify,
+# arbiter. Default: none.
+# [roles.verify]
+# rules = ["CONTRIBUTING.md"]
