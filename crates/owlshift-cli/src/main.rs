@@ -6,6 +6,7 @@ mod gate_cmd;
 mod init_cmd;
 mod logs_cmd;
 mod unquarantine_cmd;
+mod why_cmd;
 
 use std::num::NonZeroUsize;
 use std::path::PathBuf;
@@ -106,6 +107,16 @@ enum Command {
     /// the worktrees stay as they are. Refused while another command works
     /// the project.
     Unquarantine,
+    /// Say why this project's admitted tickets are not running: blockers,
+    /// the ticket or pull request that holds what they would touch, the
+    /// caps, a harness at its usage limit, the quarantine, and the people's
+    /// tickets left out for want of zones; then the machine's run slots and
+    /// the harnesses limited. With a ticket, its reasons over time. Read
+    /// only, takes no lock, and works while `owlshift watch` runs.
+    Why {
+        /// Only this ticket, such as OWL-12, with its reasons over time.
+        ticket: Option<String>,
+    },
     /// Print the events `owlshift do`, `continue`, `watch` and `forget`
     /// recorded, oldest first.
     Logs {
@@ -197,6 +208,7 @@ fn main() -> ExitCode {
         Command::Forget { ticket } => forget_cmd::run(&config, &ticket),
         Command::Gate { at } => gate_cmd::run(&system, &config, at.as_deref()),
         Command::Unquarantine => unquarantine_cmd::run(&config),
+        Command::Why { ticket } => why_cmd::run(&config, ticket.as_deref()),
         Command::Logs {
             ticket,
             last,
