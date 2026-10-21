@@ -355,7 +355,32 @@ fn rename_over(from: &Path, to: &Path) -> io::Result<()> {
 /// What a ticket's branch and ref hold in the dedicated checkout.
 struct Actual {
     tip: Option<String>,
+    /// The ref the branch points to when it is a symbolic ref: a run's
+    /// commits through it would move that other ref, so it is never a value
+    /// a run file records, and always a breach.
+    tip_alias: Option<String>,
     ticket_ref: Option<String>,
+}
+
+/// The ref `refs/heads/<branch>` points to in `checkout` when it is a
+/// symbolic ref, one level only; `None` for a plain branch or none.
+fn branch_alias(git: &Git, checkout: &Path, branch: &str) -> Result<Option<String>, String> {
+    let name = format!("refs/heads/{branch}");
+    let out = git
+        .output(
+            checkout,
+            &["symbolic-ref", "--quiet", "--no-recurse", &name],
+            None,
+        )
+        .map_err(|e| e.to_string())?;
+    match out.code {
+        Some(0) => Ok(Some(String::from_utf8_lossy(&out.stdout).trim().to_owned())),
+        Some(1) => Ok(None),
+        _ => Err(format!(
+            "reading the branch {branch}: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        )),
+    }
 }
 
 /// The commit `refs/heads/<branch>` is at in `checkout`, `None` when there is
@@ -386,10 +411,28 @@ fn branch_head(git: &Git, checkout: &Path, branch: &str) -> Result<Option<String
 }
 
 fn actual(git: &Git, checkout: &Path, ticket: &TicketId) -> Result<Actual, String> {
+    let branch = branch_for(ticket);
     Ok(Actual {
-        tip: branch_head(git, checkout, &branch_for(ticket))?,
+        tip: branch_head(git, checkout, &branch)?,
+        tip_alias: branch_alias(git, checkout, &branch)?,
         ticket_ref: ticket_ref::pointed(git, checkout, ticket)?,
     })
+}
+
+/// The breach of a ticket's branch that is a symbolic ref, whatever commit
+/// it resolves to (OWL-400, Codex P1 on #377): the ticket's worktree commits
+/// through it into the ref it names. A symbolic ticket ref is not this
+/// breach: `ticket_ref::read` refuses it as unreadable before anything runs,
+/// and the runner's moves of it never follow it.
+fn alias_breach(ticket: &TicketId, actual: &Actual) -> Result<(), RunFault> {
+    match &actual.tip_alias {
+        Some(target) => Err(RunFault::Breach(format!(
+            "the branch {} of {ticket} is a symbolic ref to {target}: it was changed outside its \
+             runs",
+            branch_for(ticket)
+        ))),
+        None => Ok(()),
+    }
 }
 
 /// A commit id as messages show it.
@@ -435,6 +478,7 @@ fn settle_one(
 /// ticket.
 fn settle(run: &mut TicketRun, actual: &Actual) -> Result<bool, RunFault> {
     let ticket = run.ticket.clone();
+    alias_breach(&ticket, actual)?;
     let breach = |why: String| RunFault::Breach(format!("{why}: it was changed outside its runs"));
     let tip = settle_one(
         &format!("the branch {} of {ticket}", branch_for(&ticket)),
@@ -454,10 +498,12 @@ fn settle(run: &mut TicketRun, actual: &Actual) -> Result<bool, RunFault> {
 }
 
 /// The run file of `ticket` from its refs as they are: what a ticket from
-/// before P6 gets, and what `owlshift unquarantine` takes afresh.
+/// before P6 gets, and what `owlshift unquarantine` takes afresh. A branch
+/// that is a symbolic ref is recorded as none, so the ticket's next start
+/// still finds it a breach until a person removes the alias.
 fn baseline(ticket: &TicketId, actual: Actual, entry: Option<String>) -> TicketRun {
     TicketRun {
-        tip: actual.tip,
+        tip: actual.tip.filter(|_| actual.tip_alias.is_none()),
         ticket_ref: actual.ticket_ref,
         entry,
         ..TicketRun::new(ticket.clone())
@@ -483,6 +529,7 @@ fn load(
         Some(run) => run,
         None if dirs.obligations_stand() => return Err(RunFault::Busy),
         None => {
+            alias_breach(ticket, &actual)?;
             let mut run = baseline(ticket, actual, entry.map(str::to_owned));
             save(dirs, &mut run).map_err(|e| RunFault::Failed(e.to_string()))?;
             return Ok(run);
@@ -701,7 +748,14 @@ pub fn run_ended(
     worktree: &Path,
 ) -> Result<(), String> {
     let mut run = read_run(dirs, ticket)?.unwrap_or_else(|| TicketRun::new(ticket.clone()));
-    run.tip = branch_head(git, checkout, &branch_for(ticket))?;
+    // A run that made its branch a symbolic ref broke its own check (its
+    // worktree is no longer on its branch): none is recorded, so the next
+    // start finds the alias a breach too.
+    let branch = branch_for(ticket);
+    run.tip = match branch_alias(git, checkout, &branch)? {
+        Some(_) => None,
+        None => branch_head(git, checkout, &branch)?,
+    };
     run.writing.tip = None;
     if fs::symlink_metadata(worktree).is_ok() {
         run.entry = entry_of(checkout, worktree);

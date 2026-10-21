@@ -251,6 +251,39 @@ fn a_branch_moved_outside_the_runner_is_found_at_the_next_start() {
     assert!(matches!(opened, Err(RunFault::Breach(_))), "{opened:?}");
 }
 
+/// A ticket's branch made a symbolic ref to another branch at the same
+/// commit, through which the ticket's worktree would commit into that one,
+/// is a breach at the next start (Codex P1 on #377); taking the run files
+/// afresh does not accept it, and a ticket from before P6 gets no baseline
+/// from it.
+#[test]
+fn a_branch_made_an_alias_at_the_same_commit_is_caught_at_the_next_start() {
+    let bench = Bench::new();
+    let owl = ticket("OWL-4");
+    let branch = format!("refs/heads/{}", branch_for(&owl));
+    bench.run(&["branch", &branch_for(&owl), "HEAD"]);
+    let main = bench.run(&["symbolic-ref", "HEAD"]);
+    let run = bench.open(&owl).unwrap();
+    assert_eq!(run.tip, Some(bench.run(&["rev-parse", "HEAD"])));
+
+    bench.run(&["symbolic-ref", &branch, &main]);
+    let caught = |opened: Result<TicketRun, RunFault>| match opened {
+        Err(RunFault::Breach(why)) => {
+            assert!(
+                why.contains(&format!("is a symbolic ref to {main}")),
+                "{why}"
+            );
+        }
+        other => panic!("{other:?}"),
+    };
+    caught(bench.open(&owl));
+    rebaseline(&bench.git, &bench.dirs).unwrap();
+    assert_eq!(bench.run_file(&owl).tip, None);
+    caught(bench.open(&owl));
+    fs::remove_file(bench.dirs.run_file(&owl)).unwrap();
+    caught(bench.open(&owl));
+}
+
 /// A ticket from before P6 gets its run file from its refs as they are,
 /// once no obligation stands; while one does, it waits.
 #[test]
