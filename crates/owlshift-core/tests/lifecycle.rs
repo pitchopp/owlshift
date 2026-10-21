@@ -72,6 +72,7 @@ fn a_standard_ticket_from_admission_to_merge() {
     let caps = Caps {
         concurrent_runs: 1,
         open_prs: Some(3),
+        max_in_flight: 1,
     };
     let ready = ready_set(std::slice::from_ref(&ticket), caps, Load::default());
     assert_eq!(
@@ -83,7 +84,7 @@ fn a_standard_ticket_from_admission_to_merge() {
     );
     ticket.blocked_by[0].tracker = BlockerState::Completed;
     let ready = ready_set(std::slice::from_ref(&ticket), caps, Load::default());
-    assert_eq!(ready.dispatch, Some("OWL-42".to_owned()));
+    assert_eq!(ready.dispatch, ["OWL-42".to_owned()]);
     step(&mut ticket, Event::Dispatched);
     assert_eq!(ticket.state.status(), Status::Active(Stage::Design));
 

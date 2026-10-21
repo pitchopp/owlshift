@@ -306,6 +306,12 @@ fn a_ticket_from_before_gets_its_baseline_once_no_run_is_in_flight() {
     assert_eq!(name, "owl-9-r1");
     assert_eq!(bench.open(&owl), Err(RunFault::Busy));
     assert!(read_run(&bench.dirs, &owl).unwrap().is_none());
+    // A ticket of which nothing exists yet gets its empty baseline at once
+    // (OWL-401): whatever a run in flight makes of it later is found at its
+    // next start.
+    let fresh = ticket("OWL-4");
+    let run = bench.open(&fresh).unwrap();
+    assert_eq!((run.ticket_ref, run.tip, run.entry), (None, None, None));
     remove_obligation(&bench.dirs, &name).unwrap();
     let run = bench.open(&owl).unwrap();
     assert_eq!(run.ticket_ref.as_deref(), Some(written.as_str()));

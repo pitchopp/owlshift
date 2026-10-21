@@ -111,6 +111,9 @@ pub fn origin_text(url: Vec<u8>) -> Result<String, String> {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ProjectDirs {
     root: PathBuf,
+    /// How long a command waits for the project's lock
+    /// ([`ProjectDirs::lock`]): [`PROJECT_LOCK_WAIT`].
+    lock_wait: Duration,
 }
 
 impl ProjectDirs {
@@ -122,6 +125,18 @@ impl ProjectDirs {
                 .join("github.com")
                 .join(component(repo.owner()))
                 .join(component(repo.name())),
+            lock_wait: PROJECT_LOCK_WAIT,
+        }
+    }
+
+    /// These directories, a command waiting `wait` for the project's lock
+    /// before it answers busy: what a test that stands for another command
+    /// holding the lock gives its command, rather than the minute every
+    /// command waits.
+    pub fn with_lock_wait(self, wait: Duration) -> Self {
+        Self {
+            lock_wait: wait,
+            ..self
         }
     }
 
@@ -261,25 +276,38 @@ impl ProjectDirs {
         self.ticket_lock_held_in(&dir)
     }
 
-    /// Takes the project's lock for a command, held until the returned value
-    /// is dropped or the process ends; `None` when another open file
-    /// description still holds it once [`LOCK_GRACE`] has passed.
+    /// Takes the project's lock for one of a command's short sections, held
+    /// until the returned value is dropped or the process ends; `None` when
+    /// another open file description still holds it once
+    /// [`PROJECT_LOCK_WAIT`] has passed (or the wait
+    /// [`ProjectDirs::with_lock_wait`] set).
     ///
-    /// The lock belongs to an open file description (`flock` on Unix), which
-    /// a child spawned while it is held shares until it execs, and on macOS
-    /// a moment longer: a child the standard library starts through
+    /// Since OWL-401 a command holds it for short sections only, never
+    /// across a harness run or a gate (architecture section 5, "Locks"):
+    /// the look at the quarantine, the fetch and the reads of the ticket ref
+    /// and its run file, an admission, a branch's or a worktree's creation
+    /// or removal, the delivery's collision check. So a command waits for
+    /// it, a bounded loop over a try, through the helper the account lock
+    /// shares (`lock_file_within`): a holder that crashed (the kernel drops
+    /// its lock) or a child that keeps a lock just released a moment is
+    /// outlasted, and a holder that never lets go is answered busy. The lock
+    /// belongs to an open file description (`flock` on Unix), so a second
+    /// take in the process that holds it waits too: no section is taken
+    /// inside another.
+    ///
+    /// A child spawned while it is held shares it until it execs, and on
+    /// macOS a moment longer: a child the standard library starts through
     /// `posix_spawn` can keep the parent's close-on-exec descriptors for
     /// some milliseconds after the spawn returned, even once it ended
-    /// (OWL-414; architecture section 5, "A lock just released"). So a lock
-    /// whose holder ran git under it can look held a moment after its
-    /// release, and a command waits that out, polling, before it answers
-    /// busy. Watch's own takes never wait ([`ProjectDirs::try_lock`]).
+    /// (OWL-414; architecture section 5, "A lock just released"), which the
+    /// wait outlasts. Watch's own takes never wait
+    /// ([`ProjectDirs::try_lock`]).
     ///
     /// A child forked by another thread of this process holds it until it
     /// execs too; only the tests spawn beside a thread that locks, so a test
     /// that takes a lock again runs alone (`alone::run_alone`).
     pub fn lock(&self) -> io::Result<Option<ProjectLock>> {
-        self.lock_within(LOCK_GRACE)
+        self.lock_within(self.lock_wait)
     }
 
     /// [`ProjectDirs::lock`] with a single try: watch's snapshot and notes,
@@ -383,11 +411,16 @@ impl ProjectDirs {
     }
 }
 
-/// How long a command waits for the project's or a ticket's lock before it
-/// answers busy (OWL-414): about six times the longest moment a lock just
-/// released was seen to look held, under load on macOS (see
-/// [`ProjectDirs::lock`]).
+/// How long a command waits for a ticket's lock before it answers busy
+/// (OWL-414): about six times the longest moment a lock just released was
+/// seen to look held, under load on macOS (see [`ProjectDirs::lock`]).
 pub const LOCK_GRACE: Duration = Duration::from_millis(250);
+
+/// How long a command waits for the project's lock before it answers busy
+/// (OWL-401): its holders keep it for short sections only, the longest a
+/// fetch, so a minute, as the account lock's wait, outlasts them while a
+/// holder that never lets go, such as a first clone, still answers busy.
+pub const PROJECT_LOCK_WAIT: Duration = Duration::from_secs(60);
 
 /// How often a command tries again within [`LOCK_GRACE`]: the moment it
 /// waits out lasts milliseconds, so a lock freed is taken soon after.
@@ -920,10 +953,16 @@ mod tests {
             return;
         }
         let dir = tempfile::tempdir().unwrap();
-        let dirs = ProjectDirs::new(dir.path(), &Repo::parse("demo/project").unwrap());
+        let repo = Repo::parse("demo/project").unwrap();
+        assert_eq!(
+            ProjectDirs::new(dir.path(), &repo).lock_wait,
+            PROJECT_LOCK_WAIT
+        );
+        let dirs = ProjectDirs::new(dir.path(), &repo).with_lock_wait(LOCK_GRACE);
         let held = dirs.lock().unwrap().expect("the first lock is free");
-        // A command waits for the bound before it answers busy (OWL-414);
-        // watch tries once, counted rather than timed.
+        // A command waits for the bound before it answers busy (OWL-414,
+        // OWL-401: a minute, shortened here); watch tries once, counted
+        // rather than timed.
         let started = Instant::now();
         assert!(dirs.lock().unwrap().is_none(), "a second lock waits");
         assert!(started.elapsed() >= LOCK_GRACE);

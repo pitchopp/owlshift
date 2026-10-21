@@ -1011,9 +1011,13 @@ impl OnDemand<'_> {
         command: Command,
         sink: &mut EventSink<'_>,
     ) -> Result<Dispatched, Stop> {
+        // The fetch and the branch's move in one of the project's short
+        // sections (OWL-401).
+        let section = self.section()?;
         p.base = project::sync_checkout(&self.executor.git, self.dirs, self.remote_url)
             .map_err(Stop::Refused)?;
         self.start_from_base(p)?;
+        drop(section);
         self.dispatch(p, command, sink)
     }
 

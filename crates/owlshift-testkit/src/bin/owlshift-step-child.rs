@@ -2,16 +2,18 @@
 //! `owlshift-step-child <PROJECT> <TICKET> <ENVELOPE>` does what
 //! `owlshift continue <TICKET> --step <ENVELOPE>` does, on the project whose
 //! paths the file `PROJECT` keeps ([`ChildProject`]), through the same
-//! entry, `owlshift_runner::step::child`. As `owlshift` does, it first
-//! makes the process trees it starts stop with it, however it ends. When
-//! `OWLSHIFT_STEP_CHILD_PID` names a file, it writes its process id there
-//! first.
+//! entry, `owlshift_runner::step::child`; with `do` in place of the
+//! envelope, what a person's `owlshift do <TICKET>` does (OWL-401). As
+//! `owlshift` does, it first makes the process trees it starts stop with it,
+//! however it ends. When `OWLSHIFT_STEP_CHILD_PID` names a file, it writes
+//! its process id there first.
 
 use std::io;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use jiff::Timestamp;
+use owlshift_contracts::ids::TicketId;
 use owlshift_contracts::step::StepEnvelope;
 use owlshift_platform::process;
 use owlshift_runner::events::printable;
@@ -30,9 +32,26 @@ fn main() -> ExitCode {
     }
     let args: Vec<String> = std::env::args().skip(1).collect();
     let [project, ticket, envelope] = args.as_slice() else {
-        eprintln!("usage: owlshift-step-child <PROJECT> <TICKET> <ENVELOPE>");
+        eprintln!("usage: owlshift-step-child <PROJECT> <TICKET> <ENVELOPE|do>");
         return ExitCode::from(2);
     };
+    // `do` in place of an envelope: a person's `owlshift do <TICKET>` on
+    // the project (OWL-401), its outcome printed, no run slot taken.
+    if envelope == "do" {
+        let Ok(ticket) = TicketId::new(ticket.as_str()) else {
+            eprintln!("not a ticket: {ticket}");
+            return ExitCode::from(2);
+        };
+        let project = ChildProject::load(Path::new(project));
+        let said = project.with_on_demand(&mut io::stdout(), |on_demand, sink| {
+            match on_demand.run(&ticket, sink) {
+                Ok(delivered) => delivered.to_string(),
+                Err(stop) => stop.to_string(),
+            }
+        });
+        println!("{}", printable(&said));
+        return ExitCode::SUCCESS;
+    }
     let envelope = match StepEnvelope::parse(envelope) {
         Ok(envelope) if envelope.ticket.as_str() == ticket => envelope,
         Ok(_) => {

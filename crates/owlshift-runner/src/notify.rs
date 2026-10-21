@@ -149,6 +149,7 @@ pub fn blocker_line(ticket: &TicketId, stop: &Stop) -> Option<String> {
         | Stop::Busy(_)
         | Stop::TicketBusy(_)
         | Stop::Refused(_)
+        | Stop::Waits { .. }
         | Stop::Unverified { .. }
         | Stop::Waiting { .. }
         | Stop::Settling { .. }

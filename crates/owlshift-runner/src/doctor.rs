@@ -2247,18 +2247,26 @@ fn secrets_check(found: &Result<ProjectSecrets, Unresolved>) -> Check {
     Check::ok(Section::Project, SUBJECT, detail)
 }
 
-/// Whether a ticket ref holds the drain's one slot (OWL-291): one between
-/// Ready and Watch, one whose state does not read, or one that cannot be
-/// read, each of which stops every dispatch of `owlshift watch --drain`.
-/// A warning naming each and the command that clears it, since none blocks
-/// `do`; one a command is working now frees the slot when its work ends.
-/// Read from the dedicated checkout without the project's lock. Only the
-/// identifiers and stages reach the report, never why a ref did not read.
+/// Whether ticket refs hold the project's capacity (OWL-291, OWL-401): one
+/// between Ready and Watch, one whose state does not read, or one that
+/// cannot be read each holds one of `policy.max_in_flight`, and as many stop
+/// every dispatch of `owlshift watch --drain` and every `owlshift do`. A
+/// warning, once the capacity is held, naming each and the command that
+/// clears it; one a command is working now frees its share when its work
+/// ends. Read from the dedicated checkout without the project's lock. Only
+/// the identifiers and stages reach the report, never why a ref did not
+/// read.
 fn drain_slot_check(system: &dyn System, config: &Effective) -> Option<Check> {
     const SUBJECT: &str = "drain slot";
-    let FileState::Loaded { path, .. } = &config.project else {
+    let FileState::Loaded {
+        path,
+        config: project,
+        ..
+    } = &config.project
+    else {
         return None;
     };
+    let capacity = usize::from(project.policy.max_in_flight());
     let root = path.parent()?;
     let refs = match system.ticket_refs(root) {
         Ok(Some(refs)) => refs,
@@ -2308,18 +2316,27 @@ fn drain_slot_check(system: &dyn System, config: &Effective) -> Option<Check> {
         ));
     }
     held.sort_by(|a, b| natural_cmp(a.0.as_str(), b.0.as_str()));
+    let count = held.len();
     let (what, clear): (Vec<String>, Vec<String>) = held
         .into_iter()
         .map(|(_, what, clear)| (what, clear))
         .unzip();
+    if count < capacity {
+        return Some(Check::ok(
+            Section::Project,
+            SUBJECT,
+            format!("{count} of {capacity} held, by {}", what.join("; ")),
+        ));
+    }
     Some(Check::warn(
         Section::Project,
         SUBJECT,
         format!("held by {}", what.join("; ")),
         format!(
-            "{DOES_NOT_BLOCK} `owlshift watch --drain` dispatches nothing while a ticket ref is \
-             between Ready and Watch or cannot be read. Unless a command is working on it now, \
-             run {}.",
+            "{DOES_NOT_BLOCK} on a ticket that holds it, only on the others: `owlshift watch \
+             --drain` dispatches nothing, and `owlshift do` waits, while {capacity} ticket refs \
+             (`policy.max_in_flight`) are between Ready and Watch or cannot be read. Unless a \
+             command is working on it now, run {}.",
             clear.join("; ")
         ),
     ))
@@ -4460,7 +4477,7 @@ states = { ready = "Todo", working = "Doing", needs_input = "Asked", review = "R
             (id("OWL-80"), RefState::Read(None)),
             at("OWL-173", Stage::Build),
         ];
-        let report = run(&ready().ticket_refs_are(Ok(refs)), &config);
+        let report = run(&ready().ticket_refs_are(Ok(refs.clone())), &config);
         assert!(report.ready(), "{report}");
         let warned = line(&report, "drain slot");
         assert_well_formed(warned);
@@ -4480,6 +4497,22 @@ states = { ready = "Todo", working = "Doing", needs_input = "Asked", review = "R
             assert!(why.contains(fix), "{fix}: {why}");
         }
         assert!(!why.contains("not a commit"), "{why}");
+
+        // OWL-401: under a capacity of 5, four holders are no warning.
+        let mut config = config;
+        if let FileState::Loaded {
+            config: project, ..
+        } = &mut config.project
+        {
+            project.policy.max_in_flight = Some(5);
+        }
+        let report = run(&ready().ticket_refs_are(Ok(refs)), &config);
+        let found = line(&report, "drain slot");
+        assert_eq!(found.status, Status::Ok);
+        assert!(
+            found.detail.starts_with("4 of 5 held, by OWL-9"),
+            "{found:?}"
+        );
     }
 
     /// OWL-291: no holder, no dedicated checkout and refs that cannot be

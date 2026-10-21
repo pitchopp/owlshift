@@ -3052,10 +3052,10 @@ pub struct ResumeComment {
     /// intake round asked before OWL-269 (OWL-248), the ticket goes back to
     /// the ready column.
     pub return_to: Stage,
-    /// Under `owlshift watch`, the ticket whose turn the project's one slot
-    /// is, when another ticket holds it and the round returns to a stage
-    /// that needs it (OWL-367): the comment says the work starts once that
-    /// ticket frees the slot. `None` otherwise.
+    /// Under `owlshift watch`, the first ticket whose turn the project's slot
+    /// is, when the ticket would not be among them and the round returns to
+    /// a stage that needs it (OWL-367, OWL-401): the comment says the work
+    /// starts once its turn comes. `None` otherwise.
     pub slot_held_by: Option<TicketId>,
 }
 
@@ -3141,7 +3141,7 @@ impl ResumeComment {
             )
         {
             sections.push(format!(
-                "{holder} holds the project's one slot: this work starts once {holder} frees it."
+                "{holder} holds the project's slot first: this work starts once its turn comes."
             ));
         }
         let footer = Footer {
@@ -5659,7 +5659,7 @@ Context.
 
         // Under watch, a round returning to a stage that waits for the slot
         // says so before the footer; Watch needs no slot (OWL-367).
-        let line = "OWL-160 holds the project's one slot: this work starts once OWL-160 frees it.";
+        let line = "OWL-160 holds the project's slot first: this work starts once its turn comes.";
         let waiting = ResumeComment {
             return_to: Stage::Design,
             slot_held_by: Some(TicketId::new("OWL-160").unwrap()),

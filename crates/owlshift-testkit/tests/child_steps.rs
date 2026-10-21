@@ -176,7 +176,11 @@ fn a_stale_envelope_is_refused_spending_nothing() {
     };
     let dirs = s.project.dirs();
     let mut lines = Vec::new();
-    let record = children(&s.file).run(&dirs, &envelope, &mut lines).unwrap();
+    let record = children(&s.file)
+        .start(&envelope)
+        .unwrap()
+        .wait(&dirs, &mut lines)
+        .unwrap();
     assert_eq!(record.end, StepEnd::Stale);
     assert_eq!(record.hold, None);
     assert_eq!(record.after, RefAfter::Absent);
@@ -246,13 +250,23 @@ fn a_restarted_watch_applies_a_hold_only_at_its_records_ref() {
 fn drain_passes(
     project: &ChildProject,
     children: &Children<'_>,
+    between: impl FnMut(u32) -> bool,
+) -> String {
+    drain_every(project, children, POLL_INTERVAL, between)
+}
+
+/// [`drain_passes`], watch waiting `interval` between idle passes.
+fn drain_every(
+    project: &ChildProject,
+    children: &Children<'_>,
+    interval: std::time::Duration,
     mut between: impl FnMut(u32) -> bool,
 ) -> String {
     let (mut lines, mut events, mut pass) = (Vec::new(), Vec::new(), 0);
     project.with_on_demand(&mut events, |on_demand, sink| {
         let watch = Watch {
             on_demand,
-            interval: POLL_INTERVAL,
+            interval,
         };
         watch.run_with_children(
             true,
@@ -396,6 +410,267 @@ fn two_watches_of_two_projects_share_the_machine_s_slots() {
     let counts = fs::read_to_string(&counts).unwrap();
     let counts: Vec<u32> = counts.lines().map(|n| n.trim().parse().unwrap()).collect();
     assert_eq!(counts, [1, 1], "runs under way as each started");
+}
+
+/// An intake that ends done, the ticket `trivial`, declaring `zones`.
+#[cfg(unix)]
+fn intake_declaring(zones: &[&str]) -> String {
+    let mut result: serde_json::Value = serde_json::from_str(&intake_done()).unwrap();
+    result["intake"]["zones"] = json!(zones);
+    result.to_string()
+}
+
+/// A Build that asks its decider one question: the step ends with the
+/// ticket waiting for the answer, holding what it holds.
+#[cfg(unix)]
+fn build_asks() -> String {
+    json!({
+        "format": RESULT_FORMAT,
+        "status": "questions",
+        "summary": "The greeting's language is not given.",
+        "questions": [{
+            "id": "Q1", "category": "scope", "context": "The ticket names no language.",
+            "text": "Which language should the greeting use?",
+            "recommendation": { "why": "The repository is in English." },
+        }],
+    })
+    .to_string()
+}
+
+/// Writes in `dir` the reply of `role`'s runs on `ticket` (any ticket when
+/// `None`), its result `result`, for [`playing_harness`].
+#[cfg(unix)]
+fn reply_for(dir: &Path, role: &str, ticket: Option<&str>, result: &str) {
+    let name = ticket.map_or_else(|| role.to_owned(), |ticket| format!("{role}-{ticket}"));
+    let result_file = dir.join(format!("{name}.json"));
+    fs::write(&result_file, result).unwrap();
+    let reply = Reply {
+        result: Some(result_file),
+        ..Reply::default()
+    };
+    fs::write(dir.join(format!("reply-{name}.toml")), reply.render()).unwrap();
+}
+
+/// A harness for the tests of several steps at once (OWL-401): a script
+/// that plays the fake harness with the reply [`reply_for`] wrote in `dir`
+/// for its run's role and ticket, read from its brief. A Build run first
+/// marks itself under way in `dir/running` and arrived in `dir/arrived/
+/// <group>`, waits, up to 30 seconds, until `builds` Build runs of its
+/// group have arrived, then writes how many runs of every group are under
+/// way to `dir/counts` and lasts two seconds more; `typed` is a
+/// command the first Build of DEMO-1 runs once while the others wait for
+/// it, its output in `dir/typed/out`.
+#[cfg(unix)]
+fn playing_harness(dir: &Path, group: &str, builds: usize, typed: Option<&str>) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+
+    for sub in ["running", &format!("arrived/{group}")] {
+        fs::create_dir_all(dir.join(sub)).unwrap();
+    }
+    let typed = typed.map_or_else(String::new, |command| {
+        format!(
+            "  if [ \"$ticket\" = DEMO-1 ] && mkdir \"$dir/typed\" 2>/dev/null; then\n    \
+             {command} > \"$dir/typed/out\" 2>&1\n  fi\n"
+        )
+    });
+    let script = dir.join(format!("harness-{group}.sh"));
+    fs::write(
+        &script,
+        format!(
+            "#!/bin/sh\ndir='{dir}'\nbrief=\"\"\nreply=\"\"\n\
+             while [ $# -gt 0 ]; do\n  case \"$1\" in\n    --brief) brief=\"$2\"; shift 2;;\n    \
+             --reply) reply=\"$2\"; shift 2;;\n    *) shift;;\n  esac\ndone\n\
+             role=$(sed -n 's/^  \"role\": \"\\([a-z_]*\\)\",$/\\1/p' \"$brief\" | head -n 1)\n\
+             ticket=$(sed -n 's/^    \"id\": \"\\([A-Z0-9-]*\\)\",$/\\1/p' \"$brief\" | head -n 1)\n\
+             if [ -f \"$dir/reply-$role-$ticket.toml\" ]; then reply=\"$dir/reply-$role-$ticket.toml\"\n\
+             elif [ -f \"$dir/reply-$role.toml\" ]; then reply=\"$dir/reply-$role.toml\"; fi\n\
+             if [ \"$role\" = build ]; then\n  mkdir \"$dir/running/$$\"\n  \
+             touch \"$dir/arrived/{group}/$ticket\"\n  n=0\n  \
+             while [ \"$(ls \"$dir/arrived/{group}\" | wc -l)\" -lt {builds} ] && [ $n -lt 300 ]; do\n    \
+             sleep 0.1\n    n=$((n+1))\n  done\n{typed}  \
+             ls \"$dir/running\" | wc -l | tr -d ' ' >> \"$dir/counts\"\n  sleep 2\n  \
+             rmdir \"$dir/running/$$\"\nfi\n\
+             exec '{FAKE}' --brief \"$brief\" --reply \"$reply\"\n",
+            dir = dir.display(),
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+    script
+}
+
+/// A drained project of tickets DEMO-1 to DEMO-`count`, each admitted and
+/// held by DEMO-9, which no gesture admits, until the test moves it to
+/// Done; its runs played by `harness`, its children taking the machine's
+/// `slots` in `machine`, its capacity `max_in_flight`.
+#[cfg(unix)]
+fn parallel_setup(
+    harness: &Path,
+    count: usize,
+    max_in_flight: u32,
+    (machine, slots): (&Path, u32),
+) -> Setup {
+    let s = setup(Some(harness.to_owned()));
+    let mut project = s.project.clone();
+    project.slots = Some(ChildSlots {
+        data: machine.to_owned(),
+        count: slots,
+    });
+    project.save(&s.file);
+    project.set_policy(&format!("max_in_flight = {max_in_flight}"));
+    project.add_ticket("DEMO-9", &[], "");
+    for n in 1..=count {
+        project.add_ticket(
+            &format!("DEMO-{n}"),
+            &["agent"],
+            "blocked_by = [\"DEMO-9\"]\n",
+        );
+    }
+    Setup { project, ..s }
+}
+
+/// The ticket ref of `id` in `project`'s dedicated checkout, if it reads.
+#[cfg(unix)]
+fn record_of(project: &ChildProject, id: &str) -> Option<ticket_ref::TicketRecord> {
+    let env = project.env();
+    let git = Git::with_setup("git", move |command| env.apply(command));
+    let checkout = project.dirs().checkout();
+    ticket_ref::read(&git, &checkout, &TicketId::new(id).unwrap())
+        .ok()
+        .flatten()
+        .map(|stored| stored.record)
+}
+
+/// Whether the ticket `id` of `project` waits for its decider's answer.
+#[cfg(unix)]
+fn asks(project: &ChildProject, id: &str) -> bool {
+    use owlshift_core::state::{Status, TicketState};
+
+    record_of(project, id).is_some_and(|record| {
+        TicketState::try_from(&record.state)
+            .is_ok_and(|state| matches!(state.status(), Status::NeedsInput { .. }))
+    })
+}
+
+/// OWL-401's acceptance, scenario S5 with three tickets in flight, their
+/// steps in real children: with `policy.max_in_flight = 4` and three run
+/// slots, DEMO-1, DEMO-2 and DEMO-3 declare the zones `a`, `b` and `c` at
+/// intake, one at a time, while DEMO-9 holds them; once it is done, one
+/// pass dispatches the three, and their Builds run at once, each holding
+/// until all three are under way. Meanwhile a person types `owlshift do
+/// DEMO-4`, a ticket with no intake, which would hold the whole repository:
+/// it is refused, DEMO-1 holding `a`. Each Build asks its decider, and the
+/// three wait; no quarantine, no obligation and no outcome record is left.
+#[cfg(unix)]
+#[test]
+fn three_tickets_build_at_once_and_a_do_typed_meanwhile_waits() {
+    let tmp = tempfile::tempdir().unwrap();
+    let plays = tmp.path().join("plays");
+    let machine = tmp.path().join("machine");
+    fs::create_dir_all(&plays).unwrap();
+    for (id, zone) in [("DEMO-1", "a"), ("DEMO-2", "b"), ("DEMO-3", "c")] {
+        reply_for(&plays, "intake", Some(id), &intake_declaring(&[zone]));
+    }
+    reply_for(&plays, "build", None, &build_asks());
+    // The file the project's paths will be kept in, which `do` reads.
+    let file = tmp.path().join("project.toml");
+    let typed = format!("'{CHILD}' '{}' DEMO-4 do", file.display());
+    let harness = playing_harness(&plays, "one", 3, Some(&typed));
+    let s = parallel_setup(&harness, 3, 4, (&machine, 3));
+    s.project.add_ticket("DEMO-4", &[], "");
+    s.project.save(&file);
+    let counted = children(&file).with_slots(MachineSlots::new(&machine, 3));
+    let interval = std::time::Duration::from_millis(200);
+    let lines = drain_every(&s.project, &counted, interval, |pass| {
+        if record_of(&s.project, "DEMO-3").is_some_and(|record| record.intake.is_some()) {
+            s.project.move_ticket("DEMO-9", "Done");
+        }
+        let all = ["DEMO-1", "DEMO-2", "DEMO-3"]
+            .iter()
+            .all(|id| asks(&s.project, id));
+        pass < 200 && !all
+    });
+    let counts = fs::read_to_string(plays.join("counts")).unwrap_or_default();
+    assert_eq!(
+        counts.lines().collect::<Vec<_>>(),
+        ["3", "3", "3"],
+        "{lines}"
+    );
+    let typed = fs::read_to_string(plays.join("typed/out")).unwrap();
+    assert!(
+        typed.contains("DEMO-4 waits: DEMO-1 holds zone `a`"),
+        "{typed}\n{lines}"
+    );
+    for (id, zone) in [("DEMO-1", "a"), ("DEMO-2", "b"), ("DEMO-3", "c")] {
+        assert!(asks(&s.project, id), "{id}\n{lines}");
+        let held = record_of(&s.project, id).unwrap().held.unwrap();
+        assert_eq!(held.zones, [zone], "{id}");
+    }
+    assert_eq!(record_of(&s.project, "DEMO-4"), None, "{lines}");
+    let dirs = s.project.dirs();
+    assert_eq!(dirs.quarantine().unwrap(), None, "{lines}");
+    assert!(!dirs.obligations_stand(), "{lines}");
+    assert!(step::leftovers(&dirs).is_empty());
+}
+
+/// OWL-401, scenario S16: two projects, each with `policy.max_in_flight =
+/// 2`, share one machine's two run slots. Each would dispatch its two
+/// tickets together once their intakes ran, each Build lasting a second:
+/// never more than two runs of the machine are under way, the first watch
+/// to take a free slot running and the other's dispatches waiting until one
+/// frees, and all four Builds run. A rendezvous of a project's Builds
+/// would deadlock here, each project holding one slot: the test of three
+/// Builds at once is the one above.
+#[cfg(unix)]
+#[test]
+fn two_projects_two_in_flight_each_share_two_slots() {
+    use std::thread;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let plays = tmp.path().join("plays");
+    let machine = tmp.path().join("machine");
+    fs::create_dir_all(&plays).unwrap();
+    for (id, zone) in [("DEMO-1", "a"), ("DEMO-2", "b")] {
+        reply_for(&plays, "intake", Some(id), &intake_declaring(&[zone]));
+    }
+    reply_for(&plays, "build", None, &build_asks());
+    let projects: Vec<Setup> = ["one", "two"]
+        .iter()
+        .map(|group| {
+            let harness = playing_harness(&plays, group, 1, None);
+            parallel_setup(&harness, 2, 2, (&machine, 2))
+        })
+        .collect();
+    let watched = std::sync::Mutex::new(Vec::<String>::new());
+    thread::scope(|scope| {
+        for s in &projects {
+            let (machine, watched) = (&machine, &watched);
+            scope.spawn(move || {
+                let counted = children(&s.file).with_slots(MachineSlots::new(machine, 2));
+                let interval = std::time::Duration::from_millis(200);
+                let lines = drain_every(&s.project, &counted, interval, |pass| {
+                    if record_of(&s.project, "DEMO-2").is_some_and(|r| r.intake.is_some()) {
+                        s.project.move_ticket("DEMO-9", "Done");
+                    }
+                    let both = asks(&s.project, "DEMO-1") && asks(&s.project, "DEMO-2");
+                    pass < 300 && !both
+                });
+                assert!(
+                    asks(&s.project, "DEMO-1") && asks(&s.project, "DEMO-2"),
+                    "{lines}"
+                );
+                watched.lock().unwrap().push(lines);
+            });
+        }
+    });
+    let lines = watched.into_inner().unwrap().join("\n");
+    let counts = fs::read_to_string(plays.join("counts")).unwrap();
+    let counts: Vec<u32> = counts.lines().map(|n| n.trim().parse().unwrap()).collect();
+    assert_eq!(counts.len(), 4, "every Build ran\n{lines}");
+    assert!(
+        counts.iter().all(|n| (1..=2).contains(n)),
+        "runs under way as each Build went on: {counts:?}\n{lines}"
+    );
 }
 
 /// What a watch process and its step left running, by pid.

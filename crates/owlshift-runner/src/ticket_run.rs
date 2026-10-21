@@ -27,10 +27,9 @@
 //!   tickets in flight or ended since its snapshot, from their run files and
 //!   their locks ([`Concurrent`]).
 //!
-//! The project's lock still keeps every step apart until OWL-401 narrows
-//! it, so in production every other ticket's lock is free and its run file
-//! unchanged during a run: the check among steps finds nothing running and
-//! is the check of a run alone.
+//! Since OWL-401 the project's lock is held for short sections only, so
+//! several tickets' runs overlap and the check among steps is what keeps
+//! each from taking a sibling's writes for a breach.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File, OpenOptions};
@@ -186,6 +185,35 @@ fn in_flight(dirs: &ProjectDirs, found: &Found, own: Option<&TicketId>) -> io::R
         return Ok(false);
     }
     dirs.ticket_lock_held(ticket)
+}
+
+/// The folder of a ticket whose lock is held elsewhere now, the first in
+/// the folders' order: a command or a step works it (OWL-401). What
+/// `owlshift gate`, which holds the project's lock for its whole length and
+/// keeps the check of a run alone, answers busy to, so that its run and a
+/// step's never overlap: every step holds its ticket's lock for its whole
+/// length and starts with one of the project's sections. One try each, let
+/// go at once; a folder with no lock file was never locked.
+pub fn ticket_in_flight(dirs: &ProjectDirs) -> io::Result<Option<PathBuf>> {
+    let listing = match fs::read_dir(dirs.tickets()) {
+        Ok(listing) => listing,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    let mut folders = Vec::new();
+    for entry in listing {
+        let entry = entry?;
+        if entry.file_type()?.is_dir() && entry.path().join("lock").exists() {
+            folders.push(entry.path());
+        }
+    }
+    folders.sort();
+    for folder in folders {
+        if dirs.ticket_lock_held_in(&folder)? {
+            return Ok(Some(folder));
+        }
+    }
+    Ok(None)
 }
 
 /// The line a quarantine, and `owlshift unquarantine`, say of an obligation
@@ -525,9 +553,17 @@ fn load(
     let read = read_run(dirs, ticket).map_err(|why| {
         RunFault::Breach(format!("the run file of {ticket} cannot be read: {why}"))
     })?;
+    // A ticket of which nothing exists yet, no ref, no branch, no kept
+    // worktree, gets its empty baseline whatever runs (OWL-401): what a run
+    // in flight would make of it is found at its next start. Only a ticket
+    // from before P6 waits for no obligation to stand.
+    let nothing = actual.tip.is_none()
+        && actual.tip_alias.is_none()
+        && actual.ticket_ref.is_none()
+        && entry.is_none();
     let mut run = match read {
         Some(run) => run,
-        None if dirs.obligations_stand() => return Err(RunFault::Busy),
+        None if !nothing && dirs.obligations_stand() => return Err(RunFault::Busy),
         None => {
             alias_breach(ticket, &actual)?;
             let mut run = baseline(ticket, actual, entry.map(str::to_owned));

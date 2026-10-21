@@ -5,14 +5,15 @@
 //! ([`ProcessTree`]): a process group of its own, registered with the signal
 //! policy and the sentinel every command shares, so Ctrl-C, a closed
 //! terminal, SIGTERM or a hard kill of watch stop it, and the child's own
-//! sentinel then stops the runs it started. Watch prints each line the
-//! child writes after its ticket, waits for the child's end without reaping
-//! it, stops what it left, then withdraws and reaps it, and reads its
-//! outcome record.
+//! sentinel then stops the runs it started. Since OWL-401 watch starts a
+//! child without waiting for it ([`Children::start`]) and polls each that
+//! runs ([`Running::poll`]): it prints each line the child writes after its
+//! ticket, sees the child's end without reaping it, stops what it left, then
+//! withdraws and reaps it, and reads its outcome record.
 
 use std::io::{self, BufRead, BufReader, Read, Write};
-use std::process::{Command, Stdio};
-use std::sync::mpsc::{self, RecvTimeoutError, Sender};
+use std::process::{Child, Command, Stdio};
+use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -85,17 +86,10 @@ impl<'a> Children<'a> {
         (self.command)(&envelope.ticket, &envelope.render())
     }
 
-    /// Runs `envelope`'s step in a child, its standard output's lines
-    /// printed on `out` and its standard error's on watch's, each after the
-    /// ticket; returns its outcome record, read and removed, or why there is
-    /// none.
-    pub fn run(
-        &self,
-        dirs: &ProjectDirs,
-        envelope: &StepEnvelope,
-        out: &mut dyn Write,
-    ) -> Result<StepOutcome, String> {
-        let ticket = &envelope.ticket;
+    /// Starts `envelope`'s step in a child, without waiting for it
+    /// (OWL-401): watch polls it ([`Running::poll`]) while its other steps'
+    /// children run. Why it could not start otherwise.
+    pub fn start(&self, envelope: &StepEnvelope) -> Result<Running, String> {
         let mut command = self.command(envelope);
         command
             .stdin(Stdio::null())
@@ -108,70 +102,134 @@ impl<'a> Children<'a> {
         read_lines(child.stdout.take(), Stream::Out, sender.clone());
         read_lines(child.stderr.take(), Stream::Err, sender);
         let exit = ExitWatch::start(&child);
-        let mut open = 2;
-        let mut ended: Option<Instant> = None;
-        let mut watch_error = None;
-        loop {
-            if open > 0 {
-                match lines.recv_timeout(POLL) {
-                    Ok(Output::Line(stream, line)) => {
-                        let line = printable(&format!("{ticket}: {line}"));
-                        match stream {
-                            Stream::Out => {
-                                let _ = writeln!(out, "{line}");
-                            }
-                            Stream::Err => eprintln!("{line}"),
+        Ok(Running {
+            ticket: envelope.ticket.clone(),
+            attempt: envelope.attempt.clone(),
+            child,
+            tree: Some(tree),
+            lines,
+            exit,
+            open: 2,
+            ended: None,
+        })
+    }
+}
+
+/// A step's child in flight (OWL-401): started by [`Children::start`],
+/// polled by watch until it ended.
+pub struct Running {
+    ticket: TicketId,
+    attempt: String,
+    child: Child,
+    /// Its process tree, until it is withdrawn.
+    tree: Option<ProcessTree>,
+    lines: Receiver<Output>,
+    exit: io::Result<ExitWatch>,
+    /// The child's streams still open.
+    open: u8,
+    /// When its end was seen.
+    ended: Option<Instant>,
+}
+
+impl Running {
+    /// The ticket whose step it runs.
+    pub fn ticket(&self) -> &TicketId {
+        &self.ticket
+    }
+
+    /// The step's attempt id.
+    pub fn attempt(&self) -> &str {
+        &self.attempt
+    }
+
+    /// Prints the lines the child wrote since the last poll, its standard
+    /// output's on `out` and its standard error's on watch's, each after
+    /// the ticket; then, once the child has ended and its output closed, or
+    /// two seconds after its end while something it left holds the output,
+    /// stops what it left, withdraws and reaps it, and returns its outcome
+    /// record, read and removed from `dirs`, or why there is none. `None`
+    /// while it runs.
+    pub fn poll(
+        &mut self,
+        dirs: &ProjectDirs,
+        out: &mut dyn Write,
+    ) -> Option<Result<StepOutcome, String>> {
+        while self.open > 0 {
+            match self.lines.try_recv() {
+                Ok(Output::Line(stream, line)) => {
+                    let line = printable(&format!("{}: {line}", self.ticket));
+                    match stream {
+                        Stream::Out => {
+                            let _ = writeln!(out, "{line}");
                         }
-                        continue;
-                    }
-                    Ok(Output::Closed) => open -= 1,
-                    Err(RecvTimeoutError::Timeout) => {}
-                    Err(RecvTimeoutError::Disconnected) => open = 0,
-                }
-            }
-            if ended.is_none() {
-                // With the output closed, the wait for the end is the poll.
-                let until = if open > 0 {
-                    Instant::now()
-                } else {
-                    Instant::now() + POLL
-                };
-                let exited = match &exit {
-                    Ok(exit) => exit.exited_by(&child, until),
-                    Err(error) => Err(io::Error::new(error.kind(), error.to_string())),
-                };
-                match exited {
-                    Ok(true) => ended = Some(Instant::now()),
-                    Ok(false) => {}
-                    // Its end cannot be watched: stop it rather than wait
-                    // without end.
-                    Err(error) => {
-                        watch_error = Some(error.to_string());
-                        break;
+                        Stream::Err => eprintln!("{line}"),
                     }
                 }
-            }
-            match ended {
-                Some(_) if open == 0 => break,
-                Some(at) if at.elapsed() >= GRACE => break,
-                _ => {}
+                Ok(Output::Closed) => self.open -= 1,
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => self.open = 0,
             }
         }
-        // What the child left is stopped while its root, ended or not,
-        // still holds its group's id; then the tree is withdrawn and the
-        // root reaped.
+        let mut watch_error = None;
+        if self.ended.is_none() {
+            let exited = match &self.exit {
+                Ok(exit) => exit.exited_by(&self.child, Instant::now()),
+                Err(error) => Err(io::Error::new(error.kind(), error.to_string())),
+            };
+            match exited {
+                Ok(true) => self.ended = Some(Instant::now()),
+                Ok(false) => {}
+                // Its end cannot be watched: stop it rather than wait
+                // without end.
+                Err(error) => watch_error = Some(error.to_string()),
+            }
+        }
+        match self.ended {
+            _ if watch_error.is_some() => {}
+            Some(_) if self.open == 0 => {}
+            Some(at) if at.elapsed() >= GRACE => {}
+            _ => return None,
+        }
+        Some(self.finish(dirs, watch_error))
+    }
+
+    /// Waits for the child's end, polling, then returns as
+    /// [`Running::poll`] does.
+    pub fn wait(mut self, dirs: &ProjectDirs, out: &mut dyn Write) -> Result<StepOutcome, String> {
+        loop {
+            if let Some(ended) = self.poll(dirs, out) {
+                return ended;
+            }
+            thread::sleep(POLL);
+        }
+    }
+
+    /// What the child left is stopped while its root, ended or not, still
+    /// holds its group's id; then the tree is withdrawn, the root reaped and
+    /// its outcome record read.
+    fn finish(
+        &mut self,
+        dirs: &ProjectDirs,
+        watch_error: Option<String>,
+    ) -> Result<StepOutcome, String> {
+        let Some(tree) = self.tree.take() else {
+            return Err("it was already withdrawn".to_owned());
+        };
         let _ = tree.kill();
         let status = tree
-            .reap(&mut child)
+            .reap(&mut self.child)
             .map_err(|error| format!("its end could not be read: {error}"))?;
         if let Some(error) = watch_error {
             return Err(format!(
                 "its end could not be watched ({error}), so it was stopped"
             ));
         }
-        let path = super::outcome_file(dirs, ticket, &envelope.attempt);
+        let ticket = &self.ticket;
+        // What its watch handed a dispatch, if the child never took it.
+        let _ = std::fs::remove_file(super::outside_file(dirs, ticket, &self.attempt));
+        let path = super::outcome_file(dirs, ticket, &self.attempt);
         match super::take_outcome(&path) {
-            Ok(Some(record)) if record.ticket == *ticket && record.attempt == envelope.attempt => {
+            Ok(Some(record)) if record.ticket == *ticket && record.attempt == self.attempt => {
                 Ok(record)
             }
             Ok(Some(_)) => Err(format!(

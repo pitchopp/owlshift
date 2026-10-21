@@ -523,6 +523,21 @@ impl Executor {
         worktree::start_from_base(&self.git, main, worktree, branch, base)
     }
 
+    /// Makes the ticket's worktree as a run would, or checks the one found,
+    /// with a [`RunSpec`]'s `main`, `worktree`, `branch` and `base`: what
+    /// the runner does under the project's lock before a run, so that no
+    /// `worktree prune` runs while it is made (OWL-401); the run then finds
+    /// it kept.
+    pub fn prepare_worktree(
+        &self,
+        main: &Path,
+        worktree: &Path,
+        branch: &str,
+        base: &str,
+    ) -> Result<(), ExecutorError> {
+        worktree::prepare_at(&self.git, main, worktree, branch, base)
+    }
+
     /// Runs one role on `harness`. See the module documentation.
     pub fn run(
         &self,

@@ -50,6 +50,20 @@ pub fn in_flight(ticket: &TicketId, stored: &Stored, named: &NamedResources) -> 
     )
 }
 
+/// When the ticket of `stored` was dispatched, as its `held.json` keeps it:
+/// none for a ref from before P6, which comes first (OWL-401, the turn by
+/// dispatch time).
+pub fn dispatched(stored: &Stored) -> Dispatched {
+    stored
+        .record
+        .held
+        .as_ref()
+        .and_then(|held| held.dispatched_at)
+        .map_or(Dispatched::Unrecorded, |at| {
+            Dispatched::At(at.as_millisecond())
+        })
+}
+
 /// A ticket ref that cannot be read: the whole repository, dispatched
 /// first, its pull request taken as not open.
 pub fn unread(ticket: &TicketId, named: &NamedResources) -> InFlight<String> {

@@ -13,8 +13,8 @@ use serde::{Deserialize, Serialize};
 use owlshift_core::gate::{Chain, ChainCost};
 
 use crate::format::{
-    self, CARRY_FORMAT, ContractError, Format, OBLIGATION_FORMAT, RUN_FORMAT, STEP_ENVELOPE_FORMAT,
-    STEP_OUTCOME_FORMAT,
+    self, CARRY_FORMAT, ContractError, Format, OBLIGATION_FORMAT, OUTSIDE_FORMAT, RUN_FORMAT,
+    STEP_ENVELOPE_FORMAT, STEP_OUTCOME_FORMAT,
 };
 use crate::ids::TicketId;
 use crate::{Role, Stage};
@@ -546,6 +546,56 @@ impl RunObligation {
     }
 }
 
+/// The work in flight outside Owlshift that a pass of `owlshift watch
+/// --drain` read (OWL-410), handed to the step of a dispatch it starts, so
+/// that the step's admission weighs what the pass weighed (OWL-401;
+/// architecture section 5, "Admission, one transaction"): kept in
+/// `outside-<attempt>.json` in the ticket's folder, written by watch before
+/// it starts the step's child, read and removed by the child.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+#[schemars(title = "Owlshift step outside")]
+pub struct StepOutside {
+    pub format: Format<OUTSIDE_FORMAT>,
+    /// The repository's open pull requests, each with the files it changes.
+    pub pulls: Vec<OutsidePull>,
+    /// The tickets of the tracker's working state.
+    pub working: Vec<OutsideTicket>,
+}
+
+/// An open pull request as a pass read it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct OutsidePull {
+    pub number: u64,
+    pub head_branch: String,
+    /// The files it changes, both paths of a rename; none when it holds the
+    /// whole repository (a list too long or too large to read).
+    #[serde(default)]
+    pub files: Option<Vec<String>>,
+}
+
+/// A ticket of the working state as a pass read it: what the collision rule
+/// reads of it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct OutsideTicket {
+    pub id: TicketId,
+    pub labels: Vec<String>,
+}
+
+impl StepOutside {
+    const CONTRACT: &str = "step outside";
+
+    pub fn parse(input: &str) -> Result<Self, ContractError> {
+        format::parse_json(Self::CONTRACT, OUTSIDE_FORMAT, input)
+    }
+
+    pub fn render(&self) -> String {
+        format::render_json(self)
+    }
+}
+
 /// Whether `id` is a run's id: ASCII letters, digits and `-`, at most
 /// [`MAX_ATTEMPT`] bytes.
 pub fn is_run_id(id: &str) -> bool {
@@ -807,5 +857,32 @@ mod tests {
             };
             assert!(RunObligation::parse(&bad.render()).is_err(), "{run:?}");
         }
+    }
+
+    /// OWL-401: the outside work a pass hands a dispatch's step, a list of
+    /// files or the whole repository for each pull request, round trips.
+    #[test]
+    fn the_outside_work_round_trips() {
+        let outside = StepOutside {
+            format: Format,
+            pulls: vec![
+                OutsidePull {
+                    number: 7,
+                    head_branch: "someone/fix".to_owned(),
+                    files: Some(vec!["a.md".to_owned()]),
+                },
+                OutsidePull {
+                    number: 8,
+                    head_branch: "huge".to_owned(),
+                    files: None,
+                },
+            ],
+            working: vec![OutsideTicket {
+                id: TicketId::new("DEMO-9").unwrap(),
+                labels: vec!["zone:app".to_owned()],
+            }],
+        };
+        assert_eq!(StepOutside::parse(&outside.render()).unwrap(), outside);
+        assert!(StepOutside::parse("{\"format\": 2, \"pulls\": [], \"working\": []}").is_err());
     }
 }

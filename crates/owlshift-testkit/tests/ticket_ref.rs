@@ -765,7 +765,8 @@ fn forget_holds_the_project_lock_and_says_what_it_dropped() {
     let dir = tempfile::tempdir().unwrap();
     let env = GitEnv::create(dir.path().join("home")).unwrap();
     let data = dir.path().join("data");
-    let dirs = ProjectDirs::new(&data, &ForgeRepo::parse("demo/project").unwrap());
+    let dirs = ProjectDirs::new(&data, &ForgeRepo::parse("demo/project").unwrap())
+        .with_lock_wait(owlshift_runner::project::LOCK_GRACE);
     let git_env = env.clone();
     let git = Git::with_setup("git", move |command| git_env.apply(command));
     let mut out = Vec::new();

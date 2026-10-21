@@ -545,6 +545,15 @@ pub struct Policy {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(range(min = 1, max = 20))]
     pub max_open_prs: Option<u8>,
+    /// How many of the project's tickets may be worked at once, a whole
+    /// number from 1 to 10 (OWL-401; architecture section 5, "Parallel",
+    /// "Three counts"): the tickets at a stage after Ready and before Watch
+    /// at which the drain dispatches no other, and the most whose stage steps
+    /// run. Absent: 1, one ticket at a time. A file using it requires an
+    /// Owlshift that reads it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(range(min = 1, max = 10))]
+    pub max_in_flight: Option<u8>,
     /// What the resolver may decide without the decider (OWL-328,
     /// architecture section 4, "Delegation level"): `none`, `facts`,
     /// `discoverable`, `ticket` or `all`. Absent: `discoverable`. `security`
@@ -719,6 +728,10 @@ const MAX_OPEN_PRS: std::ops::RangeInclusive<u8> = 1..=20;
 /// The cap on open pull requests when `policy.max_open_prs` is absent.
 pub const DEFAULT_MAX_OPEN_PRS: u8 = 3;
 
+/// The range of `policy.max_in_flight` (the schema attribute on the field
+/// repeats it as literals).
+const MAX_IN_FLIGHT: std::ops::RangeInclusive<u8> = 1..=10;
+
 impl Policy {
     /// The quiet window: the project's, or the default. A value outside
     /// the range, possible only in a configuration built in code, is
@@ -738,6 +751,15 @@ impl Policy {
     pub fn max_open_prs(&self) -> u8 {
         self.max_open_prs.map_or(DEFAULT_MAX_OPEN_PRS, |cap| {
             cap.clamp(*MAX_OPEN_PRS.start(), *MAX_OPEN_PRS.end())
+        })
+    }
+
+    /// The project's capacity (OWL-401): the project's `max_in_flight`, or
+    /// 1 when absent. A value outside the range, possible only in a
+    /// configuration built in code, is clamped into it.
+    pub fn max_in_flight(&self) -> u8 {
+        self.max_in_flight.map_or(1, |cap| {
+            cap.clamp(*MAX_IN_FLIGHT.start(), *MAX_IN_FLIGHT.end())
         })
     }
 
@@ -901,6 +923,14 @@ impl ProjectConfig {
             return Err(ContractError::invalid(
                 PROJECT,
                 "policy.max_open_prs must be a whole number from 1 to 20",
+            ));
+        }
+        if let Some(cap) = self.policy.max_in_flight
+            && !MAX_IN_FLIGHT.contains(&cap)
+        {
+            return Err(ContractError::invalid(
+                PROJECT,
+                "policy.max_in_flight must be a whole number from 1 to 10",
             ));
         }
         self.policy
@@ -1497,6 +1527,7 @@ mod tests {
             always_human: Vec::new(),
             quiet_window_minutes: Some(0),
             max_open_prs: None,
+            max_in_flight: None,
             resolver_delegation: None,
             resolver_passes: None,
             resolver_budget_usd: None,
@@ -1757,6 +1788,25 @@ mod tests {
         }
         let error = project("", "max_open_prs = 0").unwrap_err().to_string();
         assert!(error.contains("from 1 to 20"), "{error}");
+    }
+
+    /// OWL-401: the project's capacity, 1 when absent, from 1 to 10.
+    #[test]
+    fn the_capacity_is_a_policy_key_with_a_default_and_a_range() {
+        let absent = project("", "").unwrap();
+        assert_eq!(absent.policy.max_in_flight(), 1);
+        assert!(!absent.render().contains("max_in_flight"));
+        let set = project("", "max_in_flight = 10").unwrap();
+        assert_eq!(set.policy.max_in_flight(), 10);
+        assert_eq!(ProjectConfig::parse(&set.render()).unwrap(), set);
+        for bad in ["0", "11", "-1", "\"3\""] {
+            let error = project("", &format!("max_in_flight = {bad}"))
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("max_in_flight"), "{bad}: {error}");
+        }
+        let error = project("", "max_in_flight = 11").unwrap_err().to_string();
+        assert!(error.contains("from 1 to 10"), "{error}");
     }
 
     /// OWL-402: `stack.resources` is checked when the file is loaded, the

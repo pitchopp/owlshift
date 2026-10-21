@@ -22,12 +22,16 @@ use serde_json::{Value, json};
 
 use owlshift_adapters::forge::github::GitHubForge;
 use owlshift_adapters::forge::{CommitId, OpenPullRequest, PullFiles};
-use owlshift_adapters::tracker::{Ticket, Tracker};
+use owlshift_adapters::tracker::{Author, Ticket, Tracker};
+use owlshift_contracts::Priority;
 use owlshift_contracts::config::ProjectConfig;
+use owlshift_contracts::format::Format;
 use owlshift_contracts::ids::TicketId;
+use owlshift_contracts::step::{OutsidePull, OutsideTicket, StepOutside};
 use owlshift_core::collision::{Dispatched, InFlight};
 use owlshift_core::decider::declared_zones;
 use owlshift_core::resource::{self, NamedResources, Resource};
+use owlshift_core::schedule::Wait;
 
 use crate::held;
 use crate::ticket_ref::Stored;
@@ -69,6 +73,65 @@ pub struct Pull {
 pub struct Outside {
     pub pulls: Vec<Pull>,
     pub working: Vec<Ticket>,
+}
+
+impl Outside {
+    /// This read as a pass hands it to the step of a dispatch it starts
+    /// (OWL-401, `outside-<attempt>.json`).
+    pub fn to_step(&self) -> StepOutside {
+        StepOutside {
+            format: Format,
+            pulls: self
+                .pulls
+                .iter()
+                .map(|pull| OutsidePull {
+                    number: pull.number,
+                    head_branch: pull.head_branch.clone(),
+                    files: match &pull.files {
+                        PullFiles::Listed(files) => Some(files.clone()),
+                        PullFiles::Whole => None,
+                    },
+                })
+                .collect(),
+            working: self
+                .working
+                .iter()
+                .map(|ticket| OutsideTicket {
+                    id: ticket.id.clone(),
+                    labels: ticket.labels.clone(),
+                })
+                .collect(),
+        }
+    }
+
+    /// The read a pass handed to a step, as the collision rule reads it: a
+    /// working ticket's identifier and labels alone.
+    pub fn from_step(step: StepOutside) -> Self {
+        Self {
+            pulls: step
+                .pulls
+                .into_iter()
+                .map(|pull| Pull {
+                    number: pull.number,
+                    head_branch: pull.head_branch,
+                    files: pull.files.map_or(PullFiles::Whole, PullFiles::Listed),
+                })
+                .collect(),
+            working: step
+                .working
+                .into_iter()
+                .map(|ticket| Ticket {
+                    id: ticket.id,
+                    title: String::new(),
+                    description: String::new(),
+                    priority: Priority::Unset,
+                    assignee: None,
+                    labels: ticket.labels,
+                    author: Author::unknown(),
+                })
+                .collect(),
+        }
+    }
 }
 
 /// Reads the repository's open pull requests and their files through
@@ -326,6 +389,58 @@ pub fn files_held(files: &PullFiles, named: &NamedResources) -> Vec<Resource> {
         }
     }
     held
+}
+
+/// What a waiting reason says: on watch's line for a ticket of the drain,
+/// and since OWL-401 in the refusal of a person's `do` or `continue` that
+/// the admission holds back, in the words `owlshift why` uses. `exclude` is
+/// the project's exclusion label, `kinds` how the outside holders are named.
+pub fn said(wait: &Wait<String>, exclude: Option<&str>, kinds: &HashMap<String, Kind>) -> String {
+    let list = |ids: &[String]| ids.join(", ");
+    match wait {
+        Wait::Duplicate => "the column lists it twice; the first is taken".to_owned(),
+        Wait::NotAdmitted => {
+            "its admission gesture is not from an account `[tracker].admitters` lists".to_owned()
+        }
+        Wait::Excluded => format!(
+            "it carries the exclusion label {:?}",
+            exclude.unwrap_or_default()
+        ),
+        Wait::NoDecider => {
+            "it has no decider: give it an assignee, or a `zone:` label whose zone has an owner"
+                .to_owned()
+        }
+        Wait::NoIntake => "its intake has not run yet".to_owned(),
+        Wait::StaleIntake => "its text changed since its intake, which runs again".to_owned(),
+        Wait::NotReady => {
+            "it is being worked, waits for an answer, is parked, or its pull request is followed"
+                .to_owned()
+        }
+        Wait::BlockerCanceled(ids) => format!(
+            "its blocker {} was canceled: it waits until a person removes the relation or the \
+             line",
+            list(ids)
+        ),
+        Wait::BlockerUnknown(ids) => format!(
+            "its \"Blocked by\" line names {}, which the tracker does not know: it waits until a \
+             person corrects the line",
+            list(ids)
+        ),
+        Wait::BlockedBy(ids) => format!("blocked by {}", list(ids)),
+        Wait::PrCap => "the open pull requests reached their cap".to_owned(),
+        Wait::Slot(ids) => format!(
+            "the project's slot is held by {} (`owlshift doctor` says how to clear a stale one)",
+            list(ids)
+        ),
+        Wait::Collision(found) => {
+            let holder = named(kinds, &found.holder);
+            format!(
+                "{holder} holds {}, which it would touch: it goes once {holder} no longer holds it",
+                found.resource
+            )
+        }
+        Wait::RunCap => "every run of this machine is taken".to_owned(),
+    }
 }
 
 /// Whether the branch `branch` names the ticket `id`: `id` in any ASCII
