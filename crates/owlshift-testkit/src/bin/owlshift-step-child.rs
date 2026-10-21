@@ -68,7 +68,13 @@ fn main() -> ExitCode {
     // with none free, the "no slot" record is the step's outcome.
     let _slot = match project.machine_slots() {
         Some(slots) => {
-            match step::take_slot(&slots, &project.dirs(), &envelope, Timestamp::now()) {
+            match step::take_slot(
+                &slots,
+                &project.dirs(),
+                owlshift_testkit::step_child::REPO,
+                &envelope,
+                Timestamp::now(),
+            ) {
                 Ok(Some(slot)) => Some(slot),
                 Ok(None) => return ExitCode::SUCCESS,
                 Err(error) => {

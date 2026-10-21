@@ -21,7 +21,7 @@ use owlshift_contracts::ids::TicketId;
 use owlshift_contracts::step::{RefAfter, StepEnd, StepEnvelope, StepHold, StepKind, StepOutcome};
 use owlshift_runner::events::EventLog;
 use owlshift_runner::executor::Git;
-use owlshift_runner::slots::{MachineSlots, Slot};
+use owlshift_runner::slots::{Holder, MachineSlots, Slot};
 use owlshift_runner::step::{self, Children};
 use owlshift_runner::ticket_ref::{self, RefAt};
 use owlshift_runner::watch::{POLL_INTERVAL, Watch};
@@ -288,9 +288,15 @@ fn drain_every(
 /// keeps a lock it inherited (`ProjectDirs::lock`).
 fn hold_slot(data: &Path) -> Slot {
     let slots = MachineSlots::new(data, 1);
+    let holder = Holder {
+        project: "other/project".to_owned(),
+        ticket: TicketId::new("OTHER-1").unwrap(),
+        pid: std::process::id(),
+        since: Timestamp::now(),
+    };
     (0..100)
         .find_map(|_| {
-            let slot = slots.take().unwrap();
+            let slot = slots.take(&holder).unwrap();
             if slot.is_none() {
                 std::thread::sleep(std::time::Duration::from_millis(10));
             }
