@@ -39,7 +39,7 @@
     "format": {
       "description": "The format version of this document.",
       "type": "integer",
-      "const": 3
+      "const": 4
     },
     "hold": {
       "description": "The hold the step calls for, by watch's rule, none when it calls for\nnone.",
@@ -330,6 +330,35 @@
           "additionalProperties": false,
           "required": [
             "end"
+          ]
+        },
+        {
+          "description": "A Build held for its base (OWL-418): `commit`, the commit it is\nconfigured at, fails `command` in a fresh worktree too, or its check\nis `pending`, waiting for the other steps in flight. Format 4.",
+          "type": "object",
+          "properties": {
+            "command": {
+              "type": [
+                "string",
+                "null"
+              ],
+              "default": null
+            },
+            "commit": {
+              "type": "string"
+            },
+            "end": {
+              "type": "string",
+              "const": "base_held"
+            },
+            "pending": {
+              "type": "boolean",
+              "default": false
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "end",
+            "commit"
           ]
         },
         {

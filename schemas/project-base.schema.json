@@ -1,0 +1,205 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Owlshift project base checks",
+  "description": "A project's checks of its bases.",
+  "type": "object",
+  "properties": {
+    "checks": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/KeptCheck"
+      }
+    },
+    "format": {
+      "description": "The format version of this document.",
+      "type": "integer",
+      "const": 1
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "format"
+  ],
+  "$defs": {
+    "KeptCheck": {
+      "description": "What is known of one commit and its commands.",
+      "type": "object",
+      "properties": {
+        "commands": {
+          "description": "The runner's key of the setup and gate commands checked.",
+          "type": "string"
+        },
+        "commit": {
+          "description": "The commit checked, a full id.",
+          "type": "string"
+        },
+        "entry": {
+          "$ref": "#/$defs/KeptEntry"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "commit",
+        "commands",
+        "entry"
+      ]
+    },
+    "KeptEntry": {
+      "description": "A check due, or one that ran.",
+      "oneOf": [
+        {
+          "description": "A ticket's failure waits for a check that could not run yet.",
+          "type": "object",
+          "properties": {
+            "failing": {
+              "$ref": "#/$defs/KeptFailing"
+            },
+            "since": {
+              "type": "string",
+              "format": "date-time"
+            },
+            "state": {
+              "type": "string",
+              "const": "pending"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "state",
+            "failing",
+            "since"
+          ]
+        },
+        {
+          "description": "A check ran, the default branch's head being `head`.",
+          "type": "object",
+          "properties": {
+            "checked": {
+              "type": "string",
+              "format": "date-time"
+            },
+            "head": {
+              "type": "string"
+            },
+            "hold": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/KeptHold"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "state": {
+              "type": "string",
+              "const": "checked"
+            },
+            "verdict": {
+              "$ref": "#/$defs/KeptVerdict"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "state",
+            "head",
+            "checked",
+            "verdict"
+          ]
+        }
+      ]
+    },
+    "KeptFailing": {
+      "description": "A command a gate run failed on.",
+      "type": "object",
+      "properties": {
+        "command": {
+          "type": "string"
+        },
+        "step": {
+          "$ref": "#/$defs/KeptStep"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "step",
+        "command"
+      ]
+    },
+    "KeptHold": {
+      "description": "A hold on the commit.",
+      "type": "object",
+      "properties": {
+        "since": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "told": {
+          "description": "The operator was notified of it.",
+          "type": "boolean",
+          "default": false
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "since"
+      ]
+    },
+    "KeptStep": {
+      "description": "The part of a gate run a command belongs to.",
+      "type": "string",
+      "enum": [
+        "setup",
+        "gate"
+      ]
+    },
+    "KeptVerdict": {
+      "description": "What a check found.",
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "verdict": {
+              "type": "string",
+              "const": "passed"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "verdict"
+          ]
+        },
+        {
+          "description": "The command it failed on, the reason, and the end of its output.",
+          "type": "object",
+          "properties": {
+            "command": {
+              "type": "string"
+            },
+            "reason": {
+              "type": "string"
+            },
+            "step": {
+              "$ref": "#/$defs/KeptStep"
+            },
+            "tail": {
+              "type": "string"
+            },
+            "verdict": {
+              "type": "string",
+              "const": "failed"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "verdict",
+            "step",
+            "command",
+            "reason",
+            "tail"
+          ]
+        }
+      ]
+    }
+  }
+}

@@ -2,6 +2,7 @@
 
 use schemars::{JsonSchema, Schema, schema_for};
 
+use crate::base::{BaseWait, ProjectBase};
 use crate::brief::Brief;
 use crate::comment::Footer;
 use crate::config::{PersonalConfig, ProjectConfig};
@@ -42,6 +43,8 @@ pub fn all() -> Vec<(&'static str, Schema)> {
         ("run-obligation", schema::<RunObligation>()),
         ("step-outside", schema::<StepOutside>()),
         ("harness-usage", schema::<HarnessUsage>()),
+        ("project-base", schema::<ProjectBase>()),
+        ("base-wait", schema::<BaseWait>()),
     ]
 }
 
