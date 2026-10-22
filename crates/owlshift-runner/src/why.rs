@@ -2,9 +2,10 @@
 //! "`owlshift why`"): why each admitted ticket of a project is not running,
 //! read from what Owlshift keeps and nothing else.
 //!
-//! It reads the event log's `decision` events (`drain`, `watch` or `usage`
-//! = `waits`), the project's ticket refs, the machine's usage files, the
-//! quarantine marker and the run slots. It takes no lock the writers hold:
+//! It reads the event log's `decision` events (`drain`, `watch`, `usage` or
+//! `base` = `waits`), the project's ticket refs, the machine's usage files,
+//! the project's base checks (OWL-418), the quarantine marker and the run
+//! slots. It takes no lock the writers hold:
 //! the project's lock and the tickets' locks are never tried, so it runs
 //! while `owlshift watch` does. [`fold`] and [`render`] are pure; [`gather`]
 //! does the reading. The one thing it touches that a writer can notice is
@@ -24,11 +25,13 @@ use std::path::Path;
 use jiff::Timestamp;
 use owlshift_contracts::event::{Event, EventKind};
 use owlshift_contracts::ids::TicketId;
+use owlshift_core::base::{Check, Entry, Verdict};
 use owlshift_core::state::Status;
 use owlshift_core::usage::Standing;
 use owlshift_core::vocab::{Harness, Stage};
 use serde_json::Value;
 
+use crate::base;
 use crate::events::{Data, printable};
 use crate::project::ProjectDirs;
 use crate::slots::{HeldSlot, MachineSlots};
@@ -102,6 +105,8 @@ fn waiting(event: &Event, ticket: &TicketId) -> Option<Waiting> {
         event.data.get("reason")?.as_str()?.to_owned()
     } else if says("usage") {
         "usage_limit".to_owned()
+    } else if says("base") {
+        "base_broken".to_owned()
     } else if event.data.get("drain").and_then(Value::as_str) == Some("pr_cap") {
         // The drain tells the cap once, for the first ticket it holds
         // (`tell_cap`), with the counts and no `waits`.
@@ -199,6 +204,26 @@ pub fn phrase(wait: &Waiting) -> String {
                 None => format!("{harness} is at its usage limit"),
             }
         }
+        "base_broken" => {
+            let commit = data.get("commit").and_then(Value::as_str).unwrap_or("");
+            let failing = data
+                .get("command")
+                .and_then(Value::as_str)
+                .map_or_else(|| "its gate".to_owned(), |command| format!("`{command}`"));
+            if data.get("pending").and_then(Value::as_bool) == Some(true) {
+                format!(
+                    "whether the base its branch was made from, {}, fails {failing} too is \
+                     checked once no other ticket's step runs",
+                    base::short(commit)
+                )
+            } else {
+                format!(
+                    "the base its branch was made from, {}, fails {failing} in a fresh \
+                     worktree too, so its Build waits for that base to pass",
+                    base::short(commit)
+                )
+            }
+        }
         other => other.replace('_', " "),
     }
 }
@@ -245,6 +270,9 @@ pub struct Report {
     /// The machine's slots held now, each with its holder as its record
     /// says, and `concurrent_runs`; `None` when the slots cannot be probed.
     pub slots: Option<(Vec<HeldSlot>, u32)>,
+    /// The project's base checks that hold its Builds: holds and checks due
+    /// (OWL-418).
+    pub bases: Vec<Check>,
 }
 
 /// Reads every event of the log at `path`; the lines that are not events
@@ -333,6 +361,13 @@ pub fn gather(
         .holders()
         .ok()
         .map(|held| (held, concurrent_runs));
+    let bases = match base::read(dirs) {
+        Ok(checks) => checks.standing().cloned().collect(),
+        Err(why) => {
+            notes.push(format!("the base checks cannot be read: {why}"));
+            Vec::new()
+        }
+    };
     Ok(Report {
         project: project.to_owned(),
         only,
@@ -342,6 +377,7 @@ pub fn gather(
         notes,
         limits,
         slots,
+        bases,
     })
 }
 
@@ -493,10 +529,59 @@ pub fn render(report: &Report) -> String {
     {
         let _ = writeln!(out, "no harness is limited");
     }
+    for check in &report.bases {
+        render_base(&mut out, check);
+    }
     for note in &report.notes {
         let _ = writeln!(out, "note: {note}");
     }
     printable(&out)
+}
+
+/// A base check that holds the project's Builds (OWL-418): its commit, its
+/// command, the end of its output and the re-check.
+fn render_base(out: &mut String, check: &Check) {
+    let short = base::short(&check.commit);
+    match &check.entry {
+        Entry::Pending { failing, .. } => {
+            let _ = writeln!(
+                out,
+                "base {short}: a check of its {} command `{}` is due, once no other ticket's \
+                 step runs; the Builds made from it wait",
+                base::step_name(failing.step),
+                failing.command
+            );
+        }
+        Entry::Checked {
+            verdict: Verdict::Failed(failure),
+            hold: Some(hold),
+            checked_ms,
+            ..
+        } => {
+            let at = |ms: i64| Timestamp::from_millisecond(ms).unwrap_or(Timestamp::UNIX_EPOCH);
+            let _ = writeln!(
+                out,
+                "base {short}: fails its {} command `{}` ({}) since {}, last checked {}; the \
+                 Builds made from it wait, and a branch with commits of its own on it needs it \
+                 to pass, or a person to rebase it",
+                base::step_name(failure.failing.step),
+                failure.failing.command,
+                failure.reason,
+                at(hold.since_ms),
+                at(*checked_ms)
+            );
+            let lines: Vec<&str> = failure.tail.lines().collect();
+            for line in &lines[lines.len().saturating_sub(base::WHY_LINES)..] {
+                let _ = writeln!(out, "    {line}");
+            }
+            let _ = writeln!(
+                out,
+                "  once fixed: `owlshift gate --at {}`, or the next commit on the default branch",
+                check.commit
+            );
+        }
+        Entry::Checked { .. } => {}
+    }
 }
 
 #[cfg(test)]
@@ -725,6 +810,62 @@ mod tests {
         );
     }
 
+    /// OWL-418: a Build held for its base is a `base_broken` wait, held or
+    /// pending, and the report names the hold, its command, the end of its
+    /// output and the re-check.
+    #[test]
+    fn a_base_hold_is_a_wait_and_the_report_names_it() {
+        use owlshift_core::base::{Checks, Failing, Failure, Step};
+        let commit = "c".repeat(40);
+        let held = |pending: bool| {
+            waits(
+                "2026-10-22T10:00:00Z",
+                "OWL-1",
+                data([
+                    ("base", json!("waits")),
+                    ("reason", json!("base_broken")),
+                    ("commit", json!(commit)),
+                    ("command", json!("sh ci/owlshift/setup.sh")),
+                    ("pending", json!(pending)),
+                ]),
+            )
+        };
+        let folded = fold(&[held(false)], "o/r");
+        let wait = &folded.current[&TicketId::new("OWL-1").unwrap()];
+        assert_eq!(
+            phrase(wait),
+            "the base its branch was made from, cccccccccccc, fails `sh ci/owlshift/setup.sh` \
+             in a fresh worktree too, so its Build waits for that base to pass"
+        );
+        let folded = fold(&[held(true)], "o/r");
+        let wait = &folded.current[&TicketId::new("OWL-1").unwrap()];
+        assert!(phrase(wait).contains("is checked once no other ticket's step runs"));
+
+        let failing = Failing {
+            step: Step::Setup,
+            command: "sh ci/owlshift/setup.sh".to_owned(),
+        };
+        let mut checks = Checks::default();
+        checks.record_check(
+            (&commit, "k", "h"),
+            1_000,
+            Verdict::Failed(Failure {
+                failing: failing.clone(),
+                reason: "setup: exit status 1".to_owned(),
+                tail: "one\ntwo\nERR_PNPM_NO_OFFLINE_TARBALL rollup@4.64.8\n".to_owned(),
+            }),
+            Some(&failing),
+        );
+        let mut out = String::new();
+        render_base(&mut out, &checks.checks[0]);
+        assert!(
+            out.contains("base cccccccccccc: fails its setup command `sh ci/owlshift/setup.sh`")
+                && out.contains("    ERR_PNPM_NO_OFFLINE_TARBALL rollup@4.64.8")
+                && out.contains(&format!("`owlshift gate --at {commit}`")),
+            "{out}"
+        );
+    }
+
     #[test]
     fn the_cap_is_read_as_the_drain_tells_it() {
         // `tell_cap`'s shape: no `waits`, the counts.
@@ -780,6 +921,7 @@ mod tests {
                 ],
                 3,
             )),
+            bases: Vec::new(),
         };
         let text = render(&report);
         assert!(text.contains("quarantine: a marker stands"), "{text}");

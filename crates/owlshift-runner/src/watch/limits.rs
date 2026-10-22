@@ -30,9 +30,12 @@ use crate::usage as machine_usage;
 
 /// The role of the first run of a resume at `stage` of the ticket whose ref
 /// is `stored`: `None` for a Verify that delivers with no pass, a last fix's
-/// or a commit whose pass passed and whose delivery a collision held back.
-pub(super) fn resume_role(stage: Stage, stored: &Stored) -> Option<Role> {
+/// or a commit whose pass passed and whose delivery a collision held back,
+/// and for a Build whose gate, held for its base, runs again alone first
+/// (`gate_only`, OWL-418), which no harness's limit holds.
+pub(super) fn resume_role(stage: Stage, stored: &Stored, gate_only: bool) -> Option<Role> {
     match stage {
+        Stage::Build if gate_only => None,
         Stage::Intake => Some(Role::Intake),
         Stage::Design => Some(Role::Design),
         Stage::DesignReview => Some(Role::DesignReview),
