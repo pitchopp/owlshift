@@ -3,6 +3,7 @@
 //! OS sandbox agent runs are confined in.
 
 pub mod confined;
+pub mod files;
 pub mod keychain;
 pub mod paths;
 pub mod process;

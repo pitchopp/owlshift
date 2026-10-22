@@ -360,10 +360,77 @@ fn a_step_waits_for_a_free_run_slot_and_is_not_held() {
     assert!(step::leftovers(&dirs).is_empty());
 }
 
+// A process's state, with no `ps` or `kill` (OWL-110): a program forked by
+// one test thread would keep, until it execs, a slot lock another thread's
+// probe holds for a moment.
+#[cfg(unix)]
+#[path = "../../owlshift-platform/src/test_proc.rs"]
+#[allow(dead_code)]
+mod test_proc;
+
+/// The bound of a test whose watches wait for the machine's slots
+/// (OWL-425): `limit` passes, a pass counting only while no process that
+/// still runs holds one of the slots in `machine`, so a holder slowed by a
+/// loaded machine spends none of it. A slot held with no holder record, or
+/// one naming a process gone, is a lock that outlived its step, a slot leak:
+/// passes count, and the test fails at the bound once the steps under way
+/// end. A probe that fails counts too. A holder that never ends would keep
+/// the bound from counting: past [`WEDGED`] the test fails anyway.
+#[cfg(unix)]
+struct SlotBound<'a> {
+    slots: MachineSlots,
+    machine: &'a Path,
+    limit: u32,
+    counted: u32,
+    since: std::time::Instant,
+}
+
+/// How long a [`SlotBound`] waits on live holders before the test fails:
+/// far past any step of these tests, however loaded the machine.
+#[cfg(unix)]
+const WEDGED: std::time::Duration = std::time::Duration::from_secs(300);
+
+#[cfg(unix)]
+impl<'a> SlotBound<'a> {
+    fn new(machine: &'a Path, count: u32, limit: u32) -> Self {
+        Self {
+            slots: MachineSlots::new(machine, count),
+            machine,
+            limit,
+            counted: 0,
+            since: std::time::Instant::now(),
+        }
+    }
+
+    /// Counts the pass that just ended unless a live process holds a slot:
+    /// whether the test has passes left.
+    fn more(&mut self) -> bool {
+        let live = self.slots.holders().is_ok_and(|held| {
+            held.iter().any(|slot| {
+                slot.holder
+                    .as_ref()
+                    .is_some_and(|holder| test_proc::is_alive(holder.pid))
+            })
+        });
+        if !live {
+            self.counted += 1;
+        }
+        assert!(
+            self.since.elapsed() < WEDGED,
+            "{WEDGED:?} of passes, {} of them counted, the slots of {} held meanwhile",
+            self.counted,
+            self.machine.display()
+        );
+        self.counted < self.limit
+    }
+}
+
 /// OWL-409, the acceptance's own case: two watches of two projects, each
 /// step in a child taking one of the machine's slots, `concurrent_runs` 1.
 /// Each project's intake sleeps a second in its harness, which counts the
-/// runs under way: never more than one, and both intakes end up run.
+/// runs under way: never more than one, and both intakes end up run. The
+/// project that waits counts no pass while the other's step holds the slot
+/// (OWL-425): on a loaded machine that step outlasted 100 passes.
 #[cfg(unix)]
 #[test]
 fn two_watches_of_two_projects_share_the_machine_s_slots() {
@@ -405,10 +472,13 @@ fn two_watches_of_two_projects_share_the_machine_s_slots() {
             scope.spawn(move || {
                 let counted = children(&s.file).with_slots(MachineSlots::new(machine, 1));
                 let ran = || s.project.dirs().runs(&ticket()).exists();
-                let lines = drain_passes(&s.project, &counted, |pass| {
+                let mut bound = SlotBound::new(machine, 1, 100);
+                let lines = drain_passes(&s.project, &counted, |_| {
                     thread::sleep(std::time::Duration::from_millis(100));
-                    pass < 100 && !ran()
+                    bound.more() && !ran()
                 });
+                // A quarantine stops every step: it is told first.
+                assert_eq!(s.project.dirs().quarantine().unwrap(), None, "{lines}");
                 assert!(ran(), "{lines}");
             });
         }
@@ -585,6 +655,13 @@ fn asks(project: &ChildProject, id: &str) -> bool {
 /// whole repository, from within DEMO-1's Build: it is refused, DEMO-1
 /// holding `a`. Each Build asks its decider, and the three wait; no
 /// quarantine, no obligation and no outcome record is left.
+///
+/// Its bound stays 200 passes, not counted on the slots' holders as the
+/// tests of two projects are (OWL-425, 2026-10-22): its Builds wait for each
+/// other while alive, so a Build never dispatched would leave the others
+/// holding their slots, and the test would fail only when the harness gives
+/// up, some ten minutes on. OWL-422 measured 42 to 55 passes at a two to
+/// three times slower machine; in 29 loaded runs this bound never ran out.
 #[cfg(unix)]
 #[test]
 fn three_tickets_build_at_once_and_a_do_typed_meanwhile_waits() {
@@ -682,13 +759,16 @@ fn two_projects_two_in_flight_each_share_two_slots() {
             scope.spawn(move || {
                 let counted = children(&s.file).with_slots(MachineSlots::new(machine, 2));
                 let interval = std::time::Duration::from_millis(200);
-                let lines = drain_every(&s.project, &counted, interval, |pass| {
+                let mut bound = SlotBound::new(machine, 2, 300);
+                let lines = drain_every(&s.project, &counted, interval, |_| {
                     if record_of(&s.project, "DEMO-2").is_some_and(|r| r.intake.is_some()) {
                         s.project.move_ticket("DEMO-9", "Done");
                     }
                     let both = asks(&s.project, "DEMO-1") && asks(&s.project, "DEMO-2");
-                    pass < 300 && !both
+                    bound.more() && !both
                 });
+                // A quarantine stops every step: it is told first.
+                assert_eq!(s.project.dirs().quarantine().unwrap(), None, "{lines}");
                 assert!(
                     asks(&s.project, "DEMO-1") && asks(&s.project, "DEMO-2"),
                     "{lines}"
