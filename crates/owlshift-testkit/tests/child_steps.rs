@@ -619,6 +619,9 @@ fn three_tickets_build_at_once_and_a_do_typed_meanwhile_waits() {
         }
         pass < 200 && !all
     });
+    // A quarantine stops every step: it is told first, with what it says.
+    let dirs = s.project.dirs();
+    assert_eq!(dirs.quarantine().unwrap(), None, "{lines}");
     let counts = fs::read_to_string(plays.join("counts")).unwrap_or_default();
     assert!(
         !plays.join("release").exists(),
@@ -640,8 +643,6 @@ fn three_tickets_build_at_once_and_a_do_typed_meanwhile_waits() {
         assert_eq!(held.zones, [zone], "{id}");
     }
     assert_eq!(record_of(&s.project, "DEMO-4"), None, "{lines}");
-    let dirs = s.project.dirs();
-    assert_eq!(dirs.quarantine().unwrap(), None, "{lines}");
     assert!(!dirs.obligations_stand(), "{lines}");
     assert!(step::leftovers(&dirs).is_empty());
 }
