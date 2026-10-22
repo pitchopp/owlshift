@@ -270,10 +270,21 @@ pub fn core_event(outcome: &Outcome) -> (Event, Option<&RunResult>) {
 /// except that a Build run whose refusal is freed ([`freed_refusal`]) is
 /// [`Event::ResultRefused`] (OWL-183). Its count never parks the ticket,
 /// since the next Build run is told why; a run that was told and fails is a
-/// plain failed run, so refusals never loop.
+/// plain failed run, so refusals never loop. Likewise a Build run whose gate
+/// was refused for uncommitted changes before any command, untold of such a
+/// refusal by its brief's `gate_failure`, is [`Event::UncommittedGate`]
+/// (OWL-421), which keeps the count: of two in a row, the second counts.
 pub fn stage_event<'a>(outcome: &'a Outcome, brief: &Brief) -> (Event, Option<&'a RunResult>) {
+    use crate::executor::gate::refused_uncommitted;
     if brief.role == Role::Build && freed_refusal(outcome, brief) {
         return (Event::ResultRefused, None);
+    }
+    if brief.role == Role::Build
+        && let Outcome::Failed(Failure::Gate(failure)) = outcome
+        && refused_uncommitted(failure)
+        && !brief.gate_failure.as_ref().is_some_and(refused_uncommitted)
+    {
+        return (Event::UncommittedGate, None);
     }
     core_event(outcome)
 }

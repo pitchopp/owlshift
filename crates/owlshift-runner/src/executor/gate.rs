@@ -91,6 +91,10 @@ const LISTED_PATHS: usize = 10;
 /// (OWL-330). The gate's commands keep their whole deadline after it.
 pub const SETUP_SHARE: u32 = 3;
 
+/// The start of the reason of a gate refused for uncommitted changes, before
+/// any command ran ([`refused_uncommitted`]).
+pub const UNCOMMITTED_PREFIX: &str = "uncommitted changes before the gate";
+
 /// The file of the run directory a Build's setup before its harness logs
 /// to (`run_setup`).
 pub const SETUP_LOG: &str = "setup.log";
@@ -300,7 +304,7 @@ fn check_and_run(
     let dirty = uncommitted(git, worktree)?;
     if !dirty.is_empty() {
         return Err(around(format!(
-            "uncommitted changes before the gate, which runs on the last commit: {dirty}"
+            "{UNCOMMITTED_PREFIX}, which runs on the last commit: {dirty}"
         ))
         .into());
     }
@@ -351,6 +355,13 @@ fn check_and_run(
         return Err(around(format!("the gate moved HEAD from {before} to {after}")).into());
     }
     Ok(())
+}
+
+/// Whether `failure` is the gate's refusal of uncommitted changes, before
+/// any command ran: the next run, told of it, can clean them up, so it does
+/// not spend the stage's fix run (OWL-421, `on_demand::stage_event`).
+pub(crate) fn refused_uncommitted(failure: &GateFailure) -> bool {
+    failure.command.is_none() && failure.reason.starts_with(UNCOMMITTED_PREFIX)
 }
 
 /// Runs the guard; a violation stops the gate, with a line in its log.
@@ -2445,6 +2456,31 @@ mod tests {
 
         fn reason(report: &GateReport) -> &str {
             &report.failure.as_ref().expect("the setup failed").reason
+        }
+
+        /// OWL-421: only the refusal before any command is one the next run
+        /// can clean up untold of a command's output; a file left by the
+        /// setup or the gate, or a red command, is not.
+        #[test]
+        fn only_uncommitted_changes_before_any_command_are_refused_uncommitted() {
+            let refused = |report: &GateReport| {
+                refused_uncommitted(report.failure.as_ref().expect("the gate failed"))
+            };
+            let dirty = repo();
+            dirty.write(".pnpm-store/v10/index", "x");
+            let touch = format!("touch '{}'", dirty.marker.display());
+            let report = dirty.gate_set_up(&[], &[&touch], Duration::from_secs(60));
+            assert!(!dirty.marker.exists(), "a gate command ran");
+            assert!(refused(&report), "{report:?}");
+
+            for (setup, commands) in [
+                (&["echo x > stray.txt"][..], &["true"][..]),
+                (&[][..], &["echo x > stray.txt"][..]),
+                (&[][..], &["exit 1"][..]),
+            ] {
+                let report = repo().gate_set_up(setup, commands, Duration::from_secs(60));
+                assert!(!refused(&report), "{report:?}");
+            }
         }
 
         #[test]

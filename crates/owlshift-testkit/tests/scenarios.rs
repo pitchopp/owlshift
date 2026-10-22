@@ -643,7 +643,56 @@ fn the_gate_runs_on_the_last_commit_only() {
 
         [[step]]
         run = { files = { "GREETING.md" = "Hello.\n" }, result = "results/build-done.json" }
-        expect = { event = "run_failed", stage = "build", gate_failure = "uncommitted changes before the gate", branch_pushed = false }
+        expect = { event = "uncommitted_gate", stage = "build", failed_runs = 0, gate_failure = "uncommitted changes before the gate", branch_pushed = false }
+        "#,
+    );
+}
+
+/// OWL-421's acceptance, LOC-1428's order: a gate refused for uncommitted
+/// changes before any command keeps the count, so the red gate that follows
+/// still gets its fix run. A refusal whose run was told of one counts.
+#[test]
+fn a_gate_refused_before_any_command_keeps_the_fix_run() {
+    play_on_gate(
+        "gate-refused-then-red",
+        r#"
+        description = "The build leaves its greeting uncommitted: refused, not counted. Its retry commits it with a typo: a red gate, the first failed run. The fix run passes."
+        ticket = "DEMO-2"
+        start = "2026-09-28T09:00:00Z"
+
+        [[step]]
+        dispatch = true
+
+        [[step]]
+        run = { files = { "GREETING.md" = "Helo, reader.\n" }, result = "results/build-done.json" }
+        expect = { event = "uncommitted_gate", stage = "build", failed_runs = 0, gate_failure = "uncommitted changes before the gate", brief_gate_failure = "none", branch_pushed = false }
+
+        [[step]]
+        run = { files = { "GREETING.md" = "Helo, reader.\n" }, commit = "Add a greeting", result = "results/build-done.json" }
+        expect = { event = "run_failed", stage = "build", failed_runs = 1, gate_failure = "exit status 1", brief_gate_failure = "uncommitted changes before the gate", branch_pushed = false }
+
+        [[step]]
+        run = { files = { "GREETING.md" = "Hello, reader.\n" }, commit = "Fix the greeting", result = "results/build-done.json" }
+        expect = { event = "completed", stage = "verify", failed_runs = 0, gate_failure = "none", branch_pushed = true }
+        "#,
+    );
+    play_on_gate(
+        "gate-refused-twice",
+        r#"
+        description = "The build leaves a file uncommitted twice: the first refusal is free, the second, told, counts."
+        ticket = "DEMO-2"
+        start = "2026-09-28T09:00:00Z"
+
+        [[step]]
+        dispatch = true
+
+        [[step]]
+        run = { files = { "GREETING.md" = "Hello.\n" }, result = "results/build-done.json" }
+        expect = { event = "uncommitted_gate", stage = "build", failed_runs = 0 }
+
+        [[step]]
+        run = { files = { "GREETING.md" = "Hello again.\n" }, result = "results/build-done.json" }
+        expect = { event = "run_failed", stage = "build", failed_runs = 1, gate_failure = "uncommitted changes before the gate", brief_gate_failure = "uncommitted changes before the gate", branch_pushed = false }
         "#,
     );
 }

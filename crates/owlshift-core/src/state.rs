@@ -15,7 +15,8 @@ use crate::vocab::{AnswerClass, Stage};
 
 /// Failed runs in one stage that park the ticket: the second one does. A
 /// refused Build or answer-check result never brings the count there
-/// ([`Event::ResultRefused`]).
+/// ([`Event::ResultRefused`]), and a gate refused for uncommitted changes
+/// before any command does not count ([`Event::UncommittedGate`]).
 pub const MAX_FAILED_RUNS: u32 = 2;
 
 /// Re-asks of one question round before the ticket parks: an answer still
@@ -147,6 +148,7 @@ impl Status {
 /// | The decider asked a counter-question (answered in the thread) | `CounterQuestion` |
 /// | A run returned `failed` or no valid `result.json`, whatever its exit code, save the row below; a Build `done` whose project gate, run by the runner, failed | `RunFailed` |
 /// | A Build run's (at Build, or a fix run's at Watch) or an answer check's `result.json` was refused, and the run had not been told of a refused result: the next run of its kind will be | `ResultRefused` |
+/// | A Build run's (at Build, or a fix run's at Watch) gate was refused for uncommitted changes before any command ran, and the run had not been told of such a refusal: the next run will be | `UncommittedGate` |
 /// | A run was cut off by a harness usage limit; it resumes after the reset | `Interrupted` |
 /// | A run broke isolation (main checkout touched, diff outside the worktree, wrong branch) | `Quarantined` |
 /// | A run is due while the ticket's runs since its last restart cost its budget or more (`policy.ticket_budget_usd`, OWL-378): none starts | `BudgetReached` |
@@ -238,6 +240,15 @@ pub enum Event {
     /// event only for a run that was not itself told of a refused result,
     /// so that of two refusals in a row, the second is a `RunFailed`.
     ResultRefused,
+    /// A gate refused for uncommitted changes before any command ran
+    /// (OWL-421): the ticket stays as it is, its count kept, so a refusal
+    /// that ran nothing never spends the stage's fix run. Only a Build
+    /// role's run reaches the gate, so it is valid at Build and at Watch,
+    /// where a fix run is the build role's. The bound is the runner's, as
+    /// for [`Event::ResultRefused`]: it gives this event only for a run that
+    /// was not itself told of such a refusal, so that of two in a row, the
+    /// second is a `RunFailed`.
+    UncommittedGate,
     Interrupted,
     Quarantined,
     /// A run was due, but what the ticket's runs cost since its last
@@ -294,7 +305,7 @@ pub enum Event {
 
 impl Event {
     /// Every event.
-    pub const ALL: [Self; 30] = [
+    pub const ALL: [Self; 31] = [
         Self::Dispatched,
         Self::Completed,
         Self::LoopBack,
@@ -311,6 +322,7 @@ impl Event {
         Self::CounterQuestion,
         Self::RunFailed,
         Self::ResultRefused,
+        Self::UncommittedGate,
         Self::Interrupted,
         Self::Quarantined,
         Self::BudgetReached,
@@ -814,8 +826,12 @@ impl TicketState {
                     ..*self
                 })
             }
-            // A usage limit is not a failure: the run resumes after the reset.
+            // Neither a usage limit nor a gate refused before any command is
+            // a failure: the run resumes after the reset, or runs again told.
             (status, Event::Interrupted) if status.runs() => Transition::To(*self),
+            (Status::Active(Stage::Build | Stage::Watch), Event::UncommittedGate) => {
+                Transition::To(*self)
+            }
             (status, Event::Quarantined) if status.runs() => {
                 self.park(ParkReason::IsolationBreach, self.failed_runs)
             }
@@ -1162,7 +1178,9 @@ mod tests {
             (Status::Active(stage), Event::RunFailed | Event::Interrupted) if stage != Ready => {
                 Expect::To(status)
             }
-            (Status::Active(Build | Watch), Event::ResultRefused) => Expect::To(status),
+            (Status::Active(Build | Watch), Event::ResultRefused | Event::UncommittedGate) => {
+                Expect::To(status)
+            }
             // With every count at zero, nothing is at a bound.
             (
                 Status::Active(Watch),
@@ -1442,6 +1460,24 @@ mod tests {
     }
 
     #[test]
+    fn an_uncommitted_gate_never_counts() {
+        for failed_runs in 0..MAX_FAILED_RUNS {
+            let build = state(Status::Active(Stage::Build), 1, 0, failed_runs);
+            assert_eq!(to(build.apply(STANDARD, Event::UncommittedGate)), build);
+        }
+        // Not where no gate runs.
+        let waiting = state(
+            Status::NeedsInput {
+                return_to: Stage::Build,
+            },
+            1,
+            0,
+            0,
+        );
+        assert!(waiting.apply(STANDARD, Event::UncommittedGate).is_err());
+    }
+
+    #[test]
     fn interruptions_and_counter_questions_change_nothing() {
         let waiting = state(
             Status::NeedsInput {
@@ -1593,6 +1629,17 @@ mod tests {
             // A refused fix run's result counts as at Build.
             (watch(0, 1, 2), Event::ResultRefused, stays(watch(1, 1, 2))),
             (watch(1, 1, 2), Event::ResultRefused, stays(watch(1, 1, 2))),
+            // A fix run's gate refused before any command keeps the count.
+            (
+                watch(0, 1, 2),
+                Event::UncommittedGate,
+                stays(watch(0, 1, 2)),
+            ),
+            (
+                watch(1, 1, 2),
+                Event::UncommittedGate,
+                stays(watch(1, 1, 2)),
+            ),
         ];
         for (from, event, expected) in table {
             assert_eq!(
