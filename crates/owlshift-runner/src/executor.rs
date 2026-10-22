@@ -92,7 +92,7 @@ use owlshift_platform::sandbox;
 
 use crate::agent_env::{AgentEnv, CredentialFinding, RunPaths};
 use crate::artifact::{ArtifactContents, ArtifactError, MAX_ARTIFACT_BYTES, read_artifacts};
-use crate::ticket_run::Siblings;
+use crate::ticket_run::{Marks, Siblings};
 
 pub use codex::CodexHarness;
 pub use gate::{DEFAULT_GATE_TIMEOUT, GateReport, GateStep, SETUP_LOG, SETUP_PREFIX, SETUP_SHARE};
@@ -644,35 +644,9 @@ impl Executor {
         if !findings.is_empty() {
             return Err(ExecutorError::Credentials(findings));
         }
-        // The other tickets' generations, just before the snapshot (OWL-400):
-        // one that cannot be read is the check failing, the run's outcome a
-        // quarantine, never a run alone's check.
-        let marks = spec.siblings.map(Siblings::marks);
-        let before = match onto {
-            Some(onto) => isolation::Snapshot::take_rebase(
-                &self.git,
-                spec.main,
-                spec.worktree,
-                spec.branch,
-                onto,
-            ),
-            None => isolation::Snapshot::take(&self.git, spec.main, spec.worktree, spec.branch),
-        }
-        .map_err(|e| ExecutorError::Snapshot(e.to_string()))?;
-        let check = || match (spec.siblings, &marks) {
-            (Some(siblings), Some(marks)) => {
-                let read = || {
-                    marks
-                        .as_ref()
-                        .map_err(Clone::clone)
-                        .and_then(|marks| siblings.concurrent(marks))
-                };
-                before
-                    .check_among(&self.git, spec.main, spec.worktree, spec.branch, &read)
-                    .violations
-            }
-            _ => before.check(&self.git, spec.main, spec.worktree, spec.branch),
-        };
+        let guarded = self.guarded(spec, onto)?;
+        let before = &guarded.before;
+        let check = || guarded.check(&self.git, spec);
 
         // The project's setup, before anything of the harness is prepared
         // (OWL-330): confined as the gate is, in the run's own temporary
@@ -987,6 +961,68 @@ impl Executor {
             warnings,
             resumed,
             session,
+        })
+    }
+}
+
+/// What a run's isolation check compares against (OWL-400): the snapshot
+/// taken before the run, and the other tickets' generations read just
+/// before it, when the run is told of its siblings.
+struct Guarded<'s> {
+    before: isolation::Snapshot,
+    siblings: Option<&'s Siblings<'s>>,
+    marks: Option<Result<Marks, String>>,
+}
+
+impl Guarded<'_> {
+    /// The isolation check after the run: among its siblings when told of
+    /// them, alone otherwise.
+    fn check(&self, git: &Git, spec: &RunSpec<'_>) -> Vec<Violation> {
+        match (self.siblings, &self.marks) {
+            (Some(siblings), Some(marks)) => {
+                let read = || {
+                    marks
+                        .as_ref()
+                        .map_err(Clone::clone)
+                        .and_then(|marks| siblings.concurrent(marks))
+                };
+                self.before
+                    .check_among(git, spec.main, spec.worktree, spec.branch, &read)
+                    .violations
+            }
+            _ => self
+                .before
+                .check(git, spec.main, spec.worktree, spec.branch),
+        }
+    }
+}
+
+impl Executor {
+    /// The snapshot a run of `spec` is checked against, a rebase's onto
+    /// `onto`, with the other tickets' generations read just before it
+    /// (OWL-400): one that cannot be read is the check failing, the run's
+    /// outcome a quarantine, never a run alone's check.
+    fn guarded<'s>(
+        &self,
+        spec: &RunSpec<'s>,
+        onto: Option<&str>,
+    ) -> Result<Guarded<'s>, ExecutorError> {
+        let marks = spec.siblings.map(Siblings::marks);
+        let before = match onto {
+            Some(onto) => isolation::Snapshot::take_rebase(
+                &self.git,
+                spec.main,
+                spec.worktree,
+                spec.branch,
+                onto,
+            ),
+            None => isolation::Snapshot::take(&self.git, spec.main, spec.worktree, spec.branch),
+        }
+        .map_err(|e| ExecutorError::Snapshot(e.to_string()))?;
+        Ok(Guarded {
+            before,
+            siblings: spec.siblings,
+            marks,
         })
     }
 }
