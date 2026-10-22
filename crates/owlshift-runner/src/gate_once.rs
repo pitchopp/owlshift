@@ -72,6 +72,14 @@ impl Place {
             Self::Base => BASE_BRANCH,
         }
     }
+
+    /// How its obligation and a breach name the run.
+    fn what(self) -> &'static str {
+        match self {
+            Self::Gate => "`owlshift gate`",
+            Self::Base => "The base check",
+        }
+    }
 }
 
 /// The most lines of each command's output [`render`] prints; the gate log
@@ -438,7 +446,8 @@ impl GateOnce<'_> {
             None,
             &run,
             &format!(
-                "`owlshift gate` on {}, its worktree at {}",
+                "{} on {}, its worktree at {}",
+                self.place.what(),
                 plan.commit,
                 worktree.display()
             ),
@@ -485,7 +494,8 @@ impl GateOnce<'_> {
         let lines: Vec<String> = run.violations.iter().map(|v| format!("- {v}")).collect();
         // Its time makes the marker unique, as a run's are (OWL-368).
         let text = format!(
-            "`owlshift gate` on {} broke isolation at {}; its worktree is kept at {}:\n{}\n",
+            "{} on {} broke isolation at {}; its worktree is kept at {}:\n{}\n",
+            self.place.what(),
             plan.commit,
             Timestamp::now(),
             worktree.display(),
@@ -554,7 +564,16 @@ impl GateOnce<'_> {
         }
         let verdict = match base::verdict(&run.report) {
             Ok(verdict) => verdict,
-            Err(why) => return unkept(None, why),
+            Err(why) => {
+                // A check due that said nothing: its failure takes the
+                // branch's path, and no Build waits on it any more.
+                if checks.drop_pending(&plan.commit, key)
+                    && let Err(error) = base::write(self.dirs, &checks)
+                {
+                    return unkept(None, format!("{why}; {error}"));
+                }
+                return unkept(None, why);
+            }
         };
         let initiating = match self.place {
             Place::Base => self.initiating,

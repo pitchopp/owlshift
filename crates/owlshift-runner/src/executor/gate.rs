@@ -167,7 +167,7 @@ pub struct GateReport {
     /// (OWL-330). Empty when the project has none or none started.
     pub setup: Vec<GateStep>,
     /// The failing command's failure was the runner's, not the command's
-    /// ([`Fault::Runner`]: one it could not confine, start or watch, a log it
+    /// (`Fault::Runner`: one it could not confine, start or watch, a log it
     /// could not write, an output a process kept open), so no base check
     /// may take it for the project's (OWL-418).
     pub runner_fault: bool,

@@ -341,6 +341,19 @@ impl Checks {
         }
     }
 
+    /// Drops the pending check of `commit` and `commands`, one that ran and
+    /// said nothing of the commands: its failure takes the branch's path.
+    /// Returns whether one was dropped; a hold is never dropped here.
+    pub fn drop_pending(&mut self, commit: &str, commands: &str) -> bool {
+        match self.position(commit, commands) {
+            Some(at) if matches!(self.checks[at].entry, Entry::Pending { .. }) => {
+                self.checks.remove(at);
+                true
+            }
+            _ => false,
+        }
+    }
+
     /// Whether an operator's check of `commit` and `commands` is kept: only
     /// one that holds or waits is, so `owlshift gate` never opens a hold.
     pub fn holds(&self, commit: &str, commands: &str) -> bool {
