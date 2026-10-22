@@ -156,6 +156,7 @@ pub const FORGE_HOSTS: &[&str] = &["github.com"];
 /// pushed commit: GitHub updates a pull request's head shortly after a push.
 const HEAD_READS: u32 = 5;
 
+mod base_hold;
 mod correction;
 mod design;
 mod drain;
@@ -705,6 +706,17 @@ pub enum Stop {
     Ready { ticket: TicketId },
     /// The harness reached its usage limit.
     UsageLimit { resets_at: Option<Timestamp> },
+    /// The Build is held for its base (OWL-418): `commit`, the commit it is
+    /// configured at, fails `command` in a fresh worktree too, so the
+    /// failure is the base's and nothing was counted; or, `pending`, its
+    /// check waits for the other tickets' steps in flight. It goes on once
+    /// that commit passes.
+    BaseHeld {
+        ticket: TicketId,
+        commit: String,
+        command: Option<String>,
+        pending: bool,
+    },
     /// The run was done and its gate passed, but its delivery failed.
     Delivery(String),
     /// `owlshift continue` on a ticket at Watch read its pull request and
@@ -917,6 +929,43 @@ impl fmt::Display for Stop {
                     "Stopped: the harness reached its usage limit; run again once it resets.",
                 ),
             },
+            Self::BaseHeld {
+                ticket,
+                commit,
+                command,
+                pending: false,
+            } => {
+                let short = crate::base::short(commit);
+                let failing = command
+                    .as_deref()
+                    .map_or_else(|| "its gate".to_owned(), |command| format!("`{command}`"));
+                write!(
+                    f,
+                    "Held: {ticket}'s branch was made from {short}, which fails {failing} in a \
+                     fresh worktree too, so the failure is the base's and nothing was counted. \
+                     Its Build goes on once {short} passes: after a fix, `owlshift gate --at \
+                     {commit}` checks it again, as does the next commit on the default branch; \
+                     a branch with commits of its own on {short} needs that base to pass, or a \
+                     person to rebase it. `owlshift why` lists the tickets it holds."
+                )
+            }
+            Self::BaseHeld {
+                ticket,
+                commit,
+                command,
+                pending: true,
+            } => {
+                let failing = command
+                    .as_deref()
+                    .map_or_else(String::new, |command| format!(" on `{command}`"));
+                write!(
+                    f,
+                    "Held: {ticket}'s gate failed{failing}, and whether its base {} fails it too \
+                     is checked once no other ticket's step runs; nothing was counted. `owlshift \
+                     watch` checks it then, or run `owlshift continue {ticket}` again.",
+                    crate::base::short(commit)
+                )
+            }
             Self::Delivery(reason) => write!(
                 f,
                 "The run is done and its gate passed, but the delivery failed: {reason}. The \
@@ -1359,6 +1408,9 @@ impl Prepared {
 struct Dispatched {
     head: Branch,
     base_branch: Branch,
+    /// The commit the run is configured at (OWL-331): its gate and setup
+    /// are this commit's, which a base check runs (OWL-418).
+    configured_at: Base,
     rules: ProjectRules,
     /// The ticket's routing, its labels read at this dispatch (OWL-305).
     routing: TicketRouting,
@@ -2562,6 +2614,7 @@ impl OnDemand<'_> {
         Dispatched {
             head: opened.head,
             base_branch: opened.base_branch,
+            configured_at: at,
             rules,
             routing,
             build,
@@ -2805,9 +2858,25 @@ impl OnDemand<'_> {
         // The late comments a Build run of this command was given to
         // integrate (OWL-139): one such run per delivery.
         let mut integrating: Option<Vec<Comment>> = None;
+        // A Build configured at a broken base waits, and a done Build whose
+        // gate a hold kept runs that gate alone once it passes (OWL-418).
+        let mut regate = self.before_base(p, dispatched, &state, sink)?;
+        if let Some(done) = &regate {
+            gather(&mut gathered.decisions, &done.notes);
+            gather(&mut gathered.followups, &done.followups);
+            p.integrated |= done.integrating;
+        }
         loop {
             attempt += 1;
-            let comments = self.comments(&p.ticket)?;
+            let mut comments = self.comments(&p.ticket)?;
+            // What the done Build saw of the thread, so a decider comment
+            // posted while its gate was held is late (OWL-139).
+            if let Some(done) = &regate
+                && let Some(ask) = p.questions().latest()
+            {
+                let decider = person(&ask.decider, &p.found);
+                comments = answer_check::seen_through(comments, done.seen, &decider);
+            }
             let mut brief = self.brief(
                 p,
                 Role::Build,
@@ -2838,15 +2907,42 @@ impl OnDemand<'_> {
                     design::design_notes(&state, p.review.as_ref(), confirmation)
                         .filter(|_| !in_review_loop(p))
                 });
-            let (ran, event) = self.run_role_once(
-                p,
-                (&*harness, dispatched.rules.setup()),
-                &state,
-                &brief,
-                attempt,
-                &mut gathered,
-                sink,
-            )?;
+            let (ran, event) = match regate.take() {
+                Some(done) => self.regate_role(
+                    p,
+                    (&*harness, dispatched.rules.setup()),
+                    &brief,
+                    attempt,
+                    &done.result,
+                    &mut gathered,
+                    sink,
+                )?,
+                None => self.run_role_once(
+                    p,
+                    (&*harness, dispatched.rules.setup()),
+                    &state,
+                    &brief,
+                    attempt,
+                    &mut gathered,
+                    sink,
+                )?,
+            };
+            // A failure its base reproduces counts as nothing: the Build
+            // waits for that base (OWL-418).
+            if event == Event::RunFailed
+                && let Some(held) = self.base_broken(
+                    p,
+                    dispatched,
+                    &mut state,
+                    &ran,
+                    &gathered,
+                    &comments,
+                    integrating.is_some(),
+                    sink,
+                )?
+            {
+                return Err(held);
+            }
             // A last fix that asks is no longer the last fix alone: a Verify
             // pass follows it (OWL-356).
             if event == Event::Questions && drop_last_fix(p) {
@@ -4901,12 +4997,42 @@ impl OnDemand<'_> {
         session: Option<Stage>,
         sink: &mut EventSink<'_>,
     ) -> Result<Result<Ran, ExecutorError>, Stop> {
+        self.execute_inner(
+            p,
+            executor,
+            (harness, setup),
+            brief,
+            attempt,
+            (session, None),
+            sink,
+        )
+    }
+
+    /// [`Self::execute_or_unstarted`], or, given `kept`, a done Build's
+    /// result, its gate run again alone ([`Executor::regate`], OWL-418):
+    /// the same obligation, run file, events and isolation check, with no
+    /// usage admission, session or cost, since no harness runs; its
+    /// `run_started` event says `gate_only`.
+    #[allow(clippy::too_many_arguments)]
+    fn execute_inner(
+        &self,
+        p: &mut Prepared,
+        executor: &Executor,
+        (harness, setup): (&dyn Harness, &[String]),
+        brief: &Brief,
+        attempt: u32,
+        (session, kept): (Option<Stage>, Option<&RunResult>),
+        sink: &mut EventSink<'_>,
+    ) -> Result<Result<Ran, ExecutorError>, Stop> {
         let ticket = &p.ticket.clone();
         // At each run's boundary: a quarantine that stands, since a sibling's
         // breach, stops the step before anything runs (OWL-400, decided on
         // 2026-10-21): the ticket waits where it is.
         self.refuse_if_quarantined()?;
-        let admitted = self.admit_usage(ticket, harness, brief.role, sink)?;
+        let admitted = match kept {
+            Some(_) => None,
+            None => self.admit_usage(ticket, harness, brief.role, sink)?,
+        };
         let (run, run_dir) =
             new_run_dir(&self.dirs.runs(ticket)).map_err(|e| refused("the run directory", e))?;
         let (plan, resumes, fresh) = match session {
@@ -4930,6 +5056,9 @@ impl OnDemand<'_> {
         }
         if let Some(why) = fresh {
             started.insert("fresh".to_owned(), json!(why.as_str()));
+        }
+        if kept.is_some() {
+            started.insert("gate_only".to_owned(), json!(true));
         }
         sink.emit(ticket, Some(&run), EventKind::RunStarted, started);
         // The brief leaves a malformed `zone:` label out (`brief` takes the
@@ -4995,7 +5124,10 @@ impl OnDemand<'_> {
         {
             let _ = executor.prepare_worktree(&p.checkout, &p.worktree, &p.branch, &p.base.commit);
         }
-        let ran = executor.run(&spec, harness);
+        let ran = match kept {
+            Some(kept) => executor.regate(&spec, kept),
+            None => executor.run(&spec, harness),
+        };
         // Whatever the run did, its branch's head and its worktree's entry,
         // which its check verified or which the runner's own git made before
         // a refusal, before anything else is written through the run file:
@@ -5013,9 +5145,12 @@ impl OnDemand<'_> {
         let report = match ran {
             Ok(report) => {
                 // A resumed run's own cost: the executor counted out what
-                // the session had cost before it (OWL-394).
-                p.cost
-                    .ran(report.usage.as_ref().and_then(|usage| usage.cost_usd));
+                // the session had cost before it (OWL-394). A gate run alone
+                // spent nothing (OWL-418).
+                if kept.is_none() {
+                    p.cost
+                        .ran(report.usage.as_ref().and_then(|usage| usage.cost_usd));
+                }
                 // The kept session is spent; a run that asked leaves its own.
                 // A Build whose project setup failed before its harness ran
                 // spent nothing of it (OWL-330).
@@ -5328,6 +5463,7 @@ impl OnDemand<'_> {
                 | Stop::CounterQuestion { .. }
                 | Stop::CheckFailed { .. }
                 | Stop::UsageLimit { .. }
+                | Stop::BaseHeld { .. }
                 | Stop::Delivery(_)
                 | Stop::Watched { .. }
                 | Stop::Ready { .. }
@@ -8449,6 +8585,7 @@ mod tests {
             log_error: None,
             gate: None,
             setup: None,
+            gated: None,
             warnings: Vec::new(),
             resumed: None,
             session: None,

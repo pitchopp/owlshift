@@ -8,6 +8,7 @@ pub mod agent_env;
 mod alone;
 pub mod answer_check;
 pub mod artifact;
+pub mod base;
 pub mod codex_machine;
 pub mod config;
 pub mod doctor;

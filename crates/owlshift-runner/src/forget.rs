@@ -132,6 +132,19 @@ pub fn forget(
         ]),
     };
     sink.emit(ticket, None, EventKind::Decision, event);
+    // A done Build whose gate waited for its base is forgotten too, so the
+    // ticket's next Build runs afresh (OWL-418).
+    if let Err(error) = crate::base::remove_wait(dirs, ticket) {
+        sink.emit(
+            ticket,
+            None,
+            EventKind::Warning,
+            data([
+                ("what", json!("base_wait_not_kept")),
+                ("reason", json!(error.to_string())),
+            ]),
+        );
+    }
     Ok(Forgotten {
         ticket: ticket.clone(),
         forgot,

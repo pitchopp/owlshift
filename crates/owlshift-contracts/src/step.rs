@@ -201,6 +201,16 @@ pub enum StepEnd {
         #[serde(default)]
         resets_at: Option<Timestamp>,
     },
+    /// A Build held for its base (OWL-418): `commit`, the commit it is
+    /// configured at, fails `command` in a fresh worktree too, or its check
+    /// is `pending`, waiting for the other steps in flight. Format 4.
+    BaseHeld {
+        commit: String,
+        #[serde(default)]
+        command: Option<String>,
+        #[serde(default)]
+        pending: bool,
+    },
     /// A comment that makes a person the blocker landed, or a park whose
     /// comment did not, and the ticket's state was not kept.
     NotKept { landed: LandedKind },
@@ -253,12 +263,13 @@ pub enum StepHold {
 impl StepOutcome {
     const CONTRACT: &str = "step outcome";
 
-    /// Parses an outcome record. A format-1 or format-2 one, which a watch
-    /// that ran before OWL-409 or OWL-404 may have left for its successor,
-    /// is read as the current format: format 2 only adds the `no_slot` end,
-    /// refused in format 1, and format 3 only drops the `paused` hold, read
-    /// as none, since the machine's usage state now holds a harness at its
-    /// limit.
+    /// Parses an outcome record. A format-1, 2 or 3 one, which a watch that
+    /// ran before OWL-409, OWL-404 or OWL-418 may have left for its
+    /// successor, is read as the current format: format 2 only adds the
+    /// `no_slot` end, refused in format 1, format 3 only drops the `paused`
+    /// hold, read as none, since the machine's usage state now holds a
+    /// harness at its limit, and format 4 only adds the `base_held` end,
+    /// refused before.
     pub fn parse(input: &str) -> Result<Self, ContractError> {
         let outcome: Self = match Self::from_older_format(input) {
             Some(read) => read?,
@@ -268,13 +279,23 @@ impl StepOutcome {
         Ok(outcome)
     }
 
-    /// A format-1 or format-2 record read as the current format, or `None`
-    /// for any other.
+    /// A format-1, 2 or 3 record read as the current format, or `None` for
+    /// any other.
     fn from_older_format(input: &str) -> Option<Result<Self, ContractError>> {
         let mut document: serde_json::Value = serde_json::from_str(input).ok()?;
         let format = document.get("format").and_then(serde_json::Value::as_u64)?;
-        if !matches!(format, 1 | 2) {
+        if !matches!(format, 1..=3) {
             return None;
+        }
+        if document
+            .pointer("/end/end")
+            .and_then(serde_json::Value::as_str)
+            == Some("base_held")
+        {
+            return Some(Err(ContractError::invalid(
+                Self::CONTRACT,
+                "formats before 4 have no `base_held` end",
+            )));
         }
         if format == 1
             && document
@@ -744,7 +765,7 @@ mod tests {
         };
         let as_format_1 = |outcome: &StepOutcome| {
             let mut document: serde_json::Value = serde_json::from_str(&outcome.render()).unwrap();
-            assert_eq!(document["format"], 3);
+            assert_eq!(document["format"], 4);
             document["format"] = 1.into();
             document.to_string()
         };
@@ -796,6 +817,42 @@ mod tests {
             StepOutcome::parse(&no_slot.to_string()).unwrap().end,
             StepEnd::NoSlot
         );
+    }
+
+    /// OWL-418: format 4 adds `base_held`; a format-3 record a predecessor
+    /// watch left still reads, as format 4, but never with that end.
+    #[test]
+    fn base_held_is_format_4s() {
+        let outcome = StepOutcome {
+            format: Format,
+            ticket: TicketId::new("OWL-1").unwrap(),
+            attempt: "1-2-3".to_owned(),
+            commit: None,
+            progress: "p".to_owned(),
+            answer: None,
+            end: StepEnd::BaseHeld {
+                commit: "a".repeat(40),
+                command: Some("sh ci/owlshift/setup.sh".to_owned()),
+                pending: true,
+            },
+            after: RefAfter::Unread,
+            hold: None,
+            kept: KeptFollowing::default(),
+            at: "2026-10-22T09:00:00Z".parse().unwrap(),
+        };
+        assert_eq!(StepOutcome::parse(&outcome.render()).unwrap(), outcome);
+        let as_format_3 = |outcome: &StepOutcome| {
+            let mut document: serde_json::Value = serde_json::from_str(&outcome.render()).unwrap();
+            document["format"] = 3.into();
+            document.to_string()
+        };
+        let error = StepOutcome::parse(&as_format_3(&outcome)).unwrap_err();
+        assert!(error.to_string().contains("no `base_held`"), "{error}");
+        let busy = StepOutcome {
+            end: StepEnd::Busy,
+            ..outcome
+        };
+        assert_eq!(StepOutcome::parse(&as_format_3(&busy)).unwrap(), busy);
     }
 
     /// A run file and an obligation read back as written, a write under way

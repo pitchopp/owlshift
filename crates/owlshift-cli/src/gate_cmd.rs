@@ -49,13 +49,7 @@ fn run_checked(
         .map_err(|error| format!("the agent environment: {error}"))?;
     let executor = on_demand::executor(git, agent);
     let dirs = ProjectDirs::new(&data_dir, &repo);
-    let gate = GateOnce {
-        executor: &executor,
-        dirs: &dirs,
-        remote_url: &remote_url,
-        local: project,
-        at,
-    };
+    let gate = GateOnce::operator(&executor, &dirs, &remote_url, project, at);
     let mut starting = |plan: &_| {
         let mut stdout = io::stdout();
         let _ = write!(stdout, "{}", printable(&format!("{plan}")));

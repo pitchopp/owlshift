@@ -1055,7 +1055,7 @@ impl Bench {
             format!(
                 "requires = \">=0.0\"\n[tracker]\nkind = \"markdown\"\n{admit}\n\
                  states = {{ ready = \"Todo\", working = \"In Progress\", needs_input = \"Needs Input\", review = \"In Review\"{states} }}\n\
-                 [stack]\ngate = [\"git grep -q Hello -- GREETING.md\"]\n\
+                 [stack]\ngate = [\"test ! -e GREETING.md || git grep -q Hello -- GREETING.md\"]\n\
                  [pipeline]\ndefault = \"trivial\"\nplan_approval = \"never\"\nfindings = \"arbiter\"\n[models]\n[policy]\nalways_human = []\n\
                  {zones}"
             ),
@@ -1801,7 +1801,7 @@ fn a_ticket_becomes_a_pull_request_with_its_report() {
         "[owlshift] DELIVERY",
         "[#1](https://github.com/demo/project/pull/1)",
         "**Checks:** green",
-        "**Project gate:** passed: `git grep -q Hello -- GREETING.md`.",
+        "**Project gate:** passed: `test ! -e GREETING.md || git grep -q Hello -- GREETING.md`.",
         "**Decisions taken without a human:** none.",
     ] {
         assert!(comments[0].contains(text), "{text}\n---\n{}", comments[0]);
@@ -1948,7 +1948,7 @@ fn a_red_gate_gets_one_fix_run_that_resumes_from_its_plan() {
     let failure = brief.gate_failure.expect("the fix run knows why");
     assert_eq!(
         failure.command.as_deref(),
-        Some("git grep -q Hello -- GREETING.md")
+        Some("test ! -e GREETING.md || git grep -q Hello -- GREETING.md")
     );
     let checkpoint = brief.checkpoint.expect("the fix run resumes from the plan");
     assert_eq!(checkpoint.plan.unwrap().as_str(), ".owlshift/run/plan.md");
@@ -1961,6 +1961,18 @@ fn a_red_gate_gets_one_fix_run_that_resumes_from_its_plan() {
         ("AGENTS.md", AGENTS)
     );
     assert!(rule.applies_to.is_empty());
+
+    // Criterion 4 of OWL-418: the base passes the command the branch failed,
+    // so the failure is the branch's; the check is kept, holding nothing.
+    let checks: Vec<Value> = data_of(&bench.events(), EventKind::Decision, "base")
+        .into_iter()
+        .filter(|data| data["base"] == json!("checked"))
+        .collect();
+    assert_eq!(checks.len(), 1, "{checks:?}");
+    assert_eq!(
+        (&checks[0]["verdict"], &checks[0]["change"]),
+        (&json!("passed"), &json!("cached"))
+    );
 }
 
 /// OWL-180: a Build run whose `result.json` is refused, here for questions
@@ -8851,7 +8863,7 @@ fn a_first_report_the_tracker_refused_is_posted_at_the_next_pass_once() {
     assert_eq!(posted.len(), 1, "{posted:?}");
     for text in [
         "Added GREETING.md; the gate passes.",
-        "**Project gate:** passed: `git grep -q Hello -- GREETING.md`.",
+        "**Project gate:** passed: `test ! -e GREETING.md || git grep -q Hello -- GREETING.md`.",
         "**Greet in French**",
     ] {
         assert!(posted[0].contains(text), "{text}: {}", posted[0]);
@@ -11542,6 +11554,10 @@ mod parallel_scenarios;
 #[path = "on_demand/to_watch_scenarios.rs"]
 mod to_watch_scenarios;
 
+/// A base that breaks the gate holds the project once (OWL-418).
+#[path = "on_demand/base_scenarios.rs"]
+mod base_scenarios;
+
 /// OWL-312's acceptance: `[roles.build] rules` reaches Build's brief after
 /// `stack.rules`, and not the resolver's; the `dispatch` event names every
 /// source; a named file the base commit lacks refuses the run.
@@ -11789,7 +11805,7 @@ fn an_intake_pass_gives_its_resolver_the_resolver_rules() {
 }
 
 /// The bench's gate line in `owlshift.toml`.
-const GATE_LINE: &str = "gate = [\"git grep -q Hello -- GREETING.md\"]";
+const GATE_LINE: &str = "gate = [\"test ! -e GREETING.md || git grep -q Hello -- GREETING.md\"]";
 
 /// OWL-331: the base moves, with a new gate, its script and new rules,
 /// between two Builds of one ticket. The resumed Build keeps the gate and
@@ -11800,7 +11816,7 @@ const GATE_LINE: &str = "gate = [\"git grep -q Hello -- GREETING.md\"]";
 #[test]
 fn a_resumed_build_keeps_the_gate_and_rules_of_its_own_base() {
     let bench = Bench::new(true);
-    let old_gate = vec!["git grep -q Hello -- GREETING.md".to_owned()];
+    let old_gate = vec!["test ! -e GREETING.md || git grep -q Hello -- GREETING.md".to_owned()];
     let config_path = bench.remote.checkout.join("owlshift.toml");
     let original = fs::read_to_string(&config_path).unwrap();
     let failing = original.replace(GATE_LINE, "gate = [\"false\"]");
@@ -11857,7 +11873,7 @@ fn a_base_without_a_project_file_takes_the_persons_gate() {
     delivered.unwrap_or_else(|stop| panic!("{stop}\n{printed}"));
     assert_eq!(
         bench.last_of(Role::Build).gate,
-        ["git grep -q Hello -- GREETING.md"]
+        ["test ! -e GREETING.md || git grep -q Hello -- GREETING.md"]
     );
     let dispatched = data_of(&bench.events(), EventKind::Dispatch, "project_file");
     assert_eq!(dispatched[0]["project_file"], json!("local"));

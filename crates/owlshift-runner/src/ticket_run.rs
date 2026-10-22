@@ -259,6 +259,16 @@ fn in_flight(dirs: &ProjectDirs, found: &Found, own: Option<&TicketId>) -> io::R
 /// length and starts with one of the project's sections. One try each, let
 /// go at once; a folder with no lock file was never locked.
 pub fn ticket_in_flight(dirs: &ProjectDirs) -> io::Result<Option<PathBuf>> {
+    ticket_in_flight_except(dirs, None)
+}
+
+/// [`ticket_in_flight`], `except`'s folder left out: the ticket whose step
+/// runs a base check holds its own lock (OWL-418).
+pub fn ticket_in_flight_except(
+    dirs: &ProjectDirs,
+    except: Option<&TicketId>,
+) -> io::Result<Option<PathBuf>> {
+    let own = except.map(|ticket| dirs.ticket_dir(ticket));
     let listing = match fs::read_dir(dirs.tickets()) {
         Ok(listing) => listing,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
@@ -273,6 +283,9 @@ pub fn ticket_in_flight(dirs: &ProjectDirs) -> io::Result<Option<PathBuf>> {
     }
     folders.sort();
     for folder in folders {
+        if own.as_ref() == Some(&folder) {
+            continue;
+        }
         if dirs.ticket_lock_held_in(&folder)? {
             return Ok(Some(folder));
         }

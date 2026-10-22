@@ -6,6 +6,7 @@
 //! and each contract's `parse` adds the rules a schema cannot carry. Parsing
 //! and rendering work on strings; this crate reads and writes no file.
 
+pub mod base;
 pub mod brief;
 pub mod comment;
 pub mod config;

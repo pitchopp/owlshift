@@ -223,6 +223,25 @@ pub fn edited_after<'c>(
         .collect()
 }
 
+/// `comments` as a run whose brief held the decider's edits up to `seen`
+/// read them: every comment but the decider's own last edited after it, all
+/// of theirs left out when it held none. What a done Build whose gate runs
+/// again alone saw (OWL-418), so that a decider comment posted meanwhile is
+/// late ([`late_comments`]).
+pub fn seen_through(
+    comments: Vec<Comment>,
+    seen: Option<Timestamp>,
+    decider: &Person,
+) -> Vec<Comment> {
+    comments
+        .into_iter()
+        .filter(|comment| {
+            comment_author(comment, decider).relation != Relation::Decider
+                || seen.is_some_and(|seen| comment.last_edit() <= seen)
+        })
+        .collect()
+}
+
 /// The decider's own comments, as the brief marks them: their account's,
 /// and not a marked comment.
 fn decider_comments<'c>(

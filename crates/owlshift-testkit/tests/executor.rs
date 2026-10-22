@@ -891,6 +891,59 @@ fn the_fake_harness_observes_the_worktree_and_its_temporary_folder() {
     );
 }
 
+/// OWL-418: a red gate after a `done` keeps the result it replaced, and the
+/// gate alone runs again on the kept worktree, no harness spawned, judging
+/// that result: `Finished` with it once the gate passes, `Failure::Gate`
+/// with it kept again otherwise.
+#[test]
+fn a_done_builds_gate_runs_again_alone_on_its_kept_result() {
+    let bench = Bench::new();
+    let harness = bench.fake(Reply::default());
+    let mut brief = bench.brief.clone();
+    // Red until a file the run's own folder ignores is there, as a base
+    // whose environment was fixed.
+    brief.gate = vec!["git hash-object .owlshift/run/ok".to_owned()];
+    let report = bench.run_with(&bench.executor, &harness, &brief).unwrap();
+    assert!(
+        matches!(report.outcome, Outcome::Failed(Failure::Gate(_))),
+        "{:?}",
+        report.outcome
+    );
+    let kept = report.gated.expect("the result the red gate replaced");
+    assert_eq!(kept.summary, "s");
+
+    let spec = RunSpec {
+        main: &bench.main,
+        worktree: &bench.worktree,
+        branch: BRANCH,
+        base: "origin/main",
+        run_dir: &bench.tmp.path().join("regate"),
+        brief: &brief,
+        setup: &[],
+        session: None,
+        siblings: None,
+    };
+    let ok = bench.worktree.join(".owlshift/run/ok");
+    fs::write(&ok, "fixed\n").unwrap();
+    let passed = bench.executor.regate(&spec, &kept).unwrap();
+    match &passed.outcome {
+        Outcome::Finished { result, .. } => assert_eq!(**result, *kept),
+        other => panic!("{other:?}"),
+    }
+    assert!(passed.gate.as_ref().is_some_and(|gate| gate.passed()));
+    assert!(passed.gated.is_none());
+    assert!(passed.usage.is_none() && passed.exit_code.is_none() && passed.model.is_none());
+
+    fs::remove_file(&ok).unwrap();
+    let red = bench.executor.regate(&spec, &kept).unwrap();
+    assert!(
+        matches!(red.outcome, Outcome::Failed(Failure::Gate(_))),
+        "{:?}",
+        red.outcome
+    );
+    assert_eq!(red.gated.as_deref(), Some(&*kept));
+}
+
 /// OWL-394: a resume whose transcript cannot be put in place starts a
 /// session of the run's own, said in a warning, and its run counts at the
 /// whole cost it reports, never less what the other session had cost; a

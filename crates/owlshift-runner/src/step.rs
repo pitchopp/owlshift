@@ -281,6 +281,16 @@ pub fn end(stepped: &Stepped) -> StepEnd {
         Stop::UsageLimit { resets_at } => StepEnd::UsageLimit {
             resets_at: *resets_at,
         },
+        Stop::BaseHeld {
+            commit,
+            command,
+            pending,
+            ..
+        } => StepEnd::BaseHeld {
+            commit: commit.clone(),
+            command: command.clone(),
+            pending: *pending,
+        },
         Stop::NotKept { landed, .. } => StepEnd::NotKept {
             landed: landed_kind(*landed),
         },

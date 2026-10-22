@@ -138,6 +138,7 @@ use owlshift_core::usage::{Standing, own_harness};
 use owlshift_core::vocab::{Harness, Stage};
 
 use crate::answer_check::{self, Readiness};
+use crate::base;
 use crate::events::{Data, EventSink, data, printable};
 use crate::follow::{self, Following, Look};
 use crate::held;
@@ -172,6 +173,10 @@ pub const POLL_INTERVAL: Duration = Duration::from_secs(60);
 /// back, unless the decider edits a comment or the ref moves meanwhile. One
 /// that stopped with [`Stop::NotKept`] is held until then, with no end.
 pub const RETRY_AFTER: Duration = Duration::from_secs(10 * 60);
+
+/// How long a base check due holds every other step back at most (OWL-418):
+/// longer than any step a run can make, its deadline and its gate's.
+pub const BASE_DUE_AT_MOST: Duration = Duration::from_secs(3 * 60 * 60);
 
 /// Whether watch continues a ticket in `status`: one whose questions wait
 /// for its decider. A parked ticket waits for a person's `continue`, which
@@ -399,6 +404,11 @@ impl Holds {
         self.held.retain(|ticket, _| kept.contains(ticket));
     }
 
+    /// Lifts `ticket`'s hold: what it waited for ended (OWL-418).
+    pub fn release(&mut self, ticket: &TicketId) {
+        self.held.remove(ticket);
+    }
+
     /// Applies `hold`, which a step of `ticket` from `seen` called for, as
     /// [`Self::after`] would have set it (OWL-399): a record a predecessor
     /// left.
@@ -526,6 +536,17 @@ struct Memory<'c> {
     /// The quarantine's WAITING comments, folded once it is cleared
     /// (OWL-423).
     quarantine_comments: waiting::QuarantineComments,
+    /// The ticket whose base check is due and could not run beside other
+    /// steps (OWL-418), since when: no other step starts until those in
+    /// flight end and that ticket's step has run, for at most
+    /// [`BASE_DUE_AT_MOST`].
+    base_due: Option<(TicketId, Timestamp)>,
+    /// How many steps of a ticket whose check was due have ended.
+    base_due_ran: u64,
+    /// The tickets whose check's priority was given up, their step unable
+    /// to start or past [`BASE_DUE_AT_MOST`]: not given it again from
+    /// `base.json` until a step of theirs has run.
+    base_due_given_up: BTreeSet<TicketId>,
 }
 
 /// Why a ticket's next stage step waits, as told once.
@@ -540,6 +561,9 @@ enum StepWait {
     /// The harness its first run would use is at its usage limit (OWL-404),
     /// told on the ticket (OWL-419).
     Usage(Harness),
+    /// The commit its Build is configured at fails its gate, or its check is
+    /// due (OWL-418), told on the ticket.
+    Base(String),
 }
 
 /// What watch knows of one marker: what its [`Record`] says, joined with
@@ -650,9 +674,29 @@ impl Watch<'_> {
         self.adopt_leftovers(&mut memory, sink);
         loop {
             memory.stepped = false;
+            // A check left pending in `base.json`, by a watch before this one
+            // or by a person's command, gets its priority too (OWL-418).
+            if memory.base_due.is_none() {
+                memory.base_due = self.pending_due(&memory);
+            }
+            // A check due whose ticket's step did not start in a pass with
+            // nothing else in flight, held back for another reason, gives
+            // up its priority, so it never holds the project (OWL-418).
+            let due = memory
+                .base_due
+                .clone()
+                .filter(|_| memory.running.is_empty())
+                .map(|(ticket, _)| (ticket, memory.base_due_ran));
             self.pass(&mut memory, sink, out, continued);
             if draining {
                 self.drain(&mut memory, sink, out, continued);
+            }
+            if let Some((ticket, ran)) = due
+                && memory.base_due_ran == ran
+                && !memory.running.iter().any(|step| *step.ticket() == ticket)
+            {
+                memory.base_due = None;
+                memory.base_due_given_up.insert(ticket);
             }
             // The interval is only between idle passes (OWL-367): after a
             // step, the next stage step is due at once. While steps'
@@ -2043,16 +2087,31 @@ impl Watch<'_> {
                 Some(Turn::Unknown(unread)) => {
                     return self.wait_for_slot(memory, sink, out, ticket, unread);
                 }
-                // A usage limit's wait ends below, once its harness is free.
-                _ if matches!(memory.waits.get(ticket), Some(StepWait::Usage(_))) => {}
+                // A usage limit's wait ends below, once its harness is free;
+                // a base's once a step goes on (OWL-418).
+                _ if matches!(
+                    memory.waits.get(ticket),
+                    Some(StepWait::Usage(_) | StepWait::Base(_))
+                ) => {}
                 _ => self.wait_ended(memory, sink, ticket),
             }
         }
         let seen = Seen::at(at, None);
+        // A hold on its base lifted, or its check due with no other step in
+        // flight: the ticket goes at once (OWL-418).
+        if self.base_released(memory, ticket) {
+            memory.holds.release(ticket);
+        }
         if memory.holds.admit(ticket, &seen, now) != Admit::Go {
             return;
         }
-        match self.usage_wait(memory, sink, out, limits::resume_role(stage, stored)) {
+        let gate_only = stage == Stage::Build && base::wait_file(on_demand.dirs, ticket).exists();
+        match self.usage_wait(
+            memory,
+            sink,
+            out,
+            limits::resume_role(stage, stored, gate_only),
+        ) {
             // Told on the ticket while it shows working (OWL-419).
             Some((harness, until_ms)) => {
                 if shown == VisibleStage::Working {
@@ -2123,7 +2182,7 @@ impl Watch<'_> {
         let after = self.read_after(ticket);
         let progress = after.as_ref().map(Stored::progress);
         let holds_now = after.as_ref().is_some_and(holds);
-        match self.after(
+        let admitted = self.after(
             memory,
             sink,
             out,
@@ -2132,7 +2191,30 @@ impl Watch<'_> {
             end,
             progress.as_ref(),
             holds_now,
-        ) {
+        );
+        // A Build held for its base: told once per commit, on the ticket
+        // too; a later step that goes on ends that wait (OWL-418).
+        if let StepEnd::BaseHeld {
+            commit,
+            command,
+            pending,
+        } = end
+        {
+            self.wait_for_base(
+                memory,
+                sink,
+                out,
+                ticket,
+                commit,
+                command.as_deref(),
+                *pending,
+            );
+            return;
+        }
+        if matches!(memory.waits.get(ticket), Some(StepWait::Base(_))) {
+            self.wait_ended(memory, sink, ticket);
+        }
+        match admitted {
             // The usage limit's own line says it (OWL-404), and the ticket,
             // which shows working, a WAITING comment (OWL-419).
             Some(Admit::Held { .. }) if usage_held(end, now) => {
@@ -2143,7 +2225,7 @@ impl Watch<'_> {
                     Some(stored),
                 ) = (end, after.as_ref().filter(|stored| holds(stored)))
                 {
-                    let role = limits::resume_role(stage, stored);
+                    let role = limits::resume_role(stage, stored, false);
                     let harness = own_harness(role.unwrap_or(Role::Build));
                     let until_ms = machine_usage::ms(*until);
                     self.wait_for_usage(memory, sink, ticket, harness, until_ms);
@@ -2204,9 +2286,11 @@ impl Watch<'_> {
         // project's capacity hold it, or waits for its holders, told in this
         // very pass; a holder that left the slot gives its turn at the next
         // pass, at once (OWL-367, OWL-401).
+        // A Build held for its base still waits: its comment stays (OWL-418).
+        let base_held = matches!(outcome, StepEnd::BaseHeld { .. });
         match memory.turn.clone().unwrap_or(Turn::Holders(Vec::new())) {
             Turn::Holders(holders) if holders.contains(ticket) => {
-                if holds_now {
+                if holds_now && !base_held {
                     self.wait_ended(memory, sink, ticket);
                 } else if moved {
                     memory.stepped = true;
@@ -2216,7 +2300,9 @@ impl Watch<'_> {
                 if holders.len() < self.capacity() as usize {
                     holders.push(ticket.clone());
                     memory.turn = Some(Turn::Holders(holders));
-                    self.wait_ended(memory, sink, ticket);
+                    if !base_held {
+                        self.wait_ended(memory, sink, ticket);
+                    }
                 } else {
                     self.wait_for_slot(memory, sink, out, ticket, holders);
                 }
@@ -2309,6 +2395,78 @@ impl Watch<'_> {
         memory.waits.insert(ticket.clone(), told);
     }
 
+    /// Tells `ticket`, whose Build waits for `commit`, its base, which fails
+    /// `command` too or whose check is `pending` (OWL-418): one line and one
+    /// WAITING comment per commit, the `decision` event being the step's.
+    #[allow(clippy::too_many_arguments)]
+    fn wait_for_base(
+        &self,
+        memory: &mut Memory,
+        sink: &mut EventSink<'_>,
+        out: &mut dyn Write,
+        ticket: &TicketId,
+        commit: &str,
+        command: Option<&str>,
+        pending: bool,
+    ) {
+        let told = StepWait::Base(commit.to_owned());
+        if memory.waits.get(ticket) == Some(&told) {
+            return;
+        }
+        let event = data([
+            ("commit", json!(commit)),
+            ("command", json!(command)),
+            ("pending", json!(pending)),
+        ]);
+        let phrase = why::phrase(&why::Waiting {
+            at: (self.on_demand.clock)(),
+            ticket: ticket.clone(),
+            reason: "base_broken".to_owned(),
+            data: event.clone(),
+        });
+        self.show_wait(memory, sink, ticket, "base_broken", event);
+        self.line(out, &format!("{ticket} waits: {phrase}"));
+        memory.waits.insert(ticket.clone(), told);
+    }
+
+    /// The ticket a check pending in `base.json` gives its priority to, from
+    /// now, when one waits and its priority was not given up (OWL-418).
+    fn pending_due(&self, memory: &Memory) -> Option<(TicketId, Timestamp)> {
+        let dirs = self.on_demand.dirs;
+        let checks = base::read(dirs).ok()?;
+        // The tickets' folders are read only while a check is pending.
+        if !checks
+            .standing()
+            .any(|check| matches!(check.entry, owlshift_core::base::Entry::Pending { .. }))
+        {
+            return None;
+        }
+        let ticket = base::pending_ticket(&checks, &base::waits(dirs), |ticket| {
+            memory.base_due_given_up.contains(ticket)
+        })?;
+        Some((ticket, (self.on_demand.clock)()))
+    }
+
+    /// Whether `ticket`'s hold is to be lifted for its base (OWL-418): the
+    /// commit its Build waited for no longer holds it, or its check is due
+    /// and no other step is in flight.
+    fn base_released(&self, memory: &Memory, ticket: &TicketId) -> bool {
+        if memory
+            .base_due
+            .as_ref()
+            .is_some_and(|(due, _)| due == ticket)
+            && memory.running.is_empty()
+        {
+            return true;
+        }
+        match memory.waits.get(ticket) {
+            Some(StepWait::Base(commit)) => {
+                !base::read(self.on_demand.dirs).is_ok_and(|checks| checks.holds_commit(commit))
+            }
+            _ => false,
+        }
+    }
+
     /// Tells `ticket`, whose next stage step waits for `harness`'s usage
     /// limit until `until_ms` at least, on the tracker (OWL-419): one
     /// WAITING comment per harness, the `decision` event being the
@@ -2345,8 +2503,13 @@ impl Watch<'_> {
         event: Data,
     ) {
         // A harness's limit is one reason whatever its reset time, so a
-        // probe's next deadline posts nothing.
-        let usage = (reason == "usage_limit").then(|| format!("{reason}: {}", event["harness"]));
+        // probe's next deadline posts nothing; a base is one whatever its
+        // check says (OWL-418).
+        let usage = match reason {
+            "usage_limit" => Some(format!("{reason}: {}", event["harness"])),
+            "base_broken" => Some(format!("{reason}: {}", event["commit"])),
+            _ => None,
+        };
         let phrase = why::phrase(&why::Waiting {
             at: (self.on_demand.clock)(),
             ticket: ticket.clone(),
@@ -2798,6 +2961,30 @@ mod tests {
             })
         );
         assert_eq!(holds.admit(&two, &seen("d1", 0), at(32)), Admit::Go);
+    }
+
+    /// OWL-418: a Build held for its base leaves its ref as it was, so it is
+    /// held for the retry delay, and lifting its base's hold releases it at
+    /// once.
+    #[test]
+    fn a_base_hold_is_held_until_released() {
+        let one = TicketId::new("DEMO-1").unwrap();
+        let mut holds = Holds::default();
+        let held = Err(Stop::BaseHeld {
+            ticket: one.clone(),
+            commit: "c".repeat(40),
+            command: Some("sh setup.sh".to_owned()),
+            pending: false,
+        });
+        assert_eq!(
+            holds.after(&one, seen("c1", 0), &end(held), Some(&p("c1")), at(1)),
+            Some(Admit::Held {
+                until: Until::At(at(11))
+            })
+        );
+        assert_ne!(holds.admit(&one, &seen("c1", 0), at(2)), Admit::Go);
+        holds.release(&one);
+        assert_eq!(holds.admit(&one, &seen("c1", 0), at(2)), Admit::Go);
     }
 
     /// OWL-158: a continue that left a comment on the ticket whose state was
