@@ -43,6 +43,7 @@ use owlshift_contracts::format::Format;
 use owlshift_contracts::ids::TicketId;
 use owlshift_contracts::refs::ticket_ref;
 use owlshift_contracts::step::{RunObligation, RunTarget, TicketRun, is_run_id};
+use owlshift_platform::files;
 
 use crate::executor::Git;
 use crate::executor::isolation::Concurrent;
@@ -145,7 +146,7 @@ pub struct Found {
 /// Every obligation of the project, by name; none when the folder is not
 /// there, or is the marker of an Owlshift before P6, which
 /// [`ProjectDirs::quarantine`] reads; one removed between the listing and
-/// its read is not there either. A name that is not UTF-8, an entry
+/// its read is not there either, nor one Windows lists while it is deleted. A name that is not UTF-8, an entry
 /// that is not a plain file, a record past 64 KiB or one that does not
 /// parse is kept with why: it cannot be read, and a lost record never
 /// widens what a check leaves out.
@@ -162,9 +163,16 @@ pub fn obligations(dirs: &ProjectDirs) -> io::Result<Vec<Found>> {
         let entry = entry?;
         let name = entry.file_name().to_string_lossy().into_owned();
         // One removed since the listing, its run's check passed, is gone
-        // (OWL-425), not unreadable.
+        // (OWL-425), not unreadable; so is one Windows still lists while a
+        // handle another process holds keeps it from going.
         let record = match read_capped(&entry.path()) {
             Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(error)
+                if error.kind() == io::ErrorKind::PermissionDenied
+                    && files::delete_pending(&folder, &entry.file_name()) =>
+            {
+                continue;
+            }
             read => read.map_err(|e| e.to_string()),
         }
         .and_then(|text| RunObligation::parse(&text).map_err(|e| e.to_string()));
