@@ -46,7 +46,7 @@ use owlshift_runner::slots::MachineSlots;
 use owlshift_runner::step::{self, Children};
 use owlshift_runner::system::System;
 use owlshift_runner::usage::UsageStore;
-use owlshift_runner::watch::{POLL_INTERVAL, Watch, drain_refusal};
+use owlshift_runner::watch::{POLL_INTERVAL, Watch, drain_refusal, presence};
 use owlshift_runner::{forge, secrets, tracker};
 
 use crate::fail;
@@ -59,11 +59,13 @@ const HEAD_WAIT: Duration = Duration::from_secs(2);
 /// where the ticket's ref left it, each on its ticket, or `owlshift watch`
 /// over the project's tickets whose questions wait, also draining the ready
 /// column with `--drain` (OWL-250); or a step of `--drain`'s, `owlshift
-/// continue` with the step's envelope (OWL-399).
+/// continue` with the step's envelope (OWL-399); or `owlshift continue
+/// --to-watch`, which leaves its ticket to watch (OWL-420).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Mode<'a> {
     Do(&'a str),
     Continue(&'a str),
+    ToWatch(&'a str),
     Watch,
     Drain,
     Step(&'a str, &'a str),
@@ -74,6 +76,7 @@ impl<'a> Mode<'a> {
         match self {
             Mode::Do(_) => "`owlshift do`",
             Mode::Continue(_) | Mode::Step(..) => "`owlshift continue`",
+            Mode::ToWatch(_) => "`owlshift continue --to-watch`",
             Mode::Watch => "`owlshift watch`",
             Mode::Drain => "`owlshift watch --drain`",
         }
@@ -82,7 +85,10 @@ impl<'a> Mode<'a> {
     /// The ticket a command names; `watch` names none.
     fn ticket(self) -> Option<&'a str> {
         match self {
-            Mode::Do(ticket) | Mode::Continue(ticket) | Mode::Step(ticket, _) => Some(ticket),
+            Mode::Do(ticket)
+            | Mode::Continue(ticket)
+            | Mode::ToWatch(ticket)
+            | Mode::Step(ticket, _) => Some(ticket),
             Mode::Watch | Mode::Drain => None,
         }
     }
@@ -385,6 +391,9 @@ fn run_with(
     let (ticket, outcome) = match (mode, &ticket) {
         (Mode::Do(_), Some(ticket)) => (ticket, on_demand.run(ticket, &mut sink)),
         (Mode::Continue(_), Some(ticket)) => (ticket, on_demand.continue_ticket(ticket, &mut sink)),
+        (Mode::ToWatch(_), Some(ticket)) => {
+            (ticket, on_demand.continue_to_watch(ticket, &mut sink))
+        }
         (Mode::Step(..), Some(ticket)) => {
             let envelope = envelope.ok_or("a step without its envelope")?;
             // Reported as `continue`'s, then the record written last, which
@@ -416,6 +425,25 @@ fn run_with(
                  decider's reply counts{draining}, checked every {} seconds. Ctrl-C stops.",
                 POLL_INTERVAL.as_secs()
             );
+            // Held while watch runs, which `continue --to-watch` reads
+            // (OWL-420).
+            let _presence = match presence::hold(&dirs) {
+                Ok(Some(held)) => Some(held),
+                Ok(None) => {
+                    let _ = writeln!(
+                        io::stderr(),
+                        "owlshift: warning: another command kept this watch's mark, so                          `owlshift continue --to-watch` will say no watch runs"
+                    );
+                    None
+                }
+                Err(error) => {
+                    let _ = writeln!(
+                        io::stderr(),
+                        "owlshift: warning: this watch's mark could not be kept ({error}), so                          `owlshift continue --to-watch` will say no watch runs"
+                    );
+                    None
+                }
+            };
             let watch = Watch {
                 on_demand: &on_demand,
                 interval: POLL_INTERVAL,
@@ -601,10 +629,14 @@ fn finish(
             let _ = writeln!(stdout, "\n{}", printable(&stop.to_string()));
             // A look at a followed pull request is no failure (OWL-209),
             // nor is a ticket back in the ready column (OWL-248), nor a
-            // stage step of watch's (OWL-367).
+            // stage step of watch's (OWL-367), nor a ticket left to watch
+            // (OWL-420).
             if matches!(
                 stop,
-                Stop::Watched { .. } | Stop::Ready { .. } | Stop::Stepped { .. }
+                Stop::Watched { .. }
+                    | Stop::Ready { .. }
+                    | Stop::Stepped { .. }
+                    | Stop::ToWatch { .. }
             ) {
                 ExitCode::SUCCESS
             } else {
@@ -682,6 +714,42 @@ mod tests {
         );
         let text = |bytes| String::from_utf8(bytes).unwrap();
         (code, text(stdout), text(stderr))
+    }
+
+    /// OWL-420: a ticket left to watch is no failure, a watch running or
+    /// not, and the line says when none drives it.
+    #[test]
+    fn a_ticket_left_to_watch_ends_in_success() {
+        for (watching, said) in [(Some(false), true), (Some(true), false)] {
+            let (mut stdout, mut stderr) = (Vec::new(), Vec::new());
+            let stop = Stop::ToWatch {
+                ticket: TicketId::new("OWL-1").unwrap(),
+                stage: owlshift_contracts::Stage::Build,
+                takes: owlshift_runner::on_demand::Takes::Resume,
+                restarted: true,
+                watching,
+            };
+            let code = finish(
+                &Sentinel(SentinelStatus::Running { pid: 1 }),
+                &Err(stop),
+                &mut stdout,
+                &mut stderr,
+            );
+            assert_eq!(code, ExitCode::SUCCESS);
+            let stdout = String::from_utf8(stdout).unwrap();
+            assert!(
+                stdout.starts_with(
+                    "\nOWL-1 is restarted at Build, and nothing runs now: `owlshift watch` \
+                     resumes it at its next pass"
+                ),
+                "{stdout}"
+            );
+            assert_eq!(
+                stdout.contains("nothing drives the ticket"),
+                said,
+                "{stdout}"
+            );
+        }
     }
 
     #[test]
@@ -809,6 +877,7 @@ mod refusals {
         for mode in [
             Mode::Do("OWL-1"),
             Mode::Continue("OWL-1"),
+            Mode::ToWatch("OWL-1"),
             Mode::Watch,
             Mode::Step("OWL-1", &step),
         ] {

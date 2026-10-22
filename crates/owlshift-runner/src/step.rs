@@ -297,7 +297,8 @@ pub fn end(stepped: &Stepped) -> StepEnd {
         | Stop::Parked { .. }
         | Stop::Ready { .. }
         | Stop::Delivery(_)
-        | Stop::Watched { .. } => StepEnd::Other,
+        | Stop::Watched { .. }
+        | Stop::ToWatch { .. } => StepEnd::Other,
     }
 }
 

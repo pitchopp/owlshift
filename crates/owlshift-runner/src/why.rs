@@ -106,6 +106,12 @@ fn waiting(event: &Event, ticket: &TicketId) -> Option<Waiting> {
         // The drain tells the cap once, for the first ticket it holds
         // (`tell_cap`), with the counts and no `waits`.
         "pr_cap".to_owned()
+    } else if event.data.get("to_watch").and_then(Value::as_bool) == Some(true)
+        && event.data.get("takes").and_then(Value::as_str) == Some("resume")
+    {
+        // A restart left to watch's resume (OWL-420): its word until watch
+        // tells a wait or the ticket runs.
+        "to_watch".to_owned()
     } else {
         return None;
     };
@@ -180,6 +186,9 @@ pub fn phrase(wait: &Waiting) -> String {
         "run_cap" => "every run slot of this machine is taken".to_owned(),
         "in_flight_unread" => "the work in flight outside Owlshift could not be read".to_owned(),
         "quarantine" => "the project is quarantined (`owlshift unquarantine`)".to_owned(),
+        "to_watch" => "restarted by `owlshift continue --to-watch`: `owlshift watch` resumes it \
+                       at its next pass"
+            .to_owned(),
         "usage_limit" => {
             let harness = data
                 .get("harness")
@@ -556,6 +565,55 @@ mod tests {
             phrase(wait),
             "OWL-2 holds zone `leases/`, which it would touch"
         );
+    }
+
+    /// OWL-420: a restart left to watch's resume is the ticket's word until
+    /// watch tells a wait, which replaces it, or the ticket runs; one whose
+    /// round waits says nothing, the stage telling it.
+    #[test]
+    fn a_restart_left_to_watch_is_named_until_watch_speaks() {
+        let id = TicketId::new("OWL-1").unwrap();
+        let restart = |ticket, takes| {
+            waits(
+                "2026-10-21T09:00:00Z",
+                ticket,
+                data([
+                    ("restarted", json!(true)),
+                    ("stage", json!("build")),
+                    ("to_watch", json!(true)),
+                    ("takes", json!(takes)),
+                ]),
+            )
+        };
+        let mut events = vec![restart("OWL-1", "resume"), restart("OWL-2", "answers")];
+        let folded = fold(&events, "o/r");
+        assert_eq!(folded.current.len(), 1);
+        assert_eq!(
+            phrase(&folded.current[&id]),
+            "restarted by `owlshift continue --to-watch`: `owlshift watch` resumes it at its \
+             next pass"
+        );
+        events.push(waits(
+            "2026-10-21T09:01:00Z",
+            "OWL-1",
+            data([
+                ("watch", json!("waits")),
+                ("reason", json!("slot")),
+                ("tickets", json!(["OWL-7"])),
+            ]),
+        ));
+        let folded = fold(&events, "o/r");
+        assert_eq!(
+            phrase(&folded.current[&id]),
+            "the project's slot is held by OWL-7"
+        );
+        events.push(event(
+            "2026-10-21T09:05:00Z",
+            Some("OWL-1"),
+            EventKind::RunStarted,
+            Data::new(),
+        ));
+        assert!(fold(&events, "o/r").current.is_empty());
     }
 
     #[test]

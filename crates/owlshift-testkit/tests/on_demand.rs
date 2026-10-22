@@ -11538,6 +11538,10 @@ mod isolation_scenarios;
 #[path = "on_demand/parallel_scenarios.rs"]
 mod parallel_scenarios;
 
+/// A restart left to watch (OWL-420).
+#[path = "on_demand/to_watch_scenarios.rs"]
+mod to_watch_scenarios;
+
 /// OWL-312's acceptance: `[roles.build] rules` reaches Build's brief after
 /// `stack.rules`, and not the resolver's; the `dispatch` event names every
 /// source; a named file the base commit lacks refuses the run.
