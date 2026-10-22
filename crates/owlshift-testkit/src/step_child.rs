@@ -163,7 +163,12 @@ impl ChildProject {
                 }
             })
             .collect();
-        fs::write(&file, format!("{}\n", moved.join("\n"))).unwrap();
+        // Replaced whole, as an editor saves, so a command reading the
+        // tickets meanwhile never finds it empty (OWL-425); the tracker
+        // skips a file in `tickets/`.
+        let partial = self.checkout.join("tickets").join(format!(".{id}.partial"));
+        fs::write(&partial, format!("{}\n", moved.join("\n"))).unwrap();
+        fs::rename(&partial, &file).unwrap();
     }
 
     /// Adds `line` to the `[policy]` of the project file the commands load,

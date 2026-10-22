@@ -545,3 +545,44 @@ fn only_this_module_writes_a_ticket_ref() {
     assert!(offending.is_empty(), "{offending:?}");
     assert!(files.len() > 20, "the sources were not found");
 }
+
+/// An obligation is never seen partly written (OWL-425): a step's child
+/// writes its own without the project's lock, while a watch pass that holds
+/// it lists the folder, and one read empty there quarantined the project.
+/// The writer writes and removes one obligation after another; the reader
+/// lists the folder meanwhile, and every record it finds reads.
+#[test]
+fn an_obligation_is_never_seen_partly_written() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    const WRITES: usize = 300;
+    let tmp = tempfile::tempdir().unwrap();
+    let dirs = ProjectDirs::new(tmp.path(), &Repo::parse("acme/app").unwrap());
+    let owl = ticket("OWL-1");
+    let done = AtomicBool::new(false);
+    let (mut seen, mut unread) = (0, Vec::new());
+    std::thread::scope(|scope| {
+        scope.spawn(|| {
+            for n in 0..WRITES {
+                let name = write_obligation(&dirs, Some(&owl), &format!("r{n}"), "a run").unwrap();
+                remove_obligation(&dirs, &name).unwrap();
+            }
+            done.store(true, Ordering::Release);
+        });
+        while !done.load(Ordering::Acquire) {
+            for found in obligations(&dirs).unwrap() {
+                match found.record {
+                    Ok(_) => seen += 1,
+                    Err(why) => unread.push(why),
+                }
+            }
+        }
+    });
+    assert!(
+        unread.is_empty(),
+        "{} of {} read: {unread:?}",
+        seen,
+        seen + unread.len()
+    );
+    assert!(seen > 0, "the reader saw no obligation");
+}

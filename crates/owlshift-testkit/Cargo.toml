@@ -25,3 +25,8 @@ serde.workspace = true
 serde_json.workspace = true
 tempfile.workspace = true
 toml.workspace = true
+
+# Reads whether a slot's holder runs in the tests, with no `ps` (OWL-110,
+# OWL-425).
+[target.'cfg(target_os = "macos")'.dev-dependencies]
+libc.workspace = true

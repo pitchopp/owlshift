@@ -5,7 +5,8 @@
 //!
 //! - **Obligations.** A run writes its own obligation, a [`RunObligation`]
 //!   in `unverified/<ticket>-<run>` of the project's folder, before it
-//!   starts, and removes only that one once its check passed. One whose
+//!   starts, linked in whole so no reader finds it half written (OWL-425),
+//!   and removes only that one once its check passed. One whose
 //!   ticket lock is free belongs to a run that ended without its check, a
 //!   crash or a stop: the first command or watch pass that finds it writes
 //!   the project's quarantine, naming it ([`look`]).
@@ -66,6 +67,17 @@ pub fn obligation_name(ticket: Option<&TicketId>, run: &str) -> String {
 /// described by `what`, before the run starts; returns its name, which
 /// [`remove_obligation`] takes. Never replaces one: a name taken is an
 /// error.
+///
+/// A step writes its obligation without the project's lock, while a watch
+/// pass holding it may list the folder at any moment, and an obligation
+/// that does not read quarantines the project (OWL-425). So it is written
+/// whole first, synced, as `unverified-<name>.partial` in the project's
+/// folder, which nothing lists, then linked into `unverified/`: a hard link
+/// fails on a name taken, where a rename would replace it. A partial left
+/// by a crash before its removal takes its name as a written obligation
+/// does; a run's id never comes again, and nothing else reads it. The
+/// project's folder needs hard links, which every file system the data
+/// directory is expected on has.
 pub fn write_obligation(
     dirs: &ProjectDirs,
     ticket: Option<&TicketId>,
@@ -85,13 +97,19 @@ pub fn write_obligation(
     let folder = dirs.obligations_dir();
     fs::create_dir_all(&folder)?;
     let name = obligation_name(ticket, run);
+    let partial = dirs.root().join(format!("unverified-{name}.partial"));
+    // Never opened over an existing file: one there may be linked in already.
     let mut file = OpenOptions::new()
         .write(true)
         .create_new(true)
-        .open(folder.join(&name))?;
-    file.write_all(record.render().as_bytes())?;
-    file.sync_all()?;
-    Ok(name)
+        .open(&partial)?;
+    let linked = file
+        .write_all(record.render().as_bytes())
+        .and_then(|()| file.sync_all())
+        .and_then(|()| fs::hard_link(&partial, folder.join(&name)));
+    drop(file);
+    let _ = fs::remove_file(&partial);
+    linked.map(|()| name)
 }
 
 /// `what`, cut to one line of at most the bytes an obligation keeps.
@@ -126,7 +144,8 @@ pub struct Found {
 
 /// Every obligation of the project, by name; none when the folder is not
 /// there, or is the marker of an Owlshift before P6, which
-/// [`ProjectDirs::quarantine`] reads. A name that is not UTF-8, an entry
+/// [`ProjectDirs::quarantine`] reads; one removed between the listing and
+/// its read is not there either. A name that is not UTF-8, an entry
 /// that is not a plain file, a record past 64 KiB or one that does not
 /// parse is kept with why: it cannot be read, and a lost record never
 /// widens what a check leaves out.
@@ -142,9 +161,13 @@ pub fn obligations(dirs: &ProjectDirs) -> io::Result<Vec<Found>> {
     for entry in fs::read_dir(&folder)? {
         let entry = entry?;
         let name = entry.file_name().to_string_lossy().into_owned();
-        let record = read_capped(&entry.path())
-            .map_err(|e| e.to_string())
-            .and_then(|text| RunObligation::parse(&text).map_err(|e| e.to_string()));
+        // One removed since the listing, its run's check passed, is gone
+        // (OWL-425), not unreadable.
+        let record = match read_capped(&entry.path()) {
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            read => read.map_err(|e| e.to_string()),
+        }
+        .and_then(|text| RunObligation::parse(&text).map_err(|e| e.to_string()));
         found.push(Found { name, record });
     }
     found.sort_by(|a, b| a.name.cmp(&b.name));
