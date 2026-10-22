@@ -12,7 +12,8 @@
 //!   ([`written_line`]), or when watch finds a quarantine no command
 //!   notified, as a crash, a Ctrl-C or `owlshift gate` leaves
 //!   ([`found_line`]);
-//! - each ticket it holds up, by one [`QuarantineWait`] comment;
+//! - each ticket it holds up, by one [`QuarantineWait`] comment, which watch
+//!   folds once the quarantine is cleared (OWL-423, `watch::waiting`);
 //! - `owlshift doctor`, through [`state`];
 //! - and [`clear`], `owlshift unquarantine`, lifts it once a person types the
 //!   project's name.
@@ -249,9 +250,15 @@ fn not_recorded(error: &io::Error) -> crate::events::Data {
 /// Tells `ticket`, which the quarantine holds up as `held` says, that it
 /// waits: one `decision` event (`watch` or `drain` = `waits`, `reason` =
 /// `quarantine`) and one WAITING comment, its `tracker_write` event, or a
-/// `warning` when it could not be posted. The caller tells each ticket once
-/// per marker.
-pub(crate) fn tell(tracker: &dyn Tracker, ticket: &TicketId, held: Held, sink: &mut EventSink<'_>) {
+/// `warning` when it could not be posted. Returns the comment's id when it
+/// was posted, for the caller to fold once the quarantine is cleared
+/// (OWL-423). The caller tells each ticket once per marker.
+pub(crate) fn tell(
+    tracker: &dyn Tracker,
+    ticket: &TicketId,
+    held: Held,
+    sink: &mut EventSink<'_>,
+) -> Option<String> {
     let by = match held {
         Held::Answer => "watch",
         Held::Ready => "drain",
@@ -266,10 +273,11 @@ pub(crate) fn tell(tracker: &dyn Tracker, ticket: &TicketId, held: Held, sink: &
         ticket: ticket.clone(),
         held,
     };
-    let (kind, written) = match Writer::new(tracker).post_quarantine_wait(&comment) {
+    let (kind, written, id) = match Writer::new(tracker).post_quarantine_wait(&comment) {
         Ok(posted) => (
             EventKind::TrackerWrite,
             on_demand::comment_written("WAITING", &posted),
+            Some(posted.id),
         ),
         Err(error) => (
             EventKind::Warning,
@@ -277,9 +285,11 @@ pub(crate) fn tell(tracker: &dyn Tracker, ticket: &TicketId, held: Held, sink: &
                 ("what", json!("quarantine_comment_not_posted")),
                 ("reason", json!(error.to_string())),
             ]),
+            None,
         ),
     };
     sink.emit(ticket, None, kind, written);
+    id
 }
 
 /// What a ticket held up by a quarantine waits to do.

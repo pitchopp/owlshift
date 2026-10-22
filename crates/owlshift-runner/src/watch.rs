@@ -96,7 +96,8 @@
 //! then runs nothing: it notifies a marker no command notified, prints the
 //! project's line once, and tells each waiting ticket whose answer counts,
 //! and the ticket the drain would dispatch, that it waits for the quarantine,
-//! once per ticket and marker ([`crate::quarantine`]).
+//! once per ticket and marker ([`crate::quarantine`]). Since OWL-423, the
+//! first snapshot that finds it cleared folds those comments.
 //!
 //! Nothing ends the loop but the operator: a ticket that cannot be read is a
 //! `warning` event, once until it reads again, and the pass goes on. A
@@ -521,6 +522,9 @@ struct Memory<'c> {
     /// The WAITING comments shown on the tickets whose next stage step
     /// waits (OWL-419).
     wait_comments: waiting::WaitComments,
+    /// The quarantine's WAITING comments, folded once it is cleared
+    /// (OWL-423).
+    quarantine_comments: waiting::QuarantineComments,
 }
 
 /// Why a ticket's next stage step waits, as told once.
@@ -683,7 +687,11 @@ impl Watch<'_> {
                 quarantine: Some(marker),
                 refs,
             }) => return self.quarantined(memory, sink, out, continued, marker, refs),
-            Ok(snapshot) => snapshot.refs,
+            Ok(snapshot) => {
+                // None stands: its WAITING comments are folded (OWL-423).
+                memory.quarantine_comments.fold_all(&mut self.board(sink));
+                snapshot.refs
+            }
             Err(project) => return self.note(memory, out, project),
         };
         // A harness's usage limit, told when it changed (OWL-404).
@@ -952,7 +960,11 @@ impl Watch<'_> {
         if known.told.contains(ticket) || on_demand::check_team(on_demand.config, ticket).is_err() {
             return;
         }
-        quarantine::tell(on_demand.tracker, ticket, held, sink);
+        if let Some(comment) = quarantine::tell(on_demand.tracker, ticket, held, sink) {
+            memory
+                .quarantine_comments
+                .posted(&mut self.board(sink), ticket, &comment);
+        }
         known.told.insert(ticket.clone());
         let told = Record {
             notified: false,

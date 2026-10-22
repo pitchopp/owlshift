@@ -235,6 +235,11 @@ impl Watch<'_> {
             return;
         };
         let quarantined = snapshot.quarantine.is_some();
+        // Cleared since watch's own snapshot: folded before any dispatch
+        // (OWL-423).
+        if !quarantined {
+            memory.quarantine_comments.fold_all(&mut self.board(sink));
+        }
         let read = snapshot.refs;
         let mut refs = HashMap::new();
         let mut unread = Vec::new();
