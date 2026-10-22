@@ -16,7 +16,8 @@ use crate::vocab::{AnswerClass, Stage};
 /// Failed runs in one stage that park the ticket: the second one does. A
 /// refused Build or answer-check result never brings the count there
 /// ([`Event::ResultRefused`]), and a gate refused for uncommitted changes
-/// before any command does not count ([`Event::UncommittedGate`]).
+/// before any command does not count ([`Event::UncommittedGate`]), nor does
+/// a gate or setup failure the base reproduces ([`Event::BaseBroken`]).
 pub const MAX_FAILED_RUNS: u32 = 2;
 
 /// Re-asks of one question round before the ticket parks: an answer still
@@ -149,6 +150,7 @@ impl Status {
 /// | A run returned `failed` or no valid `result.json`, whatever its exit code, save the row below; a Build `done` whose project gate, run by the runner, failed | `RunFailed` |
 /// | A Build run's (at Build, or a fix run's at Watch) or an answer check's `result.json` was refused, and the run had not been told of a refused result: the next run of its kind will be | `ResultRefused` |
 /// | A Build run's (at Build, or a fix run's at Watch) gate was refused for uncommitted changes before any command ran, and the run had not been told of such a refusal: the next run will be | `UncommittedGate` |
+/// | A Build run's at Build (a Verify fix run included) gate or setup failed on a command that the commit it was configured at fails too, or that commit's check is due; or a Build run at Build was held before it started for such a commit (OWL-418, [`crate::base`]) | `BaseBroken` |
 /// | A run was cut off by a harness usage limit; it resumes after the reset | `Interrupted` |
 /// | A run broke isolation (main checkout touched, diff outside the worktree, wrong branch) | `Quarantined` |
 /// | A run is due while the ticket's runs since its last restart cost its budget or more (`policy.ticket_budget_usd`, OWL-378): none starts | `BudgetReached` |
@@ -249,6 +251,12 @@ pub enum Event {
     /// was not itself told of such a refusal, so that of two in a row, the
     /// second is a `RunFailed`.
     UncommittedGate,
+    /// A Build run's gate or setup failure that the base reproduces, or a
+    /// Build held before it started because its base does (OWL-418): the
+    /// ticket stays as it is, its counts kept, and its Build waits for that
+    /// base to pass. Only a Build at Build is held, so it is valid only
+    /// there: a fix run at Watch takes the failed-run path.
+    BaseBroken,
     Interrupted,
     Quarantined,
     /// A run was due, but what the ticket's runs cost since its last
@@ -305,7 +313,7 @@ pub enum Event {
 
 impl Event {
     /// Every event.
-    pub const ALL: [Self; 31] = [
+    pub const ALL: [Self; 32] = [
         Self::Dispatched,
         Self::Completed,
         Self::LoopBack,
@@ -323,6 +331,7 @@ impl Event {
         Self::RunFailed,
         Self::ResultRefused,
         Self::UncommittedGate,
+        Self::BaseBroken,
         Self::Interrupted,
         Self::Quarantined,
         Self::BudgetReached,
@@ -832,6 +841,8 @@ impl TicketState {
             (Status::Active(Stage::Build | Stage::Watch), Event::UncommittedGate) => {
                 Transition::To(*self)
             }
+            // A base that breaks the gate is the project's, not the ticket's.
+            (Status::Active(Stage::Build), Event::BaseBroken) => Transition::To(*self),
             (status, Event::Quarantined) if status.runs() => {
                 self.park(ParkReason::IsolationBreach, self.failed_runs)
             }
@@ -1181,6 +1192,7 @@ mod tests {
             (Status::Active(Build | Watch), Event::ResultRefused | Event::UncommittedGate) => {
                 Expect::To(status)
             }
+            (Status::Active(Build), Event::BaseBroken) => Expect::To(status),
             // With every count at zero, nothing is at a bound.
             (
                 Status::Active(Watch),
@@ -1475,6 +1487,29 @@ mod tests {
             0,
         );
         assert!(waiting.apply(STANDARD, Event::UncommittedGate).is_err());
+    }
+
+    /// OWL-418: a broken base never counts, at any count, and holds a
+    /// Build at Build alone.
+    #[test]
+    fn a_broken_base_never_counts() {
+        for failed_runs in 0..MAX_FAILED_RUNS {
+            let build = state(Status::Active(Stage::Build), 1, 0, failed_runs);
+            assert_eq!(to(build.apply(STANDARD, Event::BaseBroken)), build);
+        }
+        for status in [
+            Status::Active(Stage::Watch),
+            Status::Active(Stage::Verify),
+            Status::NeedsInput {
+                return_to: Stage::Build,
+            },
+        ] {
+            let other = state(status, 1, 0, 0);
+            assert!(
+                other.apply(STANDARD, Event::BaseBroken).is_err(),
+                "{status:?}"
+            );
+        }
     }
 
     #[test]

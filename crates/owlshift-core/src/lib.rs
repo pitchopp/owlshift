@@ -24,8 +24,10 @@
 //! | Who reviews, per variant, and on which model | [`roster`] |
 //! | Per-ticket routing: harness, tier and effort of each run | [`routing`] |
 //! | A harness's usage limits: windows, episodes, the probe, the effective harness | [`usage`] |
+//! | A broken base: whose a gate failure is, the base checks and holds | [`base`] |
 
 pub mod agent_env;
+pub mod base;
 pub mod collision;
 pub mod decider;
 pub mod dependency;
