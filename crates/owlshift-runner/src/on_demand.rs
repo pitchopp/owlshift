@@ -8449,6 +8449,7 @@ mod tests {
             log_error: None,
             gate: None,
             setup: None,
+            gated: None,
             warnings: Vec::new(),
             resumed: None,
             session: None,

@@ -332,6 +332,10 @@ pub struct RunReport {
     /// The project's setup before a Build's harness, when the executor ran
     /// it (OWL-330): its steps in `setup`, no gate command.
     pub setup: Option<GateReport>,
+    /// The result a red gate replaced with [`Failure::Gate`]: what the role
+    /// reported `done` with, kept for its gate to run again alone once the
+    /// failure is found to be its base's (OWL-418, [`Executor::regate`]).
+    pub gated: Option<Box<RunResult>>,
     /// What the run's harness home left to say: a changed login that was
     /// not written back, or a result that could not be written from the
     /// last message; and a read-only run's result read from its last
@@ -686,6 +690,7 @@ impl Executor {
                     log_error: log.error,
                     gate: None,
                     setup: Some(ran.report),
+                    gated: None,
                     warnings,
                     resumed: None,
                     session: None,
@@ -926,9 +931,10 @@ impl Executor {
             _ => None,
         };
         let mut gate = None;
+        let mut gated = None;
         if matches!(brief.role, Role::Build | Role::Rebase) && is_done(&outcome) {
             let report = self.project_gate(
-                &before,
+                before,
                 spec.worktree,
                 paths,
                 (spec.setup, &brief.gate),
@@ -937,6 +943,11 @@ impl Executor {
             if let Some(after_gate) =
                 after_check(&report, check, |failure| Some(Failure::Gate(failure)))
             {
+                if let (Outcome::Finished { result, .. }, Outcome::Failed(_)) =
+                    (&outcome, &after_gate)
+                {
+                    gated = Some(result.clone());
+                }
                 outcome = after_gate;
             }
             gate = Some(report);
@@ -958,9 +969,90 @@ impl Executor {
             log_error: log.error,
             gate,
             setup,
+            gated,
             warnings,
             resumed,
             session,
+        })
+    }
+
+    /// Runs a done Build's gate again, alone, on its kept worktree
+    /// (OWL-418): `kept` is the result the Build reported when its gate
+    /// failed for its base, which the gate now judges. As [`Executor::run`]
+    /// prepares a Build: confinement ready, the worktree checked as kept,
+    /// the run's paths and temporary folder, its brief copied to the run
+    /// directory, the credential check and the snapshot among siblings; then
+    /// the project's setup and gate commands, and the isolation check after
+    /// them. No harness runs, so no usage, model or session is reported; the
+    /// outcome is `kept` when the gate passes, [`Failure::Gate`] when it
+    /// fails, `kept` then in [`RunReport::gated`], and a quarantine when
+    /// isolation broke.
+    pub fn regate(&self, spec: &RunSpec<'_>, kept: &RunResult) -> Result<RunReport, ExecutorError> {
+        let started = Instant::now();
+        let wall_started = SystemTime::now();
+        self.agent
+            .sandbox_ready()
+            .map_err(|e| ExecutorError::Spawn(io::Error::other(e)))?;
+        worktree::prepare(&self.git, spec)?;
+        let mut paths = self.run_paths(spec.worktree, spec.run_dir)?;
+        let temp = run_temp()?;
+        paths.temp = Some(temp.path().to_owned());
+        let run_dir = |source| ExecutorError::RunDir {
+            path: spec.run_dir.to_owned(),
+            source,
+        };
+        fs::create_dir_all(spec.run_dir).map_err(run_dir)?;
+        fs::write(spec.run_dir.join("brief.json"), spec.brief.render()).map_err(run_dir)?;
+        let mut log = RunLog::create(spec.run_dir)?;
+        let hosts: Vec<&str> = self.forge_hosts.iter().map(String::as_str).collect();
+        let findings = self.agent.check(spec.worktree, &hosts);
+        if !findings.is_empty() {
+            return Err(ExecutorError::Credentials(findings));
+        }
+        let guarded = self.guarded(spec, None)?;
+        let report = self.project_gate(
+            &guarded.before,
+            spec.worktree,
+            paths,
+            (spec.setup, &spec.brief.gate),
+            spec.run_dir,
+        );
+        let mut gated = None;
+        let outcome = match after_check(
+            &report,
+            || guarded.check(&self.git, spec),
+            |failure| Some(Failure::Gate(failure)),
+        ) {
+            Some(outcome) => {
+                if matches!(outcome, Outcome::Failed(_)) {
+                    gated = Some(Box::new(kept.clone()));
+                }
+                outcome
+            }
+            None => Outcome::Finished {
+                result: Box::new(kept.clone()),
+                artifacts: ArtifactContents::default(),
+            },
+        };
+        log.finish();
+        Ok(RunReport {
+            outcome,
+            exit_code: None,
+            usage: None,
+            model: None,
+            harness_version: None,
+            elapsed: started.elapsed(),
+            wall_elapsed: wall_span(wall_started, SystemTime::now()),
+            stdout_log: log.stdout_path,
+            stderr_log: log.stderr_path,
+            log_error: log.error,
+            gate: Some(report),
+            setup: None,
+            gated,
+            warnings: Vec::new(),
+            resumed: None,
+            session: None,
+            windows: Vec::new(),
         })
     }
 }
