@@ -2002,11 +2002,21 @@ impl OnDemand<'_> {
         {
             return Err(look);
         }
+        // A ticket that goes on to a dispatch is refused on an empty gate
+        // before a park is restarted, a loop built again or an answer check
+        // run (OWL-332): `dispatch` would refuse it after them.
+        if matches!(
+            state.stage(),
+            Stage::Design | Stage::DesignReview | Stage::Build | Stage::Verify
+        ) {
+            self.refuse_empty_gate(&p, Command::Continue)?;
+        }
         // At Verify, parked or cut short, the pass runs again on the Build
         // the ref keeps (OWL-304): refused, before a park is restarted or
         // anything kept, when that Build is no longer what would be pushed.
-        // A review loop's Build runs again instead (OWL-307): `do` is
-        // refused while its pull request is followed.
+        // A review loop's Build runs again instead (OWL-307), a park there
+        // restarted as below (OWL-424): `do` is refused while its pull
+        // request is followed.
         if state.stage() == Stage::Verify
             && let Err(why) = self.verify_resumable(&p)
         {
@@ -2019,15 +2029,6 @@ impl OnDemand<'_> {
                 return Err(to_watch::rebuild_refused(ticket, &why));
             }
             state = self.rebuild_loop(&mut p, state, why, sink)?;
-        }
-        // A ticket that goes on to a dispatch is refused on an empty gate
-        // before a park is restarted or an answer check runs (OWL-332):
-        // `dispatch` would refuse it after them.
-        if matches!(
-            state.stage(),
-            Stage::Design | Stage::DesignReview | Stage::Build | Stage::Verify
-        ) {
-            self.refuse_empty_gate(&p, Command::Continue)?;
         }
         // `--to-watch` stops here, the park restarted, and runs nothing
         // (OWL-420).

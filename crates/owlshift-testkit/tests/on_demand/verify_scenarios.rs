@@ -52,7 +52,7 @@ pub(super) fn fixed_build(given: &[(&str, &str)]) -> String {
     result.to_string()
 }
 
-const FAILED_REVIEW: &str =
+pub(super) const FAILED_REVIEW: &str =
     r#"{"format":14,"status":"failed","summary":"Could not read the diff."}"#;
 
 impl Bench {
