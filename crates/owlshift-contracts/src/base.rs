@@ -14,6 +14,7 @@ use serde::{Deserialize, Serialize};
 use owlshift_core::base::{Check, Checks, Entry, Failing, Failure, Hold, Step, Verdict};
 
 use crate::format::{self, BASE_FORMAT, BASE_WAIT_FORMAT, ContractError, Format};
+use crate::ids::TicketId;
 use crate::result::{Decision, Followup, RunResult};
 
 /// A project's checks of its bases.
@@ -245,6 +246,9 @@ impl From<KeptStep> for Step {
 #[schemars(title = "Owlshift base wait")]
 pub struct BaseWait {
     pub format: Format<BASE_WAIT_FORMAT>,
+    /// The ticket whose failure it is: a watch started again finds the
+    /// ticket of a pending check by it.
+    pub ticket: TicketId,
     pub configured_at: String,
     pub commands: String,
     pub round: u32,

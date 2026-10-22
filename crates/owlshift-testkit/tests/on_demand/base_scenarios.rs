@@ -332,6 +332,71 @@ fn watch_reruns_a_held_gate_once_the_base_passes_with_no_continue() {
     assert_eq!(bench.fold.borrow().resolved.len(), 1, "{lines}");
 }
 
+/// A watch started again while a check waits in `base.json` gives it its
+/// priority back: the retry hold its predecessor's step left, adopted from
+/// that step's record, is lifted, and the check runs in the first pass with
+/// no clock moving.
+#[test]
+fn a_watch_started_again_gives_a_waiting_check_its_priority() {
+    use owlshift_contracts::format::Format;
+    use owlshift_contracts::step::{KeptFollowing, RefAfter, StepEnd, StepHold, StepOutcome};
+    use owlshift_runner::step;
+    use owlshift_runner::ticket_ref;
+
+    let bench = Bench::new(true);
+    let marker = bench.tmp.path().join("store-has-rollup");
+    let base = with_setup(&bench, &setup_line(&marker), None);
+    let two = TicketId::new("DEMO-2").unwrap();
+    let sibling = bench.dirs().ticket_lock(&two).unwrap().unwrap();
+    let (pending, printed) = bench.run(Vec::new(), None);
+    assert!(
+        matches!(pending, Err(Stop::BaseHeld { pending: true, .. })),
+        "{pending:?}\n{printed}"
+    );
+    drop(sibling);
+    // What the step of the watch before left: held for the retry delay.
+    let env = bench.env.clone();
+    let git = Git::with_setup("git", move |command| env.apply(command));
+    let stored = ticket_ref::read(&git, &bench.dirs().checkout(), &ticket())
+        .unwrap()
+        .unwrap();
+    let now = bench.clock.get();
+    let record = StepOutcome {
+        format: Format,
+        ticket: ticket(),
+        attempt: "1-1-1".to_owned(),
+        commit: Some(stored.commit.clone()),
+        progress: stored.progress().as_str().to_owned(),
+        answer: None,
+        end: StepEnd::BaseHeld {
+            commit: base,
+            command: Some(setup_line(&marker)),
+            pending: true,
+        },
+        after: RefAfter::Present {
+            commit: stored.commit.clone(),
+            progress: stored.progress().as_str().to_owned(),
+        },
+        hold: Some(StepHold::Held {
+            // Past the bench's commands' clock, which reads ten minutes on.
+            until: Some(now + SignedDuration::from_mins(60)),
+        }),
+        kept: KeptFollowing::default(),
+        at: now,
+    };
+    step::write_outcome(&bench.dirs(), &record).unwrap();
+
+    let (outcomes, lines, printed) = bench.watch(Vec::new(), &mut |_| false);
+    assert!(
+        matches!(
+            outcomes.as_slice(),
+            [Err(Stop::BaseHeld { pending: false, .. })]
+        ),
+        "{outcomes:?}\n{lines}\n{printed}"
+    );
+    assert_eq!(checked(&bench), ["opened"]);
+}
+
 /// The busy path under watch: a check that must wait, DEMO-2's step in
 /// flight, is tried again at the next pass once nothing else runs, not
 /// after the retry delay: no clock moves between the two passes.

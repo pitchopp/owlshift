@@ -37,11 +37,16 @@
       "type": "integer",
       "format": "uint32",
       "minimum": 0
+    },
+    "ticket": {
+      "description": "The ticket whose failure it is: a watch started again finds the\nticket of a pending check by it.",
+      "$ref": "#/$defs/TicketId"
     }
   },
   "additionalProperties": false,
   "required": [
     "format",
+    "ticket",
     "configured_at",
     "commands",
     "round",

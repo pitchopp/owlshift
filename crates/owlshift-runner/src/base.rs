@@ -17,7 +17,7 @@ use sha2::{Digest, Sha256};
 
 use owlshift_contracts::base::{BaseWait, ProjectBase};
 use owlshift_contracts::ids::TicketId;
-use owlshift_core::base::{Checks, Failing, Failure, Recorded, Step, Verdict};
+use owlshift_core::base::{Checks, Entry, Failing, Failure, Recorded, Step, Verdict};
 
 use crate::events::{Data, data};
 use crate::executor::gate::{GateReport, SETUP_PREFIX, refused_uncommitted};
@@ -216,6 +216,42 @@ pub fn write_wait(dirs: &ProjectDirs, ticket: &TicketId, wait: &BaseWait) -> io:
     write_atomically(&wait_file(dirs, ticket), &wait.render())
 }
 
+/// Every ticket's wait file that reads, in the folders' order.
+pub fn waits(dirs: &ProjectDirs) -> Vec<BaseWait> {
+    let Ok(listing) = fs::read_dir(dirs.tickets()) else {
+        return Vec::new();
+    };
+    let mut folders: Vec<PathBuf> = listing.flatten().map(|entry| entry.path()).collect();
+    folders.sort();
+    folders
+        .into_iter()
+        .filter_map(|folder| fs::read_to_string(folder.join(WAIT_FILE)).ok())
+        .filter_map(|text| BaseWait::parse(&text).ok())
+        .collect()
+}
+
+/// The ticket whose failure waits for a pending check of `checks`, its
+/// wait matching the entry's commit and commands, the first of `waits` that
+/// `skip` leaves: the ticket a watch gives the check's priority to, one
+/// started again included (OWL-418).
+pub fn pending_ticket(
+    checks: &Checks,
+    waits: &[BaseWait],
+    skip: impl Fn(&TicketId) -> bool,
+) -> Option<TicketId> {
+    waits
+        .iter()
+        .filter(|wait| !skip(&wait.ticket))
+        .find(|wait| {
+            checks.standing().any(|check| {
+                matches!(check.entry, Entry::Pending { .. })
+                    && check.commit == wait.configured_at
+                    && check.commands == wait.commands
+            })
+        })
+        .map(|wait| wait.ticket.clone())
+}
+
 /// Removes the ticket's wait file, if any.
 pub fn remove_wait(dirs: &ProjectDirs, ticket: &TicketId) -> io::Result<()> {
     match fs::remove_file(wait_file(dirs, ticket)) {
@@ -323,5 +359,46 @@ mod tests {
         );
         remove_wait(&dirs, &ticket).unwrap();
         assert!(!wait_file(&dirs, &ticket).exists());
+    }
+
+    /// The ticket a pending check's priority goes to: one whose wait matches
+    /// the entry, and not one skipped; none for a check that ran.
+    #[test]
+    fn a_pending_check_is_matched_to_its_waiting_ticket() {
+        use owlshift_contracts::base::KeptFailing;
+        use owlshift_contracts::format::Format;
+        let failing = Failing {
+            step: Step::Setup,
+            command: "sh setup.sh".to_owned(),
+        };
+        let wait = |ticket: &str, commit: &str| BaseWait {
+            format: Format,
+            ticket: TicketId::new(ticket).unwrap(),
+            configured_at: commit.to_owned(),
+            commands: "k".to_owned(),
+            round: 0,
+            head: "h".repeat(40),
+            failing: KeptFailing::from(&failing),
+            done: None,
+        };
+        let waits = [
+            wait("OWL-1", "other"),
+            wait("OWL-2", "base"),
+            wait("OWL-3", "base"),
+        ];
+        let mut checks = Checks::default();
+        assert_eq!(pending_ticket(&checks, &waits, |_| false), None);
+        checks.mark_pending("base", "k", &failing, 1);
+        let two = TicketId::new("OWL-2").unwrap();
+        assert_eq!(
+            pending_ticket(&checks, &waits, |_| false),
+            Some(two.clone())
+        );
+        assert_eq!(
+            pending_ticket(&checks, &waits, |ticket| *ticket == two),
+            Some(TicketId::new("OWL-3").unwrap())
+        );
+        checks.record_check(("base", "k", "h"), 2, Verdict::Passed, None);
+        assert_eq!(pending_ticket(&checks, &waits, |_| false), None);
     }
 }

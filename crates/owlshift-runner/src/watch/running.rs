@@ -190,6 +190,7 @@ impl Watch<'_> {
         });
         if expired || !at_build {
             memory.base_due = None;
+            memory.base_due_given_up.insert(due);
             return false;
         }
         due != *ticket || !memory.running.is_empty()
@@ -208,6 +209,9 @@ impl Watch<'_> {
         // A check due that could not run beside other steps holds them back
         // until this ticket's next step has run (OWL-418).
         let ran = !matches!(end, StepEnd::Busy | StepEnd::NoSlot | StepEnd::Stale);
+        if ran {
+            memory.base_due_given_up.remove(ticket);
+        }
         if ran
             && memory
                 .base_due

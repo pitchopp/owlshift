@@ -543,6 +543,10 @@ struct Memory<'c> {
     base_due: Option<(TicketId, Timestamp)>,
     /// How many steps of a ticket whose check was due have ended.
     base_due_ran: u64,
+    /// The tickets whose check's priority was given up, their step unable
+    /// to start or past [`BASE_DUE_AT_MOST`]: not given it again from
+    /// `base.json` until a step of theirs has run.
+    base_due_given_up: BTreeSet<TicketId>,
 }
 
 /// Why a ticket's next stage step waits, as told once.
@@ -670,6 +674,11 @@ impl Watch<'_> {
         self.adopt_leftovers(&mut memory, sink);
         loop {
             memory.stepped = false;
+            // A check left pending in `base.json`, by a watch before this one
+            // or by a person's command, gets its priority too (OWL-418).
+            if memory.base_due.is_none() {
+                memory.base_due = self.pending_due(&memory);
+            }
             // A check due whose ticket's step did not start in a pass with
             // nothing else in flight, held back for another reason, gives
             // up its priority, so it never holds the project (OWL-418).
@@ -687,6 +696,7 @@ impl Watch<'_> {
                 && !memory.running.iter().any(|step| *step.ticket() == ticket)
             {
                 memory.base_due = None;
+                memory.base_due_given_up.insert(ticket);
             }
             // The interval is only between idle passes (OWL-367): after a
             // step, the next stage step is due at once. While steps'
@@ -2417,6 +2427,24 @@ impl Watch<'_> {
         self.show_wait(memory, sink, ticket, "base_broken", event);
         self.line(out, &format!("{ticket} waits: {phrase}"));
         memory.waits.insert(ticket.clone(), told);
+    }
+
+    /// The ticket a check pending in `base.json` gives its priority to, from
+    /// now, when one waits and its priority was not given up (OWL-418).
+    fn pending_due(&self, memory: &Memory) -> Option<(TicketId, Timestamp)> {
+        let dirs = self.on_demand.dirs;
+        let checks = base::read(dirs).ok()?;
+        // The tickets' folders are read only while a check is pending.
+        if !checks
+            .standing()
+            .any(|check| matches!(check.entry, owlshift_core::base::Entry::Pending { .. }))
+        {
+            return None;
+        }
+        let ticket = base::pending_ticket(&checks, &base::waits(dirs), |ticket| {
+            memory.base_due_given_up.contains(ticket)
+        })?;
+        Some((ticket, (self.on_demand.clock)()))
     }
 
     /// Whether `ticket`'s hold is to be lifted for its base (OWL-418): the

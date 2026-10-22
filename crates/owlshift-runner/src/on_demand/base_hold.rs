@@ -109,6 +109,7 @@ impl OnDemand<'_> {
             Some(head) => {
                 let wait = BaseWait {
                     format: Format,
+                    ticket: p.ticket.clone(),
                     configured_at: dispatched.configured_at.commit.clone(),
                     commands: commands_key(dispatched),
                     round: state.round(),
