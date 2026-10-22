@@ -573,7 +573,17 @@ fn an_obligation_is_never_seen_partly_written() {
             for found in obligations(&dirs).unwrap() {
                 match found.record {
                     Ok(_) => seen += 1,
-                    Err(why) => unread.push(why),
+                    // What the file system says of it just after, so a
+                    // failure on a system the bench cannot run tells why.
+                    Err(why) => unread.push(format!(
+                        "{}: {why}; delete pending now: {}, gone now: {}",
+                        found.name,
+                        owlshift_platform::files::delete_pending(
+                            &dirs.obligations_dir(),
+                            found.name.as_ref()
+                        ),
+                        !dirs.obligations_dir().join(&found.name).exists(),
+                    )),
                 }
             }
         }

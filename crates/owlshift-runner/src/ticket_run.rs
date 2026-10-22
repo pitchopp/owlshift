@@ -73,8 +73,9 @@ pub fn obligation_name(ticket: Option<&TicketId>, run: &str) -> String {
 /// pass holding it may list the folder at any moment, and an obligation
 /// that does not read quarantines the project (OWL-425). So it is written
 /// whole first, synced, as `unverified-<name>.partial` in the project's
-/// folder, which nothing lists, then linked into `unverified/`: a hard link
-/// fails on a name taken, where a rename would replace it. A partial left
+/// folder, which nothing lists, then published into `unverified/`
+/// ([`files::publish`]), which fails on a name taken, where a rename would
+/// replace it. A partial left
 /// by a crash before its removal takes its name as a written obligation
 /// does; a run's id never comes again, and nothing else reads it. The
 /// project's folder needs hard links, which every file system the data
@@ -104,13 +105,38 @@ pub fn write_obligation(
         .write(true)
         .create_new(true)
         .open(&partial)?;
-    let linked = file
+    let written = file
         .write_all(record.render().as_bytes())
-        .and_then(|()| file.sync_all())
-        .and_then(|()| fs::hard_link(&partial, folder.join(&name)));
+        .and_then(|()| file.sync_all());
     drop(file);
-    let _ = fs::remove_file(&partial);
-    linked.map(|()| name)
+    let published = written.and_then(|()| publish(&partial, &folder.join(&name)));
+    if published.is_err() {
+        let _ = fs::remove_file(&partial);
+    }
+    published.map(|()| name)
+}
+
+/// [`files::publish`], tried again for up to half a second on Windows while
+/// it is refused, another process holding the new file open for a moment,
+/// as [`rename_over`] is.
+fn publish(from: &Path, to: &Path) -> io::Result<()> {
+    let mut tries = 0;
+    loop {
+        match files::publish(from, to) {
+            // Access denied, or a sharing violation (`ERROR_SHARING_VIOLATION`),
+            // which the standard library gives no kind of its own.
+            Err(error)
+                if cfg!(windows)
+                    && (error.kind() == io::ErrorKind::PermissionDenied
+                        || error.raw_os_error() == Some(32))
+                    && tries < 50 =>
+            {
+                tries += 1;
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            done => return done,
+        }
+    }
 }
 
 /// `what`, cut to one line of at most the bytes an obligation keeps.
@@ -163,13 +189,15 @@ pub fn obligations(dirs: &ProjectDirs) -> io::Result<Vec<Found>> {
         let entry = entry?;
         let name = entry.file_name().to_string_lossy().into_owned();
         // One removed since the listing, its run's check passed, is gone
-        // (OWL-425), not unreadable; so is one Windows still lists while a
-        // handle another process holds keeps it from going.
+        // (OWL-425), not unreadable; so is one Windows refused because it
+        // was being deleted, a handle another process holds keeping it
+        // listed: it still is, or it is gone by the time it is asked.
         let record = match read_capped(&entry.path()) {
             Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
             Err(error)
                 if error.kind() == io::ErrorKind::PermissionDenied
-                    && files::delete_pending(&folder, &entry.file_name()) =>
+                    && (files::delete_pending(&folder, &entry.file_name())
+                        || gone(&entry.path())) =>
             {
                 continue;
             }
@@ -180,6 +208,11 @@ pub fn obligations(dirs: &ProjectDirs) -> io::Result<Vec<Found>> {
     }
     found.sort_by(|a, b| a.name.cmp(&b.name));
     Ok(found)
+}
+
+/// Whether nothing is at `path` any more.
+fn gone(path: &Path) -> bool {
+    fs::symlink_metadata(path).is_err_and(|error| error.kind() == io::ErrorKind::NotFound)
 }
 
 /// A plain file of at most [`RECORD_CAP`] bytes of UTF-8, read without

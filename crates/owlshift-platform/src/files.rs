@@ -1,7 +1,17 @@
-//! What a folder's entry is, beyond what the standard library tells.
+//! A folder's entries, beyond what the standard library does.
 
 use std::ffi::OsStr;
+use std::io;
 use std::path::Path;
+
+/// Gives the file at `from` the name `to`, failing when `to` is taken
+/// (OWL-425): a file written whole under `from` appears whole under `to`.
+/// A hard link then the removal of `from` on Unix; on Windows a move that
+/// replaces nothing, since removing one name of a linked file there may
+/// make every open of the file fail until it is done.
+pub fn publish(from: &Path, to: &Path) -> io::Result<()> {
+    sys::publish(from, to)
+}
 
 /// Whether the entry `name` of the folder `dir` is being deleted (OWL-425).
 /// On Windows, a file removed while another process still holds it open
@@ -17,6 +27,14 @@ pub fn delete_pending(dir: &Path, name: &OsStr) -> bool {
 mod sys {
     use std::ffi::OsStr;
     use std::path::Path;
+    use std::{fs, io};
+
+    pub(super) fn publish(from: &Path, to: &Path) -> io::Result<()> {
+        fs::hard_link(from, to)?;
+        // Published already: a name left behind is the caller's partial.
+        let _ = fs::remove_file(from);
+        Ok(())
+    }
 
     pub(super) fn delete_pending(_dir: &Path, _name: &OsStr) -> bool {
         false
@@ -27,6 +45,7 @@ mod sys {
 mod sys {
     use std::ffi::OsStr;
     use std::fs::OpenOptions;
+    use std::io;
     use std::os::windows::ffi::OsStrExt;
     use std::os::windows::fs::OpenOptionsExt;
     use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
@@ -42,11 +61,23 @@ mod sys {
     };
     use windows_sys::Win32::Storage::FileSystem::{
         FILE_FLAG_BACKUP_SEMANTICS, FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ,
-        FILE_SHARE_WRITE, SYNCHRONIZE,
+        FILE_SHARE_WRITE, MOVEFILE_WRITE_THROUGH, MoveFileExW, SYNCHRONIZE,
     };
     use windows_sys::Win32::System::IO::IO_STATUS_BLOCK;
 
     const SHARE_ALL: u32 = FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE;
+
+    pub(super) fn publish(from: &Path, to: &Path) -> io::Result<()> {
+        let wide =
+            |path: &Path| -> Vec<u16> { path.as_os_str().encode_wide().chain(Some(0)).collect() };
+        let (from, to) = (wide(from), wide(to));
+        // SAFETY: both are live, NUL-terminated wide strings for the whole
+        // call; without `MOVEFILE_REPLACE_EXISTING` a taken `to` fails.
+        if unsafe { MoveFileExW(from.as_ptr(), to.as_ptr(), MOVEFILE_WRITE_THROUGH) } == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
 
     pub(super) fn delete_pending(dir: &Path, name: &OsStr) -> bool {
         let Ok(parent) = OpenOptions::new()
@@ -110,6 +141,23 @@ mod tests {
     use std::fs;
 
     use super::delete_pending;
+
+    /// A published file has its new name only, and a taken name is refused,
+    /// the file left where it was.
+    #[test]
+    fn publish_takes_a_free_name_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let (from, to) = (dir.path().join("from"), dir.path().join("to"));
+        fs::write(&from, "one").unwrap();
+        super::publish(&from, &to).unwrap();
+        assert!(!from.exists());
+        assert_eq!(fs::read_to_string(&to).unwrap(), "one");
+        fs::write(&from, "two").unwrap();
+        let taken = super::publish(&from, &to).unwrap_err();
+        assert_eq!(taken.kind(), std::io::ErrorKind::AlreadyExists, "{taken}");
+        assert_eq!(fs::read_to_string(&to).unwrap(), "one");
+        assert_eq!(fs::read_to_string(&from).unwrap(), "two");
+    }
 
     /// A file that is there, and one that is gone, are not being deleted.
     #[test]
