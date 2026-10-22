@@ -92,7 +92,7 @@ const LISTED_PATHS: usize = 10;
 pub const SETUP_SHARE: u32 = 3;
 
 /// The start of the reason of a gate refused for uncommitted changes, before
-/// any command ran ([`refused_uncommitted`]).
+/// any command ran (`refused_uncommitted`).
 pub const UNCOMMITTED_PREFIX: &str = "uncommitted changes before the gate";
 
 /// The file of the run directory a Build's setup before its harness logs
