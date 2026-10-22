@@ -541,6 +541,8 @@ struct Memory<'c> {
     /// flight end and that ticket's step has run, for at most
     /// [`BASE_DUE_AT_MOST`].
     base_due: Option<(TicketId, Timestamp)>,
+    /// How many steps of a ticket whose check was due have ended.
+    base_due_ran: u64,
 }
 
 /// Why a ticket's next stage step waits, as told once.
@@ -668,9 +670,23 @@ impl Watch<'_> {
         self.adopt_leftovers(&mut memory, sink);
         loop {
             memory.stepped = false;
+            // A check due whose ticket's step did not start in a pass with
+            // nothing else in flight, held back for another reason, gives
+            // up its priority, so it never holds the project (OWL-418).
+            let due = memory
+                .base_due
+                .clone()
+                .filter(|_| memory.running.is_empty())
+                .map(|(ticket, _)| (ticket, memory.base_due_ran));
             self.pass(&mut memory, sink, out, continued);
             if draining {
                 self.drain(&mut memory, sink, out, continued);
+            }
+            if let Some((ticket, ran)) = due
+                && memory.base_due_ran == ran
+                && !memory.running.iter().any(|step| *step.ticket() == ticket)
+            {
+                memory.base_due = None;
             }
             // The interval is only between idle passes (OWL-367): after a
             // step, the next stage step is due at once. While steps'

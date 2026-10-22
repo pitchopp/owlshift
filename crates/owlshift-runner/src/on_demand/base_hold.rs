@@ -233,6 +233,17 @@ impl OnDemand<'_> {
         let held_command = held_command(&checks, commit, &key);
         match checks.before_build(commit, &key, head) {
             Before::Held => {
+                // A hold not told yet, its first telling having found the
+                // project's lock taken, is told now.
+                if let Some(Entry::Checked {
+                    verdict: Verdict::Failed(failure),
+                    hold: Some(hold),
+                    ..
+                }) = checks.get(commit, &key).map(|check| &check.entry)
+                    && !hold.told
+                {
+                    self.tell_hold(p, commit, &key, &failure.failing, sink);
+                }
                 return Ok(Settled::Held {
                     command: held_command,
                 });

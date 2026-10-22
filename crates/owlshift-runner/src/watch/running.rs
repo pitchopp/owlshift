@@ -207,19 +207,18 @@ impl Watch<'_> {
     ) {
         // A check due that could not run beside other steps holds them back
         // until this ticket's next step has run (OWL-418).
-        match end {
-            StepEnd::BaseHeld { pending: true, .. } => {
-                memory.base_due = Some((ticket.clone(), (self.on_demand.clock)()));
-            }
-            StepEnd::Busy | StepEnd::NoSlot | StepEnd::Stale => {}
-            _ if memory
+        let ran = !matches!(end, StepEnd::Busy | StepEnd::NoSlot | StepEnd::Stale);
+        if ran
+            && memory
                 .base_due
                 .as_ref()
-                .is_some_and(|(due, _)| due == ticket) =>
-            {
-                memory.base_due = None;
-            }
-            _ => {}
+                .is_some_and(|(due, _)| due == ticket)
+        {
+            memory.base_due_ran += 1;
+            memory.base_due = None;
+        }
+        if let StepEnd::BaseHeld { pending: true, .. } = end {
+            memory.base_due = Some((ticket.clone(), (self.on_demand.clock)()));
         }
         match then {
             Then::Held { seen } => self.held_after(memory, sink, out, ticket, seen, end),

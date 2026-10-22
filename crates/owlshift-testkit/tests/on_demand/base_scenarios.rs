@@ -331,3 +331,40 @@ fn watch_reruns_a_held_gate_once_the_base_passes_with_no_continue() {
     );
     assert_eq!(bench.fold.borrow().resolved.len(), 1, "{lines}");
 }
+
+/// The busy path under watch: a check that must wait, DEMO-2's step in
+/// flight, is tried again at the next pass once nothing else runs, not
+/// after the retry delay: no clock moves between the two passes.
+#[test]
+fn watch_tries_a_check_that_waited_again_once_nothing_else_runs() {
+    let bench = Bench::new(true);
+    let marker = bench.tmp.path().join("store-has-rollup");
+    with_setup(&bench, &setup_line(&marker), None);
+    let two = TicketId::new("DEMO-2").unwrap();
+    let mut sibling = Some(bench.dirs().ticket_lock(&two).unwrap().unwrap());
+    let (pending, printed) = bench.run(Vec::new(), None);
+    assert!(
+        matches!(pending, Err(Stop::BaseHeld { pending: true, .. })),
+        "{pending:?}\n{printed}"
+    );
+
+    let mut passes = 0;
+    let (outcomes, lines, printed) = bench.watch(Vec::new(), &mut |_| {
+        passes += 1;
+        // DEMO-2's step ends after the first pass.
+        drop(sibling.take());
+        passes < 2
+    });
+    assert!(
+        matches!(
+            outcomes.as_slice(),
+            [
+                Err(Stop::BaseHeld { pending: true, .. }),
+                Err(Stop::BaseHeld { pending: false, .. })
+            ]
+        ),
+        "{outcomes:?}\n{lines}\n{printed}"
+    );
+    assert_eq!(checked(&bench), ["opened"]);
+    assert_eq!(builds(&bench), [false]);
+}
