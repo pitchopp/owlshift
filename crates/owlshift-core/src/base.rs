@@ -184,6 +184,19 @@ impl Checks {
             .find(|check| check.commit == commit && check.commands == commands)
     }
 
+    /// The verdict kept for `commit` and `commands`, checked at `head`: a
+    /// check that need not run again.
+    pub fn verdict_at(&self, commit: &str, commands: &str, head: &str) -> Option<&Verdict> {
+        match &self.get(commit, commands)?.entry {
+            Entry::Checked {
+                head: checked,
+                verdict,
+                ..
+            } if checked == head => Some(verdict),
+            _ => None,
+        }
+    }
+
     fn position(&self, commit: &str, commands: &str) -> Option<usize> {
         self.checks
             .iter()

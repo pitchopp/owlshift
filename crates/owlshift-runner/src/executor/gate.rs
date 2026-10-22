@@ -166,6 +166,11 @@ pub struct GateReport {
     /// Each setup command started before them, in order, as `steps`
     /// (OWL-330). Empty when the project has none or none started.
     pub setup: Vec<GateStep>,
+    /// The failing command's failure was the runner's, not the command's
+    /// ([`Fault::Runner`]: one it could not confine, start or watch, a log it
+    /// could not write, an output a process kept open), so no base check
+    /// may take it for the project's (OWL-418).
+    pub runner_fault: bool,
 }
 
 impl GateReport {
@@ -258,6 +263,7 @@ fn empty_report(commands: &[String], log_path: &Path) -> GateReport {
         breach: Vec::new(),
         steps: Vec::new(),
         setup: Vec::new(),
+        runner_fault: false,
     }
 }
 
@@ -310,7 +316,7 @@ fn check_and_run(
     }
     if !setup.is_empty() {
         let share = timeout / SETUP_SHARE;
-        run_commands(
+        let ran = run_commands(
             agent,
             paths,
             (setup, Phase::Setup),
@@ -318,8 +324,11 @@ fn check_and_run(
             Instant::now() + share,
             &mut log,
             &mut report.setup,
-        )
-        .map_err(|failed| setup_failure(failed.failure))?;
+        );
+        if let Err(failed) = ran {
+            report.runner_fault = failed.fault == Fault::Runner;
+            return Err(setup_failure(failed.failure).into());
+        }
         // The setup ran the branch's code, as the gate does: checked as the
         // gate is, before the gate's commands get their whole deadline.
         guarded(guard, &mut log)?;
@@ -333,7 +342,7 @@ fn check_and_run(
         }
         deadline = Instant::now() + timeout;
     }
-    run_commands(
+    let ran = run_commands(
         agent,
         paths,
         (commands, Phase::Gate),
@@ -341,8 +350,11 @@ fn check_and_run(
         deadline,
         &mut log,
         &mut report.steps,
-    )
-    .map_err(|failed| failed.failure)?;
+    );
+    if let Err(failed) = ran {
+        report.runner_fault = failed.fault == Fault::Runner;
+        return Err(failed.failure.into());
+    }
     // The commands wrote what the sandbox let them, the repository's git
     // folder included: nothing they planted may run in the gate's git.
     guarded(guard, &mut log)?;
@@ -660,6 +672,7 @@ pub(crate) fn run_setup(
         Ok(()) => {}
         Err(SetupStop::Failed(failure, fault)) => {
             run.report.failure = Some(failure);
+            run.report.runner_fault = fault == Some(Fault::Runner);
             run.fault = fault;
         }
         Err(SetupStop::Breach(violations)) => {

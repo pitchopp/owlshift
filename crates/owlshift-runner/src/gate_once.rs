@@ -14,6 +14,15 @@
 //! credential check and isolation checks. A breach marks the project as a
 //! run's would, and leaves the worktree for the person who looks; otherwise
 //! the worktree and its branch are removed. No harness, tracker or forge.
+//!
+//! The same run checks a Build's base (OWL-418, [`Place::Base`]): from the
+//! step of the ticket whose gate or setup failed, at the commit its run was
+//! configured at, in a worktree and on a branch of its own. Either place
+//! keeps its verdict in the project's base checks ([`crate::base`]) before
+//! it lets the project's lock go: a base check always, `owlshift gate` only
+//! on a commit whose check holds or is due, so a pass lifts a hold and the
+//! operator's gate never opens one. A base check finds its verdict kept at
+//! the default branch's head already, read under the lock, and runs nothing.
 
 use std::fmt;
 use std::fs;
@@ -22,9 +31,12 @@ use std::time::{Duration, Instant};
 
 use jiff::Timestamp;
 
+use crate::base;
 use crate::executor::gate::GATE_LOG;
 use crate::executor::{Executor, GateRun, GateSpec};
 use owlshift_contracts::config::ProjectConfig;
+use owlshift_contracts::ids::TicketId;
+use owlshift_core::base::{After, Failing, Recorded, Verdict};
 
 use crate::project::{self, Base, ProjectDirs};
 use crate::ticket_run::{self, Look};
@@ -32,6 +44,35 @@ use crate::ticket_run::{self, Look};
 /// The branch of `owlshift gate`'s worktree: no ticket's branch
 /// (`owlshift/<id>`) can take it.
 pub const GATE_BRANCH: &str = "owlshift-gate/check";
+
+/// The branch of a base check's worktree (OWL-418).
+pub const BASE_BRANCH: &str = "owlshift-gate/base";
+
+/// Where a run of the gate alone works, and what it keeps of its verdict.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Place {
+    /// `owlshift gate`: its verdict replaces a base check's that holds or
+    /// is due, and is kept nowhere else.
+    Gate,
+    /// A Build's base check (OWL-418): its verdict is always kept.
+    Base,
+}
+
+impl Place {
+    fn folder(self) -> &'static str {
+        match self {
+            Self::Gate => "gate",
+            Self::Base => "base",
+        }
+    }
+
+    fn branch(self) -> &'static str {
+        match self {
+            Self::Gate => GATE_BRANCH,
+            Self::Base => BASE_BRANCH,
+        }
+    }
+}
 
 /// The most lines of each command's output [`render`] prints; the gate log
 /// has them all.
@@ -53,6 +94,15 @@ pub struct GateOnce<'a> {
     /// The commit to check, a full id or a remote-tracking name such as
     /// `origin/fix-gate`; origin's default branch when `None`.
     pub at: Option<&'a str>,
+    /// Where it works (OWL-418).
+    pub place: Place,
+    /// The ticket whose step runs a base check, which holds its own lock:
+    /// not taken for a ticket in flight.
+    pub except: Option<&'a TicketId>,
+    /// The failure a base check runs for: matched with its verdict.
+    pub initiating: Option<&'a Failing>,
+    /// The time its verdict is kept at.
+    pub now: Timestamp,
 }
 
 /// Where the gate commands come from.
@@ -72,6 +122,8 @@ pub struct Plan {
     /// The name it was given: `origin/<default branch>`, or `--at`'s.
     pub name: String,
     pub source: Source,
+    /// The default branch's head the checkout was brought to.
+    pub head: String,
     pub commands: Vec<String>,
     /// The project's setup, run before the commands (OWL-330), from the same
     /// project file.
@@ -148,6 +200,27 @@ pub struct Checked {
     pub marker: Option<PathBuf>,
     /// What could not be cleaned up or recorded after the gate.
     pub warnings: Vec<String>,
+    /// What became of the project's base check of the commit (OWL-418):
+    /// `None` when nothing was kept.
+    pub base: Option<BaseKept>,
+}
+
+/// A verdict kept in the project's base checks.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BaseKept {
+    /// The verdict: the run's, or the one kept at this head already, in
+    /// which case nothing ran; `None` when the run said nothing of the
+    /// commands, a runner's fault or a failure around them.
+    pub verdict: Option<Verdict>,
+    /// How it changed the hold; `None` for a verdict not kept, or one kept
+    /// already that no failure was matched with.
+    pub recorded: Option<Recorded>,
+    /// Whether the verdict was found kept at this head, nothing run.
+    pub reused: bool,
+    /// The key of the commands checked.
+    pub commands: String,
+    /// Why the verdict could not be read or kept, when it could not.
+    pub unkept: Option<String>,
 }
 
 impl Checked {
@@ -194,12 +267,46 @@ impl fmt::Display for Stop {
 
 /// The worktree of `owlshift gate` under the project's folder.
 pub fn worktree(dirs: &ProjectDirs) -> PathBuf {
-    dirs.root().join("gate").join("worktree")
+    worktree_at(dirs, Place::Gate)
 }
 
 /// The folder of its log, hidden from the gate.
 pub fn run_dir(dirs: &ProjectDirs) -> PathBuf {
-    dirs.root().join("gate").join("run")
+    run_dir_at(dirs, Place::Gate)
+}
+
+/// The worktree of a run of the gate alone at `place`.
+pub fn worktree_at(dirs: &ProjectDirs, place: Place) -> PathBuf {
+    dirs.root().join(place.folder()).join("worktree")
+}
+
+/// The folder of its log.
+pub fn run_dir_at(dirs: &ProjectDirs, place: Place) -> PathBuf {
+    dirs.root().join(place.folder()).join("run")
+}
+
+impl<'a> GateOnce<'a> {
+    /// `owlshift gate` as the operator types it: at [`Place::Gate`], for no
+    /// ticket and no failure, its verdict kept at the system clock's time.
+    pub fn operator(
+        executor: &'a Executor,
+        dirs: &'a ProjectDirs,
+        remote_url: &'a str,
+        local: &'a ProjectConfig,
+        at: Option<&'a str>,
+    ) -> Self {
+        Self {
+            executor,
+            dirs,
+            remote_url,
+            local,
+            at,
+            place: Place::Gate,
+            except: None,
+            initiating: None,
+            now: Timestamp::now(),
+        }
+    }
 }
 
 impl GateOnce<'_> {
@@ -219,7 +326,7 @@ impl GateOnce<'_> {
             Err(error) => return Err(Stop::Refused(format!("the project's lock: {error}"))),
         };
         // The quarantine, or a run left behind, which becomes it (OWL-400).
-        match ticket_run::look(dirs, None) {
+        match ticket_run::look(dirs, self.except) {
             Ok(Look::Clear { .. }) => {}
             Ok(Look::Quarantined { path, text }) => {
                 return Err(Stop::Unverified { marker: path, text });
@@ -232,7 +339,7 @@ impl GateOnce<'_> {
         // the project's, and this gate's check is a run's alone, so it waits
         // for none to stand; no step starts meanwhile, every one starting
         // with the project's lock this gate holds.
-        match ticket_run::ticket_in_flight(dirs) {
+        match ticket_run::ticket_in_flight_except(dirs, self.except) {
             Ok(None) => {}
             Ok(Some(_)) => return Err(Stop::Busy(dirs.root().to_owned())),
             Err(error) => {
@@ -244,11 +351,12 @@ impl GateOnce<'_> {
             .sandbox_ready()
             .map_err(|e| Stop::Refused(e.to_string()))?;
         let checkout = dirs.checkout();
-        let worktree = worktree(dirs);
+        let worktree = worktree_at(dirs, self.place);
+        let branch = self.place.branch();
         // What a stopped `owlshift gate` left, once its marker is gone.
         if fs::symlink_metadata(&checkout).is_ok() {
             executor
-                .discard_worktree(&checkout, &worktree, GATE_BRANCH)
+                .discard_worktree(&checkout, &worktree, branch)
                 .map_err(|e| {
                     Stop::Refused(format!(
                         "removing what an earlier `owlshift gate` left: {e}"
@@ -256,6 +364,7 @@ impl GateOnce<'_> {
                 })?;
         }
         let base = project::sync_checkout(git, dirs, self.remote_url).map_err(Stop::Refused)?;
+        let head = base.commit.clone();
         let (commit, name) = match self.at {
             Some(at) => (
                 executor
@@ -289,26 +398,36 @@ impl GateOnce<'_> {
         );
         let commands = config.stack.gate.clone();
         let setup = config.stack.setup.clone();
-        let run_dir = run_dir(dirs);
+        let run_dir = run_dir_at(dirs, self.place);
         let plan = Plan {
             commit,
             name,
             source,
+            head,
             commands,
             setup,
             log: run_dir.join(GATE_LOG),
             gate_env_differs,
             caches_differ,
         };
-        let checked = |run, marker, warnings| Checked {
+        let checked = |run, marker, warnings, base| Checked {
             plan: plan.clone(),
             run,
             elapsed: started.elapsed(),
             marker,
             warnings,
+            base,
         };
         if plan.commands.is_empty() {
-            return Ok(checked(None, None, Vec::new()));
+            return Ok(checked(None, None, Vec::new(), None));
+        }
+        let key = base::commands_key(&plan.setup, &plan.commands);
+        // A base check another ticket's step just made at this head is
+        // used, under the lock, nothing run (OWL-418).
+        if self.place == Place::Base
+            && let Some(kept) = self.reuse(&plan, &key)
+        {
+            return Ok(checked(None, None, Vec::new(), Some(kept)));
         }
 
         // As for a run: from here until the isolation check passes, a stop
@@ -329,13 +448,13 @@ impl GateOnce<'_> {
         let spec = GateSpec {
             main: &checkout,
             worktree: &worktree,
-            branch: GATE_BRANCH,
+            branch,
             base: &plan.commit,
             run_dir: &run_dir,
             commands: &plan.commands,
             setup: &plan.setup,
         };
-        let discard = || executor.discard_worktree(&checkout, &worktree, GATE_BRANCH);
+        let discard = || executor.discard_worktree(&checkout, &worktree, branch);
         let run = match executor.run_gate(&spec) {
             Ok(run) => run,
             Err(error) => {
@@ -358,7 +477,9 @@ impl GateOnce<'_> {
             if let Err(e) = ticket_run::remove_obligation(dirs, &obligation) {
                 warnings.push(format!("the gate's obligation could not be removed: {e}"));
             }
-            return Ok(checked(Some(run), None, warnings));
+            // Kept before the project's lock goes (OWL-418).
+            let kept = self.keep(&plan, &key, &run);
+            return Ok(checked(Some(run), None, warnings, kept));
         }
         // The worktree stays for the person who looks; no more git runs.
         let lines: Vec<String> = run.violations.iter().map(|v| format!("- {v}")).collect();
@@ -374,7 +495,84 @@ impl GateOnce<'_> {
         if let Err(e) = dirs.write_quarantine(&text) {
             warnings.push(format!("the breach could not be recorded: {e}"));
         }
-        Ok(checked(Some(run), Some(dirs.quarantine_file()), warnings))
+        Ok(checked(
+            Some(run),
+            Some(dirs.quarantine_file()),
+            warnings,
+            None,
+        ))
+    }
+
+    /// The verdict of a base check kept at `plan`'s head already, matched
+    /// with the failure the check runs for, the match kept: `None` when none
+    /// is kept at this head, or the file does not read, so the check runs.
+    fn reuse(&self, plan: &Plan, key: &str) -> Option<BaseKept> {
+        let mut checks = base::read(self.dirs).ok()?;
+        let verdict = checks.verdict_at(&plan.commit, key, &plan.head)?.clone();
+        let mut kept = BaseKept {
+            verdict: Some(verdict),
+            recorded: None,
+            reused: true,
+            commands: key.to_owned(),
+            unkept: None,
+        };
+        if let Some(failing) = self.initiating
+            && let After::Matched(recorded) = checks.after_failure(
+                &plan.commit,
+                key,
+                &plan.head,
+                failing,
+                self.now.as_millisecond(),
+            )
+        {
+            kept.recorded = Some(recorded);
+            kept.unkept = base::write(self.dirs, &checks).err();
+        }
+        Some(kept)
+    }
+
+    /// Keeps `run`'s verdict in the project's base checks: a base check's
+    /// always, matched with the failure it ran for; `owlshift gate`'s only
+    /// on a commit whose check holds or is due. `None` when nothing is kept
+    /// or said.
+    fn keep(&self, plan: &Plan, key: &str, run: &GateRun) -> Option<BaseKept> {
+        let unkept = |verdict, why| {
+            Some(BaseKept {
+                verdict,
+                recorded: None,
+                reused: false,
+                commands: key.to_owned(),
+                unkept: Some(why),
+            })
+        };
+        let mut checks = match base::read(self.dirs) {
+            Ok(checks) => checks,
+            Err(why) => return unkept(base::verdict(&run.report).ok(), why),
+        };
+        if self.place == Place::Gate && !checks.holds(&plan.commit, key) {
+            return None;
+        }
+        let verdict = match base::verdict(&run.report) {
+            Ok(verdict) => verdict,
+            Err(why) => return unkept(None, why),
+        };
+        let initiating = match self.place {
+            Place::Base => self.initiating,
+            Place::Gate => None,
+        };
+        let recorded = checks.record_check(
+            (&plan.commit, key, &plan.head),
+            self.now.as_millisecond(),
+            verdict.clone(),
+            initiating,
+        );
+        Some(BaseKept {
+            verdict: Some(verdict),
+            recorded: Some(recorded),
+            reused: false,
+            commands: key.to_owned(),
+            unkept: base::write(self.dirs, &checks).err(),
+        })
     }
 }
 
@@ -442,6 +640,9 @@ pub fn render(checked: &Checked) -> String {
         ));
     }
     out.push_str(&format!("Gate log: {}\n", report.log.display()));
+    if let Some(kept) = &checked.base {
+        out.push_str(&hold_line(&checked.plan.commit, kept));
+    }
     for warning in &checked.warnings {
         out.push_str(&format!("warning: {warning}\n"));
     }
@@ -451,6 +652,29 @@ pub fn render(checked: &Checked) -> String {
 /// A commit id's first 12 characters.
 fn short(commit: &str) -> &str {
     commit.get(..12).unwrap_or(commit)
+}
+
+/// What `owlshift gate` did to the hold on `commit` (OWL-418).
+fn hold_line(commit: &str, kept: &BaseKept) -> String {
+    let short = short(commit);
+    let mut line = match kept.recorded {
+        Some(Recorded::Lifted) => {
+            format!("The hold on {short} is lifted: the Builds made from it go on.\n")
+        }
+        Some(Recorded::StillHeld | Recorded::Opened) => {
+            format!("The hold on {short} stands: the Builds made from it still wait.\n")
+        }
+        Some(Recorded::Cached) => {
+            format!("The check due on {short} ran: no Build is held for it.\n")
+        }
+        None => {
+            format!("The hold on {short} stands: this gate's run says nothing of its commands.\n")
+        }
+    };
+    if let Some(why) = &kept.unkept {
+        line.push_str(&format!("warning: the base check was not kept: {why}\n"));
+    }
+    line
 }
 
 #[cfg(test)]
@@ -639,6 +863,10 @@ mod tests {
                 remote_url: &origin,
                 local: &local,
                 at,
+                place: Place::Gate,
+                except: None,
+                initiating: None,
+                now: Timestamp::now(),
             }
             .run(&mut |_| {})
         }
@@ -684,6 +912,10 @@ mod tests {
             remote_url: &origin,
             local: &local_config(&["echo local"]),
             at: None,
+            place: Place::Gate,
+            except: None,
+            initiating: None,
+            now: Timestamp::now(),
         }
         .run(&mut |plan| told = Some(plan.clone()))
         .unwrap();
@@ -851,6 +1083,10 @@ mod tests {
             remote_url: &origin,
             local: &local_config(&["true"]),
             at: None,
+            place: Place::Gate,
+            except: None,
+            initiating: None,
+            now: Timestamp::now(),
         }
         .run(&mut |plan| told = Some(plan.clone()))
         .unwrap();
@@ -974,6 +1210,95 @@ mod tests {
         assert!(steps[1].output.contains("probe"), "{}", steps[1].output);
     }
 
+    /// OWL-418: a base check keeps its verdict, matched with the failure it
+    /// ran for, and is used again at the same head with nothing run; it is
+    /// refused while another ticket's step is in flight, never for its own;
+    /// the operator's gate keeps nothing on a commit nothing holds, and its
+    /// pass lifts a hold.
+    #[test]
+    fn a_base_check_is_kept_once_and_the_operators_gate_lifts_a_hold() {
+        use owlshift_core::base::{Checks, Failure, Step};
+        let bench = Bench::new();
+        let main = bench.push("main", Some(&project_file("\"exit 3\"")));
+        let fixed = bench.push("fixed", Some(&project_file("\"echo fixed\"")));
+        let executor = bench.executor(bench.agent().without_confinement());
+        let origin = bench.origin.to_string_lossy().into_owned();
+        let local = local_config(&["true"]);
+        let own = TicketId::new("OWL-1").unwrap();
+        let failing = Failing {
+            step: Step::Gate,
+            command: "exit 3".to_owned(),
+        };
+        let base_check = || {
+            GateOnce {
+                executor: &executor,
+                dirs: &bench.dirs,
+                remote_url: &origin,
+                local: &local,
+                at: Some(main.as_str()),
+                place: Place::Base,
+                except: Some(&own),
+                initiating: Some(&failing),
+                now: Timestamp::now(),
+            }
+            .run(&mut |_| {})
+        };
+        let own_lock = bench.dirs.ticket_lock(&own).unwrap().unwrap();
+        let other = TicketId::new("OWL-2").unwrap();
+        let sibling = bench.dirs.ticket_lock(&other).unwrap().unwrap();
+        assert!(matches!(base_check(), Err(Stop::Busy(_))));
+        drop(sibling);
+
+        let checked = base_check().unwrap();
+        assert!(checked.run.is_some());
+        let kept = checked.base.unwrap();
+        assert_eq!(
+            (kept.recorded, kept.reused),
+            (Some(Recorded::Opened), false)
+        );
+        assert!(!bench.left_over() && !worktree_at(&bench.dirs, Place::Base).exists());
+        let again = base_check().unwrap();
+        assert!(again.run.is_none());
+        let kept = again.base.unwrap();
+        assert_eq!(
+            (kept.recorded, kept.reused),
+            (Some(Recorded::StillHeld), true)
+        );
+        // The operator's gate runs with no ticket's lock held.
+        drop(own_lock);
+
+        let unheld = bench.gate(&executor, &[], Some(&fixed)).unwrap();
+        assert!(unheld.base.is_none(), "{unheld:?}");
+
+        // A hold on `fixed`, whose gate passes now: the operator's gate lifts it.
+        let key = base::commands_key(&[], &["echo fixed".to_owned()]);
+        let mut checks = base::read(&bench.dirs).unwrap();
+        let held = Failing {
+            step: Step::Gate,
+            command: "echo fixed".to_owned(),
+        };
+        checks.record_check(
+            (&fixed, &key, "an older head"),
+            0,
+            Verdict::Failed(Failure {
+                failing: held.clone(),
+                reason: "exit status 1".to_owned(),
+                tail: String::new(),
+            }),
+            Some(&held),
+        );
+        base::write(&bench.dirs, &checks).unwrap();
+        let lifted = bench.gate(&executor, &[], Some(&fixed)).unwrap();
+        assert_eq!(
+            lifted.base.as_ref().unwrap().recorded,
+            Some(Recorded::Lifted)
+        );
+        assert!(render(&lifted).contains("is lifted"), "{}", render(&lifted));
+        let checks: Checks = base::read(&bench.dirs).unwrap();
+        assert!(!checks.holds_commit(&fixed));
+        assert!(checks.holds_commit(&main));
+    }
+
     /// Native Windows has no sandbox (D9): refused before anything is made.
     #[cfg(windows)]
     #[test]
@@ -988,6 +1313,10 @@ mod tests {
             remote_url: "https://github.com/acme/app.git",
             local: &local_config(&["echo hi"]),
             at: None,
+            place: Place::Gate,
+            except: None,
+            initiating: None,
+            now: Timestamp::now(),
         }
         .run(&mut |_| panic!("nothing runs"))
         .unwrap_err();
