@@ -282,7 +282,10 @@ impl OnDemand<'_> {
     /// read, or a branch no longer at its Build's commit): its Build runs
     /// again, the loop restarted from Watch with the same reviews, its kept
     /// Build dropped. `do`, which builds a ticket again elsewhere, is
-    /// refused while the pull request is followed.
+    /// refused while the pull request is followed. A park there is the
+    /// person's restart first ([`Self::restart_park`], OWL-424), once the
+    /// branch is ready, so that a branch that cannot be made leaves it
+    /// parked.
     pub(super) fn rebuild_loop(
         &self,
         p: &mut Prepared,
@@ -292,6 +295,7 @@ impl OnDemand<'_> {
     ) -> Result<TicketState, Stop> {
         let pushed = loop_base(p).ok_or_else(|| nothing_to_continue(&p.ticket))?;
         self.fix_branch(p, &pushed)?;
+        let state = self.restart_park(p, state, None, sink)?;
         let watching =
             TicketState::restore(Status::Active(Stage::Watch), state.round(), 0, 0, 0, 0)
                 .map_err(core_error)?;

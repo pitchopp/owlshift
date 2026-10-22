@@ -631,3 +631,114 @@ fn a_later_brief_holds_owlshifts_comments_short_and_the_deciders_whole() {
         ]
     );
 }
+
+/// OWL-424: a review loop parked at Verify, whose branch moved off the
+/// Build Verify reviews, is a person's restart before its Build runs again, as
+/// any park's: refused with nothing written while the gate is empty
+/// (OWL-332); then the restart's `decision` event before the loop's
+/// `rebuild`, the budget counted afresh (OWL-378), and the Build pushed to
+/// the same pull request.
+#[test]
+fn a_review_loop_parked_at_verify_is_restarted_before_its_build_runs_again() {
+    // The commit the ticket's branch is made from keeps no project file,
+    // so the person's file gives the gate; the base's head, the project's
+    // file again, lists the reviewers.
+    let bench = Bench::with("maintainer", "assignee = \"maintainer\"\n", FORGE);
+    let config_path = bench.remote.checkout.join("owlshift.toml");
+    let config = fs::read_to_string(&config_path).unwrap();
+    bench.merge_into_main(&[("owlshift.toml", "")]);
+    let bench = deliver(bench);
+    bench.merge_into_main(&[("owlshift.toml", &config)]);
+    bench.verify_plays.set(true);
+    bench.reviews_on_github(vec![review(7_000_000_005, "ann-dev", "Use capitals.", &[])]);
+    let (parked, printed) = bench.continue_ticket(vec![
+        costed(&bench, Some("Hello there"), RENAMED, Some(2_000_000)),
+        bench.reviewing(super::verify_scenarios::FAILED_REVIEW),
+        bench.reviewing(super::verify_scenarios::FAILED_REVIEW),
+    ]);
+    assert!(
+        matches!(
+            parked,
+            Err(Stop::Parked {
+                reason: ParkReason::FailedRuns,
+                ..
+            })
+        ),
+        "{parked:?}\n{printed}"
+    );
+    assert!(matches!(
+        state_of(&bench).status(),
+        Status::Parked {
+            at: Stage::Verify,
+            ..
+        }
+    ));
+    let spent = bench.record().cost.expect("cost.json").spent_micros;
+    assert!(spent >= 2_000_000, "{spent}");
+    // The branch moved back to the delivered commit, a move a person made
+    // and accepted: the Build Verify reviews is no longer what would be
+    // pushed.
+    let built = bench.review_record().build.expect("the Build under review");
+    let checkout = bench.dirs().checkout();
+    bench
+        .env
+        .run(
+            &checkout,
+            &[
+                "update-ref",
+                "refs/heads/owlshift/demo-1",
+                &format!("{}^", built.commit),
+            ],
+        )
+        .unwrap();
+    let env = bench.env.clone();
+    let git = Git::with_setup("git", move |command| env.apply(command));
+    owlshift_runner::ticket_run::rebaseline(&git, &bench.dirs()).unwrap();
+
+    fs::write(&config_path, config.replace(GATE_LINE, "gate = []")).unwrap();
+    let (runs, kept, from) = (
+        bench.briefs().len(),
+        bench.ref_commit(),
+        bench.events().len(),
+    );
+    let (refused, printed) = bench.continue_ticket(Vec::new());
+    match &refused {
+        Err(Stop::Refused(why)) => assert!(why.contains("`stack.gate` is empty"), "{why}"),
+        other => panic!("{other:?}\n{printed}"),
+    }
+    assert_eq!(bench.briefs().len(), runs);
+    assert_eq!(bench.ref_commit(), kept);
+    assert!(data_of(&bench.events()[from..], EventKind::Decision, "restarted").is_empty());
+    fs::write(&config_path, config).unwrap();
+
+    let from = bench.events().len();
+    let (delivered, printed) = bench.continue_ticket(vec![
+        bench.reply(Some("Hello there, with a comma"), Some(RENAMED)),
+        bench.reviewing(&super::verify_scenarios::found(&[])),
+    ]);
+    delivered.unwrap_or_else(|stop| panic!("{stop}\n{printed}"));
+    let decisions: Vec<Value> = bench.events()[from..]
+        .iter()
+        .filter(|event| event.kind == EventKind::Decision)
+        .map(|event| Value::Object(event.data.clone()))
+        .filter(|data| data.get("restarted").is_some() || data["outcome"] == "rebuild")
+        .collect();
+    assert_eq!(decisions.len(), 2, "{decisions:?}");
+    assert_eq!(
+        (&decisions[0]["restarted"], &decisions[0]["stage"]),
+        (&json!(true), &json!("verify"))
+    );
+    assert_eq!(decisions[1]["watch"], "review");
+    assert!(
+        decisions[1]["reason"]
+            .as_str()
+            .is_some_and(|why| why.contains(&format!("not at {}", built.commit))),
+        "{decisions:?}"
+    );
+    let cost = bench.record().cost.expect("cost.json");
+    assert_eq!(cost.restarted_at_micros, spent);
+    assert_eq!(bench.github.created.lock().unwrap().len(), 1);
+    let kept = bench.review_record();
+    assert_eq!(kept.answered_reviews, [7_000_000_005]);
+    assert_eq!(state_of(&bench).status(), Status::Active(Stage::Watch));
+}
