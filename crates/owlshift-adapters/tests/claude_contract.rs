@@ -414,7 +414,13 @@ fn the_resolver_argv_allows_bash_without_an_edit_rule() {
             .iter()
             .take_while(|arg| !arg.starts_with("--"))
             .collect();
-        assert_eq!(tools, ["Bash"], "{case}");
+        // With network, its web tools too (OWL-415).
+        let expected: &[&str] = if network {
+            &["Bash", "WebFetch", "WebSearch"]
+        } else {
+            &["Bash"]
+        };
+        assert_eq!(tools, expected, "{case}");
         assert!(!args.iter().any(|arg| arg.starts_with("Edit(")), "{case}");
     }
 
@@ -466,6 +472,84 @@ fn the_resolver_argv_allows_bash_without_an_edit_rule() {
         launch_args(&launch(PermissionLevel::WriteWorktree, true, true)),
         Err(CommandError::Unsupported(_))
     ));
+}
+
+/// A read-only run with network allows the web tools by name, because
+/// `dontAsk` denies a call to one that is only offered (OWL-415). Both
+/// recordings were made on 2026-10-22 with Claude Code 2.1.302, unconfined,
+/// with the adapter's read-only argv of then, `WebFetch WebSearch` taken out
+/// of `--disallowedTools`, the model asked to call WebSearch once:
+/// `read_only_web_search_denied.jsonl` without the allow rules, where `init`
+/// offered both tools and the call was denied; `read_only_web_search.jsonl`
+/// with `WebFetch WebSearch` after the result's rule in `--allowedTools`, as
+/// the adapter now passes them, where the search gave results. Exit 0, empty
+/// stderr; the results are cut from the fixture.
+#[test]
+fn a_read_only_run_with_network_is_allowed_its_web_tools() {
+    let args = launch_args(&launch(PermissionLevel::ReadOnly, true, false)).unwrap();
+    let allowed = positions(&args, "--allowedTools");
+    assert_eq!(allowed.len(), 1, "{args:?}");
+    let tools: Vec<&str> = args[allowed[0] + 1..]
+        .iter()
+        .take_while(|arg| !arg.starts_with("--"))
+        .map(String::as_str)
+        .collect();
+    assert_eq!(
+        tools,
+        ["Edit(/.owlshift/result.json)", "WebFetch", "WebSearch"]
+    );
+    // A run that writes the worktree allows every tool already.
+    let write = launch_args(&launch(PermissionLevel::WriteWorktree, true, false)).unwrap();
+    assert!(positions(&write, "--allowedTools").is_empty(), "{write:?}");
+
+    let searched = |name: &str| {
+        let events = recorded_events(name);
+        let calls = tool_calls(&events);
+        let search = calls
+            .iter()
+            .find(|call| call["name"] == "WebSearch")
+            .unwrap_or_else(|| panic!("{name}: no WebSearch call"));
+        let id = search["id"].clone();
+        tool_results(&events)
+            .into_iter()
+            .find(|result| result["tool_use_id"] == id)
+            .unwrap_or_else(|| panic!("{name}: no WebSearch result"))
+            .clone()
+    };
+    for name in [
+        "read_only_web_search_denied.jsonl",
+        "read_only_web_search.jsonl",
+    ] {
+        let offered = offered_tools(name);
+        for tool in ["WebFetch", "WebSearch"] {
+            assert!(offered.contains(&tool.to_owned()), "{name}: {offered:?}");
+        }
+    }
+
+    let denied = searched("read_only_web_search_denied.jsonl");
+    assert_eq!(denied["is_error"], json!(true));
+    assert!(
+        denied["content"]
+            .as_str()
+            .unwrap()
+            .starts_with("Permission to use WebSearch has been denied"),
+        "{denied}"
+    );
+    let run = replay("read_only_web_search_denied.jsonl", 0);
+    assert_eq!(run.permission_denials, ["WebSearch"]);
+
+    let found = searched("read_only_web_search.jsonl");
+    assert_ne!(found["is_error"], json!(true), "{found}");
+    assert!(
+        found["content"]
+            .as_str()
+            .unwrap()
+            .starts_with("Web search results for query:"),
+        "{found}"
+    );
+    let run = replay("read_only_web_search.jsonl", 0);
+    assert!(matches!(run.outcome, Outcome::Completed { .. }), "{run:?}");
+    assert!(run.permission_denials.is_empty(), "{run:?}");
 }
 
 /// Where `flag` stands in `args`.

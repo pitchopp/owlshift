@@ -76,6 +76,13 @@
         "string",
         "null"
       ]
+    },
+    "web_tools": {
+      "description": "Whether the read-only planning and review roles and the resolver\n(design, design review, verify, arbiter, resolver) get their web\ntools, WebFetch and WebSearch, on this machine: on unless set to\n`false` (OWL-415). Their shell keeps the network either way; intake,\nthe answer check, Build and rebase never get them from this key.",
+      "type": [
+        "boolean",
+        "null"
+      ]
     }
   },
   "additionalProperties": false,

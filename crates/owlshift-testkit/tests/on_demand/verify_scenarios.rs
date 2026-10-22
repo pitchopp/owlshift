@@ -111,7 +111,8 @@ fn a_trivial_ticket_is_verified_before_its_pull_request_opens() {
     assert_eq!(bench.run_roles(), [Role::Build, Role::Verify]);
     let verify = bench.last_of(Role::Verify);
     assert_eq!(verify.permissions.level, PermissionLevel::ReadOnly);
-    assert!(!verify.permissions.network);
+    // With its web tools (OWL-415).
+    assert!(verify.permissions.network);
     assert!(verify.plan.is_none(), "a trivial ticket has no plan");
     let review = verify.review.expect("a review");
     assert_eq!(review.mandates, [Mandate::Critic, Mandate::Conformance]);

@@ -378,6 +378,7 @@ fn run_with(
         // others are `report`'s.
         notifier: desktop,
         usage: &usage,
+        web_tools: owlshift_runner::config::web_tools_enabled(&config.personal),
     };
     let mut stdout = io::stdout();
     let mut sink = EventSink::new(repo.to_string(), EventLog::in_dir(&data_dir), &mut stdout);

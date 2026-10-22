@@ -87,6 +87,21 @@ impl Role {
             Self::Arbiter => "arbiter",
         }
     }
+
+    /// Whether a run of this role is given the web tools (WebFetch,
+    /// WebSearch) unless the operator turns them off (OWL-415,
+    /// architecture section 8): the read-only planning and review roles and
+    /// the resolver, which check external facts. Intake reads text anyone
+    /// the tracker lets write a ticket wrote, and the answer check keeps
+    /// its permissions; Build and rebase keep their briefs' as they were.
+    pub fn takes_web_tools(self) -> bool {
+        match self {
+            Self::Design | Self::DesignReview | Self::Verify | Self::Arbiter | Self::Resolver => {
+                true
+            }
+            Self::Intake | Self::AnswerCheck | Self::Build | Self::Rebase => false,
+        }
+    }
 }
 
 /// A model tier; the configuration maps each tier to a model per harness.
@@ -372,6 +387,36 @@ mod tests {
                 "{role:?}"
             );
         }
+    }
+
+    /// OWL-415: the planning and review roles and the resolver take the web
+    /// tools; intake, the answer check, Build and rebase do not.
+    #[test]
+    fn only_the_planning_review_and_resolver_roles_take_web_tools() {
+        let takes: Vec<Role> = [
+            Role::Intake,
+            Role::Resolver,
+            Role::AnswerCheck,
+            Role::Design,
+            Role::DesignReview,
+            Role::Build,
+            Role::Verify,
+            Role::Rebase,
+            Role::Arbiter,
+        ]
+        .into_iter()
+        .filter(|role| role.takes_web_tools())
+        .collect();
+        assert_eq!(
+            takes,
+            [
+                Role::Resolver,
+                Role::Design,
+                Role::DesignReview,
+                Role::Verify,
+                Role::Arbiter
+            ]
+        );
     }
 
     #[test]
