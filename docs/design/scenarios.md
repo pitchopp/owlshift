@@ -1,6 +1,6 @@
 # Owlshift — scenarios
 
-Status: draft, 2026-09-27. Seventeen user stories fix the product's behaviour from P1 to P10 ([roadmap](roadmap.md) maps each one to its step); each acceptance line is meant to become an end-to-end test on the Markdown tracker with a fake harness.
+Status: draft, 2026-09-27. Eighteen user stories fix the product's behaviour from P1 to P10 ([roadmap](roadmap.md) maps each one to its step); each acceptance line is meant to become an end-to-end test on the Markdown tracker with a fake harness.
 
 ## Nominal flow
 
@@ -13,7 +13,7 @@ The scanner sees the admitted ticket; intake finds no question and records resou
 - No human interaction between admission and the review request.
 - A delivery report on the ticket: decisions taken, state of the complete check set, what remains for a human.
 - The PR is announced green only when every required check passed.
-- Owlshift never merges.
+- Owlshift does not merge, unless the project opted into merge on green ([S18](#s18-merge-on-green)); no agent ever merges.
 
 ### S2. The needs-input loop
 
@@ -66,7 +66,7 @@ The scanner sees the admitted ticket; intake finds no question and records resou
 
 - Configurable caps on concurrent runs and on open PRs awaiting review; above either, nothing new starts.
 - A daily digest: tickets waiting for an answer and what they block, PRs to review, follow-ups to triage.
-- A notification goes out only when a human becomes the blocker (question, re-ask, parked ticket, every harness at its usage limit), never for progress or a green check. This binds the notifications Owlshift sends itself (the desktop one, later the webhook and the digest). A tracker tells people of Owlshift's comments by its own settings: on Linear, every comment of Owlshift's app user reaches the issue's subscribers, progress included, since Linear has no comment that notifies no one; the ones that wait for the decider (a question, a re-ask, a reply to their counter-question) mention them, which Linear files apart, as a mention (decision D8, OWL-157).
+- A notification goes out only when a human becomes the blocker (question, re-ask, parked ticket, every harness at its usage limit, a merge on green GitHub refuses for good), never for progress or a green check. This binds the notifications Owlshift sends itself (the desktop one, later the webhook and the digest). A tracker tells people of Owlshift's comments by its own settings: on Linear, every comment of Owlshift's app user reaches the issue's subscribers, progress included, since Linear has no comment that notifies no one; the ones that wait for the decider (a question, a re-ask, a reply to their counter-question) mention them, which Linear files apart, as a mention (decision D8, OWL-157).
 
 ## Exceptions
 
@@ -168,3 +168,14 @@ The scanner sees the admitted ticket; intake finds no question and records resou
 - The effective harness is resolved in order: project default, role, ticket verdict, what the machine has.
 - Every review has a reviewer of another model family than the author whenever one is available and configured; no review requires one (OWL-347). A project configures one with `pipeline.codex_reviewer`: a Codex reviewer beside the Claude Code reviewers, whose absence, at a usage limit or otherwise, the ticket names and which never stops it (OWL-348).
 - A harness at its usage limit switches the role to its declared fallback and logs it on the ticket; the original harness is used again after its reset.
+
+## Delivery
+
+### S18. Merge on green
+
+*On a project where I said so, a green pull request nobody needs to judge merges by itself; anywhere else, nothing changes.*
+
+- Off by default. `[forge] merge` in the project file turns it on for every ticket (`all`) or for tickets carrying the label `owlshift:merge` (`labeled`), read at the base branch's head, so no ticket's own branch can turn it on.
+- The runner merges, never an agent, through the forge with the head it last pushed as the expected head: a push by anyone in between makes the merge fail.
+- It merges only after two green reads of the same head on the same base, with nothing due first (a correction, a review, a reply, the delivery report), the ticket still in review on the tracker, not a draft, and no question asked under a category the project keeps for a human.
+- A refusal GitHub will not lift (a required review, a forbidden method, a missing permission) notifies me once, and Owlshift does not try that head again; a successful merge notifies no one and is said on the ticket.

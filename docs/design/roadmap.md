@@ -40,7 +40,7 @@ A repository that people and agents can build in safely, and a first command tha
 - Claude Code harness: headless run logged in with the stored `claude setup-token` token, model, effort, permission level, usage capture.
 - Executor: worktree, brief, result validation, isolation check; the project's gate commands before delivery.
 - GitHub forge adapter: push the branch, open the PR, read the complete check set.
-- The floor from day one: no merge, no tracker credentials for agents, an exit code never trusted.
+- The floor from day one: no merge (until a project opts into merge on green, D14, P7), no tracker credentials for agents, an exit code never trusted.
 - Delivery report on the ticket. Scenario S1, triggered by hand.
 
 **Exit gate.** One real Owlshift ticket delivered as a PR by `owlshift do`, and one run that cannot finish stopped without delivering, with no guardrail breach. Relaxed from three delivered tickets on 2026-10-01 (OWL-113): without questions on the ticket, a run that needs a decision can only stop, so more P1 runs were left to P2; the runs are recorded in the [build plan](build-plan.md) ("P1 tasks & exit gate"). From here, Owlshift builds Owlshift.
@@ -153,6 +153,7 @@ Set it and forget it.
 
 - `start --at-login`, `stop`, `uninstall` with its manifest, `doctor` cleanup, self-healing launcher, single instance.
 - Claims with leases on git refs, recovery after sleep or crash, keep-awake, notifier adapter and daily digest, `self-update`. Scenario S11.
+- Merge on green, opt-in per project (decision D14, [architecture](architecture.md) section 5, "Merge on green"). Scenario S18. Not part of P7's exit gate: it is a Watch feature placed here because P7 is the next step built, and the gate stays about running unattended.
 
 **Exit gate.** Seven days unattended with no double dispatch.
 
@@ -191,6 +192,6 @@ A Tauri 2 shell around the P8 UI: tray icon, native notifications, login item, a
 | S3, S4, S6, S12, S13 | P4 |
 | S8 | P5 |
 | S5, S10, S16, S17 | P6 (S17's fallback for the review roles only; S5's browser slot, S16's ports and priorities across projects later: P6's readings) |
-| S11 | P7 |
+| S11, S18 | P7 (S18 outside P7's exit gate) |
 | S15 | P9 |
 | S14 | P10 |
