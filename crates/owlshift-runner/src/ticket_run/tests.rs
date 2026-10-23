@@ -736,14 +736,19 @@ struct Owl426Reader {
     refused: usize,
     status_delete_pending: usize,
     status_other: usize,
-    gone_at_once: usize,
-    listed_at_once: usize,
-    error_at_once: usize,
-    pending_now: usize,
-    gone_now: usize,
-    unexplained: usize,
+    gone_first_ask: usize,
+    gone_second_ask: usize,
+    gone_later_ask: usize,
     never_gone: usize,
+    max_asks: u32,
     max_us_to_gone: u128,
+    us_le_25: usize,
+    us_le_100: usize,
+    us_le_1000: usize,
+    us_gt_1000: usize,
+    miss_listed: usize,
+    miss_refused: usize,
+    pending_at_miss: usize,
     during_partial_removal: usize,
     during_retire: usize,
     during_either: usize,
@@ -758,7 +763,20 @@ impl Owl426Reader {
             let entry = entry.unwrap();
             let path = entry.path();
             let before = phase.load(Ordering::SeqCst);
-            let stat = fs::symlink_metadata(&path);
+            // The open `symlink_metadata` makes first on Windows (no access,
+            // backup semantics, the link itself), whose status its fallback
+            // to FindFirstFileExW would overwrite.
+            #[cfg(windows)]
+            let stat = {
+                use std::os::windows::fs::OpenOptionsExt;
+                OpenOptions::new()
+                    .access_mode(0)
+                    .custom_flags(0x0200_0000 | 0x0020_0000)
+                    .open(&path)
+                    .map(drop)
+            };
+            #[cfg(not(windows))]
+            let stat = fs::symlink_metadata(&path).map(drop);
             let status = owl426_status();
             match stat {
                 Err(error) if error.kind() == io::ErrorKind::NotFound => {
@@ -813,48 +831,62 @@ impl Owl426Reader {
         use std::sync::atomic::Ordering;
         use std::time::{Duration, Instant};
         let path = entry.path();
-        let at_once = fs::symlink_metadata(&path);
-        let pending = files::delete_pending(folder, &entry.file_name());
-        let now = gone(&path);
-        let after = phase.load(Ordering::SeqCst);
+        // `gone` asked again and again from the refusal on: how many asks,
+        // and how long, until the entry is gone; at the first ask that does
+        // not find it gone, what the metadata said and whether the file
+        // system called it being deleted.
         let started = Instant::now();
-        let mut us_to_gone = None;
+        let (mut asks, mut us_to_gone, mut first_miss) = (0_u32, None, None);
         while started.elapsed() < Duration::from_secs(1) {
-            if gone(&path) {
+            asks += 1;
+            let meta = fs::symlink_metadata(&path);
+            if meta
+                .as_ref()
+                .is_err_and(|error| error.kind() == io::ErrorKind::NotFound)
+            {
                 us_to_gone = Some(started.elapsed().as_micros());
                 break;
             }
+            if first_miss.is_none() {
+                let said = match meta {
+                    Ok(_) => "listed".to_owned(),
+                    Err(error) => format!("error ({error})"),
+                };
+                first_miss = Some((said, files::delete_pending(folder, &entry.file_name())));
+            }
         }
+        let after = phase.load(Ordering::SeqCst);
         let name = entry.file_name().to_string_lossy().into_owned();
         let n: u64 = name.rsplit_once("-r").unwrap().1.parse().unwrap();
-        let at_once_text = match &at_once {
-            Ok(_) => {
-                self.listed_at_once += 1;
-                "listed".to_owned()
-            }
-            Err(e) if e.kind() == io::ErrorKind::NotFound => {
-                self.gone_at_once += 1;
-                "gone".to_owned()
-            }
-            Err(e) => {
-                self.error_at_once += 1;
-                format!("error ({e})")
-            }
-        };
         self.refused += 1;
         if status == OWL426_DELETE_PENDING {
             self.status_delete_pending += 1;
         } else {
             self.status_other += 1;
         }
-        self.pending_now += usize::from(pending);
-        self.gone_now += usize::from(now);
-        if at_once_text != "gone" && !pending && !now {
-            self.unexplained += 1;
+        match (asks, us_to_gone) {
+            (_, None) => self.never_gone += 1,
+            (1, Some(_)) => self.gone_first_ask += 1,
+            (2, Some(_)) => self.gone_second_ask += 1,
+            (_, Some(_)) => self.gone_later_ask += 1,
         }
-        match us_to_gone {
-            Some(us) => self.max_us_to_gone = self.max_us_to_gone.max(us),
-            None => self.never_gone += 1,
+        self.max_asks = self.max_asks.max(asks);
+        if let Some(us) = us_to_gone {
+            self.max_us_to_gone = self.max_us_to_gone.max(us);
+            match us {
+                0..=25 => self.us_le_25 += 1,
+                26..=100 => self.us_le_100 += 1,
+                101..=1000 => self.us_le_1000 += 1,
+                _ => self.us_gt_1000 += 1,
+            }
+        }
+        if let Some((said, pending)) = &first_miss {
+            if said == "listed" {
+                self.miss_listed += 1;
+            } else {
+                self.miss_refused += 1;
+            }
+            self.pending_at_miss += usize::from(*pending);
         }
         // Phases are `n << 8 | p`: 2 published, 3 partial removed, 4
         // retiring, 5 retired. Partial removed before the read began: the
@@ -871,8 +903,8 @@ impl Owl426Reader {
         };
         println!(
             "OWL426 refusal variant={variant} {name}: {error} ({step}); status 0x{status:08X}; \
-             gone at once: {at_once_text}; delete pending now: {pending}; gone now: {now}; \
-             gone after: {us_to_gone:?} us; writer {}.{} -> {}.{} ({during})",
+             gone at ask {asks} after {us_to_gone:?} us; first miss (metadata, delete pending \
+             now): {first_miss:?}; writer {}.{} -> {}.{} ({during})",
             before >> 8,
             before & 0xff,
             after >> 8,
@@ -974,9 +1006,10 @@ fn owl426_probe() {
     let r = &reader;
     println!(
         "OWL426 summary variant={variant} sightings={} vanished={} unparsed={} refused={} \
-         status_delete_pending={} status_other={} gone_at_once={} listed_at_once={} \
-         error_at_once={} pending_now={} gone_now={} unexplained={} never_gone={} \
-         max_us_to_gone={} during_partial_removal={} during_retire={} during_either={} \
+         status_delete_pending={} status_other={} gone_first_ask={} gone_second_ask={} \
+         gone_later_ask={} never_gone={} max_asks={} max_us_to_gone={} us_le_25={} \
+         us_le_100={} us_le_1000={} us_gt_1000={} miss_listed={} miss_refused={} \
+         pending_at_miss={} during_partial_removal={} during_retire={} during_either={} \
          link_retries={} partial_remove_failures={} publish_retries={} retire_retries={}",
         r.sightings,
         r.vanished,
@@ -984,14 +1017,19 @@ fn owl426_probe() {
         r.refused,
         r.status_delete_pending,
         r.status_other,
-        r.gone_at_once,
-        r.listed_at_once,
-        r.error_at_once,
-        r.pending_now,
-        r.gone_now,
-        r.unexplained,
+        r.gone_first_ask,
+        r.gone_second_ask,
+        r.gone_later_ask,
         r.never_gone,
+        r.max_asks,
         r.max_us_to_gone,
+        r.us_le_25,
+        r.us_le_100,
+        r.us_le_1000,
+        r.us_gt_1000,
+        r.miss_listed,
+        r.miss_refused,
+        r.pending_at_miss,
         r.during_partial_removal,
         r.during_retire,
         r.during_either,
