@@ -550,7 +550,8 @@ fn only_this_module_writes_a_ticket_ref() {
 /// writes its own without the project's lock, while a watch pass that holds
 /// it lists the folder, and one read empty there quarantined the project.
 /// The writer writes and removes one obligation after another; the reader
-/// lists the folder meanwhile, and every record it finds reads.
+/// lists the folder meanwhile, and every record it finds reads. On Windows
+/// it also meets obligations refused while they are deleted (OWL-426).
 #[test]
 fn an_obligation_is_never_seen_partly_written() {
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -578,11 +579,8 @@ fn an_obligation_is_never_seen_partly_written() {
                     Err(why) => unread.push(format!(
                         "{}: {why}; delete pending now: {}, gone now: {}",
                         found.name,
-                        owlshift_platform::files::delete_pending(
-                            &dirs.obligations_dir(),
-                            found.name.as_ref()
-                        ),
-                        !dirs.obligations_dir().join(&found.name).exists(),
+                        files::delete_pending(&dirs.obligations_dir(), found.name.as_ref()),
+                        gone(&dirs.obligations_dir().join(&found.name)),
                     )),
                 }
             }
