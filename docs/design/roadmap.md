@@ -145,7 +145,7 @@ Owlshift replaces `/parallel` on Locary.
 - Path-scoped rules, which the build plan tied to zones at intake: zones arrive, but injecting a project's rules per zone needs a project-file key and brief changes no collision depends on, so they are left for a later ticket.
 - Claims with leases on git refs stay P7's, as that step says: on one machine, a lock per ticket keeps two commands off one ticket.
 
-**Exit gate.** A week on Locary with three concurrent tickets and no collision. Judged on outcomes ([build plan](build-plan.md), "P6 tasks & exit gate"): no file changed by two Owlshift pull requests in flight together, no rebase run caused by a sibling's merge on the same files, no isolation breach caused by a sibling step; the week's throughput and cost are compared with a `/parallel` lot of like size.
+**Exit gate.** A week on Locary with three concurrent tickets and no collision. Judged on outcomes ([build plan](build-plan.md), "P6 tasks & exit gate"): no file changed by two Owlshift pull requests in flight together, no rebase run caused by a sibling's merge on the same files, no isolation breach caused by a sibling step; the week's throughput and cost are compared with a `/parallel` lot of like size. Shortened on 2026-10-23 (OWL-408) by the maintainer from a week to the 2.9 days run, three tickets or more in flight on two of them: 23 pull requests merged with no collision settled what the gate checks. Passed on 2026-10-23; the runs are recorded in the [build plan](build-plan.md) ("P6 tasks & exit gate").
 
 ## P7 · Background service
 
