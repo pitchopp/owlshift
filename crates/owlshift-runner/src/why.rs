@@ -562,8 +562,9 @@ fn render_base(out: &mut String, check: &Check) {
             let _ = writeln!(
                 out,
                 "base {short}: fails its {} command `{}` ({}) since {}, last checked {}; the \
-                 Builds made from it wait, and a branch with commits of its own on it needs it \
-                 to pass, or a person to rebase it",
+                 Builds made from it wait, and a branch with commits of its own on it is rebased \
+                 onto the default branch's head once that head passes, unless its pull request \
+                 is open: a person rebases that one",
                 base::step_name(failure.failing.step),
                 failure.failing.command,
                 failure.reason,

@@ -1436,8 +1436,32 @@ impl Bench {
         replies: Vec<Reply>,
         sleep: &mut dyn FnMut(Duration) -> bool,
     ) -> (Vec<Result<Delivered, Stop>>, String, String) {
+        self.watch_passes_during(replies, Vec::new(), sleep)
+    }
+
+    /// [`Self::watch`] with `during` happening while the runs it names work,
+    /// counted over the whole watch.
+    fn watch_during(
+        &self,
+        replies: Vec<Reply>,
+        during: Vec<During>,
+        sleep: &mut dyn FnMut(Duration) -> bool,
+    ) -> (Vec<Result<Delivered, Stop>>, String, String) {
+        let mut steps = Steps::default();
+        self.watch_passes_during(replies, during, &mut |interval| {
+            steps.idle(interval, &mut *sleep)
+        })
+    }
+
+    /// [`Self::watch_passes`] with `during`.
+    fn watch_passes_during(
+        &self,
+        replies: Vec<Reply>,
+        during: Vec<During>,
+        sleep: &mut dyn FnMut(Duration) -> bool,
+    ) -> (Vec<Result<Delivered, Stop>>, String, String) {
         let ((outcomes, lines), printed) =
-            self.with_on_demand(replies, None, Vec::new(), |on_demand, sink| {
+            self.with_on_demand(replies, None, during, |on_demand, sink| {
                 let (mut outcomes, mut lines) = (Vec::new(), Vec::new());
                 let watch = Watch {
                     on_demand,

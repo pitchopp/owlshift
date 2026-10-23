@@ -414,7 +414,7 @@ fn head(git: &Git, worktree: &Path) -> Result<String, GateFailure> {
 /// git would look into one with its own git, reading configuration the
 /// guard does not check. Every filter driver git would find is switched off
 /// ([`filter_drivers_off`]); a list read that way names them.
-fn uncommitted(git: &Git, worktree: &Path) -> Result<String, GateFailure> {
+pub(crate) fn uncommitted(git: &Git, worktree: &Path) -> Result<String, GateFailure> {
     let status = status(git, worktree)?;
     let paths: Vec<String> = status
         .entries

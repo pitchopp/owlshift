@@ -945,8 +945,9 @@ impl fmt::Display for Stop {
                      fresh worktree too, so the failure is the base's and nothing was counted. \
                      Its Build goes on once {short} passes: after a fix, `owlshift gate --at \
                      {commit}` checks it again, as does the next commit on the default branch; \
-                     a branch with commits of its own on {short} needs that base to pass, or a \
-                     person to rebase it. `owlshift why` lists the tickets it holds."
+                     a branch with commits of its own on {short} is rebased onto the default \
+                     branch's head once that head passes, unless its pull request is open: a \
+                     person rebases that one. `owlshift why` lists the tickets it holds."
                 )
             }
             Self::BaseHeld {
@@ -2834,13 +2835,13 @@ impl OnDemand<'_> {
     fn build(
         &self,
         p: &mut Prepared,
+        command: Command,
         dispatched: &Dispatched,
         mut state: TicketState,
         sink: &mut EventSink<'_>,
     ) -> Result<Built, Stop> {
         let current = person(p.current()?, &p.found);
         self.keep(p, &state)?;
-        let harness = self.build.harness(dispatched.build);
         let confirmation = self.config.pipeline.findings();
         let mut gathered = Gathered::default();
         // The delivery's notes and follow-ups gathered so far, kept with the
@@ -2859,8 +2860,24 @@ impl OnDemand<'_> {
         // integrate (OWL-139): one such run per delivery.
         let mut integrating: Option<Vec<Comment>> = None;
         // A Build configured at a broken base waits, and a done Build whose
-        // gate a hold kept runs that gate alone once it passes (OWL-418).
-        let mut regate = self.before_base(p, dispatched, &state, sink)?;
+        // gate a hold kept runs that gate alone once it passes (OWL-418); a
+        // held branch with commits of its own may be rebased first onto a
+        // newer base that passes, the Build configured there (OWL-427).
+        let rebased;
+        let (dispatched, mut regate) =
+            match self.before_base(p, command, dispatched, &state, sink)? {
+                base_hold::Resume::Go(done) => (dispatched, done),
+                base_hold::Resume::Rebased {
+                    dispatched: moved,
+                    done,
+                    followups,
+                } => {
+                    gather(&mut gathered.followups, &followups);
+                    rebased = moved;
+                    (&*rebased, done)
+                }
+            };
+        let harness = self.build.harness(dispatched.build);
         if let Some(done) = &regate {
             gather(&mut gathered.decisions, &done.notes);
             gather(&mut gathered.followups, &done.followups);
@@ -6683,15 +6700,8 @@ impl OnDemand<'_> {
         let classified = rebase::classify(git, &checkout, onto.as_str(), pushed, !refresh);
         let dispatched = self.dispatch(p, Command::Rebase, sink)?;
         let fast = |attempt: u32| classified.trivial && attempt == 1;
-        // The rebase role takes no effort: its own fast tier, then the
-        // ticket's tier (architecture section 5, "Per-ticket routing").
-        let fast_run = self.rebase.harness(
-            role_routing(Role::Rebase, dispatched.routing).expect("the rebase role has a tier"),
-        );
-        let build_run = self.rebase.harness(RunRouting {
-            effort: None,
-            ..dispatched.build
-        });
+        let fast_run = self.rebase_harness(true, &dispatched);
+        let build_run = self.rebase_harness(false, &dispatched);
         let harness = |attempt: u32| {
             if fast(attempt) {
                 &*fast_run
@@ -6709,7 +6719,7 @@ impl OnDemand<'_> {
                     ("watch", json!("rebase_run")),
                     ("pull_request", json!(pr.number)),
                     ("attempt", json!(attempt)),
-                    ("tier", json!(if fast(attempt) { "fast" } else { "build" })),
+                    ("tier", json!(rebase_tier(fast(attempt)))),
                     ("trivial", json!(classified.trivial)),
                     ("refresh", json!(refresh)),
                     ("onto", json!(onto.as_str())),
@@ -6778,6 +6788,22 @@ impl OnDemand<'_> {
             following,
             sink,
         )
+    }
+
+    /// The harness of a rebase run, Watch's or a held Build's (OWL-427):
+    /// the rebase role takes no effort, its own `fast` tier, else the
+    /// ticket's (architecture section 5, "Per-ticket routing").
+    fn rebase_harness(&self, fast: bool, dispatched: &Dispatched) -> Box<dyn Harness + '_> {
+        if fast {
+            self.rebase.harness(
+                role_routing(Role::Rebase, dispatched.routing).expect("the rebase role has a tier"),
+            )
+        } else {
+            self.rebase.harness(RunRouting {
+                effort: None,
+                ..dispatched.build
+            })
+        }
     }
 
     /// The pull request conflicts with the base its last rebase was pushed
@@ -8393,6 +8419,11 @@ fn late_times(late: &[Comment]) -> String {
 }
 
 /// Why a parked run failed, in one line.
+/// The tier a rebase run's `decision` event names.
+fn rebase_tier(fast: bool) -> &'static str {
+    if fast { "fast" } else { "build" }
+}
+
 fn park_detail(outcome: &Outcome) -> String {
     match outcome {
         Outcome::Quarantined(violations) => {

@@ -279,6 +279,29 @@ pub(super) fn start_from_base(
     })
 }
 
+/// Moves the kept `worktree`'s `branch` back to `commit` after a held
+/// Build's rebase run the runner did not take (OWL-427): the worktree
+/// checked as [`prepare`] checks a kept one, on the branch, then `git reset
+/// --hard` there. Untracked and ignored files stay, the Build's plan and
+/// ledger among them; what the run left of tracked changes goes, the
+/// rebase having started from a clean worktree.
+pub(super) fn restore(
+    git: &Git,
+    main: &Path,
+    worktree: &Path,
+    branch: &str,
+    commit: &str,
+) -> Result<(), ExecutorError> {
+    check_spec(git, main, worktree, branch)?;
+    check_kept(git, main, worktree, branch)?;
+    git.run(
+        worktree,
+        &["reset", "--hard", "--quiet", "--end-of-options", commit],
+    )
+    .map(drop)
+    .map_err(|e| ExecutorError::Worktree(format!("moving {branch} back to {commit}: {}", e.detail)))
+}
+
 /// The commit a new branch starts from. A full object id is taken as the
 /// commit it names: git never lets a ref shadow 40 or 64 hex digits. Any
 /// other base is a remote-tracking name, looked up as exactly

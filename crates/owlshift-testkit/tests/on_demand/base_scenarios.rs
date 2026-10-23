@@ -58,6 +58,367 @@ fn state_of(bench: &Bench) -> (Status, u32) {
     (state.status(), state.failed_runs())
 }
 
+/// OWL-427's base setup: red while `marker`, the environment, is missing,
+/// unless the code carries `FIXED`, the fix a later commit on `main` brings.
+fn fixable_setup(marker: &Path) -> String {
+    format!("{} || test -f FIXED", setup_line(marker))
+}
+
+/// A held Build's rebase run's `done`.
+const REBASED_HELD: &str =
+    r#"{"format":14,"status":"done","summary":"Rebased onto the fix; nothing conflicted."}"#;
+
+/// What the agent of the `run`th run does in the ticket's worktree: `git`
+/// with `args`, which must succeed.
+fn agent_git(bench: &Bench, run: usize, args: Vec<String>) -> During {
+    let (env, worktree) = (bench.env.clone(), bench.worktree());
+    (
+        run,
+        Box::new(move || {
+            let args: Vec<&str> = args.iter().map(String::as_str).collect();
+            env.run(&worktree, &args).unwrap();
+        }),
+    )
+}
+
+/// The ticket's worktree's head.
+fn worktree_head(bench: &Bench) -> String {
+    let out = bench
+        .env
+        .run(&bench.worktree(), &["rev-parse", "HEAD"])
+        .unwrap();
+    String::from_utf8(out).unwrap().trim().to_owned()
+}
+
+/// The `decision` events of the rebases off a held commit.
+fn held_rebases(bench: &Bench) -> Vec<Value> {
+    data_of(&bench.events(), EventKind::Decision, "base")
+        .into_iter()
+        .filter(|data| data["base"] == json!("rebase"))
+        .collect()
+}
+
+/// Each base check's commit, change and verdict, in order.
+fn checks_made(bench: &Bench) -> Vec<(String, String, String)> {
+    data_of(&bench.events(), EventKind::Decision, "base")
+        .into_iter()
+        .filter(|data| data["base"] == json!("checked"))
+        .map(|data| {
+            let text = |key: &str| data[key].as_str().unwrap().to_owned();
+            (text("commit"), text("change"), text("verdict"))
+        })
+        .collect()
+}
+
+/// A done Build held at its base: the store loses its version while the
+/// Build works, so its gate's setup breaks after its `done`, on the base
+/// too. Returns the held commit and the branch's head.
+fn held_done_build(bench: &Bench, marker: &Path) -> (String, String) {
+    fs::write(marker, "").unwrap();
+    let base = with_setup(bench, &fixable_setup(marker), None);
+    let lost = marker.to_owned();
+    let lose: During = (1, Box::new(move || fs::remove_file(&lost).unwrap()));
+    let (held, printed) = bench.invoke(
+        false,
+        vec![bench.reply(Some("Hello"), Some(DONE))],
+        None,
+        vec![lose],
+    );
+    assert!(
+        matches!(&held, Err(Stop::BaseHeld { commit, pending: false, .. }) if *commit == base),
+        "{held:?}\n{printed}"
+    );
+    assert!(base::read_wait(&bench.dirs(), &ticket()).is_some_and(|wait| wait.done.is_some()));
+    (base, worktree_head(bench))
+}
+
+/// The Build's uncommitted plan, planted in the worktree's run folder,
+/// which a rebase off a held commit keeps.
+fn plant_plan(bench: &Bench) -> PathBuf {
+    let plan = bench.worktree().join(".owlshift/run/plan.md");
+    fs::write(&plan, "1. Add the greeting.\n").unwrap();
+    plan
+}
+
+/// OWL-427, criteria 1, 2 and 5, with no person: a done Build held at its
+/// base, whose environment stays broken, goes on once a fix lands on
+/// `main`. Watch's first pass checks the held commit again (still failing),
+/// then `main`'s head (passing), rebases the branch there with one rebase
+/// run on the fast tier, briefed with the broken commit and no gate, runs
+/// only the Build's gate, and delivers onto the fix, the Build's
+/// uncommitted plan kept.
+#[test]
+fn watch_rebases_a_held_done_build_onto_a_head_that_passes() {
+    let bench = Bench::new(true);
+    let marker = bench.tmp.path().join("store-has-rollup");
+    let (held, start) = held_done_build(&bench, &marker);
+    let plan = plant_plan(&bench);
+    let fixed = bench.merge_into_main(&[("FIXED", "fixed\n")]);
+    let rebase = agent_git(
+        &bench,
+        1,
+        vec!["rebase".to_owned(), "--quiet".to_owned(), fixed.clone()],
+    );
+
+    let (outcomes, lines, printed) = bench.watch_during(
+        vec![bench.reply(None, Some(REBASED_HELD))],
+        vec![rebase],
+        &mut |_| false,
+    );
+    assert!(
+        matches!(outcomes.last(), Some(Ok(_)))
+            && outcomes
+                .iter()
+                .all(|o| !matches!(o, Err(Stop::Parked { .. }))),
+        "{outcomes:?}\n{lines}\n{printed}"
+    );
+    assert_eq!(
+        builds(&bench),
+        [false, true],
+        "the gate alone after the rebase"
+    );
+    let brief = bench.last_of(Role::Rebase);
+    assert!(brief.gate.is_empty(), "{:?}", brief.gate);
+    let told = brief.rebase.expect("what to rebase");
+    assert_eq!(
+        (
+            told.pull_request,
+            told.broken.as_deref(),
+            told.onto.as_str(),
+            told.head.as_str()
+        ),
+        (None, Some(held.as_str()), fixed.as_str(), start.as_str())
+    );
+    let passed = |commit: &str, change: &str, verdict: &str| {
+        (commit.to_owned(), change.to_owned(), verdict.to_owned())
+    };
+    assert_eq!(
+        checks_made(&bench),
+        [
+            passed(&held, "opened", "failed"),
+            passed(&held, "still_held", "failed"),
+            passed(&fixed, "cached", "passed"),
+        ]
+    );
+    let rebases = held_rebases(&bench);
+    assert_eq!(rebases.len(), 1, "{rebases:?}");
+    assert_eq!(
+        (
+            &rebases[0]["from"],
+            &rebases[0]["onto"],
+            &rebases[0]["tier"],
+            &rebases[0]["trivial"]
+        ),
+        (&json!(held), &json!(fixed), &json!("fast"), &json!(true))
+    );
+    let configured = data_of(&bench.events(), EventKind::Dispatch, "configured_at");
+    assert_eq!(configured.last().unwrap()["configured_at"], json!(fixed));
+    let delivered = bench.remote_branch().expect("delivered");
+    assert!(is_ancestor(&bench, &fixed, &delivered));
+    assert!(plan.exists(), "the Build's plan was kept");
+    assert!(!base::wait_file(&bench.dirs(), &ticket()).exists());
+}
+
+/// OWL-427, criterion 3 and the guardrails: a rebase run that drops the
+/// branch's work (here, the branch reset to the fix itself) is refused;
+/// the branch goes back to its head before the run, nothing is pushed, and
+/// the ticket parks with a reason naming both commits. `continue` then runs
+/// the rebase again, which this time keeps the work, and the ticket
+/// delivers.
+#[test]
+fn a_rebase_that_drops_the_work_parks_with_the_branch_where_it_was() {
+    let bench = Bench::parking();
+    let marker = bench.tmp.path().join("store-has-rollup");
+    let (held, start) = held_done_build(&bench, &marker);
+    let plan = plant_plan(&bench);
+    let fixed = bench.merge_into_main(&[("FIXED", "fixed\n")]);
+
+    let drop_work = agent_git(
+        &bench,
+        1,
+        vec![
+            "reset".to_owned(),
+            "--hard".to_owned(),
+            "--quiet".to_owned(),
+            fixed.clone(),
+        ],
+    );
+    let (parked, printed) =
+        bench.continue_during(vec![bench.reply(None, Some(REBASED_HELD))], vec![drop_work]);
+    assert!(
+        matches!(
+            parked,
+            Err(Stop::Parked {
+                reason: ParkReason::Rebase,
+                ..
+            })
+        ),
+        "{parked:?}\n{printed}"
+    );
+    assert_eq!(worktree_head(&bench), start, "the branch back where it was");
+    assert!(bench.remote_branch().is_none(), "nothing pushed");
+    assert!(plan.exists());
+    let parked_comment = bench
+        .comments()
+        .into_iter()
+        .find(|c| c.starts_with("[owlshift] PARKED"))
+        .expect("a PARKED comment");
+    assert!(
+        parked_comment.contains("could not be rebased")
+            && parked_comment.contains(base::short(&held))
+            && parked_comment.contains(base::short(&fixed))
+            && parked_comment.contains("it is the base itself"),
+        "{parked_comment}"
+    );
+
+    let rebase = agent_git(
+        &bench,
+        1,
+        vec!["rebase".to_owned(), "--quiet".to_owned(), fixed.clone()],
+    );
+    let (delivered, printed) =
+        bench.continue_during(vec![bench.reply(None, Some(REBASED_HELD))], vec![rebase]);
+    delivered.unwrap_or_else(|stop| panic!("{stop}\n{printed}"));
+    assert_eq!(held_rebases(&bench).len(), 2);
+    assert_eq!(builds(&bench), [false, true]);
+    let delivered = bench.remote_branch().expect("delivered");
+    assert!(is_ancestor(&bench, &fixed, &delivered));
+}
+
+/// OWL-427, criterion 2 for a Build held before its run: its branch carries
+/// a first round's commit, and a sibling's failure held the commit it was
+/// made from. Once a fix lands, the answered round's `continue` rebases
+/// the branch, then runs the Build on it, configured at the fix, its plan
+/// kept.
+#[test]
+fn a_held_build_with_commits_of_its_own_runs_on_the_rebased_branch() {
+    use owlshift_core::base::{Check, Checks, Entry, Failing, Failure, Hold, Step, Verdict};
+
+    let bench = Bench::new(true);
+    let marker = bench.tmp.path().join("store-has-rollup");
+    fs::write(&marker, "").unwrap();
+    let setup = fixable_setup(&marker);
+    let held = with_setup(&bench, &setup, None);
+    let (asked, printed) = bench.run(vec![bench.reply(Some("Hello"), Some(ROUND_1))], None);
+    assert!(
+        matches!(asked, Err(Stop::NeedsInput { .. })),
+        "{asked:?}\n{printed}"
+    );
+    let plan = plant_plan(&bench);
+    // The store loses its version; another ticket's failure held the commit.
+    fs::remove_file(&marker).unwrap();
+    let gate: Vec<String> =
+        vec!["test ! -e GREETING.md || git grep -q Hello -- GREETING.md".to_owned()];
+    let failing = Failing {
+        step: Step::Setup,
+        command: setup.clone(),
+    };
+    let checks = Checks {
+        checks: vec![Check {
+            commit: held.clone(),
+            commands: base::commands_key(std::slice::from_ref(&setup), &gate),
+            entry: Entry::Checked {
+                head: held.clone(),
+                checked_ms: 0,
+                verdict: Verdict::Failed(Failure {
+                    failing,
+                    reason: "setup: exit status 1".to_owned(),
+                    tail: String::new(),
+                }),
+                hold: Some(Hold {
+                    since_ms: 0,
+                    told: true,
+                }),
+            },
+        }],
+    };
+    base::write(&bench.dirs(), &checks).unwrap();
+    let fixed = bench.merge_into_main(&[("FIXED", "fixed\n")]);
+    bench.answer("Q1: English.\nQ2: \"Hello, reader.\"\ngo");
+
+    let answered = check(&[
+        ("Q1", "answered", "English."),
+        ("Q2", "answered", "Hello, reader."),
+    ]);
+    let rebase = agent_git(
+        &bench,
+        2,
+        vec!["rebase".to_owned(), "--quiet".to_owned(), fixed.clone()],
+    );
+    let (delivered, printed) = bench.continue_during(
+        vec![
+            bench.reply(None, Some(&answered)),
+            bench.reply(None, Some(REBASED_HELD)),
+            bench.reply(None, Some(DONE)),
+        ],
+        vec![rebase],
+    );
+    delivered.unwrap_or_else(|stop| panic!("{stop}\n{printed}"));
+    let roles: Vec<Value> = data_of(&bench.events(), EventKind::RunStarted, "role")
+        .into_iter()
+        .map(|data| data["role"].clone())
+        .collect();
+    assert_eq!(
+        roles[..4],
+        [
+            json!("build"),
+            json!("answer_check"),
+            json!("rebase"),
+            json!("build"),
+        ],
+        "{roles:?}"
+    );
+    assert_eq!(
+        builds(&bench),
+        [false, false],
+        "a Build run, not its gate alone"
+    );
+    let configured = data_of(&bench.events(), EventKind::Dispatch, "configured_at");
+    assert_eq!(configured.last().unwrap()["configured_at"], json!(fixed));
+    assert!(plan.exists(), "the Build's plan was kept");
+    assert!(is_ancestor(&bench, &fixed, &bench.remote_branch().unwrap()));
+}
+
+/// OWL-427's limit, decided on 2026-10-23: a held ticket whose pull request
+/// is open is not rebased, its notice saying a person rebases it.
+#[test]
+fn a_held_ticket_with_an_open_pull_request_is_not_rebased() {
+    use owlshift_contracts::format::Format;
+    use owlshift_contracts::refs::{DeliveredPullRequest, TicketDelivery};
+
+    let bench = Bench::new(true);
+    let marker = bench.tmp.path().join("store-has-rollup");
+    let (held, start) = held_done_build(&bench, &marker);
+    let mut record = bench.record();
+    record.delivery = Some(TicketDelivery {
+        format: Format,
+        pull_request: Some(DeliveredPullRequest {
+            number: 1,
+            url: "https://github.com/demo/project/pull/1".to_owned(),
+        }),
+        branch: BRANCH.to_owned(),
+        base_branch: "main".to_owned(),
+        delivered_at: None,
+        pushed: Some(start.clone()),
+        base_at_push: Some(held.clone()),
+        rebased_onto: None,
+        pushing: None,
+        owed: None,
+        ended: None,
+    });
+    bench.write_record(&record);
+    bench.merge_into_main(&[("FIXED", "fixed\n")]);
+
+    let (still, printed) = bench.continue_ticket(Vec::new());
+    let text = match &still {
+        Err(stop @ Stop::BaseHeld { commit, .. }) if *commit == held => stop.to_string(),
+        other => panic!("{other:?}\n{printed}"),
+    };
+    assert!(text.contains("unless its pull request is open"), "{text}");
+    assert!(held_rebases(&bench).is_empty());
+    assert_eq!(worktree_head(&bench), start);
+}
+
 /// Criteria 1 and 2: the base's setup breaks before any of the branch's
 /// code runs. `do` checks the base once, holds the commit and counts
 /// nothing: no harness, no recovery run, no park, one notification; a

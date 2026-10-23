@@ -2105,6 +2105,8 @@ impl Watch<'_> {
         if memory.holds.admit(ticket, &seen, now) != Admit::Go {
             return;
         }
+        // Such a step may start a rebase run first (OWL-427), whose own
+        // check of its harness's usage holds it, nothing spent.
         let gate_only = stage == Stage::Build && base::wait_file(on_demand.dirs, ticket).exists();
         match self.usage_wait(
             memory,
