@@ -596,3 +596,409 @@ fn an_obligation_is_never_seen_partly_written() {
     );
     assert!(seen > 0, "the reader saw no obligation");
 }
+
+// ---------------------------------------------------------------------------
+// OWL-426 probe, temporary: run on windows-latest by
+// .github/workflows/owl-426-probe.yml, deleted before the pull request opens.
+// Why does Windows refuse some reads of `unverified/` while the writer works?
+// Four writers (publish by hard link, fb88d18's form, or by the no-replace
+// move of `files::publish`; retire by deleting in the folder or by renaming
+// out of it) against a reader that skips nothing, each refused read reported
+// with the NTSTATUS of the refused call and what the file system says next.
+// ---------------------------------------------------------------------------
+
+#[cfg(windows)]
+#[link(name = "ntdll", kind = "raw-dylib")]
+unsafe extern "system" {
+    safe fn RtlGetLastNtStatus() -> i32;
+}
+
+#[cfg(windows)]
+#[link(name = "kernel32", kind = "raw-dylib")]
+unsafe extern "system" {
+    fn SetFileInformationByHandle(
+        file: *mut std::ffi::c_void,
+        class: i32,
+        info: *const std::ffi::c_void,
+        size: u32,
+    ) -> i32;
+}
+
+const OWL426_DELETE_PENDING: u32 = 0xC000_0056;
+
+/// The NTSTATUS the calling thread's last failed system call left; 0 off
+/// Windows.
+fn owl426_status() -> u32 {
+    #[cfg(windows)]
+    {
+        RtlGetLastNtStatus().cast_unsigned()
+    }
+    #[cfg(not(windows))]
+    {
+        0
+    }
+}
+
+/// The status read names the call that failed: a missing file, a folder
+/// opened as a file, and a file held under a delete disposition each give
+/// their own, and `files::delete_pending` sees the last one.
+#[cfg(windows)]
+fn owl426_calibrate(dir: &Path) {
+    use std::os::windows::fs::OpenOptionsExt;
+    use std::os::windows::io::AsRawHandle;
+
+    let error = File::open(dir.join("missing")).unwrap_err();
+    let status = owl426_status();
+    println!("OWL426 calibration missing: {error}; status 0x{status:08X}");
+    assert_eq!(
+        (error.kind(), status),
+        (io::ErrorKind::NotFound, 0xC000_0034)
+    );
+
+    let error = File::open(dir).unwrap_err();
+    let status = owl426_status();
+    println!("OWL426 calibration folder: {error}; status 0x{status:08X}");
+    assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+    assert!(![0, 0xC000_0034, OWL426_DELETE_PENDING].contains(&status));
+
+    let path = dir.join("calibration");
+    fs::write(&path, "x").unwrap();
+    let held = OpenOptions::new()
+        .access_mode(0x0001_0000) // DELETE
+        .share_mode(7)
+        .open(&path)
+        .unwrap();
+    let delete: u8 = 1;
+    // SAFETY: `held` is open with DELETE access for the whole call, and the
+    // buffer is a live BOOLEAN of the size passed (FileDispositionInfo = 4).
+    let set = unsafe {
+        SetFileInformationByHandle(held.as_raw_handle(), 4, (&raw const delete).cast(), 1)
+    };
+    assert_ne!(set, 0, "{}", io::Error::last_os_error());
+    let error = File::open(&path).unwrap_err();
+    let status = owl426_status();
+    let listed = fs::read_dir(dir)
+        .unwrap()
+        .any(|entry| entry.unwrap().file_name() == "calibration");
+    let pending = files::delete_pending(dir, "calibration".as_ref());
+    println!(
+        "OWL426 calibration delete pending: {error}; status 0x{status:08X}; listed: {listed}; \
+         delete pending now: {pending}"
+    );
+    assert_eq!(
+        (error.kind(), status, listed, pending),
+        (
+            io::ErrorKind::PermissionDenied,
+            OWL426_DELETE_PENDING,
+            true,
+            true
+        )
+    );
+    drop(held);
+    assert!(gone(&path));
+}
+
+/// Sets `done` however the writer ends, so the reader never waits on a
+/// writer that panicked.
+struct Owl426Done<'a>(&'a std::sync::atomic::AtomicBool);
+
+impl Drop for Owl426Done<'_> {
+    fn drop(&mut self) {
+        self.0.store(true, std::sync::atomic::Ordering::Release);
+    }
+}
+
+#[derive(Default)]
+struct Owl426Writer {
+    link_retries: usize,
+    partial_remove_failures: usize,
+    publish_retries: usize,
+    retire_retries: usize,
+}
+
+/// `op`, tried again up to 50 times 10 ms apart, each failure counted.
+fn owl426_retry(count: &mut usize, mut op: impl FnMut() -> io::Result<()>) {
+    for _ in 0..50 {
+        if op().is_ok() {
+            return;
+        }
+        *count += 1;
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    op().unwrap();
+}
+
+#[derive(Default)]
+struct Owl426Reader {
+    sightings: usize,
+    vanished: usize,
+    unparsed: usize,
+    refused: usize,
+    status_delete_pending: usize,
+    status_other: usize,
+    gone_at_once: usize,
+    listed_at_once: usize,
+    error_at_once: usize,
+    pending_now: usize,
+    gone_now: usize,
+    unexplained: usize,
+    never_gone: usize,
+    max_us_to_gone: u128,
+    during_partial_removal: usize,
+    during_retire: usize,
+    during_either: usize,
+}
+
+impl Owl426Reader {
+    /// One listing of `folder`, each entry read with `read_capped`'s steps
+    /// (ticket_run.rs), without `obligations()`'s skips.
+    fn pass(&mut self, folder: &Path, phase: &std::sync::atomic::AtomicU64, variant: &str) {
+        use std::sync::atomic::Ordering;
+        for entry in fs::read_dir(folder).unwrap() {
+            let entry = entry.unwrap();
+            let path = entry.path();
+            let before = phase.load(Ordering::SeqCst);
+            let stat = fs::symlink_metadata(&path);
+            let status = owl426_status();
+            match stat {
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                    self.vanished += 1;
+                    continue;
+                }
+                Err(error) => {
+                    self.refusal(
+                        folder, &entry, "stat", &error, status, before, phase, variant,
+                    );
+                    continue;
+                }
+                Ok(_) => {}
+            }
+            let before = phase.load(Ordering::SeqCst);
+            let opened = File::open(&path);
+            let status = owl426_status();
+            match opened {
+                Ok(mut file) => {
+                    let mut text = String::new();
+                    if file.read_to_string(&mut text).is_ok() && RunObligation::parse(&text).is_ok()
+                    {
+                        self.sightings += 1;
+                    } else {
+                        self.unparsed += 1;
+                    }
+                }
+                Err(error) if error.kind() == io::ErrorKind::NotFound => self.vanished += 1,
+                Err(error) => {
+                    self.refusal(
+                        folder, &entry, "open", &error, status, before, phase, variant,
+                    );
+                }
+            }
+        }
+    }
+
+    /// A read refused: what the file system says right after, in the order
+    /// a skip would ask it, and where the writer was.
+    #[allow(clippy::too_many_arguments)]
+    fn refusal(
+        &mut self,
+        folder: &Path,
+        entry: &fs::DirEntry,
+        step: &str,
+        error: &io::Error,
+        status: u32,
+        before: u64,
+        phase: &std::sync::atomic::AtomicU64,
+        variant: &str,
+    ) {
+        use std::sync::atomic::Ordering;
+        use std::time::{Duration, Instant};
+        let path = entry.path();
+        let at_once = fs::symlink_metadata(&path);
+        let pending = files::delete_pending(folder, &entry.file_name());
+        let now = gone(&path);
+        let after = phase.load(Ordering::SeqCst);
+        let started = Instant::now();
+        let mut us_to_gone = None;
+        while started.elapsed() < Duration::from_secs(1) {
+            if gone(&path) {
+                us_to_gone = Some(started.elapsed().as_micros());
+                break;
+            }
+        }
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let n: u64 = name.rsplit_once("-r").unwrap().1.parse().unwrap();
+        let at_once_text = match &at_once {
+            Ok(_) => {
+                self.listed_at_once += 1;
+                "listed".to_owned()
+            }
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                self.gone_at_once += 1;
+                "gone".to_owned()
+            }
+            Err(e) => {
+                self.error_at_once += 1;
+                format!("error ({e})")
+            }
+        };
+        self.refused += 1;
+        if status == OWL426_DELETE_PENDING {
+            self.status_delete_pending += 1;
+        } else {
+            self.status_other += 1;
+        }
+        self.pending_now += usize::from(pending);
+        self.gone_now += usize::from(now);
+        if at_once_text != "gone" && !pending && !now {
+            self.unexplained += 1;
+        }
+        match us_to_gone {
+            Some(us) => self.max_us_to_gone = self.max_us_to_gone.max(us),
+            None => self.never_gone += 1,
+        }
+        // Phases are `n << 8 | p`: 2 published, 3 partial removed, 4
+        // retiring, 5 retired. Partial removed before the read began: the
+        // retire. Retire not begun when the checks ended: the partial.
+        let during = if before >= (n << 8 | 3) {
+            self.during_retire += 1;
+            "retire"
+        } else if after < (n << 8 | 4) {
+            self.during_partial_removal += 1;
+            "partial removal"
+        } else {
+            self.during_either += 1;
+            "either"
+        };
+        println!(
+            "OWL426 refusal variant={variant} {name}: {error} ({step}); status 0x{status:08X}; \
+             gone at once: {at_once_text}; delete pending now: {pending}; gone now: {now}; \
+             gone after: {us_to_gone:?} us; writer {}.{} -> {}.{} ({during})",
+            before >> 8,
+            before & 0xff,
+            after >> 8,
+            after & 0xff,
+        );
+    }
+}
+
+/// See the OWL-426 probe's header above.
+#[test]
+#[ignore = "OWL-426 probe, run by its workflow only"]
+fn owl426_probe() {
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    use std::time::{Duration, Instant};
+
+    const WRITES: u64 = 300;
+    let variant = std::env::var("OWL426_VARIANT").unwrap_or_else(|_| "link-delete".to_owned());
+    let (link, delete) = match variant.as_str() {
+        "link-delete" => (true, true),
+        "move-delete" => (false, true),
+        "link-rename" => (true, false),
+        "move-rename" => (false, false),
+        other => panic!("unknown variant {other}"),
+    };
+    let tmp = tempfile::tempdir().unwrap();
+    #[cfg(windows)]
+    owl426_calibrate(tmp.path());
+    let dirs = ProjectDirs::new(&tmp.path().join("data"), &Repo::parse("acme/app").unwrap());
+    let folder = dirs.obligations_dir();
+    let retired = dirs.root().join("retired");
+    fs::create_dir_all(&folder).unwrap();
+    fs::create_dir_all(&retired).unwrap();
+    let owl = ticket("OWL-1");
+    let done = AtomicBool::new(false);
+    let phase = AtomicU64::new(0);
+    let mut reader = Owl426Reader::default();
+    let writer = std::thread::scope(|scope| {
+        let writer = scope.spawn(|| {
+            let _done = Owl426Done(&done);
+            let mut counts = Owl426Writer::default();
+            for n in 0..WRITES {
+                let set = |p: u64| phase.store(n << 8 | p, Ordering::SeqCst);
+                let run = format!("r{n}");
+                let name = obligation_name(Some(&owl), &run);
+                let record = RunObligation {
+                    format: Format,
+                    ticket: Some(owl.clone()),
+                    run,
+                    started: Timestamp::now(),
+                    what: "a run".to_owned(),
+                };
+                let partial = dirs.root().join(format!("unverified-{name}.partial"));
+                let target = folder.join(&name);
+                let mut file = OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(&partial)
+                    .unwrap();
+                file.write_all(record.render().as_bytes()).unwrap();
+                file.sync_all().unwrap();
+                set(1);
+                if link {
+                    // fb88d18's writer: linked with the handle open, then the
+                    // partial removed, a failure there ignored.
+                    owl426_retry(&mut counts.link_retries, || {
+                        fs::hard_link(&partial, &target)
+                    });
+                    drop(file);
+                    set(2);
+                    if fs::remove_file(&partial).is_err() {
+                        counts.partial_remove_failures += 1;
+                    }
+                } else {
+                    drop(file);
+                    owl426_retry(&mut counts.publish_retries, || {
+                        files::publish(&partial, &target)
+                    });
+                    set(2);
+                }
+                set(3);
+                set(4);
+                if delete {
+                    owl426_retry(&mut counts.retire_retries, || fs::remove_file(&target));
+                } else {
+                    owl426_retry(&mut counts.retire_retries, || {
+                        fs::rename(&target, retired.join(&name))
+                    });
+                }
+                set(5);
+            }
+            counts
+        });
+        let deadline = Instant::now() + Duration::from_secs(120);
+        while !done.load(Ordering::Acquire) && Instant::now() < deadline {
+            reader.pass(&folder, &phase, &variant);
+        }
+        writer.join().unwrap()
+    });
+    let r = &reader;
+    println!(
+        "OWL426 summary variant={variant} sightings={} vanished={} unparsed={} refused={} \
+         status_delete_pending={} status_other={} gone_at_once={} listed_at_once={} \
+         error_at_once={} pending_now={} gone_now={} unexplained={} never_gone={} \
+         max_us_to_gone={} during_partial_removal={} during_retire={} during_either={} \
+         link_retries={} partial_remove_failures={} publish_retries={} retire_retries={}",
+        r.sightings,
+        r.vanished,
+        r.unparsed,
+        r.refused,
+        r.status_delete_pending,
+        r.status_other,
+        r.gone_at_once,
+        r.listed_at_once,
+        r.error_at_once,
+        r.pending_now,
+        r.gone_now,
+        r.unexplained,
+        r.never_gone,
+        r.max_us_to_gone,
+        r.during_partial_removal,
+        r.during_retire,
+        r.during_either,
+        writer.link_retries,
+        writer.partial_remove_failures,
+        writer.publish_retries,
+        writer.retire_retries,
+    );
+    assert!(reader.sightings > 0, "the reader saw no obligation");
+}
