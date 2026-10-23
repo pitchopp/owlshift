@@ -976,13 +976,15 @@ impl OnDemand<'_> {
                     }
                     state = next;
                 }
-                Status::Active(Stage::Build) => match self.build(p, &dispatched, state, sink)? {
-                    Built::Delivered(delivered) => return Ok(delivered),
-                    Built::Replan(next) if p.stepping => {
-                        return Err(self.stepped(p, &next, sink));
+                Status::Active(Stage::Build) => {
+                    match self.build(p, command, &dispatched, state, sink)? {
+                        Built::Delivered(delivered) => return Ok(delivered),
+                        Built::Replan(next) if p.stepping => {
+                            return Err(self.stepped(p, &next, sink));
+                        }
+                        Built::Replan(next) => state = next,
                     }
-                    Built::Replan(next) => state = next,
-                },
+                }
                 // A Verify pass `continue` runs again on the kept Build
                 // (OWL-304), then the delivery or a Verify fix run.
                 Status::Active(Stage::Verify) => {

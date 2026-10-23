@@ -1226,6 +1226,27 @@ impl Executor {
         Ok(GateRun { report, violations })
     }
 
+    /// The uncommitted paths of the ticket's kept `worktree`, read as the
+    /// gate reads them before its commands, as a short list: empty when it
+    /// is clean (OWL-427).
+    pub fn uncommitted(&self, worktree: &Path) -> Result<String, ExecutorError> {
+        gate::uncommitted(&self.git.as_agent(&self.agent), worktree)
+            .map_err(|failure| ExecutorError::Worktree(failure.reason))
+    }
+
+    /// Moves the kept `worktree`'s `branch` back to `commit` after a held
+    /// Build's rebase run the runner did not take (OWL-427); see
+    /// `worktree::restore`.
+    pub fn restore_branch(
+        &self,
+        main: &Path,
+        worktree: &Path,
+        branch: &str,
+        commit: &str,
+    ) -> Result<(), ExecutorError> {
+        worktree::restore(&self.git, main, worktree, branch, commit)
+    }
+
     /// Removes a worktree [`Executor::run_gate`] made, and its branch,
     /// without running git in it; see `worktree::discard`.
     pub fn discard_worktree(

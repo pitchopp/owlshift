@@ -19,6 +19,9 @@
 //! - *Pending.* A check that cannot run yet, another ticket's step being in
 //!   flight, leaves the failure pending ([`Checks::mark_pending`]): every
 //!   Build configured there waits until the check runs.
+//! - *Leaving a broken commit* (OWL-427). A held Build whose branch has
+//!   commits of its own is rebased onto a newer default-branch head once
+//!   that head passes its own check ([`leave`]).
 
 /// The most entries kept; past it the oldest without a hold goes first.
 pub const MAX_CHECKS: usize = 16;
@@ -81,6 +84,59 @@ pub fn whose(branch: &Failing, base: &Verdict) -> Whose {
         Whose::Base
     } else {
         Whose::Branch
+    }
+}
+
+/// A held Build's branch, as its step reads it (OWL-427).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HeldBranch {
+    /// Its head is an ancestor of the default branch's head: its next step
+    /// into Build fast-forwards it, no rebase needed.
+    NoCommitsOfItsOwn,
+    /// Commits of its own, its worktree clean: a rebase can move it.
+    OwnCommits,
+    /// Its worktree lists uncommitted paths, which moving the branch back
+    /// after a failed rebase would drop.
+    Uncommitted,
+    /// Its delivery is followed: its pull request is open, whose history
+    /// only Watch's rebase push replaces (decided on 2026-10-23).
+    Delivered,
+}
+
+/// What a Build held at a commit that still fails does about a newer head
+/// of the default branch (OWL-427).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Leave {
+    /// It stays held, as before.
+    Stay,
+    /// The head is checked first.
+    CheckHead,
+    /// Its branch is rebased onto the head.
+    Rebase,
+}
+
+/// What a Build held at `held`, whose check still fails, does about `head`,
+/// the default branch's head: a branch with commits of its own and a clean
+/// worktree is rebased onto a head that contains `held` (`head_has_held`)
+/// and passes its own check (`head_verdict`), and the head is checked when
+/// no verdict of it is kept. Anything else stays held: an environment fix
+/// lifts the hold through `held`'s own check, and a head that does not
+/// contain `held` was rewritten, so a rebase onto it would replay `held`'s
+/// own commits.
+pub fn leave(
+    held: &str,
+    head: &str,
+    head_has_held: bool,
+    head_verdict: Option<&Verdict>,
+    branch: HeldBranch,
+) -> Leave {
+    if branch != HeldBranch::OwnCommits || head == held || !head_has_held {
+        return Leave::Stay;
+    }
+    match head_verdict {
+        None => Leave::CheckHead,
+        Some(Verdict::Passed) => Leave::Rebase,
+        Some(Verdict::Failed(_)) => Leave::Stay,
     }
 }
 
@@ -582,6 +638,49 @@ mod tests {
         );
         assert_eq!(checks.before_build(X, KEY, "h1"), Before::Go);
         assert!(!checks.holds_commit(X));
+    }
+
+    /// OWL-427: only a branch with commits of its own and a clean worktree
+    /// leaves a held commit, onto a head that contains it and passes; a
+    /// head with no verdict is checked first.
+    #[test]
+    fn a_held_branch_with_commits_of_its_own_leaves_for_a_head_that_passes() {
+        let install = setup("install");
+        let broken = failed(&install);
+        let passed = Verdict::Passed;
+        let own = HeldBranch::OwnCommits;
+        let cases = [
+            ("h", true, Some(&passed), own, Leave::Rebase),
+            ("h", true, None, own, Leave::CheckHead),
+            ("h", true, Some(&broken), own, Leave::Stay),
+            // The head is the held commit: nothing newer to rebase onto.
+            (X, true, Some(&passed), own, Leave::Stay),
+            // A rewritten default branch, the held commit not in it.
+            ("h", false, Some(&passed), own, Leave::Stay),
+            (
+                "h",
+                true,
+                Some(&passed),
+                HeldBranch::NoCommitsOfItsOwn,
+                Leave::Stay,
+            ),
+            (
+                "h",
+                true,
+                Some(&passed),
+                HeldBranch::Uncommitted,
+                Leave::Stay,
+            ),
+            ("h", true, Some(&passed), HeldBranch::Delivered, Leave::Stay),
+            ("h", true, None, HeldBranch::Delivered, Leave::Stay),
+        ];
+        for (head, has_held, verdict, branch, expected) in cases {
+            assert_eq!(
+                leave(X, head, has_held, verdict, branch),
+                expected,
+                "{head} {has_held} {verdict:?} {branch:?}"
+            );
+        }
     }
 
     #[test]

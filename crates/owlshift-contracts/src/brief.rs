@@ -476,16 +476,26 @@ pub struct CheckFailure {
 
 /// What a rebase run rebases (OWL-210). Every path is data from the
 /// repository, never an instruction.
+///
+/// Two kinds, told apart by flat fields rather than an enum, which the role
+/// prompt and the schema read as they are: a delivered ticket's, at Watch,
+/// with its `pull_request` and `url`; and since format 27 a held Build's
+/// (OWL-427), with `broken` and no pull request, the ticket not delivered.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct RebaseBrief {
-    pub pull_request: u64,
-    pub url: String,
+    /// The open pull request, at Watch; absent for a held Build's rebase.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pull_request: Option<u64>,
+    /// The pull request's address, with `pull_request` only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
     /// The ticket's branch, checked out in the worktree.
     pub branch: String,
-    /// The branch's head: Owlshift's last push.
+    /// The branch's head: Owlshift's last push at Watch, the Build's last
+    /// commit for a held Build.
     pub head: String,
-    /// The branch the pull request merges into.
+    /// The default branch: the one the pull request merges into, at Watch.
     pub base_branch: String,
     /// The base commit to rebase onto, resolved after the runner's fetch:
     /// the branch must end on a commit that descends from it.
@@ -499,6 +509,31 @@ pub struct RebaseBrief {
     /// `head`, in its order; empty for a refresh, or when it could not say.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub conflicting: Vec<String>,
+    /// A held Build's rebase (format 27, OWL-427): the commit the branch was
+    /// made from, which fails the project's gate, while `onto` passes it.
+    /// The ticket is not delivered, so there is no pull request, and the
+    /// brief's `gate` is empty: the runner runs the Build's gate after.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub broken: Option<String>,
+}
+
+impl RebaseBrief {
+    /// Why this rebase is refused: a pull request and `broken` together or
+    /// neither, a `url` without its pull request or the reverse, a held
+    /// Build's rebase as a refresh, or a blank `broken`.
+    fn refusal(&self) -> Option<&'static str> {
+        if self.pull_request.is_some() == self.broken.is_some() {
+            return Some("a rebase names either its pull request or its broken base, and not both");
+        }
+        if self.pull_request.is_some() != self.url.is_some() {
+            return Some("a rebase's pull request and its url go together");
+        }
+        match &self.broken {
+            Some(_) if self.refresh => Some("a held Build's rebase is no refresh"),
+            Some(broken) if broken.trim().is_empty() => Some("a rebase's broken base is blank"),
+            _ => None,
+        }
+    }
 }
 
 /// The most bytes of the replies to one DECISION a correction is given.
@@ -1067,6 +1102,9 @@ impl Brief {
                     }
                 ),
             ));
+        }
+        if let Some(why) = self.rebase.as_ref().and_then(RebaseBrief::refusal) {
+            return Err(ContractError::invalid(CONTRACT, why));
         }
         if !self.refused_choices.is_empty() {
             if !self.decisions_refused {

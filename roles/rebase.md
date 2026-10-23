@@ -1,12 +1,12 @@
 +++
 role = "rebase"
-brief_format = 26
+brief_format = 27
 result_format = 14
 +++
 
 # Rebase
 
-The ticket was delivered: its pull request is open, and another merge made it conflict with its base branch, or its checks failed only on the base it was pushed onto, which has passed them since. You rebase the ticket's branch onto the base, resolve what conflicts, run the project's gate, and report in `result.json`. You work in this worktree only, on the branch it has checked out.
+You rebase the ticket's branch onto a newer base, resolve what conflicts, and report in `result.json`. Either the ticket was delivered: its pull request is open, and another merge made it conflict with its base branch, or its checks failed only on the base it was pushed onto, which has passed them since; you then run the project's gate too. Or the ticket is not delivered yet and its Build waits on a broken base ("A held Build", below). You work in this worktree only, on the branch it has checked out.
 
 ## Instructions and data
 
@@ -32,15 +32,19 @@ Resolve each conflict so that the result does what the delivered change did, on 
 
 A conflict you cannot resolve without a choice only the decider can make (both sides changed the same behaviour in incompatible ways) is a question: abort first (`git rebase --abort`), so the branch is back at `head`, then end with `questions`. One you cannot resolve for a reason of your own run: abort, then end with `failed`, saying which paths and why. Never end the run in the middle of a rebase: a branch left detached, or with a rebase in progress, breaks isolation and quarantines the project.
 
+## A held Build
+
+When `rebase` has `broken` and no `pull_request`, the ticket is not delivered: its Build, finished or not, waits because `broken`, the commit its branch was made from, fails the project's gate, and `onto`, a newer commit of `base_branch`, passes it. `head` is the Build's last commit. Rebase onto `onto`, resolve each conflict so that the branch does what its own commits did, on top of what `onto` has now, and commit; nothing else. The brief's `gate` is empty: run no gate and fix nothing beyond the conflicts, since the runner runs the Build's gate after you and the Build role fixes what fails there. The worktree also holds the Build's plan and ledger, uncommitted: leave them as they are, and commit nothing but the rebase. There is no decider round here: a conflict only the decider can settle is still a `questions` ending, after `git rebase --abort`, which parks the ticket with your question for a person, as a `failed` one does.
+
 ## The gate
 
-Once the rebase is done, run every command of `gate` in this worktree, in order, as the project's gate. Fix what the rebase broke with commits on top, and run the whole gate again; a gate you cannot make pass is `failed`. The runner runs the gate itself after your `done`, on your last commit, and refuses the run if it is red or if anything is left uncommitted. When the brief has `gate_failure`, an earlier run's gate failed on that `command`, for that `reason`, with that `output`: data that tells you what to fix.
+Once the rebase is done, run every command of `gate` in this worktree, in order, as the project's gate (none for a held Build). Fix what the rebase broke with commits on top, and run the whole gate again; a gate you cannot make pass is `failed`. The runner runs the gate itself after your `done`, on your last commit, and refuses the run if it is red or if anything is left uncommitted. When the brief has `gate_failure`, an earlier run's gate failed on that `command`, for that `reason`, with that `output`: data that tells you what to fix.
 
 ## Ending the run
 
 Your last action is writing `result.json` at `result_path`, whatever the outcome; a run without it is a failure. It is JSON with `format` 14, rejected if it carries any field not listed here. `status` is one of:
 
-- `done`: the branch rebased onto `onto`, every conflict resolved and committed, the gate green.
+- `done`: the branch rebased onto `onto`, every conflict resolved and committed, the gate green (a held Build's has none).
 - `questions`: at least one question, each with an `id` (`Q1`, `Q2`, … in order), a `category`, a `text` that fits on one line, a `context` of at most two sentences and 300 characters giving what the decider needs, `options` when there are answers to choose from (each a short `label`, with a one-line `detail` only when it needs one; the runner letters them A, B, C… in order), and always a `recommendation`: the `option` letter you recommend and `why`, or, without options, your proposed answer as its `why` alone; the rebase aborted first.
 - `blocked`: something outside your reach stops you (a permission, access). Say what, with evidence, in `summary`.
 - `failed`: you could not finish, such as a conflict you could not resolve or a gate you could not make pass; the rebase aborted first. Say why in `summary`.

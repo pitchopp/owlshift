@@ -1576,8 +1576,13 @@ fn brief_rejections() {
     );
     rejects(
         "newer format",
-        parse(|v| v["format"] = json!(27)),
+        parse(|v| v["format"] = json!(28)),
         "upgrade Owlshift",
+    );
+    rejects(
+        "format 26, before a held Build's rebase",
+        parse(|v| v["format"] = json!(26)),
+        "unknown format 26",
     );
     rejects(
         "format 17, before the resolver's brief named the asking run",
@@ -1887,6 +1892,65 @@ fn brief_rejections() {
         "a rebase brief without its rebase",
         parse(|v| v["role"] = json!("rebase")),
         "the role is rebase and a rebase is not given",
+    );
+    // A held Build's rebase (format 27, OWL-427) names its broken base and
+    // no pull request; one or the other, and the url with the pull request.
+    let rebase_with = |edit: &dyn Fn(&mut Value)| {
+        Brief::parse(&edited("brief.json", |v| {
+            v["role"] = json!("rebase");
+            v["rebase"] = rebase.clone();
+            edit(&mut v["rebase"]);
+            v.as_object_mut().unwrap().remove("result_refusal");
+        }))
+    };
+    let held = |r: &mut Value| {
+        let r = r.as_object_mut().unwrap();
+        r.remove("pull_request");
+        r.remove("url");
+        r.insert("broken".to_owned(), json!("3".repeat(40)));
+    };
+    let told = rebase_with(&held).unwrap().rebase.unwrap();
+    assert_eq!(
+        (told.pull_request, told.url, told.broken),
+        (None, None, Some("3".repeat(40)))
+    );
+    let both = "either its pull request or its broken base, and not both";
+    rejects(
+        "a rebase with both",
+        rebase_with(&|r| r["broken"] = json!("3".repeat(40))),
+        both,
+    );
+    rejects(
+        "a rebase with neither",
+        rebase_with(&|r| {
+            held(r);
+            r.as_object_mut().unwrap().remove("broken");
+        }),
+        both,
+    );
+    rejects(
+        "a url without its pull request",
+        rebase_with(&|r| {
+            held(r);
+            r["url"] = json!("https://github.com/demo/project/pull/7");
+        }),
+        "pull request and its url go together",
+    );
+    rejects(
+        "a held Build's refresh",
+        rebase_with(&|r| {
+            held(r);
+            r["refresh"] = json!(true);
+        }),
+        "a held Build's rebase is no refresh",
+    );
+    rejects(
+        "a blank broken base",
+        rebase_with(&|r| {
+            held(r);
+            r["broken"] = json!(" ");
+        }),
+        "broken base is blank",
     );
     // The checkpoint's paths and the result path come from the runner, but
     // are checked the same way as a model's artifact paths (OWL-25).

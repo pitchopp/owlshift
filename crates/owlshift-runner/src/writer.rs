@@ -3211,7 +3211,8 @@ impl ParkedComment {
             | ParkReason::FixPasses
             | ParkReason::Repairs
             | ParkReason::Forge
-            | ParkReason::TicketBudget => vec![Fit::capped(
+            | ParkReason::TicketBudget
+            | ParkReason::Rebase => vec![Fit::capped(
                 flatten(&self.detail),
                 LONGER,
                 PARKED_DETAIL_CHARS,
@@ -3266,7 +3267,8 @@ impl ParkedComment {
             | ParkReason::Blocked
             | ParkReason::FixPasses
             | ParkReason::Repairs
-            | ParkReason::Forge => {
+            | ParkReason::Forge
+            | ParkReason::Rebase => {
                 let mut line = format!("Parked: {}.", park_reason(self.reason));
                 let detail = &texts[0];
                 if !detail.is_empty() {
@@ -3469,6 +3471,9 @@ pub fn park_reason(reason: ParkReason) -> &'static str {
         ParkReason::Repairs => "the pull request reached its limit of repairs",
         ParkReason::Forge => "the forge blocks the pull request",
         ParkReason::TicketBudget => "the ticket's runs reached its budget",
+        ParkReason::Rebase => {
+            "its branch could not be rebased off a broken base onto one that passes"
+        }
     }
 }
 
@@ -3477,6 +3482,7 @@ fn detail_label(reason: ParkReason) -> &'static str {
     match reason {
         ParkReason::Blocked => "The run said",
         ParkReason::Forge => "The forge said",
+        ParkReason::Rebase => "The rebase",
         _ => "The last failure",
     }
 }
