@@ -43,7 +43,6 @@ use owlshift_contracts::format::Format;
 use owlshift_contracts::ids::TicketId;
 use owlshift_contracts::refs::ticket_ref;
 use owlshift_contracts::step::{RunObligation, RunTarget, TicketRun, is_run_id};
-use owlshift_platform::files;
 
 use crate::executor::Git;
 use crate::executor::isolation::Concurrent;
@@ -73,9 +72,8 @@ pub fn obligation_name(ticket: Option<&TicketId>, run: &str) -> String {
 /// pass holding it may list the folder at any moment, and an obligation
 /// that does not read quarantines the project (OWL-425). So it is written
 /// whole first, synced, as `unverified-<name>.partial` in the project's
-/// folder, which nothing lists, then published into `unverified/`
-/// ([`files::publish`]), which fails on a name taken, where a rename would
-/// replace it. A partial left
+/// folder, which nothing lists, then linked into `unverified/`: a hard link
+/// fails on a name taken, where a rename would replace it. A partial left
 /// by a crash before its removal takes its name as a written obligation
 /// does; a run's id never comes again, and nothing else reads it. The
 /// project's folder needs hard links, which every file system the data
@@ -105,38 +103,13 @@ pub fn write_obligation(
         .write(true)
         .create_new(true)
         .open(&partial)?;
-    let written = file
+    let linked = file
         .write_all(record.render().as_bytes())
-        .and_then(|()| file.sync_all());
+        .and_then(|()| file.sync_all())
+        .and_then(|()| fs::hard_link(&partial, folder.join(&name)));
     drop(file);
-    let published = written.and_then(|()| publish(&partial, &folder.join(&name)));
-    if published.is_err() {
-        let _ = fs::remove_file(&partial);
-    }
-    published.map(|()| name)
-}
-
-/// [`files::publish`], tried again for up to half a second on Windows while
-/// it is refused, another process holding the new file open for a moment,
-/// as [`rename_over`] is.
-fn publish(from: &Path, to: &Path) -> io::Result<()> {
-    let mut tries = 0;
-    loop {
-        match files::publish(from, to) {
-            // Access denied, or a sharing violation (`ERROR_SHARING_VIOLATION`),
-            // which the standard library gives no kind of its own.
-            Err(error)
-                if cfg!(windows)
-                    && (error.kind() == io::ErrorKind::PermissionDenied
-                        || error.raw_os_error() == Some(32))
-                    && tries < 50 =>
-            {
-                tries += 1;
-                std::thread::sleep(std::time::Duration::from_millis(10));
-            }
-            done => return done,
-        }
-    }
+    let _ = fs::remove_file(&partial);
+    linked.map(|()| name)
 }
 
 /// `what`, cut to one line of at most the bytes an obligation keeps.
@@ -172,8 +145,9 @@ pub struct Found {
 /// Every obligation of the project, by name; none when the folder is not
 /// there, or is the marker of an Owlshift before P6, which
 /// [`ProjectDirs::quarantine`] reads; one removed between the listing and
-/// its read is not there either, nor one Windows lists while it is deleted. A name that is not UTF-8, an entry
-/// that is not a plain file, a record past 64 KiB or one that does not
+/// its read is not there either, nor one refused as access denied and gone
+/// when asked again, up to [`GONE_ASKS`] times. A name that is not UTF-8, an
+/// entry that is not a plain file, a record past 64 KiB or one that does not
 /// parse is kept with why: it cannot be read, and a lost record never
 /// widens what a check leaves out.
 pub fn obligations(dirs: &ProjectDirs) -> io::Result<Vec<Found>> {
@@ -188,16 +162,15 @@ pub fn obligations(dirs: &ProjectDirs) -> io::Result<Vec<Found>> {
     for entry in fs::read_dir(&folder)? {
         let entry = entry?;
         let name = entry.file_name().to_string_lossy().into_owned();
+        let path = entry.path();
         // One removed since the listing, its run's check passed, is gone
-        // (OWL-425), not unreadable; so is one Windows refused because it
-        // was being deleted, a handle another process holds keeping it
-        // listed: it still is, or it is gone by the time it is asked.
-        let record = match read_capped(&entry.path()) {
+        // (OWL-425), not unreadable; so is one Windows refused while its run
+        // was deleting it (OWL-426), gone once that deletion ends.
+        let record = match read_capped(&path) {
             Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
             Err(error)
                 if error.kind() == io::ErrorKind::PermissionDenied
-                    && (files::delete_pending(&folder, &entry.file_name())
-                        || gone(&entry.path())) =>
+                    && (0..GONE_ASKS).any(|_| gone(&path)) =>
             {
                 continue;
             }
@@ -209,6 +182,14 @@ pub fn obligations(dirs: &ProjectDirs) -> io::Result<Vec<Found>> {
     found.sort_by(|a, b| a.name.cmp(&b.name));
     Ok(found)
 }
+
+/// How many times [`obligations`] asks whether an entry whose read was
+/// refused as access denied is gone (OWL-426). Windows keeps an obligation
+/// its run is deleting listed for a moment and refuses every open of it
+/// meanwhile (`STATUS_DELETE_PENDING`). On CI's Windows runner a first ask
+/// found 65 of 4047 such entries still there, and none needed a third: 10 is
+/// a margin, not a measured bound.
+const GONE_ASKS: usize = 10;
 
 /// Whether nothing is at `path` any more.
 fn gone(path: &Path) -> bool {

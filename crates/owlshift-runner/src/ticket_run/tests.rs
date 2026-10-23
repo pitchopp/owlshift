@@ -550,7 +550,8 @@ fn only_this_module_writes_a_ticket_ref() {
 /// writes its own without the project's lock, while a watch pass that holds
 /// it lists the folder, and one read empty there quarantined the project.
 /// The writer writes and removes one obligation after another; the reader
-/// lists the folder meanwhile, and every record it finds reads.
+/// lists the folder meanwhile, and every record it finds reads. On Windows
+/// it also meets obligations refused while they are deleted (OWL-426).
 #[test]
 fn an_obligation_is_never_seen_partly_written() {
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -576,13 +577,9 @@ fn an_obligation_is_never_seen_partly_written() {
                     // What the file system says of it just after, so a
                     // failure on a system the bench cannot run tells why.
                     Err(why) => unread.push(format!(
-                        "{}: {why}; delete pending now: {}, gone now: {}",
+                        "{}: {why}; gone now: {}",
                         found.name,
-                        owlshift_platform::files::delete_pending(
-                            &dirs.obligations_dir(),
-                            found.name.as_ref()
-                        ),
-                        !dirs.obligations_dir().join(&found.name).exists(),
+                        gone(&dirs.obligations_dir().join(&found.name)),
                     )),
                 }
             }
@@ -680,19 +677,10 @@ fn owl426_calibrate(dir: &Path) {
     let listed = fs::read_dir(dir)
         .unwrap()
         .any(|entry| entry.unwrap().file_name() == "calibration");
-    let pending = files::delete_pending(dir, "calibration".as_ref());
-    println!(
-        "OWL426 calibration delete pending: {error}; status 0x{status:08X}; listed: {listed}; \
-         delete pending now: {pending}"
-    );
+    println!("OWL426 calibration delete pending: {error}; status 0x{status:08X}; listed: {listed}");
     assert_eq!(
-        (error.kind(), status, listed, pending),
-        (
-            io::ErrorKind::PermissionDenied,
-            OWL426_DELETE_PENDING,
-            true,
-            true
-        )
+        (error.kind(), status, listed),
+        (io::ErrorKind::PermissionDenied, OWL426_DELETE_PENDING, true)
     );
     drop(held);
     assert!(gone(&path));
@@ -749,6 +737,7 @@ struct Owl426Reader {
     miss_listed: usize,
     miss_refused: usize,
     pending_at_miss: usize,
+    over_cap: usize,
     during_partial_removal: usize,
     during_retire: usize,
     during_either: usize,
@@ -819,7 +808,7 @@ impl Owl426Reader {
     #[allow(clippy::too_many_arguments)]
     fn refusal(
         &mut self,
-        folder: &Path,
+        _folder: &Path,
         entry: &fs::DirEntry,
         step: &str,
         error: &io::Error,
@@ -852,7 +841,9 @@ impl Owl426Reader {
                     Ok(_) => "listed".to_owned(),
                     Err(error) => format!("error ({error})"),
                 };
-                first_miss = Some((said, files::delete_pending(folder, &entry.file_name())));
+                // Round 3: `files::delete_pending` is removed (it never
+                // answered yes in rounds 1 and 2).
+                first_miss = Some((said, false));
             }
         }
         let after = phase.load(Ordering::SeqCst);
@@ -863,6 +854,9 @@ impl Owl426Reader {
             self.status_delete_pending += 1;
         } else {
             self.status_other += 1;
+        }
+        if us_to_gone.is_none() || asks as usize > GONE_ASKS {
+            self.over_cap += 1;
         }
         match (asks, us_to_gone) {
             (_, None) => self.never_gone += 1,
@@ -922,13 +916,14 @@ fn owl426_probe() {
 
     const WRITES: u64 = 300;
     let variant = std::env::var("OWL426_VARIANT").unwrap_or_else(|_| "link-delete".to_owned());
+    // Round 3: `files::publish` is removed; "final" is the production writer,
+    // `write_obligation` then `remove_obligation`.
     let (link, delete) = match variant.as_str() {
-        "link-delete" => (true, true),
-        "move-delete" => (false, true),
+        "link-delete" | "final" => (true, true),
         "link-rename" => (true, false),
-        "move-rename" => (false, false),
         other => panic!("unknown variant {other}"),
     };
+    let production = variant == "final";
     let tmp = tempfile::tempdir().unwrap();
     #[cfg(windows)]
     owl426_calibrate(tmp.path());
@@ -947,6 +942,15 @@ fn owl426_probe() {
             let mut counts = Owl426Writer::default();
             for n in 0..WRITES {
                 let set = |p: u64| phase.store(n << 8 | p, Ordering::SeqCst);
+                if production {
+                    let name =
+                        write_obligation(&dirs, Some(&owl), &format!("r{n}"), "a run").unwrap();
+                    set(3);
+                    set(4);
+                    remove_obligation(&dirs, &name).unwrap();
+                    set(5);
+                    continue;
+                }
                 let run = format!("r{n}");
                 let name = obligation_name(Some(&owl), &run);
                 let record = RunObligation {
@@ -977,12 +981,6 @@ fn owl426_probe() {
                     if fs::remove_file(&partial).is_err() {
                         counts.partial_remove_failures += 1;
                     }
-                } else {
-                    drop(file);
-                    owl426_retry(&mut counts.publish_retries, || {
-                        files::publish(&partial, &target)
-                    });
-                    set(2);
                 }
                 set(3);
                 set(4);
@@ -1009,7 +1007,7 @@ fn owl426_probe() {
          status_delete_pending={} status_other={} gone_first_ask={} gone_second_ask={} \
          gone_later_ask={} never_gone={} max_asks={} max_us_to_gone={} us_le_25={} \
          us_le_100={} us_le_1000={} us_gt_1000={} miss_listed={} miss_refused={} \
-         pending_at_miss={} during_partial_removal={} during_retire={} during_either={} \
+         pending_at_miss={} over_cap={} during_partial_removal={} during_retire={} during_either={} \
          link_retries={} partial_remove_failures={} publish_retries={} retire_retries={}",
         r.sightings,
         r.vanished,
@@ -1030,6 +1028,7 @@ fn owl426_probe() {
         r.miss_listed,
         r.miss_refused,
         r.pending_at_miss,
+        r.over_cap,
         r.during_partial_removal,
         r.during_retire,
         r.during_either,

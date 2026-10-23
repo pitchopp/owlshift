@@ -51,21 +51,23 @@ jobs:
           set +e
           failed=0
           for round in $(seq 1 20); do
-            # Round 2: run 39899383970 found no refusal in the rename variants.
-            for variant in link-delete move-delete; do
-              OWL426_VARIANT=$variant cargo test -p owlshift-runner --lib --locked -q -- \
-                --ignored --exact ticket_run::tests::owl426_probe --nocapture > out.txt 2>&1
-              code=$?
-              cat out.txt
-              grep -q '^OWL426 summary' out.txt || code=98
-              grep -q ' 1 passed' out.txt || code=99
-              echo "OWL426 invocation round=$round variant=$variant code=$code"
-              [ "$code" -eq 0 ] || failed=1
-            done
+            # Round 3, the final code: the production writer against the
+            # skip-free reader (how many refusals the final rule absorbs),
+            # then the real test, which must pass every round.
+            OWL426_VARIANT=final cargo test -p owlshift-runner --lib --locked -q -- \
+              --ignored --exact ticket_run::tests::owl426_probe --nocapture > out.txt 2>&1
+            code=$?
+            cat out.txt
+            grep -q '^OWL426 summary' out.txt || code=98
+            grep -q ' 1 passed' out.txt || code=99
+            echo "OWL426 invocation round=$round variant=final code=$code"
+            [ "$code" -eq 0 ] || failed=1
             cargo test -p owlshift-runner --lib --locked -q -- \
               --exact ticket_run::tests::an_obligation_is_never_seen_partly_written > out.txt 2>&1
             code=$?
             cat out.txt
-            echo "OWL426 baseline round=$round code=$code"
+            grep -q ' 1 passed' out.txt || code=99
+            echo "OWL426 final-test round=$round code=$code"
+            [ "$code" -eq 0 ] || failed=1
           done
           exit $failed
