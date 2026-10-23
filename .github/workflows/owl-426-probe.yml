@@ -23,7 +23,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        shard: [1, 2]
+        shard: [1, 2, 3, 4]
     runs-on: windows-latest
     timeout-minutes: 60
     steps:
@@ -50,10 +50,11 @@ jobs:
         run: |
           set +e
           failed=0
-          for round in $(seq 1 20); do
-            # Round 3, the final code: the production writer against the
-            # skip-free reader (how many refusals the final rule absorbs),
-            # then the real test, which must pass every round.
+          for round in $(seq 1 25); do
+            # Round 4: the production writer against the skip-free reader,
+            # each refusal judged by OWL-425's rule (delete pending, then
+            # gone) and by asks of gone; the real test runs the 10-ask rule,
+            # whose failures are data here, not the job's.
             OWL426_VARIANT=final cargo test -p owlshift-runner --lib --locked -q -- \
               --ignored --exact ticket_run::tests::owl426_probe --nocapture > out.txt 2>&1
             code=$?
@@ -68,6 +69,5 @@ jobs:
             cat out.txt
             grep -q ' 1 passed' out.txt || code=99
             echo "OWL426 final-test round=$round code=$code"
-            [ "$code" -eq 0 ] || failed=1
           done
           exit $failed

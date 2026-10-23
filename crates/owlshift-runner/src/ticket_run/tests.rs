@@ -738,6 +738,9 @@ struct Owl426Reader {
     miss_refused: usize,
     pending_at_miss: usize,
     over_cap: usize,
+    pending_first: usize,
+    gone_first: usize,
+    rule_p_miss: usize,
     during_partial_removal: usize,
     during_retire: usize,
     during_either: usize,
@@ -808,7 +811,7 @@ impl Owl426Reader {
     #[allow(clippy::too_many_arguments)]
     fn refusal(
         &mut self,
-        _folder: &Path,
+        folder: &Path,
         entry: &fs::DirEntry,
         step: &str,
         error: &io::Error,
@@ -820,10 +823,16 @@ impl Owl426Reader {
         use std::sync::atomic::Ordering;
         use std::time::{Duration, Instant};
         let path = entry.path();
-        // `gone` asked again and again from the refusal on: how many asks,
-        // and how long, until the entry is gone; at the first ask that does
-        // not find it gone, what the metadata said and whether the file
-        // system called it being deleted.
+        // Round 4: OWL-425's rule in its order, whether the file system
+        // calls the entry being deleted, then whether it is gone; then `gone`
+        // asked again and again: how many asks, and how long, until it is.
+        let pending_first = owlshift_platform::files::delete_pending(folder, &entry.file_name());
+        let gone_first = gone(&path);
+        self.pending_first += usize::from(pending_first);
+        self.gone_first += usize::from(gone_first);
+        if !pending_first && !gone_first {
+            self.rule_p_miss += 1;
+        }
         let started = Instant::now();
         let (mut asks, mut us_to_gone, mut first_miss) = (0_u32, None, None);
         while started.elapsed() < Duration::from_secs(1) {
@@ -841,9 +850,10 @@ impl Owl426Reader {
                     Ok(_) => "listed".to_owned(),
                     Err(error) => format!("error ({error})"),
                 };
-                // Round 3: `files::delete_pending` is removed (it never
-                // answered yes in rounds 1 and 2).
-                first_miss = Some((said, false));
+                first_miss = Some((
+                    said,
+                    owlshift_platform::files::delete_pending(folder, &entry.file_name()),
+                ));
             }
         }
         let after = phase.load(Ordering::SeqCst);
@@ -897,6 +907,7 @@ impl Owl426Reader {
         };
         println!(
             "OWL426 refusal variant={variant} {name}: {error} ({step}); status 0x{status:08X}; \
+             delete pending first: {pending_first}, gone first: {gone_first}; \
              gone at ask {asks} after {us_to_gone:?} us; first miss (metadata, delete pending \
              now): {first_miss:?}; writer {}.{} -> {}.{} ({during})",
             before >> 8,
@@ -1007,7 +1018,8 @@ fn owl426_probe() {
          status_delete_pending={} status_other={} gone_first_ask={} gone_second_ask={} \
          gone_later_ask={} never_gone={} max_asks={} max_us_to_gone={} us_le_25={} \
          us_le_100={} us_le_1000={} us_gt_1000={} miss_listed={} miss_refused={} \
-         pending_at_miss={} over_cap={} during_partial_removal={} during_retire={} during_either={} \
+         pending_at_miss={} over_cap={} pending_first={} gone_first={} rule_p_miss={} \
+         during_partial_removal={} during_retire={} during_either={} \
          link_retries={} partial_remove_failures={} publish_retries={} retire_retries={}",
         r.sightings,
         r.vanished,
@@ -1029,6 +1041,9 @@ fn owl426_probe() {
         r.miss_refused,
         r.pending_at_miss,
         r.over_cap,
+        r.pending_first,
+        r.gone_first,
+        r.rule_p_miss,
         r.during_partial_removal,
         r.during_retire,
         r.during_either,
