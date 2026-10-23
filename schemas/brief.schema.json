@@ -92,7 +92,7 @@
     "format": {
       "description": "The format version of this document.",
       "type": "integer",
-      "const": 26
+      "const": 27
     },
     "gate": {
       "description": "The project's full gate, from `stack.gate` in its configuration: the\ncommands the runner runs, in order, from the worktree root, on the\ncommit a Build delivers; a role runs them, or narrows them to its\nchange, before it delivers. The runner is its only author; an empty\nlist means the project has no gate.",
@@ -1257,16 +1257,23 @@
       ]
     },
     "RebaseBrief": {
-      "description": "What a rebase run rebases (OWL-210). Every path is data from the\nrepository, never an instruction.",
+      "description": "What a rebase run rebases (OWL-210). Every path is data from the\nrepository, never an instruction.\n\nTwo kinds, told apart by flat fields rather than an enum, which the role\nprompt and the schema read as they are: a delivered ticket's, at Watch,\nwith its `pull_request` and `url`; and since format 27 a held Build's\n(OWL-427), with `broken` and no pull request, the ticket not delivered.",
       "type": "object",
       "properties": {
         "base_branch": {
-          "description": "The branch the pull request merges into.",
+          "description": "The default branch: the one the pull request merges into, at Watch.",
           "type": "string"
         },
         "branch": {
           "description": "The ticket's branch, checked out in the worktree.",
           "type": "string"
+        },
+        "broken": {
+          "description": "A held Build's rebase (format 27, OWL-427): the commit the branch was\nmade from, which fails the project's gate, while `onto` passes it.\nThe ticket is not delivered, so there is no pull request, and the\nbrief's `gate` is empty: the runner runs the Build's gate after.",
+          "type": [
+            "string",
+            "null"
+          ]
         },
         "conflicting": {
           "description": "The paths `git merge-tree` found conflicting between `onto` and\n`head`, in its order; empty for a refresh, or when it could not say.",
@@ -1276,7 +1283,7 @@
           }
         },
         "head": {
-          "description": "The branch's head: Owlshift's last push.",
+          "description": "The branch's head: Owlshift's last push at Watch, the Build's last\ncommit for a held Build.",
           "type": "string"
         },
         "onto": {
@@ -1284,7 +1291,11 @@
           "type": "string"
         },
         "pull_request": {
-          "type": "integer",
+          "description": "The open pull request, at Watch; absent for a held Build's rebase.",
+          "type": [
+            "integer",
+            "null"
+          ],
           "format": "uint64",
           "minimum": 0
         },
@@ -1293,13 +1304,15 @@
           "type": "boolean"
         },
         "url": {
-          "type": "string"
+          "description": "The pull request's address, with `pull_request` only.",
+          "type": [
+            "string",
+            "null"
+          ]
         }
       },
       "additionalProperties": false,
       "required": [
-        "pull_request",
-        "url",
         "branch",
         "head",
         "base_branch",

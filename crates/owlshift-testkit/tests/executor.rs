@@ -314,14 +314,15 @@ fn a_rebase_onto_another_base_than_the_runs_is_refused() {
     let onto = "1".repeat(40);
     bench.brief.role = Role::Rebase;
     bench.brief.rebase = Some(RebaseBrief {
-        pull_request: 1,
-        url: "https://github.com/demo/project/pull/1".into(),
+        pull_request: Some(1),
+        url: Some("https://github.com/demo/project/pull/1".into()),
         branch: BRANCH.into(),
         head: "2".repeat(40),
         base_branch: "main".into(),
         onto: onto.clone(),
         refresh: false,
         conflicting: Vec::new(),
+        broken: None,
     });
     let error = bench.run_from(&bench.worktree, BRANCH, &"3".repeat(40));
     assert!(
@@ -1672,14 +1673,15 @@ mod setup {
         brief.role = Role::Rebase;
         brief.gate = vec!["true".to_owned()];
         brief.rebase = Some(RebaseBrief {
-            pull_request: 1,
-            url: "https://github.com/demo/project/pull/1".into(),
+            pull_request: Some(1),
+            url: Some("https://github.com/demo/project/pull/1".into()),
             branch: BRANCH.into(),
             head: onto.clone(),
             base_branch: "main".into(),
             onto: onto.clone(),
             refresh: false,
             conflicting: Vec::new(),
+            broken: None,
         });
         let harness = bench.fake(Reply {
             observe: vec![".owlshift/run/count".to_owned()],

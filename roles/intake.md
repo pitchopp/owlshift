@@ -1,6 +1,6 @@
 +++
 role = "intake"
-brief_format = 26
+brief_format = 27
 result_format = 14
 +++
 

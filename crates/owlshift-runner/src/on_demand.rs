@@ -6719,14 +6719,15 @@ impl OnDemand<'_> {
             Ok(())
         };
         let told = RebaseBrief {
-            pull_request: pr.number,
-            url: pr.url.clone(),
+            pull_request: Some(pr.number),
+            url: Some(pr.url.clone()),
             branch: p.branch.clone(),
             head: pushed.to_owned(),
             base_branch: delivery.base_branch.clone(),
             onto: onto.to_string(),
             refresh,
             conflicting: classified.paths.clone(),
+            broken: None,
         };
         let decorate = |brief: &mut Brief, _: &TicketQuestions| {
             brief.rebase = Some(told.clone());
