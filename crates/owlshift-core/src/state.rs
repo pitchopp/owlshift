@@ -151,6 +151,7 @@ impl Status {
 /// | A Build run's (at Build, or a fix run's at Watch) or an answer check's `result.json` was refused, and the run had not been told of a refused result: the next run of its kind will be | `ResultRefused` |
 /// | A Build run's (at Build, or a fix run's at Watch) gate was refused for uncommitted changes before any command ran, and the run had not been told of such a refusal: the next run will be | `UncommittedGate` |
 /// | A Build run's at Build (a Verify fix run included) gate or setup failed on a command that the commit it was configured at fails too, or that commit's check is due; or a Build run at Build was held before it started for such a commit (OWL-418, [`crate::base`]) | `BaseBroken` |
+/// | A rebase run off a held commit, at Build, ended without a rebase the runner accepts (OWL-427, [`crate::base::leave`]) | `RebaseFailed` |
 /// | A run was cut off by a harness usage limit; it resumes after the reset | `Interrupted` |
 /// | A run broke isolation (main checkout touched, diff outside the worktree, wrong branch) | `Quarantined` |
 /// | A run is due while the ticket's runs since its last restart cost its budget or more (`policy.ticket_budget_usd`, OWL-378): none starts | `BudgetReached` |
@@ -257,6 +258,13 @@ pub enum Event {
     /// base to pass. Only a Build at Build is held, so it is valid only
     /// there: a fix run at Watch takes the failed-run path.
     BaseBroken,
+    /// A rebase run that was to move a held Build's branch off its broken
+    /// base onto a newer head that passes (OWL-427) ended without a rebase
+    /// the runner accepts: the ticket parks at once
+    /// ([`ParkReason::Rebase`]), its counts kept, since the Build's
+    /// worktree is never made anew for a second attempt. Valid only at
+    /// Build, where a Build is held.
+    RebaseFailed,
     Interrupted,
     Quarantined,
     /// A run was due, but what the ticket's runs cost since its last
@@ -313,7 +321,7 @@ pub enum Event {
 
 impl Event {
     /// Every event.
-    pub const ALL: [Self; 32] = [
+    pub const ALL: [Self; 33] = [
         Self::Dispatched,
         Self::Completed,
         Self::LoopBack,
@@ -332,6 +340,7 @@ impl Event {
         Self::ResultRefused,
         Self::UncommittedGate,
         Self::BaseBroken,
+        Self::RebaseFailed,
         Self::Interrupted,
         Self::Quarantined,
         Self::BudgetReached,
@@ -405,6 +414,9 @@ pub enum ParkReason {
     /// A run was due, but the ticket's runs since its last restart cost its
     /// budget or more (`policy.ticket_budget_usd`, OWL-378).
     TicketBudget,
+    /// A held Build's branch could not be rebased off its broken base onto
+    /// a newer head that passes (OWL-427).
+    Rebase,
 }
 
 /// How a ticket left the machine.
@@ -843,6 +855,9 @@ impl TicketState {
             }
             // A base that breaks the gate is the project's, not the ticket's.
             (Status::Active(Stage::Build), Event::BaseBroken) => Transition::To(*self),
+            (Status::Active(Stage::Build), Event::RebaseFailed) => {
+                self.park(ParkReason::Rebase, self.failed_runs)
+            }
             (status, Event::Quarantined) if status.runs() => {
                 self.park(ParkReason::IsolationBreach, self.failed_runs)
             }
@@ -1193,6 +1208,9 @@ mod tests {
                 Expect::To(status)
             }
             (Status::Active(Build), Event::BaseBroken) => Expect::To(status),
+            (Status::Active(Build), Event::RebaseFailed) => {
+                Expect::Parked(parked(Build, false), ParkReason::Rebase)
+            }
             // With every count at zero, nothing is at a bound.
             (
                 Status::Active(Watch),
@@ -1507,6 +1525,42 @@ mod tests {
             let other = state(status, 1, 0, 0);
             assert!(
                 other.apply(STANDARD, Event::BaseBroken).is_err(),
+                "{status:?}"
+            );
+        }
+    }
+
+    /// OWL-427: a failed rebase off a held commit parks a Build at once,
+    /// whatever its count, which it keeps; it is valid at Build alone.
+    #[test]
+    fn a_failed_rebase_parks_a_build_at_once() {
+        for failed_runs in 0..MAX_FAILED_RUNS {
+            let build = state(Status::Active(Stage::Build), 1, 0, failed_runs);
+            match build.apply(STANDARD, Event::RebaseFailed) {
+                Ok(Transition::Parked { state, reason }) => {
+                    assert_eq!(reason, ParkReason::Rebase);
+                    assert_eq!(state.failed_runs(), failed_runs);
+                    assert_eq!(
+                        state.status(),
+                        Status::Parked {
+                            at: Stage::Build,
+                            awaiting_input: false
+                        }
+                    );
+                }
+                other => panic!("{other:?}"),
+            }
+        }
+        for status in [
+            Status::Active(Stage::Watch),
+            Status::Active(Stage::Verify),
+            Status::NeedsInput {
+                return_to: Stage::Build,
+            },
+        ] {
+            let other = state(status, 1, 0, 0);
+            assert!(
+                other.apply(STANDARD, Event::RebaseFailed).is_err(),
                 "{status:?}"
             );
         }
