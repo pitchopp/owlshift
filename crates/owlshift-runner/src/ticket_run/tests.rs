@@ -577,8 +577,9 @@ fn an_obligation_is_never_seen_partly_written() {
                     // What the file system says of it just after, so a
                     // failure on a system the bench cannot run tells why.
                     Err(why) => unread.push(format!(
-                        "{}: {why}; gone now: {}",
+                        "{}: {why}; delete pending now: {}, gone now: {}",
                         found.name,
+                        files::delete_pending(&dirs.obligations_dir(), found.name.as_ref()),
                         gone(&dirs.obligations_dir().join(&found.name)),
                     )),
                 }
@@ -826,7 +827,7 @@ impl Owl426Reader {
         // Round 4: OWL-425's rule in its order, whether the file system
         // calls the entry being deleted, then whether it is gone; then `gone`
         // asked again and again: how many asks, and how long, until it is.
-        let pending_first = owlshift_platform::files::delete_pending(folder, &entry.file_name());
+        let pending_first = files::delete_pending(folder, &entry.file_name());
         let gone_first = gone(&path);
         self.pending_first += usize::from(pending_first);
         self.gone_first += usize::from(gone_first);
@@ -850,10 +851,7 @@ impl Owl426Reader {
                     Ok(_) => "listed".to_owned(),
                     Err(error) => format!("error ({error})"),
                 };
-                first_miss = Some((
-                    said,
-                    owlshift_platform::files::delete_pending(folder, &entry.file_name()),
-                ));
+                first_miss = Some((said, files::delete_pending(folder, &entry.file_name())));
             }
         }
         let after = phase.load(Ordering::SeqCst);
@@ -865,7 +863,7 @@ impl Owl426Reader {
         } else {
             self.status_other += 1;
         }
-        if us_to_gone.is_none() || asks as usize > GONE_ASKS {
+        if us_to_gone.is_none() || asks > 10 {
             self.over_cap += 1;
         }
         match (asks, us_to_gone) {

@@ -43,6 +43,7 @@ use owlshift_contracts::format::Format;
 use owlshift_contracts::ids::TicketId;
 use owlshift_contracts::refs::ticket_ref;
 use owlshift_contracts::step::{RunObligation, RunTarget, TicketRun, is_run_id};
+use owlshift_platform::files;
 
 use crate::executor::Git;
 use crate::executor::isolation::Concurrent;
@@ -145,11 +146,10 @@ pub struct Found {
 /// Every obligation of the project, by name; none when the folder is not
 /// there, or is the marker of an Owlshift before P6, which
 /// [`ProjectDirs::quarantine`] reads; one removed between the listing and
-/// its read is not there either, nor one refused as access denied and gone
-/// when asked again, up to [`GONE_ASKS`] times. A name that is not UTF-8, an
-/// entry that is not a plain file, a record past 64 KiB or one that does not
-/// parse is kept with why: it cannot be read, and a lost record never
-/// widens what a check leaves out.
+/// its read is not there either, nor one Windows refused while it was being
+/// deleted. A name that is not UTF-8, an entry that is not a plain file, a
+/// record past 64 KiB or one that does not parse is kept with why: it
+/// cannot be read, and a lost record never widens what a check leaves out.
 pub fn obligations(dirs: &ProjectDirs) -> io::Result<Vec<Found>> {
     let folder = dirs.obligations_dir();
     match fs::symlink_metadata(&folder) {
@@ -165,12 +165,13 @@ pub fn obligations(dirs: &ProjectDirs) -> io::Result<Vec<Found>> {
         let path = entry.path();
         // One removed since the listing, its run's check passed, is gone
         // (OWL-425), not unreadable; so is one Windows refused while its run
-        // was deleting it (OWL-426), gone once that deletion ends.
+        // was deleting it (OWL-426): when asked, it is still being deleted,
+        // or that has ended and it is gone.
         let record = match read_capped(&path) {
             Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
             Err(error)
                 if error.kind() == io::ErrorKind::PermissionDenied
-                    && (0..GONE_ASKS).any(|_| gone(&path)) =>
+                    && (files::delete_pending(&folder, &entry.file_name()) || gone(&path)) =>
             {
                 continue;
             }
@@ -182,14 +183,6 @@ pub fn obligations(dirs: &ProjectDirs) -> io::Result<Vec<Found>> {
     found.sort_by(|a, b| a.name.cmp(&b.name));
     Ok(found)
 }
-
-/// How many times [`obligations`] asks whether an entry whose read was
-/// refused as access denied is gone (OWL-426). Windows keeps an obligation
-/// its run is deleting listed for a moment and refuses every open of it
-/// meanwhile (`STATUS_DELETE_PENDING`). On CI's Windows runner a first ask
-/// found 65 of 4047 such entries still there, and none needed a third: 10 is
-/// a margin, not a measured bound.
-const GONE_ASKS: usize = 10;
 
 /// Whether nothing is at `path` any more.
 fn gone(path: &Path) -> bool {
