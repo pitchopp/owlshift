@@ -175,18 +175,28 @@ impl OnDemand<'_> {
             }
             return Ok(None);
         }
-        // The head's own setup and gate, which its check runs and the
-        // rebase run is briefed with (OWL-331: a rebase takes the base it
-        // rebases onto).
-        let configured = self.dispatch_rules(p, Command::Rebase, sink)?;
-        let key = base::commands_key(configured.rules.setup(), configured.rules.gate());
-        let kept = match base::read(self.dirs) {
-            Ok(checks) => checks.verdict_at(&head, &key, &head).cloned(),
+        let checks = match base::read(self.dirs) {
+            Ok(checks) => checks,
             Err(why) => {
                 self.base_unchecked(&p.ticket, &why, sink);
                 return Ok(None);
             }
         };
+        // The held commit checked again at this head first, still failing:
+        // a check that could not run yet leaves an environment fix possible,
+        // which lifts the hold with no rebase.
+        if !matches!(
+            checks.verdict_at(&held, &commands_key(dispatched), &head),
+            Some(Verdict::Failed(_))
+        ) {
+            return Ok(None);
+        }
+        // The head's own setup and gate, which its check runs and the
+        // rebase run is briefed with (OWL-331: a rebase takes the base it
+        // rebases onto).
+        let configured = self.dispatch_rules(p, Command::Rebase, sink)?;
+        let key = base::commands_key(configured.rules.setup(), configured.rules.gate());
+        let kept = checks.verdict_at(&head, &key, &head).cloned();
         let verdict =
             match owlshift_core::base::leave(&held, &head, head_has_held, kept.as_ref(), branch) {
                 Leave::Stay => return Ok(None),
