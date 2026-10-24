@@ -184,6 +184,49 @@ pub fn default_branch(keychain: &Keychain, repo: &Repo) -> Result<DefaultBranch,
         .map_err(TokenTryError::Forge)
 }
 
+/// What the project's GitHub credential gives merge on green's merge (D14,
+/// OWL-445): Contents (read and write), read from the GitHub App
+/// installation's granted permissions, which a personal token has none of.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MergePermission {
+    /// The installation granted Contents (read and write).
+    Granted,
+    /// The installation, of this id, has not granted it.
+    Missing { installation: u64 },
+    /// No installation of the app lists the repository.
+    NotInstalled,
+    /// A personal token: GitHub says nothing of its permissions.
+    PersonalToken,
+}
+
+/// What the GitHub credential of the project of `repo`, resolved and read
+/// from `keychain` as `owlshift do` reads it, gives merge on green (OWL-445):
+/// for the GitHub App's token, the installation of the app `slug` that
+/// lists the repository, read-only (C12, 2026-10-19); a personal token is
+/// not asked anything.
+pub fn merge_permission(
+    keychain: &Keychain,
+    repo: &Repo,
+    slug: &str,
+) -> Result<MergePermission, TokenTryError> {
+    let mut read = |account: &str| keychain.read(account).map_err(|error| error.to_string());
+    let found = secrets::forge(repo, &mut read).map_err(TokenTryError::Credential)?;
+    if found.account.kind == ForgeKind::Personal {
+        return Ok(MergePermission::PersonalToken);
+    }
+    let token = token_at(&found, Timestamp::now()).map_err(TokenTryError::Credential)?;
+    let installation = GitHubForge::new(token, repo.clone())
+        .app_installation(slug)
+        .map_err(TokenTryError::Forge)?;
+    Ok(match installation {
+        None => MergePermission::NotInstalled,
+        Some(installation) if installation.contents_write => MergePermission::Granted,
+        Some(installation) => MergePermission::Missing {
+            installation: installation.id,
+        },
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use crate::secrets::ForgeAccount;

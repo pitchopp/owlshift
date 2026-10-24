@@ -41,7 +41,26 @@
     "format": {
       "description": "The format version of this document.",
       "type": "integer",
-      "const": 5
+      "const": 6
+    },
+    "merge_retry": {
+      "description": "When a person's `owlshift continue` at Watch last asked for the\nmerge to be tried again (format 6, OWL-445): watch tries again a head\nwhose merge GitHub refused for good before then. Not a refusal: those\nlive in watch's memory only.",
+      "type": [
+        "string",
+        "null"
+      ],
+      "format": "date-time"
+    },
+    "merging": {
+      "description": "The runner's merge on green under way (format 6, OWL-445; D14):\nkept just before the merge call, so a later read of the pull\nrequest merged is the runner's merge, told once, even after a crash\nbetween GitHub's answer and the ref write.",
+      "anyOf": [
+        {
+          "$ref": "#/$defs/Merging"
+        },
+        {
+          "type": "null"
+        }
+      ]
     },
     "owed": {
       "description": "The DELIVERY report of `pushed`, a fix, rebase or correction run's\npush that landed, while it is not on the ticket yet (OWL-218): the\nnext pass posts it, once. Since format 2; since format 4 also the\nfirst delivery's report, and a correction's that pushed nothing\n(OWL-236).",
@@ -310,6 +329,45 @@
       "additionalProperties": false,
       "required": [
         "summary"
+      ]
+    },
+    "MergeMethod": {
+      "description": "How the runner merges a pull request (`[forge] merge_method`).",
+      "oneOf": [
+        {
+          "description": "One commit on the base. The default.",
+          "type": "string",
+          "const": "squash"
+        },
+        {
+          "description": "A merge commit.",
+          "type": "string",
+          "const": "merge"
+        },
+        {
+          "description": "The head's commits replayed on the base.",
+          "type": "string",
+          "const": "rebase"
+        }
+      ]
+    },
+    "Merging": {
+      "description": "The runner's merge of the pull request under way (OWL-445).",
+      "type": "object",
+      "properties": {
+        "commit": {
+          "description": "The head the merge expects: Owlshift's last push.",
+          "type": "string"
+        },
+        "method": {
+          "description": "The project's `[forge] merge_method`.",
+          "$ref": "#/$defs/MergeMethod"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "commit",
+        "method"
       ]
     },
     "OwedReport": {

@@ -33,7 +33,7 @@ use owlshift_core::follow::{
 };
 use owlshift_core::pipeline::Pipeline;
 use owlshift_core::state::{Event, Status, TicketState, Transition};
-use owlshift_core::vocab::Stage;
+use owlshift_core::vocab::{MergeMethod, MergeSwitch, Stage};
 
 use crate::events::{Data, data};
 use crate::ticket_ref::TicketRecord;
@@ -323,6 +323,46 @@ pub struct Following {
     /// The kind of the last failure of a reviews read warned of, per ticket
     /// (OWL-307).
     reviews_unread: HashMap<TicketId, &'static str>,
+    /// When a green read of the head was first made, per ticket, for merge
+    /// on green's two green reads (OWL-445): forgotten at the first read
+    /// that is not green, or of another head.
+    green_since: HashMap<TicketId, (String, Timestamp)>,
+    /// What merge on green keeps of each ticket (OWL-445).
+    merge: HashMap<TicketId, MergeMemory>,
+    /// `[forge] merge` and `merge_method` as the project file reads at a
+    /// commit, the latest few: a commit's file never changes (OWL-445).
+    switches: Vec<(String, Switch)>,
+}
+
+/// `[forge] merge` and `merge_method` as read at a commit (OWL-445).
+pub type Switch = (MergeSwitch, MergeMethod);
+
+/// How many commits' switches [`Following`] keeps.
+const SWITCHES_KEPT: usize = 16;
+
+/// What watch keeps of a ticket's merge on green (OWL-445).
+#[derive(Debug, Default)]
+struct MergeMemory {
+    /// The refusal that will not pass, of one head on one base.
+    refused: Option<MergeRefused>,
+    /// The fact whose read failed, as last warned of.
+    unread: Option<&'static str>,
+}
+
+/// A merge on green refused for good (OWL-445; architecture section 5,
+/// "Merge on green", "Its answers"): no new attempt on `head` and `base`
+/// until one of them changes or a person's `continue` asks for one after
+/// `at`, or, for a review the last read found missing, until it clears on
+/// that same head.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MergeRefused {
+    pub head: String,
+    pub base: String,
+    pub at: Timestamp,
+    /// The last read's review decision refused it, not GitHub's answer to
+    /// the merge: the next passes read the pull request again, and merge
+    /// once the review clears.
+    pub review: bool,
 }
 
 /// A warning a look records, beside the events of what it read.
@@ -352,6 +392,7 @@ impl Following {
         };
         let seen = fresh.seen(pr.number, &pr.url);
         self.unread.remove(ticket);
+        self.green(ticket, &seen, now);
         if let Decision::Follow {
             action: Action::Fix { overdue },
             ..
@@ -605,6 +646,150 @@ impl Following {
         self.paused_until = self.paused_until.max(kept.paused_until);
     }
 
+    /// Keeps when `seen`, a read of `ticket`'s pull request at `now`, is
+    /// the first green read of its head, and forgets it at a read that is
+    /// not green (OWL-445).
+    fn green(&mut self, ticket: &TicketId, seen: &Seen, now: Timestamp) {
+        let green = matches!(
+            seen.decision,
+            Decision::Follow {
+                adopt: false,
+                action: Action::Green
+            }
+        );
+        if !green {
+            self.green_since.remove(ticket);
+            return;
+        }
+        match self.green_since.get(ticket) {
+            Some((head, _)) if *head == seen.head => {}
+            _ => {
+                self.green_since
+                    .insert(ticket.clone(), (seen.head.clone(), now));
+            }
+        }
+    }
+
+    /// The head of `ticket` first read green and how long before `now`,
+    /// for [`follow::merge_due`]'s two green reads (OWL-445).
+    pub fn first_green(&self, ticket: &TicketId, now: Timestamp) -> Option<(String, Duration)> {
+        self.green_since.get(ticket).map(|(head, since)| {
+            let ago = Duration::try_from(now.duration_since(*since)).unwrap_or_default();
+            (head.clone(), ago)
+        })
+    }
+
+    /// Whether a refusal that will not pass holds `ticket`'s merge of `head`
+    /// on `base` back from any read or call (OWL-445): one of another head
+    /// or base, or older than `retry`, a person's `continue` asking for a
+    /// new attempt, is forgotten first. A refusal of a review is no hold:
+    /// the next pass reads the pull request again.
+    pub fn merge_held(
+        &mut self,
+        ticket: &TicketId,
+        head: &str,
+        base: &str,
+        retry: Option<Timestamp>,
+    ) -> bool {
+        let Some(memory) = self.merge.get_mut(ticket) else {
+            return false;
+        };
+        if let Some(refused) = &memory.refused
+            && (refused.head != head
+                || refused.base != base
+                || retry.is_some_and(|retry| retry > refused.at))
+        {
+            memory.refused = None;
+        }
+        memory
+            .refused
+            .as_ref()
+            .is_some_and(|refused| !refused.review)
+    }
+
+    /// Keeps `refused`, a merge of `ticket` refused for good, and says
+    /// whether to notify it: not when the same head on the same base was
+    /// already refused for the same reason, a review or not (OWL-445).
+    pub fn merge_refused(&mut self, ticket: &TicketId, refused: MergeRefused) -> bool {
+        let memory = self.merge.entry(ticket.clone()).or_default();
+        let told = memory.refused.as_ref().is_some_and(|kept| {
+            kept.head == refused.head && kept.base == refused.base && kept.review == refused.review
+        });
+        if !told {
+            memory.refused = Some(refused);
+        }
+        !told
+    }
+
+    /// The last read found `ticket`'s review clearing: a refusal of its
+    /// review is forgotten, so a later one is told again (OWL-445).
+    pub fn review_cleared(&mut self, ticket: &TicketId) {
+        if let Some(memory) = self.merge.get_mut(ticket)
+            && memory
+                .refused
+                .as_ref()
+                .is_some_and(|refused| refused.review)
+        {
+            memory.refused = None;
+        }
+    }
+
+    /// Whether the failed read of `fact` for `ticket`'s merge is to be
+    /// warned of: it is the first, or another fact than the one last warned
+    /// of (OWL-445). Keeps it as warned of.
+    pub fn merge_unread(&mut self, ticket: &TicketId, fact: &'static str) -> bool {
+        let memory = self.merge.entry(ticket.clone()).or_default();
+        let warn = memory.unread != Some(fact);
+        memory.unread = Some(fact);
+        warn
+    }
+
+    /// Every fact of `ticket`'s merge read: a later failure is warned of
+    /// again (OWL-445).
+    pub fn merge_read(&mut self, ticket: &TicketId) {
+        if let Some(memory) = self.merge.get_mut(ticket) {
+            memory.unread = None;
+        }
+    }
+
+    /// Whether a spent budget holds every forge read at `now`.
+    pub fn paused(&self, now: Timestamp) -> bool {
+        self.paused_until.is_some_and(|until| now < until)
+    }
+
+    /// The warnings of a forge read for `ticket` that failed at `now`, a
+    /// merge on green's read (OWL-445), as a look's failure gives them: a
+    /// spent budget pauses every forge read, once per pause; any other
+    /// failure is warned of once per kind until a look reads.
+    pub fn read_failed(
+        &mut self,
+        ticket: &TicketId,
+        error: &owlshift_adapters::forge::Error,
+        now: Timestamp,
+    ) -> Vec<Warning> {
+        self.failed(ticket, error, now, Vec::new()).1
+    }
+
+    /// The switch kept for `commit`, if read before (OWL-445).
+    pub fn switch_at(&self, commit: &str) -> Option<Switch> {
+        self.switches
+            .iter()
+            .find(|(at, _)| at == commit)
+            .map(|(_, switch)| *switch)
+    }
+
+    /// Keeps `switch` as the project file reads at `commit`, the oldest
+    /// one kept dropped past the few it keeps (OWL-445).
+    pub fn keep_switch(&mut self, commit: &str, switch: Switch) {
+        if self.switch_at(commit).is_some() {
+            return;
+        }
+        if self.switches.len() == SWITCHES_KEPT {
+            self.switches.remove(0);
+        }
+        self.switches.push((commit.to_owned(), switch));
+    }
+
     /// Forgets everything kept of `ticket`.
     pub fn forget(&mut self, ticket: &TicketId) {
         self.recorded.remove(ticket);
@@ -614,6 +799,8 @@ impl Following {
         self.moved.remove(ticket);
         self.unposted.remove(ticket);
         self.reviews_unread.remove(ticket);
+        self.green_since.remove(ticket);
+        self.merge.remove(ticket);
     }
 
     /// Forgets the tickets `kept` does not name.
@@ -625,6 +812,8 @@ impl Following {
         self.moved.retain(|t, _| kept.contains(t));
         self.unposted.retain(|t, _| kept.contains(t));
         self.reviews_unread.retain(|t, _| kept.contains(t));
+        self.green_since.retain(|t, _| kept.contains(t));
+        self.merge.retain(|t, _| kept.contains(t));
     }
 
     /// Reads the reviews of pull request `number` at `now` (OWL-307), one
@@ -791,6 +980,8 @@ pub fn changed(
             }
             let why = ended_why(*reason);
             delivery.pushing = None;
+            // Told by the caller first when the runner merged (OWL-445).
+            delivery.merging = None;
             delivery.ended = Some(Ended {
                 why,
                 at: now,
@@ -798,6 +989,17 @@ pub fn changed(
             });
         }
         Decision::Follow { adopt, action } => {
+            // A merge under way of another head than the one read never
+            // merged: GitHub refuses a merge whose head moved (OWL-445). One
+            // of the head read is kept, a merge with no verdict may still
+            // land.
+            if delivery
+                .merging
+                .as_ref()
+                .is_some_and(|merging| merging.commit != seen.head)
+            {
+                delivery.merging = None;
+            }
             if *adopt && let Some(pushing) = delivery.pushing.take() {
                 let event = match pushing.kind {
                     PushKind::Fix => Some(Event::FixPushed),
@@ -1170,6 +1372,80 @@ mod tests {
         );
     }
 
+    /// OWL-445: the first green read is kept per head, forgotten by a read
+    /// that is not green; a refusal holds its head and base until either
+    /// changes or a later `continue`, a review's refusal holds no read and
+    /// is told again once it cleared; a failed fact is warned of once per
+    /// fact until every fact reads.
+    #[test]
+    fn merge_on_green_keeps_its_first_green_read_refusals_and_warnings() {
+        let mut following = Following::default();
+        let green = |head: &str| {
+            seen_with(
+                Decision::Follow {
+                    adopt: false,
+                    action: Action::Green,
+                },
+                head,
+            )
+        };
+        following.green(&ticket(), &green(PUSHED), at(0));
+        following.green(&ticket(), &green(PUSHED), at(1));
+        assert_eq!(
+            following.first_green(&ticket(), at(2)),
+            Some((PUSHED.to_owned(), Duration::from_secs(120)))
+        );
+        following.green(&ticket(), &green(PUSHING), at(3));
+        assert_eq!(
+            following.first_green(&ticket(), at(3)),
+            Some((PUSHING.to_owned(), Duration::ZERO))
+        );
+        let waits = seen_with(
+            Decision::Follow {
+                adopt: false,
+                action: Action::WaitChecks,
+            },
+            PUSHING,
+        );
+        following.green(&ticket(), &waits, at(4));
+        assert_eq!(following.first_green(&ticket(), at(4)), None);
+
+        // A final refusal: told once, held until the head, the base or a
+        // later `continue` changes.
+        let refused = |head: &str, base: &str, review: bool| MergeRefused {
+            head: head.to_owned(),
+            base: base.to_owned(),
+            at: at(5),
+            review,
+        };
+        assert!(following.merge_refused(&ticket(), refused(PUSHED, "b", false)));
+        assert!(!following.merge_refused(&ticket(), refused(PUSHED, "b", false)));
+        assert!(following.merge_held(&ticket(), PUSHED, "b", None));
+        assert!(following.merge_held(&ticket(), PUSHED, "b", Some(at(5))));
+        assert!(!following.merge_held(&ticket(), PUSHED, "b", Some(at(6))));
+        assert!(following.merge_refused(&ticket(), refused(PUSHED, "b", false)));
+        assert!(!following.merge_held(&ticket(), PUSHED, "c", None));
+        assert!(following.merge_refused(&ticket(), refused(PUSHED, "c", false)));
+        assert!(!following.merge_held(&ticket(), PUSHING, "c", None));
+        // A review's refusal: no hold, told once until it clears.
+        assert!(following.merge_refused(&ticket(), refused(PUSHED, "c", true)));
+        assert!(!following.merge_held(&ticket(), PUSHED, "c", None));
+        assert!(!following.merge_refused(&ticket(), refused(PUSHED, "c", true)));
+        following.review_cleared(&ticket());
+        assert!(following.merge_refused(&ticket(), refused(PUSHED, "c", true)));
+
+        // Each fact warned of once, again after a read of every fact.
+        for fact in ["label", "stage", "questions", "switch", "base"] {
+            assert!(following.merge_unread(&ticket(), fact), "{fact}");
+            assert!(!following.merge_unread(&ticket(), fact), "{fact}");
+        }
+        following.merge_read(&ticket());
+        assert!(following.merge_unread(&ticket(), "base"));
+        following.forget(&ticket());
+        assert!(!following.merge_held(&ticket(), PUSHED, "c", None));
+        assert!(following.merge_unread(&ticket(), "base"));
+    }
+
     fn record(delivery: TicketDelivery, state: TicketState) -> TicketRecord {
         TicketRecord {
             state: PersistedState::from(&state),
@@ -1228,6 +1504,31 @@ mod tests {
             .unwrap()
             .record;
         assert_eq!(cleared.state.failed_runs, 0);
+        // OWL-445: a merge under way of the head read stays (a merge with
+        // no verdict may still land); one of another head is cleared, and
+        // so is any at an end.
+        let mut merging = delivery();
+        merging.merging = Some(owlshift_contracts::refs::Merging {
+            commit: PUSHED.to_owned(),
+            method: MergeMethod::Squash,
+        });
+        let merging = record(merging, watching(0));
+        assert_eq!(changed(&merging, pipeline, &green, at(0)).unwrap(), None);
+        let moved = seen_with(green.decision.clone(), PUSHING);
+        let cleared_by = |seen: &Seen| {
+            changed(&merging, pipeline, seen, at(0))
+                .unwrap()
+                .unwrap()
+                .record
+                .delivery
+                .unwrap()
+                .merging
+        };
+        assert_eq!(cleared_by(&moved), None);
+        assert_eq!(
+            cleared_by(&seen_with(Decision::End(EndReason::Merged), PUSHED)),
+            None
+        );
 
         let mut pushing = delivery();
         pushing.pushing = Some(Pushing {

@@ -91,6 +91,11 @@
           "description": "The ticket waits for its project's quarantine to be cleared on the\nrunner's machine: told once per quarantine (OWL-368).",
           "type": "string",
           "const": "WAITING"
+        },
+        {
+          "description": "The runner merged the pull request under merge on green (D14,\nOWL-445): which head and method.",
+          "type": "string",
+          "const": "MERGED"
         }
       ]
     },

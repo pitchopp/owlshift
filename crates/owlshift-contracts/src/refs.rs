@@ -17,6 +17,7 @@ use jiff::Timestamp;
 use owlshift_core::decider::DeciderRule;
 use owlshift_core::gate::TicketSpend;
 use owlshift_core::state::{Status, TicketState};
+use owlshift_core::vocab::MergeMethod;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
@@ -1596,6 +1597,28 @@ pub struct TicketDelivery {
     /// Why and when watch stopped following the pull request.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ended: Option<Ended>,
+    /// The runner's merge on green under way (format 6, OWL-445; D14):
+    /// kept just before the merge call, so a later read of the pull
+    /// request merged is the runner's merge, told once, even after a crash
+    /// between GitHub's answer and the ref write.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub merging: Option<Merging>,
+    /// When a person's `owlshift continue` at Watch last asked for the
+    /// merge to be tried again (format 6, OWL-445): watch tries again a head
+    /// whose merge GitHub refused for good before then. Not a refusal: those
+    /// live in watch's memory only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub merge_retry: Option<Timestamp>,
+}
+
+/// The runner's merge of the pull request under way (OWL-445).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct Merging {
+    /// The head the merge expects: Owlshift's last push.
+    pub commit: String,
+    /// The project's `[forge] merge_method`.
+    pub method: MergeMethod,
 }
 
 /// A delivered pull request.
@@ -1751,6 +1774,8 @@ impl TicketDelivery {
             pushing: None,
             owed: None,
             ended: None,
+            merging: None,
+            merge_retry: None,
         }
     }
 
@@ -1759,8 +1784,10 @@ impl TicketDelivery {
     /// them, a format-2 one, written before a correction run's push
     /// (OWL-146), without one, and a format-3 one, written before the first
     /// delivery's report was owed (OWL-236), without that, and a format-4
-    /// one, written before a review loop's push (OWL-300), without one; the
-    /// next write gives it the current format.
+    /// one, written before a review loop's push (OWL-300), without one, and
+    /// a format-5 one, written before merge on green (OWL-445), without a
+    /// merge under way or a retry; the next write gives it the current
+    /// format.
     pub fn parse(input: &str) -> Result<Self, ContractError> {
         let delivery: Self = match Self::from_older_format(input) {
             Some(read) => read?,
@@ -1770,18 +1797,19 @@ impl TicketDelivery {
         Ok(delivery)
     }
 
-    /// A format-1 to 4 document read as the current format, or `None` for
+    /// A format-1 to 5 document read as the current format, or `None` for
     /// any other. Format 1 is format 2 without `owed` and `pushing.report`,
     /// format 2 is format 3 without a correction's push or report, format 3
     /// is format 4 without an owed delivery report, a report's `notes` or an
     /// owed report's `unchanged`, and format 4 is format 5 without a review
-    /// loop's push, a report's `reviews` or `delivered_at` (OWL-307), so
+    /// loop's push, a report's `reviews` or `delivered_at` (OWL-307), and
+    /// format 5 is format 6 without `merging` or `merge_retry` (OWL-445), so
     /// each is refused in an older format.
     fn from_older_format(input: &str) -> Option<Result<Self, ContractError>> {
         let mut document: serde_json::Value = serde_json::from_str(input).ok()?;
         let fields = document.as_object_mut()?;
         let format = fields.get("format").and_then(serde_json::Value::as_u64)?;
-        if !(1..=4).contains(&format) {
+        if !(1..=5).contains(&format) {
             return None;
         }
         let pushing = fields.get("pushing").and_then(serde_json::Value::as_object);
@@ -1817,6 +1845,8 @@ impl TicketDelivery {
             .is_some_and(|kind| kind == "delivery");
         let unchanged = owed.is_some_and(|owed| owed.contains_key("unchanged"));
         let delivered_at = fields.contains_key("delivered_at");
+        let merging = fields.contains_key("merging");
+        let merge_retry = fields.contains_key("merge_retry");
         for (field, kept) in [
             ("owed", format == 1 && owed.is_some()),
             ("pushing.report", format == 1 && report),
@@ -1825,9 +1855,11 @@ impl TicketDelivery {
             ("owed delivery report", format <= 3 && owed_delivery),
             ("report's notes", format <= 3 && notes),
             ("unchanged correction", format <= 3 && unchanged),
-            ("review loop's push", review),
-            ("report's reviews", reviews),
-            ("delivered_at", delivered_at),
+            ("review loop's push", format <= 4 && review),
+            ("report's reviews", format <= 4 && reviews),
+            ("delivered_at", format <= 4 && delivered_at),
+            ("merging", merging),
+            ("merge_retry", merge_retry),
         ] {
             if kept {
                 return Some(Err(ContractError::invalid(
@@ -1890,6 +1922,10 @@ impl TicketDelivery {
             (
                 "ended.head",
                 self.ended.as_ref().and_then(|e| e.head.as_deref()),
+            ),
+            (
+                "merging.commit",
+                self.merging.as_ref().map(|m| m.commit.as_str()),
             ),
         ];
         for (field, commit) in commits {

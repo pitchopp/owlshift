@@ -109,7 +109,30 @@ struct FakeGitHub {
     /// down.
     fail_pulls: Mutex<u32>,
     fail_files: Mutex<u32>,
+    /// Merge on green (OWL-445): the reads of the base branch's head and the
+    /// last reads before a merge so far, each merge call's body, how the
+    /// next ones are answered (merged when none is left), and what happens
+    /// during the next one.
+    branch_head_reads: Mutex<u32>,
+    merge_reads: Mutex<u32>,
+    merges: Mutex<Vec<Value>>,
+    merge_answers: Mutex<VecDeque<MergeAnswer>>,
+    during_merge: Mutex<Option<Box<dyn FnOnce() + Send>>>,
 }
+
+/// How GitHub answers a merge call (OWL-445).
+#[derive(Clone, Copy)]
+enum MergeAnswer {
+    /// HTTP 200: merged, the pull request reads merged from then on.
+    Merged,
+    /// A refusal: its status and GitHub's words.
+    Refused(u16, &'static str),
+    /// HTTP 502, though GitHub merged it.
+    MergedUnanswered,
+}
+
+/// The commit GitHub's answer gives a merge.
+const MERGE_COMMIT: &str = "c0ffee0c0ffee0c0ffee0c0ffee0c0ffee0c0ffe";
 
 /// What happens at the next read of a head's checks.
 enum AtChecks {
@@ -133,6 +156,10 @@ struct Followed {
     mergeable: &'static str,
     conclusion: &'static str,
     base_conclusion: &'static str,
+    /// What the last read before a merge finds (OWL-445): a draft, and
+    /// GitHub's review decision, `None` when none is required.
+    draft: bool,
+    review: Option<&'static str>,
 }
 
 impl Default for Followed {
@@ -142,11 +169,56 @@ impl Default for Followed {
             mergeable: "MERGEABLE",
             conclusion: "SUCCESS",
             base_conclusion: "SUCCESS",
+            draft: false,
+            review: None,
         }
     }
 }
 
 impl FakeGitHub {
+    /// The remote's `main`.
+    fn main(&self) -> String {
+        self.env
+            .run(&self.bare, &["rev-parse", "refs/heads/main"])
+            .map(|out| String::from_utf8(out).unwrap().trim().to_owned())
+            .unwrap()
+    }
+
+    /// A merge call (OWL-445), answered as scripted, merged by default.
+    fn merge(&self, body: &Value) -> Response {
+        self.merges.lock().unwrap().push(body.clone());
+        if let Some(during) = self.during_merge.lock().unwrap().take() {
+            during();
+        }
+        let answer = self
+            .merge_answers
+            .lock()
+            .unwrap()
+            .pop_front()
+            .unwrap_or(MergeAnswer::Merged);
+        let (status, body) = match answer {
+            MergeAnswer::Merged | MergeAnswer::MergedUnanswered => {
+                self.followed.lock().unwrap().state = "MERGED";
+                let status = if matches!(answer, MergeAnswer::Merged) {
+                    200
+                } else {
+                    502
+                };
+                let body = json!({
+                    "sha": MERGE_COMMIT, "merged": true,
+                    "message": "Pull Request successfully merged",
+                });
+                (status, body)
+            }
+            MergeAnswer::Refused(status, message) => (status, json!({ "message": message })),
+        };
+        Response {
+            status,
+            body: body.to_string(),
+            ..Default::default()
+        }
+    }
+
     fn tip(&self) -> String {
         let head = self.head.lock().unwrap().clone();
         self.env
@@ -211,6 +283,18 @@ impl FakeGitHub {
                         }],
                     },
                 } } }] },
+            } } })
+        } else if query.starts_with("query BranchHead") {
+            *self.branch_head_reads.lock().unwrap() += 1;
+            assert_eq!(request["variables"]["branch"], "refs/heads/main");
+            json!({ "repository": { "object": { "oid": self.main() } } })
+        } else if query.starts_with("query MergeRead") {
+            *self.merge_reads.lock().unwrap() += 1;
+            let followed = self.followed.lock().unwrap().clone();
+            json!({ "repository": { "pullRequest": {
+                "state": followed.state, "headRefOid": self.tip(), "isDraft": followed.draft,
+                "reviewDecision": followed.review, "baseRefName": "main",
+                "baseRef": { "target": { "oid": self.main() } },
             } } })
         } else if query.starts_with("query Reviews") {
             *self.reviews_reads.lock().unwrap() += 1;
@@ -341,6 +425,12 @@ impl Transport for Shared {
             body: json!({ "data": data }).to_string(),
             ..Default::default()
         })
+    }
+
+    /// A merge (OWL-445), the REST write of the bench.
+    fn put(&self, path: &str, body: &Value) -> Result<Response, String> {
+        assert_eq!(path, "repos/demo/project/pulls/1/merge");
+        Ok(self.0.merge(body))
     }
 
     /// The red job's log, and a pull request's files (OWL-410), the REST
@@ -1091,6 +1181,11 @@ impl Bench {
             others: Mutex::new(Vec::new()),
             fail_pulls: Mutex::new(0),
             fail_files: Mutex::new(0),
+            branch_head_reads: Mutex::new(0),
+            merge_reads: Mutex::new(0),
+            merges: Mutex::new(Vec::new()),
+            merge_answers: Mutex::new(VecDeque::new()),
+            during_merge: Mutex::new(None),
         });
         let tmp_data = tmp.path().join("data");
         Self {
@@ -7264,6 +7359,11 @@ fn watch_follows_a_delivered_pull_request_until_it_is_merged() {
     // Seven passes: the sixth read it merged, the seventh read nothing; the
     // rebase repair read it once more under the lock.
     assert_eq!(*github.follow_reads.lock().unwrap(), 7);
+    // S18 under `never` (OWL-445): the switch read at the base branch's
+    // head, then nothing more read for a merge, and no merge.
+    assert!(*github.branch_head_reads.lock().unwrap() > 0);
+    assert_eq!(*github.merge_reads.lock().unwrap(), 0);
+    assert!(github.merges.lock().unwrap().is_empty());
     let delivery = bench.record().delivery.unwrap();
     assert!(!delivery.followed());
     assert_eq!(
@@ -11963,3 +12063,7 @@ mod review_scenarios;
 /// `watch --drain` on this bench (OWL-310, build plan "P5", part M).
 #[path = "on_demand/pipeline_scenarios.rs"]
 mod pipeline_scenarios;
+
+/// Scenario S18, merge on green (OWL-445).
+#[path = "on_demand/merge_scenarios.rs"]
+mod merge_scenarios;

@@ -84,6 +84,7 @@ impl OnDemand<'_> {
         let look = || Stop::Watched {
             ticket: ticket.clone(),
             seen: Box::new(fresh.seen(pr.number, &pr.url)),
+            merge: None,
         };
         if !matches!(
             fresh.decision,
@@ -358,6 +359,7 @@ impl OnDemand<'_> {
             opened: false,
             verdict,
             comment: comment.id,
+            merge: crate::merge::switch_at(self, &p.base),
         })
     }
 

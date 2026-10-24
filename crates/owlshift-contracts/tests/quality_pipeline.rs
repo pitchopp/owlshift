@@ -658,7 +658,8 @@ fn bumped_ticket_ref_formats_read_older_ones_and_refuse_newer_ones() {
         .to_string();
     assert!(error.contains("upgrade Owlshift"), "{error}");
 
-    // delivery.json 5: a review loop's push and its report's reviews.
+    // delivery.json 5: a review loop's push and its report's reviews (read
+    // as format 6 since OWL-445).
     let delivery = json_fixture("ticket-delivery.json");
     let mut review = delivery.clone();
     review["pushing"]["kind"] = "review".into();
@@ -700,7 +701,7 @@ fn bumped_ticket_ref_formats_read_older_ones_and_refuse_newer_ones() {
         ),
         (
             "a newer delivery",
-            &|d| d["format"] = 6.into(),
+            &|d| d["format"] = 7.into(),
             "upgrade Owlshift",
         ),
     ] {
@@ -717,7 +718,7 @@ fn bumped_ticket_ref_formats_read_older_ones_and_refuse_newer_ones() {
         TicketDelivery::parse(&format_4.to_string())
             .unwrap()
             .render()
-            .starts_with("{\n  \"format\": 5,")
+            .starts_with("{\n  \"format\": 6,")
     );
     let mut reviews_in_4 = format_4;
     reviews_in_4["pushing"]["report"]["reviews"] = json!([{ "id": 7, "author": "ada" }]);

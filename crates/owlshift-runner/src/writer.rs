@@ -76,10 +76,11 @@ use owlshift_contracts::review::{
     RulingOutcome, Severity,
 };
 use owlshift_contracts::{BasisKind, DelegationLevel};
-use owlshift_core::floor::{self, Action, FloorViolation, HumanApproval};
+use owlshift_core::floor::{self, Action, FloorViolation, HumanApproval, MergeGrant};
+use owlshift_core::follow::MERGE_LABEL;
 use owlshift_core::gate::BudgetReached;
 use owlshift_core::state::{Event, MAX_FIX_PASSES, MAX_REASKS, MAX_REPAIRS, ParkReason, Status};
-use owlshift_core::vocab::{Harness, Stage, Tier, Variant};
+use owlshift_core::vocab::{Harness, MergeMethod, MergeSwitch, Stage, Tier, Variant};
 
 use crate::executor::Git;
 use crate::resolver::{Fallback, Logged};
@@ -126,6 +127,85 @@ pub struct DeliveryReport {
     /// A review loop's outcome (OWL-307): the pull request reviews it
     /// answers, and whether its Build pushed a commit. `None` otherwise.
     pub reviewed: Option<Reviewed>,
+    /// The project's `[forge] merge` (D14, OWL-445), which says who merges
+    /// the pull request: `never` when it could not be read.
+    pub merge: MergeSwitch,
+}
+
+/// Who merges a pull request on a project that opted into merge on green
+/// (D14, OWL-445), `it` being how the sentence names it; `None` under
+/// `never`, where each text keeps its own words that Owlshift never merges.
+pub fn merges_on_green(switch: MergeSwitch, it: &str) -> Option<String> {
+    match switch {
+        MergeSwitch::Never => None,
+        MergeSwitch::All => Some(format!(
+            "Owlshift merges {it} once it is green, unless a person must judge it first \
+             (merge on green)."
+        )),
+        MergeSwitch::Labeled => Some(format!(
+            "Owlshift merges {it} once it is green only if the ticket carries the label \
+             `{MERGE_LABEL}` (merge on green); otherwise review and merge it."
+        )),
+    }
+}
+
+/// The MERGED comment (D14, OWL-445; architecture section 5, "Merge on
+/// green", "Its answers"): the runner merged the pull request at its head,
+/// by the project's method.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MergedComment {
+    pub ticket: TicketId,
+    pub pull_request: DeliveredPullRequest,
+    /// The head merged: the commit Owlshift last pushed.
+    pub head: CommitId,
+    pub method: MergeMethod,
+    /// The commit the merge made on the base, when GitHub's answer was
+    /// read; `None` when the merge was found by a later read of the pull
+    /// request.
+    pub commit: Option<CommitId>,
+}
+
+impl MergedComment {
+    /// The line a MERGED comment is found by: its pull request and head.
+    fn pull_request_line(&self) -> String {
+        let pr = &self.pull_request;
+        format!(
+            "**Pull request:** {}, head {}",
+            link(&format!("#{}", pr.number), &pr.url),
+            code(short(&self.head))
+        )
+    }
+
+    pub fn render(&self) -> String {
+        let header = Header {
+            kind: MarkerKind::Merged,
+            round: None,
+        };
+        let footer = Footer {
+            format: Format,
+            kind: MarkerKind::Merged,
+            ticket: self.ticket.clone(),
+            round: None,
+            run: None,
+        };
+        let mut all = vec![
+            header.render(),
+            format!(
+                "**Merged by Owlshift** under the project's merge on green, by {}: its checks \
+                 were green twice on this head and base, and nothing on the ticket was left \
+                 for a person to judge.",
+                code(self.method.as_str())
+            ),
+            self.pull_request_line(),
+        ];
+        if let Some(commit) = &self.commit {
+            all.push(format!("**Merge commit:** {}", code(short(commit))));
+        }
+        all.push(footer.render());
+        let mut body = all.join("\n\n");
+        body.push('\n');
+        body
+    }
 }
 
 /// A review loop a DELIVERY report names (OWL-307, architecture section 5,
@@ -404,9 +484,11 @@ impl DeliveryReport {
         let pr_link = link(&format!("#{}", pr.number), &pr.url);
         let mut remains = Vec::new();
         if pr.state == PrState::Open {
-            remains.push(format!(
-                "Review and merge {pr_link}: Owlshift never merges."
-            ));
+            remains.push(
+                merges_on_green(self.merge, &pr_link).unwrap_or_else(|| {
+                    format!("Review and merge {pr_link}: Owlshift never merges.")
+                }),
+            );
         }
         let checks = self.checks_section(&mut remains);
         for proposed in &self.followups {
@@ -3906,6 +3988,60 @@ impl<'a> Writer<'a> {
         Ok(Reported { comment, new: true })
     }
 
+    /// Merges pull request `number` under `grant`, merge on green's (D14,
+    /// OWL-445), after asking the floor: at the grant's head, the commit
+    /// Owlshift last pushed, so GitHub refuses the merge of any other head,
+    /// and by the grant's method. The answer is the forge's
+    /// ([`GitHubForge::merge_pull_request`]).
+    pub fn merge_pull_request(
+        &self,
+        forge: &GitHubForge,
+        number: u64,
+        grant: &MergeGrant,
+    ) -> Result<forge::MergeAnswer, WriteError> {
+        floor::check_action(Action::Merge(Some(grant.clone())), HumanApproval::Absent)
+            .map_err(WriteError::Floor)?;
+        let head = CommitId::new(grant.head()).map_err(WriteError::Forge)?;
+        forge
+            .merge_pull_request(number, &head, grant.method().into())
+            .map_err(WriteError::Forge)
+    }
+
+    /// Posts a MERGED comment once (OWL-445): when a MERGED comment on the
+    /// ticket already names the same pull request and head, that comment is
+    /// returned and nothing is posted, so a merge told before a crash is
+    /// never told again.
+    pub fn post_merged(&self, comment: &MergedComment) -> Result<Reported, WriteError> {
+        floor::check_action(Action::Comment, HumanApproval::Absent).map_err(WriteError::Floor)?;
+        let line = comment.pull_request_line();
+        let merged = |body: &str| {
+            matches!(
+                MarkedComment::parse(body),
+                Ok(Some(MarkedComment { header, .. })) if header.kind == MarkerKind::Merged
+            ) && body.lines().any(|l| l.trim_end() == line)
+        };
+        let posted = self
+            .tracker
+            .comments(&comment.ticket)
+            .map_err(WriteError::Tracker)?
+            .into_iter()
+            .find(|posted| merged(&posted.body));
+        if let Some(posted) = posted {
+            return Ok(Reported {
+                comment: posted,
+                new: false,
+            });
+        }
+        let posted = self
+            .tracker
+            .post_comment(&comment.ticket, &comment.render())
+            .map_err(WriteError::Tracker)?;
+        Ok(Reported {
+            comment: posted,
+            new: true,
+        })
+    }
+
     /// Files a follow-up in the tracker's proposals inbox (OWL-253), after
     /// asking the floor: refused when `admission_label`, the project's
     /// `[tracker].admit` label, is the one label a proposal may carry. The
@@ -4522,6 +4658,7 @@ mod tests {
             review: None,
             reviewed: None,
             recommended: Vec::new(),
+            merge: MergeSwitch::Never,
         }
     }
 
@@ -7162,6 +7299,79 @@ Reply `Q1: B`, `ok` to take every recommendation, or in your own words.
         moved.pull_request.head = CommitId::new("b".repeat(40)).unwrap();
         assert_ne!(writer.post_repair_report(&moved).unwrap(), posted);
         assert_eq!(tracker.posts.get(), 5);
+    }
+
+    /// OWL-445: the DELIVERY report says who merges, by the project's
+    /// `[forge] merge`; a MERGED comment says the head and the method, and
+    /// is posted once per pull request and head.
+    #[test]
+    fn who_merges_is_said_and_a_merge_is_told_once() {
+        let pr_link = "[#23](https://github.com/pitchopp/owlshift/pull/23)";
+        for (switch, says) in [
+            (
+                MergeSwitch::Never,
+                format!("Review and merge {pr_link}: Owlshift never merges."),
+            ),
+            (
+                MergeSwitch::All,
+                format!(
+                    "Owlshift merges {pr_link} once it is green, unless a person must judge it \
+                     first (merge on green)."
+                ),
+            ),
+            (
+                MergeSwitch::Labeled,
+                format!(
+                    "Owlshift merges {pr_link} once it is green only if the ticket carries the \
+                     label `owlshift:merge` (merge on green); otherwise review and merge it."
+                ),
+            ),
+        ] {
+            let mut report = report(Ok(set(Mergeable::Mergeable, vec![])));
+            report.merge = switch;
+            let body = report.render();
+            assert!(body.contains(&format!("- {says}\n")), "{switch:?}: {body}");
+        }
+
+        let tracker = FakeTracker::default();
+        let writer = Writer::new(&tracker);
+        let merged = MergedComment {
+            ticket: ticket(),
+            pull_request: DeliveredPullRequest {
+                number: 23,
+                url: "https://github.com/pitchopp/owlshift/pull/23".to_owned(),
+            },
+            head: CommitId::new("a".repeat(40)).unwrap(),
+            method: MergeMethod::Squash,
+            commit: Some(CommitId::new("c".repeat(40)).unwrap()),
+        };
+        let body = merged.render();
+        assert!(body.starts_with("[owlshift] MERGED\n\n"), "{body}");
+        assert!(
+            body.contains(&format!("\n**Pull request:** {pr_link}, head `aaaaaaa`\n")),
+            "{body}"
+        );
+        assert!(
+            body.contains("by `squash`") && body.contains("`ccccccc`"),
+            "{body}"
+        );
+        let first = writer.post_merged(&merged).unwrap();
+        // Found again after a crash, even without the merge commit, which a
+        // later read of the pull request does not give.
+        let again = writer
+            .post_merged(&MergedComment {
+                commit: None,
+                ..merged.clone()
+            })
+            .unwrap();
+        assert!(first.new && !again.new);
+        assert_eq!(again.comment, first.comment);
+        let other = MergedComment {
+            head: CommitId::new("b".repeat(40)).unwrap(),
+            ..merged
+        };
+        assert!(writer.post_merged(&other).unwrap().new);
+        assert_eq!(tracker.posts.get(), 2);
     }
 
     /// OWL-228: `fit` leaves the shorter texts whole and cuts the longer

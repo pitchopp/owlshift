@@ -94,9 +94,10 @@ pub const QUESTIONS_FORMAT: u32 = 17;
 /// `report` (OWL-218); format 3 a correction run's push (OWL-146); format 4
 /// the first delivery's owed report, with its kept `notes`, and a
 /// correction's owed report that pushed nothing (OWL-236); format 5 a review
-/// loop's push and its report's answered `reviews` (OWL-300); formats 1 to 4
-/// are still read.
-pub const DELIVERY_FORMAT: u32 = 5;
+/// loop's push and its report's answered `reviews` (OWL-300); format 6 merge
+/// on green's `merging` and `merge_retry` (OWL-445); formats 1 to 5 are
+/// still read.
+pub const DELIVERY_FORMAT: u32 = 6;
 /// The format version of a ticket's intake record (`intake.json` on a ticket
 /// ref, OWL-245). Format 2 adds the `zones` and `resources` intake declared
 /// (OWL-402); format 1 is still read, as holding the whole repository.

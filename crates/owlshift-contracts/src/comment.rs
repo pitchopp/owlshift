@@ -58,10 +58,13 @@ pub enum MarkerKind {
     /// The ticket waits for its project's quarantine to be cleared on the
     /// runner's machine: told once per quarantine (OWL-368).
     Waiting,
+    /// The runner merged the pull request under merge on green (D14,
+    /// OWL-445): which head and method.
+    Merged,
 }
 
 impl MarkerKind {
-    const ALL: [Self; 10] = [
+    const ALL: [Self; 11] = [
         Self::Questions,
         Self::ReAsk,
         Self::Resume,
@@ -72,6 +75,7 @@ impl MarkerKind {
         Self::Intake,
         Self::Plan,
         Self::Waiting,
+        Self::Merged,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -86,6 +90,7 @@ impl MarkerKind {
             Self::Intake => "INTAKE",
             Self::Plan => "PLAN",
             Self::Waiting => "WAITING",
+            Self::Merged => "MERGED",
         }
     }
 

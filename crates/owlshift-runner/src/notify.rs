@@ -563,6 +563,7 @@ mod tests {
             opened: true,
             verdict: None,
             comment: "c".to_owned(),
+            merge: owlshift_core::vocab::MergeSwitch::Never,
         };
         let outcomes = [
             Ok(delivered),

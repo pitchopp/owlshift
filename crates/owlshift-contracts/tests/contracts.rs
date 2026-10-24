@@ -2878,6 +2878,13 @@ fn comment_headers() {
     };
     assert_eq!(waiting.render(), "[owlshift] WAITING");
     assert_eq!(Header::parse(&waiting.render()).unwrap(), waiting);
+    // Merge on green's MERGED (OWL-445).
+    let merged = Header {
+        kind: MarkerKind::Merged,
+        round: None,
+    };
+    assert_eq!(merged.render(), "[owlshift] MERGED");
+    assert_eq!(Header::parse(&merged.render()).unwrap(), merged);
     // A comment that waits for the decider ends its header with their
     // mention, which is passed over (OWL-324).
     let mention = " · https://linear.app/owlshift/profiles/ada";
@@ -3377,7 +3384,7 @@ fn a_ticket_delivery_round_trips_and_is_checked() {
     .unwrap();
     assert!(older.owed.is_none() && older.pushing.as_ref().unwrap().report.is_none());
     assert!(
-        older.render().contains("\"format\": 5"),
+        older.render().contains("\"format\": 6"),
         "{}",
         older.render()
     );
@@ -3409,7 +3416,7 @@ fn a_ticket_delivery_round_trips_and_is_checked() {
     // in format 1. Format 3 keeps one, whose report names its questions,
     // and only a correction's report does.
     let older = parse(|v| v["format"] = json!(2)).unwrap();
-    assert!(older.render().starts_with("{\n  \"format\": 5,"));
+    assert!(older.render().starts_with("{\n  \"format\": 6,"));
     let refused: [(&str, Edit); 3] = [
         ("correction's push", |v| {
             v["format"] = json!(2);
@@ -3527,4 +3534,38 @@ fn a_ticket_delivery_round_trips_and_is_checked() {
     let first = TicketDelivery::new("owlshift/demo-1", "main");
     assert_eq!(TicketDelivery::parse(&first.render()).unwrap(), first);
     assert!(!first.followed());
+    // OWL-445: format 6 keeps merge on green's merge under way and a
+    // person's retry; a format-5 document is read as format 6, and one that
+    // carries either is refused, as is a merge under way at no full commit.
+    let merging = parse(|v| {
+        v["merging"] = json!({
+            "commit": "36f0557116ea73f9b0805980e83b360e23b99940", "method": "squash",
+        });
+        v["merge_retry"] = json!("2026-10-24T09:00:00Z");
+    })
+    .unwrap();
+    assert_eq!(
+        merging.merging.as_ref().unwrap().method,
+        owlshift_core::vocab::MergeMethod::Squash
+    );
+    assert!(merging.merge_retry.is_some());
+    assert_eq!(TicketDelivery::parse(&merging.render()).unwrap(), merging);
+    let older = parse(|v| v["format"] = json!(5)).unwrap();
+    assert!(older.merging.is_none() && older.merge_retry.is_none());
+    let refused: [(&str, Edit); 2] = [
+        ("merging", |v| {
+            v["format"] = json!(5);
+            v["merging"] = json!({
+                "commit": "36f0557116ea73f9b0805980e83b360e23b99940", "method": "merge",
+            });
+        }),
+        ("merge_retry", |v| {
+            v["format"] = json!(5);
+            v["merge_retry"] = json!("2026-10-24T09:00:00Z");
+        }),
+    ];
+    for (field, edit) in refused {
+        rejects(field, parse(edit), &format!("format 5 keeps no {field}"));
+    }
+    assert!(parse(|v| v["merging"] = json!({ "commit": "36f0557", "method": "rebase" })).is_err());
 }

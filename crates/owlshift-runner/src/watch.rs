@@ -135,7 +135,7 @@ use owlshift_contracts::format::Format;
 use owlshift_contracts::ids::TicketId;
 use owlshift_contracts::step::{LandedKind, RefAfter, StepEnd, StepEnvelope, StepHold, StepKind};
 use owlshift_core::collision::{Collision, Dispatched, collision};
-use owlshift_core::follow::{Action, Decision};
+use owlshift_core::follow::{Action, Decision, EndReason};
 use owlshift_core::schedule::{self, Turn};
 use owlshift_core::state::{Status, TicketState};
 use owlshift_core::usage::{Standing, own_harness};
@@ -161,6 +161,7 @@ use crate::writer::VisibleStage;
 
 mod drain;
 mod limits;
+mod merge;
 mod outside;
 pub mod presence;
 mod running;
@@ -560,6 +561,21 @@ struct Memory<'c> {
     base_turn: BTreeSet<TicketId>,
     /// The strongest stop told, once one is asked (OWL-161).
     stop_told: Option<owlshift_platform::process::Degree>,
+    /// The base heads merge on green read at this pass (OWL-445).
+    base_heads: merge::BaseHeads,
+}
+
+/// What a correction's or the reviews' read found due at a pass (OWL-445):
+/// merge on green waits for anything a person's words may still change,
+/// so only an absence read for sure is [`Due::Nothing`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Due {
+    /// Read, and nothing is due.
+    Nothing,
+    /// Due, held, within its quiet window, or not read: nothing ran.
+    Waits,
+    /// Its run started.
+    Ran,
 }
 
 /// Why a ticket's next stage step waits, as told once.
@@ -748,8 +764,10 @@ impl Watch<'_> {
         // The steps whose children ended since, first, whatever the pass
         // finds (OWL-401).
         self.reap(memory, sink, out);
-        // The work outside Owlshift is read again at each pass (OWL-410).
+        // The work outside Owlshift is read again at each pass (OWL-410),
+        // and the base heads of merge on green (OWL-445).
         memory.outside.new_pass();
+        memory.base_heads.clear();
         let read = match self.snapshot(memory, sink) {
             Ok(Snapshot {
                 quarantine: Some(marker),
@@ -1129,11 +1147,26 @@ impl Watch<'_> {
             Look::Paused { .. } | Look::Unread { .. } => return,
         };
         let mut replaced = None;
+        // The runner's merge (OWL-445): told once before the end is kept.
+        let runner_merged = delivery
+            .merging
+            .clone()
+            .filter(|_| matches!(seen.decision, Decision::End(EndReason::Merged)));
         let change =
             follow::changed(&stored.record, PIPELINE, &seen, now).and_then(|change| match change {
                 Some(changed) => {
                     replaced = changed.replaced;
-                    self.write_seen(ticket, stored, &changed.record)
+                    match &runner_merged {
+                        Some(merging) => self.write_merged(
+                            memory,
+                            sink,
+                            ticket,
+                            stored,
+                            merging,
+                            &changed.record,
+                        ),
+                        None => self.write_seen(ticket, stored, &changed.record),
+                    }
                 }
                 None => Ok(Some(stored.at())),
             });
@@ -1154,6 +1187,9 @@ impl Watch<'_> {
         // always changes the ref, which keeps it now (OWL-259).
         if matches!(seen.decision, Decision::Follow { adopt: true, .. }) {
             on_demand.review_after_working(ticket, sink);
+        }
+        if let (Some(merging), Some(pr)) = (&runner_merged, &delivery.pull_request) {
+            crate::merge::merged_event(ticket, pr.number, merging, None, sink);
         }
         if let Some(event) = memory.following.events(ticket, &seen) {
             sink.emit(ticket, None, EventKind::Decision, event);
@@ -1177,16 +1213,31 @@ impl Watch<'_> {
         ) {
             // A read that asks for no repair leaves room for a correction
             // (OWL-146), then for the reviews on the pull request (OWL-307),
-            // read once the pass ran no correction.
+            // read once the pass ran no correction; then, on a green read
+            // with neither due, for merge on green (OWL-445).
             if matches!(
                 seen.decision,
                 Decision::Follow {
                     adopt: false,
                     action: Action::Green | Action::WaitChecks | Action::WaitBaseRed,
                 }
-            ) && !self.correct(memory, sink, out, continued, ticket, stored, at.clone())
-            {
-                self.review(memory, sink, out, continued, ticket, stored, at);
+            ) {
+                let corrected =
+                    self.correct(memory, sink, out, continued, ticket, stored, at.clone());
+                let reviewed = if corrected == Due::Ran {
+                    Due::Ran
+                } else {
+                    self.review(memory, sink, out, continued, ticket, stored, at.clone())
+                };
+                if (corrected, reviewed) == (Due::Nothing, Due::Nothing)
+                    && seen.decision
+                        == (Decision::Follow {
+                            adopt: false,
+                            action: Action::Green,
+                        })
+                {
+                    self.merge(memory, sink, out, continued, ticket, stored, at, &seen);
+                }
             }
             return;
         }
@@ -1213,7 +1264,13 @@ impl Watch<'_> {
             continued,
             ticket,
             held,
-            (StepKind::Repair { failing_for_ms }, first),
+            (
+                StepKind::Repair {
+                    failing_for_ms,
+                    merge_refresh: false,
+                },
+                first,
+            ),
             None,
         );
     }
@@ -1370,7 +1427,9 @@ impl Watch<'_> {
     /// once a review is due; a ticket whose zones' owners decide is left to
     /// the loop, which reads them under the lock with the reviewers at the
     /// base commit. A delivery made before OWL-307 is dated first, and no
-    /// review is due at that pass.
+    /// review is due at that pass. Returns what it found due (OWL-445):
+    /// nothing only when the reviews read and none is due, or the project
+    /// lists no reviewer.
     #[allow(clippy::too_many_arguments)]
     fn review(
         &self,
@@ -1381,16 +1440,19 @@ impl Watch<'_> {
         ticket: &TicketId,
         stored: &Stored,
         at: RefAt,
-    ) {
+    ) -> Due {
         let on_demand = self.on_demand;
         let Some(forge) = &on_demand.config.forge else {
-            return;
+            return Due::Nothing;
         };
+        if forge.reviewers.is_empty() {
+            return Due::Nothing;
+        }
         let Some(delivery) = &stored.record.delivery else {
-            return;
+            return Due::Waits;
         };
         let Some(pr) = &delivery.pull_request else {
-            return;
+            return Due::Waits;
         };
         let now = (on_demand.clock)();
         let Some(delivered_at) = delivery.delivered_at else {
@@ -1402,7 +1464,7 @@ impl Watch<'_> {
                     format!("dating its delivery: {reason}"),
                 );
             }
-            return;
+            return Due::Waits;
         };
         let (read, warnings) = memory
             .following
@@ -1411,7 +1473,7 @@ impl Watch<'_> {
             sink.emit(ticket, None, EventKind::Warning, warning);
         }
         let Some(read) = read else {
-            return;
+            return Due::Waits;
         };
         let answered = stored
             .record
@@ -1421,27 +1483,28 @@ impl Watch<'_> {
             .unwrap_or_default();
         let due = pr_reviews::due(&read.reviews, &forge.reviewers, delivered_at, &answered);
         if due.is_empty() {
-            return;
+            return Due::Nothing;
         }
         let decider = match on_demand.tracker.ticket(ticket) {
             Ok(found) => on_demand::known_decider(&found),
             Err(e) => {
                 let reason = format!("reading the ticket: {e}");
-                return self.unreadable(memory, sink, ticket, reason);
+                self.unreadable(memory, sink, ticket, reason);
+                return Due::Waits;
             }
         };
         if decider
             .as_ref()
             .is_some_and(|decider| !pr_reviews::instructed(&due, &decider.id))
         {
-            return;
+            return Due::Nothing;
         }
         // A review loop's start is a repair at Watch, which needs no room in
         // the project's capacity (OWL-401; architecture section 5, "Three
         // counts"): its Build then holds the slot, and its next step waits
         // for its turn by dispatch time.
         let held = Seen::at(at, pr_reviews::newest(&due));
-        self.held_run(
+        if self.held_run(
             memory,
             sink,
             out,
@@ -1450,7 +1513,11 @@ impl Watch<'_> {
             held,
             (StepKind::Review, Some(Role::Build)),
             Some(read),
-        );
+        ) {
+            Due::Ran
+        } else {
+            Due::Waits
+        }
     }
 
     /// Dates the delivery of `ticket`, whose ref is at `seen`, at `now`
@@ -1741,7 +1808,10 @@ impl Watch<'_> {
     /// decider of the latest ask before a reply, or the ticket's assignee,
     /// read only once a reply is found; a ticket whose zones' owners decide
     /// is left to [`OnDemand::correct_seen`], which reads them under the
-    /// lock. Returns whether a correction ran.
+    /// lock. Returns what it found due (OWL-445): nothing only when the
+    /// ticket keeps no decision or its comments read with no reversal; a
+    /// reply within its quiet window, a run held back or a failed read
+    /// waits.
     #[allow(clippy::too_many_arguments)]
     fn correct(
         &self,
@@ -1752,43 +1822,46 @@ impl Watch<'_> {
         ticket: &TicketId,
         stored: &Stored,
         at: RefAt,
-    ) -> bool {
+    ) -> Due {
         let on_demand = self.on_demand;
         let questions = &stored.record.questions;
         if questions.decisions.is_empty() {
-            return false;
+            return Due::Nothing;
         }
         let comments = match on_demand.tracker.comments(ticket) {
             Ok(comments) => comments,
             Err(e) => {
                 let reason = format!("reading its comments: {e}");
                 self.unreadable(memory, sink, ticket, reason);
-                return false;
+                return Due::Waits;
             }
         };
         if reversal::reversals(&comments, questions, Current::Unresolved).is_empty() {
-            return false;
+            return Due::Nothing;
         }
         let decider = match on_demand.tracker.ticket(ticket) {
             Ok(found) => on_demand::known_decider(&found),
             Err(e) => {
                 let reason = format!("reading the ticket: {e}");
                 self.unreadable(memory, sink, ticket, reason);
-                return false;
+                return Due::Waits;
             }
         };
         let current = decider.as_ref().map_or(Current::Unresolved, Current::Known);
         let reversed = reversal::reversals(&comments, questions, current);
+        if reversed.is_empty() {
+            return Due::Nothing;
+        }
         let now = (on_demand.clock)();
         let window = on_demand.config.policy.quiet_window();
-        if reversed.is_empty() || reversal::counts_at(&reversed, now, window).is_some() {
-            return false;
+        if reversal::counts_at(&reversed, now, window).is_some() {
+            return Due::Waits;
         }
         let held = Seen::at(
             at,
             reversal::newest(&reversed).map(|reply| reply.last_edit()),
         );
-        self.held_run(
+        if self.held_run(
             memory,
             sink,
             out,
@@ -1797,7 +1870,11 @@ impl Watch<'_> {
             held,
             (StepKind::Correct, Some(Role::Build)),
             None,
-        )
+        ) {
+            Due::Ran
+        } else {
+            Due::Waits
+        }
     }
 
     /// Writes `record` as the ticket ref of `ticket` under the project's
