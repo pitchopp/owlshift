@@ -75,4 +75,14 @@ pub trait Transport {
     fn get(&self, path: &str) -> Result<RestAnswer, String> {
         Err(format!("this transport reads no REST path ({path})"))
     }
+
+    /// Puts the JSON `body` at `path` of the forge's REST API, such as
+    /// `repos/<owner>/<name>/pulls/<n>/merge` (OWL-444), and returns the
+    /// answer whole. `Err` means no HTTP answer at all, so whether the
+    /// forge acted is unknown. Refused by default: only GitHub's own
+    /// transport and the fakes that stand in for a merge write REST.
+    fn put(&self, path: &str, body: &Value) -> Result<Response, String> {
+        let _ = body;
+        Err(format!("this transport writes no REST path ({path})"))
+    }
 }

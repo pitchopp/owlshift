@@ -1,8 +1,10 @@
 //! Forges: where the ticket's branch is pushed, its pull request opened, and
 //! the checks and merge state of that pull request read.
 //!
-//! Only the runner holds forge credentials, and no forge operation here
-//! merges: a human merges (architecture section 8). Pushing is plain git
+//! Only the runner holds forge credentials. A person merges, unless the
+//! project opted into merge on green (D14, architecture section 5): then the
+//! runner's Writer merges at the head it checked, and only at that head
+//! ([`MergeAnswer`]); no agent merges (section 8). Pushing is plain git
 //! through the user's own git credentials ([`push`]); the rest is each
 //! forge's API ([`github`]). There is no `Forge` trait yet: it is extracted
 //! at the second forge adapter, like the tracker's.
@@ -202,6 +204,62 @@ pub enum PrState {
     Open,
     Closed,
     Merged,
+}
+
+/// How a pull request is merged: the project's `[forge] merge_method`
+/// (architecture section 5, "Merge on green").
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MergeMethod {
+    Merge,
+    Squash,
+    Rebase,
+}
+
+impl MergeMethod {
+    /// The forge's word for it, GitHub's `merge_method`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Merge => "merge",
+            Self::Squash => "squash",
+            Self::Rebase => "rebase",
+        }
+    }
+}
+
+/// What the forge answered a merge at an expected head (OWL-444;
+/// architecture section 5, "Merge on green", "Its answers"). A merge cannot
+/// be undone, so each answer says only what the forge's answer proves:
+/// [`Self::Merged`] only on the forge saying so, a refusal only on an answer
+/// that refuses, and everything else [`Self::NoVerdict`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum MergeAnswer {
+    /// Merged: `commit` is the commit the merge made on the base. GitHub
+    /// answers the same to a pull request already merged at that head, with
+    /// the first merge's commit, so a merge made again after a lost answer
+    /// is merged once (C19, 2026-10-24).
+    Merged { commit: CommitId },
+    /// The head is no longer the expected commit (HTTP 409), so nothing was
+    /// merged; the next read sees the new head.
+    HeadMoved { message: String },
+    /// The forge refused the merge.
+    Refused(Refusal),
+    /// No answer that says whether it merged: a timeout, a reset
+    /// connection, a server error, an answer that cannot be read. Never a
+    /// refusal: the next read of the pull request says whether it merged.
+    NoVerdict { reason: String },
+}
+
+/// A merge the forge refused, with its status and its words.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Refusal {
+    /// Whether the same merge may pass later on its own: the base moved
+    /// during the merge, or the forge had not computed mergeability yet.
+    /// Otherwise a person is the blocker: a review or check the branch
+    /// protection requires, a draft, a method the repository forbids, a
+    /// missing permission, any other refusal.
+    pub may_pass: bool,
+    pub status: u16,
+    pub message: String,
 }
 
 /// One check of a commit: a check run or a commit status.

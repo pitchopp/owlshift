@@ -1,0 +1,25 @@
+{
+  "recorded": "2026-10-24 on pitchopp/owlshift-merge-sandbox, recorded live with a personal token (the gh login, an administrator): a merge of a draft pull request",
+  "exchanges": [
+    {
+      "request": {
+        "body": {
+          "merge_method": "squash",
+          "sha": "3324b8091eb832a52bacca69749da22c1d74d1b1"
+        },
+        "method": "PUT",
+        "path": "repos/pitchopp/owlshift-merge-sandbox/pulls/3/merge"
+      },
+      "status": 405,
+      "response": {
+        "documentation_url": "https://docs.github.com/rest/pulls/pulls#merge-a-pull-request",
+        "message": "Pull Request is still a draft",
+        "status": "405"
+      },
+      "rate": {
+        "remaining": 4972,
+        "reset": 1792827659
+      }
+    }
+  ]
+}

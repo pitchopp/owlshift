@@ -1,6 +1,8 @@
 //! The GitHub forge: GitHub's GraphQL API over HTTPS, authenticated with a
-//! token that the runner reads from the system keychain. Pushing goes
-//! through git ([`crate::forge::push`]), with the user's own git credentials.
+//! token that the runner reads from the system keychain, and its REST API
+//! for job logs, installations and the merge at an expected head (OWL-444).
+//! Pushing goes through git ([`crate::forge::push`]), with the user's own
+//! git credentials.
 //!
 //! The adapter talks through a [`Transport`] ([`crate::graphql`]):
 //! [`HttpTransport`] in production, a replay of recorded exchanges in tests.
@@ -40,8 +42,8 @@ use owlshift_contracts::brief::MAX_EXCERPT_BYTES;
 
 use crate::forge::{
     BaseChecks, Branch, Capability, Check, CheckKind, CheckSet, CheckState, CommitId,
-    DefaultBranch, Error, ErrorKind, InlineComment, Mergeable, PrState, PullRequest,
-    PullRequestRead, RateLimit, Repo, Review, ReviewsRead,
+    DefaultBranch, Error, ErrorKind, InlineComment, MergeAnswer, MergeMethod, Mergeable, PrState,
+    PullRequest, PullRequestRead, RateLimit, Refusal, Repo, Review, ReviewsRead,
 };
 pub use crate::graphql::{RateHeaders, Response, RestAnswer, Transport};
 
@@ -192,19 +194,8 @@ impl Transport for HttpTransport {
             .send_json(request)
             .map_err(|e| e.to_string())?;
         let status = response.status().as_u16();
-        let header = |name: &str| {
-            response
-                .headers()
-                .get(name)
-                .and_then(|value| value.to_str().ok())
-                .map(|value| value.trim().to_owned())
-        };
         // The rate-limit headers alone (OWL-209).
-        let rate = RateHeaders {
-            remaining: header("x-ratelimit-remaining").and_then(|v| v.parse().ok()),
-            reset: header("x-ratelimit-reset").and_then(|v| v.parse().ok()),
-            retry_after: header("retry-after").and_then(|v| v.parse().ok()),
-        };
+        let rate = rate_headers(response.headers());
         let body = response
             .body_mut()
             .read_to_string()
@@ -221,19 +212,9 @@ impl Transport for HttpTransport {
             .call()
             .map_err(|e| redact(&e.to_string()))?;
         let status = answer.status().as_u16();
-        let header = |name: &str| {
-            answer
-                .headers()
-                .get(name)
-                .and_then(|value| value.to_str().ok())
-                .map(|value| value.trim().to_owned())
-        };
-        let rate = RateHeaders {
-            remaining: header("x-ratelimit-remaining").and_then(|v| v.parse().ok()),
-            reset: header("x-ratelimit-reset").and_then(|v| v.parse().ok()),
-            retry_after: header("retry-after").and_then(|v| v.parse().ok()),
-        };
-        let answer = match redirect_target(status, header("location").as_deref())? {
+        let rate = rate_headers(answer.headers());
+        let location = header(answer.headers(), "location");
+        let answer = match redirect_target(status, location.as_deref())? {
             // A fresh request through an agent that never held the token.
             Some(target) => agent(Duration::from_secs(120))
                 .get(&target)
@@ -252,6 +233,45 @@ impl Transport for HttpTransport {
             rate,
             body: Box::new(body),
         })
+    }
+
+    /// Puts `body` at `path` and reads the answer whole, to 1 MiB. A
+    /// redirect is not followed: it is the answer, which a merge reads as
+    /// no verdict (OWL-444).
+    fn put(&self, path: &str, body: &Value) -> Result<Response, String> {
+        let mut answer = self
+            .agent
+            .put(&format!("{REST_API}{path}"))
+            .header("Authorization", &format!("bearer {}", self.token.0))
+            .header("Accept", "application/vnd.github+json")
+            .send_json(body)
+            .map_err(|e| redact(&e.to_string()))?;
+        let status = answer.status().as_u16();
+        let rate = rate_headers(answer.headers());
+        let body = answer
+            .body_mut()
+            .with_config()
+            .limit(MAX_REST_BYTES)
+            .read_to_string()
+            .map_err(|e| redact(&e.to_string()))?;
+        Ok(Response { status, body, rate })
+    }
+}
+
+/// The value of the header `name`, trimmed, when it is text.
+fn header(headers: &ureq::http::HeaderMap, name: &str) -> Option<String> {
+    headers
+        .get(name)
+        .and_then(|value| value.to_str().ok())
+        .map(|value| value.trim().to_owned())
+}
+
+/// The rate-limit headers of an answer, and no other (OWL-209).
+fn rate_headers(headers: &ureq::http::HeaderMap) -> RateHeaders {
+    RateHeaders {
+        remaining: header(headers, "x-ratelimit-remaining").and_then(|v| v.parse().ok()),
+        reset: header(headers, "x-ratelimit-reset").and_then(|v| v.parse().ok()),
+        retry_after: header(headers, "retry-after").and_then(|v| v.parse().ok()),
     }
 }
 
@@ -342,31 +362,45 @@ impl AppChannel {
 }
 
 impl Channel {
-    fn send(&self, request: &Value) -> Result<Response, Unanswered> {
+    /// Makes `call` through the fixed transport, or through the app's with
+    /// its one retry on a 401 ([`AppChannel::call`]).
+    fn via<A>(
+        &self,
+        call: impl Fn(&dyn Transport) -> Result<A, String>,
+        status: impl Fn(&A) -> u16,
+    ) -> Result<A, Unanswered> {
         match self {
-            Self::Fixed(transport) => transport.send(request).map_err(Unanswered::Transport),
+            Self::Fixed(transport) => call(transport.as_ref()).map_err(Unanswered::Transport),
             // A panic elsewhere while the lock was held leaves a channel
             // that still works: the lock is taken back.
             Self::App(channel) => channel
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)
-                .call(|transport| transport.send(request), |answer| answer.status),
+                .call(call, status),
         }
     }
 
+    fn send(&self, request: &Value) -> Result<Response, Unanswered> {
+        self.via(|transport| transport.send(request), |answer| answer.status)
+    }
+
     fn get(&self, path: &str) -> Result<RestAnswer, Unanswered> {
-        match self {
-            Self::Fixed(transport) => transport.get(path).map_err(Unanswered::Transport),
-            Self::App(channel) => channel
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .call(|transport| transport.get(path), |answer| answer.status),
-        }
+        self.via(|transport| transport.get(path), |answer| answer.status)
+    }
+
+    /// A REST write. A 401 ran nothing, so the app's retry is safe.
+    fn put(&self, path: &str, body: &Value) -> Result<Response, Unanswered> {
+        self.via(
+            |transport| transport.put(path, body),
+            |answer| answer.status,
+        )
     }
 }
 
 /// One GitHub repository, as seen through one token. It can open a pull
-/// request and read one; it cannot merge, close or approve.
+/// request, read one, and merge one at an expected head
+/// ([`GitHubForge::merge_pull_request`], for merge on green); it cannot
+/// close or approve.
 pub struct GitHubForge {
     channel: Channel,
     repo: Repo,
@@ -689,6 +723,34 @@ impl GitHubForge {
             .filter(|part| !part.trim().is_empty())
             .collect::<Vec<_>>()
             .join("\n\n"))
+    }
+
+    /// Merges pull request `number` by `method` if its head is still
+    /// `expected` (OWL-444; architecture section 5, "Merge on green"):
+    /// `PUT repos/<owner>/<name>/pulls/<number>/merge` with `sha`, which
+    /// GitHub refuses with HTTP 409 once the head moved (C19, 2026-10-23).
+    /// On the app's token, a 401 refreshes the token and the call is made
+    /// once more. The answer is [`merge_answer`]'s reading of GitHub's.
+    pub fn merge_pull_request(
+        &self,
+        number: u64,
+        expected: &CommitId,
+        method: MergeMethod,
+    ) -> Result<MergeAnswer, Error> {
+        let path = format!(
+            "repos/{}/{}/pulls/{number}/merge",
+            self.repo.owner(),
+            self.repo.name()
+        );
+        let body = json!({ "sha": expected.as_str(), "merge_method": method.as_str() });
+        match self.channel.put(&path, &body) {
+            Ok(response) => merge_answer(&response),
+            // The token source failed before anything was sent.
+            Err(Unanswered::Source(error)) => Err(error),
+            Err(Unanswered::Transport(e)) => Ok(MergeAnswer::NoVerdict {
+                reason: format!("GitHub gave no answer: {}", redact(&e)),
+            }),
+        }
     }
 
     /// The installation of the GitHub App `slug` that lists this repository,
@@ -1230,10 +1292,8 @@ fn forbidden(response: &Response) -> Option<String> {
     let rate = response.rate;
     if response.status == 403 {
         let message = envelope.and_then(|e| e.message).unwrap_or_default();
-        let limited = rate.remaining == Some(0)
-            || rate.retry_after.is_some()
-            || message.to_ascii_lowercase().contains("rate limit");
-        return (!limited).then(|| format!("GitHub answered HTTP 403 {message}"));
+        return (!spent(403, rate, &message))
+            .then(|| format!("GitHub answered HTTP 403 {message}"));
     }
     let errors = envelope?.errors;
     if response.status != 200
@@ -1305,6 +1365,105 @@ fn decode<T: DeserializeOwned>(response: &Response) -> Result<T, Error> {
             .map_err(|e| invalid(format!("unexpected answer from GitHub: {e}"))),
         _ => Err(invalid("GitHub answered without data")),
     }
+}
+
+/// The 409 message GitHub answers a merge whose `sha` is not the head's,
+/// recorded on 2026-10-23 (C19).
+const HEAD_MODIFIED: &str = "Head branch was modified";
+
+/// The starts of the 405 messages of a refused merge that may pass without
+/// a person: a conflict, which watch's rebase run repairs (recorded on
+/// 2026-10-24, C19); the base moved while GitHub merged; GitHub has not
+/// computed mergeability. The last two are GitHub's words as documented,
+/// not observed. A merge is only tried on a green read, which a conflict
+/// excludes, so each is something that changed since that read.
+const MAY_PASS: [&str; 3] = [
+    "Pull Request has merge conflicts",
+    "Base branch was modified",
+    "Pull Request is not mergeable",
+];
+
+/// Whether an answer says the budget is spent: HTTP 403 or 429 with no
+/// budget left, a `Retry-After`, or a message naming a rate limit, which a
+/// secondary limit may give without either header.
+fn spent(status: u16, rate: RateHeaders, message: &str) -> bool {
+    matches!(status, 403 | 429)
+        && (rate.remaining == Some(0)
+            || rate.retry_after.is_some()
+            || message.to_ascii_lowercase().contains("rate limit"))
+}
+
+/// What GitHub's answer to a merge says (OWL-444), and no more than it
+/// proves. Merged only on HTTP 200 with `merged` true and the merge's
+/// commit. A refusal only on a 4xx that refuses: a refusal of this call
+/// does not prove the pull request unmerged (a person may have merged it
+/// first), which the next read says. Everything else, a timeout, a 5xx, an
+/// answer that cannot be read, is no verdict. `Err` when the call ran
+/// nothing and is no refusal of this merge: a rejected token (HTTP 401,
+/// after the app's one retry) or a spent budget.
+pub fn merge_answer(response: &Response) -> Result<MergeAnswer, Error> {
+    #[derive(Deserialize)]
+    struct Merged {
+        merged: bool,
+        sha: String,
+    }
+    let status = response.status;
+    let message = redact(
+        &serde_json::from_str::<Envelope>(&response.body)
+            .ok()
+            .and_then(|e| e.message)
+            .unwrap_or_default(),
+    );
+    let refused = |may_pass| {
+        Ok(MergeAnswer::Refused(Refusal {
+            may_pass,
+            status,
+            message: message.clone(),
+        }))
+    };
+    match status {
+        200 => Ok(serde_json::from_str::<Merged>(&response.body)
+            .ok()
+            .filter(|answer| answer.merged)
+            .and_then(|answer| CommitId::new(answer.sha).ok())
+            .map_or_else(
+                || MergeAnswer::NoVerdict {
+                    reason: "GitHub answered HTTP 200 without a merged commit".to_owned(),
+                },
+                |commit| MergeAnswer::Merged { commit },
+            )),
+        401 => Err(Error::new(
+            ErrorKind::Unauthorized,
+            format!("GitHub refused the token: HTTP 401 {message}"),
+        )),
+        429 => Err(rate_limited(status, response.rate, &message)),
+        403 if spent(status, response.rate, &message) => {
+            Err(rate_limited(status, response.rate, &message))
+        }
+        // A timeout on the way: the merge may have run.
+        408 => Ok(MergeAnswer::NoVerdict {
+            reason: format!("GitHub answered HTTP 408 {message}"),
+        }),
+        409 if message.starts_with(HEAD_MODIFIED) => Ok(MergeAnswer::HeadMoved { message }),
+        // Another conflict: the next read sees it, and watch repairs it.
+        409 => refused(true),
+        405 if MAY_PASS.iter().any(|known| message.starts_with(known)) => refused(true),
+        // GitHub's documented 422 for an endpoint being spammed.
+        422 if message.to_ascii_lowercase().contains("spam") => refused(true),
+        400..=499 => refused(false),
+        _ => Ok(MergeAnswer::NoVerdict {
+            reason: format!("GitHub answered HTTP {status} {message}"),
+        }),
+    }
+}
+
+/// A spent budget's error, with when it resets.
+fn rate_limited(status: u16, rate: RateHeaders, message: &str) -> Error {
+    Error::new(
+        ErrorKind::RateLimited,
+        format!("GitHub's rate limit: HTTP {status} {message}"),
+    )
+    .with_reset(resets_at(rate, Timestamp::now()))
 }
 
 /// When a spent budget resets: `Retry-After` from `now`, else
@@ -2556,6 +2715,18 @@ mod tests {
         fn get(&self, _: &str) -> Result<RestAnswer, String> {
             Ok(RestAnswer::new(self.next(), "{}"))
         }
+
+        /// A merge: status 0 stands for no answer at all.
+        fn put(&self, _: &str, _: &Value) -> Result<Response, String> {
+            match self.next() {
+                0 => Err("connection reset".to_owned()),
+                200 => Ok(answer(
+                    200,
+                    &format!(r#"{{"merged":true,"sha":"{HEAD}","message":"merged"}}"#),
+                )),
+                status => Ok(answer(status, r#"{"message":"Bad credentials"}"#)),
+            }
+        }
     }
 
     fn app_forge(
@@ -2635,5 +2806,141 @@ mod tests {
         assert!(error.message.contains("`owlshift init`"), "{error}");
         assert_eq!(seen.lock().unwrap().sent_with, ["ghu_old"]);
         assert!(!format!("{forge:?}").contains("ghu_"), "{forge:?}");
+    }
+
+    /// OWL-444: a merge refused with HTTP 401 ran nothing, so it is made
+    /// once more with the source's token; what the retry gets is the
+    /// answer, no answer at all included. A 401 with no other token is an
+    /// error, not a refusal, and a source that fails sends nothing.
+    #[test]
+    fn a_merge_on_the_apps_token_is_retried_once_after_a_401() {
+        let merge = |forge: &GitHubForge| {
+            forge.merge_pull_request(1, &CommitId::new(HEAD).unwrap(), MergeMethod::Squash)
+        };
+        let (forge, seen) = app_forge(Ok(Some("ghu_new")), &[401, 200]);
+        assert!(matches!(merge(&forge), Ok(MergeAnswer::Merged { .. })));
+        assert_eq!(seen.lock().unwrap().sent_with, ["ghu_old", "ghu_new"]);
+
+        let (forge, _) = app_forge(Ok(Some("ghu_new")), &[401, 0]);
+        assert!(matches!(merge(&forge), Ok(MergeAnswer::NoVerdict { .. })));
+        let (forge, _) = app_forge(Ok(Some("ghu_new")), &[401, 502]);
+        assert!(matches!(merge(&forge), Ok(MergeAnswer::NoVerdict { .. })));
+
+        let (forge, _) = app_forge(Ok(None), &[401]);
+        assert_eq!(merge(&forge).unwrap_err().kind, ErrorKind::Unauthorized);
+        let (forge, seen) = app_forge(Err(ErrorKind::SignInAgain), &[401]);
+        assert_eq!(merge(&forge).unwrap_err().kind, ErrorKind::SignInAgain);
+        assert_eq!(seen.lock().unwrap().sent_with, ["ghu_old"]);
+    }
+
+    /// The answers GitHub cannot be made to give on demand, read as the
+    /// recorded ones are (OWL-444): what the call proves, and no more.
+    #[test]
+    fn a_merge_answer_says_only_what_githubs_answer_proves() {
+        let limited = RateHeaders {
+            remaining: Some(0),
+            reset: Some(1_800_000_000),
+            retry_after: None,
+        };
+        let read = |status: u16, body: &str, rate: RateHeaders| {
+            let answer = merge_answer(&Response {
+                status,
+                body: body.to_owned(),
+                rate,
+            });
+            match answer {
+                Ok(MergeAnswer::Merged { .. }) => "merged".to_owned(),
+                Ok(MergeAnswer::HeadMoved { .. }) => "head moved".to_owned(),
+                Ok(MergeAnswer::Refused(r)) if r.may_pass => format!("may pass {}", r.message),
+                Ok(MergeAnswer::Refused(r)) => format!("will not {}", r.message),
+                Ok(MergeAnswer::NoVerdict { .. }) => "no verdict".to_owned(),
+                Err(error) => format!("{:?}", error.kind),
+            }
+        };
+        let none = RateHeaders::default();
+        let cases = [
+            (
+                200,
+                r#"{"merged":false,"message":"no"}"#,
+                none,
+                "no verdict",
+            ),
+            (
+                200,
+                r#"{"merged":true,"sha":"not a sha"}"#,
+                none,
+                "no verdict",
+            ),
+            (200, "<html>", none, "no verdict"),
+            (
+                403,
+                r#"{"message":"Resource not accessible by integration"}"#,
+                none,
+                "will not Resource not accessible by integration",
+            ),
+            (
+                403,
+                r#"{"message":"API rate limit exceeded"}"#,
+                limited,
+                "RateLimited",
+            ),
+            (
+                403,
+                r#"{"message":"You have exceeded a secondary rate limit"}"#,
+                none,
+                "RateLimited",
+            ),
+            (429, "{}", none, "RateLimited"),
+            (
+                401,
+                r#"{"message":"Bad credentials"}"#,
+                none,
+                "Unauthorized",
+            ),
+            (408, "", none, "no verdict"),
+            (
+                409,
+                r#"{"message":"Merge conflict"}"#,
+                none,
+                "may pass Merge conflict",
+            ),
+            (
+                422,
+                r#"{"message":"Validation Failed"}"#,
+                none,
+                "will not Validation Failed",
+            ),
+            (
+                422,
+                r#"{"message":"Endpoint spammed"}"#,
+                none,
+                "may pass Endpoint spammed",
+            ),
+            (
+                404,
+                r#"{"message":"Not Found"}"#,
+                none,
+                "will not Not Found",
+            ),
+            (
+                405,
+                r#"{"message":"Pull Request is not mergeable"}"#,
+                none,
+                "may pass Pull Request is not mergeable",
+            ),
+            (301, "", none, "no verdict"),
+            (500, "", none, "no verdict"),
+            (502, "<html>bad gateway</html>", none, "no verdict"),
+        ];
+        for (status, body, rate, expected) in cases {
+            assert_eq!(read(status, body, rate), expected, "HTTP {status} {body}");
+        }
+        let error = merge_answer(&Response {
+            status: 403,
+            body: "{}".to_owned(),
+            rate: limited,
+        })
+        .unwrap_err();
+        assert!(error.resets_at.is_some(), "{error:?}");
     }
 }

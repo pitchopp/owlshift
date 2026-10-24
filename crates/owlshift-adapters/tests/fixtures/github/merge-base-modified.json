@@ -1,0 +1,22 @@
+{
+  "recorded": "made up on 2026-10-24 in the shape of GitHub's 405 answers recorded that day: a base moved while GitHub merges is a race that cannot be recorded on demand",
+  "exchanges": [
+    {
+      "request": {
+        "body": {
+          "merge_method": "squash",
+          "sha": "0000000000000000000000000000000000000001"
+        },
+        "method": "PUT",
+        "path": "repos/pitchopp/owlshift-live-sandbox/pulls/9999/merge"
+      },
+      "status": 405,
+      "response": {
+        "documentation_url": "https://docs.github.com/rest/pulls/pulls#merge-a-pull-request",
+        "message": "Base branch was modified. Review and try the merge again.",
+        "status": "405"
+      },
+      "synthesized": "not sent: a race, answered with GitHub's documented words"
+    }
+  ]
+}

@@ -36,7 +36,8 @@ use serde_json::{Value, json};
 
 use owlshift_adapters::forge::github::{GitHubForge, HttpTransport, NewPullRequest, Token};
 use owlshift_adapters::forge::{
-    Branch, CheckKind, CheckState, CommitId, ErrorKind, Mergeable, PrState, Repo, Verdict,
+    Branch, CheckKind, CheckState, CommitId, ErrorKind, MergeAnswer, MergeMethod, Mergeable,
+    PrState, Repo, Verdict,
 };
 
 use support::{Recorder, Replay};
@@ -52,6 +53,7 @@ const FOLLOW_MERGED: &str = "follow-merged.json";
 const BASE_CHECKS: &str = "base-checks.json";
 const RATE_LIMITED: &str = "rate-limited.json";
 const REVIEWS: &str = "reviews.json";
+const MERGE_BASE_MODIFIED: &str = "merge-base-modified.json";
 
 /// The throwaway pull request whose reviews were recorded (OWL-307), and
 /// its repository.
@@ -323,20 +325,34 @@ fn fixtures_hold_no_credential_and_flag_what_is_made_up() {
         }
         let fixture: support::Fixture = serde_json::from_str(&text).unwrap();
         let made_up = fixture.recorded.starts_with("made up");
-        // Only a spent budget is made up, and it says why (OWL-217).
+        // Only a spent budget (OWL-217) and a merge's race (OWL-444) are
+        // made up, and each says why.
         let name = path.file_name().unwrap().to_str().unwrap();
-        assert_eq!(made_up, name == RATE_LIMITED, "{}", path.display());
+        assert_eq!(
+            made_up,
+            [RATE_LIMITED, MERGE_BASE_MODIFIED].contains(&name),
+            "{}",
+            path.display()
+        );
         assert!(
             !made_up || fixture.recorded.contains("cannot be recorded"),
             "{}: a made-up fixture says why",
             path.display()
         );
         for exchange in &fixture.exchanges {
-            let query = exchange.request["query"].as_str().unwrap_or_default();
+            // A merge is a REST write, recorded on a disposable repository
+            // (OWL-444); a GraphQL write is made up.
+            let write = match exchange.request.get("query") {
+                Some(query) => query.as_str().unwrap().starts_with("mutation"),
+                None => {
+                    assert_eq!(exchange.request["method"], "PUT", "{}", path.display());
+                    false
+                }
+            };
             assert_eq!(
-                made_up || query.starts_with("mutation"),
+                made_up || write,
                 exchange.synthesized.is_some(),
-                "{}: a write must be made up, a read recorded",
+                "{}: a GraphQL write must be made up, a read or a merge recorded",
                 path.display()
             );
         }
@@ -545,4 +561,80 @@ fn record_review_fixtures() {
         .unwrap();
     assert_eq!(read.reviews.len(), 3, "{:?}", read.reviews);
     r.write(REVIEWS, &recorded);
+}
+
+/// What each merge fixture must read as (OWL-444): every `merge-*.json`,
+/// replayed through the forge, so the request it sends is the recorded one
+/// too. A new recording fails here until it is given its answer.
+#[test]
+fn reads_every_recorded_merge_answer() {
+    let expected = [
+        ("merge-merged.json", "merged"),
+        ("merge-already-merged.json", "merged"),
+        ("merge-closed.json", "merged"),
+        ("merge-head-moved.json", "head moved"),
+        ("merge-conflict.json", "refused, may pass"),
+        (MERGE_BASE_MODIFIED, "refused, may pass"),
+        ("merge-method-forbidden.json", "refused, will not pass"),
+        ("merge-review-required.json", "refused, will not pass"),
+        ("merge-check-required.json", "refused, will not pass"),
+        ("merge-draft.json", "refused, will not pass"),
+        // An administrator's token passes a review the protection does not
+        // enforce for administrators (C19).
+        ("merge-review-admin.json", "merged"),
+    ];
+    let mut names: Vec<String> = fs::read_dir(dir())
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+        .filter(|name| name.starts_with("merge-"))
+        .collect();
+    names.sort();
+    let mut listed: Vec<&str> = expected.iter().map(|(name, _)| *name).collect();
+    listed.sort_unstable();
+    assert_eq!(names, listed, "every merge fixture has its expected answer");
+    for (name, kind) in expected {
+        let fixture = support::load(&dir(), name);
+        let exchange = &fixture.exchanges[0];
+        let request = &exchange.request;
+        let (repo, number) = request["path"]
+            .as_str()
+            .and_then(|path| path.strip_prefix("repos/"))
+            .and_then(|rest| rest.strip_suffix("/merge"))
+            .and_then(|rest| rest.split_once("/pulls/"))
+            .unwrap();
+        let method = match request["body"]["merge_method"].as_str().unwrap() {
+            "merge" => MergeMethod::Merge,
+            "squash" => MergeMethod::Squash,
+            "rebase" => MergeMethod::Rebase,
+            other => panic!("{name}: {other}"),
+        };
+        let sha = CommitId::new(request["body"]["sha"].as_str().unwrap()).unwrap();
+        let replay = Replay::of(&dir(), name);
+        let answer = GitHubForge::with_transport(replay.clone(), Repo::parse(repo).unwrap())
+            .merge_pull_request(number.parse().unwrap(), &sha, method)
+            .unwrap_or_else(|e| panic!("{name}: {e}"));
+        replay.assert_done();
+        let read = match &answer {
+            MergeAnswer::Merged { commit } => {
+                assert_eq!(Some(commit.as_str()), exchange.response["sha"].as_str());
+                "merged"
+            }
+            MergeAnswer::HeadMoved { .. } => "head moved",
+            MergeAnswer::Refused(refusal) => {
+                assert_eq!(refusal.status, exchange.status, "{name}");
+                assert_eq!(
+                    Some(refusal.message.as_str()),
+                    exchange.response["message"].as_str(),
+                    "{name}"
+                );
+                if refusal.may_pass {
+                    "refused, may pass"
+                } else {
+                    "refused, will not pass"
+                }
+            }
+            MergeAnswer::NoVerdict { .. } => "no verdict",
+        };
+        assert_eq!(read, kind, "{name}: {answer:?}");
+    }
 }

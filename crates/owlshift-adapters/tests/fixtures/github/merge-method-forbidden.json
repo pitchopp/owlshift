@@ -1,0 +1,25 @@
+{
+  "recorded": "2026-10-24 on pitchopp/owlshift-live-sandbox, recorded live with a personal token (the gh login, an administrator): a rebase merge on a repository that allows none",
+  "exchanges": [
+    {
+      "request": {
+        "body": {
+          "merge_method": "rebase",
+          "sha": "cb11c1ac5cebb8e2fdd6643da2a9f4fed4cc2cec"
+        },
+        "method": "PUT",
+        "path": "repos/pitchopp/owlshift-live-sandbox/pulls/7/merge"
+      },
+      "status": 405,
+      "response": {
+        "documentation_url": "https://docs.github.com/rest/pulls/pulls#merge-a-pull-request",
+        "message": "Rebase merges are not allowed on this repository.",
+        "status": "405"
+      },
+      "rate": {
+        "remaining": 4718,
+        "reset": 1792823999
+      }
+    }
+  ]
+}
