@@ -1,0 +1,25 @@
+{
+  "recorded": "2026-10-24 on pitchopp/owlshift-merge-sandbox, recorded live with a personal token (the gh login, an administrator): a merge that branch protection requires a review for, enforced for administrators",
+  "exchanges": [
+    {
+      "request": {
+        "body": {
+          "merge_method": "squash",
+          "sha": "6b77bf9489353852687998a9d41853c8f457b519"
+        },
+        "method": "PUT",
+        "path": "repos/pitchopp/owlshift-merge-sandbox/pulls/1/merge"
+      },
+      "status": 405,
+      "response": {
+        "documentation_url": "https://docs.github.com/articles/about-protected-branches",
+        "message": "At least 1 approving review is required by reviewers with write access.",
+        "status": "405"
+      },
+      "rate": {
+        "remaining": 4986,
+        "reset": 1792827659
+      }
+    }
+  ]
+}

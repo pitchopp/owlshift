@@ -1,0 +1,25 @@
+{
+  "recorded": "2026-10-24 on pitchopp/owlshift-live-sandbox, recorded live with a personal token (the gh login, an administrator): the same merge again, once merged",
+  "exchanges": [
+    {
+      "request": {
+        "body": {
+          "merge_method": "squash",
+          "sha": "d7ed8a083990186aca3ecf984447470fe787a2ba"
+        },
+        "method": "PUT",
+        "path": "repos/pitchopp/owlshift-live-sandbox/pulls/6/merge"
+      },
+      "status": 200,
+      "response": {
+        "merged": true,
+        "message": "Pull Request successfully merged",
+        "sha": "fbf5240012699a2a60b9185b5c810da7c9a8de92"
+      },
+      "rate": {
+        "remaining": 4724,
+        "reset": 1792823999
+      }
+    }
+  ]
+}
