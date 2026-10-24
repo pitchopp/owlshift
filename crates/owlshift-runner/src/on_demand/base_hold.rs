@@ -107,8 +107,14 @@ impl OnDemand<'_> {
         let failing = wait.as_ref().map(|wait| wait.failing.failing());
         match self.settle(p, dispatched, failing.as_ref(), sink)? {
             Settled::Go => {
-                self.drop_wait(&p.ticket, sink);
-                Ok(Resume::Go(wait.and_then(|wait| wait.done)))
+                // A done Build's result stays kept until its gate has run
+                // again ([`Self::regate_role`]), so a checked stop before
+                // then leaves it for the next start (OWL-161).
+                let done = wait.and_then(|wait| wait.done);
+                if done.is_none() {
+                    self.drop_wait(&p.ticket, sink);
+                }
+                Ok(Resume::Go(done))
             }
             Settled::Held { command: failed } => {
                 match self.leave_held(p, command, dispatched, state, failed.as_deref(), sink)? {
@@ -384,8 +390,8 @@ impl OnDemand<'_> {
         // The branch where it was before the run, its worktree's plan and
         // ledger kept, before anything else is said of it.
         self.restore_branch(p, start)?;
-        if let Outcome::UsageLimit { resets_at } = ran.report.outcome {
-            return Err(Stop::UsageLimit { resets_at });
+        if let Some(stop) = interruption(&ran.report.outcome) {
+            return Err(stop);
         }
         let parked = match state.apply(p.pipeline, Event::RebaseFailed) {
             Ok(Transition::Parked { state: parked, .. }) => parked,
@@ -551,8 +557,9 @@ impl OnDemand<'_> {
     /// A done Build's gate run again alone, its kept result judged by it
     /// (OWL-418): as [`Self::run_role_once`], with no budget check, no
     /// session, no usage admission and no cost, since no harness runs. The
-    /// wait is spent whatever the gate says: a red gate is classified again
-    /// as any Build run's.
+    /// wait is spent whatever the gate says, a red gate classified again as
+    /// any Build run's, but for a checked stop (OWL-161): the gate stopped
+    /// or not started, the wait is kept for the next start.
     #[allow(clippy::too_many_arguments)]
     pub(super) fn regate_role(
         &self,
@@ -564,18 +571,24 @@ impl OnDemand<'_> {
         gathered: &mut Gathered,
         sink: &mut EventSink<'_>,
     ) -> Result<(Ran, Event), Stop> {
-        self.drop_wait(&p.ticket, sink);
-        let ran = self
-            .execute_inner(
-                p,
-                self.executor,
-                (harness, setup),
-                brief,
-                attempt,
-                (None, Some(kept)),
-                sink,
-            )?
-            .map_err(|error| refused("the gate could not run again", error))?;
+        let executed = self.execute_inner(
+            p,
+            self.executor,
+            (harness, setup),
+            brief,
+            attempt,
+            (None, Some(kept)),
+            sink,
+        );
+        let stopped = match &executed {
+            Err(stop) => matches!(stop, Stop::Stopped),
+            Ok(Ok(ran)) => matches!(ran.report.outcome, Outcome::Stopped),
+            Ok(Err(_)) => false,
+        };
+        if !stopped {
+            self.drop_wait(&p.ticket, sink);
+        }
+        let ran = executed?.map_err(|error| refused("the gate could not run again", error))?;
         if let Some(gate) = &ran.report.gate {
             gathered.gate_failure = gate.failure.clone();
         }
@@ -777,6 +790,7 @@ impl OnDemand<'_> {
                 self.base_unchecked(&p.ticket, &why, sink);
                 return Ok(CheckRun::Unchecked);
             }
+            Err(gate_once::Stop::Stopped) => return Err(Stop::Stopped),
         };
         if checked.marker.is_some() {
             return Err(self

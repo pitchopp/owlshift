@@ -451,8 +451,8 @@ impl OnDemand<'_> {
             match state.status() {
                 Status::Active(Stage::Intake) => {
                     self.keep(p, &state)?;
-                    if let Outcome::UsageLimit { resets_at } = ran.report.outcome {
-                        return Err(Stop::UsageLimit { resets_at });
+                    if let Some(stop) = interruption(&ran.report.outcome) {
+                        return Err(stop);
                     }
                 }
                 Status::Active(Stage::Ready) => {

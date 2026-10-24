@@ -16,11 +16,117 @@
 //! Object), under the lock the handler takes, so an event handled at any
 //! moment finds either no process or a registered tree.
 //!
+//! Since OWL-161, a process can stop by degrees instead ([`stop_by_degrees`],
+//! architecture section 5, "Three ways to stop"): a drain, then a checked
+//! stop, then the policy above as the last degree. Each tree says what a
+//! checked stop does to it ([`AtCheckedStop`]).
+//!
 //! [`ProcessTree::spawn`]: super::ProcessTree::spawn
 
 use std::io;
 use std::process::Child;
-use std::sync::{Mutex, MutexGuard, PoisonError};
+use std::sync::{Condvar, Mutex, MutexGuard, PoisonError};
+use std::time::Duration;
+
+/// How strongly a process that stops by degrees ([`stop_by_degrees`]) is
+/// asked to stop (OWL-161). The last degree, now, is never seen: the
+/// process ends at once, as [`stop_trees_on_signal`] ends it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Degree {
+    /// End once the work under way is done, starting nothing new.
+    Drain,
+    /// Stop the runs under way, check them, then end.
+    Checked,
+}
+
+/// What a checked stop does to a process tree (OWL-161).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AtCheckedStop {
+    /// Nothing: the tree is left to end, as the process's own short
+    /// commands are, which the checks after a stop need.
+    Left,
+    /// Every process of the tree is stopped at once, as
+    /// [`ProcessTree::kill`] stops them: a run. One started after the
+    /// checked stop is stopped as it starts.
+    ///
+    /// [`ProcessTree::kill`]: super::ProcessTree::kill
+    Stopped,
+    /// The tree's root, not its group, is sent SIGTERM, so that it stops its
+    /// own runs: a step's child. None starts once any stop is asked.
+    Told,
+}
+
+/// Makes the process stop by degrees (OWL-161, architecture section 5,
+/// "Three ways to stop"): on Unix each SIGINT (Ctrl-C) asks one degree more
+/// than the one asked, a drain, then a checked stop, then now; SIGTERM and
+/// SIGHUP ask a checked stop unless one is asked; SIGQUIT asks now. Now is
+/// [`stop_trees_on_signal`]'s policy, which it installs first if needed.
+///
+/// A drain only records the degree, for [`asked`] and [`wait_asked`]. A
+/// checked stop records it too, then, under the lock of the live trees,
+/// stops every tree spawned [`AtCheckedStop::Stopped`] and sends SIGTERM to
+/// the root of every tree spawned [`AtCheckedStop::Told`]; with a `bound`,
+/// the process is stopped now once it has passed since the checked stop.
+///
+/// On Windows it changes nothing: every console Ctrl-C keeps stopping every
+/// tree at once, and nothing is ever asked. `owlshift watch`, its one user,
+/// is refused there before any step (D9).
+pub fn stop_by_degrees(bound: Option<Duration>) -> io::Result<()> {
+    stop_trees_on_signal()?;
+    #[cfg(unix)]
+    {
+        degrees().policy = Policy::Graded { bound };
+    }
+    #[cfg(windows)]
+    let _ = bound;
+    Ok(())
+}
+
+/// The degree asked of a process that stops by degrees, if any.
+pub fn asked() -> Option<Degree> {
+    degrees().asked
+}
+
+/// Waits until a degree is asked, or `timeout` has passed: the degree asked
+/// then, if any.
+pub fn wait_asked(timeout: Duration) -> Option<Degree> {
+    let guard = degrees();
+    let (guard, _) = ASKED
+        .wait_timeout_while(guard, timeout, |degrees| degrees.asked.is_none())
+        .unwrap_or_else(PoisonError::into_inner);
+    guard.asked
+}
+
+/// What the signals ask, and what has been asked.
+struct Degrees {
+    #[cfg(unix)]
+    policy: Policy,
+    asked: Option<Degree>,
+}
+
+/// What a signal does.
+#[cfg(unix)]
+#[derive(Clone, Copy)]
+enum Policy {
+    /// [`stop_trees_on_signal`]'s: every one stops every tree at once.
+    Now,
+    /// [`stop_by_degrees`]'s, now past `bound` after a checked stop.
+    Graded { bound: Option<Duration> },
+}
+
+/// Taken after the lock of the live trees, never before it.
+static DEGREES: Mutex<Degrees> = Mutex::new(Degrees {
+    #[cfg(unix)]
+    policy: Policy::Now,
+    asked: None,
+});
+
+/// Told of every degree asked.
+static ASKED: Condvar = Condvar::new();
+
+fn degrees() -> MutexGuard<'static, Degrees> {
+    DEGREES.lock().unwrap_or_else(PoisonError::into_inner)
+}
 
 /// Makes the process stop every live [`ProcessTree`] before it ends, when
 /// told to end: on Unix on SIGINT (Ctrl-C), SIGQUIT (Ctrl-\), SIGTERM and
@@ -110,7 +216,7 @@ pub fn stop_trees_when_killed() -> io::Result<()> {
     }
     // Under the lock, so no tree starts meanwhile.
     let mut sentinel = super::sentinel::Sentinel::start()?;
-    for &(_, group) in &live.trees {
+    for &(_, group, _) in &live.trees {
         sentinel.announce(group);
     }
     live.sentinel = Some(sentinel);
@@ -144,10 +250,11 @@ pub(super) type Stopper = rustix::process::Pid;
 #[cfg(windows)]
 pub(super) type Stopper = std::sync::Arc<std::os::windows::io::OwnedHandle>;
 
-/// The live trees, each under the id of its [`Registration`].
+/// The live trees, each under the id of its [`Registration`], with what a
+/// checked stop does to it.
 struct Live {
     next: u64,
-    trees: Vec<(u64, Stopper)>,
+    trees: Vec<(u64, Stopper, AtCheckedStop)>,
     /// The sentinel, once [`stop_trees_when_killed`] started it, told of
     /// every change to `trees` under this lock.
     #[cfg(unix)]
@@ -188,16 +295,17 @@ impl Drop for Registration {
         let live = &mut *guard;
         #[cfg(unix)]
         if let Some(sentinel) = &mut live.sentinel
-            && let Some(&(_, group)) = live.trees.iter().find(|(id, _)| *id == self.id)
+            && let Some(&(_, group, _)) = live.trees.iter().find(|(id, ..)| *id == self.id)
         {
             sentinel.withdraw(group);
         }
-        live.trees.retain(|(id, _)| *id != self.id);
+        live.trees.retain(|(id, ..)| *id != self.id);
     }
 }
 
 /// Spawns a tree's root with `spawn` and registers what stops the tree,
-/// taken from the new child by `stopper`, under the lock the handler takes.
+/// taken from the new child by `stopper`, and what a checked stop does to it,
+/// `at`, under the lock the handler takes.
 ///
 /// Holding the lock across the spawn means an event is handled either before
 /// (the process ends and the spawn never happens) or after the tree is
@@ -206,11 +314,23 @@ impl Drop for Registration {
 /// spawned one at a time across threads: on Unix for the few milliseconds a
 /// spawn takes, on Windows also while the new child is placed in its job and
 /// its thread is found in a snapshot of the system's threads and resumed.
+///
+/// For the same reason a stop asked by degrees is never missed (OWL-161): a
+/// tree [`AtCheckedStop::Told`] is not spawned once any stop is asked, and
+/// one [`AtCheckedStop::Stopped`] spawned after a checked stop is stopped
+/// at once.
 pub(super) fn register(
     spawn: impl FnOnce() -> io::Result<Child>,
     stopper: impl FnOnce(&Child) -> Stopper,
+    at: AtCheckedStop,
 ) -> io::Result<(Child, Registration)> {
     let mut guard = live();
+    let asked = asked();
+    if at == AtCheckedStop::Told && asked.is_some() {
+        return Err(io::Error::other(
+            "this process is asked to stop: no step starts",
+        ));
+    }
     let child = spawn()?;
     let live = &mut *guard;
     let id = live.next;
@@ -220,8 +340,36 @@ pub(super) fn register(
     if let Some(sentinel) = &mut live.sentinel {
         sentinel.announce(stopper);
     }
-    live.trees.push((id, stopper));
+    #[cfg(unix)]
+    if at == AtCheckedStop::Stopped && asked == Some(Degree::Checked) {
+        // Best effort, as at the checked stop itself.
+        let _ = super::tree::kill_group(stopper);
+    }
+    live.trees.push((id, stopper, at));
     Ok((child, Registration { id }))
+}
+
+/// Acts on the live trees at a checked stop (OWL-161): stops those
+/// [`AtCheckedStop::Stopped`], each best effort, and sends SIGTERM to the
+/// root of those [`AtCheckedStop::Told`]. Their entries stay: their handles
+/// withdraw them as they are dropped, the process going on.
+#[cfg(unix)]
+fn act_on_trees(live: &Live) {
+    use rustix::process::{Signal, kill_process};
+
+    for &(_, stopper, at) in &live.trees {
+        match at {
+            AtCheckedStop::Left => {}
+            AtCheckedStop::Stopped => {
+                let _ = super::tree::kill_group(stopper);
+            }
+            // The root's pid is its group's id, and stays its own while
+            // the tree is registered: it is reaped only once withdrawn.
+            AtCheckedStop::Told => {
+                let _ = kill_process(stopper, Signal::TERM);
+            }
+        }
+    }
 }
 
 /// Stops every live tree, then returns the lock, which the caller keeps
@@ -231,7 +379,7 @@ pub(super) fn register(
 fn stop_every_tree() -> MutexGuard<'static, Live> {
     let mut guard = live();
     let live = &mut *guard;
-    for (_, stopper) in &live.trees {
+    for (_, stopper, _) in &live.trees {
         // Best effort: a tree that cannot be stopped must not spare the
         // ones after it.
         #[cfg(unix)]
@@ -258,6 +406,8 @@ mod imp {
     use signal_hook::iterator::Signals;
     use signal_hook::low_level::emulate_default_handler;
 
+    use super::{ASKED, Degree, Policy};
+
     pub(super) fn install() -> io::Result<()> {
         // The signals are registered on the thread that waits for them, once
         // it runs: registered and then dropped, they would be ignored from
@@ -269,8 +419,8 @@ mod imp {
                 move || match Signals::new([SIGINT, SIGQUIT, SIGTERM, SIGHUP]) {
                     Ok(mut signals) => {
                         let _ = ready.send(Ok(()));
-                        if let Some(signal) = signals.forever().next() {
-                            end(signal);
+                        for signal in signals.forever() {
+                            on_signal(signal);
                         }
                     }
                     Err(error) => {
@@ -281,6 +431,53 @@ mod imp {
         registered
             .recv()
             .map_err(|_| io::Error::other("the signal thread ended before it was ready"))?
+    }
+
+    /// What `signal` asks of a process that stops by degrees, which has
+    /// been asked `asked` (OWL-161): a degree, nothing more, or now (`Err`).
+    pub(super) fn next(signal: i32, asked: Option<Degree>) -> Result<Option<Degree>, ()> {
+        match (signal, asked) {
+            (SIGINT, None) => Ok(Some(Degree::Drain)),
+            (SIGINT, Some(Degree::Drain)) => Ok(Some(Degree::Checked)),
+            (SIGTERM | SIGHUP, Some(Degree::Checked)) => Ok(None),
+            (SIGTERM | SIGHUP, _) => Ok(Some(Degree::Checked)),
+            _ => Err(()),
+        }
+    }
+
+    /// Ends the process, or records the degree `signal` asks and acts on it.
+    fn on_signal(signal: i32) {
+        let live = super::live();
+        let mut degrees = super::degrees();
+        let Policy::Graded { bound } = degrees.policy else {
+            drop((degrees, live));
+            end(signal);
+        };
+        let degree = match next(signal, degrees.asked) {
+            Ok(Some(degree)) => degree,
+            Ok(None) => return,
+            Err(()) => {
+                drop((degrees, live));
+                end(signal);
+            }
+        };
+        degrees.asked = Some(degree);
+        ASKED.notify_all();
+        drop(degrees);
+        if degree == Degree::Checked {
+            // Recorded first, so a run that ends because its tree was
+            // stopped finds the stop asked.
+            super::act_on_trees(&live);
+            drop(live);
+            if let Some(bound) = bound {
+                let _ = thread::Builder::new()
+                    .name("owlshift-stop-bound".to_owned())
+                    .spawn(move || {
+                        thread::sleep(bound);
+                        end(SIGTERM);
+                    });
+            }
+        }
     }
 
     /// Stops every live tree, then ends the process as `signal` would have.
@@ -341,7 +538,31 @@ mod tests {
     use std::process::Command;
 
     fn registered(id: u64) -> bool {
-        live().trees.iter().any(|(entry, _)| *entry == id)
+        live().trees.iter().any(|(entry, ..)| *entry == id)
+    }
+
+    /// OWL-161: what each signal asks, by what was asked before; `Err` is
+    /// now.
+    #[cfg(unix)]
+    #[test]
+    fn each_signal_asks_its_degree() {
+        use signal_hook::consts::{SIGHUP, SIGINT, SIGQUIT, SIGTERM};
+
+        let (drain, checked) = (Some(Degree::Drain), Some(Degree::Checked));
+        for (signal, asked, next) in [
+            (SIGINT, None, Ok(drain)),
+            (SIGINT, drain, Ok(checked)),
+            (SIGINT, checked, Err(())),
+            (SIGTERM, None, Ok(checked)),
+            (SIGTERM, drain, Ok(checked)),
+            (SIGTERM, checked, Ok(None)),
+            (SIGHUP, drain, Ok(checked)),
+            (SIGHUP, checked, Ok(None)),
+            (SIGQUIT, None, Err(())),
+            (SIGQUIT, drain, Err(())),
+        ] {
+            assert_eq!(imp::next(signal, asked), next, "{signal} after {asked:?}");
+        }
     }
 
     /// A program that exits at once.

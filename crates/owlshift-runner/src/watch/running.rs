@@ -106,6 +106,11 @@ impl Watch<'_> {
     ) -> Option<StepEnd> {
         let on_demand = self.on_demand;
         let ticket = envelope.ticket.clone();
+        // Asked to stop (OWL-161): no step starts, before anything of it is
+        // made; the watch ends once the pass does.
+        if self.stopping().is_some() {
+            return Some(StepEnd::Busy);
+        }
         // A base check due runs alone (OWL-418): no other step starts, nor
         // its own while another is in flight.
         if self.base_due_holds(memory, &ticket) {
@@ -157,6 +162,16 @@ impl Watch<'_> {
             Ok(child) => {
                 memory.running.push(RunningStep { child, then });
                 None
+            }
+            // A stop asked meanwhile, which refuses every child from then
+            // on (OWL-161): the step did not start.
+            Err(_) if self.stopping().is_some() => {
+                let _ = std::fs::remove_file(step::outside_file(
+                    on_demand.dirs,
+                    &ticket,
+                    &envelope.attempt,
+                ));
+                Some(StepEnd::Busy)
             }
             Err(reason) => {
                 self.unreported(sink, &ticket, &envelope.attempt, &reason);
@@ -297,9 +312,9 @@ impl Watch<'_> {
     }
 
     /// Waits between two passes while steps' children run (OWL-401): until
-    /// one ends or `interval` has passed, polling them. Returns what is left
-    /// of the interval for `sleep`: all of it when none runs, none
-    /// otherwise.
+    /// one ends, `interval` has passed, or a stop is asked (OWL-161),
+    /// polling them. Returns what is left of the interval for `sleep`: all
+    /// of it when none runs, none otherwise.
     pub(super) fn wait_for_children(
         &self,
         memory: &mut Memory,
@@ -313,7 +328,7 @@ impl Watch<'_> {
         let started = Instant::now();
         while !self.reap(memory, sink, out) {
             let waited = started.elapsed();
-            if waited >= interval {
+            if waited >= interval || self.stopping().is_some() {
                 break;
             }
             thread::sleep(CHILD_POLL.min(interval - waited));
@@ -322,9 +337,9 @@ impl Watch<'_> {
     }
 
     /// Waits for every step's child to end and applies each end: a watch
-    /// whose loop ends lets its steps finish. A watch stopped by a signal
-    /// never gets here: the policy every command shares stops every child's
-    /// tree.
+    /// whose loop ends lets its steps finish. A watch asked to stop ends
+    /// through [`Watch::stop`] instead (OWL-161), and one stopped now never
+    /// gets here: the policy every command shares stops every child's tree.
     pub(super) fn wait_for_all(
         &self,
         memory: &mut Memory,

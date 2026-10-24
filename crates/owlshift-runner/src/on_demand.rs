@@ -260,10 +260,34 @@ pub fn core_event(outcome: &Outcome) -> (Event, Option<&RunResult>) {
             };
             (event, Some(result))
         }
-        Outcome::UsageLimit { .. } => (Event::Interrupted, None),
+        Outcome::UsageLimit { .. } | Outcome::Stopped => (Event::Interrupted, None),
         Outcome::Failed(_) => (Event::RunFailed, None),
         Outcome::Quarantined(_) => (Event::Quarantined, None),
     }
+}
+
+/// The stop an interrupted run calls for: a usage limit's, or a checked
+/// stop's (OWL-161); none for any other outcome. The one place that tells
+/// both apart from the rest. The usage the machine keeps is never read from
+/// it: a stopped run is no limit.
+pub(crate) fn interruption(outcome: &Outcome) -> Option<Stop> {
+    match outcome {
+        Outcome::UsageLimit { resets_at } => Some(Stop::UsageLimit {
+            resets_at: *resets_at,
+        }),
+        Outcome::Stopped => Some(Stop::Stopped),
+        Outcome::Finished { .. } | Outcome::Failed(_) | Outcome::Quarantined(_) => None,
+    }
+}
+
+/// Refuses a run before anything of it is made, once a checked stop of
+/// this process is asked (OWL-161): the step goes no further, as a limited
+/// harness refuses it (OWL-404).
+fn refuse_if_stopping() -> Result<(), Stop> {
+    if crate::executor::checked_stop_asked() {
+        return Err(Stop::Stopped);
+    }
+    Ok(())
 }
 
 /// The core event of a stage run's outcome, given the brief it ran with, for
@@ -728,6 +752,12 @@ pub enum Stop {
     Ready { ticket: TicketId },
     /// The harness reached its usage limit.
     UsageLimit { resets_at: Option<Timestamp> },
+    /// A checked stop of `owlshift watch` or of its step stopped the run
+    /// under way, its isolation checked and held, or the next run before
+    /// it started (OWL-161): the ticket stays at its stage, what the earlier
+    /// runs kept staying kept, and resumes at the next start. Nobody is the
+    /// blocker.
+    Stopped,
     /// The Build is held for its base (OWL-418): `commit`, the commit it is
     /// configured at, fails `command` in a fresh worktree too, so the
     /// failure is the base's and nothing was counted; or, `pending`, its
@@ -954,6 +984,10 @@ impl fmt::Display for Stop {
                     "Stopped: the harness reached its usage limit; run again once it resets.",
                 ),
             },
+            Self::Stopped => f.write_str(
+                "Stopped by a checked stop: the run under way was stopped and its isolation \
+                 checked; the ticket stays at its stage and resumes at the next start.",
+            ),
             Self::BaseHeld {
                 ticket,
                 commit,
@@ -3094,8 +3128,8 @@ impl OnDemand<'_> {
             match state.status() {
                 Status::Active(Stage::Build) => {
                     self.keep(p, &state)?;
-                    if let Outcome::UsageLimit { resets_at } = ran.report.outcome {
-                        return Err(Stop::UsageLimit { resets_at });
+                    if let Some(stop) = interruption(&ran.report.outcome) {
+                        return Err(stop);
                     }
                 }
                 Status::NeedsInput { .. } => {
@@ -3731,6 +3765,10 @@ impl OnDemand<'_> {
         if ran.breaches.is_empty() {
             self.keep_resolver_refusal(p, state, &ran.report.outcome)?;
         }
+        // A checked stop ends the step, its questions sent nowhere (OWL-161).
+        if matches!(ran.report.outcome, Outcome::Stopped) {
+            return Err(Stop::Stopped);
+        }
         // A breach is a quarantined outcome, which `ran.breaches` lists.
         let resolutions = match resolver::outcome(&ran.report.outcome) {
             Resolved::Quarantined => None,
@@ -4173,9 +4211,9 @@ impl OnDemand<'_> {
                     detail: park_detail(&ran.report.outcome),
                 })
             }
-            Event::Interrupted => match ran.report.outcome {
-                Outcome::UsageLimit { resets_at } => Err(Stop::UsageLimit { resets_at }),
-                _ => Err(core_error(event)),
+            Event::Interrupted => match interruption(&ran.report.outcome) {
+                Some(stop) => Err(stop),
+                None => Err(core_error(event)),
             },
             other => Err(core_error(other)),
         }
@@ -5071,8 +5109,10 @@ impl OnDemand<'_> {
         let ticket = &p.ticket.clone();
         // At each run's boundary: a quarantine that stands, since a sibling's
         // breach, stops the step before anything runs (OWL-400, decided on
-        // 2026-10-21): the ticket waits where it is.
+        // 2026-10-21): the ticket waits where it is. So does a checked stop
+        // (OWL-161), before the run's obligation is written.
         self.refuse_if_quarantined()?;
+        refuse_if_stopping()?;
         let admitted = match kept {
             Some(_) => None,
             None => self.admit_usage(ticket, harness, brief.role, sink)?,
@@ -5507,6 +5547,7 @@ impl OnDemand<'_> {
                 | Stop::CounterQuestion { .. }
                 | Stop::CheckFailed { .. }
                 | Stop::UsageLimit { .. }
+                | Stop::Stopped
                 | Stop::BaseHeld { .. }
                 | Stop::Delivery(_)
                 | Stop::Watched { .. }
@@ -6596,8 +6637,8 @@ impl OnDemand<'_> {
                 Ok(Transition::To(next)) => {
                     state = next;
                     self.keep(p, &state)?;
-                    if let Outcome::UsageLimit { resets_at } = ran.report.outcome {
-                        return Err(Stop::UsageLimit { resets_at });
+                    if let Some(stop) = interruption(&ran.report.outcome) {
+                        return Err(stop);
                     }
                 }
                 Ok(Transition::Parked {
@@ -8319,14 +8360,26 @@ pub fn account_author(author: &TrackerAuthor, decider: &Person) -> Author {
 }
 
 /// The plan and ledger a previous run left in the worktree, so the next run
-/// resumes from them: both must be plain files.
+/// resumes from them: both must be plain files, read through no link and
+/// within [`crate::artifact::MAX_ARTIFACT_BYTES`], the ledger parsing as JSON and the plan as
+/// UTF-8 (OWL-161: a run cut mid-write, by a usage limit or a checked stop,
+/// may leave either torn). Otherwise none: the run starts from the step's
+/// start.
 fn checkpoint(worktree: &Path) -> Option<Checkpoint> {
     let plan = format!("{RUN_DIR}/plan.md");
     let ledger = format!("{RUN_DIR}/ledger.json");
-    let is_file = |relative: &str| {
-        fs::symlink_metadata(worktree.join(relative)).is_ok_and(|meta| meta.file_type().is_file())
+    let read = |relative: &str| {
+        owlshift_platform::confined::read_confined(
+            worktree,
+            relative,
+            crate::artifact::MAX_ARTIFACT_BYTES,
+        )
+        .ok()
     };
-    (is_file(&plan) && is_file(&ledger)).then(|| Checkpoint {
+    let plan_reads = read(&plan).is_some_and(|text| std::str::from_utf8(&text).is_ok());
+    let ledger_reads = read(&ledger)
+        .is_some_and(|text| serde_json::from_slice::<serde_json::Value>(&text).is_ok());
+    (plan_reads && ledger_reads).then(|| Checkpoint {
         plan: RelativePath::new(plan).ok(),
         ledger: RelativePath::new(ledger).ok(),
     })
@@ -8460,6 +8513,7 @@ fn park_detail(outcome: &Outcome) -> String {
         Outcome::Failed(failure) => failure.to_string(),
         Outcome::Finished { result, .. } => result.summary.clone(),
         Outcome::UsageLimit { .. } => "a usage limit".to_owned(),
+        Outcome::Stopped => "a checked stop".to_owned(),
     }
 }
 
@@ -8488,6 +8542,7 @@ fn run_ended(report: &RunReport) -> Data {
             resets_at.map(|at| format!("resets at {at}")),
             None,
         ),
+        Outcome::Stopped => ("stopped", None, None),
         Outcome::Failed(failure) => ("failed", Some(failure.to_string()), None),
         Outcome::Quarantined(violations) => {
             let lines: Vec<String> = violations.iter().map(ToString::to_string).collect();
@@ -8589,6 +8644,34 @@ mod tests {
     use crate::executor::Failure;
 
     use super::*;
+
+    /// OWL-161: a Build resumes from its checkpoint only when the plan reads
+    /// as UTF-8 and the ledger parses as JSON, both plain files; a torn or
+    /// missing one starts it from the step's start.
+    #[test]
+    fn a_checkpoint_is_given_only_when_it_parses() {
+        let worktree = tempfile::tempdir().unwrap();
+        let run = worktree.path().join(RUN_DIR);
+        fs::create_dir_all(&run).unwrap();
+        let write = |plan: &[u8], ledger: &[u8]| {
+            fs::write(run.join("plan.md"), plan).unwrap();
+            fs::write(run.join("ledger.json"), ledger).unwrap();
+            checkpoint(worktree.path())
+        };
+        let given = write(b"# Plan\n", br#"{"steps": []}"#).expect("a checkpoint");
+        assert_eq!(
+            given.ledger.map(|path| path.as_str().to_owned()),
+            Some(format!("{RUN_DIR}/ledger.json"))
+        );
+        assert_eq!(write(b"# Plan\n", br#"{"steps": [{"#), None, "torn ledger");
+        assert_eq!(
+            write(b"\xff\xfe", br#"{"steps": []}"#),
+            None,
+            "plan not UTF-8"
+        );
+        fs::remove_file(run.join("plan.md")).unwrap();
+        assert_eq!(checkpoint(worktree.path()), None, "no plan");
+    }
 
     /// OWL-412: an intake record's zones choose a decider once its intake
     /// ended, the record kept for an earlier text of the ticket included,

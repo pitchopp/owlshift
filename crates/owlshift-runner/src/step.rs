@@ -281,6 +281,7 @@ pub fn end(stepped: &Stepped) -> StepEnd {
         Stop::UsageLimit { resets_at } => StepEnd::UsageLimit {
             resets_at: *resets_at,
         },
+        Stop::Stopped => StepEnd::Stopped,
         Stop::BaseHeld {
             commit,
             command,

@@ -127,8 +127,9 @@ pub const STEP_ENVELOPE_FORMAT: u32 = 1;
 /// in a ticket's folder, OWL-399). Format 2 adds the `no_slot` end
 /// (OWL-409); format 3 drops the `paused` hold, a usage limit holding its
 /// harness machine-wide instead (OWL-404); format 4 adds the `base_held` end
-/// (OWL-418). Formats 1 to 3 are still read, a `paused` hold read as none.
-pub const STEP_OUTCOME_FORMAT: u32 = 4;
+/// (OWL-418); format 5 adds the `stopped` end (OWL-161). Formats 1 to 4 are
+/// still read, a `paused` hold read as none.
+pub const STEP_OUTCOME_FORMAT: u32 = 5;
 /// The format version of what a step carries to the next (`carry.json` in a
 /// ticket's folder, OWL-399).
 pub const CARRY_FORMAT: u32 = 1;

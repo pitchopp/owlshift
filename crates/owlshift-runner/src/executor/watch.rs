@@ -14,7 +14,7 @@ use std::sync::mpsc::{self, RecvTimeoutError, Sender};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
-use owlshift_platform::process::ProcessTree;
+use owlshift_platform::process::{AtCheckedStop, ProcessTree};
 
 /// Watches a process tree and stops it when the deadline passes.
 pub(crate) struct Watchdog {
@@ -47,12 +47,13 @@ impl RunStop {
 }
 
 /// Spawns `command` as the root of a process tree, and starts a watchdog
-/// that stops the whole tree `timeout` from now.
+/// that stops the whole tree `timeout` from now. A run, so a checked stop
+/// of a watch or a step stops the tree at once (OWL-161).
 pub(crate) fn spawn(
     command: &mut Command,
     timeout: Duration,
 ) -> io::Result<(Child, Arc<ProcessTree>, Watchdog)> {
-    let (child, tree) = ProcessTree::spawn(command)?;
+    let (child, tree) = ProcessTree::spawn_for(command, AtCheckedStop::Stopped)?;
     let tree = Arc::new(tree);
     let (cancel, cancelled) = mpsc::channel::<()>();
     let fired = Arc::new(AtomicBool::new(false));

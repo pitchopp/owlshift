@@ -100,7 +100,11 @@
 //! first snapshot that finds it cleared folds those comments.
 //!
 //! Nothing ends the loop but the operator: a ticket that cannot be read is a
-//! `warning` event, once until it reads again, and the pass goes on. A
+//! `warning` event, once until it reads again, and the pass goes on. Since
+//! OWL-161 the operator stops it by degrees ([`stop`]): once a drain or a
+//! checked stop is asked, by the process's signals or the project's stop
+//! file, no step starts and no pass runs; the watch waits for its steps'
+//! children, applies their ends, then returns. A
 //! continue that left the ticket ref as it was is held for [`RETRY_AFTER`]
 //! ([`Holds`]), so a tracker that refuses writes does not cost an answer
 //! check every pass.
@@ -160,6 +164,7 @@ mod limits;
 mod outside;
 pub mod presence;
 mod running;
+pub mod stop;
 mod waiting;
 
 use running::{RunningStep, Then};
@@ -358,7 +363,8 @@ impl Holds {
     /// or unreadable), at `now`. Returns the hold it set, if any.
     ///
     /// A busy project or ticket, or no free run slot (OWL-409), ran
-    /// nothing: no hold. A usage limit with a reset time holds this ticket
+    /// nothing: no hold; nor does a checked stop's end (OWL-161), so the
+    /// ticket resumes at the next start. A usage limit with a reset time holds this ticket
     /// until then, whatever its ref did (OWL-404): the usage file holds
     /// every other step of its harness, and this hold keeps the ticket back
     /// should that file not have been kept. A comment, a RESUME included, or
@@ -380,7 +386,7 @@ impl Holds {
         progress: Option<&Progress>,
         now: Timestamp,
     ) -> Option<Admit> {
-        if matches!(outcome, StepEnd::Busy | StepEnd::NoSlot) {
+        if matches!(outcome, StepEnd::Busy | StepEnd::NoSlot | StepEnd::Stopped) {
             return None;
         }
         let as_it_was = progress == Some(&seen.progress);
@@ -552,6 +558,8 @@ struct Memory<'c> {
     /// Those a drain's dispatch gave a turn: each one's retry hold is
     /// lifted until a step of its own starts (OWL-431).
     base_turn: BTreeSet<TicketId>,
+    /// The strongest stop told, once one is asked (OWL-161).
+    stop_told: Option<owlshift_platform::process::Degree>,
 }
 
 /// Why a ticket's next stage step waits, as told once.
@@ -678,6 +686,12 @@ impl Watch<'_> {
         };
         self.adopt_leftovers(&mut memory, sink);
         loop {
+            // Asked to stop (OWL-161), by a signal or the stop file, a file
+            // found at the start included: no further pass.
+            if let Some(asked) = self.stopping() {
+                self.stop(&mut memory, sink, out, asked);
+                return;
+            }
             memory.stepped = false;
             // A check left pending in `base.json`, by a watch before this one
             // or by a person's command, gets its priority too (OWL-418).
@@ -693,6 +707,10 @@ impl Watch<'_> {
                 .filter(|_| memory.running.is_empty())
                 .map(|(ticket, _)| (ticket, memory.base_due_ran));
             self.pass(&mut memory, sink, out, continued);
+            if let Some(asked) = self.stopping() {
+                self.stop(&mut memory, sink, out, asked);
+                return;
+            }
             if draining {
                 self.drain(&mut memory, sink, out, continued);
             }
