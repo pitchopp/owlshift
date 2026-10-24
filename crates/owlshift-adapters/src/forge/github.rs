@@ -235,9 +235,9 @@ impl Transport for HttpTransport {
         })
     }
 
-    /// Puts `body` at `path` and reads the answer whole, to
-    /// [`MAX_REST_BYTES`]. A redirect is not followed: a merge never
-    /// answers one, and its body would be read as the answer (OWL-444).
+    /// Puts `body` at `path` and reads the answer whole, to 1 MiB. A
+    /// redirect is not followed: it is the answer, which a merge reads as
+    /// no verdict (OWL-444).
     fn put(&self, path: &str, body: &Value) -> Result<Response, String> {
         let mut answer = self
             .agent
