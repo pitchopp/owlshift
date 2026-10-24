@@ -576,6 +576,12 @@ fn reads_every_recorded_merge_answer() {
         ("merge-conflict.json", "refused, may pass"),
         (MERGE_BASE_MODIFIED, "refused, may pass"),
         ("merge-method-forbidden.json", "refused, will not pass"),
+        ("merge-review-required.json", "refused, will not pass"),
+        ("merge-check-required.json", "refused, will not pass"),
+        ("merge-draft.json", "refused, will not pass"),
+        // An administrator's token passes a review the protection does not
+        // enforce for administrators (C19).
+        ("merge-review-admin.json", "merged"),
     ];
     let mut names: Vec<String> = fs::read_dir(dir())
         .unwrap()
