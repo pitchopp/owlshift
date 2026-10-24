@@ -710,12 +710,15 @@ pub enum Stop {
     /// configured at, fails `command` in a fresh worktree too, so the
     /// failure is the base's and nothing was counted; or, `pending`, its
     /// check waits for the other tickets' steps in flight. It goes on once
-    /// that commit passes.
+    /// that commit passes. `due`, never with `pending`: the commit is held
+    /// and its check again, or the default branch's newer head's, waits for
+    /// those steps (OWL-431); watch gives both the same priority.
     BaseHeld {
         ticket: TicketId,
         commit: String,
         command: Option<String>,
         pending: bool,
+        due: bool,
     },
     /// The run was done and its gate passed, but its delivery failed.
     Delivery(String),
@@ -934,6 +937,7 @@ impl fmt::Display for Stop {
                 commit,
                 command,
                 pending: false,
+                ..
             } => {
                 let short = crate::base::short(commit);
                 let failing = command
@@ -955,6 +959,7 @@ impl fmt::Display for Stop {
                 commit,
                 command,
                 pending: true,
+                ..
             } => {
                 let failing = command
                     .as_deref()

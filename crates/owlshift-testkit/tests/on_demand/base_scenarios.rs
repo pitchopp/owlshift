@@ -794,3 +794,245 @@ fn watch_tries_a_check_that_waited_again_once_nothing_else_runs() {
     assert_eq!(checked(&bench), ["opened"]);
     assert_eq!(builds(&bench), [false]);
 }
+
+/// OWL-431, the head's check that must wait: a done Build held at its base,
+/// whose commit was checked again at the fix's head and fails still, finds
+/// that head's own check due while DEMO-2's step runs. It stays held, that
+/// check due (watch's priority), its text the hold's, no check made and its
+/// branch where it was; once DEMO-2's step ends, `continue` checks the head
+/// alone, rebases onto it and delivers.
+#[test]
+fn a_head_check_that_must_wait_is_due_then_runs_alone() {
+    use owlshift_core::base::Entry;
+
+    let bench = Bench::new(true);
+    let marker = bench.tmp.path().join("store-has-rollup");
+    let (held, start) = held_done_build(&bench, &marker);
+    let fixed = bench.merge_into_main(&[("FIXED", "fixed\n")]);
+    // The held commit checked again at the fix's head, failing still.
+    let mut checks = base::read(&bench.dirs()).unwrap();
+    for check in &mut checks.checks {
+        if check.commit == held
+            && let Entry::Checked { head, .. } = &mut check.entry
+        {
+            head.clone_from(&fixed);
+        }
+    }
+    base::write(&bench.dirs(), &checks).unwrap();
+    let two = TicketId::new("DEMO-2").unwrap();
+    let sibling = bench.dirs().ticket_lock(&two).unwrap().unwrap();
+
+    let (due, printed) = bench.continue_ticket(Vec::new());
+    assert!(
+        matches!(&due, Err(Stop::BaseHeld { commit, pending: false, due: true, .. }) if *commit == held),
+        "{due:?}\n{printed}"
+    );
+    let text = due.unwrap_err().to_string();
+    assert!(
+        text.contains(&format!("owlshift gate --at {held}")),
+        "told as held: {text}"
+    );
+    assert_eq!(
+        checks_made(&bench).len(),
+        1,
+        "no check beside DEMO-2's step"
+    );
+    assert!(held_rebases(&bench).is_empty());
+    assert_eq!(worktree_head(&bench), start);
+    drop(sibling);
+
+    let rebase = agent_git(
+        &bench,
+        1,
+        vec!["rebase".to_owned(), "--quiet".to_owned(), fixed.clone()],
+    );
+    let (delivered, printed) =
+        bench.continue_during(vec![bench.reply(None, Some(REBASED_HELD))], vec![rebase]);
+    delivered.unwrap_or_else(|stop| panic!("{stop}\n{printed}"));
+    let made = |commit: &str, change: &str, verdict: &str| {
+        (commit.to_owned(), change.to_owned(), verdict.to_owned())
+    };
+    assert_eq!(
+        checks_made(&bench),
+        [
+            made(&held, "opened", "failed"),
+            made(&fixed, "cached", "passed")
+        ]
+    );
+    assert_eq!(held_rebases(&bench).len(), 1);
+    assert!(is_ancestor(&bench, &fixed, &bench.remote_branch().unwrap()));
+}
+
+/// Each step's ticket and outcome, as watch reported them.
+type Outcomes = Vec<(String, Result<Delivered, Stop>)>;
+
+/// Runs `owlshift watch --drain` in watch's own process, with what happens
+/// while given runs work, `between(pass)` called after every pass until it
+/// returns `false`; returns each step's ticket and outcome, and what was
+/// printed.
+fn drain_until(
+    bench: &Bench,
+    replies: Vec<Reply>,
+    during: Vec<During>,
+    between: &mut dyn FnMut(usize) -> bool,
+) -> (Outcomes, String) {
+    let mut passes = 0;
+    let ((outcomes, lines), printed) =
+        bench.with_on_demand(replies, None, during, |on_demand, sink| {
+            let (mut outcomes, mut lines) = (Vec::new(), Vec::new());
+            let watch = Watch {
+                on_demand,
+                interval: POLL_INTERVAL,
+            };
+            watch.run_drain(
+                sink,
+                &mut lines,
+                &mut |ticket, outcome, _| {
+                    outcomes.push((ticket.as_str().to_owned(), outcome.clone()));
+                },
+                &mut |_| {
+                    passes += 1;
+                    assert!(passes < 40, "the drain never settled");
+                    between(passes)
+                },
+            );
+            (outcomes, String::from_utf8(lines).unwrap())
+        });
+    (outcomes, format!("{lines}\n{printed}"))
+}
+
+/// The drain's dispatches among `events`, each with its position in them
+/// and its ticket.
+fn drained(events: &[Event]) -> Vec<(usize, String)> {
+    events
+        .iter()
+        .enumerate()
+        .filter(|(_, e)| e.kind == EventKind::Dispatch && e.data["command"] == json!("drain"))
+        .map(|(at, e)| (at, e.ticket.as_ref().unwrap().as_str().to_owned()))
+        .collect()
+}
+
+/// The ticket's `decision` events `base` = `waits` among `events`.
+fn base_waits(events: &[Event], id: &str) -> usize {
+    events
+        .iter()
+        .filter(|e| {
+            e.kind == EventKind::Decision
+                && e.ticket.as_ref().is_some_and(|t| t.as_str() == id)
+                && e.data.get("base") == Some(&json!("waits"))
+        })
+        .count()
+}
+
+/// OWL-431's bound in a busy drain, under `policy.max_in_flight = 3`:
+/// DEMO-1, a done Build held at its base, is held again at each step while
+/// DEMO-2 and DEMO-3 are taken in, blocked. The store is fixed and `main`
+/// moves; the blocker is done. The drain dispatches DEMO-2, which gives
+/// DEMO-1 a turn before any other dispatch, with no clock moved by the test.
+/// Its check again finds another ticket's step in flight (a lock held for
+/// that pass): it is due, and its priority holds DEMO-3's dispatch back.
+/// Once that step ends, DEMO-1's check runs alone and lifts the hold before
+/// the second dispatch after the fix.
+#[test]
+fn a_held_ticket_goes_on_within_one_dispatch_of_a_fix_in_a_busy_drain() {
+    use super::drain_scenarios::{done_for, intake_declaring};
+
+    let bench = Bench::build_admitting(
+        "maintainer",
+        "assignee = \"maintainer\"\nlabels = [\"agent\"]\n",
+        "max_in_flight = 3\n",
+        ", parked = \"Parked\"",
+        "admit = { label = \"agent\" }\nadmitters = [\"maintainer\"]",
+    );
+    let marker = bench.tmp.path().join("store-has-rollup");
+    fs::write(&marker, "").unwrap();
+    let held = with_setup(&bench, &setup_line(&marker), None);
+    let lost = marker.clone();
+    let lose: During = (2, Box::new(move || fs::remove_file(&lost).unwrap()));
+    let holds = |bench: &Bench| base::read(&bench.dirs()).is_ok_and(|c| c.holds_commit(&held));
+    let (_, printed) = drain_until(
+        &bench,
+        vec![
+            bench.reply(None, Some(&intake_declaring(&["app"], &[]))),
+            bench.reply(Some("Hello"), Some(DONE)),
+        ],
+        vec![lose],
+        &mut |_| !holds(&bench),
+    );
+    assert!(holds(&bench), "{printed}");
+
+    bench.put_ticket("DEMO-9", "maintainer", "Todo", &[], "", "A blocker.");
+    for (id, text) in [("DEMO-2", "Document it."), ("DEMO-3", "Library it.")] {
+        let blocked = "blocked_by = [\"DEMO-9\"]\n";
+        bench.put_ticket(id, "maintainer", "Todo", &["agent"], blocked, text);
+    }
+    let start = bench.events().len();
+    let (mut fix_at, mut lock_at) = (None, None);
+    let mut lock = None;
+    let eight = TicketId::new("DEMO-8").unwrap();
+    let (outcomes, printed) = drain_until(
+        &bench,
+        vec![
+            bench.reply(None, Some(&intake_declaring(&["docs"], &[]))),
+            bench.reply(None, Some(&intake_declaring(&["lib"], &[]))),
+            bench.reply(Some("Hello again"), Some(&done_for("DEMO-2"))),
+            bench.reply(Some("Hello at last"), Some(&done_for("DEMO-3"))),
+        ],
+        Vec::new(),
+        &mut |_| {
+            let events = bench.events();
+            let taken_in = bench
+                .record_of("DEMO-3")
+                .is_some_and(|record| record.intake.is_some());
+            match (fix_at, lock_at) {
+                // DEMO-1 held again in this watch, both others taken in.
+                (None, _) if taken_in && base_waits(&events[start..], TICKET) > 0 => {
+                    fs::write(&marker, "").unwrap();
+                    bench.merge_into_main(&[("NEWS.md", "news\n")]);
+                    bench.put_ticket("DEMO-9", "maintainer", "Done", &[], "", "A blocker.");
+                    fix_at = Some(events.len());
+                }
+                // The first dispatch after the fix: another step is in
+                // flight for the next pass.
+                (Some(fix), None) if !drained(&events[fix..]).is_empty() => {
+                    lock = Some(bench.dirs().ticket_lock(&eight).unwrap().unwrap());
+                    lock_at = Some(events.len());
+                }
+                // DEMO-1's check found that step in flight: it ends.
+                (Some(_), Some(at)) if lock.is_some() && base_waits(&events[at..], TICKET) > 0 => {
+                    lock = None;
+                }
+                _ => {}
+            }
+            fix_at.is_none_or(|fix| drained(&events[fix..]).len() < 2)
+        },
+    );
+    let events = bench.events();
+    let fix = fix_at.expect("the fix landed");
+    let lifted = events
+        .iter()
+        .position(|e| {
+            e.kind == EventKind::Decision
+                && e.data.get("base") == Some(&json!("checked"))
+                && e.data["change"] == json!("lifted")
+                && e.data["commit"] == json!(held)
+        })
+        .unwrap_or_else(|| panic!("never lifted\n{printed}"));
+    let dispatches: Vec<(usize, String)> = drained(&events)
+        .into_iter()
+        .filter(|(at, _)| *at >= fix)
+        .collect();
+    assert!(
+        dispatches.len() >= 2 && dispatches[0].0 < lifted && lifted < dispatches[1].0,
+        "{dispatches:?}, lifted at {lifted}\n{printed}"
+    );
+    assert_eq!(dispatches[0].1, "DEMO-2");
+    let due = outcomes
+        .iter()
+        .filter(|(id, outcome)| {
+            id == TICKET && matches!(outcome, Err(Stop::BaseHeld { due: true, .. }))
+        })
+        .count();
+    assert_eq!(due, 1, "its check found a step in flight once\n{printed}");
+    assert!(lock.is_none());
+}

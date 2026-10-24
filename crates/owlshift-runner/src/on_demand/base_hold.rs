@@ -68,6 +68,19 @@ enum Settled {
     Held { command: Option<String> },
     /// A check is due that could not run yet.
     Pending { command: Option<String> },
+    /// The commit is held and its check again is due but could not run
+    /// yet (OWL-431): the failing command.
+    Due { command: Option<String> },
+}
+
+/// What a held Build does about the default branch's newer head (OWL-427).
+enum Left {
+    /// It stays held; `due` when the head's check could not run yet
+    /// (OWL-431).
+    Stay { due: bool },
+    /// Its branch was rebased onto the head: dispatched again there, with
+    /// what the rebase run proposed.
+    Rebased(Box<Dispatched>, Vec<Followup>),
 }
 
 impl OnDemand<'_> {
@@ -99,7 +112,7 @@ impl OnDemand<'_> {
             }
             Settled::Held { command: failed } => {
                 match self.leave_held(p, command, dispatched, state, failed.as_deref(), sink)? {
-                    Some((rebased, followups)) => {
+                    Left::Rebased(rebased, followups) => {
                         // A done Build's result is kept at the rebased head
                         // and the commit the ticket is configured at now, so
                         // a stop before its regate still finds it; a held
@@ -120,16 +133,21 @@ impl OnDemand<'_> {
                             self.drop_wait(&p.ticket, sink);
                         }
                         Ok(Resume::Rebased {
-                            dispatched: Box::new(rebased),
+                            dispatched: rebased,
                             done,
                             followups,
                         })
                     }
-                    None => Err(self.base_held(p, dispatched, failed, false, sink)),
+                    Left::Stay { due } => {
+                        Err(self.base_held(p, dispatched, failed, false, due, sink))
+                    }
                 }
             }
             Settled::Pending { command: failed } => {
-                Err(self.base_held(p, dispatched, failed, true, sink))
+                Err(self.base_held(p, dispatched, failed, true, false, sink))
+            }
+            Settled::Due { command: failed } => {
+                Err(self.base_held(p, dispatched, failed, false, true, sink))
             }
         }
     }
@@ -140,8 +158,9 @@ impl OnDemand<'_> {
     /// is open, and the head contains that commit and passes its own check,
     /// one `rebase` role run moves the branch onto the head
     /// ([`Self::rebase_held`]), and the ticket is dispatched again for
-    /// `command`, configured there. `None` when it stays held; `failed` is
-    /// the command the held commit fails, for a park's reason.
+    /// `command`, configured there. [`Left::Stay`] when it stays held, `due`
+    /// when the head's check could not run beside the other steps; `failed`
+    /// is the command the held commit fails, for a park's reason.
     fn leave_held(
         &self,
         p: &mut Prepared,
@@ -150,7 +169,7 @@ impl OnDemand<'_> {
         state: &TicketState,
         failed: Option<&str>,
         sink: &mut EventSink<'_>,
-    ) -> Result<Option<(Dispatched, Vec<Followup>)>, Stop> {
+    ) -> Result<Left, Stop> {
         let held = dispatched.configured_at.commit.clone();
         let head = p.base.commit.clone();
         let (branch, start) = self.held_branch(p, &head)?;
@@ -173,13 +192,13 @@ impl OnDemand<'_> {
                     ]),
                 );
             }
-            return Ok(None);
+            return Ok(Left::Stay { due: false });
         }
         let checks = match base::read(self.dirs) {
             Ok(checks) => checks,
             Err(why) => {
                 self.base_unchecked(&p.ticket, &why, sink);
-                return Ok(None);
+                return Ok(Left::Stay { due: false });
             }
         };
         // The held commit checked again at this head first, still failing:
@@ -189,7 +208,7 @@ impl OnDemand<'_> {
             checks.verdict_at(&held, &commands_key(dispatched), &head),
             Some(Verdict::Failed(_))
         ) {
-            return Ok(None);
+            return Ok(Left::Stay { due: false });
         }
         // The head's own setup and gate, which its check runs and the
         // rebase run is briefed with (OWL-331: a rebase takes the base it
@@ -199,23 +218,24 @@ impl OnDemand<'_> {
         let kept = checks.verdict_at(&head, &key, &head).cloned();
         let verdict =
             match owlshift_core::base::leave(&held, &head, head_has_held, kept.as_ref(), branch) {
-                Leave::Stay => return Ok(None),
+                Leave::Stay => return Ok(Left::Stay { due: false }),
                 Leave::Rebase => Verdict::Passed,
                 Leave::CheckHead => match self.run_check(p, &head, None, sink)? {
                     CheckRun::Ran {
                         verdict: Some(verdict),
                         ..
                     } => verdict,
+                    // Given the priority a first check gets (OWL-431).
+                    CheckRun::Busy => return Ok(Left::Stay { due: true }),
                     CheckRun::Ran { verdict: None, .. }
-                    | CheckRun::Busy
                     | CheckRun::Unchecked
-                    | CheckRun::NoGate => return Ok(None),
+                    | CheckRun::NoGate => return Ok(Left::Stay { due: false }),
                 },
             };
         if owlshift_core::base::leave(&held, &head, head_has_held, Some(&verdict), branch)
             != Leave::Rebase
         {
-            return Ok(None);
+            return Ok(Left::Stay { due: false });
         }
         let followups = self.rebase_held(
             p,
@@ -228,7 +248,7 @@ impl OnDemand<'_> {
         )?;
         // Its merge-base with the base is the head now: configured there.
         let rebased = self.dispatch(p, command, sink)?;
-        Ok(Some((rebased, followups)))
+        Ok(Left::Rebased(Box::new(rebased), followups))
     }
 
     /// The held ticket's branch as [`owlshift_core::base::leave`] reads it,
@@ -453,8 +473,9 @@ impl OnDemand<'_> {
         };
         let (command, pending) = match self.settle(p, dispatched, Some(&failing), sink)? {
             Settled::Go => return Ok(None),
-            Settled::Held { command } => (command, false),
-            Settled::Pending { command } => (command, true),
+            Settled::Held { command } => (command, (false, false)),
+            Settled::Pending { command } => (command, (true, false)),
+            Settled::Due { command } => (command, (false, true)),
         };
         match state.apply(p.pipeline, Event::BaseBroken) {
             Ok(Transition::To(next)) => *state = next,
@@ -481,7 +502,10 @@ impl OnDemand<'_> {
             Some(&ran.run),
             sink,
         );
-        Ok(Some(self.base_held(p, dispatched, command, pending, sink)))
+        let (pending, due) = pending;
+        Ok(Some(
+            self.base_held(p, dispatched, command, pending, due, sink),
+        ))
     }
 
     /// Keeps the ticket's wait file for a Build configured as `dispatched`
@@ -793,8 +817,9 @@ impl OnDemand<'_> {
     }
 
     /// A check that could not run yet, another ticket's step in flight: a
-    /// hold standing goes on holding; a failure waits for it, pending, as
-    /// does every Build configured there; with neither, nothing holds.
+    /// hold standing goes on holding, its check again due (OWL-431); a
+    /// failure waits for it, pending, as does every Build configured there;
+    /// with neither, nothing holds.
     fn check_waits(
         &self,
         dispatched: &Dispatched,
@@ -802,7 +827,7 @@ impl OnDemand<'_> {
         held: Option<String>,
     ) -> Settled {
         if let Some(command) = held {
-            return Settled::Held {
+            return Settled::Due {
                 command: Some(command),
             };
         }
@@ -870,6 +895,7 @@ impl OnDemand<'_> {
         dispatched: &Dispatched,
         command: Option<String>,
         pending: bool,
+        due: bool,
         sink: &mut EventSink<'_>,
     ) -> Stop {
         let commit = dispatched.configured_at.commit.clone();
@@ -890,6 +916,7 @@ impl OnDemand<'_> {
             commit,
             command,
             pending,
+            due,
         }
     }
 
