@@ -1,0 +1,45 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Owlshift served projects",
+  "description": "The projects this machine serves.",
+  "type": "object",
+  "properties": {
+    "format": {
+      "description": "The format version of this document.",
+      "type": "integer",
+      "const": 1
+    },
+    "projects": {
+      "type": "array",
+      "default": [],
+      "items": {
+        "$ref": "#/$defs/ServedProject"
+      }
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "format"
+  ],
+  "$defs": {
+    "ServedProject": {
+      "description": "One served project.",
+      "type": "object",
+      "properties": {
+        "checkout": {
+          "description": "The checkout it was registered from, an absolute path: it only\nlocates the project, whose `origin` it names.",
+          "type": "string"
+        },
+        "repository": {
+          "description": "Its GitHub repository, `owner/name`.",
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "repository",
+        "checkout"
+      ]
+    }
+  }
+}

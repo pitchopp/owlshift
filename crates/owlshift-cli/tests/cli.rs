@@ -131,6 +131,36 @@ always_human = []
     assert!(stdout(&output).contains("upgrade Owlshift"));
 }
 
+/// OWL-434: the service's watch finds its project in the list of served
+/// projects, never in the current directory, and refuses one it does not
+/// serve; `--served` goes with `--drain` only.
+#[test]
+fn a_served_watch_is_refused_for_a_project_not_served() {
+    let config_dir = tempfile::tempdir().unwrap();
+    let elsewhere = tempfile::tempdir().unwrap();
+    let output = owlshift(
+        elsewhere.path(),
+        config_dir.path(),
+        &["watch", "--drain", "--served", "acme/app"],
+    );
+    assert!(!output.status.success());
+    assert!(
+        stderr(&output).contains(
+            "acme/app is not served on this machine: `owlshift start` in its checkout serves it"
+        ),
+        "{}",
+        stderr(&output)
+    );
+
+    let output = owlshift(
+        elsewhere.path(),
+        config_dir.path(),
+        &["watch", "--served", "acme/app"],
+    );
+    assert_eq!(output.status.code(), Some(2), "{}", stderr(&output));
+    assert!(stderr(&output).contains("--drain"), "{}", stderr(&output));
+}
+
 /// OWL-368: `owlshift unquarantine` lifts a security marker only for a
 /// person at a terminal. Run from a script, its standard input no terminal,
 /// it is refused and the marker stays, whatever the project file says: here

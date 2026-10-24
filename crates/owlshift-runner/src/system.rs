@@ -373,7 +373,6 @@ pub(crate) mod fake {
         }
 
         /// The data directory is so, or the system has none.
-        #[cfg(unix)]
         pub(crate) fn data_dir_is(mut self, dir: Option<(PathBuf, DataDirSource)>) -> Self {
             self.data_dir = Some(dir);
             self

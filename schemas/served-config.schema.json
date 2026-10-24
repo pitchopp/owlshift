@@ -1,0 +1,103 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Owlshift served project file",
+  "description": "The project file a served project runs on, and why a newer one is not.",
+  "type": "object",
+  "properties": {
+    "format": {
+      "description": "The format version of this document.",
+      "type": "integer",
+      "const": 1
+    },
+    "kept": {
+      "description": "The last project file read at the default branch that Owlshift\naccepted: none until one is.",
+      "anyOf": [
+        {
+          "$ref": "#/$defs/KeptFile"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "refused": {
+      "description": "Why the default branch's project file is not the one kept, while it\nis not.",
+      "anyOf": [
+        {
+          "$ref": "#/$defs/RefusedFile"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "repository": {
+      "description": "The project's GitHub repository, `owner/name`.",
+      "type": "string"
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "format",
+    "repository"
+  ],
+  "$defs": {
+    "KeptFile": {
+      "description": "A project file kept.",
+      "type": "object",
+      "properties": {
+        "branch": {
+          "description": "The default branch, such as `main`.",
+          "type": "string"
+        },
+        "commit": {
+          "description": "The latest commit of the default branch read that holds this text, a\nfull id.",
+          "type": "string"
+        },
+        "since": {
+          "description": "When this text was first kept.",
+          "type": "string",
+          "format": "date-time"
+        },
+        "text": {
+          "description": "The file's text, as that commit holds it.",
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "branch",
+        "commit",
+        "text",
+        "since"
+      ]
+    },
+    "RefusedFile": {
+      "description": "A project file refused.",
+      "type": "object",
+      "properties": {
+        "commit": {
+          "description": "The commit of the default branch read last, a full id; none when the\ndefault branch could not be read.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "reason": {
+          "description": "Why it is refused.",
+          "type": "string"
+        },
+        "since": {
+          "description": "Since when a refusal has stood without a break: the operator is told\nonce, when it starts.",
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "reason",
+        "since"
+      ]
+    }
+  }
+}
