@@ -822,7 +822,7 @@ pub fn project_file_at_origin_head(git: &Git, root: &Path) -> Result<DefaultBran
 }
 
 /// The most bytes of the project file read at the base commit.
-const MAX_PROJECT_FILE_BYTES: u64 = 64 * 1024;
+pub(crate) const MAX_PROJECT_FILE_BYTES: u64 = 64 * 1024;
 
 /// The zone owners of the project file as the base commit holds it, read in
 /// the dedicated `checkout` as the project's rules are

@@ -13,6 +13,7 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use clap::{CommandFactory, FromArgMatches, Parser, Subcommand};
+use owlshift_adapters::forge::Repo;
 use owlshift_contracts::format::{
     BRIEF_FORMAT, CLAIM_FORMAT, EVENT_FORMAT, FOOTER_FORMAT, QUESTIONS_FORMAT, RESULT_FORMAT,
     TICKET_STATE_FORMAT,
@@ -70,6 +71,10 @@ enum Command {
         /// envelope (OWL-399): watch's own, never typed.
         #[arg(long, hide = true, value_name = "ENVELOPE")]
         step: Option<String>,
+        /// The step's served project, its watch's (OWL-434): watch's own,
+        /// never typed.
+        #[arg(long, hide = true, requires = "step", value_name = "OWNER/REPO")]
+        served: Option<String>,
     },
     /// Watch this project's tickets whose questions wait, in the foreground,
     /// and continue each one as `owlshift continue` would once its decider's
@@ -84,6 +89,11 @@ enum Command {
         /// first, and dispatch them to Build one at a time.
         #[arg(long)]
         drain: bool,
+        /// Watch this served project, found in the list of served projects
+        /// rather than from the current directory, on the project file of
+        /// its default branch (OWL-434): the service's own, never typed.
+        #[arg(long, hide = true, requires = "drain", value_name = "OWNER/REPO")]
+        served: Option<String>,
     },
     /// Start over what Owlshift keeps on a ticket between commands, when it
     /// has no room left or cannot be read: its asks and decisions go, their
@@ -186,6 +196,20 @@ fn main() -> ExitCode {
         owlshift_platform::paths::personal_config_file(),
     );
 
+    let served = match &cli.command {
+        Command::Watch {
+            served: Some(repo), ..
+        }
+        | Command::Continue {
+            served: Some(repo), ..
+        } => match Repo::parse(repo) {
+            Ok(repo) => Some(repo),
+            Err(error) => return fail(&format!("--served: {error}")),
+        },
+        _ => None,
+    };
+    let served = served.as_ref();
+
     match cli.command {
         Command::Doctor { json } => {
             let report = doctor::run(&system, &config);
@@ -201,24 +225,35 @@ fn main() -> ExitCode {
             exit_code(config.is_valid())
         }
         Command::Init(args) => init_cmd::run(&args, &config),
-        Command::Do { ticket } => do_cmd::run(&system, &config, do_cmd::Mode::Do(&ticket)),
+        Command::Do { ticket } => do_cmd::run(&system, &config, do_cmd::Mode::Do(&ticket), None),
         Command::Continue {
             ticket,
             step: None,
             to_watch: false,
-        } => do_cmd::run(&system, &config, do_cmd::Mode::Continue(&ticket)),
+            ..
+        } => do_cmd::run(&system, &config, do_cmd::Mode::Continue(&ticket), None),
         Command::Continue {
             ticket,
             step: None,
             to_watch: true,
-        } => do_cmd::run(&system, &config, do_cmd::Mode::ToWatch(&ticket)),
+            ..
+        } => do_cmd::run(&system, &config, do_cmd::Mode::ToWatch(&ticket), None),
         Command::Continue {
             ticket,
             step: Some(envelope),
             ..
-        } => do_cmd::run(&system, &config, do_cmd::Mode::Step(&ticket, &envelope)),
-        Command::Watch { drain: false } => do_cmd::run(&system, &config, do_cmd::Mode::Watch),
-        Command::Watch { drain: true } => do_cmd::run(&system, &config, do_cmd::Mode::Drain),
+        } => do_cmd::run(
+            &system,
+            &config,
+            do_cmd::Mode::Step(&ticket, &envelope),
+            served,
+        ),
+        Command::Watch { drain: false, .. } => {
+            do_cmd::run(&system, &config, do_cmd::Mode::Watch, None)
+        }
+        Command::Watch { drain: true, .. } => {
+            do_cmd::run(&system, &config, do_cmd::Mode::Drain, served)
+        }
         Command::Forget { ticket } => forget_cmd::run(&config, &ticket),
         Command::Gate { at } => gate_cmd::run(&system, &config, at.as_deref()),
         Command::Unquarantine => unquarantine_cmd::run(&config),

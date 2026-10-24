@@ -58,20 +58,27 @@ impl<T> FileState<T> {
     /// Reads and checks the file at `path`: its `requires` first, then the
     /// strict parse.
     pub(crate) fn load(path: PathBuf, parse: fn(&str) -> Result<T, ContractError>) -> Self {
-        let text = match fs::read_to_string(&path) {
-            Ok(text) => text,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => return Self::Absent(path),
-            Err(error) => {
-                return Self::Invalid {
-                    error: format!("cannot read it: {error}"),
-                    path,
-                };
-            }
-        };
+        match fs::read_to_string(&path) {
+            Ok(text) => Self::from_text(path, &text, parse),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Self::Absent(path),
+            Err(error) => Self::Invalid {
+                error: format!("cannot read it: {error}"),
+                path,
+            },
+        }
+    }
+
+    /// Checks `text`, read from `path` or kept for it, as [`FileState::load`]
+    /// checks a file: its `requires` first, then the strict parse.
+    pub(crate) fn from_text(
+        path: PathBuf,
+        text: &str,
+        parse: fn(&str) -> Result<T, ContractError>,
+    ) -> Self {
         let current = Version::parse(OWLSHIFT_VERSION).expect("the crate version is semver");
-        let checked = check_requires(&text, &current)
-            .and_then(|()| entries(&text))
-            .and_then(|entries| parse(&text).map(|config| (config, entries)));
+        let checked = check_requires(text, &current)
+            .and_then(|()| entries(text))
+            .and_then(|entries| parse(text).map(|config| (config, entries)));
         match checked {
             Ok((config, entries)) => Self::Loaded {
                 path,
@@ -115,14 +122,31 @@ impl Effective {
             Ok(None) => FileState::NotApplicable("not in a git repository".to_owned()),
             Err(reason) => FileState::Unavailable(reason),
         };
-        let personal = match personal {
-            Some(path) => FileState::load(path, PersonalConfig::parse),
-            None => FileState::NotApplicable("this system has no configuration directory".into()),
-        };
+        let personal = personal_state(personal);
         let mut effective = Self { project, personal };
-        effective.check_gate_env(system);
-        effective.check_caches(system);
+        effective.check_project(&|root: &Path| origin_repo(system, root));
         effective
+    }
+
+    /// The configuration a served project runs on (OWL-434): the project
+    /// file `text`, kept at `label` from the default branch of `repo`, and
+    /// the personal file at `personal`, checked as [`Effective::load`]
+    /// checks them, the names scoped to `repo` applying.
+    pub fn served(repo: &Repo, label: PathBuf, text: &str, personal: Option<PathBuf>) -> Self {
+        let mut effective = Self {
+            project: FileState::from_text(label, text, ProjectConfig::parse),
+            personal: personal_state(personal),
+        };
+        effective.check_project(&|_: &Path| Ok(repo.clone()));
+        effective
+    }
+
+    /// The operator's allowances applied to the project's declarations, the
+    /// repository being `repository` of the file's folder, asked only when
+    /// the project declares a variable or a cache folder.
+    fn check_project(&mut self, repository: &dyn Fn(&Path) -> Result<Repo, String>) {
+        self.check_gate_env(repository);
+        self.check_caches(repository);
     }
 
     /// The names the operator lets a project of `repository` pass to its
@@ -156,14 +180,14 @@ impl Effective {
     /// operator does not allow for this repository (OWL-330), as
     /// [`Effective::check_gate_env`] refuses a variable: no run and no gate
     /// starts with it. A project already invalid is left as it is.
-    fn check_caches(&mut self, system: &dyn System) {
+    fn check_caches(&mut self, repository: &dyn Fn(&Path) -> Result<Repo, String>) {
         let FileState::Loaded { path, config, .. } = &self.project else {
             return;
         };
         if config.stack.caches.is_empty() {
             return;
         }
-        let repository = origin_repo(system, path.parent().unwrap_or(path));
+        let repository = repository(path.parent().unwrap_or(path));
         let Some(allowed) = self.allowed_caches(repository.as_ref().ok()) else {
             return;
         };
@@ -186,14 +210,14 @@ impl Effective {
     /// apply, and the refusal says why. With the personal file unknown or
     /// invalid, the configuration is invalid already and the project is left
     /// as it is.
-    fn check_gate_env(&mut self, system: &dyn System) {
+    fn check_gate_env(&mut self, repository: &dyn Fn(&Path) -> Result<Repo, String>) {
         let FileState::Loaded { path, config, .. } = &self.project else {
             return;
         };
         if config.stack.gate_env.is_empty() {
             return;
         }
-        let repository = origin_repo(system, path.parent().unwrap_or(path));
+        let repository = repository(path.parent().unwrap_or(path));
         let Some(allowed) = self.allowed_gate_env(repository.as_ref().ok()) else {
             return;
         };
@@ -214,6 +238,15 @@ impl Effective {
     /// Whether both files could be read and are valid, or are simply absent.
     pub fn is_valid(&self) -> bool {
         !self.project.is_error() && !self.personal.is_error()
+    }
+}
+
+/// The personal file at `personal`, `None` when the platform has no place
+/// for it.
+fn personal_state(personal: Option<PathBuf>) -> FileState<PersonalConfig> {
+    match personal {
+        Some(path) => FileState::load(path, PersonalConfig::parse),
+        None => FileState::NotApplicable("this system has no configuration directory".into()),
     }
 }
 

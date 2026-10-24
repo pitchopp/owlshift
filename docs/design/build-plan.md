@@ -2168,17 +2168,17 @@ Designed on 2026-10-23 (OWL-432), with the maintainer, after a review of the pla
 - **L6 · A step across a sleep.** A `claude -p` run and the runner's deadlines across a sleep of a few minutes on macOS and Linux: whether the run lives on, and whether the deadlines count the sleep (`Instant`).
 - **L7 · Escaping the sentinel.** After a SIGKILL of a daemon whose watch runs a step, whether any process of the step lives on (a descendant that left its group), on macOS and Linux; what survives is written beside "A cut run".
 
-**Contracts and formats.** Every new file carries a format version: `<data>/service/projects.json` (1), `daemon.json` (1), `manifest.json` (1), `digest.json` (1); `<data>/service/pause`, `<project data>/pause` and `<project data>/stop` hold a JSON line with who asked, when and why. A step's outcome gains the kind `stopped`. The units and the launcher are written from templates in the binary.
+**Contracts and formats.** Every new file carries a format version: `<data>/service/projects.json` (1), `<project data>/served.json` (1, the project file a served project runs on), `daemon.json` (1), `manifest.json` (1), `digest.json` (1); `<data>/service/pause`, `<project data>/pause` and `<project data>/stop` hold a JSON line with who asked, when and why. A step's outcome gains the kind `stopped`. The units and the launcher are written from templates in the binary.
 
 **Who builds what.** Parts 1, 2 and 3 can start at once; part 4 joins them.
 
 - **1 · Live checks L1 to L7.** (OWL-433) Before parts 4, 6, 8 and 9; L3 and a shutdown need the maintainer at the machine.
 - **2 · A drain, a checked stop and a stop now.** (OWL-161, rescoped) For every watch, a terminal's included: the stop file and the first Ctrl-C, SIGTERM and the second, the third and SIGQUIT; the step child's checked stop and its outcome `stopped`, resumed as a run a usage limit cut is. Before 4 and 10.
-- **3 · Served projects and their configuration.** (OWL-434) `projects.json`; a served watch's project file from `origin/HEAD`, the last good one kept; the daemon's way to start a watch without its cwd; `doctor` and `status` naming the file. Before 4.
+- **3 · Served projects and their configuration.** (OWL-434) `projects.json`; a served watch's project file from `origin/HEAD`, the last good one kept; the daemon's way to start a watch without its cwd, the hidden `owlshift watch --drain --served owner/repo`; `doctor` naming the file. Before 4.
 - **4 · The daemon, `start` and `stop`.** (OWL-435) After 1, 2 and 3. One instance, `daemon.json`, the children and their sentinel, `served.lock`, restarts and their notification, the startup failure that pauses a project, the binary pinned.
 - **5 · An upgrade.** (OWL-436) After 4. The drain written by a newer binary, the daemon's exit, the start on the new binary.
 - **6 · Start at login and uninstall.** (OWL-437) After 1 and 4. The units, the launcher, the manifest, `stop --at-login`, `uninstall [--purge]`, `doctor`'s service lines and leftovers.
-- **7 · `pause`, `resume` and `status`.** (OWL-438) After 4.
+- **7 · `pause`, `resume` and `status`.** (OWL-438) After 4. `status` names the file each project runs on, or why it is not served, from `served.json` (`served::standing`, part 3).
 - **8 · Keep awake.** (OWL-439) After 1.
 - **9 · The digest.** (OWL-440) After 1 and 4.
 - **10 · Scenario S11 on the bench.** (OWL-441) After 2 and 4. A SIGTERM to the daemon during two steps, both checked and resumed; a kill of the daemon, the quarantine notified; no ticket with two overlapping runs or a second drain dispatch across the restarts.

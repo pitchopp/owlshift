@@ -40,13 +40,14 @@ use owlshift_platform::sandbox::{BWRAP_APPARMOR_PROFILE, SandboxError};
 use serde_json::Value;
 
 use crate::codex_machine::{self, Declared, FULL_ACCESS};
-use crate::config::{Effective, FileState, exit_text};
+use crate::config::{Effective, FileState, PROJECT_FILE, exit_text};
 use crate::executor::harness::CLAUDE_AGENT_ACCOUNT;
 use crate::executor::{
     MINIMUM_GIT_VERSION, git_floor_reason, git_install_advice, git_recheck_note,
 };
 use crate::forge::GITHUB_TOKEN_HELP;
 use crate::secrets::{self, ForgeSecret, Source, TrackerAccounts, TrackerSecrets};
+use crate::served;
 use crate::system::{
     AppError, DataDirSource, DefaultBranch, DefaultBranchFile, MarkerState, RunError, StatesError,
     System, TokenTryError, exact_version_of, older_than, version_of,
@@ -273,6 +274,7 @@ pub fn run(system: &dyn System, config: &Effective) -> Report {
         checks.extend(codex_requirements_check(system));
     }
     checks.push(project_config_check(system, &config.project, home));
+    checks.extend(served_check(system, config));
     checks.push(file_check("personal config", &config.personal, home));
     checks.push(tracker_check(config));
     let stored = project_secrets(system, config);
@@ -1185,6 +1187,74 @@ fn project_config_check(
         SUBJECT,
         format!("{local}; gate of {} command(s) from {source}", gate.len()),
     )
+}
+
+/// The project file the service runs this checkout's project on, when it
+/// serves it (OWL-434): the one kept from the default branch, never this
+/// working tree's, which the other lines check for the commands typed here.
+/// No line for a project the service does not serve.
+fn served_check(system: &dyn System, config: &Effective) -> Option<Check> {
+    const SUBJECT: &str = "served project file";
+    let (FileState::Loaded { path, .. }
+    | FileState::Invalid { path, .. }
+    | FileState::Absent(path)) = &config.project
+    else {
+        return None;
+    };
+    let repo = system.origin_repo(path.parent()?).ok()?;
+    let (data, _) = system.data_dir()?;
+    let record = match served::standing(&data, &repo) {
+        Ok(Some(record)) => record,
+        Ok(None) => return None,
+        Err(error) => {
+            return Some(Check::warn(
+                Section::Project,
+                SUBJECT,
+                format!("not read: {error}"),
+                format!(
+                    "{DOES_NOT_BLOCK} it says which file the service runs this project on, which \
+                     `owlshift start` writes and its watch keeps."
+                ),
+            ));
+        }
+    };
+    let fix = format!(
+        "{DOES_NOT_BLOCK} the service keeps running this project on the file it kept until \
+         one is accepted: fix {PROJECT_FILE} and merge it to the default branch."
+    );
+    Some(match (&record.kept, &record.refused) {
+        (Some(kept), None) => Check::ok(
+            Section::Project,
+            SUBJECT,
+            format!(
+                "the service runs it on {}, not this working tree",
+                served::kept_name(kept)
+            ),
+        ),
+        (Some(kept), Some(refused)) => Check::warn(
+            Section::Project,
+            SUBJECT,
+            format!(
+                "the service runs it on {}, not this working tree; the default branch's is \
+                 refused since {}: {}",
+                served::kept_name(kept),
+                refused.since,
+                refused.reason
+            ),
+            fix,
+        ),
+        (None, Some(refused)) => Check::warn(
+            Section::Project,
+            SUBJECT,
+            format!("not served: {}", refused.reason),
+            fix,
+        ),
+        (None, None) => Check::info(
+            Section::Project,
+            SUBJECT,
+            "registered with `owlshift start`; its watch has read no project file yet",
+        ),
+    })
 }
 
 /// The configured tracker's adapter and the capabilities it declares
@@ -4742,6 +4812,81 @@ states = { ready = "Todo", working = "Doing", needs_input = "Asked", review = "R
             line(&report, "secrets").detail,
             "github.com/pitchopp/owlshift (service `owlshift`): GitHub token under \
              `github.com/pitchopp/owlshift/github`"
+        );
+    }
+
+    /// OWL-434: doctor names the file the service runs a served project on,
+    /// the one kept from the default branch, and says nothing of a project
+    /// it does not serve.
+    #[test]
+    fn a_served_project_names_the_file_the_service_runs_it_on() {
+        use jiff::Timestamp;
+        use owlshift_contracts::service::{KeptFile, RefusedFile, ServedConfig};
+
+        let data = tempfile::tempdir().unwrap();
+        let system = FakeSystem::default()
+            .data_dir_is(Some((data.path().to_owned(), DataDirSource::Platform)));
+        let config = Effective {
+            project: FileState::Absent(PathBuf::from("/home/ada/p/owlshift.toml")),
+            personal: FileState::NotApplicable("none".to_owned()),
+        };
+        let repo = Repo::parse("pitchopp/owlshift").unwrap();
+        assert_eq!(served_check(&system, &config), None);
+
+        served::Registry::in_data_dir(data.path())
+            .register(&repo, &data.path().join("p"))
+            .unwrap();
+        let check = served_check(&system, &config).unwrap();
+        assert_eq!(check.status, Status::Info);
+        assert!(check.detail.contains("has read no project file yet"));
+
+        let dirs = crate::project::ProjectDirs::new(data.path(), &repo);
+        let write = |record: &ServedConfig| {
+            crate::step::write_atomically(&served::record_file(&dirs), &record.render()).unwrap();
+        };
+        let refused = RefusedFile {
+            commit: None,
+            reason: "owlshift.toml at origin/main (bbbbbbbbbbbb): invalid".to_owned(),
+            since: "2026-10-24T09:00:00Z".parse::<Timestamp>().unwrap(),
+        };
+        let mut record = ServedConfig::new("pitchopp/owlshift");
+        record.refused = Some(refused.clone());
+        write(&record);
+        let check = served_check(&system, &config).unwrap();
+        assert_eq!(check.status, Status::Warn);
+        assert_eq!(
+            check.detail,
+            "not served: owlshift.toml at origin/main (bbbbbbbbbbbb): invalid"
+        );
+        assert_well_formed(&check);
+
+        record.kept = Some(KeptFile {
+            branch: "main".to_owned(),
+            commit: "a".repeat(40),
+            text: String::new(),
+            since: "2026-10-24T08:00:00Z".parse::<Timestamp>().unwrap(),
+        });
+        write(&record);
+        let check = served_check(&system, &config).unwrap();
+        assert_eq!(check.status, Status::Warn);
+        assert!(
+            check.detail.starts_with(
+                "the service runs it on owlshift.toml at origin/main (aaaaaaaaaaaa), not this \
+                 working tree; the default branch's is refused since 2026-10-24T09:00:00Z: "
+            ),
+            "{}",
+            check.detail
+        );
+        assert_well_formed(&check);
+
+        record.refused = None;
+        write(&record);
+        let check = served_check(&system, &config).unwrap();
+        assert_eq!(check.status, Status::Ok);
+        assert_eq!(
+            check.detail,
+            "the service runs it on owlshift.toml at origin/main (aaaaaaaaaaaa), not this \
+             working tree"
         );
     }
 }

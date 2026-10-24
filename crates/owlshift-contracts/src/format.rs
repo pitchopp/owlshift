@@ -150,6 +150,12 @@ pub const BASE_FORMAT: u32 = 1;
 pub const BASE_WAIT_FORMAT: u32 = 1;
 /// The format version of a marked comment's footer.
 pub const FOOTER_FORMAT: u32 = 1;
+/// The format version of the machine's served projects
+/// (`<data>/service/projects.json`, OWL-434).
+pub const SERVED_PROJECTS_FORMAT: u32 = 1;
+/// The format version of the project file a served project runs on
+/// (`served.json` in a project's folder, OWL-434).
+pub const SERVED_CONFIG_FORMAT: u32 = 1;
 
 /// Why a contract document was refused.
 #[derive(Debug)]
