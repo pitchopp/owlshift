@@ -144,7 +144,10 @@ pub struct Brief {
     /// round whose post or keeping failed is replayed by a later command,
     /// whose questions may differ; in intake's (format 24, OWL-402), why
     /// the previous intake run of the same command was refused, its result
-    /// or a dependency it named, kept nowhere else. The runner's message, at most
+    /// or a dependency it named, kept nowhere else; in the design role's,
+    /// a design review's, a verifier's and the arbiter's (format 28,
+    /// OWL-430), why the previous run of the same role, stage and seat in
+    /// the same command was refused, kept nowhere else. The runner's message, at most
     /// [`MAX_RESULT_REFUSAL_BYTES`]; what it quotes from the refused result
     /// is data. Absent when no such refusal is kept. Since OWL-198 it quotes
     /// no choice kept typed: those are in `refused_choices`.
@@ -1001,9 +1004,10 @@ impl Brief {
     /// order, distinct questions of an earlier round; a resolver's brief has
     /// questions to `resolve`, in increasing order, a `delegation` level and
     /// the run that asked (`asked_by`, its plan's and diff's bases full
-    /// commit ids), and no other brief has any; only Build's, the answer
-    /// check's, the resolver's and, since format 24, intake's briefs have
-    /// a `result_refusal`, of at most [`MAX_RESULT_REFUSAL_BYTES`], and only
+    /// commit ids), and no other brief has any; only the rebase role's
+    /// brief has no `result_refusal` (since format 28, OWL-430: Build's, the
+    /// answer check's and the resolver's, intake's since format 24, and
+    /// now the design and review roles' have one), of at most [`MAX_RESULT_REFUSAL_BYTES`], and only
     /// Build's, with one, has `decisions_refused`, which `refused_choices`
     /// needs, at most [`MAX_REFUSED_CHOICES`] of them, each text of at most
     /// [`MAX_CHOICE_BYTES`]; the rebase role's brief, and only it, has a
@@ -1150,19 +1154,24 @@ impl Brief {
             }
         }
         if let Some(reason) = &self.result_refusal {
-            if !matches!(
-                self.role,
-                Role::Build | Role::AnswerCheck | Role::Resolver | Role::Intake
-            ) {
+            // Every role listed, so that a new one takes a side.
+            let told = match self.role {
+                Role::Build
+                | Role::AnswerCheck
+                | Role::Resolver
+                | Role::Intake
+                | Role::Design
+                | Role::DesignReview
+                | Role::Verify
+                | Role::Arbiter => true,
+                Role::Rebase => false,
+            };
+            if !told {
                 return Err(ContractError::invalid(
                     CONTRACT,
                     format!(
-                        "a refused result is given but the role is {}, not {}, {}, {} or {}",
-                        self.role.as_str(),
-                        Role::Build.as_str(),
-                        Role::AnswerCheck.as_str(),
-                        Role::Resolver.as_str(),
-                        Role::Intake.as_str()
+                        "a refused result is given but the role is {}, which is never told one",
+                        self.role.as_str()
                     ),
                 ));
             }

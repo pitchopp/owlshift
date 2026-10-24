@@ -15,7 +15,7 @@ use crate::pipeline::Pipeline;
 use crate::vocab::{AnswerClass, Stage};
 
 /// Failed runs in one stage that park the ticket: the second one does. A
-/// refused Build or answer-check result never brings the count there
+/// refused Build, design, review or answer-check result never brings the count there
 /// ([`Event::ResultRefused`]), and a gate refused for uncommitted changes
 /// before any command does not count ([`Event::UncommittedGate`]), nor does
 /// a gate or setup failure the base reproduces ([`Event::BaseBroken`]).
@@ -149,7 +149,7 @@ impl Status {
 /// | The answer check found questions left open (they are re-asked) | `Incomplete` |
 /// | The decider asked a counter-question (answered in the thread) | `CounterQuestion` |
 /// | A run returned `failed` or no valid `result.json`, whatever its exit code, save the row below; a Build `done` whose project gate, run by the runner, failed | `RunFailed` |
-/// | A Build run's (at Build, or a fix run's at Watch) or an answer check's `result.json` was refused, and the run had not been told of a refused result: the next run of its kind will be | `ResultRefused` |
+/// | A Build run's (at Build, or a fix run's at Watch), a design run's, a review seat's (at Design review or Verify, OWL-430) or an answer check's `result.json` was refused, and the run had not been told of a refused result: the next run of its kind will be | `ResultRefused` |
 /// | A Build run's (at Build, or a fix run's at Watch) gate was refused for uncommitted changes before any command ran, and the run had not been told of such a refusal: the next run will be | `UncommittedGate` |
 /// | A Build run's at Build (a Verify fix run included) gate or setup failed on a command that the commit it was configured at fails too, or that commit's check is due; or a Build run at Build was held before it started for such a commit (OWL-418, [`crate::base`]) | `BaseBroken` |
 /// | A rebase run off a held commit, at Build, ended without a rebase the runner accepts (OWL-427, [`crate::base::leave`]) | `RebaseFailed` |
@@ -237,10 +237,12 @@ pub enum Event {
     /// A failed run that never spends the stage's last attempt (OWL-183):
     /// it counts as [`Event::RunFailed`] below the last attempt, and at the
     /// last attempt leaves the ticket as it is, so the next run of its
-    /// kind, told why the result was refused, gets that attempt. Only
-    /// Build's brief and the answer check's carry that reason, so it is
-    /// valid at Build, at Watch, where a fix run is the build role's, and
-    /// while waiting for input, where the answer check runs (OWL-190). The bound is the runner's to keep: it gives this
+    /// kind, told why the result was refused, gets that attempt. Only the
+    /// briefs of the runs retried within their stage and the answer
+    /// check's carry that reason, so it is valid at Build, at Watch, where a
+    /// fix run is the build role's, at Design, Design review and Verify,
+    /// where the design role and the review seats run (OWL-430), and while
+    /// waiting for input, where the answer check runs (OWL-190). The bound is the runner's to keep: it gives this
     /// event only for a run that was not itself told of a refused result,
     /// so that of two refusals in a row, the second is a `RunFailed`.
     ResultRefused,
@@ -839,7 +841,14 @@ impl TicketState {
                 }
             }
             (
-                Status::Active(Stage::Build | Stage::Watch) | Status::NeedsInput { .. },
+                Status::Active(
+                    Stage::Build
+                    | Stage::Watch
+                    | Stage::Design
+                    | Stage::DesignReview
+                    | Stage::Verify,
+                )
+                | Status::NeedsInput { .. },
                 Event::ResultRefused,
             ) => {
                 let failed_runs = (self.failed_runs + 1).min(MAX_FAILED_RUNS - 1);
@@ -1208,6 +1217,9 @@ mod tests {
             (Status::Active(Build | Watch), Event::ResultRefused | Event::UncommittedGate) => {
                 Expect::To(status)
             }
+            (Status::Active(Design | DesignReview | Verify), Event::ResultRefused) => {
+                Expect::To(status)
+            }
             (Status::Active(Build), Event::BaseBroken) => Expect::To(status),
             (Status::Active(Build), Event::RebaseFailed) => {
                 Expect::Parked(parked(Build, false), ParkReason::Rebase)
@@ -1473,12 +1485,29 @@ mod tests {
 
     #[test]
     fn a_refused_result_counts_but_never_spends_the_last_attempt() {
-        let build = state(Status::Active(Stage::Build), 1, 0, 0);
-        let refused = to(build.apply(STANDARD, Event::ResultRefused));
-        assert_eq!(refused, state(Status::Active(Stage::Build), 1, 0, 1));
-        // At the last attempt, it leaves the ticket as it is: the next run,
-        // told why, gets that attempt.
-        assert_eq!(to(refused.apply(STANDARD, Event::ResultRefused)), refused);
+        // Build's, and since OWL-430 the design role's and the review
+        // seats'.
+        for stage in [
+            Stage::Build,
+            Stage::Design,
+            Stage::DesignReview,
+            Stage::Verify,
+        ] {
+            let at = state(Status::Active(stage), 1, 0, 0);
+            let refused = to(at.apply(STANDARD, Event::ResultRefused));
+            assert_eq!(refused, state(Status::Active(stage), 1, 0, 1), "{stage:?}");
+            // At the last attempt, it leaves the ticket as it is: the next
+            // run, told why, gets that attempt.
+            assert_eq!(to(refused.apply(STANDARD, Event::ResultRefused)), refused);
+            // A told run's failure is a plain failed run, which parks.
+            assert!(matches!(
+                refused.apply(STANDARD, Event::RunFailed),
+                Ok(Transition::Parked {
+                    reason: ParkReason::FailedRuns,
+                    ..
+                })
+            ));
+        }
 
         // The answer check's, while waiting for input, the same way
         // (OWL-190), re-asks kept.

@@ -43,8 +43,10 @@ use crate::Role;
 /// (OWL-402); format 25 `pull_request_reviews` in a review loop's verify and
 /// arbiter briefs too (OWL-396); format 26 intake's `relations` (OWL-416);
 /// format 27 a rebase's optional `pull_request` and `url` and its `broken`,
-/// for a held Build's rebase off a broken base (OWL-427).
-pub const BRIEF_FORMAT: u32 = 27;
+/// for a held Build's rebase off a broken base (OWL-427); format 28 gives
+/// `result_refusal` to the design role and the review stages' roles too,
+/// design review, verify and the arbiter (OWL-430).
+pub const BRIEF_FORMAT: u32 = 28;
 /// The format version of `result.json`. Format 4 added the resolver's
 /// `resolutions` (OWL-138); format 5 the resolver's own `category` on each
 /// decision (OWL-144); format 6 refuses `decisions` from the build role
