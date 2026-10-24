@@ -14,7 +14,7 @@ use owlshift_core::decider::ZoneOwners;
 use owlshift_core::gate::{GatePolicy, PassLimit, ResolverPolicy, usd_micros};
 use owlshift_core::reply::DEFAULT_QUIET_WINDOW;
 use owlshift_core::resource::NamedResources;
-use owlshift_core::vocab::DelegationLevel;
+use owlshift_core::vocab::{DelegationLevel, MergeMethod, MergeSwitch};
 use schemars::JsonSchema;
 use semver::{Version, VersionReq};
 use serde::{Deserialize, Serialize};
@@ -467,20 +467,42 @@ pub struct Forge {
     /// each written exactly and mapped to its tracker account's identifier,
     /// written as a zone's owner is. A review is an instruction when that
     /// account is the ticket's decider, and context otherwise; anyone
-    /// else's review is ignored. At least one, no login listed twice, even
-    /// in another case.
-    #[schemars(length(min = 1))]
+    /// else's review is ignored. No login listed twice, even in another
+    /// case. Absent or empty, no review is read; a `[forge]` table sets it
+    /// or `merge`.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub reviewers: BTreeMap<String, String>,
+    /// Which pull requests the runner merges once green (D14): `never`, the
+    /// default, `labeled` (a ticket carrying `owlshift:merge`) or `all`.
+    /// Read at the base branch's head, so a ticket's own branch cannot turn
+    /// it on; the personal file cannot set it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub merge: Option<MergeSwitch>,
+    /// How the runner merges: `squash`, the default, `merge` or `rebase`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub merge_method: Option<MergeMethod>,
 }
 
 impl Forge {
-    /// Checks the reviewers: at least one, each login and account a name
-    /// written exactly, no login twice ignoring case (forge logins are
-    /// compared without case).
+    /// Which pull requests the runner merges once green: the project's
+    /// choice, or `never`.
+    pub fn merge(&self) -> MergeSwitch {
+        self.merge.unwrap_or_default()
+    }
+
+    /// How the runner merges: the project's choice, or `squash`.
+    pub fn merge_method(&self) -> MergeMethod {
+        self.merge_method.unwrap_or_default()
+    }
+
+    /// Checks the table: it sets the reviewers or the merge; each login and
+    /// account a name written exactly, no login twice ignoring case (forge
+    /// logins are compared without case).
     fn check_reviewers(&self) -> Result<(), String> {
-        if self.reviewers.is_empty() {
+        if self.reviewers.is_empty() && self.merge.is_none() {
             return Err(
-                "forge.reviewers lists no reviewer: list at least one, or leave [forge] out"
+                "forge.reviewers lists no reviewer and forge.merge is not set: list at least \
+                 one reviewer, set merge, or leave [forge] out"
                     .to_owned(),
             );
         }

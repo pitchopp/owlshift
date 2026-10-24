@@ -2,9 +2,15 @@
 //! architecture section 5, "Watch after delivery", as a pure function over
 //! plain data. The runner does the reading, keeps the times and maps the
 //! forge's answer onto [`Read`] and [`BaseRead`]; OWL-112 and OWL-210 run the
-//! fix and the rebase it decides.
+//! fix and the rebase it decides. On a project that opted into merge on green
+//! (D14), [`merge_due`] decides on top of a green read whether the runner
+//! merges.
 
 use std::time::Duration;
+
+use crate::floor::MergeGrant;
+use crate::gate::{GatePolicy, Route};
+use crate::vocab::{MergeMethod, MergeSwitch};
 
 /// How long watch waits on a failed check beside one still unfinished before
 /// it decides on the failures it has: one hour since it first read a failure
@@ -282,6 +288,171 @@ pub fn has_failure(read: &Read) -> bool {
     read.checks.iter().any(|c| c.outcome.failed())
 }
 
+/// The tracker label that lets the runner merge a ticket's pull request under
+/// `[forge] merge = "labeled"` (D14): a fixed name, read by watch.
+pub const MERGE_LABEL: &str = "owlshift:merge";
+
+/// How old the first green read of a head must be before a later green read
+/// of it may merge: two green reads at least a minute apart (D14).
+pub const GREEN_TWICE_AFTER: Duration = Duration::from_secs(60);
+
+/// What the project lets the runner merge, read at the base branch's head:
+/// `[forge] merge` and `merge_method`, and the gate policy that says which
+/// question categories the project sends to a human.
+#[derive(Clone, Copy, Debug)]
+pub struct MergePolicy<'a> {
+    pub switch: MergeSwitch,
+    pub method: MergeMethod,
+    pub gate: &'a GatePolicy,
+}
+
+/// The first green read watch keeps for a followed pull request
+/// (`Following`): the head it was on and how long ago it was made.
+#[derive(Clone, Copy, Debug)]
+pub struct FirstGreen<'a> {
+    pub head: &'a str,
+    pub ago: Duration,
+}
+
+/// What the runner read for [`merge_due`] at a watch pass. The pass's own
+/// conditions are the runner's to hold before it asks: the ticket is at
+/// Watch, no round waits, it is not parked, the project is not quarantined,
+/// the ticket ref was read again under the project lock, and a failed read
+/// of the label, the stage or the questions means no merge at that pass
+/// (architecture section 5, "Merge on green").
+#[derive(Clone, Copy, Debug)]
+pub struct MergeFacts<'a> {
+    /// What [`decide`] made of this pass's read.
+    pub decision: &'a Decision,
+    /// The commit Owlshift last pushed (`delivery.json`'s `pushed`): the head
+    /// the merge expects.
+    pub pushed: &'a str,
+    /// The first green read of a head, `None` when this read is the first.
+    pub first_green: Option<FirstGreen<'a>>,
+    /// The base branch's head read at this pass.
+    pub base_head: &'a str,
+    /// `delivery.json`'s `base_at_push`: the base CI merged the head with.
+    pub base_at_push: Option<&'a str>,
+    /// Whether the ticket carries [`MERGE_LABEL`].
+    pub labeled: bool,
+    /// Whether the ticket carries the project's `[tracker].exclude` label: a
+    /// ticket kept out is never merged, label or not.
+    pub excluded: bool,
+    /// The categories the ticket's questions were asked under, the
+    /// resolver's labels among them when the runner counts them.
+    pub categories: &'a [String],
+    /// Whether the ticket's stage is still one the project maps for review.
+    pub at_review: bool,
+    /// Whether the pull request is a draft.
+    pub draft: bool,
+    /// Whether anything the same pass reads first is due or running: the
+    /// DELIVERY report the ref owes, a correction, a review loop, a decider
+    /// reply, a human review comment.
+    pub something_due: bool,
+}
+
+/// Why [`merge_due`] does not merge at this pass.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum MergeBlocker {
+    /// The read did not decide [`Action::Green`] on Owlshift's pushed head.
+    NotGreen,
+    /// `[forge] merge` is `never`.
+    SwitchOff,
+    /// The ticket carries the project's exclusion label.
+    Excluded,
+    /// `[forge] merge` is `labeled` and the ticket lacks [`MERGE_LABEL`].
+    Unlabeled,
+    /// A person moved the ticket out of the review stage.
+    StageMoved,
+    /// A question of the ticket was asked under this category, which the
+    /// project sends to a human.
+    HumanCategory(String),
+    /// The pull request is a draft.
+    Draft,
+    /// Something is due or running first.
+    SomethingDue,
+    /// The base Owlshift pushed onto is not known: no merge, and nothing
+    /// more is known about the base.
+    BaseUnknown,
+    /// The base moved since the push: the checks ran on a merge with the old
+    /// base, so a refresh rebase is due.
+    BaseMoved,
+    /// The head was not read green twice at least [`GREEN_TWICE_AFTER`]
+    /// apart.
+    GreenOnce,
+}
+
+/// What [`merge_due`] decides.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum MergeDue {
+    /// Merge, under the grant the floor checks.
+    Merge(MergeGrant),
+    /// No merge at this pass.
+    Wait(MergeBlocker),
+}
+
+/// Whether the runner merges the pull request at this pass (D14,
+/// architecture section 5, "Merge on green"): only when `facts.decision` is
+/// [`Action::Green`] on the head `read` shows, that head is Owlshift's pushed
+/// commit and every condition of the design holds. `Green` keeps its
+/// meaning; this decides on top of it. The grant carries the pushed head as
+/// the merge's expected head.
+pub fn merge_due(policy: &MergePolicy<'_>, facts: &MergeFacts<'_>, read: &Read) -> MergeDue {
+    match blocker(policy, facts, read) {
+        Some(blocker) => MergeDue::Wait(blocker),
+        None => MergeDue::Merge(MergeGrant::new(facts.pushed, policy.method)),
+    }
+}
+
+/// The first condition of [`merge_due`] that does not hold, in the design's
+/// order.
+fn blocker(policy: &MergePolicy<'_>, facts: &MergeFacts<'_>, read: &Read) -> Option<MergeBlocker> {
+    let green = matches!(
+        facts.decision,
+        Decision::Follow {
+            adopt: false,
+            action: Action::Green
+        }
+    );
+    if !green || read.state != PrState::Open || read.head != facts.pushed {
+        return Some(MergeBlocker::NotGreen);
+    }
+    match policy.switch {
+        MergeSwitch::Never => return Some(MergeBlocker::SwitchOff),
+        _ if facts.excluded => return Some(MergeBlocker::Excluded),
+        MergeSwitch::Labeled if !facts.labeled => return Some(MergeBlocker::Unlabeled),
+        MergeSwitch::Labeled | MergeSwitch::All => {}
+    }
+    if !facts.at_review {
+        return Some(MergeBlocker::StageMoved);
+    }
+    if let Some(category) = facts
+        .categories
+        .iter()
+        .find(|category| policy.gate.route(category) == Route::Human)
+    {
+        return Some(MergeBlocker::HumanCategory(category.clone()));
+    }
+    if facts.draft {
+        return Some(MergeBlocker::Draft);
+    }
+    if facts.something_due {
+        return Some(MergeBlocker::SomethingDue);
+    }
+    match facts.base_at_push {
+        None => return Some(MergeBlocker::BaseUnknown),
+        Some(at_push) if at_push != facts.base_head => return Some(MergeBlocker::BaseMoved),
+        Some(_) => {}
+    }
+    let green_twice = facts
+        .first_green
+        .is_some_and(|first| first.head == facts.pushed && first.ago >= GREEN_TWICE_AFTER);
+    if !green_twice {
+        return Some(MergeBlocker::GreenOnce);
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -529,5 +700,280 @@ mod tests {
         assert_eq!(outcome_of(&b.at_head, "ci"), Some(CodeFailure));
         assert_eq!(outcome_of(&running.checks, "ci"), Some(Pending));
         assert_eq!(outcome_of(&running.checks, "lint"), None);
+    }
+
+    mod merge {
+        use super::super::*;
+        use crate::vocab::{DelegationLevel, PlanApproval};
+
+        const HEAD: &str = "0123456789abcdef0123456789abcdef01234567";
+        const BASE: &str = "89abcdef0123456789abcdef0123456789abcdef";
+        const GREEN: Decision = Decision::Follow {
+            adopt: false,
+            action: Action::Green,
+        };
+
+        fn gate(level: DelegationLevel) -> GatePolicy {
+            let resolver = crate::gate::ResolverPolicy {
+                level,
+                ..Default::default()
+            };
+            GatePolicy::new(["billing"], PlanApproval::Never).with_resolver(resolver)
+        }
+
+        fn green_read() -> Read {
+            Read {
+                state: PrState::Open,
+                head: HEAD.to_owned(),
+                mergeable: Mergeable::Mergeable,
+                checks: Vec::new(),
+            }
+        }
+
+        /// Every condition met: `labeled` with the label, a minute between
+        /// the green reads.
+        fn facts<'a>(decision: &'a Decision, categories: &'a [String]) -> MergeFacts<'a> {
+            MergeFacts {
+                decision,
+                pushed: HEAD,
+                first_green: Some(FirstGreen {
+                    head: HEAD,
+                    ago: GREEN_TWICE_AFTER,
+                }),
+                base_head: BASE,
+                base_at_push: Some(BASE),
+                labeled: true,
+                excluded: false,
+                categories,
+                at_review: true,
+                draft: false,
+                something_due: false,
+            }
+        }
+
+        fn due(
+            switch: MergeSwitch,
+            gate: &GatePolicy,
+            facts: &MergeFacts<'_>,
+            read: &Read,
+        ) -> MergeDue {
+            let policy = MergePolicy {
+                switch,
+                method: MergeMethod::Rebase,
+                gate,
+            };
+            merge_due(&policy, facts, read)
+        }
+
+        #[test]
+        fn all_conditions_met_merge_at_the_pushed_head_with_the_method() {
+            let gate = gate(DelegationLevel::Discoverable);
+            let asked = ["naming".to_owned()];
+            for switch in [MergeSwitch::Labeled, MergeSwitch::All] {
+                let MergeDue::Merge(grant) =
+                    due(switch, &gate, &facts(&GREEN, &asked), &green_read())
+                else {
+                    panic!("{switch:?}");
+                };
+                assert_eq!((grant.head(), grant.method()), (HEAD, MergeMethod::Rebase));
+            }
+            // `all` needs no label.
+            let unlabeled = MergeFacts {
+                labeled: false,
+                ..facts(&GREEN, &[])
+            };
+            assert!(matches!(
+                due(MergeSwitch::All, &gate, &unlabeled, &green_read()),
+                MergeDue::Merge(_)
+            ));
+        }
+
+        /// Each condition, broken alone, stops the merge with its reason.
+        #[test]
+        fn each_condition_alone_blocks_the_merge() {
+            use MergeBlocker::*;
+            let gate = gate(DelegationLevel::Discoverable);
+            let other = "fedcba9876543210fedcba9876543210fedcba98";
+            let adopted = Decision::Follow {
+                adopt: true,
+                action: Action::Green,
+            };
+            let waiting = Decision::Follow {
+                adopt: false,
+                action: Action::WaitChecks,
+            };
+            let ended = Decision::End(EndReason::Merged);
+            let human = ["Possible security issue".to_owned()];
+            let added = ["billing_change".to_owned()];
+            let base = facts(&GREEN, &[]);
+            let mut moved_head = green_read();
+            moved_head.head = other.to_owned();
+            let mut closed = green_read();
+            closed.state = PrState::Closed;
+            let cases: Vec<(MergeSwitch, MergeFacts<'_>, Read, MergeBlocker)> = vec![
+                (
+                    MergeSwitch::All,
+                    facts(&adopted, &[]),
+                    green_read(),
+                    NotGreen,
+                ),
+                (
+                    MergeSwitch::All,
+                    facts(&waiting, &[]),
+                    green_read(),
+                    NotGreen,
+                ),
+                (MergeSwitch::All, facts(&ended, &[]), green_read(), NotGreen),
+                (MergeSwitch::All, base, moved_head, NotGreen),
+                (MergeSwitch::All, base, closed, NotGreen),
+                (MergeSwitch::Never, base, green_read(), SwitchOff),
+                (
+                    MergeSwitch::All,
+                    MergeFacts {
+                        excluded: true,
+                        ..base
+                    },
+                    green_read(),
+                    Excluded,
+                ),
+                (
+                    MergeSwitch::Labeled,
+                    MergeFacts {
+                        labeled: false,
+                        ..base
+                    },
+                    green_read(),
+                    Unlabeled,
+                ),
+                (
+                    MergeSwitch::All,
+                    MergeFacts {
+                        at_review: false,
+                        ..base
+                    },
+                    green_read(),
+                    StageMoved,
+                ),
+                (
+                    MergeSwitch::All,
+                    facts(&GREEN, &human),
+                    green_read(),
+                    HumanCategory(human[0].clone()),
+                ),
+                (
+                    MergeSwitch::All,
+                    facts(&GREEN, &added),
+                    green_read(),
+                    HumanCategory(added[0].clone()),
+                ),
+                (
+                    MergeSwitch::All,
+                    MergeFacts {
+                        draft: true,
+                        ..base
+                    },
+                    green_read(),
+                    Draft,
+                ),
+                (
+                    MergeSwitch::All,
+                    MergeFacts {
+                        something_due: true,
+                        ..base
+                    },
+                    green_read(),
+                    SomethingDue,
+                ),
+                (
+                    MergeSwitch::All,
+                    MergeFacts {
+                        base_at_push: None,
+                        ..base
+                    },
+                    green_read(),
+                    BaseUnknown,
+                ),
+                (
+                    MergeSwitch::All,
+                    MergeFacts {
+                        base_at_push: Some(other),
+                        ..base
+                    },
+                    green_read(),
+                    BaseMoved,
+                ),
+                (
+                    MergeSwitch::All,
+                    MergeFacts {
+                        first_green: None,
+                        ..base
+                    },
+                    green_read(),
+                    GreenOnce,
+                ),
+                (
+                    MergeSwitch::All,
+                    MergeFacts {
+                        first_green: Some(FirstGreen {
+                            head: HEAD,
+                            ago: GREEN_TWICE_AFTER - Duration::from_secs(1),
+                        }),
+                        ..base
+                    },
+                    green_read(),
+                    GreenOnce,
+                ),
+                (
+                    MergeSwitch::All,
+                    MergeFacts {
+                        first_green: Some(FirstGreen {
+                            head: other,
+                            ago: GREEN_TWICE_AFTER,
+                        }),
+                        ..base
+                    },
+                    green_read(),
+                    GreenOnce,
+                ),
+            ];
+            for (switch, facts, read, blocker) in cases {
+                assert_eq!(
+                    due(switch, &gate, &facts, &read),
+                    MergeDue::Wait(blocker.clone()),
+                    "{blocker:?}"
+                );
+            }
+        }
+
+        /// A category blocks when the project sends it to a human: the
+        /// level's set, the project's additions, and every one at `none`.
+        #[test]
+        fn a_human_category_follows_the_projects_level() {
+            let scope = ["scope change".to_owned()];
+            let testing = ["testing".to_owned()];
+            let blank = [String::new()];
+            let blocks = |level, categories: &[String]| {
+                matches!(
+                    due(
+                        MergeSwitch::All,
+                        &gate(level),
+                        &facts(&GREEN, categories),
+                        &green_read()
+                    ),
+                    MergeDue::Wait(MergeBlocker::HumanCategory(_))
+                )
+            };
+            assert!(blocks(DelegationLevel::Discoverable, &scope));
+            assert!(!blocks(DelegationLevel::Ticket, &scope));
+            assert!(!blocks(DelegationLevel::All, &testing));
+            assert!(!blocks(DelegationLevel::Discoverable, &blank));
+            assert!(blocks(DelegationLevel::None, &testing));
+            assert!(blocks(DelegationLevel::None, &blank));
+            // Whole-word tokens: `scoped` names no category.
+            assert!(!blocks(
+                DelegationLevel::Discoverable,
+                &["scoped".to_owned()]
+            ));
+        }
     }
 }

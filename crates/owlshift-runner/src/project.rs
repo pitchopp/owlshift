@@ -856,7 +856,8 @@ pub fn admitters_at(
 /// (OWL-307, architecture section 5, "Review comments on the pull
 /// request"), read as [`admitters_at`] reads the admitters, for the same
 /// reason: a run cannot choose whose review instructs it. `None` when the
-/// file, or its `[forge]` table, is absent: no review is read.
+/// file, its `[forge]` table or its reviewers are absent (a table may set
+/// only merge on green, D14): no review is read.
 pub fn forge_reviewers_at(
     git: &Git,
     checkout: &Path,
@@ -864,7 +865,105 @@ pub fn forge_reviewers_at(
 ) -> Result<Option<BTreeMap<String, String>>, String> {
     Ok(project_file_at(git, checkout, base)?
         .and_then(|config| config.forge)
-        .map(|forge| forge.reviewers))
+        .map(|forge| forge.reviewers)
+        .filter(|reviewers| !reviewers.is_empty()))
+}
+
+/// The `[forge] merge` and `merge_method` of the project file as the base
+/// commit holds it (D14, architecture section 5, "Merge on green"), read as
+/// [`forge_reviewers_at`] reads the reviewers, for the same reason: a
+/// ticket's own branch cannot turn merge on green on. `never` and `squash`
+/// when the file, its `[forge]` table or the keys are absent.
+pub fn forge_merge_at(
+    git: &Git,
+    checkout: &Path,
+    base: &Base,
+) -> Result<
+    (
+        owlshift_core::vocab::MergeSwitch,
+        owlshift_core::vocab::MergeMethod,
+    ),
+    String,
+> {
+    Ok(project_file_at(git, checkout, base)?
+        .and_then(|config| config.forge)
+        .map(|forge| (forge.merge(), forge.merge_method()))
+        .unwrap_or_default())
+}
+
+#[cfg(test)]
+mod forge_merge_tests {
+    use owlshift_core::vocab::{MergeMethod, MergeSwitch};
+
+    use super::*;
+
+    /// A project file whose `[forge]` table is `forge`.
+    fn project_file(forge: &str) -> String {
+        format!(
+            "requires = \">=0.0\"\n[tracker]\nkind = \"markdown\"\nadmit = \"delegation\"\n\
+             states = {{ ready = \"a\", working = \"b\", needs_input = \"c\", review = \"d\" }}\n\
+             [stack]\ngate = []\n[pipeline]\ndefault = \"trivial\"\n\
+             plan_approval = \"never\"\n[models]\n[policy]\nalways_human = []\n[forge]\n{forge}"
+        )
+    }
+
+    /// Commits `text` as the project file in `repo` and gives the commit.
+    fn commit(git: &Git, repo: &Path, text: &str) -> String {
+        fs::write(repo.join(PROJECT_FILE), text).unwrap();
+        let identity = [
+            "-c",
+            "user.name=Bench",
+            "-c",
+            "user.email=bench@example.invalid",
+            "-c",
+            "commit.gpgsign=false",
+        ];
+        git.run(repo, &["add", PROJECT_FILE]).unwrap();
+        let mut args = identity.to_vec();
+        args.extend(["commit", "-q", "-m", "project file"]);
+        git.run(repo, &args).unwrap();
+        let head = git.run(repo, &["rev-parse", "HEAD"]).unwrap();
+        String::from_utf8(head).unwrap().trim().to_owned()
+    }
+
+    /// A branch that turns merge on green on changes nothing for its own
+    /// ticket: the switch and the method are read at the base commit.
+    #[test]
+    fn a_branch_cannot_turn_merge_on_green_on() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path();
+        let git = runner_git();
+        git.run(repo, &["init", "-q"]).unwrap();
+        let base_commit = commit(
+            &git,
+            repo,
+            &project_file("reviewers = { ada = \"u-ann\" }\n"),
+        );
+        git.run(repo, &["checkout", "-q", "-b", "owl-1"]).unwrap();
+        let branch_commit = commit(
+            &git,
+            repo,
+            &project_file("merge = \"all\"\nmerge_method = \"rebase\"\n"),
+        );
+        let at = |commit: &str| Base {
+            remote_ref: "origin/main".to_owned(),
+            branch: "main".to_owned(),
+            commit: commit.to_owned(),
+        };
+        assert_eq!(
+            forge_merge_at(&git, repo, &at(&base_commit)),
+            Ok((MergeSwitch::Never, MergeMethod::Squash))
+        );
+        assert_eq!(
+            forge_merge_at(&git, repo, &at(&branch_commit)),
+            Ok((MergeSwitch::All, MergeMethod::Rebase))
+        );
+        // A table that sets only the merge lists no reviewer.
+        assert_eq!(
+            forge_reviewers_at(&git, repo, &at(&branch_commit)),
+            Ok(None)
+        );
+    }
 }
 
 /// The project file at `base.commit`, parsed, `None` when that commit has

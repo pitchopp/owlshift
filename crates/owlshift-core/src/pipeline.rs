@@ -50,7 +50,8 @@ impl Pipeline {
     /// The stage that follows `stage`: the first stage after it, in pipeline
     /// order, that this pipeline includes. It is defined for a stage the
     /// pipeline skips too, so a ticket whose variant changed while it was in
-    /// such a stage still moves forward. `None` after Watch: a human merges.
+    /// such a stage still moves forward. `None` after Watch: a human merges,
+    /// or the runner under merge on green (D14).
     pub fn next(self, stage: Stage) -> Option<Stage> {
         self.stages().iter().copied().find(|&s| s > stage)
     }
