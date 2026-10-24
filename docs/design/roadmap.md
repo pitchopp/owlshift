@@ -11,7 +11,7 @@ Status: draft, 2026-09-27. Twelve steps (P0 to P11), each shippable, testable an
 | P4 | The drain | Owlshift pulls admitted tickets from the ready column, in priority order, respecting blockers, one at a time |
 | P5 | Quality pipeline | Plan, review by another model, build, verify; plan approval by policy; per-ticket routing |
 | P6 | Parallel | Several tickets at once without collisions; usage limits pause a harness and fall back to another |
-| P7 | Background service | Starts at login, survives sleep and crashes, notifies you only when you are the blocker |
+| P7 | Background service | Starts at login, survives sleep, logouts and restarts, notifies you only when you are the blocker |
 | P8 | Local web UI | Configuration, tickets, agent and orchestrator logs in the browser |
 | P9 | Open-source readiness | First public 0.x release: GitHub Issues, Markdown tracker, `init` detection, a second project |
 | P10 | Teams | Several developers on one project; a team-server mode |
@@ -133,17 +133,17 @@ Owlshift replaces `/parallel` on Locary.
 
 **Readings and deviations** (OWL-398, decided with the maintainer on 2026-10-20).
 
-- One `owlshift watch --drain` per project, each step of a ticket in a child process, the machine's caps shared through files: P7's single runner is not brought forward. Section 5's "Deployment" stays P7's, and what P7 keeps of P6 is written there ("What P7 keeps").
+- One `owlshift watch --drain` per project, each step of a ticket in a child process, the machine's caps shared through files: P7's single runner is not brought forward (P7 builds a supervisor instead, which runs these watches: OWL-432). Section 5's "Deployment" stays P7's, and what P7 keeps of P6 is written there ("What P7 keeps").
 - S5: tickets in flight never hold conflicting resources as declared and read, against Owlshift's tickets, other open pull requests and people's tickets. Zones declared at intake are a prediction: a run's changes outside them are found once its step ends, the later ticket then waits, and a conflict is repaired by a rebase run. So two tickets can change the same folder for one step, a deviation from "never hold overlapping code zones"; the exit gate judges outcomes. The single browser slot is not taken by anything in P6 (below), and the digest that shows waits is P7's.
 - S5 (OWL-428, decided with the maintainer on 2026-10-22, found at the exit gate), a deviation from S5's "a ready ticket waits": a ticket holds nothing before its Build, whose admission takes the plan's files rather than intake's folders, so Designs and Design reviews run beside the Builds whose zones they would have waited for ([architecture](architecture.md) section 5, "Resources admitted at Build"). Replayed on Locary's drain, the backlog drains in 67 hours instead of 192.
 - S5 and S12: a ticket a person works with neither a pull request nor a `zone:` label is not counted in flight, and is warned of in `owlshift why` and by an event. Holding the whole repository for it would stop the drain whenever a person works a ticket by hand.
 - S6: the configurable cap on concurrent runs is built (`concurrent_runs`, and `policy.max_in_flight` per project); the digest stays P7's.
 - S10: the usage part is built, a harness paused until its reset, checked before each run, the operator notified once per limit. "Its roles switch to their declared fallback" holds for the review roles only, as S17 below.
-- S16: machine-wide caps on concurrent runs and on each subscription's usage are built; an idle project costs nothing, as from P3. Priorities compared across projects wait for P7's single runner: the first watch to take a free slot runs. Port ranges and the browser slot come with browser QA.
+- S16: machine-wide caps on concurrent runs and on each subscription's usage are built; an idle project costs nothing, as from P3. Priorities compared across projects wait for a single runner, which P7 does not build (OWL-432): the first watch to take a free slot runs. Port ranges and the browser slot come with browser QA.
 - S17's fallback part: a declared fallback harness takes over Design review's and Verify's reviewers only. The authoring roles stay on Claude Code (D4) and wait for the reset, and so do the arbiter, the resolver, intake and the answer check.
 - Browser QA, which P5 left here, and port ranges are a later step of their own: P6's gate is about collisions, and browser QA is a role with its own tooling. `Resource::Browser` stays modelled and untaken.
 - Path-scoped rules, which the build plan tied to zones at intake: zones arrive, but injecting a project's rules per zone needs a project-file key and brief changes no collision depends on, so they are left for a later ticket.
-- Claims with leases on git refs stay P7's, as that step says: on one machine, a lock per ticket keeps two commands off one ticket.
+- Claims with leases on git refs stay P7's, as that step says: on one machine, a lock per ticket keeps two commands off one ticket. P7's readings move them to P10 (OWL-432).
 
 **Exit gate.** A week on Locary with three concurrent tickets and no collision. Judged on outcomes ([build plan](build-plan.md), "P6 tasks & exit gate"): no file changed by two Owlshift pull requests in flight together, no rebase run caused by a sibling's merge on the same files, no isolation breach caused by a sibling step; the week's throughput and cost are compared with a `/parallel` lot of like size. Shortened on 2026-10-23 (OWL-408) by the maintainer from a week to the 2.9 days run, three tickets or more in flight on two of them: 23 pull requests merged with no collision settled what the gate checks. Passed on 2026-10-23; the runs are recorded in the [build plan](build-plan.md) ("P6 tasks & exit gate").
 
@@ -152,8 +152,19 @@ Owlshift replaces `/parallel` on Locary.
 Set it and forget it.
 
 - `start --at-login`, `stop`, `uninstall` with its manifest, `doctor` cleanup, self-healing launcher, single instance.
-- Claims with leases on git refs, recovery after sleep or crash, keep-awake, notifier adapter and daily digest, `self-update`. Scenario S11.
+- Recovery after sleep or a stop, keep-awake, `pause`, `resume` and `status`, the daily digest. Scenario S11.
 - Merge on green, opt-in per project (decision D14, [architecture](architecture.md) section 5, "Merge on green"). Scenario S18. Not part of P7's exit gate: it is a Watch feature placed here because P7 is the next step built, and the gate stays about running unattended.
+- The rules are [architecture](architecture.md) section 5, "The background service" (OWL-432), and [runtime and operations](runtime-and-operations.md), "How it runs" and "Install, lifecycle & uninstall"; the [build plan](build-plan.md), "P7 · Background service", says who builds what and how the exit gate is run.
+
+**Readings and deviations** (OWL-432, decided with the maintainer on 2026-10-23).
+
+- A supervisor, not a single runner: `owlshift daemon` holds what one process per machine must hold (one instance, the service to install and remove, the digest) and runs one `owlshift watch --drain` per served project as its child, P6's runtime unchanged. The single runner that compares two projects' priorities is not built: S16's priorities stay P6's reading, the first watch to take a free slot runs.
+- S11: a stop by the service manager (a logout, a shutdown, `launchctl bootout`, `systemctl --user stop`) is a checked stop: each step's runs are stopped and their isolation checked before the watch exits, so the ticket resumes from its checkpoint at the next start. A crash, a hard kill or a power loss still leaves the run unchecked, which stays the quarantine of section 8, notified: a deviation from S11's "nothing is lost", which the exit gate measures. Checking such a run afterwards, from a persisted snapshot, is left for a later ticket if the gate shows it is needed.
+- S11's claims with leases on git refs move to P10: on one machine P6's ticket locks keep a ticket to one runner, and a lease only matters between runners.
+- `self-update` moves to P9, which makes the first signed release; P7 restarts onto a binary the package manager replaced.
+- The notifier adapter keeps the desktop channel of P2 alone; the daily digest is one notification that points to `owlshift status`. Other channels come later.
+- No control channel: `pause`, `stop` and the upgrade's drain are files the watches read at each pass, `status` reads the files P6 already keeps. The local API arrives with the web UI (P8).
+- A served project's configuration is read from its default branch in Owlshift's own clone, as its gate and rules already are; a watch typed in a terminal keeps reading the checkout it runs in.
 
 **Exit gate.** Seven days unattended with no double dispatch.
 
@@ -167,12 +178,13 @@ The overview, ticket, orchestrator and configuration screens described in [runti
 
 - GitHub Issues adapter, public Markdown tracker, conformance suites, `init` stack detection. Scenario S15.
 - A second project on another stack (decision D6); the Docker server image; signed release 0.1; the repository made public.
+- `owlshift self-update`, for an install made without a package manager (P7's reading).
 
 **Exit gate.** The second project adopts Owlshift with configuration only, no change to the core.
 
 ## P10 · Teams
 
-Deciders, identity map across tracker and forge, per-developer runners, team-server mode, agent identities (Linear app user, GitHub App). Scenario S14.
+Deciders, identity map across tracker and forge, per-developer runners, team-server mode, agent identities (Linear app user, GitHub App), claims with leases on git refs and the takeover of an expired one (S11's part, P7's reading). Scenario S14.
 
 **Exit gate.** Two developers share one project for two weeks.
 
@@ -192,6 +204,6 @@ A Tauri 2 shell around the P8 UI: tray icon, native notifications, login item, a
 | S3, S4, S6, S12, S13 | P4 |
 | S8 | P5 |
 | S5, S10, S16, S17 | P6 (S17's fallback for the review roles only; S5's browser slot, S16's ports and priorities across projects later: P6's readings) |
-| S11, S18 | P7 (S18 outside P7's exit gate) |
+| S11, S18 | P7 (S18 outside P7's exit gate; claims and leases in P10, a run cut by a crash checked later: P7's readings) |
 | S15 | P9 |
 | S14 | P10 |
