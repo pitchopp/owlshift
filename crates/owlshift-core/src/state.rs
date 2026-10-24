@@ -2,8 +2,9 @@
 //! each event does to it.
 //!
 //! A ticket is working a stage, waiting for its decider's input, or parked
-//! until a human restarts it. It leaves the machine when a human merges its
-//! pull request or withdraws it. [`TicketState::apply`] is the only way to
+//! until a human restarts it. It leaves the machine when its pull request is
+//! merged, by a human or, on a project that opted in, by the runner's merge
+//! on green (D14), or when it is withdrawn. [`TicketState::apply`] is the only way to
 //! move: an event that does not fit the current state is an error, never
 //! silently ignored.
 

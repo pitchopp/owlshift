@@ -149,17 +149,76 @@
       "description": "The forge and how Owlshift reads it (OWL-300).",
       "type": "object",
       "properties": {
+        "merge": {
+          "description": "Which pull requests the runner merges once green (D14): `never`, the\ndefault, `labeled` (a ticket carrying `owlshift:merge`) or `all`.\nRead at the base branch's head, so a ticket's own branch cannot turn\nit on; the personal file cannot set it.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/MergeSwitch"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "merge_method": {
+          "description": "How the runner merges: `squash`, the default, `merge` or `rebase`.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/MergeMethod"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "reviewers": {
-          "description": "The forge logins whose reviews on Owlshift's pull requests are read,\neach written exactly and mapped to its tracker account's identifier,\nwritten as a zone's owner is. A review is an instruction when that\naccount is the ticket's decider, and context otherwise; anyone\nelse's review is ignored. At least one, no login listed twice, even\nin another case.",
+          "description": "The forge logins whose reviews on Owlshift's pull requests are read,\neach written exactly and mapped to its tracker account's identifier,\nwritten as a zone's owner is. A review is an instruction when that\naccount is the ticket's decider, and context otherwise; anyone\nelse's review is ignored. No login listed twice, even in another\ncase. Absent or empty, no review is read; a `[forge]` table sets it\nor `merge`.",
           "type": "object",
           "additionalProperties": {
             "type": "string"
           }
         }
       },
-      "additionalProperties": false,
-      "required": [
-        "reviewers"
+      "additionalProperties": false
+    },
+    "MergeMethod": {
+      "description": "How the runner merges a pull request (`[forge] merge_method`).",
+      "oneOf": [
+        {
+          "description": "One commit on the base. The default.",
+          "type": "string",
+          "const": "squash"
+        },
+        {
+          "description": "A merge commit.",
+          "type": "string",
+          "const": "merge"
+        },
+        {
+          "description": "The head's commits replayed on the base.",
+          "type": "string",
+          "const": "rebase"
+        }
+      ]
+    },
+    "MergeSwitch": {
+      "description": "Which pull requests the runner merges once green (`[forge] merge`, D14,\narchitecture section 5, \"Merge on green\"), read at the base branch's head.",
+      "oneOf": [
+        {
+          "description": "None: a human merges. The default.",
+          "type": "string",
+          "const": "never"
+        },
+        {
+          "description": "Only a ticket carrying the tracker label `owlshift:merge`\n([`crate::follow::MERGE_LABEL`]).",
+          "type": "string",
+          "const": "labeled"
+        },
+        {
+          "description": "Every ticket watch follows.",
+          "type": "string",
+          "const": "all"
+        }
       ]
     },
     "Models": {

@@ -7,11 +7,12 @@ use std::fs;
 use std::path::PathBuf;
 
 use owlshift_contracts::brief::Brief;
-use owlshift_contracts::config::{FindingsConfirmation, ProjectConfig};
+use owlshift_contracts::config::{FindingsConfirmation, PersonalConfig, ProjectConfig};
 use owlshift_contracts::drain::TicketProposals;
 use owlshift_contracts::refs::{PushKind, TicketDelivery, TicketQuestions};
 use owlshift_contracts::result::RunResult;
 use owlshift_contracts::review::TicketReview;
+use owlshift_core::vocab::{MergeMethod, MergeSwitch};
 use serde_json::{Value, json};
 
 fn fixture(name: &str) -> String {
@@ -1057,6 +1058,35 @@ fn findings_and_forge_keys_are_read_and_checked() {
     let reviewers = &forge.forge.as_ref().unwrap().reviewers;
     assert_eq!(reviewers.get("Octo-Cat").map(String::as_str), Some("u-bob"));
     assert_eq!(ProjectConfig::parse(&forge.render()).unwrap(), forge);
+    let forge = forge.forge.unwrap();
+    assert_eq!(
+        (forge.merge(), forge.merge_method()),
+        (MergeSwitch::Never, MergeMethod::Squash)
+    );
+
+    // D14: merge on green, set alone or beside the reviewers.
+    for (table, switch, method) in [
+        ("merge = \"all\"\n", MergeSwitch::All, MergeMethod::Squash),
+        (
+            "merge = \"labeled\"\nmerge_method = \"rebase\"\nreviewers = { ada = \"u-ann\" }\n",
+            MergeSwitch::Labeled,
+            MergeMethod::Rebase,
+        ),
+        (
+            "merge = \"never\"\nmerge_method = \"merge\"\n",
+            MergeSwitch::Never,
+            MergeMethod::Merge,
+        ),
+    ] {
+        let parsed = ProjectConfig::parse(&with("", &format!("\n[forge]\n{table}"))).unwrap();
+        let forge = parsed.forge.as_ref().unwrap();
+        assert_eq!(
+            (forge.merge(), forge.merge_method()),
+            (switch, method),
+            "{table}"
+        );
+        assert_eq!(ProjectConfig::parse(&parsed.render()).unwrap(), parsed);
+    }
 
     for (case, text, reason) in [
         (
@@ -1070,9 +1100,27 @@ fn findings_and_forge_keys_are_read_and_checked() {
             "lists no reviewer",
         ),
         (
-            "no reviewers key",
+            "an empty forge table",
             with("", "\n[forge]\n"),
-            "missing field `reviewers`",
+            "lists no reviewer and forge.merge is not set",
+        ),
+        (
+            "a merge method alone",
+            with("", "\n[forge]\nmerge_method = \"merge\"\n"),
+            "lists no reviewer and forge.merge is not set",
+        ),
+        (
+            "an unknown merge switch",
+            with("", "\n[forge]\nmerge = \"always\"\n"),
+            "unknown variant `always`, expected one of `never`, `labeled`, `all`",
+        ),
+        (
+            "an unknown merge method",
+            with(
+                "",
+                "\n[forge]\nmerge = \"all\"\nmerge_method = \"fast-forward\"\n",
+            ),
+            "unknown variant `fast-forward`, expected one of `squash`, `merge`, `rebase`",
         ),
         (
             "a padded account",
@@ -1103,5 +1151,18 @@ fn findings_and_forge_keys_are_read_and_checked() {
     ] {
         let error = ProjectConfig::parse(&text).unwrap_err().to_string();
         assert!(error.contains(reason), "{case}: {error}");
+    }
+
+    // The personal file cannot set or loosen merge on green (D14).
+    let personal = fixture("personal.toml");
+    assert!(PersonalConfig::parse(&personal).is_ok());
+    for table in ["\n[forge]\nmerge = \"all\"\n", "merge = \"all\"\n"] {
+        let text = if table.starts_with('\n') {
+            format!("{personal}{table}")
+        } else {
+            format!("{table}{personal}")
+        };
+        let error = PersonalConfig::parse(&text).unwrap_err().to_string();
+        assert!(error.contains("unknown field"), "{table}: {error}");
     }
 }
