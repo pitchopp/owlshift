@@ -490,7 +490,7 @@ impl Watch<'_> {
                 continue;
             }
             let outside = memory.outside.current();
-            self.dispatch(
+            let started = self.dispatch(
                 memory,
                 row.id(),
                 stored.at(),
@@ -499,6 +499,21 @@ impl Watch<'_> {
                 out,
                 continued,
             );
+            // Each dispatch gives the tickets held for their base a turn,
+            // taken at the next pass before any other dispatch (OWL-431):
+            // a fix that landed is checked within one dispatch.
+            if started {
+                let held: Vec<TicketId> = memory
+                    .base_held
+                    .iter()
+                    .filter(|held| *held != row.id())
+                    .cloned()
+                    .collect();
+                if !held.is_empty() {
+                    memory.base_turn.extend(held);
+                    return;
+                }
+            }
         }
     }
 
@@ -614,7 +629,7 @@ impl Watch<'_> {
 
     /// The dispatch of `ticket`, its ref at `at`, held as a continue is, its
     /// admission weighing `outside`, the work outside Owlshift this pass
-    /// read (OWL-401).
+    /// read (OWL-401). Returns whether its step started or ran.
     #[allow(clippy::too_many_arguments)]
     fn dispatch(
         &self,
@@ -625,7 +640,7 @@ impl Watch<'_> {
         sink: &mut EventSink<'_>,
         out: &mut dyn Write,
         continued: &mut Continued<'_>,
-    ) {
+    ) -> bool {
         let on_demand = self.on_demand;
         let seen = Seen::at(at, None);
         // A dispatch's first run, Design or Build, an authoring role's on
@@ -633,11 +648,12 @@ impl Watch<'_> {
         if memory.holds.admit(ticket, &seen, (on_demand.clock)()) != Admit::Go
             || self.usage_waits(memory, sink, out, Some(Role::Build))
         {
-            return;
+            return false;
         }
         let envelope = self.envelope(memory, ticket, StepKind::Dispatch, &seen);
         let then = Then::Dispatch { seen };
-        self.step(memory, sink, out, continued, envelope, None, outside, then);
+        self.step(memory, sink, out, continued, envelope, None, outside, then)
+            .is_none_or(|end| super::running::ran(&end))
     }
 
     /// What a dispatch that ended `end` left: the open pull requests' cap
