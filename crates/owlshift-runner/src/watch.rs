@@ -547,6 +547,11 @@ struct Memory<'c> {
     /// to start or past [`BASE_DUE_AT_MOST`]: not given it again from
     /// `base.json` until a step of theirs has run.
     base_due_given_up: BTreeSet<TicketId>,
+    /// The tickets whose last step ended held for their base (OWL-431).
+    base_held: BTreeSet<TicketId>,
+    /// Those a drain's dispatch gave a turn: each one's retry hold is
+    /// lifted until a step of its own starts (OWL-431).
+    base_turn: BTreeSet<TicketId>,
 }
 
 /// Why a ticket's next stage step waits, as told once.
@@ -889,6 +894,8 @@ impl Watch<'_> {
         // keeps it until it reads or its step ends.
         let kept = [&holding[..], &followed[..], &unread[..], &busy[..]].concat();
         memory.wait_comments.retain(&mut self.board(sink), &kept);
+        memory.base_held.retain(|ticket| kept.contains(ticket));
+        memory.base_turn.retain(|ticket| kept.contains(ticket));
         self.note(
             memory,
             out,
@@ -2097,8 +2104,19 @@ impl Watch<'_> {
             }
         }
         let seen = Seen::at(at, None);
+        // Another ticket's check holds the priority: one held for its base
+        // waits for it as it is, its turn kept (OWL-431).
+        if memory.base_held.contains(ticket)
+            && memory
+                .base_due
+                .as_ref()
+                .is_some_and(|(due, _)| due != ticket)
+        {
+            return;
+        }
         // A hold on its base lifted, or its check due with no other step in
-        // flight: the ticket goes at once (OWL-418).
+        // flight, or a turn a drain's dispatch gave it: the ticket goes at
+        // once (OWL-418, OWL-431).
         if self.base_released(memory, ticket) {
             memory.holds.release(ticket);
         }
@@ -2415,6 +2433,18 @@ impl Watch<'_> {
         if memory.waits.get(ticket) == Some(&told) {
             return;
         }
+        // A held commit whose check again waits (OWL-431) is told as held:
+        // the step's end says only that a check waits.
+        let pending = pending
+            && !base::read(self.on_demand.dirs).is_ok_and(|checks| {
+                checks.checks.iter().any(|check| {
+                    check.commit == commit
+                        && matches!(
+                            check.entry,
+                            owlshift_core::base::Entry::Checked { hold: Some(_), .. }
+                        )
+                })
+            });
         let event = data([
             ("commit", json!(commit)),
             ("command", json!(command)),
@@ -2451,7 +2481,8 @@ impl Watch<'_> {
 
     /// Whether `ticket`'s hold is to be lifted for its base (OWL-418): the
     /// commit its Build waited for no longer holds it, or its check is due
-    /// and no other step is in flight.
+    /// and no other step is in flight, or a drain's dispatch gave it a turn
+    /// (OWL-431).
     fn base_released(&self, memory: &Memory, ticket: &TicketId) -> bool {
         if memory
             .base_due
@@ -2459,6 +2490,9 @@ impl Watch<'_> {
             .is_some_and(|(due, _)| due == ticket)
             && memory.running.is_empty()
         {
+            return true;
+        }
+        if memory.base_turn.contains(ticket) {
             return true;
         }
         match memory.waits.get(ticket) {
@@ -2977,6 +3011,7 @@ mod tests {
             commit: "c".repeat(40),
             command: Some("sh setup.sh".to_owned()),
             pending: false,
+            due: false,
         });
         assert_eq!(
             holds.after(&one, seen("c1", 0), &end(held), Some(&p("c1")), at(1)),

@@ -285,11 +285,14 @@ pub fn end(stepped: &Stepped) -> StepEnd {
             commit,
             command,
             pending,
+            due,
             ..
         } => StepEnd::BaseHeld {
             commit: commit.clone(),
             command: command.clone(),
-            pending: *pending,
+            // Any check that waits for the other steps gets watch's
+            // priority (OWL-431).
+            pending: *pending || *due,
         },
         Stop::NotKept { landed, .. } => StepEnd::NotKept {
             landed: landed_kind(*landed),

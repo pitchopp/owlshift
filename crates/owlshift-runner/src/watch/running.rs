@@ -29,6 +29,13 @@ use crate::step::{self, Running};
 /// two passes.
 const CHILD_POLL: Duration = Duration::from_millis(100);
 
+/// Whether a step that ended `end` ran: neither another command nor watch's
+/// own priority held it back, a run slot was free, and its ref had not
+/// moved.
+pub(super) fn ran(end: &StepEnd) -> bool {
+    !matches!(end, StepEnd::Busy | StepEnd::NoSlot | StepEnd::Stale)
+}
+
 /// What follows a step's end: the code that followed each step while watch
 /// waited for it, kept with the step's child until it ends (OWL-401).
 pub(super) enum Then {
@@ -106,6 +113,9 @@ impl Watch<'_> {
             self.finish(memory, sink, out, &ticket, then, &end);
             return Some(end);
         }
+        // A step of its own starts: a turn a dispatch gave it is taken
+        // (OWL-431), unless no run slot is free below.
+        let turn = memory.base_turn.remove(&ticket);
         let Some(children) = memory.children else {
             let stepped = step::run(
                 on_demand,
@@ -131,6 +141,9 @@ impl Watch<'_> {
             .slots()
             .is_some_and(|slots| slots.full().unwrap_or(false))
         {
+            if turn {
+                memory.base_turn.insert(ticket.clone());
+            }
             let end = StepEnd::NoSlot;
             self.finish(memory, sink, out, &ticket, then, &end);
             return Some(end);
@@ -208,21 +221,31 @@ impl Watch<'_> {
     ) {
         // A check due that could not run beside other steps holds them back
         // until this ticket's next step has run (OWL-418).
-        let ran = !matches!(end, StepEnd::Busy | StepEnd::NoSlot | StepEnd::Stale);
+        let ran = ran(end);
         if ran {
             memory.base_due_given_up.remove(ticket);
         }
-        if ran
-            && memory
-                .base_due
-                .as_ref()
-                .is_some_and(|(due, _)| due == ticket)
-        {
+        // Since when this ticket's check has been due, kept across its steps
+        // that find it due still, so that the priority ends after
+        // [`super::BASE_DUE_AT_MOST`] (OWL-431).
+        let since = memory
+            .base_due
+            .as_ref()
+            .filter(|(due, _)| due == ticket)
+            .map(|(_, since)| *since);
+        if ran && since.is_some() {
             memory.base_due_ran += 1;
             memory.base_due = None;
         }
         if let StepEnd::BaseHeld { pending: true, .. } = end {
-            memory.base_due = Some((ticket.clone(), (self.on_demand.clock)()));
+            let since = since.unwrap_or_else(|| (self.on_demand.clock)());
+            memory.base_due = Some((ticket.clone(), since));
+        }
+        // Which tickets a drain's dispatch gives a turn (OWL-431).
+        if matches!(end, StepEnd::BaseHeld { .. }) {
+            memory.base_held.insert(ticket.clone());
+        } else if ran {
+            memory.base_held.remove(ticket);
         }
         match then {
             Then::Held { seen } => self.held_after(memory, sink, out, ticket, seen, end),

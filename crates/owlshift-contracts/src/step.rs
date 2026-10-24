@@ -202,8 +202,10 @@ pub enum StepEnd {
         resets_at: Option<Timestamp>,
     },
     /// A Build held for its base (OWL-418): `commit`, the commit it is
-    /// configured at, fails `command` in a fresh worktree too, or its check
-    /// is `pending`, waiting for the other steps in flight. Format 4.
+    /// configured at, fails `command` in a fresh worktree too, or a check is
+    /// `pending`, waiting for the other steps in flight: its first check, its
+    /// check again, or the default branch's newer head's (OWL-431), each of
+    /// which watch gives its priority. Format 4.
     BaseHeld {
         commit: String,
         #[serde(default)]
