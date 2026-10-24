@@ -504,7 +504,8 @@ fn the_design_roles_rules_reach_their_own_briefs() {
 
 /// Without `pipeline.findings` (the default, OWL-391): no arbiter runs; the next design run
 /// answers every finding, a result that leaves one unanswered being refused
-/// as a failed run, and its rejection is kept and shown.
+/// as a failed run, whose retry is told why (OWL-430), and its rejection is
+/// kept and shown.
 #[test]
 fn the_author_answers_every_finding_and_its_rejection_is_kept() {
     let bench = Bench::of("standard");
@@ -547,6 +548,15 @@ fn the_author_answers_every_finding_and_its_rejection_is_kept() {
     );
     let ended = data_of(&bench.events(), EventKind::RunEnded, "outcome");
     assert_eq!(ended[3]["outcome"], "failed", "{:?}", ended[3]);
+    // LOC-1436's case (OWL-430): the retry is told why, the refused run
+    // was not.
+    assert_eq!(briefs[3].result_refusal, None);
+    let told = briefs[4].result_refusal.as_deref().unwrap_or_default();
+    assert!(
+        told.contains("finding_responses") && told.contains("F1"),
+        "{told}"
+    );
+    assert_eq!(briefs[5].result_refusal, None, "the reviewer after it");
     let review = bench.record().review.unwrap();
     let kept = &review.passes[0].findings[0];
     assert_eq!(
@@ -1416,6 +1426,138 @@ fn a_reviewer_failing_twice_parks_the_ticket_at_design_review() {
         (Stage::DesignReview, Some(Waiting::Parked))
     );
     assert!(record.plan.is_some(), "the plan is kept for the restart");
+}
+
+/// A review run's `done` that carries a field no result takes: refused.
+const UNKNOWN_FIELD_REVIEW: &str =
+    r#"{"format":14,"status":"done","summary":"Reviewed.","verdict":"clean"}"#;
+
+/// The reasons the briefs of `bench`'s runs carried, oldest first.
+fn told(bench: &Bench) -> Vec<Option<String>> {
+    bench
+        .briefs()
+        .into_iter()
+        .map(|brief| brief.result_refusal)
+        .collect()
+}
+
+/// OWL-430: a design revision refused at the stage's last attempt, untold,
+/// does not park the ticket (`result_refused`); its retry, told why, and
+/// refused again, parks it as any failed run. A failed run between gives the
+/// next brief nothing to tell.
+#[test]
+fn a_refused_revision_never_spends_the_last_attempt_and_its_told_retry_parks() {
+    let bench = Bench::of("standard");
+    let unanswered =
+        format!(r#"{{"format":14,"status":"done","summary":"Revised.","plan":{REVISED}}}"#);
+    let replies = vec![
+        bench.read(&designed(PLAN)),
+        bench.read(&reviewed(&[(
+            "major",
+            "GREETING.md needs a licence header.",
+        )])),
+        bench.read(&reviewed(&[])),
+        bench.read(&ruled(&["confirmed"])),
+        // A failed revision: the stage's one failed run.
+        bench.read(FAILED),
+        // No answer to F1, untold: freed at the last attempt.
+        bench.read(&unanswered),
+        // The same, told: a failed run, which parks.
+        bench.read(&unanswered),
+    ];
+    let (outcome, printed) = bench.run(replies, None);
+    assert!(
+        matches!(
+            &outcome,
+            Err(Stop::Parked {
+                reason: ParkReason::FailedRuns,
+                ..
+            })
+        ),
+        "{outcome:?}\n{printed}"
+    );
+    let record = bench.record();
+    assert_eq!(
+        (record.state.stage, record.state.waiting),
+        (Stage::Design, Some(Waiting::Parked))
+    );
+    let told = told(&bench);
+    assert_eq!(told.len(), 7, "{printed}");
+    assert!(told[..6].iter().all(Option::is_none), "{told:?}");
+    let reason = told[6].as_deref().unwrap();
+    assert!(
+        reason.contains("finding_responses") && reason.contains("F1"),
+        "{reason}"
+    );
+}
+
+/// OWL-430: a Design review seat whose result is refused after a failed run
+/// does not park the ticket; its next run, told why, gives the review, and
+/// the next seat is told nothing.
+#[test]
+fn a_refused_reviewer_is_told_why_and_never_spends_the_last_attempt() {
+    let bench = Bench::of("standard");
+    let replies = vec![
+        bench.read(&designed(PLAN)),
+        bench.read(FAILED),
+        bench.read(UNKNOWN_FIELD_REVIEW),
+        bench.read(&reviewed(&[])),
+        bench.read(&reviewed(&[])),
+        bench.built(),
+    ];
+    let (outcome, printed) = bench.run(replies, None);
+    outcome.unwrap_or_else(|stop| panic!("{stop}\n{printed}"));
+    let told = told(&bench);
+    assert_eq!(
+        bench.roles()[..5],
+        [
+            Role::Design,
+            Role::DesignReview,
+            Role::DesignReview,
+            Role::DesignReview,
+            Role::DesignReview
+        ]
+    );
+    assert_eq!(told[..3], [None, None, None], "{told:?}");
+    assert!(told[3].as_deref().unwrap().contains("verdict"), "{told:?}");
+    assert_eq!(told[4], None, "the next seat");
+}
+
+/// OWL-430: a Verify seat refused at the stage's last attempt does not park
+/// the ticket; told why and refused again, it parks it at Verify.
+#[test]
+fn a_verifier_refused_again_once_told_parks_the_ticket() {
+    let bench = Bench::of("standard");
+    bench.verify_plays.set(true);
+    let replies = vec![
+        bench.read(&designed(PLAN)),
+        bench.read(&reviewed(&[])),
+        bench.read(&reviewed(&[])),
+        bench.built(),
+        bench.read(FAILED),
+        bench.read(UNKNOWN_FIELD_REVIEW),
+        bench.read(UNKNOWN_FIELD_REVIEW),
+    ];
+    let (outcome, printed) = bench.run(replies, None);
+    assert!(
+        matches!(
+            &outcome,
+            Err(Stop::Parked {
+                reason: ParkReason::FailedRuns,
+                ..
+            })
+        ),
+        "{outcome:?}\n{printed}"
+    );
+    let record = bench.record();
+    assert_eq!(
+        (record.state.stage, record.state.waiting),
+        (Stage::Verify, Some(Waiting::Parked))
+    );
+    let told = told(&bench);
+    assert_eq!(bench.roles()[4..], [Role::Verify; 3]);
+    assert_eq!(told[4..6], [None, None], "{told:?}");
+    assert!(told[6].as_deref().unwrap().contains("verdict"), "{told:?}");
 }
 
 /// A design run that finds the premise false and asks (OWL-306, S8): its

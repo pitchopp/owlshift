@@ -268,16 +268,17 @@ pub fn core_event(outcome: &Outcome) -> (Event, Option<&RunResult>) {
 
 /// The core event of a stage run's outcome, given the brief it ran with, for
 /// `owlshift do` and the scenarios' stand-in driver alike: as [`core_event`],
-/// except that a Build run whose refusal is freed ([`freed_refusal`]) is
-/// [`Event::ResultRefused`] (OWL-183). Its count never parks the ticket,
-/// since the next Build run is told why; a run that was told and fails is a
-/// plain failed run, so refusals never loop. Likewise a Build run whose gate
+/// except that a run of a role whose retries are told ([`told_retry`]) and
+/// whose refusal is freed ([`freed_refusal`]) is [`Event::ResultRefused`]
+/// (OWL-183, OWL-430). Its count never parks the ticket, since the next run
+/// of its kind is told why; a run that was told and fails is a plain failed
+/// run, so refusals never loop. Likewise a Build run whose gate
 /// was refused for uncommitted changes before any command, untold of such a
 /// refusal by its brief's `gate_failure`, is [`Event::UncommittedGate`]
 /// (OWL-421), which keeps the count: of two in a row, the second counts.
 pub fn stage_event<'a>(outcome: &'a Outcome, brief: &Brief) -> (Event, Option<&'a RunResult>) {
     use crate::executor::gate::refused_uncommitted;
-    if brief.role == Role::Build && freed_refusal(outcome, brief) {
+    if told_retry(brief.role) && freed_refusal(outcome, brief) {
         return (Event::ResultRefused, None);
     }
     if brief.role == Role::Build
@@ -294,12 +295,31 @@ pub fn stage_event<'a>(outcome: &'a Outcome, brief: &Brief) -> (Event, Option<&'
 /// ([`Event::ResultRefused`]): its result was refused ([`result_refusal`]),
 /// so the next run is told why, and its own brief told it of no earlier
 /// refusal, so of two refusals in a row the second counts. Build
-/// ([`stage_event`], OWL-183) and the answer check
+/// ([`stage_event`], OWL-183), the design role and the review stages' roles
+/// (OWL-430, [`told_retry`]) and the answer check
 /// ([`crate::answer_check::event`], OWL-190) free theirs; the resolver's
 /// refusal is a fallback, not a failed run, so it frees nothing, told
 /// (OWL-191) or not.
 pub fn freed_refusal(outcome: &Outcome, brief: &Brief) -> bool {
     brief.result_refusal.is_none() && result_refusal(outcome).is_some()
+}
+
+/// Whether a stage run of `role` is retried told why its predecessor's
+/// result was refused, so that [`stage_event`] frees its refusal: Build,
+/// whose next run is told from the ticket ref ([`tell_build`], OWL-192);
+/// the design role and the review stages' roles, design review, verify and
+/// the arbiter, whose next run in the same retry loop is told
+/// (`OnDemand::design_run` and `OnDemand::review_run`, OWL-430). Every
+/// role is listed, so that a new one takes a side. The answer check frees
+/// its own ([`crate::answer_check::event`]); the resolver's refusal is a
+/// fallback, never retried as such (OWL-191); intake's next run is told
+/// (OWL-402) but not freed, its stage being outside the core's
+/// [`Event::ResultRefused`]; the rebase role is told nothing.
+pub fn told_retry(role: Role) -> bool {
+    match role {
+        Role::Build | Role::Design | Role::DesignReview | Role::Verify | Role::Arbiter => true,
+        Role::Intake | Role::Resolver | Role::AnswerCheck | Role::Rebase => false,
+    }
 }
 
 /// What the next run is told of a run's outcome: why its `result.json`, or
@@ -310,7 +330,9 @@ pub fn freed_refusal(outcome: &Outcome, brief: &Brief) -> bool {
 /// outcome. The next Build run gets it from the ticket ref, whatever command
 /// runs it ([`build_refusal_after`], OWL-180 and OWL-192); the next answer
 /// check on the same ask, from the ticket ref too (OWL-184); the next
-/// resolver run, likewise ([`resolver::refusal_after`], OWL-191). A result or an
+/// resolver run, likewise ([`resolver::refusal_after`], OWL-191); the next
+/// intake run of the command (OWL-402), and the next design run or review
+/// seat's run of the same retry loop (OWL-430), from the command's memory. A result or an
 /// artifact holding the harness's login is a credential failure, never a
 /// refusal, so the reason never quotes it.
 pub fn result_refusal(outcome: &Outcome) -> Option<String> {

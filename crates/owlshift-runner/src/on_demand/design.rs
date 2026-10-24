@@ -1172,6 +1172,10 @@ impl OnDemand<'_> {
     /// stage's failed-run bound parks the ticket. A run that asks or finds
     /// a false premise is a failed one: these roles ask nothing. A usage
     /// limit stops the command; `state` keeps what the failures counted.
+    /// A run whose result was refused tells the seat's next run why
+    /// (`result_refusal`, OWL-430), kept nowhere else, and an untold
+    /// refusal never spends the stage's last attempt
+    /// ([`Event::ResultRefused`]).
     fn review_run(
         &self,
         p: &mut Prepared,
@@ -1181,23 +1185,28 @@ impl OnDemand<'_> {
         sink: &mut EventSink<'_>,
     ) -> Result<(Ran, RunResult), Stop> {
         let mut attempt = 0u32;
+        let mut brief = brief.clone();
         loop {
             attempt += 1;
             let (ran, event) = self.run_role_once(
                 p,
                 (harness, &[]),
                 state,
-                brief,
+                &brief,
                 attempt,
                 &mut Gathered::default(),
                 sink,
             )?;
+            brief.result_refusal = result_refusal(&ran.report.outcome);
             let event = match (event, ran.result()) {
                 (Event::Completed, Some(result)) => {
                     let result = result.clone();
                     return Ok((ran, result));
                 }
-                (Event::Interrupted | Event::Quarantined | Event::Blocked, _) => event,
+                (
+                    Event::Interrupted | Event::Quarantined | Event::Blocked | Event::ResultRefused,
+                    _,
+                ) => event,
                 _ => Event::RunFailed,
             };
             self.review_run_failed(p, state, event, &ran, sink)?;
@@ -1272,6 +1281,8 @@ impl OnDemand<'_> {
                 }
                 Ok(Err(error)) => return Err(refused("the run could not start", error)),
             };
+        // A refused result may read as `ResultRefused` (OWL-430): never
+        // applied, as the seat is dropped, never retried or told.
         let event = if ran.breaches.is_empty() {
             stage_event(&ran.report.outcome, brief).0
         } else {
@@ -1295,7 +1306,10 @@ impl OnDemand<'_> {
     /// Runs the design role at Design until its plan is kept, an approval is
     /// recorded, or it stops: a failed run gets one more before the core
     /// parks the ticket; questions go through the resolver, all decided,
-    /// it runs again, else a round opens.
+    /// it runs again, else a round opens. A run whose result was refused
+    /// tells the next one why (`result_refusal`, OWL-430), kept nowhere
+    /// else, as intake's loop does (OWL-402), and an untold refusal never
+    /// spends the stage's last attempt ([`Event::ResultRefused`]).
     fn design_run(
         &self,
         p: &mut Prepared,
@@ -1309,6 +1323,10 @@ impl OnDemand<'_> {
         let harness = self.design.harness(routing);
         let confirmation = self.config.pipeline.findings();
         let mut attempt = 0u32;
+        // Why the previous run of this loop was refused, which the next one
+        // is told (OWL-430), so that a missing answer to a finding is not
+        // missed again before the ticket parks.
+        let mut told: Option<String> = None;
         loop {
             attempt += 1;
             let required = p.plan.as_ref().is_some_and(|kept| {
@@ -1334,6 +1352,7 @@ impl OnDemand<'_> {
             brief.plan = kept_plan(p);
             brief.approval = input.approval && brief.plan.is_some();
             brief.findings = input.findings.filter(|_| brief.plan.is_some());
+            brief.result_refusal = told.take();
             let (ran, event) = self.run_role_once(
                 p,
                 (&*harness, &[]),
@@ -1343,6 +1362,7 @@ impl OnDemand<'_> {
                 &mut Gathered::default(),
                 sink,
             )?;
+            told = result_refusal(&ran.report.outcome);
             // A last revision that asks is no longer the last alone: the
             // round buys a reviewed pass, as after Verify's last fix
             // (OWL-356, OWL-377).

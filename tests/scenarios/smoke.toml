@@ -7,7 +7,8 @@ delay (an interruption, not a failure), a crash (failure 1 of 2), a question
 round answered by the decider, as the answer check finds and a RESUME restates,
 the build committed
 and pushed, an invalid
-result at Verify (failure 1 of 2 there), then Verify done."""
+result at Verify (a refusal, counted as failure 1 of 2 there, OWL-430), then
+Verify done, told why the result before it was refused."""
 ticket = "DEMO-1"
 start = "2026-09-28T09:00:00Z"
 
@@ -75,8 +76,8 @@ branch_files = { "GREETING.md" = "Hello, reader.\n" }
 
 [[step]]
 run = { result = "results/invalid.json" }
-expect = { event = "run_failed", stage = "verify", failed_runs = 1 }
+expect = { event = "result_refused", stage = "verify", failed_runs = 1, brief_result_refusal = "none" }
 
 [[step]]
 run = { result = "results/verify-done.json" }
-expect = { event = "completed", stage = "deliver", waiting = "none", failed_runs = 0, comments = 3 }
+expect = { event = "completed", stage = "deliver", waiting = "none", failed_runs = 0, comments = 3, brief_result_refusal = "invalid result.json" }
