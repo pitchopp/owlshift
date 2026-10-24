@@ -238,6 +238,10 @@
             "kind": {
               "type": "string",
               "const": "repair"
+            },
+            "merge_refresh": {
+              "description": "Merge on green's refresh rebase (OWL-445): watch would merge the\ngreen pull request but for its base, which moved since the push,\nso the checks ran on a merge with the old base.",
+              "type": "boolean"
             }
           },
           "additionalProperties": false,

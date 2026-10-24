@@ -78,6 +78,11 @@ pub enum StepKind {
         /// milliseconds.
         #[serde(default)]
         failing_for_ms: Option<u64>,
+        /// Merge on green's refresh rebase (OWL-445): watch would merge the
+        /// green pull request but for its base, which moved since the push,
+        /// so the checks ran on a merge with the old base.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        merge_refresh: bool,
     },
     /// A correction at Watch.
     Correct,
@@ -686,6 +691,11 @@ mod tests {
             },
             StepKind::Repair {
                 failing_for_ms: Some(90_000),
+                merge_refresh: false,
+            },
+            StepKind::Repair {
+                failing_for_ms: None,
+                merge_refresh: true,
             },
             StepKind::Correct,
             StepKind::Review,

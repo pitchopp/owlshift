@@ -142,6 +142,19 @@ pub trait System {
             .map_err(|error| TokenTryError::Credential(error.to_string()))
             .and_then(|keychain| crate::forge::default_branch(&keychain, repo))
     }
+    /// What the project's GitHub credential gives merge on green's merge,
+    /// the GitHub App `slug`'s installation read over the network (OWL-445).
+    /// Only `owlshift doctor` asks, for a project whose `[forge] merge` is
+    /// not `never`.
+    fn github_merge_permission(
+        &self,
+        repo: &Repo,
+        slug: &str,
+    ) -> Result<crate::forge::MergePermission, TokenTryError> {
+        owlshift_platform::keychain::Keychain::system()
+            .map_err(|error| TokenTryError::Credential(error.to_string()))
+            .and_then(|keychain| crate::forge::merge_permission(&keychain, repo, slug))
+    }
     /// The ticket refs of the project whose repository is at `root`, each
     /// with its state ([`ticket_ref::states`]), read in its dedicated
     /// checkout as `owlshift forget` finds it, without the project's lock:
@@ -326,6 +339,9 @@ pub(crate) mod fake {
         /// What trying the GitHub token on its repository gives; `None`: its
         /// default branch `main` is readable.
         github_default_branch: Option<Result<DefaultBranch, TokenTryError>>,
+        /// What the GitHub App's installation grants merge on green
+        /// (OWL-445); `None`: Contents (read and write).
+        github_merge_permission: Option<Result<crate::forge::MergePermission, TokenTryError>>,
         /// The repository `origin` names; `None`: `pitchopp/owlshift`.
         origin: Option<Result<Repo, String>>,
         /// What reading the project's ticket refs gives; `None`: no
@@ -470,6 +486,16 @@ pub(crate) mod fake {
             answer: Result<DefaultBranch, TokenTryError>,
         ) -> Self {
             self.github_default_branch = Some(answer);
+            self
+        }
+
+        /// Reading the GitHub App's installation for merge on green gives
+        /// this (OWL-445).
+        pub(crate) fn github_merge_permission_is(
+            mut self,
+            answer: Result<crate::forge::MergePermission, TokenTryError>,
+        ) -> Self {
+            self.github_merge_permission = Some(answer);
             self
         }
 
@@ -699,6 +725,17 @@ pub(crate) mod fake {
                     owlshift_adapters::forge::Branch::new("main").unwrap(),
                 ))
             })
+        }
+
+        /// As [`Self::github_merge_permission_is`] scripted it.
+        fn github_merge_permission(
+            &self,
+            _repo: &Repo,
+            _slug: &str,
+        ) -> Result<crate::forge::MergePermission, TokenTryError> {
+            self.github_merge_permission
+                .clone()
+                .unwrap_or(Ok(crate::forge::MergePermission::Granted))
         }
 
         #[cfg(unix)]

@@ -248,6 +248,18 @@ pub enum MergeMethod {
     Rebase,
 }
 
+impl From<owlshift_contracts::MergeMethod> for MergeMethod {
+    /// The project's `[forge] merge_method`, as the forge merges by it.
+    fn from(method: owlshift_contracts::MergeMethod) -> Self {
+        use owlshift_contracts::MergeMethod as Project;
+        match method {
+            Project::Squash => Self::Squash,
+            Project::Merge => Self::Merge,
+            Project::Rebase => Self::Rebase,
+        }
+    }
+}
+
 impl MergeMethod {
     /// The forge's word for it, GitHub's `merge_method`.
     pub fn as_str(self) -> &'static str {

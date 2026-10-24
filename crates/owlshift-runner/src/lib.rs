@@ -24,6 +24,7 @@ pub mod github_token;
 pub mod held;
 pub mod in_flight;
 pub mod init;
+mod merge;
 pub mod notify;
 pub mod on_demand;
 pub mod pr_reviews;

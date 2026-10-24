@@ -1,5 +1,5 @@
 {
-  "format": 5,
+  "format": 6,
   "pull_request": {
     "number": 42,
     "url": "https://github.com/demo/project/pull/42"

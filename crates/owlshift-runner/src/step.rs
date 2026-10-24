@@ -142,10 +142,14 @@ fn step(
             decision(envelope),
             sink,
         )),
-        StepKind::Repair { failing_for_ms } => ran(on_demand.repair_seen(
+        StepKind::Repair {
+            failing_for_ms,
+            merge_refresh,
+        } => ran(on_demand.repair_seen(
             ticket,
             commit,
             failing_for_ms.map(Duration::from_millis),
+            *merge_refresh,
             following,
             sink,
         )),

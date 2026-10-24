@@ -284,6 +284,11 @@ pub fn run(system: &dyn System, config: &Effective) -> Report {
             .as_ref()
             .and_then(|found| forge_access_check(system, found)),
     );
+    checks.extend(
+        stored
+            .as_ref()
+            .and_then(|found| merge_permission_check(system, config, found)),
+    );
     let accounts = match &stored {
         Some(Ok(found)) => found.tracker.as_ref().map(|tracker| &tracker.accounts),
         _ => None,
@@ -2205,6 +2210,99 @@ fn forge_access_check(
             }
         },
     }
+}
+
+/// Whether the project's GitHub credential can make merge on green's merge
+/// (D14, OWL-445; architecture section 5, "Merge on green", "Who merges, on
+/// GitHub"), for a project whose `[forge] merge`, read from the working
+/// tree here while watch reads the base branch's head, is not `never`: the
+/// GitHub App's installation must have granted Contents (read and write),
+/// which a read cannot show, so doctor reads the installation's granted
+/// permissions. A personal token's cannot be read, nor an installation not
+/// found: information. None for `never`, or when the secrets are unresolved
+/// or no token is stored: the `secrets` line says so.
+fn merge_permission_check(
+    system: &dyn System,
+    config: &Effective,
+    found: &Result<ProjectSecrets, Unresolved>,
+) -> Option<Check> {
+    const SUBJECT: &str = "merge on green";
+    let FileState::Loaded {
+        config: project, ..
+    } = &config.project
+    else {
+        return None;
+    };
+    let switch = project.forge.as_ref().map(|forge| forge.merge())?;
+    if switch == owlshift_core::vocab::MergeSwitch::Never {
+        return None;
+    }
+    let Ok(found) = found else {
+        return None;
+    };
+    found.forge.token?;
+    let personal = match &config.personal {
+        FileState::Loaded { config, .. } => Some(config),
+        _ => None,
+    };
+    let app = crate::forge::GitHubApp::from_personal(personal);
+    let repo = &found.repo;
+    let why = "watch merges a green pull request through the GitHub App's token, which needs \
+               Contents (read and write) on the repository; GitHub refuses the merge \
+               otherwise, a final refusal that is notified.";
+    use crate::forge::MergePermission;
+    Some(match system.github_merge_permission(repo, &app.slug) {
+        Ok(MergePermission::Granted) => Check::ok(
+            Section::Project,
+            SUBJECT,
+            format!(
+                "the GitHub App's installation on github.com/{repo} grants Contents (read and \
+                 write), which watch's merge needs"
+            ),
+        ),
+        Ok(MergePermission::Missing { installation }) => Check::fail(
+            Section::Project,
+            SUBJECT,
+            format!(
+                "the GitHub App's installation {installation} on github.com/{repo} has not \
+                 granted Contents (read and write), which watch's merge needs"
+            ),
+            why,
+            vec![Step::act(format!(
+                "Accept the app's permissions on GitHub, in the installation's settings \
+                 (Settings > Applications > Installed GitHub Apps > {} > Configure), then run \
+                 `owlshift doctor` again",
+                app.slug
+            ))],
+        ),
+        Ok(MergePermission::NotInstalled) => Check::info(
+            Section::Project,
+            SUBJECT,
+            format!(
+                "not checked: no installation of the GitHub App lists github.com/{repo}; \
+                 install it from {}",
+                app.install_link()
+            ),
+        ),
+        Ok(MergePermission::PersonalToken) => Check::info(
+            Section::Project,
+            SUBJECT,
+            "not checked: GitHub does not say what a personal token may do; its merge needs \
+             Contents (read and write), and a merge GitHub refuses is notified",
+        ),
+        Err(TokenTryError::Credential(reason)) => {
+            Check::info(Section::Project, SUBJECT, format!("not checked: {reason}"))
+        }
+        Err(TokenTryError::Forge(error)) => Check::warn(
+            Section::Project,
+            SUBJECT,
+            format!("not checked: {error}"),
+            format!(
+                "{DOES_NOT_BLOCK} doctor could not read the GitHub App's installation on \
+                 github.com/{repo}. Watch's merge needs Contents (read and write)."
+            ),
+        ),
+    })
 }
 
 /// Which keychain account each tracker and forge secret of the project is
@@ -4154,6 +4252,57 @@ states = { ready = "Todo", working = "Doing", needs_input = "Asked", review = "R
             "{}",
             named.detail
         );
+    }
+
+    /// OWL-445: a project whose `[forge] merge` is not `never` gets a
+    /// `merge on green` line from the GitHub App's installation: ok when it
+    /// granted Contents (read and write), a failure naming it otherwise,
+    /// information for a personal token or no installation; none under
+    /// `never`.
+    #[test]
+    fn merge_on_green_names_a_missing_contents_write() {
+        use crate::forge::MergePermission;
+
+        let system = || logged_in(with_harnesses(with_git(FakeSystem::default())));
+        let tracker = r#"kind = "markdown"
+admit = "delegation"
+states = { ready = "Todo", working = "Doing", needs_input = "Asked", review = "Review" }"#;
+        let (_dir, never) = project_tracked_by(&format!("{tracker}\n[forge]\nmerge = \"never\""));
+        let report = run(&system(), &never);
+        assert!(
+            !report.checks.iter().any(|c| c.subject == "merge on green"),
+            "{report:?}"
+        );
+        let (_dir, all) = project_tracked_by(&format!("{tracker}\n[forge]\nmerge = \"all\""));
+        for (permission, status, says) in [
+            (
+                MergePermission::Granted,
+                Status::Ok,
+                "grants Contents (read and write)",
+            ),
+            (
+                MergePermission::Missing { installation: 9 },
+                Status::Fail,
+                "installation 9 on github.com/pitchopp/owlshift has not granted Contents (read \
+                 and write)",
+            ),
+            (
+                MergePermission::NotInstalled,
+                Status::Info,
+                "no installation",
+            ),
+            (
+                MergePermission::PersonalToken,
+                Status::Info,
+                "personal token",
+            ),
+        ] {
+            let report = run(&system().github_merge_permission_is(Ok(permission)), &all);
+            let found = line(&report, "merge on green");
+            assert_eq!(found.status, status, "{found:?}");
+            assert!(found.detail.contains(says), "{found:?}");
+            assert_eq!(report.ready(), status != Status::Fail, "{permission:?}");
+        }
     }
 
     /// OWL-378: the `budget` line names the ticket budget, or none, as a

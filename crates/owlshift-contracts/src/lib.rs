@@ -24,5 +24,6 @@ pub mod usage;
 
 pub use format::ContractError;
 pub use owlshift_core::vocab::{
-    BasisKind, DelegationLevel, Harness, PlanApproval, Priority, Role, Stage, Tier, Variant,
+    BasisKind, DelegationLevel, Harness, MergeMethod, PlanApproval, Priority, Role, Stage, Tier,
+    Variant,
 };

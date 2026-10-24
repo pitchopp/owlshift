@@ -140,7 +140,10 @@ use crate::writer::{
     Rebased, ReopenedChoice, ReplyComment, Reported, Restart, ResumeComment, Reviewed,
     VisibleStage, WriteError, Writer, park_reason, rebase_keeps_delivery,
 };
-use owlshift_core::follow::{Action as FollowAction, Decision as FollowDecision};
+use owlshift_core::follow::{
+    Action as FollowAction, Decision as FollowDecision, EndReason as FollowEnd,
+};
+use owlshift_core::vocab::MergeSwitch;
 
 /// How long one Build run may take before its process tree is stopped.
 pub const DEFAULT_RUN_TIMEOUT: Duration = Duration::from_secs(2 * 60 * 60);
@@ -162,6 +165,7 @@ mod design;
 mod drain;
 mod intake;
 mod limits;
+mod merge_note;
 mod review_loop;
 mod to_watch;
 mod verify;
@@ -584,6 +588,9 @@ pub struct Delivered {
     pub verdict: Option<Verdict>,
     /// The delivery report's comment id.
     pub comment: String,
+    /// The project's `[forge] merge` at the base the command fetched, which
+    /// says who merges (D14, OWL-445).
+    pub merge: MergeSwitch,
 }
 
 impl fmt::Display for Delivered {
@@ -597,10 +604,12 @@ impl fmt::Display for Delivered {
             Some(Verdict::NotOpen) => "the pull request is not open",
             None => "could not be read",
         };
+        let merges = crate::writer::merges_on_green(self.merge, "it")
+            .unwrap_or_else(|| "Owlshift never merges: review and merge it.".to_owned());
         write!(
             f,
             "Delivered: pull request #{} {} ({}), checks {verdict}; the delivery report is on \
-             the ticket. Owlshift never merges: review and merge it.",
+             the ticket. {merges}",
             pr.number,
             pr.url,
             if self.opened { "opened" } else { "updated" },
@@ -777,7 +786,13 @@ pub enum Stop {
     /// `owlshift continue` on a ticket at Watch read its pull request and
     /// decided ([`follow`], OWL-209): nothing is wrong, nobody is the
     /// blocker.
-    Watched { ticket: TicketId, seen: Box<Seen> },
+    Watched {
+        ticket: TicketId,
+        seen: Box<Seen>,
+        /// What merge on green would do at watch's next pass (OWL-445),
+        /// on a project that opted in; `None` says Owlshift never merges.
+        merge: Option<String>,
+    },
     /// `owlshift watch` ran one stage step of the ticket and kept its state
     /// (OWL-367): it is now at `stage`, and its next step runs at a later
     /// pass, going on from `carried`, which `carry.json` keeps (OWL-399).
@@ -1033,7 +1048,12 @@ impl fmt::Display for Stop {
                 "The run is done and its gate passed, but the delivery failed: {reason}. The \
                  worktree keeps the work; run again to retry the delivery."
             ),
-            Self::Watched { ticket, seen } => write!(
+            Self::Watched {
+                ticket,
+                seen,
+                merge: Some(merge),
+            } => write!(f, "Watching {ticket}: {seen}. {merge}"),
+            Self::Watched { ticket, seen, .. } => write!(
                 f,
                 "Watching {ticket}: {seen}. Owlshift never merges: review and merge it."
             ),
@@ -2478,11 +2498,31 @@ impl OnDemand<'_> {
     }
 
     /// `owlshift continue` on a ticket at Watch whose pull request is
-    /// followed (OWL-209): one look, as watch's, with a memory of its own;
-    /// the ref keeps what it changes, then its events are recorded. A fix
-    /// run, a rebase run or a park the look decides is repaired at once
-    /// (OWL-112, OWL-210).
+    /// followed (OWL-209): [`Self::look_once`], then, on a project that
+    /// opted into merge on green (OWL-445), when it repaired, corrected and
+    /// looped nothing: no merge, ever, but a person's asking for one,
+    /// `merge_retry` kept in the ref, which lifts a refusal watch keeps, and
+    /// what watch's next pass would do.
     fn watch_once(&self, p: &mut Prepared, sink: &mut EventSink<'_>) -> Result<Delivered, Stop> {
+        match self.look_once(p, sink) {
+            Err(Stop::Watched { ticket, seen, .. }) => {
+                let merge = self.merge_note(p, &seen);
+                Err(Stop::Watched {
+                    ticket,
+                    seen,
+                    merge,
+                })
+            }
+            outcome => outcome,
+        }
+    }
+
+    /// One look, as watch's, with a memory of its own; the ref keeps what
+    /// it changes, then its events are recorded. A fix run, a rebase run or
+    /// a park the look decides is repaired at once (OWL-112, OWL-210). A
+    /// read of the pull request merged while the ref keeps the runner's
+    /// merge under way tells it, once, before the end is kept (OWL-445).
+    fn look_once(&self, p: &mut Prepared, sink: &mut EventSink<'_>) -> Result<Delivered, Stop> {
         let ticket = p.ticket.clone();
         let Some(stored) = p.stored.clone() else {
             return Err(nothing_to_continue(&ticket));
@@ -2508,6 +2548,10 @@ impl OnDemand<'_> {
                 return Err(refused("reading the pull request", reason));
             }
         };
+        let runner_merged = delivery
+            .merging
+            .clone()
+            .filter(|_| matches!(seen.decision, FollowDecision::End(FollowEnd::Merged)));
         match follow::changed(&stored.record, PIPELINE, &seen, now) {
             Ok(Some(changed)) => {
                 let record = changed.record;
@@ -2515,6 +2559,17 @@ impl OnDemand<'_> {
                     Ok(state) => state,
                     Err(e) => return Err(core_error(e)),
                 };
+                if let (Some(merging), Some(pr)) = (&runner_merged, &delivery.pull_request) {
+                    crate::merge::tell_merged(self, &ticket, pr, merging, None, sink).map_err(
+                        |e| {
+                            refused(
+                                "telling Owlshift's merge of the pull request on the ticket \
+                                 before keeping its end; the next read tells it",
+                                e,
+                            )
+                        },
+                    )?;
+                }
                 if let Err(e) = self.store_delivery(p, &state, record.questions, record.delivery) {
                     return Err(refused(
                         "keeping what the read changed in the ticket's ref",
@@ -2531,6 +2586,9 @@ impl OnDemand<'_> {
                 // (OWL-259).
                 if matches!(seen.decision, FollowDecision::Follow { adopt: true, .. }) {
                     self.review_after_working(&ticket, sink);
+                }
+                if let (Some(merging), Some(pr)) = (&runner_merged, &delivery.pull_request) {
+                    crate::merge::merged_event(&ticket, pr.number, merging, None, sink);
                 }
             }
             Ok(None) => {}
@@ -2551,7 +2609,7 @@ impl OnDemand<'_> {
             ..
         } = seen.decision
         {
-            return self.repair(p, seen.failing_for, &mut following, sink);
+            return self.repair(p, seen.failing_for, false, &mut following, sink);
         }
         // The decider's replies to a DECISION, which the correction reads
         // again under this command's lock (OWL-146).
@@ -2580,6 +2638,7 @@ impl OnDemand<'_> {
         Err(Stop::Watched {
             ticket,
             seen: Box::new(seen),
+            merge: None,
         })
     }
 
@@ -5902,6 +5961,7 @@ impl OnDemand<'_> {
             opened: opened.opened,
             verdict,
             comment: comment.id,
+            merge: crate::merge::switch_at(self, &p.base),
         })
     }
 
@@ -6143,12 +6203,15 @@ impl OnDemand<'_> {
     /// keeps a ticket at Watch: the next pass reads it again.
     /// `failing_for` is how long ago watch first read a failure on the
     /// head, for the table's hour. `following` is watch's memory, which
-    /// records a ticket's moved stage once (OWL-219).
+    /// records a ticket's moved stage once (OWL-219). `merge_refresh` is
+    /// merge on green's refresh rebase (OWL-445): watch found the pull
+    /// request green on a base that moved since the push.
     pub fn repair_seen(
         &self,
         ticket: &TicketId,
         seen: &str,
         failing_for: Option<Duration>,
+        merge_refresh: bool,
         following: &mut Following,
         sink: &mut EventSink<'_>,
     ) -> Option<Result<Delivered, Stop>> {
@@ -6156,7 +6219,7 @@ impl OnDemand<'_> {
             Ok(p) => p,
             Err(stop) => return Some(Err(stop)),
         };
-        Some(self.repair(&mut p, failing_for, following, sink))
+        Some(self.repair(&mut p, failing_for, merge_refresh, following, sink))
     }
 
     /// What a run watch decides at Watch starts from (a repair, a
@@ -6200,15 +6263,18 @@ impl OnDemand<'_> {
     /// the base its last rebase was pushed onto a failed run of that rebase
     /// ([`Self::rebase_failed`]). Any other decision runs nothing and is
     /// told as a look. Its end moves a stage its runs left at working back
-    /// to review ([`Self::back_from_repair`], OWL-259).
+    /// to review ([`Self::back_from_repair`], OWL-259). With
+    /// `merge_refresh` (OWL-445), a green read on a base that moved since
+    /// the push gets merge on green's refresh rebase onto that base.
     fn repair(
         &self,
         p: &mut Prepared,
         failing_for: Option<Duration>,
+        merge_refresh: bool,
         following: &mut Following,
         sink: &mut EventSink<'_>,
     ) -> Result<Delivered, Stop> {
-        let outcome = self.repair_due(p, failing_for, following, sink);
+        let outcome = self.repair_due(p, failing_for, merge_refresh, following, sink);
         self.back_from_repair(p, &outcome, sink);
         outcome
     }
@@ -6218,6 +6284,7 @@ impl OnDemand<'_> {
         &self,
         p: &mut Prepared,
         failing_for: Option<Duration>,
+        merge_refresh: bool,
         following: &mut Following,
         sink: &mut EventSink<'_>,
     ) -> Result<Delivered, Stop> {
@@ -6249,11 +6316,27 @@ impl OnDemand<'_> {
                     | FollowAction::Rebase { .. }
                     | FollowAction::RebaseFailed { .. }),
             } => action.clone(),
+            // Merge on green's refresh (OWL-445): green, on a base that moved
+            // since the push, which this command's fetch read. Watch decided
+            // the merge due but for the base; its checks ran on a merge with
+            // the old base.
+            FollowDecision::Follow {
+                adopt: false,
+                action: FollowAction::Green,
+            } if merge_refresh
+                && delivery.base_at_push.as_deref() != Some(p.base.commit.as_str()) =>
+            {
+                FollowAction::Rebase {
+                    onto: p.base.commit.clone(),
+                    refresh: true,
+                }
+            }
             // Anything else is a look's: the next one keeps it.
             _ => {
                 return Err(Stop::Watched {
                     ticket: ticket.clone(),
                     seen: Box::new(fresh.seen(pr.number, &pr.url)),
+                    merge: None,
                 });
             }
         };
@@ -7226,6 +7309,7 @@ impl OnDemand<'_> {
             opened: false,
             verdict,
             comment: comment.id,
+            merge: crate::merge::switch_at(self, &p.base),
         })
     }
 
@@ -7430,6 +7514,9 @@ impl OnDemand<'_> {
                     .unwrap_or_default(),
                 pushed: !owed.unchanged,
             }),
+            // Who merges, as the project file reads at the base of the push
+            // (OWL-445).
+            merge: crate::merge::switch_at_push(self, delivery),
         };
         match Writer::new(self.tracker).post_repair_report(&report) {
             Ok(Reported { comment, new }) => {
@@ -7990,7 +8077,8 @@ fn brief_body(comment: &Comment) -> String {
         | MarkerKind::Decision
         | MarkerKind::Parked
         | MarkerKind::Intake
-        | MarkerKind::Waiting => {
+        | MarkerKind::Waiting
+        | MarkerKind::Merged => {
             let note = format!(
                 "\n\n(Cut to {MAX_THREAD_COMMENT_BYTES} bytes in this brief: the whole comment \
                  is on the ticket, tracker comment `{}`.)",

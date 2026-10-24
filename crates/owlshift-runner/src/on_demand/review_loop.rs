@@ -124,6 +124,7 @@ impl OnDemand<'_> {
         let look = || Stop::Watched {
             ticket: ticket.clone(),
             seen: Box::new(fresh.seen(pr.number, &pr.url)),
+            merge: None,
         };
         if !matches!(
             fresh.decision,
@@ -274,6 +275,7 @@ impl OnDemand<'_> {
         Ok(Some(Stop::Watched {
             ticket,
             seen: Box::new(seen),
+            merge: None,
         }))
     }
 

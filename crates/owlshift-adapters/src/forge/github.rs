@@ -28,6 +28,7 @@
 //! - `repository.pullRequests(headRefName:, baseRefName:, states:)` filters
 //!   by branch; `headRepository` tells a fork's same-named branch apart.
 
+use std::collections::BTreeMap;
 use std::fmt;
 use std::io::{self, BufRead, BufReader, Read};
 use std::sync::{Mutex, PoisonError};
@@ -79,6 +80,10 @@ pub struct Installation {
     /// Whether it is suspended (`suspended_at` set); what that refuses is
     /// C16's, not observed on 2026-10-19.
     pub suspended: bool,
+    /// Whether the installation granted Contents (read and write), which
+    /// merge on green's merge needs (D14, OWL-445): its `permissions`
+    /// reading `contents` `write` (C12 read them on 2026-10-19).
+    pub contents_write: bool,
 }
 
 /// A GitHub token: a fine-grained or classic personal access token, or the
@@ -582,6 +587,34 @@ impl GitHubForge {
         Ok(PullRequestRead { checks, rate })
     }
 
+    /// The commit `branch` points to (merge on green, OWL-445): one light
+    /// query, the expression `refs/heads/<branch>` that the base checks
+    /// query reads too (recorded live as `base-checks.json`). A branch that
+    /// is not there is [`ErrorKind::NotFound`].
+    pub fn branch_head(&self, branch: &Branch) -> Result<CommitId, Error> {
+        #[derive(Deserialize)]
+        struct Data {
+            repository: Repository,
+        }
+        #[derive(Deserialize)]
+        struct Repository {
+            #[serde(default)]
+            object: Option<GhOid>,
+        }
+        let variables = json!({
+            "owner": self.repo.owner(), "name": self.repo.name(),
+            "branch": format!("refs/heads/{branch}"),
+        });
+        let data: Data = self.call(BRANCH_HEAD_QUERY, variables)?;
+        let oid = data.repository.object.ok_or_else(|| {
+            Error::new(
+                ErrorKind::NotFound,
+                format!("no branch {branch} in {}", self.repo),
+            )
+        })?;
+        CommitId::new(oid.oid).map_err(|e| invalid(format!("unexpected head from GitHub: {e}")))
+    }
+
     /// The reviews submitted on pull request `number` (OWL-307), in one
     /// query: the newest 100, oldest first, each with its first 100 inline
     /// comments, and the query's cost. A pending review, which only its
@@ -821,6 +854,8 @@ impl GitHubForge {
             app_slug: String,
             #[serde(default)]
             suspended_at: Option<String>,
+            #[serde(default)]
+            permissions: BTreeMap<String, String>,
         }
         #[derive(Deserialize)]
         struct Repositories {
@@ -850,6 +885,10 @@ impl GitHubForge {
                 return Ok(Some(Installation {
                     id: installation.id,
                     suspended: installation.suspended_at.is_some(),
+                    contents_write: installation
+                        .permissions
+                        .get("contents")
+                        .is_some_and(|level| level == "write"),
                 }));
             }
         }
@@ -1174,6 +1213,12 @@ const REVIEWS_QUERY: &str = "query Reviews($owner: String!, $name: String!, $num
     reviews(last: 100, states: [COMMENTED, APPROVED, CHANGES_REQUESTED, DISMISSED]) { \
     nodes { fullDatabaseId author { login } state submittedAt body commit { oid } \
     comments(first: 100) { nodes { path line body } } } } } } }";
+
+/// A branch's head (OWL-445): merge on green reads the project file there.
+const BRANCH_HEAD_QUERY: &str = "query BranchHead($owner: String!, $name: String!, \
+    $branch: String!) { rateLimit { cost remaining resetAt } \
+    repository(owner: $owner, name: $name) { object(expression: $branch) { \
+    ... on Commit { oid } } } }";
 
 /// The last read before a merge (OWL-446): no check, so one light query.
 const MERGE_READ_QUERY: &str = "query MergeRead($owner: String!, $name: String!, \
@@ -2180,6 +2225,31 @@ mod tests {
         }
     }
 
+    /// OWL-445: a branch's head is read through the expression the base
+    /// checks query reads; a branch that is not there is not found.
+    #[test]
+    fn a_branch_head_is_its_commit_or_not_found() {
+        let (forge, canned) = forge(vec![
+            format!(r#"{{"data":{{"repository":{{"object":{{"oid":"{HEAD}"}}}}}}}}"#),
+            r#"{"data":{"repository":{"object":null}}}"#.to_owned(),
+        ]);
+        let main = Branch::new("main").unwrap();
+        assert_eq!(forge.branch_head(&main).unwrap().as_str(), HEAD);
+        let request = canned.requests.lock().unwrap()[0].clone();
+        assert!(
+            request["query"]
+                .as_str()
+                .unwrap()
+                .starts_with("query BranchHead"),
+            "{request}"
+        );
+        assert_eq!(request["variables"]["branch"], "refs/heads/main");
+        assert_eq!(
+            forge.branch_head(&main).unwrap_err().kind,
+            ErrorKind::NotFound
+        );
+    }
+
     /// Answers with prepared bodies, in order, and keeps the requests.
     struct Canned {
         bodies: Mutex<Vec<String>>,
@@ -2699,7 +2769,9 @@ mod tests {
     /// last page; another app's installation is not read.
     #[test]
     fn the_apps_installation_is_found_by_slug_then_by_repository() {
-        let two = r#"{"total_count":2,"installations":[{"id":7,"app_slug":"other-app"},{"id":9,"app_slug":"owl-shift","suspended_at":null}]}"#;
+        // Permissions as C12 read them (2026-10-19), Contents raised to
+        // write as C19 did (2026-10-23).
+        let two = r#"{"total_count":2,"installations":[{"id":7,"app_slug":"other-app"},{"id":9,"app_slug":"owl-shift","suspended_at":null,"permissions":{"contents":"write","metadata":"read","pull_requests":"write"}}]}"#;
         let others: Vec<String> = (0..100)
             .map(|i| format!(r#"{{"full_name":"owner/other{i}"}}"#))
             .collect();
@@ -2724,8 +2796,26 @@ mod tests {
             forge.app_installation("owl-shift").unwrap(),
             Some(Installation {
                 id: 9,
-                suspended: false
+                suspended: false,
+                contents_write: true,
             })
+        );
+        // An installation that has not accepted Contents (write) yet.
+        let read_only = two.replace(r#""contents":"write""#, r#""contents":"read""#);
+        let forge = paths(&[
+            (INSTALLATIONS, 200, read_only.as_str()),
+            (
+                "user/installations/9/repositories?per_page=100&page=1",
+                200,
+                r#"{"total_count":1,"repositories":[{"full_name":"owner/repo"}]}"#,
+            ),
+        ]);
+        assert!(
+            !forge
+                .app_installation("owl-shift")
+                .unwrap()
+                .unwrap()
+                .contents_write
         );
 
         // Not listed by the app's installation, or no installation at all.
