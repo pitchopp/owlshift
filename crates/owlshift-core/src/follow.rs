@@ -4,7 +4,8 @@
 //! forge's answer onto [`Read`] and [`BaseRead`]; OWL-112 and OWL-210 run the
 //! fix and the rebase it decides. On a project that opted into merge on green
 //! (D14), [`merge_due`] decides on top of a green read whether the runner
-//! merges.
+//! merges, and [`confirm_merge`] whether the merge still goes on at the last
+//! read before the call.
 
 use std::time::Duration;
 
@@ -380,6 +381,21 @@ pub enum MergeBlocker {
     /// The head was not read green twice at least [`GREEN_TWICE_AFTER`]
     /// apart.
     GreenOnce,
+    /// The last read found the pull request closed or merged ([`confirm_merge`]).
+    Closed,
+    /// The last read found another head than the grant's.
+    HeadMoved,
+    /// The last read found the pull request targeting another base branch,
+    /// even one at the same commit.
+    BaseRetargeted,
+    /// The last read found the review decision a review required, or one
+    /// Owlshift does not know: a refusal that will not pass on that head,
+    /// notified once, until the head or the base changes, a person's
+    /// `continue`, or the review decision clearing on that same head.
+    ReviewRequired,
+    /// The last read found changes requested: the same refusal as
+    /// [`Self::ReviewRequired`].
+    ChangesRequested,
 }
 
 /// What [`merge_due`] decides.
@@ -451,6 +467,72 @@ fn blocker(policy: &MergePolicy<'_>, facts: &MergeFacts<'_>, read: &Read) -> Opt
         return Some(MergeBlocker::GreenOnce);
     }
     None
+}
+
+/// The forge's review decision for a pull request (GitHub's
+/// `reviewDecision`), which reads a review required whatever the merging
+/// token may bypass (OWL-446, C19).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReviewState {
+    /// No review is required.
+    NotRequired,
+    Approved,
+    /// A required review is missing, or the decision is one Owlshift does
+    /// not know.
+    Required,
+    ChangesRequested,
+}
+
+/// The read of the pull request the runner makes once [`merge_due`] said
+/// merge, right before the call (architecture section 5, "Merge on green",
+/// "The last read"): never the pass's own read, which the merge would then
+/// trust across the rest of the pass.
+#[derive(Clone, Copy, Debug)]
+pub struct LastRead<'a> {
+    pub state: PrState,
+    pub head: &'a str,
+    /// The base branch the pull request targets.
+    pub base: &'a str,
+    /// That branch's head.
+    pub base_head: &'a str,
+    pub draft: bool,
+    pub review: ReviewState,
+}
+
+/// Whether the merge [`merge_due`] granted still goes on, on the last read
+/// (OWL-446): open, at the grant's head, on `base` still at `base_at_push`,
+/// not a draft, and a review decision that clears, in that order, so a base
+/// that moved is found before a review and gets its refresh rebase. The
+/// same grant comes back when it goes on. Neither GitHub merge call refuses
+/// a closed pull request or takes a base to expect, so this narrows them to
+/// the time between the read and the call; it does not pin them.
+pub fn confirm_merge(
+    grant: MergeGrant,
+    base: &str,
+    base_at_push: &str,
+    last: &LastRead<'_>,
+) -> MergeDue {
+    let blocker = if last.state != PrState::Open {
+        Some(MergeBlocker::Closed)
+    } else if last.head != grant.head() {
+        Some(MergeBlocker::HeadMoved)
+    } else if last.base != base {
+        Some(MergeBlocker::BaseRetargeted)
+    } else if last.base_head != base_at_push {
+        Some(MergeBlocker::BaseMoved)
+    } else if last.draft {
+        Some(MergeBlocker::Draft)
+    } else {
+        match last.review {
+            ReviewState::NotRequired | ReviewState::Approved => None,
+            ReviewState::Required => Some(MergeBlocker::ReviewRequired),
+            ReviewState::ChangesRequested => Some(MergeBlocker::ChangesRequested),
+        }
+    };
+    match blocker {
+        Some(blocker) => MergeDue::Wait(blocker),
+        None => MergeDue::Merge(grant),
+    }
 }
 
 #[cfg(test)]
@@ -939,6 +1021,122 @@ mod tests {
             for (switch, facts, read, blocker) in cases {
                 assert_eq!(
                     due(switch, &gate, &facts, &read),
+                    MergeDue::Wait(blocker.clone()),
+                    "{blocker:?}"
+                );
+            }
+        }
+
+        fn last() -> LastRead<'static> {
+            LastRead {
+                state: PrState::Open,
+                head: HEAD,
+                base: "main",
+                base_head: BASE,
+                draft: false,
+                review: ReviewState::NotRequired,
+            }
+        }
+
+        fn confirm(last: &LastRead<'_>) -> MergeDue {
+            confirm_merge(
+                MergeGrant::new(HEAD, MergeMethod::Squash),
+                "main",
+                BASE,
+                last,
+            )
+        }
+
+        /// OWL-446: the grant goes on, unchanged, on a review approved or
+        /// none required.
+        #[test]
+        fn the_last_read_passes_the_grant_on_a_review_that_clears() {
+            for review in [ReviewState::NotRequired, ReviewState::Approved] {
+                let last = LastRead { review, ..last() };
+                assert_eq!(
+                    confirm(&last),
+                    MergeDue::Merge(MergeGrant::new(HEAD, MergeMethod::Squash)),
+                    "{review:?}"
+                );
+            }
+        }
+
+        /// OWL-446: each condition of the last read, broken alone, stops the
+        /// merge with its reason; a base that moved is found before a review.
+        #[test]
+        fn each_condition_of_the_last_read_alone_blocks_the_merge() {
+            use MergeBlocker::*;
+            let other = "fedcba9876543210fedcba9876543210fedcba98";
+            let cases = [
+                (
+                    LastRead {
+                        state: PrState::Closed,
+                        ..last()
+                    },
+                    Closed,
+                ),
+                (
+                    LastRead {
+                        state: PrState::Merged,
+                        ..last()
+                    },
+                    Closed,
+                ),
+                (
+                    LastRead {
+                        head: other,
+                        ..last()
+                    },
+                    HeadMoved,
+                ),
+                // Retargeted onto a branch at the same commit.
+                (
+                    LastRead {
+                        base: "release",
+                        ..last()
+                    },
+                    BaseRetargeted,
+                ),
+                (
+                    LastRead {
+                        base_head: other,
+                        ..last()
+                    },
+                    BaseMoved,
+                ),
+                (
+                    LastRead {
+                        draft: true,
+                        ..last()
+                    },
+                    Draft,
+                ),
+                (
+                    LastRead {
+                        review: ReviewState::Required,
+                        ..last()
+                    },
+                    ReviewRequired,
+                ),
+                (
+                    LastRead {
+                        review: ReviewState::ChangesRequested,
+                        ..last()
+                    },
+                    ChangesRequested,
+                ),
+                (
+                    LastRead {
+                        base_head: other,
+                        review: ReviewState::Required,
+                        ..last()
+                    },
+                    BaseMoved,
+                ),
+            ];
+            for (last, blocker) in cases {
+                assert_eq!(
+                    confirm(&last),
                     MergeDue::Wait(blocker.clone()),
                     "{blocker:?}"
                 );

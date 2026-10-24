@@ -37,7 +37,7 @@ use serde_json::{Value, json};
 use owlshift_adapters::forge::github::{GitHubForge, HttpTransport, NewPullRequest, Token};
 use owlshift_adapters::forge::{
     Branch, CheckKind, CheckState, CommitId, ErrorKind, MergeAnswer, MergeMethod, Mergeable,
-    PrState, Repo, Verdict,
+    PrState, Repo, ReviewDecision, Verdict,
 };
 
 use support::{Recorder, Replay};
@@ -636,5 +636,68 @@ fn reads_every_recorded_merge_answer() {
             MergeAnswer::NoVerdict { .. } => "no verdict",
         };
         assert_eq!(read, kind, "{name}: {answer:?}");
+    }
+}
+
+/// What each last read before a merge reads as (OWL-446): every
+/// `before-merge-*.json`, replayed through the forge, the head and the base
+/// head each the very commit GitHub answered.
+#[test]
+fn reads_every_recorded_last_read() {
+    let expected = [
+        (
+            "before-merge-open.json",
+            PrState::Open,
+            ReviewDecision::NotRequired,
+        ),
+        (
+            "before-merge-review-required.json",
+            PrState::Open,
+            ReviewDecision::Required,
+        ),
+        (
+            "before-merge-closed.json",
+            PrState::Closed,
+            ReviewDecision::NotRequired,
+        ),
+    ];
+    let mut names: Vec<String> = fs::read_dir(dir())
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+        .filter(|name| name.starts_with("before-merge-"))
+        .collect();
+    names.sort();
+    let mut listed: Vec<&str> = expected.iter().map(|(name, ..)| *name).collect();
+    listed.sort_unstable();
+    assert_eq!(
+        names, listed,
+        "every last-read fixture has its expected read"
+    );
+    for (name, state, review) in expected {
+        let fixture = support::load(&dir(), name);
+        let request = &fixture.exchanges[0].request;
+        let pr = &fixture.exchanges[0].response["data"]["repository"]["pullRequest"];
+        let repo = format!(
+            "{}/{}",
+            request["variables"]["owner"].as_str().unwrap(),
+            request["variables"]["name"].as_str().unwrap()
+        );
+        let replay = Replay::of(&dir(), name);
+        let read = GitHubForge::with_transport(replay.clone(), Repo::parse(&repo).unwrap())
+            .merge_read(request["variables"]["number"].as_u64().unwrap())
+            .unwrap_or_else(|e| panic!("{name}: {e}"));
+        replay.assert_done();
+        assert_eq!(
+            (read.state, read.review, read.draft),
+            (state, review, false)
+        );
+        assert_eq!(read.base.as_str(), "main", "{name}");
+        assert_eq!(Some(read.head.as_str()), pr["headRefOid"].as_str());
+        assert_eq!(
+            Some(read.base_head.as_str()),
+            pr["baseRef"]["target"]["oid"].as_str()
+        );
+        assert_ne!(read.head, read.base_head, "{name}");
+        assert!(read.rate.is_some(), "{name}");
     }
 }
