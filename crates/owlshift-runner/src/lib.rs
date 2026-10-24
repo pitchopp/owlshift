@@ -38,6 +38,7 @@ pub mod roles;
 pub mod routing;
 pub mod rules;
 pub mod secrets;
+pub mod served;
 pub mod slots;
 pub mod step;
 pub mod system;

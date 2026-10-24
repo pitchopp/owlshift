@@ -18,6 +18,7 @@ pub mod refs;
 pub mod result;
 pub mod review;
 pub mod schema;
+pub mod service;
 pub mod step;
 pub mod usage;
 

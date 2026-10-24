@@ -8,14 +8,20 @@
 //! `owlshift watch --drain` runs each step in a child, this binary with
 //! `continue TICKET --step ENVELOPE` (OWL-399), which opens what a run needs
 //! as `continue` does and hands the step to `owlshift_runner::step::child`.
+//!
+//! A served project's watch, `owlshift watch --drain --served OWNER/REPO`,
+//! which the service starts without a working directory, and its steps run
+//! on the project file kept from its default branch (OWL-434,
+//! `owlshift_runner::served`), never on a working tree's.
 
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
 use std::sync::Arc;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
+use owlshift_adapters::forge::Repo;
 use owlshift_adapters::notifier::Notifier;
 use owlshift_adapters::tracker::markdown::MarkdownTracker;
 use owlshift_adapters::tracker::{Capability, Tracker};
@@ -42,6 +48,7 @@ use owlshift_runner::roles::{
     REBASE_ROLE, RESOLVER_ROLE, VERIFY_ROLE,
 };
 use owlshift_runner::routing::{ClaudeRouter, CodexRouter, claude_model};
+use owlshift_runner::served::{self, Between, Served};
 use owlshift_runner::slots::MachineSlots;
 use owlshift_runner::step::{self, Children};
 use owlshift_runner::system::System;
@@ -94,18 +101,84 @@ impl<'a> Mode<'a> {
     }
 }
 
-pub fn run(system: &dyn System, config: &Effective, mode: Mode<'_>) -> ExitCode {
-    run_with(system, config, mode, Keychain::system).unwrap_or_else(|refusal| fail(&refusal))
+/// Runs `mode` on the project of the working directory, or, with `served`,
+/// on that served project (OWL-434).
+pub fn run(
+    system: &dyn System,
+    config: &Effective,
+    mode: Mode<'_>,
+    served: Option<&Repo>,
+) -> ExitCode {
+    let ran = match served {
+        None => run_with(system, config, mode, Keychain::system, None).map(Ended::code),
+        Some(repo) => run_served(system, config, mode, repo, Keychain::system),
+    };
+    ran.unwrap_or_else(|refusal| fail(&refusal))
 }
 
-/// [`run`], with the keychain opened by `open_keychain`: a refusal before
-/// the run is returned, for the caller to print.
+/// How [`run_with`] ended.
+enum Ended {
+    /// With this exit code.
+    Code(ExitCode),
+    /// A served watch whose default branch holds a newer project file,
+    /// once its steps under way ended: started again on it (OWL-434).
+    Reload,
+}
+
+impl Ended {
+    fn code(self) -> ExitCode {
+        match self {
+            Self::Code(code) => code,
+            Self::Reload => ExitCode::SUCCESS,
+        }
+    }
+}
+
+/// `mode` on the served project `repo`, located from the list of served
+/// projects, never from the working directory, whose configuration
+/// (`config`) gives only the personal file. A watch reads its project file
+/// from the default branch first, and again before it starts on a newer
+/// one; a step runs on the one its watch kept.
+fn run_served(
+    system: &dyn System,
+    config: &Effective,
+    mode: Mode<'_>,
+    repo: &Repo,
+    open_keychain: fn() -> Result<Keychain, KeychainError>,
+) -> Result<ExitCode, String> {
+    let data_dir = crate::data_dir()?;
+    let git = project::runner_git();
+    let served = Served::locate(&git, &data_dir, repo)?;
+    let personal = owlshift_platform::paths::personal_config_file();
+    let accept = |text: &str| served::accept(repo, text, personal.clone());
+    let desktop = notify::desktop_enabled(&config.personal)
+        .then(|| DesktopNotifier::for_this_machine(system))
+        .flatten();
+    let desktop = desktop.as_ref().map(|d| d as &dyn Notifier);
+    loop {
+        if mode == Mode::Drain {
+            let mut out = io::stdout();
+            let mut sink = EventSink::new(repo.to_string(), EventLog::in_dir(&data_dir), &mut out);
+            served::prepare(&git, &served, &accept, desktop, &mut sink)?;
+        }
+        let effective = served::effective(repo, &served.dirs, personal.clone())?;
+        match run_with(system, &effective, mode, open_keychain, Some(&served))? {
+            Ended::Code(code) => return Ok(code),
+            Ended::Reload => {}
+        }
+    }
+}
+
+/// [`run`], with the keychain opened by `open_keychain`, on the served
+/// project `served` when there is one: a refusal before the run is
+/// returned, for the caller to print.
 fn run_with(
     system: &dyn System,
     config: &Effective,
     mode: Mode<'_>,
     open_keychain: fn() -> Result<Keychain, KeychainError>,
-) -> Result<ExitCode, String> {
+    served: Option<&Served>,
+) -> Result<Ended, String> {
     let ticket = mode
         .ticket()
         .map(TicketId::new)
@@ -124,10 +197,22 @@ fn run_with(
     if let Some(ticket) = &ticket {
         on_demand::check_team(project, ticket)?;
     }
-    let root = project_file.parent().unwrap_or(project_file);
     let git = project::runner_git();
-    let remote_url = project::origin_url(&git, root)?;
-    let repo = on_demand::check_origin(&remote_url)?;
+    // A served project's checkout only locates it (OWL-434): its project
+    // file is the one kept from the default branch.
+    let (root, remote_url, repo) = match served {
+        Some(served) => (
+            served.checkout.as_path(),
+            served.remote_url.clone(),
+            served.repo.clone(),
+        ),
+        None => {
+            let root = project_file.parent().unwrap_or(project_file);
+            let remote_url = project::origin_url(&git, root)?;
+            let repo = on_demand::check_origin(&remote_url)?;
+            (root, remote_url, repo)
+        }
+    };
     // OWL-98: a host where agent runs cannot be confined is refused before
     // the keychain is opened, so it never prompts for or loads a secret for
     // a run that cannot happen. `do`, `continue` and `watch` always confine
@@ -148,7 +233,7 @@ fn run_with(
                 .map_err(|error| format!("the machine's run slots: {error}"))?
             {
                 Some(slot) => Some(slot),
-                None => return Ok(ExitCode::SUCCESS),
+                None => return Ok(Ended::Code(ExitCode::SUCCESS)),
             }
         }
         None => None,
@@ -405,7 +490,7 @@ fn run_with(
             step::child(&on_demand, &envelope, &mut sink, &mut reported).map_err(|error| {
                 format!("the step's outcome record could not be written: {error}")
             })?;
-            return Ok(code);
+            return Ok(Ended::Code(code));
         }
         _ => {
             // OWL-152: until Ctrl-C ends the process; each continue's outcome
@@ -451,19 +536,51 @@ fn run_with(
             let mut continued = |ticket: &TicketId, outcome: &_, sink: &mut EventSink<'_>| {
                 report(system, desktop, tracker.as_ref(), ticket, outcome, sink);
             };
+            // A served watch reads its default branch again between two
+            // passes, and ends once a newer project file is accepted there,
+            // its steps under way ending first, to start again on it
+            // (OWL-434); a watch in a terminal only sleeps.
+            let mut between = served.map(|_| Between::new(POLL_INTERVAL));
+            let mut reload = false;
+            let served_git = project::runner_git();
+            let personal = owlshift_platform::paths::personal_config_file();
+            let accept = |text: &str| served::accept(&repo, text, personal.clone());
+            let mut served_out = io::stdout();
+            let mut served_sink = EventSink::new(
+                repo.to_string(),
+                EventLog::in_dir(&data_dir),
+                &mut served_out,
+            );
             let mut sleep = |interval| {
                 thread::sleep(interval);
+                if let (Some(served), Some(between)) = (served, between.as_mut())
+                    && between.check(
+                        &served_git,
+                        served,
+                        &accept,
+                        desktop,
+                        &mut served_sink,
+                        &mut io::stdout(),
+                        Instant::now(),
+                    )
+                {
+                    reload = true;
+                    return false;
+                }
                 true
             };
             if mode == Mode::Drain {
-                // Each step in a child, this binary itself (OWL-399).
+                // Each step in a child, this binary itself (OWL-399), on the
+                // served project's kept file when served (OWL-434).
                 let program = std::env::current_exe().map_err(|error| {
                     format!("this program's own path, which runs each step: {error}")
                 })?;
+                let served_repo = served.map(|served| served.repo.clone());
                 // Each takes one of the machine's run slots (OWL-409).
-                let children =
-                    Children::new(move |ticket, envelope| step_command(&program, ticket, envelope))
-                        .with_slots(slots);
+                let children = Children::new(move |ticket, envelope| {
+                    step_command(&program, ticket, envelope, served_repo.as_ref())
+                })
+                .with_slots(slots);
                 watch.run_with_children(
                     true,
                     &children,
@@ -475,17 +592,21 @@ fn run_with(
             } else {
                 watch.run(&mut sink, &mut io::stdout(), &mut continued, &mut sleep);
             }
-            return Ok(ExitCode::SUCCESS);
+            return Ok(if reload {
+                Ended::Reload
+            } else {
+                Ended::Code(ExitCode::SUCCESS)
+            });
         }
     };
-    Ok(report(
+    Ok(Ended::Code(report(
         system,
         desktop,
         tracker.as_ref(),
         ticket,
         &outcome,
         &mut sink,
-    ))
+    )))
 }
 
 /// How many steps of `owlshift watch --drain` this machine runs at once
@@ -515,10 +636,19 @@ fn envelope_of(text: &str, ticket: &TicketId) -> Result<StepEnvelope, String> {
 
 /// The child that runs a step of `ticket` for `owlshift watch --drain`:
 /// `program`, this binary, as `owlshift continue <TICKET> --step
-/// <ENVELOPE>` (OWL-399).
-fn step_command(program: &Path, ticket: &TicketId, envelope: &str) -> Command {
+/// <ENVELOPE>` (OWL-399), with `--served <OWNER/REPO>` for a served
+/// project's watch (OWL-434).
+fn step_command(
+    program: &Path,
+    ticket: &TicketId,
+    envelope: &str,
+    served: Option<&Repo>,
+) -> Command {
     let mut command = Command::new(program);
     command.args(["continue", ticket.as_str(), "--step", envelope]);
+    if let Some(repo) = served {
+        command.args(["--served", &repo.to_string()]);
+    }
     command
 }
 
@@ -881,7 +1011,9 @@ mod refusals {
             Mode::Watch,
             Mode::Step("OWL-1", &step),
         ] {
-            let refusal = run_with(&NoSandbox, &config, mode, no_keychain).unwrap_err();
+            let refusal = run_with(&NoSandbox, &config, mode, no_keychain, None)
+                .err()
+                .unwrap();
             assert_eq!(refusal, SandboxError::Unsupported.to_string(), "{mode:?}");
         }
 
@@ -895,8 +1027,15 @@ mod refusals {
                 "the step's envelope is OWL-2's, not OWL-1's",
             ),
         ] {
-            let refusal =
-                run_with(&NoSandbox, &config, Mode::Step("OWL-1", text), no_keychain).unwrap_err();
+            let refusal = run_with(
+                &NoSandbox,
+                &config,
+                Mode::Step("OWL-1", text),
+                no_keychain,
+                None,
+            )
+            .err()
+            .unwrap();
             assert!(refusal.starts_with(said), "{refusal}");
         }
     }
@@ -921,13 +1060,25 @@ mod refusals {
     #[test]
     fn the_drains_child_continues_the_ticket_with_its_envelope() {
         let text = envelope("OWL-1").render();
-        let command = step_command(
-            Path::new("/opt/owlshift"),
-            &TicketId::new("OWL-1").unwrap(),
-            &text,
-        );
+        let ticket = TicketId::new("OWL-1").unwrap();
+        let command = step_command(Path::new("/opt/owlshift"), &ticket, &text, None);
         assert_eq!(command.get_program(), "/opt/owlshift");
         let args: Vec<_> = command.get_args().collect();
         assert_eq!(args, ["continue", "OWL-1", "--step", text.as_str()]);
+        // A served project's step runs on its watch's kept file (OWL-434).
+        let repo = Repo::parse("acme/web").unwrap();
+        let command = step_command(Path::new("/opt/owlshift"), &ticket, &text, Some(&repo));
+        let args: Vec<_> = command.get_args().collect();
+        assert_eq!(
+            args,
+            [
+                "continue",
+                "OWL-1",
+                "--step",
+                text.as_str(),
+                "--served",
+                "acme/web"
+            ]
+        );
     }
 }
