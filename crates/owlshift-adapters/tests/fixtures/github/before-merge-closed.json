@@ -1,0 +1,43 @@
+{
+  "recorded": "2026-10-24 on pitchopp/owlshift-merge-sandbox, recorded live with a personal token (the gh login, an administrator): the same pull request, closed",
+  "exchanges": [
+    {
+      "request": {
+        "query": "query MergeRead($owner: String!, $name: String!, $number: Int!) { rateLimit { cost remaining resetAt } repository(owner: $owner, name: $name) { pullRequest(number: $number) { state headRefOid isDraft reviewDecision baseRefName baseRef { target { oid } } } } }",
+        "variables": {
+          "name": "owlshift-merge-sandbox",
+          "number": 8,
+          "owner": "pitchopp"
+        }
+      },
+      "status": 200,
+      "response": {
+        "data": {
+          "rateLimit": {
+            "cost": 1,
+            "remaining": 4841,
+            "resetAt": "2026-10-24T18:21:58Z"
+          },
+          "repository": {
+            "pullRequest": {
+              "baseRef": {
+                "target": {
+                  "oid": "6eaef240212e3d89855f14411a93befedb0b6323"
+                }
+              },
+              "baseRefName": "main",
+              "headRefOid": "f1b269aa50be1060a1490a761fbcd4d873026a33",
+              "isDraft": false,
+              "reviewDecision": null,
+              "state": "CLOSED"
+            }
+          }
+        }
+      },
+      "rate": {
+        "remaining": 4841,
+        "reset": 1792866118
+      }
+    }
+  ]
+}

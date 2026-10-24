@@ -37,17 +37,21 @@ pub enum Capability {
     ReadReviewComments,
     /// Read whether a pull request can merge.
     ReadMergeState,
+    /// Merge a pull request at an expected head, after reading its review
+    /// decision (OWL-446): optional, needed only for merge on green.
+    MergePullRequest,
 }
 
 impl Capability {
     /// Every row, in the table's order.
-    pub const ALL: [Self; 6] = [
+    pub const ALL: [Self; 7] = [
         Self::OpenPullRequest,
         Self::ReadChecks,
         Self::ReadReviewComments,
         Self::PushBranch,
         Self::PushRef,
         Self::ReadMergeState,
+        Self::MergePullRequest,
     ];
 
     /// A short description, for reports such as `owlshift doctor`.
@@ -59,6 +63,7 @@ impl Capability {
             Self::ReadChecks => "read the complete check set",
             Self::ReadReviewComments => "read review comments",
             Self::ReadMergeState => "read merge state",
+            Self::MergePullRequest => "merge at an expected head",
         }
     }
 }
@@ -204,6 +209,34 @@ pub enum PrState {
     Open,
     Closed,
     Merged,
+}
+
+/// The forge's review decision for a pull request (GitHub's
+/// `reviewDecision`, OWL-446): what the repository's required reviews say,
+/// whatever the token reading it may bypass (C19, 2026-10-24).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReviewDecision {
+    /// No review is required.
+    NotRequired,
+    Approved,
+    /// A required review is missing, or a decision the adapter does not know.
+    Required,
+    ChangesRequested,
+}
+
+/// The last read before a merge (OWL-446; architecture section 5, "Merge on
+/// green", "The last read").
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MergeRead {
+    pub state: PrState,
+    pub head: CommitId,
+    pub draft: bool,
+    pub review: ReviewDecision,
+    /// The base branch the pull request itself targets, which a person can
+    /// change, and its head.
+    pub base: Branch,
+    pub base_head: CommitId,
+    pub rate: Option<RateLimit>,
 }
 
 /// How a pull request is merged: the project's `[forge] merge_method`

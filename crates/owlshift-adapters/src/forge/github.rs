@@ -42,8 +42,9 @@ use owlshift_contracts::brief::MAX_EXCERPT_BYTES;
 
 use crate::forge::{
     BaseChecks, Branch, Capability, Check, CheckKind, CheckSet, CheckState, CommitId,
-    DefaultBranch, Error, ErrorKind, InlineComment, MergeAnswer, MergeMethod, Mergeable, PrState,
-    PullRequest, PullRequestRead, RateLimit, Refusal, Repo, Review, ReviewsRead,
+    DefaultBranch, Error, ErrorKind, InlineComment, MergeAnswer, MergeMethod, MergeRead, Mergeable,
+    PrState, PullRequest, PullRequestRead, RateLimit, Refusal, Repo, Review, ReviewDecision,
+    ReviewsRead,
 };
 pub use crate::graphql::{RateHeaders, Response, RestAnswer, Transport};
 
@@ -425,6 +426,7 @@ impl GitHubForge {
         Capability::ReadReviewComments,
         Capability::PushBranch,
         Capability::ReadMergeState,
+        Capability::MergePullRequest,
     ];
 
     /// The adapter over HTTPS with this token.
@@ -723,6 +725,52 @@ impl GitHubForge {
             .filter(|part| !part.trim().is_empty())
             .collect::<Vec<_>>()
             .join("\n\n"))
+    }
+
+    /// The last read before merging pull request `number` (OWL-446;
+    /// architecture section 5, "Merge on green", "The last read"): its state,
+    /// head, draft, review decision, and the base branch it targets with that
+    /// branch's head, in one query, with its cost. GitHub's `reviewDecision`
+    /// reads review required whatever this token may bypass (C19,
+    /// 2026-10-24).
+    pub fn merge_read(&self, number: u64) -> Result<MergeRead, Error> {
+        let variables = json!({
+            "owner": self.repo.owner(), "name": self.repo.name(), "number": number,
+        });
+        let data: MergeReadData = self.call(MERGE_READ_QUERY, variables)?;
+        let mut rate = Rates::default();
+        rate.add(data.rate_limit);
+        let pr = data.repository.pull_request.ok_or_else(|| {
+            Error::new(
+                ErrorKind::NotFound,
+                format!("no pull request #{number} in {}", self.repo),
+            )
+        })?;
+        // A base branch deleted since: no base to merge onto.
+        let base_head = pr
+            .base_ref
+            .and_then(|base| base.target)
+            .and_then(|target| CommitId::new(target.oid).ok())
+            .ok_or_else(|| {
+                Error::new(
+                    ErrorKind::NotFound,
+                    format!(
+                        "no base branch {} for pull request #{number} in {}",
+                        pr.base_ref_name, self.repo
+                    ),
+                )
+            })?;
+        Ok(MergeRead {
+            state: pr_state(&pr.state)?,
+            head: CommitId::new(pr.head_ref_oid)
+                .map_err(|e| invalid(format!("unexpected head from GitHub: {e}")))?,
+            draft: pr.is_draft,
+            review: review_decision(pr.review_decision.as_deref()),
+            base: Branch::new(pr.base_ref_name)
+                .map_err(|e| invalid(format!("unexpected base branch from GitHub: {e}")))?,
+            base_head,
+            rate: rate.get(),
+        })
     }
 
     /// Merges pull request `number` by `method` if its head is still
@@ -1127,6 +1175,12 @@ const REVIEWS_QUERY: &str = "query Reviews($owner: String!, $name: String!, $num
     nodes { fullDatabaseId author { login } state submittedAt body commit { oid } \
     comments(first: 100) { nodes { path line body } } } } } } }";
 
+/// The last read before a merge (OWL-446): no check, so one light query.
+const MERGE_READ_QUERY: &str = "query MergeRead($owner: String!, $name: String!, \
+    $number: Int!) { rateLimit { cost remaining resetAt } \
+    repository(owner: $owner, name: $name) { pullRequest(number: $number) { \
+    state headRefOid isDraft reviewDecision baseRefName baseRef { target { oid } } } } }";
+
 /// The checks of the base head and of `base_at_push` (OWL-209).
 const BASE_CHECKS_QUERY: &str = "query BaseChecks($owner: String!, $name: String!, \
     $head: String!, $atPush: String!, $first: Int!) { \
@@ -1516,6 +1570,18 @@ fn mergeable(value: &str) -> Mergeable {
     }
 }
 
+/// GitHub's `reviewDecision`: `null` when no review is required (C19,
+/// 2026-10-24). A value the adapter does not know is a review required, so
+/// a new one never merges past a review.
+fn review_decision(value: Option<&str>) -> ReviewDecision {
+    match value {
+        None => ReviewDecision::NotRequired,
+        Some("APPROVED") => ReviewDecision::Approved,
+        Some("CHANGES_REQUESTED") => ReviewDecision::ChangesRequested,
+        Some(_) => ReviewDecision::Required,
+    }
+}
+
 /// A check run: pending until completed, then by its conclusion. A
 /// completed run without a conclusion, or with one the adapter does not
 /// know, is failed.
@@ -1658,6 +1724,40 @@ struct ReviewsData {
     repository: ReviewsRepository,
     #[serde(default)]
     rate_limit: Option<GhRateLimit>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct MergeReadData {
+    repository: MergeReadRepository,
+    #[serde(default)]
+    rate_limit: Option<GhRateLimit>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct MergeReadRepository {
+    pull_request: Option<MergeReadPullRequest>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct MergeReadPullRequest {
+    state: String,
+    head_ref_oid: String,
+    is_draft: bool,
+    #[serde(default)]
+    review_decision: Option<String>,
+    base_ref_name: String,
+    /// `null` once the base branch is deleted.
+    #[serde(default)]
+    base_ref: Option<GhBaseRef>,
+}
+
+#[derive(Deserialize)]
+struct GhBaseRef {
+    #[serde(default)]
+    target: Option<GhOid>,
 }
 
 #[derive(Deserialize)]
@@ -2062,6 +2162,22 @@ mod tests {
             assert_eq!(status_state(state), expected, "{state}");
         }
         assert_eq!(mergeable("SOMETHING_NEW"), Mergeable::Unknown);
+    }
+
+    /// OWL-446: a review decision the adapter does not know never clears.
+    /// Approved and changes requested need a second account to record, so
+    /// they are pinned here.
+    #[test]
+    fn a_review_decision_clears_only_when_approved_or_not_required() {
+        for (value, expected) in [
+            (None, ReviewDecision::NotRequired),
+            (Some("APPROVED"), ReviewDecision::Approved),
+            (Some("CHANGES_REQUESTED"), ReviewDecision::ChangesRequested),
+            (Some("REVIEW_REQUIRED"), ReviewDecision::Required),
+            (Some("SOMETHING_NEW"), ReviewDecision::Required),
+        ] {
+            assert_eq!(review_decision(value), expected, "{value:?}");
+        }
     }
 
     /// Answers with prepared bodies, in order, and keeps the requests.

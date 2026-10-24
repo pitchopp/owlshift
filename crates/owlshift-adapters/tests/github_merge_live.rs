@@ -26,7 +26,17 @@
 //!   cargo test -p owlshift-adapters --test github_merge_live -- --ignored --nocapture records_protection_refusals
 //! ```
 //!
-//! Both need a `main` branch, and the token of `OWLSHIFT_GITHUB_TOKEN` or the
+//! `records_merge_reads` (OWL-446) records the last read before a merge as
+//! `tests/fixtures/github/before-merge-*.json` on the same public repository:
+//! one pull request open, under a required review not enforced for
+//! administrators, then closed.
+//!
+//! ```sh
+//! OWLSHIFT_LIVE_GITHUB_PROTECTED=<owner>/<public-test-repo> \
+//!   cargo test -p owlshift-adapters --test github_merge_live -- --ignored --nocapture records_merge_reads
+//! ```
+//!
+//! All need a `main` branch, and the token of `OWLSHIFT_GITHUB_TOKEN` or the
 //! `gh` login, an administrator of the repository; the setup goes through
 //! `gh api` and that same login. Only statuses and GitHub's messages are
 //! printed, never a token.
@@ -38,7 +48,9 @@ use std::process::{Command, Stdio};
 use serde_json::{Value, json};
 
 use owlshift_adapters::forge::github::{GitHubForge, HttpTransport};
-use owlshift_adapters::forge::{CommitId, MergeAnswer, MergeMethod, Repo};
+use owlshift_adapters::forge::{
+    CommitId, MergeAnswer, MergeMethod, MergeRead, PrState, Repo, ReviewDecision,
+};
 
 use support::Recorder;
 
@@ -203,6 +215,32 @@ impl Sandbox {
         );
         eprintln!("{fixture}: {answer:?}");
         answer
+    }
+
+    /// Records the last read before a merge of `number` as `fixture`
+    /// (OWL-446).
+    fn read(&self, fixture: &str, what: &str, number: u64) -> MergeRead {
+        let recorder = Recorder::over(
+            HttpTransport::new(support::github_token()),
+            support::fixtures("github"),
+        );
+        let forge = GitHubForge::with_transport(recorder.clone(), self.repo.clone());
+        let read = forge
+            .merge_read(number)
+            .unwrap_or_else(|e| panic!("{fixture}: {:?}: {e}", e.kind));
+        let date = jiff::Timestamp::now().strftime("%Y-%m-%d");
+        recorder.write(
+            fixture,
+            &format!(
+                "{date} on {}, recorded live with a personal token (the gh login, an administrator): {what}",
+                self.repo
+            ),
+        );
+        eprintln!(
+            "{fixture}: {:?} {:?} draft {}",
+            read.state, read.review, read.draft
+        );
+        read
     }
 
     /// Whether GitHub has computed the pull request's mergeability, polled
@@ -417,4 +455,50 @@ fn records_protection_refusals() {
         &head,
         MergeMethod::Squash,
     );
+}
+
+/// The last read before a merge (OWL-446, C19): one pull request read open
+/// without protection, under a required review not enforced for
+/// administrators, which `reviewDecision` reads as required though this
+/// token merges past it, and closed.
+#[test]
+#[ignore = "live: protects on GitHub; set OWLSHIFT_LIVE_GITHUB_PROTECTED=<owner>/<public-test-repo>"]
+fn records_merge_reads() {
+    let mut sandbox = Sandbox::new("OWLSHIFT_LIVE_GITHUB_PROTECTED");
+    let stamp = sandbox.stamp;
+    sandbox.unprotect();
+
+    let (number, head) = sandbox.pull_request("read", &format!("read-{stamp}.txt"), false);
+    let base = sandbox.main();
+    let read = sandbox.read(
+        "before-merge-open.json",
+        "an open pull request, no protection",
+        number,
+    );
+    assert_eq!(
+        (read.state, read.review, &read.head, &read.base_head),
+        (PrState::Open, ReviewDecision::NotRequired, &head, &base)
+    );
+    sandbox.protect(&json!({
+        "required_status_checks": null,
+        "enforce_admins": false,
+        "required_pull_request_reviews": { "required_approving_review_count": 1 },
+        "restrictions": null,
+    }));
+    // GitHub takes a moment to apply a protection to its pull requests.
+    std::thread::sleep(std::time::Duration::from_secs(3));
+    let read = sandbox.read(
+        "before-merge-review-required.json",
+        "the same pull request, a review required but not enforced for administrators",
+        number,
+    );
+    assert_eq!(read.review, ReviewDecision::Required);
+    sandbox.unprotect();
+    sandbox.close(number);
+    let read = sandbox.read(
+        "before-merge-closed.json",
+        "the same pull request, closed",
+        number,
+    );
+    assert_eq!(read.state, PrState::Closed);
 }
