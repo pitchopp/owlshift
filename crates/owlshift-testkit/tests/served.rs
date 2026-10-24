@@ -58,7 +58,9 @@ struct Bench {
 impl Bench {
     fn new(first: &str) -> Self {
         let tmp = tempfile::tempdir().unwrap();
-        let root = fs::canonicalize(tmp.path()).unwrap();
+        // Not canonicalized: on Windows that gives a verbatim `\\?\` path,
+        // which git cannot read its configuration files from.
+        let root = tmp.path().to_owned();
         let env = GitEnv::create(root.join("home")).unwrap();
         let fixture = root.join("fixture");
         fs::create_dir_all(&fixture).unwrap();
