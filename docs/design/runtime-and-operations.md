@@ -186,6 +186,7 @@ resolver_passes = 5                  # optional, 1 to 50 or "unlimited": runs in
 quiet_window_minutes = 10            # optional, 1 to 1440: how long a decider's last edit must rest before the answer counts
 max_open_prs = 3                     # optional, 1 to 20: open pull requests at which the drain starts no new Build
 # max_in_flight = 3                  # optional, 1 to 10, 1 when absent: tickets dispatched and not yet at Watch at once (P6)
+# overlap = "exclusive"              # optional, exclusive | rebase: whether two Owlshift tickets may build on the same file at once (P6)
 
 [zones."backend/billing"]
 owner = "2f9c51d0-6a3e-4b7e-9d41-0c8a7e5b3f12"   # a tracker account id; decides unassigned tickets here
