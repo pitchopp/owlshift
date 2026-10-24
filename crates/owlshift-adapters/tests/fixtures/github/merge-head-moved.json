@@ -1,0 +1,25 @@
+{
+  "recorded": "2026-10-24 on pitchopp/owlshift-live-sandbox, recorded live with a personal token (the gh login, an administrator): a merge whose sha is the base, not the head",
+  "exchanges": [
+    {
+      "request": {
+        "body": {
+          "merge_method": "squash",
+          "sha": "ea6bf14d119d75e4f2f91cb3e1830447c7e27ed9"
+        },
+        "method": "PUT",
+        "path": "repos/pitchopp/owlshift-live-sandbox/pulls/6/merge"
+      },
+      "status": 409,
+      "response": {
+        "documentation_url": "https://docs.github.com/rest/pulls/pulls#merge-a-pull-request",
+        "message": "Head branch was modified. Review and try the merge again.",
+        "status": "409"
+      },
+      "rate": {
+        "remaining": 4726,
+        "reset": 1792823999
+      }
+    }
+  ]
+}

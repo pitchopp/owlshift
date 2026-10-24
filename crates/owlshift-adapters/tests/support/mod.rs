@@ -155,6 +155,16 @@ impl Transport for Replay {
             rate: Rate::headers(next.rate),
         })
     }
+
+    fn put(&self, path: &str, body: &Value) -> Result<Response, String> {
+        self.send(&rest_request("PUT", path, body))
+    }
+}
+
+/// How a fixture holds a REST write (OWL-444): its method, its path and its
+/// body, where a GraphQL exchange holds its query.
+pub fn rest_request(method: &str, path: &str, body: &Value) -> Value {
+    json!({ "method": method, "path": path, "body": body })
 }
 
 /// The key for recording: `LINEAR_API_KEY`, or the `LINEAR_API_KEY=` line of
@@ -368,13 +378,33 @@ impl Transport for Recorder {
                 }
             }
         };
+        Ok(self.keep(exchange))
+    }
+
+    /// A REST write is sent as is and recorded as [`rest_request`]: no
+    /// answer is made up for it.
+    fn put(&self, path: &str, body: &Value) -> Result<Response, String> {
+        let answer = self.live.put(path, body)?;
+        Ok(self.keep(Exchange {
+            request: rest_request("PUT", path, body),
+            status: answer.status,
+            response: serde_json::from_str(&answer.body).unwrap_or(Value::String(answer.body)),
+            rate: Rate::of(answer.rate),
+            synthesized: None,
+        }))
+    }
+}
+
+impl Recorder {
+    /// Logs `exchange` and returns its answer.
+    fn keep(&self, exchange: Exchange) -> Response {
         let answer = Response {
             status: exchange.status,
             body: exchange.response.to_string(),
             rate: Rate::headers(exchange.rate),
         };
         self.log.lock().unwrap().push(exchange);
-        Ok(answer)
+        answer
     }
 }
 

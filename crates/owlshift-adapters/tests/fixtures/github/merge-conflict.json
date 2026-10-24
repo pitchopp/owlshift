@@ -1,0 +1,25 @@
+{
+  "recorded": "2026-10-24 on pitchopp/owlshift-live-sandbox, recorded live with a personal token (the gh login, an administrator): a merge of a pull request in conflict with its base",
+  "exchanges": [
+    {
+      "request": {
+        "body": {
+          "merge_method": "squash",
+          "sha": "c6cce17391ebb715cdd640abc371e6cfb1ea9fc4"
+        },
+        "method": "PUT",
+        "path": "repos/pitchopp/owlshift-live-sandbox/pulls/8/merge"
+      },
+      "status": 405,
+      "response": {
+        "documentation_url": "https://docs.github.com/rest/pulls/pulls#merge-a-pull-request",
+        "message": "Pull Request has merge conflicts",
+        "status": "405"
+      },
+      "rate": {
+        "remaining": 4708,
+        "reset": 1792823999
+      }
+    }
+  ]
+}
