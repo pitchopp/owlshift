@@ -30,9 +30,13 @@
 //! (OWL-183), and whether it was the build role's own decisions, which holds
 //! them to asking (`decisions_refused`, OWL-186), kept as `owlshift do` and
 //! `continue` keep them in the ticket ref until a Build result is accepted
-//! (`owlshift_runner::on_demand::build_refusal_after`, OWL-192). A
-//! `continue` step is a person's new command: the gate's failure, which a
-//! command holds in memory, is gone, and a parked ticket restarts. That
+//! (`owlshift_runner::on_demand::build_refusal_after`, OWL-192). A design
+//! or review run whose result was refused tells the next run of its role
+//! why, a refusal it was not told of never spending the last attempt, as
+//! `owlshift do`'s design and review loops do (OWL-430). A
+//! `continue` step is a person's new command: the gate's failure and such
+//! a refusal, which a command holds in memory, are gone, and a parked
+//! ticket restarts. That
 //! part is a stand-in: the writer replaces it, and
 //! the scenario files stay.
 //!
@@ -133,7 +137,8 @@ use owlshift_runner::answer_check::{self, Readiness};
 use owlshift_runner::executor::gate::GATE_LOG;
 use owlshift_runner::executor::{Executor, Failure, Git, Outcome, RESULT_PATH, RunReport, RunSpec};
 use owlshift_runner::on_demand::{
-    account_author, asked_choices, build_refusal_after, stage_event, tell_build, thread,
+    account_author, asked_choices, build_refusal_after, result_refusal, stage_event, tell_build,
+    thread, told_retry,
 };
 use owlshift_runner::resolver::{self, Fallback, Quotable, Resolved};
 use owlshift_runner::writer::{
@@ -510,6 +515,11 @@ struct Driver {
     /// The latest failure of the gate the executor ran, for the next Build
     /// brief; a passing gate clears it, other outcomes leave it.
     gate_failure: Option<GateFailure>,
+    /// Why the last run was refused, when it was a design or review-stage
+    /// run, for the next run of the same role, as `owlshift do` tells the
+    /// next run of the same retry loop (OWL-430): any other run's outcome
+    /// replaces it, and a `continue` drops it with the command's memory.
+    told: Option<(Role, String)>,
     /// Whether the ticket would have a ticket ref: made once a round opens,
     /// a decision is kept or a Build result is refused, and kept after,
     /// whatever it holds. A `continue` needs one, and a PARKED comment says
@@ -639,6 +649,7 @@ impl Driver {
             gate: scenario.gate.clone().unwrap_or(config.stack.gate),
             setup: scenario.setup.clone().unwrap_or(config.stack.setup),
             gate_failure: None,
+            told: None,
             has_ref: false,
             branch: format!("owlshift/{}", scenario.ticket),
             id: scenario.ticket.clone(),
@@ -689,6 +700,7 @@ impl Driver {
             return Err("the last run's questions wait for a `resolve` step".to_owned());
         }
         self.gate_failure = None;
+        self.told = None;
         if !matches!(self.state.status(), Status::Parked { .. }) {
             return Ok(None);
         }
@@ -1197,6 +1209,13 @@ impl Driver {
         if let Some(gate) = &report.gate {
             self.gate_failure = gate.failure.clone();
         }
+        // Told to the next run of the same role only, as `owlshift do`'s
+        // design and review loops tell it (OWL-430); Build's is the ticket
+        // ref's, below.
+        self.told = (told_retry(role) && role != Role::Build)
+            .then(|| result_refusal(&report.outcome))
+            .flatten()
+            .map(|reason| (role, reason));
         // What the ticket ref keeps for the next Build run, whatever command
         // runs it, as `owlshift do` and `continue` keep it (OWL-192).
         // A result that asks clears it only with what keeps its questions,
@@ -1308,7 +1327,11 @@ impl Driver {
                     .latest()
                     .and_then(|ask| ask.result_refusal.clone()),
                 Role::Resolver => self.questions.resolver_refusal.clone(),
-                _ => None,
+                _ => self
+                    .told
+                    .as_ref()
+                    .filter(|(told, _)| *told == role)
+                    .map(|(_, reason)| reason.clone()),
             },
             decisions_refused: false,
             refused_choices: Vec::new(),

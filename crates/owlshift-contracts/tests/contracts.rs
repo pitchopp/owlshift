@@ -1576,7 +1576,7 @@ fn brief_rejections() {
     );
     rejects(
         "newer format",
-        parse(|v| v["format"] = json!(28)),
+        parse(|v| v["format"] = json!(29)),
         "upgrade Owlshift",
     );
     rejects(
@@ -1685,13 +1685,27 @@ fn brief_rejections() {
         "missing field `always_human`",
     );
     // The refusal of the previous result: Build's (OWL-180), the answer
-    // check's (OWL-184) and the resolver's (OWL-191), no other role's,
-    // within its cap.
+    // check's (OWL-184), the resolver's (OWL-191), intake's (OWL-402), and
+    // since format 28 the design and review roles' (OWL-430); never the
+    // rebase role's, within its cap.
     rejects(
-        "a refused result in a verifier's brief",
-        parse(|v| v["role"] = json!("verify")),
-        "a refused result is given but the role is verify, not build, answer_check, resolver or intake",
+        "a refused result in a rebase's brief",
+        parse(|v| {
+            v["role"] = json!("rebase");
+            v["rebase"] = json!({ "pull_request": 7, "url": "u", "branch": "b",
+                "head": "h", "base_branch": "main", "onto": "o" });
+        }),
+        "a refused result is given but the role is rebase, which is never told one",
     );
+    // The review roles' briefs need their plan and review: the runner's
+    // bench (`design_scenarios`) gives them a refusal.
+    Brief::parse(&edited("brief.json", |v| {
+        v["role"] = json!("design");
+        v["permissions"]["level"] = json!("read_only");
+        v.as_object_mut().unwrap().remove("checkpoint");
+        v.as_object_mut().unwrap().remove("gate_failure");
+    }))
+    .unwrap();
     Brief::parse(&edited("brief.json", |v| v["role"] = json!("answer_check"))).unwrap();
     Brief::parse(&edited("brief.json", |v| {
         v["role"] = json!("resolver");

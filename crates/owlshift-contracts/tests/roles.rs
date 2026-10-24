@@ -1116,6 +1116,7 @@ fn design_prompt_matches_the_contracts() {
             "plan.base",
             "approval",
             "findings.mode",
+            "result_refusal",
             "result_path",
         ],
     );
@@ -1171,6 +1172,7 @@ fn design_review_prompt_matches_the_contracts() {
             "review.since.parts",
             "review.since.steps",
             "review.since.removed",
+            "result_refusal",
             "result_path",
         ],
     );
@@ -1205,6 +1207,7 @@ fn verify_prompt_matches_the_contracts() {
             "pull_request_reviews.author.relation",
             "pull_request_reviews.body",
             "pull_request_reviews.comments.path",
+            "result_refusal",
             "result_path",
         ],
     );
@@ -1245,6 +1248,7 @@ fn arbiter_prompt_matches_the_contracts() {
             "pull_request_reviews.author.relation",
             "pull_request_reviews.body",
             "pull_request_reviews.comments.path",
+            "result_refusal",
             "result_path",
         ],
     );
