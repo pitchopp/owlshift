@@ -137,6 +137,7 @@ l5-report)
 cleanup)
   for l in $(launchctl list | awk -v L="$L." 'index($3, L) == 1 {print $3}'); do launchctl bootout "$dom/$l"; echo "bootout $l status=$?"; done
   [ -f "$base/l3/service" ] && /usr/bin/security delete-generic-password -s "$(cat "$base/l3/service")" -a probe > /dev/null 2>&1
-  rm -rf "$base"; echo "probe agents left: $(launchctl list | grep -c "$L.")" ;;
+  rm -rf "$base"; rmdir "$(dirname "$base")" 2>/dev/null
+  echo "probe agents left: $(launchctl list | grep -c "$L.") (a job booted out may take up to 60 s to end)" ;;
 *) sed -n '2,22p' "$0" ;;
 esac
