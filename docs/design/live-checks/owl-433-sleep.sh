@@ -38,7 +38,7 @@ EOF
 rustc -O -o "$d/probe" "$d/probe.rs" 2> "$d/rustc.err" || { echo "rustc failed: $(head -c 300 "$d/rustc.err")"; exit 1; }
 t0=$(date +%s)
 "$d/probe" > "$d/probe.out" & ppid_=$!
-(cd "$d" && claude -p "Use the Bash tool exactly once, to run this command: : > $d/ready; sleep 240 -- then reply with the word done." \
+(cd "$d" && BASH_DEFAULT_TIMEOUT_MS=600000 BASH_MAX_TIMEOUT_MS=600000 claude -p "Use the Bash tool exactly once, to run this command: : > $d/ready; sleep 240 -- then reply with the word done." \
   --max-turns 3 --max-budget-usd 0.50 --allowedTools Bash --output-format json > "$d/claude.json" 2> "$d/claude.err"
   echo $? > "$d/claude.status"; date +%s > "$d/claude.end") & cpid=$!
 i=0; while [ ! -e "$d/ready" ] && [ $i -lt 120 ]; do sleep 1; i=$((i+1)); done
@@ -48,7 +48,7 @@ sleep 10; pmset sleepnow > /dev/null; echo "pmset sleepnow status=$?"
 wait "$cpid"; cpid=
 wait "$ppid_"; ppid_=
 echo "probe: $(cat "$d/probe.out")"
-echo "claude: exit status $(cat "$d/claude.status"), ended $(( $(cat "$d/claude.end") - t0 )) s after the start (wall)"
+echo "claude: Bash tool timeout 600000 ms (BASH_DEFAULT_TIMEOUT_MS, BASH_MAX_TIMEOUT_MS), exit status $(cat "$d/claude.status"), ended $(( $(cat "$d/claude.end") - t0 )) s after the start (wall)"
 echo "claude result: $(grep -oE '"(subtype|is_error|num_turns)":("[a-z_]+"|true|false|[0-9]+)' "$d/claude.json" | tr '\n' ' ')"
 echo "claude stderr bytes: $(wc -c < "$d/claude.err" | tr -d ' ')"
 since=$(date -r "$t0" "+%Y-%m-%d %H:%M:%S")
