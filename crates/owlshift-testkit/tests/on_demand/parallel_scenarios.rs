@@ -134,6 +134,81 @@ fn scenario_s5_three_tickets_in_flight_at_once() {
     assert!(!bench.dirs().obligations_stand());
 }
 
+/// OWL-161, the drain's guard within a pass: three tickets whose zones are
+/// apart are due in one pass, steps in watch's own process. Once DEMO-1's
+/// dispatch has run, the stop file is written: the two other dispatches
+/// never start, and watch ends on its own, saying so, its stop recorded and
+/// the file removed, nothing quarantined.
+#[test]
+fn a_drain_asked_mid_pass_starts_no_other_step() {
+    let bench = parallel_bench("max_in_flight = 3\n");
+    for (id, text) in [("DEMO-2", "Document it."), ("DEMO-4", "Library it.")] {
+        bench.put_ticket(
+            id,
+            "maintainer",
+            "Todo",
+            &["agent"],
+            "blocked_by = [\"DEMO-9\"]\n",
+            text,
+        );
+    }
+    let mut replies: Vec<Reply> = ["app", "docs", "lib"]
+        .iter()
+        .map(|zone| bench.reply(None, Some(&standard_declaring(&[zone]))))
+        .collect();
+    replies.push(bench.read(&planned()));
+    let stop = owlshift_runner::watch::stop::file(&bench.dirs());
+    let (passes, lines) = bench
+        .with_on_demand(replies, None, Vec::new(), |on_demand, sink| {
+            let watch = Watch {
+                on_demand,
+                interval: POLL_INTERVAL,
+            };
+            let (mut lines, mut pass) = (Vec::new(), 0);
+            watch.run_drain(
+                sink,
+                &mut lines,
+                &mut |_, outcome, _| {
+                    if matches!(outcome, Err(Stop::Stepped { .. })) && !stop.exists() {
+                        fs::write(&stop, "").unwrap();
+                    }
+                },
+                &mut |_| {
+                    pass += 1;
+                    let blocker_done = ["DEMO-1", "DEMO-2", "DEMO-4"]
+                        .iter()
+                        .all(|id| bench.record_of(id).is_some_and(|r| r.intake.is_some()));
+                    if blocker_done {
+                        bench.put_ticket("DEMO-9", "maintainer", "Done", &[], "", "A blocker.");
+                    }
+                    pass < 20
+                },
+            );
+            (pass, String::from_utf8(lines).unwrap())
+        })
+        .0;
+    let events = bench.events();
+    assert!(passes < 20, "watch did not end on its own\n{lines}");
+    assert_eq!(dispatched(&events), ["DEMO-1"], "{lines}");
+    for id in ["DEMO-2", "DEMO-4"] {
+        assert_eq!(
+            status_of(&bench, id),
+            Some(Status::Active(Stage::Ready)),
+            "{id}"
+        );
+    }
+    let stops: Vec<_> = events
+        .iter()
+        .filter(|e| e.kind == EventKind::Decision && e.data.get("watch") == Some(&json!("stop")))
+        .map(|e| (e.data["stop"].clone(), e.data["asked"].clone()))
+        .collect();
+    assert_eq!(stops, [(json!("drain"), json!("stop_file"))], "{lines}");
+    assert!(lines.contains("ended: drained"), "{lines}");
+    assert!(!stop.exists());
+    assert_eq!(bench.dirs().quarantine().unwrap(), None);
+    assert!(!bench.dirs().obligations_stand());
+}
+
 /// The admission's first direction (OWL-401's acceptance): a `do` typed
 /// while watch runs, between two of its passes, cannot take what a
 /// dispatch took. DEMO-1 is dispatched and asks at Build, holding `app`

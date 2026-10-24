@@ -213,6 +213,10 @@ pub enum StepEnd {
         #[serde(default)]
         pending: bool,
     },
+    /// A checked stop of its watch stopped the step (OWL-161): its runs
+    /// were checked, and the ticket stays at its stage, resumed at the next
+    /// start with no hold. Format 5.
+    Stopped,
     /// A comment that makes a person the blocker landed, or a park whose
     /// comment did not, and the ticket's state was not kept.
     NotKept { landed: LandedKind },
@@ -265,13 +269,13 @@ pub enum StepHold {
 impl StepOutcome {
     const CONTRACT: &str = "step outcome";
 
-    /// Parses an outcome record. A format-1, 2 or 3 one, which a watch that
-    /// ran before OWL-409, OWL-404 or OWL-418 may have left for its
+    /// Parses an outcome record. A format-1 to 4 one, which a watch that
+    /// ran before OWL-409, OWL-404, OWL-418 or OWL-161 may have left for its
     /// successor, is read as the current format: format 2 only adds the
     /// `no_slot` end, refused in format 1, format 3 only drops the `paused`
     /// hold, read as none, since the machine's usage state now holds a
-    /// harness at its limit, and format 4 only adds the `base_held` end,
-    /// refused before.
+    /// harness at its limit, format 4 only adds the `base_held` end, refused
+    /// before, and format 5 only adds the `stopped` end, refused before.
     pub fn parse(input: &str) -> Result<Self, ContractError> {
         let outcome: Self = match Self::from_older_format(input) {
             Some(read) => read?,
@@ -281,30 +285,30 @@ impl StepOutcome {
         Ok(outcome)
     }
 
-    /// A format-1, 2 or 3 record read as the current format, or `None` for
-    /// any other.
+    /// A format-1 to 4 record read as the current format, or `None` for any
+    /// other.
     fn from_older_format(input: &str) -> Option<Result<Self, ContractError>> {
         let mut document: serde_json::Value = serde_json::from_str(input).ok()?;
         let format = document.get("format").and_then(serde_json::Value::as_u64)?;
-        if !matches!(format, 1..=3) {
+        if !matches!(format, 1..=4) {
             return None;
         }
-        if document
+        let end = document
             .pointer("/end/end")
-            .and_then(serde_json::Value::as_str)
-            == Some("base_held")
-        {
+            .and_then(serde_json::Value::as_str);
+        if end == Some("stopped") {
+            return Some(Err(ContractError::invalid(
+                Self::CONTRACT,
+                "formats before 5 have no `stopped` end",
+            )));
+        }
+        if format < 4 && end == Some("base_held") {
             return Some(Err(ContractError::invalid(
                 Self::CONTRACT,
                 "formats before 4 have no `base_held` end",
             )));
         }
-        if format == 1
-            && document
-                .pointer("/end/end")
-                .and_then(serde_json::Value::as_str)
-                == Some("no_slot")
-        {
+        if format == 1 && end == Some("no_slot") {
             return Some(Err(ContractError::invalid(
                 Self::CONTRACT,
                 "format 1 has no `no_slot` end",
@@ -767,7 +771,7 @@ mod tests {
         };
         let as_format_1 = |outcome: &StepOutcome| {
             let mut document: serde_json::Value = serde_json::from_str(&outcome.render()).unwrap();
-            assert_eq!(document["format"], 4);
+            assert_eq!(document["format"], 5);
             document["format"] = 1.into();
             document.to_string()
         };
@@ -855,6 +859,42 @@ mod tests {
             ..outcome
         };
         assert_eq!(StepOutcome::parse(&as_format_3(&busy)).unwrap(), busy);
+    }
+
+    /// OWL-161: format 5 adds `stopped`; a format-4 record a predecessor
+    /// watch left still reads, as format 5, but never with that end.
+    #[test]
+    fn stopped_is_format_5s() {
+        let outcome = StepOutcome {
+            format: Format,
+            ticket: TicketId::new("OWL-1").unwrap(),
+            attempt: "1-2-3".to_owned(),
+            commit: None,
+            progress: "p".to_owned(),
+            answer: None,
+            end: StepEnd::Stopped,
+            after: RefAfter::Unread,
+            hold: None,
+            kept: KeptFollowing::default(),
+            at: "2026-10-24T09:00:00Z".parse().unwrap(),
+        };
+        assert_eq!(StepOutcome::parse(&outcome.render()).unwrap(), outcome);
+        let as_format_4 = |outcome: &StepOutcome| {
+            let mut document: serde_json::Value = serde_json::from_str(&outcome.render()).unwrap();
+            document["format"] = 4.into();
+            document.to_string()
+        };
+        let error = StepOutcome::parse(&as_format_4(&outcome)).unwrap_err();
+        assert!(error.to_string().contains("no `stopped`"), "{error}");
+        let held = StepOutcome {
+            end: StepEnd::BaseHeld {
+                commit: "a".repeat(40),
+                command: None,
+                pending: false,
+            },
+            ..outcome
+        };
+        assert_eq!(StepOutcome::parse(&as_format_4(&held)).unwrap(), held);
     }
 
     /// A run file and an obligation read back as written, a write under way

@@ -5,7 +5,8 @@
 //! entry, `owlshift_runner::step::child`; with `do` in place of the
 //! envelope, what a person's `owlshift do <TICKET>` does (OWL-401). As
 //! `owlshift` does, it first makes the process trees it starts stop with it,
-//! however it ends. When `OWLSHIFT_STEP_CHILD_PID` names a file, it writes
+//! however it ends, and stops by degrees, SIGTERM stopping and checking its
+//! runs (OWL-161). When `OWLSHIFT_STEP_CHILD_PID` names a file, it writes
 //! its process id there first.
 
 use std::io;
@@ -24,6 +25,9 @@ fn main() -> ExitCode {
     process::stop_trees_on_signal().expect("the signal policy");
     #[cfg(unix)]
     process::stop_trees_when_killed().expect("the sentinel");
+    // As `owlshift continue --step` does (OWL-161): SIGTERM from its watch
+    // is a checked stop of its runs.
+    process::stop_by_degrees(None).expect("the stop by degrees");
     if let Some(file) = std::env::var_os("OWLSHIFT_STEP_CHILD_PID") {
         let file = PathBuf::from(file);
         let partial = file.with_extension("partial");

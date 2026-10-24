@@ -11,6 +11,7 @@ mod why_cmd;
 use std::num::NonZeroUsize;
 use std::path::PathBuf;
 use std::process::ExitCode;
+use std::time::Duration;
 
 use clap::{CommandFactory, FromArgMatches, Parser, Subcommand};
 use owlshift_adapters::forge::Repo;
@@ -22,6 +23,7 @@ use owlshift_runner::config::{Effective, OWLSHIFT_VERSION};
 use owlshift_runner::doctor;
 use owlshift_runner::events::printable;
 use owlshift_runner::system::HostSystem;
+use owlshift_runner::watch::stop::CHECKED_STOP_BOUND;
 
 /// Works a team's backlog with coding agents, and asks a human on the ticket
 /// when a decision is theirs.
@@ -78,7 +80,9 @@ enum Command {
     },
     /// Watch this project's tickets whose questions wait, in the foreground,
     /// and continue each one as `owlshift continue` would once its decider's
-    /// reply counts; checked every minute, until Ctrl-C. It also resumes a
+    /// reply counts; checked every minute. A first Ctrl-C ends it once the
+    /// steps under way finish, a second (or SIGTERM) stops them and checks
+    /// their runs, a third (or SIGQUIT) stops everything at once. It also resumes a
     /// ticket at Intake, Design, Design review, Build or Verify that an
     /// answered round (round > 0) left shown working or needing input, a
     /// refusal after the answer check included. A parked ticket, or one left
@@ -181,6 +185,14 @@ fn main() -> ExitCode {
     }
     let matches = Cli::command().long_version(long_version()).get_matches();
     let cli = Cli::from_arg_matches(&matches).unwrap_or_else(|error| error.exit());
+    // `owlshift watch` and the steps it runs in children stop by degrees
+    // (OWL-161), as soon as the command is known: a step's child before it
+    // takes its run slot or writes anything.
+    if let Some(bound) = by_degrees(&cli.command)
+        && let Err(error) = owlshift_platform::process::stop_by_degrees(bound)
+    {
+        eprintln!("owlshift: cannot stop by degrees, a signal stops everything at once: {error}");
+    }
 
     let cwd = match std::env::current_dir() {
         Ok(cwd) => cwd,
@@ -266,6 +278,19 @@ fn main() -> ExitCode {
     }
 }
 
+/// Whether `command` stops by degrees, and with which bound after a checked
+/// stop (OWL-161, architecture section 5, "Three ways to stop"): `owlshift
+/// watch`, stopped now [`CHECKED_STOP_BOUND`] after it; a step's child, with
+/// no bound of its own, its watch's applying. `None`: every signal stops the
+/// command at once.
+fn by_degrees(command: &Command) -> Option<Option<Duration>> {
+    match command {
+        Command::Watch { .. } => Some(Some(CHECKED_STOP_BOUND)),
+        Command::Continue { step: Some(_), .. } => Some(None),
+        _ => None,
+    }
+}
+
 /// The data directory, where the event log and each project's files live.
 fn data_dir() -> Result<PathBuf, String> {
     owlshift_platform::paths::data_dir().ok_or_else(|| {
@@ -284,5 +309,37 @@ fn exit_code(success: bool) -> ExitCode {
         ExitCode::SUCCESS
     } else {
         ExitCode::FAILURE
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// OWL-161: `watch`, served or not, stops by degrees with the checked
+    /// stop's bound, a step's child by degrees with none; every other
+    /// command, a typed `continue` included, keeps stopping at once.
+    #[test]
+    fn only_watch_and_its_steps_stop_by_degrees() {
+        let of = |args: &[&str]| {
+            let cli = Cli::try_parse_from([&["owlshift"], args].concat()).unwrap();
+            by_degrees(&cli.command)
+        };
+        let watch = Some(Some(CHECKED_STOP_BOUND));
+        assert_eq!(of(&["watch"]), watch);
+        assert_eq!(of(&["watch", "--drain"]), watch);
+        assert_eq!(of(&["watch", "--drain", "--served", "o/r"]), watch);
+        assert_eq!(of(&["continue", "OWL-1", "--step", "{}"]), Some(None));
+        for args in [
+            &["do", "OWL-1"][..],
+            &["continue", "OWL-1"],
+            &["continue", "OWL-1", "--to-watch"],
+            &["doctor"],
+            &["gate"],
+            &["forget", "OWL-1"],
+            &["unquarantine"],
+        ] {
+            assert_eq!(of(args), None, "{args:?}");
+        }
     }
 }

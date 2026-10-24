@@ -740,8 +740,9 @@ impl Watch<'_> {
     ) {
         let on_demand = self.on_demand;
         // Another command took the project or the ticket, or every run slot
-        // of the machine was taken (OWL-409): the next pass tries again.
-        if matches!(outcome, StepEnd::Busy | StepEnd::NoSlot) {
+        // of the machine was taken (OWL-409): the next pass tries again. A
+        // checked stop (OWL-161) has the watch run no next pass.
+        if matches!(outcome, StepEnd::Busy | StepEnd::NoSlot | StepEnd::Stopped) {
             return;
         }
         let git = &on_demand.executor.git;

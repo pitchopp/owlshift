@@ -19,7 +19,12 @@
 //!   as its last message, which the executor then writes there first
 //!   (architecture section 6, "Harness contract", OWL-323);
 //! - a usage limit is an interruption to resume, not a failure;
+//! - so is a run that fails while a checked stop of its process is asked
+//!   ([`Outcome::Stopped`], OWL-161): the stop cuts the harness's tree and
+//!   the gate's and setup's commands ([`AtCheckedStop::Stopped`]);
 //! - everything else is a [`Failure`] with its reason.
+//!
+//! [`AtCheckedStop::Stopped`]: owlshift_platform::process::AtCheckedStop::Stopped
 //!
 //! What goes wrong before the spawn (the worktree, the brief, a credential
 //! finding, the first snapshot, the command) is an [`ExecutorError`]:
@@ -366,6 +371,10 @@ pub enum Outcome {
     /// The harness reached its usage limit: an interruption, resumed after
     /// the reset.
     UsageLimit { resets_at: Option<Timestamp> },
+    /// A checked stop of the process (OWL-161) was asked while the run
+    /// failed, its tree stopped by it or not: an interruption, resumed at
+    /// the next start. Its isolation was checked and held.
+    Stopped,
     /// No usable result.
     Failed(Failure),
     /// The run broke isolation: its work cannot be trusted, and the ticket
@@ -678,7 +687,7 @@ impl Executor {
             if let Some(outcome) = stopped {
                 log.finish();
                 return Ok(RunReport {
-                    outcome,
+                    outcome: stopped_unless_ended(outcome),
                     exit_code: None,
                     usage: None,
                     model: None,
@@ -953,7 +962,7 @@ impl Executor {
             gate = Some(report);
         }
         Ok(RunReport {
-            outcome,
+            outcome: stopped_unless_ended(outcome),
             exit_code: end.as_ref().and_then(|end| end.exit_code),
             usage,
             model: end.as_ref().and_then(|end| end.model.clone()),
@@ -1036,7 +1045,7 @@ impl Executor {
         };
         log.finish();
         Ok(RunReport {
-            outcome,
+            outcome: stopped_unless_ended(outcome),
             exit_code: None,
             usage: None,
             model: None,
@@ -1370,6 +1379,23 @@ fn certificate_bundle(agent: &AgentEnv, read_only: bool) -> Option<&'static Path
         && agent.var("SSL_CERT_FILE").is_none()
         && bundle.is_file())
     .then_some(bundle)
+}
+
+/// Whether a checked stop of this process is asked (OWL-161): a watch's or
+/// a step's, which stops by degrees.
+pub fn checked_stop_asked() -> bool {
+    owlshift_platform::process::asked() == Some(owlshift_platform::process::Degree::Checked)
+}
+
+/// A run's outcome once a checked stop may have been asked during it
+/// (OWL-161): a failed run is [`Outcome::Stopped`] then, whatever made it
+/// fail, since the stop cuts its tree or its gate's; a run that finished,
+/// broke isolation or met its usage limit is left as it is.
+fn stopped_unless_ended(outcome: Outcome) -> Outcome {
+    match outcome {
+        Outcome::Failed(_) if checked_stop_asked() => Outcome::Stopped,
+        outcome => outcome,
+    }
 }
 
 /// Whether the role finished with `done`.

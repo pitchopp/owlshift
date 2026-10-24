@@ -1,9 +1,11 @@
 //! OWL-399: the steps of `owlshift watch --drain` in real child processes
 //! (architecture section 5, "Parallel", "The step, in a child process"):
 //! a drain's intake end to end, a stale envelope refused spending nothing,
-//! SIGTERM and SIGKILL of watch stopping the child and its run, and a
-//! restarted watch applying a predecessor's hold only where the ticket's
-//! ref still is. The child is `owlshift-step-child`, which calls the entry
+//! a restarted watch applying a predecessor's hold only where the ticket's
+//! ref still is, and since OWL-161 the three ways a watch stops: a drain
+//! letting the step under way finish, a checked stop (SIGTERM) checking two
+//! Builds that resume later or finding a breach, and a stop now (SIGQUIT,
+//! SIGKILL) leaving the run's obligation. The child is `owlshift-step-child`, which calls the entry
 //! `owlshift continue <TICKET> --step <ENVELOPE>` calls; the drain's own
 //! rules are the bench's to play, in watch's own process
 //! (`tests/on_demand.rs`).
@@ -830,87 +832,378 @@ impl Drop for Running {
     }
 }
 
-/// OWL-399, "Stopping": a watch told to end (SIGTERM) stops its child
-/// through the policy every command shares, and a watch killed outright
-/// (SIGKILL) has its sentinel stop it; either way the child's own sentinel
-/// then stops the run it started, a harness that would sleep 30 s.
+#[cfg(unix)]
+fn pid_in(file: &Path) -> u32 {
+    fs::read_to_string(file).unwrap().trim().parse().unwrap()
+}
+
+/// [`wait_for`], within `seconds`, `log`, watch's output, in the failure.
+#[cfg(unix)]
+fn wait_within(what: &str, seconds: u64, log: &Path, mut done: impl FnMut() -> bool) {
+    use std::thread;
+    use std::time::{Duration, Instant};
+
+    let deadline = Instant::now() + Duration::from_secs(seconds);
+    while !done() {
+        assert!(
+            Instant::now() < deadline,
+            "still waiting for {what}\n{}",
+            fs::read_to_string(log).unwrap_or_default()
+        );
+        thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// A harness for the stop tests (OWL-161): a script that, for a run of
+/// `role` while `dir/hold` stands, runs `before` (shell text), writes its
+/// pid to `dir/<role>-<ticket>.pid`, then runs `hold` (shell text), such as
+/// `exec sleep 30`, a run under way until a stop cuts it; past it, and for
+/// any other run, it plays the fake harness with the reply [`reply_for`]
+/// wrote in `dir`, or the bench's.
+#[cfg(unix)]
+fn holding_harness(dir: &Path, role: &str, before: &str, hold: &str) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+
+    let script = dir.join(format!("harness-{role}.sh"));
+    fs::write(
+        &script,
+        format!(
+            "#!/bin/sh\ndir='{dir}'\nbrief=\"\"\nreply=\"\"\n\
+             while [ $# -gt 0 ]; do\n  case \"$1\" in\n    --brief) brief=\"$2\"; shift 2;;\n    \
+             --reply) reply=\"$2\"; shift 2;;\n    *) shift;;\n  esac\ndone\n\
+             role=$(sed -n 's/^  \"role\": \"\\([a-z_]*\\)\",$/\\1/p' \"$brief\" | head -n 1)\n\
+             ticket=$(sed -n 's/^    \"id\": \"\\([A-Z0-9-]*\\)\",$/\\1/p' \"$brief\" | head -n 1)\n\
+             if [ \"$role\" = '{role}' ] && [ -e \"$dir/hold\" ]; then\n  {before}\n  \
+             echo $$ > \"$dir/$role-$ticket.pid.partial\"\n  \
+             mv \"$dir/$role-$ticket.pid.partial\" \"$dir/$role-$ticket.pid\"\n  {hold}\nfi\n\
+             if [ -f \"$dir/reply-$role-$ticket.toml\" ]; then reply=\"$dir/reply-$role-$ticket.toml\"\n\
+             elif [ -f \"$dir/reply-$role.toml\" ]; then reply=\"$dir/reply-$role.toml\"; fi\n\
+             exec '{FAKE}' --brief \"$brief\" --reply \"$reply\"\n",
+            dir = dir.display(),
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+    script
+}
+
+/// Starts [`helper_watch_until_stopped`] over the project `file` keeps, in a
+/// process group of its own with core dumps off, its output in `log`: its
+/// steps in children, or in its own process when `in_process`. A step's
+/// child writes its pid to `child_pid` when given.
+#[cfg(unix)]
+fn start_watch(
+    file: &Path,
+    in_process: bool,
+    child_pid: Option<&Path>,
+    log: &Path,
+) -> std::process::Child {
+    use std::os::unix::process::CommandExt;
+
+    let out = fs::File::create(log).unwrap();
+    let mut command = Command::new("/bin/sh");
+    command
+        .args(["-c", "ulimit -c 0; exec \"$0\" \"$@\""])
+        .arg(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "helper_watch_until_stopped",
+            "--ignored",
+            "--nocapture",
+            "--test-threads=1",
+        ])
+        .env("OWLSHIFT_CHILD_PROJECT", file)
+        .stdout(out.try_clone().unwrap())
+        .stderr(out)
+        .process_group(0);
+    if in_process {
+        command.env("OWLSHIFT_WATCH_IN_PROCESS", "1");
+    }
+    if let Some(child_pid) = child_pid {
+        command.env("OWLSHIFT_STEP_CHILD_PID", child_pid);
+    }
+    command.spawn().unwrap()
+}
+
+/// Sends `signal` to `watch`.
+#[cfg(unix)]
+fn signal(watch: &std::process::Child, signal: &str) {
+    let sent = Command::new("kill")
+        .args(["-s", signal, &watch.id().to_string()])
+        .status()
+        .unwrap();
+    assert!(sent.success(), "kill -s {signal}");
+}
+
+/// The tickets whose run ended `outcome`, as their `run_ended` events in
+/// `project`'s log say.
+#[cfg(unix)]
+fn ended(project: &ChildProject, outcome: &str) -> Vec<String> {
+    use owlshift_contracts::event::{Event, EventKind};
+
+    let log = EventLog::in_dir(&project.data);
+    let mut tickets: Vec<String> = fs::read_to_string(log.path())
+        .unwrap_or_default()
+        .lines()
+        .map(|line| Event::parse(line).unwrap())
+        .filter(|event| event.kind == EventKind::RunEnded && event.data["outcome"] == outcome)
+        .filter_map(|event| event.ticket.map(|ticket| ticket.as_str().to_owned()))
+        .collect();
+    tickets.sort();
+    tickets
+}
+
+/// OWL-161, the acceptance's first case: a drain asked while a step runs
+/// lets it finish. DEMO-1's intake, in a child, writes the project's stop
+/// file, then ends done a second later: its INTAKE is kept, DEMO-2, admitted
+/// too, never starts, and watch ends on its own, the file removed, nothing
+/// quarantined and no obligation left.
 #[cfg(unix)]
 #[test]
-fn sigterm_and_sigkill_of_watch_stop_the_child_and_its_run() {
-    use std::os::unix::fs::PermissionsExt;
-    use std::os::unix::process::CommandExt;
-    use std::process::Stdio;
+fn a_drain_lets_the_step_under_way_finish() {
+    let s = setup(None);
+    let plays = s.tmp.path().join("plays");
+    fs::create_dir_all(&plays).unwrap();
+    fs::write(plays.join("hold"), "").unwrap();
+    let dirs = s.project.dirs();
+    let stop = owlshift_runner::watch::stop::file(&dirs);
+    let before = format!("touch '{}'", stop.display());
+    let mut project = s.project.clone();
+    project.harness = holding_harness(&plays, "intake", &before, "sleep 1");
+    project.add_ticket("DEMO-2", &["agent"], "");
+    project.save(&s.file);
+    let lines = drain_every(&project, &children(&s.file), POLL_INTERVAL, |pass| {
+        pass < 20
+    });
+    assert!(lines.contains("ended: drained"), "{lines}");
+    assert!(
+        comments(&project)
+            .last()
+            .is_some_and(|c| c.starts_with("[owlshift] INTAKE")),
+        "{lines}"
+    );
+    assert!(
+        !dirs.runs(&TicketId::new("DEMO-2").unwrap()).exists(),
+        "{lines}"
+    );
+    assert!(!stop.exists());
+    assert_eq!(dirs.quarantine().unwrap(), None, "{lines}");
+    assert!(!dirs.obligations_stand(), "{lines}");
+    assert!(step::leftovers(&dirs).is_empty());
+}
 
-    for signal in ["TERM", "KILL"] {
+/// OWL-161, the acceptance's second case, scenario S11's stop: SIGTERM to a
+/// watch while two Builds run, each in a child. Watch sends each child
+/// SIGTERM; each stops its run, checks it and retires its obligation, its
+/// ticket left at Build, and watch ends, nothing quarantined. A later drain
+/// resumes both Builds, which ask their decider.
+#[cfg(unix)]
+#[test]
+fn a_sigterm_during_two_builds_checks_both_and_both_resume() {
+    use owlshift_core::state::{Status, TicketState};
+    use owlshift_core::vocab::Stage;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let plays = tmp.path().join("plays");
+    let machine = tmp.path().join("machine");
+    fs::create_dir_all(&plays).unwrap();
+    for (id, zone) in [("DEMO-1", "a"), ("DEMO-2", "b")] {
+        reply_for(&plays, "intake", Some(id), &intake_declaring(&[zone]));
+    }
+    reply_for(&plays, "build", None, &build_asks());
+    fs::write(plays.join("hold"), "").unwrap();
+    let harness = holding_harness(&plays, "build", ":", "exec sleep 30");
+    let s = parallel_setup(&harness, 2, 2, (&machine, 2));
+    s.project.move_ticket("DEMO-9", "Done");
+    let log = tmp.path().join("watch.log");
+    let mut watch = start_watch(&s.file, false, None, &log);
+    let mut running = Running {
+        pids: vec![watch.id()],
+    };
+    let builds = [
+        plays.join("build-DEMO-1.pid"),
+        plays.join("build-DEMO-2.pid"),
+    ];
+    wait_within("both Builds under way", 120, &log, || {
+        builds.iter().all(|pid| pid.exists())
+    });
+    let runs: Vec<u32> = builds.iter().map(|pid| pid_in(pid)).collect();
+    running.pids.extend(&runs);
+
+    signal(&watch, "TERM");
+    wait_within("watch to end", 60, &log, || {
+        watch.try_wait().unwrap().is_some()
+    });
+    let status = watch.wait().unwrap();
+    let log_text = fs::read_to_string(&log).unwrap_or_default();
+    assert!(status.success(), "{status}\n{log_text}");
+    for run in runs {
+        assert!(!alive(run), "a Build's run outlived the checked stop");
+    }
+    let dirs = s.project.dirs();
+    assert_eq!(dirs.quarantine().unwrap(), None, "{log_text}");
+    assert!(!dirs.obligations_stand(), "{log_text}");
+    assert_eq!(
+        ended(&s.project, "stopped"),
+        ["DEMO-1", "DEMO-2"],
+        "{log_text}"
+    );
+    for id in ["DEMO-1", "DEMO-2"] {
+        let state = TicketState::try_from(&record_of(&s.project, id).unwrap().state).unwrap();
+        assert_eq!(state.status(), Status::Active(Stage::Build), "{id}");
+    }
+    assert!(log_text.contains("ended: its steps stopped"), "{log_text}");
+
+    fs::remove_file(plays.join("hold")).unwrap();
+    let counted = children(&s.file).with_slots(MachineSlots::new(&machine, 2));
+    let interval = std::time::Duration::from_millis(200);
+    let both = || asks(&s.project, "DEMO-1") && asks(&s.project, "DEMO-2");
+    let lines = drain_every(&s.project, &counted, interval, |pass| pass < 200 && !both());
+    assert!(both(), "{lines}");
+    assert_eq!(dirs.quarantine().unwrap(), None, "{lines}");
+}
+
+/// OWL-161, the acceptance's third case: a breach planted by a run, here an
+/// intake in the watch's own process as plain `owlshift watch` runs it,
+/// writing into the dedicated checkout before it sleeps, is found by the
+/// check of the checked stop that cuts it: the project is quarantined, the
+/// run's obligation kept.
+#[cfg(unix)]
+#[test]
+fn a_breach_found_at_a_checked_stop_quarantines() {
+    let s = setup(None);
+    let plays = s.tmp.path().join("plays");
+    fs::create_dir_all(&plays).unwrap();
+    fs::write(plays.join("hold"), "").unwrap();
+    let dirs = s.project.dirs();
+    let planted = format!("echo planted > '{}/planted'", dirs.checkout().display());
+    let mut project = s.project.clone();
+    project.harness = holding_harness(&plays, "intake", &planted, "exec sleep 30");
+    project.save(&s.file);
+    let log = s.tmp.path().join("watch.log");
+    let mut watch = start_watch(&s.file, true, None, &log);
+    let mut running = Running {
+        pids: vec![watch.id()],
+    };
+    let pid = plays.join(format!("intake-{TICKET}.pid"));
+    wait_within("the intake under way", 60, &log, || pid.exists());
+    let run = pid_in(&pid);
+    running.pids.push(run);
+
+    signal(&watch, "TERM");
+    wait_within("watch to end", 60, &log, || {
+        watch.try_wait().unwrap().is_some()
+    });
+    let log_text = fs::read_to_string(&log).unwrap_or_default();
+    assert!(watch.wait().unwrap().success(), "{log_text}");
+    assert!(!alive(run), "the intake's run outlived the checked stop");
+    let quarantine = dirs.quarantine().unwrap();
+    assert!(
+        quarantine
+            .as_deref()
+            .is_some_and(|text| text.contains("broke isolation")),
+        "{quarantine:?}\n{log_text}"
+    );
+    assert!(dirs.obligations_stand(), "{log_text}");
+}
+
+/// OWL-161, the acceptance's fourth case, and OWL-399's "Stopping": a stop
+/// now, SIGQUIT, stops watch's child through the policy every command
+/// shares, and a watch killed outright (SIGKILL) has its sentinel stop it;
+/// either way the child's own sentinel then stops the run it started, a
+/// harness that would sleep 30 s, its obligation left as before OWL-161:
+/// the next pass quarantines the project.
+#[cfg(unix)]
+#[test]
+fn sigquit_and_sigkill_of_watch_stop_now_leaving_the_obligation() {
+    for signal_name in ["QUIT", "KILL"] {
         let s = setup(None);
-        let harness_pid = s.tmp.path().join("harness.pid");
-        let script = s.tmp.path().join("harness.sh");
-        fs::write(
-            &script,
-            format!(
-                "#!/bin/sh\necho $$ > '{pid}.partial'\nmv '{pid}.partial' '{pid}'\nexec sleep 30\n",
-                pid = harness_pid.display()
-            ),
-        )
-        .unwrap();
-        fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+        let plays = s.tmp.path().join("plays");
+        fs::create_dir_all(&plays).unwrap();
+        fs::write(plays.join("hold"), "").unwrap();
         let mut project = s.project.clone();
-        project.harness = script;
+        project.harness = holding_harness(&plays, "intake", ":", "exec sleep 30");
         project.save(&s.file);
 
         let child_pid = s.tmp.path().join("child.pid");
-        let mut watch = Command::new(std::env::current_exe().unwrap())
-            .args([
-                "--exact",
-                "helper_watch_drain",
-                "--ignored",
-                "--nocapture",
-                "--test-threads=1",
-            ])
-            .env("OWLSHIFT_CHILD_PROJECT", &s.file)
-            .env("OWLSHIFT_STEP_CHILD_PID", &child_pid)
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .process_group(0)
-            .spawn()
-            .unwrap();
+        let log = s.tmp.path().join("watch.log");
+        let mut watch = start_watch(&s.file, false, Some(&child_pid), &log);
         let mut running = Running {
             pids: vec![watch.id()],
         };
-        wait_for("the child and its run", || {
+        let harness_pid = plays.join(format!("intake-{TICKET}.pid"));
+        wait_within("the child and its run", 60, &log, || {
             child_pid.exists() && harness_pid.exists()
         });
-        let pid =
-            |file: &Path| -> u32 { fs::read_to_string(file).unwrap().trim().parse().unwrap() };
-        let (child, run) = (pid(&child_pid), pid(&harness_pid));
+        let (child, run) = (pid_in(&child_pid), pid_in(&harness_pid));
         running.pids.extend([child, run]);
         assert!(watch.try_wait().unwrap().is_none(), "watch ended early");
 
-        let sent = Command::new("kill")
-            .args(["-s", signal, &watch.id().to_string()])
-            .status()
-            .unwrap();
-        assert!(sent.success(), "kill -s {signal}");
+        signal(&watch, signal_name);
         wait_for("watch to end", || watch.try_wait().unwrap().is_some());
         wait_for(
-            &format!("the child and its run to stop after SIG{signal}"),
+            &format!("the child and its run to stop after SIG{signal_name}"),
             || !alive(child) && !alive(run),
+        );
+        let dirs = project.dirs();
+        assert!(dirs.obligations_stand(), "SIG{signal_name}");
+        let (lines, _) = drain_once(&project, &s.file);
+        assert!(
+            dirs.quarantine().unwrap().is_some(),
+            "SIG{signal_name}\n{lines}"
         );
     }
 }
 
-/// The watch of the signal test: one pass of `owlshift watch --drain` over
-/// the project `OWLSHIFT_CHILD_PROJECT` names, with the signal policy and
-/// the sentinel `owlshift` installs first.
+/// The watch of the stop tests (OWL-161): passes of `owlshift watch
+/// --drain` over the project `OWLSHIFT_CHILD_PROJECT` names, its steps in
+/// children or, with `OWLSHIFT_WATCH_IN_PROCESS`, in its own process, with
+/// the signal policy, the sentinel and the stop by degrees `owlshift`
+/// installs, until it is stopped or two minutes have passed.
 #[test]
-#[ignore = "helper, run by the test above"]
-fn helper_watch_drain() {
+#[ignore = "helper, run by the tests below"]
+fn helper_watch_until_stopped() {
+    use std::time::{Duration, Instant};
+
+    use owlshift_platform::process;
+    use owlshift_runner::watch::stop::CHECKED_STOP_BOUND;
+
     let Some(file) = std::env::var_os("OWLSHIFT_CHILD_PROJECT") else {
         return;
     };
-    owlshift_platform::process::stop_trees_on_signal().unwrap();
+    process::stop_trees_on_signal().unwrap();
     #[cfg(unix)]
-    owlshift_platform::process::stop_trees_when_killed().unwrap();
+    process::stop_trees_when_killed().unwrap();
+    process::stop_by_degrees(Some(CHECKED_STOP_BOUND)).unwrap();
     let file = PathBuf::from(file);
-    drain_once(&ChildProject::load(&file), &file);
+    let project = ChildProject::load(&file);
+    let in_process = std::env::var_os("OWLSHIFT_WATCH_IN_PROCESS").is_some();
+    let ends = Instant::now() + Duration::from_secs(120);
+    let mut sleep = |interval| {
+        process::wait_asked(interval);
+        Instant::now() < ends
+    };
+    let mut children = children(&file);
+    if let Some(slots) = project.machine_slots() {
+        children = children.with_slots(slots);
+    }
+    project.with_on_demand(&mut std::io::stdout(), |on_demand, sink| {
+        let watch = Watch {
+            on_demand,
+            interval: Duration::from_millis(200),
+        };
+        let mut out = std::io::stdout();
+        if in_process {
+            watch.run_drain(sink, &mut out, &mut |_, _, _| {}, &mut sleep);
+        } else {
+            watch.run_with_children(
+                true,
+                &children,
+                sink,
+                &mut out,
+                &mut |_, _, _| {},
+                &mut sleep,
+            );
+        }
+    });
 }

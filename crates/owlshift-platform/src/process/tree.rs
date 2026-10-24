@@ -8,6 +8,8 @@
 use std::io;
 use std::process::{Child, Command, ExitStatus};
 
+use super::AtCheckedStop;
+
 /// The handle that stops a process tree started by [`ProcessTree::spawn`].
 ///
 /// It is separate from the root's [`Child`] so that one thread can stop the
@@ -42,8 +44,17 @@ impl ProcessTree {
     ///
     /// The caller owns the returned child and reaps it; the tree handle only
     /// stops processes.
+    ///
+    /// A checked stop leaves the tree alone ([`AtCheckedStop::Left`]).
     pub fn spawn(command: &mut Command) -> io::Result<(Child, Self)> {
-        imp::spawn(command)
+        Self::spawn_for(command, AtCheckedStop::Left)
+    }
+
+    /// [`ProcessTree::spawn`], the tree treated as `at` says by a checked
+    /// stop of a process that stops by degrees (OWL-161): a tree
+    /// [`AtCheckedStop::Told`] is refused once any stop is asked.
+    pub fn spawn_for(command: &mut Command, at: AtCheckedStop) -> io::Result<(Child, Self)> {
+        imp::spawn(command, at)
     }
 
     /// Stops every process of the tree at once, the root included, without
@@ -83,7 +94,7 @@ pub(super) use imp::terminate_job;
 #[cfg(unix)]
 mod imp {
     use super::super::signals;
-    use super::ProcessTree;
+    use super::{AtCheckedStop, ProcessTree};
     use rustix::io::Errno;
     use rustix::process::{Pid, Signal, WaitId, WaitIdOptions, kill_process_group, waitid};
     use std::io;
@@ -93,11 +104,14 @@ mod imp {
     use std::thread;
     use std::time::Instant;
 
-    pub(super) fn spawn(command: &mut Command) -> io::Result<(Child, ProcessTree)> {
+    pub(super) fn spawn(
+        command: &mut Command,
+        at: AtCheckedStop,
+    ) -> io::Result<(Child, ProcessTree)> {
         // A group id of 0 makes the child the leader of a new group whose id
         // is its own pid.
         command.process_group(0);
-        let (child, live) = signals::register(|| command.spawn(), Pid::from_child)?;
+        let (child, live) = signals::register(|| command.spawn(), Pid::from_child, at)?;
         let group = Pid::from_child(&child);
         Ok((child, ProcessTree { group, _live: live }))
     }
@@ -195,7 +209,7 @@ mod imp {
     //! it is in the job; the processes it starts later inherit the job.
 
     use super::super::signals;
-    use super::ProcessTree;
+    use super::{AtCheckedStop, ProcessTree};
     use std::io;
     use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
     use std::os::windows::process::CommandExt;
@@ -221,7 +235,10 @@ mod imp {
     /// `Child::kill`.
     const KILLED: u32 = 1;
 
-    pub(super) fn spawn(command: &mut Command) -> io::Result<(Child, ProcessTree)> {
+    pub(super) fn spawn(
+        command: &mut Command,
+        at: AtCheckedStop,
+    ) -> io::Result<(Child, ProcessTree)> {
         // The job comes first: failing here leaves no process to clean up.
         // SAFETY: both pointers may be null, for default security and an
         // unnamed job.
@@ -244,7 +261,7 @@ mod imp {
             }
             Ok(child)
         };
-        let (child, live) = signals::register(spawn, |_| Arc::clone(&job))?;
+        let (child, live) = signals::register(spawn, |_| Arc::clone(&job), at)?;
         Ok((child, ProcessTree { job, _live: live }))
     }
 

@@ -88,7 +88,8 @@ pub fn desktop_enabled(personal: &FileState<PersonalConfig>) -> bool {
 /// outage as the run met it or was refused for it (OWL-404,
 /// [`crate::usage`]), so a command stopped by an outage already told says
 /// nothing more; nor a broken base ([`Stop::BaseHeld`]), told once per hold
-/// as it opened (OWL-418, [`crate::base`]).
+/// as it opened (OWL-418, [`crate::base`]); nor a checked stop
+/// ([`Stop::Stopped`], OWL-161), which makes nobody the blocker.
 pub fn blocker_line(ticket: &TicketId, stop: &Stop) -> Option<String> {
     Some(match stop {
         Stop::Parked {
@@ -147,6 +148,7 @@ pub fn blocker_line(ticket: &TicketId, stop: &Stop) -> Option<String> {
             format!("{ticket}: {what}, but {lost}; see the terminal")
         }
         Stop::UsageLimit { .. }
+        | Stop::Stopped
         | Stop::BaseHeld { .. }
         | Stop::Busy(_)
         | Stop::TicketBusy(_)

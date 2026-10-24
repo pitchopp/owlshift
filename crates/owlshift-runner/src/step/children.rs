@@ -3,9 +3,10 @@
 //!
 //! Each child is the root of a process tree of watch's
 //! ([`ProcessTree`]): a process group of its own, registered with the signal
-//! policy and the sentinel every command shares, so Ctrl-C, a closed
-//! terminal, SIGTERM or a hard kill of watch stop it, and the child's own
-//! sentinel then stops the runs it started. Since OWL-401 watch starts a
+//! policy and the sentinel every command shares, so a stop "now" or a hard
+//! kill of watch stops it, and the child's own sentinel then stops the runs
+//! it started. Since OWL-161 a checked stop of watch sends the child SIGTERM
+//! instead, and it stops and checks its runs itself. Since OWL-401 watch starts a
 //! child without waiting for it ([`Children::start`]) and polls each that
 //! runs ([`Running::poll`]): it prints each line the child writes after its
 //! ticket, sees the child's end without reaping it, stops what it left, then
@@ -19,7 +20,7 @@ use std::time::{Duration, Instant};
 
 use owlshift_contracts::ids::TicketId;
 use owlshift_contracts::step::{StepEnvelope, StepOutcome};
-use owlshift_platform::process::{ExitWatch, ProcessTree};
+use owlshift_platform::process::{AtCheckedStop, ExitWatch, ProcessTree};
 
 use crate::events::printable;
 use crate::project::ProjectDirs;
@@ -95,7 +96,9 @@ impl<'a> Children<'a> {
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
-        let (mut child, tree) = ProcessTree::spawn(&mut command)
+        // Told at a checked stop, so that it stops its own runs; never
+        // started once any stop is asked (OWL-161).
+        let (mut child, tree) = ProcessTree::spawn_for(&mut command, AtCheckedStop::Told)
             .map_err(|error| format!("it could not start: {error}"))?;
         drop(command);
         let (sender, lines) = mpsc::channel();
@@ -158,12 +161,12 @@ impl Running {
             match self.lines.try_recv() {
                 Ok(Output::Line(stream, line)) => {
                     let line = printable(&format!("{}: {line}", self.ticket));
-                    match stream {
-                        Stream::Out => {
-                            let _ = writeln!(out, "{line}");
-                        }
-                        Stream::Err => eprintln!("{line}"),
-                    }
+                    // Never a panic: a closed terminal is a checked stop
+                    // (OWL-161), whose children still end through here.
+                    let _ = match stream {
+                        Stream::Out => writeln!(out, "{line}"),
+                        Stream::Err => writeln!(io::stderr(), "{line}"),
+                    };
                 }
                 Ok(Output::Closed) => self.open -= 1,
                 Err(TryRecvError::Empty) => break,

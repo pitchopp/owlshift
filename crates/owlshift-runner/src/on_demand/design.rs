@@ -1228,8 +1228,8 @@ impl OnDemand<'_> {
             Ok(Transition::To(next)) => {
                 *state = next;
                 self.keep(p, state)?;
-                if let Outcome::UsageLimit { resets_at } = ran.report.outcome {
-                    return Err(Stop::UsageLimit { resets_at });
+                if let Some(stop) = interruption(&ran.report.outcome) {
+                    return Err(stop);
                 }
                 Ok(())
             }
@@ -1281,6 +1281,10 @@ impl OnDemand<'_> {
                 }
                 Ok(Err(error)) => return Err(refused("the run could not start", error)),
             };
+        // A checked stop ends the pass, the seat kept (OWL-161).
+        if matches!(ran.report.outcome, Outcome::Stopped) {
+            return Err(Stop::Stopped);
+        }
         // A refused result may read as `ResultRefused` (OWL-430): never
         // applied, as the seat is dropped, never retried or told.
         let event = if ran.breaches.is_empty() {
@@ -1429,8 +1433,8 @@ impl OnDemand<'_> {
                 Ok(Transition::To(next)) => {
                     state = next;
                     self.keep(p, &state)?;
-                    if let Outcome::UsageLimit { resets_at } = ran.report.outcome {
-                        return Err(Stop::UsageLimit { resets_at });
+                    if let Some(stop) = interruption(&ran.report.outcome) {
+                        return Err(stop);
                     }
                 }
                 Ok(Transition::Parked {
@@ -2474,6 +2478,7 @@ fn codex_drop_reason(outcome: &Outcome, event: Event) -> String {
         Outcome::Failed(Failure::NoResult) => "Codex's run left no result.".to_owned(),
         Outcome::Failed(_) => "Codex's result was refused.".to_owned(),
         Outcome::Quarantined(_) => "Codex's run broke isolation.".to_owned(),
+        Outcome::Stopped => "Codex's run was stopped by a checked stop.".to_owned(),
         Outcome::Finished { .. } => match event {
             Event::Questions => "Codex's run asked questions, which a reviewer may not.".to_owned(),
             Event::Blocked => "Codex's run ended blocked.".to_owned(),

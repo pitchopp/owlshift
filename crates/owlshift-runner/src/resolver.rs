@@ -247,13 +247,18 @@ pub enum Resolved<'a> {
 
 /// What a resolver run's outcome leaves. The role returns `done` or
 /// `failed`; any other status, a run without a valid result, or a deadline
-/// reached is a failed run, and a usage limit is the harness's.
+/// reached is a failed run, and a usage limit is the harness's. A checked
+/// stop (OWL-161) reads as a failed run here, keeping the refusal kept;
+/// `OnDemand`'s resolve stops the step before it would send the questions
+/// to the decider.
 pub fn outcome(outcome: &Outcome) -> Resolved<'_> {
     match outcome {
         Outcome::Finished { result, .. } if result.status == Status::Done => {
             Resolved::Done(&result.resolutions)
         }
-        Outcome::Finished { .. } | Outcome::Failed(_) => Resolved::Fallback(Fallback::Failed),
+        Outcome::Finished { .. } | Outcome::Failed(_) | Outcome::Stopped => {
+            Resolved::Fallback(Fallback::Failed)
+        }
         Outcome::UsageLimit { .. } => Resolved::Fallback(Fallback::UsageLimit),
         Outcome::Quarantined(_) => Resolved::Quarantined,
     }

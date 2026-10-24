@@ -251,6 +251,10 @@ pub enum Stop {
         text: String,
     },
     Refused(String),
+    /// A checked stop of the step running a base check (OWL-161): the check
+    /// did not start, or failed while the stop was asked, which may be the
+    /// stop's doing; no verdict was kept.
+    Stopped,
 }
 
 impl fmt::Display for Stop {
@@ -269,6 +273,7 @@ impl fmt::Display for Stop {
                 marker.display()
             ),
             Self::Refused(reason) => f.write_str(reason),
+            Self::Stopped => f.write_str("the check was stopped by a checked stop"),
         }
     }
 }
@@ -438,6 +443,11 @@ impl GateOnce<'_> {
             return Ok(checked(None, None, Vec::new(), Some(kept)));
         }
 
+        // A checked stop of the step (OWL-161) runs no check, as it starts
+        // no run.
+        if crate::executor::checked_stop_asked() {
+            return Err(Stop::Stopped);
+        }
         // As for a run: from here until the isolation check passes, a stop
         // leaves its obligation, which refuses the project (OWL-400).
         let run = Timestamp::now().strftime("%Y%m%dT%H%M%SZ").to_string();
@@ -485,6 +495,11 @@ impl GateOnce<'_> {
             }
             if let Err(e) = ticket_run::remove_obligation(dirs, &obligation) {
                 warnings.push(format!("the gate's obligation could not be removed: {e}"));
+            }
+            // A failure while a checked stop is asked may be the stop's, which
+            // cuts the gate's commands (OWL-161): no verdict is kept.
+            if !run.report.passed() && crate::executor::checked_stop_asked() {
+                return Err(Stop::Stopped);
             }
             // Kept before the project's lock goes (OWL-418).
             let kept = self.keep(&plan, &key, &run);

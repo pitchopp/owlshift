@@ -6,7 +6,8 @@
 //! waited on. [`run_command`] runs a command the caller prepared the same
 //! way, keeping as much of its output as the caller asks for. [`ProcessTree`] is the mechanism, shared with the executor;
 //! [`stop_trees_on_signal`] stops the live trees when the process is told to
-//! end, and, on Unix, `stop_trees_when_killed` when it is killed outright.
+//! end, and, on Unix, `stop_trees_when_killed` when it is killed outright;
+//! [`stop_by_degrees`] makes it stop by degrees instead (OWL-161).
 //! [`hand_over_on_descriptor`] gives a child a secret on an inherited
 //! descriptor, never in its environment.
 
@@ -19,7 +20,9 @@ mod tree;
 pub use handover::hand_over_on_descriptor;
 #[cfg(unix)]
 pub use sentinel::{SentinelProbe, SentinelStatus, probe_sentinel};
-pub use signals::stop_trees_on_signal;
+pub use signals::{
+    AtCheckedStop, Degree, asked, stop_by_degrees, stop_trees_on_signal, wait_asked,
+};
 #[cfg(unix)]
 pub use signals::{sentinel_status, stop_trees_when_killed};
 pub use tree::{ExitWatch, ProcessTree};
@@ -832,6 +835,212 @@ mod tests {
             hup.exists() && !is_alive(shell)
         });
         assert_eq!(std::fs::read_to_string(&hup).unwrap(), "hup\n");
+    }
+
+    /// Writes `text` to `name` in the working directory, whole or not at all.
+    #[cfg(unix)]
+    fn write_whole(name: &str, text: &str) {
+        let partial = format!("{name}.tmp");
+        std::fs::write(&partial, text).unwrap();
+        std::fs::rename(&partial, name).unwrap();
+    }
+
+    /// OWL-161: stops by degrees, with `bound`, owning three trees, one of
+    /// each kind: `sleep 30` left, `sleep 30` stopped, and a shell told,
+    /// which writes `told` when it gets SIGTERM and ends. Writes their pids,
+    /// then each degree asked to `asked`; once a checked stop is asked, the
+    /// pid of a stopped tree it spawns then to `late`, and to `refused`
+    /// whether a told tree was refused. Core dumps off, for SIGQUIT.
+    #[cfg(unix)]
+    fn stop_by_degrees_owning_trees(bound: Option<Duration>) {
+        use rustix::process::{Resource, Rlimit, getrlimit, setrlimit};
+
+        let core = getrlimit(Resource::Core);
+        setrlimit(
+            Resource::Core,
+            Rlimit {
+                current: Some(0),
+                ..core
+            },
+        )
+        .unwrap();
+        stop_by_degrees(bound).unwrap();
+        let sleep = || {
+            let mut command = Command::new("sleep");
+            command.arg("30");
+            command
+        };
+        let told = || {
+            let mut command = Command::new("/bin/sh");
+            command.args([
+                "-c",
+                "trap 'echo told > told; exit 0' TERM; i=0; \
+                 while [ $i -lt 300 ]; do sleep 0.1; i=$((i+1)); done",
+            ]);
+            command
+        };
+        let (left, _left) = ProcessTree::spawn_for(&mut sleep(), AtCheckedStop::Left).unwrap();
+        let (stopped, _stopped) =
+            ProcessTree::spawn_for(&mut sleep(), AtCheckedStop::Stopped).unwrap();
+        let (shell, _shell) = ProcessTree::spawn_for(&mut told(), AtCheckedStop::Told).unwrap();
+        write_pids(&[left.id(), stopped.id(), shell.id()]);
+        let mut last = wait_asked(Duration::from_secs(20));
+        let mut written = None;
+        let mut late = Vec::new();
+        let ends = Instant::now() + Duration::from_secs(20);
+        while Instant::now() < ends {
+            if last != written {
+                let name = match last {
+                    Some(Degree::Drain) => "drain",
+                    Some(Degree::Checked) => "checked",
+                    None => "",
+                };
+                write_whole("asked", name);
+                written = last;
+                if last == Some(Degree::Checked) {
+                    let (child, tree) =
+                        ProcessTree::spawn_for(&mut sleep(), AtCheckedStop::Stopped).unwrap();
+                    write_whole("late", &child.id().to_string());
+                    late.push((child, tree));
+                    let refused = ProcessTree::spawn_for(&mut told(), AtCheckedStop::Told).is_err();
+                    write_whole("refused", &refused.to_string());
+                }
+            }
+            thread::sleep(Duration::from_millis(20));
+            last = asked();
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[ignore = "helper, run by the tests below"]
+    fn helper_stop_by_degrees() {
+        if helper_requested() {
+            stop_by_degrees_owning_trees(None);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[ignore = "helper, run by the tests below"]
+    fn helper_stop_by_degrees_within_a_second() {
+        if helper_requested() {
+            stop_by_degrees_owning_trees(Some(Duration::from_secs(1)));
+        }
+    }
+
+    #[cfg(unix)]
+    impl Owner {
+        /// Sends it `signal`.
+        fn signal(&self, signal: rustix::process::Signal) {
+            let pid = rustix::process::Pid::from_child(&self.process);
+            rustix::process::kill_process(pid, signal).unwrap();
+        }
+
+        /// The degree its helper last wrote it was asked, if any.
+        fn asked(&self) -> String {
+            std::fs::read_to_string(self.dir.path().join("asked")).unwrap_or_default()
+        }
+
+        /// Waits for its end, 5 s at most: the signal that ended it.
+        fn ended_by(&mut self) -> Option<i32> {
+            use std::os::unix::process::ExitStatusExt;
+
+            wait_until("the helper to end", || {
+                self.process.try_wait().unwrap().is_some()
+            });
+            self.process.wait().unwrap().signal()
+        }
+    }
+
+    /// OWL-161: each Ctrl-C asks one degree more. The first a drain, which
+    /// stops nothing; the second a checked stop, which stops the tree of a
+    /// run at once, tells the step's child, leaves the process's own
+    /// command, stops a run started after it as it starts and starts no
+    /// step's child; the third stops every tree now, as the signal ends the
+    /// process.
+    #[cfg(unix)]
+    #[test]
+    fn each_ctrl_c_asks_one_degree_more() {
+        use rustix::process::Signal;
+
+        let mut owner = Owner::start("helper_stop_by_degrees");
+        let &[left, stopped, told] = owner.pids.as_slice() else {
+            panic!("pids: {:?}", owner.pids);
+        };
+        let _left = Left {
+            trees: vec![left, stopped],
+            stopped: (told, "owlshift-never-stopped"),
+        };
+        owner.signal(Signal::INT);
+        wait_until("a drain asked", || owner.asked() == "drain");
+        for pid in [left, stopped, told] {
+            assert!(is_alive(pid), "{pid} stopped by a drain");
+        }
+
+        owner.signal(Signal::INT);
+        wait_until("a checked stop asked", || owner.asked() == "checked");
+        wait_until("the run's tree stopped", || !is_alive(stopped));
+        wait_until("the step's child told", || {
+            owner.dir.path().join("told").exists() && !is_alive(told)
+        });
+        let late = owner.dir.path().join("late");
+        wait_until("a late run spawned", || late.exists());
+        let late: u32 = std::fs::read_to_string(late).unwrap().parse().unwrap();
+        wait_until("the late run stopped", || !is_alive(late));
+        let refused = owner.dir.path().join("refused");
+        wait_until("a step's child tried", || refused.exists());
+        assert_eq!(std::fs::read_to_string(refused).unwrap(), "true");
+        assert!(is_alive(left), "the process's own command was stopped");
+        assert!(owner.process.try_wait().unwrap().is_none(), "it ended");
+
+        owner.signal(Signal::INT);
+        assert_eq!(owner.ended_by(), Some(Signal::INT.as_raw()));
+        wait_until("its own command stopped", || !is_alive(left));
+    }
+
+    /// OWL-161: SIGTERM asks a checked stop, and a second asks nothing more;
+    /// past its bound the process stops every tree now, ended by SIGTERM.
+    /// SIGQUIT stops every tree now, whatever was asked.
+    #[cfg(unix)]
+    #[test]
+    fn sigterm_checks_until_its_bound_and_sigquit_stops_now() {
+        use rustix::process::Signal;
+
+        let mut owner = Owner::start("helper_stop_by_degrees_within_a_second");
+        let &[left, stopped, told] = owner.pids.as_slice() else {
+            panic!("pids: {:?}", owner.pids);
+        };
+        let _left = Left {
+            trees: vec![left, stopped],
+            stopped: (told, "owlshift-never-stopped"),
+        };
+        let asked = Instant::now();
+        owner.signal(Signal::TERM);
+        wait_until("a checked stop asked", || owner.asked() == "checked");
+        owner.signal(Signal::TERM);
+        assert!(is_alive(left), "the process's own command was stopped");
+        assert_eq!(owner.ended_by(), Some(Signal::TERM.as_raw()));
+        assert!(
+            asked.elapsed() >= Duration::from_secs(1),
+            "ended before its bound"
+        );
+        wait_until("its own command stopped", || !is_alive(left));
+
+        let mut owner = Owner::start("helper_stop_by_degrees");
+        let &[left, stopped, told] = owner.pids.as_slice() else {
+            panic!("pids: {:?}", owner.pids);
+        };
+        let _left = Left {
+            trees: vec![left, stopped],
+            stopped: (told, "owlshift-never-stopped"),
+        };
+        owner.signal(Signal::QUIT);
+        assert_eq!(owner.ended_by(), Some(Signal::QUIT.as_raw()));
+        assert_eq!(owner.asked(), "", "a degree was asked");
+        for pid in [left, stopped, told] {
+            wait_until("every tree stopped", || !is_alive(pid));
+        }
     }
 
     #[test]

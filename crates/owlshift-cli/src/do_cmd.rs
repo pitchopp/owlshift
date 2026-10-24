@@ -1,7 +1,8 @@
 //! `owlshift do TICKET`, `owlshift continue TICKET` and `owlshift watch`:
 //! open what a run needs, in this order, and hand it to
 //! `owlshift_runner::on_demand`, or to `owlshift_runner::watch`, which
-//! continues the tickets whose questions wait until Ctrl-C. What any of them
+//! continues the tickets whose questions wait until it is asked to stop
+//! (OWL-161: by degrees, architecture section 5, "Three ways to stop"). What any of them
 //! can refuse without a credential, a host where agent runs cannot be
 //! confined included, is refused before the keychain is opened.
 //!
@@ -18,7 +19,6 @@ use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
 use std::sync::Arc;
-use std::thread;
 use std::time::{Duration, Instant};
 
 use owlshift_adapters::forge::Repo;
@@ -493,7 +493,7 @@ fn run_with(
             return Ok(Ended::Code(code));
         }
         _ => {
-            // OWL-152: until Ctrl-C ends the process; each continue's outcome
+            // OWL-152: until a stop ends it (OWL-161); each continue's outcome
             // is reported as `continue`'s, and so is each intake and dispatch
             // of the drain (OWL-250).
             let draining = if mode == Mode::Drain {
@@ -507,7 +507,9 @@ fn run_with(
             let _ = writeln!(
                 io::stdout(),
                 "Watching {repo}: each ticket whose questions wait is continued once its \
-                 decider's reply counts{draining}, checked every {} seconds. Ctrl-C stops.",
+                 decider's reply counts{draining}, checked every {} seconds. Ctrl-C ends it once \
+                 the steps under way finish, a second stops them checking their runs, a third \
+                 stops now.",
                 POLL_INTERVAL.as_secs()
             );
             // Held while watch runs, which `continue --to-watch` reads
@@ -552,7 +554,11 @@ fn run_with(
                 &mut served_out,
             );
             let mut sleep = |interval| {
-                thread::sleep(interval);
+                // A stop asked by a signal wakes it (OWL-161): the loop's
+                // own check then ends the watch, so it goes on here.
+                if owlshift_platform::process::wait_asked(interval).is_some() {
+                    return true;
+                }
                 if let (Some(served), Some(between)) = (served, between.as_mut())
                     && between.check(
                         &served_git,
@@ -760,13 +766,14 @@ fn finish(
             // A look at a followed pull request is no failure (OWL-209),
             // nor is a ticket back in the ready column (OWL-248), nor a
             // stage step of watch's (OWL-367), nor a ticket left to watch
-            // (OWL-420).
+            // (OWL-420), nor a step a checked stop ended (OWL-161).
             if matches!(
                 stop,
                 Stop::Watched { .. }
                     | Stop::Ready { .. }
                     | Stop::Stepped { .. }
                     | Stop::ToWatch { .. }
+                    | Stop::Stopped
             ) {
                 ExitCode::SUCCESS
             } else {

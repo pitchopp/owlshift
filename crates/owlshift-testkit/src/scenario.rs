@@ -746,7 +746,9 @@ impl Driver {
         let detail = match &report.outcome {
             Outcome::Failed(failure) => failure.to_string(),
             Outcome::Finished { result, .. } => result.summary.clone(),
-            Outcome::Quarantined(_) | Outcome::UsageLimit { .. } => String::new(),
+            Outcome::Quarantined(_) | Outcome::UsageLimit { .. } | Outcome::Stopped => {
+                String::new()
+            }
         };
         let body = ParkedComment {
             ticket: self.id.clone(),

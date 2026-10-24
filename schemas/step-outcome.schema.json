@@ -39,7 +39,7 @@
     "format": {
       "description": "The format version of this document.",
       "type": "integer",
-      "const": 4
+      "const": 5
     },
     "hold": {
       "description": "The hold the step calls for, by watch's rule, none when it calls for\nnone.",
@@ -359,6 +359,20 @@
           "required": [
             "end",
             "commit"
+          ]
+        },
+        {
+          "description": "A checked stop of its watch stopped the step (OWL-161): its runs\nwere checked, and the ticket stays at its stage, resumed at the next\nstart with no hold. Format 5.",
+          "type": "object",
+          "properties": {
+            "end": {
+              "type": "string",
+              "const": "stopped"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "end"
           ]
         },
         {
