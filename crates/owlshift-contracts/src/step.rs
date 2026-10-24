@@ -628,7 +628,7 @@ pub fn is_run_id(id: &str) -> bool {
 /// Whether `id` is a full commit id as git prints it: 40 or 64 lower-case
 /// hexadecimal digits.
 pub fn is_commit_id(id: &str) -> bool {
-    matches!(id.len(), 40 | 64) && id.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+    owlshift_core::floor::is_commit_id(id)
 }
 
 /// Whether `name` is one plain path component of at most `max` bytes.

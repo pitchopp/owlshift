@@ -341,6 +341,45 @@ pub enum AnswerClass {
     CounterQuestion,
 }
 
+/// Which pull requests the runner merges once green (`[forge] merge`, D14,
+/// architecture section 5, "Merge on green"), read at the base branch's head.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum MergeSwitch {
+    /// None: a human merges. The default.
+    #[default]
+    Never,
+    /// Only a ticket carrying the tracker label `owlshift:merge`
+    /// ([`crate::follow::MERGE_LABEL`]).
+    Labeled,
+    /// Every ticket watch follows.
+    All,
+}
+
+/// How the runner merges a pull request (`[forge] merge_method`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum MergeMethod {
+    /// One commit on the base. The default.
+    #[default]
+    Squash,
+    /// A merge commit.
+    Merge,
+    /// The head's commits replayed on the base.
+    Rebase,
+}
+
+impl MergeMethod {
+    /// The name the project file writes, and GitHub's `merge_method`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Squash => "squash",
+            Self::Merge => "merge",
+            Self::Rebase => "rebase",
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -159,14 +159,16 @@ fn a_standard_ticket_from_admission_to_merge() {
     step(&mut ticket, Event::Completed);
     step(&mut ticket, Event::Completed);
 
-    // Deliver: the Writer may open the pull request, never merge it.
+    // Deliver: the Writer may open the pull request, never merge it without
+    // the project's merge on green grant.
     assert_eq!(ticket.state.status(), Status::Active(Stage::Deliver));
     assert!(check_action(Action::OpenPullRequest, HumanApproval::Absent).is_ok());
-    assert!(check_action(Action::Merge, HumanApproval::Recorded).is_err());
+    assert!(check_action(Action::Merge(None), HumanApproval::Recorded).is_err());
     step(&mut ticket, Event::Completed);
 
     // Watch: a red check sends it back to Build; a blocked fix run parks it;
-    // a human restarts it; the fix goes through; a human merges.
+    // a human restarts it; the fix goes through; a human merges, or the
+    // runner under merge on green.
     step(&mut ticket, Event::LoopBack);
     assert!(matches!(
         step(&mut ticket, Event::Blocked),

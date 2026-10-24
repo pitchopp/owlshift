@@ -1,15 +1,51 @@
 //! The policy floor: rules no project can configure away (architecture,
-//! section 8). Owlshift never merges, deploys or changes infrastructure on
-//! its own, agents hold no credentials, and some question categories always
-//! go to a human.
+//! section 8). No agent merges, deploys or changes infrastructure. The
+//! runner deploys or changes infrastructure only with a human approval, and
+//! merges only under the one grant a project can give, merge on green (D14),
+//! at the head it pushed. Agents hold no credentials, and some question
+//! categories always go to a human.
 
 use std::fmt;
 
-use crate::vocab::DelegationLevel;
+use crate::vocab::{DelegationLevel, MergeMethod};
+
+/// The project's leave for the runner to merge one pull request at one head
+/// (D14, architecture section 5, "Merge on green"). Only
+/// [`crate::follow::merge_due`] makes one: once the project's
+/// `[forge] merge`, read at the base branch's head, allows the ticket and
+/// every condition of merge on green holds. Its head is the commit Owlshift
+/// last pushed on that ticket's branch; the Writer sends it as the merge's
+/// expected head, so GitHub refuses the merge of any other head, another
+/// ticket's pull request included (HTTP 409, check C19). A grant is made for
+/// one pass and used at once, never kept.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct MergeGrant {
+    head: String,
+    method: MergeMethod,
+}
+
+impl MergeGrant {
+    pub(crate) fn new(head: &str, method: MergeMethod) -> Self {
+        Self {
+            head: head.to_owned(),
+            method,
+        }
+    }
+
+    /// The head the merge expects: the commit Owlshift last pushed.
+    pub fn head(&self) -> &str {
+        &self.head
+    }
+
+    /// The project's `[forge] merge_method`.
+    pub fn method(&self) -> MergeMethod {
+        self.method
+    }
+}
 
 /// Something the Writer does on the tracker, the forge or beyond. The Writer
 /// asks [`check_action`] before each one.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum Action {
     /// Post or edit a marked comment on the ticket, or resolve one the
     /// runner posted so it shows folded (OWL-353).
@@ -27,8 +63,9 @@ pub enum Action {
     PushRef,
     /// Open or update the ticket's pull request.
     OpenPullRequest,
-    /// Merge a pull request.
-    Merge,
+    /// Merge a pull request: under the project's merge on green grant, or
+    /// `None` for a merge without one, which the floor refuses.
+    Merge(Option<MergeGrant>),
     /// Deploy.
     Deploy,
     /// Change infrastructure: environment variables, feature flags, DNS, CI
@@ -46,13 +83,16 @@ pub enum HumanApproval {
     Recorded,
 }
 
-/// Checks a Writer action against the floor: a merge is always refused (a
-/// human merges); a deploy or an infrastructure change needs a human approval
-/// recorded on the ticket; everything else passes.
+/// Checks a Writer action against the floor: a merge passes only with a
+/// merge grant whose expected head is a full commit id, whatever approval is
+/// recorded (without the grant a human merges); a deploy or an
+/// infrastructure change needs a human approval recorded on the ticket;
+/// everything else passes.
 pub fn check_action(action: Action, approval: HumanApproval) -> Result<(), FloorViolation> {
     // No wildcard: a new action does not compile until the floor decides it.
     match action {
-        Action::Merge => Err(FloorViolation::Merge),
+        Action::Merge(Some(grant)) if is_commit_id(grant.head()) => Ok(()),
+        Action::Merge(_) => Err(FloorViolation::Merge),
         Action::Deploy | Action::ChangeInfrastructure => match approval {
             HumanApproval::Recorded => Ok(()),
             HumanApproval::Absent => Err(FloorViolation::Unapproved(action)),
@@ -66,6 +106,13 @@ pub fn check_action(action: Action, approval: HumanApproval) -> Result<(), Floor
         | Action::OpenPullRequest => Ok(()),
         Action::Relate => Ok(()),
     }
+}
+
+/// Whether `id` is a full commit id as git prints it: 40 or 64 lower-case
+/// hexadecimal digits (SHA-1 or SHA-256), never a branch name or an
+/// abbreviation.
+pub fn is_commit_id(id: &str) -> bool {
+    matches!(id.len(), 40 | 64) && id.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
 }
 
 /// Checks a follow-up proposal against the floor (architecture section 5,
@@ -269,7 +316,8 @@ pub(crate) fn matches_token(category: &str, token: &str) -> bool {
 /// An action or a set-up the floor refuses.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum FloorViolation {
-    /// Owlshift never merges: a human does.
+    /// A merge without the project's merge on green grant, or whose expected
+    /// head is not a full commit id: a human merges.
     Merge,
     /// The action needs a human approval recorded on the ticket.
     Unapproved(Action),
@@ -282,7 +330,10 @@ pub enum FloorViolation {
 impl fmt::Display for FloorViolation {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Merge => f.write_str("Owlshift never merges a pull request: a human does"),
+            Self::Merge => f.write_str(
+                "Owlshift merges a pull request only under the project's merge on green, at \
+                 the head it pushed: otherwise a human does",
+            ),
             Self::Unapproved(action) => write!(
                 f,
                 "{action:?} needs a human approval recorded on the ticket"
@@ -307,12 +358,42 @@ impl std::error::Error for FloorViolation {}
 mod tests {
     use super::*;
 
+    /// Without the project's merge on green grant a human merges, approval
+    /// or not.
     #[test]
     fn a_merge_is_refused_even_when_approved() {
         for approval in [HumanApproval::Absent, HumanApproval::Recorded] {
             assert_eq!(
-                check_action(Action::Merge, approval),
+                check_action(Action::Merge(None), approval),
                 Err(FloorViolation::Merge)
+            );
+        }
+    }
+
+    /// A grant passes at a full expected head, and only there.
+    #[test]
+    fn a_merge_passes_with_a_grant_at_a_full_expected_head() {
+        let sha1 = "0123456789abcdef0123456789abcdef01234567";
+        let sha256 = "a".repeat(64);
+        for head in [sha1, sha256.as_str()] {
+            let grant = MergeGrant::new(head, MergeMethod::Squash);
+            assert_eq!(
+                check_action(Action::Merge(Some(grant)), HumanApproval::Absent),
+                Ok(())
+            );
+        }
+        for head in [
+            "",
+            "main",
+            &sha1[..12],
+            &sha1.to_uppercase(),
+            "g".repeat(40).as_str(),
+        ] {
+            let grant = MergeGrant::new(head, MergeMethod::Squash);
+            assert_eq!(
+                check_action(Action::Merge(Some(grant)), HumanApproval::Recorded),
+                Err(FloorViolation::Merge),
+                "{head:?}"
             );
         }
     }
@@ -321,8 +402,8 @@ mod tests {
     fn a_deploy_or_an_infrastructure_change_needs_a_recorded_approval() {
         for action in [Action::Deploy, Action::ChangeInfrastructure] {
             assert_eq!(
-                check_action(action, HumanApproval::Absent),
-                Err(FloorViolation::Unapproved(action))
+                check_action(action.clone(), HumanApproval::Absent),
+                Err(FloorViolation::Unapproved(action.clone()))
             );
             assert_eq!(check_action(action, HumanApproval::Recorded), Ok(()));
         }
@@ -465,6 +546,11 @@ mod tests {
         assert_eq!(
             FloorViolation::Unapproved(Action::Deploy).to_string(),
             "Deploy needs a human approval recorded on the ticket"
+        );
+        assert_eq!(
+            FloorViolation::Merge.to_string(),
+            "Owlshift merges a pull request only under the project's merge on green, at the \
+             head it pushed: otherwise a human does"
         );
     }
 }
