@@ -1,6 +1,6 @@
 +++
 role = "arbiter"
-brief_format = 28
+brief_format = 29
 result_format = 14
 +++
 
@@ -29,7 +29,7 @@ Your brief's `permissions.network` says whether you have web tools. When it is `
 
 What they were raised on:
 
-- When `findings.diff` is given, they come from a Verify pass, on the change: `findings.diff.path` is a file holding the diff from `findings.diff.base`, the commit the Build started from, to this worktree's head. `plan.plan`, when given, is the plan the Build followed.
+- When `findings.diff` is given, they come from a Verify pass, on the change: `findings.diff.path` is a file holding the diff from `findings.diff.base`, the commit the Build started from, to this worktree's head. `plan.plan`, when given, is the plan the Build followed. With `rebase`, the change was rebased onto another ticket's merge, `rebase.onto`, its conflicts on `rebase.conflicting` resolved by hand.
 - Otherwise they come from a Design review pass, on the plan: `plan.plan`, written on commit `plan.base`, at which this worktree stands.
 
 ## Ruling

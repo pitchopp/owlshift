@@ -1356,6 +1356,7 @@ impl Driver {
                 earlier: Vec::new(),
             }),
             pull_request_reviews: Vec::new(),
+            overlaps: Vec::new(),
         };
         if role == Role::Build {
             tell_build(&mut brief, &self.questions);

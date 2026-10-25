@@ -30,6 +30,7 @@ use owlshift_contracts::refs::{
 use owlshift_contracts::step::{KeptFollowing, KeptUnposted};
 use owlshift_core::follow::{
     self, Action, BaseRead, CheckOutcome, CheckRead, Decision, EndReason, Followed, Read,
+    RebaseCause,
 };
 use owlshift_core::pipeline::Pipeline;
 use owlshift_core::state::{Event, Status, TicketState, Transition};
@@ -126,18 +127,21 @@ impl Fresh {
 /// Reads pull request `number` of `delivery`, whose last push is `pushed`,
 /// and decides on it by the core's table, reading the base branch when the
 /// table needs it. `failing_for` gives how long ago a failure was first read
-/// on the head read. Watch's look and a repair's read under the lock
-/// (OWL-112) both read through it.
+/// on the head read. `overlap` is the base head that changes a path one of
+/// the ticket's overlaps names, when the caller found one
+/// ([`crate::held::base_moved_on`], OWL-449). Watch's look and a repair's
+/// read under the lock (OWL-112) both read through it.
 pub fn read(
     forge: &GitHubForge,
     delivery: &TicketDelivery,
     number: u64,
     pushed: &str,
     mut failing_for: impl FnMut(&Read) -> Option<Duration>,
+    overlap: Option<&str>,
 ) -> Result<Fresh, owlshift_adapters::forge::Error> {
     let PullRequestRead { checks, .. } = forge.follow(number)?;
     let core = read_of(&checks);
-    let followed = followed_of(delivery, pushed);
+    let followed = followed_of(delivery, pushed, overlap);
     let failing_for = failing_for(&core);
     let mut decision = follow::decide(&core, followed, None, failing_for);
     let mut base = None;
@@ -166,12 +170,17 @@ pub fn read(
 }
 
 /// What the core's table follows of `delivery`, whose last push is
-/// `pushed`.
-fn followed_of<'d>(delivery: &'d TicketDelivery, pushed: &'d str) -> Followed<'d> {
+/// `pushed`, with the base head an overlap refreshes onto (OWL-449).
+fn followed_of<'d>(
+    delivery: &'d TicketDelivery,
+    pushed: &'d str,
+    overlap: Option<&'d str>,
+) -> Followed<'d> {
     Followed {
         pushed,
         pushing: delivery.pushing.as_ref().map(|p| p.commit.as_str()),
         rebased_onto: delivery.rebased_onto.as_deref(),
+        overlap,
     }
 }
 
@@ -228,10 +237,27 @@ fn describe(action: &Action) -> &'static str {
         Action::WaitChecks => "its checks are still running, or none has reported yet",
         Action::WaitBaseRed => "its failed checks fail on its base branch too: nothing to fix here",
         Action::Green => "every check passed",
-        Action::Rebase { refresh: false, .. } => "it conflicts with its base: a rebase is due",
-        Action::Rebase { refresh: true, .. } => {
+        Action::Rebase {
+            cause: RebaseCause::Conflict,
+            ..
+        } => "it conflicts with its base: a rebase is due",
+        Action::Rebase {
+            cause: RebaseCause::BaseFixed,
+            ..
+        } => {
             "its checks failed only on the base it was pushed onto and pass on the base now: a \
              rebase is due"
+        }
+        Action::Rebase {
+            cause: RebaseCause::MergeBase,
+            ..
+        } => "its base moved since the push: a refresh rebase is due before a merge",
+        Action::Rebase {
+            cause: RebaseCause::Overlap,
+            ..
+        } => {
+            "its base now changes a path it shares with another ticket: a refresh rebase is due, \
+             so its checks run on the combined code"
         }
         Action::RebaseFailed { .. } => {
             "it still conflicts with the base head its last rebase used: that rebase failed"
@@ -253,8 +279,8 @@ fn action_name(decision: &Decision) -> &'static str {
             Action::WaitChecks => "wait_checks",
             Action::WaitBaseRed => "wait_base_red",
             Action::Green => "green",
-            Action::Rebase { refresh: false, .. } => "rebase",
-            Action::Rebase { refresh: true, .. } => "refresh_rebase",
+            Action::Rebase { cause, .. } if !cause.refresh() => "rebase",
+            Action::Rebase { .. } => "refresh_rebase",
             Action::RebaseFailed { .. } => "rebase_failed",
             Action::Fix { .. } => "fix",
             Action::Park => "park",
@@ -373,12 +399,15 @@ impl Following {
     /// Returns the look, and the warnings to record now, each once: a spent
     /// budget once per pause, a forge failure once per kind until a read
     /// succeeds, overdue checks once per head.
+    /// `overlap` is the base head an overlap of the ticket refreshes onto,
+    /// when watch found one (OWL-449).
     pub fn look(
         &mut self,
         forge: &GitHubForge,
         ticket: &TicketId,
         delivery: &TicketDelivery,
         now: Timestamp,
+        overlap: Option<&str>,
     ) -> (Look, Vec<Warning>) {
         let mut warnings = Vec::new();
         let (pr, pushed) = match self.readable(delivery, now) {
@@ -386,7 +415,7 @@ impl Following {
             Err(look) => return (*look, warnings),
         };
         let failing = |core: &Read| self.failing_for(ticket, core, now);
-        let fresh = match read(forge, delivery, pr.number, pushed, failing) {
+        let fresh = match read(forge, delivery, pr.number, pushed, failing, overlap) {
             Ok(fresh) => fresh,
             Err(error) => return self.failed(ticket, &error, now, warnings),
         };
@@ -440,7 +469,12 @@ impl Following {
             Ok(PullRequestRead { checks, .. }) => checks,
             Err(error) => return self.failed(ticket, &error, now, warnings),
         };
-        let decision = follow::decide(&read_of(&checks), followed_of(delivery, pushed), None, None);
+        let decision = follow::decide(
+            &read_of(&checks),
+            followed_of(delivery, pushed, None),
+            None,
+            None,
+        );
         let fresh = Fresh {
             checks,
             base: None,
@@ -566,6 +600,17 @@ impl Following {
         }
         if let Some(base) = &seen.base_head {
             fields.push(("base", json!(base)));
+        }
+        // Rebase runs are counted by cause (OWL-449).
+        if let Decision::Follow {
+            action: Action::Rebase { cause, onto },
+            ..
+        } = &seen.decision
+        {
+            fields.push(("cause", json!(cause.as_str())));
+            if seen.base_head.is_none() {
+                fields.push(("base", json!(onto)));
+            }
         }
         Some(
             fields
@@ -1220,18 +1265,18 @@ mod tests {
         let mut following = Following::default();
         let d = delivery();
         canned.push(pr("OPEN", PUSHED, "MERGEABLE", &[("ci", "SUCCESS")]));
-        let green = seen(following.look(&forge, &ticket(), &d, at(0)));
+        let green = seen(following.look(&forge, &ticket(), &d, at(0), None));
         assert_eq!(
             following.events(&ticket(), &green).unwrap()["watch"],
             "read"
         );
         canned.push(pr("OPEN", PUSHED, "MERGEABLE", &[("ci", "SUCCESS")]));
-        let again = seen(following.look(&forge, &ticket(), &d, at(1)));
+        let again = seen(following.look(&forge, &ticket(), &d, at(1), None));
         assert_eq!(following.events(&ticket(), &again), None);
 
         canned.push(pr("OPEN", PUSHED, "MERGEABLE", &[("ci", "FAILURE")]));
         canned.push(base(&[("ci", "SUCCESS")]));
-        let red = seen(following.look(&forge, &ticket(), &d, at(2)));
+        let red = seen(following.look(&forge, &ticket(), &d, at(2), None));
         let event = following.events(&ticket(), &red).unwrap();
         assert_eq!(
             (&event["watch"], &event["verdict"], &event["action"]),
@@ -1239,14 +1284,14 @@ mod tests {
         );
         canned.push(pr("OPEN", PUSHED, "CONFLICTING", &[("ci", "FAILURE")]));
         canned.push(base(&[("ci", "SUCCESS")]));
-        let conflicting = seen(following.look(&forge, &ticket(), &d, at(3)));
+        let conflicting = seen(following.look(&forge, &ticket(), &d, at(3), None));
         let event = following.events(&ticket(), &conflicting).unwrap();
         assert_eq!(
             (&event["watch"], &event["action"]),
             (&json!("mergeable"), &json!("rebase"))
         );
         canned.push(pr("MERGED", PUSHED, "UNKNOWN", &[]));
-        let merged = seen(following.look(&forge, &ticket(), &d, at(4)));
+        let merged = seen(following.look(&forge, &ticket(), &d, at(4), None));
         let event = following.events(&ticket(), &merged).unwrap();
         assert_eq!(
             (&event["watch"], &event["reason"]),
@@ -1272,10 +1317,10 @@ mod tests {
             reset: Some(at(30).as_second()),
             retry_after: None,
         }));
-        let (look, warnings) = following.look(&forge, &ticket(), &delivery(), at(0));
+        let (look, warnings) = following.look(&forge, &ticket(), &delivery(), at(0), None);
         assert_eq!(look, Look::Paused { until: at(30) });
         assert_eq!(warnings[0]["what"], "forge_rate_limited");
-        let (look, warnings) = following.look(&forge, &ticket(), &delivery(), at(29));
+        let (look, warnings) = following.look(&forge, &ticket(), &delivery(), at(29), None);
         assert_eq!(look, Look::Paused { until: at(30) });
         assert!(warnings.is_empty());
         assert_eq!(canned.sent(), 1);
@@ -1284,7 +1329,7 @@ mod tests {
             200,
             r#"{"data":null,"errors":[{"type":"RATE_LIMITED","message":"spent"}]}"#,
         ));
-        let (look, _) = following.look(&forge, &ticket(), &delivery(), at(30));
+        let (look, _) = following.look(&forge, &ticket(), &delivery(), at(30), None);
         assert_eq!(look, Look::Paused { until: at(35) });
     }
 
@@ -1296,15 +1341,15 @@ mod tests {
         for _ in 0..2 {
             canned.push(Response::new(502, "<html>"));
         }
-        let (_, first) = following.look(&forge, &ticket(), &delivery(), at(0));
-        let (look, second) = following.look(&forge, &ticket(), &delivery(), at(1));
+        let (_, first) = following.look(&forge, &ticket(), &delivery(), at(0), None);
+        let (look, second) = following.look(&forge, &ticket(), &delivery(), at(1), None);
         assert_eq!(first.len(), 1);
         assert!(second.is_empty());
         assert!(matches!(look, Look::Unread { kind: "other", .. }));
         canned.push(pr("OPEN", PUSHED, "MERGEABLE", &[]));
-        following.look(&forge, &ticket(), &delivery(), at(2));
+        following.look(&forge, &ticket(), &delivery(), at(2), None);
         canned.push(Response::new(502, "<html>"));
-        let (_, third) = following.look(&forge, &ticket(), &delivery(), at(3));
+        let (_, third) = following.look(&forge, &ticket(), &delivery(), at(3), None);
         assert_eq!(third.len(), 1);
     }
 

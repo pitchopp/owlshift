@@ -380,6 +380,33 @@ impl MergeMethod {
     }
 }
 
+/// Whether two of the project's tickets may hold the same file
+/// (`policy.overlap`, OWL-449; architecture section 5, "Tolerated
+/// overlap"), read at the base branch's head.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum Overlap {
+    /// Never: a ticket that would touch what another holds waits. The
+    /// default.
+    #[default]
+    Exclusive,
+    /// Two Owlshift tickets may hold a file or a zone, the overlap recorded
+    /// and repaired at Watch by a refresh rebase; named resources,
+    /// whole-repository holders, other pull requests and people's tickets
+    /// still exclude, and no file is held by more than two.
+    Rebase,
+}
+
+impl Overlap {
+    /// The name the project file writes.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Exclusive => "exclusive",
+            Self::Rebase => "rebase",
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

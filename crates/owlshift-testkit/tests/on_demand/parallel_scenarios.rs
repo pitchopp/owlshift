@@ -666,3 +666,143 @@ fn scenario_s5_a_build_whose_plan_shares_a_file_waits_for_the_one_dispatched_fir
         other => panic!("{other:?}\n{printed}"),
     }
 }
+
+/// Scenario S5 under `policy.overlap = "rebase"` (OWL-449): DEMO-1, DEMO-2
+/// and DEMO-3 plan `app/one.rs`, and DEMO-1 and DEMO-4 plan a migration
+/// each, which the project names as one resource (`stack.resources`). All
+/// four are dispatched together; at Build, DEMO-1 and DEMO-2 run together,
+/// DEMO-2's admission recording its overlap with DEMO-1 and telling it; the
+/// third holder of `app/one.rs`, DEMO-3, waits for both, and DEMO-4 waits
+/// for DEMO-1's migration chain, a named resource never being shared.
+#[test]
+fn scenario_s5_under_rebase_two_builds_share_a_file_and_a_third_waits() {
+    let bench = parallel_bench(
+        "max_in_flight = 4\noverlap = \"rebase\"\n[stack.resources]\nmigrations = \"db/*\"\n",
+    );
+    for (id, text) in [
+        ("DEMO-2", "Greet twice."),
+        ("DEMO-3", "Greet thrice."),
+        ("DEMO-4", "Migrate."),
+    ] {
+        bench.put_ticket(
+            id,
+            "maintainer",
+            "Todo",
+            &["agent"],
+            "blocked_by = [\"DEMO-9\"]\n",
+            text,
+        );
+    }
+    let reviewed = || bench.read(&super::design_scenarios::reviewed(&[]));
+    let mut replies: Vec<Reply> = ["app", "app", "app", "db"]
+        .iter()
+        .map(|zone| bench.reply(None, Some(&standard_declaring(&[zone]))))
+        .collect();
+    let plans: [&[&str]; 4] = [
+        &["app/one.rs", "db/1.sql"],
+        &["app/one.rs"],
+        &["app/one.rs"],
+        &["db/2.sql"],
+    ];
+    replies.extend(plans.iter().map(|files| bench.read(&planning(files))));
+    replies.extend((0..8).map(|_| reviewed()));
+    replies.push(building(&bench, "DEMO-1", "app/one.rs"));
+    replies.push(building(&bench, "DEMO-2", "app/one.rs"));
+    let (_, lines, printed) = bench.drain_passes(replies, 7, |pass, _| {
+        if pass == 4 {
+            bench.put_ticket("DEMO-9", "maintainer", "Done", &[], "", "A blocker.");
+        }
+    });
+    let report = format!("{lines}\n{printed}");
+    let events = bench.events();
+    let built: Vec<&str> = events
+        .iter()
+        .filter(|e| e.kind == EventKind::RunStarted && e.data["role"] == json!("build"))
+        .map(|e| e.ticket.as_ref().unwrap().as_str())
+        .collect();
+    assert_eq!(built, ["DEMO-1", "DEMO-2"], "{report}");
+    // DEMO-2's admission records the overlap its plan makes, and its
+    // widening the file its Build changed beside DEMO-1's, each told once.
+    let held = bench.record_of("DEMO-2").unwrap().held.unwrap();
+    let overlaps: Vec<_> = held
+        .overlaps
+        .iter()
+        .map(|o| (o.ticket.as_str(), o.paths.clone()))
+        .collect();
+    assert_eq!(
+        overlaps,
+        [(
+            "DEMO-1",
+            vec!["GREETING.md".to_owned(), "app/one.rs".to_owned()]
+        )],
+        "{report}"
+    );
+    let recorded: Vec<_> = events
+        .iter()
+        .filter(|e| e.data.get("overlap") == Some(&json!("recorded")))
+        .map(|e| {
+            (
+                e.ticket.as_ref().unwrap().as_str(),
+                e.data["by"].clone(),
+                e.data["tickets"].clone(),
+                e.data["paths"].clone(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        recorded,
+        [
+            (
+                "DEMO-2",
+                json!("admission"),
+                json!(["DEMO-1"]),
+                json!(["app/one.rs"])
+            ),
+            (
+                "DEMO-2",
+                json!("widening"),
+                json!(["DEMO-1"]),
+                json!(["GREETING.md"])
+            ),
+        ],
+        "{report}"
+    );
+    assert!(
+        bench
+            .record_of("DEMO-1")
+            .unwrap()
+            .held
+            .unwrap()
+            .overlaps
+            .is_empty()
+    );
+    // The third holder waits for both, the migration for DEMO-1's chain.
+    let waiting = collisions(&events, "watch");
+    assert!(
+        waiting.contains(&(
+            "DEMO-3".to_owned(),
+            json!(["DEMO-1", "DEMO-2"]),
+            json!({ "zone": "app/one.rs" })
+        )),
+        "{waiting:?}\n{report}"
+    );
+    assert!(
+        waiting.contains(&(
+            "DEMO-4".to_owned(),
+            json!(["DEMO-1"]),
+            json!({ "named": "migrations" })
+        )),
+        "{waiting:?}\n{report}"
+    );
+    assert!(
+        report.contains("DEMO-3's Build waits: DEMO-1 and DEMO-2 hold zone `app/one.rs`"),
+        "{report}"
+    );
+    for id in ["DEMO-3", "DEMO-4"] {
+        assert_eq!(status_of(&bench, id), Some(Status::Active(Stage::Build)));
+        assert!(
+            !bench.record_of(id).unwrap().held.unwrap().admitted(),
+            "{id}"
+        );
+    }
+}

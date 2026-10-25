@@ -12067,3 +12067,7 @@ mod pipeline_scenarios;
 /// Scenario S18, merge on green (OWL-445).
 #[path = "on_demand/merge_scenarios.rs"]
 mod merge_scenarios;
+
+/// Scenario S5 at Watch under `policy.overlap = "rebase"` (OWL-449).
+#[path = "on_demand/overlap_scenarios.rs"]
+mod overlap_scenarios;

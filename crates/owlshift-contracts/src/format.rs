@@ -45,8 +45,9 @@ use crate::Role;
 /// format 27 a rebase's optional `pull_request` and `url` and its `broken`,
 /// for a held Build's rebase off a broken base (OWL-427); format 28 gives
 /// `result_refusal` to the design role and the review stages' roles too,
-/// design review, verify and the arbiter (OWL-430).
-pub const BRIEF_FORMAT: u32 = 28;
+/// design review, verify and the arbiter (OWL-430); format 29 the build
+/// role's `overlaps` (OWL-449).
+pub const BRIEF_FORMAT: u32 = 29;
 /// The format version of `result.json`. Format 4 added the resolver's
 /// `resolutions` (OWL-138); format 5 the resolver's own `category` on each
 /// decision (OWL-144); format 6 refuses `decisions` from the build role
@@ -122,8 +123,9 @@ pub const SESSION_FORMAT: u32 = 1;
 /// tickets (`held.json` on a ticket ref, OWL-403). Format 2 adds the
 /// admission's time and plan (OWL-448): a dispatch admits nothing, the
 /// Build's admission does; format 1 is still read, as admitted at its
-/// dispatch.
-pub const HELD_FORMAT: u32 = 2;
+/// dispatch. Format 3 adds the overlaps the ticket tolerates under
+/// `policy.overlap = "rebase"` (OWL-449); format 2 is still read, with none.
+pub const HELD_FORMAT: u32 = 3;
 /// The format version of a step's envelope, the hidden argument of the
 /// child `owlshift continue` (OWL-399).
 pub const STEP_ENVELOPE_FORMAT: u32 = 1;

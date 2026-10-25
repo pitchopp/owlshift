@@ -134,12 +134,12 @@ use owlshift_contracts::event::EventKind;
 use owlshift_contracts::format::Format;
 use owlshift_contracts::ids::TicketId;
 use owlshift_contracts::step::{LandedKind, RefAfter, StepEnd, StepEnvelope, StepHold, StepKind};
-use owlshift_core::collision::{Collision, Dispatched, InFlight, collision};
+use owlshift_core::collision::{Collision, Dispatched, InFlight, weigh};
 use owlshift_core::follow::{Action, Decision, EndReason};
 use owlshift_core::schedule::{self, Turn};
 use owlshift_core::state::{Status, TicketState};
 use owlshift_core::usage::{Standing, own_harness};
-use owlshift_core::vocab::{Harness, Stage};
+use owlshift_core::vocab::{Harness, Overlap, Stage};
 
 use crate::answer_check::{self, Readiness};
 use crate::base;
@@ -164,6 +164,7 @@ mod limits;
 mod merge;
 mod outside;
 pub mod presence;
+mod refresh;
 mod running;
 pub mod stop;
 mod waiting;
@@ -572,6 +573,8 @@ struct Memory<'c> {
     stop_told: Option<owlshift_platform::process::Degree>,
     /// The base heads merge on green read at this pass (OWL-445).
     base_heads: merge::BaseHeads,
+    /// The refreshes the overlaps make due (OWL-449).
+    refreshes: refresh::Refreshes,
 }
 
 /// What a correction's or the reviews' read found due at a pass (OWL-445):
@@ -808,10 +811,19 @@ impl Watch<'_> {
         // A Build held back this pass, by watch's own hold or its base,
         // takes nothing yet for the Builds after it (OWL-448).
         let now = (self.on_demand.clock)();
-        let collisions = self.collisions(&read, outside.as_ref(), &|ticket| {
+        // The switch at the default branch's head: each step reads it again
+        // at its own base (OWL-449).
+        let overlap = if read.is_empty() {
+            Overlap::Exclusive
+        } else {
+            self.overlap_switch(memory)
+        };
+        let collisions = self.collisions(&read, outside.as_ref(), overlap, &|ticket| {
             memory.holds.stands(ticket, now) || memory.base_held.contains(ticket)
         });
         memory.collisions = collisions;
+        // Which followed pull requests an overlap's base refreshes (OWL-449).
+        self.overlap_refreshes(memory, &read);
         // The tickets whose step's child runs (OWL-401): each counts in the
         // slot's turn as its ref says, and is left alone until it ends.
         let busy: Vec<TicketId> = memory
@@ -1152,9 +1164,11 @@ impl Watch<'_> {
             return;
         };
         let now = (on_demand.clock)();
-        let (look, warnings) = memory
-            .following
-            .look(on_demand.forge, ticket, delivery, now);
+        let overlap = memory.refreshes.due(ticket);
+        let (look, warnings) =
+            memory
+                .following
+                .look(on_demand.forge, ticket, delivery, now, overlap.as_deref());
         for warning in warnings {
             sink.emit(ticket, None, EventKind::Warning, warning);
         }
@@ -2506,8 +2520,9 @@ impl Watch<'_> {
         let StepWait::Collision(found, _) = &told else {
             unreachable!("made a collision's wait above")
         };
-        // A pull request or a person's ticket is named as such (OWL-410).
-        let holder = in_flight::named(&memory.outside.kinds, &found.holder);
+        // A pull request or a person's ticket is named as such (OWL-410);
+        // under `rebase`, both tickets that share the path (OWL-449).
+        let (holding, who) = in_flight::holding(&memory.outside.kinds, found);
         let mut event = data([
             ("watch", json!("waits")),
             ("reason", json!("collision")),
@@ -2516,21 +2531,21 @@ impl Watch<'_> {
         if build {
             event.insert("stage".to_owned(), json!("build"));
         }
-        for (key, value) in holder.data() {
+        for (key, value) in in_flight::holding_data(&memory.outside.kinds, found) {
             event.insert(key.to_owned(), value);
         }
         sink.emit(ticket, None, EventKind::Decision, event.clone());
         self.show_wait(memory, sink, ticket, "collision", event);
         let line = if build {
             format!(
-                "{ticket}'s Build waits: {holder} holds {}, which its Build would take, and it is \
-                 admitted once {holder} no longer holds it",
+                "{ticket}'s Build waits: {holding} {}, which its Build would take, and it is \
+                 admitted once {who} no longer holds it",
                 found.resource
             )
         } else {
             format!(
-                "{ticket} waits: {holder} holds {}, which it would touch, and its next stage runs \
-                 once {holder} no longer holds it",
+                "{ticket} waits: {holding} {}, which it would touch, and its next stage runs once \
+                 {who} no longer holds it",
                 found.resource
             )
         };
@@ -2717,6 +2732,7 @@ impl Watch<'_> {
         &self,
         read: &[RefRead],
         outside: Option<&in_flight::Holders>,
+        overlap: Overlap,
         held_back: &dyn Fn(&TicketId) -> bool,
     ) -> HashMap<TicketId, (Collision<String>, bool)> {
         let on_demand = self.on_demand;
@@ -2741,7 +2757,7 @@ impl Watch<'_> {
                 continue;
             }
             let own = held::in_flight(ticket, stored, &named);
-            if let Some(collided) = collision(&own, &in_flight) {
+            if let Some(collided) = weigh(&own, &in_flight, overlap).collision {
                 found.insert(ticket.clone(), (collided, false));
                 continue;
             }
@@ -2772,7 +2788,7 @@ impl Watch<'_> {
                 });
             }
         }
-        for (id, collided) in schedule::admissions(&due, &in_flight) {
+        for (id, collided) in schedule::admissions(&due, &in_flight, overlap) {
             if let (Some(collided), Ok(ticket)) = (collided, TicketId::new(&id)) {
                 found.insert(ticket, (collided, true));
             }

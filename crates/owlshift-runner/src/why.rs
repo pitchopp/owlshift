@@ -154,19 +154,26 @@ pub fn phrase(wait: &Waiting) -> String {
         ),
         "slot" => format!("the project's slot is held by {}", list("tickets")),
         "collision" => {
+            let shared = data
+                .get("tickets")
+                .and_then(Value::as_array)
+                .is_some_and(|ids| ids.len() > 1);
             let holder = if let Some(number) = data.get("pull_request").and_then(Value::as_u64) {
-                format!("pull request #{number}")
+                format!("pull request #{number} holds")
             } else if data.get("person").and_then(Value::as_bool) == Some(true) {
-                format!("{}, which a person works on,", list("tickets"))
+                format!("{}, which a person works on, holds", list("tickets"))
+            } else if shared {
+                // Two tickets share the path already (OWL-449).
+                format!("{} hold", list("tickets").replace(", ", " and "))
             } else {
-                list("tickets")
+                format!("{} holds", list("tickets"))
             };
             let resource = data.get("resource").map_or_else(String::new, resource_text);
             // A Build's admission that waits (OWL-448).
             if data.get("stage").and_then(Value::as_str) == Some("build") {
-                format!("its Build waits: {holder} holds {resource}, which its Build would take")
+                format!("its Build waits: {holder} {resource}, which its Build would take")
             } else {
-                format!("{holder} holds {resource}, which it would touch")
+                format!("{holder} {resource}, which it would touch")
             }
         }
         "pr_cap" => match (
@@ -278,6 +285,18 @@ pub struct Report {
     /// The project's base checks that hold its Builds: holds and checks due
     /// (OWL-418).
     pub bases: Vec<Check>,
+    /// The overlaps the refs that hold keep (OWL-449): the ticket that
+    /// recorded it, the sibling, the shared paths and since when.
+    pub overlaps: Vec<Overlap>,
+}
+
+/// An overlap a ticket ref keeps (OWL-449), as `why` shows it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Overlap {
+    pub ticket: TicketId,
+    pub sibling: TicketId,
+    pub paths: Vec<String>,
+    pub at: Timestamp,
 }
 
 /// Reads every event of the log at `path`; the lines that are not events
@@ -373,6 +392,11 @@ pub fn gather(
             Vec::new()
         }
     };
+    let overlaps = if dirs.checkout().exists() {
+        overlaps_held(dirs)
+    } else {
+        Vec::new()
+    };
     Ok(Report {
         project: project.to_owned(),
         only,
@@ -383,7 +407,37 @@ pub fn gather(
         limits,
         slots,
         bases,
+        overlaps,
     })
+}
+
+/// The overlaps the project's ticket refs that hold keep (OWL-449), each
+/// once, as its recorder wrote it; a ref that cannot be read gives none,
+/// its note being the stage's.
+fn overlaps_held(dirs: &ProjectDirs) -> Vec<Overlap> {
+    let git = crate::project::runner_git();
+    let checkout = dirs.checkout();
+    let Ok(tickets) = ticket_ref::list(&git, &checkout) else {
+        return Vec::new();
+    };
+    let mut overlaps = Vec::new();
+    for ticket in tickets {
+        let Ok(Some(stored)) = ticket_ref::read(&git, &checkout, &ticket) else {
+            continue;
+        };
+        if !crate::held::holds(&stored) {
+            continue;
+        }
+        for kept in stored.record.held.iter().flat_map(|held| &held.overlaps) {
+            overlaps.push(Overlap {
+                ticket: ticket.clone(),
+                sibling: kept.ticket.clone(),
+                paths: kept.paths.clone(),
+                at: kept.at,
+            });
+        }
+    }
+    overlaps
 }
 
 fn stage_text(status: Status) -> String {
@@ -536,6 +590,32 @@ pub fn render(report: &Report) -> String {
     }
     for check in &report.bases {
         render_base(&mut out, check);
+    }
+    let overlaps: Vec<&Overlap> = report
+        .overlaps
+        .iter()
+        .filter(|o| {
+            report
+                .only
+                .as_ref()
+                .is_none_or(|only| *only == o.ticket || *only == o.sibling)
+        })
+        .collect();
+    if !overlaps.is_empty() {
+        let _ = writeln!(out, "overlaps (`policy.overlap = \"rebase\"`):");
+        for overlap in overlaps {
+            let paths: Vec<String> = overlap.paths.iter().map(|p| format!("`{p}`")).collect();
+            let _ = writeln!(
+                out,
+                "  {} and {} share {} (recorded by {} at {}): the first to merge refreshes the \
+                 other",
+                overlap.ticket,
+                overlap.sibling,
+                paths.join(", "),
+                overlap.ticket,
+                overlap.at
+            );
+        }
     }
     for note in &report.notes {
         let _ = writeln!(out, "note: {note}");
@@ -909,6 +989,12 @@ mod tests {
     fn render_names_the_marker_the_slots_the_limits_and_a_waiting_person() {
         let id = |t| TicketId::new(t).unwrap();
         let report = Report {
+            overlaps: vec![Overlap {
+                ticket: id("OWL-2"),
+                sibling: id("OWL-1"),
+                paths: vec!["app/one.rs".to_owned()],
+                at: "2026-10-20T09:30:00Z".parse().unwrap(),
+            }],
             project: "o/r".to_owned(),
             only: None,
             folded: Folded::default(),
@@ -957,5 +1043,36 @@ mod tests {
         assert!(text.contains("until 2026-10-20T15:00:00Z"), "{text}");
         assert!(text.contains("deadline passed"), "{text}");
         assert!(text.contains("note: a note"), "{text}");
+        // OWL-449: each overlap a ref that holds keeps.
+        assert!(
+            text.contains(
+                "  OWL-2 and OWL-1 share `app/one.rs` (recorded by OWL-2 at \
+                 2026-10-20T09:30:00Z): the first to merge refreshes the other"
+            ),
+            "{text}"
+        );
+    }
+
+    /// OWL-449: under `rebase`, a Build that would be a path's third holder
+    /// is told who the two are.
+    #[test]
+    fn a_third_holder_is_told_both_holders() {
+        let event = waits(
+            "2026-10-22T10:00:00Z",
+            "OWL-3",
+            data([
+                ("watch", json!("waits")),
+                ("reason", json!("collision")),
+                ("stage", json!("build")),
+                ("resource", json!({ "zone": "app/one.rs" })),
+                ("tickets", json!(["OWL-1", "OWL-2"])),
+            ]),
+        );
+        let folded = fold(&[event], "o/r");
+        let wait = &folded.current[&TicketId::new("OWL-3").unwrap()];
+        assert_eq!(
+            phrase(wait),
+            "its Build waits: OWL-1 and OWL-2 hold zone `app/one.rs`, which its Build would take"
+        );
     }
 }

@@ -28,7 +28,7 @@ use owlshift_contracts::config::ProjectConfig;
 use owlshift_contracts::format::Format;
 use owlshift_contracts::ids::TicketId;
 use owlshift_contracts::step::{OutsidePull, OutsideTicket, StepOutside};
-use owlshift_core::collision::{Dispatched, InFlight};
+use owlshift_core::collision::{Collision, Dispatched, InFlight};
 use owlshift_core::decider::declared_zones;
 use owlshift_core::resource::{self, NamedResources, Resource};
 use owlshift_core::schedule::Wait;
@@ -364,12 +364,14 @@ impl Outside {
 }
 
 /// An outside holder: it holds every ticket not yet delivered and never
-/// waits ([`InFlight::delivered`]).
+/// waits ([`InFlight::delivered`]), and is never an overlap's sibling
+/// ([`InFlight::outside`], OWL-449).
 fn outside(id: String, held: Vec<Resource>) -> InFlight<String> {
     InFlight {
         id,
         dispatched: Dispatched::Unrecorded,
         delivered: true,
+        outside: true,
         held,
     }
 }
@@ -394,6 +396,38 @@ pub fn files_held(files: &PullFiles, named: &NamedResources) -> Vec<Resource> {
         }
     }
     held
+}
+
+/// Who holds what a collision names, as a reason says it: "DEMO-1 holds",
+/// or under `rebase`, a path two tickets hold already, "DEMO-1 and DEMO-2
+/// hold" (OWL-449); and who must let it go, the holder or either of them.
+pub fn holding(kinds: &HashMap<String, Kind>, found: &Collision<String>) -> (String, String) {
+    let holder = named(kinds, &found.holder);
+    match &found.sharing {
+        Some(sharing) => {
+            let sharing = named(kinds, sharing);
+            (
+                format!("{holder} and {sharing} hold"),
+                format!("{holder} or {sharing}"),
+            )
+        }
+        None => (format!("{holder} holds"), holder.to_string()),
+    }
+}
+
+/// The event's fields naming who holds what a collision names: the
+/// holder's ([`Named::data`]), and under `rebase` both tickets sharing the
+/// path in `tickets` (OWL-449).
+pub fn holding_data(
+    kinds: &HashMap<String, Kind>,
+    found: &Collision<String>,
+) -> Vec<(&'static str, Value)> {
+    let mut fields = named(kinds, &found.holder).data();
+    if found.sharing.is_some() {
+        fields.retain(|(key, _)| *key != "tickets");
+        fields.push(("tickets", json!(found.holders())));
+    }
+    fields
 }
 
 /// What a waiting reason says: on watch's line for a ticket of the drain,
@@ -438,9 +472,9 @@ pub fn said(wait: &Wait<String>, exclude: Option<&str>, kinds: &HashMap<String, 
             list(ids)
         ),
         Wait::Collision(found) => {
-            let holder = named(kinds, &found.holder);
+            let (holding, who) = holding(kinds, found);
             format!(
-                "{holder} holds {}, which it would touch: it goes once {holder} no longer holds it",
+                "{holding} {}, which it would touch: it goes once {who} no longer holds it",
                 found.resource
             )
         }
@@ -626,6 +660,7 @@ mod tests {
             id: "DEMO-30".to_owned(),
             dispatched: Dispatched::Now,
             delivered: false,
+            outside: false,
             held: vec![zone("app/sub")],
         };
         let found = collision(&ready, &in_flight).unwrap();

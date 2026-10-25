@@ -1576,8 +1576,13 @@ fn brief_rejections() {
     );
     rejects(
         "newer format",
-        parse(|v| v["format"] = json!(29)),
+        parse(|v| v["format"] = json!(30)),
         "upgrade Owlshift",
+    );
+    rejects(
+        "format 28, before the build role's overlaps",
+        parse(|v| v["format"] = json!(28)),
+        "unknown format 28",
     );
     rejects(
         "format 26, before a held Build's rebase",

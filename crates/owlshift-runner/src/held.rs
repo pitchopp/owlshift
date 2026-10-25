@@ -18,19 +18,20 @@ use serde_json::{Value, json};
 
 use owlshift_contracts::drain::TicketIntake;
 use owlshift_contracts::ids::TicketId;
-use owlshift_contracts::refs::{MAX_HELD_FILES, TicketHeld};
+use owlshift_contracts::refs::{EndedWhy, MAX_HELD_FILES, TicketHeld};
 use owlshift_contracts::review::Plan;
-use owlshift_core::collision::{Dispatched, InFlight};
+use owlshift_core::collision::{self, Dispatched, InFlight, Shared};
 use owlshift_core::decider::brief_zones;
 use owlshift_core::pipeline::Pipeline;
 use owlshift_core::resource::{self, Held, NamedResources, Resource};
 use owlshift_core::state::TicketState;
 use owlshift_core::vocab::{Stage, Variant};
 
+use crate::events::{Data, data};
 use crate::executor::Git;
 use crate::on_demand::{delivery_followed, plan_sha256};
 use crate::routing::{route_labels, ticket_variant};
-use crate::ticket_ref::{Stored, TicketRecord};
+use crate::ticket_ref::{RefRead, Stored, TicketRecord};
 
 /// Whether the ticket ref `stored` is in flight, holding what its ticket
 /// holds: at a stage after Ready and before Watch, working, waiting or
@@ -111,7 +112,161 @@ pub fn of(
         id: ticket.as_str().to_owned(),
         dispatched,
         delivered,
+        outside: false,
         held,
+    }
+}
+
+/// The overlaps of `ticket` (OWL-449; architecture section 5, "Tolerated
+/// overlap"), from both sides: those its own record `own` keeps, and those
+/// the records of `refs`, the project's ticket refs, keep naming it, each
+/// recorded once by the ticket whose admission or widening found it. One
+/// entry per sibling, by identifier, its paths sorted, each once. A sibling
+/// counts while its ref holds, and once its following ended merged or by
+/// someone's push, whose change may still reach the base; not once its pull
+/// request was closed unmerged, at Ready, or once its ref is gone. A ref
+/// that cannot be read counts, since nothing tells it does not.
+pub fn overlaps_of(
+    ticket: &TicketId,
+    own: Option<&TicketHeld>,
+    refs: &[RefRead],
+) -> Vec<(TicketId, Vec<String>)> {
+    let counts = |sibling: &TicketId| match refs.iter().find(|(id, _)| id == sibling) {
+        None => false,
+        Some((_, Err(_))) => true,
+        Some((_, Ok(stored))) => {
+            holds(stored)
+                || stored
+                    .record
+                    .delivery
+                    .as_ref()
+                    .and_then(|delivery| delivery.ended.as_ref())
+                    .is_some_and(|ended| ended.why != EndedWhy::Closed)
+        }
+    };
+    let mut found: Vec<(TicketId, Vec<String>)> = Vec::new();
+    let mut add = |sibling: &TicketId, paths: &[String]| {
+        if sibling == ticket || !counts(sibling) {
+            return;
+        }
+        let at = match found.iter().position(|(id, _)| id == sibling) {
+            Some(at) => at,
+            None => {
+                found.push((sibling.clone(), Vec::new()));
+                found.len() - 1
+            }
+        };
+        let kept = &mut found[at].1;
+        for path in paths {
+            if !kept.contains(path) {
+                kept.push(path.clone());
+            }
+        }
+    };
+    for overlap in own.map_or(&[][..], |held| held.overlaps.as_slice()) {
+        add(&overlap.ticket, &overlap.paths);
+    }
+    for (recorder, read) in refs {
+        let Ok(stored) = read else { continue };
+        let Some(held) = stored.record.held.as_ref() else {
+            continue;
+        };
+        for overlap in held.overlaps.iter().filter(|o| o.ticket == *ticket) {
+            add(recorder, &overlap.paths);
+        }
+    }
+    for (_, paths) in &mut found {
+        paths.sort();
+    }
+    found.sort_by(|a, b| a.0.cmp(&b.0));
+    found
+}
+
+/// Records in `held` the overlaps of `found` it lacks, at `at` (OWL-449):
+/// each sibling that is a ticket identifier, with the paths its record
+/// gained. Gives what was recorded, for the `overlap` events.
+pub fn record(
+    held: &mut TicketHeld,
+    found: &[Shared<String>],
+    at: Timestamp,
+) -> Vec<(TicketId, Vec<String>)> {
+    found
+        .iter()
+        .filter_map(|shared| {
+            let sibling = TicketId::new(&shared.ticket).ok()?;
+            let added = held.record_overlap(&sibling, &shared.paths, at);
+            (!added.is_empty()).then_some((sibling, added))
+        })
+        .collect()
+}
+
+/// The `decision` event of an overlap recorded by `by`, `admission` or
+/// `widening` (OWL-449): `overlap` = `recorded`, the sibling in `tickets`,
+/// the paths the record gained.
+pub fn overlap_event(by: &str, sibling: &TicketId, paths: &[String]) -> Data {
+    data([
+        ("overlap", json!("recorded")),
+        ("by", json!(by)),
+        ("tickets", json!([sibling.as_str()])),
+        ("paths", json!(paths)),
+    ])
+}
+
+/// Whether `base`, the base branch's head, is a new head that changes a
+/// path of `overlaps` the pull request's head `pushed` does not contain yet
+/// (OWL-449, architecture section 5, "The refresh"): `base` is no ancestor
+/// of `pushed`, and a file it changed since `since`, the base head read at
+/// the push, when `base` descends from it, else since its merge-base with
+/// `pushed` (`git diff --name-only --no-renames -z from...base`), is, holds
+/// or lies in one of the paths, compared as zones are
+/// ([`collision::on_overlap`]). A change the base held at the push needs no
+/// refresh: GitHub's checks ran on the merge with it. Watch and a repair
+/// read it the same way, so they never disagree.
+pub fn base_moved_on(
+    git: &Git,
+    checkout: &Path,
+    pushed: &str,
+    since: Option<&str>,
+    base: &str,
+    overlaps: &[String],
+) -> Result<bool, String> {
+    if overlaps.is_empty() {
+        return Ok(false);
+    }
+    if is_ancestor(git, checkout, base, pushed)? {
+        return Ok(false);
+    }
+    let from = match since {
+        Some(since) if is_ancestor(git, checkout, since, base)? => since,
+        _ => pushed,
+    };
+    let changed = changed_files(git, checkout, from, base)?;
+    Ok(collision::on_overlap(&changed, overlaps))
+}
+
+/// Whether `ancestor` is an ancestor of `of`, itself included
+/// (`git merge-base --is-ancestor`: 0 yes, 1 no).
+fn is_ancestor(git: &Git, checkout: &Path, ancestor: &str, of: &str) -> Result<bool, String> {
+    let read = git
+        .output(
+            checkout,
+            &[
+                "merge-base",
+                "--is-ancestor",
+                "--end-of-options",
+                ancestor,
+                of,
+            ],
+            None,
+        )
+        .map_err(|e| e.to_string())?;
+    match read.code {
+        Some(0) => Ok(true),
+        Some(1) => Ok(false),
+        code => Err(format!(
+            "whether {of} contains {ancestor}: git exited with {code:?}: {}",
+            String::from_utf8_lossy(&read.stderr).trim()
+        )),
     }
 }
 
@@ -452,6 +607,175 @@ mod tests {
             at_build(None, Some((&plan, &hash)), None, &labels, &named, minute(2)),
             None
         );
+    }
+
+    /// OWL-449: a ticket's overlaps from both sides, its own record's and
+    /// those other refs keep naming it, one entry per sibling; a sibling
+    /// closed unmerged, at Ready or gone counts no more, one merged or
+    /// unreadable still does.
+    #[test]
+    fn overlaps_are_read_from_both_sides_while_the_sibling_counts() {
+        let id = |name: &str| TicketId::new(name).unwrap();
+        let delivery = TicketDelivery::parse(include_str!(
+            "../../owlshift-contracts/tests/fixtures/ticket-delivery.json"
+        ))
+        .unwrap();
+        let mut me = TicketHeld::dispatched(minute(0));
+        me.admit(strings(&["app/one.rs"]), Vec::new(), None, minute(1));
+        me.record_overlap(&id("DEMO-2"), &strings(&["app/one.rs"]), minute(1));
+        me.record_overlap(&id("DEMO-5"), &strings(&["web/x.rs"]), minute(1));
+        let sibling = |status: Status, delivery: Option<TicketDelivery>, names: &[&str]| {
+            let mut stored = at(status, delivery);
+            let mut held = TicketHeld::dispatched(minute(0));
+            held.admit(strings(&["app"]), Vec::new(), None, minute(2));
+            for name in names {
+                held.record_overlap(&id("DEMO-1"), &strings(&[name]), minute(2));
+            }
+            stored.record.held = Some(held);
+            stored
+        };
+        let mut merged = delivery.clone();
+        merged.ended = Some(owlshift_contracts::refs::Ended {
+            why: EndedWhy::Merged,
+            at: minute(3),
+            head: None,
+        });
+        let mut closed = merged.clone();
+        closed.ended.as_mut().unwrap().why = EndedWhy::Closed;
+        let refs: Vec<RefRead> = vec![
+            (id("DEMO-1"), Ok(at(Status::Active(Stage::Build), None))),
+            (
+                id("DEMO-2"),
+                Ok(sibling(
+                    Status::Active(Stage::Watch),
+                    Some(merged),
+                    &["app/two.rs"],
+                )),
+            ),
+            (
+                id("DEMO-3"),
+                Ok(sibling(
+                    Status::Active(Stage::Build),
+                    None,
+                    &["app/three.rs"],
+                )),
+            ),
+            (
+                id("DEMO-4"),
+                Ok(sibling(
+                    Status::Active(Stage::Watch),
+                    Some(closed),
+                    &["app/four.rs"],
+                )),
+            ),
+            (id("DEMO-6"), Err("unreadable".to_owned())),
+        ];
+        assert_eq!(
+            overlaps_of(&id("DEMO-1"), Some(&me), &refs),
+            [
+                (id("DEMO-2"), strings(&["app/one.rs", "app/two.rs"])),
+                (id("DEMO-3"), strings(&["app/three.rs"])),
+            ]
+        );
+        let mut unread = me.clone();
+        unread.record_overlap(&id("DEMO-6"), &strings(&["lib/a.rs"]), minute(4));
+        assert_eq!(overlaps_of(&id("DEMO-1"), Some(&unread), &refs).len(), 3);
+        assert!(overlaps_of(&id("DEMO-9"), None, &refs).is_empty());
+    }
+
+    /// OWL-449: a base that changes an overlap's path since the pushed head
+    /// left it, in any case or inside a shared folder, refreshes; one that
+    /// changes another path, or that the head already contains, does not.
+    #[test]
+    fn a_base_moved_on_an_overlap_path_is_read_from_git() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path();
+        let git = crate::project::runner_git();
+        let commit = |files: &[(&str, &str)]| -> String {
+            for (path, text) in files {
+                let file = repo.join(path);
+                std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+                std::fs::write(file, text).unwrap();
+            }
+            git.run(repo, &["add", "-A"]).unwrap();
+            git.run(
+                repo,
+                &[
+                    "-c",
+                    "user.name=Bench",
+                    "-c",
+                    "user.email=bench@example.invalid",
+                    "-c",
+                    "commit.gpgsign=false",
+                    "commit",
+                    "-q",
+                    "-m",
+                    "c",
+                ],
+            )
+            .unwrap();
+            let head = git.run(repo, &["rev-parse", "HEAD"]).unwrap();
+            String::from_utf8(head).unwrap().trim().to_owned()
+        };
+        git.run(repo, &["init", "-q", "-b", "main"]).unwrap();
+        commit(&[("app/one.rs", "one\n"), ("docs/a.md", "a\n")]);
+        git.run(repo, &["checkout", "-q", "-b", "owl-1"]).unwrap();
+        let pushed = commit(&[("app/one.rs", "one, mine\n")]);
+        git.run(repo, &["checkout", "-q", "main"]).unwrap();
+        let other = commit(&[("docs/a.md", "b\n")]);
+        let shared = commit(&[("app/one.rs", "one, theirs\n")]);
+        let moved = |base: &str, paths: &[&str]| {
+            base_moved_on(&git, repo, &pushed, None, base, &strings(paths)).unwrap()
+        };
+        assert!(!moved(&other, &["app/one.rs"]));
+        assert!(moved(&shared, &["app/one.rs"]));
+        assert!(moved(&shared, &["App/One.rs"]));
+        assert!(moved(&shared, &["app"]));
+        assert!(!moved(&shared, &["web"]));
+        assert!(!moved(&shared, &[]));
+        // A change the base held at the push already, its checks run on it.
+        let at_push = |since: &str| {
+            base_moved_on(
+                &git,
+                repo,
+                &pushed,
+                Some(since),
+                &shared,
+                &strings(&["app/one.rs"]),
+            )
+            .unwrap()
+        };
+        assert!(!at_push(&shared) && at_push(&other));
+        // A head that contains the base's change already needs no refresh.
+        git.run(repo, &["checkout", "-q", "owl-1"]).unwrap();
+        git.run(
+            repo,
+            &[
+                "-c",
+                "user.name=Bench",
+                "-c",
+                "user.email=bench@example.invalid",
+                "merge",
+                "-q",
+                "-X",
+                "ours",
+                "-m",
+                "m",
+                &shared,
+            ],
+        )
+        .unwrap();
+        let merged = git.run(repo, &["rev-parse", "HEAD"]).unwrap();
+        let merged = String::from_utf8(merged).unwrap().trim().to_owned();
+        let contained = base_moved_on(
+            &git,
+            repo,
+            &merged,
+            None,
+            &shared,
+            &strings(&["app/one.rs"]),
+        );
+        assert!(!contained.unwrap());
     }
 
     /// OWL-448: a return to Design's new plan adds its files, and only what

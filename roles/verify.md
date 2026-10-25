@@ -1,6 +1,6 @@
 +++
 role = "verify"
-brief_format = 28
+brief_format = 29
 result_format = 14
 +++
 
@@ -27,7 +27,7 @@ Your brief's `permissions.network` says whether you have web tools. When it is `
 
 ## What you review
 
-`review.diff` names the change: `review.diff.path` is a file holding the diff from `review.diff.base`, the commit the Build started from, to this worktree's head. Read it whole, then the code around each hunk: a change is judged in its context. When the brief has no `review.diff`, end with `blocked`.
+`review.diff` names the change: `review.diff.path` is a file holding the diff from `review.diff.base`, the commit the Build started from, to this worktree's head. Read it whole, then the code around each hunk: a change is judged in its context. When the brief has no `review.diff`, end with `blocked`. When the brief has `rebase`, the change was rebased onto `rebase.onto`, another ticket's merge, and its conflicts on `rebase.conflicting` resolved by hand, code no reviewer read: check above all that those files keep both tickets' intents.
 
 `plan.plan`, when given, is the plan the Build followed, written on `plan.base`: its `criteria` and its `steps`, each with its `test`. A ticket without a design has no plan: its success criteria are what the ticket and the decider's answers ask.
 

@@ -14,7 +14,7 @@ use owlshift_core::decider::ZoneOwners;
 use owlshift_core::gate::{GatePolicy, PassLimit, ResolverPolicy, usd_micros};
 use owlshift_core::reply::DEFAULT_QUIET_WINDOW;
 use owlshift_core::resource::NamedResources;
-use owlshift_core::vocab::{DelegationLevel, MergeMethod, MergeSwitch};
+use owlshift_core::vocab::{DelegationLevel, MergeMethod, MergeSwitch, Overlap};
 use schemars::JsonSchema;
 use semver::{Version, VersionReq};
 use serde::{Deserialize, Serialize};
@@ -606,6 +606,14 @@ pub struct Policy {
     /// reads it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ticket_budget_usd: Option<Usd>,
+    /// Whether two of the project's tickets may hold the same file (OWL-449;
+    /// architecture section 5, "Tolerated overlap"): `exclusive`, the
+    /// default, or `rebase`, which lets two Owlshift tickets build on one
+    /// file or zone and repairs them at Watch. Read at the base branch's
+    /// head, so a ticket's own branch cannot turn it on. A file using it
+    /// requires an Owlshift that reads it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub overlap: Option<Overlap>,
 }
 
 /// `policy.resolver_passes`: a whole number of runs, or `"unlimited"`
@@ -774,6 +782,11 @@ impl Policy {
         self.max_open_prs.map_or(DEFAULT_MAX_OPEN_PRS, |cap| {
             cap.clamp(*MAX_OPEN_PRS.start(), *MAX_OPEN_PRS.end())
         })
+    }
+
+    /// The project's `overlap` (OWL-449), `exclusive` when absent.
+    pub fn overlap(&self) -> Overlap {
+        self.overlap.unwrap_or_default()
     }
 
     /// The project's capacity (OWL-401): the project's `max_in_flight`, or
@@ -1541,6 +1554,27 @@ mod tests {
         assert_eq!(ProjectConfig::parse(&set.render()).unwrap(), set);
     }
 
+    /// OWL-449: `policy.overlap`, `exclusive` when absent, `rebase` read
+    /// back, anything else refused naming the key.
+    #[test]
+    fn the_overlap_is_a_policy_key_exclusive_by_default() {
+        let absent = project("", "").unwrap();
+        assert_eq!(absent.policy.overlap(), Overlap::Exclusive);
+        assert!(!absent.render().contains("overlap"));
+        let set = project("", "overlap = \"rebase\"").unwrap();
+        assert_eq!(set.policy.overlap(), Overlap::Rebase);
+        assert_eq!(ProjectConfig::parse(&set.render()).unwrap(), set);
+        assert_eq!(
+            project("", "overlap = \"exclusive\"")
+                .unwrap()
+                .policy
+                .overlap(),
+            Overlap::Exclusive
+        );
+        let error = project("", "overlap = \"always\"").unwrap_err().to_string();
+        assert!(error.contains("overlap"), "{error}");
+    }
+
     #[test]
     fn the_quiet_window_is_a_policy_key_with_a_default_and_a_range() {
         let absent = project("", "").unwrap();
@@ -1561,6 +1595,7 @@ mod tests {
             resolver_passes: None,
             resolver_budget_usd: None,
             ticket_budget_usd: None,
+            overlap: None,
         };
         assert_eq!(built.quiet_window(), Duration::from_secs(60));
 

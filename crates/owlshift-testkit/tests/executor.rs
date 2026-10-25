@@ -129,6 +129,7 @@ impl Bench {
             findings: None,
             review: None,
             pull_request_reviews: Vec::new(),
+            overlaps: Vec::new(),
         };
         Self {
             worktree: tmp.path().join("worktree"),

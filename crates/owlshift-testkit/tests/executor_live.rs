@@ -1051,6 +1051,7 @@ fn run_live_seeded(
         findings: None,
         review,
         pull_request_reviews: Vec::new(),
+        overlaps: Vec::new(),
     };
     let spec = RunSpec {
         main: &remote.checkout,

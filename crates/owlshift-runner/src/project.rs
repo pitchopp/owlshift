@@ -891,6 +891,21 @@ pub fn forge_merge_at(
         .unwrap_or_default())
 }
 
+/// The `policy.overlap` of the project file as the base commit holds it
+/// (OWL-449, architecture section 5, "Tolerated overlap"), read as
+/// [`forge_merge_at`] reads the merge switch, for the same reason: a
+/// ticket's own branch cannot turn it on. `exclusive` when the file or the
+/// key is absent.
+pub fn overlap_at(
+    git: &Git,
+    checkout: &Path,
+    base: &Base,
+) -> Result<owlshift_core::vocab::Overlap, String> {
+    Ok(project_file_at(git, checkout, base)?
+        .map(|config| config.policy.overlap())
+        .unwrap_or_default())
+}
+
 #[cfg(test)]
 mod forge_merge_tests {
     use owlshift_core::vocab::{MergeMethod, MergeSwitch};
@@ -962,6 +977,40 @@ mod forge_merge_tests {
         assert_eq!(
             forge_reviewers_at(&git, repo, &at(&branch_commit)),
             Ok(None)
+        );
+    }
+
+    /// OWL-449: a branch that turns `policy.overlap` on changes nothing for
+    /// its own ticket: the switch is read at the base commit, exclusive
+    /// when absent.
+    #[test]
+    fn a_branch_cannot_turn_the_overlap_on() {
+        use owlshift_core::vocab::Overlap;
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path();
+        let git = runner_git();
+        git.run(repo, &["init", "-q"]).unwrap();
+        let file = project_file("merge = \"never\"\n");
+        let base_commit = commit(&git, repo, &file);
+        git.run(repo, &["checkout", "-q", "-b", "owl-1"]).unwrap();
+        let rebase = file.replacen(
+            "always_human = []",
+            "always_human = []\noverlap = \"rebase\"",
+            1,
+        );
+        let branch_commit = commit(&git, repo, &rebase);
+        let at = |commit: &str| Base {
+            remote_ref: "origin/main".to_owned(),
+            branch: "main".to_owned(),
+            commit: commit.to_owned(),
+        };
+        assert_eq!(
+            overlap_at(&git, repo, &at(&base_commit)),
+            Ok(Overlap::Exclusive)
+        );
+        assert_eq!(
+            overlap_at(&git, repo, &at(&branch_commit)),
+            Ok(Overlap::Rebase)
         );
     }
 }
