@@ -513,6 +513,104 @@ fn a_run_its_driver_stopped_did_not_time_out() {
     }
 }
 
+// A process's state, with no `ps` (OWL-110).
+#[cfg(unix)]
+#[path = "../../owlshift-platform/src/test_proc.rs"]
+#[allow(dead_code)]
+mod test_proc;
+
+/// A harness stand-in that is `helper_escape_the_group`, run in the worktree.
+#[cfg(unix)]
+struct Escapes;
+
+#[cfg(unix)]
+impl Harness for Escapes {
+    fn command(&self, _run: &HarnessRun<'_>) -> Result<Command, HarnessError> {
+        let mut command = Command::new(std::env::current_exe().unwrap());
+        command.args([
+            "--exact",
+            "helper_escape_the_group",
+            "--ignored",
+            "--nocapture",
+        ]);
+        Ok(command)
+    }
+
+    fn drive(
+        &self,
+        _: &HarnessRun<'_>,
+        child: &mut Child,
+        log: &mut RunLog,
+    ) -> io::Result<HarnessEnd> {
+        let run = drive_plain(child, log)?;
+        Ok(HarnessEnd::new(run.exit_code, HarnessStatus::Completed))
+    }
+}
+
+/// Starts `sleep 60` in a process group of its own, as Claude Code runs each
+/// Bash call (OWL-451), writes its pid to `ESCAPED` in the working
+/// directory, then sleeps; acts only when run alone by [`Escapes`].
+#[cfg(unix)]
+#[test]
+#[ignore = "helper, run by the test below"]
+fn helper_escape_the_group() {
+    use std::os::unix::process::CommandExt;
+    use std::process::Stdio;
+
+    if std::env::args().any(|arg| arg == "--exact") {
+        let mut sleep = Command::new("sleep")
+            .arg("60")
+            .process_group(0)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let partial = format!("{ESCAPED}.tmp");
+        fs::write(&partial, sleep.id().to_string()).unwrap();
+        fs::rename(&partial, ESCAPED).unwrap();
+        std::thread::sleep(Duration::from_secs(30));
+        // Not reached when the run is stopped at its deadline, as it is.
+        let _ = sleep.kill();
+        let _ = sleep.wait();
+    }
+}
+
+/// Where in the worktree the stand-in writes the pid of what it started.
+#[cfg(unix)]
+const ESCAPED: &str = ".owlshift/run/escaped";
+
+/// OWL-451: a run cut at its deadline leaves nothing running, not even what
+/// its harness started in a process group of its own, as Claude Code runs
+/// each Bash call.
+#[cfg(unix)]
+#[test]
+fn a_run_cut_at_its_deadline_leaves_nothing_running() {
+    let bench = Bench::new();
+    let executor = Executor {
+        timeout: Duration::from_secs(3),
+        ..bench.executor.clone()
+    };
+    let report = bench.run_with(&executor, &Escapes, &bench.brief).unwrap();
+    assert!(
+        matches!(report.outcome, Outcome::Failed(Failure::TimedOut)),
+        "{:?}",
+        report.outcome
+    );
+    let escaped: u32 = fs::read_to_string(bench.worktree.join(ESCAPED))
+        .expect("the stand-in started its sleep before the deadline")
+        .parse()
+        .unwrap();
+    let settled = std::time::Instant::now() + Duration::from_secs(5);
+    while test_proc::is_alive(escaped) {
+        assert!(
+            std::time::Instant::now() < settled,
+            "still running: {escaped}"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
 /// A harness that is a shell script, run in the worktree, whose driver
 /// reports a completed run ending on `message` with one `Write` refused, as
 /// Claude Code's driver reports a read-only run (OWL-323); logged in with

@@ -1389,8 +1389,9 @@ mod tests {
         if helper_requested() {
             use std::os::unix::process::CommandExt;
             println!("BEFORE-THE-HOLD");
-            // In a group of its own, stopping the tree does not reach it, and
-            // it inherits this process's output and working folder.
+            // In a group of its own, its parent gone once this process ends,
+            // so stopping the tree does not reach it (OWL-451), and it
+            // inherits this process's output and working folder.
             let exe = std::env::current_exe().unwrap();
             drop(
                 Command::new(exe)

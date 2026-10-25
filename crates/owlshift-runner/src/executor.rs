@@ -847,8 +847,11 @@ impl Executor {
         // deadline: its harness's end says why (OWL-319).
         let timed_out = watchdog.finish();
         // Whatever the run left running is stopped before anything it wrote
-        // is read, so nothing changes behind the checks. Best effort: a
-        // process that left the tree is a documented limit.
+        // is read, so nothing changes behind the checks, what left the
+        // tree's group included while it still descends from the tree
+        // (OWL-451). Best effort: a process whose parent and group leader
+        // have both ended, such as what a harness that already exited left,
+        // is a documented limit.
         let _ = tree.kill();
         let _ = child.kill();
         let _ = child.wait();

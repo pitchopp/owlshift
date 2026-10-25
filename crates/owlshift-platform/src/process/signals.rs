@@ -191,9 +191,10 @@ static INSTALLED: Mutex<bool> = Mutex::new(false);
 ///   rather than let it act on a list that misses one; and one stopped in
 ///   its first milliseconds, before its script ignores SIGHUP, dies of the
 ///   SIGHUP that comes with being continued;
-/// - as with [`ProcessTree::kill`], a process that left its tree's group is
-///   not stopped, and a group id could in theory belong to another group by
-///   then, once the pid space wrapped around.
+/// - the sentinel kills groups only, so a process that left its tree's group
+///   is not stopped, unlike with [`ProcessTree::kill`] (OWL-451); and a group
+///   id could in theory belong to another group by then, once the pid space
+///   wrapped around.
 ///
 /// Call it first thing in `main`, before another thread starts a process: on
 /// a system that has no `pipe2`, as macOS, a pipe is made close-on-exec just
