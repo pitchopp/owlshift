@@ -182,22 +182,37 @@ pub fn overlaps_of(
     found
 }
 
+/// What [`record`] made of the overlaps a check found (OWL-449).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Recorded {
+    /// Each sibling recorded, with the paths its record gained, for the
+    /// `overlap` events.
+    pub kept: Vec<(TicketId, Vec<String>)>,
+    /// The overlaps with new siblings the record could not take, keeping
+    /// [`MAX_OVERLAPS`] already: no refresh would cover them, so an
+    /// admission waits for them and a widening warns of them.
+    ///
+    /// [`MAX_OVERLAPS`]: owlshift_contracts::refs::MAX_OVERLAPS
+    pub unkept: Vec<Shared<String>>,
+}
+
 /// Records in `held` the overlaps of `found` it lacks, at `at` (OWL-449):
 /// each sibling that is a ticket identifier, with the paths its record
-/// gained. Gives what was recorded, for the `overlap` events.
-pub fn record(
-    held: &mut TicketHeld,
-    found: &[Shared<String>],
-    at: Timestamp,
-) -> Vec<(TicketId, Vec<String>)> {
-    found
-        .iter()
-        .filter_map(|shared| {
-            let sibling = TicketId::new(&shared.ticket).ok()?;
-            let added = held.record_overlap(&sibling, &shared.paths, at);
-            (!added.is_empty()).then_some((sibling, added))
-        })
-        .collect()
+/// gained, and apart those of new siblings past
+/// [`MAX_OVERLAPS`](owlshift_contracts::refs::MAX_OVERLAPS).
+pub fn record(held: &mut TicketHeld, found: &[Shared<String>], at: Timestamp) -> Recorded {
+    let mut recorded = Recorded::default();
+    for shared in found {
+        let Ok(sibling) = TicketId::new(&shared.ticket) else {
+            continue;
+        };
+        match held.record_overlap(&sibling, &shared.paths, at) {
+            Some(added) if added.is_empty() => {}
+            Some(added) => recorded.kept.push((sibling, added)),
+            None => recorded.unkept.push(shared.clone()),
+        }
+    }
+    recorded
 }
 
 /// The `decision` event of an overlap recorded by `by`, `admission` or
@@ -681,6 +696,42 @@ mod tests {
         unread.record_overlap(&id("DEMO-6"), &strings(&["lib/a.rs"]), minute(4));
         assert_eq!(overlaps_of(&id("DEMO-1"), Some(&unread), &refs).len(), 3);
         assert!(overlaps_of(&id("DEMO-9"), None, &refs).is_empty());
+    }
+
+    /// OWL-449: what an admission or a widening records, the siblings it
+    /// gained paths for apart from those its record cannot take, keeping
+    /// the most it keeps, which the caller must not take as recorded.
+    #[test]
+    fn a_record_keeps_new_paths_and_sets_apart_what_it_cannot_take() {
+        let shared = |ticket: &str, paths: &[&str]| Shared {
+            ticket: ticket.to_owned(),
+            paths: strings(paths),
+        };
+        let mut held = TicketHeld::dispatched(minute(0));
+        held.admit(strings(&["app/one.rs"]), Vec::new(), None, minute(1));
+        let found = [
+            shared("DEMO-2", &["app/one.rs"]),
+            shared("#7", &["app/one.rs"]),
+        ];
+        let recorded = record(&mut held, &found, minute(2));
+        let id = |name: &str| TicketId::new(name).unwrap();
+        assert_eq!(recorded.kept, [(id("DEMO-2"), strings(&["app/one.rs"]))]);
+        assert!(recorded.unkept.is_empty());
+        assert_eq!(record(&mut held, &found, minute(3)), Recorded::default());
+        for n in 1..owlshift_contracts::refs::MAX_OVERLAPS {
+            held.record_overlap(
+                &id(&format!("DEMO-{}", 100 + n)),
+                &strings(&["x"]),
+                minute(3),
+            );
+        }
+        let more = [
+            shared("DEMO-3", &["app/one.rs"]),
+            shared("DEMO-2", &["app/two.rs"]),
+        ];
+        let recorded = record(&mut held, &more, minute(4));
+        assert_eq!(recorded.kept, [(id("DEMO-2"), strings(&["app/two.rs"]))]);
+        assert_eq!(recorded.unkept, [more[0].clone()]);
     }
 
     /// OWL-449: a base that changes an overlap's path since the pushed head

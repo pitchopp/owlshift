@@ -1859,6 +1859,20 @@ fn brief_rejections() {
         }
         rejects(case, Brief::parse(&brief.to_string()), needle);
     }
+    // The ticket's overlaps (OWL-449): Build's alone.
+    let overlaps = json!([{ "ticket": "OWL-7", "paths": ["crates/owlshift-cli/src/logs.rs"] }]);
+    let shared = Brief::parse(&edited("brief.json", |v| v["overlaps"] = overlaps.clone())).unwrap();
+    assert_eq!(shared.overlaps[0].ticket, "OWL-7");
+    let mut rebasing: Value = serde_json::from_str(&fixture("brief.json")).unwrap();
+    rebasing["role"] = json!("rebase");
+    rebasing["rebase"] = json!({ "pull_request": 7, "url": "u", "branch": "b",
+        "head": "h", "base_branch": "main", "onto": "o" });
+    rebasing["overlaps"] = overlaps;
+    rejects(
+        "overlaps in a rebase brief",
+        Brief::parse(&rebasing.to_string()),
+        "overlaps are given but the role is rebase, not build",
+    );
     let mut none: Value = serde_json::from_str(&fixture("brief.json")).unwrap();
     none["correction"] = reversed("No.".into());
     none["correction"]["reversed"] = json!([]);

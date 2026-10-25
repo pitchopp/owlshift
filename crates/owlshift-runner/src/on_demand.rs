@@ -1587,7 +1587,7 @@ enum Widened {
     Files {
         added: Vec<String>,
         whole: bool,
-        overlaps: Result<Vec<(TicketId, Vec<String>)>, String>,
+        overlaps: Result<held::Recorded, String>,
     },
     /// The files changed could not be read, for this reason: the whole
     /// repository.
@@ -2064,7 +2064,7 @@ impl OnDemand<'_> {
         // The switch at the base this command fetched (OWL-449).
         let overlap = self.overlap_policy(p);
         let _section = self.section()?;
-        let mut recorded = Vec::new();
+        let mut recorded = held::Recorded::default();
         if let Some(outside) = outside {
             let locked = self.locked_load(p, Some(&outside), &named)?;
             let weighed = InFlight {
@@ -2074,8 +2074,18 @@ impl OnDemand<'_> {
                 outside: false,
                 held: added,
             };
-            let found = collision::weigh(&weighed, &locked.in_flight, overlap);
-            if let Some(found) = found.collision {
+            let weighed = collision::weigh(&weighed, &locked.in_flight, overlap);
+            // What it shares with its siblings, recorded with the admission
+            // in the same section (OWL-449); an overlap its record cannot
+            // take, keeping the most it keeps, no refresh would cover: the
+            // Build waits for that sibling, as past the bound.
+            recorded = held::record(&mut next, &weighed.overlaps, (self.clock)());
+            let unkept = recorded.unkept.first().map(|shared| Collision {
+                holder: shared.ticket.clone(),
+                resource: Resource::Zone(shared.paths.first().cloned().unwrap_or_default()),
+                sharing: None,
+            });
+            if let Some(found) = weighed.collision.or(unkept) {
                 let (holding, who) = in_flight::holding(&locked.kinds, &found);
                 if p.stepping {
                     let mut event = data([
@@ -2099,13 +2109,10 @@ impl OnDemand<'_> {
                     cap: None,
                 });
             }
-            // What it shares with its siblings, recorded with the admission
-            // in the same section (OWL-449).
-            recorded = held::record(&mut next, &found.overlaps, (self.clock)());
         }
         p.held = Some(next);
         self.keep(p, state)?;
-        for (sibling, paths) in &recorded {
+        for (sibling, paths) in &recorded.kept {
             sink.emit(
                 &p.ticket,
                 None,
@@ -5094,7 +5101,7 @@ impl OnDemand<'_> {
             let widened = Widened::Files {
                 added,
                 whole,
-                overlaps: Ok(Vec::new()),
+                overlaps: Ok(held::Recorded::default()),
             };
             return (Some(widened), None);
         }
@@ -5120,7 +5127,7 @@ impl OnDemand<'_> {
         &self,
         p: &mut Prepared,
         now: Timestamp,
-    ) -> Result<Vec<(TicketId, Vec<String>)>, String> {
+    ) -> Result<held::Recorded, String> {
         let named = self.config.stack.named_resources().unwrap_or_default();
         let others = ticket_ref::others(&self.executor.git, &p.checkout, &p.ticket)?;
         let in_flight: Vec<InFlight<String>> = others
@@ -5134,7 +5141,7 @@ impl OnDemand<'_> {
         let own = held::of(&p.ticket, p.held.as_ref(), delivered, &named);
         let found = collision::weigh(&own, &in_flight, Overlap::Rebase);
         let Some(held) = p.held.as_mut() else {
-            return Ok(Vec::new());
+            return Ok(held::Recorded::default());
         };
         Ok(held::record(held, &found.overlaps, now))
     }
@@ -5616,9 +5623,34 @@ impl OnDemand<'_> {
                     overlaps: Ok(recorded),
                     ..
                 } => {
-                    for (sibling, paths) in recorded {
+                    for (sibling, paths) in &recorded.kept {
                         let event = held::overlap_event("widening", sibling, paths);
                         sink.emit(ticket, Some(&run), EventKind::Decision, event);
+                    }
+                    // A widening holds no step: an overlap its record cannot
+                    // take is told (OWL-449).
+                    if !recorded.unkept.is_empty() {
+                        let siblings: Vec<&str> = recorded
+                            .unkept
+                            .iter()
+                            .map(|shared| shared.ticket.as_str())
+                            .collect();
+                        sink.emit(
+                            ticket,
+                            Some(&run),
+                            EventKind::Warning,
+                            data([
+                                ("what", json!("overlap_unrecorded")),
+                                ("tickets", json!(siblings)),
+                                (
+                                    "reason",
+                                    json!(format!(
+                                        "its record keeps the most overlaps it can, {}",
+                                        refs::MAX_OVERLAPS
+                                    )),
+                                ),
+                            ]),
+                        );
                     }
                 }
                 Widened::Files {

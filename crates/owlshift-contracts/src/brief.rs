@@ -1114,6 +1114,18 @@ impl Brief {
                 ));
             }
         }
+        // The ticket's overlaps are the build role's alone (format 29,
+        // OWL-449).
+        if !self.overlaps.is_empty() && self.role != Role::Build {
+            return Err(ContractError::invalid(
+                CONTRACT,
+                format!(
+                    "overlaps are given but the role is {}, not {}",
+                    self.role.as_str(),
+                    Role::Build.as_str()
+                ),
+            ));
+        }
         // A verifier and the arbiter may be told the rebase whose resolution
         // they review (format 29, OWL-449).
         let reviews_resolution = matches!(self.role, Role::Verify | Role::Arbiter);

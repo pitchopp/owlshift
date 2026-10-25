@@ -556,19 +556,19 @@ fn a_ticket_held_records_its_overlaps_once_per_sibling() {
     let mut held = admitted(&["app/one.rs"], &[], at(0));
     assert_eq!(
         held.record_overlap(&id("DEMO-9"), &paths(&["app/one.rs"]), at(1)),
-        ["app/one.rs"]
+        Some(paths(&["app/one.rs"]))
     );
     assert_eq!(
         held.record_overlap(&id("DEMO-2"), &paths(&["web/b.rs", "app/one.rs"]), at(2)),
-        ["web/b.rs", "app/one.rs"]
+        Some(paths(&["web/b.rs", "app/one.rs"]))
     );
-    assert!(
-        held.record_overlap(&id("DEMO-9"), &paths(&["app/one.rs"]), at(3))
-            .is_empty()
+    assert_eq!(
+        held.record_overlap(&id("DEMO-9"), &paths(&["app/one.rs"]), at(3)),
+        Some(Vec::new())
     );
     assert_eq!(
         held.record_overlap(&id("DEMO-9"), &paths(&["app/two.rs"]), at(4)),
-        ["app/two.rs"]
+        Some(paths(&["app/two.rs"]))
     );
     let kept: Vec<_> = held
         .overlaps
@@ -611,4 +611,25 @@ fn a_ticket_held_records_its_overlaps_once_per_sibling() {
     older.as_object_mut().unwrap().remove("overlaps");
     let read = TicketHeld::parse(&older.to_string()).unwrap();
     assert!(read.overlaps.is_empty() && read.admitted());
+    // Past the most it keeps, a new sibling is refused, never taken as
+    // recorded; one already kept still gains paths.
+    let mut full = admitted(&["app/one.rs"], &[], at(0));
+    for n in 0..owlshift_contracts::refs::MAX_OVERLAPS {
+        let sibling = id(&format!("DEMO-{}", 100 + n));
+        assert!(
+            full.record_overlap(&sibling, &paths(&["app/one.rs"]), at(1))
+                .is_some()
+        );
+    }
+    let before = full.clone();
+    assert_eq!(
+        full.record_overlap(&id("DEMO-1"), &paths(&["app/one.rs"]), at(2)),
+        None
+    );
+    assert_eq!(full, before);
+    assert_eq!(
+        full.record_overlap(&id("DEMO-100"), &paths(&["app/two.rs"]), at(2)),
+        Some(paths(&["app/two.rs"]))
+    );
+    assert_eq!(TicketHeld::parse(&full.render()).unwrap(), full);
 }

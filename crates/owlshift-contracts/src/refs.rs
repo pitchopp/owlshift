@@ -549,22 +549,24 @@ impl TicketHeld {
 
     /// Records that `ticket` holds what this ticket holds on `paths`, at
     /// `at` (OWL-449): a sibling already recorded gains the paths it lacked,
-    /// keeping its first time; a new one is added in identifier order,
-    /// unless [`MAX_OVERLAPS`] are kept. Gives the paths it added, none when
-    /// the record already named them all or could not take the sibling.
+    /// keeping its first time; a new one is added in identifier order.
+    /// Gives the paths it added, none when the record already named them
+    /// all; `None`, nothing changed, for a new sibling once [`MAX_OVERLAPS`]
+    /// are kept: the record cannot take it, which the caller must not take
+    /// as recorded.
     pub fn record_overlap(
         &mut self,
         ticket: &TicketId,
         paths: &[String],
         at: Timestamp,
-    ) -> Vec<String> {
+    ) -> Option<Vec<String>> {
         let keepable: Vec<&String> = paths.iter().filter(|path| keepable_path(path)).collect();
         if keepable.is_empty() {
-            return Vec::new();
+            return Some(Vec::new());
         }
         let index = match self.overlaps.iter().position(|kept| kept.ticket == *ticket) {
             Some(index) => index,
-            None if self.overlaps.len() >= MAX_OVERLAPS => return Vec::new(),
+            None if self.overlaps.len() >= MAX_OVERLAPS => return None,
             None => {
                 self.overlaps.push(HeldOverlap {
                     ticket: ticket.clone(),
@@ -587,7 +589,7 @@ impl TicketHeld {
         }
         kept.paths.extend(added.iter().cloned());
         kept.paths.sort();
-        added
+        Some(added)
     }
 
     /// [`Self::widen`], without keeping its time among the widenings.
