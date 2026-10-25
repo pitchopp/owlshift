@@ -1338,6 +1338,9 @@ fn a_base_wait_keeps_its_comment_while_another_step_runs() {
                             kept.push(shown.exists());
                             (phase, since) = (3, pass);
                         }
+                        // Past the delay of a hold a turn's step set after
+                        // the jump above, whenever watch set it.
+                        2 if pass % 5 == 0 => later(),
                         3 => {
                             kept.push(shown.exists());
                             // Past the delay of the hold that step's end set,
