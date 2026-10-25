@@ -143,7 +143,8 @@ fn a_served_watch_is_refused_for_a_project_not_served() {
         config_dir.path(),
         &["watch", "--drain", "--served", "acme/app"],
     );
-    assert!(!output.status.success());
+    // OWL-435: a refusal no restart mends, which the daemon pauses on.
+    assert_eq!(output.status.code(), Some(78), "{}", stderr(&output));
     assert!(
         stderr(&output).contains(
             "acme/app is not served on this machine: `owlshift start` in its checkout serves it"
@@ -159,6 +160,261 @@ fn a_served_watch_is_refused_for_a_project_not_served() {
     );
     assert_eq!(output.status.code(), Some(2), "{}", stderr(&output));
     assert!(stderr(&output).contains("--drain"), "{}", stderr(&output));
+}
+
+/// A project file `owlshift watch --drain` accepts, of a Linear project.
+#[cfg(unix)]
+const DRAINED_PROJECT: &str = r#"requires = ">=0.0"
+[tracker]
+kind = "linear"
+team = "WEB"
+admit = { label = "agent" }
+admitters = ["u1"]
+states = { ready = "Todo", working = "Doing", needs_input = "Asked", review = "Review" }
+[stack]
+gate = ["true"]
+[pipeline]
+default = "trivial"
+plan_approval = "never"
+[models]
+[policy]
+always_human = []
+"#;
+
+/// A checkout of `acme/web` holding [`DRAINED_PROJECT`].
+#[cfg(unix)]
+fn web_checkout() -> tempfile::TempDir {
+    let checkout = tempfile::tempdir().unwrap();
+    git_init(checkout.path());
+    git(
+        checkout.path(),
+        &["remote", "add", "origin", "https://github.com/acme/web.git"],
+    );
+    fs::write(checkout.path().join("owlshift.toml"), DRAINED_PROJECT).unwrap();
+    checkout
+}
+
+/// OWL-435: the real daemon, which the tests run on a data directory of
+/// their own with no notification shown. Its one served project's checkout
+/// is gone, so its watch refuses before any credential, with the code no
+/// restart mends: the project is paused, with the reason. A second daemon
+/// exits at once naming the first; `start` in a checkout registers it for
+/// the running daemon; `stop` ends the daemon, `stop --forget` stops serving
+/// the project.
+#[cfg(unix)]
+#[test]
+fn the_daemon_runs_once_pauses_a_project_it_cannot_serve_and_stops() {
+    use std::os::unix::process::CommandExt;
+    use std::process::Stdio;
+    use std::time::{Duration, Instant};
+
+    let config_dir = tempfile::tempdir().unwrap();
+    fs::write(
+        config_dir.path().join("config.toml"),
+        "[notifications]\ndesktop = false\n",
+    )
+    .unwrap();
+    let data = config_dir.path().join("data");
+    let service = data.join("service");
+    fs::create_dir_all(&service).unwrap();
+    let gone = config_dir.path().join("gone");
+    fs::write(
+        service.join("projects.json"),
+        format!(
+            "{{\"format\": 1, \"projects\": [{{\"repository\": \"acme/gone\", \"checkout\": {}}}]}}",
+            serde_json::Value::String(gone.display().to_string())
+        ),
+    )
+    .unwrap();
+    let log = config_dir.path().join("daemon.log");
+    let mut daemon = command(config_dir.path(), config_dir.path(), &["daemon"])
+        .stdin(Stdio::null())
+        .stdout(fs::File::create(&log).unwrap())
+        .stderr(fs::File::create(config_dir.path().join("daemon.err")).unwrap())
+        .process_group(0)
+        .spawn()
+        .unwrap();
+    let said = || {
+        format!(
+            "{}{}",
+            fs::read_to_string(&log).unwrap_or_default(),
+            fs::read_to_string(config_dir.path().join("daemon.err")).unwrap_or_default()
+        )
+    };
+    let wait_for = |what: &str, done: &dyn Fn() -> bool| {
+        let deadline = Instant::now() + Duration::from_secs(15);
+        while !done() {
+            assert!(
+                Instant::now() < deadline,
+                "still waiting for {what}\n{}",
+                said()
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    };
+    let record = service.join("daemon.json");
+    wait_for("the daemon's record", &|| record.exists());
+
+    let second = owlshift(config_dir.path(), config_dir.path(), &["daemon"]);
+    assert_eq!(second.status.code(), Some(1), "{}", stderr(&second));
+    assert!(
+        stderr(&second).contains(&format!("a daemon already runs on {}", data.display())),
+        "{}",
+        stderr(&second)
+    );
+    assert!(
+        stderr(&second).contains(&format!("(pid {}", daemon.id())),
+        "{}",
+        stderr(&second)
+    );
+
+    let pause = data.join("projects/github.com/acme/gone/pause");
+    wait_for("acme/gone's pause", &|| pause.exists());
+    let paused = fs::read_to_string(&pause).unwrap();
+    assert!(paused.contains("\"by\":\"owlshift daemon\""), "{paused}");
+    assert!(paused.contains("which is gone"), "{paused}");
+
+    let checkout = web_checkout();
+    let started = owlshift(checkout.path(), config_dir.path(), &["start"]);
+    assert!(started.status.success(), "{}", stderr(&started));
+    assert!(
+        stdout(&started).contains("acme/web is served from"),
+        "{}",
+        stdout(&started)
+    );
+    assert!(
+        stdout(&started).contains("serves it from its next pass"),
+        "{}",
+        stdout(&started)
+    );
+
+    let stopped = owlshift(config_dir.path(), config_dir.path(), &["stop"]);
+    assert!(stopped.status.success(), "{}", stderr(&stopped));
+    assert!(
+        stdout(&stopped).contains(&format!("Stopping the daemon (pid {})", daemon.id())),
+        "{}",
+        stdout(&stopped)
+    );
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let status = loop {
+        if let Some(status) = daemon.try_wait().unwrap() {
+            break status;
+        }
+        if Instant::now() >= deadline {
+            let _ = daemon.kill();
+            panic!("the daemon still runs after `owlshift stop`\n{}", said());
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    assert!(status.success(), "{status}\n{}", said());
+    assert!(!record.exists());
+    assert!(!service.join("stop").exists());
+
+    let again = owlshift(config_dir.path(), config_dir.path(), &["stop"]);
+    assert!(again.status.success());
+    assert!(
+        stdout(&again).starts_with("No daemon runs on"),
+        "{}",
+        stdout(&again)
+    );
+    let forgot = owlshift(checkout.path(), config_dir.path(), &["stop", "--forget"]);
+    assert!(forgot.status.success(), "{}", stderr(&forgot));
+    assert_eq!(stdout(&forgot), "acme/web is no longer served.\n");
+}
+
+/// OWL-435: `start` with no daemon running registers the project and starts
+/// the daemon for the session, which outlives `start`, its output in the
+/// data directory; `stop` ends it. Its watch's first clone is refused at
+/// once (`GIT_ALLOW_PROTOCOL`), never reaching the network.
+#[cfg(unix)]
+#[test]
+fn start_runs_the_daemon_for_the_session_and_stop_ends_it() {
+    use std::time::{Duration, Instant};
+
+    let config_dir = tempfile::tempdir().unwrap();
+    fs::write(
+        config_dir.path().join("config.toml"),
+        "[notifications]\ndesktop = false\n",
+    )
+    .unwrap();
+    let checkout = web_checkout();
+    let started = command(checkout.path(), config_dir.path(), &["start"])
+        .env("GIT_ALLOW_PROTOCOL", "file")
+        .output()
+        .unwrap();
+    let said = stdout(&started);
+    assert!(started.status.success(), "{said}{}", stderr(&started));
+    let pid: u32 = said
+        .split("Started the daemon for this session (pid ")
+        .nth(1)
+        .and_then(|rest| rest.split(')').next())
+        .and_then(|pid| pid.parse().ok())
+        .unwrap_or_else(|| panic!("{said}"));
+    let service = config_dir.path().join("data/service");
+    let log = service.join("daemon.log");
+    let read_log = || fs::read_to_string(&log).unwrap_or_default();
+    assert!(is_alive(pid), "{}", read_log());
+    assert!(service.join("daemon.json").exists());
+
+    let stopped = owlshift(config_dir.path(), config_dir.path(), &["stop"]);
+    assert!(stopped.status.success(), "{}", stderr(&stopped));
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while is_alive(pid) {
+        if Instant::now() >= deadline {
+            let _ = Command::new("kill")
+                .args(["-s", "KILL", &pid.to_string()])
+                .status();
+            panic!(
+                "the daemon still runs after `owlshift stop`\n{}",
+                read_log()
+            );
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert!(!service.join("daemon.json").exists(), "{}", read_log());
+    assert!(read_log().contains("The daemon stopped"), "{}", read_log());
+}
+
+/// OWL-435: a watch typed in a terminal on a project the background service
+/// serves refuses at once, before any credential, naming `owlshift stop`;
+/// `start` and `stop --forget` need a checkout.
+#[cfg(unix)]
+#[test]
+fn a_terminal_watch_on_a_served_project_refuses() {
+    let config_dir = tempfile::tempdir().unwrap();
+    let checkout = web_checkout();
+    let project = config_dir.path().join("data/projects/github.com/acme/web");
+    fs::create_dir_all(&project).unwrap();
+    // As the daemon holds it.
+    let served = fs::File::create(project.join("served.lock")).unwrap();
+    served.try_lock().unwrap();
+    for args in [&["watch"][..], &["watch", "--drain"]] {
+        let output = owlshift(checkout.path(), config_dir.path(), args);
+        assert_eq!(
+            output.status.code(),
+            Some(1),
+            "{args:?}: {}",
+            stderr(&output)
+        );
+        let said = stderr(&output);
+        assert!(
+            said.contains("acme/web is served by the background service on this machine"),
+            "{args:?}: {said}"
+        );
+        assert!(said.contains("`owlshift stop`"), "{said}");
+    }
+    drop(served);
+
+    let elsewhere = tempfile::tempdir().unwrap();
+    for args in [&["start"][..], &["stop", "--forget"]] {
+        let output = owlshift(elsewhere.path(), config_dir.path(), args);
+        assert_eq!(output.status.code(), Some(1), "{args:?}");
+        assert!(
+            stderr(&output).contains("runs in a git repository"),
+            "{}",
+            stderr(&output)
+        );
+    }
 }
 
 /// OWL-368: `owlshift unquarantine` lifts a security marker only for a

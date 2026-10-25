@@ -1,0 +1,40 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Owlshift daemon",
+  "description": "The daemon that runs on a data directory, written once it holds the\ndirectory's daemon lock and removed when it ends: a record left by a\ndaemon killed outright names a process that no longer holds the lock.",
+  "type": "object",
+  "properties": {
+    "binary": {
+      "description": "The binary it runs and starts every watch from, resolved when it\nstarted.",
+      "type": "string"
+    },
+    "format": {
+      "description": "The format version of this document.",
+      "type": "integer",
+      "const": 1
+    },
+    "pid": {
+      "description": "Its process id.",
+      "type": "integer",
+      "format": "uint32",
+      "minimum": 0
+    },
+    "since": {
+      "description": "When it started.",
+      "type": "string",
+      "format": "date-time"
+    },
+    "version": {
+      "description": "The version of its binary.",
+      "type": "string"
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "format",
+    "pid",
+    "version",
+    "binary",
+    "since"
+  ]
+}

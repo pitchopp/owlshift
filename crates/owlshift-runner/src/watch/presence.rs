@@ -61,8 +61,13 @@ pub fn hold(dirs: &ProjectDirs) -> io::Result<Option<Presence>> {
 }
 
 /// Whether a watch holds `dirs`'s project now: a single exclusive try,
-/// released at once. A project no watch ever ran on has no file.
+/// released at once. A project no watch ever ran on has no file. A project
+/// the daemon serves counts as watched, its watch running or about to start
+/// again (OWL-435, architecture section 5, "The served lock").
 pub fn watching(dirs: &ProjectDirs) -> io::Result<bool> {
+    if crate::served::served_now(dirs)? {
+        return Ok(true);
+    }
     let file = match OpenOptions::new().write(true).open(path(dirs)) {
         Ok(file) => file,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
@@ -98,5 +103,31 @@ mod tests {
         assert!(watching(&dirs).unwrap(), "the second still holds");
         drop(second);
         assert!(!watching(&dirs).unwrap(), "the file stays, unheld");
+    }
+
+    /// OWL-435: a project the daemon serves is watched, between its watch's
+    /// restarts too; a watch typed in a terminal shares the served lock,
+    /// which does not make the project served, and keeps the daemon off it.
+    #[test]
+    fn a_served_project_is_watched_and_a_terminal_watch_keeps_the_daemon_off() {
+        use crate::served::{served_now, share_served, take_served};
+
+        let data = tempfile::tempdir().unwrap();
+        let dirs = dirs(data.path());
+        let daemon = take_served(&dirs).unwrap().expect("the daemon serves it");
+        assert!(watching(&dirs).unwrap());
+        assert!(served_now(&dirs).unwrap());
+        assert!(
+            share_served(&dirs).unwrap().is_none(),
+            "a terminal watch refuses"
+        );
+        drop(daemon);
+        assert!(!watching(&dirs).unwrap());
+
+        let terminal = share_served(&dirs).unwrap().expect("a terminal watch runs");
+        assert!(!served_now(&dirs).unwrap());
+        assert!(take_served(&dirs).unwrap().is_none(), "the daemon waits");
+        drop(terminal);
+        assert!(take_served(&dirs).unwrap().is_some());
     }
 }

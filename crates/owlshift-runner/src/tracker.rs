@@ -9,10 +9,12 @@
 use std::fmt;
 
 use owlshift_adapters::tracker;
+use owlshift_adapters::tracker::ErrorKind;
 use owlshift_adapters::tracker::linear::app::{AppTransport, ClientCredentials, HttpOAuth};
 use owlshift_adapters::tracker::linear::{AdmissionFacts, ApiKey, AppUser, LinearTracker};
 use owlshift_platform::keychain::{Keychain, SERVICE, Secret};
 
+use crate::refusal::Refusal;
 use crate::secrets::{Source, TrackerAccounts, TrackerSecrets};
 
 /// The keychain account, under [`SERVICE`], that every project of a machine
@@ -40,20 +42,29 @@ pub const LINEAR_APP_SECRET_ACCOUNT: &str = "linear-app-client-secret";
 /// Owlshift never falls back to the key, which would keep Linear from
 /// notifying a decider who holds it. The token is revoked when the adapter
 /// is dropped.
-pub fn linear(secrets: &TrackerSecrets<Secret>, team: &str) -> Result<LinearTracker, String> {
+///
+/// Every refusal is lasting but a Linear that did not answer the token's
+/// request, which a restart may mend (OWL-435, [`Refusal`]).
+pub fn linear(secrets: &TrackerSecrets<Secret>, team: &str) -> Result<LinearTracker, Refusal> {
     let Some(key) = &secrets.key else {
         return Err(format!(
             "no Linear API key in the system keychain: run `owlshift init` in a terminal, or \
              store one under service `{SERVICE}`, account `{}`",
             secrets.accounts.key
-        ));
+        )
+        .into());
     };
     let tracker = LinearTracker::new(ApiKey::new(key.expose()));
     match app_credentials(secrets).map_err(|e| e.to_string())? {
         None => Ok(tracker),
         Some(credentials) => open_app(tracker, credentials, &secrets.accounts, team)
             .map(|(tracker, _)| tracker)
-            .map_err(|e| e.to_string()),
+            .map_err(|error| match &error {
+                AppError::Tracker { error: answer, .. } if answer.kind == ErrorKind::Other => {
+                    Refusal::passing(error.to_string())
+                }
+                _ => error.to_string().into(),
+            }),
     }
 }
 
@@ -272,6 +283,8 @@ mod tests {
     fn the_linear_key_comes_from_the_accounts_given() {
         let keychain = Keychain::in_memory();
         let missing = linear(&read(&keychain, &own()).unwrap(), "OWL").unwrap_err();
+        assert!(missing.lasting, "{missing}");
+        let missing = missing.message;
         assert!(
             missing.contains("service `owlshift`, account `github.com/pitchopp/owlshift/linear`"),
             "{missing}"
@@ -324,6 +337,8 @@ mod tests {
             .store(&accounts.key, &Secret::new("lin_api_test"))
             .unwrap();
         let refused = linear(&set(), "OWL").unwrap_err();
+        assert!(refused.lasting, "{refused}");
+        let refused = refused.message;
         assert!(
             refused.contains("`github.com/pitchopp/owlshift/linear-app-client-secret`"),
             "{refused}"

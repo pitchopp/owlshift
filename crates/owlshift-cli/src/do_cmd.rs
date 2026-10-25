@@ -36,6 +36,7 @@ use owlshift_platform::keychain::{Keychain, KeychainError};
 use owlshift_runner::agent_env::AgentEnv;
 use owlshift_runner::codex_machine::codex_critic;
 use owlshift_runner::config::{Effective, FileState};
+use owlshift_runner::daemon::UNSERVABLE_EXIT;
 use owlshift_runner::events::{EventLog, EventSink, printable};
 use owlshift_runner::executor::CodexHarness;
 use owlshift_runner::executor::codex::user_login;
@@ -43,12 +44,13 @@ use owlshift_runner::executor::harness::{CLAUDE_AGENT_ACCOUNT, ClaudeHarness};
 use owlshift_runner::notify::{self, DesktopNotifier};
 use owlshift_runner::on_demand::{self, CodexReviewer, Delivered, OnDemand, Stop};
 use owlshift_runner::project::{self, ProjectDirs};
+use owlshift_runner::refusal::Refusal;
 use owlshift_runner::roles::{
     ANSWER_CHECK_ROLE, ARBITER_ROLE, BUILD_ROLE, DESIGN_REVIEW_ROLE, DESIGN_ROLE, INTAKE_ROLE,
     REBASE_ROLE, RESOLVER_ROLE, VERIFY_ROLE,
 };
 use owlshift_runner::routing::{ClaudeRouter, CodexRouter, claude_model};
-use owlshift_runner::served::{self, Between, Served};
+use owlshift_runner::served::{self, Between, Served, ServedLock};
 use owlshift_runner::slots::MachineSlots;
 use owlshift_runner::step::{self, Children};
 use owlshift_runner::system::System;
@@ -113,7 +115,21 @@ pub fn run(
         None => run_with(system, config, mode, Keychain::system, None).map(Ended::code),
         Some(repo) => run_served(system, config, mode, repo, Keychain::system),
     };
-    ran.unwrap_or_else(|refusal| fail(&refusal))
+    ran.unwrap_or_else(|refusal| {
+        fail(&refusal.message);
+        refused_code(&refusal, mode, served.is_some())
+    })
+}
+
+/// The exit code of `refusal` (OWL-435): [`UNSERVABLE_EXIT`] for a served
+/// watch that no restart mends, which the daemon reads to pause its project
+/// rather than start the watch again; a failure otherwise.
+fn refused_code(refusal: &Refusal, mode: Mode<'_>, served: bool) -> ExitCode {
+    if served && mode == Mode::Drain && refusal.lasting {
+        ExitCode::from(UNSERVABLE_EXIT)
+    } else {
+        ExitCode::FAILURE
+    }
 }
 
 /// How [`run_with`] ended.
@@ -145,7 +161,7 @@ fn run_served(
     mode: Mode<'_>,
     repo: &Repo,
     open_keychain: fn() -> Result<Keychain, KeychainError>,
-) -> Result<ExitCode, String> {
+) -> Result<ExitCode, Refusal> {
     let data_dir = crate::data_dir()?;
     let git = project::runner_git();
     let served = Served::locate(&git, &data_dir, repo)?;
@@ -171,14 +187,15 @@ fn run_served(
 
 /// [`run`], with the keychain opened by `open_keychain`, on the served
 /// project `served` when there is one: a refusal before the run is
-/// returned, for the caller to print.
+/// returned, for the caller to print, lasting unless it says otherwise
+/// (OWL-435).
 fn run_with(
     system: &dyn System,
     config: &Effective,
     mode: Mode<'_>,
     open_keychain: fn() -> Result<Keychain, KeychainError>,
     served: Option<&Served>,
-) -> Result<Ended, String> {
+) -> Result<Ended, Refusal> {
     let ticket = mode
         .ticket()
         .map(TicketId::new)
@@ -192,7 +209,7 @@ fn run_with(
     if mode == Mode::Drain
         && let Some(refusal) = drain_refusal(project)
     {
-        return Err(refusal);
+        return Err(refusal.into());
     }
     if let Some(ticket) = &ticket {
         on_demand::check_team(project, ticket)?;
@@ -219,6 +236,13 @@ fn run_with(
     // their agents (`AgentEnv::from_runner`); `OnDemand` checks again.
     system.sandbox().map_err(|error| error.to_string())?;
     let data_dir = crate::data_dir()?;
+    // A watch typed in a terminal shares its project's served lock for its
+    // life, so it never runs on a project the background service serves,
+    // and the service waits for it to end (OWL-435).
+    let _served_share = match (served, mode) {
+        (None, Mode::Watch | Mode::Drain) => share_served_lock(&data_dir, &repo)?,
+        _ => None,
+    };
     // The machine's run slots every project's drain shares (OWL-409), in
     // Owlshift's data directory, which is the user's state directory the
     // design names. A step's child takes one before anything else, the
@@ -241,7 +265,7 @@ fn run_with(
     let Some(claude) = system.locate("claude") else {
         return Err(
             "`claude` is not on the PATH: install Claude Code (agent runs log in with the token `owlshift init` stores; `owlshift doctor` checks it)"
-                .to_owned(),
+                .into(),
         );
     };
     let prompt = strip_role_front_matter(Role::Build, BUILD_ROLE)
@@ -310,9 +334,7 @@ fn run_with(
         None => Box::new(MarkdownTracker::new(root)),
     };
     if mode == Mode::Drain && !tracker.capabilities().contains(&Capability::ListAdmitted) {
-        return Err(
-            "`owlshift watch --drain` needs a tracker that lists admitted tickets".to_owned(),
-        );
+        return Err("`owlshift watch --drain` needs a tracker that lists admitted tickets".into());
     }
     // The GitHub App's token is refreshed under the project's account lock
     // (OWL-384); one already expired is refreshed here, before any work.
@@ -577,10 +599,14 @@ fn run_with(
             };
             if mode == Mode::Drain {
                 // Each step in a child, this binary itself (OWL-399), on the
-                // served project's kept file when served (OWL-434).
-                let program = std::env::current_exe().map_err(|error| {
-                    format!("this program's own path, which runs each step: {error}")
-                })?;
+                // served project's kept file when served (OWL-434): the one
+                // this process runs, where the system can tell, even once
+                // replaced on disk (OWL-435).
+                let program = owlshift_platform::process::own_program()
+                    .map(|own| own.spawn)
+                    .map_err(|error| {
+                        format!("this program's own path, which runs each step: {error}")
+                    })?;
                 let served_repo = served.map(|served| served.repo.clone());
                 // Each takes one of the machine's run slots (OWL-409).
                 let children = Children::new(move |ticket, envelope| {
@@ -623,6 +649,32 @@ pub(crate) fn concurrent_runs(personal: &FileState<PersonalConfig>) -> u32 {
     match personal {
         FileState::Loaded { config, .. } => config.concurrent_runs(),
         _ => DEFAULT_CONCURRENT_RUNS,
+    }
+}
+
+/// Shares the served lock of `repo`'s project in `data_dir` for a watch typed
+/// in a terminal (OWL-435): refused while the background service serves the
+/// project. A lock that cannot be read is a warning, the watch going on.
+fn share_served_lock(data_dir: &Path, repo: &Repo) -> Result<Option<ServedLock>, Refusal> {
+    match served::share_served(&ProjectDirs::new(data_dir, repo)) {
+        Ok(Some(share)) => Ok(Some(share)),
+        Ok(None) => Err(format!(
+            "{repo} is served by the background service on this machine, which runs its watch: \
+             `owlshift stop --forget` in its checkout stops serving it, `owlshift stop` stops the \
+             service"
+        )
+        .into()),
+        Err(error) => {
+            let _ = writeln!(
+                io::stderr(),
+                "{}",
+                printable(&format!(
+                    "owlshift: warning: the served lock of {repo} could not be read ({error}), so \
+                     this watch cannot tell whether the background service serves the project"
+                ))
+            );
+            Ok(None)
+        }
     }
 }
 
@@ -1021,7 +1073,12 @@ mod refusals {
             let refusal = run_with(&NoSandbox, &config, mode, no_keychain, None)
                 .err()
                 .unwrap();
-            assert_eq!(refusal, SandboxError::Unsupported.to_string(), "{mode:?}");
+            assert_eq!(
+                refusal.message,
+                SandboxError::Unsupported.to_string(),
+                "{mode:?}"
+            );
+            assert!(refusal.lasting, "{mode:?}");
         }
 
         // OWL-399: a step whose envelope does not read, or is another
@@ -1043,7 +1100,33 @@ mod refusals {
             )
             .err()
             .unwrap();
-            assert!(refusal.starts_with(said), "{refusal}");
+            assert!(refusal.message.starts_with(said), "{refusal}");
+        }
+    }
+
+    /// OWL-435: a served watch that no restart mends ends with the code the
+    /// daemon pauses its project on; a refusal a restart may mend, a watch
+    /// typed in a terminal and any other command end in a plain failure.
+    #[test]
+    fn only_a_lasting_refusal_of_a_served_watch_pauses_its_project() {
+        let lasting = Refusal::from("no Linear API key");
+        let passing = Refusal::passing("Linear did not answer");
+        assert_eq!(
+            refused_code(&lasting, Mode::Drain, true),
+            ExitCode::from(UNSERVABLE_EXIT)
+        );
+        for (refusal, mode, served) in [
+            (&passing, Mode::Drain, true),
+            (&lasting, Mode::Drain, false),
+            (&lasting, Mode::Watch, false),
+            (&lasting, Mode::Step("OWL-1", "{}"), true),
+            (&lasting, Mode::Do("OWL-1"), false),
+        ] {
+            assert_eq!(
+                refused_code(refusal, mode, served),
+                ExitCode::FAILURE,
+                "{mode:?}"
+            );
         }
     }
 

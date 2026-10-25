@@ -11,11 +11,12 @@ use std::sync::Arc;
 use jiff::Timestamp;
 use owlshift_adapters::forge::github::{Connect, GitHubForge, HttpTransport, Token, TokenSource};
 use owlshift_adapters::forge::github_app::{self, DeviceFlow, HttpLogin, UserToken};
-use owlshift_adapters::forge::{DefaultBranch, Error, Repo};
+use owlshift_adapters::forge::{DefaultBranch, Error, ErrorKind, Repo};
 use owlshift_contracts::config::PersonalConfig;
 use owlshift_platform::keychain::{Keychain, SERVICE, Secret};
 
 use crate::github_token::AppToken;
+use crate::refusal::Refusal;
 use crate::secrets::{self, ForgeKind, ForgeSecret};
 
 /// The keychain account, under [`SERVICE`], that every project of a machine
@@ -97,11 +98,14 @@ pub struct AppAccess {
 /// [`ACCOUNT_LOCK_WAIT`](crate::github_token::ACCOUNT_LOCK_WAIT) for the
 /// lock, so a refresh GitHub refuses stops the command before any work. A
 /// personal token is never tried in the app token's place.
+///
+/// Every refusal is lasting but a GitHub that did not answer the refresh, or
+/// whose budget is spent, which a restart may mend (OWL-435, [`Refusal`]).
 pub fn github(
     found: &ForgeSecret<Secret>,
     repo: Repo,
     access: &AppAccess,
-) -> Result<GitHubForge, String> {
+) -> Result<GitHubForge, Refusal> {
     match (&found.token, found.account.kind) {
         (Some(entry), ForgeKind::App) => {
             let flow = DeviceFlow::new(HttpLogin::new(), &access.app.client_id);
@@ -112,15 +116,24 @@ pub fn github(
                 flow,
                 entry,
             )
-            .map_err(|error| error.message)?;
-            source.token().map_err(|error| error.message)?;
+            .map_err(refusal)?;
+            source.token().map_err(refusal)?;
             let connect: Connect = Box::new(|token| Box::new(HttpTransport::new(token)));
             Ok(GitHubForge::with_app(source, connect, repo))
         }
         (Some(token), ForgeKind::Personal) => {
             Ok(GitHubForge::new(Token::new(token.expose()), repo))
         }
-        (None, _) => Err(no_token(found)),
+        (None, _) => Err(no_token(found).into()),
+    }
+}
+
+/// The refusal of a GitHub App token that could not be had: passing when
+/// GitHub did not answer or its budget is spent, lasting otherwise.
+fn refusal(error: Error) -> Refusal {
+    match error.kind {
+        ErrorKind::Other | ErrorKind::RateLimited => Refusal::passing(error.message),
+        _ => error.message.into(),
     }
 }
 
@@ -251,6 +264,8 @@ mod tests {
             token: None,
         };
         let missing = github(&found, repo.clone(), &access).unwrap_err();
+        assert!(missing.lasting, "{missing}");
+        let missing = missing.message;
         assert!(
             missing.contains("service `owlshift`, account `github.com/pitchopp/owlshift/github`"),
             "{missing}"
@@ -289,6 +304,8 @@ mod tests {
             &repo
         );
         let error = github(&found("ghu_SENTINEL".to_owned()), repo.clone(), &access).unwrap_err();
+        assert!(error.lasting, "{error}");
+        let error = error.message;
         assert!(
             error.contains("account `github.com/pitchopp/owlshift/github-app`, does not read"),
             "{error}"

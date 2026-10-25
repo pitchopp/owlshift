@@ -25,6 +25,7 @@
 //! | Per-ticket routing: harness, tier and effort of each run | [`routing`] |
 //! | A harness's usage limits: windows, episodes, the probe, the effective harness | [`usage`] |
 //! | A broken base: whose a gate failure is, the base checks and holds | [`base`] |
+//! | When the background service starts a served project's watch again | [`restart`] |
 
 pub mod agent_env;
 pub mod base;
@@ -38,6 +39,7 @@ pub mod pipeline;
 pub mod proposal;
 pub mod reply;
 pub mod resource;
+pub mod restart;
 pub mod review;
 pub mod roster;
 pub mod routing;

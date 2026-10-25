@@ -1,0 +1,26 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Owlshift service request",
+  "description": "A request one of the service's files holds: `<data>/service/stop`,\n`<project data>/stop` or `<project data>/pause`. The file asks by\nstanding; what it holds says who asked, when and why, read leniently, so\na file another writer left still asks.",
+  "type": "object",
+  "properties": {
+    "at": {
+      "description": "When.",
+      "type": "string",
+      "format": "date-time"
+    },
+    "by": {
+      "description": "Who asked: a command, such as [`BY_STOP`] or [`BY_DAEMON`].",
+      "type": "string"
+    },
+    "why": {
+      "description": "Why, in words for a person.",
+      "type": "string"
+    }
+  },
+  "required": [
+    "by",
+    "at",
+    "why"
+  ]
+}
