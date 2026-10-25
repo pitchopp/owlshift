@@ -38,8 +38,9 @@ use rustix::process::{Pid, Signal, WaitId, WaitIdOptions, waitid};
 
 /// What the sentinel runs: it keeps the groups of the `+` lines less those
 /// of the `-` lines, and at the end of its input kills each group left, as
-/// `ProcessTree::kill` does. POSIX sh, builtins only, since it runs with an
-/// empty environment: dash on Debian and Ubuntu, bash on macOS.
+/// `ProcessTree::kill` does, without its search for what left the group
+/// (OWL-451). POSIX sh, builtins only, since it runs with an empty
+/// environment: dash on Debian and Ubuntu, bash on macOS.
 ///
 /// It first ignores SIGHUP (OWL-93): when Owlshift's end orphans the
 /// sentinel's process group while the sentinel is stopped, the system sends

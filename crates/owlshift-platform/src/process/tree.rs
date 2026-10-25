@@ -2,8 +2,11 @@
 //! whole: a process group of its own on Unix, a Job Object on Windows.
 //!
 //! Every process the root starts joins the tree, so stopping the tree leaves
-//! nothing behind. On Unix a descendant can still leave its group on purpose
-//! (`setsid`, `setpgid`); a Windows job gives no such way out.
+//! nothing behind. On Unix a descendant can leave its group on purpose
+//! (`setsid`, `setpgid`), as Claude Code does for each Bash call: stopping
+//! the tree searches for it then, by parent pid, with the members of a group
+//! it leads (OWL-451), and misses only one whose parent and group leader
+//! have both ended. A Windows job gives no such way out.
 
 use std::io;
 use std::process::{Child, Command, ExitStatus};
@@ -60,6 +63,10 @@ impl ProcessTree {
     /// Stops every process of the tree at once, the root included, without
     /// waiting for them to end; the root still has to be reaped through its
     /// [`Child`]. Stopping a tree whose processes have all ended succeeds.
+    ///
+    /// On Unix that includes what left the tree's group while it still
+    /// descends from it, found in the process table at the stop (OWL-451):
+    /// a few listings of the table, nothing waited on.
     pub fn kill(&self) -> io::Result<()> {
         imp::kill(self)
     }
@@ -96,7 +103,9 @@ mod imp {
     use super::super::signals;
     use super::{AtCheckedStop, ProcessTree};
     use rustix::io::Errno;
-    use rustix::process::{Pid, Signal, WaitId, WaitIdOptions, kill_process_group, waitid};
+    use rustix::process::{
+        Pid, Signal, WaitId, WaitIdOptions, kill_process, kill_process_group, waitid,
+    };
     use std::io;
     use std::os::unix::process::CommandExt;
     use std::process::{Child, Command};
@@ -172,7 +181,11 @@ mod imp {
         }
     }
 
-    /// Sends `SIGKILL` to the group.
+    /// Sends `SIGKILL` to the group, and first to what left it (OWL-451):
+    /// the group is frozen with `SIGSTOP`, so that nothing in it starts or
+    /// reaps a process meanwhile, then every process descending from one of
+    /// its own, and every member of a group one of those leads, is found,
+    /// frozen and checked again, as `descendants` says, and killed.
     ///
     /// The group id stays reserved while the root is unreaped or any member
     /// is alive: [`run_command`] reaps the root only after the tree is
@@ -182,16 +195,38 @@ mod imp {
     /// around; callers stop a tree while its run is still theirs, and the
     /// signal thread only while its handle is.
     ///
+    /// The result is the group's own kill: the search is best effort, and a
+    /// search that fails leaves what left the group running.
+    ///
     /// [`run_command`]: crate::process::run_command
     pub(in crate::process) fn kill_group(group: Pid) -> io::Result<()> {
-        match kill_process_group(group, Signal::KILL) {
+        // A group with no process left, or zombies only, has nothing that
+        // still descends from it by a parent pid; any other failure skips
+        // the search, and the group's kill answers.
+        if signal_group(group, Signal::STOP).unwrap_or(false) {
+            let found =
+                super::super::descendants::freeze_reached(group.as_raw_nonzero().get(), || {
+                    super::super::descendants::list()
+                });
+            for pid in found {
+                // Best effort: one that ended needs nothing.
+                let _ = kill_process(pid, Signal::KILL);
+            }
+        }
+        signal_group(group, Signal::KILL).map(drop)
+    }
+
+    /// Sends `signal` to the group: whether it had a live process to get it.
+    fn signal_group(group: Pid, signal: Signal) -> io::Result<bool> {
+        match kill_process_group(group, signal) {
+            Ok(()) => Ok(true),
             // No process left in the group.
-            Ok(()) | Err(Errno::SRCH) => Ok(()),
+            Err(Errno::SRCH) => Ok(false),
             // macOS answers EPERM for a group left with only zombies, such as
             // a root that exited and is not reaped yet (checked 2026-09-28 on
             // macOS 26.6).
             #[cfg(target_os = "macos")]
-            Err(Errno::PERM) => Ok(()),
+            Err(Errno::PERM) => Ok(false),
             Err(error) => Err(error.into()),
         }
     }

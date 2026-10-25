@@ -11,6 +11,8 @@
 //! [`hand_over_on_descriptor`] gives a child a secret on an inherited
 //! descriptor, never in its environment.
 
+#[cfg(unix)]
+mod descendants;
 mod handover;
 #[cfg(unix)]
 mod sentinel;
@@ -479,6 +481,82 @@ mod tests {
         assert_nothing_outlives_the_deadline("helper_wait_on_a_grandchild");
     }
 
+    /// Starts `/bin/sh` in a session and a process group of its own, as
+    /// Claude Code runs each Bash call (OWL-451), with `sleep 30` as its job
+    /// and another left orphaned in its group by a subshell; writes the pids
+    /// of this process, the shell and both sleeps to `pids`, then sleeps
+    /// until it is killed.
+    #[cfg(unix)]
+    #[test]
+    #[ignore = "helper, run by the tests below"]
+    fn helper_escape_the_group() {
+        if helper_requested() {
+            use std::os::unix::process::CommandExt;
+
+            let mut shell = Command::new("/bin/sh");
+            shell
+                .args([
+                    "-c",
+                    "sleep 30 & echo $! > job.tmp && mv job.tmp job; \
+                     (sleep 30 & echo $! > orphan.tmp && mv orphan.tmp orphan); wait",
+                ])
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null());
+            // SAFETY: `setsid` is async-signal-safe, and the closure calls
+            // nothing else between the fork and the exec.
+            unsafe {
+                shell.pre_exec(|| rustix::process::setsid().map(drop).map_err(io::Error::from));
+            }
+            let mut shell = shell.spawn().unwrap();
+            wait_until("the shell's sleeps", || {
+                Path::new("job").exists() && Path::new("orphan").exists()
+            });
+            let read = |name: &str| -> u32 {
+                std::fs::read_to_string(name)
+                    .unwrap()
+                    .trim()
+                    .parse()
+                    .unwrap()
+            };
+            write_pids(&[std::process::id(), shell.id(), read("job"), read("orphan")]);
+            thread::sleep(Duration::from_secs(20));
+            // Not reached when the test stops this helper, as it does.
+            let _ = shell.kill();
+            let _ = shell.wait();
+        }
+    }
+
+    /// OWL-451: a probe stopped at its deadline takes with it what left its
+    /// group, a shell in a session of its own, its job and a job orphaned in
+    /// its group, while a process outside the tree runs on.
+    #[cfg(unix)]
+    #[test]
+    fn what_left_the_group_does_not_outlive_the_deadline() {
+        use std::os::unix::process::CommandExt;
+
+        /// Killed on the way out, the test passed or not.
+        struct Outside(Child);
+        impl Drop for Outside {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+        let outside = Outside(
+            Command::new("sleep")
+                .arg("30")
+                .process_group(0)
+                .spawn()
+                .unwrap(),
+        );
+        assert_nothing_outlives_the_deadline("helper_escape_the_group");
+        assert!(
+            is_alive(outside.0.id()),
+            "a process outside the tree was stopped"
+        );
+    }
+
     #[test]
     fn a_process_holding_the_output_open_is_stopped_at_the_deadline() {
         assert_nothing_outlives_the_deadline("helper_leave_a_pipe_holder");
@@ -846,8 +924,10 @@ mod tests {
     }
 
     /// OWL-161: stops by degrees, with `bound`, owning three trees, one of
-    /// each kind: `sleep 30` left, `sleep 30` stopped, and a shell told,
-    /// which writes `told` when it gets SIGTERM and ends. Writes their pids,
+    /// each kind: `sleep 30` left, `helper_escape_the_group` stopped, run in
+    /// `escape`, where it writes its pids, so that what left the run's group
+    /// is stopped too (OWL-451), and a shell told, which writes `told` when
+    /// it gets SIGTERM and ends. Writes their pids,
     /// then each degree asked to `asked`; once a checked stop is asked, the
     /// pid of a stopped tree it spawns then to `late`, and to `refused`
     /// whether a told tree was refused. Core dumps off, for SIGQUIT.
@@ -879,9 +959,24 @@ mod tests {
             ]);
             command
         };
+        let escape = || {
+            std::fs::create_dir_all("escape").unwrap();
+            let mut command = Command::new(std::env::current_exe().unwrap());
+            command
+                .args([
+                    "--exact",
+                    "process::tests::helper_escape_the_group",
+                    "--ignored",
+                    "--nocapture",
+                    "--test-threads=1",
+                ])
+                .current_dir("escape")
+                .stdout(Stdio::null());
+            command
+        };
         let (left, _left) = ProcessTree::spawn_for(&mut sleep(), AtCheckedStop::Left).unwrap();
         let (stopped, _stopped) =
-            ProcessTree::spawn_for(&mut sleep(), AtCheckedStop::Stopped).unwrap();
+            ProcessTree::spawn_for(&mut escape(), AtCheckedStop::Stopped).unwrap();
         let (shell, _shell) = ProcessTree::spawn_for(&mut told(), AtCheckedStop::Told).unwrap();
         write_pids(&[left.id(), stopped.id(), shell.id()]);
         let mut last = wait_asked(Duration::from_secs(20));
@@ -942,6 +1037,18 @@ mod tests {
             std::fs::read_to_string(self.dir.path().join("asked")).unwrap_or_default()
         }
 
+        /// What left the group of its helper's stopped tree, once there
+        /// (OWL-451): the shell and its two sleeps, waited for 5 s at most.
+        fn escaped(&self) -> Vec<u32> {
+            let pids = self.dir.path().join("escape").join("pids");
+            wait_until("the stopped tree's shell", || pids.exists());
+            let pids = std::fs::read_to_string(pids).unwrap();
+            pids.split(' ')
+                .skip(1)
+                .map(|pid| pid.parse().unwrap())
+                .collect()
+        }
+
         /// Waits for its end, 5 s at most: the signal that ended it.
         fn ended_by(&mut self) -> Option<i32> {
             use std::os::unix::process::ExitStatusExt;
@@ -955,10 +1062,10 @@ mod tests {
 
     /// OWL-161: each Ctrl-C asks one degree more. The first a drain, which
     /// stops nothing; the second a checked stop, which stops the tree of a
-    /// run at once, tells the step's child, leaves the process's own
-    /// command, stops a run started after it as it starts and starts no
-    /// step's child; the third stops every tree now, as the signal ends the
-    /// process.
+    /// run at once, what left its group included (OWL-451), tells the step's
+    /// child, leaves the process's own command, stops a run started after it
+    /// as it starts and starts no step's child; the third stops every tree
+    /// now, as the signal ends the process.
     #[cfg(unix)]
     #[test]
     fn each_ctrl_c_asks_one_degree_more() {
@@ -968,19 +1075,23 @@ mod tests {
         let &[left, stopped, told] = owner.pids.as_slice() else {
             panic!("pids: {:?}", owner.pids);
         };
+        let escaped = owner.escaped();
         let _left = Left {
-            trees: vec![left, stopped],
+            trees: [left].into_iter().chain(escaped.iter().copied()).collect(),
             stopped: (told, "owlshift-never-stopped"),
         };
         owner.signal(Signal::INT);
         wait_until("a drain asked", || owner.asked() == "drain");
-        for pid in [left, stopped, told] {
+        for &pid in [left, stopped, told].iter().chain(&escaped) {
             assert!(is_alive(pid), "{pid} stopped by a drain");
         }
 
         owner.signal(Signal::INT);
         wait_until("a checked stop asked", || owner.asked() == "checked");
         wait_until("the run's tree stopped", || !is_alive(stopped));
+        for &pid in &escaped {
+            wait_until("what left the run's group stopped", || !is_alive(pid));
+        }
         wait_until("the step's child told", || {
             owner.dir.path().join("told").exists() && !is_alive(told)
         });
@@ -1001,7 +1112,8 @@ mod tests {
 
     /// OWL-161: SIGTERM asks a checked stop, and a second asks nothing more;
     /// past its bound the process stops every tree now, ended by SIGTERM.
-    /// SIGQUIT stops every tree now, whatever was asked.
+    /// SIGQUIT stops every tree now, whatever was asked, what left a tree's
+    /// group included (OWL-451).
     #[cfg(unix)]
     #[test]
     fn sigterm_checks_until_its_bound_and_sigquit_stops_now() {
@@ -1031,14 +1143,15 @@ mod tests {
         let &[left, stopped, told] = owner.pids.as_slice() else {
             panic!("pids: {:?}", owner.pids);
         };
+        let escaped = owner.escaped();
         let _left = Left {
-            trees: vec![left, stopped],
+            trees: [left].into_iter().chain(escaped.iter().copied()).collect(),
             stopped: (told, "owlshift-never-stopped"),
         };
         owner.signal(Signal::QUIT);
         assert_eq!(owner.ended_by(), Some(Signal::QUIT.as_raw()));
         assert_eq!(owner.asked(), "", "a degree was asked");
-        for pid in [left, stopped, told] {
+        for &pid in [left, stopped, told].iter().chain(&escaped) {
             wait_until("every tree stopped", || !is_alive(pid));
         }
     }

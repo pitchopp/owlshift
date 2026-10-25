@@ -27,7 +27,8 @@ pub(crate) struct Watchdog {
 }
 
 /// Stops a run's whole process tree from its harness's driver, before the
-/// deadline: on Unix its process group, on Windows its Job Object. A run
+/// deadline: on Unix its process group and what left it (OWL-451), on
+/// Windows its Job Object. A run
 /// stopped so is judged by its harness's own end, never as timed out, even
 /// when the deadline passed in the same moment (OWL-319).
 #[derive(Debug)]
