@@ -112,7 +112,10 @@ pub fn run(
     served: Option<&Repo>,
 ) -> ExitCode {
     let ran = match served {
-        None => run_with(system, config, mode, Keychain::system, None).map(Ended::code),
+        None => crate::data_dir()
+            .map_err(Refusal::from)
+            .and_then(|data_dir| run_with(system, config, mode, Keychain::system, None, &data_dir))
+            .map(Ended::code),
         Some(repo) => run_served(system, config, mode, repo, Keychain::system),
     };
     ran.unwrap_or_else(|refusal| {
@@ -178,7 +181,14 @@ fn run_served(
             served::prepare(&git, &served, &accept, desktop, &mut sink)?;
         }
         let effective = served::effective(repo, &served.dirs, personal.clone())?;
-        match run_with(system, &effective, mode, open_keychain, Some(&served))? {
+        match run_with(
+            system,
+            &effective,
+            mode,
+            open_keychain,
+            Some(&served),
+            &data_dir,
+        )? {
             Ended::Code(code) => return Ok(code),
             Ended::Reload => {}
         }
@@ -186,15 +196,16 @@ fn run_served(
 }
 
 /// [`run`], with the keychain opened by `open_keychain`, on the served
-/// project `served` when there is one: a refusal before the run is
-/// returned, for the caller to print, lasting unless it says otherwise
-/// (OWL-435).
+/// project `served` when there is one, Owlshift's data directory being
+/// `data_dir`: a refusal before the run is returned, for the caller to
+/// print, lasting unless it says otherwise (OWL-435).
 fn run_with(
     system: &dyn System,
     config: &Effective,
     mode: Mode<'_>,
     open_keychain: fn() -> Result<Keychain, KeychainError>,
     served: Option<&Served>,
+    data_dir: &Path,
 ) -> Result<Ended, Refusal> {
     let ticket = mode
         .ticket()
@@ -230,28 +241,28 @@ fn run_with(
             (root, remote_url, repo)
         }
     };
+    // A watch typed in a terminal shares its project's served lock for its
+    // life, so it never runs on a project the background service serves,
+    // and the service waits for it to end (OWL-435): first, needing no
+    // credential, so a served project is said whatever the host.
+    let _served_share = match (served, mode) {
+        (None, Mode::Watch | Mode::Drain) => share_served_lock(data_dir, &repo)?,
+        _ => None,
+    };
     // OWL-98: a host where agent runs cannot be confined is refused before
     // the keychain is opened, so it never prompts for or loads a secret for
     // a run that cannot happen. `do`, `continue` and `watch` always confine
     // their agents (`AgentEnv::from_runner`); `OnDemand` checks again.
     system.sandbox().map_err(|error| error.to_string())?;
-    let data_dir = crate::data_dir()?;
-    // A watch typed in a terminal shares its project's served lock for its
-    // life, so it never runs on a project the background service serves,
-    // and the service waits for it to end (OWL-435).
-    let _served_share = match (served, mode) {
-        (None, Mode::Watch | Mode::Drain) => share_served_lock(&data_dir, &repo)?,
-        _ => None,
-    };
     // The machine's run slots every project's drain shares (OWL-409), in
     // Owlshift's data directory, which is the user's state directory the
     // design names. A step's child takes one before anything else, the
     // keychain included, and keeps it to its end; with none free, it writes
     // its "no slot" record and ends, its ticket untouched.
-    let slots = MachineSlots::new(&data_dir, concurrent_runs(&config.personal));
+    let slots = MachineSlots::new(data_dir, concurrent_runs(&config.personal));
     let _slot = match &envelope {
         Some(envelope) => {
-            let dirs = ProjectDirs::new(&data_dir, &repo);
+            let dirs = ProjectDirs::new(data_dir, &repo);
             let now = on_demand::system_clock();
             match step::take_slot(&slots, &dirs, &repo.to_string(), envelope, now)
                 .map_err(|error| format!("the machine's run slots: {error}"))?
@@ -338,7 +349,7 @@ fn run_with(
     }
     // The GitHub App's token is refreshed under the project's account lock
     // (OWL-384); one already expired is refreshed here, before any work.
-    let dirs = ProjectDirs::new(&data_dir, &repo);
+    let dirs = ProjectDirs::new(data_dir, &repo);
     let access = forge::AppAccess {
         keychain: keychain.clone(),
         lock: dirs.account_lock_file(),
@@ -464,7 +475,7 @@ fn run_with(
     let desktop = desktop.as_ref().map(|d| d as &dyn Notifier);
     // Every project's commands on this machine share each harness's usage
     // state (OWL-404).
-    let usage = UsageStore::in_data_dir(&data_dir)
+    let usage = UsageStore::in_data_dir(data_dir)
         .with_caps(owlshift_runner::usage::caps_of(&config.personal));
     let on_demand = OnDemand {
         executor: &executor,
@@ -494,7 +505,7 @@ fn run_with(
         web_tools: owlshift_runner::config::web_tools_enabled(&config.personal),
     };
     let mut stdout = io::stdout();
-    let mut sink = EventSink::new(repo.to_string(), EventLog::in_dir(&data_dir), &mut stdout);
+    let mut sink = EventSink::new(repo.to_string(), EventLog::in_dir(data_dir), &mut stdout);
     let (ticket, outcome) = match (mode, &ticket) {
         (Mode::Do(_), Some(ticket)) => (ticket, on_demand.run(ticket, &mut sink)),
         (Mode::Continue(_), Some(ticket)) => (ticket, on_demand.continue_ticket(ticket, &mut sink)),
@@ -572,7 +583,7 @@ fn run_with(
             let mut served_out = io::stdout();
             let mut served_sink = EventSink::new(
                 repo.to_string(),
-                EventLog::in_dir(&data_dir),
+                EventLog::in_dir(data_dir),
                 &mut served_out,
             );
             let mut sleep = |interval| {
@@ -1062,6 +1073,7 @@ mod refusals {
             personal: FileState::Absent(repo.path().join("config.toml")),
         };
 
+        let data = tempfile::tempdir().unwrap();
         let step = envelope("OWL-1").render();
         for mode in [
             Mode::Do("OWL-1"),
@@ -1070,7 +1082,7 @@ mod refusals {
             Mode::Watch,
             Mode::Step("OWL-1", &step),
         ] {
-            let refusal = run_with(&NoSandbox, &config, mode, no_keychain, None)
+            let refusal = run_with(&NoSandbox, &config, mode, no_keychain, None, data.path())
                 .err()
                 .unwrap();
             assert_eq!(
@@ -1080,6 +1092,30 @@ mod refusals {
             );
             assert!(refusal.lasting, "{mode:?}");
         }
+
+        // OWL-435: a watch typed in a terminal on a project the background
+        // service serves is refused for that first, whatever the host.
+        let served = data.path().join("projects/github.com/owlshift/demo");
+        std::fs::create_dir_all(&served).unwrap();
+        let lock = std::fs::File::create(served.join("served.lock")).unwrap();
+        lock.try_lock().unwrap();
+        let refusal = run_with(
+            &NoSandbox,
+            &config,
+            Mode::Watch,
+            no_keychain,
+            None,
+            data.path(),
+        )
+        .err()
+        .unwrap();
+        assert!(
+            refusal
+                .message
+                .starts_with("owlshift/demo is served by the background service"),
+            "{refusal}"
+        );
+        drop(lock);
 
         // OWL-399: a step whose envelope does not read, or is another
         // ticket's, is refused before anything else.
@@ -1097,6 +1133,7 @@ mod refusals {
                 Mode::Step("OWL-1", text),
                 no_keychain,
                 None,
+                data.path(),
             )
             .err()
             .unwrap();
