@@ -32,6 +32,7 @@ use owlshift_contracts::format::strip_role_front_matter;
 use owlshift_contracts::ids::TicketId;
 use owlshift_contracts::step::StepEnvelope;
 use owlshift_contracts::{Harness, Role, Tier};
+use owlshift_platform::awake::KeepAwake;
 use owlshift_platform::keychain::{Keychain, KeychainError};
 use owlshift_runner::agent_env::AgentEnv;
 use owlshift_runner::codex_machine::codex_critic;
@@ -481,6 +482,16 @@ fn run_with(
         }
         (Mode::Step(..), Some(ticket)) => {
             let envelope = envelope.ok_or("a step without its envelope")?;
+            // The machine kept from idle sleep while this child holds its
+            // slot (OWL-439): the binding holds the assertion to the end of
+            // the step, so it must stay named (`_awake`, never `_`), and it
+            // is taken before the step's runs start, from this one thread.
+            let _awake = step::keep_awake(
+                owlshift_runner::config::keep_awake_enabled(&config.personal),
+                ticket,
+                &mut sink,
+                || KeepAwake::hold(&format!("a step of {ticket}")),
+            );
             // Reported as `continue`'s, then the record written last, which
             // its watch reads once this process has ended.
             let mut code = ExitCode::SUCCESS;

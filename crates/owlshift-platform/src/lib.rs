@@ -2,6 +2,7 @@
 //! and Job Objects, the keychain, platform directories, keep-awake, and the
 //! OS sandbox agent runs are confined in.
 
+pub mod awake;
 pub mod confined;
 pub mod files;
 pub mod keychain;

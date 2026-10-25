@@ -106,6 +106,18 @@ pub fn web_tools_enabled(personal: &FileState<PersonalConfig>) -> bool {
     }
 }
 
+/// Whether a drain's step child keeps the machine from idle sleep for its
+/// life (OWL-439, architecture section 5, "Keep awake"): yes unless
+/// `keep_awake = false`, and yes on a machine without a personal file; no
+/// for a file that could not be read or parsed, which never reaches a run.
+pub fn keep_awake_enabled(personal: &FileState<PersonalConfig>) -> bool {
+    match personal {
+        FileState::Loaded { config, .. } => config.keep_awake != Some(false),
+        FileState::Absent(_) | FileState::NotApplicable(_) => true,
+        FileState::Unavailable(_) | FileState::Invalid { .. } => false,
+    }
+}
+
 /// The configuration in effect for a directory.
 #[derive(Debug)]
 pub struct Effective {
@@ -687,8 +699,9 @@ mod tests {
     /// OWL-415: the web tools are on without a personal file and with one
     /// that leaves the key out or sets it `true`, off with `web_tools =
     /// false`, and off for a file that could not be read or parsed.
+    /// Keep-awake likewise (OWL-439).
     #[test]
-    fn the_web_tools_are_on_unless_the_personal_file_turns_them_off() {
+    fn the_web_tools_and_keep_awake_are_on_unless_the_personal_file_turns_them_off() {
         let loaded = |text: &str| FileState::Loaded {
             path: PathBuf::from("config.toml"),
             config: PersonalConfig::parse(text).unwrap(),
@@ -703,6 +716,11 @@ mod tests {
             path: PathBuf::from("config.toml"),
             error: String::new(),
         }));
+        // OWL-439: keep-awake reads its key the same way.
+        assert!(keep_awake_enabled(&FileState::Absent("config.toml".into())));
+        assert!(keep_awake_enabled(&loaded("")));
+        assert!(keep_awake_enabled(&loaded("keep_awake = true\n")));
+        assert!(!keep_awake_enabled(&loaded("keep_awake = false\n")));
     }
 
     /// OWL-75's acceptance: a name the operator allows for one repository

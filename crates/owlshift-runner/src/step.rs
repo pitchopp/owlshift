@@ -43,6 +43,7 @@ use owlshift_contracts::step::{
     KeptChain, LandedKind, RefAfter, Shown, StepEnd, StepEnvelope, StepHold, StepKind, StepOutcome,
     StepOutside, TicketCarry,
 };
+use owlshift_platform::awake::{KeepAwake, Refusal};
 
 use crate::events::{Data, EventSink, data};
 use crate::follow::Following;
@@ -643,6 +644,37 @@ pub fn child(
     Ok(record)
 }
 
+/// Keeps the machine from idle sleep for the life of this step's child
+/// (OWL-439, architecture section 5, "Keep awake"), as `hold` does it, when
+/// `enabled` (the personal file's `keep_awake`): the assertion, held while
+/// the value returned lives, and each refusal on the way a `warning` event
+/// (`keep_awake_refused`, what was `asked` and the `reason`). Nothing is
+/// asked when it is not enabled, and a refusal never stops the step.
+pub fn keep_awake(
+    enabled: bool,
+    ticket: &TicketId,
+    sink: &mut EventSink<'_>,
+    hold: impl FnOnce() -> (KeepAwake, Vec<Refusal>),
+) -> KeepAwake {
+    if !enabled {
+        return KeepAwake::none();
+    }
+    let (held, refusals) = hold();
+    for refusal in refusals {
+        sink.emit(
+            ticket,
+            None,
+            EventKind::Warning,
+            data([
+                ("what", json!("keep_awake_refused")),
+                ("asked", json!(refusal.asked)),
+                ("reason", json!(refusal.reason)),
+            ]),
+        );
+    }
+    held
+}
+
 /// Takes one of the machine's run slots for `envelope`'s step (OWL-409),
 /// before anything else of the step: the slot, kept to the step's end and
 /// named after the step's ticket in `project` ([`slot_holder`], OWL-417);
@@ -794,6 +826,46 @@ mod tests {
         let carry = read_carry(&dirs, &ticket()).unwrap();
         assert_eq!((carry.commit.as_str(), carry.generation), ("c2", 2));
         assert_eq!(carry.chain.chain(), chain().chain);
+    }
+
+    /// OWL-439: each refusal of the assertion is one `warning` event, the
+    /// step going on; nothing is asked when keep-awake is off.
+    #[test]
+    fn each_refusal_to_keep_awake_is_one_warning_and_nothing_is_asked_when_off() {
+        let tmp = tempfile::tempdir().unwrap();
+        let log = crate::events::EventLog::in_dir(tmp.path());
+        let mut out = Vec::new();
+        let mut sink = EventSink::new("acme/app", log.clone(), &mut out);
+        let off = keep_awake(false, &ticket(), &mut sink, || panic!("asked while off"));
+        assert!(!off.is_held());
+        let refused = |asked: &str| Refusal {
+            asked: asked.to_owned(),
+            reason: "Failed to inhibit: Access denied".to_owned(),
+        };
+        keep_awake(true, &ticket(), &mut sink, || {
+            (
+                KeepAwake::none(),
+                vec![refused("idle:sleep"), refused("idle")],
+            )
+        });
+        let events: Vec<_> = fs::read_to_string(log.path())
+            .unwrap()
+            .lines()
+            .map(|line| owlshift_contracts::event::Event::parse(line).unwrap())
+            .map(|event| (event.ticket, event.kind, event.data))
+            .collect();
+        let warning = |asked: &str| {
+            (
+                Some(ticket()),
+                EventKind::Warning,
+                data([
+                    ("what", json!("keep_awake_refused")),
+                    ("asked", json!(asked)),
+                    ("reason", json!("Failed to inhibit: Access denied")),
+                ]),
+            )
+        };
+        assert_eq!(events, [warning("idle:sleep"), warning("idle")]);
     }
 
     /// OWL-417: the slot a step takes is named after its project, its
