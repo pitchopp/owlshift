@@ -4,6 +4,10 @@
 #   In a Linux container with bwrap (the rig of OWL-101, Ubuntu 24.04):
 #     docker run --rm --security-opt seccomp=unconfined --security-opt systempaths=unconfined \
 #       -v "$PWD/docs/design/live-checks:/probe:ro" owlshift-linux-rig sh /probe/owl-452.sh
+#     and again under a subreaper above the probe, as `systemd --user` is above a user unit's processes (PR_SET_CHILD_SUBREAPER
+#     is 36; not pid 1, which adopts orphans anyway): the same `docker run …` ending in
+#       owlshift-linux-rig sh -c 'python3 -c "import ctypes, subprocess, sys;
+#       assert ctypes.CDLL(None).prctl(36, 1, 0, 0, 0) == 0; sys.exit(subprocess.call([\"sh\", \"/probe/owl-452.sh\"]))"; true'
 # Whether a job left by a finished call, as a Claude Code Bash call leaves `cmd &` (owl-451.sh), can be told from
 # the process table as a run's own: its parent (pid 1 once orphaned, or a process of the run's tree), whether its
 # group's and session's leaders are gone, whether it started after the run's root, and whether its working
@@ -149,6 +153,13 @@ int main(int argc, char **argv) {
       const char *parent = i.ppid == 1 ? "1" : "other";
       for (int p = i.ppid, hops = 0; p > 1 && hops < 64; hops++) {
         if (p == root) { parent = "a process of the root's tree"; break; }
+        struct info up;
+        if (describe(p, &up)) break;
+        p = up.ppid;
+      }
+      /* One of this reader's own ancestors, as a subreaper above it would be. */
+      for (int p = getppid(), hops = 0; p > 1 && hops < 64 && !strcmp(parent, "other"); hops++) {
+        if (p == i.ppid) { parent = "an ancestor of the probe"; break; }
         struct info up;
         if (describe(p, &up)) break;
         p = up.ppid;
