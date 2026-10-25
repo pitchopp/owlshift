@@ -12,13 +12,13 @@
 
 use std::fs;
 use std::path::{Path, PathBuf};
+#[cfg(unix)]
 use std::process::Command;
 
 use jiff::{SignedDuration, Timestamp};
-use serde_json::json;
 
 use owlshift_adapters::tracker::markdown::MarkdownTracker;
-use owlshift_contracts::format::{Format, RESULT_FORMAT};
+use owlshift_contracts::format::Format;
 use owlshift_contracts::ids::TicketId;
 use owlshift_contracts::step::{RefAfter, StepEnd, StepEnvelope, StepHold, StepKind, StepOutcome};
 use owlshift_runner::events::EventLog;
@@ -28,7 +28,11 @@ use owlshift_runner::step::{self, Children};
 use owlshift_runner::ticket_ref::{self, RefAt};
 use owlshift_runner::watch::{POLL_INTERVAL, Watch};
 use owlshift_testkit::reply::Reply;
-use owlshift_testkit::step_child::{ChildProject, ChildSlots, TICKET};
+use owlshift_testkit::step_child::{ChildProject, ChildSlots, TICKET, intake_done, step_children};
+#[cfg(unix)]
+use owlshift_testkit::step_child::{
+    asks, build_asks, ended_as, holding_harness, intake_declaring, record_of, reply_for,
+};
 
 /// The step's child.
 const CHILD: &str = env!("CARGO_BIN_EXE_owlshift-step-child");
@@ -37,21 +41,6 @@ const FAKE: &str = env!("CARGO_BIN_EXE_owlshift-fake-harness");
 
 fn ticket() -> TicketId {
     TicketId::new(TICKET).unwrap()
-}
-
-/// An intake that ends done, the ticket back in the ready column.
-fn intake_done() -> String {
-    json!({
-        "format": RESULT_FORMAT,
-        "status": "done",
-        "summary": "A small greeting.",
-        "intake": {
-            "variant": "trivial",
-            "routing": { "harness": "claude", "tier": "fast", "effort": "low" },
-            "dependencies": [],
-        },
-    })
-    .to_string()
 }
 
 /// A drained project under a folder of its own, its paths in a file the
@@ -79,12 +68,7 @@ fn setup(harness: Option<PathBuf>) -> Setup {
 
 /// The children of the project whose paths `file` keeps.
 fn children(file: &Path) -> Children<'static> {
-    let file = file.to_owned();
-    Children::new(move |ticket, envelope| {
-        let mut command = Command::new(CHILD);
-        command.arg(&file).arg(ticket.as_str()).arg(envelope);
-        command
-    })
+    step_children(file, Path::new(CHILD))
 }
 
 /// One pass of `owlshift watch --drain`, its steps in children: watch's
@@ -490,45 +474,6 @@ fn two_watches_of_two_projects_share_the_machine_s_slots() {
     assert_eq!(counts, [1, 1], "runs under way as each started");
 }
 
-/// An intake that ends done, the ticket `trivial`, declaring `zones`.
-#[cfg(unix)]
-fn intake_declaring(zones: &[&str]) -> String {
-    let mut result: serde_json::Value = serde_json::from_str(&intake_done()).unwrap();
-    result["intake"]["zones"] = json!(zones);
-    result.to_string()
-}
-
-/// A Build that asks its decider one question: the step ends with the
-/// ticket waiting for the answer, holding what it holds.
-#[cfg(unix)]
-fn build_asks() -> String {
-    json!({
-        "format": RESULT_FORMAT,
-        "status": "questions",
-        "summary": "The greeting's language is not given.",
-        "questions": [{
-            "id": "Q1", "category": "scope", "context": "The ticket names no language.",
-            "text": "Which language should the greeting use?",
-            "recommendation": { "why": "The repository is in English." },
-        }],
-    })
-    .to_string()
-}
-
-/// Writes in `dir` the reply of `role`'s runs on `ticket` (any ticket when
-/// `None`), its result `result`, for [`playing_harness`].
-#[cfg(unix)]
-fn reply_for(dir: &Path, role: &str, ticket: Option<&str>, result: &str) {
-    let name = ticket.map_or_else(|| role.to_owned(), |ticket| format!("{role}-{ticket}"));
-    let result_file = dir.join(format!("{name}.json"));
-    fs::write(&result_file, result).unwrap();
-    let reply = Reply {
-        result: Some(result_file),
-        ..Reply::default()
-    };
-    fs::write(dir.join(format!("reply-{name}.toml")), reply.render()).unwrap();
-}
-
 /// A harness for the tests of several steps at once (OWL-401): a script
 /// that plays the fake harness with the reply [`reply_for`] wrote in `dir`
 /// for its run's role and ticket, read from its brief. A Build run first
@@ -604,46 +549,20 @@ fn parallel_setup(
     max_in_flight: u32,
     (machine, slots): (&Path, u32),
 ) -> Setup {
-    let s = setup(Some(harness.to_owned()));
-    let mut project = s.project.clone();
-    project.slots = Some(ChildSlots {
-        data: machine.to_owned(),
-        count: slots,
-    });
-    project.save(&s.file);
-    project.set_policy(&format!("max_in_flight = {max_in_flight}"));
-    project.add_ticket("DEMO-9", &[], "");
-    for n in 1..=count {
-        project.add_ticket(
-            &format!("DEMO-{n}"),
-            &["agent"],
-            "blocked_by = [\"DEMO-9\"]\n",
-        );
-    }
-    Setup { project, ..s }
-}
-
-/// The ticket ref of `id` in `project`'s dedicated checkout, if it reads.
-#[cfg(unix)]
-fn record_of(project: &ChildProject, id: &str) -> Option<ticket_ref::TicketRecord> {
-    let env = project.env();
-    let git = Git::with_setup("git", move |command| env.apply(command));
-    let checkout = project.dirs().checkout();
-    ticket_ref::read(&git, &checkout, &TicketId::new(id).unwrap())
-        .ok()
-        .flatten()
-        .map(|stored| stored.record)
-}
-
-/// Whether the ticket `id` of `project` waits for its decider's answer.
-#[cfg(unix)]
-fn asks(project: &ChildProject, id: &str) -> bool {
-    use owlshift_core::state::{Status, TicketState};
-
-    record_of(project, id).is_some_and(|record| {
-        TicketState::try_from(&record.state)
-            .is_ok_and(|state| matches!(state.status(), Status::NeedsInput { .. }))
-    })
+    let tmp = tempfile::Builder::new()
+        .prefix("owlshift child ")
+        .tempdir()
+        .unwrap();
+    let project = ChildProject::seed_parallel(
+        tmp.path(),
+        harness.to_owned(),
+        count,
+        max_in_flight,
+        (machine, slots),
+    );
+    let file = tmp.path().join("project.toml");
+    project.save(&file);
+    Setup { tmp, project, file }
 }
 
 /// OWL-401's acceptance, scenario S5 with three tickets in flight, their
@@ -856,39 +775,6 @@ fn wait_within(what: &str, seconds: u64, log: &Path, mut done: impl FnMut() -> b
     }
 }
 
-/// A harness for the stop tests (OWL-161): a script that, for a run of
-/// `role` while `dir/hold` stands, runs `before` (shell text), writes its
-/// pid to `dir/<role>-<ticket>.pid`, then runs `hold` (shell text), such as
-/// `exec sleep 30`, a run under way until a stop cuts it; past it, and for
-/// any other run, it plays the fake harness with the reply [`reply_for`]
-/// wrote in `dir`, or the bench's.
-#[cfg(unix)]
-fn holding_harness(dir: &Path, role: &str, before: &str, hold: &str) -> PathBuf {
-    use std::os::unix::fs::PermissionsExt;
-
-    let script = dir.join(format!("harness-{role}.sh"));
-    fs::write(
-        &script,
-        format!(
-            "#!/bin/sh\ndir='{dir}'\nbrief=\"\"\nreply=\"\"\n\
-             while [ $# -gt 0 ]; do\n  case \"$1\" in\n    --brief) brief=\"$2\"; shift 2;;\n    \
-             --reply) reply=\"$2\"; shift 2;;\n    *) shift;;\n  esac\ndone\n\
-             role=$(sed -n 's/^  \"role\": \"\\([a-z_]*\\)\",$/\\1/p' \"$brief\" | head -n 1)\n\
-             ticket=$(sed -n 's/^    \"id\": \"\\([A-Z0-9-]*\\)\",$/\\1/p' \"$brief\" | head -n 1)\n\
-             if [ \"$role\" = '{role}' ] && [ -e \"$dir/hold\" ]; then\n  {before}\n  \
-             echo $$ > \"$dir/$role-$ticket.pid.partial\"\n  \
-             mv \"$dir/$role-$ticket.pid.partial\" \"$dir/$role-$ticket.pid\"\n  {hold}\nfi\n\
-             if [ -f \"$dir/reply-$role-$ticket.toml\" ]; then reply=\"$dir/reply-$role-$ticket.toml\"\n\
-             elif [ -f \"$dir/reply-$role.toml\" ]; then reply=\"$dir/reply-$role.toml\"; fi\n\
-             exec '{FAKE}' --brief \"$brief\" --reply \"$reply\"\n",
-            dir = dir.display(),
-        ),
-    )
-    .unwrap();
-    fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
-    script
-}
-
 /// Starts [`helper_watch_until_stopped`] over the project `file` keeps, in a
 /// process group of its own with core dumps off, its output in `log`: its
 /// steps in children, or in its own process when `in_process`. A step's
@@ -937,24 +823,6 @@ fn signal(watch: &std::process::Child, signal: &str) {
     assert!(sent.success(), "kill -s {signal}");
 }
 
-/// The tickets whose run ended `outcome`, as their `run_ended` events in
-/// `project`'s log say.
-#[cfg(unix)]
-fn ended(project: &ChildProject, outcome: &str) -> Vec<String> {
-    use owlshift_contracts::event::{Event, EventKind};
-
-    let log = EventLog::in_dir(&project.data);
-    let mut tickets: Vec<String> = fs::read_to_string(log.path())
-        .unwrap_or_default()
-        .lines()
-        .map(|line| Event::parse(line).unwrap())
-        .filter(|event| event.kind == EventKind::RunEnded && event.data["outcome"] == outcome)
-        .filter_map(|event| event.ticket.map(|ticket| ticket.as_str().to_owned()))
-        .collect();
-    tickets.sort();
-    tickets
-}
-
 /// OWL-161, the acceptance's first case: a drain asked while a step runs
 /// lets it finish. DEMO-1's intake, in a child, writes the project's stop
 /// file, then ends done a second later: its INTAKE is kept, DEMO-2, admitted
@@ -971,7 +839,7 @@ fn a_drain_lets_the_step_under_way_finish() {
     let stop = owlshift_runner::watch::stop::file(&dirs);
     let before = format!("touch '{}'", stop.display());
     let mut project = s.project.clone();
-    project.harness = holding_harness(&plays, "intake", &before, "sleep 1");
+    project.harness = holding_harness(&plays, Path::new(FAKE), "intake", &before, "sleep 1");
     project.add_ticket("DEMO-2", &["agent"], "");
     project.save(&s.file);
     let lines = drain_every(&project, &children(&s.file), POLL_INTERVAL, |pass| {
@@ -1014,7 +882,7 @@ fn a_sigterm_during_two_builds_checks_both_and_both_resume() {
     }
     reply_for(&plays, "build", None, &build_asks());
     fs::write(plays.join("hold"), "").unwrap();
-    let harness = holding_harness(&plays, "build", ":", "exec sleep 30");
+    let harness = holding_harness(&plays, Path::new(FAKE), "build", ":", "exec sleep 30");
     let s = parallel_setup(&harness, 2, 2, (&machine, 2));
     s.project.move_ticket("DEMO-9", "Done");
     let log = tmp.path().join("watch.log");
@@ -1046,7 +914,7 @@ fn a_sigterm_during_two_builds_checks_both_and_both_resume() {
     assert_eq!(dirs.quarantine().unwrap(), None, "{log_text}");
     assert!(!dirs.obligations_stand(), "{log_text}");
     assert_eq!(
-        ended(&s.project, "stopped"),
+        ended_as(&s.project, "stopped"),
         ["DEMO-1", "DEMO-2"],
         "{log_text}"
     );
@@ -1080,7 +948,7 @@ fn a_breach_found_at_a_checked_stop_quarantines() {
     let dirs = s.project.dirs();
     let planted = format!("echo planted > '{}/planted'", dirs.checkout().display());
     let mut project = s.project.clone();
-    project.harness = holding_harness(&plays, "intake", &planted, "exec sleep 30");
+    project.harness = holding_harness(&plays, Path::new(FAKE), "intake", &planted, "exec sleep 30");
     project.save(&s.file);
     let log = s.tmp.path().join("watch.log");
     let mut watch = start_watch(&s.file, true, None, &log);
@@ -1124,7 +992,7 @@ fn sigquit_and_sigkill_of_watch_stop_now_leaving_the_obligation() {
         fs::create_dir_all(&plays).unwrap();
         fs::write(plays.join("hold"), "").unwrap();
         let mut project = s.project.clone();
-        project.harness = holding_harness(&plays, "intake", ":", "exec sleep 30");
+        project.harness = holding_harness(&plays, Path::new(FAKE), "intake", ":", "exec sleep 30");
         project.save(&s.file);
 
         let child_pid = s.tmp.path().join("child.pid");
@@ -1229,6 +1097,9 @@ fn move_main(project: &ChildProject, root: &Path, news: &str) -> String {
 #[test]
 fn a_base_wait_keeps_its_comment_while_another_step_runs() {
     use std::cell::Cell;
+
+    use owlshift_contracts::format::RESULT_FORMAT;
+    use serde_json::json;
 
     use owlshift_runner::base;
 
@@ -1395,32 +1266,7 @@ fn helper_watch_until_stopped() {
     let file = PathBuf::from(file);
     let project = ChildProject::load(&file);
     let in_process = std::env::var_os("OWLSHIFT_WATCH_IN_PROCESS").is_some();
+    let children = (!in_process).then(|| children(&file));
     let ends = Instant::now() + Duration::from_secs(120);
-    let mut sleep = |interval| {
-        process::wait_asked(interval);
-        Instant::now() < ends
-    };
-    let mut children = children(&file);
-    if let Some(slots) = project.machine_slots() {
-        children = children.with_slots(slots);
-    }
-    project.with_on_demand(&mut std::io::stdout(), |on_demand, sink| {
-        let watch = Watch {
-            on_demand,
-            interval: Duration::from_millis(200),
-        };
-        let mut out = std::io::stdout();
-        if in_process {
-            watch.run_drain(sink, &mut out, &mut |_, _, _| {}, &mut sleep);
-        } else {
-            watch.run_with_children(
-                true,
-                &children,
-                sink,
-                &mut out,
-                &mut |_, _, _| {},
-                &mut sleep,
-            );
-        }
-    });
+    project.watch_until_stopped(children, &mut || Instant::now() < ends);
 }
