@@ -232,7 +232,7 @@ fn probe_command(program: &Path, args: &[&str], cwd: Option<&Path>) -> Command {
 /// Reads a stream to its end on its own thread, keeping the first `cap`
 /// bytes, and sends them once the stream closes, or sends the error that
 /// stopped the reading: what was read before it is not a whole output.
-fn read_capped(
+pub(crate) fn read_capped(
     stream: Option<impl Read + Send + 'static>,
     cap: usize,
 ) -> Receiver<io::Result<Vec<u8>>> {
