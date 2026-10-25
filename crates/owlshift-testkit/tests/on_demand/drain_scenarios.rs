@@ -734,18 +734,26 @@ pub(super) fn collisions(events: &[Event], key: &str) -> Vec<(String, Value, Val
 }
 
 /// Scenario S5, "Collision with work in flight", its part between
-/// Owlshift's tickets (OWL-403), one step at a time. DEMO-1 declares `app`
-/// and asks its decider at Build: its ref holds `app` while it waits, so
-/// DEMO-2, which declares `app/sub`, waits for it at the dispatch, told once,
-/// and DEMO-3, which declares `docs`, is dispatched. DEMO-3's Build changes
-/// `app/x.md` too, which the widening after the run finds: its Verify pass
-/// passes, and its delivery waits at Verify for DEMO-1, dispatched first.
-/// DEMO-1, answered, takes the turn DEMO-3 gives up and delivers; DEMO-3 waits
-/// on while DEMO-1's pull request is open, and once it is merged DEMO-3
-/// delivers the verified commit with no second Verify pass.
+/// Owlshift's tickets (OWL-403), one step at a time, with a capacity of two.
+/// DEMO-1 declares `app` and asks its decider at Build: its ref holds `app`
+/// while it waits. DEMO-2, which declares `app/sub` and has no Design, is
+/// dispatched straight to Build, where its admission waits for DEMO-1,
+/// keeping its capacity (OWL-448); DEMO-3, which declares `docs`, is
+/// dispatched. DEMO-3's Build changes `app/x.md` too, which the widening
+/// after the run finds: its Verify pass passes, and its delivery waits at
+/// Verify for DEMO-1, dispatched first. DEMO-1, answered, takes the turn
+/// DEMO-3 and DEMO-2 give up and delivers; DEMO-3 waits on while DEMO-1's
+/// pull request is open, and once it is merged DEMO-3 delivers the verified
+/// commit with no second Verify pass, and DEMO-2 is admitted.
 #[test]
 fn scenario_s5_collisions_between_owlshifts_tickets() {
-    let bench = Bench::draining("maintainer");
+    let bench = Bench::build_admitting(
+        "maintainer",
+        "assignee = \"maintainer\"\nlabels = [\"agent\"]\n",
+        "max_in_flight = 2\n",
+        ", parked = \"Parked\"",
+        "admit = { label = \"agent\" }\nadmitters = [\"maintainer\"]",
+    );
     for (id, text) in [
         ("DEMO-2", "Greet in the sub-app."),
         ("DEMO-3", "Document it."),
@@ -802,18 +810,29 @@ fn scenario_s5_collisions_between_owlshifts_tickets() {
     let report = format!("{outcomes:?}\n{lines}\n{printed}");
     let events = bench.events();
 
-    // A held zone holds a dispatch: DEMO-2 waits for DEMO-1's `app`, told
-    // once, while DEMO-3 is dispatched; DEMO-2 goes once DEMO-1's pull
-    // request is merged and the slot DEMO-3 held is free.
+    // A held zone holds a Build, never a dispatch (OWL-448): DEMO-2 is
+    // dispatched, then its Build waits for DEMO-1's `app`, while DEMO-3 is
+    // dispatched; DEMO-2's Build goes once DEMO-1's pull request is merged.
     let app = json!({ "zone": "app" });
-    let told = collisions(&events, "drain");
-    assert_eq!(
-        told,
-        [("DEMO-2".to_owned(), json!(["DEMO-1"]), app.clone())],
-        "{report}"
+    assert!(collisions(&events, "drain").is_empty(), "{report}");
+    let at_build: Vec<_> = events
+        .iter()
+        .filter(|e| e.data.get("watch") == Some(&json!("waits")))
+        .filter(|e| e.data.get("stage") == Some(&json!("build")))
+        .map(|e| {
+            (
+                e.ticket.as_ref().unwrap().as_str(),
+                e.data["tickets"].clone(),
+                e.data["resource"].clone(),
+            )
+        })
+        .collect();
+    assert!(
+        at_build.contains(&("DEMO-2", json!(["DEMO-1"]), app.clone())),
+        "{at_build:?}\n{report}"
     );
     assert!(
-        lines.contains("DEMO-2 waits: DEMO-1 holds zone `app`"),
+        lines.contains("DEMO-2's Build waits: DEMO-1 holds zone `app`"),
         "{lines}"
     );
     let from_ready = |e: &Event| e.kind == EventKind::Dispatch && e.data["command"] == "drain";
@@ -822,14 +841,16 @@ fn scenario_s5_collisions_between_owlshifts_tickets() {
         .filter(|e| from_ready(e))
         .map(|e| e.ticket.as_ref().unwrap().as_str())
         .collect();
-    assert_eq!(drained, ["DEMO-1", "DEMO-3", "DEMO-2"], "{report}");
-    let dispatch_of = |id: &str| {
-        events
-            .iter()
-            .position(|e| from_ready(e) && e.ticket.as_ref().is_some_and(|t| t.as_str() == id))
+    assert_eq!(drained, ["DEMO-1", "DEMO-2", "DEMO-3"], "{report}");
+    let first_build_of = |id: &str| {
+        events.iter().position(|e| {
+            e.kind == EventKind::RunStarted
+                && e.data["role"] == json!("build")
+                && e.ticket.as_ref().is_some_and(|t| t.as_str() == id)
+        })
     };
     assert!(
-        merge_read(&events, TICKET) < dispatch_of("DEMO-2"),
+        merge_read(&events, TICKET) < first_build_of("DEMO-2"),
         "{report}"
     );
 
@@ -860,8 +881,8 @@ fn scenario_s5_collisions_between_owlshifts_tickets() {
         waited.contains(&("DEMO-3".to_owned(), json!(["DEMO-1"]), app.clone())),
         "{waited:?}\n{report}"
     );
-    // The ticket says it once, whatever the passes it waits (OWL-419); one
-    // that waits at Ready, DEMO-2, is told nothing there.
+    // The ticket says it once, whatever the passes it waits (OWL-419); a
+    // Build that waits for its admission says so (OWL-448).
     let waiting = |id: &str| -> Vec<String> {
         bench
             .comments_on(id)
@@ -877,7 +898,14 @@ fn scenario_s5_collisions_between_owlshifts_tickets() {
         shown[0]
     );
     assert!(shown[0].contains("goes on by itself"), "{}", shown[0]);
-    assert_eq!(waiting("DEMO-2"), Vec::<String>::new(), "{report}");
+    let building = waiting("DEMO-2");
+    assert_eq!(building.len(), 1, "{building:?}\n{report}");
+    assert!(
+        building[0]
+            .contains("its Build waits: DEMO-1 holds zone `app`, which its Build would take"),
+        "{}",
+        building[0]
+    );
 
     // DEMO-1 delivers first, then DEMO-3, once DEMO-1's pull request is
     // merged, with no Verify pass after its hold.
@@ -920,13 +948,15 @@ fn scenario_s5_collisions_between_owlshifts_tickets() {
     );
 }
 
-/// The `drain` = `waits` decisions of `events` for a collision: each
-/// ticket, the event's holder fields and the resource.
+/// The decisions of `events` for a Build whose admission waits for a
+/// collision (OWL-448): each ticket, the event's holder fields and the
+/// resource, a wait told again in a row once.
 fn collisions_with(events: &[Event]) -> Vec<(String, Value, Value)> {
-    events
+    let mut told: Vec<(String, Value, Value)> = events
         .iter()
-        .filter(|e| e.kind == EventKind::Decision && e.data.get("drain") == Some(&json!("waits")))
+        .filter(|e| e.kind == EventKind::Decision && e.data.get("watch") == Some(&json!("waits")))
         .filter(|e| e.data["reason"] == json!("collision"))
+        .filter(|e| e.data.get("stage") == Some(&json!("build")))
         .map(|e| {
             let holder = ["tickets", "person", "pull_request"]
                 .into_iter()
@@ -938,16 +968,19 @@ fn collisions_with(events: &[Event]) -> Vec<(String, Value, Value)> {
                 e.data["resource"].clone(),
             )
         })
-        .collect()
+        .collect();
+    told.dedup();
+    told
 }
 
 /// Scenario S5, "Collision with work in flight", its parts for a pull
-/// request and a person's ticket (OWL-410). DEMO-1 declares `app`. A
-/// person's pull request #7 changes `app/x.md`, and DEMO-9, which a person
-/// works on, carries `zone:app`: DEMO-1 waits for the pull request, then,
-/// once it is closed, for DEMO-9, then, once DEMO-9 left the working state,
-/// is dispatched and delivered. DEMO-8, worked on with neither a pull
-/// request nor a `zone:` label, is not counted, and told once.
+/// request and a person's ticket (OWL-410). DEMO-1 declares `app` and has no
+/// Design. A person's pull request #7 changes `app/x.md`, and DEMO-9, which
+/// a person works on, carries `zone:app`: DEMO-1 is dispatched, and its
+/// Build waits for the pull request, then, once it is closed, for DEMO-9
+/// (OWL-448), then, once DEMO-9 left the working state, is admitted and
+/// delivered. DEMO-8, worked on with neither a pull request nor a `zone:`
+/// label, is not counted, and told once.
 #[test]
 fn scenario_s5_a_persons_pull_request_and_ticket() {
     let bench = Bench::draining("maintainer");
@@ -1021,12 +1054,10 @@ fn scenario_s5_a_persons_pull_request_and_ticket() {
         ],
         "{report}"
     );
+    // The first wait is the dispatch's own step's, told by its event; the
+    // second watch's, told by a line too.
     assert!(
-        lines.contains("DEMO-1 waits: pull request #7 holds zone `app/x.md`"),
-        "{lines}"
-    );
-    assert!(
-        lines.contains("DEMO-1 waits: DEMO-9, which a person works on, holds zone `app`"),
+        lines.contains("DEMO-1's Build waits: DEMO-9, which a person works on, holds zone `app`"),
         "{lines}"
     );
     let unknown: Vec<&str> = events
@@ -1035,7 +1066,14 @@ fn scenario_s5_a_persons_pull_request_and_ticket() {
         .map(|e| e.ticket.as_ref().unwrap().as_str())
         .collect();
     assert_eq!(unknown, ["DEMO-8"], "{report}");
-    assert_eq!(dispatched(&events), [TICKET], "{report}");
+    // Dispatched once by the drain; its Build's step, once free, is
+    // watch's.
+    let drained: Vec<&str> = events
+        .iter()
+        .filter(|e| e.kind == EventKind::Dispatch && e.data["command"] == json!("drain"))
+        .map(|e| e.ticket.as_ref().unwrap().as_str())
+        .collect();
+    assert_eq!(drained, [TICKET], "{report}");
     let record = bench.record_of(TICKET).unwrap();
     assert!(
         record.delivery.is_some_and(|delivery| delivery.followed()),
@@ -1327,24 +1365,25 @@ fn a_do_typed_by_hand_is_resumed_by_watch_and_holds_the_slot() {
         "{lines}"
     );
     // DEMO-2 waited for the slot DEMO-1's ref held; then, DEMO-1 delivered,
-    // for DEMO-1's open pull request, which holds the whole repository: a
-    // `do` with no intake declares no zone (OWL-403).
+    // DEMO-2 was dispatched and its Build waits for DEMO-1's open pull
+    // request, which holds the whole repository: a `do` with no intake
+    // declares no zone (OWL-403, OWL-448).
     assert_eq!(
         waits(&passes[1]),
         [("DEMO-2".to_owned(), json!("slot"), json!(["DEMO-1"]))],
         "{lines}"
     );
-    assert_eq!(
-        collisions(&events, "drain"),
-        [(
+    assert!(collisions(&events, "drain").is_empty(), "{lines}");
+    assert!(
+        collisions(&events, "watch").contains(&(
             "DEMO-2".to_owned(),
             json!(["DEMO-1"]),
             json!({ "zone": "" })
-        )],
+        )),
         "{lines}"
     );
     assert!(
-        lines.contains("DEMO-2 waits: DEMO-1 holds the whole repository"),
+        lines.contains("DEMO-2's Build waits: DEMO-1 holds the whole repository"),
         "{lines}"
     );
     assert_eq!(

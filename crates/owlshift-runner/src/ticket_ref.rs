@@ -652,6 +652,10 @@ pub enum RefState {
     /// Its record reads: its state, `None` when the core accepts none from
     /// it.
     Read(Option<TicketState>),
+    /// Its record reads, its ticket at Build with nothing admitted: its
+    /// Build's admission is due, or waits for what another ticket holds
+    /// (OWL-448).
+    Unadmitted(TicketState),
     /// It cannot be read, for this reason: [`forget`] starts it over.
     Unread(String),
 }
@@ -666,7 +670,16 @@ pub fn states(git: &Git, checkout: &Path) -> Result<Vec<(TicketId, RefState)>, S
         .filter_map(|ticket| {
             let state = match read(git, checkout, &ticket) {
                 Ok(Some(stored)) => {
-                    RefState::Read(TicketState::try_from(&stored.record.state).ok())
+                    let state = TicketState::try_from(&stored.record.state).ok();
+                    let unadmitted = stored.record.held.as_ref().is_some_and(|h| !h.admitted());
+                    match state {
+                        Some(state)
+                            if unadmitted && state.status() == Status::Active(Stage::Build) =>
+                        {
+                            RefState::Unadmitted(state)
+                        }
+                        state => RefState::Read(state),
+                    }
                 }
                 Ok(None) => return None,
                 Err(why) => RefState::Unread(why),

@@ -3,7 +3,6 @@
 
 use owlshift_core::floor::{Action, HumanApproval, check_action};
 use owlshift_core::gate::{GatePolicy, PlanGate, Route};
-use owlshift_core::resource::Resource;
 use owlshift_core::review::{Standing, settle};
 use owlshift_core::roster::roster;
 use owlshift_core::schedule::{Caps, Load, Wait, ready_set};
@@ -46,7 +45,6 @@ fn a_standard_ticket_from_admission_to_merge() {
             merged: false,
         }],
         variant: Variant::Standard,
-        resources: vec![Resource::Zone("crates/owlshift-core".to_owned())],
         state: TicketState::admitted(),
         delivery_followed: false,
     };

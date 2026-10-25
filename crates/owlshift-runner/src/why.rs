@@ -162,7 +162,12 @@ pub fn phrase(wait: &Waiting) -> String {
                 list("tickets")
             };
             let resource = data.get("resource").map_or_else(String::new, resource_text);
-            format!("{holder} holds {resource}, which it would touch")
+            // A Build's admission that waits (OWL-448).
+            if data.get("stage").and_then(Value::as_str) == Some("build") {
+                format!("its Build waits: {holder} holds {resource}, which its Build would take")
+            } else {
+                format!("{holder} holds {resource}, which it would touch")
+            }
         }
         "pr_cap" => match (
             data.get("open_prs").and_then(Value::as_u64),
@@ -317,7 +322,7 @@ pub fn gather(
             Ok(refs) => {
                 for (ticket, state) in refs {
                     match state {
-                        RefState::Read(Some(state)) => {
+                        RefState::Read(Some(state)) | RefState::Unadmitted(state) => {
                             stages.insert(ticket, stage_text(state.status()));
                         }
                         RefState::Read(None) => {}
@@ -728,6 +733,19 @@ mod tests {
         assert_eq!(
             phrase(&person),
             "OWL-4, which a person works on, holds the whole repository, which it would touch"
+        );
+        // A Build's admission names its wait at Build (OWL-448).
+        let build = Waiting {
+            data: data([
+                ("tickets", json!(["OWL-2"])),
+                ("stage", json!("build")),
+                ("resource", json!({"zone": "app/a.rs"})),
+            ]),
+            ..person
+        };
+        assert_eq!(
+            phrase(&build),
+            "its Build waits: OWL-2 holds zone `app/a.rs`, which its Build would take"
         );
     }
 

@@ -175,7 +175,7 @@ use review_loop::{in_review_loop, loop_base, loop_reviews};
 pub use to_watch::Takes;
 use verify::Verified;
 
-pub(crate) use design::APPROVAL_CATEGORY;
+pub(crate) use design::{APPROVAL_CATEGORY, plan_sha256};
 pub(crate) use drain::delivery_followed;
 pub use drain::{DispatchSeen, Taken, still_ready};
 pub use intake::admission;
@@ -1439,6 +1439,10 @@ struct Prepared {
     /// carries it, as `intake`. `None` for a ticket dispatched before it was
     /// kept, which holds the whole repository.
     held: Option<TicketHeld>,
+    /// The work in flight outside Owlshift a pass handed a dispatch's step,
+    /// or a person's `continue` read for its check, kept for the Build's
+    /// admission so it is read once (OWL-448); taken by it.
+    outside: Option<Outside>,
     /// What the ticket ref kept but its runs' cost when the command took
     /// the lock, `None` without a ref: a stage step of watch's that moved it
     /// keeps what it carries in `carry.json` ([`OnDemand::stepped`],
@@ -1519,6 +1523,10 @@ struct Configured {
 /// the work outside Owlshift hold against a ticket's admission (OWL-401).
 struct Locked {
     load: Load<String>,
+    /// What each other ticket holds from its dispatch until its pull request
+    /// ends, an unreadable ref the whole repository, the work outside
+    /// Owlshift joined when it was read (OWL-403, OWL-410).
+    in_flight: Vec<InFlight<String>>,
     /// The other tickets whose ref holds the slot, each with when it was
     /// dispatched; the refs that cannot be read, which may hold it.
     holding: Vec<(String, collision::Dispatched)>,
@@ -1799,13 +1807,11 @@ impl OnDemand<'_> {
             review.build = None;
             review.last_fix = None;
         }
-        // The forge and the tracker before the project's section (OWL-401):
-        // the work outside Owlshift the admission weighs, and the forge's
-        // check of the branch's pull request.
-        let outside = match outside {
-            Some(outside) => outside,
-            None => self.outside_now(ticket)?,
-        };
+        // The forge's check of the branch's pull request before the
+        // project's section (OWL-401). The dispatch checks the caps alone:
+        // the work outside Owlshift a pass handed the step is kept for the
+        // Build's admission (OWL-448), which reads it itself otherwise.
+        p.outside = outside;
         let opened = self.dispatch_open(p)?;
         let section = self.section()?;
         // The branch starts from the base this command fetched (OWL-274):
@@ -1814,8 +1820,8 @@ impl OnDemand<'_> {
         // the dispatch, so a refused fast-forward dispatches nothing.
         self.start_from_base(p)?;
         let configured = self.dispatch_rules(p, command, sink)?;
-        let held = self.held_at_dispatch(p, &configured.rules);
-        self.admit(p, &state, held, &outside)?;
+        let held = self.held_at_dispatch(p);
+        self.admit(p, &state, held)?;
         drop(section);
         let dispatched = self.dispatched(p, command, opened, configured, sink);
         self.show_after(ticket, None, Event::Dispatched, sink);
@@ -1845,11 +1851,12 @@ impl OnDemand<'_> {
     /// the open pull requests Owlshift follows, the ticket's own included;
     /// and what each ticket holds from its dispatch until its pull request
     /// ends, an unreadable ref the whole repository, with the outside
-    /// holders joined, all closed with `named`.
+    /// holders joined when `outside` is given (the caps read none), all
+    /// closed with `named`.
     fn locked_load(
         &self,
         p: &Prepared,
-        outside: &Outside,
+        outside: Option<&Outside>,
         named: &NamedResources,
     ) -> Result<Locked, Stop> {
         let others = ticket_ref::others(&self.executor.git, &p.checkout, &p.ticket)
@@ -1859,6 +1866,7 @@ impl OnDemand<'_> {
                 open_prs: u32::from(p.stored.as_ref().is_some_and(delivery_followed)),
                 ..Load::default()
             },
+            in_flight: Vec::new(),
             holding: Vec::new(),
             unread: Vec::new(),
             kinds: HashMap::new(),
@@ -1877,7 +1885,6 @@ impl OnDemand<'_> {
                     }
                     if held::holds(stored) {
                         locked
-                            .load
                             .in_flight
                             .push(held::in_flight(ticket, stored, named));
                     }
@@ -1885,17 +1892,19 @@ impl OnDemand<'_> {
                 Err(_) => {
                     locked.load.slot_held_by.push(id.clone());
                     locked.unread.push(id);
-                    locked.load.in_flight.push(held::unread(ticket, named));
+                    locked.in_flight.push(held::unread(ticket, named));
                 }
             }
         }
-        let refs = others
-            .iter()
-            .map(|(ticket, read)| (ticket, read.as_ref().ok()))
-            .chain([(&p.ticket, None)]);
-        let holders = outside.holders(refs, named);
-        holders.join(&mut locked.load.in_flight, named);
-        locked.kinds = holders.kinds;
+        if let Some(outside) = outside {
+            let refs = others
+                .iter()
+                .map(|(ticket, read)| (ticket, read.as_ref().ok()))
+                .chain([(&p.ticket, None)]);
+            let holders = outside.holders(refs, named);
+            holders.join(&mut locked.in_flight, named);
+            locked.kinds = holders.kinds;
+        }
         Ok(locked)
     }
 
@@ -1936,24 +1945,18 @@ impl OnDemand<'_> {
     /// The admission of `p`'s dispatch from Ready (OWL-401; architecture
     /// section 5, "Admission, one transaction"), in the project's section
     /// its command holds: the project's other ticket refs read again
-    /// ([`Self::locked_load`]), the open pull requests' cap, the project's
-    /// capacity and the collision rule checked against them and `outside`
-    /// ([`schedule::admission`]), with the named resources of the operator's
-    /// project file, as the drain's pass weighs them; then the ticket ref
-    /// written at `state`, the first stage of its variant, holding `held`
-    /// from its dispatch, through its run file. [`Stop::Waits`] when it must
-    /// wait, nothing written.
-    fn admit(
-        &self,
-        p: &mut Prepared,
-        state: &TicketState,
-        held: TicketHeld,
-        outside: &Outside,
-    ) -> Result<(), Stop> {
+    /// ([`Self::locked_load`]), the open pull requests' cap and the
+    /// project's capacity checked against them ([`schedule::admission`]);
+    /// then the ticket ref written at `state`, the first stage of its
+    /// variant, with `held`, its dispatch time and nothing admitted, through
+    /// its run file. [`Stop::Waits`] when it must wait, nothing written. What
+    /// is held is its Build's admission's to check (OWL-448,
+    /// [`Self::admit_build`]).
+    fn admit(&self, p: &mut Prepared, state: &TicketState, held: TicketHeld) -> Result<(), Stop> {
         let named = self.config.stack.named_resources().unwrap_or_default();
-        let locked = self.locked_load(p, outside, &named)?;
-        let own = held::of(&p.ticket, Some(&held), false, &named);
-        if let Some(wait) = schedule::admission(&own, self.admission_caps(), &locked.load) {
+        let locked = self.locked_load(p, None, &named)?;
+        let ticket = p.ticket.as_str().to_owned();
+        if let Some(wait) = schedule::admission(&ticket, self.admission_caps(), &locked.load) {
             return Err(self.waits(&p.ticket, &wait, &locked));
         }
         p.held = Some(held);
@@ -1970,14 +1973,17 @@ impl OnDemand<'_> {
     /// nothing held conflicting with what it holds ([`collision`]), as watch
     /// checks its next stage step. [`Stop::Waits`] otherwise, nothing run.
     /// A review loop's ticket, whose pull request is open, needs neither.
-    fn admit_stage(&self, p: &Prepared) -> Result<(), Stop> {
+    /// The work outside Owlshift it read is kept for its Build's admission
+    /// (OWL-448).
+    fn admit_stage(&self, p: &mut Prepared) -> Result<(), Stop> {
         if in_review_loop(p) {
             return Ok(());
         }
         let outside = self.outside_now(&p.ticket)?;
         let named = self.config.stack.named_resources().unwrap_or_default();
         let _section = self.section()?;
-        let locked = self.locked_load(p, &outside, &named)?;
+        let locked = self.locked_load(p, Some(&outside), &named)?;
+        p.outside = Some(outside);
         let own = held::of(
             &p.ticket,
             p.held.as_ref(),
@@ -1990,7 +1996,7 @@ impl OnDemand<'_> {
         let wait = match schedule::slot_turn(&holding, &locked.unread, capacity) {
             Turn::Holders(holders) if !holders.contains(&own.id) => Some(Wait::Slot(holders)),
             Turn::Unknown(unread) => Some(Wait::Slot(unread)),
-            Turn::Holders(_) => collision(&own, &locked.load.in_flight).map(Wait::Collision),
+            Turn::Holders(_) => collision(&own, &locked.in_flight).map(Wait::Collision),
         };
         match wait {
             Some(wait) => Err(self.waits(&p.ticket, &wait, &locked)),
@@ -1998,25 +2004,112 @@ impl OnDemand<'_> {
         }
     }
 
-    /// What the ticket holds from this dispatch (OWL-403; architecture
-    /// section 5, "Kept in the ticket ref"): the zones and resources its
-    /// intake record and labels declare ([`held_for`], at the configuring
-    /// commit's rules), the whole repository without a record, dispatched
-    /// now. A ticket that still holds from an earlier dispatch, one
-    /// restarted while in flight, keeps what it held and its dispatch time:
-    /// the held set never shrinks while the ticket holds.
-    fn held_at_dispatch(&self, p: &Prepared, rules: &ProjectRules) -> TicketHeld {
-        let Held { zones, resources } = match &p.intake {
-            Some(record) => held_for(&p.found, &record.zones, &record.resources, rules),
-            None => Held::default(),
-        };
-        let mut next = TicketHeld::dispatched(zones, resources, Some((self.clock)()));
-        if let Some(stored) = p.stored.as_ref().filter(|stored| held::holds(stored)) {
-            let earlier = stored.record.held.clone().unwrap_or_else(held::unrecorded);
-            next.join(&earlier);
-            next.dispatched_at = earlier.dispatched_at;
+    /// The Build's admission (OWL-448; architecture section 5, "Resources
+    /// admitted at Build"), before the first Build-role run of a step into
+    /// Build, whatever command runs it: what [`held::at_build`] makes due,
+    /// from the plan the Build follows, the ticket's intake record and its
+    /// labels, with the named resources of the operator's project file, as
+    /// watch predicts it. What it adds is checked in one of the project's
+    /// sections against the other ticket refs read again and the work
+    /// outside Owlshift (the one kept in `p`, or read now), whatever a
+    /// holder's dispatch time ([`collision`], the ticket weighed
+    /// [`collision::Dispatched::Now`]), then `held.json` is written in the
+    /// same section. A conflict stops with [`Stop::Waits`], nothing written:
+    /// the ticket waits at Build, keeping its capacity, and a step of
+    /// watch's records the wait as watch does. A review loop's ticket, whose
+    /// pull request is open, holds already.
+    fn admit_build(
+        &self,
+        p: &mut Prepared,
+        state: &TicketState,
+        sink: &mut EventSink<'_>,
+    ) -> Result<(), Stop> {
+        if in_review_loop(p) {
+            return Ok(());
         }
-        next
+        let Some(before) = p.held.clone() else {
+            return Ok(());
+        };
+        let named = self.config.stack.named_resources().unwrap_or_default();
+        let labels = brief_zones(p.found.labels.iter().map(String::as_str)).zones;
+        let plan = design::given_plan(p).map(|given| {
+            let hash = design::plan_sha256(&given.plan);
+            (given.plan, hash)
+        });
+        let Some(next) = held::at_build(
+            Some(&before),
+            plan.as_ref().map(|(plan, hash)| (plan, hash.as_str())),
+            p.intake.as_ref(),
+            &labels,
+            &named,
+            (self.clock)(),
+        ) else {
+            return Ok(());
+        };
+        let added = held::added(&p.ticket, &before, &next, &named);
+        let outside = match (added.is_empty(), p.outside.take()) {
+            (true, _) => None,
+            (false, Some(outside)) => Some(outside),
+            (false, None) => Some(self.outside_now(&p.ticket)?),
+        };
+        let _section = self.section()?;
+        if let Some(outside) = outside {
+            let locked = self.locked_load(p, Some(&outside), &named)?;
+            let weighed = InFlight {
+                id: p.ticket.as_str().to_owned(),
+                dispatched: collision::Dispatched::Now,
+                delivered: false,
+                held: added,
+            };
+            if let Some(found) = collision(&weighed, &locked.in_flight) {
+                let holder = in_flight::named(&locked.kinds, &found.holder);
+                if p.stepping {
+                    let mut event = data([
+                        ("watch", json!("waits")),
+                        ("reason", json!("collision")),
+                        ("stage", json!("build")),
+                        ("resource", held::resource_data(&found.resource)),
+                    ]);
+                    for (key, value) in holder.data() {
+                        event.insert(key.to_owned(), value);
+                    }
+                    sink.emit(&p.ticket, None, EventKind::Decision, event);
+                }
+                return Err(Stop::Waits {
+                    ticket: p.ticket.clone(),
+                    said: format!(
+                        "{holder} holds {}, which its Build would take: its Build is admitted \
+                         once {holder} no longer holds it",
+                        found.resource
+                    ),
+                    cap: None,
+                });
+            }
+        }
+        p.held = Some(next);
+        self.keep(p, state)
+    }
+
+    /// What the ticket holds from this dispatch (OWL-448; architecture
+    /// section 5, "Resources admitted at Build"): nothing, dispatched now,
+    /// until its Build's admission ([`Self::admit_build`]). A ticket that
+    /// still holds from an earlier dispatch, one restarted while in flight,
+    /// keeps what it held and its dispatch time, the whole repository for a
+    /// ref from before P6: the held set never shrinks while the ticket
+    /// holds. A new dispatch clears its verified mark.
+    fn held_at_dispatch(&self, p: &Prepared) -> TicketHeld {
+        match p.stored.as_ref().filter(|stored| held::holds(stored)) {
+            Some(stored) => {
+                let mut earlier = stored
+                    .record
+                    .held
+                    .clone()
+                    .unwrap_or_else(TicketHeld::unrecorded);
+                earlier.verified = None;
+                earlier
+            }
+            None => TicketHeld::dispatched((self.clock)()),
+        }
     }
 
     /// `owlshift continue`: picks `ticket` up where its ticket ref left it. A
@@ -2233,7 +2326,7 @@ impl OnDemand<'_> {
         // A person's `continue` makes the drain's check before the stage runs
         // (OWL-401): watch checked its own steps from its pass's reads.
         if !p.stepping {
-            self.admit_stage(&p)?;
+            self.admit_stage(&mut p)?;
         }
         // A stage's run may ask a new round, which goes to the decider now.
         p.current()?;
@@ -2484,6 +2577,7 @@ impl OnDemand<'_> {
             held: stored
                 .as_ref()
                 .and_then(|stored| stored.record.held.clone()),
+            outside: None,
             started: stored.as_ref().map(Stored::progress),
             stored,
             heeded: false,
@@ -2962,6 +3056,10 @@ impl OnDemand<'_> {
     ) -> Result<Built, Stop> {
         let current = person(p.current()?, &p.found);
         self.keep(p, &state)?;
+        // The Build's admission comes first (OWL-448), before the base's
+        // check and any rebase run it starts, whose widening it then
+        // covers: a Build held for its base keeps what it was admitted.
+        self.admit_build(p, &state, sink)?;
         let confirmation = self.config.pipeline.findings();
         let mut gathered = Gathered::default();
         // The delivery's notes and follow-ups gathered so far, kept with the
@@ -3422,7 +3520,7 @@ impl OnDemand<'_> {
             .as_ref()
             .and_then(|review| review.build.as_ref())
             .map(|built| built.commit.clone());
-        p.held.get_or_insert_with(held::unrecorded).verified = commit.clone();
+        p.held.get_or_insert_with(TicketHeld::unrecorded).verified = commit.clone();
         let questions = p.questions();
         if let Err(e) = self.store(p, state, questions) {
             return refused("keeping a delivery held back in the ticket's ref", e);
@@ -8192,12 +8290,18 @@ impl Kept<'_> {
     }
 }
 
-/// The zones and resources a brief of `p`'s ticket gives (OWL-402): what
-/// the ticket holds ([`held_for`]) once intake kept its record and `rules`
-/// were read from a project file; otherwise its `zone:` labels' zones and
-/// no resource.
+/// The zones and resources a brief of `p`'s ticket gives (OWL-402), once
+/// intake kept its record and `rules` were read from a project file: what
+/// its Build's admission admitted once it did, empty zones for the whole
+/// repository (OWL-448), and before, what intake and the labels declare
+/// ([`held_for`]); otherwise its `zone:` labels' zones and no resource.
 fn held_by(p: &Prepared, rules: &ProjectRules) -> (Vec<String>, Vec<String>) {
+    let admitted = p.held.as_ref().filter(|held| held.admitted());
     match (&p.intake, rules.resources()) {
+        // From its Build's admission on, what it was admitted (OWL-448).
+        (Some(_), Some(_)) if let Some(held) = admitted => {
+            (held.zones.clone(), held.resources.clone())
+        }
         (Some(record), Some(_)) => {
             let Held { zones, resources } =
                 held_for(&p.found, &record.zones, &record.resources, rules);

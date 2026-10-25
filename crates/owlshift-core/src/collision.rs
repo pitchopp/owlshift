@@ -4,7 +4,9 @@
 //! in-flight set as the caller read it. The runner reads what each ticket
 //! holds from its ticket ref and closes it with the project's named
 //! resources ([`resource::closed`](crate::resource::closed)); this module
-//! only weighs the sets.
+//! only weighs the sets. Since OWL-448 a ticket holds nothing before its
+//! Build's admission, which weighs it [`Dispatched::Now`]; the dispatch
+//! order settles the checks of admitted tickets before each step.
 
 use std::cmp::Ordering;
 
@@ -20,11 +22,9 @@ pub enum Dispatched {
     Unrecorded,
     /// At this time, in milliseconds since the Unix epoch.
     At(i64),
-    /// Dispatched earlier in the pass the ready set is computed for, the
-    /// `n`th (OWL-401): after every holder read, before the ticket weighed
-    /// now, whatever their identifiers.
-    Pass(u32),
-    /// Not yet: the ticket a dispatch from Ready weighs, after every holder.
+    /// After every holder: the ticket a Build's admission weighs (OWL-448),
+    /// which waits for anything held, whatever the holder's dispatch time,
+    /// so that an admitted ticket never waits for one admitted after it.
     Now,
 }
 
@@ -132,13 +132,13 @@ mod tests {
         let twin = flight("OWL-10", Dispatched::At(10), false, &[zone("app")]);
         assert!(collision(&early, std::slice::from_ref(&twin)).is_none());
         assert!(collision(&twin, std::slice::from_ref(&early)).is_some());
-        // A ref from before P6 comes before any kept time; a dispatch from
-        // Ready after every holder.
+        // A ref from before P6 comes before any kept time; a Build's
+        // admission after every holder, even one dispatched later (OWL-448).
         let old = flight("OWL-9", Dispatched::Unrecorded, false, &[zone("")]);
         assert!(collision(&old, std::slice::from_ref(&early)).is_none());
         assert!(collision(&early, std::slice::from_ref(&old)).is_some());
-        let ready = flight("OWL-3", Dispatched::Now, false, &[zone("app")]);
-        assert!(collision(&ready, std::slice::from_ref(&late)).is_some());
+        let admitting = flight("OWL-3", Dispatched::Now, false, &[zone("app")]);
+        assert!(collision(&admitting, std::slice::from_ref(&late)).is_some());
     }
 
     #[test]

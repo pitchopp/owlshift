@@ -2451,6 +2451,18 @@ fn drain_slot_check(system: &dyn System, config: &Effective) -> Option<Check> {
         .into_iter()
         .filter_map(|(ticket, state)| {
             let (what, clear) = match state {
+                // Its Build waits for its admission (OWL-448): `why` names
+                // what holds its resources.
+                RefState::Unadmitted(_) => (
+                    format!(
+                        "{ticket} at Build, waiting for its resources (`owlshift why {ticket}` \
+                         names what holds them)"
+                    ),
+                    format!(
+                        "`owlshift continue {ticket}` to finish its Build or `owlshift forget \
+                         {ticket}` to start it over"
+                    ),
+                ),
                 RefState::Read(Some(state)) if holds_slot(&state) => {
                     let stage = state.stage();
                     let again = if stage == Stage::Build {
@@ -4696,6 +4708,12 @@ states = { ready = "Todo", working = "Doing", needs_input = "Asked", review = "R
             (id("OWL-80"), RefState::Read(None)),
             at("OWL-173", Stage::Build),
         ];
+        // OWL-448: a Build waiting for its admission is named as such.
+        let mut refs = refs;
+        let (owl_174, RefState::Read(Some(building))) = at("OWL-174", Stage::Build) else {
+            unreachable!("a ref at Build")
+        };
+        refs.push((owl_174, RefState::Unadmitted(building)));
         let report = run(&ready().ticket_refs_are(Ok(refs.clone())), &config);
         assert!(report.ready(), "{report}");
         let warned = line(&report, "drain slot");
@@ -4704,32 +4722,34 @@ states = { ready = "Todo", working = "Doing", needs_input = "Asked", review = "R
         assert_eq!(
             warned.detail,
             "held by OWL-9, whose ticket ref cannot be read; OWL-80, whose state does not read; \
-             OWL-173 at Build; OWL-175 at Verify"
+             OWL-173 at Build; OWL-174 at Build, waiting for its resources (`owlshift why \
+             OWL-174` names what holds them); OWL-175 at Verify"
         );
         let why = warned.why.as_deref().unwrap();
         for fix in [
             "`owlshift forget OWL-9` to start it over",
             "`owlshift forget OWL-80` to start it over",
             "`owlshift continue OWL-173` to finish its Build or `owlshift forget OWL-173`",
+            "`owlshift continue OWL-174` to finish its Build or `owlshift forget OWL-174`",
             "`owlshift do OWL-175` to run it again or `owlshift forget OWL-175`",
         ] {
             assert!(why.contains(fix), "{fix}: {why}");
         }
         assert!(!why.contains("not a commit"), "{why}");
 
-        // OWL-401: under a capacity of 5, four holders are no warning.
+        // OWL-401: under a capacity of 6, five holders are no warning.
         let mut config = config;
         if let FileState::Loaded {
             config: project, ..
         } = &mut config.project
         {
-            project.policy.max_in_flight = Some(5);
+            project.policy.max_in_flight = Some(6);
         }
         let report = run(&ready().ticket_refs_are(Ok(refs)), &config);
         let found = line(&report, "drain slot");
         assert_eq!(found.status, Status::Ok);
         assert!(
-            found.detail.starts_with("4 of 5 held, by OWL-9"),
+            found.detail.starts_with("5 of 6 held, by OWL-9"),
             "{found:?}"
         );
     }

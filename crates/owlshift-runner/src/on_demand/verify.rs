@@ -784,7 +784,7 @@ mod tests {
         passed.head = Some(commit.clone());
         record.review = Some(review(vec![passed]));
         assert!(!delivers_without_pass(&state, &record), "no mark");
-        let mut held = TicketHeld::dispatched(Vec::new(), Vec::new(), None);
+        let mut held = TicketHeld::unrecorded();
         held.verified = Some(commit);
         record.held = Some(held);
         assert!(delivers_without_pass(&state, &record));

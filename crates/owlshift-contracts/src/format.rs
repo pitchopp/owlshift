@@ -119,8 +119,11 @@ pub const COST_FORMAT: u32 = 1;
 /// (`session.json` on a ticket ref, OWL-394).
 pub const SESSION_FORMAT: u32 = 1;
 /// The format version of what a ticket holds against the project's other
-/// tickets (`held.json` on a ticket ref, OWL-403).
-pub const HELD_FORMAT: u32 = 1;
+/// tickets (`held.json` on a ticket ref, OWL-403). Format 2 adds the
+/// admission's time and plan (OWL-448): a dispatch admits nothing, the
+/// Build's admission does; format 1 is still read, as admitted at its
+/// dispatch.
+pub const HELD_FORMAT: u32 = 2;
 /// The format version of a step's envelope, the hidden argument of the
 /// child `owlshift continue` (OWL-399).
 pub const STEP_ENVELOPE_FORMAT: u32 = 1;
