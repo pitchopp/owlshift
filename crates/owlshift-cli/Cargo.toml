@@ -18,6 +18,8 @@ owlshift-adapters.workspace = true
 owlshift-contracts.workspace = true
 owlshift-platform.workspace = true
 clap.workspace = true
+# The daemon's record and the stop request say when (OWL-435).
+jiff.workspace = true
 # Hidden input for the secrets `owlshift init` asks for on a terminal.
 rpassword.workspace = true
 

@@ -473,9 +473,64 @@ pub(crate) fn lock_file_within(
     wait: Duration,
     poll: Duration,
 ) -> io::Result<Option<File>> {
+    retry_within(wait, poll, || try_lock_file(path))
+}
+
+/// [`lock_file_within`], the lock taken shared (OWL-435): several holders
+/// may share it, none while one holds it alone.
+pub(crate) fn lock_file_shared_within(
+    path: &Path,
+    wait: Duration,
+    poll: Duration,
+) -> io::Result<Option<File>> {
+    retry_within(wait, poll, || {
+        let file = open_lock_file(path)?;
+        match file.try_lock_shared() {
+            Ok(()) => Ok(Some(file)),
+            Err(TryLockError::WouldBlock) => Ok(None),
+            Err(TryLockError::Error(error)) => Err(error),
+        }
+    })
+}
+
+/// Whether a holder has the lock of the file at `path` to itself now
+/// (OWL-435): one shared try, let go at once, which a shared holder does not
+/// fail. No file is no holder.
+pub(crate) fn held_alone(path: &Path) -> io::Result<bool> {
+    let file = match OpenOptions::new().write(true).open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error),
+    };
+    match file.try_lock_shared() {
+        Ok(()) => Ok(false),
+        Err(TryLockError::WouldBlock) => Ok(true),
+        Err(TryLockError::Error(error)) => Err(error),
+    }
+}
+
+/// Opens the lock file at `path`, creating it and its folder.
+fn open_lock_file(path: &Path) -> io::Result<File> {
+    if let Some(dir) = path.parent() {
+        fs::create_dir_all(dir)?;
+    }
+    OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(false)
+        .open(path)
+}
+
+/// Calls `try_once` again every `poll` until it gives a file or `wait` has
+/// passed.
+fn retry_within(
+    wait: Duration,
+    poll: Duration,
+    mut try_once: impl FnMut() -> io::Result<Option<File>>,
+) -> io::Result<Option<File>> {
     let started = Instant::now();
     loop {
-        if let Some(file) = try_lock_file(path)? {
+        if let Some(file) = try_once()? {
             return Ok(Some(file));
         }
         let waited = started.elapsed();

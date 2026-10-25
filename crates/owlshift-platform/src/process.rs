@@ -84,6 +84,39 @@ impl fmt::Display for RunError {
 
 impl std::error::Error for RunError {}
 
+/// This process's own binary, as a process it starts runs it (OWL-435,
+/// architecture section 5, "An upgrade"): the binary resolved when this
+/// process started, so that a binary replaced on disk since then is not the
+/// one a later spawn runs, where the system allows it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OwnProgram {
+    /// What to spawn: on Linux `/proc/self/exe`, which the kernel resolves to
+    /// the very file this process runs, even once removed or replaced on
+    /// disk (checked on 2026-10-25 in debian:12); elsewhere [`Self::path`].
+    pub spawn: PathBuf,
+    /// Where the binary was when this process started, for a person to read.
+    pub path: PathBuf,
+}
+
+/// [`OwnProgram`] of this process.
+pub fn own_program() -> io::Result<OwnProgram> {
+    let path = std::env::current_exe()?;
+    #[cfg(target_os = "linux")]
+    {
+        let pinned = PathBuf::from("/proc/self/exe");
+        if pinned.exists() {
+            return Ok(OwnProgram {
+                spawn: pinned,
+                path,
+            });
+        }
+    }
+    Ok(OwnProgram {
+        spawn: path.clone(),
+        path,
+    })
+}
+
 /// Finds a program on the `PATH`, with the `PATHEXT` extensions on Windows,
 /// so an npm `.cmd` shim is found too.
 pub fn find_executable(name: &str) -> Option<PathBuf> {
@@ -1194,5 +1227,31 @@ mod tests {
             "args: auth status"
         );
         assert_eq!(String::from_utf8_lossy(&captured.stderr).trim(), "oops");
+    }
+
+    /// OWL-435: on Linux a process spawns `/proc/self/exe`, which runs the
+    /// file it started from even once that file was removed and another put
+    /// in its place, as a package manager's upgrade does.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn own_program_spawns_the_binary_this_process_started_from() {
+        let own = own_program().unwrap();
+        assert_eq!(own.spawn, PathBuf::from("/proc/self/exe"));
+        assert_eq!(own.path, std::env::current_exe().unwrap());
+
+        let dir = tempfile::tempdir().unwrap();
+        let shell = dir.path().join("sh");
+        std::fs::copy("/bin/sh", &shell).unwrap();
+        let output = Command::new(&shell)
+            .arg("-c")
+            .arg(r#"rm -- "$0" && cp /bin/true "$0" && exec /proc/self/exe -c 'echo pinned'"#)
+            .arg(&shell)
+            .output()
+            .unwrap();
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout),
+            "pinned\n",
+            "{output:?}"
+        );
     }
 }

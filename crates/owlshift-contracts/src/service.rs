@@ -5,12 +5,96 @@
 //! start` under a lock of its own and replaced whole; and the project file a
 //! served project runs on, `served.json` in the project's folder
 //! ([`ServedConfig`]), read from its default branch and kept by its watch.
+//!
+//! And the daemon's own (OWL-435, "A supervisor"): the record of the daemon
+//! that runs, `<data>/service/daemon.json` ([`DaemonRecord`]); and the
+//! requests the service's files carry, a stop or a pause, each one line of
+//! JSON saying who asked, when and why ([`Request`]).
 
 use jiff::Timestamp;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-use crate::format::{self, ContractError, Format, SERVED_CONFIG_FORMAT, SERVED_PROJECTS_FORMAT};
+use crate::format::{
+    self, ContractError, DAEMON_FORMAT, Format, SERVED_CONFIG_FORMAT, SERVED_PROJECTS_FORMAT,
+};
+
+/// Who asks in a [`Request`] the daemon writes: a project's pause after a
+/// watch that could not start, the stop of a watch it no longer serves, or
+/// the stop it relays.
+pub const BY_DAEMON: &str = "owlshift daemon";
+
+/// Who asks in a [`Request`] `owlshift stop` writes.
+pub const BY_STOP: &str = "owlshift stop";
+
+/// The daemon that runs on a data directory, written once it holds the
+/// directory's daemon lock and removed when it ends: a record left by a
+/// daemon killed outright names a process that no longer holds the lock.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+#[schemars(title = "Owlshift daemon")]
+pub struct DaemonRecord {
+    pub format: Format<DAEMON_FORMAT>,
+    /// Its process id.
+    pub pid: u32,
+    /// The version of its binary.
+    pub version: String,
+    /// The binary it runs and starts every watch from, resolved when it
+    /// started.
+    pub binary: String,
+    /// When it started.
+    pub since: Timestamp,
+}
+
+impl DaemonRecord {
+    const CONTRACT: &str = "daemon record";
+
+    pub fn parse(input: &str) -> Result<Self, ContractError> {
+        format::parse_json(Self::CONTRACT, DAEMON_FORMAT, input)
+    }
+
+    pub fn render(&self) -> String {
+        format::render_json(self)
+    }
+}
+
+/// A request one of the service's files holds: `<data>/service/stop`,
+/// `<project data>/stop` or `<project data>/pause`. The file asks by
+/// standing; what it holds says who asked, when and why, read leniently, so
+/// a file another writer left still asks.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[schemars(title = "Owlshift service request")]
+pub struct Request {
+    /// Who asked: a command, such as [`BY_STOP`] or [`BY_DAEMON`].
+    pub by: String,
+    /// When.
+    pub at: Timestamp,
+    /// Why, in words for a person.
+    pub why: String,
+}
+
+impl Request {
+    /// A request made now by `by`, for `why`.
+    pub fn new(by: &str, at: Timestamp, why: impl Into<String>) -> Self {
+        Self {
+            by: by.to_owned(),
+            at,
+            why: why.into(),
+        }
+    }
+
+    /// The request a file holds; `None` when it does not read as one.
+    pub fn parse(input: &str) -> Option<Self> {
+        serde_json::from_str(input.trim()).ok()
+    }
+
+    /// One line of JSON, with its newline.
+    pub fn render(&self) -> String {
+        let mut line = serde_json::to_string(self).expect("a request always serializes to JSON");
+        line.push('\n');
+        line
+    }
+}
 
 /// The projects this machine serves.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -205,5 +289,36 @@ mod tests {
             ServedConfig::parse(&newer),
             Err(ContractError::NewerFormat { found: 2, .. })
         ));
+    }
+
+    #[test]
+    fn a_daemon_record_reads_back_and_a_newer_one_is_refused() {
+        let record = DaemonRecord {
+            format: Format,
+            pid: 4242,
+            version: "0.4.0".to_owned(),
+            binary: "/opt/homebrew/bin/owlshift".to_owned(),
+            since: at("2026-10-25T08:00:00Z"),
+        };
+        let text = record.render();
+        assert_eq!(DaemonRecord::parse(&text).unwrap(), record);
+        let newer = text.replace("\"format\": 1", "\"format\": 2");
+        assert!(matches!(
+            DaemonRecord::parse(&newer),
+            Err(ContractError::NewerFormat { found: 2, .. })
+        ));
+    }
+
+    #[test]
+    fn a_request_is_one_line_read_leniently() {
+        let request = Request::new(BY_STOP, at("2026-10-25T08:00:00Z"), "asked");
+        let line = request.render();
+        assert_eq!(line.lines().count(), 1);
+        assert!(line.ends_with('\n'));
+        assert_eq!(Request::parse(&line), Some(request.clone()));
+        // A field another writer added does not keep it from reading.
+        let more = line.replace("}\n", ",\"host\":\"mac\"}\n");
+        assert_eq!(Request::parse(&more), Some(request));
+        assert_eq!(Request::parse("stop"), None);
     }
 }

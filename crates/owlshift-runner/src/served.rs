@@ -33,6 +33,7 @@ use crate::config::{Effective, FileState, PROJECT_FILE};
 use crate::events::{EventSink, data};
 use crate::executor::Git;
 use crate::project::{self, ProjectDirs, ProjectLock};
+use crate::refusal::Refusal;
 use crate::{notify, on_demand, rules, step, watch};
 
 /// How long a change of the served projects waits for their lock.
@@ -212,6 +213,56 @@ impl Served {
             dirs: ProjectDirs::new(data, repo),
         })
     }
+}
+
+/// How long the daemon, or a watch typed in a terminal, tries a project's
+/// served lock: a probe holds it for an instant ([`served_now`]).
+const SERVED_LOCK_WAIT: Duration = Duration::from_millis(250);
+
+/// How often that wait tries it.
+const SERVED_LOCK_POLL: Duration = Duration::from_millis(50);
+
+/// The served lock of a project (OWL-435, architecture section 5, "The
+/// served lock"): `served.lock` in its folder, held by the daemon alone for
+/// as long as it serves the project, across its watch's restarts, and
+/// shared by a watch typed in a terminal for as long as it runs. The kernel
+/// drops a dead holder's lock, and the file is opened close-on-exec, so no
+/// child inherits it.
+pub fn served_lock_file(dirs: &ProjectDirs) -> PathBuf {
+    dirs.root().join("served.lock")
+}
+
+/// A hold on a project's served lock, alone or shared, let go when dropped.
+#[derive(Debug)]
+pub struct ServedLock {
+    _file: fs::File,
+}
+
+/// Takes the served lock of `dirs`'s project for the daemon alone, creating
+/// the project's folder and the file when needed: `None` when a watch typed
+/// in a terminal shares it, or another daemon holds it.
+pub fn take_served(dirs: &ProjectDirs) -> io::Result<Option<ServedLock>> {
+    let path = served_lock_file(dirs);
+    fs::create_dir_all(dirs.root())?;
+    let file = project::lock_file_within(&path, SERVED_LOCK_WAIT, SERVED_LOCK_POLL)?;
+    Ok(file.map(|file| ServedLock { _file: file }))
+}
+
+/// Shares the served lock of `dirs`'s project, for a watch typed in a
+/// terminal: `None` when the daemon serves the project.
+pub fn share_served(dirs: &ProjectDirs) -> io::Result<Option<ServedLock>> {
+    let file = project::lock_file_shared_within(
+        &served_lock_file(dirs),
+        SERVED_LOCK_WAIT,
+        SERVED_LOCK_POLL,
+    )?;
+    Ok(file.map(|file| ServedLock { _file: file }))
+}
+
+/// Whether the daemon serves `dirs`'s project now: one try, never failed by a
+/// watch typed in a terminal.
+pub fn served_now(dirs: &ProjectDirs) -> io::Result<bool> {
+    project::held_alone(&served_lock_file(dirs))
 }
 
 /// The record of the project file a served project runs on, in its folder.
@@ -457,23 +508,28 @@ pub fn report_refused(
 /// text kept. A fetch that fails leaves the text kept before, with a
 /// warning; with none kept, the project is not served and the record says
 /// why.
+///
+/// A refusal is lasting (OWL-435, [`Refusal`]) unless a restart may mend
+/// it: the project's lock held by another command, or, with no file ever
+/// kept and none refused, a default branch that could not be read.
 pub fn prepare(
     git: &Git,
     served: &Served,
     accept: &dyn Fn(&str) -> Result<(), String>,
     notifier: Option<&dyn Notifier>,
     sink: &mut EventSink<'_>,
-) -> Result<KeptFile, String> {
+) -> Result<KeptFile, Refusal> {
     let lock = served
         .dirs
         .lock()
-        .map_err(|e| format!("the project's lock: {e}"))?
+        .map_err(|e| Refusal::passing(format!("the project's lock: {e}")))?
         .ok_or_else(|| {
-            format!(
+            Refusal::passing(format!(
                 "another command held the lock of {} for a minute",
                 served.repo
-            )
+            ))
         })?;
+    let mut unread = None;
     match refresh(git, served, &lock, accept, true, Timestamp::now()) {
         Ok(Refresh::Refused {
             first: true,
@@ -482,14 +538,29 @@ pub fn prepare(
             report_refused(notifier, sink, served, &reason);
         }
         Ok(_) => {}
-        Err(error) => fetch_failed(sink, &error),
+        Err(error) => {
+            fetch_failed(sink, &error);
+            unread = Some(error);
+        }
     }
     drop(lock);
     let record = read_record(&served.dirs)?;
-    record
-        .as_ref()
-        .and_then(|record| record.kept.clone())
-        .ok_or_else(|| not_served(&served.repo, record.as_ref()))
+    if let Some(kept) = record.as_ref().and_then(|record| record.kept.clone()) {
+        return Ok(kept);
+    }
+    match unread {
+        Some(error)
+            if record
+                .as_ref()
+                .is_none_or(|record| record.refused.is_none()) =>
+        {
+            Err(Refusal::passing(format!(
+                "{} is not served yet: its default branch could not be read ({error})",
+                served.repo
+            )))
+        }
+        _ => Err(not_served(&served.repo, record.as_ref()).into()),
+    }
 }
 
 fn fetch_failed(sink: &mut EventSink<'_>, error: &str) {

@@ -261,7 +261,11 @@ fn a_project_never_accepted_is_not_served() {
     let mut sink = EventSink::new("acme/web", EventLog::in_dir(&bench.data), &mut out);
     let served = bench.served();
     let accept = |text: &str| served::accept(&Bench::repo(), text, None);
-    let error = served::prepare(&bench.git, &served, &accept, Some(&shown), &mut sink).unwrap_err();
+    let refusal =
+        served::prepare(&bench.git, &served, &accept, Some(&shown), &mut sink).unwrap_err();
+    // A merge mends it, not a restart (OWL-435).
+    assert!(refusal.lasting, "{refusal}");
+    let error = refusal.message;
     assert!(
         error.starts_with("acme/web is not served: owlshift.toml at origin/main ("),
         "{error}"
@@ -276,6 +280,38 @@ fn a_project_never_accepted_is_not_served() {
     assert_eq!(shown.0.borrow().len(), 1);
     assert!(bench.refused().is_some());
     assert_eq!(bench.kept(), None);
+}
+
+/// OWL-435: a default branch that cannot be read, with no file ever kept,
+/// is a refusal a restart may mend, as when the service starts before the
+/// network: nothing is recorded as refused, and nobody is told.
+#[test]
+fn a_default_branch_never_read_is_a_passing_refusal() {
+    let bench = Bench::new(&project("make check"));
+    let shown = Shown::default();
+    let mut out = Vec::new();
+    let mut sink = EventSink::new("acme/web", EventLog::in_dir(&bench.data), &mut out);
+    let served = Served {
+        remote_url: bench
+            .data
+            .join("no-such-remote")
+            .to_str()
+            .unwrap()
+            .to_owned(),
+        ..bench.served()
+    };
+    let accept = |text: &str| served::accept(&Bench::repo(), text, None);
+    let refusal =
+        served::prepare(&bench.git, &served, &accept, Some(&shown), &mut sink).unwrap_err();
+    assert!(!refusal.lasting, "{refusal}");
+    assert!(
+        refusal
+            .message
+            .starts_with("acme/web is not served yet: its default branch could not be read"),
+        "{refusal}"
+    );
+    assert!(shown.0.borrow().is_empty());
+    assert_eq!(bench.refused(), None);
 }
 
 /// The list only locates a project: refused when it does not serve it, when

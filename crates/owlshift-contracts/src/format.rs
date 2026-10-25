@@ -163,6 +163,9 @@ pub const SERVED_PROJECTS_FORMAT: u32 = 1;
 /// The format version of the project file a served project runs on
 /// (`served.json` in a project's folder, OWL-434).
 pub const SERVED_CONFIG_FORMAT: u32 = 1;
+/// The format version of the running daemon's record
+/// (`<data>/service/daemon.json`, OWL-435).
+pub const DAEMON_FORMAT: u32 = 1;
 
 /// Why a contract document was refused.
 #[derive(Debug)]

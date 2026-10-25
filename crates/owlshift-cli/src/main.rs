@@ -5,6 +5,7 @@ mod forget_cmd;
 mod gate_cmd;
 mod init_cmd;
 mod logs_cmd;
+mod service_cmd;
 mod unquarantine_cmd;
 mod why_cmd;
 
@@ -137,6 +138,26 @@ enum Command {
         /// Only this ticket, such as OWL-12, with its reasons over time.
         ticket: Option<String>,
     },
+    /// Serve this project with the background service, and start the service
+    /// for this login session when it does not run: it keeps one `owlshift
+    /// watch --drain` per served project alive, without a terminal, each on
+    /// the project file of its default branch. Its output goes to
+    /// `service/daemon.log` in the data directory.
+    Start,
+    /// Stop the background service: each watch ends once its steps under way
+    /// finish, then the service exits. With --forget, stop serving this
+    /// project only.
+    Stop {
+        /// Stop serving the project of the current directory, the service
+        /// going on with the others.
+        #[arg(long)]
+        forget: bool,
+    },
+    /// The background service itself, in the foreground: `owlshift start`
+    /// runs it. One per data directory; a second exits at once. Ctrl-C ends
+    /// it once its watches drained, a second (or SIGTERM) stops their steps
+    /// checking their runs, a third stops everything now.
+    Daemon,
     /// Print the events `owlshift do`, `continue`, `watch` and `forget`
     /// recorded, oldest first.
     Logs {
@@ -270,6 +291,9 @@ fn main() -> ExitCode {
         Command::Gate { at } => gate_cmd::run(&system, &config, at.as_deref()),
         Command::Unquarantine => unquarantine_cmd::run(&config),
         Command::Why { ticket } => why_cmd::run(&config, ticket.as_deref()),
+        Command::Start => service_cmd::start(&config),
+        Command::Stop { forget } => service_cmd::stop(&config, forget),
+        Command::Daemon => service_cmd::daemon(&system, &config),
         Command::Logs {
             ticket,
             last,
@@ -281,12 +305,13 @@ fn main() -> ExitCode {
 /// Whether `command` stops by degrees, and with which bound after a checked
 /// stop (OWL-161, architecture section 5, "Three ways to stop"): `owlshift
 /// watch`, stopped now [`CHECKED_STOP_BOUND`] after it; a step's child, with
-/// no bound of its own, its watch's applying. `None`: every signal stops the
+/// no bound of its own, its watch's applying; the daemon likewise, each of
+/// its watches carrying the bound (OWL-435). `None`: every signal stops the
 /// command at once.
 fn by_degrees(command: &Command) -> Option<Option<Duration>> {
     match command {
         Command::Watch { .. } => Some(Some(CHECKED_STOP_BOUND)),
-        Command::Continue { step: Some(_), .. } => Some(None),
+        Command::Continue { step: Some(_), .. } | Command::Daemon => Some(None),
         _ => None,
     }
 }
@@ -330,7 +355,12 @@ mod tests {
         assert_eq!(of(&["watch", "--drain"]), watch);
         assert_eq!(of(&["watch", "--drain", "--served", "o/r"]), watch);
         assert_eq!(of(&["continue", "OWL-1", "--step", "{}"]), Some(None));
+        // OWL-435: the daemon with no bound of its own, its watches'.
+        assert_eq!(of(&["daemon"]), Some(None));
         for args in [
+            &["start"][..],
+            &["stop"],
+            &["stop", "--forget"],
             &["do", "OWL-1"][..],
             &["continue", "OWL-1"],
             &["continue", "OWL-1", "--to-watch"],
