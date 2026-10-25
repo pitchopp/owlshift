@@ -1,0 +1,105 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Owlshift install manifest",
+  "description": "What Owlshift wrote outside its data directory: the service installed at\nlogin and the keychain entries `owlshift init` stored. `owlshift\nuninstall` removes exactly what it lists, then the manifest.",
+  "type": "object",
+  "properties": {
+    "format": {
+      "description": "The format version of this document.",
+      "type": "integer",
+      "const": 1
+    },
+    "keychain": {
+      "description": "The keychain entries `owlshift init` stored.",
+      "type": "array",
+      "default": [],
+      "items": {
+        "$ref": "#/$defs/KeychainEntry"
+      }
+    },
+    "service": {
+      "description": "The service installed at login, while it is.",
+      "anyOf": [
+        {
+          "$ref": "#/$defs/InstalledService"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "format"
+  ],
+  "$defs": {
+    "InstalledService": {
+      "description": "The service installed at login: its files, each an absolute path.",
+      "type": "object",
+      "properties": {
+        "binary": {
+          "description": "The binary the launcher starts.",
+          "type": "string"
+        },
+        "launcher": {
+          "description": "The `/bin/sh` launcher the unit runs, beside it.",
+          "type": "string"
+        },
+        "link": {
+          "description": "The link that enables a systemd unit at login, which `systemctl\nenable` makes.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "manager": {
+          "$ref": "#/$defs/ServiceManager"
+        },
+        "unit": {
+          "description": "The unit: the LaunchAgent's property list, or the systemd unit file.",
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "manager",
+        "unit",
+        "launcher",
+        "binary"
+      ]
+    },
+    "KeychainEntry": {
+      "description": "A keychain entry: the service it is filed under and its account.",
+      "type": "object",
+      "properties": {
+        "account": {
+          "type": "string"
+        },
+        "service": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "service",
+        "account"
+      ]
+    },
+    "ServiceManager": {
+      "description": "The service manager a service is installed with.",
+      "oneOf": [
+        {
+          "description": "A user LaunchAgent, on macOS.",
+          "type": "string",
+          "const": "launchd"
+        },
+        {
+          "description": "A systemd user unit, on Linux and WSL2.",
+          "type": "string",
+          "const": "systemd"
+        }
+      ]
+    }
+  }
+}

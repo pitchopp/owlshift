@@ -10,13 +10,19 @@
 //! that runs, `<data>/service/daemon.json` ([`DaemonRecord`]); and the
 //! requests the service's files carry, a stop or a pause, each one line of
 //! JSON saying who asked, when and why ([`Request`]).
+//!
+//! And the install manifest (OWL-437, runtime and operations, "Install,
+//! lifecycle & uninstall"), `<data>/service/manifest.json`
+//! ([`InstallManifest`]): what Owlshift wrote outside its data directory,
+//! which `owlshift uninstall` removes.
 
 use jiff::Timestamp;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::format::{
-    self, ContractError, DAEMON_FORMAT, Format, SERVED_CONFIG_FORMAT, SERVED_PROJECTS_FORMAT,
+    self, ContractError, DAEMON_FORMAT, Format, MANIFEST_FORMAT, SERVED_CONFIG_FORMAT,
+    SERVED_PROJECTS_FORMAT,
 };
 
 /// Who asks in a [`Request`] the daemon writes: a project's pause after a
@@ -233,6 +239,148 @@ impl ServedConfig {
     }
 }
 
+/// How the line of [`InstallManifest::render`] that holds the service
+/// begins: the service's launcher, finding its binary gone, removes the line
+/// that begins so with `grep -v`, the rest staying a manifest that parses.
+pub const MANIFEST_SERVICE_LINE: &str = "  \"service\": ";
+
+/// What Owlshift wrote outside its data directory: the service installed at
+/// login and the keychain entries `owlshift init` stored. `owlshift
+/// uninstall` removes exactly what it lists, then the manifest.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+#[schemars(title = "Owlshift install manifest")]
+pub struct InstallManifest {
+    pub format: Format<MANIFEST_FORMAT>,
+    /// The service installed at login, while it is.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub service: Option<InstalledService>,
+    /// The keychain entries `owlshift init` stored.
+    #[serde(default)]
+    pub keychain: Vec<KeychainEntry>,
+}
+
+/// The service manager a service is installed with.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum ServiceManager {
+    /// A user LaunchAgent, on macOS.
+    Launchd,
+    /// A systemd user unit, on Linux and WSL2.
+    Systemd,
+}
+
+/// The service installed at login: its files, each an absolute path.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct InstalledService {
+    pub manager: ServiceManager,
+    /// The unit: the LaunchAgent's property list, or the systemd unit file.
+    pub unit: String,
+    /// The `/bin/sh` launcher the unit runs, beside it.
+    pub launcher: String,
+    /// The link that enables a systemd unit at login, which `systemctl
+    /// enable` makes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub link: Option<String>,
+    /// The binary the launcher starts.
+    pub binary: String,
+}
+
+impl InstalledService {
+    /// Its files, in the order they are removed: the unit and its link
+    /// first, so nothing starts the launcher once it is gone.
+    pub fn files(&self) -> Vec<&str> {
+        let mut files = vec![self.unit.as_str()];
+        files.extend(self.link.as_deref());
+        files.push(&self.launcher);
+        files
+    }
+}
+
+/// A keychain entry: the service it is filed under and its account.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct KeychainEntry {
+    pub service: String,
+    pub account: String,
+}
+
+impl InstallManifest {
+    const CONTRACT: &str = "install manifest";
+
+    pub fn parse(input: &str) -> Result<Self, ContractError> {
+        let manifest: Self = format::parse_json(Self::CONTRACT, MANIFEST_FORMAT, input)?;
+        if let Some(service) = &manifest.service
+            && (service.unit.is_empty()
+                || service.launcher.is_empty()
+                || service.binary.is_empty()
+                || service.link.as_deref() == Some(""))
+        {
+            return Err(ContractError::invalid(
+                Self::CONTRACT,
+                "the service names an empty path",
+            ));
+        }
+        if manifest
+            .keychain
+            .iter()
+            .any(|entry| entry.service.is_empty() || entry.account.is_empty())
+        {
+            return Err(ContractError::invalid(
+                Self::CONTRACT,
+                "a keychain entry without its service or its account",
+            ));
+        }
+        Ok(manifest)
+    }
+
+    /// The manifest as its file holds it: the service on one line beginning
+    /// with [`MANIFEST_SERVICE_LINE`] and ending with a comma, since the
+    /// keychain entries always follow, so the file stays JSON without it.
+    pub fn render(&self) -> String {
+        let mut out = format!("{{\n  \"format\": {MANIFEST_FORMAT},\n");
+        if let Some(service) = &self.service {
+            out.push_str(MANIFEST_SERVICE_LINE);
+            out.push_str(&compact(service));
+            out.push_str(",\n");
+        }
+        if self.keychain.is_empty() {
+            out.push_str("  \"keychain\": []\n");
+        } else {
+            out.push_str("  \"keychain\": [\n");
+            let last = self.keychain.len() - 1;
+            for (index, entry) in self.keychain.iter().enumerate() {
+                out.push_str("    ");
+                out.push_str(&compact(entry));
+                out.push_str(if index == last { "\n" } else { ",\n" });
+            }
+            out.push_str("  ]\n");
+        }
+        out.push_str("}\n");
+        out
+    }
+
+    /// Lists `entry`, unless it is listed already: `true` when it was not.
+    pub fn record(&mut self, entry: KeychainEntry) -> bool {
+        if self.keychain.contains(&entry) {
+            return false;
+        }
+        self.keychain.push(entry);
+        true
+    }
+
+    /// Whether it lists nothing.
+    pub fn is_empty(&self) -> bool {
+        self.service.is_none() && self.keychain.is_empty()
+    }
+}
+
+/// One line of JSON for a value of the manifest.
+fn compact<T: Serialize>(value: &T) -> String {
+    serde_json::to_string(value).expect("a manifest entry always serializes to JSON")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -307,6 +455,64 @@ mod tests {
             DaemonRecord::parse(&newer),
             Err(ContractError::NewerFormat { found: 2, .. })
         ));
+    }
+
+    /// OWL-437: the manifest reads back; without the line the launcher
+    /// removes, it still parses, its keychain entries kept.
+    #[test]
+    fn a_manifest_reads_back_and_parses_without_its_service_line() {
+        let mut manifest = InstallManifest {
+            service: Some(InstalledService {
+                manager: ServiceManager::Systemd,
+                unit: "/home/ada/.config/systemd/user/owlshift.service".to_owned(),
+                launcher: "/home/ada/.config/systemd/user/owlshift-launcher.sh".to_owned(),
+                link: Some(
+                    "/home/ada/.config/systemd/user/default.target.wants/owlshift.service"
+                        .to_owned(),
+                ),
+                binary: "/home/ada/bin/own \"lift\"\n".to_owned(),
+            }),
+            ..InstallManifest::default()
+        };
+        let entry = |account: &str| KeychainEntry {
+            service: "owlshift".to_owned(),
+            account: account.to_owned(),
+        };
+        for keychain in [
+            vec![],
+            vec![entry("claude-agent"), entry("github.com/a/b/linear")],
+        ] {
+            manifest.keychain = keychain;
+            let text = manifest.render();
+            assert_eq!(InstallManifest::parse(&text).unwrap(), manifest, "{text}");
+            let service_lines: Vec<&str> = text
+                .lines()
+                .filter(|line| line.starts_with(MANIFEST_SERVICE_LINE))
+                .collect();
+            assert_eq!(service_lines.len(), 1, "{text}");
+            assert!(service_lines[0].ends_with(','), "{text}");
+            let without: String = text
+                .lines()
+                .filter(|line| !line.starts_with(MANIFEST_SERVICE_LINE))
+                .map(|line| format!("{line}\n"))
+                .collect();
+            let left = InstallManifest::parse(&without).unwrap();
+            assert_eq!(left.service, None);
+            assert_eq!(left.keychain, manifest.keychain);
+        }
+        assert!(!manifest.record(entry("claude-agent")), "listed once");
+        assert!(manifest.record(entry("github.com/a/b/github-app")));
+        assert!(!manifest.is_empty());
+        assert!(InstallManifest::default().is_empty());
+
+        let text = manifest.render();
+        let newer = text.replace("\"format\": 1", "\"format\": 2");
+        assert!(matches!(
+            InstallManifest::parse(&newer),
+            Err(ContractError::NewerFormat { found: 2, .. })
+        ));
+        let empty = text.replace("\"account\":\"claude-agent\"", "\"account\":\"\"");
+        assert!(InstallManifest::parse(&empty).is_err());
     }
 
     #[test]

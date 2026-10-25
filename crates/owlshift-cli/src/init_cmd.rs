@@ -14,6 +14,7 @@ use clap::ValueEnum;
 use owlshift_adapters::forge::Repo;
 use owlshift_adapters::forge::github_app::{DeviceFlow, HttpLogin};
 use owlshift_contracts::config::TrackerKind;
+use owlshift_contracts::service::KeychainEntry;
 use owlshift_platform::keychain::{Keychain, SERVICE, Secret};
 use owlshift_runner::config::{Effective, FileState};
 use owlshift_runner::forge::GitHubApp;
@@ -22,6 +23,7 @@ use owlshift_runner::init::{
     AppStored, GITHUB_TOKEN, InitOptions, SecretsReport, Wanted, Written, project_file,
     required_secrets, store_app_credentials, store_secrets, wanted_secrets, write_project_file,
 };
+use owlshift_runner::install::Manifests;
 use owlshift_runner::project::ProjectDirs;
 use owlshift_runner::secrets::{ForgeAccount, TrackerAccounts};
 use owlshift_runner::tracker::{self, app_credentials};
@@ -169,6 +171,16 @@ pub fn run(args: &Args, config: &Effective) -> ExitCode {
             .map(Secret::new)
     };
     let report = store_secrets(&keychain, &wanted, args.replace_secrets, &mut ask);
+    // What this run stored, which the install manifest lists for `owlshift
+    // uninstall` to remove (OWL-437).
+    let mut stored: Vec<String> = match &report {
+        Ok(report) => report
+            .stored
+            .iter()
+            .map(|one| one.account.clone())
+            .collect(),
+        Err(_) => Vec::new(),
+    };
     let report = match report {
         Ok(report) => report,
         Err(error) => return fail(&error.to_string()),
@@ -180,6 +192,7 @@ pub fn run(args: &Args, config: &Effective) -> ExitCode {
             &TrackerAccounts::project(repo),
             args.replace_secrets,
             &mut ask,
+            &mut stored,
         ),
         _ => true,
     };
@@ -242,11 +255,15 @@ pub fn run(args: &Args, config: &Effective) -> ExitCode {
                 &mut |line| println!("{line}"),
             );
             said_sign_in(&outcome, repo);
+            if outcome == Outcome::Stored {
+                stored.push(ForgeAccount::project_app(repo).token);
+            }
             outcome.is_ok()
         }
         // Said above, with the other secrets that cannot be named.
         Err(_) => true,
     };
+    record_in_manifest(crate::data_dir(), &stored);
     if report.missing.is_empty()
         && report.refused.is_empty()
         && unnamed.is_empty()
@@ -274,6 +291,32 @@ pub fn run(args: &Args, config: &Effective) -> ExitCode {
         );
     }
     ExitCode::FAILURE
+}
+
+/// Lists in the install manifest of the data directory `data` the keychain
+/// entries this run stored, under Owlshift's service, which `owlshift
+/// uninstall` removes (OWL-437): only what `init` stored, never an entry it
+/// kept or a shared one it reads, which another install may own. A manifest
+/// that cannot be written is a warning: the secrets are stored all the same.
+fn record_in_manifest(data: Result<std::path::PathBuf, String>, stored: &[String]) {
+    if stored.is_empty() {
+        return;
+    }
+    let entries: Vec<KeychainEntry> = stored
+        .iter()
+        .map(|account| KeychainEntry {
+            service: SERVICE.to_owned(),
+            account: account.clone(),
+        })
+        .collect();
+    if let Err(error) =
+        data.and_then(|data| Manifests::in_data_dir(&data).record_keychain(&entries))
+    {
+        eprintln!(
+            "owlshift: warning: the install manifest does not list the keychain entries just \
+             stored ({error}): `owlshift uninstall` will not remove them."
+        );
+    }
 }
 
 /// With `--github-token`: once the project holds a personal token of its
@@ -344,12 +387,13 @@ fn said_sign_in(outcome: &Outcome, repo: &Repo) {
 /// fail: half a pair given, one pasted wrong, or half a pair left in the
 /// keychain. The app goes with the project's own key: without one, the
 /// project reads the shared key and the shared app, and nothing is asked
-/// (OWL-308).
+/// (OWL-308). The accounts it stores are added to `stored_now` (OWL-437).
 fn linear_app(
     keychain: &Keychain,
     own: &TrackerAccounts,
     replace: bool,
     ask: &mut dyn FnMut(&Wanted) -> Option<Secret>,
+    stored_now: &mut Vec<String>,
 ) -> bool {
     let shared = TrackerAccounts::shared();
     let contains = |account: &str| keychain.contains(account).map_err(|e| e.to_string());
@@ -391,9 +435,12 @@ fn linear_app(
         }
     };
     match stored {
-        AppStored::Stored => println!(
-            "Stored the Linear app's client ID and secret: Owlshift comments as its app user."
-        ),
+        AppStored::Stored => {
+            stored_now.extend([own.app_id.clone(), own.app_secret.clone()]);
+            println!(
+                "Stored the Linear app's client ID and secret: Owlshift comments as its app user."
+            );
+        }
         AppStored::Kept => println!("Kept the Linear app's client ID and secret already stored."),
         AppStored::Skipped => println!(
             "No Linear app: Owlshift comments through the Linear API key, and Linear does not \
@@ -459,12 +506,53 @@ mod tests {
             keychain.store(account, &Secret::new("x")).unwrap();
         }
         let mut ask = |_: &Wanted| -> Option<Secret> { panic!("no app is asked for") };
-        assert!(!linear_app(&keychain, &own, false, &mut ask));
+        assert!(!linear_app(
+            &keychain,
+            &own,
+            false,
+            &mut ask,
+            &mut Vec::new()
+        ));
 
         keychain
             .store(LINEAR_APP_SECRET_ACCOUNT, &Secret::new("y"))
             .unwrap();
-        assert!(linear_app(&keychain, &own, false, &mut ask));
+        assert!(linear_app(
+            &keychain,
+            &own,
+            false,
+            &mut ask,
+            &mut Vec::new()
+        ));
+    }
+
+    /// OWL-437: what `init` stored is listed in the install manifest once,
+    /// under Owlshift's keychain service; nothing stored lists nothing.
+    #[test]
+    fn what_init_stored_is_listed_in_the_install_manifest() {
+        let data = tempfile::tempdir().unwrap();
+        let manifests = Manifests::in_data_dir(data.path());
+        record_in_manifest(Ok(data.path().to_owned()), &[]);
+        assert!(!manifests.file().exists());
+        let stored = [
+            "claude-agent".to_owned(),
+            "github.com/a/b/linear".to_owned(),
+        ];
+        record_in_manifest(Ok(data.path().to_owned()), &stored);
+        record_in_manifest(Ok(data.path().to_owned()), &stored[..1]);
+        let listed = manifests.read().unwrap().keychain;
+        assert_eq!(
+            listed
+                .iter()
+                .map(|entry| (entry.service.as_str(), entry.account.as_str()))
+                .collect::<Vec<_>>(),
+            [
+                ("owlshift", "claude-agent"),
+                ("owlshift", "github.com/a/b/linear")
+            ]
+        );
+        // No data directory: a warning, no panic.
+        record_in_manifest(Err("no data directory".to_owned()), &stored);
     }
 
     /// Criterion 6 (OWL-383): `--github-token` stores the personal token under

@@ -37,6 +37,7 @@ use owlshift_core::schedule::{holds_slot, natural_cmp};
 use owlshift_core::vocab::Stage;
 use owlshift_platform::keychain::SERVICE;
 use owlshift_platform::sandbox::{BWRAP_APPARMOR_PROFILE, SandboxError};
+use owlshift_platform::service::{Kind, LABEL, SYSTEMD_UNIT};
 use serde_json::Value;
 
 use crate::codex_machine::{self, Declared, FULL_ACCESS};
@@ -46,6 +47,7 @@ use crate::executor::{
     MINIMUM_GIT_VERSION, git_floor_reason, git_install_advice, git_recheck_note,
 };
 use crate::forge::GITHUB_TOKEN_HELP;
+use crate::install::ServiceState;
 use crate::secrets::{self, ForgeSecret, Source, TrackerAccounts, TrackerSecrets};
 use crate::served;
 use crate::system::{
@@ -306,6 +308,7 @@ pub fn run(system: &dyn System, config: &Effective) -> Report {
     checks.extend(budget_check(config));
     checks.extend(drain_slot_check(system, config));
     checks.extend(quarantine_check(system, config, home));
+    checks.extend(system.service().map(|state| service_check(&state, home)));
     checks.push(data_dir_check(system, home));
     let next = match &config.project {
         FileState::Absent(_) => Next::Init,
@@ -2615,6 +2618,100 @@ fn quarantine_check(system: &dyn System, config: &Effective, home: Option<&Path>
             ),
         ],
     ))
+}
+
+/// The background service installed at login (OWL-437; runtime and
+/// operations, "Install, lifecycle & uninstall"): installed or not, the
+/// binary it starts, the daemon that runs; a warning, with the commands that
+/// remove it, for a unit or launcher at Owlshift's paths the install manifest
+/// does not list, a listed binary or file that is gone, or a manifest that
+/// does not read. It never cleans up itself, and never blocks `owlshift do`.
+fn service_check(state: &ServiceState, home: Option<&Path>) -> Check {
+    const SUBJECT: &str = "service";
+    let daemon = match &state.daemon {
+        Ok(None) => "no daemon runs".to_owned(),
+        Ok(Some(Some(record))) => format!(
+            "the daemon runs (pid {}, version {}, since {})",
+            record.pid, record.version, record.since
+        ),
+        Ok(Some(None)) => "a daemon runs, its record unread".to_owned(),
+        Err(error) => format!("whether a daemon runs was not read: {error}"),
+    };
+    let listed = match &state.listed {
+        Ok(listed) => listed,
+        Err(error) => {
+            return Check::warn(
+                Section::Project,
+                SUBJECT,
+                format!("the install manifest does not read: {error}; {daemon}"),
+                format!(
+                    "{DOES_NOT_BLOCK} `owlshift uninstall` removes only what the manifest lists: \
+                     fix or remove {}.",
+                    shown(&state.manifest, home)
+                ),
+            );
+        }
+    };
+    let mut problems = Vec::new();
+    if !state.unlisted.is_empty() {
+        let files: Vec<String> = state
+            .unlisted
+            .iter()
+            .map(|path| shown(path, home))
+            .collect();
+        problems.push(format!(
+            "{} {} Owlshift's but not listed in this data directory's install manifest, so \
+             another data directory installed {} or it was left behind: remove {} with `{}`",
+            files.join(" and "),
+            if files.len() == 1 { "is" } else { "are" },
+            if files.len() == 1 { "it" } else { "them" },
+            if files.len() == 1 { "it" } else { "them" },
+            state.layout.removal_commands().join("; ")
+        ));
+    }
+    let detail = match listed {
+        None => {
+            format!("not installed at login (`owlshift start --at-login` installs it); {daemon}")
+        }
+        Some(service) => {
+            let how = match state.layout.kind {
+                Kind::Launchd => format!("the user LaunchAgent `{LABEL}`"),
+                Kind::Systemd => format!("the systemd user unit `{SYSTEMD_UNIT}`"),
+            };
+            let binary = shown(Path::new(&service.binary), home);
+            if !state.binary_there {
+                problems.push(format!(
+                    "its binary {binary} is gone, so its launcher removes the service at its next \
+                     start: `owlshift start --at-login` names this binary instead, or `owlshift \
+                     uninstall` removes it"
+                ));
+            }
+            if !state.gone.is_empty() {
+                let gone: Vec<String> = state
+                    .gone
+                    .iter()
+                    .map(|file| shown(Path::new(file), home))
+                    .collect();
+                problems.push(format!(
+                    "the install manifest lists {}, which {} gone: `owlshift start --at-login` \
+                     writes the service again, or `owlshift uninstall` drops it from the manifest",
+                    gone.join(" and "),
+                    if gone.len() == 1 { "is" } else { "are" }
+                ));
+            }
+            format!("installed at login as {how}, starting {binary}; {daemon}")
+        }
+    };
+    match (listed, problems.is_empty()) {
+        (_, false) => Check::warn(
+            Section::Project,
+            SUBJECT,
+            detail,
+            format!("{DOES_NOT_BLOCK} {}.", problems.join("; ")),
+        ),
+        (None, true) => Check::info(Section::Project, SUBJECT, detail),
+        (Some(_), true) => Check::ok(Section::Project, SUBJECT, detail),
+    }
 }
 
 fn data_dir_check(system: &dyn System, home: Option<&Path>) -> Check {
@@ -5057,5 +5154,112 @@ states = { ready = "Todo", working = "Doing", needs_input = "Asked", review = "R
             "the service runs it on owlshift.toml at origin/main (aaaaaaaaaaaa), not this \
              working tree"
         );
+    }
+
+    #[cfg(unix)]
+    /// OWL-437: the service line says whether the service is installed, the
+    /// binary it starts and the daemon that runs, and warns, with what removes
+    /// it, of a unit the manifest does not list, a binary or a listed file
+    /// that is gone, or a manifest that does not read.
+    #[test]
+    fn the_service_line_reports_the_install_and_its_leftovers() {
+        use owlshift_contracts::format::Format;
+        use owlshift_contracts::service::{DaemonRecord, InstalledService, ServiceManager};
+        use owlshift_platform::service::Layout;
+
+        let layout = Layout {
+            kind: Kind::Launchd,
+            dir: PathBuf::from("/home/ada/Library/LaunchAgents"),
+        };
+        let nothing = ServiceState {
+            layout: layout.clone(),
+            manifest: PathBuf::from("/home/ada/data/service/manifest.json"),
+            listed: Ok(None),
+            gone: Vec::new(),
+            binary_there: true,
+            unlisted: Vec::new(),
+            daemon: Ok(None),
+        };
+        let home = Some(Path::new("/home/ada"));
+        let check = service_check(&nothing, home);
+        assert_eq!(check.status, Status::Info);
+        assert_eq!(
+            check.detail,
+            "not installed at login (`owlshift start --at-login` installs it); no daemon runs"
+        );
+
+        let service = InstalledService {
+            manager: ServiceManager::Launchd,
+            unit: layout.unit().display().to_string(),
+            launcher: layout.launcher().display().to_string(),
+            link: None,
+            binary: "/opt/homebrew/bin/owlshift".to_owned(),
+        };
+        let running = ServiceState {
+            listed: Ok(Some(service)),
+            daemon: Ok(Some(Some(DaemonRecord {
+                format: Format,
+                pid: 4242,
+                version: "0.4.0".to_owned(),
+                binary: "/opt/homebrew/bin/owlshift".to_owned(),
+                since: "2026-10-25T08:00:00Z".parse().unwrap(),
+            }))),
+            ..nothing.clone()
+        };
+        let check = service_check(&running, home);
+        assert_eq!(check.status, Status::Ok);
+        assert_eq!(
+            check.detail,
+            "installed at login as the user LaunchAgent `dev.owlshift.daemon`, starting \
+             /opt/homebrew/bin/owlshift; the daemon runs (pid 4242, version 0.4.0, since \
+             2026-10-25T08:00:00Z)"
+        );
+
+        let broken = ServiceState {
+            binary_there: false,
+            gone: vec![layout.launcher().display().to_string()],
+            ..running.clone()
+        };
+        let check = service_check(&broken, home);
+        assert_eq!(check.status, Status::Warn);
+        let why = check.why.clone().unwrap();
+        assert!(
+            why.contains("its binary /opt/homebrew/bin/owlshift is gone")
+                && why.contains("lists ~/Library/LaunchAgents/owlshift-launcher.sh, which is gone"),
+            "{why}"
+        );
+        assert_well_formed(&check);
+
+        let leftover = ServiceState {
+            unlisted: vec![layout.unit()],
+            ..nothing.clone()
+        };
+        let check = service_check(&leftover, home);
+        assert_eq!(check.status, Status::Warn);
+        let why = check.why.clone().unwrap();
+        assert!(
+            why.contains(
+                "~/Library/LaunchAgents/dev.owlshift.daemon.plist is Owlshift's but not \
+                 listed"
+            ) && why.contains("launchctl bootout gui/$(id -u)/dev.owlshift.daemon; rm -f"),
+            "{why}"
+        );
+
+        let unread = ServiceState {
+            listed: Err("invalid install manifest".to_owned()),
+            ..nothing
+        };
+        let check = service_check(&unread, home);
+        assert_eq!(check.status, Status::Warn);
+        assert!(
+            check
+                .why
+                .unwrap()
+                .contains("fix or remove ~/data/service/manifest.json")
+        );
+
+        let system = logged_in(with_harnesses(with_git(FakeSystem::default())));
+        let report = run(&system.service_is(running), &no_config());
+        assert!(report.checks.iter().any(|c| c.subject == "service"));
     }
 }

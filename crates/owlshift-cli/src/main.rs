@@ -143,7 +143,13 @@ enum Command {
     /// watch --drain` per served project alive, without a terminal, each on
     /// the project file of its default branch. Its output goes to
     /// `service/daemon.log` in the data directory.
-    Start,
+    Start {
+        /// Also install the service to start at each login, as a user
+        /// LaunchAgent (macOS) or a systemd user unit (Linux): `owlshift stop
+        /// --at-login` or `owlshift uninstall` removes it.
+        #[arg(long)]
+        at_login: bool,
+    },
     /// Stop the background service: each watch ends once its steps under way
     /// finish, then the service exits. With --forget, stop serving this
     /// project only.
@@ -152,6 +158,20 @@ enum Command {
         /// going on with the others.
         #[arg(long)]
         forget: bool,
+        /// Also remove the service installed at login, once the daemon has
+        /// ended: this waits for the steps under way to finish.
+        #[arg(long, conflicts_with = "forget")]
+        at_login: bool,
+    },
+    /// Remove what Owlshift installed on this machine, as its install
+    /// manifest lists it: the service at login and the keychain entries
+    /// `owlshift init` stored. A daemon that runs is stopped first, its runs
+    /// checked. Repositories, tickets and branches are never touched.
+    Uninstall {
+        /// Also remove the data directory (the dedicated clones, worktrees,
+        /// run logs and events) and the personal file.
+        #[arg(long)]
+        purge: bool,
     },
     /// The background service itself, in the foreground: `owlshift start`
     /// runs it. One per data directory; a second exits at once. Ctrl-C ends
@@ -291,8 +311,9 @@ fn main() -> ExitCode {
         Command::Gate { at } => gate_cmd::run(&system, &config, at.as_deref()),
         Command::Unquarantine => unquarantine_cmd::run(&config),
         Command::Why { ticket } => why_cmd::run(&config, ticket.as_deref()),
-        Command::Start => service_cmd::start(&config),
-        Command::Stop { forget } => service_cmd::stop(&config, forget),
+        Command::Start { at_login } => service_cmd::start(&config, at_login),
+        Command::Stop { forget, at_login } => service_cmd::stop(&config, forget, at_login),
+        Command::Uninstall { purge } => service_cmd::uninstall(purge),
         Command::Daemon => service_cmd::daemon(&system, &config),
         Command::Logs {
             ticket,
@@ -359,8 +380,12 @@ mod tests {
         assert_eq!(of(&["daemon"]), Some(None));
         for args in [
             &["start"][..],
+            &["start", "--at-login"],
             &["stop"],
             &["stop", "--forget"],
+            &["stop", "--at-login"],
+            &["uninstall"],
+            &["uninstall", "--purge"],
             &["do", "OWL-1"][..],
             &["continue", "OWL-1"],
             &["continue", "OWL-1", "--to-watch"],
@@ -371,5 +396,8 @@ mod tests {
         ] {
             assert_eq!(of(args), None, "{args:?}");
         }
+        // OWL-437: removing the service while forgetting one project is no
+        // one command.
+        assert!(Cli::try_parse_from(["owlshift", "stop", "--forget", "--at-login"]).is_err());
     }
 }

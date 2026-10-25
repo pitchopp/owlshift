@@ -476,6 +476,35 @@ pub(crate) fn lock_file_within(
     retry_within(wait, poll, || try_lock_file(path))
 }
 
+/// How long a change of one of the service's small files waits for its lock:
+/// the list of served projects (OWL-434) or the install manifest (OWL-437).
+const SHARED_FILE_LOCK_WAIT: Duration = Duration::from_secs(10);
+/// How often that wait tries the lock.
+const SHARED_FILE_LOCK_POLL: Duration = Duration::from_millis(50);
+
+/// Runs `change` holding the lock of the file at `lock`, its folder made
+/// first, waited for up to ten seconds: one read-modify-write of a small file
+/// several commands change, each replacing it whole. The error says which
+/// lock stayed held.
+pub(crate) fn under_lock<T>(
+    lock: &Path,
+    change: impl FnOnce() -> Result<T, String>,
+) -> Result<T, String> {
+    if let Some(dir) = lock.parent() {
+        fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+    }
+    let _held = lock_file_within(lock, SHARED_FILE_LOCK_WAIT, SHARED_FILE_LOCK_POLL)
+        .map_err(|e| format!("{}: {e}", lock.display()))?
+        .ok_or_else(|| {
+            format!(
+                "{} stayed held for {} seconds",
+                lock.display(),
+                SHARED_FILE_LOCK_WAIT.as_secs()
+            )
+        })?;
+    change()
+}
+
 /// [`lock_file_within`], the lock taken shared (OWL-435): several holders
 /// may share it, none while one holds it alone.
 pub(crate) fn lock_file_shared_within(

@@ -201,6 +201,19 @@ pub trait System {
     fn default_branch_file(&self, root: &Path) -> Result<DefaultBranchFile, String> {
         crate::project::project_file_at_origin_head(&crate::project::runner_git(), root)
     }
+    /// The background service installed at login, as the data directory's
+    /// install manifest and this machine's folders show it, with the daemon
+    /// that runs (OWL-437); `None` without a data directory or a home
+    /// folder. Only `owlshift doctor` asks.
+    fn service(&self) -> Option<crate::install::ServiceState> {
+        let (data, _) = self.data_dir()?;
+        let home = self.home()?;
+        let layout = owlshift_platform::service::Layout::for_this_machine(
+            &home,
+            owlshift_platform::paths::config_home().as_deref(),
+        );
+        Some(crate::install::state(&data, layout))
+    }
     /// Whether the sentinel still protects the live process trees from a
     /// hard kill of Owlshift (OWL-86, OWL-88, OWL-91).
     #[cfg(unix)]
@@ -352,6 +365,9 @@ pub(crate) mod fake {
         /// What reading the project file at the default branch gives;
         /// `None`: the default branch is unknown here.
         default_branch_file: Option<Result<DefaultBranchFile, String>>,
+        /// The background service as doctor reads it; `None`: no line, and
+        /// never the disk.
+        service: Option<crate::install::ServiceState>,
         /// Files that are not there; every other one is.
         missing_files: Vec<PathBuf>,
         /// What reading a text file gives; a file not here has no text,
@@ -385,6 +401,13 @@ pub(crate) mod fake {
         /// Agent runs cannot be confined, for this reason.
         pub(crate) fn no_sandbox(mut self, error: SandboxError) -> Self {
             self.sandbox = Some(error);
+            self
+        }
+
+        /// The background service is so (OWL-437).
+        #[cfg(unix)]
+        pub(crate) fn service_is(mut self, state: crate::install::ServiceState) -> Self {
+            self.service = Some(state);
             self
         }
 
@@ -601,6 +624,11 @@ pub(crate) mod fake {
         /// answer; never git.
         fn ticket_refs(&self, _root: &Path) -> Result<Option<Vec<(TicketId, RefState)>>, String> {
             self.ticket_refs.clone().transpose()
+        }
+
+        /// As [`Self::service_is`] scripted it; never the disk.
+        fn service(&self) -> Option<crate::install::ServiceState> {
+            self.service.clone()
         }
 
         /// As [`Self::quarantine_is`] scripted it; never the disk.
