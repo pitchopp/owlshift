@@ -17,6 +17,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use jiff::Timestamp;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
@@ -210,6 +211,18 @@ impl ChildProject {
         out: &mut dyn Write,
         act: impl FnOnce(&OnDemand<'_>, &mut EventSink<'_>) -> R,
     ) -> R {
+        self.with_on_demand_at(&on_demand::system_clock, out, act)
+    }
+
+    /// [`Self::with_on_demand`], the `OnDemand` reading `clock`, such as one
+    /// a test moves past watch's retry delay; the children read the system
+    /// clock still.
+    pub fn with_on_demand_at<R>(
+        &self,
+        clock: &dyn Fn() -> Timestamp,
+        out: &mut dyn Write,
+        act: impl FnOnce(&OnDemand<'_>, &mut EventSink<'_>) -> R,
+    ) -> R {
         let env = self.env();
         // The executor's credential probes run the real gh.
         gh::warm_up(&env.agent_parent());
@@ -253,7 +266,7 @@ impl ChildProject {
             config: &config,
             dirs: &dirs,
             head_wait: Duration::ZERO,
-            clock: &on_demand::system_clock,
+            clock,
             notifier: None,
             usage: &usage,
             web_tools: true,

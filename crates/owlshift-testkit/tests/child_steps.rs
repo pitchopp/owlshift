@@ -1157,6 +1157,218 @@ fn sigquit_and_sigkill_of_watch_stop_now_leaving_the_obligation() {
     }
 }
 
+/// A harness for [`a_base_wait_keeps_its_comment_while_another_step_runs`]:
+/// DEMO-2's Build waits while `dir/hold` stands, marked under way in
+/// `dir/demo2-running`. Each run then plays the fake harness with
+/// `dir/reply-<role>-<ticket>.toml`, or `<role>`'s.
+#[cfg(unix)]
+fn base_wait_harness(dir: &Path) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+
+    let script = dir.join("harness-base-wait.sh");
+    fs::write(
+        &script,
+        format!(
+            "#!/bin/sh\ndir='{dir}'\nbrief=\"\"\nreply=\"\"\n\
+             while [ $# -gt 0 ]; do\n  case \"$1\" in\n    --brief) brief=\"$2\"; shift 2;;\n    \
+             --reply) reply=\"$2\"; shift 2;;\n    *) shift;;\n  esac\ndone\n\
+             role=$(sed -n 's/^  \"role\": \"\\([a-z_]*\\)\",$/\\1/p' \"$brief\" | head -n 1)\n\
+             ticket=$(sed -n 's/^    \"id\": \"\\([A-Z0-9-]*\\)\",$/\\1/p' \"$brief\" | head -n 1)\n\
+             if [ -f \"$dir/reply-$role-$ticket.toml\" ]; then reply=\"$dir/reply-$role-$ticket.toml\"\n\
+             elif [ -f \"$dir/reply-$role.toml\" ]; then reply=\"$dir/reply-$role.toml\"; fi\n\
+             if [ \"$role\" = build ] && [ \"$ticket\" = DEMO-2 ]; then\n  \
+             touch \"$dir/demo2-running\"\n  n=0\n  \
+             while [ -e \"$dir/hold\" ] && [ $n -lt 6000 ]; do sleep 0.1; n=$((n+1)); done\n\
+             fi\n\
+             exec '{FAKE}' --brief \"$brief\" --reply \"$reply\"\n",
+            dir = dir.display(),
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+    script
+}
+
+/// A commit on `project`'s `main` writing `news` to `NEWS.md`, from a
+/// clone of its own under `root`: returns the new head.
+#[cfg(unix)]
+fn move_main(project: &ChildProject, root: &Path, news: &str) -> String {
+    let env = project.env();
+    let clone = root.join(format!("merger-{news}"));
+    let bare = project.bare.to_str().unwrap();
+    env.run(root, &["clone", "--quiet", bare, clone.to_str().unwrap()])
+        .unwrap();
+    fs::write(clone.join("NEWS.md"), format!("{news}\n")).unwrap();
+    env.run(&clone, &["add", "--all"]).unwrap();
+    env.run(&clone, &["commit", "--quiet", "-m", "Another merge"])
+        .unwrap();
+    env.run(
+        &clone,
+        &["push", "--quiet", "origin", "HEAD:refs/heads/main"],
+    )
+    .unwrap();
+    let head = env
+        .run(&project.bare, &["rev-parse", "refs/heads/main"])
+        .unwrap();
+    String::from_utf8(head).unwrap().trim().to_owned()
+}
+
+/// A base wait's WAITING comment stays shown while the base still holds the
+/// Build (OWL-418, OWL-419, OWL-431), as LOC-1458 found on 2026-10-25.
+/// DEMO-1's Build, drained alone, fails a gate its base fails too: its
+/// commit is held. Then `main` moves and DEMO-2's Build runs, a long step.
+/// Past the retry delay, DEMO-1 is resumed: its commit's check again is due
+/// at the new head and waits for DEMO-2's step, and watch shows DEMO-1's
+/// WAITING comment. Past the delay again, DEMO-1's step is held back for
+/// that check while DEMO-2's runs: that end ran nothing and the base still
+/// holds DEMO-1, so its comment is not folded. The comment is kept in
+/// DEMO-1's `waiting.json`, which a fold removes; the markdown tracker
+/// folds none. Watch reads a clock the test moves; the children the system
+/// clock.
+#[cfg(unix)]
+#[test]
+fn a_base_wait_keeps_its_comment_while_another_step_runs() {
+    use std::cell::Cell;
+
+    use owlshift_runner::base;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let plays = tmp.path().join("plays");
+    let machine = tmp.path().join("machine");
+    fs::create_dir_all(&plays).unwrap();
+    for (id, zone) in [("DEMO-1", "a"), ("DEMO-2", "b")] {
+        reply_for(&plays, "intake", Some(id), &intake_declaring(&[zone]));
+    }
+    reply_for(&plays, "build", Some("DEMO-2"), &build_asks());
+    // DEMO-1's Build commits work that does not say Hello: the gate fails
+    // on its branch and on the base alike.
+    let done = plays.join("build-DEMO-1.json");
+    fs::write(
+        &done,
+        json!({
+            "format": RESULT_FORMAT,
+            "status": "done",
+            "summary": "Added a note.",
+            "pr": { "branch": "owlshift/demo-1", "title": "Add a note", "body": "A note." },
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let mut files = std::collections::BTreeMap::new();
+    files.insert(
+        owlshift_contracts::ids::RelativePath::new("NOTE.md").unwrap(),
+        "A note.\n".to_owned(),
+    );
+    let reply = Reply {
+        files,
+        commit: Some("Add a note".to_owned()),
+        result: Some(done),
+        ..Reply::default()
+    };
+    fs::write(plays.join("reply-build-DEMO-1.toml"), reply.render()).unwrap();
+    fs::write(plays.join("hold"), "").unwrap();
+    let harness = base_wait_harness(&plays);
+    // DEMO-1 alone at first, the seed's, blocked by nothing.
+    let s = parallel_setup(&harness, 0, 2, (&machine, 2));
+    let counted = children(&s.file).with_slots(MachineSlots::new(&machine, 2));
+    let dirs = s.project.dirs();
+    let one = TicketId::new("DEMO-1").unwrap();
+    let shown = dirs.ticket_dir(&one).join("waiting.json");
+    let base_at = {
+        let env = s.project.env();
+        let head = env
+            .run(&s.project.bare, &["rev-parse", "refs/heads/main"])
+            .unwrap();
+        String::from_utf8(head).unwrap().trim().to_owned()
+    };
+    let skew = Cell::new(SignedDuration::ZERO);
+    let clock = || Timestamp::now() + skew.get();
+    let later = || skew.set(skew.get() + SignedDuration::from_mins(11));
+    // DEMO-1's `decision` events `base` = `waits` in the shared log.
+    let log = s.project.data.join("events.jsonl");
+    let held_told = || {
+        fs::read_to_string(&log)
+            .unwrap_or_default()
+            .lines()
+            .filter(|line| {
+                line.contains("\"ticket\":\"DEMO-1\"") && line.contains("\"base\":\"waits\"")
+            })
+            .count()
+    };
+    // 0: DEMO-1 drained alone, until its commit is held; then `main` moves,
+    // so the drain dispatches again, and DEMO-2 is put in the ready column,
+    // 1: until its Build runs; then `main` moves again and the delay passes,
+    // 2: until DEMO-1 is held again, its check at that head due; 3: a few
+    // passes, the delay passing again, DEMO-2's Build under way.
+    let (mut phase, mut since, mut told, mut kept) = (0, 0, 0, Vec::new());
+    let (mut lines, mut events, mut pass) = (Vec::new(), Vec::new(), 0u32);
+    s.project
+        .with_on_demand_at(&clock, &mut events, |on_demand, sink| {
+            let watch = Watch {
+                on_demand,
+                interval: std::time::Duration::from_millis(200),
+            };
+            watch.run_with_children(
+                true,
+                &counted,
+                sink,
+                &mut lines,
+                &mut |_, _, _| {},
+                &mut |_| {
+                    pass += 1;
+                    if pass >= 400 {
+                        let _ = fs::remove_file(plays.join("hold"));
+                        return false;
+                    }
+                    match phase {
+                        0 if base::read(&dirs)
+                            .is_ok_and(|checks| checks.holds_commit(&base_at)) =>
+                        {
+                            move_main(&s.project, tmp.path(), "one");
+                            s.project.add_ticket("DEMO-2", &["agent"], "");
+                            phase = 1;
+                        }
+                        1 if plays.join("demo2-running").exists() => {
+                            move_main(&s.project, tmp.path(), "two");
+                            told = held_told();
+                            later();
+                            phase = 2;
+                        }
+                        2 if held_told() > told => {
+                            kept.push(shown.exists());
+                            (phase, since) = (3, pass);
+                        }
+                        3 => {
+                            kept.push(shown.exists());
+                            // Past the delay of the hold that step's end set,
+                            // whenever watch set it.
+                            if (pass - since) % 5 == 0 {
+                                later();
+                            }
+                            if pass >= since + 40 {
+                                let _ = fs::remove_file(plays.join("hold"));
+                                return false;
+                            }
+                        }
+                        _ => {}
+                    }
+                    true
+                },
+            );
+        });
+    // DEMO-2's Build ends once released; its child is waited for.
+    let lines = String::from_utf8(lines).unwrap();
+    assert_eq!(
+        phase, 3,
+        "DEMO-1 was never held with its check due\n{lines}"
+    );
+    assert!(
+        kept.iter().all(|&stood| stood),
+        "DEMO-1's WAITING comment was folded while its base still held it, at the \
+         passes marked false: {kept:?}\n{lines}"
+    );
+}
+
 /// The watch of the stop tests (OWL-161): passes of `owlshift watch
 /// --drain` over the project `OWLSHIFT_CHILD_PROJECT` names, its steps in
 /// children or, with `OWLSHIFT_WATCH_IN_PROCESS`, in its own process, with

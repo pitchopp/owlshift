@@ -2342,7 +2342,8 @@ impl Watch<'_> {
             );
             return;
         }
-        if matches!(memory.waits.get(ticket), Some(StepWait::Base(_))) {
+        // A step that ran nothing did not go on: the base still holds it.
+        if running::ran(end) && matches!(memory.waits.get(ticket), Some(StepWait::Base(_))) {
             self.wait_ended(memory, sink, ticket);
         }
         match admitted {
@@ -2417,8 +2418,12 @@ impl Watch<'_> {
         // project's capacity hold it, or waits for its holders, told in this
         // very pass; a holder that left the slot gives its turn at the next
         // pass, at once (OWL-367, OWL-401).
-        // A Build held for its base still waits: its comment stays (OWL-418).
-        let base_held = matches!(outcome, StepEnd::BaseHeld { .. });
+        // A Build held for its base still waits: its comment stays (OWL-418),
+        // as it does when the step ran nothing, held back for that base's
+        // check or for a run slot (found on LOC-1458, 2026-10-25).
+        let base_held = matches!(outcome, StepEnd::BaseHeld { .. })
+            || !running::ran(outcome)
+                && matches!(memory.waits.get(ticket), Some(StepWait::Base(_)));
         match memory.turn.clone().unwrap_or(Turn::Holders(Vec::new())) {
             Turn::Holders(holders) if holders.contains(ticket) => {
                 if holds_now && !base_held {
