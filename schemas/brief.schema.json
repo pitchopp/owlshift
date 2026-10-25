@@ -92,7 +92,7 @@
     "format": {
       "description": "The format version of this document.",
       "type": "integer",
-      "const": 28
+      "const": 29
     },
     "gate": {
       "description": "The project's full gate, from `stack.gate` in its configuration: the\ncommands the runner runs, in order, from the worktree root, on the\ncommit a Build delivers; a role runs them, or narrows them to its\nchange, before it delivers. The runner is its only author; an empty\nlist means the project has no gate.",
@@ -117,6 +117,13 @@
       "type": "object",
       "additionalProperties": {
         "type": "string"
+      }
+    },
+    "overlaps": {
+      "description": "The ticket's overlaps (format 29, OWL-449; architecture section 5,\n\"Tolerated overlap\"): under `policy.overlap = \"rebase\"`, the other\nOwlshift tickets that hold some of what it holds, each with the\nshared paths, by identifier. A run keeps its edits of a shared file to\nwhat its ticket needs, without reordering or reformatting it. In the\nbuild role's brief only.",
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/BriefOverlap"
       }
     },
     "permissions": {
@@ -145,7 +152,7 @@
       }
     },
     "rebase": {
-      "description": "The delivered pull request conflicts with its base, or its checks\nfailed only on the base it was pushed onto, and this run rebases its\nbranch (OWL-210, architecture section 5, \"Conflicts and the rebase\nrun\"). In the rebase role's brief, always; absent otherwise.",
+      "description": "The delivered pull request conflicts with its base, or its checks\nfailed only on the base it was pushed onto, and this run rebases its\nbranch (OWL-210, architecture section 5, \"Conflicts and the rebase\nrun\"). In the rebase role's brief, always. In a verifier's and the\narbiter's (format 29, OWL-449), the rebase whose resolution of a\nconflict on another ticket's overlap their Verify pass reviews before\nits push. Absent otherwise.",
       "anyOf": [
         {
           "$ref": "#/$defs/RebaseBrief"
@@ -396,6 +403,28 @@
           "type": "string",
           "const": "unread"
         }
+      ]
+    },
+    "BriefOverlap": {
+      "description": "One overlap of the ticket's (OWL-449): `ticket` holds what the ticket\nholds on `paths`.",
+      "type": "object",
+      "properties": {
+        "paths": {
+          "description": "The shared paths, files or folders, sorted.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "ticket": {
+          "description": "The other ticket's identifier.",
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "ticket",
+        "paths"
       ]
     },
     "CheckFailure": {

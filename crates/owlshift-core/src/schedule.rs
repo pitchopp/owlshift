@@ -14,11 +14,11 @@
 use std::cmp::Ordering;
 use std::collections::BTreeSet;
 
-use crate::collision::{Collision, Dispatched, InFlight, collision};
+use crate::collision::{Collision, Dispatched, InFlight, weigh};
 use crate::resource::Resource;
 use crate::state::{Status, TicketState};
 use crate::ticket::{Admission, Blocker, BlockerState, Ticket};
-use crate::vocab::Stage;
+use crate::vocab::{Overlap, Stage};
 
 /// Limits on what may start.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -131,15 +131,19 @@ impl<K> Wait<K> {
 
     /// The tickets the reason names: the blockers that hold the ticket, the
     /// tickets that hold the project's capacity, or the holder it collides
-    /// with; none for any other reason.
-    pub fn tickets(&self) -> &[K] {
+    /// with, and under `rebase` the one sharing the path it would be the
+    /// third holder of (OWL-449); none for any other reason.
+    pub fn tickets(&self) -> Vec<K>
+    where
+        K: Clone,
+    {
         match self {
             Wait::BlockerCanceled(ids)
             | Wait::BlockerUnknown(ids)
             | Wait::BlockedBy(ids)
-            | Wait::Slot(ids) => ids,
-            Wait::Collision(collision) => std::slice::from_ref(&collision.holder),
-            _ => &[],
+            | Wait::Slot(ids) => ids.clone(),
+            Wait::Collision(collision) => collision.holders(),
+            _ => Vec::new(),
         }
     }
 
@@ -299,14 +303,16 @@ pub struct Due<K> {
 /// "Resources admitted at Build"): each of `due`, the one dispatched first
 /// first, then in identifier order ([`natural_cmp`]), waits when what it
 /// adds conflicts with anything `in_flight` holds, whatever the holder's
-/// dispatch time ([`collision`], the ticket weighed [`Dispatched::Now`]), so
-/// an admitted ticket never waits for one admitted after it; one that goes
-/// and [`Due::starts`] holds, for those after it, what it would hold once
-/// admitted. Each with its collision, `None` when it is admitted, in that
-/// order.
+/// dispatch time ([`weigh`] under the project's `overlap`, the ticket
+/// weighed [`Dispatched::Now`]), so an admitted ticket never waits for one
+/// admitted after it; one that goes and [`Due::starts`] holds, for those
+/// after it, what it would hold once admitted, so that under `rebase` two
+/// Builds of one pass never make a third holder of a path (OWL-449). Each
+/// with its collision, `None` when it is admitted, in that order.
 pub fn admissions<K: Clone + Ord + AsRef<str>>(
     due: &[Due<K>],
     in_flight: &[InFlight<K>],
+    overlap: Overlap,
 ) -> Vec<(K, Option<Collision<K>>)> {
     let mut order: Vec<&Due<K>> = due.iter().collect();
     order.sort_by(|a, b| {
@@ -323,9 +329,10 @@ pub fn admissions<K: Clone + Ord + AsRef<str>>(
             id: due.ticket.id.clone(),
             dispatched: Dispatched::Now,
             delivered: false,
+            outside: false,
             held: due.added.clone(),
         };
-        let found = collision(&weighed, &holders);
+        let found = weigh(&weighed, &holders, overlap).collision;
         if found.is_none() && due.starts {
             holders.retain(|holder| holder.id != due.ticket.id);
             holders.push(due.ticket.clone());
@@ -1024,16 +1031,16 @@ mod tests {
         assert_eq!(Wait::<&str>::NotReady.key(), "not_ready");
         assert!(Wait::<&str>::RunCap.tickets().is_empty());
         let slot = Wait::Slot(vec!["X-9"]);
-        assert_eq!((slot.key(), slot.tickets()), ("slot", &["X-9"][..]));
+        assert_eq!((slot.key(), slot.tickets()), ("slot", vec!["X-9"]));
         let held = Wait::BlockerUnknown(vec!["UTF-8"]);
         assert_eq!(
             (held.key(), held.tickets()),
-            ("blocker_unknown", &["UTF-8"][..])
+            ("blocker_unknown", vec!["UTF-8"])
         );
         let open = Wait::BlockedBy(vec!["X-1", "X-2"]);
         assert_eq!(
             (open.key(), open.tickets()),
-            ("blocked_by", &["X-1", "X-2"][..])
+            ("blocked_by", vec!["X-1", "X-2"])
         );
     }
 
@@ -1050,6 +1057,7 @@ mod tests {
             id,
             dispatched: Dispatched::At(at),
             delivered: false,
+            outside: false,
             held: held.to_vec(),
         };
         let due = |id, at, wanted: &[Resource], starts| Due {
@@ -1069,10 +1077,11 @@ mod tests {
             Some(Collision {
                 holder,
                 resource: zone(path),
+                sharing: None,
             })
         };
         assert_eq!(
-            admissions(&builds, &in_flight),
+            admissions(&builds, &in_flight, Overlap::Exclusive),
             [
                 ("B-9", None),
                 ("B-1", collided("B-9", "app/one.rs")),
@@ -1083,19 +1092,61 @@ mod tests {
         // B-9 held back from starting holds nothing for B-1.
         let mut held_back = builds.clone();
         held_back[1].starts = false;
-        assert_eq!(admissions(&held_back, &in_flight)[1], ("B-1", None));
+        assert_eq!(
+            admissions(&held_back, &in_flight, Overlap::Exclusive)[1],
+            ("B-1", None)
+        );
         // A return to Design's admission checks only what it adds.
         let returning = Due {
             ticket: flight("B-5", 5, &[zone("lib"), zone("web/a.rs")]),
             added: vec![zone("web/a.rs")],
             starts: true,
         };
-        assert_eq!(admissions(&[returning], &in_flight), [("B-5", None)]);
+        assert_eq!(
+            admissions(&[returning], &in_flight, Overlap::Exclusive),
+            [("B-5", None)]
+        );
         let collision = Wait::Collision(collided("H-1", "lib/a.rs").unwrap());
         assert_eq!(
             (collision.key(), collision.tickets(), collision.resource()),
-            ("collision", &["H-1"][..], Some(&zone("lib/a.rs")))
+            ("collision", vec!["H-1"], Some(&zone("lib/a.rs")))
         );
+    }
+
+    /// OWL-449: under `rebase`, two Builds of one pass that plan the same
+    /// file are both admitted, and the third waits, naming both.
+    #[test]
+    fn under_rebase_two_builds_of_a_pass_share_a_file_and_a_third_waits() {
+        let file = Resource::Zone("app/one.rs".to_owned());
+        let due = |id, at| Due {
+            ticket: InFlight {
+                id,
+                dispatched: Dispatched::At(at),
+                delivered: false,
+                outside: false,
+                held: vec![file.clone()],
+            },
+            added: vec![file.clone()],
+            starts: true,
+        };
+        let builds = [due("B-3", 30), due("B-1", 10), due("B-2", 20)];
+        assert_eq!(
+            admissions(&builds, &[], Overlap::Rebase),
+            [
+                ("B-1", None),
+                ("B-2", None),
+                (
+                    "B-3",
+                    Some(Collision {
+                        holder: "B-1",
+                        resource: file.clone(),
+                        sharing: Some("B-2"),
+                    })
+                ),
+            ]
+        );
+        let exclusive = admissions(&builds, &[], Overlap::Exclusive);
+        assert!(exclusive[1].1.is_some() && exclusive[2].1.is_some());
     }
 
     #[test]

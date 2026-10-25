@@ -466,6 +466,19 @@ pub(crate) fn earlier_left(review: &TicketReview, pass: u32) -> Vec<(u32, KeptFi
 /// The findings of the loop's passes at `stage` before `pass`, as a review
 /// brief gives them (OWL-356): each as the record keeps it, with its pass,
 /// oldest first, at most [`MAX_PASS_FINDINGS`], the latest kept.
+/// The number of a Verify pass on a resolution (OWL-449): the one after
+/// the record's last Verify pass, 1 when it has none.
+fn resolution_pass(review: Option<&TicketReview>) -> u32 {
+    review
+        .and_then(|review| {
+            review
+                .passes
+                .iter()
+                .rfind(|pass| pass.stage == Stage::Verify)
+        })
+        .map_or(1, |last| last.pass.get().saturating_add(1))
+}
+
 pub(crate) fn earlier_findings(
     review: Option<&TicketReview>,
     stage: Stage,
@@ -1634,6 +1647,13 @@ impl OnDemand<'_> {
     /// 2, what changed `since` the previous pass and the loop's earlier
     /// findings (OWL-356). The pass keeps what it reviewed: `head` at
     /// Verify, the plan's print at Design review.
+    ///
+    /// With `resolution`, the rebase whose resolution of a conflict on an
+    /// overlap it reviews at Watch (OWL-449, architecture section 5, "A
+    /// review after a resolution"), a Verify pass of its own: numbered after
+    /// the record's last Verify pass, so it never stands in for one, given no
+    /// earlier finding, its seats told the rebase (`rebase`), settled as a
+    /// last pass, and its `review` event marked `resolution`.
     #[allow(clippy::too_many_arguments)]
     pub(super) fn run_review_pass(
         &self,
@@ -1646,6 +1666,7 @@ impl OnDemand<'_> {
         since: Option<ReviewSince>,
         head: Option<String>,
         next: &dyn Fn(PassOutcome) -> &'static str,
+        resolution: Option<&RebaseBrief>,
         sink: &mut EventSink<'_>,
     ) -> Result<PassRun, Stop> {
         let ticket = p.ticket.clone();
@@ -1656,13 +1677,23 @@ impl OnDemand<'_> {
             (Role::DesignReview, self.design_review)
         };
         let stage_key = stage_name(stage);
-        let pass = state.review_pass_due();
+        let pass = match resolution {
+            Some(_) => resolution_pass(p.review.as_ref()),
+            None => state.review_pass_due(),
+        };
+        let settled_at = match resolution {
+            Some(_) => pass.max(owlshift_core::state::MAX_REVIEW_PASSES),
+            None => pass,
+        };
         let pass_id = NonZeroU32::new(pass).expect("a pass due counts from 1");
         let models = &self.config.models;
         let routed = reviewer_routing(dispatched.routing, |tier| claude_model(models, tier));
         let model = claude_model(models, routed.routing.tier);
         let seats = roster::roster(p.pipeline.variant(), stage);
-        let earlier = earlier_findings(p.review.as_ref(), stage, pass);
+        let earlier = match resolution {
+            Some(_) => Vec::new(),
+            None => earlier_findings(p.review.as_ref(), stage, pass),
+        };
         let seat_brief = |p: &Prepared, mandates: &[Mandate]| -> Result<Brief, Stop> {
             let comments = self.comments(&ticket)?;
             let mut brief = self.brief(p, role, &comments, &dispatched.rules, None, &current);
@@ -1679,6 +1710,7 @@ impl OnDemand<'_> {
                 since: since.clone(),
                 earlier: earlier.clone(),
             });
+            brief.rebase = resolution.cloned();
             Ok(brief)
         };
         let mut outputs: Vec<SeatOutput> = Vec::new();
@@ -1841,6 +1873,7 @@ impl OnDemand<'_> {
             if stage == Stage::Verify {
                 brief.pull_request_reviews = loop_reviews(p);
             }
+            brief.rebase = resolution.cloned();
             brief.findings = Some(GivenFindings {
                 mode: FindingsMode::Rule,
                 findings: findings.iter().map(|kept| kept.finding.clone()).collect(),
@@ -1873,8 +1906,8 @@ impl OnDemand<'_> {
             );
             last_run = Some(ran.run.clone());
         }
-        let verdict =
-            settle_pass(stage, pass, &mut findings, confirmation).expect("a review stage settles");
+        let verdict = settle_pass(stage, settled_at, &mut findings, confirmation)
+            .expect("a review stage settles");
         let reviewers_data: Vec<Value> = outputs
             .iter()
             .zip(&routings)
@@ -1901,6 +1934,9 @@ impl OnDemand<'_> {
             ("standing", json!(standing(&findings, confirmation).len())),
             ("reviewers", json!(reviewers_data)),
         ]);
+        if resolution.is_some() {
+            pass_data.insert("resolution".to_owned(), json!(true));
+        }
         if let Some(dropped) = &dropped {
             pass_data.insert(
                 "dropped".to_owned(),
@@ -2080,6 +2116,7 @@ impl OnDemand<'_> {
             since,
             None,
             &next,
+            None,
             sink,
         )?;
         let event = verdict.outcome.design_review_event(gate);

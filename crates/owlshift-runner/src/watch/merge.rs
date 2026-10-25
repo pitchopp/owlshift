@@ -638,7 +638,11 @@ impl Watch<'_> {
     }
 
     /// The head of `branch` on the forge, read once a pass.
-    fn base_head(&self, memory: &mut Memory, branch: &str) -> Result<String, forge::Error> {
+    pub(super) fn base_head(
+        &self,
+        memory: &mut Memory,
+        branch: &str,
+    ) -> Result<String, forge::Error> {
         if let Some(read) = memory.base_heads.get(branch) {
             return read.clone();
         }

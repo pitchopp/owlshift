@@ -154,6 +154,8 @@ const BUILD_BRIEF_FIELDS: &[&str] = &[
     "plan.plan",
     "plan.base",
     "findings.mode",
+    "overlaps.ticket",
+    "overlaps.paths",
     "result_path",
 ];
 

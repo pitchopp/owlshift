@@ -83,12 +83,18 @@ pub struct Read {
     pub checks: Vec<CheckRead>,
 }
 
-/// What `delivery.json` says of Owlshift's pushes.
+/// What `delivery.json` says of Owlshift's pushes, and what the runner read
+/// of the ticket's overlaps (OWL-449).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Followed<'a> {
     pub pushed: &'a str,
     pub pushing: Option<&'a str>,
     pub rebased_onto: Option<&'a str>,
+    /// The base branch's head, when it changes a path one of the ticket's
+    /// overlaps names and the pushed head does not contain it (architecture
+    /// section 5, "Tolerated overlap", "The refresh"): the runner's reading,
+    /// from git. `None` otherwise.
+    pub overlap: Option<&'a str>,
 }
 
 /// The base branch's head, its checks, and the checks of `base_at_push`
@@ -133,9 +139,8 @@ pub enum Action {
     WaitBaseRed,
     /// Every check passed with no conflict: the fix passes are cleared.
     Green,
-    /// A rebase run onto `onto`; `refresh` when there is no conflict but
-    /// the checks failed only on the base the head was pushed onto.
-    Rebase { onto: String, refresh: bool },
+    /// A rebase run onto `onto`, for `cause`.
+    Rebase { onto: String, cause: RebaseCause },
     /// The pull request conflicts with the base head the last rebase run
     /// used: that rebase failed, and no second one runs onto the same head.
     RebaseFailed { onto: String },
@@ -144,6 +149,40 @@ pub enum Action {
     Fix { overdue: Vec<String> },
     /// Only failures a person re-runs: park.
     Park,
+}
+
+/// Why a rebase run is due (OWL-449: `rebase_run` events name it, so that
+/// the runs are counted by cause).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum RebaseCause {
+    /// The pull request conflicts with its base.
+    Conflict,
+    /// Its checks failed only on the base it was pushed onto, and pass on
+    /// the base now: a refresh, CI not running again by itself.
+    BaseFixed,
+    /// Merge on green found it green on a base that moved since the push
+    /// (OWL-445): a refresh, which the runner decides.
+    MergeBase,
+    /// Its base now changes a path one of its overlaps names (OWL-449): a
+    /// refresh, so its checks run on the combined code.
+    Overlap,
+}
+
+impl RebaseCause {
+    /// Whether the forge reports no conflict: the run refreshes the branch.
+    pub const fn refresh(self) -> bool {
+        !matches!(self, Self::Conflict)
+    }
+
+    /// The cause's name in events.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Conflict => "conflict",
+            Self::BaseFixed => "base_fixed",
+            Self::MergeBase => "merge",
+            Self::Overlap => "overlap",
+        }
+    }
 }
 
 /// Decides on `read` by architecture section 5's table, in its order.
@@ -188,11 +227,21 @@ fn act(
             } else {
                 Action::Rebase {
                     onto,
-                    refresh: false,
+                    cause: RebaseCause::Conflict,
                 }
             };
         }
         Mergeable::Mergeable => {}
+    }
+    // A base that changes a path an overlap names, before the checks: a
+    // merge git makes cleanly does not prove two changes agree (OWL-449).
+    if let Some(onto) = followed.overlap
+        && followed.rebased_onto != Some(onto)
+    {
+        return Action::Rebase {
+            onto: onto.to_owned(),
+            cause: RebaseCause::Overlap,
+        };
     }
     let checks = collapse(&read.checks);
     let failed: Vec<&CheckRead> = checks.iter().filter(|c| c.outcome.failed()).collect();
@@ -248,7 +297,7 @@ fn act(
         if refreshed {
             return Action::Rebase {
                 onto: base.head.clone(),
-                refresh: true,
+                cause: RebaseCause::BaseFixed,
             };
         }
     }
@@ -563,6 +612,7 @@ mod tests {
             pushed: PUSHED,
             pushing: None,
             rebased_onto: None,
+            overlap: None,
         }
     }
 
@@ -647,6 +697,62 @@ mod tests {
 
     /// A conflict comes before the checks; a second rebase onto the base
     /// head the last one used is a failed run of that rebase.
+    /// OWL-449: a base that changes a path an overlap names gets a refresh
+    /// rebase before the checks are read, red or green, once per base head;
+    /// a conflict still comes first.
+    #[test]
+    fn a_base_changing_an_overlap_path_is_a_refresh_rebase() {
+        let moved = Followed {
+            overlap: Some("b3"),
+            ..followed()
+        };
+        let refresh = Action::Rebase {
+            onto: "b3".to_owned(),
+            cause: RebaseCause::Overlap,
+        };
+        for checks in [
+            &[("ci", Passed)][..],
+            &[("ci", CodeFailure)],
+            &[("ci", Pending)],
+            &[],
+        ] {
+            let r = read(Mergeable::Mergeable, checks);
+            assert_eq!(
+                decide(&r, moved, None, None),
+                Decision::Follow {
+                    adopt: false,
+                    action: refresh.clone()
+                },
+                "{checks:?}"
+            );
+        }
+        assert!(RebaseCause::Overlap.refresh() && !RebaseCause::Conflict.refresh());
+        let conflicting = read(Mergeable::Conflicting, &[("ci", Passed)]);
+        assert_eq!(
+            decide(&conflicting, moved, None, None),
+            Decision::Follow {
+                adopt: false,
+                action: Action::NeedsBase
+            }
+        );
+        let used = Followed {
+            rebased_onto: Some("b3"),
+            ..moved
+        };
+        assert_eq!(
+            decide(
+                &read(Mergeable::Mergeable, &[("ci", Passed)]),
+                used,
+                None,
+                None
+            ),
+            Decision::Follow {
+                adopt: false,
+                action: Action::Green
+            }
+        );
+    }
+
     #[test]
     fn a_conflict_is_a_rebase_unless_onto_the_head_already_used() {
         let r = read(Mergeable::Conflicting, &[("ci", CodeFailure)]);
@@ -656,7 +762,7 @@ mod tests {
             action(&r, Some(&b), None),
             Action::Rebase {
                 onto: "b2".to_owned(),
-                refresh: false
+                cause: RebaseCause::Conflict
             }
         );
         let used = Followed {
@@ -741,7 +847,7 @@ mod tests {
             action(&r, Some(&fixed), None),
             Action::Rebase {
                 onto: "b2".to_owned(),
-                refresh: true
+                cause: RebaseCause::BaseFixed
             }
         );
         // Passing then too: the pull request's own failure.

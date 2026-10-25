@@ -1,6 +1,6 @@
 +++
 role = "build"
-brief_format = 28
+brief_format = 29
 result_format = 14
 +++
 
@@ -49,7 +49,7 @@ Only after a step's commit lands do you set its `"done":true` and add `"commit":
 
 ## Building
 
-For each step, in order: implement it, run the checks it touches, commit it, then mark it done in the ledger with the commit's sha. One step, one commit, ledger after commit. Commit only your files, by explicit path; never commit the plan, the ledger or `result.json`. Follow `rules` for commit messages and sign-off. Keep to the plan's scope; work you notice outside it becomes a follow-up, not part of this branch.
+For each step, in order: implement it, run the checks it touches, commit it, then mark it done in the ledger with the commit's sha. One step, one commit, ledger after commit. Commit only your files, by explicit path; never commit the plan, the ledger or `result.json`. Follow `rules` for commit messages and sign-off. Keep to the plan's scope; work you notice outside it becomes a follow-up, not part of this branch. Each entry of `overlaps`, when the brief has it, is another ticket (`ticket`) built at the same time on the same `paths`: in such a file change only what your ticket needs, never reorder, reformat, rename or move what is there, so that the runner can rebase one branch onto the other.
 
 ## Deciding and asking
 

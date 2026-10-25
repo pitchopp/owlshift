@@ -498,6 +498,7 @@ impl OnDemand<'_> {
             since,
             Some(built.commit.clone()),
             &next,
+            None,
             sink,
         )?;
         if let Some(build) = review.build.as_mut() {
@@ -537,6 +538,141 @@ impl OnDemand<'_> {
                 Ok(Verified::Revise(next))
             }
         }
+    }
+
+    /// The Verify pass on a rebase's resolution (OWL-449; architecture
+    /// section 5, "Tolerated overlap", "A review after a resolution"): a
+    /// rebase run at Watch, `done`, resolved a non-trivial conflict on a
+    /// path one of the ticket's overlaps names, its gate passed. Before its
+    /// push, one Verify pass with the ticket's roster, the arbiter when the
+    /// project confirms findings so and the opt-in Codex seat, on the whole
+    /// pull request as rebased, told the rebase `told`, and settled as a
+    /// last pass ([`Self::run_review_pass`]): one that passes leaves the
+    /// rebased commit to push; one that leaves findings gives them to one
+    /// last Build-role run at Watch on the rebased head, which fixes,
+    /// disagrees with or defers each, as Verify's last fix does, then the
+    /// gate; its commit, which must still be a rebase of the delivery onto
+    /// `onto` ([`rebase_keeps_delivery`]), is what is pushed. The ticket stays
+    /// at Watch: the pass's and the fix's failed runs count as the rebase's
+    /// do, and a crash before the push leaves nothing pushed, the next
+    /// repair rebasing and reviewing again. The pass is kept in the review
+    /// record with the push.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn review_resolution(
+        &self,
+        p: &mut Prepared,
+        dispatched: &Dispatched,
+        done: RepairDone,
+        mut followups: Vec<Followup>,
+        told: &RebaseBrief,
+        pushed: &CommitId,
+        onto: &CommitId,
+        sink: &mut EventSink<'_>,
+    ) -> Result<(RepairDone, Vec<Followup>), Stop> {
+        let commit = done.repaired.commit.to_string();
+        let mut state = done.state;
+        let diff = self.review_diff(p, &commit)?;
+        let next = |outcome: PassOutcome| match outcome {
+            PassOutcome::Passed => "push",
+            PassOutcome::Revise | PassOutcome::LastFix => "last_fix",
+        };
+        let PassRun {
+            pass,
+            findings,
+            verdict,
+            review,
+            ..
+        } = self.run_review_pass(
+            p,
+            dispatched,
+            &mut state,
+            Stage::Verify,
+            design::given_plan(p),
+            Some(diff),
+            None,
+            Some(commit.clone()),
+            &next,
+            Some(told),
+            sink,
+        )?;
+        p.review = Some(review);
+        let confirmation = self.config.pipeline.findings();
+        let given = match verdict.outcome {
+            PassOutcome::Passed => None,
+            PassOutcome::Revise | PassOutcome::LastFix => {
+                design::given_to_author(&findings, &verdict, confirmation, &[Fate::LastFix])
+            }
+        };
+        let Some(given) = given else {
+            let repaired = Repaired {
+                summary: format!(
+                    "{} Verify pass {pass} reviewed the resolution and passed.",
+                    done.repaired.summary
+                ),
+                ..done.repaired
+            };
+            let done = RepairDone {
+                state,
+                repaired,
+                result: done.result,
+            };
+            return Ok((done, followups));
+        };
+        let harness = self.build.harness(dispatched.build);
+        let build = |_: u32| &*harness;
+        let decorate = |brief: &mut Brief, questions: &TicketQuestions| {
+            brief.findings = Some(given.clone());
+            tell_build(brief, questions);
+        };
+        let git = &self.executor.git;
+        let checkout = p.checkout.clone();
+        let accept =
+            |commit: &CommitId| rebase_keeps_delivery(git, &checkout, pushed, onto, commit);
+        let (fixed, more) = self.repair_runs(
+            p,
+            state,
+            &RepairRun {
+                role: Role::Build,
+                what: "last fix",
+                pull_request: told.pull_request.unwrap_or_default(),
+                rules: &dispatched.rules,
+                harness: &build,
+                before: &|_, _, _| Ok(()),
+                decorate: &decorate,
+                accept: &accept,
+            },
+            sink,
+        )?;
+        gather(&mut followups, &more);
+        let review = p.review.get_or_insert_with(TicketReview::new);
+        design::mark_answered(review, Stage::Verify, &given, &fixed.result);
+        let count = |outcome: FindingOutcome| {
+            review.passes.last().map_or(0, |last| {
+                last.findings
+                    .iter()
+                    .filter(|kept| kept.outcome == Some(outcome))
+                    .count()
+            })
+        };
+        let summary = format!(
+            "{} Verify pass {pass} reviewed the resolution; its {} findings went to one last \
+             fix, which fixed {}, disagreed with {} and deferred {}: {}",
+            done.repaired.summary,
+            given.findings.len(),
+            count(FindingOutcome::Fixed),
+            count(FindingOutcome::Disagreed),
+            count(FindingOutcome::Deferred),
+            fixed.repaired.summary
+        );
+        let done = RepairDone {
+            state: fixed.state,
+            repaired: Repaired {
+                summary,
+                ..fixed.repaired
+            },
+            result: fixed.result,
+        };
+        Ok((done, followups))
     }
 
     /// Whether `continue` may run again the Verify pass of a ticket at

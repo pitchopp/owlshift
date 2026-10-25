@@ -258,6 +258,21 @@
       },
       "additionalProperties": false
     },
+    "Overlap": {
+      "description": "Whether two of the project's tickets may hold the same file\n(`policy.overlap`, OWL-449; architecture section 5, \"Tolerated\noverlap\"), read at the base branch's head.",
+      "oneOf": [
+        {
+          "description": "Never: a ticket that would touch what another holds waits. The\ndefault.",
+          "type": "string",
+          "const": "exclusive"
+        },
+        {
+          "description": "Two Owlshift tickets may hold a file or a zone, the overlap recorded\nand repaired at Watch by a refresh rebase; named resources,\nwhole-repository holders, other pull requests and people's tickets\nstill exclude, and no file is held by more than two.",
+          "type": "string",
+          "const": "rebase"
+        }
+      ]
+    },
     "Pipeline": {
       "type": "object",
       "properties": {
@@ -330,6 +345,17 @@
           "format": "uint8",
           "maximum": 20,
           "minimum": 1
+        },
+        "overlap": {
+          "description": "Whether two of the project's tickets may hold the same file (OWL-449;\narchitecture section 5, \"Tolerated overlap\"): `exclusive`, the\ndefault, or `rebase`, which lets two Owlshift tickets build on one\nfile or zone and repairs them at Watch. Read at the base branch's\nhead, so a ticket's own branch cannot turn it on. A file using it\nrequires an Owlshift that reads it.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Overlap"
+            },
+            {
+              "type": "null"
+            }
+          ]
         },
         "quiet_window_minutes": {
           "description": "How long the decider's latest comment must be left unedited before\ntheir answer counts, in whole minutes from 1 to 1440 (a day). Absent:\n10 minutes. Zero is refused: every edit would count at once, which is\nwhat ending a comment with `go` is for.",

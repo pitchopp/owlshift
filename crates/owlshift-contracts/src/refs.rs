@@ -349,6 +349,24 @@ pub const MAX_HELD_BYTES: usize = 256 * 1024;
 pub const MAX_HELD_PATH_BYTES: usize = 4_096;
 /// The widenings whose time a [`TicketHeld`] keeps: the latest ones.
 pub const MAX_WIDENINGS: usize = 100;
+/// The most overlaps a [`TicketHeld`] keeps, one per sibling ticket
+/// (OWL-449): past it a new sibling's overlap is not kept, its event told.
+pub const MAX_OVERLAPS: usize = 100;
+
+/// An overlap a ticket tolerates under `policy.overlap = "rebase"`
+/// (OWL-449; architecture section 5, "Tolerated overlap"): another of
+/// Owlshift's tickets holds what it holds on `paths`, since `at`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct HeldOverlap {
+    /// The sibling ticket.
+    #[schemars(with = "String")]
+    pub ticket: TicketId,
+    /// The shared paths, files or zones, each once, sorted, at least one.
+    pub paths: Vec<String>,
+    /// When the overlap was first recorded.
+    pub at: Timestamp,
+}
 
 /// What a ticket holds against the project's other tickets, in
 /// [`HELD_FILE`] (OWL-403, architecture section 5, "What a ticket holds"):
@@ -360,7 +378,8 @@ pub const MAX_WIDENINGS: usize = 100;
 /// belongs to the ticket's text and is replaced by the next intake.
 ///
 /// Format 1, written before OWL-448, held what its dispatch declared: it
-/// reads as admitted at its dispatch, with no plan admitted.
+/// reads as admitted at its dispatch, with no plan admitted. Format 2,
+/// before OWL-449, reads with no overlap.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 #[schemars(title = "Owlshift ticket held")]
@@ -411,6 +430,12 @@ pub struct TicketHeld {
     /// and by a new dispatch.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub verified: Option<String>,
+    /// The overlaps its Build's admission and its widenings tolerated under
+    /// `policy.overlap = "rebase"` (format 3, OWL-449), one per sibling, by
+    /// identifier. Each is recorded by one side only: the other ticket's
+    /// record may name this one.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub overlaps: Vec<HeldOverlap>,
 }
 
 impl TicketHeld {
@@ -430,6 +455,7 @@ impl TicketHeld {
             widened_at: Vec::new(),
             delivered_at: None,
             verified: None,
+            overlaps: Vec::new(),
         }
     }
 
@@ -521,6 +547,51 @@ impl TicketHeld {
         }
     }
 
+    /// Records that `ticket` holds what this ticket holds on `paths`, at
+    /// `at` (OWL-449): a sibling already recorded gains the paths it lacked,
+    /// keeping its first time; a new one is added in identifier order.
+    /// Gives the paths it added, none when the record already named them
+    /// all; `None`, nothing changed, for a new sibling once [`MAX_OVERLAPS`]
+    /// are kept: the record cannot take it, which the caller must not take
+    /// as recorded.
+    pub fn record_overlap(
+        &mut self,
+        ticket: &TicketId,
+        paths: &[String],
+        at: Timestamp,
+    ) -> Option<Vec<String>> {
+        let keepable: Vec<&String> = paths.iter().filter(|path| keepable_path(path)).collect();
+        if keepable.is_empty() {
+            return Some(Vec::new());
+        }
+        let index = match self.overlaps.iter().position(|kept| kept.ticket == *ticket) {
+            Some(index) => index,
+            None if self.overlaps.len() >= MAX_OVERLAPS => return None,
+            None => {
+                self.overlaps.push(HeldOverlap {
+                    ticket: ticket.clone(),
+                    paths: Vec::new(),
+                    at,
+                });
+                self.overlaps.sort_by(|a, b| a.ticket.cmp(&b.ticket));
+                self.overlaps
+                    .iter()
+                    .position(|kept| kept.ticket == *ticket)
+                    .expect("just added")
+            }
+        };
+        let kept = &mut self.overlaps[index];
+        let mut added = Vec::new();
+        for path in keepable {
+            if !kept.paths.contains(path) && !added.contains(path) {
+                added.push(path.clone());
+            }
+        }
+        kept.paths.extend(added.iter().cloned());
+        kept.paths.sort();
+        Some(added)
+    }
+
     /// [`Self::widen`], without keeping its time among the widenings.
     fn widen_by(&mut self, files: impl IntoIterator<Item = String>, at: Timestamp) -> Vec<String> {
         if self.whole() {
@@ -545,7 +616,8 @@ impl TicketHeld {
 
     /// Parses and validates a `held.json`. A format-1 one, kept before
     /// OWL-448, is read as the current format admitted at its dispatch, with
-    /// no plan admitted: it keeps holding what its dispatch declared.
+    /// no plan admitted: it keeps holding what its dispatch declared. A
+    /// format-2 one, kept before OWL-449, is read with no overlap.
     pub fn parse(input: &str) -> Result<Self, ContractError> {
         let held: Self = match Self::from_older_format(input) {
             Some(read) => read?,
@@ -555,22 +627,34 @@ impl TicketHeld {
         Ok(held)
     }
 
-    /// A format-1 document read as the current format, or `None` for any
-    /// other. Format 1 is format 2 without `admitted_at` and `plan_sha256`,
-    /// which are refused in it.
+    /// A format-1 or format-2 document read as the current format, or
+    /// `None` for any other. Format 1 is format 2 without `admitted_at` and
+    /// `plan_sha256`, which are refused in it; format 2 is format 3 without
+    /// `overlaps`, refused in either.
     fn from_older_format(input: &str) -> Option<Result<Self, ContractError>> {
         let mut document: serde_json::Value = serde_json::from_str(input).ok()?;
-        if document.get("format").and_then(serde_json::Value::as_u64) != Some(1) {
+        let format = document.get("format").and_then(serde_json::Value::as_u64);
+        if !matches!(format, Some(1 | 2)) {
             return None;
         }
-        if document.get("admitted_at").is_some() || document.get("plan_sha256").is_some() {
+        if document.get("overlaps").is_some() {
+            return Some(Err(ContractError::invalid(
+                Self::CONTRACT,
+                "formats 1 and 2 keep no overlap",
+            )));
+        }
+        if format == Some(1)
+            && (document.get("admitted_at").is_some() || document.get("plan_sha256").is_some())
+        {
             return Some(Err(ContractError::invalid(
                 Self::CONTRACT,
                 "format 1 keeps no admission",
             )));
         }
         document["format"] = HELD_FORMAT.into();
-        if let Some(at) = document.get("dispatched_at").cloned() {
+        if format == Some(1)
+            && let Some(at) = document.get("dispatched_at").cloned()
+        {
             document["admitted_at"] = at;
         }
         Some(
@@ -647,6 +731,35 @@ impl TicketHeld {
             && !is_commit_id(commit)
         {
             return invalid(format!("verified {commit:?} is not a commit id"));
+        }
+        if self.overlaps.len() > MAX_OVERLAPS {
+            return invalid(format!(
+                "{} overlaps are kept, past the {MAX_OVERLAPS} it keeps",
+                self.overlaps.len()
+            ));
+        }
+        if self
+            .overlaps
+            .windows(2)
+            .any(|pair| pair[0].ticket >= pair[1].ticket)
+        {
+            return invalid("the overlaps are not one per ticket, sorted".to_owned());
+        }
+        for overlap in &self.overlaps {
+            let ticket = &overlap.ticket;
+            if overlap.paths.is_empty() {
+                return invalid(format!("the overlap with {ticket} names no path"));
+            }
+            if overlap.paths.windows(2).any(|pair| pair[0] >= pair[1]) {
+                return invalid(format!(
+                    "the paths of the overlap with {ticket} are not sorted, each once"
+                ));
+            }
+            if let Some(path) = overlap.paths.iter().find(|path| !keepable_path(path)) {
+                return invalid(format!(
+                    "the overlap with {ticket} names {path:?}, not a path it keeps"
+                ));
+            }
         }
         Ok(())
     }

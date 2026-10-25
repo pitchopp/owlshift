@@ -479,7 +479,7 @@ fn a_ticket_holding_the_whole_repository_is_widened_by_nothing() {
 /// cannot be read is never free: a widening of it keeps its files, and one
 /// past its bounds or unread admits the whole repository at that time. A
 /// format-1 record reads as admitted at its dispatch, holding what its
-/// dispatch declared, and is written back as format 2; format 1 keeps no
+/// dispatch declared, and is written back as format 3; format 1 keeps no
 /// admission.
 #[test]
 fn a_ticket_held_admits_nothing_at_its_dispatch_and_reads_format_1_as_admitted() {
@@ -490,7 +490,7 @@ fn a_ticket_held_admits_nothing_at_its_dispatch_and_reads_format_1_as_admitted()
     assert!(!nothing.admitted() && !nothing.whole() && nothing.zones.is_empty());
     assert_eq!(TicketHeld::parse(&nothing.render()).unwrap(), nothing);
     let document: Value = serde_json::from_str(&nothing.render()).unwrap();
-    assert_eq!(document["format"], json!(2));
+    assert_eq!(document["format"], json!(3));
     for (field, value) in [
         ("zones", json!(["app"])),
         ("resources", json!(["migrations"])),
@@ -530,7 +530,7 @@ fn a_ticket_held_admits_nothing_at_its_dispatch_and_reads_format_1_as_admitted()
         (&vec!["app".to_owned()], Some(at(0)), None)
     );
     let rendered: Value = serde_json::from_str(&read.render()).unwrap();
-    assert_eq!(rendered["format"], json!(2));
+    assert_eq!(rendered["format"], json!(3));
     assert_eq!(TicketHeld::parse(&read.render()).unwrap(), read);
     // One kept for a ref from before P6, with no dispatch time, holds the
     // whole repository.
@@ -539,4 +539,97 @@ fn a_ticket_held_admits_nothing_at_its_dispatch_and_reads_format_1_as_admitted()
     let mut admitting = old.clone();
     admitting["admitted_at"] = json!(at(1).to_string());
     assert!(TicketHeld::parse(&admitting.to_string()).is_err());
+}
+
+/// OWL-449: the overlaps a ticket tolerates under `rebase`, one per
+/// sibling, by identifier, their paths sorted, each once, the first time
+/// kept; read back, valid against the schema; refused unsorted, empty or
+/// with a path it cannot keep, and in a record of format 1 or 2, which
+/// reads with none.
+#[test]
+fn a_ticket_held_records_its_overlaps_once_per_sibling() {
+    let at = |minute: i64| -> jiff::Timestamp {
+        jiff::Timestamp::from_second(1_790_000_000 + minute * 60).unwrap()
+    };
+    let id = |name: &str| owlshift_contracts::ids::TicketId::new(name).unwrap();
+    let paths = |names: &[&str]| names.iter().map(|n| (*n).to_owned()).collect::<Vec<_>>();
+    let mut held = admitted(&["app/one.rs"], &[], at(0));
+    assert_eq!(
+        held.record_overlap(&id("DEMO-9"), &paths(&["app/one.rs"]), at(1)),
+        Some(paths(&["app/one.rs"]))
+    );
+    assert_eq!(
+        held.record_overlap(&id("DEMO-2"), &paths(&["web/b.rs", "app/one.rs"]), at(2)),
+        Some(paths(&["web/b.rs", "app/one.rs"]))
+    );
+    assert_eq!(
+        held.record_overlap(&id("DEMO-9"), &paths(&["app/one.rs"]), at(3)),
+        Some(Vec::new())
+    );
+    assert_eq!(
+        held.record_overlap(&id("DEMO-9"), &paths(&["app/two.rs"]), at(4)),
+        Some(paths(&["app/two.rs"]))
+    );
+    let kept: Vec<_> = held
+        .overlaps
+        .iter()
+        .map(|o| (o.ticket.as_str(), o.paths.clone(), o.at))
+        .collect();
+    assert_eq!(
+        kept,
+        [
+            ("DEMO-2", paths(&["app/one.rs", "web/b.rs"]), at(2)),
+            ("DEMO-9", paths(&["app/one.rs", "app/two.rs"]), at(1)),
+        ]
+    );
+    let document: Value = serde_json::from_str(&held.render()).unwrap();
+    let path =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../schemas/ticket-held.schema.json");
+    let schema: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+    assert!(
+        jsonschema::validator_for(&schema)
+            .unwrap()
+            .is_valid(&document)
+    );
+    assert_eq!(TicketHeld::parse(&held.render()).unwrap(), held);
+    for broken_overlaps in [
+        json!([document["overlaps"][1], document["overlaps"][0]]),
+        json!([{ "ticket": "DEMO-2", "paths": [], "at": at(2).to_string() }]),
+        json!([{ "ticket": "DEMO-2", "paths": ["b", "a"], "at": at(2).to_string() }]),
+        json!([{ "ticket": "DEMO-2", "paths": [""], "at": at(2).to_string() }]),
+    ] {
+        let mut broken = document.clone();
+        broken["overlaps"] = broken_overlaps.clone();
+        assert!(
+            TicketHeld::parse(&broken.to_string()).is_err(),
+            "{broken_overlaps}"
+        );
+    }
+    let mut older = document.clone();
+    older["format"] = json!(2);
+    assert!(TicketHeld::parse(&older.to_string()).is_err());
+    older.as_object_mut().unwrap().remove("overlaps");
+    let read = TicketHeld::parse(&older.to_string()).unwrap();
+    assert!(read.overlaps.is_empty() && read.admitted());
+    // Past the most it keeps, a new sibling is refused, never taken as
+    // recorded; one already kept still gains paths.
+    let mut full = admitted(&["app/one.rs"], &[], at(0));
+    for n in 0..owlshift_contracts::refs::MAX_OVERLAPS {
+        let sibling = id(&format!("DEMO-{}", 100 + n));
+        assert!(
+            full.record_overlap(&sibling, &paths(&["app/one.rs"]), at(1))
+                .is_some()
+        );
+    }
+    let before = full.clone();
+    assert_eq!(
+        full.record_overlap(&id("DEMO-1"), &paths(&["app/one.rs"]), at(2)),
+        None
+    );
+    assert_eq!(full, before);
+    assert_eq!(
+        full.record_overlap(&id("DEMO-100"), &paths(&["app/two.rs"]), at(2)),
+        Some(paths(&["app/two.rs"]))
+    );
+    assert_eq!(TicketHeld::parse(&full.render()).unwrap(), full);
 }

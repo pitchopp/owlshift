@@ -80,8 +80,9 @@ use owlshift_adapters::harness::claude::Usage;
 use owlshift_adapters::notifier::Notifier;
 use owlshift_adapters::tracker::{self, Author as TrackerAuthor, Comment, Person, Ticket, Tracker};
 use owlshift_contracts::brief::{
-    AnsweredQuestion, AskedBy, Author, Brief, Checkpoint, GateFailure, GivenPlan, PermissionLevel,
-    Permissions, PullRequestReview, RebaseBrief, Relation, ThreadEntry, TicketBrief,
+    AnsweredQuestion, AskedBy, Author, Brief, BriefOverlap, Checkpoint, GateFailure, GivenPlan,
+    PermissionLevel, Permissions, PullRequestReview, RebaseBrief, Relation, ThreadEntry,
+    TicketBrief,
 };
 use owlshift_contracts::comment::{MarkedComment, MarkerKind};
 use owlshift_contracts::config::{Admit, ProjectConfig, States, TrackerKind};
@@ -100,7 +101,7 @@ use owlshift_contracts::result::{
 };
 use owlshift_contracts::review::{KeptBuild, KeptFinding, TicketPlan, TicketReview};
 use owlshift_contracts::{BasisKind, DelegationLevel, Role, Stage, Variant};
-use owlshift_core::collision::{self, Collision, InFlight, collision};
+use owlshift_core::collision::{self, Collision, InFlight};
 use owlshift_core::decider::{self, Decider, NoDecider, ZoneOwners, brief_zones, ticket_zones};
 use owlshift_core::gate::{BudgetReached, Chain, ChainCost, GatePolicy, TicketSpend};
 use owlshift_core::pipeline::Pipeline;
@@ -141,9 +142,9 @@ use crate::writer::{
     VisibleStage, WriteError, Writer, park_reason, rebase_keeps_delivery,
 };
 use owlshift_core::follow::{
-    Action as FollowAction, Decision as FollowDecision, EndReason as FollowEnd,
+    Action as FollowAction, Decision as FollowDecision, EndReason as FollowEnd, RebaseCause,
 };
-use owlshift_core::vocab::MergeSwitch;
+use owlshift_core::vocab::{MergeSwitch, Overlap};
 
 /// How long one Build run may take before its process tree is stopped.
 pub const DEFAULT_RUN_TIMEOUT: Duration = Duration::from_secs(2 * 60 * 60);
@@ -1580,8 +1581,14 @@ impl ProjectFile {
 /// [`OnDemand::widen`]), for the event that follows `run_ended`.
 enum Widened {
     /// These files, not held before; `whole` once the ticket holds the
-    /// whole repository.
-    Files { added: Vec<String>, whole: bool },
+    /// whole repository. Under `rebase`, the overlaps the widening recorded
+    /// with the siblings holding some of them (OWL-449), or why it could
+    /// recorded none.
+    Files {
+        added: Vec<String>,
+        whole: bool,
+        overlaps: Result<held::Recorded, String>,
+    },
     /// The files changed could not be read, for this reason: the whole
     /// repository.
     Unread(String),
@@ -1603,7 +1610,7 @@ impl Widened {
     /// (`widening_unread`, with the reason).
     fn data(&self) -> Data {
         match self {
-            Widened::Files { added, whole } => data([
+            Widened::Files { added, whole, .. } => data([
                 ("held", json!("widened")),
                 (
                     "files",
@@ -1996,7 +2003,9 @@ impl OnDemand<'_> {
         let wait = match schedule::slot_turn(&holding, &locked.unread, capacity) {
             Turn::Holders(holders) if !holders.contains(&own.id) => Some(Wait::Slot(holders)),
             Turn::Unknown(unread) => Some(Wait::Slot(unread)),
-            Turn::Holders(_) => collision(&own, &locked.in_flight).map(Wait::Collision),
+            Turn::Holders(_) => collision::weigh(&own, &locked.in_flight, self.overlap_policy(p))
+                .collision
+                .map(Wait::Collision),
         };
         match wait {
             Some(wait) => Err(self.waits(&p.ticket, &wait, &locked)),
@@ -2036,7 +2045,7 @@ impl OnDemand<'_> {
             let hash = design::plan_sha256(&given.plan);
             (given.plan, hash)
         });
-        let Some(next) = held::at_build(
+        let Some(mut next) = held::at_build(
             Some(&before),
             plan.as_ref().map(|(plan, hash)| (plan, hash.as_str())),
             p.intake.as_ref(),
@@ -2052,17 +2061,32 @@ impl OnDemand<'_> {
             (false, Some(outside)) => Some(outside),
             (false, None) => Some(self.outside_now(&p.ticket)?),
         };
+        // The switch at the base this command fetched (OWL-449).
+        let overlap = self.overlap_policy(p);
         let _section = self.section()?;
+        let mut recorded = held::Recorded::default();
         if let Some(outside) = outside {
             let locked = self.locked_load(p, Some(&outside), &named)?;
             let weighed = InFlight {
                 id: p.ticket.as_str().to_owned(),
                 dispatched: collision::Dispatched::Now,
                 delivered: false,
+                outside: false,
                 held: added,
             };
-            if let Some(found) = collision(&weighed, &locked.in_flight) {
-                let holder = in_flight::named(&locked.kinds, &found.holder);
+            let weighed = collision::weigh(&weighed, &locked.in_flight, overlap);
+            // What it shares with its siblings, recorded with the admission
+            // in the same section (OWL-449); an overlap its record cannot
+            // take, keeping the most it keeps, no refresh would cover: the
+            // Build waits for that sibling, as past the bound.
+            recorded = held::record(&mut next, &weighed.overlaps, (self.clock)());
+            let unkept = recorded.unkept.first().map(|shared| Collision {
+                holder: shared.ticket.clone(),
+                resource: Resource::Zone(shared.paths.first().cloned().unwrap_or_default()),
+                sharing: None,
+            });
+            if let Some(found) = weighed.collision.or(unkept) {
+                let (holding, who) = in_flight::holding(&locked.kinds, &found);
                 if p.stepping {
                     let mut event = data([
                         ("watch", json!("waits")),
@@ -2070,7 +2094,7 @@ impl OnDemand<'_> {
                         ("stage", json!("build")),
                         ("resource", held::resource_data(&found.resource)),
                     ]);
-                    for (key, value) in holder.data() {
+                    for (key, value) in in_flight::holding_data(&locked.kinds, &found) {
                         event.insert(key.to_owned(), value);
                     }
                     sink.emit(&p.ticket, None, EventKind::Decision, event);
@@ -2078,8 +2102,8 @@ impl OnDemand<'_> {
                 return Err(Stop::Waits {
                     ticket: p.ticket.clone(),
                     said: format!(
-                        "{holder} holds {}, which its Build would take: its Build is admitted \
-                         once {holder} no longer holds it",
+                        "{holding} {}, which its Build would take: its Build is admitted once \
+                         {who} no longer holds it",
                         found.resource
                     ),
                     cap: None,
@@ -2087,7 +2111,58 @@ impl OnDemand<'_> {
             }
         }
         p.held = Some(next);
-        self.keep(p, state)
+        self.keep(p, state)?;
+        for (sibling, paths) in &recorded.kept {
+            sink.emit(
+                &p.ticket,
+                None,
+                EventKind::Decision,
+                held::overlap_event("admission", sibling, paths),
+            );
+        }
+        Ok(())
+    }
+
+    /// The project's `policy.overlap` at the base `p`'s command fetched
+    /// (OWL-449; architecture section 5, "Tolerated overlap"): never a
+    /// ticket's own branch's. A project file that cannot be read there is
+    /// `exclusive`, so what cannot be read is never taken as shared.
+    fn overlap_policy(&self, p: &Prepared) -> Overlap {
+        project::overlap_at(&self.executor.git, &p.checkout, &p.base).unwrap_or_default()
+    }
+
+    /// The base head `p`'s command fetched, when it changes a path one of
+    /// the ticket's overlaps names since `delivery`'s push and its pushed
+    /// head does not contain it ([`held::base_moved_on`], OWL-449): what a
+    /// refresh rebases onto, as watch reads it. `None` too when git cannot
+    /// tell, the next read asking again.
+    fn overlap_base(&self, p: &Prepared, delivery: &TicketDelivery) -> Option<String> {
+        let pushed = delivery.pushed.as_deref()?;
+        let paths: Vec<String> = self
+            .overlaps(p)
+            .into_iter()
+            .flat_map(|(_, paths)| paths)
+            .collect();
+        held::base_moved_on(
+            &self.executor.git,
+            &p.checkout,
+            pushed,
+            delivery.base_at_push.as_deref(),
+            &p.base.commit,
+            &paths,
+        )
+        .unwrap_or(false)
+        .then(|| p.base.commit.clone())
+    }
+
+    /// The overlaps of `p`'s ticket from both sides, its own record's and
+    /// those the project's other ticket refs keep naming it
+    /// ([`held::overlaps_of`], OWL-449); its own alone when the refs cannot
+    /// be listed.
+    fn overlaps(&self, p: &Prepared) -> Vec<(TicketId, Vec<String>)> {
+        let others =
+            ticket_ref::others(&self.executor.git, &p.checkout, &p.ticket).unwrap_or_default();
+        held::overlaps_of(&p.ticket, p.held.as_ref(), &others)
     }
 
     /// What the ticket holds from this dispatch (OWL-448; architecture
@@ -2626,7 +2701,9 @@ impl OnDemand<'_> {
         };
         let mut following = Following::default();
         let now = (self.clock)();
-        let (look, warnings) = following.look(self.forge, &ticket, delivery, now);
+        let overlap = self.overlap_base(p, delivery);
+        let (look, warnings) =
+            following.look(self.forge, &ticket, delivery, now, overlap.as_deref());
         for warning in warnings {
             sink.emit(&ticket, None, EventKind::Warning, warning);
         }
@@ -3465,7 +3542,7 @@ impl OnDemand<'_> {
             ("reason", json!("collision")),
             ("resource", held::resource_data(&found.resource)),
         ];
-        why.extend(holders.named(&found.holder).data());
+        why.extend(in_flight::holding_data(&holders.kinds, &found));
         Ok(Some(why))
     }
 
@@ -3497,7 +3574,7 @@ impl OnDemand<'_> {
             .collect();
         outside.join(&mut in_flight, named);
         let own = held::of(&p.ticket, p.held.as_ref(), false, named);
-        Ok(collision(&own, &in_flight))
+        Ok(collision::weigh(&own, &in_flight, self.overlap_policy(p)).collision)
     }
 
     /// A delivery held back for `why`, the `decision` event's fields
@@ -4984,29 +5061,89 @@ impl OnDemand<'_> {
     /// read widen it to the whole repository. A ticket whose ref keeps no
     /// `held.json` holds the whole repository already, and one with no branch
     /// changed nothing.
-    fn widen(&self, p: &mut Prepared, role: Role) -> Option<Widened> {
+    ///
+    /// Under `policy.overlap = "rebase"` (OWL-449), a widening that added
+    /// files records the overlaps they make with the project's other
+    /// tickets, read again in one of the project's sections that the
+    /// caller holds until the ref is written, as an admission records its
+    /// own, so that a widening and a sibling's admission never miss each
+    /// other. The section is given back with the widening; a section that
+    /// cannot be had records none, which the event tells.
+    fn widen(&self, p: &mut Prepared, role: Role) -> (Option<Widened>, Option<ProjectLock>) {
         if !matches!(role, Role::Build | Role::Rebase) || p.held.is_none() {
-            return None;
+            return (None, None);
         }
         let now = (self.clock)();
         let read = match self.read_branch_head(p) {
             Ok(Some(head)) => {
                 held::changed_files(&self.executor.git, &p.checkout, &p.base.commit, &head)
             }
-            Ok(None) => return None,
+            Ok(None) => return (None, None),
             Err(reason) => Err(reason),
         };
-        let held = p.held.as_mut()?;
-        match read {
-            Ok(files) => {
-                let added = held.widen(files, now);
-                (!added.is_empty()).then(|| Widened::Files {
-                    added,
-                    whole: held.whole(),
-                })
+        let Some(held) = p.held.as_mut() else {
+            return (None, None);
+        };
+        let added = match read {
+            Ok(files) => held.widen(files, now),
+            Err(reason) => {
+                return (
+                    held.widen_whole(now).then_some(Widened::Unread(reason)),
+                    None,
+                );
             }
-            Err(reason) => held.widen_whole(now).then_some(Widened::Unread(reason)),
+        };
+        if added.is_empty() {
+            return (None, None);
         }
+        let whole = held.whole();
+        if whole || self.overlap_policy(p) == Overlap::Exclusive {
+            let widened = Widened::Files {
+                added,
+                whole,
+                overlaps: Ok(held::Recorded::default()),
+            };
+            return (Some(widened), None);
+        }
+        let (overlaps, section) = match self.section() {
+            Ok(section) => (self.widening_overlaps(p, now), Some(section)),
+            Err(stop) => (Err(stop.to_string()), None),
+        };
+        let widened = Widened::Files {
+            added,
+            whole,
+            overlaps,
+        };
+        (Some(widened), section)
+    }
+
+    /// The overlaps a widening of `p`'s ticket makes under `rebase`, recorded
+    /// in what it holds at `now` (OWL-449): what it holds weighed against
+    /// the project's other ticket refs, read again, and the open pull
+    /// requests Owlshift follows; only Owlshift's tickets are siblings. A
+    /// widening holds no step, so a collision found here waits for the next
+    /// check, before its next step or its delivery.
+    fn widening_overlaps(
+        &self,
+        p: &mut Prepared,
+        now: Timestamp,
+    ) -> Result<held::Recorded, String> {
+        let named = self.config.stack.named_resources().unwrap_or_default();
+        let others = ticket_ref::others(&self.executor.git, &p.checkout, &p.ticket)?;
+        let in_flight: Vec<InFlight<String>> = others
+            .iter()
+            .filter_map(|(ticket, read)| match read {
+                Ok(stored) => held::holds(stored).then(|| held::in_flight(ticket, stored, &named)),
+                Err(_) => None,
+            })
+            .collect();
+        let delivered = p.stored.as_ref().is_some_and(delivery_followed);
+        let own = held::of(&p.ticket, p.held.as_ref(), delivered, &named);
+        let found = collision::weigh(&own, &in_flight, Overlap::Rebase);
+        let Some(held) = p.held.as_mut() else {
+            return Ok(held::Recorded::default());
+        };
+        Ok(held::record(held, &found.overlaps, now))
     }
 
     /// Runs one role through the executor, between the project's marker
@@ -5401,12 +5538,15 @@ impl OnDemand<'_> {
                     p.session = self.asked_session(p, (brief.role, stage), key, &run, &report);
                 }
                 // What the run's branch now changes, before the step goes
-                // on (OWL-403).
-                widened = self.widen(p, brief.role);
+                // on (OWL-403), and under `rebase` the overlaps it makes, in
+                // a section held until the ref keeps them (OWL-449).
+                let section;
+                (widened, section) = self.widen(p, brief.role);
                 // Kept before anything else the command does, so no stop
                 // after it, nor a crash, loses the run's cost (OWL-397), nor
                 // what its branch widened.
                 self.keep_cost(p, &run, sink);
+                drop(section);
                 report
             }
             Err(error) => {
@@ -5478,6 +5618,57 @@ impl OnDemand<'_> {
         }
         if let Some(widened) = widened {
             sink.emit(ticket, Some(&run), widened.kind(), widened.data());
+            match &widened {
+                Widened::Files {
+                    overlaps: Ok(recorded),
+                    ..
+                } => {
+                    for (sibling, paths) in &recorded.kept {
+                        let event = held::overlap_event("widening", sibling, paths);
+                        sink.emit(ticket, Some(&run), EventKind::Decision, event);
+                    }
+                    // A widening holds no step: an overlap its record cannot
+                    // take is told (OWL-449).
+                    if !recorded.unkept.is_empty() {
+                        let siblings: Vec<&str> = recorded
+                            .unkept
+                            .iter()
+                            .map(|shared| shared.ticket.as_str())
+                            .collect();
+                        sink.emit(
+                            ticket,
+                            Some(&run),
+                            EventKind::Warning,
+                            data([
+                                ("what", json!("overlap_unrecorded")),
+                                ("tickets", json!(siblings)),
+                                (
+                                    "reason",
+                                    json!(format!(
+                                        "its record keeps the most overlaps it can, {}",
+                                        refs::MAX_OVERLAPS
+                                    )),
+                                ),
+                            ]),
+                        );
+                    }
+                }
+                Widened::Files {
+                    overlaps: Err(reason),
+                    ..
+                } => {
+                    sink.emit(
+                        ticket,
+                        Some(&run),
+                        EventKind::Warning,
+                        data([
+                            ("what", json!("overlap_unrecorded")),
+                            ("reason", json!(reason)),
+                        ]),
+                    );
+                }
+                Widened::Unread(_) => {}
+            }
         }
         // What the run's harness home left to say, such as a refreshed login
         // not written back (OWL-299): a warning each (OWL-303).
@@ -5890,6 +6081,18 @@ impl OnDemand<'_> {
             findings: None,
             review: None,
             pull_request_reviews: Vec::new(),
+            // The ticket's overlaps, from both sides (OWL-449).
+            overlaps: if build {
+                self.overlaps(p)
+                    .into_iter()
+                    .map(|(ticket, paths)| BriefOverlap {
+                        ticket: ticket.to_string(),
+                        paths,
+                    })
+                    .collect()
+            } else {
+                Vec::new()
+            },
         }
     }
 
@@ -6289,6 +6492,9 @@ struct RepairRun<'r> {
 struct RepairDone {
     state: TicketState,
     repaired: Repaired,
+    /// The run's result, whose answers to the findings it was given a
+    /// resolution's last fix records (OWL-449).
+    result: RunResult,
 }
 
 impl OnDemand<'_> {
@@ -6403,8 +6609,18 @@ impl OnDemand<'_> {
             )));
         };
         let mut state = TicketState::try_from(&stored.record.state).map_err(core_error)?;
-        let fresh = follow::read(self.forge, &delivery, pr.number, &pushed, |_| failing_for)
-            .map_err(|e| refused("reading the pull request again", e))?;
+        // A base that changes a path an overlap names, as this command's
+        // fetch read it (OWL-449): watch read the same.
+        let overlap = self.overlap_base(p, &delivery);
+        let fresh = follow::read(
+            self.forge,
+            &delivery,
+            pr.number,
+            &pushed,
+            |_| failing_for,
+            overlap.as_deref(),
+        )
+        .map_err(|e| refused("reading the pull request again", e))?;
         let action = match &fresh.decision {
             FollowDecision::Follow {
                 adopt: false,
@@ -6426,7 +6642,7 @@ impl OnDemand<'_> {
             {
                 FollowAction::Rebase {
                     onto: p.base.commit.clone(),
-                    refresh: true,
+                    cause: RebaseCause::MergeBase,
                 }
             }
             // Anything else is a look's: the next one keeps it.
@@ -6465,9 +6681,9 @@ impl OnDemand<'_> {
             )));
         }
         match action {
-            FollowAction::Rebase { refresh, .. } => {
+            FollowAction::Rebase { cause, .. } => {
                 return self
-                    .repair_rebase(p, state, &delivery, &pr, &pushed, refresh, following, sink);
+                    .repair_rebase(p, state, &delivery, &pr, &pushed, cause, following, sink);
             }
             FollowAction::RebaseFailed { .. } => {
                 return Err(self.rebase_failed(p, state, &delivery, &pr, sink));
@@ -6765,7 +6981,14 @@ impl OnDemand<'_> {
                                         .unwrap_or_default(),
                                 ),
                             };
-                            return Ok((RepairDone { state, repaired }, gathered.followups));
+                            return Ok((
+                                RepairDone {
+                                    state,
+                                    repaired,
+                                    result: result.clone(),
+                                },
+                                gathered.followups,
+                            ));
                         }
                         Err(why) => why,
                     },
@@ -6857,7 +7080,9 @@ impl OnDemand<'_> {
     /// ([`Self::reset_worktree`]). A `done` is pushed only when its gated
     /// commit is a rebase of the delivery onto the base that keeps its
     /// change ([`rebase_keeps_delivery`]); the runner pushes it, leased on
-    /// `pushed`, never the agent.
+    /// `pushed`, never the agent. A non-trivial conflict on a path one of
+    /// the ticket's overlaps names gets a Verify pass on the rebased head
+    /// before the push (OWL-449, [`Self::review_resolution`]).
     #[allow(clippy::too_many_arguments)]
     fn repair_rebase(
         &self,
@@ -6866,10 +7091,11 @@ impl OnDemand<'_> {
         delivery: &TicketDelivery,
         pr: &DeliveredPullRequest,
         pushed: &str,
-        refresh: bool,
+        cause: RebaseCause,
         following: &mut Following,
         sink: &mut EventSink<'_>,
     ) -> Result<Delivered, Stop> {
+        let refresh = cause.refresh();
         match state.apply(PIPELINE, Event::RebaseDue) {
             Ok(Transition::To(due)) => state = due,
             Ok(Transition::Parked {
@@ -6947,6 +7173,15 @@ impl OnDemand<'_> {
             )));
         }
         let classified = rebase::classify(git, &checkout, onto.as_str(), pushed, !refresh);
+        // A resolution that merges two tickets' intents is code no reviewer
+        // read (OWL-449): a non-trivial conflict on an overlap's path.
+        let overlap_paths: Vec<String> = self
+            .overlaps(p)
+            .into_iter()
+            .flat_map(|(_, paths)| paths)
+            .collect();
+        let review =
+            !classified.trivial && collision::on_overlap(&classified.paths, &overlap_paths);
         let dispatched = self.dispatch(p, Command::Rebase, sink)?;
         let fast = |attempt: u32| classified.trivial && attempt == 1;
         let fast_run = self.rebase_harness(true, &dispatched);
@@ -6971,6 +7206,8 @@ impl OnDemand<'_> {
                     ("tier", json!(rebase_tier(fast(attempt)))),
                     ("trivial", json!(classified.trivial)),
                     ("refresh", json!(refresh)),
+                    ("cause", json!(cause.as_str())),
+                    ("review", json!(review)),
                     ("onto", json!(onto.as_str())),
                     ("conflicting", json!(classified.paths)),
                 ]),
@@ -7008,6 +7245,23 @@ impl OnDemand<'_> {
             },
             sink,
         );
+        // Reviewed before its push when its resolution asks it (OWL-449).
+        let ran = ran.and_then(|(done, followups)| {
+            if review {
+                self.review_resolution(
+                    p,
+                    &dispatched,
+                    done,
+                    followups,
+                    &told,
+                    &pushed_id,
+                    &onto,
+                    sink,
+                )
+            } else {
+                Ok((done, followups))
+            }
+        });
         let (done, followups) = match ran {
             Ok(done) => done,
             Err(stop) => {

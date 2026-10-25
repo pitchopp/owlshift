@@ -29,7 +29,7 @@ pub(super) fn found(findings: &[(&str, &str)]) -> String {
 }
 
 /// The arbiter's `done` with a ruling per outcome, on F1..Fn.
-fn ruled(outcomes: &[&str]) -> String {
+pub(super) fn ruled(outcomes: &[&str]) -> String {
     let rulings: Vec<Value> = outcomes
         .iter()
         .enumerate()

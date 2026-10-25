@@ -1,7 +1,7 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "Owlshift ticket held",
-  "description": "What a ticket holds against the project's other tickets, in\n[`HELD_FILE`] (OWL-403, architecture section 5, \"What a ticket holds\"):\nwritten at its dispatch with nothing admitted, given what its Build's\nadmission takes (OWL-448, \"Resources admitted at Build\"), widened by the\nfiles its branch changes, and never narrowed while the ticket holds\nanything, until its pull request ends. A ticket dispatched before it was\nkept has none and holds the whole repository. Not in `intake.json`, which\nbelongs to the ticket's text and is replaced by the next intake.\n\nFormat 1, written before OWL-448, held what its dispatch declared: it\nreads as admitted at its dispatch, with no plan admitted.",
+  "description": "What a ticket holds against the project's other tickets, in\n[`HELD_FILE`] (OWL-403, architecture section 5, \"What a ticket holds\"):\nwritten at its dispatch with nothing admitted, given what its Build's\nadmission takes (OWL-448, \"Resources admitted at Build\"), widened by the\nfiles its branch changes, and never narrowed while the ticket holds\nanything, until its pull request ends. A ticket dispatched before it was\nkept has none and holds the whole repository. Not in `intake.json`, which\nbelongs to the ticket's text and is replaced by the next intake.\n\nFormat 1, written before OWL-448, held what its dispatch declared: it\nreads as admitted at its dispatch, with no plan admitted. Format 2,\nbefore OWL-449, reads with no overlap.",
   "type": "object",
   "properties": {
     "admitted_at": {
@@ -38,7 +38,14 @@
     "format": {
       "description": "The format version of this document.",
       "type": "integer",
-      "const": 2
+      "const": 3
+    },
+    "overlaps": {
+      "description": "The overlaps its Build's admission and its widenings tolerated under\n`policy.overlap = \"rebase\"` (format 3, OWL-449), one per sibling, by\nidentifier. Each is recorded by one side only: the other ticket's\nrecord may name this one.",
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/HeldOverlap"
+      }
     },
     "plan_sha256": {
       "description": "The SHA-256 of the plan whose files its latest admission took, as 64\nlowercase hexadecimal digits (format 2): a plan with another hash, a\nreturn to Design's, is admitted at the next Build. None when no plan\nwas admitted.",
@@ -83,5 +90,35 @@
   "additionalProperties": false,
   "required": [
     "format"
-  ]
+  ],
+  "$defs": {
+    "HeldOverlap": {
+      "description": "An overlap a ticket tolerates under `policy.overlap = \"rebase\"`\n(OWL-449; architecture section 5, \"Tolerated overlap\"): another of\nOwlshift's tickets holds what it holds on `paths`, since `at`.",
+      "type": "object",
+      "properties": {
+        "at": {
+          "description": "When the overlap was first recorded.",
+          "type": "string",
+          "format": "date-time"
+        },
+        "paths": {
+          "description": "The shared paths, files or zones, each once, sorted, at least one.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "ticket": {
+          "description": "The sibling ticket.",
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "ticket",
+        "paths",
+        "at"
+      ]
+    }
+  }
 }

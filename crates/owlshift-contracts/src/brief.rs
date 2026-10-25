@@ -179,7 +179,10 @@ pub struct Brief {
     /// The delivered pull request conflicts with its base, or its checks
     /// failed only on the base it was pushed onto, and this run rebases its
     /// branch (OWL-210, architecture section 5, "Conflicts and the rebase
-    /// run"). In the rebase role's brief, always; absent otherwise.
+    /// run"). In the rebase role's brief, always. In a verifier's and the
+    /// arbiter's (format 29, OWL-449), the rebase whose resolution of a
+    /// conflict on another ticket's overlap their Verify pass reviews before
+    /// its push. Absent otherwise.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rebase: Option<RebaseBrief>,
     /// The decider replied to the DECISION comments of decisions kept on the
@@ -220,8 +223,27 @@ pub struct Brief {
     /// at most [`MAX_PULL_REQUEST_REVIEW_BYTES`] each.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub pull_request_reviews: Vec<PullRequestReview>,
+    /// The ticket's overlaps (format 29, OWL-449; architecture section 5,
+    /// "Tolerated overlap"): under `policy.overlap = "rebase"`, the other
+    /// Owlshift tickets that hold some of what it holds, each with the
+    /// shared paths, by identifier. A run keeps its edits of a shared file to
+    /// what its ticket needs, without reordering or reformatting it. In the
+    /// build role's brief only.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub overlaps: Vec<BriefOverlap>,
     /// Where the role writes `result.json`, relative to the worktree.
     pub result_path: RelativePath,
+}
+
+/// One overlap of the ticket's (OWL-449): `ticket` holds what the ticket
+/// holds on `paths`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct BriefOverlap {
+    /// The other ticket's identifier.
+    pub ticket: String,
+    /// The shared paths, files or folders, sorted.
+    pub paths: Vec<String>,
 }
 
 /// The plan a brief gives (OWL-300).
@@ -1092,12 +1114,29 @@ impl Brief {
                 ));
             }
         }
-        if self.rebase.is_some() != (self.role == Role::Rebase) {
+        // The ticket's overlaps are the build role's alone (format 29,
+        // OWL-449).
+        if !self.overlaps.is_empty() && self.role != Role::Build {
             return Err(ContractError::invalid(
                 CONTRACT,
                 format!(
-                    "the rebase role's brief, and only it, says what to rebase: the role is {} \
-                     and a rebase is {}",
+                    "overlaps are given but the role is {}, not {}",
+                    self.role.as_str(),
+                    Role::Build.as_str()
+                ),
+            ));
+        }
+        // A verifier and the arbiter may be told the rebase whose resolution
+        // they review (format 29, OWL-449).
+        let reviews_resolution = matches!(self.role, Role::Verify | Role::Arbiter);
+        if self.rebase.is_some() != (self.role == Role::Rebase)
+            && !(reviews_resolution && self.rebase.is_some())
+        {
+            return Err(ContractError::invalid(
+                CONTRACT,
+                format!(
+                    "the rebase role's brief says what to rebase, a verifier's and the arbiter's \
+                     the rebase they review, no other brief: the role is {} and a rebase is {}",
                     self.role.as_str(),
                     if self.rebase.is_some() {
                         "given"
