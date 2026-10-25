@@ -27,7 +27,13 @@ const POLL: Duration = Duration::from_millis(100);
 
 /// How long a watch waits for its steps' children after a checked stop
 /// before it stops them now (architecture section 5, "Three ways to stop").
-pub const CHECKED_STOP_BOUND: Duration = Duration::from_secs(60);
+///
+/// 45 seconds (OWL-450): the service manager's grace is 60 seconds on macOS
+/// at a bootout, a logout and a shutdown, and 90 on Linux. The bound ends
+/// before the smallest, with 15 seconds left for what follows it: the step
+/// trees stopped, the watch's exit, the daemon's exit (architecture section 5,
+/// "Three ways to stop", "Checked stop").
+pub const CHECKED_STOP_BOUND: Duration = Duration::from_secs(45);
 
 /// The project's stop file.
 pub fn file(dirs: &ProjectDirs) -> PathBuf {
@@ -185,5 +191,28 @@ impl Watch<'_> {
                 ("asked", json!(by)),
             ]),
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The service manager's grace on macOS, the smallest measured
+    /// (`ExitTimeOut`; build plan, "P7 · Background service", L1).
+    const MACOS_GRACE: Duration = Duration::from_secs(60);
+    /// The grace on Linux (`TimeoutStopSec`).
+    const LINUX_GRACE: Duration = Duration::from_secs(90);
+    /// The least time left after the bound for the watch's and the daemon's exit.
+    const MARGIN: Duration = Duration::from_secs(15);
+
+    #[test]
+    fn the_checked_stop_bound_ends_before_every_service_grace_with_a_margin() {
+        for grace in [MACOS_GRACE, LINUX_GRACE] {
+            assert!(
+                CHECKED_STOP_BOUND + MARGIN <= grace,
+                "{CHECKED_STOP_BOUND:?} leaves less than {MARGIN:?} before a grace of {grace:?}"
+            );
+        }
     }
 }
