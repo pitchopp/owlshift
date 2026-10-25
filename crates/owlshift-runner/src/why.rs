@@ -335,25 +335,10 @@ pub fn gather(
     let (events, bad) = read_events(crate::events::EventLog::in_dir(data_dir).path())?;
     let mut notes = bad;
     let folded = fold(&events, project);
-    let mut stages = HashMap::new();
-    if dirs.checkout().exists() {
-        match ticket_ref::states(&crate::project::runner_git(), &dirs.checkout()) {
-            Ok(refs) => {
-                for (ticket, state) in refs {
-                    match state {
-                        RefState::Read(Some(state)) | RefState::Unadmitted(state) => {
-                            stages.insert(ticket, stage_text(state.status()));
-                        }
-                        RefState::Read(None) => {}
-                        RefState::Unread(why) => {
-                            notes.push(format!("the ref of {ticket} cannot be read: {why}"));
-                        }
-                    }
-                }
-            }
-            Err(why) => notes.push(format!("the ticket refs cannot be read: {why}")),
-        }
-    }
+    let stages = statuses(dirs, &mut notes)
+        .into_iter()
+        .map(|(ticket, status)| (ticket, stage_text(status)))
+        .collect();
     let quarantined = match dirs.quarantine() {
         Ok(marker) => marker.is_some(),
         Err(error) => {
@@ -366,21 +351,7 @@ pub fn gather(
     if !quarantined {
         folded.current.retain(|_, wait| wait.reason != "quarantine");
     }
-    let store = UsageStore::in_data_dir(data_dir).with_caps(caps.iter().copied());
-    let limits = [Harness::Claude, Harness::Codex]
-        .into_iter()
-        .map(|harness| {
-            let limit = match store.standing(harness, machine_usage::ms(Timestamp::now())) {
-                Ok(standing) => match standing {
-                    Standing::Free => Limit::Free,
-                    Standing::ProbeDue => Limit::ProbeDue,
-                    Standing::Limited { until_ms } => Limit::Until(machine_usage::at(until_ms)),
-                },
-                Err(why) => Limit::Unread(why),
-            };
-            (harness, limit)
-        })
-        .collect();
+    let limits = limits(data_dir, caps, Timestamp::now());
     let slots = MachineSlots::new(data_dir, concurrent_runs)
         .holders()
         .ok()
@@ -409,6 +380,57 @@ pub fn gather(
         bases,
         overlaps,
     })
+}
+
+/// Each ticket ref's status in the project of `dirs`, admitted or not; none
+/// while its checkout does not exist. What cannot be read is said in
+/// `notes`. Shared with the daily digest (OWL-440).
+pub(crate) fn statuses(dirs: &ProjectDirs, notes: &mut Vec<String>) -> Vec<(TicketId, Status)> {
+    let mut statuses = Vec::new();
+    if !dirs.checkout().exists() {
+        return statuses;
+    }
+    match ticket_ref::states(&crate::project::runner_git(), &dirs.checkout()) {
+        Ok(refs) => {
+            for (ticket, state) in refs {
+                match state {
+                    RefState::Read(Some(state)) | RefState::Unadmitted(state) => {
+                        statuses.push((ticket, state.status()));
+                    }
+                    RefState::Read(None) => {}
+                    RefState::Unread(why) => {
+                        notes.push(format!("the ref of {ticket} cannot be read: {why}"));
+                    }
+                }
+            }
+        }
+        Err(why) => notes.push(format!("the ticket refs cannot be read: {why}")),
+    }
+    statuses
+}
+
+/// Each harness's standing on this machine at `now`, its cap applied.
+/// Shared with the daily digest (OWL-440).
+pub(crate) fn limits(
+    data_dir: &Path,
+    caps: &[(Harness, u8)],
+    now: Timestamp,
+) -> Vec<(Harness, Limit)> {
+    let store = UsageStore::in_data_dir(data_dir).with_caps(caps.iter().copied());
+    [Harness::Claude, Harness::Codex]
+        .into_iter()
+        .map(|harness| {
+            let limit = match store.standing(harness, machine_usage::ms(now)) {
+                Ok(standing) => match standing {
+                    Standing::Free => Limit::Free,
+                    Standing::ProbeDue => Limit::ProbeDue,
+                    Standing::Limited { until_ms } => Limit::Until(machine_usage::at(until_ms)),
+                },
+                Err(why) => Limit::Unread(why),
+            };
+            (harness, limit)
+        })
+        .collect()
 }
 
 /// The overlaps the project's ticket refs that hold keep (OWL-449), each

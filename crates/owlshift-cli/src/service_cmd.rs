@@ -89,6 +89,7 @@ pub fn daemon(system: &dyn System, config: &Effective) -> ExitCode {
         watch: &watch,
         notifier: desktop.as_ref().map(|d| d as &dyn Notifier),
         timing: Timing::SERVICE,
+        digest: daemon::digest::Settings::of(&config.personal),
     };
     let daemon::Ended::Stopped = daemon.run(&mut io::stdout());
     drop(instance);

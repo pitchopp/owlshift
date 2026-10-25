@@ -1098,6 +1098,9 @@ pub struct PersonalConfig {
     /// blocker.
     #[serde(default)]
     pub notifications: Notifications,
+    /// The background service (P7).
+    #[serde(default)]
+    pub service: ServiceSettings,
     /// Names of variables of this machine's environment that a project may
     /// pass to its agents by declaring them in `stack.gate_env`, in any
     /// letter case. A project's declaration never widens this list: a name
@@ -1200,6 +1203,31 @@ pub struct Notifications {
     /// to `false`. A machine with no desktop session shows nothing.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub desktop: Option<bool>,
+}
+
+/// `digest_hour` when the personal file does not set it (OWL-440).
+pub const DEFAULT_DIGEST_HOUR: u8 = 8;
+
+/// The background service's settings (P7).
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ServiceSettings {
+    /// Whether the daemon sends one notification a day, pointing to
+    /// `owlshift status`: on unless set to `false` (OWL-440).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub digest: Option<bool>,
+    /// The hour of that notification, 0 to 23, local time: 8 when absent. A
+    /// machine asleep at the hour sends it at wake.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(range(min = 0, max = 23))]
+    pub digest_hour: Option<u8>,
+}
+
+impl ServiceSettings {
+    /// The digest's hour, when the digest is on.
+    pub fn digest_hour(&self) -> Option<u8> {
+        (self.digest != Some(false)).then(|| self.digest_hour.unwrap_or(DEFAULT_DIGEST_HOUR))
+    }
 }
 
 /// The user's accounts on the tracker and the forge.
@@ -1325,6 +1353,12 @@ impl PersonalConfig {
             return Err(ContractError::invalid(
                 PERSONAL,
                 format!("concurrent_runs must be a whole number from 1 to {MAX_CONCURRENT_RUNS}"),
+            ));
+        }
+        if self.service.digest_hour.is_some_and(|hour| hour > 23) {
+            return Err(ContractError::invalid(
+                PERSONAL,
+                "service.digest_hour must be a whole number from 0 to 23",
             ));
         }
         check_names(&names(&self.allow_gate_env)).map_err(|error| {
@@ -2404,6 +2438,25 @@ mod tests {
                 "{input}: {actual}"
             );
         }
+    }
+
+    /// OWL-440: the digest is on at 8 unless the personal file says
+    /// otherwise, and its hour is one of the day's.
+    #[test]
+    fn the_digest_is_on_at_eight_unless_service_says_otherwise() {
+        let hour = |input: &str| PersonalConfig::parse(input).unwrap().service.digest_hour();
+        assert_eq!(hour(""), Some(8));
+        assert_eq!(hour("[service]\ndigest_hour = 0\n"), Some(0));
+        assert_eq!(
+            hour("[service]\ndigest = true\ndigest_hour = 23\n"),
+            Some(23)
+        );
+        assert_eq!(hour("[service]\ndigest = false\ndigest_hour = 7\n"), None);
+        let error = PersonalConfig::parse("[service]\ndigest_hour = 24\n")
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("service.digest_hour must be"), "{error}");
+        assert!(PersonalConfig::parse("[service]\ndigest_minute = 3\n").is_err());
     }
 
     #[test]

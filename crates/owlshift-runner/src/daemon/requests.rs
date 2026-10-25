@@ -7,7 +7,9 @@
 //! - `<project data>/stop`, a watch's drain (OWL-161, `watch::stop`), which
 //!   the daemon writes for a watch it stops;
 //! - `<project data>/pause`, which the daemon writes, with its reason, for a
-//!   project whose watch could not start for a reason no restart mends.
+//!   project whose watch could not start for a reason no restart mends;
+//! - `<data>/service/pause`, the pause of every project, which the daily
+//!   digest reads (OWL-440).
 
 use std::fs;
 use std::io;
@@ -62,10 +64,27 @@ pub fn pause_file(dirs: &ProjectDirs) -> PathBuf {
 /// The pause that stands on `dirs`'s project, if any: what it holds, `None`
 /// for a file that does not read as a request.
 pub fn pause(dirs: &ProjectDirs) -> Option<Option<Request>> {
-    let path = pause_file(dirs);
-    fs::symlink_metadata(&path).ok()?;
+    standing(&pause_file(dirs))
+}
+
+/// The pause of every project of the machine, `<data>/service/pause`
+/// (architecture section 5, "Pause").
+pub fn machine_pause_file(data: &Path) -> PathBuf {
+    service_dir(data).join("pause")
+}
+
+/// The pause that stands on every project of `data`, if any, read as
+/// [`pause`] reads a project's.
+pub fn machine_pause(data: &Path) -> Option<Option<Request>> {
+    standing(&machine_pause_file(data))
+}
+
+/// The request the file at `path` holds, when it stands: `None` within for
+/// a file that does not read as one.
+fn standing(path: &Path) -> Option<Option<Request>> {
+    fs::symlink_metadata(path).ok()?;
     Some(
-        fs::read_to_string(&path)
+        fs::read_to_string(path)
             .ok()
             .and_then(|text| Request::parse(&text)),
     )
@@ -128,10 +147,14 @@ mod tests {
         let person = Request::new("owlshift pause", Timestamp::now(), "lunch");
         write_pause(&dirs, &person).unwrap();
         assert!(!remove_own_pause(&dirs).unwrap(), "a person's pause stays");
-        assert_eq!(pause(&dirs), Some(Some(person)));
+        assert_eq!(pause(&dirs), Some(Some(person.clone())));
         let own = Request::new(BY_DAEMON, Timestamp::now(), "keychain locked");
         write_pause(&dirs, &own).unwrap();
         assert!(remove_own_pause(&dirs).unwrap());
         assert_eq!(pause(&dirs), None);
+
+        assert_eq!(machine_pause(data), None);
+        step::write_atomically(&machine_pause_file(data), &person.render()).unwrap();
+        assert_eq!(machine_pause(data), Some(Some(person)));
     }
 }

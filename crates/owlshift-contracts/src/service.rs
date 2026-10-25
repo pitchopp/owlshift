@@ -21,8 +21,8 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::format::{
-    self, ContractError, DAEMON_FORMAT, Format, MANIFEST_FORMAT, SERVED_CONFIG_FORMAT,
-    SERVED_PROJECTS_FORMAT,
+    self, ContractError, DAEMON_FORMAT, DIGEST_FORMAT, Format, MANIFEST_FORMAT,
+    SERVED_CONFIG_FORMAT, SERVED_PROJECTS_FORMAT,
 };
 
 /// Who asks in a [`Request`] the daemon writes: a project's pause after a
@@ -57,6 +57,35 @@ impl DaemonRecord {
 
     pub fn parse(input: &str) -> Result<Self, ContractError> {
         format::parse_json(Self::CONTRACT, DAEMON_FORMAT, input)
+    }
+
+    pub fn render(&self) -> String {
+        format::render_json(self)
+    }
+}
+
+/// The daily digest's record, `<data>/service/digest.json` (OWL-440): when
+/// the latest digest was made, so a machine asleep at the hour sends it once
+/// at wake and never twice.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+#[schemars(title = "Owlshift digest")]
+pub struct DigestRecord {
+    pub format: Format<DIGEST_FORMAT>,
+    /// When the latest digest was made; before the first one, when the
+    /// daemon first counted from. The next digest is due at the first
+    /// digest hour after it, and tells what happened since.
+    pub at: Timestamp,
+    /// The latest digest's text; absent until one is made.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub line: Option<String>,
+}
+
+impl DigestRecord {
+    const CONTRACT: &str = "digest record";
+
+    pub fn parse(input: &str) -> Result<Self, ContractError> {
+        format::parse_json(Self::CONTRACT, DIGEST_FORMAT, input)
     }
 
     pub fn render(&self) -> String {
@@ -513,6 +542,22 @@ mod tests {
         ));
         let empty = text.replace("\"account\":\"claude-agent\"", "\"account\":\"\"");
         assert!(InstallManifest::parse(&empty).is_err());
+    }
+
+    #[test]
+    fn a_digest_record_reads_back_and_a_newer_one_is_refused() {
+        let record = DigestRecord {
+            format: Format,
+            at: at("2026-10-25T08:00:00Z"),
+            line: Some("Owlshift: 1 delivered".to_owned()),
+        };
+        let text = record.render();
+        assert_eq!(DigestRecord::parse(&text).unwrap(), record);
+        let newer = text.replace("\"format\": 1", "\"format\": 2");
+        assert!(matches!(
+            DigestRecord::parse(&newer),
+            Err(ContractError::NewerFormat { found: 2, .. })
+        ));
     }
 
     #[test]
