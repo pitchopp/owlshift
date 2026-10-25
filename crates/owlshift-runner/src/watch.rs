@@ -134,7 +134,7 @@ use owlshift_contracts::event::EventKind;
 use owlshift_contracts::format::Format;
 use owlshift_contracts::ids::TicketId;
 use owlshift_contracts::step::{LandedKind, RefAfter, StepEnd, StepEnvelope, StepHold, StepKind};
-use owlshift_core::collision::{Collision, Dispatched, collision};
+use owlshift_core::collision::{Collision, Dispatched, InFlight, collision};
 use owlshift_core::follow::{Action, Decision, EndReason};
 use owlshift_core::schedule::{self, Turn};
 use owlshift_core::state::{Status, TicketState};
@@ -406,6 +406,14 @@ impl Holds {
         Some(Admit::Held { until })
     }
 
+    /// Whether a hold of `ticket` stands at `now`, whatever its ref says
+    /// since.
+    fn stands(&self, ticket: &TicketId, now: Timestamp) -> bool {
+        self.held
+            .get(ticket)
+            .is_some_and(|(_, until)| until.holds_at(now))
+    }
+
     /// Forgets the holds of the tickets `kept` does not name.
     fn retain(&mut self, kept: &[TicketId]) {
         self.held.retain(|ticket, _| kept.contains(ticket));
@@ -523,9 +531,10 @@ struct Memory<'c> {
     /// told: the slot's holders, or a collision (OWL-403).
     waits: HashMap<TicketId, StepWait>,
     /// The tickets whose next stage step a collision holds back, as this
-    /// pass's snapshot read them (OWL-403): they leave the slot's turn to
+    /// pass's snapshot read them (OWL-403), each with whether it is its
+    /// Build's admission that waits (OWL-448): they leave the slot's turn to
     /// the others.
-    collisions: HashMap<TicketId, Collision<String>>,
+    collisions: HashMap<TicketId, (Collision<String>, bool)>,
     /// The work in flight outside Owlshift, as read (OWL-410).
     outside: outside::OutsideMemory,
     /// The tickets whose answer check watch ran into a stage that needs the
@@ -583,8 +592,9 @@ enum Due {
 enum StepWait {
     /// These tickets hold the slot's turn (OWL-367).
     Slot(Vec<TicketId>),
-    /// A ticket holds what it would touch (OWL-403).
-    Collision(Collision<String>),
+    /// A ticket holds what it would touch (OWL-403), its Build's admission
+    /// waiting when marked (OWL-448).
+    Collision(Collision<String>, bool),
     /// The work in flight outside Owlshift could not be read (OWL-410).
     Unread,
     /// The harness its first run would use is at its usage limit (OWL-404),
@@ -795,7 +805,13 @@ impl Watch<'_> {
         // (OWL-403), from what the refs read hold and the work in flight
         // outside Owlshift (OWL-410).
         let outside = self.step_holders(memory, sink, out, &read);
-        memory.collisions = self.collisions(&read, outside.as_ref());
+        // A Build held back this pass, by watch's own hold or its base,
+        // takes nothing yet for the Builds after it (OWL-448).
+        let now = (self.on_demand.clock)();
+        let collisions = self.collisions(&read, outside.as_ref(), &|ticket| {
+            memory.holds.stands(ticket, now) || memory.base_held.contains(ticket)
+        });
+        memory.collisions = collisions;
         // The tickets whose step's child runs (OWL-401): each counts in the
         // slot's turn as its ref says, and is left alone until it ends.
         let busy: Vec<TicketId> = memory
@@ -2179,8 +2195,8 @@ impl Watch<'_> {
             if memory.outside.unread_steps.contains(ticket) {
                 return self.wait_for_unread(memory, sink, out, ticket);
             }
-            if let Some(found) = memory.collisions.get(ticket).cloned() {
-                return self.wait_for_collision(memory, sink, out, ticket, found);
+            if let Some((found, build)) = memory.collisions.get(ticket).cloned() {
+                return self.wait_for_collision(memory, sink, out, ticket, found, build);
             }
             match memory.turn.clone() {
                 Some(Turn::Holders(holders)) if !holders.contains(ticket) => {
@@ -2469,9 +2485,11 @@ impl Watch<'_> {
     }
 
     /// Tells that `ticket`'s next stage step waits for `found` (OWL-403;
-    /// architecture section 5, "The collision rule"): one `decision` event
-    /// (`watch` = `waits`, `reason` = `collision`, the holder in `tickets`,
-    /// its `resource`) and one line, unless the last told was the same.
+    /// architecture section 5, "The collision rule"), its Build's admission
+    /// when `build` (OWL-448, "Resources admitted at Build"): one `decision`
+    /// event (`watch` = `waits`, `reason` = `collision`, the holder in
+    /// `tickets`, its `resource`, and `stage` = `build` for a Build's) and one
+    /// line, unless the last told was the same.
     fn wait_for_collision(
         &self,
         memory: &mut Memory,
@@ -2479,12 +2497,13 @@ impl Watch<'_> {
         out: &mut dyn Write,
         ticket: &TicketId,
         found: Collision<String>,
+        build: bool,
     ) {
-        let told = StepWait::Collision(found);
+        let told = StepWait::Collision(found, build);
         if memory.waits.get(ticket) == Some(&told) {
             return;
         }
-        let StepWait::Collision(found) = &told else {
+        let StepWait::Collision(found, _) = &told else {
             unreachable!("made a collision's wait above")
         };
         // A pull request or a person's ticket is named as such (OWL-410).
@@ -2494,19 +2513,28 @@ impl Watch<'_> {
             ("reason", json!("collision")),
             ("resource", held::resource_data(&found.resource)),
         ]);
+        if build {
+            event.insert("stage".to_owned(), json!("build"));
+        }
         for (key, value) in holder.data() {
             event.insert(key.to_owned(), value);
         }
         sink.emit(ticket, None, EventKind::Decision, event.clone());
         self.show_wait(memory, sink, ticket, "collision", event);
-        self.line(
-            out,
-            &format!(
+        let line = if build {
+            format!(
+                "{ticket}'s Build waits: {holder} holds {}, which its Build would take, and it is \
+                 admitted once {holder} no longer holds it",
+                found.resource
+            )
+        } else {
+            format!(
                 "{ticket} waits: {holder} holds {}, which it would touch, and its next stage runs \
                  once {holder} no longer holds it",
                 found.resource
-            ),
-        );
+            )
+        };
+        self.line(out, &line);
         memory.waits.insert(ticket.clone(), told);
     }
 
@@ -2678,34 +2706,78 @@ impl Watch<'_> {
     /// The work in flight outside Owlshift, `outside`, holds them too, and
     /// its pull requests' files join the tickets that delivered them
     /// (OWL-410).
+    ///
+    /// A ticket at Build whose admission is due ([`held::due`], its labels
+    /// from `outside`'s read of the working state) is predicted as its step
+    /// would admit it (OWL-448): those due together in dispatch order, each
+    /// waiting for anything held whatever the holder's dispatch time
+    /// ([`schedule::admissions`]); one `held_back` this pass holds nothing
+    /// for those after it. Each wait says whether it is a Build's.
     fn collisions(
         &self,
         read: &[RefRead],
         outside: Option<&in_flight::Holders>,
-    ) -> HashMap<TicketId, Collision<String>> {
-        let named = self
-            .on_demand
-            .config
-            .stack
-            .named_resources()
-            .unwrap_or_default();
-        let mut in_flight: Vec<_> = read
+        held_back: &dyn Fn(&TicketId) -> bool,
+    ) -> HashMap<TicketId, (Collision<String>, bool)> {
+        let on_demand = self.on_demand;
+        let named = on_demand.config.stack.named_resources().unwrap_or_default();
+        let refs: Vec<(&TicketId, &Stored)> = read
             .iter()
             .filter_map(|(ticket, stored)| stored.as_ref().ok().map(|stored| (ticket, stored)))
+            .collect();
+        let mut in_flight: Vec<_> = refs
+            .iter()
             .filter(|(_, stored)| held::holds(stored))
             .map(|(ticket, stored)| held::in_flight(ticket, stored, &named))
             .collect();
         if let Some(outside) = outside {
             outside.join(&mut in_flight, &named);
         }
-        read.iter()
-            .filter_map(|(ticket, stored)| stored.as_ref().ok().map(|stored| (ticket, stored)))
-            .filter(|(_, stored)| holds(stored) && !delivery_followed(stored))
-            .filter_map(|(ticket, stored)| {
-                let own = held::in_flight(ticket, stored, &named);
-                collision(&own, &in_flight).map(|found| (ticket.clone(), found))
-            })
-            .collect()
+        let now = (on_demand.clock)();
+        let mut found = HashMap::new();
+        let mut due = Vec::new();
+        for (ticket, stored) in refs {
+            if !holds(stored) || delivery_followed(stored) {
+                continue;
+            }
+            let own = held::in_flight(ticket, stored, &named);
+            if let Some(collided) = collision(&own, &in_flight) {
+                found.insert(ticket.clone(), (collided, false));
+                continue;
+            }
+            let at_build = TicketState::try_from(&stored.record.state)
+                .is_ok_and(|state| state.status() == Status::Active(Stage::Build));
+            let labels = outside
+                .and_then(|outside| outside.labels.get(ticket.as_str()))
+                .map_or(&[][..], Vec::as_slice);
+            let admitted = at_build
+                .then(|| {
+                    held::due(
+                        &stored.record,
+                        labels,
+                        on_demand.config.pipeline.default,
+                        &named,
+                        now,
+                    )
+                })
+                .flatten();
+            if let (Some(admitted), Some(before)) = (admitted, stored.record.held.as_ref()) {
+                due.push(schedule::Due {
+                    ticket: InFlight {
+                        held: held::of(ticket, Some(&admitted), false, &named).held,
+                        ..own
+                    },
+                    added: held::added(ticket, before, &admitted, &named),
+                    starts: !held_back(ticket),
+                });
+            }
+        }
+        for (id, collided) in schedule::admissions(&due, &in_flight) {
+            if let (Some(collided), Ok(ticket)) = (collided, TicketId::new(&id)) {
+                found.insert(ticket, (collided, true));
+            }
+        }
+        found
     }
 
     /// Moves `ticket` to working, under the project's lock while its ref is

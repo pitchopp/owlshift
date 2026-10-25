@@ -1,9 +1,17 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "Owlshift ticket held",
-  "description": "What a ticket holds against the project's other tickets, in\n[`HELD_FILE`] (OWL-403, architecture section 5, \"What a ticket holds\"):\nwritten at its dispatch, widened by the files its branch changes, and\nnever narrowed while the ticket holds anything, from its dispatch until\nits pull request ends. A ticket dispatched before it was kept has none and\nholds the whole repository. Not in `intake.json`, which belongs to the\nticket's text and is replaced by the next intake.",
+  "description": "What a ticket holds against the project's other tickets, in\n[`HELD_FILE`] (OWL-403, architecture section 5, \"What a ticket holds\"):\nwritten at its dispatch with nothing admitted, given what its Build's\nadmission takes (OWL-448, \"Resources admitted at Build\"), widened by the\nfiles its branch changes, and never narrowed while the ticket holds\nanything, until its pull request ends. A ticket dispatched before it was\nkept has none and holds the whole repository. Not in `intake.json`, which\nbelongs to the ticket's text and is replaced by the next intake.\n\nFormat 1, written before OWL-448, held what its dispatch declared: it\nreads as admitted at its dispatch, with no plan admitted.",
   "type": "object",
   "properties": {
+    "admitted_at": {
+      "description": "When its Build's admission took what it holds, the latest when a\nreturn to Design added a plan's files (format 2). None with a\ndispatch time: nothing admitted, the ticket holding nothing but the\nfiles a widening added ([`Self::admitted`]).",
+      "type": [
+        "string",
+        "null"
+      ],
+      "format": "date-time"
+    },
     "delivered_at": {
       "description": "When its pull request was opened.",
       "type": [
@@ -30,10 +38,18 @@
     "format": {
       "description": "The format version of this document.",
       "type": "integer",
-      "const": 1
+      "const": 2
+    },
+    "plan_sha256": {
+      "description": "The SHA-256 of the plan whose files its latest admission took, as 64\nlowercase hexadecimal digits (format 2): a plan with another hash, a\nreturn to Design's, is admitted at the next Build. None when no plan\nwas admitted.",
+      "type": [
+        "string",
+        "null"
+      ],
+      "pattern": "^[0-9a-f]{64}$"
     },
     "resources": {
-      "description": "The named resources declared at its dispatch, by name: those its\nfiles match are not kept, each check reaching them from the\nproject's list.",
+      "description": "The named resources admitted, by name: those its files match are not\nkept, each check reaching them from the project's list.",
       "type": "array",
       "default": [],
       "items": {
@@ -56,7 +72,7 @@
       }
     },
     "zones": {
-      "description": "The zones declared at its dispatch, intake's and its `zone:` labels',\nas written; none: the whole repository.",
+      "description": "The zones admitted, as written: the plan's files, each the zone of its\nown path, with the `zone:` labels' zones, or intake's zones with the\nlabels' (format 1: those its dispatch declared). None, once\nadmitted: the whole repository; with nothing admitted, none.",
       "type": "array",
       "default": [],
       "items": {

@@ -3,11 +3,13 @@
 //!
 //! A ticket holds zones (folders of the repository), named resources (the
 //! keys of `stack.resources`, each a [`Pattern`] over repository paths) and
-//! files, each the zone of its own path. Intake declares its zones and named
-//! resources; [`held`] adds the zones its `zone:` labels declare and the
-//! named resources its zones reach; [`closed`] gives the collision rule
-//! everything a ticket holds, the files its branch changed included
-//! (OWL-403).
+//! files, each the zone of its own path. A ticket takes them at its Build's
+//! admission (OWL-448): its plan's files ([`planned`]), or intake's zones and
+//! named resources when no plan names files; [`held`] adds the zones its
+//! `zone:` labels declare and the named resources its zones reach; [`added`]
+//! is what an admission adds to what a ticket holds; [`closed`] gives the
+//! collision rule everything a ticket holds, the files its branch changed
+//! included (OWL-403).
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -43,6 +45,17 @@ impl Resource {
             (Resource::Named(a), Resource::Named(b)) => a == b,
             (Resource::Browser, Resource::Browser) => true,
             _ => false,
+        }
+    }
+
+    /// Whether holding this resource holds `other` already: a zone holds
+    /// every zone inside it, itself included, compared as
+    /// [`Self::conflicts_with`] compares them; a named resource and the
+    /// browser slot hold themselves.
+    pub fn contains(&self, other: &Resource) -> bool {
+        match (self, other) {
+            (Resource::Zone(a), Resource::Zone(b)) => contains(&segments(a), &segments(b)),
+            _ => self == other,
         }
     }
 }
@@ -100,6 +113,66 @@ pub fn closed(
         }
     }
     held
+}
+
+/// The zones a plan's `files` hold at its Build's admission (OWL-448;
+/// architecture section 5, "Resources admitted at Build"): each entry the
+/// zone of its own path, so a file holds itself, read fail-closed. Blanks
+/// around it, leading `./` and trailing `/` are dropped, and a part holding
+/// `*` cuts the path to the folder before it, the whole repository when it
+/// is the first. `None`, so that intake's zones hold as for a plan without
+/// files, when the plan names no file or an entry is no path from the
+/// repository's root by the rules of a `zone:` label
+/// ([`check_zone`](crate::decider::check_zone)), or holds a blank or one of
+/// `` ` ' " { } [ ] ? , ( ) < > | ; ``: a list or a note written in its
+/// place. More than `max` entries hold the whole repository, as a widening
+/// past its bound does. The whole repository is no zone: `Some` of none.
+pub fn planned(files: &[String], max: usize) -> Option<Vec<String>> {
+    const NOT_A_PATH: &str = "`'\"{}[]?,()<>|;";
+    if files.is_empty() {
+        return None;
+    }
+    let mut zones: Vec<String> = Vec::new();
+    for entry in files {
+        let mut path = entry.trim();
+        while let Some(rest) = path.strip_prefix("./") {
+            path = rest;
+        }
+        let path = path.trim_end_matches('/');
+        if crate::decider::check_zone(path).is_err()
+            || path
+                .chars()
+                .any(|c| c.is_whitespace() || NOT_A_PATH.contains(c))
+        {
+            return None;
+        }
+        let kept: Vec<&str> = path
+            .split('/')
+            .take_while(|part| !part.contains('*'))
+            .collect();
+        if kept.is_empty() {
+            return Some(Vec::new());
+        }
+        let zone = kept.join("/");
+        if !zones.contains(&zone) {
+            zones.push(zone);
+        }
+    }
+    if zones.len() > max {
+        return Some(Vec::new());
+    }
+    Some(zones)
+}
+
+/// The resources of `wanted` that nothing of `held` holds already
+/// ([`Resource::contains`]), in their order: what a Build's admission adds
+/// to what a ticket holds, and checks (OWL-448).
+pub fn added(held: &[Resource], wanted: &[Resource]) -> Vec<Resource> {
+    wanted
+        .iter()
+        .filter(|resource| !held.iter().any(|kept| kept.contains(resource)))
+        .cloned()
+        .collect()
 }
 
 /// A zone's segments, without the empty and `.` ones.
@@ -617,5 +690,52 @@ mod tests {
         assert_eq!(whole[0].to_string(), "the whole repository");
         assert_eq!(reached[0].to_string(), "zone `db/main`");
         assert_eq!(reached[1].to_string(), "resource `migrations`");
+    }
+
+    /// OWL-448: a plan's files as its Build's admission holds them, read
+    /// fail-closed: a pattern holds the folder it lies in, one from the root
+    /// the whole repository, as do more entries than the bound; a list
+    /// written in place of a path, a note or a path outside the repository
+    /// leaves the plan's files unread, and so does a plan naming none.
+    #[test]
+    fn a_plans_files_are_read_as_zones_fail_closed() {
+        let read = |files: &[&str]| planned(&strings(files), 3);
+        assert_eq!(
+            read(&[" ./src/lib.rs ", "docs/", "src/lib.rs", "a/*/b.rs"]),
+            Some(strings(&["src/lib.rs", "docs", "a"]))
+        );
+        assert_eq!(read(&["src/a.rs", "**/*.rs"]), Some(Vec::new()));
+        assert_eq!(read(&["a", "b", "c", "d"]), Some(Vec::new()));
+        for unread in [
+            &[][..],
+            &["src/lib.rs (new)"],
+            &["`src/lib.rs`"],
+            &["src/{a,b}.rs"],
+            &["/etc/passwd"],
+            &["../x.rs"],
+            &["a\\b.rs"],
+            &["./"],
+        ] {
+            assert_eq!(read(unread), None, "{unread:?}");
+        }
+    }
+
+    /// OWL-448: what an admission adds is what nothing held holds already,
+    /// a zone holding every zone inside it.
+    #[test]
+    fn an_admission_adds_only_what_is_not_held_already() {
+        let held = [zone("app"), named("migrations"), zone("docs/a.md")];
+        let wanted = [
+            zone("app/x.rs"),
+            zone("docs"),
+            named("migrations"),
+            named("lock"),
+            zone("App"),
+        ];
+        assert_eq!(added(&held, &wanted), [zone("docs"), named("lock")]);
+        assert_eq!(
+            added(&[zone("")], &wanted),
+            [named("migrations"), named("lock")]
+        );
     }
 }

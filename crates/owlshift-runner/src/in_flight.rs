@@ -234,6 +234,10 @@ pub struct Holders {
     /// The people's tickets with neither a pull request nor a `zone:`
     /// label, left out: each is warned of (`zones_unknown`).
     pub unknown: Vec<TicketId>,
+    /// The labels of each of Owlshift's own tickets in the working state,
+    /// from which watch reads the `zone:` labels a Build's admission takes
+    /// (OWL-448).
+    pub labels: HashMap<String, Vec<String>>,
 }
 
 impl Holders {
@@ -326,6 +330,7 @@ impl Outside {
         for ticket in &self.working {
             let id = ticket.id.as_str();
             if ours.contains(id) {
+                holders.labels.insert(id.to_owned(), ticket.labels.clone());
                 continue;
             }
             let held = match declared_zones(ticket.labels.iter().map(String::as_str)) {
@@ -546,16 +551,30 @@ mod tests {
                 person("DEMO-23", &["zone:../x"]),
                 person("DEMO-5", &[]),
                 person("DEMO-6", &[]),
+                person("DEMO-7", &["zone:web"]),
             ],
         };
         let (one, five, six) = (id("DEMO-1"), id("DEMO-5"), id("DEMO-6"));
         let held = stored(Status::Active(Stage::Watch), Some(1));
         let ended = stored(Status::Active(Stage::Ready), Some(8));
+        // In Design, dispatched and holding nothing (OWL-448): Owlshift's
+        // all the same, never a person's, its labels kept for its Build.
+        let seven = id("DEMO-7");
+        let mut designing = stored(Status::Active(Stage::Design), None);
+        designing.record.held = Some(owlshift_contracts::refs::TicketHeld::dispatched(
+            jiff::Timestamp::UNIX_EPOCH,
+        ));
         let named = NamedResources::new([("migrations", "db/**")]).unwrap();
         let holders = outside.holders(
-            [(&one, Some(&held)), (&five, None), (&six, Some(&ended))],
+            [
+                (&one, Some(&held)),
+                (&five, None),
+                (&six, Some(&ended)),
+                (&seven, Some(&designing)),
+            ],
             &named,
         );
+        assert_eq!(holders.labels["DEMO-7"], ["zone:web"]);
 
         assert_eq!(
             holders.own,

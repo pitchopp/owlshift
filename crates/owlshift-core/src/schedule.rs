@@ -1,12 +1,15 @@
 //! The scheduler: which admitted tickets of the ready column the drain
 //! dispatches now, and why each other one waits (architecture, section 5,
-//! "The drain"). A ticket that would touch what one in flight holds waits
-//! (OWL-403, [`collision`](crate::collision)). Since OWL-401 the project's
-//! one slot is a capacity, `policy.max_in_flight` ([`Caps::max_in_flight`]),
-//! the dispatch a list, and the turn of the stage steps goes to the first
-//! holders by dispatch time ([`slot_turn`]); [`admission`] is the check a
-//! dispatch makes again under the project's lock (architecture, section 5,
-//! "Parallel", "Three counts", "Admission, one transaction").
+//! "The drain"). Since OWL-401 the project's one slot is a capacity,
+//! `policy.max_in_flight` ([`Caps::max_in_flight`]), the dispatch a list,
+//! and the turn of the stage steps goes to the first holders by dispatch
+//! time ([`slot_turn`]); [`admission`] is the check a dispatch makes again
+//! under the project's lock (architecture, section 5, "Parallel", "Three
+//! counts", "Admission, one transaction"). Since OWL-448 a dispatch checks
+//! the caps alone: a ticket takes its resources at its Build's admission,
+//! where one that would touch what a ticket in flight holds waits
+//! ([`admissions`], [`collision`](crate::collision)), and a ready ticket
+//! never waits for a collision.
 
 use std::cmp::Ordering;
 use std::collections::BTreeSet;
@@ -43,12 +46,9 @@ pub struct Load<K> {
     /// The tickets whose ref holds the project's slot
     /// ([`holds_slot_or_unknown`]), in any order: as many as
     /// [`Caps::max_in_flight`] stop every dispatch. [`ready_set`] adds those
-    /// of the tickets it is given whose state holds it, once each.
+    /// of the tickets it is given whose state holds it, once each. A ticket
+    /// counts here from its dispatch, admitted or not (OWL-448).
     pub slot_held_by: Vec<K>,
-    /// The project's Owlshift tickets from their dispatch until their pull
-    /// request ends, with what each holds (OWL-403): a ticket a dispatch
-    /// would make collide with one waits.
-    pub in_flight: Vec<InFlight<K>>,
 }
 
 impl<K> Default for Load<K> {
@@ -57,7 +57,6 @@ impl<K> Default for Load<K> {
             runs: 0,
             open_prs: 0,
             slot_held_by: Vec::new(),
-            in_flight: Vec::new(),
         }
     }
 }
@@ -98,8 +97,10 @@ pub enum Wait<K> {
     /// ([`Caps::max_in_flight`]), in identifier order, those dispatched in
     /// this pass included (OWL-291, OWL-401).
     Slot(Vec<K>),
-    /// What the ticket would hold conflicts with what a ticket in flight
-    /// holds (OWL-403): the holder and its resource.
+    /// What the ticket holds or its Build would take conflicts with what a
+    /// ticket in flight holds (OWL-403): the holder and its resource. Never a
+    /// ready ticket's reason since OWL-448: its stage steps' and its Build's
+    /// admission's ([`admissions`]).
     Collision(Collision<K>),
     /// Every run slot of this machine is taken.
     RunCap,
@@ -247,17 +248,17 @@ pub fn slot_turn<K: Clone + Ord + AsRef<str>>(
     Turn::Holders(turn)
 }
 
-/// Why `ticket`, a dispatch from Ready weighed now ([`Dispatched::Now`],
-/// with what it would hold), would wait, against the project's `caps` and
-/// what `load` reads in flight; `None` when it may go (OWL-401;
+/// Why `ticket`, a dispatch from Ready, would wait, against the project's
+/// `caps` and what `load` reads in flight; `None` when it may go (OWL-401;
 /// architecture section 5, "Admission, one transaction"). In the design's
-/// order: the open pull requests at their cap, the project's capacity held
-/// by as many tickets as `caps.max_in_flight` (the ticket's own ref left
-/// out), then a collision with what a ticket in flight holds
-/// ([`collision`]). This machine's runs are the ready set's alone
-/// ([`ready_set`]): a step that admits holds its run slot already.
+/// order: the open pull requests at their cap, then the project's capacity
+/// held by as many tickets as `caps.max_in_flight` (the ticket's own ref
+/// left out). Never what is held: since OWL-448 that is its Build's
+/// admission's to check ([`admissions`]). This machine's runs are the ready
+/// set's alone ([`ready_set`]): a step that admits holds its run slot
+/// already.
 pub fn admission<K: Clone + Ord + AsRef<str>>(
-    ticket: &InFlight<K>,
+    ticket: &K,
     caps: Caps,
     load: &Load<K>,
 ) -> Option<Wait<K>> {
@@ -267,7 +268,7 @@ pub fn admission<K: Clone + Ord + AsRef<str>>(
     let mut holders: Vec<K> = load
         .slot_held_by
         .iter()
-        .filter(|id| **id != ticket.id)
+        .filter(|id| *id != ticket)
         .cloned()
         .collect();
     holders.sort_by(|a, b| natural_cmp(a.as_ref(), b.as_ref()).then_with(|| a.cmp(b)));
@@ -275,7 +276,63 @@ pub fn admission<K: Clone + Ord + AsRef<str>>(
     if holders.len() >= caps.max_in_flight as usize {
         return Some(Wait::Slot(holders));
     }
-    collision(ticket, &load.in_flight).map(Wait::Collision)
+    None
+}
+
+/// A ticket whose Build's admission is due (OWL-448; architecture section
+/// 5, "Resources admitted at Build").
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Due<K> {
+    /// The ticket, its dispatch time and what it would hold once admitted.
+    pub ticket: InFlight<K>,
+    /// What its admission adds to what it holds already, which is what is
+    /// checked: everything it would hold at a first admission, the new
+    /// plan's files after a return to Design.
+    pub added: Vec<Resource>,
+    /// Whether its step may start now: one held back for another reason
+    /// still waits or goes as the rule says, but holds nothing for those
+    /// after it, since it takes nothing yet.
+    pub starts: bool,
+}
+
+/// The Builds' admissions of one pass (OWL-448; architecture section 5,
+/// "Resources admitted at Build"): each of `due`, the one dispatched first
+/// first, then in identifier order ([`natural_cmp`]), waits when what it
+/// adds conflicts with anything `in_flight` holds, whatever the holder's
+/// dispatch time ([`collision`], the ticket weighed [`Dispatched::Now`]), so
+/// an admitted ticket never waits for one admitted after it; one that goes
+/// and [`Due::starts`] holds, for those after it, what it would hold once
+/// admitted. Each with its collision, `None` when it is admitted, in that
+/// order.
+pub fn admissions<K: Clone + Ord + AsRef<str>>(
+    due: &[Due<K>],
+    in_flight: &[InFlight<K>],
+) -> Vec<(K, Option<Collision<K>>)> {
+    let mut order: Vec<&Due<K>> = due.iter().collect();
+    order.sort_by(|a, b| {
+        a.ticket
+            .dispatched
+            .cmp(&b.ticket.dispatched)
+            .then_with(|| natural_cmp(a.ticket.id.as_ref(), b.ticket.id.as_ref()))
+            .then_with(|| a.ticket.id.cmp(&b.ticket.id))
+    });
+    let mut holders = in_flight.to_vec();
+    let mut admitted = Vec::new();
+    for due in order {
+        let weighed = InFlight {
+            id: due.ticket.id.clone(),
+            dispatched: Dispatched::Now,
+            delivered: false,
+            held: due.added.clone(),
+        };
+        let found = collision(&weighed, &holders);
+        if found.is_none() && due.starts {
+            holders.retain(|holder| holder.id != due.ticket.id);
+            holders.push(due.ticket.clone());
+        }
+        admitted.push((due.ticket.id.clone(), found));
+    }
+    admitted
 }
 
 /// Orders identifiers naturally: runs of digits compare as numbers, so
@@ -379,9 +436,10 @@ fn dispatchable<K>(ticket: &Ticket<K>) -> bool {
 /// current text, its ref is at Ready (or at Watch with its following ended),
 /// every blocker but itself released it, [`admission`] lets it go against
 /// `load` and the tickets dispatched before it in this pass (the open pull
-/// requests under their cap, the project's capacity not held, what it would
-/// hold, its `resources`, conflicting with nothing held), and this machine
-/// has a run free once those dispatched before it took theirs (OWL-401).
+/// requests under their cap, the project's capacity not held), and this
+/// machine has a run free once those dispatched before it took theirs
+/// (OWL-401). What is held never holds it back: a ticket takes its
+/// resources at its Build's admission (OWL-448).
 pub fn ready_set<K: Clone + Ord + AsRef<str>>(
     tickets: &[Ticket<K>],
     caps: Caps,
@@ -411,8 +469,6 @@ pub fn ready_set<K: Clone + Ord + AsRef<str>>(
         dispatch: Vec::new(),
         waiting: Vec::new(),
     };
-    let mut passed = 0;
-
     for ticket in candidates {
         let wait = if !seen.insert(&ticket.id) {
             Some(Wait::Duplicate)
@@ -430,19 +486,13 @@ pub fn ready_set<K: Clone + Ord + AsRef<str>>(
             Some(Wait::NotReady)
         } else {
             let held = holding(&ticket.id, &ticket.blocked_by);
-            let own = InFlight {
-                id: ticket.id.clone(),
-                dispatched: Dispatched::Now,
-                delivered: false,
-                held: ticket.resources.clone(),
-            };
             if !held.canceled.is_empty() {
                 Some(Wait::BlockerCanceled(held.canceled))
             } else if !held.unknown.is_empty() {
                 Some(Wait::BlockerUnknown(held.unknown))
             } else if !held.open.is_empty() {
                 Some(Wait::BlockedBy(held.open))
-            } else if let Some(wait) = admission(&own, caps, &load) {
+            } else if let Some(wait) = admission(&ticket.id, caps, &load) {
                 Some(wait)
             } else if load.runs >= caps.concurrent_runs {
                 Some(Wait::RunCap)
@@ -454,17 +504,9 @@ pub fn ready_set<K: Clone + Ord + AsRef<str>>(
             Some(wait) => ready.waiting.push((ticket.id.clone(), wait)),
             None => {
                 // Dispatched: for every ticket after it in this pass, it
-                // holds the slot, one of this machine's runs and what it
-                // would touch.
+                // holds the slot and one of this machine's runs.
                 load.slot_held_by.push(ticket.id.clone());
                 load.runs = load.runs.saturating_add(1);
-                load.in_flight.push(InFlight {
-                    id: ticket.id.clone(),
-                    dispatched: Dispatched::Pass(passed),
-                    delivered: false,
-                    held: ticket.resources.clone(),
-                });
-                passed += 1;
                 ready.dispatch.push(ticket.id.clone());
             }
         }
@@ -486,7 +528,6 @@ mod tests {
         runs: 0,
         open_prs: 0,
         slot_held_by: Vec::new(),
-        in_flight: Vec::new(),
     };
 
     fn restore(status: Status, round: u32) -> TicketState {
@@ -504,7 +545,6 @@ mod tests {
             intake_hash: Some("h1".to_owned()),
             blocked_by: Vec::new(),
             variant: Variant::Standard,
-            resources: Vec::new(),
             state: restore(Status::Active(Stage::Ready), 0),
             delivery_followed: false,
         }
@@ -624,7 +664,6 @@ mod tests {
                 runs: 1,
                 open_prs: 2,
                 slot_held_by: vec!["Z-1"],
-                in_flight: Vec::new(),
             },
         );
         assert_eq!(ready.dispatch, Vec::<&str>::new());
@@ -864,22 +903,16 @@ mod tests {
     }
 
     /// OWL-401: a pass dispatches while the project's capacity, its open
-    /// pull requests, what it holds and this machine's runs allow, each
-    /// ticket dispatched holding against those after it: the capacity, a
-    /// run, and what it would touch, whatever the identifiers.
+    /// pull requests and this machine's runs allow, each ticket dispatched
+    /// holding the capacity and a run against those after it. Since
+    /// OWL-448 nothing it would touch holds it back.
     #[test]
     fn a_pass_dispatches_up_to_the_capacity_and_the_runs() {
-        let zone = |path: &str| Resource::Zone(path.to_owned());
-        let with = |id, priority, path: &str| Ticket {
-            resources: vec![zone(path)],
-            ..ticket(id, priority)
-        };
         let tickets = [
-            with("A-9", Priority::Urgent, "app"),
-            with("A-1", Priority::High, "app/sub"),
-            with("A-2", Priority::Medium, "docs"),
-            with("A-3", Priority::Low, "lib"),
-            with("A-4", Priority::Low, "web"),
+            ticket("A-9", Priority::Urgent),
+            ticket("A-1", Priority::High),
+            ticket("A-2", Priority::Medium),
+            ticket("A-3", Priority::Low),
         ];
         let caps = |max_in_flight, concurrent_runs| Caps {
             concurrent_runs,
@@ -891,84 +924,52 @@ mod tests {
             ..IDLE
         };
         let ready = ready_set(&tickets, caps(3, 10), held.clone());
-        assert_eq!(ready.dispatch, ["A-9", "A-2"]);
-        let capacity = Wait::Slot(vec!["A-2", "A-9", "X-1"]);
+        assert_eq!(ready.dispatch, ["A-9", "A-1"]);
+        let capacity = Wait::Slot(vec!["A-1", "A-9", "X-1"]);
         assert_eq!(
             ready.waiting,
-            [
-                (
-                    "A-1",
-                    Wait::Collision(Collision {
-                        holder: "A-9",
-                        resource: zone("app"),
-                    })
-                ),
-                ("A-3", capacity.clone()),
-                ("A-4", capacity),
-            ]
+            [("A-2", capacity.clone()), ("A-3", capacity)]
         );
         // This machine's runs, those of the pass included.
         let busy = Load { runs: 8, ..held };
         let ready = ready_set(&tickets, caps(10, 10), busy);
-        assert_eq!(ready.dispatch, ["A-9", "A-2"]);
+        assert_eq!(ready.dispatch, ["A-9", "A-1"]);
         assert_eq!(
-            ready.waiting[1..],
-            [("A-3", Wait::RunCap), ("A-4", Wait::RunCap)]
+            ready.waiting,
+            [("A-2", Wait::RunCap), ("A-3", Wait::RunCap)]
         );
     }
 
-    /// OWL-401: the check a dispatch makes again under the lock: the open
-    /// pull requests, the capacity without the ticket's own ref, then what
-    /// it would touch; never this machine's runs.
+    /// OWL-401, OWL-448: the check a dispatch makes again under the lock:
+    /// the open pull requests, then the capacity without the ticket's own
+    /// ref, a ticket dispatched and not admitted counting in it; never what
+    /// is held, nor this machine's runs.
     #[test]
-    fn the_admission_checks_the_cap_the_capacity_then_collisions() {
-        let zone = |path: &str| Resource::Zone(path.to_owned());
-        let own = InFlight {
-            id: "A-1",
-            dispatched: Dispatched::Now,
-            delivered: false,
-            held: vec![zone("app")],
-        };
+    fn the_admission_checks_the_cap_then_the_capacity() {
         let caps = Caps {
             concurrent_runs: 1,
             open_prs: Some(2),
             max_in_flight: 2,
         };
-        let holder = InFlight {
-            id: "B-1",
-            dispatched: Dispatched::At(5),
-            delivered: false,
-            held: vec![zone("app/x")],
-        };
         let load = Load {
             runs: 1,
             open_prs: 1,
             slot_held_by: vec!["A-1", "B-1"],
-            in_flight: vec![holder],
         };
-        let collided = Wait::Collision(Collision {
-            holder: "B-1",
-            resource: zone("app/x"),
-        });
-        assert_eq!(admission(&own, caps, &load), Some(collided));
+        assert_eq!(admission(&"A-1", caps, &load), None);
         let full = Load {
             slot_held_by: vec!["C-1", "B-1", "A-1"],
             ..load.clone()
         };
         assert_eq!(
-            admission(&own, caps, &full),
+            admission(&"A-1", caps, &full),
             Some(Wait::Slot(vec!["B-1", "C-1"]))
         );
         let capped = Load {
             open_prs: 2,
             ..full
         };
-        assert_eq!(admission(&own, caps, &capped), Some(Wait::PrCap));
-        let free = Load {
-            in_flight: Vec::new(),
-            ..load
-        };
-        assert_eq!(admission(&own, caps, &free), None);
+        assert_eq!(admission(&"A-1", caps, &capped), Some(Wait::PrCap));
     }
 
     #[test]
@@ -1036,47 +1037,65 @@ mod tests {
         );
     }
 
-    /// OWL-403: a ticket whose resources conflict with a ticket in flight
-    /// waits, after the slot and before this machine's runs, and the next
-    /// one goes.
+    /// OWL-448: the Builds' admissions of a pass. A Build waits for any
+    /// holder of what it adds, whatever the holder's dispatch time, so an
+    /// admitted ticket never waits for one admitted after it; among Builds
+    /// due together the one dispatched first goes first, whatever the
+    /// identifiers, and holds for the next one, unless its step cannot start
+    /// now. What a ticket holds already is never checked again.
     #[test]
-    fn a_collision_holds_a_ticket_once_the_slot_is_free_and_the_next_goes() {
+    fn builds_are_admitted_in_dispatch_order_against_any_holder() {
         let zone = |path: &str| Resource::Zone(path.to_owned());
-        let mut app = ticket("A-1", Priority::High);
-        app.resources = vec![zone("app")];
-        let mut docs = ticket("A-2", Priority::Low);
-        docs.resources = vec![zone("docs")];
-        let waiting = InFlight {
-            id: "W-1",
-            dispatched: Dispatched::At(5),
+        let flight = |id, at, held: &[Resource]| InFlight {
+            id,
+            dispatched: Dispatched::At(at),
             delivered: false,
-            held: vec![zone("app/x.rs")],
+            held: held.to_vec(),
         };
-        let load = || Load {
-            in_flight: vec![waiting.clone()],
-            ..IDLE
+        let due = |id, at, wanted: &[Resource], starts| Due {
+            ticket: flight(id, at, wanted),
+            added: wanted.to_vec(),
+            starts,
         };
-        let ready = ready_set(&[app.clone(), docs.clone()], ROOMY, load());
-        assert_eq!(ready.dispatch, ["A-2"]);
-        let collided = Wait::Collision(Collision {
-            holder: "W-1",
-            resource: zone("app/x.rs"),
-        });
-        assert_eq!(ready.waiting, [("A-1", collided.clone())]);
+        // H-1 was dispatched after both Builds but admitted before them.
+        let in_flight = [flight("H-1", 50, &[zone("lib/a.rs")])];
+        let builds = [
+            due("B-1", 20, &[zone("app/one.rs")], true),
+            due("B-9", 10, &[zone("app/one.rs")], true),
+            due("B-3", 30, &[zone("lib")], true),
+            due("B-4", 40, &[zone("docs/x.md")], true),
+        ];
+        let collided = |holder, path: &str| {
+            Some(Collision {
+                holder,
+                resource: zone(path),
+            })
+        };
         assert_eq!(
-            (collided.key(), collided.tickets(), collided.resource()),
-            ("collision", &["W-1"][..], Some(&zone("app/x.rs")))
+            admissions(&builds, &in_flight),
+            [
+                ("B-9", None),
+                ("B-1", collided("B-9", "app/one.rs")),
+                ("B-3", collided("H-1", "lib/a.rs")),
+                ("B-4", None),
+            ]
         );
-        // A held slot comes first; a full machine after.
-        let held = Load {
-            slot_held_by: vec!["X-1"],
-            ..load()
+        // B-9 held back from starting holds nothing for B-1.
+        let mut held_back = builds.clone();
+        held_back[1].starts = false;
+        assert_eq!(admissions(&held_back, &in_flight)[1], ("B-1", None));
+        // A return to Design's admission checks only what it adds.
+        let returning = Due {
+            ticket: flight("B-5", 5, &[zone("lib"), zone("web/a.rs")]),
+            added: vec![zone("web/a.rs")],
+            starts: true,
         };
-        let ready = ready_set(std::slice::from_ref(&app), ROOMY, held);
-        assert_eq!(ready.waiting, [("A-1", Wait::Slot(vec!["X-1"]))]);
-        let full = Load { runs: 10, ..load() };
-        let ready = ready_set(&[app, docs], ROOMY, full);
-        assert_eq!(ready.waiting, [("A-1", collided), ("A-2", Wait::RunCap)]);
+        assert_eq!(admissions(&[returning], &in_flight), [("B-5", None)]);
+        let collision = Wait::Collision(collided("H-1", "lib/a.rs").unwrap());
+        assert_eq!(
+            (collision.key(), collision.tickets(), collision.resource()),
+            ("collision", &["H-1"][..], Some(&zone("lib/a.rs")))
+        );
     }
 
     #[test]

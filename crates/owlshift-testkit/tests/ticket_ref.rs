@@ -116,12 +116,15 @@ fn record(state: &str, round: u32) -> TicketRecord {
     }
 }
 
-/// What a ticket dispatched at 09:00 holds, widened once (OWL-403).
+/// What a ticket dispatched at 09:00 and admitted at 09:10 holds, widened
+/// once (OWL-403, OWL-448).
 fn ticket_held() -> TicketHeld {
-    let mut held = TicketHeld::dispatched(
+    let mut held = TicketHeld::dispatched("2026-10-20T09:00:00Z".parse().unwrap());
+    held.admit(
         vec!["app".to_owned()],
         Vec::new(),
-        Some("2026-10-20T09:00:00Z".parse().unwrap()),
+        None,
+        "2026-10-20T09:10:00Z".parse().unwrap(),
     );
     held.widen(
         ["app/x.rs".to_owned(), "docs/y.md".to_owned()],

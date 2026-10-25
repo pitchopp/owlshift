@@ -29,7 +29,7 @@ use crate::format::{
     self, CLAIM_FORMAT, COST_FORMAT, ContractError, DELIVERY_FORMAT, Format, HELD_FORMAT,
     QUESTIONS_FORMAT, SESSION_FORMAT, TICKET_STATE_FORMAT,
 };
-use crate::ids::{SessionId, TicketId, check_name, is_commit_id};
+use crate::ids::{SessionId, TicketId, check_name, is_commit_id, is_lower_hex};
 use crate::result::{
     self, DECISIONS_ADVICE, Decision, Followup, Question, RefusedChoice, Verdict, check_verdicts,
 };
@@ -352,23 +352,28 @@ pub const MAX_WIDENINGS: usize = 100;
 
 /// What a ticket holds against the project's other tickets, in
 /// [`HELD_FILE`] (OWL-403, architecture section 5, "What a ticket holds"):
-/// written at its dispatch, widened by the files its branch changes, and
-/// never narrowed while the ticket holds anything, from its dispatch until
-/// its pull request ends. A ticket dispatched before it was kept has none and
-/// holds the whole repository. Not in `intake.json`, which belongs to the
-/// ticket's text and is replaced by the next intake.
+/// written at its dispatch with nothing admitted, given what its Build's
+/// admission takes (OWL-448, "Resources admitted at Build"), widened by the
+/// files its branch changes, and never narrowed while the ticket holds
+/// anything, until its pull request ends. A ticket dispatched before it was
+/// kept has none and holds the whole repository. Not in `intake.json`, which
+/// belongs to the ticket's text and is replaced by the next intake.
+///
+/// Format 1, written before OWL-448, held what its dispatch declared: it
+/// reads as admitted at its dispatch, with no plan admitted.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 #[schemars(title = "Owlshift ticket held")]
 pub struct TicketHeld {
     pub format: Format<HELD_FORMAT>,
-    /// The zones declared at its dispatch, intake's and its `zone:` labels',
-    /// as written; none: the whole repository.
+    /// The zones admitted, as written: the plan's files, each the zone of its
+    /// own path, with the `zone:` labels' zones, or intake's zones with the
+    /// labels' (format 1: those its dispatch declared). None, once
+    /// admitted: the whole repository; with nothing admitted, none.
     #[serde(default)]
     pub zones: Vec<String>,
-    /// The named resources declared at its dispatch, by name: those its
-    /// files match are not kept, each check reaching them from the
-    /// project's list.
+    /// The named resources admitted, by name: those its files match are not
+    /// kept, each check reaching them from the project's list.
     #[serde(default)]
     pub resources: Vec<String>,
     /// The files its branch changed against its merge-base with the base,
@@ -380,6 +385,19 @@ pub struct TicketHeld {
     /// `held.json` was kept, which came before any other.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dispatched_at: Option<Timestamp>,
+    /// When its Build's admission took what it holds, the latest when a
+    /// return to Design added a plan's files (format 2). None with a
+    /// dispatch time: nothing admitted, the ticket holding nothing but the
+    /// files a widening added ([`Self::admitted`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub admitted_at: Option<Timestamp>,
+    /// The SHA-256 of the plan whose files its latest admission took, as 64
+    /// lowercase hexadecimal digits (format 2): a plan with another hash, a
+    /// return to Design's, is admitted at the next Build. None when no plan
+    /// was admitted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(regex(pattern = r"^[0-9a-f]{64}$"))]
+    pub plan_sha256: Option<String>,
     /// When widenings added files, oldest first, the latest
     /// [`MAX_WIDENINGS`].
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -398,38 +416,68 @@ pub struct TicketHeld {
 impl TicketHeld {
     const CONTRACT: &str = "ticket held";
 
-    /// What a ticket dispatched at `at` holds: `zones` (none for the whole
-    /// repository) and `resources`, no file yet.
-    pub fn dispatched(zones: Vec<String>, resources: Vec<String>, at: Option<Timestamp>) -> Self {
+    /// What a ticket dispatched at `at` holds (OWL-448): nothing, until its
+    /// Build's admission.
+    pub fn dispatched(at: Timestamp) -> Self {
         Self {
             format: Format,
-            zones,
-            resources,
+            zones: Vec::new(),
+            resources: Vec::new(),
             files: Vec::new(),
-            dispatched_at: at,
+            dispatched_at: Some(at),
+            admitted_at: None,
+            plan_sha256: None,
             widened_at: Vec::new(),
             delivered_at: None,
             verified: None,
         }
     }
 
-    /// Whether it holds the whole repository.
-    pub fn whole(&self) -> bool {
-        self.zones.is_empty()
+    /// What a ticket of a ref from before P6 holds once a record must be
+    /// kept for it: the whole repository, with no dispatch time, so it stays
+    /// first.
+    pub fn unrecorded() -> Self {
+        Self {
+            dispatched_at: None,
+            ..Self::dispatched(Timestamp::UNIX_EPOCH)
+        }
     }
 
-    /// Adds what `other` holds: a whole repository stays whole, listing no
-    /// file, and the zones, resources and files are united, each once. Its
-    /// times and its mark stay this record's.
-    pub fn join(&mut self, other: &TicketHeld) {
-        if other.whole() {
+    /// Whether what it lists is held: once its Build's admission took it, a
+    /// record of format 1 included, or for a record with no dispatch time,
+    /// a ref's from before P6. A ticket dispatched since OWL-448 and not yet
+    /// admitted holds nothing but the files a widening added.
+    pub fn admitted(&self) -> bool {
+        self.admitted_at.is_some() || self.dispatched_at.is_none()
+    }
+
+    /// Whether it holds the whole repository: admitted, with no zone.
+    pub fn whole(&self) -> bool {
+        self.admitted() && self.zones.is_empty()
+    }
+
+    /// Admits `zones` (none for the whole repository) and `resources` at
+    /// `at`, the plan whose files they hold being `plan_sha256` (OWL-448). A
+    /// first admission takes them; a later one, a return to Design's, adds
+    /// them, each once, a whole repository staying whole and listing no file.
+    pub fn admit(
+        &mut self,
+        zones: Vec<String>,
+        resources: Vec<String>,
+        plan_sha256: Option<String>,
+        at: Timestamp,
+    ) {
+        if zones.is_empty() {
             self.zones.clear();
             self.files.clear();
+        } else if !self.admitted() {
+            self.zones = zones;
         } else if !self.whole() {
-            gather_strings(&mut self.zones, &other.zones);
+            gather_strings(&mut self.zones, &zones);
         }
-        gather_strings(&mut self.resources, &other.resources);
-        self.widen_by(other.files.iter().cloned());
+        gather_strings(&mut self.resources, &resources);
+        self.admitted_at = Some(at);
+        self.plan_sha256 = plan_sha256;
     }
 
     /// Adds the files its branch changed, at `at`, and gives those it did
@@ -438,9 +486,9 @@ impl TicketHeld {
     /// Past [`MAX_HELD_FILES`] or [`MAX_HELD_BYTES`], or given a path it
     /// cannot keep (empty, holding a NUL, longer than
     /// [`MAX_HELD_PATH_BYTES`]), the ticket holds the whole repository and
-    /// lists no file.
+    /// lists no file, admitted at `at` if it was not.
     pub fn widen(&mut self, files: impl IntoIterator<Item = String>, at: Timestamp) -> Vec<String> {
-        let added = self.widen_by(files);
+        let added = self.widen_by(files, at);
         if !added.is_empty() {
             self.widened_at.push(at);
             let over = self.widened_at.len().saturating_sub(MAX_WIDENINGS);
@@ -450,22 +498,31 @@ impl TicketHeld {
     }
 
     /// The whole repository from now, at `at`, for a widening whose files
-    /// could not be read: what cannot be read is never taken as free.
-    /// Whether that changed what it holds.
+    /// could not be read: what cannot be read is never taken as free, so a
+    /// record with nothing admitted is admitted then. Whether that changed
+    /// what it holds.
     pub fn widen_whole(&mut self, at: Timestamp) -> bool {
         if self.whole() {
             return false;
         }
-        self.zones.clear();
-        self.files.clear();
+        self.hold_whole(at);
         self.widened_at.push(at);
         let over = self.widened_at.len().saturating_sub(MAX_WIDENINGS);
         self.widened_at.drain(..over);
         true
     }
 
-    /// [`Self::widen`], without its time.
-    fn widen_by(&mut self, files: impl IntoIterator<Item = String>) -> Vec<String> {
+    /// The whole repository from `at`, listing no file.
+    fn hold_whole(&mut self, at: Timestamp) {
+        self.zones.clear();
+        self.files.clear();
+        if !self.admitted() {
+            self.admitted_at = Some(at);
+        }
+    }
+
+    /// [`Self::widen`], without keeping its time among the widenings.
+    fn widen_by(&mut self, files: impl IntoIterator<Item = String>, at: Timestamp) -> Vec<String> {
         if self.whole() {
             return Vec::new();
         }
@@ -481,17 +538,47 @@ impl TicketHeld {
         self.files.extend(added.iter().cloned());
         self.files.sort();
         if unkept || self.files.len() > MAX_HELD_FILES || self.render().len() > MAX_HELD_BYTES {
-            self.zones.clear();
-            self.files.clear();
+            self.hold_whole(at);
         }
         added
     }
 
-    /// Parses and validates a `held.json`.
+    /// Parses and validates a `held.json`. A format-1 one, kept before
+    /// OWL-448, is read as the current format admitted at its dispatch, with
+    /// no plan admitted: it keeps holding what its dispatch declared.
     pub fn parse(input: &str) -> Result<Self, ContractError> {
-        let held: Self = format::parse_json(Self::CONTRACT, HELD_FORMAT, input)?;
+        let held: Self = match Self::from_older_format(input) {
+            Some(read) => read?,
+            None => format::parse_json(Self::CONTRACT, HELD_FORMAT, input)?,
+        };
         held.validate()?;
         Ok(held)
+    }
+
+    /// A format-1 document read as the current format, or `None` for any
+    /// other. Format 1 is format 2 without `admitted_at` and `plan_sha256`,
+    /// which are refused in it.
+    fn from_older_format(input: &str) -> Option<Result<Self, ContractError>> {
+        let mut document: serde_json::Value = serde_json::from_str(input).ok()?;
+        if document.get("format").and_then(serde_json::Value::as_u64) != Some(1) {
+            return None;
+        }
+        if document.get("admitted_at").is_some() || document.get("plan_sha256").is_some() {
+            return Some(Err(ContractError::invalid(
+                Self::CONTRACT,
+                "format 1 keeps no admission",
+            )));
+        }
+        document["format"] = HELD_FORMAT.into();
+        if let Some(at) = document.get("dispatched_at").cloned() {
+            document["admitted_at"] = at;
+        }
+        Some(
+            serde_json::from_value(document).map_err(|source| ContractError::Json {
+                contract: Self::CONTRACT,
+                source,
+            }),
+        )
     }
 
     pub fn render(&self) -> String {
@@ -501,7 +588,8 @@ impl TicketHeld {
     /// Checks each zone keeps the rules of a `zone:` label's, each resource
     /// is a resource name, the files are none for the whole repository and
     /// otherwise paths it keeps, sorted, each once and at most
-    /// [`MAX_HELD_FILES`], the widenings at most
+    /// [`MAX_HELD_FILES`], nothing but files kept while nothing is admitted,
+    /// the plan's hash a SHA-256 in lowercase hex, the widenings at most
     /// [`MAX_WIDENINGS`], and the mark is a full commit id.
     pub fn validate(&self) -> Result<(), ContractError> {
         let invalid = |reason: String| Err(ContractError::invalid(Self::CONTRACT, reason));
@@ -522,6 +610,20 @@ impl TicketHeld {
         }
         if self.whole() && !self.files.is_empty() {
             return invalid("lists files while it holds the whole repository".to_owned());
+        }
+        if !self.admitted()
+            && (!self.zones.is_empty() || !self.resources.is_empty() || self.plan_sha256.is_some())
+        {
+            return invalid(
+                "keeps zones, resources or a plan while nothing is admitted".to_owned(),
+            );
+        }
+        if let Some(hash) = &self.plan_sha256
+            && !is_lower_hex(hash, 64)
+        {
+            return invalid(format!(
+                "plan_sha256 {hash:?} is not a SHA-256 in lowercase hex"
+            ));
         }
         if self.files.len() > MAX_HELD_FILES {
             return invalid(format!(

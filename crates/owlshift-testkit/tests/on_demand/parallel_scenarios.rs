@@ -46,14 +46,25 @@ fn status_of(bench: &Bench, id: &str) -> Option<Status> {
     Some(TicketState::try_from(&record.state).unwrap().status())
 }
 
-/// Scenario S5 with three tickets in flight (OWL-401): with
+/// The ticket of each `dispatch` event of `events` that `command` made.
+fn by_command(events: &[Event], command: &str) -> Vec<String> {
+    events
+        .iter()
+        .filter(|e| e.kind == EventKind::Dispatch && e.data["command"] == json!(command))
+        .map(|e| e.ticket.as_ref().unwrap().as_str().to_owned())
+        .collect()
+}
+
+/// Scenario S5 with three tickets in flight (OWL-401, OWL-448): with
 /// `policy.max_in_flight = 3`, five admitted tickets declare their zones at
 /// intake, one a pass, while a blocker holds them all; once it is done, one
-/// pass dispatches DEMO-1, DEMO-2 and DEMO-4, whose zones are apart, each
-/// running its Design and holding the slot at Design review. DEMO-3, whose
-/// zone lies in DEMO-1's, waits for it, and DEMO-5 waits for the project's
-/// capacity, each told once. Three refs hold the slot at once, each with
-/// what it holds and its dispatch time, and nothing is quarantined.
+/// pass dispatches DEMO-1, DEMO-2 and DEMO-3, each running its Design and
+/// holding the slot at Design review: DEMO-3's zone lies in DEMO-1's, but a
+/// ready ticket never waits for a collision, and a ticket in Design holds
+/// nothing. DEMO-4 and DEMO-5 wait for the project's capacity, which the
+/// three hold though nothing is admitted, each told once. Three refs hold
+/// the slot at once, each with its dispatch time and nothing admitted, and
+/// nothing is quarantined.
 #[test]
 fn scenario_s5_three_tickets_in_flight_at_once() {
     let bench = parallel_bench("max_in_flight = 3\n");
@@ -88,46 +99,43 @@ fn scenario_s5_three_tickets_in_flight_at_once() {
     let events = bench.events();
     let passes = by_pass(&events, 0, &ends.borrow());
 
-    // One pass dispatches the three whose zones are apart.
+    // One pass dispatches the first three, whatever their zones.
     assert_eq!(
         dispatched(&passes[5]),
-        ["DEMO-1", "DEMO-2", "DEMO-4"],
+        ["DEMO-1", "DEMO-2", "DEMO-3"],
         "{report}"
     );
     assert_eq!(dispatched(&events).len(), 3, "{report}");
-    for id in ["DEMO-1", "DEMO-2", "DEMO-4"] {
+    for id in ["DEMO-1", "DEMO-2", "DEMO-3"] {
         assert_eq!(
             status_of(&bench, id),
             Some(Status::Active(Stage::DesignReview)),
             "{id}\n{report}"
         );
         let held = bench.record_of(id).unwrap().held.unwrap();
-        assert!(held.dispatched_at.is_some(), "{id}: {held:?}");
+        assert!(
+            held.dispatched_at.is_some() && !held.admitted() && held.zones.is_empty(),
+            "{id}: {held:?}"
+        );
     }
-    // DEMO-3 waits for DEMO-1's zone, DEMO-5 for the capacity.
-    assert_eq!(
-        collisions(&events, "drain"),
-        [(
-            "DEMO-3".to_owned(),
-            json!(["DEMO-1"]),
-            json!({ "zone": "app" })
-        )],
-        "{report}"
-    );
+    // No collision; DEMO-4 and DEMO-5 wait for the capacity the three hold
+    // in Design, nothing admitted.
+    assert!(collisions(&events, "drain").is_empty(), "{report}");
+    assert!(collisions(&events, "watch").is_empty(), "{report}");
     let capacity: Vec<_> = waits(&events)
         .into_iter()
         .filter(|(_, reason, _)| *reason == json!("slot"))
         .collect();
+    let three = json!(["DEMO-1", "DEMO-2", "DEMO-3"]);
     assert_eq!(
         capacity,
-        [(
-            "DEMO-5".to_owned(),
-            json!("slot"),
-            json!(["DEMO-1", "DEMO-2", "DEMO-4"])
-        )],
+        [
+            ("DEMO-4".to_owned(), json!("slot"), three.clone()),
+            ("DEMO-5".to_owned(), json!("slot"), three)
+        ],
         "{report}"
     );
-    for id in ["DEMO-3", "DEMO-5"] {
+    for id in ["DEMO-4", "DEMO-5"] {
         assert_eq!(status_of(&bench, id), Some(Status::Active(Stage::Ready)));
     }
     assert_eq!(bench.dirs().quarantine().unwrap(), None);
@@ -209,14 +217,15 @@ fn a_drain_asked_mid_pass_starts_no_other_step() {
     assert!(!bench.dirs().obligations_stand());
 }
 
-/// The admission's first direction (OWL-401's acceptance): a `do` typed
-/// while watch runs, between two of its passes, cannot take what a
-/// dispatch took. DEMO-1 is dispatched and asks at Build, holding `app`
-/// while it waits; `owlshift do DEMO-2`, which would hold `app/sub`, is
-/// refused as `owlshift why` words it, running and writing nothing, and
-/// the drain tells DEMO-2 it waits for DEMO-1.
+/// The admission's first direction (OWL-401's acceptance, OWL-448): a `do`
+/// typed while watch runs, between two of its passes, cannot take what an
+/// admitted Build holds. DEMO-1, with no Design, is dispatched and asks at
+/// Build, holding `app` while it waits; `owlshift do DEMO-2`, which would
+/// hold `app/sub`, is dispatched, its capacity free, and its Build waits as
+/// `owlshift why` words it, running nothing and admitting nothing; watch
+/// then tells DEMO-2 its Build waits for DEMO-1.
 #[test]
-fn a_do_typed_during_a_pass_cannot_take_what_a_dispatch_took() {
+fn a_do_typed_during_a_pass_cannot_take_what_a_build_holds() {
     let bench = Bench::draining("maintainer");
     bench.put_ticket(
         "DEMO-2",
@@ -258,18 +267,25 @@ fn a_do_typed_during_a_pass_cannot_take_what_a_dispatch_took() {
     match typed {
         Some(Err(Stop::Waits { ticket, said, cap })) => {
             assert_eq!((ticket, cap), (demo2, None));
-            assert!(said.starts_with("DEMO-1 holds zone `app`"), "{said}");
+            assert!(
+                said.starts_with("DEMO-1 holds zone `app`, which its Build would take"),
+                "{said}"
+            );
         }
         other => panic!("{other:?}\n{report}"),
     }
     let events = bench.events();
-    assert_eq!(dispatched(&events), ["DEMO-1"], "{report}");
+    assert_eq!(by_command(&events, "drain"), ["DEMO-1"], "{report}");
+    assert_eq!(by_command(&events, "do"), ["DEMO-2"], "{report}");
     assert_eq!(
         status_of(&bench, "DEMO-2"),
-        Some(Status::Active(Stage::Ready))
+        Some(Status::Active(Stage::Build))
     );
+    let held = bench.record_of("DEMO-2").unwrap().held.unwrap();
+    assert!(!held.admitted(), "{held:?}");
+    assert!(collisions(&events, "drain").is_empty(), "{report}");
     assert!(
-        collisions(&events, "drain").contains(&(
+        collisions(&events, "watch").contains(&(
             "DEMO-2".to_owned(),
             json!(["DEMO-1"]),
             json!({ "zone": "app" })
@@ -288,16 +304,17 @@ fn read_ref(bench: &Bench, id: &str) -> String {
     stored.commit
 }
 
-/// The admission's other direction (OWL-401): a dispatch the drain's pass
-/// decided from refs read before a person's `do` took what it would touch
-/// runs nothing. With DEMO-1 blocked while both intakes run, the pass's
-/// view of DEMO-1 is kept; `owlshift do DEMO-2` then takes `app/sub` and
-/// asks at Build; DEMO-1, its blocker done, is dispatched from that view:
-/// its admission reads the refs again and finds DEMO-2, so nothing runs,
-/// no `dispatch` event is recorded and DEMO-1's ref stays where it was;
-/// the next pass tells DEMO-1 it waits for DEMO-2.
+/// The admission's other direction (OWL-401, OWL-448): a dispatch the
+/// drain's pass decided from refs read before a person's `do` took what it
+/// would touch builds nothing. With DEMO-1 blocked while both intakes run,
+/// the pass's view of DEMO-1 is kept; `owlshift do DEMO-2` then takes
+/// `app/sub` and asks at Build; DEMO-1, its blocker done, is dispatched
+/// from that view, the capacity free, straight to Build, where its
+/// admission reads the refs again and finds DEMO-2: no Build runs, nothing
+/// is admitted, the step's wait is recorded, and the next pass tells DEMO-1
+/// its Build waits for DEMO-2.
 #[test]
-fn a_dispatch_decided_before_a_do_runs_nothing_once_the_do_took_its_zone() {
+fn a_dispatch_decided_before_a_do_builds_nothing_once_the_do_took_its_zone() {
     let bench = parallel_bench("");
     bench.put_ticket(
         "DEMO-2",
@@ -351,22 +368,31 @@ fn a_dispatch_decided_before_a_do_runs_nothing_once_the_do_took_its_zone() {
         },
     );
     assert_eq!(stepped, step::Stepped::Stale, "{lines}\n{printed}");
-    assert_eq!(read_ref(&bench, "DEMO-1"), commit);
-    let dispatches: Vec<Option<TicketId>> = bench
-        .events()
-        .into_iter()
-        .filter(|e| e.kind == EventKind::Dispatch)
-        .map(|e| e.ticket)
-        .collect();
-    assert_eq!(dispatches, [Some(demo2)], "{printed}");
+    assert_ne!(read_ref(&bench, "DEMO-1"), commit);
+    assert_eq!(
+        status_of(&bench, "DEMO-1"),
+        Some(Status::Active(Stage::Build))
+    );
+    let held = bench.record_of("DEMO-1").unwrap().held.unwrap();
+    assert!(held.dispatched_at.is_some() && !held.admitted(), "{held:?}");
+    let events = bench.events();
+    assert_eq!(by_command(&events, "drain"), ["DEMO-1"], "{printed}");
+    assert!(
+        !events.iter().any(|e| e.kind == EventKind::RunStarted
+            && e.ticket.as_ref() == Some(&demo1)
+            && e.data["role"] == json!("build")),
+        "{printed}"
+    );
+    let waiting = (
+        "DEMO-1".to_owned(),
+        json!(["DEMO-2"]),
+        json!({ "zone": "app/sub" }),
+    );
+    assert!(collisions(&events, "watch").contains(&waiting), "{printed}");
     // The next pass reads the refs again and tells why DEMO-1 waits.
     let (_, lines, printed) = bench.drain_passes(Vec::new(), 1, |_, _| {});
     assert!(
-        collisions(&bench.events(), "drain").contains(&(
-            "DEMO-1".to_owned(),
-            json!(["DEMO-2"]),
-            json!({ "zone": "app/sub" })
-        )),
+        lines.contains("DEMO-1's Build waits: DEMO-2 holds zone `app/sub`"),
         "{lines}\n{printed}"
     );
 }
@@ -375,7 +401,8 @@ fn a_dispatch_decided_before_a_do_runs_nothing_once_the_do_took_its_zone() {
 /// capacity of one, DEMO-1 and DEMO-2 both ask at Build; watch takes
 /// DEMO-1's answer to Build, where its ref holds the slot. A person's
 /// `continue DEMO-2` then checks its answers and posts its RESUME, but its
-/// Build waits: the capacity is DEMO-1's, dispatched first. A `do` while
+/// Build waits: the capacity is DEMO-1's, dispatched first. A `do` waits
+/// for that capacity too, writing nothing, and a person's `continue` while
 /// the work in flight outside Owlshift cannot be read is refused,
 /// fail-closed.
 #[test]
@@ -450,13 +477,28 @@ fn a_persons_continue_and_do_make_the_drains_check() {
             .any(|c| c.contains("RESUME"))
     );
 
-    // Fail-closed: the open pull requests cannot be read.
+    // A `do` waits for the capacity, which a dispatch checks alone.
     bench.put_ticket("DEMO-3", "maintainer", "Todo", &["agent"], "", "Other.");
-    *bench.github.fail_pulls.lock().unwrap() = 1;
     let demo3 = TicketId::new("DEMO-3").unwrap();
     let (refused, printed) =
         bench.with_on_demand(Vec::new(), None, Vec::new(), |on_demand, sink| {
             on_demand.run(&demo3, sink)
+        });
+    match refused {
+        Err(Stop::Waits { said, .. }) => assert!(
+            said.starts_with("the project's slot is held by DEMO-1"),
+            "{said}"
+        ),
+        other => panic!("{other:?}\n{printed}"),
+    }
+    assert_eq!(bench.record_of("DEMO-3"), None);
+    // Fail-closed: the open pull requests cannot be read.
+    *bench.github.fail_pulls.lock().unwrap() = 1;
+    let demo1 = TicketId::new("DEMO-1").unwrap();
+    let before = read_ref(&bench, "DEMO-1");
+    let (refused, printed) =
+        bench.with_on_demand(Vec::new(), None, Vec::new(), |on_demand, sink| {
+            on_demand.continue_ticket(&demo1, sink)
         });
     match refused {
         Err(Stop::Waits { said, .. }) => assert!(
@@ -465,5 +507,162 @@ fn a_persons_continue_and_do_make_the_drains_check() {
         ),
         other => panic!("{other:?}\n{printed}"),
     }
-    assert_eq!(bench.record_of("DEMO-3"), None);
+    assert_eq!(read_ref(&bench, "DEMO-1"), before);
+}
+
+/// A Design run's plan naming `files`.
+fn planning(files: &[&str]) -> String {
+    let mut plan: Value = serde_json::from_str(super::design_scenarios::PLAN).unwrap();
+    plan["files"] = json!(files);
+    super::design_scenarios::designed(&plan.to_string())
+}
+
+/// A Build run of `id` that greets, as the gate asks, and writes `file`.
+fn building(bench: &Bench, id: &str, file: &str) -> Reply {
+    let mut reply = bench.reply(Some("Hello"), Some(&super::drain_scenarios::done_for(id)));
+    reply
+        .files
+        .insert(RelativePath::new(file).unwrap(), "Built.\n".to_owned());
+    reply
+}
+
+/// Two standard tickets, DEMO-1 declaring `app` and DEMO-2 `app/sub` at
+/// intake, held by a blocker until both intakes ran, under a capacity of
+/// two, DEMO-2 first when `urgent`; each Design plans `plans`' files; then
+/// the drain's passes, `builds` the Build replies of the pass whose steps
+/// reach Build. Returns watch's lines and the events printed.
+fn two_planned(bench: &Bench, plans: [&[&str]; 2], builds: Vec<Reply>) -> String {
+    let reviewed = || bench.read(&super::design_scenarios::reviewed(&[]));
+    let mut replies = vec![
+        bench.reply(None, Some(&standard_declaring(&["app"]))),
+        bench.reply(None, Some(&standard_declaring(&["app/sub"]))),
+    ];
+    replies.extend(plans.iter().map(|files| bench.read(&planning(files))));
+    replies.extend((0..4).map(|_| reviewed()));
+    replies.extend(builds);
+    let (_, lines, printed) = bench.drain_passes(replies, 5, |pass, _| {
+        if pass == 2 {
+            bench.put_ticket("DEMO-9", "maintainer", "Done", &[], "", "A blocker.");
+        }
+    });
+    format!("{lines}\n{printed}")
+}
+
+/// Scenario S5, resources admitted at Build (OWL-448): DEMO-1 and DEMO-2
+/// declared intake zones that overlap, `app` and `app/sub`, but their plans
+/// share no file. Both are dispatched in one pass, both Designs and reviews
+/// run, and both Builds are admitted and run in the same pass, each holding
+/// its plan's file from its admission's time, with no collision.
+#[test]
+fn scenario_s5_builds_whose_plans_share_no_file_run_together() {
+    let bench = parallel_bench("max_in_flight = 2\n");
+    bench.put_ticket(
+        "DEMO-2",
+        "maintainer",
+        "Todo",
+        &["agent"],
+        "blocked_by = [\"DEMO-9\"]\n",
+        "Greet in the sub-app.",
+    );
+    let builds = vec![
+        building(&bench, "DEMO-1", "app/one.rs"),
+        building(&bench, "DEMO-2", "app/sub/two.rs"),
+    ];
+    let report = two_planned(&bench, [&["app/one.rs"], &["app/sub/two.rs"]], builds);
+    let events = bench.events();
+    let built: Vec<&str> = events
+        .iter()
+        .filter(|e| e.kind == EventKind::RunStarted && e.data["role"] == json!("build"))
+        .map(|e| e.ticket.as_ref().unwrap().as_str())
+        .collect();
+    assert_eq!(built, ["DEMO-1", "DEMO-2"], "{report}");
+    assert!(collisions(&events, "watch").is_empty(), "{report}");
+    for (id, file) in [("DEMO-1", "app/one.rs"), ("DEMO-2", "app/sub/two.rs")] {
+        let held = bench.record_of(id).unwrap().held.unwrap();
+        assert_eq!(held.zones, [file], "{id}\n{report}");
+        assert!(
+            held.admitted_at > held.dispatched_at && held.plan_sha256.is_some(),
+            "{id}: {held:?}"
+        );
+    }
+}
+
+/// Scenario S5, resources admitted at Build (OWL-448): the plans of DEMO-1
+/// and DEMO-2 share `app/one.rs`. Dispatched in the same pass, DEMO-1 comes
+/// first (its identifier breaks the tie of their dispatch times), so its
+/// Build is admitted first, and DEMO-2's Build, due in the same pass, waits
+/// at Build for it: told once by watch, by `owlshift why`'s phrase and by
+/// its WAITING comment, its capacity kept, nothing admitted. A person's
+/// `continue DEMO-2` is told the same.
+#[test]
+fn scenario_s5_a_build_whose_plan_shares_a_file_waits_for_the_one_dispatched_first() {
+    let bench = parallel_bench("max_in_flight = 2\n");
+    bench.put_ticket(
+        "DEMO-2",
+        "maintainer",
+        "Todo",
+        &["agent"],
+        "blocked_by = [\"DEMO-9\"]\n",
+        "Greet in the sub-app.",
+    );
+    let builds = vec![building(&bench, "DEMO-1", "app/one.rs")];
+    let report = two_planned(&bench, [&["app/one.rs"], &["app/one.rs"]], builds);
+    let events = bench.events();
+    assert_eq!(
+        by_command(&events, "drain"),
+        ["DEMO-1", "DEMO-2"],
+        "{report}"
+    );
+    let shared = json!({ "zone": "app/one.rs" });
+    let told: Vec<_> = events
+        .iter()
+        .filter(|e| e.data.get("watch") == Some(&json!("waits")))
+        .map(|e| {
+            (
+                e.ticket.as_ref().unwrap().as_str(),
+                e.data["stage"].clone(),
+                e.data["tickets"].clone(),
+                e.data["resource"].clone(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        told,
+        [("DEMO-2", json!("build"), json!(["DEMO-1"]), shared)],
+        "{report}"
+    );
+    assert!(
+        report.contains("DEMO-2's Build waits: DEMO-1 holds zone `app/one.rs`"),
+        "{report}"
+    );
+    assert_eq!(
+        status_of(&bench, "DEMO-2"),
+        Some(Status::Active(Stage::Build))
+    );
+    assert!(!bench.record_of("DEMO-2").unwrap().held.unwrap().admitted());
+    let waiting: Vec<String> = bench
+        .comments_on("DEMO-2")
+        .into_iter()
+        .filter(|c| c.starts_with("[owlshift] WAITING\n"))
+        .collect();
+    assert_eq!(waiting.len(), 1, "{waiting:?}");
+    assert!(
+        waiting[0].contains(
+            "its Build waits: DEMO-1 holds zone `app/one.rs`, which its Build would take"
+        ),
+        "{}",
+        waiting[0]
+    );
+    let demo2 = TicketId::new("DEMO-2").unwrap();
+    let (continued, printed) =
+        bench.with_on_demand(Vec::new(), None, Vec::new(), |on_demand, sink| {
+            on_demand.continue_ticket(&demo2, sink)
+        });
+    match continued {
+        Err(Stop::Waits { said, .. }) => assert!(
+            said.starts_with("DEMO-1 holds zone `app/one.rs`, which its Build would take"),
+            "{said}"
+        ),
+        other => panic!("{other:?}\n{printed}"),
+    }
 }

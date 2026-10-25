@@ -351,21 +351,27 @@ fn a_ticket_session_reads_back_and_refuses_what_no_run_keeps() {
     assert!(SessionId::new("ffffffff-ffff-4fff-bfff-fffffffffff").is_err());
 }
 
+/// A ticket admitted at `at` with `zones` (none for the whole repository)
+/// and `resources`, no plan (OWL-448).
+fn admitted(zones: &[&str], resources: &[&str], at: jiff::Timestamp) -> TicketHeld {
+    let owned = |names: &[&str]| names.iter().map(|n| (*n).to_owned()).collect::<Vec<_>>();
+    let mut held = TicketHeld::dispatched(at);
+    held.admit(owned(zones), owned(resources), None, at);
+    held
+}
+
 /// What a ticket holds (OWL-403): written and read back, valid against its
 /// schema; widened by the files its branch changed, each once and sorted,
 /// with the widening's time; the whole repository past its bounds; refused
-/// when a zone is no folder, a resource no name, the files unsorted or the
-/// mark no commit.
+/// when a zone is no folder, a resource no name, the files unsorted, the
+/// plan's hash or the mark malformed. A return to Design's admission adds
+/// to what it holds, a whole repository staying whole (OWL-448).
 #[test]
 fn a_ticket_held_widens_reads_back_and_refuses_what_it_cannot_hold() {
     let at = |minute: i64| -> jiff::Timestamp {
         jiff::Timestamp::from_second(1_790_000_000 + minute * 60).unwrap()
     };
-    let mut held = TicketHeld::dispatched(
-        vec!["app".to_owned()],
-        vec!["migrations".to_owned()],
-        Some(at(0)),
-    );
+    let mut held = admitted(&["app"], &["migrations"], at(0));
     let files = |names: &[&str]| names.iter().map(|n| (*n).to_owned()).collect::<Vec<_>>();
     assert_eq!(
         held.widen(files(&["b.rs", "a.rs"]), at(1)),
@@ -375,6 +381,7 @@ fn a_ticket_held_widens_reads_back_and_refuses_what_it_cannot_hold() {
     assert_eq!(held.files, ["a.rs", "b.rs"]);
     assert_eq!(held.widened_at, [at(1)]);
     held.verified = Some("c".repeat(40));
+    held.plan_sha256 = Some("d".repeat(64));
     let document: Value = serde_json::from_str(&held.render()).unwrap();
     let path =
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../schemas/ticket-held.schema.json");
@@ -391,6 +398,7 @@ fn a_ticket_held_widens_reads_back_and_refuses_what_it_cannot_hold() {
         ("resources", json!(["two words"])),
         ("files", json!(["b.rs", "a.rs"])),
         ("files", json!(["a.rs", "a.rs"])),
+        ("plan_sha256", json!("D".repeat(64))),
         ("verified", json!("main")),
     ] {
         let mut broken = document.clone();
@@ -401,7 +409,7 @@ fn a_ticket_held_widens_reads_back_and_refuses_what_it_cannot_hold() {
         }
     }
     // Past the files it lists, or a path it cannot keep: the whole
-    // repository, its declared resources kept.
+    // repository, its admitted resources kept.
     let many: Vec<String> = (0..=MAX_HELD_FILES).map(|n| format!("f{n:05}")).collect();
     let mut wide = held.clone();
     wide.widen(many, at(3));
@@ -410,34 +418,51 @@ fn a_ticket_held_widens_reads_back_and_refuses_what_it_cannot_hold() {
     let mut odd = held.clone();
     odd.widen(files(&["x\0y"]), at(4));
     assert!(odd.whole());
-    // Joined with a whole repository, a ticket holds it too.
-    let mut joined = TicketHeld::dispatched(vec!["docs".to_owned()], Vec::new(), Some(at(5)));
-    joined.join(&held);
+    // A return to Design's admission adds the new plan's zones, its time
+    // and its plan; the whole repository stays whole.
+    let hash = "e".repeat(64);
+    held.admit(
+        files(&["app", "docs/a.md"]),
+        Vec::new(),
+        Some(hash.clone()),
+        at(5),
+    );
     assert_eq!(
-        (&joined.zones, &joined.files, joined.dispatched_at),
         (
-            &files(&["docs", "app"]),
+            &held.zones,
+            &held.files,
+            held.admitted_at,
+            held.dispatched_at
+        ),
+        (
+            &files(&["app", "docs/a.md"]),
             &files(&["a.rs", "b.rs"]),
-            Some(at(5))
+            Some(at(5)),
+            Some(at(0))
         )
     );
-    joined.join(&wide);
-    assert!(joined.whole() && joined.files.is_empty(), "{joined:?}");
+    assert_eq!(held.plan_sha256, Some(hash));
+    wide.admit(files(&["docs"]), Vec::new(), None, at(6));
+    assert!(wide.whole() && wide.files.is_empty(), "{wide:?}");
+    held.admit(Vec::new(), Vec::new(), None, at(7));
+    assert!(held.whole() && held.files.is_empty(), "{held:?}");
 }
 
-/// A ticket that holds the whole repository, declared so or past its
+/// A ticket that holds the whole repository, admitted so or past its
 /// bounds, lists no file: a widening then adds none, keeps no time and
 /// changes nothing, and a record that lists files anyway is refused
 /// (OWL-403).
 #[test]
 fn a_ticket_holding_the_whole_repository_is_widened_by_nothing() {
     let at = jiff::Timestamp::from_second(1_790_000_000).unwrap();
-    let mut whole = TicketHeld::dispatched(Vec::new(), Vec::new(), Some(at));
+    let mut whole = admitted(&[], &[], at);
     let before = whole.clone();
     assert!(whole.widen(["src/lib.rs".to_owned()], at).is_empty());
     assert!(!whole.widen_whole(at));
     assert_eq!(whole, before);
-    let mut overflowed = TicketHeld::dispatched(vec!["app".to_owned()], Vec::new(), Some(at));
+    let unrecorded = TicketHeld::unrecorded();
+    assert!(unrecorded.whole() && unrecorded.dispatched_at.is_none());
+    let mut overflowed = admitted(&["app"], &[], at);
     overflowed.widen(["".to_owned()], at);
     assert!(overflowed.whole() && overflowed.files.is_empty());
     let after = overflowed.clone();
@@ -446,4 +471,72 @@ fn a_ticket_holding_the_whole_repository_is_widened_by_nothing() {
     let mut listed: Value = serde_json::from_str(&whole.render()).unwrap();
     listed["files"] = json!(["src/lib.rs"]);
     assert!(TicketHeld::parse(&listed.to_string()).is_err());
+}
+
+/// A ticket dispatched since OWL-448 holds nothing until its Build's
+/// admission: no zone, not the whole repository, and a record keeping a
+/// zone, a resource or a plan while nothing is admitted is refused. What
+/// cannot be read is never free: a widening of it keeps its files, and one
+/// past its bounds or unread admits the whole repository at that time. A
+/// format-1 record reads as admitted at its dispatch, holding what its
+/// dispatch declared, and is written back as format 2; format 1 keeps no
+/// admission.
+#[test]
+fn a_ticket_held_admits_nothing_at_its_dispatch_and_reads_format_1_as_admitted() {
+    let at = |minute: i64| -> jiff::Timestamp {
+        jiff::Timestamp::from_second(1_790_000_000 + minute * 60).unwrap()
+    };
+    let nothing = TicketHeld::dispatched(at(0));
+    assert!(!nothing.admitted() && !nothing.whole() && nothing.zones.is_empty());
+    assert_eq!(TicketHeld::parse(&nothing.render()).unwrap(), nothing);
+    let document: Value = serde_json::from_str(&nothing.render()).unwrap();
+    assert_eq!(document["format"], json!(2));
+    for (field, value) in [
+        ("zones", json!(["app"])),
+        ("resources", json!(["migrations"])),
+        ("plan_sha256", json!("d".repeat(64))),
+    ] {
+        let mut broken = document.clone();
+        broken[field] = value.clone();
+        assert!(
+            TicketHeld::parse(&broken.to_string()).is_err(),
+            "{field} {value}"
+        );
+    }
+    let mut widened = nothing.clone();
+    assert_eq!(widened.widen(["a.rs".to_owned()], at(1)), ["a.rs"]);
+    assert!(!widened.admitted() && !widened.whole());
+    let mut past = nothing.clone();
+    past.widen([String::new()], at(2));
+    assert!(past.whole() && past.admitted_at == Some(at(2)), "{past:?}");
+    let mut unread = nothing.clone();
+    assert!(unread.widen_whole(at(3)));
+    assert!(
+        unread.whole() && unread.admitted_at == Some(at(3)),
+        "{unread:?}"
+    );
+
+    let old = json!({
+        "format": 1,
+        "zones": ["app"],
+        "resources": ["migrations"],
+        "files": ["app/a.rs"],
+        "dispatched_at": at(0).to_string(),
+    });
+    let read = TicketHeld::parse(&old.to_string()).unwrap();
+    assert!(read.admitted() && !read.whole(), "{read:?}");
+    assert_eq!(
+        (&read.zones, read.admitted_at, read.plan_sha256.as_ref()),
+        (&vec!["app".to_owned()], Some(at(0)), None)
+    );
+    let rendered: Value = serde_json::from_str(&read.render()).unwrap();
+    assert_eq!(rendered["format"], json!(2));
+    assert_eq!(TicketHeld::parse(&read.render()).unwrap(), read);
+    // One kept for a ref from before P6, with no dispatch time, holds the
+    // whole repository.
+    let first = TicketHeld::parse(r#"{"format":1}"#).unwrap();
+    assert!(first.whole() && first.admitted_at.is_none());
+    let mut admitting = old.clone();
+    admitting["admitted_at"] = json!(at(1).to_string());
+    assert!(TicketHeld::parse(&admitting.to_string()).is_err());
 }

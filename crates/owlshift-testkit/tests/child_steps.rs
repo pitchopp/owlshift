@@ -654,9 +654,10 @@ fn asks(project: &ChildProject, id: &str) -> bool {
 /// until all three are under way and none leaving until the three have
 /// counted, however long each takes (OWL-422). Meanwhile a person types
 /// `owlshift do DEMO-4`, a ticket with no intake, which would hold the
-/// whole repository, from within DEMO-1's Build: it is refused, DEMO-1
-/// holding `a`. Each Build asks its decider, and the three wait; no
-/// quarantine, no obligation and no outcome record is left.
+/// whole repository, from within DEMO-1's Build: it is dispatched, and its
+/// Build waits, DEMO-1 holding `a`, nothing admitted (OWL-448). Each Build
+/// asks its decider, and the three wait; no quarantine, no obligation and
+/// no outcome record is left.
 ///
 /// Its bound stays 200 passes, not counted on the slots' holders as the
 /// tests of two projects are (OWL-425, 2026-10-22): its Builds wait for each
@@ -721,7 +722,8 @@ fn three_tickets_build_at_once_and_a_do_typed_meanwhile_waits() {
         let held = record_of(&s.project, id).unwrap().held.unwrap();
         assert_eq!(held.zones, [zone], "{id}");
     }
-    assert_eq!(record_of(&s.project, "DEMO-4"), None, "{lines}");
+    let waiting = record_of(&s.project, "DEMO-4").unwrap();
+    assert!(!waiting.held.unwrap().admitted(), "{lines}");
     assert!(!dirs.obligations_stand(), "{lines}");
     assert!(step::leftovers(&dirs).is_empty());
 }
