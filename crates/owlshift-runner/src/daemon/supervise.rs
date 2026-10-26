@@ -6,7 +6,7 @@ use std::io::{self, Write};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use jiff::Timestamp;
+use jiff::{Timestamp, Zoned};
 use owlshift_adapters::forge::Repo;
 use owlshift_contracts::event::EventKind;
 use owlshift_contracts::service::{BY_DAEMON, Request};
@@ -15,6 +15,7 @@ use owlshift_platform::process::{self, AtCheckedStop, Degree};
 use serde_json::json;
 
 use super::child::{Ended as ChildEnded, Supervised};
+use super::digest::Digests;
 use super::{Daemon, Ended, UNSERVABLE_EXIT, requests};
 use crate::events::{Data, EventLog, EventSink, data, printable};
 use crate::notify;
@@ -74,6 +75,7 @@ struct State {
     /// for a checked stop, whose watches the platform told.
     relay: Option<Request>,
     next_pass: Instant,
+    digests: Digests,
 }
 
 impl Daemon<'_> {
@@ -105,12 +107,14 @@ impl Daemon<'_> {
             stopping: false,
             relay: None,
             next_pass: Instant::now(),
+            digests: Digests::default(),
         };
         loop {
             self.check_stop(&mut state, out);
             let now = Instant::now();
             if !state.stopping && now >= state.next_pass {
                 self.pass(&mut state, out);
+                self.digest(&mut state, out);
                 state.next_pass = now + self.timing.pass;
             }
             let stopping = state.stopping;
@@ -267,6 +271,27 @@ impl Daemon<'_> {
                 slot.due = Some(now);
             }
         }
+    }
+
+    /// Sends the daily digest of the listed projects when it is due.
+    fn digest(&self, state: &mut State, out: &mut dyn Write) {
+        let Some(settings) = &self.digest else {
+            return;
+        };
+        let projects: Vec<_> = state
+            .slots
+            .iter()
+            .filter(|slot| slot.listed)
+            .map(|slot| (&slot.repo, &slot.dirs))
+            .collect();
+        state.digests.check(
+            self.data,
+            settings,
+            &projects,
+            self.notifier,
+            &Zoned::now(),
+            out,
+        );
     }
 
     /// Starts `slot`'s watch, its served lock taken first.

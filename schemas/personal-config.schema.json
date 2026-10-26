@@ -77,6 +77,11 @@
         "null"
       ]
     },
+    "service": {
+      "description": "The background service (P7).",
+      "$ref": "#/$defs/ServiceSettings",
+      "default": {}
+    },
     "web_tools": {
       "description": "Whether the read-only planning and review roles and the resolver\n(design, design review, verify, arbiter, resolver) get their web\ntools, WebFetch and WebSearch, on this machine: on unless set to\n`false` (OWL-415). Their shell keeps the network either way; intake,\nthe answer check, Build and rebase never get them from this key.",
       "type": [
@@ -207,6 +212,30 @@
           "items": {
             "type": "string"
           }
+        }
+      },
+      "additionalProperties": false
+    },
+    "ServiceSettings": {
+      "description": "The background service's settings (P7).",
+      "type": "object",
+      "properties": {
+        "digest": {
+          "description": "Whether the daemon sends one notification a day, pointing to\n`owlshift status`: on unless set to `false` (OWL-440).",
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "digest_hour": {
+          "description": "The hour of that notification, 0 to 23, local time: 8 when absent. A\nmachine asleep at the hour sends it at wake.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint8",
+          "maximum": 23,
+          "minimum": 0
         }
       },
       "additionalProperties": false

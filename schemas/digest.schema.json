@@ -1,0 +1,30 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Owlshift digest",
+  "description": "The daily digest's record, `<data>/service/digest.json` (OWL-440): when\nthe latest digest was made, so a machine asleep at the hour sends it once\nat wake and never twice.",
+  "type": "object",
+  "properties": {
+    "at": {
+      "description": "When the latest digest was made; before the first one, when the\ndaemon first counted from. The next digest is due at the first\ndigest hour after it, and tells what happened since.",
+      "type": "string",
+      "format": "date-time"
+    },
+    "format": {
+      "description": "The format version of this document.",
+      "type": "integer",
+      "const": 1
+    },
+    "line": {
+      "description": "The latest digest's text; absent until one is made.",
+      "type": [
+        "string",
+        "null"
+      ]
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "format",
+    "at"
+  ]
+}

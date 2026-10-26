@@ -171,6 +171,9 @@ pub const DAEMON_FORMAT: u32 = 1;
 /// The format version of the install manifest
 /// (`<data>/service/manifest.json`, OWL-437).
 pub const MANIFEST_FORMAT: u32 = 1;
+/// The format version of the daily digest's record
+/// (`<data>/service/digest.json`, OWL-440).
+pub const DIGEST_FORMAT: u32 = 1;
 
 /// Why a contract document was refused.
 #[derive(Debug)]

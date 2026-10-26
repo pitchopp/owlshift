@@ -22,11 +22,15 @@
 //!   SIGTERM is a checked stop: the platform sends each watch SIGTERM, and
 //!   the daemon exits once they have ended. A project no longer listed has
 //!   its watch drained the same way.
+//! - *The digest* ([`digest`]): once a day at the personal file's
+//!   `digest_hour`, one notification, `<data>/service/digest.json` keeping
+//!   when it was made so it is sent once at wake, never twice.
 //!
 //! The watch's command is the caller's ([`Daemon::watch`]): this binary in
 //! `owlshift daemon`, a stand-in on the test bench.
 
 mod child;
+pub mod digest;
 pub mod instance;
 pub mod requests;
 mod supervise;
@@ -80,6 +84,8 @@ pub struct Daemon<'a> {
     /// keeps ending; `None` tells no one.
     pub notifier: Option<&'a dyn Notifier>,
     pub timing: Timing,
+    /// The daily digest's settings; `None` sends none.
+    pub digest: Option<digest::Settings>,
 }
 
 /// How the daemon ended.

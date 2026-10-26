@@ -116,6 +116,7 @@ fn run_daemon(data: &Path) -> ExitCode {
         watch: &watch,
         notifier: Some(&notes),
         timing,
+        digest: None,
     };
     let daemon::Ended::Stopped = daemon.run(&mut std::io::stdout());
     drop(instance);
