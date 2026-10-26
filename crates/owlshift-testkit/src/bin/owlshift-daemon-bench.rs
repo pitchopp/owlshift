@@ -3,8 +3,18 @@
 //! `owlshift_runner::daemon`, on the data directory `OWLSHIFT_DATA_DIR`,
 //! with the timings `OWLSHIFT_BENCH_TIMING` gives (milliseconds: pass, tick,
 //! first delay, longest delay, reset after), each notification appended to
-//! the file `OWLSHIFT_BENCH_NOTES`, and as each served project's watch this
-//! binary's stand-in, `owlshift-daemon-bench watch <OWNER/REPO>`.
+//! the file `OWLSHIFT_BENCH_NOTES`, and as each served project's watch one
+//! of this binary's two: the stand-in, `owlshift-daemon-bench watch
+//! <OWNER/REPO>`, or, when `OWLSHIFT_BENCH_PROJECT` names a step child's
+//! project file ([`ChildProject`]), a real watch, `owlshift-daemon-bench
+//! drain demo/project` (OWL-441).
+//!
+//! The real watch is `owlshift watch --drain` on that project: the Markdown
+//! tracker, the harness the file names, each step in a child,
+//! `owlshift-step-child` beside this binary, taking the project's machine
+//! slots. It stops by degrees as `owlshift watch` does, its checked stop
+//! bounded by `CHECKED_STOP_BOUND`, and passes until a stop is asked of it,
+//! adding a byte to `<data>/bench/demo-project/passes` after each pass.
 //!
 //! The stand-in stops as a watch does: by degrees, its checked stop bounded
 //! by 2 seconds, its process trees stopping with it however it ends. It runs
@@ -23,7 +33,6 @@ use std::time::Duration;
 
 use jiff::Timestamp;
 use owlshift_adapters::forge::Repo;
-use owlshift_adapters::notifier::{Error, Notifier};
 use owlshift_contracts::format::Format;
 use owlshift_contracts::service::DaemonRecord;
 use owlshift_core::restart::RestartPolicy;
@@ -31,6 +40,8 @@ use owlshift_platform::process::{self, AtCheckedStop, ProcessTree};
 use owlshift_runner::daemon::{self, Daemon, Held, Timing};
 use owlshift_runner::project::ProjectDirs;
 use owlshift_runner::watch;
+use owlshift_runner::watch::stop::CHECKED_STOP_BOUND;
+use owlshift_testkit::step_child::{self, ChildProject, FileNotifier};
 
 fn main() -> ExitCode {
     process::stop_trees_on_signal().expect("the signal policy");
@@ -41,26 +52,13 @@ fn main() -> ExitCode {
     match args.as_slice() {
         [command] if command == "daemon" => run_daemon(&data),
         [command, repo] if command == "watch" => run_watch(&data, &Repo::parse(repo).unwrap()),
+        [command, repo] if command == "drain" => run_drain(&data, repo),
         _ => {
-            eprintln!("usage: owlshift-daemon-bench daemon | watch <OWNER/REPO>");
+            eprintln!(
+                "usage: owlshift-daemon-bench daemon | watch <OWNER/REPO> | drain <OWNER/REPO>"
+            );
             ExitCode::from(2)
         }
-    }
-}
-
-/// Appends each notification to a file, one line each.
-struct FileNotifier(PathBuf);
-
-impl Notifier for FileNotifier {
-    fn notify(&self, line: &str) -> Result<(), Error> {
-        use std::io::Write;
-        let mut file = fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&self.0)
-            .unwrap();
-        writeln!(file, "{line}").unwrap();
-        Ok(())
     }
 }
 
@@ -106,9 +104,11 @@ fn run_daemon(data: &Path) -> ExitCode {
     let notes = FileNotifier(PathBuf::from(
         std::env::var_os("OWLSHIFT_BENCH_NOTES").expect("OWLSHIFT_BENCH_NOTES"),
     ));
+    // The real watch when a project file is given, else the stand-in.
+    let real = std::env::var_os("OWLSHIFT_BENCH_PROJECT").is_some();
     let watch = |repo: &Repo| {
         let mut command = Command::new(&exe);
-        command.args(["watch", &repo.to_string()]);
+        command.args([if real { "drain" } else { "watch" }, &repo.to_string()]);
         command
     };
     let daemon = Daemon {
@@ -122,7 +122,49 @@ fn run_daemon(data: &Path) -> ExitCode {
     ExitCode::SUCCESS
 }
 
-/// The bench's folder of `repo`'s stand-in.
+/// The real watch of the project `OWLSHIFT_BENCH_PROJECT` names, which must
+/// be `repo` in the data directory `data`.
+fn run_drain(data: &Path, repo: &str) -> ExitCode {
+    // As `owlshift watch`.
+    process::stop_by_degrees(Some(CHECKED_STOP_BOUND)).expect("the stop by degrees");
+    let file =
+        PathBuf::from(std::env::var_os("OWLSHIFT_BENCH_PROJECT").expect("OWLSHIFT_BENCH_PROJECT"));
+    let project = ChildProject::load(&file);
+    if repo != step_child::REPO || project.data != data {
+        eprintln!(
+            "owlshift: the bench's project is {} in {}, not {repo} in {}",
+            step_child::REPO,
+            project.data.display(),
+            data.display()
+        );
+        return ExitCode::from(2);
+    }
+    let exe = std::env::current_exe().unwrap();
+    let child = exe.with_file_name(format!(
+        "owlshift-step-child{}",
+        std::env::consts::EXE_SUFFIX
+    ));
+    // A byte for each pass, so a test knows the watch passed since it looked.
+    let bench = bench_dir(data, &Repo::parse(repo).unwrap());
+    fs::create_dir_all(&bench).unwrap();
+    let passes = bench.join("passes");
+    let mut between = || {
+        use std::io::Write;
+        let mut file = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&passes)
+            .unwrap();
+        file.write_all(b".").unwrap();
+        true
+    };
+    println!("watching {repo}");
+    project.watch_until_stopped(Some(step_child::step_children(&file, &child)), &mut between);
+    println!("{repo} ended");
+    ExitCode::SUCCESS
+}
+
+/// The bench's folder of `repo`'s watches.
 fn bench_dir(data: &Path, repo: &Repo) -> PathBuf {
     data.join("bench").join(repo.to_string().replace('/', "-"))
 }

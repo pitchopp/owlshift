@@ -10,11 +10,20 @@
 //! forge with no pull request: a drain's intake reads none, and a
 //! dispatch reads that none is open (OWL-401).
 //! `owlshift-step-child` is the child, calling the same entry as
-//! `owlshift continue <TICKET> --step <ENVELOPE>`.
+//! `owlshift continue <TICKET> --step <ENVELOPE>`; [`step_children`] starts
+//! it for a watch, and [`ChildProject::watch_until_stopped`] is the watch
+//! of the tests that stop one (OWL-161) and of the daemon's bench (OWL-441).
+//!
+//! The rest is what those tests play with: the results of [`intake_done`],
+//! [`intake_declaring`] and [`build_asks`], the replies of [`reply_for`],
+//! the harness of `holding_harness` (Unix), a ticket's record ([`record_of`],
+//! [`asks`]), the event log ([`events`], [`ended_as`]) and a notifier writing to a file
+//! ([`FileNotifier`]).
 
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::time::Duration;
 
 use jiff::Timestamp;
@@ -24,9 +33,15 @@ use serde_json::{Value, json};
 use owlshift_adapters::forge::Repo;
 use owlshift_adapters::forge::github::GitHubForge;
 use owlshift_adapters::graphql::{Response, Transport};
+use owlshift_adapters::notifier::{self, Notifier};
 use owlshift_adapters::tracker::markdown::MarkdownTracker;
 use owlshift_contracts::config::ProjectConfig;
+use owlshift_contracts::event::{Event, EventKind};
+use owlshift_contracts::format::RESULT_FORMAT;
+use owlshift_contracts::ids::TicketId;
 use owlshift_core::routing::RunRouting;
+use owlshift_core::state::{Status, TicketState};
+use owlshift_platform::process;
 use owlshift_runner::agent_env::AgentEnv;
 use owlshift_runner::events::{EventLog, EventSink};
 use owlshift_runner::executor::{Git, Harness};
@@ -34,7 +49,10 @@ use owlshift_runner::on_demand::{self, OnDemand};
 use owlshift_runner::project::ProjectDirs;
 use owlshift_runner::routing::Router;
 use owlshift_runner::slots::MachineSlots;
+use owlshift_runner::step::Children;
+use owlshift_runner::ticket_ref::{self, TicketRecord};
 use owlshift_runner::usage::UsageStore;
+use owlshift_runner::watch::Watch;
 
 use crate::gh;
 use crate::git::{GitEnv, seed};
@@ -66,6 +84,10 @@ pub struct ChildProject {
     /// live in and their count. None: the child takes none.
     #[serde(default)]
     pub slots: Option<ChildSlots>,
+    /// The file each notification is appended to, one line each
+    /// ([`FileNotifier`]). None: this machine shows no notification.
+    #[serde(default)]
+    pub notes: Option<PathBuf>,
 }
 
 /// The machine's run slots of [`ChildProject::slots`].
@@ -115,7 +137,38 @@ impl ChildProject {
             harness,
             reply,
             slots: None,
+            notes: None,
         }
+    }
+
+    /// [`Self::seed`], its runs ending as [`intake_done`] says, then the
+    /// tickets DEMO-1 to DEMO-`count` added, each admitted and held by
+    /// DEMO-9, which no gesture admits, until a test moves it to Done; its
+    /// children taking the machine's `slots` in `machine`, its capacity
+    /// `max_in_flight` (OWL-401).
+    pub fn seed_parallel(
+        root: &Path,
+        harness: PathBuf,
+        count: usize,
+        max_in_flight: u32,
+        (machine, slots): (&Path, u32),
+    ) -> Self {
+        let mut project = Self::seed(root, harness);
+        project.play(Reply::default(), Some(&intake_done()));
+        project.slots = Some(ChildSlots {
+            data: machine.to_owned(),
+            count: slots,
+        });
+        project.set_policy(&format!("max_in_flight = {max_in_flight}"));
+        project.add_ticket("DEMO-9", &[], "");
+        for n in 1..=count {
+            project.add_ticket(
+                &format!("DEMO-{n}"),
+                &["agent"],
+                "blocked_by = [\"DEMO-9\"]\n",
+            );
+        }
+        project
     }
 
     /// The machine's run slots this project's children take, if any.
@@ -247,6 +300,7 @@ impl ChildProject {
         let dirs = self.dirs();
         let remote_url = self.bare.to_string_lossy().into_owned();
         let usage = UsageStore::in_data_dir(&self.data);
+        let notes = self.notes.clone().map(FileNotifier);
         let on_demand = OnDemand {
             executor: &executor,
             tracker: &tracker,
@@ -267,13 +321,204 @@ impl ChildProject {
             dirs: &dirs,
             head_wait: Duration::ZERO,
             clock,
-            notifier: None,
+            notifier: notes.as_ref().map(|notes| notes as &dyn Notifier),
             usage: &usage,
             web_tools: true,
         };
         let mut sink = EventSink::new(REPO, EventLog::in_dir(&self.data), out);
         act(&on_demand, &mut sink)
     }
+
+    /// Passes of `owlshift watch --drain` over this project, a pass every
+    /// 200 ms, until a stop is asked of it or `between`, called after each
+    /// pass, says to end: its steps in `children`, each taking one of this
+    /// project's machine slots, or with none in its own process, as plain
+    /// `owlshift watch` runs them. The caller installs the signal policy, the
+    /// sentinel and the stop by degrees, as `owlshift` does.
+    pub fn watch_until_stopped(
+        &self,
+        children: Option<Children<'_>>,
+        between: &mut dyn FnMut() -> bool,
+    ) {
+        let children = children.map(|children| match self.machine_slots() {
+            Some(slots) => children.with_slots(slots),
+            None => children,
+        });
+        let mut sleep = |interval| {
+            process::wait_asked(interval);
+            between()
+        };
+        self.with_on_demand(&mut std::io::stdout(), |on_demand, sink| {
+            let watch = Watch {
+                on_demand,
+                interval: Duration::from_millis(200),
+            };
+            let mut out = std::io::stdout();
+            match &children {
+                Some(children) => watch.run_with_children(
+                    true,
+                    children,
+                    sink,
+                    &mut out,
+                    &mut |_, _, _| {},
+                    &mut sleep,
+                ),
+                None => watch.run_drain(sink, &mut out, &mut |_, _, _| {}, &mut sleep),
+            }
+        });
+    }
+}
+
+/// The children of a watch's steps over the project whose paths `file`
+/// keeps: `program`, the step's child, given the file, the ticket and the
+/// envelope.
+pub fn step_children(file: &Path, program: &Path) -> Children<'static> {
+    let (file, program) = (file.to_owned(), program.to_owned());
+    Children::new(move |ticket, envelope| {
+        let mut command = Command::new(&program);
+        command.arg(&file).arg(ticket.as_str()).arg(envelope);
+        command
+    })
+}
+
+/// Appends each notification to the file it names, one line each.
+pub struct FileNotifier(pub PathBuf);
+
+impl Notifier for FileNotifier {
+    fn notify(&self, line: &str) -> Result<(), notifier::Error> {
+        fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.0)
+            .and_then(|mut file| writeln!(file, "{line}"))
+            .map_err(|error| notifier::Error::new(format!("{}: {error}", self.0.display())))
+    }
+}
+
+/// An intake that ends done, the ticket back in the ready column.
+pub fn intake_done() -> String {
+    json!({
+        "format": RESULT_FORMAT,
+        "status": "done",
+        "summary": "A small greeting.",
+        "intake": {
+            "variant": "trivial",
+            "routing": { "harness": "claude", "tier": "fast", "effort": "low" },
+            "dependencies": [],
+        },
+    })
+    .to_string()
+}
+
+/// An intake that ends done, the ticket `trivial`, declaring `zones`.
+pub fn intake_declaring(zones: &[&str]) -> String {
+    let mut result: Value = serde_json::from_str(&intake_done()).unwrap();
+    result["intake"]["zones"] = json!(zones);
+    result.to_string()
+}
+
+/// A Build that asks its decider one question: the step ends with the
+/// ticket waiting for the answer, holding what it holds.
+pub fn build_asks() -> String {
+    json!({
+        "format": RESULT_FORMAT,
+        "status": "questions",
+        "summary": "The greeting's language is not given.",
+        "questions": [{
+            "id": "Q1", "category": "scope", "context": "The ticket names no language.",
+            "text": "Which language should the greeting use?",
+            "recommendation": { "why": "The repository is in English." },
+        }],
+    })
+    .to_string()
+}
+
+/// Writes in `dir` the reply of `role`'s runs on `ticket` (any ticket when
+/// `None`), its result `result`, for the tests' harness scripts such as
+/// `holding_harness` (Unix).
+pub fn reply_for(dir: &Path, role: &str, ticket: Option<&str>, result: &str) {
+    let name = ticket.map_or_else(|| role.to_owned(), |ticket| format!("{role}-{ticket}"));
+    let result_file = dir.join(format!("{name}.json"));
+    fs::write(&result_file, result).unwrap();
+    let reply = Reply {
+        result: Some(result_file),
+        ..Reply::default()
+    };
+    fs::write(dir.join(format!("reply-{name}.toml")), reply.render()).unwrap();
+}
+
+/// A harness for the stop tests (OWL-161): a script that, for a run of
+/// `role` while `dir/hold` stands, runs `before` (shell text, in the run's
+/// worktree), writes its pid to `dir/<role>-<ticket>.pid`, then runs `hold`
+/// (shell text), such as `exec sleep 30`, a run under way until a stop cuts
+/// it; past it, and for any other run, it plays `fake`, the fake harness,
+/// with the reply [`reply_for`] wrote in `dir`, or the bench's.
+#[cfg(unix)]
+pub fn holding_harness(dir: &Path, fake: &Path, role: &str, before: &str, hold: &str) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+
+    let script = dir.join(format!("harness-{role}.sh"));
+    fs::write(
+        &script,
+        format!(
+            "#!/bin/sh\ndir='{dir}'\nbrief=\"\"\nreply=\"\"\n\
+             while [ $# -gt 0 ]; do\n  case \"$1\" in\n    --brief) brief=\"$2\"; shift 2;;\n    \
+             --reply) reply=\"$2\"; shift 2;;\n    *) shift;;\n  esac\ndone\n\
+             role=$(sed -n 's/^  \"role\": \"\\([a-z_]*\\)\",$/\\1/p' \"$brief\" | head -n 1)\n\
+             ticket=$(sed -n 's/^    \"id\": \"\\([A-Z0-9-]*\\)\",$/\\1/p' \"$brief\" | head -n 1)\n\
+             if [ \"$role\" = '{role}' ] && [ -e \"$dir/hold\" ]; then\n  {before}\n  \
+             echo $$ > \"$dir/$role-$ticket.pid.partial\"\n  \
+             mv \"$dir/$role-$ticket.pid.partial\" \"$dir/$role-$ticket.pid\"\n  {hold}\nfi\n\
+             if [ -f \"$dir/reply-$role-$ticket.toml\" ]; then reply=\"$dir/reply-$role-$ticket.toml\"\n\
+             elif [ -f \"$dir/reply-$role.toml\" ]; then reply=\"$dir/reply-$role.toml\"; fi\n\
+             exec '{fake}' --brief \"$brief\" --reply \"$reply\"\n",
+            dir = dir.display(),
+            fake = fake.display(),
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+    script
+}
+
+/// The ticket ref of `id` in `project`'s dedicated checkout, if it reads.
+pub fn record_of(project: &ChildProject, id: &str) -> Option<TicketRecord> {
+    let env = project.env();
+    let git = Git::with_setup("git", move |command| env.apply(command));
+    let checkout = project.dirs().checkout();
+    ticket_ref::read(&git, &checkout, &TicketId::new(id).unwrap())
+        .ok()
+        .flatten()
+        .map(|stored| stored.record)
+}
+
+/// Whether the ticket `id` of `project` waits for its decider's answer.
+pub fn asks(project: &ChildProject, id: &str) -> bool {
+    record_of(project, id).is_some_and(|record| {
+        TicketState::try_from(&record.state)
+            .is_ok_and(|state| matches!(state.status(), Status::NeedsInput { .. }))
+    })
+}
+
+/// Every event of the log in the data directory `data`, oldest first.
+pub fn events(data: &Path) -> Vec<Event> {
+    fs::read_to_string(EventLog::in_dir(data).path())
+        .unwrap_or_default()
+        .lines()
+        .map(|line| Event::parse(line).unwrap())
+        .collect()
+}
+
+/// The tickets whose run ended `outcome`, as their `run_ended` events in
+/// `project`'s log say, sorted.
+pub fn ended_as(project: &ChildProject, outcome: &str) -> Vec<String> {
+    let mut tickets: Vec<String> = events(&project.data)
+        .into_iter()
+        .filter(|event| event.kind == EventKind::RunEnded && event.data["outcome"] == outcome)
+        .filter_map(|event| event.ticket.map(|ticket| ticket.as_str().to_owned()))
+        .collect();
+    tickets.sort();
+    tickets
 }
 
 /// A forge with no pull request (OWL-401): the open pull requests of the

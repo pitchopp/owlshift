@@ -6,23 +6,36 @@
 //! doubling delay, told at the third end; a hard kill of the daemon leaving
 //! no watch or step; a stop drained and a SIGTERM checked, a hung watch
 //! stopped by its bound; a watch that cannot serve pausing its project.
+//!
+//! OWL-441: scenario S11 with a real watch under the daemon (the bench's
+//! `drain`), its steps in children and its runs on the fake harness: a
+//! SIGTERM checks and resumes two Builds, a SIGKILL leaves the quarantine,
+//! notified, and no ticket is dispatched twice across the restarts.
 #![cfg(unix)]
 
+use std::collections::BTreeMap;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use jiff::Timestamp;
 use owlshift_adapters::forge::Repo;
+use owlshift_contracts::event::EventKind;
 use owlshift_contracts::service::{BY_DAEMON, BY_STOP, Request};
 use owlshift_runner::daemon::{self, requests};
 use owlshift_runner::project::ProjectDirs;
+use owlshift_runner::quarantine;
 use owlshift_runner::served::{self, Registry};
 use owlshift_runner::watch;
+use owlshift_testkit::step_child::{
+    ChildProject, REPO, build_asks, ended_as, events, holding_harness, intake_declaring, reply_for,
+};
 
 const BENCH: &str = env!("CARGO_BIN_EXE_owlshift-daemon-bench");
+/// The fake harness.
+const FAKE: &str = env!("CARGO_BIN_EXE_owlshift-fake-harness");
 
 /// The bench's timings, in milliseconds: a pass a second, a look every
 /// 50 ms, restarts after 300 ms doubling up to 1.2 s, reset after 5 s.
@@ -34,6 +47,9 @@ const API: &str = "acme/api";
 struct Bench {
     tmp: tempfile::TempDir,
     daemon: Option<Child>,
+    /// The project file of the real watch the daemon runs (OWL-441); none:
+    /// the stand-in.
+    project: Option<PathBuf>,
 }
 
 impl Bench {
@@ -41,6 +57,7 @@ impl Bench {
         Self {
             tmp: tempfile::tempdir().unwrap(),
             daemon: None,
+            project: None,
         }
     }
 
@@ -69,19 +86,29 @@ impl Bench {
         self.data().join("bench").join(repo.replace('/', "-"))
     }
 
+    /// Starts a daemon, its output added to what the ones before it wrote.
     fn start(&mut self) {
         fs::create_dir_all(self.data()).unwrap();
-        let daemon = Command::new(BENCH)
+        let output = |name: &str| {
+            fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(self.tmp.path().join(name))
+                .unwrap()
+        };
+        let mut daemon = Command::new(BENCH);
+        daemon
             .arg("daemon")
             .env("OWLSHIFT_DATA_DIR", self.data())
             .env("OWLSHIFT_BENCH_TIMING", TIMING)
             .env("OWLSHIFT_BENCH_NOTES", self.notes_file())
             .stdin(Stdio::null())
-            .stdout(fs::File::create(self.tmp.path().join("out")).unwrap())
-            .stderr(fs::File::create(self.tmp.path().join("err")).unwrap())
-            .spawn()
-            .unwrap();
-        self.daemon = Some(daemon);
+            .stdout(output("out"))
+            .stderr(output("err"));
+        if let Some(project) = &self.project {
+            daemon.env("OWLSHIFT_BENCH_PROJECT", project);
+        }
+        self.daemon = Some(daemon.spawn().unwrap());
     }
 
     fn notes_file(&self) -> PathBuf {
@@ -94,6 +121,11 @@ impl Bench {
             .lines()
             .map(str::to_owned)
             .collect()
+    }
+
+    /// How many passes the real watches of [`REPO`] made so far.
+    fn passes(&self) -> u64 {
+        fs::metadata(self.bench_dir(REPO).join("passes")).map_or(0, |file| file.len())
     }
 
     /// The daemon's output so far, for a failure.
@@ -417,4 +449,185 @@ fn a_watch_that_cannot_serve_pauses_its_project_until_one_serves() {
     assert!(bench.output().contains("acme/web is served again"));
     bench.signal("TERM", bench.daemon_pid());
     assert!(bench.ended(10).success(), "{}", bench.output());
+}
+
+/// The two tickets of scenario S11.
+const TICKETS: [&str; 2] = ["DEMO-1", "DEMO-2"];
+
+/// What a held Build writes in its worktree before it is cut: a plan and a
+/// ledger in its run folder, the checkpoint the next run resumes from.
+const CHECKPOINT: &str = "mkdir -p .owlshift/run && echo '# Plan' > .owlshift/run/plan.md && \
+                          echo '{\"steps\": []}' > .owlshift/run/ledger.json";
+
+/// Whether each Build run of `ticket` in the log of `data` started from a
+/// checkpoint, oldest first.
+fn build_starts(data: &Path, ticket: &str) -> Vec<bool> {
+    events(data)
+        .into_iter()
+        .filter(|event| {
+            event.kind == EventKind::RunStarted
+                && event.ticket.as_ref().is_some_and(|t| t.as_str() == ticket)
+                && event.data.get("role").and_then(|role| role.as_str()) == Some("build")
+        })
+        .map(|event| event.data.get("resumes_plan") == Some(&serde_json::json!(true)))
+        .collect()
+}
+
+/// No double dispatch, as the exit gate reads it from the events of `data`
+/// (architecture section 5, "Dispatch and resume"): no run of a ticket
+/// starts before every earlier run of it has ended, and each of `tickets`,
+/// like any other, has one `dispatch` with the command `drain`.
+fn assert_no_double_dispatch(data: &Path, tickets: &[&str]) {
+    let mut open: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    let mut drains: BTreeMap<String, usize> = BTreeMap::new();
+    for event in events(data) {
+        let Some(ticket) = event.ticket.as_ref().map(|t| t.as_str().to_owned()) else {
+            continue;
+        };
+        match event.kind {
+            EventKind::RunStarted => {
+                let runs = open.entry(ticket.clone()).or_default();
+                assert!(
+                    runs.is_empty(),
+                    "{ticket}: run {:?} started while {runs:?} had not ended",
+                    event.run
+                );
+                runs.extend(event.run);
+            }
+            EventKind::RunEnded => {
+                if let Some(runs) = open.get_mut(&ticket) {
+                    runs.retain(|run| Some(run) != event.run.as_ref());
+                }
+            }
+            EventKind::Dispatch
+                if event.data.get("command") == Some(&serde_json::json!("drain")) =>
+            {
+                *drains.entry(ticket).or_default() += 1;
+            }
+            _ => {}
+        }
+    }
+    for ticket in tickets {
+        assert!(drains.contains_key(*ticket), "{ticket}: {drains:?}");
+    }
+    assert!(drains.values().all(|&count| count == 1), "{drains:?}");
+}
+
+/// OWL-441's acceptance, scenario S11 on the bench (architecture section 5,
+/// "Three ways to stop", "A cut run", "Dispatch and resume"): the daemon
+/// serves the project of DEMO-1 and DEMO-2 with a real watch, each step in
+/// a child, and both Builds, once under way, have left a checkpoint.
+///
+/// - A SIGTERM to the daemon is a checked stop: it exits 0, both runs are
+///   stopped and checked, their obligations retired, nothing quarantined.
+/// - At the next start both Builds resume from their checkpoints.
+/// - A SIGKILL of the daemon while they run cuts them: the next start
+///   quarantines the project, notified once, and nothing runs.
+/// - Across the three starts, no ticket has two runs at once, nor a second
+///   `drain` dispatch.
+#[test]
+fn s11_a_checked_stop_resumes_both_builds_and_a_kill_quarantines() {
+    let mut bench = Bench::new();
+    let root = bench.tmp.path().to_owned();
+    let plays = root.join("plays");
+    fs::create_dir_all(&plays).unwrap();
+    for (id, zone) in [("DEMO-1", "a"), ("DEMO-2", "b")] {
+        reply_for(&plays, "intake", Some(id), &intake_declaring(&[zone]));
+    }
+    reply_for(&plays, "build", None, &build_asks());
+    fs::write(plays.join("hold"), "").unwrap();
+    let harness = holding_harness(
+        &plays,
+        Path::new(FAKE),
+        "build",
+        CHECKPOINT,
+        "exec sleep 60",
+    );
+    let machine = root.join("machine");
+    let mut project = ChildProject::seed_parallel(&root, harness, 2, 2, (&machine, 2));
+    assert_eq!(project.data, bench.data());
+    project.notes = Some(bench.notes_file());
+    let file = root.join("project.toml");
+    project.save(&file);
+    project.move_ticket("DEMO-9", "Done");
+    bench
+        .registry()
+        .register(&Repo::parse(REPO).unwrap(), &project.checkout)
+        .unwrap();
+    bench.project = Some(file);
+    let dirs = project.dirs();
+    let pid_files = TICKETS.map(|id| plays.join(format!("build-{id}.pid")));
+    // Both Builds under way, held: their runs' pids.
+    let held = |bench: &Bench| -> Vec<u32> {
+        bench.wait_for("both Builds under way", 120, || {
+            pid_files.iter().all(|file| file.exists())
+        });
+        pid_files
+            .iter()
+            .map(|file| fs::read_to_string(file).unwrap().trim().parse().unwrap())
+            .collect()
+    };
+
+    // A checked stop.
+    bench.start();
+    let runs = held(&bench);
+    bench.signal("TERM", bench.daemon_pid());
+    let status = bench.ended(60);
+    assert!(status.success(), "{status}\n{}", bench.output());
+    for run in &runs {
+        assert!(!alive(*run), "a Build's run outlived the checked stop");
+    }
+    assert_eq!(dirs.quarantine().unwrap(), None, "{}", bench.output());
+    assert!(!dirs.obligations_stand(), "{}", bench.output());
+    assert_eq!(ended_as(&project, "stopped"), TICKETS, "{}", bench.output());
+
+    // Resumed from their checkpoints at the next start.
+    for file in &pid_files {
+        fs::remove_file(file).unwrap();
+    }
+    bench.start();
+    let runs = held(&bench);
+    for id in TICKETS {
+        assert_eq!(
+            build_starts(&bench.data(), id),
+            [false, true],
+            "{id}\n{}",
+            bench.output()
+        );
+    }
+
+    // A hard kill cuts them: the quarantine, notified once.
+    bench.signal("KILL", bench.daemon_pid());
+    let _ = bench.ended(10);
+    bench.wait_for("the cut runs to be gone", 10, || {
+        runs.iter().all(|run| !alive(*run))
+    });
+    assert!(dirs.obligations_stand(), "{}", bench.output());
+    for file in &pid_files {
+        fs::remove_file(file).unwrap();
+    }
+    bench.start();
+    let found = quarantine::found_line(REPO);
+    bench.wait_for("the quarantine, notified", 60, || {
+        dirs.quarantine().unwrap().is_some() && bench.notes().contains(&found)
+    });
+    // Three passes more, none of which may start a run.
+    let passes = bench.passes();
+    bench.wait_for("three more passes of the watch", 30, || {
+        bench.passes() >= passes + 3
+    });
+    bench.signal("TERM", bench.daemon_pid());
+    let status = bench.ended(60);
+    assert!(status.success(), "{status}\n{}", bench.output());
+    let notes = bench.notes();
+    assert_eq!(
+        notes.iter().filter(|line| **line == found).count(),
+        1,
+        "{notes:?}"
+    );
+    for (id, file) in TICKETS.iter().zip(&pid_files) {
+        assert!(!file.exists(), "{id} ran while quarantined");
+        assert_eq!(build_starts(&bench.data(), id).len(), 2, "{id}");
+    }
+    assert_no_double_dispatch(&bench.data(), &TICKETS);
 }

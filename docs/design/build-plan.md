@@ -2235,7 +2235,7 @@ Designed on 2026-10-23 (OWL-432), with the maintainer, after a review of the pla
 - **7 · `pause`, `resume` and `status`.** (OWL-438) After 4. `status` names the file each project runs on, or why it is not served, from `served.json` (`served::standing`, part 3).
 - **8 · Keep awake.** (OWL-439) After 1. Built (OWL-439): `owlshift_platform::awake` (`KeepAwake::hold`), taken by `owlshift continue --step` just before its step, with each refusal a `warning` event (`keep_awake_refused`, `step::keep_awake`); off with `keep_awake = false` (`config::keep_awake_enabled`).
 - **9 · The digest.** (OWL-440) After 1 and 4.
-- **10 · Scenario S11 on the bench.** (OWL-441) After 2 and 4. A SIGTERM to the daemon during two steps, both checked and resumed; a kill of the daemon, the quarantine notified; no ticket with two overlapping runs or a second drain dispatch across the restarts.
+- **10 · Scenario S11 on the bench.** (OWL-441) After 2 and 4. A SIGTERM to the daemon during two steps, both checked and resumed; a kill of the daemon, the quarantine notified; no ticket with two overlapping runs or a second drain dispatch across the restarts. Built (OWL-441, 2026-10-25): `s11_a_checked_stop_resumes_both_builds_and_a_kill_quarantines` in `tests/daemon.rs`, the daemon running a real watch, the bench's `drain` (`ChildProject::watch_until_stopped`), over two Builds of the fake harness: three starts, a SIGTERM, a resume from the checkpoints (`resumes_plan`), a SIGKILL, then the quarantine notified once. The resumed Build's `dispatch` names `continue`, so a ticket has one `drain` dispatch whatever its restarts.
 - **11 · The exit gate** (OWL-442), below. After 1 to 10.
 
 ## P7 tasks & exit gate
