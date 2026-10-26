@@ -91,15 +91,27 @@ pub(in crate::process) struct Workdir {
 
 impl Workdir {
     /// The tie to `path`, canonical, of the tree whose root `root` was just
-    /// spawned and is not reaped yet: none when the system does not describe
-    /// the root, which then has ended already, having run nothing.
-    pub(in crate::process) fn new(path: PathBuf, root: u32) -> Option<Self> {
-        let root = i32::try_from(root).ok()?;
-        imp::describe(root).map(|entry| Self {
-            path,
-            since: entry.start,
-        })
+    /// spawned and is not reaped yet, bounded by the root's start. A root
+    /// the system no longer describes, as macOS does not describe a zombie,
+    /// may still have left a job: the bound is then `before`, which
+    /// [`before_spawn`] read; none without it.
+    pub(in crate::process) fn new(path: PathBuf, root: u32, before: Option<u64>) -> Option<Self> {
+        let since = i32::try_from(root)
+            .ok()
+            .and_then(imp::describe)
+            .map(|entry| entry.start)
+            .or(before)?;
+        Some(Self { path, since })
     }
+}
+
+/// A bound no later than the start of a process spawned after this call,
+/// in the table's unit, for a root that ends before its start is read
+/// ([`Workdir::new`]): on macOS the wall clock, which `pbi_start` is read
+/// from, less a margin for its granularity. None on Linux, where an
+/// unreaped root, a zombie included, keeps its `/proc/<pid>/stat`.
+pub(in crate::process) fn before_spawn() -> Option<u64> {
+    imp::before_spawn()
 }
 
 /// The pids of `listing` that the run tied to `workdir` left, from which a
@@ -310,6 +322,17 @@ mod imp {
     /// Room for the processes started between the count and the listing.
     const SLACK: usize = 256;
 
+    /// What [`super::before_spawn`] takes off the clock, in microseconds:
+    /// more than its granularity, small beside a run.
+    const MARGIN: u64 = 10_000;
+
+    pub(super) fn before_spawn() -> Option<u64> {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()?;
+        Some(u64::try_from(now.as_micros()).ok()?.saturating_sub(MARGIN))
+    }
+
     pub(super) fn list() -> io::Result<Vec<Entry>> {
         // SAFETY: a null buffer asks for the number of processes only.
         let count = unsafe { libc::proc_listallpids(ptr::null_mut(), 0) };
@@ -440,6 +463,10 @@ mod imp {
     pub(super) fn cwd(pid: i32) -> Option<PathBuf> {
         fs::read_link(format!("/proc/{pid}/cwd")).ok()
     }
+
+    pub(super) fn before_spawn() -> Option<u64> {
+        None
+    }
 }
 
 #[cfg(not(any(target_os = "macos", target_os = "linux")))]
@@ -459,6 +486,10 @@ mod imp {
     }
 
     pub(super) fn cwd(_pid: i32) -> Option<PathBuf> {
+        None
+    }
+
+    pub(super) fn before_spawn() -> Option<u64> {
         None
     }
 }
@@ -561,6 +592,28 @@ mod tests {
         assert_eq!(left_by(&own_init, &workdir, 1, cwd), BTreeSet::from([300]));
         let below = [at(40, 1, 299, 150), at(50, 40, 50, 160)];
         assert!(left_by(&below, &workdir, 50, cwd).is_empty());
+    }
+
+    /// A tie is bounded by its root's start, and by the bound read before
+    /// the spawn once the root is no longer described; without that bound,
+    /// there is none.
+    #[test]
+    fn a_tie_outlives_a_root_no_longer_described() {
+        use std::process::Command;
+
+        let path = || PathBuf::from("/wt");
+        let mut sleep = Command::new("sleep").arg("30").spawn().unwrap();
+        let tie = Workdir::new(path(), sleep.id(), Some(7)).unwrap();
+        sleep.kill().unwrap();
+        sleep.wait().unwrap();
+        assert_ne!(tie.since, 7, "the root's own start");
+
+        // Reaped: no longer described, on any system.
+        let mut ended = Command::new("true").spawn().unwrap();
+        let root = ended.id();
+        ended.wait().unwrap();
+        assert_eq!(Workdir::new(path(), root, Some(7)).unwrap().since, 7);
+        assert!(Workdir::new(path(), root, None).is_none());
     }
 
     /// Killed: a frozen process listed as it was. Let go: one listed with

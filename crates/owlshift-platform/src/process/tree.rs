@@ -146,11 +146,20 @@ mod imp {
         // A group id of 0 makes the child the leader of a new group whose id
         // is its own pid.
         command.process_group(0);
+        let tied = worktree.is_some();
+        let before = std::cell::Cell::new(None);
+        let spawn = || {
+            if tied {
+                before.set(descendants::before_spawn());
+            }
+            command.spawn()
+        };
         let mut made = None;
         let stopper = |child: &Child| {
-            // The root's start, read while it is unreaped (OWL-452).
+            // The root's start, read while it is unreaped (OWL-452), or the
+            // bound read just before its spawn when it is already gone.
             let left_in = worktree
-                .and_then(|path| Workdir::new(path, child.id()))
+                .and_then(|path| Workdir::new(path, child.id(), before.get()))
                 .map(Arc::new);
             let stopper = Stopper {
                 group: Pid::from_child(child),
@@ -159,7 +168,7 @@ mod imp {
             made = Some(stopper.clone());
             stopper
         };
-        let (child, live) = signals::register(|| command.spawn(), stopper, at)?;
+        let (child, live) = signals::register(spawn, stopper, at)?;
         let stopper = made.expect("a registered tree has its stopper");
         Ok((
             child,
