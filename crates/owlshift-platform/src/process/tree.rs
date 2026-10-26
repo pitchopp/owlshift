@@ -5,10 +5,13 @@
 //! nothing behind. On Unix a descendant can leave its group on purpose
 //! (`setsid`, `setpgid`), as Claude Code does for each Bash call: stopping
 //! the tree searches for it then, by parent pid, with the members of a group
-//! it leads (OWL-451), and misses only one whose parent and group leader
-//! have both ended. A Windows job gives no such way out.
+//! it leads (OWL-451), and misses one whose parent and group leader have both
+//! ended, unless the tree is a run's, tied to its worktree, and the run left
+//! it there ([`ProcessTree::spawn_in`], OWL-452). A Windows job gives no such
+//! way out.
 
 use std::io;
+use std::path::Path;
 use std::process::{Child, Command, ExitStatus};
 
 use super::AtCheckedStop;
@@ -31,7 +34,7 @@ use super::AtCheckedStop;
 #[derive(Debug)]
 pub struct ProcessTree {
     #[cfg(unix)]
-    group: rustix::process::Pid,
+    stopper: super::signals::Stopper,
     #[cfg(windows)]
     job: std::sync::Arc<std::os::windows::io::OwnedHandle>,
     _live: super::signals::Registration,
@@ -57,7 +60,23 @@ impl ProcessTree {
     /// stop of a process that stops by degrees (OWL-161): a tree
     /// [`AtCheckedStop::Told`] is refused once any stop is asked.
     pub fn spawn_for(command: &mut Command, at: AtCheckedStop) -> io::Result<(Child, Self)> {
-        imp::spawn(command, at)
+        imp::spawn(command, at, None)
+    }
+
+    /// [`ProcessTree::spawn_for`] for a run working in `worktree`, an
+    /// existing folder (OWL-452): on macOS and Linux every stop of the tree
+    /// also reaches what the run left there once its parent and its group's
+    /// leader ended, such as a background job a Bash call left once it
+    /// returned, as the process table ties it to the run (architecture
+    /// section 5, "Which processes"). The worktree is canonicalized first,
+    /// and a failure to do so is the spawn's error. On Windows, where the
+    /// Job Object holds every process the root starts, it changes nothing.
+    pub fn spawn_in(
+        command: &mut Command,
+        at: AtCheckedStop,
+        worktree: &Path,
+    ) -> io::Result<(Child, Self)> {
+        imp::spawn(command, at, Some(worktree))
     }
 
     /// Stops every process of the tree at once, the root included, without
@@ -65,8 +84,10 @@ impl ProcessTree {
     /// [`Child`]. Stopping a tree whose processes have all ended succeeds.
     ///
     /// On Unix that includes what left the tree's group while it still
-    /// descends from it, found in the process table at the stop (OWL-451):
-    /// a few listings of the table, nothing waited on.
+    /// descends from it, found in the process table at the stop (OWL-451),
+    /// and, for a tree spawned in a worktree with [`ProcessTree::spawn_in`],
+    /// what the run left there, even once the root ended (OWL-452): a few
+    /// listings of the table, nothing waited on.
     pub fn kill(&self) -> io::Result<()> {
         imp::kill(self)
     }
@@ -100,7 +121,8 @@ pub(super) use imp::terminate_job;
 
 #[cfg(unix)]
 mod imp {
-    use super::super::signals;
+    use super::super::descendants::{self, Workdir};
+    use super::super::signals::{self, Stopper};
     use super::{AtCheckedStop, ProcessTree};
     use rustix::io::Errno;
     use rustix::process::{
@@ -108,7 +130,9 @@ mod imp {
     };
     use std::io;
     use std::os::unix::process::CommandExt;
+    use std::path::Path;
     use std::process::{Child, Command};
+    use std::sync::Arc;
     use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
     use std::thread;
     use std::time::Instant;
@@ -116,17 +140,47 @@ mod imp {
     pub(super) fn spawn(
         command: &mut Command,
         at: AtCheckedStop,
+        worktree: Option<&Path>,
     ) -> io::Result<(Child, ProcessTree)> {
+        let worktree = worktree.map(std::fs::canonicalize).transpose()?;
         // A group id of 0 makes the child the leader of a new group whose id
         // is its own pid.
         command.process_group(0);
-        let (child, live) = signals::register(|| command.spawn(), Pid::from_child, at)?;
-        let group = Pid::from_child(&child);
-        Ok((child, ProcessTree { group, _live: live }))
+        let tied = worktree.is_some();
+        let before = std::cell::Cell::new(None);
+        let spawn = || {
+            if tied {
+                before.set(descendants::before_spawn());
+            }
+            command.spawn()
+        };
+        let mut made = None;
+        let stopper = |child: &Child| {
+            // The root's start, read while it is unreaped (OWL-452), or the
+            // bound read just before its spawn when it is already gone.
+            let left_in = worktree
+                .and_then(|path| Workdir::new(path, child.id(), before.get()))
+                .map(Arc::new);
+            let stopper = Stopper {
+                group: Pid::from_child(child),
+                left_in,
+            };
+            made = Some(stopper.clone());
+            stopper
+        };
+        let (child, live) = signals::register(spawn, stopper, at)?;
+        let stopper = made.expect("a registered tree has its stopper");
+        Ok((
+            child,
+            ProcessTree {
+                stopper,
+                _live: live,
+            },
+        ))
     }
 
     pub(super) fn kill(tree: &ProcessTree) -> io::Result<()> {
-        kill_group(tree.group)
+        kill_group(&tree.stopper)
     }
 
     /// Tells when the root of a tree exits, without reaping it.
@@ -185,7 +239,11 @@ mod imp {
     /// the group is frozen with `SIGSTOP`, so that nothing in it starts or
     /// reaps a process meanwhile, then every process descending from one of
     /// its own, and every member of a group one of those leads, is found,
-    /// frozen and checked again, as `descendants` says, and killed.
+    /// frozen and checked again, as `descendants` says, and killed. For a
+    /// tree tied to a run's worktree, the search also starts from what the
+    /// run left there (OWL-452), and runs even when the group has no live
+    /// process left, as once the run ended by itself; it then starts from
+    /// those alone, never from the group's id.
     ///
     /// The group id stays reserved while the root is unreaped or any member
     /// is alive: [`run_command`] reaps the root only after the tree is
@@ -199,15 +257,19 @@ mod imp {
     /// search that fails leaves what left the group running.
     ///
     /// [`run_command`]: crate::process::run_command
-    pub(in crate::process) fn kill_group(group: Pid) -> io::Result<()> {
+    pub(in crate::process) fn kill_group(stopper: &Stopper) -> io::Result<()> {
+        let group = stopper.group;
         // A group with no process left, or zombies only, has nothing that
         // still descends from it by a parent pid; any other failure skips
-        // the search, and the group's kill answers.
-        if signal_group(group, Signal::STOP).unwrap_or(false) {
-            let found =
-                super::super::descendants::freeze_reached(group.as_raw_nonzero().get(), || {
-                    super::super::descendants::list()
-                });
+        // the search from it, and the group's kill answers.
+        let live = signal_group(group, Signal::STOP).unwrap_or(false);
+        if live || stopper.left_in.is_some() {
+            let found = descendants::freeze_reached(
+                live.then(|| group.as_raw_nonzero().get()),
+                stopper.left_in.as_deref(),
+                descendants::list,
+                descendants::cwd,
+            );
             for pid in found {
                 // Best effort: one that ended needs nothing.
                 let _ = kill_process(pid, Signal::KILL);
@@ -270,9 +332,11 @@ mod imp {
     /// `Child::kill`.
     const KILLED: u32 = 1;
 
+    /// The worktree is not needed: the job holds whatever the run leaves.
     pub(super) fn spawn(
         command: &mut Command,
         at: AtCheckedStop,
+        _worktree: Option<&std::path::Path>,
     ) -> io::Result<(Child, ProcessTree)> {
         // The job comes first: failing here leaves no process to clean up.
         // SAFETY: both pointers may be null, for default security and an

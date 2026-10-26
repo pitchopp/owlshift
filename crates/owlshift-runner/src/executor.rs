@@ -835,7 +835,8 @@ impl Executor {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
         let (mut child, tree, watchdog) =
-            watch::spawn(&mut command, self.timeout).map_err(ExecutorError::Spawn)?;
+            watch::spawn(&mut command, self.timeout, Some(spec.worktree))
+                .map_err(ExecutorError::Spawn)?;
         drop(command);
         let stop = watchdog.run_stop();
         let driving = HarnessRun {
@@ -849,9 +850,11 @@ impl Executor {
         // Whatever the run left running is stopped before anything it wrote
         // is read, so nothing changes behind the checks, what left the
         // tree's group included while it still descends from the tree
-        // (OWL-451). Best effort: a process whose parent and group leader
-        // have both ended, such as what a harness that already exited left,
-        // is a documented limit.
+        // (OWL-451), and what the run left in the worktree once its parent
+        // and group leader ended, such as a Bash call's background job
+        // (OWL-452). Best effort: what the tie does not reach, such as a
+        // process leading its own group or working elsewhere, is a
+        // documented limit (architecture section 5, "Which processes").
         let _ = tree.kill();
         let _ = child.kill();
         let _ = child.wait();

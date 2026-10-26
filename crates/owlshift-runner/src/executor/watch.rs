@@ -7,6 +7,7 @@
 //! the watchdog's [`RunStop`] (OWL-319).
 
 use std::io;
+use std::path::Path;
 use std::process::{Child, Command};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -49,12 +50,18 @@ impl RunStop {
 
 /// Spawns `command` as the root of a process tree, and starts a watchdog
 /// that stops the whole tree `timeout` from now. A run, so a checked stop
-/// of a watch or a step stops the tree at once (OWL-161).
+/// of a watch or a step stops the tree at once (OWL-161). With `left_in`,
+/// the worktree a harness runs in, every stop of the tree also reaches what
+/// the run left there once its parent and group leader ended (OWL-452).
 pub(crate) fn spawn(
     command: &mut Command,
     timeout: Duration,
+    left_in: Option<&Path>,
 ) -> io::Result<(Child, Arc<ProcessTree>, Watchdog)> {
-    let (child, tree) = ProcessTree::spawn_for(command, AtCheckedStop::Stopped)?;
+    let (child, tree) = match left_in {
+        Some(worktree) => ProcessTree::spawn_in(command, AtCheckedStop::Stopped, worktree)?,
+        None => ProcessTree::spawn_for(command, AtCheckedStop::Stopped)?,
+    };
     let tree = Arc::new(tree);
     let (cancel, cancelled) = mpsc::channel::<()>();
     let fired = Arc::new(AtomicBool::new(false));

@@ -774,7 +774,8 @@ mod tests {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
-        let (child, tree, watchdog) = watch::spawn(&mut command, Duration::from_secs(120)).unwrap();
+        let (child, tree, watchdog) =
+            watch::spawn(&mut command, Duration::from_secs(120), None).unwrap();
         let mut reaped = Reaped(Arc::clone(&tree), child);
         let stop = watchdog.run_stop();
         let (brief_file, result_file) = (files.join("brief.json"), files.join("result.json"));
