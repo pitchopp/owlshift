@@ -119,16 +119,19 @@ pub fn closed(
 /// architecture section 5, "Resources admitted at Build"): each entry the
 /// zone of its own path, so a file holds itself, read fail-closed. Blanks
 /// around it, leading `./` and trailing `/` are dropped, and a part holding
-/// `*` cuts the path to the folder before it, the whole repository when it
-/// is the first. `None`, so that intake's zones hold as for a plan without
-/// files, when the plan names no file or an entry is no path from the
-/// repository's root by the rules of a `zone:` label
-/// ([`check_zone`](crate::decider::check_zone)), or holds a blank or one of
-/// `` ` ' " { } [ ] ? , ( ) < > | ; ``: a list or a note written in its
-/// place. More than `max` entries hold the whole repository, as a widening
-/// past its bound does. The whole repository is no zone: `Some` of none.
+/// `*`, `?`, `[` or `]` is a pattern that cuts the path to the folder before
+/// it, the whole repository when it is the first: a Next.js dynamic segment
+/// (`[id]`) holds its parent folder. Parentheses are part of a path, as a
+/// Next.js route group's (`(app)`) are (OWL-458). `None`, so that intake's
+/// zones hold as for a plan without files, when the plan names no file or
+/// an entry is no path from the repository's root by the rules of a `zone:`
+/// label ([`check_zone`](crate::decider::check_zone)), or holds a blank or
+/// one of `` ` ' " { } , < > | ; ``: a list or a note written in its place.
+/// More than `max` entries hold the whole repository, as a widening past
+/// its bound does. The whole repository is no zone: `Some` of none.
 pub fn planned(files: &[String], max: usize) -> Option<Vec<String>> {
-    const NOT_A_PATH: &str = "`'\"{}[]?,()<>|;";
+    const NOT_A_PATH: &str = "`'\"{},<>|;";
+    const PATTERN: &[char] = &['*', '?', '[', ']'];
     if files.is_empty() {
         return None;
     }
@@ -148,7 +151,7 @@ pub fn planned(files: &[String], max: usize) -> Option<Vec<String>> {
         }
         let kept: Vec<&str> = path
             .split('/')
-            .take_while(|part| !part.contains('*'))
+            .take_while(|part| !part.contains(PATTERN))
             .collect();
         if kept.is_empty() {
             return Some(Vec::new());
@@ -718,6 +721,28 @@ mod tests {
         ] {
             assert_eq!(read(unread), None, "{unread:?}");
         }
+    }
+
+    /// OWL-458: Next.js route paths, found on Locary's LOC-1030, whose
+    /// route group made the whole plan unread: a group's parentheses are
+    /// part of the path, and a dynamic segment's brackets, read as a
+    /// pattern, hold the folder before it.
+    #[test]
+    fn a_plans_nextjs_route_paths_are_read() {
+        let read = |files: &[&str]| planned(&strings(files), 3);
+        assert_eq!(
+            read(&[
+                "frontend/src/app/(app)/dashboard/leases/import/page.js",
+                "frontend/src/app/(app)/dashboard/leases/[id]/page.js",
+                "src/a?.rs",
+            ]),
+            Some(strings(&[
+                "frontend/src/app/(app)/dashboard/leases/import/page.js",
+                "frontend/src/app/(app)/dashboard/leases",
+                "src",
+            ]))
+        );
+        assert_eq!(read(&["[id]/page.js"]), Some(Vec::new()));
     }
 
     /// OWL-448: what an admission adds is what nothing held holds already,
