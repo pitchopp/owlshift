@@ -1079,7 +1079,9 @@ fn run_one(agent: &AgentEnv, paths: &RunPaths, line: &str, deadline: Instant, lo
     };
     command.stdin(Stdio::null()).stdout(stdout).stderr(writer);
     let remaining = deadline.saturating_duration_since(Instant::now());
-    let spawned = watch::spawn(&mut command, remaining);
+    // Not tied to the worktree: the gate's and setup's commands keep the
+    // search of what left their group alone (OWL-452).
+    let spawned = watch::spawn(&mut command, remaining, None);
     // The command holds the pipe's write ends: dropping it leaves them to
     // the child alone, so the output closes when the tree is gone.
     drop(command);

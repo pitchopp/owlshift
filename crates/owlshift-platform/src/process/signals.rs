@@ -217,8 +217,8 @@ pub fn stop_trees_when_killed() -> io::Result<()> {
     }
     // Under the lock, so no tree starts meanwhile.
     let mut sentinel = super::sentinel::Sentinel::start()?;
-    for &(_, group, _) in &live.trees {
-        sentinel.announce(group);
+    for (_, stopper, _) in &live.trees {
+        sentinel.announce(stopper.group);
     }
     live.sentinel = Some(sentinel);
     Ok(())
@@ -242,9 +242,15 @@ pub(super) fn with_sentinel<R>(act: impl FnOnce(&mut super::sentinel::Sentinel) 
     live().sentinel.as_mut().map(act)
 }
 
-/// What stops a live tree: its process group.
+/// What stops a live tree: its process group, and for a run's tree the tie
+/// to its worktree, from which its stop also searches for what the run left
+/// (OWL-452).
 #[cfg(unix)]
-pub(super) type Stopper = rustix::process::Pid;
+#[derive(Clone, Debug)]
+pub(super) struct Stopper {
+    pub(super) group: rustix::process::Pid,
+    pub(super) left_in: Option<std::sync::Arc<super::descendants::Workdir>>,
+}
 
 /// What stops a live tree: its Job Object, shared with the tree's handle so
 /// that it stays open while registered.
@@ -296,9 +302,9 @@ impl Drop for Registration {
         let live = &mut *guard;
         #[cfg(unix)]
         if let Some(sentinel) = &mut live.sentinel
-            && let Some(&(_, group, _)) = live.trees.iter().find(|(id, ..)| *id == self.id)
+            && let Some((_, stopper, _)) = live.trees.iter().find(|(id, ..)| *id == self.id)
         {
-            sentinel.withdraw(group);
+            sentinel.withdraw(stopper.group);
         }
         live.trees.retain(|(id, ..)| *id != self.id);
     }
@@ -339,12 +345,12 @@ pub(super) fn register(
     let stopper = stopper(&child);
     #[cfg(unix)]
     if let Some(sentinel) = &mut live.sentinel {
-        sentinel.announce(stopper);
+        sentinel.announce(stopper.group);
     }
     #[cfg(unix)]
     if at == AtCheckedStop::Stopped && asked == Some(Degree::Checked) {
         // Best effort, as at the checked stop itself.
-        let _ = super::tree::kill_group(stopper);
+        let _ = super::tree::kill_group(&stopper);
     }
     live.trees.push((id, stopper, at));
     Ok((child, Registration { id }))
@@ -358,7 +364,7 @@ pub(super) fn register(
 fn act_on_trees(live: &Live) {
     use rustix::process::{Signal, kill_process};
 
-    for &(_, stopper, at) in &live.trees {
+    for (_, stopper, at) in &live.trees {
         match at {
             AtCheckedStop::Left => {}
             AtCheckedStop::Stopped => {
@@ -367,7 +373,7 @@ fn act_on_trees(live: &Live) {
             // The root's pid is its group's id, and stays its own while
             // the tree is registered: it is reaped only once withdrawn.
             AtCheckedStop::Told => {
-                let _ = kill_process(stopper, Signal::TERM);
+                let _ = kill_process(stopper.group, Signal::TERM);
             }
         }
     }
@@ -384,12 +390,12 @@ fn stop_every_tree() -> MutexGuard<'static, Live> {
         // Best effort: a tree that cannot be stopped must not spare the
         // ones after it.
         #[cfg(unix)]
-        if super::tree::kill_group(*stopper).is_ok()
+        if super::tree::kill_group(stopper).is_ok()
             && let Some(sentinel) = &mut live.sentinel
         {
             // Stopped: once this process is gone, its group id may be
             // another group's, which the sentinel must not kill.
-            sentinel.withdraw(*stopper);
+            sentinel.withdraw(stopper.group);
         }
         #[cfg(windows)]
         let _ = super::tree::terminate_job(stopper);

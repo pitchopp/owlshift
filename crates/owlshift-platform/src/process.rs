@@ -524,15 +524,32 @@ mod tests {
     #[ignore = "helper, run by the tests below"]
     fn helper_escape_the_group() {
         if helper_requested() {
-            use std::os::unix::process::CommandExt;
+            escape_the_group(false);
+        }
+    }
 
+    /// [`helper_escape_the_group`], which also leaves `sleep 30` as a Bash
+    /// call that returned leaves a background job (OWL-452): started by a
+    /// shell in a session of its own, which ended, so that neither its parent
+    /// nor its group's leader is left; its pid follows the others in `pids`.
+    #[cfg(unix)]
+    #[test]
+    #[ignore = "helper, run by the tests below"]
+    fn helper_escape_the_group_and_leave_a_job() {
+        if helper_requested() {
+            escape_the_group(true);
+        }
+    }
+
+    #[cfg(unix)]
+    fn escape_the_group(leave_a_job: bool) {
+        use std::os::unix::process::CommandExt;
+
+        /// `/bin/sh -c script` in a session and a process group of its own.
+        fn shell_in_a_session(script: &str) -> Command {
             let mut shell = Command::new("/bin/sh");
             shell
-                .args([
-                    "-c",
-                    "sleep 30 & echo $! > job.tmp && mv job.tmp job; \
-                     (sleep 30 & echo $! > orphan.tmp && mv orphan.tmp orphan); wait",
-                ])
+                .args(["-c", script])
                 .stdin(Stdio::null())
                 .stdout(Stdio::null())
                 .stderr(Stdio::null());
@@ -541,23 +558,39 @@ mod tests {
             unsafe {
                 shell.pre_exec(|| rustix::process::setsid().map(drop).map_err(io::Error::from));
             }
-            let mut shell = shell.spawn().unwrap();
-            wait_until("the shell's sleeps", || {
-                Path::new("job").exists() && Path::new("orphan").exists()
-            });
-            let read = |name: &str| -> u32 {
-                std::fs::read_to_string(name)
-                    .unwrap()
-                    .trim()
-                    .parse()
-                    .unwrap()
-            };
-            write_pids(&[std::process::id(), shell.id(), read("job"), read("orphan")]);
-            thread::sleep(Duration::from_secs(20));
-            // Not reached when the test stops this helper, as it does.
-            let _ = shell.kill();
-            let _ = shell.wait();
+            shell
         }
+        let mut shell = shell_in_a_session(
+            "sleep 30 & echo $! > job.tmp && mv job.tmp job; \
+             (sleep 30 & echo $! > orphan.tmp && mv orphan.tmp orphan); wait",
+        )
+        .spawn()
+        .unwrap();
+        wait_until("the shell's sleeps", || {
+            Path::new("job").exists() && Path::new("orphan").exists()
+        });
+        let read = |name: &str| -> u32 {
+            std::fs::read_to_string(name)
+                .unwrap()
+                .trim()
+                .parse()
+                .unwrap()
+        };
+        let mut pids = vec![std::process::id(), shell.id(), read("job"), read("orphan")];
+        if leave_a_job {
+            let call = shell_in_a_session(
+                "sleep 30 >/dev/null 2>&1 & echo $! > left.tmp && mv left.tmp left",
+            )
+            .status()
+            .unwrap();
+            assert!(call.success(), "{call}");
+            pids.push(read("left"));
+        }
+        write_pids(&pids);
+        thread::sleep(Duration::from_secs(20));
+        // Not reached when the test stops this helper, as it does.
+        let _ = shell.kill();
+        let _ = shell.wait();
     }
 
     /// OWL-451: a probe stopped at its deadline takes with it what left its
@@ -957,10 +990,11 @@ mod tests {
     }
 
     /// OWL-161: stops by degrees, with `bound`, owning three trees, one of
-    /// each kind: `sleep 30` left, `helper_escape_the_group` stopped, run in
-    /// `escape`, where it writes its pids, so that what left the run's group
-    /// is stopped too (OWL-451), and a shell told, which writes `told` when
-    /// it gets SIGTERM and ends. Writes their pids,
+    /// each kind: `sleep 30` left, `helper_escape_the_group_and_leave_a_job`
+    /// stopped, run in `escape`, where it writes its pids, so that what left
+    /// the run's group is stopped too (OWL-451), and, its tree tied to
+    /// `escape`, the job it left there (OWL-452), and a shell told, which
+    /// writes `told` when it gets SIGTERM and ends. Writes their pids,
     /// then each degree asked to `asked`; once a checked stop is asked, the
     /// pid of a stopped tree it spawns then to `late`, and to `refused`
     /// whether a told tree was refused. Core dumps off, for SIGQUIT.
@@ -998,7 +1032,7 @@ mod tests {
             command
                 .args([
                     "--exact",
-                    "process::tests::helper_escape_the_group",
+                    "process::tests::helper_escape_the_group_and_leave_a_job",
                     "--ignored",
                     "--nocapture",
                     "--test-threads=1",
@@ -1009,7 +1043,8 @@ mod tests {
         };
         let (left, _left) = ProcessTree::spawn_for(&mut sleep(), AtCheckedStop::Left).unwrap();
         let (stopped, _stopped) =
-            ProcessTree::spawn_for(&mut escape(), AtCheckedStop::Stopped).unwrap();
+            ProcessTree::spawn_in(&mut escape(), AtCheckedStop::Stopped, Path::new("escape"))
+                .unwrap();
         let (shell, _shell) = ProcessTree::spawn_for(&mut told(), AtCheckedStop::Told).unwrap();
         write_pids(&[left.id(), stopped.id(), shell.id()]);
         let mut last = wait_asked(Duration::from_secs(20));
@@ -1071,7 +1106,8 @@ mod tests {
         }
 
         /// What left the group of its helper's stopped tree, once there
-        /// (OWL-451): the shell and its two sleeps, waited for 5 s at most.
+        /// (OWL-451): the shell and its two sleeps, then the job it left as a
+        /// returned Bash call does (OWL-452), waited for 5 s at most.
         fn escaped(&self) -> Vec<u32> {
             let pids = self.dir.path().join("escape").join("pids");
             wait_until("the stopped tree's shell", || pids.exists());
@@ -1095,7 +1131,8 @@ mod tests {
 
     /// OWL-161: each Ctrl-C asks one degree more. The first a drain, which
     /// stops nothing; the second a checked stop, which stops the tree of a
-    /// run at once, what left its group included (OWL-451), tells the step's
+    /// run at once, what left its group included (OWL-451) and the job it
+    /// left in its worktree (OWL-452), tells the step's
     /// child, leaves the process's own command, stops a run started after it
     /// as it starts and starts no step's child; the third stops every tree
     /// now, as the signal ends the process.
@@ -1146,7 +1183,8 @@ mod tests {
     /// OWL-161: SIGTERM asks a checked stop, and a second asks nothing more;
     /// past its bound the process stops every tree now, ended by SIGTERM.
     /// SIGQUIT stops every tree now, whatever was asked, what left a tree's
-    /// group included (OWL-451).
+    /// group included (OWL-451), and the job a run's tree left in its
+    /// worktree (OWL-452).
     #[cfg(unix)]
     #[test]
     fn sigterm_checks_until_its_bound_and_sigquit_stops_now() {

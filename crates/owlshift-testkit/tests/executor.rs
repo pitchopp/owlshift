@@ -520,20 +520,16 @@ fn a_run_its_driver_stopped_did_not_time_out() {
 #[allow(dead_code)]
 mod test_proc;
 
-/// A harness stand-in that is `helper_escape_the_group`, run in the worktree.
+/// A harness stand-in that is the named helper of this file, run in the
+/// worktree.
 #[cfg(unix)]
-struct Escapes;
+struct Helper(&'static str);
 
 #[cfg(unix)]
-impl Harness for Escapes {
+impl Harness for Helper {
     fn command(&self, _run: &HarnessRun<'_>) -> Result<Command, HarnessError> {
         let mut command = Command::new(std::env::current_exe().unwrap());
-        command.args([
-            "--exact",
-            "helper_escape_the_group",
-            "--ignored",
-            "--nocapture",
-        ]);
+        command.args(["--exact", self.0, "--ignored", "--nocapture"]);
         Ok(command)
     }
 
@@ -550,7 +546,8 @@ impl Harness for Escapes {
 
 /// Starts `sleep 60` in a process group of its own, as Claude Code runs each
 /// Bash call (OWL-451), writes its pid to `ESCAPED` in the working
-/// directory, then sleeps; acts only when run alone by [`Escapes`].
+/// directory, leaves a job as [`leave_a_job`] does, its pid at `JOB`, then
+/// sleeps; acts only when run alone by [`Helper`].
 #[cfg(unix)]
 #[test]
 #[ignore = "helper, run by the test below"]
@@ -570,6 +567,7 @@ fn helper_escape_the_group() {
         let partial = format!("{ESCAPED}.tmp");
         fs::write(&partial, sleep.id().to_string()).unwrap();
         fs::rename(&partial, ESCAPED).unwrap();
+        leave_a_job(Path::new("."), Path::new(JOB));
         std::thread::sleep(Duration::from_secs(30));
         // Not reached when the run is stopped at its deadline, as it is.
         let _ = sleep.kill();
@@ -577,13 +575,95 @@ fn helper_escape_the_group() {
     }
 }
 
-/// Where in the worktree the stand-in writes the pid of what it started.
+/// Leaves a job in the worktree, its pid at `JOB`, and another in the
+/// worktree's parent folder, its pid at `OUTSIDE`, each as [`leave_a_job`]
+/// does, then ends; acts only when run alone by [`Helper`].
+#[cfg(unix)]
+#[test]
+#[ignore = "helper, run by the test below"]
+fn helper_leave_jobs_and_end() {
+    if std::env::args().any(|arg| arg == "--exact") {
+        let here = std::env::current_dir().unwrap();
+        leave_a_job(&here, &here.join(JOB));
+        leave_a_job(here.parent().unwrap(), &here.join(OUTSIDE));
+    }
+}
+
+/// Leaves `sleep 60` working in `dir` as a Bash call that returned leaves a
+/// background job (OWL-452): a shell in a process group of its own starts
+/// it, writes its pid to `file`, and ends, so that neither the job's parent
+/// nor its group's leader is left. Claude Code also puts the shell in a
+/// session of its own, which changes nothing to what ties the job to a run.
+/// Gives the job's pid.
+#[cfg(unix)]
+fn leave_a_job(dir: &Path, file: &Path) -> u32 {
+    use std::os::unix::process::CommandExt;
+    use std::process::Stdio;
+
+    let status = Command::new("/bin/sh")
+        .args([
+            "-c",
+            r#"sleep 60 >/dev/null 2>&1 & echo $! > "$0.tmp" && mv "$0.tmp" "$0""#,
+        ])
+        .arg(file)
+        .current_dir(dir)
+        .process_group(0)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .unwrap();
+    assert!(status.success(), "{status}");
+    read_pid(file)
+}
+
+/// The pid written in `file`.
+#[cfg(unix)]
+fn read_pid(file: &Path) -> u32 {
+    fs::read_to_string(file)
+        .unwrap_or_else(|error| panic!("{}: {error}", file.display()))
+        .trim()
+        .parse()
+        .unwrap()
+}
+
+/// Waits until `pid` is gone, failing past 5 s.
+#[cfg(unix)]
+fn assert_gone(pid: u32) {
+    let settled = std::time::Instant::now() + Duration::from_secs(5);
+    while test_proc::is_alive(pid) {
+        assert!(std::time::Instant::now() < settled, "still running: {pid}");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// A process the test expects to outlive the run, killed on the way out.
+#[cfg(unix)]
+struct Survivor(u32);
+
+#[cfg(unix)]
+impl Drop for Survivor {
+    fn drop(&mut self) {
+        let _ = Command::new("kill")
+            .args(["-s", "KILL", &self.0.to_string()])
+            .status();
+    }
+}
+
+/// Where in the worktree the stand-ins write the pid of what they started:
+/// in a process group of its own, a job left in the worktree, one left
+/// outside it.
 #[cfg(unix)]
 const ESCAPED: &str = ".owlshift/run/escaped";
+#[cfg(unix)]
+const JOB: &str = ".owlshift/run/job";
+#[cfg(unix)]
+const OUTSIDE: &str = ".owlshift/run/outside";
 
 /// OWL-451: a run cut at its deadline leaves nothing running, not even what
 /// its harness started in a process group of its own, as Claude Code runs
-/// each Bash call.
+/// each Bash call, nor the job it left as a returned Bash call does
+/// (OWL-452).
 #[cfg(unix)]
 #[test]
 fn a_run_cut_at_its_deadline_leaves_nothing_running() {
@@ -592,24 +672,49 @@ fn a_run_cut_at_its_deadline_leaves_nothing_running() {
         timeout: Duration::from_secs(3),
         ..bench.executor.clone()
     };
-    let report = bench.run_with(&executor, &Escapes, &bench.brief).unwrap();
+    let report = bench
+        .run_with(&executor, &Helper("helper_escape_the_group"), &bench.brief)
+        .unwrap();
     assert!(
         matches!(report.outcome, Outcome::Failed(Failure::TimedOut)),
         "{:?}",
         report.outcome
     );
-    let escaped: u32 = fs::read_to_string(bench.worktree.join(ESCAPED))
-        .expect("the stand-in started its sleep before the deadline")
-        .parse()
+    assert_gone(read_pid(&bench.worktree.join(ESCAPED)));
+    assert_gone(read_pid(&bench.worktree.join(JOB)));
+}
+
+/// OWL-452: a run that ends by itself leaves no job it left in its worktree
+/// as a returned Bash call does, while a job left there before the run and
+/// one the run left outside the worktree run on.
+#[cfg(unix)]
+#[test]
+fn a_job_a_run_left_does_not_outlive_its_end() {
+    let bench = Bench::new();
+    bench
+        .executor
+        .prepare_worktree(&bench.main, &bench.worktree, BRANCH, "origin/main")
         .unwrap();
-    let settled = std::time::Instant::now() + Duration::from_secs(5);
-    while test_proc::is_alive(escaped) {
-        assert!(
-            std::time::Instant::now() < settled,
-            "still running: {escaped}"
-        );
-        std::thread::sleep(Duration::from_millis(50));
-    }
+    let earlier = Survivor(leave_a_job(
+        &bench.worktree,
+        &bench.tmp.path().join("earlier"),
+    ));
+    // Started well before the run's root: Linux counts in 10 ms ticks.
+    std::thread::sleep(Duration::from_millis(50));
+    bench
+        .run_with(
+            &bench.executor,
+            &Helper("helper_leave_jobs_and_end"),
+            &bench.brief,
+        )
+        .unwrap();
+    let outside = Survivor(read_pid(&bench.worktree.join(OUTSIDE)));
+    assert_gone(read_pid(&bench.worktree.join(JOB)));
+    assert!(test_proc::is_alive(earlier.0), "a job left before the run");
+    assert!(
+        test_proc::is_alive(outside.0),
+        "a job left outside the worktree"
+    );
 }
 
 /// A harness that is a shell script, run in the worktree, whose driver

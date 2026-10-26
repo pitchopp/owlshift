@@ -10,20 +10,28 @@
 //! with SIGSTOP, then searches again, until a search made once every frozen
 //! process has stopped finds none new: a process started by one that was
 //! being frozen is found that way too. It then checks each one again
-//! ([`verify`]) and hands back those whose parent and group are unchanged,
-//! for the caller to kill. Any other process it froze is let go with
-//! SIGCONT, whatever happens, so none is ever left stopped by it.
+//! ([`verify`]) and hands back those whose parent, group and start are
+//! unchanged, for the caller to kill. Any other process it froze is let go
+//! with SIGCONT, whatever happens, so none is ever left stopped by it.
 //!
-//! Nothing is waited on. A search is one listing of the process table, and
-//! there are at most [`ROUNDS`] of them plus one, so the signal thread, which
-//! stops trees under the lock of the live trees, stays bounded. Measured on
-//! 2026-10-25 on a Mac running some 800 processes: a listing took 1.4 ms,
-//! and a stop of a shell with two jobs, two listings, 3.2 ms at worst over
-//! 20 stops.
+//! A tree tied to a run's worktree ([`Workdir`], OWL-452) is also searched
+//! from what the run left there ([`left_by`]): a background job a Bash call
+//! left once that call returned, whose parent and group leader have both
+//! ended, and which the search above cannot find (checked on 2026-10-25 and
+//! 2026-10-26, L7, `docs/design/live-checks/owl-452.sh`).
+//!
+//! Nothing is waited on. A search is one listing of the process table, plus
+//! one read of the working directory of each process the cheap rules of
+//! [`left_by`] keep, and there are at most [`ROUNDS`] of them plus one, so
+//! the signal thread, which stops trees under the lock of the live trees,
+//! stays bounded. Measured on 2026-10-25 on a Mac running some 800
+//! processes: a listing took 1.4 ms, and a stop of a shell with two jobs,
+//! two listings, 3.2 ms at worst over 20 stops; reading the working
+//! directory of every one of 655 processes took 1.1 to 1.4 ms.
 //!
 //! Not found: a process whose parent and group leader have both ended
-//! before the stop, such as a background job a finished Bash call left
-//! behind; one the system does not describe to this process, such as one
+//! before the stop, unless a run left it in its worktree as [`left_by`]
+//! says; one the system does not describe to this process, such as one
 //! running as another user or, on macOS, a zombie. The table is read with
 //! `proc_listallpids` and `proc_pidinfo` on macOS, and from
 //! `/proc/<pid>/stat` on Linux. The tests' own reader of a process's state,
@@ -32,6 +40,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::io;
+use std::path::PathBuf;
 
 use rustix::process::{Pid, Signal, kill_process};
 
@@ -40,14 +49,26 @@ use rustix::process::{Pid, Signal, kill_process};
 /// is left, so that a stop stays bounded even while processes keep forking.
 const ROUNDS: usize = 8;
 
+/// Whether an orphan may be handed to one of its ancestors rather than to
+/// pid 1: on Linux the nearest subreaper above it adopts it, such as
+/// `systemd --user` above a user unit's processes (checked on 2026-10-25);
+/// macOS has no subreapers.
+const SUBREAPERS: bool = cfg!(target_os = "linux");
+
 /// One process of the table.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct Entry {
     pub(super) pid: i32,
     pub(super) parent: i32,
     pub(super) group: i32,
+    /// When it started, in the system's own unit: microseconds since the
+    /// epoch on macOS, clock ticks since boot on Linux.
+    pub(super) start: u64,
     /// Whether it runs no code: stopped, or ended and not reaped yet.
     pub(super) stopped: bool,
+    /// Whether it ended and is not reaped yet; never on macOS, which
+    /// describes no zombie.
+    pub(super) ended: bool,
 }
 
 /// Every process the system describes to this one.
@@ -55,15 +76,100 @@ pub(super) fn list() -> io::Result<Vec<Entry>> {
     imp::list()
 }
 
-/// The pids of `listing` that a stop of the tree of `group` reaches: the
-/// group's members, then, until nothing changes, every process whose parent
-/// is reached or whose group's id is the pid of a reached process, its
-/// leader. Never `own`, this process, nor pid 1.
-pub(super) fn reach(listing: &[Entry], group: i32, own: i32) -> BTreeSet<i32> {
+/// The working directory of `pid`, if the system shows it to this process.
+pub(super) fn cwd(pid: i32) -> Option<PathBuf> {
+    imp::cwd(pid)
+}
+
+/// What ties a process to the run whose tree left it (OWL-452): the run's
+/// worktree, canonical, and the start of the tree's root.
+#[derive(Debug)]
+pub(in crate::process) struct Workdir {
+    path: PathBuf,
+    since: u64,
+}
+
+impl Workdir {
+    /// The tie to `path`, canonical, of the tree whose root `root` was just
+    /// spawned and is not reaped yet: none when the system does not describe
+    /// the root, which then has ended already, having run nothing.
+    pub(in crate::process) fn new(path: PathBuf, root: u32) -> Option<Self> {
+        let root = i32::try_from(root).ok()?;
+        imp::describe(root).map(|entry| Self {
+            path,
+            since: entry.start,
+        })
+    }
+}
+
+/// The pids of `listing` that the run tied to `workdir` left, from which a
+/// stop of its tree also searches (OWL-452). Each one:
+///
+/// 1. has its working directory, as `cwd` reads it, in the worktree;
+/// 2. started no earlier than the tree's root;
+/// 3. was orphaned: its parent is pid 1, or on Linux one of the ancestors
+///    of `own`, this process, never `own` itself unless it is pid 1;
+/// 4. has no leader of its group left: no process listed, not ended, under
+///    the group's id that started no later than it, so a pid reused since
+///    is no leader.
+///
+/// Never `own` nor one of its ancestors. The working directory is read only
+/// for the processes the other rules keep.
+pub(super) fn left_by(
+    listing: &[Entry],
+    workdir: &Workdir,
+    own: i32,
+    cwd: impl Fn(i32) -> Option<PathBuf>,
+) -> BTreeSet<i32> {
+    let listed: BTreeMap<i32, &Entry> = listing.iter().map(|entry| (entry.pid, entry)).collect();
+    let mut ancestors = BTreeSet::new();
+    let mut at = Some(own);
+    while let Some(pid) = at
+        && ancestors.insert(pid)
+    {
+        at = listed
+            .get(&pid)
+            .map(|entry| entry.parent)
+            .filter(|&parent| parent > 0);
+    }
+    let orphaned =
+        |parent: i32| parent == 1 || (SUBREAPERS && parent != own && ancestors.contains(&parent));
+    let led = |entry: &Entry| {
+        listed
+            .get(&entry.group)
+            .is_some_and(|leader| !leader.ended && leader.start <= entry.start)
+    };
+    listing
+        .iter()
+        .filter(|entry| {
+            entry.pid > 1
+                && !entry.ended
+                && !ancestors.contains(&entry.pid)
+                && entry.start >= workdir.since
+                && orphaned(entry.parent)
+                && !led(entry)
+                && cwd(entry.pid).is_some_and(|dir| dir.starts_with(&workdir.path))
+        })
+        .map(|entry| entry.pid)
+        .collect()
+}
+
+/// The pids of `listing` that a stop of a tree reaches: the members of its
+/// `group`, if any, and the `seeds`, then, until nothing changes, every
+/// process whose parent is reached or whose group's id is the pid of a
+/// reached process, its leader. Never `own`, this process, nor pid 1.
+pub(super) fn reach(
+    listing: &[Entry],
+    group: Option<i32>,
+    seeds: &BTreeSet<i32>,
+    own: i32,
+) -> BTreeSet<i32> {
     let eligible = |entry: &Entry| entry.pid != own && entry.pid > 1;
     let mut reached: BTreeSet<i32> = listing
         .iter()
-        .filter(|entry| entry.group == group && eligible(entry))
+        .filter(|entry| {
+            eligible(entry) && (Some(entry.group) == group || seeds.contains(&entry.pid))
+        })
         .map(|entry| entry.pid)
         .collect();
     loop {
@@ -82,10 +188,10 @@ pub(super) fn reach(listing: &[Entry], group: i32, own: i32) -> BTreeSet<i32> {
 }
 
 /// What the check of the frozen processes against `listing` decides: the
-/// pids listed with the parent and the group they had when frozen, to kill,
-/// and every other one, to let go. One listed otherwise may be another
-/// process under a reused pid; one not listed may have ended, or may no
-/// longer be described.
+/// pids listed with the parent, the group and the start they had when
+/// frozen, to kill, and every other one, to let go. One listed otherwise may
+/// be another process under a reused pid; one not listed may have ended, or
+/// may no longer be described.
 pub(super) fn verify(frozen: &BTreeMap<i32, Entry>, listing: &[Entry]) -> (Vec<i32>, Vec<i32>) {
     let listed: BTreeMap<i32, &Entry> = listing.iter().map(|entry| (entry.pid, entry)).collect();
     let (mut kill, mut let_go) = (Vec::new(), Vec::new());
@@ -99,20 +205,26 @@ pub(super) fn verify(frozen: &BTreeMap<i32, Entry>, listing: &[Entry]) -> (Vec<i
     (kill, let_go)
 }
 
-/// Whether `now` is still the process listed as `was`: same pid, parent and
-/// group.
+/// Whether `now` is still the process listed as `was`: same pid, parent,
+/// group and start (OWL-452: a pid reused meanwhile is another process).
 fn same(was: &Entry, now: &Entry) -> bool {
-    was.pid == now.pid && was.parent == now.parent && was.group == now.group
+    was.pid == now.pid
+        && was.parent == now.parent
+        && was.group == now.group
+        && was.start == now.start
 }
 
-/// Freezes what a stop of the tree of `group` reaches in the listings
-/// `list` gives, as the module says, and hands back the pids to kill. Every
-/// other process it froze is let go before it returns, a failed listing or
-/// the last round included: such a failure leaves what left the group
-/// running, as before OWL-451.
+/// Freezes what a stop of a tree reaches in the listings `list` gives, as
+/// the module says, from the members of `group`, if any, and from what the
+/// run tied to `workdir`, if any, left, each working directory read with
+/// `cwd`; hands back the pids to kill. Every other process it froze is let
+/// go before it returns, a failed listing or the last round included: such
+/// a failure leaves what left the group running, as before OWL-451.
 pub(super) fn freeze_reached(
-    group: i32,
+    group: Option<i32>,
+    workdir: Option<&Workdir>,
     mut list: impl FnMut() -> io::Result<Vec<Entry>>,
+    cwd: impl Fn(i32) -> Option<PathBuf>,
 ) -> Vec<Pid> {
     let own = i32::try_from(std::process::id()).unwrap_or(i32::MAX);
     let mut frozen = Frozen::default();
@@ -120,7 +232,10 @@ pub(super) fn freeze_reached(
         let Ok(listing) = list() else {
             return Vec::new();
         };
-        let reached = reach(&listing, group, own);
+        let seeds = workdir
+            .map(|workdir| left_by(&listing, workdir, own, &cwd))
+            .unwrap_or_default();
+        let reached = reach(&listing, group, &seeds, own);
         let fresh: Vec<Entry> = listing
             .iter()
             .filter(|entry| reached.contains(&entry.pid) && !frozen.0.contains_key(&entry.pid))
@@ -185,7 +300,9 @@ impl Drop for Frozen {
 
 #[cfg(target_os = "macos")]
 mod imp {
-    use std::ffi::{c_int, c_void};
+    use std::ffi::{OsStr, c_int, c_void};
+    use std::os::unix::ffi::OsStrExt;
+    use std::path::PathBuf;
     use std::{io, mem, ptr};
 
     use super::Entry;
@@ -216,7 +333,7 @@ mod imp {
 
     /// The process `pid`, if the system describes it: not when it ended,
     /// is a zombie, or runs as another user.
-    fn describe(pid: libc::pid_t) -> Option<Entry> {
+    pub(super) fn describe(pid: libc::pid_t) -> Option<Entry> {
         // SAFETY: `proc_bsdinfo` is plain data, valid all zero.
         let mut info: libc::proc_bsdinfo = unsafe { mem::zeroed() };
         let size = c_int::try_from(size_of::<libc::proc_bsdinfo>()).ok()?;
@@ -234,13 +351,51 @@ mod imp {
             pid,
             parent: i32::try_from(info.pbi_ppid).unwrap_or(0),
             group: i32::try_from(info.pbi_pgid).unwrap_or(0),
+            start: info
+                .pbi_start_tvsec
+                .saturating_mul(1_000_000)
+                .saturating_add(info.pbi_start_tvusec),
             stopped: info.pbi_status == libc::SSTOP,
+            ended: false,
         })
+    }
+
+    /// The working directory of `pid`, read with `PROC_PIDVNODEPATHINFO`:
+    /// shown for any process of the same user, an Apple binary's and a
+    /// confined one's included (checked on 2026-10-25).
+    pub(super) fn cwd(pid: libc::pid_t) -> Option<PathBuf> {
+        // SAFETY: `proc_vnodepathinfo` is plain data, valid all zero.
+        let mut info: libc::proc_vnodepathinfo = unsafe { mem::zeroed() };
+        let size = c_int::try_from(size_of::<libc::proc_vnodepathinfo>()).ok()?;
+        // SAFETY: `info` is `size` bytes and outlives the call.
+        let written = unsafe {
+            libc::proc_pidinfo(
+                pid,
+                libc::PROC_PIDVNODEPATHINFO,
+                0,
+                (&raw mut info).cast::<c_void>(),
+                size,
+            )
+        };
+        if written != size {
+            return None;
+        }
+        // The path ends at its first NUL, within `MAXPATHLEN`.
+        let path: Vec<u8> = info
+            .pvi_cdir
+            .vip_path
+            .as_flattened()
+            .iter()
+            .take_while(|&&byte| byte != 0)
+            .map(|&byte| byte as u8)
+            .collect();
+        (!path.is_empty()).then(|| PathBuf::from(OsStr::from_bytes(&path)))
     }
 }
 
 #[cfg(target_os = "linux")]
 mod imp {
+    use std::path::PathBuf;
     use std::{fs, io};
 
     use super::Entry;
@@ -252,41 +407,59 @@ mod imp {
             let Some(pid) = dir.file_name().to_str().and_then(|name| name.parse().ok()) else {
                 continue;
             };
-            // Gone meanwhile, or not readable: not described.
-            let Ok(stat) = fs::read_to_string(dir.path().join("stat")) else {
-                continue;
-            };
-            entries.extend(parse(pid, &stat));
+            entries.extend(describe(pid));
         }
         Ok(entries)
     }
 
-    /// `pid (name) state ppid pgrp ...`: the name may hold spaces and
-    /// parentheses, so the fields follow the last closing one.
+    /// The process `pid`, if `/proc/<pid>/stat` can be read: not when it is
+    /// gone, or went meanwhile.
+    pub(super) fn describe(pid: i32) -> Option<Entry> {
+        parse(pid, &fs::read_to_string(format!("/proc/{pid}/stat")).ok()?)
+    }
+
+    /// `pid (name) state ppid pgrp ... starttime ...`: the name may hold
+    /// spaces and parentheses, so the fields follow the last closing one;
+    /// `starttime` is the 22nd field, the 20th after the name.
     fn parse(pid: i32, stat: &str) -> Option<Entry> {
         let (_, rest) = stat.rsplit_once(')')?;
-        let mut fields = rest.split_whitespace();
-        let state = fields.next()?;
-        let parent = fields.next()?.parse().ok()?;
-        let group = fields.next()?.parse().ok()?;
+        let fields: Vec<&str> = rest.split_whitespace().collect();
+        let state = *fields.first()?;
         Some(Entry {
             pid,
-            parent,
-            group,
+            parent: fields.get(1)?.parse().ok()?,
+            group: fields.get(2)?.parse().ok()?,
+            start: fields.get(19)?.parse().ok()?,
             stopped: matches!(state, "T" | "t" | "Z" | "X" | "x"),
+            ended: matches!(state, "Z" | "X" | "x"),
         })
+    }
+
+    /// The working directory of `pid`: not shown for another user's
+    /// process, nor for a non-dumpable one.
+    pub(super) fn cwd(pid: i32) -> Option<PathBuf> {
+        fs::read_link(format!("/proc/{pid}/cwd")).ok()
     }
 }
 
 #[cfg(not(any(target_os = "macos", target_os = "linux")))]
 mod imp {
     use std::io;
+    use std::path::PathBuf;
 
     use super::Entry;
 
     /// No search on another system: what left a tree's group is not found.
     pub(super) fn list() -> io::Result<Vec<Entry>> {
         Err(io::ErrorKind::Unsupported.into())
+    }
+
+    pub(super) fn describe(_pid: i32) -> Option<Entry> {
+        None
+    }
+
+    pub(super) fn cwd(_pid: i32) -> Option<PathBuf> {
+        None
     }
 }
 
@@ -299,14 +472,16 @@ mod tests {
             pid,
             parent,
             group,
+            start: 100,
             stopped: false,
+            ended: false,
         }
     }
 
     /// Reached: the tree's group, a Bash call's shell in a group of its own
-    /// below it, the shell's job and a job orphaned in the shell's group. Not
-    /// reached: the runner, a job whose group's leader is gone, nor this
-    /// process, even below the tree.
+    /// below it, the shell's job and a job orphaned in the shell's group, and
+    /// a seed's own child. Not reached: the runner, a job whose group's leader
+    /// is gone, nor this process, even below the tree.
     #[test]
     fn reach_follows_parents_and_the_groups_they_lead() {
         let listing = [
@@ -318,15 +493,79 @@ mod tests {
             entry(302, 1, 300),
             entry(400, 1, 399),
             entry(600, 301, 600),
+            entry(700, 1, 699),
+            entry(701, 700, 699),
         ];
         assert_eq!(
-            reach(&listing, 200, 600),
-            BTreeSet::from([200, 201, 300, 301, 302])
+            reach(&listing, Some(200), &BTreeSet::from([700]), 600),
+            BTreeSet::from([200, 201, 300, 301, 302, 700, 701])
         );
     }
 
+    /// OWL-452: what a run left, from a listing where this process is 50,
+    /// below 40 and 1, the run's root started at 100, the worktree `/wt`.
+    #[test]
+    fn left_by_ties_only_what_a_run_left() {
+        let at = |pid, parent, group, start| Entry {
+            start,
+            ..entry(pid, parent, group)
+        };
+        let zombie = Entry {
+            ended: true,
+            stopped: true,
+            ..entry(901, 1, 901)
+        };
+        let listing = [
+            at(40, 1, 40, 1),
+            at(50, 40, 50, 2),
+            // Left: orphaned to pid 1, its group's leader gone.
+            at(300, 1, 299, 200),
+            // Left: its group's leader ended, not reaped yet.
+            at(301, 1, 901, 200),
+            zombie,
+            // Left: its group's "leader" a pid reused since, younger.
+            at(302, 1, 902, 200),
+            at(902, 77, 902, 250),
+            // Left on Linux only: handed to an ancestor, a subreaper.
+            at(303, 40, 299, 200),
+            // Not left: started before the run's root.
+            at(310, 1, 299, 99),
+            // Not left: working outside the worktree.
+            at(311, 1, 299, 200),
+            // Not left: its parent alive, not an ancestor.
+            at(312, 77, 299, 200),
+            at(77, 1, 77, 3),
+            // Not left: its group's leader alive.
+            at(313, 1, 313, 200),
+            // Not left: its parent is this process.
+            at(314, 50, 299, 200),
+        ];
+        let workdir = Workdir {
+            path: PathBuf::from("/wt"),
+            since: 100,
+        };
+        let cwd = |pid: i32| {
+            Some(PathBuf::from(match pid {
+                311 => "/wt-other",
+                _ => "/wt/sub",
+            }))
+        };
+        let mut expected = BTreeSet::from([300, 301, 302]);
+        if SUBREAPERS {
+            expected.insert(303);
+        }
+        assert_eq!(left_by(&listing, &workdir, 50, cwd), expected);
+        // This process as pid 1 adopts what is orphaned, and is never left
+        // itself; its ancestors never are either.
+        let own_init = [at(1, 0, 1, 1), at(300, 1, 299, 200)];
+        assert_eq!(left_by(&own_init, &workdir, 1, cwd), BTreeSet::from([300]));
+        let below = [at(40, 1, 299, 150), at(50, 40, 50, 160)];
+        assert!(left_by(&below, &workdir, 50, cwd).is_empty());
+    }
+
     /// Killed: a frozen process listed as it was. Let go: one listed with
-    /// another parent, maybe another process under its pid, and one no
+    /// another parent, maybe another process under its pid, one listed with
+    /// another start, another process under its pid (OWL-452), and one no
     /// longer described.
     #[test]
     fn a_frozen_process_that_changed_is_let_go_not_killed() {
@@ -334,9 +573,17 @@ mod tests {
             (300, entry(300, 200, 300)),
             (301, entry(301, 300, 300)),
             (302, entry(302, 1, 300)),
+            (303, entry(303, 1, 300)),
         ]);
-        let listing = [entry(300, 200, 300), entry(301, 77, 301)];
-        assert_eq!(verify(&frozen, &listing), (vec![300], vec![301, 302]));
+        let listing = [
+            entry(300, 200, 300),
+            entry(301, 77, 301),
+            Entry {
+                start: 101,
+                ..entry(303, 1, 300)
+            },
+        ];
+        assert_eq!(verify(&frozen, &listing), (vec![300], vec![301, 302, 303]));
     }
 
     /// A search whose listing fails once it froze a process lets it go and
@@ -354,13 +601,18 @@ mod tests {
             .unwrap();
         let pid = i32::try_from(sleep.id()).unwrap();
         let mut listings = 0;
-        let kill = freeze_reached(pid, || {
-            listings += 1;
-            match listings {
-                1 => Ok(vec![entry(pid, 1, pid)]),
-                _ => Err(io::Error::other("broken")),
-            }
-        });
+        let kill = freeze_reached(
+            Some(pid),
+            None,
+            || {
+                listings += 1;
+                match listings {
+                    1 => Ok(vec![entry(pid, 1, pid)]),
+                    _ => Err(io::Error::other("broken")),
+                }
+            },
+            cwd,
+        );
         // A SIGCONT takes a moment to land.
         let running = Instant::now() + Duration::from_secs(5);
         let mut state = crate::test_proc::state(sleep.id());
