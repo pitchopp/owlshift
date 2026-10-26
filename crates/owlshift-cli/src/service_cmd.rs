@@ -2,7 +2,9 @@
 //! architecture section 5, "The background service"; runtime and
 //! operations, "Install, lifecycle & uninstall"): the service itself, which
 //! `owlshift_runner::daemon` runs, and the two commands a person types to
-//! serve a project and to stop the service.
+//! serve a project and to stop the service. With `--at-login` they install
+//! and remove the service at login, and `owlshift uninstall` removes what
+//! the install manifest lists (OWL-437, `owlshift_runner::install`).
 
 use std::io;
 use std::path::{Path, PathBuf};
@@ -15,8 +17,13 @@ use owlshift_adapters::forge::Repo;
 use owlshift_adapters::notifier::Notifier;
 use owlshift_contracts::format::Format;
 use owlshift_contracts::service::{BY_STOP, DaemonRecord, Request};
+use owlshift_platform::keychain::Keychain;
+use owlshift_platform::service::{HostManager, Layout, Manager};
 use owlshift_runner::config::{Effective, FileState, OWLSHIFT_VERSION};
 use owlshift_runner::daemon::{self, Daemon, Held, Timing, requests};
+use owlshift_runner::events::printable;
+use owlshift_runner::install::uninstall::{self, Personal, Stopped};
+use owlshift_runner::install::{self, Install, Installed};
 use owlshift_runner::notify::{self, DesktopNotifier};
 use owlshift_runner::served::Registry;
 use owlshift_runner::system::System;
@@ -111,10 +118,18 @@ fn already_runs(data: &Path, holder: Option<&DaemonRecord>) -> String {
 }
 
 /// `owlshift start`: serves the project of the working directory, and
-/// starts the daemon for this login session when none runs.
-pub fn start(config: &Effective) -> ExitCode {
+/// starts the daemon for this login session when none runs; with
+/// `at_login`, installs the service at login first (OWL-437). An installed
+/// service is started through its manager, never as a second daemon.
+pub fn start(config: &Effective, at_login: bool) -> ExitCode {
     if cfg!(windows) {
         return fail(&format!("`owlshift start`: {ON_WINDOWS}"));
+    }
+    if at_login && owlshift_platform::service::runs_as_root() {
+        return fail(
+            "`owlshift start --at-login` installs the service of the user who runs it: run it as \
+             yourself, not as root",
+        );
     }
     let (project_file, project) = match loaded_project(config, "`owlshift start`") {
         Ok(loaded) => loaded,
@@ -143,6 +158,29 @@ pub fn start(config: &Effective) -> ExitCode {
     } else {
         format!("{repo} was already served from {}", checkout.display())
     };
+    let manager = HostManager::for_this_machine();
+    if at_login {
+        let (layout, binary) = match this_layout().and_then(|l| Ok((l, binary_for_service()?))) {
+            Ok(found) => found,
+            Err(error) => return fail(&error),
+        };
+        let config_dir = personal_folder();
+        let path = std::env::var_os("PATH");
+        let spec = Install {
+            data: &data,
+            layout: &layout,
+            binary: &binary,
+            config_dir: config_dir.as_deref(),
+            path: path.as_deref(),
+        };
+        match install_at_login(&spec, &manager) {
+            Ok(said) => println!("{said}"),
+            Err(error) => {
+                println!("{served}.");
+                return fail(&error);
+            }
+        }
+    }
     match daemon::running(&data) {
         Ok(Some(record)) => {
             let pid = record.map_or_else(String::new, |record| format!(" (pid {})", record.pid));
@@ -160,6 +198,13 @@ pub fn start(config: &Effective) -> ExitCode {
             } else {
                 println!("{served}, by the daemon{pid}.");
             }
+            if at_login {
+                println!(
+                    "The daemon that runs now{pid} goes on: the service at login takes over at \
+                     its next start, at the latest at your next login (`owlshift stop`, then \
+                     `owlshift start`, hands over now)."
+                );
+            }
             ExitCode::SUCCESS
         }
         Ok(None) => {
@@ -167,6 +212,33 @@ pub fn start(config: &Effective) -> ExitCode {
             // stop the new one at its start.
             if let Err(error) = requests::remove_stop_request(&data) {
                 return fail(&format!("the stop request left behind: {error}"));
+            }
+            match install::installed(&data) {
+                Ok(Some(service)) => {
+                    return start_by_manager(&data, &install::layout_of(&service), &manager)
+                        .map_or_else(
+                            |error| {
+                                println!("{served}.");
+                                fail(&format!(
+                                    "the service at login is installed but did not start: \
+                                     {error}. It starts at your next login; `owlshift doctor` \
+                                     says more"
+                                ))
+                            },
+                            |record| {
+                                println!(
+                                    "{served}. Started the service at login (pid {}): its \
+                                     output is in {}; `owlshift stop` stops it, `owlshift stop \
+                                     --at-login` removes it.",
+                                    record.pid,
+                                    log_file(&data).display()
+                                );
+                                ExitCode::SUCCESS
+                            },
+                        );
+                }
+                Ok(None) => {}
+                Err(error) => return fail(&error),
             }
             let program = match std::env::current_exe() {
                 Ok(program) => program,
@@ -206,6 +278,96 @@ pub fn start(config: &Effective) -> ExitCode {
             daemon::service_dir(&data).display()
         )),
     }
+}
+
+/// Where this machine's service manager keeps Owlshift's unit and launcher.
+fn this_layout() -> Result<Layout, String> {
+    let home = owlshift_platform::paths::home_dir()
+        .ok_or_else(|| "this system names no home folder for the service's files".to_owned())?;
+    Ok(Layout::for_this_machine(
+        &home,
+        owlshift_platform::paths::config_home().as_deref(),
+    ))
+}
+
+/// The binary the service starts: this one, by the path it was run by when
+/// that is the same file, so a package manager's stable link is named
+/// rather than its versioned folder.
+fn binary_for_service() -> Result<PathBuf, String> {
+    let current = std::env::current_exe()
+        .map_err(|e| format!("this program's own path, which the service starts: {e}"))?;
+    let cwd = std::env::current_dir()
+        .map_err(|e| format!("the current directory, against which this program ran: {e}"))?;
+    let invoked = std::env::args_os().next();
+    Ok(owlshift_platform::service::service_binary(
+        invoked.as_deref(),
+        &cwd,
+        &current,
+        &|name| owlshift_platform::process::find_executable(&name.to_string_lossy()),
+    ))
+}
+
+/// The folder of the personal file, named to the daemon, when there is one.
+fn personal_folder() -> Option<PathBuf> {
+    owlshift_platform::paths::personal_config_file()
+        .and_then(|file| file.parent().map(Path::to_owned))
+}
+
+/// Installs the service at login and registers it with `manager` for the
+/// next logins; what to say. A manager that refuses it leaves nothing
+/// installed.
+fn install_at_login(spec: &Install<'_>, manager: &dyn Manager) -> Result<String, String> {
+    let installed = install::install(spec)?;
+    if let Err(error) = manager.enable(spec.layout) {
+        let undone = match install::remove_service(spec.data, manager) {
+            Ok(_) => "nothing stays installed".to_owned(),
+            Err(left) => format!("and removing it failed too: {left}"),
+        };
+        return Err(format!(
+            "the service manager did not take the service at login ({error}): {undone}"
+        ));
+    }
+    let unit = spec.layout.unit();
+    Ok(match installed {
+        Installed::New => format!(
+            "Installed the service at login: {} runs {}, which starts {} daemon on {}; `owlshift \
+             stop --at-login` removes it.",
+            unit.display(),
+            spec.layout.launcher().display(),
+            spec.binary.display(),
+            spec.data.display()
+        ),
+        Installed::Updated => format!(
+            "Updated the service at login ({}): it starts {} daemon.",
+            unit.display(),
+            spec.binary.display()
+        ),
+        Installed::Unchanged => format!(
+            "The service at login is installed already ({}).",
+            unit.display()
+        ),
+    })
+}
+
+/// Starts the installed service through its manager, then waits for its
+/// daemon to run.
+fn start_by_manager(
+    data: &Path,
+    layout: &Layout,
+    manager: &dyn Manager,
+) -> Result<DaemonRecord, String> {
+    /// A daemon its manager starts: only its record tells it runs.
+    struct ByManager;
+
+    impl Launched for ByManager {
+        fn ended(&mut self) -> Option<String> {
+            None
+        }
+    }
+
+    let since = Timestamp::now();
+    manager.start(layout)?;
+    wait_running(data, since, &mut ByManager)
 }
 
 /// What `owlshift start` needs to run the daemon for this login session.
@@ -328,8 +490,10 @@ fn wait_running(
 }
 
 /// `owlshift stop`: drains every watch of the daemon, which then exits; with
-/// `forget`, stops serving the project of the working directory only.
-pub fn stop(config: &Effective, forget: bool) -> ExitCode {
+/// `forget`, stops serving the project of the working directory only; with
+/// `at_login`, also waits for the daemon to end, however long its steps under
+/// way take, then unloads and removes the service at login (OWL-437).
+pub fn stop(config: &Effective, forget: bool, at_login: bool) -> ExitCode {
     if cfg!(windows) {
         return fail(&format!("`owlshift stop`: {ON_WINDOWS}"));
     }
@@ -370,27 +534,257 @@ pub fn stop(config: &Effective, forget: bool) -> ExitCode {
             Err(error) => fail(&error),
         };
     }
-    let Some(record) = running else {
-        println!("No daemon runs on {}.", data.display());
+    match running {
+        None => println!("No daemon runs on {}.", data.display()),
+        Some(record) => {
+            let request = Request::new(BY_STOP, Timestamp::now(), "asked by `owlshift stop`");
+            if let Err(error) = daemon::ask_stop(&data, &request) {
+                return fail(&format!("the stop request: {error}"));
+            }
+            // A daemon that ended meanwhile would leave the request to stop
+            // the next one at its start.
+            if matches!(daemon::running(&data), Ok(None)) {
+                let _ = requests::remove_stop_request(&data);
+                println!("No daemon runs on {}.", data.display());
+            } else {
+                let pid =
+                    record.map_or_else(String::new, |record| format!(" (pid {})", record.pid));
+                println!(
+                    "Stopping the daemon{pid}: each watch ends once its steps under way finish, \
+                     then the daemon exits."
+                );
+                if at_login {
+                    println!(
+                        "Waiting for it to end before removing the service at login. Ctrl-C \
+                         stops the wait: the service then stays installed while the drain goes \
+                         on, and `owlshift stop --at-login` again removes it."
+                    );
+                    if let Err(error) = wait_ended(&data) {
+                        return fail(&error);
+                    }
+                }
+            }
+        }
+    }
+    if !at_login {
         return ExitCode::SUCCESS;
+    }
+    match remove_at_login(&data, &HostManager::for_this_machine()) {
+        Ok(said) => {
+            for line in said {
+                println!("{line}");
+            }
+            ExitCode::SUCCESS
+        }
+        Err(error) => fail(&error),
+    }
+}
+
+/// How often `owlshift stop --at-login` looks whether the daemon ended.
+const END_POLL: Duration = Duration::from_millis(500);
+
+/// Waits, with no bound, until no daemon runs on `data`.
+fn wait_ended(data: &Path) -> Result<(), String> {
+    loop {
+        match daemon::running(data) {
+            Ok(None) => return Ok(()),
+            Ok(Some(_)) => thread::sleep(END_POLL),
+            Err(error) => {
+                return Err(format!("{}: {error}", daemon::service_dir(data).display()));
+            }
+        }
+    }
+}
+
+/// Unloads and removes the service at login the install manifest of
+/// `data` lists, once no daemon runs; what to say.
+fn remove_at_login(data: &Path, manager: &dyn Manager) -> Result<Vec<String>, String> {
+    let removal = install::remove_service(data, manager)?;
+    let mut said: Vec<String> = removal
+        .warnings
+        .iter()
+        .map(|warning| format!("Note: {warning}."))
+        .collect();
+    said.push(match removal.removed {
+        Some(service) => format!(
+            "Removed the service at login: {}.",
+            service.files().join(", ")
+        ),
+        None => format!(
+            "No service at login to remove: the install manifest of {} lists none.",
+            data.display()
+        ),
+    });
+    Ok(said)
+}
+
+/// `owlshift uninstall`: stops the daemon checked, then removes exactly what
+/// the install manifest lists; with `purge`, also Owlshift's entries of the
+/// data directory and the personal file (OWL-437).
+pub fn uninstall(purge: bool) -> ExitCode {
+    if cfg!(windows) {
+        return fail(&format!("`owlshift uninstall`: {ON_WINDOWS}"));
+    }
+    let data = match data_dir() {
+        Ok(data) => data,
+        Err(error) => return fail(&error),
     };
-    let request = Request::new(BY_STOP, Timestamp::now(), "asked by `owlshift stop`");
-    if let Err(error) = daemon::ask_stop(&data, &request) {
-        return fail(&format!("the stop request: {error}"));
+    let personal_file = owlshift_platform::paths::personal_config_file();
+    let personal = personal_file.as_deref().map(|file| Personal {
+        file,
+        own_folder: owlshift_platform::paths::personal_file_in_own_folder(file),
+    });
+    let home = owlshift_platform::paths::home_dir();
+    let outcome = uninstall_with(&Uninstall {
+        data: &data,
+        home: home.as_deref(),
+        manager: &HostManager::for_this_machine(),
+        terminate: &owlshift_platform::service::terminate,
+        keychain: &|| Keychain::system().map_err(|e| e.to_string()),
+        purge: purge.then_some(personal.as_ref()),
+        stop_wait: uninstall::STOP_WAIT,
+    });
+    for line in &outcome.said {
+        println!("{line}");
     }
-    // A daemon that ended meanwhile would leave the request to stop the
-    // next one at its start.
-    if matches!(daemon::running(&data), Ok(None)) {
-        let _ = requests::remove_stop_request(&data);
-        println!("No daemon runs on {}.", data.display());
+    if outcome.failed.is_empty() {
         return ExitCode::SUCCESS;
     }
-    let pid = record.map_or_else(String::new, |record| format!(" (pid {})", record.pid));
-    println!(
-        "Stopping the daemon{pid}: each watch ends once its steps under way finish, then the \
-         daemon exits."
-    );
-    ExitCode::SUCCESS
+    for error in &outcome.failed {
+        eprintln!("owlshift: {}", printable(error));
+    }
+    ExitCode::FAILURE
+}
+
+/// What `owlshift uninstall` works with.
+struct Uninstall<'a> {
+    data: &'a Path,
+    home: Option<&'a Path>,
+    manager: &'a dyn Manager,
+    terminate: &'a dyn Fn(u32) -> io::Result<()>,
+    keychain: &'a dyn Fn() -> Result<Keychain, String>,
+    /// With `--purge`: the personal file, when there is one.
+    purge: Option<Option<&'a Personal<'a>>>,
+    stop_wait: Duration,
+}
+
+/// What `owlshift uninstall` did: what to say, and what failed.
+#[derive(Debug, Default)]
+struct Outcome {
+    said: Vec<String>,
+    failed: Vec<String>,
+}
+
+/// The daemon stopped checked, the purge's refusals told before anything is
+/// removed, then the manifest's entries, then the purge.
+fn uninstall_with(how: &Uninstall<'_>) -> Outcome {
+    let data = how.data;
+    let mut outcome = Outcome::default();
+    if how.purge.is_some()
+        && let Some(refusal) = uninstall::purge_refusal(data, how.home)
+    {
+        outcome.failed.push(refusal);
+        return outcome;
+    }
+    let running = || daemon::running(data);
+    match uninstall::stop_checked(
+        data,
+        &running,
+        how.terminate,
+        how.stop_wait,
+        uninstall::STOP_POLL,
+    ) {
+        Ok(Stopped::NotRunning) => {}
+        Ok(Stopped::Ended(pid)) => outcome.said.push(format!(
+            "Stopped the daemon (pid {pid}), its runs checked: a ticket it cut resumes at the \
+             next start."
+        )),
+        Err(refusal) => {
+            outcome.failed.push(refusal);
+            return outcome;
+        }
+    }
+    if how.purge.is_some() {
+        match uninstall::busy(data) {
+            Ok(held) if held.is_empty() => {}
+            Ok(held) => {
+                outcome.failed.push(format!(
+                    "another Owlshift command works on {} in {}: nothing was removed. Let it \
+                     end, then run `owlshift uninstall --purge` again",
+                    held.join(", "),
+                    data.display()
+                ));
+                return outcome;
+            }
+            Err(error) => {
+                outcome.failed.push(error);
+                return outcome;
+            }
+        }
+    }
+    match uninstall::remove_listed(data, how.manager, how.keychain) {
+        Ok(report) => {
+            outcome.said.extend(
+                report
+                    .warnings
+                    .iter()
+                    .map(|warning| format!("Note: {warning}.")),
+            );
+            outcome
+                .said
+                .extend(report.removed.iter().map(|what| format!("Removed {what}.")));
+            if report.removed.is_empty() && report.left.is_empty() {
+                outcome.said.push(format!(
+                    "The install manifest of {} lists nothing to remove.",
+                    data.display()
+                ));
+            }
+            outcome.failed.extend(
+                report.left.iter().map(|what| {
+                    format!("not removed: {what}; the install manifest still lists it")
+                }),
+            );
+        }
+        Err(error) => {
+            outcome.failed.push(error);
+            return outcome;
+        }
+    }
+    if let Some(personal) = how.purge {
+        let purged = uninstall::purge(data, personal);
+        if purged.removed.iter().any(|path| path == data) {
+            outcome.said.push(format!(
+                "Removed the data directory {}: the projects' clones, worktrees and run logs, \
+                 the event log and the service's files.",
+                data.display()
+            ));
+        } else if !purged.removed.is_empty() {
+            outcome
+                .said
+                .push(format!("Removed Owlshift's files in {}.", data.display()));
+        }
+        if let Some(personal) = personal
+            && purged.removed.iter().any(|path| path == personal.file)
+        {
+            outcome.said.push(format!(
+                "Removed the personal file {}.",
+                personal.file.display()
+            ));
+        }
+        if !purged.left.is_empty() {
+            let left: Vec<String> = purged
+                .left
+                .iter()
+                .map(|path| path.display().to_string())
+                .collect();
+            outcome.said.push(format!(
+                "Left in place, not Owlshift's or still listing what was not removed: {}.",
+                left.join(", ")
+            ));
+        }
+        outcome.failed.extend(purged.failed);
+    }
+    outcome
 }
 
 /// The checkout of the working directory's project, whether its project
@@ -418,6 +812,194 @@ fn repo_of(checkout: &Path) -> Result<Repo, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// OWL-437: the service at login, on temp folders and a recording
+    /// manager, never `launchctl` or `systemctl`.
+    #[cfg(unix)]
+    mod at_login {
+        use std::cell::RefCell;
+        use std::fs;
+
+        use owlshift_contracts::service::KeychainEntry;
+        use owlshift_platform::keychain::Secret;
+        use owlshift_platform::service::Kind;
+        use owlshift_runner::install::Manifests;
+
+        use super::super::*;
+
+        /// A service manager that records what it is asked, failing `enable`
+        /// when told to.
+        #[derive(Default)]
+        struct Recorded {
+            calls: RefCell<Vec<&'static str>>,
+            refuses_enable: bool,
+        }
+
+        impl Recorded {
+            fn take(&self) -> Vec<&'static str> {
+                std::mem::take(&mut self.calls.borrow_mut())
+            }
+        }
+
+        impl Manager for Recorded {
+            fn enable(&self, _: &Layout) -> Result<(), String> {
+                self.calls.borrow_mut().push("enable");
+                if self.refuses_enable {
+                    Err("no user bus".to_owned())
+                } else {
+                    Ok(())
+                }
+            }
+            fn start(&self, _: &Layout) -> Result<(), String> {
+                self.calls.borrow_mut().push("start");
+                Ok(())
+            }
+            fn unload(&self, _: &Layout) -> Result<(), String> {
+                self.calls.borrow_mut().push("unload");
+                Ok(())
+            }
+            fn reload(&self, _: &Layout) -> Result<(), String> {
+                self.calls.borrow_mut().push("reload");
+                Ok(())
+            }
+        }
+
+        fn spec<'a>(data: &'a Path, layout: &'a Layout, binary: &'a Path) -> Install<'a> {
+            Install {
+                data,
+                layout,
+                binary,
+                config_dir: None,
+                path: None,
+            }
+        }
+
+        /// OWL-437: `start --at-login` installs and enables; a manager that
+        /// refuses leaves nothing installed. `stop --at-login`, with no daemon
+        /// running, still unloads and removes it.
+        #[test]
+        fn the_service_is_installed_at_login_and_removed_with_stop() {
+            let root = tempfile::tempdir().unwrap();
+            let data = root.path().join("data");
+            let layout = Layout {
+                kind: Kind::Systemd,
+                dir: root.path().join("units"),
+            };
+            let binary = root.path().join("owlshift");
+            let manager = Recorded::default();
+            let said = install_at_login(&spec(&data, &layout, &binary), &manager).unwrap();
+            assert!(
+                said.starts_with("Installed the service at login: "),
+                "{said}"
+            );
+            assert_eq!(manager.take(), ["enable"]);
+            assert!(layout.unit().exists() && layout.launcher().exists());
+            let said = install_at_login(&spec(&data, &layout, &binary), &manager).unwrap();
+            assert!(said.contains("installed already"), "{said}");
+            manager.take();
+
+            let said = remove_at_login(&data, &manager).unwrap();
+            assert_eq!(manager.take(), ["unload", "reload"]);
+            assert!(
+                said[0].starts_with("Removed the service at login: "),
+                "{said:?}"
+            );
+            assert!(!layout.unit().exists() && !layout.launcher().exists());
+            let said = remove_at_login(&data, &manager).unwrap();
+            assert!(
+                said[0].starts_with("No service at login to remove"),
+                "{said:?}"
+            );
+
+            let refusing = Recorded {
+                refuses_enable: true,
+                ..Recorded::default()
+            };
+            let error = install_at_login(&spec(&data, &layout, &binary), &refusing).unwrap_err();
+            assert!(
+                error.contains("(no user bus): nothing stays installed"),
+                "{error}"
+            );
+            assert!(!layout.unit().exists() && !Manifests::in_data_dir(&data).file().exists());
+        }
+
+        /// OWL-437: `uninstall --purge` with no daemon running removes the
+        /// service, the keychain entries `init` stored, the data directory and
+        /// the personal file; a folder that is not Owlshift's data directory is
+        /// refused before anything is removed.
+        #[test]
+        fn uninstall_removes_what_the_manifest_lists_then_purges() {
+            let root = tempfile::tempdir().unwrap();
+            let data = root.path().join("data");
+            let layout = Layout {
+                kind: Kind::Launchd,
+                dir: root.path().join("agents"),
+            };
+            let binary = root.path().join("owlshift");
+            let manager = Recorded::default();
+            install_at_login(&spec(&data, &layout, &binary), &manager).unwrap();
+            Manifests::in_data_dir(&data)
+                .record_keychain(&[KeychainEntry {
+                    service: "owlshift".to_owned(),
+                    account: "claude-agent".to_owned(),
+                }])
+                .unwrap();
+            fs::create_dir_all(data.join("projects/github.com/acme/web/checkout")).unwrap();
+            fs::write(data.join("events.lock"), "").unwrap();
+            let personal_file = root.path().join("config.toml");
+            fs::write(&personal_file, "").unwrap();
+            let personal = Personal {
+                file: &personal_file,
+                own_folder: false,
+            };
+            let terminate =
+                |pid: u32| -> io::Result<()> { panic!("no daemon runs, yet pid {pid}") };
+            let keychain = || {
+                let keychain = Keychain::in_memory();
+                keychain
+                    .store("claude-agent", &Secret::new("token"))
+                    .unwrap();
+                Ok(keychain)
+            };
+            let not_ours = root.path().join("not-ours");
+            fs::create_dir_all(not_ours.join("projects")).unwrap();
+            let refused = uninstall_with(&Uninstall {
+                data: &not_ours,
+                home: None,
+                manager: &manager,
+                terminate: &terminate,
+                keychain: &keychain,
+                purge: Some(None),
+                stop_wait: Duration::ZERO,
+            });
+            assert!(
+                refused.failed[0].contains("does not look like Owlshift's data directory"),
+                "{refused:?}"
+            );
+            assert!(not_ours.join("projects").exists());
+
+            let outcome = uninstall_with(&Uninstall {
+                data: &data,
+                home: Some(root.path()),
+                manager: &manager,
+                terminate: &terminate,
+                keychain: &keychain,
+                purge: Some(Some(&personal)),
+                stop_wait: Duration::ZERO,
+            });
+            assert!(outcome.failed.is_empty(), "{outcome:?}");
+            let said = outcome.said.join("\n");
+            for line in [
+                "Removed the service at login (",
+                "Removed the keychain entry `claude-agent` (service `owlshift`).",
+                "Removed the data directory ",
+                "Removed the personal file ",
+            ] {
+                assert!(said.contains(line), "{line}\n{said}");
+            }
+            assert!(!data.exists() && !personal_file.exists() && !layout.unit().exists());
+        }
+    }
 
     /// The daemon's watch of a served project is this binary's served drain
     /// (OWL-434).

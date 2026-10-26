@@ -36,11 +36,6 @@ use crate::project::{self, ProjectDirs, ProjectLock};
 use crate::refusal::Refusal;
 use crate::{notify, on_demand, rules, step, watch};
 
-/// How long a change of the served projects waits for their lock.
-const LOCK_WAIT: Duration = Duration::from_secs(10);
-/// How often that wait tries the lock.
-const LOCK_POLL: Duration = Duration::from_millis(50);
-
 /// The machine's list of served projects: `projects.json` in
 /// `<data>/service`, replaced whole under `projects.lock`.
 #[derive(Clone, Debug)]
@@ -136,25 +131,16 @@ impl Registry {
     /// Applies `change` under the list's lock, the list replaced whole when
     /// `change` says it changed it.
     fn update(&self, change: impl FnOnce(&mut ServedProjects) -> bool) -> Result<bool, String> {
-        fs::create_dir_all(&self.dir).map_err(|e| format!("{}: {e}", self.dir.display()))?;
-        let lock_path = self.lock_file();
-        let _lock = project::lock_file_within(&lock_path, LOCK_WAIT, LOCK_POLL)
-            .map_err(|e| format!("{}: {e}", lock_path.display()))?
-            .ok_or_else(|| {
-                format!(
-                    "{} stayed held for {} seconds",
-                    lock_path.display(),
-                    LOCK_WAIT.as_secs()
-                )
-            })?;
-        let mut served = self.read()?;
-        let changed = change(&mut served);
-        if changed {
-            let path = self.file();
-            step::write_atomically(&path, &served.render())
-                .map_err(|e| format!("{}: {e}", path.display()))?;
-        }
-        Ok(changed)
+        project::under_lock(&self.lock_file(), || {
+            let mut served = self.read()?;
+            let changed = change(&mut served);
+            if changed {
+                let path = self.file();
+                step::write_atomically(&path, &served.render())
+                    .map_err(|e| format!("{}: {e}", path.display()))?;
+            }
+            Ok(changed)
+        })
     }
 }
 

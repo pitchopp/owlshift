@@ -168,6 +168,9 @@ pub const SERVED_CONFIG_FORMAT: u32 = 1;
 /// The format version of the running daemon's record
 /// (`<data>/service/daemon.json`, OWL-435).
 pub const DAEMON_FORMAT: u32 = 1;
+/// The format version of the install manifest
+/// (`<data>/service/manifest.json`, OWL-437).
+pub const MANIFEST_FORMAT: u32 = 1;
 
 /// Why a contract document was refused.
 #[derive(Debug)]

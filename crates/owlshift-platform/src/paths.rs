@@ -61,6 +61,20 @@ pub fn home_dir() -> Option<PathBuf> {
     dirs::home_dir()
 }
 
+/// The platform's configuration directory, which `OWLSHIFT_CONFIG_DIR` does
+/// not change: `$XDG_CONFIG_HOME` or `~/.config` on Linux, where systemd's
+/// user units live (OWL-437).
+pub fn config_home() -> Option<PathBuf> {
+    dirs::config_dir()
+}
+
+/// Whether `file` is the personal file at its platform place,
+/// `<config_dir>/owlshift/config.toml`, rather than in a folder
+/// `OWLSHIFT_CONFIG_DIR` names: its folder is then Owlshift's own (OWL-437).
+pub fn personal_file_in_own_folder(file: &std::path::Path) -> bool {
+    dirs::config_dir().is_some_and(|dir| file == dir.join("owlshift").join("config.toml"))
+}
+
 /// `override_dir`: `OWLSHIFT_CONFIG_DIR` as read from the environment.
 /// Unset, empty or relative means "no override". `config_dir`: the
 /// platform's parent configuration directory, as `dirs::config_dir()`

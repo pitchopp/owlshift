@@ -198,17 +198,15 @@ impl Watch<'_> {
 mod tests {
     use super::*;
 
-    /// The service manager's grace on macOS, the smallest measured
-    /// (`ExitTimeOut`; build plan, "P7 · Background service", L1).
-    const MACOS_GRACE: Duration = Duration::from_secs(60);
-    /// The grace on Linux (`TimeoutStopSec`).
-    const LINUX_GRACE: Duration = Duration::from_secs(90);
     /// The least time left after the bound for the watch's and the daemon's exit.
     const MARGIN: Duration = Duration::from_secs(15);
 
+    /// The graces are those the units installed at login name (OWL-437):
+    /// `ExitTimeOut` on macOS, the smallest measured (build plan, "P7 ·
+    /// Background service", L1), and `TimeoutStopSec` on Linux.
     #[test]
     fn the_checked_stop_bound_ends_before_every_service_grace_with_a_margin() {
-        for grace in [MACOS_GRACE, LINUX_GRACE] {
+        for grace in [crate::install::LAUNCHD_GRACE, crate::install::SYSTEMD_GRACE] {
             assert!(
                 CHECKED_STOP_BOUND + MARGIN <= grace,
                 "{CHECKED_STOP_BOUND:?} leaves less than {MARGIN:?} before a grace of {grace:?}"

@@ -9,6 +9,7 @@ pub mod keychain;
 pub mod paths;
 pub mod process;
 pub mod sandbox;
+pub mod service;
 pub mod terminal;
 #[cfg(all(test, unix))]
 mod test_proc;

@@ -322,6 +322,61 @@ fn the_daemon_runs_once_pauses_a_project_it_cannot_serve_and_stops() {
     assert_eq!(stdout(&forgot), "acme/web is no longer served.\n");
 }
 
+/// OWL-437: `uninstall` with an install manifest listing nothing removes
+/// nothing; `--purge` removes Owlshift's entries of the data directory and
+/// the personal file, and names a file of the person's it leaves. No service
+/// and no keychain entry is listed, so neither the service manager nor the
+/// keychain is reached.
+#[cfg(unix)]
+#[test]
+fn uninstall_purges_owlshifts_entries_and_leaves_the_rest() {
+    let config_dir = tempfile::tempdir().unwrap();
+    let personal = config_dir.path().join("config.toml");
+    fs::write(&personal, "").unwrap();
+    let data = config_dir.path().join("data");
+    let nothing = owlshift(config_dir.path(), config_dir.path(), &["uninstall"]);
+    assert!(nothing.status.success(), "{}", stderr(&nothing));
+    assert!(
+        stdout(&nothing).contains("lists nothing to remove"),
+        "{}",
+        stdout(&nothing)
+    );
+
+    for file in [
+        "projects/github.com/acme/web/checkout/HEAD",
+        "projects/github.com/acme/web/worktrees/OWL-1/file",
+        "projects/github.com/acme/web/runs/OWL-1/run.log",
+        "events.jsonl",
+        "events.lock",
+        "notes.txt",
+    ] {
+        let path = data.join(file);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, "x").unwrap();
+    }
+    let purged = owlshift(
+        config_dir.path(),
+        config_dir.path(),
+        &["uninstall", "--purge"],
+    );
+    assert!(purged.status.success(), "{}", stderr(&purged));
+    let said = stdout(&purged);
+    assert!(
+        said.contains(&format!("Removed the personal file {}", personal.display()))
+            && said.contains(&format!(
+                "Left in place, not Owlshift's or still listing what was not removed: {}",
+                data.join("notes.txt").display()
+            )),
+        "{said}"
+    );
+    let left: Vec<String> = fs::read_dir(&data)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    assert_eq!(left, ["notes.txt"]);
+    assert!(!personal.exists());
+}
+
 /// OWL-435: `start` with no daemon running registers the project and starts
 /// the daemon for the session, which outlives `start`, its output in the
 /// data directory; `stop` ends it. Its watch's first clone is refused at
