@@ -16,7 +16,7 @@
 //!
 //! The rest is what those tests play with: the results of [`intake_done`],
 //! [`intake_declaring`] and [`build_asks`], the replies of [`reply_for`],
-//! the harness of [`holding_harness`], a ticket's record ([`record_of`],
+//! the harness of `holding_harness` (Unix), a ticket's record ([`record_of`],
 //! [`asks`]), the event log ([`events`], [`ended_as`]) and a notifier writing to a file
 //! ([`FileNotifier`]).
 
@@ -435,7 +435,7 @@ pub fn build_asks() -> String {
 
 /// Writes in `dir` the reply of `role`'s runs on `ticket` (any ticket when
 /// `None`), its result `result`, for the tests' harness scripts such as
-/// [`holding_harness`].
+/// `holding_harness` (Unix).
 pub fn reply_for(dir: &Path, role: &str, ticket: Option<&str>, result: &str) {
     let name = ticket.map_or_else(|| role.to_owned(), |ticket| format!("{role}-{ticket}"));
     let result_file = dir.join(format!("{name}.json"));
