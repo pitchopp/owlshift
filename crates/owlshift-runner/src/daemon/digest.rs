@@ -147,7 +147,10 @@ pub fn gather(
             .any(|(repo, _)| repo.to_string().eq_ignore_ascii_case(project))
     };
     match why::read_events(EventLog::in_dir(data).path()) {
-        Ok((events, _)) => {
+        Ok((events, bad)) => {
+            // A delivery on a line that is not an event is not counted:
+            // said, as `why` says it.
+            notes.extend(bad.into_iter().map(|why| format!("the event log's {why}")));
             for event in events {
                 let says = |key: &str, value: &str| {
                     event.data.get(key).and_then(Value::as_str) == Some(value)
@@ -653,6 +656,21 @@ mod tests {
         )
         .unwrap();
         assert!(gather(data, &projects, &[], since, now, &mut out).all_paused);
+    }
+
+    #[test]
+    fn gather_says_the_event_log_lines_it_cannot_read() {
+        let data = tempfile::tempdir().unwrap();
+        let data = data.path();
+        fs::write(EventLog::in_dir(data).path(), "{\"torn\": \n").unwrap();
+        let mut out = Vec::new();
+        let summary = gather(data, &[], &[], Timestamp::MIN, Timestamp::MAX, &mut out);
+        assert!(summary.delivered.is_empty());
+        let said = String::from_utf8(out).unwrap();
+        assert!(
+            said.contains("the event log's line 1 is not an event"),
+            "{said}"
+        );
     }
 
     /// A notifier that keeps what it was asked to show, or fails.
