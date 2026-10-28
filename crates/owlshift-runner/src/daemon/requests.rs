@@ -23,7 +23,7 @@ use std::path::{Path, PathBuf};
 use owlshift_contracts::service::{BY_DAEMON, Request};
 
 use super::instance::service_dir;
-use crate::project::ProjectDirs;
+use crate::project::{self, ProjectDirs};
 use crate::{step, watch};
 
 /// The daemon's stop request in `data`.
@@ -133,20 +133,41 @@ pub fn ask_pause(
     request: &Request,
 ) -> io::Result<Option<Option<Request>>> {
     let path = pause_path(data, dirs);
-    let before = standing(&path);
-    step::write_atomically(&path, &request.render())?;
-    Ok(before)
+    under_pause_lock(&path, || {
+        let before = standing(&path);
+        step::write_atomically(&path, &request.render())?;
+        Ok(before)
+    })
 }
 
 /// Removes the pause of `dirs`'s project, or of every project of `data`
 /// when `dirs` is `None`: what stood, `None` when nothing did.
 pub fn lift_pause(data: &Path, dirs: Option<&ProjectDirs>) -> io::Result<Option<Option<Request>>> {
     let path = pause_path(data, dirs);
-    let before = standing(&path);
-    if before.is_some() {
-        remove_if_any(&path)?;
-    }
-    Ok(before)
+    under_pause_lock(&path, || {
+        let before = standing(&path);
+        if before.is_some() {
+            remove_if_any(&path)?;
+        }
+        Ok(before)
+    })
+}
+
+/// Runs `change` of the pause file at `path` holding `<path>.lock`, waited
+/// for a few seconds: every writer and remover of a pause file takes it,
+/// the daemon's included, so a read of what stands and the write or removal
+/// it decides are one step, and the daemon never replaces nor removes a
+/// person's pause written meanwhile. Readers take no lock.
+fn under_pause_lock<T>(path: &Path, change: impl FnOnce() -> io::Result<T>) -> io::Result<T> {
+    let mut lock = path.as_os_str().to_owned();
+    lock.push(".lock");
+    let mut result = None;
+    project::under_lock(Path::new(&lock), || {
+        result = Some(change());
+        Ok(())
+    })
+    .map_err(io::Error::other)?;
+    result.unwrap_or_else(|| Err(io::Error::other("the pause was not changed")))
 }
 
 /// The request the file at `path` holds, when it stands: `None` within for
@@ -160,21 +181,32 @@ fn standing(path: &Path) -> Option<Option<Request>> {
     )
 }
 
-/// Writes the daemon's own pause of `dirs`'s project.
-pub fn write_pause(dirs: &ProjectDirs, request: &Request) -> io::Result<()> {
-    step::write_atomically(&pause_file(dirs), &request.render())
+/// Writes the daemon's own pause of `dirs`'s project unless a pause stands,
+/// so it never replaces one a person wrote, even one written since the
+/// daemon looked: `true` when it wrote it.
+pub fn write_pause(dirs: &ProjectDirs, request: &Request) -> io::Result<bool> {
+    let path = pause_file(dirs);
+    under_pause_lock(&path, || {
+        if standing(&path).is_some() {
+            return Ok(false);
+        }
+        step::write_atomically(&path, &request.render())?;
+        Ok(true)
+    })
 }
 
 /// Removes the pause of `dirs`'s project when it is the daemon's own: one a
-/// person or another command wrote stays. `true` when it removed one.
+/// person or another command wrote stays, even one written since the daemon
+/// looked. `true` when it removed one.
 pub fn remove_own_pause(dirs: &ProjectDirs) -> io::Result<bool> {
-    match pause(dirs) {
+    let path = pause_file(dirs);
+    under_pause_lock(&path, || match standing(&path) {
         Some(Some(request)) if request.by == BY_DAEMON => {
-            remove_if_any(&pause_file(dirs))?;
+            remove_if_any(&path)?;
             Ok(true)
         }
         _ => Ok(false),
-    }
+    })
 }
 
 fn remove_if_any(path: &Path) -> io::Result<()> {
@@ -219,7 +251,8 @@ mod tests {
         assert!(!remove_own_pause(&dirs).unwrap(), "a person's pause stays");
         assert_eq!(pause(&dirs), Some(Some(person.clone())));
         let own = Request::new(BY_DAEMON, Timestamp::now(), "keychain locked");
-        write_pause(&dirs, &own).unwrap();
+        fs::remove_file(pause_file(&dirs)).unwrap();
+        assert!(write_pause(&dirs, &own).unwrap());
         assert!(remove_own_pause(&dirs).unwrap());
         assert_eq!(pause(&dirs), None);
 
@@ -248,11 +281,41 @@ mod tests {
         assert_eq!(lift_pause(data, Some(&dirs)).unwrap(), None);
 
         let own = Request::new(BY_DAEMON, Timestamp::now(), "keychain locked");
-        write_pause(&dirs, &own).unwrap();
+        assert!(write_pause(&dirs, &own).unwrap());
         let person = Request::new(BY_PAUSE, Timestamp::now(), "lunch");
         let replaced = ask_pause(data, Some(&dirs), &person).unwrap();
-        assert_eq!(replaced, Some(Some(own)));
+        assert_eq!(replaced, Some(Some(own.clone())));
+        // The daemon's write after the person's, and its removal: the
+        // person's pause stands through both.
+        assert!(!write_pause(&dirs, &own).unwrap(), "never replaces it");
         assert!(!remove_own_pause(&dirs).unwrap(), "the person's stays");
+        assert_eq!(pause(&dirs), Some(Some(person.clone())));
+        // A write that finds the lock held waits for it, then decides on
+        // what stands then.
+        let lock = {
+            let mut lock = pause_file(&dirs).into_os_string();
+            lock.push(".lock");
+            PathBuf::from(lock)
+        };
+        let held =
+            project::lock_file_within(&lock, std::time::Duration::ZERO, std::time::Duration::ZERO)
+                .unwrap()
+                .unwrap();
+        let daemon = {
+            let (dirs, own) = (dirs.clone(), own.clone());
+            std::thread::spawn(move || write_pause(&dirs, &own).unwrap())
+        };
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        assert!(
+            !daemon.is_finished(),
+            "the daemon's write waits for the lock"
+        );
+        drop(held);
+        assert!(
+            !daemon.join().unwrap(),
+            "and then leaves the person's pause"
+        );
+        assert_eq!(pause(&dirs), Some(Some(person.clone())));
         assert_eq!(
             operator_pause(&dirs),
             Some((PauseScope::Project, Some(person.clone())))
