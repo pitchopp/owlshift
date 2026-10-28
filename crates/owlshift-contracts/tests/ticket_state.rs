@@ -541,6 +541,79 @@ fn a_ticket_held_admits_nothing_at_its_dispatch_and_reads_format_1_as_admitted()
     assert!(TicketHeld::parse(&admitting.to_string()).is_err());
 }
 
+/// OWL-461: a record admitted without a plan narrows, and only it; its
+/// re-admission replaces its zones and resources, keeps its files with
+/// those given, its dispatch time and no widening's time, and goes whole
+/// for no zone or past its bounds.
+#[test]
+fn a_ticket_held_without_a_plan_is_admitted_again_in_place_of_what_it_held() {
+    let at = |minute: i64| -> jiff::Timestamp {
+        jiff::Timestamp::from_second(1_790_000_000 + minute * 60).unwrap()
+    };
+    let owned = |names: &[&str]| names.iter().map(|n| (*n).to_owned()).collect::<Vec<_>>();
+    let mut old = TicketHeld::parse(
+        &json!({
+            "format": 1,
+            "zones": ["app", "web"],
+            "resources": ["migrations"],
+            "dispatched_at": at(0).to_string(),
+        })
+        .to_string(),
+    )
+    .unwrap();
+    old.widen(owned(&["app/b.rs"]), at(1));
+    assert!(old.narrows());
+    assert!(!TicketHeld::dispatched(at(0)).narrows());
+    let mut planned = admitted(&["app/a.rs"], &[], at(0));
+    planned.plan_sha256 = Some("a".repeat(64));
+    assert!(!planned.narrows());
+
+    let hash = "b".repeat(64);
+    let mut narrowed = old.clone();
+    narrowed.readmit(
+        owned(&["app/a.rs", "docs"]),
+        Vec::new(),
+        owned(&["web/c.rs", "app/b.rs"]),
+        Some(hash.clone()),
+        at(2),
+    );
+    assert_eq!(
+        (
+            &narrowed.zones,
+            &narrowed.resources,
+            &narrowed.files,
+            narrowed.admitted_at,
+            narrowed.dispatched_at,
+            &narrowed.widened_at
+        ),
+        (
+            &owned(&["app/a.rs", "docs"]),
+            &Vec::new(),
+            &owned(&["app/b.rs", "web/c.rs"]),
+            Some(at(2)),
+            Some(at(0)),
+            &vec![at(1)]
+        )
+    );
+    assert_eq!(narrowed.plan_sha256, Some(hash.clone()));
+    assert!(!narrowed.narrows());
+    assert_eq!(TicketHeld::parse(&narrowed.render()).unwrap(), narrowed);
+    // No zone, or files past its bounds: the whole repository, no file.
+    let mut whole = old.clone();
+    whole.readmit(
+        Vec::new(),
+        Vec::new(),
+        owned(&["x.rs"]),
+        Some(hash.clone()),
+        at(3),
+    );
+    assert!(whole.whole() && whole.files.is_empty(), "{whole:?}");
+    let many: Vec<String> = (0..=MAX_HELD_FILES).map(|n| format!("f{n:05}")).collect();
+    let mut past = old.clone();
+    past.readmit(owned(&["app/a.rs"]), Vec::new(), many, Some(hash), at(4));
+    assert!(past.whole() && past.files.is_empty(), "{past:?}");
+}
+
 /// OWL-449: the overlaps a ticket tolerates under `rebase`, one per
 /// sibling, by identifier, their paths sorted, each once, the first time
 /// kept; read back, valid against the schema; refused unsorted, empty or

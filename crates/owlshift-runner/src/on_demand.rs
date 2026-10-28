@@ -2045,16 +2045,35 @@ impl OnDemand<'_> {
             let hash = design::plan_sha256(&given.plan);
             (given.plan, hash)
         });
+        // A record admitted without a plan is narrowed to the plan's files
+        // with every file its branch changed, read now (OWL-461): a read
+        // that fails narrows nothing, and the next Build tries again.
+        let branch = if before.narrows() && plan.is_some() {
+            let read = self.read_branch_head(p).and_then(|head| match head {
+                Some(head) => {
+                    held::changed_files(&self.executor.git, &p.checkout, &p.base.commit, &head)
+                }
+                None => Ok(Vec::new()),
+            });
+            match read {
+                Ok(files) => Some(files),
+                Err(reason) => return self.narrowing_unread(p, &reason, sink),
+            }
+        } else {
+            None
+        };
         let Some(mut next) = held::at_build(
             Some(&before),
             plan.as_ref().map(|(plan, hash)| (plan, hash.as_str())),
             p.intake.as_ref(),
             &labels,
+            branch.as_deref(),
             &named,
             (self.clock)(),
         ) else {
             return Ok(());
         };
+        let dropped = held::added(&p.ticket, &next, &before, &named);
         let added = held::added(&p.ticket, &before, &next, &named);
         let outside = match (added.is_empty(), p.outside.take()) {
             (true, _) => None,
@@ -2110,8 +2129,17 @@ impl OnDemand<'_> {
                 });
             }
         }
+        let kept = next.files.len();
         p.held = Some(next);
         self.keep(p, state)?;
+        if !dropped.is_empty() {
+            sink.emit(
+                &p.ticket,
+                None,
+                EventKind::Decision,
+                held::narrowed_event(&dropped, kept),
+            );
+        }
         for (sibling, paths) in &recorded.kept {
             sink.emit(
                 &p.ticket,
@@ -2120,6 +2148,28 @@ impl OnDemand<'_> {
                 held::overlap_event("admission", sibling, paths),
             );
         }
+        Ok(())
+    }
+
+    /// A narrowing whose branch could not be read (OWL-461): nothing is
+    /// narrowed and the Build goes on holding what it held, a `warning`
+    /// (`narrowing_unread`, the reason) telling it; the next Build tries
+    /// again.
+    fn narrowing_unread(
+        &self,
+        p: &Prepared,
+        reason: &str,
+        sink: &mut EventSink<'_>,
+    ) -> Result<(), Stop> {
+        sink.emit(
+            &p.ticket,
+            None,
+            EventKind::Warning,
+            data([
+                ("what", json!("narrowing_unread")),
+                ("reason", json!(reason)),
+            ]),
+        );
         Ok(())
     }
 

@@ -59,6 +59,21 @@ pub struct Folded {
     pub history: BTreeMap<TicketId, Vec<Waiting>>,
     /// People's tickets whose latest event is the `zones_unknown` warning.
     pub people: BTreeMap<TicketId, Timestamp>,
+    /// Each narrowing of a ticket's held set at its Build (OWL-461), oldest
+    /// first.
+    pub narrowed: BTreeMap<TicketId, Vec<Narrowed>>,
+}
+
+/// A ticket's held set narrowed to its plan's files at its Build (OWL-461;
+/// architecture section 5, "Refs from before OWL-428"): a `decision` event,
+/// `held` = `narrowed`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Narrowed {
+    pub at: Timestamp,
+    /// The resources dropped, as the report says them.
+    pub dropped: Vec<String>,
+    /// The files its branch changed that it keeps.
+    pub count: u64,
 }
 
 /// Folds `events`, oldest first, for the project `project`.
@@ -77,6 +92,25 @@ pub fn fold(events: &[Event], project: &str) -> Folded {
             folded.people.insert(ticket.clone(), event.at);
         } else {
             folded.people.remove(ticket);
+        }
+        if event.kind == EventKind::Decision
+            && event.data.get("held").and_then(Value::as_str) == Some("narrowed")
+        {
+            let dropped = event
+                .data
+                .get("dropped")
+                .and_then(Value::as_array)
+                .map_or_else(Vec::new, |all| all.iter().map(resource_text).collect());
+            let count = event.data.get("count").and_then(Value::as_u64);
+            folded
+                .narrowed
+                .entry(ticket.clone())
+                .or_default()
+                .push(Narrowed {
+                    at: event.at,
+                    dropped,
+                    count: count.unwrap_or(0),
+                });
         }
         if let Some(waiting) = waiting(event, ticket) {
             folded
@@ -494,6 +528,16 @@ pub fn render(report: &Report) -> String {
             }
             for wait in history {
                 let _ = writeln!(out, "  {} waits: {}", wait.at, phrase(wait));
+            }
+            for narrowed in folded.narrowed.get(ticket).map_or(&[][..], Vec::as_slice) {
+                let _ = writeln!(
+                    out,
+                    "  {} narrowed at its Build to its plan's files: dropped {}; keeps the {} \
+                     files its branch changed",
+                    narrowed.at,
+                    narrowed.dropped.join(", "),
+                    narrowed.count
+                );
             }
             match folded.current.get(ticket) {
                 Some(wait) => {
@@ -1004,6 +1048,54 @@ mod tests {
         assert_eq!(
             phrase(wait),
             "the open pull requests reached their cap (3 of 3)"
+        );
+    }
+
+    /// OWL-461: a narrowing at a ticket's Build is told by `why` for that
+    /// ticket, with its waits, what it dropped and the files it keeps; it is
+    /// no wait, so the ticket's current wait stands.
+    #[test]
+    fn a_narrowing_is_told_for_its_ticket() {
+        let id = TicketId::new("LOC-1030").unwrap();
+        let events = [
+            waits(
+                "2026-10-26T09:00:00Z",
+                "LOC-1030",
+                data([("watch", json!("waits")), ("reason", json!("slot"))]),
+            ),
+            waits(
+                "2026-10-26T10:00:00Z",
+                "LOC-1030",
+                crate::held::narrowed_event(
+                    &[
+                        owlshift_core::resource::Resource::Zone("backend/leases".to_owned()),
+                        owlshift_core::resource::Resource::Named("migrations".to_owned()),
+                    ],
+                    3,
+                ),
+            ),
+        ];
+        let folded = fold(&events, "o/r");
+        assert!(folded.current.contains_key(&id));
+        let report = Report {
+            project: "o/r".to_owned(),
+            only: Some(id.clone()),
+            folded,
+            stages: HashMap::new(),
+            quarantined: false,
+            notes: Vec::new(),
+            limits: Vec::new(),
+            slots: None,
+            bases: Vec::new(),
+            overlaps: Vec::new(),
+        };
+        let text = render(&report);
+        assert!(
+            text.contains(
+                "  2026-10-26T10:00:00Z narrowed at its Build to its plan's files: dropped zone \
+                 `backend/leases`, resource `migrations`; keeps the 3 files its branch changed\n"
+            ),
+            "{text}"
         );
     }
 
