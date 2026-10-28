@@ -1030,6 +1030,41 @@ fn a_concurrent_runs_entry_is_left_out_when_the_check_is_told_of_it() {
     );
 }
 
+/// Another ticket's worktree removed with its entry, then made again at the
+/// same path, as its reset before a rebase run does while this run is in
+/// flight (OWL-457): left out when the check is told of the entry, the one
+/// that ticket's run file names, and a breach when it is not.
+#[test]
+fn a_concurrent_runs_entry_removed_and_made_again_is_left_out_when_told_of_it() {
+    let (f, other) = with_other();
+    let before = Snapshot::take(&f.git, &f.main, &f.worktree, BRANCH).unwrap();
+    let check = |told: &Concurrent| {
+        before
+            .check_among(&f.git, &f.main, &f.worktree, BRANCH, &|| Ok(told.clone()))
+            .violations
+    };
+    let named = Concurrent {
+        entries: [OTHER.to_owned()].into(),
+        ..Concurrent::default()
+    };
+    fs::remove_dir_all(f.worktree.with_file_name("other")).unwrap();
+    fs::remove_dir_all(&other).unwrap();
+    assert_eq!(check(&named), []);
+    let found = check(&Concurrent::default());
+    assert!(
+        found
+            .iter()
+            .any(|violation| matches!(violation, Violation::WorktreeEntries(_))),
+        "{found:?}"
+    );
+    f.main_git(&["worktree", "add", "--quiet", "../other", OTHER]);
+    assert!(
+        other.join("HEAD").exists(),
+        "made again under the same name"
+    );
+    assert_eq!(check(&named), []);
+}
+
 /// An entry made after the snapshot is a run's when the check is told so,
 /// and a breach when it is not; and a run that registers between the check's
 /// two answers, with its entry made before the second one, is not flagged

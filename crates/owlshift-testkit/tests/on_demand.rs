@@ -9242,6 +9242,43 @@ fn a_trivial_conflict_is_rebased_on_the_fast_tier_and_pushed_by_the_runner() {
     assert_eq!(bench.remote_branch().unwrap(), rebased);
 }
 
+/// A rebase pass whose worktree reset stops before its first run moves no
+/// stage and starts no run (OWL-457). A `.lock` beside the ticket's branch
+/// in Owlshift's checkout makes the reset's branch move refuse. It stands
+/// in for the reset's busy answer, the project's lock not had within its
+/// one-minute wait, which takes the same path (`before` fails, nothing is
+/// shown) but which no test can wait for. The next pass rebases from what
+/// the refused reset left, its worktree's folder and entry gone.
+#[test]
+fn a_rebase_pass_whose_reset_refuses_moves_no_stage() {
+    let bench = delivered_with_rules();
+    let delivered_events = bench.events().len();
+    let main = bench.merge_into_main(&[("AGENTS.md", AGENTS_MERGED)]);
+    bench.github.followed.lock().unwrap().mergeable = "CONFLICTING";
+    let checkout = bench.dirs().checkout();
+    let lock = checkout.join(format!(".git/refs/heads/{BRANCH}.lock"));
+    fs::create_dir_all(lock.parent().unwrap()).unwrap();
+    fs::write(&lock, "").unwrap();
+    let (outcome, printed) = bench.continue_ticket(Vec::new());
+    assert!(
+        matches!(&outcome, Err(Stop::Refused(why)) if why.contains("moving the ticket's branch")),
+        "{outcome:?}\n{printed}"
+    );
+    assert_eq!(stage_moves(&bench, delivered_events), Vec::<String>::new());
+    assert_eq!(bench.stage(), "In Review");
+    let events = &bench.events()[delivered_events..];
+    assert!(data_of(events, EventKind::Decision, "trivial").is_empty());
+    assert!(!bench.worktree().exists());
+
+    fs::remove_file(&lock).unwrap();
+    let rebase = rebase_in(&bench, main.clone(), vec![("AGENTS.md", AGENTS_RESOLVED)]);
+    let (outcome, printed) =
+        bench.continue_during(vec![bench.reply(None, Some(REBASED))], vec![rebase]);
+    outcome.unwrap_or_else(|stop| panic!("{stop}\n{printed}"));
+    assert_eq!(stage_moves(&bench, delivered_events), ["working", "review"]);
+    assert!(is_ancestor(&bench, &main, &bench.remote_branch().unwrap()));
+}
+
 /// A conflict that is not trivial, the delivery changing a file another
 /// merge removed, goes to the Build routing at once (OWL-210). The base moving again during the
 /// run changes nothing of what the rebase was onto: the ref keeps the base

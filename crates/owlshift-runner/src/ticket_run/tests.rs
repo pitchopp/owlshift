@@ -251,6 +251,54 @@ fn a_branch_moved_outside_the_runner_is_found_at_the_next_start() {
     assert!(matches!(opened, Err(RunFault::Breach(_))), "{opened:?}");
 }
 
+/// The reset before a rebase run removes the entry the run file names and
+/// no other (OWL-457): none when it names none; a kept worktree on another
+/// entry, or a name that is not one folder of `worktrees/`, is a breach;
+/// the removal leaves another entry as it was, and one already gone is no
+/// error.
+#[test]
+fn a_reset_removes_the_entry_its_run_file_names_and_no_other() {
+    let bench = Bench::new();
+    let owl = ticket("OWL-3");
+    let checkout = bench.dirs.checkout();
+    let worktree = checkout.with_file_name("owl-3");
+    let reset = |owl: &TicketId| {
+        let lock = bench.dirs.ticket_lock(owl).unwrap().unwrap();
+        reset_entry(&bench.dirs, &checkout, &lock, owl, &worktree)
+    };
+    bench.open(&owl).unwrap();
+    bench.run(&["worktree", "add", "--quiet", "-b", "a", "../owl-3"]);
+    bench.run(&["worktree", "add", "--quiet", "-b", "b", "../other"]);
+    assert_eq!(reset(&owl).unwrap(), None, "the run file names none");
+
+    let mut run = bench.run_file(&owl);
+    run.entry = Some("other".to_owned());
+    bench.keep(&run);
+    assert!(matches!(reset(&owl), Err(RunFault::Breach(_))));
+    run.entry = Some("../other".to_owned());
+    bench.keep(&run);
+    fs::remove_dir_all(&worktree).unwrap();
+    assert!(matches!(reset(&owl), Err(RunFault::Breach(_))));
+    run.entry = Some("owl-3".to_owned());
+    bench.keep(&run);
+    assert_eq!(reset(&owl).unwrap().as_deref(), Some("owl-3"));
+
+    let entries = checkout.join(".git/worktrees");
+    let other = fs::read(entries.join("other/HEAD")).unwrap();
+    remove_entry(&checkout, "owl-3").unwrap();
+    remove_entry(&checkout, "owl-3").unwrap();
+    assert!(!entries.join("owl-3").exists());
+    assert_eq!(fs::read(entries.join("other/HEAD")).unwrap(), other);
+    // A link in its place is removed, never followed.
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::symlink(entries.join("other"), entries.join("owl-3")).unwrap();
+        remove_entry(&checkout, "owl-3").unwrap();
+        assert!(fs::symlink_metadata(entries.join("owl-3")).is_err());
+        assert_eq!(fs::read(entries.join("other/HEAD")).unwrap(), other);
+    }
+}
+
 /// A ticket's branch made a symbolic ref to another branch at the same
 /// commit, through which the ticket's worktree would commit into that one,
 /// is a breach at the next start (Codex P1 on #377); taking the run files

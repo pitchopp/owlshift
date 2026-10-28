@@ -6928,16 +6928,21 @@ impl OnDemand<'_> {
         run: &RepairRun<'_>,
         sink: &mut EventSink<'_>,
     ) -> Result<(RepairDone, Vec<Followup>), Stop> {
-        // Working from the runs' start, until the repair's end moves it
-        // back (OWL-259).
-        self.show(&p.ticket, None, VisibleStage::Working, sink);
-        p.repairing = true;
         let current = person(p.current()?, &p.found);
         let mut gathered = Gathered::default();
         let mut attempt = 0u32;
+        let mut shown = false;
         loop {
             attempt += 1;
             (run.before)(p, attempt, sink)?;
+            // Working from the runs' start, once the first attempt's `before`
+            // was made, so a pass that starts no run leaves the stage as it
+            // is (OWL-457); until the repair's end moves it back (OWL-259).
+            if !shown {
+                self.show(&p.ticket, None, VisibleStage::Working, sink);
+                p.repairing = true;
+                shown = true;
+            }
             let comments = self.comments(&p.ticket)?;
             let mut brief = self.brief(
                 p,
@@ -7193,8 +7198,13 @@ impl OnDemand<'_> {
                 &*build_run
             }
         };
+        // Whether the last attempt's reset was made: a reset that failed is
+        // not made again once the runs stop (OWL-457).
+        let reset = std::cell::Cell::new(false);
         let before = |p: &Prepared, attempt: u32, sink: &mut EventSink<'_>| {
+            reset.set(false);
             self.reset_worktree(p, &pushed_id)?;
+            reset.set(true);
             sink.emit(
                 &p.ticket,
                 None,
@@ -7267,14 +7277,17 @@ impl OnDemand<'_> {
             Err(stop) => {
                 // The ticket's branch goes back to Owlshift's last push, so a
                 // fix run that comes next starts from it; a breach's worktree
-                // is left for the person who looks.
-                if !matches!(
-                    stop,
-                    Stop::Parked {
-                        reason: ParkReason::IsolationBreach,
-                        ..
-                    }
-                ) {
+                // is left for the person who looks, and a reset that failed,
+                // which stopped the runs, is not tried again.
+                if reset.get()
+                    && !matches!(
+                        stop,
+                        Stop::Parked {
+                            reason: ParkReason::IsolationBreach,
+                            ..
+                        }
+                    )
+                {
                     let _ = self.reset_worktree(p, &pushed_id);
                 }
                 return Err(stop);
@@ -7348,27 +7361,44 @@ impl OnDemand<'_> {
     /// The ticket's worktree made anew at `pushed` before a rebase attempt
     /// (OWL-210), so no attempt starts from an earlier one's rebase, its
     /// conflicts or a detached head: the worktree's folder is removed by
-    /// the file system alone, no git running in it, then the dedicated
-    /// checkout forgets it and moves the ticket's branch to `pushed`; the
-    /// executor adds the worktree again on that branch.
+    /// the file system alone, no git running in it, then its entry in the
+    /// dedicated checkout, the one its run file names and that one alone
+    /// ([`ticket_run::reset_entry`]), and the ticket's branch is moved to
+    /// `pushed`; the executor adds the worktree again on that branch.
+    ///
+    /// A run in flight's check leaves that entry out, the ticket's lock
+    /// being held for the whole command and the run file's generation
+    /// raised around the removal, so the reset waits for no other run
+    /// (OWL-457). It prunes only while no obligation stands, since `worktree
+    /// prune` removes other entries such a check reads (OWL-400); a run file
+    /// that names no entry leaves none known to be the ticket's alone, so
+    /// the reset then waits for no obligation to stand, as before.
     fn reset_worktree(&self, p: &Prepared, pushed: &CommitId) -> Result<(), Stop> {
-        // A worktree's removal is one of the project's sections (OWL-401),
-        // so no worktree is made meanwhile.
-        let _section = self.section()?;
-        // `worktree prune` removes entries a run in flight's check reads: it
-        // waits for no obligation to stand, the ticket tried again later,
-        // before anything is removed (OWL-400).
-        if self.dirs.obligations_stand() {
-            return Err(Stop::Busy(self.dirs.root().to_owned()));
-        }
+        let entry = ticket_run::reset_entry(
+            self.dirs,
+            &p.checkout,
+            &p._ticket_lock,
+            &p.ticket,
+            &p.worktree,
+        )
+        .map_err(|fault| self.run_fault(&p.ticket, fault))?;
+        // The folder before the project's section: no other run reads it,
+        // and one with build output takes a while to remove.
         if fs::symlink_metadata(&p.worktree).is_ok() {
             fs::remove_dir_all(&p.worktree)
                 .map_err(|e| refused("removing the ticket's worktree before a rebase run", e))?;
         }
+        // The entry's removal is one of the project's sections (OWL-401), so
+        // no worktree is made meanwhile.
+        let _section = self.section()?;
+        let idle = !self.dirs.obligations_stand();
+        if entry.is_none() && !idle {
+            return Err(Stop::Busy(self.dirs.root().to_owned()));
+        }
         let git = &self.executor.git;
-        git.run(&p.checkout, &["worktree", "prune"])
-            .map_err(|e| refused("pruning the ticket's worktree", e))?;
         let branch = format!("refs/heads/{}", p.branch);
+        // Within the move, so the run file's generation is raised before and
+        // after the entry goes, under the ticket's lock.
         ticket_run::move_branch(
             git,
             self.dirs,
@@ -7376,11 +7406,21 @@ impl OnDemand<'_> {
             &p._ticket_lock,
             &p.ticket,
             Some(pushed.as_str()),
-            || git.run(&p.checkout, &["update-ref", &branch, pushed.as_str()]),
+            || {
+                if let Some(entry) = &entry {
+                    ticket_run::remove_entry(&p.checkout, entry)
+                        .map_err(|e| refused("removing the ticket's worktree entry", e))?;
+                }
+                if idle {
+                    git.run(&p.checkout, &["worktree", "prune"])
+                        .map_err(|e| refused("pruning the ticket's worktree", e))?;
+                }
+                git.run(&p.checkout, &["update-ref", &branch, pushed.as_str()])
+                    .map_err(|e| refused("moving the ticket's branch to its last push", e))
+                    .map(drop)
+            },
         )
         .map_err(|fault| self.run_fault(&p.ticket, fault))?
-        .map_err(|e| refused("moving the ticket's branch to its last push", e))?;
-        Ok(())
     }
 
     /// The ticket's branch's head in the dedicated checkout, when it has one.

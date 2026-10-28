@@ -184,10 +184,66 @@ fn refresh_in(bench: &Bench, onto: String) -> During {
 /// instead, and a merge only once the rebased head reads green twice.
 #[test]
 fn a_moved_base_gets_a_refresh_rebase_then_two_green_reads_before_the_merge() {
+    refresh_then_merge(&merging("all"));
+}
+
+/// LOC-1454 on the bench (OWL-457): the same moved base while two other
+/// tickets' runs are in flight throughout, their obligations standing and
+/// their locks held, beside a third ticket's entry whose folder is gone. The
+/// rebase runs and the merge follows with no one waiting for them to end,
+/// and the third ticket's entry, which a run in flight's check reads, is
+/// left as it was: no `worktree prune` ran.
+#[test]
+fn a_moved_base_is_rebased_and_merged_while_other_runs_are_in_flight() {
     let bench = merging("all");
+    let dirs = bench.dirs();
+    let in_flight: Vec<_> = [
+        ("DEMO-2", "20261025T210000Z"),
+        ("DEMO-3", "20261025T210100Z"),
+    ]
+    .into_iter()
+    .map(|(id, run)| {
+        let id = TicketId::new(id).unwrap();
+        let lock = dirs.ticket_lock(&id).unwrap().expect("its lock is free");
+        owlshift_runner::ticket_run::write_obligation(
+            &dirs,
+            Some(&id),
+            run,
+            &format!("Run {run} of {id}"),
+        )
+        .unwrap();
+        lock
+    })
+    .collect();
+    let checkout = dirs.checkout();
+    let stale = bench.tmp.path().join("stale");
+    let stale_path = stale.to_str().unwrap();
+    let add = [
+        "worktree",
+        "add",
+        "--quiet",
+        "-b",
+        "owlshift/demo-4",
+        stale_path,
+    ];
+    bench.env.run(&checkout, &add).unwrap();
+    fs::remove_dir_all(&stale).unwrap();
+    let entry = checkout.join(".git/worktrees/stale");
+    let kept = fs::read(entry.join("gitdir")).unwrap();
+
+    refresh_then_merge(&bench);
+    assert!(dirs.obligations_stand());
+    assert_eq!(fs::read(entry.join("gitdir")).unwrap(), kept, "pruned");
+    drop(in_flight);
+}
+
+/// A moved base's refresh rebase run, then the merge once the rebased head
+/// read green twice, played by `watch` on `bench`, a delivered ticket of a
+/// project whose `[forge] merge` is `all`.
+fn refresh_then_merge(bench: &Bench) {
     let first_push = bench.remote_branch().unwrap();
     let main = bench.merge_into_main(&[("OTHER.md", "Another ticket's file.\n")]);
-    let refresh = refresh_in(&bench, main.clone());
+    let refresh = refresh_in(bench, main.clone());
     let github = bench.github.clone();
     let clock = bench.clock.clone();
     let mut pushed_at: Option<u32> = None;
@@ -217,12 +273,12 @@ fn a_moved_base_gets_a_refresh_rebase_then_two_green_reads_before_the_merge() {
         (&json!(true), &json!(main))
     );
     let head = bench.remote_branch().unwrap();
-    assert!(is_ancestor(&bench, &main, &head));
+    assert!(is_ancestor(bench, &main, &head));
     assert!(pushed_at.is_some(), "{lines}");
     let merges = github.merges.lock().unwrap().clone();
     assert_eq!(merges, [json!({ "sha": head, "merge_method": "squash" })]);
-    assert_eq!(merged_comments(&bench).len(), 1);
-    assert_ended_merged(&bench);
+    assert_eq!(merged_comments(bench).len(), 1);
+    assert_ended_merged(bench);
 }
 
 /// S18's refusals: one that may pass is tried again at the next pass; one

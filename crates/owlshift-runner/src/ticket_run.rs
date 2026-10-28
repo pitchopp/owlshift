@@ -653,19 +653,83 @@ pub fn open(
     kept_entry: Option<&str>,
 ) -> Result<TicketRun, RunFault> {
     let mut run = load(git, dirs, checkout, ticket, kept_entry)?;
-    match (&run.entry, kept_entry) {
-        (Some(recorded), Some(kept)) if recorded != kept => {
-            return Err(RunFault::Breach(format!(
-                "the worktree of {ticket} is the entry {kept}, where its run file names {recorded}"
-            )));
-        }
-        (None, Some(kept)) => {
-            run.entry = Some(kept.to_owned());
-            save(dirs, &mut run).map_err(|e| RunFault::Failed(e.to_string()))?;
-        }
-        _ => {}
+    same_entry(ticket, run.entry.as_deref(), kept_entry)?;
+    if let (None, Some(kept)) = (&run.entry, kept_entry) {
+        run.entry = Some(kept.to_owned());
+        save(dirs, &mut run).map_err(|e| RunFault::Failed(e.to_string()))?;
     }
     Ok(run)
+}
+
+/// The kept worktree's entry, `kept`, must be the one the run file of
+/// `ticket` names, `recorded`, when both are known: a difference is a
+/// breach ([`open`], [`reset_entry`]).
+fn same_entry(
+    ticket: &TicketId,
+    recorded: Option<&str>,
+    kept: Option<&str>,
+) -> Result<(), RunFault> {
+    match (recorded, kept) {
+        (Some(recorded), Some(kept)) if recorded != kept => Err(RunFault::Breach(format!(
+            "the worktree of {ticket} is the entry {kept}, where its run file names {recorded}"
+        ))),
+        _ => Ok(()),
+    }
+}
+
+/// The entry of `ticket`'s worktree that its reset before a rebase run
+/// removes (OWL-457), under its lock: the one its run file names, which a
+/// sibling's check leaves out while that lock is held or once the run
+/// file's generation moved ([`Siblings::concurrent`]), so no run in flight
+/// takes its removal for a breach. The worktree at `worktree`, when its
+/// folder is there, must name the same one, as at the step's start
+/// ([`open`]). `None` when the run file names none: no entry is then known
+/// to be the ticket's alone.
+pub fn reset_entry(
+    dirs: &ProjectDirs,
+    checkout: &Path,
+    _lock: &TicketLock,
+    ticket: &TicketId,
+    worktree: &Path,
+) -> Result<Option<String>, RunFault> {
+    let recorded = read_run(dirs, ticket)
+        .map_err(|why| RunFault::Breach(format!("the run file of {ticket} cannot be read: {why}")))?
+        .and_then(|run| run.entry);
+    let kept = fs::symlink_metadata(worktree)
+        .ok()
+        .and_then(|_| entry_of(checkout, worktree));
+    same_entry(ticket, recorded.as_deref(), kept.as_deref())?;
+    match recorded {
+        Some(name) if !is_entry_name(&name) => Err(RunFault::Breach(format!(
+            "the run file of {ticket} names the entry {name:?}, which is not a folder of \
+             worktrees/"
+        ))),
+        recorded => Ok(recorded),
+    }
+}
+
+/// Whether `name` is one plain path component, as an entry of `worktrees/`.
+fn is_entry_name(name: &str) -> bool {
+    let mut parts = Path::new(name).components();
+    matches!(
+        (parts.next(), parts.next()),
+        (Some(std::path::Component::Normal(part)), None) if part == name
+    )
+}
+
+/// Removes the entry `name` from the common git folder of `checkout`
+/// (`.git/worktrees/<name>`) by the file system alone, as `git worktree
+/// prune` removes one, and that one only (OWL-457): a link there is
+/// removed, never followed, and an entry already gone is no error.
+/// `name` is [`reset_entry`]'s.
+pub fn remove_entry(checkout: &Path, name: &str) -> io::Result<()> {
+    let path = checkout.join(".git").join("worktrees").join(name);
+    match fs::symlink_metadata(&path) {
+        Ok(meta) if meta.is_dir() => fs::remove_dir_all(&path),
+        Ok(_) => fs::remove_file(&path),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
+    }
 }
 
 /// The guard of a write of a ticket's ref through its run file
