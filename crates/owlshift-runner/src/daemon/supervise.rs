@@ -391,6 +391,18 @@ impl Daemon<'_> {
                 .as_deref()
                 .map(|line| line.strip_prefix("owlshift: ").unwrap_or(line).to_owned())
                 .unwrap_or_else(|| "its watch could not start".to_owned());
+            // Recorded, so `owlshift status` never reads the watch as
+            // running (OWL-438).
+            self.event(
+                &slot.repo,
+                EventKind::Decision,
+                data([
+                    ("service", json!("watch_ended")),
+                    ("end", json!(end)),
+                    ("asked", json!(false)),
+                    ("unservable", json!(reason)),
+                ]),
+            );
             self.pause(slot, &reason, out);
             return;
         }

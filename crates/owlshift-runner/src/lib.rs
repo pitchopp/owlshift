@@ -44,6 +44,7 @@ pub mod rules;
 pub mod secrets;
 pub mod served;
 pub mod slots;
+pub mod status;
 pub mod step;
 pub mod system;
 pub mod ticket_ref;

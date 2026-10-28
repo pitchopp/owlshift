@@ -5,7 +5,9 @@ mod forget_cmd;
 mod gate_cmd;
 mod init_cmd;
 mod logs_cmd;
+mod pause_cmd;
 mod service_cmd;
+mod status_cmd;
 mod unquarantine_cmd;
 mod why_cmd;
 
@@ -163,6 +165,31 @@ enum Command {
         #[arg(long, conflicts_with = "forget")]
         at_login: bool,
     },
+    /// Pause every project of this machine, or only OWNER/REPO: from each
+    /// watch's next pass, no ticket is dispatched and no step starts, nor a
+    /// merge on green; the steps under way finish, and answers, pull
+    /// requests and stages are still read. The service keeps running.
+    Pause {
+        /// Pause only this project, such as acme/web.
+        #[arg(value_name = "OWNER/REPO")]
+        repo: Option<String>,
+        /// Why, shown by `owlshift status` and the digest.
+        #[arg(long, value_name = "TEXT")]
+        reason: Option<String>,
+    },
+    /// Lift the pause of every project of this machine, or of OWNER/REPO
+    /// only: each watch goes on at its next pass.
+    Resume {
+        /// Lift only this project's pause, such as acme/web.
+        #[arg(value_name = "OWNER/REPO")]
+        repo: Option<String>,
+    },
+    /// Say what the background service serves and does: the daemon, each
+    /// served project's watch (running, restarting and why, paused and why,
+    /// draining) and the file it runs on, the tickets waiting for a person,
+    /// the steps under way, each harness's usage and reset, the latest
+    /// digest. Read only, takes no lock.
+    Status,
     /// Remove what Owlshift installed on this machine, as its install
     /// manifest lists it: the service at login and the keychain entries
     /// `owlshift init` stored. A daemon that runs is stopped first, its runs
@@ -313,6 +340,9 @@ fn main() -> ExitCode {
         Command::Why { ticket } => why_cmd::run(&config, ticket.as_deref()),
         Command::Start { at_login } => service_cmd::start(&config, at_login),
         Command::Stop { forget, at_login } => service_cmd::stop(&config, forget, at_login),
+        Command::Pause { repo, reason } => pause_cmd::pause(repo.as_deref(), reason.as_deref()),
+        Command::Resume { repo } => pause_cmd::resume(repo.as_deref()),
+        Command::Status => status_cmd::run(&config),
         Command::Uninstall { purge } => service_cmd::uninstall(purge),
         Command::Daemon => service_cmd::daemon(&system, &config),
         Command::Logs {
@@ -393,6 +423,12 @@ mod tests {
             &["gate"],
             &["forget", "OWL-1"],
             &["unquarantine"],
+            // OWL-438.
+            &["pause"],
+            &["pause", "acme/web", "--reason", "lunch"],
+            &["resume"],
+            &["resume", "acme/web"],
+            &["status"],
         ] {
             assert_eq!(of(args), None, "{args:?}");
         }

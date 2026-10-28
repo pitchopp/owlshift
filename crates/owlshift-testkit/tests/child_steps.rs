@@ -862,6 +862,94 @@ fn a_drain_lets_the_step_under_way_finish() {
     assert!(step::leftovers(&dirs).is_empty());
 }
 
+/// OWL-438's acceptance, S12's pause: DEMO-1's intake, in a child, writes
+/// the project's pause, then ends done a second later: its INTAKE is kept,
+/// and DEMO-2, admitted too, starts nothing while the pause stands, nor once
+/// it is swapped for the machine's pause. Once that is removed, the next
+/// pass takes DEMO-2 in. Each pause is told once, then its lift.
+#[cfg(unix)]
+#[test]
+fn a_pause_lets_the_step_under_way_finish_and_starts_nothing_until_resumed() {
+    use owlshift_contracts::event::EventKind;
+    use owlshift_runner::daemon::requests;
+    use owlshift_testkit::step_child::events;
+
+    let s = setup(None);
+    let plays = s.tmp.path().join("plays");
+    fs::create_dir_all(&plays).unwrap();
+    fs::write(plays.join("hold"), "").unwrap();
+    let dirs = s.project.dirs();
+    let pause = requests::pause_file(&dirs);
+    let machine = requests::machine_pause_file(&s.project.data);
+    // Only DEMO-1's intake writes it: the hold goes with it.
+    let before = format!("touch '{}'; rm \"$dir/hold\"", pause.display());
+    let mut project = s.project.clone();
+    project.harness = holding_harness(&plays, Path::new(FAKE), "intake", &before, "sleep 1");
+    project.add_ticket("DEMO-2", &["agent"], "");
+    project.save(&s.file);
+    let demo2 = TicketId::new("DEMO-2").unwrap();
+    let (mut paused_passes, mut started_while_paused) = (0, false);
+    let lines = drain_every(&project, &children(&s.file), POLL_INTERVAL, |pass| {
+        if pause.exists() || machine.exists() {
+            started_while_paused |= dirs.runs(&demo2).exists();
+            if record_of(&project, TICKET).is_some_and(|record| record.intake.is_some()) {
+                paused_passes += 1;
+            }
+            match paused_passes {
+                3 => {
+                    fs::remove_file(&pause).unwrap();
+                    fs::create_dir_all(machine.parent().unwrap()).unwrap();
+                    fs::write(&machine, "").unwrap();
+                }
+                6 => fs::remove_file(&machine).unwrap(),
+                _ => {}
+            }
+        }
+        let taken = record_of(&project, "DEMO-2").is_some_and(|record| record.intake.is_some());
+        pass < 40 && !taken
+    });
+    assert!(
+        comments(&project)
+            .iter()
+            .any(|c| c.starts_with("[owlshift] INTAKE")),
+        "{lines}"
+    );
+    assert_eq!(paused_passes, 6, "{lines}");
+    assert!(!started_while_paused, "{lines}");
+    assert!(
+        record_of(&project, "DEMO-2").is_some_and(|record| record.intake.is_some()),
+        "taken in after the lift\n{lines}"
+    );
+    let told: Vec<(String, Option<String>)> = events(&project.data)
+        .iter()
+        .filter(|e| e.kind == EventKind::Decision)
+        .filter_map(|e| {
+            let watch = e.data.get("watch")?.as_str()?;
+            matches!(watch, "paused" | "resumed").then(|| {
+                let scope = e.data.get("scope").and_then(|s| s.as_str());
+                (watch.to_owned(), scope.map(ToOwned::to_owned))
+            })
+        })
+        .collect();
+    let told: Vec<(&str, Option<&str>)> = told
+        .iter()
+        .map(|(watch, scope)| (watch.as_str(), scope.as_deref()))
+        .collect();
+    assert_eq!(
+        told,
+        [
+            ("paused", Some("project")),
+            ("paused", Some("machine")),
+            ("resumed", None)
+        ],
+        "{lines}"
+    );
+    assert!(lines.contains("this project is paused"), "{lines}");
+    assert!(lines.contains("the pause is lifted"), "{lines}");
+    assert_eq!(dirs.quarantine().unwrap(), None, "{lines}");
+    assert!(!dirs.obligations_stand(), "{lines}");
+}
+
 /// OWL-161, the acceptance's second case, scenario S11's stop: SIGTERM to a
 /// watch while two Builds run, each in a child. Watch sends each child
 /// SIGTERM; each stops its run, checks it and retires its obligation, its

@@ -80,6 +80,11 @@ impl Watch<'_> {
         if memory.following.paused(now) {
             return;
         }
+        // An operator's pause (OWL-438): Owlshift merges nothing, nor reads
+        // for a merge; the first pass after its lift decides it again.
+        if self.operator_paused(memory, sink, out) {
+            return;
+        }
         let base_head = match self.base_head(memory, &delivery.base_branch) {
             Ok(head) => head,
             Err(error) => {

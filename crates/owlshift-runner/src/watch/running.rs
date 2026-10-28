@@ -111,6 +111,12 @@ impl Watch<'_> {
         if self.stopping().is_some() {
             return Some(StepEnd::Busy);
         }
+        // An operator's pause (OWL-438), one written since the pass began
+        // included: no step starts, nothing of it is made or held, and the
+        // next pass after the pause is lifted decides it again.
+        if self.operator_paused(memory, sink, out) {
+            return Some(StepEnd::Busy);
+        }
         // A base check due runs alone (OWL-418): no other step starts, nor
         // its own while another is in flight.
         if self.base_due_holds(memory, &ticket) {

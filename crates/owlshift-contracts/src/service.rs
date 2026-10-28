@@ -33,6 +33,9 @@ pub const BY_DAEMON: &str = "owlshift daemon";
 /// Who asks in a [`Request`] `owlshift stop` writes.
 pub const BY_STOP: &str = "owlshift stop";
 
+/// Who asks in a [`Request`] `owlshift pause` writes (OWL-438).
+pub const BY_PAUSE: &str = "owlshift pause";
+
 /// The daemon that runs on a data directory, written once it holds the
 /// directory's daemon lock and removed when it ends: a record left by a
 /// daemon killed outright names a process that no longer holds the lock.
