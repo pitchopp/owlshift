@@ -407,7 +407,7 @@ pub(crate) mod tests {
         let binary = root.path().join("bin/owl shift");
         fs::create_dir_all(binary.parent().unwrap()).unwrap();
         let stub = "#!/bin/sh\nprintf '%s\\n' \"$@\" \"$OWLSHIFT_DATA_DIR\" \"$OWLSHIFT_CONFIG_DIR\" \
-                    \"$PATH\" \"$(pwd)\" >ran\necho said\n";
+                    \"$PATH\" \"$(pwd)\" >ran\necho $$ >pid\necho said\n";
         let put_binary = || {
             fs::write(&binary, stub).unwrap();
             fs::set_permissions(&binary, fs::Permissions::from_mode(0o755)).unwrap();
@@ -451,6 +451,11 @@ pub(crate) mod tests {
         assert_eq!(
             fs::read_to_string(service.join("daemon.log")).unwrap(),
             "said\n"
+        );
+        // OWL-436: the marker names the daemon's own pid, `exec` keeping it.
+        assert_eq!(
+            fs::read_to_string(crate::daemon::upgrade::launched_file(&data)).unwrap(),
+            fs::read_to_string(service.join("pid")).unwrap()
         );
 
         fs::remove_file(&binary).unwrap();

@@ -292,6 +292,14 @@ fn main() -> ExitCode {
 
     match cli.command {
         Command::Doctor { json } => {
+            // A newer binary hands an older daemon over (OWL-436) before the
+            // report, whose service line then tells the drain; standard
+            // error keeps `--json` clean.
+            if let Ok(data) = data_dir()
+                && let Some(line) = service_cmd::hand_over(&data, "owlshift doctor")
+            {
+                eprintln!("{}", printable(&line));
+            }
             let report = doctor::run(&system, &config);
             if json {
                 println!("{:#}", report.to_json());

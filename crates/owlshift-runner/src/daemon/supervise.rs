@@ -16,7 +16,7 @@ use serde_json::json;
 
 use super::child::{Ended as ChildEnded, Supervised};
 use super::digest::Digests;
-use super::{Daemon, Ended, UNSERVABLE_EXIT, requests};
+use super::{Daemon, Ended, UNSERVABLE_EXIT, UPGRADE_EXIT, requests};
 use crate::events::{Data, EventLog, EventSink, data, printable};
 use crate::notify;
 use crate::project::ProjectDirs;
@@ -74,6 +74,9 @@ struct State {
     /// The drain to write as the stop file of each watch, for a drain; none
     /// for a checked stop, whose watches the platform told.
     relay: Option<Request>,
+    /// Whether the stop is an upgrade's drain, no stop being asked when it
+    /// was seen (OWL-436).
+    upgrading: bool,
     next_pass: Instant,
     digests: Digests,
 }
@@ -94,6 +97,19 @@ impl Daemon<'_> {
             self.remove_stop_request(out);
             return Ended::Stopped;
         }
+        if let Some(request) = requests::drain_asked(self.data) {
+            // Left by the daemon before this one, or written as it ended:
+            // this daemon is already the binary that drain was for.
+            say(
+                out,
+                &format!(
+                    "A drain for an upgrade was asked before this daemon started ({}, at {}: \
+                     {}): this daemon serves, on the binary it runs.",
+                    request.by, request.at, request.why
+                ),
+            );
+            self.remove_drain_request(out);
+        }
         say(
             out,
             &format!(
@@ -106,6 +122,7 @@ impl Daemon<'_> {
             slots: Vec::new(),
             stopping: false,
             relay: None,
+            upgrading: false,
             next_pass: Instant::now(),
             digests: Digests::default(),
         };
@@ -160,14 +177,38 @@ impl Daemon<'_> {
         for slot in &mut state.slots {
             self.remove_own_stop(slot, out);
         }
+        // A stop asked during an upgrade's drain wins: the service manager
+        // must not start the daemon again.
+        let stopped = process::asked().is_some() || requests::stop_asked(self.data).is_some();
         self.remove_stop_request(out);
+        self.remove_drain_request(out);
+        if state.upgrading && !stopped {
+            say(
+                out,
+                &format!(
+                    "The daemon drained for an upgrade: every watch it ran has ended; it exits \
+                     with {UPGRADE_EXIT}, so the service manager starts it again on the new \
+                     binary."
+                ),
+            );
+            return Ended::Upgraded;
+        }
+        if state.upgrading {
+            say(
+                out,
+                "A stop was asked during the upgrade's drain: the daemon ends, not to be started \
+                 again.",
+            );
+        }
         say(out, "The daemon stopped: every watch it ran has ended.");
         Ended::Stopped
     }
 
-    /// Whether any stop is asked of the daemon now.
+    /// Whether any stop, or an upgrade's drain, is asked of the daemon now.
     fn stop_asked(&self) -> bool {
-        process::asked().is_some() || requests::stop_asked(self.data).is_some()
+        process::asked().is_some()
+            || requests::stop_asked(self.data).is_some()
+            || requests::drain_asked(self.data).is_some()
     }
 
     /// Notes a stop asked of the daemon, once, and relays a drain to each
@@ -176,7 +217,11 @@ impl Daemon<'_> {
         if !state.stopping {
             let asked = process::asked();
             let request = requests::stop_asked(self.data);
-            if asked.is_none() && request.is_none() {
+            // A stop asked first is a stop: no upgrade then.
+            let drain = (asked.is_none() && request.is_none())
+                .then(|| requests::drain_asked(self.data))
+                .flatten();
+            if asked.is_none() && request.is_none() && drain.is_none() {
                 return;
             }
             state.stopping = true;
@@ -185,7 +230,19 @@ impl Daemon<'_> {
                 .iter()
                 .filter(|slot| slot.child.is_some())
                 .count();
-            if asked == Some(Degree::Checked) {
+            if let Some(drain) = drain {
+                say(
+                    out,
+                    &format!(
+                        "Draining for an upgrade ({}: {}): each of the {running} watches under \
+                         way ends once its steps under way finish, then the daemon exits with \
+                         {UPGRADE_EXIT}.",
+                        drain.by, drain.why
+                    ),
+                );
+                state.upgrading = true;
+                state.relay = Some(drain);
+            } else if asked == Some(Degree::Checked) {
                 say(
                     out,
                     &format!(
@@ -585,6 +642,15 @@ impl Daemon<'_> {
             say(
                 out,
                 &format!("warning: the stop request could not be removed: {error}"),
+            );
+        }
+    }
+
+    fn remove_drain_request(&self, out: &mut dyn Write) {
+        if let Err(error) = requests::remove_drain_request(self.data) {
+            say(
+                out,
+                &format!("warning: the drain request could not be removed: {error}"),
             );
         }
     }

@@ -91,9 +91,35 @@ pub fn daemon(system: &dyn System, config: &Effective) -> ExitCode {
         timing: Timing::SERVICE,
         digest: daemon::digest::Settings::of(&config.personal),
     };
-    let daemon::Ended::Stopped = daemon.run(&mut io::stdout());
+    let ended = daemon.run(&mut io::stdout());
     drop(instance);
-    ExitCode::SUCCESS
+    match ended {
+        daemon::Ended::Stopped => ExitCode::SUCCESS,
+        // The service manager starts it again, on the new binary.
+        daemon::Ended::Upgraded => ExitCode::from(daemon::UPGRADE_EXIT),
+    }
+}
+
+/// Hands the running daemon over to this binary when it is older and the
+/// service at login would start this one after it (OWL-436,
+/// `daemon::upgrade`): what to tell, if anything. A failure is told as a
+/// warning; it never fails the command.
+pub fn hand_over(data: &Path, by: &str) -> Option<String> {
+    let binary = match std::env::current_exe() {
+        Ok(binary) => binary,
+        Err(error) => {
+            return Some(format!(
+                "warning: whether the daemon runs an older version was not checked: this \
+                 program's own path: {error}"
+            ));
+        }
+    };
+    match daemon::upgrade::hand_over(data, OWLSHIFT_VERSION, &binary, by) {
+        Ok(handover) => handover.line(OWLSHIFT_VERSION),
+        Err(error) => Some(format!(
+            "warning: the daemon was not handed over to this binary: {error}"
+        )),
+    }
 }
 
 /// The watch of the served project `repo`: `program`, this binary, as
@@ -192,6 +218,7 @@ pub fn start(config: &Effective, at_login: bool) -> ExitCode {
                      more: run `owlshift start` again once it has ended"
                 ));
             }
+            let upgrade = hand_over(&data, "owlshift start");
             if changed {
                 println!(
                     "{served}: the daemon{pid} serves it from its next pass, within a minute."
@@ -199,7 +226,9 @@ pub fn start(config: &Effective, at_login: bool) -> ExitCode {
             } else {
                 println!("{served}, by the daemon{pid}.");
             }
-            if at_login {
+            if let Some(line) = &upgrade {
+                println!("{}", printable(line));
+            } else if at_login {
                 println!(
                     "The daemon that runs now{pid} goes on: the service at login takes over at \
                      its next start, at the latest at your next login (`owlshift stop`, then \

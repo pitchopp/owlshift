@@ -9,7 +9,13 @@
 //! - `<project data>/pause`, which the daemon writes, with its reason, for a
 //!   project whose watch could not start for a reason no restart mends;
 //! - `<data>/service/pause`, the pause of every project, which the daily
-//!   digest reads (OWL-440).
+//!   digest reads (OWL-440);
+//! - `<data>/service/drain`, which a newer binary writes (OWL-436,
+//!   `daemon::upgrade`): the daemon drains every watch as for a stop, then
+//!   exits with `UPGRADE_EXIT` so the service manager starts it again on the
+//!   new binary. A daemon that finds it at its own start removes it and
+//!   serves: it is already the binary the drain was for. A daemon built
+//!   before OWL-436 does not read it.
 //!
 //! `owlshift pause` and `owlshift resume` (OWL-438) write and remove both
 //! pauses ([`ask_pause`], [`lift_pause`]), and every watch reads them at each
@@ -39,21 +45,50 @@ pub fn ask_stop(data: &Path, request: &Request) -> io::Result<()> {
 /// What asks the daemon of `data` to stop, when a request stands: what it
 /// holds, or, when that does not read, a request of nobody known.
 pub fn stop_asked(data: &Path) -> Option<Request> {
-    let path = stop_request_file(data);
-    fs::symlink_metadata(&path).ok()?;
-    let text = fs::read_to_string(&path).unwrap_or_default();
-    Some(Request::parse(&text).unwrap_or_else(|| {
-        Request::new(
-            "an unknown writer",
-            jiff::Timestamp::now(),
-            "a stop request that does not read",
-        )
-    }))
+    asked(
+        &stop_request_file(data),
+        "a stop request that does not read",
+    )
 }
 
 /// Removes the daemon's stop request in `data`, if there is one.
 pub fn remove_stop_request(data: &Path) -> io::Result<()> {
     remove_if_any(&stop_request_file(data))
+}
+
+/// The upgrade's drain request in `data` (OWL-436).
+pub fn drain_request_file(data: &Path) -> PathBuf {
+    service_dir(data).join("drain")
+}
+
+/// Asks the daemon of `data` to drain and exit for an upgrade.
+pub fn ask_drain(data: &Path, request: &Request) -> io::Result<()> {
+    step::write_atomically(&drain_request_file(data), &request.render())
+}
+
+/// What asks the daemon of `data` to drain for an upgrade, when a request
+/// stands, read as [`stop_asked`] reads a stop.
+pub fn drain_asked(data: &Path) -> Option<Request> {
+    asked(
+        &drain_request_file(data),
+        "a drain request that does not read",
+    )
+}
+
+/// Removes the upgrade's drain request in `data`, if there is one.
+pub fn remove_drain_request(data: &Path) -> io::Result<()> {
+    remove_if_any(&drain_request_file(data))
+}
+
+/// The request the file at `path` holds, when it stands: one of nobody
+/// known, saying `unread`, when it does not read.
+fn asked(path: &Path, unread: &str) -> Option<Request> {
+    fs::symlink_metadata(path).ok()?;
+    let text = fs::read_to_string(path).unwrap_or_default();
+    Some(
+        Request::parse(&text)
+            .unwrap_or_else(|| Request::new("an unknown writer", jiff::Timestamp::now(), unread)),
+    )
 }
 
 /// Asks the watch of `dirs`'s project to drain, by its stop file.
@@ -240,6 +275,19 @@ mod tests {
         remove_stop_request(data).unwrap();
         remove_stop_request(data).unwrap();
         assert_eq!(stop_asked(data), None);
+
+        // OWL-436: the upgrade's drain, read the same way.
+        assert_eq!(drain_asked(data), None);
+        ask_drain(data, &request).unwrap();
+        assert_eq!(drain_asked(data), Some(request.clone()));
+        fs::write(drain_request_file(data), "").unwrap();
+        assert_eq!(
+            drain_asked(data).map(|r| r.why),
+            Some("a drain request that does not read".to_owned())
+        );
+        remove_drain_request(data).unwrap();
+        remove_drain_request(data).unwrap();
+        assert_eq!(drain_asked(data), None);
 
         let dirs = ProjectDirs::new(data, &Repo::parse("acme/web").unwrap());
         ask_watch_stop(&dirs, &request).unwrap();
