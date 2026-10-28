@@ -303,20 +303,29 @@ fn files_held(files: &[String], named: &NamedResources) -> Vec<Resource> {
 /// before P6 holding the whole repository, or an admitted record whose plan
 /// is the one it admitted, or none. `plan` is the plan the Build follows
 /// with its hash, `intake` the ticket's intake record, `labels` the zones of
-/// its `zone:` labels, `named` the project's named resources.
+/// its `zone:` labels, `branch` the files the ticket's branch changed as the
+/// step read them ([`changed_files`]; none when the branch is not there),
+/// `None` when they were not read, `named` the project's named resources.
 ///
 /// With nothing admitted, the plan's files ([`resource::planned`]) with the
 /// labels' zones and the named resources they reach; with no plan or none
 /// of its files usable, intake's zones and resources with the labels', as
 /// before OWL-448. Once admitted, a plan of another hash is a return to
-/// Design's, whose files are added; a record of format 1, kept with no
-/// plan, adds them too unless it was built (a widening kept), when only the
-/// plan's hash is kept.
+/// Design's, whose files are added. A record admitted without a plan
+/// ([`TicketHeld::narrows`]: of format 1, or holding the whole repository
+/// with no plan) is admitted again from a plan whose files are usable, in
+/// place of what it held (OWL-461; architecture section 5, "Refs from
+/// before OWL-428"): what a first admission takes, with the files it lists
+/// and those of `branch`. That needs `branch` for a record holding the
+/// whole repository, which lists no file; the step always reads it, and
+/// watch, which does not, never predicts that narrowing. A plan none of
+/// whose files is usable keeps only its hash.
 pub fn at_build(
     held: Option<&TicketHeld>,
     plan: Option<(&Plan, &str)>,
     intake: Option<&TicketIntake>,
     labels: &[String],
+    branch: Option<&[String]>,
     named: &NamedResources,
     at: Timestamp,
 ) -> Option<TicketHeld> {
@@ -337,22 +346,38 @@ pub fn at_build(
     if held.plan_sha256.as_deref() == Some(hash.as_str()) {
         return None;
     }
-    let built = held.plan_sha256.is_none() && !held.widened_at.is_empty();
     match planned {
-        Some(zones) if !built => {
+        Some(zones) if held.narrows() => {
+            if held.whole() && branch.is_none() {
+                return None;
+            }
+            let Held { zones, resources } = resource::held(&zones, labels, &[], named);
+            let files = branch.unwrap_or_default().iter().cloned();
+            next.readmit(zones, resources, files, Some(hash), at);
+        }
+        Some(zones) => {
             let Held { zones, resources } = resource::held(&zones, &[], &[], named);
             next.admit(zones, resources, Some(hash), at);
         }
-        _ => next.plan_sha256 = Some(hash),
+        None => next.plan_sha256 = Some(hash),
     }
     Some(next)
+}
+
+/// Whether [`at_build`] admits `held` again from `plan` in place of what it
+/// held (OWL-461): admitted without a plan, `plan` naming files it can hold.
+/// A plan none of whose files it can hold only keeps its hash.
+pub fn readmits(held: &TicketHeld, plan: &Plan) -> bool {
+    held.narrows() && resource::planned(&plan.files, MAX_HELD_FILES).is_some()
 }
 
 /// [`at_build`] for the ticket ref `record`, as watch predicts its next
 /// step (OWL-448): its plan when its pipeline, by its `labels`, its intake
 /// record and the project's `default` variant, has Design, as the step
 /// itself reads it; the zones of its `zone:` labels; `named`, the project's
-/// named resources.
+/// named resources. Watch reads no branch: a narrowing it predicts holds the
+/// files the record lists, and it predicts none for a record holding the
+/// whole repository (OWL-461).
 pub fn due(
     record: &TicketRecord,
     labels: &[String],
@@ -375,6 +400,7 @@ pub fn due(
         plan.as_ref().map(|(plan, hash)| (*plan, hash.as_str())),
         record.intake.as_ref(),
         &brief_zones(labels.iter().map(String::as_str)).zones,
+        None,
         named,
         at,
     )
@@ -382,7 +408,8 @@ pub fn due(
 
 /// What `ticket`'s admission from `before` to `after` adds, as the rule
 /// weighs it with `named`: the resources `after` holds that nothing of
-/// `before` holds already (OWL-448), which its check weighs.
+/// `before` holds already (OWL-448), which its check weighs. Its arguments
+/// swapped, what a narrowing drops (OWL-461).
 pub fn added(
     ticket: &TicketId,
     before: &TicketHeld,
@@ -392,6 +419,21 @@ pub fn added(
     let before = of(ticket, Some(before), false, named).held;
     let after = of(ticket, Some(after), false, named).held;
     resource::added(&before, &after)
+}
+
+/// The `decision` event of a narrowing (OWL-461; architecture section 5,
+/// "Refs from before OWL-428"): `held` = `narrowed`, the resources it
+/// dropped (`dropped`, each as [`resource_data`] names it) and the count of
+/// the files it keeps (`count`).
+pub fn narrowed_event(dropped: &[Resource], files: usize) -> Data {
+    data([
+        ("held", json!("narrowed")),
+        (
+            "dropped",
+            json!(dropped.iter().map(resource_data).collect::<Vec<_>>()),
+        ),
+        ("count", json!(files)),
+    ])
 }
 
 /// The files the branch at `head` changed against its merge-base with
@@ -573,6 +615,7 @@ mod tests {
                 plan.map(|plan| (plan, hash.as_str())),
                 intake,
                 &labels,
+                None,
                 &named,
                 minute(1),
             )
@@ -613,13 +656,22 @@ mod tests {
                 Some((&plan, &hash)),
                 None,
                 &labels,
+                None,
                 &named,
                 minute(2)
             ),
             None
         );
         assert_eq!(
-            at_build(None, Some((&plan, &hash)), None, &labels, &named, minute(2)),
+            at_build(
+                None,
+                Some((&plan, &hash)),
+                None,
+                &labels,
+                None,
+                &named,
+                minute(2)
+            ),
             None
         );
     }
@@ -829,19 +881,40 @@ mod tests {
         assert!(!contained.unwrap());
     }
 
-    /// OWL-448: a return to Design's new plan adds its files, and only what
-    /// they add is checked; a record of format 1 adds them while not built,
-    /// and keeps only the plan's hash once a widening was kept.
-    #[test]
-    fn a_later_plan_adds_its_files_unless_a_format_1_ticket_was_built() {
-        let named = NamedResources::default();
-        let ticket = TicketId::new("DEMO-1").unwrap();
+    /// The plan of the ticket-plan fixture, naming `files`.
+    fn plan_naming(files: &[&str]) -> Plan {
         let mut plan = TicketPlan::parse(include_str!(
             "../../owlshift-contracts/tests/fixtures/ticket-plan.json"
         ))
         .unwrap()
         .plan;
-        plan.files = strings(&["app/a.rs", "web/b.rs"]);
+        plan.files = strings(files);
+        plan
+    }
+
+    /// A record of format 1, as a binary older than OWL-448 wrote it:
+    /// intake's `zones` and a named resource held from its dispatch, no
+    /// plan.
+    fn format_1(zones: &[&str]) -> TicketHeld {
+        TicketHeld::parse(
+            &json!({
+                "format": 1,
+                "zones": zones,
+                "resources": ["migrations"],
+                "dispatched_at": minute(0).to_string(),
+            })
+            .to_string(),
+        )
+        .unwrap()
+    }
+
+    /// OWL-448: a return to Design's new plan adds its files, and only what
+    /// they add is checked.
+    #[test]
+    fn a_return_to_designs_plan_adds_its_files() {
+        let named = NamedResources::default();
+        let ticket = TicketId::new("DEMO-1").unwrap();
+        let plan = plan_naming(&["app/a.rs", "web/b.rs"]);
         let mut admitted = TicketHeld::dispatched(minute(0));
         admitted.admit(
             strings(&["app"]),
@@ -855,6 +928,7 @@ mod tests {
             Some((&plan, &hash)),
             None,
             &[],
+            None,
             &named,
             minute(2),
         )
@@ -868,37 +942,195 @@ mod tests {
             )
         );
         assert_eq!(added(&ticket, &admitted, &next, &named), [zone("web/b.rs")]);
+    }
 
-        let old = TicketHeld::parse(&format!(
-            r#"{{"format":1,"zones":["app"],"dispatched_at":"{}"}}"#,
-            minute(0)
-        ))
-        .unwrap();
-        let unbuilt = at_build(
-            Some(&old),
-            Some((&plan, &hash)),
-            None,
-            &[],
-            &named,
-            minute(3),
-        )
-        .unwrap();
-        assert_eq!(unbuilt.zones, strings(&["app", "app/a.rs", "web/b.rs"]));
-        let mut built = old.clone();
-        built.widen(strings(&["app/c.rs"]), minute(1));
+    /// OWL-461: a record of format 1 holding intake's folders, built (a
+    /// widening kept), is admitted again at its next Build from the plan it
+    /// follows: the plan's files, the labels' zones and the named resources
+    /// they reach, with the widened files and those the step read from its
+    /// branch; no folder, nor intake's resource. A plan within its folders
+    /// adds only the label's zone to check, and what it drops is the
+    /// folders and the resource. Unbuilt, the same. A second Build of the
+    /// plan changes nothing; a plan none of whose files is usable keeps only
+    /// its hash.
+    #[test]
+    fn a_format_1_record_is_narrowed_to_its_plans_files_at_its_next_build() {
+        let named = NamedResources::new([("lock", "app/Cargo.lock")]).unwrap();
+        let ticket = TicketId::new("DEMO-1").unwrap();
+        let plan = plan_naming(&["app/a.rs", "app/Cargo.lock"]);
+        let hash = "c".repeat(64);
+        let mut built = format_1(&["app", "web"]);
+        built.widen(strings(&["web/w.rs"]), minute(1));
+        let labels = strings(&["docs"]);
+        let narrow = |held: &TicketHeld, branch: Option<&[String]>| {
+            at_build(
+                Some(held),
+                Some((&plan, &hash)),
+                None,
+                &labels,
+                branch,
+                &named,
+                minute(2),
+            )
+            .unwrap()
+        };
+        let branch = strings(&["app/b.rs"]);
+        let narrowed = narrow(&built, Some(&branch));
+        assert_eq!(
+            (
+                &narrowed.zones,
+                &narrowed.resources,
+                &narrowed.files,
+                narrowed.admitted_at,
+                narrowed.plan_sha256.as_ref()
+            ),
+            (
+                &strings(&["app/a.rs", "app/Cargo.lock", "docs"]),
+                &strings(&["lock"]),
+                &strings(&["app/b.rs", "web/w.rs"]),
+                Some(minute(2)),
+                Some(&hash)
+            )
+        );
+        assert_eq!(added(&ticket, &built, &narrowed, &named), [zone("docs")]);
+        assert_eq!(
+            added(&ticket, &narrowed, &built, &named),
+            [
+                zone("app"),
+                zone("web"),
+                Resource::Named("migrations".to_owned())
+            ]
+        );
+        // Watch's prediction, with no branch read, holds the recorded files.
+        assert_eq!(narrow(&built, None).files, strings(&["web/w.rs"]));
+        let unbuilt = narrow(&format_1(&["app"]), Some(&[]));
+        assert_eq!(
+            (&unbuilt.zones, &unbuilt.files),
+            (
+                &strings(&["app/a.rs", "app/Cargo.lock", "docs"]),
+                &Vec::new()
+            )
+        );
+        assert_eq!(
+            at_build(
+                Some(&narrowed),
+                Some((&plan, &hash)),
+                None,
+                &labels,
+                Some(&branch),
+                &named,
+                minute(3)
+            ),
+            None
+        );
+        let unusable = plan_naming(&["web/a.rs (new)"]);
         let kept = at_build(
             Some(&built),
-            Some((&plan, &hash)),
+            Some((&unusable, &hash)),
             None,
-            &[],
+            &labels,
+            Some(&branch),
             &named,
-            minute(3),
+            minute(2),
         )
         .unwrap();
         assert_eq!(
             (&kept.zones, kept.plan_sha256.as_ref()),
-            (&strings(&["app"]), Some(&hash))
+            (&strings(&["app", "web"]), Some(&hash))
         );
-        assert!(added(&ticket, &built, &kept, &named).is_empty());
+        // What the step tells as a narrowing: a re-admission, whatever it
+        // dropped, never a plan's hash kept alone.
+        assert!(readmits(&built, &plan));
+        assert!(!readmits(&built, &unusable) && !readmits(&narrowed, &plan));
+    }
+
+    /// OWL-461: a record holding the whole repository with no plan narrows
+    /// once the step read its branch, of which it lists no file; watch,
+    /// reading none, predicts nothing. The narrowing adds nothing to check.
+    #[test]
+    fn a_whole_record_narrows_only_with_its_branch_read() {
+        let named = NamedResources::default();
+        let ticket = TicketId::new("DEMO-1").unwrap();
+        let plan = plan_naming(&["app/a.rs"]);
+        let hash = "d".repeat(64);
+        let whole = format_1(&[]);
+        assert!(whole.whole());
+        let narrow = |branch: Option<&[String]>| {
+            at_build(
+                Some(&whole),
+                Some((&plan, &hash)),
+                None,
+                &[],
+                branch,
+                &named,
+                minute(2),
+            )
+        };
+        assert_eq!(narrow(None), None);
+        let branch = strings(&["lib/x.rs"]);
+        let narrowed = narrow(Some(&branch)).unwrap();
+        assert_eq!(
+            (&narrowed.zones, &narrowed.files),
+            (&strings(&["app/a.rs"]), &branch)
+        );
+        assert!(added(&ticket, &whole, &narrowed, &named).is_empty());
+        assert_eq!(
+            added(&ticket, &narrowed, &whole, &named),
+            [zone(""), Resource::Named("migrations".to_owned())]
+        );
+    }
+
+    /// OWL-461: a re-admission whose new file another ticket holds collides,
+    /// as a first admission does, whatever the holder's dispatch time; a
+    /// Build that waited on a folder the narrowing dropped no longer does.
+    #[test]
+    fn a_narrowing_is_checked_for_what_it_adds_and_frees_what_it_drops() {
+        let named = NamedResources::default();
+        let one = TicketId::new("DEMO-1").unwrap();
+        let two = TicketId::new("DEMO-2").unwrap();
+        let old = format_1(&["app"]);
+        let hash = "e".repeat(64);
+        let plan = plan_naming(&["app/a.rs", "web/b.rs"]);
+        let narrowed = at_build(
+            Some(&old),
+            Some((&plan, &hash)),
+            None,
+            &[],
+            Some(&[]),
+            &named,
+            minute(2),
+        )
+        .unwrap();
+        let mut holder = TicketHeld::dispatched(minute(1));
+        holder.admit(strings(&["web/b.rs"]), Vec::new(), None, minute(1));
+        let weighed = InFlight {
+            held: added(&one, &old, &narrowed, &named),
+            dispatched: Dispatched::Now,
+            ..of(&one, Some(&old), false, &named)
+        };
+        let found = collision::weigh(
+            &weighed,
+            &[of(&two, Some(&holder), false, &named)],
+            Default::default(),
+        );
+        assert_eq!(
+            found.collision.map(|c| (c.holder, c.resource)),
+            Some(("DEMO-2".to_owned(), zone("web/b.rs")))
+        );
+        let waiting = InFlight {
+            held: vec![zone("app/c.rs")],
+            dispatched: Dispatched::Now,
+            ..of(&two, None, false, &named)
+        };
+        let against = |held: &TicketHeld| {
+            collision::weigh(
+                &waiting,
+                &[of(&one, Some(held), false, &named)],
+                Default::default(),
+            )
+            .collision
+        };
+        assert!(against(&old).is_some());
+        assert_eq!(against(&narrowed), None);
     }
 }

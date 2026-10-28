@@ -2504,6 +2504,62 @@ fn a_resumed_build_that_fails_twice_is_parked_and_not_resumed_again() {
     assert_eq!(bench.watch_resumes(), ["build", "build"]);
 }
 
+/// OWL-461: a ticket held from before OWL-448, its record of format 1
+/// holding intake's folder `docs` from its dispatch and a widened file, is
+/// narrowed at its next Build to the plan's file with the widened one: the
+/// folder is dropped, one `decision` event tells it, and the Build runs and
+/// delivers. Played by a Build a usage limit cut off, its record rewritten
+/// as a binary older than OWL-448 wrote it.
+#[test]
+fn a_format_1_record_is_narrowed_to_its_plans_files_at_its_next_build() {
+    let bench = answered_design();
+    let mut plan: Value = serde_json::from_str(PLAN).unwrap();
+    plan["files"] = json!(["GREETING.md"]);
+    let (outcome, printed) = bench.continue_ticket(vec![
+        bench.read(&check(&[("Q1", "answered", "Markdown.")])),
+        bench.read(&designed(&plan.to_string())),
+        bench.read(&reviewed(&[])),
+        bench.read(&reviewed(&[])),
+        bench.limited_until(LONG_PAST),
+    ]);
+    assert!(
+        matches!(outcome, Err(Stop::UsageLimit { .. })),
+        "{outcome:?}\n{printed}"
+    );
+    let mut record = bench.record();
+    let admitted = record.held.clone().unwrap();
+    assert_eq!(admitted.zones, ["GREETING.md"]);
+    let mut old = owlshift_contracts::refs::TicketHeld::parse(
+        &json!({
+            "format": 1,
+            "zones": ["docs"],
+            "dispatched_at": admitted.dispatched_at.unwrap().to_string(),
+        })
+        .to_string(),
+    )
+    .unwrap();
+    old.widen(["notes/a.md".to_owned()], admitted.dispatched_at.unwrap());
+    record.held = Some(old);
+    bench.write_record(&record);
+    let events = bench.events().len();
+
+    let (outcome, printed) = bench.continue_ticket(vec![bench.built()]);
+    outcome.unwrap_or_else(|stop| panic!("{stop}\n{printed}"));
+    let held = bench.record().held.unwrap();
+    assert_eq!(held.zones, ["GREETING.md"], "{held:?}");
+    assert!(held.files.contains(&"notes/a.md".to_owned()), "{held:?}");
+    assert!(held.plan_sha256.is_some() && !held.narrows());
+    let narrowed = data_of(&bench.events()[events..], EventKind::Decision, "held");
+    let narrowed: Vec<&Value> = narrowed
+        .iter()
+        .filter(|event| event["held"] == json!("narrowed"))
+        .collect();
+    assert_eq!(narrowed.len(), 1, "{narrowed:?}");
+    assert_eq!(narrowed[0]["dropped"], json!([{ "zone": "docs" }]));
+    assert_eq!(narrowed[0]["count"], json!(1));
+    assert_eq!(bench.stage(), "In Review");
+}
+
 /// OWL-340: a resumed Design run asks questions, and keeping the round fails
 /// once its QUESTIONS comment is posted: the ticket is held until a person
 /// acts, so later passes read no stage, run nothing and post nothing.

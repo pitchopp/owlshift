@@ -373,7 +373,9 @@ pub struct HeldOverlap {
 /// written at its dispatch with nothing admitted, given what its Build's
 /// admission takes (OWL-448, "Resources admitted at Build"), widened by the
 /// files its branch changes, and never narrowed while the ticket holds
-/// anything, until its pull request ends. A ticket dispatched before it was
+/// anything, until its pull request ends, but once: a record admitted
+/// without a plan is admitted again from its next Build's plan
+/// ([`Self::narrows`], [`Self::readmit`], OWL-461). A ticket dispatched before it was
 /// kept has none and holds the whole repository. Not in `intake.json`, which
 /// belongs to the ticket's text and is replaced by the next intake.
 ///
@@ -480,6 +482,39 @@ impl TicketHeld {
     /// Whether it holds the whole repository: admitted, with no zone.
     pub fn whole(&self) -> bool {
         self.admitted() && self.zones.is_empty()
+    }
+
+    /// Whether its next Build re-admits it from that Build's plan (OWL-461;
+    /// architecture section 5, "Refs from before OWL-428"): admitted with no
+    /// plan admitted, a record of format 1 or one holding the whole
+    /// repository with no plan.
+    pub fn narrows(&self) -> bool {
+        self.admitted() && self.plan_sha256.is_none()
+    }
+
+    /// Admits it again at `at` (OWL-461): `zones` (none for the whole
+    /// repository) and `resources` replace those it held, the plan whose
+    /// files they hold being `plan_sha256`, and it keeps the files it
+    /// listed with `files`, those its branch changed, added as a widening
+    /// adds them, without a widening's time: past the bounds it holds the
+    /// whole repository. Its dispatch time and its overlaps are kept.
+    pub fn readmit(
+        &mut self,
+        zones: Vec<String>,
+        resources: Vec<String>,
+        files: impl IntoIterator<Item = String>,
+        plan_sha256: Option<String>,
+        at: Timestamp,
+    ) {
+        self.admitted_at = Some(at);
+        self.plan_sha256 = plan_sha256;
+        self.resources = resources;
+        if zones.is_empty() {
+            self.hold_whole(at);
+            return;
+        }
+        self.zones = zones;
+        self.widen_by(files, at);
     }
 
     /// Admits `zones` (none for the whole repository) and `resources` at
@@ -616,7 +651,8 @@ impl TicketHeld {
 
     /// Parses and validates a `held.json`. A format-1 one, kept before
     /// OWL-448, is read as the current format admitted at its dispatch, with
-    /// no plan admitted: it keeps holding what its dispatch declared. A
+    /// no plan admitted: it holds what its dispatch declared until its next
+    /// Build narrows it ([`Self::narrows`], OWL-461). A
     /// format-2 one, kept before OWL-449, is read with no overlap.
     pub fn parse(input: &str) -> Result<Self, ContractError> {
         let held: Self = match Self::from_older_format(input) {
