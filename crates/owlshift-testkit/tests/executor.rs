@@ -717,6 +717,78 @@ fn a_job_a_run_left_does_not_outlive_its_end() {
     );
 }
 
+/// A stand-in setup or gate command: leaves a job in its working directory,
+/// the worktree, as [`leave_a_job`] does, prints `job <pid>` and ends; acts
+/// only when run alone by [`helper_line`].
+#[cfg(unix)]
+#[test]
+#[ignore = "helper, run by the test below"]
+fn helper_leave_a_job_and_print_it() {
+    if std::env::args().any(|arg| arg == "--exact") {
+        use std::io::Write;
+
+        // Its pid file outside the worktree, which the gate checks clean.
+        let pid_dir = tempfile::tempdir().unwrap();
+        let here = std::env::current_dir().unwrap();
+        let pid = leave_a_job(&here, &pid_dir.path().join("job"));
+        // Written raw: libtest captures `print!`, not the handle. On a line
+        // of its own, after libtest's name of the test.
+        writeln!(io::stdout(), "\njob {pid}").unwrap();
+    }
+}
+
+/// The shell line that runs the named helper of this file.
+#[cfg(unix)]
+fn helper_line(name: &str) -> String {
+    let exe = std::env::current_exe().unwrap();
+    format!(
+        "\"{}\" --exact {name} --ignored --nocapture --test-threads=1",
+        exe.display()
+    )
+}
+
+/// OWL-455: a job a setup command or a gate command leaves in the worktree,
+/// as a returned Bash call leaves one, does not outlive its command, and the
+/// gate's checks pass.
+#[cfg(unix)]
+#[test]
+fn a_job_a_setup_or_gate_command_left_does_not_outlive_the_gate() {
+    let bench = Bench::new();
+    let line = helper_line("helper_leave_a_job_and_print_it");
+    let lines = [line];
+    let run = bench
+        .executor
+        .run_gate(&owlshift_runner::executor::GateSpec {
+            main: &bench.main,
+            worktree: &bench.worktree,
+            branch: BRANCH,
+            base: "origin/main",
+            run_dir: &bench.tmp.path().join("gate-run"),
+            commands: &lines,
+            setup: &lines,
+        })
+        .unwrap();
+    let jobs: Vec<Survivor> = run
+        .report
+        .setup
+        .iter()
+        .chain(&run.report.steps)
+        .map(|step| {
+            let pid = step
+                .output
+                .lines()
+                .find_map(|line| line.strip_prefix("job "))
+                .unwrap_or_else(|| panic!("no job: {step:?}"));
+            Survivor(pid.trim().parse().unwrap())
+        })
+        .collect();
+    assert_eq!(jobs.len(), 2, "{:?}", run.report);
+    for job in &jobs {
+        assert_gone(job.0);
+    }
+    assert!(run.passed(), "{:?} {:?}", run.report, run.violations);
+}
+
 /// A harness that is a shell script, run in the worktree, whose driver
 /// reports a completed run ending on `message` with one `Write` refused, as
 /// Claude Code's driver reports a read-only run (OWL-323); logged in with
