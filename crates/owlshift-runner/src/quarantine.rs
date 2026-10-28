@@ -260,7 +260,7 @@ pub(crate) fn tell(
     sink: &mut EventSink<'_>,
 ) -> Option<String> {
     let by = match held {
-        Held::Answer => "watch",
+        Held::Answer | Held::Stage => "watch",
         Held::Ready => "drain",
     };
     sink.emit(
@@ -299,6 +299,10 @@ pub enum Held {
     Answer,
     /// It is ready: the drain would build it.
     Ready,
+    /// It is left at a stage, its step not running, while the tracker shows
+    /// that stage: watch would resume it, as after a run a hard kill of the
+    /// daemon cut (OWL-456).
+    Stage,
 }
 
 /// The WAITING comment of a ticket a quarantine holds up: fixed words, no
@@ -328,6 +332,11 @@ impl QuarantineWait {
             Held::Ready => format!(
                 "This ticket is ready, but Owlshift builds no ticket of this project for now: \
                  {why}. It is built once the quarantine is cleared."
+            ),
+            Held::Stage => format!(
+                "This ticket's work has started, but Owlshift runs no ticket of this project for \
+                 now: {why}. Nothing is needed from you: this ticket goes on by itself once the \
+                 quarantine is cleared."
             ),
         };
         let footer = Footer {
@@ -759,7 +768,7 @@ mod tests {
 
     #[test]
     fn a_waiting_comment_is_marked_and_says_why() {
-        for held in [Held::Answer, Held::Ready] {
+        for held in [Held::Answer, Held::Ready, Held::Stage] {
             let body = QuarantineWait {
                 ticket: owl_7(),
                 held,
@@ -769,6 +778,10 @@ mod tests {
             assert_eq!(marked.header.kind, MarkerKind::Waiting);
             assert_eq!(marked.footer.unwrap().ticket, owl_7());
             assert!(body.contains("`owlshift unquarantine`"), "{body}");
+            if held == Held::Stage {
+                assert!(body.contains("work has started"), "{body}");
+                assert!(body.contains("goes on by itself"), "{body}");
+            }
         }
     }
 

@@ -1938,6 +1938,8 @@ fn a_quarantine_is_told_once_to_the_operator_and_to_the_ticket_it_holds() {
         "{park}"
     );
     assert!(park.contains("`owlshift unquarantine`"), "{park}");
+    // Parked, its PARKED comment says it all: no WAITING comment (OWL-456).
+    assert_eq!(bench.quarantine_told("DEMO-2").2, 0);
     // Cleared, DEMO-1 is continued and built; DEMO-2 stays parked.
     assert_eq!(bench.dirs().quarantine().unwrap(), None);
     assert!(

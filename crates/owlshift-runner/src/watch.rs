@@ -1029,7 +1029,9 @@ impl Watch<'_> {
 
     /// A pass while the marker `marker` quarantines the project (OWL-368):
     /// its line once, then each waiting ticket whose answer counts is told
-    /// that it waits, once per marker, instead of continued. Nothing else
+    /// that it waits, once per marker, instead of continued; so is each
+    /// ticket left at a stage watch would resume, whose step does not run,
+    /// while the tracker still shows that stage (OWL-456). Nothing else
     /// runs: no continue, follow, stage move or resume.
     fn quarantined(
         &self,
@@ -1041,6 +1043,13 @@ impl Watch<'_> {
         refs: Vec<(TicketId, Result<Stored, String>)>,
     ) {
         self.note(memory, out, Project::Quarantined(marker));
+        // A ticket whose step's child still runs is told once it has
+        // stopped, at the run's boundary, and is left at its stage.
+        let busy: Vec<TicketId> = memory
+            .running
+            .iter()
+            .map(|running| running.ticket().clone())
+            .collect();
         for (ticket, stored) in refs {
             // A ticket told already costs no read of its comments.
             let told = memory
@@ -1050,9 +1059,42 @@ impl Watch<'_> {
             let (false, Ok(stored)) = (told, stored) else {
                 continue;
             };
-            if TicketState::try_from(&stored.record.state).is_ok_and(|s| watched(s.status())) {
+            let Ok(state) = TicketState::try_from(&stored.record.state) else {
+                continue;
+            };
+            if watched(state.status()) {
                 self.look(memory, sink, out, continued, &ticket, &stored, true);
+            } else if let Some(shown) = resumable_stage(&state)
+                && !busy.contains(&ticket)
+            {
+                self.tell_stage(memory, sink, out, &ticket, shown);
             }
+        }
+    }
+
+    /// Tells `ticket`, left at a stage the tracker must show as `shown` for
+    /// watch to resume it, that it waits for the quarantine (OWL-456): only
+    /// while the tracker shows it so, since a ticket a person moved
+    /// elsewhere would not go on by itself.
+    fn tell_stage(
+        &self,
+        memory: &mut Memory,
+        sink: &mut EventSink<'_>,
+        out: &mut dyn Write,
+        ticket: &TicketId,
+        shown: VisibleStage,
+    ) {
+        let on_demand = self.on_demand;
+        let found = match on_demand.tracker.stage(ticket) {
+            Ok(found) => found,
+            Err(e) => {
+                let reason = format!("reading its stage: {e}");
+                return self.unreadable(memory, sink, ticket, reason);
+            }
+        };
+        memory.failing.remove(ticket);
+        if found == shown.state(&on_demand.config.tracker.states) {
+            self.tell(memory, sink, out, ticket, Held::Stage);
         }
     }
 
