@@ -34,7 +34,11 @@
 //!   alone under `always`: an approval it decides, option A, takes the
 //!   ticket to Build; a change it decides goes back to Design with the
 //!   decision; what it leaves goes to the decider. No finding is asked
-//!   (OWL-377).
+//!   (OWL-377). A revision on the resolver's change that touched no fork
+//!   and not the work's scope, and answered no `blocker` or `major`
+//!   ([`unreviewed_change`], OWL-463), gets no review pass: kept with a pass
+//!   no reviewer runs and approved by the change's DECISION comment, it
+//!   leaves its review at once, to Build.
 //!
 //! A refused design, review or arbiter result is a failed run, as intake's
 //! is: their briefs carry no refused result to fix. A failed review seat or
@@ -62,7 +66,9 @@ use owlshift_contracts::review::{
     PublishedPlan, ResponseOutcome, ReviewPass, Reviewer, RulingOutcome, Severity, TicketPlan,
     TicketReview,
 };
-use owlshift_core::review::{Fate, PassOutcome, PassVerdict, Standing, settle};
+use owlshift_core::review::{
+    Carried, Fate, PassOutcome, PassVerdict, Standing, resolver_change_reviewed, settle,
+};
 use owlshift_core::roster;
 use owlshift_core::routing::{codex_reviewer_routing, reviewer_routing};
 use owlshift_core::vocab::Harness as HarnessKind;
@@ -72,8 +78,8 @@ use crate::routing::codex_model;
 use crate::ticket_ref::text_sha256;
 use crate::writer::{
     CONTEXT_CHARS, DocumentPass, PlanComment, PlanDocument, PlanNext, PlanPointer, PlanReviewer,
-    QuestionNote, ROUND_BUDGET_CHARS, ROUND_FRAME_CHARS, WriteError, chars, document_link, flatten,
-    question_block,
+    QuestionNote, ROUND_BUDGET_CHARS, ROUND_FRAME_CHARS, Unreviewed, WriteError, chars,
+    document_link, flatten, question_block,
 };
 
 /// The category of the plan-approval question (architecture section 5,
@@ -144,21 +150,22 @@ pub(super) struct PassRun {
 }
 
 /// How the plan leaves its review ([`OnDemand::plan_leaves_review`]):
-/// after a pass that passed, or the pass of Design's last revision
-/// (OWL-377).
+/// after a pass that passed, or the pass of a revision no reviewer runs,
+/// Design's last revision (OWL-377) or a resolver's change on the plan's
+/// approval (OWL-463).
 pub(super) struct PlanEnd {
     /// The pass that ended, from 1.
     pub pass: u32,
     pub reviewers: Vec<PlanReviewer>,
-    /// The pass's findings; for a last revision, those of the pass before,
-    /// which the revision answered.
+    /// The pass's findings; for a revision, those of the pass before, which
+    /// the revision answered or which the approval round carried.
     pub findings: Vec<KeptFinding>,
     /// What the PLAN comment lists of the loop's earlier passes
     /// ([`earlier_left`]).
     pub earlier: Vec<(u32, KeptFinding)>,
-    /// The pass is the last revision's, which no reviewer ran.
-    pub revision: bool,
-    /// The pass's last run, or the design run of the last revision.
+    /// The pass is a revision's, which no reviewer ran, and which.
+    pub revision: Option<Unreviewed>,
+    /// The pass's last run, or the design run of the revision.
     pub run: Option<String>,
     /// What the pass's runs cost, as [`PassRun::cost`] sums it.
     pub cost: Option<f64>,
@@ -713,6 +720,90 @@ pub(crate) fn design_input(
             approval: approval_required,
         },
     })
+}
+
+/// The parts of a plan a resolver's change on the plan's approval must leave
+/// as they were to go to Build with no review pass (OWL-463): its goal and
+/// criteria, the work's scope, and its forks and the alternatives it set
+/// aside, the design's choices of approach; each compared whole.
+const TOUCHED_PARTS: [PlanPart; 4] = [
+    PlanPart::Goal,
+    PlanPart::Criteria,
+    PlanPart::Forks,
+    PlanPart::Alternatives,
+];
+
+/// The latest decision on the plan's approval newer than the latest ask:
+/// the resolver's word on the approval round a design run answers, when it
+/// decided the round (OWL-342).
+fn approval_decision(questions: &TicketQuestions) -> Option<&KeptDecision> {
+    questions
+        .decisions
+        .iter()
+        .rev()
+        .find(|kept| kept.question.category == APPROVAL_CATEGORY)
+        .filter(|kept| questions.latest().is_none_or(|ask| kept.at > ask.at))
+}
+
+/// The findings the approval round after the record's latest Design review
+/// pass, numbered `pass`, carried to the resolver, as
+/// [`OnDemand::plan_leaves_review`] gives them: that pass's, or, when it is
+/// Design's last revision, those of the pass before, which it answered.
+/// `None` when the record does not end with that pass.
+fn carried(review: &TicketReview, pass: u32) -> Option<Vec<Carried>> {
+    let last = review
+        .passes
+        .iter()
+        .rev()
+        .find(|kept| kept.stage == Stage::DesignReview)
+        .filter(|kept| kept.pass.get() == pass)?;
+    let findings = if last.revision.is_some() {
+        revised_findings(review, pass)
+    } else {
+        last.findings.clone()
+    };
+    Some(
+        findings
+            .iter()
+            .map(|kept| Carried {
+                severity: kept.finding.severity,
+                fixed: kept.outcome == Some(FindingOutcome::Fixed),
+            })
+            .collect(),
+    )
+}
+
+/// The DECISION comment of the resolver's change on the plan's approval
+/// whose revision, from `before` to `after`, goes to Build with no review
+/// pass (OWL-463; [`resolver_change_reviewed`]): the approval round's latest
+/// decision, by the resolver, not reversed, and no comment of the decider's
+/// newer than it in the design run's `thread`, which the run may have
+/// followed instead; the revision leaving [`TOUCHED_PARTS`] as they were; no
+/// `blocker` or `major` the round carried left unfixed. `passes` is the
+/// state's count of review passes, the round's pass the last of them.
+/// `None` when the revision gets its pass: the decider's change, or any
+/// other.
+pub(crate) fn unreviewed_change(
+    thread: &[ThreadEntry],
+    questions: &TicketQuestions,
+    review: Option<&TicketReview>,
+    passes: u32,
+    before: &Plan,
+    after: &Plan,
+) -> Option<String> {
+    let decision = approval_decision(questions).filter(|kept| kept.reversed.is_none())?;
+    let decider_since = thread.iter().any(|entry| {
+        matches!(entry, ThreadEntry::Comment { at, author, .. }
+            if author.relation == Relation::Decider && *at > decision.at)
+    });
+    if decider_since {
+        return None;
+    }
+    let carried = carried(review?, passes)?;
+    let touched = TOUCHED_PARTS
+        .iter()
+        .any(|part| before.part_canonical(*part) != after.part_canonical(*part));
+    (!resolver_change_reviewed(touched, &carried)).then(|| decision.comment.clone())
 }
 
 /// `text` cut to at most `chars` characters, a mark of the cut kept.
@@ -1440,7 +1531,7 @@ impl OnDemand<'_> {
                 && let Some(result) = result
             {
                 let result = result.clone();
-                return self.designed(p, state, &brief, &result, &comments, &ran, sink);
+                return self.designed(p, dispatched, state, &brief, &result, &comments, &ran, sink);
             }
             match state.apply(p.pipeline, event) {
                 Ok(Transition::To(next)) => {
@@ -1479,11 +1570,14 @@ impl OnDemand<'_> {
     /// answers, which takes it to Design review. A last revision's plan
     /// (OWL-377, [`last_revision_marked`]) is kept with a Design review pass
     /// that names the run and no reviewer runs. One write keeps it with the
-    /// state.
+    /// state. A revision on a resolver's change that gets no review pass
+    /// (OWL-463, [`unreviewed_change`]) leaves its review at once
+    /// ([`Self::applied_unreviewed`]).
     #[allow(clippy::too_many_arguments)]
     fn designed(
         &self,
         p: &mut Prepared,
+        dispatched: &Dispatched,
         state: TicketState,
         brief: &Brief,
         result: &RunResult,
@@ -1503,12 +1597,7 @@ impl OnDemand<'_> {
             // its DECISION comment; else the decider's answer: their newest
             // comment, or the round's comment their thumbs-up answered
             // (OWL-371).
-            let decided = questions
-                .decisions
-                .iter()
-                .rev()
-                .find(|kept| kept.question.category == APPROVAL_CATEGORY)
-                .filter(|kept| questions.latest().is_none_or(|ask| kept.at > ask.at));
+            let decided = approval_decision(&questions);
             let comment = match decided {
                 Some(decision) => decision.comment.clone(),
                 None => {
@@ -1568,6 +1657,25 @@ impl OnDemand<'_> {
             .review
             .as_ref()
             .is_some_and(|review| last_revision_marked(&state, review));
+        // A resolver's change on the plan's approval for its notes alone:
+        // to Build with no review pass (OWL-463).
+        if brief.approval
+            && !revision
+            && let Some(before) = p.plan.as_ref()
+        {
+            let questions = p.questions();
+            let unreviewed = unreviewed_change(
+                &brief.thread,
+                &questions,
+                p.review.as_ref(),
+                state.review_passes(),
+                &before.plan,
+                &plan,
+            );
+            if let Some(comment) = unreviewed {
+                return self.applied_unreviewed(p, dispatched, state, plan, comment, ran, sink);
+            }
+        }
         // What the run did with the findings it was given, on the pass that
         // raised them.
         if let (Some(given), Some(review)) = (&brief.findings, p.review.as_mut()) {
@@ -1629,6 +1737,106 @@ impl OnDemand<'_> {
                 ("base", json!(base)),
                 ("forks", json!(forks)),
                 ("last_revision", json!(revision)),
+            ]),
+        );
+        Ok(next)
+    }
+
+    /// The revision a design run wrote on a resolver's change to the plan,
+    /// decided on its approval, that gets no review pass (OWL-463,
+    /// [`unreviewed_change`]): the plan kept, approved by the change's
+    /// DECISION comment with the revised plan's hash, with a Design review
+    /// pass that names the run and no reviewer runs, as Design's last
+    /// revision's is; then it leaves its review as after a pass that passed
+    /// ([`Self::plan_leaves_review`]), the PLAN comment first, the approval
+    /// opening the gate to Build. Nothing is kept when the PLAN comment
+    /// cannot be posted, so `continue` runs the design again.
+    #[allow(clippy::too_many_arguments)]
+    fn applied_unreviewed(
+        &self,
+        p: &mut Prepared,
+        dispatched: &Dispatched,
+        state: TicketState,
+        plan: Plan,
+        comment: String,
+        ran: &Ran,
+        sink: &mut EventSink<'_>,
+    ) -> Result<TicketState, Stop> {
+        let ticket = p.ticket.clone();
+        let base = self.branch_head(p).unwrap_or_else(|| p.base.commit.clone());
+        let sha = plan_sha256(&plan);
+        let forks = plan.forks.len();
+        let kept = TicketPlan {
+            format: Format,
+            plan,
+            text_sha256: text_sha256(&p.found.title, &p.found.description),
+            base: base.clone(),
+            approval: Some(KeptApproval {
+                comment: comment.clone(),
+                plan_sha256: sha.clone(),
+            }),
+            published: p.plan.as_ref().and_then(|plan| plan.published.clone()),
+        };
+        let pass = NonZeroU32::new(state.review_pass_due()).expect("a pass due counts from 1");
+        let mut review = p.review.clone().unwrap_or_default();
+        push_pass(
+            &mut review,
+            ReviewPass {
+                stage: Stage::DesignReview,
+                pass,
+                findings: Vec::new(),
+                reviewers: Vec::new(),
+                head: None,
+                plan: None,
+                revision: Some(ran.run.clone()),
+                dropped: None,
+            },
+        );
+        review.validate().map_err(|e| {
+            Stop::Refused(format!(
+                "the review record of {ticket} would not read back ({e}): `owlshift forget \
+                 {ticket}` starts it over"
+            ))
+        })?;
+        let reviewing = match state.apply(p.pipeline, Event::Completed) {
+            Ok(Transition::To(next)) => next,
+            other => return Err(core_error(other)),
+        };
+        let gate = self.plan_gate(p, &kept);
+        let end = PlanEnd {
+            pass: pass.get(),
+            reviewers: Vec::new(),
+            earlier: earlier_left(&review, pass.get().saturating_sub(1)),
+            findings: revised_findings(&review, pass.get()),
+            revision: Some(Unreviewed::Change),
+            run: Some(ran.run.clone()),
+            cost: Some(0.0),
+            review,
+        };
+        p.plan = Some(kept.clone());
+        let next = self.plan_leaves_review(p, dispatched, reviewing, kept, gate, end, sink)?;
+        sink.emit(
+            &ticket,
+            Some(&ran.run),
+            EventKind::Decision,
+            data([
+                ("plan", json!("kept")),
+                ("plan_sha256", json!(sha)),
+                ("base", json!(base)),
+                ("forks", json!(forks)),
+                ("last_revision", json!(false)),
+            ]),
+        );
+        sink.emit(
+            &ticket,
+            Some(&ran.run),
+            EventKind::Decision,
+            data([
+                ("plan", json!("approved")),
+                ("by", json!("resolver")),
+                ("unreviewed", json!(true)),
+                ("comment", json!(comment)),
+                ("plan_sha256", json!(sha)),
             ]),
         );
         Ok(next)
@@ -2081,7 +2289,7 @@ impl OnDemand<'_> {
                 reviewers: Vec::new(),
                 earlier: earlier_left(&review, pass.saturating_sub(1)),
                 findings: answered,
-                revision: true,
+                revision: Some(Unreviewed::LastRevision),
                 run: Some(run),
                 cost: Some(0.0),
                 review,
@@ -2150,7 +2358,7 @@ impl OnDemand<'_> {
                 .collect(),
             earlier: earlier_left(&review, pass),
             findings,
-            revision: false,
+            revision: None,
             run: last_run,
             cost,
             review,
@@ -2235,17 +2443,21 @@ impl OnDemand<'_> {
                 .map_err(|e| refused("keeping the review pass in the ticket's ref", e))?;
             return Ok(next);
         }
-        let summary = if revision {
-            format!(
+        let summary = match revision {
+            Some(Unreviewed::LastRevision) => format!(
                 "The plan's last revision, after design review pass {}, waits for your \
                  approval: the PLAN comment above shows it and what it answered.",
                 pass.saturating_sub(1)
-            )
-        } else {
-            format!(
+            ),
+            Some(Unreviewed::Change) => format!(
+                "The plan, revised on the resolver's change after design review pass {}, waits \
+                 for your approval: the PLAN comment above shows it.",
+                pass.saturating_sub(1)
+            ),
+            None => format!(
                 "The plan passed design review pass {pass} and waits for your approval: the \
                  PLAN comment above shows it."
-            )
+            ),
         };
         let asked = vec![approval_question(&kept.plan, plan_link(&ticket, &kept))];
         // The approval is the decider's alone under `always` (OWL-342).
@@ -2383,7 +2595,13 @@ impl OnDemand<'_> {
                     pass: kept.pass.get(),
                     reviewers: kept.reviewers.iter().map(PlanReviewer::from).collect(),
                     findings: kept.findings.clone(),
-                    revision: kept.revision.is_some(),
+                    // A resolver's change applied with no pass is the
+                    // loop's last pass (OWL-463); an earlier revision is
+                    // Design's last revision (OWL-377).
+                    revision: kept.revision.as_ref().map(|_| match comment.revision {
+                        Some(kind) if kept.pass.get() == comment.pass => kind,
+                        _ => Unreviewed::LastRevision,
+                    }),
                     dropped: kept.dropped.clone(),
                 })
                 .collect(),
@@ -2861,6 +3079,166 @@ mod tests {
         assert_eq!(since.pass.get(), 2);
         assert_eq!(since.parts, [PlanPart::Approach]);
         assert!(design_since(Some(&record), 1, &after).is_none());
+    }
+
+    /// OWL-463: a resolver's change on the approval goes to Build with no
+    /// pass only when its revision left the goal, criteria, forks and
+    /// alternatives as they were, the round carried no `blocker` or `major`
+    /// left unfixed, and the decision is the resolver's still: not reversed,
+    /// no comment of the decider's after it, no ask after it.
+    #[test]
+    fn only_a_resolvers_change_for_the_notes_goes_unreviewed() {
+        use owlshift_core::decider::DeciderRule;
+        let at = |minute: i64| Timestamp::from_second(1_790_000_000 + minute * 60).unwrap();
+        let decision = KeptDecision {
+            at: at(10),
+            comment: "decision-1".to_owned(),
+            question: approval_question(&plan(Vec::new()), None),
+            decision: "Change it: fold F1 into step 1.".to_owned(),
+            basis: "The note is cheap to fold.".to_owned(),
+            basis_kind: Some(BasisKind::Judgment),
+            number: None,
+            reversed: None,
+        };
+        let questions = |decision: KeptDecision| TicketQuestions {
+            decisions: vec![decision],
+            ..TicketQuestions::default()
+        };
+        let decided = questions(decision.clone());
+        let mut asked_after = decided.clone();
+        asked_after.asks.push(Ask {
+            kind: AskKind::Questions,
+            round: NonZeroU32::MIN,
+            at: at(11),
+            comment: "ask-1".to_owned(),
+            questions: Vec::new(),
+            decider: AskDecider {
+                account: "ada".to_owned(),
+                by: DeciderRule::Assignee,
+            },
+            verdicts: Vec::new(),
+            result_refusal: None,
+        });
+        let reversed = questions(KeptDecision {
+            reversed: Some(owlshift_contracts::refs::Reversal {
+                through: at(12),
+                comment: "reply-1".to_owned(),
+            }),
+            ..decision
+        });
+        let comment = |minute: i64, relation: Relation| ThreadEntry::Comment {
+            at: at(minute),
+            author: Author {
+                name: "ada".to_owned(),
+                relation,
+            },
+            body: "No: keep step 1.".to_owned(),
+        };
+        let kept = |severity: Severity, outcome: Option<FindingOutcome>| KeptFinding {
+            outcome,
+            ..pass_findings(
+                &[seat(
+                    &[Mandate::Critic],
+                    HarnessKind::Claude,
+                    vec![finding(1, severity)],
+                )],
+                None,
+            )
+            .remove(0)
+        };
+        let minor = || kept(Severity::Minor, None);
+        let passed = review(&[(1, vec![minor()])]);
+        let rejected_major = review(&[(
+            1,
+            vec![
+                kept(Severity::Major, Some(FindingOutcome::Rejected)),
+                minor(),
+            ],
+        )]);
+        let revised = |outcome: FindingOutcome| {
+            let mut record = review(&[
+                (1, vec![kept(Severity::Major, Some(FindingOutcome::Fixed))]),
+                (2, vec![kept(Severity::Major, Some(outcome)), minor()]),
+            ]);
+            record.passes.push(ReviewPass {
+                revision: Some("run-9".to_owned()),
+                ..review(&[(3, Vec::new())]).passes.remove(0)
+            });
+            record
+        };
+        let fixed = revised(FindingOutcome::Fixed);
+        let disagreed = revised(FindingOutcome::Disagreed);
+        let before = plan(vec![Fork {
+            choice: "Markdown.".to_owned(),
+            options: vec!["Markdown.".to_owned(), "Plain text.".to_owned()],
+            reason: "The docs are Markdown.".to_owned(),
+        }]);
+        let edit = |change: fn(&mut Plan)| {
+            let mut after = before.clone();
+            change(&mut after);
+            after
+        };
+        let notes = edit(|plan| plan.steps[0].test = "T, the encoding checked.".to_owned());
+        let fork = edit(|plan| plan.forks[0].choice = "Plain text.".to_owned());
+        let reason = edit(|plan| plan.forks[0].reason = "Reworded.".to_owned());
+        let alternative = edit(|plan| plan.alternatives.clear());
+        let goal = edit(|plan| plan.goal = "G, wider.".to_owned());
+        let criteria = edit(|plan| plan.criteria.push("C2".to_owned()));
+        let approach = edit(|plan| plan.approach = "A, with a README line.".to_owned());
+        let none: &[ThreadEntry] = &[];
+        let later = [comment(11, Relation::Decider)];
+        let earlier = [comment(9, Relation::Decider)];
+        let others = [comment(11, Relation::Other)];
+        type Case<'a> = (
+            &'a [ThreadEntry],
+            &'a TicketQuestions,
+            &'a TicketReview,
+            u32,
+            &'a Plan,
+            bool,
+        );
+        let cases: [Case<'_>; 15] = [
+            // For the notes: no pass, whatever else the revision changed.
+            (none, &decided, &passed, 1, &notes, true),
+            (none, &decided, &passed, 1, &approach, true),
+            (&earlier, &decided, &passed, 1, &notes, true),
+            (&others, &decided, &passed, 1, &notes, true),
+            // A fork or the scope touched, a reworded reason included.
+            (none, &decided, &passed, 1, &fork, false),
+            (none, &decided, &passed, 1, &reason, false),
+            (none, &decided, &passed, 1, &alternative, false),
+            (none, &decided, &passed, 1, &goal, false),
+            (none, &decided, &passed, 1, &criteria, false),
+            // A major the round carried: one the arbiter rejected, one the
+            // last revision disagreed with; one it fixed is settled.
+            (none, &decided, &rejected_major, 1, &notes, false),
+            (none, &decided, &disagreed, 3, &notes, false),
+            (none, &decided, &fixed, 3, &notes, true),
+            // The decider's word: their comment after the decision, the
+            // decision reversed, an ask after it.
+            (&later, &decided, &passed, 1, &notes, false),
+            (none, &reversed, &passed, 1, &notes, false),
+            (none, &asked_after, &passed, 1, &notes, false),
+        ];
+        for (n, (thread, questions, record, passes, after, unreviewed)) in
+            cases.into_iter().enumerate()
+        {
+            assert_eq!(
+                unreviewed_change(thread, questions, Some(record), passes, &before, after),
+                unreviewed.then(|| "decision-1".to_owned()),
+                "case {n}"
+            );
+        }
+        // No record, or one that does not end with the state's pass: the
+        // pass is run.
+        assert_eq!(
+            unreviewed_change(none, &decided, None, 1, &before, &notes),
+            None
+        );
+        assert_eq!(
+            unreviewed_change(none, &decided, Some(&passed), 2, &before, &notes),
+            None
+        );
     }
 
     /// The PLAN comment lists the rejections and the notes of the loop's

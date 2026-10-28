@@ -1863,6 +1863,233 @@ fn the_resolver_approves_a_forked_plan_under_on_fork() {
     assert_eq!(approved["by"], json!("resolver"));
 }
 
+/// [`FORKED`] with a minor note folded into its step: its fork, goal and
+/// criteria as they were (OWL-463).
+const FORKED_ENCODED: &str = r#"{"goal":"Add GREETING.md saying Hello.",
+"criteria":["GREETING.md says Hello."],
+"approach":"Write GREETING.md with the line the gate greps.",
+"steps":[{"what":"Add GREETING.md, encoded in UTF-8.","test":"The gate's grep for Hello."}],
+"forks":[{"choice":"Markdown.","options":["Markdown.","Plain text."],
+"reason":"The repository's docs are Markdown."}]}"#;
+
+/// [`FORKED`] with its fork chosen otherwise.
+const FORKED_PLAIN: &str = r#"{"goal":"Add GREETING.md saying Hello.",
+"criteria":["GREETING.md says Hello."],
+"approach":"Write GREETING.md with the line the gate greps.",
+"steps":[{"what":"Add GREETING.md.","test":"The gate's grep for Hello."}],
+"forks":[{"choice":"Plain text.","options":["Markdown.","Plain text."],
+"reason":"The repository's docs are Markdown."}]}"#;
+
+/// The resolver's change to the plan on its approval round, option B,
+/// `decision` saying what.
+fn changes(decision: &str) -> String {
+    json!({
+        "format": 14,
+        "status": "done",
+        "summary": "Weighed the plan.",
+        "resolutions": [{
+            "question": "Q1",
+            "outcome": "decided",
+            "category": "approval",
+            "decision": decision,
+            "basis": "The change is cheap, and the decider would take it.",
+            "basis_kind": "judgment",
+            "option": "B",
+        }],
+    })
+    .to_string()
+}
+
+/// OWL-463's acceptance, LOC-1459 replayed: the decider answers the
+/// design's question, the next pass leaves one minor finding, and the
+/// resolver answers the plan's approval "change it" to fold it in. The
+/// design's revision touches no fork and not the scope, so no reviewer runs
+/// after it: the change's DECISION comment approves the revised plan, the
+/// PLAN document says so and still lists the note, and the Build follows the
+/// revised plan with the note. The decider's reply to that DECISION comment
+/// then reverses the approval, back to Design (OWL-345).
+#[test]
+fn a_resolver_change_for_the_notes_alone_reaches_build_with_no_review_pass() {
+    use Role::{AnswerCheck, Arbiter, Build, Design, DesignReview, Resolver};
+    let bench = at_level("standard", "all");
+    bench.on_fork();
+    let (outcome, printed) = bench.run(
+        vec![bench.read(TRADE_OFF), bench.read(&passed_on(&["Q1"]))],
+        None,
+    );
+    assert!(
+        matches!(outcome, Err(Stop::NeedsInput { .. })),
+        "{outcome:?}\n{printed}"
+    );
+    bench.answer("Q1: Markdown.");
+    let note = "Step 1 could name the file's encoding.";
+    let replies = vec![
+        bench.read(&check(&[("Q1", "answered", "Markdown.")])),
+        bench.read(&designed(FORKED)),
+        bench.read(&reviewed(&[("minor", note)])),
+        bench.read(&reviewed(&[])),
+        bench.read(&ruled(&["confirmed"])),
+        bench.read(&changes(
+            "Change it: name the file's encoding in step 1, as F1 notes.",
+        )),
+        bench.read(&answered("changed", Some(FORKED_ENCODED))),
+        bench.limited(),
+    ];
+    let (stopped, printed) = bench.continue_ticket(replies);
+    assert!(
+        matches!(&stopped, Err(Stop::UsageLimit { .. })),
+        "{stopped:?}\n{printed}"
+    );
+    assert_eq!(
+        bench.roles()[2..],
+        [
+            AnswerCheck,
+            Design,
+            DesignReview,
+            DesignReview,
+            Arbiter,
+            Resolver,
+            Design,
+            Build
+        ]
+    );
+    let record = bench.record();
+    let change = record.questions.decisions.last().unwrap();
+    assert_eq!(change.question.category, "plan_approval");
+    let kept = record.plan.as_ref().unwrap();
+    assert!(kept.plan.steps[0].what.contains("UTF-8"), "{kept:?}");
+    let approval = kept.approval.as_ref().expect("the change approves it");
+    assert_eq!(approval.comment, change.comment);
+    let approved = bench
+        .decisions("plan")
+        .into_iter()
+        .find(|event| event["plan"] == "approved")
+        .unwrap();
+    assert_eq!(
+        (
+            &approved["by"],
+            &approved["unreviewed"],
+            &approved["plan_sha256"]
+        ),
+        (
+            &json!("resolver"),
+            &json!(true),
+            &json!(approval.plan_sha256)
+        )
+    );
+    let review = record.review.as_ref().unwrap();
+    let passes: Vec<(u32, bool, usize)> = review
+        .passes
+        .iter()
+        .map(|pass| {
+            (
+                pass.pass.get(),
+                pass.revision.is_some(),
+                pass.reviewers.len(),
+            )
+        })
+        .collect();
+    assert_eq!(passes, [(1, false, 2), (2, true, 0)]);
+    let build = bench.last_of(Build);
+    assert_eq!(build.plan.as_ref().unwrap().plan.steps, kept.plan.steps);
+    let notes = build.findings.expect("the note");
+    let claims: Vec<&str> = notes.findings.iter().map(|f| f.claim.as_str()).collect();
+    assert_eq!((notes.mode, claims), (FindingsMode::Note, vec![note]));
+    // The plan's document, the first, beside the resolver's "Decisions".
+    let published = kept.published.as_ref().expect("the plan's document");
+    assert_eq!(
+        (published.document.as_str(), published.version.get()),
+        ("1", 2)
+    );
+    let plan = fs::read_to_string(
+        bench
+            .remote
+            .checkout
+            .join("tickets")
+            .join(TICKET)
+            .join("documents")
+            .join("1.md"),
+    )
+    .unwrap();
+    for text in [
+        "### Design review, pass 2\n\nThe design's revision on the resolver's change to the \
+         plan, decided on its approval after pass 1: it touched no fork",
+        "F1, minor, critic on Claude Code: Step 1 could name the file's encoding. (noted for \
+         the Build)",
+    ] {
+        assert!(plan.contains(text), "{text}\n---\n{plan}");
+    }
+    let pointer = bench.plan_pointer();
+    assert!(
+        pointer.contains("**Next.** The Build follows this plan."),
+        "{pointer}"
+    );
+
+    bench.reply_as(
+        "maintainer",
+        &approval.comment,
+        "No: keep step 1 as it was.",
+    );
+    let before = bench.roles().len();
+    let (stopped, printed) = bench.continue_ticket(vec![bench.limited()]);
+    assert!(
+        matches!(&stopped, Err(Stop::UsageLimit { .. })),
+        "{stopped:?}\n{printed}"
+    );
+    assert_eq!(bench.roles()[before..], [Design]);
+    let record = bench.record();
+    assert!(record.plan.unwrap().approval.is_none());
+    assert!(
+        record
+            .questions
+            .decisions
+            .last()
+            .unwrap()
+            .reversed
+            .is_some()
+    );
+}
+
+/// OWL-463: a resolver's change that chooses a fork otherwise gets its
+/// review pass, and the plan's approval is asked again.
+#[test]
+fn a_resolver_change_of_a_fork_gets_its_review_pass() {
+    use Role::{Design, DesignReview, Resolver};
+    let bench = at_level("standard", "all");
+    bench.on_fork();
+    let replies = vec![
+        bench.read(&designed(FORKED)),
+        bench.read(&reviewed(&[])),
+        bench.read(&reviewed(&[])),
+        bench.read(&changes("Change it: fork 1 option B, plain text.")),
+        bench.read(&answered("changed", Some(FORKED_PLAIN))),
+        bench.read(&reviewed(&[])),
+        bench.read(&reviewed(&[])),
+        bench.read(&passed_on(&["Q1"])),
+    ];
+    let (outcome, printed) = bench.run(replies, None);
+    let stop = outcome.expect_err("the approval asked again");
+    assert!(
+        matches!(&stop, Stop::NeedsInput { questions, .. }
+            if questions[0].category == "plan_approval"),
+        "{stop:?}\n{printed}"
+    );
+    assert_eq!(
+        bench.roles(),
+        [
+            Design,
+            DesignReview,
+            DesignReview,
+            Resolver,
+            Design,
+            DesignReview,
+            DesignReview,
+            Resolver
+        ]
+    );
+    assert!(bench.record().plan.unwrap().approval.is_none());
+}
+
 /// A false premise at `all` (OWL-343): the resolver may decide the re-scope,
 /// the design then planning the ticket as re-scoped; the closure, the
 /// runner's own last option, is refused and goes to the decider.

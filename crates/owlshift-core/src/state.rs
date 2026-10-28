@@ -2462,6 +2462,41 @@ mod tests {
         );
     }
 
+    /// A resolver's change for the notes alone (OWL-463): the approval round
+    /// it decided at a last pass counts the pass; the revision's own pass,
+    /// which no reviewer runs, takes it to Build only on the approval of the
+    /// revised plan's hash, never on the plan put to approval.
+    #[test]
+    fn a_resolvers_change_for_notes_reaches_build_on_the_revised_plans_approval() {
+        use Event::{Completed, RoundDecided};
+        let last = state(Status::Active(Stage::DesignReview), 1, 0, 0)
+            .with_review_passes(MAX_REVIEW_PASSES - 1)
+            .expect("passes in the loop");
+        let revising = walk(last, STANDARD, &[RoundDecided]);
+        assert_eq!(
+            at(revising),
+            (Status::Active(Stage::Design), MAX_REVIEW_PASSES)
+        );
+        let unreviewed = walk(revising, STANDARD, &[Completed]);
+        let gate = |kept| {
+            GatePolicy::new(Vec::<String>::new(), PlanApproval::OnFork)
+                .plan_gate(STANDARD, true, OTHER_PLAN, kept)
+        };
+        assert!(
+            unreviewed
+                .apply_gated(STANDARD, Completed, gate(Some(PLAN)))
+                .is_err()
+        );
+        assert_eq!(
+            at(to(unreviewed.apply_gated(
+                STANDARD,
+                Completed,
+                gate(Some(OTHER_PLAN))
+            ))),
+            (Status::Active(Stage::Build), 0)
+        );
+    }
+
     /// A plan invalidated during Build goes back to Design with no review
     /// pass behind it: no approval takes it to Build before its new plan is
     /// reviewed, and that plan goes through the gate as the first did.

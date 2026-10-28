@@ -19,6 +19,11 @@
 //! | Design review | `minor` | [`Fate::Note`] | [`Fate::Note`] |
 //! | Verify | `blocker`, `major` | [`Fate::Fix`] | [`Fate::LastFix`] |
 //! | Verify | `minor` | [`Fate::Fix`] beside a `blocker` or `major`, else [`Fate::LastFix`] | [`Fate::LastFix`] |
+//!
+//! After the review passes, a change the resolver decides on the plan's
+//! approval buys one more pass only when it touched a fork or the work's
+//! scope, or answered a `blocker` or `major` the approval round carried
+//! ([`resolver_change_reviewed`], OWL-463); a decider's change always does.
 
 use crate::gate::PlanGate;
 use crate::state::{Event, is_last_review_pass};
@@ -143,6 +148,31 @@ pub fn settle(stage: Stage, pass: u32, findings: &[Standing]) -> Option<PassVerd
     Some(PassVerdict { outcome, fates })
 }
 
+/// A finding the plan's approval round carried to the resolver (OWL-463):
+/// those of the pass that passed, or, after Design's last revision, those
+/// the revision answered.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct Carried {
+    pub severity: Severity,
+    /// Its author fixed it: Design's last revision did (OWL-377).
+    pub fixed: bool,
+}
+
+/// Whether a change the resolver decided on the plan's approval, once
+/// Design's revision applied it, gets one more review pass (OWL-463;
+/// architecture section 5, "A change the resolver decides"). `touched` says
+/// that the revision changed the plan's forks, its alternatives, its goal or
+/// its criteria; `carried`, the findings the approval round gave the
+/// resolver. A change that touched none of them and leaves no `blocker` or
+/// `major` unfixed goes to Build with no pass, the resolver's decision
+/// approving it; any other gets its pass, as a decider's change always does.
+pub fn resolver_change_reviewed(touched: bool, carried: &[Carried]) -> bool {
+    touched
+        || carried
+            .iter()
+            .any(|finding| finding.severity != Severity::Minor && !finding.fixed)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -238,6 +268,32 @@ mod tests {
                 settle(stage, pass, findings),
                 expected,
                 "{stage:?} pass {pass}: {findings:?}"
+            );
+        }
+    }
+
+    /// OWL-463: a resolver's change for the notes alone gets no pass; one
+    /// that touched a fork or the scope, or that leaves a `blocker` or
+    /// `major` of the round unfixed, gets its pass.
+    #[test]
+    fn a_resolver_change_is_reviewed_only_past_the_notes() {
+        let carried = |severity, fixed| Carried { severity, fixed };
+        let minor = carried(Severity::Minor, false);
+        let cases: [(bool, &[Carried], bool); 7] = [
+            (false, &[], false),
+            (false, &[minor, minor], false),
+            (true, &[minor], true),
+            (false, &[minor, carried(Severity::Major, false)], true),
+            (false, &[carried(Severity::Blocker, false)], true),
+            // What Design's last revision fixed is no longer open.
+            (false, &[carried(Severity::Major, true), minor], false),
+            (true, &[carried(Severity::Blocker, true)], true),
+        ];
+        for (touched, findings, reviewed) in cases {
+            assert_eq!(
+                resolver_change_reviewed(touched, findings),
+                reviewed,
+                "touched {touched}: {findings:?}"
             );
         }
     }

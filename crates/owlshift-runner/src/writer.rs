@@ -2145,9 +2145,10 @@ pub struct PlanComment {
     /// kept its choice on (OWL-377), listed with their reasons, and the
     /// `minor` ones noted for the Build (OWL-356).
     pub earlier: Vec<(u32, KeptFinding)>,
-    /// The pass that ended is Design's last revision, which no reviewer
-    /// reviews (OWL-377).
-    pub revision: bool,
+    /// The pass that ended is a revision no reviewer reviews, and which:
+    /// Design's last revision (OWL-377) or a resolver's change on the plan's
+    /// approval (OWL-463).
+    pub revision: Option<Unreviewed>,
     /// The passes of the loop that ran without the opt-in Codex reviewer,
     /// each with why (OWL-348), oldest first.
     pub dropped: Vec<(u32, DroppedReviewer)>,
@@ -2187,12 +2188,13 @@ impl PlanComment {
     /// its reason, the earlier passes' first, each pass in id order; an
     /// earlier pass's note for the Build is left too (OWL-356).
     fn sorted(&self) -> Sorted<'_> {
-        let at = if self.revision {
+        let at = if self.revision.is_some() {
             self.pass.saturating_sub(1)
         } else {
             self.pass
         };
-        let (mut last, mut rejected, mut kept) = fates(at, &self.findings, self.revision);
+        let revised = self.revision == Some(Unreviewed::LastRevision);
+        let (mut last, mut rejected, mut kept) = fates(at, &self.findings, revised);
         let mut earlier: Vec<Rejected<'_>> = self
             .earlier
             .iter()
@@ -2249,8 +2251,8 @@ impl PlanComment {
         sections.push(format!(
             "**Design review, pass {}.** {}",
             self.pass,
-            if self.revision {
-                last_revision_line(self.pass)
+            if let Some(kind) = self.revision {
+                kind.line(self.pass)
             } else if reviewers.is_empty() {
                 "No reviewer.".to_owned()
             } else {
@@ -2341,14 +2343,35 @@ type Rejected<'a> = (u32, &'a KeptFinding, &'a str);
 /// on or deferred.
 type Sorted<'a> = (Vec<Left<'a>>, Vec<Rejected<'a>>, Vec<Rejected<'a>>);
 
-/// What the PLAN comment and the plan's document say of the last
-/// revision's pass, `pass` (OWL-377).
-fn last_revision_line(pass: u32) -> String {
-    format!(
-        "The design's last revision, after the findings of pass {}: past the review loop's \
-         bound, no reviewer reviews it.",
-        pass.saturating_sub(1)
-    )
+/// A Design review pass no reviewer runs: which revision it keeps.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Unreviewed {
+    /// Design's last revision, answering what the loop's last pass left
+    /// (OWL-377).
+    LastRevision,
+    /// A change the resolver decided on the plan's approval, applied by
+    /// Design: it touched no fork and not the work's scope, and answered no
+    /// `blocker` or `major` (OWL-463).
+    Change,
+}
+
+impl Unreviewed {
+    /// What the PLAN comment and the plan's document say of such a pass,
+    /// `pass`.
+    fn line(self, pass: u32) -> String {
+        let before = pass.saturating_sub(1);
+        match self {
+            Self::LastRevision => format!(
+                "The design's last revision, after the findings of pass {before}: past the \
+                 review loop's bound, no reviewer reviews it."
+            ),
+            Self::Change => format!(
+                "The design's revision on the resolver's change to the plan, decided on its \
+                 approval after pass {before}: it touched no fork and not the work's scope and \
+                 answered no blocker or major, so no reviewer reviews it; Verify reviews the code."
+            ),
+        }
+    }
 }
 
 /// Whether the author kept its choice against `kept` or deferred it
@@ -2557,9 +2580,9 @@ pub struct DocumentPass {
     pub reviewers: Vec<PlanReviewer>,
     /// Its findings, as the ticket's review record keeps them.
     pub findings: Vec<KeptFinding>,
-    /// The pass is Design's last revision, which no reviewer reviews
-    /// (OWL-377).
-    pub revision: bool,
+    /// The pass is a revision no reviewer reviews, and which (OWL-377,
+    /// OWL-463).
+    pub revision: Option<Unreviewed>,
     /// The opt-in Codex reviewer the pass ran without, and why (OWL-348).
     pub dropped: Option<DroppedReviewer>,
 }
@@ -2607,7 +2630,9 @@ impl PlanDocument {
             .iter()
             .enumerate()
             .map(|(n, pass)| {
-                let revised = passes.get(n + 1).is_some_and(|after| after.revision);
+                let revised = passes
+                    .get(n + 1)
+                    .is_some_and(|after| after.revision == Some(Unreviewed::LastRevision));
                 fates(pass.pass, &pass.findings, revised)
             })
             .collect();
@@ -2646,8 +2671,8 @@ impl PlanDocument {
                     .map(|reviewer| reviewer_line(reviewer, "the design run's"))
                     .collect();
                 let mut lines = vec![format!("### Design review, pass {}", pass.pass)];
-                lines.push(if pass.revision {
-                    last_revision_line(pass.pass)
+                lines.push(if let Some(kind) = pass.revision {
+                    kind.line(pass.pass)
                 } else if reviewers.is_empty() {
                     "No reviewer named.".to_owned()
                 } else {
@@ -2709,7 +2734,11 @@ impl PlanDocument {
                         bullets(&found)
                     ));
                 }
-                if left.is_empty() && rejected.is_empty() && kept.is_empty() && !pass.revision {
+                if left.is_empty()
+                    && rejected.is_empty()
+                    && kept.is_empty()
+                    && pass.revision.is_none()
+                {
                     lines.push("No finding left or rejected.".to_owned());
                 }
                 sections.push(lines.join("\n\n"));
@@ -5272,7 +5301,7 @@ Merge state reported by the forge: `CLEAN`.
                     Some("Earlier."),
                 ),
             )],
-            revision: false,
+            revision: None,
             dropped: Vec::new(),
             next: PlanNext::Approval,
             run: Some("r1".to_owned()),
@@ -5349,9 +5378,9 @@ Merge state reported by the forge: `CLEAN`.
                 disagreed(2),
             ],
             earlier: Vec::new(),
-            revision: true,
+            revision: Some(Unreviewed::LastRevision),
             next: PlanNext::Build,
-            ..comment
+            ..comment.clone()
         };
         let body = revision.render();
         for line in [
@@ -5365,6 +5394,27 @@ Merge state reported by the forge: `CLEAN`.
             assert!(body.contains(line), "{line}\n---\n{body}");
         }
         assert_eq!(revision.open_findings(), 2);
+        // A resolver's change applied with no pass (OWL-463): the notes of
+        // the pass before still listed for the Build.
+        let change = PlanComment {
+            pass: 2,
+            reviewers: Vec::new(),
+            findings: vec![kept_finding(1, Severity::Minor, None, None)],
+            earlier: Vec::new(),
+            revision: Some(Unreviewed::Change),
+            next: PlanNext::Build,
+            ..comment
+        };
+        let body = change.render();
+        for line in [
+            "**Design review, pass 2.** The design's revision on the resolver's change to the \
+             plan, decided on its approval after pass 1: it touched no fork and not the work's \
+             scope and answered no blocker or major, so no reviewer reviews it; Verify reviews \
+             the code.",
+            "- F1, minor, critic and conformance on Claude Code: Claim 1. (noted for the Build)",
+        ] {
+            assert!(body.contains(line), "{line}\n---\n{body}");
+        }
     }
 
     /// A finding the arbiter confirmed and the design disagreed with
@@ -5399,7 +5449,7 @@ Merge state reported by the forge: `CLEAN`.
             reviewers: Vec::new(),
             findings,
             earlier: Vec::new(),
-            revision: false,
+            revision: None,
             dropped: Vec::new(),
             next: PlanNext::Build,
             run: None,
@@ -5550,7 +5600,7 @@ Merge state reported by the forge: `CLEAN`.
                             Some("Not so."),
                         ),
                     ],
-                    revision: false,
+                    revision: None,
                     dropped: None,
                 },
                 DocumentPass {
@@ -5560,7 +5610,7 @@ Merge state reported by the forge: `CLEAN`.
                         kept_finding(1, Severity::Major, Some(FindingOutcome::Fixed), None),
                         disagreed(3),
                     ],
-                    revision: false,
+                    revision: None,
                     // OWL-348.
                     dropped: Some(codex_dropped()),
                 },
@@ -5569,7 +5619,7 @@ Merge state reported by the forge: `CLEAN`.
                     pass: 3,
                     reviewers: Vec::new(),
                     findings: Vec::new(),
-                    revision: true,
+                    revision: Some(Unreviewed::LastRevision),
                     dropped: None,
                 },
             ],
@@ -5626,7 +5676,7 @@ Merge state reported by the forge: `CLEAN`.
                 pass: 1,
                 reviewers: Vec::new(),
                 findings: findings.clone(),
-                revision: false,
+                revision: None,
                 dropped: None,
             }],
         }
@@ -5650,7 +5700,7 @@ Merge state reported by the forge: `CLEAN`.
                     pass,
                     reviewers: Vec::new(),
                     findings: short.clone(),
-                    revision: false,
+                    revision: None,
                     dropped: None,
                 })
                 .collect(),

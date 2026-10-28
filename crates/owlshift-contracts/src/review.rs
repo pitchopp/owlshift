@@ -516,7 +516,8 @@ pub struct KeptApproval {
     /// The tracker's identifier of the comment that approved it: the
     /// decider's, or the approval round's own when the decider answered it
     /// with a thumbs-up (OWL-371), or, when the resolver decided the
-    /// approval (OWL-343), its DECISION comment, kept with the decision in
+    /// approval (OWL-343), or a change Design applied with no review pass
+    /// (OWL-463), its DECISION comment, kept with the decision in
     /// `questions.json`.
     #[schemars(regex(pattern = r"\S"))]
     pub comment: String,
@@ -684,10 +685,13 @@ pub struct ReviewPass {
     /// keeping only the current plan.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub plan: Option<PlanPrint>,
-    /// At Design review, the design run whose last revision the pass keeps
-    /// (OWL-377): the revision that answered the findings of the pass
-    /// before, the loop's last, which no reviewer reviews. Such a pass has
-    /// no reviewer, no finding and no plan's print.
+    /// At Design review, the design run whose revision the pass keeps, which
+    /// no reviewer reviews: Design's last revision, which answered the
+    /// findings of the pass before, the loop's last (OWL-377), or, since
+    /// OWL-463, the revision that applied a resolver's change on the plan's
+    /// approval with no review pass, the plan's approval naming that
+    /// change's DECISION comment. Such a pass has no reviewer, no finding
+    /// and no plan's print.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(regex(pattern = r"\S"))]
     pub revision: Option<String>,
