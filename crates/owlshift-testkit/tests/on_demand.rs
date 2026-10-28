@@ -12108,3 +12108,8 @@ mod merge_scenarios;
 /// Scenario S5 at Watch under `policy.overlap = "rebase"` (OWL-449).
 #[path = "on_demand/overlap_scenarios.rs"]
 mod overlap_scenarios;
+
+/// What each ticket in flight waits on, read by `owlshift status --waits`
+/// from a drain's refs and events (OWL-459).
+#[path = "on_demand/waits_scenarios.rs"]
+mod waits_scenarios;

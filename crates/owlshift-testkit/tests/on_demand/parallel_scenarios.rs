@@ -15,7 +15,7 @@ use super::*;
 
 /// The admitting bench, its project file's `[policy]` given `policy`, and
 /// DEMO-1 blocked by DEMO-9, a ticket of the tracker no gesture admits.
-fn parallel_bench(policy: &str) -> Bench {
+pub(super) fn parallel_bench(policy: &str) -> Bench {
     let bench = Bench::build_admitting(
         "maintainer",
         "assignee = \"maintainer\"\nlabels = [\"agent\"]\nblocked_by = [\"DEMO-9\"]\n",
@@ -29,14 +29,14 @@ fn parallel_bench(policy: &str) -> Bench {
 
 /// An intake declaring `zones`, the ticket `standard`: its dispatch runs
 /// Design first, one stage step.
-fn standard_declaring(zones: &[&str]) -> String {
+pub(super) fn standard_declaring(zones: &[&str]) -> String {
     let mut result: Value = serde_json::from_str(&intake_declaring(zones, &[])).unwrap();
     result["intake"]["variant"] = json!("standard");
     result.to_string()
 }
 
 /// A Design run's plan: the step stops at Design review.
-fn planned() -> String {
+pub(super) fn planned() -> String {
     super::design_scenarios::designed(super::design_scenarios::PLAN)
 }
 
@@ -518,7 +518,7 @@ fn planning(files: &[&str]) -> String {
 }
 
 /// A Build run of `id` that greets, as the gate asks, and writes `file`.
-fn building(bench: &Bench, id: &str, file: &str) -> Reply {
+pub(super) fn building(bench: &Bench, id: &str, file: &str) -> Reply {
     let mut reply = bench.reply(Some("Hello"), Some(&super::drain_scenarios::done_for(id)));
     reply
         .files
@@ -531,7 +531,7 @@ fn building(bench: &Bench, id: &str, file: &str) -> Reply {
 /// two, DEMO-2 first when `urgent`; each Design plans `plans`' files; then
 /// the drain's passes, `builds` the Build replies of the pass whose steps
 /// reach Build. Returns watch's lines and the events printed.
-fn two_planned(bench: &Bench, plans: [&[&str]; 2], builds: Vec<Reply>) -> String {
+pub(super) fn two_planned(bench: &Bench, plans: [&[&str]; 2], builds: Vec<Reply>) -> String {
     let reviewed = || bench.read(&super::design_scenarios::reviewed(&[]));
     let mut replies = vec![
         bench.reply(None, Some(&standard_declaring(&["app"]))),

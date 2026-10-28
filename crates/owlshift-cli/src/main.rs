@@ -189,7 +189,19 @@ enum Command {
     /// draining) and the file it runs on, the tickets waiting for a person,
     /// the steps under way, each harness's usage and reset, the latest
     /// digest. Read only, takes no lock.
-    Status,
+    Status {
+        /// Instead, what each ticket in flight or admitted waits on and
+        /// behind whom: the holders with what waits behind each, the queues
+        /// for a slot, the other waits.
+        #[arg(long)]
+        waits: bool,
+        /// With --waits: print it as JSON (`schemas/status-waits.schema.json`).
+        #[arg(long, requires = "waits")]
+        json: bool,
+        /// With --waits: only this project, such as acme/web, served or not.
+        #[arg(value_name = "OWNER/REPO", requires = "waits")]
+        repo: Option<String>,
+    },
     /// Remove what Owlshift installed on this machine, as its install
     /// manifest lists it: the service at login and the keychain entries
     /// `owlshift init` stored. A daemon that runs is stopped first, its runs
@@ -342,7 +354,13 @@ fn main() -> ExitCode {
         Command::Stop { forget, at_login } => service_cmd::stop(&config, forget, at_login),
         Command::Pause { repo, reason } => pause_cmd::pause(repo.as_deref(), reason.as_deref()),
         Command::Resume { repo } => pause_cmd::resume(repo.as_deref()),
-        Command::Status => status_cmd::run(&config),
+        Command::Status { waits, json, repo } => {
+            if waits {
+                status_cmd::waits(&config, repo.as_deref(), json)
+            } else {
+                status_cmd::run(&config)
+            }
+        }
         Command::Uninstall { purge } => service_cmd::uninstall(purge),
         Command::Daemon => service_cmd::daemon(&system, &config),
         Command::Logs {
@@ -429,9 +447,15 @@ mod tests {
             &["resume"],
             &["resume", "acme/web"],
             &["status"],
+            // OWL-459.
+            &["status", "--waits"],
+            &["status", "--waits", "--json", "acme/web"],
         ] {
             assert_eq!(of(args), None, "{args:?}");
         }
+        // OWL-459: --json and a project only with --waits.
+        assert!(Cli::try_parse_from(["owlshift", "status", "--json"]).is_err());
+        assert!(Cli::try_parse_from(["owlshift", "status", "acme/web"]).is_err());
         // OWL-437: removing the service while forgetting one project is no
         // one command.
         assert!(Cli::try_parse_from(["owlshift", "stop", "--forget", "--at-login"]).is_err());
