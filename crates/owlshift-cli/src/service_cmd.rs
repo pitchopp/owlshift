@@ -20,6 +20,7 @@ use owlshift_contracts::service::{BY_STOP, DaemonRecord, Request};
 use owlshift_platform::keychain::Keychain;
 use owlshift_platform::service::{HostManager, Layout, Manager};
 use owlshift_runner::config::{Effective, FileState, OWLSHIFT_VERSION};
+use owlshift_runner::daemon::upgrade::Binary;
 use owlshift_runner::daemon::{self, Daemon, Held, Timing, requests};
 use owlshift_runner::events::printable;
 use owlshift_runner::install::uninstall::{self, Personal, Stopped};
@@ -31,7 +32,7 @@ use owlshift_runner::watch::drain_refusal;
 use owlshift_runner::{on_demand, project};
 
 use crate::do_cmd::loaded_project;
-use crate::{data_dir, fail};
+use crate::{data_dir, fail, own_build};
 
 /// Why the service is refused on native Windows.
 const ON_WINDOWS: &str = "the background service runs on macOS and Linux, and on Windows through \
@@ -69,6 +70,7 @@ pub fn daemon(system: &dyn System, config: &Effective) -> ExitCode {
         version: OWLSHIFT_VERSION.to_owned(),
         binary: own.path.display().to_string(),
         since: Timestamp::now(),
+        build: Some(own_build()),
     };
     let instance = match daemon::instance::take(&data, &record) {
         Ok(Ok(instance)) => instance,
@@ -114,8 +116,13 @@ pub fn hand_over(data: &Path, by: &str) -> Option<String> {
             ));
         }
     };
-    match daemon::upgrade::hand_over(data, OWLSHIFT_VERSION, &binary, by) {
-        Ok(handover) => handover.line(OWLSHIFT_VERSION),
+    let build = own_build();
+    let own = Binary {
+        version: OWLSHIFT_VERSION,
+        build: Some(&build),
+    };
+    match daemon::upgrade::hand_over(data, own, &binary, by) {
+        Ok(handover) => handover.line(own),
         Err(error) => Some(format!(
             "warning: the daemon was not handed over to this binary: {error}"
         )),

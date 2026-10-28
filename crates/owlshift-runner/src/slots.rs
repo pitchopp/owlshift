@@ -222,8 +222,9 @@ fn remove_stale(record: &Path) {
 }
 
 /// Writes a holder record whole, tried a few times; a record that cannot
-/// be written is left out.
-fn write_record(path: &Path, text: &str) {
+/// be written is left out. A watch's holder record is written so too
+/// (OWL-462, `watch::presence::record`).
+pub(crate) fn write_record(path: &Path, text: &str) {
     for tried in 0..RECORD_TRIES {
         if tried > 0 {
             thread::sleep(RECORD_PAUSE);

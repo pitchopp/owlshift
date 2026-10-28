@@ -81,14 +81,25 @@ fn version_lists_the_format_versions() {
     let config_dir = tempfile::tempdir().unwrap();
     let output = owlshift(config_dir.path(), config_dir.path(), &["--version"]);
     assert!(output.status.success());
+    let text = stdout(&output);
+    let lines: Vec<&str> = text.lines().collect();
     assert_eq!(
-        stdout(&output),
-        concat!(
-            "owlshift ",
-            env!("CARGO_PKG_VERSION"),
-            "\nformats: brief 29, result 14, event 2, claim 1, ticket state 4, ticket questions 17, \
-             comment footer 1\n"
-        )
+        lines[0],
+        concat!("owlshift ", env!("CARGO_PKG_VERSION")),
+        "{text}"
+    );
+    // OWL-462: the build, whichever tree this test was built in.
+    assert!(
+        lines[1].starts_with("build: ") && lines[1].contains(", built "),
+        "{text}"
+    );
+    assert_eq!(
+        lines[2..],
+        [
+            "formats: brief 29, result 14, event 2, claim 1, ticket state 4, ticket questions 17, \
+             comment footer 1"
+        ],
+        "{text}"
     );
 }
 

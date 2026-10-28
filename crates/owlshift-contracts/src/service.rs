@@ -22,7 +22,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::format::{
     self, ContractError, DAEMON_FORMAT, DIGEST_FORMAT, Format, MANIFEST_FORMAT,
-    SERVED_CONFIG_FORMAT, SERVED_PROJECTS_FORMAT,
+    SERVED_CONFIG_FORMAT, SERVED_PROJECTS_FORMAT, WATCH_FORMAT,
 };
 
 /// Who asks in a [`Request`] the daemon writes: a project's pause after a
@@ -53,13 +53,189 @@ pub struct DaemonRecord {
     pub binary: String,
     /// When it started.
     pub since: Timestamp,
+    /// The build of its binary (format 2, OWL-462); absent from a format-1
+    /// record, written before it, which is read as an unknown build.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub build: Option<BuildIdentity>,
 }
 
 impl DaemonRecord {
     const CONTRACT: &str = "daemon record";
 
+    /// Parses a record; a format-1 one is read as the current format with
+    /// no build.
     pub fn parse(input: &str) -> Result<Self, ContractError> {
-        format::parse_json(Self::CONTRACT, DAEMON_FORMAT, input)
+        let record: Self = match Self::from_format_1(input) {
+            Some(read) => read?,
+            None => format::parse_json(Self::CONTRACT, DAEMON_FORMAT, input)?,
+        };
+        if let Some(build) = &record.build {
+            build.validate(Self::CONTRACT)?;
+        }
+        Ok(record)
+    }
+
+    /// A format-1 record read as the current format, or `None` for any
+    /// other: format 1 is format 2 without `build`, refused in it.
+    fn from_format_1(input: &str) -> Option<Result<Self, ContractError>> {
+        let mut document: serde_json::Value = serde_json::from_str(input).ok()?;
+        if document.get("format").and_then(serde_json::Value::as_u64) != Some(1) {
+            return None;
+        }
+        if document.get("build").is_some() {
+            return Some(Err(ContractError::invalid(
+                Self::CONTRACT,
+                "format 1 records no build",
+            )));
+        }
+        document["format"] = DAEMON_FORMAT.into();
+        Some(
+            serde_json::from_value(document).map_err(|source| ContractError::Json {
+                contract: Self::CONTRACT,
+                source,
+            }),
+        )
+    }
+
+    pub fn render(&self) -> String {
+        format::render_json(self)
+    }
+}
+
+/// What a binary was built from (OWL-462, architecture section 5, "An
+/// upgrade", "Newer"): set at compile time by the `owlshift` binary's build
+/// script, and recorded beside the pid by the daemon ([`DaemonRecord`]) and
+/// by each watch ([`WatchRecord`]).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct BuildIdentity {
+    /// The commit it was built from, a full commit id in lowercase
+    /// hexadecimal; absent when it was not built from a git tree of
+    /// Owlshift's workspace, the build then unknown.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub commit: Option<String>,
+    /// Whether the tree held uncommitted changes to tracked files.
+    pub dirty: bool,
+    /// When the build script last ran, which is when the binary was built
+    /// unless nothing it watches changed since.
+    pub built_at: Timestamp,
+    /// The git tree it was built from, an absolute path, when known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
+}
+
+impl BuildIdentity {
+    /// The identity the build script described: `commit`, kept only when it
+    /// is a full commit id; `dirty`, `1` when the tree held changes;
+    /// `built_at`, in seconds since the Unix epoch, the epoch itself when it
+    /// does not read; `source`, none when empty.
+    pub fn from_build(commit: &str, dirty: &str, built_at: &str, source: &str) -> Self {
+        Self {
+            commit: full_commit(commit).then(|| commit.to_owned()),
+            dirty: dirty == "1",
+            built_at: built_at
+                .parse::<i64>()
+                .ok()
+                .and_then(|seconds| Timestamp::from_second(seconds).ok())
+                .unwrap_or(Timestamp::UNIX_EPOCH),
+            source: (!source.is_empty()).then(|| source.to_owned()),
+        }
+    }
+
+    /// Whether `self` and `other` are the same build: the very same one
+    /// (commit, changes and time), or one commit with no uncommitted change
+    /// in either, whose code is the same whenever it was built.
+    pub fn same_build(&self, other: &Self) -> bool {
+        let identical = self.commit == other.commit
+            && self.dirty == other.dirty
+            && self.built_at == other.built_at;
+        let clean_commit =
+            self.commit.is_some() && self.commit == other.commit && !self.dirty && !other.dirty;
+        identical || clean_commit
+    }
+
+    /// In a few words, for a line about it: the commit's first 12 digits,
+    /// whether it was dirty, and when it was built.
+    pub fn short(&self) -> String {
+        let commit = self
+            .commit
+            .as_deref()
+            .map_or("unknown commit", |commit| &commit[..12]);
+        let dirty = if self.dirty { " (dirty)" } else { "" };
+        format!("{commit}{dirty}, built {}", self.built_at)
+    }
+
+    fn validate(&self, contract: &'static str) -> Result<(), ContractError> {
+        match &self.commit {
+            Some(commit) if !full_commit(commit) => Err(ContractError::invalid(
+                contract,
+                format!("the build's commit `{commit}` is not a full commit id"),
+            )),
+            _ => Ok(()),
+        }
+    }
+}
+
+impl std::fmt::Display for BuildIdentity {
+    /// In full, as `owlshift --version` prints it.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match &self.commit {
+            Some(commit) => write!(f, "commit {commit}")?,
+            None => write!(f, "unknown commit (not built from a git tree of Owlshift)")?,
+        }
+        if self.dirty {
+            write!(f, " with uncommitted changes")?;
+        }
+        write!(f, ", built {}", self.built_at)?;
+        if let Some(source) = &self.source {
+            write!(f, ", from {source}")?;
+        }
+        Ok(())
+    }
+}
+
+/// Whether `text` is a full commit id: 40 lowercase hexadecimal digits, or
+/// 64 in a SHA-256 repository.
+fn full_commit(text: &str) -> bool {
+    matches!(text.len(), 40 | 64)
+        && text
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+/// A watch that runs on a project (OWL-462): `watches/<pid>.json` in the
+/// project's folder, written once the watch holds `watches/<pid>.lock` and
+/// removed at its end, so `owlshift doctor` tells which build each watch
+/// runs. A record whose lock is free is a dead watch's.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+#[schemars(title = "Owlshift watch")]
+pub struct WatchRecord {
+    pub format: Format<WATCH_FORMAT>,
+    /// Its process id.
+    pub pid: u32,
+    /// Its project, `owner/name`.
+    pub project: String,
+    /// Whether the daemon runs it (`owlshift watch --drain --served`),
+    /// rather than a person in a terminal.
+    pub served: bool,
+    /// When it started.
+    pub since: Timestamp,
+    /// The binary it runs, resolved when it started.
+    pub binary: String,
+    /// The version of its binary.
+    pub version: String,
+    /// The build of its binary.
+    pub build: BuildIdentity,
+}
+
+impl WatchRecord {
+    const CONTRACT: &str = "watch record";
+
+    pub fn parse(input: &str) -> Result<Self, ContractError> {
+        let record: Self = format::parse_json(Self::CONTRACT, WATCH_FORMAT, input)?;
+        record.build.validate(Self::CONTRACT)?;
+        Ok(record)
     }
 
     pub fn render(&self) -> String {
@@ -486,22 +662,94 @@ mod tests {
         ));
     }
 
+    fn build(commit: &str, dirty: bool, built_at: &str) -> BuildIdentity {
+        BuildIdentity {
+            commit: (!commit.is_empty()).then(|| commit.repeat(40)),
+            dirty,
+            built_at: at(built_at),
+            source: Some("/home/ada/owlshift".to_owned()),
+        }
+    }
+
+    /// OWL-462: format 2 records the build and reads back; a format-1
+    /// record reads as an unknown build, and one naming a build is refused;
+    /// a build whose commit is no commit id leaves the record unread.
     #[test]
-    fn a_daemon_record_reads_back_and_a_newer_one_is_refused() {
+    fn a_daemon_record_reads_back_with_its_build_and_a_format_1_one_without() {
         let record = DaemonRecord {
             format: Format,
             pid: 4242,
             version: "0.4.0".to_owned(),
             binary: "/opt/homebrew/bin/owlshift".to_owned(),
             since: at("2026-10-25T08:00:00Z"),
+            build: Some(build("a", true, "2026-10-25T07:00:00Z")),
         };
         let text = record.render();
         assert_eq!(DaemonRecord::parse(&text).unwrap(), record);
-        let newer = text.replace("\"format\": 1", "\"format\": 2");
+        let newer = text.replace("\"format\": 2", "\"format\": 3");
         assert!(matches!(
             DaemonRecord::parse(&newer),
-            Err(ContractError::NewerFormat { found: 2, .. })
+            Err(ContractError::NewerFormat { found: 3, .. })
         ));
+        let unknown = DaemonRecord {
+            build: None,
+            ..record.clone()
+        };
+        let format_1 = unknown.render().replace("\"format\": 2", "\"format\": 1");
+        assert_eq!(DaemonRecord::parse(&format_1).unwrap(), unknown);
+        let format_1_built = text.replace("\"format\": 2", "\"format\": 1");
+        assert!(DaemonRecord::parse(&format_1_built).is_err());
+        let bad_commit = text.replace(&"a".repeat(40), "main");
+        assert!(DaemonRecord::parse(&bad_commit).is_err());
+
+        let watch = WatchRecord {
+            format: Format,
+            pid: 77,
+            project: "acme/web".to_owned(),
+            served: false,
+            since: at("2026-10-25T09:00:00Z"),
+            binary: "/opt/homebrew/bin/owlshift".to_owned(),
+            version: "0.4.0".to_owned(),
+            build: build("", false, "2026-10-25T07:00:00Z"),
+        };
+        assert_eq!(WatchRecord::parse(&watch.render()).unwrap(), watch);
+    }
+
+    /// What the build script sets reads back; a commit that is no commit id
+    /// is unknown. One clean commit is one build whenever it was built; a
+    /// dirty build matches only itself.
+    #[test]
+    fn a_build_identity_reads_from_the_build_script_and_tells_the_same_build() {
+        let commit = "0123456789abcdef".repeat(3)[..40].to_owned();
+        let read = BuildIdentity::from_build(&commit, "1", "1761609600", "/src/owlshift");
+        assert_eq!(read.commit.as_deref(), Some(commit.as_str()));
+        assert!(read.dirty);
+        assert_eq!(read.built_at, at("2025-10-28T00:00:00Z"));
+        assert_eq!(
+            read.short(),
+            "0123456789ab (dirty), built 2025-10-28T00:00:00Z"
+        );
+        assert_eq!(
+            read.to_string(),
+            format!(
+                "commit {commit} with uncommitted changes, built 2025-10-28T00:00:00Z, from \
+                 /src/owlshift"
+            )
+        );
+        let unknown = BuildIdentity::from_build("HEAD", "0", "soon", "");
+        assert_eq!(unknown.commit, None);
+        assert_eq!((unknown.dirty, unknown.source), (false, None));
+        assert_eq!(unknown.built_at, Timestamp::UNIX_EPOCH);
+
+        let early = build("a", false, "2026-10-25T07:00:00Z");
+        let late = build("a", false, "2026-10-25T08:00:00Z");
+        assert!(early.same_build(&late), "one clean commit");
+        let dirty = build("a", true, "2026-10-25T08:00:00Z");
+        assert!(!early.same_build(&dirty));
+        assert!(dirty.same_build(&dirty.clone()), "the very same build");
+        assert!(!early.same_build(&build("b", false, "2026-10-25T07:00:00Z")));
+        let none = build("", false, "2026-10-25T07:00:00Z");
+        assert!(!none.same_build(&build("", false, "2026-10-25T08:00:00Z")));
     }
 
     /// OWL-437: the manifest reads back; without the line the launcher

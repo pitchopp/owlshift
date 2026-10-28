@@ -31,6 +31,7 @@ use owlshift_adapters::tracker::markdown::MarkdownTracker;
 use owlshift_adapters::tracker::{Capability, ErrorKind, PROPOSED_LABEL};
 use owlshift_contracts::config::{Admit, ProjectConfig, States, Tracker, TrackerKind};
 use owlshift_contracts::ids::TicketId;
+use owlshift_contracts::service::BuildIdentity;
 use owlshift_contracts::{DelegationLevel, Harness};
 use owlshift_core::gate::PassLimit;
 use owlshift_core::schedule::{holds_slot, natural_cmp};
@@ -41,7 +42,8 @@ use owlshift_platform::service::{Kind, LABEL, SYSTEMD_UNIT};
 use serde_json::Value;
 
 use crate::codex_machine::{self, Declared, FULL_ACCESS};
-use crate::config::{Effective, FileState, PROJECT_FILE, exit_text};
+use crate::config::{Effective, FileState, OWLSHIFT_VERSION, PROJECT_FILE, exit_text};
+use crate::daemon::upgrade::{Binary, supersedes};
 use crate::executor::harness::CLAUDE_AGENT_ACCOUNT;
 use crate::executor::{
     MINIMUM_GIT_VERSION, git_floor_reason, git_install_advice, git_recheck_note,
@@ -51,8 +53,8 @@ use crate::install::ServiceState;
 use crate::secrets::{self, ForgeSecret, Source, TrackerAccounts, TrackerSecrets};
 use crate::served;
 use crate::system::{
-    AppError, DataDirSource, DefaultBranch, DefaultBranchFile, MarkerState, RunError, StatesError,
-    System, TokenTryError, exact_version_of, older_than, version_of,
+    AppError, DataDirSource, DefaultBranch, DefaultBranchFile, MarkerState, RunError, Running,
+    RunningBuilds, StatesError, System, TokenTryError, exact_version_of, older_than, version_of,
 };
 #[cfg(unix)]
 use crate::system::{SentinelProbe, SentinelStatus};
@@ -251,8 +253,9 @@ impl Report {
 /// The note of every warning: none blocks `owlshift do`.
 const DOES_NOT_BLOCK: &str = "Does not block `owlshift do`:";
 
-/// Runs every check against the host and the loaded configuration.
-pub fn run(system: &dyn System, config: &Effective) -> Report {
+/// Runs every check against the host and the loaded configuration, this
+/// binary's build being `own` (OWL-462).
+pub fn run(system: &dyn System, config: &Effective, own: &BuildIdentity) -> Report {
     let home = system.home();
     let home = home.as_deref();
     let mut checks = vec![git(system, home)];
@@ -309,6 +312,11 @@ pub fn run(system: &dyn System, config: &Effective) -> Report {
     checks.extend(drain_slot_check(system, config));
     checks.extend(quarantine_check(system, config, home));
     checks.extend(system.service().map(|state| service_check(&state, home)));
+    checks.extend(
+        system
+            .running_builds()
+            .and_then(|running| builds_check(system, running, own, home)),
+    );
     checks.push(data_dir_check(system, home));
     let next = match &config.project {
         FileState::Absent(_) => Next::Init,
@@ -2723,6 +2731,213 @@ fn service_check(state: &ServiceState, home: Option<&Path>) -> Check {
     }
 }
 
+/// How far a build's commit is behind the tree it was built from.
+struct Behind {
+    commits: u64,
+    reference: &'static str,
+    source: String,
+}
+
+/// Whether `build`'s commit is behind `origin/HEAD`, else `origin/main`, of
+/// the tree it was built from, as that tree last fetched it: nothing is
+/// fetched. `None` when it is not, or when git, the tree, the reference or
+/// the commit cannot be read.
+fn behind(system: &dyn System, build: &BuildIdentity) -> Option<Behind> {
+    let (commit, source) = (build.commit.as_deref()?, build.source.as_deref()?);
+    let git = system.locate("git")?;
+    for reference in ["origin/HEAD", "origin/main"] {
+        let range = format!("{commit}..{reference}");
+        match system.run(
+            &git,
+            &["rev-list", "--count", &range],
+            Some(Path::new(source)),
+        ) {
+            Ok(out) if out.code == Some(0) => {
+                let commits: u64 = String::from_utf8_lossy(&out.stdout).trim().parse().ok()?;
+                return (commits > 0).then(|| Behind {
+                    commits,
+                    reference,
+                    source: source.to_owned(),
+                });
+            }
+            _ => continue,
+        }
+    }
+    None
+}
+
+/// Which build each daemon and watch that runs on the data directory runs
+/// (OWL-462; architecture section 5, "An upgrade"): a warning, saying what
+/// to do, for each one whose build is not this binary's `own` or is
+/// unknown, that was started from a file since replaced on disk, or whose
+/// commit is behind the tree it was built from as last fetched ([`behind`]).
+/// No line when none runs; it never blocks `owlshift do`.
+fn builds_check(
+    system: &dyn System,
+    running: Result<RunningBuilds, String>,
+    own: &BuildIdentity,
+    home: Option<&Path>,
+) -> Option<Check> {
+    const SUBJECT: &str = "running builds";
+    let running = match running {
+        Ok(running) => running,
+        Err(error) => {
+            return Some(Check::warn(
+                Section::Project,
+                SUBJECT,
+                format!("not read: {error}"),
+                format!(
+                    "{DOES_NOT_BLOCK} which build the daemon and the watches run is not known."
+                ),
+            ));
+        }
+    };
+    if running.processes.is_empty() {
+        return None;
+    }
+    let mine = Binary {
+        version: OWLSHIFT_VERSION,
+        build: Some(own),
+    };
+    // One look per tree and commit: the daemon and its watches share one.
+    let mut looked: Vec<(&BuildIdentity, Option<Behind>)> = Vec::new();
+    let mut current = Vec::new();
+    let mut problems = Vec::new();
+    for process in &running.processes {
+        let who = who_runs(process);
+        let mut reasons = Vec::new();
+        match (&process.build, &process.version) {
+            (None, Some(_)) => {
+                reasons.push("records no build, being from before OWL-462".to_owned())
+            }
+            (None, None) => {
+                reasons.push("has a record that does not read, its build unknown".to_owned())
+            }
+            (Some(build), _) if !build.same_build(own) => reasons.push(format!(
+                "runs {}, not this binary's {}",
+                build.short(),
+                own.short()
+            )),
+            (Some(_), _) => {}
+        }
+        if process.replaced {
+            reasons.push("was started from a file since replaced on disk".to_owned());
+        }
+        let index = process.build.as_ref().map(|build| {
+            let known = looked
+                .iter()
+                .position(|(seen, _)| seen.commit == build.commit && seen.source == build.source);
+            known.unwrap_or_else(|| {
+                looked.push((build, behind(system, build)));
+                looked.len() - 1
+            })
+        });
+        let behind = index.and_then(|index| looked[index].1.as_ref());
+        if let Some(behind) = behind {
+            reasons.push(format!(
+                "is {} commit{} behind {} of {}, as that tree last fetched it",
+                behind.commits,
+                if behind.commits == 1 { "" } else { "s" },
+                behind.reference,
+                shown(Path::new(&behind.source), home)
+            ));
+        }
+        if reasons.is_empty() {
+            current.push(who);
+            continue;
+        }
+        let todo = what_to_do(process, mine, running.drain.is_some(), behind, home);
+        problems.push(format!("{who} {}: {todo}", reasons.join(", ")));
+    }
+    if problems.is_empty() {
+        return Some(Check::ok(
+            Section::Project,
+            SUBJECT,
+            format!(
+                "{} {} this binary's build ({})",
+                current.join(" and "),
+                if current.len() == 1 { "runs" } else { "run" },
+                own.short()
+            ),
+        ));
+    }
+    Some(Check::warn(
+        Section::Project,
+        SUBJECT,
+        format!(
+            "{} of {} running {} not on this binary's build ({}) or behind its source",
+            problems.len(),
+            running.processes.len(),
+            if running.processes.len() == 1 {
+                "process is"
+            } else {
+                "processes are"
+            },
+            own.short()
+        ),
+        format!("{DOES_NOT_BLOCK} {}.", problems.join("; ")),
+    ))
+}
+
+/// The daemon or the watch `process`, in words.
+fn who_runs(process: &Running) -> String {
+    match (&process.project, process.pid) {
+        (None, Some(pid)) => format!("the daemon (pid {pid})"),
+        (None, None) => "the daemon".to_owned(),
+        (Some(project), pid) => format!(
+            "the watch of {project} (pid {}, {})",
+            pid.map_or_else(|| "unknown".to_owned(), |pid| pid.to_string()),
+            if process.served {
+                "run by the daemon"
+            } else {
+                "typed in a terminal"
+            }
+        ),
+    }
+}
+
+/// What to do about `process`, a daemon or a watch not on this binary
+/// `mine`'s build: rebuild first when it is `behind` its source; restart it
+/// (a typed watch in its terminal, the daemon and its watches by `owlshift
+/// stop` then `start`), unless its upgrade's drain is `draining` it; and
+/// when it runs a newer build than this binary, this binary is the stale one.
+fn what_to_do(
+    process: &Running,
+    mine: Binary<'_>,
+    draining: bool,
+    behind: Option<&Behind>,
+    home: Option<&Path>,
+) -> String {
+    let theirs = process.version.as_deref().map(|version| Binary {
+        version,
+        build: process.build.as_ref(),
+    });
+    if theirs.is_some_and(|theirs| supersedes(theirs, mine)) {
+        return "this binary is the older one: run the `owlshift` you mean to keep, or rebuild \
+                this one"
+            .to_owned();
+    }
+    let restart = match (&process.project, process.served, draining) {
+        (Some(_), false, _) => {
+            "stop it in its terminal (a first Ctrl-C ends it once its steps under way finish) and \
+             start it again"
+        }
+        (_, _, true) => {
+            "let the upgrade's drain asked of the daemon end: the service at login starts it \
+             again once its steps under way finish"
+        }
+        _ => "run `owlshift stop`, then `owlshift start`",
+    };
+    match behind {
+        Some(behind) => format!(
+            "rebuild and install `owlshift` from {} once that tree is up to date with its origin, \
+             then {restart}",
+            shown(Path::new(&behind.source), home)
+        ),
+        None => restart.to_owned(),
+    }
+}
+
 fn data_dir_check(system: &dyn System, home: Option<&Path>) -> Check {
     const SUBJECT: &str = "data directory";
     match system.data_dir() {
@@ -2766,7 +2981,7 @@ mod tests {
     /// a test builds goes through here, so a failure path that forgets its
     /// why or its fix fails the test that reaches it.
     fn run(system: &dyn System, config: &Effective) -> Report {
-        let report = super::run(system, config);
+        let report = super::run(system, config, &built('a', false, 0));
         for check in &report.checks {
             assert_well_formed(check);
         }
@@ -5213,6 +5428,7 @@ states = { ready = "Todo", working = "Doing", needs_input = "Asked", review = "R
                 version: "0.4.0".to_owned(),
                 binary: "/opt/homebrew/bin/owlshift".to_owned(),
                 since: "2026-10-25T08:00:00Z".parse().unwrap(),
+                build: None,
             }))),
             ..nothing.clone()
         };
@@ -5291,5 +5507,215 @@ states = { ready = "Todo", working = "Doing", needs_input = "Asked", review = "R
         let system = logged_in(with_harnesses(with_git(FakeSystem::default())));
         let report = run(&system.service_is(running), &no_config());
         assert!(report.checks.iter().any(|c| c.subject == "service"));
+    }
+
+    /// A build of the commit `commit` repeated, `minute` minutes after a
+    /// fixed time, with no source tree; this binary's is `built('a', false,
+    /// 0)`.
+    fn built(commit: char, dirty: bool, minute: i64) -> BuildIdentity {
+        BuildIdentity {
+            commit: Some(commit.to_string().repeat(40)),
+            dirty,
+            built_at: jiff::Timestamp::from_second(1_761_600_000 + minute * 60).unwrap(),
+            source: None,
+        }
+    }
+
+    fn process(
+        project: Option<&str>,
+        served: bool,
+        pid: u32,
+        build: Option<BuildIdentity>,
+    ) -> Running {
+        Running {
+            project: project.map(str::to_owned),
+            served,
+            pid: Some(pid),
+            version: Some(OWLSHIFT_VERSION.to_owned()),
+            build,
+            replaced: false,
+        }
+    }
+
+    /// The line `owlshift doctor` shows for what runs, with no other
+    /// answer scripted than git's own.
+    fn builds_line(running: RunningBuilds) -> Option<Check> {
+        let system = logged_in(with_harnesses(with_git(FakeSystem::default())));
+        let report = run(&system.running_builds_are(running), &no_config());
+        report
+            .checks
+            .into_iter()
+            .find(|check| check.subject == "running builds")
+    }
+
+    /// OWL-462: a watch on another build is warned, naming its project and
+    /// both builds, with what to do; one on this build gets nothing; a
+    /// daemon's record from before OWL-462 is an unknown build, not this
+    /// one; a file replaced on disk is told even on this build; a draining
+    /// daemon is left to its drain. Never a failure, and no line when
+    /// nothing runs.
+    #[test]
+    fn a_running_build_other_than_doctors_is_warned_with_both_identities() {
+        let own = built('a', false, 0);
+        let daemon = process(None, false, 10, Some(built('a', false, 5)));
+        let older = process(Some("acme/web"), false, 77, Some(built('b', true, -10)));
+        let mut replaced = process(Some("acme/api"), true, 78, Some(own.clone()));
+        replaced.replaced = true;
+        let check = builds_line(RunningBuilds {
+            processes: vec![daemon.clone(), older, replaced],
+            drain: None,
+        })
+        .unwrap();
+        assert_eq!(check.status, Status::Warn, "{check:?}");
+        let why = check.why.unwrap();
+        assert!(
+            why.contains(&format!(
+                "the watch of acme/web (pid 77, typed in a terminal) runs {}, not this binary's \
+                 {}: stop it in its terminal",
+                built('b', true, -10).short(),
+                own.short()
+            )),
+            "{why}"
+        );
+        assert!(
+            why.contains(
+                "the watch of acme/api (pid 78, run by the daemon) was started from a file since \
+                 replaced on disk: run `owlshift stop`, then `owlshift start`"
+            ),
+            "{why}"
+        );
+        assert!(
+            !why.contains("pid 10"),
+            "a clean rebuild of one commit: {why}"
+        );
+
+        let matching = builds_line(RunningBuilds {
+            processes: vec![daemon],
+            drain: None,
+        })
+        .unwrap();
+        assert_eq!(matching.status, Status::Ok, "{matching:?}");
+        assert_eq!(
+            matching.detail,
+            format!(
+                "the daemon (pid 10) runs this binary's build ({})",
+                own.short()
+            )
+        );
+
+        let unknown = builds_line(RunningBuilds {
+            processes: vec![process(None, false, 10, None)],
+            drain: None,
+        })
+        .unwrap();
+        assert_eq!(unknown.status, Status::Warn);
+        assert!(unknown.why.unwrap().contains(
+            "the daemon (pid 10) records no build, being from before OWL-462: run `owlshift \
+                 stop`, then `owlshift start`"
+        ));
+
+        let draining = builds_line(RunningBuilds {
+            processes: vec![process(None, false, 10, Some(built('c', false, -5)))],
+            drain: Some(owlshift_contracts::service::Request::new(
+                "owlshift doctor",
+                jiff::Timestamp::now(),
+                "an upgrade",
+            )),
+        })
+        .unwrap();
+        assert!(
+            draining
+                .why
+                .unwrap()
+                .contains("let the upgrade's drain asked of the daemon end"),
+        );
+
+        let newer = builds_line(RunningBuilds {
+            processes: vec![process(
+                Some("acme/web"),
+                false,
+                77,
+                Some(built('d', false, 9)),
+            )],
+            drain: None,
+        })
+        .unwrap();
+        assert!(newer.why.unwrap().contains("this binary is the older one"));
+
+        assert_eq!(builds_line(RunningBuilds::default()), None);
+    }
+
+    /// OWL-462: a running build whose commit is behind `origin/HEAD` of the
+    /// tree it was built from, as last fetched, is warned with what to
+    /// rebuild; `origin/main` stands in for a missing `origin/HEAD`; git
+    /// failing on both, or missing, says nothing. One look per tree and
+    /// commit.
+    #[test]
+    fn a_running_build_behind_its_source_is_warned() {
+        let from_tree = BuildIdentity {
+            source: Some("/home/ada/owlshift".to_owned()),
+            ..built('a', false, 0)
+        };
+        let running = RunningBuilds {
+            processes: vec![
+                process(None, false, 10, Some(from_tree.clone())),
+                process(Some("acme/web"), true, 77, Some(from_tree.clone())),
+            ],
+            drain: None,
+        };
+        let head = format!("git rev-list --count {}..origin/HEAD", "a".repeat(40));
+        let main = format!("git rev-list --count {}..origin/main", "a".repeat(40));
+        let system = |head_answer: Answer, main_answer: Answer| {
+            logged_in(with_harnesses(with_git(FakeSystem::default())))
+                .answer(&head, head_answer)
+                .answer(&main, main_answer)
+                .running_builds_are(running.clone())
+        };
+        let line = |system: &FakeSystem| {
+            run(system, &no_config())
+                .checks
+                .into_iter()
+                .find(|check| check.subject == "running builds")
+                .unwrap()
+        };
+
+        let behind = line(&system(Answer::Exit(0, "3\n", ""), Answer::TimedOut));
+        assert_eq!(behind.status, Status::Warn);
+        let why = behind.why.unwrap();
+        // `~/owlshift` on Unix; the whole path where `/home/ada` is no
+        // absolute home.
+        let tree = shown(Path::new("/home/ada/owlshift"), Some(Path::new("/home/ada")));
+        assert!(
+            why.contains(&format!(
+                "the daemon (pid 10) is 3 commits behind origin/HEAD of {tree}, as that tree \
+                 last fetched it: rebuild and install `owlshift` from {tree} once that tree is up \
+                 to date with its origin, then run `owlshift stop`, then `owlshift start`"
+            )),
+            "{why}"
+        );
+        assert!(why.contains("the watch of acme/web (pid 77, run by the daemon) is 3"));
+
+        let fallback = line(&system(
+            Answer::Exit(128, "", "fatal: bad revision"),
+            Answer::Exit(0, "1\n", ""),
+        ));
+        assert!(
+            fallback
+                .why
+                .unwrap()
+                .contains("is 1 commit behind origin/main")
+        );
+
+        let failing = || Answer::Exit(128, "", "fatal: bad revision");
+        let silent = line(&system(failing(), failing()));
+        assert_eq!(silent.status, Status::Ok, "{silent:?}");
+
+        let no_git = builds_check(
+            &FakeSystem::default(),
+            Ok(running),
+            &built('a', false, 0),
+            None,
+        );
+        assert_eq!(no_git.unwrap().status, Status::Ok);
     }
 }

@@ -1,6 +1,9 @@
 //! The background service on the test bench (OWL-435):
 //! `owlshift-daemon-bench daemon` runs the daemon `owlshift daemon` runs,
 //! `owlshift_runner::daemon`, on the data directory `OWLSHIFT_DATA_DIR`,
+//! recorded as a build of `OWLSHIFT_BENCH_COMMIT` made at
+//! `OWLSHIFT_BENCH_BUILT_AT` (seconds since the epoch) when those are set,
+//! of version "bench" with no build otherwise (OWL-462),
 //! with the timings `OWLSHIFT_BENCH_TIMING` gives (milliseconds: pass, tick,
 //! first delay, longest delay, reset after), each notification appended to
 //! the file `OWLSHIFT_BENCH_NOTES`, and as each served project's watch one
@@ -36,9 +39,10 @@ use std::time::Duration;
 use jiff::Timestamp;
 use owlshift_adapters::forge::Repo;
 use owlshift_contracts::format::Format;
-use owlshift_contracts::service::DaemonRecord;
+use owlshift_contracts::service::{BuildIdentity, DaemonRecord};
 use owlshift_core::restart::RestartPolicy;
 use owlshift_platform::process::{self, AtCheckedStop, ProcessTree};
+use owlshift_runner::config::OWLSHIFT_VERSION;
 use owlshift_runner::daemon::{self, Daemon, Held, Timing};
 use owlshift_runner::project::ProjectDirs;
 use owlshift_runner::watch;
@@ -86,12 +90,23 @@ fn run_daemon(data: &Path) -> ExitCode {
         },
     };
     let exe = std::env::current_exe().unwrap();
+    // A build of its own when the test names one (OWL-462): this binary's
+    // version, with the commit and build time it gives.
+    let build = std::env::var("OWLSHIFT_BENCH_COMMIT").ok().map(|commit| {
+        let built_at = std::env::var("OWLSHIFT_BENCH_BUILT_AT").expect("OWLSHIFT_BENCH_BUILT_AT");
+        BuildIdentity::from_build(&commit, "0", &built_at, "")
+    });
     let record = DaemonRecord {
         format: Format,
         pid: std::process::id(),
-        version: "bench".to_owned(),
+        version: if build.is_some() {
+            OWLSHIFT_VERSION.to_owned()
+        } else {
+            "bench".to_owned()
+        },
         binary: exe.display().to_string(),
         since: Timestamp::now(),
+        build,
     };
     let instance = match daemon::instance::take(data, &record).unwrap() {
         Ok(instance) => instance,

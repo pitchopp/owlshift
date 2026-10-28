@@ -130,6 +130,23 @@ impl ProjectDirs {
         }
     }
 
+    /// The directories of every project under `data_dir`, laid out as
+    /// [`Self::new`] lays them out (OWL-462): none when no project has a
+    /// folder yet.
+    pub fn all(data_dir: &Path) -> io::Result<Vec<Self>> {
+        let host = data_dir.join("projects").join("github.com");
+        let mut all = Vec::new();
+        for owner in subdirectories(&host)? {
+            for root in subdirectories(&owner)? {
+                all.push(Self {
+                    root,
+                    lock_wait: PROJECT_LOCK_WAIT,
+                });
+            }
+        }
+        Ok(all)
+    }
+
     /// These directories, a command waiting `wait` for the project's lock
     /// before it answers busy: what a test that stands for another command
     /// holding the lock gives its command, rather than the minute every
@@ -536,6 +553,24 @@ pub(crate) fn held_alone(path: &Path) -> io::Result<bool> {
         Err(TryLockError::WouldBlock) => Ok(true),
         Err(TryLockError::Error(error)) => Err(error),
     }
+}
+
+/// The folders in `dir`, by name; none when `dir` is not there.
+fn subdirectories(dir: &Path) -> io::Result<Vec<PathBuf>> {
+    let entries = match fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(error),
+    };
+    let mut found = Vec::new();
+    for entry in entries {
+        let entry = entry?;
+        if entry.file_type()?.is_dir() {
+            found.push(entry.path());
+        }
+    }
+    found.sort();
+    Ok(found)
 }
 
 /// Opens the lock file at `path`, creating it and its folder.

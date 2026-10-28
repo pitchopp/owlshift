@@ -166,8 +166,12 @@ pub const SERVED_PROJECTS_FORMAT: u32 = 1;
 /// (`served.json` in a project's folder, OWL-434).
 pub const SERVED_CONFIG_FORMAT: u32 = 1;
 /// The format version of the running daemon's record
-/// (`<data>/service/daemon.json`, OWL-435).
-pub const DAEMON_FORMAT: u32 = 1;
+/// (`<data>/service/daemon.json`, OWL-435). Format 2 adds the build of its
+/// binary (OWL-462); format 1 is still read, as an unknown build.
+pub const DAEMON_FORMAT: u32 = 2;
+/// The format version of a running watch's record (`watches/<pid>.json` in
+/// a project's folder, OWL-462).
+pub const WATCH_FORMAT: u32 = 1;
 /// The format version of the install manifest
 /// (`<data>/service/manifest.json`, OWL-437).
 pub const MANIFEST_FORMAT: u32 = 1;

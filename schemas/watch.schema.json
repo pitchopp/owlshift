@@ -1,0 +1,91 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Owlshift watch",
+  "description": "A watch that runs on a project (OWL-462): `watches/<pid>.json` in the\nproject's folder, written once the watch holds `watches/<pid>.lock` and\nremoved at its end, so `owlshift doctor` tells which build each watch\nruns. A record whose lock is free is a dead watch's.",
+  "type": "object",
+  "properties": {
+    "binary": {
+      "description": "The binary it runs, resolved when it started.",
+      "type": "string"
+    },
+    "build": {
+      "description": "The build of its binary.",
+      "$ref": "#/$defs/BuildIdentity"
+    },
+    "format": {
+      "description": "The format version of this document.",
+      "type": "integer",
+      "const": 1
+    },
+    "pid": {
+      "description": "Its process id.",
+      "type": "integer",
+      "format": "uint32",
+      "minimum": 0
+    },
+    "project": {
+      "description": "Its project, `owner/name`.",
+      "type": "string"
+    },
+    "served": {
+      "description": "Whether the daemon runs it (`owlshift watch --drain --served`),\nrather than a person in a terminal.",
+      "type": "boolean"
+    },
+    "since": {
+      "description": "When it started.",
+      "type": "string",
+      "format": "date-time"
+    },
+    "version": {
+      "description": "The version of its binary.",
+      "type": "string"
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "format",
+    "pid",
+    "project",
+    "served",
+    "since",
+    "binary",
+    "version",
+    "build"
+  ],
+  "$defs": {
+    "BuildIdentity": {
+      "description": "What a binary was built from (OWL-462, architecture section 5, \"An\nupgrade\", \"Newer\"): set at compile time by the `owlshift` binary's build\nscript, and recorded beside the pid by the daemon ([`DaemonRecord`]) and\nby each watch ([`WatchRecord`]).",
+      "type": "object",
+      "properties": {
+        "built_at": {
+          "description": "When the build script last ran, which is when the binary was built\nunless nothing it watches changed since.",
+          "type": "string",
+          "format": "date-time"
+        },
+        "commit": {
+          "description": "The commit it was built from, a full commit id in lowercase\nhexadecimal; absent when it was not built from a git tree of\nOwlshift's workspace, the build then unknown.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "dirty": {
+          "description": "Whether the tree held uncommitted changes to tracked files.",
+          "type": "boolean"
+        },
+        "source": {
+          "description": "The git tree it was built from, an absolute path, when known.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "dirty",
+        "built_at"
+      ]
+    }
+  }
+}

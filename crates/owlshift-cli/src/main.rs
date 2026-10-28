@@ -22,6 +22,7 @@ use owlshift_contracts::format::{
     BRIEF_FORMAT, CLAIM_FORMAT, EVENT_FORMAT, FOOTER_FORMAT, QUESTIONS_FORMAT, RESULT_FORMAT,
     TICKET_STATE_FORMAT,
 };
+use owlshift_contracts::service::BuildIdentity;
 use owlshift_runner::config::{Effective, OWLSHIFT_VERSION};
 use owlshift_runner::doctor;
 use owlshift_runner::events::printable;
@@ -237,13 +238,24 @@ enum ConfigCommand {
     Show,
 }
 
-/// `--version`: the binary's version, then the version of every format it
-/// reads and writes.
+/// This binary's build (OWL-462), as its build script described it.
+pub(crate) fn own_build() -> BuildIdentity {
+    BuildIdentity::from_build(
+        env!("OWLSHIFT_BUILD_COMMIT"),
+        env!("OWLSHIFT_BUILD_DIRTY"),
+        env!("OWLSHIFT_BUILD_AT"),
+        env!("OWLSHIFT_BUILD_SOURCE"),
+    )
+}
+
+/// `--version`: the binary's version, its build (OWL-462), then the version
+/// of every format it reads and writes.
 fn long_version() -> String {
     format!(
-        "{OWLSHIFT_VERSION}\nformats: brief {BRIEF_FORMAT}, result {RESULT_FORMAT}, \
+        "{OWLSHIFT_VERSION}\nbuild: {}\nformats: brief {BRIEF_FORMAT}, result {RESULT_FORMAT}, \
          event {EVENT_FORMAT}, claim {CLAIM_FORMAT}, ticket state {TICKET_STATE_FORMAT}, \
-         ticket questions {QUESTIONS_FORMAT}, comment footer {FOOTER_FORMAT}"
+         ticket questions {QUESTIONS_FORMAT}, comment footer {FOOTER_FORMAT}",
+        own_build()
     )
 }
 
@@ -312,7 +324,7 @@ fn main() -> ExitCode {
             {
                 eprintln!("{}", printable(&line));
             }
-            let report = doctor::run(&system, &config);
+            let report = doctor::run(&system, &config, &own_build());
             if json {
                 println!("{:#}", report.to_json());
             } else {

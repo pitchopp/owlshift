@@ -10,11 +10,12 @@
 //! that service naming this binary. Any other is told, never drained, since
 //! its drain would be a stop nobody asked for.
 
+use std::cmp::Ordering;
 use std::fs;
 use std::path::{Path, PathBuf};
 
 use jiff::Timestamp;
-use owlshift_contracts::service::{DaemonRecord, Request};
+use owlshift_contracts::service::{BuildIdentity, DaemonRecord, Request};
 use semver::Version;
 
 use super::instance::{self, service_dir};
@@ -27,15 +28,58 @@ pub fn launched_file(data: &Path) -> PathBuf {
     service_dir(data).join("launched")
 }
 
-/// Whether the binary of version `own` supersedes a daemon of version
-/// `running`: strictly newer by semver precedence, build metadata ignored.
-/// A version that does not parse supersedes nothing and is superseded by
-/// nothing. The one seam where a build identity (OWL-462) sharpens what
-/// "newer" means.
-pub fn supersedes(own: &str, running: &str) -> bool {
-    match (Version::parse(own), Version::parse(running)) {
-        (Ok(own), Ok(running)) => own.cmp_precedence(&running).is_gt(),
-        _ => false,
+/// What a binary is, as far as an upgrade compares two: its version and,
+/// when known, its build (OWL-462).
+#[derive(Clone, Copy, Debug)]
+pub struct Binary<'a> {
+    pub version: &'a str,
+    pub build: Option<&'a BuildIdentity>,
+}
+
+impl<'a> Binary<'a> {
+    /// The binary a daemon's record names.
+    pub fn of(record: &'a DaemonRecord) -> Self {
+        Self {
+            version: &record.version,
+            build: record.build.as_ref(),
+        }
+    }
+
+    /// Its version, then its build in a few words when known.
+    pub fn shown(&self) -> String {
+        match self.build {
+            Some(build) => format!("{} ({})", self.version, build.short()),
+            None => format!("{} (unknown build)", self.version),
+        }
+    }
+
+    /// Whether its build tells its commit.
+    fn identified(&self) -> bool {
+        self.build.is_some_and(|build| build.commit.is_some())
+    }
+}
+
+/// Whether the binary `own` supersedes a daemon running `running`
+/// (architecture section 5, "An upgrade", "Newer"): a version strictly
+/// greater by semver precedence, build metadata ignored; at equal versions,
+/// both builds known, not the same clean build, and `own` built strictly
+/// later. A version that does not parse, or a missing or unknown build,
+/// supersedes nothing and is superseded by nothing.
+pub fn supersedes(own: Binary<'_>, running: Binary<'_>) -> bool {
+    let (Ok(own_version), Ok(running_version)) =
+        (Version::parse(own.version), Version::parse(running.version))
+    else {
+        return false;
+    };
+    match own_version.cmp_precedence(&running_version) {
+        Ordering::Greater => true,
+        Ordering::Less => false,
+        Ordering::Equal => match (own.build, running.build) {
+            (Some(ours), Some(theirs)) if own.identified() && running.identified() => {
+                !ours.same_build(theirs) && ours.built_at > theirs.built_at
+            }
+            _ => false,
+        },
     }
 }
 
@@ -88,8 +132,11 @@ pub enum Handover {
     Unknown,
     /// A stop is asked of it already.
     Stopping,
-    /// It runs this version or a newer one.
+    /// It runs this version or a newer one, or this build or a later one.
     Current(DaemonRecord),
+    /// It runs this version, its record naming no build (format 1, from
+    /// before OWL-462), so whether it is older cannot be told.
+    Unidentified(DaemonRecord),
     /// Its upgrade's drain is asked already.
     AlreadyAsked(DaemonRecord),
     /// It is older, but no manager would start this binary after it.
@@ -100,11 +147,11 @@ pub enum Handover {
     EndedMeanwhile,
 }
 
-/// What `facts` call for, the binary being of version `own`: decided
-/// without reading or writing anything.
+/// What `facts` call for, the binary being `own`: decided without reading
+/// or writing anything.
 pub fn decide(
     running: Option<Option<DaemonRecord>>,
-    own: &str,
+    own: Binary<'_>,
     stop_asked: bool,
     drain_asked: bool,
     managed: impl FnOnce(&DaemonRecord) -> Result<(), Unmanaged>,
@@ -117,7 +164,14 @@ pub fn decide(
     if stop_asked {
         return Handover::Stopping;
     }
-    if !supersedes(own, &record.version) {
+    if !supersedes(own, Binary::of(&record)) {
+        let same_version = matches!(
+            (Version::parse(own.version), Version::parse(&record.version)),
+            (Ok(a), Ok(b)) if a.cmp_precedence(&b).is_eq()
+        );
+        if same_version && own.identified() && !Binary::of(&record).identified() {
+            return Handover::Unidentified(record);
+        }
         return Handover::Current(record);
     }
     if drain_asked {
@@ -129,11 +183,16 @@ pub fn decide(
     }
 }
 
-/// Hands the daemon of `data` over to this binary, of version `own` at
-/// `binary`, when it is older and managed: writes its drain, asked `by`
-/// this command. A daemon that ended, or was replaced, while the drain was
-/// written has it withdrawn, so it never stops the next one.
-pub fn hand_over(data: &Path, own: &str, binary: &Path, by: &str) -> Result<Handover, String> {
+/// Hands the daemon of `data` over to this binary, `own` at `binary`, when
+/// it is older and managed: writes its drain, asked `by` this command. A
+/// daemon that ended, or was replaced, while the drain was written has it
+/// withdrawn, so it never stops the next one.
+pub fn hand_over(
+    data: &Path,
+    own: Binary<'_>,
+    binary: &Path,
+    by: &str,
+) -> Result<Handover, String> {
     let shown = |error: std::io::Error| format!("{}: {error}", service_dir(data).display());
     let running = instance::running(data).map_err(shown)?;
     let decided = decide(
@@ -147,8 +206,9 @@ pub fn hand_over(data: &Path, own: &str, binary: &Path, by: &str) -> Result<Hand
         return Ok(decided);
     };
     let why = format!(
-        "an upgrade from version {} to {own}, at {}",
-        record.version,
+        "an upgrade from version {} to {}, at {}",
+        Binary::of(record).shown(),
+        own.shown(),
         binary.display()
     );
     let request = Request::new(by, Timestamp::now(), why).for_pid(record.pid);
@@ -162,16 +222,24 @@ pub fn hand_over(data: &Path, own: &str, binary: &Path, by: &str) -> Result<Hand
 }
 
 impl Handover {
-    /// What to tell the person, this binary being of version `own`: `None`
-    /// when there is nothing to tell.
-    pub fn line(&self, own: &str) -> Option<String> {
+    /// What to tell the person, this binary being `own`: `None` when there
+    /// is nothing to tell.
+    pub fn line(&self, own: Binary<'_>) -> Option<String> {
         let who = |record: &DaemonRecord| {
             format!(
                 "the daemon (pid {}, version {})",
-                record.pid, record.version
+                record.pid,
+                Binary::of(record).shown()
             )
         };
+        let own = own.shown();
         match self {
+            Self::Unidentified(record) => Some(format!(
+                "warning: {} records no build, being from before OWL-462, so this binary ({own}) \
+                 cannot tell whether it is older: `owlshift stop`, then `owlshift start`, moves \
+                 it to this binary.",
+                who(record)
+            )),
             Self::Ask(record) => Some(format!(
                 "Upgrade: {} drains for version {own}: its steps under way finish and no new one \
                  starts, then it exits with {UPGRADE_EXIT} and the service at login starts it \
@@ -225,11 +293,31 @@ mod tests {
             version: version.to_owned(),
             binary: "/bin/owlshift".to_owned(),
             since: Timestamp::now(),
+            build: None,
         }
     }
 
+    /// A build of the commit `commit` repeated, `minute` minutes after a
+    /// fixed time.
+    fn build(commit: char, dirty: bool, minute: i64) -> BuildIdentity {
+        BuildIdentity {
+            commit: Some(commit.to_string().repeat(40)),
+            dirty,
+            built_at: Timestamp::from_second(1_761_600_000 + minute * 60).unwrap(),
+            source: None,
+        }
+    }
+
+    fn of<'a>(version: &'a str, build: Option<&'a BuildIdentity>) -> Binary<'a> {
+        Binary { version, build }
+    }
+
+    /// OWL-436's rule across versions, whatever the builds; at one version,
+    /// OWL-462's: a later build of another commit, or a later dirty build,
+    /// supersedes; the same identity, a rebuild of one clean commit, an
+    /// older build and a missing or unknown build do not.
     #[test]
-    fn only_a_strictly_newer_version_supersedes() {
+    fn a_newer_version_or_a_later_build_of_another_commit_supersedes() {
         for (own, running, newer) in [
             ("0.0.0", "0.0.0", false),
             ("0.2.0", "0.1.9", true),
@@ -239,24 +327,64 @@ mod tests {
             ("0.2.0", "bench", false),
             ("garbage", "0.1.0", false),
         ] {
-            assert_eq!(supersedes(own, running), newer, "{own} over {running}");
+            assert_eq!(
+                supersedes(of(own, None), of(running, None)),
+                newer,
+                "{own} over {running}"
+            );
         }
+        let early = build('a', false, 0);
+        let other = build('b', false, 10);
+        let rebuilt = build('a', false, 10);
+        let dirty = build('a', true, 10);
+        let unknown = BuildIdentity {
+            commit: None,
+            ..build('c', false, 20)
+        };
+        for (own, running, newer, case) in [
+            (&other, &early, true, "a later build of another commit"),
+            (
+                &dirty,
+                &early,
+                true,
+                "a later dirty build of the same commit",
+            ),
+            (&early, &early, false, "the same identity"),
+            (&rebuilt, &early, false, "one clean commit built again"),
+            (&early, &other, false, "an older build"),
+            (&unknown, &early, false, "an unknown own build"),
+            (&other, &unknown, false, "an unknown running build"),
+        ] {
+            assert_eq!(
+                supersedes(of("0.0.0", Some(own)), of("0.0.0", Some(running))),
+                newer,
+                "{case}"
+            );
+        }
+        assert!(!supersedes(of("0.0.0", Some(&other)), of("0.0.0", None)));
+        assert!(supersedes(
+            of("0.1.0", Some(&early)),
+            of("0.0.0", Some(&other))
+        ));
+        assert!(!supersedes(
+            of("0.0.0", Some(&other)),
+            of("0.1.0", Some(&early))
+        ));
     }
 
     /// Every outcome, from the facts alone: only an older, managed daemon
-    /// with nothing asked of it yet is asked to drain.
+    /// with nothing asked of it yet is asked to drain; one of this version
+    /// whose record names no build is told, not taken as current.
     #[test]
     fn only_an_older_managed_daemon_is_asked_to_drain() {
         let ok = |_: &DaemonRecord| Ok(());
+        let own = of("0.2.0", None);
         let old = record(7, "0.1.0");
         let decide_with = |running, stop, drain, managed: Result<(), Unmanaged>| {
-            decide(running, "0.2.0", stop, drain, |_| managed)
+            decide(running, own, stop, drain, |_| managed)
         };
-        assert_eq!(decide(None, "0.2.0", false, false, ok), Handover::NoDaemon);
-        assert_eq!(
-            decide(Some(None), "0.2.0", false, false, ok),
-            Handover::Unknown
-        );
+        assert_eq!(decide(None, own, false, false, ok), Handover::NoDaemon);
+        assert_eq!(decide(Some(None), own, false, false, ok), Handover::Unknown);
         assert_eq!(
             decide_with(Some(Some(old.clone())), true, false, Ok(())),
             Handover::Stopping
@@ -277,17 +405,28 @@ mod tests {
         ] {
             let decided = decide_with(Some(Some(old.clone())), false, false, Err(why.clone()));
             assert_eq!(decided, Handover::Unmanaged(old.clone(), why));
-            let line = decided.line("0.2.0").unwrap();
+            let line = decided.line(own).unwrap();
             assert!(
-                line.starts_with("warning: the daemon (pid 7, version 0.1.0)")
+                line.starts_with("warning: the daemon (pid 7, version 0.1.0 (unknown build))")
                     && line.contains("`owlshift stop`, then `owlshift start`"),
                 "{line}"
             );
         }
         let asked = decide_with(Some(Some(old.clone())), false, false, Ok(()));
         assert_eq!(asked, Handover::Ask(old));
-        assert!(asked.line("0.2.0").unwrap().contains("exits with 75"));
-        assert_eq!(Handover::Current(record(1, "0.2.0")).line("0.2.0"), None);
+        assert!(asked.line(own).unwrap().contains("exits with 75"));
+        assert_eq!(Handover::Current(record(1, "0.2.0")).line(own), None);
+        // OWL-462: this binary's build known, the record's not.
+        let built = build('a', false, 0);
+        let identified = of("0.2.0", Some(&built));
+        let same = record(7, "0.2.0");
+        let unidentified = decide(Some(Some(same.clone())), identified, false, false, ok);
+        assert_eq!(unidentified, Handover::Unidentified(same));
+        let line = unidentified.line(identified).unwrap();
+        assert!(
+            line.contains("records no build") && line.contains("`owlshift stop`, then"),
+            "{line}"
+        );
     }
 
     /// The managed test: a service installed for this binary, whose
@@ -339,17 +478,20 @@ mod tests {
         let me = record(std::process::id(), "0.1.0");
         fs::write(launched_file(&data), format!("{}\n", me.pid)).unwrap();
         let held = instance::take(&data, &me).unwrap().unwrap();
-        let handover = hand_over(&data, "0.2.0", &binary, "owlshift start").unwrap();
+        let own = of("0.2.0", None);
+        let handover = hand_over(&data, own, &binary, "owlshift start").unwrap();
         assert_eq!(handover, Handover::Ask(me.clone()));
         let asked = requests::drain_asked(&data).unwrap();
         assert_eq!(asked.by, "owlshift start");
         assert_eq!(asked.pid, Some(me.pid), "it names the daemon it is for");
         assert!(
-            asked.why.contains("from version 0.1.0 to 0.2.0"),
+            asked
+                .why
+                .contains("from version 0.1.0 (unknown build) to 0.2.0 (unknown build)"),
             "{asked:?}"
         );
         assert_eq!(
-            hand_over(&data, "0.2.0", &binary, "owlshift doctor"),
+            hand_over(&data, own, &binary, "owlshift doctor"),
             Ok(Handover::AlreadyAsked(me))
         );
         drop(held);
@@ -362,14 +504,15 @@ mod tests {
         let data = tempfile::tempdir().unwrap();
         let data = data.path();
         let binary = data.join("owlshift");
+        let own = of("0.2.0", None);
         assert_eq!(
-            hand_over(data, "0.2.0", &binary, "owlshift doctor"),
+            hand_over(data, own, &binary, "owlshift doctor"),
             Ok(Handover::NoDaemon)
         );
         let held = instance::take(data, &record(std::process::id(), "0.2.0"))
             .unwrap()
             .unwrap();
-        let handover = hand_over(data, "0.2.0", &binary, "owlshift doctor").unwrap();
+        let handover = hand_over(data, own, &binary, "owlshift doctor").unwrap();
         assert!(matches!(handover, Handover::Current(_)), "{handover:?}");
         assert!(requests::drain_asked(data).is_none());
         // Older, not managed: told, not drained.
@@ -377,7 +520,7 @@ mod tests {
         let held = instance::take(data, &record(std::process::id(), "0.1.0"))
             .unwrap()
             .unwrap();
-        let handover = hand_over(data, "0.2.0", &binary, "owlshift doctor").unwrap();
+        let handover = hand_over(data, own, &binary, "owlshift doctor").unwrap();
         assert!(
             matches!(handover, Handover::Unmanaged(_, Unmanaged::NotInstalled)),
             "{handover:?}"

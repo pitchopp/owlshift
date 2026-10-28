@@ -8,10 +8,21 @@
       "description": "The binary it runs and starts every watch from, resolved when it\nstarted.",
       "type": "string"
     },
+    "build": {
+      "description": "The build of its binary (format 2, OWL-462); absent from a format-1\nrecord, written before it, which is read as an unknown build.",
+      "anyOf": [
+        {
+          "$ref": "#/$defs/BuildIdentity"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
     "format": {
       "description": "The format version of this document.",
       "type": "integer",
-      "const": 1
+      "const": 2
     },
     "pid": {
       "description": "Its process id.",
@@ -36,5 +47,41 @@
     "version",
     "binary",
     "since"
-  ]
+  ],
+  "$defs": {
+    "BuildIdentity": {
+      "description": "What a binary was built from (OWL-462, architecture section 5, \"An\nupgrade\", \"Newer\"): set at compile time by the `owlshift` binary's build\nscript, and recorded beside the pid by the daemon ([`DaemonRecord`]) and\nby each watch ([`WatchRecord`]).",
+      "type": "object",
+      "properties": {
+        "built_at": {
+          "description": "When the build script last ran, which is when the binary was built\nunless nothing it watches changed since.",
+          "type": "string",
+          "format": "date-time"
+        },
+        "commit": {
+          "description": "The commit it was built from, a full commit id in lowercase\nhexadecimal; absent when it was not built from a git tree of\nOwlshift's workspace, the build then unknown.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "dirty": {
+          "description": "Whether the tree held uncommitted changes to tracked files.",
+          "type": "boolean"
+        },
+        "source": {
+          "description": "The git tree it was built from, an absolute path, when known.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "dirty",
+        "built_at"
+      ]
+    }
+  }
 }
