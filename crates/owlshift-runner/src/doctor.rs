@@ -2630,10 +2630,19 @@ fn service_check(state: &ServiceState, home: Option<&Path>) -> Check {
     const SUBJECT: &str = "service";
     let daemon = match &state.daemon {
         Ok(None) => "no daemon runs".to_owned(),
-        Ok(Some(Some(record))) => format!(
-            "the daemon runs (pid {}, version {}, since {})",
-            record.pid, record.version, record.since
-        ),
+        Ok(Some(Some(record))) => {
+            let drain = state.drain.as_ref().map_or_else(String::new, |drain| {
+                format!(
+                    ", draining for an upgrade ({}: {}): the service at login starts it again \
+                     once its steps under way finish",
+                    drain.by, drain.why
+                )
+            });
+            format!(
+                "the daemon runs (pid {}, version {}, since {}){drain}",
+                record.pid, record.version, record.since
+            )
+        }
         Ok(Some(None)) => "a daemon runs, its record unread".to_owned(),
         Err(error) => format!("whether a daemon runs was not read: {error}"),
     };
@@ -5179,6 +5188,7 @@ states = { ready = "Todo", working = "Doing", needs_input = "Asked", review = "R
             binary_there: true,
             unlisted: Vec::new(),
             daemon: Ok(None),
+            drain: None,
         };
         let home = Some(Path::new("/home/ada"));
         let check = service_check(&nothing, home);
@@ -5213,6 +5223,26 @@ states = { ready = "Todo", working = "Doing", needs_input = "Asked", review = "R
             "installed at login as the user LaunchAgent `dev.owlshift.daemon`, starting \
              /opt/homebrew/bin/owlshift; the daemon runs (pid 4242, version 0.4.0, since \
              2026-10-25T08:00:00Z)"
+        );
+        // OWL-436: an upgrade's drain asked of it.
+        let draining = ServiceState {
+            drain: Some(owlshift_contracts::service::Request::new(
+                "owlshift doctor",
+                "2026-10-28T08:00:00Z".parse().unwrap(),
+                "an upgrade from version 0.4.0 to 0.5.0, at /opt/homebrew/bin/owlshift",
+            )),
+            ..running.clone()
+        };
+        let check = service_check(&draining, home);
+        assert_eq!(check.status, Status::Ok);
+        assert!(
+            check.detail.ends_with(
+                "since 2026-10-25T08:00:00Z), draining for an upgrade (owlshift doctor: an \
+                 upgrade from version 0.4.0 to 0.5.0, at /opt/homebrew/bin/owlshift): the service \
+                 at login starts it again once its steps under way finish"
+            ),
+            "{}",
+            check.detail
         );
 
         let broken = ServiceState {

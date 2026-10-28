@@ -22,6 +22,10 @@
 //!   SIGTERM is a checked stop: the platform sends each watch SIGTERM, and
 //!   the daemon exits once they have ended. A project no longer listed has
 //!   its watch drained the same way.
+//! - *An upgrade* ([`upgrade`], OWL-436): a newer binary writes
+//!   `<data>/service/drain`, which the daemon relays as a stop does; once
+//!   its watches have ended it exits with [`UPGRADE_EXIT`], so the service
+//!   manager starts it again on the new binary. A stop asked meanwhile wins.
 //! - *The digest* ([`digest`]): once a day at the personal file's
 //!   `digest_hour`, one notification, `<data>/service/digest.json` keeping
 //!   when it was made so it is sent once at wake, never twice.
@@ -34,6 +38,7 @@ pub mod digest;
 pub mod instance;
 pub mod requests;
 mod supervise;
+pub mod upgrade;
 
 use std::path::Path;
 use std::process::Command;
@@ -51,6 +56,11 @@ pub use requests::ask_stop;
 /// project rather than start it again on backoff. `EX_CONFIG` of
 /// `sysexits.h`: something must be set up first.
 pub const UNSERVABLE_EXIT: u8 = 78;
+
+/// The exit code of a daemon whose upgrade's drain is done: the service
+/// manager starts it again, on the new binary (architecture section 5,
+/// "Restarts"). `EX_TEMPFAIL` of `sysexits.h`.
+pub const UPGRADE_EXIT: u8 = 75;
 
 /// How often the daemon does what.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -93,4 +103,7 @@ pub struct Daemon<'a> {
 pub enum Ended {
     /// A stop asked of it is done: its watches ended, nothing restarts them.
     Stopped,
+    /// An upgrade's drain is done, no stop asked meanwhile: its watches
+    /// ended, and the daemon exits with [`UPGRADE_EXIT`].
+    Upgraded,
 }

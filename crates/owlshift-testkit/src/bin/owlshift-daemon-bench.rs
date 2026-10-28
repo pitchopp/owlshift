@@ -23,7 +23,9 @@
 //! the file `exit` there holds, saying why on its standard error, when that
 //! file stands; otherwise it ends, its step stopped, once its project's stop
 //! file stands (removing it) or a stop is asked of it, unless the file
-//! `hang` stands, when only its bound ends it.
+//! `hang` stands, when only its bound ends it. While the file `linger`
+//! stands, a drain on its stop file waits, as for a step under way, until
+//! it is removed or a stop is asked of it.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -118,9 +120,13 @@ fn run_daemon(data: &Path) -> ExitCode {
         timing,
         digest: None,
     };
-    let daemon::Ended::Stopped = daemon.run(&mut std::io::stdout());
+    let ended = daemon.run(&mut std::io::stdout());
     drop(instance);
-    ExitCode::SUCCESS
+    // As `owlshift daemon`.
+    match ended {
+        daemon::Ended::Stopped => ExitCode::SUCCESS,
+        daemon::Ended::Upgraded => ExitCode::from(daemon::UPGRADE_EXIT),
+    }
 }
 
 /// The real watch of the project `OWLSHIFT_BENCH_PROJECT` names, which must
@@ -192,6 +198,14 @@ fn run_watch(data: &Path, repo: &Repo) -> ExitCode {
         let drained = watch::stop::stands(&dirs);
         if drained {
             watch::stop::remove(&dirs).unwrap();
+        }
+        // A step under way holds the drain while `linger` stands (OWL-436).
+        let lingers = drained && bench.join("linger").exists();
+        if lingers {
+            println!("{repo} drains, its step under way");
+            while bench.join("linger").exists() && process::asked().is_none() {
+                thread::sleep(Duration::from_millis(50));
+            }
         }
         if drained || (process::asked().is_some() && !hang) {
             let _ = tree.kill();

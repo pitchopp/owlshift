@@ -651,3 +651,186 @@ fn s11_a_checked_stop_resumes_both_builds_and_a_kill_quarantines() {
     }
     assert_no_double_dispatch(&bench.data(), &TICKETS);
 }
+
+/// An upgrade's drain request, as a newer binary writes it.
+fn upgrade_drain() -> Request {
+    Request::new(
+        "owlshift start",
+        Timestamp::now(),
+        "an upgrade from version 0.1.0 to 0.2.0",
+    )
+}
+
+/// OWL-436's acceptance (architecture section 5, "An upgrade"): the daemon
+/// serves DEMO-1 and DEMO-2 with a real watch, both Builds under way and
+/// held. An upgrade's drain reaches the watch; the Builds, released, finish
+/// as they would have, not `stopped`; no run of the old binary starts after
+/// the drain; the daemon exits with 75, nothing left standing.
+#[test]
+fn an_upgrade_drain_lets_the_steps_under_way_finish_then_exits_75() {
+    let mut bench = Bench::new();
+    let root = bench.tmp.path().to_owned();
+    let plays = root.join("plays");
+    fs::create_dir_all(&plays).unwrap();
+    for (id, zone) in [("DEMO-1", "a"), ("DEMO-2", "b")] {
+        reply_for(&plays, "intake", Some(id), &intake_declaring(&[zone]));
+    }
+    reply_for(&plays, "build", None, &build_asks());
+    fs::write(plays.join("hold"), "").unwrap();
+    let harness = holding_harness(
+        &plays,
+        Path::new(FAKE),
+        "build",
+        CHECKPOINT,
+        "while [ -e \"$dir/hold\" ]; do sleep 0.1; done",
+    );
+    let machine = root.join("machine");
+    let mut project = ChildProject::seed_parallel(&root, harness, 2, 2, (&machine, 2));
+    project.notes = Some(bench.notes_file());
+    let file = root.join("project.toml");
+    project.save(&file);
+    project.move_ticket("DEMO-9", "Done");
+    bench
+        .registry()
+        .register(&Repo::parse(REPO).unwrap(), &project.checkout)
+        .unwrap();
+    bench.project = Some(file);
+    let dirs = project.dirs();
+    bench.start();
+    bench.wait_for("both Builds under way", 120, || {
+        TICKETS
+            .iter()
+            .all(|id| plays.join(format!("build-{id}.pid")).exists())
+    });
+    let started = |data: &Path| {
+        events(data)
+            .iter()
+            .filter(|event| event.kind == EventKind::RunStarted)
+            .count()
+    };
+    let before = started(&bench.data());
+
+    requests::ask_drain(&bench.data(), &upgrade_drain()).unwrap();
+    bench.wait_for("the watch to drain on its stop file", 30, || {
+        events(&bench.data()).iter().any(|event| {
+            event.data.get("watch") == Some(&serde_json::json!("stop"))
+                && event.data.get("asked") == Some(&serde_json::json!("stop_file"))
+        })
+    });
+    fs::remove_file(plays.join("hold")).unwrap();
+    let status = bench.ended(60);
+    assert_eq!(status.code(), Some(75), "{status}\n{}", bench.output());
+
+    assert_eq!(
+        started(&bench.data()),
+        before,
+        "a run started after the drain\n{}",
+        bench.output()
+    );
+    for id in TICKETS {
+        assert_eq!(build_starts(&bench.data(), id).len(), 1, "{id}");
+    }
+    // Every run, both Builds included, ended, and none `stopped`.
+    let runs = |kind: EventKind| -> Vec<String> {
+        let mut runs: Vec<String> = events(&bench.data())
+            .into_iter()
+            .filter(|event| event.kind == kind)
+            .filter_map(|event| event.run.map(|run| run.to_string()))
+            .collect();
+        runs.sort();
+        runs
+    };
+    assert_eq!(
+        runs(EventKind::RunStarted),
+        runs(EventKind::RunEnded),
+        "{}",
+        bench.output()
+    );
+    assert!(
+        ended_as(&project, "stopped").is_empty(),
+        "{}",
+        bench.output()
+    );
+    assert_eq!(dirs.quarantine().unwrap(), None, "{}", bench.output());
+    assert!(!dirs.obligations_stand(), "{}", bench.output());
+    assert!(requests::drain_asked(&bench.data()).is_none());
+    assert!(!watch::stop::stands(&dirs));
+    assert!(daemon::running(&bench.data()).unwrap().is_none());
+    let watch_starts = events(&bench.data())
+        .iter()
+        .filter(|event| event.data.get("service") == Some(&serde_json::json!("watch_started")))
+        .count();
+    assert_eq!(watch_starts, 1, "the watch was not started again");
+    assert!(
+        bench
+            .output()
+            .contains("Draining for an upgrade (owlshift start: an upgrade from version 0.1.0"),
+        "{}",
+        bench.output()
+    );
+}
+
+/// OWL-436, on the stand-in: a drain left from before the daemon started is
+/// removed and the daemon serves; a drain ends it with 75; a stop asked
+/// during a drain, by `owlshift stop` or by SIGTERM, wins: it ends 0, so the
+/// service manager does not start it again.
+#[test]
+fn an_upgrade_drain_ends_75_unless_a_stop_is_asked_meanwhile() {
+    let mut bench = Bench::new();
+    bench.serve(WEB);
+    let data = bench.data();
+    fs::create_dir_all(daemon::service_dir(&data)).unwrap();
+
+    requests::ask_drain(&data, &upgrade_drain()).unwrap();
+    bench.start();
+    let (watch, step) = bench.running(WEB);
+    assert!(requests::drain_asked(&data).is_none(), "{}", bench.output());
+
+    requests::ask_drain(&data, &upgrade_drain()).unwrap();
+    let status = bench.ended(10);
+    assert_eq!(status.code(), Some(75), "{status}\n{}", bench.output());
+    assert!(!alive(watch) && !alive(step));
+    assert_eq!(bench.watches(WEB).len(), 1, "nothing started again");
+    assert!(requests::drain_asked(&data).is_none());
+    assert!(!watch::stop::stands(&bench.dirs(WEB)));
+
+    // The watch holds its drain while `linger` stands, as for a step.
+    let linger = bench.bench_dir(WEB).join("linger");
+    let lingering = |bench: &Bench, times: usize| {
+        bench.wait_for("the watch to hold its drain", 10, || {
+            bench.output().matches("drains, its step under way").count() >= times
+        });
+    };
+    fs::write(&linger, "").unwrap();
+    bench.start();
+    bench.running(WEB);
+    requests::ask_drain(&data, &upgrade_drain()).unwrap();
+    lingering(&bench, 1);
+    requests::ask_stop(
+        &data,
+        &Request::new(BY_STOP, Timestamp::now(), "asked by the test"),
+    )
+    .unwrap();
+    fs::remove_file(&linger).unwrap();
+    let status = bench.ended(10);
+    assert!(status.success(), "{status}\n{}", bench.output());
+    assert!(requests::drain_asked(&data).is_none());
+    assert!(requests::stop_asked(&data).is_none());
+
+    fs::write(&linger, "").unwrap();
+    bench.start();
+    bench.running(WEB);
+    requests::ask_drain(&data, &upgrade_drain()).unwrap();
+    lingering(&bench, 2);
+    bench.signal("TERM", bench.daemon_pid());
+    let status = bench.ended(15);
+    assert!(status.success(), "{status}\n{}", bench.output());
+    assert!(requests::drain_asked(&data).is_none());
+    assert!(
+        bench
+            .output()
+            .contains("A stop was asked during the upgrade's drain"),
+        "{}",
+        bench.output()
+    );
+}

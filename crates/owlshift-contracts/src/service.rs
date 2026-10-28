@@ -109,6 +109,12 @@ pub struct Request {
     pub at: Timestamp,
     /// Why, in words for a person.
     pub why: String,
+    /// The pid of the daemon it is for, when it names one: an upgrade's
+    /// drain names the daemon it hands over (OWL-436), so a daemon that
+    /// finds at its start a drain naming another one removes it, and one
+    /// naming itself is honoured.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pid: Option<u32>,
 }
 
 impl Request {
@@ -118,6 +124,15 @@ impl Request {
             by: by.to_owned(),
             at,
             why: why.into(),
+            pid: None,
+        }
+    }
+
+    /// This request, for the daemon of pid `pid`.
+    pub fn for_pid(self, pid: u32) -> Self {
+        Self {
+            pid: Some(pid),
+            ..self
         }
     }
 

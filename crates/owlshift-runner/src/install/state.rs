@@ -5,7 +5,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use owlshift_contracts::service::{DaemonRecord, InstalledService};
+use owlshift_contracts::service::{DaemonRecord, InstalledService, Request};
 use owlshift_platform::service::Layout;
 
 use super::manifest::Manifests;
@@ -29,6 +29,8 @@ pub struct ServiceState {
     /// The daemon that runs on the data directory, with its record when it
     /// reads; or why that could not be told.
     pub daemon: Result<Option<Option<DaemonRecord>>, String>,
+    /// The upgrade's drain asked of the daemon, when one stands (OWL-436).
+    pub drain: Option<Request>,
 }
 
 /// The service of the data directory `data`, Owlshift's paths being
@@ -62,6 +64,7 @@ pub fn state(data: &Path, layout: Layout) -> ServiceState {
         binary_there,
         unlisted,
         daemon: daemon::running(data).map_err(|e| e.to_string()),
+        drain: daemon::requests::drain_asked(data),
     }
 }
 

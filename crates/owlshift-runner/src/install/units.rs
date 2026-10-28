@@ -109,6 +109,9 @@ pub(crate) fn launcher_text(launcher: &Launcher<'_>) -> Result<String, String> {
     text.push_str(
         "umask 077\n\
          cd \"$data/service\" || exit 1\n\
+         # The daemon keeps this shell's pid: a newer binary hands over only a\n\
+         # daemon the service started, which the manager starts again (OWL-436).\n\
+         echo $$ >launched\n\
          exec \"$binary\" daemon >>daemon.log 2>&1\n",
     );
     Ok(text)
