@@ -186,33 +186,16 @@ pub fn gather(
         }
     }
     summary.all_paused = requests::machine_pause(data).is_some();
-    let store = UsageStore::in_data_dir(data).with_caps(caps.iter().copied());
-    let now_ms = machine_usage::ms(now);
-    for (harness, limit) in why::limits(data, caps, now) {
-        let usage = match limit {
-            Limit::Until(until) => Usage::Limited(Some(until)),
-            Limit::ProbeDue => Usage::Limited(None),
-            Limit::Unread(why) => {
-                notes.push(format!("the usage of {harness:?} cannot be read: {why}"));
-                continue;
-            }
-            Limit::Free => {
-                let share = store.read_at(harness, now_ms).ok().and_then(|state| {
-                    state
-                        .windows
-                        .values()
-                        .filter(|window| window.resets_at_ms > now_ms)
-                        .map(|window| window.share)
-                        .reduce(f64::max)
-                });
-                match share {
-                    Some(share) => Usage::Share(share),
-                    None => continue,
-                }
-            }
-        };
-        summary.usage.push((harness, usage));
-    }
+    summary.usage = usage(data, caps, now, &mut notes)
+        .into_iter()
+        .map(|(harness, usage)| {
+            let usage = match usage {
+                HarnessUsage::Limited(until) => Usage::Limited(until),
+                HarnessUsage::Share { share, .. } => Usage::Share(share),
+            };
+            (harness, usage)
+        })
+        .collect();
     for note in notes {
         say(
             out,
@@ -220,6 +203,60 @@ pub fn gather(
         );
     }
     summary
+}
+
+/// A harness's usage on this machine, as the digest and `owlshift status`
+/// read it (OWL-438).
+#[derive(Clone, Debug, PartialEq)]
+pub enum HarnessUsage {
+    /// At its usage limit or cap, until then when known.
+    Limited(Option<Timestamp>),
+    /// Free: the highest share used of a window that has not reset, from 0
+    /// to 1, and when that window resets.
+    Share { share: f64, resets_at: Timestamp },
+}
+
+/// Each harness's usage at `now`, its cap applied: one free with no window
+/// under way is left out, and one whose usage cannot be read is said in
+/// `notes`.
+pub(crate) fn usage(
+    data: &Path,
+    caps: &[(Harness, u8)],
+    now: Timestamp,
+    notes: &mut Vec<String>,
+) -> Vec<(Harness, HarnessUsage)> {
+    let store = UsageStore::in_data_dir(data).with_caps(caps.iter().copied());
+    let now_ms = machine_usage::ms(now);
+    let mut usage = Vec::new();
+    for (harness, limit) in why::limits(data, caps, now) {
+        let standing = match limit {
+            Limit::Until(until) => HarnessUsage::Limited(Some(until)),
+            Limit::ProbeDue => HarnessUsage::Limited(None),
+            Limit::Unread(why) => {
+                notes.push(format!("the usage of {harness:?} cannot be read: {why}"));
+                continue;
+            }
+            Limit::Free => {
+                let highest = store.read_at(harness, now_ms).ok().and_then(|state| {
+                    state
+                        .windows
+                        .values()
+                        .filter(|window| window.resets_at_ms > now_ms)
+                        .map(|window| (window.share, window.resets_at_ms))
+                        .reduce(|a, b| if b.0 > a.0 { b } else { a })
+                });
+                match highest {
+                    Some((share, resets_at_ms)) => HarnessUsage::Share {
+                        share,
+                        resets_at: machine_usage::at(resets_at_ms),
+                    },
+                    None => continue,
+                }
+            }
+        };
+        usage.push((harness, standing));
+    }
+    usage
 }
 
 /// The digest's text, its times in `tz`.
@@ -434,7 +471,7 @@ impl Digests {
 }
 
 /// Why the digest's record was not read.
-enum Unread {
+pub(crate) enum Unread {
     /// It is of a newer format.
     Newer,
     /// It cannot be read, or does not parse, for this reason.
@@ -442,7 +479,7 @@ enum Unread {
 }
 
 /// The digest's record in `data`: `None` when there is none.
-fn read(data: &Path) -> Result<Option<DigestRecord>, Unread> {
+pub(crate) fn read(data: &Path) -> Result<Option<DigestRecord>, Unread> {
     match fs::read_to_string(record_file(data)) {
         Ok(text) => match DigestRecord::parse(&text) {
             Ok(record) => Ok(Some(record)),

@@ -163,6 +163,7 @@ mod drain;
 mod limits;
 mod merge;
 mod outside;
+mod pause;
 pub mod presence;
 mod refresh;
 mod running;
@@ -571,6 +572,11 @@ struct Memory<'c> {
     base_turn: BTreeSet<TicketId>,
     /// The strongest stop told, once one is asked (OWL-161).
     stop_told: Option<owlshift_platform::process::Degree>,
+    /// The operator's pause last told, while one stands (OWL-438).
+    operator_pause: Option<(
+        crate::daemon::requests::PauseScope,
+        Option<owlshift_contracts::service::Request>,
+    )>,
     /// The base heads merge on green read at this pass (OWL-445).
     base_heads: merge::BaseHeads,
     /// The refreshes the overlaps make due (OWL-449).
@@ -735,6 +741,9 @@ impl Watch<'_> {
                 .clone()
                 .filter(|_| memory.running.is_empty())
                 .map(|(ticket, _)| (ticket, memory.base_due_ran));
+            // An operator's pause, told as the pass starts (OWL-438): the
+            // pass reads on, and no step starts.
+            let paused = self.operator_paused(&mut memory, sink, out);
             self.pass(&mut memory, sink, out, continued);
             if let Some(asked) = self.stopping() {
                 self.stop(&mut memory, sink, out, asked);
@@ -743,7 +752,9 @@ impl Watch<'_> {
             if draining {
                 self.drain(&mut memory, sink, out, continued);
             }
+            // A pause keeps a check due its priority: no step ran for it.
             if let Some((ticket, ran)) = due
+                && !paused
                 && memory.base_due_ran == ran
                 && !memory.running.iter().any(|step| *step.ticket() == ticket)
             {
@@ -1327,7 +1338,10 @@ impl Watch<'_> {
     ) -> bool {
         let on_demand = self.on_demand;
         let now = (on_demand.clock)();
-        if memory.holds.admit(ticket, &held, now) != Admit::Go
+        // Under an operator's pause no repair, correction or review loop
+        // starts (OWL-438).
+        if self.operator_paused(memory, sink, out)
+            || memory.holds.admit(ticket, &held, now) != Admit::Go
             || self.usage_waits(memory, sink, out, first)
         {
             return false;
@@ -2064,6 +2078,11 @@ impl Watch<'_> {
             stored.at(),
             answer_check::new_answer(&comments, &decider, questions),
         );
+        // An answer read under an operator's pause waits for its lift,
+        // nothing told on the ticket (OWL-438).
+        if self.operator_paused(memory, sink, out) {
+            return;
+        }
         if memory.holds.admit(ticket, &seen, now) != Admit::Go
             || self.usage_waits(memory, sink, out, Some(Role::AnswerCheck))
         {
@@ -2192,6 +2211,11 @@ impl Watch<'_> {
         stage: Stage,
     ) {
         let on_demand = self.on_demand;
+        // Under an operator's pause no stage resumes, and no wait is told
+        // on the ticket for it (OWL-438).
+        if self.operator_paused(memory, sink, out) {
+            return;
+        }
         let now = (on_demand.clock)();
         let at = stored.at();
         if memory

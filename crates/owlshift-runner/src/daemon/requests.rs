@@ -10,6 +10,11 @@
 //!   project whose watch could not start for a reason no restart mends;
 //! - `<data>/service/pause`, the pause of every project, which the daily
 //!   digest reads (OWL-440).
+//!
+//! `owlshift pause` and `owlshift resume` (OWL-438) write and remove both
+//! pauses ([`ask_pause`], [`lift_pause`]), and every watch reads them at each
+//! pass and before each step ([`operator_pause`]): while one stands it
+//! dispatches nothing and starts no step.
 
 use std::fs;
 use std::io;
@@ -79,6 +84,71 @@ pub fn machine_pause(data: &Path) -> Option<Option<Request>> {
     standing(&machine_pause_file(data))
 }
 
+/// The data directory `dirs` lies in: `ProjectDirs::new` places a project at
+/// `<data>/projects/github.com/<owner>/<name>`, which a test pins.
+pub fn data_of(dirs: &ProjectDirs) -> &Path {
+    let root = dirs.root();
+    root.ancestors().nth(4).unwrap_or(root)
+}
+
+/// What an operator's pause covers.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PauseScope {
+    /// Every project of the machine: `<data>/service/pause`.
+    Machine,
+    /// One project: `<project data>/pause`.
+    Project,
+}
+
+impl PauseScope {
+    /// Its name in events.
+    pub fn key(self) -> &'static str {
+        match self {
+            Self::Machine => "machine",
+            Self::Project => "project",
+        }
+    }
+}
+
+/// The pause that stands on `dirs`'s project, the machine's first: what it
+/// covers and what it holds, `None` within for a file that does not read.
+pub fn operator_pause(dirs: &ProjectDirs) -> Option<(PauseScope, Option<Request>)> {
+    machine_pause(data_of(dirs))
+        .map(|request| (PauseScope::Machine, request))
+        .or_else(|| pause(dirs).map(|request| (PauseScope::Project, request)))
+}
+
+/// The pause file of `dirs`'s project, or the machine's of `data` when
+/// `dirs` is `None`.
+fn pause_path(data: &Path, dirs: Option<&ProjectDirs>) -> PathBuf {
+    dirs.map_or_else(|| machine_pause_file(data), pause_file)
+}
+
+/// Writes `request` as the pause of `dirs`'s project, or of every project of
+/// `data` when `dirs` is `None`, replacing whatever stood, a daemon's own
+/// pause included, so the daemon never lifts it: what stood before.
+pub fn ask_pause(
+    data: &Path,
+    dirs: Option<&ProjectDirs>,
+    request: &Request,
+) -> io::Result<Option<Option<Request>>> {
+    let path = pause_path(data, dirs);
+    let before = standing(&path);
+    step::write_atomically(&path, &request.render())?;
+    Ok(before)
+}
+
+/// Removes the pause of `dirs`'s project, or of every project of `data`
+/// when `dirs` is `None`: what stood, `None` when nothing did.
+pub fn lift_pause(data: &Path, dirs: Option<&ProjectDirs>) -> io::Result<Option<Option<Request>>> {
+    let path = pause_path(data, dirs);
+    let before = standing(&path);
+    if before.is_some() {
+        remove_if_any(&path)?;
+    }
+    Ok(before)
+}
+
 /// The request the file at `path` holds, when it stands: `None` within for
 /// a file that does not read as one.
 fn standing(path: &Path) -> Option<Option<Request>> {
@@ -118,7 +188,7 @@ fn remove_if_any(path: &Path) -> io::Result<()> {
 mod tests {
     use jiff::Timestamp;
     use owlshift_adapters::forge::Repo;
-    use owlshift_contracts::service::BY_STOP;
+    use owlshift_contracts::service::{BY_PAUSE, BY_STOP};
 
     use super::*;
 
@@ -156,5 +226,52 @@ mod tests {
         assert_eq!(machine_pause(data), None);
         step::write_atomically(&machine_pause_file(data), &person.render()).unwrap();
         assert_eq!(machine_pause(data), Some(Some(person)));
+    }
+
+    /// OWL-438: `ProjectDirs::new`'s layout gives back its data directory.
+    #[test]
+    fn a_project_folder_names_its_data_directory() {
+        let data = Path::new("/var/owlshift data");
+        let dirs = ProjectDirs::new(data, &Repo::parse("acme/web").unwrap());
+        assert_eq!(data_of(&dirs), data);
+    }
+
+    /// OWL-438: a person's pause replaces a daemon's own, which the daemon
+    /// then never lifts; the machine's stands over a project's; a lift says
+    /// what it removed.
+    #[test]
+    fn a_persons_pause_replaces_the_daemons_and_the_machines_stands_first() {
+        let data = tempfile::tempdir().unwrap();
+        let data = data.path();
+        let dirs = ProjectDirs::new(data, &Repo::parse("acme/web").unwrap());
+        assert_eq!(operator_pause(&dirs), None);
+        assert_eq!(lift_pause(data, Some(&dirs)).unwrap(), None);
+
+        let own = Request::new(BY_DAEMON, Timestamp::now(), "keychain locked");
+        write_pause(&dirs, &own).unwrap();
+        let person = Request::new(BY_PAUSE, Timestamp::now(), "lunch");
+        let replaced = ask_pause(data, Some(&dirs), &person).unwrap();
+        assert_eq!(replaced, Some(Some(own)));
+        assert!(!remove_own_pause(&dirs).unwrap(), "the person's stays");
+        assert_eq!(
+            operator_pause(&dirs),
+            Some((PauseScope::Project, Some(person.clone())))
+        );
+
+        let all = Request::new(BY_PAUSE, Timestamp::now(), "travel");
+        assert_eq!(ask_pause(data, None, &all).unwrap(), None);
+        assert_eq!(
+            operator_pause(&dirs),
+            Some((PauseScope::Machine, Some(all.clone())))
+        );
+        assert_eq!(lift_pause(data, None).unwrap(), Some(Some(all)));
+        assert_eq!(
+            lift_pause(data, Some(&dirs)).unwrap(),
+            Some(Some(person))
+        );
+        assert_eq!(operator_pause(&dirs), None);
+        // An empty file still pauses.
+        fs::write(pause_file(&dirs), "").unwrap();
+        assert_eq!(operator_pause(&dirs), Some((PauseScope::Project, None)));
     }
 }

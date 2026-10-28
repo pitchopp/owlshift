@@ -219,6 +219,11 @@ impl Watch<'_> {
         continued: &mut Continued<'_>,
     ) {
         let on_demand = self.on_demand;
+        // An operator's pause, one written during the pass included
+        // (OWL-438): nothing is taken in or dispatched, nor read for it.
+        if self.operator_paused(memory, sink, out) {
+            return;
+        }
         // Read again: watch's work may have ended a following or closed a
         // round in this pass. A project busy now waits for the next pass,
         // which watch's own note tells. A quarantined one takes nothing in,
