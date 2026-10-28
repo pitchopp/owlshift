@@ -6,9 +6,9 @@
 //! (`setsid`, `setpgid`), as Claude Code does for each Bash call: stopping
 //! the tree searches for it then, by parent pid, with the members of a group
 //! it leads (OWL-451), and misses one whose parent and group leader have both
-//! ended, unless the tree is a run's, tied to its worktree, and the run left
-//! it there ([`ProcessTree::spawn_in`], OWL-452). A Windows job gives no such
-//! way out.
+//! ended, unless the tree is tied to the worktree it works in, a harness
+//! run's (OWL-452) or a gate or setup command's (OWL-455), and it was left
+//! there ([`ProcessTree::spawn_in`]). A Windows job gives no such way out.
 
 use std::io;
 use std::path::Path;

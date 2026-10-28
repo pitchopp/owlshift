@@ -51,8 +51,10 @@ impl RunStop {
 /// Spawns `command` as the root of a process tree, and starts a watchdog
 /// that stops the whole tree `timeout` from now. A run, so a checked stop
 /// of a watch or a step stops the tree at once (OWL-161). With `left_in`,
-/// the worktree a harness runs in, every stop of the tree also reaches what
-/// the run left there once its parent and group leader ended (OWL-452).
+/// the worktree a harness run (OWL-452) or a gate or setup command
+/// (OWL-455) works in, every stop of the tree also reaches what it left
+/// there once its parent and group leader ended; `None` for a tree that
+/// works in no worktree.
 pub(crate) fn spawn(
     command: &mut Command,
     timeout: Duration,

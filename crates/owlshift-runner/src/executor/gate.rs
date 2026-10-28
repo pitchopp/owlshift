@@ -1079,9 +1079,11 @@ fn run_one(agent: &AgentEnv, paths: &RunPaths, line: &str, deadline: Instant, lo
     };
     command.stdin(Stdio::null()).stdout(stdout).stderr(writer);
     let remaining = deadline.saturating_duration_since(Instant::now());
-    // Not tied to the worktree: the gate's and setup's commands keep the
-    // search of what left their group alone (OWL-452).
-    let spawned = watch::spawn(&mut command, remaining, None);
+    // Tied to the worktree, as a harness run is (OWL-455): every stop of the
+    // tree also reaches what the command left there once its parent and
+    // group leader ended, so nothing of it outlives the command into the
+    // checks that follow.
+    let spawned = watch::spawn(&mut command, remaining, Some(&paths.workdir));
     // The command holds the pipe's write ends: dropping it leaves them to
     // the child alone, so the output closes when the tree is gone.
     drop(command);
@@ -1102,8 +1104,9 @@ fn run_one(agent: &AgentEnv, paths: &RunPaths, line: &str, deadline: Instant, lo
     }
     let waited = child.wait();
     let timed_out = watchdog.finish();
-    // What the command left running would hold the output open; the tree
-    // stops it. Best effort, as for the harness.
+    // What the command left running would hold the output open, or write in
+    // the worktree after the checks; the tree stops it, what it left in the
+    // worktree included. Best effort, as for the harness.
     let _ = tree.kill();
     let wait_for = deadline
         .saturating_duration_since(Instant::now())
