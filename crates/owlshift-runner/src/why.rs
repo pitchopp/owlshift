@@ -530,13 +530,16 @@ pub fn render(report: &Report) -> String {
                 let _ = writeln!(out, "  {} waits: {}", wait.at, phrase(wait));
             }
             for narrowed in folded.narrowed.get(ticket).map_or(&[][..], Vec::as_slice) {
+                let dropped = if narrowed.dropped.is_empty() {
+                    "nothing".to_owned()
+                } else {
+                    narrowed.dropped.join(", ")
+                };
                 let _ = writeln!(
                     out,
-                    "  {} narrowed at its Build to its plan's files: dropped {}; keeps the {} \
-                     files its branch changed",
-                    narrowed.at,
-                    narrowed.dropped.join(", "),
-                    narrowed.count
+                    "  {} narrowed at its Build to its plan's files: dropped {dropped}; keeps the \
+                     {} files its branch changed",
+                    narrowed.at, narrowed.count
                 );
             }
             match folded.current.get(ticket) {
@@ -1074,6 +1077,11 @@ mod tests {
                     3,
                 ),
             ),
+            waits(
+                "2026-10-26T11:00:00Z",
+                "LOC-1030",
+                crate::held::narrowed_event(&[], 0),
+            ),
         ];
         let folded = fold(&events, "o/r");
         assert!(folded.current.contains_key(&id));
@@ -1094,6 +1102,13 @@ mod tests {
             text.contains(
                 "  2026-10-26T10:00:00Z narrowed at its Build to its plan's files: dropped zone \
                  `backend/leases`, resource `migrations`; keeps the 3 files its branch changed\n"
+            ),
+            "{text}"
+        );
+        assert!(
+            text.contains(
+                "  2026-10-26T11:00:00Z narrowed at its Build to its plan's files: dropped \
+                 nothing; keeps the 0 files its branch changed\n"
             ),
             "{text}"
         );

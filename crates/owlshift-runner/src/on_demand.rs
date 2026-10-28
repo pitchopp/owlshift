@@ -2073,7 +2073,13 @@ impl OnDemand<'_> {
         ) else {
             return Ok(());
         };
-        let dropped = held::added(&p.ticket, &next, &before, &named);
+        // A re-admission of a record admitted without a plan, told whatever
+        // it dropped (OWL-461); a plan whose files it cannot hold only keeps
+        // its hash, admitting nothing.
+        let narrowed = plan
+            .as_ref()
+            .is_some_and(|(plan, _)| held::readmits(&before, plan))
+            .then(|| held::added(&p.ticket, &next, &before, &named));
         let added = held::added(&p.ticket, &before, &next, &named);
         let outside = match (added.is_empty(), p.outside.take()) {
             (true, _) => None,
@@ -2132,7 +2138,7 @@ impl OnDemand<'_> {
         let kept = next.files.len();
         p.held = Some(next);
         self.keep(p, state)?;
-        if !dropped.is_empty() {
+        if let Some(dropped) = narrowed {
             sink.emit(
                 &p.ticket,
                 None,

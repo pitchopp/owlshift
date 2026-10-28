@@ -364,6 +364,13 @@ pub fn at_build(
     Some(next)
 }
 
+/// Whether [`at_build`] admits `held` again from `plan` in place of what it
+/// held (OWL-461): admitted without a plan, `plan` naming files it can hold.
+/// A plan none of whose files it can hold only keeps its hash.
+pub fn readmits(held: &TicketHeld, plan: &Plan) -> bool {
+    held.narrows() && resource::planned(&plan.files, MAX_HELD_FILES).is_some()
+}
+
 /// [`at_build`] for the ticket ref `record`, as watch predicts its next
 /// step (OWL-448): its plan when its pipeline, by its `labels`, its intake
 /// record and the project's `default` variant, has Design, as the step
@@ -1031,6 +1038,10 @@ mod tests {
             (&kept.zones, kept.plan_sha256.as_ref()),
             (&strings(&["app", "web"]), Some(&hash))
         );
+        // What the step tells as a narrowing: a re-admission, whatever it
+        // dropped, never a plan's hash kept alone.
+        assert!(readmits(&built, &plan));
+        assert!(!readmits(&built, &unusable) && !readmits(&narrowed, &plan));
     }
 
     /// OWL-461: a record holding the whole repository with no plan narrows
