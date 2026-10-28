@@ -13,6 +13,15 @@
       "description": "Who asked: a command, such as [`BY_STOP`] or [`BY_DAEMON`].",
       "type": "string"
     },
+    "pid": {
+      "description": "The pid of the daemon it is for, when it names one: an upgrade's\ndrain names the daemon it hands over (OWL-436), so a daemon that\nfinds at its start a drain naming another one removes it, and one\nnaming itself is honoured.",
+      "type": [
+        "integer",
+        "null"
+      ],
+      "format": "uint32",
+      "minimum": 0
+    },
     "why": {
       "description": "Why, in words for a person.",
       "type": "string"

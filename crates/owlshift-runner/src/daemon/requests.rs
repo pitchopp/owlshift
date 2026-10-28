@@ -75,6 +75,30 @@ pub fn drain_asked(data: &Path) -> Option<Request> {
     )
 }
 
+/// Takes the daemon's stop request in `data` away: renamed to a name of its
+/// own, then removed, so a request is never removed without being counted.
+/// Whether one stood.
+pub fn take_stop_request(data: &Path) -> io::Result<bool> {
+    let taken = service_dir(data).join(format!("stop.taken.{}", std::process::id()));
+    match fs::rename(stop_request_file(data), &taken) {
+        Ok(()) => remove_if_any(&taken).map(|()| true),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error),
+    }
+}
+
+/// The upgrade's drain in `data` that does not name the daemon of pid
+/// `pid`, removed: what it held. One naming that daemon stays, to be
+/// honoured.
+pub fn leftover_drain(data: &Path, pid: u32) -> Option<Request> {
+    let request = drain_asked(data)?;
+    if request.pid == Some(pid) {
+        return None;
+    }
+    let _ = remove_drain_request(data);
+    Some(request)
+}
+
 /// Removes the upgrade's drain request in `data`, if there is one.
 pub fn remove_drain_request(data: &Path) -> io::Result<()> {
     remove_if_any(&drain_request_file(data))
@@ -288,6 +312,23 @@ mod tests {
         remove_drain_request(data).unwrap();
         remove_drain_request(data).unwrap();
         assert_eq!(drain_asked(data), None);
+
+        // A drain naming this daemon stays at its start; any other goes.
+        let named = request.clone().for_pid(42);
+        ask_drain(data, &named).unwrap();
+        assert_eq!(leftover_drain(data, 42), None);
+        assert_eq!(drain_asked(data), Some(named.clone()));
+        assert_eq!(leftover_drain(data, 43), Some(named));
+        assert_eq!(drain_asked(data), None);
+        ask_drain(data, &request).unwrap();
+        assert_eq!(leftover_drain(data, 42), Some(request.clone()));
+
+        // A stop request taken is counted, then gone; none is none.
+        assert!(!take_stop_request(data).unwrap());
+        ask_stop(data, &request).unwrap();
+        assert!(take_stop_request(data).unwrap());
+        assert_eq!(stop_asked(data), None);
+        assert_eq!(fs::read_dir(service_dir(data)).unwrap().count(), 0);
 
         let dirs = ProjectDirs::new(data, &Repo::parse("acme/web").unwrap());
         ask_watch_stop(&dirs, &request).unwrap();

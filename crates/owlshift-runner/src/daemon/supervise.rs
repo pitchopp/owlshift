@@ -97,9 +97,10 @@ impl Daemon<'_> {
             self.remove_stop_request(out);
             return Ended::Stopped;
         }
-        if let Some(request) = requests::drain_asked(self.data) {
-            // Left by the daemon before this one, or written as it ended:
-            // this daemon is already the binary that drain was for.
+        // A drain naming this daemon was written once its record stood, by a
+        // newer binary: honoured by the loop. Any other was left for the
+        // daemon before this one, which is already the binary it was for.
+        if let Some(request) = requests::leftover_drain(self.data, std::process::id()) {
             say(
                 out,
                 &format!(
@@ -108,7 +109,6 @@ impl Daemon<'_> {
                     request.by, request.at, request.why
                 ),
             );
-            self.remove_drain_request(out);
         }
         say(
             out,
@@ -178,10 +178,12 @@ impl Daemon<'_> {
             self.remove_own_stop(slot, out);
         }
         // A stop asked during an upgrade's drain wins: the service manager
-        // must not start the daemon again.
-        let stopped = process::asked().is_some() || requests::stop_asked(self.data).is_some();
-        self.remove_stop_request(out);
+        // must not start the daemon again. The drain goes first, then the
+        // stop request is taken and read in one step, so a stop written in
+        // between is never removed unread; one written later stands for the
+        // next daemon, which then ends at its start.
         self.remove_drain_request(out);
+        let stopped = self.take_stop_request(out) || process::asked().is_some();
         if state.upgrading && !stopped {
             say(
                 out,
@@ -643,6 +645,21 @@ impl Daemon<'_> {
                 out,
                 &format!("warning: the stop request could not be removed: {error}"),
             );
+        }
+    }
+
+    /// Takes the stop request away, if one stands: whether one did. One
+    /// that cannot be taken counts as standing.
+    fn take_stop_request(&self, out: &mut dyn Write) -> bool {
+        match requests::take_stop_request(self.data) {
+            Ok(taken) => taken,
+            Err(error) => {
+                say(
+                    out,
+                    &format!("warning: the stop request could not be removed: {error}"),
+                );
+                true
+            }
         }
     }
 

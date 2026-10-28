@@ -151,8 +151,8 @@ pub fn hand_over(data: &Path, own: &str, binary: &Path, by: &str) -> Result<Hand
         record.version,
         binary.display()
     );
-    requests::ask_drain(data, &Request::new(by, Timestamp::now(), why))
-        .map_err(|e| format!("the drain request: {e}"))?;
+    let request = Request::new(by, Timestamp::now(), why).for_pid(record.pid);
+    requests::ask_drain(data, &request).map_err(|e| format!("the drain request: {e}"))?;
     let same = |now: &DaemonRecord| now.pid == record.pid && now.since == record.since;
     if !matches!(instance::running(data), Ok(Some(Some(now))) if same(&now)) {
         let _ = requests::remove_drain_request(data);
@@ -343,6 +343,7 @@ mod tests {
         assert_eq!(handover, Handover::Ask(me.clone()));
         let asked = requests::drain_asked(&data).unwrap();
         assert_eq!(asked.by, "owlshift start");
+        assert_eq!(asked.pid, Some(me.pid), "it names the daemon it is for");
         assert!(
             asked.why.contains("from version 0.1.0 to 0.2.0"),
             "{asked:?}"
