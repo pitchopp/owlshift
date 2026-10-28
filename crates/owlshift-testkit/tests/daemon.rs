@@ -10,7 +10,8 @@
 //! OWL-441: scenario S11 with a real watch under the daemon (the bench's
 //! `drain`), its steps in children and its runs on the fake harness: a
 //! SIGTERM checks and resumes two Builds, a SIGKILL leaves the quarantine,
-//! notified, and no ticket is dispatched twice across the restarts.
+//! notified, each cut Build told once that it waits (OWL-456), and no
+//! ticket is dispatched twice across the restarts.
 #![cfg(unix)]
 
 use std::collections::BTreeMap;
@@ -22,7 +23,9 @@ use std::time::{Duration, Instant};
 
 use jiff::Timestamp;
 use owlshift_adapters::forge::Repo;
+use owlshift_adapters::tracker::markdown::MarkdownTracker;
 use owlshift_contracts::event::EventKind;
+use owlshift_contracts::ids::TicketId;
 use owlshift_contracts::service::{BY_DAEMON, BY_STOP, Request};
 use owlshift_runner::daemon::{self, requests};
 use owlshift_runner::project::ProjectDirs;
@@ -473,6 +476,16 @@ fn build_starts(data: &Path, ticket: &str) -> Vec<bool> {
         .collect()
 }
 
+/// The WAITING comments on `ticket` in the tracker of `project`.
+fn waiting_on(project: &ChildProject, ticket: &str) -> usize {
+    MarkdownTracker::new(&project.checkout)
+        .comments(&TicketId::new(ticket).unwrap())
+        .unwrap()
+        .iter()
+        .filter(|comment| comment.body.starts_with("[owlshift] WAITING\n"))
+        .count()
+}
+
 /// No double dispatch, as the exit gate reads it from the events of `data`
 /// (architecture section 5, "Dispatch and resume"): no run of a ticket
 /// starts before every earlier run of it has ended, and each of `tickets`,
@@ -522,7 +535,9 @@ fn assert_no_double_dispatch(data: &Path, tickets: &[&str]) {
 ///   stopped and checked, their obligations retired, nothing quarantined.
 /// - At the next start both Builds resume from their checkpoints.
 /// - A SIGKILL of the daemon while they run cuts them: the next start
-///   quarantines the project, notified once, and nothing runs.
+///   quarantines the project, notified once, and nothing runs. Each cut
+///   Build, In Progress at its stage, is told on the ticket that it waits:
+///   one WAITING comment over the passes (OWL-456).
 /// - Across the three starts, no ticket has two runs at once, nor a second
 ///   `drain` dispatch.
 #[test]
@@ -580,6 +595,9 @@ fn s11_a_checked_stop_resumes_both_builds_and_a_kill_quarantines() {
     assert_eq!(dirs.quarantine().unwrap(), None, "{}", bench.output());
     assert!(!dirs.obligations_stand(), "{}", bench.output());
     assert_eq!(ended_as(&project, "stopped"), TICKETS, "{}", bench.output());
+    for id in TICKETS {
+        assert_eq!(waiting_on(&project, id), 0, "{id}\n{}", bench.output());
+    }
 
     // Resumed from their checkpoints at the next start.
     for file in &pid_files {
@@ -628,6 +646,8 @@ fn s11_a_checked_stop_resumes_both_builds_and_a_kill_quarantines() {
     for (id, file) in TICKETS.iter().zip(&pid_files) {
         assert!(!file.exists(), "{id} ran while quarantined");
         assert_eq!(build_starts(&bench.data(), id).len(), 2, "{id}");
+        // Told once, whatever the passes (OWL-456).
+        assert_eq!(waiting_on(&project, id), 1, "{id}\n{}", bench.output());
     }
     assert_no_double_dispatch(&bench.data(), &TICKETS);
 }
