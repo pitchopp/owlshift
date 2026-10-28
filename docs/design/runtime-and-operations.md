@@ -239,7 +239,7 @@ Every action is a recorded event, readable from the CLI from P1 and from a local
 
 | Command | Answers |
 | --- | --- |
-| `owlshift status` | What the service serves and runs, what waits for me, usage and when each harness's limit resets (P7) |
+| `owlshift status` | What the service serves and runs, what waits for me, usage and when each harness's limit resets (P7); with `--waits [owner/repo]`, what each ticket in flight or admitted waits on and behind whom, the holders first, then the queue for a slot, and `--json` for the web UI's graph view (OWL-459) |
 | `owlshift logs --follow` | The live event stream |
 | `owlshift logs PROJ-123` | Everything about one ticket, runs included |
 | `owlshift why PROJ-123` | Why a ticket is not starting: a blocker, a held zone, a cap, a harness at its limit |

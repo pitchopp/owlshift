@@ -12,6 +12,8 @@
 //! `owlshift why` counts them, each free one tried for a moment.
 //!
 //! [`gather`] does the reading; [`watch_state`] and [`render`] are pure.
+//! `owlshift status --waits`, what each ticket in flight waits on, is
+//! [`waits`] (OWL-459).
 
 use std::fmt::Write as _;
 use std::path::Path;
@@ -21,7 +23,9 @@ use jiff::tz::TimeZone;
 use owlshift_adapters::forge::Repo;
 use owlshift_contracts::event::{Event, EventKind};
 use owlshift_contracts::ids::TicketId;
-use owlshift_contracts::service::{BY_DAEMON, DaemonRecord, DigestRecord, Request, ServedConfig};
+use owlshift_contracts::service::{
+    BY_DAEMON, DaemonRecord, DigestRecord, Request, ServedConfig, ServedProject,
+};
 use owlshift_core::state::Status;
 use owlshift_core::vocab::Harness;
 use serde_json::Value;
@@ -33,6 +37,8 @@ use crate::project::ProjectDirs;
 use crate::served::{self, Registry};
 use crate::slots::{HeldSlot, MachineSlots};
 use crate::{watch, why};
+
+pub mod waits;
 
 /// Everything `owlshift status` shows.
 #[derive(Clone, Debug)]
@@ -160,6 +166,43 @@ pub fn watch_state(events: &[Event], project: &str, since: Timestamp) -> Watch {
     }
 }
 
+/// Every event of the data directory `data`'s log, oldest first; what
+/// cannot be read is said in `notes`.
+pub(crate) fn read_events(data: &Path, notes: &mut Vec<String>) -> Vec<Event> {
+    match why::read_events(EventLog::in_dir(data).path()) {
+        Ok((events, bad)) => {
+            notes.extend(bad.into_iter().map(|why| format!("the event log's {why}")));
+            events
+        }
+        Err(error) => {
+            notes.push(format!("the event log cannot be read: {error}"));
+            Vec::new()
+        }
+    }
+}
+
+/// The projects `projects.json` of `data` lists, each with its repository;
+/// what cannot be read is said in `notes`.
+pub(crate) fn served_projects(data: &Path, notes: &mut Vec<String>) -> Vec<(ServedProject, Repo)> {
+    let listed = match Registry::in_data_dir(data).read() {
+        Ok(served) => served.projects,
+        Err(error) => {
+            notes.push(format!("the served projects cannot be read: {error}"));
+            Vec::new()
+        }
+    };
+    listed
+        .into_iter()
+        .filter_map(|entry| match Repo::parse(&entry.repository) {
+            Ok(repo) => Some((entry, repo)),
+            Err(error) => {
+                notes.push(format!("{} is not a repository: {error}", entry.repository));
+                None
+            }
+        })
+        .collect()
+}
+
 /// Reads what `owlshift status` shows of the data directory `data`, its
 /// slots counted up to `concurrent_runs`, its harnesses' caps `caps`, at
 /// `now`.
@@ -170,32 +213,9 @@ pub fn gather(data: &Path, concurrent_runs: u32, caps: &[(Harness, u8)], now: Ti
         Ok(Some(record)) => Daemon::Running(record),
         Err(error) => Daemon::Unknown(error.to_string()),
     };
-    let events = match why::read_events(EventLog::in_dir(data).path()) {
-        Ok((events, bad)) => {
-            notes.extend(bad.into_iter().map(|why| format!("the event log's {why}")));
-            events
-        }
-        Err(error) => {
-            notes.push(format!("the event log cannot be read: {error}"));
-            Vec::new()
-        }
-    };
-    let listed = match Registry::in_data_dir(data).read() {
-        Ok(served) => served.projects,
-        Err(error) => {
-            notes.push(format!("the served projects cannot be read: {error}"));
-            Vec::new()
-        }
-    };
+    let events = read_events(data, &mut notes);
     let mut projects = Vec::new();
-    for entry in listed {
-        let repo = match Repo::parse(&entry.repository) {
-            Ok(repo) => repo,
-            Err(error) => {
-                notes.push(format!("{} is not a repository: {error}", entry.repository));
-                continue;
-            }
-        };
+    for (entry, repo) in served_projects(data, &mut notes) {
         let dirs = ProjectDirs::new(data, &repo);
         let config = served::read_record(&dirs)
             .map(|record| record.unwrap_or_else(|| ServedConfig::new(repo.to_string())));

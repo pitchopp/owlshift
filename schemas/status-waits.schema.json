@@ -1,0 +1,481 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Owlshift status waits",
+  "description": "The wait graph of the projects asked about, at one time.",
+  "type": "object",
+  "properties": {
+    "at": {
+      "description": "When it was read.",
+      "type": "string",
+      "format": "date-time"
+    },
+    "format": {
+      "description": "The format version of this document.",
+      "type": "integer",
+      "const": 1
+    },
+    "machine_pause": {
+      "description": "The pause of every project of the machine (`<data>/service/pause`),\nwhile it stands: no ticket is dispatched and no step starts.",
+      "anyOf": [
+        {
+          "$ref": "#/$defs/Paused"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null
+    },
+    "notes": {
+      "description": "What could not be read, in words for a person.",
+      "type": "array",
+      "default": [],
+      "items": {
+        "type": "string"
+      }
+    },
+    "projects": {
+      "description": "The served projects, or the one asked about.",
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/ProjectWaits"
+      }
+    },
+    "runs": {
+      "description": "The machine's run slots (`concurrent_runs`); `null` when they cannot\nbe probed.",
+      "anyOf": [
+        {
+          "$ref": "#/$defs/RunSlots"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "format",
+    "at",
+    "projects"
+  ],
+  "$defs": {
+    "Behind": {
+      "description": "What a ticket waits behind.",
+      "oneOf": [
+        {
+          "description": "A ticket: one of Owlshift's, or, with `person`, a ticket a person\nworks on, which holds no run slot of Owlshift's.",
+          "type": "object",
+          "properties": {
+            "id": {
+              "$ref": "#/$defs/TicketId"
+            },
+            "kind": {
+              "type": "string",
+              "const": "ticket"
+            },
+            "person": {
+              "type": "boolean"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "id",
+            "person"
+          ]
+        },
+        {
+          "description": "A pull request Owlshift does not follow.",
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "pull_request"
+            },
+            "number": {
+              "type": "integer",
+              "format": "uint64",
+              "minimum": 0
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "number"
+          ]
+        }
+      ]
+    },
+    "HeldRun": {
+      "description": "A machine run slot a ticket's step holds.",
+      "type": "object",
+      "properties": {
+        "pid": {
+          "description": "The step's process.",
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "since": {
+          "description": "When it took the slot.",
+          "type": "string",
+          "format": "date-time"
+        },
+        "slot": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "slot",
+        "pid",
+        "since"
+      ]
+    },
+    "Paused": {
+      "description": "A pause file that stands, with who asked, when and why; each `null` when\nthe file does not read.",
+      "type": "object",
+      "properties": {
+        "at": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "date-time",
+          "default": null
+        },
+        "by": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
+        },
+        "why": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
+        }
+      },
+      "additionalProperties": false
+    },
+    "ProjectWaits": {
+      "description": "One project's tickets in flight or admitted.",
+      "type": "object",
+      "properties": {
+        "in_flight": {
+          "description": "The tickets that count against that capacity now: those whose\n[`TicketWaits::holds_capacity`] is true.",
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "max_in_flight": {
+          "description": "Its capacity, `policy.max_in_flight` of the project file it is\nserved on; `null` when no such file is kept (a project not served).",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint8",
+          "default": null,
+          "maximum": 255,
+          "minimum": 0
+        },
+        "paused": {
+          "description": "Its own pause, while it stands.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Paused"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "quarantined": {
+          "description": "Whether its quarantine marker stands: every command refuses it.",
+          "type": "boolean"
+        },
+        "repository": {
+          "description": "`owner/repo`, as the served projects or the command name it.",
+          "type": "string"
+        },
+        "served": {
+          "description": "Whether the background service serves it.",
+          "type": "boolean"
+        },
+        "tickets": {
+          "description": "Its tickets, in identifier order.",
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/TicketWaits"
+          }
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "repository",
+        "served",
+        "in_flight",
+        "quarantined",
+        "tickets"
+      ]
+    },
+    "RefStatus": {
+      "description": "What a ticket's ref says of it.",
+      "oneOf": [
+        {
+          "description": "It is worked at its stage.",
+          "type": "string",
+          "const": "active"
+        },
+        {
+          "description": "It waits for its decider's answer.",
+          "type": "string",
+          "const": "needs_input"
+        },
+        {
+          "description": "It is parked: only a person's `owlshift continue` restarts it.",
+          "type": "string",
+          "const": "parked"
+        },
+        {
+          "description": "It has no ticket ref: admitted, and not dispatched.",
+          "type": "string",
+          "const": "no_ref"
+        },
+        {
+          "description": "Its ref cannot be read.",
+          "type": "string",
+          "const": "unread"
+        }
+      ]
+    },
+    "RunSlots": {
+      "description": "The machine's run slots: every step's child of every project takes one.",
+      "type": "object",
+      "properties": {
+        "in_use": {
+          "description": "The slots held now.",
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "of": {
+          "description": "`concurrent_runs`.",
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "in_use",
+        "of"
+      ]
+    },
+    "Stage": {
+      "description": "A stage of the pipeline, or `ready` for an admitted ticket not yet started.",
+      "type": "string",
+      "enum": [
+        "intake",
+        "ready",
+        "design",
+        "design_review",
+        "build",
+        "verify",
+        "deliver",
+        "watch"
+      ]
+    },
+    "TicketId": {
+      "description": "A tracker's ticket identifier, safe as a git ref component and a file name.",
+      "type": "string",
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$"
+    },
+    "TicketWaits": {
+      "description": "One ticket in flight or admitted.",
+      "type": "object",
+      "properties": {
+        "holds_capacity": {
+          "description": "Whether it counts against the project's capacity: its ref is past\nReady and before Watch, neither waiting for an answer nor parked, or\ncannot be read.",
+          "type": "boolean"
+        },
+        "ref_status": {
+          "$ref": "#/$defs/RefStatus"
+        },
+        "run": {
+          "description": "The machine run slot it holds now: a step of it is under way.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/HeldRun"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "stage": {
+          "description": "Its stage, from its ticket ref; `null` without a ref that reads.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Stage"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "ticket": {
+          "$ref": "#/$defs/TicketId"
+        },
+        "waits": {
+          "description": "What it waits on; `null` when it waits on nothing.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Wait"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "ticket",
+        "ref_status",
+        "holds_capacity"
+      ]
+    },
+    "Wait": {
+      "description": "What a ticket waits on.",
+      "type": "object",
+      "properties": {
+        "behind": {
+          "description": "What it waits behind, as the wait named it when told: the blockers,\nthe holder of a resource (both, when two tickets share it), or the\ntickets that held the project's capacity.",
+          "type": "array",
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/Behind"
+          }
+        },
+        "harness": {
+          "description": "The harness of a `usage_limit`, such as `claude`.",
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
+        },
+        "reason": {
+          "description": "Why, as a key. From the event log, the reasons `owlshift why` reads:\n`blocked_by`, `blocker_canceled`, `blocker_unknown` (its blockers),\n`collision` (a resource another holds), `slot` (the project's\ncapacity), `run_cap` (the machine's run slots), `usage_limit`,\n`quarantine`, `pr_cap`, `base_broken`, `in_flight_unread`,\n`to_watch`, `no_decider`, `no_intake`, `stale_intake`, `not_ready`.\nFrom the ticket's ref: `needs_input` (its decider's answer) and\n`parked`. The set is open: a reader shows [`Wait::text`] for a key\nit does not know.",
+          "type": "string"
+        },
+        "resource": {
+          "description": "The resource of a `collision`.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/WaitResource"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "since": {
+          "description": "When it was told; `null` for a wait its ref says.",
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "date-time",
+          "default": null
+        },
+        "text": {
+          "description": "The wait in words for a person, as `owlshift why` says it: for\ndisplay only.",
+          "type": "string"
+        },
+        "until": {
+          "description": "The time a `usage_limit` ends, when the harness gave one.",
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "date-time",
+          "default": null
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "reason",
+        "text"
+      ]
+    },
+    "WaitResource": {
+      "description": "A resource a ticket would take.",
+      "oneOf": [
+        {
+          "description": "A zone or a file, as a path of the repository; empty for the whole\nrepository.",
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "zone"
+            },
+            "path": {
+              "type": "string"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "path"
+          ]
+        },
+        {
+          "description": "A named resource of `stack.resources`.",
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "named"
+            },
+            "name": {
+              "type": "string"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "name"
+          ]
+        },
+        {
+          "description": "The browser.",
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "browser"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "kind"
+          ]
+        }
+      ]
+    }
+  }
+}

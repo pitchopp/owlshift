@@ -18,6 +18,7 @@ use crate::service::{
 };
 use crate::step::{RunObligation, StepEnvelope, StepOutcome, StepOutside, TicketCarry, TicketRun};
 use crate::usage::HarnessUsage;
+use crate::waits::StatusWaits;
 
 /// Every published schema, by file stem: `schemas/<stem>.schema.json`.
 pub fn all() -> Vec<(&'static str, Schema)> {
@@ -54,6 +55,7 @@ pub fn all() -> Vec<(&'static str, Schema)> {
         ("service-request", schema::<Request>()),
         ("install-manifest", schema::<InstallManifest>()),
         ("digest", schema::<DigestRecord>()),
+        ("status-waits", schema::<StatusWaits>()),
     ]
 }
 

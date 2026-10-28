@@ -21,6 +21,7 @@ pub mod schema;
 pub mod service;
 pub mod step;
 pub mod usage;
+pub mod waits;
 
 pub use format::ContractError;
 pub use owlshift_core::vocab::{
