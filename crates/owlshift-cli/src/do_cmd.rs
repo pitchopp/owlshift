@@ -21,6 +21,7 @@ use std::process::{Command, ExitCode};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use jiff::Timestamp;
 use owlshift_adapters::forge::Repo;
 use owlshift_adapters::notifier::Notifier;
 use owlshift_adapters::tracker::markdown::MarkdownTracker;
@@ -28,15 +29,16 @@ use owlshift_adapters::tracker::{Capability, Tracker};
 use owlshift_contracts::config::{
     DEFAULT_CONCURRENT_RUNS, Models, PersonalConfig, ProjectConfig, TrackerKind,
 };
-use owlshift_contracts::format::strip_role_front_matter;
+use owlshift_contracts::format::{Format, strip_role_front_matter};
 use owlshift_contracts::ids::TicketId;
+use owlshift_contracts::service::WatchRecord;
 use owlshift_contracts::step::StepEnvelope;
 use owlshift_contracts::{Harness, Role, Tier};
 use owlshift_platform::awake::KeepAwake;
 use owlshift_platform::keychain::{Keychain, KeychainError};
 use owlshift_runner::agent_env::AgentEnv;
 use owlshift_runner::codex_machine::codex_critic;
-use owlshift_runner::config::{Effective, FileState};
+use owlshift_runner::config::{Effective, FileState, OWLSHIFT_VERSION};
 use owlshift_runner::daemon::UNSERVABLE_EXIT;
 use owlshift_runner::events::{EventLog, EventSink, printable};
 use owlshift_runner::executor::CodexHarness;
@@ -59,7 +61,7 @@ use owlshift_runner::usage::UsageStore;
 use owlshift_runner::watch::{POLL_INTERVAL, Watch, drain_refusal, presence};
 use owlshift_runner::{forge, secrets, tracker};
 
-use crate::fail;
+use crate::{fail, own_build};
 
 /// How long to wait between two reads of a pull request's head after a
 /// push.
@@ -563,14 +565,41 @@ fn run_with(
                 Ok(None) => {
                     let _ = writeln!(
                         io::stderr(),
-                        "owlshift: warning: another command kept this watch's mark, so                          `owlshift continue --to-watch` will say no watch runs"
+                        "owlshift: warning: another command kept this watch's mark, so \
+                         `owlshift continue --to-watch` will say no watch runs"
                     );
                     None
                 }
                 Err(error) => {
                     let _ = writeln!(
                         io::stderr(),
-                        "owlshift: warning: this watch's mark could not be kept ({error}), so                          `owlshift continue --to-watch` will say no watch runs"
+                        "owlshift: warning: this watch's mark could not be kept ({error}), so \
+                         `owlshift continue --to-watch` will say no watch runs"
+                    );
+                    None
+                }
+            };
+            // Which build this watch runs, which `owlshift doctor` reads
+            // (OWL-462).
+            let watch_record = WatchRecord {
+                format: Format,
+                pid: std::process::id(),
+                project: repo.to_string(),
+                served: served.is_some(),
+                since: Timestamp::now(),
+                binary: std::env::current_exe()
+                    .map(|binary| binary.display().to_string())
+                    .unwrap_or_default(),
+                version: OWLSHIFT_VERSION.to_owned(),
+                build: own_build(),
+            };
+            let _recorded = match presence::record(&dirs, &watch_record) {
+                Ok(recorded) => recorded,
+                Err(error) => {
+                    let _ = writeln!(
+                        io::stderr(),
+                        "owlshift: warning: this watch's record could not be kept ({error}), so \
+                         `owlshift doctor` cannot tell which build it runs"
                     );
                     None
                 }

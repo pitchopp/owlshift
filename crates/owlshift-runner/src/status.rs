@@ -501,6 +501,7 @@ mod tests {
             version: "0.4.0".to_owned(),
             binary: "/bin/owlshift".to_owned(),
             since,
+            build: None,
         }
     }
 

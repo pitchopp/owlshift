@@ -106,6 +106,7 @@ mod tests {
             version: "0.0.0".to_owned(),
             binary: "/bin/owlshift".to_owned(),
             since: jiff::Timestamp::now(),
+            build: None,
         }
     }
 

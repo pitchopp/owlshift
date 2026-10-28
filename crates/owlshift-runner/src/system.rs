@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use owlshift_contracts::ids::TicketId;
+use owlshift_contracts::service::{BuildIdentity, Request};
 pub use owlshift_platform::paths::DataDirSource;
 pub use owlshift_platform::process::{Captured, RunError};
 #[cfg(unix)]
@@ -214,6 +215,13 @@ pub trait System {
         );
         Some(crate::install::state(&data, layout))
     }
+    /// The daemon and the watches that run on the data directory, each
+    /// with the build it runs (OWL-462); `None` without a data directory.
+    /// Only `owlshift doctor` asks.
+    fn running_builds(&self) -> Option<Result<RunningBuilds, String>> {
+        let (data, _) = self.data_dir()?;
+        Some(running_builds(&data).map_err(|error| format!("{}: {error}", data.display())))
+    }
     /// Whether the sentinel still protects the live process trees from a
     /// hard kill of Owlshift (OWL-86, OWL-88, OWL-91).
     #[cfg(unix)]
@@ -226,6 +234,84 @@ pub trait System {
     fn sentinel_probe(&self) -> SentinelProbe {
         owlshift_platform::process::probe_sentinel(SENTINEL_PROBE_TIMEOUT)
     }
+}
+
+/// A daemon or a watch that runs on this machine's data directory, and the
+/// build it runs (OWL-462).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Running {
+    /// The watch's project, `owner/name`; `None` for the daemon.
+    pub project: Option<String>,
+    /// Whether the daemon runs this watch, rather than a person in a
+    /// terminal.
+    pub served: bool,
+    /// Its pid; `None` for a daemon whose record does not read.
+    pub pid: Option<u32>,
+    /// The version its record names; `None` when the record does not read.
+    pub version: Option<String>,
+    /// The build its record names: `None` when it names none (a daemon's
+    /// record from before OWL-462) or does not read.
+    pub build: Option<BuildIdentity>,
+    /// Whether the file it started from changed on disk after it started,
+    /// that file not being this program's own: what it runs is then not
+    /// what that file holds.
+    pub replaced: bool,
+}
+
+/// What runs on this machine's data directory (OWL-462).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct RunningBuilds {
+    /// The daemon first, then each watch.
+    pub processes: Vec<Running>,
+    /// The upgrade's drain asked of the daemon, when one stands.
+    pub drain: Option<Request>,
+}
+
+/// What runs on the data directory `data`: its daemon (the instant probe
+/// of `daemon.lock`) and its watches (`watch::presence::running`).
+fn running_builds(data: &Path) -> std::io::Result<RunningBuilds> {
+    let own = std::env::current_exe()
+        .ok()
+        .and_then(|own| std::fs::canonicalize(own).ok());
+    let replaced = |binary: &str, since: jiff::Timestamp| {
+        let path = Path::new(binary);
+        std::fs::metadata(path)
+            .and_then(|metadata| metadata.modified())
+            .ok()
+            .and_then(|modified| jiff::Timestamp::try_from(modified).ok())
+            .is_some_and(|modified| modified > since)
+            && std::fs::canonicalize(path).ok() != own
+    };
+    let mut processes = Vec::new();
+    if let Some(record) = crate::daemon::running(data)? {
+        processes.push(Running {
+            project: None,
+            served: false,
+            pid: record.as_ref().map(|record| record.pid),
+            version: record.as_ref().map(|record| record.version.clone()),
+            replaced: record
+                .as_ref()
+                .is_some_and(|record| replaced(&record.binary, record.since)),
+            build: record.and_then(|record| record.build),
+        });
+    }
+    for watch in crate::watch::presence::running(data)? {
+        let record = watch.record;
+        processes.push(Running {
+            project: record.as_ref().map(|record| record.project.clone()),
+            served: record.as_ref().is_some_and(|record| record.served),
+            pid: Some(watch.pid),
+            version: record.as_ref().map(|record| record.version.clone()),
+            replaced: record
+                .as_ref()
+                .is_some_and(|record| replaced(&record.binary, record.since)),
+            build: record.map(|record| record.build),
+        });
+    }
+    Ok(RunningBuilds {
+        processes,
+        drain: crate::daemon::requests::drain_asked(data),
+    })
 }
 
 /// Whether the dedicated checkout at `checkout` exists: only its absence is
@@ -368,6 +454,9 @@ pub(crate) mod fake {
         /// The background service as doctor reads it; `None`: no line, and
         /// never the disk.
         service: Option<crate::install::ServiceState>,
+        /// What runs on the data directory as doctor reads it (OWL-462);
+        /// `None`: no line, and never the disk.
+        running_builds: Option<RunningBuilds>,
         /// Files that are not there; every other one is.
         missing_files: Vec<PathBuf>,
         /// What reading a text file gives; a file not here has no text,
@@ -408,6 +497,12 @@ pub(crate) mod fake {
         #[cfg(unix)]
         pub(crate) fn service_is(mut self, state: crate::install::ServiceState) -> Self {
             self.service = Some(state);
+            self
+        }
+
+        /// These run on the data directory (OWL-462).
+        pub(crate) fn running_builds_are(mut self, running: RunningBuilds) -> Self {
+            self.running_builds = Some(running);
             self
         }
 
@@ -629,6 +724,11 @@ pub(crate) mod fake {
         /// As [`Self::service_is`] scripted it; never the disk.
         fn service(&self) -> Option<crate::install::ServiceState> {
             self.service.clone()
+        }
+
+        /// As [`Self::running_builds_are`] scripted it; never the disk.
+        fn running_builds(&self) -> Option<Result<RunningBuilds, String>> {
+            self.running_builds.clone().map(Ok)
         }
 
         /// As [`Self::quarantine_is`] scripted it; never the disk.

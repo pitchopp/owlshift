@@ -26,8 +26,12 @@ use owlshift_adapters::forge::Repo;
 use owlshift_adapters::tracker::markdown::MarkdownTracker;
 use owlshift_contracts::event::EventKind;
 use owlshift_contracts::ids::TicketId;
-use owlshift_contracts::service::{BY_DAEMON, BY_STOP, Request};
+use owlshift_contracts::service::{BY_DAEMON, BY_STOP, BuildIdentity, Request};
+use owlshift_platform::service::{Kind, Layout};
+use owlshift_runner::config::OWLSHIFT_VERSION;
+use owlshift_runner::daemon::upgrade::{self, Binary, Handover};
 use owlshift_runner::daemon::{self, requests};
+use owlshift_runner::install::{self, Install};
 use owlshift_runner::project::ProjectDirs;
 use owlshift_runner::quarantine;
 use owlshift_runner::served::{self, Registry};
@@ -53,6 +57,9 @@ struct Bench {
     /// The project file of the real watch the daemon runs (OWL-441); none:
     /// the stand-in.
     project: Option<PathBuf>,
+    /// The build the daemon records (OWL-462): its commit and its build
+    /// time in seconds since the epoch; none: version "bench", no build.
+    build: Option<(String, i64)>,
 }
 
 impl Bench {
@@ -61,6 +68,7 @@ impl Bench {
             tmp: tempfile::tempdir().unwrap(),
             daemon: None,
             project: None,
+            build: None,
         }
     }
 
@@ -110,6 +118,11 @@ impl Bench {
             .stderr(output("err"));
         if let Some(project) = &self.project {
             daemon.env("OWLSHIFT_BENCH_PROJECT", project);
+        }
+        if let Some((commit, built_at)) = &self.build {
+            daemon
+                .env("OWLSHIFT_BENCH_COMMIT", commit)
+                .env("OWLSHIFT_BENCH_BUILT_AT", built_at.to_string());
         }
         self.daemon = Some(daemon.spawn().unwrap());
     }
@@ -666,9 +679,14 @@ fn upgrade_drain() -> Request {
 /// held. An upgrade's drain reaches the watch; the Builds, released, finish
 /// as they would have, not `stopped`; no run of the old binary starts after
 /// the drain; the daemon exits with 75, nothing left standing.
+///
+/// OWL-462: the drain is the real handover's, by a binary of the same
+/// version whose build alone is later and of another commit, the service
+/// at login installed for it and its launcher having started the daemon.
 #[test]
 fn an_upgrade_drain_lets_the_steps_under_way_finish_then_exits_75() {
     let mut bench = Bench::new();
+    bench.build = Some(("a".repeat(40), 1_761_600_000));
     let root = bench.tmp.path().to_owned();
     let plays = root.join("plays");
     fs::create_dir_all(&plays).unwrap();
@@ -710,7 +728,35 @@ fn an_upgrade_drain_lets_the_steps_under_way_finish_then_exits_75() {
     };
     let before = started(&bench.data());
 
-    requests::ask_drain(&bench.data(), &upgrade_drain()).unwrap();
+    let data = bench.data();
+    let layout = Layout {
+        kind: Kind::Systemd,
+        dir: root.join("units"),
+    };
+    install::install(&Install {
+        data: &data,
+        layout: &layout,
+        binary: Path::new(BENCH),
+        config_dir: None,
+        path: None,
+    })
+    .unwrap();
+    let running = daemon::running(&data).unwrap().unwrap().unwrap();
+    fs::write(upgrade::launched_file(&data), format!("{}\n", running.pid)).unwrap();
+    let later = BuildIdentity::from_build(&"b".repeat(40), "0", "1761600600", "");
+    let own = Binary {
+        version: OWLSHIFT_VERSION,
+        build: Some(&later),
+    };
+    assert_eq!(running.version, own.version, "one version");
+    assert!(
+        running.build.as_ref().is_some_and(|build| build != &later),
+        "two builds: {running:?}"
+    );
+    assert_eq!(
+        upgrade::hand_over(&data, own, Path::new(BENCH), "owlshift start"),
+        Ok(Handover::Ask(running))
+    );
     bench.wait_for("the watch to drain on its stop file", 30, || {
         events(&bench.data()).iter().any(|event| {
             event.data.get("watch") == Some(&serde_json::json!("stop"))
@@ -762,9 +808,11 @@ fn an_upgrade_drain_lets_the_steps_under_way_finish_then_exits_75() {
         .count();
     assert_eq!(watch_starts, 1, "the watch was not started again");
     assert!(
-        bench
-            .output()
-            .contains("Draining for an upgrade (owlshift start: an upgrade from version 0.1.0"),
+        bench.output().contains(&format!(
+            "Draining for an upgrade (owlshift start: an upgrade from version {OWLSHIFT_VERSION} \
+             (aaaaaaaaaaaa, built 2025-10-27T21:20:00Z) to {OWLSHIFT_VERSION} (bbbbbbbbbbbb, \
+             built 2025-10-27T21:30:00Z)"
+        )),
         "{}",
         bench.output()
     );
