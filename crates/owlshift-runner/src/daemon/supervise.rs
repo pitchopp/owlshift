@@ -363,7 +363,7 @@ impl Daemon<'_> {
         let asked = slot.stop_written || stopping;
         self.remove_own_stop(slot, out);
         slot.lift_at = None;
-        let end = match &ended.status {
+        let end = match &ended.status() {
             Ok(status) => status.to_string(),
             Err(error) => error.clone(),
         };
@@ -384,7 +384,7 @@ impl Daemon<'_> {
             slot.due = (slot.listed && !stopping).then(Instant::now);
             return;
         }
-        let code = ended.status.as_ref().ok().and_then(|status| status.code());
+        let code = ended.status().ok().and_then(|status| status.code());
         if code == Some(i32::from(UNSERVABLE_EXIT)) {
             let reason = ended
                 .last_error

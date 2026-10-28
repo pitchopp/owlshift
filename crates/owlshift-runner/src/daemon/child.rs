@@ -1,15 +1,17 @@
-//! A child the daemon supervises: a served project's watch, the root of a
-//! process tree of the daemon's ([`ProcessTree`]), its own process group
-//! registered with the daemon's signal policy and sentinel, so a stop "now"
-//! or a hard kill of the daemon stops it, and its own sentinel then stops
-//! its steps. A checked stop of the daemon sends it SIGTERM, a checked stop
-//! of its own ([`AtCheckedStop::Told`]).
+//! A child a process supervises, the one type behind the daemon's watches
+//! and a drain's step children (`step::children`, OWL-453): the root of a
+//! process tree of the supervisor's ([`ProcessTree`]), its own process group
+//! registered with the signal policy and sentinel, so a stop "now" or a hard
+//! kill of the supervisor stops it, and its own sentinel then stops what it
+//! started. A checked stop of the supervisor sends it SIGTERM, a checked stop
+//! of its own ([`AtCheckedStop::Told`]), or refuses to start it, as the
+//! caller chooses.
 //!
 //! It is started without waiting for it ([`Supervised::start`]) and polled
 //! ([`Supervised::poll`]): each line it writes is printed after its label,
 //! its end is seen without reaping it, what it left in its group is stopped,
-//! then it is withdrawn and reaped. The same steps as a drain's step child
-//! (`step::children`), without the step's outcome record.
+//! then it is withdrawn and reaped. What its owner reads once it has ended,
+//! a step's outcome record, is the owner's.
 
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::process::{Child, Command, ExitStatus, Stdio};
@@ -32,14 +34,14 @@ enum Stream {
     Err,
 }
 
-/// What a reader of the child's output tells the daemon.
+/// What a reader of the child's output tells its owner.
 enum Output {
     Line(Stream, String),
     Closed,
 }
 
 /// A child under way.
-pub struct Supervised {
+pub(crate) struct Supervised {
     label: String,
     child: Child,
     /// Its process tree, until it is withdrawn.
@@ -57,13 +59,28 @@ pub struct Supervised {
 
 /// How a child ended.
 #[derive(Debug)]
-pub struct Ended {
-    /// Its exit status, or why it could not be read.
-    pub status: Result<ExitStatus, String>,
+pub(crate) struct Ended {
+    /// Its exit status as reaped, or why it could not be read.
+    pub reaped: Result<ExitStatus, String>,
+    /// Why its end could not be watched, so that it was stopped.
+    pub watch_error: Option<String>,
     /// The last line it wrote on its standard error: a refusal says why there.
     pub last_error: Option<String>,
     /// How long it ran.
     pub ran_for: Duration,
+}
+
+impl Ended {
+    /// Its exit status, or why it could not be read; an end that could not
+    /// be watched comes before how it was reaped.
+    pub fn status(&self) -> Result<ExitStatus, String> {
+        match &self.watch_error {
+            Some(error) => Err(format!(
+                "its end could not be watched ({error}), so it was stopped"
+            )),
+            None => self.reaped.clone(),
+        }
+    }
 }
 
 impl Supervised {
@@ -76,6 +93,7 @@ impl Supervised {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
         let (mut child, tree) = ProcessTree::spawn_for(&mut command, at)?;
+        drop(command);
         let (sender, lines) = mpsc::channel();
         read_lines(child.stdout.take(), Stream::Out, sender.clone());
         read_lines(child.stderr.take(), Stream::Err, sender);
@@ -99,7 +117,7 @@ impl Supervised {
     }
 
     /// Prints the lines the child wrote since the last poll, its standard
-    /// output's on `out` and its standard error's on the daemon's, each
+    /// output's on `out` and its standard error's on the process's own, each
     /// after its label; then, once it has ended and its output closed, or two
     /// seconds after its end while something it left holds the output,
     /// stops what it left, withdraws and reaps it: how it ended. `None` while
@@ -109,7 +127,8 @@ impl Supervised {
             match self.lines.try_recv() {
                 Ok(Output::Line(stream, line)) => {
                     let shown = printable(&format!("{}: {line}", self.label));
-                    // Never a panic: the daemon's output may be gone.
+                    // Never a panic: the output may be gone, a closed terminal being a
+                    // checked stop (OWL-161) whose children still end through here.
                     let _ = match stream {
                         Stream::Out => writeln!(out, "{shown}"),
                         Stream::Err => {
@@ -152,7 +171,7 @@ impl Supervised {
     /// its group's id; then withdraws the tree and reaps the root.
     fn finish(&mut self, watch_error: Option<String>) -> Ended {
         let ran_for = self.ended.unwrap_or_else(Instant::now) - self.started;
-        let status = match self.tree.take() {
+        let reaped = match self.tree.take() {
             Some(tree) => {
                 let _ = tree.kill();
                 tree.reap(&mut self.child)
@@ -160,14 +179,9 @@ impl Supervised {
             }
             None => Err("it was already withdrawn".to_owned()),
         };
-        let status = match watch_error {
-            Some(error) => Err(format!(
-                "its end could not be watched ({error}), so it was stopped"
-            )),
-            None => status,
-        };
         Ended {
-            status,
+            reaped,
+            watch_error,
             last_error: self.last_error.take(),
             ran_for,
         }

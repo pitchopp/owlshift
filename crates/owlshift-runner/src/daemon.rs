@@ -29,7 +29,7 @@
 //! The watch's command is the caller's ([`Daemon::watch`]): this binary in
 //! `owlshift daemon`, a stand-in on the test bench.
 
-mod child;
+pub(crate) mod child;
 pub mod digest;
 pub mod instance;
 pub mod requests;
