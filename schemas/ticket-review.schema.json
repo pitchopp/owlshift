@@ -624,7 +624,7 @@
           }
         },
         "revision": {
-          "description": "At Design review, the design run whose last revision the pass keeps\n(OWL-377): the revision that answered the findings of the pass\nbefore, the loop's last, which no reviewer reviews. Such a pass has\nno reviewer, no finding and no plan's print.",
+          "description": "At Design review, the design run whose revision the pass keeps, which\nno reviewer reviews: Design's last revision, which answered the\nfindings of the pass before, the loop's last (OWL-377), or, since\nOWL-463, the revision that applied a resolver's change on the plan's\napproval with no review pass, the plan's approval naming that\nchange's DECISION comment. Such a pass has no reviewer, no finding\nand no plan's print.",
           "type": [
             "string",
             "null"
