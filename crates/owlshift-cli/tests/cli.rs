@@ -1505,12 +1505,13 @@ fn do_refuses_a_project_it_cannot_deliver_before_any_credential() {
             stderr(&output)
         );
     }
-    // OWL-127: `resume` is the background service's dispatch command (P7),
-    // not a ticket's; the ticket command has no other name.
+    // OWL-127: `resume` is the background service's command (P7, OWL-438:
+    // it lifts a pause), not a ticket's; the ticket command has no other
+    // name, and a ticket given to it is refused.
     let output = owlshift(repo.path(), config_dir.path(), &["resume", "OWL-1"]);
     assert!(!output.status.success());
     assert!(
-        stderr(&output).contains("unrecognized subcommand 'resume'"),
+        stderr(&output).contains("\"OWL-1\" is not a repository of the form owner/name"),
         "{}",
         stderr(&output)
     );

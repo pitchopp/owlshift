@@ -163,12 +163,7 @@ pub fn watch_state(events: &[Event], project: &str, since: Timestamp) -> Watch {
 /// Reads what `owlshift status` shows of the data directory `data`, its
 /// slots counted up to `concurrent_runs`, its harnesses' caps `caps`, at
 /// `now`.
-pub fn gather(
-    data: &Path,
-    concurrent_runs: u32,
-    caps: &[(Harness, u8)],
-    now: Timestamp,
-) -> Report {
+pub fn gather(data: &Path, concurrent_runs: u32, caps: &[(Harness, u8)], now: Timestamp) -> Report {
     let mut notes = Vec::new();
     let daemon = match daemon::running(data) {
         Ok(None) => Daemon::NotRunning,
@@ -208,7 +203,9 @@ pub fn gather(
             Daemon::Running(record) => {
                 // A record that does not read leaves the daemon's start
                 // unknown: every event counts.
-                let since = record.as_ref().map_or(Timestamp::MIN, |record| record.since);
+                let since = record
+                    .as_ref()
+                    .map_or(Timestamp::MIN, |record| record.since);
                 watch_state(&events, &entry.repository, since)
             }
             _ => Watch::NoDaemon,
@@ -265,7 +262,9 @@ pub fn gather(
 
 /// `at` in `tz`, to the minute.
 fn time(at: Timestamp, tz: &TimeZone) -> String {
-    at.to_zoned(tz.clone()).strftime("%Y-%m-%d %H:%M").to_string()
+    at.to_zoned(tz.clone())
+        .strftime("%Y-%m-%d %H:%M")
+        .to_string()
 }
 
 /// Who asked `request`, when and why; a file that does not read says so.
@@ -368,10 +367,8 @@ pub fn render(report: &Report, tz: &TimeZone) -> String {
                     why,
                     in_a_row,
                 } => {
-                    let when = at.map_or_else(
-                        || "later".to_owned(),
-                        |at| format!("at {}", time(at, tz)),
-                    );
+                    let when =
+                        at.map_or_else(|| "later".to_owned(), |at| format!("at {}", time(at, tz)));
                     let row = match in_a_row {
                         Some(n) if *n > 1 => format!(", {n} ends in a row"),
                         _ => String::new(),
@@ -394,10 +391,7 @@ pub fn render(report: &Report, tz: &TimeZone) -> String {
                 }
                 _ => "; `owlshift resume <owner/repo>` lifts it",
             };
-            line(format!(
-                "  paused {}{more}",
-                asked(request.as_ref(), tz)
-            ));
+            line(format!("  paused {}{more}", asked(request.as_ref(), tz)));
         }
         if project.draining {
             line("  draining: its watch ends once its steps under way finish".to_owned());
@@ -527,11 +521,8 @@ mod tests {
                 })
                 .collect(),
         };
-        crate::step::write_atomically(
-            &Registry::in_data_dir(data_dir).file(),
-            &served.render(),
-        )
-        .unwrap();
+        crate::step::write_atomically(&Registry::in_data_dir(data_dir).file(), &served.render())
+            .unwrap();
         let web = ProjectDirs::new(data_dir, &Repo::parse("acme/web").unwrap());
         let mut kept = ServedConfig::new("acme/web");
         kept.kept = Some(KeptFile {
@@ -551,7 +542,10 @@ mod tests {
             "acme/web",
             vec![
                 ("service", json!("watch_ended")),
-                ("end", json!("exit status: 1: owlshift: the tracker did not answer")),
+                (
+                    "end",
+                    json!("exit status: 1: owlshift: the tracker did not answer"),
+                ),
                 ("asked", json!(false)),
                 ("restart_in_ms", json!(20_000)),
                 ("in_a_row", json!(2)),
@@ -570,8 +564,10 @@ mod tests {
 
         let report = gather(data_dir, 2, &[], Timestamp::now());
         assert!(report.notes.is_empty(), "{:?}", report.notes);
-        assert!(matches!(&report.projects[0].watch, Watch::Restarting { why, .. }
-            if why.ends_with("the tracker did not answer")));
+        assert!(
+            matches!(&report.projects[0].watch, Watch::Restarting { why, .. }
+            if why.ends_with("the tracker did not answer"))
+        );
         let text = render(&report, &TimeZone::UTC);
         let has = |part: &str| assert!(text.contains(part), "{part:?} missing in\n{text}");
         has("Daemon: running since");
@@ -613,7 +609,10 @@ mod tests {
             watch_state(&events, "ACME/web", Timestamp::MIN),
             Watch::Running { pid: Some(1), .. }
         ));
-        assert_eq!(watch_state(&events, "acme/api", Timestamp::MIN), Watch::NotStarted);
+        assert_eq!(
+            watch_state(&events, "acme/api", Timestamp::MIN),
+            Watch::NotStarted
+        );
         service(
             data_dir,
             "acme/web",

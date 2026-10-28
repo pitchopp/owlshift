@@ -265,10 +265,7 @@ mod tests {
             Some((PauseScope::Machine, Some(all.clone())))
         );
         assert_eq!(lift_pause(data, None).unwrap(), Some(Some(all)));
-        assert_eq!(
-            lift_pause(data, Some(&dirs)).unwrap(),
-            Some(Some(person))
-        );
+        assert_eq!(lift_pause(data, Some(&dirs)).unwrap(), Some(Some(person)));
         assert_eq!(operator_pause(&dirs), None);
         // An empty file still pauses.
         fs::write(pause_file(&dirs), "").unwrap();
