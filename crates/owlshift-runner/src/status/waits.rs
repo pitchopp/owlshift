@@ -95,7 +95,7 @@ pub fn gather(data: &Path, only: Option<&Repo>, concurrent_runs: u32, now: Times
                 .find(|(entry, _)| entry.repository.eq_ignore_ascii_case(&name))
             {
                 Some((entry, repo)) => vec![(entry.repository, repo, true)],
-                None => vec![(name, repo.clone(), false)],
+                None => vec![(spelled(&events, &name), repo.clone(), false)],
             }
         }
         None => served
@@ -123,6 +123,18 @@ pub fn gather(data: &Path, only: Option<&Repo>, concurrent_runs: u32, now: Times
         projects,
         notes,
     }
+}
+
+/// `name` as the event log spells it: the project of its latest event that
+/// is `name` in any ASCII case, or `name` when none is. A project's folder
+/// is the same whatever the case (`project::component`); its events are
+/// folded by their exact spelling.
+fn spelled(events: &[owlshift_contracts::event::Event], name: &str) -> String {
+    events
+        .iter()
+        .rev()
+        .find(|event| event.project.eq_ignore_ascii_case(name))
+        .map_or_else(|| name.to_owned(), |event| event.project.clone())
 }
 
 fn project(
@@ -894,6 +906,24 @@ mod tests {
             "{text}"
         );
         assert!(!text.contains("DEMO-7"), "{text}");
+    }
+
+    /// A project named in another case than its events' is read under
+    /// their spelling, so its waits are folded.
+    #[test]
+    fn a_project_named_in_another_case_takes_the_events_spelling() {
+        let events = [waits(
+            "2026-10-28T09:00:00Z",
+            "DEMO-1",
+            vec![("drain", json!("waits")), ("reason", json!("pr_cap"))],
+        )];
+        assert_eq!(spelled(&events, "O/R"), "o/r");
+        assert_eq!(spelled(&events, "acme/web"), "acme/web");
+        assert!(why::fold(&events, "O/R").current.is_empty());
+        assert_eq!(
+            why::fold(&events, &spelled(&events, "O/R")).current.len(),
+            1
+        );
     }
 
     /// A pull request holder, a person's ticket, a usage limit's end, a
