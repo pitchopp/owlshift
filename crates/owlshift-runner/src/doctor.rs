@@ -5684,7 +5684,10 @@ states = { ready = "Todo", working = "Doing", needs_input = "Asked", review = "R
         let why = behind.why.unwrap();
         // `~/owlshift` on Unix; the whole path where `/home/ada` is no
         // absolute home.
-        let tree = shown(Path::new("/home/ada/owlshift"), Some(Path::new("/home/ada")));
+        let tree = shown(
+            Path::new("/home/ada/owlshift"),
+            Some(Path::new("/home/ada")),
+        );
         assert!(
             why.contains(&format!(
                 "the daemon (pid 10) is 3 commits behind origin/HEAD of {tree}, as that tree \
