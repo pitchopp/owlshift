@@ -166,8 +166,9 @@ Set it and forget it.
 - The notifier adapter keeps the desktop channel of P2 alone; the daily digest is one notification that points to `owlshift status`. Other channels come later.
 - No control channel: `pause`, `stop` and the upgrade's drain are files the watches read at each pass, `status` reads the files P6 already keeps. The local API arrives with the web UI (P8).
 - A served project's configuration is read from its default branch in Owlshift's own clone, as its gate and rules already are; a watch typed in a terminal keeps reading the checkout it runs in.
+- The exit gate runs 72 hours, not seven days (decided with the maintainer on 2026-10-29, during the gate's run): the week stood for the machine's ordinary life, its sleeps, logouts and restarts, which the staged cases bring on purpose, while a Locary drain already delivers about ten tickets a day, enough dispatches to judge double dispatch.
 
-**Exit gate.** Seven days unattended with no double dispatch.
+**Exit gate.** 72 hours unattended with no double dispatch.
 
 ## P8 · Local web UI
 
