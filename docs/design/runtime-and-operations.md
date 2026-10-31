@@ -245,7 +245,7 @@ Every action is a recorded event, readable from the CLI from P1 and from a local
 | `owlshift why PROJ-123` | Why a ticket is not starting: a blocker, a held zone, a cap, a harness at its limit |
 | `owlshift continue PROJ-123` | Pick one ticket up once its decider has answered, after the quiet window (P2, OWL-127) |
 | `owlshift pause`, `resume` | Stop or restart dispatch for every ticket, or one project's; running steps finish (P7) |
-| `owlshift cancel PROJ-123` | Stop a ticket's step under way, checked, and park the ticket; `owlshift continue` restarts it (P8) |
+| `owlshift cancel PROJ-123 [--reason TEXT]` | Stop a ticket's step under way, checked, and park the ticket; `owlshift continue` restarts it (P8, OWL-474) |
 | `owlshift ui` | Open the local web UI in the browser, logged in; `--print` for an SSH tunnel (P8) |
 | `owlshift doctor` | Capabilities, harness versions and logins, leftovers |
 
