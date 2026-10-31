@@ -121,8 +121,6 @@ impl OAuth for HttpOAuth {
             ("client_secret", self.credentials.secret.as_str()),
             ("scope", SCOPES),
         ];
-        let unreachable =
-            |e: ureq::Error| Error::new(ErrorKind::Other, format!("Linear's token endpoint: {e}"));
         let mut response = self
             .agent
             .post(TOKEN_ENDPOINT)
@@ -149,6 +147,16 @@ impl OAuth for HttpOAuth {
             status => Err(format!("Linear answered HTTP {status} to the revocation")),
         }
     }
+}
+
+/// The token endpoint gave no answer, or one that could not be read: the
+/// client's error, which carries no form field (OWL-479). The agent reads
+/// every HTTP status as an answer, so a refusal never gets here.
+fn unreachable(error: ureq::Error) -> Error {
+    Error::new(
+        ErrorKind::Unreachable,
+        format!("Linear's token endpoint: {error}"),
+    )
 }
 
 fn bearer(token: &AccessToken) -> String {
@@ -221,7 +229,10 @@ fn token_answer(status: u16, body: &str) -> Result<AccessToken, Error> {
 /// token. The token is requested when the transport connects, so wrong
 /// credentials are found before any work; a request Linear answers 401 (the
 /// token expired after its 30 days, or was revoked) gets one new token and
-/// is sent once more, and an error without an answer is never retried. The
+/// is sent once more, and an error without an answer is never retried. A new
+/// token Linear refuses leaves that 401 the answer, so a refusal is never
+/// read as no answer (OWL-479); a token endpoint that did not answer is the
+/// send's error. The
 /// token is revoked when the transport is dropped, at the end of a command;
 /// a revocation that fails is let go, since the token expires anyway.
 pub struct AppTransport<O: OAuth = HttpOAuth> {
@@ -257,7 +268,11 @@ impl<O: OAuth> Transport for AppTransport<O> {
         if response.status != 401 {
             return Ok(response);
         }
-        *token = self.oauth.token().map_err(|e| e.message)?;
+        match self.oauth.token() {
+            Ok(new) => *token = new,
+            Err(error) if error.kind == ErrorKind::Unreachable => return Err(error.message),
+            Err(_) => return Ok(response),
+        }
         self.oauth.send(&token, request)
     }
 }
@@ -294,6 +309,8 @@ mod tests {
         seen: Arc<Mutex<Seen>>,
         statuses: Mutex<VecDeque<u16>>,
         refuse_after: u32,
+        /// The kind of a refused token request.
+        refused_as: ErrorKind,
     }
 
     impl FakeOAuth {
@@ -303,6 +320,7 @@ mod tests {
                 seen: seen.clone(),
                 statuses: Mutex::new(statuses.iter().copied().collect()),
                 refuse_after,
+                refused_as: ErrorKind::Unauthorized,
             };
             (fake, seen)
         }
@@ -312,7 +330,7 @@ mod tests {
         fn token(&self) -> Result<AccessToken, Error> {
             let mut seen = self.seen.lock().unwrap();
             if seen.minted == self.refuse_after {
-                return Err(Error::new(ErrorKind::Unauthorized, "refused"));
+                return Err(Error::new(self.refused_as, "refused"));
             }
             seen.minted += 1;
             Ok(AccessToken(format!("token-{}", seen.minted)))
@@ -361,8 +379,10 @@ mod tests {
     }
 
     /// Credentials refused when connecting is an error before any request;
-    /// a new token refused after a 401 is the send's error, and the token
-    /// held is still revoked at the end.
+    /// a new token refused after a 401 leaves the 401 the answer, never an
+    /// error without one (OWL-479), while a token endpoint that did not
+    /// answer is the send's error; the token held is still revoked at the
+    /// end.
     #[test]
     fn a_refused_token_request_is_an_error() {
         let (fake, seen) = FakeOAuth::new(&[], 0);
@@ -372,9 +392,40 @@ mod tests {
 
         let (fake, seen) = FakeOAuth::new(&[401], 1);
         let transport = AppTransport::connect(fake).unwrap();
-        assert_eq!(transport.send(&json!({})).unwrap_err(), "refused");
+        assert_eq!(transport.send(&json!({})).unwrap().status, 401);
         drop(transport);
         assert_eq!(seen.lock().unwrap().revoked, ["token-1"]);
+
+        let (mut fake, _) = FakeOAuth::new(&[401], 1);
+        fake.refused_as = ErrorKind::Unreachable;
+        let transport = AppTransport::connect(fake).unwrap();
+        assert_eq!(transport.send(&json!({})).unwrap_err(), "refused");
+    }
+
+    /// A token endpoint that cannot be reached is no answer at all
+    /// (OWL-479): a real request to a closed port, through an agent that
+    /// uses no proxy.
+    #[test]
+    fn a_token_endpoint_that_cannot_be_reached_is_unreachable() {
+        let port = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let config = ureq::Agent::config_builder()
+            .proxy(None)
+            .http_status_as_error(false)
+            .build();
+        let failed = ureq::Agent::new_with_config(config)
+            .post(&format!("http://127.0.0.1:{port}/oauth/token"))
+            .send_form([("grant_type", "client_credentials")])
+            .unwrap_err();
+        let error = unreachable(failed);
+        assert_eq!(error.kind, ErrorKind::Unreachable);
+        assert!(
+            error.message.starts_with("Linear's token endpoint: "),
+            "{error}"
+        );
     }
 
     /// The token endpoint's answers: a bearer token, or a refusal that keeps

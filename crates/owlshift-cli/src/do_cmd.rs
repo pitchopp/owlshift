@@ -58,6 +58,7 @@ use owlshift_runner::slots::MachineSlots;
 use owlshift_runner::step::{self, Children};
 use owlshift_runner::system::System;
 use owlshift_runner::usage::UsageStore;
+use owlshift_runner::watch::offline::{self, Backoff, Opened};
 use owlshift_runner::watch::{POLL_INTERVAL, Watch, drain_refusal, presence};
 use owlshift_runner::{forge, secrets, tracker};
 
@@ -131,11 +132,19 @@ pub fn run(
 /// watch that no restart mends, which the daemon reads to pause its project
 /// rather than start the watch again; a failure otherwise.
 fn refused_code(refusal: &Refusal, mode: Mode<'_>, served: bool) -> ExitCode {
-    if served && mode == Mode::Drain && refusal.lasting {
+    if served && mode == Mode::Drain && refusal.lasting() {
         ExitCode::from(UNSERVABLE_EXIT)
     } else {
         ExitCode::FAILURE
     }
+}
+
+/// Whether `mode`, on a served project when `served`, waits for the network
+/// while its tracker and forge give no answer at all (OWL-479): a watch the
+/// daemon starts alone; a person at a terminal, and a step's child, are told
+/// at once.
+fn waits_for_network(served: bool, mode: Mode<'_>) -> bool {
+    served && mode == Mode::Drain
 }
 
 /// How [`run_with`] ended.
@@ -334,24 +343,16 @@ fn run_with(
     {
         eprintln!("owlshift: {notice}");
     }
-    // With the Linear app stored, its token is requested here, before any
-    // work, and revoked when the tracker is dropped (OWL-157).
-    let tracker: Box<dyn Tracker> = match &tracker_secrets {
-        Some(found) => {
-            let team = project
+    let team = match &tracker_secrets {
+        Some(_) => Some(
+            project
                 .tracker
                 .team
                 .as_deref()
-                .ok_or("a Linear project names its team in `tracker.team`")?;
-            Box::new(tracker::linear(found, team)?)
-        }
-        None => Box::new(MarkdownTracker::new(root)),
+                .ok_or("a Linear project names its team in `tracker.team`")?,
+        ),
+        None => None,
     };
-    if mode == Mode::Drain && !tracker.capabilities().contains(&Capability::ListAdmitted) {
-        return Err("`owlshift watch --drain` needs a tracker that lists admitted tickets".into());
-    }
-    // The GitHub App's token is refreshed under the project's account lock
-    // (OWL-384); one already expired is refreshed here, before any work.
     let dirs = ProjectDirs::new(data_dir, &repo);
     let access = forge::AppAccess {
         keychain: keychain.clone(),
@@ -361,7 +362,39 @@ fn run_with(
             _ => None,
         }),
     };
-    let forge = forge::github(&forge_secret, repo.clone(), &access)?;
+    // With the Linear app stored, its token is requested here, before any
+    // work, and revoked when the tracker is dropped (OWL-157). The GitHub
+    // App's token is refreshed under the project's account lock (OWL-384);
+    // one already expired is refreshed here, before any work.
+    let mut open = || -> Result<(Box<dyn Tracker>, _), Refusal> {
+        let tracker: Box<dyn Tracker> = match (&tracker_secrets, team) {
+            (Some(found), Some(team)) => Box::new(tracker::linear(found, team)?),
+            _ => Box::new(MarkdownTracker::new(root)),
+        };
+        let forge = forge::github(&forge_secret, repo.clone(), &access)?;
+        Ok((tracker, forge))
+    };
+    // A watch the daemon starts waits for the network rather than end while
+    // neither answers at all (OWL-479); any other command refuses at once.
+    let (tracker, forge) = if waits_for_network(served.is_some(), mode) {
+        let mut out = io::stdout();
+        let mut sink = EventSink::new(repo.to_string(), EventLog::in_dir(data_dir), &mut out);
+        match offline::open(
+            &dirs,
+            Backoff::SERVICE,
+            &mut sink,
+            &mut io::stdout(),
+            &mut open,
+        )? {
+            Opened::Open(opened) => opened,
+            Opened::Stopped => return Ok(Ended::Code(ExitCode::SUCCESS)),
+        }
+    } else {
+        open()?
+    };
+    if mode == Mode::Drain && !tracker.capabilities().contains(&Capability::ListAdmitted) {
+        return Err("`owlshift watch --drain` needs a tracker that lists admitted tickets".into());
+    }
     // The token agent runs log in with (OWL-94), read with the other
     // secrets and set on the harness command alone. None stored refuses the
     // run, with the fix, before anything is cloned.
@@ -1130,7 +1163,7 @@ mod refusals {
                 SandboxError::Unsupported.to_string(),
                 "{mode:?}"
             );
-            assert!(refusal.lasting, "{mode:?}");
+            assert!(refusal.lasting(), "{mode:?}");
         }
 
         // OWL-435: a watch typed in a terminal on a project the background
@@ -1179,6 +1212,27 @@ mod refusals {
             .unwrap();
             assert!(refusal.message.starts_with(said), "{refusal}");
         }
+    }
+
+    /// OWL-479: only a watch the daemon starts waits for the network; a
+    /// refusal of no answer that reaches any other command fails plainly.
+    #[test]
+    fn only_a_served_drain_waits_for_the_network() {
+        assert!(waits_for_network(true, Mode::Drain));
+        for (served, mode) in [
+            (false, Mode::Drain),
+            (false, Mode::Watch),
+            (true, Mode::Step("OWL-1", "{}")),
+            (false, Mode::Do("OWL-1")),
+            (false, Mode::Continue("OWL-1")),
+        ] {
+            assert!(!waits_for_network(served, mode), "{mode:?}");
+        }
+        let unanswered = Refusal::unreachable("Linear: io: x");
+        assert_eq!(
+            refused_code(&unanswered, Mode::Step("OWL-1", "{}"), true),
+            ExitCode::FAILURE
+        );
     }
 
     /// OWL-435: a served watch that no restart mends ends with the code the

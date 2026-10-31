@@ -475,6 +475,8 @@ impl LinearTracker {
 }
 
 /// Sends one request through `transport` and returns its `data`, decoded.
+/// A transport error is no answer at all, [`ErrorKind::Unreachable`]
+/// (OWL-479): every answer, whatever its status, is decoded.
 fn call<T: DeserializeOwned>(
     transport: &(dyn Transport + Send + Sync),
     query: &str,
@@ -483,7 +485,7 @@ fn call<T: DeserializeOwned>(
     let request = json!({ "query": query, "variables": variables });
     let response = transport
         .send(&request)
-        .map_err(|e| Error::new(ErrorKind::Other, format!("Linear: {e}")))?;
+        .map_err(|e| Error::new(ErrorKind::Unreachable, format!("Linear: {e}")))?;
     decode(&response)
 }
 
@@ -3677,6 +3679,28 @@ mod tests {
             ErrorKind::NotFound
         );
         assert_eq!(linear.state_type(&id).unwrap_err().kind, ErrorKind::Other);
+    }
+
+    /// No answer at all is [`ErrorKind::Unreachable`] (OWL-479); an answer,
+    /// a 5xx included, is decoded as before.
+    #[test]
+    fn no_answer_is_unreachable_and_a_server_error_is_not() {
+        struct Silent;
+        impl Transport for Silent {
+            fn send(&self, _: &Value) -> Result<Response, String> {
+                Err("io: failed to lookup address information".to_owned())
+            }
+        }
+        let id = TicketId::new("OWL-479").unwrap();
+        let error = LinearTracker::with_transport(Silent)
+            .state_type(&id)
+            .unwrap_err();
+        assert_eq!(error.kind, ErrorKind::Unreachable);
+        assert_eq!(
+            error.message,
+            "Linear: io: failed to lookup address information"
+        );
+        assert_eq!(error_kind(503, "<html>"), ErrorKind::Other);
     }
 
     /// Intake's links (OWL-416): a `blocks` relation from another issue

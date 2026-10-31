@@ -934,9 +934,10 @@ impl GitHubForge {
             .get(path)
             .map_err(|unanswered| match unanswered {
                 Unanswered::Source(error) => error,
-                Unanswered::Transport(e) => {
-                    invalid(format!("GitHub could not be reached: {}", redact(&e)))
-                }
+                Unanswered::Transport(e) => Error::new(
+                    ErrorKind::Unreachable,
+                    format!("GitHub could not be reached: {}", redact(&e)),
+                ),
             })?;
         if (200..300).contains(&answer.status) {
             return Ok(answer);
@@ -1149,14 +1150,17 @@ impl GitHubForge {
         decode(&self.send(query, variables)?)
     }
 
-    /// Sends one request and returns GitHub's answer, undecoded.
+    /// Sends one request and returns GitHub's answer, undecoded: no answer
+    /// at all is [`ErrorKind::Unreachable`] (OWL-479).
     fn send(&self, query: &str, variables: Value) -> Result<Response, Error> {
         let request = json!({ "query": query, "variables": variables });
         self.channel
             .send(&request)
             .map_err(|unanswered| match unanswered {
                 Unanswered::Source(error) => error,
-                Unanswered::Transport(e) => invalid(format!("GitHub: {e}")),
+                Unanswered::Transport(e) => {
+                    Error::new(ErrorKind::Unreachable, format!("GitHub: {e}"))
+                }
             })
     }
 }
@@ -2572,7 +2576,7 @@ mod tests {
             ErrorKind::NotFound
         );
         let unreachable = default_branch(Err("connection refused".into())).unwrap_err();
-        assert_eq!(unreachable.kind, ErrorKind::Other);
+        assert_eq!(unreachable.kind, ErrorKind::Unreachable);
         assert_eq!(unreachable.message, "GitHub: connection refused");
         // A spent budget stays one, whatever else the answer says.
         let spent = Response {

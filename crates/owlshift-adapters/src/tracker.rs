@@ -610,7 +610,11 @@ pub enum ErrorKind {
     NotFound,
     /// The tracker refused the credentials.
     Unauthorized,
-    /// Anything else: transport, a refused request, a malformed answer.
+    /// No HTTP answer at all: the name did not resolve, the connection or
+    /// TLS failed, or the request timed out (OWL-479). Never an answer the
+    /// tracker gave, whatever its status.
+    Unreachable,
+    /// Anything else: a refused request, a malformed answer.
     Other,
 }
 

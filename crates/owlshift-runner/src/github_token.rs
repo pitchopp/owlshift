@@ -235,10 +235,15 @@ impl<E: Entries, R: Refresh> AppToken<E, R> {
             Err(other) => {
                 // No answer, or one a retry may clear: the token is tried
                 // again next time; a rotation GitHub made meanwhile shows as
-                // a refused refresh then.
+                // a refused refresh then. No answer at all is its own kind,
+                // which a watch starting waits on (OWL-479).
                 self.dead = None;
+                let kind = match other {
+                    AppError::Unreachable(_) => ErrorKind::Unreachable,
+                    _ => ErrorKind::Other,
+                };
                 return Err(Error::new(
-                    ErrorKind::Other,
+                    kind,
                     format!("the GitHub App's token could not be refreshed: {other}"),
                 ));
             }
@@ -355,6 +360,9 @@ mod tests {
 
     const REFUSED: &str = r#"{"error":"bad_refresh_token"}"#;
 
+    /// An answer [`Script`] gives as no answer at all.
+    const NO_ANSWER: &str = "<no answer>";
+
     /// The first refresh says it started on the sender, then waits for the
     /// receiver to release it.
     type Hold = (Mutex<mpsc::Sender<()>>, Mutex<mpsc::Receiver<()>>);
@@ -398,6 +406,9 @@ mod tests {
                 release.lock().unwrap().recv().unwrap();
             }
             let body = self.answers.lock().unwrap().pop_front().expect("an answer");
+            if body == NO_ANSWER {
+                return Err("GitHub's login endpoint could not be reached".to_owned());
+            }
             Ok(LoginAnswer::new(200, body))
         }
     }
@@ -739,6 +750,23 @@ mod tests {
         assert_eq!(error.kind, ErrorKind::Other);
         assert!(error.message.contains("account lock"), "{error}");
         assert!(script.sent().is_empty());
+    }
+
+    /// A refresh GitHub gave no answer to is its own kind (OWL-479), and
+    /// the token is tried again next time.
+    #[test]
+    fn a_refresh_with_no_answer_is_unreachable() {
+        let dir = tempfile::tempdir().unwrap();
+        let keychain = Keychain::in_memory();
+        keychain
+            .store(ACCOUNT, &entry("ghu_old", Some("ghr_old"), 0))
+            .unwrap();
+        let script = Script::answering(&[NO_ANSWER, &granted("ghu_new", "ghr_new")]);
+        let mut token = source(&keychain, &script, dir.path().join("lock"));
+        let error = token.token_at(now()).unwrap_err();
+        assert_eq!(error.kind, ErrorKind::Unreachable);
+        assert!(error.message.contains("could not be reached"), "{error}");
+        assert_eq!(token.token_at(now()).unwrap(), Token::new("ghu_new"));
     }
 
     /// An entry that does not read, or is gone when the refresh reads it

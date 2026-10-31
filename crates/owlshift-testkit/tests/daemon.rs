@@ -467,6 +467,87 @@ fn a_watch_that_cannot_serve_pauses_its_project_until_one_serves() {
     assert!(bench.ended(10).success(), "{}", bench.output());
 }
 
+/// A real watch of [`REPO`] under the daemon (OWL-479), on a project whose
+/// drain admits nothing: what its start does, not its steps.
+fn real_watch(bench: &mut Bench) {
+    let root = bench.tmp.path().to_owned();
+    let machine = root.join("machine");
+    let mut project = ChildProject::seed_parallel(&root, PathBuf::from(FAKE), 0, 1, (&machine, 1));
+    project.notes = Some(bench.notes_file());
+    let file = root.join("project.toml");
+    project.save(&file);
+    bench
+        .registry()
+        .register(&Repo::parse(REPO).unwrap(), &project.checkout)
+        .unwrap();
+    bench.project = Some(file);
+    fs::create_dir_all(bench.bench_dir(REPO)).unwrap();
+}
+
+/// OWL-479: a watch the daemon starts while its tracker gives no answer
+/// waits, told once, without ending or being restarted, then starts once
+/// the tracker answers.
+#[test]
+fn a_watch_started_offline_waits_then_starts_once_its_tracker_answers() {
+    let mut bench = Bench::new();
+    real_watch(&mut bench);
+    let offline = bench.bench_dir(REPO).join("offline");
+    fs::write(&offline, "").unwrap();
+    bench.start();
+    bench.wait_for("the wait told", 10, || {
+        bench.output().contains("waits for the network")
+    });
+    // Several tries later: still waiting, told once, never restarted.
+    thread::sleep(Duration::from_millis(1500));
+    let output = bench.output();
+    assert_eq!(
+        output.matches("waits for the network").count(),
+        1,
+        "{output}"
+    );
+    assert!(
+        output.contains("Linear's token endpoint: io: failed to lookup address information"),
+        "{output}"
+    );
+    assert!(!output.contains("watching demo/project"), "{output}");
+    assert_eq!(bench.passes(), 0);
+    assert!(bench.notes().is_empty(), "{:?}", bench.notes());
+
+    fs::remove_file(&offline).unwrap();
+    bench.wait_for("a pass", 10, || bench.passes() > 0);
+    let output = bench.output();
+    assert_eq!(
+        output.matches("reached its tracker and forge").count(),
+        1,
+        "{output}"
+    );
+    assert_eq!(
+        output.matches("watching demo/project").count(),
+        1,
+        "{output}"
+    );
+    bench.signal("TERM", bench.daemon_pid());
+    assert!(bench.ended(20).success(), "{}", bench.output());
+}
+
+/// OWL-479: a tracker that refuses its credentials still ends the watch as
+/// unservable, and the daemon pauses the project.
+#[test]
+fn a_refused_token_at_a_watchs_start_still_pauses_its_project() {
+    let mut bench = Bench::new();
+    real_watch(&mut bench);
+    fs::write(bench.bench_dir(REPO).join("refused"), "").unwrap();
+    bench.start();
+    let dirs = bench.dirs(REPO);
+    bench.wait_for("the pause", 10, || requests::pause(&dirs).is_some());
+    let pause = requests::pause(&dirs).unwrap().unwrap();
+    assert_eq!(pause.by, BY_DAEMON);
+    assert!(pause.why.contains("invalid_client"), "{}", pause.why);
+    assert!(!bench.output().contains("waits for the network"));
+    bench.signal("TERM", bench.daemon_pid());
+    assert!(bench.ended(20).success(), "{}", bench.output());
+}
+
 /// The two tickets of scenario S11.
 const TICKETS: [&str; 2] = ["DEMO-1", "DEMO-2"];
 
