@@ -161,6 +161,7 @@ pub const FORGE_HOSTS: &[&str] = &["github.com"];
 const HEAD_READS: u32 = 5;
 
 mod base_hold;
+mod cancel;
 mod correction;
 mod design;
 mod drain;
@@ -171,6 +172,7 @@ mod review_loop;
 mod to_watch;
 mod verify;
 
+pub use cancel::Canceled;
 use design::Built;
 use review_loop::{in_review_loop, loop_base, loop_reviews};
 pub use to_watch::Takes;
@@ -2255,6 +2257,8 @@ impl OnDemand<'_> {
         sink: &mut EventSink<'_>,
     ) -> Result<Delivered, Stop> {
         let p = self.prepare(ticket, Command::Continue)?;
+        // A cancel still standing is withdrawn (OWL-474).
+        self.withdraw_cancel(ticket, sink);
         self.drop_carry(ticket, sink);
         self.continue_prepared(p, sink)
     }

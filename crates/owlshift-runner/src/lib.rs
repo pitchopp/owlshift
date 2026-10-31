@@ -9,6 +9,7 @@ mod alone;
 pub mod answer_check;
 pub mod artifact;
 pub mod base;
+pub mod cancel;
 pub mod codex_machine;
 pub mod config;
 pub mod daemon;

@@ -1,5 +1,6 @@
 //! The `owlshift` binary.
 
+mod cancel_cmd;
 mod do_cmd;
 mod forget_cmd;
 mod gate_cmd;
@@ -111,6 +112,19 @@ enum Command {
     Forget {
         /// The ticket, such as OWL-12.
         ticket: String,
+    },
+    /// Cancel a ticket's work: its step under way stops within 5 seconds,
+    /// its runs stopped and checked, and the project's watch parks it, with
+    /// a PARKED comment saying who canceled and why. `owlshift continue`
+    /// restarts it from where it was stopped. Refused for a ticket parked
+    /// already, one whose delivery ended, and one waiting in the ready
+    /// column: removing its admission keeps it there.
+    Cancel {
+        /// The ticket, such as OWL-12.
+        ticket: String,
+        /// Why, said in the PARKED comment.
+        #[arg(long, value_name = "TEXT")]
+        reason: Option<String>,
     },
     /// Run the project's gate once, as a Build's gate runs it: in a fresh
     /// worktree of origin's default branch, confined, with the variables
@@ -367,6 +381,7 @@ fn main() -> ExitCode {
             do_cmd::run(&system, &config, do_cmd::Mode::Drain, served)
         }
         Command::Forget { ticket } => forget_cmd::run(&config, &ticket),
+        Command::Cancel { ticket, reason } => cancel_cmd::run(&config, &ticket, reason.as_deref()),
         Command::Gate { at } => gate_cmd::run(&system, &config, at.as_deref()),
         Command::Unquarantine => unquarantine_cmd::run(&config),
         Command::Why { ticket } => why_cmd::run(&config, ticket.as_deref()),
@@ -470,6 +485,14 @@ mod tests {
             // OWL-459.
             &["status", "--waits"],
             &["status", "--waits", "--json", "acme/web"],
+            // OWL-474.
+            &["cancel", "OWL-1"],
+            &[
+                "cancel",
+                "OWL-1",
+                "--reason",
+                "it rewrites the wrong module",
+            ],
         ] {
             assert_eq!(of(args), None, "{args:?}");
         }

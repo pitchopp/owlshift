@@ -3323,7 +3323,8 @@ impl ParkedComment {
             | ParkReason::Repairs
             | ParkReason::Forge
             | ParkReason::TicketBudget
-            | ParkReason::Rebase => vec![Fit::capped(
+            | ParkReason::Rebase
+            | ParkReason::Stopped => vec![Fit::capped(
                 flatten(&self.detail),
                 LONGER,
                 PARKED_DETAIL_CHARS,
@@ -3367,7 +3368,8 @@ impl ParkedComment {
                  on that machine: no other ticket of it is continued, taken in or built either.",
                 park_reason(self.reason)
             )),
-            ParkReason::TicketBudget => {
+            // OWL-474: the detail says who canceled, when and why.
+            ParkReason::TicketBudget | ParkReason::Stopped => {
                 sections.push(format!(
                     "Parked: {}. {}",
                     park_reason(self.reason),
@@ -3406,6 +3408,9 @@ impl ParkedComment {
                 "**To restart it:** answer the questions it waits for, if any, then run \
                  {continue_cmd}: its budget then counts its runs afresh. Raising \
                  `policy.ticket_budget_usd` in owlshift.toml raises every ticket's."
+            ),
+            (ParkReason::Stopped, Restart::Continue) => format!(
+                "**To restart it:** run {continue_cmd}: it goes on from where it was stopped."
             ),
             (_, Restart::Continue) => format!("**To restart it:** run {continue_cmd}."),
             (_, Restart::Do) => format!(
@@ -3585,6 +3590,7 @@ pub fn park_reason(reason: ParkReason) -> &'static str {
         ParkReason::Rebase => {
             "its branch could not be rebased off a broken base onto one that passes"
         }
+        ParkReason::Stopped => "its work was stopped by a cancel",
     }
 }
 

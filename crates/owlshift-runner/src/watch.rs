@@ -159,6 +159,7 @@ use crate::usage as machine_usage;
 use crate::why;
 use crate::writer::VisibleStage;
 
+mod cancel;
 mod drain;
 mod limits;
 mod merge;
@@ -581,6 +582,9 @@ struct Memory<'c> {
     base_heads: merge::BaseHeads,
     /// The refreshes the overlaps make due (OWL-449).
     refreshes: refresh::Refreshes,
+    /// Why each cancel waits, by its ticket's folder, as last warned of
+    /// (OWL-474).
+    cancel_failing: HashMap<String, String>,
 }
 
 /// What a correction's or the reviews' read found due at a pass (OWL-445):
@@ -806,6 +810,9 @@ impl Watch<'_> {
         };
         // A harness's usage limit, told when it changed (OWL-404).
         self.read_usage(memory, sink, out);
+        // The cancels standing (OWL-474): each ticket whose step does not
+        // run is parked, or its cancel dropped, before anything else of it.
+        let canceled = self.cancels(memory, sink, out, &read);
         let mut waiting = Vec::new();
         let mut following = Vec::new();
         let mut resumable = Vec::new();
@@ -836,11 +843,13 @@ impl Watch<'_> {
         // Which followed pull requests an overlap's base refreshes (OWL-449).
         self.overlap_refreshes(memory, &read);
         // The tickets whose step's child runs (OWL-401): each counts in the
-        // slot's turn as its ref says, and is left alone until it ends.
+        // slot's turn as its ref says, and is left alone until it ends; so
+        // is each a cancel stood on at this pass (OWL-474).
         let busy: Vec<TicketId> = memory
             .running
             .iter()
             .map(|running| running.ticket().clone())
+            .chain(canceled)
             .collect();
         for (ticket, stored) in read {
             let state = stored.and_then(|stored| {
