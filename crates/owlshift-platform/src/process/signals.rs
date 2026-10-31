@@ -19,7 +19,9 @@
 //! Since OWL-161, a process can stop by degrees instead ([`stop_by_degrees`],
 //! architecture section 5, "Three ways to stop"): a drain, then a checked
 //! stop, then the policy above as the last degree. Each tree says what a
-//! checked stop does to it ([`AtCheckedStop`]).
+//! checked stop does to it ([`AtCheckedStop`]). Since OWL-474 the step a
+//! process runs can be stopped checked alone ([`stop_step`]), the process
+//! going on: a person canceled its ticket.
 //!
 //! [`ProcessTree::spawn`]: super::ProcessTree::spawn
 
@@ -97,11 +99,54 @@ pub fn wait_asked(timeout: Duration) -> Option<Degree> {
     guard.asked
 }
 
+/// Asks a checked stop of the step this process runs, not of the process
+/// (OWL-474, architecture section 5, "Cancel"): a person canceled the
+/// step's ticket. Under the lock of the live trees, every tree spawned
+/// [`AtCheckedStop::Stopped`] is stopped at once, as a checked stop stops
+/// it, and so is each one spawned until [`end_step_stop`]; trees
+/// [`AtCheckedStop::Left`] and [`AtCheckedStop::Told`] are left, a step
+/// starting no step's child. [`step_stop_asked`] says so meanwhile. No
+/// degree is asked: [`asked`] answers as before, so a watch that runs the
+/// step in its own process goes on, and nothing bounds the stop.
+///
+/// The stop holds for the whole process, which is the step's alone when
+/// the caller runs one step at a time: plain `owlshift watch` does, and a
+/// step's child runs one. Calling it again changes nothing.
+///
+/// On Windows it records the stop and stops no tree: `owlshift watch` is
+/// refused there before any step (D9), so no step watches a cancel.
+pub fn stop_step() {
+    let live = live();
+    degrees().step_stopped = true;
+    #[cfg(unix)]
+    for (_, stopper, at) in &live.trees {
+        if *at == AtCheckedStop::Stopped {
+            // Best effort, as at a checked stop.
+            let _ = super::tree::kill_group(stopper);
+        }
+    }
+    drop(live);
+}
+
+/// Whether [`stop_step`] was called since the last [`end_step_stop`].
+pub fn step_stop_asked() -> bool {
+    degrees().step_stopped
+}
+
+/// Ends the stop [`stop_step`] asked, once its step has ended: trees
+/// spawned from now on run.
+pub fn end_step_stop() {
+    let _live = live();
+    degrees().step_stopped = false;
+}
+
 /// What the signals ask, and what has been asked.
 struct Degrees {
     #[cfg(unix)]
     policy: Policy,
     asked: Option<Degree>,
+    /// A checked stop of this process's step alone ([`stop_step`]).
+    step_stopped: bool,
 }
 
 /// What a signal does.
@@ -119,6 +164,7 @@ static DEGREES: Mutex<Degrees> = Mutex::new(Degrees {
     #[cfg(unix)]
     policy: Policy::Now,
     asked: None,
+    step_stopped: false,
 });
 
 /// Told of every degree asked.
@@ -324,15 +370,20 @@ impl Drop for Registration {
 ///
 /// For the same reason a stop asked by degrees is never missed (OWL-161): a
 /// tree [`AtCheckedStop::Told`] is not spawned once any stop is asked, and
-/// one [`AtCheckedStop::Stopped`] spawned after a checked stop is stopped
-/// at once.
+/// one [`AtCheckedStop::Stopped`] spawned after a checked stop, or while
+/// the step is stopped ([`stop_step`], OWL-474), is stopped at once.
 pub(super) fn register(
     spawn: impl FnOnce() -> io::Result<Child>,
     stopper: impl FnOnce(&Child) -> Stopper,
     at: AtCheckedStop,
 ) -> io::Result<(Child, Registration)> {
     let mut guard = live();
-    let asked = asked();
+    let (asked, step_stopped) = {
+        let degrees = degrees();
+        (degrees.asked, degrees.step_stopped)
+    };
+    #[cfg(windows)]
+    let _ = step_stopped;
     if at == AtCheckedStop::Told && asked.is_some() {
         return Err(io::Error::other(
             "this process is asked to stop: no step starts",
@@ -348,7 +399,7 @@ pub(super) fn register(
         sentinel.announce(stopper.group);
     }
     #[cfg(unix)]
-    if at == AtCheckedStop::Stopped && asked == Some(Degree::Checked) {
+    if at == AtCheckedStop::Stopped && (asked == Some(Degree::Checked) || step_stopped) {
         // Best effort, as at the checked stop itself.
         let _ = super::tree::kill_group(&stopper);
     }
