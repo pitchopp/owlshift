@@ -585,6 +585,9 @@ struct Memory<'c> {
     /// Why each cancel waits, by its ticket's folder, as last warned of
     /// (OWL-474).
     cancel_failing: HashMap<String, String>,
+    /// The tickets a cancel's park whose state was not kept holds, with
+    /// their ref's progress then: left alone until it moves (OWL-474).
+    cancel_held: HashMap<TicketId, Progress>,
 }
 
 /// What a correction's or the reviews' read found due at a pass (OWL-445):

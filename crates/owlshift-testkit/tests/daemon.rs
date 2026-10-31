@@ -665,6 +665,130 @@ fn s11_a_checked_stop_resumes_both_builds_and_a_kill_quarantines() {
     assert_no_double_dispatch(&bench.data(), &TICKETS);
 }
 
+/// OWL-474's acceptance under the daemon (architecture section 5, "The
+/// local web UI", "Cancel"): DEMO-1's and DEMO-2's Builds are under way,
+/// each in a child of the real watch, and have left a checkpoint. DEMO-1 is
+/// canceled:
+///
+/// - its run is stopped within 5 seconds and checked, its obligation
+///   retired, nothing quarantined, while DEMO-2's runs on and the watch
+///   goes on passing;
+/// - DEMO-1 is parked at Build within 10 seconds, the PARKED comment naming
+///   `owlshift cancel` and why, the cancel file gone;
+/// - `owlshift continue --to-watch DEMO-1` restarts it, and the watch
+///   resumes its Build from its checkpoint.
+#[test]
+fn a_canceled_build_is_stopped_checked_and_parked_then_resumed_from_its_checkpoint() {
+    use owlshift_runner::on_demand::Stop;
+    use owlshift_testkit::step_child::{cancel, parked_at_build};
+
+    let mut bench = Bench::new();
+    let root = bench.tmp.path().to_owned();
+    let plays = root.join("plays");
+    fs::create_dir_all(&plays).unwrap();
+    for (id, zone) in [("DEMO-1", "a"), ("DEMO-2", "b")] {
+        reply_for(&plays, "intake", Some(id), &intake_declaring(&[zone]));
+    }
+    reply_for(&plays, "build", None, &build_asks());
+    fs::write(plays.join("hold"), "").unwrap();
+    let harness = holding_harness(
+        &plays,
+        Path::new(FAKE),
+        "build",
+        CHECKPOINT,
+        "exec sleep 60",
+    );
+    let machine = root.join("machine");
+    let mut project = ChildProject::seed_parallel(&root, harness, 2, 2, (&machine, 2));
+    project.notes = Some(bench.notes_file());
+    let file = root.join("project.toml");
+    project.save(&file);
+    project.move_ticket("DEMO-9", "Done");
+    bench
+        .registry()
+        .register(&Repo::parse(REPO).unwrap(), &project.checkout)
+        .unwrap();
+    bench.project = Some(file);
+    let dirs = project.dirs();
+    let pid_files = TICKETS.map(|id| plays.join(format!("build-{id}.pid")));
+    let pid = |file: &Path| -> u32 { fs::read_to_string(file).unwrap().trim().parse().unwrap() };
+    bench.start();
+    bench.wait_for("both Builds under way", 120, || {
+        pid_files.iter().all(|file| file.exists())
+    });
+    let (one, two) = (pid(&pid_files[0]), pid(&pid_files[1]));
+
+    let asked = Instant::now();
+    let why = "it rewrites the wrong module";
+    cancel(&project, "DEMO-1", why);
+    bench.wait_for("DEMO-1's run stopped", 5, || !alive(one));
+    bench.wait_for("DEMO-1 parked", 10, || parked_at_build(&project, "DEMO-1"));
+    assert!(asked.elapsed() < Duration::from_secs(10));
+    assert!(alive(two), "DEMO-2's run was stopped\n{}", bench.output());
+    let passes = bench.passes();
+    bench.wait_for("three more passes of the watch", 30, || {
+        bench.passes() >= passes + 3
+    });
+    assert!(alive(two), "DEMO-2's run was stopped\n{}", bench.output());
+    let demo1 = TicketId::new("DEMO-1").unwrap();
+    assert!(!owlshift_runner::cancel::stands(&dirs, &demo1));
+    assert_eq!(dirs.quarantine().unwrap(), None, "{}", bench.output());
+    let left = fs::read_dir(dirs.obligations_dir())
+        .map(|entries| {
+            entries
+                .filter_map(Result::ok)
+                .map(|entry| entry.file_name().to_string_lossy().into_owned())
+                .filter(|name| name.starts_with("demo-1-"))
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    assert!(left.is_empty(), "{left:?}\n{}", bench.output());
+    assert_eq!(
+        ended_as(&project, "stopped"),
+        ["DEMO-1"],
+        "{}",
+        bench.output()
+    );
+    let parked: Vec<String> = MarkdownTracker::new(&project.checkout)
+        .comments(&demo1)
+        .unwrap()
+        .into_iter()
+        .map(|comment| comment.body)
+        .filter(|body| body.starts_with("[owlshift] PARKED\n"))
+        .collect();
+    assert_eq!(parked.len(), 1, "{parked:?}");
+    assert!(
+        parked[0].contains("Canceled by `owlshift cancel` at ") && parked[0].contains(why),
+        "{}",
+        parked[0]
+    );
+
+    // Restarted and left to the watch, which resumes it from its checkpoint.
+    fs::remove_file(&pid_files[0]).unwrap();
+    let mut out = Vec::new();
+    let restarted = project.with_on_demand(&mut out, |od, sink| od.continue_to_watch(&demo1, sink));
+    assert!(
+        matches!(
+            restarted,
+            Err(Stop::ToWatch {
+                restarted: true,
+                ..
+            })
+        ),
+        "{restarted:?}"
+    );
+    bench.wait_for("DEMO-1's Build resumed", 60, || pid_files[0].exists());
+    assert_eq!(
+        build_starts(&bench.data(), "DEMO-1"),
+        [false, true],
+        "{}",
+        bench.output()
+    );
+    bench.signal("TERM", bench.daemon_pid());
+    let status = bench.ended(60);
+    assert!(status.success(), "{status}\n{}", bench.output());
+}
+
 /// An upgrade's drain request, as a newer binary writes it.
 fn upgrade_drain() -> Request {
     Request::new(

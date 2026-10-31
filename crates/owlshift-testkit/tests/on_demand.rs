@@ -11719,6 +11719,10 @@ mod to_watch_scenarios;
 #[path = "on_demand/base_scenarios.rs"]
 mod base_scenarios;
 
+/// A ticket's cancel parked, refused, withdrawn or dropped (OWL-474).
+#[path = "on_demand/cancel_scenarios.rs"]
+mod cancel_scenarios;
+
 /// OWL-312's acceptance: `[roles.build] rules` reaches Build's brief after
 /// `stack.rules`, and not the resolver's; the `dispatch` event names every
 /// source; a named file the base commit lacks refuses the run.

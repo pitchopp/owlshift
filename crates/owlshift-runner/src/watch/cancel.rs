@@ -30,12 +30,11 @@ use serde_json::json;
 use owlshift_contracts::event::EventKind;
 use owlshift_contracts::ids::TicketId;
 
-use super::{Memory, Seen, Watch};
+use super::{Memory, Watch};
 use crate::cancel;
 use crate::events::{Data, EventSink, data};
 use crate::on_demand::{Canceled, Stop};
 use crate::project;
-use crate::step::{self, Stepped};
 use crate::ticket_ref::Stored;
 
 /// The key of a failing read of the tickets' folder in
@@ -82,7 +81,16 @@ impl Watch<'_> {
         memory
             .cancel_failing
             .retain(|name, _| standing.iter().any(|(folder, _)| folder == name));
-        let mut left = Vec::new();
+        // The tickets a park not kept holds, until their ref moves.
+        memory.cancel_held.retain(|ticket, progress| {
+            read.iter().any(|(read, stored)| {
+                read == ticket
+                    && stored
+                        .as_ref()
+                        .is_ok_and(|stored| stored.at().progress == *progress)
+            })
+        });
+        let mut left: Vec<TicketId> = memory.cancel_held.keys().cloned().collect();
         for (name, path) in standing {
             let named = |ticket: &TicketId| project::component(ticket.as_str()) == name;
             // Its step under way stops itself; the park follows its end.
@@ -126,13 +134,13 @@ impl Watch<'_> {
                 // The turn is chosen again at once without it.
                 memory.stepped = true;
                 // A park whose state was not kept holds the ticket until a
-                // person acts, as a continue's (OWL-158): the comment is
-                // not posted again.
+                // person acts, as a continue's does (OWL-158): until its ref
+                // moves, nothing of it runs, and the comment is not posted
+                // again.
                 if matches!(stop, Stop::NotKept { .. }) {
-                    let end = step::end(&Stepped::Ran(Err(stop.clone())));
-                    let now = (self.on_demand.clock)();
-                    let seen = Seen::at(stored.at(), None);
-                    memory.holds.after(ticket, seen, &end, None, now);
+                    memory
+                        .cancel_held
+                        .insert(ticket.clone(), stored.at().progress);
                 }
                 self.line(
                     out,
@@ -192,7 +200,8 @@ impl Watch<'_> {
         words: &str,
         path: &Path,
     ) {
-        self.line(out, &format!("the cancel of {name} is dropped: {words}"));
+        let named = ticket.map_or(name, TicketId::as_str);
+        self.line(out, &format!("the cancel of {named} is dropped: {words}"));
         let mut event = data([("cancel", json!("dropped")), ("why", json!(words))]);
         if ticket.is_none() {
             event.insert("folder".to_owned(), json!(name));
