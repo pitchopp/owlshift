@@ -237,6 +237,11 @@ pub fn phrase(wait: &Waiting) -> String {
         "run_cap" => "every run slot of this machine is taken".to_owned(),
         "in_flight_unread" => "the work in flight outside Owlshift could not be read".to_owned(),
         "quarantine" => "the project is quarantined (`owlshift unquarantine`)".to_owned(),
+        // Told by the drain's ready snapshot alone (OWL-468).
+        "held" => "its last step left its ticket ref as it was: it is tried again later".to_owned(),
+        "next_pass" => "chosen in this pass, it did not start: the next pass tries it".to_owned(),
+        "ref_unread" => "its ticket ref cannot be read".to_owned(),
+        "refs_unread" => "nothing is dispatched while a ticket ref cannot be read".to_owned(),
         "to_watch" => "restarted by `owlshift continue --to-watch`: `owlshift watch` resumes it \
                        at its next pass"
             .to_owned(),

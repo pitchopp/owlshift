@@ -330,7 +330,7 @@ fn person(reason: &str, text: &str) -> Wait {
 }
 
 /// A wait the event log tells, with what it named.
-fn told(waiting: &Waiting) -> Wait {
+pub(crate) fn told(waiting: &Waiting) -> Wait {
     let data = &waiting.data;
     let text = |key: &str| data.get(key).and_then(Value::as_str);
     let mut behind = Vec::new();

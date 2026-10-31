@@ -33,6 +33,12 @@
 //! one. The dispatch counts again from the refs read under its lock
 //! (OWL-313), so a pull request another command delivered since the
 //! snapshot holds it too, told the same way.
+//!
+//! The ready snapshot (OWL-468, [`crate::ready`]): a pass that listed the
+//! column writes, at its end, every ticket of it in the core's order with
+//! what the pass made of it (taken in, running, dispatched, waiting and
+//! why, not admitted and why) and the blockers it weighed. A pass that
+//! listed nothing writes nothing.
 
 use std::collections::HashMap;
 use std::io::Write;
@@ -43,22 +49,27 @@ use serde_json::json;
 use owlshift_adapters::tracker::{Column, Error, ErrorKind, Listed, StateType};
 use owlshift_contracts::config::{Admit as Gesture, ProjectConfig};
 use owlshift_contracts::event::EventKind;
+use owlshift_contracts::format::Format;
 use owlshift_contracts::ids::TicketId;
+use owlshift_contracts::ready::{
+    BlockerState as ReadyState, Outcome, ReadyBlocker, ReadySnapshot, ReadyTicket,
+};
 use owlshift_contracts::refs::EndedWhy;
 use owlshift_contracts::step::{StepEnd, StepKind};
 use owlshift_contracts::{Role, Variant};
 use owlshift_core::schedule::{self, Caps, Load, Wait, natural_cmp};
 use owlshift_core::state::{Status, TicketState};
 use owlshift_core::ticket::{Admission, Blocker, BlockerState, Ticket, text_blockers};
-use owlshift_core::vocab::Stage;
+use owlshift_core::vocab::{Harness, Stage};
 
 use super::{Admit, Continued, Memory as WatchMemory, RETRY_AFTER, Seen, Then, Watch};
-use crate::events::{EventSink, data};
-use crate::held;
-use crate::in_flight::{self, Outside};
+use crate::events::{Data, EventSink, data};
+use crate::in_flight::{self, Kind, Outside};
 use crate::on_demand::{self, delivery_followed};
 use crate::quarantine::Held;
 use crate::ticket_ref::{self, RefAt, Stored, text_sha256};
+use crate::usage as machine_usage;
+use crate::{held, ready};
 
 /// Why `owlshift watch --drain` refuses to start on a project configured
 /// so, from its working tree (architecture section 5, "The gesture", "By
@@ -100,6 +111,106 @@ pub(super) struct Memory {
     /// Whether the cap was told as reached and the count has not fallen
     /// below it since.
     capped: bool,
+    /// Why the ready snapshot could not be written, as last said.
+    unwritten: Option<String>,
+}
+
+/// What the pass's intake did.
+enum Intake {
+    /// It ran on no ticket.
+    None,
+    /// It went to `ticket`: its step ran or started (`started`), or found
+    /// the project, the ticket or the machine's run slots taken.
+    Took { ticket: TicketId, started: bool },
+    /// Intake's harness is held by a usage limit until `until_ms`: no
+    /// intake runs (OWL-404).
+    UsageLimit { harness: Harness, until_ms: i64 },
+}
+
+/// What a dispatch did.
+enum Dispatch {
+    /// Its step ran or started.
+    Started,
+    /// Watch's hold keeps the ticket back: its last step left its ref as it
+    /// was.
+    Held,
+    /// Build's harness is held by a usage limit until `until_ms`.
+    UsageLimit { harness: Harness, until_ms: i64 },
+    /// Its step found the project, the ticket or the machine's run slots
+    /// taken, or the ref moved: the next pass tries again.
+    NotStarted,
+}
+
+/// A wait of the ready snapshot.
+fn waits(ticket: &TicketId, reason: &str, data: Data) -> Outcome {
+    Outcome::Waits {
+        wait: ready::wait(ticket, reason, data),
+    }
+}
+
+/// What a usage limit's event carries.
+fn usage_data(harness: Harness, until_ms: i64) -> Data {
+    data([
+        ("harness", json!(machine_usage::key(harness))),
+        ("until", json!(machine_usage::at(until_ms))),
+    ])
+}
+
+/// What the drain's `waits` decision for `wait` carries besides its reason:
+/// the holder a collision names, as a pull request or a person's ticket
+/// (OWL-410), or the tickets it names; the resource.
+fn wait_data(wait: &Wait<String>, kinds: &HashMap<String, Kind>) -> Data {
+    let mut event = Data::new();
+    if let Wait::Collision(found) = wait {
+        let holder = in_flight::named(kinds, &found.holder);
+        for (key, value) in holder.data() {
+            event.insert(key.to_owned(), value);
+        }
+    } else if !wait.tickets().is_empty() {
+        event.insert("tickets".to_owned(), json!(wait.tickets()));
+    }
+    if let Some(resource) = wait.resource() {
+        event.insert("resource".to_owned(), held::resource_data(resource));
+    }
+    event
+}
+
+/// A blocker as the ready snapshot keeps it.
+fn ready_blocker(blocker: Blocker<String>) -> ReadyBlocker {
+    ReadyBlocker {
+        ticket: blocker.id,
+        state: match blocker.tracker {
+            BlockerState::Open => ReadyState::Open,
+            BlockerState::Completed => ReadyState::Completed,
+            BlockerState::Canceled => ReadyState::Canceled,
+            BlockerState::Unknown => ReadyState::Unknown,
+        },
+        merged: blocker.merged,
+    }
+}
+
+/// Whether the ticket ref of `id` records its pull request merged.
+fn merged_in(refs: &HashMap<TicketId, Stored>, id: &str) -> bool {
+    TicketId::new(id)
+        .ok()
+        .and_then(|id| refs.get(&id))
+        .and_then(|stored| stored.record.delivery.as_ref())
+        .and_then(|delivery| delivery.ended.as_ref())
+        .is_some_and(|ended| ended.why == EndedWhy::Merged)
+}
+
+/// A row's relations, with what the listing shows of each blocker and
+/// whether its ticket ref records its pull request merged: no read.
+fn relations(row: &Row, refs: &HashMap<TicketId, Stored>) -> Vec<Blocker<String>> {
+    row.listed
+        .blockers
+        .iter()
+        .map(|blocker| Blocker {
+            id: blocker.id.as_str().to_owned(),
+            tracker: relation_state(blocker.state),
+            merged: merged_in(refs, blocker.id.as_str()),
+        })
+        .collect()
 }
 
 impl Memory {
@@ -132,6 +243,13 @@ impl Row {
             state,
             text,
         }
+    }
+
+    /// A ticket of the column whose ref cannot be read: no state.
+    fn unread(listed: Listed) -> Self {
+        let mut row = Row::new(listed, None);
+        row.state = None;
+        row
     }
 
     fn id(&self) -> &TicketId {
@@ -292,15 +410,23 @@ impl Watch<'_> {
             }
             memory.drain.unread = unread.clone();
         }
-        let mut rows: Vec<Row> = listed
-            .into_iter()
-            .filter(|listed| !unread.contains(&listed.ticket.id))
-            .map(|listed| {
+        // A ticket whose ref cannot be read is weighed by nothing: the ready
+        // snapshot alone keeps it (OWL-468).
+        let (mut rows, mut unread_rows) = (Vec::new(), Vec::new());
+        for listed in listed {
+            if unread.contains(&listed.ticket.id) {
+                unread_rows.push(Row::unread(listed));
+            } else {
                 let stored = refs.get(&listed.ticket.id).cloned();
-                Row::new(listed, stored)
-            })
-            .collect();
+                rows.push(Row::new(listed, stored));
+            }
+        }
         rows.sort_by(Row::order);
+        // What the pass made of each ticket, for the ready snapshot.
+        let mut made: HashMap<TicketId, Outcome> = HashMap::new();
+        for row in &unread_rows {
+            made.insert(row.id().clone(), waits(row.id(), "ref_unread", Data::new()));
+        }
         // The tickets whose step's child runs (OWL-401) are neither taken in
         // nor dispatched again; a dispatch's holds the slot, as one of this
         // pass's, until its admission writes its ref.
@@ -319,11 +445,30 @@ impl Watch<'_> {
         // Under quarantine no intake runs, nor is its candidate told: its
         // gesture is checked at the base commit under the lock, which the
         // quarantine refuses, and a ticket at Intake is not ready yet.
-        let taken = if quarantined {
-            None
+        let intake = if quarantined {
+            Intake::None
         } else {
             self.take_in(memory, &rows, &busy, sink, out, continued)
         };
+        for row in rows.iter().filter(|row| busy.contains(row.id())) {
+            made.insert(row.id().clone(), Outcome::Running);
+        }
+        let taken = match &intake {
+            Intake::Took { ticket, started } => {
+                let outcome = if *started {
+                    Outcome::TakenIn
+                } else {
+                    waits(ticket, "next_pass", Data::new())
+                };
+                made.insert(ticket.clone(), outcome);
+                Some(ticket.clone())
+            }
+            _ => None,
+        };
+        for row in rows.iter().filter(|row| row.state.is_none()) {
+            made.entry(row.id().clone())
+                .or_insert_with(|| waits(row.id(), "ref_unread", Data::new()));
+        }
         let exclude = tracker.exclude.as_deref();
         let mut reads = HashMap::new();
         let tickets: Vec<Ticket<String>> = rows
@@ -405,42 +550,62 @@ impl Watch<'_> {
             self.tell_cap(memory, &held, open_prs, cap, sink, out);
         }
         for (id, wait) in &ready.waiting {
-            if *wait == Wait::PrCap {
-                continue;
-            }
             let Some(row) = rows.iter().find(|row| row.id().as_str() == id) else {
                 continue;
             };
+            let detail = wait_data(wait, &memory.outside.kinds);
+            let outcome = match (wait, &intake) {
+                (Wait::NotAdmitted | Wait::Excluded, _) => Outcome::NotAdmitted {
+                    wait: ready::wait(row.id(), wait.key(), detail.clone()),
+                },
+                (Wait::PrCap, _) => waits(
+                    row.id(),
+                    wait.key(),
+                    data([("open_prs", json!(open_prs)), ("max_open_prs", json!(cap))]),
+                ),
+                // Its intake is due, and every intake waits for its
+                // harness's usage limit (OWL-404).
+                (Wait::NoIntake | Wait::StaleIntake, Intake::UsageLimit { harness, until_ms })
+                    if row.intake_due(exclude) =>
+                {
+                    waits(row.id(), "usage_limit", usage_data(*harness, *until_ms))
+                }
+                _ => waits(row.id(), wait.key(), detail.clone()),
+            };
+            made.insert(row.id().clone(), outcome);
+            if *wait == Wait::PrCap {
+                continue;
+            }
             let told = format!("{}{:?}{:?}", wait.key(), wait.tickets(), wait.resource());
             if memory.drain.waits.get(row.id()) == Some(&told) {
                 continue;
             }
+            // A pull request or a person's ticket is named as such
+            // (OWL-410).
             let mut event = data([("drain", json!("waits")), ("reason", json!(wait.key()))]);
-            if let Wait::Collision(found) = wait {
-                // A pull request or a person's ticket is named as such
-                // (OWL-410).
-                let holder = in_flight::named(&memory.outside.kinds, &found.holder);
-                for (key, value) in holder.data() {
-                    event.insert(key.to_owned(), value);
-                }
-            } else if !wait.tickets().is_empty() {
-                event.insert("tickets".to_owned(), json!(wait.tickets()));
-            }
-            if let Some(resource) = wait.resource() {
-                event.insert("resource".to_owned(), held::resource_data(resource));
-            }
+            event.extend(detail);
             sink.emit(row.id(), None, EventKind::Decision, event);
             let reason = in_flight::said(wait, exclude, &memory.outside.kinds);
             self.line(out, &format!("{} waits: {reason}", row.id()));
             memory.drain.waits.insert(row.id().clone(), told);
         }
-        // The pass's dispatches, in the ready set's order (OWL-401).
-        for id in &ready.dispatch {
-            let Some(row) = rows.iter().find(|row| row.id().as_str() == id) else {
-                continue;
-            };
+        // The pass's dispatches, in the ready set's order (OWL-401). Each is
+        // kept as not started until the pass tells otherwise.
+        let picked: Vec<&Row> = ready
+            .dispatch
+            .iter()
+            .filter_map(|id| rows.iter().find(|row| row.id().as_str() == id))
+            .collect();
+        for row in &picked {
+            made.insert(row.id().clone(), waits(row.id(), "next_pass", Data::new()));
+        }
+        for (turn, row) in picked.iter().enumerate() {
             if outside_unread {
                 self.wait_for_outside(memory, sink, out, row.id());
+                made.insert(
+                    row.id().clone(),
+                    waits(row.id(), "in_flight_unread", Data::new()),
+                );
                 continue;
             }
             // Told again if it waits again for a reason it had before.
@@ -449,17 +614,24 @@ impl Watch<'_> {
                 .waits
                 .insert(row.id().clone(), "dispatch".to_owned());
             if !memory.drain.unread.is_empty() {
-                return;
+                for row in &picked[turn..] {
+                    made.insert(
+                        row.id().clone(),
+                        waits(row.id(), "refs_unread", Data::new()),
+                    );
+                }
+                break;
             }
             let Some(stored) = &row.stored else {
                 continue;
             };
             if quarantined {
                 self.tell(memory, sink, out, row.id(), Held::Ready);
+                made.insert(row.id().clone(), waits(row.id(), "quarantine", Data::new()));
                 continue;
             }
             let outside = memory.outside.current();
-            let started = self.dispatch(
+            let dispatched = self.dispatch(
                 memory,
                 row.id(),
                 stored.at(),
@@ -468,10 +640,19 @@ impl Watch<'_> {
                 out,
                 continued,
             );
+            let outcome = match dispatched {
+                Dispatch::Started => Outcome::Dispatched,
+                Dispatch::Held => waits(row.id(), "held", Data::new()),
+                Dispatch::UsageLimit { harness, until_ms } => {
+                    waits(row.id(), "usage_limit", usage_data(harness, until_ms))
+                }
+                Dispatch::NotStarted => waits(row.id(), "next_pass", Data::new()),
+            };
+            made.insert(row.id().clone(), outcome);
             // Each dispatch gives the tickets held for their base a turn,
             // taken at the next pass before any other dispatch (OWL-431):
             // a fix that landed is checked within one dispatch.
-            if started {
+            if matches!(dispatched, Dispatch::Started) {
                 let held: Vec<TicketId> = memory
                     .base_held
                     .iter()
@@ -480,7 +661,73 @@ impl Watch<'_> {
                     .collect();
                 if !held.is_empty() {
                     memory.base_turn.extend(held);
-                    return;
+                    break;
+                }
+            }
+        }
+        let weighed: HashMap<&str, &Ticket<String>> = tickets
+            .iter()
+            .map(|ticket| (ticket.id.as_str(), ticket))
+            .collect();
+        self.keep_ready(memory, out, rows, unread_rows, &weighed, &refs, made);
+    }
+
+    /// Writes the ready snapshot of a pass that read the column (OWL-468):
+    /// `rows` and `unread_rows` in the core's order, each with what the pass
+    /// made of it (`made`) and its blockers: those the core weighed
+    /// (`weighed`) when its intake holds its current text, the only ones
+    /// whose "Blocked by" lines are read, its relations otherwise. A write
+    /// that fails is one line, until it fails otherwise.
+    #[allow(clippy::too_many_arguments)]
+    fn keep_ready(
+        &self,
+        memory: &mut WatchMemory,
+        out: &mut dyn Write,
+        rows: Vec<Row>,
+        unread_rows: Vec<Row>,
+        weighed: &HashMap<&str, &Ticket<String>>,
+        refs: &HashMap<TicketId, Stored>,
+        mut made: HashMap<TicketId, Outcome>,
+    ) {
+        let mut all: Vec<Row> = rows.into_iter().chain(unread_rows).collect();
+        all.sort_by(Row::order);
+        let tickets = all
+            .iter()
+            .map(|row| {
+                let blockers = weighed
+                    .get(row.id().as_str())
+                    .filter(|_| row.intake_hash() == Some(row.text.as_str()))
+                    .map_or_else(|| relations(row, refs), |ticket| ticket.blocked_by.clone());
+                ReadyTicket {
+                    ticket: row.id().clone(),
+                    title: row.listed.ticket.title.clone(),
+                    priority: row.listed.ticket.priority,
+                    blockers: blockers
+                        .into_iter()
+                        .filter(|blocker| blocker.id != row.id().as_str())
+                        .map(ready_blocker)
+                        .collect(),
+                    drain: made
+                        .remove(row.id())
+                        .unwrap_or_else(|| waits(row.id(), "next_pass", Data::new())),
+                }
+            })
+            .collect();
+        let snapshot = ReadySnapshot {
+            format: Format,
+            at: (self.on_demand.clock)(),
+            interval_ms: u64::try_from(self.interval.as_millis()).unwrap_or(u64::MAX),
+            tickets,
+        };
+        match ready::write(self.on_demand.dirs, &snapshot) {
+            Ok(()) => memory.drain.unwritten = None,
+            Err(error) => {
+                if memory.drain.unwritten.as_ref() != Some(&error) {
+                    self.line(
+                        out,
+                        &format!("the ready snapshot could not be written: {error}"),
+                    );
+                    memory.drain.unwritten = Some(error);
                 }
             }
         }
@@ -520,7 +767,8 @@ impl Watch<'_> {
     /// The pass's intake: the first candidate, in the core's order, that its
     /// gesture admits and no hold keeps back, none whose step runs. One
     /// intake runs at a time (OWL-401): none starts while one's child runs.
-    /// Returns the ticket it ran on, or started, if any.
+    /// Returns the ticket it went to, if any, or the usage limit that holds
+    /// every intake.
     fn take_in(
         &self,
         memory: &mut WatchMemory,
@@ -529,10 +777,10 @@ impl Watch<'_> {
         sink: &mut EventSink<'_>,
         out: &mut dyn Write,
         continued: &mut Continued<'_>,
-    ) -> Option<TicketId> {
+    ) -> Intake {
         let on_demand = self.on_demand;
         if memory.running.iter().any(|running| running.intake()) {
-            return None;
+            return Intake::None;
         }
         let exclude = on_demand.config.tracker.exclude.as_deref();
         for row in rows
@@ -556,21 +804,28 @@ impl Watch<'_> {
             }
             // Intake's harness held by a usage limit holds every intake
             // (OWL-404).
-            if self.usage_waits(memory, sink, out, Some(Role::Intake)) {
-                return None;
+            if let Some((harness, until_ms)) =
+                self.usage_wait(memory, sink, out, Some(Role::Intake))
+            {
+                return Intake::UsageLimit { harness, until_ms };
             }
             let envelope = self.envelope(memory, ticket, StepKind::Intake, &seen);
             let then = Then::Intake { seen };
             match self.step(memory, sink, out, continued, envelope, None, None, then) {
                 // The ref moved, or the ticket left the column: the next
                 // pass reads it again.
-                Some(StepEnd::Stale) => return None,
+                Some(StepEnd::Stale) => return Intake::None,
                 // Told: the next candidate is tried.
                 Some(StepEnd::NotAdmitted { .. }) => {}
-                _ => return Some(ticket.clone()),
+                end => {
+                    return Intake::Took {
+                        ticket: ticket.clone(),
+                        started: end.as_ref().is_none_or(super::running::ran),
+                    };
+                }
             }
         }
-        None
+        Intake::None
     }
 
     /// What an intake that ended `end` left: a gesture that does not admit
@@ -598,7 +853,9 @@ impl Watch<'_> {
 
     /// The dispatch of `ticket`, its ref at `at`, held as a continue is, its
     /// admission weighing `outside`, the work outside Owlshift this pass
-    /// read (OWL-401). Returns whether its step started or ran.
+    /// read (OWL-401). Says whether its step started or ran, and what kept
+    /// it back otherwise: the hold is checked before the usage limit, which
+    /// is read only for a ticket the hold lets go.
     #[allow(clippy::too_many_arguments)]
     fn dispatch(
         &self,
@@ -609,20 +866,23 @@ impl Watch<'_> {
         sink: &mut EventSink<'_>,
         out: &mut dyn Write,
         continued: &mut Continued<'_>,
-    ) -> bool {
+    ) -> Dispatch {
         let on_demand = self.on_demand;
         let seen = Seen::at(at, None);
+        if memory.holds.admit(ticket, &seen, (on_demand.clock)()) != Admit::Go {
+            return Dispatch::Held;
+        }
         // A dispatch's first run, Design or Build, an authoring role's on
         // Claude Code, waits for its usage limit (OWL-404).
-        if memory.holds.admit(ticket, &seen, (on_demand.clock)()) != Admit::Go
-            || self.usage_waits(memory, sink, out, Some(Role::Build))
-        {
-            return false;
+        if let Some((harness, until_ms)) = self.usage_wait(memory, sink, out, Some(Role::Build)) {
+            return Dispatch::UsageLimit { harness, until_ms };
         }
         let envelope = self.envelope(memory, ticket, StepKind::Dispatch, &seen);
         let then = Then::Dispatch { seen };
-        self.step(memory, sink, out, continued, envelope, None, outside, then)
-            .is_none_or(|end| super::running::ran(&end))
+        match self.step(memory, sink, out, continued, envelope, None, outside, then) {
+            Some(end) if !super::running::ran(&end) => Dispatch::NotStarted,
+            _ => Dispatch::Started,
+        }
     }
 
     /// What a dispatch that ended `end` left: the open pull requests' cap
@@ -846,24 +1106,7 @@ impl Watch<'_> {
         refs: &HashMap<TicketId, Stored>,
         reads: &mut HashMap<String, BlockerState>,
     ) -> Vec<Blocker<String>> {
-        let merged = |id: &str| {
-            TicketId::new(id)
-                .ok()
-                .and_then(|id| refs.get(&id))
-                .and_then(|stored| stored.record.delivery.as_ref())
-                .and_then(|delivery| delivery.ended.as_ref())
-                .is_some_and(|ended| ended.why == EndedWhy::Merged)
-        };
-        let mut blockers: Vec<Blocker<String>> = row
-            .listed
-            .blockers
-            .iter()
-            .map(|blocker| Blocker {
-                id: blocker.id.as_str().to_owned(),
-                tracker: relation_state(blocker.state),
-                merged: merged(blocker.id.as_str()),
-            })
-            .collect();
+        let mut blockers = relations(row, refs);
         for id in text_blockers(&row.listed.ticket.description) {
             if blockers.iter().any(|blocker| blocker.id == id) {
                 continue;
@@ -883,7 +1126,7 @@ impl Watch<'_> {
             blockers.push(Blocker {
                 id: id.to_owned(),
                 tracker,
-                merged: merged(id),
+                merged: merged_in(refs, id),
             });
         }
         blockers
