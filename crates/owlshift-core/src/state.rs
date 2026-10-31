@@ -275,6 +275,14 @@ pub enum Event {
     /// parks where it stands, waiting for input if it was. Valid wherever a
     /// run can be in flight.
     BudgetReached,
+    /// A person canceled the ticket's work with `owlshift cancel` or the
+    /// UI's Cancel (OWL-474, architecture section 5, "Cancel"): its step
+    /// under way, if any, was stopped and checked, and the ticket parks
+    /// where it stands ([`ParkReason::Stopped`]), waiting for input if it
+    /// was. Not [`Event::Withdrawn`], which ends the ticket: a person's
+    /// `continue` restarts it. Valid wherever a run can be in flight, so a
+    /// ticket at Ready, the admission's, is never parked by it.
+    Canceled,
     /// A fix run's push landed (OWL-55): the ticket stays at Watch, its
     /// failed runs are cleared, and a fix pass and a repair are counted.
     /// The runner gives [`Event::FixDue`] before the run, so a push past a
@@ -324,7 +332,7 @@ pub enum Event {
 
 impl Event {
     /// Every event.
-    pub const ALL: [Self; 33] = [
+    pub const ALL: [Self; 34] = [
         Self::Dispatched,
         Self::Completed,
         Self::LoopBack,
@@ -347,6 +355,7 @@ impl Event {
         Self::Interrupted,
         Self::Quarantined,
         Self::BudgetReached,
+        Self::Canceled,
         Self::FixPushed,
         Self::RebasePushed,
         Self::Corrected,
@@ -420,6 +429,9 @@ pub enum ParkReason {
     /// A held Build's branch could not be rebased off its broken base onto
     /// a newer head that passes (OWL-427).
     Rebase,
+    /// A person canceled the ticket's work ([`Event::Canceled`], OWL-474):
+    /// its step under way was stopped and its runs checked.
+    Stopped,
 }
 
 /// How a ticket left the machine.
@@ -874,6 +886,9 @@ impl TicketState {
             (status, Event::BudgetReached) if status.runs() => {
                 self.park(ParkReason::TicketBudget, self.failed_runs)
             }
+            (status, Event::Canceled) if status.runs() => {
+                self.park(ParkReason::Stopped, self.failed_runs)
+            }
 
             (Status::Active(Stage::Watch), Event::FixPushed) => {
                 if self.fix_passes >= MAX_FIX_PASSES || self.repairs >= MAX_REPAIRS {
@@ -1243,6 +1258,9 @@ mod tests {
             (Status::Active(stage), Event::BudgetReached) if stage != Ready => {
                 Expect::Parked(parked(stage, false), ParkReason::TicketBudget)
             }
+            (Status::Active(stage), Event::Canceled) if stage != Ready => {
+                Expect::Parked(parked(stage, false), ParkReason::Stopped)
+            }
 
             (Status::NeedsInput { return_to }, Event::Answered) => {
                 Expect::To(Status::Active(return_to))
@@ -1260,6 +1278,9 @@ mod tests {
             }
             (Status::NeedsInput { return_to }, Event::BudgetReached) => {
                 Expect::Parked(parked(return_to, true), ParkReason::TicketBudget)
+            }
+            (Status::NeedsInput { return_to }, Event::Canceled) => {
+                Expect::Parked(parked(return_to, true), ParkReason::Stopped)
             }
             (
                 Status::NeedsInput { return_to: Watch } | Status::Parked { at: Watch, .. },
