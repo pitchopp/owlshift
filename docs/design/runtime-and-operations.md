@@ -36,7 +36,7 @@ One process per machine, `owlshift daemon`, started by the operating system's se
 **Around it:**
 
 - **Single instance.** A lock on the data directory allows one daemon per machine; a newer binary asks the running one to drain and exit, with 75, and the service manager starts it again on the new binary (P7).
-- **Control.** In P7, files: `owlshift stop`, `pause` and `resume` write and remove request files the watches read at each pass, and `owlshift status` reads the files the daemon and the watches keep (architecture section 5, "The background service"). A local API, a Unix socket (macOS, Linux) or a named pipe (Windows), comes with the web UI (P8) and serves it, the CLI and later the app.
+- **Control.** Files: `owlshift stop`, `pause` and `resume` (P7) and `cancel` (P8) write and remove request files the watches read, and `owlshift status` reads the files the daemon and the watches keep (architecture section 5, "The background service"). The local web UI (P8) is served by a child of the daemon on `127.0.0.1` and writes the same files; the CLI talks to no socket, and the app of P11 loads the UI (architecture section 5, "The local web UI").
 - **Usage limits.** When a CLI reports that the subscription's usage limit is reached, the daemon records the reset time it reports, pauses that harness until then, and routes the review roles to their fallback, the authoring roles waiting for the reset (P6, [architecture](architecture.md) section 5, "Parallel"). The interrupted run resumes from its checkpoint after the reset.
 - **Sleep and stops.** A sleeping machine freezes the daemon and its steps; on wake they go on and the watches catch up. A logout, a shutdown or a stop of the service is a checked stop: the steps' runs are stopped and their isolation checked before the daemon exits, and each ticket resumes from its checkpoint at the next start. A crash, a hard kill or a power loss leaves a run unchecked, which quarantines the project until a person looks, as in P6 (P7's reading; claims with leases, which would let another machine take over a ticket, are P10's).
 - **Keep awake.** While a step runs, a power assertion held for the step's process (`caffeinate -i -w <pid>` on macOS, a `systemd-inhibit` beside the step on Linux, `idle:sleep`, else `idle`, else none with a warning, never holding the step back) prevents idle sleep; it ends with the step. A laptop's closed lid on battery still sleeps.
@@ -233,7 +233,7 @@ fallback = "claude"
 
 ## Observability & the local web UI
 
-Every action is a recorded event, readable from the CLI from P1 and from a local web UI from P8; the tray app of P11 wraps that same UI instead of rebuilding it.
+Every action is a recorded event, readable from the CLI from P1 and from a local web UI from P8, where the CLI's gestures can also be made; the tray app of P11 wraps that same UI instead of rebuilding it.
 
 **Events and logs.** Each scan, decision, dispatch, run start and end, usage, gate, tracker write and warning (something left out without stopping a run) is a structured event in the local store. Each run's full harness output is captured to its own log file. On the ticket, comments give the human-readable trace. Until the local store exists, the events of `owlshift do` go to `events.jsonl` in the data directory, one JSON line each, and `owlshift logs` reads that file. It shows each run's log directory, not the logs themselves (OWL-20).
 
@@ -245,20 +245,28 @@ Every action is a recorded event, readable from the CLI from P1 and from a local
 | `owlshift why PROJ-123` | Why a ticket is not starting: a blocker, a held zone, a cap, a harness at its limit |
 | `owlshift continue PROJ-123` | Pick one ticket up once its decider has answered, after the quiet window (P2, OWL-127) |
 | `owlshift pause`, `resume` | Stop or restart dispatch for every ticket, or one project's; running steps finish (P7) |
-| `owlshift retry`, `cancel` | Act on one run |
+| `owlshift cancel PROJ-123` | Stop a ticket's step under way, checked, and park the ticket; `owlshift continue` restarts it (P8) |
+| `owlshift ui` | Open the local web UI in the browser, logged in; `--print` for an SSH tunnel (P8) |
 | `owlshift doctor` | Capabilities, harness versions and logins, leftovers |
 
 `why` is the most useful of them: a scheduler that cannot explain a wait looks broken.
 
-**The local web UI (P8)** is served by the daemon on `127.0.0.1` only, protected by a per-install token so no website open in the browser can drive it. It is identical on every platform and reachable on a server through an SSH tunnel.
+**The local web UI (P8)** is served by a child of the daemon on `127.0.0.1` only. A browser logs in through `owlshift ui`, which opens a one-time link; no website open in the browser and no agent run can drive it (architecture section 5, "The local web UI"). It is the same on macOS, Linux and WSL2, and reachable on a server through an SSH tunnel. It shows the served projects, all of them or one, reads only what Owlshift keeps on the machine, and updates itself as that changes.
 
-- **Overview:** tickets ready, running, waiting for a human, in review, and what blocks what.
-- **Ticket:** the stage timeline, each run with its live log, usage and result, the questions and answers.
-- **Orchestrator:** scans, decisions, errors, adapter health (tracker reachable, harness logged in, usage limit reached), usage per harness.
-- **Config:** the effective configuration with the origin of each value and validation errors; an edit writes to the file.
-- **Controls:** pause, resume, retry or cancel a run, release a claim.
+- **Header,** on every page: each served project and the capacity it uses, the machine's run slots, each harness's usage and reset, how many tickets wait for you, the daemon's state.
+- **For you,** first on the overview: the questions waiting for an answer, the plans to approve, the pull requests to review, the parked tickets.
+- **Overview:** the tickets in flight and those admitted but not started, in three views with a switch, the browser keeping the last one used:
+  - *Columns,* one per stage from "not started" to an open pull request, each card saying what its ticket does or waits on;
+  - *List,* one row per ticket, those needing you first, with a strip of its stages, its state and why;
+  - *Graph,* what blocks what, in two layers to switch: the tracker's blockers among the ready column and the tickets in flight, and the live waits (a zone held, a run slot, the project's capacity, an answer, a usage limit), drawn from `owlshift status --waits --json` and the drain's ready snapshot; a click opens the ticket.
+- **Since your last visit:** what was delivered, merged, parked, asked and spent since this browser last looked.
+- **Ticket:** the stage timeline from its ref's history; each run with its log rendered readable and live (the agent's text, its tool calls folded), its usage and result; the questions with their decisions, and the reply form when you are the decider; the plan and its review; its waits; its cost against the ticket budget; Cancel or Restart.
+- **Orchestrator:** the daemon and each watch (restarts and why, pauses, a quarantine), decisions and warnings as they come, the daemon's log, each harness's usage windows, and `owlshift doctor`'s checks run on demand.
+- **Spend:** cost per day, ticket, role and harness, from the `usage` events and each ticket's `cost.json`, against the ticket budget and the usage caps.
+- **Config:** the effective configuration with the origin of each value and validation errors; the personal file can be edited, the project file is read-only.
+- **Controls:** pause and resume the machine or a project, stop serving a project, cancel a ticket, restart a parked ticket. Starting and stopping the service and lifting a quarantine stay in the terminal.
 
-**The tray app (P11)** is a Tauri shell around the same UI, adding the menu-bar icon, native notifications and the login item.
+**The tray app (P11)** is a Tauri shell around the same UI, adding the menu-bar icon, native notifications and the login item; replying to a question and approving a plan are the UI's own from P8.
 
 **Telemetry:** none sent anywhere. An OpenTelemetry export can be switched on by a team for its own collector.
 

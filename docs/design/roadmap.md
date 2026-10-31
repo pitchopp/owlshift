@@ -12,7 +12,7 @@ Status: draft, 2026-09-27. Twelve steps (P0 to P11), each shippable, testable an
 | P5 | Quality pipeline | Plan, review by another model, build, verify; plan approval by policy; per-ticket routing |
 | P6 | Parallel | Several tickets at once without collisions; usage limits pause a harness and fall back to another |
 | P7 | Background service | Starts at login, survives sleep, logouts and restarts, notifies you only when you are the blocker |
-| P8 | Local web UI | Configuration, tickets, agent and orchestrator logs in the browser |
+| P8 | Local web UI | Follow and drive the drain from the browser: what runs and waits, what blocks what, logs, spend, configuration, replies |
 | P9 | Open-source readiness | First public 0.x release: GitHub Issues, Markdown tracker, `init` detection, a second project |
 | P10 | Teams | Several developers on one project; a team-server mode |
 | P11 | Menu-bar app | A Tauri shell around the web UI, with native notifications |
@@ -172,9 +172,22 @@ Set it and forget it.
 
 ## P8 · Local web UI
 
-The overview, ticket, orchestrator and configuration screens described in [runtime & operations](runtime-and-operations.md), served on `127.0.0.1` behind a per-install token.
+Follow and drive the drain from a browser.
 
-**Exit gate.** A day of operation followed from the UI alone.
+- The screens of [runtime & operations](runtime-and-operations.md), "Observability & the local web UI": what waits for you first; an overview in three views (columns by stage, a list, the graph of what blocks what); a ticket's timeline and readable live logs; the orchestrator; spend; the configuration.
+- Served by a child of the daemon on `127.0.0.1`, logged in through `owlshift ui`; no agent run can drive it.
+- Actions: pause and resume, stop serving a project, cancel a ticket (`owlshift cancel`), restart a parked ticket, reply to a ticket's questions and approve its plan, edit the personal file.
+- The rules are [architecture](architecture.md) section 5, "The local web UI"; the [build plan](build-plan.md), "P8 · Local web UI", says who builds what and how the exit gate is run.
+
+**Readings and deviations** (decided with the maintainer on 2026-10-31).
+
+- The local API is the UI's listener on `127.0.0.1`, not a Unix socket or a named pipe: a browser cannot reach a socket, and P7 showed the CLI's gestures need nothing files cannot carry. The CLI keeps its files, and the UI writes the same ones.
+- Replying to a question and approving a plan, which the P11 app was to bring, come with P8: the app wraps the UI, so it gets them unchanged.
+- `retry` is dropped, restarting a parked ticket being one; `cancel` acts on a ticket, stopping its step checked and parking it. Releasing a claim waits for P10 with the claims.
+- The configuration screen edits the personal file only: a served project runs on its default branch's project file, which changes through a pull request.
+- The drain keeps what it read of the ready column (`ready.json`), so the UI shows the tickets not yet started, their order and their blockers without calling the tracker.
+
+**Exit gate.** A working day of Locary's drain followed and driven from the UI alone.
 
 ## P9 · Open-source readiness
 
@@ -192,7 +205,7 @@ Deciders, identity map across tracker and forge, per-developer runners, team-ser
 
 ## P11 · Menu-bar app
 
-A Tauri 2 shell around the P8 UI: tray icon, native notifications, login item, answering a gate from the app.
+A Tauri 2 shell around the P8 UI: tray icon, native notifications, login item, answering a gate from the app with the UI's own reply form (P8).
 
 **Exit gate.** The app replaces the terminal for daily use on macOS and Windows.
 
