@@ -2283,12 +2283,12 @@ The tasks are the parts above, OWL-433 to OWL-441 and OWL-161, in the Linear pro
 
 What the run showed:
 
-- `owlshift status` lists only the steps the service runs: LOC-1035's Build, from the maintainer's `continue` in a terminal, ran while `status` said "Steps under way: none", and the served watch logged "Another `owlshift do`, `continue` or `watch` is working LOC-1035" at each pass, 263 times.
-- `owlshift status` says nothing of a quarantine: the project's line showed no word of it from 20:24 to 20:43 on 2026-10-30; the tickets' WAITING comments and the notification did.
-- A drain lasts as long as the step under way, its inner loops included: 15 minutes for the stop of 2026-10-28; 14 for the upgrade, in which LOC-1037's design review loop started two more runs.
-- A run in a dark wake without the network fails the project gate and spends an attempt (LOC-1036, 2.94 USD).
-- A watch the daemon starts before the network is up ends at once, and only the daemon's restart brings it back.
-- `status --waits` still showed LOC-1025 holding `backend/leases` in front of seven ready tickets on 2026-10-30, its last pull request merged on 2026-10-28; not looked into during the gate.
+- `owlshift status` lists only the steps the service runs: LOC-1035's Build, from the maintainer's `continue` in a terminal, ran while `status` said "Steps under way: none", and the served watch logged "Another `owlshift do`, `continue` or `watch` is working LOC-1035" at each pass, 263 times (OWL-478).
+- `owlshift status` says nothing of a quarantine: the project's line showed no word of it from 20:24 to 20:43 on 2026-10-30; the tickets' WAITING comments and the notification did (OWL-478).
+- A drain lasts as long as the step under way, its inner loops included: 15 minutes for the stop of 2026-10-28; 14 for the upgrade, in which LOC-1037's design review loop started two more runs; `status` does not say what a drain waits for (OWL-481).
+- A run in a dark wake without the network fails the project gate and spends an attempt (LOC-1036, 2.94 USD; OWL-480).
+- A watch the daemon starts before the network is up ends at once, and only the daemon's restart brings it back (OWL-479).
+- `status --waits` still showed LOC-1025 holding `backend/leases` in front of seven ready tickets on 2026-10-30, its last pull request merged on 2026-10-28; not looked into during the gate (OWL-477).
 - Codex was at its usage limit for most of the run: its reviewer was dropped 40 times.
 
 ## P8 · Local web UI
