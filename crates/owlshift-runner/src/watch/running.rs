@@ -137,7 +137,7 @@ impl Watch<'_> {
                 sink,
             );
             if let step::Stepped::Ran(outcome) = &stepped
-                && step::reported(&envelope.step, outcome)
+                && step::told(on_demand.dirs, &envelope, outcome)
             {
                 continued(&ticket, outcome, sink);
             }

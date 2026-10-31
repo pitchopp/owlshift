@@ -214,8 +214,10 @@ impl MachineSlots {
     }
 }
 
-/// Removes a holder record left by a dead holder, if there is one.
-fn remove_stale(record: &Path) {
+/// Removes a holder record left by a dead holder, if there is one. A
+/// ticket lock's holder record is removed so too (OWL-478,
+/// `ProjectDirs::ticket_lock`).
+pub(crate) fn remove_stale(record: &Path) {
     if record.exists() {
         let _ = fs::remove_file(record);
     }
