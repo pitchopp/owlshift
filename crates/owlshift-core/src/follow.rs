@@ -9,7 +9,7 @@
 
 use std::time::Duration;
 
-use crate::floor::MergeGrant;
+use crate::floor::{FloorCategory, MergeGrant, names_floor_category};
 use crate::gate::{GatePolicy, Route};
 use crate::vocab::{MergeMethod, MergeSwitch};
 
@@ -364,6 +364,30 @@ pub struct FirstGreen<'a> {
     pub ago: Duration,
 }
 
+/// Who settled a question of the ticket, as [`merge_due`] reads it
+/// (OWL-465, architecture section 5, "Merge on green", "No question left for
+/// a person").
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Settled {
+    /// Its decider: the latest verdict an answer check kept on it, on an ask
+    /// of its round, is `answered`, a thumbs-up's included.
+    Decider,
+    /// No person: a decision kept without its decider, the resolver's or the
+    /// asking run's recommendation the runner took at a chain's bound,
+    /// reversed by the decider or not.
+    Resolver,
+    /// Asked, and no kept verdict says its decider answered it.
+    Open,
+}
+
+/// A question of the ticket as [`merge_due`] reads it: the category it was
+/// asked under and who settled it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MergeQuestion {
+    pub category: String,
+    pub settled: Settled,
+}
+
 /// What the runner read for [`merge_due`] at a watch pass. The pass's own
 /// conditions are the runner's to hold before it asks: the ticket is at
 /// Watch, no round waits, it is not parked, the project is not quarantined,
@@ -388,9 +412,9 @@ pub struct MergeFacts<'a> {
     /// Whether the ticket carries the project's `[tracker].exclude` label: a
     /// ticket kept out is never merged, label or not.
     pub excluded: bool,
-    /// The categories the ticket's questions were asked under, the
-    /// resolver's labels among them when the runner counts them.
-    pub categories: &'a [String],
+    /// The ticket's questions: every ask's, under the asking run's
+    /// category, then every decision kept without its decider.
+    pub questions: &'a [MergeQuestion],
     /// Whether the ticket's stage is still one the project maps for review.
     pub at_review: bool,
     /// Whether the pull request is a draft.
@@ -414,9 +438,16 @@ pub enum MergeBlocker {
     Unlabeled,
     /// A person moved the ticket out of the review stage.
     StageMoved,
-    /// A question of the ticket was asked under this category, which the
-    /// project sends to a human.
-    HumanCategory(String),
+    /// A question of the ticket was asked under this category, which names
+    /// `security`: a person merges it, whatever the answer.
+    Security(String),
+    /// A question of the ticket under this category, which the project
+    /// sends to a human, has no answer of its decider on record.
+    Unanswered(String),
+    /// A question of the ticket under this category, which the project
+    /// sends to a human, was settled by a decision kept without its
+    /// decider.
+    ResolverDecided(String),
     /// The pull request is a draft.
     Draft,
     /// Something is due or running first.
@@ -491,12 +522,8 @@ fn blocker(policy: &MergePolicy<'_>, facts: &MergeFacts<'_>, read: &Read) -> Opt
     if !facts.at_review {
         return Some(MergeBlocker::StageMoved);
     }
-    if let Some(category) = facts
-        .categories
-        .iter()
-        .find(|category| policy.gate.route(category) == Route::Human)
-    {
-        return Some(MergeBlocker::HumanCategory(category.clone()));
+    if let Some(blocker) = question_held(policy.gate, facts.questions) {
+        return Some(blocker);
     }
     if facts.draft {
         return Some(MergeBlocker::Draft);
@@ -516,6 +543,28 @@ fn blocker(policy: &MergePolicy<'_>, facts: &MergeFacts<'_>, read: &Read) -> Opt
         return Some(MergeBlocker::GreenOnce);
     }
     None
+}
+
+/// The question that keeps the ticket for a person, if one does (OWL-465):
+/// among those under a category the project sends to a human, one under
+/// `security` first, whatever the answer, since no answer lifts it; else the
+/// first, in the order given, that its decider did not answer. A question its
+/// decider answered holds nothing.
+fn question_held(gate: &GatePolicy, questions: &[MergeQuestion]) -> Option<MergeBlocker> {
+    let mut human = questions
+        .iter()
+        .filter(|question| gate.route(&question.category) == Route::Human);
+    if let Some(question) = human
+        .clone()
+        .find(|question| names_floor_category(&question.category, FloorCategory::Security))
+    {
+        return Some(MergeBlocker::Security(question.category.clone()));
+    }
+    human.find_map(|question| match question.settled {
+        Settled::Decider => None,
+        Settled::Resolver => Some(MergeBlocker::ResolverDecided(question.category.clone())),
+        Settled::Open => Some(MergeBlocker::Unanswered(question.category.clone())),
+    })
 }
 
 /// The forge's review decision for a pull request (GitHub's
@@ -918,9 +967,16 @@ mod tests {
             }
         }
 
+        fn question(category: &str, settled: Settled) -> MergeQuestion {
+            MergeQuestion {
+                category: category.to_owned(),
+                settled,
+            }
+        }
+
         /// Every condition met: `labeled` with the label, a minute between
         /// the green reads.
-        fn facts<'a>(decision: &'a Decision, categories: &'a [String]) -> MergeFacts<'a> {
+        fn facts<'a>(decision: &'a Decision, questions: &'a [MergeQuestion]) -> MergeFacts<'a> {
             MergeFacts {
                 decision,
                 pushed: HEAD,
@@ -932,7 +988,7 @@ mod tests {
                 base_at_push: Some(BASE),
                 labeled: true,
                 excluded: false,
-                categories,
+                questions,
                 at_review: true,
                 draft: false,
                 something_due: false,
@@ -956,7 +1012,7 @@ mod tests {
         #[test]
         fn all_conditions_met_merge_at_the_pushed_head_with_the_method() {
             let gate = gate(DelegationLevel::Discoverable);
-            let asked = ["naming".to_owned()];
+            let asked = [question("naming", Settled::Open)];
             for switch in [MergeSwitch::Labeled, MergeSwitch::All] {
                 let MergeDue::Merge(grant) =
                     due(switch, &gate, &facts(&GREEN, &asked), &green_read())
@@ -991,8 +1047,8 @@ mod tests {
                 action: Action::WaitChecks,
             };
             let ended = Decision::End(EndReason::Merged);
-            let human = ["Possible security issue".to_owned()];
-            let added = ["billing_change".to_owned()];
+            let human = [question("Possible security issue", Settled::Decider)];
+            let added = [question("billing_change", Settled::Open)];
             let base = facts(&GREEN, &[]);
             let mut moved_head = green_read();
             moved_head.head = other.to_owned();
@@ -1046,13 +1102,13 @@ mod tests {
                     MergeSwitch::All,
                     facts(&GREEN, &human),
                     green_read(),
-                    HumanCategory(human[0].clone()),
+                    Security(human[0].category.clone()),
                 ),
                 (
                     MergeSwitch::All,
                     facts(&GREEN, &added),
                     green_read(),
-                    HumanCategory(added[0].clone()),
+                    Unanswered(added[0].category.clone()),
                 ),
                 (
                     MergeSwitch::All,
@@ -1249,35 +1305,110 @@ mod tests {
             }
         }
 
-        /// A category blocks when the project sends it to a human: the
-        /// level's set, the project's additions, and every one at `none`.
+        /// A question its decider did not answer blocks when the project
+        /// sends its category to a human: the level's set, the project's
+        /// additions, and every one at `none`; once answered it does not.
         #[test]
         fn a_human_category_follows_the_projects_level() {
-            let scope = ["scope change".to_owned()];
-            let testing = ["testing".to_owned()];
-            let blank = [String::new()];
-            let blocks = |level, categories: &[String]| {
+            let blocks = |level, category: &str, settled| {
+                let questions = [question(category, settled)];
                 matches!(
                     due(
                         MergeSwitch::All,
                         &gate(level),
-                        &facts(&GREEN, categories),
+                        &facts(&GREEN, &questions),
                         &green_read()
                     ),
-                    MergeDue::Wait(MergeBlocker::HumanCategory(_))
+                    MergeDue::Wait(MergeBlocker::Unanswered(_))
                 )
             };
-            assert!(blocks(DelegationLevel::Discoverable, &scope));
-            assert!(!blocks(DelegationLevel::Ticket, &scope));
-            assert!(!blocks(DelegationLevel::All, &testing));
-            assert!(!blocks(DelegationLevel::Discoverable, &blank));
-            assert!(blocks(DelegationLevel::None, &testing));
-            assert!(blocks(DelegationLevel::None, &blank));
+            let open = Settled::Open;
+            assert!(blocks(DelegationLevel::Discoverable, "scope change", open));
+            assert!(!blocks(DelegationLevel::Ticket, "scope change", open));
+            assert!(!blocks(DelegationLevel::All, "testing", open));
+            assert!(!blocks(DelegationLevel::Discoverable, "", open));
+            assert!(blocks(DelegationLevel::None, "testing", open));
+            assert!(blocks(DelegationLevel::None, "", open));
+            // At `none` every category is a person's, and their answer lifts it.
+            assert!(!blocks(DelegationLevel::None, "testing", Settled::Decider));
+            assert!(!blocks(DelegationLevel::None, "", Settled::Decider));
             // Whole-word tokens: `scoped` names no category.
-            assert!(!blocks(
-                DelegationLevel::Discoverable,
-                &["scoped".to_owned()]
+            assert!(!blocks(DelegationLevel::Discoverable, "scoped", open));
+        }
+
+        /// Who settled a question under a human category decides whether it
+        /// holds (OWL-465): `security` whatever the answer; the floor's
+        /// `irreversible`, a category the level keeps and one the project
+        /// added until their decider answers them; a category the resolver
+        /// may decide never.
+        #[test]
+        fn who_settled_a_human_question_decides_whether_it_holds() {
+            use MergeBlocker::*;
+            use Settled::*;
+            let gate = gate(DelegationLevel::Discoverable);
+            let held = |category: &str| {
+                [
+                    Some(Security(category.to_owned())),
+                    Some(Security(category.to_owned())),
+                    Some(Security(category.to_owned())),
+                ]
+            };
+            let lifted_once_answered = |category: &str| {
+                [
+                    None,
+                    Some(ResolverDecided(category.to_owned())),
+                    Some(Unanswered(category.to_owned())),
+                ]
+            };
+            let cases = [
+                ("security", held("security")),
+                ("irreversible", lifted_once_answered("irreversible")),
+                ("money", lifted_once_answered("money")),
+                ("billing", lifted_once_answered("billing")),
+                ("naming", [None, None, None]),
+            ];
+            for (category, expected) in cases {
+                for (settled, expected) in [Decider, Resolver, Open].into_iter().zip(expected) {
+                    let questions = [question(category, settled)];
+                    let got = due(
+                        MergeSwitch::All,
+                        &gate,
+                        &facts(&GREEN, &questions),
+                        &green_read(),
+                    );
+                    let want = expected.map_or_else(
+                        || MergeDue::Merge(MergeGrant::new(HEAD, MergeMethod::Rebase)),
+                        MergeDue::Wait,
+                    );
+                    assert_eq!(got, want, "{category} {settled:?}");
+                }
+            }
+            // LOC-1037: its `irreversible` question answered, a decision on
+            // another topic: merged.
+            let loc_1037 = [
+                question("naming", Resolver),
+                question("irreversible", Decider),
+            ];
+            assert!(matches!(
+                due(
+                    MergeSwitch::All,
+                    &gate,
+                    &facts(&GREEN, &loc_1037),
+                    &green_read()
+                ),
+                MergeDue::Merge(_)
             ));
+            // A `security` hold, which no answer lifts, is told first.
+            let both = [question("money", Open), question("security", Decider)];
+            assert_eq!(
+                due(
+                    MergeSwitch::All,
+                    &gate,
+                    &facts(&GREEN, &both),
+                    &green_read()
+                ),
+                MergeDue::Wait(Security("security".to_owned()))
+            );
         }
     }
 }

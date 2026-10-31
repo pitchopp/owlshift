@@ -64,8 +64,8 @@ fn assert_ended_merged(bench: &Bench) {
 }
 
 /// S18 under `labeled`: no merge without the label, none while its labels
-/// do not read (warned of once), none while a question of the ticket was
-/// asked under a category the project keeps for a person; then, its label
+/// do not read (warned of once), none while a question of the ticket under a
+/// category the project keeps for a person has no answer; then, its label
 /// on and that question gone, one merge at the head Owlshift pushed, by the
 /// project's method, told by a MERGED comment and a `pr_merged` event, and
 /// no notification.
@@ -166,6 +166,82 @@ fn labeled_merges_once_its_label_is_on_and_no_question_is_kept_for_a_person() {
     assert_ended_merged(&bench);
     assert!(bench.notified.0.borrow().is_empty());
     assert!(lines.contains("merged by Owlshift (squash)"), "{lines}");
+}
+
+/// `continue` at Watch says what merge on green makes of the ticket's
+/// questions (OWL-465). LOC-1037's shape, an `irreversible` question its
+/// decider answered, lets watch's next pass merge; a `security` question
+/// answered, an `irreversible` one with no answer on record and a decision
+/// the resolver kept under `money`, which the project's level keeps for a
+/// person, each hold it, said in a person's words.
+#[test]
+fn continue_at_watch_says_which_questions_still_hold_the_merge() {
+    let bench = merging("all");
+    let plain = bench.record();
+    let say = |questions: String| {
+        let mut asked = plain.clone();
+        asked.questions = TicketQuestions::parse(&questions).unwrap();
+        bench.write_record(&asked);
+        let (outcome, printed) = bench.continue_ticket(Vec::new());
+        match &outcome {
+            Err(stop @ Stop::Watched { .. }) => stop.to_string(),
+            other => panic!("{other:?}\n{printed}"),
+        }
+    };
+    let asked = |category: &str, verdicts: &str| {
+        r#"{"format":17,"asks":[{"kind":"questions","round":1,"at":"2026-10-02T09:00:00Z",
+        "comment":"c1","decider":{"account":"maintainer","by":"assignee"},"questions":[
+        {"id":"Q1","category":"CATEGORY","context":"The letter is legally binding.",
+        "text":"Send it from the sandbox only, or for real now?","options":[
+        {"label":"Sandbox only"},{"label":"Prod-ready now"}],
+        "recommendation":{"option":"A","why":"Nothing leaves the sandbox."}}]VERDICTS}]}"#
+            .replace("CATEGORY", category)
+            .replace("VERDICTS", verdicts)
+    };
+    let answered = r#","verdicts":[{"question":"Q1","class":"answered","reason":"Sandbox only."}]"#;
+    let held = |words: &str| {
+        format!(
+            "`continue` never merges, and the next pass of `owlshift watch` would not merge it: \
+             a question of the ticket {words}."
+        )
+    };
+    let cases = [
+        (
+            asked("irreversible", answered),
+            "`continue` never merges: the next pass of `owlshift watch` would merge it, once its \
+             read is green again (merge on green)."
+                .to_owned(),
+        ),
+        (
+            asked("security", answered),
+            held(
+                "was asked under `security`, and a person merges a security question whatever \
+                 the answer",
+            ),
+        ),
+        (
+            asked("irreversible", ""),
+            held(
+                "under `irreversible`, a category the project keeps for a person, has no answer \
+                 of its decider on record",
+            ),
+        ),
+        (
+            r#"{"format":17,"decisions":[{"at":"2026-10-02T09:00:00Z","comment":"c2",
+            "question":{"id":"Q1","category":"money","context":"c","text":"t","options":[]},
+            "decision":"d","basis":"b"}]}"#
+                .to_owned(),
+            held(
+                "under `money`, a category the project keeps for a person, was decided by the \
+                 resolver rather than answered by its decider",
+            ),
+        ),
+    ];
+    for (questions, expected) in cases {
+        let said = say(questions);
+        assert!(said.ends_with(&expected), "{said}\nexpected: {expected}");
+    }
+    assert!(github_merges(&bench).is_empty());
 }
 
 /// The rebase run of a refresh: the delivered branch replayed onto `onto`,

@@ -177,5 +177,5 @@ The scanner sees the admitted ticket; intake finds no question and records resou
 
 - Off by default. `[forge] merge` in the project file turns it on for every ticket (`all`) or for tickets carrying the label `owlshift:merge` (`labeled`), read at the base branch's head, so no ticket's own branch can turn it on.
 - The runner merges, never an agent, through the forge with the head it last pushed as the expected head: a push by anyone in between makes the merge fail.
-- It merges only after two green reads of the same head on the same base, with nothing due first (a correction, a review, a reply, the delivery report), the ticket still in review on the tracker, not a draft, and no question asked under a category the project keeps for a human.
+- It merges only after two green reads of the same head on the same base, with nothing due first (a correction, a review, a reply, the delivery report), the ticket still in review on the tracker, not a draft, and no question left for a human: none asked under `security`, and none under another category the project keeps for a human that its decider's answer did not settle.
 - A refusal GitHub will not lift (a required review, a forbidden method, a missing permission) notifies me once, and Owlshift does not try that head again; a successful merge notifies no one and is said on the ticket.

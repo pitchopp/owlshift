@@ -3,9 +3,9 @@
 //! Watch share. The decisions are `owlshift_core::follow`'s, `merge_due` and
 //! `confirm_merge`; the merge itself is the Writer's
 //! ([`Writer::merge_pull_request`]), behind the floor's grant. Here: the
-//! project's switch read at a commit of the base branch, the categories the
-//! ticket's questions were asked under, the MERGED comment, the events and
-//! the one notification a final refusal gives.
+//! project's switch read at a commit of the base branch, the ticket's
+//! questions with who settled each (OWL-465), the MERGED comment, the events
+//! and the one notification a final refusal gives.
 
 use serde_json::json;
 
@@ -13,9 +13,10 @@ use owlshift_adapters::forge::CommitId;
 use owlshift_contracts::event::EventKind;
 use owlshift_contracts::ids::TicketId;
 use owlshift_contracts::refs::{DeliveredPullRequest, Merging, TicketDelivery, TicketQuestions};
-use owlshift_core::follow::MergeBlocker;
-use owlshift_core::vocab::MergeSwitch;
+use owlshift_core::follow::{MergeBlocker, MergeQuestion, Settled};
+use owlshift_core::vocab::{AnswerClass, MergeSwitch};
 
+use crate::answer_check;
 use crate::events::{Data, EventSink, data};
 use crate::follow::Switch;
 use crate::notify;
@@ -23,26 +24,37 @@ use crate::on_demand::OnDemand;
 use crate::project::{self, Base};
 use crate::writer::{MergedComment, Writer};
 
-/// The categories the ticket's questions were asked under: every ask's, the
-/// resolver's decisions' among them, each once, in the order first asked.
-pub(crate) fn categories(questions: &TicketQuestions) -> Vec<String> {
-    let mut categories: Vec<String> = Vec::new();
-    let asked = questions
-        .asks
-        .iter()
-        .flat_map(|ask| ask.questions.iter())
-        .chain(
-            questions
-                .decisions
-                .iter()
-                .map(|decision| &decision.question),
-        );
-    for question in asked {
-        if !categories.contains(&question.category) {
-            categories.push(question.category.clone());
+/// The ticket's questions as merge on green reads them (OWL-465): every
+/// round's, in order, under the category it was asked under, settled by its
+/// decider when the latest verdict an answer check kept on it is
+/// `answered` ([`answer_check::understood`], what a RESUME restates), a
+/// thumbs-up's included; then every kept decision's, settled by no person.
+/// A category may come more than once, settled differently: each entry
+/// counts on its own.
+pub(crate) fn questions(questions: &TicketQuestions) -> Vec<MergeQuestion> {
+    let mut rounds = Vec::new();
+    for ask in &questions.asks {
+        if !rounds.contains(&ask.round) {
+            rounds.push(ask.round);
         }
     }
-    categories
+    let asked = rounds.into_iter().flat_map(|round| {
+        answer_check::understood(questions.round_asks(round))
+            .into_iter()
+            .map(|(question, verdict)| MergeQuestion {
+                category: question.category,
+                settled: if verdict.is_some_and(|verdict| verdict.class == AnswerClass::Answered) {
+                    Settled::Decider
+                } else {
+                    Settled::Open
+                },
+            })
+    });
+    let decided = questions.decisions.iter().map(|decision| MergeQuestion {
+        category: decision.question.category.clone(),
+        settled: Settled::Resolver,
+    });
+    asked.chain(decided).collect()
 }
 
 /// The base `commit` of `branch` as [`project::forge_merge_at`] reads it.
@@ -220,9 +232,17 @@ pub(crate) fn blocker_words(blocker: &MergeBlocker) -> String {
         MergeBlocker::StageMoved => {
             "the ticket is no longer in the project's review state on the tracker".to_owned()
         }
-        MergeBlocker::HumanCategory(category) => format!(
-            "a question of the ticket was asked under `{category}`, a category the project \
-             keeps for a person"
+        MergeBlocker::Security(category) => format!(
+            "a question of the ticket was asked under `{category}`, and a person merges a \
+             security question whatever the answer"
+        ),
+        MergeBlocker::Unanswered(category) => format!(
+            "a question of the ticket under `{category}`, a category the project keeps for a \
+             person, has no answer of its decider on record"
+        ),
+        MergeBlocker::ResolverDecided(category) => format!(
+            "a question of the ticket under `{category}`, a category the project keeps for a \
+             person, was decided by the resolver rather than answered by its decider"
         ),
         MergeBlocker::Draft => "the pull request is a draft".to_owned(),
         MergeBlocker::SomethingDue => {
@@ -249,21 +269,49 @@ pub(crate) fn blocker_words(blocker: &MergeBlocker) -> String {
 mod tests {
     use super::*;
 
-    /// Every ask's categories and the resolver's decisions', each once.
+    /// Each round's questions with their latest verdict, a re-ask's and a
+    /// thumbs-up's included and a later round's never borrowing an earlier
+    /// one's, then the resolver's decisions.
     #[test]
-    fn the_categories_are_every_question_asked_once() {
-        let questions = TicketQuestions::parse(
+    fn the_questions_say_who_settled_each() {
+        let mut questions = TicketQuestions::parse(
             r#"{"format":17,"asks":[{"kind":"questions","round":1,"at":"2026-10-24T09:00:00Z",
             "comment":"c1","decider":{"account":"ada","by":"assignee"},"questions":[
-            {"id":"Q1","category":"scope","context":"c","text":"t","options":[]},
-            {"id":"Q2","category":"billing","context":"c","text":"t","options":[]},
-            {"id":"Q3","category":"scope","context":"c","text":"t","options":[]}]}],
-            "decisions":[{"at":"2026-10-24T09:00:00Z","comment":"c2","question":
+            {"id":"Q1","category":"irreversible","context":"c","text":"t","options":[]},
+            {"id":"Q2","category":"scope","context":"c","text":"t","options":[]}],
+            "verdicts":[{"question":"Q1","class":"answered","reason":"r"},
+            {"question":"Q2","class":"partial","reason":"r"}]},
+            {"kind":"reask","round":1,"at":"2026-10-24T10:00:00Z","comment":"c2",
+            "decider":{"account":"ada","by":"assignee"},"questions":[
+            {"id":"Q2","category":"scope","context":"c","text":"t","options":[]}],
+            "verdicts":[{"question":"Q2","class":"answered","reason":"r"}]},
+            {"kind":"questions","round":2,"at":"2026-10-24T11:00:00Z","comment":"c3",
+            "decider":{"account":"ada","by":"assignee"},"questions":[
+            {"id":"Q1","category":"money","context":"c","text":"t","options":[]}]},
+            {"kind":"questions","round":3,"at":"2026-10-24T12:00:00Z","comment":"c4",
+            "decider":{"account":"ada","by":"assignee"},"questions":[
+            {"id":"Q1","category":"legal","context":"c","text":"t","options":[]}]}],
+            "decisions":[{"at":"2026-10-24T09:00:00Z","comment":"c5","question":
             {"id":"Q1","category":"naming","context":"c","text":"t","options":[]},
             "decision":"d","basis":"b"}]}"#,
         )
         .unwrap();
-        assert_eq!(categories(&questions), ["scope", "billing", "naming"]);
-        assert!(categories(&TicketQuestions::new()).is_empty());
+        let legal = &mut questions.asks[3];
+        legal.verdicts = answer_check::thumbs_up_verdicts(&legal.questions);
+        let settled = |category: &str, settled| MergeQuestion {
+            category: category.to_owned(),
+            settled,
+        };
+        assert_eq!(
+            super::questions(&questions),
+            [
+                settled("irreversible", Settled::Decider),
+                settled("scope", Settled::Decider),
+                settled("money", Settled::Open),
+                settled("legal", Settled::Decider),
+                settled("naming", Settled::Resolver),
+            ]
+        );
+        assert!(super::questions(&TicketQuestions::new()).is_empty());
     }
 }
