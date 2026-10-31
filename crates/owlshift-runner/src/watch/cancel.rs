@@ -14,9 +14,13 @@
 //! - *Waiting:* a ticket whose step runs, whose ref moved or does not read,
 //!   which another command holds, or whose park was refused, keeps its
 //!   file for a later pass, a refusal warned of once while it lasts.
+//! - *Held:* a park whose state was not kept, its PARKED comment posted,
+//!   removes the file and holds the ticket until its ref moves, as a
+//!   continue's does (OWL-158): nothing of it runs, nor is it parked again.
 //!
-//! Every ticket a cancel stands on is left alone for the rest of the pass,
-//! as one whose step's child runs. Only files named `cancel` in the
+//! Every ticket a cancel stands on, or a park not kept holds, is left alone
+//! for the rest of the pass, as one whose step's child runs. Only files
+//! named `cancel` in the
 //! tickets' folders are read or removed: those folders hold other files.
 //!
 //! [`OnDemand::cancel_seen`]: crate::on_demand::OnDemand::cancel_seen
