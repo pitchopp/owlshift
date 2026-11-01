@@ -141,6 +141,9 @@ fn waiting(event: &Event, ticket: &TicketId) -> Option<Waiting> {
         "usage_limit".to_owned()
     } else if says("base") {
         "base_broken".to_owned()
+    } else if says("gate") {
+        // A red gate the machine cut (OWL-480).
+        "machine_cut".to_owned()
     } else if event.data.get("drain").and_then(Value::as_str) == Some("pr_cap") {
         // The drain tells the cap once, for the first ticket it holds
         // (`tell_cap`), with the counts and no `waits`.
@@ -274,6 +277,17 @@ pub fn phrase(wait: &Waiting) -> String {
                     base::short(commit)
                 )
             }
+        }
+        "machine_cut" => {
+            let why = if data.get("tracker").and_then(Value::as_str) == Some("unreachable") {
+                "the tracker gave no answer right after it"
+            } else {
+                "the machine slept while it ran"
+            };
+            format!(
+                "its gate failed and {why}, so nothing was counted: its gate alone runs again \
+                 at its next step"
+            )
         }
         other => other.replace('_', " "),
     }
@@ -1013,6 +1027,25 @@ mod tests {
         let folded = fold(&[held(true)], "o/r");
         let wait = &folded.current[&TicketId::new("OWL-1").unwrap()];
         assert!(phrase(wait).contains("is checked once no other ticket's step runs"));
+        // OWL-480: a red gate the machine cut is a wait of its own.
+        let cut = waits(
+            "2026-10-29T08:01:22Z",
+            "OWL-1",
+            data([
+                ("gate", json!("waits")),
+                ("reason", json!("machine_cut")),
+                ("command", json!("sh ci/owlshift/gate.sh test")),
+                ("slept_ms", json!(0)),
+                ("tracker", json!("unreachable")),
+            ]),
+        );
+        let folded = fold(&[cut], "o/r");
+        let wait = &folded.current[&TicketId::new("OWL-1").unwrap()];
+        assert_eq!(
+            phrase(wait),
+            "its gate failed and the tracker gave no answer right after it, so nothing was \
+             counted: its gate alone runs again at its next step"
+        );
 
         let failing = Failing {
             step: Step::Setup,

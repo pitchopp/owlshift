@@ -153,7 +153,7 @@ impl Status {
 /// | A Build run's (at Build, or a fix run's at Watch) gate was refused for uncommitted changes before any command ran, and the run had not been told of such a refusal: the next run will be | `UncommittedGate` |
 /// | A Build run's at Build (a Verify fix run included) gate or setup failed on a command that the commit it was configured at fails too, or that commit's check is due; or a Build run at Build was held before it started for such a commit (OWL-418, [`crate::base`]) | `BaseBroken` |
 /// | A rebase run off a held commit, at Build, ended without a rebase the runner accepts (OWL-427, [`crate::base::leave`]) | `RebaseFailed` |
-/// | A run was cut off by a harness usage limit; it resumes after the reset | `Interrupted` |
+/// | A run was cut off by a harness usage limit; it resumes after the reset. A Build run's at Build gate failed on a command while the machine slept through it, or the tracker gave no answer right after it: the machine cut it, and its gate alone runs again (OWL-480) | `Interrupted` |
 /// | A run broke isolation (main checkout touched, diff outside the worktree, wrong branch) | `Quarantined` |
 /// | A run is due while the ticket's runs since its last restart cost its budget or more (`policy.ticket_budget_usd`, OWL-378): none starts | `BudgetReached` |
 /// | At Watch, a fix run's push landed on the pull request | `FixPushed` |

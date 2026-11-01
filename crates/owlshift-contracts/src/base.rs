@@ -238,9 +238,10 @@ impl From<KeptStep> for Step {
     }
 }
 
-/// A ticket's gate or setup failure waiting for its base, valid while the
-/// ticket is at Build in `round`, configured at `configured_at` with
-/// `commands`, on the branch head `head`.
+/// A ticket's gate or setup failure waiting for its base, or a red gate the
+/// machine cut (OWL-480) waiting for its next run, valid while the ticket is
+/// at Build in `round`, configured at `configured_at` with `commands`, on
+/// the branch head `head`.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 #[schemars(title = "Owlshift base wait")]
@@ -254,7 +255,12 @@ pub struct BaseWait {
     pub round: u32,
     /// The branch's head the failure was found on, a full commit id.
     pub head: String,
-    pub failing: KeptFailing,
+    /// The command a base check owes a verdict on; none for a red gate the
+    /// machine cut, which no check owes one (OWL-480). An Owlshift from
+    /// before OWL-480 does not read a wait without it, and runs the Build
+    /// again.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failing: Option<KeptFailing>,
     /// A done Build's, whose gate alone runs again once the base passes;
     /// none for a failure before the harness.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -335,6 +341,37 @@ mod tests {
         assert_eq!(ProjectBase::parse(&text).unwrap().checks(), checks);
         assert!(text.contains("\"state\": \"pending\""), "{text}");
         assert!(text.contains("\"verdict\": \"failed\""), "{text}");
+    }
+
+    /// OWL-480: a wait the machine's cut left keeps no failure, and an
+    /// OWL-418 wait still reads with its own.
+    #[test]
+    fn a_cut_wait_keeps_no_failure() {
+        let wait = BaseWait {
+            format: Format,
+            ticket: TicketId::new("OWL-1").unwrap(),
+            configured_at: "c".repeat(40),
+            commands: "k".to_owned(),
+            round: 2,
+            head: "h".repeat(40),
+            failing: None,
+            done: None,
+        };
+        let text = wait.render();
+        assert!(!text.contains("failing"), "{text}");
+        assert_eq!(BaseWait::parse(&text).unwrap(), wait);
+        let held = text.replacen(
+            "\"head\"",
+            r#""failing": {"step": "gate", "command": "make test"}, "head""#,
+            1,
+        );
+        assert_eq!(
+            BaseWait::parse(&held).unwrap().failing,
+            Some(KeptFailing {
+                step: KeptStep::Gate,
+                command: "make test".to_owned()
+            })
+        );
     }
 
     #[test]

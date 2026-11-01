@@ -60,7 +60,7 @@ use std::path::{Path, PathBuf};
 use std::process::{ExitStatus, Stdio};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, mpsc};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use owlshift_contracts::brief::GateFailure;
 use sha2::{Digest, Sha256};
@@ -101,6 +101,38 @@ pub const SETUP_LOG: &str = "setup.log";
 
 /// The start of the reason of a setup command's failure.
 pub const SETUP_PREFIX: &str = "setup: ";
+
+/// The sleep beyond which a gate ran across one (OWL-480): its span by the
+/// system clock longer than its span awake by more than this. A clock moved
+/// forward by as much reads the same.
+pub const SLEEP_BOUND: Duration = Duration::from_secs(10);
+
+/// A span read on both clocks: [`Instant`], which counts no sleep on macOS
+/// and Linux (build plan, L6) though it does on Windows, and the system
+/// clock, which counts it (OWL-480).
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Span {
+    awake: Instant,
+    wall: SystemTime,
+}
+
+impl Span {
+    pub(crate) fn start() -> Self {
+        Self {
+            awake: Instant::now(),
+            wall: SystemTime::now(),
+        }
+    }
+
+    /// How much longer the span has lasted by the system clock than awake:
+    /// the time the machine slept in it; zero when the clock was set back.
+    pub(crate) fn slept(&self) -> Duration {
+        let awake = self.awake.elapsed();
+        self.wall
+            .elapsed()
+            .map_or(Duration::ZERO, |wall| wall.saturating_sub(awake))
+    }
+}
 
 /// Whose a failed command's failure is (OWL-330): internal, never written
 /// into a brief or a report.
@@ -171,11 +203,22 @@ pub struct GateReport {
     /// could not write, an output a process kept open), so no base check
     /// may take it for the project's (OWL-418).
     pub runner_fault: bool,
+    /// The time the machine slept while the gate ran, its setup included
+    /// (OWL-480): how much longer its span lasted by the system clock than
+    /// by [`Instant`], zero when the clock was set back. Never any on
+    /// Windows, where `Instant` counts a sleep too.
+    pub slept: Duration,
 }
 
 impl GateReport {
     pub fn passed(&self) -> bool {
         self.failure.is_none() && self.breach.is_empty()
+    }
+
+    /// Whether the machine slept longer than [`SLEEP_BOUND`] while the gate
+    /// ran: a red gate then is the machine's (OWL-480).
+    pub fn slept_through(&self) -> bool {
+        self.slept > SLEEP_BOUND
     }
 }
 
@@ -232,6 +275,7 @@ pub(crate) fn run(
     log_path: &Path,
     guard: Guard<'_>,
 ) -> GateReport {
+    let span = Span::start();
     let deadline = Instant::now() + timeout;
     let git = git.as_agent(agent);
     let mut report = empty_report(commands, log_path);
@@ -249,6 +293,7 @@ pub(crate) fn run(
         Err(Stop::Failed(failure)) => report.failure = Some(failure),
         Err(Stop::Breach(violations)) => breached(&mut report, violations),
     }
+    report.slept = span.slept();
     report
 }
 
@@ -264,6 +309,7 @@ fn empty_report(commands: &[String], log_path: &Path) -> GateReport {
         steps: Vec::new(),
         setup: Vec::new(),
         runner_fault: false,
+        slept: Duration::ZERO,
     }
 }
 
@@ -1252,6 +1298,42 @@ mod tests {
     use std::process::Command;
 
     use super::*;
+
+    /// OWL-480: a span reads as slept by what the system clock counts past
+    /// the awake clock: a system clock read an hour earlier is an hour
+    /// asleep, one ahead of now, set back since, is none, and one read now
+    /// is below the bound. A gate slept through past the bound only.
+    #[test]
+    fn a_span_slept_by_what_the_system_clock_counts_beyond_awake() {
+        let hour = Duration::from_secs(3600);
+        let span = |wall: SystemTime| Span {
+            awake: Instant::now(),
+            wall,
+        };
+        // The system clock's window opens before the awake one and closes
+        // after it, so the reading is an hour give or take their reads.
+        let slept = span(SystemTime::now() - hour).slept();
+        assert!(
+            slept > hour - SLEEP_BOUND && slept < hour + SLEEP_BOUND,
+            "{slept:?}"
+        );
+        assert_eq!(span(SystemTime::now() + hour).slept(), Duration::ZERO);
+        assert!(span(SystemTime::now()).slept() < SLEEP_BOUND);
+
+        let dir = tempfile::tempdir().unwrap();
+        let report = GateReport {
+            slept: SLEEP_BOUND,
+            ..empty_report(&[], &dir.path().join(GATE_LOG))
+        };
+        assert!(!report.slept_through());
+        assert!(
+            GateReport {
+                slept: SLEEP_BOUND + Duration::from_millis(1),
+                ..report
+            }
+            .slept_through()
+        );
+    }
 
     /// The agent environment of these tests, bare: they check the gate's own
     /// rules; the sandbox's are checked below and in the test bench.
