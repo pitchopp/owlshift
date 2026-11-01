@@ -131,7 +131,7 @@ impl Watch<'_> {
             }
         };
         memory.following.merge_read(ticket);
-        let categories = merge::categories(&current.record.questions);
+        let questions = merge::questions(&current.record.questions);
         let gate = on_demand.config.gate_policy();
         let policy = MergePolicy {
             switch,
@@ -160,7 +160,7 @@ impl Watch<'_> {
                 .exclude
                 .as_ref()
                 .is_some_and(|exclude| labels.contains(exclude)),
-            categories: &categories,
+            questions: &questions,
             at_review: stage == tracker.states.review,
             // Read below when it is the condition that decides: the pass's
             // own read (`FOLLOW_QUERY`, whose text fixtures recorded live
