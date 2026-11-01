@@ -357,6 +357,7 @@ mod tests {
             },
             verdicts: Vec::new(),
             result_refusal: None,
+            labels: Default::default(),
         };
         let questions = TicketQuestions {
             asks: vec![ask],

@@ -26,6 +26,7 @@
 //! `owlshift do` and `owlshift continue` run it ([`crate::on_demand`]); the
 //! test bench's stand-in driver plays the same pieces in the scenarios.
 
+use std::collections::BTreeMap;
 use std::time::Duration;
 
 use owlshift_contracts::BasisKind;
@@ -35,7 +36,7 @@ use owlshift_contracts::refs::KeptDecision;
 use owlshift_contracts::result::{
     Decision, Question, QuestionOption, Resolution, Status, option_letter,
 };
-use owlshift_core::floor::FloorCategory;
+use owlshift_core::floor::{FloorCategory, names_floor_category};
 use owlshift_core::gate::{BudgetReached, ChainEnd, GatePolicy, Route};
 
 use crate::executor::Outcome;
@@ -444,6 +445,38 @@ pub fn left_for_decider(
             (question.id.clone(), renumbered)
         })
         .collect()
+}
+
+/// The resolver's own label for each question of the round `left` (from
+/// [`left_for_decider`]) it decided, under the question's id in the round
+/// (OWL-482): a decision the runner refused, or whose DECISION comment it
+/// could not post, sends its question to the decider, and merge on green
+/// reads the label beside the asking run's category. Of two decisions on one
+/// question, a label naming `security` is kept.
+pub fn round_labels(
+    left: &[(QuestionId, Question)],
+    resolutions: &[Resolution],
+) -> BTreeMap<QuestionId, String> {
+    let security = |label: &str| names_floor_category(label, FloorCategory::Security);
+    let mut labels: BTreeMap<QuestionId, String> = BTreeMap::new();
+    for resolution in resolutions {
+        let Resolution::Decided {
+            question, category, ..
+        } = resolution
+        else {
+            continue;
+        };
+        let Some((_, asked)) = left.iter().find(|(raised, _)| raised == question) else {
+            continue;
+        };
+        match labels.get(&asked.id) {
+            Some(kept) if security(kept) => {}
+            _ => {
+                labels.insert(asked.id.clone(), category.clone());
+            }
+        }
+    }
+    labels
 }
 
 /// The refused choices a round reopens (OWL-203): those of `asked`, under

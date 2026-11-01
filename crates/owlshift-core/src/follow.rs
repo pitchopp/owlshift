@@ -381,10 +381,14 @@ pub enum Settled {
 }
 
 /// A question of the ticket as [`merge_due`] reads it: the category it was
-/// asked under and who settled it.
+/// asked under, the resolver's own label for it when the resolver decided it
+/// and the runner sent it to the decider (OWL-482), and who settled it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MergeQuestion {
     pub category: String,
+    /// Read for the `security` hold alone: the resolver reads the question's
+    /// text, and may see `security` where the asking run did not.
+    pub labelled: Option<String>,
     pub settled: Settled,
 }
 
@@ -413,7 +417,8 @@ pub struct MergeFacts<'a> {
     /// ticket kept out is never merged, label or not.
     pub excluded: bool,
     /// The ticket's questions: every ask's, under the asking run's
-    /// category, then every decision kept without its decider.
+    /// category and with the resolver's label kept on its round's ask, then
+    /// every decision kept without its decider.
     pub questions: &'a [MergeQuestion],
     /// Whether the ticket's stage is still one the project maps for review.
     pub at_review: bool,
@@ -439,7 +444,8 @@ pub enum MergeBlocker {
     /// A person moved the ticket out of the review stage.
     StageMoved,
     /// A question of the ticket was asked under this category, which names
-    /// `security`: a person merges it, whatever the answer.
+    /// `security`, or the resolver labelled it so, the token `security` then
+    /// given: a person merges it, whatever the answer.
     Security(String),
     /// A question of the ticket under this category, which the project
     /// sends to a human, has no answer of its decider on record.
@@ -546,20 +552,29 @@ fn blocker(policy: &MergePolicy<'_>, facts: &MergeFacts<'_>, read: &Read) -> Opt
 }
 
 /// The question that keeps the ticket for a person, if one does (OWL-465):
-/// among those under a category the project sends to a human, one under
-/// `security` first, whatever the answer, since no answer lifts it; else the
-/// first, in the order given, that its decider did not answer. A question its
-/// decider answered holds nothing.
+/// one under `security` first, whatever the answer, since no answer lifts it,
+/// or one the resolver labelled `security` (OWL-482); else, among those under
+/// a category the project sends to a human, the first, in the order given,
+/// that its decider did not answer. A question its decider answered holds
+/// nothing.
 fn question_held(gate: &GatePolicy, questions: &[MergeQuestion]) -> Option<MergeBlocker> {
+    let security = |category: &str| names_floor_category(category, FloorCategory::Security);
+    if let Some(category) = questions.iter().find_map(|question| {
+        if security(&question.category) {
+            Some(question.category.clone())
+        } else {
+            question
+                .labelled
+                .as_deref()
+                .is_some_and(security)
+                .then(|| FloorCategory::Security.token().to_owned())
+        }
+    }) {
+        return Some(MergeBlocker::Security(category));
+    }
     let mut human = questions
         .iter()
         .filter(|question| gate.route(&question.category) == Route::Human);
-    if let Some(question) = human
-        .clone()
-        .find(|question| names_floor_category(&question.category, FloorCategory::Security))
-    {
-        return Some(MergeBlocker::Security(question.category.clone()));
-    }
     human.find_map(|question| match question.settled {
         Settled::Decider => None,
         Settled::Resolver => Some(MergeBlocker::ResolverDecided(question.category.clone())),
@@ -970,6 +985,7 @@ mod tests {
         fn question(category: &str, settled: Settled) -> MergeQuestion {
             MergeQuestion {
                 category: category.to_owned(),
+                labelled: None,
                 settled,
             }
         }
@@ -1409,6 +1425,56 @@ mod tests {
                 ),
                 MergeDue::Wait(Security("security".to_owned()))
             );
+        }
+
+        /// OWL-482: a question asked under another category that the
+        /// resolver labelled `security` holds whatever the answer, at every
+        /// level; any other label of the resolver changes nothing.
+        #[test]
+        fn a_question_the_resolver_labelled_security_holds_whatever_the_answer() {
+            use MergeBlocker::*;
+            use Settled::*;
+            let labelled = |category: &str, label: &str, settled| MergeQuestion {
+                labelled: Some(label.to_owned()),
+                ..question(category, settled)
+            };
+            let held = Some(Security("security".to_owned()));
+            let cases = [
+                ("naming", "security", held.clone()),
+                ("naming", "auth_security", held.clone()),
+                ("money", "security", held),
+                // The asking run's own `security` category is the one told.
+                (
+                    "Security",
+                    "security",
+                    Some(Security("Security".to_owned())),
+                ),
+                ("naming", "irreversible", None),
+                ("naming", "naming", None),
+            ];
+            for level in [DelegationLevel::None, DelegationLevel::All] {
+                for (category, label, expected) in &cases {
+                    for settled in [Decider, Open] {
+                        let questions = [labelled(category, label, settled)];
+                        let got = due(
+                            MergeSwitch::All,
+                            &gate(level),
+                            &facts(&GREEN, &questions),
+                            &green_read(),
+                        );
+                        let lifted = settled == Decider
+                            || (level != DelegationLevel::None && *category == "naming");
+                        let want = match expected {
+                            Some(blocker) => MergeDue::Wait(blocker.clone()),
+                            None if lifted => {
+                                MergeDue::Merge(MergeGrant::new(HEAD, MergeMethod::Rebase))
+                            }
+                            None => MergeDue::Wait(Unanswered((*category).to_owned())),
+                        };
+                        assert_eq!(got, want, "{level:?} {category} {label} {settled:?}");
+                    }
+                }
+            }
         }
     }
 }
