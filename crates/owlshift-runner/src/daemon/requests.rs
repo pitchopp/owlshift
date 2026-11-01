@@ -230,8 +230,9 @@ fn under_pause_lock<T>(path: &Path, change: impl FnOnce() -> io::Result<T>) -> i
 }
 
 /// The request the file at `path` holds, when it stands: `None` within for
-/// a file that does not read as one.
-fn standing(path: &Path) -> Option<Option<Request>> {
+/// a file that does not read as one. A ticket's cancel file is read so too
+/// (OWL-474, `crate::cancel`).
+pub(crate) fn standing(path: &Path) -> Option<Option<Request>> {
     fs::symlink_metadata(path).ok()?;
     Some(
         fs::read_to_string(path)

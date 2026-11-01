@@ -1388,9 +1388,11 @@ fn certificate_bundle(agent: &AgentEnv, read_only: bool) -> Option<&'static Path
 }
 
 /// Whether a checked stop of this process is asked (OWL-161): a watch's or
-/// a step's, which stops by degrees.
+/// a step's, which stops by degrees; or one of the step it runs alone, its
+/// ticket canceled (OWL-474, `owlshift_platform::process::stop_step`).
 pub fn checked_stop_asked() -> bool {
     owlshift_platform::process::asked() == Some(owlshift_platform::process::Degree::Checked)
+        || owlshift_platform::process::step_stop_asked()
 }
 
 /// A run's outcome once a checked stop may have been asked during it

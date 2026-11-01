@@ -500,6 +500,34 @@ pub fn asks(project: &ChildProject, id: &str) -> bool {
     })
 }
 
+/// Whether the ticket `id` of `project` is parked at Build, not waiting
+/// for input.
+pub fn parked_at_build(project: &ChildProject, id: &str) -> bool {
+    record_of(project, id).is_some_and(|record| {
+        TicketState::try_from(&record.state).is_ok_and(|state| {
+            state.status()
+                == Status::Parked {
+                    at: owlshift_core::vocab::Stage::Build,
+                    awaiting_input: false,
+                }
+        })
+    })
+}
+
+/// `owlshift cancel <id> --reason <why>` on `project` (OWL-474), as the
+/// command asks it; refused when the command would be.
+pub fn cancel(project: &ChildProject, id: &str, why: &str) -> owlshift_runner::cancel::Asked {
+    let env = project.env();
+    let git = Git::with_setup("git", move |command| env.apply(command));
+    let request = owlshift_contracts::service::Request::new(
+        owlshift_contracts::service::BY_CANCEL,
+        Timestamp::now(),
+        why,
+    );
+    owlshift_runner::cancel::ask(&git, &project.dirs(), &TicketId::new(id).unwrap(), &request)
+        .unwrap()
+}
+
 /// Every event of the log in the data directory `data`, oldest first.
 pub fn events(data: &Path) -> Vec<Event> {
     fs::read_to_string(EventLog::in_dir(data).path())

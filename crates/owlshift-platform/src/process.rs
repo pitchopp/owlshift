@@ -23,7 +23,8 @@ pub use handover::hand_over_on_descriptor;
 #[cfg(unix)]
 pub use sentinel::{SentinelProbe, SentinelStatus, probe_sentinel};
 pub use signals::{
-    AtCheckedStop, Degree, asked, stop_by_degrees, stop_trees_on_signal, wait_asked,
+    AtCheckedStop, Degree, asked, end_step_stop, step_stop_asked, stop_by_degrees, stop_step,
+    stop_trees_on_signal, wait_asked,
 };
 #[cfg(unix)]
 pub use signals::{sentinel_status, stop_trees_when_killed};
@@ -1224,6 +1225,65 @@ mod tests {
         assert_eq!(owner.asked(), "", "a degree was asked");
         for &pid in [left, stopped, told].iter().chain(&escaped) {
             wait_until("every tree stopped", || !is_alive(pid));
+        }
+    }
+
+    /// OWL-474: a step stop stops a run's tree at once, and one spawned
+    /// while it stands as it starts, leaves the process's own command and a
+    /// step's child untold, asks no degree, and ends with `end_step_stop`,
+    /// after which a run's tree runs. In the test's own process, the stop
+    /// being the process's: nextest runs each test in a process of its own.
+    #[cfg(unix)]
+    #[test]
+    fn a_step_stop_stops_the_runs_alone_until_it_ends() {
+        let dir = tempfile::tempdir().unwrap();
+        let told = dir.path().join("told");
+        let sleep = || {
+            let mut command = Command::new("sleep");
+            command.arg("30");
+            command
+        };
+        let mut shell = Command::new("/bin/sh");
+        shell.args([
+            "-c",
+            &format!(
+                "trap 'echo told > \"{}\"; exit 0' TERM; i=0; \
+                 while [ $i -lt 300 ]; do sleep 0.1; i=$((i+1)); done",
+                told.display()
+            ),
+        ]);
+        let (mut left, left_tree) =
+            ProcessTree::spawn_for(&mut sleep(), AtCheckedStop::Left).unwrap();
+        let (mut run, _run) = ProcessTree::spawn_for(&mut sleep(), AtCheckedStop::Stopped).unwrap();
+        let (mut child, child_tree) =
+            ProcessTree::spawn_for(&mut shell, AtCheckedStop::Told).unwrap();
+        let ended = |process: &mut Child| process.try_wait().unwrap().is_some();
+
+        stop_step();
+        assert!(step_stop_asked());
+        assert_eq!(asked(), None, "a degree was asked");
+        wait_until("the run's tree stopped", || ended(&mut run));
+        let (mut late, _late) =
+            ProcessTree::spawn_for(&mut sleep(), AtCheckedStop::Stopped).unwrap();
+        wait_until("the late run's tree stopped", || ended(&mut late));
+
+        end_step_stop();
+        assert!(!step_stop_asked());
+        let (mut after, after_tree) =
+            ProcessTree::spawn_for(&mut sleep(), AtCheckedStop::Stopped).unwrap();
+        thread::sleep(Duration::from_millis(200));
+        assert!(
+            !ended(&mut after),
+            "a run's tree was stopped after the stop ended"
+        );
+        assert!(!ended(&mut left), "the process's own command was stopped");
+        assert!(!ended(&mut child), "the step's child ended");
+        assert!(!told.exists(), "the step's child was told");
+        for tree in [left_tree, child_tree, after_tree] {
+            tree.kill().unwrap();
+        }
+        for mut process in [left, child, after] {
+            let _ = process.wait();
         }
     }
 

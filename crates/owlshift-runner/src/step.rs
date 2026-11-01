@@ -45,6 +45,7 @@ use owlshift_contracts::step::{
 };
 use owlshift_platform::awake::{KeepAwake, Refusal};
 
+use crate::cancel;
 use crate::events::{Data, EventSink, data};
 use crate::follow::Following;
 use crate::in_flight::Outside;
@@ -75,6 +76,11 @@ pub enum Stepped {
 /// pull requests it follows, `following`, and, for a review loop's start,
 /// the reviews watch read (`None`: read again). What the step carries is
 /// read from `carry.json` and kept there after it.
+///
+/// Since OWL-474 the step watches its ticket's cancel file for its whole
+/// length ([`cancel::Watcher`]): once it stands, the step stops itself
+/// checked, as a checked stop of its process would stop it, the process
+/// going on; a `decision` event (`cancel` `stopped`) says so.
 pub fn run(
     on_demand: &OnDemand<'_>,
     envelope: &StepEnvelope,
@@ -83,7 +89,27 @@ pub fn run(
     outside: Option<Outside>,
     sink: &mut EventSink<'_>,
 ) -> Stepped {
+    let ticket = &envelope.ticket;
+    let watcher = cancel::Watcher::start(on_demand.dirs, ticket);
+    if !watcher.watching() {
+        sink.emit(
+            ticket,
+            None,
+            EventKind::Warning,
+            data([("what", json!("cancel_unwatched"))]),
+        );
+    }
     let stepped = step(on_demand, envelope, following, reviews, outside, sink);
+    let fired = watcher.fired();
+    drop(watcher);
+    if fired {
+        sink.emit(
+            ticket,
+            None,
+            EventKind::Decision,
+            data([("cancel", json!("stopped"))]),
+        );
+    }
     keep_carry(on_demand, envelope, &stepped, sink);
     stepped
 }

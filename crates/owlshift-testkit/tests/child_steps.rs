@@ -1021,6 +1021,64 @@ fn a_sigterm_during_two_builds_checks_both_and_both_resume() {
     assert_eq!(dirs.quarantine().unwrap(), None, "{lines}");
 }
 
+/// OWL-474's acceptance in plain `owlshift watch`, whose steps run in its
+/// own process: DEMO-1's Build, under way, is canceled. Its run is stopped
+/// within 5 seconds and the ticket parked at Build within 10, the cancel
+/// file gone, while the watch goes on until its own SIGTERM. The daemon's
+/// bench checks the rest in children (`tests/daemon.rs`).
+#[cfg(unix)]
+#[test]
+fn a_build_canceled_in_watch_s_own_process_stops_and_parks_the_watch_going_on() {
+    use std::time::{Duration, Instant};
+
+    use owlshift_testkit::step_child::{cancel, parked_at_build};
+
+    let tmp = tempfile::tempdir().unwrap();
+    let plays = tmp.path().join("plays");
+    let machine = tmp.path().join("machine");
+    fs::create_dir_all(&plays).unwrap();
+    reply_for(&plays, "intake", Some(TICKET), &intake_declaring(&["a"]));
+    reply_for(&plays, "build", None, &build_asks());
+    fs::write(plays.join("hold"), "").unwrap();
+    let harness = holding_harness(&plays, Path::new(FAKE), "build", ":", "exec sleep 30");
+    let s = parallel_setup(&harness, 1, 1, (&machine, 1));
+    s.project.move_ticket("DEMO-9", "Done");
+    let log = tmp.path().join("watch.log");
+    let mut watch = start_watch(&s.file, true, None, &log);
+    let mut running = Running {
+        pids: vec![watch.id()],
+    };
+    let pid = plays.join(format!("build-{TICKET}.pid"));
+    wait_within("the Build under way", 120, &log, || pid.exists());
+    let run = pid_in(&pid);
+    running.pids.push(run);
+
+    let asked = Instant::now();
+    cancel(&s.project, TICKET, "it rewrites the wrong module");
+    wait_within("the Build's run stopped", 5, &log, || !alive(run));
+    wait_within("the ticket parked", 10, &log, || {
+        parked_at_build(&s.project, TICKET)
+    });
+    assert!(asked.elapsed() < Duration::from_secs(10));
+    assert!(
+        watch.try_wait().unwrap().is_none(),
+        "the watch ended\n{}",
+        fs::read_to_string(&log).unwrap_or_default()
+    );
+    assert!(!owlshift_runner::cancel::stands(
+        &s.project.dirs(),
+        &ticket()
+    ));
+
+    signal(&watch, "TERM");
+    wait_within("watch to end", 60, &log, || {
+        watch.try_wait().unwrap().is_some()
+    });
+    let log_text = fs::read_to_string(&log).unwrap_or_default();
+    assert!(watch.wait().unwrap().success(), "{log_text}");
+    assert_eq!(s.project.dirs().quarantine().unwrap(), None, "{log_text}");
+}
+
 /// OWL-161, the acceptance's third case: a breach planted by a run, here an
 /// intake in the watch's own process as plain `owlshift watch` runs it,
 /// writing into the dedicated checkout before it sleeps, is found by the

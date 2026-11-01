@@ -240,6 +240,12 @@ impl Watch<'_> {
         then: Then,
         end: &StepEnd,
     ) {
+        // A step its ticket's cancel stopped (OWL-474): the pass that parks
+        // the ticket comes at once. Plain watch's needs it; a child's end
+        // makes the next pass come at once already.
+        if matches!(end, StepEnd::Stopped) && crate::cancel::stands(self.on_demand.dirs, ticket) {
+            memory.stepped = true;
+        }
         // A check due that could not run beside other steps holds them back
         // until this ticket's next step has run (OWL-418).
         let ran = ran(end);
