@@ -2,12 +2,18 @@
 //! "`owlshift status`"): what each ticket in flight or admitted waits on,
 //! and behind whom.
 //!
-//! It reads what `owlshift status` and `owlshift why` read, and nothing
-//! else: the machine's run slots and pause, each project's ticket refs, its
-//! pause, quarantine marker and the project file kept in its `served.json`,
-//! and the event log's waits, folded by [`why::fold`] and worded by
-//! [`why::phrase`]. It takes no lock: the slots are counted as `status`
-//! counts them.
+//! It reads what `owlshift status` and `owlshift why` read, and the drain's
+//! ready snapshot: the machine's run slots and pause, each project's ticket
+//! refs, its pause, quarantine marker, the project file kept in its
+//! `served.json` and its `ready.json`, and the event log's waits, folded by
+//! [`why::fold`] and worded by [`why::phrase`]. It takes no lock: the slots
+//! are counted as `status` counts them.
+//!
+//! A ticket is shown while it is in flight ([`held::holds`]), holds a run
+//! slot, or the drain still reads it (OWL-477): its latest ready snapshot
+//! lists it. So a ticket that left the ready column, and a ref whose pull
+//! request ended, are not shown with a wait or as a holder that are no
+//! longer true.
 //!
 //! [`gather`] does the reading; [`build`] makes the document
 //! `--json` prints ([`StatusWaits`]) and [`render`] the text from it, both
@@ -35,7 +41,9 @@ use serde_json::Value;
 
 use crate::daemon::requests;
 use crate::events::printable;
+use crate::held;
 use crate::project::ProjectDirs;
+use crate::ready;
 use crate::served;
 use crate::slots::{HeldSlot, MachineSlots};
 use crate::ticket_ref::{self, RefState};
@@ -69,8 +77,9 @@ pub struct ProjectRead {
     pub served: bool,
     /// `policy.max_in_flight` of the project file its `served.json` keeps.
     pub max_in_flight: Option<u8>,
-    /// Its ticket refs, each with its state.
-    pub refs: Vec<(TicketId, RefState)>,
+    /// Its ticket refs, each with its state and whether it holds
+    /// ([`held::holds`], a ref that cannot be read holding).
+    pub refs: Vec<(TicketId, RefState, bool)>,
     /// Its events, folded; a quarantine's wait dropped when no marker
     /// stands any more.
     pub folded: Folded,
@@ -78,6 +87,9 @@ pub struct ProjectRead {
     /// Its own pause, while it stands; `None` within for a file that does
     /// not read.
     pub pause: Option<Option<Request>>,
+    /// The tickets of its latest ready snapshot; `None` when there is none
+    /// or it does not read.
+    pub ready: Option<BTreeSet<TicketId>>,
 }
 
 /// Reads the waits of the data directory `data` at `now`: the project
@@ -106,7 +118,7 @@ pub fn gather(data: &Path, only: Option<&Repo>, concurrent_runs: u32, now: Times
     let projects = chosen
         .into_iter()
         .map(|(repository, repo, served)| {
-            project(data, &events, repository, &repo, served, &mut notes)
+            project(data, &events, repository, &repo, served, now, &mut notes)
         })
         .collect();
     let slots = match MachineSlots::new(data, concurrent_runs).holders() {
@@ -143,25 +155,56 @@ fn project(
     repository: String,
     repo: &Repo,
     served: bool,
+    now: Timestamp,
     notes: &mut Vec<String>,
 ) -> ProjectRead {
     let dirs = ProjectDirs::new(data, repo);
     let mut refs = Vec::new();
     if dirs.checkout().exists() {
-        match ticket_ref::states(&crate::project::runner_git(), &dirs.checkout()) {
-            Ok(states) => refs = states,
+        match ticket_ref::all(&crate::project::runner_git(), &dirs.checkout()) {
+            Ok(all) => {
+                refs = all
+                    .into_iter()
+                    .map(|(ticket, stored)| match stored {
+                        Ok(stored) => {
+                            let holds = held::holds(&stored);
+                            (ticket, ticket_ref::state_of(&stored), holds)
+                        }
+                        Err(why) => (ticket, RefState::Unread(why), true),
+                    })
+                    .collect();
+            }
             Err(why) => notes.push(format!(
                 "{repository}: the ticket refs cannot be read: {why}"
             )),
         }
     }
-    for (ticket, state) in &refs {
+    for (ticket, state, _) in &refs {
         if let RefState::Unread(why) = state {
             notes.push(format!(
                 "{repository}: the ref of {ticket} cannot be read: {why}"
             ));
         }
     }
+    let ready = match ready::read(&dirs) {
+        Ok(Some(snapshot)) => {
+            if ready::stale(&snapshot, now) {
+                notes.push(format!(
+                    "{repository}: the drain last read the ready column at {}, more than two \
+                     passes ago: its waits are as it told them then",
+                    snapshot.at
+                ));
+            }
+            Some(snapshot.tickets.into_iter().map(|t| t.ticket).collect())
+        }
+        Ok(None) => None,
+        Err(why) => {
+            notes.push(format!(
+                "{repository}: its ready snapshot cannot be read: {why}"
+            ));
+            None
+        }
+    };
     let mut folded = why::fold(events, &repository);
     let quarantined = match dirs.quarantine() {
         Ok(marker) => marker.is_some(),
@@ -202,6 +245,7 @@ fn project(
         folded,
         quarantined,
         pause: requests::pause(&dirs),
+        ready,
     }
 }
 
@@ -217,6 +261,22 @@ fn paused(request: Option<&Request>) -> Paused {
 /// The document of `read`.
 pub fn build(read: &Read) -> StatusWaits {
     let held: &[HeldSlot] = read.slots.as_ref().map_or(&[], |(held, _)| held);
+    let mut notes = read.notes.clone();
+    let projects = read
+        .projects
+        .iter()
+        .map(|project| {
+            let (waits, left_out) = build_project(project, held);
+            if left_out > 0 {
+                notes.push(format!(
+                    "{}: no ready snapshot reads, so the waits of {left_out} ticket(s) not in \
+                     flight are left out (the drain writes `ready.json` at its next pass)",
+                    project.repository
+                ));
+            }
+            waits
+        })
+        .collect();
     StatusWaits {
         format: Format,
         at: read.at,
@@ -225,16 +285,31 @@ pub fn build(read: &Read) -> StatusWaits {
             in_use: u32::try_from(held.len()).unwrap_or(u32::MAX),
             of: *of,
         }),
-        projects: read
-            .projects
-            .iter()
-            .map(|project| build_project(project, held))
-            .collect(),
-        notes: read.notes.clone(),
+        projects,
+        notes,
     }
 }
 
-fn build_project(project: &ProjectRead, held: &[HeldSlot]) -> ProjectWaits {
+/// The project's document, and how many tickets with a told wait were left
+/// out for want of a ready snapshot that reads.
+fn build_project(project: &ProjectRead, held: &[HeldSlot]) -> (ProjectWaits, usize) {
+    let running: BTreeSet<&TicketId> = held
+        .iter()
+        .filter_map(|slot| slot.holder.as_ref())
+        .filter(|holder| holder.project.eq_ignore_ascii_case(&project.repository))
+        .map(|holder| &holder.ticket)
+        .collect();
+    // Whether `ticket` holds a run slot or the drain's latest snapshot
+    // lists it. The snapshot's time is the watch's clock and the events'
+    // the system's, so a wait's time is not weighed against it.
+    let shown = |ticket: &TicketId| {
+        running.contains(ticket)
+            || project
+                .ready
+                .as_ref()
+                .is_some_and(|listed| listed.contains(ticket))
+    };
+    let mut left_out: BTreeSet<&TicketId> = BTreeSet::new();
     let mut tickets: BTreeMap<TicketId, TicketWaits> = BTreeMap::new();
     let blank = |ticket: &TicketId| TicketWaits {
         ticket: ticket.clone(),
@@ -244,7 +319,11 @@ fn build_project(project: &ProjectRead, held: &[HeldSlot]) -> ProjectWaits {
         run: None,
         waits: None,
     };
-    for (ticket, state) in &project.refs {
+    for (ticket, state, holds) in &project.refs {
+        if !holds && !shown(ticket) {
+            left_out.insert(ticket);
+            continue;
+        }
         let state = match state {
             RefState::Read(Some(state)) | RefState::Unadmitted(state) => Some(state),
             RefState::Read(None) | RefState::Unread(_) => None,
@@ -268,6 +347,10 @@ fn build_project(project: &ProjectRead, held: &[HeldSlot]) -> ProjectWaits {
     for (ticket, waiting) in &project.folded.current {
         if !tickets.contains_key(ticket) {
             if NOT_ADMITTED.contains(&waiting.reason.as_str()) {
+                continue;
+            }
+            if !shown(ticket) {
+                left_out.insert(ticket);
                 continue;
             }
             tickets.insert(ticket.clone(), blank(ticket));
@@ -304,7 +387,23 @@ fn build_project(project: &ProjectRead, held: &[HeldSlot]) -> ProjectWaits {
     }
     let mut tickets: Vec<TicketWaits> = tickets.into_values().collect();
     tickets.sort_by(|a, b| natural_cmp(a.ticket.as_str(), b.ticket.as_str()));
-    ProjectWaits {
+    // Only waits left out for want of a snapshot are worth a note: with one,
+    // the drain no longer reading a ticket is the point.
+    let unexplained = if project.ready.is_none() {
+        left_out
+            .iter()
+            .filter(|ticket| {
+                project
+                    .folded
+                    .current
+                    .get(**ticket)
+                    .is_some_and(|wait| !NOT_ADMITTED.contains(&wait.reason.as_str()))
+            })
+            .count()
+    } else {
+        0
+    };
+    let waits = ProjectWaits {
         repository: project.repository.clone(),
         served: project.served,
         max_in_flight: project.max_in_flight,
@@ -313,7 +412,8 @@ fn build_project(project: &ProjectRead, held: &[HeldSlot]) -> ProjectWaits {
         paused: project.pause.as_ref().map(|r| paused(r.as_ref())),
         quarantined: project.quarantined,
         tickets,
-    }
+    };
+    (waits, unexplained)
 }
 
 /// A wait for a person, which the ticket's ref says.
@@ -701,15 +801,19 @@ mod tests {
         ))
     }
 
+    /// A project whose refs all hold and whose snapshot lists every ticket
+    /// the events name: every wait told is shown.
     fn project(refs: Vec<(&str, RefState)>, events: &[Event]) -> ProjectRead {
+        let listed = events.iter().filter_map(|e| e.ticket.clone()).collect();
         ProjectRead {
             repository: "o/r".to_owned(),
             served: true,
             max_in_flight: Some(1),
-            refs: refs.into_iter().map(|(t, s)| (id(t), s)).collect(),
+            refs: refs.into_iter().map(|(t, s)| (id(t), s, true)).collect(),
             folded: why::fold(events, "o/r"),
             quarantined: false,
             pause: None,
+            ready: Some(listed),
         }
     }
 
@@ -1026,5 +1130,77 @@ mod tests {
              2026-10-28T15:00:00Z",
         );
         assert_eq!(text.matches("DEMO-3 [").count(), 1, "{text}");
+    }
+
+    /// The case seen live in OWL-477: DEMO-1, at Watch with its pull request
+    /// ended, was told the holder of a zone in front of DEMO-2, DEMO-3 and
+    /// DEMO-4. With a snapshot that lists DEMO-3 only, DEMO-2 and DEMO-1 are
+    /// gone, DEMO-3 still waits, and DEMO-1 is named as not in flight; DEMO-4,
+    /// out of the column but holding a run slot, stays, with its ref.
+    #[test]
+    fn a_ticket_the_drain_no_longer_reads_and_an_ended_holder_are_not_shown() {
+        let collision = |at: &str, ticket: &str| {
+            waits(
+                at,
+                ticket,
+                vec![
+                    ("drain", json!("waits")),
+                    ("reason", json!("collision")),
+                    ("tickets", json!(["DEMO-1"])),
+                    ("resource", json!({"zone": "backend/leases"})),
+                ],
+            )
+        };
+        let events = [
+            collision("2026-10-24T12:48:00Z", "DEMO-2"),
+            collision("2026-10-24T12:48:00Z", "DEMO-3"),
+            collision("2026-10-24T12:48:00Z", "DEMO-4"),
+        ];
+        let mut one = project(Vec::new(), &events);
+        one.refs = vec![
+            (id("DEMO-1"), at(Status::Active(Stage::Watch)), false),
+            (id("DEMO-4"), at(Status::Active(Stage::Ready)), false),
+        ];
+        one.ready = Some(BTreeSet::from([id("DEMO-3")]));
+        let held = vec![HeldSlot {
+            slot: 1,
+            holder: Some(Holder {
+                project: "o/r".to_owned(),
+                ticket: id("DEMO-4"),
+                pid: 9,
+                since: "2026-10-28T09:00:00Z".parse().unwrap(),
+            }),
+        }];
+        let built = build(&read(vec![one.clone()], held));
+        let shown: Vec<&str> = built.projects[0]
+            .tickets
+            .iter()
+            .map(|row| row.ticket.as_str())
+            .collect();
+        assert_eq!(shown, ["DEMO-3", "DEMO-4"], "{built:#?}");
+        assert_eq!(row(&built, "DEMO-4").stage, Some(Stage::Ready));
+        assert!(built.notes.is_empty(), "{:?}", built.notes);
+        let text = render(&built, &TimeZone::UTC);
+        assert!(
+            text.contains("    DEMO-1, not in flight here\n      DEMO-3 [not dispatched]: "),
+            "{text}"
+        );
+        assert!(
+            !text.contains("DEMO-1 [watch]") && !text.contains("DEMO-2"),
+            "{text}"
+        );
+
+        // With no snapshot that reads, nothing out of flight is shown, and
+        // a note says how many waits were left out.
+        one.ready = None;
+        let built = build(&read(vec![one], Vec::new()));
+        assert!(built.projects[0].tickets.is_empty(), "{built:#?}");
+        assert_eq!(
+            built.notes,
+            [
+                "o/r: no ready snapshot reads, so the waits of 3 ticket(s) not in flight are left \
+              out (the drain writes `ready.json` at its next pass)"
+            ]
+        );
     }
 }
