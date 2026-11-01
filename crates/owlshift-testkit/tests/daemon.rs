@@ -462,7 +462,10 @@ fn a_watch_that_cannot_serve_pauses_its_project_until_one_serves() {
         requests::pause(&dirs).is_none()
     });
     assert!(alive(watch), "{}", bench.output());
-    assert!(bench.output().contains("acme/web is served again"));
+    // The daemon removes the pause file before it says so: wait for the line.
+    bench.wait_for("the served-again line", 10, || {
+        bench.output().contains("acme/web is served again")
+    });
     bench.signal("TERM", bench.daemon_pid());
     assert!(bench.ended(10).success(), "{}", bench.output());
 }
@@ -514,7 +517,14 @@ fn a_watch_started_offline_waits_then_starts_once_its_tracker_answers() {
     assert!(bench.notes().is_empty(), "{:?}", bench.notes());
 
     fs::remove_file(&offline).unwrap();
-    bench.wait_for("a pass", 10, || bench.passes() > 0);
+    // The watch's lines reach the output through the daemon's relay, a tick
+    // after the pass is counted: wait for them too.
+    bench.wait_for("a pass and its lines", 10, || {
+        let output = bench.output();
+        bench.passes() > 0
+            && output.contains("reached its tracker and forge")
+            && output.contains("watching demo/project")
+    });
     let output = bench.output();
     assert_eq!(
         output.matches("reached its tracker and forge").count(),
