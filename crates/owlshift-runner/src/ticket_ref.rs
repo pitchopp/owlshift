@@ -664,34 +664,49 @@ pub enum RefState {
 /// that cannot be read is kept, with why; one gone since the listing is
 /// left out. The error says why the refs could not be listed.
 pub fn states(git: &Git, checkout: &Path) -> Result<Vec<(TicketId, RefState)>, String> {
-    let tickets = list(git, checkout)?;
-    Ok(tickets
+    Ok(all(git, checkout)?
         .into_iter()
-        .filter_map(|ticket| {
-            let state = match read(git, checkout, &ticket) {
-                Ok(Some(stored)) => {
-                    let state = TicketState::try_from(&stored.record.state).ok();
-                    let unadmitted = stored.record.held.as_ref().is_some_and(|h| !h.admitted());
-                    match state {
-                        Some(state)
-                            if unadmitted && state.status() == Status::Active(Stage::Build) =>
-                        {
-                            RefState::Unadmitted(state)
-                        }
-                        state => RefState::Read(state),
-                    }
-                }
-                Ok(None) => return None,
+        .map(|(ticket, stored)| {
+            let state = match stored {
+                Ok(stored) => state_of(&stored),
                 Err(why) => RefState::Unread(why),
             };
-            Some((ticket, state))
+            (ticket, state)
         })
         .collect())
+}
+
+/// The ref `stored` as the drain's slot weighs it: [`RefState::Unadmitted`]
+/// at Build with nothing admitted, [`RefState::Read`] otherwise.
+pub fn state_of(stored: &Stored) -> RefState {
+    let state = TicketState::try_from(&stored.record.state).ok();
+    let unadmitted = stored.record.held.as_ref().is_some_and(|h| !h.admitted());
+    match state {
+        Some(state) if unadmitted && state.status() == Status::Active(Stage::Build) => {
+            RefState::Unadmitted(state)
+        }
+        state => RefState::Read(state),
+    }
 }
 
 /// A ticket ref as read: its ticket, and its record or why it cannot be
 /// read.
 pub type RefRead = (TicketId, Result<Stored, String>);
+
+/// Every ticket ref of `checkout`, read now, in [`list`]'s order: why a ref
+/// cannot be read in its place, one gone since the listing left out. The
+/// error says why the refs could not be listed.
+pub fn all(git: &Git, checkout: &Path) -> Result<Vec<RefRead>, String> {
+    let tickets = list(git, checkout)?;
+    Ok(tickets
+        .into_iter()
+        .filter_map(|ticket| match read(git, checkout, &ticket) {
+            Ok(Some(stored)) => Some((ticket, Ok(stored))),
+            Ok(None) => None,
+            Err(why) => Some((ticket, Err(why))),
+        })
+        .collect())
+}
 
 /// Every ticket ref of `checkout` but `own`'s, read now, in [`list`]'s
 /// order: why a ref cannot be read in its place, one gone since the listing
