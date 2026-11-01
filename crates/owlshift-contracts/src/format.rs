@@ -181,6 +181,9 @@ pub const DIGEST_FORMAT: u32 = 1;
 /// The format version of what each ticket in flight waits on, as `owlshift
 /// status --waits --json` prints it (OWL-459).
 pub const WAITS_FORMAT: u32 = 1;
+/// The format version of the drain's ready snapshot
+/// (`<project data>/ready.json`, OWL-468).
+pub const READY_FORMAT: u32 = 1;
 
 /// Why a contract document was refused.
 #[derive(Debug)]

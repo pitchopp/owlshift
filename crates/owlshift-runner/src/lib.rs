@@ -33,6 +33,7 @@ pub mod pr_reviews;
 pub mod project;
 pub mod proposals;
 pub mod quarantine;
+pub mod ready;
 pub mod rebase;
 pub mod refusal;
 pub mod resolver;

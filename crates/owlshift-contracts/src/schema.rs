@@ -8,6 +8,7 @@ use crate::comment::Footer;
 use crate::config::{PersonalConfig, ProjectConfig};
 use crate::drain::{TicketIntake, TicketProposals};
 use crate::event::Event;
+use crate::ready::ReadySnapshot;
 use crate::refs::{
     Claim, PersistedState, TicketCost, TicketDelivery, TicketHeld, TicketQuestions, TicketSession,
 };
@@ -57,6 +58,7 @@ pub fn all() -> Vec<(&'static str, Schema)> {
         ("install-manifest", schema::<InstallManifest>()),
         ("digest", schema::<DigestRecord>()),
         ("status-waits", schema::<StatusWaits>()),
+        ("ready", schema::<ReadySnapshot>()),
     ]
 }
 

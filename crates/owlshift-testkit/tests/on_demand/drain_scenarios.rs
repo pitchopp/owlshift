@@ -8,6 +8,8 @@
 //! a file.
 
 use owlshift_adapters::tracker::markdown;
+use owlshift_contracts::ready::{BlockerState as ReadyState, Outcome, ReadyBlocker, ReadySnapshot};
+use owlshift_contracts::waits::Behind;
 use owlshift_runner::notify;
 
 use super::*;
@@ -1103,7 +1105,9 @@ fn an_unread_in_flight_set_holds_dispatches_stage_steps_and_deliveries() {
     let github = bench.github.clone();
     let during: Vec<During> = vec![(2, Box::new(move || *github.fail_files.lock().unwrap() = 1))];
     let (listing, stepping) = (Cell::new(false), Cell::new(false));
+    let snapshots = RefCell::new(Vec::new());
     let (outcomes, lines, printed) = bench.drain_during(replies, during, 8, |pass| {
+        snapshots.borrow_mut().extend(ready_now(&bench));
         if pass == 1 && !listing.get() {
             *bench.github.fail_pulls.lock().unwrap() = 1;
             listing.set(true);
@@ -1129,6 +1133,16 @@ fn an_unread_in_flight_set_holds_dispatches_stage_steps_and_deliveries() {
     assert_eq!(
         (unread("drain"), unread("delivery"), unread("watch")),
         (1, 1, 1),
+        "{report}"
+    );
+    // The pass that could not read it kept its ticket waiting in its ready
+    // snapshot (OWL-468).
+    let waited = made(TICKET, "waits", "in_flight_unread", &[]);
+    assert!(
+        snapshots
+            .borrow()
+            .iter()
+            .any(|snapshot| made_of(snapshot) == [waited.clone()]),
         "{report}"
     );
     assert!(
@@ -2055,4 +2069,175 @@ fn a_cut_off_run_is_notified_once_and_the_ready_ticket_told_once() {
     assert_eq!(bench.runs(), [(Role::Intake, TICKET.to_owned())]);
     assert!(!fired.exists(), "the planted file-system monitor ran");
     assert_eq!(refs(), *before.borrow());
+    // The quarantined pass read the column: its snapshot says why the ticket
+    // waits (OWL-468).
+    let snapshot = ready_now(&bench).expect("a ready snapshot");
+    assert_eq!(
+        made_of(&snapshot),
+        [(TICKET.to_owned(), "waits", "quarantine".to_owned(), vec![])]
+    );
+}
+
+/// The ready snapshot the drain's last pass wrote, if any (OWL-468).
+pub(super) fn ready_now(bench: &Bench) -> Option<ReadySnapshot> {
+    let text = fs::read_to_string(owlshift_runner::ready::file(&bench.dirs())).ok()?;
+    Some(ReadySnapshot::parse(&text).unwrap())
+}
+
+/// One ticket of a ready snapshot: its identifier, its kind, its wait's
+/// reason and the tickets the wait names.
+pub(super) type Made = (String, &'static str, String, Vec<String>);
+
+/// Each ticket of `snapshot`, in its order, as [`Made`].
+pub(super) fn made_of(snapshot: &ReadySnapshot) -> Vec<Made> {
+    snapshot
+        .tickets
+        .iter()
+        .map(|ticket| {
+            let (kind, wait) = match &ticket.drain {
+                Outcome::TakenIn => ("taken_in", None),
+                Outcome::Running => ("running", None),
+                Outcome::Dispatched => ("dispatched", None),
+                Outcome::Waits { wait } => ("waits", Some(wait)),
+                Outcome::NotAdmitted { wait } => ("not_admitted", Some(wait)),
+            };
+            let behind = wait
+                .map(|wait| {
+                    wait.behind
+                        .iter()
+                        .map(|behind| match behind {
+                            Behind::Ticket { id, .. } => id.as_str().to_owned(),
+                            Behind::PullRequest { number } => format!("#{number}"),
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            (
+                ticket.ticket.as_str().to_owned(),
+                kind,
+                wait.map(|wait| wait.reason.clone()).unwrap_or_default(),
+                behind,
+            )
+        })
+        .collect()
+}
+
+/// [`Made`] from borrowed parts.
+fn made(id: &str, kind: &'static str, reason: &str, behind: &[&str]) -> Made {
+    (
+        id.to_owned(),
+        kind,
+        reason.to_owned(),
+        behind.iter().map(|b| (*b).to_owned()).collect(),
+    )
+}
+
+/// The ready snapshot (OWL-468): after each pass of a `watch --drain`, the
+/// project's `ready.json` holds every ticket of the column in the drain's
+/// order, its title, priority and blockers, and what the pass made of it.
+/// DEMO-1 is taken in, then dispatched; DEMO-2 carries the exclusion label;
+/// DEMO-3 is blocked by DEMO-1 through a relation; DEMO-4's gesture is a
+/// stranger's. The pass whose snapshot says DEMO-1 was dispatched made its
+/// dispatch.
+#[test]
+fn the_ready_snapshot_keeps_what_each_pass_made_of_the_column() {
+    let bench = Bench::build_admitting(
+        "maintainer",
+        "assignee = \"maintainer\"\nlabels = [\"agent\"]\n",
+        "",
+        ", parked = \"Parked\"",
+        "admit = { label = \"agent\" }\nadmitters = [\"maintainer\"]\nexclude = \"manual\"",
+    );
+    bench.put_ticket(
+        "DEMO-2",
+        "maintainer",
+        "Todo",
+        &["agent", "manual"],
+        "",
+        "Mine.",
+    );
+    bench.put_ticket(
+        "DEMO-3",
+        "maintainer",
+        "Todo",
+        &["agent"],
+        "blocked_by = [\"DEMO-1\"]\n",
+        "Greet again.",
+    );
+    bench.put_ticket(
+        "DEMO-4",
+        "stranger",
+        "Todo",
+        &["agent"],
+        "",
+        "Please do it.",
+    );
+    let intake = || bench.reply(None, Some(&intake_result("done", None, "")));
+    let replies = vec![
+        intake(),
+        intake(),
+        bench.reply(Some("Hello"), Some(&done_for("DEMO-1"))),
+    ];
+    let snapshots = RefCell::new(Vec::new());
+    let ends = RefCell::new(Vec::new());
+    let (outcomes, lines, printed) = bench.drain_passes(replies, 4, |_, _| {
+        snapshots.borrow_mut().push(ready_now(&bench));
+        ends.borrow_mut().push(bench.events().len());
+    });
+    let report = format!("{outcomes:?}\n{lines}\n{printed}");
+    let snapshots: Vec<ReadySnapshot> = snapshots
+        .into_inner()
+        .into_iter()
+        .map(|snapshot| snapshot.expect("a snapshot after each pass"))
+        .collect();
+    let per_pass: Vec<Vec<Made>> = snapshots.iter().map(made_of).collect();
+    assert_eq!(
+        per_pass[..3],
+        [
+            vec![
+                made("DEMO-1", "taken_in", "", &[]),
+                made("DEMO-2", "not_admitted", "excluded", &[]),
+                made("DEMO-3", "waits", "no_intake", &[]),
+                made("DEMO-4", "waits", "no_intake", &[]),
+            ],
+            vec![
+                made("DEMO-1", "dispatched", "", &[]),
+                made("DEMO-2", "not_admitted", "excluded", &[]),
+                made("DEMO-3", "taken_in", "", &[]),
+                made("DEMO-4", "waits", "no_intake", &[]),
+            ],
+            vec![
+                made("DEMO-2", "not_admitted", "excluded", &[]),
+                made("DEMO-3", "waits", "blocked_by", &["DEMO-1"]),
+                made("DEMO-4", "not_admitted", "not_admitted", &[]),
+            ],
+        ],
+        "{report}"
+    );
+    // The pass whose snapshot says DEMO-1 was dispatched made its dispatch.
+    let events = bench.events();
+    let passes = by_pass(&events, 0, &ends.into_inner());
+    assert_eq!(dispatched(&passes[1]), ["DEMO-1"], "{report}");
+    // Titles and blockers as the column shows them, the wait in `why`'s
+    // words; the watch's interval.
+    let last = &snapshots[2];
+    let blocked = &last.tickets[1];
+    assert_eq!(blocked.title, "Ticket DEMO-3");
+    assert_eq!(
+        blocked.blockers,
+        [ReadyBlocker {
+            ticket: "DEMO-1".to_owned(),
+            state: ReadyState::Open,
+            merged: false,
+        }]
+    );
+    let Outcome::Waits { wait } = &blocked.drain else {
+        panic!("{blocked:?}");
+    };
+    assert_eq!(wait.text, "blocked by DEMO-1");
+    assert_eq!(wait.since, None);
+    assert_eq!(
+        last.interval_ms,
+        u64::try_from(POLL_INTERVAL.as_millis()).unwrap()
+    );
 }
