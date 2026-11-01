@@ -6090,6 +6090,14 @@ fn a_decision_the_resolver_labels_always_human_goes_to_the_decider() {
         .map(|d| d.question.id.as_str())
         .collect();
     assert_eq!(kept, ["Q1"]);
+    // The resolver's label of the refused decision is kept on the round's
+    // ask, under its id in the round, for merge on green (OWL-482).
+    let labels: Vec<(&str, &str)> = record.questions.asks[0]
+        .labels
+        .iter()
+        .map(|(id, label)| (id.as_str(), label.as_str()))
+        .collect();
+    assert_eq!(labels, [("Q1", "data_loss")]);
     let events = bench.events();
     let resolved = data_of(&events, EventKind::Gate, "resolver");
     assert_eq!(resolved[0]["decided"], json!(["Q1"]));

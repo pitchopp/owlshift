@@ -96,7 +96,7 @@ use owlshift_contracts::refs::{
     TicketDelivery, TicketHeld, TicketQuestions, TicketSession, cut_reason, cut_to,
 };
 use owlshift_contracts::result::{
-    self, AnswerClass, Decision, DecisionsRefusal, Followup, Question, RunResult,
+    self, AnswerClass, Decision, DecisionsRefusal, Followup, Question, Resolution, RunResult,
     Verdict as AnswerVerdict,
 };
 use owlshift_contracts::review::{KeptBuild, KeptFinding, TicketPlan, TicketReview};
@@ -1236,6 +1236,9 @@ struct Round {
     /// The refused choices its questions reopen, under the round's ids
     /// (OWL-203).
     reopened: Vec<ReopenedChoice>,
+    /// The resolver's label for each question of the round it decided,
+    /// under the round's ids (OWL-482), kept on the round's ask.
+    labels: BTreeMap<QuestionId, String>,
 }
 
 impl Round {
@@ -1255,7 +1258,15 @@ impl Round {
             decided: decided.len(),
             fallback,
             reopened,
+            labels: BTreeMap::new(),
         }
+    }
+
+    /// The round with the resolver's label for each of its questions that
+    /// one of `resolutions` decided ([`resolver::round_labels`]).
+    fn labelled(self, resolutions: &[Resolution]) -> Self {
+        let labels = resolver::round_labels(&self.questions, resolutions);
+        Round { labels, ..self }
     }
 }
 
@@ -3856,6 +3867,7 @@ impl OnDemand<'_> {
             decider,
             verdicts: Vec::new(),
             result_refusal: None,
+            labels: left.labels,
         });
         // At Watch, `do` is refused: `continue` reads the pull request
         // again, and a repair still due asks again (OWL-211).
@@ -4129,7 +4141,7 @@ impl OnDemand<'_> {
         event.insert("unposted".to_owned(), question_ids(&unposted));
         add_spend(&mut event, p, self.budget());
         sink.emit(&ticket, Some(&ran.run), EventKind::Gate, event);
-        let left = Round::of(&raised, &decided_ids, asked.reopened, None);
+        let left = Round::of(&raised, &decided_ids, asked.reopened, None).labelled(resolutions);
         if left.questions.is_empty() {
             p.chain.settled_once();
             return Ok(Routing::Settled(decided));
@@ -4412,6 +4424,7 @@ impl OnDemand<'_> {
                     decider: asked,
                     verdicts: Vec::new(),
                     result_refusal: None,
+                    labels: BTreeMap::new(),
                 });
                 self.store(p, &next, questions).map_err(|e| Stop::NotKept {
                     landed: Landed::Reask,
@@ -9016,6 +9029,7 @@ fn late_round(late: &[Comment]) -> Round {
         decided: 0,
         fallback: None,
         reopened: Vec::new(),
+        labels: BTreeMap::new(),
     }
 }
 
@@ -9465,6 +9479,7 @@ mod tests {
             },
             verdicts: Vec::new(),
             result_refusal: None,
+            labels: Default::default(),
         };
         let decision = |minute: u32, id: &str, decided: &str| KeptDecision {
             at: at(minute),
@@ -9602,6 +9617,7 @@ mod tests {
             },
             verdicts: kept,
             result_refusal: None,
+            labels: Default::default(),
         };
         let asks = [
             ask(
@@ -9818,6 +9834,7 @@ mod tests {
             },
             verdicts: Vec::new(),
             result_refusal: None,
+            labels: Default::default(),
         };
         // Round 1 went to the zone owner `bob`, round 2 to `tia`; the
         // ticket was since assigned to `ann`.
@@ -10504,7 +10521,7 @@ mod tests {
                     \"Which file\" (recorded: \"config.toml\"); \"Every key\" (recorded: \"yes\")";
         let format_8 = serde_json::json!({ "format": 8, "build_refusal": { "lists": [held] } });
         let questions = TicketQuestions::parse(&format_8.to_string()).unwrap();
-        assert!(questions.render().starts_with("{\n  \"format\": 17,"));
+        assert!(questions.render().starts_with("{\n  \"format\": 18,"));
         let kept = questions.build_refusal.clone().unwrap();
         assert_eq!(
             (&kept.lists[..], kept.choices.len()),

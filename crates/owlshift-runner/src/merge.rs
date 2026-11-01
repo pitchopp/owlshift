@@ -13,6 +13,7 @@ use owlshift_adapters::forge::CommitId;
 use owlshift_contracts::event::EventKind;
 use owlshift_contracts::ids::TicketId;
 use owlshift_contracts::refs::{DeliveredPullRequest, Merging, TicketDelivery, TicketQuestions};
+use owlshift_contracts::result::Question;
 use owlshift_core::follow::{MergeBlocker, MergeQuestion, Settled};
 use owlshift_core::vocab::{AnswerClass, MergeSwitch};
 
@@ -28,7 +29,8 @@ use crate::writer::{MergedComment, Writer};
 /// round's, in order, under the category it was asked under, settled by its
 /// decider when the latest verdict an answer check kept on it is
 /// `answered` ([`answer_check::understood`], what a RESUME restates), a
-/// thumbs-up's included; then every kept decision's, settled by no person.
+/// thumbs-up's included, with the resolver's label its round's ask kept for
+/// it (OWL-482); then every kept decision's, settled by no person.
 /// A category may come more than once, settled differently: each entry
 /// counts on its own.
 pub(crate) fn questions(questions: &TicketQuestions) -> Vec<MergeQuestion> {
@@ -39,9 +41,17 @@ pub(crate) fn questions(questions: &TicketQuestions) -> Vec<MergeQuestion> {
         }
     }
     let asked = rounds.into_iter().flat_map(|round| {
+        let labelled = move |question: &Question| {
+            questions
+                .asks
+                .iter()
+                .filter(|ask| ask.round == round)
+                .find_map(|ask| ask.labels.get(&question.id).cloned())
+        };
         answer_check::understood(questions.round_asks(round))
             .into_iter()
-            .map(|(question, verdict)| MergeQuestion {
+            .map(move |(question, verdict)| MergeQuestion {
+                labelled: labelled(&question),
                 category: question.category,
                 settled: if verdict.is_some_and(|verdict| verdict.class == AnswerClass::Answered) {
                     Settled::Decider
@@ -52,6 +62,7 @@ pub(crate) fn questions(questions: &TicketQuestions) -> Vec<MergeQuestion> {
     });
     let decided = questions.decisions.iter().map(|decision| MergeQuestion {
         category: decision.question.category.clone(),
+        labelled: None,
         settled: Settled::Resolver,
     });
     asked.chain(decided).collect()
@@ -271,16 +282,17 @@ mod tests {
 
     /// Each round's questions with their latest verdict, a re-ask's and a
     /// thumbs-up's included and a later round's never borrowing an earlier
-    /// one's, then the resolver's decisions.
+    /// one's, nor its resolver labels (OWL-482), then the resolver's
+    /// decisions.
     #[test]
     fn the_questions_say_who_settled_each() {
         let mut questions = TicketQuestions::parse(
-            r#"{"format":17,"asks":[{"kind":"questions","round":1,"at":"2026-10-24T09:00:00Z",
+            r#"{"format":18,"asks":[{"kind":"questions","round":1,"at":"2026-10-24T09:00:00Z",
             "comment":"c1","decider":{"account":"ada","by":"assignee"},"questions":[
             {"id":"Q1","category":"irreversible","context":"c","text":"t","options":[]},
             {"id":"Q2","category":"scope","context":"c","text":"t","options":[]}],
             "verdicts":[{"question":"Q1","class":"answered","reason":"r"},
-            {"question":"Q2","class":"partial","reason":"r"}]},
+            {"question":"Q2","class":"partial","reason":"r"}],"labels":{"Q2":"security"}},
             {"kind":"reask","round":1,"at":"2026-10-24T10:00:00Z","comment":"c2",
             "decider":{"account":"ada","by":"assignee"},"questions":[
             {"id":"Q2","category":"scope","context":"c","text":"t","options":[]}],
@@ -300,13 +312,17 @@ mod tests {
         legal.verdicts = answer_check::thumbs_up_verdicts(&legal.questions);
         let settled = |category: &str, settled| MergeQuestion {
             category: category.to_owned(),
+            labelled: None,
             settled,
         };
         assert_eq!(
             super::questions(&questions),
             [
                 settled("irreversible", Settled::Decider),
-                settled("scope", Settled::Decider),
+                MergeQuestion {
+                    labelled: Some("security".to_owned()),
+                    ..settled("scope", Settled::Decider)
+                },
                 settled("money", Settled::Open),
                 settled("legal", Settled::Decider),
                 settled("naming", Settled::Resolver),
