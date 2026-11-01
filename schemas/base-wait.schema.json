@@ -1,7 +1,7 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "Owlshift base wait",
-  "description": "A ticket's gate or setup failure waiting for its base, valid while the\nticket is at Build in `round`, configured at `configured_at` with\n`commands`, on the branch head `head`.",
+  "description": "A ticket's gate or setup failure waiting for its base, or a red gate the\nmachine cut (OWL-480) waiting for its next run, valid while the ticket is\nat Build in `round`, configured at `configured_at` with `commands`, on\nthe branch head `head`.",
   "type": "object",
   "properties": {
     "commands": {
@@ -22,7 +22,15 @@
       ]
     },
     "failing": {
-      "$ref": "#/$defs/KeptFailing"
+      "description": "The command a base check owes a verdict on; none for a red gate the\nmachine cut, which no check owes one (OWL-480). An Owlshift from\nbefore OWL-480 does not read a wait without it, and runs the Build\nagain.",
+      "anyOf": [
+        {
+          "$ref": "#/$defs/KeptFailing"
+        },
+        {
+          "type": "null"
+        }
+      ]
     },
     "format": {
       "description": "The format version of this document.",
@@ -50,8 +58,7 @@
     "configured_at",
     "commands",
     "round",
-    "head",
-    "failing"
+    "head"
   ],
   "$defs": {
     "Alternative": {

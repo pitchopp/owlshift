@@ -669,6 +669,9 @@ struct Clocked<'a> {
     refuse_mention: bool,
     /// How many of the next comment reads fail, as a tracker that is down.
     fail_reads: &'a Cell<u32>,
+    /// Every comment read gets no answer at all while it is set, as with the
+    /// network out (OWL-480).
+    offline: &'a Cell<bool>,
     /// What happens once, right after the next stage read.
     after_stage_read: &'a RefCell<Option<Box<dyn FnOnce()>>>,
     /// How many stage reads were made (OWL-340).
@@ -860,6 +863,12 @@ impl Tracker for Clocked<'_> {
     }
 
     fn comments(&self, id: &TicketId) -> Result<Vec<Comment>, tracker::Error> {
+        if self.offline.get() {
+            return Err(tracker::Error::new(
+                tracker::ErrorKind::Unreachable,
+                "Linear: io: failed to lookup address information",
+            ));
+        }
         if self.fail_reads.get() > 0 {
             self.fail_reads.set(self.fail_reads.get() - 1);
             return Err(tracker::Error::new(
@@ -1019,6 +1028,9 @@ struct Bench {
     refuse_mention: Cell<bool>,
     /// How many of the next comment reads the tracker refuses.
     fail_reads: Cell<u32>,
+    /// The tracker gives no answer to a comment read while it is set
+    /// (OWL-480): shared, so a run can cut the network.
+    offline: Rc<Cell<bool>>,
     /// What happens once, right after the tracker's next stage read.
     after_stage_read: RefCell<Option<Box<dyn FnOnce()>>>,
     /// How many stage reads the tracker answered (OWL-340).
@@ -1200,6 +1212,7 @@ impl Bench {
             refuse_stage: Cell::new(false),
             refuse_mention: Cell::new(false),
             fail_reads: Cell::new(0),
+            offline: Rc::default(),
             after_stage_read: RefCell::new(None),
             stage_reads: Cell::new(0),
             waited: Cell::new(SignedDuration::from_mins(10)),
@@ -1687,6 +1700,7 @@ impl Bench {
             refuse_stage: &self.refuse_stage,
             refuse_mention: self.refuse_mention.get(),
             fail_reads: &self.fail_reads,
+            offline: &self.offline,
             after_stage_read: &self.after_stage_read,
             stage_reads: &self.stage_reads,
             inbox: &self.inbox,

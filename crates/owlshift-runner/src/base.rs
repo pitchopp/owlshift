@@ -11,6 +11,7 @@
 use std::fs;
 use std::io;
 use std::path::PathBuf;
+use std::time::Duration;
 
 use serde_json::json;
 use sha2::{Digest, Sha256};
@@ -106,6 +107,44 @@ pub fn failing(report: &RunReport) -> Option<Failing> {
         Step::Gate
     };
     Some(Failing { step, command })
+}
+
+/// A Build's red gate the machine cut (OWL-480; architecture section 5, "A
+/// broken base", "The machine's"): the command it failed on, how long the
+/// machine slept while it ran, and whether the tracker gave no answer right
+/// after it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Cut {
+    pub failing: Failing,
+    pub slept: Duration,
+    pub unreachable: bool,
+}
+
+/// The machine's cut of a red gate after a `done`: a command that failed
+/// ([`failing`]: no gate refused for uncommitted changes, no runner's fault)
+/// while the machine slept longer than the bound
+/// ([`GateReport::slept_through`]), or, the machine awake, one that
+/// `unreachable` says the tracker gave no answer about, read right after.
+/// `unreachable` is called only then. `None` for any other outcome, a setup
+/// failure before the harness included.
+pub fn cut(report: &RunReport, unreachable: impl FnOnce() -> bool) -> Option<Cut> {
+    if !matches!(report.outcome, Outcome::Failed(RunFailure::Gate(_))) {
+        return None;
+    }
+    let failing = failing(report)?;
+    let gate = report.gate.as_ref()?;
+    let unreachable = if gate.slept_through() {
+        false
+    } else if unreachable() {
+        true
+    } else {
+        return None;
+    };
+    Some(Cut {
+        failing,
+        slept: gate.slept,
+        unreachable,
+    })
 }
 
 /// What a base check's report found: its verdict, or why it says nothing of
@@ -233,7 +272,8 @@ pub fn waits(dirs: &ProjectDirs) -> Vec<BaseWait> {
 /// The ticket whose failure waits for a pending check of `checks`, its
 /// wait matching the entry's commit and commands, the first of `waits` that
 /// `skip` leaves: the ticket a watch gives the check's priority to, one
-/// started again included (OWL-418).
+/// started again included (OWL-418). A wait the machine's cut left
+/// (OWL-480) has no failure, and no check waits for it.
 pub fn pending_ticket(
     checks: &Checks,
     waits: &[BaseWait],
@@ -241,7 +281,7 @@ pub fn pending_ticket(
 ) -> Option<TicketId> {
     waits
         .iter()
-        .filter(|wait| !skip(&wait.ticket))
+        .filter(|wait| wait.failing.is_some() && !skip(&wait.ticket))
         .find(|wait| {
             checks.standing().any(|check| {
                 matches!(check.entry, Entry::Pending { .. })
@@ -278,6 +318,7 @@ mod tests {
             steps: Vec::new(),
             setup: Vec::new(),
             runner_fault,
+            slept: Duration::ZERO,
         }
     }
 
@@ -324,6 +365,78 @@ mod tests {
         assert!(verdict(&report(Some(failure(None, "the gate moved HEAD")), false)).is_err());
     }
 
+    /// OWL-480: a red gate's command after a `done` is the machine's when
+    /// the machine slept through the gate, the tracker then not read, or
+    /// when the tracker gives no answer right after; nothing else is: a
+    /// tracker that answers, a runner's fault, a failure around the
+    /// commands, a setup failure before the harness.
+    #[test]
+    fn a_red_gate_is_the_machines_when_it_slept_or_the_tracker_is_unreachable() {
+        let run = |outcome: Outcome, gate: GateReport| RunReport {
+            outcome,
+            exit_code: Some(0),
+            usage: None,
+            model: None,
+            harness_version: None,
+            elapsed: Duration::ZERO,
+            wall_elapsed: None,
+            stdout_log: PathBuf::new(),
+            stderr_log: PathBuf::new(),
+            log_error: None,
+            gate: Some(gate),
+            setup: None,
+            gated: None,
+            warnings: Vec::new(),
+            resumed: None,
+            session: None,
+            windows: Vec::new(),
+        };
+        let red = |command: Option<&str>| failure(command, "exit status 2");
+        let gate_red = |command: Option<&str>, runner_fault: bool, slept: u64| {
+            let failed = red(command);
+            run(
+                Outcome::Failed(RunFailure::Gate(Box::new(failed.clone()))),
+                GateReport {
+                    slept: Duration::from_secs(slept),
+                    ..report(Some(failed), runner_fault)
+                },
+            )
+        };
+        let failing = Failing {
+            step: Step::Gate,
+            command: "make test".to_owned(),
+        };
+        let unasked = || -> bool { panic!("the tracker is not read after a sleep") };
+        assert_eq!(
+            cut(&gate_red(Some("make test"), false, 700), unasked),
+            Some(Cut {
+                failing: failing.clone(),
+                slept: Duration::from_secs(700),
+                unreachable: false
+            })
+        );
+        assert_eq!(
+            cut(&gate_red(Some("make test"), false, 10), || true),
+            Some(Cut {
+                failing,
+                slept: Duration::from_secs(10),
+                unreachable: true
+            })
+        );
+        assert_eq!(cut(&gate_red(Some("make test"), false, 10), || false), None);
+        assert_eq!(cut(&gate_red(Some("make test"), true, 700), || true), None);
+        assert_eq!(cut(&gate_red(None, false, 700), || true), None);
+        let setup = red(Some("pnpm i"));
+        let before_harness = run(
+            Outcome::Failed(RunFailure::Setup(Box::new(setup.clone()))),
+            GateReport {
+                slept: Duration::from_secs(700),
+                ..report(Some(setup), false)
+            },
+        );
+        assert_eq!(cut(&before_harness, || true), None);
+    }
+
     #[test]
     fn the_tail_is_cut_on_a_character_boundary() {
         let text = format!("{}é", "a".repeat(TAIL_BYTES));
@@ -362,7 +475,8 @@ mod tests {
     }
 
     /// The ticket a pending check's priority goes to: one whose wait matches
-    /// the entry, and not one skipped; none for a check that ran.
+    /// the entry, and not one skipped, nor one the machine's cut left
+    /// (OWL-480); none for a check that ran.
     #[test]
     fn a_pending_check_is_matched_to_its_waiting_ticket() {
         use owlshift_contracts::base::KeptFailing;
@@ -378,10 +492,15 @@ mod tests {
             commands: "k".to_owned(),
             round: 0,
             head: "h".repeat(40),
-            failing: KeptFailing::from(&failing),
+            failing: Some(KeptFailing::from(&failing)),
             done: None,
         };
+        let cut = BaseWait {
+            failing: None,
+            ..wait("OWL-0", "base")
+        };
         let waits = [
+            cut,
             wait("OWL-1", "other"),
             wait("OWL-2", "base"),
             wait("OWL-3", "base"),

@@ -527,6 +527,69 @@ fn a_done_build_whose_gate_the_base_breaks_reruns_only_its_gate_once_the_base_pa
     assert!(bench.remote_branch().is_some(), "delivered");
 }
 
+/// OWL-480's acceptance: a done Build whose gate fails while the network is
+/// out, the tracker giving no answer right after, is the machine's: nothing
+/// is counted, no base check runs, and its result is kept with no failure.
+/// With the network back, the next `continue` runs only its gate, which is
+/// classified as any Build's: still red here, on a command the base fails
+/// too, it holds the base; once that passes, the gate alone again, and the
+/// ticket delivers with no failed run counted.
+#[test]
+fn a_gate_failing_with_the_network_out_counts_nothing_and_runs_again_alone() {
+    let bench = Bench::new(true);
+    let marker = bench.tmp.path().join("store-has-rollup");
+    fs::write(&marker, "").unwrap();
+    let base = with_setup(&bench, &setup_line(&marker), None);
+    let (lost, offline) = (marker.clone(), bench.offline.clone());
+    let cut: During = (
+        1,
+        Box::new(move || {
+            fs::remove_file(&lost).unwrap();
+            offline.set(true);
+        }),
+    );
+
+    let (stopped, printed) = bench.invoke(
+        false,
+        vec![bench.reply(Some("Hello"), Some(DONE))],
+        None,
+        vec![cut],
+    );
+    assert!(
+        matches!(&stopped, Err(Stop::MachineCut { unreachable: true, command, .. }) if *command == setup_line(&marker)),
+        "{stopped:?}\n{printed}"
+    );
+    assert_eq!(state_of(&bench), (Status::Active(Stage::Build), 0));
+    let wait = base::read_wait(&bench.dirs(), &ticket()).expect("the done Build's wait");
+    assert!(wait.failing.is_none() && wait.done.is_some(), "{wait:?}");
+    assert!(checked(&bench).is_empty());
+    assert_eq!(unchecked(&bench), 0);
+    let cuts: Vec<Value> = data_of(&bench.events(), EventKind::Decision, "gate")
+        .into_iter()
+        .filter(|data| data["reason"] == json!("machine_cut"))
+        .collect();
+    assert_eq!(cuts.len(), 1, "{cuts:?}");
+    assert_eq!(cuts[0]["tracker"], json!("unreachable"));
+
+    bench.offline.set(false);
+    let (held, printed) = bench.continue_ticket(Vec::new());
+    assert!(
+        matches!(&held, Err(Stop::BaseHeld { commit, pending: false, .. }) if *commit == base),
+        "{held:?}\n{printed}"
+    );
+    assert_eq!(builds(&bench), [false, true]);
+    assert_eq!(state_of(&bench), (Status::Active(Stage::Build), 0));
+
+    fs::write(&marker, "").unwrap();
+    bench.merge_into_main(&[("NEWS.md", "news\n")]);
+    let (delivered, printed) = bench.continue_ticket(Vec::new());
+    delivered.unwrap_or_else(|stop| panic!("{stop}\n{printed}"));
+    assert_eq!(builds(&bench), [false, true, true], "the gate alone twice");
+    assert_eq!(checked(&bench), ["opened", "lifted"]);
+    assert!(!base::wait_file(&bench.dirs(), &ticket()).exists());
+    assert!(bench.remote_branch().is_some(), "delivered");
+}
+
 /// Criterion 5: a base check that cannot run says so in a `warning` event,
 /// and the failure takes today's path: the second failed run parks.
 #[test]

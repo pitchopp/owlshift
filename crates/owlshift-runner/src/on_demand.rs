@@ -784,6 +784,17 @@ pub enum Stop {
         pending: bool,
         due: bool,
     },
+    /// A done Build's gate failed on `command` while the machine slept
+    /// `slept`, past the bound, or, `unreachable`, the tracker gave no answer
+    /// right after it (OWL-480): the failure is the machine's, so nothing was
+    /// counted, and the Build's result is kept for its gate alone to run
+    /// again at the next step. Nobody is the blocker.
+    MachineCut {
+        ticket: TicketId,
+        command: String,
+        slept: Duration,
+        unreachable: bool,
+    },
     /// The run was done and its gate passed, but its delivery failed.
     Delivery(String),
     /// `owlshift continue` on a ticket at Watch read its pull request and
@@ -1044,6 +1055,25 @@ impl fmt::Display for Stop {
                      is checked once no other ticket's step runs; nothing was counted. `owlshift \
                      watch` checks it then, or run `owlshift continue {ticket}` again.",
                     crate::base::short(commit)
+                )
+            }
+            Self::MachineCut {
+                ticket,
+                command,
+                slept,
+                unreachable,
+            } => {
+                let why = if *unreachable {
+                    "the tracker gave no answer right after it, the network out".to_owned()
+                } else {
+                    format!("the machine slept {} s while it ran", slept.as_secs())
+                };
+                write!(
+                    f,
+                    "Cut by the machine: {ticket}'s gate failed on `{command}`, and {why}, so \
+                     nothing was counted. The Build's result is kept and only its gate runs \
+                     again, at the next step: `owlshift watch` runs it once the tracker answers, \
+                     or run `owlshift continue {ticket}`."
                 )
             }
             Self::Delivery(reason) => write!(
@@ -5970,6 +6000,7 @@ impl OnDemand<'_> {
                 | Stop::UsageLimit { .. }
                 | Stop::Stopped
                 | Stop::BaseHeld { .. }
+                | Stop::MachineCut { .. }
                 | Stop::Delivery(_)
                 | Stop::Watched { .. }
                 | Stop::Ready { .. }
