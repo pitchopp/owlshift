@@ -11,12 +11,17 @@
 //! `owlshift start` and `stop` read it, and the slots are counted as
 //! `owlshift why` counts them, each free one tried for a moment.
 //!
+//! Since OWL-478 it also shows each served project's standing quarantine,
+//! and the steps no run slot names: a ticket lock a command holds
+//! ([`ProjectDirs::ticket_holders`]) whose holder holds no slot, such as a
+//! `do` or a `continue` a person typed in a terminal.
+//!
 //! [`gather`] does the reading; [`watch_state`] and [`render`] are pure.
 //! `owlshift status --waits`, what each ticket in flight waits on, is
 //! [`waits`] (OWL-459).
 
 use std::fmt::Write as _;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use jiff::Timestamp;
 use jiff::tz::TimeZone;
@@ -33,7 +38,7 @@ use serde_json::Value;
 use crate::daemon::digest::{self, HarnessUsage};
 use crate::daemon::{self, requests};
 use crate::events::{EventLog, printable};
-use crate::project::ProjectDirs;
+use crate::project::{ProjectDirs, TicketHolder};
 use crate::served::{self, Registry};
 use crate::slots::{HeldSlot, MachineSlots};
 use crate::{watch, why};
@@ -53,11 +58,25 @@ pub struct Report {
     /// The machine's run slots held now, with their holders, and
     /// `concurrent_runs`; `None` when they cannot be probed.
     pub slots: Option<(Vec<HeldSlot>, u32)>,
+    /// The ticket locks commands hold now whose holder holds no run slot
+    /// (OWL-478): steps typed in a terminal. Not looked for when the slots
+    /// cannot be probed, since a slot's holder would then read as typed.
+    pub typed: Vec<TypedStep>,
     pub usage: Vec<(Harness, HarnessUsage)>,
     /// The latest digest's record.
     pub digest: Option<DigestRecord>,
     /// What could not be read.
     pub notes: Vec<String>,
+}
+
+/// A step a command typed in a terminal runs (OWL-478): its ticket's lock
+/// is held, and its holder holds no run slot.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TypedStep {
+    /// The project, its repository when it is served, its folder's
+    /// `owner/name` otherwise.
+    pub project: String,
+    pub holder: TicketHolder,
 }
 
 /// Whether a daemon runs.
@@ -86,6 +105,9 @@ pub struct Project {
     pub pause: Option<Option<Request>>,
     /// Whether its stop file stands: its watch drains.
     pub draining: bool,
+    /// Its quarantine's first line while one stands (OWL-478), or why its
+    /// file cannot be read.
+    pub quarantine: Option<Result<String, String>>,
     /// The tickets whose questions wait for a person, and the parked ones.
     pub waiting: Vec<TicketId>,
     pub parked: Vec<TicketId>,
@@ -215,8 +237,10 @@ pub fn gather(data: &Path, concurrent_runs: u32, caps: &[(Harness, u8)], now: Ti
     };
     let events = read_events(data, &mut notes);
     let mut projects = Vec::new();
+    let mut named = Vec::new();
     for (entry, repo) in served_projects(data, &mut notes) {
         let dirs = ProjectDirs::new(data, &repo);
+        named.push((dirs.root().to_owned(), entry.repository.clone()));
         let config = served::read_record(&dirs)
             .map(|record| record.unwrap_or_else(|| ServedConfig::new(repo.to_string())));
         let watch = match &daemon {
@@ -245,6 +269,7 @@ pub fn gather(data: &Path, concurrent_runs: u32, caps: &[(Harness, u8)], now: Ti
             watch,
             pause: requests::pause(&dirs),
             draining: watch::stop::stands(&dirs),
+            quarantine: quarantine_line(&dirs),
             waiting,
             parked,
         });
@@ -255,6 +280,10 @@ pub fn gather(data: &Path, concurrent_runs: u32, caps: &[(Harness, u8)], now: Ti
             notes.push(format!("the run slots cannot be probed: {error}"));
             None
         }
+    };
+    let typed = match &slots {
+        Some((held, _)) => typed_steps(data, &named, held, &mut notes),
+        None => Vec::new(),
     };
     let usage = digest::usage(data, caps, now, &mut notes);
     let digest = match digest::read(data) {
@@ -274,10 +303,80 @@ pub fn gather(data: &Path, concurrent_runs: u32, caps: &[(Harness, u8)], now: Ti
         machine_pause: requests::machine_pause(data),
         projects,
         slots,
+        typed,
         usage,
         digest,
         notes,
     }
+}
+
+/// The first line of the quarantine of the project at `dirs`, while one
+/// stands, or why it cannot be read.
+fn quarantine_line(dirs: &ProjectDirs) -> Option<Result<String, String>> {
+    match dirs.quarantine() {
+        Ok(None) => None,
+        Ok(Some(text)) => Some(Ok(text
+            .lines()
+            .map(str::trim)
+            .find(|line| !line.is_empty())
+            .map_or("its file is empty", |line| line.trim_end_matches(':'))
+            .to_owned())),
+        Err(error) => Some(Err(error.to_string())),
+    }
+}
+
+/// The steps typed in a terminal (OWL-478): in every project's folder under
+/// `data`, the ticket locks a command holds whose holder holds none of the
+/// slots `held`; `named` gives the served projects' repositories by folder.
+fn typed_steps(
+    data: &Path,
+    named: &[(PathBuf, String)],
+    held: &[HeldSlot],
+    notes: &mut Vec<String>,
+) -> Vec<TypedStep> {
+    let in_slots: Vec<u32> = held
+        .iter()
+        .filter_map(|slot| slot.holder.as_ref().map(|holder| holder.pid))
+        .collect();
+    let all = match ProjectDirs::all(data) {
+        Ok(all) => all,
+        Err(error) => {
+            notes.push(format!("the projects' folders cannot be read: {error}"));
+            return Vec::new();
+        }
+    };
+    let mut typed = Vec::new();
+    for dirs in all {
+        let project = named
+            .iter()
+            .find(|(root, _)| root == dirs.root())
+            .map_or_else(|| folder_name(dirs.root()), |(_, name)| name.clone());
+        match dirs.ticket_holders() {
+            Ok(holders) => typed.extend(
+                holders
+                    .into_iter()
+                    .filter(|holder| !in_slots.contains(&holder.pid))
+                    .map(|holder| TypedStep {
+                        project: project.clone(),
+                        holder,
+                    }),
+            ),
+            Err(error) => notes.push(format!(
+                "the ticket locks of {project} cannot be probed: {error}"
+            )),
+        }
+    }
+    typed
+}
+
+/// `owner/name` of a project's folder, as [`ProjectDirs::new`] lays it out.
+fn folder_name(root: &Path) -> String {
+    let name = |path: Option<&Path>| {
+        path.and_then(Path::file_name)
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_default()
+    };
+    format!("{}/{}", name(root.parent()), name(Some(root)))
 }
 
 /// `at` in `tz`, to the minute.
@@ -413,6 +512,14 @@ pub fn render(report: &Report, tz: &TimeZone) -> String {
             };
             line(format!("  paused {}{more}", asked(request.as_ref(), tz)));
         }
+        let lifted = "`owlshift unquarantine`, in its checkout, shows it whole and clears it";
+        match &project.quarantine {
+            Some(Ok(first)) => line(format!("  quarantined: {first}; {lifted}")),
+            Some(Err(why)) => line(format!(
+                "  quarantined, its file cannot be read ({why}); {lifted}"
+            )),
+            None => {}
+        }
         if project.draining {
             line("  draining: its watch ends once its steps under way finish".to_owned());
         }
@@ -427,12 +534,16 @@ pub fn render(report: &Report, tz: &TimeZone) -> String {
         }
     }
     match &report.slots {
-        Some((held, count)) if held.is_empty() => {
+        Some((held, count)) if held.is_empty() && report.typed.is_empty() => {
             line(format!("Steps under way: none (0 of {count} run slots)."));
         }
         Some((held, count)) => {
+            let typed = match report.typed.len() {
+                0 => String::new(),
+                n => format!(", and {n} typed in a terminal"),
+            };
             line(format!(
-                "Steps under way: {} of {count} run slots.",
+                "Steps under way: {} of {count} run slots{typed}.",
                 held.len()
             ));
             for slot in held {
@@ -446,6 +557,15 @@ pub fn render(report: &Report, tz: &TimeZone) -> String {
                     ),
                     None => format!("  slot {}: its holder is not recorded", slot.slot),
                 });
+            }
+            for step in &report.typed {
+                line(format!(
+                    "  {} {}, typed in a terminal (pid {}, since {})",
+                    step.project,
+                    step.holder.ticket,
+                    step.holder.pid,
+                    time(step.holder.since, tz)
+                ));
             }
         }
         None => {}
@@ -607,6 +727,76 @@ mod tests {
         has(": lunch break; `owlshift resume <owner/repo>` lifts it");
         has("Steps under way: none (0 of 2 run slots).");
         has("Latest digest: none yet.");
+    }
+
+    /// OWL-478: a ticket lock a command holds with no run slot is a step
+    /// typed in a terminal, in a served project or not, and its holder is
+    /// not shown twice once it holds a slot; a served project's quarantine
+    /// is shown with its first line and the way to clear it.
+    #[test]
+    fn status_shows_a_typed_step_and_a_standing_quarantine() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path();
+        let served = ServedProjects {
+            format: Format,
+            projects: vec![ServedProject {
+                repository: "acme/web".to_owned(),
+                checkout: "/home/ada/acme/web".to_owned(),
+            }],
+        };
+        crate::step::write_atomically(&Registry::in_data_dir(data_dir).file(), &served.render())
+            .unwrap();
+        let web = ProjectDirs::new(data_dir, &Repo::parse("acme/web").unwrap());
+        std::fs::create_dir_all(web.root()).unwrap();
+        std::fs::write(
+            web.quarantine_file(),
+            "\nRun r1 of OWL-1 broke isolation:\n- the checkout's hooks changed\n",
+        )
+        .unwrap();
+        let typed = TicketId::new("OWL-5").unwrap();
+        let _web_lock = web.ticket_lock(&typed).unwrap().unwrap();
+        let api = ProjectDirs::new(data_dir, &Repo::parse("Other/Api").unwrap());
+        let _api_lock = api
+            .ticket_lock(&TicketId::new("OWL-9").unwrap())
+            .unwrap()
+            .unwrap();
+
+        let report = gather(data_dir, 2, &[], Timestamp::now());
+        assert!(report.notes.is_empty(), "{:?}", report.notes);
+        let text = render(&report, &TimeZone::UTC);
+        let has = |part: &str| assert!(text.contains(part), "{part:?} missing in\n{text}");
+        has(
+            "  quarantined: Run r1 of OWL-1 broke isolation; `owlshift unquarantine`, in its \
+             checkout, shows it whole and clears it",
+        );
+        has("Steps under way: 0 of 2 run slots, and 2 typed in a terminal.");
+        let pid = std::process::id();
+        has(&format!(
+            "  acme/web OWL-5, typed in a terminal (pid {pid}, since "
+        ));
+        has(&format!(
+            "  other/api OWL-9, typed in a terminal (pid {pid}, since "
+        ));
+
+        // A step child takes its slot before the ticket's lock, under the
+        // same process: its lock is the slot's, never a typed step.
+        let holder = crate::slots::Holder {
+            project: "acme/web".to_owned(),
+            ticket: typed,
+            pid,
+            since: Timestamp::now(),
+        };
+        let _slot = MachineSlots::new(data_dir, 2)
+            .take(&holder)
+            .unwrap()
+            .unwrap();
+        let report = gather(data_dir, 2, &[], Timestamp::now());
+        assert_eq!(report.typed, []);
+        let text = render(&report, &TimeZone::UTC);
+        assert!(
+            text.contains("Steps under way: 1 of 2 run slots.\n"),
+            "{text}"
+        );
     }
 
     /// A watch the daemon paused for a refusal no restart mends is never

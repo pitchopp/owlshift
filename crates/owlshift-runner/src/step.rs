@@ -258,6 +258,31 @@ pub fn reported(step: &StepKind, outcome: &Result<Delivered, Stop>) -> bool {
         && matches!(outcome, Err(stop) if stop.is_busy()))
 }
 
+/// Whether a step's outcome is told: [`reported`], and a ticket whose lock
+/// another command holds only once per holder (OWL-478). The step that
+/// tells it makes the ticket's busy mark ([`ProjectDirs::busy_told_file`]);
+/// while the mark stands, a busy refusal is not told again, at any pass or
+/// after a restart of the watch. A command's take of the ticket's lock
+/// removes the mark, and so does its end, so the next holder is told. A
+/// mark that cannot be made tells the refusal, never hides it.
+pub fn told(
+    dirs: &ProjectDirs,
+    envelope: &StepEnvelope,
+    outcome: &Result<Delivered, Stop>,
+) -> bool {
+    if !reported(&envelope.step, outcome) {
+        return false;
+    }
+    let Err(Stop::TicketBusy(ticket)) = outcome else {
+        return true;
+    };
+    let made = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(dirs.busy_told_file(ticket));
+    !matches!(made, Err(error) if error.kind() == io::ErrorKind::AlreadyExists)
+}
+
 /// How a step ended, as watch tells ends apart. Every way to stop is named,
 /// so that a new one is placed here.
 pub fn end(stepped: &Stepped) -> StepEnd {
@@ -614,7 +639,7 @@ pub fn child(
     let outside = take_outside(on_demand.dirs, envelope);
     let stepped = run(on_demand, envelope, &mut following, None, outside, sink);
     if let Stepped::Ran(outcome) = &stepped
-        && reported(&envelope.step, outcome)
+        && told(on_demand.dirs, envelope, outcome)
     {
         report(outcome, sink);
     }
@@ -826,6 +851,27 @@ mod tests {
         let carry = read_carry(&dirs, &ticket()).unwrap();
         assert_eq!((carry.commit.as_str(), carry.generation), ("c2", 2));
         assert_eq!(carry.chain.chain(), chain().chain);
+    }
+
+    /// OWL-478: a ticket found busy is told once per holder of its lock,
+    /// pass after pass, and again once another holder takes it; any other
+    /// outcome is told as before.
+    #[test]
+    fn a_busy_ticket_is_told_once_per_holder() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dirs = ProjectDirs::new(tmp.path(), &Repo::parse("acme/app").unwrap());
+        let step = envelope(StepKind::Correct);
+        let busy = Err(Stop::TicketBusy(ticket()));
+        let first = dirs.ticket_lock(&ticket()).unwrap().unwrap();
+        assert!(told(&dirs, &step, &busy), "the first refusal");
+        assert!(!told(&dirs, &step, &busy), "the same holder, a later pass");
+        assert!(!told(&dirs, &step, &busy));
+        let ready = Err(Stop::Ready { ticket: ticket() });
+        assert!(told(&dirs, &step, &ready), "another outcome");
+        drop(first);
+        let _next = dirs.ticket_lock(&ticket()).unwrap().unwrap();
+        assert!(told(&dirs, &step, &busy), "the next holder");
+        assert!(!told(&dirs, &step, &busy));
     }
 
     /// OWL-439: each refusal of the assertion is one `warning` event, the

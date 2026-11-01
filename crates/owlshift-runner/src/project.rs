@@ -19,7 +19,8 @@
 //!     quarantine-comments.json  its WAITING comments not folded (OWL-423)
 //!     unfinished-clone     a first clone that has not finished
 //!     tickets/<ticket>/    lock, run.json (OWL-400), carry.json and
-//!                          outcome-<attempt>.json (OWL-399)
+//!                          outcome-<attempt>.json (OWL-399), holder.json
+//!                          and busy-told (OWL-478)
 //! ```
 //!
 //! A first clone stopped part-way, by its deadline, a crash or a Ctrl-C,
@@ -47,15 +48,18 @@ use std::process::Command;
 use std::thread;
 use std::time::{Duration, Instant};
 
+use jiff::Timestamp;
 use owlshift_adapters::forge::Repo;
 use owlshift_contracts::config::{ProjectConfig, check_requires};
 use owlshift_contracts::ids::TicketId;
 use owlshift_core::decider::ZoneOwners;
 use semver::Version;
+use serde_json::{Value, json};
 
 use crate::config::{OWLSHIFT_VERSION, PROJECT_FILE};
 use crate::executor::Git;
 use crate::rules;
+use crate::slots::{remove_stale, write_record};
 
 /// The variables that point git at another repository, index or object
 /// store than the one of its working directory. The runner's own git drops
@@ -200,6 +204,20 @@ impl ProjectDirs {
         self.ticket_dir(ticket).join("lock")
     }
 
+    /// The holder record of a command's ticket lock (OWL-478),
+    /// `holder.json` in the ticket's folder ([`ProjectDirs::ticket_lock`]).
+    pub fn ticket_holder_file(&self, ticket: &TicketId) -> PathBuf {
+        self.ticket_dir(ticket).join(TICKET_HOLDER_FILE)
+    }
+
+    /// The mark of a busy refusal told (OWL-478), `busy-told` in the
+    /// ticket's folder: made by a step that found the ticket's lock held and
+    /// said so (`step::told`), and removed by the next command's take of the
+    /// lock and by its end, so the refusal is told once per holder.
+    pub fn busy_told_file(&self, ticket: &TicketId) -> PathBuf {
+        self.ticket_dir(ticket).join(BUSY_TOLD_FILE)
+    }
+
     /// Takes the lock of `ticket` for a command, held until the returned
     /// value is dropped or the process ends; `None` when another open file
     /// description, in this process or another, still holds it once
@@ -208,8 +226,54 @@ impl ProjectDirs {
     /// ([`ProjectDirs::lock_for_write`] is watch's reverse order, which never
     /// waits). The bound outlasts the moment a lock just released can still
     /// look held (see [`ProjectDirs::lock`]).
+    ///
+    /// Who holds it is written beside it (OWL-478), as a run slot's holder
+    /// is (`slots.rs`): once the lock is held, a dead holder's record and a
+    /// stale [`ProjectDirs::busy_told_file`] are removed and this process's
+    /// [`TicketHolder`] is written, best effort; both files are removed
+    /// before the lock is let go. Watch's single tries record nothing.
     pub fn ticket_lock(&self, ticket: &TicketId) -> io::Result<Option<TicketLock>> {
-        self.ticket_lock_within(ticket, LOCK_GRACE)
+        let Some(mut lock) = self.ticket_lock_within(ticket, LOCK_GRACE)? else {
+            return Ok(None);
+        };
+        let record = self.ticket_holder_file(ticket);
+        let told = self.busy_told_file(ticket);
+        remove_stale(&record);
+        remove_stale(&told);
+        let holder = TicketHolder {
+            ticket: ticket.clone(),
+            pid: std::process::id(),
+            since: Timestamp::now(),
+        };
+        write_record(&record, &holder.render());
+        lock.left = vec![record, told];
+        Ok(Some(lock))
+    }
+
+    /// The ticket locks a command holds now in this project (OWL-478), each
+    /// as its holder record says, in ticket order. Only a ticket folder
+    /// whose record exists is looked at: its lock is tried once, never
+    /// waited on, so a held lock is never taken; a free one is a dead
+    /// holder's, whose record is removed while the try holds the lock, and
+    /// is never read. A record that does not read leaves its holder out.
+    pub fn ticket_holders(&self) -> io::Result<Vec<TicketHolder>> {
+        let mut held = Vec::new();
+        for dir in subdirectories(&self.tickets())? {
+            let record = dir.join(TICKET_HOLDER_FILE);
+            if !exists(&record)? {
+                continue;
+            }
+            match try_lock_file(&dir.join("lock"))? {
+                Some(_free) => remove_stale(&record),
+                None => held.extend(
+                    fs::read_to_string(&record)
+                        .ok()
+                        .and_then(|text| TicketHolder::parse(&text)),
+                ),
+            }
+        }
+        held.sort_by(|a, b| a.ticket.cmp(&b.ticket));
+        Ok(held)
     }
 
     /// [`ProjectDirs::ticket_lock`] with a single try: what `owlshift
@@ -227,8 +291,12 @@ impl ProjectDirs {
     ) -> io::Result<Option<TicketLock>> {
         fs::create_dir_all(self.ticket_dir(ticket))?;
         Ok(
-            lock_file_within(&self.ticket_lock_file(ticket), wait, LOCK_POLL)?
-                .map(|file| TicketLock { _file: file }),
+            lock_file_within(&self.ticket_lock_file(ticket), wait, LOCK_POLL)?.map(|file| {
+                TicketLock {
+                    left: Vec::new(),
+                    _file: file,
+                }
+            }),
         )
     }
 
@@ -632,7 +700,61 @@ pub struct ProjectLock {
 /// A ticket's lock: see [`ProjectDirs::ticket_lock`].
 #[derive(Debug)]
 pub struct TicketLock {
+    /// What a command's take wrote beside the lock, its holder record and
+    /// the busy mark it cleared: removed before the lock is let go.
+    left: Vec<PathBuf>,
     _file: File,
+}
+
+impl Drop for TicketLock {
+    /// Removes the holder record and the busy mark while the lock is still
+    /// held, so it never removes the next holder's; the lock goes after,
+    /// with the file.
+    fn drop(&mut self) {
+        for path in &self.left {
+            let _ = fs::remove_file(path);
+        }
+    }
+}
+
+/// The holder record's name in a ticket's folder (OWL-478).
+const TICKET_HOLDER_FILE: &str = "holder.json";
+
+/// The busy mark's name in a ticket's folder (OWL-478).
+const BUSY_TOLD_FILE: &str = "busy-told";
+
+/// Who holds a ticket's lock for a command (OWL-478), as its holder record,
+/// `holder.json` beside the lock, says: what `owlshift status` shows of a
+/// step no run slot names, such as one a person typed.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TicketHolder {
+    pub ticket: TicketId,
+    /// The holding process.
+    pub pid: u32,
+    /// When it took the lock.
+    pub since: Timestamp,
+}
+
+impl TicketHolder {
+    fn render(&self) -> String {
+        json!({
+            "ticket": self.ticket.as_str(),
+            "pid": self.pid,
+            "since": self.since.to_string(),
+        })
+        .to_string()
+    }
+
+    /// The record read back; `None` when it is not one this binary reads.
+    fn parse(text: &str) -> Option<Self> {
+        let value: Value = serde_json::from_str(text).ok()?;
+        let field = |key: &str| value.get(key).and_then(Value::as_str);
+        Some(Self {
+            ticket: TicketId::new(field("ticket")?).ok()?,
+            pid: u32::try_from(value.get("pid")?.as_u64()?).ok()?,
+            since: field("since")?.parse().ok()?,
+        })
+    }
 }
 
 /// A path component every platform takes as is, and the same whatever the
@@ -1202,6 +1324,53 @@ mod tests {
         ] {
             assert_eq!(component(name), expected, "{name}");
         }
+    }
+
+    /// OWL-478: a command's ticket lock names its holder until it ends, and
+    /// clears the busy mark; a record under a free lock, a killed holder's,
+    /// is never read and is removed; watch's single try records nothing, and
+    /// no other file of the ticket's folder is touched.
+    #[test]
+    fn a_commands_ticket_lock_names_its_holder_until_it_ends() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dirs = ProjectDirs::new(tmp.path(), &Repo::parse("acme/web").unwrap());
+        let ticket = TicketId::new("OWL-7").unwrap();
+        assert_eq!(dirs.ticket_holders().unwrap(), []);
+
+        fs::create_dir_all(dirs.ticket_dir(&ticket)).unwrap();
+        let other = dirs.ticket_dir(&ticket).join("cancel");
+        fs::write(&other, "").unwrap();
+        fs::write(dirs.busy_told_file(&ticket), "").unwrap();
+        let held = dirs.ticket_lock(&ticket).unwrap().expect("a free ticket");
+        assert!(
+            !dirs.busy_told_file(&ticket).exists(),
+            "cleared at the take"
+        );
+        let holders = dirs.ticket_holders().unwrap();
+        assert_eq!(holders.len(), 1, "{holders:?}");
+        assert_eq!(holders[0].ticket, ticket);
+        assert_eq!(holders[0].pid, std::process::id());
+        fs::write(dirs.busy_told_file(&ticket), "").unwrap();
+        drop(held);
+        assert!(!dirs.ticket_holder_file(&ticket).exists());
+        assert!(!dirs.busy_told_file(&ticket).exists(), "cleared at the end");
+        assert!(other.exists(), "another file of the folder stays");
+        assert_eq!(dirs.ticket_holders().unwrap(), []);
+
+        // A holder killed: its record outlives its lock.
+        let dead = TicketHolder {
+            ticket: ticket.clone(),
+            pid: 1,
+            since: Timestamp::UNIX_EPOCH,
+        };
+        fs::write(dirs.ticket_holder_file(&ticket), dead.render()).unwrap();
+        assert_eq!(dirs.ticket_holders().unwrap(), []);
+        assert!(!dirs.ticket_holder_file(&ticket).exists(), "removed");
+
+        let written = dirs.lock_for_write(&ticket).unwrap().expect("free");
+        assert!(!dirs.ticket_holder_file(&ticket).exists(), "watch's try");
+        drop(written);
+        assert!(other.exists());
     }
 
     /// The lock is checked alone, in a fresh copy of this test binary
