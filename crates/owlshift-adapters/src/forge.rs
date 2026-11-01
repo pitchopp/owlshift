@@ -547,8 +547,11 @@ pub enum ErrorKind {
     /// cannot help, and no other credential is tried: the message names
     /// `owlshift init`, which signs in again.
     SignInAgain,
-    /// Anything else: transport, a refused request, a malformed or
-    /// incomplete answer.
+    /// No HTTP answer at all: the name did not resolve, the connection or
+    /// TLS failed, or the request timed out (OWL-479). Never an answer the
+    /// forge gave, whatever its status.
+    Unreachable,
+    /// Anything else: a refused request, a malformed or incomplete answer.
     Other,
 }
 

@@ -911,7 +911,7 @@ fn unread_kind(kind: ErrorKind) -> &'static str {
         ErrorKind::Unauthorized | ErrorKind::SignInAgain => "unauthorized",
         ErrorKind::HeadMoved => "head_moved",
         ErrorKind::RateLimited => "rate_limited",
-        ErrorKind::Other => "other",
+        ErrorKind::Unreachable | ErrorKind::Other => "other",
     }
 }
 

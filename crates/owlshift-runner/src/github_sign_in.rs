@@ -312,8 +312,10 @@ fn ended(error: AppError) -> Outcome {
     match error {
         AppError::Denied => Outcome::Denied,
         AppError::Expired => Outcome::Expired,
-        // Both are in Owlshift's words, never the answer's.
-        other @ (AppError::Refused(_) | AppError::Failed(_)) => Outcome::Failed(other.to_string()),
+        // All are in Owlshift's words, never the answer's.
+        other @ (AppError::Refused(_) | AppError::Unreachable(_) | AppError::Failed(_)) => {
+            Outcome::Failed(other.to_string())
+        }
     }
 }
 
@@ -325,7 +327,7 @@ fn words(error: &Error) -> String {
             "GitHub refused the GitHub App's token".to_owned()
         }
         ErrorKind::RateLimited => "GitHub's rate limit is spent: try again later".to_owned(),
-        ErrorKind::NotFound | ErrorKind::HeadMoved | ErrorKind::Other => {
+        ErrorKind::NotFound | ErrorKind::HeadMoved | ErrorKind::Unreachable | ErrorKind::Other => {
             "the GitHub App's installations could not be read from GitHub".to_owned()
         }
     }

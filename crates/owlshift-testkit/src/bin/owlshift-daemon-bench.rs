@@ -18,6 +18,11 @@
 //! slots. It stops by degrees as `owlshift watch` does, its checked stop
 //! bounded by `CHECKED_STOP_BOUND`, and passes until a stop is asked of it,
 //! adding a byte to `<data>/bench/demo-project/passes` after each pass.
+//! Before its loop it opens its tracker as a watch the daemon starts does
+//! (OWL-479), through `owlshift_runner::watch::offline` with delays of
+//! 100 ms doubling up to 400 ms: while the file `offline` stands there, the
+//! tracker gives no answer and the watch waits; while `refused` stands, the
+//! tracker refuses its credentials and the watch ends as unservable.
 //!
 //! The stand-in stops as a watch does: by degrees, its checked stop bounded
 //! by 2 seconds, its process trees stopping with it however it ends. It runs
@@ -44,8 +49,11 @@ use owlshift_core::restart::RestartPolicy;
 use owlshift_platform::process::{self, AtCheckedStop, ProcessTree};
 use owlshift_runner::config::OWLSHIFT_VERSION;
 use owlshift_runner::daemon::{self, Daemon, Held, Timing};
+use owlshift_runner::events::{EventLog, EventSink};
 use owlshift_runner::project::ProjectDirs;
+use owlshift_runner::refusal::Refusal;
 use owlshift_runner::watch;
+use owlshift_runner::watch::offline::{self, Backoff, Opened};
 use owlshift_runner::watch::stop::CHECKED_STOP_BOUND;
 use owlshift_testkit::step_child::{self, ChildProject, FileNotifier};
 
@@ -166,9 +174,46 @@ fn run_drain(data: &Path, repo: &str) -> ExitCode {
         "owlshift-step-child{}",
         std::env::consts::EXE_SUFFIX
     ));
-    // A byte for each pass, so a test knows the watch passed since it looked.
-    let bench = bench_dir(data, &Repo::parse(repo).unwrap());
+    let parsed = Repo::parse(repo).unwrap();
+    let bench = bench_dir(data, &parsed);
     fs::create_dir_all(&bench).unwrap();
+    // Its tracker opened as a served watch opens it (OWL-479).
+    let mut out = std::io::stdout();
+    let mut sink = EventSink::new(repo, EventLog::in_dir(data), &mut out);
+    let backoff = Backoff {
+        first: Duration::from_millis(100),
+        longest: Duration::from_millis(400),
+    };
+    let mut open = || {
+        if bench.join("refused").exists() {
+            return Err(Refusal::from(
+                "the Linear app Owlshift writes as cannot be used: Linear refused the app's \
+                 token request: HTTP 400, invalid_client",
+            ));
+        }
+        if bench.join("offline").exists() {
+            return Err(Refusal::unreachable(
+                "the Linear app Owlshift writes as cannot be used: Linear's token endpoint: io: \
+                 failed to lookup address information",
+            ));
+        }
+        Ok(())
+    };
+    let dirs = ProjectDirs::new(data, &parsed);
+    match offline::open(&dirs, backoff, &mut sink, &mut std::io::stdout(), &mut open) {
+        Ok(Opened::Open(())) => {}
+        Ok(Opened::Stopped) => return ExitCode::SUCCESS,
+        // As `owlshift watch --drain --served`.
+        Err(refusal) => {
+            eprintln!("owlshift: {refusal}");
+            return if refusal.lasting() {
+                ExitCode::from(daemon::UNSERVABLE_EXIT)
+            } else {
+                ExitCode::FAILURE
+            };
+        }
+    }
+    // A byte for each pass, so a test knows the watch passed since it looked.
     let passes = bench.join("passes");
     let mut between = || {
         use std::io::Write;

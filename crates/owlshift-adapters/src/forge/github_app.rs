@@ -186,9 +186,12 @@ pub enum AppError {
     /// cannot help: the user signs in again (architecture section 8, the
     /// refresh-failure rule).
     Refused(Option<&'static str>),
-    /// Anything else: no answer, an HTTP status other than 200, an answer
-    /// that does not read, or an error a retry may clear. In Owlshift's
-    /// words, never the answer's.
+    /// No answer at all: GitHub's login endpoint could not be reached
+    /// (OWL-479). In Owlshift's words.
+    Unreachable(String),
+    /// Anything else: an HTTP status other than 200, an answer that does not
+    /// read, or an error a retry may clear. In Owlshift's words, never the
+    /// answer's.
     Failed(String),
 }
 
@@ -202,7 +205,7 @@ impl fmt::Display for AppError {
                 "GitHub refused the GitHub App's refresh token ({})",
                 code.unwrap_or("an unrecognised error")
             ),
-            Self::Failed(reason) => f.write_str(reason),
+            Self::Unreachable(reason) | Self::Failed(reason) => f.write_str(reason),
         }
     }
 }
@@ -497,10 +500,13 @@ impl<L: Login> DeviceFlow<L> {
         }
     }
 
-    /// Posts `form`; anything but HTTP 200 is a failure that names the
-    /// status alone.
+    /// Posts `form`; no answer is [`AppError::Unreachable`], anything but
+    /// HTTP 200 a failure that names the status alone.
     fn post(&self, url: &str, form: &[(&str, &str)]) -> Result<LoginAnswer, AppError> {
-        let answer = self.login.post_form(url, form).map_err(AppError::Failed)?;
+        let answer = self
+            .login
+            .post_form(url, form)
+            .map_err(AppError::Unreachable)?;
         if answer.status != 200 {
             return Err(AppError::Failed(format!(
                 "GitHub answered HTTP {} at {url}",
@@ -893,8 +899,10 @@ mod tests {
         assert!(!format!("{outage} {outage:?}").contains(SENTINEL));
     }
 
+    /// No answer is [`AppError::Unreachable`] (OWL-479), whatever the
+    /// request; checked with a real request to a closed port too.
     #[test]
-    fn no_answer_is_a_failure() {
+    fn no_answer_is_unreachable() {
         let script = Script::default();
         script
             .answers
@@ -902,8 +910,20 @@ mod tests {
             .push_back(Err("GitHub's login endpoint could not be reached".into()));
         assert!(matches!(
             flow(&script).refresh("ghr_refresh1"),
-            Err(AppError::Failed(_))
+            Err(AppError::Unreachable(_))
         ));
+
+        let port = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let url = format!("http://127.0.0.1:{port}/login/oauth/access_token");
+        let refused = HttpLogin::new().post_form(&url, &[("grant_type", "refresh_token")]);
+        assert_eq!(
+            refused.unwrap_err(),
+            format!("GitHub's login endpoint {url} could not be reached")
+        );
     }
 
     #[test]

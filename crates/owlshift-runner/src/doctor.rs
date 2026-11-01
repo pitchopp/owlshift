@@ -1646,7 +1646,7 @@ fn tracker_states_check(
                          issue identifiers start with, such as `OWL` for `OWL-12`",
                     )],
                 ),
-                ErrorKind::Other => Some(Check::warn(
+                ErrorKind::Unreachable | ErrorKind::Other => Some(Check::warn(
                     Section::Project,
                     SUBJECT,
                     format!("not checked: {error}"),
@@ -2052,11 +2052,11 @@ fn tracker_identity_check(
             match error.kind {
                 // The shared entries may serve another project: never
                 // advise deleting them (OWL-308).
-                ErrorKind::Other if shared => vec![Step::act(
+                ErrorKind::Unreachable | ErrorKind::Other if shared => vec![Step::act(
                     "Check that Linear is reachable from this machine, then run `owlshift \
                      doctor` again",
                 )],
-                ErrorKind::Other => vec![Step::act(
+                ErrorKind::Unreachable | ErrorKind::Other => vec![Step::act(
                     "Check that Linear is reachable from this machine, then run `owlshift \
                      doctor` again; or delete both of the app's keychain entries to write \
                      through the API key",
@@ -2207,18 +2207,19 @@ fn forge_access_check(
                      repository under Repository access.{shared}"
                 ),
             ),
-            ForgeErrorKind::HeadMoved | ForgeErrorKind::RateLimited | ForgeErrorKind::Other => {
-                Some(Check::warn(
-                    Section::Project,
-                    SUBJECT,
-                    format!("not checked: {error}"),
-                    format!(
-                        "{DOES_NOT_BLOCK} doctor could not ask GitHub whether the token reads \
+            ForgeErrorKind::HeadMoved
+            | ForgeErrorKind::RateLimited
+            | ForgeErrorKind::Unreachable
+            | ForgeErrorKind::Other => Some(Check::warn(
+                Section::Project,
+                SUBJECT,
+                format!("not checked: {error}"),
+                format!(
+                    "{DOES_NOT_BLOCK} doctor could not ask GitHub whether the token reads \
                          the branches of github.com/{repo}. Without contents (read), a delivery \
                          stops after its push."
-                    ),
-                ))
-            }
+                ),
+            )),
         },
     }
 }

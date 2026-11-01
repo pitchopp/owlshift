@@ -162,6 +162,7 @@ use crate::writer::VisibleStage;
 mod drain;
 mod limits;
 mod merge;
+pub mod offline;
 mod outside;
 mod pause;
 pub mod presence;

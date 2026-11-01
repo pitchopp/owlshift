@@ -128,10 +128,13 @@ pub fn github(
     }
 }
 
-/// The refusal of a GitHub App token that could not be had: passing when
-/// GitHub did not answer or its budget is spent, lasting otherwise.
+/// The refusal of a GitHub App token that could not be had: waiting for the
+/// network when GitHub gave no answer at all (OWL-479), passing when it
+/// answered with an error a retry may clear or its budget is spent, lasting
+/// otherwise.
 fn refusal(error: Error) -> Refusal {
     match error.kind {
+        ErrorKind::Unreachable => Refusal::unreachable(error.message),
         ErrorKind::Other | ErrorKind::RateLimited => Refusal::passing(error.message),
         _ => error.message.into(),
     }
@@ -264,7 +267,7 @@ mod tests {
             token: None,
         };
         let missing = github(&found, repo.clone(), &access).unwrap_err();
-        assert!(missing.lasting, "{missing}");
+        assert!(missing.lasting(), "{missing}");
         let missing = missing.message;
         assert!(
             missing.contains("service `owlshift`, account `github.com/pitchopp/owlshift/github`"),
@@ -273,6 +276,21 @@ mod tests {
 
         found.token = Some(Secret::new("ghp_test"));
         assert_eq!(github(&found, repo.clone(), &access).unwrap().repo(), &repo);
+    }
+
+    /// OWL-479: no answer waits for the network, an error a retry may clear
+    /// restarts, a refusal lasts.
+    #[test]
+    fn a_token_that_could_not_be_had_is_refused_by_what_mends_it() {
+        let of = |kind| refusal(Error::new(kind, "x"));
+        assert!(of(ErrorKind::Unreachable).unanswered());
+        for kind in [ErrorKind::Other, ErrorKind::RateLimited] {
+            let passing = of(kind);
+            assert!(!passing.lasting() && !passing.unanswered(), "{kind:?}");
+        }
+        for kind in [ErrorKind::Unauthorized, ErrorKind::SignInAgain] {
+            assert!(of(kind).lasting(), "{kind:?}");
+        }
     }
 
     /// OWL-384: an app entry that is not expired builds the adapter on the
@@ -304,7 +322,7 @@ mod tests {
             &repo
         );
         let error = github(&found("ghu_SENTINEL".to_owned()), repo.clone(), &access).unwrap_err();
-        assert!(error.lasting, "{error}");
+        assert!(error.lasting(), "{error}");
         let error = error.message;
         assert!(
             error.contains("account `github.com/pitchopp/owlshift/github-app`, does not read"),

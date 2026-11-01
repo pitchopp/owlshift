@@ -264,7 +264,7 @@ fn a_project_never_accepted_is_not_served() {
     let refusal =
         served::prepare(&bench.git, &served, &accept, Some(&shown), &mut sink).unwrap_err();
     // A merge mends it, not a restart (OWL-435).
-    assert!(refusal.lasting, "{refusal}");
+    assert!(refusal.lasting(), "{refusal}");
     let error = refusal.message;
     assert!(
         error.starts_with("acme/web is not served: owlshift.toml at origin/main ("),
@@ -303,7 +303,7 @@ fn a_default_branch_never_read_is_a_passing_refusal() {
     let accept = |text: &str| served::accept(&Bench::repo(), text, None);
     let refusal =
         served::prepare(&bench.git, &served, &accept, Some(&shown), &mut sink).unwrap_err();
-    assert!(!refusal.lasting, "{refusal}");
+    assert!(!refusal.lasting(), "{refusal}");
     assert!(
         refusal
             .message

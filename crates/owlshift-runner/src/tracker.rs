@@ -59,12 +59,21 @@ pub fn linear(secrets: &TrackerSecrets<Secret>, team: &str) -> Result<LinearTrac
         None => Ok(tracker),
         Some(credentials) => open_app(tracker, credentials, &secrets.accounts, team)
             .map(|(tracker, _)| tracker)
-            .map_err(|error| match &error {
-                AppError::Tracker { error: answer, .. } if answer.kind == ErrorKind::Other => {
-                    Refusal::passing(error.to_string())
-                }
-                _ => error.to_string().into(),
-            }),
+            .map_err(app_refusal),
+    }
+}
+
+/// The refusal of a Linear app that could not be used: waiting for the
+/// network when Linear gave no answer at all (OWL-479), passing when it
+/// answered with an error a retry may clear, lasting otherwise.
+fn app_refusal(error: AppError) -> Refusal {
+    match &error {
+        AppError::Tracker { error: answer, .. } => match answer.kind {
+            ErrorKind::Unreachable => Refusal::unreachable(error.to_string()),
+            ErrorKind::Other => Refusal::passing(error.to_string()),
+            ErrorKind::Unauthorized | ErrorKind::NotFound => error.to_string().into(),
+        },
+        _ => error.to_string().into(),
     }
 }
 
@@ -279,11 +288,34 @@ mod tests {
         TrackerAccounts::project(&Repo::parse("pitchopp/owlshift").unwrap())
     }
 
+    /// OWL-479: a Linear that gave no answer waits for the network, one
+    /// that answered with an error a retry may clear restarts, a refusal
+    /// lasts.
+    #[test]
+    fn an_app_that_could_not_be_used_is_refused_by_what_mends_it() {
+        let of = |kind| {
+            app_refusal(AppError::Tracker {
+                error: tracker::Error::new(kind, "Linear's token endpoint: io: x"),
+                accounts: own(),
+            })
+        };
+        assert!(of(ErrorKind::Unreachable).unanswered());
+        let passing = of(ErrorKind::Other);
+        assert!(!passing.lasting() && !passing.unanswered());
+        assert!(of(ErrorKind::Unauthorized).lasting());
+        assert!(
+            app_refusal(AppError::NoKey {
+                account: "k".into()
+            })
+            .lasting()
+        );
+    }
+
     #[test]
     fn the_linear_key_comes_from_the_accounts_given() {
         let keychain = Keychain::in_memory();
         let missing = linear(&read(&keychain, &own()).unwrap(), "OWL").unwrap_err();
-        assert!(missing.lasting, "{missing}");
+        assert!(missing.lasting(), "{missing}");
         let missing = missing.message;
         assert!(
             missing.contains("service `owlshift`, account `github.com/pitchopp/owlshift/linear`"),
@@ -337,7 +369,7 @@ mod tests {
             .store(&accounts.key, &Secret::new("lin_api_test"))
             .unwrap();
         let refused = linear(&set(), "OWL").unwrap_err();
-        assert!(refused.lasting, "{refused}");
+        assert!(refused.lasting(), "{refused}");
         let refused = refused.message;
         assert!(
             refused.contains("`github.com/pitchopp/owlshift/linear-app-client-secret`"),
