@@ -94,7 +94,7 @@ caches = []
 # "trivial", "standard" or "risky".
 default = "standard"
 # When a human approves the plan: "always", "on-fork" or "never".
-plan_approval = "on-fork"
+plan_approval = "never"
 # Who confirms a review finding before it is acted on: "author" (default:
 # the next design or fix run answers each finding) or "arbiter" (one
 # arbiter run per review pass rules on all its findings).
@@ -151,6 +151,10 @@ resolver_budget_usd = 100.0
 # 2026-10-20 for the tickets run since 2026-10-14, the most 79 USD
 # (OWL-330, still open).
 ticket_budget_usd = 100.0
+
+[forge]
+merge = "all"         # never (défaut) | labeled | all
+# merge_method = "squash" # squash (défaut) | merge | rebase
 
 [forge.reviewers]
 # The forge logins whose reviews on a delivered pull request Owlshift reads,
