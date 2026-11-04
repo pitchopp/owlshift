@@ -640,6 +640,7 @@ impl OnDemand<'_> {
                 before: &|_, _, _| Ok(()),
                 decorate: &decorate,
                 accept: &accept,
+                cut: None,
             },
             sink,
         )?;

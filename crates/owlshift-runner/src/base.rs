@@ -250,6 +250,44 @@ pub fn read_wait(dirs: &ProjectDirs, ticket: &TicketId) -> Option<BaseWait> {
     BaseWait::parse(&text).ok()
 }
 
+/// Where a ticket's wait is kept and read: at Build (OWL-418, OWL-480), or
+/// by a fix run at Watch whose red gate the machine cut, on the pull
+/// request's head `pushed` it fixes (OWL-486).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WaitAt<'a> {
+    Build,
+    Fix { pushed: &'a str },
+}
+
+impl<'a> WaitAt<'a> {
+    /// The pull request's head a fix run's wait names; none at Build.
+    pub fn pushed(self) -> Option<&'a str> {
+        match self {
+            Self::Build => None,
+            Self::Fix { pushed } => Some(pushed),
+        }
+    }
+}
+
+/// Whether `wait` is valid for a run read `at`, in `round`, configured at
+/// `configured_at` with `commands`, its branch at `head`: the wait's round,
+/// commit, commands and branch head all those, and the pull request's head
+/// it names the one read `at` names. A wait of the other stage never is, so
+/// Build never regates a fix run's result, nor a fix a Build's.
+pub fn wait_holds(
+    wait: &BaseWait,
+    at: WaitAt<'_>,
+    round: u32,
+    (configured_at, commands): (&str, &str),
+    head: Option<&str>,
+) -> bool {
+    wait.round == round
+        && wait.configured_at == configured_at
+        && wait.commands == commands
+        && head == Some(wait.head.as_str())
+        && wait.pushed.as_deref() == at.pushed()
+}
+
 /// Keeps `wait` as the ticket's, replacing any.
 pub fn write_wait(dirs: &ProjectDirs, ticket: &TicketId, wait: &BaseWait) -> io::Result<()> {
     write_atomically(&wait_file(dirs, ticket), &wait.render())
@@ -494,6 +532,7 @@ mod tests {
             head: "h".repeat(40),
             failing: Some(KeptFailing::from(&failing)),
             done: None,
+            pushed: None,
         };
         let cut = BaseWait {
             failing: None,
@@ -519,5 +558,46 @@ mod tests {
         );
         checks.record_check(("base", "k", "h"), 2, Verdict::Passed, None);
         assert_eq!(pending_ticket(&checks, &waits, |_| false), None);
+    }
+
+    /// OWL-486: a wait holds only at its own stage, a fix run's only on the
+    /// pull request's head it fixes, and only for its round, commit,
+    /// commands and branch head.
+    #[test]
+    fn a_wait_holds_at_its_own_stage_only() {
+        use owlshift_contracts::format::Format;
+        let (pushed, head) = ("p".repeat(40), "h".repeat(40));
+        let build = BaseWait {
+            format: Format,
+            ticket: TicketId::new("OWL-1").unwrap(),
+            configured_at: "c".to_owned(),
+            commands: "k".to_owned(),
+            round: 1,
+            head: head.clone(),
+            failing: None,
+            done: None,
+            pushed: None,
+        };
+        let fix = BaseWait {
+            pushed: Some(pushed.clone()),
+            ..build.clone()
+        };
+        let at_fix = WaitAt::Fix { pushed: &pushed };
+        let holds = |wait: &BaseWait, at, round, head: Option<&str>| {
+            wait_holds(wait, at, round, ("c", "k"), head)
+        };
+        assert!(holds(&build, WaitAt::Build, 1, Some(&head)));
+        assert!(!holds(&build, at_fix, 1, Some(&head)));
+        assert!(holds(&fix, at_fix, 1, Some(&head)));
+        assert!(!holds(
+            &fix,
+            WaitAt::Fix { pushed: "other" },
+            1,
+            Some(&head)
+        ));
+        assert!(!holds(&fix, WaitAt::Build, 1, Some(&head)));
+        assert!(!holds(&fix, at_fix, 2, Some(&head)));
+        assert!(!holds(&fix, at_fix, 1, Some("moved")));
+        assert!(!holds(&fix, at_fix, 1, None));
     }
 }

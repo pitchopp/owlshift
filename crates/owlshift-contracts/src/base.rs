@@ -241,7 +241,9 @@ impl From<KeptStep> for Step {
 /// A ticket's gate or setup failure waiting for its base, or a red gate the
 /// machine cut (OWL-480) waiting for its next run, valid while the ticket is
 /// at Build in `round`, configured at `configured_at` with `commands`, on
-/// the branch head `head`.
+/// the branch head `head`; with `pushed`, a fix run's red gate the machine
+/// cut at Watch (OWL-486), valid there alone, while the pull request's head
+/// is `pushed`.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 #[schemars(title = "Owlshift base wait")]
@@ -265,6 +267,12 @@ pub struct BaseWait {
     /// none for a failure before the harness.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub done: Option<KeptDone>,
+    /// The pull request's head a fix run at Watch was made on, for a fix
+    /// whose red gate the machine cut (OWL-486), a full commit id; none for
+    /// a Build's wait. An Owlshift from before OWL-486 does not read a wait
+    /// with it, and runs the fix again.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pushed: Option<String>,
 }
 
 /// What a done Build left for its gate's next run.
@@ -344,7 +352,8 @@ mod tests {
     }
 
     /// OWL-480: a wait the machine's cut left keeps no failure, and an
-    /// OWL-418 wait still reads with its own.
+    /// OWL-418 wait still reads with its own. OWL-486: a fix run's at
+    /// Watch names the pull request's head it fixes; a Build's names none.
     #[test]
     fn a_cut_wait_keeps_no_failure() {
         let wait = BaseWait {
@@ -356,10 +365,21 @@ mod tests {
             head: "h".repeat(40),
             failing: None,
             done: None,
+            pushed: None,
         };
         let text = wait.render();
-        assert!(!text.contains("failing"), "{text}");
+        assert!(
+            !text.contains("failing") && !text.contains("pushed"),
+            "{text}"
+        );
         assert_eq!(BaseWait::parse(&text).unwrap(), wait);
+        let fix = BaseWait {
+            pushed: Some("p".repeat(40)),
+            ..wait.clone()
+        };
+        let fixed = fix.render();
+        assert!(fixed.contains("\"pushed\""), "{fixed}");
+        assert_eq!(BaseWait::parse(&fixed).unwrap(), fix);
         let held = text.replacen(
             "\"head\"",
             r#""failing": {"step": "gate", "command": "make test"}, "head""#,

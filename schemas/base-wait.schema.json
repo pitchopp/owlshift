@@ -1,7 +1,7 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "Owlshift base wait",
-  "description": "A ticket's gate or setup failure waiting for its base, or a red gate the\nmachine cut (OWL-480) waiting for its next run, valid while the ticket is\nat Build in `round`, configured at `configured_at` with `commands`, on\nthe branch head `head`.",
+  "description": "A ticket's gate or setup failure waiting for its base, or a red gate the\nmachine cut (OWL-480) waiting for its next run, valid while the ticket is\nat Build in `round`, configured at `configured_at` with `commands`, on\nthe branch head `head`; with `pushed`, a fix run's red gate the machine\ncut at Watch (OWL-486), valid there alone, while the pull request's head\nis `pushed`.",
   "type": "object",
   "properties": {
     "commands": {
@@ -40,6 +40,13 @@
     "head": {
       "description": "The branch's head the failure was found on, a full commit id.",
       "type": "string"
+    },
+    "pushed": {
+      "description": "The pull request's head a fix run at Watch was made on, for a fix\nwhose red gate the machine cut (OWL-486), a full commit id; none for\na Build's wait. An Owlshift from before OWL-486 does not read a wait\nwith it, and runs the fix again.",
+      "type": [
+        "string",
+        "null"
+      ]
     },
     "round": {
       "type": "integer",

@@ -784,11 +784,12 @@ pub enum Stop {
         pending: bool,
         due: bool,
     },
-    /// A done Build's gate failed on `command` while the machine slept
-    /// `slept`, past the bound, or, `unreachable`, the tracker gave no answer
-    /// right after it (OWL-480): the failure is the machine's, so nothing was
-    /// counted, and the Build's result is kept for its gate alone to run
-    /// again at the next step. Nobody is the blocker.
+    /// A done Build's gate (OWL-480), or a done fix run's at Watch
+    /// (OWL-486), failed on `command` while the machine slept `slept`, past
+    /// the bound, or, `unreachable`, the tracker gave no answer right after
+    /// it: the failure is the machine's, so nothing was counted, and the
+    /// run's result is kept for its gate alone to run again at the next
+    /// step. Nobody is the blocker.
     MachineCut {
         ticket: TicketId,
         command: String,
@@ -1071,7 +1072,7 @@ impl fmt::Display for Stop {
                 write!(
                     f,
                     "Cut by the machine: {ticket}'s gate failed on `{command}`, and {why}, so \
-                     nothing was counted. The Build's result is kept and only its gate runs \
+                     nothing was counted. The run's result is kept and only its gate runs \
                      again, at the next step: `owlshift watch` runs it once the tracker answers, \
                      or run `owlshift continue {ticket}`."
                 )
@@ -6590,6 +6591,23 @@ struct RepairRun<'r> {
     /// Whether a `done`'s gated commit is one to push, or why not: a failed
     /// run then.
     accept: &'r dyn Fn(&CommitId) -> Result<(), String>,
+    /// A fix run's: where a red gate the machine cut keeps its result, and
+    /// the result such a cut kept, whose gate the first attempt runs alone
+    /// (OWL-486). `None` for the other repairs, whose cut gate is counted.
+    cut: Option<FixCut<'r>>,
+}
+
+/// A fix run's machine cut at Watch (OWL-486; architecture section 5, "A
+/// broken base", "The machine's").
+#[derive(Clone, Copy)]
+struct FixCut<'r> {
+    /// The fix's dispatch, whose configuring commit and commands the wait
+    /// keeps.
+    dispatched: &'r Dispatched,
+    /// The pull request's head the fix is made on, Owlshift's last push.
+    pushed: &'r str,
+    /// The result a cut kept, valid on that head.
+    kept: Option<&'r owlshift_contracts::base::KeptDone>,
 }
 
 /// A repair's runs ended on a commit to push.
@@ -6907,6 +6925,14 @@ impl OnDemand<'_> {
             })
         })?;
         let dispatched = self.dispatch(p, Command::Fix, sink)?;
+        // A fix whose red gate the machine cut on this head runs that gate
+        // alone, its result kept (OWL-486); a wait of any other is dropped.
+        let at = crate::base::WaitAt::Fix {
+            pushed: pushed.as_str(),
+        };
+        let kept = self
+            .valid_wait(p, &dispatched, &state, at)
+            .and_then(|wait| wait.done);
         let harness = self.build.harness(dispatched.build);
         let build = |_: u32| &*harness;
         let decorate = |brief: &mut Brief, questions: &TicketQuestions| {
@@ -6935,6 +6961,11 @@ impl OnDemand<'_> {
                 before: &|_, _, _| Ok(()),
                 decorate: &decorate,
                 accept: &accept,
+                cut: Some(FixCut {
+                    dispatched: &dispatched,
+                    pushed: pushed.as_str(),
+                    kept: kept.as_ref(),
+                }),
             },
             sink,
         )?;
@@ -7024,7 +7055,10 @@ impl OnDemand<'_> {
     /// as for a Build run, a `done` whose commit `run.accept` refuses is a
     /// failed run; questions go through the resolver (OWL-342), the run
     /// again when it decides them all, an attempt not counted, else to the
-    /// decider as a round that returns to Watch (OWL-211).
+    /// decider as a round that returns to Watch (OWL-211). A fix run's red
+    /// gate the machine cut stops the runs, nothing counted, its result kept
+    /// (`run.cut`, OWL-486); given such a result, the first attempt runs its
+    /// gate alone ([`Self::regate_role`]).
     fn repair_runs(
         &self,
         p: &mut Prepared,
@@ -7034,6 +7068,13 @@ impl OnDemand<'_> {
     ) -> Result<(RepairDone, Vec<Followup>), Stop> {
         let current = person(p.current()?, &p.found);
         let mut gathered = Gathered::default();
+        // A fix run's result a machine cut kept: its gate alone first, with
+        // what it gathered (OWL-486).
+        let mut regate = run.cut.and_then(|cut| cut.kept);
+        if let Some(done) = regate {
+            gather(&mut gathered.decisions, &done.notes);
+            gather(&mut gathered.followups, &done.followups);
+        }
         let mut attempt = 0u32;
         let mut shown = false;
         loop {
@@ -7058,15 +7099,42 @@ impl OnDemand<'_> {
             );
             (run.decorate)(&mut brief, &p.questions());
             let harness = (run.harness)(attempt);
-            let (ran, mut event) = self.run_role_once(
-                p,
-                (harness, run.rules.setup()),
-                &state,
-                &brief,
-                attempt,
-                &mut gathered,
-                sink,
-            )?;
+            let (ran, mut event) = match regate.take() {
+                Some(done) => self.regate_role(
+                    p,
+                    (harness, run.rules.setup()),
+                    &brief,
+                    attempt,
+                    &done.result,
+                    &mut gathered,
+                    sink,
+                )?,
+                None => self.run_role_once(
+                    p,
+                    (harness, run.rules.setup()),
+                    &state,
+                    &brief,
+                    attempt,
+                    &mut gathered,
+                    sink,
+                )?,
+            };
+            // A fix run's red gate the machine cut counts nothing: its result
+            // is kept for its gate alone at the next step (OWL-486).
+            if event == Event::RunFailed
+                && let Some(cut) = run.cut
+                && let Some(stop) = self.machine_cut(
+                    p,
+                    cut.dispatched,
+                    crate::base::WaitAt::Fix { pushed: cut.pushed },
+                    &mut state,
+                    &ran,
+                    self.kept_done(p, &ran, &gathered, &comments, false),
+                    sink,
+                )?
+            {
+                return Err(stop);
+            }
             let mut detail = None;
             let gated = ran
                 .report
@@ -7356,6 +7424,9 @@ impl OnDemand<'_> {
                 before: &before,
                 decorate: &decorate,
                 accept: &accept,
+                // Each attempt starts from a fresh worktree at the last
+                // push, so no result outlives it: a cut gate is counted.
+                cut: None,
             },
             sink,
         );

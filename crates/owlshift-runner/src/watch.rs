@@ -1351,6 +1351,13 @@ impl Watch<'_> {
                 action: Action::Rebase { .. } | Action::RebaseFailed { .. },
                 ..
             } => Some(Role::Rebase),
+            // Nor a fix whose gate the machine cut, its gate alone run first
+            // (OWL-486): told by the wait file's presence, which the step
+            // checks; a fix run after it is held at its own admission.
+            Decision::Follow {
+                action: Action::Fix { .. },
+                ..
+            } if base::wait_file(on_demand.dirs, ticket).exists() => None,
             _ => Some(Role::Build),
         };
         self.held_run(
