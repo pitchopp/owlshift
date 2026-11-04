@@ -276,6 +276,24 @@
           "required": [
             "kind"
           ]
+        },
+        {
+          "description": "A parked ticket's restart its decider typed on the ticket (OWL-488):\n`comment`, the newest `continue` comment watch read; the step reads\nthe thread again and decides with the ticket's decider.",
+          "type": "object",
+          "properties": {
+            "comment": {
+              "type": "string"
+            },
+            "kind": {
+              "type": "string",
+              "const": "restart"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "comment"
+          ]
         }
       ]
     },

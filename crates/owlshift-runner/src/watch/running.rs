@@ -54,6 +54,9 @@ pub(super) enum Then {
     Intake { seen: Seen },
     /// The drain's dispatch from Ready.
     Dispatch { seen: Seen },
+    /// A restart typed on the ticket (OWL-488), from what watch read; an
+    /// intake when the park restarts to Intake.
+    Restart { seen: Seen, intake: bool },
 }
 
 /// A step's child in flight, with what follows its end.
@@ -68,9 +71,13 @@ impl RunningStep {
         self.child.ticket()
     }
 
-    /// Whether it is an intake.
+    /// Whether it is an intake: the drain's, or a park's at Intake
+    /// restarted from the ticket (OWL-488).
     pub(super) fn intake(&self) -> bool {
-        matches!(self.then, Then::Intake { .. })
+        matches!(
+            self.then,
+            Then::Intake { .. } | Then::Restart { intake: true, .. }
+        )
     }
 
     /// Whether it is a dispatch from Ready.
@@ -284,6 +291,7 @@ impl Watch<'_> {
             }
             Then::Intake { seen } => self.taken_in(memory, ticket, seen, end, sink, out),
             Then::Dispatch { seen } => self.dispatched(memory, ticket, seen, end, sink, out),
+            Then::Restart { seen, .. } => self.restarted(memory, sink, out, ticket, seen, end),
         }
     }
 

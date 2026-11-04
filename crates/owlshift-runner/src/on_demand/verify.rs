@@ -703,7 +703,10 @@ impl OnDemand<'_> {
         if let Some(ask) = p.questions().latest() {
             let decider = person(&ask.decider, &p.found);
             let now = self.comments(ticket)?;
-            let late = answer_check::edited_after(built.seen, &now, &decider);
+            // The decider's `continue` alone is no content the Build missed:
+            // it restarts a park from the ticket (OWL-488).
+            let mut late = answer_check::edited_after(built.seen, &now, &decider);
+            late.retain(|comment| !typed::is_restart_word(&comment.body));
             if !late.is_empty() {
                 return Err(Stop::Refused(format!(
                     "{} commented on {ticket} after the Build that Verify reviews read the \

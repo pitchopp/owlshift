@@ -65,7 +65,7 @@ author = "owlshift"
 first_line = "[owlshift] PARKED"
 contains = [
   "status is done, but the previous run's decisions were refused",
-  "**To restart it:** run `owlshift continue DEMO-5`.",
+  "**To restart it:** reply `continue` here, in a comment of its own, or run `owlshift continue DEMO-5`.",
 ]
 
 [[step]]

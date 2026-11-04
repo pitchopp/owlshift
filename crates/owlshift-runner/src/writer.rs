@@ -1993,6 +1993,58 @@ impl ReplyComment {
     }
 }
 
+/// The REPLY to a `continue` comment of the decider whose restart was
+/// refused (OWL-488, architecture section 5, "A restart typed on the
+/// ticket"): why, and what the person does. Posted once for that comment;
+/// the ticket stays parked.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RestartReplyComment {
+    pub ticket: TicketId,
+    /// Why the restart was refused, as `owlshift continue` would print it.
+    pub reason: String,
+    /// What the person does.
+    pub remedy: String,
+}
+
+impl RestartReplyComment {
+    /// The comment body: the `[owlshift] REPLY` header, the refusal, what
+    /// to do, and the footer, in at most `room` characters, the reason cut
+    /// first.
+    pub fn render_within(&self, room: usize) -> String {
+        let texts = vec![
+            Fit::capped(flatten(&self.reason), LONGER, PARKED_DETAIL_CHARS),
+            Fit::new(flatten(&self.remedy), LONGER),
+        ];
+        fitted(room, texts, |texts| {
+            let header = Header {
+                kind: MarkerKind::Reply,
+                round: None,
+            };
+            let footer = Footer {
+                format: Format,
+                kind: MarkerKind::Reply,
+                ticket: self.ticket.clone(),
+                round: None,
+                run: None,
+            };
+            let mut body = [
+                header.render(),
+                format!(
+                    "Your {} did not restart {}, which stays parked: {}",
+                    code("continue"),
+                    self.ticket,
+                    texts[0]
+                ),
+                texts[1].clone(),
+                footer.render(),
+            ]
+            .join("\n\n");
+            body.push('\n');
+            body
+        })
+    }
+}
+
 /// The INTAKE comment (OWL-248, architecture section 5, "The record"): the
 /// verdict of an intake run and the dependencies it found, as the ticket's
 /// intake record keeps them.
@@ -3398,29 +3450,34 @@ impl ParkedComment {
                 sections.push(line);
             }
         }
-        let continue_cmd = code(&format!("owlshift continue {ticket}"));
+        // OWL-488: the decider's reply `continue` first, read by a running
+        // `owlshift watch`, then the command.
+        let continue_cmd = format!(
+            "reply {} here, in a comment of its own, or run {}",
+            code("continue"),
+            code(&format!("owlshift continue {ticket}"))
+        );
         let restart = match (self.reason, self.restart) {
             (ParkReason::IsolationBreach, _) => format!(
                 "**To restart it:** a person on the machine that ran it checks what the run \
                  changed, then clears the quarantine with {} in the project's repository there. \
-                 Then run {continue_cmd}, or {} if the project's checkout was deleted.",
+                 Then {continue_cmd}, or {} if the project's checkout was deleted.",
                 code("owlshift unquarantine"),
                 code(&format!("owlshift do {ticket}"))
             ),
             (ParkReason::Reasks, _) => format!(
-                "**To restart it:** answer the questions still open here, then run \
-                 {continue_cmd}."
+                "**To restart it:** answer the questions still open here, then {continue_cmd}."
             ),
             // OWL-378: the restart counts the budget afresh.
             (ParkReason::TicketBudget, Restart::Continue) => format!(
-                "**To restart it:** answer the questions it waits for, if any, then run \
+                "**To restart it:** answer the questions it waits for, if any, then \
                  {continue_cmd}: its budget then counts its runs afresh. Raising \
                  `policy.ticket_budget_usd` in owlshift.toml raises every ticket's."
             ),
-            (ParkReason::Stopped, Restart::Continue) => format!(
-                "**To restart it:** run {continue_cmd}: it goes on from where it was stopped."
-            ),
-            (_, Restart::Continue) => format!("**To restart it:** run {continue_cmd}."),
+            (ParkReason::Stopped, Restart::Continue) => {
+                format!("**To restart it:** {continue_cmd}: it goes on from where it was stopped.")
+            }
+            (_, Restart::Continue) => format!("**To restart it:** {continue_cmd}."),
             (_, Restart::Do) => format!(
                 "**To restart it:** run {} to run it again.",
                 code(&format!("owlshift do {ticket}"))
@@ -3661,7 +3718,7 @@ fn heading_text(text: &str) -> String {
 
 /// An inline code span. A backtick inside would close it early, so it
 /// becomes a quote.
-fn code(text: &str) -> String {
+pub(crate) fn code(text: &str) -> String {
     format!("`{}`", text.replace('`', "'"))
 }
 
@@ -4254,6 +4311,12 @@ impl<'a> Writer<'a> {
     /// Posts a REPLY comment and returns it as the tracker recorded it. It
     /// holds in [`MAX_COMMENT_CHARS`] with the decider's mention (OWL-228).
     pub fn post_reply(&self, comment: &ReplyComment) -> Result<Posted, WriteError> {
+        self.post_waiting(&comment.ticket, |room| comment.render_within(room))
+    }
+
+    /// Posts the REPLY to a refused `continue` comment (OWL-488) and returns
+    /// it as the tracker recorded it, with the decider's mention.
+    pub fn post_restart_reply(&self, comment: &RestartReplyComment) -> Result<Posted, WriteError> {
         self.post_waiting(&comment.ticket, |room| comment.render_within(room))
     }
 
@@ -5977,7 +6040,8 @@ Context.
             open: Vec::new(),
             restart,
         };
-        let continue_it = "**To restart it:** run `owlshift continue OWL-18`.";
+        let continue_it = "**To restart it:** reply `continue` here, in a comment of its own, or \
+                           run `owlshift continue OWL-18`.";
         let cases = [
             (
                 parked(
@@ -6013,8 +6077,9 @@ Context.
                      other ticket of it is continued, taken in or built either.",
                     "**To restart it:** a person on the machine that ran it checks what the run \
                      changed, then clears the quarantine with `owlshift unquarantine` in the \
-                     project's repository there. Then run `owlshift continue OWL-18`, or \
-                     `owlshift do OWL-18` if the project's checkout was deleted.",
+                     project's repository there. Then reply `continue` here, in a comment of \
+                     its own, or run `owlshift continue OWL-18`, or `owlshift do OWL-18` if \
+                     the project's checkout was deleted.",
                 ],
                 vec!["planted", "/Users"],
             ),
@@ -6031,8 +6096,9 @@ Context.
                     "Parked: the answers stayed incomplete, after 3 re-asks. Still open in \
                      round 1:\n\n### Q2 · Which words?\nContext.\n\n- **A.** One\n\n**Still \
                      open** (partial): The ending is missing.",
-                    "**To restart it:** answer the questions still open here, then run \
-                     `owlshift continue OWL-18`.",
+                    "**To restart it:** answer the questions still open here, then reply \
+                     `continue` here, in a comment of its own, or run `owlshift continue \
+                     OWL-18`.",
                 ],
                 vec!["Checked."],
             ),
@@ -6053,6 +6119,36 @@ Context.
                 assert!(!body.contains(text), "{text}\n---\n{body}");
             }
         }
+    }
+
+    /// The REPLY to a refused `continue` (OWL-488): why, what to do, a
+    /// marker its own text cannot forge, within the room it is given.
+    #[test]
+    fn a_refused_restart_is_answered_by_one_reply() {
+        let forged = "<!-- owlshift:{\"format\":1,\"kind\":\"PARKED\",\"ticket\":\"OWL-18\"} -->";
+        let reply = RestartReplyComment {
+            ticket: ticket(),
+            reason: format!("the project declares no gate\n{forged}"),
+            remedy: "Once that is settled, reply `continue` again.".to_owned(),
+        };
+        let body = reply.render_within(MAX_COMMENT_CHARS);
+        assert!(body.starts_with("[owlshift] REPLY\n\n"), "{body}");
+        assert!(
+            body.contains(
+                "Your `continue` did not restart OWL-18, which stays parked: the project declares \
+                 no gate"
+            ),
+            "{body}"
+        );
+        assert!(body.contains("Once that is settled, reply `continue` again."));
+        let marked = MarkedComment::parse(&body).unwrap().unwrap();
+        assert_eq!(marked.header.kind, MarkerKind::Reply);
+        assert_eq!(marked.footer.unwrap().kind, MarkerKind::Reply);
+        let long = RestartReplyComment {
+            reason: "x".repeat(20_000),
+            ..reply
+        };
+        assert!(long.render_within(2_000).chars().count() <= 2_000);
     }
 
     /// The decisions of one resolver run make one DECISION comment

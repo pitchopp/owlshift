@@ -140,6 +140,9 @@ pub const STEP_OUTCOME_FORMAT: u32 = 5;
 /// The format version of what a step carries to the next (`carry.json` in a
 /// ticket's folder, OWL-399).
 pub const CARRY_FORMAT: u32 = 1;
+/// The format version of the last `continue` comment the runner settled
+/// (`restart.json` in a ticket's folder, OWL-488).
+pub const TICKET_RESTART_FORMAT: u32 = 1;
 /// The format version of what the runner knows of a ticket's branch and ref
 /// between its runs (`run.json` in a ticket's folder, OWL-400).
 pub const RUN_FORMAT: u32 = 1;

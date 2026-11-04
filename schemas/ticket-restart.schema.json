@@ -1,0 +1,54 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Owlshift ticket restart",
+  "description": "The last `continue` comment of a ticket's decider that the runner\nsettled (OWL-488; architecture section 5, \"A restart typed on the\nticket\"), kept in `restart.json` in the ticket's folder: a comment\ncounts only once it is newer than this one, so one comment restarts at\nmost one park and is answered at most once.",
+  "type": "object",
+  "properties": {
+    "at": {
+      "description": "When the tracker recorded it.",
+      "type": "string",
+      "format": "date-time"
+    },
+    "comment": {
+      "description": "The tracker's identifier of the comment.",
+      "type": "string"
+    },
+    "format": {
+      "description": "The format version of this document.",
+      "type": "integer",
+      "const": 1
+    },
+    "settled": {
+      "$ref": "#/$defs/Settled"
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "format",
+    "comment",
+    "at",
+    "settled"
+  ],
+  "$defs": {
+    "Settled": {
+      "description": "How a `continue` comment was settled.",
+      "oneOf": [
+        {
+          "description": "It restarted the ticket.",
+          "type": "string",
+          "const": "restarted"
+        },
+        {
+          "description": "It was the newest of `continue` comments none of which was the\ndecider's.",
+          "type": "string",
+          "const": "not_counted"
+        },
+        {
+          "description": "Its restart was refused, and a REPLY said why.",
+          "type": "string",
+          "const": "replied"
+        }
+      ]
+    }
+  }
+}

@@ -155,7 +155,12 @@ impl OnDemand<'_> {
             stage: next.stage(),
             takes: taken,
             restarted: parked,
-            watching: presence::watching(self.dirs).ok(),
+            // A restart typed on the ticket is watch's own step (OWL-488).
+            watching: if p.typed.is_some() {
+                Some(true)
+            } else {
+                presence::watching(self.dirs).ok()
+            },
         }
     }
 
@@ -222,6 +227,20 @@ impl OnDemand<'_> {
         if let Some(taken) = handed {
             event.insert("to_watch".to_owned(), json!(true));
             event.insert("takes".to_owned(), json!(taken.key()));
+        }
+        // A restart typed on the ticket (OWL-488): its comment, kept as
+        // settled, so it restarts no later park.
+        if let Some(typed) = &p.typed {
+            event.insert("by".to_owned(), json!("tracker"));
+            event.insert("comment".to_owned(), json!(typed.comment));
+            typed::settle(
+                self.dirs,
+                ticket,
+                &typed.comment,
+                typed.at,
+                owlshift_contracts::step::Settled::Restarted,
+                sink,
+            );
         }
         sink.emit(ticket, None, EventKind::Decision, event);
         if handed.is_none()
