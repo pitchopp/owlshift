@@ -3,8 +3,10 @@
 //! foreground. The decisions are architecture section 5's "Watch mode".
 //!
 //! Each pass takes the project's lock for a moment, the snapshot: it checks
-//! the `unverified` marker and reads the ticket refs. The lock is released
-//! before the tracker is read, so a command typed by hand meanwhile runs.
+//! the `unverified` marker and lists the ticket refs with their commits. The
+//! lock is released before the refs' records are read, by those commits
+//! (OWL-489), and before the tracker is, so a command typed by hand
+//! meanwhile runs.
 //! Each ticket whose questions wait ([`watched`]) has its comments read, and
 //! when the decider's reply counts ([`answer_check::readiness`], the function
 //! `continue` asks too), the ticket goes through `continue`'s own path,
@@ -2034,14 +2036,19 @@ impl Watch<'_> {
         Ok(Some(lock))
     }
 
-    /// The ticket refs, read under the project's lock, and the marker of a
-    /// run whose isolation check did not pass, when one stands. While it
-    /// does, what watch knows of it is brought up to date under that lock
-    /// (`keep_quarantine`, OWL-368), and the refs are read through the
-    /// runner's read-only plumbing alone, nothing written: none when they
-    /// cannot be. The marker is read first, so that one left once the
-    /// dedicated checkout was deleted still stands. No dedicated checkout
-    /// and no marker: nothing was asked.
+    /// The ticket refs and the marker of a run whose isolation check did not
+    /// pass, when one stands. Under the project's lock, the marker, then one
+    /// listing of the ticket refs with the commit each points to
+    /// ([`ticket_ref::listing`]); the records are read once the lock is let
+    /// go, by those commits, which never change (OWL-489): the snapshot is
+    /// the refs as they were at the listing, a ref moved or gone since read
+    /// as listed, and every act on one reads it again under the lock
+    /// (`locked_at`). While a marker stands, what watch knows of it is
+    /// brought up to date under that lock (`keep_quarantine`, OWL-368), and
+    /// the refs are read through the runner's read-only plumbing alone,
+    /// nothing written: none when they cannot be listed. The marker is read
+    /// first, so that one left once the dedicated checkout was deleted
+    /// still stands. No dedicated checkout and no marker: nothing was asked.
     fn snapshot(&self, memory: &mut Memory, sink: &mut EventSink<'_>) -> Result<Snapshot, Project> {
         let dirs = self.on_demand.dirs;
         let checkout = dirs.checkout();
@@ -2076,16 +2083,18 @@ impl Watch<'_> {
             });
         }
         let git = &self.on_demand.executor.git;
-        let tickets = match ticket_ref::list(git, &checkout) {
-            Ok(tickets) => tickets,
+        let listing = match ticket_ref::listing(git, &checkout) {
+            Ok(listing) => listing,
             Err(_) if quarantine.is_some() => Vec::new(),
             Err(e) => return Err(Project::Unread(e)),
         };
-        let refs = tickets
+        // The lock goes before the records are read: a command typed
+        // meanwhile no longer waits for a few git commands per ref (OWL-489).
+        drop(lock);
+        let refs = listing
             .into_iter()
-            .map(|ticket| {
-                let stored = ticket_ref::read(git, &checkout, &ticket)
-                    .and_then(|stored| stored.ok_or_else(|| "its ticket ref is gone".to_owned()));
+            .map(|(ticket, listed)| {
+                let stored = ticket_ref::read_listed_ref(git, &checkout, &ticket, &listed);
                 (ticket, stored)
             })
             .collect();
