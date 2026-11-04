@@ -217,7 +217,6 @@ fn web_checkout() -> tempfile::TempDir {
 fn the_daemon_runs_once_pauses_a_project_it_cannot_serve_and_stops() {
     use std::os::unix::process::CommandExt;
     use std::process::Stdio;
-    use std::time::{Duration, Instant};
 
     let config_dir = tempfile::tempdir().unwrap();
     fs::write(
@@ -252,19 +251,8 @@ fn the_daemon_runs_once_pauses_a_project_it_cannot_serve_and_stops() {
             fs::read_to_string(config_dir.path().join("daemon.err")).unwrap_or_default()
         )
     };
-    let wait_for = |what: &str, done: &dyn Fn() -> bool| {
-        let deadline = Instant::now() + Duration::from_secs(15);
-        while !done() {
-            assert!(
-                Instant::now() < deadline,
-                "still waiting for {what}\n{}",
-                said()
-            );
-            std::thread::sleep(Duration::from_millis(50));
-        }
-    };
     let record = service.join("daemon.json");
-    wait_for("the daemon's record", &|| record.exists());
+    wait::until_with("the daemon's record", said, || record.exists());
 
     let second = owlshift(config_dir.path(), config_dir.path(), &["daemon"]);
     assert_eq!(second.status.code(), Some(1), "{}", stderr(&second));
@@ -280,7 +268,7 @@ fn the_daemon_runs_once_pauses_a_project_it_cannot_serve_and_stops() {
     );
 
     let pause = data.join("projects/github.com/acme/gone/pause");
-    wait_for("acme/gone's pause", &|| pause.exists());
+    wait::until_with("acme/gone's pause", said, || pause.exists());
     let paused = fs::read_to_string(&pause).unwrap();
     assert!(paused.contains("\"by\":\"owlshift daemon\""), "{paused}");
     assert!(paused.contains("which is gone"), "{paused}");
@@ -306,17 +294,15 @@ fn the_daemon_runs_once_pauses_a_project_it_cannot_serve_and_stops() {
         "{}",
         stdout(&stopped)
     );
-    let deadline = Instant::now() + Duration::from_secs(15);
-    let status = loop {
-        if let Some(status) = daemon.try_wait().unwrap() {
-            break status;
-        }
-        if Instant::now() >= deadline {
-            let _ = daemon.kill();
-            panic!("the daemon still runs after `owlshift stop`\n{}", said());
-        }
-        std::thread::sleep(Duration::from_millis(50));
-    };
+    let mut status = None;
+    if !wait::reached(wait::REACHED, || {
+        status = daemon.try_wait().unwrap();
+        status.is_some()
+    }) {
+        let _ = daemon.kill();
+        panic!("the daemon still runs after `owlshift stop`\n{}", said());
+    }
+    let status = status.unwrap();
     assert!(status.success(), "{status}\n{}", said());
     assert!(!record.exists());
     assert!(!service.join("stop").exists());
@@ -395,8 +381,6 @@ fn uninstall_purges_owlshifts_entries_and_leaves_the_rest() {
 #[cfg(unix)]
 #[test]
 fn start_runs_the_daemon_for_the_session_and_stop_ends_it() {
-    use std::time::{Duration, Instant};
-
     let config_dir = tempfile::tempdir().unwrap();
     fs::write(
         config_dir.path().join("config.toml"),
@@ -424,18 +408,14 @@ fn start_runs_the_daemon_for_the_session_and_stop_ends_it() {
 
     let stopped = owlshift(config_dir.path(), config_dir.path(), &["stop"]);
     assert!(stopped.status.success(), "{}", stderr(&stopped));
-    let deadline = Instant::now() + Duration::from_secs(20);
-    while is_alive(pid) {
-        if Instant::now() >= deadline {
-            let _ = Command::new("kill")
-                .args(["-s", "KILL", &pid.to_string()])
-                .status();
-            panic!(
-                "the daemon still runs after `owlshift stop`\n{}",
-                read_log()
-            );
-        }
-        std::thread::sleep(Duration::from_millis(50));
+    if !wait::reached(wait::REACHED, || !is_alive(pid)) {
+        let _ = Command::new("kill")
+            .args(["-s", "KILL", &pid.to_string()])
+            .status();
+        panic!(
+            "the daemon still runs after `owlshift stop`\n{}",
+            read_log()
+        );
     }
     assert!(!service.join("daemon.json").exists(), "{}", read_log());
     assert!(read_log().contains("The daemon stopped"), "{}", read_log());
@@ -703,8 +683,10 @@ fn ctrl_c_on_doctor_stops_a_hung_probe_and_its_child() {
 
 /// The acceptance criterion for OWL-86: killing `doctor` outright while a
 /// probe hangs, which runs no handler, still stops the probe and the process
-/// it started, within five seconds. The whole process group `owlshift` leads
-/// is killed, so what stops the probe, the sentinel, cannot be in that group.
+/// it started. The whole process group `owlshift` leads is killed, so what
+/// stops the probe, the sentinel, cannot be in that group. The probe's child
+/// would outlive the wait, so only a stop passes; the five seconds measured
+/// when it was decided are no bound of the design's (OWL-493).
 #[cfg(unix)]
 #[test]
 fn a_hard_kill_of_doctor_stops_a_hung_probe_and_its_child() {
@@ -745,12 +727,11 @@ impl HungProbe {
         use std::os::unix::fs::PermissionsExt;
         use std::os::unix::process::CommandExt;
         use std::process::Stdio;
-        use std::thread;
-        use std::time::{Duration, Instant};
 
-        // A `git` whose `--version` starts a long-lived child, records both
-        // pids, and waits on the child; anything else answers as git does
-        // outside a repository, so loading the configuration does not hang.
+        // A `git` whose `--version` starts a child that outlives every wait,
+        // so that only a stop ends it, records both pids, and waits on the
+        // child; anything else answers as git does outside a repository, so
+        // loading the configuration does not hang.
         let bin = tempfile::tempdir().unwrap();
         let pids = bin.path().join("pids");
         let git = bin.path().join("git");
@@ -759,14 +740,15 @@ impl HungProbe {
             format!(
                 "#!/bin/sh\n\
                  if [ \"$1\" = --version ]; then\n\
-                 \x20 sleep 30 &\n\
+                 \x20 sleep {outlasts} &\n\
                  \x20 echo \"$$ $!\" > '{pids}.tmp'\n\
                  \x20 mv '{pids}.tmp' '{pids}'\n\
                  \x20 wait\n\
                  fi\n\
                  echo 'fatal: not a git repository' >&2\n\
                  exit 128\n",
-                pids = pids.display()
+                pids = pids.display(),
+                outlasts = wait::OUTLASTS.as_secs()
             ),
         )
         .unwrap();
@@ -787,13 +769,22 @@ impl HungProbe {
             .spawn()
             .unwrap();
 
-        let probe_started = Instant::now() + Duration::from_secs(10);
-        while !pids.exists() {
-            if let Some(status) = owlshift.try_wait().unwrap() {
-                panic!("owlshift ended before its probe started: {status}");
+        // Doctor tries its sentinel and loads the configuration first, which
+        // a loaded machine slows (OWL-493).
+        let mut ended = None;
+        wait::reached(wait::REACHED, || {
+            pids.exists() || {
+                ended = owlshift.try_wait().unwrap();
+                ended.is_some()
             }
-            assert!(Instant::now() < probe_started, "the probe never started");
-            thread::sleep(Duration::from_millis(20));
+        });
+        if !pids.exists() {
+            let _ = owlshift.kill();
+            let _ = owlshift.wait();
+            match ended {
+                Some(status) => panic!("owlshift ended before its probe started: {status}"),
+                None => panic!("the probe never started"),
+            }
         }
         let pids = fs::read_to_string(&pids)
             .unwrap()
@@ -832,37 +823,26 @@ impl HungProbe {
         assert!(sent.success(), "kill {args:?}");
     }
 
-    /// Waits for `owlshift` to end after `signal`, promptly: well before the
-    /// probe's own ten-second deadline.
+    /// Waits for `owlshift` to end after `signal`. What ended it, the signal
+    /// or the probe's own ten-second deadline, the caller reads from the
+    /// status; a failure leaves the kill to `Drop`.
     fn ended(&mut self, signal: &str) -> std::process::ExitStatus {
-        use std::thread;
-        use std::time::{Duration, Instant};
-
-        let ended = Instant::now() + Duration::from_secs(5);
-        loop {
-            if let Some(status) = self.owlshift.try_wait().unwrap() {
-                return status;
-            }
-            if Instant::now() >= ended {
-                let _ = self.owlshift.kill();
-                panic!("owlshift still running 5 s after {signal}");
-            }
-            thread::sleep(Duration::from_millis(20));
-        }
+        let mut status = None;
+        wait::until(&format!("owlshift to end after {signal}"), || {
+            status = self.owlshift.try_wait().unwrap();
+            status.is_some()
+        });
+        status.unwrap()
     }
 
-    /// Checks the probe and its child are gone within five seconds: killed
-    /// processes take a moment to be gone, as an orphan is reaped by the
-    /// system.
+    /// Checks the probe and its child are gone: killed processes take a
+    /// moment to be gone, as an orphan is reaped by the system.
     fn assert_probe_gone(&self) {
-        use std::thread;
-        use std::time::{Duration, Instant};
-
-        let settled = Instant::now() + Duration::from_secs(5);
-        while self.pids.iter().any(|&pid| is_alive(pid)) {
-            assert!(Instant::now() < settled, "still running: {:?}", self.pids);
-            thread::sleep(Duration::from_millis(50));
-        }
+        wait::until_with(
+            "the probe and its child to be gone",
+            || format!("still running among {:?}", self.pids),
+            || !self.pids.iter().any(|&pid| is_alive(pid)),
+        );
     }
 }
 
@@ -896,9 +876,11 @@ fn doctor_reports_a_sentinel_killed_while_it_runs() {
     let mut hung = HungProbe::start();
     let sentinel = hung.sentinel();
     hung.signal(&["-s", "KILL", &sentinel.to_string()]);
-    // Gone before the probe ends and `doctor` reads its state; well within
-    // the probe's ten-second deadline.
-    wait_for("the sentinel to be gone", || !is_alive(sentinel));
+    // Gone before the probe ends and `doctor` reads its state. The bound is
+    // the probe's own ten-second deadline (runtime-and-operations.md, "the
+    // 10 s deadline of each doctor probe"), which the check that `doctor`
+    // still runs enforces, not the wait.
+    wait::until("the sentinel to be gone", || !is_alive(sentinel));
     assert!(
         hung.owlshift.try_wait().unwrap().is_none(),
         "doctor ended early"
@@ -926,7 +908,7 @@ fn doctor_reports_a_sentinel_stopped_while_it_runs() {
     let sentinel = hung.sentinel();
     let _left = KillIfStopped(sentinel);
     hung.signal(&["-s", "STOP", &sentinel.to_string()]);
-    wait_for("the sentinel to stop", || state(sentinel).starts_with('T'));
+    wait::until("the sentinel to stop", || state(sentinel).starts_with('T'));
     for pid in hung.pids.clone() {
         hung.signal(&["-s", "KILL", &pid.to_string()]);
     }
@@ -972,18 +954,10 @@ fn sentinel_line(report: &str) -> &str {
         .unwrap_or_else(|| panic!("no sentinel line:\n{report}"))
 }
 
-/// Waits until `done` holds, 5 s at most.
-#[cfg(unix)]
-fn wait_for(what: &str, mut done: impl FnMut() -> bool) {
-    use std::thread;
-    use std::time::{Duration, Instant};
-
-    let deadline = Instant::now() + Duration::from_secs(5);
-    while !done() {
-        assert!(Instant::now() < deadline, "5 s without {what}");
-        thread::sleep(Duration::from_millis(20));
-    }
-}
+// How a test waits for a state (OWL-493), shared with the test bench.
+#[allow(dead_code)]
+#[path = "../../owlshift-testkit/src/wait.rs"]
+mod wait;
 
 // A process's state, with no `ps`: it is setuid on macOS, which a confined
 // process may not run (OWL-110).
@@ -1030,7 +1004,8 @@ fn helper_hung_git() {
 #[ignore = "helper, run by the Windows Ctrl-C test"]
 fn helper_sleep() {
     if windows_ctrl_c::helper_requested() {
-        std::thread::sleep(std::time::Duration::from_secs(30));
+        // Longer than any wait, so that only a stop ends it (OWL-493).
+        std::thread::sleep(wait::OUTLASTS);
     }
 }
 
@@ -1050,9 +1025,9 @@ mod windows_ctrl_c {
     use std::path::{Path, PathBuf};
     use std::process::{Command, Stdio};
     use std::sync::atomic::{AtomicBool, Ordering};
-    use std::thread;
-    use std::time::{Duration, Instant};
+    use std::time::Instant;
 
+    use super::wait;
     use windows_sys::Win32::Foundation::STATUS_CONTROL_C_EXIT;
     use windows_sys::Win32::System::Console::{
         CTRL_C_EVENT, GenerateConsoleCtrlEvent, SetConsoleCtrlHandler,
@@ -1135,17 +1110,17 @@ mod windows_ctrl_c {
             .stdout(File::create(&log).unwrap())
             .stderr(File::create(bin.path().join("driver.err")).unwrap());
         let mut driver = driver.spawn().unwrap();
-        let deadline = Instant::now() + Duration::from_secs(60);
-        let status = loop {
-            if let Some(status) = driver.try_wait().unwrap() {
-                break status;
-            }
-            if Instant::now() >= deadline {
-                // With `owlshift` and the probe, if still there.
-                stop(&[driver.id()]);
-                break driver.wait().unwrap();
-            }
-            thread::sleep(Duration::from_millis(50));
+        // The driver's own waits, four, are each `REACHED` at most.
+        let mut ended = None;
+        let status = if wait::reached(wait::REACHED * 5, || {
+            ended = driver.try_wait().unwrap();
+            ended.is_some()
+        }) {
+            ended.unwrap()
+        } else {
+            // With `owlshift` and the probe, if still there.
+            stop(&[driver.id()]);
+            driver.wait().unwrap()
         };
         let report = format!(
             "driver {status}\n--- stdout\n{}\n--- stderr\n{}",
@@ -1184,7 +1159,8 @@ mod windows_ctrl_c {
 
     /// The driver: runs `owlshift doctor` in this console, sends the console
     /// a Ctrl-C once the probe has started, checks how `owlshift` ended, and
-    /// that the probe and its child are gone within 5 s.
+    /// that the probe and its child are gone, the child outliving every wait
+    /// on its own.
     pub(super) fn interrupt_in_this_console() {
         let bin = var(BIN);
         let config_dir = var(CONFIG_DIR);
@@ -1224,13 +1200,21 @@ mod windows_ctrl_c {
         let noted = unsafe { SetConsoleCtrlHandler(Some(note_ctrl_c), 1) };
         assert_ne!(noted, 0, "{}", io::Error::last_os_error());
 
-        let probe_started = Instant::now() + Duration::from_secs(10);
-        while !pids.exists() {
-            if let Some(status) = owlshift.try_wait().unwrap() {
-                panic!("owlshift ended before its probe started: {status}");
+        // Doctor loads the configuration first, which a loaded machine slows
+        // (OWL-493).
+        let mut ended = None;
+        wait::reached(wait::REACHED, || {
+            pids.exists() || {
+                ended = owlshift.try_wait().unwrap();
+                ended.is_some()
             }
-            assert!(Instant::now() < probe_started, "the probe never started");
-            thread::sleep(Duration::from_millis(20));
+        });
+        if !pids.exists() {
+            let _ = owlshift.kill();
+            match ended {
+                Some(status) => panic!("owlshift ended before its probe started: {status}"),
+                None => panic!("the probe never started"),
+            }
         }
         println!("probe: {}", fs::read_to_string(&pids).unwrap());
         let started = read_pids(&pids);
@@ -1254,42 +1238,39 @@ mod windows_ctrl_c {
         let generated = unsafe { GenerateConsoleCtrlEvent(CTRL_C_EVENT, 0) };
         assert_ne!(generated, 0, "{}", io::Error::last_os_error());
 
-        // Promptly: well before the probe's own ten-second deadline.
-        let status = loop {
-            if let Some(status) = owlshift.try_wait().unwrap() {
-                break status;
-            }
-            if sent.elapsed() >= Duration::from_secs(5) {
-                let _ = owlshift.kill();
-                stop(&started);
-                panic!(
-                    "owlshift still running 5 s after Ctrl-C (seen by the driver: {})",
-                    CTRL_C_SEEN.load(Ordering::SeqCst)
-                );
-            }
-            thread::sleep(Duration::from_millis(20));
-        };
+        // What ended it, the Ctrl-C or the probe's own ten-second deadline,
+        // the status says (OWL-493).
+        let mut status = None;
+        if !wait::reached(wait::REACHED, || {
+            status = owlshift.try_wait().unwrap();
+            status.is_some()
+        }) {
+            let _ = owlshift.kill();
+            stop(&started);
+            panic!(
+                "owlshift still running {:?} after Ctrl-C (seen by the driver: {})",
+                wait::REACHED,
+                CTRL_C_SEEN.load(Ordering::SeqCst)
+            );
+        }
+        let status = status.unwrap();
         let ended = sent.elapsed();
         // The driver's own handler runs on a thread of its own, maybe later.
-        while !CTRL_C_SEEN.load(Ordering::SeqCst) && sent.elapsed() < ended + Duration::from_secs(1)
-        {
-            thread::sleep(Duration::from_millis(10));
-        }
-        let seen = CTRL_C_SEEN.load(Ordering::SeqCst);
+        let seen = wait::reached(wait::REACHED, || CTRL_C_SEEN.load(Ordering::SeqCst));
         println!(
             "owlshift ended {ended:?} after Ctrl-C: {status}; Ctrl-C seen by the driver: {seen}"
         );
 
         // A process ends asynchronously once stopped.
         let mut gone = [None, None];
-        while gone.iter().any(Option::is_none) && sent.elapsed() < ended + Duration::from_secs(5) {
+        wait::reached(wait::REACHED, || {
             for (at, &pid) in gone.iter_mut().zip(&started) {
                 if at.is_none() && !is_alive(pid) {
                     *at = Some(sent.elapsed());
                 }
             }
-            thread::sleep(Duration::from_millis(20));
-        }
+            gone.iter().all(Option::is_some)
+        });
         println!(
             "after Ctrl-C, gone: probe {:?}, child {:?}",
             gone[0], gone[1]
@@ -1309,7 +1290,8 @@ mod windows_ctrl_c {
         );
         assert!(
             alive.is_empty(),
-            "still running 5 s after owlshift ended: {alive:?} of the probe and its child {started:?}"
+            "still running {:?} after owlshift ended: {alive:?} of the probe and its child {started:?}",
+            wait::REACHED
         );
     }
 
@@ -1753,7 +1735,6 @@ fn logs_follow_prints_events_as_they_are_recorded() {
     use std::io::{BufRead, BufReader, Write};
     use std::process::Stdio;
     use std::sync::mpsc;
-    use std::time::Duration;
 
     let config_dir = tempfile::tempdir().unwrap();
     let data = config_dir.path().join("data");
@@ -1775,7 +1756,7 @@ fn logs_follow_prints_events_as_they_are_recorded() {
             }
         }
     });
-    let next = || received.recv_timeout(Duration::from_secs(10));
+    let next = || received.recv_timeout(wait::REACHED);
     let seen = next();
     let mut file = fs::OpenOptions::new()
         .append(true)
