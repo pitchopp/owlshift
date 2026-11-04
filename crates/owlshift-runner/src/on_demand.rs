@@ -170,6 +170,7 @@ mod limits;
 mod merge_note;
 mod review_loop;
 mod to_watch;
+pub mod typed;
 mod verify;
 
 pub use cancel::Canceled;
@@ -1461,6 +1462,10 @@ struct Prepared {
     /// `owlshift continue --to-watch` (OWL-420): the command restarts a
     /// park and leaves the ticket to watch, running nothing.
     to_watch: bool,
+    /// The decider's `continue` comment on the ticket that this restart of
+    /// a park is (OWL-488), which the restart's `decision` event names; a
+    /// refusal `continue` would print is answered there by a REPLY.
+    typed: Option<typed::Typed>,
     /// What the ticket's runs cost (OWL-378), as the ticket ref keeps it,
     /// plus each run of this command as it ends ([`OnDemand::execute`]),
     /// which the ref keeps at once, making the ref of a ticket that has none
@@ -2427,8 +2432,10 @@ impl OnDemand<'_> {
         if matches!(
             state.stage(),
             Stage::Design | Stage::DesignReview | Stage::Build | Stage::Verify
-        ) {
-            self.refuse_empty_gate(&p, Command::Continue)?;
+        ) && let Err(stop) = self.refuse_empty_gate(&p, Command::Continue)
+        {
+            // A restart typed on the ticket is answered there (OWL-488).
+            return Err(self.typed_refused(&p, stop, sink));
         }
         // At Verify, parked or cut short, the pass runs again on the Build
         // the ref keeps (OWL-304): refused, before a park is restarted or
@@ -2440,7 +2447,7 @@ impl OnDemand<'_> {
             && let Err(why) = self.verify_resumable(&p)
         {
             if !in_review_loop(&p) {
-                return Err(why);
+                return Err(self.typed_refused(&p, why, sink));
             }
             // Watch never builds a loop again in place of Verify: the flag
             // leaves it to plain `continue` (OWL-420).
@@ -2448,6 +2455,12 @@ impl OnDemand<'_> {
                 return Err(to_watch::rebuild_refused(ticket, &why));
             }
             state = self.rebuild_loop(&mut p, state, why, sink)?;
+        }
+        // A restart typed on the ticket (OWL-488) is handed to watch as
+        // `--to-watch` hands it when watch takes the restarted ticket, and
+        // runs on as plain `continue` otherwise, one step of watch's.
+        if p.typed.is_some() && matches!(state.status(), Status::Parked { .. }) {
+            p.to_watch = self.typed_handed(&p, &state);
         }
         // `--to-watch` stops here, the park restarted, and runs nothing
         // (OWL-420).
@@ -2767,6 +2780,7 @@ impl OnDemand<'_> {
             policy: self.config.gate_policy(),
             stepping: false,
             to_watch: false,
+            typed: None,
             integrated: false,
             slot_held_by: None,
         })

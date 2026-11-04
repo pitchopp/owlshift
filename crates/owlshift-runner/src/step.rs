@@ -181,6 +181,9 @@ fn step(
             sink,
         )),
         StepKind::Correct => ran(on_demand.correct_seen(ticket, commit, following, sink)),
+        StepKind::Restart { comment } => {
+            ran(on_demand.restart_typed(ticket, commit, comment, sink))
+        }
         StepKind::Review => {
             let read = match reviews {
                 Some(read) => read,

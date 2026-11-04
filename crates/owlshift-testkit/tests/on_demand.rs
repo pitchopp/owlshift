@@ -4764,7 +4764,9 @@ fn a_failed_check_is_retried_and_a_parked_ticket_restarts_on_continue() {
     assert_eq!(comments.len(), 3, "{comments:?}");
     assert!(comments[2].starts_with("[owlshift] PARKED\n"));
     assert!(
-        comments[2].contains("Then run `owlshift continue DEMO-1`"),
+        comments[2].contains(
+            "Then reply `continue` here, in a comment of its own, or run `owlshift continue DEMO-1`"
+        ),
         "{}",
         comments[2]
     );
@@ -5021,7 +5023,7 @@ fn the_reask_limit_parks_the_ticket_until_it_is_answered() {
     for text in [
         "Still open in round 1:",
         "**Still open** (partial): The ending is still missing.",
-        "answer the questions still open here, then run `owlshift continue DEMO-1`",
+        "answer the questions still open here, then reply `continue` here, in a comment of its own, or run `owlshift continue DEMO-1`",
     ] {
         assert!(parked.contains(text), "{text}\n{parked}");
     }
@@ -11910,6 +11912,10 @@ mod parallel_scenarios;
 /// A restart left to watch (OWL-420).
 #[path = "on_demand/to_watch_scenarios.rs"]
 mod to_watch_scenarios;
+
+/// A restart typed on the ticket (OWL-488).
+#[path = "on_demand/typed_scenarios.rs"]
+mod typed_scenarios;
 
 /// A base that breaks the gate holds the project once (OWL-418).
 #[path = "on_demand/base_scenarios.rs"]

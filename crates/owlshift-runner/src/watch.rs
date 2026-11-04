@@ -101,6 +101,10 @@
 //! once per ticket and marker ([`crate::quarantine`]). Since OWL-423, the
 //! first snapshot that finds it cleared folds those comments.
 //!
+//! Since OWL-488, each pass also reads the thread of each parked ticket:
+//! its decider's reply `continue` restarts it as `owlshift continue` does,
+//! through a step ([`crate::on_demand::typed`]).
+//!
 //! Nothing ends the loop but the operator: a ticket that cannot be read is a
 //! `warning` event, once until it reads again, and the pass goes on. Since
 //! OWL-161 the operator stops it by degrees ([`stop`]): once a drain or a
@@ -172,6 +176,7 @@ pub mod presence;
 mod refresh;
 mod running;
 pub mod stop;
+mod typed;
 mod waiting;
 
 use running::{RunningStep, Then};
@@ -822,6 +827,9 @@ impl Watch<'_> {
         let mut waiting = Vec::new();
         let mut following = Vec::new();
         let mut resumable = Vec::new();
+        // The parked tickets, whose thread may hold their decider's
+        // `continue` (OWL-488).
+        let mut parked = Vec::new();
         // A ticket whose ref cannot be read now keeps its hold: only one
         // read and found not waiting, or gone from the list, loses it.
         let mut unread = Vec::new();
@@ -895,6 +903,10 @@ impl Watch<'_> {
                 // Its failing read is cleared once its stage reads (OWL-273).
                 Ok((stored, state)) if let Some(shown) = resumable_stage(&state) => {
                     resumable.push((ticket, stored, shown, state.stage()));
+                }
+                // Its failing read is cleared once its thread reads.
+                Ok((stored, state)) if matches!(state.status(), Status::Parked { .. }) => {
+                    parked.push((ticket, stored));
                 }
                 Ok(_) => {
                     memory.failing.remove(&ticket);
@@ -1033,6 +1045,12 @@ impl Watch<'_> {
             if outlived && self.close_outlived(memory, sink, out, &ticket, &stored, status) {
                 continue;
             }
+            // A park at Watch its pull request did not end may be restarted
+            // from the ticket (OWL-488), after the resumes.
+            if matches!(status, Status::Parked { .. }) {
+                parked.push((ticket, stored));
+                continue;
+            }
             if watched(status) {
                 self.look(memory, sink, out, continued, &ticket, &stored, false);
             } else if let Some(shown) = resume {
@@ -1050,6 +1068,11 @@ impl Watch<'_> {
         }
         for (ticket, stored, shown, stage) in resumable {
             self.resume_stage(memory, sink, out, continued, &ticket, &stored, shown, stage);
+        }
+        // The restarts typed on the tickets (OWL-488), by dispatch time.
+        parked.sort_by(|(a, at), (b, bt)| first(a, at, b, bt));
+        for (ticket, stored) in parked {
+            self.restart_look(memory, sink, out, continued, &ticket, &stored);
         }
     }
 
@@ -1090,6 +1113,9 @@ impl Watch<'_> {
             };
             if watched(state.status()) {
                 self.look(memory, sink, out, continued, &ticket, &stored, true);
+            } else if matches!(state.status(), Status::Parked { .. }) {
+                // A `continue` typed on it is answered (OWL-488).
+                self.restart_quarantined(memory, sink, &ticket);
             } else if let Some(shown) = resumable_stage(&state)
                 && !busy.contains(&ticket)
             {

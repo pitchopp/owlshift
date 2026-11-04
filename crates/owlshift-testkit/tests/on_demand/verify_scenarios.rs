@@ -904,3 +904,27 @@ fn a_ticket_parked_at_verify_is_not_resumed_on_a_moved_branch_or_a_late_comment(
     assert_eq!(parked(&bench), (Stage::Verify, Some(Waiting::Parked)));
     assert_eq!(bench.briefs().len(), ran, "nothing ran");
 }
+
+/// The decider's `continue` alone, which restarts a park from the ticket
+/// (OWL-488), is no comment the Build missed: the park at Verify is
+/// restarted, its pass run again on the same Build, which is delivered.
+#[test]
+fn a_continue_alone_is_no_late_comment_for_verify() {
+    let bench = Bench::verifying();
+    let check = answered_round(&bench);
+    let (outcome, printed) = bench.continue_ticket(vec![
+        check,
+        bench.reply(Some("Hello"), Some(DONE)),
+        bench.reviewing(FAILED_REVIEW),
+        bench.reviewing(FAILED_REVIEW),
+    ]);
+    assert!(
+        matches!(outcome, Err(Stop::Parked { .. })),
+        "{outcome:?}\n{printed}"
+    );
+    let commit = bench.record().review.unwrap().build.unwrap().commit;
+    bench.answer("  Continue ");
+    let (outcome, printed) = bench.continue_ticket(vec![bench.reviewing(&found(&[]))]);
+    outcome.unwrap_or_else(|stop| panic!("{stop}\n{printed}"));
+    assert_eq!(bench.remote_branch(), Some(commit));
+}

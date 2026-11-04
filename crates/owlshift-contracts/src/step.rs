@@ -14,7 +14,7 @@ use owlshift_core::gate::{Chain, ChainCost};
 
 use crate::format::{
     self, CARRY_FORMAT, ContractError, Format, OBLIGATION_FORMAT, OUTSIDE_FORMAT, RUN_FORMAT,
-    STEP_ENVELOPE_FORMAT, STEP_OUTCOME_FORMAT,
+    STEP_ENVELOPE_FORMAT, STEP_OUTCOME_FORMAT, TICKET_RESTART_FORMAT,
 };
 use crate::ids::TicketId;
 use crate::{Role, Stage};
@@ -88,6 +88,10 @@ pub enum StepKind {
     Correct,
     /// A review loop's start at Watch.
     Review,
+    /// A parked ticket's restart its decider typed on the ticket (OWL-488):
+    /// `comment`, the newest `continue` comment watch read; the step reads
+    /// the thread again and decides with the ticket's decider.
+    Restart { comment: String },
 }
 
 /// The visible stage watch read before a resume.
@@ -406,6 +410,48 @@ impl TicketCarry {
 
     pub fn parse(input: &str) -> Result<Self, ContractError> {
         format::parse_json(Self::CONTRACT, CARRY_FORMAT, input)
+    }
+
+    pub fn render(&self) -> String {
+        format::render_json(self)
+    }
+}
+
+/// The last `continue` comment of a ticket's decider that the runner
+/// settled (OWL-488; architecture section 5, "A restart typed on the
+/// ticket"), kept in `restart.json` in the ticket's folder: a comment
+/// counts only once it is newer than this one, so one comment restarts at
+/// most one park and is answered at most once.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+#[schemars(title = "Owlshift ticket restart")]
+pub struct TicketRestart {
+    pub format: Format<TICKET_RESTART_FORMAT>,
+    /// The tracker's identifier of the comment.
+    pub comment: String,
+    /// When the tracker recorded it.
+    pub at: Timestamp,
+    pub settled: Settled,
+}
+
+/// How a `continue` comment was settled.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum Settled {
+    /// It restarted the ticket.
+    Restarted,
+    /// It was the newest of `continue` comments none of which was the
+    /// decider's.
+    NotCounted,
+    /// Its restart was refused, and a REPLY said why.
+    Replied,
+}
+
+impl TicketRestart {
+    const CONTRACT: &str = "ticket restart";
+
+    pub fn parse(input: &str) -> Result<Self, ContractError> {
+        format::parse_json(Self::CONTRACT, TICKET_RESTART_FORMAT, input)
     }
 
     pub fn render(&self) -> String {

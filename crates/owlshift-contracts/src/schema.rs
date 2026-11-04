@@ -17,7 +17,9 @@ use crate::review::{TicketPlan, TicketReview};
 use crate::service::{
     DaemonRecord, DigestRecord, InstallManifest, Request, ServedConfig, ServedProjects, WatchRecord,
 };
-use crate::step::{RunObligation, StepEnvelope, StepOutcome, StepOutside, TicketCarry, TicketRun};
+use crate::step::{
+    RunObligation, StepEnvelope, StepOutcome, StepOutside, TicketCarry, TicketRestart, TicketRun,
+};
 use crate::usage::HarnessUsage;
 use crate::waits::StatusWaits;
 
@@ -44,6 +46,7 @@ pub fn all() -> Vec<(&'static str, Schema)> {
         ("step-envelope", schema::<StepEnvelope>()),
         ("step-outcome", schema::<StepOutcome>()),
         ("ticket-carry", schema::<TicketCarry>()),
+        ("ticket-restart", schema::<TicketRestart>()),
         ("ticket-run", schema::<TicketRun>()),
         ("run-obligation", schema::<RunObligation>()),
         ("step-outside", schema::<StepOutside>()),

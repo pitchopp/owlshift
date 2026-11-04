@@ -151,9 +151,14 @@ fn waiting(event: &Event, ticket: &TicketId) -> Option<Waiting> {
     } else if event.data.get("to_watch").and_then(Value::as_bool) == Some(true)
         && event.data.get("takes").and_then(Value::as_str) == Some("resume")
     {
-        // A restart left to watch's resume (OWL-420): its word until watch
-        // tells a wait or the ticket runs.
-        "to_watch".to_owned()
+        // A restart left to watch's resume (OWL-420), typed on the ticket
+        // too (OWL-488): its word until watch tells a wait or the ticket
+        // runs.
+        if event.data.get("by").and_then(Value::as_str) == Some("tracker") {
+            "tracker_restart".to_owned()
+        } else {
+            "to_watch".to_owned()
+        }
     } else {
         return None;
     };
@@ -247,6 +252,9 @@ pub fn phrase(wait: &Waiting) -> String {
         "refs_unread" => "nothing is dispatched while a ticket ref cannot be read".to_owned(),
         "to_watch" => "restarted by `owlshift continue --to-watch`: `owlshift watch` resumes it \
                        at its next pass"
+            .to_owned(),
+        "tracker_restart" => "restarted by its decider's `continue` on the ticket: `owlshift \
+                              watch` resumes it at its next pass"
             .to_owned(),
         "usage_limit" => {
             let harness = data
@@ -979,6 +987,24 @@ mod tests {
             Data::new(),
         ));
         assert!(fold(&events, "o/r").current.is_empty());
+        // Typed on the ticket by its decider (OWL-488): named so, alike.
+        let typed = waits(
+            "2026-11-04T09:00:00Z",
+            "OWL-1",
+            data([
+                ("restarted", json!(true)),
+                ("stage", json!("build")),
+                ("to_watch", json!(true)),
+                ("takes", json!("resume")),
+                ("by", json!("tracker")),
+                ("comment", json!("c-9")),
+            ]),
+        );
+        assert_eq!(
+            phrase(&fold(&[typed], "o/r").current[&id]),
+            "restarted by its decider's `continue` on the ticket: `owlshift watch` resumes it at \
+             its next pass"
+        );
     }
 
     #[test]
