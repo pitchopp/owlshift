@@ -39,6 +39,7 @@ use owlshift_runner::watch;
 use owlshift_testkit::step_child::{
     ChildProject, REPO, build_asks, ended_as, events, holding_harness, intake_declaring, reply_for,
 };
+use owlshift_testkit::wait;
 
 const BENCH: &str = env!("CARGO_BIN_EXE_owlshift-daemon-bench");
 /// The fake harness.
@@ -182,7 +183,7 @@ impl Bench {
     /// The stand-in watch of `repo` running now, once there is one.
     fn running(&self, repo: &str) -> (u32, u32) {
         let mut seen = None;
-        self.wait_for(&format!("a watch of {repo}"), 10, || {
+        self.wait_for(&format!("a watch of {repo}"), || {
             seen = self
                 .watches(repo)
                 .into_iter()
@@ -193,33 +194,27 @@ impl Bench {
         seen.unwrap()
     }
 
-    fn wait_for(&self, what: &str, seconds: u64, mut done: impl FnMut() -> bool) {
-        let deadline = Instant::now() + Duration::from_secs(seconds);
-        while !done() {
-            assert!(
-                Instant::now() < deadline,
-                "still waiting for {what}\n{}",
-                self.output()
-            );
-            thread::sleep(Duration::from_millis(20));
-        }
+    /// Waits until `done` holds, the bench's output in a failure.
+    fn wait_for(&self, what: &str, done: impl FnMut() -> bool) {
+        wait::until_with(what, || self.output(), done);
     }
 
-    /// The daemon's end, within `seconds`.
-    fn ended(&mut self, seconds: u64) -> ExitStatus {
+    /// [`Bench::wait_for`] within `bound`, which only a bound the design sets
+    /// justifies: the caller cites it.
+    fn wait_within(&self, what: &str, bound: Duration, done: impl FnMut() -> bool) {
+        wait::within(bound, what, || self.output(), done);
+    }
+
+    /// The daemon's end.
+    fn ended(&mut self) -> ExitStatus {
+        let mut status = None;
         let daemon = self.daemon.as_mut().unwrap();
-        let deadline = Instant::now() + Duration::from_secs(seconds);
-        loop {
-            if let Some(status) = daemon.try_wait().unwrap() {
-                return status;
-            }
-            assert!(
-                Instant::now() < deadline,
-                "the daemon still runs\n{}",
-                self.output()
-            );
-            thread::sleep(Duration::from_millis(20));
-        }
+        let ended = wait::reached(wait::REACHED, || {
+            status = daemon.try_wait().unwrap();
+            status.is_some()
+        });
+        assert!(ended, "the daemon still runs\n{}", self.output());
+        status.unwrap()
     }
 
     fn signal(&self, signal: &str, pid: u32) {
@@ -282,7 +277,7 @@ fn served_projects_run_each_under_its_lock_and_a_forgotten_one_is_drained() {
     let (web, web_step) = bench.running(WEB);
     assert!(alive(web_step));
     assert!(served::served_now(&bench.dirs(WEB)).unwrap());
-    bench.wait_for("the daemon to say acme/api is held", 5, || {
+    bench.wait_for("the daemon to say acme/api is held", || {
         bench
             .output()
             .contains("acme/api: a watch typed in a terminal runs on it")
@@ -294,8 +289,8 @@ fn served_projects_run_each_under_its_lock_and_a_forgotten_one_is_drained() {
     assert!(served::served_now(&bench.dirs(API)).unwrap());
 
     bench.registry().forget(&Repo::parse(WEB).unwrap()).unwrap();
-    bench.wait_for("acme/web's watch to drain", 10, || !alive(web));
-    bench.wait_for("acme/web to be let go", 5, || {
+    bench.wait_for("acme/web's watch to drain", || !alive(web));
+    bench.wait_for("acme/web to be let go", || {
         !served::served_now(&bench.dirs(WEB)).unwrap()
     });
     assert!(!alive(web_step));
@@ -308,7 +303,7 @@ fn served_projects_run_each_under_its_lock_and_a_forgotten_one_is_drained() {
         &Request::new(BY_STOP, Timestamp::now(), "the test ends"),
     )
     .unwrap();
-    assert!(bench.ended(10).success(), "{}", bench.output());
+    assert!(bench.ended().success(), "{}", bench.output());
 }
 
 /// A watch that ends without being asked starts again after a delay that
@@ -324,7 +319,7 @@ fn a_killed_watch_starts_again_with_a_doubling_delay_told_at_the_third_end() {
         let started = bench.watches(WEB).len();
         bench.signal("KILL", watch);
         let killed = Instant::now();
-        bench.wait_for("the watch to start again", 10, || {
+        bench.wait_for("the watch to start again", || {
             bench.watches(WEB).len() > started
         });
         delays.push(killed.elapsed());
@@ -346,7 +341,7 @@ fn a_killed_watch_starts_again_with_a_doubling_delay_told_at_the_third_end() {
         "{notes:?}"
     );
     bench.signal("TERM", bench.daemon_pid());
-    assert!(bench.ended(10).success(), "{}", bench.output());
+    assert!(bench.ended().success(), "{}", bench.output());
 }
 
 /// A hard kill of the daemon leaves no watch and no step running: its
@@ -359,12 +354,12 @@ fn a_hard_kill_of_the_daemon_leaves_no_watch_or_step() {
     bench.start();
     let started = [bench.running(WEB), bench.running(API)];
     bench.signal("KILL", bench.daemon_pid());
-    let _ = bench.ended(5);
+    let _ = bench.ended();
     let pids: Vec<u32> = started
         .iter()
         .flat_map(|(watch, step)| [*watch, *step])
         .collect();
-    bench.wait_for("every watch and step to be gone", 5, || {
+    bench.wait_for("every watch and step to be gone", || {
         pids.iter().all(|&pid| !alive(pid))
     });
 }
@@ -385,7 +380,7 @@ fn a_stop_drains_every_watch_and_a_sigterm_checks_them() {
         &Request::new(BY_STOP, Timestamp::now(), "asked by the test"),
     )
     .unwrap();
-    let status = bench.ended(10);
+    let status = bench.ended();
     assert!(status.success(), "{status}\n{}", bench.output());
     for (watch, step) in watches {
         assert!(!alive(watch) && !alive(step));
@@ -412,14 +407,14 @@ fn a_stop_drains_every_watch_and_a_sigterm_checks_them() {
     let watches = [bench.running(WEB), bench.running(API)];
     let sent = Instant::now();
     bench.signal("TERM", bench.daemon_pid());
-    let status = bench.ended(15);
+    let status = bench.ended();
     assert!(status.success(), "{status}\n{}", bench.output());
     assert!(
         sent.elapsed() >= Duration::from_secs(2),
         "the hung watch held the daemon until its bound"
     );
     for (watch, step) in watches {
-        bench.wait_for("the watches and their steps to be gone", 5, || {
+        bench.wait_for("the watches and their steps to be gone", || {
             !alive(watch) && !alive(step)
         });
     }
@@ -441,12 +436,12 @@ fn a_watch_that_cannot_serve_pauses_its_project_until_one_serves() {
     .unwrap();
     bench.start();
     let dirs = bench.dirs(WEB);
-    bench.wait_for("the pause", 5, || requests::pause(&dirs).is_some());
+    bench.wait_for("the pause", || requests::pause(&dirs).is_some());
     let pause = requests::pause(&dirs).unwrap().unwrap();
     assert_eq!(pause.by, BY_DAEMON);
     assert_eq!(pause.why, "acme/web cannot be served on the bench");
     // Tried again at the next passes, told once.
-    bench.wait_for("two more tries", 10, || {
+    bench.wait_for("two more tries", || {
         bench.output().matches("Paused acme/web").count() >= 3
     });
     let notes = bench.notes();
@@ -458,16 +453,16 @@ fn a_watch_that_cannot_serve_pauses_its_project_until_one_serves() {
 
     fs::remove_file(bench.bench_dir(WEB).join("exit")).unwrap();
     let (watch, _) = bench.running(WEB);
-    bench.wait_for("the pause to be lifted", 10, || {
+    bench.wait_for("the pause to be lifted", || {
         requests::pause(&dirs).is_none()
     });
     assert!(alive(watch), "{}", bench.output());
     // The daemon removes the pause file before it says so: wait for the line.
-    bench.wait_for("the served-again line", 10, || {
+    bench.wait_for("the served-again line", || {
         bench.output().contains("acme/web is served again")
     });
     bench.signal("TERM", bench.daemon_pid());
-    assert!(bench.ended(10).success(), "{}", bench.output());
+    assert!(bench.ended().success(), "{}", bench.output());
 }
 
 /// A real watch of [`REPO`] under the daemon (OWL-479), on a project whose
@@ -497,7 +492,7 @@ fn a_watch_started_offline_waits_then_starts_once_its_tracker_answers() {
     let offline = bench.bench_dir(REPO).join("offline");
     fs::write(&offline, "").unwrap();
     bench.start();
-    bench.wait_for("the wait told", 10, || {
+    bench.wait_for("the wait told", || {
         bench.output().contains("waits for the network")
     });
     // Several tries later: still waiting, told once, never restarted.
@@ -519,7 +514,7 @@ fn a_watch_started_offline_waits_then_starts_once_its_tracker_answers() {
     fs::remove_file(&offline).unwrap();
     // The watch's lines reach the output through the daemon's relay, a tick
     // after the pass is counted: wait for them too.
-    bench.wait_for("a pass and its lines", 10, || {
+    bench.wait_for("a pass and its lines", || {
         let output = bench.output();
         bench.passes() > 0
             && output.contains("reached its tracker and forge")
@@ -537,7 +532,7 @@ fn a_watch_started_offline_waits_then_starts_once_its_tracker_answers() {
         "{output}"
     );
     bench.signal("TERM", bench.daemon_pid());
-    assert!(bench.ended(20).success(), "{}", bench.output());
+    assert!(bench.ended().success(), "{}", bench.output());
 }
 
 /// OWL-479: a tracker that refuses its credentials still ends the watch as
@@ -549,13 +544,13 @@ fn a_refused_token_at_a_watchs_start_still_pauses_its_project() {
     fs::write(bench.bench_dir(REPO).join("refused"), "").unwrap();
     bench.start();
     let dirs = bench.dirs(REPO);
-    bench.wait_for("the pause", 10, || requests::pause(&dirs).is_some());
+    bench.wait_for("the pause", || requests::pause(&dirs).is_some());
     let pause = requests::pause(&dirs).unwrap().unwrap();
     assert_eq!(pause.by, BY_DAEMON);
     assert!(pause.why.contains("invalid_client"), "{}", pause.why);
     assert!(!bench.output().contains("waits for the network"));
     bench.signal("TERM", bench.daemon_pid());
-    assert!(bench.ended(20).success(), "{}", bench.output());
+    assert!(bench.ended().success(), "{}", bench.output());
 }
 
 /// The two tickets of scenario S11.
@@ -660,7 +655,7 @@ fn s11_a_checked_stop_resumes_both_builds_and_a_kill_quarantines() {
         Path::new(FAKE),
         "build",
         CHECKPOINT,
-        "exec sleep 60",
+        &format!("exec sleep {}", wait::OUTLASTS.as_secs()),
     );
     let machine = root.join("machine");
     let mut project = ChildProject::seed_parallel(&root, harness, 2, 2, (&machine, 2));
@@ -678,7 +673,7 @@ fn s11_a_checked_stop_resumes_both_builds_and_a_kill_quarantines() {
     let pid_files = TICKETS.map(|id| plays.join(format!("build-{id}.pid")));
     // Both Builds under way, held: their runs' pids.
     let held = |bench: &Bench| -> Vec<u32> {
-        bench.wait_for("both Builds under way", 120, || {
+        bench.wait_for("both Builds under way", || {
             pid_files.iter().all(|file| file.exists())
         });
         pid_files
@@ -691,7 +686,7 @@ fn s11_a_checked_stop_resumes_both_builds_and_a_kill_quarantines() {
     bench.start();
     let runs = held(&bench);
     bench.signal("TERM", bench.daemon_pid());
-    let status = bench.ended(60);
+    let status = bench.ended();
     assert!(status.success(), "{status}\n{}", bench.output());
     for run in &runs {
         assert!(!alive(*run), "a Build's run outlived the checked stop");
@@ -720,8 +715,8 @@ fn s11_a_checked_stop_resumes_both_builds_and_a_kill_quarantines() {
 
     // A hard kill cuts them: the quarantine, notified once.
     bench.signal("KILL", bench.daemon_pid());
-    let _ = bench.ended(10);
-    bench.wait_for("the cut runs to be gone", 10, || {
+    let _ = bench.ended();
+    bench.wait_for("the cut runs to be gone", || {
         runs.iter().all(|run| !alive(*run))
     });
     assert!(dirs.obligations_stand(), "{}", bench.output());
@@ -730,16 +725,16 @@ fn s11_a_checked_stop_resumes_both_builds_and_a_kill_quarantines() {
     }
     bench.start();
     let found = quarantine::found_line(REPO);
-    bench.wait_for("the quarantine, notified", 60, || {
+    bench.wait_for("the quarantine, notified", || {
         dirs.quarantine().unwrap().is_some() && bench.notes().contains(&found)
     });
     // Three passes more, none of which may start a run.
     let passes = bench.passes();
-    bench.wait_for("three more passes of the watch", 30, || {
+    bench.wait_for("three more passes of the watch", || {
         bench.passes() >= passes + 3
     });
     bench.signal("TERM", bench.daemon_pid());
-    let status = bench.ended(60);
+    let status = bench.ended();
     assert!(status.success(), "{status}\n{}", bench.output());
     let notes = bench.notes();
     assert_eq!(
@@ -789,7 +784,7 @@ fn a_canceled_build_is_stopped_checked_and_parked_then_resumed_from_its_checkpoi
         Path::new(FAKE),
         "build",
         CHECKPOINT,
-        "exec sleep 60",
+        &format!("exec sleep {}", wait::OUTLASTS.as_secs()),
     );
     let machine = root.join("machine");
     let mut project = ChildProject::seed_parallel(&root, harness, 2, 2, (&machine, 2));
@@ -806,18 +801,22 @@ fn a_canceled_build_is_stopped_checked_and_parked_then_resumed_from_its_checkpoi
     let pid_files = TICKETS.map(|id| plays.join(format!("build-{id}.pid")));
     let pid = |file: &Path| -> u32 { fs::read_to_string(file).unwrap().trim().parse().unwrap() };
     bench.start();
-    bench.wait_for("both Builds under way", 120, || {
+    bench.wait_for("both Builds under way", || {
         pid_files.iter().all(|file| file.exists())
     });
     let (one, two) = (pid(&pid_files[0]), pid(&pid_files[1]));
 
     let why = "it rewrites the wrong module";
     cancel(&project, "DEMO-1", why);
-    bench.wait_for("DEMO-1's run stopped", 5, || !alive(one));
-    bench.wait_for("DEMO-1 parked", 60, || parked_at_build(&project, "DEMO-1"));
+    // The bound the design gives the cut (architecture section 5, "Cancel",
+    // "As built").
+    bench.wait_within("DEMO-1's run stopped", Duration::from_secs(5), || {
+        !alive(one)
+    });
+    bench.wait_for("DEMO-1 parked", || parked_at_build(&project, "DEMO-1"));
     assert!(alive(two), "DEMO-2's run was stopped\n{}", bench.output());
     let passes = bench.passes();
-    bench.wait_for("three more passes of the watch", 60, || {
+    bench.wait_for("three more passes of the watch", || {
         bench.passes() >= passes + 3
     });
     assert!(alive(two), "DEMO-2's run was stopped\n{}", bench.output());
@@ -868,7 +867,7 @@ fn a_canceled_build_is_stopped_checked_and_parked_then_resumed_from_its_checkpoi
         ),
         "{restarted:?}"
     );
-    bench.wait_for("DEMO-1's Build resumed", 60, || pid_files[0].exists());
+    bench.wait_for("DEMO-1's Build resumed", || pid_files[0].exists());
     assert_eq!(
         build_starts(&bench.data(), "DEMO-1"),
         [false, true],
@@ -876,7 +875,7 @@ fn a_canceled_build_is_stopped_checked_and_parked_then_resumed_from_its_checkpoi
         bench.output()
     );
     bench.signal("TERM", bench.daemon_pid());
-    let status = bench.ended(60);
+    let status = bench.ended();
     assert!(status.success(), "{status}\n{}", bench.output());
 }
 
@@ -930,7 +929,7 @@ fn an_upgrade_drain_lets_the_steps_under_way_finish_then_exits_75() {
     bench.project = Some(file);
     let dirs = project.dirs();
     bench.start();
-    bench.wait_for("both Builds under way", 120, || {
+    bench.wait_for("both Builds under way", || {
         TICKETS
             .iter()
             .all(|id| plays.join(format!("build-{id}.pid")).exists())
@@ -972,14 +971,14 @@ fn an_upgrade_drain_lets_the_steps_under_way_finish_then_exits_75() {
         upgrade::hand_over(&data, own, Path::new(BENCH), "owlshift start"),
         Ok(Handover::Ask(running))
     );
-    bench.wait_for("the watch to drain on its stop file", 30, || {
+    bench.wait_for("the watch to drain on its stop file", || {
         events(&bench.data()).iter().any(|event| {
             event.data.get("watch") == Some(&serde_json::json!("stop"))
                 && event.data.get("asked") == Some(&serde_json::json!("stop_file"))
         })
     });
     fs::remove_file(plays.join("hold")).unwrap();
-    let status = bench.ended(60);
+    let status = bench.ended();
     assert_eq!(status.code(), Some(75), "{status}\n{}", bench.output());
 
     assert_eq!(
@@ -1050,7 +1049,7 @@ fn an_upgrade_drain_ends_75_unless_a_stop_is_asked_meanwhile() {
     assert!(requests::drain_asked(&data).is_none(), "{}", bench.output());
 
     requests::ask_drain(&data, &upgrade_drain()).unwrap();
-    let status = bench.ended(10);
+    let status = bench.ended();
     assert_eq!(status.code(), Some(75), "{status}\n{}", bench.output());
     assert!(!alive(watch) && !alive(step));
     assert_eq!(bench.watches(WEB).len(), 1, "nothing started again");
@@ -1060,7 +1059,7 @@ fn an_upgrade_drain_ends_75_unless_a_stop_is_asked_meanwhile() {
     // The watch holds its drain while `linger` stands, as for a step.
     let linger = bench.bench_dir(WEB).join("linger");
     let lingering = |bench: &Bench, times: usize| {
-        bench.wait_for("the watch to hold its drain", 10, || {
+        bench.wait_for("the watch to hold its drain", || {
             bench.output().matches("drains, its step under way").count() >= times
         });
     };
@@ -1075,7 +1074,7 @@ fn an_upgrade_drain_ends_75_unless_a_stop_is_asked_meanwhile() {
     )
     .unwrap();
     fs::remove_file(&linger).unwrap();
-    let status = bench.ended(10);
+    let status = bench.ended();
     assert!(status.success(), "{status}\n{}", bench.output());
     assert!(requests::drain_asked(&data).is_none());
     assert!(requests::stop_asked(&data).is_none());
@@ -1086,7 +1085,7 @@ fn an_upgrade_drain_ends_75_unless_a_stop_is_asked_meanwhile() {
     requests::ask_drain(&data, &upgrade_drain()).unwrap();
     lingering(&bench, 2);
     bench.signal("TERM", bench.daemon_pid());
-    let status = bench.ended(15);
+    let status = bench.ended();
     assert!(status.success(), "{status}\n{}", bench.output());
     assert!(requests::drain_asked(&data).is_none());
     assert!(

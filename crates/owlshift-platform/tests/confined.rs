@@ -7,6 +7,11 @@ use std::path::{Path, PathBuf};
 use owlshift_platform::confined::{ConfinedError, Refusal, read_confined};
 use tempfile::TempDir;
 
+// How a test waits for a state (OWL-493), shared with the test bench.
+#[allow(dead_code)]
+#[path = "../../owlshift-testkit/src/wait.rs"]
+mod wait;
+
 /// Contents with bytes that are not UTF-8, to prove the read is byte for byte.
 const INSIDE: &[u8] = b"inside \xff\x00 plan\n";
 const SECRET: &[u8] = b"outside secret\n";
@@ -267,7 +272,7 @@ fn a_fifo_is_refused_without_blocking() {
     let wt = f.wt.clone();
     std::thread::spawn(move || sender.send(read(&wt, "plan.md")));
     let result = receiver
-        .recv_timeout(std::time::Duration::from_secs(10))
+        .recv_timeout(wait::REACHED)
         .expect("opening a FIFO blocked");
     assert_eq!(
         refused_at(result),

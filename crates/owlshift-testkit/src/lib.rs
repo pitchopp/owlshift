@@ -13,6 +13,8 @@
 //!   runs roles through the executor and plays the writer until it exists.
 //! - [`step_child`]: a project whose steps run in a real child process, and
 //!   `owlshift-step-child`, the child (OWL-399).
+//! - [`wait`]: how a test waits for a state, as long as load could make it
+//!   take (OWL-493).
 //!
 //! This crate is test only: it is never published and no shipped crate
 //! depends on it. See "The test bench" in `docs/design/build-plan.md`.
@@ -24,3 +26,4 @@ pub mod harness;
 pub mod reply;
 pub mod scenario;
 pub mod step_child;
+pub mod wait;
