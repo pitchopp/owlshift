@@ -130,19 +130,27 @@ pub struct DeliveryReport {
     /// The project's `[forge] merge` (D14, OWL-445), which says who merges
     /// the pull request: `never` when it could not be read.
     pub merge: MergeSwitch,
+    /// Why merge on green will not merge it, when a question of the ticket
+    /// keeps it for a person (OWL-464): `None` under `never`.
+    pub merge_held: Option<String>,
 }
 
 /// Who merges a pull request on a project that opted into merge on green
 /// (D14, OWL-445), `it` being how the sentence names it; `None` under
 /// `never`, where each text keeps its own words that Owlshift never merges.
-pub fn merges_on_green(switch: MergeSwitch, it: &str) -> Option<String> {
-    match switch {
-        MergeSwitch::Never => None,
-        MergeSwitch::All => Some(format!(
+/// `held`, why a question of the ticket keeps it for a person, says that
+/// Owlshift will not merge it (OWL-464).
+pub fn merges_on_green(switch: MergeSwitch, held: Option<&str>, it: &str) -> Option<String> {
+    match (switch, held) {
+        (MergeSwitch::Never, _) => None,
+        (_, Some(held)) => Some(format!(
+            "Owlshift will not merge {it}: {held}. Review and merge it yourself."
+        )),
+        (MergeSwitch::All, None) => Some(format!(
             "Owlshift merges {it} once it is green, unless a person must judge it first \
              (merge on green)."
         )),
-        MergeSwitch::Labeled => Some(format!(
+        (MergeSwitch::Labeled, None) => Some(format!(
             "Owlshift merges {it} once it is green only if the ticket carries the label \
              `{MERGE_LABEL}` (merge on green); otherwise review and merge it."
         )),
@@ -485,9 +493,9 @@ impl DeliveryReport {
         let mut remains = Vec::new();
         if pr.state == PrState::Open {
             remains.push(
-                merges_on_green(self.merge, &pr_link).unwrap_or_else(|| {
-                    format!("Review and merge {pr_link}: Owlshift never merges.")
-                }),
+                merges_on_green(self.merge, self.merge_held.as_deref(), &pr_link).unwrap_or_else(
+                    || format!("Review and merge {pr_link}: Owlshift never merges."),
+                ),
             );
         }
         let checks = self.checks_section(&mut remains);
@@ -4694,6 +4702,7 @@ mod tests {
             reviewed: None,
             recommended: Vec::new(),
             merge: MergeSwitch::Never,
+            merge_held: None,
         }
     }
 
@@ -7388,6 +7397,21 @@ Reply `Q1: B`, `ok` to take every recommendation, or in your own words.
             let body = report.render();
             assert!(body.contains(&format!("- {says}\n")), "{switch:?}: {body}");
         }
+        // A question of the ticket kept for a person: Owlshift will not
+        // merge it, whichever switch lets it merge on green (OWL-464).
+        let held = "question Q2 of round 2 under `money`, a category the project keeps for a \
+                    person, has no answer of its decider on record";
+        for switch in [MergeSwitch::All, MergeSwitch::Labeled] {
+            let mut report = report(Ok(set(Mergeable::Mergeable, vec![])));
+            report.merge = switch;
+            report.merge_held = Some(held.to_owned());
+            let body = report.render();
+            let says = format!(
+                "- Owlshift will not merge {pr_link}: {held}. Review and merge it yourself.\n"
+            );
+            assert!(body.contains(&says), "{switch:?}: {body}");
+        }
+        assert_eq!(merges_on_green(MergeSwitch::Never, Some(held), "it"), None);
 
         let tracker = FakeTracker::default();
         let writer = Writer::new(&tracker);

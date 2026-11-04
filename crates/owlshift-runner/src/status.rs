@@ -16,6 +16,10 @@
 //! ([`ProjectDirs::ticket_holders`]) whose holder holds no slot, such as a
 //! `do` or a `continue` a person typed in a terminal.
 //!
+//! Since OWL-464 each served project lists its green pull requests that
+//! wait for a person to merge them ([`merge_waits`]), from watch's
+//! `merge_waits` and final `merge_refused` events and the ticket refs.
+//!
 //! [`gather`] does the reading; [`watch_state`] and [`render`] are pure.
 //! `owlshift status --waits`, what each ticket in flight waits on, is
 //! [`waits`] (OWL-459).
@@ -31,8 +35,8 @@ use owlshift_contracts::ids::TicketId;
 use owlshift_contracts::service::{
     BY_DAEMON, DaemonRecord, DigestRecord, Request, ServedConfig, ServedProject,
 };
-use owlshift_core::state::Status;
-use owlshift_core::vocab::Harness;
+use owlshift_core::state::{Status, TicketState};
+use owlshift_core::vocab::{Harness, Stage};
 use serde_json::Value;
 
 use crate::daemon::digest::{self, HarnessUsage};
@@ -41,7 +45,7 @@ use crate::events::{EventLog, printable};
 use crate::project::{ProjectDirs, TicketHolder};
 use crate::served::{self, Registry};
 use crate::slots::{HeldSlot, MachineSlots};
-use crate::{watch, why};
+use crate::{ticket_ref, watch, why};
 
 pub mod waits;
 
@@ -129,6 +133,94 @@ pub struct Project {
     /// The tickets whose questions wait for a person, and the parked ones.
     pub waiting: Vec<TicketId>,
     pub parked: Vec<TicketId>,
+    /// Its green pull requests that wait for a person to merge them
+    /// (OWL-464), by [`merge_waits`].
+    pub merges_waiting: Vec<MergeWait>,
+}
+
+/// A green pull request merge on green leaves for a person (OWL-464;
+/// architecture section 5, "Merge on green", "Kept for a person").
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MergeWait {
+    pub ticket: TicketId,
+    pub pull_request: u64,
+    /// Why, in a person's words: the hold's, or GitHub's own reason for a
+    /// refusal that will not pass.
+    pub reason: String,
+    /// GitHub refused the merge for good (`merge_refused`).
+    pub refused: bool,
+}
+
+/// The green pull requests of `project` that wait for a person (OWL-464):
+/// for each ticket, the latest `merge_waits` or final `merge_refused`
+/// decision of the events, oldest first, kept while `pushed_of`, the head
+/// of Owlshift's last push its ticket ref keeps at Watch with its pull
+/// request followed, is that event's head. `pushed_of` is asked only for a
+/// ticket with such an event.
+pub fn merge_waits(
+    events: &[Event],
+    project: &str,
+    mut pushed_of: impl FnMut(&TicketId) -> Option<String>,
+) -> Vec<MergeWait> {
+    let mut latest: Vec<&Event> = Vec::new();
+    for event in events {
+        let watch = event.data.get("watch").and_then(Value::as_str);
+        let told = match watch {
+            Some("merge_waits") => true,
+            Some("merge_refused") => event.data.get("final").and_then(Value::as_bool) == Some(true),
+            _ => false,
+        };
+        if event.kind != EventKind::Decision
+            || !told
+            || !event.project.eq_ignore_ascii_case(project)
+            || event.ticket.is_none()
+        {
+            continue;
+        }
+        latest.retain(|kept| kept.ticket != event.ticket);
+        latest.push(event);
+    }
+    latest
+        .into_iter()
+        .filter_map(|event| {
+            let ticket = event.ticket.clone()?;
+            let head = event.data.get("head").and_then(Value::as_str)?;
+            if pushed_of(&ticket).as_deref() != Some(head) {
+                return None;
+            }
+            Some(MergeWait {
+                ticket,
+                pull_request: event.data.get("pull_request").and_then(Value::as_u64)?,
+                reason: event
+                    .data
+                    .get("reason")
+                    .and_then(Value::as_str)
+                    .unwrap_or("no reason was recorded")
+                    .to_owned(),
+                refused: event.data.get("watch").and_then(Value::as_str) == Some("merge_refused"),
+            })
+        })
+        .collect()
+}
+
+/// The head of Owlshift's last push to `ticket`'s pull request, while its
+/// ref keeps it at Watch with that pull request followed; `None` otherwise,
+/// a ref that cannot be read said in `notes`.
+fn followed_head(dirs: &ProjectDirs, ticket: &TicketId, notes: &mut Vec<String>) -> Option<String> {
+    let stored = match ticket_ref::read(&crate::project::runner_git(), &dirs.checkout(), ticket) {
+        Ok(stored) => stored?,
+        Err(why) => {
+            notes.push(format!("the ref of {ticket} cannot be read: {why}"));
+            return None;
+        }
+    };
+    let at_watch = TicketState::try_from(&stored.record.state)
+        .is_ok_and(|state| state.status() == Status::Active(Stage::Watch));
+    stored
+        .record
+        .delivery
+        .filter(|delivery| at_watch && delivery.followed())
+        .and_then(|delivery| delivery.pushed)
 }
 
 /// A served project's watch, as the daemon's events tell it.
@@ -280,6 +372,9 @@ pub fn gather(data: &Path, concurrent_runs: u32, caps: &[(Harness, u8)], now: Ti
                 Status::Active(_) => {}
             }
         }
+        let merges_waiting = merge_waits(&events, &entry.repository, |ticket| {
+            followed_head(&dirs, ticket, &mut notes)
+        });
         projects.push(Project {
             repository: entry.repository,
             checkout: entry.checkout,
@@ -290,6 +385,7 @@ pub fn gather(data: &Path, concurrent_runs: u32, caps: &[(Harness, u8)], now: Ti
             quarantine: quarantine_line(&dirs),
             waiting,
             parked,
+            merges_waiting,
         });
     }
     let slots = match MachineSlots::new(data, concurrent_runs).holders() {
@@ -609,6 +705,20 @@ pub fn render(report: &Report, tz: &TimeZone) -> String {
         }
         if !project.parked.is_empty() {
             line(format!("  parked: {}", tickets(&project.parked)));
+        }
+        if !project.merges_waiting.is_empty() {
+            line("  green, waiting for a person to merge:".to_owned());
+        }
+        for wait in &project.merges_waiting {
+            let why = if wait.refused {
+                format!("GitHub refused to merge it: {}", wait.reason)
+            } else {
+                wait.reason.clone()
+            };
+            line(format!(
+                "    {}: pull request #{}, {why}",
+                wait.ticket, wait.pull_request
+            ));
         }
     }
     match &report.slots {
@@ -964,6 +1074,99 @@ mod tests {
     /// A watch the daemon paused for a refusal no restart mends is never
     /// read as running, nor any watch of a daemon that does not run, nor an
     /// event of an earlier daemon.
+    /// OWL-464: a project lists each ticket whose latest `merge_waits` or
+    /// final `merge_refused` event is at the head its ref still follows,
+    /// with the reason, and reads the ref only of a ticket with such an
+    /// event.
+    #[test]
+    fn status_lists_the_green_pull_requests_that_wait_for_a_person() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path();
+        let emit = |repo: &str, ticket: &str, pairs: Vec<(&str, Value)>| {
+            let mut details = data([]);
+            for (key, value) in pairs {
+                details.insert(key.to_owned(), value);
+            }
+            let ticket = TicketId::new(ticket).unwrap();
+            EventSink::new(repo, EventLog::in_dir(data_dir), &mut io::sink()).emit(
+                &ticket,
+                None,
+                EventKind::Decision,
+                details,
+            );
+        };
+        let waits = |head: &str, reason: &str| {
+            vec![
+                ("watch", json!("merge_waits")),
+                ("pull_request", json!(3)),
+                ("head", json!(head)),
+                ("reason", json!(reason)),
+            ]
+        };
+        let refused = |head: &str, final_: bool| {
+            vec![
+                ("watch", json!("merge_refused")),
+                ("pull_request", json!(4)),
+                ("head", json!(head)),
+                ("final", json!(final_)),
+                ("reason", json!("Merge method squash is not allowed")),
+            ]
+        };
+        emit("acme/web", "OWL-1", waits("a", "first hold"));
+        emit("acme/web", "OWL-1", waits("b", "the label is missing"));
+        emit("acme/web", "OWL-2", refused("c", true));
+        emit("acme/web", "OWL-3", refused("d", false));
+        emit("acme/web", "OWL-4", waits("e", "no longer followed"));
+        emit("acme/api", "OWL-5", waits("f", "another project's"));
+        let (events, _) = why::read_events(EventLog::in_dir(data_dir).path()).unwrap();
+        let mut asked = Vec::new();
+        let listed = merge_waits(&events, "ACME/web", |ticket| {
+            asked.push(ticket.to_string());
+            match ticket.as_str() {
+                "OWL-1" => Some("b".to_owned()),
+                "OWL-2" => Some("c".to_owned()),
+                _ => None,
+            }
+        });
+        assert_eq!(asked, ["OWL-1", "OWL-2", "OWL-4"]);
+        let wait = |ticket: &str, pull_request, reason: &str, refused| MergeWait {
+            ticket: TicketId::new(ticket).unwrap(),
+            pull_request,
+            reason: reason.to_owned(),
+            refused,
+        };
+        assert_eq!(
+            listed,
+            [
+                wait("OWL-1", 3, "the label is missing", false),
+                wait("OWL-2", 4, "Merge method squash is not allowed", true),
+            ]
+        );
+
+        // The text, under its project.
+        let served = ServedProjects {
+            format: Format,
+            projects: vec![ServedProject {
+                repository: "acme/web".to_owned(),
+                checkout: "/home/ada/acme/web".to_owned(),
+            }],
+        };
+        crate::step::write_atomically(&Registry::in_data_dir(data_dir).file(), &served.render())
+            .unwrap();
+        let mut report = gather(data_dir, 1, &[], Timestamp::now());
+        assert!(report.projects[0].merges_waiting.is_empty());
+        report.projects[0].merges_waiting = listed;
+        let text = render(&report, &TimeZone::UTC);
+        assert!(
+            text.contains(
+                "  green, waiting for a person to merge:\n    OWL-1: pull request #3, the label is \
+                 missing\n    OWL-2: pull request #4, GitHub refused to merge it: Merge method \
+                 squash is not allowed\n"
+            ),
+            "{text}"
+        );
+    }
+
     #[test]
     fn a_watch_is_read_from_the_daemons_events_since_it_started() {
         let tmp = tempfile::tempdir().unwrap();

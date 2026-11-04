@@ -373,6 +373,8 @@ struct MergeMemory {
     refused: Option<MergeRefused>,
     /// The fact whose read failed, as last warned of.
     unread: Option<&'static str>,
+    /// The head and the hold last told as waiting for a person (OWL-464).
+    waits: Option<(String, &'static str)>,
 }
 
 /// A merge on green refused for good (OWL-445; architecture section 5,
@@ -762,6 +764,23 @@ impl Following {
         });
         if !told {
             memory.refused = Some(refused);
+        }
+        !told
+    }
+
+    /// Whether to tell that `ticket`'s green pull request at `head` waits
+    /// for a person, for the hold `key`
+    /// ([`MergeBlocker::kept_for_a_person`](owlshift_core::follow::MergeBlocker::kept_for_a_person)):
+    /// not when that head was told for that hold last (OWL-464). Keeps it as
+    /// told.
+    pub fn merge_waits(&mut self, ticket: &TicketId, head: &str, key: &'static str) -> bool {
+        let memory = self.merge.entry(ticket.clone()).or_default();
+        let told = memory
+            .waits
+            .as_ref()
+            .is_some_and(|(told, held)| told == head && *held == key);
+        if !told {
+            memory.waits = Some((head.to_owned(), key));
         }
         !told
     }
@@ -1478,6 +1497,14 @@ mod tests {
         assert!(!following.merge_refused(&ticket(), refused(PUSHED, "c", true)));
         following.review_cleared(&ticket());
         assert!(following.merge_refused(&ticket(), refused(PUSHED, "c", true)));
+
+        // A green head waiting for a person: told once per head and hold
+        // (OWL-464).
+        assert!(following.merge_waits(&ticket(), PUSHED, "unlabeled"));
+        assert!(!following.merge_waits(&ticket(), PUSHED, "unlabeled"));
+        assert!(following.merge_waits(&ticket(), PUSHED, "security"));
+        assert!(following.merge_waits(&ticket(), PUSHING, "security"));
+        assert!(!following.merge_waits(&ticket(), PUSHING, "security"));
 
         // Each fact warned of once, again after a read of every fact.
         for fact in ["label", "stage", "questions", "switch", "base"] {

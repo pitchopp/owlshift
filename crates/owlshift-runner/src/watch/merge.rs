@@ -23,7 +23,7 @@ use owlshift_contracts::step::StepKind;
 use owlshift_core::floor::MergeGrant;
 use owlshift_core::follow::{
     self as core, Decision, EndReason, FirstGreen, LastRead, MergeBlocker, MergeDue, MergeFacts,
-    MergePolicy, ReviewState,
+    MergePolicy, MergeQuestion, ReviewState,
 };
 use owlshift_core::state::{Status, TicketState};
 use owlshift_core::vocab::{MergeSwitch, Stage};
@@ -192,7 +192,21 @@ impl Watch<'_> {
                 drop(locked);
                 return self.refresh(memory, sink, out, continued, ticket, at);
             }
-            MergeDue::Wait(_) => return,
+            // A hold only a person lifts is told once per head (OWL-464),
+            // outside the locks, since a notification may take seconds; the
+            // next pass settles any other wait.
+            MergeDue::Wait(blocker) => {
+                if let Some(key) = blocker.kept_for_a_person() {
+                    let pushed = pushed.to_owned();
+                    drop(locked);
+                    let question = core::held_question(&gate, &questions)
+                        .filter(|(_, held)| *held == blocker)
+                        .map(|(question, _)| question);
+                    let waits = (pushed.as_str(), &blocker, key, question);
+                    self.waits_for_person(memory, sink, out, ticket, pr, waits);
+                }
+                return;
+            }
         };
         // The last read, right before the call (OWL-446).
         let last = match on_demand.forge.merge_read(pr.number) {
@@ -460,6 +474,37 @@ impl Watch<'_> {
             ),
         );
         merge::notify_refused(self.on_demand, ticket, pr.number, reason, sink);
+    }
+
+    /// A green pull request merge on green leaves for a person, at `head`,
+    /// for `blocker`, whose key is `key`, with the question that holds, if
+    /// one does (OWL-464; architecture section 5, "Merge on green", "Kept
+    /// for a person"): one `merge_waits` event, one line and one
+    /// notification per head and hold, none again while watch remembers it.
+    fn waits_for_person(
+        &self,
+        memory: &mut Memory,
+        sink: &mut EventSink<'_>,
+        out: &mut dyn Write,
+        ticket: &TicketId,
+        pr: &DeliveredPullRequest,
+        (head, blocker, key, question): (&str, &MergeBlocker, &'static str, Option<&MergeQuestion>),
+    ) {
+        if !memory.following.merge_waits(ticket, head, key) {
+            return;
+        }
+        let reason = merge::hold_words(blocker, question);
+        let event = merge::waits_data(pr.number, head, blocker, question);
+        sink.emit(ticket, None, EventKind::Decision, event);
+        self.line(
+            out,
+            &format!(
+                "{ticket}: pull request #{} {} is green and waits for a person: Owlshift will not \
+                 merge it, as {reason}. Merge it yourself once you have read it",
+                pr.number, pr.url
+            ),
+        );
+        merge::notify_waits(self.on_demand, ticket, pr.number, &reason, sink);
     }
 
     /// A base that moved since the push, the pull request green and the
