@@ -1347,6 +1347,13 @@ impl Watch<'_> {
                 action: Action::Park,
                 ..
             } => None,
+            // Nor a rebase whose gate the machine cut, kept by a rebase's
+            // wait (OWL-490), its gate alone run first; a rebase run it
+            // leaves is held by its own usage admission, as a fix's below.
+            Decision::Follow {
+                action: Action::Rebase { .. },
+                ..
+            } if base::read_wait(on_demand.dirs, ticket).is_some_and(|wait| wait.rebase) => None,
             Decision::Follow {
                 action: Action::Rebase { .. } | Action::RebaseFailed { .. },
                 ..

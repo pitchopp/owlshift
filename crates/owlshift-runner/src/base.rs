@@ -251,29 +251,38 @@ pub fn read_wait(dirs: &ProjectDirs, ticket: &TicketId) -> Option<BaseWait> {
 }
 
 /// Where a ticket's wait is kept and read: at Build (OWL-418, OWL-480), or
-/// by a fix run at Watch whose red gate the machine cut, on the pull
-/// request's head `pushed` it fixes (OWL-486).
+/// at Watch by a fix run (OWL-486) or a rebase run (OWL-490) whose red gate
+/// the machine cut, on the pull request's head `pushed` it repairs.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum WaitAt<'a> {
     Build,
     Fix { pushed: &'a str },
+    Rebase { pushed: &'a str },
 }
 
 impl<'a> WaitAt<'a> {
-    /// The pull request's head a fix run's wait names; none at Build.
+    /// The pull request's head a repair's wait names; none at Build.
     pub fn pushed(self) -> Option<&'a str> {
         match self {
             Self::Build => None,
-            Self::Fix { pushed } => Some(pushed),
+            Self::Fix { pushed } | Self::Rebase { pushed } => Some(pushed),
         }
+    }
+
+    /// Whether it is a rebase run's.
+    pub fn rebase(self) -> bool {
+        matches!(self, Self::Rebase { .. })
     }
 }
 
 /// Whether `wait` is valid for a run read `at`, in `round`, configured at
 /// `configured_at` with `commands`, its branch at `head`: the wait's round,
 /// commit, commands and branch head all those, and the pull request's head
-/// it names the one read `at` names. A wait of the other stage never is, so
-/// Build never regates a fix run's result, nor a fix a Build's.
+/// it names and whether it is a rebase's those read `at`. A wait of another
+/// stage never is, so Build never regates a repair's result, nor a fix a
+/// rebase's. A rebase's `head` is the rebased commit it kept, the branch
+/// going back to `pushed` after the cut: the branch is at either (OWL-490),
+/// the regate moving it to that commit.
 pub fn wait_holds(
     wait: &BaseWait,
     at: WaitAt<'_>,
@@ -281,11 +290,16 @@ pub fn wait_holds(
     (configured_at, commands): (&str, &str),
     head: Option<&str>,
 ) -> bool {
+    let on_head = match at {
+        WaitAt::Rebase { pushed } => head == Some(pushed) || head == Some(wait.head.as_str()),
+        WaitAt::Build | WaitAt::Fix { .. } => head == Some(wait.head.as_str()),
+    };
     wait.round == round
         && wait.configured_at == configured_at
         && wait.commands == commands
-        && head == Some(wait.head.as_str())
+        && on_head
         && wait.pushed.as_deref() == at.pushed()
+        && wait.rebase == at.rebase()
 }
 
 /// Keeps `wait` as the ticket's, replacing any.
@@ -533,6 +547,7 @@ mod tests {
             failing: Some(KeptFailing::from(&failing)),
             done: None,
             pushed: None,
+            rebase: false,
         };
         let cut = BaseWait {
             failing: None,
@@ -577,6 +592,7 @@ mod tests {
             failing: None,
             done: None,
             pushed: None,
+            rebase: false,
         };
         let fix = BaseWait {
             pushed: Some(pushed.clone()),
@@ -599,5 +615,51 @@ mod tests {
         assert!(!holds(&fix, at_fix, 2, Some(&head)));
         assert!(!holds(&fix, at_fix, 1, Some("moved")));
         assert!(!holds(&fix, at_fix, 1, None));
+    }
+
+    /// OWL-490: a rebase run's wait holds at a rebase on the pull request's
+    /// head it rebases, its branch back there or at the rebased commit,
+    /// configured at the base it rebased onto; never at a fix or a Build,
+    /// nor a fix's at a rebase.
+    #[test]
+    fn a_rebase_wait_holds_at_a_rebase_only() {
+        use owlshift_contracts::format::Format;
+        let (pushed, rebased) = ("p".repeat(40), "r".repeat(40));
+        let rebase = BaseWait {
+            format: Format,
+            ticket: TicketId::new("OWL-1").unwrap(),
+            configured_at: "onto".to_owned(),
+            commands: "k".to_owned(),
+            round: 1,
+            head: rebased.clone(),
+            failing: None,
+            done: None,
+            pushed: Some(pushed.clone()),
+            rebase: true,
+        };
+        let at = WaitAt::Rebase { pushed: &pushed };
+        let holds = |wait: &BaseWait, at, configured_at, head: &str| {
+            wait_holds(wait, at, 1, (configured_at, "k"), Some(head))
+        };
+        assert!(holds(&rebase, at, "onto", &pushed));
+        assert!(holds(&rebase, at, "onto", &rebased));
+        assert!(!holds(&rebase, at, "onto", "moved"), "another branch head");
+        assert!(!holds(&rebase, at, "moved", &pushed), "a moved base");
+        let other = WaitAt::Rebase { pushed: "other" };
+        assert!(!holds(&rebase, other, "onto", &pushed), "a moved head");
+        let at_fix = WaitAt::Fix { pushed: &pushed };
+        assert!(!holds(&rebase, at_fix, "onto", &rebased));
+        assert!(!holds(&rebase, WaitAt::Build, "onto", &rebased));
+        let fix = BaseWait {
+            rebase: false,
+            ..rebase.clone()
+        };
+        assert!(!holds(&fix, at, "onto", &rebased));
+        let unpushed = BaseWait {
+            pushed: None,
+            ..rebase.clone()
+        };
+        assert!(!holds(&unpushed, at, "onto", &pushed));
+        assert!(!holds(&unpushed, WaitAt::Build, "onto", &rebased));
     }
 }
