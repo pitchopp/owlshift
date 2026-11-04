@@ -10,8 +10,11 @@
 //! inbox socket replaced (see `docs/design/build-plan.md`, OWL-14, OWL-46,
 //! OWL-52, OWL-53, OWL-77, OWL-327 and OWL-338 results). Each test states the exit status and standard error
 //! the run had, since both decide the outcome; the recorder checks them.
-//! `usage_limit.jsonl` alone is constructed, not recorded: no run has hit a
-//! limit on purpose (C7's open item). It follows the shapes C7 logged.
+//! `usage_limit.jsonl` is a real run at the weekly limit, captured on
+//! 2026-11-03 with a bare `claude -p` on Claude Code 2.1.317, not by the
+//! recorder: a limit cannot be reached on demand (OWL-40). It was scrubbed by
+//! hand to the recorder's rules, and the user's hook events dropped, since
+//! the adapter's command runs no user hook.
 //! `repo_settings_ignored.jsonl` was recorded with the real CLI and a local
 //! stand-in for the model, which played scripted tool calls (OWL-53).
 
@@ -290,16 +293,17 @@ fn unknown_model() {
     }
 }
 
-/// Constructed: a rejected rate-limit report, then the synthetic limit
-/// message. The exit status is assumed to be 1, as for other API errors.
+/// Recorded at a real weekly limit (OWL-40): a rejected rate-limit report,
+/// then the synthetic limit message; the run exited with status 1 and an
+/// empty standard error.
 #[test]
 fn usage_limit() {
     let run = replay("usage_limit.jsonl", 1);
     assert_eq!(
         run.outcome,
         Outcome::UsageLimit {
-            resets_at: Some(Timestamp::from_second(1790613600).unwrap()),
-            window: Some("five_hour".into()),
+            resets_at: Some(Timestamp::from_second(1793772000).unwrap()),
+            window: Some("seven_day".into()),
         }
     );
 }
@@ -850,8 +854,10 @@ fn bundled_skills_are_disabled_on_every_launch() {
 
 /// Every recorded fixture carries a version listed in `harness/tested.rs`,
 /// so re-recording with a new release cannot leave the list `owlshift
-/// doctor` reads behind. The constructed fixture proves nothing about a
-/// release and is skipped, and so is the sender of OWL-52's probe: it plays
+/// doctor` reads behind. The usage-limit fixture is skipped: it was captured
+/// outside the recorder, with a bare `claude -p` rather than the adapter's
+/// command, so it proves nothing about a release; and so is the sender of
+/// OWL-52's probe: it plays
 /// one of the user's other sessions, whatever their version, not a run the
 /// adapter launches.
 #[test]
