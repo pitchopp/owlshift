@@ -1,7 +1,7 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "Owlshift base wait",
-  "description": "A ticket's gate or setup failure waiting for its base, or a red gate the\nmachine cut (OWL-480) waiting for its next run, valid while the ticket is\nat Build in `round`, configured at `configured_at` with `commands`, on\nthe branch head `head`; with `pushed`, a fix run's red gate the machine\ncut at Watch (OWL-486), valid there alone, while the pull request's head\nis `pushed`.",
+  "description": "A ticket's gate or setup failure waiting for its base, or a red gate the\nmachine cut (OWL-480) waiting for its next run, valid while the ticket is\nat Build in `round`, configured at `configured_at` with `commands`, on\nthe branch head `head`; with `pushed`, a fix run's red gate the machine\ncut at Watch (OWL-486), valid there alone, while the pull request's head\nis `pushed`; with `rebase` too, a rebase run's (OWL-490), whose `head` is\nthe rebased commit it kept.",
   "type": "object",
   "properties": {
     "commands": {
@@ -38,7 +38,7 @@
       "const": 1
     },
     "head": {
-      "description": "The branch's head the failure was found on, a full commit id.",
+      "description": "The branch's head the failure was found on, a full commit id; for a\nrebase run's, the rebased commit, the branch being back at `pushed`.",
       "type": "string"
     },
     "pushed": {
@@ -47,6 +47,10 @@
         "string",
         "null"
       ]
+    },
+    "rebase": {
+      "description": "The wait is a rebase run's at Watch whose red gate the machine cut\n(OWL-490), made on the pull request's head `pushed`; false for a fix\nrun's and a Build's. An Owlshift from before OWL-490 does not read a\nwait with it, and runs the rebase again.",
+      "type": "boolean"
     },
     "round": {
       "type": "integer",

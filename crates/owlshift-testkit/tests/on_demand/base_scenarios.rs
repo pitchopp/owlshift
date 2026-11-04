@@ -710,6 +710,7 @@ fn a_stale_wait_lets_no_fix_run_past_a_usage_limit() {
         failing: None,
         done: None,
         pushed: Some("0".repeat(40)),
+        rebase: false,
     };
     base::write_wait(&bench.dirs(), &ticket(), &stale).unwrap();
     let now: Timestamp = "2026-10-02T09:10:00Z".parse().unwrap();
@@ -751,6 +752,131 @@ fn a_stale_wait_lets_no_fix_run_past_a_usage_limit() {
     );
     let state = TicketState::try_from(&bench.record().state).unwrap();
     assert_eq!((state.failed_runs(), state.fix_passes()), (0, 0));
+}
+
+/// The rebase runs started, each with whether it ran the gate alone.
+fn rebases(bench: &Bench) -> Vec<bool> {
+    data_of(&bench.events(), EventKind::RunStarted, "role")
+        .into_iter()
+        .filter(|data| data["role"] == json!("rebase"))
+        .map(|data| data.get("gate_only") == Some(&json!(true)))
+        .collect()
+}
+
+/// The head of the ticket's branch in Owlshift's checkout.
+fn local_branch(bench: &Bench) -> String {
+    let name = format!("refs/heads/{BRANCH}");
+    let out = bench
+        .env
+        .run(&bench.dirs().checkout(), &["rev-parse", &name])
+        .unwrap();
+    String::from_utf8(out).unwrap().trim().to_owned()
+}
+
+/// A delivered pull request that conflicts with `main`, which also gave
+/// its gate a first command passing while the machine is awake; the
+/// rebase run's gate then cut by the machine, the network out once the
+/// bench rebased the branch. Returns the bench, the first push, the base
+/// rebased onto and the machine's marker.
+fn cut_rebase() -> (Bench, String, String, PathBuf) {
+    let bench = delivered_with_rules();
+    let first = bench.remote_branch().unwrap();
+    let awake = bench.tmp.path().join("machine-awake");
+    fs::write(&awake, "").unwrap();
+    let config = fs::read_to_string(bench.remote.checkout.join("owlshift.toml")).unwrap();
+    let gate = format!(
+        "gate = [{:?}, \"test ! -e GREETING.md || git grep -q Hello -- GREETING.md\"]",
+        setup_line(&awake)
+    );
+    let config = config.replace(GATE_LINE, &gate);
+    let main = bench.merge_into_main(&[("AGENTS.md", AGENTS_MERGED), ("owlshift.toml", &config)]);
+    bench.github.followed.lock().unwrap().mergeable = "CONFLICTING";
+    let (_, rebase) = rebase_in(&bench, main.clone(), vec![("AGENTS.md", AGENTS_RESOLVED)]);
+    let (lost, offline) = (awake.clone(), bench.offline.clone());
+    let cut: During = (
+        1,
+        Box::new(move || {
+            rebase();
+            fs::remove_file(&lost).unwrap();
+            offline.set(true);
+        }),
+    );
+    let (stopped, printed) =
+        bench.continue_during(vec![bench.reply(None, Some(REBASED))], vec![cut]);
+    assert!(
+        matches!(&stopped, Err(Stop::MachineCut { unreachable: true, command, .. }) if *command == setup_line(&awake)),
+        "{stopped:?}\n{printed}"
+    );
+    (bench, first, main, awake)
+}
+
+/// OWL-490's acceptance: a rebase run at Watch whose gate fails while the
+/// network is out, the tracker giving no answer right after, is the
+/// machine's: nothing counted, nothing pushed, the branch back at the last
+/// push, and the rebased commit kept with that push. With the network
+/// back, the next `continue` runs only the gate on that commit, then the
+/// runner pushes it, leased on the last push, as a repair.
+#[test]
+fn a_rebase_runs_gate_cut_by_the_machine_counts_nothing_and_runs_again_alone() {
+    let (bench, first, main, awake) = cut_rebase();
+    let state = || TicketState::try_from(&bench.record().state).unwrap();
+    let cut_at = state();
+    assert_eq!(
+        (cut_at.status(), cut_at.failed_runs(), cut_at.repairs()),
+        (Status::Active(Stage::Watch), 0, 0)
+    );
+    let wait = base::read_wait(&bench.dirs(), &ticket()).expect("the rebase run's wait");
+    assert!(
+        wait.rebase && wait.failing.is_none() && wait.done.is_some(),
+        "{wait:?}"
+    );
+    assert_eq!(wait.pushed.as_deref(), Some(first.as_str()));
+    assert_eq!(wait.configured_at, main, "configured at the base");
+    assert_ne!(wait.head, first, "the rebased commit");
+    assert_eq!(bench.remote_branch(), Some(first.clone()), "nothing pushed");
+    assert_eq!(local_branch(&bench), first, "the branch back at the push");
+    assert_eq!(rebases(&bench), [false]);
+    let cost = |bench: &Bench| bench.record().cost.expect("cost.json").runs;
+    let spent = cost(&bench);
+
+    bench.offline.set(false);
+    fs::write(&awake, "").unwrap();
+    let (rebased, printed) = bench.continue_ticket(Vec::new());
+    rebased.unwrap_or_else(|stop| panic!("{stop}\n{printed}"));
+    assert_eq!(rebases(&bench), [false, true], "the rebase's gate alone");
+    assert_eq!(cost(&bench), spent, "the gate alone costs nothing");
+    assert!(!base::wait_file(&bench.dirs(), &ticket()).exists());
+    let pushed = bench.remote_branch().unwrap();
+    assert_eq!(pushed, wait.head, "the kept rebase pushed");
+    assert!(is_ancestor(&bench, &main, &pushed));
+    let lease = data_of(&bench.events(), EventKind::TrackerWrite, "lease");
+    assert_eq!(lease.last().unwrap()["lease"], json!(first));
+    let delivery = bench.record().delivery.unwrap();
+    assert_eq!(delivery.rebased_onto.as_deref(), Some(main.as_str()));
+    assert_eq!((state().repairs(), state().failed_runs()), (1, 0));
+}
+
+/// OWL-490: a rebase's kept commit is gated alone only onto the base it was
+/// rebased onto. Once `main` moves, the wait is dropped and a whole rebase
+/// runs onto the new head, the cut having counted nothing.
+#[test]
+fn a_cut_rebase_onto_a_base_that_moved_runs_again_whole() {
+    let (bench, first, main, awake) = cut_rebase();
+    let moved = bench.merge_into_main(&[("NOTES.md", "Another change.\n")]);
+    assert_ne!(moved, main);
+    bench.offline.set(false);
+    fs::write(&awake, "").unwrap();
+    let (_, rebase) = rebase_in(&bench, moved.clone(), vec![("AGENTS.md", AGENTS_RESOLVED)]);
+    let (rebased, printed) =
+        bench.continue_during(vec![bench.reply(None, Some(REBASED))], vec![(1, rebase)]);
+    rebased.unwrap_or_else(|stop| panic!("{stop}\n{printed}"));
+    assert_eq!(rebases(&bench), [false, false], "a whole rebase run");
+    assert!(!base::wait_file(&bench.dirs(), &ticket()).exists());
+    let pushed = bench.remote_branch().unwrap();
+    assert_ne!(pushed, first);
+    assert!(is_ancestor(&bench, &moved, &pushed));
+    let state = TicketState::try_from(&bench.record().state).unwrap();
+    assert_eq!((state.repairs(), state.failed_runs()), (1, 0));
 }
 
 /// Criterion 5: a base check that cannot run says so in a `warning` event,

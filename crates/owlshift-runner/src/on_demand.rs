@@ -787,8 +787,9 @@ pub enum Stop {
         pending: bool,
         due: bool,
     },
-    /// A done Build's gate (OWL-480), or a done fix run's at Watch
-    /// (OWL-486), failed on `command` while the machine slept `slept`, past
+    /// A done Build's gate (OWL-480), or a done fix run's (OWL-486) or
+    /// rebase run's (OWL-490) at Watch, failed on `command` while the
+    /// machine slept `slept`, past
     /// the bound, or, `unreachable`, the tracker gave no answer right after
     /// it: the failure is the machine's, so nothing was counted, and the
     /// run's result is kept for its gate alone to run again at the next
@@ -6596,21 +6597,23 @@ struct RepairRun<'r> {
     /// Whether a `done`'s gated commit is one to push, or why not: a failed
     /// run then.
     accept: &'r dyn Fn(&CommitId) -> Result<(), String>,
-    /// A fix run's: where a red gate the machine cut keeps its result, and
-    /// the result such a cut kept, whose gate the first attempt runs alone
-    /// (OWL-486). `None` for the other repairs, whose cut gate is counted.
-    cut: Option<FixCut<'r>>,
+    /// A fix run's (OWL-486) or a rebase run's (OWL-490): where a red gate
+    /// the machine cut keeps its result, and the result such a cut kept,
+    /// whose gate the first attempt runs alone. `None` for the other
+    /// repairs, whose cut gate is counted.
+    cut: Option<RepairCut<'r>>,
 }
 
-/// A fix run's machine cut at Watch (OWL-486; architecture section 5, "A
-/// broken base", "The machine's").
+/// A fix run's or a rebase run's machine cut at Watch (OWL-486, OWL-490;
+/// architecture section 5, "A broken base", "The machine's").
 #[derive(Clone, Copy)]
-struct FixCut<'r> {
-    /// The fix's dispatch, whose configuring commit and commands the wait
-    /// keeps.
+struct RepairCut<'r> {
+    /// The repair's dispatch, whose configuring commit and commands the
+    /// wait keeps.
     dispatched: &'r Dispatched,
-    /// The pull request's head the fix is made on, Owlshift's last push.
-    pushed: &'r str,
+    /// Where the wait is kept and read: the repair, and the pull request's
+    /// head it is made on, Owlshift's last push.
+    at: crate::base::WaitAt<'r>,
     /// The result a cut kept, valid on that head.
     kept: Option<&'r owlshift_contracts::base::KeptDone>,
 }
@@ -6966,9 +6969,9 @@ impl OnDemand<'_> {
                 before: &|_, _, _| Ok(()),
                 decorate: &decorate,
                 accept: &accept,
-                cut: Some(FixCut {
+                cut: Some(RepairCut {
                     dispatched: &dispatched,
-                    pushed: pushed.as_str(),
+                    at,
                     kept: kept.as_ref(),
                 }),
             },
@@ -7060,10 +7063,11 @@ impl OnDemand<'_> {
     /// as for a Build run, a `done` whose commit `run.accept` refuses is a
     /// failed run; questions go through the resolver (OWL-342), the run
     /// again when it decides them all, an attempt not counted, else to the
-    /// decider as a round that returns to Watch (OWL-211). A fix run's red
-    /// gate the machine cut stops the runs, nothing counted, its result kept
-    /// (`run.cut`, OWL-486); given such a result, the first attempt runs its
-    /// gate alone ([`Self::regate_role`]).
+    /// decider as a round that returns to Watch (OWL-211). A fix run's or a
+    /// rebase run's red gate the machine cut stops the runs, nothing
+    /// counted, its result kept (`run.cut`, OWL-486, OWL-490); given such a
+    /// result, the first attempt runs its gate alone
+    /// ([`Self::regate_role`]).
     fn repair_runs(
         &self,
         p: &mut Prepared,
@@ -7073,8 +7077,8 @@ impl OnDemand<'_> {
     ) -> Result<(RepairDone, Vec<Followup>), Stop> {
         let current = person(p.current()?, &p.found);
         let mut gathered = Gathered::default();
-        // A fix run's result a machine cut kept: its gate alone first, with
-        // what it gathered (OWL-486).
+        // A repair's result a machine cut kept: its gate alone first, with
+        // what it gathered (OWL-486, OWL-490).
         let mut regate = run.cut.and_then(|cut| cut.kept);
         if let Some(done) = regate {
             gather(&mut gathered.decisions, &done.notes);
@@ -7124,14 +7128,15 @@ impl OnDemand<'_> {
                     sink,
                 )?,
             };
-            // A fix run's red gate the machine cut counts nothing: its result
-            // is kept for its gate alone at the next step (OWL-486).
+            // A fix run's or a rebase run's red gate the machine cut counts
+            // nothing: its result is kept for its gate alone at the next
+            // step (OWL-486, OWL-490).
             if event == Event::RunFailed
                 && let Some(cut) = run.cut
                 && let Some(stop) = self.machine_cut(
                     p,
                     cut.dispatched,
-                    crate::base::WaitAt::Fix { pushed: cut.pushed },
+                    cut.at,
                     &mut state,
                     &ran,
                     self.kept_done(p, &ran, &gathered, &comments, false),
@@ -7259,12 +7264,15 @@ impl OnDemand<'_> {
     /// onto: a trivial one's first run is on the fast tier, any other run
     /// on the Build routing, and a failed run gets one more before the
     /// ticket parks. Each attempt starts from a fresh worktree at `pushed`
-    /// ([`Self::reset_worktree`]). A `done` is pushed only when its gated
-    /// commit is a rebase of the delivery onto the base that keeps its
-    /// change ([`rebase_keeps_delivery`]); the runner pushes it, leased on
-    /// `pushed`, never the agent. A non-trivial conflict on a path one of
-    /// the ticket's overlaps names gets a Verify pass on the rebased head
-    /// before the push (OWL-449, [`Self::review_resolution`]).
+    /// ([`Self::reset_worktree`]), but for a gate the machine cut: the
+    /// rebased commit is kept, nothing counted, the branch back at `pushed`,
+    /// and the next rebase onto the same base's first attempt starts from
+    /// that commit and runs its gate alone (OWL-490). A `done` is pushed
+    /// only when its gated commit is a rebase of the delivery onto the base
+    /// that keeps its change ([`rebase_keeps_delivery`]); the runner pushes
+    /// it, leased on `pushed`, never the agent. A non-trivial conflict on a
+    /// path one of the ticket's overlaps names gets a Verify pass on the
+    /// rebased head before the push (OWL-449, [`Self::review_resolution`]).
     #[allow(clippy::too_many_arguments)]
     fn repair_rebase(
         &self,
@@ -7375,12 +7383,26 @@ impl OnDemand<'_> {
                 &*build_run
             }
         };
+        // A rebase onto this base whose red gate the machine cut on this
+        // head left its rebased commit (OWL-490): the first attempt starts
+        // from it and runs its gate alone; a wait of any other is dropped.
+        let at = crate::base::WaitAt::Rebase { pushed };
+        let (kept, restore) = match self.valid_wait(p, &dispatched, &state, at) {
+            Some(wait) => match (wait.done, CommitId::new(wait.head.as_str())) {
+                (Some(done), Ok(rebased)) => (Some(done), Some(rebased)),
+                _ => (None, None),
+            },
+            None => (None, None),
+        };
+        // Taken by the first attempt alone, whatever its number.
+        let restore = std::cell::Cell::new(restore);
         // Whether the last attempt's reset was made: a reset that failed is
         // not made again once the runs stop (OWL-457).
         let reset = std::cell::Cell::new(false);
         let before = |p: &Prepared, attempt: u32, sink: &mut EventSink<'_>| {
             reset.set(false);
-            self.reset_worktree(p, &pushed_id)?;
+            let rebased = restore.take();
+            self.reset_worktree(p, rebased.as_ref().unwrap_or(&pushed_id))?;
             reset.set(true);
             sink.emit(
                 &p.ticket,
@@ -7390,6 +7412,7 @@ impl OnDemand<'_> {
                     ("watch", json!("rebase_run")),
                     ("pull_request", json!(pr.number)),
                     ("attempt", json!(attempt)),
+                    ("gate_only", json!(rebased.is_some())),
                     ("tier", json!(rebase_tier(fast(attempt)))),
                     ("trivial", json!(classified.trivial)),
                     ("refresh", json!(refresh)),
@@ -7429,9 +7452,13 @@ impl OnDemand<'_> {
                 before: &before,
                 decorate: &decorate,
                 accept: &accept,
-                // Each attempt starts from a fresh worktree at the last
-                // push, so no result outlives it: a cut gate is counted.
-                cut: None,
+                // The cut's wait keeps the rebased commit as its head, read
+                // before the stop below moves the branch back to `pushed`.
+                cut: Some(RepairCut {
+                    dispatched: &dispatched,
+                    at,
+                    kept: kept.as_ref(),
+                }),
             },
             sink,
         );

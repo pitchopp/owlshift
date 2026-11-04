@@ -24,7 +24,10 @@
 //! gate, no check owed ([`OnDemand::machine_cut`]). A fix run's at Watch
 //! that the machine cut likewise counts nothing and keeps its result, with
 //! the pull request's head it fixes, for the next fix read on that head to
-//! run only its gate (OWL-486, [`WaitAt::Fix`]); Watch runs no base check.
+//! run only its gate (OWL-486, [`WaitAt::Fix`]); a rebase run's too, its
+//! rebased commit kept while its branch goes back to that head, for the
+//! next rebase onto the same base to gate that commit alone (OWL-490,
+//! [`WaitAt::Rebase`]). Watch runs no base check.
 
 use owlshift_contracts::base::{BaseWait, KeptDone, KeptFailing};
 use owlshift_core::base::{After, Before, Entry, Failing, HeldBranch, Leave, Recorded, Verdict};
@@ -553,7 +556,8 @@ impl OnDemand<'_> {
 
     /// A Build's red gate the machine cut (OWL-480; architecture section 5,
     /// "A broken base", "The machine's"), read before any base check, or a
-    /// fix run's at Watch (OWL-486), read `at` that fix: a command that
+    /// fix run's (OWL-486) or a rebase run's (OWL-490) at Watch, read `at`
+    /// that repair: a command that
     /// failed while the machine slept through the gate, or, the machine
     /// awake, one the tracker gives no answer about right after
     /// ([`base::cut`]). The ticket stays as it is ([`Event::Interrupted`]),
@@ -632,8 +636,10 @@ impl OnDemand<'_> {
     /// Keeps the ticket's wait file for a run configured as `dispatched` in
     /// `round`, to be read `at` its stage, at its branch's head now: the held
     /// failure, none for a gate the machine cut, and a done run's result.
-    /// Whether it was kept: a branch with no head keeps none; a write that
-    /// fails is a `warning` for `run`.
+    /// For a rebase run's, that head is the rebased commit, read before the
+    /// rebase's stop moves the branch back to the pull request's head
+    /// (OWL-490). Whether it was kept: a branch with no head keeps none; a
+    /// write that fails is a `warning` for `run`.
     #[allow(clippy::too_many_arguments)]
     fn keep_wait(
         &self,
@@ -659,6 +665,7 @@ impl OnDemand<'_> {
             failing,
             done,
             pushed: at.pushed().map(str::to_owned),
+            rebase: at.rebase(),
         };
         let Err(error) = base::write_wait(self.dirs, &p.ticket, &wait) else {
             return true;
@@ -676,8 +683,8 @@ impl OnDemand<'_> {
     }
 
     /// A done Build's gate run again alone, its kept result judged by it
-    /// (OWL-418), or a fix run's at Watch whose gate the machine cut
-    /// (OWL-486): as [`Self::run_role_once`], with no budget check, no
+    /// (OWL-418), or a fix run's (OWL-486) or a rebase run's (OWL-490) at
+    /// Watch whose gate the machine cut: as [`Self::run_role_once`], with no budget check, no
     /// session, no usage admission and no cost, since no harness runs. The
     /// wait is spent whatever the gate says, a red gate classified again as
     /// any Build run's, but for a checked stop (OWL-161): the gate stopped
@@ -725,8 +732,10 @@ impl OnDemand<'_> {
     /// The ticket's wait file when it is valid for this run, read `at` its
     /// stage ([`base::wait_holds`]): the ticket in the wait's round,
     /// configured at its commit with its commands, its branch's head the one
-    /// the failure was found on, and a fix run's on the pull request's head
-    /// it fixes. One that is not is removed, a wait of the other stage too.
+    /// the failure was found on, and a repair's on the pull request's head
+    /// it repairs; a rebase run's only while git still holds the rebased
+    /// commit it kept, which no ref keeps (OWL-490). One that is not is
+    /// removed, a wait of another stage too.
     pub(super) fn valid_wait(
         &self,
         p: &Prepared,
@@ -742,12 +751,31 @@ impl OnDemand<'_> {
                 state.round(),
                 (&dispatched.configured_at.commit, &commands_key(dispatched)),
                 self.branch_head(p).as_deref(),
-            )
+            ) && (!at.rebase() || self.holds_commit(p, &wait.head))
         });
         if valid.is_none() {
             let _ = base::remove_wait(self.dirs, &p.ticket);
         }
         valid
+    }
+
+    /// Whether the dedicated checkout holds `commit`, a commit git may have
+    /// pruned once no ref reached it.
+    fn holds_commit(&self, p: &Prepared, commit: &str) -> bool {
+        let object = format!("{commit}^{{commit}}");
+        self.executor
+            .git
+            .run(
+                &p.checkout,
+                &[
+                    "rev-parse",
+                    "--verify",
+                    "--quiet",
+                    "--end-of-options",
+                    &object,
+                ],
+            )
+            .is_ok()
     }
 
     /// Removes the ticket's wait file; a removal that fails is a `warning`.
