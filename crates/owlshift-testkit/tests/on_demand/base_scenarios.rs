@@ -686,6 +686,73 @@ fn a_fix_runs_gate_cut_by_the_machine_counts_nothing_and_runs_again_alone() {
     assert_ne!(bench.remote_branch().unwrap(), second);
 }
 
+/// OWL-486: a wait file lets watch start a red pull request's fix step
+/// while its Build harness is at its usage limit, the gate alone being due
+/// first; a wait that does not hold for this fix, made on another head, is
+/// dropped, and the fix run it leaves is held by its own usage admission
+/// before anything of it is made: no harness run, no failed run. Watch's
+/// next pass, no wait left, holds the step itself.
+#[test]
+fn a_stale_wait_lets_no_fix_run_past_a_usage_limit() {
+    use owlshift_contracts::base::BaseWait;
+    use owlshift_contracts::format::Format;
+    use owlshift_core::usage::{self, Reported};
+
+    let bench = deliver(Bench::new(true));
+    bench.github.followed.lock().unwrap().conclusion = "FAILURE";
+    let stale = BaseWait {
+        format: Format,
+        ticket: ticket(),
+        configured_at: "c".repeat(40),
+        commands: "k".to_owned(),
+        round: 0,
+        head: "h".repeat(40),
+        failing: None,
+        done: None,
+        pushed: Some("0".repeat(40)),
+    };
+    base::write_wait(&bench.dirs(), &ticket(), &stale).unwrap();
+    let now: Timestamp = "2026-10-02T09:10:00Z".parse().unwrap();
+    let reported = Reported {
+        limit: Some(Some(
+            "2026-10-02T12:00:00Z"
+                .parse::<Timestamp>()
+                .unwrap()
+                .as_millisecond(),
+        )),
+        answered: true,
+        ..Reported::default()
+    };
+    bench
+        .usage_store()
+        .update(HarnessKind::Claude, |state| {
+            usage::record(state, &reported, "elsewhere", now.as_millisecond());
+        })
+        .unwrap();
+
+    let mut passes = 0;
+    let (outcomes, lines, printed) = bench.watch(Vec::new(), &mut |_| {
+        passes += 1;
+        passes < 2
+    });
+    assert!(
+        matches!(outcomes.as_slice(), [Err(Stop::UsageLimit { .. })]),
+        "{outcomes:?}\n{lines}\n{printed}"
+    );
+    assert_eq!(builds(&bench), [false], "no fix run");
+    assert!(!base::wait_file(&bench.dirs(), &ticket()).exists());
+    let held: Vec<Value> = data_of(&bench.events(), EventKind::Decision, "usage")
+        .into_iter()
+        .filter(|data| data["usage"] == json!("waits"))
+        .collect();
+    assert!(
+        held.iter().any(|data| data["role"] == json!("build")),
+        "{held:?}"
+    );
+    let state = TicketState::try_from(&bench.record().state).unwrap();
+    assert_eq!((state.failed_runs(), state.fix_passes()), (0, 0));
+}
+
 /// Criterion 5: a base check that cannot run says so in a `warning` event,
 /// and the failure takes today's path: the second failed run parks.
 #[test]

@@ -1353,7 +1353,9 @@ impl Watch<'_> {
             } => Some(Role::Rebase),
             // Nor a fix whose gate the machine cut, its gate alone run first
             // (OWL-486): told by the wait file's presence, which the step
-            // checks; a fix run after it is held at its own admission.
+            // checks. A fix run it leaves, the wait not holding or the gate
+            // red, is held by its own usage admission before anything of it
+            // is made (`OnDemand::admit_usage`, from `execute_inner`).
             Decision::Follow {
                 action: Action::Fix { .. },
                 ..
