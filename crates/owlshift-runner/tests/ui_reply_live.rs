@@ -180,6 +180,7 @@ fn a_reply_through_the_operators_key_is_the_deciders_and_counts_at_once() {
         decider: ask_decider.clone(),
         verdicts: Vec::new(),
         result_refusal: None,
+        labels: Default::default(),
     });
 
     let author_is_key = matches!(&comment.author, TrackerAuthor::Account(p) if p.id == me.id);
