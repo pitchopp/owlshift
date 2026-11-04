@@ -355,12 +355,14 @@ impl OnDemand<'_> {
         let checks = self.forge.checks(pull_request.number, pushed);
         let verdict = checks.as_ref().ok().map(CheckSet::verdict);
         let comment = self.post_and_settle(p, state, kept, checks, done, following, sink)?;
+        let (merge, merge_held) = crate::merge::who_merges(self, &p.base, &p.questions());
         Ok(Delivered {
             pull_request,
             opened: false,
             verdict,
             comment: comment.id,
-            merge: crate::merge::switch_at(self, &p.base),
+            merge,
+            merge_held,
         })
     }
 

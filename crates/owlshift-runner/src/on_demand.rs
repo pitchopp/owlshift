@@ -594,6 +594,9 @@ pub struct Delivered {
     /// The project's `[forge] merge` at the base the command fetched, which
     /// says who merges (D14, OWL-445).
     pub merge: MergeSwitch,
+    /// Why merge on green will not merge it, when a question of the ticket
+    /// keeps it for a person (OWL-464): `None` under `never`.
+    pub merge_held: Option<String>,
 }
 
 impl fmt::Display for Delivered {
@@ -607,7 +610,7 @@ impl fmt::Display for Delivered {
             Some(Verdict::NotOpen) => "the pull request is not open",
             None => "could not be read",
         };
-        let merges = crate::writer::merges_on_green(self.merge, "it")
+        let merges = crate::writer::merges_on_green(self.merge, self.merge_held.as_deref(), "it")
             .unwrap_or_else(|| "Owlshift never merges: review and merge it.".to_owned());
         write!(
             f,
@@ -6362,12 +6365,14 @@ impl OnDemand<'_> {
         let mut following = Following::default();
         let comment =
             self.post_and_settle(p, &watching, kept, checks, &done, &mut following, sink)?;
+        let (merge, merge_held) = crate::merge::who_merges(self, &p.base, &p.questions());
         Ok(Delivered {
             pull_request,
             opened: opened.opened,
             verdict,
             comment: comment.id,
-            merge: crate::merge::switch_at(self, &p.base),
+            merge,
+            merge_held,
         })
     }
 
@@ -7871,12 +7876,14 @@ impl OnDemand<'_> {
         let verdict = checks_read.as_ref().ok().map(CheckSet::verdict);
         let done = format!("the {what} {commit} was pushed and kept");
         let comment = self.post_and_settle(p, &state, kept, checks_read, &done, following, sink)?;
+        let (merge, merge_held) = crate::merge::who_merges(self, &p.base, &p.questions());
         Ok(Delivered {
             pull_request,
             opened: false,
             verdict,
             comment: comment.id,
-            merge: crate::merge::switch_at(self, &p.base),
+            merge,
+            merge_held,
         })
     }
 
@@ -8042,6 +8049,7 @@ impl OnDemand<'_> {
         if let Some(kept) = &owed.report {
             gather(&mut decisions, &kept.notes);
         }
+        let merge = crate::merge::switch_at_push(self, delivery);
         let report = DeliveryReport {
             ticket: ticket.clone(),
             summary,
@@ -8082,8 +8090,10 @@ impl OnDemand<'_> {
                 pushed: !owed.unchanged,
             }),
             // Who merges, as the project file reads at the base of the push
-            // (OWL-445).
-            merge: crate::merge::switch_at_push(self, delivery),
+            // (OWL-445), and the question that keeps it for a person
+            // (OWL-464).
+            merge,
+            merge_held: crate::merge::held_at_delivery(self, merge, questions),
         };
         match Writer::new(self.tracker).post_repair_report(&report) {
             Ok(Reported { comment, new }) => {
