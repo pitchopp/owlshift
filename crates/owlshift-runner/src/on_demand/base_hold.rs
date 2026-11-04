@@ -21,13 +21,16 @@
 //! Before any base check, a done Build's red gate the machine cut, its sleep
 //! or the network out (OWL-480, "The machine's"), counts nothing and keeps
 //! the Build's result with no failure, so that its next step runs only its
-//! gate, no check owed ([`OnDemand::machine_cut`]).
+//! gate, no check owed ([`OnDemand::machine_cut`]). A fix run's at Watch
+//! that the machine cut likewise counts nothing and keeps its result, with
+//! the pull request's head it fixes, for the next fix read on that head to
+//! run only its gate (OWL-486, [`WaitAt::Fix`]); Watch runs no base check.
 
 use owlshift_contracts::base::{BaseWait, KeptDone, KeptFailing};
 use owlshift_core::base::{After, Before, Entry, Failing, HeldBranch, Leave, Recorded, Verdict};
 
 use super::*;
-use crate::base;
+use crate::base::{self, WaitAt};
 use crate::gate_once::{self, GateOnce, Place};
 use crate::notify;
 
@@ -108,7 +111,7 @@ impl OnDemand<'_> {
         if state.status() != Status::Active(Stage::Build) || p.repairing {
             return Ok(Resume::Go(None));
         }
-        let wait = self.valid_wait(p, dispatched, state);
+        let wait = self.valid_wait(p, dispatched, state, WaitAt::Build);
         // A wait the machine's cut left has no failure: no check is owed it
         // (OWL-480), only the holds standing on the commit.
         let failing = wait
@@ -138,6 +141,7 @@ impl OnDemand<'_> {
                             self.keep_wait(
                                 p,
                                 &rebased,
+                                WaitAt::Build,
                                 state.round(),
                                 (wait.failing, Some(done.clone())),
                                 None,
@@ -486,7 +490,9 @@ impl OnDemand<'_> {
             return Ok(None);
         }
         let done = self.kept_done(p, ran, gathered, comments, integrating);
-        if let Some(cut) = self.machine_cut(p, dispatched, state, ran, done.clone(), sink)? {
+        if let Some(cut) =
+            self.machine_cut(p, dispatched, WaitAt::Build, state, ran, done.clone(), sink)?
+        {
             return Ok(Some(cut));
         }
         let Some(failing) = base::failing(&ran.report) else {
@@ -505,6 +511,7 @@ impl OnDemand<'_> {
         self.keep_wait(
             p,
             dispatched,
+            WaitAt::Build,
             state.round(),
             (Some(KeptFailing::from(&failing)), done),
             Some(&ran.run),
@@ -520,7 +527,7 @@ impl OnDemand<'_> {
     /// its result, the notes and follow-ups gathered for the delivery, the
     /// newest decider edit its brief held and whether it was the run given
     /// late comments. `None` for a run that reported no `done`.
-    fn kept_done(
+    pub(super) fn kept_done(
         &self,
         p: &Prepared,
         ran: &Ran,
@@ -545,20 +552,23 @@ impl OnDemand<'_> {
     }
 
     /// A Build's red gate the machine cut (OWL-480; architecture section 5,
-    /// "A broken base", "The machine's"), read before any base check: a
-    /// command that failed while the machine slept through the gate, or, the
-    /// machine awake, one the tracker gives no answer about right after
+    /// "A broken base", "The machine's"), read before any base check, or a
+    /// fix run's at Watch (OWL-486), read `at` that fix: a command that
+    /// failed while the machine slept through the gate, or, the machine
+    /// awake, one the tracker gives no answer about right after
     /// ([`base::cut`]). The ticket stays as it is ([`Event::Interrupted`]),
-    /// the done Build's result is kept in its wait file with no failure, so
+    /// the done run's result is kept in its wait file with no failure, so
     /// that no check is owed it and its next step runs only its gate
     /// ([`Self::regate_role`]), and the command stops
     /// [`Stop::MachineCut`]. `None` when the gate is not the machine's, or
     /// the result cannot be kept, which takes the base's check and today's
-    /// path: a cut is never a Build run again for nothing counted.
-    fn machine_cut(
+    /// path: a cut is never a run again for nothing counted.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn machine_cut(
         &self,
         p: &Prepared,
         dispatched: &Dispatched,
+        at: WaitAt<'_>,
         state: &mut TicketState,
         ran: &Ran,
         done: Option<KeptDone>,
@@ -576,6 +586,7 @@ impl OnDemand<'_> {
             || !self.keep_wait(
                 p,
                 dispatched,
+                at,
                 state.round(),
                 (None, done),
                 Some(&ran.run),
@@ -618,15 +629,17 @@ impl OnDemand<'_> {
         }))
     }
 
-    /// Keeps the ticket's wait file for a Build configured as `dispatched`
-    /// in `round`, at its branch's head now: the held failure, none for a
-    /// gate the machine cut, and a done Build's result. Whether it was kept:
-    /// a branch with no head keeps none; a write that fails is a `warning`
-    /// for `run`.
+    /// Keeps the ticket's wait file for a run configured as `dispatched` in
+    /// `round`, to be read `at` its stage, at its branch's head now: the held
+    /// failure, none for a gate the machine cut, and a done run's result.
+    /// Whether it was kept: a branch with no head keeps none; a write that
+    /// fails is a `warning` for `run`.
+    #[allow(clippy::too_many_arguments)]
     fn keep_wait(
         &self,
         p: &Prepared,
         dispatched: &Dispatched,
+        at: WaitAt<'_>,
         round: u32,
         (failing, done): (Option<KeptFailing>, Option<KeptDone>),
         run: Option<&str>,
@@ -645,6 +658,7 @@ impl OnDemand<'_> {
             head,
             failing,
             done,
+            pushed: at.pushed().map(str::to_owned),
         };
         let Err(error) = base::write_wait(self.dirs, &p.ticket, &wait) else {
             return true;
@@ -662,7 +676,8 @@ impl OnDemand<'_> {
     }
 
     /// A done Build's gate run again alone, its kept result judged by it
-    /// (OWL-418): as [`Self::run_role_once`], with no budget check, no
+    /// (OWL-418), or a fix run's at Watch whose gate the machine cut
+    /// (OWL-486): as [`Self::run_role_once`], with no budget check, no
     /// session, no usage admission and no cost, since no harness runs. The
     /// wait is spent whatever the gate says, a red gate classified again as
     /// any Build run's, but for a checked stop (OWL-161): the gate stopped
@@ -707,22 +722,27 @@ impl OnDemand<'_> {
         Ok((ran, event))
     }
 
-    /// The ticket's wait file when it is valid for this run: the ticket at
-    /// Build in the wait's round, configured at its commit with its
-    /// commands, its branch's head the one the failure was found on. One
-    /// that is not is removed.
-    fn valid_wait(
+    /// The ticket's wait file when it is valid for this run, read `at` its
+    /// stage ([`base::wait_holds`]): the ticket in the wait's round,
+    /// configured at its commit with its commands, its branch's head the one
+    /// the failure was found on, and a fix run's on the pull request's head
+    /// it fixes. One that is not is removed, a wait of the other stage too.
+    pub(super) fn valid_wait(
         &self,
         p: &Prepared,
         dispatched: &Dispatched,
         state: &TicketState,
+        at: WaitAt<'_>,
     ) -> Option<BaseWait> {
         let wait = base::read_wait(self.dirs, &p.ticket);
         let valid = wait.filter(|wait| {
-            wait.round == state.round()
-                && wait.configured_at == dispatched.configured_at.commit
-                && wait.commands == commands_key(dispatched)
-                && self.branch_head(p).as_deref() == Some(wait.head.as_str())
+            base::wait_holds(
+                wait,
+                at,
+                state.round(),
+                (&dispatched.configured_at.commit, &commands_key(dispatched)),
+                self.branch_head(p).as_deref(),
+            )
         });
         if valid.is_none() {
             let _ = base::remove_wait(self.dirs, &p.ticket);
