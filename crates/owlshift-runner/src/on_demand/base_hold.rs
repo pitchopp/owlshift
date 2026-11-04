@@ -17,12 +17,23 @@
 //! Build's own worktree, its gate empty, nothing pushed
 //! ([`OnDemand::leave_held`]); a rebase the runner does not accept moves the
 //! branch back to where it was and parks the ticket.
+//!
+//! Before any base check, a done Build's red gate the machine cut, its sleep
+//! or the network out (OWL-480, "The machine's"), counts nothing and keeps
+//! the Build's result with no failure, so that its next step runs only its
+//! gate, no check owed ([`OnDemand::machine_cut`]). A fix run's at Watch
+//! that the machine cut likewise counts nothing and keeps its result, with
+//! the pull request's head it fixes, for the next fix read on that head to
+//! run only its gate (OWL-486, [`WaitAt::Fix`]); a rebase run's too, its
+//! rebased commit kept while its branch goes back to that head, for the
+//! next rebase onto the same base to gate that commit alone (OWL-490,
+//! [`WaitAt::Rebase`]). Watch runs no base check.
 
 use owlshift_contracts::base::{BaseWait, KeptDone, KeptFailing};
 use owlshift_core::base::{After, Before, Entry, Failing, HeldBranch, Leave, Recorded, Verdict};
 
 use super::*;
-use crate::base;
+use crate::base::{self, WaitAt};
 use crate::gate_once::{self, GateOnce, Place};
 use crate::notify;
 
@@ -103,8 +114,13 @@ impl OnDemand<'_> {
         if state.status() != Status::Active(Stage::Build) || p.repairing {
             return Ok(Resume::Go(None));
         }
-        let wait = self.valid_wait(p, dispatched, state);
-        let failing = wait.as_ref().map(|wait| wait.failing.failing());
+        let wait = self.valid_wait(p, dispatched, state, WaitAt::Build);
+        // A wait the machine's cut left has no failure: no check is owed it
+        // (OWL-480), only the holds standing on the commit.
+        let failing = wait
+            .as_ref()
+            .and_then(|wait| wait.failing.as_ref())
+            .map(KeptFailing::failing);
         match self.settle(p, dispatched, failing.as_ref(), sink)? {
             Settled::Go => {
                 // A done Build's result stays kept until its gate has run
@@ -128,6 +144,7 @@ impl OnDemand<'_> {
                             self.keep_wait(
                                 p,
                                 &rebased,
+                                WaitAt::Build,
                                 state.round(),
                                 (wait.failing, Some(done.clone())),
                                 None,
@@ -454,11 +471,12 @@ impl OnDemand<'_> {
     }
 
     /// After a Build run at Build whose outcome counts as a failed run: when
-    /// it failed on a command its base fails too, or whose check is due and
-    /// cannot run yet, the ticket stays as it is ([`Event::BaseBroken`]),
-    /// what a done Build reported is kept for its gate to run again, and the
-    /// command stops held. `None` for any other failure, which takes today's
-    /// path.
+    /// the machine cut its red gate ([`Self::machine_cut`], OWL-480), or it
+    /// failed on a command its base fails too, or whose check is due and
+    /// cannot run yet, the ticket stays as it is ([`Event::Interrupted`],
+    /// [`Event::BaseBroken`]), what a done Build reported is kept for its
+    /// gate to run again, and the command stops. `None` for any other
+    /// failure, which takes today's path.
     #[allow(clippy::too_many_arguments)]
     pub(super) fn base_broken(
         &self,
@@ -474,6 +492,12 @@ impl OnDemand<'_> {
         if state.status() != Status::Active(Stage::Build) || p.repairing {
             return Ok(None);
         }
+        let done = self.kept_done(p, ran, gathered, comments, integrating);
+        if let Some(cut) =
+            self.machine_cut(p, dispatched, WaitAt::Build, state, ran, done.clone(), sink)?
+        {
+            return Ok(Some(cut));
+        }
         let Some(failing) = base::failing(&ran.report) else {
             return Ok(None);
         };
@@ -487,24 +511,12 @@ impl OnDemand<'_> {
             Ok(Transition::To(next)) => *state = next,
             other => return Err(core_error(other)),
         }
-        let decider = p
-            .questions()
-            .latest()
-            .map(|ask| person(&ask.decider, &p.found));
-        let done = ran.report.gated.as_ref().map(|result| KeptDone {
-            result: (**result).clone(),
-            notes: gathered.decisions.clone(),
-            followups: gathered.followups.clone(),
-            seen: decider
-                .as_ref()
-                .and_then(|decider| answer_check::newest_decider_edit(comments, decider)),
-            integrating,
-        });
         self.keep_wait(
             p,
             dispatched,
+            WaitAt::Build,
             state.round(),
-            (KeptFailing::from(&failing), done),
+            (Some(KeptFailing::from(&failing)), done),
             Some(&ran.run),
             sink,
         );
@@ -514,22 +526,134 @@ impl OnDemand<'_> {
         ))
     }
 
-    /// Keeps the ticket's wait file for a Build configured as `dispatched`
-    /// in `round`, at its branch's head now: the held failure and a done
-    /// Build's result. A branch with no head keeps none; a write that fails
-    /// is a `warning` for `run`.
+    /// What a done Build reported, kept for its gate to run again alone:
+    /// its result, the notes and follow-ups gathered for the delivery, the
+    /// newest decider edit its brief held and whether it was the run given
+    /// late comments. `None` for a run that reported no `done`.
+    pub(super) fn kept_done(
+        &self,
+        p: &Prepared,
+        ran: &Ran,
+        gathered: &Gathered,
+        comments: &[Comment],
+        integrating: bool,
+    ) -> Option<KeptDone> {
+        let result = ran.report.gated.as_ref()?;
+        let decider = p
+            .questions()
+            .latest()
+            .map(|ask| person(&ask.decider, &p.found));
+        Some(KeptDone {
+            result: (**result).clone(),
+            notes: gathered.decisions.clone(),
+            followups: gathered.followups.clone(),
+            seen: decider
+                .as_ref()
+                .and_then(|decider| answer_check::newest_decider_edit(comments, decider)),
+            integrating,
+        })
+    }
+
+    /// A Build's red gate the machine cut (OWL-480; architecture section 5,
+    /// "A broken base", "The machine's"), read before any base check, or a
+    /// fix run's (OWL-486) or a rebase run's (OWL-490) at Watch, read `at`
+    /// that repair: a command that
+    /// failed while the machine slept through the gate, or, the machine
+    /// awake, one the tracker gives no answer about right after
+    /// ([`base::cut`]). The ticket stays as it is ([`Event::Interrupted`]),
+    /// the done run's result is kept in its wait file with no failure, so
+    /// that no check is owed it and its next step runs only its gate
+    /// ([`Self::regate_role`]), and the command stops
+    /// [`Stop::MachineCut`]. `None` when the gate is not the machine's, or
+    /// the result cannot be kept, which takes the base's check and today's
+    /// path: a cut is never a run again for nothing counted.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn machine_cut(
+        &self,
+        p: &Prepared,
+        dispatched: &Dispatched,
+        at: WaitAt<'_>,
+        state: &mut TicketState,
+        ran: &Ran,
+        done: Option<KeptDone>,
+        sink: &mut EventSink<'_>,
+    ) -> Result<Option<Stop>, Stop> {
+        let Some(cut) = base::cut(&ran.report, || {
+            matches!(
+                self.tracker.comments(&p.ticket),
+                Err(error) if error.kind == tracker::ErrorKind::Unreachable
+            )
+        }) else {
+            return Ok(None);
+        };
+        if done.is_none()
+            || !self.keep_wait(
+                p,
+                dispatched,
+                at,
+                state.round(),
+                (None, done),
+                Some(&ran.run),
+                sink,
+            )
+        {
+            return Ok(None);
+        }
+        match state.apply(p.pipeline, Event::Interrupted) {
+            Ok(Transition::To(next)) => *state = next,
+            other => return Err(core_error(other)),
+        }
+        sink.emit(
+            &p.ticket,
+            Some(&ran.run),
+            EventKind::Decision,
+            data([
+                ("gate", json!("waits")),
+                ("reason", json!("machine_cut")),
+                ("command", json!(cut.failing.command)),
+                (
+                    "slept_ms",
+                    json!(u64::try_from(cut.slept.as_millis()).unwrap_or(u64::MAX)),
+                ),
+                (
+                    "tracker",
+                    json!(if cut.unreachable {
+                        "unreachable"
+                    } else {
+                        "unread"
+                    }),
+                ),
+            ]),
+        );
+        Ok(Some(Stop::MachineCut {
+            ticket: p.ticket.clone(),
+            command: cut.failing.command,
+            slept: cut.slept,
+            unreachable: cut.unreachable,
+        }))
+    }
+
+    /// Keeps the ticket's wait file for a run configured as `dispatched` in
+    /// `round`, to be read `at` its stage, at its branch's head now: the held
+    /// failure, none for a gate the machine cut, and a done run's result.
+    /// For a rebase run's, that head is the rebased commit, read before the
+    /// rebase's stop moves the branch back to the pull request's head
+    /// (OWL-490). Whether it was kept: a branch with no head keeps none; a
+    /// write that fails is a `warning` for `run`.
+    #[allow(clippy::too_many_arguments)]
     fn keep_wait(
         &self,
         p: &Prepared,
         dispatched: &Dispatched,
+        at: WaitAt<'_>,
         round: u32,
-        (failing, done): (KeptFailing, Option<KeptDone>),
+        (failing, done): (Option<KeptFailing>, Option<KeptDone>),
         run: Option<&str>,
         sink: &mut EventSink<'_>,
-    ) {
+    ) -> bool {
         let Some(head) = self.branch_head(p) else {
             self.drop_wait(&p.ticket, sink);
-            return;
+            return false;
         };
         let wait = BaseWait {
             format: Format,
@@ -540,22 +664,27 @@ impl OnDemand<'_> {
             head,
             failing,
             done,
+            pushed: at.pushed().map(str::to_owned),
+            rebase: at.rebase(),
         };
-        if let Err(error) = base::write_wait(self.dirs, &p.ticket, &wait) {
-            sink.emit(
-                &p.ticket,
-                run,
-                EventKind::Warning,
-                data([
-                    ("what", json!("base_wait_not_kept")),
-                    ("reason", json!(error.to_string())),
-                ]),
-            );
-        }
+        let Err(error) = base::write_wait(self.dirs, &p.ticket, &wait) else {
+            return true;
+        };
+        sink.emit(
+            &p.ticket,
+            run,
+            EventKind::Warning,
+            data([
+                ("what", json!("base_wait_not_kept")),
+                ("reason", json!(error.to_string())),
+            ]),
+        );
+        false
     }
 
     /// A done Build's gate run again alone, its kept result judged by it
-    /// (OWL-418): as [`Self::run_role_once`], with no budget check, no
+    /// (OWL-418), or a fix run's (OWL-486) or a rebase run's (OWL-490) at
+    /// Watch whose gate the machine cut: as [`Self::run_role_once`], with no budget check, no
     /// session, no usage admission and no cost, since no harness runs. The
     /// wait is spent whatever the gate says, a red gate classified again as
     /// any Build run's, but for a checked stop (OWL-161): the gate stopped
@@ -600,27 +729,53 @@ impl OnDemand<'_> {
         Ok((ran, event))
     }
 
-    /// The ticket's wait file when it is valid for this run: the ticket at
-    /// Build in the wait's round, configured at its commit with its
-    /// commands, its branch's head the one the failure was found on. One
-    /// that is not is removed.
-    fn valid_wait(
+    /// The ticket's wait file when it is valid for this run, read `at` its
+    /// stage ([`base::wait_holds`]): the ticket in the wait's round,
+    /// configured at its commit with its commands, its branch's head the one
+    /// the failure was found on, and a repair's on the pull request's head
+    /// it repairs; a rebase run's only while git still holds the rebased
+    /// commit it kept, which no ref keeps (OWL-490). One that is not is
+    /// removed, a wait of another stage too.
+    pub(super) fn valid_wait(
         &self,
         p: &Prepared,
         dispatched: &Dispatched,
         state: &TicketState,
+        at: WaitAt<'_>,
     ) -> Option<BaseWait> {
         let wait = base::read_wait(self.dirs, &p.ticket);
         let valid = wait.filter(|wait| {
-            wait.round == state.round()
-                && wait.configured_at == dispatched.configured_at.commit
-                && wait.commands == commands_key(dispatched)
-                && self.branch_head(p).as_deref() == Some(wait.head.as_str())
+            base::wait_holds(
+                wait,
+                at,
+                state.round(),
+                (&dispatched.configured_at.commit, &commands_key(dispatched)),
+                self.branch_head(p).as_deref(),
+            ) && (!at.rebase() || self.holds_commit(p, &wait.head))
         });
         if valid.is_none() {
             let _ = base::remove_wait(self.dirs, &p.ticket);
         }
         valid
+    }
+
+    /// Whether the dedicated checkout holds `commit`, a commit git may have
+    /// pruned once no ref reached it.
+    fn holds_commit(&self, p: &Prepared, commit: &str) -> bool {
+        let object = format!("{commit}^{{commit}}");
+        self.executor
+            .git
+            .run(
+                &p.checkout,
+                &[
+                    "rev-parse",
+                    "--verify",
+                    "--quiet",
+                    "--end-of-options",
+                    &object,
+                ],
+            )
+            .is_ok()
     }
 
     /// Removes the ticket's wait file; a removal that fails is a `warning`.

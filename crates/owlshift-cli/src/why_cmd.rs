@@ -42,6 +42,7 @@ fn report(config: &Effective, ticket: Option<&str>) -> Result<String, String> {
         ticket,
         crate::do_cmd::concurrent_runs(&config.personal),
         &owlshift_runner::usage::caps_of(&config.personal),
+        jiff::Timestamp::now(),
     )
     .map_err(|error| format!("cannot read the event log: {error}"))?;
     Ok(why::render(&report))

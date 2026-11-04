@@ -3118,6 +3118,7 @@ mod tests {
             },
             verdicts: Vec::new(),
             result_refusal: None,
+            labels: Default::default(),
         });
         let reversed = questions(KeptDecision {
             reversed: Some(owlshift_contracts::refs::Reversal {

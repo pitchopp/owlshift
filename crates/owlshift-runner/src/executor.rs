@@ -1911,6 +1911,7 @@ mod tests {
             steps: Vec::new(),
             setup: Vec::new(),
             runner_fault: false,
+            slept: Duration::ZERO,
         };
         let link = Violation::WorktreeLink("redirected".to_owned());
         let breached = report(vec![link.clone()], Some(failure.clone()));

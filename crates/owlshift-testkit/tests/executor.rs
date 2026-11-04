@@ -33,6 +33,7 @@ use owlshift_runner::executor::{
 use owlshift_testkit::git::{GitEnv, seed};
 use owlshift_testkit::harness::FakeHarness;
 use owlshift_testkit::reply::Reply;
+use owlshift_testkit::wait;
 
 const BRANCH: &str = "owlshift/T-1";
 
@@ -468,7 +469,10 @@ struct StopsItself {
 impl Harness for StopsItself {
     fn command(&self, _run: &HarnessRun<'_>) -> Result<Command, HarnessError> {
         let mut command = Command::new("sh");
-        command.arg("-c").arg("sleep 30");
+        // Longer than any wait, so that only a stop ends it (OWL-493).
+        command
+            .arg("-c")
+            .arg(format!("sleep {}", wait::OUTLASTS.as_secs()));
         Ok(command)
     }
 
@@ -510,7 +514,7 @@ fn a_run_its_driver_stopped_did_not_time_out() {
             (Outcome::Failed(Failure::TimedOut), false) => {}
             (other, _) => panic!("stops: {stops}: {other:?}"),
         }
-        assert!(report.elapsed < Duration::from_secs(20), "{report:?}");
+        assert!(report.elapsed < wait::REACHED, "{report:?}");
     }
 }
 
@@ -557,7 +561,7 @@ fn helper_escape_the_group() {
 
     if std::env::args().any(|arg| arg == "--exact") {
         let mut sleep = Command::new("sleep")
-            .arg("60")
+            .arg(wait::OUTLASTS.as_secs().to_string())
             .process_group(0)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
@@ -568,7 +572,7 @@ fn helper_escape_the_group() {
         fs::write(&partial, sleep.id().to_string()).unwrap();
         fs::rename(&partial, ESCAPED).unwrap();
         leave_a_job(Path::new("."), Path::new(JOB));
-        std::thread::sleep(Duration::from_secs(30));
+        std::thread::sleep(wait::OUTLASTS);
         // Not reached when the run is stopped at its deadline, as it is.
         let _ = sleep.kill();
         let _ = sleep.wait();
@@ -603,7 +607,10 @@ fn leave_a_job(dir: &Path, file: &Path) -> u32 {
     let status = Command::new("/bin/sh")
         .args([
             "-c",
-            r#"sleep 60 >/dev/null 2>&1 & echo $! > "$0.tmp" && mv "$0.tmp" "$0""#,
+            &format!(
+                r#"sleep {} >/dev/null 2>&1 & echo $! > "$0.tmp" && mv "$0.tmp" "$0""#,
+                wait::OUTLASTS.as_secs()
+            ),
         ])
         .arg(file)
         .current_dir(dir)
@@ -627,14 +634,10 @@ fn read_pid(file: &Path) -> u32 {
         .unwrap()
 }
 
-/// Waits until `pid` is gone, failing past 5 s.
+/// Waits until `pid` is gone.
 #[cfg(unix)]
 fn assert_gone(pid: u32) {
-    let settled = std::time::Instant::now() + Duration::from_secs(5);
-    while test_proc::is_alive(pid) {
-        assert!(std::time::Instant::now() < settled, "still running: {pid}");
-        std::thread::sleep(Duration::from_millis(50));
-    }
+    wait::until(&format!("{pid} to be gone"), || !test_proc::is_alive(pid));
 }
 
 /// A process the test expects to outlive the run, killed on the way out.
@@ -2000,7 +2003,6 @@ mod setup {
 mod among {
     use std::sync::Barrier;
     use std::thread;
-    use std::time::Instant;
 
     use owlshift_adapters::forge::Repo;
     use owlshift_runner::on_demand::branch_for;
@@ -2182,11 +2184,9 @@ mod among {
         /// Waits for `ticket`'s lock to read free: a child spawned while it
         /// was held can keep it a moment after its release (OWL-414).
         fn until_free(&self, ticket: &TicketId) {
-            let started = Instant::now();
-            while self.dirs.ticket_lock_held(ticket).unwrap() {
-                assert!(started.elapsed() < Duration::from_secs(5), "still held");
-                thread::sleep(Duration::from_millis(10));
-            }
+            wait::until("the ticket's lock to read free", || {
+                !self.dirs.ticket_lock_held(ticket).unwrap()
+            });
         }
 
         fn commit_in(&self, worktree: &Path, message: &str) {

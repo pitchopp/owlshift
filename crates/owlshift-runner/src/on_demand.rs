@@ -96,7 +96,7 @@ use owlshift_contracts::refs::{
     TicketDelivery, TicketHeld, TicketQuestions, TicketSession, cut_reason, cut_to,
 };
 use owlshift_contracts::result::{
-    self, AnswerClass, Decision, DecisionsRefusal, Followup, Question, RunResult,
+    self, AnswerClass, Decision, DecisionsRefusal, Followup, Question, Resolution, RunResult,
     Verdict as AnswerVerdict,
 };
 use owlshift_contracts::review::{KeptBuild, KeptFinding, TicketPlan, TicketReview};
@@ -594,6 +594,9 @@ pub struct Delivered {
     /// The project's `[forge] merge` at the base the command fetched, which
     /// says who merges (D14, OWL-445).
     pub merge: MergeSwitch,
+    /// Why merge on green will not merge it, when a question of the ticket
+    /// keeps it for a person (OWL-464): `None` under `never`.
+    pub merge_held: Option<String>,
 }
 
 impl fmt::Display for Delivered {
@@ -607,7 +610,7 @@ impl fmt::Display for Delivered {
             Some(Verdict::NotOpen) => "the pull request is not open",
             None => "could not be read",
         };
-        let merges = crate::writer::merges_on_green(self.merge, "it")
+        let merges = crate::writer::merges_on_green(self.merge, self.merge_held.as_deref(), "it")
             .unwrap_or_else(|| "Owlshift never merges: review and merge it.".to_owned());
         write!(
             f,
@@ -783,6 +786,19 @@ pub enum Stop {
         command: Option<String>,
         pending: bool,
         due: bool,
+    },
+    /// A done Build's gate (OWL-480), or a done fix run's (OWL-486) or
+    /// rebase run's (OWL-490) at Watch, failed on `command` while the
+    /// machine slept `slept`, past
+    /// the bound, or, `unreachable`, the tracker gave no answer right after
+    /// it: the failure is the machine's, so nothing was counted, and the
+    /// run's result is kept for its gate alone to run again at the next
+    /// step. Nobody is the blocker.
+    MachineCut {
+        ticket: TicketId,
+        command: String,
+        slept: Duration,
+        unreachable: bool,
     },
     /// The run was done and its gate passed, but its delivery failed.
     Delivery(String),
@@ -1046,6 +1062,25 @@ impl fmt::Display for Stop {
                     crate::base::short(commit)
                 )
             }
+            Self::MachineCut {
+                ticket,
+                command,
+                slept,
+                unreachable,
+            } => {
+                let why = if *unreachable {
+                    "the tracker gave no answer right after it, the network out".to_owned()
+                } else {
+                    format!("the machine slept {} s while it ran", slept.as_secs())
+                };
+                write!(
+                    f,
+                    "Cut by the machine: {ticket}'s gate failed on `{command}`, and {why}, so \
+                     nothing was counted. The run's result is kept and only its gate runs \
+                     again, at the next step: `owlshift watch` runs it once the tracker answers, \
+                     or run `owlshift continue {ticket}`."
+                )
+            }
             Self::Delivery(reason) => write!(
                 f,
                 "The run is done and its gate passed, but the delivery failed: {reason}. The \
@@ -1236,6 +1271,9 @@ struct Round {
     /// The refused choices its questions reopen, under the round's ids
     /// (OWL-203).
     reopened: Vec<ReopenedChoice>,
+    /// The resolver's label for each question of the round it decided,
+    /// under the round's ids (OWL-482), kept on the round's ask.
+    labels: BTreeMap<QuestionId, String>,
 }
 
 impl Round {
@@ -1255,7 +1293,15 @@ impl Round {
             decided: decided.len(),
             fallback,
             reopened,
+            labels: BTreeMap::new(),
         }
+    }
+
+    /// The round with the resolver's label for each of its questions that
+    /// one of `resolutions` decided ([`resolver::round_labels`]).
+    fn labelled(self, resolutions: &[Resolution]) -> Self {
+        let labels = resolver::round_labels(&self.questions, resolutions);
+        Round { labels, ..self }
     }
 }
 
@@ -3856,6 +3902,7 @@ impl OnDemand<'_> {
             decider,
             verdicts: Vec::new(),
             result_refusal: None,
+            labels: left.labels,
         });
         // At Watch, `do` is refused: `continue` reads the pull request
         // again, and a repair still due asks again (OWL-211).
@@ -4129,7 +4176,7 @@ impl OnDemand<'_> {
         event.insert("unposted".to_owned(), question_ids(&unposted));
         add_spend(&mut event, p, self.budget());
         sink.emit(&ticket, Some(&ran.run), EventKind::Gate, event);
-        let left = Round::of(&raised, &decided_ids, asked.reopened, None);
+        let left = Round::of(&raised, &decided_ids, asked.reopened, None).labelled(resolutions);
         if left.questions.is_empty() {
             p.chain.settled_once();
             return Ok(Routing::Settled(decided));
@@ -4412,6 +4459,7 @@ impl OnDemand<'_> {
                     decider: asked,
                     verdicts: Vec::new(),
                     result_refusal: None,
+                    labels: BTreeMap::new(),
                 });
                 self.store(p, &next, questions).map_err(|e| Stop::NotKept {
                     landed: Landed::Reask,
@@ -5957,6 +6005,7 @@ impl OnDemand<'_> {
                 | Stop::UsageLimit { .. }
                 | Stop::Stopped
                 | Stop::BaseHeld { .. }
+                | Stop::MachineCut { .. }
                 | Stop::Delivery(_)
                 | Stop::Watched { .. }
                 | Stop::Ready { .. }
@@ -6317,12 +6366,14 @@ impl OnDemand<'_> {
         let mut following = Following::default();
         let comment =
             self.post_and_settle(p, &watching, kept, checks, &done, &mut following, sink)?;
+        let (merge, merge_held) = crate::merge::who_merges(self, &p.base, &p.questions());
         Ok(Delivered {
             pull_request,
             opened: opened.opened,
             verdict,
             comment: comment.id,
-            merge: crate::merge::switch_at(self, &p.base),
+            merge,
+            merge_held,
         })
     }
 
@@ -6546,6 +6597,25 @@ struct RepairRun<'r> {
     /// Whether a `done`'s gated commit is one to push, or why not: a failed
     /// run then.
     accept: &'r dyn Fn(&CommitId) -> Result<(), String>,
+    /// A fix run's (OWL-486) or a rebase run's (OWL-490): where a red gate
+    /// the machine cut keeps its result, and the result such a cut kept,
+    /// whose gate the first attempt runs alone. `None` for the other
+    /// repairs, whose cut gate is counted.
+    cut: Option<RepairCut<'r>>,
+}
+
+/// A fix run's or a rebase run's machine cut at Watch (OWL-486, OWL-490;
+/// architecture section 5, "A broken base", "The machine's").
+#[derive(Clone, Copy)]
+struct RepairCut<'r> {
+    /// The repair's dispatch, whose configuring commit and commands the
+    /// wait keeps.
+    dispatched: &'r Dispatched,
+    /// Where the wait is kept and read: the repair, and the pull request's
+    /// head it is made on, Owlshift's last push.
+    at: crate::base::WaitAt<'r>,
+    /// The result a cut kept, valid on that head.
+    kept: Option<&'r owlshift_contracts::base::KeptDone>,
 }
 
 /// A repair's runs ended on a commit to push.
@@ -6863,6 +6933,14 @@ impl OnDemand<'_> {
             })
         })?;
         let dispatched = self.dispatch(p, Command::Fix, sink)?;
+        // A fix whose red gate the machine cut on this head runs that gate
+        // alone, its result kept (OWL-486); a wait of any other is dropped.
+        let at = crate::base::WaitAt::Fix {
+            pushed: pushed.as_str(),
+        };
+        let kept = self
+            .valid_wait(p, &dispatched, &state, at)
+            .and_then(|wait| wait.done);
         let harness = self.build.harness(dispatched.build);
         let build = |_: u32| &*harness;
         let decorate = |brief: &mut Brief, questions: &TicketQuestions| {
@@ -6891,6 +6969,11 @@ impl OnDemand<'_> {
                 before: &|_, _, _| Ok(()),
                 decorate: &decorate,
                 accept: &accept,
+                cut: Some(RepairCut {
+                    dispatched: &dispatched,
+                    at,
+                    kept: kept.as_ref(),
+                }),
             },
             sink,
         )?;
@@ -6980,7 +7063,11 @@ impl OnDemand<'_> {
     /// as for a Build run, a `done` whose commit `run.accept` refuses is a
     /// failed run; questions go through the resolver (OWL-342), the run
     /// again when it decides them all, an attempt not counted, else to the
-    /// decider as a round that returns to Watch (OWL-211).
+    /// decider as a round that returns to Watch (OWL-211). A fix run's or a
+    /// rebase run's red gate the machine cut stops the runs, nothing
+    /// counted, its result kept (`run.cut`, OWL-486, OWL-490); given such a
+    /// result, the first attempt runs its gate alone
+    /// ([`Self::regate_role`]).
     fn repair_runs(
         &self,
         p: &mut Prepared,
@@ -6990,6 +7077,13 @@ impl OnDemand<'_> {
     ) -> Result<(RepairDone, Vec<Followup>), Stop> {
         let current = person(p.current()?, &p.found);
         let mut gathered = Gathered::default();
+        // A repair's result a machine cut kept: its gate alone first, with
+        // what it gathered (OWL-486, OWL-490).
+        let mut regate = run.cut.and_then(|cut| cut.kept);
+        if let Some(done) = regate {
+            gather(&mut gathered.decisions, &done.notes);
+            gather(&mut gathered.followups, &done.followups);
+        }
         let mut attempt = 0u32;
         let mut shown = false;
         loop {
@@ -7014,15 +7108,43 @@ impl OnDemand<'_> {
             );
             (run.decorate)(&mut brief, &p.questions());
             let harness = (run.harness)(attempt);
-            let (ran, mut event) = self.run_role_once(
-                p,
-                (harness, run.rules.setup()),
-                &state,
-                &brief,
-                attempt,
-                &mut gathered,
-                sink,
-            )?;
+            let (ran, mut event) = match regate.take() {
+                Some(done) => self.regate_role(
+                    p,
+                    (harness, run.rules.setup()),
+                    &brief,
+                    attempt,
+                    &done.result,
+                    &mut gathered,
+                    sink,
+                )?,
+                None => self.run_role_once(
+                    p,
+                    (harness, run.rules.setup()),
+                    &state,
+                    &brief,
+                    attempt,
+                    &mut gathered,
+                    sink,
+                )?,
+            };
+            // A fix run's or a rebase run's red gate the machine cut counts
+            // nothing: its result is kept for its gate alone at the next
+            // step (OWL-486, OWL-490).
+            if event == Event::RunFailed
+                && let Some(cut) = run.cut
+                && let Some(stop) = self.machine_cut(
+                    p,
+                    cut.dispatched,
+                    cut.at,
+                    &mut state,
+                    &ran,
+                    self.kept_done(p, &ran, &gathered, &comments, false),
+                    sink,
+                )?
+            {
+                return Err(stop);
+            }
             let mut detail = None;
             let gated = ran
                 .report
@@ -7142,12 +7264,15 @@ impl OnDemand<'_> {
     /// onto: a trivial one's first run is on the fast tier, any other run
     /// on the Build routing, and a failed run gets one more before the
     /// ticket parks. Each attempt starts from a fresh worktree at `pushed`
-    /// ([`Self::reset_worktree`]). A `done` is pushed only when its gated
-    /// commit is a rebase of the delivery onto the base that keeps its
-    /// change ([`rebase_keeps_delivery`]); the runner pushes it, leased on
-    /// `pushed`, never the agent. A non-trivial conflict on a path one of
-    /// the ticket's overlaps names gets a Verify pass on the rebased head
-    /// before the push (OWL-449, [`Self::review_resolution`]).
+    /// ([`Self::reset_worktree`]), but for a gate the machine cut: the
+    /// rebased commit is kept, nothing counted, the branch back at `pushed`,
+    /// and the next rebase onto the same base's first attempt starts from
+    /// that commit and runs its gate alone (OWL-490). A `done` is pushed
+    /// only when its gated commit is a rebase of the delivery onto the base
+    /// that keeps its change ([`rebase_keeps_delivery`]); the runner pushes
+    /// it, leased on `pushed`, never the agent. A non-trivial conflict on a
+    /// path one of the ticket's overlaps names gets a Verify pass on the
+    /// rebased head before the push (OWL-449, [`Self::review_resolution`]).
     #[allow(clippy::too_many_arguments)]
     fn repair_rebase(
         &self,
@@ -7258,12 +7383,26 @@ impl OnDemand<'_> {
                 &*build_run
             }
         };
+        // A rebase onto this base whose red gate the machine cut on this
+        // head left its rebased commit (OWL-490): the first attempt starts
+        // from it and runs its gate alone; a wait of any other is dropped.
+        let at = crate::base::WaitAt::Rebase { pushed };
+        let (kept, restore) = match self.valid_wait(p, &dispatched, &state, at) {
+            Some(wait) => match (wait.done, CommitId::new(wait.head.as_str())) {
+                (Some(done), Ok(rebased)) => (Some(done), Some(rebased)),
+                _ => (None, None),
+            },
+            None => (None, None),
+        };
+        // Taken by the first attempt alone, whatever its number.
+        let restore = std::cell::Cell::new(restore);
         // Whether the last attempt's reset was made: a reset that failed is
         // not made again once the runs stop (OWL-457).
         let reset = std::cell::Cell::new(false);
         let before = |p: &Prepared, attempt: u32, sink: &mut EventSink<'_>| {
             reset.set(false);
-            self.reset_worktree(p, &pushed_id)?;
+            let rebased = restore.take();
+            self.reset_worktree(p, rebased.as_ref().unwrap_or(&pushed_id))?;
             reset.set(true);
             sink.emit(
                 &p.ticket,
@@ -7273,6 +7412,7 @@ impl OnDemand<'_> {
                     ("watch", json!("rebase_run")),
                     ("pull_request", json!(pr.number)),
                     ("attempt", json!(attempt)),
+                    ("gate_only", json!(rebased.is_some())),
                     ("tier", json!(rebase_tier(fast(attempt)))),
                     ("trivial", json!(classified.trivial)),
                     ("refresh", json!(refresh)),
@@ -7312,6 +7452,13 @@ impl OnDemand<'_> {
                 before: &before,
                 decorate: &decorate,
                 accept: &accept,
+                // The cut's wait keeps the rebased commit as its head, read
+                // before the stop below moves the branch back to `pushed`.
+                cut: Some(RepairCut {
+                    dispatched: &dispatched,
+                    at,
+                    kept: kept.as_ref(),
+                }),
             },
             sink,
         );
@@ -7756,12 +7903,14 @@ impl OnDemand<'_> {
         let verdict = checks_read.as_ref().ok().map(CheckSet::verdict);
         let done = format!("the {what} {commit} was pushed and kept");
         let comment = self.post_and_settle(p, &state, kept, checks_read, &done, following, sink)?;
+        let (merge, merge_held) = crate::merge::who_merges(self, &p.base, &p.questions());
         Ok(Delivered {
             pull_request,
             opened: false,
             verdict,
             comment: comment.id,
-            merge: crate::merge::switch_at(self, &p.base),
+            merge,
+            merge_held,
         })
     }
 
@@ -7927,6 +8076,7 @@ impl OnDemand<'_> {
         if let Some(kept) = &owed.report {
             gather(&mut decisions, &kept.notes);
         }
+        let merge = crate::merge::switch_at_push(self, delivery);
         let report = DeliveryReport {
             ticket: ticket.clone(),
             summary,
@@ -7967,8 +8117,10 @@ impl OnDemand<'_> {
                 pushed: !owed.unchanged,
             }),
             // Who merges, as the project file reads at the base of the push
-            // (OWL-445).
-            merge: crate::merge::switch_at_push(self, delivery),
+            // (OWL-445), and the question that keeps it for a person
+            // (OWL-464).
+            merge,
+            merge_held: crate::merge::held_at_delivery(self, merge, questions),
         };
         match Writer::new(self.tracker).post_repair_report(&report) {
             Ok(Reported { comment, new }) => {
@@ -9016,6 +9168,7 @@ fn late_round(late: &[Comment]) -> Round {
         decided: 0,
         fallback: None,
         reopened: Vec::new(),
+        labels: BTreeMap::new(),
     }
 }
 
@@ -9465,6 +9618,7 @@ mod tests {
             },
             verdicts: Vec::new(),
             result_refusal: None,
+            labels: Default::default(),
         };
         let decision = |minute: u32, id: &str, decided: &str| KeptDecision {
             at: at(minute),
@@ -9602,6 +9756,7 @@ mod tests {
             },
             verdicts: kept,
             result_refusal: None,
+            labels: Default::default(),
         };
         let asks = [
             ask(
@@ -9818,6 +9973,7 @@ mod tests {
             },
             verdicts: Vec::new(),
             result_refusal: None,
+            labels: Default::default(),
         };
         // Round 1 went to the zone owner `bob`, round 2 to `tia`; the
         // ticket was since assigned to `ann`.
@@ -10504,7 +10660,7 @@ mod tests {
                     \"Which file\" (recorded: \"config.toml\"); \"Every key\" (recorded: \"yes\")";
         let format_8 = serde_json::json!({ "format": 8, "build_refusal": { "lists": [held] } });
         let questions = TicketQuestions::parse(&format_8.to_string()).unwrap();
-        assert!(questions.render().starts_with("{\n  \"format\": 17,"));
+        assert!(questions.render().starts_with("{\n  \"format\": 18,"));
         let kept = questions.build_refusal.clone().unwrap();
         assert_eq!(
             (&kept.lists[..], kept.choices.len()),

@@ -669,6 +669,9 @@ struct Clocked<'a> {
     refuse_mention: bool,
     /// How many of the next comment reads fail, as a tracker that is down.
     fail_reads: &'a Cell<u32>,
+    /// Every comment read gets no answer at all while it is set, as with the
+    /// network out (OWL-480).
+    offline: &'a Cell<bool>,
     /// What happens once, right after the next stage read.
     after_stage_read: &'a RefCell<Option<Box<dyn FnOnce()>>>,
     /// How many stage reads were made (OWL-340).
@@ -860,6 +863,12 @@ impl Tracker for Clocked<'_> {
     }
 
     fn comments(&self, id: &TicketId) -> Result<Vec<Comment>, tracker::Error> {
+        if self.offline.get() {
+            return Err(tracker::Error::new(
+                tracker::ErrorKind::Unreachable,
+                "Linear: io: failed to lookup address information",
+            ));
+        }
         if self.fail_reads.get() > 0 {
             self.fail_reads.set(self.fail_reads.get() - 1);
             return Err(tracker::Error::new(
@@ -1019,6 +1028,9 @@ struct Bench {
     refuse_mention: Cell<bool>,
     /// How many of the next comment reads the tracker refuses.
     fail_reads: Cell<u32>,
+    /// The tracker gives no answer to a comment read while it is set
+    /// (OWL-480): shared, so a run can cut the network.
+    offline: Rc<Cell<bool>>,
     /// What happens once, right after the tracker's next stage read.
     after_stage_read: RefCell<Option<Box<dyn FnOnce()>>>,
     /// How many stage reads the tracker answered (OWL-340).
@@ -1061,6 +1073,66 @@ struct Bench {
     /// The personal file's `web_tools` as the runner reads it (OWL-415): on
     /// by default.
     web_tools: Cell<bool>,
+    /// The runner's git commands a test probes, once it turns it on
+    /// (OWL-489, [`LockProbe`]): an `Arc<Mutex<…>>`, not a `Cell`, as the
+    /// runner's git setup must be `Send + Sync`.
+    lock_probe: Arc<Mutex<Option<LockProbe>>>,
+}
+
+/// What the runner's git found of the project's lock at each command
+/// `probed` picks by its arguments (OWL-489, OWL-492): before it runs, the
+/// project's lock taken with a short wait, then let go before git starts,
+/// so no child shares it.
+struct LockProbe {
+    /// Which commands are probed, by their arguments.
+    probed: fn(&[String]) -> bool,
+    /// Each probed command: its arguments, and whether the lock was free.
+    reads: Vec<(Vec<String>, bool)>,
+}
+
+impl LockProbe {
+    /// A probe of the commands `probed` picks.
+    fn of(probed: fn(&[String]) -> bool) -> Self {
+        Self {
+            probed,
+            reads: Vec::new(),
+        }
+    }
+}
+
+/// Whether `args` read the contents of ticket refs: `ls-tree` or `cat-file
+/// --batch`.
+fn reads_contents(args: &[String]) -> bool {
+    args.iter().any(|arg| arg == "ls-tree")
+        || (args.iter().any(|arg| arg == "cat-file") && args.iter().any(|arg| arg == "--batch"))
+}
+
+/// Whether `args` read objects: any `cat-file` or `ls-tree`, which every
+/// read of a ticket ref's record runs, by ref or in a batch.
+fn reads_objects(args: &[String]) -> bool {
+    args.iter()
+        .any(|arg| ["cat-file", "ls-tree"].contains(&arg.as_str()))
+}
+
+/// Takes the project's lock in `dirs` for a moment before `command` runs,
+/// when `probe` is on and picks the command, and records whether it was
+/// free. The wait outlasts a lock just released whose descriptor a child
+/// keeps a moment (architecture section 5, "A lock just released"); the
+/// lock is let go before the spawn.
+fn probe_lock(probe: &Mutex<Option<LockProbe>>, dirs: &ProjectDirs, command: &Command) {
+    let mut probe = probe.lock().unwrap_or_else(PoisonError::into_inner);
+    let Some(probe) = probe.as_mut() else {
+        return;
+    };
+    let args: Vec<String> = command
+        .get_args()
+        .map(|arg| arg.to_string_lossy().into_owned())
+        .collect();
+    if !(probe.probed)(&args) {
+        return;
+    }
+    let free = dirs.lock().unwrap().is_some();
+    probe.reads.push((args, free));
 }
 
 /// A notifier that records each line instead of showing it.
@@ -1200,6 +1272,7 @@ impl Bench {
             refuse_stage: Cell::new(false),
             refuse_mention: Cell::new(false),
             fail_reads: Cell::new(0),
+            offline: Rc::default(),
             after_stage_read: RefCell::new(None),
             stage_reads: Cell::new(0),
             waited: Cell::new(SignedDuration::from_mins(10)),
@@ -1216,6 +1289,7 @@ impl Bench {
             usage: RefCell::new(tmp_data.join("usage")),
             usage_cap: Cell::new(None),
             web_tools: Cell::new(true),
+            lock_probe: Arc::default(),
         }
     }
 
@@ -1665,8 +1739,15 @@ impl Bench {
         // The executor's credential probes run the real gh on `github.com`.
         gh::warm_up(&self.env.agent_parent());
         let env = self.env.clone();
+        let (probe, probed) = (
+            self.lock_probe.clone(),
+            self.dirs().with_lock_wait(Duration::from_millis(250)),
+        );
         let executor = on_demand::executor(
-            Git::with_setup("git", move |command| env.apply(command)),
+            Git::with_setup("git", move |command| {
+                env.apply(command);
+                probe_lock(&probe, &probed, command);
+            }),
             // Bare, as the scenarios' isolation tests run: what `do` does
             // around the executor is under test here, and a breaking agent
             // must reach the checkout and its own `.git`, which the sandbox
@@ -1687,6 +1768,7 @@ impl Bench {
             refuse_stage: &self.refuse_stage,
             refuse_mention: self.refuse_mention.get(),
             fail_reads: &self.fail_reads,
+            offline: &self.offline,
             after_stage_read: &self.after_stage_read,
             stage_reads: &self.stage_reads,
             inbox: &self.inbox,
@@ -6090,6 +6172,14 @@ fn a_decision_the_resolver_labels_always_human_goes_to_the_decider() {
         .map(|d| d.question.id.as_str())
         .collect();
     assert_eq!(kept, ["Q1"]);
+    // The resolver's label of the refused decision is kept on the round's
+    // ask, under its id in the round, for merge on green (OWL-482).
+    let labels: Vec<(&str, &str)> = record.questions.asks[0]
+        .labels
+        .iter()
+        .map(|(id, label)| (id.as_str(), label.as_str()))
+        .collect();
+    assert_eq!(labels, [("Q1", "data_loss")]);
     let events = bench.events();
     let resolved = data_of(&events, EventKind::Gate, "resolver");
     assert_eq!(resolved[0]["decided"], json!(["Q1"]));
@@ -10922,6 +11012,112 @@ fn an_unknown_blocker_holds_the_drained_ticket() {
         .collect();
     assert_eq!(waits, [json!(["OWL-1", "UTF-8"])], "{lines}");
     assert!(lines.contains("which the tracker does not know"), "{lines}");
+}
+
+/// OWL-489: watch's snapshot holds the project's lock for the marker and one
+/// listing of the ticket refs alone, and reads the refs' contents, by their
+/// commits, once the lock is let go: a command typed meanwhile takes the
+/// lock at every one of those reads. The planted refs, fresh records at
+/// Ready that the tracker does not list, are read by the snapshot alone, in
+/// one batch since OWL-492, which names no commit: nothing in a plain
+/// watch's pass reads a ref's contents under a lock, DEMO-1 waiting for an
+/// answer not given.
+#[test]
+fn the_snapshot_reads_the_ticket_refs_without_the_project_lock() {
+    let bench = Bench::new(true);
+    let (asked, printed) = bench.run(vec![bench.reply(None, Some(ROUND_1))], None);
+    assert!(
+        matches!(&asked, Err(Stop::NeedsInput { .. })),
+        "{asked:?}\n{printed}"
+    );
+    let env = bench.env.clone();
+    let git = Git::with_setup("git", move |command| env.apply(command));
+    let dirs = bench.dirs();
+    let planted: Vec<String> = (2..=9)
+        .map(|n| {
+            let ticket = TicketId::new(format!("DEMO-{n}")).unwrap();
+            write_through_run_file(&git, &dirs, &ticket, &ticket_ref::blank(None), None)
+        })
+        .collect();
+    assert_eq!(planted.len(), 8);
+    *bench.lock_probe.lock().unwrap() = Some(LockProbe::of(reads_contents));
+    let (outcomes, lines, printed) = bench.watch(Vec::new(), &mut |_| false);
+    assert!(outcomes.is_empty(), "{outcomes:?}\n{lines}\n{printed}");
+    let reads = bench.lock_probe.lock().unwrap().take().unwrap().reads;
+    assert!(
+        reads
+            .iter()
+            .any(|(args, _)| args.iter().any(|a| a == "--batch")),
+        "no contents read: {reads:?}"
+    );
+    assert!(
+        reads.iter().all(|(_, free)| *free),
+        "the project's lock was held at a read of contents: {reads:?}"
+    );
+}
+
+/// OWL-492: a command holding the project's lock reads every other ticket
+/// ref in a fixed number of git commands, whatever their number. DEMO-1's
+/// ref, once asked, is set back at Ready and DEMO-1 dispatched again, its
+/// admission reading the other refs in the project's section: with 2 and
+/// with 8 other refs planted, fresh records at Ready, the git commands that
+/// read objects under the lock are as many, the listing's type check among
+/// them. A read by ref, by name or by commit, runs at least one such command
+/// per ref.
+#[test]
+fn the_sections_read_the_ticket_refs_in_a_fixed_number_of_git_commands() {
+    let bench = Bench::new(true);
+    let (asked, printed) = bench.run(vec![bench.reply(None, Some(ROUND_1))], None);
+    assert!(
+        matches!(&asked, Err(Stop::NeedsInput { .. })),
+        "{asked:?}\n{printed}"
+    );
+    let env = bench.env.clone();
+    let git = Git::with_setup("git", move |command| env.apply(command));
+    let dirs = bench.dirs();
+    let mut planted = 1;
+    let mut held = |others: usize| {
+        for n in planted + 1..=others + 1 {
+            let ticket = TicketId::new(format!("DEMO-{n}")).unwrap();
+            write_through_run_file(&git, &dirs, &ticket, &ticket_ref::blank(None), None);
+        }
+        planted = others + 1;
+        bench.write_record(&ticket_ref::blank(None));
+        *bench.lock_probe.lock().unwrap() = Some(LockProbe::of(reads_objects));
+        let (asked, printed) = bench.run(vec![bench.reply(None, Some(ROUND_1))], None);
+        assert!(
+            matches!(&asked, Err(Stop::NeedsInput { .. })),
+            "{asked:?}\n{printed}"
+        );
+        let reads = bench.lock_probe.lock().unwrap().take().unwrap().reads;
+        // Each command as git runs it, the runner's `-c` settings and the
+        // objects' ids left out.
+        reads
+            .into_iter()
+            .filter(|(_, free)| !free)
+            .map(|(args, _)| {
+                let mut words = args.iter().map(String::as_str);
+                let mut shape = Vec::new();
+                while let Some(word) = words.next() {
+                    if word == "-c" {
+                        words.next();
+                    } else if word.len() == 40 && word.bytes().all(|b| b.is_ascii_hexdigit()) {
+                        shape.push("<id>");
+                    } else {
+                        shape.push(word);
+                    }
+                }
+                shape.join(" ")
+            })
+            .collect::<Vec<_>>()
+    };
+    let (few, many) = (held(2), held(8));
+    let types = "cat-file --batch-check=%(objectname) %(objecttype)";
+    assert!(
+        few.iter().any(|command| command == types),
+        "no listing under the lock: {few:?}"
+    );
+    assert_eq!(few, many);
 }
 
 /// The `tickets` of the last `waits` event.

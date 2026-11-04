@@ -69,14 +69,20 @@ impl Repo {
     /// The tree is built in the index, so a symbolic link entry needs no
     /// link on disk.
     fn plant(&self, entries: &[(&str, &str, &str)]) {
+        self.plant_at(REF, entries);
+    }
+
+    /// [`Self::plant`] at the ref `name`; an entry may name an object the
+    /// repository does not hold.
+    fn plant_at(&self, name: &str, entries: &[(&str, &str, &str)]) {
         self.git(&["read-tree", "--empty"]);
         for (mode, oid, name) in entries {
             let info = format!("{mode},{oid},{name}");
-            self.git(&["update-index", "--add", "--cacheinfo", &info]);
+            self.git(&["update-index", "--add", "--info-only", "--cacheinfo", &info]);
         }
-        let tree = self.git(&["write-tree"]);
+        let tree = self.git(&["write-tree", "--missing-ok"]);
         let commit = self.git(&["commit-tree", "--no-gpg-sign", &tree, "-m", "planted"]);
-        self.git(&["update-ref", REF, &commit]);
+        self.git(&["update-ref", name, &commit]);
     }
 
     fn read(&self) -> Result<Option<ticket_ref::Stored>, String> {
@@ -1013,4 +1019,258 @@ fn every_ticket_ref_comes_with_its_state_or_why_it_cannot_be_read() {
             .any(|(id, state)| *id == ticket() && matches!(state, RefState::Unread(_))),
         "{states:?}"
     );
+}
+
+/// OWL-489: a listing is a cut of every ticket ref: each read by the commit
+/// it listed reads as it was then, once the ref moved or went. It names the
+/// refs `for-each-ref --format=%(refname)` names, as `list` did before it
+/// read what they point to too: a ref to a missing object, a symbolic ref
+/// and one whose target is gone are listed or left out alike.
+#[test]
+fn a_listed_ticket_ref_reads_as_listed_once_it_moved_or_went() {
+    let repo = Repo::new();
+    let waiting = record(WAITING, 1);
+    let demo_9 = TicketId::new("DEMO-9").unwrap();
+    let first = ticket_ref::write(&repo.git, &repo.root, &ticket(), &waiting, None).unwrap();
+    ticket_ref::write(&repo.git, &repo.root, &demo_9, &waiting, None).unwrap();
+    let listing = ticket_ref::listing(&repo.git, &repo.root).unwrap();
+    let ids: Vec<&str> = listing.iter().map(|(t, _)| t.as_str()).collect();
+    assert_eq!(ids, ["DEMO-1", "DEMO-9"]);
+
+    // DEMO-1 moves, DEMO-9 goes, after the listing.
+    let verify = r#"{"format":2,"stage":"verify","round":1,"reasks":0,"failed_runs":0}"#;
+    ticket_ref::write(
+        &repo.git,
+        &repo.root,
+        &ticket(),
+        &record(verify, 1),
+        Some(&first),
+    )
+    .unwrap();
+    repo.git(&["update-ref", "-d", "refs/owlshift/tickets/DEMO-9"]);
+    let read = ticket_ref::read_listed_refs(&repo.git, &repo.root, listing.clone());
+    for (ticket, stored) in &read {
+        assert_eq!(stored.as_ref().unwrap().record, waiting, "{ticket}");
+    }
+    assert_eq!(read[0].1.as_ref().unwrap().commit, first);
+
+    let tickets = repo.root.join(".git/refs/owlshift/tickets");
+    fs::write(tickets.join("GONE-1"), format!("{}\n", "1".repeat(40))).unwrap();
+    repo.git(&["symbolic-ref", "refs/owlshift/tickets/ALIAS-1", REF]);
+    repo.git(&[
+        "symbolic-ref",
+        "refs/owlshift/tickets/DANGLING-1",
+        "refs/owlshift/tickets/NONE-1",
+    ]);
+    let names = repo.git(&[
+        "for-each-ref",
+        "--format=%(refname)",
+        "refs/owlshift/tickets/",
+    ]);
+    let listed: Vec<String> = ticket_ref::list(&repo.git, &repo.root)
+        .unwrap()
+        .iter()
+        .map(|ticket| format!("refs/owlshift/tickets/{ticket}"))
+        .collect();
+    assert_eq!(listed, names.lines().collect::<Vec<_>>());
+    let listing = ticket_ref::listing(&repo.git, &repo.root).unwrap();
+    let of = |id: &str| {
+        let ticket = TicketId::new(id).unwrap();
+        let (_, listed) = listing
+            .iter()
+            .find(|(listed, _)| *listed == ticket)
+            .unwrap_or_else(|| panic!("{id} is not listed: {listing:?}"));
+        let read =
+            ticket_ref::read_listed_refs(&repo.git, &repo.root, vec![(ticket, listed.clone())]);
+        read.into_iter().next().unwrap().1
+    };
+    // A symbolic ref is refused once read, as `read` refuses it; a ref to a
+    // missing object is refused alone, the others read.
+    let alias = TicketId::new("ALIAS-1").unwrap();
+    assert_eq!(
+        of("ALIAS-1").unwrap_err(),
+        ticket_ref::read(&repo.git, &repo.root, &alias).unwrap_err()
+    );
+    let missing = of("GONE-1").unwrap_err();
+    assert!(missing.contains("does not hold"), "{missing}");
+    assert!(of("DEMO-1").is_ok());
+}
+
+/// A git that counts the commands it runs in `calls`.
+fn counted(repo: &Repo, calls: &Arc<AtomicUsize>) -> Git {
+    let (env, calls) = (repo.env.clone(), Arc::clone(calls));
+    Git::with_setup("git", move |command| {
+        calls.fetch_add(1, Ordering::SeqCst);
+        env.apply(command);
+    })
+}
+
+/// OWL-492: every ticket ref is read in a fixed number of git commands,
+/// whatever their number: one listing, a check of the objects' types, the
+/// trees, the files' sizes and their contents; the listing alone when there
+/// is none. `others` leaves its own ref out before reading.
+#[test]
+fn every_ticket_ref_is_read_in_a_fixed_number_of_git_commands() {
+    let repo = Repo::new();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let git = counted(&repo, &calls);
+    let run = |read: &dyn Fn(&Git) -> Vec<ticket_ref::RefRead>| {
+        calls.store(0, Ordering::SeqCst);
+        let read = read(&git);
+        assert!(read.iter().all(|(_, stored)| stored.is_ok()), "{read:?}");
+        (calls.load(Ordering::SeqCst), read.len())
+    };
+    let all = |git: &Git| ticket_ref::all(git, &repo.root).unwrap();
+    let others = |git: &Git| ticket_ref::others(git, &repo.root, &ticket()).unwrap();
+    assert_eq!(run(&all), (1, 0));
+    let mut counts = Vec::new();
+    for n in 1..=12 {
+        let id = TicketId::new(format!("DEMO-{n}")).unwrap();
+        let mut full = kept_everything();
+        full.state = record(WAITING, 1).state;
+        full.questions = record(WAITING, 1).questions;
+        ticket_ref::write(&repo.git, &repo.root, &id, &full, None).unwrap();
+        if n == 2 || n == 12 {
+            counts.push((run(&all), run(&others)));
+        }
+    }
+    assert_eq!(counts, [((5, 2), (5, 1)), ((5, 12), (5, 11))]);
+}
+
+/// OWL-492: the ticket refs read together read each as `read` reads it
+/// alone, refusals and their messages included, one broken ref leaving the
+/// others whole: the first broken file is the error, whatever a later one
+/// holds or lacks.
+#[test]
+fn ticket_refs_read_together_read_each_as_alone() {
+    let repo = Repo::new();
+    let state = repo.blob(WAITING);
+    let asked = repo.blob(&questions(1));
+    let later = repo.blob(&questions(2));
+    let unparsable = repo.blob("{}");
+    let not_utf8 = repo.blob_bytes(b"\xff");
+    let cap = usize::try_from(ticket_ref::MAX_FILE).unwrap();
+    let oversized = repo.blob(&"x".repeat(cap + 1));
+    let absent = "2".repeat(40);
+    let empty = repo.git(&["write-tree"]);
+    let commit = repo.git(&["commit-tree", "--no-gpg-sign", &empty, "-m", "a commit"]);
+    let cases: Vec<(&str, Vec<Entry>, &str)> = vec![
+        (
+            "CASE-1",
+            vec![("100644", &state, "state.json")],
+            "has no questions.json",
+        ),
+        (
+            "CASE-2",
+            vec![
+                ("100755", &state, "state.json"),
+                ("100644", &asked, "questions.json"),
+            ],
+            "holds state.json as 100755 blob, not a regular file",
+        ),
+        (
+            "CASE-3",
+            vec![
+                ("100644", &state, "state.json"),
+                ("160000", &commit, "questions.json"),
+            ],
+            "holds questions.json as 160000 commit, not a regular file",
+        ),
+        (
+            "CASE-4",
+            vec![
+                ("100644", &state, "state.json"),
+                ("100644", &later, "questions.json"),
+            ],
+            "but its latest ask is of round 2",
+        ),
+        (
+            "CASE-5",
+            vec![("100644", &unparsable, "state.json")],
+            "holds an invalid state.json",
+        ),
+        (
+            "CASE-6",
+            vec![
+                ("100644", &not_utf8, "state.json"),
+                ("100644", &asked, "questions.json"),
+            ],
+            "holds state.json not in UTF-8",
+        ),
+        (
+            "CASE-7",
+            vec![
+                ("100644", &oversized, "state.json"),
+                ("120000", &asked, "questions.json"),
+            ],
+            "holds state.json past",
+        ),
+        (
+            "CASE-8",
+            vec![
+                ("100644", &state, "state.json"),
+                ("100644", &oversized, "questions.json"),
+                ("100644", &absent, "delivery.json"),
+            ],
+            "holds questions.json past",
+        ),
+        (
+            "CASE-9",
+            vec![
+                ("100644", &absent, "state.json"),
+                ("100644", &asked, "questions.json"),
+            ],
+            "holds state.json past",
+        ),
+        (
+            "CASE-10",
+            vec![
+                ("100644", &state, "state.json"),
+                ("100644", &asked, "questions.json"),
+            ],
+            "",
+        ),
+    ];
+    for (id, entries, _) in &cases {
+        repo.plant_at(&format!("refs/owlshift/tickets/{id}"), entries);
+    }
+    let good = TicketId::new("GOOD-1").unwrap();
+    ticket_ref::write(&repo.git, &repo.root, &good, &kept_everything(), None).unwrap();
+    repo.git(&["update-ref", "refs/owlshift/tickets/BLOB-1", &state]);
+    repo.git(&[
+        "symbolic-ref",
+        "refs/owlshift/tickets/ALIAS-1",
+        "refs/owlshift/tickets/GOOD-1",
+    ]);
+    let tickets = repo.root.join(".git/refs/owlshift/tickets");
+    fs::write(tickets.join("GONE-1"), format!("{}\n", "1".repeat(40))).unwrap();
+
+    let listing = ticket_ref::listing(&repo.git, &repo.root).unwrap();
+    let together = ticket_ref::read_listed_refs(&repo.git, &repo.root, listing);
+    assert_eq!(together.len(), cases.len() + 4, "{together:?}");
+    for (ticket, read) in &together {
+        if ticket.as_str() == "GONE-1" {
+            // `read` cannot list a ref to a missing object at all.
+            let error = read.as_ref().unwrap_err();
+            assert!(error.contains("does not hold"), "{error}");
+            continue;
+        }
+        let alone = ticket_ref::read(&repo.git, &repo.root, ticket).map(Option::unwrap);
+        assert_eq!(read, &alone, "{ticket}");
+    }
+    let of = |id: &str| &together.iter().find(|(t, _)| t.as_str() == id).unwrap().1;
+    for (id, _, needle) in &cases {
+        match of(id) {
+            Ok(_) => assert!(needle.is_empty(), "{id} read"),
+            Err(error) => assert!(
+                !needle.is_empty() && error.contains(needle),
+                "{id}: {needle}: {error}"
+            ),
+        }
+    }
+    assert_eq!(of("GOOD-1").as_ref().unwrap().record, kept_everything());
+    let blob = of("BLOB-1").as_ref().unwrap_err();
+    assert!(blob.contains("points to a blob, not a commit"), "{blob}");
+    let alias = of("ALIAS-1").as_ref().unwrap_err();
+    assert!(alias.contains("is a symbolic ref"), "{alias}");
 }

@@ -33,6 +33,7 @@ use owlshift_testkit::step_child::{ChildProject, ChildSlots, TICKET, intake_done
 use owlshift_testkit::step_child::{
     asks, build_asks, ended_as, holding_harness, intake_declaring, record_of, reply_for,
 };
+use owlshift_testkit::wait;
 
 /// The step's child.
 const CHILD: &str = env!("CARGO_BIN_EXE_owlshift-step-child");
@@ -726,18 +727,6 @@ fn alive(pid: u32) -> bool {
         .success()
 }
 
-#[cfg(unix)]
-fn wait_for(what: &str, mut done: impl FnMut() -> bool) {
-    use std::thread;
-    use std::time::{Duration, Instant};
-
-    let deadline = Instant::now() + Duration::from_secs(10);
-    while !done() {
-        assert!(Instant::now() < deadline, "still waiting for {what}");
-        thread::sleep(Duration::from_millis(20));
-    }
-}
-
 /// Kills, on a failed test's way out, what it left running.
 #[cfg(unix)]
 impl Drop for Running {
@@ -758,21 +747,17 @@ fn pid_in(file: &Path) -> u32 {
     fs::read_to_string(file).unwrap().trim().parse().unwrap()
 }
 
-/// [`wait_for`], within `seconds`, `log`, watch's output, in the failure.
+/// A held run's `hold`: longer than any wait, so that only a stop ends it
+/// (OWL-493).
 #[cfg(unix)]
-fn wait_within(what: &str, seconds: u64, log: &Path, mut done: impl FnMut() -> bool) {
-    use std::thread;
-    use std::time::{Duration, Instant};
+fn hold_until_cut() -> String {
+    format!("exec sleep {}", wait::OUTLASTS.as_secs())
+}
 
-    let deadline = Instant::now() + Duration::from_secs(seconds);
-    while !done() {
-        assert!(
-            Instant::now() < deadline,
-            "still waiting for {what}\n{}",
-            fs::read_to_string(log).unwrap_or_default()
-        );
-        thread::sleep(Duration::from_millis(50));
-    }
+/// What watch wrote to `log`, for a failure.
+#[cfg(unix)]
+fn log_text(log: &Path) -> String {
+    fs::read_to_string(log).unwrap_or_default()
 }
 
 /// Starts [`helper_watch_until_stopped`] over the project `file` keeps, in a
@@ -970,7 +955,7 @@ fn a_sigterm_during_two_builds_checks_both_and_both_resume() {
     }
     reply_for(&plays, "build", None, &build_asks());
     fs::write(plays.join("hold"), "").unwrap();
-    let harness = holding_harness(&plays, Path::new(FAKE), "build", ":", "exec sleep 30");
+    let harness = holding_harness(&plays, Path::new(FAKE), "build", ":", &hold_until_cut());
     let s = parallel_setup(&harness, 2, 2, (&machine, 2));
     s.project.move_ticket("DEMO-9", "Done");
     let log = tmp.path().join("watch.log");
@@ -982,16 +967,20 @@ fn a_sigterm_during_two_builds_checks_both_and_both_resume() {
         plays.join("build-DEMO-1.pid"),
         plays.join("build-DEMO-2.pid"),
     ];
-    wait_within("both Builds under way", 120, &log, || {
-        builds.iter().all(|pid| pid.exists())
-    });
+    wait::until_with(
+        "both Builds under way",
+        || log_text(&log),
+        || builds.iter().all(|pid| pid.exists()),
+    );
     let runs: Vec<u32> = builds.iter().map(|pid| pid_in(pid)).collect();
     running.pids.extend(&runs);
 
     signal(&watch, "TERM");
-    wait_within("watch to end", 60, &log, || {
-        watch.try_wait().unwrap().is_some()
-    });
+    wait::until_with(
+        "watch to end",
+        || log_text(&log),
+        || watch.try_wait().unwrap().is_some(),
+    );
     let status = watch.wait().unwrap();
     let log_text = fs::read_to_string(&log).unwrap_or_default();
     assert!(status.success(), "{status}\n{log_text}");
@@ -1022,15 +1011,15 @@ fn a_sigterm_during_two_builds_checks_both_and_both_resume() {
 }
 
 /// OWL-474's acceptance in plain `owlshift watch`, whose steps run in its
-/// own process: DEMO-1's Build, under way, is canceled. Its run is stopped
-/// within 5 seconds and the ticket parked at Build within 10, the cancel
-/// file gone, while the watch goes on until its own SIGTERM. The daemon's
-/// bench checks the rest in children (`tests/daemon.rs`).
+/// own process: DEMO-1's Build, under way, is canceled. Its run is gone
+/// within 5 seconds of the cancel, the bound the design gives the cut of the
+/// runs (architecture section 5, "Cancel", "As built"), then the ticket is
+/// parked at Build, a pass the design does not bound and load slows (OWL-491),
+/// the cancel file gone, while the watch goes on until its own SIGTERM. The
+/// daemon's bench checks the rest in children (`tests/daemon.rs`).
 #[cfg(unix)]
 #[test]
 fn a_build_canceled_in_watch_s_own_process_stops_and_parks_the_watch_going_on() {
-    use std::time::{Duration, Instant};
-
     use owlshift_testkit::step_child::{cancel, parked_at_build};
 
     let tmp = tempfile::tempdir().unwrap();
@@ -1040,7 +1029,7 @@ fn a_build_canceled_in_watch_s_own_process_stops_and_parks_the_watch_going_on() 
     reply_for(&plays, "intake", Some(TICKET), &intake_declaring(&["a"]));
     reply_for(&plays, "build", None, &build_asks());
     fs::write(plays.join("hold"), "").unwrap();
-    let harness = holding_harness(&plays, Path::new(FAKE), "build", ":", "exec sleep 30");
+    let harness = holding_harness(&plays, Path::new(FAKE), "build", ":", &hold_until_cut());
     let s = parallel_setup(&harness, 1, 1, (&machine, 1));
     s.project.move_ticket("DEMO-9", "Done");
     let log = tmp.path().join("watch.log");
@@ -1049,17 +1038,24 @@ fn a_build_canceled_in_watch_s_own_process_stops_and_parks_the_watch_going_on() 
         pids: vec![watch.id()],
     };
     let pid = plays.join(format!("build-{TICKET}.pid"));
-    wait_within("the Build under way", 120, &log, || pid.exists());
+    wait::until_with("the Build under way", || log_text(&log), || pid.exists());
     let run = pid_in(&pid);
     running.pids.push(run);
 
-    let asked = Instant::now();
     cancel(&s.project, TICKET, "it rewrites the wrong module");
-    wait_within("the Build's run stopped", 5, &log, || !alive(run));
-    wait_within("the ticket parked", 10, &log, || {
-        parked_at_build(&s.project, TICKET)
-    });
-    assert!(asked.elapsed() < Duration::from_secs(10));
+    // The bound the design gives the cut (architecture section 5, "Cancel",
+    // "As built").
+    wait::within(
+        std::time::Duration::from_secs(5),
+        "the Build's run stopped",
+        || log_text(&log),
+        || !alive(run),
+    );
+    wait::until_with(
+        "the ticket parked",
+        || log_text(&log),
+        || parked_at_build(&s.project, TICKET),
+    );
     assert!(
         watch.try_wait().unwrap().is_none(),
         "the watch ended\n{}",
@@ -1071,9 +1067,11 @@ fn a_build_canceled_in_watch_s_own_process_stops_and_parks_the_watch_going_on() 
     ));
 
     signal(&watch, "TERM");
-    wait_within("watch to end", 60, &log, || {
-        watch.try_wait().unwrap().is_some()
-    });
+    wait::until_with(
+        "watch to end",
+        || log_text(&log),
+        || watch.try_wait().unwrap().is_some(),
+    );
     let log_text = fs::read_to_string(&log).unwrap_or_default();
     assert!(watch.wait().unwrap().success(), "{log_text}");
     assert_eq!(s.project.dirs().quarantine().unwrap(), None, "{log_text}");
@@ -1094,7 +1092,13 @@ fn a_breach_found_at_a_checked_stop_quarantines() {
     let dirs = s.project.dirs();
     let planted = format!("echo planted > '{}/planted'", dirs.checkout().display());
     let mut project = s.project.clone();
-    project.harness = holding_harness(&plays, Path::new(FAKE), "intake", &planted, "exec sleep 30");
+    project.harness = holding_harness(
+        &plays,
+        Path::new(FAKE),
+        "intake",
+        &planted,
+        &hold_until_cut(),
+    );
     project.save(&s.file);
     let log = s.tmp.path().join("watch.log");
     let mut watch = start_watch(&s.file, true, None, &log);
@@ -1102,14 +1106,16 @@ fn a_breach_found_at_a_checked_stop_quarantines() {
         pids: vec![watch.id()],
     };
     let pid = plays.join(format!("intake-{TICKET}.pid"));
-    wait_within("the intake under way", 60, &log, || pid.exists());
+    wait::until_with("the intake under way", || log_text(&log), || pid.exists());
     let run = pid_in(&pid);
     running.pids.push(run);
 
     signal(&watch, "TERM");
-    wait_within("watch to end", 60, &log, || {
-        watch.try_wait().unwrap().is_some()
-    });
+    wait::until_with(
+        "watch to end",
+        || log_text(&log),
+        || watch.try_wait().unwrap().is_some(),
+    );
     let log_text = fs::read_to_string(&log).unwrap_or_default();
     assert!(watch.wait().unwrap().success(), "{log_text}");
     assert!(!alive(run), "the intake's run outlived the checked stop");
@@ -1127,7 +1133,7 @@ fn a_breach_found_at_a_checked_stop_quarantines() {
 /// now, SIGQUIT, stops watch's child through the policy every command
 /// shares, and a watch killed outright (SIGKILL) has its sentinel stop it;
 /// either way the child's own sentinel then stops the run it started, a
-/// harness that would sleep 30 s, its obligation left as before OWL-161:
+/// harness that would sleep past every wait, its obligation left as before OWL-161:
 /// the next pass quarantines the project.
 #[cfg(unix)]
 #[test]
@@ -1138,7 +1144,8 @@ fn sigquit_and_sigkill_of_watch_stop_now_leaving_the_obligation() {
         fs::create_dir_all(&plays).unwrap();
         fs::write(plays.join("hold"), "").unwrap();
         let mut project = s.project.clone();
-        project.harness = holding_harness(&plays, Path::new(FAKE), "intake", ":", "exec sleep 30");
+        project.harness =
+            holding_harness(&plays, Path::new(FAKE), "intake", ":", &hold_until_cut());
         project.save(&s.file);
 
         let child_pid = s.tmp.path().join("child.pid");
@@ -1148,16 +1155,18 @@ fn sigquit_and_sigkill_of_watch_stop_now_leaving_the_obligation() {
             pids: vec![watch.id()],
         };
         let harness_pid = plays.join(format!("intake-{TICKET}.pid"));
-        wait_within("the child and its run", 60, &log, || {
-            child_pid.exists() && harness_pid.exists()
-        });
+        wait::until_with(
+            "the child and its run",
+            || log_text(&log),
+            || child_pid.exists() && harness_pid.exists(),
+        );
         let (child, run) = (pid_in(&child_pid), pid_in(&harness_pid));
         running.pids.extend([child, run]);
         assert!(watch.try_wait().unwrap().is_none(), "watch ended early");
 
         signal(&watch, signal_name);
-        wait_for("watch to end", || watch.try_wait().unwrap().is_some());
-        wait_for(
+        wait::until("watch to end", || watch.try_wait().unwrap().is_some());
+        wait::until(
             &format!("the child and its run to stop after SIG{signal_name}"),
             || !alive(child) && !alive(run),
         );
@@ -1393,11 +1402,11 @@ fn a_base_wait_keeps_its_comment_while_another_step_runs() {
 /// --drain` over the project `OWLSHIFT_CHILD_PROJECT` names, its steps in
 /// children or, with `OWLSHIFT_WATCH_IN_PROCESS`, in its own process, with
 /// the signal policy, the sentinel and the stop by degrees `owlshift`
-/// installs, until it is stopped or two minutes have passed.
+/// installs, until it is stopped or [`wait::OUTLASTS`] has passed.
 #[test]
 #[ignore = "helper, run by the tests below"]
 fn helper_watch_until_stopped() {
-    use std::time::{Duration, Instant};
+    use std::time::Instant;
 
     use owlshift_platform::process;
     use owlshift_runner::watch::stop::CHECKED_STOP_BOUND;
@@ -1413,6 +1422,7 @@ fn helper_watch_until_stopped() {
     let project = ChildProject::load(&file);
     let in_process = std::env::var_os("OWLSHIFT_WATCH_IN_PROCESS").is_some();
     let children = (!in_process).then(|| children(&file));
-    let ends = Instant::now() + Duration::from_secs(120);
+    // Past any wait for the watch to end, so that only a stop ends it.
+    let ends = Instant::now() + wait::OUTLASTS;
     project.watch_until_stopped(children, &mut || Instant::now() < ends);
 }

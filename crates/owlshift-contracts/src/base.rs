@@ -238,9 +238,13 @@ impl From<KeptStep> for Step {
     }
 }
 
-/// A ticket's gate or setup failure waiting for its base, valid while the
-/// ticket is at Build in `round`, configured at `configured_at` with
-/// `commands`, on the branch head `head`.
+/// A ticket's gate or setup failure waiting for its base, or a red gate the
+/// machine cut (OWL-480) waiting for its next run, valid while the ticket is
+/// at Build in `round`, configured at `configured_at` with `commands`, on
+/// the branch head `head`; with `pushed`, a fix run's red gate the machine
+/// cut at Watch (OWL-486), valid there alone, while the pull request's head
+/// is `pushed`; with `rebase` too, a rebase run's (OWL-490), whose `head` is
+/// the rebased commit it kept.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 #[schemars(title = "Owlshift base wait")]
@@ -252,13 +256,31 @@ pub struct BaseWait {
     pub configured_at: String,
     pub commands: String,
     pub round: u32,
-    /// The branch's head the failure was found on, a full commit id.
+    /// The branch's head the failure was found on, a full commit id; for a
+    /// rebase run's, the rebased commit, the branch being back at `pushed`.
     pub head: String,
-    pub failing: KeptFailing,
+    /// The command a base check owes a verdict on; none for a red gate the
+    /// machine cut, which no check owes one (OWL-480). An Owlshift from
+    /// before OWL-480 does not read a wait without it, and runs the Build
+    /// again.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failing: Option<KeptFailing>,
     /// A done Build's, whose gate alone runs again once the base passes;
     /// none for a failure before the harness.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub done: Option<KeptDone>,
+    /// The pull request's head a fix run at Watch was made on, for a fix
+    /// whose red gate the machine cut (OWL-486), a full commit id; none for
+    /// a Build's wait. An Owlshift from before OWL-486 does not read a wait
+    /// with it, and runs the fix again.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pushed: Option<String>,
+    /// The wait is a rebase run's at Watch whose red gate the machine cut
+    /// (OWL-490), made on the pull request's head `pushed`; false for a fix
+    /// run's and a Build's. An Owlshift from before OWL-490 does not read a
+    /// wait with it, and runs the rebase again.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub rebase: bool,
 }
 
 /// What a done Build left for its gate's next run.
@@ -335,6 +357,61 @@ mod tests {
         assert_eq!(ProjectBase::parse(&text).unwrap().checks(), checks);
         assert!(text.contains("\"state\": \"pending\""), "{text}");
         assert!(text.contains("\"verdict\": \"failed\""), "{text}");
+    }
+
+    /// OWL-480: a wait the machine's cut left keeps no failure, and an
+    /// OWL-418 wait still reads with its own. OWL-486: a fix run's at
+    /// Watch names the pull request's head it fixes; a Build's names none.
+    /// OWL-490: a rebase run's says so, which a fix's and a Build's do not.
+    #[test]
+    fn a_cut_wait_keeps_no_failure() {
+        let wait = BaseWait {
+            format: Format,
+            ticket: TicketId::new("OWL-1").unwrap(),
+            configured_at: "c".repeat(40),
+            commands: "k".to_owned(),
+            round: 2,
+            head: "h".repeat(40),
+            failing: None,
+            done: None,
+            pushed: None,
+            rebase: false,
+        };
+        let text = wait.render();
+        assert!(
+            !text.contains("failing") && !text.contains("pushed") && !text.contains("rebase"),
+            "{text}"
+        );
+        assert_eq!(BaseWait::parse(&text).unwrap(), wait);
+        let fix = BaseWait {
+            pushed: Some("p".repeat(40)),
+            ..wait.clone()
+        };
+        let fixed = fix.render();
+        assert!(
+            fixed.contains("\"pushed\"") && !fixed.contains("rebase"),
+            "{fixed}"
+        );
+        assert_eq!(BaseWait::parse(&fixed).unwrap(), fix);
+        let rebase = BaseWait {
+            rebase: true,
+            ..fix.clone()
+        };
+        let rebased = rebase.render();
+        assert!(rebased.contains("\"rebase\": true"), "{rebased}");
+        assert_eq!(BaseWait::parse(&rebased).unwrap(), rebase);
+        let held = text.replacen(
+            "\"head\"",
+            r#""failing": {"step": "gate", "command": "make test"}, "head""#,
+            1,
+        );
+        assert_eq!(
+            BaseWait::parse(&held).unwrap().failing,
+            Some(KeptFailing {
+                step: KeptStep::Gate,
+                command: "make test".to_owned()
+            })
+        );
     }
 
     #[test]

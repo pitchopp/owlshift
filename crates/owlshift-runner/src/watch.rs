@@ -3,8 +3,10 @@
 //! foreground. The decisions are architecture section 5's "Watch mode".
 //!
 //! Each pass takes the project's lock for a moment, the snapshot: it checks
-//! the `unverified` marker and reads the ticket refs. The lock is released
-//! before the tracker is read, so a command typed by hand meanwhile runs.
+//! the `unverified` marker and lists the ticket refs with their commits. The
+//! lock is released before the refs' records are read, by those commits
+//! (OWL-489), and before the tracker is, so a command typed by hand
+//! meanwhile runs.
 //! Each ticket whose questions wait ([`watched`]) has its comments read, and
 //! when the decider's reply counts ([`answer_check::readiness`], the function
 //! `continue` asks too), the ticket goes through `continue`'s own path,
@@ -1347,10 +1349,26 @@ impl Watch<'_> {
                 action: Action::Park,
                 ..
             } => None,
+            // Nor a rebase whose gate the machine cut, kept by a rebase's
+            // wait (OWL-490), its gate alone run first; a rebase run it
+            // leaves is held by its own usage admission, as a fix's below.
+            Decision::Follow {
+                action: Action::Rebase { .. },
+                ..
+            } if base::read_wait(on_demand.dirs, ticket).is_some_and(|wait| wait.rebase) => None,
             Decision::Follow {
                 action: Action::Rebase { .. } | Action::RebaseFailed { .. },
                 ..
             } => Some(Role::Rebase),
+            // Nor a fix whose gate the machine cut, its gate alone run first
+            // (OWL-486): told by the wait file's presence, which the step
+            // checks. A fix run it leaves, the wait not holding or the gate
+            // red, is held by its own usage admission before anything of it
+            // is made (`OnDemand::admit_usage`, from `execute_inner`).
+            Decision::Follow {
+                action: Action::Fix { .. },
+                ..
+            } if base::wait_file(on_demand.dirs, ticket).exists() => None,
             _ => Some(Role::Build),
         };
         self.held_run(
@@ -2025,14 +2043,19 @@ impl Watch<'_> {
         Ok(Some(lock))
     }
 
-    /// The ticket refs, read under the project's lock, and the marker of a
-    /// run whose isolation check did not pass, when one stands. While it
-    /// does, what watch knows of it is brought up to date under that lock
-    /// (`keep_quarantine`, OWL-368), and the refs are read through the
-    /// runner's read-only plumbing alone, nothing written: none when they
-    /// cannot be. The marker is read first, so that one left once the
-    /// dedicated checkout was deleted still stands. No dedicated checkout
-    /// and no marker: nothing was asked.
+    /// The ticket refs and the marker of a run whose isolation check did not
+    /// pass, when one stands. Under the project's lock, the marker, then one
+    /// listing of the ticket refs with the commit each points to
+    /// ([`ticket_ref::listing`]); the records are read once the lock is let
+    /// go, by those commits, which never change (OWL-489): the snapshot is
+    /// the refs as they were at the listing, a ref moved or gone since read
+    /// as listed, and every act on one reads it again under the lock
+    /// (`locked_at`). While a marker stands, what watch knows of it is
+    /// brought up to date under that lock (`keep_quarantine`, OWL-368), and
+    /// the refs are read through the runner's read-only plumbing alone,
+    /// nothing written: none when they cannot be listed. The marker is read
+    /// first, so that one left once the dedicated checkout was deleted
+    /// still stands. No dedicated checkout and no marker: nothing was asked.
     fn snapshot(&self, memory: &mut Memory, sink: &mut EventSink<'_>) -> Result<Snapshot, Project> {
         let dirs = self.on_demand.dirs;
         let checkout = dirs.checkout();
@@ -2067,19 +2090,15 @@ impl Watch<'_> {
             });
         }
         let git = &self.on_demand.executor.git;
-        let tickets = match ticket_ref::list(git, &checkout) {
-            Ok(tickets) => tickets,
+        let listing = match ticket_ref::listing(git, &checkout) {
+            Ok(listing) => listing,
             Err(_) if quarantine.is_some() => Vec::new(),
             Err(e) => return Err(Project::Unread(e)),
         };
-        let refs = tickets
-            .into_iter()
-            .map(|ticket| {
-                let stored = ticket_ref::read(git, &checkout, &ticket)
-                    .and_then(|stored| stored.ok_or_else(|| "its ticket ref is gone".to_owned()));
-                (ticket, stored)
-            })
-            .collect();
+        // The lock goes before the records are read (OWL-489), all of them
+        // in a fixed number of git commands (OWL-492).
+        drop(lock);
+        let refs = ticket_ref::read_listed_refs(git, &checkout, listing);
         Ok(Snapshot { refs, quarantine })
     }
 

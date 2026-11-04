@@ -4,6 +4,7 @@
 //! (`watch::drain`), replaced whole. Only the project's draining watch
 //! writes it, which the watch lock keeps to one, so no other lock is taken.
 
+use std::collections::BTreeSet;
 use std::path::PathBuf;
 
 use jiff::Timestamp;
@@ -22,6 +23,58 @@ pub const FILE: &str = "ready.json";
 /// The project's ready snapshot.
 pub fn file(dirs: &ProjectDirs) -> PathBuf {
     dirs.root().join(FILE)
+}
+
+/// The project's snapshot, `None` when there is none; the error says why
+/// it does not read.
+pub fn read(dirs: &ProjectDirs) -> Result<Option<ReadySnapshot>, String> {
+    let path = file(dirs);
+    match std::fs::read_to_string(&path) {
+        Ok(text) => ReadySnapshot::parse(&text)
+            .map(Some)
+            .map_err(|e| format!("{}: {e}", path.display())),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(format!("{}: {error}", path.display())),
+    }
+}
+
+/// Whether `snapshot` is stale at `now`: older than two of its watch's
+/// intervals (architecture section 5, "The ready snapshot").
+pub fn stale(snapshot: &ReadySnapshot, now: Timestamp) -> bool {
+    let age = now
+        .as_millisecond()
+        .saturating_sub(snapshot.at.as_millisecond());
+    u64::try_from(age).is_ok_and(|age| age > snapshot.interval_ms.saturating_mul(2))
+}
+
+/// The tickets the drain's latest snapshot lists, `None` when there is none
+/// or when it does not read, which is said in `notes` (each line starting
+/// with `prefix`); a stale one is listed all the same, with a note naming when
+/// the drain last read the column. What `status --waits` and `why` share
+/// (OWL-477, OWL-484).
+pub fn listed(
+    dirs: &ProjectDirs,
+    now: Timestamp,
+    prefix: &str,
+    notes: &mut Vec<String>,
+) -> Option<BTreeSet<TicketId>> {
+    match read(dirs) {
+        Ok(Some(snapshot)) => {
+            if stale(&snapshot, now) {
+                notes.push(format!(
+                    "{prefix}the drain last read the ready column at {}, more than two passes \
+                     ago: its waits are as it told them then",
+                    snapshot.at
+                ));
+            }
+            Some(snapshot.tickets.into_iter().map(|t| t.ticket).collect())
+        }
+        Ok(None) => None,
+        Err(why) => {
+            notes.push(format!("{prefix}its ready snapshot cannot be read: {why}"));
+            None
+        }
+    }
 }
 
 /// Replaces the project's snapshot with `snapshot`.
@@ -50,6 +103,20 @@ mod tests {
     use crate::events::data;
     use owlshift_contracts::waits::Behind;
     use serde_json::json;
+
+    #[test]
+    fn a_snapshot_older_than_two_intervals_is_stale() {
+        let snapshot = ReadySnapshot {
+            format: Default::default(),
+            at: "2026-10-31T10:00:00Z".parse().unwrap(),
+            interval_ms: 60_000,
+            tickets: Vec::new(),
+        };
+        let at = |time: &str| stale(&snapshot, time.parse().unwrap());
+        assert!(!at("2026-10-31T10:02:00Z"));
+        assert!(at("2026-10-31T10:02:01Z"));
+        assert!(!at("2026-10-31T09:00:00Z"), "a clock behind is not stale");
+    }
 
     #[test]
     fn a_wait_names_its_tickets_and_the_new_reasons_are_worded() {

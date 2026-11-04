@@ -1010,6 +1010,7 @@ mod tests {
                 },
                 verdicts: Vec::new(),
                 result_refusal: None,
+                labels: Default::default(),
             });
             asked.checked_through = checked.map(at);
             asked

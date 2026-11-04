@@ -10,15 +10,18 @@
 //! inbox socket replaced (see `docs/design/build-plan.md`, OWL-14, OWL-46,
 //! OWL-52, OWL-53, OWL-77, OWL-327 and OWL-338 results). Each test states the exit status and standard error
 //! the run had, since both decide the outcome; the recorder checks them.
-//! `usage_limit.jsonl` alone is constructed, not recorded: no run has hit a
-//! limit on purpose (C7's open item). It follows the shapes C7 logged.
+//! `usage_limit.jsonl` is a real run at the weekly limit, captured on
+//! 2026-11-03 with a bare `claude -p` on Claude Code 2.1.317, not by the
+//! recorder: a limit cannot be reached on demand (OWL-40). It was scrubbed by
+//! hand to the recorder's rules, and the user's hook events dropped, since
+//! the adapter's command runs no user hook.
 //! `repo_settings_ignored.jsonl` was recorded with the real CLI and a local
 //! stand-in for the model, which played scripted tool calls (OWL-53).
 
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use jiff::Timestamp;
 use owlshift_adapters::harness::claude::{
@@ -30,6 +33,11 @@ use owlshift_contracts::Harness;
 use owlshift_contracts::brief::{PermissionLevel, Permissions};
 use owlshift_contracts::ids::RelativePath;
 use serde_json::{Value, json};
+
+// How a test waits for a state (OWL-493), shared with the test bench.
+#[allow(dead_code)]
+#[path = "../../owlshift-testkit/src/wait.rs"]
+mod wait;
 
 fn fixture(name: &str) -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -290,16 +298,17 @@ fn unknown_model() {
     }
 }
 
-/// Constructed: a rejected rate-limit report, then the synthetic limit
-/// message. The exit status is assumed to be 1, as for other API errors.
+/// Recorded at a real weekly limit (OWL-40): a rejected rate-limit report,
+/// then the synthetic limit message; the run exited with status 1 and an
+/// empty standard error.
 #[test]
 fn usage_limit() {
     let run = replay("usage_limit.jsonl", 1);
     assert_eq!(
         run.outcome,
         Outcome::UsageLimit {
-            resets_at: Some(Timestamp::from_second(1790613600).unwrap()),
-            window: Some("five_hour".into()),
+            resets_at: Some(Timestamp::from_second(1793772000).unwrap()),
+            window: Some("seven_day".into()),
         }
     );
 }
@@ -850,8 +859,10 @@ fn bundled_skills_are_disabled_on_every_launch() {
 
 /// Every recorded fixture carries a version listed in `harness/tested.rs`,
 /// so re-recording with a new release cannot leave the list `owlshift
-/// doctor` reads behind. The constructed fixture proves nothing about a
-/// release and is skipped, and so is the sender of OWL-52's probe: it plays
+/// doctor` reads behind. The usage-limit fixture is skipped: it was captured
+/// outside the recorder, with a bare `claude -p` rather than the adapter's
+/// command, so it proves nothing about a release; and so is the sender of
+/// OWL-52's probe: it plays
 /// one of the user's other sessions, whatever their version, not a run the
 /// adapter launches.
 #[test]
@@ -918,13 +929,23 @@ fn helper_replay() {
     }
 }
 
-/// How long the grandchild holds the output pipes open.
-const PIPE_HOLDER_SLEEP: Duration = Duration::from_secs(10);
+/// The variable naming the file whose creation lets the grandchild go: it
+/// holds the output pipes open until then, or for [`wait::OUTLASTS`], longer
+/// than any wait (OWL-493).
+const RELEASE: &str = "OWLSHIFT_HELPER_RELEASE";
 
-// The pipe-holder test's upper bound is `PIPE_HOLDER_SLEEP - EXIT_GRACE`: keep
-// it at least two grace periods above the lower bound, or the test could
-// never pass (and the subtraction could underflow).
-const _: () = assert!(PIPE_HOLDER_SLEEP.as_millis() >= 4 * EXIT_GRACE.as_millis());
+// The pipe-holder test's upper bound is `REACHED`, its lower one `EXIT_GRACE`:
+// keep them apart, or the test could never pass.
+const _: () = assert!(wait::REACHED.as_millis() >= 4 * EXIT_GRACE.as_millis());
+
+/// Lets the grandchild go when dropped, as the test ends, passing or not.
+struct Release(PathBuf);
+
+impl Drop for Release {
+    fn drop(&mut self) {
+        let _ = std::fs::write(&self.0, "");
+    }
+}
 
 /// Starts a process that inherits stdout and outlives this one, then exits.
 #[test]
@@ -951,7 +972,8 @@ fn helper_leave_a_pipe_holder() {
 #[ignore = "helper, run by the tests below"]
 fn helper_sleep() {
     if helper_requested() {
-        std::thread::sleep(PIPE_HOLDER_SLEEP);
+        let release = PathBuf::from(std::env::var_os(RELEASE).unwrap());
+        wait::reached(wait::OUTLASTS, || release.exists());
     }
 }
 
@@ -1004,24 +1026,30 @@ fn drive_sends_the_prompt_and_streams_the_output() {
 
 #[test]
 fn drive_does_not_wait_for_a_process_holding_the_output_open() {
+    let dir = tempfile::tempdir().unwrap();
+    // Dropped before `dir`, so the file can still be written.
+    let release = Release(dir.path().join("release"));
     let started = Instant::now();
-    let mut child = helper("helper_leave_a_pipe_holder", 0).spawn().unwrap();
+    let mut child = helper("helper_leave_a_pipe_holder", 0)
+        .env(RELEASE, &release.0)
+        .spawn()
+        .unwrap();
     let run = drive(&mut child, "hi", |_| {}).unwrap();
     assert!(
         matches!(run.outcome, Outcome::Completed { .. }),
         "{:?}",
         run.outcome
     );
-    // The grandchild holds stdout and stderr open for `PIPE_HOLDER_SLEEP`. The
+    // The grandchild holds stdout and stderr open until the test ends. The
     // helper exits right after starting it, so `drive` returns after one grace
-    // period. The upper bound is `PIPE_HOLDER_SLEEP - EXIT_GRACE` (8 s today): well
-    // above a run slowed by a loaded machine (4.6 s seen under a confined
-    // `cargo test --workspace`), and below the at least 10 s a `drive` that
-    // waited for the pipe holder would take. It catches that wait, not a second grace
-    // period spent on stderr or the prompt (that would add only 2 s): the unit test
+    // period. The upper bound is `REACHED` (OWL-493): far above a run slowed
+    // by a loaded machine (4.6 s seen under a confined `cargo test
+    // --workspace`), and below the `OUTLASTS` a `drive` that waited for the
+    // pipe holder would take. It catches that wait, not a second grace period
+    // spent on stderr or the prompt (that would add only 2 s): the unit test
     // `drive_spends_one_grace_period_not_two_when_the_output_stays_held`, in
     // `src/harness/claude.rs`, catches that one on a clock of its own.
     let elapsed = started.elapsed();
     assert!(elapsed >= EXIT_GRACE, "{elapsed:?}");
-    assert!(elapsed < PIPE_HOLDER_SLEEP - EXIT_GRACE, "{elapsed:?}");
+    assert!(elapsed < wait::REACHED, "{elapsed:?}");
 }

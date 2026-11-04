@@ -164,8 +164,130 @@ fn labeled_merges_once_its_label_is_on_and_no_question_is_kept_for_a_person() {
         (&json!(pushed), &json!("squash"), &json!(MERGE_COMMIT))
     );
     assert_ended_merged(&bench);
-    assert!(bench.notified.0.borrow().is_empty());
+    // The merge notifies nothing; each hold only a person lifts was told
+    // once at its first green read (OWL-464): the label missing, then the
+    // `billing` question.
+    let notified = bench.notified.0.borrow().clone();
+    assert_eq!(notified.len(), 2, "{notified:?}");
+    assert!(
+        notified[0].contains("the ticket does not carry the label `owlshift:merge`")
+            && notified[1].contains("question Q1 of round 1 under `billing`"),
+        "{notified:?}"
+    );
+    assert_eq!(
+        waits_for_a_person(&bench),
+        [json!("unlabeled"), json!("unanswered")]
+    );
     assert!(lines.contains("merged by Owlshift (squash)"), "{lines}");
+}
+
+/// The `blocker` of each `merge_waits` event (OWL-464).
+fn waits_for_a_person(bench: &Bench) -> Vec<Value> {
+    data_of(&bench.events(), EventKind::Decision, "watch")
+        .into_iter()
+        .filter(|data| data["watch"] == "merge_waits")
+        .map(|data| data["blocker"].clone())
+        .collect()
+}
+
+/// A Build round asking one question under `security`.
+const SECURITY_ROUND: &str = r#"{"format":14,"status":"questions",
+"summary":"Who may read the greeting is not given.",
+"questions":[
+  {"id":"Q1","category":"security","context":"The greeting file is public.",
+   "text":"May anyone read the greeting?","options":[{"label":"Yes"},{"label":"No"}],
+   "recommendation":{"option":"A","why":"It holds no secret."}}]}"#;
+
+/// OWL-464: a ticket whose round asked a question under `security`, which
+/// its decider answered, is delivered saying that Owlshift will not merge
+/// it, naming the question, in the DELIVERY report and the delivery line;
+/// its first green read is told once, an event, a line and a notification,
+/// and no later pass tells it again or merges it.
+#[test]
+fn a_question_kept_for_a_person_is_said_at_delivery_and_once_at_watch() {
+    let bench = Bench::with(
+        "maintainer",
+        "assignee = \"maintainer\"\n",
+        "[forge]\nmerge = \"all\"\n",
+    );
+    let (asked, printed) = bench.run(vec![bench.reply(None, Some(SECURITY_ROUND))], None);
+    assert!(
+        matches!(&asked, Err(Stop::NeedsInput { posted: Ok(round), .. }) if round.get() == 1),
+        "{asked:?}\n{printed}"
+    );
+    bench.answer("Q1: A");
+    let answered = check(&[("Q1", "answered", "A, anyone.")]);
+    let (delivered, printed) = bench.continue_ticket(vec![
+        bench.reply(None, Some(&answered)),
+        bench.reply(Some("Hello"), Some(DONE)),
+    ]);
+    let line = delivered.unwrap_or_else(|stop| panic!("{stop}\n{printed}"));
+    let held = "question Q1 of round 1 was asked under `security`, and a person merges a security \
+                question whatever the answer. Review and merge it yourself.";
+    assert!(
+        line.to_string()
+            .ends_with(&format!("Owlshift will not merge it: {held}")),
+        "{line}"
+    );
+    let report = bench
+        .comments()
+        .into_iter()
+        .rfind(|body| body.starts_with("[owlshift] DELIVERY"))
+        .unwrap();
+    assert!(
+        report.contains(&format!(
+            "Owlshift will not merge [#1](https://github.com/demo/project/pull/1): {held}"
+        )),
+        "{report}"
+    );
+
+    let clock = bench.clock.clone();
+    let mut pass = 0;
+    let (_, lines, printed) = bench.watch(Vec::new(), &mut |_| {
+        pass += 1;
+        later(&clock);
+        pass < 4
+    });
+    assert!(github_merges(&bench).is_empty(), "{lines}\n{printed}");
+    let waits: Vec<Value> = data_of(&bench.events(), EventKind::Decision, "watch")
+        .into_iter()
+        .filter(|data| data["watch"] == "merge_waits")
+        .collect();
+    assert_eq!(waits.len(), 1, "{waits:?}");
+    assert_eq!(
+        (
+            &waits[0]["blocker"],
+            &waits[0]["category"],
+            &waits[0]["question"],
+            &waits[0]["round"],
+            &waits[0]["head"],
+        ),
+        (
+            &json!("security"),
+            &json!("security"),
+            &json!("Q1"),
+            &json!(1),
+            &json!(bench.remote_branch().unwrap()),
+        )
+    );
+    let notified = bench.notified.0.borrow().clone();
+    let told = notified
+        .iter()
+        .filter(|line| line.contains("is green and waits for a person"))
+        .collect::<Vec<_>>();
+    assert_eq!(told.len(), 1, "{notified:?}");
+    assert!(
+        told[0].starts_with(
+            "DEMO-1: pull request #1 is green and waits for a person: Owlshift will not merge \
+             it, as question Q1 of round 1 was asked under `security`"
+        ),
+        "{told:?}"
+    );
+    assert_eq!(
+        lines.matches("is green and waits for a person").count(),
+        1,
+        "{lines}"
+    );
 }
 
 /// `continue` at Watch says what merge on green makes of the ticket's

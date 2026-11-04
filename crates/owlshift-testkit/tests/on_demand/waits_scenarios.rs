@@ -3,21 +3,22 @@
 //! on the bench of `on_demand.rs`, its refs and its event log, the way the
 //! command reads them.
 
+use owlshift_contracts::refs::{Ended, EndedWhy};
 use owlshift_contracts::service::{KeptFile, ServedConfig};
 use owlshift_contracts::waits::{Behind, RefStatus, StatusWaits, WaitResource};
-use owlshift_runner::served;
 use owlshift_runner::status::waits;
+use owlshift_runner::{ready, served, why};
 
 use super::parallel_scenarios::{
     building, parallel_bench, planned, standard_declaring, two_planned,
 };
 use super::*;
 
-/// What `owlshift status --waits demo/project` reads of the bench now, as
-/// the document and as text.
+/// What `owlshift status --waits demo/project` reads of the bench at its
+/// clock, as the document and as text.
 fn waits_of(bench: &Bench) -> (StatusWaits, String) {
     let repo = Repo::parse(REPO).unwrap();
-    let read = waits::gather(&bench.data, Some(&repo), 2, Timestamp::now());
+    let read = waits::gather(&bench.data, Some(&repo), 2, bench.clock.get());
     let built = waits::build(&read);
     let text = waits::render(&built, &TimeZone::UTC);
     (built, text)
@@ -156,10 +157,200 @@ fn a_chain_of_blockers_then_the_queue_for_the_capacity() {
     assert!(!text.contains("DEMO-9"), "{text}");
 }
 
+/// Whether `ticket` is a row of the bench project's waits.
+fn shown(built: &StatusWaits, ticket: &str) -> bool {
+    built.projects[0]
+        .tickets
+        .iter()
+        .any(|row| row.ticket.as_str() == ticket)
+}
+
+/// OWL-477: DEMO-2, a ready ticket told it waits behind DEMO-1, is done
+/// outside Owlshift and leaves the ready column. The event log still tells
+/// its wait, but once the drain's next pass wrote a snapshot without it,
+/// `status --waits` no longer shows it, while DEMO-1, still in the column,
+/// keeps its own wait.
+#[test]
+fn a_ready_ticket_that_left_the_column_is_not_shown() {
+    let bench = parallel_bench("max_in_flight = 1\n");
+    bench.put_ticket(
+        "DEMO-2",
+        "maintainer",
+        "Todo",
+        &["agent"],
+        "blocked_by = [\"DEMO-1\"]\n",
+        "Document it.",
+    );
+    served_on(&bench);
+    let replies: Vec<Reply> = ["app", "docs"]
+        .iter()
+        .map(|zone| bench.reply(None, Some(&standard_declaring(&[zone]))))
+        .collect();
+    let told = RefCell::new(None);
+    let (_, lines, printed) = bench.drain_passes(replies, 4, |pass, _| {
+        if pass == 3 {
+            told.replace(Some(waits_of(&bench)));
+            bench.put_ticket(
+                "DEMO-2",
+                "maintainer",
+                "Done",
+                &["agent"],
+                "blocked_by = [\"DEMO-1\"]\n",
+                "Document it.",
+            );
+        }
+    });
+    let report = format!("{lines}\n{printed}");
+    let (built, text) = told.into_inner().expect("read after the intakes");
+    follow(
+        &text,
+        &[
+            "  Holders, and what waits behind each:",
+            "    DEMO-9, not in flight here",
+            "      DEMO-1 [ready]: blocked by DEMO-9 (told ",
+            "        DEMO-2 [ready]: blocked by DEMO-1 (told ",
+        ],
+    );
+    assert!(shown(&built, "DEMO-2"), "{text}\n{report}");
+
+    let (built, text) = waits_of(&bench);
+    let snapshot = ready::read(&bench.dirs()).unwrap().expect("a snapshot");
+    assert!(
+        snapshot
+            .tickets
+            .iter()
+            .all(|t| t.ticket.as_str() != "DEMO-2"),
+        "{snapshot:?}"
+    );
+    let folded = why::fold(&bench.events(), REPO);
+    assert!(
+        folded
+            .current
+            .contains_key(&TicketId::new("DEMO-2").unwrap()),
+        "the events still tell DEMO-2's wait"
+    );
+    assert!(!shown(&built, "DEMO-2"), "{text}\n{report}");
+    assert!(!text.contains("DEMO-2"), "{text}");
+    assert!(built.notes.is_empty(), "{:?}", built.notes);
+    follow(
+        &text,
+        &[
+            "  Holders, and what waits behind each:",
+            "    DEMO-9, not in flight here",
+            "      DEMO-1 [ready]: blocked by DEMO-9 (told ",
+        ],
+    );
+}
+
+/// What `owlshift why [ticket]` prints of the bench at its clock.
+fn why_of(bench: &Bench, ticket: Option<&str>) -> String {
+    why_at(bench, ticket, bench.clock.get())
+}
+
+/// The same at the time `now`.
+fn why_at(bench: &Bench, ticket: Option<&str>, now: Timestamp) -> String {
+    let report = why::gather(
+        &bench.data,
+        &bench.dirs(),
+        REPO,
+        ticket.map(|t| TicketId::new(t).unwrap()),
+        2,
+        &[],
+        now,
+    )
+    .unwrap();
+    why::render(&report)
+}
+
+/// OWL-484: the same ticket as OWL-477's, DEMO-2, told it waits behind
+/// DEMO-1, then done outside Owlshift. While the drain lists it, `why` says
+/// its wait is current; once a pass wrote a snapshot without it, `why
+/// DEMO-2` keeps the wait as history but says it is not shown as waiting,
+/// and `why` alone leaves it out with a count while DEMO-1 keeps its own
+/// wait. With the snapshot gone, the ticket out of flight is left out as
+/// well, said otherwise.
+#[test]
+fn why_does_not_repeat_the_wait_of_a_ticket_the_drain_no_longer_reads() {
+    let bench = parallel_bench("max_in_flight = 1\n");
+    bench.put_ticket(
+        "DEMO-2",
+        "maintainer",
+        "Todo",
+        &["agent"],
+        "blocked_by = [\"DEMO-1\"]\n",
+        "Document it.",
+    );
+    let replies: Vec<Reply> = ["app", "docs"]
+        .iter()
+        .map(|zone| bench.reply(None, Some(&standard_declaring(&[zone]))))
+        .collect();
+    let told = RefCell::new(None);
+    bench.drain_passes(replies, 4, |pass, _| {
+        if pass == 3 {
+            told.replace(Some(why_of(&bench, Some("DEMO-2"))));
+            bench.put_ticket(
+                "DEMO-2",
+                "maintainer",
+                "Done",
+                &["agent"],
+                "blocked_by = [\"DEMO-1\"]\n",
+                "Document it.",
+            );
+        }
+    });
+    let before = told.into_inner().expect("read after the intakes");
+    assert!(before.contains("now: blocked by DEMO-1"), "{before}");
+
+    let one = why_of(&bench, Some("DEMO-2"));
+    assert!(
+        one.contains(" waits: blocked by DEMO-1"),
+        "history kept: {one}"
+    );
+    assert!(
+        one.contains("now: not shown as waiting: it is neither in flight nor listed in the drain's latest ready snapshot"),
+        "{one}"
+    );
+    assert!(!one.contains("now: blocked"), "{one}");
+    assert!(!one.contains("note:"), "{one}");
+
+    let all = why_of(&bench, None);
+    assert!(
+        !all.contains("DEMO-2 [") && !all.contains("  DEMO-2 last"),
+        "{all}"
+    );
+    assert!(all.contains("  DEMO-1 [ready] last told "), "{all}");
+    assert!(
+        all.contains("1 ticket(s) with a told wait are left out"),
+        "{all}"
+    );
+
+    // A stale snapshot is used all the same, with a note.
+    let later = bench.clock.get() + std::time::Duration::from_secs(30 * 24 * 3600);
+    let stale = why_at(&bench, None, later);
+    assert!(
+        stale.contains("note: the drain last read the ready column at "),
+        "{stale}"
+    );
+    assert!(stale.contains("  DEMO-1 [ready] last told "), "{stale}");
+
+    fs::remove_file(ready::file(&bench.dirs())).unwrap();
+    let none = why_of(&bench, None);
+    assert!(!none.contains("no admitted ticket waits"), "{none}");
+    assert!(
+        none.contains("left out: they are not in flight and no ready snapshot reads"),
+        "{none}"
+    );
+    let gone = why_of(&bench, Some("DEMO-2"));
+    assert!(gone.contains("no ready snapshot reads"), "{gone}");
+    assert!(!gone.contains("now: blocked"), "{gone}");
+}
+
 /// Scenario S5's Build that waits on a file the one dispatched first holds
 /// (OWL-448): `status --waits` names DEMO-1, delivered and followed at
 /// Watch, as the holder and the zone, with the edge and the resource; the
-/// project, named and not served, has no capacity known.
+/// project, named and not served, has no capacity known. Once DEMO-1's pull
+/// request is merged, its ref no longer holds and it is no row (OWL-477):
+/// DEMO-2's wait names it as not in flight.
 #[test]
 fn a_build_waiting_on_a_zone_names_its_holder_and_the_zone() {
     let bench = parallel_bench("max_in_flight = 2\n");
@@ -204,6 +395,30 @@ fn a_build_waiting_on_a_zone_names_its_holder_and_the_zone() {
             "    DEMO-1 [watch]",
             "      DEMO-2 [build]: its Build waits: DEMO-1 holds zone `app/one.rs`, which its \
              Build would take (told ",
+        ],
+    );
+
+    let mut record = bench.record();
+    let mut delivery = record.delivery.take().expect("DEMO-1 delivered");
+    delivery.ended = Some(Ended {
+        why: EndedWhy::Merged,
+        at: bench.clock.get(),
+        head: None,
+    });
+    record.delivery = Some(delivery);
+    bench.write_record(&record);
+    let (built, text) = waits_of(&bench);
+    assert!(
+        shown(&built, "DEMO-2") && !shown(&built, "DEMO-1"),
+        "{text}"
+    );
+    assert!(!text.contains("DEMO-1 [watch]"), "{text}");
+    follow(
+        &text,
+        &[
+            "  Holders, and what waits behind each:",
+            "    DEMO-1, not in flight here",
+            "      DEMO-2 [build]: its Build waits: DEMO-1 holds zone ",
         ],
     );
 }

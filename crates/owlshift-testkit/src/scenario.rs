@@ -123,9 +123,11 @@ use owlshift_contracts::brief::{
 };
 use owlshift_contracts::config::{PersonalConfig, ProjectConfig, States, TrackerKind};
 use owlshift_contracts::format::Format;
-use owlshift_contracts::ids::{RelativePath, TicketId};
+use owlshift_contracts::ids::{QuestionId, RelativePath, TicketId};
 use owlshift_contracts::refs::{Ask, AskDecider, AskKind, KeptDecision, TicketQuestions};
-use owlshift_contracts::result::{Question, RunResult, Status as ResultStatus, Verdict};
+use owlshift_contracts::result::{
+    Question, Resolution, RunResult, Status as ResultStatus, Verdict,
+};
 use owlshift_contracts::review::Mandate;
 use owlshift_contracts::{Role, Stage};
 use owlshift_core::decider::{DeciderRule, brief_zones};
@@ -829,8 +831,8 @@ impl Driver {
         }
         self.last_run = Some(report);
         if let (Event::Questions, Some(result)) = (event, &result) {
-            let (questions, reopened) = left(&result.questions, &[], &asked);
-            if !self.post_round(result, questions, reopened, 0, None)? {
+            let (questions, reopened, labels) = left(&result.questions, &[], &asked, &[]);
+            if !self.post_round(result, (questions, labels), reopened, 0, None)? {
                 self.state = before;
                 return Ok(None);
             }
@@ -857,7 +859,7 @@ impl Driver {
     fn post_round(
         &mut self,
         result: &RunResult,
-        questions: Vec<Question>,
+        (questions, labels): (Vec<Question>, BTreeMap<QuestionId, String>),
         reopened: Vec<ReopenedChoice>,
         decided: usize,
         fallback: Option<Fallback>,
@@ -904,6 +906,7 @@ impl Driver {
             },
             verdicts: Vec::new(),
             result_refusal: None,
+            labels,
         });
         self.show_after(Event::Questions)?;
         Ok(true)
@@ -945,6 +948,7 @@ impl Driver {
             );
             self.has_ref |= self.questions.resolver_refusal.is_some();
         }
+        let mut resolved: &[Resolution] = &[];
         let (decided, fallback) = match resolver::outcome(&report.outcome) {
             Resolved::Quarantined => {
                 if let Some(reason) = self.apply(Event::Quarantined)? {
@@ -955,6 +959,7 @@ impl Driver {
             }
             Resolved::Fallback(fallback) => (Vec::new(), Some(fallback)),
             Resolved::Done(resolutions) => {
+                resolved = resolutions;
                 let mut decided = Vec::new();
                 // What a `ticket` basis may quote: the resolver's brief
                 // (OWL-337).
@@ -1001,14 +1006,20 @@ impl Driver {
                 (decided, None)
             }
         };
+        let (questions, reopened, labels) = left(&result.questions, &decided, &asked, resolved);
         self.last_run = Some(report);
-        let (questions, reopened) = left(&result.questions, &decided, &asked);
         if questions.is_empty() {
             return Ok(None);
         }
         let before = self.state;
         self.apply(Event::Questions)?;
-        if !self.post_round(&result, questions, reopened, decided.len(), fallback)? {
+        if !self.post_round(
+            &result,
+            (questions, labels),
+            reopened,
+            decided.len(),
+            fallback,
+        )? {
             self.state = before;
             return Ok(None);
         }
@@ -1098,6 +1109,7 @@ impl Driver {
                     decider,
                     verdicts: Vec::new(),
                     result_refusal: None,
+                    labels: BTreeMap::new(),
                 });
             }
             // A REPLY answers each counter-question; the ticket keeps
@@ -1683,17 +1695,25 @@ impl Driver {
 
 /// The questions a round asks of a run's: all but those `decided`,
 /// renumbered Q1..Qn, with the refused choices `asked` of the run they
-/// reopen, under the round's ids.
+/// reopen and the resolver's labels of those `resolutions` decided
+/// (OWL-482), under the round's ids.
 fn left(
     raised: &[Question],
-    decided: &[owlshift_contracts::ids::QuestionId],
+    decided: &[QuestionId],
     asked: &[ReopenedChoice],
-) -> (Vec<Question>, Vec<ReopenedChoice>) {
+    resolutions: &[Resolution],
+) -> (
+    Vec<Question>,
+    Vec<ReopenedChoice>,
+    BTreeMap<QuestionId, String>,
+) {
     let left = resolver::left_for_decider(raised, decided);
     let reopened = resolver::reopened_in(&left, asked);
+    let labels = resolver::round_labels(&left, resolutions);
     (
         left.into_iter().map(|(_, question)| question).collect(),
         reopened,
+        labels,
     )
 }
 

@@ -183,6 +183,7 @@ Follow and drive the drain from a browser.
 
 - The local API is the UI's listener on `127.0.0.1`, not a Unix socket or a named pipe: a browser cannot reach a socket, and P7 showed the CLI's gestures need nothing files cannot carry. The CLI keeps its files, and the UI writes the same ones.
 - Replying to a question and approving a plan, which the P11 app was to bring, come with P8: the app wraps the UI, so it gets them unchanged.
+- A parked ticket also restarts from the tracker, its decider replying `continue` on it (OWL-488, decided 2026-11-04): following through the tracker should not need a terminal for the one gesture a park asks for.
 - `retry` is dropped, restarting a parked ticket being one; `cancel` acts on a ticket, stopping its step checked and parking it. Releasing a claim waits for P10 with the claims.
 - The configuration screen edits the personal file only: a served project runs on its default branch's project file, which changes through a pull request.
 - The drain keeps what it read of the ready column (`ready.json`), so the UI shows the tickets not yet started, their order and their blockers without calling the tracker.

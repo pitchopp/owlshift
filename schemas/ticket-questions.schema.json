@@ -52,7 +52,7 @@
     "format": {
       "description": "The format version of this document.",
       "type": "integer",
-      "const": 17
+      "const": 18
     },
     "resolver_refusal": {
       "description": "Why the runner refused the latest resolver result (format 7,\nOWL-191): what the next resolver run is told, whatever command runs\nit. Its questions went to the decider in a fallback round; it is kept\nfor the case where that round's post or keeping failed, and a later\ncommand's Build asks them again. A later refusal replaces it; an\naccepted resolver result, or any round kept, clears it; at most\n[`MAX_RESULT_REFUSAL_BYTES`].",
@@ -113,6 +113,16 @@
         },
         "kind": {
           "$ref": "#/$defs/AskKind"
+        },
+        "labels": {
+          "description": "The resolver's own label for each question of a `questions` ask it\ndecided but the runner sent to the decider, under its id in the\nround (format 18, OWL-482): the asking run's category is not the only\none merge on green reads, so a question the resolver labelled\n`security` holds the merge whatever the answer. Empty on a re-ask and\non an ask kept before.",
+          "type": "object",
+          "additionalProperties": false,
+          "patternProperties": {
+            "^Q[1-9][0-9]*$": {
+              "type": "string"
+            }
+          }
         },
         "questions": {
           "description": "The questions, under their ids in the round.",

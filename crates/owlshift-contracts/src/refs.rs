@@ -11,6 +11,7 @@
 //! artifacts. Since OWL-122 the runner keeps the ticket ref in its dedicated
 //! checkout only; pushing it to the remote comes with claims (P7).
 
+use std::collections::BTreeMap;
 use std::num::NonZeroU32;
 
 use jiff::Timestamp;
@@ -29,7 +30,7 @@ use crate::format::{
     self, CLAIM_FORMAT, COST_FORMAT, ContractError, DELIVERY_FORMAT, Format, HELD_FORMAT,
     QUESTIONS_FORMAT, SESSION_FORMAT, TICKET_STATE_FORMAT,
 };
-use crate::ids::{SessionId, TicketId, check_name, is_commit_id, is_lower_hex};
+use crate::ids::{QuestionId, SessionId, TicketId, check_name, is_commit_id, is_lower_hex};
 use crate::result::{
     self, DECISIONS_ADVICE, Decision, Followup, Question, RefusedChoice, Verdict, check_verdicts,
 };
@@ -1352,6 +1353,14 @@ pub struct Ask {
     /// kept check clears it; at most [`MAX_RESULT_REFUSAL_BYTES`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub result_refusal: Option<String>,
+    /// The resolver's own label for each question of a `questions` ask it
+    /// decided but the runner sent to the decider, under its id in the
+    /// round (format 18, OWL-482): the asking run's category is not the only
+    /// one merge on green reads, so a question the resolver labelled
+    /// `security` holds the merge whatever the answer. Empty on a re-ask and
+    /// on an ask kept before.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub labels: BTreeMap<QuestionId, String>,
 }
 
 /// The decider of an ask.
@@ -1442,7 +1451,7 @@ impl TicketQuestions {
         Ok(questions)
     }
 
-    /// A format-2 to 16 document read as the current format, or `None` for
+    /// A format-2 to 17 document read as the current format, or `None` for
     /// any other. Each older format up to 7 is a strict subset of the next,
     /// so a field a later format added is refused in it, whatever its
     /// value; format 8 reshaped Build's refusal, which formats 6 and 7 keep
@@ -1453,11 +1462,12 @@ impl TicketQuestions {
     /// format 14 its asking role, format 15 its number and the decisions
     /// document, format 16 the runner's `recommendation` basis kind
     /// (OWL-375); format 17 drops the asking role, which formats 14 to 16
-    /// are read without (OWL-379).
+    /// are read without (OWL-379); format 18 adds an ask's resolver labels
+    /// (OWL-482).
     fn from_older_format(input: &str) -> Option<Result<Self, ContractError>> {
         let mut document: serde_json::Value = serde_json::from_str(input).ok()?;
         let format = document.get("format").and_then(serde_json::Value::as_u64)?;
-        if !(2..=16).contains(&format) {
+        if !(2..=17).contains(&format) {
             return None;
         }
         let kinded = format <= 12
@@ -1507,7 +1517,9 @@ impl TicketQuestions {
                 .as_array()
                 .is_some_and(|asks| asks.iter().any(|ask| ask.get(field).is_some()))
         };
-        let refused = if replan {
+        let refused = if in_an_ask("labels") {
+            Some("resolver label")
+        } else if replan {
             Some("replan")
         } else if format == 2 && in_an_ask("verdicts") {
             Some("verdicts")
@@ -1605,7 +1617,9 @@ impl TicketQuestions {
 
     /// Checks the rules the types alone do not carry: each ask names its
     /// comment and its decider's account, its verdicts keep the rules of
-    /// `result.json`'s and name questions of that ask, and the asks follow a
+    /// `result.json`'s and name questions of that ask, as its resolver
+    /// labels do, which only a `questions` ask keeps, none blank, and the
+    /// asks follow a
     /// brief thread's rules (rounds increase, a round's questions are
     /// Q1..Qn, a re-ask names questions of an earlier round, in order), and a
     /// kept refusal is not blank and at most [`MAX_RESULT_REFUSAL_BYTES`];
@@ -1742,6 +1756,28 @@ impl TicketQuestions {
                         "an ask of round {} keeps a verdict for {}, which it did not ask",
                         ask.round, verdict.question
                     ),
+                ));
+            }
+            let flaw = if !ask.labels.is_empty() && ask.kind != AskKind::Questions {
+                Some("keeps resolver labels on a re-ask".to_owned())
+            } else if let Some(id) = ask
+                .labels
+                .keys()
+                .find(|id| !ask.questions.iter().any(|q| q.id == **id))
+            {
+                Some(format!(
+                    "keeps a resolver label for {id}, which it did not ask"
+                ))
+            } else {
+                ask.labels
+                    .iter()
+                    .find(|(_, label)| label.trim().is_empty())
+                    .map(|(id, _)| format!("keeps a blank resolver label for {id}"))
+            };
+            if let Some(flaw) = flaw {
+                return Err(ContractError::invalid(
+                    Self::CONTRACT,
+                    format!("an ask of round {} {flaw}", ask.round),
                 ));
             }
         }

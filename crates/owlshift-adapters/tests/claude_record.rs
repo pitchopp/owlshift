@@ -14,7 +14,8 @@
 //! status, standard error and what the contract test will rely on. Then it
 //! is scrubbed by [`Scrub`]: ids, timestamps, thinking signatures, local
 //! paths and the user's skills, plugins, agents, commands and memory paths
-//! go. `usage_limit.jsonl` is constructed by hand, not recorded (C7).
+//! go. `usage_limit.jsonl` is not recorded here: a limit cannot be reached
+//! on demand, so it was captured once at a real one (OWL-40).
 //!
 //! The `claude` run is the first on the `PATH`. To record with a release
 //! other than the installed one, put a folder holding a `claude` link to

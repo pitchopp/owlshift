@@ -366,6 +366,9 @@ pub fn end(stepped: &Stepped) -> StepEnd {
         | Stop::CheckFailed { .. }
         | Stop::Parked { .. }
         | Stop::Ready { .. }
+        // Its ticket ref as it was, watch tries it again after its retry
+        // delay (OWL-480).
+        | Stop::MachineCut { .. }
         | Stop::Delivery(_)
         | Stop::Watched { .. }
         | Stop::ToWatch { .. } => StepEnd::Other,

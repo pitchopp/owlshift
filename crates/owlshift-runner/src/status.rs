@@ -16,6 +16,10 @@
 //! ([`ProjectDirs::ticket_holders`]) whose holder holds no slot, such as a
 //! `do` or a `continue` a person typed in a terminal.
 //!
+//! Since OWL-464 each served project lists its green pull requests that
+//! wait for a person to merge them ([`merge_waits`]), from watch's
+//! `merge_waits` and final `merge_refused` events and the ticket refs.
+//!
 //! [`gather`] does the reading; [`watch_state`] and [`render`] are pure.
 //! `owlshift status --waits`, what each ticket in flight waits on, is
 //! [`waits`] (OWL-459).
@@ -31,8 +35,8 @@ use owlshift_contracts::ids::TicketId;
 use owlshift_contracts::service::{
     BY_DAEMON, DaemonRecord, DigestRecord, Request, ServedConfig, ServedProject,
 };
-use owlshift_core::state::Status;
-use owlshift_core::vocab::Harness;
+use owlshift_core::state::{Status, TicketState};
+use owlshift_core::vocab::{Harness, Stage};
 use serde_json::Value;
 
 use crate::daemon::digest::{self, HarnessUsage};
@@ -41,7 +45,7 @@ use crate::events::{EventLog, printable};
 use crate::project::{ProjectDirs, TicketHolder};
 use crate::served::{self, Registry};
 use crate::slots::{HeldSlot, MachineSlots};
-use crate::{watch, why};
+use crate::{ticket_ref, watch, why};
 
 pub mod waits;
 
@@ -51,6 +55,12 @@ pub struct Report {
     pub daemon: Daemon,
     /// The daemon's stop request, while it stands: the daemon drains.
     pub stop_asked: Option<Request>,
+    /// The upgrade's drain request, while it stands: the daemon exits once
+    /// its steps under way finish (OWL-481).
+    pub drain_asked: Option<Request>,
+    /// While a running daemon drains, for a stop or an upgrade, the steps it
+    /// waits on, one per held run slot (OWL-481).
+    pub drain_steps: Vec<DrainStep>,
     /// The pause of every project, while it stands; `None` within for a
     /// file that does not read.
     pub machine_pause: Option<Option<Request>>,
@@ -67,6 +77,18 @@ pub struct Report {
     pub digest: Option<DigestRecord>,
     /// What could not be read.
     pub notes: Vec<String>,
+}
+
+/// A step a draining daemon waits on (OWL-481): a held run slot's holder,
+/// with the step's latest run as the event log tells it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DrainStep {
+    pub project: String,
+    pub ticket: TicketId,
+    /// The role and start of the step's latest `run_started` event since the
+    /// slot was taken, `None` while it has none. A review loop starts runs
+    /// inside one step, so this is not the slot's `since`.
+    pub run: Option<(String, Timestamp)>,
 }
 
 /// A step a command typed in a terminal runs (OWL-478): its ticket's lock
@@ -111,6 +133,94 @@ pub struct Project {
     /// The tickets whose questions wait for a person, and the parked ones.
     pub waiting: Vec<TicketId>,
     pub parked: Vec<TicketId>,
+    /// Its green pull requests that wait for a person to merge them
+    /// (OWL-464), by [`merge_waits`].
+    pub merges_waiting: Vec<MergeWait>,
+}
+
+/// A green pull request merge on green leaves for a person (OWL-464;
+/// architecture section 5, "Merge on green", "Kept for a person").
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MergeWait {
+    pub ticket: TicketId,
+    pub pull_request: u64,
+    /// Why, in a person's words: the hold's, or GitHub's own reason for a
+    /// refusal that will not pass.
+    pub reason: String,
+    /// GitHub refused the merge for good (`merge_refused`).
+    pub refused: bool,
+}
+
+/// The green pull requests of `project` that wait for a person (OWL-464):
+/// for each ticket, the latest `merge_waits` or final `merge_refused`
+/// decision of the events, oldest first, kept while `pushed_of`, the head
+/// of Owlshift's last push its ticket ref keeps at Watch with its pull
+/// request followed, is that event's head. `pushed_of` is asked only for a
+/// ticket with such an event.
+pub fn merge_waits(
+    events: &[Event],
+    project: &str,
+    mut pushed_of: impl FnMut(&TicketId) -> Option<String>,
+) -> Vec<MergeWait> {
+    let mut latest: Vec<&Event> = Vec::new();
+    for event in events {
+        let watch = event.data.get("watch").and_then(Value::as_str);
+        let told = match watch {
+            Some("merge_waits") => true,
+            Some("merge_refused") => event.data.get("final").and_then(Value::as_bool) == Some(true),
+            _ => false,
+        };
+        if event.kind != EventKind::Decision
+            || !told
+            || !event.project.eq_ignore_ascii_case(project)
+            || event.ticket.is_none()
+        {
+            continue;
+        }
+        latest.retain(|kept| kept.ticket != event.ticket);
+        latest.push(event);
+    }
+    latest
+        .into_iter()
+        .filter_map(|event| {
+            let ticket = event.ticket.clone()?;
+            let head = event.data.get("head").and_then(Value::as_str)?;
+            if pushed_of(&ticket).as_deref() != Some(head) {
+                return None;
+            }
+            Some(MergeWait {
+                ticket,
+                pull_request: event.data.get("pull_request").and_then(Value::as_u64)?,
+                reason: event
+                    .data
+                    .get("reason")
+                    .and_then(Value::as_str)
+                    .unwrap_or("no reason was recorded")
+                    .to_owned(),
+                refused: event.data.get("watch").and_then(Value::as_str) == Some("merge_refused"),
+            })
+        })
+        .collect()
+}
+
+/// The head of Owlshift's last push to `ticket`'s pull request, while its
+/// ref keeps it at Watch with that pull request followed; `None` otherwise,
+/// a ref that cannot be read said in `notes`.
+fn followed_head(dirs: &ProjectDirs, ticket: &TicketId, notes: &mut Vec<String>) -> Option<String> {
+    let stored = match ticket_ref::read(&crate::project::runner_git(), &dirs.checkout(), ticket) {
+        Ok(stored) => stored?,
+        Err(why) => {
+            notes.push(format!("the ref of {ticket} cannot be read: {why}"));
+            return None;
+        }
+    };
+    let at_watch = TicketState::try_from(&stored.record.state)
+        .is_ok_and(|state| state.status() == Status::Active(Stage::Watch));
+    stored
+        .record
+        .delivery
+        .filter(|delivery| at_watch && delivery.followed())
+        .and_then(|delivery| delivery.pushed)
 }
 
 /// A served project's watch, as the daemon's events tell it.
@@ -262,6 +372,9 @@ pub fn gather(data: &Path, concurrent_runs: u32, caps: &[(Harness, u8)], now: Ti
                 Status::Active(_) => {}
             }
         }
+        let merges_waiting = merge_waits(&events, &entry.repository, |ticket| {
+            followed_head(&dirs, ticket, &mut notes)
+        });
         projects.push(Project {
             repository: entry.repository,
             checkout: entry.checkout,
@@ -272,6 +385,7 @@ pub fn gather(data: &Path, concurrent_runs: u32, caps: &[(Harness, u8)], now: Ti
             quarantine: quarantine_line(&dirs),
             waiting,
             parked,
+            merges_waiting,
         });
     }
     let slots = match MachineSlots::new(data, concurrent_runs).holders() {
@@ -297,9 +411,19 @@ pub fn gather(data: &Path, concurrent_runs: u32, caps: &[(Harness, u8)], now: Ti
             None
         }
     };
+    let stop_asked = requests::stop_asked(data);
+    let drain_asked = requests::drain_asked(data);
+    let drain_steps = match (&daemon, &slots) {
+        (Daemon::Running(_), Some((held, _))) if stop_asked.is_some() || drain_asked.is_some() => {
+            drain_steps(held, &events)
+        }
+        _ => Vec::new(),
+    };
     Report {
         daemon,
-        stop_asked: requests::stop_asked(data),
+        stop_asked,
+        drain_asked,
+        drain_steps,
         machine_pause: requests::machine_pause(data),
         projects,
         slots,
@@ -308,6 +432,35 @@ pub fn gather(data: &Path, concurrent_runs: u32, caps: &[(Harness, u8)], now: Ti
         digest,
         notes,
     }
+}
+
+/// The steps a draining daemon waits on: the holders of the slots `held`,
+/// each with the role and time of the latest `run_started` event of its
+/// ticket at or after the slot was taken.
+fn drain_steps(held: &[HeldSlot], events: &[Event]) -> Vec<DrainStep> {
+    held.iter()
+        .filter_map(|slot| slot.holder.as_ref())
+        .map(|holder| {
+            let run = events
+                .iter()
+                .rev()
+                .find(|event| {
+                    event.kind == EventKind::RunStarted
+                        && event.at >= holder.since
+                        && event.ticket.as_ref() == Some(&holder.ticket)
+                        && event.project.eq_ignore_ascii_case(&holder.project)
+                })
+                .map(|event| {
+                    let role = event.data.get("role").and_then(Value::as_str);
+                    (role.unwrap_or("unknown").to_owned(), event.at)
+                });
+            DrainStep {
+                project: holder.project.clone(),
+                ticket: holder.ticket.clone(),
+                run,
+            }
+        })
+        .collect()
 }
 
 /// The first line of the quarantine of the project at `dirs`, while one
@@ -434,6 +587,27 @@ pub fn render(report: &Report, tz: &TimeZone) -> String {
             asked(Some(request), tz)
         ));
     }
+    if let Some(request) = &report.drain_asked {
+        line(format!(
+            "  Draining for an upgrade, asked {}: the daemon exits once its steps under way \
+             finish.",
+            asked(Some(request), tz)
+        ));
+    }
+    for step in &report.drain_steps {
+        line(match &step.run {
+            Some((role, at)) => format!(
+                "  waits on {} {}: role {role}, run started {}",
+                step.project,
+                step.ticket,
+                time(*at, tz)
+            ),
+            None => format!(
+                "  waits on {} {}: no run started yet",
+                step.project, step.ticket
+            ),
+        });
+    }
     if let Some(request) = &report.machine_pause {
         line(format!(
             "Paused: every project of this machine, {}. Nothing is dispatched and no step \
@@ -531,6 +705,20 @@ pub fn render(report: &Report, tz: &TimeZone) -> String {
         }
         if !project.parked.is_empty() {
             line(format!("  parked: {}", tickets(&project.parked)));
+        }
+        if !project.merges_waiting.is_empty() {
+            line("  green, waiting for a person to merge:".to_owned());
+        }
+        for wait in &project.merges_waiting {
+            let why = if wait.refused {
+                format!("GitHub refused to merge it: {}", wait.reason)
+            } else {
+                wait.reason.clone()
+            };
+            line(format!(
+                "    {}: pull request #{}, {why}",
+                wait.ticket, wait.pull_request
+            ));
         }
     }
     match &report.slots {
@@ -799,9 +987,186 @@ mod tests {
         );
     }
 
+    /// OWL-481: a draining daemon, for a stop or an upgrade, says so and
+    /// names each step it waits on with its latest run's role and start,
+    /// which is not the slot's `since`: a review loop starts runs inside one
+    /// step.
+    #[test]
+    fn a_draining_daemon_names_the_steps_it_waits_on() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path();
+        let since: Timestamp = "2026-10-30T18:00:00Z".parse().unwrap();
+        let _daemon = daemon::instance::take(data_dir, &record(since))
+            .unwrap()
+            .unwrap();
+        let (one, two) = (
+            TicketId::new("OWL-5").unwrap(),
+            TicketId::new("OWL-6").unwrap(),
+        );
+        let take = |ticket: &TicketId, at: &str| crate::slots::Holder {
+            project: "acme/web".to_owned(),
+            ticket: ticket.clone(),
+            pid: std::process::id(),
+            since: at.parse().unwrap(),
+        };
+        let slots = MachineSlots::new(data_dir, 3);
+        let _first = slots
+            .take(&take(&one, "2026-10-30T18:10:00Z"))
+            .unwrap()
+            .unwrap();
+        let _second = slots
+            .take(&take(&two, "2026-10-30T18:11:00Z"))
+            .unwrap()
+            .unwrap();
+        let log = EventLog::in_dir(data_dir);
+        for (at, ticket, role) in [
+            ("2026-10-30T18:10:30Z", "OWL-5", "build"),
+            ("2026-10-30T18:40:00Z", "OWL-5", "design_review"),
+            ("2026-10-30T18:12:00Z", "OWL-7", "build"),
+        ] {
+            let mut started = Event {
+                format: Format,
+                at: at.parse().unwrap(),
+                project: "Acme/Web".to_owned(),
+                ticket: Some(TicketId::new(ticket).unwrap()),
+                run: Some("r1".to_owned()),
+                kind: EventKind::RunStarted,
+                data: data([("role", json!(role))]),
+            };
+            started.run = Some(format!("run-{at}"));
+            log.append(&started).unwrap();
+        }
+        let text = |report: &Report| render(report, &TimeZone::UTC);
+
+        let quiet = gather(data_dir, 3, &[], Timestamp::now());
+        assert!(quiet.drain_steps.is_empty());
+        assert!(!text(&quiet).contains("waits on"));
+
+        let request = |by: &str| Request {
+            by: by.to_owned(),
+            at: "2026-10-30T19:00:00Z".parse().unwrap(),
+            why: "an upgrade".to_owned(),
+            pid: None,
+        };
+        requests::ask_drain(data_dir, &request("upgrade")).unwrap();
+        let report = gather(data_dir, 3, &[], Timestamp::now());
+        let out = text(&report);
+        let has = |part: &str| assert!(out.contains(part), "{part:?} missing in\n{out}");
+        has(
+            "  Draining for an upgrade, asked by upgrade at 2026-10-30 19:00: an upgrade: the daemon exits once its steps under way finish.",
+        );
+        has("  waits on acme/web OWL-5: role design_review, run started 2026-10-30 18:40");
+        has("  waits on acme/web OWL-6: no run started yet");
+        assert!(!out.contains("OWL-7"), "{out}");
+        assert!(!out.contains("Stopping"), "{out}");
+
+        requests::remove_drain_request(data_dir).unwrap();
+        requests::ask_stop(data_dir, &request("stop")).unwrap();
+        let out = text(&gather(data_dir, 3, &[], Timestamp::now()));
+        assert!(out.contains("  Stopping, asked by stop at"), "{out}");
+        assert!(
+            out.contains("waits on acme/web OWL-5: role design_review"),
+            "{out}"
+        );
+        assert!(!out.contains("Draining for an upgrade"), "{out}");
+    }
+
     /// A watch the daemon paused for a refusal no restart mends is never
     /// read as running, nor any watch of a daemon that does not run, nor an
     /// event of an earlier daemon.
+    /// OWL-464: a project lists each ticket whose latest `merge_waits` or
+    /// final `merge_refused` event is at the head its ref still follows,
+    /// with the reason, and reads the ref only of a ticket with such an
+    /// event.
+    #[test]
+    fn status_lists_the_green_pull_requests_that_wait_for_a_person() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path();
+        let emit = |repo: &str, ticket: &str, pairs: Vec<(&str, Value)>| {
+            let mut details = data([]);
+            for (key, value) in pairs {
+                details.insert(key.to_owned(), value);
+            }
+            let ticket = TicketId::new(ticket).unwrap();
+            EventSink::new(repo, EventLog::in_dir(data_dir), &mut io::sink()).emit(
+                &ticket,
+                None,
+                EventKind::Decision,
+                details,
+            );
+        };
+        let waits = |head: &str, reason: &str| {
+            vec![
+                ("watch", json!("merge_waits")),
+                ("pull_request", json!(3)),
+                ("head", json!(head)),
+                ("reason", json!(reason)),
+            ]
+        };
+        let refused = |head: &str, final_: bool| {
+            vec![
+                ("watch", json!("merge_refused")),
+                ("pull_request", json!(4)),
+                ("head", json!(head)),
+                ("final", json!(final_)),
+                ("reason", json!("Merge method squash is not allowed")),
+            ]
+        };
+        emit("acme/web", "OWL-1", waits("a", "first hold"));
+        emit("acme/web", "OWL-1", waits("b", "the label is missing"));
+        emit("acme/web", "OWL-2", refused("c", true));
+        emit("acme/web", "OWL-3", refused("d", false));
+        emit("acme/web", "OWL-4", waits("e", "no longer followed"));
+        emit("acme/api", "OWL-5", waits("f", "another project's"));
+        let (events, _) = why::read_events(EventLog::in_dir(data_dir).path()).unwrap();
+        let mut asked = Vec::new();
+        let listed = merge_waits(&events, "ACME/web", |ticket| {
+            asked.push(ticket.to_string());
+            match ticket.as_str() {
+                "OWL-1" => Some("b".to_owned()),
+                "OWL-2" => Some("c".to_owned()),
+                _ => None,
+            }
+        });
+        assert_eq!(asked, ["OWL-1", "OWL-2", "OWL-4"]);
+        let wait = |ticket: &str, pull_request, reason: &str, refused| MergeWait {
+            ticket: TicketId::new(ticket).unwrap(),
+            pull_request,
+            reason: reason.to_owned(),
+            refused,
+        };
+        assert_eq!(
+            listed,
+            [
+                wait("OWL-1", 3, "the label is missing", false),
+                wait("OWL-2", 4, "Merge method squash is not allowed", true),
+            ]
+        );
+
+        // The text, under its project.
+        let served = ServedProjects {
+            format: Format,
+            projects: vec![ServedProject {
+                repository: "acme/web".to_owned(),
+                checkout: "/home/ada/acme/web".to_owned(),
+            }],
+        };
+        crate::step::write_atomically(&Registry::in_data_dir(data_dir).file(), &served.render())
+            .unwrap();
+        let mut report = gather(data_dir, 1, &[], Timestamp::now());
+        assert!(report.projects[0].merges_waiting.is_empty());
+        report.projects[0].merges_waiting = listed;
+        let text = render(&report, &TimeZone::UTC);
+        assert!(
+            text.contains(
+                "  green, waiting for a person to merge:\n    OWL-1: pull request #3, the label is \
+                 missing\n    OWL-2: pull request #4, GitHub refused to merge it: Merge method \
+                 squash is not allowed\n"
+            ),
+            "{text}"
+        );
+    }
+
     #[test]
     fn a_watch_is_read_from_the_daemons_events_since_it_started() {
         let tmp = tempfile::tempdir().unwrap();
