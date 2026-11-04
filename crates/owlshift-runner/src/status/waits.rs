@@ -186,25 +186,7 @@ fn project(
             ));
         }
     }
-    let ready = match ready::read(&dirs) {
-        Ok(Some(snapshot)) => {
-            if ready::stale(&snapshot, now) {
-                notes.push(format!(
-                    "{repository}: the drain last read the ready column at {}, more than two \
-                     passes ago: its waits are as it told them then",
-                    snapshot.at
-                ));
-            }
-            Some(snapshot.tickets.into_iter().map(|t| t.ticket).collect())
-        }
-        Ok(None) => None,
-        Err(why) => {
-            notes.push(format!(
-                "{repository}: its ready snapshot cannot be read: {why}"
-            ));
-            None
-        }
-    };
+    let ready = ready::listed(&dirs, now, &format!("{repository}: "), notes);
     let mut folded = why::fold(events, &repository);
     let quarantined = match dirs.quarantine() {
         Ok(marker) => marker.is_some(),

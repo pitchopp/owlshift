@@ -16,7 +16,7 @@
 //! began and never ended may have died, and a slot is held through its
 //! step's gate, when no run is open.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt::Write as _;
 use std::fs;
 use std::io;
@@ -319,6 +319,28 @@ pub enum Limit {
     Unread(String),
 }
 
+impl Left {
+    /// Why a ticket's told wait is not shown, as `why` says it.
+    fn reason(&self, plural: bool) -> String {
+        let (it, is, them) = if plural {
+            ("they", "are", "them")
+        } else {
+            ("it", "is", "it")
+        };
+        if self.no_snapshot {
+            format!(
+                "{it} {is} not in flight and no ready snapshot reads, so the drain may no \
+                 longer read {them} (the drain writes `ready.json` at its next pass)"
+            )
+        } else {
+            format!(
+                "{it} {is} neither in flight nor listed in the drain's latest ready snapshot, \
+                 so the drain no longer reads {them}"
+            )
+        }
+    }
+}
+
 /// Everything `why` reads, ready to be shown.
 #[derive(Clone, Debug)]
 pub struct Report {
@@ -341,6 +363,20 @@ pub struct Report {
     /// The overlaps the refs that hold keep (OWL-449): the ticket that
     /// recorded it, the sibling, the shared paths and since when.
     pub overlaps: Vec<Overlap>,
+    /// The waits the events still tell that are not shown as current: their
+    /// ticket is neither in flight nor listed by the drain (OWL-484).
+    pub left_out: Left,
+}
+
+/// The tickets whose latest told wait is left out of `folded.current`
+/// because the drain no longer reads them (OWL-484; the rule of
+/// `owlshift status --waits`, OWL-477).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Left {
+    pub tickets: BTreeSet<TicketId>,
+    /// Whether no ready snapshot reads, so a ticket out of flight cannot be
+    /// told from one the drain still lists.
+    pub no_snapshot: bool,
 }
 
 /// An overlap a ticket ref keeps (OWL-449), as `why` shows it.
@@ -384,6 +420,7 @@ pub fn gather(
     only: Option<TicketId>,
     concurrent_runs: u32,
     caps: &[(Harness, u8)],
+    now: Timestamp,
 ) -> io::Result<Report> {
     let (events, bad) = read_events(crate::events::EventLog::in_dir(data_dir).path())?;
     let mut notes = bad;
@@ -404,11 +441,40 @@ pub fn gather(
     if !quarantined {
         folded.current.retain(|_, wait| wait.reason != "quarantine");
     }
-    let limits = limits(data_dir, caps, Timestamp::now());
+    let limits = limits(data_dir, caps, now);
     let slots = MachineSlots::new(data_dir, concurrent_runs)
         .holders()
         .ok()
         .map(|held| (held, concurrent_runs));
+    // A wait is current only while the drain reads its ticket: it is in
+    // flight, holds a run slot, or the latest ready snapshot lists it
+    // (OWL-484, as `status --waits`, OWL-477).
+    let in_flight = in_flight(dirs);
+    let listed = crate::ready::listed(dirs, now, "", &mut notes);
+    let running = |ticket: &TicketId| {
+        slots.iter().flat_map(|(held, _)| held).any(|slot| {
+            slot.holder
+                .as_ref()
+                .is_some_and(|h| h.project.eq_ignore_ascii_case(project) && &h.ticket == ticket)
+        })
+    };
+    let mut left_out = Left {
+        tickets: BTreeSet::new(),
+        no_snapshot: listed.is_none(),
+    };
+    folded.current.retain(|ticket, _| {
+        let read = in_flight
+            .as_ref()
+            .is_none_or(|holding| holding.contains(ticket))
+            || running(ticket)
+            || listed
+                .as_ref()
+                .is_some_and(|listed| listed.contains(ticket));
+        if !read {
+            left_out.tickets.insert(ticket.clone());
+        }
+        read
+    });
     let bases = match base::read(dirs) {
         Ok(checks) => checks.standing().cloned().collect(),
         Err(why) => {
@@ -432,7 +498,31 @@ pub fn gather(
         slots,
         bases,
         overlaps,
+        left_out,
     })
+}
+
+/// The tickets whose ref holds (`held::holds`, a ref that cannot be read
+/// holding), in the project of `dirs`; none while its checkout does not
+/// exist. `None` when the refs cannot be listed, which [`statuses`] says:
+/// nothing is then known not to be in flight.
+fn in_flight(dirs: &ProjectDirs) -> Option<BTreeSet<TicketId>> {
+    let mut holding = BTreeSet::new();
+    if !dirs.checkout().exists() {
+        return Some(holding);
+    }
+    match ticket_ref::all(&crate::project::runner_git(), &dirs.checkout()) {
+        Ok(all) => {
+            for (ticket, stored) in all {
+                // A ref that does not read is reported by `statuses`.
+                if stored.as_ref().map_or(true, crate::held::holds) {
+                    holding.insert(ticket);
+                }
+            }
+        }
+        Err(_) => return None,
+    }
+    Some(holding)
 }
 
 /// Each ticket ref's status in the project of `dirs`, admitted or not; none
@@ -565,6 +655,13 @@ pub fn render(report: &Report) -> String {
                 Some(wait) => {
                     let _ = writeln!(out, "now: {}", phrase(wait));
                 }
+                None if report.left_out.tickets.contains(ticket) => {
+                    let _ = writeln!(
+                        out,
+                        "now: not shown as waiting: {}; the waits above are history",
+                        report.left_out.reason(false)
+                    );
+                }
                 None if !history.is_empty() => {
                     let _ = writeln!(out, "now: not waiting (it was dispatched or ran since)");
                 }
@@ -573,7 +670,7 @@ pub fn render(report: &Report) -> String {
         }
         None => {
             let _ = writeln!(out, "{}", report.project);
-            if folded.current.is_empty() {
+            if folded.current.is_empty() && report.left_out.tickets.is_empty() {
                 let _ = writeln!(out, "  no admitted ticket waits");
             }
             for (ticket, wait) in &folded.current {
@@ -583,6 +680,14 @@ pub fn render(report: &Report) -> String {
                     stage(ticket),
                     wait.at,
                     phrase(wait)
+                );
+            }
+            if !report.left_out.tickets.is_empty() {
+                let _ = writeln!(
+                    out,
+                    "  {} ticket(s) with a told wait are left out: {}",
+                    report.left_out.tickets.len(),
+                    report.left_out.reason(report.left_out.tickets.len() > 1)
                 );
             }
             // A ticket that waits for a person keeps what it holds
@@ -602,7 +707,8 @@ pub fn render(report: &Report) -> String {
                 let _ = writeln!(
                     out,
                     "  (reasons are read from the events: the latest one told, until the \
-                     ticket is dispatched or runs)"
+                     ticket is dispatched or runs, while it is in flight, holds a run slot or the \
+                     drain's latest ready snapshot lists it)"
                 );
             }
         }
@@ -971,7 +1077,7 @@ mod tests {
             tmp.path(),
             &owlshift_adapters::forge::Repo::parse("o/r").unwrap(),
         );
-        let report = gather(tmp.path(), &dirs, "o/r", None, 3, &[]).unwrap();
+        let report = gather(tmp.path(), &dirs, "o/r", None, 3, &[], Timestamp::now()).unwrap();
         assert_eq!(report.slots, Some((vec![], 3)));
         let text = render(&report);
         assert!(text.contains("machine slots: 0 of 3 in use"), "{text}");
@@ -1126,6 +1232,7 @@ mod tests {
         let report = Report {
             project: "o/r".to_owned(),
             only: Some(id.clone()),
+            left_out: Left::default(),
             folded,
             stages: HashMap::new(),
             quarantined: false,
@@ -1164,6 +1271,7 @@ mod tests {
             }],
             project: "o/r".to_owned(),
             only: None,
+            left_out: Left::default(),
             folded: Folded::default(),
             stages: HashMap::from([(id("OWL-4"), "verify, parked".to_owned())]),
             quarantined: true,

@@ -242,6 +242,109 @@ fn a_ready_ticket_that_left_the_column_is_not_shown() {
     );
 }
 
+/// What `owlshift why [ticket]` prints of the bench at its clock.
+fn why_of(bench: &Bench, ticket: Option<&str>) -> String {
+    why_at(bench, ticket, bench.clock.get())
+}
+
+/// The same at the time `now`.
+fn why_at(bench: &Bench, ticket: Option<&str>, now: Timestamp) -> String {
+    let report = why::gather(
+        &bench.data,
+        &bench.dirs(),
+        REPO,
+        ticket.map(|t| TicketId::new(t).unwrap()),
+        2,
+        &[],
+        now,
+    )
+    .unwrap();
+    why::render(&report)
+}
+
+/// OWL-484: the same ticket as OWL-477's, DEMO-2, told it waits behind
+/// DEMO-1, then done outside Owlshift. While the drain lists it, `why` says
+/// its wait is current; once a pass wrote a snapshot without it, `why
+/// DEMO-2` keeps the wait as history but says it is not shown as waiting,
+/// and `why` alone leaves it out with a count while DEMO-1 keeps its own
+/// wait. With the snapshot gone, the ticket out of flight is left out as
+/// well, said otherwise.
+#[test]
+fn why_does_not_repeat_the_wait_of_a_ticket_the_drain_no_longer_reads() {
+    let bench = parallel_bench("max_in_flight = 1\n");
+    bench.put_ticket(
+        "DEMO-2",
+        "maintainer",
+        "Todo",
+        &["agent"],
+        "blocked_by = [\"DEMO-1\"]\n",
+        "Document it.",
+    );
+    let replies: Vec<Reply> = ["app", "docs"]
+        .iter()
+        .map(|zone| bench.reply(None, Some(&standard_declaring(&[zone]))))
+        .collect();
+    let told = RefCell::new(None);
+    bench.drain_passes(replies, 4, |pass, _| {
+        if pass == 3 {
+            told.replace(Some(why_of(&bench, Some("DEMO-2"))));
+            bench.put_ticket(
+                "DEMO-2",
+                "maintainer",
+                "Done",
+                &["agent"],
+                "blocked_by = [\"DEMO-1\"]\n",
+                "Document it.",
+            );
+        }
+    });
+    let before = told.into_inner().expect("read after the intakes");
+    assert!(before.contains("now: blocked by DEMO-1"), "{before}");
+
+    let one = why_of(&bench, Some("DEMO-2"));
+    assert!(
+        one.contains(" waits: blocked by DEMO-1"),
+        "history kept: {one}"
+    );
+    assert!(
+        one.contains("now: not shown as waiting: it is neither in flight nor listed in the drain's latest ready snapshot"),
+        "{one}"
+    );
+    assert!(!one.contains("now: blocked"), "{one}");
+    assert!(!one.contains("note:"), "{one}");
+
+    let all = why_of(&bench, None);
+    assert!(
+        !all.contains("DEMO-2 [") && !all.contains("  DEMO-2 last"),
+        "{all}"
+    );
+    assert!(all.contains("  DEMO-1 [ready] last told "), "{all}");
+    assert!(
+        all.contains("1 ticket(s) with a told wait are left out"),
+        "{all}"
+    );
+
+    // A stale snapshot is used all the same, with a note.
+    let later = bench.clock.get() + std::time::Duration::from_secs(30 * 24 * 3600);
+    let stale = why_at(&bench, None, later);
+    assert!(
+        stale.contains("note: the drain last read the ready column at "),
+        "{stale}"
+    );
+    assert!(stale.contains("  DEMO-1 [ready] last told "), "{stale}");
+
+    fs::remove_file(ready::file(&bench.dirs())).unwrap();
+    let none = why_of(&bench, None);
+    assert!(!none.contains("no admitted ticket waits"), "{none}");
+    assert!(
+        none.contains("left out: they are not in flight and no ready snapshot reads"),
+        "{none}"
+    );
+    let gone = why_of(&bench, Some("DEMO-2"));
+    assert!(gone.contains("no ready snapshot reads"), "{gone}");
+    assert!(!gone.contains("now: blocked"), "{gone}");
+}
+
 /// Scenario S5's Build that waits on a file the one dispatched first holds
 /// (OWL-448): `status --waits` names DEMO-1, delivered and followed at
 /// Watch, as the holder and the zone, with the edge and the resource; the

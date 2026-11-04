@@ -4,6 +4,7 @@
 //! (`watch::drain`), replaced whole. Only the project's draining watch
 //! writes it, which the watch lock keeps to one, so no other lock is taken.
 
+use std::collections::BTreeSet;
 use std::path::PathBuf;
 
 use jiff::Timestamp;
@@ -44,6 +45,36 @@ pub fn stale(snapshot: &ReadySnapshot, now: Timestamp) -> bool {
         .as_millisecond()
         .saturating_sub(snapshot.at.as_millisecond());
     u64::try_from(age).is_ok_and(|age| age > snapshot.interval_ms.saturating_mul(2))
+}
+
+/// The tickets the drain's latest snapshot lists, `None` when there is none
+/// or when it does not read, which is said in `notes` (each line starting
+/// with `prefix`); a stale one is listed all the same, with a note naming when
+/// the drain last read the column. What `status --waits` and `why` share
+/// (OWL-477, OWL-484).
+pub fn listed(
+    dirs: &ProjectDirs,
+    now: Timestamp,
+    prefix: &str,
+    notes: &mut Vec<String>,
+) -> Option<BTreeSet<TicketId>> {
+    match read(dirs) {
+        Ok(Some(snapshot)) => {
+            if stale(&snapshot, now) {
+                notes.push(format!(
+                    "{prefix}the drain last read the ready column at {}, more than two passes \
+                     ago: its waits are as it told them then",
+                    snapshot.at
+                ));
+            }
+            Some(snapshot.tickets.into_iter().map(|t| t.ticket).collect())
+        }
+        Ok(None) => None,
+        Err(why) => {
+            notes.push(format!("{prefix}its ready snapshot cannot be read: {why}"));
+            None
+        }
+    }
 }
 
 /// Replaces the project's snapshot with `snapshot`.
