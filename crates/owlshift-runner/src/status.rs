@@ -51,6 +51,12 @@ pub struct Report {
     pub daemon: Daemon,
     /// The daemon's stop request, while it stands: the daemon drains.
     pub stop_asked: Option<Request>,
+    /// The upgrade's drain request, while it stands: the daemon exits once
+    /// its steps under way finish (OWL-481).
+    pub drain_asked: Option<Request>,
+    /// While a running daemon drains, for a stop or an upgrade, the steps it
+    /// waits on, one per held run slot (OWL-481).
+    pub drain_steps: Vec<DrainStep>,
     /// The pause of every project, while it stands; `None` within for a
     /// file that does not read.
     pub machine_pause: Option<Option<Request>>,
@@ -67,6 +73,18 @@ pub struct Report {
     pub digest: Option<DigestRecord>,
     /// What could not be read.
     pub notes: Vec<String>,
+}
+
+/// A step a draining daemon waits on (OWL-481): a held run slot's holder,
+/// with the step's latest run as the event log tells it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DrainStep {
+    pub project: String,
+    pub ticket: TicketId,
+    /// The role and start of the step's latest `run_started` event since the
+    /// slot was taken, `None` while it has none. A review loop starts runs
+    /// inside one step, so this is not the slot's `since`.
+    pub run: Option<(String, Timestamp)>,
 }
 
 /// A step a command typed in a terminal runs (OWL-478): its ticket's lock
@@ -297,9 +315,19 @@ pub fn gather(data: &Path, concurrent_runs: u32, caps: &[(Harness, u8)], now: Ti
             None
         }
     };
+    let stop_asked = requests::stop_asked(data);
+    let drain_asked = requests::drain_asked(data);
+    let drain_steps = match (&daemon, &slots) {
+        (Daemon::Running(_), Some((held, _))) if stop_asked.is_some() || drain_asked.is_some() => {
+            drain_steps(held, &events)
+        }
+        _ => Vec::new(),
+    };
     Report {
         daemon,
-        stop_asked: requests::stop_asked(data),
+        stop_asked,
+        drain_asked,
+        drain_steps,
         machine_pause: requests::machine_pause(data),
         projects,
         slots,
@@ -308,6 +336,35 @@ pub fn gather(data: &Path, concurrent_runs: u32, caps: &[(Harness, u8)], now: Ti
         digest,
         notes,
     }
+}
+
+/// The steps a draining daemon waits on: the holders of the slots `held`,
+/// each with the role and time of the latest `run_started` event of its
+/// ticket at or after the slot was taken.
+fn drain_steps(held: &[HeldSlot], events: &[Event]) -> Vec<DrainStep> {
+    held.iter()
+        .filter_map(|slot| slot.holder.as_ref())
+        .map(|holder| {
+            let run = events
+                .iter()
+                .rev()
+                .find(|event| {
+                    event.kind == EventKind::RunStarted
+                        && event.at >= holder.since
+                        && event.ticket.as_ref() == Some(&holder.ticket)
+                        && event.project.eq_ignore_ascii_case(&holder.project)
+                })
+                .map(|event| {
+                    let role = event.data.get("role").and_then(Value::as_str);
+                    (role.unwrap_or("unknown").to_owned(), event.at)
+                });
+            DrainStep {
+                project: holder.project.clone(),
+                ticket: holder.ticket.clone(),
+                run,
+            }
+        })
+        .collect()
 }
 
 /// The first line of the quarantine of the project at `dirs`, while one
@@ -433,6 +490,27 @@ pub fn render(report: &Report, tz: &TimeZone) -> String {
             "  Stopping, asked {}: each watch ends once its steps under way finish.",
             asked(Some(request), tz)
         ));
+    }
+    if let Some(request) = &report.drain_asked {
+        line(format!(
+            "  Draining for an upgrade, asked {}: the daemon exits once its steps under way \
+             finish.",
+            asked(Some(request), tz)
+        ));
+    }
+    for step in &report.drain_steps {
+        line(match &step.run {
+            Some((role, at)) => format!(
+                "  waits on {} {}: role {role}, run started {}",
+                step.project,
+                step.ticket,
+                time(*at, tz)
+            ),
+            None => format!(
+                "  waits on {} {}: no run started yet",
+                step.project, step.ticket
+            ),
+        });
     }
     if let Some(request) = &report.machine_pause {
         line(format!(
@@ -797,6 +875,90 @@ mod tests {
             text.contains("Steps under way: 1 of 2 run slots.\n"),
             "{text}"
         );
+    }
+
+    /// OWL-481: a draining daemon, for a stop or an upgrade, says so and
+    /// names each step it waits on with its latest run's role and start,
+    /// which is not the slot's `since`: a review loop starts runs inside one
+    /// step.
+    #[test]
+    fn a_draining_daemon_names_the_steps_it_waits_on() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path();
+        let since: Timestamp = "2026-10-30T18:00:00Z".parse().unwrap();
+        let _daemon = daemon::instance::take(data_dir, &record(since))
+            .unwrap()
+            .unwrap();
+        let (one, two) = (
+            TicketId::new("OWL-5").unwrap(),
+            TicketId::new("OWL-6").unwrap(),
+        );
+        let take = |ticket: &TicketId, at: &str| crate::slots::Holder {
+            project: "acme/web".to_owned(),
+            ticket: ticket.clone(),
+            pid: std::process::id(),
+            since: at.parse().unwrap(),
+        };
+        let slots = MachineSlots::new(data_dir, 3);
+        let _first = slots
+            .take(&take(&one, "2026-10-30T18:10:00Z"))
+            .unwrap()
+            .unwrap();
+        let _second = slots
+            .take(&take(&two, "2026-10-30T18:11:00Z"))
+            .unwrap()
+            .unwrap();
+        let log = EventLog::in_dir(data_dir);
+        for (at, ticket, role) in [
+            ("2026-10-30T18:10:30Z", "OWL-5", "build"),
+            ("2026-10-30T18:40:00Z", "OWL-5", "design_review"),
+            ("2026-10-30T18:12:00Z", "OWL-7", "build"),
+        ] {
+            let mut started = Event {
+                format: Format,
+                at: at.parse().unwrap(),
+                project: "Acme/Web".to_owned(),
+                ticket: Some(TicketId::new(ticket).unwrap()),
+                run: Some("r1".to_owned()),
+                kind: EventKind::RunStarted,
+                data: data([("role", json!(role))]),
+            };
+            started.run = Some(format!("run-{at}"));
+            log.append(&started).unwrap();
+        }
+        let text = |report: &Report| render(report, &TimeZone::UTC);
+
+        let quiet = gather(data_dir, 3, &[], Timestamp::now());
+        assert!(quiet.drain_steps.is_empty());
+        assert!(!text(&quiet).contains("waits on"));
+
+        let request = |by: &str| Request {
+            by: by.to_owned(),
+            at: "2026-10-30T19:00:00Z".parse().unwrap(),
+            why: "an upgrade".to_owned(),
+            pid: None,
+        };
+        requests::ask_drain(data_dir, &request("upgrade")).unwrap();
+        let report = gather(data_dir, 3, &[], Timestamp::now());
+        let out = text(&report);
+        let has = |part: &str| assert!(out.contains(part), "{part:?} missing in\n{out}");
+        has(
+            "  Draining for an upgrade, asked by upgrade at 2026-10-30 19:00: an upgrade: the daemon exits once its steps under way finish.",
+        );
+        has("  waits on acme/web OWL-5: role design_review, run started 2026-10-30 18:40");
+        has("  waits on acme/web OWL-6: no run started yet");
+        assert!(!out.contains("OWL-7"), "{out}");
+        assert!(!out.contains("Stopping"), "{out}");
+
+        requests::remove_drain_request(data_dir).unwrap();
+        requests::ask_stop(data_dir, &request("stop")).unwrap();
+        let out = text(&gather(data_dir, 3, &[], Timestamp::now()));
+        assert!(out.contains("  Stopping, asked by stop at"), "{out}");
+        assert!(
+            out.contains("waits on acme/web OWL-5: role design_review"),
+            "{out}"
+        );
+        assert!(!out.contains("Draining for an upgrade"), "{out}");
     }
 
     /// A watch the daemon paused for a refusal no restart mends is never
