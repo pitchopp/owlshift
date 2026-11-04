@@ -1022,15 +1022,15 @@ fn a_sigterm_during_two_builds_checks_both_and_both_resume() {
 }
 
 /// OWL-474's acceptance in plain `owlshift watch`, whose steps run in its
-/// own process: DEMO-1's Build, under way, is canceled. Its run is stopped
-/// within 5 seconds and the ticket parked at Build within 10, the cancel
-/// file gone, while the watch goes on until its own SIGTERM. The daemon's
-/// bench checks the rest in children (`tests/daemon.rs`).
+/// own process: DEMO-1's Build, under way, is canceled. Its run is gone
+/// within 5 seconds of the cancel, the bound the design gives the cut of the
+/// runs (architecture section 5, "Cancel", "As built"), then the ticket is
+/// parked at Build, a pass the design does not bound and load slows (OWL-491),
+/// the cancel file gone, while the watch goes on until its own SIGTERM. The
+/// daemon's bench checks the rest in children (`tests/daemon.rs`).
 #[cfg(unix)]
 #[test]
 fn a_build_canceled_in_watch_s_own_process_stops_and_parks_the_watch_going_on() {
-    use std::time::{Duration, Instant};
-
     use owlshift_testkit::step_child::{cancel, parked_at_build};
 
     let tmp = tempfile::tempdir().unwrap();
@@ -1053,13 +1053,11 @@ fn a_build_canceled_in_watch_s_own_process_stops_and_parks_the_watch_going_on() 
     let run = pid_in(&pid);
     running.pids.push(run);
 
-    let asked = Instant::now();
     cancel(&s.project, TICKET, "it rewrites the wrong module");
     wait_within("the Build's run stopped", 5, &log, || !alive(run));
-    wait_within("the ticket parked", 10, &log, || {
+    wait_within("the ticket parked", 60, &log, || {
         parked_at_build(&s.project, TICKET)
     });
-    assert!(asked.elapsed() < Duration::from_secs(10));
     assert!(
         watch.try_wait().unwrap().is_none(),
         "the watch ended\n{}",

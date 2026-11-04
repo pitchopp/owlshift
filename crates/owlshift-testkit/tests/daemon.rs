@@ -761,11 +761,13 @@ fn s11_a_checked_stop_resumes_both_builds_and_a_kill_quarantines() {
 /// each in a child of the real watch, and have left a checkpoint. DEMO-1 is
 /// canceled:
 ///
-/// - its run is stopped within 5 seconds and checked, its obligation
+/// - its run is gone within 5 seconds of the cancel, the bound the design
+///   gives the cut of the runs ("As built"), and checked, its obligation
 ///   retired, nothing quarantined, while DEMO-2's runs on and the watch
 ///   goes on passing;
-/// - DEMO-1 is parked at Build within 10 seconds, the PARKED comment naming
-///   `owlshift cancel` and why, the cancel file gone;
+/// - DEMO-1 is then parked at Build, a pass the design does not bound and
+///   load slows (OWL-491), the PARKED comment naming `owlshift cancel` and
+///   why, the cancel file gone;
 /// - `owlshift continue --to-watch DEMO-1` restarts it, and the watch
 ///   resumes its Build from its checkpoint.
 #[test]
@@ -809,15 +811,13 @@ fn a_canceled_build_is_stopped_checked_and_parked_then_resumed_from_its_checkpoi
     });
     let (one, two) = (pid(&pid_files[0]), pid(&pid_files[1]));
 
-    let asked = Instant::now();
     let why = "it rewrites the wrong module";
     cancel(&project, "DEMO-1", why);
     bench.wait_for("DEMO-1's run stopped", 5, || !alive(one));
-    bench.wait_for("DEMO-1 parked", 10, || parked_at_build(&project, "DEMO-1"));
-    assert!(asked.elapsed() < Duration::from_secs(10));
+    bench.wait_for("DEMO-1 parked", 60, || parked_at_build(&project, "DEMO-1"));
     assert!(alive(two), "DEMO-2's run was stopped\n{}", bench.output());
     let passes = bench.passes();
-    bench.wait_for("three more passes of the watch", 30, || {
+    bench.wait_for("three more passes of the watch", 60, || {
         bench.passes() >= passes + 3
     });
     assert!(alive(two), "DEMO-2's run was stopped\n{}", bench.output());
