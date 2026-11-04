@@ -1014,3 +1014,78 @@ fn every_ticket_ref_comes_with_its_state_or_why_it_cannot_be_read() {
         "{states:?}"
     );
 }
+
+/// OWL-489: a listing is a cut of every ticket ref: each read by the commit
+/// it listed reads as it was then, once the ref moved or went. It names the
+/// refs `for-each-ref --format=%(refname)` names, as `list` did before it
+/// read what they point to too: a ref to a missing object, a symbolic ref
+/// and one whose target is gone are listed or left out alike.
+#[test]
+fn a_listed_ticket_ref_reads_as_listed_once_it_moved_or_went() {
+    let repo = Repo::new();
+    let waiting = record(WAITING, 1);
+    let demo_9 = TicketId::new("DEMO-9").unwrap();
+    let first = ticket_ref::write(&repo.git, &repo.root, &ticket(), &waiting, None).unwrap();
+    ticket_ref::write(&repo.git, &repo.root, &demo_9, &waiting, None).unwrap();
+    let listing = ticket_ref::listing(&repo.git, &repo.root).unwrap();
+    let ids: Vec<&str> = listing.iter().map(|(t, _)| t.as_str()).collect();
+    assert_eq!(ids, ["DEMO-1", "DEMO-9"]);
+
+    // DEMO-1 moves, DEMO-9 goes, after the listing.
+    let verify = r#"{"format":2,"stage":"verify","round":1,"reasks":0,"failed_runs":0}"#;
+    ticket_ref::write(
+        &repo.git,
+        &repo.root,
+        &ticket(),
+        &record(verify, 1),
+        Some(&first),
+    )
+    .unwrap();
+    repo.git(&["update-ref", "-d", "refs/owlshift/tickets/DEMO-9"]);
+    for (ticket, listed) in &listing {
+        let stored = ticket_ref::read_listed_ref(&repo.git, &repo.root, ticket, listed).unwrap();
+        assert_eq!(stored.record, waiting, "{ticket}");
+    }
+    let stored =
+        ticket_ref::read_listed_ref(&repo.git, &repo.root, &ticket(), &listing[0].1).unwrap();
+    assert_eq!(stored.commit, first);
+
+    let tickets = repo.root.join(".git/refs/owlshift/tickets");
+    fs::write(tickets.join("GONE-1"), format!("{}\n", "1".repeat(40))).unwrap();
+    repo.git(&["symbolic-ref", "refs/owlshift/tickets/ALIAS-1", REF]);
+    repo.git(&[
+        "symbolic-ref",
+        "refs/owlshift/tickets/DANGLING-1",
+        "refs/owlshift/tickets/NONE-1",
+    ]);
+    let names = repo.git(&[
+        "for-each-ref",
+        "--format=%(refname)",
+        "refs/owlshift/tickets/",
+    ]);
+    let listed: Vec<String> = ticket_ref::list(&repo.git, &repo.root)
+        .unwrap()
+        .iter()
+        .map(|ticket| format!("refs/owlshift/tickets/{ticket}"))
+        .collect();
+    assert_eq!(listed, names.lines().collect::<Vec<_>>());
+    let listing = ticket_ref::listing(&repo.git, &repo.root).unwrap();
+    let of = |id: &str| {
+        let ticket = TicketId::new(id).unwrap();
+        let (_, listed) = listing
+            .iter()
+            .find(|(listed, _)| *listed == ticket)
+            .unwrap_or_else(|| panic!("{id} is not listed: {listing:?}"));
+        ticket_ref::read_listed_ref(&repo.git, &repo.root, &ticket, listed)
+    };
+    // A symbolic ref is refused once read, as `read` refuses it; a ref to a
+    // missing object is refused alone, the others read.
+    let alias = TicketId::new("ALIAS-1").unwrap();
+    assert_eq!(
+        of("ALIAS-1").unwrap_err(),
+        ticket_ref::read(&repo.git, &repo.root, &alias).unwrap_err()
+    );
+    let missing = of("GONE-1").unwrap_err();
+    assert!(missing.contains("does not hold"), "{missing}");
+    assert!(of("DEMO-1").is_ok());
+}

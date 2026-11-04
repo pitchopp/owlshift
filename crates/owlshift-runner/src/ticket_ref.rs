@@ -243,10 +243,23 @@ pub fn read(git: &Git, checkout: &Path, ticket: &TicketId) -> Result<Option<Stor
     let Some(listed) = listed(git, checkout, &name)? else {
         return Ok(None);
     };
-    match read_listed(git, checkout, &name, &listed) {
-        Ok(stored) => Ok(Some(stored)),
-        Err(ReadError::Invalid(why) | ReadError::Git(why)) => Err(why),
-    }
+    read_listed(git, checkout, &name, &listed)
+        .map(Some)
+        .map_err(ReadError::into_message)
+}
+
+/// Reads the ticket ref of `ticket` as [`listing`] listed it, by the commit
+/// it pointed to then, wherever the ref is now: a commit never changes, so
+/// this is what [`read`] answered at the listing, even once the ref moved or
+/// went (OWL-489). Watch's snapshot so reads the refs once it let go of the
+/// project's lock. Refused as [`read`] refuses.
+pub fn read_listed_ref(
+    git: &Git,
+    checkout: &Path,
+    ticket: &TicketId,
+    listed: &Listed,
+) -> Result<Stored, String> {
+    read_listed(git, checkout, &ticket_ref(ticket), listed).map_err(ReadError::into_message)
 }
 
 /// The object the ticket ref of `ticket` points to, as `for-each-ref` lists
@@ -330,10 +343,13 @@ fn move_ref(
     told.map_err(|e| format!("{name} moved, but {e}"))
 }
 
-/// A ref as `for-each-ref` lists it.
-struct Listed {
+/// A ref as `for-each-ref` lists it: what [`read_listed_ref`] reads.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Listed {
     /// The object it points to, through a symbolic ref.
     oid: String,
+    /// Its type, as git names it; `missing` when [`listing`] found no such
+    /// object.
     kind: String,
     /// The ref a symbolic ref points to.
     symref: Option<String>,
@@ -371,12 +387,94 @@ fn listed(git: &Git, checkout: &Path, name: &str) -> Result<Option<Listed>, Stri
     }))
 }
 
+/// A ticket ref as the namespace's `for-each-ref` lists it: its ticket, the
+/// object it points to, through a symbolic ref, and the ref a symbolic one
+/// points to.
+type Named = (TicketId, String, Option<String>);
+
+/// Every ticket ref of `checkout`, in the order git lists the refs, a name
+/// below the namespace that is no ticket id left out (no ticket's ref is
+/// named so). The objects are not read: `%(objecttype)` would make one ref
+/// to a missing object fail the whole listing (`fatal: missing object`,
+/// checked on 2026-11-04 with git 2.54.0), where each other ref still reads.
+/// `%(symref)` is empty for a ref that is not symbolic, so the line has
+/// three fields.
+fn named(git: &Git, checkout: &Path) -> Result<Vec<Named>, String> {
+    let out = git
+        .run(
+            checkout,
+            &[
+                "for-each-ref",
+                "--format=%(objectname) %(symref) %(refname)",
+                TICKETS_PREFIX,
+            ],
+        )
+        .map_err(|e| e.to_string())?;
+    Ok(String::from_utf8_lossy(&out)
+        .lines()
+        .filter_map(|line| {
+            let mut fields = line.splitn(3, ' ');
+            let (oid, symref, refname) = (fields.next()?, fields.next()?, fields.next()?);
+            let ticket = TicketId::new(refname.strip_prefix(TICKETS_PREFIX)?).ok()?;
+            let symref = (!symref.is_empty()).then(|| symref.to_owned());
+            Some((ticket, oid.to_owned(), symref))
+        })
+        .collect())
+}
+
+/// The type of each of `named`'s objects, in order, by one `git cat-file
+/// --batch-check`: `missing` for one the repository does not hold, which it
+/// answers `<oid> missing` (checked on 2026-10-15 for `--batch`, git
+/// 2.43.0; [`parse_batch`]).
+fn kinds(git: &Git, checkout: &Path, named: &[Named]) -> Result<Vec<String>, String> {
+    if named.is_empty() {
+        return Ok(Vec::new());
+    }
+    let input: String = named.iter().map(|(_, oid, _)| format!("{oid}\n")).collect();
+    let out = git
+        .run_with_input(
+            checkout,
+            &["cat-file", "--batch-check=%(objectname) %(objecttype)"],
+            input.as_bytes(),
+        )
+        .map_err(|e| e.to_string())?;
+    let mut lines = String::from_utf8_lossy(&out).into_owned();
+    lines.truncate(lines.trim_end().len());
+    let answers: Vec<&str> = lines.lines().collect();
+    if answers.len() != named.len() {
+        return Err(format!(
+            "git cat-file --batch-check answered {} lines for {} objects",
+            answers.len(),
+            named.len()
+        ));
+    }
+    named
+        .iter()
+        .zip(answers)
+        .map(|((_, oid, _), answer)| match answer.split_once(' ') {
+            Some((answered, kind)) if answered == oid => Ok(kind.to_owned()),
+            _ => Err(format!(
+                "git cat-file --batch-check: unexpected answer {answer:?} for {oid}"
+            )),
+        })
+        .collect()
+}
+
 /// Why a ticket ref could not be read.
 enum ReadError {
     /// What it holds is not a ticket record: the ref is broken.
     Invalid(String),
     /// Git could not show it: nothing is known of the record.
     Git(String),
+}
+
+impl ReadError {
+    /// Why, as [`read`] answers it.
+    fn into_message(self) -> String {
+        match self {
+            Self::Invalid(why) | Self::Git(why) => why,
+        }
+    }
 }
 
 /// Reads the record `listed` points to; [`read`] says what is refused.
@@ -390,6 +488,13 @@ fn read_listed(
     if let Some(target) = &listed.symref {
         return Err(broken(format!(
             "is a symbolic ref to {target}, which Owlshift never writes"
+        )));
+    }
+    // Only [`listing`] answers `missing`: [`listed`]'s `for-each-ref` fails.
+    if listed.kind == "missing" {
+        return Err(ReadError::Git(format!(
+            "the ticket ref {name} points to {}, which the repository does not hold",
+            listed.oid
         )));
     }
     if listed.kind != "commit" {
@@ -633,16 +738,24 @@ fn parse_batch(out: &[u8], oids: &[&str]) -> Result<Vec<Vec<u8>>, String> {
 /// the refs (OWL-152). A ref below the namespace whose name is not a ticket
 /// id is left out: no ticket's ref is named so.
 pub fn list(git: &Git, checkout: &Path) -> Result<Vec<TicketId>, String> {
-    let listed = git
-        .run(
-            checkout,
-            &["for-each-ref", "--format=%(refname)", TICKETS_PREFIX],
-        )
-        .map_err(|e| e.to_string())?;
-    Ok(String::from_utf8_lossy(&listed)
-        .lines()
-        .filter_map(|name| name.strip_prefix(TICKETS_PREFIX))
-        .filter_map(|id| TicketId::new(id).ok())
+    Ok(named(git, checkout)?
+        .into_iter()
+        .map(|(ticket, _, _)| ticket)
+        .collect())
+}
+
+/// [`list`], with what each ref points to: a cut of every ticket ref at one
+/// moment, by one `for-each-ref` and one `cat-file --batch-check` of the
+/// objects' types, whose records [`read_listed_ref`] reads later, by
+/// commit. Watch's snapshot lists so under the project's lock and reads
+/// once it let go (OWL-489).
+pub fn listing(git: &Git, checkout: &Path) -> Result<Vec<(TicketId, Listed)>, String> {
+    let named = named(git, checkout)?;
+    let kinds = kinds(git, checkout, &named)?;
+    Ok(named
+        .into_iter()
+        .zip(kinds)
+        .map(|((ticket, oid, symref), kind)| (ticket, Listed { oid, kind, symref }))
         .collect())
 }
 
