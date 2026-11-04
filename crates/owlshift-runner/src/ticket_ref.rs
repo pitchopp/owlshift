@@ -248,20 +248,6 @@ pub fn read(git: &Git, checkout: &Path, ticket: &TicketId) -> Result<Option<Stor
         .map_err(ReadError::into_message)
 }
 
-/// Reads the ticket ref of `ticket` as [`listing`] listed it, by the commit
-/// it pointed to then, wherever the ref is now: a commit never changes, so
-/// this is what [`read`] answered at the listing, even once the ref moved or
-/// went (OWL-489). Watch's snapshot so reads the refs once it let go of the
-/// project's lock. Refused as [`read`] refuses.
-pub fn read_listed_ref(
-    git: &Git,
-    checkout: &Path,
-    ticket: &TicketId,
-    listed: &Listed,
-) -> Result<Stored, String> {
-    read_listed(git, checkout, &ticket_ref(ticket), listed).map_err(ReadError::into_message)
-}
-
 /// The object the ticket ref of `ticket` points to, as `for-each-ref` lists
 /// it, through a symbolic ref: what the run file protocol compares (OWL-400,
 /// [`crate::ticket_run`]); `None` when there is no ref. A symbolic ticket
@@ -343,7 +329,7 @@ fn move_ref(
     told.map_err(|e| format!("{name} moved, but {e}"))
 }
 
-/// A ref as `for-each-ref` lists it: what [`read_listed_ref`] reads.
+/// A ref as `for-each-ref` lists it: what [`read_listed_refs`] reads.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Listed {
     /// The object it points to, through a symbolic ref.
@@ -484,10 +470,19 @@ fn read_listed(
     name: &str,
     listed: &Listed,
 ) -> Result<Stored, ReadError> {
-    let broken = |why: String| ReadError::Invalid(format!("the ticket ref {name} {why}"));
+    precheck(name, listed)?;
+    let entries = tree_entries(git, checkout, &listed.oid).map_err(ReadError::Git)?;
+    let wanted = wanted(&entries);
+    let texts = read_files(git, checkout, &entries, &wanted, false).map_err(ReadError::Git)?;
+    parse_record(name, &listed.oid, &entries, texts)
+}
+
+/// What [`read_listed`] refuses before git is asked anything: a symbolic
+/// ref, a missing object, an object that is not a commit.
+fn precheck(name: &str, listed: &Listed) -> Result<(), ReadError> {
     if let Some(target) = &listed.symref {
-        return Err(broken(format!(
-            "is a symbolic ref to {target}, which Owlshift never writes"
+        return Err(ReadError::Invalid(format!(
+            "the ticket ref {name} is a symbolic ref to {target}, which Owlshift never writes"
         )));
     }
     // Only [`listing`] answers `missing`: [`listed`]'s `for-each-ref` fails.
@@ -498,11 +493,20 @@ fn read_listed(
         )));
     }
     if listed.kind != "commit" {
-        return Err(broken(format!("points to a {}, not a commit", listed.kind)));
+        return Err(ReadError::Invalid(format!(
+            "the ticket ref {name} points to a {}, not a commit",
+            listed.kind
+        )));
     }
-    let entries = tree_entries(git, checkout, &listed.oid).map_err(ReadError::Git)?;
+    Ok(())
+}
+
+/// The files of a ticket record `entries` hold, in the order they are
+/// judged: [`STATE_FILE`] and [`QUESTIONS_FILE`], then each optional file
+/// present.
+fn wanted(entries: &[Entry]) -> Vec<&'static str> {
     let has = |file: &str| entries.iter().any(|entry| entry.name == file);
-    let optional: Vec<&str> = [
+    let optional = [
         DELIVERY_FILE,
         INTAKE_FILE,
         PLAN_FILE,
@@ -513,17 +517,27 @@ fn read_listed(
         PROPOSALS_FILE,
     ]
     .into_iter()
-    .filter(|file| has(file))
-    .collect();
-    let wanted: Vec<&str> = [STATE_FILE, QUESTIONS_FILE]
+    .filter(|file| has(file));
+    [STATE_FILE, QUESTIONS_FILE]
         .into_iter()
         .chain(optional)
-        .collect();
-    // The files are shown in one call, then judged in this order: the first
-    // that is refused or does not parse is the error, as with one call each.
-    let mut texts = read_files(git, checkout, &entries, &wanted, false)
-        .map_err(ReadError::Git)?
-        .into_iter();
+        .collect()
+}
+
+/// The record the ref `name` at `commit` holds, from its tree's `entries`
+/// and the `texts` of [`wanted`]'s files, as [`read_files`] gives them.
+fn parse_record(
+    name: &str,
+    commit: &str,
+    entries: &[Entry],
+    texts: Vec<Result<String, String>>,
+) -> Result<Stored, ReadError> {
+    let broken = |why: String| ReadError::Invalid(format!("the ticket ref {name} {why}"));
+    let has = |file: &str| entries.iter().any(|entry| entry.name == file);
+    // The files were shown in one call, and are judged in this order: the
+    // first that is refused or does not parse is the error, as with one call
+    // each.
+    let mut texts = texts.into_iter();
     let mut next = |file: &str| match texts.next() {
         Some(Ok(text)) => Ok(text),
         Some(Err(why)) => Err(broken(why)),
@@ -620,9 +634,85 @@ fn read_listed(
             session,
             held,
         },
-        commit: listed.oid.clone(),
+        commit: commit.to_owned(),
         proposals,
     })
+}
+
+/// The entry of `file` among `entries` when it is a regular blob, or why
+/// the ref is broken for that file; its size is [`check_files`]' to judge.
+fn regular<'e>(entries: &'e [Entry], file: &str) -> Result<&'e Entry, String> {
+    let entry = entries
+        .iter()
+        .find(|entry| entry.name == file)
+        .ok_or_else(|| format!("has no {file}"))?;
+    if entry.mode != "100644" || entry.kind != "blob" {
+        return Err(format!(
+            "holds {file} as {} {}, not a regular file",
+            entry.mode, entry.kind
+        ));
+    }
+    Ok(entry)
+}
+
+/// Each of `files` among `entries` checked: the blob to read for one that
+/// is a regular blob of at most [`MAX_FILE`] bytes, or why the ref is
+/// broken for that file; and how many are read: unless `past_invalid`,
+/// none after the first that is refused.
+fn check_files<'e>(
+    entries: &'e [Entry],
+    files: &[&str],
+    past_invalid: bool,
+) -> (Vec<Result<&'e str, String>>, usize) {
+    let checked: Vec<Result<&str, String>> = files
+        .iter()
+        .map(|&file| {
+            let entry = regular(entries, file)?;
+            if entry.size.is_none_or(|size| size > MAX_FILE) {
+                return Err(format!("holds {file} past {MAX_FILE} bytes"));
+            }
+            Ok(entry.oid.as_str())
+        })
+        .collect();
+    let stop = if past_invalid {
+        checked.len()
+    } else {
+        checked
+            .iter()
+            .position(Result::is_err)
+            .unwrap_or(checked.len())
+    };
+    (checked, stop)
+}
+
+/// The blobs [`check_files`] picked, in order.
+fn picked<'e>(checked: &[Result<&'e str, String>], stop: usize) -> Vec<&'e str> {
+    checked[..stop]
+        .iter()
+        .filter_map(|checked| checked.as_ref().ok().copied())
+        .collect()
+}
+
+/// The text of each file [`check_files`] checked, up to the first refused
+/// one included, the picked ones from `blobs`, in order.
+fn texts_of(
+    checked: Vec<Result<&str, String>>,
+    files: &[&str],
+    stop: usize,
+    blobs: Vec<Vec<u8>>,
+) -> Vec<Result<String, String>> {
+    let mut blobs = blobs.into_iter();
+    checked
+        .into_iter()
+        .zip(files)
+        .take(stop + 1)
+        .map(|(checked, file)| {
+            checked.and_then(|_| {
+                let bytes = blobs.next().expect("one blob per checked file");
+                String::from_utf8(bytes).map_err(|_| format!("holds {file} not in UTF-8"))
+            })
+        })
+        .collect()
 }
 
 /// The text of each of `files` among `entries`, in order: a regular blob of
@@ -638,59 +728,103 @@ fn read_files(
     files: &[&str],
     past_invalid: bool,
 ) -> Result<Vec<Result<String, String>>, String> {
-    let checked: Vec<Result<&str, String>> = files
-        .iter()
-        .map(|&file| {
-            let entry = entries
-                .iter()
-                .find(|entry| entry.name == file)
-                .ok_or_else(|| format!("has no {file}"))?;
-            if entry.mode != "100644" || entry.kind != "blob" {
-                return Err(format!(
-                    "holds {file} as {} {}, not a regular file",
-                    entry.mode, entry.kind
-                ));
-            }
-            if entry.size.is_none_or(|size| size > MAX_FILE) {
-                return Err(format!("holds {file} past {MAX_FILE} bytes"));
-            }
-            Ok(entry.oid.as_str())
-        })
-        .collect();
-    let stop = if past_invalid {
-        checked.len()
-    } else {
-        checked
-            .iter()
-            .position(Result::is_err)
-            .unwrap_or(checked.len())
-    };
-    let oids: Vec<&str> = checked[..stop]
-        .iter()
-        .filter_map(|checked| checked.as_ref().ok().copied())
-        .collect();
-    let mut blobs = if oids.is_empty() {
-        Vec::new().into_iter()
+    let (checked, stop) = check_files(entries, files, past_invalid);
+    let oids = picked(&checked, stop);
+    let blobs = if oids.is_empty() {
+        Vec::new()
     } else {
         let input: String = oids.iter().map(|oid| format!("{oid}\n")).collect();
         let out = git
             .run_with_input(checkout, &["cat-file", "--batch"], input.as_bytes())
             .map_err(|e| e.to_string())?;
-        parse_batch(&out, &oids)
-            .map_err(|e| format!("git cat-file --batch: {e}"))?
-            .into_iter()
+        parse_batch(&out, &oids).map_err(|e| format!("git cat-file --batch: {e}"))?
     };
-    Ok(checked
-        .into_iter()
-        .zip(files)
-        .take(stop + 1)
-        .map(|(checked, file)| {
-            checked.and_then(|_| {
-                let bytes = blobs.next().expect("one blob per checked file");
-                String::from_utf8(bytes).map_err(|_| format!("holds {file} not in UTF-8"))
-            })
-        })
-        .collect())
+    Ok(texts_of(checked, files, stop, blobs))
+}
+
+/// One answer of `git cat-file --batch` or `--batch-check`.
+#[derive(Debug, PartialEq, Eq)]
+enum Answer {
+    /// `<oid> <type> <size>`, and the content `--batch` printed after it
+    /// (none for `--batch-check`).
+    Object {
+        header: String,
+        oid: String,
+        kind: String,
+        size: usize,
+        content: Vec<u8>,
+    },
+    /// `<asked> <word>`: `missing` for an object the repository does not
+    /// hold, or `ambiguous` for a short id.
+    Not { header: String, word: String },
+}
+
+/// The answers git printed for `asked`, one per name, in order (checked on
+/// 2026-11-04, git 2.54.0): `<oid> <type> <size>\n`, then with `contents`
+/// that many bytes and a `\n`; `<asked> missing\n` for a name that is no
+/// object, after which the next answer follows at once. A name peeled with
+/// `^{tree}` is answered with the tree's own id; any other is answered with
+/// itself. A header that does not read, a name answered with another, or a
+/// content cut short is an error for the whole answer: what follows can no
+/// longer be told apart.
+fn parse_objects(out: &[u8], asked: &[&str], contents: bool) -> Result<Vec<Answer>, String> {
+    let mut rest = out;
+    let mut answers = Vec::with_capacity(asked.len());
+    for name in asked {
+        let end = rest
+            .iter()
+            .position(|&byte| byte == b'\n')
+            .ok_or_else(|| format!("no answer for {name}"))?;
+        let header = String::from_utf8_lossy(&rest[..end]).into_owned();
+        rest = &rest[end + 1..];
+        let fields: Vec<&str> = header.split(' ').collect();
+        match fields[..] {
+            [answered, word] if answered == *name => answers.push(Answer::Not {
+                header: header.clone(),
+                word: word.to_owned(),
+            }),
+            [answered, kind, size] if answered == *name || name.ends_with("^{tree}") => {
+                let size: usize = size
+                    .parse()
+                    .map_err(|_| format!("unexpected answer {header:?} for {name}"))?;
+                let content = if contents {
+                    if rest.len() <= size || rest[size] != b'\n' {
+                        return Err(format!("the content of {name} is cut short"));
+                    }
+                    let content = rest[..size].to_vec();
+                    rest = &rest[size + 1..];
+                    content
+                } else {
+                    Vec::new()
+                };
+                answers.push(Answer::Object {
+                    header: header.clone(),
+                    oid: answered.to_owned(),
+                    kind: kind.to_owned(),
+                    size,
+                    content,
+                });
+            }
+            [answered, ..] if answered != *name => {
+                return Err(format!("answered {answered} where {name} was asked"));
+            }
+            _ => return Err(format!("unexpected answer {header:?} for {name}")),
+        }
+    }
+    Ok(answers)
+}
+
+/// The blob `answer` gives for `oid`, or why it is none: a missing object,
+/// or any other type than a blob, is an error, as a failing `cat-file blob`
+/// is.
+fn blob_of(answer: Answer, oid: &str) -> Result<Vec<u8>, String> {
+    match answer {
+        Answer::Object { kind, content, .. } if kind == "blob" => Ok(content),
+        Answer::Not { word, .. } if word == "missing" => Err(format!("{oid} is missing")),
+        Answer::Object { header, .. } | Answer::Not { header, .. } => {
+            Err(format!("unexpected answer {header:?} for {oid}"))
+        }
+    }
 }
 
 /// The contents `git cat-file --batch` printed for `oids`, one per id, in
@@ -700,38 +834,248 @@ fn read_files(
 /// object, or any other type than a blob, is an error here, as a failing
 /// `cat-file blob` is. A blob may hold newlines; its size says where it ends.
 fn parse_batch(out: &[u8], oids: &[&str]) -> Result<Vec<Vec<u8>>, String> {
-    let mut rest = out;
-    let mut blobs = Vec::with_capacity(oids.len());
-    for oid in oids {
-        let end = rest
-            .iter()
-            .position(|&byte| byte == b'\n')
-            .ok_or_else(|| format!("no answer for {oid}"))?;
-        let header = String::from_utf8_lossy(&rest[..end]).into_owned();
-        rest = &rest[end + 1..];
-        let mut fields = header.split(' ');
-        let (Some(answered), Some(kind), size, None) =
-            (fields.next(), fields.next(), fields.next(), fields.next())
-        else {
-            return Err(format!("unexpected answer {header:?} for {oid}"));
+    parse_objects(out, oids, true)?
+        .into_iter()
+        .zip(oids)
+        .map(|(answer, oid)| blob_of(answer, oid))
+        .collect()
+}
+
+/// The entries of a tree as `git cat-file --batch` prints it, raw (checked
+/// on 2026-11-04, git 2.54.0): `<mode> <name>\0` and the entry's id in
+/// bytes, as many as the tree's own id `oid` has, so a SHA-256 repository
+/// reads too. Each is an [`Entry`] as `ls-tree -l` lists it, its mode
+/// padded to six digits (`40000` is `040000` there) and its type taken
+/// from it; the size is left unknown, a later `--batch-check` reading it.
+fn tree_of(oid: &str, raw: &[u8]) -> Result<Vec<Entry>, String> {
+    let width = oid.len() / 2;
+    let mut rest = raw;
+    let mut entries = Vec::new();
+    while !rest.is_empty() {
+        let cut = || format!("the tree {oid} is cut short");
+        let space = rest.iter().position(|&b| b == b' ').ok_or_else(cut)?;
+        let mode = String::from_utf8_lossy(&rest[..space]).into_owned();
+        rest = &rest[space + 1..];
+        let nul = rest.iter().position(|&b| b == 0).ok_or_else(cut)?;
+        let name = String::from_utf8_lossy(&rest[..nul]).into_owned();
+        rest = &rest[nul + 1..];
+        if rest.len() < width || mode.is_empty() || !mode.bytes().all(|b| b.is_ascii_digit()) {
+            return Err(format!("unexpected entry {name:?} in the tree {oid}"));
+        }
+        let id: String = rest[..width].iter().map(|b| format!("{b:02x}")).collect();
+        rest = &rest[width..];
+        let mode = format!("{mode:0>6}");
+        let kind = match mode.as_str() {
+            "040000" => "tree",
+            "160000" => "commit",
+            _ => "blob",
         };
-        if answered != *oid {
-            return Err(format!("answered {answered} where {oid} was asked"));
-        }
-        if kind == "missing" && size.is_none() {
-            return Err(format!("{oid} is missing"));
-        }
-        let size = size.and_then(|size| size.parse::<usize>().ok());
-        let (true, Some(size)) = (kind == "blob", size) else {
-            return Err(format!("unexpected answer {header:?} for {oid}"));
-        };
-        if rest.len() <= size || rest[size] != b'\n' {
-            return Err(format!("the content of {oid} is cut short"));
-        }
-        blobs.push(rest[..size].to_vec());
-        rest = &rest[size + 1..];
+        entries.push(Entry {
+            mode,
+            kind: kind.to_owned(),
+            oid: id,
+            size: None,
+            name,
+        });
     }
-    Ok(blobs)
+    Ok(entries)
+}
+
+/// Runs `git cat-file` with `format` (`--batch` or `--batch-check=…`) on
+/// `asked`, and reads its answers, one per name: why it failed otherwise.
+/// Nothing runs when nothing is asked.
+fn batch(git: &Git, checkout: &Path, format: &str, asked: &[&str]) -> Result<Vec<Answer>, String> {
+    if asked.is_empty() {
+        return Ok(Vec::new());
+    }
+    let input: String = asked.iter().map(|name| format!("{name}\n")).collect();
+    let out = git
+        .run_with_input(checkout, &["cat-file", format], input.as_bytes())
+        .map_err(|e| e.to_string())?;
+    let what = format.split('=').next().unwrap_or(format);
+    parse_objects(&out, asked, format == "--batch").map_err(|e| format!("git cat-file {what}: {e}"))
+}
+
+/// Reads each ref of `refs`, a name and what [`listing`] listed for it, as
+/// [`read_listed`] reads it, the files of all of them in three git
+/// commands whatever their number (OWL-492): one `cat-file --batch` of
+/// their trees, by `<commit>^{tree}`; one `cat-file --batch-check` of the
+/// sizes of the files they hold, so that a file past [`MAX_FILE`] is never
+/// read, which bounds what the last one prints; one `cat-file --batch` of
+/// the files' contents. Each ref is judged as alone: its first refusal is
+/// its error, and a git failure on an object it asked for is its own
+/// alone. A command that fails is the error of each ref that asked it
+/// something, the others read on.
+fn read_batch(
+    git: &Git,
+    checkout: &Path,
+    refs: &[(String, &Listed)],
+) -> Vec<Result<Stored, String>> {
+    /// A ref whose tree was read: its place in `refs`, the tree's entries
+    /// and the files it wants.
+    struct Open {
+        at: usize,
+        entries: Vec<Entry>,
+        wanted: Vec<&'static str>,
+    }
+    let mut done: Vec<Option<Result<Stored, ReadError>>> = refs.iter().map(|_| None).collect();
+    let mut pending = Vec::new();
+    for (at, (name, listed)) in refs.iter().enumerate() {
+        match precheck(name, listed) {
+            Ok(()) => pending.push(at),
+            Err(why) => done[at] = Some(Err(why)),
+        }
+    }
+
+    // Their trees: a commit whose tree is not there fails as `ls-tree` does.
+    let peeled: Vec<String> = pending
+        .iter()
+        .map(|&at| format!("{}^{{tree}}", refs[at].1.oid))
+        .collect();
+    let asked: Vec<&str> = peeled.iter().map(String::as_str).collect();
+    let mut open = Vec::new();
+    match batch(git, checkout, "--batch", &asked) {
+        Err(why) => {
+            for &at in &pending {
+                done[at] = Some(Err(ReadError::Git(why.clone())));
+            }
+        }
+        Ok(answers) => {
+            for (&at, answer) in pending.iter().zip(answers) {
+                let (name, listed) = &refs[at];
+                let entries = match answer {
+                    Answer::Object {
+                        kind, oid, content, ..
+                    } if kind == "tree" => tree_of(&oid, &content),
+                    Answer::Object { header, .. } | Answer::Not { header, .. } => Err(format!(
+                        "the tree of {} in the ticket ref {name} cannot be read: {header}",
+                        listed.oid
+                    )),
+                };
+                match entries {
+                    Ok(entries) => {
+                        let wanted = wanted(&entries);
+                        open.push(Open {
+                            at,
+                            entries,
+                            wanted,
+                        });
+                    }
+                    Err(why) => done[at] = Some(Err(ReadError::Git(why))),
+                }
+            }
+        }
+    }
+
+    // The sizes of the regular files each wants, up to its first refusal:
+    // `ls-tree -l` gives them with the entries. One git does not hold, or
+    // that is no blob, has none, as `ls-tree -l` prints `BAD` for a missing
+    // blob (checked on 2026-11-04, git 2.54.0).
+    let sized: Vec<Vec<String>> = open
+        .iter()
+        .map(|open| {
+            open.wanted
+                .iter()
+                .map_while(|file| regular(&open.entries, file).ok())
+                .map(|entry| entry.oid.clone())
+                .collect()
+        })
+        .collect();
+    let asked: Vec<&str> = sized.iter().flatten().map(String::as_str).collect();
+    let check = "--batch-check=%(objectname) %(objecttype) %(objectsize)";
+    match batch(git, checkout, check, &asked) {
+        Err(why) => {
+            let mut kept = Vec::new();
+            for (open, sized) in open.into_iter().zip(&sized) {
+                if sized.is_empty() {
+                    kept.push(open);
+                } else {
+                    done[open.at] = Some(Err(ReadError::Git(why.clone())));
+                }
+            }
+            open = kept;
+        }
+        Ok(answers) => {
+            let mut answers = answers.into_iter();
+            for (open, sized) in open.iter_mut().zip(&sized) {
+                for oid in sized {
+                    let size = match answers.next() {
+                        Some(Answer::Object { kind, size, .. }) if kind == "blob" => {
+                            u64::try_from(size).ok()
+                        }
+                        _ => None,
+                    };
+                    for entry in open.entries.iter_mut().filter(|entry| entry.oid == *oid) {
+                        entry.size = size;
+                    }
+                }
+            }
+        }
+    }
+
+    // Their contents, as [`read_files`] picks them.
+    let checks: Vec<_> = open
+        .iter()
+        .map(|open| check_files(&open.entries, &open.wanted, false))
+        .collect();
+    let picks: Vec<Vec<&str>> = checks
+        .iter()
+        .map(|(checked, stop)| picked(checked, *stop))
+        .collect();
+    let asked: Vec<&str> = picks.iter().flatten().copied().collect();
+    let mut contents = batch(git, checkout, "--batch", &asked).map(Vec::into_iter);
+    for ((open, (checked, stop)), picks) in open.iter().zip(checks).zip(&picks) {
+        let blobs: Result<Vec<Vec<u8>>, String> = match &mut contents {
+            Err(why) if !picks.is_empty() => Err(why.clone()),
+            Err(_) => Ok(Vec::new()),
+            Ok(answers) => {
+                // Every answer of the ref taken, so the next ref gets its own.
+                let blobs: Vec<Result<Vec<u8>, String>> = picks
+                    .iter()
+                    .map(|oid| {
+                        let answer = answers.next().expect("one answer per asked object");
+                        blob_of(answer, oid).map_err(|e| format!("git cat-file --batch: {e}"))
+                    })
+                    .collect();
+                blobs.into_iter().collect()
+            }
+        };
+        let (name, listed) = &refs[open.at];
+        done[open.at] = Some(match blobs {
+            Err(why) => Err(ReadError::Git(why)),
+            Ok(blobs) => {
+                let texts = texts_of(checked, &open.wanted, stop, blobs);
+                parse_record(name, &listed.oid, &open.entries, texts)
+            }
+        });
+    }
+    done.into_iter()
+        .map(|read| {
+            read.expect("every ref is judged")
+                .map_err(ReadError::into_message)
+        })
+        .collect()
+}
+
+/// Reads each ref of `listing` by the commit [`listing`] listed, wherever
+/// the ref is now: a commit never changes, so this is what [`read`] answered
+/// at the listing, even once the ref moved or went (OWL-489). The files of
+/// all of them are read in three git commands, whatever their number
+/// (OWL-492): watch's snapshot so reads the refs once it let go of the
+/// project's lock, and a command holding the lock reads every other ref in
+/// a fixed number of git commands. Each ref is refused as [`read`] refuses
+/// it.
+pub fn read_listed_refs(
+    git: &Git,
+    checkout: &Path,
+    listing: Vec<(TicketId, Listed)>,
+) -> Vec<RefRead> {
+    let (tickets, listed): (Vec<TicketId>, Vec<Listed>) = listing.into_iter().unzip();
+    let refs: Vec<(String, &Listed)> = tickets.iter().map(ticket_ref).zip(&listed).collect();
+    tickets
+        .into_iter()
+        .zip(read_batch(git, checkout, &refs))
+        .collect()
 }
 
 /// The tickets that have a ticket ref in `checkout`, in the order git lists
@@ -746,7 +1090,7 @@ pub fn list(git: &Git, checkout: &Path) -> Result<Vec<TicketId>, String> {
 
 /// [`list`], with what each ref points to: a cut of every ticket ref at one
 /// moment, by one `for-each-ref` and one `cat-file --batch-check` of the
-/// objects' types, whose records [`read_listed_ref`] reads later, by
+/// objects' types, whose records [`read_listed_refs`] reads later, by
 /// commit. Watch's snapshot lists so under the project's lock and reads
 /// once it let go (OWL-489).
 pub fn listing(git: &Git, checkout: &Path) -> Result<Vec<(TicketId, Listed)>, String> {
@@ -773,9 +1117,9 @@ pub enum RefState {
     Unread(String),
 }
 
-/// Every ticket ref of `checkout` with its state, in [`list`]'s order. A ref
-/// that cannot be read is kept, with why; one gone since the listing is
-/// left out. The error says why the refs could not be listed.
+/// Every ticket ref of `checkout` with its state, in [`list`]'s order, as
+/// [`all`] reads them. A ref that cannot be read is kept, with why. The
+/// error says why the refs could not be listed.
 pub fn states(git: &Git, checkout: &Path) -> Result<Vec<(TicketId, RefState)>, String> {
     Ok(all(git, checkout)?
         .into_iter()
@@ -806,37 +1150,31 @@ pub fn state_of(stored: &Stored) -> RefState {
 /// read.
 pub type RefRead = (TicketId, Result<Stored, String>);
 
-/// Every ticket ref of `checkout`, read now, in [`list`]'s order: why a ref
-/// cannot be read in its place, one gone since the listing left out. The
-/// error says why the refs could not be listed.
+/// Every ticket ref of `checkout`, in [`list`]'s order, as one [`listing`]
+/// found them, read by the commits it listed ([`read_listed_refs`]): why a
+/// ref cannot be read in its place, one gone since the listing read as
+/// listed. Five git commands whatever the number of refs (OWL-492), one
+/// when there is none. The error says why the refs could not be listed.
 pub fn all(git: &Git, checkout: &Path) -> Result<Vec<RefRead>, String> {
-    let tickets = list(git, checkout)?;
-    Ok(tickets
-        .into_iter()
-        .filter_map(|ticket| match read(git, checkout, &ticket) {
-            Ok(Some(stored)) => Some((ticket, Ok(stored))),
-            Ok(None) => None,
-            Err(why) => Some((ticket, Err(why))),
-        })
-        .collect())
+    read_all(git, checkout, None)
 }
 
-/// Every ticket ref of `checkout` but `own`'s, read now, in [`list`]'s
-/// order: why a ref cannot be read in its place, one gone since the listing
-/// left out. A command that holds the project's lock reads them so, for the
-/// slot, the open pull request cap (OWL-313) and the collisions (OWL-403).
-/// The error says why the refs could not be listed.
+/// Every ticket ref of `checkout` but `own`'s, as [`all`] reads them. A
+/// command that holds the project's lock reads them so, for the slot, the
+/// open pull request cap (OWL-313) and the collisions (OWL-403), in a fixed
+/// number of git commands whatever the number of refs (OWL-492). The error
+/// says why the refs could not be listed.
 pub fn others(git: &Git, checkout: &Path, own: &TicketId) -> Result<Vec<RefRead>, String> {
-    let tickets = list(git, checkout)?;
-    Ok(tickets
+    read_all(git, checkout, Some(own))
+}
+
+/// [`all`], the ref of `skip` left out before any is read.
+fn read_all(git: &Git, checkout: &Path, skip: Option<&TicketId>) -> Result<Vec<RefRead>, String> {
+    let listing = listing(git, checkout)?
         .into_iter()
-        .filter(|ticket| ticket != own)
-        .filter_map(|ticket| match read(git, checkout, &ticket) {
-            Ok(Some(stored)) => Some((ticket, Ok(stored))),
-            Ok(None) => None,
-            Err(why) => Some((ticket, Err(why))),
-        })
-        .collect())
+        .filter(|(ticket, _)| Some(ticket) != skip)
+        .collect();
+    Ok(read_listed_refs(git, checkout, listing))
 }
 
 /// Writes `record` as the ticket ref of `ticket` in `checkout` and returns
@@ -1298,10 +1636,106 @@ fn text(bytes: Vec<u8>) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_batch;
+    use super::{Answer, parse_batch, parse_objects, tree_of};
 
     const A: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
     const B: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+
+    /// OWL-492: a missing object in the middle of an answer leaves the next
+    /// one read, and a tree peeled with `^{tree}` is answered with the
+    /// tree's own id (as git 2.54.0 answered on 2026-11-04).
+    #[test]
+    fn each_object_has_its_own_answer_whatever_the_one_before() {
+        let peeled = format!("{A}^{{tree}}");
+        let out = format!("{peeled} missing\n{B} tree 2\nxy\n{A} blob 1\nz\n");
+        let answers = parse_objects(out.as_bytes(), &[&peeled, &peeled, A], true).unwrap();
+        assert_eq!(
+            answers[0],
+            Answer::Not {
+                header: format!("{peeled} missing"),
+                word: "missing".to_owned()
+            }
+        );
+        assert!(
+            matches!(&answers[1], Answer::Object { oid, kind, content, .. }
+                if oid == B && kind == "tree" && content == b"xy"),
+            "{answers:?}"
+        );
+        assert!(
+            matches!(&answers[2], Answer::Object { content, .. } if content == b"z"),
+            "{answers:?}"
+        );
+        // A plain id is answered with itself; `--batch-check` prints no
+        // content.
+        let wrong = format!("{B} blob 1\nz\n");
+        assert!(parse_objects(wrong.as_bytes(), &[A], true).is_err());
+        let checked = format!("{A} blob 7\n{B} missing\n");
+        let answers = parse_objects(checked.as_bytes(), &[A, B], false).unwrap();
+        assert!(
+            matches!(&answers[0], Answer::Object { size: 7, content, .. } if content.is_empty())
+        );
+    }
+
+    /// OWL-492: a raw tree reads as `ls-tree -l` lists it, its modes padded
+    /// to six digits, a name with a space, a tab or bytes not in UTF-8 kept,
+    /// an id as long as the tree's own (SHA-1 or SHA-256).
+    #[test]
+    fn a_raw_tree_reads_as_ls_tree_lists_it() {
+        let mut raw = Vec::new();
+        for (mode, name, byte) in [
+            (&b"100644"[..], &b"state.json"[..], 1u8),
+            (b"100755", b"a b\tc", 2),
+            (b"120000", b"link\xff", 3),
+            (b"40000", b"sub", 4),
+            (b"160000", b"module", 5),
+        ] {
+            raw.extend_from_slice(mode);
+            raw.push(b' ');
+            raw.extend_from_slice(name);
+            raw.push(0);
+            raw.extend_from_slice(&[byte; 20]);
+        }
+        let entries = tree_of(A, &raw).unwrap();
+        let listed: Vec<(&str, &str, &str, &str)> = entries
+            .iter()
+            .map(|e| {
+                (
+                    e.mode.as_str(),
+                    e.kind.as_str(),
+                    &e.oid[..2],
+                    e.name.as_str(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            listed,
+            [
+                ("100644", "blob", "01", "state.json"),
+                ("100755", "blob", "02", "a b\tc"),
+                ("120000", "blob", "03", "link\u{fffd}"),
+                ("040000", "tree", "04", "sub"),
+                ("160000", "commit", "05", "module"),
+            ]
+        );
+        assert!(
+            entries
+                .iter()
+                .all(|e| e.oid.len() == 40 && e.size.is_none())
+        );
+        assert!(tree_of(A, b"").unwrap().is_empty());
+        let sha256 = "c".repeat(64);
+        let mut wide = b"100644 f\0".to_vec();
+        wide.extend_from_slice(&[0xab; 32]);
+        assert_eq!(tree_of(&sha256, &wide).unwrap()[0].oid, "ab".repeat(32));
+        for cut in [
+            &b"100644 f\0abc"[..],
+            b"100644 f",
+            b"100644",
+            b"x f\0aaaaaaaaaaaaaaaaaaaa",
+        ] {
+            assert!(tree_of(A, cut).is_err(), "{cut:?}");
+        }
+    }
 
     #[test]
     fn several_blobs_come_out_whole_whatever_they_hold() {

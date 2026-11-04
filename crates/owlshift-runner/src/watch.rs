@@ -2095,16 +2095,10 @@ impl Watch<'_> {
             Err(_) if quarantine.is_some() => Vec::new(),
             Err(e) => return Err(Project::Unread(e)),
         };
-        // The lock goes before the records are read: a command typed
-        // meanwhile no longer waits for a few git commands per ref (OWL-489).
+        // The lock goes before the records are read (OWL-489), all of them
+        // in a fixed number of git commands (OWL-492).
         drop(lock);
-        let refs = listing
-            .into_iter()
-            .map(|(ticket, listed)| {
-                let stored = ticket_ref::read_listed_ref(git, &checkout, &ticket, &listed);
-                (ticket, stored)
-            })
-            .collect();
+        let refs = ticket_ref::read_listed_refs(git, &checkout, listing);
         Ok(Snapshot { refs, quarantine })
     }
 
