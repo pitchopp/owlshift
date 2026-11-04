@@ -1992,6 +1992,23 @@ fn why_tells_each_waiting_ticket_its_reason_while_the_project_is_locked() {
         .unwrap();
     lock.lock().unwrap();
 
+    // No snapshot: OWL-1 is not in flight, so its wait is left out (OWL-484).
+    let unread = stdout(&owlshift(repo.path(), config_dir.path(), &["why"]));
+    assert!(!unread.contains("OWL-1 last told"), "{unread}");
+    assert!(
+        unread.contains("1 ticket(s) with a told wait are left out: it is not in flight and no ready snapshot reads"),
+        "{unread}"
+    );
+    // The drain's snapshot lists OWL-1 (its interval is long, so it is not stale).
+    fs::write(
+        project.join("ready.json"),
+        format!(
+            r#"{{"format":1,"at":"{}","interval_ms":4000000000000,"tickets":[{{"ticket":"OWL-1","title":"One","priority":"high","blockers":[],"drain":{{"kind":"taken_in"}}}}]}}"#,
+            jiff::Timestamp::now()
+        ),
+    )
+    .unwrap();
+
     let all = owlshift(repo.path(), config_dir.path(), &["why"]);
     assert!(all.status.success(), "{}", stderr(&all));
     let text = stdout(&all);
