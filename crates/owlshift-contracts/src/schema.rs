@@ -15,7 +15,8 @@ use crate::refs::{
 use crate::result::RunResult;
 use crate::review::{TicketPlan, TicketReview};
 use crate::service::{
-    DaemonRecord, DigestRecord, InstallManifest, Request, ServedConfig, ServedProjects, WatchRecord,
+    DaemonRecord, DigestRecord, InstallManifest, Request, ServedConfig, ServedProjects, UiRecord,
+    WatchRecord,
 };
 use crate::step::{
     RunObligation, StepEnvelope, StepOutcome, StepOutside, TicketCarry, TicketRestart, TicketRun,
@@ -62,6 +63,7 @@ pub fn all() -> Vec<(&'static str, Schema)> {
         ("digest", schema::<DigestRecord>()),
         ("status-waits", schema::<StatusWaits>()),
         ("ready", schema::<ReadySnapshot>()),
+        ("ui", schema::<UiRecord>()),
     ]
 }
 

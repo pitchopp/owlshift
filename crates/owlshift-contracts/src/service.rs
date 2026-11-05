@@ -15,6 +15,10 @@
 //! lifecycle & uninstall"), `<data>/service/manifest.json`
 //! ([`InstallManifest`]): what Owlshift wrote outside its data directory,
 //! which `owlshift uninstall` removes.
+//!
+//! And the local web UI's (OWL-467, "The local web UI"),
+//! `<data>/service/ui.json` ([`UiRecord`]): where the UI the daemon started
+//! listens.
 
 use jiff::Timestamp;
 use schemars::JsonSchema;
@@ -22,7 +26,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::format::{
     self, ContractError, DAEMON_FORMAT, DIGEST_FORMAT, Format, MANIFEST_FORMAT,
-    SERVED_CONFIG_FORMAT, SERVED_PROJECTS_FORMAT, WATCH_FORMAT,
+    SERVED_CONFIG_FORMAT, SERVED_PROJECTS_FORMAT, UI_FORMAT, WATCH_FORMAT,
 };
 
 /// Who asks in a [`Request`] the daemon writes: a project's pause after a
@@ -239,6 +243,43 @@ impl WatchRecord {
     pub fn parse(input: &str) -> Result<Self, ContractError> {
         let record: Self = format::parse_json(Self::CONTRACT, WATCH_FORMAT, input)?;
         record.build.validate(Self::CONTRACT)?;
+        Ok(record)
+    }
+
+    pub fn render(&self) -> String {
+        format::render_json(self)
+    }
+}
+
+/// The web UI the daemon started, `<data>/service/ui.json` (OWL-467):
+/// written by the UI once it holds the socket the daemon handed it, removed
+/// by the daemon at its start, before each start of the UI and when the
+/// port cannot be bound. Whether a record is live is settled by the UI's
+/// proof, never by its pid.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+#[schemars(title = "Owlshift web UI")]
+pub struct UiRecord {
+    pub format: Format<UI_FORMAT>,
+    /// The UI's process id.
+    pub pid: u32,
+    /// The port of 127.0.0.1 it listens on.
+    pub port: u16,
+    /// When it started.
+    pub since: Timestamp,
+    /// The build of its binary, when known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub build: Option<BuildIdentity>,
+}
+
+impl UiRecord {
+    const CONTRACT: &str = "web UI record";
+
+    pub fn parse(input: &str) -> Result<Self, ContractError> {
+        let record: Self = format::parse_json(Self::CONTRACT, UI_FORMAT, input)?;
+        if let Some(build) = &record.build {
+            build.validate(Self::CONTRACT)?;
+        }
         Ok(record)
     }
 
@@ -664,6 +705,31 @@ mod tests {
             ServedConfig::parse(&newer),
             Err(ContractError::NewerFormat { found: 2, .. })
         ));
+    }
+
+    /// OWL-467: the web UI's record reads back, and a newer format is
+    /// refused.
+    #[test]
+    fn a_ui_record_reads_back_and_a_newer_one_is_refused() {
+        let record = UiRecord {
+            format: Format,
+            pid: 4243,
+            port: 18466,
+            since: at("2026-11-05T08:00:00Z"),
+            build: Some(build("a", false, "2026-11-05T07:00:00Z")),
+        };
+        let text = record.render();
+        assert_eq!(UiRecord::parse(&text).unwrap(), record);
+        let newer = text.replace("\"format\": 1", "\"format\": 2");
+        assert!(matches!(
+            UiRecord::parse(&newer),
+            Err(ContractError::NewerFormat { found: 2, .. })
+        ));
+        let unbuilt = UiRecord {
+            build: None,
+            ..record
+        };
+        assert_eq!(UiRecord::parse(&unbuilt.render()).unwrap(), unbuilt);
     }
 
     fn build(commit: &str, dirty: bool, built_at: &str) -> BuildIdentity {

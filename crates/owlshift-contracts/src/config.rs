@@ -6,7 +6,7 @@
 //! reports "upgrade" rather than an unknown key.
 
 use std::collections::BTreeMap;
-use std::num::NonZeroU32;
+use std::num::{NonZeroU16, NonZeroU32};
 use std::time::Duration;
 
 use owlshift_core::agent_env::{check_declared, check_home_folders, check_names};
@@ -1101,6 +1101,9 @@ pub struct PersonalConfig {
     /// The background service (P7).
     #[serde(default)]
     pub service: ServiceSettings,
+    /// The local web UI (P8, OWL-467).
+    #[serde(default)]
+    pub ui: UiSettings,
     /// Names of variables of this machine's environment that a project may
     /// pass to its agents by declaring them in `stack.gate_env`, in any
     /// letter case. A project's declaration never widens this list: a name
@@ -1227,6 +1230,31 @@ impl ServiceSettings {
     /// The digest's hour, when the digest is on.
     pub fn digest_hour(&self) -> Option<u8> {
         (self.digest != Some(false)).then(|| self.digest_hour.unwrap_or(DEFAULT_DIGEST_HOUR))
+    }
+}
+
+/// `[ui] port` when the personal file does not set it (OWL-467): a port
+/// the IANA registry lists as unassigned, checked on 2026-11-05 (build plan,
+/// P8, part 2).
+pub const DEFAULT_UI_PORT: u16 = 18466;
+
+/// The local web UI's settings (P8, OWL-467).
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct UiSettings {
+    /// The port of 127.0.0.1 the daemon binds for the web UI, 1 to 65535:
+    /// 18466 when absent. The daemon binds it once at its start, so a
+    /// change applies at the service's next start.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(range(min = 1, max = 65535))]
+    pub port: Option<NonZeroU16>,
+}
+
+impl UiSettings {
+    /// The port the web UI listens on: `port`, [`DEFAULT_UI_PORT`] when
+    /// absent.
+    pub fn port(&self) -> u16 {
+        self.port.map_or(DEFAULT_UI_PORT, NonZeroU16::get)
     }
 }
 
@@ -2438,6 +2466,38 @@ mod tests {
                 "{input}: {actual}"
             );
         }
+    }
+
+    /// OWL-467: `[ui] port` is read, 18466 when absent, and a port that is
+    /// not one of 1 to 65535, or another key, is refused.
+    #[test]
+    fn the_ui_port_is_read_with_its_default() {
+        let port = |input: &str| PersonalConfig::parse(input).unwrap().ui.port();
+        assert_eq!(port("[ui]\nport = 18500\n"), 18500);
+        assert_eq!(port(""), DEFAULT_UI_PORT);
+        assert_eq!(port("[ui]\n"), 18466);
+        for input in [
+            "[ui]\nport = 0\n",
+            "[ui]\nport = 70000\n",
+            "[ui]\nhost = \"x\"\n",
+        ] {
+            assert!(PersonalConfig::parse(input).is_err(), "{input}");
+        }
+    }
+
+    /// OWL-467: the default port is the one the build plan records, after
+    /// its check of the IANA registry.
+    #[test]
+    fn the_build_plan_records_the_default_ui_port() {
+        let plan = include_str!("../../../docs/design/build-plan.md");
+        let recorded = format!("`[ui] port` default {DEFAULT_UI_PORT}");
+        assert!(plan.contains(&recorded), "build-plan.md lacks {recorded}");
+        assert!(
+            plan.contains(&format!(
+                "{DEFAULT_UI_PORT}/tcp unassigned in the IANA registry, checked on 2026-11-05"
+            )),
+            "build-plan.md lacks the IANA check of {DEFAULT_UI_PORT}"
+        );
     }
 
     /// OWL-440: the digest is on at 8 unless the personal file says

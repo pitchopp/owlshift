@@ -82,6 +82,11 @@
       "$ref": "#/$defs/ServiceSettings",
       "default": {}
     },
+    "ui": {
+      "description": "The local web UI (P8, OWL-467).",
+      "$ref": "#/$defs/UiSettings",
+      "default": {}
+    },
     "web_tools": {
       "description": "Whether the read-only planning and review roles and the resolver\n(design, design review, verify, arbiter, resolver) get their web\ntools, WebFetch and WebSearch, on this machine: on unless set to\n`false` (OWL-415). Their shell keeps the network either way; intake,\nthe answer check, Build and rebase never get them from this key.",
       "type": [
@@ -236,6 +241,23 @@
           "format": "uint8",
           "maximum": 23,
           "minimum": 0
+        }
+      },
+      "additionalProperties": false
+    },
+    "UiSettings": {
+      "description": "The local web UI's settings (P8, OWL-467).",
+      "type": "object",
+      "properties": {
+        "port": {
+          "description": "The port of 127.0.0.1 the daemon binds for the web UI, 1 to 65535:\n18466 when absent. The daemon binds it once at its start, so a\nchange applies at the service's next start.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint16",
+          "maximum": 65535,
+          "minimum": 1
         }
       },
       "additionalProperties": false
