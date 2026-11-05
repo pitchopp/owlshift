@@ -21,7 +21,7 @@ pub fn run(config: &Effective) -> ExitCode {
     };
     let report = status::gather(
         &data,
-        crate::do_cmd::concurrent_runs(&config.personal),
+        owlshift_runner::usage::concurrent_runs(&config.personal),
         &owlshift_runner::usage::caps_of(&config.personal),
         Timestamp::now(),
     );
@@ -42,7 +42,7 @@ pub fn waits(config: &Effective, repo: Option<&str>, json: bool) -> ExitCode {
     let read = status::waits::gather(
         &data,
         only.as_ref(),
-        crate::do_cmd::concurrent_runs(&config.personal),
+        owlshift_runner::usage::concurrent_runs(&config.personal),
         Timestamp::now(),
     );
     let waits = status::waits::build(&read);

@@ -59,6 +59,7 @@ use crate::system::{
 #[cfg(unix)]
 use crate::system::{SentinelProbe, SentinelStatus};
 use crate::ticket_ref::RefState;
+use crate::ui::probe::Probe;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Status {
@@ -312,6 +313,15 @@ pub fn run(system: &dyn System, config: &Effective, own: &BuildIdentity) -> Repo
     checks.extend(drain_slot_check(system, config));
     checks.extend(quarantine_check(system, config, home));
     checks.extend(system.service().map(|state| service_check(&state, home)));
+    if let Some((data, _)) = system.data_dir() {
+        let port = crate::ui::probe::port_to_check(&data, &config.personal);
+        let log = shown(&crate::daemon::service_dir(&data).join("daemon.log"), home);
+        checks.extend(
+            system
+                .ui(&data, port)
+                .map(|probe| ui_check(&probe, port, &log)),
+        );
+    }
     checks.extend(
         system
             .running_builds()
@@ -2627,6 +2637,74 @@ fn quarantine_check(system: &dyn System, config: &Effective, home: Option<&Path>
             ),
         ],
     ))
+}
+
+/// The web UI the daemon runs (OWL-467), while a daemon runs: proved on
+/// `127.0.0.1:<port>`, or a warning naming the port, and `[ui] port` when
+/// another program may hold it. `log` is the daemon's log, shown. It never
+/// blocks `owlshift do`.
+fn ui_check(probe: &Probe, port: u16, log: &str) -> Check {
+    const SUBJECT: &str = "web UI";
+    let held = || {
+        format!(
+            "{DOES_NOT_BLOCK} free the port, which the daemon tries again, or set another `[ui] \
+             port` in the personal file and restart the service."
+        )
+    };
+    match probe {
+        Probe::Proved(Some(record)) => Check::ok(
+            Section::Project,
+            SUBJECT,
+            format!(
+                "listens on 127.0.0.1:{port} (pid {}, since {})",
+                record.pid, record.since
+            ),
+        ),
+        Probe::Proved(None) => Check::ok(
+            Section::Project,
+            SUBJECT,
+            format!("listens on 127.0.0.1:{port}"),
+        ),
+        Probe::Refused => Check::warn(
+            Section::Project,
+            SUBJECT,
+            format!("nothing listens on 127.0.0.1:{port}"),
+            format!(
+                "{DOES_NOT_BLOCK} the daemon binds the port again at its next try; {log} says \
+                 why."
+            ),
+        ),
+        Probe::Silent { recorded: true } => Check::warn(
+            Section::Project,
+            SUBJECT,
+            format!("the web UI on 127.0.0.1:{port} does not answer"),
+            format!("{DOES_NOT_BLOCK} the daemon starts it again after an end; {log} says why."),
+        ),
+        Probe::Silent { recorded: false } => Check::warn(
+            Section::Project,
+            SUBJECT,
+            format!(
+                "port {port} of 127.0.0.1, `[ui] port` of the personal file, takes connections \
+                 and answers nothing, and no web UI recorded itself there"
+            ),
+            format!("{} {log} says why.", held()),
+        ),
+        Probe::NotProved(why) => Check::warn(
+            Section::Project,
+            SUBJECT,
+            format!(
+                "port {port} of 127.0.0.1, `[ui] port` of the personal file, is held by a program \
+                 that did not prove itself the web UI ({why})"
+            ),
+            held(),
+        ),
+        Probe::Unread(why) => Check::warn(
+            Section::Project,
+            SUBJECT,
+            format!("the web UI on 127.0.0.1:{port} could not be checked: {why}"),
+            format!("{DOES_NOT_BLOCK} `owlshift ui` checks it the same way."),
+        ),
+    }
 }
 
 /// The background service installed at login (OWL-437; runtime and
@@ -5721,5 +5799,83 @@ states = { ready = "Todo", working = "Doing", needs_input = "Asked", review = "R
             None,
         );
         assert_eq!(no_git.unwrap().status, Status::Ok);
+    }
+
+    /// OWL-467: while a daemon runs, the web UI's line: ok once proved,
+    /// naming 127.0.0.1 and the port; a warning, never a failure, naming
+    /// the port and `[ui] port` when another program may hold it, and the
+    /// daemon's log when the UI is down; no line without a daemon.
+    #[test]
+    fn the_web_ui_is_checked_while_a_daemon_runs() {
+        let system = || logged_in(with_harnesses(with_git(FakeSystem::default())));
+        let report = run(&system(), &no_config());
+        assert!(
+            report.checks.iter().all(|check| check.subject != "web UI"),
+            "{report}"
+        );
+
+        let record = owlshift_contracts::service::UiRecord {
+            format: owlshift_contracts::format::Format,
+            pid: 4242,
+            port: 18466,
+            since: "2026-11-05T09:00:00Z".parse().unwrap(),
+            build: None,
+        };
+        let report = run(&system().ui_is(Probe::Proved(Some(record))), &no_config());
+        let check = line(&report, "web UI");
+        assert_eq!(check.status, Status::Ok, "{report}");
+        assert_eq!(
+            check.detail,
+            "listens on 127.0.0.1:18466 (pid 4242, since 2026-11-05T09:00:00Z)"
+        );
+        let json = report.to_json();
+        let entry = json["checks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|check| check["subject"] == "web UI")
+            .unwrap();
+        assert_eq!(entry["section"], "project");
+        assert_eq!(entry["status"], "ok");
+
+        for probe in [
+            Probe::NotProved("its answer is not the web UI's proof".into()),
+            Probe::Silent { recorded: false },
+        ] {
+            let report = run(&system().ui_is(probe), &no_config());
+            let check = line(&report, "web UI");
+            assert_eq!(check.status, Status::Warn, "{report}");
+            assert!(
+                check.detail.contains("port 18466 of 127.0.0.1")
+                    && check.detail.contains("`[ui] port`"),
+                "{}",
+                check.detail
+            );
+            assert!(report.ready(), "{report}");
+        }
+        // The fake's home is not absolute on Windows: the log shows whole.
+        let log = shown(
+            &crate::daemon::service_dir(Path::new("/home/ada/.local/share/owlshift"))
+                .join("daemon.log"),
+            Some(Path::new("/home/ada")),
+        );
+        #[cfg(unix)]
+        assert_eq!(log, "~/.local/share/owlshift/service/daemon.log");
+        for probe in [Probe::Silent { recorded: true }, Probe::Refused] {
+            let report = run(&system().ui_is(probe), &no_config());
+            let check = line(&report, "web UI");
+            assert_eq!(check.status, Status::Warn, "{report}");
+            assert!(check.detail.contains("127.0.0.1:18466"), "{}", check.detail);
+            let why = check.why.as_deref().unwrap();
+            assert!(why.contains(&log), "{why}");
+            assert!(report.ready(), "{report}");
+        }
+        let report = run(
+            &system().ui_is(Probe::Unread("its answer was cut short".into())),
+            &no_config(),
+        );
+        let check = line(&report, "web UI");
+        assert_eq!(check.status, Status::Warn, "{report}");
+        assert!(check.detail.contains("cut short"), "{}", check.detail);
     }
 }

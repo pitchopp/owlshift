@@ -21,7 +21,7 @@ use owlshift_platform::keychain::Keychain;
 use owlshift_platform::service::{HostManager, Layout, Manager};
 use owlshift_runner::config::{Effective, FileState, OWLSHIFT_VERSION};
 use owlshift_runner::daemon::upgrade::Binary;
-use owlshift_runner::daemon::{self, Daemon, Held, Timing, requests};
+use owlshift_runner::daemon::{self, Daemon, Held, Timing, UiLaunch, requests};
 use owlshift_runner::events::printable;
 use owlshift_runner::install::uninstall::{self, Personal, Stopped};
 use owlshift_runner::install::{self, Install, Installed};
@@ -35,7 +35,7 @@ use crate::do_cmd::loaded_project;
 use crate::{data_dir, fail, own_build};
 
 /// Why the service is refused on native Windows.
-const ON_WINDOWS: &str = "the background service runs on macOS and Linux, and on Windows through \
+pub(crate) const ON_WINDOWS: &str = "the background service runs on macOS and Linux, and on Windows through \
      WSL2: native Windows runs no agent (D9)";
 
 /// How long `owlshift start` waits for the daemon it launched to run.
@@ -86,12 +86,24 @@ pub fn daemon(system: &dyn System, config: &Effective) -> ExitCode {
         .then(|| DesktopNotifier::for_this_machine(system))
         .flatten();
     let watch = |repo: &Repo| watch_command(&own.spawn, repo);
+    // The web UI (OWL-467): `owlshift ui --daemon`, on the socket the daemon
+    // binds at `[ui] port`, read once: a change takes effect at the
+    // service's next start.
+    let ui = || {
+        let mut command = Command::new(&own.spawn);
+        command.args(["ui", "--daemon"]);
+        command
+    };
     let daemon = Daemon {
         data: &data,
         watch: &watch,
         notifier: desktop.as_ref().map(|d| d as &dyn Notifier),
         timing: Timing::SERVICE,
         digest: daemon::digest::Settings::of(&config.personal),
+        ui: Some(UiLaunch {
+            port: owlshift_runner::ui::port_of(&config.personal),
+            command: &ui,
+        }),
     };
     let ended = daemon.run(&mut io::stdout());
     drop(instance);

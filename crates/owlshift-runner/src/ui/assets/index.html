@@ -1,0 +1,37 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="referrer" content="no-referrer">
+<title>Owlshift</title>
+<link rel="stylesheet" href="/app.css">
+<script src="/app.js" defer></script>
+</head>
+<body>
+<header class="bar">
+  <div class="bar-row">
+    <span class="wordmark">owlshift</span>
+    <label class="switch">
+      <span class="switch-label">Project</span>
+      <select id="project" class="control" aria-label="Project">
+        <option value="">All projects</option>
+      </select>
+    </label>
+    <label class="switch">
+      <span class="switch-label">Theme</span>
+      <select id="theme" class="control" aria-label="Theme">
+        <option value="system">System</option>
+        <option value="light">Light</option>
+        <option value="dark">Dark</option>
+      </select>
+    </label>
+  </div>
+  <div id="header" class="bar-row facts" hidden></div>
+</header>
+<main>
+  <p id="logged-out" class="notice">Not logged in: run <code>owlshift ui</code> in a terminal.</p>
+  <p id="problem" class="notice problem" hidden></p>
+</main>
+</body>
+</html>

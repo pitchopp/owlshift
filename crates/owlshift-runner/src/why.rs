@@ -537,16 +537,38 @@ fn in_flight(dirs: &ProjectDirs) -> Option<BTreeSet<TicketId>> {
 /// while its checkout does not exist. What cannot be read is said in
 /// `notes`. Shared with the daily digest (OWL-440).
 pub(crate) fn statuses(dirs: &ProjectDirs, notes: &mut Vec<String>) -> Vec<(TicketId, Status)> {
-    let mut statuses = Vec::new();
+    standings(dirs, notes)
+        .into_iter()
+        .map(|(ticket, status, _)| (ticket, status))
+        .collect()
+}
+
+/// [`statuses`], each with whether watch follows the ticket's pull request
+/// (`watch::followed`): a pull request for a person to review, which the
+/// web UI's header counts (OWL-467). The refs are read once.
+pub(crate) fn standings(
+    dirs: &ProjectDirs,
+    notes: &mut Vec<String>,
+) -> Vec<(TicketId, Status, bool)> {
+    let mut standings = Vec::new();
     if !dirs.checkout().exists() {
-        return statuses;
+        return standings;
     }
-    match ticket_ref::states(&crate::project::runner_git(), &dirs.checkout()) {
+    match ticket_ref::all(&crate::project::runner_git(), &dirs.checkout()) {
         Ok(refs) => {
-            for (ticket, state) in refs {
-                match state {
+            for (ticket, stored) in refs {
+                let stored = match stored {
+                    Ok(stored) => stored,
+                    Err(why) => {
+                        notes.push(format!("the ref of {ticket} cannot be read: {why}"));
+                        continue;
+                    }
+                };
+                match ticket_ref::state_of(&stored) {
                     RefState::Read(Some(state)) | RefState::Unadmitted(state) => {
-                        statuses.push((ticket, state.status()));
+                        let status = state.status();
+                        let followed = crate::watch::followed(status, &stored);
+                        standings.push((ticket, status, followed));
                     }
                     RefState::Read(None) => {}
                     RefState::Unread(why) => {
@@ -557,7 +579,7 @@ pub(crate) fn statuses(dirs: &ProjectDirs, notes: &mut Vec<String>) -> Vec<(Tick
         }
         Err(why) => notes.push(format!("the ticket refs cannot be read: {why}")),
     }
-    statuses
+    standings
 }
 
 /// Each harness's standing on this machine at `now`, its cap applied.

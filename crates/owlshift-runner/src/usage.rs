@@ -290,6 +290,16 @@ pub fn caps_of(personal: &crate::config::FileState<PersonalConfig>) -> Vec<(Harn
     }
 }
 
+/// How many steps of `owlshift watch --drain` this machine runs at once
+/// (OWL-409): the personal file's `concurrent_runs`, its default when the
+/// file is absent or does not load.
+pub fn concurrent_runs(personal: &crate::config::FileState<PersonalConfig>) -> u32 {
+    match personal {
+        crate::config::FileState::Loaded { config, .. } => config.concurrent_runs(),
+        _ => owlshift_contracts::config::DEFAULT_CONCURRENT_RUNS,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

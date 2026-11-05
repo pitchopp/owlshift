@@ -40,7 +40,7 @@ fn report(config: &Effective, ticket: Option<&str>) -> Result<String, String> {
         &dirs,
         &repo.to_string(),
         ticket,
-        crate::do_cmd::concurrent_runs(&config.personal),
+        owlshift_runner::usage::concurrent_runs(&config.personal),
         &owlshift_runner::usage::caps_of(&config.personal),
         jiff::Timestamp::now(),
     )

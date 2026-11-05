@@ -9,6 +9,7 @@ mod logs_cmd;
 mod pause_cmd;
 mod service_cmd;
 mod status_cmd;
+mod ui_cmd;
 mod unquarantine_cmd;
 mod why_cmd;
 
@@ -217,6 +218,33 @@ enum Command {
         #[arg(value_name = "OWNER/REPO", requires = "waits")]
         repo: Option<String>,
     },
+    /// Open the local web UI in your browser, logged in: checks that the
+    /// daemon's web UI listens on 127.0.0.1 at `[ui] port` (18466 unless the
+    /// personal file sets it), then opens a link with a one-time code, valid
+    /// for a minute.
+    Ui {
+        /// Print the link instead of opening it.
+        #[arg(long)]
+        print: bool,
+        /// Replace the web UI's token first, which ends every session.
+        #[arg(long)]
+        new_token: bool,
+        /// The web UI itself, as the daemon's child, on the socket and with
+        /// the run secret the daemon hands over.
+        #[arg(
+            long,
+            hide = true,
+            conflicts_with_all = ["print", "new_token"],
+            requires_all = ["listener_fd", "run_secret_fd"]
+        )]
+        daemon: bool,
+        /// With --daemon: the descriptor of the listening socket.
+        #[arg(long, hide = true, value_name = "FD", requires = "daemon")]
+        listener_fd: Option<i32>,
+        /// With --daemon: the descriptor the run secret is read from.
+        #[arg(long, hide = true, value_name = "FD", requires = "daemon")]
+        run_secret_fd: Option<i32>,
+    },
     /// Remove what Owlshift installed on this machine, as its install
     /// manifest lists it: the service at login and the keychain entries
     /// `owlshift init` stored. A daemon that runs is stopped first, its runs
@@ -396,6 +424,15 @@ fn main() -> ExitCode {
                 status_cmd::run(&config)
             }
         }
+        Command::Ui {
+            daemon: true,
+            listener_fd: Some(listener_fd),
+            run_secret_fd: Some(run_secret_fd),
+            ..
+        } => ui_cmd::run_daemon(listener_fd, run_secret_fd),
+        Command::Ui {
+            print, new_token, ..
+        } => ui_cmd::run(&config, print, new_token),
         Command::Uninstall { purge } => service_cmd::uninstall(purge),
         Command::Daemon => service_cmd::daemon(&system, &config),
         Command::Logs {
@@ -493,12 +530,45 @@ mod tests {
                 "--reason",
                 "it rewrites the wrong module",
             ],
+            // OWL-467.
+            &["ui"],
+            &["ui", "--print"],
+            &["ui", "--new-token"],
+            &[
+                "ui",
+                "--daemon",
+                "--listener-fd",
+                "3",
+                "--run-secret-fd",
+                "4",
+            ],
         ] {
             assert_eq!(of(args), None, "{args:?}");
         }
         // OWL-459: --json and a project only with --waits.
         assert!(Cli::try_parse_from(["owlshift", "status", "--json"]).is_err());
         assert!(Cli::try_parse_from(["owlshift", "status", "acme/web"]).is_err());
+        // OWL-467: the UI's own form needs both descriptors, and takes
+        // neither --print nor --new-token; the descriptors need it.
+        for args in [
+            &["ui", "--daemon"][..],
+            &["ui", "--daemon", "--listener-fd", "3"],
+            &[
+                "ui",
+                "--daemon",
+                "--listener-fd",
+                "3",
+                "--run-secret-fd",
+                "4",
+                "--print",
+            ],
+            &["ui", "--listener-fd", "3"],
+        ] {
+            assert!(
+                Cli::try_parse_from([&["owlshift"], args].concat()).is_err(),
+                "{args:?}"
+            );
+        }
         // OWL-437: removing the service while forgetting one project is no
         // one command.
         assert!(Cli::try_parse_from(["owlshift", "stop", "--forget", "--at-login"]).is_err());

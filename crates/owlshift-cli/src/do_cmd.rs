@@ -26,9 +26,7 @@ use owlshift_adapters::forge::Repo;
 use owlshift_adapters::notifier::Notifier;
 use owlshift_adapters::tracker::markdown::MarkdownTracker;
 use owlshift_adapters::tracker::{Capability, Tracker};
-use owlshift_contracts::config::{
-    DEFAULT_CONCURRENT_RUNS, Models, PersonalConfig, ProjectConfig, TrackerKind,
-};
+use owlshift_contracts::config::{Models, ProjectConfig, TrackerKind};
 use owlshift_contracts::format::{Format, strip_role_front_matter};
 use owlshift_contracts::ids::TicketId;
 use owlshift_contracts::service::WatchRecord;
@@ -271,7 +269,10 @@ fn run_with(
     // design names. A step's child takes one before anything else, the
     // keychain included, and keeps it to its end; with none free, it writes
     // its "no slot" record and ends, its ticket untouched.
-    let slots = MachineSlots::new(data_dir, concurrent_runs(&config.personal));
+    let slots = MachineSlots::new(
+        data_dir,
+        owlshift_runner::usage::concurrent_runs(&config.personal),
+    );
     let _slot = match &envelope {
         Some(envelope) => {
             let dirs = ProjectDirs::new(data_dir, &repo);
@@ -723,17 +724,6 @@ fn run_with(
         &outcome,
         &mut sink,
     )))
-}
-
-/// How many steps of `owlshift watch --drain` this machine runs at once
-/// (OWL-409): the personal file's `concurrent_runs`, its default when the
-/// file is absent. An invalid file never gets here: `loaded_project`
-/// refuses it.
-pub(crate) fn concurrent_runs(personal: &FileState<PersonalConfig>) -> u32 {
-    match personal {
-        FileState::Loaded { config, .. } => config.concurrent_runs(),
-        _ => DEFAULT_CONCURRENT_RUNS,
-    }
 }
 
 /// Shares the served lock of `repo`'s project in `data_dir` for a watch typed

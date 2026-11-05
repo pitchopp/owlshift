@@ -1,0 +1,246 @@
+/* The web UI's style (OWL-467): the palette Dawn of visual identity
+   section 4 as CSS variables, light on :root, dark under the system's dark
+   setting unless the switch says light, and under the switch's dark. Only
+   classes: the Content-Security-Policy refuses style attributes. */
+
+:root {
+  /* Brand */
+  --night: #2B1638;
+  --night-deep: #1C0E25;
+  --apricot: #FF8E5E;
+  --apricot-burnt: #D9572A;
+  --apricot-ink: #A83E17;
+  --apricot-light: #FFB38F;
+  --sun: #FFD166;
+  --cream: #FFF1E6;
+  --paper: #FFF8F2;
+  /* Neutrals */
+  --plum-800: #3D2150;
+  --plum-700: #4A2D5C;
+  --plum-600: #5A3A68;
+  --plum-500: #725480;
+  --plum-400: #8E7899;
+  --plum-300: #A692AE;
+  --plum-200: #C9B3D6;
+  --plum-100: #EBDDE4;
+
+  /* Theme roles, light */
+  color-scheme: light;
+  --page: #FFF8F2;
+  --surface: #FFFFFF;
+  --raised: #FFF1E6;
+  --text: #2B1638;
+  --text-secondary: #5A3A68;
+  --text-muted: #725480;
+  --border-hairline: #EBDDE4;
+  --border-strong: #8E7899;
+  --action-fill: #2B1638;
+  --action-text: #FFF1E6;
+  --link: #A83E17;
+  --focus: #D9572A;
+  --badge-fill: #FFDCCB;
+  --badge-text: #7A2E10;
+  /* States, light */
+  --success: #1E7A52;
+  --warning: #8A5A00;
+  --danger: #B8283F;
+  --information: #5A3A68;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme=light]) {
+    color-scheme: dark;
+    --page: #1C0E25;
+    --surface: #2B1638;
+    --raised: #3D2150;
+    --text: #FFF1E6;
+    --text-secondary: #C9B3D6;
+    --text-muted: #A692AE;
+    --border-hairline: #4A2D5C;
+    --border-strong: #8E7899;
+    --action-fill: #FF8E5E;
+    --action-text: #2B1638;
+    --link: #FFB38F;
+    --focus: #FF8E5E;
+    --badge-fill: #5A2A1E;
+    --badge-text: #FFD2BD;
+    --success: #7FE0B0;
+    --warning: #FFD166;
+    --danger: #FF6B81;
+    --information: #C9B3D6;
+  }
+}
+
+:root[data-theme=dark] {
+  color-scheme: dark;
+  --page: #1C0E25;
+  --surface: #2B1638;
+  --raised: #3D2150;
+  --text: #FFF1E6;
+  --text-secondary: #C9B3D6;
+  --text-muted: #A692AE;
+  --border-hairline: #4A2D5C;
+  --border-strong: #8E7899;
+  --action-fill: #FF8E5E;
+  --action-text: #2B1638;
+  --link: #FFB38F;
+  --focus: #FF8E5E;
+  --badge-fill: #5A2A1E;
+  --badge-text: #FFD2BD;
+  --success: #7FE0B0;
+  --warning: #FFD166;
+  --danger: #FF6B81;
+  --information: #C9B3D6;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+/* A class's display, such as .bar-row's flex, would show an element the
+   page hides. */
+[hidden] {
+  display: none !important;
+}
+
+body {
+  margin: 0;
+  background: var(--page);
+  color: var(--text);
+  font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
+  font-size: 15px;
+  line-height: 1.45;
+}
+
+a {
+  color: var(--link);
+}
+
+:focus-visible {
+  outline: 2px solid var(--focus);
+  outline-offset: 2px;
+}
+
+code {
+  font-family: ui-monospace, "SF Mono", Menlo, monospace;
+}
+
+.bar {
+  background: var(--surface);
+  border-bottom: 1px solid var(--border-hairline);
+  padding: 8px 16px;
+}
+
+.bar-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px 20px;
+}
+
+.bar-row + .bar-row {
+  margin-top: 6px;
+}
+
+.wordmark {
+  font-weight: 700;
+  letter-spacing: 0.02em;
+  margin-right: auto;
+}
+
+.switch {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--text-secondary);
+}
+
+.control {
+  background: var(--surface);
+  color: var(--text);
+  border: 1px solid var(--border-strong);
+  border-radius: 4px;
+  padding: 2px 6px;
+  font: inherit;
+}
+
+.facts {
+  color: var(--text-secondary);
+}
+
+.fact {
+  display: inline-flex;
+  gap: 4px;
+}
+
+.fact-label {
+  color: var(--text-muted);
+}
+
+.project {
+  background: var(--raised);
+  border-radius: 4px;
+  padding: 0 6px;
+}
+
+.badge {
+  background: var(--badge-fill);
+  color: var(--badge-text);
+  border-radius: 10px;
+  padding: 0 8px;
+  font-weight: 600;
+}
+
+.state-success {
+  color: var(--success);
+}
+
+.state-warning {
+  color: var(--warning);
+}
+
+.state-danger {
+  color: var(--danger);
+}
+
+.state-information {
+  color: var(--information);
+}
+
+/* Each state keeps its symbol, so colour never carries a meaning alone
+   (visual identity section 4, "States"). */
+.state-success::before,
+.state-warning::before,
+.state-danger::before,
+.state-information::before {
+  margin-right: 0.3em;
+  font-weight: 700;
+}
+
+.state-success::before {
+  content: "\2713";
+}
+
+.state-warning::before {
+  content: "!";
+}
+
+.state-danger::before {
+  content: "\2717";
+}
+
+.state-information::before {
+  content: "\00B7";
+}
+
+main {
+  padding: 16px;
+}
+
+.notice {
+  color: var(--text-secondary);
+}
+
+.problem {
+  color: var(--danger);
+}

@@ -215,6 +215,18 @@ pub trait System {
         );
         Some(crate::install::state(&data, layout))
     }
+    /// The web UI on `127.0.0.1:<port>` of the data directory `data`, proved
+    /// or not (OWL-467, [`crate::ui::probe`]); `None` when no daemon runs,
+    /// which runs no UI then. Only `owlshift doctor` asks.
+    fn ui(&self, data: &Path, port: u16) -> Option<crate::ui::probe::Probe> {
+        match crate::daemon::running(data) {
+            Ok(None) => None,
+            Ok(Some(_)) => Some(crate::ui::probe::probe(data, port)),
+            Err(error) => Some(crate::ui::probe::Probe::Unread(format!(
+                "whether the daemon runs cannot be read: {error}"
+            ))),
+        }
+    }
     /// The daemon and the watches that run on the data directory, each
     /// with the build it runs (OWL-462); `None` without a data directory.
     /// Only `owlshift doctor` asks.
@@ -454,6 +466,9 @@ pub(crate) mod fake {
         /// The background service as doctor reads it; `None`: no line, and
         /// never the disk.
         service: Option<crate::install::ServiceState>,
+        /// The web UI as doctor's probe finds it; `None`: no daemon runs,
+        /// and never the network.
+        ui: Option<crate::ui::probe::Probe>,
         /// What runs on the data directory as doctor reads it (OWL-462);
         /// `None`: no line, and never the disk.
         running_builds: Option<RunningBuilds>,
@@ -490,6 +505,12 @@ pub(crate) mod fake {
         /// Agent runs cannot be confined, for this reason.
         pub(crate) fn no_sandbox(mut self, error: SandboxError) -> Self {
             self.sandbox = Some(error);
+            self
+        }
+
+        /// A daemon runs, and the web UI's probe finds this (OWL-467).
+        pub(crate) fn ui_is(mut self, probe: crate::ui::probe::Probe) -> Self {
+            self.ui = Some(probe);
             self
         }
 
@@ -724,6 +745,11 @@ pub(crate) mod fake {
         /// As [`Self::service_is`] scripted it; never the disk.
         fn service(&self) -> Option<crate::install::ServiceState> {
             self.service.clone()
+        }
+
+        /// As [`Self::ui_is`] scripted it; never the network.
+        fn ui(&self, _data: &Path, _port: u16) -> Option<crate::ui::probe::Probe> {
+            self.ui.clone()
         }
 
         /// As [`Self::running_builds_are`] scripted it; never the disk.

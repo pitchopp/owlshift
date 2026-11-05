@@ -9,7 +9,9 @@
 //! end, and, on Unix, `stop_trees_when_killed` when it is killed outright;
 //! [`stop_by_degrees`] makes it stop by degrees instead (OWL-161).
 //! [`hand_over_on_descriptor`] gives a child a secret on an inherited
-//! descriptor, never in its environment.
+//! descriptor, never in its environment, and [`take_handed_over`] reads it;
+//! [`bind_loopback`], [`hand_over_listener`] and [`adopt_listener`] hand the
+//! web UI's listening socket from the daemon to its child (OWL-467).
 
 #[cfg(unix)]
 mod descendants;
@@ -19,7 +21,9 @@ mod sentinel;
 mod signals;
 mod tree;
 
-pub use handover::hand_over_on_descriptor;
+pub use handover::{
+    adopt_listener, bind_loopback, hand_over_listener, hand_over_on_descriptor, take_handed_over,
+};
 #[cfg(unix)]
 pub use sentinel::{SentinelProbe, SentinelStatus, probe_sentinel};
 pub use signals::{

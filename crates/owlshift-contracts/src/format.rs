@@ -188,6 +188,9 @@ pub const WAITS_FORMAT: u32 = 1;
 /// The format version of the drain's ready snapshot
 /// (`<project data>/ready.json`, OWL-468).
 pub const READY_FORMAT: u32 = 1;
+/// The format version of the web UI's record (`<data>/service/ui.json`,
+/// OWL-467).
+pub const UI_FORMAT: u32 = 1;
 
 /// Why a contract document was refused.
 #[derive(Debug)]
