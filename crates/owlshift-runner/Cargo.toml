@@ -22,6 +22,8 @@ toml.workspace = true
 # The local web UI (OWL-467): its token, its run secret and their MACs.
 getrandom.workspace = true
 hmac.workspace = true
+# The web UI's synchronous HTTP server, on the socket the daemon hands over.
+tiny_http.workspace = true
 # Each run's own temporary folder, private to the user and removed with the
 # run (OWL-41).
 tempfile.workspace = true

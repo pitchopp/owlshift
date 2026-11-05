@@ -12,6 +12,9 @@
 //! - *The header* ([`header`]), read from the files `owlshift status` reads
 //!   (`status::gather_files`), and the UI's record ([`record`]),
 //!   `<data>/service/ui.json`.
+//! - *The server* ([`server`]): tiny_http and threads on the socket the
+//!   daemon hands over, its routes and checks, and the page carried in the
+//!   binary.
 
 use owlshift_contracts::config::{DEFAULT_UI_PORT, PersonalConfig};
 
@@ -20,6 +23,7 @@ use crate::config::FileState;
 pub mod auth;
 pub mod header;
 pub mod record;
+pub mod server;
 pub mod token;
 
 /// The port of `127.0.0.1` the web UI listens on: `[ui] port` of the
@@ -37,9 +41,14 @@ pub fn port_of(personal: &FileState<PersonalConfig>) -> u16 {
 /// shows without a restart.
 pub fn personal_now() -> FileState<PersonalConfig> {
     match owlshift_platform::paths::personal_config_file() {
-        Some(path) => FileState::load(path, PersonalConfig::parse),
+        Some(path) => personal_at(&path),
         None => FileState::NotApplicable("this system has no configuration directory".into()),
     }
+}
+
+/// The personal file at `path`, read now.
+pub fn personal_at(path: &std::path::Path) -> FileState<PersonalConfig> {
+    FileState::load(path.to_owned(), PersonalConfig::parse)
 }
 
 #[cfg(test)]
