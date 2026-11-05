@@ -6,10 +6,12 @@
 #   sh docs/design/live-checks/owl-485.sh sleep   run by the maintainer in a terminal of the Mac, on power. It PUTS THE MAC
 #                                                 TO SLEEP, which suspends every run Owlshift has in flight: pause the watch
 #                                                 (`owlshift pause`) and let the runs in flight end before you start it.
-# `sleep` samples every 2 s to a scratch file, counts down 20 s (Ctrl-C ends it before the sleep), runs `pmset sleepnow`
-# and keeps sampling for at most 15 minutes. A dark wake needs a sleep of a few minutes with the lid closed or the system
-# idle (a Power Nap or a maintenance wake produces one): wait for the DarkWake line of `pmset -g log`, not only for the
-# wake, then press Ctrl-C to end the script early, or let it run out. Paste back everything it prints. The capability
+# `sleep` samples every second to a scratch file, counts down 20 s (Ctrl-C ends it before the sleep), runs `pmset sleepnow`
+# and keeps sampling for at most 45 minutes. A dark wake needs a sleep of a few minutes to tens of minutes, on power, left
+# alone (a maintenance or SleepService wake produces one, as `pmset -g log | grep DarkWake` shows on this Mac): do not wake
+# the Mac by hand, since a wake by the power button is a full wake. The script ends by itself once `pmset -g log` holds a
+# DarkWake line since its start and the Mac is awake again, or after 45 minutes; Ctrl-C ends it early (the first run, on
+# 2026-11-05, was woken by hand after 14 minutes and sampled no dark wake). Paste back everything it prints. The capability
 # letters of the pmset lines (a full wake lists V, a dark wake does not) only say which samples were a dark wake; the
 # reading is the "System Capabilities" value. Nothing is printed but the readings; scratch files under ${TMPDIR:-/tmp}
 # are removed at the end.
@@ -64,13 +66,18 @@ fi
 
 echo "WARNING: the Mac goes to sleep in 20 s and every run in flight is suspended. Ctrl-C now to cancel."
 : > "$d/all"
-( while :; do reading >> "$d/all"; sleep 2; done ) & spid=$!
+( while :; do reading >> "$d/all"; sleep 1; done ) & spid=$!
 i=20; while [ $i -gt 0 ]; do echo "  $i"; sleep 1; i=$((i - 1)); done
 trap 'stop=1' INT
 stop=0
-echo "pmset sleepnow (sampling goes on for at most 15 minutes; Ctrl-C after the wake ends it)"
+echo "pmset sleepnow (sampling goes on for at most 45 minutes; leave the Mac alone, Ctrl-C ends it)"
 pmset sleepnow > /dev/null; echo "pmset sleepnow status=$?"
-while [ $stop = 0 ] && [ $(( $(date +%s) - t0 )) -lt 900 ]; do sleep 2; done
+# True once pmset's log holds a DarkWake line since the start.
+dark() { pmset -g log | awk -v s="$since" '$1" "$2 >= s && $4 == "DarkWake" {n++} END {exit !n}'; }
+while [ $stop = 0 ] && [ $(( $(date +%s) - t0 )) -lt 2700 ]; do
+  sleep 2
+  if [ $(( $(date +%s) - t0 )) -gt 60 ] && dark; then sleep 5; break; fi
+done
 kill "$spid" 2>/dev/null; spid=
 echo "samples (time of day, then the value; a gap is the time asleep):"
 print_samples "$d/all"
