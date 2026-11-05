@@ -25,6 +25,13 @@
 //! An agent environment is always confined: the only way out is
 //! `without_confinement`, compiled for the test bench alone.
 //!
+//! The web UI's token folder, `<data>/service/ui` (OWL-467), is on the
+//! hidden list of every policy of an environment that knows its data
+//! directory ([`AgentEnv::from_runner`], [`AgentEnv::with_data_dir`]): the
+//! run's, the read-only profile's, the setup's, the gate's and the
+//! credential probes'. Every confined spawn first makes the folder when it
+//! is missing, since bwrap hides only a path that exists.
+//!
 //! The probes run git and gh as the agent would, with its environment and in
 //! its directory. They never keep, log or display a secret: a finding names a
 //! variable, a host or a redacted setting, never a value.
@@ -44,6 +51,7 @@ use owlshift_platform::sandbox::{self, Policy, SandboxError};
 
 use crate::executor::own_entry;
 use crate::system::PROBE_TIMEOUT;
+use crate::ui::token::{ensure_dir, token_dir};
 
 /// The environment an agent process gets, and the sandbox it runs in: see
 /// the module documentation.
@@ -58,6 +66,11 @@ pub struct AgentEnv {
     /// operator allows (`stack.caches`, `allow_caches`, OWL-330), from the
     /// home: opened read-only ([`AgentEnv::policy`]).
     caches: Vec<String>,
+    /// The web UI's token folder, `<data>/service/ui`, hidden from every
+    /// command (OWL-467). [`AgentEnv::from_runner`], the constructor every
+    /// production run and gate uses, sets it; a production path that built
+    /// its environment another way would miss it, so none does.
+    ui_dir: Option<PathBuf>,
     /// Whether every command spawned for the agent is confined. Always true
     /// outside the test bench.
     confined: bool,
@@ -124,6 +137,7 @@ impl AgentEnv {
             vars,
             gate_env: declared.iter().map(|name| (*name).to_owned()).collect(),
             caches: Vec::new(),
+            ui_dir: None,
             confined: true,
         })
     }
@@ -138,6 +152,10 @@ impl AgentEnv {
     /// harness command alone, never on a gate command or a probe
     /// (`executor::harness::HarnessLogin`, OWL-94). `caches` are the
     /// project's cache folders the operator allows ([`AgentEnv::with_caches`]).
+    /// The web UI's token folder of the data directory
+    /// (`owlshift_platform::paths::data_dir`) is hidden from every command
+    /// ([`AgentEnv::with_data_dir`]); with no data directory resolved, which
+    /// every caller has refused before, there is no token to hide.
     pub fn from_runner(
         declared: &[&str],
         allowed: &[&str],
@@ -147,7 +165,20 @@ impl AgentEnv {
             Self::for_project(std::env::vars_os(), declared, allowed)?.with_caches(caches);
         let (name, value) = claude::PEER_INBOX_ENV;
         env.set(name, value.into());
+        env.ui_dir = owlshift_platform::paths::data_dir().map(|data| token_dir(&data));
         Ok(env)
+    }
+
+    /// The same environment, hiding the web UI's token folder of the data
+    /// directory `data`, `<data>/service/ui`, from every command (OWL-467).
+    pub fn with_data_dir(mut self, data: &Path) -> Self {
+        self.ui_dir = Some(token_dir(data));
+        self
+    }
+
+    /// The web UI's token folder hidden from every command, when known.
+    pub fn ui_dir(&self) -> Option<&Path> {
+        self.ui_dir.as_deref()
     }
 
     /// The same environment, with `caches`, folders of the home from the
@@ -257,6 +288,7 @@ impl AgentEnv {
         }
         readable.extend(run.readable.iter().cloned());
         hidden.extend(run.hidden.iter().cloned());
+        hidden.extend(self.ui_dir.iter().cloned());
 
         let mut writable = Vec::new();
         let mut protected = Vec::new();
@@ -408,9 +440,14 @@ impl AgentEnv {
     }
 
     /// `inner` wrapped in the sandbox of `run`, or, without confinement,
-    /// `inner` itself in the run's working directory.
+    /// `inner` itself in the run's working directory. Confined, the web UI's
+    /// token folder is made first when it is missing, since bwrap hides only
+    /// a path that exists; a folder that cannot be made refuses the spawn.
     fn sandboxed(&self, inner: Command, run: &RunPaths) -> Result<Command, SandboxError> {
         if self.confined {
+            if let Some(dir) = &self.ui_dir {
+                ensure_dir(dir).map_err(|_| SandboxError::Path(dir.clone()))?;
+            }
             sandbox::wrap(&self.policy(run), inner.get_program(), inner.get_args())
         } else {
             let mut inner = inner;
@@ -905,6 +942,117 @@ mod tests {
             .iter()
             .map(|(name, value)| (OsString::from(name), OsString::from(value)));
         AgentEnv::new(parent).unwrap()
+    }
+
+    /// Whether `path` is, lies in or holds `folder`.
+    fn reaches(path: &Path, folder: &Path) -> bool {
+        path.starts_with(folder) || folder.starts_with(path)
+    }
+
+    /// OWL-467: the web UI's token folder is hidden from every shape of
+    /// policy a run, the read-only profile, the setup, the gate and the
+    /// probes build, and no folder they open is, lies in or holds it.
+    #[test]
+    fn no_policy_reaches_the_ui_token() {
+        let base = tempfile::tempdir().unwrap();
+        let data = base.path().join("data");
+        let home = base.path().join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        let agent = env(&[("HOME", home.to_str().unwrap()), ("PATH", "/usr/bin:/bin")])
+            .with_data_dir(&data);
+        let ui = data.join("service").join("ui");
+        assert_eq!(agent.ui_dir(), Some(ui.as_path()));
+        let worktree = base.path().join("wt");
+        let git_dir = base.path().join("repo/.git");
+        let run = RunPaths {
+            workdir: worktree.clone(),
+            git_dir: Some(git_dir.clone()),
+            worktree_git_dir: Some(git_dir.join("worktrees/wt")),
+            hidden: vec![data.join("runs/1")],
+            ..RunPaths::default()
+        };
+        let shapes = [
+            (
+                "default",
+                RunPaths {
+                    workdir: worktree.clone(),
+                    ..RunPaths::default()
+                },
+            ),
+            (
+                "read-only",
+                RunPaths {
+                    read_only: true,
+                    readable: vec![base.path().join("harness")],
+                    writable: vec![base.path().join("harness-state")],
+                    temp: Some(base.path().join("tmp")),
+                    ..run.clone()
+                },
+            ),
+            ("executor", run.clone()),
+            (
+                "gate",
+                RunPaths {
+                    temp: Some(base.path().join("tmp")),
+                    readable: Vec::new(),
+                    writable: Vec::new(),
+                    ..run.clone()
+                },
+            ),
+            (
+                "probe",
+                RunPaths {
+                    workdir: worktree.clone(),
+                    git_dir: Some(git_dir.clone()),
+                    ..RunPaths::default()
+                },
+            ),
+        ];
+        for (shape, paths) in shapes {
+            let policy = agent.policy(&paths);
+            assert!(policy.hidden.contains(&ui), "{shape}: {:?}", policy.hidden);
+            let opened = policy
+                .readable
+                .iter()
+                .chain(&policy.writable)
+                .chain(&policy.reopened)
+                .chain(&policy.temp);
+            for path in opened {
+                assert!(!reaches(path, &ui), "{shape} opens {}", path.display());
+            }
+        }
+    }
+
+    /// OWL-467: the runner's own environment hides the token folder of its
+    /// data directory.
+    #[test]
+    fn the_runner_environment_hides_the_ui_token_of_its_data_directory() {
+        let agent = AgentEnv::from_runner(&[], &[], &[]).unwrap();
+        let expected = owlshift_platform::paths::data_dir().map(|data| token_dir(&data));
+        assert_eq!(agent.ui_dir().map(Path::to_path_buf), expected);
+        assert!(expected.is_some(), "the test machine has a data directory");
+    }
+
+    /// OWL-467: a confined spawn makes the token folder, so bwrap hides it.
+    #[cfg(unix)]
+    #[test]
+    fn a_confined_spawn_makes_the_ui_token_folder() {
+        let data = tempfile::tempdir().unwrap();
+        let workdir = tempfile::tempdir().unwrap();
+        let agent = AgentEnv::new(std::env::vars_os())
+            .unwrap()
+            .with_data_dir(data.path());
+        let run = RunPaths {
+            workdir: workdir.path().to_owned(),
+            ..RunPaths::default()
+        };
+        let ui = data.path().join("service/ui");
+        assert!(!ui.exists());
+        let made = agent.confine(Command::new("true"), &run);
+        if matches!(agent.sandbox_ready(), Ok(())) {
+            made.unwrap();
+        }
+        assert!(ui.is_dir());
     }
 
     #[test]

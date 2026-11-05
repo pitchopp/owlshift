@@ -6,8 +6,9 @@
 //! environment built from your own (`AgentEnv::from_runner`), the run's paths
 //! as `Executor::run_paths` builds them (a worktree, its repository's common
 //! git folder and its own entry there, the run folder hidden, the run's own
-//! temporary folder), with `<data>/service/ui` added to the hidden list as
-//! part 2 of P8 adds it. The data directory is a scratch folder, placed under
+//! temporary folder), with the executor's own hidden list, which holds
+//! `<data>/service/ui` since part 2 of P8 (OWL-467,
+//! `AgentEnv::with_data_dir`). The data directory is a scratch folder, placed under
 //! the home where the platform keeps Owlshift's data, then outside the home
 //! where `OWLSHIFT_DATA_DIR` can put it (`/Users/Shared` on macOS, `/srv` on
 //! Linux, or `OWLSHIFT_LIVE_OUTSIDE`): never a temporary folder, which the
@@ -167,13 +168,13 @@ fn data_dir_in(parent: &Path) -> tempfile::TempDir {
 
 /// The run's paths, as the executor's: a worktree of a scratch repository,
 /// the common git folder, the worktree's own entry, the run folder hidden,
-/// the run's temporary folder; `ui` hidden too when given.
+/// the run's temporary folder.
 struct Run {
     paths: RunPaths,
     _scratch: tempfile::TempDir,
 }
 
-fn run_paths(ui: Option<&Path>) -> Run {
+fn run_paths() -> Run {
     let scratch = tempfile::tempdir().unwrap();
     let main = scratch.path().join("repo");
     std::fs::create_dir(&main).unwrap();
@@ -200,8 +201,7 @@ fn run_paths(ui: Option<&Path>) -> Run {
     let temp = scratch.path().join("temp");
     std::fs::create_dir(&run_dir).unwrap();
     std::fs::create_dir(&temp).unwrap();
-    let mut hidden = vec![run_dir];
-    hidden.extend(ui.map(Path::to_owned));
+    let hidden = vec![run_dir];
     Run {
         paths: RunPaths {
             workdir: worktree,
@@ -265,8 +265,15 @@ fn probe(
     data: &Path,
     hide: bool,
 ) -> (BTreeMap<String, String>, Vec<Seen>, &'static str) {
-    let ui = data.join("service").join("ui");
-    let run = run_paths(hide.then_some(ui.as_path()));
+    // The executor's own list hides the token folder of the data directory
+    // the agent knows; the control knows another, the machine's own.
+    let agent = if hide {
+        agent.clone().with_data_dir(data)
+    } else {
+        agent.clone()
+    };
+    let agent = &agent;
+    let run = run_paths();
     let policy = agent.policy(&run.paths);
     // A placement inside or above anything the run opens would test that
     // opening rather than the hidden entry.
