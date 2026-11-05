@@ -116,6 +116,16 @@ impl Supervised {
         self.child.id()
     }
 
+    /// Stops the child and everything in its group now, as a stop "now"
+    /// does; [`Supervised::poll`] then sees its end and reaps it. The web
+    /// UI's end once the daemon's watches have ended (OWL-467).
+    pub fn kill(&self) -> io::Result<()> {
+        match &self.tree {
+            Some(tree) => tree.kill(),
+            None => Ok(()),
+        }
+    }
+
     /// Prints the lines the child wrote since the last poll, its standard
     /// output's on `out` and its standard error's on the process's own, each
     /// after its label; then, once it has ended and its output closed, or two

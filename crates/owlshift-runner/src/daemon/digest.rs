@@ -876,6 +876,7 @@ mod tests {
                 ..Timing::SERVICE
             },
             digest: Some(settings()),
+            ui: None,
         };
         let stop = data.to_owned();
         let asker = std::thread::spawn(move || {

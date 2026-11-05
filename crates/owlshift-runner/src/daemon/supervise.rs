@@ -1,8 +1,9 @@
 //! The daemon's loop: a pass every [`Timing::pass`](super::Timing) reads the
-//! served projects, and a look every tick polls the watches, the stop asked
-//! and the starts due.
+//! served projects, and a look every tick polls the watches and the web UI,
+//! the stop asked and the starts due.
 
 use std::io::{self, Write};
+use std::net::TcpListener;
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -10,17 +11,19 @@ use jiff::{Timestamp, Zoned};
 use owlshift_adapters::forge::Repo;
 use owlshift_contracts::event::EventKind;
 use owlshift_contracts::service::{BY_DAEMON, Request};
-use owlshift_core::restart::Restarts;
+use owlshift_core::restart::{Restart, Restarts};
 use owlshift_platform::process::{self, AtCheckedStop, Degree};
 use serde_json::json;
 
 use super::child::{Ended as ChildEnded, Supervised};
 use super::digest::Digests;
-use super::{Daemon, Ended, UNSERVABLE_EXIT, UPGRADE_EXIT, requests};
+use super::{Daemon, Ended, UNSERVABLE_EXIT, UPGRADE_EXIT, UiLaunch, requests};
 use crate::events::{Data, EventLog, EventSink, data, printable};
 use crate::notify;
 use crate::project::ProjectDirs;
 use crate::served::{self, Registry, ServedLock};
+use crate::ui::auth::RunSecret;
+use crate::ui::{record, token};
 use crate::watch;
 
 /// One served project, from the pass that listed it until its watch, if
@@ -66,9 +69,28 @@ impl Slot {
     }
 }
 
+/// The web UI the daemon runs (OWL-467): what it keeps across the UI's
+/// ends, for as long as it runs.
+#[derive(Default)]
+struct UiChild {
+    /// The run secret, made once per daemon run, handed to each UI.
+    run: Option<RunSecret>,
+    /// The listening socket on `127.0.0.1:<[ui] port>`, once bound: kept, so
+    /// the port is never free while the daemon runs.
+    listener: Option<TcpListener>,
+    /// The UI under way.
+    child: Option<Supervised>,
+    restarts: Restarts,
+    /// When it is to start; `None` while one runs.
+    due: Option<Instant>,
+    /// Whether it was stopped, the watches having ended at a stop.
+    killed: bool,
+}
+
 /// What the loop keeps between two looks.
 struct State {
     slots: Vec<Slot>,
+    ui: UiChild,
     /// Once a stop is asked: nothing starts any more.
     stopping: bool,
     /// The drain to write as the stop file of each watch, for a drain; none
@@ -118,8 +140,17 @@ impl Daemon<'_> {
                 self.timing.pass.as_secs()
             ),
         );
+        if self.ui.is_some() {
+            // A record of an earlier run, or of another port, is never read
+            // as this run's UI (`ui::probe::port_to_check`).
+            self.remove_ui_record(out);
+        }
         let mut state = State {
             slots: Vec::new(),
+            ui: UiChild {
+                due: self.ui.map(|_| Instant::now()),
+                ..UiChild::default()
+            },
             stopping: false,
             relay: None,
             upgrading: false,
@@ -141,6 +172,10 @@ impl Daemon<'_> {
                     self.ended(slot, ended, stopping, out);
                 }
             }
+            if let Some(ended) = state.ui.child.as_mut().and_then(|child| child.poll(out)) {
+                state.ui.child = None;
+                self.ui_ended(&mut state.ui, ended, stopping, out);
+            }
             state.slots.retain_mut(|slot| {
                 let gone = !slot.listed && slot.child.is_none();
                 if gone {
@@ -150,7 +185,21 @@ impl Daemon<'_> {
             });
             if state.stopping {
                 if state.slots.iter().all(|slot| slot.child.is_none()) {
-                    break;
+                    // The UI shows the drain until every watch has ended,
+                    // then is stopped; the loop ends once it is reaped.
+                    match &state.ui.child {
+                        None => break,
+                        Some(child) if !state.ui.killed => {
+                            state.ui.killed = true;
+                            if let Err(error) = child.kill() {
+                                say(
+                                    out,
+                                    &format!("warning: the web UI could not be stopped: {error}"),
+                                );
+                            }
+                        }
+                        Some(_) => {}
+                    }
                 }
             } else {
                 let now = Instant::now();
@@ -164,6 +213,13 @@ impl Daemon<'_> {
                     if slot.child.is_some() && slot.lift_at.is_some_and(|at| now >= at) {
                         self.lift(slot, out);
                     }
+                }
+                if let Some(launch) = &self.ui
+                    && state.ui.child.is_none()
+                    && state.ui.due.is_some_and(|due| now >= due)
+                    && !self.stop_asked()
+                {
+                    self.start_ui(launch, &mut state.ui, out);
                 }
             }
             // A stop asked by a signal wakes the wait; once one is asked,
@@ -510,6 +566,165 @@ impl Daemon<'_> {
                     ("in_a_row", json!(next.in_a_row)),
                     ("end", json!(end)),
                 ]),
+            );
+        }
+    }
+
+    /// Starts the web UI on the socket the daemon holds, binding it first
+    /// when it holds none, with the run secret made once per run.
+    fn start_ui(&self, launch: &UiLaunch<'_>, ui: &mut UiChild, out: &mut dyn Write) {
+        let port = launch.port;
+        self.remove_ui_record(out);
+        if ui.run.is_none() {
+            match RunSecret::new() {
+                Ok(run) => ui.run = Some(run),
+                Err(error) => {
+                    let end = format!("no run secret could be made: {error}");
+                    return self.ui_not_started(ui, &end, out);
+                }
+            }
+        }
+        if let Err(error) = token::ensure_token(self.data) {
+            let end = format!(
+                "{} cannot be made: {error}",
+                token::token_file(self.data).display()
+            );
+            return self.ui_not_started(ui, &end, out);
+        }
+        if ui.listener.is_none() {
+            match process::bind_loopback(port) {
+                Ok(listener) => ui.listener = Some(listener),
+                Err(error) if error.kind() == io::ErrorKind::AddrInUse => {
+                    let next = ui.restarts.ended(&self.timing.restarts, Duration::ZERO);
+                    ui.due = Some(Instant::now() + next.delay);
+                    let delay = duration_text(next.delay);
+                    say(
+                        out,
+                        &format!(
+                            "Port {port} of 127.0.0.1, `[ui] port` of the personal file, is \
+                             taken by another program: the web UI does not start; tried again \
+                             in {delay}."
+                        ),
+                    );
+                    let end = format!("port {port} of 127.0.0.1 is taken by another program");
+                    self.tell_ui_ends(&next, &end, &delay, out);
+                    return;
+                }
+                Err(error) => {
+                    let end = format!("port {port} of 127.0.0.1 cannot be bound: {error}");
+                    return self.ui_not_started(ui, &end, out);
+                }
+            }
+        }
+        let (Some(listener), Some(run)) = (&ui.listener, &ui.run) else {
+            return;
+        };
+        let mut command = (launch.command)();
+        let handed = process::hand_over_listener(&mut command, listener).and_then(|listener_fd| {
+            let secret_fd =
+                process::hand_over_on_descriptor(&mut command, run.to_hex().as_bytes())?;
+            Ok((listener_fd, secret_fd))
+        });
+        let (listener_fd, secret_fd) = match handed {
+            Ok(fds) => fds,
+            Err(error) => {
+                let end =
+                    format!("the socket and the run secret could not be handed over: {error}");
+                return self.ui_not_started(ui, &end, out);
+            }
+        };
+        command
+            .arg("--listener-fd")
+            .arg(listener_fd.to_string())
+            .arg("--run-secret-fd")
+            .arg(secret_fd.to_string());
+        // Dropped by the start, with the copies handed over.
+        match Supervised::start(command, "ui", AtCheckedStop::Stopped) {
+            Ok(child) => {
+                say(
+                    out,
+                    &format!(
+                        "Started the web UI on 127.0.0.1:{port} (pid {}).",
+                        child.pid()
+                    ),
+                );
+                ui.child = Some(child);
+                ui.due = None;
+            }
+            Err(_) if self.stop_asked() => ui.due = None,
+            Err(error) => {
+                let end = format!("it could not start: {error}");
+                self.ui_not_started(ui, &end, out);
+            }
+        }
+    }
+
+    /// Counts a start of the web UI that failed for `end` as an end.
+    fn ui_not_started(&self, ui: &mut UiChild, end: &str, out: &mut dyn Write) {
+        self.restart_ui(ui, Duration::ZERO, end, out);
+    }
+
+    /// Acts on the end of the web UI.
+    fn ui_ended(&self, ui: &mut UiChild, ended: ChildEnded, stopping: bool, out: &mut dyn Write) {
+        let end = match &ended.status() {
+            Ok(status) => status.to_string(),
+            Err(error) => error.clone(),
+        };
+        if stopping {
+            say(out, &format!("The web UI ended ({end}), as asked."));
+            ui.due = None;
+            return;
+        }
+        let code = ended.status().ok().and_then(|status| status.code());
+        let end = match &ended.last_error {
+            Some(line) if code != Some(0) => format!("{end}: {line}"),
+            _ => end,
+        };
+        self.restart_ui(ui, ended.ran_for, &end, out);
+    }
+
+    /// Counts an end of the web UI, which ran `ran_for`: started again after
+    /// the delay, the operator told at the end the rule says. No event: the
+    /// event log is per project.
+    fn restart_ui(&self, ui: &mut UiChild, ran_for: Duration, end: &str, out: &mut dyn Write) {
+        let next = ui.restarts.ended(&self.timing.restarts, ran_for);
+        ui.due = Some(Instant::now() + next.delay);
+        let delay = duration_text(next.delay);
+        say(
+            out,
+            &format!("The web UI ended ({end}): started again in {delay}."),
+        );
+        self.tell_ui_ends(&next, end, &delay, out);
+    }
+
+    /// Tells the operator the web UI keeps ending, when the rule says so.
+    fn tell_ui_ends(&self, next: &Restart, end: &str, delay: &str, out: &mut dyn Write) {
+        if !next.notify {
+            return;
+        }
+        let line = format!(
+            "the web UI ended {} times in a row, the last ({end}); started again in {delay}",
+            next.in_a_row
+        );
+        say(out, &format!("Told: {line}."));
+        if let Some(notifier) = self.notifier
+            && let Err(error) = notifier.notify(&format!("Owlshift: {line}"))
+        {
+            say(
+                out,
+                &format!("warning: the notification was not shown: {error}"),
+            );
+        }
+    }
+
+    fn remove_ui_record(&self, out: &mut dyn Write) {
+        if let Err(error) = record::remove(self.data) {
+            say(
+                out,
+                &format!(
+                    "warning: {} could not be removed: {error}",
+                    record::file(self.data).display()
+                ),
             );
         }
     }

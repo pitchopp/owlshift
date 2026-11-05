@@ -34,8 +34,18 @@
 //! `hang` stands, when only its bound ends it. While the file `linger`
 //! stands, a drain on its stop file waits, as for a step under way, until
 //! it is removed or a stop is asked of it.
+//!
+//! The web UI (OWL-467): when `OWLSHIFT_BENCH_UI_PORT` is set, the daemon
+//! runs the UI's stand-in, `owlshift-daemon-bench ui`, on that port of
+//! `127.0.0.1`. The stand-in adopts the socket the daemon hands it
+//! (`--listener-fd`), reads the run secret (`--run-secret-fd`), writes its
+//! pid to `<data>/bench-ui.pid`, and answers each connection with
+//! `bench-ui <pid> <the run secret's fingerprint>` and a newline. With
+//! `OWLSHIFT_BENCH_UI=exit` it ends at once with 1, saying why on its
+//! standard error.
 
 use std::fs;
+use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
 use std::thread;
@@ -48,10 +58,11 @@ use owlshift_contracts::service::{BuildIdentity, DaemonRecord};
 use owlshift_core::restart::RestartPolicy;
 use owlshift_platform::process::{self, AtCheckedStop, ProcessTree};
 use owlshift_runner::config::OWLSHIFT_VERSION;
-use owlshift_runner::daemon::{self, Daemon, Held, Timing};
+use owlshift_runner::daemon::{self, Daemon, Held, Timing, UiLaunch};
 use owlshift_runner::events::{EventLog, EventSink};
 use owlshift_runner::project::ProjectDirs;
 use owlshift_runner::refusal::Refusal;
+use owlshift_runner::ui::auth::RunSecret;
 use owlshift_runner::watch;
 use owlshift_runner::watch::offline::{self, Backoff, Opened};
 use owlshift_runner::watch::stop::CHECKED_STOP_BOUND;
@@ -67,9 +78,15 @@ fn main() -> ExitCode {
         [command] if command == "daemon" => run_daemon(&data),
         [command, repo] if command == "watch" => run_watch(&data, &Repo::parse(repo).unwrap()),
         [command, repo] if command == "drain" => run_drain(&data, repo),
+        [command, flag, listener, secret_flag, secret]
+            if command == "ui" && flag == "--listener-fd" && secret_flag == "--run-secret-fd" =>
+        {
+            run_ui(&data, listener.parse().unwrap(), secret.parse().unwrap())
+        }
         _ => {
             eprintln!(
-                "usage: owlshift-daemon-bench daemon | watch <OWNER/REPO> | drain <OWNER/REPO>"
+                "usage: owlshift-daemon-bench daemon | watch <OWNER/REPO> | drain <OWNER/REPO> | \
+                 ui --listener-fd <N> --run-secret-fd <M>"
             );
             ExitCode::from(2)
         }
@@ -136,12 +153,22 @@ fn run_daemon(data: &Path) -> ExitCode {
         command.args([if real { "drain" } else { "watch" }, &repo.to_string()]);
         command
     };
+    // The UI's stand-in when the test names its port (OWL-467).
+    let ui = || {
+        let mut command = Command::new(&exe);
+        command.arg("ui");
+        command
+    };
+    let ui_port = std::env::var("OWLSHIFT_BENCH_UI_PORT")
+        .ok()
+        .map(|port| port.parse().unwrap());
     let daemon = Daemon {
         data,
         watch: &watch,
         notifier: Some(&notes),
         timing,
         digest: None,
+        ui: ui_port.map(|port| UiLaunch { port, command: &ui }),
     };
     let ended = daemon.run(&mut std::io::stdout());
     drop(instance);
@@ -228,6 +255,28 @@ fn run_drain(data: &Path, repo: &str) -> ExitCode {
     println!("watching {repo}");
     project.watch_until_stopped(Some(step_child::step_children(&file, &child)), &mut between);
     println!("{repo} ended");
+    ExitCode::SUCCESS
+}
+
+/// The web UI's stand-in, on the socket and with the run secret the daemon
+/// handed over.
+fn run_ui(data: &Path, listener_fd: i32, secret_fd: i32) -> ExitCode {
+    if std::env::var("OWLSHIFT_BENCH_UI").as_deref() == Ok("exit") {
+        eprintln!("bench-ui exits as asked");
+        return ExitCode::FAILURE;
+    }
+    let secret = process::take_handed_over(secret_fd).unwrap();
+    let run = RunSecret::from_hex(std::str::from_utf8(&secret).unwrap()).unwrap();
+    let listener = process::adopt_listener(listener_fd).unwrap();
+    let pid = std::process::id();
+    let partial = data.join("bench-ui.pid.partial");
+    fs::write(&partial, pid.to_string()).unwrap();
+    fs::rename(&partial, data.join("bench-ui.pid")).unwrap();
+    println!("bench-ui listens");
+    let answer = format!("bench-ui {pid} {}\n", run.fingerprint());
+    for mut stream in listener.incoming().flatten() {
+        let _ = stream.write_all(answer.as_bytes());
+    }
     ExitCode::SUCCESS
 }
 

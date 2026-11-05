@@ -30,8 +30,18 @@
 //!   `digest_hour`, one notification, `<data>/service/digest.json` keeping
 //!   when it was made so it is sent once at wake, never twice.
 //!
-//! The watch's command is the caller's ([`Daemon::watch`]): this binary in
-//! `owlshift daemon`, a stand-in on the test bench.
+//! - *The web UI* (OWL-467): the daemon binds `127.0.0.1:<[ui] port>` itself
+//!   and keeps the socket for as long as it runs, handing it to each
+//!   `owlshift ui --daemon` it starts, with a run secret it makes once per
+//!   run, so the port is never free while it runs and a new daemon run ends
+//!   every session. The UI starts again after an end as a watch does; a
+//!   taken port is said, and tried again with the same delays. At a stop or
+//!   an upgrade's drain it serves until every watch has ended, then is
+//!   stopped; a SIGTERM stops it at once, with the runs.
+//!
+//! The watch's command is the caller's ([`Daemon::watch`]), and so is the
+//! web UI's ([`Daemon::ui`]): this binary in `owlshift daemon`, a stand-in
+//! on the test bench.
 
 pub(crate) mod child;
 pub mod digest;
@@ -96,6 +106,18 @@ pub struct Daemon<'a> {
     pub timing: Timing,
     /// The daily digest's settings; `None` sends none.
     pub digest: Option<digest::Settings>,
+    /// The web UI to run as a child; `None` runs none.
+    pub ui: Option<UiLaunch<'a>>,
+}
+
+/// The web UI the daemon runs (OWL-467).
+#[derive(Clone, Copy)]
+pub struct UiLaunch<'a> {
+    /// The port of `127.0.0.1` the daemon binds: `[ui] port`.
+    pub port: u16,
+    /// The UI's command, `owlshift ui --daemon`, to which the daemon adds
+    /// `--listener-fd <n> --run-secret-fd <m>`.
+    pub command: &'a dyn Fn() -> Command,
 }
 
 /// How the daemon ended.

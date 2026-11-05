@@ -12,10 +12,18 @@
 //! SIGTERM checks and resumes two Builds, a SIGKILL leaves the quarantine,
 //! notified, each cut Build told once that it waits (OWL-456), and no
 //! ticket is dispatched twice across the restarts.
+//!
+//! OWL-467: the web UI as the daemon's child, the bench's stand-in on a
+//! socket the daemon binds and keeps: started again after a kill, the port
+//! held meanwhile; a new run secret for each daemon run; told at the third
+//! end; a taken port said and tried again; stopped once the watches end,
+//! and gone after a SIGTERM or a hard kill; no watch holding its socket.
 #![cfg(unix)]
 
 use std::collections::BTreeMap;
 use std::fs;
+use std::io::{BufRead, BufReader};
+use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::thread;
@@ -35,6 +43,7 @@ use owlshift_runner::install::{self, Install};
 use owlshift_runner::project::ProjectDirs;
 use owlshift_runner::quarantine;
 use owlshift_runner::served::{self, Registry};
+use owlshift_runner::ui::{record, token};
 use owlshift_runner::watch;
 use owlshift_testkit::step_child::{
     ChildProject, REPO, build_asks, ended_as, events, holding_harness, intake_declaring, reply_for,
@@ -61,6 +70,10 @@ struct Bench {
     /// The build the daemon records (OWL-462): its commit and its build
     /// time in seconds since the epoch; none: version "bench", no build.
     build: Option<(String, i64)>,
+    /// The port of the web UI's stand-in (OWL-467); none: no UI.
+    ui_port: Option<u16>,
+    /// Whether the stand-in ends at once, each time.
+    ui_exits: bool,
 }
 
 impl Bench {
@@ -70,6 +83,8 @@ impl Bench {
             daemon: None,
             project: None,
             build: None,
+            ui_port: None,
+            ui_exits: false,
         }
     }
 
@@ -124,6 +139,12 @@ impl Bench {
             daemon
                 .env("OWLSHIFT_BENCH_COMMIT", commit)
                 .env("OWLSHIFT_BENCH_BUILT_AT", built_at.to_string());
+        }
+        if let Some(port) = self.ui_port {
+            daemon.env("OWLSHIFT_BENCH_UI_PORT", port.to_string());
+        }
+        if self.ui_exits {
+            daemon.env("OWLSHIFT_BENCH_UI", "exit");
         }
         self.daemon = Some(daemon.spawn().unwrap());
     }
@@ -228,6 +249,33 @@ impl Bench {
     fn daemon_pid(&self) -> u32 {
         self.daemon.as_ref().unwrap().id()
     }
+
+    /// The pid the UI's stand-in wrote last.
+    fn ui_pid(&self) -> Option<u32> {
+        fs::read_to_string(self.data().join("bench-ui.pid"))
+            .ok()?
+            .trim()
+            .parse()
+            .ok()
+    }
+
+    /// The answer of the UI's stand-in on `port` other than `not`'s, once
+    /// there is one: its pid and its run secret's fingerprint.
+    fn ui(&self, port: u16, not: Option<u32>) -> (u32, String) {
+        let mut seen = None;
+        self.wait_for("the web UI to answer", || {
+            seen = ui_answer(port).filter(|(pid, _)| Some(*pid) != not);
+            seen.is_some()
+        });
+        seen.unwrap()
+    }
+
+    /// Waits until the port is free and the UI `pid` gone.
+    fn ui_gone(&self, port: u16, pid: u32) {
+        self.wait_for("the web UI to be gone and its port free", || {
+            !alive(pid) && TcpListener::bind(("127.0.0.1", port)).is_ok()
+        });
+    }
 }
 
 /// Stops, on a test's way out, what it left running: on a failure only,
@@ -240,6 +288,11 @@ impl Drop for Bench {
         if let Some(daemon) = &mut self.daemon {
             let _ = daemon.kill();
             let _ = daemon.wait();
+        }
+        if let Some(pid) = self.ui_pid() {
+            let _ = Command::new("kill")
+                .args(["-s", "KILL", &pid.to_string()])
+                .status();
         }
         for repo in [WEB, API] {
             for (watch, step) in self.watches(repo) {
@@ -1095,4 +1148,292 @@ fn an_upgrade_drain_ends_75_unless_a_stop_is_asked_meanwhile() {
         "{}",
         bench.output()
     );
+}
+
+/// A port of 127.0.0.1 free now.
+fn free_port() -> u16 {
+    TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port()
+}
+
+/// What the UI's stand-in on `port` answers, within 200 ms: its pid and its
+/// run secret's fingerprint. `None` while the daemon holds the port with no
+/// UI: the connection waits in the socket's queue.
+fn ui_answer(port: u16) -> Option<(u32, String)> {
+    let stream = TcpStream::connect(("127.0.0.1", port)).ok()?;
+    stream
+        .set_read_timeout(Some(Duration::from_millis(200)))
+        .ok()?;
+    let mut line = String::new();
+    BufReader::new(stream).read_line(&mut line).ok()?;
+    let mut words = line.split_whitespace();
+    (words.next()? == "bench-ui").then_some(())?;
+    Some((words.next()?.parse().ok()?, words.next()?.to_owned()))
+}
+
+/// OWL-467: the UI starts with the daemon; killed, it starts again after the
+/// bench's first delay, then after twice that, with the same run secret;
+/// while it is down, the daemon holds its port. A record of an earlier run
+/// is gone once the daemon starts.
+#[test]
+fn the_ui_starts_with_the_daemon_and_starts_again_after_a_kill() {
+    let mut bench = Bench::new();
+    let port = free_port();
+    bench.ui_port = Some(port);
+    let data = bench.data();
+    fs::create_dir_all(daemon::service_dir(&data)).unwrap();
+    fs::write(
+        record::file(&data),
+        r#"{"format":1,"pid":1,"port":1,"since":"2026-11-01T00:00:00Z"}"#,
+    )
+    .unwrap();
+    assert!(record::read(&data).unwrap().is_some());
+    bench.start();
+    let (mut last, digest) = bench.ui(port, None);
+    assert!(record::read(&data).unwrap().is_none(), "{}", bench.output());
+    assert!(token::token_file(&data).exists());
+    let mut delays = Vec::new();
+    for _ in 0..2 {
+        bench.signal("KILL", last);
+        let killed = Instant::now();
+        let mut answered = None;
+        bench.wait_for("the web UI to start again", || {
+            answered = ui_answer(port).filter(|(pid, _)| *pid != last);
+            if answered.is_none() {
+                let taken = TcpListener::bind(("127.0.0.1", port));
+                assert!(
+                    taken.is_err_and(|error| error.kind() == std::io::ErrorKind::AddrInUse),
+                    "the port is free while the UI is down"
+                );
+            }
+            answered.is_some()
+        });
+        delays.push(killed.elapsed());
+        let (pid, again) = answered.unwrap();
+        assert_eq!(again, digest, "the same daemon run, the same run secret");
+        last = pid;
+    }
+    for (delay, least) in delays.iter().zip([300, 600]) {
+        assert!(
+            *delay >= Duration::from_millis(least),
+            "{delays:?}\n{}",
+            bench.output()
+        );
+    }
+    assert!(
+        bench
+            .output()
+            .contains(&format!("Started the web UI on 127.0.0.1:{port}")),
+        "{}",
+        bench.output()
+    );
+    bench.signal("TERM", bench.daemon_pid());
+    assert!(bench.ended().success(), "{}", bench.output());
+    bench.ui_gone(port, last);
+}
+
+/// OWL-467: each daemon run hands its UI a run secret of its own, so a new
+/// daemon start ends every session.
+#[test]
+fn a_new_daemon_hands_over_a_new_run_secret() {
+    let mut bench = Bench::new();
+    let port = free_port();
+    bench.ui_port = Some(port);
+    bench.start();
+    let (first, digest) = bench.ui(port, None);
+    requests::ask_stop(
+        &bench.data(),
+        &Request::new(BY_STOP, Timestamp::now(), "asked by the test"),
+    )
+    .unwrap();
+    assert!(bench.ended().success(), "{}", bench.output());
+    bench.ui_gone(port, first);
+    bench.start();
+    let (second, again) = bench.ui(port, Some(first));
+    assert_ne!(again, digest);
+    bench.signal("TERM", bench.daemon_pid());
+    assert!(bench.ended().success(), "{}", bench.output());
+    bench.ui_gone(port, second);
+}
+
+/// OWL-467: a UI that keeps ending is started again each time, and told at
+/// the third end in a row, with what it said.
+#[test]
+fn a_ui_that_keeps_ending_is_told_at_the_third_end() {
+    let mut bench = Bench::new();
+    bench.ui_port = Some(free_port());
+    bench.ui_exits = true;
+    bench.start();
+    bench.wait_for("the third end to be told", || {
+        bench
+            .notes()
+            .iter()
+            .any(|note| note.starts_with("Owlshift: the web UI ended 3 times in a row"))
+    });
+    let output = bench.output();
+    assert!(output.contains("ui: bench-ui exits as asked"), "{output}");
+    assert!(
+        output.contains(
+            "The web UI ended (exit status: 1: bench-ui exits as asked): started again in"
+        ),
+        "{output}"
+    );
+    assert_eq!(bench.notes().len(), 1, "{:?}", bench.notes());
+    bench.signal("TERM", bench.daemon_pid());
+    assert!(bench.ended().success(), "{}", bench.output());
+}
+
+/// OWL-467: a port another program holds is said, naming it and `[ui]
+/// port`, and tried again with the restart delays until it is free; the
+/// token is made before the first try.
+#[test]
+fn a_taken_port_is_said_and_tried_again() {
+    let mut bench = Bench::new();
+    let holder = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = holder.local_addr().unwrap().port();
+    bench.ui_port = Some(port);
+    bench.start();
+    let said = format!(
+        "Port {port} of 127.0.0.1, `[ui] port` of the personal file, is taken by another \
+         program: the web UI does not start; tried again in"
+    );
+    bench.wait_for("the taken port to be said", || {
+        bench.output().contains(&said)
+    });
+    assert!(token::token_file(&bench.data()).exists());
+    drop(holder);
+    let (pid, _) = bench.ui(port, None);
+    bench.signal("TERM", bench.daemon_pid());
+    assert!(bench.ended().success(), "{}", bench.output());
+    bench.ui_gone(port, pid);
+}
+
+/// OWL-467: at a stop by request, and at an upgrade's drain, the UI serves
+/// until every watch has ended, then is stopped; the port is free once the
+/// daemon has exited.
+#[test]
+fn a_stop_and_an_upgrade_end_the_ui_after_the_watches() {
+    let mut bench = Bench::new();
+    let port = free_port();
+    bench.ui_port = Some(port);
+    bench.serve(WEB);
+    let linger = bench.bench_dir(WEB).join("linger");
+    for (times, upgrade) in [(1, false), (2, true)] {
+        fs::create_dir_all(bench.bench_dir(WEB)).unwrap();
+        fs::write(&linger, "").unwrap();
+        bench.start();
+        bench.running(WEB);
+        let (pid, _) = bench.ui(port, bench.ui_pid().filter(|pid| !alive(*pid)));
+        if upgrade {
+            requests::ask_drain(&bench.data(), &upgrade_drain()).unwrap();
+        } else {
+            requests::ask_stop(
+                &bench.data(),
+                &Request::new(BY_STOP, Timestamp::now(), "asked by the test"),
+            )
+            .unwrap();
+        }
+        bench.wait_for("the watch to hold its drain", || {
+            bench.output().matches("drains, its step under way").count() >= times
+        });
+        assert!(alive(pid), "{}", bench.output());
+        assert_eq!(ui_answer(port).map(|(answered, _)| answered), Some(pid));
+        fs::remove_file(&linger).unwrap();
+        let status = bench.ended();
+        let expected = if upgrade { 75 } else { 0 };
+        assert_eq!(
+            status.code(),
+            Some(expected),
+            "{status}\n{}",
+            bench.output()
+        );
+        bench.ui_gone(port, pid);
+    }
+    assert_eq!(
+        bench.output().matches("The web UI ended (").count(),
+        2,
+        "{}",
+        bench.output()
+    );
+}
+
+/// OWL-467: a SIGTERM stops the UI with the daemon, and a hard kill of the
+/// daemon leaves no UI: its sentinel stops it.
+#[test]
+fn a_sigterm_and_a_hard_kill_leave_no_ui() {
+    let mut bench = Bench::new();
+    let port = free_port();
+    bench.ui_port = Some(port);
+    bench.start();
+    let (first, _) = bench.ui(port, None);
+    bench.signal("TERM", bench.daemon_pid());
+    assert!(bench.ended().success(), "{}", bench.output());
+    bench.ui_gone(port, first);
+    bench.start();
+    let (second, _) = bench.ui(port, Some(first));
+    bench.signal("KILL", bench.daemon_pid());
+    let _ = bench.ended();
+    bench.ui_gone(port, second);
+}
+
+/// Whether the process `pid` holds a socket on `port` of 127.0.0.1: `None`
+/// when this system offers no way to tell.
+fn holds_socket(pid: u32, port: u16) -> Option<bool> {
+    match Command::new("lsof")
+        .args(["-a", "-p", &pid.to_string(), &format!("-iTCP:{port}")])
+        .stderr(Stdio::null())
+        .output()
+    {
+        Ok(output) => return Some(!output.stdout.is_empty()),
+        Err(error) if error.kind() != std::io::ErrorKind::NotFound => panic!("lsof: {error}"),
+        Err(_) => {}
+    }
+    // Linux without lsof: the listening socket's inode in /proc/net/tcp,
+    // then the process's descriptors.
+    let table = fs::read_to_string("/proc/net/tcp").ok()?;
+    let local = format!("0100007F:{port:04X}");
+    let inode = table.lines().skip(1).find_map(|line| {
+        let fields: Vec<&str> = line.split_whitespace().collect();
+        (fields.get(1) == Some(&local.as_str()) && fields.get(3) == Some(&"0A"))
+            .then(|| fields.get(9).map(|inode| (*inode).to_owned()))
+            .flatten()
+    })?;
+    let wanted = format!("socket:[{inode}]");
+    let descriptors = fs::read_dir(format!("/proc/{pid}/fd")).ok()?;
+    Some(descriptors.filter_map(Result::ok).any(|entry| {
+        fs::read_link(entry.path()).is_ok_and(|target| target.to_string_lossy() == wanted)
+    }))
+}
+
+/// OWL-467: the daemon's copies of the UI's socket are close-on-exec: a
+/// watch started while it holds the socket, and its step, hold none; the
+/// UI does.
+#[test]
+fn a_watch_holds_no_socket_of_the_ui() {
+    let mut bench = Bench::new();
+    let port = free_port();
+    bench.ui_port = Some(port);
+    bench.serve(WEB);
+    bench.start();
+    let (first, _) = bench.running(WEB);
+    let (ui, _) = bench.ui(port, None);
+    // The first watch may have started before the bind: kill it, so the
+    // next starts while the daemon holds the socket.
+    let started = bench.watches(WEB).len();
+    bench.signal("KILL", first);
+    bench.wait_for("the watch to start again", || {
+        bench.watches(WEB).len() > started
+    });
+    let (watch, step) = bench.running(WEB);
+    if let Some(held) = holds_socket(ui, port) {
+        assert!(held, "the UI holds its socket");
+        assert_eq!(holds_socket(watch, port), Some(false), "the watch");
+        assert_eq!(holds_socket(step, port), Some(false), "its step");
+    }
+    bench.signal("TERM", bench.daemon_pid());
+    assert!(bench.ended().success(), "{}", bench.output());
+    bench.ui_gone(port, ui);
 }
