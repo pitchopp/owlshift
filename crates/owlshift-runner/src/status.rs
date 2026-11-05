@@ -21,6 +21,8 @@
 //! `merge_waits` and final `merge_refused` events and the ticket refs.
 //!
 //! [`gather`] does the reading; [`watch_state`] and [`render`] are pure.
+//! [`gather_files`] reads all of it but the event log, for the web UI's
+//! header (OWL-467), which reads no event log.
 //! `owlshift status --waits`, what each ticket in flight waits on, is
 //! [`waits`] (OWL-459).
 
@@ -49,7 +51,9 @@ use crate::{ticket_ref, watch, why};
 
 pub mod waits;
 
-/// Everything `owlshift status` shows.
+/// Everything `owlshift status` shows. [`gather_files`] leaves unread what
+/// only the event log tells: each project's watch is [`Watch::NotRead`]
+/// while a daemon runs, and `merges_waiting` and `drain_steps` are empty.
 #[derive(Clone, Debug)]
 pub struct Report {
     pub daemon: Daemon,
@@ -133,6 +137,10 @@ pub struct Project {
     /// The tickets whose questions wait for a person, and the parked ones.
     pub waiting: Vec<TicketId>,
     pub parked: Vec<TicketId>,
+    /// The tickets at Watch whose pull request watch follows: for a person
+    /// to review (OWL-467). The web UI's header counts them; `render` does
+    /// not show them.
+    pub in_review: Vec<TicketId>,
     /// Its green pull requests that wait for a person to merge them
     /// (OWL-464), by [`merge_waits`].
     pub merges_waiting: Vec<MergeWait>,
@@ -228,6 +236,9 @@ fn followed_head(dirs: &ProjectDirs, ticket: &TicketId, notes: &mut Vec<String>)
 pub enum Watch {
     /// No daemon runs, so no watch is served.
     NoDaemon,
+    /// A daemon runs, and the event log that tells its watch was not read:
+    /// [`gather_files`]'s, never [`gather`]'s (OWL-467).
+    NotRead,
     /// The daemon running now has not started it yet.
     NotStarted,
     /// Started at `since`, process `pid`.
@@ -337,15 +348,62 @@ pub(crate) fn served_projects(data: &Path, notes: &mut Vec<String>) -> Vec<(Serv
 
 /// Reads what `owlshift status` shows of the data directory `data`, its
 /// slots counted up to `concurrent_runs`, its harnesses' caps `caps`, at
-/// `now`.
+/// `now`: [`gather_files`], then the event log's part.
 pub fn gather(data: &Path, concurrent_runs: u32, caps: &[(Harness, u8)], now: Timestamp) -> Report {
+    let mut report = gather_files(data, concurrent_runs, caps, now);
+    let events = read_events(data, &mut report.notes);
+    // A record that does not read leaves the daemon's start unknown: every
+    // event counts.
+    let since = match &report.daemon {
+        Daemon::Running(record) => Some(
+            record
+                .as_ref()
+                .map_or(Timestamp::MIN, |record| record.since),
+        ),
+        _ => None,
+    };
+    for project in &mut report.projects {
+        if let Some(since) = since {
+            project.watch = watch_state(&events, &project.repository, since);
+        }
+        let Ok(repo) = Repo::parse(&project.repository) else {
+            continue;
+        };
+        let dirs = ProjectDirs::new(data, &repo);
+        project.merges_waiting = merge_waits(&events, &project.repository, |ticket| {
+            followed_head(&dirs, ticket, &mut report.notes)
+        });
+    }
+    report.drain_steps = match (&report.daemon, &report.slots) {
+        (Daemon::Running(_), Some((held, _)))
+            if report.stop_asked.is_some() || report.drain_asked.is_some() =>
+        {
+            drain_steps(held, &events)
+        }
+        _ => Vec::new(),
+    };
+    report
+}
+
+/// What [`gather`] reads but the event log, which it never opens
+/// (OWL-467): the daemon, the served projects and their records, ticket
+/// refs, pauses, stop files and quarantines, the stop and drain requests,
+/// the slots and the steps typed in a terminal, the usage and the digest.
+/// Each project's watch is [`Watch::NoDaemon`] when no daemon runs and
+/// [`Watch::NotRead`] otherwise; no merge waits and no drain steps are
+/// read.
+pub fn gather_files(
+    data: &Path,
+    concurrent_runs: u32,
+    caps: &[(Harness, u8)],
+    now: Timestamp,
+) -> Report {
     let mut notes = Vec::new();
     let daemon = match daemon::running(data) {
         Ok(None) => Daemon::NotRunning,
         Ok(Some(record)) => Daemon::Running(record),
         Err(error) => Daemon::Unknown(error.to_string()),
     };
-    let events = read_events(data, &mut notes);
     let mut projects = Vec::new();
     let mut named = Vec::new();
     for (entry, repo) in served_projects(data, &mut notes) {
@@ -354,27 +412,10 @@ pub fn gather(data: &Path, concurrent_runs: u32, caps: &[(Harness, u8)], now: Ti
         let config = served::read_record(&dirs)
             .map(|record| record.unwrap_or_else(|| ServedConfig::new(repo.to_string())));
         let watch = match &daemon {
-            Daemon::Running(record) => {
-                // A record that does not read leaves the daemon's start
-                // unknown: every event counts.
-                let since = record
-                    .as_ref()
-                    .map_or(Timestamp::MIN, |record| record.since);
-                watch_state(&events, &entry.repository, since)
-            }
+            Daemon::Running(_) => Watch::NotRead,
             _ => Watch::NoDaemon,
         };
-        let (mut waiting, mut parked) = (Vec::new(), Vec::new());
-        for (ticket, status) in why::statuses(&dirs, &mut notes) {
-            match status {
-                Status::NeedsInput { .. } => waiting.push(ticket),
-                Status::Parked { .. } => parked.push(ticket),
-                Status::Active(_) => {}
-            }
-        }
-        let merges_waiting = merge_waits(&events, &entry.repository, |ticket| {
-            followed_head(&dirs, ticket, &mut notes)
-        });
+        let (waiting, parked, in_review) = sorted(why::standings(&dirs, &mut notes));
         projects.push(Project {
             repository: entry.repository,
             checkout: entry.checkout,
@@ -385,7 +426,8 @@ pub fn gather(data: &Path, concurrent_runs: u32, caps: &[(Harness, u8)], now: Ti
             quarantine: quarantine_line(&dirs),
             waiting,
             parked,
-            merges_waiting,
+            in_review,
+            merges_waiting: Vec::new(),
         });
     }
     let slots = match MachineSlots::new(data, concurrent_runs).holders() {
@@ -411,19 +453,11 @@ pub fn gather(data: &Path, concurrent_runs: u32, caps: &[(Harness, u8)], now: Ti
             None
         }
     };
-    let stop_asked = requests::stop_asked(data);
-    let drain_asked = requests::drain_asked(data);
-    let drain_steps = match (&daemon, &slots) {
-        (Daemon::Running(_), Some((held, _))) if stop_asked.is_some() || drain_asked.is_some() => {
-            drain_steps(held, &events)
-        }
-        _ => Vec::new(),
-    };
     Report {
         daemon,
-        stop_asked,
-        drain_asked,
-        drain_steps,
+        stop_asked: requests::stop_asked(data),
+        drain_asked: requests::drain_asked(data),
+        drain_steps: Vec::new(),
         machine_pause: requests::machine_pause(data),
         projects,
         slots,
@@ -432,6 +466,23 @@ pub fn gather(data: &Path, concurrent_runs: u32, caps: &[(Harness, u8)], now: Ti
         digest,
         notes,
     }
+}
+
+/// The tickets of `standings` whose questions wait for a person, the parked
+/// ones, and those whose pull request watch follows, for a person to review.
+fn sorted(
+    standings: Vec<(TicketId, Status, bool)>,
+) -> (Vec<TicketId>, Vec<TicketId>, Vec<TicketId>) {
+    let (mut waiting, mut parked, mut in_review) = (Vec::new(), Vec::new(), Vec::new());
+    for (ticket, status, followed) in standings {
+        match status {
+            Status::NeedsInput { .. } => waiting.push(ticket),
+            Status::Parked { .. } => parked.push(ticket),
+            Status::Active(_) if followed => in_review.push(ticket),
+            Status::Active(_) => {}
+        }
+    }
+    (waiting, parked, in_review)
 }
 
 /// The steps a draining daemon waits on: the holders of the slots `held`,
@@ -648,6 +699,7 @@ pub fn render(report: &Report, tz: &TimeZone) -> String {
             "  watch: {}",
             match &project.watch {
                 Watch::NoDaemon => "none, no daemon runs".to_owned(),
+                Watch::NotRead => "not read".to_owned(),
                 Watch::NotStarted => "not started yet".to_owned(),
                 Watch::Running { pid, since } => format!(
                     "running since {}{}",
@@ -825,6 +877,73 @@ mod tests {
             EventKind::Decision,
             details,
         );
+    }
+
+    /// OWL-467: the files' reading never opens the event log, which `gather`
+    /// reads, and leaves a running daemon's watches unread.
+    #[test]
+    fn gather_files_never_reads_the_event_log() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path();
+        let served = ServedProjects {
+            format: Format,
+            projects: vec![ServedProject {
+                repository: "acme/web".to_owned(),
+                checkout: "/home/ada/acme/web".to_owned(),
+            }],
+        };
+        crate::step::write_atomically(&Registry::in_data_dir(data_dir).file(), &served.render())
+            .unwrap();
+        let log = EventLog::in_dir(data_dir).path().to_owned();
+        std::fs::create_dir_all(&log).unwrap();
+        let event_note = |notes: &[String]| notes.iter().any(|note| note.contains("event log"));
+
+        let files = gather_files(data_dir, 2, &[], Timestamp::now());
+        assert!(!event_note(&files.notes), "{:?}", files.notes);
+        assert_eq!(files.projects[0].watch, Watch::NoDaemon);
+        let all = gather(data_dir, 2, &[], Timestamp::now());
+        assert!(event_note(&all.notes), "{:?}", all.notes);
+
+        let _daemon = daemon::instance::take(data_dir, &record(Timestamp::now()))
+            .unwrap()
+            .unwrap();
+        let files = gather_files(data_dir, 2, &[], Timestamp::now());
+        assert_eq!(files.projects[0].watch, Watch::NotRead);
+        assert!(!event_note(&files.notes), "{:?}", files.notes);
+        let all = gather(data_dir, 2, &[], Timestamp::now());
+        assert_eq!(all.projects[0].watch, Watch::NotStarted);
+        let text = render(&files, &TimeZone::UTC);
+        assert!(text.contains("  watch: not read"), "{text}");
+    }
+
+    /// OWL-467: a ticket at Watch whose pull request watch follows is for a
+    /// person to review; one whose following ended is not.
+    #[test]
+    fn a_followed_pull_request_at_watch_is_in_review() {
+        let id = |id: &str| TicketId::new(id).unwrap();
+        let (waiting, parked, in_review) = sorted(vec![
+            (id("OWL-1"), Status::Active(Stage::Watch), true),
+            (id("OWL-2"), Status::Active(Stage::Watch), false),
+            (
+                id("OWL-3"),
+                Status::NeedsInput {
+                    return_to: Stage::Design,
+                },
+                false,
+            ),
+            (
+                id("OWL-4"),
+                Status::Parked {
+                    at: Stage::Build,
+                    awaiting_input: false,
+                },
+                false,
+            ),
+            (id("OWL-5"), Status::Active(Stage::Build), false),
+        ]);
+        assert_eq!(in_review, [id("OWL-1")]);
+        assert_eq!(waiting, [id("OWL-3")]);
+        assert_eq!(parked, [id("OWL-4")]);
     }
 
     /// The acceptance: a running daemon serving two projects, one whose
