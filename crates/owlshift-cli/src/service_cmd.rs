@@ -35,7 +35,7 @@ use crate::do_cmd::loaded_project;
 use crate::{data_dir, fail, own_build};
 
 /// Why the service is refused on native Windows.
-const ON_WINDOWS: &str = "the background service runs on macOS and Linux, and on Windows through \
+pub(crate) const ON_WINDOWS: &str = "the background service runs on macOS and Linux, and on Windows through \
      WSL2: native Windows runs no agent (D9)";
 
 /// How long `owlshift start` waits for the daemon it launched to run.

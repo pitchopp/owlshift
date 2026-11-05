@@ -16,7 +16,7 @@ use owlshift_runner::ui::auth::{self, RunSecret, Session};
 use owlshift_runner::ui::server::{
     self, APP_CSS, APP_JS, INDEX_HTML, Options, SUPERSEDED_LINE, ServeError, Serving,
 };
-use owlshift_runner::ui::{personal_at, record, token};
+use owlshift_runner::ui::{personal_at, probe, record, token};
 use serde_json::{Value, json};
 
 /// A response as the wire carries it.
@@ -492,17 +492,17 @@ fn the_token_never_appears_in_a_request() {
     let mut stream = open_stream(port, &session);
     assert!(next_line(&mut stream).unwrap().starts_with(r#"{"header":"#));
     drop(stream);
-    let challenge = [9u8; auth::CHALLENGE_LEN];
-    let reply = post_json(
-        port,
-        "/api/proof",
-        &json!({ "challenge": auth::hex(&challenge) }),
-    );
-    assert_eq!(reply.status, 200);
+    // The listener check of `owlshift ui` and `owlshift doctor`.
+    assert!(matches!(
+        probe::probe(data.path(), port),
+        probe::Probe::Proved(Some(_))
+    ));
     let token = token::read_token(data.path()).unwrap();
     let recorded = recorded.lock().unwrap().clone();
     let text = String::from_utf8_lossy(&recorded);
-    assert!(text.contains("/api/login") && text.contains("/api/stream"));
+    for path in ["/api/proof", "/api/login", "/api/header", "/api/stream"] {
+        assert!(text.contains(path), "{path}");
+    }
     assert!(!text.contains(&token.to_hex()));
     assert!(
         !recorded

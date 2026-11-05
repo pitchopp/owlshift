@@ -15,6 +15,8 @@
 //! - *The server* ([`server`]): tiny_http and threads on the socket the
 //!   daemon hands over, its routes and checks, and the page carried in the
 //!   binary.
+//! - *The probe* ([`probe`]): whether the web UI listens, proved by its
+//!   answer to a challenge, for `owlshift ui` and `owlshift doctor`.
 
 use owlshift_contracts::config::{DEFAULT_UI_PORT, PersonalConfig};
 
@@ -22,6 +24,7 @@ use crate::config::FileState;
 
 pub mod auth;
 pub mod header;
+pub mod probe;
 pub mod record;
 pub mod server;
 pub mod token;
