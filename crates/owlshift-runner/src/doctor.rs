@@ -5853,16 +5853,21 @@ states = { ready = "Todo", working = "Doing", needs_input = "Asked", review = "R
             );
             assert!(report.ready(), "{report}");
         }
+        // The fake's home is not absolute on Windows: the log shows whole.
+        let log = shown(
+            &crate::daemon::service_dir(Path::new("/home/ada/.local/share/owlshift"))
+                .join("daemon.log"),
+            Some(Path::new("/home/ada")),
+        );
+        #[cfg(unix)]
+        assert_eq!(log, "~/.local/share/owlshift/service/daemon.log");
         for probe in [Probe::Silent { recorded: true }, Probe::Refused] {
             let report = run(&system().ui_is(probe), &no_config());
             let check = line(&report, "web UI");
             assert_eq!(check.status, Status::Warn, "{report}");
             assert!(check.detail.contains("127.0.0.1:18466"), "{}", check.detail);
             let why = check.why.as_deref().unwrap();
-            assert!(
-                why.contains("~/.local/share/owlshift/service/daemon.log"),
-                "{why}"
-            );
+            assert!(why.contains(&log), "{why}");
             assert!(report.ready(), "{report}");
         }
         let report = run(

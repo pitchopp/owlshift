@@ -620,6 +620,12 @@ fn the_page_sets_every_text_as_text() {
     }
 }
 
+/// `asset` with LF line ends: a checkout on Windows may give the assets CRLF
+/// ones, which the tests that match across lines do not mean.
+fn lf(asset: &str) -> String {
+    asset.replace("\r\n", "\n")
+}
+
 /// The text of the block of `css` that opens with `opening`, up to its
 /// closing brace at `indent`.
 fn block<'a>(css: &'a str, opening: &str, indent: &str) -> &'a str {
@@ -671,6 +677,7 @@ fn the_style_sheet_holds_each_theme_role_light_and_dark() {
 #[test]
 fn each_state_shows_its_symbol_beside_its_colour() {
     // Visual identity section 4, "States": ✓ ! ✗ ·.
+    let app_css = lf(APP_CSS);
     for (state, symbol) in [
         ("success", r#""\2713""#),
         ("warning", r#""!""#),
@@ -679,7 +686,7 @@ fn each_state_shows_its_symbol_beside_its_colour() {
     ] {
         // Its own rule, a line of its own after a blank line, not the
         // grouped one that sets the symbols' spacing.
-        let rule = block(APP_CSS, &format!("\n\n.state-{state}::before {{"), "");
+        let rule = block(&app_css, &format!("\n\n.state-{state}::before {{"), "");
         assert!(
             rule.contains(&format!("content: {symbol};")),
             "{state}: {rule}"
@@ -713,7 +720,8 @@ fn a_hidden_element_stays_hidden_and_a_logout_empties_the_header() {
 fn a_logout_removes_the_stored_session_only_while_it_is_the_refused_one() {
     // Every tab of the origin shares the storage: an old tab told its
     // session ended must not remove the one a newer tab stored since.
-    let logged_out = block(APP_JS, "function loggedOut(sent) {", "");
+    let app_js = lf(APP_JS);
+    let logged_out = block(&app_js, "function loggedOut(sent) {", "");
     let guarded =
         "  if (current && sessionHeader(current) === sent) {\n    store(SESSION_KEY, null);\n  }";
     assert!(logged_out.contains(guarded), "{logged_out}");

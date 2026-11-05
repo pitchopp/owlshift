@@ -334,7 +334,13 @@ mod tests {
             let listener = TcpListener::bind("127.0.0.1:0").unwrap();
             listener.local_addr().unwrap().port()
         };
-        assert_eq!(probe(data.path(), port), Probe::Refused);
+        // Windows tries a refused loopback connection again for about two
+        // seconds, as long as `TIMEOUT`, before it says so; the web UI, like
+        // the daemon, never runs there.
+        assert_eq!(
+            probe_within(data.path(), port, Duration::from_secs(10)),
+            Probe::Refused
+        );
     }
 
     #[test]
