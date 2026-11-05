@@ -78,12 +78,24 @@ function session() {
   return null;
 }
 
+// The `X-Owlshift-Session` value of a session.
+function sessionHeader(current) {
+  return current.id + "." + current.secret;
+}
+
 function show(id, shown) {
   document.getElementById(id).hidden = !shown;
 }
 
-function loggedOut() {
-  store(SESSION_KEY, null);
+// Ends the session on this page. `sent` is the session a refused request
+// carried: the stored session is removed only while it is still that one,
+// since every tab of the origin shares the storage and a newer tab may have
+// logged in and stored its own since.
+function loggedOut(sent) {
+  const current = session();
+  if (current && sessionHeader(current) === sent) {
+    store(SESSION_KEY, null);
+  }
   clear(document.getElementById("header"));
   show("header", false);
   show("logged-out", true);
@@ -121,25 +133,27 @@ async function login() {
   store(SESSION_KEY, JSON.stringify({ id: value.id, secret: value.secret }));
 }
 
-// A fetch with the session; a 401 ends the session on this page.
+// A fetch with the session, answering the response and the session it
+// sent, or null; a 401 ends that session on this page.
 async function authedFetch(path) {
   const current = session();
   if (!current) {
-    loggedOut();
+    loggedOut(null);
     return null;
   }
+  const sent = sessionHeader(current);
   const headers = {};
-  headers[SESSION_HEADER] = current.id + "." + current.secret;
+  headers[SESSION_HEADER] = sent;
   const response = await fetch(path, {
     headers: headers,
     credentials: "omit",
     cache: "no-store",
   });
   if (response.status === 401) {
-    loggedOut();
+    loggedOut(sent);
     return null;
   }
-  return response;
+  return { response: response, sent: sent };
 }
 
 function fact(label, value, className) {
@@ -251,11 +265,14 @@ let retry = 2000;
 async function follow() {
   let superseded = false;
   let ended = false;
+  let sent = null;
   try {
-    const response = await authedFetch("/api/stream");
-    if (!response) {
+    const answer = await authedFetch("/api/stream");
+    if (!answer) {
       return;
     }
+    sent = answer.sent;
+    const response = answer.response;
     if (!response.ok || !response.body) {
       throw new Error("the stream answered " + response.status);
     }
@@ -291,7 +308,7 @@ async function follow() {
     problem("The live header stopped: " + error.message);
   }
   if (ended) {
-    loggedOut();
+    loggedOut(sent);
     return;
   }
   if (superseded) {
@@ -323,7 +340,7 @@ async function start() {
     problem("The login failed: " + error.message);
   }
   if (!session()) {
-    loggedOut();
+    loggedOut(null);
     return;
   }
   follow();

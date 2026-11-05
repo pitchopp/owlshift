@@ -543,7 +543,9 @@ fn no_asset_holds_the_token_and_the_page_sends_only_the_code_and_the_session() {
         "{authed:?}"
     );
     assert!(APP_JS.contains("body: JSON.stringify({ code: match[1] })"));
-    assert!(APP_JS.contains("headers[SESSION_HEADER] = current.id + \".\" + current.secret"));
+    assert!(APP_JS.contains("return current.id + \".\" + current.secret;"));
+    assert!(APP_JS.contains("const sent = sessionHeader(current);"));
+    assert!(APP_JS.contains("headers[SESSION_HEADER] = sent;"));
     assert_eq!(APP_JS.matches("body:").count(), 1);
 }
 
@@ -698,13 +700,43 @@ fn a_hidden_element_stays_hidden_and_a_logout_empties_the_header() {
         block(APP_CSS, "[hidden] {", "").contains("display: none !important;"),
         "no [hidden] rule"
     );
-    let logged_out = block(APP_JS, "function loggedOut() {", "");
+    let logged_out = block(APP_JS, "function loggedOut(sent) {", "");
     assert!(
         logged_out.contains(r#"clear(document.getElementById("header"));"#),
         "{logged_out}"
     );
     // A stream the session no longer holds logs the page out.
     assert!(APP_JS.contains(r#"message.closed === "logged_out""#));
+}
+
+#[test]
+fn a_logout_removes_the_stored_session_only_while_it_is_the_refused_one() {
+    // Every tab of the origin shares the storage: an old tab told its
+    // session ended must not remove the one a newer tab stored since.
+    let logged_out = block(APP_JS, "function loggedOut(sent) {", "");
+    let guarded =
+        "  if (current && sessionHeader(current) === sent) {\n    store(SESSION_KEY, null);\n  }";
+    assert!(logged_out.contains(guarded), "{logged_out}");
+    assert_eq!(logged_out.matches("store(SESSION_KEY, null)").count(), 1);
+    // Each call names the session its request sent, or none when it sent
+    // none, which removes nothing.
+    let calls: Vec<&str> = APP_JS
+        .match_indices("loggedOut(")
+        .map(|(at, _)| APP_JS[at..].split(')').next().unwrap())
+        .collect();
+    assert_eq!(
+        calls,
+        [
+            "loggedOut(sent",
+            "loggedOut(null",
+            "loggedOut(sent",
+            "loggedOut(sent",
+            "loggedOut(null"
+        ],
+        "{calls:?}"
+    );
+    let follow = block(APP_JS, "async function follow() {", "");
+    assert!(follow.contains("sent = answer.sent;"), "{follow}");
 }
 
 #[test]
