@@ -133,6 +133,12 @@ max_in_flight = 10
 # How many pull requests Owlshift delivered may be open at once before the
 # drain dispatches no new Build: 1 to 20. Default: 3.
 max_open_prs = 20
+# Whether two Owlshift tickets may build on the same file at once:
+# "exclusive" (default), the later Build waits until the earlier pull
+# request ends; or "rebase", both build and the later one is refreshed
+# onto the first's merge, its checks run again (OWL-449). Named resources
+# (stack.resources) and people's pull requests stay exclusive.
+overlap = "rebase"
 # What the resolver may decide without the decider: "none", "facts",
 # "discoverable" (default), "ticket" or "all".
 resolver_delegation = "all"
