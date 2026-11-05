@@ -192,6 +192,28 @@ plan_approval = "never"
 always_human = []
 "#;
 
+/// A port of 127.0.0.1 free now.
+#[cfg(unix)]
+fn free_port() -> u16 {
+    std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port()
+}
+
+/// Writes the personal file of `config_dir`: no notification shown, and the
+/// web UI on `port` (OWL-467), so a daemon the test starts binds a port of
+/// its own.
+#[cfg(unix)]
+fn personal_file(config_dir: &Path, port: u16) {
+    fs::write(
+        config_dir.join("config.toml"),
+        format!("[notifications]\ndesktop = false\n\n[ui]\nport = {port}\n"),
+    )
+    .unwrap();
+}
+
 /// A checkout of `acme/web` holding [`DRAINED_PROJECT`].
 #[cfg(unix)]
 fn web_checkout() -> tempfile::TempDir {
@@ -219,11 +241,7 @@ fn the_daemon_runs_once_pauses_a_project_it_cannot_serve_and_stops() {
     use std::process::Stdio;
 
     let config_dir = tempfile::tempdir().unwrap();
-    fs::write(
-        config_dir.path().join("config.toml"),
-        "[notifications]\ndesktop = false\n",
-    )
-    .unwrap();
+    personal_file(config_dir.path(), free_port());
     let data = config_dir.path().join("data");
     let service = data.join("service");
     fs::create_dir_all(&service).unwrap();
@@ -382,11 +400,7 @@ fn uninstall_purges_owlshifts_entries_and_leaves_the_rest() {
 #[test]
 fn start_runs_the_daemon_for_the_session_and_stop_ends_it() {
     let config_dir = tempfile::tempdir().unwrap();
-    fs::write(
-        config_dir.path().join("config.toml"),
-        "[notifications]\ndesktop = false\n",
-    )
-    .unwrap();
+    personal_file(config_dir.path(), free_port());
     let checkout = web_checkout();
     let started = command(checkout.path(), config_dir.path(), &["start"])
         .env("GIT_ALLOW_PROTOCOL", "file")
@@ -593,6 +607,13 @@ fn personal_config_file_is_read_from_the_override_directory() {
 /// login, which needs `claude`, is not asked of the keychain.
 #[cfg(unix)]
 fn doctor(args: &[&str]) -> Output {
+    let config_dir = tempfile::tempdir().unwrap();
+    doctor_in(config_dir.path(), args)
+}
+
+/// [`doctor`] with the configuration directory `config_dir`.
+#[cfg(unix)]
+fn doctor_in(config_dir: &Path, args: &[&str]) -> Output {
     use std::os::unix::fs::PermissionsExt;
 
     let bin = tempfile::tempdir().unwrap();
@@ -606,10 +627,9 @@ fn doctor(args: &[&str]) -> Output {
     )
     .unwrap();
     fs::set_permissions(&git, fs::Permissions::from_mode(0o755)).unwrap();
-    let config_dir = tempfile::tempdir().unwrap();
     let mut all = vec!["doctor"];
     all.extend_from_slice(args);
-    command(config_dir.path(), config_dir.path(), &all)
+    command(config_dir, config_dir, &all)
         .env("PATH", format!("{}:/usr/bin:/bin", bin.path().display()))
         .env_remove("NO_COLOR")
         .output()
@@ -2024,4 +2044,349 @@ fn why_tells_each_waiting_ticket_its_reason_while_the_project_is_locked() {
             .status
             .success()
     );
+}
+
+/// A daemon a test started, killed if the test fails: its sentinel then
+/// stops the web UI it ran.
+#[cfg(unix)]
+struct Daemon {
+    child: std::process::Child,
+    out: std::path::PathBuf,
+    err: std::path::PathBuf,
+}
+
+#[cfg(unix)]
+impl Daemon {
+    /// `owlshift daemon` on `config_dir`, its output appended to the files
+    /// the daemons before it wrote.
+    fn start(config_dir: &Path) -> Self {
+        use std::os::unix::process::CommandExt;
+        use std::process::Stdio;
+
+        let out = config_dir.join("daemon.out");
+        let err = config_dir.join("daemon.err");
+        let append = |path: &Path| {
+            fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(path)
+                .unwrap()
+        };
+        let child = command(config_dir, config_dir, &["daemon"])
+            .stdin(Stdio::null())
+            .stdout(append(&out))
+            .stderr(append(&err))
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        Self { child, out, err }
+    }
+
+    fn said(&self) -> String {
+        format!(
+            "--- out\n{}--- err\n{}",
+            fs::read_to_string(&self.out).unwrap_or_default(),
+            fs::read_to_string(&self.err).unwrap_or_default()
+        )
+    }
+
+    /// Sends SIGTERM and waits for the daemon's end: a success.
+    fn stop(&mut self) {
+        let sent = Command::new("kill")
+            .args(["-s", "TERM", &self.child.id().to_string()])
+            .status()
+            .unwrap();
+        assert!(sent.success());
+        let mut status = None;
+        let ended = wait::reached(wait::REACHED, || {
+            status = self.child.try_wait().unwrap();
+            status.is_some()
+        });
+        assert!(ended, "the daemon still runs\n{}", self.said());
+        assert!(status.unwrap().success(), "{}", self.said());
+    }
+}
+
+#[cfg(unix)]
+impl Drop for Daemon {
+    fn drop(&mut self) {
+        if std::thread::panicking() {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+        }
+    }
+}
+
+/// The pid of the web UI `ui.json` names on `port`, once it names one that
+/// runs other than `not`.
+#[cfg(unix)]
+fn ui_listening(daemon: &Daemon, data: &Path, port: u16, not: Option<u32>) -> u32 {
+    let file = data.join("service/ui.json");
+    let mut pid = None;
+    wait::until_with(
+        "the web UI's record",
+        || daemon.said(),
+        || {
+            pid = fs::read_to_string(&file)
+                .ok()
+                .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
+                .filter(|record| record["port"] == port)
+                .and_then(|record| record["pid"].as_u64())
+                .and_then(|pid| u32::try_from(pid).ok())
+                .filter(|pid| Some(*pid) != not && is_alive(*pid));
+            pid.is_some()
+        },
+    );
+    pid.unwrap()
+}
+
+/// An HTTP/1.1 exchange with 127.0.0.1:`port`: the status, the head and the
+/// body.
+#[cfg(unix)]
+fn http(
+    port: u16,
+    method: &str,
+    path: &str,
+    headers: &[(&str, &str)],
+    body: &str,
+) -> (u16, String, String) {
+    use std::io::{Read, Write};
+
+    let mut stream = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+    stream
+        .set_read_timeout(Some(std::time::Duration::from_secs(30)))
+        .unwrap();
+    let mut request = format!("{method} {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n");
+    for (name, value) in headers {
+        request.push_str(&format!("{name}: {value}\r\n"));
+    }
+    if method == "POST" {
+        request.push_str(&format!(
+            "Content-Type: application/json\r\nContent-Length: {}\r\n",
+            body.len()
+        ));
+    }
+    request.push_str("Connection: close\r\n\r\n");
+    request.push_str(body);
+    stream.write_all(request.as_bytes()).unwrap();
+    let mut answer = String::new();
+    stream.read_to_string(&mut answer).unwrap();
+    let (head, body) = answer.split_once("\r\n\r\n").unwrap();
+    let status = head.split(' ').nth(1).unwrap().parse().unwrap();
+    (status, head.to_owned(), body.to_owned())
+}
+
+/// The code of the link `owlshift ui --print` (with `extra`) prints for
+/// `port`.
+#[cfg(unix)]
+fn login_code(config_dir: &Path, port: u16, extra: &[&str]) -> String {
+    let mut args = vec!["ui", "--print"];
+    args.extend_from_slice(extra);
+    let printed = owlshift(config_dir, config_dir, &args);
+    assert!(printed.status.success(), "{}", stderr(&printed));
+    let link = stdout(&printed);
+    let prefix = format!("http://127.0.0.1:{port}/#login=");
+    link.trim()
+        .strip_prefix(&prefix)
+        .unwrap_or_else(|| panic!("{link}"))
+        .to_owned()
+}
+
+/// Trades `code` for a session on `port`, from the UI's own origin: the
+/// header value, `None` when the code is refused.
+#[cfg(unix)]
+fn log_in(port: u16, code: &str) -> Option<String> {
+    let origin = format!("http://127.0.0.1:{port}");
+    let (status, _, body) = http(
+        port,
+        "POST",
+        "/api/login",
+        &[("Origin", &origin)],
+        &serde_json::json!({ "code": code }).to_string(),
+    );
+    if status != 200 {
+        assert_eq!(status, 401, "{body}");
+        return None;
+    }
+    let session: serde_json::Value = serde_json::from_str(&body).unwrap();
+    Some(format!(
+        "{}.{}",
+        session["id"].as_str().unwrap(),
+        session["secret"].as_str().unwrap()
+    ))
+}
+
+/// `/api/header` on `port` with `session`: its status and body.
+#[cfg(unix)]
+fn header_with(port: u16, session: &str) -> (u16, String) {
+    let (status, _, body) = http(
+        port,
+        "GET",
+        "/api/header",
+        &[("X-Owlshift-Session", session)],
+        "",
+    );
+    (status, body)
+}
+
+/// OWL-467: the frame loads from `owlshift ui --print`'s link, served by the
+/// daemon's child on `[ui] port`, and the code logs in once. A UI killed
+/// keeps the port held by the daemon and its sessions once started again;
+/// `--new-token` ends them, and so does a new daemon run.
+#[cfg(unix)]
+#[test]
+fn the_frame_loads_from_owlshift_ui_print() {
+    let config_dir = tempfile::tempdir().unwrap();
+    let port = free_port();
+    personal_file(config_dir.path(), port);
+    let data = config_dir.path().join("data");
+    let mut daemon = Daemon::start(config_dir.path());
+    let first = ui_listening(&daemon, &data, port, None);
+
+    let code = login_code(config_dir.path(), port, &[]);
+    let (status, head, body) = http(port, "GET", "/", &[], "");
+    assert_eq!(status, 200, "{head}");
+    assert!(
+        head.contains("Content-Security-Policy: default-src 'self'; frame-ancestors 'none'"),
+        "{head}"
+    );
+    assert!(body.contains("/app.js"), "{body}");
+    for asset in ["/app.js", "/app.css"] {
+        assert_eq!(http(port, "GET", asset, &[], "").0, 200, "{asset}");
+    }
+    let session = log_in(port, &code).expect("the printed code logs in");
+    let (status, body) = header_with(port, &session);
+    assert_eq!(status, 200, "{body}");
+    let header: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(header["daemon"]["state"], "running", "{header}");
+    assert_eq!(header["daemon"]["pid"], daemon.child.id(), "{header}");
+    for key in ["usage", "slots", "waiting", "projects"] {
+        assert!(header.get(key).is_some(), "{key}: {header}");
+    }
+    assert_eq!(log_in(port, &code), None, "a code logs in once");
+
+    // Killed, the UI starts again on the socket the daemon kept.
+    let killed = Command::new("kill")
+        .args(["-s", "KILL", &first.to_string()])
+        .status()
+        .unwrap();
+    assert!(killed.success());
+    assert!(
+        std::net::TcpListener::bind(("127.0.0.1", port)).is_err(),
+        "the daemon holds the port while the UI is down"
+    );
+    ui_listening(&daemon, &data, port, Some(first));
+    assert_eq!(header_with(port, &session).0, 200, "{}", daemon.said());
+
+    // A new token ends every session; its link logs in.
+    let code = login_code(config_dir.path(), port, &["--new-token"]);
+    assert_eq!(header_with(port, &session).0, 401);
+    let session = log_in(port, &code).expect("the new link logs in");
+    assert_eq!(header_with(port, &session).0, 200);
+
+    // A new daemon run ends every session of the one before.
+    let second = ui_listening(&daemon, &data, port, None);
+    daemon.stop();
+    let mut daemon = Daemon::start(config_dir.path());
+    ui_listening(&daemon, &data, port, Some(second));
+    assert_eq!(header_with(port, &session).0, 401);
+    let code = login_code(config_dir.path(), port, &[]);
+    let session = log_in(port, &code).expect("a new link logs in");
+    assert_eq!(header_with(port, &session).0, 200);
+    daemon.stop();
+}
+
+/// OWL-467: a port another program holds is named, with `[ui] port`, by the
+/// daemon, by `owlshift ui`, which mints no code, and by `owlshift doctor`:
+/// whether the program answers or stays silent. Without a daemon, `owlshift
+/// ui` names `owlshift start`; the UI's own form needs its descriptors.
+#[cfg(unix)]
+#[test]
+fn a_taken_ui_port_is_named() {
+    use std::io::{Read, Write};
+    use std::sync::{Arc, Mutex};
+
+    let config_dir = tempfile::tempdir().unwrap();
+    let no_daemon = owlshift(config_dir.path(), config_dir.path(), &["ui", "--print"]);
+    assert_eq!(no_daemon.status.code(), Some(1));
+    assert!(
+        stderr(&no_daemon).contains("no daemon runs, so no web UI: `owlshift start` starts both"),
+        "{}",
+        stderr(&no_daemon)
+    );
+    let bare = owlshift(config_dir.path(), config_dir.path(), &["ui", "--daemon"]);
+    assert_eq!(bare.status.code(), Some(2), "{}", stderr(&bare));
+
+    // A program that answers, without the proof.
+    let answering = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = answering.local_addr().unwrap().port();
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let recorded = requests.clone();
+    std::thread::spawn(move || {
+        for mut stream in answering.incoming().flatten() {
+            let _ = stream.set_read_timeout(Some(std::time::Duration::from_millis(500)));
+            let mut buffer = [0u8; 4096];
+            let read = stream.read(&mut buffer).unwrap_or(0);
+            let text = String::from_utf8_lossy(&buffer[..read]).into_owned();
+            recorded
+                .lock()
+                .unwrap()
+                .push(text.lines().next().unwrap_or("").to_owned());
+            let _ = stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok");
+        }
+    });
+    // And one that takes connections and says nothing.
+    let silent = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let quiet = silent.local_addr().unwrap().port();
+
+    for (port, answers) in [(port, true), (quiet, false)] {
+        personal_file(config_dir.path(), port);
+        let mut daemon = Daemon::start(config_dir.path());
+        let said = format!(
+            "Port {port} of 127.0.0.1, `[ui] port` of the personal file, is taken by another \
+             program"
+        );
+        wait::until_with(
+            "the daemon to name the taken port",
+            || daemon.said(),
+            || daemon.said().contains(&said),
+        );
+        let refused = owlshift(config_dir.path(), config_dir.path(), &["ui", "--print"]);
+        assert_eq!(refused.status.code(), Some(1), "{}", stderr(&refused));
+        let why = stderr(&refused);
+        assert!(
+            why.contains(&format!("port {port} of 127.0.0.1")) && why.contains("`[ui] port`"),
+            "{why}"
+        );
+        if answers {
+            assert!(why.contains("did not prove itself the web UI"), "{why}");
+        }
+        assert!(!stdout(&refused).contains("login="), "{}", stdout(&refused));
+
+        let report = doctor_in(config_dir.path(), &["--json"]);
+        let report: serde_json::Value = serde_json::from_slice(&report.stdout).unwrap();
+        let check = report["checks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|check| check["subject"] == "web UI")
+            .unwrap_or_else(|| panic!("{report}"))
+            .clone();
+        assert_eq!(check["status"], "warn", "{check}");
+        let detail = check["detail"].as_str().unwrap();
+        assert!(
+            detail.contains(&port.to_string()) && detail.contains("`[ui] port`"),
+            "{detail}"
+        );
+        daemon.stop();
+    }
+    let requests = requests.lock().unwrap().clone();
+    assert!(!requests.is_empty());
+    assert!(
+        requests
+            .iter()
+            .all(|line| line == "POST /api/proof HTTP/1.1"),
+        "only the proof was asked: {requests:?}"
+    );
+    drop(silent);
 }
