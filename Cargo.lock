@@ -1419,6 +1419,8 @@ dependencies = [
 name = "owlshift-runner"
 version = "0.0.0"
 dependencies = [
+ "getrandom 0.4.3",
+ "hmac",
  "jiff",
  "owlshift-adapters",
  "owlshift-contracts",

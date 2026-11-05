@@ -18,6 +18,8 @@ owlshift-platform = { path = "crates/owlshift-platform" }
 owlshift-runner = { path = "crates/owlshift-runner" }
 clap = { version = "4.6", features = ["derive", "string"] }
 dirs = "7.0"
+getrandom = "0.4"
+hmac = "0.13"
 jiff = { version = "0.2", features = ["serde"] }
 jsonschema = { version = "0.58", default-features = false }
 keyring-core = "1.0"
