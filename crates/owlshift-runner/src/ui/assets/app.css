@@ -207,6 +207,32 @@ code {
   color: var(--information);
 }
 
+/* Each state keeps its symbol, so colour never carries a meaning alone
+   (visual identity section 4, "States"). */
+.state-success::before,
+.state-warning::before,
+.state-danger::before,
+.state-information::before {
+  margin-right: 0.3em;
+  font-weight: 700;
+}
+
+.state-success::before {
+  content: "\2713";
+}
+
+.state-warning::before {
+  content: "!";
+}
+
+.state-danger::before {
+  content: "\2717";
+}
+
+.state-information::before {
+  content: "\00B7";
+}
+
 main {
   padding: 16px;
 }

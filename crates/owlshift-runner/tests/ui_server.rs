@@ -667,6 +667,30 @@ fn the_style_sheet_holds_each_theme_role_light_and_dark() {
 }
 
 #[test]
+fn each_state_shows_its_symbol_beside_its_colour() {
+    // Visual identity section 4, "States": ✓ ! ✗ ·.
+    for (state, symbol) in [
+        ("success", r#""\2713""#),
+        ("warning", r#""!""#),
+        ("danger", r#""\2717""#),
+        ("information", r#""\00B7""#),
+    ] {
+        // Its own rule, a line of its own after a blank line, not the
+        // grouped one that sets the symbols' spacing.
+        let rule = block(APP_CSS, &format!("\n\n.state-{state}::before {{"), "");
+        assert!(
+            rule.contains(&format!("content: {symbol};")),
+            "{state}: {rule}"
+        );
+        let colour = block(APP_CSS, &format!(".state-{state} {{"), "");
+        assert!(
+            colour.contains(&format!("color: var(--{state});")),
+            "{state}"
+        );
+    }
+}
+
+#[test]
 fn a_hidden_element_stays_hidden_and_a_logout_empties_the_header() {
     // `.bar-row` sets `display: flex`, which beats the browser's own
     // `[hidden]` rule: the sheet's rule must win over any class.
