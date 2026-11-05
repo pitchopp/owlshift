@@ -9,8 +9,9 @@
 //! the socket the daemon handed it, with the daemon's run secret, both on
 //! descriptors the daemon names.
 
+use std::io::{self, Write};
 use std::path::Path;
-use std::process::{Command, ExitCode, Stdio};
+use std::process::{Command, ExitCode, ExitStatus, Stdio};
 
 use owlshift_runner::config::Effective;
 use owlshift_runner::daemon;
@@ -65,15 +66,70 @@ pub fn login_link(port: u16, code: &str) -> String {
     format!("http://127.0.0.1:{port}/#login={code}")
 }
 
-/// The command that opens `link` in the person's browser.
-pub fn opener(link: &str) -> Command {
-    let mut command = Command::new(if cfg!(target_os = "macos") {
-        "open"
+/// The program that opens the link on macOS.
+const OSASCRIPT: &str = "/usr/bin/osascript";
+
+/// How the person's browser is asked to open a link: a command, and what
+/// it reads on its standard input.
+#[derive(Debug)]
+pub struct Opener {
+    /// The command to run.
+    pub command: Command,
+    /// What the command reads on its standard input, when anything.
+    pub input: Option<String>,
+}
+
+/// The opener of `link` on this platform ([`opener_for`]).
+pub fn opener(link: &str) -> Opener {
+    opener_for(cfg!(target_os = "macos"), link)
+}
+
+/// The opener of `link`, on macOS when `macos`. On macOS a confined run
+/// reads the arguments of the user's other processes (architecture section
+/// 5, "Who may drive it"), so the link, its one-time code included, never
+/// is one: `osascript` reads `open location "<link>"` on its standard
+/// input, as the decider chose on OWL-467 (round 4, Q1). On Linux bwrap
+/// gives a confined run its own process namespace, which hides every other
+/// process, and `xdg-open` takes the link as its argument.
+pub fn opener_for(macos: bool, link: &str) -> Opener {
+    if macos {
+        let quoted = link.replace('\\', "\\\\").replace('"', "\\\"");
+        Opener {
+            command: Command::new(OSASCRIPT),
+            input: Some(format!("open location \"{quoted}\"\n")),
+        }
     } else {
-        "xdg-open"
-    });
-    command.arg(link);
+        let mut command = Command::new("xdg-open");
+        command.arg(link);
+        Opener {
+            command,
+            input: None,
+        }
+    }
+}
+
+/// Runs `opener`, its input written then closed, and waits for its end.
+/// Its standard output goes nowhere; its errors reach the terminal.
+fn open_with(opener: Opener) -> io::Result<ExitStatus> {
+    let Opener { mut command, input } = opener;
     command
+        .stdin(if input.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
+        .stdout(Stdio::null());
+    let mut child = command.spawn()?;
+    if let (Some(input), Some(mut stdin)) = (input, child.stdin.take()) {
+        let written = stdin.write_all(input.as_bytes());
+        drop(stdin);
+        if let Err(error) = written {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(error);
+        }
+    }
+    child.wait()
 }
 
 /// What `owlshift ui` says of a listener that did not prove itself, or
@@ -146,10 +202,7 @@ pub fn run(config: &Effective, print: bool, new_token: bool) -> ExitCode {
         println!("{link}");
         return ExitCode::SUCCESS;
     }
-    let opened = opener(&link)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .status();
+    let opened = open_with(opener(&link));
     match opened {
         Ok(status) if status.success() => {
             println!("The web UI opens in your browser, on 127.0.0.1:{port}.");
@@ -175,14 +228,54 @@ mod tests {
     use super::*;
 
     #[test]
-    fn the_opener_opens_the_login_link() {
+    fn on_macos_no_argument_holds_the_login_code() {
         let code = "00112233445566778899aabbccddeeff.1762329600000.ab";
-        let command = opener(&login_link(18466, code));
-        let last = command.get_args().last().unwrap();
+        let link = login_link(18466, code);
+        let Opener { command, input } = opener_for(true, &link);
+        assert_eq!(command.get_program(), OSASCRIPT);
+        assert_eq!(command.get_args().count(), 0);
         assert_eq!(
-            last,
-            format!("http://127.0.0.1:18466/#login={code}").as_str()
+            input.as_deref(),
+            Some(format!("open location \"http://127.0.0.1:18466/#login={code}\"\n").as_str())
         );
+        // A quote or a backslash, which no link holds, stays inside the
+        // AppleScript string.
+        let Opener { input, .. } = opener_for(true, r#"a"b\c"#);
+        assert_eq!(input.as_deref(), Some("open location \"a\\\"b\\\\c\"\n"));
+    }
+
+    #[test]
+    fn elsewhere_xdg_open_takes_the_login_link() {
+        let code = "00112233445566778899aabbccddeeff.1762329600000.ab";
+        let Opener { command, input } = opener_for(false, &login_link(18466, code));
+        assert_eq!(command.get_program(), "xdg-open");
+        let args: Vec<_> = command.get_args().collect();
+        assert_eq!(
+            args,
+            [format!("http://127.0.0.1:18466/#login={code}").as_str()]
+        );
+        assert_eq!(input, None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_opener_reads_its_input_on_its_standard_input() {
+        // `cat` ends only once its input is closed.
+        let mut command = Command::new("/bin/sh");
+        command.args(["-c", "cat >/dev/null; exit 5"]);
+        let status = open_with(Opener {
+            command,
+            input: Some("open location \"x\"\n".into()),
+        })
+        .unwrap();
+        assert_eq!(status.code(), Some(5));
+        // `sh` reads its script on standard input, as `osascript` does.
+        let status = open_with(Opener {
+            command: Command::new("/bin/sh"),
+            input: Some("exit 7\n".into()),
+        })
+        .unwrap();
+        assert_eq!(status.code(), Some(7));
     }
 
     #[test]
