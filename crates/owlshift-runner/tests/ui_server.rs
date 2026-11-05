@@ -14,7 +14,8 @@ use owlshift_contracts::service::{BY_PAUSE, Request};
 use owlshift_runner::daemon::requests;
 use owlshift_runner::ui::auth::{self, RunSecret, Session};
 use owlshift_runner::ui::server::{
-    self, APP_CSS, APP_JS, INDEX_HTML, Options, SUPERSEDED_LINE, ServeError, Serving,
+    self, APP_CSS, APP_JS, INDEX_HTML, LOGGED_OUT_LINE, Options, SUPERSEDED_LINE, ServeError,
+    Serving,
 };
 use owlshift_runner::ui::{personal_at, probe, record, token};
 use serde_json::{Value, json};
@@ -666,6 +667,23 @@ fn the_style_sheet_holds_each_theme_role_light_and_dark() {
 }
 
 #[test]
+fn a_hidden_element_stays_hidden_and_a_logout_empties_the_header() {
+    // `.bar-row` sets `display: flex`, which beats the browser's own
+    // `[hidden]` rule: the sheet's rule must win over any class.
+    assert!(
+        block(APP_CSS, "[hidden] {", "").contains("display: none !important;"),
+        "no [hidden] rule"
+    );
+    let logged_out = block(APP_JS, "function loggedOut() {", "");
+    assert!(
+        logged_out.contains(r#"clear(document.getElementById("header"));"#),
+        "{logged_out}"
+    );
+    // A stream the session no longer holds logs the page out.
+    assert!(APP_JS.contains(r#"message.closed === "logged_out""#));
+}
+
+#[test]
 fn a_stream_starts_at_once_and_the_seventeenth_supersedes_the_first() {
     let data = tempfile::tempdir().unwrap();
     let ui = serve(data.path(), RunSecret::new().unwrap());
@@ -729,6 +747,34 @@ fn a_stream_writes_the_header_again_when_it_changes() {
     .unwrap();
     let next: Value = serde_json::from_str(&next_line(&mut stream).unwrap()).unwrap();
     assert_eq!(next["header"]["machine_pause"]["why"], "lunch");
+}
+
+#[test]
+fn a_new_token_ends_a_stream_already_open() {
+    let data = tempfile::tempdir().unwrap();
+    let ui = serve(data.path(), RunSecret::new().unwrap());
+    let session = session(ui.port(), data.path());
+    let mut stream = open_stream(ui.port(), &session);
+    assert!(next_line(&mut stream).unwrap().starts_with(r#"{"header":"#));
+    token::new_token(data.path()).unwrap();
+    let replaced = Instant::now();
+    stream
+        .get_ref()
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .unwrap();
+    let mut last = None;
+    while let Some(line) = next_line(&mut stream) {
+        last = Some(line);
+    }
+    // The refresh period of these tests is 100 ms: the stream checks its
+    // session at least that often.
+    assert!(replaced.elapsed() < Duration::from_secs(2));
+    assert_eq!(last.as_deref(), Some(LOGGED_OUT_LINE));
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while ui.streams() > 0 && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(10));
+    }
+    assert_eq!(ui.streams(), 0);
 }
 
 #[test]

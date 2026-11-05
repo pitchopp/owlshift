@@ -27,7 +27,10 @@
 //! A stream writes `{"header":…}` at once and whenever the header changes,
 //! `{"keepalive":true}` every keepalive period, and `{"closed":"superseded"}`
 //! before it ends when a newer stream took its place: at most
-//! [`Options::streams`] run at once, the oldest closed beyond that. One
+//! [`Options::streams`] run at once, the oldest closed beyond that. It
+//! checks its session again, under the token read again, before each line
+//! and at least every refresh period, and ends with `{"closed":"logged_out"}`
+//! once the session no longer holds, so a new token ends a stream too. One
 //! refresher thread reads the header every refresh period while a stream
 //! runs; the streams share its latest value.
 
@@ -84,6 +87,10 @@ pub const SECURITY_HEADERS: [(&str, &str); 5] = [
 /// place, so the page does not take it back.
 pub const SUPERSEDED_LINE: &str = r#"{"closed":"superseded"}"#;
 
+/// The line a stream writes before it ends when its session no longer
+/// holds, a new token having ended it, so the page shows it logged out.
+pub const LOGGED_OUT_LINE: &str = r#"{"closed":"logged_out"}"#;
+
 /// The figures of the personal file the header needs: the machine's run
 /// slots and each harness's usage cap.
 type Figures = (u32, Vec<(Harness, u8)>);
@@ -91,7 +98,8 @@ type Figures = (u32, Vec<(Harness, u8)>);
 /// How the server runs.
 #[derive(Clone)]
 pub struct Options {
-    /// How often the refresher reads the header while a stream runs.
+    /// How often the refresher reads the header while a stream runs, and
+    /// how long a stream goes at most without checking its session again.
     pub refresh: Duration,
     /// How often a stream writes a keepalive line.
     pub keepalive: Duration,
@@ -546,6 +554,12 @@ fn in_session(context: &Context, request: &Request) -> bool {
     let Ok(Some(value)) = header_value(request, SESSION_HEADER) else {
         return false;
     };
+    session_holds(context, value)
+}
+
+/// Whether the session header value `value` holds under the token, read
+/// again, and this daemon's run.
+fn session_holds(context: &Context, value: &str) -> bool {
     token::read_token(&context.data)
         .is_ok_and(|token| auth::check_session(&token, &context.run, value))
 }
@@ -685,15 +699,26 @@ fn chunk(writer: &mut dyn Write, line: &str) -> io::Result<()> {
 /// Serves `/api/stream`: its own status line and headers, then one chunk
 /// per line until the page goes, or a newer stream supersedes it.
 fn stream(context: &Arc<Context>, request: Request) {
+    let session = match header_value(&request, SESSION_HEADER) {
+        Ok(Some(value)) => value.to_owned(),
+        _ => {
+            let _ = request.respond(error_response(
+                401,
+                "not logged in: run `owlshift ui` in a terminal",
+            ));
+            return;
+        }
+    };
     let (id, superseded) = admit(context);
     let mut writer = request.into_writer();
-    let _ = write_stream(context, &mut *writer, &superseded);
+    let _ = write_stream(context, &mut *writer, &session, &superseded);
     leave(context, id);
 }
 
 fn write_stream(
     context: &Context,
     writer: &mut dyn Write,
+    session: &str,
     superseded: &AtomicBool,
 ) -> io::Result<()> {
     let mut head = String::from(
@@ -709,10 +734,18 @@ fn write_stream(
     chunk(writer, &written)?;
     let mut seen = context.hub.lock().generation;
     let mut kept = Instant::now();
+    let mut checked = Instant::now();
     loop {
         if superseded.load(Ordering::SeqCst) {
             chunk(writer, SUPERSEDED_LINE)?;
             break;
+        }
+        if checked.elapsed() >= context.options.refresh {
+            if !session_holds(context, session) {
+                chunk(writer, LOGGED_OUT_LINE)?;
+                break;
+            }
+            checked = Instant::now();
         }
         let latest = {
             let state = context.hub.lock();
@@ -731,7 +764,13 @@ fn write_stream(
         if superseded.load(Ordering::SeqCst) {
             continue;
         }
-        if let Some(latest) = latest.filter(|latest| *latest != written) {
+        let latest = latest.filter(|latest| *latest != written);
+        let due = latest.is_some() || kept.elapsed() >= context.options.keepalive;
+        if due && !session_holds(context, session) {
+            chunk(writer, LOGGED_OUT_LINE)?;
+            break;
+        }
+        if let Some(latest) = latest {
             chunk(writer, &latest)?;
             written = latest;
             kept = Instant::now();

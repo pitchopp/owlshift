@@ -84,6 +84,7 @@ function show(id, shown) {
 
 function loggedOut() {
   store(SESSION_KEY, null);
+  clear(document.getElementById("header"));
   show("header", false);
   show("logged-out", true);
 }
@@ -243,11 +244,13 @@ function render(header) {
 
 // The live header: a streamed fetch read line by line. It reconnects after
 // an end, 2 s then doubling to 30 s, but not once a newer tab took its
-// place, which would take the stream back and forth between tabs.
+// place, which would take the stream back and forth between tabs, nor once
+// the server says the session ended.
 let retry = 2000;
 
 async function follow() {
   let superseded = false;
+  let ended = false;
   try {
     const response = await authedFetch("/api/stream");
     if (!response) {
@@ -279,11 +282,17 @@ async function follow() {
           render(message.header);
         } else if (message.closed === "superseded") {
           superseded = true;
+        } else if (message.closed === "logged_out") {
+          ended = true;
         }
       }
     }
   } catch (error) {
     problem("The live header stopped: " + error.message);
+  }
+  if (ended) {
+    loggedOut();
+    return;
   }
   if (superseded) {
     problem("Live updates went to a newer tab: reload this page to take them back.");
