@@ -572,9 +572,17 @@ fn no_asset_holds_the_token_and_the_page_sends_only_the_code_and_the_session() {
         .match_indices("authedFetch(")
         .map(|(at, _)| APP_JS[at..].split(')').next().unwrap())
         .collect();
+    // The header's stream, and the ticket page's snapshot and run logs
+    // (OWL-471): each a route of the session, none a path the client
+    // chooses beyond the ticket's own.
     assert_eq!(
         authed,
-        ["authedFetch(path", "authedFetch(\"/api/stream\""],
+        [
+            "authedFetch(path",
+            "authedFetch(\"/api/stream\"",
+            "authedFetch(snapshotPath(handle",
+            "authedFetch(logPath(handle, run.id, which, log.from, log.line",
+        ],
         "{authed:?}"
     );
     assert!(APP_JS.contains("body: JSON.stringify({ code: match[1] })"));
@@ -1616,6 +1624,32 @@ fn a_log_holding_markup_is_served_as_text() {
             assert_eq!(records[0]["text"], hostile);
         }
     }
+}
+
+#[test]
+fn a_ticket_route_survives_the_login_and_is_read_after_it() {
+    let app_js = lf(APP_JS);
+    // Only a `#login=` fragment is replaced: a ticket page's route stays.
+    let login = block(&app_js, "async function login() {", "");
+    let guarded = "  if (window.location.hash.startsWith(\"#login=\")) {\n    \
+                   window.history.replaceState(null, \"\", window.location.pathname);\n  }";
+    assert!(login.contains(guarded), "{login}");
+    assert_eq!(login.matches("replaceState").count(), 1);
+    // `start()` reads the route after the login, and a hash change reads it
+    // again.
+    let start = block(&app_js, "async function start() {", "");
+    let logged_in = start.find("await login();").unwrap();
+    let routed = start.find("\n  route();").unwrap();
+    assert!(logged_in < routed, "{start}");
+    assert!(start.contains(r#"window.addEventListener("hashchange", route);"#));
+    // A route ends the page open before it draws another, and a ticket's is
+    // `#/ticket/<owner>/<repo>/<TICKET>`.
+    let route = block(&app_js, "function route() {", "");
+    assert!(route.find("closeTicket();").unwrap() < route.find("openTicket(target);").unwrap());
+    assert!(app_js.contains(r##"const prefix = "#/ticket/";"##));
+    assert!(app_js.contains("parts.length !== 3"));
+    // The page's container is in the frame, hidden until a route shows it.
+    assert!(INDEX_HTML.contains(r#"<section id="ticket" class="ticket" hidden></section>"#));
 }
 
 impl Ground {

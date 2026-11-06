@@ -331,6 +331,28 @@ fn text_of<'a>(data: &'a Map<String, Value>, key: &str) -> Option<&'a str> {
     data.get(key).and_then(Value::as_str)
 }
 
+/// What a `usage` event measured, under the names the page reads: `input`,
+/// `output`, `cache_read` and `cache_write` in counts of what the harness
+/// reports, `cost_usd`, `turns`, `duration_ms` and `models`.
+fn usage_of(data: &Map<String, Value>) -> Value {
+    let mut usage = Map::new();
+    for (from, to) in [
+        ("input_tokens", "input"),
+        ("output_tokens", "output"),
+        ("cache_read_input_tokens", "cache_read"),
+        ("cache_creation_input_tokens", "cache_write"),
+        ("cost_usd", "cost_usd"),
+        ("num_turns", "turns"),
+        ("duration_ms", "duration_ms"),
+        ("models", "models"),
+    ] {
+        if let Some(value) = data.get(from) {
+            usage.insert(to.into(), value.clone());
+        }
+    }
+    Value::Object(usage)
+}
+
 /// A log's size and the seconds since it last grew: `None` when there is
 /// no such regular file.
 fn log_facts(path: &Path, now: Timestamp) -> Value {
@@ -426,7 +448,7 @@ fn runs(
             }
         }
         if let Some(event) = usage {
-            run.insert("usage".into(), Value::Object(event.data.clone()));
+            run.insert("usage".into(), usage_of(&event.data));
         }
         let dir = folder.join(&id);
         run.insert(
@@ -1043,8 +1065,8 @@ mod tests {
         assert_eq!(runs[0]["role"], "build");
         assert_eq!(runs[0]["outcome"], "finished");
         assert_eq!(runs[0]["summary"], "Added the file.");
-        assert_eq!(runs[0]["usage"]["input_tokens"], 10);
-        assert_eq!(runs[0]["usage"]["output_tokens"], 20);
+        assert_eq!(runs[0]["usage"]["input"], 10);
+        assert_eq!(runs[0]["usage"]["output"], 20);
         assert_eq!(runs[0]["usage"]["cost_usd"], 0.12);
         assert_eq!(runs[0]["elapsed_ms"], 900);
         assert_eq!(runs[0]["ended"], true);
