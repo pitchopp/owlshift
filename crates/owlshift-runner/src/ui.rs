@@ -12,6 +12,10 @@
 //! - *The header* ([`header`]), read from the files `owlshift status` reads
 //!   (`status::gather_files`), and the UI's record ([`record`]),
 //!   `<data>/service/ui.json`.
+//! - *The overview* ([`overview`], OWL-470): the tickets in columns and in a
+//!   list, what waits for you, and what happened since your last visit,
+//!   from the ticket refs, `ready.json` and the event log read from its
+//!   offset ([`eventtail`]).
 //! - *The server* ([`server`]): tiny_http and threads on the socket the
 //!   daemon hands over, its routes and checks, and the page carried in the
 //!   binary.
