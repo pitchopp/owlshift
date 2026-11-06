@@ -1135,11 +1135,38 @@ fn audit(css: &str) -> Result<(), String> {
                 .find(|(name, _)| name == wanted)
                 .map(|(_, value)| value.as_str())
         };
+        // A fill the table pairs with its text carries that text and no other,
+        // also when the rule sets no `color` (the inherited text is unchecked).
+        for (fill, text) in [("badge-fill", "badge-text"), ("action-fill", "action-text")] {
+            let on_fill = declarations.iter().any(|(name, value)| {
+                name.starts_with("background") && roles(value).contains(&fill)
+            });
+            if on_fill && value_of("color") != Some(&format!("var(--{text})")) {
+                return Err(format!(
+                    "{selector}: --{fill} without --{text} as its color"
+                ));
+            }
+        }
         for (name, value) in &declarations {
             let coloured = name == "color"
                 || name.starts_with("background")
                 || (name.starts_with("border") && name != "border-radius")
                 || name.starts_with("outline") && !name.ends_with("offset");
+            // Other properties that carry a colour have no pair in the table.
+            const UNCHECKED: [&str; 9] = [
+                "box-shadow",
+                "text-shadow",
+                "text-decoration-color",
+                "caret-color",
+                "accent-color",
+                "fill",
+                "stroke",
+                "column-rule",
+                "scrollbar-color",
+            ];
+            if UNCHECKED.contains(&name.as_str()) {
+                return Err(format!("{selector}: {name} colours outside the table"));
+            }
             if !coloured {
                 continue;
             }
@@ -1186,6 +1213,10 @@ fn every_colour_the_style_sheet_uses_is_a_pair_of_the_contrast_table() {
         ".new { color: #FFFFFF; }",
         ".new { border-color: rgb(0 0 0); }",
         ".bar { outline: 2px solid var(--link); }",
+        ".new { background: var(--action-fill); }",
+        ".new { color: var(--text-muted); background: var(--badge-fill); }",
+        ".new { color: var(--text); background: var(--action-fill); }",
+        ".new { box-shadow: 0 0 0 2px var(--border-hairline); }",
     ] {
         assert!(audit(css).is_err(), "{css}");
     }
@@ -1235,6 +1266,10 @@ fn no_asset_names_a_place_off_the_origin_and_the_policy_allows_none() {
     ] {
         assert_eq!(egress(text), None, "{name}");
     }
+    // The mark is served too; its XML namespace is the one URL it may hold.
+    let mark = owlshift_runner::ui::server::FAVICON_SVG
+        .replace("xmlns=\"http://www.w3.org/2000/svg\"", "");
+    assert_eq!(egress(&mark), None, "favicon.svg");
     // The check tells a URL from a comment.
     assert!(egress(r#"fetch("//example.com/x")"#).is_some());
     assert!(egress("img.src = '//example.com/x';").is_some());
