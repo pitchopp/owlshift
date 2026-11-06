@@ -14,8 +14,8 @@ use owlshift_contracts::service::{BY_PAUSE, Request};
 use owlshift_runner::daemon::requests;
 use owlshift_runner::ui::auth::{self, RunSecret, Session};
 use owlshift_runner::ui::server::{
-    self, APP_CSS, APP_JS, INDEX_HTML, LOGGED_OUT_LINE, Options, SUPERSEDED_LINE, ServeError,
-    Serving,
+    self, APP_CSS, APP_JS, INDEX_HTML, LOGGED_OUT_LINE, Options, SECURITY_HEADERS, SUPERSEDED_LINE,
+    ServeError, Serving,
 };
 use owlshift_runner::ui::{personal_at, probe, record, token};
 use serde_json::{Value, json};
@@ -1198,6 +1198,69 @@ fn every_colour_the_style_sheet_uses_is_a_pair_of_the_contrast_table() {
     ] {
         assert!(audit(css).is_ok(), "{css}");
     }
+}
+
+/// Why `text` names a place off the origin, if it does: an absolute or
+/// protocol-relative URL, an `@import`, or a `url(` that is not a carried
+/// font. A `//` starts a URL only right after a quote, a bracket or `=`;
+/// a `// comment` does not.
+fn egress(text: &str) -> Option<String> {
+    for scheme in ["http://", "https://", "ws://", "wss://", "ftp://", "data:"] {
+        if text.contains(scheme) {
+            return Some(scheme.to_owned());
+        }
+    }
+    if text.contains("@import") {
+        return Some("@import".to_owned());
+    }
+    for opener in ["\"//", "'//", "`//", "(//", "=//", "url(//", "src=//"] {
+        if text.contains(opener) {
+            return Some(opener.to_owned());
+        }
+    }
+    for part in text.split("url(").skip(1) {
+        if !part.starts_with("/fonts/") {
+            return Some(format!("url({}", part.chars().take(20).collect::<String>()));
+        }
+    }
+    None
+}
+
+#[test]
+fn no_asset_names_a_place_off_the_origin_and_the_policy_allows_none() {
+    for (name, text) in [
+        ("index.html", INDEX_HTML),
+        ("app.js", APP_JS),
+        ("app.css", APP_CSS),
+    ] {
+        assert_eq!(egress(text), None, "{name}");
+    }
+    // The check tells a URL from a comment.
+    assert!(egress(r#"fetch("//example.com/x")"#).is_some());
+    assert!(egress("img.src = '//example.com/x';").is_some());
+    assert!(egress("x { background: url(//example.com/f.woff2) }").is_some());
+    assert!(egress("x { background: url(/img/a.png) }").is_some());
+    assert!(egress("@import 'a.css';").is_some());
+    assert!(egress("a { src: url(https://example.com/f) }").is_some());
+    assert_eq!(
+        egress("// a comment about the page\nlet x = 1; // another"),
+        None
+    );
+    assert_eq!(egress("x { src: url(/fonts/a.woff2) }"), None);
+    // Nothing in the page points at another origin: every `src` and `href`
+    // is a path of the page.
+    for attribute in ["src=\"", "href=\""] {
+        for part in INDEX_HTML.split(attribute).skip(1) {
+            assert!(part.starts_with('/'), "{attribute}{part:.30}");
+            assert!(!part.starts_with("//"), "{attribute}{part:.30}");
+        }
+    }
+    let policy = SECURITY_HEADERS
+        .iter()
+        .find(|(name, _)| *name == "Content-Security-Policy")
+        .unwrap()
+        .1;
+    assert_eq!(policy, "default-src 'self'; frame-ancestors 'none'");
 }
 
 const SANS_STACK: &str =
