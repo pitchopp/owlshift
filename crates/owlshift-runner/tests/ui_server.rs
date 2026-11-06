@@ -11,9 +11,12 @@ use std::time::{Duration, Instant};
 
 use jiff::Timestamp;
 use owlshift_adapters::forge::Repo;
+use owlshift_contracts::event::{Event, EventKind};
+use owlshift_contracts::format::Format;
 use owlshift_contracts::ids::TicketId;
 use owlshift_contracts::service::{BY_PAUSE, Request};
 use owlshift_runner::daemon::requests;
+use owlshift_runner::events::EventLog;
 use owlshift_runner::project::ProjectDirs;
 use owlshift_runner::served::Registry;
 use owlshift_runner::ui::auth::{self, RunSecret, Session};
@@ -1613,4 +1616,123 @@ fn a_log_holding_markup_is_served_as_text() {
             assert_eq!(records[0]["text"], hostile);
         }
     }
+}
+
+impl Ground {
+    /// Appends an event of `OWL-1`'s run `RUN` to the event log.
+    fn event(&self, kind: EventKind) {
+        let event = Event {
+            format: Format,
+            at: "2026-11-05T10:00:00Z".parse().unwrap(),
+            project: "o/r".to_owned(),
+            ticket: Some(TicketId::new("OWL-1").unwrap()),
+            run: Some(RUN.to_owned()),
+            kind,
+            data: serde_json::Map::new(),
+        };
+        EventLog::in_dir(self.data.path()).append(&event).unwrap();
+    }
+
+    fn snapshot(&self) -> Value {
+        let reply = self.get("/api/ticket?project=o%2Fr&ticket=OWL-1");
+        assert_eq!(reply.status, 200, "{}", reply.text());
+        reply.json()
+    }
+}
+
+/// One line of an assistant's text, as Claude Code writes it.
+fn said(text: &str) -> String {
+    format!(
+        "{}\n",
+        json!({ "type": "assistant", "message": { "content": [{ "type": "text", "text": text }] } })
+    )
+}
+
+fn texts(reply: &Reply) -> Vec<String> {
+    reply.json()["records"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|record| record["text"].as_str().unwrap().to_owned())
+        .collect()
+}
+
+#[test]
+fn a_live_logs_new_lines_are_served_as_written() {
+    let ground = Ground::new();
+    ground.event(EventKind::RunStarted);
+    ground.append("stdout.log", &(said("one") + &said("two")));
+    let first = ground.log("&from=0");
+    assert_eq!(texts(&first), ["one", "two"]);
+    let value = first.json();
+    assert_eq!(value["ended"], false);
+    let next = value["next"].as_u64().unwrap();
+    assert_eq!(next, value["size"].as_u64().unwrap());
+    assert_eq!(value["next_line"], 2);
+
+    // A third line and half of a fourth: only the third is served.
+    let fourth = said("four");
+    let (head, tail) = fourth.split_at(fourth.len() / 2);
+    ground.append("stdout.log", &(said("three") + head));
+    let second = ground.log(&format!("&from={next}&line=2"));
+    assert_eq!(texts(&second), ["three"]);
+    assert_eq!(second.json()["records"][0]["line"], 3);
+    assert_eq!(second.json()["records"][0]["offset"], next);
+    let next = second.json()["next"].as_u64().unwrap();
+    assert!(next < second.json()["size"].as_u64().unwrap());
+
+    // The fourth completes: it is served whole, its line counted from the
+    // file when the page does not say.
+    ground.append("stdout.log", tail);
+    let third = ground.log(&format!("&from={next}"));
+    assert_eq!(texts(&third), ["four"]);
+    assert_eq!(third.json()["records"][0]["line"], 4);
+    let next = third.json()["next"].as_u64().unwrap();
+    assert_eq!(next, third.json()["size"].as_u64().unwrap());
+
+    // A last line with no newline waits while the run goes on.
+    ground.append(
+        "stdout.log",
+        "{\"type\":\"result\",\"subtype\":\"success\"}",
+    );
+    let waiting = ground.log(&format!("&from={next}"));
+    assert!(texts(&waiting).is_empty());
+    assert_eq!(waiting.json()["ended"], false);
+    assert_eq!(waiting.json()["next"], next);
+    let live = ground.snapshot();
+    assert_eq!(live["runs"]["runs"][0]["ended"], false);
+
+    // Once the run ended, it never gets its newline: it is served, and
+    // `next` reaches the size.
+    ground.event(EventKind::RunEnded);
+    let last = ground.log(&format!("&from={next}"));
+    let value = last.json();
+    assert_eq!(value["ended"], true);
+    assert_eq!(value["records"][0]["kind"], "result");
+    assert_eq!(value["records"][0]["line"], 5);
+    assert_eq!(value["next"], value["size"]);
+    assert_eq!(ground.snapshot()["runs"]["runs"][0]["ended"], true);
+    // And a poll after it has nothing more.
+    let after = ground.log(&format!("&from={}", value["next"]));
+    assert!(texts(&after).is_empty());
+    assert_eq!(after.json()["next"], value["size"]);
+}
+
+#[test]
+fn a_run_that_starts_after_the_first_snapshot_is_listed() {
+    let ground = Ground::new();
+    assert!(
+        ground.snapshot()["runs"]["runs"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+    ground.append("stdout.log", &said("hello"));
+    ground.event(EventKind::RunStarted);
+    let runs = ground.snapshot()["runs"]["runs"].clone();
+    let runs = runs.as_array().unwrap();
+    assert_eq!(runs.len(), 1);
+    assert_eq!(runs[0]["id"], RUN);
+    assert_eq!(runs[0]["ended"], false);
+    assert_eq!(texts(&ground.log("&from=0")), ["hello"]);
 }
