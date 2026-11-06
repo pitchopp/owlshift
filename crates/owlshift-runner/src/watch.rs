@@ -178,6 +178,7 @@ mod running;
 pub mod stop;
 mod typed;
 mod waiting;
+mod wake;
 
 use running::{RunningStep, Then};
 
@@ -586,6 +587,15 @@ struct Memory<'c> {
         crate::daemon::requests::PauseScope,
         Option<owlshift_contracts::service::Request>,
     )>,
+    /// The machine's state as read at this iteration of the watch loop,
+    /// until the loop's next iteration clears it (OWL-485).
+    wake_read: Option<owlshift_platform::wake::Wake>,
+    /// Whether the machine is in a dark wake as last known, and so as last
+    /// told: a reading that could not be made leaves it as it was (OWL-485).
+    dark_wake: bool,
+    /// A step or a pass was held back for a dark wake since the loop's
+    /// iteration began, so a check due keeps its priority (OWL-485).
+    dark_wake_held: bool,
     /// The base heads merge on green read at this pass (OWL-445).
     base_heads: merge::BaseHeads,
     /// The refreshes the overlaps make due (OWL-449).
@@ -621,6 +631,9 @@ enum Due {
 enum HeldBack {
     /// An operator's pause, told for the project.
     Paused,
+    /// The machine is in a dark wake (OWL-485): no step starts until a full
+    /// wake.
+    DarkWake,
     /// Its last step, from the same ticket ref and answer, left the ref as
     /// it was ([`Holds`]).
     Held(Until),
@@ -767,6 +780,9 @@ impl Watch<'_> {
                 return;
             }
             memory.stepped = false;
+            // The machine's state is read again for this iteration (OWL-485).
+            memory.wake_read = None;
+            memory.dark_wake_held = false;
             // A check left pending in `base.json`, by a watch before this one
             // or by a person's command, gets its priority too (OWL-418).
             if memory.base_due.is_none() {
@@ -780,9 +796,9 @@ impl Watch<'_> {
                 .clone()
                 .filter(|_| memory.running.is_empty())
                 .map(|(ticket, _)| (ticket, memory.base_due_ran));
-            // An operator's pause, told as the pass starts (OWL-438): the
-            // pass reads on, and no step starts.
-            let paused = self.operator_paused(&mut memory, sink, out);
+            // An operator's pause, told as the pass starts (OWL-438), or a
+            // dark wake (OWL-485): the pass reads on, and no step starts.
+            let paused = self.held_back(&mut memory, sink, out, false);
             self.pass(&mut memory, sink, out, continued);
             if let Some(asked) = self.stopping() {
                 self.stop(&mut memory, sink, out, asked);
@@ -791,9 +807,11 @@ impl Watch<'_> {
             if draining {
                 self.drain(&mut memory, sink, out, continued);
             }
-            // A pause keeps a check due its priority: no step ran for it.
+            // A pause, or a dark wake that held its step, keeps a check due
+            // its priority: no step ran for it.
             if let Some((ticket, ran)) = due
                 && !paused
+                && !memory.dark_wake_held
                 && memory.base_due_ran == ran
                 && !memory.running.iter().any(|step| *step.ticket() == ticket)
             {
@@ -1487,9 +1505,12 @@ impl Watch<'_> {
         let on_demand = self.on_demand;
         let now = (on_demand.clock)();
         // Under an operator's pause no repair, correction or review loop
-        // starts (OWL-438).
+        // starts (OWL-438), nor in a dark wake (OWL-485).
         if self.operator_paused(memory, sink, out) {
             return Err(HeldBack::Paused);
+        }
+        if self.dark_wake(memory, sink, out, false) {
+            return Err(HeldBack::DarkWake);
         }
         if let Admit::Held { until } = memory.holds.admit(ticket, &held, now) {
             return Err(HeldBack::Held(until));
@@ -2235,9 +2256,9 @@ impl Watch<'_> {
             stored.at(),
             answer_check::new_answer(&comments, &decider, questions),
         );
-        // An answer read under an operator's pause waits for its lift,
-        // nothing told on the ticket (OWL-438).
-        if self.operator_paused(memory, sink, out) {
+        // An answer read under an operator's pause or in a dark wake waits
+        // for its lift, nothing told on the ticket (OWL-438, OWL-485).
+        if self.held_back(memory, sink, out, false) {
             return;
         }
         if memory.holds.admit(ticket, &seen, now) != Admit::Go
@@ -2368,9 +2389,9 @@ impl Watch<'_> {
         stage: Stage,
     ) {
         let on_demand = self.on_demand;
-        // Under an operator's pause no stage resumes, and no wait is told
-        // on the ticket for it (OWL-438).
-        if self.operator_paused(memory, sink, out) {
+        // Under an operator's pause or in a dark wake no stage resumes, and
+        // no wait is told on the ticket for it (OWL-438, OWL-485).
+        if self.held_back(memory, sink, out, false) {
             return;
         }
         let now = (on_demand.clock)();

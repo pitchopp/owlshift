@@ -321,6 +321,7 @@ impl ChildProject {
             dirs: &dirs,
             head_wait: Duration::ZERO,
             clock,
+            wake: &|| owlshift_platform::wake::Wake::Full,
             notifier: notes.as_ref().map(|notes| notes as &dyn Notifier),
             usage: &usage,
             web_tools: true,

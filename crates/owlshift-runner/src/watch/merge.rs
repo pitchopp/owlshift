@@ -572,7 +572,7 @@ impl Watch<'_> {
             None,
         );
         let wait = match run {
-            Err(HeldBack::Paused) => return,
+            Err(HeldBack::Paused | HeldBack::DarkWake) => return,
             Err(HeldBack::Held(until)) => {
                 let until = match until {
                     Until::At(at) => Some(at),

@@ -534,6 +534,7 @@ fn run_with(
         dirs: &dirs,
         head_wait: HEAD_WAIT,
         clock: &on_demand::system_clock,
+        wake: &owlshift_platform::wake::read,
         // The quarantine's notification, sent as its marker is written
         // (OWL-368), and a usage limit's, once per outage (OWL-404); the
         // others are `report`'s.

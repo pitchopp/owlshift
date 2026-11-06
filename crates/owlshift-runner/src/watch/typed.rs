@@ -62,8 +62,9 @@ impl Watch<'_> {
         stored: &Stored,
     ) {
         let on_demand = self.on_demand;
-        // Under an operator's pause nothing restarts (OWL-438).
-        if self.operator_paused(memory, sink, out) {
+        // Under an operator's pause or in a dark wake nothing restarts
+        // (OWL-438, OWL-485).
+        if self.held_back(memory, sink, out, false) {
             return;
         }
         let Ok(state) = TicketState::try_from(&stored.record.state) else {
