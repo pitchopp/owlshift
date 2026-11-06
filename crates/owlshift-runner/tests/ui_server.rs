@@ -10,8 +10,12 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use jiff::Timestamp;
+use owlshift_adapters::forge::Repo;
+use owlshift_contracts::ids::TicketId;
 use owlshift_contracts::service::{BY_PAUSE, Request};
 use owlshift_runner::daemon::requests;
+use owlshift_runner::project::ProjectDirs;
+use owlshift_runner::served::Registry;
 use owlshift_runner::ui::auth::{self, RunSecret, Session};
 use owlshift_runner::ui::server::{
     self, APP_CSS, APP_JS, INDEX_HTML, LOGGED_OUT_LINE, Options, SECURITY_HEADERS, SUPERSEDED_LINE,
@@ -1371,5 +1375,242 @@ fn the_carried_fonts_are_latin_woff2_of_bounded_size_and_documented() {
     }
     for licence in ["OFL-BricolageGrotesque.txt", "OFL-JetBrainsMono.txt"] {
         assert!(font_dir().join(licence).is_file(), "{licence}");
+    }
+}
+
+/// A data directory that serves `o/r`, a ticket page's ground.
+struct Ground {
+    data: tempfile::TempDir,
+    ui: Serving,
+    session: Session,
+}
+
+const RUN: &str = "20261105T100000Z";
+
+impl Ground {
+    fn new() -> Self {
+        let data = tempfile::tempdir().unwrap();
+        let repo = Repo::parse("o/r").unwrap();
+        let checkout = data.path().join("checkout-of-o-r");
+        std::fs::create_dir_all(&checkout).unwrap();
+        Registry::in_data_dir(data.path())
+            .register(&repo, &checkout)
+            .unwrap();
+        let ui = serve(data.path(), RunSecret::new().unwrap());
+        let session = session(ui.port(), data.path());
+        Self { data, ui, session }
+    }
+
+    fn runs(&self, ticket: &str) -> PathBuf {
+        ProjectDirs::new(self.data.path(), &Repo::parse("o/r").unwrap())
+            .runs(&TicketId::new(ticket).unwrap())
+    }
+
+    /// The folder of run `run` of `OWL-1`, made.
+    fn run_dir(&self, run: &str) -> PathBuf {
+        let dir = self.runs("OWL-1").join(run);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn get(&self, path: &str) -> Reply {
+        get(
+            self.ui.port(),
+            path,
+            &[("X-Owlshift-Session", &self.session.header())],
+        )
+    }
+
+    fn log(&self, extra: &str) -> Reply {
+        self.get(&format!(
+            "/api/ticket/log?project=o%2Fr&ticket=OWL-1&run={RUN}&file=stdout{extra}"
+        ))
+    }
+
+    fn append(&self, file: &str, text: &str) {
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(self.run_dir(RUN).join(file))
+            .unwrap();
+        file.write_all(text.as_bytes()).unwrap();
+    }
+}
+
+#[test]
+fn the_ticket_routes_need_a_session() {
+    let ground = Ground::new();
+    for path in [
+        "/api/ticket?project=o%2Fr&ticket=OWL-1",
+        "/api/ticket/log?project=o%2Fr&ticket=OWL-1&run=20261105T100000Z&file=stdout",
+    ] {
+        let none = get(ground.ui.port(), path, &[]);
+        assert_eq!(none.status, 401, "{path}");
+        none.assert_secured();
+        let made_up = get(
+            ground.ui.port(),
+            path,
+            &[("X-Owlshift-Session", "nonsense")],
+        );
+        assert_eq!(made_up.status, 401, "{path}");
+    }
+}
+
+#[test]
+fn the_ticket_routes_refuse_what_names_no_served_ticket() {
+    let ground = Ground::new();
+    ground.run_dir(RUN);
+    let log = |query: &str| ground.get(&format!("/api/ticket/log?{query}"));
+    let page = |query: &str| ground.get(&format!("/api/ticket?{query}"));
+    // An unserved project, a malformed one, a missing one.
+    assert_eq!(page("project=o%2Fother&ticket=OWL-1").status, 404);
+    assert_eq!(page("project=nonsense&ticket=OWL-1").status, 400);
+    assert_eq!(page("ticket=OWL-1").status, 400);
+    assert_eq!(page("project=o%2Fr").status, 400);
+    // A ticket that is no ticket id.
+    for ticket in ["..%2Fx", "../x", "OWL-1%2F..", "OWL%201", ""] {
+        let reply = page(&format!("project=o%2Fr&ticket={ticket}"));
+        assert_eq!(reply.status, 400, "{ticket}");
+        reply.assert_secured();
+    }
+    // A repeated key and a broken escape.
+    assert_eq!(page("project=o%2Fr&ticket=OWL-1&ticket=OWL-2").status, 400);
+    assert_eq!(page("project=o%2Fr&ticket=OWL-%zz").status, 400);
+    // A run, a file and an offset that name nothing the route reads.
+    let base = "project=o%2Fr&ticket=OWL-1";
+    for run in ["..", "..%2F..", "20261105T100000Z-x", "x", ""] {
+        assert_eq!(
+            log(&format!("{base}&run={run}&file=stdout")).status,
+            400,
+            "{run}"
+        );
+    }
+    for file in ["result", "stdout.log", "..%2Fstdout", ""] {
+        assert_eq!(
+            log(&format!("{base}&run={RUN}&file={file}")).status,
+            400,
+            "{file}"
+        );
+    }
+    for from in ["-1", "x", "1.5", ""] {
+        let reply = log(&format!("{base}&run={RUN}&file=stdout&from={from}"));
+        assert_eq!(reply.status, 400, "{from}");
+    }
+    // A run that has no folder.
+    assert_eq!(
+        log(&format!("{base}&run=20261105T110000Z&file=stdout")).status,
+        404
+    );
+    // A run folder that is a link is not followed.
+    #[cfg(unix)]
+    {
+        let elsewhere = ground.data.path().join("elsewhere");
+        std::fs::create_dir_all(&elsewhere).unwrap();
+        std::fs::write(
+            elsewhere.join("stdout.log"),
+            "{\"type\":\"turn.started\"}\n",
+        )
+        .unwrap();
+        std::os::unix::fs::symlink(&elsewhere, ground.runs("OWL-1").join("20261105T120000Z"))
+            .unwrap();
+        let reply = log(&format!("{base}&run=20261105T120000Z&file=stdout"));
+        assert_eq!(reply.status, 404);
+        // Nor a log that is a link.
+        std::os::unix::fs::symlink(
+            elsewhere.join("stdout.log"),
+            ground.run_dir(RUN).join("stdout.log"),
+        )
+        .unwrap();
+        assert_eq!(log(&format!("{base}&run={RUN}&file=stdout")).status, 404);
+    }
+}
+
+#[test]
+fn the_ticket_snapshot_takes_a_percent_encoded_project() {
+    let ground = Ground::new();
+    for query in [
+        "project=o%2Fr&ticket=OWL-1",
+        "ticket=OWL-1&project=o/r",
+        "project=O%2FR&ticket=OWL-1",
+    ] {
+        let reply = ground.get(&format!("/api/ticket?{query}"));
+        assert_eq!(reply.status, 200, "{query}: {}", reply.text());
+        reply.assert_secured();
+        let value = reply.json();
+        assert_eq!(value["format"], 1);
+        assert_eq!(value["ticket"], "OWL-1");
+        assert!(value["runs"]["runs"].as_array().unwrap().is_empty());
+    }
+}
+
+#[test]
+fn a_recorded_log_is_served_as_records_to_its_end() {
+    let ground = Ground::new();
+    let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../owlshift-adapters/tests/fixtures/claude/success.jsonl");
+    let bytes = std::fs::read(&fixture).unwrap();
+    std::fs::write(ground.run_dir(RUN).join("stdout.log"), &bytes).unwrap();
+    let reply = ground.log("&from=0");
+    assert_eq!(reply.status, 200, "{}", reply.text());
+    reply.assert_secured();
+    let value = reply.json();
+    assert_eq!(value["next"], bytes.len());
+    assert_eq!(value["size"], bytes.len());
+    assert_eq!(value["reset"], false);
+    assert_eq!(value["ended"], false);
+    let lines = bytes
+        .split(|&b| b == b'\n')
+        .filter(|l| !l.is_empty())
+        .count();
+    let records = value["records"].as_array().unwrap();
+    assert!(records.len() >= lines, "{} < {lines}", records.len());
+    assert_eq!(value["next_line"], lines);
+    assert!(records.iter().all(|r| r["kind"] != "unknown"), "{value}");
+    // Asked again from `next`, with or without the line count: nothing new.
+    for extra in ["&from=SIZE", "&from=SIZE&line=LINES"] {
+        let extra = extra
+            .replace("SIZE", &bytes.len().to_string())
+            .replace("LINES", &lines.to_string());
+        let again = ground.log(&extra).json();
+        assert!(again["records"].as_array().unwrap().is_empty());
+        assert_eq!(again["next"], bytes.len());
+    }
+}
+
+#[test]
+fn a_log_holding_markup_is_served_as_text() {
+    let ground = Ground::new();
+    let hostile = "<script>alert(1)</script> <b>bold</b> & \u{2028}\u{2029}";
+    let assistant = json!({
+        "type": "assistant",
+        "message": { "content": [{ "type": "text", "text": hostile }] }
+    });
+    ground.append(
+        "stdout.log",
+        &format!("{assistant}\n<b>not json</b> & \u{2028}\n{{\"type\":\"<i>new</i>\"}}\n"),
+    );
+    ground.append("stderr.log", &format!("{hostile}\n"));
+    for file in ["stdout", "stderr"] {
+        let reply = ground.get(&format!(
+            "/api/ticket/log?project=o%2Fr&ticket=OWL-1&run={RUN}&file={file}"
+        ));
+        assert_eq!(reply.status, 200);
+        let text = reply.text();
+        for c in ['<', '>', '&', '\u{2028}', '\u{2029}'] {
+            assert!(!text.contains(c), "{file}: {c:?} in {text}");
+        }
+        let value: Value = serde_json::from_str(&text).unwrap();
+        let records = value["records"].as_array().unwrap();
+        if file == "stdout" {
+            assert_eq!(records.len(), 3);
+            assert_eq!(records[0]["kind"], "text");
+            assert_eq!(records[0]["text"], hostile);
+            assert_eq!(records[1]["kind"], "unknown");
+            assert_eq!(records[1]["text"], "<b>not json</b> & \u{2028}");
+            assert_eq!(records[2]["kind"], "unknown");
+            assert_eq!(records[2]["text"], "{\"type\":\"<i>new</i>\"}");
+        } else {
+            assert_eq!(records[0]["text"], hostile);
+        }
     }
 }

@@ -161,6 +161,30 @@ fn unknown(line: u64, offset: u64, why: impl Into<String>, raw: impl Into<String
     ViewRecord::new(line, offset, Kind::Unknown, raw).label(why)
 }
 
+/// A line [`super::tail`] cut: `bytes` are its first bytes, `length` its
+/// whole length in bytes. The one record whose text is not the whole line,
+/// and it says so.
+pub fn cut(line: u64, offset: u64, bytes: &[u8], length: u64) -> ViewRecord {
+    let shown = String::from_utf8_lossy(bytes).into_owned();
+    unknown(
+        line,
+        offset,
+        format!("line cut: {length} bytes, the first {} shown", bytes.len()),
+        shown,
+    )
+}
+
+/// A line of a log that is plain text, such as a run's stderr: a text
+/// record, none for a blank line.
+pub fn plain(line: u64, offset: u64, bytes: &[u8]) -> Vec<ViewRecord> {
+    let text = String::from_utf8_lossy(bytes);
+    let text = text.strip_suffix('\r').unwrap_or(&text);
+    if text.trim().is_empty() {
+        return Vec::new();
+    }
+    vec![ViewRecord::new(line, offset, Kind::Text, text).label("stderr")]
+}
+
 /// `value` as indented JSON.
 fn pretty(value: &Value) -> String {
     serde_json::to_string_pretty(value).unwrap_or_else(|_| value.to_string())
