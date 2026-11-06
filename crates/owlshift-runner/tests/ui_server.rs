@@ -927,6 +927,279 @@ fn font_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("src/ui/assets/fonts")
 }
 
+/// The colour variables of a theme block: `--name: #RRGGBB;` lines.
+fn colours(block: &str) -> std::collections::BTreeMap<String, [f64; 3]> {
+    let mut found = std::collections::BTreeMap::new();
+    for line in block.lines() {
+        let Some((name, value)) = line.trim().strip_prefix("--").and_then(|rest| {
+            let (name, value) = rest.split_once(':')?;
+            Some((name.trim(), value.trim().strip_suffix(';')?.trim()))
+        }) else {
+            continue;
+        };
+        let Some(hex) = value.strip_prefix('#').filter(|hex| hex.len() == 6) else {
+            continue;
+        };
+        let channel = |at: usize| f64::from(u8::from_str_radix(&hex[at..at + 2], 16).unwrap());
+        found.insert(name.to_owned(), [channel(0), channel(2), channel(4)]);
+    }
+    found
+}
+
+/// The WCAG 2.2 contrast ratio of two colours.
+fn contrast(a: [f64; 3], b: [f64; 3]) -> f64 {
+    let luminance = |rgb: [f64; 3]| {
+        let [r, g, b] = rgb.map(|value| {
+            let value = value / 255.0;
+            if value <= 0.04045 {
+                value / 12.92
+            } else {
+                ((value + 0.055) / 1.055).powf(2.4)
+            }
+        });
+        0.2126 * r + 0.7152 * g + 0.0722 * b
+    };
+    let (high, low) = (
+        luminance(a).max(luminance(b)),
+        luminance(a).min(luminance(b)),
+    );
+    (high + 0.05) / (low + 0.05)
+}
+
+#[test]
+fn every_text_pair_of_the_contrast_table_holds_in_both_themes() {
+    // Visual identity section 4, "Contrast": page · surface · raised, light
+    // then dark. The table lists two decimals, hence the tolerance.
+    let text_rows: [(&str, [f64; 3], [f64; 3]); 7] = [
+        ("text", [15.66, 16.48, 14.89], [16.66, 14.89, 12.39]),
+        ("text-secondary", [8.91, 9.38, 8.47], [9.57, 8.55, 7.12]),
+        ("text-muted", [6.06, 6.37, 5.76], [6.45, 5.76, 4.79]),
+        ("link", [5.93, 6.24, 5.64], [10.62, 9.49, 7.90]),
+        ("success", [5.04, 5.30, 4.79], [11.58, 10.35, 8.61]),
+        ("warning", [5.63, 5.93, 5.36], [12.79, 11.43, 9.51]),
+        ("danger", [5.85, 6.15, 5.56], [6.74, 6.02, 5.01]),
+    ];
+    let graphic_rows: [(&str, [f64; 3], [f64; 3]); 2] = [
+        ("border-strong", [3.77, 3.96, 3.58], [4.65, 4.16, 3.46]),
+        // The ring's table lists it on page and surface only; on raised it
+        // is held to the 3:1 floor below.
+        ("focus", [3.73, 3.93, 3.0], [8.15, 7.28, 3.0]),
+    ];
+    let light = colours(block(APP_CSS, ":root {", ""));
+    let system_dark = colours(block(APP_CSS, ":root:not([data-theme=light]) {", "  "));
+    let chosen_dark = colours(block(APP_CSS, ":root[data-theme=dark] {", ""));
+    for role in system_dark.keys() {
+        assert_eq!(system_dark[role], chosen_dark[role], "{role}");
+    }
+    let backgrounds = ["page", "surface", "raised"];
+    let mut checked = 0;
+    for (theme, vars, column) in [
+        ("light", &light, 0),
+        ("dark", &system_dark, 1),
+        ("dark", &chosen_dark, 1),
+    ] {
+        let at = |role: &str| *vars.get(role).unwrap_or_else(|| panic!("{theme} {role}"));
+        let pick = |row: &[f64; 3], index: usize| row[index];
+        for (role, on_light, on_dark) in text_rows {
+            let listed = if column == 0 { on_light } else { on_dark };
+            for (index, background) in backgrounds.iter().enumerate() {
+                let ratio = contrast(at(role), at(background));
+                assert!(
+                    (ratio - pick(&listed, index)).abs() <= 0.005 && ratio >= 4.5,
+                    "{theme} {role} on {background}: {ratio:.3}"
+                );
+                checked += 1;
+            }
+        }
+        for (role, on_light, on_dark) in graphic_rows {
+            let listed = if column == 0 { on_light } else { on_dark };
+            for (index, background) in backgrounds.iter().enumerate() {
+                let ratio = contrast(at(role), at(background));
+                assert!(ratio >= 3.0, "{theme} {role} on {background}: {ratio:.3}");
+                if pick(&listed, index) > 3.0 {
+                    assert!(
+                        (ratio - pick(&listed, index)).abs() <= 0.005,
+                        "{theme} {role} on {background}: {ratio:.3}"
+                    );
+                }
+                checked += 1;
+            }
+        }
+        let action = contrast(at("action-text"), at("action-fill"));
+        let listed = if column == 0 { 14.89 } else { 7.28 };
+        assert!(
+            (action - listed).abs() <= 0.005,
+            "{theme} action: {action:.3}"
+        );
+        let badge = contrast(at("badge-text"), at("badge-fill"));
+        let listed = if column == 0 { 7.35 } else { 8.52 };
+        assert!((badge - listed).abs() <= 0.005, "{theme} badge: {badge:.3}");
+        // Section 4 has no row for the information state: it shares the
+        // secondary text's colour, so its row is that one.
+        assert_eq!(at("information"), at("text-secondary"), "{theme}");
+    }
+    assert_eq!(checked, 3 * (7 + 2) * 3);
+}
+
+/// The rules of `css` outside the theme blocks and the font faces, as
+/// (selector, declarations), the at-rule `@media` looked into.
+fn style_rules(css: &str) -> Vec<(String, Vec<(String, String)>)> {
+    // Comments carry no rule.
+    let mut plain = String::new();
+    let mut rest = css;
+    while let Some(start) = rest.find("/*") {
+        plain.push_str(&rest[..start]);
+        rest = &rest[start + 2..];
+        rest = &rest[rest.find("*/").expect("a closed comment") + 2..];
+    }
+    plain.push_str(rest);
+    let mut rules = Vec::new();
+    let mut queue = vec![plain];
+    while let Some(text) = queue.pop() {
+        let mut rest = text.trim();
+        while !rest.is_empty() {
+            let open = rest.find('{').expect("a rule without a block");
+            let selector = rest[..open].trim().to_owned();
+            let mut depth = 0;
+            let mut close = None;
+            for (at, c) in rest[open..].char_indices() {
+                match c {
+                    '{' => depth += 1,
+                    '}' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            close = Some(open + at);
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            let close = close.expect("a closed block");
+            let inner = &rest[open + 1..close];
+            rest = rest[close + 1..].trim();
+            if selector.starts_with("@media") {
+                queue.push(inner.to_owned());
+            } else if selector.starts_with("@") {
+                assert_eq!(selector, "@font-face", "an at-rule the walk does not know");
+            } else if !selector.starts_with(":root") {
+                assert!(
+                    !inner.contains('{'),
+                    "nested rules are not walked: {selector}"
+                );
+                let declarations = inner
+                    .split(';')
+                    .filter_map(|declaration| {
+                        let (name, value) = declaration.split_once(':')?;
+                        Some((name.trim().to_owned(), value.trim().to_owned()))
+                    })
+                    .collect();
+                rules.push((selector, declarations));
+            }
+        }
+    }
+    rules
+}
+
+/// The role names a rule's declaration uses, `var(--role)`.
+fn roles(value: &str) -> Vec<&str> {
+    value
+        .split("var(--")
+        .skip(1)
+        .filter_map(|part| part.split(')').next())
+        .collect()
+}
+
+/// What a rule outside the themes may colour with: text in a role the
+/// contrast table lists on page, surface and raised, a fill the table pairs
+/// with its text, and a border or outline of the strong or focus role
+/// (3:1), the hairline exempt. Any other colour is an unchecked pair.
+fn audit(css: &str) -> Result<(), String> {
+    const TEXT: [&str; 7] = [
+        "text",
+        "text-secondary",
+        "text-muted",
+        "link",
+        "success",
+        "warning",
+        "danger",
+    ];
+    // `information` shares the secondary text's colour, which the contrast
+    // test asserts.
+    const TEXT_LIKE: [&str; 1] = ["information"];
+    const FILLS: [&str; 3] = ["page", "surface", "raised"];
+    for (selector, declarations) in style_rules(css) {
+        let value_of = |wanted: &str| {
+            declarations
+                .iter()
+                .find(|(name, _)| name == wanted)
+                .map(|(_, value)| value.as_str())
+        };
+        for (name, value) in &declarations {
+            let coloured = name == "color"
+                || name.starts_with("background")
+                || (name.starts_with("border") && name != "border-radius")
+                || name.starts_with("outline") && !name.ends_with("offset");
+            if !coloured {
+                continue;
+            }
+            if value.contains('#') || value.contains("rgb") || value.contains("hsl") {
+                return Err(format!(
+                    "{selector}: {name} sets a colour outside the themes"
+                ));
+            }
+            for role in roles(value) {
+                let fine = if name == "color" {
+                    TEXT.contains(&role)
+                        || TEXT_LIKE.contains(&role)
+                        || (role == "badge-text"
+                            && value_of("background") == Some("var(--badge-fill)"))
+                        || (role == "action-text"
+                            && value_of("background") == Some("var(--action-fill)"))
+                } else if name.starts_with("background") {
+                    FILLS.contains(&role) || role == "badge-fill" || role == "action-fill"
+                } else {
+                    // The hairline only separates areas that differ otherwise.
+                    role == "border-hairline" || role == "border-strong" || role == "focus"
+                };
+                if !fine {
+                    return Err(format!(
+                        "{selector}: {name} uses --{role}, a pair the contrast table does not list"
+                    ));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn every_colour_the_style_sheet_uses_is_a_pair_of_the_contrast_table() {
+    audit(APP_CSS).unwrap();
+    // A rule added later cannot slip an unchecked pair in.
+    for css in [
+        ".new { color: var(--border-strong); }",
+        ".new { color: var(--badge-text); }",
+        ".new { color: var(--action-text); background: var(--surface); }",
+        ".new { background: var(--text); }",
+        ".new { border: 1px solid var(--page); }",
+        ".new { color: #FFFFFF; }",
+        ".new { border-color: rgb(0 0 0); }",
+        ".bar { outline: 2px solid var(--link); }",
+    ] {
+        assert!(audit(css).is_err(), "{css}");
+    }
+    for css in [
+        ".new { color: var(--text-muted); }",
+        ".new { color: var(--badge-text); background: var(--badge-fill); }",
+        ".new { border-bottom: 1px solid var(--border-hairline); }",
+        ".new { border: 1px solid var(--border-strong); border-radius: 4px; }",
+        ".new { outline: 2px solid var(--focus); outline-offset: 2px; }",
+    ] {
+        assert!(audit(css).is_ok(), "{css}");
+    }
+}
+
 const SANS_STACK: &str =
     r#""Bricolage Grotesque", system-ui, -apple-system, "Segoe UI", sans-serif"#;
 const MONO_STACK: &str = r#""JetBrains Mono", ui-monospace, "SF Mono", Menlo, Consolas, monospace"#;
