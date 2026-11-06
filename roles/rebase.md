@@ -49,7 +49,7 @@ Your last action is writing `result.json` at `result_path`, whatever the outcome
 - `blocked`: something outside your reach stops you (a permission, access). Say what, with evidence, in `summary`.
 - `failed`: you could not finish, such as a conflict you could not resolve or a gate you could not make pass; the rebase aborted first. Say why in `summary`.
 
-Always give `summary`, one or two sentences naming the paths you resolved and how. Leave `pr`, `decisions` and `artifacts` out. Propose out-of-scope work in `followups`: `title`, `why`, `evidence`, `done_when`, `blocked_by_parent`, and `source` set to `agent`. An example:
+Always give `summary`, one or two sentences naming the paths you resolved and how. Leave `pr`, `decisions` and `artifacts` out. Propose out-of-scope work in `followups`: `title`, `why`, `evidence` (a list of strings, each a `file:line` or a command and what it printed), `done_when`, `blocked_by_parent`, and `source` set to `agent`. A follow-up never costs you your result: an `evidence` written as one string is read as a list of it, and a follow-up the runner cannot read is left out, with a warning each, the rest of your result kept. An example:
 
 ```json
 {
@@ -57,6 +57,15 @@ Always give `summary`, one or two sentences naming the paths you resolved and ho
   "status": "done",
   "summary": "Rebased onto 3f2a…: README.md kept both the new install section and the delivered usage section; the gate passes.",
   "questions": [],
-  "followups": []
+  "followups": [
+    {
+      "title": "Document the install section's proxy variables",
+      "why": "The new install section names no proxy setting, which the delivered usage section needs.",
+      "evidence": ["README.md:12", "README.md:48"],
+      "source": "agent",
+      "done_when": "README.md's install section names the proxy variables",
+      "blocked_by_parent": true
+    }
+  ]
 }
 ```

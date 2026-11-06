@@ -100,6 +100,7 @@ pub struct RunResult {
     #[serde(default)]
     pub decisions: Vec<Decision>,
     /// Follow-up tickets proposed to a human; never admitted automatically.
+    /// Read leniently ([`Followup`], OWL-500).
     #[serde(default)]
     pub followups: Vec<Followup>,
     /// Paths, relative to the worktree, of the artifacts the run left.
@@ -563,6 +564,13 @@ pub struct Decision {
 }
 
 /// A follow-up ticket proposed to a human.
+///
+/// In `result.json`, a follow-up is secondary to the run's outcome
+/// (OWL-500): reading one is lenient, where every other field is strict.
+/// An `evidence` given as one string is read as a list of that string, and
+/// a follow-up still not of this shape is dropped, the rest of the result
+/// kept; the runner warns of each ([`FollowupRepairs`]). The schema keeps
+/// the shape asked for.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct Followup {
@@ -576,6 +584,95 @@ pub struct Followup {
     /// Whether the follow-up waits for the current ticket to be done.
     #[serde(default)]
     pub blocked_by_parent: bool,
+}
+
+/// What reading a result's follow-ups repaired (OWL-500): those whose
+/// `evidence` was one string, read as a list of it, and those dropped as not
+/// of [`Followup`]'s shape. The runner gives a warning for each kind.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct FollowupRepairs {
+    pub coerced: Vec<CoercedFollowup>,
+    pub dropped: Vec<DroppedFollowup>,
+}
+
+impl FollowupRepairs {
+    /// Whether nothing was repaired.
+    pub fn is_empty(&self) -> bool {
+        self.coerced.is_empty() && self.dropped.is_empty()
+    }
+}
+
+/// A follow-up whose `evidence` was one string, kept with that string as
+/// its one item.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CoercedFollowup {
+    /// Its place in the result's `followups`, from 1.
+    pub place: usize,
+    pub title: Option<String>,
+}
+
+/// A follow-up left out of the result as not of [`Followup`]'s shape.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DroppedFollowup {
+    /// Its place in the result's `followups` as written, from 1; `None`
+    /// when `followups` itself was not a list, and was dropped whole.
+    pub place: Option<usize>,
+    /// Its `title`, when it gave one as a string.
+    pub title: Option<String>,
+    /// Why it could not be read.
+    pub reason: String,
+}
+
+/// Repairs the `followups` of a result read as JSON, before it is read as
+/// a [`RunResult`] (OWL-500): see [`Followup`]. A `followups` that is not a
+/// list is removed.
+fn repair_followups(value: &mut serde_json::Value) -> FollowupRepairs {
+    let mut repairs = FollowupRepairs::default();
+    let Some(object) = value.as_object_mut() else {
+        return repairs;
+    };
+    let Some(followups) = object.get_mut("followups") else {
+        return repairs;
+    };
+    let Some(list) = followups.as_array_mut() else {
+        object.remove("followups");
+        repairs.dropped.push(DroppedFollowup {
+            place: None,
+            title: None,
+            reason: "followups is not a list".to_owned(),
+        });
+        return repairs;
+    };
+    let mut kept = Vec::with_capacity(list.len());
+    for (index, mut followup) in std::mem::take(list).into_iter().enumerate() {
+        let place = index + 1;
+        let title = followup
+            .get("title")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned);
+        let coerced = match followup.get_mut("evidence") {
+            Some(evidence) if evidence.is_string() => {
+                *evidence = serde_json::Value::Array(vec![evidence.take()]);
+                true
+            }
+            _ => false,
+        };
+        match Followup::deserialize(&followup) {
+            Ok(_) => {
+                if coerced {
+                    repairs.coerced.push(CoercedFollowup { place, title });
+                }
+                kept.push(followup);
+            }
+            Err(error) => repairs.dropped.push(DroppedFollowup {
+                place: Some(place),
+                title,
+                reason: error.to_string(),
+            }),
+        }
+    }
+    *list = kept;
+    repairs
 }
 
 /// Who found the follow-up.
@@ -612,11 +709,41 @@ pub struct PullRequest {
 }
 
 impl RunResult {
-    /// Parses and validates `result.json`.
+    /// Parses and validates `result.json`, its follow-ups read leniently
+    /// ([`Followup`]); what that repaired is not kept, which
+    /// [`RunResult::read_against`] returns.
     pub fn parse(input: &str) -> Result<Self, ContractError> {
-        let result: Self = format::parse_json(CONTRACT, RESULT_FORMAT, input)?;
+        let (result, _) = Self::read(input)?;
         result.validate()?;
         Ok(result)
+    }
+
+    /// Reads `result.json` as its type, once its format is checked and its
+    /// follow-ups repaired (OWL-500). A result that needs no repair is read
+    /// from the text itself, so an error names its line and column as
+    /// before, as is one that is not JSON at all; a repaired one is read
+    /// from its repaired JSON.
+    fn read(input: &str) -> Result<(Self, FollowupRepairs), ContractError> {
+        let strict = || format::parse_json(CONTRACT, RESULT_FORMAT, input);
+        let Ok(mut value) = format::parse_json::<serde_json::Value>(CONTRACT, RESULT_FORMAT, input)
+        else {
+            return Ok((strict()?, FollowupRepairs::default()));
+        };
+        let repairs = repair_followups(&mut value);
+        let result = if repairs.is_empty() {
+            strict()?
+        } else {
+            serde_json::from_value(value).map_err(|source| ContractError::Json {
+                contract: CONTRACT,
+                source,
+            })?
+        };
+        Ok((result, repairs))
+    }
+
+    /// [`RunResult::read_against`] without what it repaired.
+    pub fn parse_against(input: &str, brief: &Brief) -> Result<Self, Refused> {
+        Self::read_against(input, brief).map(|(result, _)| result)
     }
 
     /// Parses `result.json` as the run of `brief` wrote it and validates it
@@ -625,13 +752,15 @@ impl RunResult {
     /// role's own decisions are checked right after the document's shape, so
     /// a result that lists any is refused for them whatever other rule it
     /// breaks, and the refusal says so, and of which kind (OWL-186,
-    /// OWL-195).
-    pub fn parse_against(input: &str, brief: &Brief) -> Result<Self, Refused> {
+    /// OWL-195). Returns too what reading its follow-ups repaired, which the
+    /// runner warns of (OWL-500): the executor's `validate_result` is the
+    /// one reader of a role's result.
+    pub fn read_against(input: &str, brief: &Brief) -> Result<(Self, FollowupRepairs), Refused> {
         let other = |error| Refused {
             error,
             decisions: None,
         };
-        let result: Self = format::parse_json(CONTRACT, RESULT_FORMAT, input).map_err(other)?;
+        let (result, repairs) = Self::read(input).map_err(other)?;
         result
             .decisions_refused(brief)
             .map_err(|(kind, error)| Refused {
@@ -640,7 +769,7 @@ impl RunResult {
             })?;
         result.validate().map_err(other)?;
         result.validate_against(brief).map_err(other)?;
-        Ok(result)
+        Ok((result, repairs))
     }
 
     /// Renders `result.json`.

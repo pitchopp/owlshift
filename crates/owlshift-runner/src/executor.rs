@@ -89,7 +89,7 @@ use owlshift_adapters::harness::claude::{Usage, UsageWindow};
 use owlshift_contracts::Role;
 use owlshift_contracts::brief::{Brief, GateFailure, PermissionLevel};
 use owlshift_contracts::ids::{RelativePath, SessionId};
-use owlshift_contracts::result::{self, DecisionsRefusal, RunResult};
+use owlshift_contracts::result::{self, DecisionsRefusal, FollowupRepairs, RunResult};
 use owlshift_core::gate::usd_micros;
 use owlshift_platform::confined::{ConfinedError, Refusal, read_confined};
 use owlshift_platform::keychain::Secret;
@@ -348,6 +348,10 @@ pub struct RunReport {
     /// session not resumed, or not kept, and a resumed session's total
     /// below its earlier one.
     pub warnings: Vec<String>,
+    /// What reading the role's result repaired of its follow-ups (OWL-500):
+    /// kept whatever the outcome became after the result was read, such as
+    /// a red gate's.
+    pub followup_repairs: FollowupRepairs,
     /// For a run given a session to resume, whether it resumed it: `false`
     /// when its transcript could not be put in place and the run started a
     /// session of its own (OWL-394). `None` when none was to be resumed.
@@ -701,6 +705,7 @@ impl Executor {
                     setup: Some(ran.report),
                     gated: None,
                     warnings,
+                    followup_repairs: FollowupRepairs::default(),
                     resumed: None,
                     session: None,
                     windows: Vec::new(),
@@ -906,7 +911,8 @@ impl Executor {
             Some(run_files) => (run_files.as_path(), RUN_FILES_RESULT),
             None => (spec.worktree, RESULT_PATH),
         };
-        let (mut outcome, end) = decide(violations, timed_out, driven, spec, result, &hidden);
+        let (mut outcome, end, followup_repairs) =
+            decide(violations, timed_out, driven, spec, result, &hidden);
         if let Err(reason) = result_written
             && matches!(outcome, Outcome::Finished { .. })
         {
@@ -986,6 +992,7 @@ impl Executor {
             setup,
             gated,
             warnings,
+            followup_repairs,
             resumed,
             session,
         })
@@ -1065,6 +1072,7 @@ impl Executor {
             setup: None,
             gated,
             warnings: Vec::new(),
+            followup_repairs: FollowupRepairs::default(),
             resumed: None,
             session: None,
             windows: Vec::new(),
@@ -1456,11 +1464,12 @@ fn decide(
     spec: &RunSpec<'_>,
     result: (&Path, &str),
     hidden: &[Secret],
-) -> (Outcome, Option<HarnessEnd>) {
+) -> (Outcome, Option<HarnessEnd>, FollowupRepairs) {
     let (driven, end) = match driven {
         Ok(end) => (Ok(()), Some(end)),
         Err(error) => (Err(error), None),
     };
+    let mut repairs = FollowupRepairs::default();
     let outcome = if !violations.is_empty() {
         Outcome::Quarantined(violations)
     } else if timed_out {
@@ -1478,12 +1487,15 @@ fn decide(
                 },
                 HarnessStatus::Failed(reason) => Outcome::Failed(Failure::Harness(reason.clone())),
                 HarnessStatus::Completed => {
-                    read_result(result, spec.worktree, spec.branch, spec.brief, hidden)
+                    let read;
+                    (read, repairs) =
+                        read_result(result, spec.worktree, spec.branch, spec.brief, hidden);
+                    read
                 }
             }
         }
     };
-    (outcome, end)
+    (outcome, end, repairs)
 }
 
 /// Reads and validates the role's `result.json`, the file `name` in the
@@ -1491,14 +1503,16 @@ fn decide(
 /// read-only profile), then its artifacts, in the worktree. A result or an
 /// artifact that holds one of `hidden`, the harness's login secrets, fails
 /// the run: what it says would reach the tracker, the pull request and the
-/// events (OWL-94).
+/// events (OWL-94). Returns too what reading the result repaired of its
+/// follow-ups (OWL-500), whatever fails after it was read.
 fn read_result(
     (root, name): (&Path, &str),
     worktree: &Path,
     branch: &str,
     brief: &Brief,
     hidden: &[Secret],
-) -> Outcome {
+) -> (Outcome, FollowupRepairs) {
+    let none = FollowupRepairs::default;
     let copied = |into: &str, bytes: &[u8]| {
         hidden.iter().any(|token| holds(bytes, token)).then(|| {
             Outcome::Failed(Failure::Credentials(vec![CredentialFinding::LoginCopied {
@@ -1511,17 +1525,22 @@ fn read_result(
         Err(ConfinedError::Refused {
             reason: Refusal::NotFound,
             ..
-        }) => return Outcome::Failed(Failure::NoResult),
-        Err(error) => return Outcome::Failed(Failure::InvalidResult(error.to_string())),
+        }) => return (Outcome::Failed(Failure::NoResult), none()),
+        Err(error) => {
+            return (
+                Outcome::Failed(Failure::InvalidResult(error.to_string())),
+                none(),
+            );
+        }
     };
     if let Some(refused) = copied(name, &bytes) {
-        return refused;
+        return (refused, none());
     }
-    let result = match validate_result(&bytes, branch, brief) {
-        Ok(result) => result,
-        Err(failure) => return Outcome::Failed(failure),
+    let (result, repairs) = match validate_result(&bytes, branch, brief) {
+        Ok(read) => read,
+        Err(failure) => return (Outcome::Failed(failure), none()),
     };
-    match read_artifacts(worktree, &result.artifacts) {
+    let outcome = match read_artifacts(worktree, &result.artifacts) {
         Ok(artifacts) => {
             let named = [
                 ("the plan artifact", &artifacts.plan),
@@ -1529,29 +1548,33 @@ fn read_result(
                 ("the findings artifact", &artifacts.findings),
                 ("the report artifact", &artifacts.report),
             ];
-            for (into, bytes) in named {
-                if let Some(refused) = bytes.as_deref().and_then(|bytes| copied(into, bytes)) {
-                    return refused;
-                }
-            }
-            Outcome::Finished {
+            let refused = named
+                .into_iter()
+                .find_map(|(into, bytes)| bytes.as_deref().and_then(|bytes| copied(into, bytes)));
+            refused.unwrap_or_else(|| Outcome::Finished {
                 result: Box::new(result),
                 artifacts,
-            }
+            })
         }
         Err(error) => Outcome::Failed(Failure::Artifact(error)),
-    }
+    };
+    (outcome, repairs)
 }
 
 /// Parses `result.json` against its contract and against the run's brief
 /// (verdicts from the answer check only, covering its latest ask), and
 /// requires a pull request to name the run's own branch. A refusal for the
 /// build role's own decisions is [`Failure::Decisions`], any other
-/// [`Failure::InvalidResult`].
-pub fn validate_result(bytes: &[u8], branch: &str, brief: &Brief) -> Result<RunResult, Failure> {
+/// [`Failure::InvalidResult`]. Returns too what reading its follow-ups
+/// repaired ([`RunResult::read_against`], OWL-500).
+pub fn validate_result(
+    bytes: &[u8],
+    branch: &str,
+    brief: &Brief,
+) -> Result<(RunResult, FollowupRepairs), Failure> {
     let text = std::str::from_utf8(bytes)
         .map_err(|_| Failure::InvalidResult("it is not UTF-8 text".to_owned()))?;
-    let result = RunResult::parse_against(text, brief).map_err(|refused| {
+    let (result, repairs) = RunResult::read_against(text, brief).map_err(|refused| {
         let reason = refused.error.to_string();
         match refused.decisions {
             Some(kind) => Failure::Decisions { kind, reason },
@@ -1566,7 +1589,7 @@ pub fn validate_result(bytes: &[u8], branch: &str, brief: &Brief) -> Result<RunR
             pr.branch
         )));
     }
-    Ok(result)
+    Ok((result, repairs))
 }
 
 /// What replaces the harness's login token in the run's log files.
