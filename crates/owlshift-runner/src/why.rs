@@ -3,7 +3,9 @@
 //! read from what Owlshift keeps and nothing else.
 //!
 //! It reads the event log's `decision` events (`drain`, `watch`, `usage` or
-//! `base` = `waits`), the project's ticket refs, the machine's usage files,
+//! `base` = `waits`, merge on green's among them, OWL-499; and watch's
+//! `merge_waits` and final `merge_refused`, OWL-464), the project's ticket
+//! refs, the machine's usage files,
 //! the project's base checks (OWL-418), the quarantine marker and the run
 //! slots. It takes no lock the writers hold:
 //! the project's lock and the tickets' locks are never tried, so it runs
@@ -135,8 +137,17 @@ fn waiting(event: &Event, ticket: &TicketId) -> Option<Waiting> {
         return None;
     }
     let says = |key: &str| event.data.get(key).and_then(Value::as_str) == Some("waits");
+    let watch = event.data.get("watch").and_then(Value::as_str);
     let reason = if says("drain") || says("watch") {
         event.data.get("reason")?.as_str()?.to_owned()
+    } else if watch == Some("merge_waits") {
+        // A green pull request merge on green leaves for a person (OWL-464),
+        // shown beside the waits that lift by themselves (OWL-499).
+        "kept_for_a_person".to_owned()
+    } else if watch == Some("merge_refused")
+        && event.data.get("final").and_then(Value::as_bool) == Some(true)
+    {
+        "merge_refused".to_owned()
     } else if says("usage") {
         "usage_limit".to_owned()
     } else if says("base") {
@@ -173,6 +184,10 @@ fn waiting(event: &Event, ticket: &TicketId) -> Option<Waiting> {
 /// The phrase a wait is shown as.
 pub fn phrase(wait: &Waiting) -> String {
     let data = &wait.data;
+    // Merge on green's waits (OWL-499), worded where they are told.
+    if let Some(words) = crate::merge::wait_words(&wait.reason, data) {
+        return words;
+    }
     let list = |key: &str| -> String {
         data.get(key)
             .and_then(Value::as_array)
@@ -227,6 +242,29 @@ pub fn phrase(wait: &Waiting) -> String {
             }
             _ => "the open pull requests reached their cap".to_owned(),
         },
+        "kept_for_a_person" => {
+            let pr = data
+                .get("pull_request")
+                .and_then(Value::as_u64)
+                .unwrap_or(0);
+            let reason = data.get("reason").and_then(Value::as_str).unwrap_or("");
+            format!(
+                "pull request #{pr} is green and waits for a person: Owlshift will not merge it, \
+                 as {reason}"
+            )
+        }
+        "merge_refused" => {
+            let pr = data
+                .get("pull_request")
+                .and_then(Value::as_u64)
+                .unwrap_or(0);
+            let reason = data.get("reason").and_then(Value::as_str).unwrap_or("");
+            format!(
+                "GitHub refused the merge on green of pull request #{pr} for good: {}; a person \
+                 acts, then `owlshift continue` asks for another try",
+                reason.trim_end_matches('.')
+            )
+        }
         "duplicate" => "the column lists it twice; the first is taken".to_owned(),
         "not_admitted" => {
             "its admission gesture is not from an account `[tracker].admitters` lists".to_owned()
@@ -959,6 +997,118 @@ mod tests {
         assert_eq!(
             phrase(wait),
             "OWL-2 holds zone `leases/`, which it would touch"
+        );
+    }
+
+    /// OWL-499: merge on green's waits are a ticket's waits, worded where
+    /// they are told, and so are a hold for a person and a refusal for good
+    /// (OWL-464); a refusal that may pass is no wait, and a merge or a
+    /// dispatch ends the wait.
+    #[test]
+    fn merge_on_green_s_waits_holds_and_refusals_are_waits() {
+        let id = |t| TicketId::new(t).unwrap();
+        let events = [
+            waits(
+                "2026-11-06T08:04:20Z",
+                "LOC-1513",
+                crate::merge::wait_data(
+                    1606,
+                    "2b62a208",
+                    "merge_owes_first",
+                    data([
+                        ("report", json!(false)),
+                        ("proposals", json!(["Back the quotes with fixtures"])),
+                        ("refusal", json!(null)),
+                    ]),
+                ),
+            ),
+            waits(
+                "2026-11-06T08:05:00Z",
+                "LOC-1475",
+                data([
+                    ("watch", json!("merge_waits")),
+                    ("pull_request", json!(1590)),
+                    (
+                        "reason",
+                        json!("the ticket carries the project's exclusion label"),
+                    ),
+                ]),
+            ),
+            waits(
+                "2026-11-06T08:06:00Z",
+                "LOC-1500",
+                data([
+                    ("watch", json!("merge_refused")),
+                    ("pull_request", json!(1595)),
+                    ("final", json!(true)),
+                    ("reason", json!("Base branch was modified.")),
+                ]),
+            ),
+            waits(
+                "2026-11-06T08:06:00Z",
+                "LOC-1505",
+                data([
+                    ("watch", json!("merge_refused")),
+                    ("pull_request", json!(1597)),
+                    ("final", json!(false)),
+                    ("reason", json!("Base branch was modified.")),
+                ]),
+            ),
+            waits(
+                "2026-11-06T08:07:00Z",
+                "LOC-1530",
+                crate::merge::wait_data(
+                    1608,
+                    "ad6dc7cc",
+                    "refresh_held",
+                    data([("until", json!("2026-11-06T08:17:00Z"))]),
+                ),
+            ),
+            event(
+                "2026-11-06T08:20:00Z",
+                Some("LOC-1530"),
+                EventKind::Dispatch,
+                Data::new(),
+            ),
+        ];
+        let folded = fold(&events, "o/r");
+        let current: Vec<(&str, String)> = folded
+            .current
+            .iter()
+            .map(|(ticket, wait)| (ticket.as_str(), phrase(wait)))
+            .collect();
+        assert_eq!(
+            current,
+            [
+                (
+                    "LOC-1475",
+                    "pull request #1590 is green and waits for a person: Owlshift will not merge \
+                     it, as the ticket carries the project's exclusion label"
+                        .to_owned()
+                ),
+                (
+                    "LOC-1500",
+                    "GitHub refused the merge on green of pull request #1595 for good: Base \
+                     branch was modified; a person acts, then `owlshift continue` asks for \
+                     another try"
+                        .to_owned()
+                ),
+                (
+                    "LOC-1513",
+                    "pull request #1606 is green and not merged yet: the ticket owes the \
+                     follow-up \"Back the quotes with fixtures\" on the tracker, which comes \
+                     first. Owlshift tries again at each pass, then gets it a refresh rebase or \
+                     merges it"
+                        .to_owned()
+                ),
+            ]
+        );
+        let held = &folded.history[&id("LOC-1530")][0];
+        assert_eq!(
+            phrase(held),
+            "pull request #1608 is green on a base that moved since the push, and its refresh \
+             rebase waits: its last step left its ticket ref as it was, so it is tried again at \
+             2026-11-06T08:17:00Z, or sooner once its ref moves"
         );
     }
 

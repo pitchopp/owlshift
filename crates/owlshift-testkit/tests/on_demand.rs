@@ -85,6 +85,9 @@ struct FakeGitHub {
     followed: Mutex<Followed>,
     /// Watch's reads of the pull request so far.
     follow_reads: Mutex<u32>,
+    /// The read of the pull request, by its count, that finds its check
+    /// still running, once (OWL-499).
+    pending_follow_read: Mutex<Option<u32>>,
     /// Reads of the base branch's checks so far.
     base_reads: Mutex<u32>,
     /// The status the red job's log answers (OWL-112), and how many times
@@ -263,7 +266,17 @@ impl FakeGitHub {
             *self.open.lock().unwrap() = Some(1);
             json!({ "createPullRequest": { "pullRequest": self.pull_request() } })
         } else if query.starts_with("query Follow") {
-            *self.follow_reads.lock().unwrap() += 1;
+            let reads = {
+                let mut reads = self.follow_reads.lock().unwrap();
+                *reads += 1;
+                *reads
+            };
+            let pending = *self.pending_follow_read.lock().unwrap() == Some(reads);
+            let (status, conclusion) = if pending {
+                ("IN_PROGRESS", Value::Null)
+            } else {
+                ("COMPLETED", json!(self.followed.lock().unwrap().conclusion))
+            };
             let followed = self.followed.lock().unwrap().clone();
             let head = self.tip();
             json!({ "repository": { "pullRequest": {
@@ -275,7 +288,7 @@ impl FakeGitHub {
                         "pageInfo": { "hasNextPage": false, "endCursor": null },
                         "nodes": [{
                             "__typename": "CheckRun", "databaseId": 2, "name": "ci",
-                            "status": "COMPLETED", "conclusion": followed.conclusion,
+                            "status": status, "conclusion": conclusion,
                             "isRequired": true,
                             "detailsUrl": "https://github.com/demo/project/runs/2",
                             "checkSuite": { "app": { "slug": "github-actions" },
@@ -1243,6 +1256,7 @@ impl Bench {
             stale_reads: Mutex::new(0),
             followed: Mutex::default(),
             follow_reads: Mutex::new(0),
+            pending_follow_read: Mutex::new(None),
             base_reads: Mutex::new(0),
             log: Mutex::new((200, 0)),
             at_checks: Mutex::new(None),

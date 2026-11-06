@@ -6789,12 +6789,34 @@ impl OnDemand<'_> {
                     cause: RebaseCause::MergeBase,
                 }
             }
-            // Anything else is a look's: the next one keeps it.
+            // Anything else is a look's: the next one keeps it. A refresh
+            // that finds nothing to refresh says what it read (OWL-499),
+            // and its ticket is held as any step that left its ref as it
+            // was, which watch tells.
             _ => {
+                let merge = merge_refresh.then(|| {
+                    sink.emit(
+                        &ticket,
+                        None,
+                        EventKind::Decision,
+                        data([
+                            ("watch", json!("refresh_unneeded")),
+                            ("pull_request", json!(pr.number)),
+                            ("head", json!(fresh.checks.head.to_string())),
+                            ("action", json!(crate::follow::action_name(&fresh.decision))),
+                            ("base", json!(p.base.commit)),
+                            ("base_at_push", json!(delivery.base_at_push)),
+                        ]),
+                    );
+                    "Merge on green's refresh rebase ran nothing: its own read did not find the \
+                     pull request green on a base that moved since the push; watch's next pass \
+                     decides again."
+                        .to_owned()
+                });
                 return Err(Stop::Watched {
                     ticket: ticket.clone(),
                     seen: Box::new(fresh.seen(pr.number, &pr.url)),
-                    merge: None,
+                    merge,
                 });
             }
         };

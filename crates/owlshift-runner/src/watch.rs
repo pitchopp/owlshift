@@ -605,10 +605,34 @@ struct Memory<'c> {
 enum Due {
     /// Read, and nothing is due.
     Nothing,
-    /// Due, held, within its quiet window, or not read: nothing ran.
+    /// Not read, a warning saying why: nothing ran.
     Waits,
+    /// Due, but held back, within its quiet window, or a delivery dated
+    /// first: nothing ran, and a green pull request's merge waits for it,
+    /// which is told (OWL-499).
+    Pending,
     /// Its run started.
     Ran,
+}
+
+/// Why [`Watch::held_run`] started no step (OWL-499): what merge on
+/// green's refresh tells.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum HeldBack {
+    /// An operator's pause, told for the project.
+    Paused,
+    /// Its last step, from the same ticket ref and answer, left the ref as
+    /// it was ([`Holds`]).
+    Held(Until),
+    /// The harness its first run would use is at its usage limit, until
+    /// then, in milliseconds (OWL-404).
+    Usage { harness: Harness, until_ms: i64 },
+}
+
+/// Whether a step [`Watch::held_run`] gave `run` started, ran, or ended at
+/// once for want of a lock or a run slot: anything but held back or stale.
+fn started(run: &Result<Option<StepEnd>, HeldBack>) -> bool {
+    matches!(run, Ok(end) if end.as_ref().is_none_or(|end| *end != StepEnd::Stale))
 }
 
 /// Why a ticket's next stage step waits, as told once.
@@ -1268,7 +1292,21 @@ impl Watch<'_> {
         }
         let seen = match look {
             Look::Read(seen) => seen,
-            Look::Paused { .. } | Look::Unread { .. } => return,
+            // A spent budget holds a pull request last read green at its
+            // head too, which is told (OWL-499).
+            Look::Paused { until } => {
+                if let (Some(pr), Some(pushed)) = (&delivery.pull_request, &delivery.pushed)
+                    && memory
+                        .following
+                        .first_green(ticket, now)
+                        .is_some_and(|(head, _)| head == *pushed)
+                {
+                    let wait = ("forge_paused", data([("until", json!(until))]));
+                    self.tell_wait(memory, sink, out, ticket, pr, pushed, wait);
+                }
+                return;
+            }
+            Look::Unread { .. } => return,
         };
         let mut replaced = None;
         // The runner's merge (OWL-445): told once before the end is kept.
@@ -1353,14 +1391,22 @@ impl Watch<'_> {
                 } else {
                     self.review(memory, sink, out, continued, ticket, stored, at.clone())
                 };
-                if (corrected, reviewed) == (Due::Nothing, Due::Nothing)
-                    && seen.decision
-                        == (Decision::Follow {
-                            adopt: false,
-                            action: Action::Green,
-                        })
-                {
+                let green = seen.decision
+                    == (Decision::Follow {
+                        adopt: false,
+                        action: Action::Green,
+                    });
+                if green && (corrected, reviewed) == (Due::Nothing, Due::Nothing) {
                     self.merge(memory, sink, out, continued, ticket, stored, at, &seen);
+                } else if green
+                    && let Some(pr) = &delivery.pull_request
+                    && let Some(due) = [(corrected, "correction"), (reviewed, "review")]
+                        .into_iter()
+                        .find_map(|(found, due)| (found == Due::Pending).then_some(due))
+                {
+                    // Merge on green waits for it, which is told (OWL-499).
+                    let wait = ("merge_due_first", data([("due", json!(due))]));
+                    self.tell_wait(memory, sink, out, ticket, pr, &seen.head, wait);
                 }
             }
             return;
@@ -1397,7 +1443,7 @@ impl Watch<'_> {
             } if base::wait_file(on_demand.dirs, ticket).exists() => None,
             _ => Some(Role::Build),
         };
-        self.held_run(
+        let _ = self.held_run(
             memory,
             sink,
             out,
@@ -1422,7 +1468,10 @@ impl Watch<'_> {
     /// ran nothing. Its outcome is told, then what it did is held as a
     /// continue is ([`Holds::after`]), from the ticket ref read after it.
     /// A step whose first run, of `first`, has no harness for a usage limit
-    /// does not start (OWL-404). Returns whether it ran.
+    /// does not start (OWL-404). Returns how the step ended, `None` while
+    /// its child runs, or why it was held back before anything of it was
+    /// made (OWL-499). A step that starts lets merge on green tell the
+    /// waits after it again.
     #[allow(clippy::too_many_arguments)]
     fn held_run(
         &self,
@@ -1434,21 +1483,27 @@ impl Watch<'_> {
         held: Seen,
         (kind, first): (StepKind, Option<Role>),
         reviews: Option<ReviewsRead>,
-    ) -> bool {
+    ) -> Result<Option<StepEnd>, HeldBack> {
         let on_demand = self.on_demand;
         let now = (on_demand.clock)();
         // Under an operator's pause no repair, correction or review loop
         // starts (OWL-438).
-        if self.operator_paused(memory, sink, out)
-            || memory.holds.admit(ticket, &held, now) != Admit::Go
-            || self.usage_waits(memory, sink, out, first)
-        {
-            return false;
+        if self.operator_paused(memory, sink, out) {
+            return Err(HeldBack::Paused);
+        }
+        if let Admit::Held { until } = memory.holds.admit(ticket, &held, now) {
+            return Err(HeldBack::Held(until));
+        }
+        if let Some((harness, until_ms)) = self.usage_wait(memory, sink, out, first) {
+            return Err(HeldBack::Usage { harness, until_ms });
         }
         let envelope = self.envelope(memory, ticket, kind, &held);
         let then = Then::Held { seen: held };
-        self.step(memory, sink, out, continued, envelope, reviews, None, then)
-            .is_none_or(|end| end != StepEnd::Stale)
+        let end = self.step(memory, sink, out, continued, envelope, reviews, None, then);
+        if end.as_ref().is_none_or(running::ran) {
+            memory.following.merge_told_reset(ticket);
+        }
+        Ok(end)
     }
 
     /// What a step of [`Self::held_run`] that ended `end` left (since
@@ -1607,7 +1662,7 @@ impl Watch<'_> {
                     format!("dating its delivery: {reason}"),
                 );
             }
-            return Due::Waits;
+            return Due::Pending;
         };
         let (read, warnings) = memory
             .following
@@ -1647,7 +1702,7 @@ impl Watch<'_> {
         // counts"): its Build then holds the slot, and its next step waits
         // for its turn by dispatch time.
         let held = Seen::at(at, pr_reviews::newest(&due));
-        if self.held_run(
+        let run = self.held_run(
             memory,
             sink,
             out,
@@ -1656,10 +1711,11 @@ impl Watch<'_> {
             held,
             (StepKind::Review, Some(Role::Build)),
             Some(read),
-        ) {
+        );
+        if started(&run) {
             Due::Ran
         } else {
-            Due::Waits
+            Due::Pending
         }
     }
 
@@ -1953,8 +2009,8 @@ impl Watch<'_> {
     /// is left to [`OnDemand::correct_seen`], which reads them under the
     /// lock. Returns what it found due (OWL-445): nothing only when the
     /// ticket keeps no decision or its comments read with no reversal; a
-    /// reply within its quiet window, a run held back or a failed read
-    /// waits.
+    /// failed read waits; a reply within its quiet window or a run held
+    /// back is pending (OWL-499).
     #[allow(clippy::too_many_arguments)]
     fn correct(
         &self,
@@ -1998,13 +2054,13 @@ impl Watch<'_> {
         let now = (on_demand.clock)();
         let window = on_demand.config.policy.quiet_window();
         if reversal::counts_at(&reversed, now, window).is_some() {
-            return Due::Waits;
+            return Due::Pending;
         }
         let held = Seen::at(
             at,
             reversal::newest(&reversed).map(|reply| reply.last_edit()),
         );
-        if self.held_run(
+        let run = self.held_run(
             memory,
             sink,
             out,
@@ -2013,10 +2069,11 @@ impl Watch<'_> {
             held,
             (StepKind::Correct, Some(Role::Build)),
             None,
-        ) {
+        );
+        if started(&run) {
             Due::Ran
         } else {
-            Due::Waits
+            Due::Pending
         }
     }
 

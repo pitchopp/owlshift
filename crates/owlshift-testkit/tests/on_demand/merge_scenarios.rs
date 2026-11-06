@@ -366,23 +366,45 @@ fn continue_at_watch_says_which_questions_still_hold_the_merge() {
     assert!(github_merges(&bench).is_empty());
 }
 
-/// The rebase run of a refresh: the delivered branch replayed onto `onto`,
-/// with no conflict.
-fn refresh_in(bench: &Bench, onto: String) -> During {
+/// The rebase run of a refresh: the delivered branch replayed onto the base
+/// its step fetched, with no conflict.
+fn refresh_in(bench: &Bench) -> During {
     let (env, worktree) = (bench.env.clone(), bench.worktree());
     (
         1,
         Box::new(move || {
-            env.run(&worktree, &["rebase", "--quiet", &onto]).unwrap();
+            env.run(&worktree, &["rebase", "--quiet", "origin/main"])
+                .unwrap();
         }),
     )
+}
+
+/// A sibling's merge into `main`, writing a file of its own.
+fn sibling_merged(bench: &Bench) -> String {
+    bench.merge_into_main(&[("OTHER.md", "Another ticket's file.\n")])
+}
+
+/// The data of the waits merge on green told (OWL-499).
+fn waits_told(bench: &Bench) -> Vec<Value> {
+    data_of(&bench.events(), EventKind::Decision, "watch")
+        .into_iter()
+        .filter(|data| data["watch"] == "waits")
+        .collect()
 }
 
 /// S18, a base that moved since the push: no merge, a refresh rebase run
 /// instead, and a merge only once the rebased head reads green twice.
 #[test]
 fn a_moved_base_gets_a_refresh_rebase_then_two_green_reads_before_the_merge() {
-    refresh_then_merge(&merging("all"));
+    refresh_then_merge(&merging("all"), false);
+}
+
+/// OWL-499: a base a sibling's merge moves while watch follows a green
+/// pull request, after its first green read, gets the refresh rebase at
+/// the next pass, then the merge, with no wait told on the way.
+#[test]
+fn a_base_moved_by_a_sibling_s_merge_while_watch_follows_gets_its_refresh() {
+    refresh_then_merge(&merging("all"), true);
 }
 
 /// LOC-1454 on the bench (OWL-457): the same moved base while two other
@@ -429,7 +451,7 @@ fn a_moved_base_is_rebased_and_merged_while_other_runs_are_in_flight() {
     let entry = checkout.join(".git/worktrees/stale");
     let kept = fs::read(entry.join("gitdir")).unwrap();
 
-    refresh_then_merge(&bench);
+    refresh_then_merge(&bench, false);
     assert!(dirs.obligations_stand());
     assert_eq!(fs::read(entry.join("gitdir")).unwrap(), kept, "pruned");
     drop(in_flight);
@@ -437,11 +459,13 @@ fn a_moved_base_is_rebased_and_merged_while_other_runs_are_in_flight() {
 
 /// A moved base's refresh rebase run, then the merge once the rebased head
 /// read green twice, played by `watch` on `bench`, a delivered ticket of a
-/// project whose `[forge] merge` is `all`.
-fn refresh_then_merge(bench: &Bench) {
+/// project whose `[forge] merge` is `all`: the base moved before watch
+/// starts, or, `while_watching`, after its first pass read the pull request
+/// green (OWL-499).
+fn refresh_then_merge(bench: &Bench, while_watching: bool) {
     let first_push = bench.remote_branch().unwrap();
-    let main = bench.merge_into_main(&[("OTHER.md", "Another ticket's file.\n")]);
-    let refresh = refresh_in(bench, main.clone());
+    let mut main = (!while_watching).then(|| sibling_merged(bench));
+    let refresh = refresh_in(bench);
     let github = bench.github.clone();
     let clock = bench.clock.clone();
     let mut pushed_at: Option<u32> = None;
@@ -452,6 +476,10 @@ fn refresh_then_merge(bench: &Bench) {
         &mut |_| {
             pass += 1;
             later(&clock);
+            if main.is_none() {
+                assert_eq!(bench.remote_branch().as_deref(), Some(first_push.as_str()));
+                main = Some(sibling_merged(bench));
+            }
             let merges = github.merges.lock().unwrap().len();
             if pushed_at.is_none() && bench.remote_branch().as_deref() != Some(&first_push) {
                 pushed_at = Some(pass);
@@ -464,6 +492,9 @@ fn refresh_then_merge(bench: &Bench) {
         outcomes.iter().all(Result::is_ok),
         "{outcomes:?}\n{lines}\n{printed}"
     );
+    let main = main.unwrap();
+    // Each wait the next pass settled said nothing (OWL-499).
+    assert_eq!(waits_told(bench), Vec::<Value>::new(), "{lines}");
     let rebased = data_of(&bench.events(), EventKind::Decision, "refresh");
     assert_eq!(rebased.len(), 1, "{rebased:?}");
     assert_eq!(
@@ -658,5 +689,149 @@ fn a_crash_between_the_merge_and_the_ref_write_still_tells_one_merged() {
     assert_eq!(github_merges(&bench).len(), 1, "{lines}\n{printed}");
     assert_eq!(merged_comments(&bench).len(), 1, "{lines}\n{printed}");
     assert_eq!(merged_events(&bench).len(), 1);
+    assert_ended_merged(&bench);
+}
+
+/// LOC-1513 and LOC-1530 on the bench (OWL-499): a green pull request on a
+/// base a sibling's merge moved, whose ticket owes follow-ups the tracker
+/// refuses, gets no refresh rebase while they are owed, and says so once,
+/// with the refusal; once the tracker files them, the refresh rebase runs
+/// and the merge follows.
+#[test]
+fn owed_follow_ups_hold_the_refresh_and_say_so() {
+    let bench = Bench::with(
+        "maintainer",
+        "assignee = \"maintainer\"\n",
+        "[forge]\nmerge = \"all\"\n",
+    );
+    {
+        let mut inbox = bench.inbox.borrow_mut();
+        inbox.on = true;
+        inbox.refuse = Some("the plan holds 250 issues");
+    }
+    let (outcome, printed) = bench.run(vec![bench.reply(Some("Hello"), Some(PROPOSING))], None);
+    outcome.unwrap_or_else(|stop| panic!("{stop}\n{printed}"));
+    let first_push = bench.remote_branch().unwrap();
+    let main = sibling_merged(&bench);
+    let refresh = refresh_in(&bench);
+    let clock = bench.clock.clone();
+    let mut pass = 0;
+    let (outcomes, lines, printed) = bench.watch_during(
+        vec![bench.reply(None, Some(REBASED))],
+        vec![refresh],
+        &mut |_| {
+            pass += 1;
+            later(&clock);
+            if pass == 4 {
+                assert_eq!(bench.remote_branch().as_deref(), Some(first_push.as_str()));
+                bench.inbox.borrow_mut().refuse = None;
+            }
+            pass < 10
+        },
+    );
+    assert!(
+        outcomes.iter().all(Result::is_ok),
+        "{outcomes:?}\n{lines}\n{printed}"
+    );
+    let told = waits_told(&bench);
+    assert_eq!(told.len(), 1, "{told:?}\n{lines}");
+    assert_eq!(
+        (&told[0]["reason"], &told[0]["head"], &told[0]["refusal"]),
+        (
+            &json!("merge_owes_first"),
+            &json!(first_push),
+            &json!("tracker: the plan holds 250 issues")
+        )
+    );
+    assert_eq!(
+        told[0]["proposals"],
+        json!(["Translate the greeting", "Lint the docs"])
+    );
+    let line = "DEMO-1: pull request #1 is green and not merged yet: the ticket owes 2 \
+                follow-ups (\"Translate the greeting\", \"Lint the docs\") on the tracker, which \
+                comes first; the tracker refused the last filing: tracker: the plan holds 250 \
+                issues";
+    assert_eq!(lines.matches(line).count(), 1, "{lines}");
+    assert!(
+        proposal_outcomes(&bench)
+            .iter()
+            .all(|outcome| matches!(outcome, ProposalOutcome::Filed { .. })),
+        "{:?}",
+        proposal_outcomes(&bench)
+    );
+    let rebased = data_of(&bench.events(), EventKind::Decision, "refresh");
+    assert_eq!(rebased.len(), 1, "{rebased:?}\n{lines}");
+    assert_eq!(rebased[0]["onto"], json!(main));
+    let head = bench.remote_branch().unwrap();
+    assert_eq!(
+        github_merges(&bench),
+        [json!({ "sha": head, "merge_method": "squash" })],
+        "{lines}"
+    );
+    assert_ended_merged(&bench);
+}
+
+/// OWL-499: a refresh rebase whose own read does not find the pull request
+/// green, its check running again, says what it read and that it ran
+/// nothing, never that Owlshift does not merge; its ticket is held as any
+/// step's that left its ref as it was, which the passes after it tell once;
+/// after the hold, the refresh rebase runs and the merge follows.
+#[test]
+fn a_refresh_that_ran_nothing_is_held_and_told() {
+    let bench = merging("all");
+    let at_push = bench.remote_main();
+    let main = sibling_merged(&bench);
+    // Watch's first read is green; the refresh's own read, the next one,
+    // finds the check running.
+    let reads = *bench.github.follow_reads.lock().unwrap();
+    *bench.github.pending_follow_read.lock().unwrap() = Some(reads + 2);
+    let refresh = refresh_in(&bench);
+    let clock = bench.clock.clone();
+    let mut pass = 0;
+    let (outcomes, lines, printed) = bench.watch_during(
+        vec![bench.reply(None, Some(REBASED))],
+        vec![refresh],
+        &mut |_| {
+            pass += 1;
+            later(&clock);
+            pass < 12
+        },
+    );
+    let watched: Vec<String> = outcomes
+        .iter()
+        .filter_map(|outcome| outcome.as_ref().err().map(ToString::to_string))
+        .collect();
+    assert_eq!(watched.len(), 1, "{outcomes:?}\n{lines}\n{printed}");
+    assert!(
+        watched[0].contains("refresh rebase ran nothing") && !watched[0].contains("never merges"),
+        "{}",
+        watched[0]
+    );
+    let unneeded: Vec<Value> = data_of(&bench.events(), EventKind::Decision, "watch")
+        .into_iter()
+        .filter(|data| data["watch"] == "refresh_unneeded")
+        .collect();
+    assert_eq!(unneeded.len(), 1, "{unneeded:?}");
+    assert_eq!(
+        (
+            &unneeded[0]["action"],
+            &unneeded[0]["base"],
+            &unneeded[0]["base_at_push"]
+        ),
+        (&json!("wait_checks"), &json!(main), &json!(at_push))
+    );
+    let told = waits_told(&bench);
+    assert_eq!(told.len(), 1, "{told:?}\n{lines}");
+    assert_eq!(told[0]["reason"], "refresh_held");
+    let until = told[0]["until"].as_str().expect("a time");
+    let line = format!(
+        "DEMO-1: pull request #1 is green on a base that moved since the push, and its refresh \
+         rebase waits: its last step left its ticket ref as it was, so it is tried again at \
+         {until}, or sooner once its ref moves"
+    );
+    assert_eq!(lines.matches(&line).count(), 1, "{lines}");
+    let rebased = data_of(&bench.events(), EventKind::Decision, "refresh");
+    assert_eq!(rebased.len(), 1, "{rebased:?}\n{lines}");
+    assert_eq!(github_merges(&bench).len(), 1, "{lines}");
     assert_ended_merged(&bench);
 }
