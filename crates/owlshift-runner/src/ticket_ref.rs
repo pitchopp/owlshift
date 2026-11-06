@@ -1177,6 +1177,109 @@ fn read_all(git: &Git, checkout: &Path, skip: Option<&TicketId>) -> Result<Vec<R
     Ok(read_listed_refs(git, checkout, listing))
 }
 
+/// One commit of a ticket ref's history (OWL-471): the commit, when it was
+/// committed, and the record it holds or why it does not read.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Revision {
+    pub commit: String,
+    /// The committer date, as git prints `%cI`.
+    pub at: String,
+    pub record: Result<TicketRecord, String>,
+}
+
+/// The commits of a ticket ref's history, newest first, as [`commits`]
+/// lists them.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Commits {
+    /// The commit and its committer date, newest first.
+    pub listed: Vec<(String, String)>,
+    /// Whether the history holds commits older than the newest `max`.
+    pub truncated: bool,
+}
+
+/// The newest `max` commits of the ticket ref of `ticket`, by its first
+/// parents: every write is a commit on the one before. An absent ref lists
+/// none; a symbolic ref, or one that is no commit, is refused as [`read`]
+/// refuses it. The commits are not read: [`read_commits`] does.
+pub fn commits(
+    git: &Git,
+    checkout: &Path,
+    ticket: &TicketId,
+    max: usize,
+) -> Result<Commits, String> {
+    let name = ticket_ref(ticket);
+    let Some(tip) = listed(git, checkout, &name)? else {
+        return Ok(Commits::default());
+    };
+    precheck(&name, &tip).map_err(ReadError::into_message)?;
+    let limit = format!("-n{}", max.saturating_add(1));
+    let out = git
+        .run(
+            checkout,
+            &["log", "--first-parent", "--format=%H %cI", &limit, &tip.oid],
+        )
+        .map_err(|e| e.to_string())?;
+    let mut listed: Vec<(String, String)> = String::from_utf8_lossy(&out)
+        .lines()
+        .filter_map(|line| {
+            let (commit, at) = line.split_once(' ')?;
+            Some((commit.to_owned(), at.to_owned()))
+        })
+        .collect();
+    let truncated = listed.len() > max;
+    listed.truncate(max);
+    Ok(Commits { listed, truncated })
+}
+
+/// The record each of `commits` holds, in order, read in the few git
+/// commands [`read_listed_refs`] reads many refs in: a commit never changes,
+/// so what this answers for a commit is what it will answer later. One that
+/// does not read keeps its reason and does not stop the others.
+pub fn read_commits(
+    git: &Git,
+    checkout: &Path,
+    ticket: &TicketId,
+    commits: &[String],
+) -> Vec<Result<TicketRecord, String>> {
+    let name = ticket_ref(ticket);
+    let tips: Vec<Listed> = commits
+        .iter()
+        .map(|commit| Listed {
+            oid: commit.clone(),
+            kind: "commit".to_owned(),
+            symref: None,
+        })
+        .collect();
+    let refs: Vec<(String, &Listed)> = tips.iter().map(|tip| (name.clone(), tip)).collect();
+    read_batch(git, checkout, &refs)
+        .into_iter()
+        .map(|read| read.map(|stored| stored.record))
+        .collect()
+}
+
+/// The history of the ticket ref of `ticket` (OWL-471), oldest first: its
+/// newest `max` commits by first parent, each with the record it holds. The
+/// flag says whether older commits were left out. An absent ref gives none.
+pub fn history(
+    git: &Git,
+    checkout: &Path,
+    ticket: &TicketId,
+    max: usize,
+) -> Result<(Vec<Revision>, bool), String> {
+    let Commits {
+        mut listed,
+        truncated,
+    } = commits(git, checkout, ticket, max)?;
+    listed.reverse();
+    let ids: Vec<String> = listed.iter().map(|(commit, _)| commit.clone()).collect();
+    let revisions = listed
+        .into_iter()
+        .zip(read_commits(git, checkout, ticket, &ids))
+        .map(|((commit, at), record)| Revision { commit, at, record })
+        .collect();
+    Ok((revisions, truncated))
+}
+
 /// Writes `record` as the ticket ref of `ticket` in `checkout` and returns
 /// the new commit. `previous` is the commit the ref was read at, `None` when
 /// it did not exist: the ref moves only from there, and the new commit has
@@ -1769,6 +1872,168 @@ mod tests {
             format!("{A} blob\n"),
         ] {
             assert!(parse_batch(out.as_bytes(), &[A]).is_err(), "{out:?}");
+        }
+    }
+
+    #[test]
+    fn a_history_is_the_first_parent_commits_oldest_first() {
+        use super::fixtures::{plan, record, repo, ticket};
+        use super::{history, write};
+        use owlshift_core::vocab::Stage;
+
+        let repo = repo();
+        let ticket = ticket();
+        let (revisions, truncated) = history(&repo.git, &repo.root, &ticket, 400).unwrap();
+        assert!(revisions.is_empty() && !truncated, "no ref, no history");
+
+        let mut first = record(Stage::Design);
+        let one = write(&repo.git, &repo.root, &ticket, &first, None).unwrap();
+        first.plan = Some(plan("goal one", &["a"]));
+        let two = write(&repo.git, &repo.root, &ticket, &first, Some(&one)).unwrap();
+        let third = record(Stage::Build);
+        let three = write(&repo.git, &repo.root, &ticket, &third, Some(&two)).unwrap();
+
+        let (revisions, truncated) = history(&repo.git, &repo.root, &ticket, 400).unwrap();
+        assert!(!truncated);
+        let commits: Vec<&str> = revisions.iter().map(|r| r.commit.as_str()).collect();
+        assert_eq!(commits, [one.as_str(), two.as_str(), three.as_str()]);
+        let records: Vec<_> = revisions
+            .iter()
+            .map(|r| r.record.as_ref().unwrap())
+            .collect();
+        assert_eq!(records[0].state.stage, Stage::Design);
+        assert!(records[0].plan.is_none());
+        assert_eq!(records[1].plan.as_ref().unwrap().plan.goal, "goal one");
+        assert_eq!(records[2].state.stage, Stage::Build);
+        assert!(
+            revisions.iter().all(|r| r.at.contains('T')),
+            "{revisions:?}"
+        );
+
+        // The cap keeps the newest and says it cut.
+        let (newest, truncated) = history(&repo.git, &repo.root, &ticket, 2).unwrap();
+        assert!(truncated);
+        let commits: Vec<&str> = newest.iter().map(|r| r.commit.as_str()).collect();
+        assert_eq!(commits, [two.as_str(), three.as_str()]);
+        let (all, truncated) = history(&repo.git, &repo.root, &ticket, 3).unwrap();
+        assert!(!truncated && all.len() == 3);
+    }
+
+    #[test]
+    fn a_commit_that_does_not_read_is_kept_with_its_reason() {
+        use super::fixtures::{record, repo, ticket};
+        use super::{history, write};
+        use owlshift_core::vocab::Stage;
+
+        let repo = repo();
+        let ticket = ticket();
+        let one = write(&repo.git, &repo.root, &ticket, &record(Stage::Design), None).unwrap();
+        // A commit on top whose tree holds no state file: the index of a
+        // fresh repository is empty.
+        let tree = repo.git.run(&repo.root, &["write-tree"]).unwrap();
+        let tree = String::from_utf8(tree).unwrap().trim().to_owned();
+        let broken = repo
+            .git
+            .run(
+                &repo.root,
+                &[
+                    "-c",
+                    "user.name=T",
+                    "-c",
+                    "user.email=t@example.invalid",
+                    "commit-tree",
+                    "--no-gpg-sign",
+                    &tree,
+                    "-p",
+                    &one,
+                    "-m",
+                    "x",
+                ],
+            )
+            .unwrap();
+        let broken = String::from_utf8(broken).unwrap().trim().to_owned();
+        let name = owlshift_contracts::refs::ticket_ref(&ticket);
+        repo.git
+            .run(&repo.root, &["update-ref", &name, &broken])
+            .unwrap();
+        let (revisions, _) = history(&repo.git, &repo.root, &ticket, 10).unwrap();
+        assert_eq!(revisions.len(), 2);
+        assert!(revisions[0].record.is_ok());
+        let why = revisions[1].record.as_ref().unwrap_err();
+        assert!(why.contains("state.json"), "{why}");
+    }
+}
+
+/// What the tests of the modules that read ticket refs build refs from
+/// (OWL-471): a repository read with the runner's own git, records and plans.
+#[cfg(test)]
+pub(crate) mod fixtures {
+    use std::path::PathBuf;
+
+    use owlshift_contracts::format::Format;
+    use owlshift_contracts::ids::TicketId;
+    use owlshift_contracts::review::{Plan, PlanStep, TicketPlan};
+    use owlshift_core::vocab::Stage;
+
+    use super::{TicketRecord, blank};
+    use crate::executor::Git;
+
+    /// A temporary repository.
+    pub struct Repo {
+        pub _dir: tempfile::TempDir,
+        pub git: Git,
+        pub root: PathBuf,
+    }
+
+    pub fn repo() -> Repo {
+        let dir = tempfile::tempdir().unwrap();
+        let git = crate::project::runner_git();
+        let root = dir.path().join("checkout");
+        std::fs::create_dir_all(&root).unwrap();
+        git.run(&root, &["init", "-q", "-b", "main"]).unwrap();
+        Repo {
+            _dir: dir,
+            git,
+            root,
+        }
+    }
+
+    pub fn ticket() -> TicketId {
+        TicketId::new("OWL-1").unwrap()
+    }
+
+    /// A record of a ticket working `stage`, nothing else kept.
+    pub fn record(stage: Stage) -> TicketRecord {
+        let mut record = blank(None);
+        record.state.stage = stage;
+        record
+    }
+
+    /// A plan whose goal is `goal`, with a step for each name in `steps`.
+    pub fn plan(goal: &str, steps: &[&str]) -> TicketPlan {
+        TicketPlan {
+            format: Format,
+            plan: Plan {
+                goal: goal.to_owned(),
+                criteria: vec!["it works".to_owned()],
+                approach: "directly".to_owned(),
+                alternatives: Vec::new(),
+                files: vec!["src/lib.rs".to_owned()],
+                steps: steps
+                    .iter()
+                    .map(|what| PlanStep {
+                        what: (*what).to_owned(),
+                        test: format!("test of {what}"),
+                    })
+                    .collect(),
+                risks: Vec::new(),
+                out_of_scope: Vec::new(),
+                forks: Vec::new(),
+            },
+            text_sha256: "0".repeat(64),
+            base: "1".repeat(40),
+            approval: None,
+            published: None,
         }
     }
 }
