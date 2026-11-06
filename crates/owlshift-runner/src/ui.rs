@@ -23,10 +23,14 @@ use owlshift_contracts::config::{DEFAULT_UI_PORT, PersonalConfig};
 use crate::config::FileState;
 
 pub mod auth;
+pub mod events;
 pub mod header;
 pub mod probe;
 pub mod record;
+pub mod runlog;
 pub mod server;
+pub mod tail;
+pub mod ticket;
 pub mod token;
 
 /// The port of `127.0.0.1` the web UI listens on: `[ui] port` of the

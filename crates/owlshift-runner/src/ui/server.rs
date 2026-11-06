@@ -18,7 +18,17 @@
 //! - `POST /api/login` `{"code"}` → `{"id", "secret"}`: a one-time code
 //!   traded for a session;
 //! - `GET /api/header` and `GET /api/stream`, under the session sent in
-//!   `X-Owlshift-Session`: the header, once, or as a stream of lines.
+//!   `X-Owlshift-Session`: the header, once, or as a stream of lines;
+//! - `GET /api/ticket?project=owner/repo&ticket=OWL-1` and
+//!   `GET /api/ticket/log?project&ticket&run&file=stdout|stderr&from=N&line=L`
+//!   (OWL-471), under the session as well: a ticket's snapshot
+//!   ([`super::ticket`]) and the records of a run's log from a byte offset
+//!   ([`super::tail`], [`super::runlog`]). The query is split on `&` and the
+//!   first `=` and percent-decoded, a repeated key refused; the project must
+//!   be one the served registry lists, the ticket a ticket id, the run a
+//!   run folder's name and the file one of two literals, so no text of the
+//!   query becomes a path, and a run folder or a log that is a link is not
+//!   followed.
 //!
 //! Every response, errors included, carries [`SECURITY_HEADERS`], and none
 //! a CORS header or a cookie. JSON goes out through [`json_text`], which
@@ -47,16 +57,20 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use jiff::Timestamp;
+use owlshift_adapters::forge::Repo;
 use owlshift_contracts::config::PersonalConfig;
 use owlshift_contracts::format::Format;
+use owlshift_contracts::ids::TicketId;
 use owlshift_contracts::service::{BuildIdentity, UiRecord};
 use owlshift_core::vocab::Harness;
 use serde_json::{Value, json};
 use tiny_http::{Header as HttpHeader, Method, Request, Response, Server, StatusCode};
 
 use super::auth::{self, CHALLENGE_LEN, RunSecret, UsedCodes};
-use super::{header, record, token};
+use super::{events, header, record, runlog, tail, ticket, token};
 use crate::config::FileState;
+use crate::project::ProjectDirs;
+use crate::served::Registry;
 use crate::status;
 
 /// The page's frame.
@@ -195,6 +209,11 @@ struct Context {
     /// The last figures of a personal file that loaded.
     figures: Mutex<Option<Figures>>,
     hub: Hub,
+    /// The event log's incremental reader (OWL-471): what the ticket page's
+    /// snapshot and its run logs' `ended` read.
+    events: events::Reader,
+    /// What a ticket's snapshot keeps between two builds.
+    tickets: ticket::Cache,
 }
 
 /// A serving web UI. Dropping it stops taking requests.
@@ -308,6 +327,8 @@ pub fn start(
         options,
         figures: Mutex::new(None),
         hub: Hub::default(),
+        events: events::Reader::new(data),
+        tickets: ticket::Cache::new(ticket::WAITS_KEPT),
     });
     let stopping = Arc::new(AtomicBool::new(false));
     let accept = {
@@ -498,7 +519,8 @@ fn handle(context: &Arc<Context>, mut request: Request) {
             return;
         }
     };
-    let path = request.url().split('?').next().unwrap_or("").to_owned();
+    let url = request.url().to_owned();
+    let path = url.split('?').next().unwrap_or("").to_owned();
     let response = match (request.method(), path.as_str()) {
         (Method::Get, "/" | "/index.html") => {
             asset(INDEX_HTML.as_bytes(), "text/html; charset=utf-8")
@@ -527,9 +549,208 @@ fn handle(context: &Arc<Context>, mut request: Request) {
                 return;
             }
         }
+        (Method::Get, "/api/ticket" | "/api/ticket/log") => {
+            if !in_session(context, &request) {
+                error_response(401, "not logged in: run `owlshift ui` in a terminal")
+            } else if path == "/api/ticket" {
+                ticket_page(context, &url)
+            } else {
+                ticket_log(context, &url)
+            }
+        }
         _ => error_response(404, "no such page"),
     };
     let _ = request.respond(response);
+}
+
+/// The value of `text` with its `%XX` escapes and `+`s read, `None` when
+/// they are not whole or the bytes are not UTF-8.
+fn percent_decode(text: &str) -> Option<String> {
+    let bytes = text.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut at = 0;
+    while at < bytes.len() {
+        match bytes[at] {
+            b'%' => {
+                let pair = text.get(at + 1..at + 3)?;
+                out.push(u8::from_str_radix(pair, 16).ok()?);
+                at += 3;
+            }
+            b'+' => {
+                out.push(b' ');
+                at += 1;
+            }
+            byte => {
+                out.push(byte);
+                at += 1;
+            }
+        }
+    }
+    String::from_utf8(out).ok()
+}
+
+/// The query of `url` as `(key, value)` pairs, split on `&` and on the first
+/// `=` of each, each decoded; a key that repeats, or text that does not
+/// decode, is refused.
+fn query_of(url: &str) -> Result<Vec<(String, String)>, &'static str> {
+    let Some((_, query)) = url.split_once('?') else {
+        return Ok(Vec::new());
+    };
+    let mut pairs: Vec<(String, String)> = Vec::new();
+    for part in query.split('&').filter(|part| !part.is_empty()) {
+        let (key, value) = part.split_once('=').unwrap_or((part, ""));
+        let (Some(key), Some(value)) = (percent_decode(key), percent_decode(value)) else {
+            return Err("the query is not percent-encoded UTF-8");
+        };
+        if pairs.iter().any(|(seen, _)| *seen == key) {
+            return Err("a key of the query is repeated");
+        }
+        pairs.push((key, value));
+    }
+    Ok(pairs)
+}
+
+fn param<'a>(pairs: &'a [(String, String)], key: &str) -> Option<&'a str> {
+    pairs
+        .iter()
+        .find(|(name, _)| name == key)
+        .map(|(_, value)| value.as_str())
+}
+
+/// The project and ticket a ticket route names: the project must be one the
+/// served registry lists, the ticket a ticket id. Nothing of the query
+/// becomes a path but through these two.
+fn target(
+    context: &Context,
+    pairs: &[(String, String)],
+) -> Result<(Repo, TicketId), Response<Cursor<Vec<u8>>>> {
+    let Some(project) = param(pairs, "project") else {
+        return Err(error_response(400, "a ticket route names its project"));
+    };
+    let Some(ticket) = param(pairs, "ticket") else {
+        return Err(error_response(400, "a ticket route names its ticket"));
+    };
+    let Ok(repo) = Repo::parse(project) else {
+        return Err(error_response(400, "the project is not owner/name"));
+    };
+    let Ok(ticket) = TicketId::new(ticket) else {
+        return Err(error_response(400, "the ticket is not a ticket identifier"));
+    };
+    match Registry::in_data_dir(&context.data).read() {
+        Ok(served) if served.find(&repo.to_string()).is_some() => Ok((repo, ticket)),
+        Ok(_) => Err(error_response(404, "no such served project")),
+        Err(why) => Err(error_response(
+            503,
+            &format!("the served projects cannot be read: {why}"),
+        )),
+    }
+}
+
+/// `GET /api/ticket?project=owner/repo&ticket=OWL-1`: the ticket's snapshot.
+fn ticket_page(context: &Context, url: &str) -> Response<Cursor<Vec<u8>>> {
+    let pairs = match query_of(url) {
+        Ok(pairs) => pairs,
+        Err(why) => return error_response(400, why),
+    };
+    let (repo, ticket) = match target(context, &pairs) {
+        Ok(target) => target,
+        Err(response) => return response,
+    };
+    let git = crate::project::runner_git();
+    let personal = (context.options.personal)();
+    let inputs = ticket::Inputs {
+        data: &context.data,
+        git: &git,
+        events: &context.events,
+        cache: &context.tickets,
+        concurrent_runs: crate::usage::concurrent_runs(&personal),
+        now: Timestamp::now(),
+    };
+    json_response(200, &ticket::snapshot(&inputs, &repo, &ticket))
+}
+
+/// `GET /api/ticket/log?project&ticket&run&file=stdout|stderr&from=N[&line=L]`:
+/// the records of the whole lines of a run's log from byte `from`, `line`
+/// being how many lines come before it (counted when absent).
+fn ticket_log(context: &Context, url: &str) -> Response<Cursor<Vec<u8>>> {
+    let pairs = match query_of(url) {
+        Ok(pairs) => pairs,
+        Err(why) => return error_response(400, why),
+    };
+    let (repo, ticket) = match target(context, &pairs) {
+        Ok(target) => target,
+        Err(response) => return response,
+    };
+    let Some(run) = param(&pairs, "run").filter(|run| ticket::is_run_id(run)) else {
+        return error_response(400, "a run is named as its folder is");
+    };
+    let file = match param(&pairs, "file") {
+        Some("stdout") => "stdout.log",
+        Some("stderr") => "stderr.log",
+        _ => return error_response(400, "the file is stdout or stderr"),
+    };
+    let number = |key: &str| -> Result<Option<u64>, ()> {
+        match param(&pairs, key) {
+            None => Ok(None),
+            Some(text) if !text.is_empty() && text.bytes().all(|b| b.is_ascii_digit()) => {
+                text.parse().map(Some).map_err(|_| ())
+            }
+            Some(_) => Err(()),
+        }
+    };
+    let (Ok(from), Ok(line)) = (number("from"), number("line")) else {
+        return error_response(400, "from and line are whole numbers");
+    };
+    let from = from.unwrap_or(0);
+    let dir = ProjectDirs::new(&context.data, &repo)
+        .runs(&ticket)
+        .join(run);
+    if !std::fs::symlink_metadata(&dir).is_ok_and(|meta| meta.is_dir()) {
+        return error_response(404, "no such run");
+    }
+    let path = dir.join(file);
+    match std::fs::symlink_metadata(&path) {
+        Ok(meta) if !meta.is_file() => return error_response(404, "no such log"),
+        _ => {}
+    }
+    // Asked before the file is read: a run's last bytes are flushed before
+    // its `run_ended` is written, so a file read after it was seen is whole.
+    let ended = context.events.ended(&repo.to_string(), &ticket, run);
+    let read = match tail::read_lines(&path, from, tail::MAX_ANSWER, ended) {
+        Ok(read) => read,
+        Err(why) => return error_response(500, &why),
+    };
+    let start = if read.reset { 0 } else { from };
+    let before = match (line, read.reset) {
+        (_, true) => 0,
+        (Some(line), false) => line,
+        (None, false) => match tail::count_lines(&path, start) {
+            Ok(count) => count,
+            Err(why) => return error_response(500, &why),
+        },
+    };
+    let plain = file == "stderr.log";
+    let mut records = Vec::new();
+    for (at, one) in read.lines.iter().enumerate() {
+        let number = before + at as u64 + 1;
+        let made = match one.cut {
+            Some(length) => vec![runlog::cut(number, one.offset, &one.bytes, length)],
+            None if plain => runlog::plain(number, one.offset, &one.bytes),
+            None => runlog::classify(number, one.offset, &one.bytes),
+        };
+        records.extend(made.iter().map(runlog::ViewRecord::json));
+    }
+    json_response(
+        200,
+        &json!({
+            "records": records,
+            "next": read.next,
+            "next_line": before + read.lines.len() as u64,
+            "size": read.size,
+            "reset": read.reset,
+            "ended": ended,
+        }),
+    )
 }
 
 /// The field `name` of the JSON object `body`, as text.

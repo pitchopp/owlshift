@@ -282,3 +282,204 @@ main {
 .problem {
   color: var(--danger);
 }
+
+/* A ticket's page (OWL-471). Colours only from the roles above. */
+.ticket {
+  max-width: 1100px;
+}
+
+.ticket-title {
+  margin: 0 0 4px;
+}
+
+.section {
+  background: var(--surface);
+  border: 1px solid var(--border-hairline);
+  border-radius: 6px;
+  margin-top: 14px;
+  padding: 4px 14px 12px;
+}
+
+.section h3 {
+  margin: 10px 0 6px;
+}
+
+.section h4,
+.section h5 {
+  margin: 10px 0 4px;
+}
+
+.timeline {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+.entry {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 14px;
+  padding: 3px 0;
+  border-bottom: 1px solid var(--border-hairline);
+}
+
+.entry-at,
+.entry-changed {
+  color: var(--text-muted);
+}
+
+.entry-stage {
+  font-weight: 600;
+}
+
+.budget {
+  width: 100%;
+  max-width: 420px;
+}
+
+.pre-text {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+pre {
+  font-family: "JetBrains Mono", ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  font-size: 13px;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  margin: 4px 0;
+}
+
+.ask,
+.decision,
+.finding {
+  border-left: 3px solid var(--border-strong);
+  margin: 8px 0;
+  padding-left: 10px;
+}
+
+.question-text {
+  font-weight: 600;
+  margin: 6px 0 2px;
+}
+
+.options,
+.plan-list {
+  margin: 2px 0 6px;
+}
+
+.recommendation {
+  color: var(--text-secondary);
+}
+
+.verdict {
+  color: var(--text-secondary);
+  font-style: italic;
+}
+
+.diff-added,
+.diff-removed {
+  background: var(--raised);
+  margin: 2px 0;
+  padding: 2px 6px;
+}
+
+.diff-added {
+  color: var(--success);
+}
+
+.diff-removed {
+  color: var(--danger);
+}
+
+.fold,
+.run {
+  border-top: 1px solid var(--border-hairline);
+  padding: 4px 0;
+}
+
+.run-summary {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 2px 14px;
+  cursor: pointer;
+}
+
+.run-id,
+.run-fact {
+  color: var(--text-muted);
+}
+
+.run-role {
+  font-weight: 600;
+}
+
+.run-facts {
+  margin: 4px 0 8px;
+}
+
+.log {
+  background: var(--page);
+  border: 1px solid var(--border-hairline);
+  border-radius: 4px;
+  padding: 6px 8px;
+  max-height: 70vh;
+  overflow: auto;
+}
+
+.log:empty {
+  display: none;
+}
+
+.rec {
+  margin: 3px 0;
+}
+
+.rec-label {
+  color: var(--text-muted);
+  font-weight: 600;
+  margin-right: 8px;
+}
+
+.rec-text,
+.rec-thinking {
+  color: var(--text);
+}
+
+.rec-thinking,
+.rec-status,
+.rec-usage,
+.rec-state {
+  color: var(--text-muted);
+}
+
+.rec-state {
+  margin-left: 8px;
+}
+
+.rec-tool > summary,
+.rec-tool-result > summary,
+.rec-status > summary {
+  cursor: pointer;
+}
+
+.rec-tool code {
+  color: var(--text-secondary);
+}
+
+.rec-result-body {
+  border-left: 3px solid var(--border-hairline);
+  padding-left: 8px;
+}
+
+.rec-unknown {
+  background: var(--raised);
+  border: 1px solid var(--border-strong);
+  border-radius: 4px;
+  color: var(--text);
+  padding: 4px 8px;
+}
+
+.log-stderr {
+  margin-top: 4px;
+}
