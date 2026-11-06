@@ -417,6 +417,7 @@ function openTicket(target) {
     project: target.owner + "/" + target.repo,
     ticket: target.ticket,
     snapshotTimer: null,
+    refreshing: false,
     runs: new Map(),
     opened: new Set(),
     last: {},
@@ -452,11 +453,21 @@ function openTicket(target) {
   refresh(handle);
 }
 
-// The snapshot, read once and drawn.
+// How often the snapshot is read again: every 3 s while a run has no end
+// recorded, every 10 s otherwise (the ticket is queued, waits for an answer,
+// is between two steps, or is finished), and at once when the page becomes
+// visible again. It goes on until the route changes or the session ends.
+const SNAPSHOT_LIVE_MS = 3000;
+const SNAPSHOT_IDLE_MS = 10000;
+
+// The snapshot, read and drawn, and read again after its delay. A null
+// answer is a session that ended: `authedFetch` already told the page, and
+// nothing is scheduled.
 async function refresh(handle) {
-  if (!alive(handle)) {
+  if (!alive(handle) || handle.refreshing) {
     return;
   }
+  handle.refreshing = true;
   const answer = await authedFetch(snapshotPath(handle));
   if (!alive(handle) || !answer) {
     return;
@@ -476,12 +487,18 @@ async function refresh(handle) {
   if (!alive(handle)) {
     return;
   }
+  handle.refreshing = false;
+  let delay = SNAPSHOT_IDLE_MS;
   if (!value) {
     text(handle.note, "This ticket cannot be read: " + why);
-    return;
+  } else {
+    text(handle.note, "Read " + shortTime(value.at));
+    renderSnapshot(handle, value);
+    if (value.runs && value.runs.runs && value.runs.runs.some((run) => !run.ended)) {
+      delay = SNAPSHOT_LIVE_MS;
+    }
   }
-  text(handle.note, "Read " + shortTime(value.at));
-  renderSnapshot(handle, value);
+  handle.snapshotTimer = window.setTimeout(() => refresh(handle), delay);
 }
 
 function shortTime(at) {
@@ -930,8 +947,11 @@ function makeRun(handle, info, open) {
   const facts = make("div", "run-facts");
   const log = make("div", "log");
   const err = make("div", "log log-stderr");
+  const idle = make("p", "notice state-warning");
+  idle.hidden = true;
   el.appendChild(summary);
   el.appendChild(facts);
+  el.appendChild(idle);
   el.appendChild(log);
   const errHead = make("p", "notice", "Standard error");
   const errBox = make("div", "log-stderr-box");
@@ -944,6 +964,7 @@ function makeRun(handle, info, open) {
     el: el,
     summary: summary,
     facts: facts,
+    idle: idle,
     log: log,
     err: err,
     errBox: errBox,
@@ -951,8 +972,8 @@ function makeRun(handle, info, open) {
     info: null,
     key: "",
     logs: {
-      stdout: { from: 0, line: 0, timer: null, started: false, finished: false },
-      stderr: { from: 0, line: 0, timer: null, started: false, finished: false },
+      stdout: { from: 0, line: 0, timer: null, started: false, finished: false, lastData: 0, failed: false },
+      stderr: { from: 0, line: 0, timer: null, started: false, finished: false, lastData: 0, failed: false },
     },
   };
   const key = "run:" + info.id;
@@ -1000,9 +1021,13 @@ function renderRuns(handle, section) {
     }
     const infoKey = JSON.stringify(info);
     if (run.key !== infoKey) {
+      const wasEnded = run.info !== null && run.info.ended;
       run.key = infoKey;
       run.info = info;
       drawRunHead(run, info);
+      if (info.ended && !wasEnded) {
+        wakeLogs(handle, run);
+      }
     }
   }
 }
@@ -1103,44 +1128,85 @@ function appendRecords(run, which, records) {
   container.appendChild(batch);
 }
 
-// Reads a log from its offset to the end that is there.
-async function readLog(handle, run, which) {
-  const log = run.logs[which];
-  for (;;) {
-    if (!alive(handle)) {
-      return;
-    }
-    const answer = await authedFetch(logPath(handle, run.id, which, log.from, log.line));
-    if (!alive(handle) || !answer) {
-      return;
-    }
-    let value = null;
-    try {
-      value = answer.response.ok ? await answer.response.json() : null;
-    } catch (_) {
-      value = null;
-    }
-    if (!alive(handle)) {
-      return;
-    }
-    if (!value) {
-      appendRecords(run, which, [{
-        kind: "unknown", label: "the log cannot be read", line: 0, text: "the server answered " +
-          answer.response.status,
-      }]);
-      return;
-    }
-    if (value.reset) {
-      clear(which === "stderr" ? run.err : run.log);
-      run.entries.clear();
-    }
-    appendRecords(run, which, value.records);
-    log.from = value.next;
-    log.line = value.next_line;
-    if (value.next >= value.size) {
-      return;
-    }
+// How a log is followed: at once while there is more to read, then every
+// second; every 5 s after 30 s without new data, and every minute after 10
+// minutes, which the run says (a runner that died leaves no end to wait
+// for). A log ends once its answer says the run ended and `next` reached
+// the size; a run already ended is read through once, from 0.
+const LOG_FAST_MS = 1000;
+const LOG_SLOW_MS = 5000;
+const LOG_IDLE_MS = 60000;
+const LOG_SLOW_AFTER_MS = 30000;
+const LOG_IDLE_AFTER_MS = 600000;
+
+function logDelay(log) {
+  const quiet = Date.now() - log.lastData;
+  if (quiet >= LOG_IDLE_AFTER_MS) {
+    return LOG_IDLE_MS;
   }
+  return quiet >= LOG_SLOW_AFTER_MS ? LOG_SLOW_MS : LOG_FAST_MS;
+}
+
+// One read of a log from where it stopped, drawn, and the next one
+// scheduled. Every continuation after an await names its page: one that
+// is not the page open does nothing, and a null answer is a session that
+// ended, which stops the loop.
+async function pollLog(handle, run, which) {
+  const log = run.logs[which];
+  log.timer = null;
+  if (!alive(handle)) {
+    return;
+  }
+  const answer = await authedFetch(logPath(handle, run.id, which, log.from, log.line));
+  if (!alive(handle) || !answer) {
+    return;
+  }
+  let value = null;
+  try {
+    value = answer.response.ok ? await answer.response.json() : null;
+  } catch (_) {
+    value = null;
+  }
+  if (!alive(handle)) {
+    return;
+  }
+  if (!value) {
+    if (!log.failed) {
+      log.failed = true;
+      appendRecords(run, which, [{
+        kind: "unknown", label: "the log cannot be read", line: 0,
+        text: "the server answered " + answer.response.status,
+      }]);
+    }
+    log.timer = window.setTimeout(() => pollLog(handle, run, which), LOG_IDLE_MS);
+    return;
+  }
+  log.failed = false;
+  if (value.reset) {
+    clear(which === "stderr" ? run.err : run.log);
+    run.entries.clear();
+  }
+  if (value.records.length) {
+    appendRecords(run, which, value.records);
+    log.lastData = Date.now();
+  }
+  log.from = value.next;
+  log.line = value.next_line;
+  if (which === "stdout") {
+    const quiet = Date.now() - log.lastData;
+    const stale = !value.ended && quiet >= LOG_IDLE_AFTER_MS;
+    text(run.idle, stale
+      ? "No new output for " + Math.floor(quiet / 60000) + " minutes, and no end of the run is recorded: " +
+        "looking again every minute."
+      : "");
+    run.idle.hidden = !stale;
+  }
+  if (value.ended && value.next >= value.size) {
+    log.finished = true;
+    return;
+  }
+  const delay = value.next < value.size ? 0 : logDelay(log);
+  log.timer = window.setTimeout(() => pollLog(handle, run, which), delay);
 }
 
 function startLog(handle, run, which) {
@@ -1149,10 +1215,23 @@ function startLog(handle, run, which) {
     return;
   }
   log.started = true;
+  log.lastData = Date.now();
   if (which === "stderr") {
     run.errBox.hidden = false;
   }
-  readLog(handle, run, which);
+  pollLog(handle, run, which);
+}
+
+// A run whose end the snapshot now shows is read once more at once, rather
+// than at the pace of a quiet log: its last line may be waiting for it.
+function wakeLogs(handle, run) {
+  for (const log of Object.values(run.logs)) {
+    if (log.started && !log.finished && log.timer !== null) {
+      window.clearTimeout(log.timer);
+      log.timer = null;
+      pollLog(handle, run, log === run.logs.stderr ? "stderr" : "stdout");
+    }
+  }
 }
 
 async function start() {
@@ -1176,6 +1255,12 @@ async function start() {
     problem("The login failed: " + error.message);
   }
   window.addEventListener("hashchange", route);
+  document.addEventListener("visibilitychange", () => {
+    if (!document.hidden && openPage) {
+      window.clearTimeout(openPage.snapshotTimer);
+      refresh(openPage);
+    }
+  });
   if (!session()) {
     loggedOut(null);
     return;

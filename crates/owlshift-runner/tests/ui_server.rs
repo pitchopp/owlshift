@@ -1652,6 +1652,78 @@ fn a_ticket_route_survives_the_login_and_is_read_after_it() {
     assert!(INDEX_HTML.contains(r#"<section id="ticket" class="ticket" hidden></section>"#));
 }
 
+/// JavaScript has no test setup here: these pin the structure that keeps a
+/// ticket page's loops from outliving their route or their session (the
+/// manual checks are in the pull request).
+#[test]
+fn the_ticket_page_stops_what_it_scheduled_with_its_route_and_its_session() {
+    let app_js = lf(APP_JS);
+    // A logout empties the ticket page like the header.
+    let logged_out = block(&app_js, "function loggedOut(sent) {", "");
+    assert!(logged_out.contains("closeTicket();"), "{logged_out}");
+    assert!(logged_out.contains(r#"clear(document.getElementById("header"));"#));
+    // The one teardown: stops every timer of the page, bumps the
+    // generation, empties and hides the container.
+    let close = block(&app_js, "function closeTicket() {", "");
+    for part in [
+        "generation += 1;",
+        "window.clearTimeout(openPage.snapshotTimer);",
+        "window.clearTimeout(log.timer);",
+        "clear(el);",
+        "el.hidden = true;",
+        "openPage = null;",
+    ] {
+        assert!(close.contains(part), "{part}: {close}");
+    }
+    // A hash change goes to `route`, which ends the page open before it
+    // draws another.
+    let route = block(&app_js, "function route() {", "");
+    assert!(route.starts_with("\n  closeTicket();"), "{route}");
+    // Every continuation after an await is for the page that is open only:
+    // the loops compare the generation, through `alive`, after each await,
+    // and a null answer (a session that ended, which `authedFetch` already
+    // told the page of) ends the loop without a call of its own.
+    let alive = block(&app_js, "function alive(handle) {", "");
+    assert!(alive.contains("openPage === handle && handle.generation === generation"));
+    for name in [
+        "async function refresh(handle) {",
+        "async function pollLog(handle, run, which) {",
+    ] {
+        let function = block(&app_js, name, "");
+        let continuations: Vec<&str> = function.split("await ").skip(1).collect();
+        assert!(continuations.len() >= 2, "{name}");
+        for continuation in continuations {
+            assert!(
+                continuation.contains("alive(handle)"),
+                "{name}: {continuation}"
+            );
+        }
+        assert!(
+            function.contains("if (!alive(handle) || !answer) {\n    return;\n  }"),
+            "{name}"
+        );
+        assert!(function.contains("\n  if (!alive(handle)"), "{name}");
+    }
+    // The pace: the snapshot every 3 s while a run has no end, every 10 s
+    // otherwise, again at once when the page shows; a log every second,
+    // every 5 s after 30 s without data.
+    for pace in [
+        "const SNAPSHOT_LIVE_MS = 3000;",
+        "const SNAPSHOT_IDLE_MS = 10000;",
+        "const LOG_FAST_MS = 1000;",
+        "const LOG_SLOW_MS = 5000;",
+        "const LOG_SLOW_AFTER_MS = 30000;",
+    ] {
+        assert!(app_js.contains(pace), "{pace}");
+    }
+    assert!(app_js.contains(r#"document.addEventListener("visibilitychange""#));
+    // A refresh keeps what is drawn: a run already listed is not made again,
+    // and a log is drawn from where it stopped.
+    assert!(app_js.contains("let run = handle.runs.get(info.id);\n    if (!run) {"));
+    assert!(app_js.contains("log.from = value.next;"));
+    assert!(app_js.contains("if (value.ended && value.next >= value.size) {"));
+}
+
 impl Ground {
     /// Appends an event of `OWL-1`'s run `RUN` to the event log.
     fn event(&self, kind: EventKind) {
