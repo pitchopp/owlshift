@@ -26,6 +26,7 @@ pub mod auth;
 pub mod header;
 pub mod probe;
 pub mod record;
+pub mod runlog;
 pub mod server;
 pub mod token;
 
