@@ -3,6 +3,35 @@
    setting unless the switch says light, and under the switch's dark. Only
    classes: the Content-Security-Policy refuses style attributes. */
 
+/* The typefaces of visual identity section 5, carried in the binary and
+   served from the same origin; Latin only. */
+@font-face {
+  font-family: "Bricolage Grotesque";
+  src: url(/fonts/BricolageGrotesque-latin.woff2) format("woff2");
+  font-weight: 200 800;
+  font-style: normal;
+  font-display: swap;
+  unicode-range: U+0020-007E, U+00A0-00FF, U+2010-2027, U+2030-205E, U+20AC;
+}
+
+@font-face {
+  font-family: "JetBrains Mono";
+  src: url(/fonts/JetBrainsMono-Regular-latin.woff2) format("woff2");
+  font-weight: 400;
+  font-style: normal;
+  font-display: swap;
+  unicode-range: U+0020-007E, U+00A0-00FF, U+2010-2027, U+2030-205E, U+20AC, U+2713, U+2717;
+}
+
+@font-face {
+  font-family: "JetBrains Mono";
+  src: url(/fonts/JetBrainsMono-Medium-latin.woff2) format("woff2");
+  font-weight: 500;
+  font-style: normal;
+  font-display: swap;
+  unicode-range: U+0020-007E, U+00A0-00FF, U+2010-2027, U+2030-205E, U+20AC, U+2713, U+2717;
+}
+
 :root {
   /* Brand */
   --night: #2B1638;
@@ -107,9 +136,10 @@ body {
   margin: 0;
   background: var(--page);
   color: var(--text);
-  font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
+  font-family: "Bricolage Grotesque", system-ui, -apple-system, "Segoe UI", sans-serif;
+  font-optical-sizing: auto;
   font-size: 15px;
-  line-height: 1.45;
+  line-height: 1.5;
 }
 
 a {
@@ -122,7 +152,14 @@ a {
 }
 
 code {
-  font-family: ui-monospace, "SF Mono", Menlo, monospace;
+  font-family: "JetBrains Mono", ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+}
+
+h1,
+h2,
+h3 {
+  font-weight: 800;
+  line-height: 1.15;
 }
 
 .bar {
@@ -143,7 +180,8 @@ code {
 }
 
 .wordmark {
-  font-weight: 700;
+  font-family: "JetBrains Mono", ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  font-weight: 500;
   letter-spacing: 0.02em;
   margin-right: auto;
 }
@@ -214,7 +252,7 @@ code {
 .state-danger::before,
 .state-information::before {
   margin-right: 0.3em;
-  font-weight: 700;
+  font-weight: 600;
 }
 
 .state-success::before {

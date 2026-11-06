@@ -14,8 +14,8 @@ use owlshift_contracts::service::{BY_PAUSE, Request};
 use owlshift_runner::daemon::requests;
 use owlshift_runner::ui::auth::{self, RunSecret, Session};
 use owlshift_runner::ui::server::{
-    self, APP_CSS, APP_JS, INDEX_HTML, LOGGED_OUT_LINE, Options, SUPERSEDED_LINE, ServeError,
-    Serving,
+    self, APP_CSS, APP_JS, INDEX_HTML, LOGGED_OUT_LINE, Options, SECURITY_HEADERS, SUPERSEDED_LINE,
+    ServeError, Serving,
 };
 use owlshift_runner::ui::{personal_at, probe, record, token};
 use serde_json::{Value, json};
@@ -214,6 +214,34 @@ fn the_frame_and_its_assets_answer_without_a_session() {
         assert_eq!(reply.text(), body);
     }
     assert!(INDEX_HTML.contains(r#"<script src="/app.js" defer>"#));
+    assert!(INDEX_HTML.contains(r#"<link rel="icon" href="/favicon.svg" type="image/svg+xml">"#));
+    let brand = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../assets/brand/owlshift-mark.svg");
+    let mut carried = vec![(
+        "/favicon.svg".to_owned(),
+        "image/svg+xml",
+        std::fs::read(brand).unwrap(),
+    )];
+    for name in FONT_FILES {
+        carried.push((
+            format!("/fonts/{name}"),
+            "font/woff2",
+            std::fs::read(font_dir().join(name)).unwrap(),
+        ));
+    }
+    for (path, kind, bytes) in carried {
+        let reply = get(ui.port(), &path, &[]);
+        assert_eq!(reply.status, 200, "{path}");
+        reply.assert_secured();
+        assert_eq!(
+            reply.header("Content-Type").as_deref(),
+            Some(kind),
+            "{path}"
+        );
+        assert_eq!(reply.body, bytes, "{path}");
+    }
+    let missing = get(ui.port(), "/fonts/missing.woff2", &[]);
+    assert_eq!(missing.status, 404);
+    missing.assert_secured();
 }
 
 #[test]
@@ -883,4 +911,465 @@ fn a_listener_off_the_loopback_is_refused() {
         other => panic!("{other:?}"),
     }
     assert!(record::read(data.path()).unwrap().is_none());
+}
+
+/// The three typefaces the UI carries, by file name.
+const FONT_FILES: [&str; 3] = [
+    "BricolageGrotesque-latin.woff2",
+    "JetBrainsMono-Regular-latin.woff2",
+    "JetBrainsMono-Medium-latin.woff2",
+];
+
+/// The most bytes one carried font may take.
+const FONT_CAP: usize = 120 * 1024;
+
+fn font_dir() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("src/ui/assets/fonts")
+}
+
+/// The colour variables of a theme block: `--name: #RRGGBB;` lines.
+fn colours(block: &str) -> std::collections::BTreeMap<String, [f64; 3]> {
+    let mut found = std::collections::BTreeMap::new();
+    for line in block.lines() {
+        let Some((name, value)) = line.trim().strip_prefix("--").and_then(|rest| {
+            let (name, value) = rest.split_once(':')?;
+            Some((name.trim(), value.trim().strip_suffix(';')?.trim()))
+        }) else {
+            continue;
+        };
+        let Some(hex) = value.strip_prefix('#').filter(|hex| hex.len() == 6) else {
+            continue;
+        };
+        let channel = |at: usize| f64::from(u8::from_str_radix(&hex[at..at + 2], 16).unwrap());
+        found.insert(name.to_owned(), [channel(0), channel(2), channel(4)]);
+    }
+    found
+}
+
+/// The WCAG 2.2 contrast ratio of two colours.
+fn contrast(a: [f64; 3], b: [f64; 3]) -> f64 {
+    let luminance = |rgb: [f64; 3]| {
+        let [r, g, b] = rgb.map(|value| {
+            let value = value / 255.0;
+            if value <= 0.04045 {
+                value / 12.92
+            } else {
+                ((value + 0.055) / 1.055).powf(2.4)
+            }
+        });
+        0.2126 * r + 0.7152 * g + 0.0722 * b
+    };
+    let (high, low) = (
+        luminance(a).max(luminance(b)),
+        luminance(a).min(luminance(b)),
+    );
+    (high + 0.05) / (low + 0.05)
+}
+
+#[test]
+fn every_text_pair_of_the_contrast_table_holds_in_both_themes() {
+    // Visual identity section 4, "Contrast": page · surface · raised, light
+    // then dark. The table lists two decimals, hence the tolerance.
+    let text_rows: [(&str, [f64; 3], [f64; 3]); 7] = [
+        ("text", [15.66, 16.48, 14.89], [16.66, 14.89, 12.39]),
+        ("text-secondary", [8.91, 9.38, 8.47], [9.57, 8.55, 7.12]),
+        ("text-muted", [6.06, 6.37, 5.76], [6.45, 5.76, 4.79]),
+        ("link", [5.93, 6.24, 5.64], [10.62, 9.49, 7.90]),
+        ("success", [5.04, 5.30, 4.79], [11.58, 10.35, 8.61]),
+        ("warning", [5.63, 5.93, 5.36], [12.79, 11.43, 9.51]),
+        ("danger", [5.85, 6.15, 5.56], [6.74, 6.02, 5.01]),
+    ];
+    let graphic_rows: [(&str, [f64; 3], [f64; 3]); 2] = [
+        ("border-strong", [3.77, 3.96, 3.58], [4.65, 4.16, 3.46]),
+        // The ring's table lists it on page and surface only; on raised it
+        // is held to the 3:1 floor below.
+        ("focus", [3.73, 3.93, 3.0], [8.15, 7.28, 3.0]),
+    ];
+    let light = colours(block(APP_CSS, ":root {", ""));
+    let system_dark = colours(block(APP_CSS, ":root:not([data-theme=light]) {", "  "));
+    let chosen_dark = colours(block(APP_CSS, ":root[data-theme=dark] {", ""));
+    for role in system_dark.keys() {
+        assert_eq!(system_dark[role], chosen_dark[role], "{role}");
+    }
+    let backgrounds = ["page", "surface", "raised"];
+    let mut checked = 0;
+    for (theme, vars, column) in [
+        ("light", &light, 0),
+        ("dark", &system_dark, 1),
+        ("dark", &chosen_dark, 1),
+    ] {
+        let at = |role: &str| *vars.get(role).unwrap_or_else(|| panic!("{theme} {role}"));
+        let pick = |row: &[f64; 3], index: usize| row[index];
+        for (role, on_light, on_dark) in text_rows {
+            let listed = if column == 0 { on_light } else { on_dark };
+            for (index, background) in backgrounds.iter().enumerate() {
+                let ratio = contrast(at(role), at(background));
+                assert!(
+                    (ratio - pick(&listed, index)).abs() <= 0.005 && ratio >= 4.5,
+                    "{theme} {role} on {background}: {ratio:.3}"
+                );
+                checked += 1;
+            }
+        }
+        for (role, on_light, on_dark) in graphic_rows {
+            let listed = if column == 0 { on_light } else { on_dark };
+            for (index, background) in backgrounds.iter().enumerate() {
+                let ratio = contrast(at(role), at(background));
+                assert!(ratio >= 3.0, "{theme} {role} on {background}: {ratio:.3}");
+                if pick(&listed, index) > 3.0 {
+                    assert!(
+                        (ratio - pick(&listed, index)).abs() <= 0.005,
+                        "{theme} {role} on {background}: {ratio:.3}"
+                    );
+                }
+                checked += 1;
+            }
+        }
+        let action = contrast(at("action-text"), at("action-fill"));
+        let listed = if column == 0 { 14.89 } else { 7.28 };
+        assert!(
+            (action - listed).abs() <= 0.005,
+            "{theme} action: {action:.3}"
+        );
+        let badge = contrast(at("badge-text"), at("badge-fill"));
+        let listed = if column == 0 { 7.35 } else { 8.52 };
+        assert!((badge - listed).abs() <= 0.005, "{theme} badge: {badge:.3}");
+        // Section 4 has no row for the information state: it shares the
+        // secondary text's colour, so its row is that one.
+        assert_eq!(at("information"), at("text-secondary"), "{theme}");
+    }
+    assert_eq!(checked, 3 * (7 + 2) * 3);
+}
+
+/// The rules of `css` outside the theme blocks and the font faces, as
+/// (selector, declarations), the at-rule `@media` looked into.
+fn style_rules(css: &str) -> Vec<(String, Vec<(String, String)>)> {
+    // Comments carry no rule.
+    let mut plain = String::new();
+    let mut rest = css;
+    while let Some(start) = rest.find("/*") {
+        plain.push_str(&rest[..start]);
+        rest = &rest[start + 2..];
+        rest = &rest[rest.find("*/").expect("a closed comment") + 2..];
+    }
+    plain.push_str(rest);
+    let mut rules = Vec::new();
+    let mut queue = vec![plain];
+    while let Some(text) = queue.pop() {
+        let mut rest = text.trim();
+        while !rest.is_empty() {
+            let open = rest.find('{').expect("a rule without a block");
+            let selector = rest[..open].trim().to_owned();
+            let mut depth = 0;
+            let mut close = None;
+            for (at, c) in rest[open..].char_indices() {
+                match c {
+                    '{' => depth += 1,
+                    '}' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            close = Some(open + at);
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            let close = close.expect("a closed block");
+            let inner = &rest[open + 1..close];
+            rest = rest[close + 1..].trim();
+            if selector.starts_with("@media") {
+                queue.push(inner.to_owned());
+            } else if selector.starts_with("@") {
+                assert_eq!(selector, "@font-face", "an at-rule the walk does not know");
+            } else if !selector.starts_with(":root") {
+                assert!(
+                    !inner.contains('{'),
+                    "nested rules are not walked: {selector}"
+                );
+                let declarations = inner
+                    .split(';')
+                    .filter_map(|declaration| {
+                        let (name, value) = declaration.split_once(':')?;
+                        Some((name.trim().to_owned(), value.trim().to_owned()))
+                    })
+                    .collect();
+                rules.push((selector, declarations));
+            }
+        }
+    }
+    rules
+}
+
+/// The role names a rule's declaration uses, `var(--role)`.
+fn roles(value: &str) -> Vec<&str> {
+    value
+        .split("var(--")
+        .skip(1)
+        .filter_map(|part| part.split(')').next())
+        .collect()
+}
+
+/// What a rule outside the themes may colour with: text in a role the
+/// contrast table lists on page, surface and raised, a fill the table pairs
+/// with its text, and a border or outline of the strong or focus role
+/// (3:1), the hairline exempt. Any other colour is an unchecked pair.
+fn audit(css: &str) -> Result<(), String> {
+    const TEXT: [&str; 7] = [
+        "text",
+        "text-secondary",
+        "text-muted",
+        "link",
+        "success",
+        "warning",
+        "danger",
+    ];
+    // `information` shares the secondary text's colour, which the contrast
+    // test asserts.
+    const TEXT_LIKE: [&str; 1] = ["information"];
+    const FILLS: [&str; 3] = ["page", "surface", "raised"];
+    for (selector, declarations) in style_rules(css) {
+        let value_of = |wanted: &str| {
+            declarations
+                .iter()
+                .find(|(name, _)| name == wanted)
+                .map(|(_, value)| value.as_str())
+        };
+        // A fill the table pairs with its text carries that text and no other,
+        // also when the rule sets no `color` (the inherited text is unchecked).
+        for (fill, text) in [("badge-fill", "badge-text"), ("action-fill", "action-text")] {
+            let on_fill = declarations.iter().any(|(name, value)| {
+                name.starts_with("background") && roles(value).contains(&fill)
+            });
+            if on_fill && value_of("color") != Some(&format!("var(--{text})")) {
+                return Err(format!(
+                    "{selector}: --{fill} without --{text} as its color"
+                ));
+            }
+        }
+        for (name, value) in &declarations {
+            let coloured = name == "color"
+                || name.starts_with("background")
+                || (name.starts_with("border") && name != "border-radius")
+                || name.starts_with("outline") && !name.ends_with("offset");
+            // Any other property that carries a colour has no pair in the
+            // table, whatever its name.
+            let holds_colour = value.contains("var(--")
+                || value.contains('#')
+                || value.contains("rgb")
+                || value.contains("hsl");
+            if !coloured && holds_colour {
+                return Err(format!("{selector}: {name} colours outside the table"));
+            }
+            if !coloured {
+                continue;
+            }
+            if value.contains('#') || value.contains("rgb") || value.contains("hsl") {
+                return Err(format!(
+                    "{selector}: {name} sets a colour outside the themes"
+                ));
+            }
+            for role in roles(value) {
+                let fine = if name == "color" {
+                    TEXT.contains(&role)
+                        || TEXT_LIKE.contains(&role)
+                        || (role == "badge-text"
+                            && value_of("background") == Some("var(--badge-fill)"))
+                        || (role == "action-text"
+                            && value_of("background") == Some("var(--action-fill)"))
+                } else if name.starts_with("background") {
+                    FILLS.contains(&role) || role == "badge-fill" || role == "action-fill"
+                } else {
+                    // The hairline only separates areas that differ otherwise.
+                    role == "border-hairline" || role == "border-strong" || role == "focus"
+                };
+                if !fine {
+                    return Err(format!(
+                        "{selector}: {name} uses --{role}, a pair the contrast table does not list"
+                    ));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn every_colour_the_style_sheet_uses_is_a_pair_of_the_contrast_table() {
+    audit(APP_CSS).unwrap();
+    // A rule added later cannot slip an unchecked pair in.
+    for css in [
+        ".new { color: var(--border-strong); }",
+        ".new { color: var(--badge-text); }",
+        ".new { color: var(--action-text); background: var(--surface); }",
+        ".new { background: var(--text); }",
+        ".new { border: 1px solid var(--page); }",
+        ".new { color: #FFFFFF; }",
+        ".new { border-color: rgb(0 0 0); }",
+        ".bar { outline: 2px solid var(--link); }",
+        ".new { background: var(--action-fill); }",
+        ".new { color: var(--text-muted); background: var(--badge-fill); }",
+        ".new { color: var(--text); background: var(--action-fill); }",
+        ".new { box-shadow: 0 0 0 2px var(--border-hairline); }",
+        ".new { column-rule-color: var(--border-hairline); }",
+        ".new { text-decoration: underline var(--text-muted); }",
+        ".new { -webkit-text-stroke: 1px var(--text); }",
+        ".new { text-emphasis-color: #000; }",
+    ] {
+        assert!(audit(css).is_err(), "{css}");
+    }
+    for css in [
+        ".new { color: var(--text-muted); }",
+        ".new { color: var(--badge-text); background: var(--badge-fill); }",
+        ".new { border-bottom: 1px solid var(--border-hairline); }",
+        ".new { border: 1px solid var(--border-strong); border-radius: 4px; }",
+        ".new { outline: 2px solid var(--focus); outline-offset: 2px; }",
+    ] {
+        assert!(audit(css).is_ok(), "{css}");
+    }
+}
+
+/// Why `text` names a place off the origin, if it does: an absolute or
+/// protocol-relative URL, an `@import`, or a `url(` that is not a carried
+/// font. A `//` starts a URL only right after a quote, a bracket or `=`;
+/// a `// comment` does not.
+fn egress(text: &str) -> Option<String> {
+    for scheme in ["http://", "https://", "ws://", "wss://", "ftp://", "data:"] {
+        if text.contains(scheme) {
+            return Some(scheme.to_owned());
+        }
+    }
+    if text.contains("@import") {
+        return Some("@import".to_owned());
+    }
+    for opener in ["\"//", "'//", "`//", "(//", "=//", "url(//", "src=//"] {
+        if text.contains(opener) {
+            return Some(opener.to_owned());
+        }
+    }
+    for part in text.split("url(").skip(1) {
+        if !part.starts_with("/fonts/") {
+            return Some(format!("url({}", part.chars().take(20).collect::<String>()));
+        }
+    }
+    None
+}
+
+#[test]
+fn no_asset_names_a_place_off_the_origin_and_the_policy_allows_none() {
+    for (name, text) in [
+        ("index.html", INDEX_HTML),
+        ("app.js", APP_JS),
+        ("app.css", APP_CSS),
+    ] {
+        assert_eq!(egress(text), None, "{name}");
+    }
+    // The mark is served too; its XML namespace is the one URL it may hold.
+    let mark = owlshift_runner::ui::server::FAVICON_SVG
+        .replace("xmlns=\"http://www.w3.org/2000/svg\"", "");
+    assert_eq!(egress(&mark), None, "favicon.svg");
+    // The check tells a URL from a comment.
+    assert!(egress(r#"fetch("//example.com/x")"#).is_some());
+    assert!(egress("img.src = '//example.com/x';").is_some());
+    assert!(egress("x { background: url(//example.com/f.woff2) }").is_some());
+    assert!(egress("x { background: url(/img/a.png) }").is_some());
+    assert!(egress("@import 'a.css';").is_some());
+    assert!(egress("a { src: url(https://example.com/f) }").is_some());
+    assert_eq!(
+        egress("// a comment about the page\nlet x = 1; // another"),
+        None
+    );
+    assert_eq!(egress("x { src: url(/fonts/a.woff2) }"), None);
+    // Nothing in the page points at another origin: every `src` and `href`
+    // is a path of the page.
+    for attribute in ["src=\"", "href=\""] {
+        for part in INDEX_HTML.split(attribute).skip(1) {
+            assert!(part.starts_with('/'), "{attribute}{part:.30}");
+            assert!(!part.starts_with("//"), "{attribute}{part:.30}");
+        }
+    }
+    let policy = SECURITY_HEADERS
+        .iter()
+        .find(|(name, _)| *name == "Content-Security-Policy")
+        .unwrap()
+        .1;
+    assert_eq!(policy, "default-src 'self'; frame-ancestors 'none'");
+}
+
+const SANS_STACK: &str =
+    r#""Bricolage Grotesque", system-ui, -apple-system, "Segoe UI", sans-serif"#;
+const MONO_STACK: &str = r#""JetBrains Mono", ui-monospace, "SF Mono", Menlo, Consolas, monospace"#;
+
+#[test]
+fn the_style_sheet_sets_both_typefaces_from_the_binary_with_the_identity_stacks() {
+    let css = lf(APP_CSS);
+    for (family, file) in [
+        ("Bricolage Grotesque", "BricolageGrotesque-latin.woff2"),
+        ("JetBrains Mono", "JetBrainsMono-Regular-latin.woff2"),
+        ("JetBrains Mono", "JetBrainsMono-Medium-latin.woff2"),
+    ] {
+        let face = css
+            .split("@font-face {")
+            .skip(1)
+            .find(|face| face.contains(&format!("url(/fonts/{file})")))
+            .unwrap_or_else(|| panic!("no @font-face for {file}"));
+        assert!(
+            face.contains(&format!("font-family: \"{family}\";")),
+            "{file}"
+        );
+        assert!(face.contains("font-display: swap;"), "{file}");
+        assert!(face.contains("unicode-range: U+0020-007E"), "{file}");
+        assert!(FONT_FILES.contains(&file));
+    }
+    assert!(css.contains("font-weight: 200 800;"));
+    assert!(block(&css, "\nbody {", "").contains(&format!("font-family: {SANS_STACK};")));
+    assert!(block(&css, "\ncode {", "").contains(&format!("font-family: {MONO_STACK};")));
+    assert!(block(&css, "\n.wordmark {", "").contains(&format!("font-family: {MONO_STACK};")));
+    assert!(block(&css, "\nbody {", "").contains("line-height: 1.5;"));
+    assert!(block(&css, "\nh1,\nh2,\nh3 {", "").contains("line-height: 1.15;"));
+    // Section 5's weights: 400, 600 and 800 for the sans, 400 and 500 for the
+    // mono; nothing else, not even 700.
+    for rule in css.split('}') {
+        let mono = rule.contains(&format!("font-family: {MONO_STACK};"));
+        for line in rule
+            .lines()
+            .filter(|line| line.trim().starts_with("font-weight:"))
+        {
+            let weight = line.trim().trim_start_matches("font-weight:").trim();
+            let allowed: &[&str] = if rule.contains("@font-face") {
+                &["200 800", "400", "500"]
+            } else if mono {
+                &["400;", "500;"]
+            } else {
+                &["400;", "600;", "800;"]
+            };
+            assert!(
+                allowed
+                    .iter()
+                    .any(|ok| weight.starts_with(ok) || weight == *ok),
+                "{line}"
+            );
+        }
+    }
+    // Every font the sheet names is a route that answers.
+    let data = tempfile::tempdir().unwrap();
+    let ui = serve(data.path(), RunSecret::new().unwrap());
+    for part in css.split("url(").skip(1) {
+        let path = part.split(')').next().unwrap();
+        assert_eq!(get(ui.port(), path, &[]).status, 200, "{path}");
+    }
+}
+
+#[test]
+fn the_carried_fonts_are_latin_woff2_of_bounded_size_and_documented() {
+    let readme = std::fs::read_to_string(font_dir().join("README.md")).unwrap();
+    for name in FONT_FILES {
+        let bytes = std::fs::read(font_dir().join(name)).unwrap();
+        assert_eq!(&bytes[..4], b"wOF2", "{name}");
+        assert!(bytes.len() < FONT_CAP, "{name}: {} bytes", bytes.len());
+        assert!(readme.contains(name), "{name} is not in the README");
+    }
+    for licence in ["OFL-BricolageGrotesque.txt", "OFL-JetBrainsMono.txt"] {
+        assert!(font_dir().join(licence).is_file(), "{licence}");
+    }
 }

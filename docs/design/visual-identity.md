@@ -191,7 +191,7 @@ A terminal has its user's theme, light or dark, and its user's palette. Owlshift
 | CLI: the voice | Section 2 applied to every message of `doctor`, `init`, `do`, `continue`, `watch`, `logs` and `config show`, and to desktop notifications; the build plan's fixed wording and the tests that check it change with it | Follow-up, OWL-163 |
 | CLI: the signature | `{o,o}` in the header of the CLI's reports, its eyes coloured as section 4 says | Follow-up, OWL-164 |
 | Ticket comments | The voice applies to their human-readable text, with a light hand since a whole team reads them; their markers, numbering and structure stay as they are (section 2, rule 4) | With the CLI's voice, OWL-163 |
-| Local web UI (P8) | The themes and both typefaces, carried in the binary; the mark as favicon | Follow-up, P8, OWL-165 |
+| Local web UI (P8) | The themes and both typefaces, carried in the binary; the mark as favicon | Done in OWL-165: both typefaces from `crates/owlshift-runner/src/ui/assets/fonts/` (sources and hashes in its README), the mark at `/favicon.svg`, the contrast table checked by tests in both themes |
 | Menu-bar app (P11) | The app icon from the dark mark on macOS's icon grid; the menu-bar icon from the one-colour mark as a template image (black with transparency, which macOS tints) | Follow-up, P11, OWL-166 |
 | Public site | The themes and typefaces of the web UI, the lockups, the social preview's art direction | When a site is planned; no issue yet |
 

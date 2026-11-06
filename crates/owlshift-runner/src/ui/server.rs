@@ -10,8 +10,9 @@
 //!
 //! The routes:
 //!
-//! - `GET /`, `/app.js`, `/app.css`: the page's frame and assets, carried in
-//!   the binary, served without a session;
+//! - `GET /`, `/app.js`, `/app.css`, `/favicon.svg` and `/fonts/<name>.woff2`:
+//!   the page's frame and assets, carried in the binary, served without a
+//!   session;
 //! - `POST /api/proof` `{"challenge"}` → `{"proof"}`, the listener's proof
 //!   for `owlshift ui` and `owlshift doctor`, which reveals nothing;
 //! - `POST /api/login` `{"code"}` → `{"id", "secret"}`: a one-time code
@@ -64,6 +65,17 @@ pub const INDEX_HTML: &str = include_str!("assets/index.html");
 pub const APP_JS: &str = include_str!("assets/app.js");
 /// The page's style sheet.
 pub const APP_CSS: &str = include_str!("assets/app.css");
+/// The Bricolage Grotesque face, Latin, a variable font (visual identity
+/// section 5), carried in the binary.
+pub const BRICOLAGE_WOFF2: &[u8] = include_bytes!("assets/fonts/BricolageGrotesque-latin.woff2");
+/// The JetBrains Mono Regular face, Latin.
+pub const MONO_REGULAR_WOFF2: &[u8] =
+    include_bytes!("assets/fonts/JetBrainsMono-Regular-latin.woff2");
+/// The JetBrains Mono Medium face, Latin.
+pub const MONO_MEDIUM_WOFF2: &[u8] =
+    include_bytes!("assets/fonts/JetBrainsMono-Medium-latin.woff2");
+/// The mark, the page's favicon: the brand's own file, not a copy.
+pub const FAVICON_SVG: &str = include_str!("../../../../assets/brand/owlshift-mark.svg");
 
 /// The header a session is sent in.
 pub const SESSION_HEADER: &str = "X-Owlshift-Session";
@@ -472,10 +484,9 @@ fn error_response(status: u16, why: &str) -> Response<Cursor<Vec<u8>>> {
     json_response(status, &json!({ "error": why }))
 }
 
-fn asset(text: &'static str, kind: &str) -> Response<Cursor<Vec<u8>>> {
+fn asset(bytes: &'static [u8], kind: &str) -> Response<Cursor<Vec<u8>>> {
     with_security(
-        Response::from_data(text.as_bytes().to_vec())
-            .with_header(http_header("Content-Type", kind)),
+        Response::from_data(bytes.to_vec()).with_header(http_header("Content-Type", kind)),
     )
 }
 
@@ -489,9 +500,21 @@ fn handle(context: &Arc<Context>, mut request: Request) {
     };
     let path = request.url().split('?').next().unwrap_or("").to_owned();
     let response = match (request.method(), path.as_str()) {
-        (Method::Get, "/" | "/index.html") => asset(INDEX_HTML, "text/html; charset=utf-8"),
-        (Method::Get, "/app.js") => asset(APP_JS, "text/javascript; charset=utf-8"),
-        (Method::Get, "/app.css") => asset(APP_CSS, "text/css; charset=utf-8"),
+        (Method::Get, "/" | "/index.html") => {
+            asset(INDEX_HTML.as_bytes(), "text/html; charset=utf-8")
+        }
+        (Method::Get, "/app.js") => asset(APP_JS.as_bytes(), "text/javascript; charset=utf-8"),
+        (Method::Get, "/app.css") => asset(APP_CSS.as_bytes(), "text/css; charset=utf-8"),
+        (Method::Get, "/favicon.svg") => asset(FAVICON_SVG.as_bytes(), "image/svg+xml"),
+        (Method::Get, "/fonts/BricolageGrotesque-latin.woff2") => {
+            asset(BRICOLAGE_WOFF2, "font/woff2")
+        }
+        (Method::Get, "/fonts/JetBrainsMono-Regular-latin.woff2") => {
+            asset(MONO_REGULAR_WOFF2, "font/woff2")
+        }
+        (Method::Get, "/fonts/JetBrainsMono-Medium-latin.woff2") => {
+            asset(MONO_MEDIUM_WOFF2, "font/woff2")
+        }
         (Method::Post, "/api/proof") => proof(context, &body),
         (Method::Post, "/api/login") => login(context, &body),
         (Method::Get, "/api/header" | "/api/stream") => {
