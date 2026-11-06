@@ -493,7 +493,11 @@ async function refresh(handle) {
     text(handle.note, "This ticket cannot be read: " + why);
   } else {
     text(handle.note, "Read " + shortTime(value.at));
-    renderSnapshot(handle, value);
+    try {
+      renderSnapshot(handle, value);
+    } catch (error) {
+      text(handle.note, "This ticket cannot be drawn: " + error);
+    }
     if (value.runs && value.runs.runs && value.runs.runs.some((run) => !run.ended)) {
       delay = SNAPSHOT_LIVE_MS;
     }
@@ -555,15 +559,28 @@ function renderSnapshot(handle, snapshot) {
     handle.last[name] = key;
     const body = handle.parts[name];
     clear(body);
-    if (part && part.error) {
-      problemLine(body, part.error);
-    } else if (part === null || part === undefined) {
-      body.appendChild(make("p", "notice", "Nothing yet."));
-    } else {
-      draw(handle, body, part, snapshot);
+    // One section that cannot be drawn says so and stops nothing else: the
+    // other sections, the runs and the next refresh go on.
+    try {
+      if (part && part.error) {
+        problemLine(body, part.error);
+      } else if (part === null || part === undefined) {
+        body.appendChild(make("p", "notice", "Nothing yet."));
+      } else {
+        draw(handle, body, part, snapshot);
+      }
+    } catch (error) {
+      clear(body);
+      handle.last[name] = null;
+      problemLine(body, "the page cannot draw it (" + error + ")");
     }
   }
-  renderRuns(handle, snapshot.runs);
+  try {
+    renderRuns(handle, snapshot.runs);
+  } catch (error) {
+    handle.last.runs = null;
+    problemLine(handle.runsNotes, "the page cannot draw the runs (" + error + ")");
+  }
 }
 
 function renderTimeline(handle, body, timeline) {
@@ -678,7 +695,8 @@ function renderQuestions(handle, body, questions) {
     el.appendChild(make("h4", "", "Round " + ask.round + (ask.kind === "reask" ? " (asked again)" : "") +
       " · " + shortTime(ask.at) + " · decider " + ask.decider.account));
     for (const question of ask.questions) {
-      const verdict = ask.verdicts.find((one) => one.question === question.id);
+      // `verdicts` is left out of an ask's JSON until a check gives them.
+      const verdict = (ask.verdicts || []).find((one) => one.question === question.id);
       el.appendChild(questionEl(question, verdict));
     }
     body.appendChild(el);
@@ -971,6 +989,8 @@ function makeRun(handle, info, open) {
     entries: new Map(),
     info: null,
     key: "",
+    // A run only the events name has no folder, so no log to follow.
+    noLog: info.folder === false,
     logs: {
       stdout: { from: 0, line: 0, timer: null, started: false, finished: false, lastData: 0, failed: false },
       stderr: { from: 0, line: 0, timer: null, started: false, finished: false, lastData: 0, failed: false },
@@ -1024,6 +1044,10 @@ function renderRuns(handle, section) {
       const wasEnded = run.info !== null && run.info.ended;
       run.key = infoKey;
       run.info = info;
+      if (run.noLog && info.folder !== false) {
+        run.noLog = false;
+        startLog(handle, run, "stdout");
+      }
       drawRunHead(run, info);
       if (info.ended && !wasEnded) {
         wakeLogs(handle, run);
@@ -1178,6 +1202,13 @@ async function pollLog(handle, run, which) {
         text: "the server answered " + answer.response.status,
       }]);
     }
+    // A run that has ended and whose log the server says is not there (or
+    // not a run's) will not get one: stop asking.
+    const status = answer.response.status;
+    if ((status === 404 || status === 400) && run.info && run.info.ended) {
+      log.finished = true;
+      return;
+    }
     log.timer = window.setTimeout(() => pollLog(handle, run, which), LOG_IDLE_MS);
     return;
   }
@@ -1212,6 +1243,13 @@ async function pollLog(handle, run, which) {
 function startLog(handle, run, which) {
   const log = run.logs[which];
   if (log.started) {
+    return;
+  }
+  if (run.noLog) {
+    if (which === "stdout" && !run.noLogShown) {
+      run.noLogShown = true;
+      run.log.appendChild(make("p", "notice", "This run has no folder: its log is not kept."));
+    }
     return;
   }
   log.started = true;

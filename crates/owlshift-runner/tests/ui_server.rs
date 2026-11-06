@@ -1724,6 +1724,60 @@ fn the_ticket_page_stops_what_it_scheduled_with_its_route_and_its_session() {
     assert!(app_js.contains("if (value.ended && value.next >= value.size) {"));
 }
 
+/// The contracts leave an ask's `verdicts` out of its JSON until a check
+/// gives them, which is every ask still waiting for its answer: the page
+/// must read them as absent, and one section that throws must not stop the
+/// refresh or the runs.
+#[test]
+fn the_ticket_page_reads_what_the_contracts_leave_out_and_survives_a_section_that_throws() {
+    use owlshift_contracts::refs::TicketQuestions;
+    let waiting = TicketQuestions::parse(
+        r#"{"format":18,"asks":[{"kind":"questions","round":1,"at":"2026-11-05T09:00:00Z",
+        "comment":"c1","questions":[{"id":"Q1","category":"scope","context":"c","text":"t",
+        "options":[]}],"decider":{"account":"maintainer","by":"assignee"}}]}"#,
+    )
+    .unwrap();
+    let json = serde_json::to_value(&waiting).unwrap();
+    assert!(json["asks"][0].get("verdicts").is_none(), "{json}");
+
+    let app_js = lf(APP_JS);
+    assert!(app_js.contains("(ask.verdicts || []).find("));
+    assert!(!app_js.contains("ask.verdicts.find("));
+    // Each section is drawn in its own try/catch, the runs too, and the next
+    // refresh is scheduled whatever the drawing did.
+    let snapshot = block(&app_js, "function renderSnapshot(handle, snapshot) {", "");
+    assert!(
+        snapshot.contains("    try {\n      if (part && part.error) {"),
+        "{snapshot}"
+    );
+    assert!(snapshot.contains("draw(handle, body, part, snapshot);"));
+    assert!(snapshot.contains("    renderRuns(handle, snapshot.runs);\n  } catch (error) {"));
+    let refresh = block(&app_js, "async function refresh(handle) {", "");
+    let (drawn, scheduled) = refresh
+        .split_once("renderSnapshot(handle, value);")
+        .expect("refresh draws the snapshot");
+    assert!(drawn.ends_with("    try {\n      "), "{drawn}");
+    assert!(scheduled.contains("} catch (error) {"));
+    assert!(scheduled.contains("handle.snapshotTimer = window.setTimeout"));
+}
+
+/// A run only the events name has no folder: its log is not followed, and a
+/// log the server says is not there stops being asked for once the run ended.
+#[test]
+fn the_ticket_page_follows_no_log_a_run_cannot_have() {
+    let app_js = lf(APP_JS);
+    assert!(app_js.contains("noLog: info.folder === false,"));
+    let start = block(&app_js, "function startLog(handle, run, which) {", "");
+    let (no_log, followed) = start.split_once("log.started = true;").unwrap();
+    assert!(no_log.contains("if (run.noLog) {"), "{start}");
+    assert!(no_log.contains("return;"));
+    assert!(followed.contains("pollLog(handle, run, which);"));
+    let poll = block(&app_js, "async function pollLog(handle, run, which) {", "");
+    assert!(poll.contains(
+        "(status === 404 || status === 400) && run.info && run.info.ended) {\n      log.finished = true;\n      return;"
+    ));
+}
+
 impl Ground {
     /// Appends an event of `OWL-1`'s run `RUN` to the event log.
     fn event(&self, kind: EventKind) {
