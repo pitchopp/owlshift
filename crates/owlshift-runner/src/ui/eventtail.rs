@@ -332,6 +332,16 @@ impl EventTail {
         lookup(&self.titles, project, ticket).map(String::as_str)
     }
 
+    /// The latest run that started of each (project, ticket).
+    pub fn runs(&self) -> &BTreeMap<(String, TicketId), Run> {
+        &self.runs
+    }
+
+    /// The title of the latest `dispatch` event of each (project, ticket).
+    pub fn titles(&self) -> &BTreeMap<(String, TicketId), String> {
+        &self.titles
+    }
+
     /// The lines that are not events, as notes, the cap's rest counted.
     pub fn notes(&self) -> Vec<String> {
         let mut notes = self.notes.clone();
@@ -408,7 +418,7 @@ impl EventTail {
     }
 }
 
-fn lookup<'a, V>(
+pub(super) fn lookup<'a, V>(
     map: &'a BTreeMap<(String, TicketId), V>,
     project: &str,
     ticket: &TicketId,

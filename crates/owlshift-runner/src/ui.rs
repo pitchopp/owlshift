@@ -26,6 +26,7 @@ pub mod auth;
 pub mod events;
 pub mod eventtail;
 pub mod header;
+pub mod overview;
 pub mod probe;
 pub mod record;
 pub mod runlog;
