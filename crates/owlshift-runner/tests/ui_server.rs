@@ -884,3 +884,31 @@ fn a_listener_off_the_loopback_is_refused() {
     }
     assert!(record::read(data.path()).unwrap().is_none());
 }
+
+/// The three typefaces the UI carries, by file name.
+const FONT_FILES: [&str; 3] = [
+    "BricolageGrotesque-latin.woff2",
+    "JetBrainsMono-Regular-latin.woff2",
+    "JetBrainsMono-Medium-latin.woff2",
+];
+
+/// The most bytes one carried font may take.
+const FONT_CAP: usize = 120 * 1024;
+
+fn font_dir() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("src/ui/assets/fonts")
+}
+
+#[test]
+fn the_carried_fonts_are_latin_woff2_of_bounded_size_and_documented() {
+    let readme = std::fs::read_to_string(font_dir().join("README.md")).unwrap();
+    for name in FONT_FILES {
+        let bytes = std::fs::read(font_dir().join(name)).unwrap();
+        assert_eq!(&bytes[..4], b"wOF2", "{name}");
+        assert!(bytes.len() < FONT_CAP, "{name}: {} bytes", bytes.len());
+        assert!(readme.contains(name), "{name} is not in the README");
+    }
+    for licence in ["OFL-BricolageGrotesque.txt", "OFL-JetBrainsMono.txt"] {
+        assert!(font_dir().join(licence).is_file(), "{licence}");
+    }
+}
