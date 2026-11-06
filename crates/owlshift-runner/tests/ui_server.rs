@@ -1152,19 +1152,13 @@ fn audit(css: &str) -> Result<(), String> {
                 || name.starts_with("background")
                 || (name.starts_with("border") && name != "border-radius")
                 || name.starts_with("outline") && !name.ends_with("offset");
-            // Other properties that carry a colour have no pair in the table.
-            const UNCHECKED: [&str; 9] = [
-                "box-shadow",
-                "text-shadow",
-                "text-decoration-color",
-                "caret-color",
-                "accent-color",
-                "fill",
-                "stroke",
-                "column-rule",
-                "scrollbar-color",
-            ];
-            if UNCHECKED.contains(&name.as_str()) {
+            // Any other property that carries a colour has no pair in the
+            // table, whatever its name.
+            let holds_colour = value.contains("var(--")
+                || value.contains('#')
+                || value.contains("rgb")
+                || value.contains("hsl");
+            if !coloured && holds_colour {
                 return Err(format!("{selector}: {name} colours outside the table"));
             }
             if !coloured {
@@ -1217,6 +1211,10 @@ fn every_colour_the_style_sheet_uses_is_a_pair_of_the_contrast_table() {
         ".new { color: var(--text-muted); background: var(--badge-fill); }",
         ".new { color: var(--text); background: var(--action-fill); }",
         ".new { box-shadow: 0 0 0 2px var(--border-hairline); }",
+        ".new { column-rule-color: var(--border-hairline); }",
+        ".new { text-decoration: underline var(--text-muted); }",
+        ".new { -webkit-text-stroke: 1px var(--text); }",
+        ".new { text-emphasis-color: #000; }",
     ] {
         assert!(audit(css).is_err(), "{css}");
     }
