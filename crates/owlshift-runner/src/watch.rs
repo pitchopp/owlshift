@@ -591,7 +591,8 @@ struct Memory<'c> {
     /// until the loop's next iteration clears it (OWL-485).
     wake_read: Option<owlshift_platform::wake::Wake>,
     /// Whether the machine is in a dark wake as last known, and so as last
-    /// told: a reading that could not be made leaves it as it was (OWL-485).
+    /// told: a reading that could not be made neither holds nor changes it
+    /// (OWL-485).
     dark_wake: bool,
     /// A step or a pass was held back for a dark wake since the loop's
     /// iteration began, so a check due keeps its priority (OWL-485).

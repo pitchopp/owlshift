@@ -6,11 +6,13 @@
 //! which is where a gate that runs across it fails (OWL-480). macOS shows it
 //! in the `"System Capabilities"` integer of `ioreg -r -n IOPMrootDomain`, a
 //! mask of what the system keeps up: 1 CPU, 2 graphics, 4 audio, 8 network.
-//! Checked on 2026-11-05 on macOS 26.6.2 (build plan, "P0", L6, OWL-485): 15
-//! at a full wake, with the display on and with it put to sleep while the
-//! system is held awake, and 9 (CPU and network) in every sample of a dark
-//! wake. So the graphics bit tells them apart, and [`parse`] reads nothing
-//! else. The probe fails open: any reading it cannot make, and any platform
+//! Checked on 2026-11-05 and 2026-11-06 on macOS 26.6.2 (build plan, "P0",
+//! L6, OWL-485): 15 at a full wake, with the display on and with it put to
+//! sleep for seconds while the system is held awake, and 9 (CPU and network)
+//! in every sample of a dark wake. So the graphics bit tells them apart, and
+//! [`parse`] reads nothing else. A display asleep for long on an awake Mac
+//! was not observed (the record says so): were the bit to drop with it, that
+//! machine would read as dark. The probe fails open: any reading it cannot make, and any platform
 //! but macOS, is [`Wake::Unknown`], which never holds anything, as
 //! keep-awake ([`crate::awake`]) does not hold anything back either.
 
@@ -93,30 +95,39 @@ mod imp {
 mod tests {
     use super::*;
 
-    /// The lines of `ioreg -r -n IOPMrootDomain` around the key, as captured
-    /// on 2026-11-05 on macOS 26.6.2 (L6, OWL-485).
-    fn captured(value: &str) -> String {
-        format!(
-            "+-o IOPMrootDomain  <class IOPMrootDomain, id 0x100000381, registered, matched, active, busy 0 (1911 ms), retain 229>\n  | {{\n  |   \"IOClass\" = \"IOPMrootDomain\"\n  |   \"System Capabilities\" = {value}\n  |   \"Supported Features\" = 1\n  | }}\n"
-        )
-    }
+    /// The start of `ioreg -r -n IOPMrootDomain` as captured on 2026-11-06 on
+    /// macOS 26.6.2 at a full wake (L6, OWL-485): the lines around the key,
+    /// verbatim, the longest left out. It holds `"CapabilityFlags"=2`, a
+    /// look-alike the parser must not read.
+    const FULL: &str = include_str!("../tests/ioreg/full_wake.txt");
+
+    /// The same capture with the one line the dark wake of 2026-11-06 changed
+    /// (the maintainer's `sleep` run, L6: 9 in both samples of the DarkWake
+    /// at 00:18:55) set to its value there; the rest of a dark wake's output
+    /// was not kept.
+    const DARK: &str = include_str!("../tests/ioreg/dark_wake.txt");
 
     #[test]
     fn parse_reads_a_full_wake() {
-        assert_eq!(parse(&captured("15")), Wake::Full);
+        assert_eq!(parse(FULL), Wake::Full);
     }
 
     #[test]
     fn parse_reads_a_dark_wake() {
-        assert_eq!(parse(&captured("9")), Wake::Dark);
+        assert_eq!(parse(DARK), Wake::Dark);
     }
 
     #[test]
-    fn parse_reads_a_sleeping_display_as_full() {
-        // Sampled with the display put to sleep and the system held awake.
-        assert_eq!(parse(&captured("15")), Wake::Full);
-        // Any mask with graphics up is a full wake.
-        assert_eq!(parse(&captured("7")), Wake::Full);
+    fn parse_reads_the_graphics_bit_and_nothing_else() {
+        let with = |mask: &str| FULL.replace("= 15", &format!("= {mask}"));
+        // The display asleep with the system held awake read 15 as well: the
+        // same input as a full wake, so nothing more to assert there.
+        for full in ["15", "7", "2", "3"] {
+            assert_eq!(parse(&with(full)), Wake::Full, "{full}");
+        }
+        for dark in ["9", "1", "0", "13"] {
+            assert_eq!(parse(&with(dark)), Wake::Dark, "{dark}");
+        }
     }
 
     #[test]
@@ -129,12 +140,17 @@ mod tests {
             Wake::Unknown
         );
         assert_eq!(parse("  |   \"System Capabilities\" = \n"), Wake::Unknown);
+        assert_eq!(
+            parse(&FULL.replace("\"System Capabilities\"", "\"Other\"")),
+            Wake::Unknown
+        );
     }
 
     #[cfg(target_os = "macos")]
     #[test]
     fn read_answers_on_this_machine() {
-        // Whatever the machine's state, the probe answers without panicking.
-        let _ = read();
+        // Any awake machine with `ioreg` answers; a dark wake is no state to
+        // run a suite in, but it would still be an answer.
+        assert_ne!(read(), Wake::Unknown);
     }
 }

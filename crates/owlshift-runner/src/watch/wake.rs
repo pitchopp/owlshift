@@ -10,10 +10,11 @@
 //! The machine is read ([`owlshift_platform::wake::read`]) once per
 //! iteration of the watch loop and again before each step starts, so a
 //! machine that fell into a dark wake in the middle of a pass starts
-//! nothing further. A reading that cannot be made ([`Wake::Unknown`])
-//! leaves the state as it was: it holds nothing on a machine never known to
-//! be in a dark wake, and lifts nothing on one known to be. Each change is
-//! said once, as a line and a project `decision` event.
+//! nothing further. A reading that cannot be made ([`Wake::Unknown`]) holds
+//! nothing, whatever the machine read before: the probe fails open, as
+//! keep-awake does, and a failed read neither tells nor changes what was
+//! told. Each change between a dark and a full wake is said once, as a line
+//! and a project `decision` event.
 
 use std::io::Write;
 
@@ -61,7 +62,8 @@ impl Watch<'_> {
         let dark = match reading {
             Wake::Dark => true,
             Wake::Full => false,
-            Wake::Unknown => memory.dark_wake,
+            // Fails open: nothing is held, and what was told stays told.
+            Wake::Unknown => return false,
         };
         if dark != memory.dark_wake {
             memory.dark_wake = dark;

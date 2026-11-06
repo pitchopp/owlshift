@@ -3454,3 +3454,37 @@ fn a_role_that_took_recommendations_asks_at_its_next_step() {
         "{round}"
     );
 }
+
+/// OWL-485: a stage a usage limit cut off, resumable by a watch pass, is not
+/// resumed in a dark wake: no run, no RESUME or other comment, no stage move;
+/// the first pass after the full wake resumes it as usual.
+#[test]
+fn a_dark_wake_resumes_no_stage_until_the_full_wake() {
+    // A reset ahead: but for the hold, the pass would tell the ticket it waits
+    // for the usage limit.
+    let (bench, replies) = cut_off_at(Stage::Build, FAR_AHEAD);
+    let (briefs, comments, shown) = (bench.briefs().len(), bench.comments(), bench.stage());
+    bench.wake.set(Wake::Dark);
+    let mut pass = 0;
+    let (outcomes, lines, printed) = bench.watch(replies, &mut |_| {
+        pass += 1;
+        if pass <= 3 {
+            assert_eq!(bench.briefs().len(), briefs, "a run started in pass {pass}");
+            assert_eq!(bench.comments(), comments, "told in pass {pass}");
+            assert_eq!(bench.stage(), shown, "moved in pass {pass}");
+            assert!(bench.watch_resumes().is_empty(), "resumed in pass {pass}");
+        }
+        if pass == 3 {
+            bench.wake.set(Wake::Full);
+            // Past the reset.
+            bench.wait(40 * 60);
+        }
+        pass < 5
+    });
+    assert!(
+        matches!(&outcomes[..], [Ok(_)]),
+        "{outcomes:?}\n{lines}\n{printed}"
+    );
+    assert_eq!(bench.watch_resumes(), ["build"]);
+    assert_eq!(bench.stage(), "In Review");
+}

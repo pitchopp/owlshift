@@ -2308,30 +2308,32 @@ fn an_unknown_wake_holds_nothing() {
     assert!(wake_told(&bench).is_empty(), "{lines}");
 }
 
-/// A dark wake followed by readings that fail keeps the hold, tells nothing
-/// more, and starts nothing; only a full wake lifts it, told once, and a
-/// failing probe after that holds nothing.
+/// A dark wake followed by readings that fail holds nothing: the probe fails
+/// open, whatever it read before. Nothing is told for a failed reading (the
+/// hold stays told as it was), and the full wake after it is told once.
 #[test]
-fn an_unreadable_probe_keeps_the_last_known_state() {
+fn an_unreadable_probe_after_a_dark_wake_holds_nothing() {
     let bench = Bench::draining("maintainer");
     let replies = vec![
         bench.reply(None, Some(&intake_result("done", None, ""))),
         bench.reply(Some("Hello"), Some(DONE)),
     ];
     bench.wake.set(Wake::Dark);
-    let (outcomes, lines, printed) = bench.drain(replies, 10, |pass| {
-        match pass {
-            1 => bench.wake.set(Wake::Unknown),
-            2 => bench.wake.set(Wake::Dark),
-            3 => bench.wake.set(Wake::Unknown),
-            4 => bench.wake.set(Wake::Full),
-            5 => bench.wake.set(Wake::Unknown),
-            _ => {}
-        }
-        if pass <= 4 {
+    let (outcomes, lines, printed) = bench.drain(replies, 10, |pass| match pass {
+        1 => {
             assert!(bench.runs().is_empty(), "a run started: pass {pass}");
             assert_eq!(wake_told(&bench), ["dark_wake"], "pass {pass}");
+            bench.wake.set(Wake::Unknown);
         }
+        3 => {
+            assert!(
+                !bench.runs().is_empty(),
+                "nothing ran on an unreadable probe"
+            );
+            assert_eq!(wake_told(&bench), ["dark_wake"], "pass {pass}");
+            bench.wake.set(Wake::Full);
+        }
+        _ => {}
     });
     assert!(
         outcomes.iter().any(|outcome| outcome.is_ok()),
@@ -2450,6 +2452,69 @@ fn a_dark_wake_does_not_cut_a_step_under_way() {
     assert!(roles.contains(&Role::Verify), "{roles:?}");
     assert_eq!(dispatched(&bench.events()), [TICKET], "{lines}");
     assert_eq!(wake_told(&bench), ["dark_wake"], "{lines}");
+}
+
+/// Two ready tickets dispatched by one pass, and a machine that falls into a
+/// dark wake between their step starts: the first ticket's step starts, the
+/// second's does not. The probe is read once for the pass start and once per
+/// step start; the second ticket is dispatched at the first pass after the
+/// full wake.
+#[test]
+fn a_dark_wake_that_begins_between_two_step_starts_holds_only_the_second() {
+    use super::parallel_scenarios::{parallel_bench, planned, standard_declaring};
+
+    let started = |bench: &Bench| -> Vec<String> {
+        let mut tickets: Vec<String> = bench
+            .events()
+            .iter()
+            .filter(|e| e.kind == EventKind::Dispatch)
+            .map(|e| e.ticket.as_ref().unwrap().as_str().to_owned())
+            .collect();
+        // A dispatch is told again by the continue that carries it on.
+        tickets.dedup();
+        tickets
+    };
+    let bench = parallel_bench("max_in_flight = 2\n");
+    bench.put_ticket(
+        "DEMO-2",
+        "maintainer",
+        "Todo",
+        &["agent"],
+        "blocked_by = [\"DEMO-9\"]\n",
+        "Document it.",
+    );
+    let mut replies: Vec<Reply> = ["app", "docs"]
+        .iter()
+        .map(|zone| bench.reply(None, Some(&standard_declaring(&[zone]))))
+        .collect();
+    replies.extend((0..6).map(|_| bench.read(&planned())));
+    let reads = Cell::new(0);
+    let (_, lines, printed) = bench.drain_passes(replies, 10, |pass, _| match pass {
+        // Both tickets have been through intake; the blocker is done and
+        // the next pass dispatches both: awake at its start and at the
+        // first step, dark at the second.
+        2 => {
+            bench.put_ticket("DEMO-9", "maintainer", "Done", &[], "", "A blocker.");
+            *bench.wake_script.borrow_mut() = VecDeque::from([Wake::Full, Wake::Full, Wake::Dark]);
+            reads.set(bench.wake_reads.get());
+        }
+        3 => {
+            assert_eq!(bench.wake_reads.get() - reads.get(), 3, "one per start");
+            assert_eq!(started(&bench), ["DEMO-1"]);
+            assert_eq!(bench.runs().len(), 3, "two intakes and one Design");
+            assert_eq!(wake_told(&bench), ["dark_wake"]);
+            bench.wake_script.borrow_mut().clear();
+        }
+        _ => {}
+    });
+    let report = format!("{lines}\n{printed}");
+    assert_eq!(started(&bench), ["DEMO-1", "DEMO-2"], "{report}");
+    let own = |id: &str| bench.runs().iter().filter(|(_, t)| t == id).count();
+    assert!(
+        own("DEMO-2") > 1,
+        "its step ran after the full wake: {report}"
+    );
+    assert_eq!(wake_told(&bench), ["dark_wake", "full_wake"], "{report}");
 }
 
 /// A machine that falls into a dark wake in the middle of a pass: the pass
