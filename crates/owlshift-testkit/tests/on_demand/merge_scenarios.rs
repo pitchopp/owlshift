@@ -664,6 +664,32 @@ fn a_pause_holds_merge_on_green_until_it_is_lifted() {
     assert!(lines.contains("nor a merge on green"), "{lines}");
 }
 
+/// OWL-485: a dark wake holds the dispatches and the steps' starts, not
+/// Owlshift's merge on green, which starts no run and spends nothing: a
+/// green, mergeable pull request is merged while the machine is in a dark
+/// wake.
+#[test]
+fn a_dark_wake_leaves_merge_on_green_alone() {
+    let bench = merging("all");
+    let pushed = bench.remote_branch().unwrap();
+    bench.wake.set(Wake::Dark);
+    let clock = bench.clock.clone();
+    let mut pass = 0;
+    let (_, lines, printed) = bench.watch(Vec::new(), &mut |_| {
+        pass += 1;
+        later(&clock);
+        pass < 6
+    });
+    assert_eq!(
+        github_merges(&bench),
+        [json!({ "sha": pushed, "merge_method": "squash" })],
+        "{lines}\n{printed}"
+    );
+    assert_eq!(merged_comments(&bench).len(), 1, "{lines}\n{printed}");
+    assert_ended_merged(&bench);
+    assert!(lines.contains("is in a dark wake"), "{lines}");
+}
+
 #[test]
 fn a_crash_between_the_merge_and_the_ref_write_still_tells_one_merged() {
     let bench = merging("all");

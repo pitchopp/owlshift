@@ -1149,6 +1149,46 @@ fn watch_tries_a_check_that_waited_again_once_nothing_else_runs() {
     assert_eq!(builds(&bench), [false]);
 }
 
+/// OWL-485: a base check due whose ticket's step a dark wake held, one that
+/// began after the pass's own read, runs nothing in the dark wake, and the
+/// first pass after the full wake makes the check and goes on.
+#[test]
+fn a_dark_wake_that_begins_mid_pass_holds_a_check_due_until_the_full_wake() {
+    let bench = Bench::new(true);
+    let marker = bench.tmp.path().join("store-has-rollup");
+    with_setup(&bench, &setup_line(&marker), None);
+    let two = TicketId::new("DEMO-2").unwrap();
+    let sibling = bench.dirs().ticket_lock(&two).unwrap().unwrap();
+    let (pending, printed) = bench.run(Vec::new(), None);
+    assert!(
+        matches!(pending, Err(Stop::BaseHeld { pending: true, .. })),
+        "{pending:?}\n{printed}"
+    );
+    drop(sibling);
+
+    // The pass start reads the machine awake and the step's own read finds
+    // the dark wake.
+    *bench.wake_script.borrow_mut() = VecDeque::from([Wake::Full, Wake::Dark]);
+    let mut passes = 0;
+    let (outcomes, lines, printed) = bench.watch(Vec::new(), &mut |_| {
+        passes += 1;
+        if passes == 1 {
+            assert_eq!(bench.wake_reads.get(), 2, "the pass start's and the step's");
+            assert!(checked(&bench).is_empty(), "a check ran in a dark wake");
+            bench.wake_script.borrow_mut().clear();
+        }
+        passes < 3
+    });
+    assert!(
+        matches!(
+            outcomes.as_slice(),
+            [Err(Stop::BaseHeld { pending: false, .. })]
+        ),
+        "{outcomes:?}\n{lines}\n{printed}"
+    );
+    assert_eq!(checked(&bench), ["opened"]);
+}
+
 /// OWL-431, the head's check that must wait: a done Build held at its base,
 /// whose commit was checked again at the fix's head and fails still, finds
 /// that head's own check due while DEMO-2's step runs. It stays held, that

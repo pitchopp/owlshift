@@ -2241,3 +2241,243 @@ fn the_ready_snapshot_keeps_what_each_pass_made_of_the_column() {
         u64::try_from(POLL_INTERVAL.as_millis()).unwrap()
     );
 }
+
+// OWL-485: a dark wake holds the dispatches and the steps' starts.
+
+/// The `watch` decisions a dark wake told, oldest first.
+fn wake_told(bench: &Bench) -> Vec<String> {
+    bench
+        .events()
+        .iter()
+        .filter(|event| event.kind == EventKind::Decision)
+        .filter_map(|event| event.data.get("watch")?.as_str().map(ToOwned::to_owned))
+        .filter(|watch| matches!(watch.as_str(), "dark_wake" | "full_wake"))
+        .collect()
+}
+
+/// A ready ticket and a drain: under a dark wake no run starts, no ticket is
+/// dispatched and nothing is told on the ticket; the first pass after the
+/// full wake dispatches it as usual. The hold and its lift are one line and
+/// one `decision` event each, however many passes the dark wake lasts.
+#[test]
+fn a_dark_wake_dispatches_nothing_until_a_full_wake() {
+    let bench = Bench::draining("maintainer");
+    let replies = vec![
+        bench.reply(None, Some(&intake_result("done", None, ""))),
+        bench.reply(Some("Hello"), Some(DONE)),
+    ];
+    bench.wake.set(Wake::Dark);
+    let (outcomes, lines, printed) = bench.drain(replies, 8, |pass| {
+        if pass <= 3 {
+            assert!(bench.runs().is_empty(), "a run started in a dark wake");
+            assert_eq!(bench.dispatches(), 0);
+            assert!(bench.comments_on(TICKET).is_empty());
+            assert_eq!(wake_told(&bench), ["dark_wake"]);
+        }
+        if pass == 3 {
+            bench.wake.set(Wake::Full);
+        }
+    });
+    assert!(
+        outcomes.iter().any(|outcome| outcome.is_ok()),
+        "{outcomes:?}\n{lines}\n{printed}"
+    );
+    assert_eq!(dispatched(&bench.events()), [TICKET], "{lines}");
+    assert_eq!(wake_told(&bench), ["dark_wake", "full_wake"], "{lines}");
+    assert_eq!(lines.matches("is in a dark wake").count(), 1, "{lines}");
+    assert_eq!(lines.matches("full wake again").count(), 1, "{lines}");
+    assert_eq!(bench.runs()[0], (Role::Intake, TICKET.to_owned()));
+}
+
+/// A reading that cannot be made holds nothing on a machine never known to
+/// be in a dark wake.
+#[test]
+fn an_unknown_wake_holds_nothing() {
+    let bench = Bench::draining("maintainer");
+    let replies = vec![
+        bench.reply(None, Some(&intake_result("done", None, ""))),
+        bench.reply(Some("Hello"), Some(DONE)),
+    ];
+    bench.wake.set(Wake::Unknown);
+    let (outcomes, lines, printed) = bench.drain(replies, 6, |_| {});
+    assert!(
+        outcomes.iter().any(|outcome| outcome.is_ok()),
+        "{outcomes:?}\n{lines}\n{printed}"
+    );
+    assert_eq!(dispatched(&bench.events()), [TICKET], "{lines}");
+    assert!(wake_told(&bench).is_empty(), "{lines}");
+}
+
+/// A dark wake followed by readings that fail keeps the hold, tells nothing
+/// more, and starts nothing; only a full wake lifts it, told once, and a
+/// failing probe after that holds nothing.
+#[test]
+fn an_unreadable_probe_keeps_the_last_known_state() {
+    let bench = Bench::draining("maintainer");
+    let replies = vec![
+        bench.reply(None, Some(&intake_result("done", None, ""))),
+        bench.reply(Some("Hello"), Some(DONE)),
+    ];
+    bench.wake.set(Wake::Dark);
+    let (outcomes, lines, printed) = bench.drain(replies, 10, |pass| {
+        match pass {
+            1 => bench.wake.set(Wake::Unknown),
+            2 => bench.wake.set(Wake::Dark),
+            3 => bench.wake.set(Wake::Unknown),
+            4 => bench.wake.set(Wake::Full),
+            5 => bench.wake.set(Wake::Unknown),
+            _ => {}
+        }
+        if pass <= 4 {
+            assert!(bench.runs().is_empty(), "a run started: pass {pass}");
+            assert_eq!(wake_told(&bench), ["dark_wake"], "pass {pass}");
+        }
+    });
+    assert!(
+        outcomes.iter().any(|outcome| outcome.is_ok()),
+        "{outcomes:?}\n{lines}\n{printed}"
+    );
+    assert_eq!(dispatched(&bench.events()), [TICKET], "{lines}");
+    assert_eq!(wake_told(&bench), ["dark_wake", "full_wake"], "{lines}");
+}
+
+/// A question answered in a dark wake: the answer check does not run, and
+/// nothing is told on the ticket; after the full wake the check runs and the
+/// ticket goes on, the intake resumed and the ticket dispatched.
+#[test]
+fn a_dark_wake_starts_no_answer_check_or_stage_step() {
+    let bench = Bench::draining("maintainer");
+    let question = r#"[{"id":"Q1","category":"scope",
+        "context":"The ticket does not say which greeting.",
+        "text":"Which greeting?","recommendation":{"why":"The simplest."}}]"#;
+    let replies = vec![
+        bench.reply(None, Some(&intake_result("questions", None, question))),
+        bench.reply(None, Some(&check(&[("Q1", "answered", "Hello.")]))),
+        bench.reply(None, Some(&intake_result("done", None, ""))),
+        bench.reply(Some("Hello"), Some(DONE)),
+    ];
+    let mut asked = (0, Vec::new());
+    let (outcomes, lines, printed) = bench.drain(replies, 10, |pass| match pass {
+        1 => {
+            bench.answer("Hello.");
+            bench.wake.set(Wake::Dark);
+            asked = (bench.runs().len(), bench.comments_on(TICKET));
+            assert_eq!(asked.0, 1, "the intake that asked");
+        }
+        2..=4 => {
+            assert_eq!(bench.runs().len(), asked.0, "a run started in pass {pass}");
+            assert_eq!(bench.answer_checks(), 0);
+            assert_eq!(bench.comments_on(TICKET), asked.1, "told in pass {pass}");
+            if pass == 4 {
+                bench.wake.set(Wake::Full);
+            }
+        }
+        _ => {}
+    });
+    assert!(
+        outcomes.iter().any(|outcome| outcome.is_ok()),
+        "{outcomes:?}\n{lines}\n{printed}"
+    );
+    assert_eq!(bench.answer_checks(), 1, "{lines}");
+    assert_eq!(dispatched(&bench.events()), [TICKET], "{lines}");
+    assert_eq!(wake_told(&bench), ["dark_wake", "full_wake"], "{lines}");
+}
+
+/// A delivered ticket whose pull request got a decider's review: the loop's
+/// Build is a held run of watch, and it does not start in a dark wake; once
+/// the machine is awake the loop runs and pushes to the same pull request.
+#[test]
+fn a_dark_wake_starts_no_review_loop() {
+    use super::review_scenarios::{FORGE, RENAMED, review};
+
+    let bench = deliver(Bench::with(
+        "maintainer",
+        "assignee = \"maintainer\"\n",
+        FORGE,
+    ));
+    *bench.github.reviews.lock().unwrap() =
+        vec![review(7_000_000_001, "ann-dev", "Use capitals.", &[])];
+    let delivered = bench.remote_branch().unwrap();
+    let runs = bench.briefs().len();
+    bench.wake.set(Wake::Dark);
+    let mut pass = 0;
+    let replies = vec![bench.reply(Some("Hello there"), Some(RENAMED))];
+    let (outcomes, lines, printed) = bench.watch(replies, &mut |_| {
+        pass += 1;
+        if pass <= 3 {
+            assert_eq!(bench.briefs().len(), runs, "a run started in pass {pass}");
+            assert_eq!(bench.remote_branch().unwrap(), delivered);
+        }
+        if pass == 3 {
+            bench.wake.set(Wake::Full);
+        }
+        pass < 5
+    });
+    assert!(
+        matches!(&outcomes[..], [Ok(_)]),
+        "{outcomes:?}\n{lines}\n{printed}"
+    );
+    assert!(bench.briefs().len() > runs, "the loop ran");
+    assert_eq!(
+        bench.last_of(Role::Build).pull_request_reviews[0].id,
+        7_000_000_001
+    );
+    assert_ne!(bench.remote_branch().unwrap(), delivered);
+    assert_eq!(wake_told(&bench), ["dark_wake", "full_wake"], "{lines}");
+}
+
+/// A step under way when a dark wake begins goes on: the Build run it was in
+/// the middle of and the Verify that follows are not held, and its ticket is
+/// delivered; the hold is told at the next pass and starts nothing more.
+#[test]
+fn a_dark_wake_does_not_cut_a_step_under_way() {
+    let bench = Bench::draining("maintainer");
+    let replies = vec![
+        bench.reply(None, Some(&intake_result("done", None, ""))),
+        bench.reply(Some("Hello"), Some(DONE)),
+    ];
+    let wake = bench.wake.clone();
+    // The Build, the second run (they count from 1), is working when the
+    // wake turns dark.
+    let during: Vec<During> = vec![(2, Box::new(move || wake.set(Wake::Dark)))];
+    let (outcomes, lines, printed) = bench.drain_during(replies, during, 4, |_| {});
+    assert!(
+        outcomes.iter().any(|outcome| outcome.is_ok()),
+        "{outcomes:?}\n{lines}\n{printed}"
+    );
+    let roles: Vec<Role> = bench.runs().iter().map(|(role, _)| *role).collect();
+    assert_eq!(roles[..2], [Role::Intake, Role::Build], "{roles:?}");
+    assert!(roles.contains(&Role::Verify), "{roles:?}");
+    assert_eq!(dispatched(&bench.events()), [TICKET], "{lines}");
+    assert_eq!(wake_told(&bench), ["dark_wake"], "{lines}");
+}
+
+/// A machine that falls into a dark wake in the middle of a pass: the pass
+/// start read it awake, the step's own read finds the dark wake, and the
+/// ticket is not started. One read for the pass start and one for the step
+/// start, so a step that used the pass's cached reading would start.
+#[test]
+fn a_dark_wake_that_begins_mid_pass_starts_no_further_step() {
+    let bench = Bench::draining("maintainer");
+    let replies = vec![
+        bench.reply(None, Some(&intake_result("done", None, ""))),
+        bench.reply(Some("Hello"), Some(DONE)),
+    ];
+    *bench.wake_script.borrow_mut() = VecDeque::from([Wake::Full, Wake::Dark]);
+    let (outcomes, lines, printed) = bench.drain(replies, 6, |pass| {
+        if pass == 1 {
+            assert_eq!(bench.wake_reads.get(), 2, "the pass start's and the step's");
+            assert!(bench.runs().is_empty(), "a run started in a dark wake");
+            assert_eq!(wake_told(&bench), ["dark_wake"]);
+        }
+        if pass == 3 {
+            bench.wake_script.borrow_mut().clear();
+        }
+    });
+    assert!(
+        outcomes.iter().any(|outcome| outcome.is_ok()),
+        "{outcomes:?}\n{lines}\n{printed}"
+    );
+    assert_eq!(dispatched(&bench.events()), [TICKET], "{lines}");
+    assert_eq!(wake_told(&bench), ["dark_wake", "full_wake"], "{lines}");
+}
