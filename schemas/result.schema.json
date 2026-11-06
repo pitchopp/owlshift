@@ -44,7 +44,7 @@
       "maxItems": 64
     },
     "followups": {
-      "description": "Follow-up tickets proposed to a human; never admitted automatically.",
+      "description": "Follow-up tickets proposed to a human; never admitted automatically.\nRead leniently ([`Followup`], OWL-500).",
       "type": "array",
       "default": [],
       "items": {
@@ -624,7 +624,7 @@
       ]
     },
     "Followup": {
-      "description": "A follow-up ticket proposed to a human.",
+      "description": "A follow-up ticket proposed to a human.\n\nIn `result.json`, a follow-up is secondary to the run's outcome\n(OWL-500): reading one is lenient, where every other field is strict.\nAn `evidence` given as one string is read as a list of that string, and\na follow-up still not of this shape is dropped, the rest of the result\nkept; the runner warns of each ([`FollowupRepairs`]). The schema keeps\nthe shape asked for.",
       "type": "object",
       "properties": {
         "blocked_by_parent": {

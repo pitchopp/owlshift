@@ -9232,9 +9232,12 @@ fn park_detail(outcome: &Outcome) -> String {
 
 /// The `run_ended` event's details.
 /// The `warning` events of a run's [`RunReport::warnings`] (OWL-303): one
-/// each, `what` = `run_warning`, with the role and the warning.
+/// each, `what` = `run_warning`, with the role and the warning. Then those of
+/// what reading its result repaired of its follow-ups (OWL-500), one per
+/// kind: `followup_coerced`, the follow-ups whose `evidence` was one string,
+/// and `followup_dropped`, those left out, each with why.
 fn run_warnings(role: Role, report: &RunReport) -> Vec<Data> {
-    report
+    let mut events: Vec<Data> = report
         .warnings
         .iter()
         .map(|warning| {
@@ -9244,8 +9247,51 @@ fn run_warnings(role: Role, report: &RunReport) -> Vec<Data> {
                 ("warning", json!(warning)),
             ])
         })
-        .collect()
+        .collect();
+    let repairs = &report.followup_repairs;
+    let title = |title: &Option<String>| title.as_deref().map(|t| cut_to(t, NOTED_TITLE_BYTES));
+    let mut repaired = |what: &str, count: usize, followups: Vec<Value>| {
+        if count > 0 {
+            events.push(data([
+                ("what", json!(what)),
+                ("role", json!(role.as_str())),
+                ("count", json!(count)),
+                ("followups", json!(followups)),
+            ]));
+        }
+    };
+    let coerced = repairs.coerced.iter().take(NOTED_FOLLOWUPS);
+    repaired(
+        "followup_coerced",
+        repairs.coerced.len(),
+        coerced
+            .map(|c| json!({ "place": c.place, "title": title(&c.title) }))
+            .collect(),
+    );
+    let dropped = repairs.dropped.iter().take(NOTED_FOLLOWUPS);
+    repaired(
+        "followup_dropped",
+        repairs.dropped.len(),
+        dropped
+            .map(|d| {
+                json!({
+                    "place": d.place,
+                    "title": title(&d.title),
+                    "reason": cut_to(&d.reason, NOTED_REASON_BYTES),
+                })
+            })
+            .collect(),
+    );
+    events
 }
+
+/// The most follow-ups one `followup_coerced` or `followup_dropped` event
+/// names (OWL-500); its `count` gives them all.
+const NOTED_FOLLOWUPS: usize = 16;
+/// The most bytes of a follow-up's title, and of why it was dropped, those
+/// events keep.
+const NOTED_TITLE_BYTES: usize = 120;
+const NOTED_REASON_BYTES: usize = 300;
 
 fn run_ended(report: &RunReport) -> Data {
     let (outcome, reason, status) = match &report.outcome {
@@ -9442,6 +9488,7 @@ mod tests {
             setup: None,
             gated: None,
             warnings: Vec::new(),
+            followup_repairs: Default::default(),
             resumed: None,
             session: None,
             windows: Vec::new(),
@@ -9464,6 +9511,42 @@ mod tests {
         assert_eq!(
             events[0]["warning"],
             json!("the login was not written back")
+        );
+    }
+
+    /// OWL-500: what reading a result repaired of its follow-ups is one
+    /// warning per kind, naming each by its place and title, with why it
+    /// was dropped.
+    #[test]
+    fn repaired_followups_are_a_warning_each_kind() {
+        use owlshift_contracts::result::{CoercedFollowup, DroppedFollowup, FollowupRepairs};
+        let repaired = RunReport {
+            followup_repairs: FollowupRepairs {
+                coerced: vec![CoercedFollowup {
+                    place: 1,
+                    title: Some("Fix the lease tests".to_owned()),
+                }],
+                dropped: vec![DroppedFollowup {
+                    place: None,
+                    title: None,
+                    reason: "followups is not a list".to_owned(),
+                }],
+            },
+            ..report(None)
+        };
+        let events = run_warnings(Role::Rebase, &repaired);
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0]["what"], json!("followup_coerced"));
+        assert_eq!(events[0]["role"], json!("rebase"));
+        assert_eq!(
+            events[0]["followups"],
+            json!([{ "place": 1, "title": "Fix the lease tests" }])
+        );
+        assert_eq!(events[1]["what"], json!("followup_dropped"));
+        assert_eq!(events[1]["count"], json!(1));
+        assert_eq!(
+            events[1]["followups"],
+            json!([{ "place": null, "title": null, "reason": "followups is not a list" }])
         );
     }
 
@@ -10688,6 +10771,7 @@ mod tests {
         };
         let validated = |result: &str, brief: &Brief| {
             crate::executor::validate_result(result.as_bytes(), "owlshift/T-1", brief)
+                .map(|(result, _)| result)
         };
         let finished = |result: RunResult| Outcome::Finished {
             result: Box::new(result),

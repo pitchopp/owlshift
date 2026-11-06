@@ -439,6 +439,7 @@ mod tests {
             setup: None,
             gated: None,
             warnings: Vec::new(),
+            followup_repairs: Default::default(),
             resumed: None,
             session: None,
             windows: Vec::new(),

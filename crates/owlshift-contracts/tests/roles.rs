@@ -441,12 +441,45 @@ fn build_example_result_parses() {
     let result = RunResult::parse(blocks[0]).unwrap_or_else(|e| {
         panic!("the example in roles/build.md is not a valid result.json: {e}")
     });
+    example_followups_need_no_repair("build.md", blocks[0], &result);
     // Checked against a Build brief too, so it never lists decisions (OWL-176).
     let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/brief.json");
     let brief = Brief::parse(&fs::read_to_string(&fixture).unwrap()).unwrap();
     assert_eq!(brief.role, Role::Build);
     if let Err(e) = result.validate_against(&brief) {
         panic!("the example in roles/build.md is refused from Build: {e}");
+    }
+}
+
+/// OWL-500: the rebase role's example is a valid result, and shows a
+/// follow-up as the contract asks for it.
+#[test]
+fn rebase_example_result_parses() {
+    let text = prompt("rebase.md");
+    let blocks = json_examples(&text);
+    assert_eq!(blocks.len(), 1, "roles/rebase.md holds one json example");
+    let result = RunResult::parse(blocks[0]).unwrap_or_else(|e| {
+        panic!("the example in roles/rebase.md is not a valid result.json: {e}")
+    });
+    assert!(!result.followups.is_empty(), "it shows a follow-up");
+    example_followups_need_no_repair("rebase.md", blocks[0], &result);
+}
+
+/// A role's example shows its follow-ups in the contract's own shape: none
+/// is dropped by the lenient read, and every `evidence` is a list (OWL-500).
+fn example_followups_need_no_repair(file: &str, example: &str, result: &RunResult) {
+    let written: Value = serde_json::from_str(example).unwrap();
+    let followups = written["followups"].as_array().cloned().unwrap_or_default();
+    assert_eq!(
+        followups.len(),
+        result.followups.len(),
+        "roles/{file} shows a follow-up the runner drops"
+    );
+    for followup in &followups {
+        assert!(
+            followup.get("evidence").is_none_or(Value::is_array),
+            "roles/{file} shows an evidence that is not a list"
+        );
     }
 }
 

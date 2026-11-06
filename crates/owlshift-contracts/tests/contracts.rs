@@ -3625,3 +3625,100 @@ fn a_ticket_delivery_round_trips_and_is_checked() {
     }
     assert!(parse(|v| v["merging"] = json!({ "commit": "36f0557", "method": "rebase" })).is_err());
 }
+
+/// OWL-500: a follow-up is secondary to the run's outcome. Its `evidence`
+/// given as one string is read as a list of it, and a follow-up not of the
+/// contract's shape is dropped, the rest of the result kept, for each role
+/// that files follow-ups: rebase and build.
+#[test]
+fn a_malformed_followup_keeps_the_result() {
+    let brief = |role: &'static str| {
+        Brief::parse(&edited("brief.json", |v| {
+            v.as_object_mut().unwrap().remove("result_refusal");
+            v["role"] = json!(role);
+            if role == "rebase" {
+                v["rebase"] = json!({ "pull_request": 7, "url": "u", "branch": "b",
+                    "head": "h", "base_branch": "main", "onto": "o" });
+            }
+        }))
+        .unwrap()
+    };
+    let failed = |followups: Value| {
+        json!({
+            "format": 14,
+            "status": "failed",
+            "summary": "On 8a681af, the gate fails: 5 tests of the leases module fail on the base too.",
+            "followups": followups,
+        })
+        .to_string()
+    };
+    let followup = json!({
+        "title": "Fix the lease tests failing on main",
+        "why": "They fail on the base, whatever the branch changes.",
+        "evidence": "Gate output: 2 failed, 13135 passed",
+        "source": "agent",
+        "done_when": "the gate passes on main",
+        "blocked_by_parent": false,
+    });
+    let mut no_done_when = followup.clone();
+    no_done_when.as_object_mut().unwrap().remove("done_when");
+    let mut unknown_source = followup.clone();
+    unknown_source["source"] = json!("rebase");
+    unknown_source["evidence"] = json!(["a list"]);
+    let written = failed(json!([
+        followup,
+        no_done_when,
+        unknown_source,
+        "Fix the lease tests"
+    ]));
+
+    let (result, repairs) = RunResult::read_against(&written, &brief("rebase")).unwrap();
+    assert_eq!(result.status, Status::Failed);
+    assert!(result.summary.starts_with("On 8a681af"));
+    assert_eq!(result.followups.len(), 1);
+    assert_eq!(
+        result.followups[0].evidence,
+        ["Gate output: 2 failed, 13135 passed"]
+    );
+    let coerced: Vec<_> = repairs.coerced.iter().map(|c| c.place).collect();
+    assert_eq!(coerced, [1]);
+    let dropped: Vec<_> = repairs.dropped.iter().map(|d| d.place).collect();
+    assert_eq!(dropped, [Some(2), Some(3), Some(4)]);
+    assert!(
+        repairs.dropped[0]
+            .reason
+            .contains("missing field `done_when`")
+    );
+    assert!(
+        repairs.dropped[1]
+            .reason
+            .contains("unknown variant `rebase`")
+    );
+    assert_eq!(repairs.dropped[2].title, None);
+
+    // A `followups` that is not a list is dropped whole.
+    let (result, repairs) =
+        RunResult::read_against(&failed(json!("none")), &brief("build")).unwrap();
+    assert!(result.followups.is_empty());
+    assert_eq!(repairs.coerced, []);
+    assert_eq!(repairs.dropped.len(), 1);
+    assert_eq!(repairs.dropped[0].place, None);
+    // The build role's follow-ups are read the same way.
+    let (result, repairs) =
+        RunResult::read_against(&failed(json!([followup])), &brief("build")).unwrap();
+    assert_eq!(result.followups.len(), 1);
+    assert_eq!(repairs.coerced.len(), 1);
+
+    // Any other fault still refuses the result, and says which.
+    let mut finished: Value = serde_json::from_str(&written).unwrap();
+    finished["status"] = json!("finished");
+    let refused = RunResult::read_against(&finished.to_string(), &brief("rebase")).unwrap_err();
+    assert!(
+        refused
+            .error
+            .to_string()
+            .contains("unknown variant `finished`"),
+        "{}",
+        refused.error
+    );
+}
