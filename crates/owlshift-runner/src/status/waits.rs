@@ -29,6 +29,7 @@ use owlshift_adapters::forge::Repo;
 use owlshift_contracts::config::ProjectConfig;
 use owlshift_contracts::format::Format;
 use owlshift_contracts::ids::TicketId;
+use owlshift_contracts::result::Question;
 use owlshift_contracts::service::Request;
 use owlshift_contracts::waits::{
     Behind, HeldRun, Paused, ProjectWaits, RefStatus, RunSlots, StatusWaits, TicketWaits, Wait,
@@ -90,6 +91,80 @@ pub struct ProjectRead {
     /// The tickets of its latest ready snapshot; `None` when there is none
     /// or it does not read.
     pub ready: Option<BTreeSet<TicketId>>,
+    /// What the web UI's overview needs of every ref that reads, the ones
+    /// `refs` holds but no row of the document shows included (OWL-470).
+    pub details: BTreeMap<TicketId, RefDetail>,
+}
+
+/// What a ticket ref says that the document's rows do not: for the web UI's
+/// "For you" block, which counts every ref as the header does
+/// (`why::standings`), whether or not its ticket has a row.
+#[derive(Clone, Debug, PartialEq)]
+pub struct RefDetail {
+    /// Its status; `Unread` when the ref's record does not read or the core
+    /// accepts no state from it.
+    pub status: RefStatus,
+    /// The pull request watch follows (`watch::followed`), a pull request
+    /// for a person to review.
+    pub pull_request: Option<u64>,
+    /// The questions of its latest ask, in the ask's order.
+    pub questions: Vec<Question>,
+    /// Whether the ticket waits for its plan's approval: it needs input and
+    /// its latest ask holds a question of the approval category, which the
+    /// runner marks its approval round with (`on_demand::APPROVAL_CATEGORY`).
+    pub plan_to_approve: bool,
+}
+
+/// The detail of the ref `stored`, `state` being what [`ticket_ref::state_of`]
+/// made of it.
+fn detail(stored: &ticket_ref::Stored, state: &RefState) -> RefDetail {
+    let state = match state {
+        RefState::Read(Some(state)) | RefState::Unadmitted(state) => Some(state),
+        RefState::Read(None) | RefState::Unread(_) => None,
+    };
+    let Some(state) = state else {
+        return RefDetail {
+            status: RefStatus::Unread,
+            pull_request: None,
+            questions: Vec::new(),
+            plan_to_approve: false,
+        };
+    };
+    let status = state.status();
+    let questions = stored
+        .record
+        .questions
+        .asks
+        .last()
+        .map_or_else(Vec::new, |ask| ask.questions.clone());
+    let needs_input = matches!(status, Status::NeedsInput { .. });
+    let pull_request = crate::watch::followed(status, stored)
+        .then(|| {
+            stored
+                .record
+                .delivery
+                .as_ref()
+                .and_then(|delivery| delivery.pull_request.as_ref())
+                .map(|pull_request| pull_request.number)
+        })
+        .flatten();
+    RefDetail {
+        status: ref_status(status),
+        pull_request,
+        plan_to_approve: needs_input
+            && questions
+                .iter()
+                .any(|question| question.category == crate::on_demand::APPROVAL_CATEGORY),
+        questions,
+    }
+}
+
+fn ref_status(status: Status) -> RefStatus {
+    match status {
+        Status::Active(_) => RefStatus::Active,
+        Status::NeedsInput { .. } => RefStatus::NeedsInput,
+        Status::Parked { .. } => RefStatus::Parked,
+    }
 }
 
 /// Reads the waits of the data directory `data` at `now`: the project
@@ -115,10 +190,35 @@ pub fn gather(data: &Path, only: Option<&Repo>, concurrent_runs: u32, now: Times
             .map(|(entry, repo)| (entry.repository, repo, true))
             .collect(),
     };
+    gather_folded(
+        data,
+        chosen,
+        concurrent_runs,
+        now,
+        &mut |repository| why::fold(&events, repository),
+        notes,
+    )
+}
+
+/// [`gather`] for projects already chosen, each `(repository as the events
+/// spell it, repo, served)`, with each project's events folded by the
+/// caller: `fold_of` is asked for a repository's fold once. The web UI's
+/// overview keeps its fold from one read of the event log to the next
+/// (OWL-470) and passes the served projects, so it never needs the spelling
+/// of one that is not. `notes` is what the caller could not read.
+pub fn gather_folded(
+    data: &Path,
+    chosen: Vec<(String, Repo, bool)>,
+    concurrent_runs: u32,
+    now: Timestamp,
+    fold_of: &mut dyn FnMut(&str) -> Folded,
+    mut notes: Vec<String>,
+) -> Read {
     let projects = chosen
         .into_iter()
         .map(|(repository, repo, served)| {
-            project(data, &events, repository, &repo, served, now, &mut notes)
+            let folded = fold_of(&repository);
+            project(data, folded, repository, &repo, served, now, &mut notes)
         })
         .collect();
     let slots = match MachineSlots::new(data, concurrent_runs).holders() {
@@ -151,7 +251,7 @@ fn spelled(events: &[owlshift_contracts::event::Event], name: &str) -> String {
 
 fn project(
     data: &Path,
-    events: &[owlshift_contracts::event::Event],
+    mut folded: Folded,
     repository: String,
     repo: &Repo,
     served: bool,
@@ -160,6 +260,7 @@ fn project(
 ) -> ProjectRead {
     let dirs = ProjectDirs::new(data, repo);
     let mut refs = Vec::new();
+    let mut details = BTreeMap::new();
     if dirs.checkout().exists() {
         match ticket_ref::all(&crate::project::runner_git(), &dirs.checkout()) {
             Ok(all) => {
@@ -168,7 +269,9 @@ fn project(
                     .map(|(ticket, stored)| match stored {
                         Ok(stored) => {
                             let holds = held::holds(&stored);
-                            (ticket, ticket_ref::state_of(&stored), holds)
+                            let state = ticket_ref::state_of(&stored);
+                            details.insert(ticket.clone(), detail(&stored, &state));
+                            (ticket, state, holds)
                         }
                         Err(why) => (ticket, RefState::Unread(why), true),
                     })
@@ -187,7 +290,6 @@ fn project(
         }
     }
     let ready = ready::listed(&dirs, now, &format!("{repository}: "), notes);
-    let mut folded = why::fold(events, &repository);
     let quarantined = match dirs.quarantine() {
         Ok(marker) => marker.is_some(),
         Err(error) => {
@@ -228,6 +330,7 @@ fn project(
         quarantined,
         pause: requests::pause(&dirs),
         ready,
+        details,
     }
 }
 
@@ -316,11 +419,7 @@ fn build_project(project: &ProjectRead, held: &[HeldSlot]) -> (ProjectWaits, usi
             Some(state) => {
                 let status = state.status();
                 row.stage = Some(status.stage());
-                row.ref_status = match status {
-                    Status::Active(_) => RefStatus::Active,
-                    Status::NeedsInput { .. } => RefStatus::NeedsInput,
-                    Status::Parked { .. } => RefStatus::Parked,
-                };
+                row.ref_status = ref_status(status);
             }
             None => row.ref_status = RefStatus::Unread,
         }
@@ -796,6 +895,7 @@ mod tests {
             quarantined: false,
             pause: None,
             ready: Some(listed),
+            details: BTreeMap::new(),
         }
     }
 
@@ -1184,5 +1284,125 @@ mod tests {
               out (the drain writes `ready.json` at its next pass)"
             ]
         );
+    }
+
+    /// OWL-470: a detail is kept for every ref that reads, the pull request
+    /// only for a followed one, the questions of the latest ask, and the plan
+    /// to approve only for the approval category.
+    #[test]
+    fn a_detail_is_kept_for_every_ref_with_its_pull_request_and_questions() {
+        use std::num::NonZeroU32;
+
+        use owlshift_contracts::ids::QuestionId;
+        use owlshift_contracts::refs::{
+            Ask, AskDecider, AskKind, DeliveredPullRequest, TicketDelivery, TicketQuestions,
+        };
+        use owlshift_core::decider::DeciderRule;
+
+        let question = |category: &str| Question {
+            id: QuestionId::new("Q1").unwrap(),
+            category: category.to_owned(),
+            context: "c".to_owned(),
+            text: "t".to_owned(),
+            options: Vec::new(),
+            recommendation: None,
+            replan: false,
+        };
+        let asking = |category: &str| {
+            let mut questions = TicketQuestions::new();
+            questions.asks.push(Ask {
+                kind: AskKind::Questions,
+                round: NonZeroU32::new(1).unwrap(),
+                at: "2026-10-28T09:00:00Z".parse().unwrap(),
+                comment: "c1".to_owned(),
+                questions: vec![question(category)],
+                decider: AskDecider {
+                    account: "u1".to_owned(),
+                    by: DeciderRule::Assignee,
+                },
+                verdicts: Vec::new(),
+                result_refusal: None,
+                labels: BTreeMap::new(),
+            });
+            questions
+        };
+        let stored =
+            |state: TicketState, questions: TicketQuestions, delivery| ticket_ref::Stored {
+                record: ticket_ref::TicketRecord {
+                    state: owlshift_contracts::refs::PersistedState::from(&state),
+                    questions,
+                    delivery,
+                    intake: None,
+                    plan: None,
+                    review: None,
+                    cost: None,
+                    session: None,
+                    held: None,
+                },
+                commit: "0".repeat(40),
+                proposals: None,
+            };
+        let state = |status: Status| {
+            let round = u32::from(status.stage() != Stage::Ready);
+            TicketState::restore(status, round, 0, 0, 0, 0).unwrap()
+        };
+        let delivery = TicketDelivery {
+            pull_request: Some(DeliveredPullRequest {
+                number: 42,
+                url: "https://github.com/o/r/pull/42".to_owned(),
+            }),
+            ..TicketDelivery::new("owlshift/demo-1", "main")
+        };
+        let read = |stored: &ticket_ref::Stored| detail(stored, &ticket_ref::state_of(stored));
+
+        let watching = read(&stored(
+            state(Status::Active(Stage::Watch)),
+            TicketQuestions::new(),
+            Some(delivery.clone()),
+        ));
+        assert_eq!(watching.status, RefStatus::Active);
+        assert_eq!(watching.pull_request, Some(42));
+        assert!(!watching.plan_to_approve && watching.questions.is_empty());
+
+        let approving = read(&stored(
+            state(Status::NeedsInput {
+                return_to: Stage::Design,
+            }),
+            asking(crate::on_demand::APPROVAL_CATEGORY),
+            None,
+        ));
+        assert_eq!(approving.status, RefStatus::NeedsInput);
+        assert!(approving.plan_to_approve);
+        assert_eq!(approving.questions.len(), 1);
+        assert_eq!(approving.pull_request, None);
+
+        let asking_scope = read(&stored(
+            state(Status::NeedsInput {
+                return_to: Stage::Intake,
+            }),
+            asking("scope"),
+            None,
+        ));
+        assert_eq!(asking_scope.status, RefStatus::NeedsInput);
+        assert!(!asking_scope.plan_to_approve);
+        assert_eq!(asking_scope.questions[0].category, "scope");
+
+        // A pull request nobody follows (the delivery ended) is no review.
+        let mut ended = delivery;
+        ended.ended = Some(owlshift_contracts::refs::Ended {
+            why: owlshift_contracts::refs::EndedWhy::Merged,
+            at: "2026-10-28T10:00:00Z".parse().unwrap(),
+            head: None,
+        });
+        let parked = read(&stored(
+            state(Status::Parked {
+                at: Stage::Watch,
+                awaiting_input: false,
+            }),
+            TicketQuestions::new(),
+            Some(ended),
+        ));
+        assert_eq!(parked.status, RefStatus::Parked);
+        assert_eq!(parked.pull_request, None);
     }
 }
