@@ -2002,6 +2002,26 @@ pub(crate) mod fixtures {
         TicketId::new("OWL-1").unwrap()
     }
 
+    /// A repository at `root`, made if need be, and the runner's git.
+    pub fn init_at(root: &std::path::Path) -> Git {
+        std::fs::create_dir_all(root).unwrap();
+        let git = crate::project::runner_git();
+        git.run(root, &["init", "-q", "-b", "main"]).unwrap();
+        git
+    }
+
+    /// Writes `record` as the ticket ref of `ticket` after `previous`, and
+    /// returns the new commit.
+    pub fn put(
+        git: &Git,
+        root: &std::path::Path,
+        ticket: &TicketId,
+        record: &TicketRecord,
+        previous: Option<&str>,
+    ) -> String {
+        super::write(git, root, ticket, record, previous).unwrap()
+    }
+
     /// A record of a ticket working `stage`, nothing else kept.
     pub fn record(stage: Stage) -> TicketRecord {
         let mut record = blank(None);

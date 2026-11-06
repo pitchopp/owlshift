@@ -30,6 +30,7 @@ pub mod record;
 pub mod runlog;
 pub mod server;
 pub mod tail;
+pub mod ticket;
 pub mod token;
 
 /// The port of `127.0.0.1` the web UI listens on: `[ui] port` of the
