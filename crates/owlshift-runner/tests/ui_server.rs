@@ -927,6 +927,70 @@ fn font_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("src/ui/assets/fonts")
 }
 
+const SANS_STACK: &str =
+    r#""Bricolage Grotesque", system-ui, -apple-system, "Segoe UI", sans-serif"#;
+const MONO_STACK: &str = r#""JetBrains Mono", ui-monospace, "SF Mono", Menlo, Consolas, monospace"#;
+
+#[test]
+fn the_style_sheet_sets_both_typefaces_from_the_binary_with_the_identity_stacks() {
+    let css = lf(APP_CSS);
+    for (family, file) in [
+        ("Bricolage Grotesque", "BricolageGrotesque-latin.woff2"),
+        ("JetBrains Mono", "JetBrainsMono-Regular-latin.woff2"),
+        ("JetBrains Mono", "JetBrainsMono-Medium-latin.woff2"),
+    ] {
+        let face = css
+            .split("@font-face {")
+            .skip(1)
+            .find(|face| face.contains(&format!("url(/fonts/{file})")))
+            .unwrap_or_else(|| panic!("no @font-face for {file}"));
+        assert!(
+            face.contains(&format!("font-family: \"{family}\";")),
+            "{file}"
+        );
+        assert!(face.contains("font-display: swap;"), "{file}");
+        assert!(face.contains("unicode-range: U+0020-007E"), "{file}");
+        assert!(FONT_FILES.contains(&file));
+    }
+    assert!(css.contains("font-weight: 200 800;"));
+    assert!(block(&css, "\nbody {", "").contains(&format!("font-family: {SANS_STACK};")));
+    assert!(block(&css, "\ncode {", "").contains(&format!("font-family: {MONO_STACK};")));
+    assert!(block(&css, "\n.wordmark {", "").contains(&format!("font-family: {MONO_STACK};")));
+    assert!(block(&css, "\nbody {", "").contains("line-height: 1.5;"));
+    assert!(block(&css, "\nh1,\nh2,\nh3 {", "").contains("line-height: 1.15;"));
+    // Section 5's weights: 400, 600 and 800 for the sans, 400 and 500 for the
+    // mono; nothing else, not even 700.
+    for rule in css.split('}') {
+        let mono = rule.contains(&format!("font-family: {MONO_STACK};"));
+        for line in rule
+            .lines()
+            .filter(|line| line.trim().starts_with("font-weight:"))
+        {
+            let weight = line.trim().trim_start_matches("font-weight:").trim();
+            let allowed: &[&str] = if rule.contains("@font-face") {
+                &["200 800", "400", "500"]
+            } else if mono {
+                &["400;", "500;"]
+            } else {
+                &["400;", "600;", "800;"]
+            };
+            assert!(
+                allowed
+                    .iter()
+                    .any(|ok| weight.starts_with(ok) || weight == *ok),
+                "{line}"
+            );
+        }
+    }
+    // Every font the sheet names is a route that answers.
+    let data = tempfile::tempdir().unwrap();
+    let ui = serve(data.path(), RunSecret::new().unwrap());
+    for part in css.split("url(").skip(1) {
+        let path = part.split(')').next().unwrap();
+        assert_eq!(get(ui.port(), path, &[]).status, 200, "{path}");
+    }
+}
+
 #[test]
 fn the_carried_fonts_are_latin_woff2_of_bounded_size_and_documented() {
     let readme = std::fs::read_to_string(font_dir().join("README.md")).unwrap();
