@@ -7,9 +7,10 @@
 //! questions with who settled each (OWL-465), the MERGED comment, the events
 //! and the one notification a final refusal gives.
 
-use serde_json::json;
+use serde_json::{Value, json};
 
 use owlshift_adapters::forge::CommitId;
+use owlshift_contracts::drain::{ProposalOutcome, TicketProposals};
 use owlshift_contracts::event::EventKind;
 use owlshift_contracts::ids::TicketId;
 use owlshift_contracts::refs::{DeliveredPullRequest, Merging, TicketDelivery, TicketQuestions};
@@ -388,9 +389,293 @@ pub(crate) fn hold_words(blocker: &MergeBlocker, question: Option<&MergeQuestion
     }
 }
 
+/// What a ticket owes on the tracker before merge on green merges it
+/// (OWL-499; architecture section 5, "Merge on green", "Nothing is due
+/// first"): its DELIVERY report, and, on a tracker with a proposals inbox,
+/// the titles of its follow-ups not filed yet, with the latest refusal the
+/// ref keeps for one.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct Owed {
+    pub report: bool,
+    pub proposals: Vec<String>,
+    pub refusal: Option<String>,
+}
+
+impl Owed {
+    /// What `delivery` and `proposals` owe, the follow-ups only when the
+    /// tracker has an `inbox`.
+    pub(crate) fn of(
+        delivery: &TicketDelivery,
+        proposals: Option<&TicketProposals>,
+        inbox: bool,
+    ) -> Self {
+        let refusals: Vec<(&str, Option<&String>)> = proposals
+            .filter(|_| inbox)
+            .into_iter()
+            .flat_map(|kept| &kept.proposals)
+            .filter_map(|kept| match &kept.outcome {
+                ProposalOutcome::Owed { refusal } => {
+                    Some((kept.proposal.title.as_str(), refusal.as_ref()))
+                }
+                _ => None,
+            })
+            .collect();
+        Owed {
+            report: delivery.owed.is_some(),
+            proposals: refusals
+                .iter()
+                .map(|(title, _)| (*title).to_owned())
+                .collect(),
+            refusal: refusals
+                .iter()
+                .rev()
+                .find_map(|(_, refusal)| refusal.cloned()),
+        }
+    }
+
+    /// Whether anything is owed: merge on green's `something_due`.
+    pub(crate) fn any(&self) -> bool {
+        self.report || !self.proposals.is_empty()
+    }
+}
+
+/// The `decision` event of a wait merge on green tells (OWL-499;
+/// architecture section 5, "Merge on green", "Waits told"): `watch`
+/// `waits`, its `reason`, the pull request and the head, then `fields`.
+pub(crate) fn wait_data(number: u64, head: &str, reason: &str, fields: Data) -> Data {
+    let mut event = data([
+        ("watch", json!("waits")),
+        ("reason", json!(reason)),
+        ("pull_request", json!(number)),
+        ("head", json!(head)),
+    ]);
+    event.extend(fields);
+    event
+}
+
+/// The wait merge on green tells for `blocker`, one no person needs to lift
+/// and no refusal tells (OWL-499): its reason and fields, `owed` giving
+/// those of `merge_owes_first`. `None` for a hold kept for a person, a
+/// review the last read refuses, and the switch off.
+pub(crate) fn blocker_wait(blocker: &MergeBlocker, owed: &Owed) -> Option<(&'static str, Data)> {
+    let reason = match blocker {
+        MergeBlocker::SomethingDue => {
+            let fields = data([
+                ("report", json!(owed.report)),
+                ("proposals", json!(owed.proposals)),
+                ("refusal", json!(owed.refusal)),
+            ]);
+            return Some(("merge_owes_first", fields));
+        }
+        MergeBlocker::NotGreen => "merge_not_green",
+        MergeBlocker::StageMoved => "merge_stage_moved",
+        MergeBlocker::Draft => "merge_draft",
+        MergeBlocker::BaseUnknown => "merge_base_unknown",
+        MergeBlocker::BaseMoved => "merge_base_moved",
+        MergeBlocker::GreenOnce => "merge_green_once",
+        MergeBlocker::Closed => "merge_closed",
+        MergeBlocker::HeadMoved => "merge_head_moved",
+        MergeBlocker::BaseRetargeted => "merge_retargeted",
+        MergeBlocker::SwitchOff
+        | MergeBlocker::Excluded
+        | MergeBlocker::Unlabeled
+        | MergeBlocker::Security(_)
+        | MergeBlocker::Unanswered(_)
+        | MergeBlocker::ResolverDecided(_)
+        | MergeBlocker::ReviewRequired
+        | MergeBlocker::ChangesRequested => return None,
+    };
+    Some((reason, Data::new()))
+}
+
+/// A wait merge on green told, in a person's words (OWL-499), from its
+/// event's `reason` and fields, for watch's line, `owlshift why` and
+/// `owlshift status --waits`: `None` for a reason it does not tell.
+pub(crate) fn wait_words(reason: &str, data: &Data) -> Option<String> {
+    let text = |key: &str| data.get(key).and_then(Value::as_str);
+    let pr = data
+        .get("pull_request")
+        .and_then(Value::as_u64)
+        .map_or_else(
+            || "its pull request".to_owned(),
+            |n| format!("pull request #{n}"),
+        );
+    let merge = |words: &str| format!("{pr} is green and not merged yet: {words}");
+    let refresh = |words: &str| {
+        format!(
+            "{pr} is green on a base that moved since the push, and its refresh rebase waits: \
+             {words}"
+        )
+    };
+    let words = match reason {
+        "merge_owes_first" => merge(&owes_words(data)),
+        "merge_due_first" if text("due") == Some("correction") => merge(
+            "a correction a decider's reply asks for comes first, then the merge at the pass \
+             after it ends",
+        ),
+        "merge_due_first" => merge(
+            "a review loop the reviews on it ask for comes first, then the merge at the pass \
+             after it ends",
+        ),
+        "merge_busy" => merge(
+            "the project or the ticket was busy, or its ticket ref moved, when watch tried; the \
+             next pass tries again",
+        ),
+        "merge_green_once" => merge(
+            "it was read green once on this head; a second green read at least a minute later \
+             merges it",
+        ),
+        "merge_not_green" => merge("the head it was read green at is not Owlshift's last push"),
+        "merge_stage_moved" => merge(
+            "the ticket is no longer in the project's review state on the tracker; moved back \
+             there, it is merged",
+        ),
+        "merge_draft" => merge("it is a draft; marked ready for review, it is merged"),
+        "merge_base_unknown" => merge(
+            "the base of Owlshift's last push is not known, so whether its checks ran on the \
+             base cannot be told: a person merges it",
+        ),
+        "merge_base_moved" => merge(
+            "its base moved right before the merge call; the next pass gets it a refresh rebase",
+        ),
+        "merge_closed" => merge("the last read before the merge found it no longer open"),
+        "merge_head_moved" => merge(
+            "the last read before the merge found another head than Owlshift's push; the next \
+             pass reads it",
+        ),
+        "merge_retargeted" => merge(
+            "it now targets another base branch than the one Owlshift pushed onto: a person \
+             merges it, or targets it back",
+        ),
+        "refresh_held" => refresh(&match text("until") {
+            Some(until) => format!(
+                "its last step left its ticket ref as it was, so it is tried again at {until}, \
+                 or sooner once its ref moves"
+            ),
+            None => "its last step left its ticket ref as it was and a person must act on the \
+                     ticket first"
+                .to_owned(),
+        }),
+        "refresh_usage_limit" => {
+            let harness = text("harness").unwrap_or("its harness");
+            refresh(&match text("until") {
+                Some(until) => format!("{harness} is at its usage limit until {until}"),
+                None => format!("{harness} is at its usage limit"),
+            })
+        }
+        "refresh_run_cap" => refresh("every run slot of this machine is taken"),
+        "refresh_base_check" => {
+            let tickets: Vec<&str> = data
+                .get("tickets")
+                .and_then(Value::as_array)
+                .map(|all| all.iter().filter_map(Value::as_str).collect())
+                .unwrap_or_default();
+            refresh(&format!(
+                "the base check of {} runs alone first",
+                tickets.join(", ")
+            ))
+        }
+        "refresh_busy" => refresh(
+            "the project or the ticket was busy when watch tried; the next pass tries again",
+        ),
+        "forge_paused" => format!(
+            "GitHub's API budget is spent until {}: watch reads no pull request before then, so \
+             {pr} is neither merged nor refreshed",
+            text("until").unwrap_or("its reset")
+        ),
+        _ => return None,
+    };
+    Some(words)
+}
+
+/// What a ticket owes first, in a person's words.
+fn owes_words(data: &Data) -> String {
+    let report = data.get("report").and_then(Value::as_bool) == Some(true);
+    let titles: Vec<String> = data
+        .get("proposals")
+        .and_then(Value::as_array)
+        .map(|all| {
+            all.iter()
+                .filter_map(Value::as_str)
+                .map(|title| format!("\"{title}\""))
+                .collect()
+        })
+        .unwrap_or_default();
+    let follow_ups = match titles.len() {
+        0 => String::new(),
+        1 => format!("the follow-up {}", titles[0]),
+        n => format!("{n} follow-ups ({})", titles.join(", ")),
+    };
+    let owed = match (report, follow_ups.is_empty()) {
+        (true, true) => "its DELIVERY report".to_owned(),
+        (true, false) => format!("its DELIVERY report and {follow_ups}"),
+        (false, _) => follow_ups,
+    };
+    let refusal = data
+        .get("refusal")
+        .and_then(Value::as_str)
+        .map_or_else(String::new, |refusal| {
+            format!("; the tracker refused the last filing: {refusal}")
+        });
+    format!(
+        "the ticket owes {owed} on the tracker, which comes first{refusal}. Owlshift tries again \
+         at each pass, then gets it a refresh rebase or merges it"
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// OWL-499: each wait merge on green tells for a blocker has its words,
+    /// and the holds a person lifts and the refusals are told otherwise.
+    #[test]
+    fn every_wait_told_for_a_blocker_has_its_words() {
+        let owed = Owed {
+            report: false,
+            proposals: vec!["Lint the docs".to_owned()],
+            refusal: Some("tracker: the plan holds 250 issues".to_owned()),
+        };
+        let told = [
+            MergeBlocker::NotGreen,
+            MergeBlocker::StageMoved,
+            MergeBlocker::Draft,
+            MergeBlocker::SomethingDue,
+            MergeBlocker::BaseUnknown,
+            MergeBlocker::BaseMoved,
+            MergeBlocker::GreenOnce,
+            MergeBlocker::Closed,
+            MergeBlocker::HeadMoved,
+            MergeBlocker::BaseRetargeted,
+        ];
+        for blocker in told {
+            let (reason, fields) = blocker_wait(&blocker, &owed).expect("told");
+            let event = wait_data(7, "p", reason, fields);
+            let words = wait_words(reason, &event).expect("worded");
+            assert!(words.starts_with("pull request #7 is green"), "{words}");
+        }
+        for blocker in [
+            MergeBlocker::SwitchOff,
+            MergeBlocker::Excluded,
+            MergeBlocker::Unlabeled,
+            MergeBlocker::Security("security".to_owned()),
+            MergeBlocker::Unanswered("money".to_owned()),
+            MergeBlocker::ResolverDecided("money".to_owned()),
+            MergeBlocker::ReviewRequired,
+            MergeBlocker::ChangesRequested,
+        ] {
+            assert_eq!(blocker_wait(&blocker, &owed), None, "{blocker:?}");
+        }
+        let (reason, fields) = blocker_wait(&MergeBlocker::SomethingDue, &owed).unwrap();
+        assert_eq!(
+            wait_words(reason, &wait_data(7, "p", reason, fields)).unwrap(),
+            "pull request #7 is green and not merged yet: the ticket owes the follow-up \"Lint \
+             the docs\" on the tracker, which comes first; the tracker refused the last filing: \
+             tracker: the plan holds 250 issues. Owlshift tries again at each pass, then gets it \
+             a refresh rebase or merges it"
+        );
+        assert_eq!(wait_words("slot", &Data::new()), None);
+    }
 
     /// Each round's questions with their latest verdict, a re-ask's and a
     /// thumbs-up's included and a later round's never borrowing an earlier

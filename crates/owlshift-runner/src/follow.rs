@@ -270,7 +270,7 @@ fn describe(action: &Action) -> &'static str {
 }
 
 /// The name of an action in events.
-fn action_name(decision: &Decision) -> &'static str {
+pub(crate) fn action_name(decision: &Decision) -> &'static str {
     match decision {
         Decision::End(_) => "end",
         Decision::Follow { action, .. } => match action {
@@ -375,7 +375,13 @@ struct MergeMemory {
     unread: Option<&'static str>,
     /// The head and the hold last told as waiting for a person (OWL-464).
     waits: Option<(String, &'static str)>,
+    /// The head, and each wait found on it since a step of the ticket last
+    /// started, with whether it was told (OWL-499).
+    told: Option<(String, Vec<(Data, bool)>)>,
 }
+
+/// How many waits of one head [`Following::merge_told`] keeps.
+const WAITS_KEPT: usize = 32;
 
 /// A merge on green refused for good (OWL-445; architecture section 5,
 /// "Merge on green", "Its answers"): no new attempt on `head` and `base`
@@ -785,6 +791,44 @@ impl Following {
         !told
     }
 
+    /// Whether to tell `wait`, a wait of `ticket`'s green pull request at
+    /// `head` that merge on green finds at this pass (OWL-499;
+    /// architecture section 5, "Merge on green", "Waits told"): at the
+    /// second pass that finds it on that head, and once, so a wait the
+    /// next pass settles says nothing and two that alternate are each told
+    /// once. A new head, or [`Self::merge_told_reset`], starts over.
+    pub fn merge_told(&mut self, ticket: &TicketId, head: &str, wait: &Data) -> bool {
+        let memory = self.merge.entry(ticket.clone()).or_default();
+        if memory.told.as_ref().is_none_or(|(at, _)| at != head) {
+            memory.told = Some((head.to_owned(), Vec::new()));
+        }
+        let Some((_, found)) = memory.told.as_mut() else {
+            return false;
+        };
+        match found.iter_mut().find(|(kept, _)| kept == wait) {
+            Some((_, told @ false)) => {
+                *told = true;
+                true
+            }
+            Some(_) => false,
+            None => {
+                if found.len() == WAITS_KEPT {
+                    found.remove(0);
+                }
+                found.push((wait.clone(), false));
+                false
+            }
+        }
+    }
+
+    /// A step of `ticket` started: the waits found after it are told again
+    /// (OWL-499).
+    pub fn merge_told_reset(&mut self, ticket: &TicketId) {
+        if let Some(memory) = self.merge.get_mut(ticket) {
+            memory.told = None;
+        }
+    }
+
     /// The last read found `ticket`'s review clearing: a refusal of its
     /// review is forgotten, so a later one is told again (OWL-445).
     pub fn review_cleared(&mut self, ticket: &TicketId) {
@@ -818,7 +862,13 @@ impl Following {
 
     /// Whether a spent budget holds every forge read at `now`.
     pub fn paused(&self, now: Timestamp) -> bool {
-        self.paused_until.is_some_and(|until| now < until)
+        self.pause(now).is_some()
+    }
+
+    /// Until when a spent budget holds every forge read, if it does at
+    /// `now`.
+    pub fn pause(&self, now: Timestamp) -> Option<Timestamp> {
+        self.paused_until.filter(|until| now < *until)
     }
 
     /// The warnings of a forge read for `ticket` that failed at `now`, a
@@ -1180,6 +1230,29 @@ mod tests {
     const PUSHING: &str = "2222222222222222222222222222222222222222";
     const BASE: &str = "3333333333333333333333333333333333333333";
     const ONTO: &str = "4444444444444444444444444444444444444444";
+
+    /// OWL-499: a wait is told at the second pass that finds it on a head,
+    /// once, two that alternate each once; a new head or a step's start
+    /// begins again.
+    #[test]
+    fn a_wait_is_told_at_its_second_pass_once_per_head() {
+        let mut following = Following::default();
+        let ticket = TicketId::new("DEMO-1").unwrap();
+        let (a, b) = (
+            data([("reason", json!("merge_owes_first"))]),
+            data([("reason", json!("merge_busy"))]),
+        );
+        let told: Vec<bool> = [&a, &b, &a, &b, &a, &b]
+            .into_iter()
+            .map(|wait| following.merge_told(&ticket, PUSHED, wait))
+            .collect();
+        assert_eq!(told, [false, false, true, true, false, false]);
+        assert!(!following.merge_told(&ticket, PUSHING, &a));
+        assert!(following.merge_told(&ticket, PUSHING, &a));
+        following.merge_told_reset(&ticket);
+        assert!(!following.merge_told(&ticket, PUSHING, &a));
+        assert!(following.merge_told(&ticket, PUSHING, &a));
+    }
 
     /// Answers with prepared responses, in order, counting the requests.
     #[derive(Clone, Default)]

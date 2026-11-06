@@ -19,7 +19,7 @@ use owlshift_contracts::Role;
 use owlshift_contracts::event::EventKind;
 use owlshift_contracts::ids::TicketId;
 use owlshift_contracts::refs::{DeliveredPullRequest, Merging, TicketDelivery};
-use owlshift_contracts::step::StepKind;
+use owlshift_contracts::step::{StepEnd, StepKind};
 use owlshift_core::floor::MergeGrant;
 use owlshift_core::follow::{
     self as core, Decision, EndReason, FirstGreen, LastRead, MergeBlocker, MergeDue, MergeFacts,
@@ -28,19 +28,30 @@ use owlshift_core::follow::{
 use owlshift_core::state::{Status, TicketState};
 use owlshift_core::vocab::{MergeSwitch, Stage};
 
-use super::{Continued, Memory, Seen, Watch};
-use crate::events::{EventSink, data};
+use super::{Continued, HeldBack, Memory, Seen, Until, Watch};
+use crate::events::{Data, EventSink, data};
 use crate::follow::{self, MergeRefused, Switch};
 use crate::merge;
 use crate::on_demand::PIPELINE;
 use crate::project::{self, ProjectLock, TicketLock};
 use crate::proposals;
 use crate::ticket_ref::{self, ProposalsFile, RefAt, Stored, TicketRecord};
+use crate::usage as machine_usage;
 use crate::writer::{WriteError, Writer};
 
 /// The base heads merge on green read at this pass, by base branch: one
 /// read a pass serves every pull request of the project (OWL-445).
 pub(super) type BaseHeads = HashMap<String, Result<String, forge::Error>>;
+
+/// Why [`Watch::merge_lock`] holds nothing.
+enum Unlocked {
+    /// The project or the ticket is busy, or the ref moved since the
+    /// snapshot: the next pass tries again, a wait told (OWL-499).
+    Busy,
+    /// Quarantined, no longer a followed ticket at Watch, or a ref that
+    /// does not read (warned of): nothing to tell here.
+    Gone,
+}
 
 /// What the merge step holds under the lock: the locks, the ticket ref read
 /// again under them, its delivery, and the base head read at this pass.
@@ -77,8 +88,11 @@ impl Watch<'_> {
         let (Some(pr), Some(pushed)) = (&delivery.pull_request, &delivery.pushed) else {
             return;
         };
-        if memory.following.paused(now) {
-            return;
+        // Every wait below is told (OWL-499; architecture section 5,
+        // "Merge on green", "Waits told"), but those that say themselves.
+        if let Some(until) = memory.following.pause(now) {
+            let wait = ("forge_paused", data([("until", json!(until))]));
+            return self.tell_wait(memory, sink, out, ticket, pr, pushed, wait);
         }
         // An operator's pause (OWL-438): Owlshift merges nothing, nor reads
         // for a merge; the first pass after its lift decides it again.
@@ -94,7 +108,10 @@ impl Watch<'_> {
         let (switch, method) = match self.switch(memory, &delivery.base_branch, &base_head) {
             Ok(Some(switch)) => switch,
             // The project is busy: the next pass reads it.
-            Ok(None) => return,
+            Ok(None) => {
+                let wait = ("merge_busy", Data::new());
+                return self.tell_wait(memory, sink, out, ticket, pr, pushed, wait);
+            }
             Err(reason) => return self.merge_unread(memory, sink, ticket, "switch", reason),
         };
         if switch == MergeSwitch::Never {
@@ -119,8 +136,13 @@ impl Watch<'_> {
         // Under the project's lock from here: the ticket ref read again, the
         // stage, the last read and the call (architecture section 5, "The
         // call").
-        let Some(locked) = self.merge_lock(memory, sink, ticket, &at.commit, &base_head) else {
-            return;
+        let locked = match self.merge_lock(memory, sink, ticket, &at.commit, &base_head) {
+            Ok(locked) => locked,
+            Err(Unlocked::Busy) => {
+                let wait = ("merge_busy", Data::new());
+                return self.tell_wait(memory, sink, out, ticket, pr, pushed, wait);
+            }
+            Err(Unlocked::Gone) => return,
         };
         let current = &locked.current;
         let stage = match on_demand.tracker.stage(ticket) {
@@ -144,9 +166,11 @@ impl Watch<'_> {
         let Some(pushed) = delivery.pushed.as_deref() else {
             return;
         };
-        let owes = delivery.owed.is_some()
-            || (proposals::has_inbox(on_demand.tracker)
-                && proposals::owes(current.proposals.as_ref()));
+        let owed = merge::Owed::of(
+            delivery,
+            current.proposals.as_ref(),
+            proposals::has_inbox(on_demand.tracker),
+        );
         let mut facts = MergeFacts {
             decision: &seen.decision,
             pushed,
@@ -166,7 +190,7 @@ impl Watch<'_> {
             // own read (`FOLLOW_QUERY`, whose text fixtures recorded live
             // pin) does not say it.
             draft: false,
-            something_due: owes,
+            something_due: owed.any(),
         };
         let read = core_read(seen);
         let mut due = core::merge_due(&policy, &facts, &read);
@@ -189,21 +213,24 @@ impl Watch<'_> {
         let grant = match due {
             MergeDue::Merge(grant) => grant,
             MergeDue::Wait(MergeBlocker::BaseMoved) => {
+                let pushed = pushed.to_owned();
                 drop(locked);
-                return self.refresh(memory, sink, out, continued, ticket, at);
+                return self.refresh(memory, sink, out, continued, (ticket, pr, &pushed), at);
             }
             // A hold only a person lifts is told once per head (OWL-464),
-            // outside the locks, since a notification may take seconds; the
-            // next pass settles any other wait.
+            // outside the locks, since a notification may take seconds; any
+            // other wait is told at its second pass (OWL-499).
             MergeDue::Wait(blocker) => {
+                let pushed = pushed.to_owned();
+                drop(locked);
                 if let Some(key) = blocker.kept_for_a_person() {
-                    let pushed = pushed.to_owned();
-                    drop(locked);
                     let question = core::held_question(&gate, &questions)
                         .filter(|(_, held)| *held == blocker)
                         .map(|(question, _)| question);
                     let waits = (pushed.as_str(), &blocker, key, question);
                     self.waits_for_person(memory, sink, out, ticket, pr, waits);
+                } else if let Some(wait) = merge::blocker_wait(&blocker, &owed) {
+                    self.tell_wait(memory, sink, out, ticket, pr, &pushed, wait);
                 }
                 return;
             }
@@ -247,8 +274,15 @@ impl Watch<'_> {
                     .refused_for_good(memory, sink, out, ticket, pr, refused, None, &reason);
             }
             // The next pass reads what changed: a base that moved gets its
-            // refresh rebase then.
-            MergeDue::Wait(_) => return,
+            // refresh rebase then. Told at its second pass (OWL-499).
+            MergeDue::Wait(blocker) => {
+                let pushed = pushed.to_owned();
+                drop(locked);
+                if let Some(wait) = merge::blocker_wait(&blocker, &owed) {
+                    self.tell_wait(memory, sink, out, ticket, pr, &pushed, wait);
+                }
+                return;
+            }
         };
         memory.following.review_cleared(ticket);
         self.merge_now(memory, sink, out, ticket, pr, locked, grant, seen, now);
@@ -507,23 +541,27 @@ impl Watch<'_> {
         merge::notify_waits(self.on_demand, ticket, pr.number, &reason, sink);
     }
 
-    /// A base that moved since the push, the pull request green and the
-    /// merge otherwise due: a repair step of its own, the refresh rebase,
-    /// held as a repair is.
+    /// A base that moved since the push, the pull request `pr` of `ticket`
+    /// green at `head` and the merge otherwise due: a repair step of its
+    /// own, the refresh rebase, held as a repair is. What holds it back is
+    /// told at its second pass (OWL-499): a hold its last step left, a
+    /// usage limit, the machine's run slots, another ticket's base check,
+    /// a busy project or ticket; never a stop, an operator's pause, told
+    /// for the project, or a ref that moved, which the next pass reads.
     fn refresh(
         &self,
         memory: &mut Memory,
         sink: &mut EventSink<'_>,
         out: &mut dyn Write,
         continued: &mut Continued<'_>,
-        ticket: &TicketId,
+        (ticket, pr, head): (&TicketId, &DeliveredPullRequest, &str),
         at: RefAt,
     ) {
         let kind = StepKind::Repair {
             failing_for_ms: None,
             merge_refresh: true,
         };
-        self.held_run(
+        let run = self.held_run(
             memory,
             sink,
             out,
@@ -533,12 +571,71 @@ impl Watch<'_> {
             (kind, Some(Role::Rebase)),
             None,
         );
+        let wait = match run {
+            Err(HeldBack::Paused) => return,
+            Err(HeldBack::Held(until)) => {
+                let until = match until {
+                    Until::At(at) => Some(at),
+                    Until::Person => None,
+                };
+                ("refresh_held", data([("until", json!(until))]))
+            }
+            Err(HeldBack::Usage { harness, until_ms }) => (
+                "refresh_usage_limit",
+                data([
+                    ("harness", json!(machine_usage::key(harness))),
+                    ("until", json!(machine_usage::at(until_ms))),
+                ]),
+            ),
+            Ok(Some(StepEnd::NoSlot)) => ("refresh_run_cap", Data::new()),
+            Ok(Some(StepEnd::Busy))
+                if self.stopping().is_none() && memory.operator_pause.is_none() =>
+            {
+                match &memory.base_due {
+                    Some((due, _)) => (
+                        "refresh_base_check",
+                        data([("tickets", json!([due.as_str()]))]),
+                    ),
+                    None => ("refresh_busy", Data::new()),
+                }
+            }
+            Ok(_) => return,
+        };
+        self.tell_wait(memory, sink, out, ticket, pr, head, wait);
+    }
+
+    /// Tells `wait`, a reason and its fields, for which `ticket`'s pull
+    /// request `pr`, read green at `head`, is neither merged nor refreshed
+    /// at this pass (OWL-499; architecture section 5, "Merge on green",
+    /// "Waits told"): at the second pass that finds it on that head, once,
+    /// one `decision` event (`watch` `waits`) and one line, in the words
+    /// `owlshift why` shows it with. No notification: it lifts by itself,
+    /// or the person who caused it knows.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn tell_wait(
+        &self,
+        memory: &mut Memory,
+        sink: &mut EventSink<'_>,
+        out: &mut dyn Write,
+        ticket: &TicketId,
+        pr: &DeliveredPullRequest,
+        head: &str,
+        (reason, fields): (&'static str, Data),
+    ) {
+        let event = merge::wait_data(pr.number, head, reason, fields);
+        if !memory.following.merge_told(ticket, head, &event) {
+            return;
+        }
+        let words = merge::wait_words(reason, &event).unwrap_or_else(|| reason.replace('_', " "));
+        sink.emit(ticket, None, EventKind::Decision, event);
+        self.line(out, &format!("{ticket}: {words}"));
     }
 
     /// The project's lock, then the ticket's, while the ref is still at
     /// `seen` and keeps a ticket at Watch whose delivery is followed: the
-    /// ref read again under them. `None` when busy, moved, quarantined or
-    /// no longer followed; a ref that cannot be read is warned of.
+    /// ref read again under them. [`Unlocked::Busy`] when busy or moved;
+    /// [`Unlocked::Gone`] when quarantined, no longer at Watch or followed,
+    /// or when the ref cannot be read, which is warned of.
     fn merge_lock(
         &self,
         memory: &mut Memory,
@@ -546,27 +643,27 @@ impl Watch<'_> {
         ticket: &TicketId,
         seen: &str,
         base_head: &str,
-    ) -> Option<Locked> {
+    ) -> Result<Locked, Unlocked> {
         let on_demand = self.on_demand;
         let (project, ticket_lock) = match self.locked_at(ticket, seen) {
             Ok(Some(locks)) => locks,
-            Ok(None) => return None,
+            Ok(None) => return Err(Unlocked::Busy),
             Err(reason) => {
                 self.merge_unread(memory, sink, ticket, "questions", reason);
-                return None;
+                return Err(Unlocked::Gone);
             }
         };
         if !matches!(on_demand.dirs.quarantine(), Ok(None)) {
-            return None;
+            return Err(Unlocked::Gone);
         }
         let git = &on_demand.executor.git;
         let current = match ticket_ref::read(git, &on_demand.dirs.checkout(), ticket) {
             Ok(Some(current)) => current,
-            Ok(None) => return None,
+            Ok(None) => return Err(Unlocked::Gone),
             Err(reason) => {
                 let reason = format!("reading the ticket's ref: {reason}");
                 self.merge_unread(memory, sink, ticket, "questions", reason);
-                return None;
+                return Err(Unlocked::Gone);
             }
         };
         let at_watch = TicketState::try_from(&current.record.state)
@@ -575,11 +672,12 @@ impl Watch<'_> {
             .record
             .delivery
             .clone()
-            .filter(TicketDelivery::followed)?;
+            .filter(TicketDelivery::followed)
+            .ok_or(Unlocked::Gone)?;
         if !at_watch {
-            return None;
+            return Err(Unlocked::Gone);
         }
-        Some(Locked {
+        Ok(Locked {
             _project: project,
             ticket_lock,
             current,
