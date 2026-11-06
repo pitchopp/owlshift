@@ -214,6 +214,34 @@ fn the_frame_and_its_assets_answer_without_a_session() {
         assert_eq!(reply.text(), body);
     }
     assert!(INDEX_HTML.contains(r#"<script src="/app.js" defer>"#));
+    assert!(INDEX_HTML.contains(r#"<link rel="icon" href="/favicon.svg" type="image/svg+xml">"#));
+    let brand = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../assets/brand/owlshift-mark.svg");
+    let mut carried = vec![(
+        "/favicon.svg".to_owned(),
+        "image/svg+xml",
+        std::fs::read(brand).unwrap(),
+    )];
+    for name in FONT_FILES {
+        carried.push((
+            format!("/fonts/{name}"),
+            "font/woff2",
+            std::fs::read(font_dir().join(name)).unwrap(),
+        ));
+    }
+    for (path, kind, bytes) in carried {
+        let reply = get(ui.port(), &path, &[]);
+        assert_eq!(reply.status, 200, "{path}");
+        reply.assert_secured();
+        assert_eq!(
+            reply.header("Content-Type").as_deref(),
+            Some(kind),
+            "{path}"
+        );
+        assert_eq!(reply.body, bytes, "{path}");
+    }
+    let missing = get(ui.port(), "/fonts/missing.woff2", &[]);
+    assert_eq!(missing.status, 404);
+    missing.assert_secured();
 }
 
 #[test]
