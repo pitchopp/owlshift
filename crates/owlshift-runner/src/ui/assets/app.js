@@ -109,6 +109,7 @@ function loggedOut(sent) {
   if (window.owlshiftOps) {
     window.owlshiftOps.hide();
   }
+  endStream();
   show("logged-out", true);
 }
 
@@ -145,8 +146,9 @@ async function login() {
 }
 
 // A fetch with the session, answering the response and the session it
-// sent, or null; a 401 ends that session on this page.
-async function authedFetch(path) {
+// sent, or null; a 401 ends that session on this page. `signal` ends a
+// request the page no longer wants.
+async function authedFetch(path, signal) {
   const current = session();
   if (!current) {
     loggedOut(null);
@@ -159,6 +161,7 @@ async function authedFetch(path) {
     headers: headers,
     credentials: "omit",
     cache: "no-store",
+    signal: signal,
   });
   if (response.status === 401) {
     loggedOut(sent);
@@ -273,12 +276,54 @@ function render(header) {
 // the server says the session ended.
 let retry = 2000;
 
+// The stream open now, or null: `graph` is whether it asked for the drain's
+// graph (OWL-460), which the server computes only while a stream asks, so
+// only the graph's page does. A change of route that changes the answer
+// ends the stream and opens the other (`syncStream`), a restart the page
+// asked for, which is neither a failure nor a newer tab.
+let stream = null;
+let streamTimer = null;
+
+function wantsGraph() {
+  const target = parseRoute(window.location.hash);
+  return target === null || target === "graph";
+}
+
+function streamPath(graph) {
+  return graph ? "/api/stream?graph=1" : "/api/stream";
+}
+
+// Ends the stream without opening another.
+function endStream() {
+  window.clearTimeout(streamTimer);
+  if (stream) {
+    stream.controller.abort();
+    stream = null;
+  }
+}
+
+// Opens the other stream when the route now asks for the graph and the
+// stream open did not, or the reverse.
+function syncStream() {
+  if (!stream || stream.graph === wantsGraph()) {
+    return;
+  }
+  endStream();
+  if (!wantsGraph()) {
+    lastGraph = null;
+  }
+  retry = 2000;
+  follow();
+}
+
 async function follow() {
   let superseded = false;
   let ended = false;
   let sent = null;
+  const mine = { controller: new AbortController(), graph: wantsGraph() };
+  stream = mine;
   try {
-    const answer = await authedFetch("/api/stream?graph=1");
+    const answer = await authedFetch(streamPath(mine.graph), mine.controller.signal);
     if (!answer) {
       return;
     }
@@ -321,17 +366,26 @@ async function follow() {
       }
     }
   } catch (error) {
+    if (stream !== mine) {
+      return;
+    }
     problem("The live header stopped: " + error.message);
+  }
+  if (stream !== mine) {
+    // The page ended this stream (a route that asks for the other one, or a
+    // logout): the stream that replaced it, if any, goes on by itself.
+    return;
   }
   if (ended) {
     loggedOut(sent);
     return;
   }
   if (superseded) {
+    stream = null;
     problem("Live updates went to a newer tab: reload this page to take them back.");
     return;
   }
-  window.setTimeout(follow, retry);
+  streamTimer = window.setTimeout(follow, retry);
   retry = Math.min(retry * 2, 30000);
 }
 
@@ -427,6 +481,7 @@ function markNav(name) {
 function route() {
   closeTicket();
   closeGraph();
+  syncStream();
   const target = parseRoute(window.location.hash);
   show("home", target === null && session() !== null);
   if (window.owlshiftOps) {

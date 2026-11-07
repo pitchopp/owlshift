@@ -597,8 +597,8 @@ fn no_asset_holds_the_token_and_the_page_sends_only_the_code_and_the_session() {
     assert_eq!(
         authed,
         [
-            "authedFetch(path",
-            "authedFetch(\"/api/stream?graph=1\"",
+            "authedFetch(path, signal",
+            "authedFetch(streamPath(mine.graph",
             "authedFetch(snapshotPath(handle",
             "authedFetch(logPath(handle, run.id, which, log.from, log.line",
             // The overview's "since" panel (OWL-470).
@@ -2657,9 +2657,39 @@ fn the_graph_is_a_route_of_its_own_next_to_the_ticket_page() {
     let logged_out = block(&app_js, "function loggedOut(sent) {", "");
     assert!(logged_out.contains("closeGraph();"), "{logged_out}");
     assert!(logged_out.contains("lastGraph = null;"));
-    // The stream that carries the header carries the graph, which the page
-    // draws as it comes.
-    assert!(APP_JS.contains("authedFetch(\"/api/stream?graph=1\""));
+    // The stream that carries the header carries the graph only while the
+    // graph's page is the route (the server computes it only while a stream
+    // asks), and a change of route that changes the answer ends the stream
+    // and opens the other, which is no failure and no newer tab.
+    let path = block(&app_js, "function streamPath(graph) {", "");
+    assert!(
+        path.contains(r#"graph ? "/api/stream?graph=1" : "/api/stream""#),
+        "{path}"
+    );
+    assert_eq!(APP_JS.matches(r#""/api/stream?graph=1""#).count(), 1);
+    let wants = block(&app_js, "function wantsGraph() {", "");
+    assert!(
+        wants.contains(r#"target === null || target === "graph""#),
+        "{wants}"
+    );
+    let sync = block(&app_js, "function syncStream() {", "");
+    assert!(sync.contains("stream.graph === wantsGraph()"), "{sync}");
+    assert!(sync.contains("endStream();") && sync.contains("follow();"));
+    assert!(sync.contains("lastGraph = null;"));
+    let end = block(&app_js, "function endStream() {", "");
+    assert!(end.contains("stream.controller.abort();"), "{end}");
+    let follow = block(&app_js, "async function follow() {", "");
+    assert!(follow.contains("mine.controller.signal"), "{follow}");
+    // A stream the page ended returns before it says a failure or retries.
+    let catch = follow.split("} catch (error) {").nth(1).unwrap();
+    assert!(
+        catch.starts_with("\n    if (stream !== mine) {\n      return;\n    }\n    problem("),
+        "{catch}"
+    );
+    assert!(follow.contains("streamTimer = window.setTimeout(follow, retry);"));
+    // A route reads the stream again, and a logout ends it.
+    assert!(route.contains("\n  syncStream();"), "{route}");
+    assert!(logged_out.contains("endStream();"), "{logged_out}");
     assert!(APP_JS.contains("} else if (message.graph) {\n          lastGraph = message.graph;"));
     // The frame: a link to the graph, and the container the graph draws in.
     assert!(INDEX_HTML.contains(r##"<a href="/#/graph">Graph</a>"##));
