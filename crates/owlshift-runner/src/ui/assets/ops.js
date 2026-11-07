@@ -546,9 +546,18 @@
     }
     state.busy = true;
     try {
-      const asked = spendPath(state);
-      const answer = await request(asked.path);
-      if (answer && mine === epoch) {
+      for (;;) {
+        const asked = spendPath(state);
+        const answer = await request(asked.path);
+        if (!answer || mine !== epoch) {
+          break;
+        }
+        // The period or the project changed while the request was in flight:
+        // the answer is to a question no longer asked. Drop it and ask again
+        // at once.
+        if (asked.key !== spendPath(state).key) {
+          continue;
+        }
         if (answer.status !== 200) {
           problem((answer.value && answer.value.error) || "Spend did not answer.");
         } else if (!answer.value.unchanged) {
@@ -556,6 +565,7 @@
           state.key = asked.key;
           drawSpend(state, answer.value);
         }
+        break;
       }
     } catch (error) {
       problem("Spend stopped: " + error.message);
@@ -662,6 +672,9 @@
     window.clearTimeout(timer);
     screen.tick(current.state, mine).then(() => {
       if (mine === epoch) {
+        // A refresh or a selector change called tick while this one was in
+        // flight and scheduled its own: keep one.
+        window.clearTimeout(timer);
         timer = window.setTimeout(tick, screen.every);
       }
     });
