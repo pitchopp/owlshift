@@ -135,7 +135,9 @@ pub struct Since {
     pub merged: BTreeSet<(String, TicketId)>,
     pub parked: BTreeSet<(String, TicketId)>,
     pub asked: BTreeSet<(String, TicketId)>,
-    pub spent_usd: f64,
+    /// What the runs spent, by project (`owner/repo`), so the page can sum
+    /// the one it shows.
+    pub spent_usd: BTreeMap<String, f64>,
     /// Highlights older than the oldest kept were dropped by the cap, and
     /// `from` precedes it: the answer may miss some.
     pub truncated: bool,
@@ -388,7 +390,7 @@ impl EventTail {
             merged: BTreeSet::new(),
             parked: BTreeSet::new(),
             asked: BTreeSet::new(),
-            spent_usd: 0.0,
+            spent_usd: BTreeMap::new(),
             truncated: self.dropped > 0
                 && self
                     .highlights
@@ -398,7 +400,10 @@ impl EventTail {
         for highlight in self.highlights.iter().filter(|h| h.at > from) {
             let Some(ticket) = &highlight.ticket else {
                 if highlight.kind == Kind::Spent {
-                    since.spent_usd += highlight.usd;
+                    *since
+                        .spent_usd
+                        .entry(highlight.project.clone())
+                        .or_insert(0.0) += highlight.usd;
                 }
                 continue;
             };
@@ -409,7 +414,10 @@ impl EventTail {
                 Kind::Parked => since.parked.insert(key),
                 Kind::Asked => since.asked.insert(key),
                 Kind::Spent => {
-                    since.spent_usd += highlight.usd;
+                    *since
+                        .spent_usd
+                        .entry(highlight.project.clone())
+                        .or_insert(0.0) += highlight.usd;
                     continue;
                 }
             };
@@ -714,6 +722,13 @@ mod tests {
                 usage("2026-11-01T11:10:00Z", json!(0.25)),
                 usage("2026-11-01T11:11:00Z", json!(0.5)),
                 usage("2026-11-01T11:12:00Z", Value::Null),
+                event(
+                    "2026-11-01T11:13:00Z",
+                    "other/repo",
+                    Some("X-1"),
+                    EventKind::Usage,
+                    data([("cost_usd", json!(2.0))]),
+                ),
             ],
         );
         let since = tail.since(Some(ts("2026-11-01T10:00:00Z")), ts("2026-11-01T12:00:00Z"));
@@ -724,7 +739,10 @@ mod tests {
         assert_eq!(names(&since.merged), ["OWL-2"]);
         assert_eq!(names(&since.parked), ["OWL-3"], "watch's ending is no park");
         assert_eq!(names(&since.asked), ["OWL-5", "OWL-6"]);
-        assert!((since.spent_usd - 0.75).abs() < 1e-9, "{}", since.spent_usd);
+        let spent = since.spent_usd["o/r"];
+        assert!((spent - 0.75).abs() < 1e-9, "{spent}");
+        assert_eq!(since.spent_usd.len(), 2, "spend is by project");
+        assert!((since.spent_usd["other/repo"] - 2.0).abs() < 1e-9);
         assert!(!since.truncated);
         assert_eq!(since.from, ts("2026-11-01T10:00:00Z"));
         let json = since.json();

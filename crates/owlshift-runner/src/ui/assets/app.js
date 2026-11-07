@@ -1643,9 +1643,15 @@ function renderSince() {
   sinceGroup(lines, "Merged", since.merged, chosen);
   sinceGroup(lines, "Parked", since.parked, chosen);
   sinceGroup(lines, "Asked", since.asked, chosen);
-  if (since.spent_usd > 0) {
-    lines.appendChild(make("div", "since-line",
-      "Spent $" + since.spent_usd.toFixed(2)));
+  // Spend comes by project: the chosen project's, or every project's.
+  let spent = 0;
+  for (const [project, usd] of Object.entries(since.spent_usd || {})) {
+    if (!chosen || project === chosen) {
+      spent += usd;
+    }
+  }
+  if (spent > 0) {
+    lines.appendChild(make("div", "since-line", "Spent $" + spent.toFixed(2)));
   }
   if (!lines.firstChild) {
     lines.appendChild(make("p", "notice", "Nothing happened since."));
