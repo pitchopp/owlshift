@@ -1033,11 +1033,8 @@ fn refresh(context: &Arc<Context>) {
 /// one built now when it has none yet (which it then shares). Reading the
 /// generation apart would mark a newer line as already written.
 fn first_overview(context: &Context) -> (String, u64) {
-    {
-        let state = context.hub.lock();
-        if let Some(line) = state.overview.clone() {
-            return (line, state.overview_generation);
-        }
+    if let Some(stored) = stored_overview(&context.hub) {
+        return stored;
     }
     let line = overview_line(&overview_now(context));
     let mut state = context.hub.lock();
@@ -1050,6 +1047,16 @@ fn first_overview(context: &Context) -> (String, u64) {
     drop(state);
     context.hub.changed.notify_all();
     (line, generation)
+}
+
+/// The refresher's latest overview line with the generation it was stored
+/// at, read under one lock.
+fn stored_overview(hub: &Hub) -> Option<(String, u64)> {
+    let state = hub.lock();
+    state
+        .overview
+        .clone()
+        .map(|line| (line, state.overview_generation))
 }
 
 /// Writes `line` as one chunk of a chunked body, and flushes it.
@@ -1214,5 +1221,38 @@ mod tests {
         }
         let back: Value = serde_json::from_str(&text).unwrap();
         assert_eq!(back["line"], line);
+    }
+
+    /// F1: the line a stream writes first and the generation it takes as seen
+    /// are the pair the refresher stored under one lock, never a line with
+    /// another generation (a newer one would hide the newer line from the
+    /// stream). A writer bumps both under the lock while the reader reads;
+    /// a reader that took them with two locks would see them apart.
+    #[test]
+    fn the_stored_overview_and_its_generation_are_read_together() {
+        let hub = Arc::new(Hub::default());
+        assert_eq!(stored_overview(&hub), None);
+        let writer = {
+            let hub = hub.clone();
+            thread::spawn(move || {
+                for generation in 1..=20_000_u64 {
+                    let mut state = hub.lock();
+                    state.overview = Some(format!("line {generation}"));
+                    state.overview_generation = generation;
+                }
+            })
+        };
+        let mut reads = 0;
+        while !writer.is_finished() || reads == 0 {
+            if let Some((line, generation)) = stored_overview(&hub) {
+                assert_eq!(line, format!("line {generation}"));
+                reads += 1;
+            }
+        }
+        writer.join().unwrap();
+        assert_eq!(
+            stored_overview(&hub),
+            Some(("line 20000".to_owned(), 20_000))
+        );
     }
 }

@@ -2145,8 +2145,10 @@ fn a_stream_writes_the_overview_again_when_a_ref_a_pause_ready_json_or_an_event_
 }
 
 /// A stream that starts after the last one closed, with the overview kept
-/// from before changed meanwhile, gets the new one (F1): the line it writes
-/// first and the generation it has seen are read together.
+/// from before changed meanwhile, gets the new one. This covers the
+/// closed-stream path end to end; the race between the first line and the
+/// generation read is pinned by `server.rs`'s unit test
+/// `the_stored_overview_and_its_generation_are_read_together`.
 #[test]
 fn a_stream_that_starts_after_another_closed_gets_the_overview_as_it_is_now() {
     let ground = Ground::with_options(Options {
