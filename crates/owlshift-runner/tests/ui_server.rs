@@ -14,6 +14,7 @@ use owlshift_adapters::forge::Repo;
 use owlshift_contracts::event::{Event, EventKind};
 use owlshift_contracts::format::Format;
 use owlshift_contracts::ids::TicketId;
+use owlshift_contracts::ready::{Outcome, ReadySnapshot, ReadyTicket};
 use owlshift_contracts::service::{BY_PAUSE, Request};
 use owlshift_runner::daemon::requests;
 use owlshift_runner::events::EventLog;
@@ -467,6 +468,11 @@ fn relay(port: u16) -> (u16, Arc<Mutex<Vec<u8>>>) {
 /// Opens `/api/stream` on `port` and reads its head: the stream, positioned
 /// at its first chunk.
 fn open_stream(port: u16, session: &Session) -> BufReader<TcpStream> {
+    open_stream_on(port, session, "/api/stream")
+}
+
+/// [`open_stream`] on `path`, a query included.
+fn open_stream_on(port: u16, session: &Session, path: &str) -> BufReader<TcpStream> {
     let stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
     stream
         .set_read_timeout(Some(Duration::from_secs(10)))
@@ -475,7 +481,7 @@ fn open_stream(port: u16, session: &Session) -> BufReader<TcpStream> {
         .write_all(&request_bytes(
             port,
             "GET",
-            "/api/stream",
+            path,
             &[("X-Owlshift-Session", &session.header())],
             "",
         ))
@@ -2350,4 +2356,278 @@ fn the_overview_page_links_only_a_guarded_pull_request_and_keeps_the_view_and_th
     }
     // Only the viewing of columns and list is offered: the graph is OWL-460.
     assert!(!INDEX_HTML.to_ascii_lowercase().contains("graph"));
+}
+
+// ---------------------------------------------------------------------------
+// The drain's graph (OWL-460): `/api/graph` and `/api/stream?graph=1`.
+
+/// A served project `o/r` whose ready snapshot lists DEMO-1 and DEMO-2, with
+/// a machine pause, and a session on a UI over it.
+struct Drain {
+    data: tempfile::TempDir,
+    ui: Serving,
+    session: Session,
+}
+
+impl Drain {
+    fn new() -> Self {
+        let data = tempfile::tempdir().unwrap();
+        let repo = Repo::parse("o/r").unwrap();
+        let checkout = data.path().join("checkout-of-o-r");
+        std::fs::create_dir_all(&checkout).unwrap();
+        Registry::in_data_dir(data.path())
+            .register(&repo, &checkout)
+            .unwrap();
+        requests::ask_pause(
+            data.path(),
+            None,
+            &Request::new(BY_PAUSE, Timestamp::now(), "lunch"),
+        )
+        .unwrap();
+        let drain = {
+            let ui = serve(data.path(), RunSecret::new().unwrap());
+            let session = session(ui.port(), data.path());
+            Self { data, ui, session }
+        };
+        drain.ready("DEMO-1 title", "DEMO-2 title");
+        drain
+    }
+
+    fn ready(&self, first: &str, second: &str) {
+        let ticket = |id: &str, title: &str| ReadyTicket {
+            ticket: TicketId::new(id).unwrap(),
+            title: title.to_owned(),
+            priority: owlshift_core::vocab::Priority::Medium,
+            blockers: Vec::new(),
+            drain: Outcome::TakenIn,
+        };
+        let snapshot = ReadySnapshot {
+            format: Format,
+            at: Timestamp::now(),
+            interval_ms: 60_000,
+            tickets: vec![ticket("DEMO-1", first), ticket("DEMO-2", second)],
+        };
+        let dirs = ProjectDirs::new(self.data.path(), &Repo::parse("o/r").unwrap());
+        owlshift_runner::ready::write(&dirs, &snapshot).unwrap();
+    }
+
+    fn event(&self, ticket: &str, kind: EventKind, data: Value) {
+        let event = Event {
+            format: Format,
+            at: Timestamp::now(),
+            project: "o/r".to_owned(),
+            ticket: Some(TicketId::new(ticket).unwrap()),
+            run: None,
+            kind,
+            data: data.as_object().unwrap().clone(),
+        };
+        EventLog::in_dir(self.data.path()).append(&event).unwrap();
+    }
+
+    /// The drain tells `ticket` waits blocked by `behind`.
+    fn blocked(&self, ticket: &str, behind: &str) {
+        self.event(
+            ticket,
+            EventKind::Decision,
+            json!({ "drain": "waits", "reason": "blocked_by", "tickets": [behind] }),
+        );
+    }
+
+    fn stream(&self) -> BufReader<TcpStream> {
+        open_stream_on(self.ui.port(), &self.session, "/api/stream?graph=1")
+    }
+
+    fn get(&self, path: &str) -> Reply {
+        get(
+            self.ui.port(),
+            path,
+            &[("X-Owlshift-Session", &self.session.header())],
+        )
+    }
+
+    /// The graph a whole read of the directory gives now: what the tail's
+    /// incremental one must equal.
+    fn whole(&self) -> Value {
+        let mut tail = owlshift_runner::events::EventTail::in_dir(self.data.path());
+        let graph = server::graph_read(self.data.path(), &mut tail, 2, Timestamp::now());
+        serde_json::to_value(graph).unwrap()
+    }
+}
+
+/// The next line of `stream` that is a graph, the header lines skipped.
+fn next_graph(stream: &mut BufReader<TcpStream>) -> Value {
+    loop {
+        let line = next_line(stream).expect("a graph line");
+        let value: Value = serde_json::from_str(&line).unwrap();
+        if value.get("graph").is_some() {
+            return value["graph"].clone();
+        }
+    }
+}
+
+fn edges(graph: &Value, layer: &str) -> Vec<(String, String)> {
+    graph["projects"][0][layer]["edges"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|edge| {
+            (
+                edge["from"].as_str().unwrap().to_owned(),
+                edge["to"].as_str().unwrap().to_owned(),
+            )
+        })
+        .collect()
+}
+
+#[test]
+fn the_graph_needs_a_session_and_comes_back_as_escaped_json_text() {
+    let drain = Drain::new();
+    let none = get(drain.ui.port(), "/api/graph", &[]);
+    assert_eq!(none.status, 401);
+    none.assert_secured();
+    let made_up = get(
+        drain.ui.port(),
+        "/api/graph",
+        &[("X-Owlshift-Session", "nonsense")],
+    );
+    assert_eq!(made_up.status, 401);
+    let title = "<script>alert(1)</script> & x";
+    drain.ready("DEMO-1 title", title);
+    drain.blocked("DEMO-2", "DEMO-1");
+    let reply = drain.get("/api/graph");
+    assert_eq!(reply.status, 200, "{}", reply.text());
+    reply.assert_secured();
+    assert!(
+        reply
+            .header("Content-Type")
+            .unwrap()
+            .starts_with("application/json")
+    );
+    let text = reply.text();
+    for c in ['<', '>', '&', '\u{2028}'] {
+        assert!(!text.contains(c), "{text}");
+    }
+    let graph = reply.json();
+    assert_eq!(graph["machine_pause"]["why"], "lunch");
+    assert_eq!(graph["projects"][0]["repository"], "o/r");
+    assert_eq!(graph["projects"][0]["served"], true);
+    let blockers = &graph["projects"][0]["blockers"]["nodes"];
+    let titles: Vec<&str> = blockers
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|node| node["title"].as_str().unwrap())
+        .collect();
+    assert_eq!(titles, ["DEMO-1 title", title]);
+    assert_eq!(
+        edges(&graph, "live"),
+        [("DEMO-2".to_owned(), "DEMO-1".to_owned())]
+    );
+    assert_eq!(graph["projects"][0]["ready"]["stale"], false);
+}
+
+#[test]
+fn a_graph_stream_follows_the_waits_through_the_event_tail() {
+    let drain = Drain::new();
+    let mut stream = drain.stream();
+    let first: Value = serde_json::from_str(&next_line(&mut stream).unwrap()).unwrap();
+    assert!(first.get("header").is_some(), "{first}");
+    let graph = next_graph(&mut stream);
+    // No ticket ref and no wait: the ready tickets are in the blockers
+    // layer only, the live one has nothing to draw.
+    assert!(
+        graph["projects"][0]["live"]["nodes"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(
+        graph["projects"][0]["blockers"]["nodes"]
+            .as_array()
+            .unwrap()
+            .len(),
+        2
+    );
+
+    // A wait told, with `ready.json` untouched: the next line has its edge,
+    // and nodes and edges are what a whole read of the directory builds.
+    drain.blocked("DEMO-2", "DEMO-1");
+    let told = next_graph(&mut stream);
+    assert_eq!(
+        edges(&told, "live"),
+        [("DEMO-2".to_owned(), "DEMO-1".to_owned())]
+    );
+    let whole = drain.whole();
+    assert_eq!(told["projects"], whole["projects"]);
+
+    // The drain's dispatch ends the wait: the following line has no edge.
+    drain.event(
+        "DEMO-2",
+        EventKind::Dispatch,
+        json!({ "branch": "owlshift/demo-2" }),
+    );
+    let cleared = next_graph(&mut stream);
+    assert!(edges(&cleared, "live").is_empty(), "{cleared}");
+    assert_eq!(cleared["projects"], drain.whole()["projects"]);
+}
+
+#[test]
+fn a_changed_ready_snapshot_alone_gives_a_line_and_an_unchanged_directory_none() {
+    let drain = Drain::new();
+    let mut stream = drain.stream();
+    next_line(&mut stream).unwrap();
+    let first = next_graph(&mut stream);
+    let title = |graph: &Value| {
+        graph["projects"][0]["blockers"]["nodes"][0]["title"]
+            .as_str()
+            .unwrap()
+            .to_owned()
+    };
+    assert_eq!(title(&first), "DEMO-1 title");
+    drain.ready("DEMO-1 renamed", "DEMO-2 title");
+    let next = next_graph(&mut stream);
+    assert_eq!(title(&next), "DEMO-1 renamed");
+    // Nothing changed since: no graph line within many refresh periods
+    // (100 ms here), the keepalive being 15 s away.
+    stream
+        .get_ref()
+        .set_read_timeout(Some(Duration::from_millis(600)))
+        .unwrap();
+    assert_eq!(next_line(&mut stream), None);
+}
+
+#[test]
+fn a_stream_without_graph_one_never_carries_a_graph_line() {
+    let drain = Drain::new();
+    for path in ["/api/stream", "/api/stream?graph=2", "/api/stream?graph=0"] {
+        let mut stream = open_stream_on(drain.ui.port(), &drain.session, path);
+        let first = next_line(&mut stream).unwrap();
+        assert!(first.starts_with(r#"{"header":"#), "{path}: {first}");
+        drain.blocked("DEMO-2", "DEMO-1");
+        stream
+            .get_ref()
+            .set_read_timeout(Some(Duration::from_millis(500)))
+            .unwrap();
+        while let Some(line) = next_line(&mut stream) {
+            assert!(!line.contains(r#""graph""#), "{path}: {line}");
+        }
+    }
+}
+
+#[test]
+fn a_new_token_ends_a_graph_stream_with_the_logged_out_line() {
+    let drain = Drain::new();
+    let mut stream = drain.stream();
+    next_line(&mut stream).unwrap();
+    next_graph(&mut stream);
+    token::new_token(drain.data.path()).unwrap();
+    stream
+        .get_ref()
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .unwrap();
+    let mut last = None;
+    while let Some(line) = next_line(&mut stream) {
+        last = Some(line);
+    }
+    assert_eq!(last.as_deref(), Some(LOGGED_OUT_LINE));
 }

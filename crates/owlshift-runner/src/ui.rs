@@ -12,7 +12,6 @@
 //! - *The header* ([`header`]), read from the files `owlshift status` reads
 //!   (`status::gather_files`), and the UI's record ([`record`]),
 //!   `<data>/service/ui.json`.
-<<<<<<< HEAD
 //! - *The overview* ([`overview`], OWL-470): the tickets in columns and in a
 //!   list, what waits for you, and what happened since your last visit,
 //!   from the ticket refs, `ready.json` and the event log read from its
@@ -21,11 +20,9 @@
 //!   the usage windows, the decisions and warnings as they are appended and
 //!   the daemon's log, in `owlshift status`'s own words, from the event log
 //!   read incrementally ([`index`]).
-=======
 //! - *The drain's graph* ([`graph`], OWL-460): the live waits of
 //!   `status --waits` and the tracker's blockers of `ready.json`, laid out
 //!   for the graph page.
->>>>>>> c82af595 (Model the drain's live waits as a laid-out graph for the web UI (OWL-460))
 //! - *The server* ([`server`]): tiny_http and threads on the socket the
 //!   daemon hands over, its routes and checks, and the page carried in the
 //!   binary.
@@ -39,11 +36,8 @@ use crate::config::FileState;
 pub mod auth;
 pub mod configuration;
 pub mod events;
-<<<<<<< HEAD
 pub mod eventtail;
-=======
 pub mod graph;
->>>>>>> c82af595 (Model the drain's live waits as a laid-out graph for the web UI (OWL-460))
 pub mod header;
 pub mod index;
 pub mod orchestrator;
