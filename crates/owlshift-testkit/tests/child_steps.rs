@@ -1061,10 +1061,13 @@ fn a_build_canceled_in_watch_s_own_process_stops_and_parks_the_watch_going_on() 
         "the watch ended\n{}",
         fs::read_to_string(&log).unwrap_or_default()
     );
-    assert!(!owlshift_runner::cancel::stands(
-        &s.project.dirs(),
-        &ticket()
-    ));
+    // The watch removes the cancel file after the park is stored and posted,
+    // so it can outlive `parked_at_build` on a loaded runner (OWL-496).
+    wait::until_with(
+        "the cancel file gone",
+        || log_text(&log),
+        || !owlshift_runner::cancel::stands(&s.project.dirs(), &ticket()),
+    );
 
     signal(&watch, "TERM");
     wait::until_with(
