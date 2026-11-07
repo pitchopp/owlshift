@@ -927,3 +927,232 @@ fn spend_needs_a_session() {
     let none = send(ground.ui.port(), "GET", "/api/spend", None, "");
     assert_eq!(none.status, 401);
 }
+
+// ---- Config (OWL-472) ----
+
+const PROJECT: &str = r#"requires = ">=0.0"
+
+[tracker]
+kind = "linear"
+team = "WEB"
+admit = { label = "agent" }
+admitters = ["u1"]
+states = { ready = "Todo", working = "Doing", needs_input = "Asked", review = "Review" }
+
+[stack]
+gate = ["cargo test"]
+
+[pipeline]
+default = "trivial"
+plan_approval = "never"
+
+[models]
+
+[policy]
+always_human = ["money"]
+ticket_budget_usd = 5.0
+"#;
+
+/// A host that only knows git: the repository root and its origin, which is
+/// all `Effective::load` asks.
+struct GitOnly {
+    root: PathBuf,
+    origin: String,
+}
+
+impl owlshift_runner::system::System for GitOnly {
+    fn locate(&self, program: &str) -> Option<PathBuf> {
+        (program == "git").then(|| PathBuf::from("/scripted/git"))
+    }
+
+    fn run(
+        &self,
+        _program: &Path,
+        args: &[&str],
+        _cwd: Option<&Path>,
+    ) -> Result<owlshift_runner::system::Captured, owlshift_runner::system::RunError> {
+        let say = |text: String| owlshift_runner::system::Captured {
+            code: Some(0),
+            stdout: text.into_bytes(),
+            stderr: Vec::new(),
+        };
+        match args {
+            ["rev-parse", "--show-toplevel"] => Ok(say(format!("{}\n", self.root.display()))),
+            ["remote", "get-url", "origin"] => {
+                Ok(say(format!("git@github.com:{}.git\n", self.origin)))
+            }
+            other => panic!("unscripted git {other:?}"),
+        }
+    }
+}
+
+fn keep(ground: &Ground, repo: &str, text: &str, refused: Option<&str>) {
+    use owlshift_contracts::service::{KeptFile, RefusedFile, ServedConfig};
+    let dirs = ProjectDirs::new(ground.data(), &Repo::parse(repo).unwrap());
+    std::fs::create_dir_all(dirs.root()).unwrap();
+    let mut record = ServedConfig::new(repo);
+    record.kept = Some(KeptFile {
+        branch: "main".to_owned(),
+        commit: "b".repeat(40),
+        text: text.to_owned(),
+        since: ts("2026-11-01T00:00:00Z"),
+    });
+    record.refused = refused.map(|reason| RefusedFile {
+        commit: Some("c".repeat(40)),
+        reason: reason.to_owned(),
+        since: ts("2026-11-04T00:00:00Z"),
+    });
+    std::fs::write(owlshift_runner::served::record_file(&dirs), record.render()).unwrap();
+}
+
+fn lines_of(value: &Value) -> Vec<String> {
+    value
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|line| line.as_str().unwrap().to_owned())
+        .collect()
+}
+
+#[test]
+fn a_served_projects_config_is_what_config_show_prints_in_its_checkout() {
+    let ground = Ground::new();
+    ground.serve(&["acme/web"]);
+    keep(
+        &ground,
+        "acme/web",
+        PROJECT,
+        Some("requires a newer Owlshift"),
+    );
+    let answer = ground.json("/api/config");
+    let project = &answer["projects"][0];
+    assert_eq!(project["repository"], "acme/web");
+    assert_eq!(project["record"]["kept"]["branch"], "main");
+    assert_eq!(project["record"]["kept"]["commit"], "b".repeat(40));
+    assert_eq!(
+        project["record"]["refused"]["reason"],
+        "requires a newer Owlshift"
+    );
+    assert!(
+        project["record"]["kept"]["name"]
+            .as_str()
+            .unwrap()
+            .contains("owlshift.toml at origin/main")
+    );
+
+    // The reference: `owlshift config show` run in a checkout holding the same
+    // file as its owlshift.toml.
+    let checkout = ProjectDirs::new(ground.data(), &Repo::parse("acme/web").unwrap()).checkout();
+    std::fs::create_dir_all(&checkout).unwrap();
+    std::fs::write(checkout.join("owlshift.toml"), PROJECT).unwrap();
+    let host = GitOnly {
+        root: checkout.clone(),
+        origin: "acme/web".to_owned(),
+    };
+    let effective = owlshift_runner::config::Effective::load(
+        &host,
+        &checkout,
+        Some(PathBuf::from("/nowhere/owlshift.toml")),
+    );
+    let want: Vec<String> = effective.to_string().lines().map(str::to_owned).collect();
+    assert_eq!(lines_of(&project["config"]["lines"]), want);
+    // The origin of each value is the checkout's file, and the budget and the
+    // always-human addition come with theirs.
+    let text = want.join("\n");
+    let label = checkout.join("owlshift.toml").display().to_string();
+    assert!(
+        text.contains(&format!("ticket_budget_usd = 5.0  ({label})")),
+        "{text}"
+    );
+    assert!(text.contains(&format!("money  ({label})")), "{text}");
+    assert_eq!(project["refusal"], Value::Null);
+    // The machine's report is the personal file's.
+    assert!(
+        answer["machine"]["personal_file"]
+            .as_str()
+            .unwrap()
+            .contains("not found at")
+    );
+}
+
+#[test]
+fn a_kept_file_no_longer_accepted_shows_the_refusal_and_an_invalid_personal_file_its_error() {
+    let ground = Ground::new();
+    ground.serve(&["acme/web", "acme/new"]);
+    keep(&ground, "acme/web", "not toml [", None);
+    let answer = ground.json("/api/config");
+    let web = &answer["projects"][0];
+    assert_eq!(web["config"], Value::Null);
+    assert!(
+        web["refusal"]
+            .as_str()
+            .unwrap()
+            .contains("is not accepted any more")
+    );
+    // Older than the first file read: nothing kept yet.
+    let new = &answer["projects"][1];
+    assert!(new["refusal"].as_str().unwrap().contains("is not served"));
+    assert_eq!(new["record"]["kept"], Value::Null);
+
+    let file = ground.data().join("personal.toml");
+    std::fs::write(&file, "concurrent_runs = \"many\"\n").unwrap();
+    *ground.personal.lock().unwrap() = FileState::Loaded {
+        path: file,
+        config: PersonalConfig::parse("").unwrap(),
+        entries: Vec::new(),
+    };
+    let answer = ground.json("/api/config");
+    assert!(
+        answer["machine"]["personal_file"]
+            .as_str()
+            .unwrap()
+            .contains("is invalid")
+    );
+}
+
+#[test]
+fn configs_rev_is_the_answers_and_changes_with_the_record_and_the_personal_file() {
+    let ground = Ground::new();
+    ground.serve(&["acme/web"]);
+    keep(&ground, "acme/web", PROJECT, None);
+    let first = ground.json("/api/config");
+    let rev = first["rev"].as_str().unwrap().to_owned();
+    let same = ground.json(&format!("/api/config?rev={rev}"));
+    assert_eq!(same["unchanged"], true);
+    // served.json rewritten.
+    keep(
+        &ground,
+        "acme/web",
+        PROJECT,
+        Some("a newer file is refused"),
+    );
+    let rewritten = ground.json(&format!("/api/config?rev={rev}"));
+    assert!(rewritten.get("unchanged").is_none());
+    let rev = rewritten["rev"].as_str().unwrap().to_owned();
+    // The personal file edited.
+    let file = ground.data().join("personal.toml");
+    std::fs::write(&file, "concurrent_runs = 3\n").unwrap();
+    *ground.personal.lock().unwrap() = FileState::Loaded {
+        path: file,
+        config: PersonalConfig::parse("").unwrap(),
+        entries: Vec::new(),
+    };
+    let edited = ground.json(&format!("/api/config?rev={rev}"));
+    assert!(edited.get("unchanged").is_none());
+    assert!(
+        edited["machine"]["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|entry| entry["key"] == "concurrent_runs")
+    );
+}
+
+#[test]
+fn config_needs_a_session() {
+    let ground = Ground::new();
+    assert_eq!(
+        send(ground.ui.port(), "GET", "/api/config", None, "").status,
+        401
+    );
+}

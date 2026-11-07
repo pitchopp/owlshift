@@ -40,10 +40,12 @@
 //!   offset ([`super::orchestrator`]), read from the event log's index
 //!   ([`super::index`]).
 //!
-//! - `GET /api/spend[?days=7|30|90|all][&project=owner/repo][&rev=<hash>]` and
+//! - `GET /api/config[?rev=<hash>]`, `GET /api/spend[?days=7|30|90|all]
+//!   [&project=owner/repo][&rev=<hash>]` and
 //!   `POST /api/doctor` (OWL-472), under the session as well: the cost per
 //!   day, ticket, role and harness against the budgets and usage caps
-//!   ([`super::spend`]), and `owlshift doctor`'s checks run on demand.
+//!   ([`super::spend`]), the effective configuration ([`super::configuration`])
+//!   and `owlshift doctor`'s checks run on demand.
 //!
 //! Every response, errors included, carries [`SECURITY_HEADERS`], and none
 //! a CORS header or a cookie. JSON goes out through [`json_text`], which
@@ -86,7 +88,10 @@ use tiny_http::{Header as HttpHeader, Method, Request, Response, Server, StatusC
 use super::auth::{self, CHALLENGE_LEN, RunSecret, UsedCodes};
 use super::eventtail::EventTail;
 use super::index::EventIndex;
-use super::{events, header, orchestrator, overview, record, runlog, spend, tail, ticket, token};
+use super::{
+    configuration, events, header, orchestrator, overview, record, runlog, spend, tail, ticket,
+    token,
+};
 use crate::config::FileState;
 use crate::project::ProjectDirs;
 use crate::served::Registry;
@@ -623,6 +628,13 @@ fn handle(context: &Arc<Context>, mut request: Request) {
                 doctor_page(context, &body)
             }
         }
+        (Method::Get, "/api/config") => {
+            if !in_session(context, &request) {
+                error_response(401, "not logged in: run `owlshift ui` in a terminal")
+            } else {
+                config_page(context, &url)
+            }
+        }
         (Method::Get, "/api/spend") => {
             if !in_session(context, &request) {
                 error_response(401, "not logged in: run `owlshift ui` in a terminal")
@@ -688,6 +700,20 @@ fn doctor_page(context: &Context, body: &[u8]) -> Response<Cursor<Vec<u8>>> {
     ) {
         Ok(value) => json_response(200, &value),
         Err(why) => error_response(503, &why),
+    }
+}
+
+/// `GET /api/config[?rev=<hash>]` (OWL-472): the effective configuration with
+/// each value's file ([`configuration`]).
+fn config_page(context: &Context, url: &str) -> Response<Cursor<Vec<u8>>> {
+    let pairs = match query_of(url) {
+        Ok(pairs) => pairs,
+        Err(why) => return error_response(400, why),
+    };
+    let personal = (context.options.personal)();
+    match configuration::answer(&context.data, &personal, param(&pairs, "rev")) {
+        Ok(value) => json_response(200, &value),
+        Err(why) => error_response(503, &format!("the served projects cannot be read: {why}")),
     }
 }
 

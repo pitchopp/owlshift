@@ -31,6 +31,7 @@ use owlshift_contracts::config::{DEFAULT_UI_PORT, PersonalConfig};
 use crate::config::FileState;
 
 pub mod auth;
+pub mod configuration;
 pub mod events;
 pub mod eventtail;
 pub mod header;
