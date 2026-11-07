@@ -34,7 +34,6 @@ use crate::follow::{self, MergeRefused, Switch};
 use crate::merge;
 use crate::on_demand::PIPELINE;
 use crate::project::{self, ProjectLock, TicketLock};
-use crate::proposals;
 use crate::ticket_ref::{self, ProposalsFile, RefAt, Stored, TicketRecord};
 use crate::usage as machine_usage;
 use crate::writer::{WriteError, Writer};
@@ -166,11 +165,6 @@ impl Watch<'_> {
         let Some(pushed) = delivery.pushed.as_deref() else {
             return;
         };
-        let owed = merge::Owed::of(
-            delivery,
-            current.proposals.as_ref(),
-            proposals::has_inbox(on_demand.tracker),
-        );
         let mut facts = MergeFacts {
             decision: &seen.decision,
             pushed,
@@ -190,7 +184,7 @@ impl Watch<'_> {
             // own read (`FOLLOW_QUERY`, whose text fixtures recorded live
             // pin) does not say it.
             draft: false,
-            something_due: owed.any(),
+            something_due: merge::owes_first(delivery),
         };
         let read = core_read(seen);
         let mut due = core::merge_due(&policy, &facts, &read);
@@ -229,7 +223,7 @@ impl Watch<'_> {
                         .map(|(question, _)| question);
                     let waits = (pushed.as_str(), &blocker, key, question);
                     self.waits_for_person(memory, sink, out, ticket, pr, waits);
-                } else if let Some(wait) = merge::blocker_wait(&blocker, &owed) {
+                } else if let Some(wait) = merge::blocker_wait(&blocker) {
                     self.tell_wait(memory, sink, out, ticket, pr, &pushed, wait);
                 }
                 return;
@@ -278,7 +272,7 @@ impl Watch<'_> {
             MergeDue::Wait(blocker) => {
                 let pushed = pushed.to_owned();
                 drop(locked);
-                if let Some(wait) = merge::blocker_wait(&blocker, &owed) {
+                if let Some(wait) = merge::blocker_wait(&blocker) {
                     self.tell_wait(memory, sink, out, ticket, pr, &pushed, wait);
                 }
                 return;

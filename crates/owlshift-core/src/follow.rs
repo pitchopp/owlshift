@@ -432,7 +432,8 @@ pub struct MergeFacts<'a> {
     pub draft: bool,
     /// Whether anything the same pass reads first is due or running: the
     /// DELIVERY report the ref owes, a correction, a review loop, a decider
-    /// reply, a human review comment.
+    /// reply, a human review comment. Never a follow-up the ticket owes on
+    /// the tracker (OWL-501), which is filed after the merge if need be.
     pub something_due: bool,
 }
 
