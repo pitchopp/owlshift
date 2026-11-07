@@ -1410,6 +1410,10 @@ const RUN: &str = "20261105T100000Z";
 
 impl Ground {
     fn new() -> Self {
+        Self::with_options(options())
+    }
+
+    fn with_options(options: Options) -> Self {
         let data = tempfile::tempdir().unwrap();
         let repo = Repo::parse("o/r").unwrap();
         let checkout = data.path().join("checkout-of-o-r");
@@ -1417,7 +1421,7 @@ impl Ground {
         Registry::in_data_dir(data.path())
             .register(&repo, &checkout)
             .unwrap();
-        let ui = serve(data.path(), RunSecret::new().unwrap());
+        let ui = serve_with(data.path(), RunSecret::new().unwrap(), options);
         let session = session(ui.port(), data.path());
         Self { data, ui, session }
     }
@@ -1952,6 +1956,38 @@ impl Ground {
         owlshift_runner::ready::write(&dirs, &snapshot).unwrap();
     }
 
+    /// Writes the ticket ref of `ticket` in the checkout of `o/r`, made a
+    /// repository on the first call, with the ticket at Build (in flight, so
+    /// it has a card whether or not `ready.json` lists it).
+    fn building(&self, ticket: &str) {
+        use owlshift_contracts::refs::PersistedState;
+        use owlshift_core::state::{Status, TicketState};
+        use owlshift_core::vocab::Stage;
+        use owlshift_runner::ticket_ref::{self, TicketRecord};
+        // Where the status reader looks for the ticket refs of `o/r`.
+        let checkout = ProjectDirs::new(self.data.path(), &self.repo()).checkout();
+        std::fs::create_dir_all(&checkout).unwrap();
+        let git = owlshift_runner::project::runner_git();
+        if !checkout.join(".git").exists() {
+            let init = std::process::Command::new("git")
+                .args(["init", "-q"])
+                .current_dir(&checkout)
+                .output()
+                .unwrap();
+            assert!(init.status.success(), "{init:?}");
+        }
+        let ticket = TicketId::new(ticket).unwrap();
+        let state = TicketState::restore(Status::Active(Stage::Build), 0, 0, 0, 0, 0).unwrap();
+        let record = TicketRecord {
+            state: PersistedState::from(&state),
+            ..ticket_ref::blank(None)
+        };
+        let previous = ticket_ref::read(&git, &checkout, &ticket)
+            .unwrap()
+            .map(|stored| stored.commit);
+        ticket_ref::write(&git, &checkout, &ticket, &record, previous.as_deref()).unwrap();
+    }
+
     /// Appends an event of the project `o/r` that happened at `at`.
     fn event_at(&self, at: Timestamp, ticket: &str, kind: EventKind) {
         let event = Event {
@@ -2084,14 +2120,61 @@ fn a_stream_writes_the_overview_again_when_a_ref_a_pause_ready_json_or_an_event_
     let third = next_with(&mut stream, "overview");
     assert_eq!(third["overview"]["projects"][0]["paused"]["why"], "lunch");
 
+    // A new ticket ref shows as a card in its stage's column.
+    ground.building("OWL-7");
+    let fourth = loop {
+        let line = next_with(&mut stream, "overview");
+        if card_tickets(&line["overview"], "build").contains(&"OWL-7".to_owned()) {
+            break line;
+        }
+    };
+    assert_eq!(
+        card_tickets(&fourth["overview"], "build"),
+        ["OWL-7"],
+        "{fourth}"
+    );
+
     // A new event that changes no ref, no ready.json and no wait still
     // moves the line: its highlights counter goes up.
     ground.event_at(Timestamp::now(), "OWL-1", EventKind::PrMerged);
-    let fourth = next_with(&mut stream, "overview");
+    let fifth = next_with(&mut stream, "overview");
     assert!(
-        fourth["overview"]["highlights"].as_u64().unwrap() > highlights,
-        "{fourth}"
+        fifth["overview"]["highlights"].as_u64().unwrap() > highlights,
+        "{fifth}"
     );
+}
+
+/// A stream that starts after the last one closed, with the overview kept
+/// from before changed meanwhile, gets the new one (F1): the line it writes
+/// first and the generation it has seen are read together.
+#[test]
+fn a_stream_that_starts_after_another_closed_gets_the_overview_as_it_is_now() {
+    let ground = Ground::with_options(Options {
+        keepalive: Duration::from_millis(50),
+        ..options()
+    });
+    ground.ready(&[("OWL-1", "First")], Timestamp::now());
+    let mut first = ground.stream();
+    assert_eq!(
+        card_tickets(
+            &next_with(&mut first, "overview")["overview"],
+            "not_started"
+        ),
+        ["OWL-1"]
+    );
+    drop(first);
+    // The server notices the closed stream at its next keepalive, and the
+    // refresher goes once no stream is left.
+    thread::sleep(Duration::from_millis(500));
+    ground.ready(&[("OWL-1", "First"), ("OWL-9", "Ninth")], Timestamp::now());
+    let mut second = ground.stream();
+    for _ in 0..40 {
+        let line = next_with(&mut second, "overview");
+        if card_tickets(&line["overview"], "not_started") == ["OWL-1", "OWL-9"] {
+            return;
+        }
+    }
+    panic!("the new stream never got OWL-9");
 }
 
 #[test]

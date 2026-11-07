@@ -1028,20 +1028,28 @@ fn refresh(context: &Arc<Context>) {
     }
 }
 
-/// The overview line a stream that starts writes: the refresher's latest,
-/// or one built now when it has none yet (which it then shares).
-fn first_overview(context: &Context) -> String {
-    if let Some(line) = context.hub.lock().overview.clone() {
-        return line;
+/// The overview line a stream that starts writes, with the generation it
+/// was read at, taken together under one lock: the refresher's latest, or
+/// one built now when it has none yet (which it then shares). Reading the
+/// generation apart would mark a newer line as already written.
+fn first_overview(context: &Context) -> (String, u64) {
+    {
+        let state = context.hub.lock();
+        if let Some(line) = state.overview.clone() {
+            return (line, state.overview_generation);
+        }
     }
     let line = overview_line(&overview_now(context));
     let mut state = context.hub.lock();
-    if state.overview.is_none() {
-        state.overview = Some(line.clone());
-        state.overview_generation += 1;
-        context.hub.changed.notify_all();
+    if let Some(shared) = state.overview.clone() {
+        return (shared, state.overview_generation);
     }
-    line
+    state.overview = Some(line.clone());
+    state.overview_generation += 1;
+    let generation = state.overview_generation;
+    drop(state);
+    context.hub.changed.notify_all();
+    (line, generation)
 }
 
 /// Writes `line` as one chunk of a chunked body, and flushes it.
@@ -1087,9 +1095,8 @@ fn write_stream(
     let mut written = json_text(&json!({ "header": header_now(context).json() }));
     chunk(writer, &written)?;
     let mut seen = context.hub.lock().generation;
-    let mut written_overview = first_overview(context);
+    let (mut written_overview, mut seen_overview) = first_overview(context);
     chunk(writer, &written_overview)?;
-    let mut seen_overview = context.hub.lock().overview_generation;
     let mut kept = Instant::now();
     let mut checked = Instant::now();
     loop {
