@@ -1,0 +1,11 @@
++-o IOPMrootDomain  <class IOPMrootDomain, id 0x100000381, registered, matched, active, busy 0 (1944 ms), retain 231>
+  | {
+  |   "Wake Type" = "UserActivity Assertion"
+  |   "IOPMUserTriggeredFullWake" = Yes
+  |   "IOPreviewBuffer" = ({"address"=0,"length"=23855104})
+  |   "IOHibernateState" = <00000000>
+  |   "IOPowerManagement" = {"ChildrenPowerState"=0,"DevicePowerState"=4,"CurrentPowerState"=4,"CapabilityFlags"=2,"MaxPowerState"=4}
+  |   "Standby Enabled" = Yes
+  |   "IOPMSystemSleepType" = 7
+  |   "IOAppPowerStateInterest" = "IOCommand is not serializable"
+  |   "System Capabilities" = 9

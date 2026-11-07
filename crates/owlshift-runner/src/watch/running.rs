@@ -119,9 +119,11 @@ impl Watch<'_> {
             return Some(StepEnd::Busy);
         }
         // An operator's pause (OWL-438), one written since the pass began
-        // included: no step starts, nothing of it is made or held, and the
-        // next pass after the pause is lifted decides it again.
-        if self.operator_paused(memory, sink, out) {
+        // included, or a dark wake (OWL-485), read again here, one begun
+        // since the pass began included: no step starts, nothing of it is
+        // made or held, and the next pass after the pause is lifted or the
+        // full wake decides it again.
+        if self.held_back(memory, sink, out, true) {
             return Some(StepEnd::Busy);
         }
         // A base check due runs alone (OWL-418): no other step starts, nor

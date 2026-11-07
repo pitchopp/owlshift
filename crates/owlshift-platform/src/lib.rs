@@ -13,3 +13,4 @@ pub mod service;
 pub mod terminal;
 #[cfg(all(test, unix))]
 mod test_proc;
+pub mod wake;

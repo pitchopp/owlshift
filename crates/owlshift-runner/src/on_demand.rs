@@ -535,6 +535,10 @@ pub struct OnDemand<'a> {
     /// asked ended, which says whether its session's resume is cold
     /// ([`resume::decide`]).
     pub clock: &'a dyn Fn() -> Timestamp,
+    /// Whether this machine is in a dark wake, which holds the dispatches
+    /// and the steps' starts of a watch (OWL-485,
+    /// [`owlshift_platform::wake::read`] outside tests).
+    pub wake: &'a dyn Fn() -> owlshift_platform::wake::Wake,
     /// Tells the operator of a quarantine as its marker is written, and
     /// watch's of one it finds ([`quarantine`], OWL-368); `None` when this
     /// machine shows no notification. Every other notification is the

@@ -255,3 +255,36 @@ fn a_refusal_is_replied_once_and_a_failed_write_is_tried_again() {
     assert!(replied[0].contains("declares no gate"), "{}", replied[0]);
     assert!(matches!(state_of(&bench).status(), Status::Parked { .. }));
 }
+
+/// OWL-485: the decider's `continue` on a parked ticket restarts nothing in
+/// a dark wake: no run, no restart, no stage move; the first pass after the
+/// full wake restarts it as usual.
+#[test]
+fn a_dark_wake_restarts_no_parked_ticket_until_the_full_wake() {
+    let bench = parked_at_build();
+    let (briefs, events, comments) = (
+        bench.briefs().len(),
+        bench.events().len(),
+        bench.comments().len(),
+    );
+    bench.answer("continue");
+    // The decider's own comment is the one the count takes in.
+    let comments = comments + 1;
+    bench.wake.set(Wake::Dark);
+    for pass in 1..=3 {
+        one_pass(&bench, Vec::new());
+        assert_eq!(bench.briefs().len(), briefs, "a run started in pass {pass}");
+        assert!(restarts(&bench, events).is_empty(), "restarted: {pass}");
+        assert!(matches!(state_of(&bench).status(), Status::Parked { .. }));
+        assert_eq!(bench.comments().len(), comments, "told in pass {pass}");
+        assert_eq!(
+            settled(&bench).map(|kept| kept.settled),
+            None,
+            "settled in pass {pass}"
+        );
+    }
+    bench.wake.set(Wake::Full);
+    one_pass(&bench, vec![bench.reply(None, Some(BLOCKED))]);
+    assert_eq!(restarts(&bench, events).len(), 1);
+    assert_eq!(bench.briefs().len(), briefs + 1, "the Build ran");
+}

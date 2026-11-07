@@ -338,8 +338,9 @@ impl Watch<'_> {
     ) {
         let on_demand = self.on_demand;
         // An operator's pause, one written during the pass included
-        // (OWL-438): nothing is taken in or dispatched, nor read for it.
-        if self.operator_paused(memory, sink, out) {
+        // (OWL-438), or a dark wake (OWL-485): nothing is taken in or
+        // dispatched, nor read for it.
+        if self.held_back(memory, sink, out, false) {
             return;
         }
         // Read again: watch's work may have ended a following or closed a

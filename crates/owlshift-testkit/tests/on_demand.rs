@@ -45,6 +45,7 @@ use owlshift_core::routing::RunRouting;
 use owlshift_core::state::{ParkReason, Status, TicketState};
 use owlshift_core::vocab::Harness as HarnessKind;
 use owlshift_core::vocab::{Effort, Tier};
+use owlshift_platform::wake::Wake;
 use owlshift_runner::agent_env::AgentEnv;
 use owlshift_runner::events::{Data, EventLog, EventSink};
 use owlshift_runner::executor::harness::ClaudeHarness;
@@ -1044,6 +1045,14 @@ struct Bench {
     /// The tracker gives no answer to a comment read while it is set
     /// (OWL-480): shared, so a run can cut the network.
     offline: Rc<Cell<bool>>,
+    /// What the machine's probe reads (OWL-485): `Full` unless a test sets
+    /// it, read at each call of the watch's probe.
+    wake: Rc<Cell<Wake>>,
+    /// Readings the probe gives one by one before it goes back to `wake`:
+    /// the last one is kept (OWL-485).
+    wake_script: RefCell<VecDeque<Wake>>,
+    /// How many times the watch's probe was called (OWL-485).
+    wake_reads: Cell<u32>,
     /// What happens once, right after the tracker's next stage read.
     after_stage_read: RefCell<Option<Box<dyn FnOnce()>>>,
     /// How many stage reads the tracker answered (OWL-340).
@@ -1287,6 +1296,9 @@ impl Bench {
             refuse_mention: Cell::new(false),
             fail_reads: Cell::new(0),
             offline: Rc::default(),
+            wake: Rc::new(Cell::new(Wake::Full)),
+            wake_script: RefCell::default(),
+            wake_reads: Cell::new(0),
             after_stage_read: RefCell::new(None),
             stage_reads: Cell::new(0),
             waited: Cell::new(SignedDuration::from_mins(10)),
@@ -1325,6 +1337,18 @@ impl Bench {
             reply.result = Some(path);
         }
         reply
+    }
+
+    /// The machine's probe the watch reads (OWL-485): the next scripted
+    /// reading, the last one kept, or else `wake`'s; every call counted.
+    fn probe(&self) -> Wake {
+        self.wake_reads.set(self.wake_reads.get() + 1);
+        let mut script = self.wake_script.borrow_mut();
+        match script.len() {
+            0 => self.wake.get(),
+            1 => script[0],
+            _ => script.pop_front().unwrap(),
+        }
     }
 
     fn dirs(&self) -> ProjectDirs {
@@ -1794,6 +1818,7 @@ impl Bench {
         let dirs = self.dirs();
         let remote_url = self.remote.bare.to_string_lossy().into_owned();
         let now = || self.clock.get().checked_add(self.waited.get()).unwrap();
+        let probe = || self.probe();
         let usage = self.usage_store();
         let on_demand = OnDemand {
             executor: &executor,
@@ -1816,6 +1841,7 @@ impl Bench {
             dirs: &dirs,
             head_wait: Duration::ZERO,
             clock: &now,
+            wake: &probe,
             notifier: Some(&self.notified),
             usage: &usage,
             web_tools: self.web_tools.get(),
@@ -3178,6 +3204,7 @@ fn a_do_whose_agent_cannot_run_is_refused_before_anything() {
         dirs: &dirs,
         head_wait: Duration::ZERO,
         clock: &on_demand::system_clock,
+        wake: &|| Wake::Full,
         notifier: None,
         usage: &UsageStore::in_data_dir(&bench.data),
         web_tools: true,
@@ -3262,6 +3289,7 @@ fn a_git_older_than_the_floor_is_refused_before_the_lock_and_the_tracker() {
         dirs: &dirs,
         head_wait: Duration::ZERO,
         clock: &on_demand::system_clock,
+        wake: &|| Wake::Full,
         notifier: None,
         usage: &UsageStore::in_data_dir(&bench.data),
         web_tools: true,
