@@ -311,6 +311,30 @@ fn of_project(project: &ProjectWaits, ready: Option<&ReadyInput>) -> ProjectGrap
                     ready_fields(node, ticket);
                 }
             }
+            // A ticket in flight that left the ready column has no entry in
+            // `ready.json`, so its blockers cannot be drawn: say so, or it
+            // reads as blocked by nothing.
+            let unknown: Vec<&str> = project
+                .tickets
+                .iter()
+                .filter(|row| {
+                    !snapshot.tickets.iter().any(|ticket| {
+                        ticket
+                            .ticket
+                            .as_str()
+                            .eq_ignore_ascii_case(row.ticket.as_str())
+                    })
+                })
+                .map(|row| row.ticket.as_str())
+                .collect();
+            if !unknown.is_empty() {
+                let it = if unknown.len() == 1 { "it" } else { "them" };
+                notes.push(format!(
+                    "{}: the blockers of {} are not known (the ready column no longer lists {it}), so the blockers layer draws {it} with no edge",
+                    project.repository,
+                    unknown.join(", "),
+                ));
+            }
             (
                 Some(blockers_layer(project, snapshot)),
                 Some(ReadyInfo {
@@ -1123,12 +1147,52 @@ mod tests {
     }
 
     #[test]
+    fn a_ticket_in_flight_that_left_the_ready_column_is_told_to_have_unknown_blockers() {
+        let waiting = waits(vec![
+            ticket("DEMO-1", None),
+            ticket("DEMO-2", None),
+            ticket("DEMO-3", None),
+        ]);
+        // DEMO-1 is listed (in any case), DEMO-2 and DEMO-3 are not.
+        let graph = with(
+            &waiting,
+            read(vec![ready_ticket("demo-1", vec![], Outcome::TakenIn)]),
+        );
+        assert_eq!(graph.notes.len(), 1, "{:?}", graph.notes);
+        assert!(
+            graph.notes[0].starts_with("o/r: the blockers of DEMO-2, DEMO-3 are not known"),
+            "{}",
+            graph.notes[0]
+        );
+        let layer = graph.blockers.unwrap();
+        assert!(layer.nodes.iter().any(|node| node.id == "DEMO-2"));
+        assert!(layer.edges.is_empty());
+        // One ticket is worded in the singular.
+        let one = with(
+            &waits(vec![ticket("DEMO-2", None)]),
+            read(vec![ready_ticket("DEMO-1", vec![], Outcome::TakenIn)]),
+        );
+        assert!(one.notes[0].contains("blockers of DEMO-2 are not known"));
+        assert!(one.notes[0].ends_with("draws it with no edge"));
+        // Every ticket listed: nothing to say.
+        let all = with(
+            &waiting,
+            read(vec![
+                ready_ticket("DEMO-1", vec![], Outcome::TakenIn),
+                ready_ticket("DEMO-2", vec![], Outcome::TakenIn),
+                ready_ticket("DEMO-3", vec![], Outcome::TakenIn),
+            ]),
+        );
+        assert!(all.notes.is_empty());
+    }
+
+    #[test]
     fn the_snapshots_age_is_told_and_a_missing_or_unread_one_leaves_no_layer() {
         let waiting = waits(vec![ticket("DEMO-1", None)]);
         let stale = with(
             &waiting,
             ReadyInput::Read {
-                snapshot: snapshot(vec![]),
+                snapshot: snapshot(vec![ready_ticket("DEMO-1", vec![], Outcome::TakenIn)]),
                 stale: true,
             },
         );
