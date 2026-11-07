@@ -40,6 +40,11 @@
 //!   offset ([`super::orchestrator`]), read from the event log's index
 //!   ([`super::index`]).
 //!
+//! - `GET /api/spend[?days=7|30|90|all][&project=owner/repo][&rev=<hash>]` and
+//!   `POST /api/doctor` (OWL-472), under the session as well: the cost per
+//!   day, ticket, role and harness against the budgets and usage caps
+//!   ([`super::spend`]), and `owlshift doctor`'s checks run on demand.
+//!
 //! Every response, errors included, carries [`SECURITY_HEADERS`], and none
 //! a CORS header or a cookie. JSON goes out through [`json_text`], which
 //! writes `<`, `>`, `&`, U+2028 and U+2029 as `\u` escapes, so no text an
@@ -81,7 +86,7 @@ use tiny_http::{Header as HttpHeader, Method, Request, Response, Server, StatusC
 use super::auth::{self, CHALLENGE_LEN, RunSecret, UsedCodes};
 use super::eventtail::EventTail;
 use super::index::EventIndex;
-use super::{events, header, orchestrator, overview, record, runlog, tail, ticket, token};
+use super::{events, header, orchestrator, overview, record, runlog, spend, tail, ticket, token};
 use crate::config::FileState;
 use crate::project::ProjectDirs;
 use crate::served::Registry;
@@ -251,6 +256,8 @@ struct Context {
     build: Option<BuildIdentity>,
     /// Held while a doctor run is under way: one at a time.
     doctor: Mutex<()>,
+    /// What the Spend screen keeps between two requests.
+    spend: spend::Cache,
 }
 
 /// A serving web UI. Dropping it stops taking requests.
@@ -370,6 +377,7 @@ pub fn start(
         index: Mutex::new(EventIndex::new(data)),
         build,
         doctor: Mutex::new(()),
+        spend: spend::Cache::default(),
     });
     let stopping = Arc::new(AtomicBool::new(false));
     let accept = {
@@ -615,6 +623,13 @@ fn handle(context: &Arc<Context>, mut request: Request) {
                 doctor_page(context, &body)
             }
         }
+        (Method::Get, "/api/spend") => {
+            if !in_session(context, &request) {
+                error_response(401, "not logged in: run `owlshift ui` in a terminal")
+            } else {
+                spend_page(context, &url)
+            }
+        }
         (Method::Get, "/api/orchestrator") => {
             if !in_session(context, &request) {
                 error_response(401, "not logged in: run `owlshift ui` in a terminal")
@@ -674,6 +689,44 @@ fn doctor_page(context: &Context, body: &[u8]) -> Response<Cursor<Vec<u8>>> {
         Ok(value) => json_response(200, &value),
         Err(why) => error_response(503, &why),
     }
+}
+
+/// `GET /api/spend[?days=7|30|90|all][&project=owner/repo][&rev=<hash>]`
+/// (OWL-472): what the runs cost ([`spend`]), the last 30 days by default.
+fn spend_page(context: &Context, url: &str) -> Response<Cursor<Vec<u8>>> {
+    let pairs = match query_of(url) {
+        Ok(pairs) => pairs,
+        Err(why) => return error_response(400, why),
+    };
+    let period = match param(&pairs, "days") {
+        None => spend::Period::Days(spend::DEFAULT_DAYS),
+        Some(text) => match spend::Period::parse(text) {
+            Some(period) => period,
+            None => return error_response(400, "days is 7, 30, 90 or all"),
+        },
+    };
+    let project = match param(&pairs, "project") {
+        None | Some("") => None,
+        Some(text) => match Repo::parse(text) {
+            Ok(repo) => Some(repo.to_string()),
+            Err(_) => return error_response(400, "the project is not owner/name"),
+        },
+    };
+    let query = spend::Query {
+        period,
+        project,
+        rev: param(&pairs, "rev").map(str::to_owned),
+    };
+    let personal = (context.options.personal)();
+    let inputs = spend::Inputs {
+        data: &context.data,
+        index: &context.index,
+        personal: &personal,
+        cache: &context.spend,
+        now: Timestamp::now(),
+        tz: jiff::tz::TimeZone::system(),
+    };
+    json_response(200, &spend::answer(&inputs, &query))
 }
 
 /// A whole number query value, `None` when the key is absent, `Err` when it

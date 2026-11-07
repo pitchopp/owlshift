@@ -148,10 +148,15 @@ pub fn report(inputs: &Inputs<'_>, index: &EventIndex) -> Report {
 /// The usage windows of every harness: each window's share, reset, the
 /// moment it was read, and whether it holds the harness under the usage
 /// cap; the standing the harness has in `owlshift status` beside them.
-fn usage(inputs: &Inputs<'_>, report: &Report) -> Vec<Value> {
-    let caps = machine_usage::caps_of(inputs.personal);
-    let store = UsageStore::in_data_dir(inputs.data).with_caps(caps.iter().copied());
-    let now_ms = machine_usage::ms(inputs.now);
+pub fn usage_windows(
+    data: &Path,
+    personal: &FileState<PersonalConfig>,
+    now: Timestamp,
+    report: Option<&Report>,
+) -> Vec<Value> {
+    let caps = machine_usage::caps_of(personal);
+    let store = UsageStore::in_data_dir(data).with_caps(caps.iter().copied());
+    let now_ms = machine_usage::ms(now);
     [Harness::Claude, Harness::Codex]
         .into_iter()
         .map(|harness| {
@@ -178,10 +183,14 @@ fn usage(inputs: &Inputs<'_>, report: &Report) -> Vec<Value> {
                 Err(_) => Vec::new(),
             };
             let standing = report
-                .usage
-                .iter()
-                .find(|(other, _)| *other == harness)
-                .map(|(_, usage)| match usage {
+                .and_then(|report| {
+                    report
+                        .usage
+                        .iter()
+                        .find(|(other, _)| *other == harness)
+                        .map(|(_, usage)| usage)
+                })
+                .map(|usage| match usage {
                     HarnessUsage::Limited(until) => {
                         json!({ "state": "limited", "until": until.map(time) })
                     }
@@ -372,7 +381,7 @@ pub fn answer(inputs: &Inputs<'_>, cursors: Cursors) -> Value {
         "machine_pause": head["machine_pause"],
         "projects": head["projects"],
         "notes": head["notes"],
-        "usage": usage(inputs, &report),
+        "usage": usage_windows(inputs.data, inputs.personal, inputs.now, Some(&report)),
         "events": {
             "entries": entries,
             "reset": feed.reset,

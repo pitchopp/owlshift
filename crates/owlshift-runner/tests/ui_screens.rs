@@ -639,3 +639,291 @@ fn a_query_that_is_not_a_number_is_refused() {
     assert_eq!(ground.get("/api/orchestrator?after=x&gen=1").status, 400);
     assert_eq!(ground.get("/api/orchestrator?log=-1").status, 400);
 }
+
+// ---- Spend (OWL-472) ----
+
+/// An event line as the runner writes it, at `at`.
+fn event_line(
+    at: &str,
+    ticket: Option<&str>,
+    run: Option<&str>,
+    kind: &str,
+    data: Value,
+) -> String {
+    let mut value = json!({
+        "format": 2,
+        "at": at,
+        "project": "acme/web",
+        "kind": kind,
+        "data": data,
+    });
+    if let Some(ticket) = ticket {
+        value["ticket"] = json!(ticket);
+    }
+    if let Some(run) = run {
+        value["run"] = json!(run);
+    }
+    format!("{value}\n")
+}
+
+fn started(at: &str, ticket: &str, run: &str, role: &str, harness: Option<&str>) -> String {
+    let mut data = json!({ "role": role });
+    if let Some(harness) = harness {
+        data["harness"] = json!(harness);
+    }
+    event_line(at, Some(ticket), Some(run), "run_started", data)
+}
+
+fn used(at: &str, ticket: &str, run: &str, cost: f64) -> String {
+    event_line(
+        at,
+        Some(ticket),
+        Some(run),
+        "usage",
+        json!({ "cost_usd": cost, "input_tokens": 100, "output_tokens": 10 }),
+    )
+}
+
+fn days_ago(days: i64) -> String {
+    Timestamp::now()
+        .checked_sub(jiff::SignedDuration::from_hours(24 * days))
+        .unwrap()
+        .to_string()
+}
+
+fn sum(buckets: &Value, key: &str) -> std::collections::BTreeMap<String, u64> {
+    buckets
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|b| {
+            (
+                b[key].as_str().unwrap().to_owned(),
+                b["micros"].as_u64().unwrap(),
+            )
+        })
+        .collect()
+}
+
+#[test]
+fn spend_counts_the_last_30_days_by_default_and_the_period_selects_more_or_less() {
+    let ground = Ground::new();
+    ground.append_log(&started(
+        &days_ago(40),
+        "OWL-1",
+        "old",
+        "build",
+        Some("claude"),
+    ));
+    ground.append_log(&used(&days_ago(40), "OWL-1", "old", 4.0));
+    ground.append_log(&started(
+        &days_ago(20),
+        "OWL-1",
+        "mid",
+        "build",
+        Some("claude"),
+    ));
+    ground.append_log(&used(&days_ago(20), "OWL-1", "mid", 2.0));
+    ground.append_log(&started(
+        &days_ago(1),
+        "OWL-1",
+        "new",
+        "verify",
+        Some("codex"),
+    ));
+    ground.append_log(&used(&days_ago(1), "OWL-1", "new", 1.0));
+    let total = |path: &str| {
+        ground.json(path)["events"]["total_micros"]
+            .as_u64()
+            .unwrap()
+    };
+    // No period: the last 30 days, which leave the 40-day-old event out.
+    assert_eq!(total("/api/spend"), 3_000_000);
+    assert_eq!(total("/api/spend?days=30"), 3_000_000);
+    // 7 days leave out the 20-day-old one, all keeps every one.
+    assert_eq!(total("/api/spend?days=7"), 1_000_000);
+    assert_eq!(total("/api/spend?days=90"), 7_000_000);
+    assert_eq!(total("/api/spend?days=all"), 7_000_000);
+    assert_eq!(ground.get("/api/spend?days=12").status, 400);
+    assert_eq!(ground.get("/api/spend?project=nope").status, 400);
+    // Filtered to another project: nothing.
+    assert_eq!(total("/api/spend?project=acme%2Fother"), 0);
+}
+
+#[test]
+fn spend_splits_by_role_harness_ticket_and_keeps_runs_with_the_same_id_apart() {
+    let ground = Ground::new();
+    // Two tickets whose runs share a run id; one run has no harness recorded;
+    // one usage event has no run_started at all.
+    ground.append_log(&started(
+        &days_ago(1),
+        "OWL-1",
+        "r1",
+        "build",
+        Some("claude"),
+    ));
+    ground.append_log(&started(&days_ago(1), "OWL-2", "r1", "verify", None));
+    ground.append_log(&used(&days_ago(1), "OWL-1", "r1", 1.5));
+    ground.append_log(&used(&days_ago(1), "OWL-2", "r1", 0.5));
+    ground.append_log(&used(&days_ago(1), "OWL-3", "r9", 0.25));
+    let answer = ground.json("/api/spend");
+    let roles = sum(&answer["roles"], "role");
+    assert_eq!(roles["build"], 1_500_000);
+    assert_eq!(roles["verify"], 500_000);
+    assert_eq!(roles["unknown"], 250_000);
+    let harnesses = sum(&answer["harnesses"], "harness");
+    assert_eq!(harnesses["claude"], 1_500_000);
+    assert_eq!(harnesses["unrecorded"], 750_000);
+    let tickets: Vec<(String, u64)> = answer["tickets"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|t| {
+            (
+                t["ticket"].as_str().unwrap().to_owned(),
+                t["events_micros"].as_u64().unwrap(),
+            )
+        })
+        .collect();
+    assert!(tickets.contains(&("OWL-1".to_owned(), 1_500_000)));
+    assert!(tickets.contains(&("OWL-2".to_owned(), 500_000)));
+    // The events' total and cost.json's are separate fields.
+    assert!(answer["tickets"][0].get("cost").is_some());
+    assert_eq!(answer["events"]["total_micros"], 2_250_000);
+}
+
+#[test]
+fn spend_buckets_by_the_local_day_across_midnight() {
+    use owlshift_runner::ui::index::EventIndex;
+    use owlshift_runner::ui::spend::{self, Cache, Query};
+    let data = tempfile::tempdir().unwrap();
+    let log = EventLog::in_dir(data.path()).path().to_owned();
+    // UTC+2: 21:59 UTC is 23:59 local, 22:01 UTC is 00:01 local the next day.
+    std::fs::write(
+        &log,
+        [
+            started(
+                "2026-11-05T21:00:00Z",
+                "OWL-1",
+                "r1",
+                "build",
+                Some("claude"),
+            ),
+            used("2026-11-05T21:59:00Z", "OWL-1", "r1", 1.0),
+            used("2026-11-05T22:01:00Z", "OWL-1", "r1", 2.0),
+        ]
+        .concat(),
+    )
+    .unwrap();
+    let index = std::sync::Mutex::new(EventIndex::new(data.path()));
+    let cache = Cache::default();
+    let personal = absent();
+    let inputs = spend::Inputs {
+        data: data.path(),
+        index: &index,
+        personal: &personal,
+        cache: &cache,
+        now: ts("2026-11-06T10:00:00Z"),
+        tz: TimeZone::fixed(jiff::tz::offset(2)),
+    };
+    let answer = spend::answer(&inputs, &Query::default());
+    assert_eq!(
+        sum(&answer["days"], "day"),
+        [
+            ("2026-11-05".to_owned(), 1_000_000),
+            ("2026-11-06".to_owned(), 2_000_000)
+        ]
+        .into_iter()
+        .collect()
+    );
+}
+
+#[test]
+fn spends_rev_changes_with_everything_the_answer_shows_and_with_nothing_else() {
+    use owlshift_runner::ui::index::EventIndex;
+    use owlshift_runner::ui::spend::{self, Cache, Query};
+    let data = tempfile::tempdir().unwrap();
+    let log = EventLog::in_dir(data.path()).path().to_owned();
+    let write_log = |extra: &str| {
+        let mut text = started(
+            "2026-11-05T09:00:00Z",
+            "OWL-1",
+            "r1",
+            "build",
+            Some("claude"),
+        );
+        text.push_str(&used("2026-11-05T09:30:00Z", "OWL-1", "r1", 1.0));
+        text.push_str(extra);
+        std::fs::write(&log, text).unwrap();
+    };
+    write_log("");
+    let resets = ts("2026-11-05T12:00:00Z");
+    UsageStore::in_data_dir(data.path())
+        .update(Harness::Claude, |state| {
+            state.windows.insert(
+                "five_hour".to_owned(),
+                Window {
+                    share: 0.5,
+                    resets_at_ms: resets.as_millisecond(),
+                    read_at_ms: ts("2026-11-05T09:30:00Z").as_millisecond(),
+                },
+            );
+        })
+        .unwrap();
+    let personal_file = data.path().join("personal.toml");
+    let index = std::sync::Mutex::new(EventIndex::new(data.path()));
+    let cache = Cache::default();
+    let ask = |now: &str, rev: Option<&str>, personal: &FileState<PersonalConfig>| {
+        let inputs = spend::Inputs {
+            data: data.path(),
+            index: &index,
+            personal,
+            cache: &cache,
+            now: ts(now),
+            tz: TimeZone::UTC,
+        };
+        spend::answer(
+            &inputs,
+            &Query {
+                rev: rev.map(str::to_owned),
+                ..Query::default()
+            },
+        )
+    };
+    let none = absent();
+    let first = ask("2026-11-05T10:00:00Z", None, &none);
+    let rev = first["rev"].as_str().unwrap().to_owned();
+    // The same question, the same rev: nothing to redraw.
+    let same = ask("2026-11-05T10:00:10Z", Some(&rev), &none);
+    assert_eq!(same["unchanged"], true);
+    // A usage cap changed in the personal file, no event appended.
+    std::fs::write(
+        &personal_file,
+        "[harnesses.claude]\nusage_cap_percent = 40\n",
+    )
+    .unwrap();
+    let capped = owlshift_runner::ui::personal_at(&personal_file);
+    let changed = ask("2026-11-05T10:00:10Z", Some(&rev), &capped);
+    assert_ne!(changed["rev"], rev.as_str());
+    assert!(changed.get("unchanged").is_none());
+    let rev_capped = changed["rev"].as_str().unwrap().to_owned();
+    // A window that resets, its time passing with no file changed.
+    let reset = ask("2026-11-05T13:00:00Z", Some(&rev_capped), &capped);
+    assert!(reset.get("unchanged").is_none());
+    // The local day passing with no file changed.
+    let next_day = ask("2026-11-06T10:00:00Z", Some(&rev_capped), &capped);
+    assert!(next_day.get("unchanged").is_none());
+    // An appended usage event.
+    let before = ask("2026-11-05T10:00:00Z", None, &capped);
+    write_log(&used("2026-11-05T09:45:00Z", "OWL-1", "r1", 0.5));
+    let after = ask("2026-11-05T10:00:00Z", before["rev"].as_str(), &capped);
+    assert!(after.get("unchanged").is_none());
+    assert_eq!(after["events"]["total_micros"], 1_500_000);
+}
+
+#[test]
+fn spend_needs_a_session() {
+    let ground = Ground::new();
+    let none = send(ground.ui.port(), "GET", "/api/spend", None, "");
+    assert_eq!(none.status, 401);
+}

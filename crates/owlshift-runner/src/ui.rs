@@ -41,6 +41,7 @@ pub mod probe;
 pub mod record;
 pub mod runlog;
 pub mod server;
+pub mod spend;
 pub mod tail;
 pub mod ticket;
 pub mod token;
