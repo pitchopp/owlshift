@@ -379,7 +379,7 @@ fn the_overview_matches_status_waits_and_ready_json_pass_by_pass() {
             at: Stage::DesignReview,
             awaiting_input: false,
         },
-        asked,
+        asked.clone(),
     );
     let built = watched.build(&bench);
     let _ = matches_status(&bench, &built, &waits_doc(&bench), &report);
@@ -388,5 +388,65 @@ fn the_overview_matches_status_waits_and_ready_json_pass_by_pass() {
     assert_eq!(for_you_counts(&built), (0, 0, 1));
     // The parked ticket is first in the list.
     assert_eq!(built.projects[0].list[0].as_str(), "DEMO-1");
+
+    // A ticket at Intake waiting for an answer, which `ready.json` does not
+    // list and which holds nothing: `status --waits` leaves it out, For you
+    // still lists it as a question, with no card, and counts it as the
+    // header does.
+    let other = TicketId::new("DEMO-7").unwrap();
+    let mut waiting = asked;
+    waiting.questions.asks[0].questions[0].category = "scope".to_owned();
+    let state = TicketState::restore(
+        Status::NeedsInput {
+            return_to: Stage::Intake,
+        },
+        1,
+        0,
+        0,
+        0,
+        0,
+    )
+    .unwrap();
+    waiting.state = PersistedState::from(&state);
+    write_record_of(&bench, &other, &waiting);
+    let listed =
+        ready_now(&bench).is_some_and(|ready| ready.tickets.iter().any(|t| t.ticket == other));
+    assert!(!listed, "ready.json does not list DEMO-7");
+    let built = watched.build(&bench);
+    let doc = waits_doc(&bench);
+    assert!(
+        doc.projects[0]
+            .tickets
+            .iter()
+            .all(|row| row.ticket != other),
+        "status --waits leaves DEMO-7 out: {doc:#?}"
+    );
+    let _ = matches_status(&bench, &built, &doc, &report);
+    assert!(
+        built.projects[0]
+            .cards
+            .iter()
+            .all(|card| card.ticket != other),
+        "DEMO-7 has no card"
+    );
+    let entry = built
+        .for_you
+        .questions
+        .iter()
+        .find(|entry| entry.ticket == other)
+        .unwrap_or_else(|| panic!("DEMO-7 is in For you: {:#?}", built.for_you));
+    assert!(!entry.card);
+    assert_eq!(for_you_counts(&built), header_counts(&bench));
+    assert_eq!(for_you_counts(&built), (1, 0, 1));
     assert_eq!(watched.tail.restarts(), 0);
+}
+
+/// Writes `ticket`'s ref the way a person's command does, under its lock.
+fn write_record_of(bench: &Bench, ticket: &TicketId, record: &TicketRecord) {
+    let env = bench.env.clone();
+    let git = Git::with_setup("git", move |command| env.apply(command));
+    let previous = ticket_ref::read(&git, &bench.dirs().checkout(), ticket)
+        .unwrap()
+        .map(|stored| stored.commit);
+    write_through_run_file(&git, &bench.dirs(), ticket, record, previous.as_deref());
 }
