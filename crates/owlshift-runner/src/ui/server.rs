@@ -657,6 +657,17 @@ fn handle(context: &Arc<Context>, mut request: Request) {
     let _ = request.respond(response);
 }
 
+/// The guard of `lock` when no run holds it. A run that panicked poisoned it
+/// and holds nothing any more: it counts as free, so that one panic does not
+/// answer 409 until the UI restarts.
+fn try_lock_free(lock: &Mutex<()>) -> Option<std::sync::MutexGuard<'_, ()>> {
+    match lock.try_lock() {
+        Ok(guard) => Some(guard),
+        Err(std::sync::TryLockError::Poisoned(poisoned)) => Some(poisoned.into_inner()),
+        Err(std::sync::TryLockError::WouldBlock) => None,
+    }
+}
+
 /// `POST /api/doctor` `{"project": "owner/name"}` or `{}` (OWL-472):
 /// `owlshift doctor`'s checks, run on demand, once for the project named, once
 /// per served project when it names none, or once on the personal file alone
@@ -690,7 +701,7 @@ fn doctor_page(context: &Context, body: &[u8]) -> Response<Cursor<Vec<u8>>> {
         },
         Some(Err(())) => return error_response(400, "the project is a text"),
     };
-    let Ok(_running) = context.doctor.try_lock() else {
+    let Some(_running) = try_lock_free(&context.doctor) else {
         return error_response(409, "a run of the checks is under way: wait for it");
     };
     let personal = (context.options.personal)();
@@ -1384,6 +1395,25 @@ fn write_stream(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_doctor_lock_poisoned_by_a_panic_is_free_and_a_held_one_is_not() {
+        let lock = Mutex::new(());
+        {
+            let held = try_lock_free(&lock).expect("free at first");
+            assert!(try_lock_free(&lock).is_none(), "held by a run");
+            drop(held);
+        }
+        let shared = Arc::new(lock);
+        let panicking = shared.clone();
+        let _ = thread::spawn(move || {
+            let _guard = panicking.lock().unwrap();
+            panic!("a doctor run that panics");
+        })
+        .join();
+        assert!(shared.is_poisoned());
+        assert!(try_lock_free(&shared).is_some(), "a poisoned lock is free");
+    }
 
     #[test]
     fn a_loopback_host_passes_with_any_port() {
