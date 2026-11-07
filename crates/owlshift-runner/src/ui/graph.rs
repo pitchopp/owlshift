@@ -26,7 +26,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 use jiff::Timestamp;
-use owlshift_contracts::ready::ReadySnapshot;
+use owlshift_contracts::ready::{BlockerState, Outcome, ReadySnapshot};
 use owlshift_contracts::waits::{
     Behind, HeldRun, Paused, ProjectWaits, RefStatus, RunSlots, StatusWaits, TicketWaits,
     WaitResource,
@@ -297,8 +297,44 @@ pub fn of(waits: &StatusWaits, ready: &BTreeMap<String, ReadyInput>) -> Graph {
     }
 }
 
-fn of_project(project: &ProjectWaits, _ready: Option<&ReadyInput>) -> ProjectGraph {
-    let (live, queue) = live_layer(project);
+fn of_project(project: &ProjectWaits, ready: Option<&ReadyInput>) -> ProjectGraph {
+    let (mut live, queue) = live_layer(project);
+    let mut notes = Vec::new();
+    let (blockers, info) = match ready {
+        Some(ReadyInput::Read { snapshot, stale }) => {
+            for node in &mut live.nodes {
+                if let Some(ticket) = snapshot
+                    .tickets
+                    .iter()
+                    .find(|ticket| ticket.ticket.as_str().eq_ignore_ascii_case(&node.id))
+                {
+                    ready_fields(node, ticket);
+                }
+            }
+            (
+                Some(blockers_layer(project, snapshot)),
+                Some(ReadyInfo {
+                    at: snapshot.at,
+                    interval_ms: snapshot.interval_ms,
+                    stale: *stale,
+                }),
+            )
+        }
+        Some(ReadyInput::Unread(why)) => {
+            notes.push(format!(
+                "{}: its ready snapshot cannot be read: {why}",
+                project.repository
+            ));
+            (None, None)
+        }
+        Some(ReadyInput::Missing) | None => {
+            notes.push(format!(
+                "{}: the drain has written no ready snapshot yet, so the blockers are not drawn",
+                project.repository
+            ));
+            (None, None)
+        }
+    };
     ProjectGraph {
         repository: project.repository.clone(),
         served: project.served,
@@ -308,10 +344,100 @@ fn of_project(project: &ProjectWaits, _ready: Option<&ReadyInput>) -> ProjectGra
         quarantined: project.quarantined,
         live,
         queue,
-        blockers: None,
-        ready: None,
-        notes: Vec::new(),
+        blockers,
+        ready: info,
+        notes,
     }
+}
+
+/// What the ready snapshot says of a ticket, put on its node.
+fn ready_fields(node: &mut Node, ticket: &owlshift_contracts::ready::ReadyTicket) {
+    node.title = Some(ticket.title.clone());
+    node.priority = Some(ticket.priority);
+    let (drain, reason) = match &ticket.drain {
+        Outcome::TakenIn => ("taken_in", None),
+        Outcome::Running => ("running", None),
+        Outcome::Dispatched => ("dispatched", None),
+        Outcome::Waits { wait } => ("waits", Some(wait.reason.clone())),
+        Outcome::NotAdmitted { wait } => ("not_admitted", Some(wait.reason.clone())),
+    };
+    node.drain = Some(drain);
+    node.drain_reason = reason;
+}
+
+/// How a blocker's state is worded on an edge and a ghost.
+fn blocker_word(state: BlockerState) -> &'static str {
+    match state {
+        BlockerState::Open => "open",
+        BlockerState::Completed => "completed",
+        BlockerState::Canceled => "canceled",
+        BlockerState::Unknown => "unknown",
+    }
+}
+
+/// The tracker's blockers: a node for each ticket of the ready column and
+/// each ticket of the waits, an edge from a ticket to each blocker that still
+/// holds it (not `completed`, not recorded merged), and a dashed ghost for a
+/// blocker that is neither. An identifier is compared in any ASCII case.
+fn blockers_layer(project: &ProjectWaits, snapshot: &ReadySnapshot) -> Layer {
+    let rows: HashMap<String, &TicketWaits> = project
+        .tickets
+        .iter()
+        .map(|row| (row.ticket.as_str().to_ascii_lowercase(), row))
+        .collect();
+    let mut nodes: Vec<Node> = Vec::new();
+    let mut index: HashMap<String, usize> = HashMap::new();
+    for ticket in &snapshot.tickets {
+        let key = ticket.ticket.as_str().to_ascii_lowercase();
+        if index.contains_key(&key) {
+            continue;
+        }
+        let mut node = match rows.get(&key) {
+            Some(row) => ticket_node(row),
+            None => blank(ticket.ticket.as_str().to_owned(), "ticket", "ready"),
+        };
+        ready_fields(&mut node, ticket);
+        index.insert(key, nodes.len());
+        nodes.push(node);
+    }
+    for row in &project.tickets {
+        let key = row.ticket.as_str().to_ascii_lowercase();
+        if let std::collections::hash_map::Entry::Vacant(slot) = index.entry(key) {
+            slot.insert(nodes.len());
+            nodes.push(ticket_node(row));
+        }
+    }
+    let mut edges: Vec<Edge> = Vec::new();
+    let mut drawn: HashSet<(usize, usize)> = HashSet::new();
+    for ticket in &snapshot.tickets {
+        let Some(&from) = index.get(&ticket.ticket.as_str().to_ascii_lowercase()) else {
+            continue;
+        };
+        for blocker in &ticket.blockers {
+            if blocker.state == BlockerState::Completed || blocker.merged {
+                continue;
+            }
+            let word = blocker_word(blocker.state);
+            let to = *index
+                .entry(blocker.ticket.to_ascii_lowercase())
+                .or_insert_with(|| {
+                    let mut ghost = blank(blocker.ticket.clone(), "ticket", "ghost");
+                    ghost.blocker_state = Some(word);
+                    nodes.push(ghost);
+                    nodes.len() - 1
+                });
+            if drawn.insert((from, to)) {
+                edges.push(Edge {
+                    from: nodes[from].id.clone(),
+                    to: nodes[to].id.clone(),
+                    label: word.to_owned(),
+                    text: format!("{} is held by {}: {word}", nodes[from].id, nodes[to].id),
+                });
+            }
+        }
+    }
+    layout(&mut nodes, &edges);
+    Layer { nodes, edges }
 }
 
 /// Whether a wait for `reason` is a place in a queue, not an edge.
@@ -499,6 +625,7 @@ pub fn layout(nodes: &mut [Node], edges: &[Edge]) {
 mod tests {
     use owlshift_contracts::format::Format;
     use owlshift_contracts::ids::TicketId;
+    use owlshift_contracts::ready::{ReadyBlocker, ReadyTicket};
     use owlshift_contracts::waits::Wait;
 
     use super::*;
@@ -832,5 +959,196 @@ mod tests {
         }
         assert!(value["nodes"][0]["text"].is_null());
         assert!(value["nodes"][0]["run"].is_null());
+    }
+
+    fn blocker(name: &str, state: BlockerState, merged: bool) -> ReadyBlocker {
+        ReadyBlocker {
+            ticket: name.to_owned(),
+            state,
+            merged,
+        }
+    }
+
+    fn ready_ticket(name: &str, blockers: Vec<ReadyBlocker>, drain: Outcome) -> ReadyTicket {
+        ReadyTicket {
+            ticket: id(name),
+            title: format!("{name} title"),
+            priority: Priority::High,
+            blockers,
+            drain,
+        }
+    }
+
+    fn snapshot(tickets: Vec<ReadyTicket>) -> ReadySnapshot {
+        ReadySnapshot {
+            format: Format,
+            at: "2026-11-07T09:59:00Z".parse().unwrap(),
+            interval_ms: 60_000,
+            tickets,
+        }
+    }
+
+    /// The project graph of `waits` over `snapshot`, read or not.
+    fn with(waits: &StatusWaits, input: ReadyInput) -> ProjectGraph {
+        let ready = BTreeMap::from([("o/r".to_owned(), input)]);
+        of(waits, &ready).projects.into_iter().next().unwrap()
+    }
+
+    fn read(tickets: Vec<ReadyTicket>) -> ReadyInput {
+        ReadyInput::Read {
+            snapshot: snapshot(tickets),
+            stale: false,
+        }
+    }
+
+    fn edge_set(layer: &Layer) -> Vec<(&str, &str, &str)> {
+        layer
+            .edges
+            .iter()
+            .map(|e| (e.from.as_str(), e.to.as_str(), e.label.as_str()))
+            .collect()
+    }
+
+    #[test]
+    fn a_blocker_that_is_a_node_gets_an_edge_and_one_outside_a_dashed_ghost() {
+        let waiting = waits(vec![
+            ticket("DEMO-1", None),
+            ticket("DEMO-2", Some(wait("blocked_by", vec![behind("DEMO-1")]))),
+        ]);
+        let graph = with(
+            &waiting,
+            read(vec![
+                ready_ticket(
+                    "DEMO-2",
+                    vec![
+                        blocker("DEMO-1", BlockerState::Open, false),
+                        blocker("DEMO-7", BlockerState::Open, false),
+                        blocker("DEMO-8", BlockerState::Canceled, false),
+                        blocker("DEMO-9", BlockerState::Unknown, false),
+                    ],
+                    Outcome::TakenIn,
+                ),
+                ready_ticket("DEMO-5", vec![], Outcome::Dispatched),
+            ]),
+        );
+        let layer = graph.blockers.unwrap();
+        assert_eq!(
+            edge_set(&layer),
+            [
+                ("DEMO-2", "DEMO-1", "open"),
+                ("DEMO-2", "DEMO-7", "open"),
+                ("DEMO-2", "DEMO-8", "canceled"),
+                ("DEMO-2", "DEMO-9", "unknown"),
+            ]
+        );
+        for (name, state) in [
+            ("DEMO-7", "open"),
+            ("DEMO-8", "canceled"),
+            ("DEMO-9", "unknown"),
+        ] {
+            let ghost = node(&layer, name);
+            assert_eq!(ghost.state, "ghost");
+            assert_eq!(ghost.blocker_state, Some(state));
+            assert!(!ghost.in_flight);
+            assert!(BLOCKER_STATES.contains(&state));
+        }
+        // A ready ticket in the waits has its live state, one that is only
+        // in the column is `ready`, and both say what the drain made of
+        // them.
+        assert_eq!(node(&layer, "DEMO-2").state, "ticket");
+        assert_eq!(
+            node(&layer, "DEMO-2").title.as_deref(),
+            Some("DEMO-2 title")
+        );
+        assert_eq!(node(&layer, "DEMO-5").state, "ready");
+        assert_eq!(node(&layer, "DEMO-5").drain, Some("dispatched"));
+        // The live layer carries the titles too.
+        assert_eq!(
+            node(&graph.live, "DEMO-2").title.as_deref(),
+            Some("DEMO-2 title")
+        );
+        assert_eq!(node(&graph.live, "DEMO-1").title, None);
+        assert_eq!(layer.nodes.len(), 6);
+        for node in &layer.nodes {
+            assert!(NODE_STATES.contains(&node.state), "{}", node.state);
+        }
+    }
+
+    #[test]
+    fn a_completed_or_merged_blocker_has_no_node_and_no_edge() {
+        let graph = with(
+            &waits(vec![]),
+            read(vec![ready_ticket(
+                "DEMO-2",
+                vec![
+                    blocker("DEMO-1", BlockerState::Completed, false),
+                    blocker("DEMO-3", BlockerState::Open, true),
+                ],
+                Outcome::TakenIn,
+            )]),
+        );
+        let layer = graph.blockers.unwrap();
+        assert!(layer.edges.is_empty());
+        assert_eq!(layer.nodes.len(), 1);
+    }
+
+    #[test]
+    fn a_blocker_is_found_in_any_case_and_a_text_that_is_no_id_is_a_ghost() {
+        let graph = with(
+            &waits(vec![ticket("DEMO-1", None)]),
+            read(vec![ready_ticket(
+                "DEMO-2",
+                vec![
+                    blocker("demo-1", BlockerState::Open, false),
+                    blocker("see the design doc", BlockerState::Open, false),
+                    blocker("SEE THE DESIGN DOC", BlockerState::Open, false),
+                ],
+                Outcome::TakenIn,
+            )]),
+        );
+        let layer = graph.blockers.unwrap();
+        assert_eq!(
+            edge_set(&layer),
+            [
+                ("DEMO-2", "DEMO-1", "open"),
+                ("DEMO-2", "see the design doc", "open"),
+            ]
+        );
+        assert_eq!(layer.nodes.len(), 3);
+        assert_eq!(node(&layer, "see the design doc").state, "ghost");
+        // Two chains: the layout reads the blockers' edges as the live
+        // layer's.
+        assert_eq!(node(&layer, "DEMO-2").layer, 1);
+        assert_eq!(node(&layer, "DEMO-1").layer, 0);
+    }
+
+    #[test]
+    fn the_snapshots_age_is_told_and_a_missing_or_unread_one_leaves_no_layer() {
+        let waiting = waits(vec![ticket("DEMO-1", None)]);
+        let stale = with(
+            &waiting,
+            ReadyInput::Read {
+                snapshot: snapshot(vec![]),
+                stale: true,
+            },
+        );
+        let info = stale.ready.unwrap();
+        assert!(info.stale);
+        assert_eq!(info.interval_ms, 60_000);
+        assert!(stale.blockers.is_some() && stale.notes.is_empty());
+
+        let missing = with(&waiting, ReadyInput::Missing);
+        assert!(missing.blockers.is_none() && missing.ready.is_none());
+        assert_eq!(missing.notes.len(), 1);
+        assert!(missing.notes[0].starts_with("o/r: the drain has written no ready snapshot"));
+        let unread = with(&waiting, ReadyInput::Unread("bad json".to_owned()));
+        assert!(unread.blockers.is_none());
+        assert_eq!(
+            unread.notes,
+            ["o/r: its ready snapshot cannot be read: bad json"]
+        );
+        // No entry at all reads as missing.
+        let none = of(&waiting, &BTreeMap::new());
+        assert!(none.projects[0].blockers.is_none());
     }
 }
