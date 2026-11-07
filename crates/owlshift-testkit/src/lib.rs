@@ -13,6 +13,8 @@
 //!   runs roles through the executor and plays the writer until it exists.
 //! - [`step_child`]: a project whose steps run in a real child process, and
 //!   `owlshift-step-child`, the child (OWL-399).
+//! - [`system`]: a host that reaches nothing of the machine, for `owlshift
+//!   doctor` on the bench (OWL-472).
 //! - [`wait`]: how a test waits for a state, as long as load could make it
 //!   take (OWL-493).
 //!
@@ -26,4 +28,5 @@ pub mod harness;
 pub mod reply;
 pub mod scenario;
 pub mod step_child;
+pub mod system;
 pub mod wait;

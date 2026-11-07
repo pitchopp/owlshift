@@ -86,6 +86,7 @@ use crate::config::FileState;
 use crate::project::ProjectDirs;
 use crate::served::Registry;
 use crate::status;
+use crate::system::{HostSystem, System};
 
 /// The page's frame.
 pub const INDEX_HTML: &str = include_str!("assets/index.html");
@@ -153,6 +154,10 @@ pub struct Options {
     /// header, so a change to `concurrent_runs` or a cap shows without a
     /// restart: [`super::personal_now`] in production.
     pub personal: Arc<dyn Fn() -> FileState<PersonalConfig> + Send + Sync>,
+    /// The host `owlshift doctor`'s checks probe when the Orchestrator runs
+    /// them on demand (OWL-472): [`HostSystem`] in production; the bench
+    /// passes a scripted one that reaches nothing of the machine.
+    pub system: Arc<dyn System + Send + Sync>,
 }
 
 impl Default for Options {
@@ -167,6 +172,7 @@ impl Default for Options {
             keepalive: Duration::from_secs(15),
             streams: 16,
             personal: Arc::new(super::personal_now),
+            system: Arc::new(HostSystem),
         }
     }
 }
@@ -240,6 +246,11 @@ struct Context {
     /// The event log indexed for the Orchestrator and Spend screens
     /// (OWL-472): held while a request brings it up to date.
     index: Mutex<EventIndex>,
+    /// The build this server runs, which `doctor` compares the running
+    /// builds with; `None` answers the doctor route 503.
+    build: Option<BuildIdentity>,
+    /// Held while a doctor run is under way: one at a time.
+    doctor: Mutex<()>,
 }
 
 /// A serving web UI. Dropping it stops taking requests.
@@ -334,7 +345,7 @@ pub fn start(
         pid: std::process::id(),
         port: address.port(),
         since: Timestamp::now(),
-        build,
+        build: build.clone(),
     };
     record::write(data, &record).map_err(|error| {
         ServeError::Io(
@@ -357,6 +368,8 @@ pub fn start(
         tickets: ticket::Cache::new(ticket::WAITS_KEPT),
         tail: Mutex::new(EventTail::new(data)),
         index: Mutex::new(EventIndex::new(data)),
+        build,
+        doctor: Mutex::new(()),
     });
     let stopping = Arc::new(AtomicBool::new(false));
     let accept = {
@@ -595,6 +608,13 @@ fn handle(context: &Arc<Context>, mut request: Request) {
                 ticket_log(context, &url)
             }
         }
+        (Method::Post, "/api/doctor") => {
+            if !in_session(context, &request) {
+                error_response(401, "not logged in: run `owlshift ui` in a terminal")
+            } else {
+                doctor_page(context, &body)
+            }
+        }
         (Method::Get, "/api/orchestrator") => {
             if !in_session(context, &request) {
                 error_response(401, "not logged in: run `owlshift ui` in a terminal")
@@ -605,6 +625,55 @@ fn handle(context: &Arc<Context>, mut request: Request) {
         _ => error_response(404, "no such page"),
     };
     let _ = request.respond(response);
+}
+
+/// `POST /api/doctor` `{"project": "owner/name"}` or `{}` (OWL-472):
+/// `owlshift doctor`'s checks, run on demand, once for the project named, once
+/// per served project when it names none, or once on the personal file alone
+/// when none is served. One run at a time (409), and none without a build
+/// to compare (503). The handover of an older daemon, which the command line
+/// does before its report, is not here: the server only calls
+/// `doctor::run`.
+fn doctor_page(context: &Context, body: &[u8]) -> Response<Cursor<Vec<u8>>> {
+    let Some(build) = &context.build else {
+        return error_response(
+            503,
+            "this server knows no build to check the running ones against",
+        );
+    };
+    let asked = if body.iter().all(u8::is_ascii_whitespace) {
+        None
+    } else {
+        match serde_json::from_slice::<Value>(body) {
+            Ok(value) if value.is_object() => value
+                .get("project")
+                .map(|project| project.as_str().map(str::to_owned))
+                .map(|project| project.ok_or(())),
+            _ => return error_response(400, "the body is a JSON object"),
+        }
+    };
+    let project = match asked {
+        None => None,
+        Some(Ok(project)) => match Repo::parse(&project) {
+            Ok(repo) => Some(repo),
+            Err(_) => return error_response(400, "the project is not owner/name"),
+        },
+        Some(Err(())) => return error_response(400, "the project is a text"),
+    };
+    let Ok(_running) = context.doctor.try_lock() else {
+        return error_response(409, "a run of the checks is under way: wait for it");
+    };
+    let personal = (context.options.personal)();
+    match orchestrator::doctor(
+        &*context.options.system,
+        &context.data,
+        &personal,
+        build,
+        project.as_ref(),
+    ) {
+        Ok(value) => json_response(200, &value),
+        Err(why) => error_response(503, &why),
+    }
 }
 
 /// A whole number query value, `None` when the key is absent, `Err` when it

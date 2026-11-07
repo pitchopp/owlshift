@@ -255,7 +255,7 @@ impl Effective {
 
 /// The personal file at `personal`, `None` when the platform has no place
 /// for it.
-fn personal_state(personal: Option<PathBuf>) -> FileState<PersonalConfig> {
+pub(crate) fn personal_state(personal: Option<PathBuf>) -> FileState<PersonalConfig> {
     match personal {
         Some(path) => FileState::load(path, PersonalConfig::parse),
         None => FileState::NotApplicable("this system has no configuration directory".into()),

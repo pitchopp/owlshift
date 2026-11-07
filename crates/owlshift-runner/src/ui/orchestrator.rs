@@ -29,12 +29,14 @@
 
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use jiff::Timestamp;
 use jiff::tz::TimeZone;
+use owlshift_adapters::forge::Repo;
 use owlshift_contracts::config::PersonalConfig;
+use owlshift_contracts::service::BuildIdentity;
 use owlshift_core::usage::at_cap;
 use owlshift_core::vocab::Harness;
 use serde_json::{Value, json};
@@ -42,11 +44,14 @@ use serde_json::{Value, json};
 use super::header;
 use super::index::{EventIndex, Item};
 use super::tail::LineTail;
-use crate::config::FileState;
+use crate::config::{Effective, FileState};
 use crate::daemon::digest::HarnessUsage;
-use crate::events;
+use crate::project::ProjectDirs;
+use crate::served::{self, Registry};
 use crate::status::{self, Daemon, Part, Report, Watch};
+use crate::system::System;
 use crate::usage::{self as machine_usage, UsageStore};
+use crate::{doctor, events};
 
 /// How many feed entries a first answer, or a reset one, carries.
 pub const FIRST_ENTRIES: usize = 100;
@@ -379,4 +384,70 @@ pub fn answer(inputs: &Inputs<'_>, cursors: Cursors) -> Value {
         },
         "log": log_json(inputs.data, cursors.log),
     })
+}
+
+/// The path of the personal file a state is of, when it has one.
+pub fn path_of(personal: &FileState<PersonalConfig>) -> Option<PathBuf> {
+    match personal {
+        FileState::Loaded { path, .. }
+        | FileState::Invalid { path, .. }
+        | FileState::Absent(path) => Some(path.clone()),
+        FileState::NotApplicable(_) | FileState::Unavailable(_) => None,
+    }
+}
+
+/// `owlshift doctor`'s checks, run now (OWL-472): once per served project on
+/// the project file its `served.json` keeps, labelled in the project's
+/// checkout ([`served::in_checkout`]), as `owlshift doctor` run in that
+/// checkout would; `only` limits it to one project. With no project served,
+/// once on the personal file alone, the project file being not applicable. A
+/// project that is not served, or whose kept file is no longer accepted,
+/// answers why, in place of a report.
+///
+/// This calls `doctor::run` and nothing else: the handover of an older
+/// daemon, which the command does before its report, lives in the command.
+pub fn doctor(
+    system: &dyn System,
+    data: &Path,
+    personal: &FileState<PersonalConfig>,
+    build: &BuildIdentity,
+    only: Option<&Repo>,
+) -> Result<Value, String> {
+    let served = Registry::in_data_dir(data).read()?;
+    let personal_path = path_of(personal);
+    let mut repos: Vec<Repo> = served
+        .projects
+        .iter()
+        .filter_map(|entry| Repo::parse(&entry.repository).ok())
+        .collect();
+    if let Some(only) = only {
+        repos = vec![only.clone()];
+    }
+    let mut reports = Vec::new();
+    for repo in &repos {
+        let name = repo.to_string();
+        let dirs = ProjectDirs::new(data, repo);
+        let entry = match Registry::in_data_dir(data).find(repo) {
+            Ok(Some(_)) => served::in_checkout(repo, &dirs, personal_path.clone()),
+            Ok(None) => Err(served::not_served(repo, None)),
+            Err(why) => Err(why),
+        };
+        reports.push(match entry {
+            Ok(effective) => {
+                let report = doctor::run(system, &effective, build);
+                json!({ "project": name, "ready": report.ready(), "report": report.to_json() })
+            }
+            Err(why) => json!({ "project": name, "error": why }),
+        });
+    }
+    if reports.is_empty() {
+        let effective = Effective {
+            project: FileState::NotApplicable("no project is served".to_owned()),
+            personal: crate::config::personal_state(personal_path),
+        };
+        let report = doctor::run(system, &effective, build);
+        reports
+            .push(json!({ "project": null, "ready": report.ready(), "report": report.to_json() }));
+    }
+    Ok(json!({ "reports": reports }))
 }
