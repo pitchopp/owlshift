@@ -430,6 +430,50 @@ mod tests {
                 json!({ "service": "watch_ended", "end": "exit status 1", "asked": false,
                          "restart_in_ms": 60000, "in_a_row": 3 }),
             ),
+            // An unservable project, an ended one (asked to), a running one
+            // and one whose latest end came before the daemon started.
+            event(
+                "2026-11-05T08:02:00Z",
+                "acme/api",
+                None,
+                None,
+                "decision",
+                json!({ "service": "watch_ended", "end": "refused", "asked": false,
+                         "unservable": "owlshift.toml is not accepted" }),
+            ),
+            event(
+                "2026-11-05T08:03:00Z",
+                "acme/db",
+                None,
+                None,
+                "decision",
+                json!({ "service": "watch_started", "pid": 9 }),
+            ),
+            event(
+                "2026-11-05T08:40:00Z",
+                "acme/db",
+                None,
+                None,
+                "decision",
+                json!({ "service": "watch_ended", "end": "stopped", "asked": true }),
+            ),
+            event(
+                "2026-11-05T08:04:00Z",
+                "acme/ops",
+                None,
+                None,
+                "decision",
+                json!({ "service": "watch_started", "pid": 12 }),
+            ),
+            event(
+                "2026-11-05T07:00:00Z",
+                "acme/old",
+                None,
+                None,
+                "decision",
+                json!({ "service": "watch_ended", "end": "exit status 1", "asked": false,
+                         "restart_in_ms": 1000, "in_a_row": 1 }),
+            ),
         ];
         for event in &events {
             append(&path, &format!("{event}\n"));
@@ -437,12 +481,29 @@ mod tests {
         let mut index = EventIndex::at(&path);
         index.update().unwrap();
         let since: Timestamp = started.parse().unwrap();
-        let from_index: Vec<Event> = index.watch_event("acme/web").cloned().into_iter().collect();
         let all: Vec<Event> = events.iter().map(|e| Event::parse(e).unwrap()).collect();
-        let want = watch_state(&all, "acme/web", since);
-        assert!(matches!(want, Watch::Restarting { .. }));
-        assert_eq!(watch_state(&from_index, "acme/web", since), want);
-        assert!(index.watch_event("acme/api").is_none());
+        let mut seen = Vec::new();
+        for project in [
+            "acme/web",
+            "acme/api",
+            "acme/db",
+            "acme/ops",
+            "acme/old",
+            "acme/none",
+        ] {
+            let from_index: Vec<Event> = index.watch_event(project).cloned().into_iter().collect();
+            let want = watch_state(&all, project, since);
+            assert_eq!(watch_state(&from_index, project, since), want, "{project}");
+            seen.push(want);
+        }
+        assert!(matches!(seen[0], Watch::Restarting { .. }), "{seen:?}");
+        assert!(matches!(seen[1], Watch::Unservable { .. }), "{seen:?}");
+        assert!(matches!(seen[2], Watch::Ended { .. }), "{seen:?}");
+        assert!(matches!(seen[3], Watch::Running { .. }), "{seen:?}");
+        // An end before the daemon started, and a project with no event.
+        assert_eq!(seen[4], Watch::NotStarted);
+        assert_eq!(seen[5], Watch::NotStarted);
+        assert!(index.watch_event("acme/none").is_none());
     }
 
     #[test]
