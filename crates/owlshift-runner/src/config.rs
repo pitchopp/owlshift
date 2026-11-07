@@ -336,47 +336,115 @@ pub(crate) fn exit_text(code: Option<i32>) -> String {
 }
 
 impl<T> FileState<T> {
-    fn describe(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    fn described(&self) -> String {
         match self {
-            Self::NotApplicable(reason) => write!(f, "none ({reason})"),
-            Self::Unavailable(reason) => write!(f, "unknown: {reason}"),
-            Self::Absent(path) => write!(f, "not found at {}", path.display()),
-            Self::Loaded { path, .. } => write!(f, "{}", path.display()),
-            Self::Invalid { path, error } => write!(f, "{} is invalid: {error}", path.display()),
+            Self::NotApplicable(reason) => format!("none ({reason})"),
+            Self::Unavailable(reason) => format!("unknown: {reason}"),
+            Self::Absent(path) => format!("not found at {}", path.display()),
+            Self::Loaded { path, .. } => path.display().to_string(),
+            Self::Invalid { path, error } => format!("{} is invalid: {error}", path.display()),
         }
     }
 
-    fn write_entries(&self, f: &mut fmt::Formatter<'_>) -> Result<bool, fmt::Error> {
+    fn entries_of(&self) -> Vec<ConfigEntry> {
         let Self::Loaded { path, entries, .. } = self else {
-            return Ok(false);
+            return Vec::new();
         };
-        for (key, value) in entries {
-            writeln!(f, "{key} = {value}  ({})", path.display())?;
-        }
-        Ok(!entries.is_empty())
+        entries
+            .iter()
+            .map(|(key, value)| ConfigEntry {
+                key: key.clone(),
+                value: value.clone(),
+                file: path.display().to_string(),
+            })
+            .collect()
     }
 }
 
 /// `owlshift config show`: where each file is, then every value and its file.
 impl fmt::Display for Effective {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str("project file:  ")?;
-        self.project.describe(f)?;
-        f.write_str("\npersonal file: ")?;
-        self.personal.describe(f)?;
-        f.write_str("\n\n")?;
-        let project = self.project.write_entries(f)?;
-        let personal = self.personal.write_entries(f)?;
-        if !project && !personal {
-            f.write_str("No configuration value is set.\n")?;
+        self.report().fmt(f)
+    }
+}
+
+/// One value a configuration file sets, with the file it comes from.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ConfigEntry {
+    pub key: String,
+    pub value: String,
+    pub file: String,
+}
+
+/// What `owlshift config show` prints, as data (OWL-472): the web UI's
+/// Config screen shows these very lines, and [`fmt::Display`] writes them, so
+/// the two cannot drift.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ConfigReport {
+    /// Where the project file is, or why it is not (the text after
+    /// `project file:  `).
+    pub project_file: String,
+    /// The same for the personal file.
+    pub personal_file: String,
+    /// The project file's entries, then the personal file's.
+    pub entries: Vec<ConfigEntry>,
+    /// The always-human section: its heading, then one line per category.
+    pub always_human: Vec<String>,
+    /// The resolver section: its heading, then its three settings.
+    pub resolver: Vec<String>,
+    /// The budget section: its heading, then the setting.
+    pub budget: Vec<String>,
+}
+
+impl ConfigReport {
+    /// The lines `owlshift config show` prints, in order, blank ones
+    /// included.
+    pub fn lines(&self) -> Vec<String> {
+        let mut lines = vec![
+            format!("project file:  {}", self.project_file),
+            format!("personal file: {}", self.personal_file),
+            String::new(),
+        ];
+        if self.entries.is_empty() {
+            lines.push("No configuration value is set.".to_owned());
         }
-        self.write_always_human(f)?;
-        self.write_resolver(f)?;
-        self.write_budget(f)
+        for entry in &self.entries {
+            lines.push(format!("{} = {}  ({})", entry.key, entry.value, entry.file));
+        }
+        for section in [&self.always_human, &self.resolver, &self.budget] {
+            lines.push(String::new());
+            lines.extend(section.iter().cloned());
+        }
+        lines
+    }
+}
+
+impl fmt::Display for ConfigReport {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        for line in self.lines() {
+            writeln!(f, "{line}")?;
+        }
+        Ok(())
     }
 }
 
 impl Effective {
+    /// The configuration as [`ConfigReport`] says it.
+    pub fn report(&self) -> ConfigReport {
+        let mut entries = Vec::new();
+        for state in [self.project.entries_of(), self.personal.entries_of()] {
+            entries.extend(state);
+        }
+        ConfigReport {
+            project_file: self.project.described(),
+            personal_file: self.personal.described(),
+            entries,
+            always_human: self.always_human_lines(),
+            resolver: self.resolver_lines(),
+            budget: self.budget_lines(),
+        }
+    }
+
     /// The project's resolver settings, as the gate reads them, and the
     /// file they come from: the defaults without a project file.
     fn resolver(&self) -> (ResolverPolicy, Option<(&Path, &Policy)>) {
@@ -393,23 +461,23 @@ impl Effective {
     /// the project's additions with their file. An addition the level
     /// already covers (matching a token the way [`is_human_category`] does)
     /// is shown as such.
-    fn write_always_human(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    fn always_human_lines(&self) -> Vec<String> {
         let (resolver, project) = self.resolver();
         let level = resolver.level;
-        f.write_str(
-            "\nalways-human categories (the floor's never go away; the delegation level keeps \
-             others; a project adds to them):\n",
-        )?;
+        let mut lines = vec![
+            "always-human categories (the floor's never go away; the delegation level keeps \
+             others; a project adds to them):"
+                .to_owned(),
+        ];
         for category in FloorCategory::ALL {
             if category.human_at(DelegationLevel::All) {
-                writeln!(f, "  {}  (floor)", category.token())?;
+                lines.push(format!("  {}  (floor)", category.token()));
             } else if category.human_at(level) {
-                writeln!(
-                    f,
+                lines.push(format!(
                     "  {}  (delegation level {})",
                     category.token(),
                     level.as_str()
-                )?;
+                ));
             }
         }
         if let Some((path, policy)) = project {
@@ -420,58 +488,60 @@ impl Effective {
                 } else {
                     ""
                 };
-                writeln!(f, "  {category}  ({}){note}", path.display())?;
+                lines.push(format!("  {category}  ({}){note}", path.display()));
             }
         }
-        Ok(())
+        lines
     }
 
     /// What the resolver may do (OWL-328): its delegation level, its pass
     /// limit and its ceiling, each with the file it comes from, or
     /// `default`.
-    fn write_resolver(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    fn resolver_lines(&self) -> Vec<String> {
         let (resolver, project) = self.resolver();
-        f.write_str("\nresolver (what it decides without the decider):\n")?;
         let source = |set: bool| match project {
             Some((path, _)) if set => path.display().to_string(),
             _ => "default".to_owned(),
         };
         let policy = project.map(|(_, policy)| policy);
-        writeln!(
-            f,
-            "  resolver_delegation = \"{}\"  ({})",
-            resolver.level.as_str(),
-            source(policy.is_some_and(|p| p.resolver_delegation.is_some()))
-        )?;
         let passes = match resolver.passes {
             PassLimit::Runs(runs) => runs.to_string(),
             PassLimit::Unlimited => "\"unlimited\"".to_owned(),
         };
-        writeln!(
-            f,
-            "  resolver_passes = {passes}  ({})",
-            source(policy.is_some_and(|p| p.resolver_passes.is_some()))
-        )?;
-        match policy.and_then(|p| p.resolver_budget_usd) {
-            Some(usd) => writeln!(f, "  resolver_budget_usd = {}  ({})", usd.0, source(true)),
-            None => writeln!(f, "  resolver_budget_usd: none, no ceiling  (default)"),
-        }
+        vec![
+            "resolver (what it decides without the decider):".to_owned(),
+            format!(
+                "  resolver_delegation = \"{}\"  ({})",
+                resolver.level.as_str(),
+                source(policy.is_some_and(|p| p.resolver_delegation.is_some()))
+            ),
+            format!(
+                "  resolver_passes = {passes}  ({})",
+                source(policy.is_some_and(|p| p.resolver_passes.is_some()))
+            ),
+            match policy.and_then(|p| p.resolver_budget_usd) {
+                Some(usd) => format!("  resolver_budget_usd = {}  ({})", usd.0, source(true)),
+                None => "  resolver_budget_usd: none, no ceiling  (default)".to_owned(),
+            },
+        ]
     }
 
     /// The budget on one ticket's runs (OWL-378), with the file it comes
     /// from, or `default`: none.
-    fn write_budget(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str("\nbudget (what one ticket's runs may cost):\n")?;
-        match self
-            .resolver()
-            .1
-            .and_then(|(path, policy)| policy.ticket_budget_usd.map(|usd| (path, usd)))
-        {
-            Some((path, usd)) => {
-                writeln!(f, "  ticket_budget_usd = {}  ({})", usd.0, path.display())
-            }
-            None => writeln!(f, "  ticket_budget_usd: none, no budget  (default)"),
-        }
+    fn budget_lines(&self) -> Vec<String> {
+        vec![
+            "budget (what one ticket's runs may cost):".to_owned(),
+            match self
+                .resolver()
+                .1
+                .and_then(|(path, policy)| policy.ticket_budget_usd.map(|usd| (path, usd)))
+            {
+                Some((path, usd)) => {
+                    format!("  ticket_budget_usd = {}  ({})", usd.0, path.display())
+                }
+                None => "  ticket_budget_usd: none, no budget  (default)".to_owned(),
+            },
+        ]
     }
 }
 
@@ -586,6 +656,44 @@ mod tests {
         ] {
             assert!(!all.contains(line), "{line}\n---\n{all}");
         }
+    }
+
+    /// OWL-472: the report's lines are the lines `config show` prints, for an
+    /// absent, a valid and an invalid personal file, and its entries carry
+    /// their file.
+    #[test]
+    fn the_report_holds_the_lines_config_show_prints() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join(PROJECT_FILE), PROJECT).unwrap();
+        let personal = dir.path().join("personal.toml");
+        for text in [
+            None,
+            Some("concurrent_runs = 2\n"),
+            Some("concurrent_runs = \"many\"\n"),
+        ] {
+            if let Some(text) = text {
+                fs::write(&personal, text).unwrap();
+            }
+            let effective =
+                Effective::load(&repository(dir.path()), dir.path(), Some(personal.clone()));
+            let report = effective.report();
+            assert_eq!(report.lines().join("\n") + "\n", effective.to_string());
+            assert_eq!(report.to_string(), effective.to_string());
+            let origin = dir.path().join(PROJECT_FILE).display().to_string();
+            assert!(
+                report
+                    .entries
+                    .iter()
+                    .any(|entry| entry.key == "tracker.kind" && entry.file == origin),
+                "{report:?}"
+            );
+        }
+        let bare = Effective {
+            project: FileState::NotApplicable("outside a repository".into()),
+            personal: FileState::Absent(personal),
+        };
+        assert!(bare.report().entries.is_empty());
+        assert!(bare.to_string().contains("No configuration value is set."));
     }
 
     #[test]
