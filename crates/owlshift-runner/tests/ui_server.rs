@@ -2739,6 +2739,31 @@ fn each_state_the_server_sends_has_its_colour_and_each_ghost_its_own() {
         let rule = block(APP_CSS, &format!("\n.ghost-{state} {{"), "");
         assert!(rule.contains("color: var(--"), "{state}: {rule}");
     }
+    // The states the ticket names apart do not merge a zone collision with
+    // a usage limit: the decider's and the usage limit's share a role, as the
+    // ticket groups them, and no other two of those six do.
+    let role = |state: &str| {
+        block(APP_CSS, &format!("\n.node-{state} {{"), "")
+            .split("color: var(--")
+            .nth(1)
+            .and_then(|rest| rest.split(')').next())
+            .unwrap()
+            .to_owned()
+    };
+    let named = [
+        "running",
+        "resource",
+        "ticket",
+        "slot",
+        "decider",
+        "usage_limit",
+    ];
+    for (i, a) in named.iter().enumerate() {
+        for b in &named[i + 1..] {
+            let together = [*a, *b] == ["decider", "usage_limit"];
+            assert_eq!(role(a) == role(b), together, "{a} and {b}");
+        }
+    }
     // A ghost is dashed, and a shape takes its colour from its group's.
     let ghost = block(APP_CSS, "\n.node-ghost .node-box {", "");
     assert!(ghost.contains("stroke-dasharray"));
