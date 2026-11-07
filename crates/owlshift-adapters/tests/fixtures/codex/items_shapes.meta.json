@@ -1,0 +1,32 @@
+{
+  "recorded": "2026-11-07",
+  "codex_version": "0.154.0",
+  "platform": "macos",
+  "os": "macOS 26.6.2 arm64",
+  "login": "ChatGPT",
+  "model": "gpt-6-astra",
+  "confinement": "none: `-s workspace-write`, in a scratch git repository",
+  "argv": [
+    "codex",
+    "exec",
+    "--ephemeral",
+    "--json",
+    "--ignore-user-config",
+    "-m",
+    "gpt-6-astra",
+    "-s",
+    "workspace-write",
+    "-c",
+    "model_reasoning_effort=high",
+    "-c",
+    "model_reasoning_summary=auto",
+    "-c",
+    "tools.web_search=true",
+    "<prompt>"
+  ],
+  "prompt": "Do these steps in order and use your tools for each, not plain text. 1) Call your plan tool (update_plan) to set a todo list with three items: search, write, verify. 2) Use web search to find the version number of the latest stable Rust release. 3) Mark search done with the plan tool. 4) Create a file VERSION.txt holding only that version number, using the apply_patch tool (not a shell command). 5) Mark write done with the plan tool. 6) Run cat VERSION.txt, then mark verify done with the plan tool. Reply with the version.",
+  "exit_status": 0,
+  "stderr": [],
+  "stderr_note": "Not kept: the maintainer who recorded the run reported only MCP OAuth errors from their own servers, so no line is given here. The run had no `-o`, so there is no `output_last_message`.",
+  "scrub": "thread_id zeroed, the repository path replaced by /home/user/repo; the `exec-` call ids of web_search items kept, so that two searches keep two ids"
+}
