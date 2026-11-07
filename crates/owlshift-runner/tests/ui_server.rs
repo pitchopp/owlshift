@@ -21,8 +21,8 @@ use owlshift_runner::project::ProjectDirs;
 use owlshift_runner::served::Registry;
 use owlshift_runner::ui::auth::{self, RunSecret, Session};
 use owlshift_runner::ui::server::{
-    self, APP_CSS, APP_JS, INDEX_HTML, LOGGED_OUT_LINE, Options, SECURITY_HEADERS, SUPERSEDED_LINE,
-    ServeError, Serving,
+    self, APP_CSS, APP_JS, INDEX_HTML, LOGGED_OUT_LINE, OPS_JS, Options, SECURITY_HEADERS,
+    SUPERSEDED_LINE, ServeError, Serving,
 };
 use owlshift_runner::ui::{personal_at, probe, record, token};
 use serde_json::{Value, json};
@@ -213,6 +213,7 @@ fn the_frame_and_its_assets_answer_without_a_session() {
     for (path, kind, body) in [
         ("/", "text/html", INDEX_HTML),
         ("/app.js", "text/javascript", APP_JS),
+        ("/ops.js", "text/javascript", OPS_JS),
         ("/app.css", "text/css", APP_CSS),
     ] {
         let reply = get(ui.port(), path, &[]);
@@ -222,6 +223,7 @@ fn the_frame_and_its_assets_answer_without_a_session() {
         assert_eq!(reply.text(), body);
     }
     assert!(INDEX_HTML.contains(r#"<script src="/app.js" defer>"#));
+    assert!(INDEX_HTML.contains(r#"<script src="/ops.js" defer>"#));
     assert!(INDEX_HTML.contains(r#"<link rel="icon" href="/favicon.svg" type="image/svg+xml">"#));
     let brand = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../assets/brand/owlshift-mark.svg");
     let mut carried = vec![(
@@ -554,10 +556,20 @@ fn no_asset_holds_the_token_and_the_page_sends_only_the_code_and_the_session() {
     let data = tempfile::tempdir().unwrap();
     let ui = serve(data.path(), RunSecret::new().unwrap());
     let token = token::read_token(data.path()).unwrap().to_hex();
-    for path in ["/", "/app.js", "/app.css"] {
+    for path in ["/", "/app.js", "/ops.js", "/app.css"] {
         assert!(!get(ui.port(), path, &[]).text().contains(&token), "{path}");
     }
     assert!(!APP_JS.to_ascii_lowercase().contains("token"));
+    assert!(!OPS_JS.to_ascii_lowercase().contains("token"));
+    // The operations screens (OWL-472) fetch through one function that sends
+    // the session, and nothing else.
+    let ops_fetches: Vec<&str> = OPS_JS
+        .match_indices("fetch(")
+        .map(|(at, _)| OPS_JS[at..].split(',').next().unwrap())
+        .collect();
+    assert_eq!(ops_fetches, ["fetch(path"], "{ops_fetches:?}");
+    assert!(OPS_JS.contains("headers[SESSION_HEADER] = sent;"));
+    assert!(OPS_JS.contains("const sent = sessionHeader(own);"));
     // The page's requests: the login, with the code, and the session's
     // routes through `authedFetch`, with the session's header.
     let fetches: Vec<&str> = APP_JS
@@ -593,6 +605,43 @@ fn no_asset_holds_the_token_and_the_page_sends_only_the_code_and_the_session() {
     assert!(APP_JS.contains("const sent = sessionHeader(current);"));
     assert!(APP_JS.contains("headers[SESSION_HEADER] = sent;"));
     assert_eq!(APP_JS.matches("body:").count(), 1);
+}
+
+/// OWL-472: the Orchestrator sends back the generation and the cursors it was
+/// given, Spend and Config the `rev` of the answer they hold, and each refresh
+/// is one timer that stops when the screen is left.
+#[test]
+fn the_operations_screens_send_back_their_cursors_and_revs_and_stop_their_timer() {
+    for sent in [
+        r#"query.push("gen=" + state.gen);"#,
+        r#"query.push("after=" + state.after);"#,
+        r#"query.push("log=" + state.log);"#,
+        r#"query.push("rev=" + encodeURIComponent(state.rev));"#,
+        r#"? "?rev=" + encodeURIComponent(state.rev)"#,
+    ] {
+        assert!(OPS_JS.contains(sent), "ops.js does not send {sent}");
+    }
+    // The answer's cursors are the ones kept for the next request.
+    assert!(OPS_JS.contains("state.gen = events.generation;"));
+    assert!(OPS_JS.contains("state.after = events.cursor;"));
+    assert!(OPS_JS.contains("state.log = log.next;"));
+    assert!(OPS_JS.contains("state.rev = answer.rev;"));
+    // Nothing is redrawn for an answer that says `unchanged`.
+    assert_eq!(OPS_JS.matches("!answer.value.unchanged").count(), 2);
+    // The timer: set after a tick, cleared when the screen is left.
+    let ops = lf(OPS_JS);
+    let hide = block(&ops, "  function hide() {", "  ");
+    assert!(hide.contains("window.clearTimeout(timer);"), "{hide}");
+    assert!(OPS_JS.contains("ORCHESTRATOR_MS = 2000"));
+    assert!(OPS_JS.contains("SLOW_MS = 10000"));
+    // The app routes the three addresses to it, and drops the screen when
+    // the session ends.
+    for address in ["#/orchestrator", "#/spend", "#/config"] {
+        assert!(APP_JS.contains(address), "{address}");
+    }
+    let app = lf(APP_JS);
+    let logged_out = block(&app, "function loggedOut(sent) {", "");
+    assert!(logged_out.contains("window.owlshiftOps.hide();"));
 }
 
 #[test]
@@ -642,8 +691,20 @@ fn the_page_sets_every_text_as_text() {
         "javascript:",
     ] {
         assert!(!APP_JS.contains(banned), "app.js holds {banned}");
+        assert!(!OPS_JS.contains(banned), "ops.js holds {banned}");
     }
     assert!(APP_JS.contains("el.textContent ="));
+    // The operations screens set text through app.js's `text` and `make`,
+    // never their own markup, and no inline handler.
+    for banned in [
+        ".onclick",
+        ".onchange",
+        ".oninput",
+        "setAttribute(\"on",
+        "srcdoc",
+    ] {
+        assert!(!OPS_JS.contains(banned), "ops.js holds {banned}");
+    }
     let html = INDEX_HTML.to_ascii_lowercase();
     for (at, _) in html.match_indices("<script") {
         let tag = &html[at..at + html[at..].find('>').unwrap()];
@@ -1285,6 +1346,7 @@ fn no_asset_names_a_place_off_the_origin_and_the_policy_allows_none() {
     for (name, text) in [
         ("index.html", INDEX_HTML),
         ("app.js", script.as_str()),
+        ("ops.js", OPS_JS),
         ("app.css", APP_CSS),
     ] {
         assert_eq!(egress(text), None, "{name}");

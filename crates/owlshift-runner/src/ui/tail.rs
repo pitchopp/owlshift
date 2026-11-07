@@ -26,7 +26,7 @@
 
 use std::fs::File;
 use std::io::{self, BufRead, BufReader, Read, Seek, SeekFrom};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// The most a line may weigh to be served whole: 8 MiB.
 pub const MAX_LINE: usize = 8 * 1024 * 1024;
@@ -206,6 +206,161 @@ pub fn count_lines(path: &Path, offset: u64) -> Result<u64, String> {
         count += chunk.iter().filter(|&&b| b == b'\n').count() as u64;
         let length = chunk.len();
         reader.consume(length);
+    }
+}
+
+/// The file's identity, where the system gives one: a replaced file is not
+/// the file that was being read, even when it is as long.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Identity(Option<(u64, u64)>);
+
+impl Identity {
+    fn of(meta: &std::fs::Metadata) -> Self {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            Self(Some((meta.dev(), meta.ino())))
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = meta;
+            Self(None)
+        }
+    }
+}
+
+/// One whole line a [`LineTail`] read.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TailLine {
+    /// The offset of its first byte in the file.
+    pub offset: u64,
+    /// Its text without the newline, lossy where it is not UTF-8, and cut
+    /// with a `…` when it was longer than the call's `cut`.
+    pub text: String,
+}
+
+/// What one call of [`LineTail::read`] found.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct TailRead {
+    pub lines: Vec<TailLine>,
+    /// The tail started again from byte 0: the file is shorter than the
+    /// offset it had read to, is another file, or went away. What a caller
+    /// kept from the file before is stale.
+    pub restarted: bool,
+}
+
+/// A file read from a byte offset, whole lines only (OWL-472): the event log
+/// the Orchestrator's index follows, and the daemon's log the screen shows.
+///
+/// - A line is returned once its newline is written, as `owlshift logs` does
+///   (`events::print`); a half-written last line waits for the call after
+///   its newline lands.
+/// - It starts again from byte 0 when the file is shorter than the offset or
+///   is another file (on unix the device and inode, elsewhere the length
+///   alone), and says so ([`TailRead::restarted`]).
+/// - A file that is not there reads nothing, and is read from its start when
+///   it appears; one that was being read and went away has restarted.
+#[derive(Debug)]
+pub struct LineTail {
+    path: PathBuf,
+    /// The offset of the first byte not read: a line start.
+    offset: u64,
+    identity: Option<Identity>,
+}
+
+impl LineTail {
+    pub fn new(path: &Path) -> Self {
+        Self {
+            path: path.to_owned(),
+            offset: 0,
+            identity: None,
+        }
+    }
+
+    /// The offset of the first byte not read.
+    pub fn offset(&self) -> u64 {
+        self.offset
+    }
+
+    /// Starts again from byte 0 on the next [`read`](Self::read), without
+    /// saying so.
+    pub fn rewind(&mut self) {
+        self.offset = 0;
+        self.identity = None;
+    }
+
+    /// Positions the tail at `offset`, which the caller read to before: used
+    /// to go on from a cursor a page sent back.
+    pub fn seek(&mut self, offset: u64) {
+        self.offset = offset;
+    }
+
+    /// Reads the whole lines appended since the last call, at most `max`
+    /// bytes of them; a line longer than `cut` bytes is cut (see
+    /// [`TailLine::text`]) and a line with no newline in `max` bytes is
+    /// taken as it stands, so a log with a line longer than `max` cannot
+    /// stall the tail.
+    pub fn read(&mut self, max: usize, cut: usize) -> io::Result<TailRead> {
+        let mut file = match File::open(&self.path) {
+            Ok(file) => file,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                let had = self.offset > 0 || self.identity.is_some();
+                self.rewind();
+                return Ok(TailRead {
+                    lines: Vec::new(),
+                    restarted: had,
+                });
+            }
+            Err(error) => return Err(error),
+        };
+        let meta = file.metadata()?;
+        let identity = Identity::of(&meta);
+        let size = meta.len();
+        let restarted = size < self.offset || self.identity.is_some_and(|known| known != identity);
+        if restarted {
+            self.rewind();
+        }
+        self.identity = Some(identity);
+        let remaining = size - self.offset;
+        if remaining == 0 {
+            return Ok(TailRead {
+                lines: Vec::new(),
+                restarted,
+            });
+        }
+        let window = usize::try_from(remaining).unwrap_or(usize::MAX).min(max);
+        file.seek(SeekFrom::Start(self.offset))?;
+        let mut bytes = Vec::with_capacity(window.min(1 << 20));
+        file.take(window as u64).read_to_end(&mut bytes)?;
+        let whole = match bytes.iter().rposition(|&b| b == b'\n') {
+            Some(at) => at + 1,
+            // No newline in a full window: the line is longer than `max`.
+            None if bytes.len() == max && remaining > max as u64 => bytes.len(),
+            None => 0,
+        };
+        let mut lines = Vec::new();
+        let mut at = self.offset;
+        let mut rest = &bytes[..whole];
+        while !rest.is_empty() {
+            let end = rest.iter().position(|&b| b == b'\n').unwrap_or(rest.len());
+            let taken = (end + 1).min(rest.len());
+            let content = &rest[..end];
+            let content = content.strip_suffix(b"\r").unwrap_or(content);
+            if !content.iter().all(u8::is_ascii_whitespace) {
+                let text = if content.len() > cut {
+                    // Cut on a char boundary of the lossy text.
+                    let lossy = String::from_utf8_lossy(&content[..cut]);
+                    format!("{}…", lossy.trim_end_matches('\u{fffd}'))
+                } else {
+                    String::from_utf8_lossy(content).into_owned()
+                };
+                lines.push(TailLine { offset: at, text });
+            }
+            at += taken as u64;
+            rest = &rest[taken..];
+        }
+        self.offset += whole as u64;
+        Ok(TailRead { lines, restarted })
     }
 }
 
@@ -402,5 +557,101 @@ mod tests {
         assert_eq!(count_lines(&path, 2).unwrap(), 1);
         assert_eq!(count_lines(&path, 7).unwrap(), 3);
         assert_eq!(count_lines(&dir.path().join("none"), 5).unwrap(), 0);
+    }
+
+    fn line_texts(read: &TailRead) -> Vec<&str> {
+        read.lines.iter().map(|l| l.text.as_str()).collect()
+    }
+
+    #[test]
+    fn a_line_tail_returns_appended_lines_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("log");
+        write(&path, b"one\ntwo\n");
+        let mut tail = LineTail::new(&path);
+        let first = tail.read(usize::MAX, usize::MAX).unwrap();
+        assert_eq!(line_texts(&first), ["one", "two"]);
+        assert!(!first.restarted);
+        assert_eq!(first.lines[1].offset, 4);
+        assert_eq!(tail.offset(), 8);
+        assert!(tail.read(usize::MAX, usize::MAX).unwrap().lines.is_empty());
+        append(&path, b"three\n");
+        let more = tail.read(usize::MAX, usize::MAX).unwrap();
+        assert_eq!(line_texts(&more), ["three"]);
+        assert!(!more.restarted);
+        assert_eq!(more.lines[0].offset, 8);
+    }
+
+    #[test]
+    fn a_half_written_line_is_returned_after_its_newline() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("log");
+        write(&path, b"whole\nhal");
+        let mut tail = LineTail::new(&path);
+        assert_eq!(
+            line_texts(&tail.read(usize::MAX, usize::MAX).unwrap()),
+            ["whole"]
+        );
+        assert_eq!(tail.offset(), 6);
+        append(&path, b"f\n");
+        assert_eq!(
+            line_texts(&tail.read(usize::MAX, usize::MAX).unwrap()),
+            ["half"]
+        );
+    }
+
+    #[test]
+    fn a_truncated_or_replaced_file_is_read_again_from_the_start() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("log");
+        write(&path, b"a long first line\nsecond\n");
+        let mut tail = LineTail::new(&path);
+        tail.read(usize::MAX, usize::MAX).unwrap();
+        write(&path, b"new\n");
+        let again = tail.read(usize::MAX, usize::MAX).unwrap();
+        assert!(again.restarted);
+        assert_eq!(line_texts(&again), ["new"]);
+        // Replaced by a file of the same length: another file on unix.
+        #[cfg(unix)]
+        {
+            let other = dir.path().join("other");
+            write(&other, b"abc\n");
+            std::fs::rename(&other, &path).unwrap();
+            let replaced = tail.read(usize::MAX, usize::MAX).unwrap();
+            assert!(replaced.restarted);
+            assert_eq!(line_texts(&replaced), ["abc"]);
+        }
+    }
+
+    #[test]
+    fn a_missing_file_reads_nothing_and_is_picked_up_when_it_appears() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("log");
+        let mut tail = LineTail::new(&path);
+        let none = tail.read(usize::MAX, usize::MAX).unwrap();
+        assert!(none.lines.is_empty() && !none.restarted);
+        write(&path, b"here\n");
+        let found = tail.read(usize::MAX, usize::MAX).unwrap();
+        assert_eq!(line_texts(&found), ["here"]);
+        assert!(!found.restarted);
+        std::fs::remove_file(&path).unwrap();
+        let gone = tail.read(usize::MAX, usize::MAX).unwrap();
+        assert!(gone.lines.is_empty() && gone.restarted);
+    }
+
+    #[test]
+    fn long_lines_are_cut_and_a_small_window_cannot_stall_the_tail() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("log");
+        write(&path, format!("{}\nshort\n", "x".repeat(100)).as_bytes());
+        let mut tail = LineTail::new(&path);
+        let read = tail.read(usize::MAX, 10).unwrap();
+        assert_eq!(line_texts(&read), ["xxxxxxxxxx…", "short"]);
+        // A window smaller than the first line takes the window as a line.
+        let mut small = LineTail::new(&path);
+        let first = small.read(40, usize::MAX).unwrap();
+        assert_eq!(first.lines.len(), 1);
+        assert_eq!(first.lines[0].text.len(), 40);
+        assert_eq!(small.offset(), 40);
     }
 }

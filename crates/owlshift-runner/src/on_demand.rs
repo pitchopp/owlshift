@@ -5551,6 +5551,12 @@ impl OnDemand<'_> {
             ("gate_failure", json!(brief.gate_failure.is_some())),
             ("result_refusal", json!(brief.result_refusal.is_some())),
         ]);
+        // The harness the run goes on (OWL-472): what the web UI's Spend
+        // screen splits the cost by. A harness with no usage state (a stub)
+        // leaves the key out; runs recorded before it have none either.
+        if let Some(kind) = harness.usage_harness() {
+            started.insert("harness".to_owned(), json!(crate::usage::key(kind)));
+        }
         if let Some((plan, _)) = &plan {
             let id = plan.resume.as_ref().map_or(&plan.own, |from| &from.id);
             started.insert("session".to_owned(), json!(id.as_str()));

@@ -613,122 +613,258 @@ fn tickets(tickets: &[TicketId]) -> String {
         .join(", ")
 }
 
+/// The kind of a line of [`render`]'s text (OWL-472): the web UI's
+/// Orchestrator screen shows the kinds that are [`Part::on_the_page`], in
+/// `owlshift status`'s own words, and the overview, graph and ticket parts
+/// show the others.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Part {
+    /// The daemon's line, and the stop and drain requests asked of it.
+    Daemon,
+    MachinePause,
+    /// "No project is served".
+    NoProject,
+    /// A project's heading, `owner/name (from checkout)`.
+    Project,
+    /// The project file it runs on, a newer one refused, or why none.
+    Record,
+    Watch,
+    ProjectPause,
+    Quarantine,
+    Draining,
+    /// The tickets that wait for a person.
+    Waiting,
+    Parked,
+    /// The green pull requests that wait for a person to merge.
+    Merges,
+    /// The steps a draining daemon waits on.
+    DrainSteps,
+    /// The steps under way, each holder, and the ones typed in a terminal.
+    Slots,
+    Usage,
+    Digest,
+    Note,
+}
+
+impl Part {
+    /// Every kind, in the order [`render`] prints them.
+    pub const ALL: [Part; 17] = [
+        Part::Daemon,
+        Part::MachinePause,
+        Part::NoProject,
+        Part::Project,
+        Part::Record,
+        Part::Watch,
+        Part::ProjectPause,
+        Part::Quarantine,
+        Part::Draining,
+        Part::Waiting,
+        Part::Parked,
+        Part::Merges,
+        Part::DrainSteps,
+        Part::Slots,
+        Part::Usage,
+        Part::Digest,
+        Part::Note,
+    ];
+
+    /// Whether the Orchestrator screen shows this kind. The others belong
+    /// to the overview (waits for a person, parked tickets, merge waits,
+    /// the digest), the graph (steps under way and typed in a terminal) and
+    /// the daemon's drain (the steps it waits on) and are left out here.
+    pub fn on_the_page(self) -> bool {
+        !matches!(
+            self,
+            Part::Waiting
+                | Part::Parked
+                | Part::Merges
+                | Part::DrainSteps
+                | Part::Slots
+                | Part::Digest
+        )
+    }
+
+    /// The kind's name in the web UI's JSON.
+    pub fn name(self) -> &'static str {
+        match self {
+            Part::Daemon => "daemon",
+            Part::MachinePause => "machine_pause",
+            Part::NoProject => "no_project",
+            Part::Project => "project",
+            Part::Record => "record",
+            Part::Watch => "watch",
+            Part::ProjectPause => "project_pause",
+            Part::Quarantine => "quarantine",
+            Part::Draining => "draining",
+            Part::Waiting => "waiting",
+            Part::Parked => "parked",
+            Part::Merges => "merges",
+            Part::DrainSteps => "drain_steps",
+            Part::Slots => "slots",
+            Part::Usage => "usage",
+            Part::Digest => "digest",
+            Part::Note => "note",
+        }
+    }
+}
+
 /// The report as text, its times in `tz`, safe for a terminal.
 pub fn render(report: &Report, tz: &TimeZone) -> String {
     let mut out = String::new();
-    let mut line = |text: String| {
-        let _ = writeln!(out, "{}", printable(&text));
-    };
-    line(match &report.daemon {
-        Daemon::NotRunning => {
-            "Daemon: not running, so no project is served (`owlshift start` starts it).".to_owned()
-        }
-        Daemon::Running(Some(record)) => format!(
-            "Daemon: running since {} (pid {}, version {}).",
-            time(record.since, tz),
-            record.pid,
-            record.version
-        ),
-        Daemon::Running(None) => "Daemon: running (its record does not read).".to_owned(),
-        Daemon::Unknown(why) => format!("Daemon: unknown, its lock cannot be probed: {why}."),
-    });
+    for (_, text) in parts(report, tz) {
+        let _ = writeln!(out, "{text}");
+    }
+    out
+}
+
+/// The lines [`render`] prints, each with its kind and already passed
+/// through [`printable`]: `render` is their join, one per line.
+pub fn parts(report: &Report, tz: &TimeZone) -> Vec<(Part, String)> {
+    let mut out: Vec<(Part, String)> = Vec::new();
+    let mut line = |part: Part, text: String| out.push((part, printable(&text)));
+    line(
+        Part::Daemon,
+        match &report.daemon {
+            Daemon::NotRunning => {
+                "Daemon: not running, so no project is served (`owlshift start` starts it)."
+                    .to_owned()
+            }
+            Daemon::Running(Some(record)) => format!(
+                "Daemon: running since {} (pid {}, version {}).",
+                time(record.since, tz),
+                record.pid,
+                record.version
+            ),
+            Daemon::Running(None) => "Daemon: running (its record does not read).".to_owned(),
+            Daemon::Unknown(why) => format!("Daemon: unknown, its lock cannot be probed: {why}."),
+        },
+    );
     if let Some(request) = &report.stop_asked {
-        line(format!(
-            "  Stopping, asked {}: each watch ends once its steps under way finish.",
-            asked(Some(request), tz)
-        ));
+        line(
+            Part::Daemon,
+            format!(
+                "  Stopping, asked {}: each watch ends once its steps under way finish.",
+                asked(Some(request), tz)
+            ),
+        );
     }
     if let Some(request) = &report.drain_asked {
-        line(format!(
-            "  Draining for an upgrade, asked {}: the daemon exits once its steps under way \
-             finish.",
-            asked(Some(request), tz)
-        ));
+        line(
+            Part::Daemon,
+            format!(
+                "  Draining for an upgrade, asked {}: the daemon exits once its steps under way \
+                 finish.",
+                asked(Some(request), tz)
+            ),
+        );
     }
     for step in &report.drain_steps {
-        line(match &step.run {
-            Some((role, at)) => format!(
-                "  waits on {} {}: role {role}, run started {}",
-                step.project,
-                step.ticket,
-                time(*at, tz)
-            ),
-            None => format!(
-                "  waits on {} {}: no run started yet",
-                step.project, step.ticket
-            ),
-        });
+        line(
+            Part::DrainSteps,
+            match &step.run {
+                Some((role, at)) => format!(
+                    "  waits on {} {}: role {role}, run started {}",
+                    step.project,
+                    step.ticket,
+                    time(*at, tz)
+                ),
+                None => format!(
+                    "  waits on {} {}: no run started yet",
+                    step.project, step.ticket
+                ),
+            },
+        );
     }
     if let Some(request) = &report.machine_pause {
-        line(format!(
-            "Paused: every project of this machine, {}. Nothing is dispatched and no step \
-             starts; `owlshift resume` lifts it.",
-            asked(request.as_ref(), tz)
-        ));
+        line(
+            Part::MachinePause,
+            format!(
+                "Paused: every project of this machine, {}. Nothing is dispatched and no step \
+                 starts; `owlshift resume` lifts it.",
+                asked(request.as_ref(), tz)
+            ),
+        );
     }
     if report.projects.is_empty() {
-        line("No project is served (`owlshift start`, in a checkout, serves it).".to_owned());
+        line(
+            Part::NoProject,
+            "No project is served (`owlshift start`, in a checkout, serves it).".to_owned(),
+        );
     }
     for project in &report.projects {
-        line(format!(
-            "{} (from {})",
-            project.repository, project.checkout
-        ));
+        line(
+            Part::Project,
+            format!("{} (from {})", project.repository, project.checkout),
+        );
         match &project.config {
             Ok(record) => {
                 if let Some(kept) = &record.kept {
-                    line(format!("  runs on {}", served::kept_name(kept)));
+                    line(
+                        Part::Record,
+                        format!("  runs on {}", served::kept_name(kept)),
+                    );
                     if let Some(refused) = &record.refused {
-                        line(format!(
-                            "  a newer project file is refused since {}: {}",
-                            time(refused.since, tz),
-                            refused.reason
-                        ));
+                        line(
+                            Part::Record,
+                            format!(
+                                "  a newer project file is refused since {}: {}",
+                                time(refused.since, tz),
+                                refused.reason
+                            ),
+                        );
                     }
                 } else {
                     let reason = record.refused.as_ref().map_or(
                         "no project file was read from its default branch yet",
                         |refused| refused.reason.as_str(),
                     );
-                    line(format!("  not served: {reason}"));
+                    line(Part::Record, format!("  not served: {reason}"));
                 }
             }
-            Err(why) => line(format!("  its served record cannot be read: {why}")),
+            Err(why) => line(
+                Part::Record,
+                format!("  its served record cannot be read: {why}"),
+            ),
         }
-        line(format!(
-            "  watch: {}",
-            match &project.watch {
-                Watch::NoDaemon => "none, no daemon runs".to_owned(),
-                Watch::NotRead => "not read".to_owned(),
-                Watch::NotStarted => "not started yet".to_owned(),
-                Watch::Running { pid, since } => format!(
-                    "running since {}{}",
-                    time(*since, tz),
-                    pid.map_or_else(String::new, |pid| format!(" (pid {pid})"))
-                ),
-                Watch::Restarting {
-                    ended,
-                    at,
-                    why,
-                    in_a_row,
-                } => {
-                    let when =
-                        at.map_or_else(|| "later".to_owned(), |at| format!("at {}", time(at, tz)));
-                    let row = match in_a_row {
-                        Some(n) if *n > 1 => format!(", {n} ends in a row"),
-                        _ => String::new(),
-                    };
-                    format!(
-                        "restarting {when}: it ended at {} ({why}){row}",
-                        time(*ended, tz)
-                    )
+        line(
+            Part::Watch,
+            format!(
+                "  watch: {}",
+                match &project.watch {
+                    Watch::NoDaemon => "none, no daemon runs".to_owned(),
+                    Watch::NotRead => "not read".to_owned(),
+                    Watch::NotStarted => "not started yet".to_owned(),
+                    Watch::Running { pid, since } => format!(
+                        "running since {}{}",
+                        time(*since, tz),
+                        pid.map_or_else(String::new, |pid| format!(" (pid {pid})"))
+                    ),
+                    Watch::Restarting {
+                        ended,
+                        at,
+                        why,
+                        in_a_row,
+                    } => {
+                        let when = at.map_or_else(
+                            || "later".to_owned(),
+                            |at| format!("at {}", time(at, tz)),
+                        );
+                        let row = match in_a_row {
+                            Some(n) if *n > 1 => format!(", {n} ends in a row"),
+                            _ => String::new(),
+                        };
+                        format!(
+                            "restarting {when}: it ended at {} ({why}){row}",
+                            time(*ended, tz)
+                        )
+                    }
+                    Watch::Unservable { at, why } => {
+                        format!("ended at {} and cannot start: {why}", time(*at, tz))
+                    }
+                    Watch::Ended { at } => format!("ended as asked at {}", time(*at, tz)),
                 }
-                Watch::Unservable { at, why } => {
-                    format!("ended at {} and cannot start: {why}", time(*at, tz))
-                }
-                Watch::Ended { at } => format!("ended as asked at {}", time(*at, tz)),
-            }
-        ));
+            ),
+        );
         if let Some(request) = &project.pause {
             let more = match request {
                 Some(request) if request.by == BY_DAEMON => {
@@ -736,30 +872,46 @@ pub fn render(report: &Report, tz: &TimeZone) -> String {
                 }
                 _ => "; `owlshift resume <owner/repo>` lifts it",
             };
-            line(format!("  paused {}{more}", asked(request.as_ref(), tz)));
+            line(
+                Part::ProjectPause,
+                format!("  paused {}{more}", asked(request.as_ref(), tz)),
+            );
         }
         let lifted = "`owlshift unquarantine`, in its checkout, shows it whole and clears it";
         match &project.quarantine {
-            Some(Ok(first)) => line(format!("  quarantined: {first}; {lifted}")),
-            Some(Err(why)) => line(format!(
-                "  quarantined, its file cannot be read ({why}); {lifted}"
-            )),
+            Some(Ok(first)) => line(
+                Part::Quarantine,
+                format!("  quarantined: {first}; {lifted}"),
+            ),
+            Some(Err(why)) => line(
+                Part::Quarantine,
+                format!("  quarantined, its file cannot be read ({why}); {lifted}"),
+            ),
             None => {}
         }
         if project.draining {
-            line("  draining: its watch ends once its steps under way finish".to_owned());
+            line(
+                Part::Draining,
+                "  draining: its watch ends once its steps under way finish".to_owned(),
+            );
         }
         if !project.waiting.is_empty() {
-            line(format!(
-                "  waiting for a person: {}",
-                tickets(&project.waiting)
-            ));
+            line(
+                Part::Waiting,
+                format!("  waiting for a person: {}", tickets(&project.waiting)),
+            );
         }
         if !project.parked.is_empty() {
-            line(format!("  parked: {}", tickets(&project.parked)));
+            line(
+                Part::Parked,
+                format!("  parked: {}", tickets(&project.parked)),
+            );
         }
         if !project.merges_waiting.is_empty() {
-            line("  green, waiting for a person to merge:".to_owned());
+            line(
+                Part::Merges,
+                "  green, waiting for a person to merge:".to_owned(),
+            );
         }
         for wait in &project.merges_waiting {
             let why = if wait.refused {
@@ -767,78 +919,99 @@ pub fn render(report: &Report, tz: &TimeZone) -> String {
             } else {
                 wait.reason.clone()
             };
-            line(format!(
-                "    {}: pull request #{}, {why}",
-                wait.ticket, wait.pull_request
-            ));
+            line(
+                Part::Merges,
+                format!(
+                    "    {}: pull request #{}, {why}",
+                    wait.ticket, wait.pull_request
+                ),
+            );
         }
     }
     match &report.slots {
         Some((held, count)) if held.is_empty() && report.typed.is_empty() => {
-            line(format!("Steps under way: none (0 of {count} run slots)."));
+            line(
+                Part::Slots,
+                format!("Steps under way: none (0 of {count} run slots)."),
+            );
         }
         Some((held, count)) => {
             let typed = match report.typed.len() {
                 0 => String::new(),
                 n => format!(", and {n} typed in a terminal"),
             };
-            line(format!(
-                "Steps under way: {} of {count} run slots{typed}.",
-                held.len()
-            ));
+            line(
+                Part::Slots,
+                format!(
+                    "Steps under way: {} of {count} run slots{typed}.",
+                    held.len()
+                ),
+            );
             for slot in held {
-                line(match &slot.holder {
-                    Some(holder) => format!(
-                        "  {} {} (pid {}, since {})",
-                        holder.project,
-                        holder.ticket,
-                        holder.pid,
-                        time(holder.since, tz)
-                    ),
-                    None => format!("  slot {}: its holder is not recorded", slot.slot),
-                });
+                line(
+                    Part::Slots,
+                    match &slot.holder {
+                        Some(holder) => format!(
+                            "  {} {} (pid {}, since {})",
+                            holder.project,
+                            holder.ticket,
+                            holder.pid,
+                            time(holder.since, tz)
+                        ),
+                        None => format!("  slot {}: its holder is not recorded", slot.slot),
+                    },
+                );
             }
             for step in &report.typed {
-                line(format!(
-                    "  {} {}, typed in a terminal (pid {}, since {})",
-                    step.project,
-                    step.holder.ticket,
-                    step.holder.pid,
-                    time(step.holder.since, tz)
-                ));
+                line(
+                    Part::Slots,
+                    format!(
+                        "  {} {}, typed in a terminal (pid {}, since {})",
+                        step.project,
+                        step.holder.ticket,
+                        step.holder.pid,
+                        time(step.holder.since, tz)
+                    ),
+                );
             }
         }
         None => {}
     }
     if report.usage.is_empty() {
-        line("Usage: nothing under way recorded.".to_owned());
+        line(Part::Usage, "Usage: nothing under way recorded.".to_owned());
     }
     for (harness, usage) in &report.usage {
         let name = crate::usage::key(*harness);
-        line(match usage {
-            HarnessUsage::Limited(Some(until)) => {
-                format!("Usage: {name} at its limit until {}.", time(*until, tz))
-            }
-            HarnessUsage::Limited(None) => {
-                format!("Usage: {name} at its limit, until a probe shows it reset.")
-            }
-            HarnessUsage::Share { share, resets_at } => format!(
-                "Usage: {name} {:.0} % of a window that resets at {}.",
-                share * 100.0,
-                time(*resets_at, tz)
-            ),
-        });
+        line(
+            Part::Usage,
+            match usage {
+                HarnessUsage::Limited(Some(until)) => {
+                    format!("Usage: {name} at its limit until {}.", time(*until, tz))
+                }
+                HarnessUsage::Limited(None) => {
+                    format!("Usage: {name} at its limit, until a probe shows it reset.")
+                }
+                HarnessUsage::Share { share, resets_at } => format!(
+                    "Usage: {name} {:.0} % of a window that resets at {}.",
+                    share * 100.0,
+                    time(*resets_at, tz)
+                ),
+            },
+        );
     }
     match &report.digest {
         Some(DigestRecord {
             at,
             line: Some(text),
             ..
-        }) => line(format!("Latest digest, {}: {text}", time(*at, tz))),
-        _ => line("Latest digest: none yet.".to_owned()),
+        }) => line(
+            Part::Digest,
+            format!("Latest digest, {}: {text}", time(*at, tz)),
+        ),
+        _ => line(Part::Digest, "Latest digest: none yet.".to_owned()),
     }
     for note in &report.notes {
-        line(format!("warning: {note}"));
+        line(Part::Note, format!("warning: {note}"));
     }
     out
 }
@@ -1334,5 +1507,165 @@ mod tests {
         let text = render(&report, &TimeZone::UTC);
         assert!(text.starts_with("Daemon: not running"), "{text}");
         assert!(text.contains("No project is served"), "{text}");
+    }
+
+    /// A report that holds every kind of line `render` prints.
+    fn full_report() -> Report {
+        let at = |text: &str| text.parse::<Timestamp>().unwrap();
+        let ask = |by: &str, why: &str| Request::new(by, at("2026-11-05T09:00:00Z"), why);
+        let holder = |ticket: &str| crate::slots::Holder {
+            project: "acme/web".to_owned(),
+            ticket: TicketId::new(ticket).unwrap(),
+            pid: 77,
+            since: at("2026-11-05T09:30:00Z"),
+        };
+        let mut kept = ServedConfig::new("acme/web");
+        kept.kept = Some(KeptFile {
+            branch: "main".to_owned(),
+            commit: "a".repeat(40),
+            text: String::new(),
+            since: at("2026-11-04T09:00:00Z"),
+        });
+        kept.refused = Some(owlshift_contracts::service::RefusedFile {
+            commit: None,
+            reason: "requires a newer Owlshift".to_owned(),
+            since: at("2026-11-05T08:00:00Z"),
+        });
+        let project = |repository: &str, config: Result<ServedConfig, String>| Project {
+            repository: repository.to_owned(),
+            checkout: format!("/home/ada/{repository}"),
+            config,
+            watch: Watch::Restarting {
+                ended: at("2026-11-05T09:00:00Z"),
+                at: Some(at("2026-11-05T09:01:00Z")),
+                why: "exit status 1".to_owned(),
+                in_a_row: Some(3),
+            },
+            pause: Some(Some(ask(BY_DAEMON, "the keychain refused"))),
+            draining: true,
+            quarantine: Some(Ok("a run changed the checkout".to_owned())),
+            waiting: vec![TicketId::new("OWL-1").unwrap()],
+            parked: vec![TicketId::new("OWL-2").unwrap()],
+            in_review: Vec::new(),
+            merges_waiting: vec![MergeWait {
+                ticket: TicketId::new("OWL-3").unwrap(),
+                pull_request: 9,
+                reason: "a person merges it".to_owned(),
+                refused: false,
+            }],
+        };
+        Report {
+            daemon: Daemon::Running(Some(record(at("2026-11-05T08:00:00Z")))),
+            stop_asked: Some(ask("stop", "maintenance")),
+            drain_asked: Some(ask("upgrade", "a new build")),
+            drain_steps: vec![DrainStep {
+                project: "acme/web".to_owned(),
+                ticket: TicketId::new("OWL-4").unwrap(),
+                run: Some(("build".to_owned(), at("2026-11-05T09:10:00Z"))),
+            }],
+            machine_pause: Some(Some(ask(BY_PAUSE, "lunch"))),
+            projects: vec![
+                project("acme/web", Ok(kept)),
+                project("acme/api", Ok(ServedConfig::new("acme/api"))),
+                project("acme/old", Err("served.json is unreadable".to_owned())),
+            ],
+            slots: Some((
+                vec![
+                    HeldSlot {
+                        slot: 0,
+                        holder: Some(holder("OWL-5")),
+                    },
+                    HeldSlot {
+                        slot: 1,
+                        holder: None,
+                    },
+                ],
+                2,
+            )),
+            typed: vec![TypedStep {
+                project: "acme/web".to_owned(),
+                holder: TicketHolder {
+                    ticket: TicketId::new("OWL-6").unwrap(),
+                    pid: 88,
+                    since: at("2026-11-05T09:40:00Z"),
+                },
+            }],
+            usage: vec![
+                (
+                    Harness::Claude,
+                    HarnessUsage::Share {
+                        share: 0.42,
+                        resets_at: at("2026-11-05T14:00:00Z"),
+                    },
+                ),
+                (Harness::Codex, HarnessUsage::Limited(None)),
+            ],
+            digest: Some(DigestRecord {
+                format: Format,
+                at: at("2026-11-05T07:00:00Z"),
+                line: Some("3 delivered".to_owned()),
+            }),
+            notes: vec!["the run slots cannot be probed: nope".to_owned()],
+        }
+    }
+
+    /// OWL-472: `render` is the join of `parts`, every line of it is in
+    /// exactly one part, and the parts the Orchestrator shows are the ones
+    /// the overview, the graph and the ticket page do not.
+    #[test]
+    fn the_parts_are_the_lines_render_prints_by_kind() {
+        let report = full_report();
+        let tz = TimeZone::UTC;
+        let parts = parts(&report, &tz);
+        let text = render(&report, &tz);
+        let joined: String = parts.iter().map(|(_, line)| format!("{line}\n")).collect();
+        assert_eq!(joined, text);
+        assert_eq!(text.lines().count(), parts.len());
+        // The kinds appear in `render`'s order, and every kind is present.
+        let kinds: Vec<Part> = parts.iter().map(|(kind, _)| *kind).collect();
+        for kind in Part::ALL
+            .into_iter()
+            .filter(|kind| *kind != Part::NoProject)
+        {
+            assert!(kinds.contains(&kind), "{kind:?} is missing: {text}");
+        }
+        // With no project served the line that says so is the one of its kind.
+        let bare = Report {
+            projects: Vec::new(),
+            ..report.clone()
+        };
+        assert!(
+            super::parts(&bare, &tz)
+                .iter()
+                .any(|(kind, _)| *kind == Part::NoProject)
+        );
+        let shown: Vec<Part> = Part::ALL
+            .into_iter()
+            .filter(|kind| kind.on_the_page())
+            .collect();
+        assert_eq!(
+            shown,
+            [
+                Part::Daemon,
+                Part::MachinePause,
+                Part::NoProject,
+                Part::Project,
+                Part::Record,
+                Part::Watch,
+                Part::ProjectPause,
+                Part::Quarantine,
+                Part::Draining,
+                Part::Usage,
+                Part::Note
+            ]
+        );
+        // A line that holds a control character is printable in its part.
+        let mut report = report;
+        report.notes = vec!["bad\u{1b}[31m".to_owned()];
+        assert!(
+            super::parts(&report, &tz)
+                .iter()
+                .all(|(_, line)| !line.contains('\u{1b}'))
+        );
     }
 }

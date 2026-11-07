@@ -328,6 +328,30 @@ pub fn effective(
     Ok(effective)
 }
 
+/// The configuration a served project runs on, labelled where its file lives
+/// in the project's git checkout (OWL-472): `<checkout>/owlshift.toml`, so
+/// that every project check of `owlshift doctor` (which takes the repository
+/// root from the file's folder) and `owlshift config show` read the
+/// checkout as they would run in it. The text parsed is the one kept in
+/// `served.json`, as [`effective`] reads it, and the same refusals apply.
+pub fn in_checkout(
+    repo: &Repo,
+    dirs: &ProjectDirs,
+    personal: Option<PathBuf>,
+) -> Result<Effective, String> {
+    effective(repo, dirs, personal.clone())?;
+    let record = read_record(dirs)?;
+    let Some(kept) = record.as_ref().and_then(|record| record.kept.as_ref()) else {
+        return Err(not_served(repo, record.as_ref()));
+    };
+    Ok(Effective::served(
+        repo,
+        dirs.checkout().join(PROJECT_FILE),
+        &kept.text,
+        personal,
+    ))
+}
+
 /// The project of `effective`, when Owlshift accepts it for a served watch.
 fn check(effective: &Effective) -> Result<&ProjectConfig, String> {
     let config = match &effective.project {

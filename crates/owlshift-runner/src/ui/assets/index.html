@@ -8,6 +8,7 @@
 <link rel="icon" href="/favicon.svg" type="image/svg+xml">
 <link rel="stylesheet" href="/app.css">
 <script src="/app.js" defer></script>
+<script src="/ops.js" defer></script>
 </head>
 <body>
 <header class="bar">
@@ -28,6 +29,12 @@
       </select>
     </label>
   </div>
+  <nav class="bar-row nav" aria-label="Screens">
+    <a href="/#" data-screen="overview">Overview</a>
+    <a href="/#/orchestrator" data-screen="orchestrator">Orchestrator</a>
+    <a href="/#/spend" data-screen="spend">Spend</a>
+    <a href="/#/config" data-screen="config">Config</a>
+  </nav>
   <div id="header" class="bar-row facts" hidden></div>
 </header>
 <main>
@@ -54,6 +61,7 @@
     </section>
   </div>
   <section id="ticket" class="ticket" hidden></section>
+  <section id="ops" class="ticket" hidden></section>
 </main>
 </body>
 </html>

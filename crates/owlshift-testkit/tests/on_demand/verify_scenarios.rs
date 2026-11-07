@@ -272,6 +272,42 @@ fn a_codex_reviewer_that_cannot_start_drops_its_seat_and_never_stops() {
     assert!(!report.contains("login file"), "{report}");
 }
 
+/// OWL-472: a run's `run_started` names its harness (`claude`, `codex`) when
+/// the harness has a usage state, for the web UI's Spend screen to split by;
+/// a harness with none (the unstartable stub) leaves the key out.
+#[test]
+fn run_started_names_the_harness_when_it_has_one() {
+    let bench = Bench::verifying();
+    *bench.codex.borrow_mut() = Some(Ok(()));
+    bench.codex_unstartable.set(true);
+    let replies = vec![
+        bench.reply(Some("Hello"), Some(DONE)),
+        bench.reviewing(&found(&[])),
+    ];
+    let (outcome, printed) = bench.run(replies, None);
+    outcome.unwrap_or_else(|stop| panic!("{stop}\n{printed}"));
+    let started: Vec<Event> = bench
+        .events()
+        .into_iter()
+        .filter(|event| event.kind == EventKind::RunStarted)
+        .collect();
+    assert!(!started.is_empty());
+    let harnesses: Vec<Option<&str>> = started
+        .iter()
+        .map(|event| event.data.get("harness").and_then(Value::as_str))
+        .collect();
+    assert!(harnesses.contains(&Some("claude")), "{harnesses:?}");
+    assert!(harnesses.contains(&None), "{harnesses:?}");
+    // Every key that is there is a harness name.
+    assert!(
+        harnesses
+            .iter()
+            .flatten()
+            .all(|name| ["claude", "codex"].contains(name)),
+        "{harnesses:?}"
+    );
+}
+
 /// OWL-321: `[roles.verify]` is accepted, and its file reaches the brief of
 /// the Verify reviewer after `stack.rules`, and no other role's.
 #[test]

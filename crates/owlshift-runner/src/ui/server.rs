@@ -10,7 +10,7 @@
 //!
 //! The routes:
 //!
-//! - `GET /`, `/app.js`, `/app.css`, `/favicon.svg` and `/fonts/<name>.woff2`:
+//! - `GET /`, `/app.js`, `/ops.js`, `/app.css`, `/favicon.svg` and `/fonts/<name>.woff2`:
 //!   the page's frame and assets, carried in the binary, served without a
 //!   session;
 //! - `POST /api/proof` `{"challenge"}` → `{"proof"}`, the listener's proof
@@ -33,6 +33,19 @@
 //!   run folder's name and the file one of two literals, so no text of the
 //!   query becomes a path, and a run folder or a log that is a link is not
 //!   followed.
+//!
+//! - `GET /api/orchestrator[?gen=G&after=O][&log=O]` (OWL-472), under the
+//!   session as well: the daemon, the watches, the usage windows, the
+//!   decisions and warnings after a cursor and the daemon's log after an
+//!   offset ([`super::orchestrator`]), read from the event log's index
+//!   ([`super::index`]).
+//!
+//! - `GET /api/config[?rev=<hash>]`, `GET /api/spend[?days=7|30|90|all]
+//!   [&project=owner/repo][&rev=<hash>]` and
+//!   `POST /api/doctor` (OWL-472), under the session as well: the cost per
+//!   day, ticket, role and harness against the budgets and usage caps
+//!   ([`super::spend`]), the effective configuration ([`super::configuration`])
+//!   and `owlshift doctor`'s checks run on demand.
 //!
 //! Every response, errors included, carries [`SECURITY_HEADERS`], and none
 //! a CORS header or a cookie. JSON goes out through [`json_text`], which
@@ -74,16 +87,23 @@ use tiny_http::{Header as HttpHeader, Method, Request, Response, Server, StatusC
 
 use super::auth::{self, CHALLENGE_LEN, RunSecret, UsedCodes};
 use super::eventtail::EventTail;
-use super::{events, header, overview, record, runlog, tail, ticket, token};
+use super::index::EventIndex;
+use super::{
+    configuration, events, header, orchestrator, overview, record, runlog, spend, tail, ticket,
+    token,
+};
 use crate::config::FileState;
 use crate::project::ProjectDirs;
 use crate::served::Registry;
 use crate::status;
+use crate::system::{HostSystem, System};
 
 /// The page's frame.
 pub const INDEX_HTML: &str = include_str!("assets/index.html");
 /// The page's script.
 pub const APP_JS: &str = include_str!("assets/app.js");
+/// The operations screens' script (OWL-472).
+pub const OPS_JS: &str = include_str!("assets/ops.js");
 /// The page's style sheet.
 pub const APP_CSS: &str = include_str!("assets/app.css");
 /// The Bricolage Grotesque face, Latin, a variable font (visual identity
@@ -146,6 +166,10 @@ pub struct Options {
     /// header, so a change to `concurrent_runs` or a cap shows without a
     /// restart: [`super::personal_now`] in production.
     pub personal: Arc<dyn Fn() -> FileState<PersonalConfig> + Send + Sync>,
+    /// The host `owlshift doctor`'s checks probe when the Orchestrator runs
+    /// them on demand (OWL-472): [`HostSystem`] in production; the bench
+    /// passes a scripted one that reaches nothing of the machine.
+    pub system: Arc<dyn System + Send + Sync>,
 }
 
 impl Default for Options {
@@ -160,6 +184,7 @@ impl Default for Options {
             keepalive: Duration::from_secs(15),
             streams: 16,
             personal: Arc::new(super::personal_now),
+            system: Arc::new(HostSystem),
         }
     }
 }
@@ -230,6 +255,16 @@ struct Context {
     /// The event log's tail for the overview (OWL-470): held while the overview
     /// is built, which is the one reader of the log it advances.
     tail: Mutex<EventTail>,
+    /// The event log indexed for the Orchestrator and Spend screens
+    /// (OWL-472): held while a request brings it up to date.
+    index: Mutex<EventIndex>,
+    /// The build this server runs, which `doctor` compares the running
+    /// builds with; `None` answers the doctor route 503.
+    build: Option<BuildIdentity>,
+    /// Held while a doctor run is under way: one at a time.
+    doctor: Mutex<()>,
+    /// What the Spend screen keeps between two requests.
+    spend: spend::Cache,
 }
 
 /// A serving web UI. Dropping it stops taking requests.
@@ -324,7 +359,7 @@ pub fn start(
         pid: std::process::id(),
         port: address.port(),
         since: Timestamp::now(),
-        build,
+        build: build.clone(),
     };
     record::write(data, &record).map_err(|error| {
         ServeError::Io(
@@ -346,6 +381,10 @@ pub fn start(
         events: events::Reader::new(data),
         tickets: ticket::Cache::new(ticket::WAITS_KEPT),
         tail: Mutex::new(EventTail::new(data)),
+        index: Mutex::new(EventIndex::new(data)),
+        build,
+        doctor: Mutex::new(()),
+        spend: spend::Cache::default(),
     });
     let stopping = Arc::new(AtomicBool::new(false));
     let accept = {
@@ -543,6 +582,7 @@ fn handle(context: &Arc<Context>, mut request: Request) {
             asset(INDEX_HTML.as_bytes(), "text/html; charset=utf-8")
         }
         (Method::Get, "/app.js") => asset(APP_JS.as_bytes(), "text/javascript; charset=utf-8"),
+        (Method::Get, "/ops.js") => asset(OPS_JS.as_bytes(), "text/javascript; charset=utf-8"),
         (Method::Get, "/app.css") => asset(APP_CSS.as_bytes(), "text/css; charset=utf-8"),
         (Method::Get, "/favicon.svg") => asset(FAVICON_SVG.as_bytes(), "image/svg+xml"),
         (Method::Get, "/fonts/BricolageGrotesque-latin.woff2") => {
@@ -584,9 +624,191 @@ fn handle(context: &Arc<Context>, mut request: Request) {
                 ticket_log(context, &url)
             }
         }
+        (Method::Post, "/api/doctor") => {
+            if !in_session(context, &request) {
+                error_response(401, "not logged in: run `owlshift ui` in a terminal")
+            } else {
+                doctor_page(context, &body)
+            }
+        }
+        (Method::Get, "/api/config") => {
+            if !in_session(context, &request) {
+                error_response(401, "not logged in: run `owlshift ui` in a terminal")
+            } else {
+                config_page(context, &url)
+            }
+        }
+        (Method::Get, "/api/spend") => {
+            if !in_session(context, &request) {
+                error_response(401, "not logged in: run `owlshift ui` in a terminal")
+            } else {
+                spend_page(context, &url)
+            }
+        }
+        (Method::Get, "/api/orchestrator") => {
+            if !in_session(context, &request) {
+                error_response(401, "not logged in: run `owlshift ui` in a terminal")
+            } else {
+                orchestrator_page(context, &url)
+            }
+        }
         _ => error_response(404, "no such page"),
     };
     let _ = request.respond(response);
+}
+
+/// The guard of `lock` when no run holds it. A run that panicked poisoned it
+/// and holds nothing any more: it counts as free, so that one panic does not
+/// answer 409 until the UI restarts.
+fn try_lock_free(lock: &Mutex<()>) -> Option<std::sync::MutexGuard<'_, ()>> {
+    match lock.try_lock() {
+        Ok(guard) => Some(guard),
+        Err(std::sync::TryLockError::Poisoned(poisoned)) => Some(poisoned.into_inner()),
+        Err(std::sync::TryLockError::WouldBlock) => None,
+    }
+}
+
+/// `POST /api/doctor` `{"project": "owner/name"}` or `{}` (OWL-472):
+/// `owlshift doctor`'s checks, run on demand, once for the project named, once
+/// per served project when it names none, or once on the personal file alone
+/// when none is served. One run at a time (409), and none without a build
+/// to compare (503). The handover of an older daemon, which the command line
+/// does before its report, is not here: the server only calls
+/// `doctor::run`.
+fn doctor_page(context: &Context, body: &[u8]) -> Response<Cursor<Vec<u8>>> {
+    let Some(build) = &context.build else {
+        return error_response(
+            503,
+            "this server knows no build to check the running ones against",
+        );
+    };
+    let asked = if body.iter().all(u8::is_ascii_whitespace) {
+        None
+    } else {
+        match serde_json::from_slice::<Value>(body) {
+            Ok(value) if value.is_object() => value
+                .get("project")
+                .map(|project| project.as_str().map(str::to_owned))
+                .map(|project| project.ok_or(())),
+            _ => return error_response(400, "the body is a JSON object"),
+        }
+    };
+    let project = match asked {
+        None => None,
+        Some(Ok(project)) => match Repo::parse(&project) {
+            Ok(repo) => Some(repo),
+            Err(_) => return error_response(400, "the project is not owner/name"),
+        },
+        Some(Err(())) => return error_response(400, "the project is a text"),
+    };
+    let Some(_running) = try_lock_free(&context.doctor) else {
+        return error_response(409, "a run of the checks is under way: wait for it");
+    };
+    let personal = (context.options.personal)();
+    match orchestrator::doctor(
+        &*context.options.system,
+        &context.data,
+        &personal,
+        build,
+        project.as_ref(),
+    ) {
+        Ok(value) => json_response(200, &value),
+        Err(why) => error_response(503, &why),
+    }
+}
+
+/// `GET /api/config[?rev=<hash>]` (OWL-472): the effective configuration with
+/// each value's file ([`configuration`]).
+fn config_page(context: &Context, url: &str) -> Response<Cursor<Vec<u8>>> {
+    let pairs = match query_of(url) {
+        Ok(pairs) => pairs,
+        Err(why) => return error_response(400, why),
+    };
+    let personal = (context.options.personal)();
+    match configuration::answer(&context.data, &personal, param(&pairs, "rev")) {
+        Ok(value) => json_response(200, &value),
+        Err(why) => error_response(503, &format!("the served projects cannot be read: {why}")),
+    }
+}
+
+/// `GET /api/spend[?days=7|30|90|all][&project=owner/repo][&rev=<hash>]`
+/// (OWL-472): what the runs cost ([`spend`]), the last 30 days by default.
+fn spend_page(context: &Context, url: &str) -> Response<Cursor<Vec<u8>>> {
+    let pairs = match query_of(url) {
+        Ok(pairs) => pairs,
+        Err(why) => return error_response(400, why),
+    };
+    let period = match param(&pairs, "days") {
+        None => spend::Period::Days(spend::DEFAULT_DAYS),
+        Some(text) => match spend::Period::parse(text) {
+            Some(period) => period,
+            None => return error_response(400, "days is 7, 30, 90 or all"),
+        },
+    };
+    let project = match param(&pairs, "project") {
+        None | Some("") => None,
+        Some(text) => match Repo::parse(text) {
+            Ok(repo) => Some(repo.to_string()),
+            Err(_) => return error_response(400, "the project is not owner/name"),
+        },
+    };
+    let query = spend::Query {
+        period,
+        project,
+        rev: param(&pairs, "rev").map(str::to_owned),
+    };
+    let personal = (context.options.personal)();
+    let inputs = spend::Inputs {
+        data: &context.data,
+        index: &context.index,
+        personal: &personal,
+        cache: &context.spend,
+        now: Timestamp::now(),
+        tz: jiff::tz::TimeZone::system(),
+    };
+    json_response(200, &spend::answer(&inputs, &query))
+}
+
+/// A whole number query value, `None` when the key is absent, `Err` when it
+/// is not one.
+fn number_param(pairs: &[(String, String)], key: &str) -> Result<Option<u64>, ()> {
+    match param(pairs, key) {
+        None => Ok(None),
+        Some(text) if !text.is_empty() && text.bytes().all(|b| b.is_ascii_digit()) => {
+            text.parse().map(Some).map_err(|_| ())
+        }
+        Some(_) => Err(()),
+    }
+}
+
+/// `GET /api/orchestrator[?gen=G&after=O][&log=O]` (OWL-472): the daemon, the
+/// watches, the usage windows, the feed of decisions and warnings after the
+/// cursor, and the daemon's log after its offset ([`orchestrator`]).
+fn orchestrator_page(context: &Context, url: &str) -> Response<Cursor<Vec<u8>>> {
+    let pairs = match query_of(url) {
+        Ok(pairs) => pairs,
+        Err(why) => return error_response(400, why),
+    };
+    let (Ok(generation), Ok(after), Ok(log)) = (
+        number_param(&pairs, "gen"),
+        number_param(&pairs, "after"),
+        number_param(&pairs, "log"),
+    ) else {
+        return error_response(400, "gen, after and log are whole numbers");
+    };
+    let cursors = orchestrator::Cursors {
+        events: generation.zip(after),
+        log,
+    };
+    let personal = (context.options.personal)();
+    let inputs = orchestrator::Inputs {
+        data: &context.data,
+        index: &context.index,
+        personal: &personal,
+        now: Timestamp::now(),
+        tz: jiff::tz::TimeZone::system(),
+    };
+    json_response(200, &orchestrator::answer(&inputs, cursors))
 }
 
 /// The value of `text` with its `%XX` escapes and `+`s read, `None` when
@@ -1173,6 +1395,25 @@ fn write_stream(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_doctor_lock_poisoned_by_a_panic_is_free_and_a_held_one_is_not() {
+        let lock = Mutex::new(());
+        {
+            let held = try_lock_free(&lock).expect("free at first");
+            assert!(try_lock_free(&lock).is_none(), "held by a run");
+            drop(held);
+        }
+        let shared = Arc::new(lock);
+        let panicking = shared.clone();
+        let _ = thread::spawn(move || {
+            let _guard = panicking.lock().unwrap();
+            panic!("a doctor run that panics");
+        })
+        .join();
+        assert!(shared.is_poisoned());
+        assert!(try_lock_free(&shared).is_some(), "a poisoned lock is free");
+    }
 
     #[test]
     fn a_loopback_host_passes_with_any_port() {
