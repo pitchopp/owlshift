@@ -8368,7 +8368,7 @@ impl OnDemand<'_> {
     /// stays owed and the pass ends, with no repair or correction on a read
     /// that is no longer the pull request's (OWL-238). Nothing is locked or
     /// read unless `stored`, the ref the look started from, owes a report or
-    /// `seen` adopted a push.
+    /// a follow-up, or `seen` adopted a push.
     pub fn post_owed_report(
         &self,
         ticket: &TicketId,
@@ -8387,19 +8387,56 @@ impl OnDemand<'_> {
         if !owes && !matches!(seen.decision, FollowDecision::Follow { adopt: true, .. }) {
             return Some(at);
         }
+        match self.settle_owed_at(ticket, at, following, sink) {
+            Owing::NotTried(at) => Some(at),
+            Owing::Tried(at) => at,
+        }
+    }
+
+    /// For `owlshift watch`, a ticket whose following ended and whose ref,
+    /// as `stored` keeps it, still owes a follow-up (OWL-501; architecture
+    /// section 5, "Follow-ups", "Owed, then filed"): files what it owes by
+    /// the same filing as a followed ticket's, under the same locks, and
+    /// keeps it; a DELIVERY report still owed is dropped, as the end drops
+    /// it. Whether it was tried: not while the project's lock or the
+    /// ticket's is busy, a quarantine stands or the ref moved since `stored`.
+    pub fn file_owed_after_end(
+        &self,
+        ticket: &TicketId,
+        stored: &Stored,
+        following: &mut Following,
+        sink: &mut EventSink<'_>,
+    ) -> bool {
+        matches!(
+            self.settle_owed_at(ticket, stored.at(), following, sink),
+            Owing::Tried(_)
+        )
+    }
+
+    /// Under the project's lock and the ticket's, while the ticket ref is
+    /// still at `at`'s commit: the follow-ups it owes filed and the DELIVERY
+    /// report it owes posted, or dropped once the following ended, then kept
+    /// ([`Self::settle_owed`]).
+    fn settle_owed_at(
+        &self,
+        ticket: &TicketId,
+        at: RefAt,
+        following: &mut Following,
+        sink: &mut EventSink<'_>,
+    ) -> Owing {
         // Watch's write of the ticket's ref: the project's lock, then the
         // ticket's without waiting (OWL-409).
         let Ok(Some((_project, ticket_lock))) = self.dirs.lock_for_write(ticket) else {
-            return Some(at);
+            return Owing::NotTried(at);
         };
         if !matches!(self.dirs.quarantine(), Ok(None)) {
-            return Some(at);
+            return Owing::NotTried(at);
         }
         let git = &self.executor.git;
         let checkout = self.dirs.checkout();
         let current = match ticket_ref::read(git, &checkout, ticket) {
             Ok(Some(current)) if current.commit == at.commit => current,
-            _ => return Some(at),
+            _ => return Owing::NotTried(at),
         };
         let settled = self.settle_owed(
             ticket,
@@ -8409,7 +8446,7 @@ impl OnDemand<'_> {
             sink,
         );
         if settled.delivery.is_none() && settled.proposals.is_none() {
-            return settled.moved.is_none().then_some(at);
+            return Owing::Tried(settled.moved.is_none().then_some(at));
         }
         let record = TicketRecord {
             delivery: settled.delivery.or(current.record.delivery),
@@ -8431,9 +8468,9 @@ impl OnDemand<'_> {
         )
         .map_err(|fault| self.ref_fault(ticket, fault));
         if settled.moved.is_some() {
-            return None;
+            return Owing::Tried(None);
         }
-        Some(match written {
+        Owing::Tried(Some(match written {
             Ok(commit) => RefAt {
                 commit,
                 progress: ticket_ref::progress(
@@ -8453,7 +8490,7 @@ impl OnDemand<'_> {
                 );
                 at
             }
-        })
+        }))
     }
 
     /// For `owlshift continue` at Watch, under its lock: posts the DELIVERY
@@ -8508,6 +8545,16 @@ struct Settled {
     proposals: Option<TicketProposals>,
     /// The checks' error when the head moved: nothing was posted.
     moved: Option<forge::Error>,
+}
+
+/// What [`OnDemand::settle_owed_at`] did.
+enum Owing {
+    /// Nothing was tried: a lock was busy, a quarantine stands or the ref
+    /// moved since; the ref is where it was.
+    NotTried(RefAt),
+    /// Tried: where the ref is after it, `None` when the head moved since
+    /// the look (OWL-238).
+    Tried(Option<RefAt>),
 }
 
 /// Whether `checks` were read at a head that is no longer the pull

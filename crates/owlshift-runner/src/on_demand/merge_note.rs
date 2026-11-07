@@ -109,9 +109,6 @@ impl OnDemand<'_> {
         let questions = p.questions();
         let asked = crate::merge::questions(&questions);
         let gate = self.config.gate_policy();
-        let owes = delivery.owed.is_some()
-            || (proposals::has_inbox(self.tracker)
-                && proposals::owes(p.stored.as_ref().and_then(|s| s.proposals.as_ref())));
         let facts = MergeFacts {
             decision: &seen.decision,
             pushed,
@@ -129,7 +126,7 @@ impl OnDemand<'_> {
             questions: &asked,
             at_review: stage == tracker.states.review,
             draft,
-            something_due: owes,
+            something_due: crate::merge::owes_first(delivery),
         };
         let read = core::Read {
             state: core::PrState::Open,
