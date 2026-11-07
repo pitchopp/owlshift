@@ -179,7 +179,9 @@ use review_loop::{in_review_loop, loop_base, loop_reviews};
 pub use to_watch::Takes;
 use verify::Verified;
 
-pub(crate) use design::{APPROVAL_CATEGORY, plan_sha256};
+pub(crate) use design::{APPROVAL_CATEGORY, change_needs_words, plan_sha256};
+#[cfg(test)]
+pub(crate) use design::{PlanLink, approval_question};
 pub(crate) use drain::delivery_followed;
 pub use drain::{DispatchSeen, Taken, still_ready};
 pub use intake::admission;

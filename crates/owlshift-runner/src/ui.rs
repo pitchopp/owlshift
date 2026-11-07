@@ -23,6 +23,10 @@
 //! - *The drain's graph* ([`graph`], OWL-460): the live waits of
 //!   `status --waits` and the tracker's blockers of `ready.json`, laid out
 //!   for the graph page.
+//! - *Replies from the UI* ([`reply`], OWL-475): the operator's tracker key
+//!   and its account, read once per served project; the reply form offered
+//!   to the open ask's decider alone; the reply composed as the answer check
+//!   reads it and posted through the UI's Writer.
 //! - *The server* ([`server`]): tiny_http and threads on the socket the
 //!   daemon hands over, its routes and checks, and the page carried in the
 //!   binary.
@@ -44,6 +48,7 @@ pub mod orchestrator;
 pub mod overview;
 pub mod probe;
 pub mod record;
+pub mod reply;
 pub mod runlog;
 pub mod server;
 pub mod spend;

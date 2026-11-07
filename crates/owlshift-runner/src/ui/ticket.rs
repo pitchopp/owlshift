@@ -482,33 +482,27 @@ fn usd(micros: u64) -> f64 {
     micros as f64 / 1_000_000.0
 }
 
+/// The project file the project of `dirs` is served on, as it was kept, or
+/// why there is none to read: what the ticket's budget and the reply's key
+/// ([`super::reply::open_key`]) are read from.
+pub(crate) fn served_config(dirs: &ProjectDirs) -> Result<ProjectConfig, String> {
+    let kept = match served::read_record(dirs) {
+        Err(why) => return Err(format!("the served project file is unreadable: {why}")),
+        Ok(record) => record.and_then(|record| record.kept),
+    };
+    let Some(kept) = kept else {
+        return Err("no project file is kept for this project yet".into());
+    };
+    ProjectConfig::parse(&kept.text)
+        .map_err(|error| format!("the project file it is served on does not read: {error}"))
+}
+
 /// The ticket's budget in micro-dollars, from the project file the project
 /// is served on, and a note when there is none to read.
 fn budget(dirs: &ProjectDirs) -> (Option<u64>, Option<String>) {
-    match served::read_record(dirs) {
-        Err(why) => (
-            None,
-            Some(format!("the served project file is unreadable: {why}")),
-        ),
-        Ok(None) => (
-            None,
-            Some("no project file is kept for this project yet".into()),
-        ),
-        Ok(Some(record)) => match record.kept {
-            None => (
-                None,
-                Some("no project file is kept for this project yet".into()),
-            ),
-            Some(kept) => match ProjectConfig::parse(&kept.text) {
-                Ok(config) => (config.policy.ticket_budget_micros(), None),
-                Err(error) => (
-                    None,
-                    Some(format!(
-                        "the project file it is served on does not read: {error}"
-                    )),
-                ),
-            },
-        },
+    match served_config(dirs) {
+        Ok(config) => (config.policy.ticket_budget_micros(), None),
+        Err(note) => (None, Some(note)),
     }
 }
 
