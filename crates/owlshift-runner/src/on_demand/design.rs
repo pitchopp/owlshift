@@ -90,6 +90,35 @@ pub(crate) const APPROVAL_CATEGORY: &str = "plan_approval";
 /// The first option of the approval question.
 const APPROVE: &str = "Approve the plan as it is";
 
+/// The option to change the plan of the approval question with the plan's
+/// document: the change is in the decider's words.
+pub(crate) const CHANGE_IT: &str = "Change it";
+
+/// The one option to change the plan of an approval question too long for
+/// its per-fork options: the change is in the decider's words.
+pub(crate) const CHANGE_IT_SAY_HOW: &str = "Change it: say how in your answer";
+
+/// What the per-fork change option of an approval question starts with.
+const CHANGE_FORK: &str = "Change fork ";
+
+/// The option to change fork `n` of an approval question whose forks'
+/// options are too long to list: which option is in the decider's words.
+pub(crate) fn change_fork_label(n: usize) -> String {
+    format!("{CHANGE_FORK}{n}: its options are in the plan the PLAN comment shows")
+}
+
+/// Whether picking `option` of an approval question changes the plan only
+/// with the decider's words beside it, the option not naming the change by
+/// itself: [`CHANGE_IT`], [`CHANGE_IT_SAY_HOW`] and each
+/// [`change_fork_label`]. Approving does not, nor a "Fork n: X instead of Y"
+/// option, a whole change whose letter alone the design run follows. The
+/// local web UI asks for the words before it posts such a pick.
+pub(crate) fn change_needs_words(option: &QuestionOption) -> bool {
+    option.label == CHANGE_IT
+        || option.label == CHANGE_IT_SAY_HOW
+        || option.label.starts_with(CHANGE_FORK)
+}
+
 /// What Build did with a ticket.
 pub(super) enum Built {
     /// It delivered the ticket.
@@ -902,7 +931,7 @@ pub(crate) fn approval_question(plan: &Plan, document: Option<PlanLink<'_>>) -> 
         options: vec![
             QuestionOption::new(APPROVE),
             QuestionOption {
-                label: "Change it".to_owned(),
+                label: CHANGE_IT.to_owned(),
                 detail: Some(change.to_owned()),
             },
         ],
@@ -1004,19 +1033,12 @@ fn per_fork_approval(plan: &Plan) -> Question {
         return detailed;
     }
     let mut options = vec![APPROVE.to_owned()];
-    options.extend(
-        (1..=plan.forks.len()).map(|n| {
-            format!("Change fork {n}: its options are in the plan the PLAN comment shows")
-        }),
-    );
+    options.extend((1..=plan.forks.len()).map(change_fork_label));
     let per_fork = question(options);
     if weight(&per_fork) <= budget {
         return per_fork;
     }
-    question(vec![
-        APPROVE.to_owned(),
-        "Change it: say how in your answer".to_owned(),
-    ])
+    question(vec![APPROVE.to_owned(), CHANGE_IT_SAY_HOW.to_owned()])
 }
 
 fn harness_key(harness: HarnessKind) -> &'static str {
@@ -3441,6 +3463,56 @@ mod tests {
             ticket: TICKET.get_or_init(ticket_id),
             url: Some(url),
         }
+    }
+
+    /// Which change options of the approval question's shapes need the
+    /// decider's words: the document's "Change it", the long question's
+    /// "Change it: say how", each "Change fork n"; never the approval, nor a
+    /// fork's other option, which names its change.
+    #[test]
+    fn which_change_options_need_words() {
+        let fork = |choice: &str, other: &str| Fork {
+            choice: choice.to_owned(),
+            options: vec![choice.to_owned(), other.to_owned()],
+            reason: "R".to_owned(),
+        };
+        let forked = plan(vec![
+            fork("Markdown", "Plain text"),
+            fork("One file", "Two"),
+        ]);
+        let with_document = approval_question(&forked, Some(link("https://example.com/d")));
+        assert!(!change_needs_words(&with_document.options[0]));
+        assert!(change_needs_words(&with_document.options[1]));
+        let per_fork = approval_question(&forked, None);
+        assert_eq!(per_fork.options.len(), 3);
+        assert!(per_fork.options.iter().all(|o| !change_needs_words(o)));
+        let unforked = approval_question(&plan(Vec::new()), None);
+        assert!(!change_needs_words(&unforked.options[0]));
+        for label in [
+            CHANGE_IT_SAY_HOW.to_owned(),
+            change_fork_label(1),
+            change_fork_label(12),
+        ] {
+            assert!(
+                change_needs_words(&QuestionOption::new(label.clone())),
+                "{label}"
+            );
+        }
+        assert_eq!(
+            change_fork_label(2),
+            "Change fork 2: its options are in the plan the PLAN comment shows"
+        );
+        // The shape past a question's bytes, built from the same labels.
+        let long = "x".repeat(3_000);
+        let many: Vec<Fork> = (0..400).map(|n| fork(&format!("a{n}"), &long)).collect();
+        let folded = approval_question(&plan(many), None);
+        assert!(folded.options.len() > 1);
+        assert!(!change_needs_words(&folded.options[0]));
+        assert!(
+            folded.options[1..].iter().all(change_needs_words),
+            "{:?}",
+            folded.options
+        );
     }
 
     /// A QUESTIONS comment of the runner's, as `ask` posts it, and its
