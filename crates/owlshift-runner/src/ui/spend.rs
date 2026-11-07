@@ -18,7 +18,7 @@
 //!   `ticket_budget_usd`. The events' sums and `cost.json` are two columns,
 //!   never added: a run whose harness reports no cost adds nothing to
 //!   either, and `unreported_runs` says how many;
-//! - `usage`: each harness's cap and windows ([`orchestrator::usage_windows`]).
+//! - `usage`: each harness's cap and windows ([`super::orchestrator::usage_windows`]).
 //!
 //! The answer carries `rev`, the SHA-256 of the whole body without it. A
 //! request passing the same `rev` is answered `{"unchanged": true, "rev"}`,

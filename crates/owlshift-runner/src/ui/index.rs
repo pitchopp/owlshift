@@ -64,7 +64,7 @@ pub struct RunFacts {
 pub enum Item {
     Event(Box<Event>),
     /// A line that is not an event, as the log holds it (cut at
-    /// [`LINE_CUT`] bytes).
+    /// 4 MiB).
     Line(String),
 }
 
