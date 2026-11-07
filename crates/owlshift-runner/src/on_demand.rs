@@ -9137,7 +9137,7 @@ pub fn account_author(author: &TrackerAuthor, decider: &Person) -> Author {
     match author {
         TrackerAuthor::Account(person) => Author {
             name: person.name.clone(),
-            relation: if !person.id.trim().is_empty() && person.id == decider.id {
+            relation: if owlshift_core::floor::same_account(&person.id, &decider.id) {
                 Relation::Decider
             } else {
                 Relation::Other
