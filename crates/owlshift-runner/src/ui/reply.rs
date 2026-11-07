@@ -459,7 +459,7 @@ struct Line {
 /// once; without, it settles through the quiet window, and a reply that
 /// would end with the word go anyway is refused. An option of the plan's
 /// approval that does not name its change by itself needs words
-/// ([`change_needs_words`]).
+/// (`design::change_needs_words`).
 pub fn compose(
     questions: &[Question],
     answers: &[Answer],
