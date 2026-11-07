@@ -597,9 +597,11 @@ fn no_asset_holds_the_token_and_the_page_sends_only_the_code_and_the_session() {
     assert_eq!(
         authed,
         [
-            "authedFetch(path, signal",
+            "authedFetch(path, init",
             "authedFetch(streamPath(mine.graph",
             "authedFetch(snapshotPath(handle",
+            // The reply form's one POST (OWL-475).
+            "authedFetch(\"/api/reply\", {\n    method: \"POST\",\n    body: JSON.stringify({\n      project: handle.project,\n      ticket: handle.ticket,\n      ask: reply.ask,\n      answers: answers,\n      go: draft.go,\n    }",
             "authedFetch(logPath(handle, run.id, which, log.from, log.line",
             // The overview's "since" panel (OWL-470).
             "authedFetch(path",
@@ -610,7 +612,63 @@ fn no_asset_holds_the_token_and_the_page_sends_only_the_code_and_the_session() {
     assert!(APP_JS.contains("return current.id + \".\" + current.secret;"));
     assert!(APP_JS.contains("const sent = sessionHeader(current);"));
     assert!(APP_JS.contains("headers[SESSION_HEADER] = sent;"));
-    assert_eq!(APP_JS.matches("body:").count(), 1);
+    // The login's code, and the reply's form: its fields and nothing else.
+    assert_eq!(APP_JS.matches("body:").count(), 2);
+    assert!(APP_JS.contains("options.body = init.body;"));
+}
+
+/// OWL-475: the reply form is drawn by one function, in the questions
+/// section, or in the plan section for the plan's approval, below the plan
+/// and the change since the plan before; a choice listed in `reply.words`
+/// asks for words; "count it now" is ticked unless the decider unticks it.
+#[test]
+fn the_approval_form_is_drawn_in_the_plan_section() {
+    let app_js = lf(APP_JS);
+    let questions = block(
+        &app_js,
+        "function renderQuestions(handle, body, questions) {",
+        "",
+    );
+    assert!(questions.contains("reply.approval"), "{questions}");
+    assert!(questions.contains("replyForm(handle, reply, questions)"));
+    let plan = block(
+        &app_js,
+        "function renderPlan(handle, body, plan, snapshot) {",
+        "",
+    );
+    assert!(plan.contains("reply && reply.approval"), "{plan}");
+    assert!(plan.contains("replyForm(handle, reply, snapshot.questions)"));
+    let diff = plan.find("diffEl(newest.diff)").unwrap();
+    assert!(plan.find("planEl(plan.current.plan)").unwrap() < diff);
+    assert!(diff < plan.find("replyForm(").unwrap());
+    assert_eq!(app_js.matches("replyForm(").count(), 3);
+    let question = block(
+        &app_js,
+        "function replyQuestion(handle, reply, question, draft) {",
+        "",
+    );
+    assert!(question.contains("reply.words"));
+    assert!(question.contains("words.required = needed;"));
+    let form = block(
+        &app_js,
+        "function replyForm(handle, reply, questions) {",
+        "",
+    );
+    assert!(form.contains("go.checked = draft.go;"));
+    assert!(app_js.contains("handle.drafts[reply.ask] = { answers: {}, go: true };"));
+    // Send is disabled while the reply is posted, and every continuation
+    // after an await is for the page that is open.
+    let send = block(
+        &app_js,
+        "async function sendReply(handle, reply, draft, button, status) {",
+        "",
+    );
+    assert!(send.contains("button.disabled = true;"));
+    for continuation in send.split("await ").skip(1) {
+        assert!(continuation.contains("alive(handle)"), "{continuation}");
+    }
+    // The plan section is drawn again when the reply form changes.
+    assert!(app_js.contains("const beside = name === \"plan\" && snapshot.questions"));
 }
 
 /// OWL-472: the Orchestrator sends back the generation and the cursors it was
@@ -1348,7 +1406,13 @@ fn no_asset_names_a_place_off_the_origin_and_the_policy_allows_none() {
     // and the policy allows no fetch.
     const PULL_REQUEST_LINK: &str = "https://github.com/";
     assert_eq!(APP_JS.matches(PULL_REQUEST_LINK).count(), 1);
-    let script = APP_JS.replace(PULL_REQUEST_LINK, "");
+    // And the prefix of a ticket's link on the tracker beside the reply form
+    // (OWL-475), which a click navigates to as well.
+    const TRACKER_LINK: &str = "https://linear.app/";
+    assert_eq!(APP_JS.matches(TRACKER_LINK).count(), 1);
+    let script = APP_JS
+        .replace(PULL_REQUEST_LINK, "")
+        .replace(TRACKER_LINK, "");
     for (name, text) in [
         ("index.html", INDEX_HTML),
         ("app.js", script.as_str()),
@@ -2299,10 +2363,23 @@ fn since_counts_the_last_24_hours_when_it_is_given_no_time() {
 #[test]
 fn the_overview_page_links_only_a_guarded_pull_request_and_keeps_the_view_and_the_visit() {
     let app_js = lf(APP_JS);
-    // The one `.href` assignment is the pull request's, guarded by the
-    // repository and number patterns; the other links are ticket pages' hash
-    // routes, set as attributes from encoded parts.
-    assert_eq!(app_js.matches(".href =").count(), 1);
+    // The `.href` assignments are the pull request's, guarded by the
+    // repository and number patterns, and the tracker's link of the reply
+    // form (OWL-475), guarded by its own; the other links are ticket pages'
+    // hash routes, set as attributes from encoded parts.
+    assert_eq!(app_js.matches(".href =").count(), 2);
+    let tracker = block(&app_js, "function trackerLink(reply) {", "");
+    let (guard, assigned) = tracker.split_once(".href =").unwrap();
+    assert!(guard.contains("given.startsWith(LINEAR_LINK)"), "{tracker}");
+    assert!(
+        guard.contains("TRACKER_LINK_PATTERN.test(path)"),
+        "{tracker}"
+    );
+    assert!(guard.contains("return null;"), "{tracker}");
+    assert!(assigned.starts_with(" LINEAR_LINK + path;"), "{tracker}");
+    assert!(app_js.contains(
+        "const TRACKER_LINK_PATTERN = /^[A-Za-z0-9_-]+\\/issue\\/[A-Za-z0-9]+-[0-9]+$/;"
+    ));
     let link = block(&app_js, "function pullRequestLink(project, number) {", "");
     let (guard, assigned) = link.split_once(".href =").unwrap();
     assert!(guard.contains("REPOSITORY_PATTERN.test(project)"), "{link}");

@@ -146,9 +146,10 @@ async function login() {
 }
 
 // A fetch with the session, answering the response and the session it
-// sent, or null; a 401 ends that session on this page. `signal` ends a
-// request the page no longer wants.
-async function authedFetch(path, signal) {
+// sent, or null; a 401 ends that session on this page. `init`, when given,
+// is `{ signal }`, whose signal ends a request the page no longer wants, or
+// `{ method: "POST", body }`, a JSON body (OWL-475).
+async function authedFetch(path, init) {
   const current = session();
   if (!current) {
     loggedOut(null);
@@ -157,12 +158,18 @@ async function authedFetch(path, signal) {
   const sent = sessionHeader(current);
   const headers = {};
   headers[SESSION_HEADER] = sent;
-  const response = await fetch(path, {
+  const options = {
     headers: headers,
     credentials: "omit",
     cache: "no-store",
-    signal: signal,
-  });
+    signal: init ? init.signal : undefined,
+  };
+  if (init && init.method === "POST") {
+    options.method = "POST";
+    headers["Content-Type"] = "application/json";
+    options.body = init.body;
+  }
+  const response = await fetch(path, options);
   if (response.status === 401) {
     loggedOut(sent);
     return null;
@@ -322,7 +329,9 @@ async function follow() {
   const mine = { controller: new AbortController(), graph: wantsGraph() };
   stream = mine;
   try {
-    const answer = await authedFetch(streamPath(mine.graph), mine.controller.signal);
+    const answer = await authedFetch(streamPath(mine.graph), {
+      signal: mine.controller.signal,
+    });
     if (!answer) {
       return;
     }
@@ -659,7 +668,9 @@ function renderSnapshot(handle, snapshot) {
   ];
   for (const [name, draw] of sections) {
     const part = snapshot[name];
-    const key = JSON.stringify(part === undefined ? null : part);
+    // The plan section holds the approval's reply form (OWL-475).
+    const beside = name === "plan" && snapshot.questions ? snapshot.questions.reply : null;
+    const key = JSON.stringify(part === undefined ? null : part) + JSON.stringify(beside || null);
     if (handle.last[name] === key) {
       continue;
     }
@@ -794,6 +805,13 @@ function questionEl(question, verdict) {
 }
 
 function renderQuestions(handle, body, questions) {
+  const reply = questions.reply;
+  if (reply && reply.approval) {
+    body.appendChild(make("p", "notice",
+      "This round asks for the plan's approval: its reply form is beside the plan, below."));
+  } else if (reply) {
+    body.appendChild(replyForm(handle, reply, questions));
+  }
   if (questions.asks.length === 0 && questions.decisions.length === 0) {
     body.appendChild(make("p", "notice", "No question was asked."));
   }
@@ -819,6 +837,206 @@ function renderQuestions(handle, body, questions) {
     }
     body.appendChild(el);
   });
+}
+
+// The reply form (OWL-475): the open ask's questions, each with its
+// options as radio buttons, the recommendation when it names no option, and
+// a text; "count it now", ticked by default, ends the reply with `go`. A
+// choice listed in `reply.words` changes the plan only with words, which it
+// then asks for. What is picked and written is kept per ask in the handle, so
+// a redraw keeps it, and so is a reply once posted, which the form then shows
+// in its place. When the form is not offered, it says whose round it is and
+// why, with the ticket's link when the server has one.
+function replyDraft(handle, reply) {
+  if (!handle.drafts) {
+    handle.drafts = {};
+  }
+  if (!handle.drafts[reply.ask]) {
+    handle.drafts[reply.ask] = { answers: {}, go: true };
+  }
+  return handle.drafts[reply.ask];
+}
+
+// The address a reply form links its ticket to: Linear's, the one tracker
+// whose key the UI reads, then the workspace and the ticket as the server
+// built them. A click navigates there; the page fetches nothing from it.
+const LINEAR_LINK = "https://linear.app/";
+const TRACKER_LINK_PATTERN = /^[A-Za-z0-9_-]+\/issue\/[A-Za-z0-9]+-[0-9]+$/;
+
+// The ticket's link on the tracker, or null when the server gave none that
+// is Linear's workspace and ticket.
+function trackerLink(reply) {
+  const given = typeof reply.link === "string" ? reply.link : "";
+  const path = given.startsWith(LINEAR_LINK) ? given.slice(LINEAR_LINK.length) : "";
+  if (!TRACKER_LINK_PATTERN.test(path)) {
+    return null;
+  }
+  const link = make("a", "ticket-link", "Open the ticket on the tracker");
+  link.href = LINEAR_LINK + path;
+  link.rel = "noopener noreferrer";
+  return link;
+}
+
+function replyForm(handle, reply, questions) {
+  const el = make("div", "reply");
+  const decider = reply.decider.account + " (" + String(reply.decider.by).replace(/_/g, " ") + ")";
+  const posted = handle.posted && handle.posted[reply.ask];
+  if (posted) {
+    el.appendChild(make("p", "state-success", posted));
+    return el;
+  }
+  if (!reply.offered) {
+    el.appendChild(make("p", "notice", "Round " + reply.round + " waits for its decider, " + decider +
+      ". No reply form here: " + (reply.why_not || "it is not offered") + "."));
+    const link = trackerLink(reply);
+    if (link) {
+      el.appendChild(link);
+    }
+    return el;
+  }
+  const ask = questions.asks.find((one) => one.comment === reply.ask);
+  if (!ask) {
+    el.appendChild(make("p", "notice", "The round this form answers is not listed."));
+    return el;
+  }
+  const draft = replyDraft(handle, reply);
+  el.appendChild(make("h4", "", "Reply to round " + reply.round + " as " +
+    (reply.key && reply.key.name ? reply.key.name : decider)));
+  for (const question of ask.questions) {
+    el.appendChild(replyQuestion(handle, reply, question, draft));
+  }
+  const count = make("label", "switch");
+  const go = make("input");
+  go.type = "checkbox";
+  go.checked = draft.go;
+  go.addEventListener("change", () => {
+    draft.go = go.checked;
+  });
+  count.appendChild(go);
+  count.appendChild(make("span", "", "Count it now (ends the reply with go)"));
+  const actions = make("div", "reply-actions");
+  actions.appendChild(count);
+  const button = make("button", "reply-send", "Send");
+  button.type = "button";
+  const status = make("p", "notice");
+  button.addEventListener("click", () => sendReply(handle, reply, draft, button, status));
+  actions.appendChild(button);
+  el.appendChild(actions);
+  el.appendChild(status);
+  const link = trackerLink(reply);
+  if (link) {
+    el.appendChild(link);
+  }
+  return el;
+}
+
+function replyQuestion(handle, reply, question, draft) {
+  const el = make("fieldset", "reply-question");
+  el.appendChild(make("legend", "question-text", question.id + " · " + question.text));
+  if (!draft.answers[question.id]) {
+    draft.answers[question.id] = { choice: null, text: "" };
+  }
+  const answer = draft.answers[question.id];
+  const needsWords = (reply.words && reply.words[question.id]) || [];
+  const hint = make("p", "state-warning", "This option changes the plan: say how in your own words.");
+  const words = make("textarea", "control reply-text");
+  words.rows = 2;
+  words.value = answer.text;
+  words.placeholder = "In your own words (optional)";
+  const ask = () => {
+    const needed = answer.choice !== null && needsWords.includes(answer.choice);
+    hint.hidden = !needed;
+    words.required = needed;
+  };
+  words.addEventListener("input", () => {
+    answer.text = words.value;
+  });
+  const choices = [[null, "No option"]];
+  question.options.forEach((option, index) => {
+    choices.push([optionLetter(index), optionLetter(index) + ". " + option.label +
+      (option.detail ? " — " + option.detail : "")]);
+  });
+  const rec = question.recommendation;
+  if (rec && !rec.option) {
+    choices.push(["recommendation", "Take the recommendation: " + rec.why]);
+  }
+  for (const [value, label] of choices) {
+    const line = make("label", "reply-choice");
+    const radio = make("input");
+    radio.type = "radio";
+    radio.name = "reply-" + reply.ask + "-" + question.id;
+    radio.checked = answer.choice === value;
+    radio.addEventListener("change", () => {
+      if (radio.checked) {
+        answer.choice = value;
+        ask();
+      }
+    });
+    line.appendChild(radio);
+    line.appendChild(make("span", "", label + (rec && rec.option === value ? " (recommended)" : "")));
+    el.appendChild(line);
+  }
+  ask();
+  el.appendChild(hint);
+  el.appendChild(words);
+  return el;
+}
+
+// Posts the reply, once: Send stays disabled until the answer, the form keeps
+// what was picked and written when it fails, and shows the posted comment
+// in its place once it is posted.
+async function sendReply(handle, reply, draft, button, status) {
+  if (button.disabled) {
+    return;
+  }
+  for (const [id, answer] of Object.entries(draft.answers)) {
+    const needsWords = (reply.words && reply.words[id]) || [];
+    if (answer.choice !== null && needsWords.includes(answer.choice) && !answer.text.trim()) {
+      text(status, "Option " + answer.choice + " of " + id + " changes the plan: say how first.");
+      return;
+    }
+  }
+  const answers = Object.entries(draft.answers).map(([id, answer]) =>
+    ({ question: id, choice: answer.choice, text: answer.text }));
+  button.disabled = true;
+  text(status, "Posting…");
+  const answer = await authedFetch("/api/reply", {
+    method: "POST",
+    body: JSON.stringify({
+      project: handle.project,
+      ticket: handle.ticket,
+      ask: reply.ask,
+      answers: answers,
+      go: draft.go,
+    }),
+  });
+  if (!alive(handle) || !answer) {
+    return;
+  }
+  let value = null;
+  try {
+    value = await answer.response.json();
+  } catch (_) {
+    // A body that is not JSON: the status says what happened.
+  }
+  if (!alive(handle)) {
+    return;
+  }
+  button.disabled = false;
+  if (!answer.response.ok) {
+    text(status, "Not posted: " + (value && value.error ? value.error : "the server answered " +
+      answer.response.status));
+    return;
+  }
+  if (!handle.posted) {
+    handle.posted = {};
+  }
+  handle.posted[reply.ask] = "Posted as comment " + value.comment + " at " + shortTime(value.at) +
+    (value.counts_now ? ": it counts now." : ": it counts once left unedited for the quiet window.");
+  handle.last.questions = null;
+  handle.last.plan = null;
+  window.clearTimeout(handle.snapshotTimer);
+  refresh(handle);
 }
 
 function itemText(item) {
@@ -919,7 +1137,7 @@ function reviewEl(handle, pass) {
   return el;
 }
 
-function renderPlan(handle, body, plan) {
+function renderPlan(handle, body, plan, snapshot) {
   if (plan.current) {
     const current = fold(handle, "plan:current", "The plan now", "fold", true);
     current.appendChild(planEl(plan.current.plan));
@@ -929,6 +1147,17 @@ function renderPlan(handle, body, plan) {
     body.appendChild(current);
   } else {
     body.appendChild(make("p", "notice", "No plan was written yet."));
+  }
+  // A ticket waiting on its plan's approval: the change since the plan
+  // before, then the reply form, beside the plan (OWL-475).
+  const reply = snapshot && snapshot.questions ? snapshot.questions.reply : null;
+  if (reply && reply.approval) {
+    const newest = plan.revisions.length ? plan.revisions[plan.revisions.length - 1] : null;
+    if (newest && newest.diff) {
+      body.appendChild(make("h4", "", "What changed since the plan before"));
+      body.appendChild(diffEl(newest.diff));
+    }
+    body.appendChild(replyForm(handle, reply, snapshot.questions));
   }
   plan.revisions.forEach((revision, index) => {
     const el = fold(handle, "revision:" + revision.commit,

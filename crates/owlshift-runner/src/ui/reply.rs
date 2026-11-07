@@ -223,10 +223,16 @@ fn is_approval(question: &Question) -> bool {
     question.category == APPROVAL_CATEGORY
 }
 
-/// The ticket's link on Linear, from the workspace the key read: no title
-/// slug, which Linear adds itself.
-fn link(account: &KeyAccount, ticket: &TicketId) -> String {
-    format!("https://linear.app/{}/issue/{}", account.workspace, ticket)
+/// The ticket's link on Linear, from the workspace the key read, with no
+/// title slug; none for a workspace key that is not plain letters, digits,
+/// `-` and `_`, so the page is never handed another address.
+fn link(account: &KeyAccount, ticket: &TicketId) -> Option<String> {
+    let plain = !account.workspace.is_empty()
+        && account
+            .workspace
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_');
+    plain.then(|| format!("https://linear.app/{}/issue/{}", account.workspace, ticket))
 }
 
 /// The snapshot's `questions.reply` of `record`, with `key` the project's
@@ -1010,6 +1016,16 @@ pub(crate) mod tests {
             ),
         });
         assert_eq!(section(&record, &app, &ticket())["offered"], false);
+        // A workspace key that is not plain gives no link.
+        let mut odd = account("maintainer");
+        odd.workspace = "x/../y".to_owned();
+        let odd = KeyState::Ready(Key {
+            account: odd,
+            tracker: Box::new(
+                owlshift_adapters::tracker::linear::LinearTracker::with_transport(Unreachable),
+            ),
+        });
+        assert!(section(&record, &odd, &ticket())["link"].is_null());
         // Without a read key, no form and no link: the workspace is the
         // key's to tell.
         for state in [
