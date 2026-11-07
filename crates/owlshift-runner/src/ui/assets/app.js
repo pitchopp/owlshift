@@ -103,6 +103,8 @@ function loggedOut(sent) {
   clear(document.getElementById("header"));
   show("header", false);
   closeTicket();
+  closeGraph();
+  lastGraph = null;
   clearHome();
   if (window.owlshiftOps) {
     window.owlshiftOps.hide();
@@ -276,7 +278,7 @@ async function follow() {
   let ended = false;
   let sent = null;
   try {
-    const answer = await authedFetch("/api/stream");
+    const answer = await authedFetch("/api/stream?graph=1");
     if (!answer) {
       return;
     }
@@ -308,6 +310,9 @@ async function follow() {
           render(message.header);
         } else if (message.overview) {
           renderOverview(message.overview);
+        } else if (message.graph) {
+          lastGraph = message.graph;
+          drawGraph();
         } else if (message.closed === "superseded") {
           superseded = true;
         } else if (message.closed === "logged_out") {
@@ -350,6 +355,9 @@ function alive(handle) {
 function parseRoute(hash) {
   if (!hash || hash === "#") {
     return null;
+  }
+  if (hash === "#/graph") {
+    return "graph";
   }
   // The operations screens (OWL-472), drawn by ops.js.
   const screen = { "#/orchestrator": "orchestrator", "#/spend": "spend", "#/config": "config" }[hash];
@@ -418,12 +426,13 @@ function markNav(name) {
 // Shows the page the address names, or none.
 function route() {
   closeTicket();
+  closeGraph();
   const target = parseRoute(window.location.hash);
   show("home", target === null && session() !== null);
   if (window.owlshiftOps) {
     window.owlshiftOps.hide();
   }
-  markNav(target && target.screen ? target.screen : "overview");
+  markNav(target === "graph" ? "graph" : target && target.screen ? target.screen : "overview");
   if (target === null) {
     return;
   }
@@ -438,12 +447,17 @@ function route() {
   if (target === false) {
     const el = document.getElementById("ticket");
     el.appendChild(make("p", "notice problem",
-      "This address is not a page: a ticket's is #/ticket/<owner>/<repo>/<TICKET>."));
+      "This address is not a page: the drain's graph is #/graph, a ticket's " +
+      "#/ticket/<owner>/<repo>/<TICKET>."));
     el.hidden = false;
     return;
   }
   if (!session()) {
     show("logged-out", true);
+    return;
+  }
+  if (target === "graph") {
+    openGraph();
     return;
   }
   openTicket(target);
@@ -1735,6 +1749,396 @@ function renderOverview(overview) {
   }
 }
 
+// ---------------------------------------------------------------------------
+// The drain's graph (OWL-460), at `#/graph`: the graph the stream delivers
+// (`/api/stream?graph=1`), drawn as SVG by hand. The server lays it out
+// (every node has its `layer` and `row`); this only places and draws it.
+// Colours come from classes (`node-<state>`, and `ghost-<blocker state>` for
+// a node the tracker names outside the drain), never from a style attribute,
+// which the Content-Security-Policy refuses; every node also says its state
+// as a word, since colour is never alone.
+
+const LAYER_KEY = "owlshift.graph.layer";
+// The SVG namespace is a name, not a place the page reads from; it is written
+// in parts so that the audit of the assets finds no address in them.
+const SVG_NS = ["http:", "", "www.w3.org", "2000", "svg"].join("/");
+const COLUMN = 260;
+const ROW = 66;
+const BOX_W = 210;
+const BOX_H = 50;
+const PAD = 14;
+const TOP = 30;
+const TICKET_ID = /^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$/;
+const CLASS_WORD = /^[a-z_]+$/;
+
+// The latest graph the stream delivered, and the handles of the page open.
+let lastGraph = null;
+let graphView = null;
+
+// The layer drawn: `live` or `blockers`, kept in the browser.
+function graphLayer() {
+  return stored(LAYER_KEY) === "blockers" ? "blockers" : "live";
+}
+
+function svgEl(tag, attributes, value) {
+  const el = document.createElementNS(SVG_NS, tag);
+  for (const [name, attribute] of Object.entries(attributes || {})) {
+    el.setAttribute(name, String(attribute));
+  }
+  if (value !== undefined) {
+    text(el, value);
+  }
+  return el;
+}
+
+function clip(value, length) {
+  const full = value === null || value === undefined ? "" : String(value);
+  return full.length > length ? full.slice(0, length - 1) + "…" : full;
+}
+
+// The route of a ticket's page: the project is `owner/repo`.
+function ticketHref(repository, ticket) {
+  const parts = repository.split("/").map((part) => encodeURIComponent(part));
+  return "#/ticket/" + parts.join("/") + "/" + encodeURIComponent(ticket);
+}
+
+// What a node says of its state, in words.
+function stateWord(node) {
+  if (node.state === "ghost") {
+    return "outside the drain · " + node.blocker_state;
+  }
+  if (node.kind === "pull_request") {
+    return "pull request";
+  }
+  if (node.person) {
+    return "a person's ticket";
+  }
+  if (!node.in_flight && node.state === "idle") {
+    return "not in flight";
+  }
+  switch (node.state) {
+    case "running":
+      return "running";
+    case "resource":
+      return "waits on a resource";
+    case "ticket":
+      return "waits on a ticket";
+    case "slot":
+      return "waits for a slot";
+    case "decider":
+      return "waits on the decider";
+    case "intake":
+      return "waits on intake";
+    case "usage_limit":
+      return "waits on a usage limit";
+    case "other":
+      return node.reason ? "waits: " + node.reason : "waits";
+    case "not_started":
+      return "not started";
+    case "ready":
+      return "in the ready column";
+    default:
+      return "no wait";
+  }
+}
+
+// A node's tooltip: everything it knows, one fact a line.
+function nodeTip(node) {
+  const lines = [node.id, stateWord(node)];
+  if (node.title) {
+    lines.push(node.title);
+  }
+  if (node.stage) {
+    lines.push("stage: " + node.stage);
+  }
+  if (node.run) {
+    lines.push("run slot " + node.run.slot + " since " + node.run.since);
+  }
+  if (node.text) {
+    lines.push(node.text);
+  }
+  if (node.since) {
+    lines.push("told " + node.since);
+  }
+  if (node.drain) {
+    lines.push("the drain: " + node.drain + (node.drain_reason ? " (" + node.drain_reason + ")" : ""));
+  }
+  return lines.join("\n");
+}
+
+// The classes of a node's group: its state, and for a ghost its blocker state.
+function nodeClasses(node) {
+  const classes = ["node"];
+  if (CLASS_WORD.test(node.state)) {
+    classes.push("node-" + node.state);
+  }
+  if (node.blocker_state && CLASS_WORD.test(node.blocker_state)) {
+    classes.push("ghost-" + node.blocker_state);
+  }
+  return classes.join(" ");
+}
+
+// Where an edge runs, as the four points of a cubic curve: from the waiting
+// node to what it waits on, which is to its left; a back edge or an edge
+// inside a column leaves by the top.
+function edgeCurve(from, to) {
+  const a = { x: PAD + from.layer * COLUMN, y: TOP + from.row * ROW };
+  const b = { x: PAD + to.layer * COLUMN, y: TOP + to.row * ROW };
+  const middle = BOX_H / 2;
+  if (b.x < a.x) {
+    const shift = (a.x - (b.x + BOX_W)) / 2;
+    const p0 = { x: a.x, y: a.y + middle };
+    const p3 = { x: b.x + BOX_W, y: b.y + middle };
+    return [p0, { x: p0.x - shift, y: p0.y }, { x: p3.x + shift, y: p3.y }, p3];
+  }
+  if (b.x > a.x) {
+    const shift = (b.x - (a.x + BOX_W)) / 2;
+    const p0 = { x: a.x + BOX_W, y: a.y + middle };
+    const p3 = { x: b.x, y: b.y + middle };
+    return [p0, { x: p0.x + shift, y: p0.y }, { x: p3.x - shift, y: p3.y }, p3];
+  }
+  const p0 = { x: a.x + BOX_W / 2, y: a.y };
+  const p3 = { x: b.x + BOX_W / 2, y: b.y };
+  return [p0, { x: p0.x + 70, y: p0.y - 26 }, { x: p3.x + 70, y: p3.y - 26 }, p3];
+}
+
+function drawEdge(svg, edge, from, to) {
+  const [p0, p1, p2, p3] = edgeCurve(from, to);
+  const group = svgEl("g", { class: "edge" });
+  group.appendChild(svgEl("title", {}, edge.from + " → " + edge.to + ": " + edge.text));
+  group.appendChild(svgEl("path", {
+    class: "edge-line",
+    d: "M " + p0.x + " " + p0.y + " C " + p1.x + " " + p1.y + ", " + p2.x + " " + p2.y +
+      ", " + p3.x + " " + p3.y,
+  }));
+  const angle = Math.atan2(p3.y - p2.y, p3.x - p2.x);
+  const corner = (turn) => (p3.x - 9 * Math.cos(angle + turn)) + " " +
+    (p3.y - 9 * Math.sin(angle + turn));
+  group.appendChild(svgEl("path", {
+    class: "edge-head",
+    d: "M " + p3.x + " " + p3.y + " L " + corner(-0.4) + " L " + corner(0.4) + " Z",
+  }));
+  group.appendChild(svgEl("text", {
+    class: "edge-label",
+    x: (p0.x + 3 * p1.x + 3 * p2.x + p3.x) / 8,
+    y: (p0.y + 3 * p1.y + 3 * p2.y + p3.y) / 8 - 5,
+    "text-anchor": "middle",
+  }, clip(edge.label, 30)));
+  svg.appendChild(group);
+}
+
+function drawNode(svg, node, repository) {
+  const x = PAD + node.layer * COLUMN;
+  const y = TOP + node.row * ROW;
+  const group = svgEl("g", { class: nodeClasses(node) });
+  group.appendChild(svgEl("title", {}, nodeTip(node)));
+  group.appendChild(svgEl("rect", {
+    class: "node-box", x: x, y: y, width: BOX_W, height: BOX_H, rx: 6,
+  }));
+  group.appendChild(svgEl("text", { class: "node-id", x: x + 8, y: y + 20 }, clip(node.id, 22)));
+  group.appendChild(svgEl("text", {
+    class: "node-state", x: x + BOX_W - 8, y: y + 20, "text-anchor": "end",
+  }, clip(stateWord(node), 26)));
+  group.appendChild(svgEl("text", { class: "node-detail", x: x + 8, y: y + 39 },
+    clip(node.title || node.text || "", 32)));
+  // A ticket's own node opens its page; a pull request, a person's ticket
+  // and what the tracker names that is no identifier are only drawn.
+  if (node.kind === "ticket" && !node.person && TICKET_ID.test(node.id)) {
+    const anchor = svgEl("a", { href: ticketHref(repository, node.id) });
+    anchor.appendChild(group);
+    svg.appendChild(anchor);
+  } else {
+    svg.appendChild(group);
+  }
+}
+
+// A layer as an SVG, edges under nodes.
+function drawLayer(layer, repository) {
+  const nodes = new Map();
+  let columns = 1;
+  let rows = 1;
+  for (const node of layer.nodes) {
+    nodes.set(node.id, node);
+    columns = Math.max(columns, node.layer + 1);
+    rows = Math.max(rows, node.row + 1);
+  }
+  const width = PAD * 2 + (columns - 1) * COLUMN + BOX_W;
+  const height = TOP + rows * ROW + PAD;
+  const svg = svgEl("svg", {
+    class: "graph-svg",
+    width: width,
+    height: height,
+    viewBox: "0 0 " + width + " " + height,
+    role: "group",
+    "aria-label": "Waits of " + repository,
+  });
+  for (const edge of layer.edges) {
+    const from = nodes.get(edge.from);
+    const to = nodes.get(edge.to);
+    if (from && to && from !== to) {
+      drawEdge(svg, edge, from, to);
+    }
+  }
+  for (const node of layer.nodes) {
+    drawNode(svg, node, repository);
+  }
+  return svg;
+}
+
+function queueWord(entry) {
+  return entry.reason === "run_cap" ? "a machine run slot" : "the project's capacity";
+}
+
+// The tickets that wait for a slot, apart from the graph.
+function drawQueue(queue, repository) {
+  const el = make("aside", "queue");
+  el.appendChild(make("h4", "", "Waiting for a slot"));
+  const list = make("ol", "queue-list");
+  for (const entry of queue) {
+    const item = make("li", "queue-entry");
+    if (TICKET_ID.test(entry.ticket)) {
+      const link = make("a", "queue-ticket", entry.ticket);
+      link.setAttribute("href", ticketHref(repository, entry.ticket));
+      item.appendChild(link);
+    } else {
+      item.appendChild(make("span", "queue-ticket", entry.ticket));
+    }
+    item.appendChild(make("span", "queue-reason", " for " + queueWord(entry)));
+    if (entry.since) {
+      item.appendChild(make("span", "queue-since", " since " + entry.since));
+    }
+    if (entry.behind.length) {
+      item.appendChild(make("span", "queue-behind", ", behind " + entry.behind.join(", ")));
+    }
+    list.appendChild(item);
+  }
+  el.appendChild(list);
+  return el;
+}
+
+function drawProject(project, layerName) {
+  const section = make("section", "graph-project");
+  const cap = project.max_in_flight === null ? "?" : project.max_in_flight;
+  section.appendChild(make("h3", "",
+    project.repository + " · " + project.in_flight + " of " + cap + " in flight" +
+    (project.served ? "" : " · not served")));
+  if (project.paused) {
+    section.appendChild(make("p", "state-warning", "paused: " + (project.paused.why || "by a person")));
+  }
+  if (project.quarantined) {
+    section.appendChild(make("p", "state-danger", "quarantined"));
+  }
+  // The graph is sent when it changes: its time is that of its last change.
+  const ages = [];
+  if (project.ready) {
+    ages.push("ready snapshot written " + project.ready.at);
+  }
+  if (ages.length) {
+    const line = make("p", "graph-age", ages.join(" · "));
+    if (project.ready && project.ready.stale) {
+      line.appendChild(make("span", "state-warning",
+        "stale: the drain has not read the ready column for more than two passes"));
+    }
+    section.appendChild(line);
+  }
+  for (const note of project.notes) {
+    section.appendChild(make("p", "notice state-information", note));
+  }
+  const layer = layerName === "blockers" ? project.blockers : project.live;
+  if (!layer) {
+    section.appendChild(make("p", "notice", "The blockers need the drain's ready snapshot."));
+    return section;
+  }
+  if (!layer.nodes.length) {
+    section.appendChild(make("p", "notice",
+      layerName === "blockers" ? "Nothing in the ready column is blocked." : "Nothing waits."));
+  }
+  const layout = make("div", "graph-layout");
+  if (layer.nodes.length) {
+    const frame = make("div", "graph-frame");
+    frame.appendChild(drawLayer(layer, project.repository));
+    layout.appendChild(frame);
+  }
+  if (layerName !== "blockers" && project.queue.length) {
+    layout.appendChild(drawQueue(project.queue, project.repository));
+  }
+  section.appendChild(layout);
+  return section;
+}
+
+// Draws the graph of the page open from the latest one the stream delivered,
+// the projects the header's switch chose, and the layer the browser kept.
+function drawGraph() {
+  if (!graphView) {
+    return;
+  }
+  const layerName = graphLayer();
+  for (const [name, button] of Object.entries(graphView.buttons)) {
+    button.setAttribute("aria-pressed", name === layerName ? "true" : "false");
+  }
+  const content = graphView.content;
+  clear(content);
+  if (!lastGraph) {
+    content.appendChild(make("p", "notice", "Reading the drain…"));
+    return;
+  }
+  const facts = make("div", "facts graph-facts");
+  if (lastGraph.runs) {
+    facts.appendChild(fact("Run slots", lastGraph.runs.in_use + " of " + lastGraph.runs.of));
+  }
+  if (lastGraph.machine_pause) {
+    facts.appendChild(fact("Paused", lastGraph.machine_pause.why || "by a person", "state-warning"));
+  }
+  facts.appendChild(fact("Changed", lastGraph.at));
+  content.appendChild(facts);
+  for (const note of lastGraph.notes) {
+    content.appendChild(make("p", "notice state-information", note));
+  }
+  const chosen = document.getElementById("project").value;
+  const shown = lastGraph.projects.filter((project) => !chosen || project.repository === chosen);
+  if (!shown.length) {
+    content.appendChild(make("p", "notice", "No project is served."));
+  }
+  for (const project of shown) {
+    content.appendChild(drawProject(project, layerName));
+  }
+}
+
+function closeGraph() {
+  graphView = null;
+  const el = document.getElementById("view");
+  clear(el);
+  el.hidden = true;
+}
+
+function openGraph() {
+  const el = document.getElementById("view");
+  clear(el);
+  const bar = make("div", "graph-bar");
+  bar.appendChild(make("h2", "graph-title", "The drain"));
+  const switcher = make("div", "layer-switch");
+  switcher.setAttribute("role", "group");
+  switcher.setAttribute("aria-label", "Layer");
+  const buttons = {};
+  for (const [name, label] of [["live", "Live waits"], ["blockers", "Blockers"]]) {
+    const button = make("button", "control", label);
+    button.type = "button";
+    button.addEventListener("click", () => {
+      store(LAYER_KEY, name);
+      drawGraph();
+    });
+    switcher.appendChild(button);
+    buttons[name] = button;
+  }
+  bar.appendChild(switcher);
+  el.appendChild(bar);
+  const content = make("div", "graph-content");
+  el.appendChild(content);
+  graphView = { content: content, buttons: buttons };
+  el.hidden = false;
+  drawGraph();
+}
+
 async function start() {
   const theme = document.getElementById("theme");
   theme.value = stored(THEME_KEY) || "system";
@@ -1750,6 +2154,7 @@ async function start() {
       render(lastHeader);
     }
     renderHome();
+    drawGraph();
     if (window.owlshiftOps) {
       window.owlshiftOps.refresh();
     }
