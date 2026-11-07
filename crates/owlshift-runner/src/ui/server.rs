@@ -30,6 +30,14 @@
 //!   query becomes a path, and a run folder or a log that is a link is not
 //!   followed.
 //!
+//! - `GET /api/graph` (OWL-460), under the session: the drain's wait graph
+//!   ([`super::graph`]), built by [`graph_read`] from the waits of
+//!   `owlshift status --waits` over an incremental read of the event log
+//!   ([`EventTail`]) and each served project's ready snapshot. `GET
+//!   /api/stream?graph=1` adds `{"graph":…}` lines to the stream: one at
+//!   once, and one whenever the graph changes with its `at` (the time of a
+//!   read) left out. Any other value of `graph` is ignored.
+//!
 //! Every response, errors included, carries [`SECURITY_HEADERS`], and none
 //! a CORS header or a cookie. JSON goes out through [`json_text`], which
 //! writes `<`, `>`, `&`, U+2028 and U+2029 as `\u` escapes, so no text an
@@ -45,7 +53,7 @@
 //! refresher thread reads the header every refresh period while a stream
 //! runs; the streams share its latest value.
 
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::convert::Infallible;
 use std::fmt;
 use std::io::{self, Cursor, Read, Write};
@@ -67,11 +75,13 @@ use serde_json::{Value, json};
 use tiny_http::{Header as HttpHeader, Method, Request, Response, Server, StatusCode};
 
 use super::auth::{self, CHALLENGE_LEN, RunSecret, UsedCodes};
+use super::graph::{self, Graph, ReadyInput};
 use super::{events, header, record, runlog, tail, ticket, token};
 use crate::config::FileState;
+use crate::events::EventTail;
 use crate::project::ProjectDirs;
 use crate::served::Registry;
-use crate::status;
+use crate::status::{self, waits};
 
 /// The page's frame.
 pub const INDEX_HTML: &str = include_str!("assets/index.html");
@@ -212,6 +222,10 @@ struct Context {
     /// The event log's incremental reader (OWL-471): what the ticket page's
     /// snapshot and its run logs' `ended` read.
     events: events::Reader,
+    /// The event log's waits, read incrementally for the graph (OWL-460):
+    /// every event, which `status::waits` folds, where [`events::Reader`]
+    /// keeps only a ticket page's rows.
+    graph_events: Mutex<EventTail>,
     /// What a ticket's snapshot keeps between two builds.
     tickets: ticket::Cache,
 }
@@ -328,6 +342,7 @@ pub fn start(
         figures: Mutex::new(None),
         hub: Hub::default(),
         events: events::Reader::new(data),
+        graph_events: Mutex::new(EventTail::in_dir(data)),
         tickets: ticket::Cache::new(ticket::WAITS_KEPT),
     });
     let stopping = Arc::new(AtomicBool::new(false));
@@ -545,8 +560,19 @@ fn handle(context: &Arc<Context>, mut request: Request) {
             } else if path == "/api/header" {
                 json_response(200, header_now(context).json())
             } else {
-                stream(context, request);
+                let graph = query_of(&url).is_ok_and(|pairs| param(&pairs, "graph") == Some("1"));
+                stream(context, request, graph);
                 return;
+            }
+        }
+        (Method::Get, "/api/graph") => {
+            if !in_session(context, &request) {
+                error_response(401, "not logged in: run `owlshift ui` in a terminal")
+            } else {
+                json_response(
+                    200,
+                    &serde_json::to_value(graph_now(context)).unwrap_or(Value::Null),
+                )
             }
         }
         (Method::Get, "/api/ticket" | "/api/ticket/log") => {
@@ -808,10 +834,9 @@ fn session_holds(context: &Context, value: &str) -> bool {
         .is_ok_and(|token| auth::check_session(&token, &context.run, value))
 }
 
-/// The header now, read from the files `owlshift status` reads, with the
-/// personal file read again; when it does not load, the last figures of
-/// one that did, and a note saying so.
-fn header_now(context: &Context) -> header::Header {
+/// The figures of the personal file read again, and, when it does not load,
+/// the last figures of one that did with a note saying so.
+fn figures_now(context: &Context) -> (Figures, Option<String>) {
     let personal = (context.options.personal)();
     let mut note = None;
     let figures = {
@@ -839,6 +864,14 @@ fn header_now(context: &Context) -> header::Header {
             }
         }
     };
+    (figures, note)
+}
+
+/// The header now, read from the files `owlshift status` reads, with the
+/// personal file read again; when it does not load, the last figures of
+/// one that did, and a note saying so.
+fn header_now(context: &Context) -> header::Header {
+    let (figures, note) = figures_now(context);
     let report = status::gather_files(&context.data, figures.0, &figures.1, Timestamp::now());
     let mut header = header::of(&report);
     if let (Some(note), Some(notes)) = (
@@ -848,6 +881,69 @@ fn header_now(context: &Context) -> header::Header {
         notes.push(Value::String(note));
     }
     header
+}
+
+/// The drain's graph of the data directory `data` at `now`: the events
+/// `tail` reads past what it had, the waits of every served project as
+/// `owlshift status --waits` builds them from those events, and each
+/// project's ready snapshot as that read held it, laid out by
+/// [`graph::of`]. The machine's run slots are counted up to
+/// `concurrent_runs`.
+pub fn graph_read(
+    data: &Path,
+    tail: &mut EventTail,
+    concurrent_runs: u32,
+    now: Timestamp,
+) -> Graph {
+    let mut event_notes = Vec::new();
+    if let Err(error) = tail.refresh() {
+        event_notes.push(format!("the event log cannot be read: {error}"));
+    }
+    event_notes.extend(
+        tail.notes()
+            .iter()
+            .map(|why| format!("the event log's {why}")),
+    );
+    let read = waits::gather_with(data, None, concurrent_runs, now, tail.events(), event_notes);
+    let ready: BTreeMap<String, ReadyInput> = read
+        .projects
+        .iter()
+        .map(|project| {
+            let input = match &project.snapshot {
+                Ok(Some(snapshot)) => ReadyInput::Read {
+                    stale: crate::ready::stale(snapshot, now),
+                    snapshot: snapshot.clone(),
+                },
+                Ok(None) => ReadyInput::Missing,
+                Err(why) => ReadyInput::Unread(why.clone()),
+            };
+            (project.repository.clone(), input)
+        })
+        .collect();
+    graph::of(&waits::build(&read), &ready)
+}
+
+/// The graph now, the personal file read again for `concurrent_runs`.
+fn graph_now(context: &Context) -> Graph {
+    let (figures, note) = figures_now(context);
+    let mut tail = context
+        .graph_events
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut graph = graph_read(&context.data, &mut tail, figures.0, Timestamp::now());
+    graph.notes.extend(note);
+    graph
+}
+
+/// A graph as the stream's line and as the value that tells whether it
+/// changed: its JSON without `at`, which is the time of each read.
+fn graph_parts(graph: &Graph) -> (Value, String) {
+    let mut value = serde_json::to_value(graph).unwrap_or(Value::Null);
+    let line = json_text(&json!({ "graph": value }));
+    if let Some(object) = value.as_object_mut() {
+        object.remove("at");
+    }
+    (value, line)
 }
 
 /// The streams that run and the refresher's latest header.
@@ -864,6 +960,13 @@ struct HubState {
     generation: u64,
     latest: Option<String>,
     refreshing: bool,
+    /// The streams that asked for the graph (`?graph=1`): the refresher
+    /// computes it only while there are any.
+    graph_streams: HashSet<u64>,
+    /// The refresher's latest graph, its JSON without `at` and its line, and
+    /// how many times it changed.
+    graph: Option<(Value, String)>,
+    graph_generation: u64,
 }
 
 impl Hub {
@@ -880,7 +983,7 @@ impl Hub {
 
 /// Admits a stream, superseding the oldest beyond the cap, and starts the
 /// refresher when none runs: the stream's id and its superseded flag.
-fn admit(context: &Arc<Context>) -> (u64, Arc<AtomicBool>) {
+fn admit(context: &Arc<Context>, graph: bool) -> (u64, Arc<AtomicBool>) {
     let mut state = context.hub.lock();
     while state.streams.len() >= context.options.streams.max(1) {
         if let Some((_, oldest)) = state.streams.pop_front() {
@@ -891,6 +994,9 @@ fn admit(context: &Arc<Context>) -> (u64, Arc<AtomicBool>) {
     state.next += 1;
     let superseded = Arc::new(AtomicBool::new(false));
     state.streams.push_back((id, superseded.clone()));
+    if graph {
+        state.graph_streams.insert(id);
+    }
     if !state.refreshing {
         state.refreshing = true;
         let context = context.clone();
@@ -907,7 +1013,9 @@ fn admit(context: &Arc<Context>) -> (u64, Arc<AtomicBool>) {
 }
 
 fn leave(context: &Context, id: u64) {
-    context.hub.lock().streams.retain(|(other, _)| *other != id);
+    let mut state = context.hub.lock();
+    state.streams.retain(|(other, _)| *other != id);
+    state.graph_streams.remove(&id);
 }
 
 /// Reads the header every refresh period while a stream runs, and shares
@@ -915,6 +1023,8 @@ fn leave(context: &Context, id: u64) {
 fn refresh(context: &Arc<Context>) {
     loop {
         let line = json_text(&json!({ "header": header_now(context).json() }));
+        let wanted = !context.hub.lock().graph_streams.is_empty();
+        let graph = wanted.then(|| graph_parts(&graph_now(context)));
         let mut state = context.hub.lock();
         if state.streams.is_empty() {
             state.refreshing = false;
@@ -923,6 +1033,13 @@ fn refresh(context: &Arc<Context>) {
         if state.latest.as_deref() != Some(line.as_str()) {
             state.latest = Some(line);
             state.generation += 1;
+            context.hub.changed.notify_all();
+        }
+        if let Some(graph) =
+            graph.filter(|graph| state.graph.as_ref().map(|(value, _)| value) != Some(&graph.0))
+        {
+            state.graph = Some(graph);
+            state.graph_generation += 1;
             context.hub.changed.notify_all();
         }
         let (state, _) = context
@@ -942,7 +1059,7 @@ fn chunk(writer: &mut dyn Write, line: &str) -> io::Result<()> {
 
 /// Serves `/api/stream`: its own status line and headers, then one chunk
 /// per line until the page goes, or a newer stream supersedes it.
-fn stream(context: &Arc<Context>, request: Request) {
+fn stream(context: &Arc<Context>, request: Request, graph: bool) {
     let session = match header_value(&request, SESSION_HEADER) {
         Ok(Some(value)) => value.to_owned(),
         _ => {
@@ -953,9 +1070,9 @@ fn stream(context: &Arc<Context>, request: Request) {
             return;
         }
     };
-    let (id, superseded) = admit(context);
+    let (id, superseded) = admit(context, graph);
     let mut writer = request.into_writer();
-    let _ = write_stream(context, &mut *writer, &session, &superseded);
+    let _ = write_stream(context, &mut *writer, &session, &superseded, graph);
     leave(context, id);
 }
 
@@ -964,6 +1081,7 @@ fn write_stream(
     writer: &mut dyn Write,
     session: &str,
     superseded: &AtomicBool,
+    graph: bool,
 ) -> io::Result<()> {
     let mut head = String::from(
         "HTTP/1.1 200 OK\r\nContent-Type: application/x-ndjson; charset=utf-8\r\n\
@@ -976,7 +1094,18 @@ fn write_stream(
     writer.write_all(head.as_bytes())?;
     let mut written = json_text(&json!({ "header": header_now(context).json() }));
     chunk(writer, &written)?;
-    let mut seen = context.hub.lock().generation;
+    let (mut seen, mut seen_graph) = {
+        let state = context.hub.lock();
+        (state.generation, state.graph_generation)
+    };
+    // The graph the stream wrote last, without its `at`: what the
+    // refresher's changes are compared with.
+    let mut written_graph = None;
+    if graph {
+        let (value, line) = graph_parts(&graph_now(context));
+        chunk(writer, &line)?;
+        written_graph = Some(value);
+    }
     let mut kept = Instant::now();
     let mut checked = Instant::now();
     loop {
@@ -991,32 +1120,48 @@ fn write_stream(
             }
             checked = Instant::now();
         }
-        let latest = {
+        let (latest, graph_latest) = {
             let state = context.hub.lock();
             let (state, _) = context
                 .hub
                 .changed
                 .wait_timeout(state, Duration::from_millis(250))
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if state.generation == seen {
+            let header = if state.generation == seen {
                 None
             } else {
                 seen = state.generation;
                 state.latest.clone()
-            }
+            };
+            let graph = if graph && state.graph_generation != seen_graph {
+                seen_graph = state.graph_generation;
+                state.graph.clone()
+            } else {
+                None
+            };
+            (header, graph)
         };
         if superseded.load(Ordering::SeqCst) {
             continue;
         }
         let latest = latest.filter(|latest| *latest != written);
-        let due = latest.is_some() || kept.elapsed() >= context.options.keepalive;
+        let graph_latest = graph_latest.filter(|(value, _)| Some(value) != written_graph.as_ref());
+        let due = latest.is_some()
+            || graph_latest.is_some()
+            || kept.elapsed() >= context.options.keepalive;
         if due && !session_holds(context, session) {
             chunk(writer, LOGGED_OUT_LINE)?;
             break;
         }
-        if let Some(latest) = latest {
-            chunk(writer, &latest)?;
-            written = latest;
+        if latest.is_some() || graph_latest.is_some() {
+            if let Some(latest) = latest {
+                chunk(writer, &latest)?;
+                written = latest;
+            }
+            if let Some((value, line)) = graph_latest {
+                chunk(writer, &line)?;
+                written_graph = Some(value);
+            }
             kept = Instant::now();
         } else if kept.elapsed() >= context.options.keepalive {
             chunk(writer, r#"{"keepalive":true}"#)?;
