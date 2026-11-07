@@ -435,7 +435,12 @@ fn project_view(
                 running: row.run.map(|run| Running {
                     slot: run.slot,
                     since: run.since,
-                    role: lookup(runs, repository, &row.ticket).map(|run| run.role.clone()),
+                    // Only a run that started once the slot was taken: before
+                    // its own `run_started`, the slot is a new step's and the
+                    // latest run is the previous step's (as `status` has it).
+                    role: lookup(runs, repository, &row.ticket)
+                        .filter(|latest| latest.at >= run.since)
+                        .map(|latest| latest.role.clone()),
                 }),
                 wait: row.waits.clone(),
                 needs_you: detail.and_then(needs_of),

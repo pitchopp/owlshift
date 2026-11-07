@@ -352,8 +352,18 @@ fn a_running_card_names_the_role_of_its_latest_run() {
     let waits = waits_of(vec![
         holding(active("T-1", Stage::Build), 2),
         active("T-2", Stage::Build),
+        holding(active("T-3", Stage::Verify), 3),
     ]);
     let mut runs = BTreeMap::new();
+    // T-3's latest run started before its slot was taken (09:00): the slot
+    // is a new step's, which has not emitted its `run_started` yet.
+    runs.insert(
+        ("o/r".to_owned(), id("T-3")),
+        Run {
+            role: "build".to_owned(),
+            at: ts("2026-11-06T08:00:00Z"),
+        },
+    );
     runs.insert(
         ("o/r".to_owned(), id("T-1")),
         Run {
@@ -380,6 +390,8 @@ fn a_running_card_names_the_role_of_its_latest_run() {
     let running = card(&overview, "T-1").running.clone().unwrap();
     assert_eq!((running.slot, running.role.as_deref()), (2, Some("build")));
     assert_eq!(card(&overview, "T-2").running, None);
+    let new_step = card(&overview, "T-3").running.clone().unwrap();
+    assert_eq!((new_step.slot, new_step.role), (3, None));
 }
 
 /// The strip has eight cells in pipeline order.
