@@ -1445,6 +1445,7 @@ dependencies = [
  "owlshift-core",
  "owlshift-platform",
  "semver",
+ "serde",
  "serde_json",
  "sha2",
  "tempfile",

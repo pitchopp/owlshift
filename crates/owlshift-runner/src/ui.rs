@@ -12,6 +12,9 @@
 //! - *The header* ([`header`]), read from the files `owlshift status` reads
 //!   (`status::gather_files`), and the UI's record ([`record`]),
 //!   `<data>/service/ui.json`.
+//! - *The drain's graph* ([`graph`], OWL-460): the live waits of
+//!   `status --waits` and the tracker's blockers of `ready.json`, laid out
+//!   for the graph page.
 //! - *The server* ([`server`]): tiny_http and threads on the socket the
 //!   daemon hands over, its routes and checks, and the page carried in the
 //!   binary.
@@ -24,6 +27,7 @@ use crate::config::FileState;
 
 pub mod auth;
 pub mod events;
+pub mod graph;
 pub mod header;
 pub mod probe;
 pub mod record;
