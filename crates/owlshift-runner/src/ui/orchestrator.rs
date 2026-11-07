@@ -9,6 +9,9 @@
 //!   ([`Part::on_the_page`]), in its order and its words, built by the same
 //!   function ([`status::parts`]); `left_out` names the kinds of line it
 //!   leaves to other screens;
+//! - `notes`: what only the page's reads say, such as an event log the index
+//!   cannot read; the notes of `status` are among the `lines`, as
+//!   `warning: <note>`, and not repeated here;
 //! - `daemon`, `machine_pause` and `projects` (each with its `watch`, record,
 //!   `paused`, `quarantined` and `draining`), the header's own structure
 //!   ([`header::of`]) with the watch state added;
@@ -322,14 +325,12 @@ pub fn answer(inputs: &Inputs<'_>, cursors: Cursors) -> Value {
         (report, feed, index.generation(), index.offset(), error)
     };
     let mut head = header::of(&report).0;
-    if let (Some(why), Some(notes)) = (
-        index_error,
-        head.get_mut("notes").and_then(Value::as_array_mut),
-    ) {
-        notes.push(Value::String(format!(
-            "the event log cannot be read: {why}"
-        )));
-    }
+    // The notes of `status` are among the lines (`warning: <note>`); what
+    // only the page knows is the index's.
+    let notes: Vec<String> = index_error
+        .into_iter()
+        .map(|why| format!("the event log cannot be read: {why}"))
+        .collect();
     let shown: Vec<(Part, String)> = status::parts(&report, &inputs.tz)
         .into_iter()
         .filter(|(part, _)| part.on_the_page())
@@ -382,7 +383,7 @@ pub fn answer(inputs: &Inputs<'_>, cursors: Cursors) -> Value {
         "daemon": head["daemon"],
         "machine_pause": head["machine_pause"],
         "projects": head["projects"],
-        "notes": head["notes"],
+        "notes": notes,
         "usage": usage_windows(inputs.data, inputs.personal, inputs.now, Some(&report)),
         "events": {
             "entries": entries,

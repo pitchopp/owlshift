@@ -306,6 +306,25 @@ fn the_orchestrator_needs_a_session() {
 }
 
 #[test]
+fn a_note_of_status_is_among_the_lines_once_and_not_among_the_notes() {
+    let ground = Ground::new();
+    // A served-projects file that does not read gives `status` a note.
+    let file = Registry::in_data_dir(ground.data()).file();
+    std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+    std::fs::write(file, "{ not json").unwrap();
+    let answer = ground.json("/api/orchestrator");
+    let warnings: Vec<&str> = answer["lines"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|line| line.as_str().unwrap())
+        .filter(|line| line.starts_with("warning: the served projects cannot be read"))
+        .collect();
+    assert_eq!(warnings.len(), 1, "{answer}");
+    assert_eq!(answer["notes"], json!([]));
+}
+
+#[test]
 fn the_orchestrators_lines_are_the_status_lines_it_shows_in_order() {
     let ground = Ground::new();
     let _daemon = bench(&ground);
