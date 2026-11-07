@@ -1,27 +1,28 @@
-//! The event log as the ticket page reads it (P8 part 6, OWL-471): an
-//! incremental reader of `<data>/events.jsonl`, which the page's snapshot
-//! asks every few seconds while it is open, and the run log's route asks
-//! before each read of a file.
+//! The event log as the UI reads it (P8 part 6, OWL-471, and part 5,
+//! OWL-460): one incremental reader of `<data>/events.jsonl`, which the
+//! ticket page's snapshot asks every few seconds while it is open, the run
+//! log's route asks before each read of a file, and the drain's graph asks
+//! at each refresh while a graph stream is open.
 //!
 //! The log is shared by every project of the machine and grows without end,
-//! so the reader keeps its byte offset and reads only what was appended
-//! since, never a half-written last line (it waits for the newline, as
-//! `events::print` does), and starts again from 0 when the file shrank. It
-//! keeps only the rows the page draws, those of a ticket: `run_started`,
-//! `run_ended`, `usage`, `warning`, `decision` and `dispatch`. A line that
-//! does not parse is counted, never fatal.
+//! so the reader is an [`EventTail`]: it keeps its byte offset and reads only
+//! what was appended since, never a half-written last line (it waits for the
+//! newline, as `events::print` does), and starts again from 0 when the file
+//! shrank or is another file. It keeps every event, since the graph's waits
+//! fold them all (`why::fold`); the ticket page's questions are answered by
+//! filtering them: the rows it draws are those of a ticket of the kinds
+//! `run_started`, `run_ended`, `usage`, `warning`, `decision` and `dispatch`.
+//! A line that does not parse is counted, never fatal.
 
-use std::fs::File;
-use std::io::{Read, Seek, SeekFrom};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Mutex;
 
 use owlshift_contracts::event::{Event, EventKind};
 use owlshift_contracts::ids::TicketId;
 
-use crate::events::EventLog;
+use crate::events::EventTail;
 
-/// The kinds of event the reader keeps.
+/// The kinds of event the ticket page draws.
 const KEPT: [EventKind; 6] = [
     EventKind::RunStarted,
     EventKind::RunEnded,
@@ -31,19 +32,9 @@ const KEPT: [EventKind; 6] = [
     EventKind::Dispatch,
 ];
 
-#[derive(Default)]
-struct State {
-    /// The offset of the first byte not read: a line start.
-    offset: u64,
-    rows: Vec<Event>,
-    /// The complete lines read that were no event.
-    unparsable: u64,
-}
-
 /// The incremental reader of a data directory's event log.
 pub struct Reader {
-    path: PathBuf,
-    state: Mutex<State>,
+    tail: Mutex<EventTail>,
 }
 
 /// What the reader holds of a ticket.
@@ -60,79 +51,39 @@ impl Reader {
     /// before the first question.
     pub fn new(data: &Path) -> Self {
         Self {
-            path: EventLog::in_dir(data).path().to_owned(),
-            state: Mutex::new(State::default()),
+            tail: Mutex::new(EventTail::in_dir(data)),
         }
     }
 
-    fn lock(&self) -> std::sync::MutexGuard<'_, State> {
-        self.state
+    fn lock(&self) -> std::sync::MutexGuard<'_, EventTail> {
+        self.tail
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
-    /// Reads what was appended since the last read, within `state`.
-    fn refresh(&self, state: &mut State) -> Result<(), String> {
-        let fail = |error: std::io::Error| format!("{}: {error}", self.path.display());
-        let mut file = match File::open(&self.path) {
-            Ok(file) => file,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                *state = State::default();
-                return Ok(());
-            }
-            Err(error) => return Err(fail(error)),
-        };
-        let size = file.metadata().map_err(fail)?.len();
-        if size < state.offset {
-            *state = State::default();
-        }
-        if size == state.offset {
-            return Ok(());
-        }
-        file.seek(SeekFrom::Start(state.offset)).map_err(fail)?;
-        let mut appended = Vec::new();
-        file.take(size - state.offset)
-            .read_to_end(&mut appended)
-            .map_err(fail)?;
-        // Only whole lines: the rest waits for its newline.
-        let whole = appended
-            .iter()
-            .rposition(|&b| b == b'\n')
-            .map_or(0, |at| at + 1);
-        for line in appended[..whole].split(|&b| b == b'\n') {
-            let text = String::from_utf8_lossy(line);
-            if text.trim().is_empty() {
-                continue;
-            }
-            match Event::parse(&text) {
-                Ok(event) => {
-                    if event.ticket.is_some() && KEPT.contains(&event.kind) {
-                        state.rows.push(event);
-                    }
-                }
-                Err(_) => state.unparsable += 1,
-            }
-        }
-        state.offset += whole as u64;
-        Ok(())
+    /// Reads what was appended since the last read, within `tail`.
+    fn refresh(tail: &mut EventTail) -> Result<(), String> {
+        tail.refresh()
+            .map_err(|error| format!("{}: {error}", tail.path().display()))
     }
 
     /// The rows of `ticket` of `project` (as the events spell it, in any
     /// ASCII case) after a read of what was appended.
     pub fn rows(&self, project: &str, ticket: &TicketId) -> Result<Rows, String> {
-        let mut state = self.lock();
-        self.refresh(&mut state)?;
+        let mut tail = self.lock();
+        Self::refresh(&mut tail)?;
         Ok(Rows {
-            events: state
-                .rows
+            events: tail
+                .events()
                 .iter()
                 .filter(|event| {
-                    event.project.eq_ignore_ascii_case(project)
+                    KEPT.contains(&event.kind)
+                        && event.project.eq_ignore_ascii_case(project)
                         && event.ticket.as_ref() == Some(ticket)
                 })
                 .cloned()
                 .collect(),
-            unparsable: state.unparsable,
+            unparsable: tail.notes().len() as u64,
         })
     }
 
@@ -140,11 +91,11 @@ impl Reader {
     /// A log that cannot be read says no: a run is then served as live for
     /// a poll more, never cut short.
     pub fn ended(&self, project: &str, ticket: &TicketId, run: &str) -> bool {
-        let mut state = self.lock();
-        if self.refresh(&mut state).is_err() {
+        let mut tail = self.lock();
+        if Self::refresh(&mut tail).is_err() {
             return false;
         }
-        state.rows.iter().any(|event| {
+        tail.events().iter().any(|event| {
             event.kind == EventKind::RunEnded
                 && event.run.as_deref() == Some(run)
                 && event.project.eq_ignore_ascii_case(project)
@@ -152,9 +103,16 @@ impl Reader {
         })
     }
 
+    /// Runs `read` on the tail itself, the log's lock held: the drain's
+    /// graph reads every event through it, from the offset the ticket page
+    /// had kept, never a second copy of the log.
+    pub fn with_tail<T>(&self, read: impl FnOnce(&mut EventTail) -> T) -> T {
+        read(&mut self.lock())
+    }
+
     /// The offset of the first byte not read.
     pub fn offset(&self) -> u64 {
-        self.lock().offset
+        self.lock().offset()
     }
 }
 
@@ -324,5 +282,39 @@ mod tests {
         assert_eq!(rows.events.len(), 1);
         assert_eq!(rows.events[0].kind, EventKind::Usage);
         assert_eq!(rows.unparsable, 1);
+    }
+
+    #[test]
+    fn the_graph_reads_every_event_through_the_same_offset() {
+        let dir = tempfile::tempdir().unwrap();
+        let reader = Reader::new(dir.path());
+        let log = dir.path().join("events.jsonl");
+        let ticket = TicketId::new("OWL-1").unwrap();
+        let scan = line(&event("o/r", "OWL-1", RUN, EventKind::Scan, Data::new()));
+        let usage = line(&event("o/r", "OWL-1", RUN, EventKind::Usage, Data::new()));
+        append(&log, &scan);
+        append(&log, &usage);
+        // The ticket page reads first: the graph's read starts from there,
+        // and holds the event the page's rows leave out.
+        assert_eq!(reader.rows("o/r", &ticket).unwrap().events.len(), 1);
+        let total = (scan.len() + usage.len()) as u64;
+        assert_eq!(reader.offset(), total);
+        let kinds = reader.with_tail(|tail| {
+            assert_eq!(tail.offset(), total);
+            tail.events().iter().map(|e| e.kind).collect::<Vec<_>>()
+        });
+        assert_eq!(kinds, [EventKind::Scan, EventKind::Usage]);
+        // What the graph's read takes in, the page's does not read again.
+        let ended = line(&event(
+            "o/r",
+            "OWL-1",
+            RUN,
+            EventKind::RunEnded,
+            Data::new(),
+        ));
+        append(&log, &ended);
+        reader.with_tail(|tail| tail.refresh().unwrap());
+        assert_eq!(reader.offset(), total + ended.len() as u64);
+        assert!(reader.ended("o/r", &ticket, RUN));
     }
 }
