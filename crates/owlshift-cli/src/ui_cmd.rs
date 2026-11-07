@@ -12,12 +12,14 @@
 use std::io::{self, Write};
 use std::path::Path;
 use std::process::{Command, ExitCode, ExitStatus, Stdio};
+use std::sync::Arc;
 
 use owlshift_runner::config::Effective;
 use owlshift_runner::daemon;
 use owlshift_runner::events::printable;
 use owlshift_runner::ui::auth::{self, RunSecret};
 use owlshift_runner::ui::probe::{self, Probe};
+use owlshift_runner::ui::reply;
 use owlshift_runner::ui::server::{self, Options};
 use owlshift_runner::ui::token;
 
@@ -55,7 +57,11 @@ pub fn run_daemon(listener_fd: i32, run_secret_fd: i32) -> ExitCode {
         Ok(listener) => listener,
         Err(error) => return fail(&format!("the socket handed over cannot be used: {error}")),
     };
-    match server::serve(&data, listener, run, Some(own_build()), Options::default()) {
+    let options = Options {
+        keys: Arc::new(reply::open_key),
+        ..Options::default()
+    };
+    match server::serve(&data, listener, run, Some(own_build()), options) {
         Ok(never) => match never {},
         Err(error) => fail(&error.to_string()),
     }

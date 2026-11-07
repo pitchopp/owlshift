@@ -54,6 +54,12 @@
 //!   /api/stream?graph=1` adds `{"graph":…}` lines to the stream: one at
 //!   once, and one whenever the graph changes with its `at` (the time of a
 //!   read) left out. Any other value of `graph` is ignored.
+//! - `POST /api/reply` `{"project", "ticket", "ask", "answers", "go"}`
+//!   (OWL-475), under the session as well: the decider's reply to the open
+//!   ask of a ticket, composed and posted through the operator's tracker key
+//!   ([`super::reply`]), only when the key's account is that ask's decider.
+//!   One reply at a time per ticket (409), and none to a round that changed
+//!   since the page read it (409).
 //!
 //! Every response, errors included, carries [`SECURITY_HEADERS`], and none
 //! a CORS header or a cookie. JSON goes out through [`json_text`], which
@@ -97,6 +103,7 @@ use super::auth::{self, CHALLENGE_LEN, RunSecret, UsedCodes};
 use super::eventtail::EventTail;
 use super::graph::{self, Graph, ReadyInput};
 use super::index::EventIndex;
+use super::reply::{self, KeyOpener, KeyState, Keys};
 use super::{
     configuration, events, header, orchestrator, overview, record, runlog, spend, tail, ticket,
     token,
@@ -179,6 +186,16 @@ pub struct Options {
     /// them on demand (OWL-472): [`HostSystem`] in production; the bench
     /// passes a scripted one that reaches nothing of the machine.
     pub system: Arc<dyn System + Send + Sync>,
+    /// Opens a served project's tracker key and reads its account, once per
+    /// project (OWL-475): [`reply::open_key`] for `owlshift ui --daemon`. The
+    /// default opens none, so a bench or a test never reads the system
+    /// keychain: the page then names the decider and offers no form.
+    pub keys: KeyOpener,
+}
+
+/// The opener of [`Options::default`]: no key.
+fn no_key(_: &Path, _: &Repo) -> Result<reply::Key, String> {
+    Err("this web UI was started without the tracker keys".into())
 }
 
 impl Default for Options {
@@ -194,6 +211,7 @@ impl Default for Options {
             streams: 16,
             personal: Arc::new(super::personal_now),
             system: Arc::new(HostSystem),
+            keys: Arc::new(no_key),
         }
     }
 }
@@ -275,6 +293,11 @@ struct Context {
     doctor: Mutex<()>,
     /// What the Spend screen keeps between two requests.
     spend: spend::Cache,
+    /// The served projects' tracker keys, each read once (OWL-475).
+    keys: Arc<Keys>,
+    /// The tickets a reply is being posted to, by lower-cased project and
+    /// ticket: one at a time each.
+    replying: Mutex<HashSet<(String, String)>>,
 }
 
 /// A serving web UI. Dropping it stops taking requests.
@@ -381,6 +404,7 @@ pub fn start(
         Server::from_listener(listener, None)
             .map_err(|error| ServeError::Server(error.to_string()))?,
     );
+    let options_keys = options.keys.clone();
     let context = Arc::new(Context {
         data: data.to_owned(),
         run,
@@ -395,7 +419,22 @@ pub fn start(
         build,
         doctor: Mutex::new(()),
         spend: spend::Cache::default(),
+        keys: Keys::new(options_keys),
+        replying: Mutex::new(HashSet::new()),
     });
+    // The keys of the projects served now, read once on a thread of their
+    // own; a project served later is read at its first ticket page.
+    let served: Vec<Repo> = Registry::in_data_dir(data)
+        .read()
+        .map(|served| {
+            served
+                .projects
+                .iter()
+                .filter_map(|project| Repo::parse(&project.repository).ok())
+                .collect()
+        })
+        .unwrap_or_default();
+    context.keys.read_all(data, served);
     let stopping = Arc::new(AtomicBool::new(false));
     let accept = {
         let (server, context, stopping) = (server.clone(), context.clone(), stopping.clone());
@@ -634,6 +673,13 @@ fn handle(context: &Arc<Context>, mut request: Request) {
                     200,
                     &serde_json::to_value(graph_now(context)).unwrap_or(Value::Null),
                 )
+            }
+        }
+        (Method::Post, "/api/reply") => {
+            if !in_session(context, &request) {
+                error_response(401, "not logged in: run `owlshift ui` in a terminal")
+            } else {
+                reply_page(context, &body)
             }
         }
         (Method::Get, "/api/ticket" | "/api/ticket/log") => {
@@ -927,6 +973,7 @@ fn ticket_page(context: &Context, url: &str) -> Response<Cursor<Vec<u8>>> {
     };
     let git = crate::project::runner_git();
     let personal = (context.options.personal)();
+    let key = context.keys.state(&context.data, &repo);
     let inputs = ticket::Inputs {
         data: &context.data,
         git: &git,
@@ -934,8 +981,180 @@ fn ticket_page(context: &Context, url: &str) -> Response<Cursor<Vec<u8>>> {
         cache: &context.tickets,
         concurrent_runs: crate::usage::concurrent_runs(&personal),
         now: Timestamp::now(),
+        key: &key,
     };
     json_response(200, &ticket::snapshot(&inputs, &repo, &ticket))
+}
+
+/// The form `POST /api/reply` sends, read strictly: `answers` a list of
+/// `{"question", "choice", "text"}`, `choice` an option's letter,
+/// `"recommendation"` or null, `go` a boolean.
+fn reply_form(value: &Value) -> Result<(String, String, reply::Form), &'static str> {
+    let text = |key: &str| value.get(key).and_then(Value::as_str).map(str::to_owned);
+    let (Some(project), Some(ticket), Some(ask)) = (text("project"), text("ticket"), text("ask"))
+    else {
+        return Err("a reply names its project, its ticket and the ask it answers");
+    };
+    let Some(go) = value.get("go").and_then(Value::as_bool) else {
+        return Err("a reply says whether it counts now (go)");
+    };
+    let Some(listed) = value.get("answers").and_then(Value::as_array) else {
+        return Err("a reply lists its answers");
+    };
+    let mut answers = Vec::new();
+    for answer in listed {
+        let Some(question) = answer.get("question").and_then(Value::as_str) else {
+            return Err("each answer names its question");
+        };
+        let choice = match answer.get("choice") {
+            None | Some(Value::Null) => None,
+            Some(Value::String(choice)) if choice == "recommendation" => {
+                Some(reply::Choice::Recommendation)
+            }
+            Some(Value::String(letter))
+                if !letter.is_empty() && letter.bytes().all(|b| b.is_ascii_uppercase()) =>
+            {
+                Some(reply::Choice::Letter(letter.clone()))
+            }
+            Some(_) => return Err("a choice is an option's letter or the recommendation"),
+        };
+        let text = match answer.get("text") {
+            None | Some(Value::Null) => String::new(),
+            Some(Value::String(text)) => text.clone(),
+            Some(_) => return Err("an answer's text is a text"),
+        };
+        answers.push(reply::Answer {
+            question: question.to_owned(),
+            choice,
+            text,
+        });
+    }
+    Ok((project, ticket, reply::Form { ask, answers, go }))
+}
+
+/// Removes its ticket from the replies under way when dropped.
+struct Replying<'a> {
+    context: &'a Context,
+    key: (String, String),
+}
+
+impl Drop for Replying<'_> {
+    fn drop(&mut self) {
+        self.context
+            .replying
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&self.key);
+    }
+}
+
+/// `POST /api/reply` (OWL-475): the decider's reply to the open ask of a
+/// ticket, posted through the operator's key. 403 when the form is not
+/// offered or the floor refuses the reply, 409 for a round that changed or a
+/// reply to the ticket under way, 400 for a form that does not compose, 502
+/// for the tracker's error, and 200 with the comment once posted. One line on
+/// the UI's error output names the project, the ticket, the round and the
+/// comment, never the body.
+fn reply_page(context: &Context, body: &[u8]) -> Response<Cursor<Vec<u8>>> {
+    let Ok(value) = serde_json::from_slice::<Value>(body) else {
+        return error_response(400, "the body is a JSON object");
+    };
+    let (project, ticket, form) = match reply_form(&value) {
+        Ok(read) => read,
+        Err(why) => return error_response(400, why),
+    };
+    let pairs = [
+        ("project".to_owned(), project),
+        ("ticket".to_owned(), ticket),
+    ];
+    let (repo, ticket) = match target(context, &pairs) {
+        Ok(target) => target,
+        Err(response) => return response,
+    };
+    let state = context.keys.state(&context.data, &repo);
+    let key = match &*state {
+        KeyState::Ready(key) => key,
+        KeyState::Reading => {
+            return error_response(
+                403,
+                "the account of the project's tracker key is still being read",
+            );
+        }
+        KeyState::Unavailable(why) => {
+            return error_response(
+                403,
+                &format!("the project's tracker key cannot be used: {why}"),
+            );
+        }
+    };
+    let busy = (
+        repo.to_string().to_ascii_lowercase(),
+        ticket.as_str().to_owned(),
+    );
+    if !context
+        .replying
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert(busy.clone())
+    {
+        return error_response(409, "a reply to this ticket is being posted");
+    }
+    let _replying = Replying { context, key: busy };
+    let git = crate::project::runner_git();
+    let checkout = ProjectDirs::new(&context.data, &repo).checkout();
+    let stored = match crate::ticket_ref::read(&git, &checkout, &ticket) {
+        Ok(Some(stored)) => stored,
+        Ok(None) => return error_response(409, "the ticket waits for no answer"),
+        Err(why) => return error_response(503, &format!("the ticket cannot be read: {why}")),
+    };
+    let offer = reply::section(&stored.record, &state, &ticket);
+    if offer["offered"] != Value::Bool(true) {
+        if offer.is_null() || offer["ask"] != Value::String(form.ask.clone()) {
+            return error_response(
+                409,
+                "the ticket no longer waits on the round this page shows: reload it",
+            );
+        }
+        let why = offer["why_not"]
+            .as_str()
+            .unwrap_or("the form is not offered");
+        return error_response(403, why);
+    }
+    let round = offer["round"].clone();
+    match reply::send(
+        key.tracker.as_ref(),
+        &key.account,
+        &stored.record,
+        &ticket,
+        &form,
+    ) {
+        Ok(comment) => {
+            eprintln!(
+                "The web UI posted the decider's reply to {repo} {ticket}, round {round}: \
+                 comment {}",
+                comment.id
+            );
+            json_response(
+                200,
+                &json!({
+                    "comment": comment.id,
+                    "at": comment.created_at.to_string(),
+                    "counts_now": form.go,
+                }),
+            )
+        }
+        Err(reply::ReplyError::RoundChanged) => error_response(
+            409,
+            "the ticket no longer waits on the round this page shows: reload it",
+        ),
+        Err(reply::ReplyError::Compose(error)) => error_response(400, &error.to_string()),
+        Err(reply::ReplyError::Write(crate::writer::WriteError::Floor(violation))) => {
+            error_response(403, &format!("refused by the policy floor: {violation}"))
+        }
+        Err(reply::ReplyError::Write(error)) => {
+            error_response(502, &format!("the reply was not posted: {error}"))
+        }
+    }
 }
 
 /// `GET /api/ticket/log?project&ticket&run&file=stdout|stderr&from=N[&line=L]`:
