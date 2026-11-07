@@ -787,8 +787,15 @@ fn spend_splits_by_role_harness_ticket_and_keeps_runs_with_the_same_id_apart() {
         .collect();
     assert!(tickets.contains(&("OWL-1".to_owned(), 1_500_000)));
     assert!(tickets.contains(&("OWL-2".to_owned(), 500_000)));
-    // The events' total and cost.json's are separate fields.
-    assert!(answer["tickets"][0].get("cost").is_some());
+    // The events' total and cost.json's are separate fields: no ticket ref
+    // here, so no cost.json (the next test has some).
+    assert!(
+        answer["tickets"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|t| t["cost"].is_null())
+    );
     assert_eq!(answer["events"]["total_micros"], 2_250_000);
 }
 
@@ -919,6 +926,182 @@ fn spends_rev_changes_with_everything_the_answer_shows_and_with_nothing_else() {
     let after = ask("2026-11-05T10:00:00Z", before["rev"].as_str(), &capped);
     assert!(after.get("unchanged").is_none());
     assert_eq!(after["events"]["total_micros"], 1_500_000);
+}
+
+/// Writes `cost` as the cost of `ticket` in the ticket ref of the checkout of
+/// the served project `repo` (made if need be), after `previous`.
+fn put_cost(
+    ground: &Ground,
+    repo: &str,
+    ticket: &str,
+    cost: &str,
+    previous: Option<&str>,
+) -> String {
+    let dirs = ProjectDirs::new(ground.data(), &Repo::parse(repo).unwrap());
+    let checkout = dirs.checkout();
+    let git = owlshift_runner::project::runner_git();
+    if !checkout.exists() {
+        std::fs::create_dir_all(&checkout).unwrap();
+        for args in [
+            &["init", "-q", "-b", "main"][..],
+            &["config", "user.name", "Ada"],
+            &["config", "user.email", "ada@example.com"],
+        ] {
+            let status = std::process::Command::new("git")
+                .args(args)
+                .current_dir(&checkout)
+                .status()
+                .unwrap();
+            assert!(status.success(), "git {args:?}");
+        }
+    }
+    let record = owlshift_runner::ticket_ref::blank(Some(
+        owlshift_contracts::refs::TicketCost::parse(cost).unwrap(),
+    ));
+    owlshift_runner::ticket_ref::write(
+        &git,
+        &checkout,
+        &owlshift_contracts::ids::TicketId::new(ticket).unwrap(),
+        &record,
+        previous,
+    )
+    .unwrap()
+}
+
+fn cost_json(runs: u32, unreported: u32, spent: u64, restarted: u64) -> String {
+    format!(
+        r#"{{"format":1,"runs":{runs},"unreported_runs":{unreported},"spent_micros":{spent},"restarted_at_micros":{restarted}}}"#
+    )
+}
+
+#[test]
+fn spend_shows_each_tickets_cost_json_against_the_budget_and_follows_the_budget_and_a_restart() {
+    use owlshift_runner::ui::index::EventIndex;
+    use owlshift_runner::ui::spend::{self, Cache, Query};
+    let ground = Ground::new();
+    ground.serve(&["acme/web"]);
+    keep(&ground, "acme/web", PROJECT, None);
+    // Three runs, one of which reported no cost, one restart at 2.5.
+    let first = put_cost(
+        &ground,
+        "acme/web",
+        "OWL-1",
+        &cost_json(3, 1, 2_750_000, 2_500_000),
+        None,
+    );
+    put_cost(
+        &ground,
+        "acme/web",
+        "OWL-2",
+        &cost_json(1, 0, 400_000, 0),
+        None,
+    );
+    ground.append_log(&started(
+        "2026-11-05T09:00:00Z",
+        "OWL-1",
+        "r1",
+        "build",
+        Some("claude"),
+    ));
+    ground.append_log(&used("2026-11-05T09:30:00Z", "OWL-1", "r1", 0.25));
+    let index = std::sync::Mutex::new(EventIndex::new(ground.data()));
+    // Every request reads the refs again, as a request after the 10 s the
+    // refs are kept does.
+    let cache = Cache::keeping_refs_for(Duration::ZERO);
+    let none = absent();
+    let ask = |rev: Option<&str>| {
+        spend::answer(
+            &spend::Inputs {
+                data: ground.data(),
+                index: &index,
+                personal: &none,
+                cache: &cache,
+                now: ts("2026-11-05T10:00:00Z"),
+                tz: TimeZone::UTC,
+            },
+            &Query {
+                rev: rev.map(str::to_owned),
+                ..Query::default()
+            },
+        )
+    };
+    let row = |answer: &Value, ticket: &str| {
+        answer["tickets"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["ticket"] == ticket)
+            .unwrap_or_else(|| panic!("no row for {ticket}: {answer}"))
+            .clone()
+    };
+    let answer = ask(None);
+    let one = row(&answer, "OWL-1");
+    assert_eq!(
+        one["cost"],
+        json!({
+            "runs": 3,
+            "unreported_runs": 1,
+            "spent_micros": 2_750_000,
+            "restarted_at_micros": 2_500_000,
+            // The spend since the restart, as the budget counts it.
+            "counted_micros": 250_000,
+            "budget_micros": 5_000_000,
+        })
+    );
+    // The events' sum is its own column.
+    assert_eq!(one["events_micros"], 250_000);
+    let two = row(&answer, "OWL-2");
+    assert_eq!(two["cost"]["spent_micros"], 400_000);
+    assert_eq!(two["cost"]["counted_micros"], 400_000);
+    assert_eq!(two["cost"]["unreported_runs"], 0);
+    assert_eq!(two["events_micros"], 0);
+    // The counted part is what the budget's own TicketSpend counts.
+    let spend = owlshift_core::gate::TicketSpend::try_from(
+        &owlshift_contracts::refs::TicketCost::parse(&cost_json(3, 1, 2_750_000, 2_500_000))
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(one["cost"]["counted_micros"], spend.counted_micros());
+    // The same question, the same rev: nothing to redraw.
+    let rev = answer["rev"].as_str().unwrap().to_owned();
+    assert_eq!(ask(Some(&rev))["unchanged"], true);
+    // The budget changed in the file the project runs on.
+    keep(
+        &ground,
+        "acme/web",
+        &PROJECT.replace("ticket_budget_usd = 5.0", "ticket_budget_usd = 8.0"),
+        None,
+    );
+    let budget = ask(Some(&rev));
+    assert!(budget.get("unchanged").is_none(), "{budget}");
+    assert_eq!(row(&budget, "OWL-1")["cost"]["budget_micros"], 8_000_000);
+    assert_eq!(row(&budget, "OWL-2")["cost"]["budget_micros"], 8_000_000);
+    let rev = budget["rev"].as_str().unwrap().to_owned();
+    assert_eq!(ask(Some(&rev))["unchanged"], true);
+    // A person restarted the ticket: the ref moves its restart to the spend.
+    put_cost(
+        &ground,
+        "acme/web",
+        "OWL-1",
+        &cost_json(3, 1, 2_750_000, 2_750_000),
+        Some(&first),
+    );
+    let restarted = ask(Some(&rev));
+    assert!(restarted.get("unchanged").is_none(), "{restarted}");
+    assert_eq!(row(&restarted, "OWL-1")["cost"]["counted_micros"], 0);
+    assert_eq!(
+        row(&restarted, "OWL-1")["cost"]["restarted_at_micros"],
+        2_750_000
+    );
+    // A project file without a budget shows none.
+    keep(
+        &ground,
+        "acme/web",
+        &PROJECT.replace("ticket_budget_usd = 5.0\n", ""),
+        None,
+    );
+    let unbudgeted = ask(None);
+    assert!(row(&unbudgeted, "OWL-1")["cost"]["budget_micros"].is_null());
 }
 
 #[test]

@@ -34,6 +34,7 @@ use jiff::Timestamp;
 use jiff::tz::TimeZone;
 use owlshift_adapters::forge::Repo;
 use owlshift_contracts::config::PersonalConfig;
+use owlshift_core::gate::TicketSpend;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
@@ -99,10 +100,28 @@ impl Default for Query {
 }
 
 /// What the screen keeps between two requests.
-#[derive(Default)]
 pub struct Cache {
     refs: Mutex<Option<(Instant, Vec<Ticket>)>>,
+    refs_kept: Duration,
     fold: Mutex<Option<(FoldKey, Fold)>>,
+}
+
+impl Default for Cache {
+    fn default() -> Self {
+        Self::keeping_refs_for(REFS_KEPT)
+    }
+}
+
+impl Cache {
+    /// A cache that reads the ticket refs again once they are `kept` old;
+    /// `Duration::ZERO` reads them on every request.
+    pub fn keeping_refs_for(kept: Duration) -> Self {
+        Self {
+            refs: Mutex::new(None),
+            refs_kept: kept,
+            fold: Mutex::new(None),
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -124,7 +143,9 @@ struct Fold {
     harnesses: BTreeMap<String, u64>,
 }
 
-/// One ticket's `cost.json` and its project's budget.
+/// One ticket's `cost.json`. Its project's budget is not kept with it: the
+/// kept project file is read on every request, so a budget that changes shows
+/// at once.
 #[derive(Clone, Debug)]
 struct Ticket {
     project: String,
@@ -134,7 +155,6 @@ struct Ticket {
     spent_micros: u64,
     restarted_at_micros: u64,
     counted_micros: u64,
-    budget_micros: Option<u64>,
 }
 
 /// What the answer is made from.
@@ -153,12 +173,24 @@ fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
+/// The `policy.ticket_budget_usd` of the project file `repository` runs on,
+/// in millionths of a dollar: `None` when it sets none or runs on no file.
+fn budget_of(inputs: &Inputs<'_>, repository: &str) -> Option<u64> {
+    let repo = Repo::parse(repository).ok()?;
+    let dirs = ProjectDirs::new(inputs.data, &repo);
+    let effective = served::effective(&repo, &dirs, path_of(inputs.personal)).ok()?;
+    match effective.project {
+        FileState::Loaded { config, .. } => config.policy.ticket_budget_micros(),
+        _ => None,
+    }
+}
+
 /// The tickets' cost totals of every served project, read at most every
-/// [`REFS_KEPT`]; the notes say what could not be read.
+/// [`Cache::keeping_refs_for`]; the notes say what could not be read.
 fn tickets(inputs: &Inputs<'_>, notes: &mut Vec<String>) -> Vec<Ticket> {
     let mut kept = lock(&inputs.cache.refs);
     if let Some((at, rows)) = kept.as_ref()
-        && at.elapsed() < REFS_KEPT
+        && at.elapsed() < inputs.cache.refs_kept
     {
         return rows.clone();
     }
@@ -170,19 +202,11 @@ fn tickets(inputs: &Inputs<'_>, notes: &mut Vec<String>) -> Vec<Ticket> {
             return rows;
         }
     };
-    let personal = path_of(inputs.personal);
     for entry in &served.projects {
         let Ok(repo) = Repo::parse(&entry.repository) else {
             continue;
         };
         let dirs = ProjectDirs::new(inputs.data, &repo);
-        // The budget is the project file's that the project runs on.
-        let budget = served::effective(&repo, &dirs, personal.clone())
-            .ok()
-            .and_then(|effective| match effective.project {
-                FileState::Loaded { config, .. } => config.policy.ticket_budget_micros(),
-                _ => None,
-            });
         if !dirs.checkout().exists() {
             continue;
         }
@@ -193,6 +217,11 @@ fn tickets(inputs: &Inputs<'_>, notes: &mut Vec<String>) -> Vec<Ticket> {
                     let Some(cost) = stored.record.cost else {
                         continue;
                     };
+                    // `read` refuses a cost.json whose parts contradict each
+                    // other, so this conversion only counts what the budget counts.
+                    let Ok(spend) = TicketSpend::try_from(&cost) else {
+                        continue;
+                    };
                     rows.push(Ticket {
                         project: entry.repository.clone(),
                         ticket: ticket.as_str().to_owned(),
@@ -200,8 +229,7 @@ fn tickets(inputs: &Inputs<'_>, notes: &mut Vec<String>) -> Vec<Ticket> {
                         unreported_runs: cost.unreported_runs,
                         spent_micros: cost.spent_micros,
                         restarted_at_micros: cost.restarted_at_micros,
-                        counted_micros: cost.spent_micros.saturating_sub(cost.restarted_at_micros),
-                        budget_micros: budget,
+                        counted_micros: spend.counted_micros(),
                     });
                 }
             }
@@ -320,14 +348,18 @@ pub fn answer(inputs: &Inputs<'_>, query: &Query) -> Value {
             json!({ "project": project, "ticket": ticket, "events_micros": micros, "cost": null }),
         );
     }
+    let mut budgets: BTreeMap<String, Option<u64>> = BTreeMap::new();
     for row in rows {
+        let budget = *budgets
+            .entry(row.project.to_ascii_lowercase())
+            .or_insert_with(|| budget_of(inputs, &row.project));
         let cost = json!({
             "runs": row.runs,
             "unreported_runs": row.unreported_runs,
             "spent_micros": row.spent_micros,
             "restarted_at_micros": row.restarted_at_micros,
             "counted_micros": row.counted_micros,
-            "budget_micros": row.budget_micros,
+            "budget_micros": budget,
         });
         let key = (row.project.to_ascii_lowercase(), row.ticket.clone());
         match tickets.get_mut(&key) {
