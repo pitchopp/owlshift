@@ -74,6 +74,56 @@ pub enum Action {
     /// Write a `blocks` relation between two tickets: a dependency intake
     /// found (architecture section 5, "Dependencies to relations").
     Relate,
+    /// Post the decider's own reply to the open ask of a ticket, from the
+    /// local web UI through the operator's tracker key (architecture
+    /// section 5, "Replies from the UI"): the one write the UI makes, and
+    /// one the runner never makes, since an unmarked comment of the
+    /// runner's would read as the decider's.
+    Reply(ReplyFacts),
+}
+
+/// What the floor reads of a reply the UI would post ([`Action::Reply`]).
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct ReplyFacts {
+    /// Whether the body carries any of Owlshift's markers, in the Writer's
+    /// strict reading.
+    pub marked: bool,
+    /// The account of the key the reply is posted through.
+    pub key_account: String,
+    /// Whether that account is an app user.
+    pub key_is_app: bool,
+    /// The decider's account of the ticket's open ask; `None` when the
+    /// ticket waits for no answer.
+    pub open_ask_decider: Option<String>,
+}
+
+/// Which component a Writer writes for: the runner, or the local web UI,
+/// whose one write is [`Action::Reply`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Origin {
+    Runner,
+    Ui,
+}
+
+/// Why the floor refuses a reply from the UI.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum ReplyRefusal {
+    /// The body carries one of Owlshift's markers: it could read as the
+    /// runner's own comment.
+    Marked,
+    /// The key's account is an app user, never an operator's.
+    AppKey,
+    /// The ticket waits for no answer.
+    NoOpenAsk,
+    /// The key's account is not the decider of the open ask.
+    NotTheDecider,
+}
+
+/// Whether the tracker account `account` is `decider`'s, compared as the
+/// runner compares accounts: by identifier, exactly, an empty or blank
+/// identifier matching nothing.
+pub fn same_account(account: &str, decider: &str) -> bool {
+    !account.trim().is_empty() && account == decider
 }
 
 /// Whether a human approval of the action is recorded on the ticket.
@@ -87,24 +137,72 @@ pub enum HumanApproval {
 /// merge grant whose expected head is a full commit id, whatever approval is
 /// recorded (without the grant a human merges); a deploy or an
 /// infrastructure change needs a human approval recorded on the ticket;
-/// everything else passes.
+/// a reply in the decider's name is the UI's alone ([`check_from`]);
+/// everything else passes. The runner's check: [`check_from`] under
+/// [`Origin::Runner`].
 pub fn check_action(action: Action, approval: HumanApproval) -> Result<(), FloorViolation> {
+    check_from(Origin::Runner, action, approval)
+}
+
+/// Checks a Writer action of `origin` against the floor. Under
+/// [`Origin::Runner`], [`check_action`]'s rules, a reply in the decider's
+/// name refused. Under [`Origin::Ui`], every action but that reply is
+/// refused, and the reply passes only unmarked, through a key that is no
+/// app's, whose account is the open ask's decider ([`same_account`]).
+pub fn check_from(
+    origin: Origin,
+    action: Action,
+    approval: HumanApproval,
+) -> Result<(), FloorViolation> {
     // No wildcard: a new action does not compile until the floor decides it.
-    match action {
-        Action::Merge(Some(grant)) if is_commit_id(grant.head()) => Ok(()),
-        Action::Merge(_) => Err(FloorViolation::Merge),
-        Action::Deploy | Action::ChangeInfrastructure => match approval {
-            HumanApproval::Recorded => Ok(()),
-            HumanApproval::Absent => Err(FloorViolation::Unapproved(action)),
+    match origin {
+        Origin::Runner => match action {
+            Action::Merge(Some(grant)) if is_commit_id(grant.head()) => Ok(()),
+            Action::Merge(_) => Err(FloorViolation::Merge),
+            Action::Deploy | Action::ChangeInfrastructure => match approval {
+                HumanApproval::Recorded => Ok(()),
+                HumanApproval::Absent => Err(FloorViolation::Unapproved(action)),
+            },
+            Action::Comment
+            | Action::Document
+            | Action::SetVisibleStage
+            | Action::ProposeFollowup
+            | Action::PushBranch
+            | Action::PushRef
+            | Action::OpenPullRequest => Ok(()),
+            Action::Relate => Ok(()),
+            Action::Reply(_) => Err(FloorViolation::ReplyNotFromUi),
         },
-        Action::Comment
-        | Action::Document
-        | Action::SetVisibleStage
-        | Action::ProposeFollowup
-        | Action::PushBranch
-        | Action::PushRef
-        | Action::OpenPullRequest => Ok(()),
-        Action::Relate => Ok(()),
+        Origin::Ui => match action {
+            Action::Reply(facts) => check_reply(&facts).map_err(FloorViolation::Reply),
+            other @ (Action::Comment
+            | Action::Document
+            | Action::SetVisibleStage
+            | Action::ProposeFollowup
+            | Action::PushBranch
+            | Action::PushRef
+            | Action::OpenPullRequest
+            | Action::Merge(_)
+            | Action::Deploy
+            | Action::ChangeInfrastructure
+            | Action::Relate) => Err(FloorViolation::FromUi(other)),
+        },
+    }
+}
+
+/// The rule of a reply from the UI, its refusals in this order: a marker,
+/// an app's key, no open ask, another account than its decider.
+fn check_reply(facts: &ReplyFacts) -> Result<(), ReplyRefusal> {
+    if facts.marked {
+        return Err(ReplyRefusal::Marked);
+    }
+    if facts.key_is_app {
+        return Err(ReplyRefusal::AppKey);
+    }
+    match &facts.open_ask_decider {
+        None => Err(ReplyRefusal::NoOpenAsk),
+        Some(decider) if same_account(&facts.key_account, decider) => Ok(()),
+        Some(_) => Err(ReplyRefusal::NotTheDecider),
     }
 }
 
@@ -325,6 +423,29 @@ pub enum FloorViolation {
     CredentialVariables(Vec<String>),
     /// A proposal would carry this admission label (OWL-253).
     ProposalAdmitted(String),
+    /// The local web UI's one write is the decider's reply: this action is
+    /// refused from it.
+    FromUi(Action),
+    /// The runner never posts a reply in the decider's name.
+    ReplyNotFromUi,
+    /// A reply from the UI that the floor refuses, and why.
+    Reply(ReplyRefusal),
+}
+
+impl fmt::Display for ReplyRefusal {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Marked => {
+                "the reply carries one of Owlshift's markers (a line starting `[owlshift]` or an \
+                 `<!-- owlshift:` footer), so it could read as Owlshift's own comment"
+            }
+            Self::AppKey => "the tracker key's account is an app user, not an operator's",
+            Self::NoOpenAsk => "the ticket waits for no answer",
+            Self::NotTheDecider => {
+                "the tracker key's account is not the decider of the ticket's open questions"
+            }
+        })
+    }
 }
 
 impl fmt::Display for FloorViolation {
@@ -348,6 +469,15 @@ impl fmt::Display for FloorViolation {
                 "a proposal would carry the admission label {label:?} and enter the queue \
                  without a person"
             ),
+            Self::FromUi(action) => write!(
+                f,
+                "{action:?} is refused from the web UI: its one write is the decider's reply"
+            ),
+            Self::ReplyNotFromUi => f.write_str(
+                "Owlshift never posts a reply in the decider's name: only the web UI does, \
+                 through their own key",
+            ),
+            Self::Reply(refusal) => write!(f, "the reply is refused: {refusal}"),
         }
     }
 }
@@ -423,6 +553,117 @@ mod tests {
         for action in actions {
             assert_eq!(check_action(action, HumanApproval::Absent), Ok(()));
         }
+    }
+
+    fn facts(marked: bool, account: &str, app: bool, decider: Option<&str>) -> ReplyFacts {
+        ReplyFacts {
+            marked,
+            key_account: account.to_owned(),
+            key_is_app: app,
+            open_ask_decider: decider.map(str::to_owned),
+        }
+    }
+
+    fn from_ui(facts: ReplyFacts) -> Result<(), FloorViolation> {
+        check_from(Origin::Ui, Action::Reply(facts), HumanApproval::Absent)
+    }
+
+    #[test]
+    fn the_ui_may_post_only_an_unmarked_reply_of_the_asks_decider() {
+        assert_eq!(from_ui(facts(false, "u1", false, Some("u1"))), Ok(()));
+        for (refused, why) in [
+            (facts(true, "u1", false, Some("u1")), ReplyRefusal::Marked),
+            (facts(false, "u1", true, Some("u1")), ReplyRefusal::AppKey),
+            (
+                facts(false, "", false, Some("")),
+                ReplyRefusal::NotTheDecider,
+            ),
+            (
+                facts(false, "  ", false, Some("  ")),
+                ReplyRefusal::NotTheDecider,
+            ),
+            (facts(false, "u1", false, None), ReplyRefusal::NoOpenAsk),
+            (
+                facts(false, "u1", false, Some("u2")),
+                ReplyRefusal::NotTheDecider,
+            ),
+            (
+                facts(false, "u1", false, Some("U1")),
+                ReplyRefusal::NotTheDecider,
+            ),
+        ] {
+            assert_eq!(
+                from_ui(refused.clone()),
+                Err(FloorViolation::Reply(why)),
+                "{refused:?}"
+            );
+        }
+        // A recorded approval changes nothing.
+        assert_eq!(
+            check_from(
+                Origin::Ui,
+                Action::Reply(facts(false, "u1", false, Some("u2"))),
+                HumanApproval::Recorded
+            ),
+            Err(FloorViolation::Reply(ReplyRefusal::NotTheDecider))
+        );
+    }
+
+    #[test]
+    fn every_other_action_from_the_ui_is_refused() {
+        let grant = MergeGrant::new(&"a".repeat(40), MergeMethod::Squash);
+        let actions = [
+            Action::Comment,
+            Action::Document,
+            Action::SetVisibleStage,
+            Action::ProposeFollowup,
+            Action::PushBranch,
+            Action::PushRef,
+            Action::OpenPullRequest,
+            Action::Merge(None),
+            Action::Merge(Some(grant)),
+            Action::Deploy,
+            Action::ChangeInfrastructure,
+            Action::Relate,
+        ];
+        for action in actions {
+            for approval in [HumanApproval::Absent, HumanApproval::Recorded] {
+                assert_eq!(
+                    check_from(Origin::Ui, action.clone(), approval),
+                    Err(FloorViolation::FromUi(action.clone())),
+                    "{action:?} {approval:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_runner_may_not_post_a_decider_reply() {
+        for approval in [HumanApproval::Absent, HumanApproval::Recorded] {
+            let reply = Action::Reply(facts(false, "u1", false, Some("u1")));
+            assert_eq!(
+                check_action(reply.clone(), approval),
+                Err(FloorViolation::ReplyNotFromUi)
+            );
+            assert_eq!(
+                check_from(Origin::Runner, reply, approval),
+                Err(FloorViolation::ReplyNotFromUi)
+            );
+        }
+        // The runner's checks are check_action's.
+        assert_eq!(
+            check_from(Origin::Runner, Action::Comment, HumanApproval::Absent),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn an_account_is_the_deciders_by_its_exact_identifier() {
+        assert!(same_account("u1", "u1"));
+        assert!(!same_account("u1", "u2"));
+        assert!(!same_account("u1", "U1"));
+        assert!(!same_account("", ""));
+        assert!(!same_account(" ", " "));
     }
 
     #[test]
@@ -551,6 +792,20 @@ mod tests {
             FloorViolation::Merge.to_string(),
             "Owlshift merges a pull request only under the project's merge on green, at the \
              head it pushed: otherwise a human does"
+        );
+        assert_eq!(
+            FloorViolation::FromUi(Action::SetVisibleStage).to_string(),
+            "SetVisibleStage is refused from the web UI: its one write is the decider's reply"
+        );
+        assert_eq!(
+            FloorViolation::Reply(ReplyRefusal::NotTheDecider).to_string(),
+            "the reply is refused: the tracker key's account is not the decider of the \
+             ticket's open questions"
+        );
+        assert!(
+            FloorViolation::ReplyNotFromUi
+                .to_string()
+                .contains("never posts a reply in the decider's name")
         );
     }
 }
