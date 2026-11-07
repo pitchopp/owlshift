@@ -1455,14 +1455,7 @@ mod tests {
         let mut tail = crate::events::EventTail::in_dir(dir.path());
         tail.refresh().unwrap();
         let whole = gather(dir.path(), Some(&repo), 2, now);
-        let tailed = gather_with(
-            dir.path(),
-            Some(&repo),
-            2,
-            now,
-            tail.events(),
-            Vec::new(),
-        );
+        let tailed = gather_with(dir.path(), Some(&repo), 2, now, tail.events(), Vec::new());
         assert_eq!(build(&whole), build(&tailed));
         assert_eq!(whole.projects.len(), 1);
         assert!(matches!(tailed.projects[0].snapshot, Ok(None)));
