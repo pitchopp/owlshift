@@ -18,11 +18,13 @@
 //!   rule of [`super::tail`] ever shortens a line, never the classifier.
 //!
 //! Only the shapes the recorded fixtures hold are named
-//! (`crates/owlshift-adapters/tests/fixtures`): Codex's `reasoning`,
-//! `file_change`, `web_search` and `todo_list` items and its `item.updated`
-//! event were never recorded, so they show as unknown until a recording
-//! settles them (AGENTS.md: an assumption about an external tool is
-//! verified before code depends on it).
+//! (`crates/owlshift-adapters/tests/fixtures`): Codex's `todo_list` items
+//! and its `item.updated` event were never recorded, because `codex exec`
+//! 0.154.0 does not offer the plan tool (build plan, P8 part 6, OWL-502),
+//! so they show as unknown until a Codex version records them (AGENTS.md:
+//! an assumption about an external tool is verified before code depends on
+//! it). A web_search item carries the key `id` twice; `Value` keeps the
+//! last, which is why this module never parses an item into a typed struct.
 
 use serde_json::{Map, Value, json};
 
@@ -621,6 +623,34 @@ fn item(line: u64, offset: u64, value: &Value) -> Option<Vec<ViewRecord>> {
         )
         .label("collab")
         .body(pretty(item)),
+        // Recorded 2026-11-07 (codex-cli 0.154.0, `items_shapes`): `text`
+        // holds the reasoning summary.
+        "reasoning" => {
+            ViewRecord::new(line, offset, Kind::Thinking, str_of(item, "text")?).label("reasoning")
+        }
+        // `changes[]` of `{path, kind}`; `status` goes in_progress, then
+        // completed. A `failed` status was never recorded, so it sets no
+        // error flag: the state shows it as it is.
+        "file_change" => {
+            let changes: Vec<String> = item
+                .get("changes")?
+                .as_array()?
+                .iter()
+                .map(|change| {
+                    format!(
+                        "{} {}",
+                        str_of(change, "kind").unwrap_or("change"),
+                        str_of(change, "path").unwrap_or("?")
+                    )
+                })
+                .collect();
+            ViewRecord::new(line, offset, Kind::Tool, one_line(&changes.join("\n")))
+                .label("file_change")
+                .body(pretty(item))
+        }
+        "web_search" => ViewRecord::new(line, offset, Kind::Tool, search_summary(item))
+            .label("web_search")
+            .body(pretty(item)),
         "error" => ViewRecord::new(line, offset, Kind::Status, str_of(item, "message")?)
             .label("error")
             .failed(true)
@@ -630,6 +660,33 @@ fn item(line: u64, offset: u64, value: &Value) -> Option<Vec<ViewRecord>> {
     let mut record = record.id(id);
     record.state = state;
     Some(vec![record])
+}
+
+/// What a web_search item searched for: its `query`, which the started
+/// record leaves empty, else the `search` action's `query` or `queries[]`.
+fn search_summary(item: &Value) -> String {
+    let action = item.get("action");
+    let queries = action
+        .and_then(|action| action.get("queries"))
+        .and_then(Value::as_array)
+        .map(|queries| {
+            queries
+                .iter()
+                .filter_map(Value::as_str)
+                .collect::<Vec<_>>()
+                .join(", ")
+        });
+    [
+        str_of(item, "query").map(str::to_owned),
+        action
+            .and_then(|action| str_of(action, "query"))
+            .map(str::to_owned),
+        queries,
+    ]
+    .into_iter()
+    .flatten()
+    .find(|query| !query.trim().is_empty())
+    .map_or_else(|| "searching".to_owned(), |query| one_line(&query))
 }
 
 fn turn_completed(line: u64, offset: u64, value: &Value) -> ViewRecord {
@@ -842,9 +899,71 @@ mod tests {
     }
 
     #[test]
+    fn the_recorded_reasoning_file_change_and_web_search_items_are_named() {
+        let lines: Vec<String> = std::fs::read_to_string(
+            PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("../owlshift-adapters/tests/fixtures/codex/items_shapes.jsonl"),
+        )
+        .unwrap()
+        .lines()
+        .map(str::to_owned)
+        .collect();
+        let at = |n: usize| one(&lines[n]);
+        let reasoning = at(3);
+        assert_eq!(reasoning[0].kind, Kind::Thinking);
+        assert_eq!(reasoning[0].text, "**Following remaining steps**");
+        assert_eq!(reasoning[0].id.as_deref(), Some("item_1"));
+
+        let (started, done) = (at(9), at(10));
+        for record in [&started[0], &done[0]] {
+            assert_eq!(record.kind, Kind::Tool);
+            assert_eq!(record.label.as_deref(), Some("file_change"));
+            assert_eq!(record.text, "add /home/user/repo/VERSION.txt");
+        }
+        assert_eq!(started[0].id, done[0].id);
+        assert_eq!(started[0].id.as_deref(), Some("item_5"));
+        assert_eq!(started[0].state.as_deref(), Some("in_progress"));
+        assert_eq!(done[0].state.as_deref(), Some("completed"));
+
+        // The two ids of a web_search item: a typed parse would reject the
+        // duplicate key, a `Value` keeps the last (the `exec-` one).
+        let (s3, d3, s4, d4) = (at(5), at(6), at(7), at(8));
+        for record in [&s3, &d3, &s4, &d4] {
+            assert_eq!(record.len(), 1);
+            assert_eq!(record[0].kind, Kind::Tool);
+            assert_eq!(record[0].label.as_deref(), Some("web_search"));
+        }
+        assert_eq!(s3[0].id, d3[0].id);
+        assert_eq!(s4[0].id, d4[0].id);
+        assert_ne!(s3[0].id, s4[0].id);
+        assert!(s3[0].id.as_deref().unwrap().starts_with("exec-"));
+        assert_eq!(s3[0].text, "searching");
+        assert_eq!(
+            d3[0].text,
+            "site.rust-lang.org latest stable Rust release November 2026"
+        );
+        assert_eq!(d4[0].text, "https://blog.rust-lang.org/releases/");
+    }
+
+    #[test]
+    fn a_search_names_its_queries_and_a_malformed_item_stays_unknown() {
+        let search = one(
+            r#"{"type":"item.completed","item":{"id":"i","type":"web_search","query":"","action":{"type":"search","queries":["a","b"]}}}"#,
+        );
+        assert_eq!(search[0].text, "a, b");
+        for line in [
+            r#"{"type":"item.completed","item":{"id":"i","type":"file_change"}}"#,
+            r#"{"type":"item.completed","item":{"id":"i","type":"reasoning"}}"#,
+        ] {
+            assert_eq!(one(line)[0].kind, Kind::Unknown, "{line}");
+        }
+    }
+
+    /// `todo_list` and `item.updated` are unreachable from `codex exec`
+    /// 0.154.0 (no plan tool): never recorded, so unknown on purpose.
+    #[test]
     fn a_codex_shape_never_recorded_is_unknown() {
         for line in [
-            r#"{"type":"item.completed","item":{"id":"i","type":"reasoning","text":"x"}}"#,
             r#"{"type":"item.updated","item":{"id":"i","type":"agent_message","text":"x"}}"#,
             r#"{"type":"item.completed","item":{"id":"i","type":"todo_list","items":[]}}"#,
         ] {

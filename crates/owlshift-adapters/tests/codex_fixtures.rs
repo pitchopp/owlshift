@@ -17,7 +17,9 @@
 //! control were recorded for OWL-132 on 2026-10-16 by
 //! `owlshift-testkit/tests/codex_live.rs`, on a ChatGPT login,
 //! `critic_tools` and its control by the same file for OWL-316, and
-//! `critic_collaboration` by it for OWL-317.
+//! `critic_collaboration` by it for OWL-317. `items_shapes` was recorded by
+//! hand on 2026-11-07 for OWL-502 (reasoning, file_change and web_search
+//! items); its record is in the build plan, P8 part 6.
 
 use std::path::{Path, PathBuf};
 
@@ -32,7 +34,7 @@ use owlshift_contracts::brief::{PermissionLevel, Permissions};
 use owlshift_contracts::{Harness, Role};
 
 /// Every recording, so that one added without its checks fails here.
-const FIXTURES: [&str; 20] = [
+const FIXTURES: [&str; 21] = [
     "success",
     "write_refused",
     "nested_sandbox",
@@ -53,6 +55,7 @@ const FIXTURES: [&str; 20] = [
     "critic_tools",
     "critic_tools_control",
     "critic_collaboration",
+    "items_shapes",
 ];
 
 /// The one id left in the recordings, where each thread id was.
@@ -277,6 +280,14 @@ fn the_adapter_reads_each_recording_as_the_checks_found_it() {
         );
         assert!(run.usage.is_some(), "{name}");
     }
+    // OWL-502: the run of reasoning, file_change and web_search items ends
+    // on its last agent message; it has no `-o` file.
+    let items = replay("items_shapes");
+    let Outcome::Completed { text } = &items.outcome else {
+        panic!("items_shapes: {:?}", items.outcome);
+    };
+    assert!(text.contains("1.99.1"), "{text}");
+    assert!(items.usage.is_some());
     assert_eq!(
         replay("codex_home_read_only").outcome,
         Outcome::Failed(Failure::NoThread)
@@ -623,7 +634,9 @@ fn has_email(text: &str) -> bool {
     })
 }
 
-/// Every substring shaped like a UUID: 8-4-4-4-12 hexadecimal digits.
+/// Every substring shaped like a UUID: 8-4-4-4-12 hexadecimal digits, but
+/// the one directly after `exec-`: a Codex call id (a web_search item's
+/// second `id`), which names no one.
 fn uuids(text: &str) -> Vec<&str> {
     let shape = |s: &str| {
         s.len() == 36
@@ -634,6 +647,7 @@ fn uuids(text: &str) -> Vec<&str> {
     };
     (0..text.len().saturating_sub(35))
         .filter(|&i| text.is_char_boundary(i) && text.is_char_boundary(i + 36))
+        .filter(|&i| !text[..i].ends_with("exec-"))
         .map(|i| &text[i..i + 36])
         .filter(|s| shape(s))
         .collect()
@@ -648,6 +662,12 @@ fn the_scrub_checks_catch_what_they_look_for() {
         ["01a13f6e-17c3-7ed0-90ab-9d2a59c4f4c6"]
     );
     assert!(uuids("no id here").is_empty());
+    // A Codex call id is not personal; a bare id or one after another prefix
+    // still is.
+    let id = "eaf1f396-db47-4803-a729-b57263abb148";
+    assert!(uuids(&format!("\"id\":\"exec-{id}\"")).is_empty());
+    assert_eq!(uuids(&format!("\"id\":\"{id}\"")), [id]);
+    assert_eq!(uuids(&format!("\"id\":\"call-{id}\"")), [id]);
     assert_eq!(
         following(
             "request id: req_a7c3ddf654a8444fa4d251ed67f7a475, x",
