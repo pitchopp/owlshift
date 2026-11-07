@@ -367,3 +367,54 @@ fn the_ui_never_hands_the_daemon_over() {
         }
     }
 }
+
+fn listing(dir: &Path) -> std::collections::BTreeMap<PathBuf, (u64, std::time::SystemTime)> {
+    let mut found = std::collections::BTreeMap::new();
+    let mut pending = vec![dir.to_owned()];
+    while let Some(dir) = pending.pop() {
+        for entry in std::fs::read_dir(&dir).unwrap() {
+            let entry = entry.unwrap();
+            let meta = std::fs::symlink_metadata(entry.path()).unwrap();
+            found.insert(entry.path(), (meta.len(), meta.modified().unwrap()));
+            if meta.is_dir() {
+                pending.push(entry.path());
+            }
+        }
+    }
+    found
+}
+
+/// OWL-472: a run of the checks writes nothing to the data directory, and
+/// the route answers JSON and takes JSON only.
+#[test]
+fn a_run_of_the_checks_writes_nothing_to_the_data_directory() {
+    let ground = start("acme/web", true, Duration::ZERO);
+    serve(&ground, &[("acme/web", Some(PROJECT)), ("acme/api", None)]);
+    let before = listing(&ground.data());
+    assert!(before.len() >= 5);
+    let reply = doctor_call(&ground, &json!({}));
+    assert_eq!(reply.status, 200);
+    assert!(reply.content_type.starts_with("application/json"));
+    assert_eq!(listing(&ground.data()), before);
+    // A body that is not JSON is refused before the route.
+    let port = ground.ui.port();
+    let wrong = {
+        let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        let text = format!(
+            "POST /api/doctor HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\
+             X-Owlshift-Session: {}\r\nContent-Type: text/plain\r\nContent-Length: 2\r\n\r\n{{}}",
+            ground.session.header()
+        );
+        stream.write_all(text.as_bytes()).unwrap();
+        let mut answer = String::new();
+        stream.read_to_string(&mut answer).unwrap();
+        answer
+    };
+    assert!(wrong.starts_with("HTTP/1.1 415"), "{wrong}");
+    // A text for the project, or one that is no repository, is refused.
+    assert_eq!(doctor_call(&ground, &json!({ "project": 3 })).status, 400);
+    assert_eq!(
+        doctor_call(&ground, &json!({ "project": "nope" })).status,
+        400
+    );
+}

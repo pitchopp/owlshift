@@ -1156,3 +1156,80 @@ fn config_needs_a_session() {
         401
     );
 }
+
+// ---- Security (OWL-472) ----
+
+fn listing(dir: &Path) -> std::collections::BTreeMap<PathBuf, (u64, std::time::SystemTime)> {
+    let mut found = std::collections::BTreeMap::new();
+    let mut pending = vec![dir.to_owned()];
+    while let Some(dir) = pending.pop() {
+        for entry in std::fs::read_dir(&dir).unwrap() {
+            let entry = entry.unwrap();
+            let meta = std::fs::symlink_metadata(entry.path()).unwrap();
+            found.insert(entry.path(), (meta.len(), meta.modified().unwrap()));
+            if meta.is_dir() {
+                pending.push(entry.path());
+            }
+        }
+    }
+    found
+}
+
+#[test]
+fn every_new_route_needs_a_session() {
+    let ground = Ground::new();
+    for path in [
+        "/api/orchestrator",
+        "/api/orchestrator?gen=0&after=0&log=0",
+        "/api/spend",
+        "/api/spend?days=all&rev=x",
+        "/api/config",
+        "/api/config?rev=x",
+    ] {
+        assert_eq!(
+            send(ground.ui.port(), "GET", path, None, "").status,
+            401,
+            "{path}"
+        );
+    }
+    assert_eq!(
+        send(ground.ui.port(), "POST", "/api/doctor", None, "{}").status,
+        401
+    );
+}
+
+#[test]
+fn no_new_route_writes_to_the_data_directory() {
+    let ground = Ground::new();
+    let _daemon = bench(&ground);
+    keep(
+        &ground,
+        "acme/web",
+        PROJECT,
+        Some("a newer file is refused"),
+    );
+    ground.append_log(&started(
+        &days_ago(1),
+        "OWL-1",
+        "r1",
+        "build",
+        Some("claude"),
+    ));
+    ground.append_log(&used(&days_ago(1), "OWL-1", "r1", 1.0));
+    ground.append_log("not an event\n");
+    let dir = daemon::service_dir(ground.data());
+    std::fs::write(dir.join("daemon.log"), "a line\n").unwrap();
+    let before = listing(ground.data());
+    assert!(before.len() > 10);
+    for path in [
+        "/api/orchestrator",
+        "/api/orchestrator?log=0",
+        "/api/spend?days=all",
+        "/api/spend?days=7&project=acme%2Fweb",
+        "/api/config",
+    ] {
+        ground.json(path);
+    }
+    // Appending to the log is the test's, not the route's: nothing else changed.
+    assert_eq!(listing(ground.data()), before);
+}
