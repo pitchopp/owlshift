@@ -251,7 +251,8 @@ mod tests {
     fn trait_methods() -> Vec<String> {
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../owlshift-runner/src/system.rs");
-        let text = std::fs::read_to_string(path).unwrap();
+        // A Windows checkout may carry CRLF line ends.
+        let text = std::fs::read_to_string(path).unwrap().replace("\r\n", "\n");
         let start = text.find("pub trait System {").expect("the trait");
         let body = &text[start..];
         let end = body.find("\n}\n").expect("its end");
