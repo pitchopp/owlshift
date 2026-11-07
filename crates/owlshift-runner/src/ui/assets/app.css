@@ -648,8 +648,10 @@ a:focus-visible .node-box {
   color: var(--text-secondary);
 }
 
+/* With the decider's, as the ticket groups them, and apart from a
+   resource's collision. */
 .node-usage_limit {
-  color: var(--warning);
+  color: var(--danger);
 }
 
 .node-other {
