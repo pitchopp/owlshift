@@ -162,6 +162,7 @@ fn post_json(port: u16, path: &str, body: &Value) -> Reply {
 fn options() -> Options {
     Options {
         refresh: Duration::from_millis(100),
+        overview_refresh: Duration::from_millis(100),
         personal: Arc::new(|| {
             owlshift_runner::config::FileState::Absent(PathBuf::from("/nowhere/owlshift.toml"))
         }),
@@ -582,6 +583,8 @@ fn no_asset_holds_the_token_and_the_page_sends_only_the_code_and_the_session() {
             "authedFetch(\"/api/stream\"",
             "authedFetch(snapshotPath(handle",
             "authedFetch(logPath(handle, run.id, which, log.from, log.line",
+            // The overview's "since" panel (OWL-470).
+            "authedFetch(path",
         ],
         "{authed:?}"
     );
@@ -852,7 +855,8 @@ fn a_stream_writes_the_header_again_when_it_changes() {
         &Request::new(BY_PAUSE, Timestamp::now(), "lunch"),
     )
     .unwrap();
-    let next: Value = serde_json::from_str(&next_line(&mut stream).unwrap()).unwrap();
+    // The overview line the stream writes after the header is skipped.
+    let next = next_with(&mut stream, "header");
     assert_eq!(next["header"]["machine_pause"]["why"], "lunch");
 }
 
@@ -1272,9 +1276,15 @@ fn egress(text: &str) -> Option<String> {
 
 #[test]
 fn no_asset_names_a_place_off_the_origin_and_the_policy_allows_none() {
+    // The one address the page names: the prefix of a pull request's link
+    // (OWL-470), which a click navigates to. The page fetches nothing from it,
+    // and the policy allows no fetch.
+    const PULL_REQUEST_LINK: &str = "https://github.com/";
+    assert_eq!(APP_JS.matches(PULL_REQUEST_LINK).count(), 1);
+    let script = APP_JS.replace(PULL_REQUEST_LINK, "");
     for (name, text) in [
         ("index.html", INDEX_HTML),
-        ("app.js", APP_JS),
+        ("app.js", script.as_str()),
         ("app.css", APP_CSS),
     ] {
         assert_eq!(egress(text), None, "{name}");
@@ -1400,6 +1410,10 @@ const RUN: &str = "20261105T100000Z";
 
 impl Ground {
     fn new() -> Self {
+        Self::with_options(options())
+    }
+
+    fn with_options(options: Options) -> Self {
         let data = tempfile::tempdir().unwrap();
         let repo = Repo::parse("o/r").unwrap();
         let checkout = data.path().join("checkout-of-o-r");
@@ -1407,7 +1421,7 @@ impl Ground {
         Registry::in_data_dir(data.path())
             .register(&repo, &checkout)
             .unwrap();
-        let ui = serve(data.path(), RunSecret::new().unwrap());
+        let ui = serve_with(data.path(), RunSecret::new().unwrap(), options);
         let session = session(ui.port(), data.path());
         Self { data, ui, session }
     }
@@ -1895,4 +1909,383 @@ fn a_run_that_starts_after_the_first_snapshot_is_listed() {
     assert_eq!(runs[0]["id"], RUN);
     assert_eq!(runs[0]["ended"], false);
     assert_eq!(texts(&ground.log("&from=0")), ["hello"]);
+}
+
+// ---------------------------------------------------------------------------
+// The overview (OWL-470): `/api/overview`, `/api/since` and the stream's
+// `overview` line, on the data directory of `Ground`, which serves `o/r` with
+// a checkout that holds no refs.
+
+impl Ground {
+    fn repo(&self) -> Repo {
+        Repo::parse("o/r").unwrap()
+    }
+
+    /// Rewrites `o/r`'s `ready.json` with these `(ticket, title)`, all
+    /// waiting for the next pass, written at `at`.
+    fn ready(&self, tickets: &[(&str, &str)], at: Timestamp) {
+        use owlshift_contracts::ready::{Outcome, ReadySnapshot, ReadyTicket};
+        use owlshift_contracts::waits::Wait;
+        let dirs = ProjectDirs::new(self.data.path(), &self.repo());
+        std::fs::create_dir_all(dirs.root()).unwrap();
+        let snapshot = ReadySnapshot {
+            format: Format,
+            at,
+            interval_ms: 60_000,
+            tickets: tickets
+                .iter()
+                .map(|(ticket, title)| ReadyTicket {
+                    ticket: TicketId::new(*ticket).unwrap(),
+                    title: (*title).to_owned(),
+                    priority: owlshift_core::vocab::Priority::High,
+                    blockers: Vec::new(),
+                    drain: Outcome::Waits {
+                        wait: Wait {
+                            reason: "next_pass".to_owned(),
+                            since: None,
+                            behind: Vec::new(),
+                            resource: None,
+                            harness: None,
+                            until: None,
+                            text: "chosen, it starts at the next pass".to_owned(),
+                        },
+                    },
+                })
+                .collect(),
+        };
+        owlshift_runner::ready::write(&dirs, &snapshot).unwrap();
+    }
+
+    /// Writes the ticket ref of `ticket` in the checkout of `o/r`, made a
+    /// repository on the first call, with the ticket at Build (in flight, so
+    /// it has a card whether or not `ready.json` lists it).
+    fn building(&self, ticket: &str) {
+        use owlshift_contracts::refs::PersistedState;
+        use owlshift_core::state::{Status, TicketState};
+        use owlshift_core::vocab::Stage;
+        use owlshift_runner::ticket_ref::{self, TicketRecord};
+        // Where the status reader looks for the ticket refs of `o/r`.
+        let checkout = ProjectDirs::new(self.data.path(), &self.repo()).checkout();
+        std::fs::create_dir_all(&checkout).unwrap();
+        let git = owlshift_runner::project::runner_git();
+        if !checkout.join(".git").exists() {
+            let init = std::process::Command::new("git")
+                .args(["init", "-q"])
+                .current_dir(&checkout)
+                .output()
+                .unwrap();
+            assert!(init.status.success(), "{init:?}");
+        }
+        let ticket = TicketId::new(ticket).unwrap();
+        let state = TicketState::restore(Status::Active(Stage::Build), 0, 0, 0, 0, 0).unwrap();
+        let record = TicketRecord {
+            state: PersistedState::from(&state),
+            ..ticket_ref::blank(None)
+        };
+        let previous = ticket_ref::read(&git, &checkout, &ticket)
+            .unwrap()
+            .map(|stored| stored.commit);
+        ticket_ref::write(&git, &checkout, &ticket, &record, previous.as_deref()).unwrap();
+    }
+
+    /// Appends an event of the project `o/r` that happened at `at`.
+    fn event_at(&self, at: Timestamp, ticket: &str, kind: EventKind) {
+        let event = Event {
+            format: Format,
+            at,
+            project: "o/r".to_owned(),
+            ticket: Some(TicketId::new(ticket).unwrap()),
+            run: None,
+            kind,
+            data: serde_json::Map::new(),
+        };
+        EventLog::in_dir(self.data.path()).append(&event).unwrap();
+    }
+
+    fn overview(&self) -> Value {
+        let reply = self.get("/api/overview");
+        assert_eq!(reply.status, 200, "{}", reply.text());
+        reply.assert_secured();
+        reply.json()
+    }
+
+    fn stream(&self) -> BufReader<TcpStream> {
+        open_stream(self.ui.port(), &self.session)
+    }
+}
+
+/// The next line of `stream` that holds `key`, the others skipped.
+fn next_with(stream: &mut BufReader<TcpStream>, key: &str) -> Value {
+    loop {
+        let line = next_line(stream).expect("the stream ended");
+        let value: Value = serde_json::from_str(&line).unwrap();
+        if value.get(key).is_some() {
+            return value;
+        }
+    }
+}
+
+fn hours_ago(hours: i64) -> Timestamp {
+    Timestamp::now()
+        .checked_sub(jiff::SignedDuration::from_hours(hours))
+        .unwrap()
+}
+
+fn card_tickets(overview: &Value, column: &str) -> Vec<String> {
+    overview["projects"][0]["cards"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|card| card["column"] == column)
+        .map(|card| card["ticket"].as_str().unwrap().to_owned())
+        .collect()
+}
+
+#[test]
+fn the_overview_routes_need_a_session() {
+    let ground = Ground::new();
+    for path in ["/api/overview", "/api/since"] {
+        let none = get(ground.ui.port(), path, &[]);
+        assert_eq!(none.status, 401, "{path}");
+        none.assert_secured();
+        let made_up = get(
+            ground.ui.port(),
+            path,
+            &[("X-Owlshift-Session", "nonsense")],
+        );
+        assert_eq!(made_up.status, 401, "{path}");
+        let reply = ground.get(path);
+        assert_eq!(reply.status, 200, "{path}: {}", reply.text());
+        reply.assert_secured();
+        assert!(
+            reply
+                .header("Content-Type")
+                .unwrap()
+                .starts_with("application/json")
+        );
+    }
+}
+
+#[test]
+fn the_overview_lists_the_admitted_tickets_of_ready_json_not_started() {
+    let ground = Ground::new();
+    ground.ready(
+        &[("OWL-1", "First"), ("OWL-2", "<script>alert(1)</script>")],
+        Timestamp::now(),
+    );
+    let reply = ground.get("/api/overview");
+    assert_eq!(reply.status, 200);
+    let text = reply.text();
+    assert!(!text.contains('<') && !text.contains('>'), "{text}");
+    let overview = reply.json();
+    assert_eq!(overview["projects"][0]["repository"], "o/r");
+    assert_eq!(card_tickets(&overview, "not_started"), ["OWL-1", "OWL-2"]);
+    assert_eq!(
+        overview["projects"][0]["cards"][1]["title"],
+        "<script>alert(1)</script>"
+    );
+    assert_eq!(overview["projects"][0]["ready"]["stale"], false);
+    // A snapshot older than two of its intervals is stale (F5).
+    ground.ready(&[("OWL-1", "First")], hours_ago(2));
+    assert_eq!(ground.overview()["projects"][0]["ready"]["stale"], true);
+}
+
+#[test]
+fn a_stream_writes_the_overview_again_when_a_ref_a_pause_ready_json_or_an_event_changes() {
+    let ground = Ground::new();
+    ground.ready(&[("OWL-1", "First")], Timestamp::now());
+    let mut stream = ground.stream();
+    let first = next_with(&mut stream, "overview");
+    let first = &first["overview"];
+    assert_eq!(card_tickets(first, "not_started"), ["OWL-1"]);
+    assert_eq!(first["projects"][0]["paused"], Value::Null);
+    let highlights = first["highlights"].as_u64().unwrap();
+
+    // A new ready.json shows without a request.
+    ground.ready(&[("OWL-1", "First"), ("OWL-3", "Third")], Timestamp::now());
+    let second = next_with(&mut stream, "overview");
+    assert_eq!(
+        card_tickets(&second["overview"], "not_started"),
+        ["OWL-1", "OWL-3"]
+    );
+
+    // A project's pause shows as `paused`.
+    let dirs = ProjectDirs::new(ground.data.path(), &ground.repo());
+    requests::ask_pause(
+        ground.data.path(),
+        Some(&dirs),
+        &Request::new(BY_PAUSE, Timestamp::now(), "lunch"),
+    )
+    .unwrap();
+    let third = next_with(&mut stream, "overview");
+    assert_eq!(third["overview"]["projects"][0]["paused"]["why"], "lunch");
+
+    // A new ticket ref shows as a card in its stage's column.
+    ground.building("OWL-7");
+    let fourth = loop {
+        let line = next_with(&mut stream, "overview");
+        if card_tickets(&line["overview"], "build").contains(&"OWL-7".to_owned()) {
+            break line;
+        }
+    };
+    assert_eq!(
+        card_tickets(&fourth["overview"], "build"),
+        ["OWL-7"],
+        "{fourth}"
+    );
+
+    // A new event that changes no ref, no ready.json and no wait still
+    // moves the line: its highlights counter goes up.
+    ground.event_at(Timestamp::now(), "OWL-1", EventKind::PrMerged);
+    let fifth = next_with(&mut stream, "overview");
+    assert!(
+        fifth["overview"]["highlights"].as_u64().unwrap() > highlights,
+        "{fifth}"
+    );
+}
+
+/// A stream that starts after the last one closed, with the overview kept
+/// from before changed meanwhile, gets the new one. This covers the
+/// closed-stream path end to end; the race between the first line and the
+/// generation read is pinned by `server.rs`'s unit test
+/// `the_stored_overview_and_its_generation_are_read_together`.
+#[test]
+fn a_stream_that_starts_after_another_closed_gets_the_overview_as_it_is_now() {
+    let ground = Ground::with_options(Options {
+        keepalive: Duration::from_millis(50),
+        ..options()
+    });
+    ground.ready(&[("OWL-1", "First")], Timestamp::now());
+    let mut first = ground.stream();
+    assert_eq!(
+        card_tickets(
+            &next_with(&mut first, "overview")["overview"],
+            "not_started"
+        ),
+        ["OWL-1"]
+    );
+    drop(first);
+    // The server notices the closed stream at its next keepalive, and the
+    // refresher goes once no stream is left.
+    thread::sleep(Duration::from_millis(500));
+    ground.ready(&[("OWL-1", "First"), ("OWL-9", "Ninth")], Timestamp::now());
+    let mut second = ground.stream();
+    for _ in 0..40 {
+        let line = next_with(&mut second, "overview");
+        if card_tickets(&line["overview"], "not_started") == ["OWL-1", "OWL-9"] {
+            return;
+        }
+    }
+    panic!("the new stream never got OWL-9");
+}
+
+#[test]
+fn since_counts_the_last_24_hours_when_it_is_given_no_time() {
+    let ground = Ground::new();
+    ground.event_at(hours_ago(2), "OWL-1", EventKind::PrMerged);
+    ground.event_at(hours_ago(30), "OWL-2", EventKind::PrMerged);
+    let reply = ground.get("/api/since");
+    assert_eq!(reply.status, 200, "{}", reply.text());
+    reply.assert_secured();
+    let since = reply.json();
+    let merged: Vec<_> = since["merged"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|entry| entry["ticket"].as_str().unwrap())
+        .collect();
+    assert_eq!(merged, ["OWL-1"]);
+    assert_eq!(since["merged"][0]["project"], "o/r");
+    let from: Timestamp = since["from"].as_str().unwrap().parse().unwrap();
+    let back = Timestamp::now().as_second() - from.as_second();
+    assert!(
+        (24 * 3600 - 120..=24 * 3600 + 120).contains(&back),
+        "from is {back} s back"
+    );
+    assert_eq!(since["truncated"], false);
+    // An event after the baseline of a load, with that `at` percent-encoded
+    // as the page sends it (F2).
+    let at = hours_ago(1).to_string();
+    let encoded = at.replace(':', "%3A").replace('+', "%2B");
+    ground.event_at(Timestamp::now(), "OWL-3", EventKind::PrMerged);
+    let reply = ground.get(&format!("/api/since?at={encoded}"));
+    assert_eq!(reply.status, 200, "{}", reply.text());
+    assert_eq!(reply.json()["merged"][0]["ticket"], "OWL-3");
+    assert_eq!(reply.json()["merged"].as_array().unwrap().len(), 1);
+    for bad in [
+        "at=",
+        "at=yesterday",
+        "at=2026-13-45T00:00:00Z",
+        "at=1&at=2",
+    ] {
+        let reply = ground.get(&format!("/api/since?{bad}"));
+        assert_eq!(reply.status, 400, "{bad}");
+        reply.assert_secured();
+    }
+}
+
+/// The page's part of the overview, by what it carries: the browser is not
+/// driven here (the pull request records the manual check), and everything
+/// the page only draws (the list's order, the strip, the 24-hour default) is
+/// tested on the server.
+#[test]
+fn the_overview_page_links_only_a_guarded_pull_request_and_keeps_the_view_and_the_visit() {
+    let app_js = lf(APP_JS);
+    // The one `.href` assignment is the pull request's, guarded by the
+    // repository and number patterns; the other links are ticket pages' hash
+    // routes, set as attributes from encoded parts.
+    assert_eq!(app_js.matches(".href =").count(), 1);
+    let link = block(&app_js, "function pullRequestLink(project, number) {", "");
+    let (guard, assigned) = link.split_once(".href =").unwrap();
+    assert!(guard.contains("REPOSITORY_PATTERN.test(project)"), "{link}");
+    assert!(guard.contains("Number.isInteger(number)"), "{link}");
+    assert!(guard.contains("return make(\"span\""), "{link}");
+    assert!(
+        assigned.starts_with(" \"https://github.com/\" + project + \"/pull/\" + number;"),
+        "{link}"
+    );
+    assert!(link.contains("link.rel = \"noopener noreferrer\";"));
+    assert!(app_js.contains(r#"const REPOSITORY_PATTERN = /^[A-Za-z0-9._-]+\/[A-Za-z0-9._-]+$/;"#));
+    for part in app_js.split("setAttribute(\"href\"").skip(1) {
+        assert!(
+            part.trim_start().starts_with(", \"#/ticket/\" +"),
+            "{part:.60}"
+        );
+    }
+    // The view is kept under `owlshift.view`, columns by default.
+    assert!(app_js.contains("const VIEW_KEY = \"owlshift.view\";"));
+    assert!(app_js.contains("return stored(VIEW_KEY) === \"list\" ? \"list\" : \"columns\";"));
+    assert!(app_js.contains("store(VIEW_KEY, view);"));
+    // The visit: the stored time is read before this load's time is stored,
+    // and the request carries `at` only when one was read.
+    assert!(app_js.contains("const VISIT_KEY = \"owlshift.lastVisit\";"));
+    let visit = block(&app_js, "function startVisit() {", "");
+    let read = visit.find("stored(VISIT_KEY)").unwrap();
+    let write = visit
+        .find("store(VISIT_KEY, new Date().toISOString())")
+        .unwrap();
+    assert!(read < write, "{visit}");
+    assert!(
+        app_js.contains("(previousVisit ? \"?at=\" + encodeURIComponent(previousVisit) : \"\");")
+    );
+    assert_eq!(app_js.matches("store(VISIT_KEY").count(), 1);
+    // The panel is asked for again when the count of highlights moved.
+    assert!(app_js.contains("if (overview.highlights !== lastHighlights) {"));
+    // The overview's notes are drawn as text, as the header's are (F7), and a
+    // stale snapshot is marked with its age (F5).
+    assert!(app_js.contains("for (const note of overview.notes) {"));
+    assert!(app_js.contains("body.appendChild(make(\"p\", \"fact state-information\", note));"));
+    assert!(app_js.contains("ready.json is stale: the drain last read the column "));
+    // The frame: the three sections and the switch, no inline script or style.
+    for id in [
+        "id=\"for-you\"",
+        "id=\"overview\"",
+        "id=\"since\"",
+        "id=\"view-columns\"",
+        "id=\"view-list\"",
+    ] {
+        assert!(INDEX_HTML.contains(id), "{id}");
+    }
+    // Only the viewing of columns and list is offered: the graph is OWL-460.
+    assert!(!INDEX_HTML.to_ascii_lowercase().contains("graph"));
 }

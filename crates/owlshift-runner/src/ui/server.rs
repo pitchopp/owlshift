@@ -19,6 +19,10 @@
 //!   traded for a session;
 //! - `GET /api/header` and `GET /api/stream`, under the session sent in
 //!   `X-Owlshift-Session`: the header, once, or as a stream of lines;
+//! - `GET /api/overview` and `GET /api/since[?at=<RFC 3339>]` (OWL-470), under
+//!   the session as well: the overview ([`super::overview`]) and what
+//!   happened after `at` (the last 24 hours when the request has none), read
+//!   from the event log's tail ([`super::eventtail`]);
 //! - `GET /api/ticket?project=owner/repo&ticket=OWL-1` and
 //!   `GET /api/ticket/log?project&ticket&run&file=stdout|stderr&from=N&line=L`
 //!   (OWL-471), under the session as well: a ticket's snapshot
@@ -36,6 +40,8 @@
 //! agent or a comment wrote reads as markup whatever reads it.
 //!
 //! A stream writes `{"header":…}` at once and whenever the header changes,
+//! `{"overview":…}` after it, on the overview's own slower period
+//! ([`Options::overview_refresh`]) and when it changes,
 //! `{"keepalive":true}` every keepalive period, and `{"closed":"superseded"}`
 //! before it ends when a newer stream took its place: at most
 //! [`Options::streams`] run at once, the oldest closed beyond that. It
@@ -67,7 +73,8 @@ use serde_json::{Value, json};
 use tiny_http::{Header as HttpHeader, Method, Request, Response, Server, StatusCode};
 
 use super::auth::{self, CHALLENGE_LEN, RunSecret, UsedCodes};
-use super::{events, header, record, runlog, tail, ticket, token};
+use super::eventtail::EventTail;
+use super::{events, header, overview, record, runlog, tail, ticket, token};
 use crate::config::FileState;
 use crate::project::ProjectDirs;
 use crate::served::Registry;
@@ -127,6 +134,10 @@ pub struct Options {
     /// How often the refresher reads the header while a stream runs, and
     /// how long a stream goes at most without checking its session again.
     pub refresh: Duration,
+    /// How often the refresher builds the overview while a stream runs: a
+    /// build reads every project's ticket refs (five git commands each), so it
+    /// is slower than the header (OWL-470).
+    pub overview_refresh: Duration,
     /// How often a stream writes a keepalive line.
     pub keepalive: Duration,
     /// How many streams run at once at most.
@@ -145,6 +156,7 @@ impl Default for Options {
     fn default() -> Self {
         Self {
             refresh: Duration::from_secs(2),
+            overview_refresh: Duration::from_secs(5),
             keepalive: Duration::from_secs(15),
             streams: 16,
             personal: Arc::new(super::personal_now),
@@ -156,6 +168,7 @@ impl fmt::Debug for Options {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Options")
             .field("refresh", &self.refresh)
+            .field("overview_refresh", &self.overview_refresh)
             .field("keepalive", &self.keepalive)
             .field("streams", &self.streams)
             .finish_non_exhaustive()
@@ -214,6 +227,9 @@ struct Context {
     events: events::Reader,
     /// What a ticket's snapshot keeps between two builds.
     tickets: ticket::Cache,
+    /// The event log's tail for the overview (OWL-470): held while the overview
+    /// is built, which is the one reader of the log it advances.
+    tail: Mutex<EventTail>,
 }
 
 /// A serving web UI. Dropping it stops taking requests.
@@ -329,6 +345,7 @@ pub fn start(
         hub: Hub::default(),
         events: events::Reader::new(data),
         tickets: ticket::Cache::new(ticket::WAITS_KEPT),
+        tail: Mutex::new(EventTail::new(data)),
     });
     let stopping = Arc::new(AtomicBool::new(false));
     let accept = {
@@ -547,6 +564,15 @@ fn handle(context: &Arc<Context>, mut request: Request) {
             } else {
                 stream(context, request);
                 return;
+            }
+        }
+        (Method::Get, "/api/overview" | "/api/since") => {
+            if !in_session(context, &request) {
+                error_response(401, "not logged in: run `owlshift ui` in a terminal")
+            } else if path == "/api/overview" {
+                json_response(200, &overview_now(context).json())
+            } else {
+                since_page(context, &url)
             }
         }
         (Method::Get, "/api/ticket" | "/api/ticket/log") => {
@@ -850,7 +876,47 @@ fn header_now(context: &Context) -> header::Header {
     header
 }
 
-/// The streams that run and the refresher's latest header.
+/// The overview now: the event log's tail advanced, then the refs and the
+/// ready snapshots read (OWL-470).
+fn overview_now(context: &Context) -> overview::Overview {
+    let personal = (context.options.personal)();
+    let mut tail = context
+        .tail
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    overview::gather(
+        &context.data,
+        &mut tail,
+        crate::usage::concurrent_runs(&personal),
+        Timestamp::now(),
+    )
+}
+
+/// `GET /api/since[?at=<RFC 3339>]`: what happened after `at`, or in the
+/// last 24 hours when the request has none (a browser's first visit). The
+/// time is not a secret and is read as given: a bad one is a 400.
+fn since_page(context: &Context, url: &str) -> Response<Cursor<Vec<u8>>> {
+    let pairs = match query_of(url) {
+        Ok(pairs) => pairs,
+        Err(why) => return error_response(400, why),
+    };
+    let at = match param(&pairs, "at") {
+        None => None,
+        Some(text) => match text.parse::<Timestamp>() {
+            Ok(at) => Some(at),
+            Err(_) => return error_response(400, "at is a time, such as 2026-11-06T09:00:00Z"),
+        },
+    };
+    let mut tail = context
+        .tail
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    // A read that fails leaves what was read before: the answer is of that.
+    let _ = tail.advance();
+    json_response(200, &tail.since(at, Timestamp::now()).json())
+}
+
+/// The streams that run and the refresher's latest header and overview.
 #[derive(Default)]
 struct Hub {
     state: Mutex<HubState>,
@@ -863,6 +929,10 @@ struct HubState {
     streams: VecDeque<(u64, Arc<AtomicBool>)>,
     generation: u64,
     latest: Option<String>,
+    /// The refresher's latest overview line, and its own generation: the
+    /// overview is built on a slower period than the header.
+    overview: Option<String>,
+    overview_generation: u64,
     refreshing: bool,
 }
 
@@ -910,11 +980,28 @@ fn leave(context: &Context, id: u64) {
     context.hub.lock().streams.retain(|(other, _)| *other != id);
 }
 
-/// Reads the header every refresh period while a stream runs, and shares
-/// it with the streams.
+/// The line a stream writes for `overview`.
+fn overview_line(overview: &overview::Overview) -> String {
+    json_text(&json!({ "overview": overview.json() }))
+}
+
+/// Reads the header every refresh period while a stream runs, and the
+/// overview every overview period, and shares them with the streams.
 fn refresh(context: &Arc<Context>) {
+    let mut overview_read: Option<Instant> = None;
+    let wait = context
+        .options
+        .refresh
+        .min(context.options.overview_refresh)
+        .max(Duration::from_millis(1));
     loop {
         let line = json_text(&json!({ "header": header_now(context).json() }));
+        let overview_due =
+            overview_read.is_none_or(|read| read.elapsed() >= context.options.overview_refresh);
+        let overview = overview_due.then(|| overview_line(&overview_now(context)));
+        if overview_due {
+            overview_read = Some(Instant::now());
+        }
         let mut state = context.hub.lock();
         if state.streams.is_empty() {
             state.refreshing = false;
@@ -925,13 +1012,51 @@ fn refresh(context: &Arc<Context>) {
             state.generation += 1;
             context.hub.changed.notify_all();
         }
+        if let Some(overview) = overview
+            && state.overview.as_deref() != Some(overview.as_str())
+        {
+            state.overview = Some(overview);
+            state.overview_generation += 1;
+            context.hub.changed.notify_all();
+        }
         let (state, _) = context
             .hub
             .changed
-            .wait_timeout(state, context.options.refresh)
+            .wait_timeout(state, wait)
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         drop(state);
     }
+}
+
+/// The overview line a stream that starts writes, with the generation it
+/// was read at, taken together under one lock: the refresher's latest, or
+/// one built now when it has none yet (which it then shares). Reading the
+/// generation apart would mark a newer line as already written.
+fn first_overview(context: &Context) -> (String, u64) {
+    if let Some(stored) = stored_overview(&context.hub) {
+        return stored;
+    }
+    let line = overview_line(&overview_now(context));
+    let mut state = context.hub.lock();
+    if let Some(shared) = state.overview.clone() {
+        return (shared, state.overview_generation);
+    }
+    state.overview = Some(line.clone());
+    state.overview_generation += 1;
+    let generation = state.overview_generation;
+    drop(state);
+    context.hub.changed.notify_all();
+    (line, generation)
+}
+
+/// The refresher's latest overview line with the generation it was stored
+/// at, read under one lock.
+fn stored_overview(hub: &Hub) -> Option<(String, u64)> {
+    let state = hub.lock();
+    state
+        .overview
+        .clone()
+        .map(|line| (line, state.overview_generation))
 }
 
 /// Writes `line` as one chunk of a chunked body, and flushes it.
@@ -977,6 +1102,8 @@ fn write_stream(
     let mut written = json_text(&json!({ "header": header_now(context).json() }));
     chunk(writer, &written)?;
     let mut seen = context.hub.lock().generation;
+    let (mut written_overview, mut seen_overview) = first_overview(context);
+    chunk(writer, &written_overview)?;
     let mut kept = Instant::now();
     let mut checked = Instant::now();
     loop {
@@ -991,32 +1118,48 @@ fn write_stream(
             }
             checked = Instant::now();
         }
-        let latest = {
+        let (latest, latest_overview) = {
             let state = context.hub.lock();
             let (state, _) = context
                 .hub
                 .changed
                 .wait_timeout(state, Duration::from_millis(250))
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if state.generation == seen {
+            let header = if state.generation == seen {
                 None
             } else {
                 seen = state.generation;
                 state.latest.clone()
-            }
+            };
+            let overview = if state.overview_generation == seen_overview {
+                None
+            } else {
+                seen_overview = state.overview_generation;
+                state.overview.clone()
+            };
+            (header, overview)
         };
         if superseded.load(Ordering::SeqCst) {
             continue;
         }
         let latest = latest.filter(|latest| *latest != written);
-        let due = latest.is_some() || kept.elapsed() >= context.options.keepalive;
+        let latest_overview = latest_overview.filter(|latest| *latest != written_overview);
+        let due = latest.is_some()
+            || latest_overview.is_some()
+            || kept.elapsed() >= context.options.keepalive;
         if due && !session_holds(context, session) {
             chunk(writer, LOGGED_OUT_LINE)?;
             break;
         }
-        if let Some(latest) = latest {
-            chunk(writer, &latest)?;
-            written = latest;
+        if latest.is_some() || latest_overview.is_some() {
+            if let Some(latest) = latest {
+                chunk(writer, &latest)?;
+                written = latest;
+            }
+            if let Some(latest) = latest_overview {
+                chunk(writer, &latest)?;
+                written_overview = latest;
+            }
             kept = Instant::now();
         } else if kept.elapsed() >= context.options.keepalive {
             chunk(writer, r#"{"keepalive":true}"#)?;
@@ -1078,5 +1221,38 @@ mod tests {
         }
         let back: Value = serde_json::from_str(&text).unwrap();
         assert_eq!(back["line"], line);
+    }
+
+    /// F1: the line a stream writes first and the generation it takes as seen
+    /// are the pair the refresher stored under one lock, never a line with
+    /// another generation (a newer one would hide the newer line from the
+    /// stream). A writer bumps both under the lock while the reader reads;
+    /// a reader that took them with two locks would see them apart.
+    #[test]
+    fn the_stored_overview_and_its_generation_are_read_together() {
+        let hub = Arc::new(Hub::default());
+        assert_eq!(stored_overview(&hub), None);
+        let writer = {
+            let hub = hub.clone();
+            thread::spawn(move || {
+                for generation in 1..=20_000_u64 {
+                    let mut state = hub.lock();
+                    state.overview = Some(format!("line {generation}"));
+                    state.overview_generation = generation;
+                }
+            })
+        };
+        let mut reads = 0;
+        while !writer.is_finished() || reads == 0 {
+            if let Some((line, generation)) = stored_overview(&hub) {
+                assert_eq!(line, format!("line {generation}"));
+                reads += 1;
+            }
+        }
+        writer.join().unwrap();
+        assert_eq!(
+            stored_overview(&hub),
+            Some(("line 20000".to_owned(), 20_000))
+        );
     }
 }

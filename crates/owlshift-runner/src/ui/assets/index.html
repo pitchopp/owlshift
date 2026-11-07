@@ -33,6 +33,26 @@
 <main>
   <p id="logged-out" class="notice">Not logged in: run <code>owlshift ui</code> in a terminal.</p>
   <p id="problem" class="notice problem" hidden></p>
+  <div id="home" hidden>
+    <section id="for-you" class="home-section" aria-labelledby="for-you-title">
+      <h2 id="for-you-title">For you</h2>
+      <div id="for-you-body"></div>
+    </section>
+    <section id="overview" class="home-section" aria-labelledby="overview-title">
+      <div class="section-head">
+        <h2 id="overview-title">Overview</h2>
+        <div class="view-switch" role="group" aria-label="View">
+          <button type="button" id="view-columns" class="toggle" aria-pressed="true">Columns</button>
+          <button type="button" id="view-list" class="toggle" aria-pressed="false">List</button>
+        </div>
+      </div>
+      <div id="overview-body"></div>
+    </section>
+    <section id="since" class="home-section" aria-labelledby="since-title">
+      <h2 id="since-title">Since your last visit</h2>
+      <div id="since-body"></div>
+    </section>
+  </div>
   <section id="ticket" class="ticket" hidden></section>
 </main>
 </body>

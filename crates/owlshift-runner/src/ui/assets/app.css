@@ -483,3 +483,185 @@ pre {
 .log-stderr {
   margin-top: 4px;
 }
+
+/* The overview (OWL-470): For you, the columns and list views, and since
+   your last visit. Colours only from the theme roles above. */
+.home-section {
+  margin-bottom: 22px;
+}
+
+.home-section h2 {
+  margin: 0 0 8px;
+}
+
+.section-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px 16px;
+}
+
+.view-switch {
+  display: inline-flex;
+}
+
+.toggle {
+  background: var(--surface);
+  color: var(--text);
+  border: 1px solid var(--border-strong);
+  padding: 2px 12px;
+  font: inherit;
+  cursor: pointer;
+}
+
+.toggle:first-child {
+  border-radius: 4px 0 0 4px;
+}
+
+.toggle:last-child {
+  border-radius: 0 4px 4px 0;
+  border-left: 0;
+}
+
+.toggle[aria-pressed=true] {
+  background: var(--action-fill);
+  color: var(--action-text);
+}
+
+.plain {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+.muted {
+  color: var(--text-muted);
+}
+
+.for-you-group h3,
+.project-head {
+  margin: 10px 0 4px;
+}
+
+.project-head span {
+  margin-left: 12px;
+  font-size: 0.85em;
+  font-weight: 400;
+}
+
+.for-you-entry,
+.since-line {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 2px 12px;
+  padding: 3px 0;
+  border-bottom: 1px solid var(--border-hairline);
+}
+
+.since-title {
+  color: var(--text-secondary);
+  font-weight: 600;
+}
+
+.question {
+  flex-basis: 100%;
+  color: var(--text-secondary);
+}
+
+.entry-title,
+.row-title,
+.card-title {
+  color: var(--text);
+}
+
+.columns {
+  display: grid;
+  grid-auto-flow: column;
+  grid-auto-columns: minmax(210px, 1fr);
+  gap: 10px;
+  overflow-x: auto;
+  padding-bottom: 8px;
+}
+
+.column {
+  background: var(--raised);
+  border: 1px solid var(--border-hairline);
+  border-radius: 6px;
+  padding: 6px 8px;
+  min-width: 0;
+}
+
+.column-head {
+  display: flex;
+  justify-content: space-between;
+  margin: 2px 0 6px;
+  color: var(--text-secondary);
+}
+
+.column-count {
+  color: var(--text-muted);
+}
+
+.card {
+  background: var(--surface);
+  border: 1px solid var(--border-hairline);
+  border-radius: 4px;
+  margin-bottom: 6px;
+  padding: 6px 8px;
+  overflow-wrap: anywhere;
+}
+
+.card-head {
+  display: flex;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.card-state {
+  font-size: 0.85em;
+}
+
+.card-why {
+  color: var(--text-muted);
+  font-size: 0.9em;
+}
+
+.rows .row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 2px 14px;
+  padding: 4px 6px;
+  border-bottom: 1px solid var(--border-hairline);
+}
+
+.row-needs-you {
+  background: var(--raised);
+}
+
+.strip {
+  display: inline-flex;
+  gap: 2px;
+}
+
+.strip-cell {
+  width: 12px;
+  height: 8px;
+  border: 1px solid var(--border-strong);
+  border-radius: 2px;
+}
+
+.strip-done {
+  background: var(--badge-fill);
+  color: var(--badge-text);
+}
+
+.strip-current {
+  background: var(--action-fill);
+  color: var(--action-text);
+}
+
+.strip-todo {
+  background: transparent;
+}

@@ -3,11 +3,15 @@
 // `text`, which sets `textContent`: nothing an agent or a comment wrote is
 // ever read as markup. The only secret this page sends is the session, in
 // the `X-Owlshift-Session` header; the login sends the one-time code.
+// The overview (OWL-470) is further down: For you, the columns and list views
+// and the panel of what happened since the last visit.
 "use strict";
 
 const SESSION_KEY = "owlshift.session";
 const THEME_KEY = "owlshift.theme";
 const PROJECT_KEY = "owlshift.project";
+const VIEW_KEY = "owlshift.view";
+const VISIT_KEY = "owlshift.lastVisit";
 const SESSION_HEADER = "X-Owlshift-Session";
 
 function text(el, value) {
@@ -99,6 +103,7 @@ function loggedOut(sent) {
   clear(document.getElementById("header"));
   show("header", false);
   closeTicket();
+  clearHome();
   show("logged-out", true);
 }
 
@@ -298,6 +303,8 @@ async function follow() {
         if (message.header) {
           retry = 2000;
           render(message.header);
+        } else if (message.overview) {
+          renderOverview(message.overview);
         } else if (message.closed === "superseded") {
           superseded = true;
         } else if (message.closed === "logged_out") {
@@ -393,6 +400,7 @@ function closeTicket() {
 function route() {
   closeTicket();
   const target = parseRoute(window.location.hash);
+  show("home", target === null && session() !== null);
   if (target === null) {
     return;
   }
@@ -1272,6 +1280,430 @@ function wakeLogs(handle, run) {
   }
 }
 
+// ---------------------------------------------------------------------------
+// The overview (OWL-470): For you, the columns and list views, and since
+// your last visit. The server builds everything the page draws (the order of
+// the list, the strip, the words of a wait); the page only draws it. Every
+// text goes through `make` and `text`.
+
+const STAGES = ["Intake", "Ready", "Design", "Design review", "Build", "Verify", "Deliver", "Watch"];
+
+const COLUMNS = [
+  ["not_started", "Not started"],
+  ["intake", "Intake"],
+  ["ready", "Ready"],
+  ["design", "Design"],
+  ["design_review", "Design review"],
+  ["build", "Build"],
+  ["verify", "Verify"],
+  ["deliver", "Deliver"],
+  ["watch", "Watch"],
+];
+
+// A repository the page links a pull request of: two plain names.
+const REPOSITORY_PATTERN = /^[A-Za-z0-9._-]+\/[A-Za-z0-9._-]+$/;
+
+let lastOverview = null;
+let lastSince = null;
+let lastHighlights = null;
+let previousVisit = null;
+let sinceSeq = 0;
+
+// The baseline of "since your last visit" is the previous page load: read
+// first, then this load's time becomes the next one. Nothing stored (a first
+// visit) means the request carries no `at`, and the server counts the last
+// 24 hours.
+function startVisit() {
+  const raw = stored(VISIT_KEY);
+  const parsed = raw ? Date.parse(raw) : NaN;
+  previousVisit = Number.isNaN(parsed) ? null : new Date(parsed).toISOString();
+  store(VISIT_KEY, new Date().toISOString());
+}
+
+function currentView() {
+  return stored(VIEW_KEY) === "list" ? "list" : "columns";
+}
+
+function wireViewSwitch() {
+  for (const view of ["columns", "list"]) {
+    document.getElementById("view-" + view).addEventListener("click", () => {
+      store(VIEW_KEY, view);
+      renderHome();
+    });
+  }
+}
+
+function clearHome() {
+  lastOverview = null;
+  lastSince = null;
+  lastHighlights = null;
+  sinceSeq += 1;
+  for (const id of ["for-you-body", "overview-body", "since-body"]) {
+    clear(document.getElementById(id));
+  }
+  show("home", false);
+}
+
+function selectedProject() {
+  return document.getElementById("project").value;
+}
+
+// A link to a ticket's page. The address is built from the project's two
+// names and the ticket, each encoded; a project that is not owner/name gets
+// no link.
+function ticketLink(project, ticket) {
+  const link = make("a", "ticket-link", ticket);
+  const parts = project.split("/");
+  if (parts.length === 2 && parts.every((part) => part !== "")) {
+    link.setAttribute("href", "#/ticket/" + encodeURIComponent(parts[0]) + "/" +
+      encodeURIComponent(parts[1]) + "/" + encodeURIComponent(ticket));
+  }
+  return link;
+}
+
+// A pull request, linked to the forge when the project is two plain names and
+// the number a whole number; the address is built here, from local state, and
+// the forge is not called.
+function pullRequestLink(project, number) {
+  const label = "pull request #" + number;
+  const names = project.split("/");
+  const plain = REPOSITORY_PATTERN.test(project) && names.every((n) => n !== "." && n !== "..");
+  if (!plain || !Number.isInteger(number) || number < 1) {
+    return make("span", "pr-link", label);
+  }
+  const link = make("a", "pr-link", label);
+  link.href = "https://github.com/" + project + "/pull/" + number;
+  link.rel = "noopener noreferrer";
+  return link;
+}
+
+function ageText(iso) {
+  const seconds = Math.max(0, Math.round((Date.now() - Date.parse(iso)) / 1000));
+  if (seconds < 90) {
+    return seconds + " s";
+  }
+  if (seconds < 5400) {
+    return Math.round(seconds / 60) + " min";
+  }
+  return Math.round(seconds / 3600) + " h";
+}
+
+const NEEDS_YOU = {
+  question: "Questions to answer",
+  plan: "Plans to approve",
+  review: "Pull requests to review",
+  parked: "Parked",
+};
+
+function shownProjects(overview) {
+  const chosen = selectedProject();
+  return overview.projects.filter((project) => !chosen || project.repository === chosen);
+}
+
+function renderForYou(overview) {
+  const body = document.getElementById("for-you-body");
+  clear(body);
+  const chosen = selectedProject();
+  const lists = [
+    ["questions", NEEDS_YOU.question],
+    ["plans", NEEDS_YOU.plan],
+    ["reviews", NEEDS_YOU.review],
+    ["parked", NEEDS_YOU.parked],
+  ];
+  let total = 0;
+  for (const [key, title] of lists) {
+    const entries = overview.for_you[key].filter((entry) => !chosen || entry.project === chosen);
+    if (!entries.length) {
+      continue;
+    }
+    total += entries.length;
+    const group = make("div", "for-you-group");
+    group.appendChild(make("h3", "", title + " (" + entries.length + ")"));
+    const list = make("ul", "plain");
+    for (const entry of entries) {
+      const item = make("li", "for-you-entry");
+      item.appendChild(ticketLink(entry.project, entry.ticket));
+      if (!chosen) {
+        item.appendChild(make("span", "muted", entry.project));
+      }
+      if (entry.title) {
+        item.appendChild(make("span", "entry-title", entry.title));
+      }
+      if (entry.pull_request !== null && entry.pull_request !== undefined) {
+        item.appendChild(pullRequestLink(entry.project, entry.pull_request));
+      }
+      for (const question of entry.questions) {
+        item.appendChild(make("div", "question", question.id + ": " + question.text));
+      }
+      list.appendChild(item);
+    }
+    group.appendChild(list);
+    body.appendChild(group);
+  }
+  if (!total) {
+    body.appendChild(make("p", "notice", "Nothing waits for you."));
+  }
+}
+
+// The words of a card's state, and the class that colours it.
+function stateOf(card) {
+  if (card.running) {
+    return ["running" + (card.running.role ? ", " + card.running.role : "") +
+      ", slot " + card.running.slot, "state-success"];
+  }
+  switch (card.needs_you) {
+    case "question":
+      return ["questions to answer", "state-warning"];
+    case "plan":
+      return ["plan to approve", "state-warning"];
+    case "review":
+      return ["pull request to review", "state-warning"];
+    case "parked":
+      return ["parked", "state-danger"];
+    default:
+      break;
+  }
+  switch (card.column) {
+    case "not_started":
+      return ["not started", "state-information"];
+    case "starting":
+      return ["starting", "state-information"];
+    case "unreadable":
+      return ["its ref cannot be read", "state-danger"];
+    default:
+      return ["idle", ""];
+  }
+}
+
+function whyOf(card) {
+  if (card.wait) {
+    return card.wait.text;
+  }
+  if (card.column === "not_started" && card.drain && card.drain !== "waits") {
+    return "the drain " + card.drain.replace("_", " ") + " it";
+  }
+  return "";
+}
+
+function cardElement(card, withStrip) {
+  const el = make("div", "card");
+  const head = make("div", "card-head");
+  head.appendChild(ticketLink(card.project, card.ticket));
+  const [state, stateClass] = stateOf(card);
+  head.appendChild(make("span", "card-state " + stateClass, state));
+  el.appendChild(head);
+  if (card.title) {
+    el.appendChild(make("div", "card-title", card.title));
+  }
+  const why = whyOf(card);
+  if (why) {
+    el.appendChild(make("div", "card-why", why));
+  }
+  if (card.pull_request !== null && card.pull_request !== undefined) {
+    el.appendChild(pullRequestLink(card.project, card.pull_request));
+  }
+  if (withStrip) {
+    el.appendChild(stripElement(card.strip));
+  }
+  return el;
+}
+
+function stripElement(strip) {
+  const el = make("span", "strip");
+  strip.forEach((cell, at) => {
+    const part = make("span", "strip-cell strip-" + cell);
+    part.setAttribute("title", STAGES[at] + ": " + cell);
+    el.appendChild(part);
+  });
+  return el;
+}
+
+function renderColumns(project, into) {
+  const byTicket = new Map(project.cards.map((card) => [card.ticket, card]));
+  const columns = new Map(COLUMNS.map(([key]) => [key, []]));
+  columns.set("other", []);
+  for (const ticket of project.list) {
+    const card = byTicket.get(ticket);
+    const key = columns.has(card.column) ? card.column : "other";
+    columns.get(key).push(card);
+  }
+  const grid = make("div", "columns");
+  const shown = COLUMNS.concat([["other", "Starting or unreadable"]]);
+  for (const [key, title] of shown) {
+    const cards = columns.get(key);
+    if (key === "other" && !cards.length) {
+      continue;
+    }
+    const column = make("div", "column");
+    const head = make("h4", "column-head");
+    head.appendChild(make("span", "", title));
+    head.appendChild(make("span", "column-count", cards.length));
+    column.appendChild(head);
+    if (key === "not_started" && project.ready && project.ready.stale) {
+      column.appendChild(make("div", "card-why state-warning",
+        "ready.json is stale: the drain last read the column " + ageText(project.ready.at) + " ago"));
+    }
+    for (const card of cards) {
+      column.appendChild(cardElement(card, false));
+    }
+    grid.appendChild(column);
+  }
+  into.appendChild(grid);
+}
+
+function renderList(project, into) {
+  const byTicket = new Map(project.cards.map((card) => [card.ticket, card]));
+  if (project.ready && project.ready.stale) {
+    into.appendChild(make("p", "card-why state-warning",
+      "ready.json is stale: the drain last read the column " + ageText(project.ready.at) + " ago"));
+  }
+  const list = make("ul", "plain rows");
+  for (const ticket of project.list) {
+    const card = byTicket.get(ticket);
+    const row = make("li", "row" + (card.needs_you ? " row-needs-you" : ""));
+    row.appendChild(ticketLink(card.project, card.ticket));
+    row.appendChild(stripElement(card.strip));
+    const [state, stateClass] = stateOf(card);
+    row.appendChild(make("span", "card-state " + stateClass, state));
+    row.appendChild(make("span", "row-title", card.title || ""));
+    row.appendChild(make("span", "card-why", whyOf(card)));
+    if (card.pull_request !== null && card.pull_request !== undefined) {
+      row.appendChild(pullRequestLink(card.project, card.pull_request));
+    }
+    list.appendChild(row);
+  }
+  if (!project.list.length) {
+    into.appendChild(make("p", "notice", "No ticket in flight or admitted."));
+  }
+  into.appendChild(list);
+}
+
+function renderView(overview) {
+  const body = document.getElementById("overview-body");
+  clear(body);
+  const view = currentView();
+  document.getElementById("view-columns").setAttribute("aria-pressed", String(view === "columns"));
+  document.getElementById("view-list").setAttribute("aria-pressed", String(view === "list"));
+  for (const note of overview.notes) {
+    body.appendChild(make("p", "fact state-information", note));
+  }
+  const projects = shownProjects(overview);
+  if (!projects.length) {
+    body.appendChild(make("p", "notice", "No project is served."));
+  }
+  for (const project of projects) {
+    const block = make("div", "project-block");
+    const head = make("h3", "project-head", project.repository);
+    if (project.paused) {
+      head.appendChild(make("span", "state-warning", "paused: " + (project.paused.why || "")));
+    }
+    if (project.quarantined) {
+      head.appendChild(make("span", "state-danger", "quarantined"));
+    }
+    block.appendChild(head);
+    if (view === "list") {
+      renderList(project, block);
+    } else {
+      renderColumns(project, block);
+    }
+    body.appendChild(block);
+  }
+}
+
+function sinceGroup(into, title, entries, chosen) {
+  const shown = entries.filter((entry) => !chosen || entry.project === chosen);
+  if (!shown.length) {
+    return;
+  }
+  const line = make("div", "since-line");
+  line.appendChild(make("span", "since-title", title + " (" + shown.length + ")"));
+  for (const entry of shown) {
+    line.appendChild(ticketLink(entry.project, entry.ticket));
+  }
+  into.appendChild(line);
+}
+
+function renderSince() {
+  const body = document.getElementById("since-body");
+  clear(body);
+  if (!lastSince) {
+    return;
+  }
+  const since = lastSince;
+  const chosen = selectedProject();
+  body.appendChild(make("p", "muted", previousVisit
+    ? "Since this browser last looked, " + since.from
+    : "First visit: the last 24 hours, since " + since.from));
+  if (since.truncated) {
+    body.appendChild(make("p", "state-warning",
+      "The event log's oldest records for this period were dropped: the counts may be short."));
+  }
+  const lines = make("div", "since-lines");
+  sinceGroup(lines, "Delivered", since.delivered, chosen);
+  sinceGroup(lines, "Merged", since.merged, chosen);
+  sinceGroup(lines, "Parked", since.parked, chosen);
+  sinceGroup(lines, "Asked", since.asked, chosen);
+  // Spend comes by project: the chosen project's, or every project's.
+  let spent = 0;
+  for (const [project, usd] of Object.entries(since.spent_usd || {})) {
+    if (!chosen || project === chosen) {
+      spent += usd;
+    }
+  }
+  if (spent > 0) {
+    lines.appendChild(make("div", "since-line", "Spent $" + spent.toFixed(2)));
+  }
+  if (!lines.firstChild) {
+    lines.appendChild(make("p", "notice", "Nothing happened since."));
+  }
+  body.appendChild(lines);
+}
+
+async function refreshSince() {
+  sinceSeq += 1;
+  const mine = sinceSeq;
+  const path = "/api/since" +
+    (previousVisit ? "?at=" + encodeURIComponent(previousVisit) : "");
+  try {
+    const answer = await authedFetch(path);
+    if (!answer || mine !== sinceSeq) {
+      return;
+    }
+    if (!answer.response.ok) {
+      throw new Error("answered " + answer.response.status);
+    }
+    lastSince = await answer.response.json();
+    if (mine === sinceSeq) {
+      renderSince();
+    }
+  } catch (error) {
+    const body = document.getElementById("since-body");
+    clear(body);
+    body.appendChild(make("p", "problem", "What happened since could not be read: " + error.message));
+  }
+}
+
+function renderHome() {
+  if (!lastOverview) {
+    return;
+  }
+  renderForYou(lastOverview);
+  renderView(lastOverview);
+  renderSince();
+}
+
+// The overview the stream sent. The "since" panel is asked for again when the
+// count of highlights moved: it only ever goes up, so a new event always
+// moves it.
+function renderOverview(overview) {
+  lastOverview = overview;
+  renderHome();
+  if (overview.highlights !== lastHighlights) {
+    lastHighlights = overview.highlights;
+    refreshSince();
+  }
+}
+
 async function start() {
   const theme = document.getElementById("theme");
   theme.value = stored(THEME_KEY) || "system";
@@ -1286,7 +1718,10 @@ async function start() {
     if (lastHeader) {
       render(lastHeader);
     }
+    renderHome();
   });
+  startVisit();
+  wireViewSwitch();
   try {
     await login();
   } catch (error) {

@@ -82,18 +82,29 @@ pub struct Narrowed {
 pub fn fold(events: &[Event], project: &str) -> Folded {
     let mut folded = Folded::default();
     for event in events {
+        folded.absorb(project, event);
+    }
+    folded
+}
+
+impl Folded {
+    /// Folds one more `event`, the next in the log's order, for the project
+    /// `project`: [`fold`] is this over a slice, and a reader that keeps its
+    /// place in the log (the web UI's overview, OWL-470) calls it for each
+    /// line it reads.
+    pub fn absorb(&mut self, project: &str, event: &Event) {
         if event.project != project {
-            continue;
+            return;
         }
         let Some(ticket) = &event.ticket else {
-            continue;
+            return;
         };
         let zones_unknown = event.kind == EventKind::Warning
             && event.data.get("what").and_then(Value::as_str) == Some("zones_unknown");
         if zones_unknown {
-            folded.people.insert(ticket.clone(), event.at);
+            self.people.insert(ticket.clone(), event.at);
         } else {
-            folded.people.remove(ticket);
+            self.people.remove(ticket);
         }
         if event.kind == EventKind::Decision
             && event.data.get("held").and_then(Value::as_str) == Some("narrowed")
@@ -104,8 +115,7 @@ pub fn fold(events: &[Event], project: &str) -> Folded {
                 .and_then(Value::as_array)
                 .map_or_else(Vec::new, |all| all.iter().map(resource_text).collect());
             let count = event.data.get("count").and_then(Value::as_u64);
-            folded
-                .narrowed
+            self.narrowed
                 .entry(ticket.clone())
                 .or_default()
                 .push(Narrowed {
@@ -115,20 +125,18 @@ pub fn fold(events: &[Event], project: &str) -> Folded {
                 });
         }
         if let Some(waiting) = waiting(event, ticket) {
-            folded
-                .history
+            self.history
                 .entry(ticket.clone())
                 .or_default()
                 .push(waiting.clone());
-            folded.current.insert(ticket.clone(), waiting);
+            self.current.insert(ticket.clone(), waiting);
         } else if matches!(
             event.kind,
             EventKind::Dispatch | EventKind::RunStarted | EventKind::PrMerged
         ) {
-            folded.current.remove(ticket);
+            self.current.remove(ticket);
         }
     }
-    folded
 }
 
 /// The wait a `decision` event tells, if it tells one.
@@ -954,6 +962,65 @@ mod tests {
 
     fn waits(at: &str, ticket: &str, details: Data) -> Event {
         event(at, Some(ticket), EventKind::Decision, details)
+    }
+
+    /// OWL-470: folding event by event, in batches, is folding the slice.
+    #[test]
+    fn absorbing_event_by_event_is_folding_the_slice() {
+        let mut other = waits(
+            "2026-10-20T10:01:00Z",
+            "OWL-9",
+            data([("drain", json!("waits")), ("reason", json!("slot"))]),
+        );
+        other.project = "p/q".to_owned();
+        let events = [
+            waits(
+                "2026-10-20T10:00:00Z",
+                "OWL-1",
+                data([("drain", json!("waits")), ("reason", json!("slot"))]),
+            ),
+            other,
+            waits(
+                "2026-10-20T10:02:00Z",
+                "OWL-2",
+                data([("drain", json!("waits")), ("reason", json!("slot"))]),
+            ),
+            event(
+                "2026-10-20T10:03:00Z",
+                Some("OWL-3"),
+                EventKind::Warning,
+                data([("what", json!("zones_unknown"))]),
+            ),
+            waits(
+                "2026-10-20T10:04:00Z",
+                "OWL-3",
+                data([
+                    ("held", json!("narrowed")),
+                    ("dropped", json!(["a"])),
+                    ("count", json!(2)),
+                ]),
+            ),
+            event(
+                "2026-10-20T10:05:00Z",
+                Some("OWL-1"),
+                EventKind::Dispatch,
+                Data::new(),
+            ),
+        ];
+        let mut absorbed = Folded::default();
+        for batch in [&events[..3], &events[3..]] {
+            for event in batch {
+                absorbed.absorb("o/r", event);
+            }
+        }
+        let folded = fold(&events, "o/r");
+        assert_eq!(absorbed, folded);
+        assert_eq!(folded.current.len(), 1, "OWL-1 was dispatched");
+        assert_eq!(folded.narrowed.len(), 1);
+        assert!(
+            folded.people.is_empty(),
+            "the narrowing followed the warning"
+        );
     }
 
     #[test]
