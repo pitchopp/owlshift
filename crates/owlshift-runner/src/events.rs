@@ -212,6 +212,11 @@ impl EventTail {
         &self.notes
     }
 
+    /// The log file the tail reads.
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
     /// The offset of the first byte not read.
     pub fn offset(&self) -> u64 {
         self.offset

@@ -220,12 +220,10 @@ struct Context {
     figures: Mutex<Option<Figures>>,
     hub: Hub,
     /// The event log's incremental reader (OWL-471): what the ticket page's
-    /// snapshot and its run logs' `ended` read.
+    /// snapshot and its run logs' `ended` read, and, through
+    /// [`events::Reader::with_tail`], the drain's graph (OWL-460): one
+    /// offset and one copy of the log for both.
     events: events::Reader,
-    /// The event log's waits, read incrementally for the graph (OWL-460):
-    /// every event, which `status::waits` folds, where [`events::Reader`]
-    /// keeps only a ticket page's rows.
-    graph_events: Mutex<EventTail>,
     /// What a ticket's snapshot keeps between two builds.
     tickets: ticket::Cache,
 }
@@ -342,7 +340,6 @@ pub fn start(
         figures: Mutex::new(None),
         hub: Hub::default(),
         events: events::Reader::new(data),
-        graph_events: Mutex::new(EventTail::in_dir(data)),
         tickets: ticket::Cache::new(ticket::WAITS_KEPT),
     });
     let stopping = Arc::new(AtomicBool::new(false));
@@ -926,11 +923,9 @@ pub fn graph_read(
 /// The graph now, the personal file read again for `concurrent_runs`.
 fn graph_now(context: &Context) -> Graph {
     let (figures, note) = figures_now(context);
-    let mut tail = context
-        .graph_events
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let mut graph = graph_read(&context.data, &mut tail, figures.0, Timestamp::now());
+    let mut graph = context
+        .events
+        .with_tail(|tail| graph_read(&context.data, tail, figures.0, Timestamp::now()));
     graph.notes.extend(note);
     graph
 }
