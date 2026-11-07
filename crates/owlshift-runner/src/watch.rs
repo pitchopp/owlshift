@@ -167,6 +167,7 @@ use crate::writer::VisibleStage;
 
 mod cancel;
 mod drain;
+mod ended;
 mod limits;
 mod merge;
 pub mod offline;
@@ -607,6 +608,9 @@ struct Memory<'c> {
     /// The tickets a cancel's park whose state was not kept holds, with
     /// their ref's progress then: left alone until it moves (OWL-474).
     cancel_held: HashMap<TicketId, Progress>,
+    /// When each ticket whose following ended, and which still owes a
+    /// follow-up, was last tried (OWL-501).
+    ended_filings: ended::EndedFilings,
 }
 
 /// What a correction's or the reviews' read found due at a pass (OWL-445):
@@ -869,6 +873,7 @@ impl Watch<'_> {
         let canceled = self.cancels(memory, sink, out, &read);
         let mut waiting = Vec::new();
         let mut following = Vec::new();
+        let mut owing = Vec::new();
         let mut resumable = Vec::new();
         // The parked tickets, whose thread may hold their decider's
         // `continue` (OWL-488).
@@ -921,6 +926,12 @@ impl Watch<'_> {
             }
             if busy.contains(&ticket) {
                 continue;
+            }
+            // Its follow-ups still owed once its following ended (OWL-501).
+            if let Ok((stored, _)) = &state
+                && ended::owes_after_end(stored)
+            {
+                owing.push((ticket.clone(), stored.clone()));
             }
             match state {
                 // A ticket parked at Watch is read for an end alone (OWL-243),
@@ -1074,6 +1085,7 @@ impl Watch<'_> {
             );
             self.follow(memory, sink, out, continued, &ticket, &stored);
         }
+        self.file_ended(memory, sink, &owing);
         for (ticket, stored, status, outlived, resume) in waiting {
             // A stage a stop left at working first (OWL-265): an end then
             // moves the stage it shows to review, which it would not do

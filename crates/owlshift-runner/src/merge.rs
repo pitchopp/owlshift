@@ -10,7 +10,6 @@
 use serde_json::{Value, json};
 
 use owlshift_adapters::forge::CommitId;
-use owlshift_contracts::drain::{ProposalOutcome, TicketProposals};
 use owlshift_contracts::event::EventKind;
 use owlshift_contracts::ids::TicketId;
 use owlshift_contracts::refs::{DeliveredPullRequest, Merging, TicketDelivery, TicketQuestions};
@@ -370,7 +369,7 @@ pub(crate) fn hold_words(blocker: &MergeBlocker, question: Option<&MergeQuestion
         ),
         MergeBlocker::Draft => "the pull request is a draft".to_owned(),
         MergeBlocker::SomethingDue => {
-            "the ticket owes a report or a follow-up on the tracker first".to_owned()
+            "the ticket owes its DELIVERY report on the tracker first".to_owned()
         }
         MergeBlocker::BaseUnknown => "the base of Owlshift's last push is not known".to_owned(),
         MergeBlocker::BaseMoved => {
@@ -389,54 +388,15 @@ pub(crate) fn hold_words(blocker: &MergeBlocker, question: Option<&MergeQuestion
     }
 }
 
-/// What a ticket owes on the tracker before merge on green merges it
-/// (OWL-499; architecture section 5, "Merge on green", "Nothing is due
-/// first"): its DELIVERY report, and, on a tracker with a proposals inbox,
-/// the titles of its follow-ups not filed yet, with the latest refusal the
-/// ref keeps for one.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub(crate) struct Owed {
-    pub report: bool,
-    pub proposals: Vec<String>,
-    pub refusal: Option<String>,
-}
-
-impl Owed {
-    /// What `delivery` and `proposals` owe, the follow-ups only when the
-    /// tracker has an `inbox`.
-    pub(crate) fn of(
-        delivery: &TicketDelivery,
-        proposals: Option<&TicketProposals>,
-        inbox: bool,
-    ) -> Self {
-        let refusals: Vec<(&str, Option<&String>)> = proposals
-            .filter(|_| inbox)
-            .into_iter()
-            .flat_map(|kept| &kept.proposals)
-            .filter_map(|kept| match &kept.outcome {
-                ProposalOutcome::Owed { refusal } => {
-                    Some((kept.proposal.title.as_str(), refusal.as_ref()))
-                }
-                _ => None,
-            })
-            .collect();
-        Owed {
-            report: delivery.owed.is_some(),
-            proposals: refusals
-                .iter()
-                .map(|(title, _)| (*title).to_owned())
-                .collect(),
-            refusal: refusals
-                .iter()
-                .rev()
-                .find_map(|(_, refusal)| refusal.cloned()),
-        }
-    }
-
-    /// Whether anything is owed: merge on green's `something_due`.
-    pub(crate) fn any(&self) -> bool {
-        self.report || !self.proposals.is_empty()
-    }
+/// Whether `delivery` owes on the tracker what comes before merge on green
+/// merges it or refreshes it, merge on green's `something_due` as far as the
+/// ticket ref says, for watch and `continue` alike (architecture section 5,
+/// "Merge on green", "Nothing is due first"): its DELIVERY report. Its owed
+/// follow-ups do not count since OWL-501 ("An owed follow-up does not
+/// hold"): the pass files them first, and one the tracker refuses is filed
+/// after, the following's end included.
+pub(crate) fn owes_first(delivery: &TicketDelivery) -> bool {
+    delivery.owed.is_some()
 }
 
 /// The `decision` event of a wait merge on green tells (OWL-499;
@@ -454,18 +414,13 @@ pub(crate) fn wait_data(number: u64, head: &str, reason: &str, fields: Data) -> 
 }
 
 /// The wait merge on green tells for `blocker`, one no person needs to lift
-/// and no refusal tells (OWL-499): its reason and fields, `owed` giving
-/// those of `merge_owes_first`. `None` for a hold kept for a person, a
-/// review the last read refuses, and the switch off.
-pub(crate) fn blocker_wait(blocker: &MergeBlocker, owed: &Owed) -> Option<(&'static str, Data)> {
+/// and no refusal tells (OWL-499): its reason and fields, `merge_owes_first`
+/// the DELIVERY report owed ([`owes_first`], OWL-501). `None` for a hold
+/// kept for a person, a review the last read refuses, and the switch off.
+pub(crate) fn blocker_wait(blocker: &MergeBlocker) -> Option<(&'static str, Data)> {
     let reason = match blocker {
         MergeBlocker::SomethingDue => {
-            let fields = data([
-                ("report", json!(owed.report)),
-                ("proposals", json!(owed.proposals)),
-                ("refusal", json!(owed.refusal)),
-            ]);
-            return Some(("merge_owes_first", fields));
+            return Some(("merge_owes_first", data([("report", json!(true))])));
         }
         MergeBlocker::NotGreen => "merge_not_green",
         MergeBlocker::StageMoved => "merge_stage_moved",
@@ -588,7 +543,9 @@ pub(crate) fn wait_words(reason: &str, data: &Data) -> Option<String> {
     Some(words)
 }
 
-/// What a ticket owes first, in a person's words.
+/// What a ticket owes first, in a person's words: its DELIVERY report, and,
+/// in an event written before OWL-501, the follow-ups it owed then, with
+/// the tracker's last refusal.
 fn owes_words(data: &Data) -> String {
     let report = data.get("report").and_then(Value::as_bool) == Some(true);
     let titles: Vec<String> = data
@@ -629,13 +586,10 @@ mod tests {
 
     /// OWL-499: each wait merge on green tells for a blocker has its words,
     /// and the holds a person lifts and the refusals are told otherwise.
+    /// What is owed first is the DELIVERY report alone (OWL-501), and an
+    /// event written before, naming follow-ups, is still worded.
     #[test]
     fn every_wait_told_for_a_blocker_has_its_words() {
-        let owed = Owed {
-            report: false,
-            proposals: vec!["Lint the docs".to_owned()],
-            refusal: Some("tracker: the plan holds 250 issues".to_owned()),
-        };
         let told = [
             MergeBlocker::NotGreen,
             MergeBlocker::StageMoved,
@@ -649,7 +603,7 @@ mod tests {
             MergeBlocker::BaseRetargeted,
         ];
         for blocker in told {
-            let (reason, fields) = blocker_wait(&blocker, &owed).expect("told");
+            let (reason, fields) = blocker_wait(&blocker).expect("told");
             let event = wait_data(7, "p", reason, fields);
             let words = wait_words(reason, &event).expect("worded");
             assert!(words.starts_with("pull request #7 is green"), "{words}");
@@ -664,11 +618,22 @@ mod tests {
             MergeBlocker::ReviewRequired,
             MergeBlocker::ChangesRequested,
         ] {
-            assert_eq!(blocker_wait(&blocker, &owed), None, "{blocker:?}");
+            assert_eq!(blocker_wait(&blocker), None, "{blocker:?}");
         }
-        let (reason, fields) = blocker_wait(&MergeBlocker::SomethingDue, &owed).unwrap();
+        let (reason, fields) = blocker_wait(&MergeBlocker::SomethingDue).unwrap();
         assert_eq!(
             wait_words(reason, &wait_data(7, "p", reason, fields)).unwrap(),
+            "pull request #7 is green and not merged yet: the ticket owes its DELIVERY report on \
+             the tracker, which comes first. Owlshift tries again at each pass, then gets it a \
+             refresh rebase or merges it"
+        );
+        let before = data([
+            ("report", json!(false)),
+            ("proposals", json!(["Lint the docs"])),
+            ("refusal", json!("tracker: the plan holds 250 issues")),
+        ]);
+        assert_eq!(
+            wait_words(reason, &wait_data(7, "p", reason, before)).unwrap(),
             "pull request #7 is green and not merged yet: the ticket owes the follow-up \"Lint \
              the docs\" on the tracker, which comes first; the tracker refused the last filing: \
              tracker: the plan holds 250 issues. Owlshift tries again at each pass, then gets it \

@@ -718,13 +718,18 @@ fn a_crash_between_the_merge_and_the_ref_write_still_tells_one_merged() {
     assert_ended_merged(&bench);
 }
 
-/// LOC-1513 and LOC-1530 on the bench (OWL-499): a green pull request on a
-/// base a sibling's merge moved, whose ticket owes follow-ups the tracker
-/// refuses, gets no refresh rebase while they are owed, and says so once,
-/// with the refusal; once the tracker files them, the refresh rebase runs
-/// and the merge follows.
+/// LOC-1513 and LOC-1530 on the bench (OWL-501; architecture section 5,
+/// "Merge on green", "An owed follow-up does not hold"): a green pull
+/// request on a base a sibling's merge moved, whose ticket owes follow-ups
+/// the tracker refuses. While its DELIVERY report is owed too, it gets no
+/// refresh rebase, which is told once (OWL-499). Once the report is posted,
+/// the follow-ups, still refused, hold nothing: the refresh rebase runs and
+/// the merge follows, with no wait told for them. After the merge, watch
+/// files them again at most every 10 minutes, a refusal kept again changing
+/// nothing, and files them once the tracker takes them, with no second
+/// report.
 #[test]
-fn owed_follow_ups_hold_the_refresh_and_say_so() {
+fn owed_follow_ups_the_tracker_refuses_hold_neither_the_refresh_nor_the_merge() {
     let bench = Bench::with(
         "maintainer",
         "assignee = \"maintainer\"\n",
@@ -735,56 +740,82 @@ fn owed_follow_ups_hold_the_refresh_and_say_so() {
         inbox.on = true;
         inbox.refuse = Some("the plan holds 250 issues");
     }
+    bench.refuse.set(Some("[owlshift] DELIVERY"));
     let (outcome, printed) = bench.run(vec![bench.reply(Some("Hello"), Some(PROPOSING))], None);
-    outcome.unwrap_or_else(|stop| panic!("{stop}\n{printed}"));
+    assert!(
+        matches!(&outcome, Err(Stop::Delivery(why)) if why.contains("the next pass posts it")),
+        "{outcome:?}\n{printed}"
+    );
+    let refused = ProposalOutcome::Owed {
+        refusal: Some("tracker: the plan holds 250 issues".to_owned()),
+    };
+    assert_eq!(
+        proposal_outcomes(&bench),
+        [refused.clone(), refused.clone()]
+    );
     let first_push = bench.remote_branch().unwrap();
     let main = sibling_merged(&bench);
     let refresh = refresh_in(&bench);
     let clock = bench.clock.clone();
     let mut pass = 0;
+    // From the first idle pass that reads the following ended: the filings
+    // tried by then and after each pass, the comments and the ref then.
+    let mut ended: Option<(u32, usize, String)> = None;
+    let mut tries = Vec::new();
+    let mut refs = Vec::new();
     let (outcomes, lines, printed) = bench.watch_during(
         vec![bench.reply(None, Some(REBASED))],
         vec![refresh],
         &mut |_| {
             pass += 1;
-            later(&clock);
-            if pass == 4 {
-                assert_eq!(bench.remote_branch().as_deref(), Some(first_push.as_str()));
+            let attempts = bench.inbox.borrow().attempts;
+            if ended.is_none() && bench.record().delivery.unwrap().ended.is_some() {
+                assert_eq!(
+                    proposal_outcomes(&bench),
+                    [refused.clone(), refused.clone()]
+                );
+                ended = Some((pass, bench.comments().len(), bench.ref_commit()));
+            }
+            let Some((at, _, _)) = ended else {
+                // The report, refused twice, holds the refresh, then posts.
+                if pass == 2 {
+                    assert_eq!(bench.remote_branch().as_deref(), Some(first_push.as_str()));
+                    bench.refuse.set(None);
+                }
+                later(&clock);
+                return pass < 12;
+            };
+            tries.push(attempts);
+            refs.push(bench.ref_commit());
+            if pass == at + 3 {
                 bench.inbox.borrow_mut().refuse = None;
             }
-            pass < 10
+            // Five minutes a pass: a try is due every second pass.
+            clock.set(
+                clock
+                    .get()
+                    .checked_add(SignedDuration::from_mins(5))
+                    .unwrap(),
+            );
+            pass < at + 5
         },
     );
     assert!(
         outcomes.iter().all(Result::is_ok),
         "{outcomes:?}\n{lines}\n{printed}"
     );
+    let (_, comments, _) = ended.expect("the following ended");
+    // The report alone was told as owed first; the follow-ups never were.
     let told = waits_told(&bench);
     assert_eq!(told.len(), 1, "{told:?}\n{lines}");
     assert_eq!(
-        (&told[0]["reason"], &told[0]["head"], &told[0]["refusal"]),
-        (
-            &json!("merge_owes_first"),
-            &json!(first_push),
-            &json!("tracker: the plan holds 250 issues")
-        )
+        (&told[0]["reason"], &told[0]["head"], &told[0]["report"]),
+        (&json!("merge_owes_first"), &json!(first_push), &json!(true))
     );
-    assert_eq!(
-        told[0]["proposals"],
-        json!(["Translate the greeting", "Lint the docs"])
-    );
-    let line = "DEMO-1: pull request #1 is green and not merged yet: the ticket owes 2 \
-                follow-ups (\"Translate the greeting\", \"Lint the docs\") on the tracker, which \
-                comes first; the tracker refused the last filing: tracker: the plan holds 250 \
-                issues";
+    let line = "DEMO-1: pull request #1 is green and not merged yet: the ticket owes its \
+                DELIVERY report on the tracker, which comes first. Owlshift tries again at each \
+                pass, then gets it a refresh rebase or merges it";
     assert_eq!(lines.matches(line).count(), 1, "{lines}");
-    assert!(
-        proposal_outcomes(&bench)
-            .iter()
-            .all(|outcome| matches!(outcome, ProposalOutcome::Filed { .. })),
-        "{:?}",
-        proposal_outcomes(&bench)
-    );
     let rebased = data_of(&bench.events(), EventKind::Decision, "refresh");
     assert_eq!(rebased.len(), 1, "{rebased:?}\n{lines}");
     assert_eq!(rebased[0]["onto"], json!(main));
@@ -795,6 +826,27 @@ fn owed_follow_ups_hold_the_refresh_and_say_so() {
         "{lines}"
     );
     assert_ended_merged(&bench);
+    // After the end, two filings a try: tried at the next pass, held while
+    // under 10 minutes, tried again at 10 (`RETRY_AFTER` reached) and
+    // refused, each refusal kept again leaving the ref as it was; then, the
+    // tracker taking them, filed at the next try.
+    let made: Vec<usize> = tries.windows(2).map(|w| w[1] - w[0]).collect();
+    assert_eq!(made, [2, 0, 2, 0, 2], "{tries:?}\n{lines}");
+    assert_eq!(refs[0], refs[3], "a refusal kept again wrote the ref");
+    assert_eq!(
+        proposal_outcomes(&bench)
+            .iter()
+            .filter(|outcome| matches!(outcome, ProposalOutcome::Filed { .. }))
+            .count(),
+        2,
+        "{:?}",
+        proposal_outcomes(&bench)
+    );
+    assert_eq!(
+        proposal_events(&bench.events()),
+        ["proposal_unfiled", "proposal_unfiled", "filed", "filed"]
+    );
+    assert_eq!(bench.comments().len(), comments, "a second report");
 }
 
 /// OWL-499: a refresh rebase whose own read does not find the pull request

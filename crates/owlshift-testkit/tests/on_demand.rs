@@ -753,6 +753,9 @@ struct FakeInbox {
     tickets: Vec<(TicketId, String, String)>,
     /// Every filing is refused with this.
     refuse: Option<&'static str>,
+    /// The filings tried, refused or not: a refusal kept again changes
+    /// neither the ref nor the events (OWL-501).
+    attempts: usize,
 }
 
 /// The Markdown tracker's capabilities without its proposals inbox.
@@ -824,6 +827,7 @@ impl Tracker for Clocked<'_> {
             return Tracker::propose(&self.inner, proposal);
         }
         let mut inbox = self.inbox.borrow_mut();
+        inbox.attempts += 1;
         if let Some(why) = inbox.refuse {
             return Err(tracker::Error::new(tracker::ErrorKind::Other, why));
         }
