@@ -578,14 +578,14 @@ fn no_asset_holds_the_token_and_the_page_sends_only_the_code_and_the_session() {
         .match_indices("authedFetch(")
         .map(|(at, _)| APP_JS[at..].split(')').next().unwrap())
         .collect();
-    // The header's stream, and the ticket page's snapshot and run logs
-    // (OWL-471): each a route of the session, none a path the client
-    // chooses beyond the ticket's own.
+    // The header's stream, which carries the graph too (OWL-460), and the
+    // ticket page's snapshot and run logs (OWL-471): each a route of the
+    // session, none a path the client chooses beyond the ticket's own.
     assert_eq!(
         authed,
         [
             "authedFetch(path",
-            "authedFetch(\"/api/stream\"",
+            "authedFetch(\"/api/stream?graph=1\"",
             "authedFetch(snapshotPath(handle",
             "authedFetch(logPath(handle, run.id, which, log.from, log.line",
         ],
@@ -2175,4 +2175,241 @@ fn a_new_token_ends_a_graph_stream_with_the_logged_out_line() {
         last = Some(line);
     }
     assert_eq!(last.as_deref(), Some(LOGGED_OUT_LINE));
+}
+
+// The graph's page. JavaScript has no test setup here: these pin its
+// structure, and what it draws is checked by a person (see the pull
+// request).
+
+#[test]
+fn the_graph_is_a_route_of_its_own_next_to_the_ticket_page() {
+    let app_js = lf(APP_JS);
+    // The route table: the graph, a ticket's page, and what is neither.
+    let parse = block(&app_js, "function parseRoute(hash) {", "");
+    assert!(parse.contains(r##"if (hash === "#/graph") {"##), "{parse}");
+    assert!(parse.contains(r#"return "graph";"#));
+    assert!(parse.contains(r##"const prefix = "#/ticket/";"##));
+    // It ends the pages open before it draws one, the graph is the page
+    // without a route, and a hash change reads the route again.
+    let route = block(&app_js, "function route() {", "");
+    assert!(
+        route.starts_with("\n  closeTicket();\n  closeGraph();"),
+        "{route}"
+    );
+    assert!(route.find("closeGraph();").unwrap() < route.find("openGraph();").unwrap());
+    assert!(route.contains("target === null || target === \"graph\""));
+    // A logout empties the graph like the header, and forgets it.
+    let logged_out = block(&app_js, "function loggedOut(sent) {", "");
+    assert!(logged_out.contains("closeGraph();"), "{logged_out}");
+    assert!(logged_out.contains("lastGraph = null;"));
+    // The stream that carries the header carries the graph, which the page
+    // draws as it comes.
+    assert!(APP_JS.contains("authedFetch(\"/api/stream?graph=1\""));
+    assert!(APP_JS.contains("} else if (message.graph) {\n          lastGraph = message.graph;"));
+    // The frame: a link to the graph, and the container the graph draws in.
+    assert!(INDEX_HTML.contains(r##"<a href="/#/graph">Graph</a>"##));
+    assert!(INDEX_HTML.contains(r#"<section id="view" class="view" hidden></section>"#));
+    assert!(INDEX_HTML.contains(r#"<section id="ticket" class="ticket" hidden></section>"#));
+}
+
+#[test]
+fn the_layer_switch_is_kept_by_the_browser_and_the_project_switch_filters_the_graph() {
+    let app_js = lf(APP_JS);
+    assert!(app_js.contains(r#"const LAYER_KEY = "owlshift.graph.layer";"#));
+    // The layer is read from, and written to, the page's storage helpers.
+    let layer = block(&app_js, "function graphLayer() {", "");
+    assert!(layer.contains("stored(LAYER_KEY)"), "{layer}");
+    assert!(layer.contains(r#""blockers" ? "blockers" : "live""#));
+    let open = block(&app_js, "function openGraph() {", "");
+    assert!(
+        open.contains("store(LAYER_KEY, name);\n      drawGraph();"),
+        "{open}"
+    );
+    assert!(open.contains("\"Live waits\"") && open.contains("\"Blockers\""));
+    // The graph draws the projects the header's switch chose, again when it
+    // is changed.
+    let draw = block(&app_js, "function drawGraph() {", "");
+    assert!(
+        draw.contains(r#"document.getElementById("project").value"#),
+        "{draw}"
+    );
+    assert!(draw.contains("!chosen || project.repository === chosen"));
+    assert!(draw.contains("aria-pressed"));
+    let start = block(&app_js, "async function start() {", "");
+    assert!(start.contains("store(PROJECT_KEY, project.value || null);"));
+    assert!(start.contains("    drawGraph();\n  });"), "{start}");
+}
+
+#[test]
+fn a_node_opens_its_ticket_and_every_text_of_the_graph_goes_through_text() {
+    let app_js = lf(APP_JS);
+    // A node is a link to the ticket page's route, its parts encoded, so a
+    // click, Enter and a middle click work; only a ticket's own node is one.
+    let href = block(&app_js, "function ticketHref(repository, ticket) {", "");
+    assert!(
+        href.contains(r##"return "#/ticket/" + parts.join("/")"##),
+        "{href}"
+    );
+    assert!(
+        href.contains("encodeURIComponent(part)") && href.contains("encodeURIComponent(ticket)")
+    );
+    let node = block(&app_js, "function drawNode(svg, node, repository) {", "");
+    assert!(
+        node.contains(r#"svgEl("a", { href: ticketHref(repository, node.id) })"#),
+        "{node}"
+    );
+    assert!(node.contains("node.kind === \"ticket\" && !node.person && TICKET_ID.test(node.id)"));
+    // The ticket page reads the route the graph links to: owner, repository
+    // and ticket.
+    assert!(app_js.contains("parts.length !== 3"));
+    // Texts are set as text and colours come from classes: nothing the
+    // graph draws is a style attribute or markup.
+    assert!(!APP_JS.contains(r#"setAttribute("style""#));
+    assert!(!APP_JS.contains(".style."));
+    let svg = block(&app_js, "function svgEl(tag, attributes, value) {", "");
+    assert!(svg.contains("text(el, value);"), "{svg}");
+    // The classes of a node: its state and, for a ghost, its blocker's.
+    assert!(app_js.contains(r#"classes.push("node-" + node.state);"#));
+    assert!(app_js.contains(r#"classes.push("ghost-" + node.blocker_state);"#));
+}
+
+#[test]
+fn each_state_the_server_sends_has_its_colour_and_each_ghost_its_own() {
+    use owlshift_runner::ui::graph::{BLOCKER_STATES, NODE_STATES};
+    for state in NODE_STATES {
+        let rule = block(APP_CSS, &format!("\n.node-{state} {{"), "");
+        assert!(rule.contains("color: var(--"), "{state}: {rule}");
+    }
+    for state in BLOCKER_STATES {
+        let rule = block(APP_CSS, &format!("\n.ghost-{state} {{"), "");
+        assert!(rule.contains("color: var(--"), "{state}: {rule}");
+    }
+    // A ghost is dashed, and a shape takes its colour from its group's.
+    let ghost = block(APP_CSS, "\n.node-ghost .node-box {", "");
+    assert!(ghost.contains("stroke-dasharray"));
+    let shape = block(APP_CSS, "\n.node-box {", "");
+    assert!(shape.contains("fill: currentColor;") && shape.contains("stroke: currentColor;"));
+    // Both are in the audited sheet: a colour outside the themes, a pair
+    // outside the contrast table, would fail `audit`.
+    audit(APP_CSS).unwrap();
+}
+
+/// What `owlshift` serialises of a graph with a node, an edge, a queue and a
+/// blockers layer: the keys a page may read.
+fn sample_graph() -> Value {
+    use owlshift_contracts::waits::{
+        Behind, ProjectWaits, RefStatus, RunSlots, StatusWaits, TicketWaits, Wait,
+    };
+    use owlshift_runner::ui::graph::{self, ReadyInput};
+    let ticket = |name: &str, wait: Option<Wait>| TicketWaits {
+        ticket: TicketId::new(name).unwrap(),
+        stage: None,
+        ref_status: RefStatus::Active,
+        holds_capacity: true,
+        run: None,
+        waits: wait,
+    };
+    let wait = |reason: &str| Wait {
+        reason: reason.to_owned(),
+        since: None,
+        behind: vec![Behind::Ticket {
+            id: TicketId::new("DEMO-1").unwrap(),
+            person: false,
+        }],
+        resource: None,
+        harness: None,
+        until: None,
+        text: reason.to_owned(),
+    };
+    let waits = StatusWaits {
+        format: Format,
+        at: Timestamp::now(),
+        machine_pause: None,
+        runs: Some(RunSlots { in_use: 0, of: 2 }),
+        projects: vec![ProjectWaits {
+            repository: "o/r".to_owned(),
+            served: true,
+            max_in_flight: Some(1),
+            in_flight: 1,
+            paused: None,
+            quarantined: false,
+            tickets: vec![
+                ticket("DEMO-1", None),
+                ticket("DEMO-2", Some(wait("blocked_by"))),
+                ticket("DEMO-3", Some(wait("slot"))),
+            ],
+        }],
+        notes: Vec::new(),
+    };
+    let ready = std::collections::BTreeMap::from([(
+        "o/r".to_owned(),
+        ReadyInput::Read {
+            snapshot: ReadySnapshot {
+                format: Format,
+                at: Timestamp::now(),
+                interval_ms: 1000,
+                tickets: Vec::new(),
+            },
+            stale: false,
+        },
+    )]);
+    serde_json::to_value(graph::of(&waits, &ready)).unwrap()
+}
+
+/// The names the script reads off `prefix` (`node.`) in `source`.
+fn read_keys(source: &str, prefix: &str) -> std::collections::BTreeSet<String> {
+    let mut keys = std::collections::BTreeSet::new();
+    for (at, _) in source.match_indices(prefix) {
+        let before = source[..at].chars().next_back();
+        if before.is_some_and(|c| c.is_ascii_alphanumeric() || c == '_' || c == '.') {
+            continue;
+        }
+        let key: String = source[at + prefix.len()..]
+            .chars()
+            .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+            .collect();
+        if !key.is_empty() {
+            keys.insert(key);
+        }
+    }
+    keys
+}
+
+/// The page never reads a key the server does not send: a missing one is
+/// `undefined`, which the drawing would show as such.
+#[test]
+fn the_graph_page_reads_only_keys_the_server_sends() {
+    let graph = sample_graph();
+    let project = &graph["projects"][0];
+    let drawing = {
+        let start = APP_JS.find("// The drain's graph (OWL-460)").unwrap();
+        let end = APP_JS.find("async function start() {").unwrap();
+        &APP_JS[start..end]
+    };
+    let keys = |value: &Value| -> std::collections::BTreeSet<String> {
+        value.as_object().unwrap().keys().cloned().collect()
+    };
+    for (prefix, sent) in [
+        ("node.", keys(&project["live"]["nodes"][0])),
+        ("project.", keys(project)),
+        ("lastGraph.", keys(&graph)),
+        ("layer.", keys(&project["live"])),
+        ("entry.", keys(&project["queue"][0])),
+        ("edge.", keys(&project["live"]["edges"][0])),
+        ("project.ready.", keys(&project["ready"])),
+    ] {
+        for key in read_keys(drawing, prefix) {
+            // `entry.since` and the like are read; `node.layer` is a key;
+            // methods are not keys.
+            if matches!(key.as_str(), "length" | "push" | "slice") {
+                continue;
+            }
+            assert!(sent.contains(&key), "{prefix}{key} is not sent: {sent:?}");
+        }
+    }
+    // The run a node holds, and the machine's pause.
+    assert!(project["live"]["nodes"][0].get("run").is_some());
+    for key in read_keys(drawing, "node.run.") {
+        assert!(["slot", "pid", "since"].contains(&key.as_str()), "{key}");
+    }
 }
