@@ -34,6 +34,12 @@
 //!   query becomes a path, and a run folder or a log that is a link is not
 //!   followed.
 //!
+//! - `GET /api/orchestrator[?gen=G&after=O][&log=O]` (OWL-472), under the
+//!   session as well: the daemon, the watches, the usage windows, the
+//!   decisions and warnings after a cursor and the daemon's log after an
+//!   offset ([`super::orchestrator`]), read from the event log's index
+//!   ([`super::index`]).
+//!
 //! Every response, errors included, carries [`SECURITY_HEADERS`], and none
 //! a CORS header or a cookie. JSON goes out through [`json_text`], which
 //! writes `<`, `>`, `&`, U+2028 and U+2029 as `\u` escapes, so no text an
@@ -74,7 +80,8 @@ use tiny_http::{Header as HttpHeader, Method, Request, Response, Server, StatusC
 
 use super::auth::{self, CHALLENGE_LEN, RunSecret, UsedCodes};
 use super::eventtail::EventTail;
-use super::{events, header, overview, record, runlog, tail, ticket, token};
+use super::index::EventIndex;
+use super::{events, header, orchestrator, overview, record, runlog, tail, ticket, token};
 use crate::config::FileState;
 use crate::project::ProjectDirs;
 use crate::served::Registry;
@@ -230,6 +237,9 @@ struct Context {
     /// The event log's tail for the overview (OWL-470): held while the overview
     /// is built, which is the one reader of the log it advances.
     tail: Mutex<EventTail>,
+    /// The event log indexed for the Orchestrator and Spend screens
+    /// (OWL-472): held while a request brings it up to date.
+    index: Mutex<EventIndex>,
 }
 
 /// A serving web UI. Dropping it stops taking requests.
@@ -346,6 +356,7 @@ pub fn start(
         events: events::Reader::new(data),
         tickets: ticket::Cache::new(ticket::WAITS_KEPT),
         tail: Mutex::new(EventTail::new(data)),
+        index: Mutex::new(EventIndex::new(data)),
     });
     let stopping = Arc::new(AtomicBool::new(false));
     let accept = {
@@ -584,9 +595,58 @@ fn handle(context: &Arc<Context>, mut request: Request) {
                 ticket_log(context, &url)
             }
         }
+        (Method::Get, "/api/orchestrator") => {
+            if !in_session(context, &request) {
+                error_response(401, "not logged in: run `owlshift ui` in a terminal")
+            } else {
+                orchestrator_page(context, &url)
+            }
+        }
         _ => error_response(404, "no such page"),
     };
     let _ = request.respond(response);
+}
+
+/// A whole number query value, `None` when the key is absent, `Err` when it
+/// is not one.
+fn number_param(pairs: &[(String, String)], key: &str) -> Result<Option<u64>, ()> {
+    match param(pairs, key) {
+        None => Ok(None),
+        Some(text) if !text.is_empty() && text.bytes().all(|b| b.is_ascii_digit()) => {
+            text.parse().map(Some).map_err(|_| ())
+        }
+        Some(_) => Err(()),
+    }
+}
+
+/// `GET /api/orchestrator[?gen=G&after=O][&log=O]` (OWL-472): the daemon, the
+/// watches, the usage windows, the feed of decisions and warnings after the
+/// cursor, and the daemon's log after its offset ([`orchestrator`]).
+fn orchestrator_page(context: &Context, url: &str) -> Response<Cursor<Vec<u8>>> {
+    let pairs = match query_of(url) {
+        Ok(pairs) => pairs,
+        Err(why) => return error_response(400, why),
+    };
+    let (Ok(generation), Ok(after), Ok(log)) = (
+        number_param(&pairs, "gen"),
+        number_param(&pairs, "after"),
+        number_param(&pairs, "log"),
+    ) else {
+        return error_response(400, "gen, after and log are whole numbers");
+    };
+    let cursors = orchestrator::Cursors {
+        events: generation.zip(after),
+        log,
+    };
+    let personal = (context.options.personal)();
+    let inputs = orchestrator::Inputs {
+        data: &context.data,
+        index: &context.index,
+        personal: &personal,
+        now: Timestamp::now(),
+        tz: jiff::tz::TimeZone::system(),
+    };
+    json_response(200, &orchestrator::answer(&inputs, cursors))
 }
 
 /// The value of `text` with its `%XX` escapes and `+`s read, `None` when

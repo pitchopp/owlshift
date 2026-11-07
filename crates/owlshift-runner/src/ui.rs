@@ -16,6 +16,10 @@
 //!   list, what waits for you, and what happened since your last visit,
 //!   from the ticket refs, `ready.json` and the event log read from its
 //!   offset ([`eventtail`]).
+//! - *The Orchestrator* ([`orchestrator`], OWL-472): the daemon, the watches,
+//!   the usage windows, the decisions and warnings as they are appended and
+//!   the daemon's log, in `owlshift status`'s own words, from the event log
+//!   read incrementally ([`index`]).
 //! - *The server* ([`server`]): tiny_http and threads on the socket the
 //!   daemon hands over, its routes and checks, and the page carried in the
 //!   binary.
@@ -31,6 +35,7 @@ pub mod events;
 pub mod eventtail;
 pub mod header;
 pub mod index;
+pub mod orchestrator;
 pub mod overview;
 pub mod probe;
 pub mod record;
