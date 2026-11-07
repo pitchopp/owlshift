@@ -249,3 +249,82 @@ fn a_served_project_with_no_ticket_ref_shows_no_ticket() {
     let port = ground.ui.as_ref().unwrap().port();
     assert_eq!(send(port, "GET", "/api/spend", None, "").status, 401);
 }
+
+fn cost(runs: u32, unreported: u32, spent: u64, restarted: u64) -> Value {
+    json!({
+        "format": 1,
+        "runs": runs,
+        "unreported_runs": unreported,
+        "spent_micros": spent,
+        "restarted_at_micros": restarted,
+    })
+}
+
+/// The row of `ticket` in a Spend answer.
+fn row(body: &Value, ticket: &str) -> Value {
+    body["tickets"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["ticket"] == ticket)
+        .unwrap_or_else(|| panic!("no row for {ticket}: {body}"))
+        .clone()
+}
+
+fn rev(body: &Value) -> String {
+    body["rev"].as_str().unwrap().to_owned()
+}
+
+/// OWL-1: three runs, one without a cost, restarted once after 2.5 dollars;
+/// OWL-2: one run, never restarted.
+fn plant_two(ground: &Ground) -> (String, String) {
+    (
+        ground.plant("OWL-1", &cost(3, 1, 2_750_000, 2_500_000), None),
+        ground.plant("OWL-2", &cost(1, 0, 400_000, 0), None),
+    )
+}
+
+#[test]
+fn spend_over_http_shows_two_tickets_cost_json_against_the_budget() {
+    let ground = ground(&project(Some("5.0")));
+    plant_two(&ground);
+    let reply = ground.spend("");
+    assert_eq!(reply.status, 200, "{}", reply.text);
+    let body = reply.json();
+    assert_eq!(body["tickets"].as_array().unwrap().len(), 2);
+    let one = row(&body, "OWL-1");
+    assert_eq!(one["project"], REPO);
+    // counted_micros is what was spent since the restart.
+    assert_eq!(
+        one["cost"],
+        json!({
+            "runs": 3,
+            "unreported_runs": 1,
+            "spent_micros": 2_750_000,
+            "restarted_at_micros": 2_500_000,
+            "counted_micros": 250_000,
+            "budget_micros": 5_000_000,
+        })
+    );
+    assert_eq!(
+        row(&body, "OWL-2")["cost"],
+        json!({
+            "runs": 1,
+            "unreported_runs": 0,
+            "spent_micros": 400_000,
+            "restarted_at_micros": 0,
+            "counted_micros": 400_000,
+            "budget_micros": 5_000_000,
+        })
+    );
+    // The rows come largest spend first.
+    assert_eq!(body["tickets"][0]["ticket"], "OWL-1");
+
+    // The page's own rev answers unchanged, and the project filter keeps both.
+    let same = ground.spend(&format!("?rev={}", rev(&body))).json();
+    assert_eq!(same["unchanged"], true);
+    let named = ground.spend("?project=acme%2Fweb").json();
+    assert_eq!(named["tickets"], body["tickets"]);
+    let other = ground.spend("?project=acme%2Fother").json();
+    assert_eq!(other["tickets"], json!([]));
+}
