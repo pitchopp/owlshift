@@ -328,3 +328,60 @@ fn spend_over_http_shows_two_tickets_cost_json_against_the_budget() {
     let other = ground.spend("?project=acme%2Fother").json();
     assert_eq!(other["tickets"], json!([]));
 }
+
+#[test]
+fn a_budget_change_and_a_restart_each_give_a_new_rev() {
+    let mut ground = ground(&project(Some("5.0")));
+    let (one_commit, _) = plant_two(&ground);
+    let first = ground.spend("").json();
+    let first_rev = rev(&first);
+
+    // The kept file is read on every request: a new budget shows at once on
+    // the running server, with a new rev.
+    ground.keep(&project(Some("8.0")));
+    let budgeted = ground.spend(&format!("?rev={first_rev}")).json();
+    assert!(budgeted.get("unchanged").is_none(), "{budgeted}");
+    let budget_rev = rev(&budgeted);
+    assert_ne!(budget_rev, first_rev);
+    for ticket in ["OWL-1", "OWL-2"] {
+        assert_eq!(row(&budgeted, ticket)["cost"]["budget_micros"], 8_000_000);
+    }
+    assert_eq!(
+        ground.spend(&format!("?rev={budget_rev}")).json()["unchanged"],
+        true
+    );
+
+    // A restart of the server with nothing changed keeps the rev, so a new
+    // rev below is the ticket's restart and nothing else.
+    ground.restart_ui();
+    let again = ground.spend(&format!("?rev={budget_rev}")).json();
+    assert_eq!(again["unchanged"], true, "{again}");
+
+    // OWL-1 is restarted: its restart mark moves to what was spent. The new
+    // server reads the refs afresh, as the daemon does after a restart.
+    ground.plant(
+        "OWL-1",
+        &cost(3, 1, 2_750_000, 2_750_000),
+        Some(&one_commit),
+    );
+    ground.restart_ui();
+    let restarted = ground.spend(&format!("?rev={budget_rev}")).json();
+    assert!(restarted.get("unchanged").is_none(), "{restarted}");
+    assert_ne!(rev(&restarted), budget_rev);
+    let one = row(&restarted, "OWL-1");
+    assert_eq!(one["cost"]["restarted_at_micros"], 2_750_000);
+    assert_eq!(one["cost"]["spent_micros"], 2_750_000);
+    assert_eq!(one["cost"]["counted_micros"], 0);
+    assert_eq!(one["cost"]["budget_micros"], 8_000_000);
+    assert_eq!(
+        row(&restarted, "OWL-2")["cost"],
+        row(&budgeted, "OWL-2")["cost"]
+    );
+
+    // A file with no ticket_budget_usd leaves no budget.
+    ground.keep(&project(None));
+    let none = ground.spend(&format!("?rev={}", rev(&restarted))).json();
+    assert!(none.get("unchanged").is_none(), "{none}");
+    assert_eq!(row(&none, "OWL-1")["cost"]["budget_micros"], Value::Null);
+    assert_eq!(row(&none, "OWL-2")["cost"]["budget_micros"], Value::Null);
+}
