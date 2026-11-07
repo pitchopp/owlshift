@@ -157,6 +157,248 @@ fn a_chain_of_blockers_then_the_queue_for_the_capacity() {
     assert!(!text.contains("DEMO-9"), "{text}");
 }
 
+/// What the web UI's graph reads of the bench through the server's own
+/// read, `tail` kept from one call to the next, with the `--json` document
+/// of `status --waits` read at the same time.
+fn graph_and_document(
+    bench: &Bench,
+    tail: &mut owlshift_runner::events::EventTail,
+) -> (Value, StatusWaits) {
+    let now = bench.clock.get();
+    let graph = owlshift_runner::ui::server::graph_read(&bench.data, tail, 2, now);
+    let document = waits::build(&waits::gather(&bench.data, None, 2, now));
+    (serde_json::to_value(graph).unwrap(), document)
+}
+
+/// What labels the edge of a wait: its resource, else its reason.
+fn label_of(wait: &owlshift_contracts::waits::Wait) -> String {
+    match &wait.resource {
+        Some(WaitResource::Zone { path }) if path.is_empty() => "whole repository".to_owned(),
+        Some(WaitResource::Zone { path }) => path.clone(),
+        Some(WaitResource::Named { name }) => name.clone(),
+        Some(WaitResource::Browser) => "browser".to_owned(),
+        None => wait.reason.clone(),
+    }
+}
+
+/// The graph's live layer against the document, node for node and edge for
+/// edge: its nodes are the document's tickets plus what a wait names behind
+/// a ticket that is none, its edges one per `behind` of every wait that is
+/// not a place in a queue, and its queue the tickets that wait for a slot.
+fn assert_matches(graph: &Value, document: &StatusWaits) {
+    assert_eq!(graph["projects"].as_array().unwrap().len(), 1, "{graph}");
+    let project = &document.projects[0];
+    let mut nodes: Vec<String> = project
+        .tickets
+        .iter()
+        .map(|row| row.ticket.as_str().to_owned())
+        .collect();
+    let mut edges: Vec<(String, String, String)> = Vec::new();
+    let mut queue: Vec<(Option<Timestamp>, String)> = Vec::new();
+    for row in &project.tickets {
+        let Some(wait) = &row.waits else { continue };
+        if wait.reason == "slot" {
+            queue.push((wait.since, row.ticket.as_str().to_owned()));
+        }
+        if matches!(wait.reason.as_str(), "slot" | "run_cap") {
+            continue;
+        }
+        for behind in &wait.behind {
+            let name = match behind {
+                Behind::Ticket { id, .. } => id.as_str().to_owned(),
+                Behind::PullRequest { number } => format!("pull request #{number}"),
+            };
+            if !nodes.contains(&name) {
+                nodes.push(name.clone());
+            }
+            edges.push((row.ticket.as_str().to_owned(), name, label_of(wait)));
+        }
+    }
+    let live = &graph["projects"][0]["live"];
+    let mut got_nodes: Vec<String> = live["nodes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|node| node["id"].as_str().unwrap().to_owned())
+        .collect();
+    let mut got_edges: Vec<(String, String, String)> = live["edges"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|edge| {
+            let text = |key: &str| edge[key].as_str().unwrap().to_owned();
+            (text("from"), text("to"), text("label"))
+        })
+        .collect();
+    nodes.sort();
+    got_nodes.sort();
+    edges.sort();
+    got_edges.sort();
+    assert_eq!(got_nodes, nodes, "{graph}");
+    assert_eq!(got_edges, edges, "{graph}");
+    queue.sort();
+    let got_queue: Vec<&str> = graph["projects"][0]["queue"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|entry| entry["reason"] == "slot")
+        .map(|entry| entry["ticket"].as_str().unwrap())
+        .collect();
+    let want: Vec<&str> = queue.iter().map(|(_, ticket)| ticket.as_str()).collect();
+    assert_eq!(got_queue, want, "{graph}");
+}
+
+/// OWL-460: the web UI's graph of the chain drain, read through the server's
+/// own read with one event tail kept across the passes, is the document of
+/// `status --waits --json` node for node and edge for edge; the pass that
+/// completes DEMO-9 takes its node and its edge away at the next read; the
+/// blockers layer draws DEMO-9, which the column does not list, as a dashed
+/// ghost, and so a blocker written into the snapshot as canceled.
+#[test]
+fn the_graph_of_a_chain_matches_the_document_and_a_cleared_wait_leaves_it() {
+    let bench = parallel_bench("max_in_flight = 1\n");
+    bench.put_ticket(
+        "DEMO-2",
+        "maintainer",
+        "Todo",
+        &["agent"],
+        "blocked_by = [\"DEMO-1\"]\n",
+        "Document it.",
+    );
+    bench.put_ticket(
+        "DEMO-3",
+        "maintainer",
+        "Todo",
+        &["agent"],
+        "blocked_by = [\"DEMO-9\"]\n",
+        "Library it.",
+    );
+    served_on(&bench);
+    let mut replies: Vec<Reply> = ["app", "docs", "lib"]
+        .iter()
+        .map(|zone| bench.reply(None, Some(&standard_declaring(&[zone]))))
+        .collect();
+    replies.push(bench.read(&planned()));
+    let mut tail = owlshift_runner::events::EventTail::in_dir(&bench.data);
+    let chained = RefCell::new(None);
+    let (_, lines, printed) = bench.drain_passes(replies, 4, |pass, _| {
+        if pass == 3 {
+            // The server's read counts a project served when `projects.json`
+            // lists it, which `served_on` does not do.
+            let repo = Repo::parse(REPO).unwrap();
+            served::Registry::in_data_dir(&bench.data)
+                .register(&repo, &bench.remote.checkout)
+                .unwrap();
+            chained.replace(Some(graph_and_document(&bench, &mut tail)));
+            bench.put_ticket("DEMO-9", "maintainer", "Done", &[], "", "A blocker.");
+        }
+    });
+    let report = format!("{lines}\n{printed}");
+    let (graph, document) = chained.into_inner().expect("read after the intakes");
+    assert_eq!(document.projects.len(), 1, "the project is served");
+    assert_matches(&graph, &document);
+    let live = &graph["projects"][0]["live"];
+    let ids = |layer: &Value| -> Vec<String> {
+        let mut ids: Vec<String> = layer["nodes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|node| node["id"].as_str().unwrap().to_owned())
+            .collect();
+        ids.sort();
+        ids
+    };
+    assert_eq!(
+        ids(live),
+        ["DEMO-1", "DEMO-2", "DEMO-3", "DEMO-9"],
+        "{graph}"
+    );
+    let edge = |layer: &Value, from: &str, to: &str| {
+        layer["edges"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|e| e["from"] == from && e["to"] == to)
+    };
+    assert!(edge(live, "DEMO-1", "DEMO-9") && edge(live, "DEMO-2", "DEMO-1"));
+    // The blockers layer: DEMO-9 has no `agent` label, so the bench's ready
+    // column does not list it, and it is a dashed ghost, open, with both
+    // edges that name it; the tickets of the column are nodes of their own.
+    let blockers = &graph["projects"][0]["blockers"];
+    let demo9 = blockers["nodes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|node| node["id"] == "DEMO-9")
+        .unwrap_or_else(|| panic!("DEMO-9 missing in {graph}"));
+    assert_eq!(demo9["state"], "ghost", "{demo9}");
+    assert_eq!(demo9["blocker_state"], "open", "{demo9}");
+    assert!(edge(blockers, "DEMO-1", "DEMO-9") && edge(blockers, "DEMO-3", "DEMO-9"));
+    assert_eq!(
+        ids(blockers),
+        ["DEMO-1", "DEMO-2", "DEMO-3", "DEMO-9"],
+        "{graph}"
+    );
+
+    // The pass that completes DEMO-9: the same tail, and neither its node
+    // nor its edge.
+    let (graph, document) = graph_and_document(&bench, &mut tail);
+    assert_matches(&graph, &document);
+    let live = &graph["projects"][0]["live"];
+    assert!(
+        !ids(live).contains(&"DEMO-9".to_owned()),
+        "{graph}\n{report}"
+    );
+    assert!(!edge(live, "DEMO-1", "DEMO-9"), "{graph}");
+    assert!(edge(live, "DEMO-2", "DEMO-1"), "{graph}");
+    let queue: Vec<&str> = graph["projects"][0]["queue"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|entry| entry["ticket"].as_str().unwrap())
+        .collect();
+    assert_eq!(queue, ["DEMO-3"], "{graph}");
+    assert!(
+        !edge(live, "DEMO-3", "DEMO-1"),
+        "a queued ticket has no edge"
+    );
+
+    // A blocker outside the column, which the bench cannot record as a
+    // relation: written into the snapshot as the drain would.
+    let mut snapshot = ready::read(&bench.dirs()).unwrap().expect("a snapshot");
+    let waiting = snapshot
+        .tickets
+        .iter_mut()
+        .find(|ticket| ticket.ticket.as_str() == "DEMO-3")
+        .expect("DEMO-3 is in the column");
+    for (name, state) in [
+        ("DEMO-20", owlshift_contracts::ready::BlockerState::Open),
+        ("DEMO-21", owlshift_contracts::ready::BlockerState::Canceled),
+    ] {
+        waiting
+            .blockers
+            .push(owlshift_contracts::ready::ReadyBlocker {
+                ticket: name.to_owned(),
+                state,
+                merged: false,
+            });
+    }
+    ready::write(&bench.dirs(), &snapshot).unwrap();
+    let (graph, _) = graph_and_document(&bench, &mut tail);
+    let blockers = &graph["projects"][0]["blockers"];
+    for (name, state) in [("DEMO-20", "open"), ("DEMO-21", "canceled")] {
+        let ghost = blockers["nodes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|node| node["id"] == name)
+            .unwrap_or_else(|| panic!("{name} missing in {graph}"));
+        assert_eq!(ghost["state"], "ghost");
+        assert_eq!(ghost["blocker_state"], state);
+        assert!(edge(blockers, "DEMO-3", name));
+    }
+}
+
 /// Whether `ticket` is a row of the bench project's waits.
 fn shown(built: &StatusWaits, ticket: &str) -> bool {
     built.projects[0]
