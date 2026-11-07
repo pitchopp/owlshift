@@ -12369,3 +12369,8 @@ mod waits_scenarios;
 /// The web UI's overview against the same drain and `ready.json` (OWL-470).
 #[path = "on_demand/overview_scenarios.rs"]
 mod overview_scenarios;
+
+/// Replies from the web UI through the operator's key, read as the
+/// decider's by the answer check (OWL-475).
+#[path = "on_demand/ui_reply_scenarios.rs"]
+mod ui_reply_scenarios;
