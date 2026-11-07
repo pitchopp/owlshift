@@ -68,6 +68,28 @@ impl ScriptedSystem {
             .push(format!("{method} {}", path.display()));
     }
 
+    /// The repository whose dedicated checkout is `root`
+    /// (`<data>/projects/<host>/<owner>/<name>/checkout`), else the one the
+    /// host was made for.
+    fn origin_of(&self, root: &Path) -> Repo {
+        let folder = root.parent();
+        let name = folder.and_then(Path::file_name);
+        let owner = folder.and_then(Path::parent).and_then(Path::file_name);
+        match (owner, name) {
+            (Some(owner), Some(name))
+                if root.file_name().is_some_and(|last| last == "checkout") =>
+            {
+                Repo::parse(&format!(
+                    "{}/{}",
+                    owner.to_string_lossy(),
+                    name.to_string_lossy()
+                ))
+                .unwrap_or_else(|_| self.origin.clone())
+            }
+            _ => self.origin.clone(),
+        }
+    }
+
     fn scripted(what: &str) -> String {
         format!("scripted host: {what} is not available")
     }
@@ -96,11 +118,12 @@ impl System for ScriptedSystem {
         };
         Ok(match (name.as_str(), args) {
             ("git", ["rev-parse", "--show-toplevel"]) => {
-                say(format!("{}\n", self.checkout.display()))
+                say(format!("{}\n", cwd.unwrap_or(&self.checkout).display()))
             }
-            ("git", ["remote", "get-url", "origin"]) => {
-                say(format!("git@github.com:{}.git\n", self.origin))
-            }
+            ("git", ["remote", "get-url", "origin"]) => say(format!(
+                "git@github.com:{}.git\n",
+                self.origin_of(cwd.unwrap_or(&self.checkout))
+            )),
             (_, ["--version"]) => say(format!("{name} 1.0.0 (scripted)\n")),
             _ => Captured {
                 code: Some(1),
@@ -140,7 +163,7 @@ impl System for ScriptedSystem {
 
     fn origin_repo(&self, root: &Path) -> Result<Repo, String> {
         self.note("origin_repo", root);
-        Ok(self.origin.clone())
+        Ok(self.origin_of(root))
     }
 
     fn linear_states(

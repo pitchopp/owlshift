@@ -74,6 +74,8 @@ struct Bench {
     ui_port: Option<u16>,
     /// Whether the stand-in ends at once, each time.
     ui_exits: bool,
+    /// Whether the daemon's UI is the real one, on a scripted host (OWL-472).
+    ui_real: bool,
 }
 
 impl Bench {
@@ -85,6 +87,7 @@ impl Bench {
             build: None,
             ui_port: None,
             ui_exits: false,
+            ui_real: false,
         }
     }
 
@@ -145,6 +148,9 @@ impl Bench {
         }
         if self.ui_exits {
             daemon.env("OWLSHIFT_BENCH_UI", "exit");
+        }
+        if self.ui_real {
+            daemon.env("OWLSHIFT_BENCH_UI", "real");
         }
         self.daemon = Some(daemon.spawn().unwrap());
     }
@@ -1436,4 +1442,347 @@ fn a_watch_holds_no_socket_of_the_ui() {
     bench.signal("TERM", bench.daemon_pid());
     assert!(bench.ended().success(), "{}", bench.output());
     bench.ui_gone(port, ui);
+}
+
+// ---- The real web UI on the bench (OWL-472) ----
+
+/// A response of the real UI: its status and body.
+fn ui_request(
+    port: u16,
+    method: &str,
+    path: &str,
+    session: Option<&str>,
+    body: &str,
+) -> Option<(u16, String)> {
+    use std::io::{Read, Write};
+    let mut stream = TcpStream::connect(("127.0.0.1", port)).ok()?;
+    stream
+        .set_read_timeout(Some(Duration::from_secs(60)))
+        .ok()?;
+    let mut text =
+        format!("{method} {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n");
+    if let Some(session) = session {
+        text.push_str(&format!("X-Owlshift-Session: {session}\r\n"));
+    }
+    if method == "POST" {
+        text.push_str(&format!(
+            "Content-Type: application/json\r\nContent-Length: {}\r\n",
+            body.len()
+        ));
+    }
+    text.push_str("\r\n");
+    text.push_str(body);
+    stream.write_all(text.as_bytes()).ok()?;
+    let mut answer = Vec::new();
+    stream.read_to_end(&mut answer).ok()?;
+    let split = answer.windows(4).position(|four| four == b"\r\n\r\n")?;
+    let head = String::from_utf8_lossy(&answer[..split]).into_owned();
+    let status = head.split(' ').nth(1)?.parse().ok()?;
+    Some((
+        status,
+        String::from_utf8_lossy(&answer[split + 4..]).into_owned(),
+    ))
+}
+
+const KEPT: &str = r#"requires = ">=0.0"
+
+[tracker]
+kind = "linear"
+team = "WEB"
+admit = { label = "agent" }
+admitters = ["u1"]
+states = { ready = "Todo", working = "Doing", needs_input = "Asked", review = "Review" }
+
+[stack]
+gate = ["cargo test"]
+
+[pipeline]
+default = "trivial"
+plan_approval = "never"
+
+[models]
+
+[policy]
+always_human = ["money"]
+ticket_budget_usd = 5.0
+"#;
+
+/// The lines of `owlshift status` the Orchestrator shows, read as the command
+/// reads them: the files, then the daemon's events for each watch.
+fn status_lines(data: &Path) -> Vec<String> {
+    use owlshift_runner::events::EventLog;
+    use owlshift_runner::status::{self, Daemon};
+    let mut report = status::gather_files(
+        data,
+        owlshift_contracts::config::DEFAULT_CONCURRENT_RUNS,
+        &[],
+        Timestamp::now(),
+    );
+    let (events, _) = owlshift_runner::why::read_events(EventLog::in_dir(data).path()).unwrap();
+    if let Daemon::Running(record) = &report.daemon {
+        let since = record
+            .as_ref()
+            .map_or(Timestamp::MIN, |record| record.since);
+        for project in &mut report.projects {
+            project.watch = status::watch_state(&events, &project.repository, since);
+        }
+    }
+    status::parts(&report, &jiff::tz::TimeZone::system())
+        .into_iter()
+        .filter(|(part, _)| part.on_the_page())
+        .map(|(_, line)| line)
+        .collect()
+}
+
+/// OWL-472: with the bench daemon serving the real UI, each screen answers
+/// what its command prints for the bench's data directory: `status`'s lines
+/// (the kinds the Orchestrator leaves to other screens named), `logs`'s lines
+/// for the decisions and warnings, `doctor --json`, `config show`, and the
+/// sums of the usage events.
+#[test]
+fn the_real_ui_answers_what_the_commands_print_for_the_bench() {
+    use owlshift_contracts::service::{KeptFile, ServedConfig};
+    use owlshift_runner::config::{Effective, PROJECT_FILE};
+    use owlshift_runner::events::{self, EventLog};
+    use owlshift_runner::ui::auth;
+    use owlshift_testkit::system::ScriptedSystem;
+
+    let mut bench = Bench::new();
+    let port = free_port();
+    bench.ui_port = Some(port);
+    bench.ui_real = true;
+    bench.serve(WEB);
+    bench.start();
+    let data = bench.data();
+    bench.wait_for("the real UI to answer", || {
+        ui_request(port, "GET", "/", None, "").is_some_and(|(status, _)| status == 200)
+    });
+    let (_, _) = bench.running(WEB);
+
+    // The bench's data: the project file the project runs on, in its record
+    // and, as the CLI reads it, in its checkout; a machine pause; a
+    // quarantine; a usage window; a daemon log; events.
+    let dirs = bench.dirs(WEB);
+    let mut record = ServedConfig::new(WEB);
+    record.kept = Some(KeptFile {
+        branch: "main".to_owned(),
+        commit: "d".repeat(40),
+        text: KEPT.to_owned(),
+        since: "2026-11-01T00:00:00Z".parse().unwrap(),
+    });
+    fs::create_dir_all(dirs.root()).unwrap();
+    fs::write(served::record_file(&dirs), record.render()).unwrap();
+    // A git repository with no ticket ref, as a dedicated checkout is before
+    // its first run: `status` reads its refs and finds none.
+    fs::create_dir_all(dirs.checkout()).unwrap();
+    let init = Command::new("git")
+        .args(["init", "--quiet"])
+        .current_dir(dirs.checkout())
+        .status()
+        .unwrap();
+    assert!(init.success());
+    fs::write(dirs.checkout().join(PROJECT_FILE), KEPT).unwrap();
+    requests::ask_pause(
+        &data,
+        None,
+        &Request::new(BY_STOP, Timestamp::now(), "a bench pause"),
+    )
+    .unwrap();
+    fs::write(
+        dirs.quarantine_file(),
+        "\nRun r1 of OWL-1 broke isolation:\n- x\n",
+    )
+    .unwrap();
+    fs::write(
+        daemon::service_dir(&data).join("daemon.log"),
+        "daemon line 1\ndaemon line 2\n",
+    )
+    .unwrap();
+    let log = EventLog::in_dir(&data).path().to_owned();
+    let mut lines = fs::read_to_string(&log).unwrap_or_default();
+    let line = |at: &str, ticket: &str, run: &str, kind: &str, data: &str| {
+        format!(
+            "{{\"format\":2,\"at\":\"{at}\",\"project\":\"{WEB}\",\"ticket\":\"{ticket}\",\
+             \"run\":\"{run}\",\"kind\":\"{kind}\",\"data\":{data}}}\n"
+        )
+    };
+    let stamp = |ago: i64| {
+        Timestamp::now()
+            .checked_sub(jiff::SignedDuration::from_hours(ago))
+            .unwrap()
+            .to_string()
+    };
+    lines.push_str(&line(
+        &stamp(3),
+        "OWL-1",
+        "r1",
+        "run_started",
+        r#"{"role":"build","harness":"claude"}"#,
+    ));
+    lines.push_str(&line(
+        &stamp(3),
+        "OWL-1",
+        "r1",
+        "usage",
+        r#"{"cost_usd":1.25,"input_tokens":1,"output_tokens":1}"#,
+    ));
+    lines.push_str(&line(
+        &stamp(2),
+        "OWL-1",
+        "r2",
+        "run_started",
+        r#"{"role":"verify"}"#,
+    ));
+    lines.push_str(&line(
+        &stamp(2),
+        "OWL-1",
+        "r2",
+        "usage",
+        r#"{"cost_usd":0.5,"input_tokens":1,"output_tokens":1}"#,
+    ));
+    lines.push_str(&line(
+        &stamp(1),
+        "OWL-1",
+        "r2",
+        "decision",
+        r#"{"note":"a decision <b>"}"#,
+    ));
+    lines.push_str(&line(
+        &stamp(1),
+        "OWL-1",
+        "r2",
+        "warning",
+        r#"{"note":"a warning"}"#,
+    ));
+    fs::write(&log, lines).unwrap();
+
+    // A session: the page trades a code for it.
+    let token = token::read_token(&data).unwrap();
+    let code = auth::mint_code(&token, now_ms()).unwrap();
+    let (status, body) = ui_request(
+        port,
+        "POST",
+        "/api/login",
+        None,
+        &serde_json::json!({ "code": code }).to_string(),
+    )
+    .unwrap();
+    assert_eq!(status, 200, "{body}");
+    let login: serde_json::Value = serde_json::from_str(&body).unwrap();
+    let session = format!(
+        "{}.{}",
+        login["id"].as_str().unwrap(),
+        login["secret"].as_str().unwrap()
+    );
+    let get = |path: &str| -> serde_json::Value {
+        let (status, body) = ui_request(port, "GET", path, Some(&session), "").unwrap();
+        assert_eq!(status, 200, "{path}: {body}");
+        serde_json::from_str(&body).unwrap()
+    };
+
+    // The Orchestrator. The stand-in watches keep writing events, so the
+    // comparison waits for a steady bench: the route and the command agree.
+    let mut orchestrator = serde_json::Value::Null;
+    bench.wait_for("the Orchestrator to show what status shows", || {
+        orchestrator = get("/api/orchestrator");
+        let shown: Vec<String> = orchestrator["lines"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|line| line.as_str().unwrap().to_owned())
+            .collect();
+        let want = status_lines(&data);
+        shown == want
+    });
+    let text = orchestrator["lines"].to_string();
+    assert!(
+        text.contains("Paused: every project of this machine"),
+        "{text}"
+    );
+    assert!(
+        text.contains("quarantined: Run r1 of OWL-1 broke isolation"),
+        "{text}"
+    );
+    assert_eq!(
+        orchestrator["left_out"],
+        serde_json::json!([
+            "waiting",
+            "parked",
+            "merges",
+            "drain_steps",
+            "slots",
+            "digest"
+        ])
+    );
+    // The feed: the lines `owlshift logs` prints for the decisions and warnings.
+    let (all, _) = owlshift_runner::why::read_events(&log).unwrap();
+    let printed: Vec<String> = all
+        .iter()
+        .filter(|event| matches!(event.kind, EventKind::Decision | EventKind::Warning))
+        .map(events::format_line)
+        .collect();
+    let shown: Vec<String> = orchestrator["events"]["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|entry| entry["line"].as_str().unwrap().to_owned())
+        .collect();
+    assert_eq!(shown, printed);
+    // The daemon's log.
+    assert_eq!(
+        orchestrator["log"]["lines"],
+        serde_json::json!(["daemon line 1", "daemon line 2"])
+    );
+
+    // Doctor and Config, as the command line builds them in the checkout.
+    let scripted = ScriptedSystem::bench(&data, &data.join("bench-checkout"), "bench/none");
+    let personal = Some(data.join("bench-personal.toml"));
+    let checkout = dirs.checkout();
+    let effective = Effective::load(&scripted, &checkout, personal);
+    let build = BuildIdentity::from_build("bench", "0", "2026-01-01T00:00:00Z", "");
+    let want = owlshift_runner::doctor::run(&scripted, &effective, &build).to_json();
+    let (status, body) = ui_request(port, "POST", "/api/doctor", Some(&session), "{}").unwrap();
+    assert_eq!(status, 200, "{body}");
+    let doctor: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(doctor["reports"][0]["project"], WEB);
+    assert_eq!(doctor["reports"][0]["report"], want);
+    let config = get("/api/config");
+    let shown: Vec<String> = config["projects"][0]["config"]["lines"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|line| line.as_str().unwrap().to_owned())
+        .collect();
+    let want: Vec<String> = effective.to_string().lines().map(str::to_owned).collect();
+    assert_eq!(shown, want);
+
+    // Spend: the sums of the usage events, split by role and harness.
+    let spend = get("/api/spend?days=all");
+    assert_eq!(spend["events"]["total_micros"], 1_750_000);
+    assert_eq!(spend["roles"][0]["role"], "build");
+    let harnesses: Vec<(String, u64)> = spend["harnesses"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|h| {
+            (
+                h["harness"].as_str().unwrap().to_owned(),
+                h["micros"].as_u64().unwrap(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        harnesses,
+        [
+            ("claude".to_owned(), 1_250_000),
+            ("unrecorded".to_owned(), 500_000)
+        ]
+    );
+
+    bench.signal("TERM", bench.daemon_pid());
+    assert!(bench.ended().success(), "{}", bench.output());
+}
+
+fn now_ms() -> u64 {
+    owlshift_runner::ui::server::now_ms()
 }

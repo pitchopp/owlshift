@@ -42,7 +42,9 @@
 //! pid to `<data>/bench-ui.pid`, and answers each connection with
 //! `bench-ui <pid> <the run secret's fingerprint>` and a newline. With
 //! `OWLSHIFT_BENCH_UI=exit` it ends at once with 1, saying why on its
-//! standard error.
+//! standard error. With `OWLSHIFT_BENCH_UI=real` (OWL-472) it serves the real
+//! UI instead, `owlshift_runner::ui::server::serve`, on a scripted host and the
+//! personal file `<data>/bench-personal.toml`.
 
 use std::fs;
 use std::io::Write as _;
@@ -261,13 +263,17 @@ fn run_drain(data: &Path, repo: &str) -> ExitCode {
 /// The web UI's stand-in, on the socket and with the run secret the daemon
 /// handed over.
 fn run_ui(data: &Path, listener_fd: i32, secret_fd: i32) -> ExitCode {
-    if std::env::var("OWLSHIFT_BENCH_UI").as_deref() == Ok("exit") {
+    let mode = std::env::var("OWLSHIFT_BENCH_UI");
+    if mode.as_deref() == Ok("exit") {
         eprintln!("bench-ui exits as asked");
         return ExitCode::FAILURE;
     }
     let secret = process::take_handed_over(secret_fd).unwrap();
     let run = RunSecret::from_hex(std::str::from_utf8(&secret).unwrap()).unwrap();
     let listener = process::adopt_listener(listener_fd).unwrap();
+    if mode.as_deref() == Ok("real") {
+        return run_real_ui(data, listener, run);
+    }
     let pid = std::process::id();
     let partial = data.join("bench-ui.pid.partial");
     fs::write(&partial, pid.to_string()).unwrap();
@@ -278,6 +284,41 @@ fn run_ui(data: &Path, listener_fd: i32, secret_fd: i32) -> ExitCode {
         let _ = stream.write_all(answer.as_bytes());
     }
     ExitCode::SUCCESS
+}
+
+/// The real web UI (OWL-472), on the socket and with the run secret the
+/// daemon handed over: `owlshift_runner::ui::server::serve` on a scripted host
+/// that reaches nothing of the machine, with the build of
+/// `OWLSHIFT_BENCH_COMMIT` and `OWLSHIFT_BENCH_BUILT_AT` when they are set and
+/// a fixed one otherwise, and the personal file `<data>/bench-personal.toml`
+/// (absent unless a test writes it), never the machine's.
+fn run_real_ui(data: &Path, listener: std::net::TcpListener, run: RunSecret) -> ExitCode {
+    let build = match std::env::var("OWLSHIFT_BENCH_COMMIT") {
+        Ok(commit) => {
+            let built_at =
+                std::env::var("OWLSHIFT_BENCH_BUILT_AT").expect("OWLSHIFT_BENCH_BUILT_AT");
+            BuildIdentity::from_build(&commit, "0", &built_at, "")
+        }
+        Err(_) => BuildIdentity::from_build("bench", "0", "2026-01-01T00:00:00Z", ""),
+    };
+    let personal = data.join("bench-personal.toml");
+    let options = owlshift_runner::ui::server::Options {
+        personal: std::sync::Arc::new(move || owlshift_runner::ui::personal_at(&personal)),
+        system: std::sync::Arc::new(owlshift_testkit::system::ScriptedSystem::bench(
+            data,
+            &data.join("bench-checkout"),
+            "bench/none",
+        )),
+        ..owlshift_runner::ui::server::Options::default()
+    };
+    println!("bench-ui serves the real web UI");
+    match owlshift_runner::ui::server::serve(data, listener, run, Some(build), options) {
+        Ok(never) => match never {},
+        Err(error) => {
+            eprintln!("owlshift: {error}");
+            ExitCode::FAILURE
+        }
+    }
 }
 
 /// The bench's folder of `repo`'s watches.
