@@ -10,7 +10,7 @@
 //!
 //! The routes:
 //!
-//! - `GET /`, `/app.js`, `/app.css`, `/favicon.svg` and `/fonts/<name>.woff2`:
+//! - `GET /`, `/app.js`, `/ops.js`, `/app.css`, `/favicon.svg` and `/fonts/<name>.woff2`:
 //!   the page's frame and assets, carried in the binary, served without a
 //!   session;
 //! - `POST /api/proof` `{"challenge"}` → `{"proof"}`, the listener's proof
@@ -102,6 +102,8 @@ use crate::system::{HostSystem, System};
 pub const INDEX_HTML: &str = include_str!("assets/index.html");
 /// The page's script.
 pub const APP_JS: &str = include_str!("assets/app.js");
+/// The operations screens' script (OWL-472).
+pub const OPS_JS: &str = include_str!("assets/ops.js");
 /// The page's style sheet.
 pub const APP_CSS: &str = include_str!("assets/app.css");
 /// The Bricolage Grotesque face, Latin, a variable font (visual identity
@@ -580,6 +582,7 @@ fn handle(context: &Arc<Context>, mut request: Request) {
             asset(INDEX_HTML.as_bytes(), "text/html; charset=utf-8")
         }
         (Method::Get, "/app.js") => asset(APP_JS.as_bytes(), "text/javascript; charset=utf-8"),
+        (Method::Get, "/ops.js") => asset(OPS_JS.as_bytes(), "text/javascript; charset=utf-8"),
         (Method::Get, "/app.css") => asset(APP_CSS.as_bytes(), "text/css; charset=utf-8"),
         (Method::Get, "/favicon.svg") => asset(FAVICON_SVG.as_bytes(), "image/svg+xml"),
         (Method::Get, "/fonts/BricolageGrotesque-latin.woff2") => {

@@ -104,6 +104,9 @@ function loggedOut(sent) {
   show("header", false);
   closeTicket();
   clearHome();
+  if (window.owlshiftOps) {
+    window.owlshiftOps.hide();
+  }
   show("logged-out", true);
 }
 
@@ -348,6 +351,11 @@ function parseRoute(hash) {
   if (!hash || hash === "#") {
     return null;
   }
+  // The operations screens (OWL-472), drawn by ops.js.
+  const screen = { "#/orchestrator": "orchestrator", "#/spend": "spend", "#/config": "config" }[hash];
+  if (screen) {
+    return { screen: screen };
+  }
   const prefix = "#/ticket/";
   if (!hash.startsWith(prefix)) {
     return false;
@@ -396,12 +404,35 @@ function closeTicket() {
   el.hidden = true;
 }
 
+// Marks the navigation link of the screen shown.
+function markNav(name) {
+  for (const link of document.querySelectorAll("nav a[data-screen]")) {
+    if (link.getAttribute("data-screen") === name) {
+      link.setAttribute("aria-current", "page");
+    } else {
+      link.removeAttribute("aria-current");
+    }
+  }
+}
+
 // Shows the page the address names, or none.
 function route() {
   closeTicket();
   const target = parseRoute(window.location.hash);
   show("home", target === null && session() !== null);
+  if (window.owlshiftOps) {
+    window.owlshiftOps.hide();
+  }
+  markNav(target && target.screen ? target.screen : "overview");
   if (target === null) {
+    return;
+  }
+  if (target && target.screen) {
+    if (!session()) {
+      show("logged-out", true);
+    } else if (window.owlshiftOps) {
+      window.owlshiftOps.show(target.screen);
+    }
     return;
   }
   if (target === false) {
@@ -1719,6 +1750,9 @@ async function start() {
       render(lastHeader);
     }
     renderHome();
+    if (window.owlshiftOps) {
+      window.owlshiftOps.refresh();
+    }
   });
   startVisit();
   wireViewSwitch();

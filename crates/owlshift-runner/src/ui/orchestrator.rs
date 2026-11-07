@@ -330,11 +330,12 @@ pub fn answer(inputs: &Inputs<'_>, cursors: Cursors) -> Value {
             "the event log cannot be read: {why}"
         )));
     }
-    let lines: Vec<String> = status::parts(&report, &inputs.tz)
+    let shown: Vec<(Part, String)> = status::parts(&report, &inputs.tz)
         .into_iter()
         .filter(|(part, _)| part.on_the_page())
-        .map(|(_, text)| text)
         .collect();
+    let line_parts: Vec<&str> = shown.iter().map(|(part, _)| part.name()).collect();
+    let lines: Vec<String> = shown.into_iter().map(|(_, text)| text).collect();
     let left_out: Vec<&str> = Part::ALL
         .into_iter()
         .filter(|part| !part.on_the_page())
@@ -376,6 +377,7 @@ pub fn answer(inputs: &Inputs<'_>, cursors: Cursors) -> Value {
     json!({
         "generation": generation,
         "lines": lines,
+        "line_parts": line_parts,
         "left_out": left_out,
         "daemon": head["daemon"],
         "machine_pause": head["machine_pause"],

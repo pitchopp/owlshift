@@ -665,3 +665,39 @@ pre {
 .strip-todo {
   background: transparent;
 }
+
+/* The operations screens (OWL-472). Layout only: colours come from the roles
+   above, through the classes the other screens use. */
+.nav {
+  gap: 4px 18px;
+}
+
+.nav a[aria-current=page] {
+  font-weight: 800;
+}
+
+.table {
+  border-collapse: collapse;
+  width: 100%;
+}
+
+.table th,
+.table td {
+  text-align: left;
+  padding: 2px 14px 2px 0;
+  border-bottom: 1px solid var(--border-hairline);
+  vertical-align: top;
+}
+
+.usage-head {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 12px;
+  margin-top: 8px;
+}
+
+.budget-cell {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+}
