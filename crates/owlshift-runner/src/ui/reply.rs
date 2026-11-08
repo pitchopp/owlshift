@@ -223,6 +223,15 @@ fn is_approval(question: &Question) -> bool {
     question.category == APPROVAL_CATEGORY
 }
 
+/// Why a key that could not be read offers no form: the UI reads each
+/// key once, so the page says that a restart of the UI reads it again.
+pub(crate) fn unusable(why: &str) -> String {
+    format!(
+        "the project's tracker key cannot be used: {why}. The UI reads it once: \
+         restart the UI to read it again"
+    )
+}
+
 /// The ticket's link on Linear, from the workspace the key read, with no
 /// title slug; none for a workspace key that is not plain letters, digits,
 /// `-` and `_`, so the page is never handed another address.
@@ -273,7 +282,7 @@ pub fn section(record: &TicketRecord, key: &KeyState, ticket: &TicketId) -> Valu
         KeyState::Unavailable(why) => (
             json!({ "why": why }),
             false,
-            Some(format!("the project's tracker key cannot be used: {why}")),
+            Some(unusable(why)),
             Value::Null,
         ),
         KeyState::Ready(Key { account, .. }) => {
@@ -1033,6 +1042,13 @@ pub(crate) mod tests {
             KeyState::Unavailable("no Linear API key is stored".into()),
         ] {
             let none = section(&record, &state, &ticket());
+            if matches!(state, KeyState::Unavailable(_)) {
+                assert_eq!(
+                    none["why_not"],
+                    "the project's tracker key cannot be used: no Linear API key is stored. \
+                     The UI reads it once: restart the UI to read it again"
+                );
+            }
             assert_eq!(none["offered"], false, "{state:?}");
             assert!(none["link"].is_null(), "{state:?}");
             assert!(none["why_not"].is_string(), "{state:?}");

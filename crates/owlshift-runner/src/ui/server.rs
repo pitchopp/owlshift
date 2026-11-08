@@ -1081,10 +1081,7 @@ fn reply_page(context: &Context, body: &[u8]) -> Response<Cursor<Vec<u8>>> {
             );
         }
         KeyState::Unavailable(why) => {
-            return error_response(
-                403,
-                &format!("the project's tracker key cannot be used: {why}"),
-            );
+            return error_response(403, &reply::unusable(why));
         }
     };
     let busy = (
