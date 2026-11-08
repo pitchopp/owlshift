@@ -245,6 +245,20 @@ fn the_scan_finds_the_argument_of_a_process_and_no_needle_nobody_holds() {
     assert!(seen.read >= 1 && seen.processes >= seen.read, "{seen:?}");
 }
 
+#[test]
+fn the_reader_writes_its_counts_from_a_request_file() {
+    let (held, nobody) = (needle(), needle());
+    let _holder = hold(&held);
+    let seen = Reader::start(None, &[&held, &nobody], 0).finish();
+    assert_eq!(value(&seen, "own"), "1", "{seen:?}");
+    assert_eq!(value(&seen, "found_0"), "1", "{seen:?}");
+    assert_eq!(value(&seen, "found_1"), "0", "{seen:?}");
+    assert!(!seen.contains_key("found_2"), "{seen:?}");
+    let read: usize = value(&seen, "read").parse().unwrap();
+    let processes: usize = value(&seen, "processes").parse().unwrap();
+    assert!(read >= 1 && processes >= read, "{seen:?}");
+}
+
 /// A run of [`reader`], confined by `agent` or bare, in a scratch folder
 /// laid out as a run's: its worktree, which holds the request, a hidden run
 /// folder and its own temporary folder. This binary's folder is opened,
