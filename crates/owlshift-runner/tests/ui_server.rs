@@ -3045,10 +3045,19 @@ fn the_graph_page_reads_only_keys_the_server_sends() {
     }
 }
 
-/// The tracker of a key on the reply tests: records what it posts.
+/// The tracker of a key on the reply tests: records what it posts, and,
+/// when it is held, says each post began and waits to be let go first.
 #[derive(Clone, Default)]
 struct Posting {
     posted: Arc<Mutex<Vec<String>>>,
+    hold: Option<Hold>,
+}
+
+/// A post held open: `began` hears of each post, `release` lets it go on.
+#[derive(Clone)]
+struct Hold {
+    began: std::sync::mpsc::Sender<()>,
+    release: Arc<Mutex<std::sync::mpsc::Receiver<()>>>,
 }
 
 impl owlshift_adapters::tracker::Tracker for Posting {
@@ -3072,6 +3081,14 @@ impl owlshift_adapters::tracker::Tracker for Posting {
         _: &TicketId,
         body: &str,
     ) -> Result<owlshift_adapters::tracker::Comment, owlshift_adapters::tracker::Error> {
+        if let Some(hold) = &self.hold {
+            hold.began.send(()).unwrap();
+            hold.release
+                .lock()
+                .unwrap()
+                .recv_timeout(Duration::from_secs(30))
+                .unwrap();
+        }
         let mut posted = self.posted.lock().unwrap();
         posted.push(body.to_owned());
         Ok(owlshift_adapters::tracker::Comment {
@@ -3121,7 +3138,10 @@ struct ReplyGround {
 
 impl ReplyGround {
     fn new(account: &str) -> Self {
-        let tracker = Posting::default();
+        Self::with_tracker(account, Posting::default())
+    }
+
+    fn with_tracker(account: &str, tracker: Posting) -> Self {
         let posted = tracker.posted.clone();
         let opened = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let (counted, account) = (opened.clone(), account.to_owned());
@@ -3283,6 +3303,51 @@ fn a_reply_posts_once_through_the_key() {
     assert_eq!(answer["comment"], "reply-1");
     assert_eq!(answer["counts_now"], true);
     assert_eq!(ground.posted(), ["Q1: B\nQ2: B\n\ngo"]);
+}
+
+/// A second reply to a ticket while the first is posted, a double click, is
+/// refused with 409 and posts nothing; once the first is posted, the ticket
+/// takes replies again.
+#[test]
+fn a_reply_under_way_refuses_a_second_to_the_same_ticket() {
+    let (began, heard) = std::sync::mpsc::channel();
+    let (release, released) = std::sync::mpsc::channel();
+    let tracker = Posting {
+        hold: Some(Hold {
+            began,
+            release: Arc::new(Mutex::new(released)),
+        }),
+        ..Posting::default()
+    };
+    let ground = ReplyGround::with_tracker("maintainer", tracker);
+    ground.waiting(REPLY_QUESTIONS);
+    ground.reply();
+    let body = reply_body("ask-1", lettered_answers(), true);
+    thread::scope(|scope| {
+        let first = scope.spawn(|| ground.post(&body, &[]));
+        heard.recv_timeout(Duration::from_secs(30)).unwrap();
+        let second = ground.post(&body, &[]);
+        assert_eq!(second.status, 409, "{}", second.text());
+        assert!(
+            second.json()["error"]
+                .as_str()
+                .unwrap()
+                .contains("being posted"),
+            "{}",
+            second.text()
+        );
+        assert!(ground.posted().is_empty());
+        release.send(()).unwrap();
+        let first = first.join().unwrap();
+        assert_eq!(first.status, 200, "{}", first.text());
+    });
+    assert_eq!(ground.posted(), ["Q1: B\nQ2: B\n\ngo"]);
+    // The guard is gone with the first reply: the next one is posted.
+    release.send(()).unwrap();
+    let again = ground.post(&body, &[]);
+    assert_eq!(again.status, 200, "{}", again.text());
+    heard.recv_timeout(Duration::from_secs(30)).unwrap();
+    assert_eq!(ground.posted().len(), 2);
 }
 
 #[test]
