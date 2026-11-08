@@ -95,7 +95,10 @@ pub fn opener(link: &str) -> Opener {
 /// is one: `osascript` reads `open location "<link>"` on its standard
 /// input, as the decider chose on OWL-467 (round 4, Q1). On Linux bwrap
 /// gives a confined run its own process namespace, which hides every other
-/// process, and `xdg-open` takes the link as its argument.
+/// process, and `xdg-open` takes the link as its argument. The test
+/// `argv_check::a_confined_run_reads_other_processes_arguments_on_macos_only`
+/// holds both readings on each system, and `argv_check`'s browser check
+/// this opener on macOS (live check U4, OWL-495).
 pub fn opener_for(macos: bool, link: &str) -> Opener {
     if macos {
         let quoted = link.replace('\\', "\\\\").replace('"', "\\\"");
