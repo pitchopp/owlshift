@@ -49,8 +49,8 @@
 //!
 //! - `GET /api/graph` (OWL-460), under the session: the drain's wait graph
 //!   ([`super::graph`]), built by [`graph_read`] from the waits of
-//!   `owlshift status --waits` over an incremental read of the event log
-//!   ([`LogTail`]) and each served project's ready snapshot. `GET
+//!   `owlshift status --waits` over the overview's tail of the event log
+//!   ([`super::eventtail`]) and each served project's ready snapshot. `GET
 //!   /api/stream?graph=1` adds `{"graph":…}` lines to the stream: one at
 //!   once, and one whenever the graph changes with its `at` (the time of a
 //!   read) left out. Any other value of `graph` is ignored.
@@ -102,7 +102,6 @@ use super::{
     token,
 };
 use crate::config::FileState;
-use crate::events::EventTail as LogTail;
 use crate::project::ProjectDirs;
 use crate::served::Registry;
 use crate::status::{self, waits};
@@ -258,14 +257,13 @@ struct Context {
     figures: Mutex<Option<Figures>>,
     hub: Hub,
     /// The event log's incremental reader (OWL-471): what the ticket page's
-    /// snapshot and its run logs' `ended` read, and, through
-    /// [`events::Reader::with_tail`], the drain's graph (OWL-460): one
-    /// offset and one copy of the log for both.
+    /// snapshot and its run logs' `ended` read.
     events: events::Reader,
     /// What a ticket's snapshot keeps between two builds.
     tickets: ticket::Cache,
-    /// The event log's tail for the overview (OWL-470): held while the overview
-    /// is built, which is the one reader of the log it advances.
+    /// The event log's tail for the overview (OWL-470) and the drain's graph
+    /// (OWL-460): held while either is built, so the two share one offset and
+    /// one copy of the log's folds.
     tail: Mutex<EventTail>,
     /// The event log indexed for the Orchestrator and Spend screens
     /// (OWL-472): held while a request brings it up to date.
@@ -1168,23 +1166,36 @@ fn since_page(context: &Context, url: &str) -> Response<Cursor<Vec<u8>>> {
     json_response(200, &tail.since(at, Timestamp::now()).json())
 }
 
-/// The drain's graph of the data directory `data` at `now`: the events
-/// `tail` reads past what it had, the waits of every served project as
-/// `owlshift status --waits` builds them from those events, and each
+/// The drain's graph of the data directory `data` at `now`: `tail` advanced,
+/// the waits of every served project as `owlshift status --waits` builds
+/// them from the tail's folds (as [`overview::gather`] does), and each
 /// project's ready snapshot as that read held it, laid out by
 /// [`graph::of`]. The machine's run slots are counted up to
 /// `concurrent_runs`.
-pub fn graph_read(data: &Path, tail: &mut LogTail, concurrent_runs: u32, now: Timestamp) -> Graph {
-    let mut event_notes = Vec::new();
-    if let Err(error) = tail.refresh() {
-        event_notes.push(format!("the event log cannot be read: {error}"));
+pub fn graph_read(
+    data: &Path,
+    tail: &mut EventTail,
+    concurrent_runs: u32,
+    now: Timestamp,
+) -> Graph {
+    let mut notes = Vec::new();
+    if let Err(why) = tail.advance() {
+        notes.push(format!("the event log cannot be read: {why}"));
     }
-    event_notes.extend(
-        tail.notes()
-            .iter()
-            .map(|why| format!("the event log's {why}")),
+    notes.extend(tail.notes());
+    let chosen: Vec<(String, Repo, bool)> = status::served_projects(data, &mut notes)
+        .into_iter()
+        .map(|(entry, repo)| (entry.repository, repo, true))
+        .collect();
+    let tail: &EventTail = tail;
+    let read = waits::gather_folded(
+        data,
+        chosen,
+        concurrent_runs,
+        now,
+        &mut |repository| tail.folded(repository),
+        notes,
     );
-    let read = waits::gather_with(data, None, concurrent_runs, now, tail.events(), event_notes);
     let ready: BTreeMap<String, ReadyInput> = read
         .projects
         .iter()
@@ -1206,9 +1217,13 @@ pub fn graph_read(data: &Path, tail: &mut LogTail, concurrent_runs: u32, now: Ti
 /// The graph now, the personal file read again for `concurrent_runs`.
 fn graph_now(context: &Context) -> Graph {
     let (figures, note) = figures_now(context);
-    let mut graph = context
-        .events
-        .with_tail(|tail| graph_read(&context.data, tail, figures.0, Timestamp::now()));
+    let mut graph = {
+        let mut tail = context
+            .tail
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        graph_read(&context.data, &mut tail, figures.0, Timestamp::now())
+    };
     graph.notes.extend(note);
     graph
 }

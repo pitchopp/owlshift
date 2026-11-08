@@ -177,22 +177,6 @@ fn ref_status(status: Status) -> RefStatus {
 pub fn gather(data: &Path, only: Option<&Repo>, concurrent_runs: u32, now: Timestamp) -> Read {
     let mut notes = Vec::new();
     let events = super::read_events(data, &mut notes);
-    gather_with(data, only, concurrent_runs, now, &events, notes)
-}
-
-/// [`gather`] over events already read (the web UI keeps them in an
-/// [`EventTail`](crate::events::EventTail) rather than reading the whole log
-/// at each pass): `event_notes` is what reading them said, worded as the
-/// document's notes are.
-pub fn gather_with(
-    data: &Path,
-    only: Option<&Repo>,
-    concurrent_runs: u32,
-    now: Timestamp,
-    events: &[owlshift_contracts::event::Event],
-    event_notes: Vec<String>,
-) -> Read {
-    let mut notes = event_notes;
     let served = super::served_projects(data, &mut notes);
     let chosen: Vec<(String, Repo, bool)> = match only {
         Some(repo) => {
@@ -202,7 +186,7 @@ pub fn gather_with(
                 .find(|(entry, _)| entry.repository.eq_ignore_ascii_case(&name))
             {
                 Some((entry, repo)) => vec![(entry.repository, repo, true)],
-                None => vec![(spelled(events, &name), repo.clone(), false)],
+                None => vec![(spelled(&events, &name), repo.clone(), false)],
             }
         }
         None => served
@@ -215,7 +199,7 @@ pub fn gather_with(
         chosen,
         concurrent_runs,
         now,
-        &mut |repository| why::fold(events, repository),
+        &mut |repository| why::fold(&events, repository),
         notes,
     )
 }
@@ -1427,50 +1411,5 @@ mod tests {
         ));
         assert_eq!(parked.status, RefStatus::Parked);
         assert_eq!(parked.pull_request, None);
-    }
-
-    /// `gather_with` over the events an `EventTail` holds builds the very
-    /// document `gather` does, and carries the ready snapshot it read.
-    #[test]
-    fn gather_with_a_tail_builds_what_gather_builds() {
-        let dir = tempfile::tempdir().unwrap();
-        let log = crate::events::EventLog::in_dir(dir.path());
-        for (at, ticket, reason) in [
-            ("2026-10-28T09:00:00Z", "DEMO-2", "blocked_by"),
-            ("2026-10-28T09:01:00Z", "DEMO-3", "slot"),
-        ] {
-            log.append(&waits(
-                at,
-                ticket,
-                vec![
-                    ("drain", json!("waits")),
-                    ("reason", json!(reason)),
-                    ("tickets", json!(["DEMO-1"])),
-                ],
-            ))
-            .unwrap();
-        }
-        let repo = Repo::parse("o/r").unwrap();
-        let now: Timestamp = "2026-10-28T10:00:00Z".parse().unwrap();
-        let mut tail = crate::events::EventTail::in_dir(dir.path());
-        tail.refresh().unwrap();
-        let whole = gather(dir.path(), Some(&repo), 2, now);
-        let tailed = gather_with(dir.path(), Some(&repo), 2, now, tail.events(), Vec::new());
-        assert_eq!(build(&whole), build(&tailed));
-        assert_eq!(whole.projects.len(), 1);
-        assert!(matches!(tailed.projects[0].snapshot, Ok(None)));
-        // The notes of the reading come first, as `gather` words them.
-        let noted = gather_with(
-            dir.path(),
-            Some(&repo),
-            2,
-            now,
-            tail.events(),
-            vec!["the event log's line 3 is not an event: x".to_owned()],
-        );
-        assert_eq!(
-            build(&noted).notes.first().map(String::as_str),
-            Some("the event log's line 3 is not an event: x")
-        );
     }
 }

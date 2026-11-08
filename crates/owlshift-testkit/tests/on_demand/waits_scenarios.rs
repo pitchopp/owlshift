@@ -162,7 +162,7 @@ fn a_chain_of_blockers_then_the_queue_for_the_capacity() {
 /// of `status --waits` read at the same time.
 fn graph_and_document(
     bench: &Bench,
-    tail: &mut owlshift_runner::events::EventTail,
+    tail: &mut owlshift_runner::ui::eventtail::EventTail,
 ) -> (Value, StatusWaits) {
     let now = bench.clock.get();
     let graph = owlshift_runner::ui::server::graph_read(&bench.data, tail, 2, now);
@@ -279,7 +279,7 @@ fn the_graph_of_a_chain_matches_the_document_and_a_cleared_wait_leaves_it() {
         .map(|zone| bench.reply(None, Some(&standard_declaring(&[zone]))))
         .collect();
     replies.push(bench.read(&planned()));
-    let mut tail = owlshift_runner::events::EventTail::in_dir(&bench.data);
+    let mut tail = owlshift_runner::ui::eventtail::EventTail::new(&bench.data);
     let chained = RefCell::new(None);
     let (_, lines, printed) = bench.drain_passes(replies, 4, |pass, _| {
         if pass == 3 {

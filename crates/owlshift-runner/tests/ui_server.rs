@@ -2449,7 +2449,7 @@ impl Drain {
     /// The graph a whole read of the directory gives now: what the tail's
     /// incremental one must equal.
     fn whole(&self) -> Value {
-        let mut tail = owlshift_runner::events::EventTail::in_dir(self.data.path());
+        let mut tail = owlshift_runner::ui::eventtail::EventTail::new(self.data.path());
         let graph = server::graph_read(self.data.path(), &mut tail, 2, Timestamp::now());
         serde_json::to_value(graph).unwrap()
     }
@@ -2823,7 +2823,10 @@ fn each_state_the_server_sends_has_its_colour_and_each_ghost_its_own() {
     // A ghost is dashed, and a shape takes its colour from its group's.
     assert!(value(".node-ghost .node-box", "stroke-dasharray").is_some());
     assert_eq!(value(".node-box", "fill").as_deref(), Some("currentColor"));
-    assert_eq!(value(".node-box", "stroke").as_deref(), Some("currentColor"));
+    assert_eq!(
+        value(".node-box", "stroke").as_deref(),
+        Some("currentColor")
+    );
     // An edge is stroked, not filled.
     assert_eq!(value(".edge-line", "fill").as_deref(), Some("none"));
     assert!(value(".edge-line", "stroke").is_some());
