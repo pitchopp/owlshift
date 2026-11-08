@@ -16,7 +16,13 @@ use super::*;
 /// The admitting bench, its project file's `[policy]` given `policy`, and
 /// DEMO-1 blocked by DEMO-9, a ticket of the tracker no gesture admits.
 pub(super) fn parallel_bench(policy: &str) -> Bench {
-    let bench = Bench::build_admitting(
+    parallel_bench_in(None, policy)
+}
+
+/// [`parallel_bench`], its directory made under `root` when given.
+pub(super) fn parallel_bench_in(root: Option<&Path>, policy: &str) -> Bench {
+    let bench = Bench::build_in(
+        root,
         "maintainer",
         "assignee = \"maintainer\"\nlabels = [\"agent\"]\nblocked_by = [\"DEMO-9\"]\n",
         policy,

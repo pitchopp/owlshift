@@ -32,12 +32,37 @@ impl Bench {
         front: &str,
         description: &str,
     ) {
+        self.put_ticket_titled(
+            id,
+            &format!("Ticket {id}"),
+            author,
+            stage,
+            labels,
+            front,
+            description,
+        );
+    }
+
+    /// [`Self::put_ticket`] with `title` as the ticket's title, written
+    /// through TOML's own escaping (OWL-508).
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn put_ticket_titled(
+        &self,
+        id: &str,
+        title: &str,
+        author: &str,
+        stage: &str,
+        labels: &[&str],
+        front: &str,
+        description: &str,
+    ) {
         let dir = self.remote.checkout.join("tickets").join(id);
         fs::create_dir_all(&dir).unwrap();
+        let title = toml::Value::String(title.to_owned());
         fs::write(
             dir.join("ticket.md"),
             format!(
-                "+++\ntitle = \"Ticket {id}\"\nauthor = \"{author}\"\nstage = \"{stage}\"\n\
+                "+++\ntitle = {title}\nauthor = \"{author}\"\nstage = \"{stage}\"\n\
                  assignee = \"maintainer\"\nlabels = {labels:?}\n{front}+++\n\n{description}\n"
             ),
         )
