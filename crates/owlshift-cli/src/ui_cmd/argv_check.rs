@@ -10,12 +10,15 @@
 //! [`reader`] alone, inside the agent's sandbox: the sandbox builds the
 //! agent's own environment, so the reader takes its request from a file of
 //! its working directory, [`REQUEST`], and writes what it saw to [`OUTPUT`].
-#![cfg(unix)]
+#![cfg(any(target_os = "linux", target_os = "macos"))]
 
+use std::collections::BTreeMap;
 use std::io::Read;
-use std::path::Path;
-use std::process::{Child, Command, Stdio};
+use std::path::{Path, PathBuf};
+use std::process::{Child, Command, Output, Stdio};
 use std::time::{Duration, Instant};
+
+use owlshift_runner::agent_env::{AgentEnv, RunPaths};
 
 // Its `state` and `is_alive` are not used here.
 #[allow(dead_code)]
@@ -157,6 +160,22 @@ fn parse_request(text: &str) -> (Vec<String>, Duration) {
     (needles, watch)
 }
 
+/// A request for `needles`, watched for `watch_ms` milliseconds after the
+/// first scan.
+fn request(needles: &[&str], watch_ms: u64) -> String {
+    let mut text: String = needles.iter().map(|needle| format!("{needle}\n")).collect();
+    text.push_str(&format!("watch_ms={watch_ms}\n"));
+    text
+}
+
+/// The `key=value` lines of an output.
+fn parse_output(text: &str) -> BTreeMap<String, String> {
+    text.lines()
+        .filter_map(|line| line.split_once('='))
+        .map(|(key, value)| (key.to_owned(), value.to_owned()))
+        .collect()
+}
+
 /// Runs the request of `dir`, when there is one: holds a needle of its own
 /// as a control, scans once or until the watch ends, every needle counted
 /// as found when any scan found it, then writes the output beside it.
@@ -211,4 +230,147 @@ fn the_scan_finds_the_argument_of_a_process_and_no_needle_nobody_holds() {
     let seen = scan(&[&held, &nobody]);
     assert_eq!(seen.found, [true, false], "{seen:?}");
     assert!(seen.read >= 1 && seen.processes >= seen.read, "{seen:?}");
+}
+
+/// A run of [`reader`], confined by `agent` or bare, in a scratch folder
+/// laid out as a run's: its worktree, which holds the request, a hidden run
+/// folder and its own temporary folder. This binary's folder is opened,
+/// read-only: it lies in the checkout, under the home the policy closes.
+pub struct Reader {
+    child: Child,
+    workdir: PathBuf,
+    _scratch: tempfile::TempDir,
+}
+
+impl Reader {
+    /// Starts the reader on `needles`, watched for `watch_ms`.
+    pub fn start(agent: Option<&AgentEnv>, needles: &[&str], watch_ms: u64) -> Self {
+        let scratch = tempfile::tempdir().unwrap();
+        let workdir = scratch.path().join("wt");
+        let run_dir = scratch.path().join("run");
+        let temp = scratch.path().join("temp");
+        for dir in [&workdir, &run_dir, &temp] {
+            std::fs::create_dir(dir).unwrap();
+        }
+        std::fs::write(workdir.join(REQUEST), request(needles, watch_ms)).unwrap();
+        let binary = std::env::current_exe().unwrap();
+        let mut inner = Command::new(&binary);
+        inner.args([
+            "ui_cmd::argv_check::reader",
+            "--exact",
+            "--ignored",
+            "--nocapture",
+        ]);
+        let run = RunPaths {
+            workdir: workdir.clone(),
+            git_dir: None,
+            worktree_git_dir: None,
+            readable: vec![binary.parent().unwrap().to_owned()],
+            writable: Vec::new(),
+            hidden: vec![run_dir],
+            temp: Some(temp),
+            read_only: false,
+        };
+        let mut command = match agent {
+            Some(agent) => agent.confine(inner, &run).unwrap(),
+            None => {
+                inner.current_dir(&workdir);
+                inner
+            }
+        };
+        let child = command
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        Reader {
+            child,
+            workdir,
+            _scratch: scratch,
+        }
+    }
+
+    /// Waits for the reader's end, and gives what it saw; panics, with its
+    /// output, when it saw nothing.
+    pub fn finish(self) -> BTreeMap<String, String> {
+        let output = self.child.wait_with_output().unwrap();
+        match std::fs::read_to_string(self.workdir.join(OUTPUT)) {
+            Ok(text) if output.status.success() => parse_output(&text),
+            _ => panic!("the reader failed: {}", shown(&output)),
+        }
+    }
+}
+
+fn shown(output: &Output) -> String {
+    format!(
+        "{}\nstdout: {}\nstderr: {}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    )
+}
+
+/// Whether a confined run can be made here, as `owlshift-testkit`'s
+/// `tests/confinement.rs` decides: a skip, but a failure when
+/// `OWLSHIFT_REQUIRE_CONFINEMENT` is set, as on CI's unix legs.
+fn sandbox_or_skip(agent: &AgentEnv) -> bool {
+    match agent.sandbox_ready() {
+        Ok(()) => true,
+        Err(error) => {
+            assert!(
+                std::env::var_os("OWLSHIFT_REQUIRE_CONFINEMENT").is_none(),
+                "confinement is required here, but: {error}"
+            );
+            eprintln!("skipped: agent runs cannot be confined here: {error}");
+            false
+        }
+    }
+}
+
+/// The value of `key` in a reader's output.
+fn value<'a>(seen: &'a BTreeMap<String, String>, key: &str) -> &'a str {
+    seen.get(key).map_or("missing", String::as_str)
+}
+
+/// Checks what a reader saw: its own child, so its scan works where it ran,
+/// and the needle of another process when `expected`.
+fn assert_saw(seen: &BTreeMap<String, String>, case: &str, expected: bool) {
+    let counts = format!("{case} on {}: {seen:?}", std::env::consts::OS);
+    assert_eq!(value(seen, "own"), "1", "{counts}");
+    assert!(
+        value(seen, "read").parse::<usize>().unwrap() >= 1,
+        "{counts}"
+    );
+    assert_eq!(
+        value(seen, "found_0"),
+        if expected { "1" } else { "0" },
+        "{counts}"
+    );
+}
+
+/// Live check U4's confinement test (build plan, "P8 · Local web UI"): a
+/// run confined by the executor's policy reads the arguments of a process
+/// outside its sandbox on macOS, whose Seatbelt profile lets `sysctl`
+/// `KERN_PROCARGS2` through, and none on Linux, where bwrap gives it its own
+/// process namespace and `/proc`. The reader run bare is the control.
+#[test]
+fn a_confined_run_reads_other_processes_arguments_on_macos_only() {
+    let other = needle();
+    let _holder = hold(&other);
+    // First and everywhere: the reader works, and finds the needle bare.
+    assert_saw(&Reader::start(None, &[&other], 0).finish(), "bare", true);
+
+    // The data directory a scratch one, so its hidden token folder, which
+    // the sandbox makes, is not made in the real one.
+    let data = tempfile::tempdir().unwrap();
+    let agent = AgentEnv::from_runner(&[], &[], &[])
+        .unwrap()
+        .with_data_dir(data.path());
+    if !sandbox_or_skip(&agent) {
+        return;
+    }
+    let seen = Reader::start(Some(&agent), &[&other], 0).finish();
+    println!("confined on {}: {seen:?}", std::env::consts::OS);
+    assert_saw(&seen, "confined", cfg!(target_os = "macos"));
 }
