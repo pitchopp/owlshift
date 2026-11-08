@@ -24,6 +24,11 @@ use owlshift_runner::ui::token;
 use crate::service_cmd::ON_WINDOWS;
 use crate::{data_dir, fail, own_build};
 
+/// Live check U4: whether a confined run reads other processes' arguments
+/// (OWL-495).
+#[cfg(test)]
+mod argv_check;
+
 /// Why `form` of `owlshift ui` is refused on this platform, `windows` when
 /// it is native Windows, as the daemon is.
 fn refused_on(windows: bool, form: &str) -> Option<String> {
