@@ -2765,22 +2765,44 @@ fn a_node_opens_its_ticket_and_every_text_of_the_graph_goes_through_text() {
 #[test]
 fn each_state_the_server_sends_has_its_colour_and_each_ghost_its_own() {
     use owlshift_runner::ui::graph::{BLOCKER_STATES, NODE_STATES};
+    // The rules are the sheet's with its comments stripped: a rule inside a
+    // comment colours nothing.
+    let rules = style_rules(APP_CSS);
+    let declarations = |selector: &str| -> Vec<(String, String)> {
+        rules
+            .iter()
+            .filter(|(s, _)| s == selector)
+            .flat_map(|(_, d)| d.clone())
+            .collect()
+    };
+    let value = |selector: &str, name: &str| -> Option<String> {
+        declarations(selector)
+            .into_iter()
+            .find(|(n, _)| n == name)
+            .map(|(_, v)| v)
+    };
     for state in NODE_STATES {
-        let rule = block(APP_CSS, &format!("\n.node-{state} {{"), "");
-        assert!(rule.contains("color: var(--"), "{state}: {rule}");
+        let rule = value(&format!(".node-{state}"), "color");
+        assert!(
+            rule.as_deref().is_some_and(|v| v.starts_with("var(--")),
+            "{state}: {rule:?}"
+        );
     }
     for state in BLOCKER_STATES {
-        let rule = block(APP_CSS, &format!("\n.ghost-{state} {{"), "");
-        assert!(rule.contains("color: var(--"), "{state}: {rule}");
+        let rule = value(&format!(".ghost-{state}"), "color");
+        assert!(
+            rule.as_deref().is_some_and(|v| v.starts_with("var(--")),
+            "{state}: {rule:?}"
+        );
     }
     // The states the ticket names apart do not merge a zone collision with
     // a usage limit: the decider's and the usage limit's share a role, as the
     // ticket groups them, and no other two of those six do.
     let role = |state: &str| {
-        block(APP_CSS, &format!("\n.node-{state} {{"), "")
-            .split("color: var(--")
-            .nth(1)
-            .and_then(|rest| rest.split(')').next())
+        value(&format!(".node-{state}"), "color")
+            .unwrap()
+            .strip_prefix("var(--")
+            .and_then(|rest| rest.strip_suffix(')'))
             .unwrap()
             .to_owned()
     };
@@ -2799,10 +2821,12 @@ fn each_state_the_server_sends_has_its_colour_and_each_ghost_its_own() {
         }
     }
     // A ghost is dashed, and a shape takes its colour from its group's.
-    let ghost = block(APP_CSS, "\n.node-ghost .node-box {", "");
-    assert!(ghost.contains("stroke-dasharray"));
-    let shape = block(APP_CSS, "\n.node-box {", "");
-    assert!(shape.contains("fill: currentColor;") && shape.contains("stroke: currentColor;"));
+    assert!(value(".node-ghost .node-box", "stroke-dasharray").is_some());
+    assert_eq!(value(".node-box", "fill").as_deref(), Some("currentColor"));
+    assert_eq!(value(".node-box", "stroke").as_deref(), Some("currentColor"));
+    // An edge is stroked, not filled.
+    assert_eq!(value(".edge-line", "fill").as_deref(), Some("none"));
+    assert!(value(".edge-line", "stroke").is_some());
     // Both are in the audited sheet: a colour outside the themes, a pair
     // outside the contrast table, would fail `audit`.
     audit(APP_CSS).unwrap();

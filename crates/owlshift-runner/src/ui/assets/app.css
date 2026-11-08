@@ -705,7 +705,7 @@ pre {
 
 /* The drain's graph (OWL-460). A shape takes its colour from its group's
    `color` through `currentColor`, so every colour is a role of the table
-}
+   above; a node says its state in words as well. */
 
 .graph-bar {
   display: flex;
