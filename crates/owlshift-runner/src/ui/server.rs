@@ -1168,19 +1168,13 @@ fn since_page(context: &Context, url: &str) -> Response<Cursor<Vec<u8>>> {
     json_response(200, &tail.since(at, Timestamp::now()).json())
 }
 
-
 /// The drain's graph of the data directory `data` at `now`: the events
 /// `tail` reads past what it had, the waits of every served project as
 /// `owlshift status --waits` builds them from those events, and each
 /// project's ready snapshot as that read held it, laid out by
 /// [`graph::of`]. The machine's run slots are counted up to
 /// `concurrent_runs`.
-pub fn graph_read(
-    data: &Path,
-    tail: &mut LogTail,
-    concurrent_runs: u32,
-    now: Timestamp,
-) -> Graph {
+pub fn graph_read(data: &Path, tail: &mut LogTail, concurrent_runs: u32, now: Timestamp) -> Graph {
     let mut event_notes = Vec::new();
     if let Err(error) = tail.refresh() {
         event_notes.push(format!("the event log cannot be read: {error}"));

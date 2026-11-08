@@ -285,8 +285,7 @@ let stream = null;
 let streamTimer = null;
 
 function wantsGraph() {
-  const target = parseRoute(window.location.hash);
-  return target === null || target === "graph";
+  return parseRoute(window.location.hash) === "graph";
 }
 
 function streamPath(graph) {

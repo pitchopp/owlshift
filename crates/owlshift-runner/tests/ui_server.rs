@@ -2316,7 +2316,8 @@ fn the_overview_page_links_only_a_guarded_pull_request_and_keeps_the_view_and_th
     assert!(app_js.contains(r#"const REPOSITORY_PATTERN = /^[A-Za-z0-9._-]+\/[A-Za-z0-9._-]+$/;"#));
     for part in app_js.split("setAttribute(\"href\"").skip(1) {
         assert!(
-            part.trim_start().starts_with(", \"#/ticket/\" +"),
+            part.trim_start().starts_with(", \"#/ticket/\" +")
+                || part.trim_start().starts_with(", ticketHref("),
             "{part:.60}"
         );
     }
@@ -2354,8 +2355,8 @@ fn the_overview_page_links_only_a_guarded_pull_request_and_keeps_the_view_and_th
     ] {
         assert!(INDEX_HTML.contains(id), "{id}");
     }
-    // Only the viewing of columns and list is offered: the graph is OWL-460.
-    assert!(!INDEX_HTML.to_ascii_lowercase().contains("graph"));
+    // The switch offers columns and list only: the graph is its own page, `#/graph` (OWL-460).
+    assert!(!INDEX_HTML.contains("id=\"view-graph\""));
 }
 
 // ---------------------------------------------------------------------------
@@ -2644,15 +2645,15 @@ fn the_graph_is_a_route_of_its_own_next_to_the_ticket_page() {
     assert!(parse.contains(r##"if (hash === "#/graph") {"##), "{parse}");
     assert!(parse.contains(r#"return "graph";"#));
     assert!(parse.contains(r##"const prefix = "#/ticket/";"##));
-    // It ends the pages open before it draws one, the graph is the page
-    // without a route, and a hash change reads the route again.
+    // It ends the pages open before it draws one, the graph is a route
+    // of its own, and a hash change reads the route again.
     let route = block(&app_js, "function route() {", "");
     assert!(
         route.starts_with("\n  closeTicket();\n  closeGraph();"),
         "{route}"
     );
     assert!(route.find("closeGraph();").unwrap() < route.find("openGraph();").unwrap());
-    assert!(route.contains("target === null || target === \"graph\""));
+    assert!(route.contains("target === \"graph\""));
     // A logout empties the graph like the header, and forgets it.
     let logged_out = block(&app_js, "function loggedOut(sent) {", "");
     assert!(logged_out.contains("closeGraph();"), "{logged_out}");
@@ -2669,7 +2670,7 @@ fn the_graph_is_a_route_of_its_own_next_to_the_ticket_page() {
     assert_eq!(APP_JS.matches(r#""/api/stream?graph=1""#).count(), 1);
     let wants = block(&app_js, "function wantsGraph() {", "");
     assert!(
-        wants.contains(r#"target === null || target === "graph""#),
+        wants.contains(r#"parseRoute(window.location.hash) === "graph""#),
         "{wants}"
     );
     let sync = block(&app_js, "function syncStream() {", "");
@@ -2692,7 +2693,7 @@ fn the_graph_is_a_route_of_its_own_next_to_the_ticket_page() {
     assert!(logged_out.contains("endStream();"), "{logged_out}");
     assert!(APP_JS.contains("} else if (message.graph) {\n          lastGraph = message.graph;"));
     // The frame: a link to the graph, and the container the graph draws in.
-    assert!(INDEX_HTML.contains(r##"<a href="/#/graph">Graph</a>"##));
+    assert!(INDEX_HTML.contains(r##"<a href="/#/graph" data-screen="graph">Graph</a>"##));
     assert!(INDEX_HTML.contains(r#"<section id="view" class="view" hidden></section>"#));
     assert!(INDEX_HTML.contains(r#"<section id="ticket" class="ticket" hidden></section>"#));
 }
@@ -2722,7 +2723,10 @@ fn the_layer_switch_is_kept_by_the_browser_and_the_project_switch_filters_the_gr
     assert!(draw.contains("aria-pressed"));
     let start = block(&app_js, "async function start() {", "");
     assert!(start.contains("store(PROJECT_KEY, project.value || null);"));
-    assert!(start.contains("    drawGraph();\n  });"), "{start}");
+    assert!(
+        start.contains("    renderHome();\n    drawGraph();\n"),
+        "{start}"
+    );
 }
 
 #[test]

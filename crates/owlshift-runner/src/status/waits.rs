@@ -29,8 +29,8 @@ use owlshift_adapters::forge::Repo;
 use owlshift_contracts::config::ProjectConfig;
 use owlshift_contracts::format::Format;
 use owlshift_contracts::ids::TicketId;
-use owlshift_contracts::result::Question;
 use owlshift_contracts::ready::ReadySnapshot;
+use owlshift_contracts::result::Question;
 use owlshift_contracts::service::Request;
 use owlshift_contracts::waits::{
     Behind, HeldRun, Paused, ProjectWaits, RefStatus, RunSlots, StatusWaits, TicketWaits, Wait,
@@ -215,7 +215,7 @@ pub fn gather_with(
         chosen,
         concurrent_runs,
         now,
-        &mut |repository| why::fold(&events, repository),
+        &mut |repository| why::fold(events, repository),
         notes,
     )
 }
