@@ -10,9 +10,9 @@
 //! L6, OWL-485): 15 at a full wake, with the display on and with it put to
 //! sleep for seconds while the system is held awake, and 9 (CPU and network)
 //! in every sample of a dark wake. So the graphics bit tells them apart, and
-//! [`parse`] reads nothing else. A display asleep for long on an awake Mac
-//! was not observed (the record says so): were the bit to drop with it, that
-//! machine would read as dark. The probe fails open: any reading it cannot make, and any platform
+//! [`parse`] reads nothing else. A display asleep for
+//! 5 minutes on an awake Mac (2026-11-08, OWL-505) read 15 in all 31 samples,
+//! so it is not read as dark; a headless Mac was not observed. The probe fails open: any reading it cannot make, and any platform
 //! but macOS, is [`Wake::Unknown`], which never holds anything, as
 //! keep-awake ([`crate::awake`]) does not hold anything back either.
 
