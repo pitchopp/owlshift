@@ -2691,7 +2691,7 @@ fn the_graph_is_a_route_of_its_own_next_to_the_ticket_page() {
     // A route reads the stream again, and a logout ends it.
     assert!(route.contains("\n  syncStream();"), "{route}");
     assert!(logged_out.contains("endStream();"), "{logged_out}");
-    assert!(APP_JS.contains("} else if (message.graph) {\n          lastGraph = message.graph;"));
+    assert!(app_js.contains("} else if (message.graph) {\n          lastGraph = message.graph;"));
     // The frame: a link to the graph, and the container the graph draws in.
     assert!(INDEX_HTML.contains(r##"<a href="/#/graph" data-screen="graph">Graph</a>"##));
     assert!(INDEX_HTML.contains(r#"<section id="view" class="view" hidden></section>"#));
