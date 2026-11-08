@@ -587,9 +587,11 @@ fn no_asset_holds_the_token_and_the_page_sends_only_the_code_and_the_session() {
         ["fetch(\"/api/login\"", "fetch(path"],
         "{fetches:?}"
     );
-    let authed: Vec<&str> = APP_JS
+    // A checkout with CRLF line endings (Windows) reads as one with LF.
+    let app_js = APP_JS.replace("\r\n", "\n");
+    let authed: Vec<&str> = app_js
         .match_indices("authedFetch(")
-        .map(|(at, _)| APP_JS[at..].split(')').next().unwrap())
+        .map(|(at, _)| app_js[at..].split(')').next().unwrap())
         .collect();
     // The header's stream, which carries the graph too (OWL-460), and the
     // ticket page's snapshot and run logs (OWL-471): each a route of the

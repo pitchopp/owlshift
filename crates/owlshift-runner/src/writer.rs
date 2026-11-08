@@ -8913,7 +8913,8 @@ Reply `Q1: B`, `ok` to take every recommendation, or in your own words.
     /// fails here.
     #[test]
     fn every_public_writer_method_is_in_the_ui_refusal_table() {
-        let source = include_str!("writer.rs");
+        // A checkout with CRLF line endings (Windows) reads as one with LF.
+        let source = include_str!("writer.rs").replace("\r\n", "\n");
         let opening = "impl<'a> Writer<'a> {\n";
         assert_eq!(source.matches(opening).count(), 1);
         // No other inherent or trait block of the Writer in this file.
