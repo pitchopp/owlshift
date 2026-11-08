@@ -12391,3 +12391,8 @@ mod overview_scenarios;
 /// decider's by the answer check (OWL-475).
 #[path = "on_demand/ui_reply_scenarios.rs"]
 mod ui_reply_scenarios;
+
+/// The web UI served on a bench data directory for a browser's check
+/// (OWL-508).
+#[path = "on_demand/ui_bench_scenarios.rs"]
+mod ui_bench_scenarios;
