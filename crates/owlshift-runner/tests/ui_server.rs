@@ -655,6 +655,19 @@ fn the_approval_form_is_drawn_in_the_plan_section() {
         "",
     );
     assert!(form.contains("go.checked = draft.go;"));
+    // A posted reply is shown above the form, which stays drawn while the
+    // round is offered: a reply left uncounted can be followed by a `go`.
+    let shown = form
+        .find("el.appendChild(make(\"p\", \"state-success\", posted));")
+        .unwrap();
+    assert!(shown < form.find("if (!reply.offered)").unwrap());
+    assert!(
+        shown
+            < form
+                .find("const draft = replyDraft(handle, reply);")
+                .unwrap()
+    );
+    assert_eq!(form.matches("return el;").count(), 3, "{form}");
     assert!(app_js.contains("handle.drafts[reply.ask] = { answers: {}, go: true };"));
     // Send is disabled while the reply is posted, and every continuation
     // after an await is for the page that is open.

@@ -845,8 +845,10 @@ function renderQuestions(handle, body, questions) {
 // choice listed in `reply.words` changes the plan only with words, which it
 // then asks for. What is picked and written is kept per ask in the handle, so
 // a redraw keeps it, and so is a reply once posted, which the form then shows
-// in its place. When the form is not offered, it says whose round it is and
-// why, with the ticket's link when the server has one.
+// above itself: the form stays drawn while the round is offered, so a reply
+// left uncounted can be followed by one that ends with `go`. When the form is
+// not offered, it says whose round it is and why, with the ticket's link when
+// the server has one.
 function replyDraft(handle, reply) {
   if (!handle.drafts) {
     handle.drafts = {};
@@ -883,7 +885,6 @@ function replyForm(handle, reply, questions) {
   const posted = handle.posted && handle.posted[reply.ask];
   if (posted) {
     el.appendChild(make("p", "state-success", posted));
-    return el;
   }
   if (!reply.offered) {
     el.appendChild(make("p", "notice", "Round " + reply.round + " waits for its decider, " + decider +
@@ -984,7 +985,7 @@ function replyQuestion(handle, reply, question, draft) {
 
 // Posts the reply, once: Send stays disabled until the answer, the form keeps
 // what was picked and written when it fails, and shows the posted comment
-// in its place once it is posted.
+// above the form once it is posted.
 async function sendReply(handle, reply, draft, button, status) {
   if (button.disabled) {
     return;
