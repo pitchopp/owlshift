@@ -10,6 +10,19 @@
 //! [`reader`] alone, inside the agent's sandbox: the sandbox builds the
 //! agent's own environment, so the reader takes its request from a file of
 //! its working directory, [`REQUEST`], and writes what it saw to [`OUTPUT`].
+//!
+//! Three checks. The confinement test,
+//! `a_confined_run_reads_other_processes_arguments_on_macos_only`, runs with
+//! every test and on CI's unix legs, where `OWLSHIFT_REQUIRE_CONFINEMENT`
+//! makes it fail rather than skip. Two live checks run by hand:
+//!
+//! ```sh
+//! # From inside a run already confined, such as a Build: its own scan.
+//! OWLSHIFT_LIVE_UI_ARGV_SELF=1 cargo test -p owlshift-cli --bin owlshift -- --ignored --nocapture ui_cmd::argv_check::a_run_already_confined
+//! # On macOS, outside any sandbox, once with the default browser open and
+//! # once with it quit: it opens a tab on a throwaway listener.
+//! OWLSHIFT_LIVE_UI_ARGV=1 cargo test -p owlshift-cli --bin owlshift -- --ignored --nocapture ui_cmd::argv_check::the_login_link
+//! ```
 #![cfg(any(target_os = "linux", target_os = "macos"))]
 
 use std::collections::BTreeMap;
@@ -373,4 +386,131 @@ fn a_confined_run_reads_other_processes_arguments_on_macos_only() {
     let seen = Reader::start(Some(&agent), &[&other], 0).finish();
     println!("confined on {}: {seen:?}", std::env::consts::OS);
     assert_saw(&seen, "confined", cfg!(target_os = "macos"));
+}
+
+/// Live check U4 from a run already confined, where no sandbox nests, such
+/// as a Build's: the scan of its own process, which prints what it read of
+/// the machine's other processes.
+#[test]
+#[ignore = "live: run from a confined run; set OWLSHIFT_LIVE_UI_ARGV_SELF=1"]
+fn a_run_already_confined_reads_other_processes_arguments() {
+    assert_eq!(
+        std::env::var("OWLSHIFT_LIVE_UI_ARGV_SELF").as_deref(),
+        Ok("1"),
+        "a live check: set OWLSHIFT_LIVE_UI_ARGV_SELF=1 to run it"
+    );
+    let held = needle();
+    let _holder = hold(&held);
+    let seen = scan(&[&held]);
+    println!(
+        "U4 self scan on {} {}: processes={} read={} found={}",
+        std::env::consts::OS,
+        std::env::consts::ARCH,
+        seen.processes,
+        seen.read,
+        u8::from(seen.found[0])
+    );
+    assert!(
+        seen.found[0],
+        "the scan did not find its own child: {seen:?}"
+    );
+}
+
+/// A throwaway listener on `127.0.0.1`, which answers every request with a
+/// small page and counts them.
+#[cfg(target_os = "macos")]
+fn listen() -> (u16, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+    use std::io::Write;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let count = Arc::new(AtomicUsize::new(0));
+    let counted = Arc::clone(&count);
+    std::thread::spawn(move || {
+        for mut stream in listener.incoming().flatten() {
+            let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
+            let mut head = Vec::new();
+            let mut byte = [0u8; 1];
+            while !head.ends_with(b"\r\n\r\n") && head.len() < 16 * 1024 {
+                match stream.read(&mut byte) {
+                    Ok(1) => head.push(byte[0]),
+                    _ => break,
+                }
+            }
+            counted.fetch_add(1, Ordering::SeqCst);
+            let page =
+                "<!doctype html><title>U4</title><p>OWL-495's live check U4: close this tab.";
+            let _ = write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\n\
+                 Connection: close\r\n\r\n{page}",
+                page.len()
+            );
+        }
+    });
+    (port, count)
+}
+
+/// Live check U4's browser check, on macOS, outside any sandbox: the login
+/// link opened by `owlshift ui`'s own opener reaches the browser, and while
+/// it does, a confined run watching every process's arguments never reads
+/// its code, though it reads a control needle held as an argument meanwhile.
+/// The link points at a throwaway listener and its code is a random needle,
+/// so nothing can be redeemed. Run it with the default browser open, then
+/// with it quit.
+#[cfg(target_os = "macos")]
+#[test]
+#[ignore = "live: opens a browser tab; set OWLSHIFT_LIVE_UI_ARGV=1"]
+fn the_login_link_reaches_the_browser_in_no_argument_a_confined_run_reads() {
+    use std::sync::atomic::Ordering;
+
+    assert_eq!(
+        std::env::var("OWLSHIFT_LIVE_UI_ARGV").as_deref(),
+        Ok("1"),
+        "a live check that opens a browser tab: set OWLSHIFT_LIVE_UI_ARGV=1 to run it"
+    );
+    let data = tempfile::tempdir().unwrap();
+    let agent = AgentEnv::from_runner(&[], &[], &[])
+        .unwrap()
+        .with_data_dir(data.path());
+    agent.sandbox_ready().expect("a working sandbox");
+    let (port, requests) = listen();
+    let (code, control) = (needle(), needle());
+    let reader = Reader::start(Some(&agent), &[&code, &control], 20_000);
+    std::thread::sleep(Duration::from_secs(1));
+
+    let opened = super::open_with(super::opener(&super::login_link(port, &code))).unwrap();
+    assert!(opened.success(), "the opener failed: {opened}");
+    // Held for 3 seconds only: a watch that missed it would also miss a
+    // short-lived opener.
+    let _control = hold_for("sleep 3; :", &control);
+    let end = Instant::now() + Duration::from_secs(15);
+    while requests.load(Ordering::SeqCst) == 0 && Instant::now() < end {
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    let received = requests.load(Ordering::SeqCst);
+    let seen = reader.finish();
+    println!(
+        "U4 browser check on macOS: requests={received} processes={} read={} own={} code={} \
+         control={}",
+        value(&seen, "processes"),
+        value(&seen, "read"),
+        value(&seen, "own"),
+        value(&seen, "found_0"),
+        value(&seen, "found_1")
+    );
+    assert!(received >= 1, "the browser never requested the link");
+    assert_eq!(value(&seen, "own"), "1", "{seen:?}");
+    assert_eq!(
+        value(&seen, "found_1"),
+        "1",
+        "the control was missed: {seen:?}"
+    );
+    assert_eq!(
+        value(&seen, "found_0"),
+        "0",
+        "a confined run read the code: {seen:?}"
+    );
 }
