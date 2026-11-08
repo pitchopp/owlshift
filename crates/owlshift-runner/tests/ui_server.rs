@@ -626,11 +626,27 @@ fn the_approval_form_is_drawn_in_the_plan_section() {
     let app_js = lf(APP_JS);
     let questions = block(
         &app_js,
-        "function renderQuestions(handle, body, questions) {",
+        "function renderQuestions(handle, body, questions, snapshot) {",
         "",
     );
     assert!(questions.contains("reply.approval"), "{questions}");
     assert!(questions.contains("replyForm(handle, reply, questions)"));
+    // A plan section that cannot draw the plan draws no form: the questions
+    // section draws the approval's then, and says so.
+    assert!(
+        questions.contains("if (reply && reply.approval && planDrawn(snapshot)) {"),
+        "{questions}"
+    );
+    assert!(questions.contains("the plan cannot be drawn: its reply form is here."));
+    let drawn = block(&app_js, "function planDrawn(snapshot) {", "");
+    assert!(
+        drawn.contains("snapshot.plan && !snapshot.plan.error"),
+        "{drawn}"
+    );
+    let snapshot = block(&app_js, "function renderSnapshot(handle, snapshot) {", "");
+    assert!(snapshot.contains("if (part && part.error) {"));
+    assert!(snapshot.contains("} else if (part === null || part === undefined) {"));
+    assert!(snapshot.contains(": name === \"questions\" ? planDrawn(snapshot) : null;"));
     let plan = block(
         &app_js,
         "function renderPlan(handle, body, plan, snapshot) {",

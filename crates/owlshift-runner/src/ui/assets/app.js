@@ -668,8 +668,10 @@ function renderSnapshot(handle, snapshot) {
   ];
   for (const [name, draw] of sections) {
     const part = snapshot[name];
-    // The plan section holds the approval's reply form (OWL-475).
-    const beside = name === "plan" && snapshot.questions ? snapshot.questions.reply : null;
+    // The plan section holds the approval's reply form (OWL-475), unless it
+    // cannot draw the plan: the questions section holds it then.
+    const beside = name === "plan" && snapshot.questions ? snapshot.questions.reply
+      : name === "questions" ? planDrawn(snapshot) : null;
     const key = JSON.stringify(part === undefined ? null : part) + JSON.stringify(beside || null);
     if (handle.last[name] === key) {
       continue;
@@ -804,12 +806,21 @@ function questionEl(question, verdict) {
   return el;
 }
 
-function renderQuestions(handle, body, questions) {
+// Whether the plan section draws the plan, and with it the approval's form.
+function planDrawn(snapshot) {
+  return Boolean(snapshot && snapshot.plan && !snapshot.plan.error);
+}
+
+function renderQuestions(handle, body, questions, snapshot) {
   const reply = questions.reply;
-  if (reply && reply.approval) {
+  if (reply && reply.approval && planDrawn(snapshot)) {
     body.appendChild(make("p", "notice",
       "This round asks for the plan's approval: its reply form is beside the plan, below."));
   } else if (reply) {
+    if (reply.approval) {
+      body.appendChild(make("p", "notice",
+        "This round asks for the plan's approval, and the plan cannot be drawn: its reply form is here."));
+    }
     body.appendChild(replyForm(handle, reply, questions));
   }
   if (questions.asks.length === 0 && questions.decisions.length === 0) {
