@@ -701,3 +701,201 @@ pre {
   align-items: center;
   gap: 8px;
 }
+
+
+/* The drain's graph (OWL-460). A shape takes its colour from its group's
+   `color` through `currentColor`, so every colour is a role of the table
+   above; a node says its state in words as well. */
+
+.graph-bar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px 20px;
+}
+
+.graph-title {
+  margin: 0 auto 0 0;
+}
+
+.layer-switch {
+  display: inline-flex;
+  gap: 6px;
+}
+
+.layer-switch .control {
+  cursor: pointer;
+}
+
+.layer-switch .control[aria-pressed=true] {
+  background: var(--raised);
+  border: 2px solid var(--focus);
+  font-weight: 600;
+}
+
+.graph-project {
+  background: var(--surface);
+  border: 1px solid var(--border-hairline);
+  border-radius: 6px;
+  margin-top: 14px;
+  padding: 4px 14px 12px;
+}
+
+.graph-project h3 {
+  margin: 10px 0 6px;
+}
+
+.graph-age {
+  color: var(--text-muted);
+  margin: 2px 0;
+}
+
+.graph-age .state-warning {
+  margin-left: 10px;
+}
+
+.graph-layout {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-start;
+  gap: 14px 24px;
+}
+
+.graph-frame {
+  max-width: 100%;
+  overflow: auto;
+}
+
+.queue {
+  min-width: 240px;
+}
+
+.queue h4 {
+  margin: 4px 0;
+}
+
+.queue-list {
+  margin: 0;
+  padding-left: 22px;
+}
+
+.queue-reason,
+.queue-since,
+.queue-behind {
+  color: var(--text-secondary);
+}
+
+.node-box {
+  fill: currentColor;
+  fill-opacity: 0.1;
+  stroke: currentColor;
+  stroke-width: 2;
+}
+
+.node-id,
+.node-state,
+.node-detail,
+.edge-label {
+  font-size: 12px;
+  fill: currentColor;
+}
+
+.node-id {
+  color: var(--text);
+  font-weight: 600;
+}
+
+.node-state {
+  color: var(--text-secondary);
+}
+
+.node-detail {
+  color: var(--text-muted);
+}
+
+.edge-line {
+  color: var(--text-muted);
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.5;
+}
+
+.edge-head {
+  color: var(--text-muted);
+  fill: currentColor;
+}
+
+.edge-label {
+  color: var(--text-secondary);
+  font-size: 11px;
+}
+
+a:focus-visible .node-box {
+  stroke-width: 3;
+}
+
+.node-running {
+  color: var(--success);
+}
+
+.node-resource {
+  color: var(--warning);
+}
+
+.node-ticket {
+  color: var(--link);
+}
+
+.node-slot {
+  color: var(--information);
+}
+
+.node-decider {
+  color: var(--danger);
+}
+
+.node-intake {
+  color: var(--text-secondary);
+}
+
+/* With the decider's, as the ticket groups them, and apart from a
+   resource's collision. */
+.node-usage_limit {
+  color: var(--danger);
+}
+
+.node-other {
+  color: var(--text-muted);
+}
+
+.node-not_started {
+  color: var(--text-muted);
+}
+
+.node-idle {
+  color: var(--text-muted);
+}
+
+.node-ready {
+  color: var(--text-secondary);
+}
+
+.node-ghost {
+  color: var(--text-muted);
+}
+
+.node-ghost .node-box {
+  stroke-dasharray: 6 4;
+}
+
+.ghost-open {
+  color: var(--text-secondary);
+}
+
+.ghost-canceled {
+  color: var(--danger);
+}
+
+.ghost-unknown {
+  color: var(--warning);
+}

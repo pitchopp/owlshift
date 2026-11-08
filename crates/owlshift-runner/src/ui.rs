@@ -20,6 +20,9 @@
 //!   the usage windows, the decisions and warnings as they are appended and
 //!   the daemon's log, in `owlshift status`'s own words, from the event log
 //!   read incrementally ([`index`]).
+//! - *The drain's graph* ([`graph`], OWL-460): the live waits of
+//!   `status --waits` and the tracker's blockers of `ready.json`, laid out
+//!   for the graph page.
 //! - *The server* ([`server`]): tiny_http and threads on the socket the
 //!   daemon hands over, its routes and checks, and the page carried in the
 //!   binary.
@@ -34,6 +37,7 @@ pub mod auth;
 pub mod configuration;
 pub mod events;
 pub mod eventtail;
+pub mod graph;
 pub mod header;
 pub mod index;
 pub mod orchestrator;

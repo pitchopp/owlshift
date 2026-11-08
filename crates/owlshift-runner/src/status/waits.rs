@@ -29,6 +29,7 @@ use owlshift_adapters::forge::Repo;
 use owlshift_contracts::config::ProjectConfig;
 use owlshift_contracts::format::Format;
 use owlshift_contracts::ids::TicketId;
+use owlshift_contracts::ready::ReadySnapshot;
 use owlshift_contracts::result::Question;
 use owlshift_contracts::service::Request;
 use owlshift_contracts::waits::{
@@ -91,6 +92,9 @@ pub struct ProjectRead {
     /// The tickets of its latest ready snapshot; `None` when there is none
     /// or it does not read.
     pub ready: Option<BTreeSet<TicketId>>,
+    /// That snapshot as read, once: what the web UI's blockers layer draws
+    /// from, so that it joins the very snapshot the waits were shown with.
+    pub snapshot: Result<Option<ReadySnapshot>, String>,
     /// What the web UI's overview needs of every ref that reads, the ones
     /// `refs` holds but no row of the document shows included (OWL-470).
     pub details: BTreeMap<TicketId, RefDetail>,
@@ -289,7 +293,8 @@ fn project(
             ));
         }
     }
-    let ready = ready::listed(&dirs, now, &format!("{repository}: "), notes);
+    let snapshot = ready::read(&dirs);
+    let ready = ready::listed_of(&snapshot, now, &format!("{repository}: "), notes);
     let quarantined = match dirs.quarantine() {
         Ok(marker) => marker.is_some(),
         Err(error) => {
@@ -331,6 +336,7 @@ fn project(
         pause: requests::pause(&dirs),
         ready,
         details,
+        snapshot,
     }
 }
 
@@ -896,6 +902,7 @@ mod tests {
             pause: None,
             ready: Some(listed),
             details: BTreeMap::new(),
+            snapshot: Ok(None),
         }
     }
 

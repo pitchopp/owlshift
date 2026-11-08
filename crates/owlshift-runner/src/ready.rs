@@ -58,16 +58,26 @@ pub fn listed(
     prefix: &str,
     notes: &mut Vec<String>,
 ) -> Option<BTreeSet<TicketId>> {
-    match read(dirs) {
+    listed_of(&read(dirs), now, prefix, notes)
+}
+
+/// [`listed`] over a snapshot already read by [`read`].
+pub fn listed_of(
+    snapshot: &Result<Option<ReadySnapshot>, String>,
+    now: Timestamp,
+    prefix: &str,
+    notes: &mut Vec<String>,
+) -> Option<BTreeSet<TicketId>> {
+    match snapshot {
         Ok(Some(snapshot)) => {
-            if stale(&snapshot, now) {
+            if stale(snapshot, now) {
                 notes.push(format!(
                     "{prefix}the drain last read the ready column at {}, more than two passes \
                      ago: its waits are as it told them then",
                     snapshot.at
                 ));
             }
-            Some(snapshot.tickets.into_iter().map(|t| t.ticket).collect())
+            Some(snapshot.tickets.iter().map(|t| t.ticket.clone()).collect())
         }
         Ok(None) => None,
         Err(why) => {

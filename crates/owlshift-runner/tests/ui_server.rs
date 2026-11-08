@@ -14,6 +14,7 @@ use owlshift_adapters::forge::Repo;
 use owlshift_contracts::event::{Event, EventKind};
 use owlshift_contracts::format::Format;
 use owlshift_contracts::ids::TicketId;
+use owlshift_contracts::ready::{Outcome, ReadySnapshot, ReadyTicket};
 use owlshift_contracts::service::{BY_PAUSE, Request};
 use owlshift_runner::daemon::requests;
 use owlshift_runner::events::EventLog;
@@ -467,6 +468,11 @@ fn relay(port: u16) -> (u16, Arc<Mutex<Vec<u8>>>) {
 /// Opens `/api/stream` on `port` and reads its head: the stream, positioned
 /// at its first chunk.
 fn open_stream(port: u16, session: &Session) -> BufReader<TcpStream> {
+    open_stream_on(port, session, "/api/stream")
+}
+
+/// [`open_stream`] on `path`, a query included.
+fn open_stream_on(port: u16, session: &Session, path: &str) -> BufReader<TcpStream> {
     let stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
     stream
         .set_read_timeout(Some(Duration::from_secs(10)))
@@ -475,7 +481,7 @@ fn open_stream(port: u16, session: &Session) -> BufReader<TcpStream> {
         .write_all(&request_bytes(
             port,
             "GET",
-            "/api/stream",
+            path,
             &[("X-Owlshift-Session", &session.header())],
             "",
         ))
@@ -585,14 +591,14 @@ fn no_asset_holds_the_token_and_the_page_sends_only_the_code_and_the_session() {
         .match_indices("authedFetch(")
         .map(|(at, _)| APP_JS[at..].split(')').next().unwrap())
         .collect();
-    // The header's stream, and the ticket page's snapshot and run logs
-    // (OWL-471): each a route of the session, none a path the client
-    // chooses beyond the ticket's own.
+    // The header's stream, which carries the graph too (OWL-460), and the
+    // ticket page's snapshot and run logs (OWL-471): each a route of the
+    // session, none a path the client chooses beyond the ticket's own.
     assert_eq!(
         authed,
         [
-            "authedFetch(path",
-            "authedFetch(\"/api/stream\"",
+            "authedFetch(path, signal",
+            "authedFetch(streamPath(mine.graph",
             "authedFetch(snapshotPath(handle",
             "authedFetch(logPath(handle, run.id, which, log.from, log.line",
             // The overview's "since" panel (OWL-470).
@@ -2310,7 +2316,8 @@ fn the_overview_page_links_only_a_guarded_pull_request_and_keeps_the_view_and_th
     assert!(app_js.contains(r#"const REPOSITORY_PATTERN = /^[A-Za-z0-9._-]+\/[A-Za-z0-9._-]+$/;"#));
     for part in app_js.split("setAttribute(\"href\"").skip(1) {
         assert!(
-            part.trim_start().starts_with(", \"#/ticket/\" +"),
+            part.trim_start().starts_with(", \"#/ticket/\" +")
+                || part.trim_start().starts_with(", ticketHref("),
             "{part:.60}"
         );
     }
@@ -2348,6 +2355,602 @@ fn the_overview_page_links_only_a_guarded_pull_request_and_keeps_the_view_and_th
     ] {
         assert!(INDEX_HTML.contains(id), "{id}");
     }
-    // Only the viewing of columns and list is offered: the graph is OWL-460.
-    assert!(!INDEX_HTML.to_ascii_lowercase().contains("graph"));
+    // The switch offers columns and list only: the graph is its own page, `#/graph` (OWL-460).
+    assert!(!INDEX_HTML.contains("id=\"view-graph\""));
+}
+
+// ---------------------------------------------------------------------------
+// The drain's graph (OWL-460): `/api/graph` and `/api/stream?graph=1`.
+
+/// A served project `o/r` whose ready snapshot lists DEMO-1 and DEMO-2, with
+/// a machine pause, and a session on a UI over it.
+struct Drain {
+    data: tempfile::TempDir,
+    ui: Serving,
+    session: Session,
+}
+
+impl Drain {
+    fn new() -> Self {
+        let data = tempfile::tempdir().unwrap();
+        let repo = Repo::parse("o/r").unwrap();
+        let checkout = data.path().join("checkout-of-o-r");
+        std::fs::create_dir_all(&checkout).unwrap();
+        Registry::in_data_dir(data.path())
+            .register(&repo, &checkout)
+            .unwrap();
+        requests::ask_pause(
+            data.path(),
+            None,
+            &Request::new(BY_PAUSE, Timestamp::now(), "lunch"),
+        )
+        .unwrap();
+        let drain = {
+            let ui = serve(data.path(), RunSecret::new().unwrap());
+            let session = session(ui.port(), data.path());
+            Self { data, ui, session }
+        };
+        drain.ready("DEMO-1 title", "DEMO-2 title");
+        drain
+    }
+
+    fn ready(&self, first: &str, second: &str) {
+        let ticket = |id: &str, title: &str| ReadyTicket {
+            ticket: TicketId::new(id).unwrap(),
+            title: title.to_owned(),
+            priority: owlshift_core::vocab::Priority::Medium,
+            blockers: Vec::new(),
+            drain: Outcome::TakenIn,
+        };
+        let snapshot = ReadySnapshot {
+            format: Format,
+            at: Timestamp::now(),
+            interval_ms: 60_000,
+            tickets: vec![ticket("DEMO-1", first), ticket("DEMO-2", second)],
+        };
+        let dirs = ProjectDirs::new(self.data.path(), &Repo::parse("o/r").unwrap());
+        owlshift_runner::ready::write(&dirs, &snapshot).unwrap();
+    }
+
+    fn event(&self, ticket: &str, kind: EventKind, data: Value) {
+        let event = Event {
+            format: Format,
+            at: Timestamp::now(),
+            project: "o/r".to_owned(),
+            ticket: Some(TicketId::new(ticket).unwrap()),
+            run: None,
+            kind,
+            data: data.as_object().unwrap().clone(),
+        };
+        EventLog::in_dir(self.data.path()).append(&event).unwrap();
+    }
+
+    /// The drain tells `ticket` waits blocked by `behind`.
+    fn blocked(&self, ticket: &str, behind: &str) {
+        self.event(
+            ticket,
+            EventKind::Decision,
+            json!({ "drain": "waits", "reason": "blocked_by", "tickets": [behind] }),
+        );
+    }
+
+    fn stream(&self) -> BufReader<TcpStream> {
+        open_stream_on(self.ui.port(), &self.session, "/api/stream?graph=1")
+    }
+
+    fn get(&self, path: &str) -> Reply {
+        get(
+            self.ui.port(),
+            path,
+            &[("X-Owlshift-Session", &self.session.header())],
+        )
+    }
+
+    /// The graph a whole read of the directory gives now: what the tail's
+    /// incremental one must equal.
+    fn whole(&self) -> Value {
+        let mut tail = owlshift_runner::ui::eventtail::EventTail::new(self.data.path());
+        let graph = server::graph_read(self.data.path(), &mut tail, 2, Timestamp::now());
+        serde_json::to_value(graph).unwrap()
+    }
+}
+
+/// The next line of `stream` that is a graph, the header lines skipped.
+fn next_graph(stream: &mut BufReader<TcpStream>) -> Value {
+    loop {
+        let line = next_line(stream).expect("a graph line");
+        let value: Value = serde_json::from_str(&line).unwrap();
+        if value.get("graph").is_some() {
+            return value["graph"].clone();
+        }
+    }
+}
+
+fn edges(graph: &Value, layer: &str) -> Vec<(String, String)> {
+    graph["projects"][0][layer]["edges"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|edge| {
+            (
+                edge["from"].as_str().unwrap().to_owned(),
+                edge["to"].as_str().unwrap().to_owned(),
+            )
+        })
+        .collect()
+}
+
+#[test]
+fn the_graph_needs_a_session_and_comes_back_as_escaped_json_text() {
+    let drain = Drain::new();
+    let none = get(drain.ui.port(), "/api/graph", &[]);
+    assert_eq!(none.status, 401);
+    none.assert_secured();
+    let made_up = get(
+        drain.ui.port(),
+        "/api/graph",
+        &[("X-Owlshift-Session", "nonsense")],
+    );
+    assert_eq!(made_up.status, 401);
+    let title = "<script>alert(1)</script> & x";
+    drain.ready("DEMO-1 title", title);
+    drain.blocked("DEMO-2", "DEMO-1");
+    let reply = drain.get("/api/graph");
+    assert_eq!(reply.status, 200, "{}", reply.text());
+    reply.assert_secured();
+    assert!(
+        reply
+            .header("Content-Type")
+            .unwrap()
+            .starts_with("application/json")
+    );
+    let text = reply.text();
+    for c in ['<', '>', '&', '\u{2028}'] {
+        assert!(!text.contains(c), "{text}");
+    }
+    let graph = reply.json();
+    assert_eq!(graph["machine_pause"]["why"], "lunch");
+    assert_eq!(graph["projects"][0]["repository"], "o/r");
+    assert_eq!(graph["projects"][0]["served"], true);
+    let blockers = &graph["projects"][0]["blockers"]["nodes"];
+    let titles: Vec<&str> = blockers
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|node| node["title"].as_str().unwrap())
+        .collect();
+    assert_eq!(titles, ["DEMO-1 title", title]);
+    assert_eq!(
+        edges(&graph, "live"),
+        [("DEMO-2".to_owned(), "DEMO-1".to_owned())]
+    );
+    assert_eq!(graph["projects"][0]["ready"]["stale"], false);
+}
+
+#[test]
+fn a_graph_stream_follows_the_waits_through_the_event_tail() {
+    let drain = Drain::new();
+    let mut stream = drain.stream();
+    let first: Value = serde_json::from_str(&next_line(&mut stream).unwrap()).unwrap();
+    assert!(first.get("header").is_some(), "{first}");
+    let graph = next_graph(&mut stream);
+    // No ticket ref and no wait: the ready tickets are in the blockers
+    // layer only, the live one has nothing to draw.
+    assert!(
+        graph["projects"][0]["live"]["nodes"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(
+        graph["projects"][0]["blockers"]["nodes"]
+            .as_array()
+            .unwrap()
+            .len(),
+        2
+    );
+
+    // A wait told, with `ready.json` untouched: the next line has its edge,
+    // and nodes and edges are what a whole read of the directory builds.
+    drain.blocked("DEMO-2", "DEMO-1");
+    let told = next_graph(&mut stream);
+    assert_eq!(
+        edges(&told, "live"),
+        [("DEMO-2".to_owned(), "DEMO-1".to_owned())]
+    );
+    let whole = drain.whole();
+    assert_eq!(told["projects"], whole["projects"]);
+
+    // The drain's dispatch ends the wait: the following line has no edge.
+    drain.event(
+        "DEMO-2",
+        EventKind::Dispatch,
+        json!({ "branch": "owlshift/demo-2" }),
+    );
+    let cleared = next_graph(&mut stream);
+    assert!(edges(&cleared, "live").is_empty(), "{cleared}");
+    assert_eq!(cleared["projects"], drain.whole()["projects"]);
+}
+
+#[test]
+fn a_changed_ready_snapshot_alone_gives_a_line_and_an_unchanged_directory_none() {
+    let drain = Drain::new();
+    let mut stream = drain.stream();
+    next_line(&mut stream).unwrap();
+    let first = next_graph(&mut stream);
+    let title = |graph: &Value| {
+        graph["projects"][0]["blockers"]["nodes"][0]["title"]
+            .as_str()
+            .unwrap()
+            .to_owned()
+    };
+    assert_eq!(title(&first), "DEMO-1 title");
+    drain.ready("DEMO-1 renamed", "DEMO-2 title");
+    let next = next_graph(&mut stream);
+    assert_eq!(title(&next), "DEMO-1 renamed");
+    // Nothing changed since: no graph line within many refresh periods
+    // (100 ms here), the keepalive being 15 s away.
+    stream
+        .get_ref()
+        .set_read_timeout(Some(Duration::from_millis(600)))
+        .unwrap();
+    assert_eq!(next_line(&mut stream), None);
+}
+
+#[test]
+fn a_stream_without_graph_one_never_carries_a_graph_line() {
+    let drain = Drain::new();
+    for path in ["/api/stream", "/api/stream?graph=2", "/api/stream?graph=0"] {
+        let mut stream = open_stream_on(drain.ui.port(), &drain.session, path);
+        let first = next_line(&mut stream).unwrap();
+        assert!(first.starts_with(r#"{"header":"#), "{path}: {first}");
+        drain.blocked("DEMO-2", "DEMO-1");
+        stream
+            .get_ref()
+            .set_read_timeout(Some(Duration::from_millis(500)))
+            .unwrap();
+        while let Some(line) = next_line(&mut stream) {
+            assert!(!line.contains(r#""graph""#), "{path}: {line}");
+        }
+    }
+}
+
+#[test]
+fn a_new_token_ends_a_graph_stream_with_the_logged_out_line() {
+    let drain = Drain::new();
+    let mut stream = drain.stream();
+    next_line(&mut stream).unwrap();
+    next_graph(&mut stream);
+    token::new_token(drain.data.path()).unwrap();
+    stream
+        .get_ref()
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .unwrap();
+    let mut last = None;
+    while let Some(line) = next_line(&mut stream) {
+        last = Some(line);
+    }
+    assert_eq!(last.as_deref(), Some(LOGGED_OUT_LINE));
+}
+
+// The graph's page. JavaScript has no test setup here: these pin its
+// structure, and what it draws is checked by a person (see the pull
+// request).
+
+#[test]
+fn the_graph_is_a_route_of_its_own_next_to_the_ticket_page() {
+    let app_js = lf(APP_JS);
+    // The route table: the graph, a ticket's page, and what is neither.
+    let parse = block(&app_js, "function parseRoute(hash) {", "");
+    assert!(parse.contains(r##"if (hash === "#/graph") {"##), "{parse}");
+    assert!(parse.contains(r#"return "graph";"#));
+    assert!(parse.contains(r##"const prefix = "#/ticket/";"##));
+    // It ends the pages open before it draws one, the graph is a route
+    // of its own, and a hash change reads the route again.
+    let route = block(&app_js, "function route() {", "");
+    assert!(
+        route.starts_with("\n  closeTicket();\n  closeGraph();"),
+        "{route}"
+    );
+    assert!(route.find("closeGraph();").unwrap() < route.find("openGraph();").unwrap());
+    assert!(route.contains("target === \"graph\""));
+    // A logout empties the graph like the header, and forgets it.
+    let logged_out = block(&app_js, "function loggedOut(sent) {", "");
+    assert!(logged_out.contains("closeGraph();"), "{logged_out}");
+    assert!(logged_out.contains("lastGraph = null;"));
+    // The stream that carries the header carries the graph only while the
+    // graph's page is the route (the server computes it only while a stream
+    // asks), and a change of route that changes the answer ends the stream
+    // and opens the other, which is no failure and no newer tab.
+    let path = block(&app_js, "function streamPath(graph) {", "");
+    assert!(
+        path.contains(r#"graph ? "/api/stream?graph=1" : "/api/stream""#),
+        "{path}"
+    );
+    assert_eq!(APP_JS.matches(r#""/api/stream?graph=1""#).count(), 1);
+    let wants = block(&app_js, "function wantsGraph() {", "");
+    assert!(
+        wants.contains(r#"parseRoute(window.location.hash) === "graph""#),
+        "{wants}"
+    );
+    let sync = block(&app_js, "function syncStream() {", "");
+    assert!(sync.contains("stream.graph === wantsGraph()"), "{sync}");
+    assert!(sync.contains("endStream();") && sync.contains("follow();"));
+    assert!(sync.contains("lastGraph = null;"));
+    let end = block(&app_js, "function endStream() {", "");
+    assert!(end.contains("stream.controller.abort();"), "{end}");
+    let follow = block(&app_js, "async function follow() {", "");
+    assert!(follow.contains("mine.controller.signal"), "{follow}");
+    // A stream the page ended returns before it says a failure or retries.
+    let catch = follow.split("} catch (error) {").nth(1).unwrap();
+    assert!(
+        catch.starts_with("\n    if (stream !== mine) {\n      return;\n    }\n    problem("),
+        "{catch}"
+    );
+    assert!(follow.contains("streamTimer = window.setTimeout(follow, retry);"));
+    // A route reads the stream again, and a logout ends it.
+    assert!(route.contains("\n  syncStream();"), "{route}");
+    assert!(logged_out.contains("endStream();"), "{logged_out}");
+    assert!(app_js.contains("} else if (message.graph) {\n          lastGraph = message.graph;"));
+    // The frame: a link to the graph, and the container the graph draws in.
+    assert!(INDEX_HTML.contains(r##"<a href="/#/graph" data-screen="graph">Graph</a>"##));
+    assert!(INDEX_HTML.contains(r#"<section id="view" class="view" hidden></section>"#));
+    assert!(INDEX_HTML.contains(r#"<section id="ticket" class="ticket" hidden></section>"#));
+}
+
+#[test]
+fn the_layer_switch_is_kept_by_the_browser_and_the_project_switch_filters_the_graph() {
+    let app_js = lf(APP_JS);
+    assert!(app_js.contains(r#"const LAYER_KEY = "owlshift.graph.layer";"#));
+    // The layer is read from, and written to, the page's storage helpers.
+    let layer = block(&app_js, "function graphLayer() {", "");
+    assert!(layer.contains("stored(LAYER_KEY)"), "{layer}");
+    assert!(layer.contains(r#""blockers" ? "blockers" : "live""#));
+    let open = block(&app_js, "function openGraph() {", "");
+    assert!(
+        open.contains("store(LAYER_KEY, name);\n      drawGraph();"),
+        "{open}"
+    );
+    assert!(open.contains("\"Live waits\"") && open.contains("\"Blockers\""));
+    // The graph draws the projects the header's switch chose, again when it
+    // is changed.
+    let draw = block(&app_js, "function drawGraph() {", "");
+    assert!(
+        draw.contains(r#"document.getElementById("project").value"#),
+        "{draw}"
+    );
+    assert!(draw.contains("!chosen || project.repository === chosen"));
+    assert!(draw.contains("aria-pressed"));
+    let start = block(&app_js, "async function start() {", "");
+    assert!(start.contains("store(PROJECT_KEY, project.value || null);"));
+    assert!(
+        start.contains("    renderHome();\n    drawGraph();\n"),
+        "{start}"
+    );
+}
+
+#[test]
+fn a_node_opens_its_ticket_and_every_text_of_the_graph_goes_through_text() {
+    let app_js = lf(APP_JS);
+    // A node is a link to the ticket page's route, its parts encoded, so a
+    // click, Enter and a middle click work; only a ticket's own node is one.
+    let href = block(&app_js, "function ticketHref(repository, ticket) {", "");
+    assert!(
+        href.contains(r##"return "#/ticket/" + parts.join("/")"##),
+        "{href}"
+    );
+    assert!(
+        href.contains("encodeURIComponent(part)") && href.contains("encodeURIComponent(ticket)")
+    );
+    let node = block(&app_js, "function drawNode(svg, node, repository) {", "");
+    assert!(
+        node.contains(r#"svgEl("a", { href: ticketHref(repository, node.id) })"#),
+        "{node}"
+    );
+    assert!(node.contains("node.kind === \"ticket\" && !node.person && TICKET_ID.test(node.id)"));
+    // The ticket page reads the route the graph links to: owner, repository
+    // and ticket.
+    assert!(app_js.contains("parts.length !== 3"));
+    // Texts are set as text and colours come from classes: nothing the
+    // graph draws is a style attribute or markup.
+    assert!(!APP_JS.contains(r#"setAttribute("style""#));
+    assert!(!APP_JS.contains(".style."));
+    let svg = block(&app_js, "function svgEl(tag, attributes, value) {", "");
+    assert!(svg.contains("text(el, value);"), "{svg}");
+    // The classes of a node: its state and, for a ghost, its blocker's.
+    assert!(app_js.contains(r#"classes.push("node-" + node.state);"#));
+    assert!(app_js.contains(r#"classes.push("ghost-" + node.blocker_state);"#));
+}
+
+#[test]
+fn each_state_the_server_sends_has_its_colour_and_each_ghost_its_own() {
+    use owlshift_runner::ui::graph::{BLOCKER_STATES, NODE_STATES};
+    // The rules are the sheet's with its comments stripped: a rule inside a
+    // comment colours nothing.
+    let rules = style_rules(APP_CSS);
+    let declarations = |selector: &str| -> Vec<(String, String)> {
+        rules
+            .iter()
+            .filter(|(s, _)| s == selector)
+            .flat_map(|(_, d)| d.clone())
+            .collect()
+    };
+    let value = |selector: &str, name: &str| -> Option<String> {
+        declarations(selector)
+            .into_iter()
+            .find(|(n, _)| n == name)
+            .map(|(_, v)| v)
+    };
+    for state in NODE_STATES {
+        let rule = value(&format!(".node-{state}"), "color");
+        assert!(
+            rule.as_deref().is_some_and(|v| v.starts_with("var(--")),
+            "{state}: {rule:?}"
+        );
+    }
+    for state in BLOCKER_STATES {
+        let rule = value(&format!(".ghost-{state}"), "color");
+        assert!(
+            rule.as_deref().is_some_and(|v| v.starts_with("var(--")),
+            "{state}: {rule:?}"
+        );
+    }
+    // The states the ticket names apart do not merge a zone collision with
+    // a usage limit: the decider's and the usage limit's share a role, as the
+    // ticket groups them, and no other two of those six do.
+    let role = |state: &str| {
+        value(&format!(".node-{state}"), "color")
+            .unwrap()
+            .strip_prefix("var(--")
+            .and_then(|rest| rest.strip_suffix(')'))
+            .unwrap()
+            .to_owned()
+    };
+    let named = [
+        "running",
+        "resource",
+        "ticket",
+        "slot",
+        "decider",
+        "usage_limit",
+    ];
+    for (i, a) in named.iter().enumerate() {
+        for b in &named[i + 1..] {
+            let together = [*a, *b] == ["decider", "usage_limit"];
+            assert_eq!(role(a) == role(b), together, "{a} and {b}");
+        }
+    }
+    // A ghost is dashed, and a shape takes its colour from its group's.
+    assert!(value(".node-ghost .node-box", "stroke-dasharray").is_some());
+    assert_eq!(value(".node-box", "fill").as_deref(), Some("currentColor"));
+    assert_eq!(
+        value(".node-box", "stroke").as_deref(),
+        Some("currentColor")
+    );
+    // An edge is stroked, not filled.
+    assert_eq!(value(".edge-line", "fill").as_deref(), Some("none"));
+    assert!(value(".edge-line", "stroke").is_some());
+    // Both are in the audited sheet: a colour outside the themes, a pair
+    // outside the contrast table, would fail `audit`.
+    audit(APP_CSS).unwrap();
+}
+
+/// What `owlshift` serialises of a graph with a node, an edge, a queue and a
+/// blockers layer: the keys a page may read.
+fn sample_graph() -> Value {
+    use owlshift_contracts::waits::{
+        Behind, ProjectWaits, RefStatus, RunSlots, StatusWaits, TicketWaits, Wait,
+    };
+    use owlshift_runner::ui::graph::{self, ReadyInput};
+    let ticket = |name: &str, wait: Option<Wait>| TicketWaits {
+        ticket: TicketId::new(name).unwrap(),
+        stage: None,
+        ref_status: RefStatus::Active,
+        holds_capacity: true,
+        run: None,
+        waits: wait,
+    };
+    let wait = |reason: &str| Wait {
+        reason: reason.to_owned(),
+        since: None,
+        behind: vec![Behind::Ticket {
+            id: TicketId::new("DEMO-1").unwrap(),
+            person: false,
+        }],
+        resource: None,
+        harness: None,
+        until: None,
+        text: reason.to_owned(),
+    };
+    let waits = StatusWaits {
+        format: Format,
+        at: Timestamp::now(),
+        machine_pause: None,
+        runs: Some(RunSlots { in_use: 0, of: 2 }),
+        projects: vec![ProjectWaits {
+            repository: "o/r".to_owned(),
+            served: true,
+            max_in_flight: Some(1),
+            in_flight: 1,
+            paused: None,
+            quarantined: false,
+            tickets: vec![
+                ticket("DEMO-1", None),
+                ticket("DEMO-2", Some(wait("blocked_by"))),
+                ticket("DEMO-3", Some(wait("slot"))),
+            ],
+        }],
+        notes: Vec::new(),
+    };
+    let ready = std::collections::BTreeMap::from([(
+        "o/r".to_owned(),
+        ReadyInput::Read {
+            snapshot: ReadySnapshot {
+                format: Format,
+                at: Timestamp::now(),
+                interval_ms: 1000,
+                tickets: Vec::new(),
+            },
+            stale: false,
+        },
+    )]);
+    serde_json::to_value(graph::of(&waits, &ready)).unwrap()
+}
+
+/// The names the script reads off `prefix` (`node.`) in `source`.
+fn read_keys(source: &str, prefix: &str) -> std::collections::BTreeSet<String> {
+    let mut keys = std::collections::BTreeSet::new();
+    for (at, _) in source.match_indices(prefix) {
+        let before = source[..at].chars().next_back();
+        if before.is_some_and(|c| c.is_ascii_alphanumeric() || c == '_' || c == '.') {
+            continue;
+        }
+        let key: String = source[at + prefix.len()..]
+            .chars()
+            .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+            .collect();
+        if !key.is_empty() {
+            keys.insert(key);
+        }
+    }
+    keys
+}
+
+/// The page never reads a key the server does not send: a missing one is
+/// `undefined`, which the drawing would show as such.
+#[test]
+fn the_graph_page_reads_only_keys_the_server_sends() {
+    let graph = sample_graph();
+    let project = &graph["projects"][0];
+    let drawing = {
+        let start = APP_JS.find("// The drain's graph (OWL-460)").unwrap();
+        let end = APP_JS.find("async function start() {").unwrap();
+        &APP_JS[start..end]
+    };
+    let keys = |value: &Value| -> std::collections::BTreeSet<String> {
+        value.as_object().unwrap().keys().cloned().collect()
+    };
+    for (prefix, sent) in [
+        ("node.", keys(&project["live"]["nodes"][0])),
+        ("project.", keys(project)),
+        ("lastGraph.", keys(&graph)),
+        ("layer.", keys(&project["live"])),
+        ("entry.", keys(&project["queue"][0])),
+        ("edge.", keys(&project["live"]["edges"][0])),
+        ("project.ready.", keys(&project["ready"])),
+    ] {
+        for key in read_keys(drawing, prefix) {
+            // `entry.since` and the like are read; `node.layer` is a key;
+            // methods are not keys.
+            if matches!(key.as_str(), "length" | "push" | "slice") {
+                continue;
+            }
+            assert!(sent.contains(&key), "{prefix}{key} is not sent: {sent:?}");
+        }
+    }
+    // The run a node holds, and the machine's pause.
+    assert!(project["live"]["nodes"][0].get("run").is_some());
+    for key in read_keys(drawing, "node.run.") {
+        assert!(["slot", "pid", "since"].contains(&key.as_str()), "{key}");
+    }
 }
