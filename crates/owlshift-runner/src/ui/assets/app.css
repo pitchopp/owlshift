@@ -377,6 +377,53 @@ pre {
   font-style: italic;
 }
 
+/* The reply form (OWL-475). */
+.reply {
+  border-left: 3px solid var(--border-strong);
+  margin: 8px 0;
+  padding-left: 10px;
+}
+
+.reply-question {
+  border: 0;
+  margin: 6px 0;
+  padding: 0;
+}
+
+.reply-choice {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+}
+
+.reply-text {
+  display: block;
+  width: 100%;
+  box-sizing: border-box;
+  margin-top: 4px;
+}
+
+.reply-actions {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  margin-top: 8px;
+}
+
+.reply-send {
+  background: var(--action-fill);
+  color: var(--action-text);
+  border: 1px solid var(--border-strong);
+  border-radius: 4px;
+  padding: 2px 12px;
+  font: inherit;
+  cursor: pointer;
+}
+
+.reply-send:disabled {
+  cursor: progress;
+}
+
 .diff-added,
 .diff-removed {
   background: var(--raised);

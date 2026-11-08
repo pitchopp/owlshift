@@ -1,6 +1,8 @@
 //! The Writer: the only component that writes to the tracker and the forge
 //! (architecture section 5, step 4). It asks the policy floor before each
-//! write ([`floor::check_action`]).
+//! write, under the origin it writes for ([`floor::check_from`]): the
+//! runner, or the local web UI, whose one write is the decider's own reply
+//! ([`Writer::post_decider_reply`]).
 //!
 //! A delivery has three writes, made by `owlshift do` and `owlshift continue`
 //! once a Build run is done and the runner's own run of the project gate
@@ -57,11 +59,14 @@ use owlshift_adapters::forge::push::{
 use owlshift_adapters::forge::{
     self, Branch, CheckSet, CheckState, CommitId, Mergeable, PrState, PullRequest, Verdict,
 };
+use owlshift_adapters::tracker::linear::KeyAccount;
 use owlshift_adapters::tracker::{
     Capability, Comment, Document, Error as TrackerError, ErrorKind, Filed, MAX_DOCUMENT_CHARS,
     PROPOSED_LABEL, Proposal, Tracker,
 };
-use owlshift_contracts::comment::{Footer, HEADER_SEPARATOR, Header, MarkedComment, MarkerKind};
+use owlshift_contracts::comment::{
+    FOOTER_OPEN, Footer, HEADER_PREFIX, HEADER_SEPARATOR, Header, MarkedComment, MarkerKind,
+};
 use owlshift_contracts::config::States;
 use owlshift_contracts::drain::{DependencyOutcome, KeptDependency, ProposalOutcome};
 use owlshift_contracts::format::Format;
@@ -76,7 +81,9 @@ use owlshift_contracts::review::{
     RulingOutcome, Severity,
 };
 use owlshift_contracts::{BasisKind, DelegationLevel};
-use owlshift_core::floor::{self, Action, FloorViolation, HumanApproval, MergeGrant};
+use owlshift_core::floor::{
+    self, Action, FloorViolation, HumanApproval, MergeGrant, Origin, ReplyFacts,
+};
 use owlshift_core::follow::MERGE_LABEL;
 use owlshift_core::gate::BudgetReached;
 use owlshift_core::state::{Event, MAX_FIX_PASSES, MAX_REASKS, MAX_REPAIRS, ParkReason, Status};
@@ -3862,10 +3869,20 @@ impl WaitComment {
 }
 
 /// Writes to the tracker, and later to the forge, after asking the floor.
+///
+/// A Writer writes for the runner ([`Writer::new`]) or for the local web UI
+/// ([`Writer::for_ui`], architecture section 5, "Replies from the UI"). Each
+/// public write asks the floor under that origin before it reaches the
+/// tracker, the forge or git, so a UI Writer refuses every one but
+/// [`Writer::post_decider_reply`], before any call.
 pub struct Writer<'a> {
     tracker: &'a dyn Tracker,
     /// The account the comments that wait for a person mention.
     decider: Option<String>,
+    /// Whom it writes for.
+    origin: Origin,
+    /// The account of the key a UI Writer posts through.
+    key: Option<KeyAccount>,
 }
 
 impl<'a> Writer<'a> {
@@ -3873,6 +3890,20 @@ impl<'a> Writer<'a> {
         Self {
             tracker,
             decider: None,
+            origin: Origin::Runner,
+            key: None,
+        }
+    }
+
+    /// The local web UI's Writer, posting through `tracker`, the adapter of
+    /// the operator's own key, whose account is `key`. Its one write is
+    /// [`Self::post_decider_reply`]; the floor refuses every other.
+    pub fn for_ui(tracker: &'a dyn Tracker, key: &KeyAccount) -> Self {
+        Self {
+            tracker,
+            decider: None,
+            origin: Origin::Ui,
+            key: Some(key.clone()),
         }
     }
 
@@ -3911,7 +3942,7 @@ impl<'a> Writer<'a> {
         commit: &CommitId,
         branch: &Branch,
     ) -> Result<Pushed, WriteError> {
-        floor::check_action(Action::PushBranch, HumanApproval::Absent)
+        self.check(Action::PushBranch, HumanApproval::Absent)
             .map_err(WriteError::Floor)?;
         // The adapter builds the push; the runner's git runs it, so a test
         // bench's hermetic setup applies to the push too.
@@ -3936,7 +3967,7 @@ impl<'a> Writer<'a> {
         branch: &Branch,
         lease: &CommitId,
     ) -> Result<Pushed, WriteError> {
-        floor::check_action(Action::PushBranch, HumanApproval::Absent)
+        self.check(Action::PushBranch, HumanApproval::Absent)
             .map_err(WriteError::Floor)?;
         let descends = git
             .output(
@@ -3982,7 +4013,7 @@ impl<'a> Writer<'a> {
         lease: &CommitId,
         onto: &CommitId,
     ) -> Result<Pushed, WriteError> {
-        floor::check_action(Action::PushBranch, HumanApproval::Absent)
+        self.check(Action::PushBranch, HumanApproval::Absent)
             .map_err(WriteError::Floor)?;
         rebase_keeps_delivery(git, checkout, lease, onto, commit).map_err(push_failed)?;
         let command =
@@ -4003,7 +4034,7 @@ impl<'a> Writer<'a> {
         title: &str,
         body: &str,
     ) -> Result<OpenedPullRequest, WriteError> {
-        floor::check_action(Action::OpenPullRequest, HumanApproval::Absent)
+        self.check(Action::OpenPullRequest, HumanApproval::Absent)
             .map_err(WriteError::Floor)?;
         if let Some(pull_request) = forge
             .find_open_pull_request(head, base)
@@ -4045,7 +4076,8 @@ impl<'a> Writer<'a> {
 
     /// [`Self::post_delivery_report`], saying whether it posted.
     fn report_once(&self, report: &DeliveryReport) -> Result<Reported, WriteError> {
-        floor::check_action(Action::Comment, HumanApproval::Absent).map_err(WriteError::Floor)?;
+        self.check(Action::Comment, HumanApproval::Absent)
+            .map_err(WriteError::Floor)?;
         let (lead, pull_request) = report.lead_lines();
         let second = report.second_line();
         let summary_note = cut_note(SUMMARY_CUT);
@@ -4099,7 +4131,7 @@ impl<'a> Writer<'a> {
         number: u64,
         grant: &MergeGrant,
     ) -> Result<forge::MergeAnswer, WriteError> {
-        floor::check_action(Action::Merge(Some(grant.clone())), HumanApproval::Absent)
+        self.check(Action::Merge(Some(grant.clone())), HumanApproval::Absent)
             .map_err(WriteError::Floor)?;
         let head = CommitId::new(grant.head()).map_err(WriteError::Forge)?;
         forge
@@ -4112,7 +4144,8 @@ impl<'a> Writer<'a> {
     /// returned and nothing is posted, so a merge told before a crash is
     /// never told again.
     pub fn post_merged(&self, comment: &MergedComment) -> Result<Reported, WriteError> {
-        floor::check_action(Action::Comment, HumanApproval::Absent).map_err(WriteError::Floor)?;
+        self.check(Action::Comment, HumanApproval::Absent)
+            .map_err(WriteError::Floor)?;
         let line = comment.pull_request_line();
         let merged = |body: &str| {
             matches!(
@@ -4153,7 +4186,7 @@ impl<'a> Writer<'a> {
         ready: &str,
         admission_label: Option<&str>,
     ) -> Result<Filed, WriteError> {
-        floor::check_action(Action::ProposeFollowup, HumanApproval::Absent)
+        self.check(Action::ProposeFollowup, HumanApproval::Absent)
             .map_err(WriteError::Floor)?;
         floor::check_proposal(admission_label, PROPOSED_LABEL).map_err(WriteError::Floor)?;
         let (title, description) = (proposal.title(), proposal.render());
@@ -4185,6 +4218,13 @@ impl<'a> Writer<'a> {
     /// caller to warn of, and the command goes on.
     pub fn fold(&self, ticket: &TicketId, posted: &Comment) -> Folded {
         let mut folded = Folded::default();
+        if let Err(violation) = self.check(Action::Comment, HumanApproval::Absent) {
+            folded.failed.push(Unfolded {
+                comment: None,
+                reason: format!("refused by the policy floor: {violation}"),
+            });
+            return folded;
+        }
         if !self
             .tracker
             .capabilities()
@@ -4195,10 +4235,6 @@ impl<'a> Writer<'a> {
         let mut fail = |comment: Option<String>, reason: String| {
             folded.failed.push(Unfolded { comment, reason });
         };
-        if let Err(violation) = floor::check_action(Action::Comment, HumanApproval::Absent) {
-            fail(None, format!("refused by the policy floor: {violation}"));
-            return folded;
-        }
         let comments = match self.tracker.comments(ticket) {
             Ok(comments) => comments,
             Err(error) => {
@@ -4243,6 +4279,8 @@ impl<'a> Writer<'a> {
     /// On a tracker that reads reactions ([`Capability::Reactions`]), a
     /// round a thumbs-up answers says so in its answer line (OWL-371).
     pub fn post_questions(&self, comment: &QuestionsComment) -> Result<Posted, WriteError> {
+        self.check(Action::Comment, HumanApproval::Absent)
+            .map_err(WriteError::Floor)?;
         let (mention, mention_dropped) = self.mention();
         let thumbs_up = self.tracker.capabilities().contains(&Capability::Reactions)
             && crate::answer_check::answerable_by_thumbs_up(&comment.questions);
@@ -4289,7 +4327,8 @@ impl<'a> Writer<'a> {
         existing: Option<&str>,
         decisions: &DecisionsDocument,
     ) -> Result<Document, WriteError> {
-        floor::check_action(Action::Document, HumanApproval::Absent).map_err(WriteError::Floor)?;
+        self.check(Action::Document, HumanApproval::Absent)
+            .map_err(WriteError::Floor)?;
         let (title, content) = (decisions.title(), decisions.render());
         let publish = |existing| {
             self.tracker
@@ -4338,7 +4377,8 @@ impl<'a> Writer<'a> {
         document: Option<&str>,
         plan: &PlanDocument,
     ) -> Result<Document, WriteError> {
-        floor::check_action(Action::Document, HumanApproval::Absent).map_err(WriteError::Floor)?;
+        self.check(Action::Document, HumanApproval::Absent)
+            .map_err(WriteError::Floor)?;
         self.tracker
             .publish_document(&plan.ticket, document, &plan.title(), &plan.render())
             .map_err(WriteError::Tracker)
@@ -4379,6 +4419,8 @@ impl<'a> Writer<'a> {
     /// the tracker shows it folded (OWL-419): `Ok(false)` from a tracker
     /// without [`Capability::FoldComments`], which is asked nothing.
     pub fn resolve_wait(&self, comment: &str) -> Result<bool, WriteError> {
+        self.check(Action::Comment, HumanApproval::Absent)
+            .map_err(WriteError::Floor)?;
         if !self
             .tracker
             .capabilities()
@@ -4386,7 +4428,6 @@ impl<'a> Writer<'a> {
         {
             return Ok(false);
         }
-        floor::check_action(Action::Comment, HumanApproval::Absent).map_err(WriteError::Floor)?;
         self.tracker
             .resolve_comment(comment)
             .map_err(WriteError::Tracker)?;
@@ -4401,7 +4442,7 @@ impl<'a> Writer<'a> {
         stage: VisibleStage,
         states: &'s States,
     ) -> Result<&'s str, WriteError> {
-        floor::check_action(Action::SetVisibleStage, HumanApproval::Absent)
+        self.check(Action::SetVisibleStage, HumanApproval::Absent)
             .map_err(WriteError::Floor)?;
         let state = stage.state(states);
         self.tracker
@@ -4413,14 +4454,52 @@ impl<'a> Writer<'a> {
     /// Writes that `blocker` blocks `blocked`: a dependency intake found
     /// (OWL-249, architecture section 5, "Dependencies to relations").
     pub fn relate(&self, blocker: &TicketId, blocked: &TicketId) -> Result<(), WriteError> {
-        floor::check_action(Action::Relate, HumanApproval::Absent).map_err(WriteError::Floor)?;
+        self.check(Action::Relate, HumanApproval::Absent)
+            .map_err(WriteError::Floor)?;
         self.tracker
             .block(blocker, blocked)
             .map_err(WriteError::Tracker)
     }
 
+    /// Posts `body` on `ticket` as written, through the key of a UI Writer:
+    /// the decider's own reply to the ticket's open ask, whose decider's
+    /// account is `open_ask_decider` (`None` when the ticket waits for no
+    /// answer). The floor allows it only from the UI, for a body that
+    /// carries none of Owlshift's markers ([`carries_marker`]), through a
+    /// key that is no app's, whose account is that decider; refused, nothing
+    /// is asked of the tracker. Unlike [`Self::post_reply`], the runner's
+    /// marked REPLY, it adds nothing to the body.
+    pub fn post_decider_reply(
+        &self,
+        ticket: &TicketId,
+        body: &str,
+        open_ask_decider: Option<&str>,
+    ) -> Result<Comment, WriteError> {
+        let facts = ReplyFacts {
+            marked: carries_marker(body),
+            key_account: self
+                .key
+                .as_ref()
+                .map(|key| key.id.clone())
+                .unwrap_or_default(),
+            key_is_app: self.key.as_ref().is_some_and(|key| key.app),
+            open_ask_decider: open_ask_decider.map(str::to_owned),
+        };
+        self.check(Action::Reply(facts), HumanApproval::Absent)
+            .map_err(WriteError::Floor)?;
+        self.tracker
+            .post_comment(ticket, body)
+            .map_err(WriteError::Tracker)
+    }
+
+    /// The floor's answer to `action` under this Writer's origin.
+    fn check(&self, action: Action, approval: HumanApproval) -> Result<(), FloorViolation> {
+        floor::check_from(self.origin, action, approval)
+    }
+
     fn post(&self, ticket: &TicketId, body: &str) -> Result<Comment, WriteError> {
-        floor::check_action(Action::Comment, HumanApproval::Absent).map_err(WriteError::Floor)?;
+        self.check(Action::Comment, HumanApproval::Absent)
+            .map_err(WriteError::Floor)?;
         self.tracker
             .post_comment(ticket, body)
             .map_err(WriteError::Tracker)
@@ -4435,6 +4514,8 @@ impl<'a> Writer<'a> {
         ticket: &TicketId,
         render: impl FnOnce(usize) -> String,
     ) -> Result<Posted, WriteError> {
+        self.check(Action::Comment, HumanApproval::Absent)
+            .map_err(WriteError::Floor)?;
         let (mention, mention_dropped) = self.mention();
         let body = with_mention(render(room_beside(mention.as_deref())), mention.as_deref());
         let comment = self.post(ticket, &body)?;
@@ -4479,6 +4560,20 @@ fn with_mention(body: String, mention: Option<&str>) -> String {
         }
         _ => body,
     }
+}
+
+/// Whether `body` carries any of Owlshift's markers, in the strict reading
+/// a reply from the UI is held to: a body [`MarkedComment::parse`] reads as
+/// marked or as malformed-marked, a line that starts, past its leading
+/// whitespace, with `[owlshift]`, or a footer's opening anywhere. A reply
+/// the answer check could take for the runner's own comment is never posted
+/// in the decider's name.
+pub fn carries_marker(body: &str) -> bool {
+    !matches!(MarkedComment::parse(body), Ok(None))
+        || body
+            .lines()
+            .any(|line| line.trim_start().starts_with(HEADER_PREFIX.trim_end()))
+        || body.contains(FOOTER_OPEN)
 }
 
 /// Whether a comment is a delivery report. A malformed marker is someone
@@ -4669,6 +4764,7 @@ mod tests {
     use owlshift_contracts::result::{FollowupSource, QuestionOption, Recommendation};
 
     use owlshift_contracts::ids::FindingId;
+    use owlshift_core::floor::ReplyRefusal;
 
     use super::*;
 
@@ -8262,5 +8358,668 @@ Reply `Q1: B`, `ok` to take every recommendation, or in your own words.
             folded.failed[0].reason.contains("is not among"),
             "{folded:?}"
         );
+    }
+    /// A tracker that counts every call, of every method of [`Tracker`],
+    /// and answers each with an error but its capabilities, which name every
+    /// path a write may take: a UI Writer must ask it nothing.
+    #[derive(Default)]
+    struct Counting {
+        calls: Cell<usize>,
+        posted: RefCell<Vec<String>>,
+        /// Posts go through, recorded, when set.
+        accepts_posts: Cell<bool>,
+    }
+
+    impl Counting {
+        fn call<T>(&self) -> Result<T, TrackerError> {
+            self.calls.set(self.calls.get() + 1);
+            Err(TrackerError::new(TrackerErrorKind::Other, "counted"))
+        }
+    }
+
+    impl Tracker for Counting {
+        fn capabilities(&self) -> &'static [Capability] {
+            self.calls.set(self.calls.get() + 1);
+            &[
+                Capability::Comments,
+                Capability::FoldComments,
+                Capability::Reactions,
+                Capability::Documents,
+                Capability::ProposalsInbox,
+            ]
+        }
+        fn ticket(&self, _: &TicketId) -> Result<Ticket, TrackerError> {
+            self.call()
+        }
+        fn comments(&self, _: &TicketId) -> Result<Vec<Comment>, TrackerError> {
+            self.call()
+        }
+        fn post_comment(&self, _: &TicketId, body: &str) -> Result<Comment, TrackerError> {
+            if !self.accepts_posts.get() {
+                return self.call();
+            }
+            self.calls.set(self.calls.get() + 1);
+            self.posted.borrow_mut().push(body.to_owned());
+            Ok(Comment {
+                id: format!("c{}", self.posted.borrow().len()),
+                author: Author::Account(owlshift_adapters::tracker::Person {
+                    id: "u1".to_owned(),
+                    name: "ada".to_owned(),
+                }),
+                created_at: "2026-11-07T12:00:00Z".parse().unwrap(),
+                edited_at: None,
+                body: body.to_owned(),
+                parent: None,
+                reactions: Vec::new(),
+            })
+        }
+        fn set_stage(&self, _: &TicketId, _: &str) -> Result<(), TrackerError> {
+            self.call()
+        }
+        fn stage(&self, _: &TicketId) -> Result<String, TrackerError> {
+            self.call()
+        }
+        fn ticket_url(&self, _: &TicketId) -> Option<String> {
+            self.calls.set(self.calls.get() + 1);
+            None
+        }
+        fn mention(&self, _: &str) -> Result<Option<String>, TrackerError> {
+            self.call()
+        }
+        fn admitted(
+            &self,
+            _: &owlshift_adapters::tracker::Column<'_>,
+        ) -> Result<Vec<owlshift_adapters::tracker::Listed>, TrackerError> {
+            self.call()
+        }
+        fn working(&self, _: Option<&str>, _: &str) -> Result<Vec<Ticket>, TrackerError> {
+            self.call()
+        }
+        fn gesture(
+            &self,
+            _: &TicketId,
+            _: &owlshift_contracts::config::Admit,
+        ) -> Result<owlshift_adapters::tracker::Gesture, TrackerError> {
+            self.call()
+        }
+        fn state_type(
+            &self,
+            _: &TicketId,
+        ) -> Result<Option<owlshift_adapters::tracker::StateType>, TrackerError> {
+            self.call()
+        }
+        fn propose(&self, _: &Proposal<'_>) -> Result<Filed, TrackerError> {
+            self.call()
+        }
+        fn proposed(
+            &self,
+            _: Option<&str>,
+            _: &str,
+            _: &str,
+        ) -> Result<Vec<owlshift_adapters::tracker::Found>, TrackerError> {
+            self.call()
+        }
+        fn relations(
+            &self,
+            _: &TicketId,
+        ) -> Result<owlshift_adapters::tracker::Relations, TrackerError> {
+            self.call()
+        }
+        fn links(&self, _: &TicketId) -> Result<owlshift_adapters::tracker::Links, TrackerError> {
+            self.call()
+        }
+        fn block(&self, _: &TicketId, _: &TicketId) -> Result<(), TrackerError> {
+            self.call()
+        }
+        fn publish_document(
+            &self,
+            _: &TicketId,
+            _: Option<&str>,
+            _: &str,
+            _: &str,
+        ) -> Result<Document, TrackerError> {
+            self.call()
+        }
+        fn resolve_comment(&self, _: &str) -> Result<(), TrackerError> {
+            self.call()
+        }
+    }
+
+    /// The forge's API, counting every request.
+    struct CountingForge(std::sync::Arc<std::sync::atomic::AtomicUsize>);
+
+    impl owlshift_adapters::graphql::Transport for CountingForge {
+        fn send(
+            &self,
+            _: &serde_json::Value,
+        ) -> Result<owlshift_adapters::graphql::Response, String> {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Err("counted".to_owned())
+        }
+        fn get(&self, _: &str) -> Result<owlshift_adapters::graphql::RestAnswer, String> {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Err("counted".to_owned())
+        }
+        fn put(
+            &self,
+            _: &str,
+            _: &serde_json::Value,
+        ) -> Result<owlshift_adapters::graphql::Response, String> {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Err("counted".to_owned())
+        }
+    }
+
+    /// The key of the UI Writer of these tests.
+    fn key(id: &str, app: bool) -> KeyAccount {
+        KeyAccount {
+            id: id.to_owned(),
+            name: "ada".to_owned(),
+            app,
+            workspace: "owlshift".to_owned(),
+        }
+    }
+
+    /// The project's merge on green grant, made the only way one is made.
+    fn grant() -> MergeGrant {
+        use owlshift_core::follow::{
+            Action as FollowAction, Decision as FollowDecision, FirstGreen, GREEN_TWICE_AFTER,
+            MergeDue, MergeFacts, MergePolicy, Mergeable as CoreMergeable, PrState as CorePrState,
+            Read, merge_due,
+        };
+        let gate = owlshift_core::gate::GatePolicy::new(
+            Vec::<String>::new(),
+            owlshift_core::vocab::PlanApproval::Never,
+        );
+        let decision = FollowDecision::Follow {
+            adopt: false,
+            action: FollowAction::Green,
+        };
+        let policy = MergePolicy {
+            switch: MergeSwitch::All,
+            method: MergeMethod::Squash,
+            gate: &gate,
+        };
+        let facts = MergeFacts {
+            decision: &decision,
+            pushed: HEAD,
+            first_green: Some(FirstGreen {
+                head: HEAD,
+                ago: GREEN_TWICE_AFTER,
+            }),
+            base_head: HEAD,
+            base_at_push: Some(HEAD),
+            labeled: true,
+            excluded: false,
+            questions: &[],
+            at_review: true,
+            draft: false,
+            something_due: false,
+        };
+        let read = Read {
+            state: CorePrState::Open,
+            head: HEAD.to_owned(),
+            mergeable: CoreMergeable::Mergeable,
+            checks: Vec::new(),
+        };
+        match merge_due(&policy, &facts, &read) {
+            MergeDue::Merge(grant) => grant,
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// What every write of the refusal table is called with.
+    struct Fixtures {
+        git: Git,
+        git_calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        checkout: tempfile::TempDir,
+        forge: GitHubForge,
+        forge_calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        grant: MergeGrant,
+        branch: Branch,
+        states: States,
+        posted: Comment,
+    }
+
+    impl Fixtures {
+        fn new() -> Self {
+            let git_calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let counted = git_calls.clone();
+            let forge_calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            Self {
+                git: Git::with_setup("git", move |_| {
+                    counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                }),
+                git_calls,
+                checkout: tempfile::tempdir().unwrap(),
+                forge: GitHubForge::with_transport(
+                    CountingForge(forge_calls.clone()),
+                    owlshift_adapters::forge::Repo::parse("o/r").unwrap(),
+                ),
+                forge_calls,
+                grant: grant(),
+                branch: Branch::new("owlshift/owl-18").unwrap(),
+                states: States {
+                    ready: "Todo".to_owned(),
+                    working: "Doing".to_owned(),
+                    needs_input: "Asked".to_owned(),
+                    review: "Review".to_owned(),
+                    parked: None,
+                },
+                posted: Comment {
+                    id: "c0".to_owned(),
+                    author: Author::Other {
+                        name: "owlshift".to_owned(),
+                    },
+                    created_at: "2026-11-07T12:00:00Z".parse().unwrap(),
+                    edited_at: None,
+                    body: String::new(),
+                    parent: None,
+                    reactions: Vec::new(),
+                },
+            }
+        }
+
+        fn checkout(&self) -> &Path {
+            self.checkout.path()
+        }
+    }
+
+    fn pull_request() -> DeliveredPullRequest {
+        DeliveredPullRequest {
+            number: 23,
+            url: URL.to_owned(),
+        }
+    }
+
+    fn intake() -> IntakeComment {
+        IntakeComment {
+            ticket: ticket(),
+            variant: Variant::Standard,
+            routing: Routing {
+                harness: Harness::Claude,
+                tier: Tier::Standard,
+                effort: owlshift_core::vocab::Effort::High,
+            },
+            dependencies: Vec::new(),
+            zones: Vec::new(),
+            resources: Vec::new(),
+            run: None,
+        }
+    }
+
+    fn questions() -> QuestionsComment {
+        QuestionsComment {
+            ticket: ticket(),
+            round: NonZeroU32::new(1).unwrap(),
+            summary: "s".to_owned(),
+            questions: vec![asked("Q1", "Which one?")],
+            premise_false: false,
+            decided: 0,
+            fallback: None,
+            reopened: Vec::new(),
+            notes: Vec::new(),
+        }
+    }
+
+    fn plan_comment() -> PlanComment {
+        PlanComment {
+            ticket: ticket(),
+            plan: plan_of("p"),
+            pass: 1,
+            reviewers: Vec::new(),
+            findings: Vec::new(),
+            earlier: Vec::new(),
+            revision: None,
+            dropped: Vec::new(),
+            next: PlanNext::Approval,
+            run: None,
+        }
+    }
+
+    /// What a write of the refusal table came to.
+    #[derive(Debug)]
+    enum Came {
+        Refused(FloorViolation),
+        Folded(Folded),
+        Other(String),
+    }
+
+    fn came<T: fmt::Debug>(result: Result<T, WriteError>) -> Came {
+        match result {
+            Err(WriteError::Floor(violation)) => Came::Refused(violation),
+            other => Came::Other(format!("{other:?}")),
+        }
+    }
+
+    type Write = fn(&Writer<'_>, &Fixtures) -> Came;
+
+    /// Every public write of the Writer, by name, as a UI Writer would call
+    /// it: the floor must refuse each before any call.
+    const UI_REFUSED_WRITES: &[(&str, Write)] = &[
+        ("push_branch", |w, f| {
+            came(w.push_branch(&f.git, f.checkout(), "origin", &head(), &f.branch))
+        }),
+        ("push_leased", |w, f| {
+            came(w.push_leased(&f.git, f.checkout(), "origin", &head(), &f.branch, &head()))
+        }),
+        ("push_rebased", |w, f| {
+            came(w.push_rebased(
+                &f.git,
+                f.checkout(),
+                "origin",
+                &head(),
+                &f.branch,
+                &head(),
+                &head(),
+            ))
+        }),
+        ("open_pull_request", |w, f| {
+            came(w.open_pull_request(&f.forge, &f.branch, &f.branch, "t", "b"))
+        }),
+        ("post_delivery_report", |w, _| {
+            came(w.post_delivery_report(&report(Ok(set(Mergeable::Mergeable, vec![])))))
+        }),
+        ("merge_pull_request", |w, f| {
+            came(w.merge_pull_request(&f.forge, 23, &f.grant))
+        }),
+        ("post_merged", |w, _| {
+            came(w.post_merged(&MergedComment {
+                ticket: ticket(),
+                pull_request: pull_request(),
+                head: head(),
+                method: MergeMethod::Squash,
+                commit: None,
+            }))
+        }),
+        ("propose", |w, _| {
+            let followup = report(Ok(set(Mergeable::Mergeable, vec![]))).followups[0]
+                .followup
+                .clone();
+            came(w.propose(
+                &ProposalDescription {
+                    parent: ticket(),
+                    pull_request: Some(pull_request()),
+                    run: PushKind::Fix,
+                    followup,
+                    fingerprint: "0123456789ab".to_owned(),
+                },
+                "Todo",
+                None,
+            ))
+        }),
+        ("post_repair_report", |w, _| {
+            came(w.post_repair_report(&report(Ok(set(Mergeable::Mergeable, vec![])))))
+        }),
+        ("fold", |w, f| Came::Folded(w.fold(&ticket(), &f.posted))),
+        ("post_questions", |w, _| {
+            came(w.post_questions(&questions()))
+        }),
+        ("post_decision", |w, _| {
+            came(w.post_decision(&DecisionComment {
+                ticket: ticket(),
+                decisions: Vec::new(),
+                level: DelegationLevel::All,
+                reasoning: Reasoning::Folded,
+                run: None,
+                by: DecidedBy::Resolver,
+            }))
+        }),
+        ("publish_decisions", |w, _| {
+            came(w.publish_decisions(
+                None,
+                &DecisionsDocument {
+                    ticket: ticket(),
+                    level: DelegationLevel::All,
+                    groups: Vec::new(),
+                },
+            ))
+        }),
+        ("post_reask", |w, _| {
+            came(w.post_reask(&ReaskComment {
+                ticket: ticket(),
+                round: NonZeroU32::new(1).unwrap(),
+                reask: 1,
+                open: Vec::new(),
+            }))
+        }),
+        ("post_reply", |w, _| {
+            came(w.post_reply(&ReplyComment {
+                ticket: ticket(),
+                replies: Vec::new(),
+            }))
+        }),
+        ("post_restart_reply", |w, _| {
+            came(w.post_restart_reply(&RestartReplyComment {
+                ticket: ticket(),
+                reason: "r".to_owned(),
+                remedy: "m".to_owned(),
+            }))
+        }),
+        ("post_intake", |w, _| came(w.post_intake(&intake()))),
+        ("post_plan", |w, _| came(w.post_plan(&plan_comment()))),
+        ("publish_plan", |w, _| {
+            came(w.publish_plan(
+                None,
+                &PlanDocument {
+                    ticket: ticket(),
+                    plan: plan_of("p"),
+                    version: 1,
+                    passes: Vec::new(),
+                },
+            ))
+        }),
+        ("post_plan_pointer", |w, _| {
+            came(w.post_plan_pointer(&PlanPointer {
+                ticket: ticket(),
+                version: 1,
+                pass: 1,
+                url: None,
+                change: PlanChange::First,
+                forks: 0,
+                open: 0,
+                next: PlanNext::Approval,
+                run: None,
+            }))
+        }),
+        ("post_resume", |w, _| {
+            came(w.post_resume(&ResumeComment {
+                ticket: ticket(),
+                return_to: Stage::Build,
+                slot_held_by: None,
+                round: NonZeroU32::new(1).unwrap(),
+                understood: Vec::new(),
+            }))
+        }),
+        ("post_parked", |w, _| {
+            came(w.post_parked(&ParkedComment {
+                ticket: ticket(),
+                reason: ParkReason::Blocked,
+                detail: String::new(),
+                round: None,
+                open: Vec::new(),
+                restart: Restart::Do,
+            }))
+        }),
+        ("post_quarantine_wait", |w, _| {
+            came(w.post_quarantine_wait(&crate::quarantine::QuarantineWait {
+                ticket: ticket(),
+                held: crate::quarantine::Held::Ready,
+            }))
+        }),
+        ("post_wait", |w, _| {
+            came(w.post_wait(&WaitComment {
+                ticket: ticket(),
+                phrase: "p".to_owned(),
+            }))
+        }),
+        ("resolve_wait", |w, _| came(w.resolve_wait("c0"))),
+        ("set_stage", |w, f| {
+            came(w.set_stage(&ticket(), VisibleStage::Working, &f.states))
+        }),
+        ("relate", |w, _| {
+            came(w.relate(&ticket(), &TicketId::new("OWL-19").unwrap()))
+        }),
+    ];
+
+    /// A UI Writer refuses each public write but the decider's reply, by
+    /// the floor, before it asks the tracker, the forge or git anything;
+    /// `fold`, which is never an error, says so in its one failure.
+    #[test]
+    fn a_ui_writer_refuses_every_other_write() {
+        assert_eq!(UI_REFUSED_WRITES.len(), 27);
+        for (name, write) in UI_REFUSED_WRITES {
+            let tracker = Counting::default();
+            tracker.accepts_posts.set(true);
+            let fixtures = Fixtures::new();
+            let writer = Writer::for_ui(&tracker, &key("u1", false)).mentioning("u1");
+            match write(&writer, &fixtures) {
+                Came::Refused(FloorViolation::FromUi(_)) => {}
+                Came::Folded(folded) if *name == "fold" => {
+                    assert!(folded.resolved.is_empty(), "{folded:?}");
+                    assert_eq!(folded.failed.len(), 1, "{folded:?}");
+                    assert_eq!(folded.failed[0].comment, None);
+                    assert!(
+                        folded.failed[0].reason.starts_with(
+                            "refused by the policy floor: Comment is refused from the web UI"
+                        ),
+                        "{folded:?}"
+                    );
+                }
+                Came::Refused(violation) => panic!("{name}: refused otherwise: {violation}"),
+                Came::Folded(folded) => panic!("{name}: {folded:?}"),
+                Came::Other(what) => panic!("{name}: not refused: {what}"),
+            }
+            assert_eq!(tracker.calls.get(), 0, "{name} asked the tracker");
+            assert!(tracker.posted.borrow().is_empty(), "{name}");
+            assert_eq!(
+                fixtures
+                    .forge_calls
+                    .load(std::sync::atomic::Ordering::SeqCst),
+                0,
+                "{name} asked the forge"
+            );
+            assert_eq!(
+                fixtures.git_calls.load(std::sync::atomic::Ordering::SeqCst),
+                0,
+                "{name} ran git"
+            );
+        }
+    }
+
+    /// The public methods of the Writer's one inherent block, read from this
+    /// file: each write is in the refusal table, and the table names no
+    /// method that is gone. A public write added later without its entry
+    /// fails here.
+    #[test]
+    fn every_public_writer_method_is_in_the_ui_refusal_table() {
+        // A checkout with CRLF line endings (Windows) reads as one with LF.
+        let source = include_str!("writer.rs").replace("\r\n", "\n");
+        let opening = "impl<'a> Writer<'a> {\n";
+        assert_eq!(source.matches(opening).count(), 1);
+        // No other inherent or trait block of the Writer in this file.
+        let blocks = source
+            .lines()
+            .filter(|line| line.starts_with("impl") && line.contains("Writer<"))
+            .count();
+        assert_eq!(blocks, 1);
+        let start = source.find(opening).unwrap() + opening.len();
+        let end = start + source[start..].find("\n}\n").unwrap();
+        let mut found: Vec<&str> = source[start..end]
+            .lines()
+            .filter_map(|line| line.strip_prefix("    pub fn "))
+            .map(|rest| rest.split(['(', '<']).next().unwrap())
+            .collect();
+        found.sort_unstable();
+        let mut expected: Vec<&str> = UI_REFUSED_WRITES.iter().map(|(name, _)| *name).collect();
+        expected.extend(["new", "mentioning", "for_ui", "post_decider_reply"]);
+        expected.sort_unstable();
+        assert_eq!(found, expected);
+    }
+
+    #[test]
+    fn a_decider_reply_is_posted_once_as_written() {
+        let tracker = Counting::default();
+        tracker.accepts_posts.set(true);
+        let writer = Writer::for_ui(&tracker, &key("u1", false));
+        let body = "Q1: B — only on main\n\ngo";
+        let posted = writer
+            .post_decider_reply(&ticket(), body, Some("u1"))
+            .unwrap();
+        assert_eq!(posted.body, body);
+        assert_eq!(*tracker.posted.borrow(), [body]);
+        assert_eq!(tracker.calls.get(), 1);
+    }
+
+    #[test]
+    fn a_decider_reply_carrying_a_marker_is_refused() {
+        let footer = "<!-- owlshift:{\"format\":1,\"kind\":\"RESUME\",\"ticket\":\"OWL-18\"} -->";
+        for body in [
+            "[owlshift] RESUME · round 1\n\nok".to_owned(),
+            "ok\n  [owlshift] QUESTIONS".to_owned(),
+            format!("ok\n\n{footer}"),
+            format!("ok {footer} go"),
+            "[owlshift] NOT-A-KIND".to_owned(),
+            "[owlshift]".to_owned(),
+        ] {
+            assert!(carries_marker(&body), "{body}");
+            let tracker = Counting::default();
+            tracker.accepts_posts.set(true);
+            let writer = Writer::for_ui(&tracker, &key("u1", false));
+            let refused = writer.post_decider_reply(&ticket(), &body, Some("u1"));
+            assert!(
+                matches!(
+                    refused,
+                    Err(WriteError::Floor(FloorViolation::Reply(
+                        ReplyRefusal::Marked
+                    )))
+                ),
+                "{body}: {refused:?}"
+            );
+            assert_eq!(tracker.calls.get(), 0, "{body}");
+        }
+        for body in [
+            "ok",
+            "Q1: B\n\ngo",
+            "the owlshift README says so",
+            "`[owl]`",
+        ] {
+            assert!(!carries_marker(body), "{body}");
+        }
+    }
+
+    #[test]
+    fn a_decider_reply_to_another_decider_or_no_ask_is_refused() {
+        for (account, app, decider, why) in [
+            ("u1", false, Some("u2"), ReplyRefusal::NotTheDecider),
+            ("u1", false, None, ReplyRefusal::NoOpenAsk),
+            ("", false, Some(""), ReplyRefusal::NotTheDecider),
+            ("u1", true, Some("u1"), ReplyRefusal::AppKey),
+        ] {
+            let tracker = Counting::default();
+            tracker.accepts_posts.set(true);
+            let writer = Writer::for_ui(&tracker, &key(account, app));
+            let refused = writer.post_decider_reply(&ticket(), "ok", decider);
+            assert!(
+                matches!(&refused, Err(WriteError::Floor(FloorViolation::Reply(r))) if *r == why),
+                "{account} {decider:?}: {refused:?}"
+            );
+            assert_eq!(tracker.calls.get(), 0);
+        }
+    }
+
+    #[test]
+    fn a_runner_writer_refuses_a_decider_reply() {
+        let tracker = Counting::default();
+        tracker.accepts_posts.set(true);
+        let refused = Writer::new(&tracker).post_decider_reply(&ticket(), "ok", Some("u1"));
+        assert!(
+            matches!(
+                refused,
+                Err(WriteError::Floor(FloorViolation::ReplyNotFromUi))
+            ),
+            "{refused:?}"
+        );
+        assert_eq!(tracker.calls.get(), 0);
     }
 }

@@ -16,7 +16,9 @@
 //!   event names it) and how big and how old its log is;
 //! - `cost`: the ticket's spend since its last restart against
 //!   `policy.ticket_budget_usd` of the project file the project is served on;
-//! - `questions`: the asks and the decisions of `questions.json`;
+//! - `questions`: the asks and the decisions of `questions.json`, and
+//!   `reply`, the reply form of the open ask, offered when the operator's
+//!   tracker key is its decider's ([`super::reply::section`], OWL-475);
 //! - `plan`: the current plan, the distinct plans of the history with each
 //!   one's diff against the one before, per part, and the review passes;
 //! - `waits`: what the ticket waits on, as `owlshift status --waits` tells it.
@@ -41,6 +43,7 @@ use owlshift_contracts::review::{Plan, PlanPart};
 use serde_json::{Map, Value, json};
 
 use super::events::Reader;
+use super::reply::{self, KeyState};
 use crate::executor::Git;
 use crate::project::ProjectDirs;
 use crate::ticket_ref::{self, Commits, Revision, TicketRecord};
@@ -102,6 +105,8 @@ pub struct Inputs<'a> {
     /// The machine's run slots, for the waits.
     pub concurrent_runs: u32,
     pub now: Timestamp,
+    /// The project's tracker key, for the reply form (OWL-475).
+    pub key: &'a KeyState,
 }
 
 /// Whether `text` is a run's folder name, as `new_run_dir` makes it:
@@ -164,7 +169,7 @@ pub fn snapshot(inputs: &Inputs, repo: &Repo, ticket: &TicketId) -> Value {
         "timeline": timeline,
         "runs": section(runs(inputs, repo, &dirs, ticket)),
         "cost": on_record(&|record| cost(&dirs, record)),
-        "questions": on_record(&|record| questions(record)),
+        "questions": on_record(&|record| questions(record, inputs.key, ticket)),
         "plan": plan,
         "waits": section(waits(inputs, repo, ticket)),
     })
@@ -482,33 +487,27 @@ fn usd(micros: u64) -> f64 {
     micros as f64 / 1_000_000.0
 }
 
+/// The project file the project of `dirs` is served on, as it was kept, or
+/// why there is none to read: what the ticket's budget and the reply's key
+/// ([`super::reply::open_key`]) are read from.
+pub(crate) fn served_config(dirs: &ProjectDirs) -> Result<ProjectConfig, String> {
+    let kept = match served::read_record(dirs) {
+        Err(why) => return Err(format!("the served project file is unreadable: {why}")),
+        Ok(record) => record.and_then(|record| record.kept),
+    };
+    let Some(kept) = kept else {
+        return Err("no project file is kept for this project yet".into());
+    };
+    ProjectConfig::parse(&kept.text)
+        .map_err(|error| format!("the project file it is served on does not read: {error}"))
+}
+
 /// The ticket's budget in micro-dollars, from the project file the project
 /// is served on, and a note when there is none to read.
 fn budget(dirs: &ProjectDirs) -> (Option<u64>, Option<String>) {
-    match served::read_record(dirs) {
-        Err(why) => (
-            None,
-            Some(format!("the served project file is unreadable: {why}")),
-        ),
-        Ok(None) => (
-            None,
-            Some("no project file is kept for this project yet".into()),
-        ),
-        Ok(Some(record)) => match record.kept {
-            None => (
-                None,
-                Some("no project file is kept for this project yet".into()),
-            ),
-            Some(kept) => match ProjectConfig::parse(&kept.text) {
-                Ok(config) => (config.policy.ticket_budget_micros(), None),
-                Err(error) => (
-                    None,
-                    Some(format!(
-                        "the project file it is served on does not read: {error}"
-                    )),
-                ),
-            },
-        },
+    match served_config(dirs) {
+        Ok(config) => (config.policy.ticket_budget_micros(), None),
+        Err(note) => (None, Some(note)),
     }
 }
 
@@ -536,11 +535,13 @@ fn cost(dirs: &ProjectDirs, record: &TicketRecord) -> Value {
     })
 }
 
-/// The asks and the decisions of the ticket.
-fn questions(record: &TicketRecord) -> Value {
+/// The asks and the decisions of the ticket, and the reply form of its
+/// open ask, null when it waits for no answer.
+fn questions(record: &TicketRecord, key: &KeyState, ticket: &TicketId) -> Value {
     json!({
         "asks": as_json!(&record.questions.asks),
         "decisions": as_json!(&record.questions.decisions),
+        "reply": reply::section(record, key, ticket),
     })
 }
 
@@ -840,6 +841,11 @@ mod tests {
         }
 
         fn snapshot(&self, ticket: &str) -> Value {
+            self.snapshot_with(ticket, &KeyState::Unavailable("no key on the bench".into()))
+        }
+
+        /// The snapshot with the project's key `key`.
+        fn snapshot_with(&self, ticket: &str, key: &KeyState) -> Value {
             let inputs = Inputs {
                 data: self.data.path(),
                 git: &self.git,
@@ -847,6 +853,7 @@ mod tests {
                 cache: &self.cache,
                 concurrent_runs: 2,
                 now: Timestamp::now(),
+                key,
             };
             snapshot(&inputs, &self.repo, &TicketId::new(ticket).unwrap())
         }
@@ -1054,6 +1061,88 @@ mod tests {
             decision["question"]["recommendation"]["why"],
             "because it is safer"
         );
+    }
+
+    /// The questions section carries the reply form of the open ask: not
+    /// offered without a key, offered to the ask's decider, and null for a
+    /// ticket that waits for no answer.
+    #[test]
+    fn the_reply_form_is_the_open_asks() {
+        let bench = busy();
+        let reply = &bench.snapshot("OWL-1")["questions"]["reply"];
+        assert_eq!(reply["offered"], false);
+        assert_eq!(reply["approval"], false);
+        assert!(reply["link"].is_null());
+        assert_eq!(reply["decider"]["account"], "maintainer");
+        let snap = bench.snapshot_with("OWL-1", &reply::tests::ready("maintainer"));
+        let reply = &snap["questions"]["reply"];
+        assert_eq!(reply["offered"], true, "{reply:#}");
+        assert_eq!(reply["ask"], "c1");
+        let quiet = Bench::new(Some(BUDGET_FILE));
+        quiet.write("OWL-1", &record(Stage::Build), None);
+        let snap = quiet.snapshot_with("OWL-1", &reply::tests::ready("maintainer"));
+        assert!(snap["questions"]["reply"].is_null());
+    }
+
+    /// A ticket waiting on its plan's approval: the approval question is the
+    /// open ask, and the plan section holds the plan and its diff with the
+    /// plan before, which the page draws the form beside.
+    #[test]
+    fn an_approval_ask_is_offered_beside_the_plan_and_its_diff() {
+        use owlshift_contracts::review::Fork;
+        let fork = Fork {
+            choice: "Markdown".to_owned(),
+            options: vec!["Markdown".to_owned(), "Plain text".to_owned()],
+            reason: "R".to_owned(),
+        };
+        let approval = |with_document: bool, plans: usize| {
+            let bench = Bench::new(Some(BUDGET_FILE));
+            let mut design = record(Stage::Design);
+            let mut previous = None;
+            for n in 0..plans {
+                let mut plan = crate::ticket_ref::fixtures::plan("goal", &["a"]);
+                plan.plan.forks = vec![fork.clone()];
+                if n > 0 {
+                    plan.plan.approach = format!("revision {n}");
+                }
+                design.plan = Some(plan);
+                previous = Some(bench.write("OWL-1", &design, previous.as_deref()));
+            }
+            let ticket = TicketId::new("OWL-1").unwrap();
+            let plan = design.plan.as_ref().unwrap().plan.clone();
+            let link = crate::on_demand::PlanLink {
+                ticket: &ticket,
+                url: Some("https://linear.app/owlshift/document/plan-owl-1"),
+            };
+            let question =
+                crate::on_demand::approval_question(&plan, with_document.then_some(link));
+            let question = serde_json::to_string(&question).unwrap();
+            design.state = PersistedState::parse(&WAITING.replace("build", "design")).unwrap();
+            design.questions = TicketQuestions::parse(&format!(
+                r#"{{"format":18,"asks":[{{"kind":"questions","round":1,
+                "at":"2026-11-05T09:00:00Z","comment":"c1","questions":[{question}],
+                "decider":{{"account":"maintainer","by":"assignee"}}}}],"decisions":[]}}"#
+            ))
+            .unwrap();
+            bench.write("OWL-1", &design, previous.as_deref());
+            bench.snapshot_with("OWL-1", &reply::tests::ready("maintainer"))
+        };
+        let snap = approval(true, 2);
+        let reply = &snap["questions"]["reply"];
+        assert_eq!(reply["offered"], true);
+        assert_eq!(reply["approval"], true);
+        assert_eq!(reply["words"], json!({ "Q1": ["B"] }));
+        let revisions = snap["plan"]["revisions"].as_array().unwrap();
+        let newest = revisions.last().unwrap();
+        assert!(!newest["diff"].as_array().unwrap().is_empty());
+        assert_eq!(newest["plan"], snap["plan"]["current"]["plan"]);
+        // A first plan, without its document: the fork's other option names
+        // its change, and there is no plan before, so no diff.
+        let snap = approval(false, 1);
+        let reply = &snap["questions"]["reply"];
+        assert_eq!(reply["approval"], true);
+        assert_eq!(reply["words"], json!({ "Q1": [] }));
+        assert!(snap["plan"]["revisions"][0]["diff"].is_null());
     }
 
     #[test]

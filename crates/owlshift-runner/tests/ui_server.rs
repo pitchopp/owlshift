@@ -587,9 +587,11 @@ fn no_asset_holds_the_token_and_the_page_sends_only_the_code_and_the_session() {
         ["fetch(\"/api/login\"", "fetch(path"],
         "{fetches:?}"
     );
-    let authed: Vec<&str> = APP_JS
+    // A checkout with CRLF line endings (Windows) reads as one with LF.
+    let app_js = APP_JS.replace("\r\n", "\n");
+    let authed: Vec<&str> = app_js
         .match_indices("authedFetch(")
-        .map(|(at, _)| APP_JS[at..].split(')').next().unwrap())
+        .map(|(at, _)| app_js[at..].split(')').next().unwrap())
         .collect();
     // The header's stream, which carries the graph too (OWL-460), and the
     // ticket page's snapshot and run logs (OWL-471): each a route of the
@@ -597,9 +599,11 @@ fn no_asset_holds_the_token_and_the_page_sends_only_the_code_and_the_session() {
     assert_eq!(
         authed,
         [
-            "authedFetch(path, signal",
+            "authedFetch(path, init",
             "authedFetch(streamPath(mine.graph",
             "authedFetch(snapshotPath(handle",
+            // The reply form's one POST (OWL-475).
+            "authedFetch(\"/api/reply\", {\n    method: \"POST\",\n    body: JSON.stringify({\n      project: handle.project,\n      ticket: handle.ticket,\n      ask: reply.ask,\n      answers: answers,\n      go: draft.go,\n    }",
             "authedFetch(logPath(handle, run.id, which, log.from, log.line",
             // The overview's "since" panel (OWL-470).
             "authedFetch(path",
@@ -610,7 +614,92 @@ fn no_asset_holds_the_token_and_the_page_sends_only_the_code_and_the_session() {
     assert!(APP_JS.contains("return current.id + \".\" + current.secret;"));
     assert!(APP_JS.contains("const sent = sessionHeader(current);"));
     assert!(APP_JS.contains("headers[SESSION_HEADER] = sent;"));
-    assert_eq!(APP_JS.matches("body:").count(), 1);
+    // The login's code, and the reply's form: its fields and nothing else.
+    assert_eq!(APP_JS.matches("body:").count(), 2);
+    assert!(APP_JS.contains("options.body = init.body;"));
+}
+
+/// OWL-475: the reply form is drawn by one function, in the questions
+/// section, or in the plan section for the plan's approval, below the plan
+/// and the change since the plan before; a choice listed in `reply.words`
+/// asks for words; "count it now" is ticked unless the decider unticks it.
+#[test]
+fn the_approval_form_is_drawn_in_the_plan_section() {
+    let app_js = lf(APP_JS);
+    let questions = block(
+        &app_js,
+        "function renderQuestions(handle, body, questions, snapshot) {",
+        "",
+    );
+    assert!(questions.contains("reply.approval"), "{questions}");
+    assert!(questions.contains("replyForm(handle, reply, questions)"));
+    // A plan section that cannot draw the plan draws no form: the questions
+    // section draws the approval's then, and says so.
+    assert!(
+        questions.contains("if (reply && reply.approval && planDrawn(snapshot)) {"),
+        "{questions}"
+    );
+    assert!(questions.contains("the plan cannot be drawn: its reply form is here."));
+    let drawn = block(&app_js, "function planDrawn(snapshot) {", "");
+    assert!(
+        drawn.contains("snapshot.plan && !snapshot.plan.error"),
+        "{drawn}"
+    );
+    let snapshot = block(&app_js, "function renderSnapshot(handle, snapshot) {", "");
+    assert!(snapshot.contains("if (part && part.error) {"));
+    assert!(snapshot.contains("} else if (part === null || part === undefined) {"));
+    assert!(snapshot.contains(": name === \"questions\" ? planDrawn(snapshot) : null;"));
+    let plan = block(
+        &app_js,
+        "function renderPlan(handle, body, plan, snapshot) {",
+        "",
+    );
+    assert!(plan.contains("reply && reply.approval"), "{plan}");
+    assert!(plan.contains("replyForm(handle, reply, snapshot.questions)"));
+    let diff = plan.find("diffEl(newest.diff)").unwrap();
+    assert!(plan.find("planEl(plan.current.plan)").unwrap() < diff);
+    assert!(diff < plan.find("replyForm(").unwrap());
+    assert_eq!(app_js.matches("replyForm(").count(), 3);
+    let question = block(
+        &app_js,
+        "function replyQuestion(handle, reply, question, draft) {",
+        "",
+    );
+    assert!(question.contains("reply.words"));
+    assert!(question.contains("words.required = needed;"));
+    let form = block(
+        &app_js,
+        "function replyForm(handle, reply, questions) {",
+        "",
+    );
+    assert!(form.contains("go.checked = draft.go;"));
+    // A posted reply is shown above the form, which stays drawn while the
+    // round is offered: a reply left uncounted can be followed by a `go`.
+    let shown = form
+        .find("el.appendChild(make(\"p\", \"state-success\", posted));")
+        .unwrap();
+    assert!(shown < form.find("if (!reply.offered)").unwrap());
+    assert!(
+        shown
+            < form
+                .find("const draft = replyDraft(handle, reply);")
+                .unwrap()
+    );
+    assert_eq!(form.matches("return el;").count(), 3, "{form}");
+    assert!(app_js.contains("handle.drafts[reply.ask] = { answers: {}, go: true };"));
+    // Send is disabled while the reply is posted, and every continuation
+    // after an await is for the page that is open.
+    let send = block(
+        &app_js,
+        "async function sendReply(handle, reply, draft, button, status) {",
+        "",
+    );
+    assert!(send.contains("button.disabled = true;"));
+    for continuation in send.split("await ").skip(1) {
+        assert!(continuation.contains("alive(handle)"), "{continuation}");
+    }
+    // The plan section is drawn again when the reply form changes.
+    assert!(app_js.contains("const beside = name === \"plan\" && snapshot.questions"));
 }
 
 /// OWL-472: the Orchestrator sends back the generation and the cursors it was
@@ -1348,7 +1437,13 @@ fn no_asset_names_a_place_off_the_origin_and_the_policy_allows_none() {
     // and the policy allows no fetch.
     const PULL_REQUEST_LINK: &str = "https://github.com/";
     assert_eq!(APP_JS.matches(PULL_REQUEST_LINK).count(), 1);
-    let script = APP_JS.replace(PULL_REQUEST_LINK, "");
+    // And the prefix of a ticket's link on the tracker beside the reply form
+    // (OWL-475), which a click navigates to as well.
+    const TRACKER_LINK: &str = "https://linear.app/";
+    assert_eq!(APP_JS.matches(TRACKER_LINK).count(), 1);
+    let script = APP_JS
+        .replace(PULL_REQUEST_LINK, "")
+        .replace(TRACKER_LINK, "");
     for (name, text) in [
         ("index.html", INDEX_HTML),
         ("app.js", script.as_str()),
@@ -2299,10 +2394,23 @@ fn since_counts_the_last_24_hours_when_it_is_given_no_time() {
 #[test]
 fn the_overview_page_links_only_a_guarded_pull_request_and_keeps_the_view_and_the_visit() {
     let app_js = lf(APP_JS);
-    // The one `.href` assignment is the pull request's, guarded by the
-    // repository and number patterns; the other links are ticket pages' hash
-    // routes, set as attributes from encoded parts.
-    assert_eq!(app_js.matches(".href =").count(), 1);
+    // The `.href` assignments are the pull request's, guarded by the
+    // repository and number patterns, and the tracker's link of the reply
+    // form (OWL-475), guarded by its own; the other links are ticket pages'
+    // hash routes, set as attributes from encoded parts.
+    assert_eq!(app_js.matches(".href =").count(), 2);
+    let tracker = block(&app_js, "function trackerLink(reply) {", "");
+    let (guard, assigned) = tracker.split_once(".href =").unwrap();
+    assert!(guard.contains("given.startsWith(LINEAR_LINK)"), "{tracker}");
+    assert!(
+        guard.contains("TRACKER_LINK_PATTERN.test(path)"),
+        "{tracker}"
+    );
+    assert!(guard.contains("return null;"), "{tracker}");
+    assert!(assigned.starts_with(" LINEAR_LINK + path;"), "{tracker}");
+    assert!(app_js.contains(
+        "const TRACKER_LINK_PATTERN = /^[A-Za-z0-9_-]+\\/issue\\/[A-Za-z0-9]+-[0-9]+$/;"
+    ));
     let link = block(&app_js, "function pullRequestLink(project, number) {", "");
     let (guard, assigned) = link.split_once(".href =").unwrap();
     assert!(guard.contains("REPOSITORY_PATTERN.test(project)"), "{link}");
@@ -2953,4 +3061,407 @@ fn the_graph_page_reads_only_keys_the_server_sends() {
     for key in read_keys(drawing, "node.run.") {
         assert!(["slot", "pid", "since"].contains(&key.as_str()), "{key}");
     }
+}
+
+/// The tracker of a key on the reply tests: records what it posts, and,
+/// when it is held, says each post began and waits to be let go first.
+#[derive(Clone, Default)]
+struct Posting {
+    posted: Arc<Mutex<Vec<String>>>,
+    hold: Option<Hold>,
+}
+
+/// A post held open: `began` hears of each post, `release` lets it go on.
+#[derive(Clone)]
+struct Hold {
+    began: std::sync::mpsc::Sender<()>,
+    release: Arc<Mutex<std::sync::mpsc::Receiver<()>>>,
+}
+
+impl owlshift_adapters::tracker::Tracker for Posting {
+    fn capabilities(&self) -> &'static [owlshift_adapters::tracker::Capability] {
+        &[owlshift_adapters::tracker::Capability::Comments]
+    }
+    fn ticket(
+        &self,
+        _: &TicketId,
+    ) -> Result<owlshift_adapters::tracker::Ticket, owlshift_adapters::tracker::Error> {
+        unreachable!("a reply reads no ticket")
+    }
+    fn comments(
+        &self,
+        _: &TicketId,
+    ) -> Result<Vec<owlshift_adapters::tracker::Comment>, owlshift_adapters::tracker::Error> {
+        unreachable!("a reply reads no comment")
+    }
+    fn post_comment(
+        &self,
+        _: &TicketId,
+        body: &str,
+    ) -> Result<owlshift_adapters::tracker::Comment, owlshift_adapters::tracker::Error> {
+        if let Some(hold) = &self.hold {
+            hold.began.send(()).unwrap();
+            hold.release
+                .lock()
+                .unwrap()
+                .recv_timeout(Duration::from_secs(30))
+                .unwrap();
+        }
+        let mut posted = self.posted.lock().unwrap();
+        posted.push(body.to_owned());
+        Ok(owlshift_adapters::tracker::Comment {
+            id: format!("reply-{}", posted.len()),
+            author: owlshift_adapters::tracker::Author::Account(
+                owlshift_adapters::tracker::Person {
+                    id: "maintainer".into(),
+                    name: "maintainer".into(),
+                },
+            ),
+            created_at: "2026-11-07T12:00:00Z".parse().unwrap(),
+            edited_at: None,
+            body: body.to_owned(),
+            parent: None,
+            reactions: Vec::new(),
+        })
+    }
+    fn set_stage(&self, _: &TicketId, _: &str) -> Result<(), owlshift_adapters::tracker::Error> {
+        unreachable!("a reply moves no stage")
+    }
+}
+
+/// Two lettered questions, recommending A and B.
+const REPLY_QUESTIONS: &str = r#"[
+    {"id":"Q1","category":"scope","context":"c","text":"Which language?",
+     "options":[{"label":"English"},{"label":"French"}],
+     "recommendation":{"option":"A","why":"English."}},
+    {"id":"Q2","category":"scope","context":"c","text":"A sign-off?",
+     "options":[{"label":"Yes"},{"label":"No"}],
+     "recommendation":{"option":"B","why":"None needed."}}]"#;
+
+/// The approval question of a plan with its document, as design.rs words it.
+const APPROVAL_QUESTION: &str = r#"[
+    {"id":"Q1","category":"plan_approval","context":"The plan passed its design review.",
+     "text":"Do you approve the plan as it is, or change it?",
+     "options":[{"label":"Approve the plan as it is"},
+                {"label":"Change it","detail":"say what in your own words"}],
+     "recommendation":{"option":"A","why":"The plan passed its design review."}}]"#;
+
+/// A served `o/r` whose key's account is `account`, its posts recorded, and
+/// how many times its key was opened.
+struct ReplyGround {
+    ground: Ground,
+    posted: Arc<Mutex<Vec<String>>>,
+    opened: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl ReplyGround {
+    fn new(account: &str) -> Self {
+        Self::with_tracker(account, Posting::default())
+    }
+
+    fn with_tracker(account: &str, tracker: Posting) -> Self {
+        let posted = tracker.posted.clone();
+        let opened = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (counted, account) = (opened.clone(), account.to_owned());
+        let keys: owlshift_runner::ui::reply::KeyOpener = Arc::new(move |_: &Path, _: &Repo| {
+            counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(owlshift_runner::ui::reply::Key {
+                account: owlshift_adapters::tracker::linear::KeyAccount {
+                    id: account.clone(),
+                    name: "Ada".into(),
+                    app: false,
+                    workspace: "owlshift".into(),
+                },
+                tracker: Box::new(tracker.clone()),
+            })
+        });
+        let ground = Ground::with_options(Options { keys, ..options() });
+        Self {
+            ground,
+            posted,
+            opened,
+        }
+    }
+
+    /// OWL-1 waits for its decider `maintainer` on `questions`, asked in
+    /// comment `ask-1`.
+    fn waiting(&self, questions: &str) {
+        use owlshift_contracts::refs::{PersistedState, TicketQuestions};
+        use owlshift_runner::ticket_ref::{self, TicketRecord};
+        let checkout =
+            ProjectDirs::new(self.ground.data.path(), &Repo::parse("o/r").unwrap()).checkout();
+        std::fs::create_dir_all(&checkout).unwrap();
+        let init = std::process::Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(&checkout)
+            .output()
+            .unwrap();
+        assert!(init.status.success(), "{init:?}");
+        let record = TicketRecord {
+            state: PersistedState::parse(
+                r#"{"format":4,"stage":"build","waiting":"needs_input","round":1,
+                "reasks":0,"failed_runs":0,"fix_passes":0,"repairs":0,"review_passes":0}"#,
+            )
+            .unwrap(),
+            questions: TicketQuestions::parse(&format!(
+                r#"{{"format":18,"asks":[{{"kind":"questions","round":1,
+                "at":"2026-11-05T09:00:00Z","comment":"ask-1","questions":{questions},
+                "decider":{{"account":"maintainer","by":"assignee"}}}}],"decisions":[]}}"#
+            ))
+            .unwrap(),
+            ..ticket_ref::blank(None)
+        };
+        let git = owlshift_runner::project::runner_git();
+        let ticket = TicketId::new("OWL-1").unwrap();
+        ticket_ref::write(&git, &checkout, &ticket, &record, None).unwrap();
+    }
+
+    /// The snapshot's reply section, once the key's account is read.
+    fn reply(&self) -> Value {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let reply = self.ground.get("/api/ticket?project=o%2Fr&ticket=OWL-1");
+            assert_eq!(reply.status, 200, "{}", reply.text());
+            let section = reply.json()["questions"]["reply"].clone();
+            if section["key"]["reading"] != true || Instant::now() > deadline {
+                return section;
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    fn post(&self, body: &Value, headers: &[(&str, &str)]) -> Reply {
+        let session = self.ground.session.header();
+        let mut all = vec![
+            ("Content-Type", "application/json"),
+            ("X-Owlshift-Session", session.as_str()),
+        ];
+        all.extend_from_slice(headers);
+        send(
+            self.ground.ui.port(),
+            "POST",
+            "/api/reply",
+            &all,
+            &body.to_string(),
+        )
+    }
+
+    fn posted(&self) -> Vec<String> {
+        self.posted.lock().unwrap().clone()
+    }
+}
+
+fn reply_body(ask: &str, answers: Value, go: bool) -> Value {
+    json!({ "project": "o/r", "ticket": "OWL-1", "ask": ask, "answers": answers, "go": go })
+}
+
+fn lettered_answers() -> Value {
+    json!([
+        { "question": "Q1", "choice": "B", "text": "" },
+        { "question": "Q2", "choice": "recommendation", "text": null },
+    ])
+}
+
+#[test]
+fn the_reply_form_is_offered_to_the_asks_decider_only() {
+    let decider = ReplyGround::new("maintainer");
+    decider.waiting(REPLY_QUESTIONS);
+    let reply = decider.reply();
+    assert_eq!(reply["offered"], true, "{reply:#}");
+    assert_eq!(reply["ask"], "ask-1");
+    assert_eq!(reply["key"]["name"], "Ada");
+    assert_eq!(reply["link"], "https://linear.app/owlshift/issue/OWL-1");
+    for _ in 0..3 {
+        decider.reply();
+    }
+    assert_eq!(
+        decider.opened.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "the key is read once"
+    );
+    let other = ReplyGround::new("someone-else");
+    other.waiting(REPLY_QUESTIONS);
+    let reply = other.reply();
+    assert_eq!(reply["offered"], false);
+    assert!(
+        reply["why_not"]
+            .as_str()
+            .unwrap()
+            .contains("not the decider's"),
+        "{reply:#}"
+    );
+    assert_eq!(
+        reply["decider"],
+        json!({ "account": "maintainer", "by": "assignee" })
+    );
+    assert_eq!(reply["link"], "https://linear.app/owlshift/issue/OWL-1");
+    // Without a key opener, no key: the decider named, no form, no link.
+    let bare = Ground::new();
+    let keyless = ReplyGround {
+        ground: bare,
+        posted: Arc::default(),
+        opened: Arc::default(),
+    };
+    keyless.waiting(REPLY_QUESTIONS);
+    let reply = keyless.reply();
+    assert_eq!(reply["offered"], false);
+    assert!(reply["link"].is_null());
+    assert!(reply["key"]["why"].is_string(), "{reply:#}");
+}
+
+#[test]
+fn a_reply_posts_once_through_the_key() {
+    let ground = ReplyGround::new("maintainer");
+    ground.waiting(REPLY_QUESTIONS);
+    ground.reply();
+    let posted = ground.post(&reply_body("ask-1", lettered_answers(), true), &[]);
+    assert_eq!(posted.status, 200, "{}", posted.text());
+    posted.assert_secured();
+    let answer = posted.json();
+    assert_eq!(answer["comment"], "reply-1");
+    assert_eq!(answer["counts_now"], true);
+    assert_eq!(ground.posted(), ["Q1: B\nQ2: B\n\ngo"]);
+}
+
+/// A second reply to a ticket while the first is posted, a double click, is
+/// refused with 409 and posts nothing; once the first is posted, the ticket
+/// takes replies again.
+#[test]
+fn a_reply_under_way_refuses_a_second_to_the_same_ticket() {
+    let (began, heard) = std::sync::mpsc::channel();
+    let (release, released) = std::sync::mpsc::channel();
+    let tracker = Posting {
+        hold: Some(Hold {
+            began,
+            release: Arc::new(Mutex::new(released)),
+        }),
+        ..Posting::default()
+    };
+    let ground = ReplyGround::with_tracker("maintainer", tracker);
+    ground.waiting(REPLY_QUESTIONS);
+    ground.reply();
+    let body = reply_body("ask-1", lettered_answers(), true);
+    thread::scope(|scope| {
+        let first = scope.spawn(|| ground.post(&body, &[]));
+        heard.recv_timeout(Duration::from_secs(30)).unwrap();
+        let second = ground.post(&body, &[]);
+        assert_eq!(second.status, 409, "{}", second.text());
+        assert!(
+            second.json()["error"]
+                .as_str()
+                .unwrap()
+                .contains("being posted"),
+            "{}",
+            second.text()
+        );
+        assert!(ground.posted().is_empty());
+        release.send(()).unwrap();
+        let first = first.join().unwrap();
+        assert_eq!(first.status, 200, "{}", first.text());
+    });
+    assert_eq!(ground.posted(), ["Q1: B\nQ2: B\n\ngo"]);
+    // The guard is gone with the first reply: the next one is posted.
+    release.send(()).unwrap();
+    let again = ground.post(&body, &[]);
+    assert_eq!(again.status, 200, "{}", again.text());
+    heard.recv_timeout(Duration::from_secs(30)).unwrap();
+    assert_eq!(ground.posted().len(), 2);
+}
+
+#[test]
+fn an_unchecked_count_it_now_posts_no_go() {
+    let ground = ReplyGround::new("maintainer");
+    ground.waiting(REPLY_QUESTIONS);
+    ground.reply();
+    let posted = ground.post(&reply_body("ask-1", lettered_answers(), false), &[]);
+    assert_eq!(posted.status, 200, "{}", posted.text());
+    assert_eq!(posted.json()["counts_now"], false);
+    assert_eq!(ground.posted(), ["Q1: B\nQ2: B"]);
+}
+
+#[test]
+fn a_reply_is_refused_without_a_session_from_another_origin_for_another_decider_or_a_changed_round()
+{
+    let ground = ReplyGround::new("maintainer");
+    ground.waiting(REPLY_QUESTIONS);
+    ground.reply();
+    let body = reply_body("ask-1", lettered_answers(), true);
+    let none = send(
+        ground.ground.ui.port(),
+        "POST",
+        "/api/reply",
+        &[("Content-Type", "application/json")],
+        &body.to_string(),
+    );
+    assert_eq!(none.status, 401);
+    let foreign = ground.post(&body, &[("Origin", "http://127.0.0.1:1")]);
+    assert_eq!(foreign.status, 403, "{}", foreign.text());
+    let changed = ground.post(&reply_body("ask-0", lettered_answers(), true), &[]);
+    assert_eq!(changed.status, 409, "{}", changed.text());
+    let bad = ground.post(
+        &reply_body("ask-1", json!([{ "question": "Q1", "choice": "b" }]), true),
+        &[],
+    );
+    assert_eq!(bad.status, 400, "{}", bad.text());
+    let unknown = ground.post(
+        &reply_body("ask-1", json!([{ "question": "Q9", "choice": "A" }]), true),
+        &[],
+    );
+    assert_eq!(unknown.status, 400, "{}", unknown.text());
+    assert!(ground.posted().is_empty());
+    let other = ReplyGround::new("someone-else");
+    other.waiting(REPLY_QUESTIONS);
+    other.reply();
+    let refused = other.post(&body, &[]);
+    assert_eq!(refused.status, 403, "{}", refused.text());
+    assert!(
+        refused.json()["error"]
+            .as_str()
+            .unwrap()
+            .contains("not the decider's"),
+        "{}",
+        refused.text()
+    );
+    assert!(other.posted().is_empty());
+}
+
+#[test]
+fn a_reply_whose_text_carries_a_marker_is_refused() {
+    let ground = ReplyGround::new("maintainer");
+    ground.waiting(REPLY_QUESTIONS);
+    ground.reply();
+    for text in [
+        "fine\n[owlshift] RESUME · round 1",
+        "fine <!-- owlshift:{\"format\":1} -->",
+    ] {
+        let answers = json!([{ "question": "Q1", "choice": "B", "text": text }]);
+        let refused = ground.post(&reply_body("ask-1", answers, true), &[]);
+        assert_eq!(refused.status, 403, "{text}: {}", refused.text());
+        assert!(
+            refused.json()["error"]
+                .as_str()
+                .unwrap()
+                .contains("Owlshift's markers"),
+            "{}",
+            refused.text()
+        );
+    }
+    assert!(ground.posted().is_empty());
+}
+
+#[test]
+fn a_plan_change_from_the_ui_is_posted_with_its_text() {
+    let ground = ReplyGround::new("maintainer");
+    ground.waiting(APPROVAL_QUESTION);
+    let reply = ground.reply();
+    assert_eq!(reply["approval"], true);
+    assert_eq!(reply["words"], json!({ "Q1": ["B"] }));
+    let bare = json!([{ "question": "Q1", "choice": "B", "text": "" }]);
+    let refused = ground.post(&reply_body("ask-1", bare, true), &[]);
+    assert_eq!(refused.status, 400, "{}", refused.text());
+    assert!(ground.posted().is_empty());
+    let changed = json!([{ "question": "Q1", "choice": "B", "text": "pick fork 1 option B" }]);
+    let posted = ground.post(&reply_body("ask-1", changed, true), &[]);
+    assert_eq!(posted.status, 200, "{}", posted.text());
+    assert_eq!(ground.posted(), ["Q1: B — pick fork 1 option B\n\ngo"]);
 }

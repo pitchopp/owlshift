@@ -510,6 +510,40 @@ impl LinearTracker {
     }
 }
 
+/// The account of the API key the adapter reads with, and its workspace:
+/// what the local web UI reads once per served project to tell whether the
+/// operator's key is the decider of a ticket's open ask (architecture
+/// section 5, "Replies from the UI").
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct KeyAccount {
+    /// The account's identifier, the one an ask's decider holds.
+    pub id: String,
+    /// The name Linear shows for it.
+    pub name: String,
+    /// Whether it is an app user: a key of an app is never an operator's.
+    pub app: bool,
+    /// The workspace's URL key, as in `https://linear.app/<workspace>/…`.
+    pub workspace: String,
+}
+
+impl LinearTracker {
+    /// The account of the key this adapter reads with, never that of the
+    /// app it may write as: one read through the key's own transport, the
+    /// query of live check U2 (build plan, "P8 · Local web UI", checked on
+    /// 2026-11-01: the key's `viewer` is the account its comments come from,
+    /// `app` false) with the name `viewer.displayName` that
+    /// [`Self::writing_as_app`] reads too.
+    pub fn key_account(&self) -> Result<KeyAccount, Error> {
+        let data: KeyAccountData = self.call(KEY_ACCOUNT_QUERY, json!({}))?;
+        Ok(KeyAccount {
+            id: data.viewer.id,
+            name: data.viewer.display_name,
+            app: data.viewer.app,
+            workspace: data.organization.url_key,
+        })
+    }
+}
+
 /// What `owlshift doctor` learns of a team's admission and proposals setup
 /// (OWL-155).
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1378,6 +1412,10 @@ const APP_QUERY: &str = "query App($key: String!) { viewer { id displayName app 
 /// What [`LinearTracker::writing_as_app`] asks through the API key.
 const WORKSPACE_QUERY: &str = "query Workspace { organization { id } }";
 
+/// What [`LinearTracker::key_account`] asks through the API key.
+const KEY_ACCOUNT_QUERY: &str =
+    "query KeyAccount { viewer { id displayName app } organization { urlKey } }";
+
 /// A mention's link (OWL-157).
 const USER_QUERY: &str = "query Mention($id: String!) { user(id: $id) { url } }";
 
@@ -2144,6 +2182,18 @@ struct Workspace {
 }
 
 #[derive(Deserialize)]
+struct KeyAccountData {
+    viewer: AppViewer,
+    organization: UrlKey,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct UrlKey {
+    url_key: String,
+}
+
+#[derive(Deserialize)]
 struct Organization {
     id: String,
 }
@@ -2884,6 +2934,60 @@ mod tests {
             ["Workspace", "Comments", "States", "Mention"]
         );
         assert_eq!(*by_app.lock().unwrap(), ["App", "PostComment", "SetStage"]);
+    }
+
+    /// The key's account is the key's viewer, its `app` kept, read through
+    /// the key: never through the app the adapter writes as.
+    #[test]
+    fn the_key_account_is_the_viewer_of_the_key() {
+        let key = Scripted::new(vec![
+            ("Workspace", json!({ "organization": { "id": "org-1" } })),
+            (
+                "KeyAccount",
+                json!({ "viewer": { "id": "u1", "displayName": "ada", "app": false },
+                    "organization": { "urlKey": "owlshift" } }),
+            ),
+        ]);
+        let app = Scripted::new(vec![("App", app_seen(true, "org-1", 1))]);
+        let (by_key, by_app) = (key.asked.clone(), app.asked.clone());
+        let (tracker, _) = LinearTracker::with_transport(key)
+            .writing_as_app(app, "owl")
+            .unwrap();
+        assert_eq!(
+            tracker.key_account().unwrap(),
+            KeyAccount {
+                id: "u1".into(),
+                name: "ada".into(),
+                app: false,
+                workspace: "owlshift".into(),
+            }
+        );
+        assert_eq!(*by_key.lock().unwrap(), ["Workspace", "KeyAccount"]);
+        assert_eq!(*by_app.lock().unwrap(), ["App"]);
+        let app_key = Scripted::new(vec![(
+            "KeyAccount",
+            json!({ "viewer": { "id": "a1", "displayName": "bot", "app": true },
+                "organization": { "urlKey": "owlshift" } }),
+        )]);
+        assert!(
+            LinearTracker::with_transport(app_key)
+                .key_account()
+                .unwrap()
+                .app
+        );
+    }
+
+    #[test]
+    fn a_key_account_without_a_viewer_is_an_error() {
+        let key = Scripted::new(vec![(
+            "KeyAccount",
+            json!({ "viewer": null, "organization": { "urlKey": "owlshift" } }),
+        )]);
+        let error = LinearTracker::with_transport(key)
+            .key_account()
+            .unwrap_err();
+        assert_eq!(error.kind, ErrorKind::Other);
+        assert!(error.message.contains("unexpected answer"), "{error}");
     }
 
     /// An app that is not an app user, belongs to another workspace than the
