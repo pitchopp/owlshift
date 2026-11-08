@@ -33,3 +33,6 @@ tempfile.workspace = true
 # Test only: `AgentEnv::without_confinement`, for the test bench. No shipped
 # crate enables it (OWL-41).
 testkit = []
+
+[dev-dependencies]
+boa_engine = "0.22.0"

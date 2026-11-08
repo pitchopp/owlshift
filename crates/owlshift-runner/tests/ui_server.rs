@@ -3465,3 +3465,150 @@ fn a_plan_change_from_the_ui_is_posted_with_its_text() {
     assert_eq!(posted.status, 200, "{}", posted.text());
     assert_eq!(ground.posted(), ["Q1: B — pick fork 1 option B\n\ngo"]);
 }
+
+/// The page's wait rule, run as the page's own source: the `LOG_*` constants,
+/// `logDelay` and `nextLogDelay`, with `Date.now` fixed at `NOW`.
+mod page_rule {
+    use super::{APP_JS, lf};
+    use boa_engine::{Context, Source};
+
+    const NOW: u64 = 1_000_000_000_000;
+
+    /// A top-level function of the page, header and closing brace included.
+    fn function<'a>(app: &'a str, header: &str) -> &'a str {
+        let start = app.find(header).unwrap_or_else(|| panic!("{header}"));
+        let end = app[start..].find("\n}\n").unwrap() + 2;
+        &app[start..start + end]
+    }
+
+    pub fn source() -> String {
+        let app = lf(APP_JS);
+        let mut out = format!("const Date = {{ now: () => {NOW} }};\n");
+        for line in app.lines().filter(|l| l.starts_with("const LOG_")) {
+            out.push_str(line);
+            out.push('\n');
+        }
+        out.push_str(function(&app, "function logDelay("));
+        out.push('\n');
+        out.push_str(function(&app, "function nextLogDelay("));
+        out.push('\n');
+        out
+    }
+
+    /// Evaluates `expression` after the page's source, as a string.
+    pub fn text(expression: &str) -> String {
+        let mut context = Context::default();
+        let code = format!("{}\n{expression}", source());
+        context
+            .eval(Source::from_bytes(code.as_bytes()))
+            .unwrap_or_else(|e| panic!("{e}\n{code}"))
+            .to_string(&mut context)
+            .unwrap()
+            .to_std_string_escaped()
+    }
+
+    /// Evaluates `expression` after the page's source, as a number.
+    pub fn number(expression: &str) -> f64 {
+        text(expression)
+            .parse()
+            .unwrap_or_else(|_| panic!("not a number: {expression}"))
+    }
+}
+
+#[test]
+fn the_page_runs_in_the_test_engine() {
+    assert_eq!(page_rule::number("1 + 1"), 2.0);
+    assert_eq!(page_rule::number("LOG_FAST_MS"), 1000.0);
+}
+
+#[test]
+fn the_page_waits_when_a_read_makes_no_progress() {
+    let delay = |from: u64, answer: &str| {
+        page_rule::number(&format!(
+            "nextLogDelay({{ lastData: Date.now() }}, {from}, {answer})"
+        ))
+    };
+    // The loop seen on OWL-475's log: next stuck below size.
+    let stuck = delay(581528, "{ next: 581528, size: 722000, reset: false }");
+    assert!(stuck >= 1000.0, "{stuck}");
+    // Progress with more behind it is read again at once.
+    assert_eq!(
+        delay(0, "{ next: 262144, size: 722000, reset: false }"),
+        0.0
+    );
+    // A reset is progress, even when next fell below the old offset.
+    assert_eq!(delay(500, "{ next: 100, size: 722000, reset: true }"), 0.0);
+    // Caught up: as logDelay says.
+    assert_eq!(delay(0, "{ next: 10, size: 10, reset: false }"), 1000.0);
+    // A quiet log waits longer, stuck or not.
+    let quiet = page_rule::number(
+        "nextLogDelay({ lastData: Date.now() - 40000 }, 5, { next: 5, size: 9, reset: false })",
+    );
+    assert_eq!(quiet, 5000.0);
+}
+
+#[test]
+fn a_log_stopped_on_a_partial_line_is_read_once_a_second() {
+    // The answers of a log that stops on an unterminated line, applied as
+    // pollLog does: `from` is the offset of the read, then `log.from = next`.
+    let script = r#"
+      const log = { from: 0, lastData: Date.now() };
+      const answers = [
+        { next: 4, size: 140004, reset: false },
+        { next: 4, size: 140004, reset: false },
+        { next: 4, size: 140004, reset: false },
+        { next: 140005, size: 140005, reset: false },
+      ];
+      const delays = [];
+      const froms = [];
+      for (const value of answers) {
+        const from = log.from;
+        froms.push(from);
+        log.from = value.next;
+        delays.push(nextLogDelay(log, from, value));
+      }
+      delays.join(",") + ";" + froms.join(",")
+    "#;
+    // One immediate read reaches the line; every read after it waits, never
+    // stops, and asks again from the withheld line's start.
+    assert_eq!(page_rule::text(script), "0,1000,1000,1000;0,4,4,4");
+}
+
+#[test]
+fn poll_log_uses_the_rule_with_the_offset_read_before_it_moves() {
+    let app = lf(APP_JS);
+    let poll = block(&app, "async function pollLog(", "");
+    assert!(!poll.contains("value.next < value.size ? 0"));
+    assert!(poll.contains("nextLogDelay(log, from, value)"));
+    let from = poll.find("const from = log.from;").unwrap();
+    let moved = poll.find("log.from = value.next;").unwrap();
+    assert!(from < moved);
+    assert!(from < poll.find("nextLogDelay(").unwrap());
+}
+
+#[test]
+fn the_log_endpoint_withholds_a_long_partial_line_over_http() {
+    let ground = Ground::new();
+    ground.event(EventKind::RunStarted);
+    ground.append("stdout.log", &said("one"));
+    let long = said(&"a".repeat(140_000));
+    let (head, tail) = long.split_at(long.len() - 1);
+    ground.append("stdout.log", head);
+    let first = ground.log("&from=0").json();
+    let next = first["next"].as_u64().unwrap();
+    let size = first["size"].as_u64().unwrap();
+    assert!(next < size);
+    assert_eq!(first["records"].as_array().unwrap().len(), 1);
+    // The same answer again: no records, `next` where it was.
+    for _ in 0..3 {
+        let again = ground.log(&format!("&from={next}&line=1")).json();
+        assert!(again["records"].as_array().unwrap().is_empty());
+        assert_eq!(again["next"].as_u64().unwrap(), next);
+        assert_eq!(again["size"].as_u64().unwrap(), size);
+    }
+    // The newline lands: the line is served whole and `next` reaches size.
+    ground.append("stdout.log", tail);
+    let done = ground.log(&format!("&from={next}&line=1")).json();
+    assert_eq!(done["records"].as_array().unwrap().len(), 1);
+    assert_eq!(done["next"], done["size"]);
+}

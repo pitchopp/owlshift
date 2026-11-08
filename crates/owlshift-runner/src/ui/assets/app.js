@@ -1500,7 +1500,8 @@ function appendRecords(run, which, records) {
   container.appendChild(batch);
 }
 
-// How a log is followed: at once while there is more to read, then every
+// How a log is followed: at once while a read makes progress and there is
+// more to read (a read that makes none waits like a caught-up one), then every
 // second; every 5 s after 30 s without new data, and every minute after 10
 // minutes, which the run says (a runner that died leaves no end to wait
 // for). A log ends once its answer says the run ended and `next` reached
@@ -1517,6 +1518,17 @@ function logDelay(log) {
     return LOG_IDLE_MS;
   }
   return quiet >= LOG_SLOW_AFTER_MS ? LOG_SLOW_MS : LOG_FAST_MS;
+}
+
+// The wait before the next read. A read is repeated at once only while it
+// made progress and more is waiting behind it (the server caps an answer).
+// An answer whose `next` did not move, with `next` below `size`, left only
+// a half-written last line, which the server withholds until its newline
+// lands: it waits like a caught-up log, instead of asking again in a loop.
+// A reset counts as progress. No DOM here: a test runs this source.
+function nextLogDelay(log, from, value) {
+  const moved = value.reset === true || value.next > from;
+  return moved && value.next < value.size ? 0 : logDelay(log);
 }
 
 // One read of a log from where it stopped, drawn, and the next one
@@ -1569,6 +1581,7 @@ async function pollLog(handle, run, which) {
     appendRecords(run, which, value.records);
     log.lastData = Date.now();
   }
+  const from = log.from;
   log.from = value.next;
   log.line = value.next_line;
   if (which === "stdout") {
@@ -1584,7 +1597,7 @@ async function pollLog(handle, run, which) {
     log.finished = true;
     return;
   }
-  const delay = value.next < value.size ? 0 : logDelay(log);
+  const delay = nextLogDelay(log, from, value);
   log.timer = window.setTimeout(() => pollLog(handle, run, which), delay);
 }
 
