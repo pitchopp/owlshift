@@ -44,8 +44,8 @@ verdict() {
   v_as=0; v_ae=0
   grep -Eq 'caffeinate.*PreventUserIdleSystemSleep|PreventUserIdleSystemSleep.*caffeinate' "$4" 2>/dev/null && v_as=1
   grep -Eq 'caffeinate.*PreventUserIdleSystemSleep|PreventUserIdleSystemSleep.*caffeinate' "$5" 2>/dev/null && v_ae=1
-  if [ $v_as = 1 ] && [ $v_ae = 1 ]; then echo "assertion: caffeinate's PreventUserIdleSystemSleep held at the start and at the end"
-  else echo "assertion: caffeinate's PreventUserIdleSystemSleep NOT held at the start (${v_as}) and the end (${v_ae}), not valid"; v_ok=0; fi
+  if [ $v_as = 1 ] && [ $v_ae = 1 ]; then echo "assertion: a caffeinate PreventUserIdleSystemSleep assertion held at the start and at the end"
+  else echo "assertion: no caffeinate PreventUserIdleSystemSleep assertion at the start (${v_as}) and the end (${v_ae}), not valid"; v_ok=0; fi
   if [ $v_ok = 1 ]; then echo "valid: yes"; else echo "valid: no"; fi
 }
 
