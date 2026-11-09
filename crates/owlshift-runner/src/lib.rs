@@ -12,6 +12,7 @@ pub mod base;
 pub mod cancel;
 pub mod codex_machine;
 pub mod config;
+pub mod controls;
 pub mod daemon;
 pub mod doctor;
 pub mod events;

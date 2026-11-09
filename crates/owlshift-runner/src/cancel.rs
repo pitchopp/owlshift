@@ -204,6 +204,46 @@ pub fn ask(
     })
 }
 
+/// What `owlshift cancel`, and the web UI's Cancel, say of the cancel of
+/// `ticket` [`ask`] wrote.
+pub fn said(ticket: &TicketId, asked: &Asked) -> Vec<String> {
+    let mut lines = vec![format!(
+        "Asked to cancel {ticket}: its step under way stops within 5 seconds, its runs stopped and \
+         checked, and the project's watch then parks it, with a PARKED comment on the ticket. \
+         `owlshift continue {ticket}` restarts it from where it was stopped. A step typed in a \
+         terminal (`owlshift continue`, `owlshift do`) is not stopped."
+    )];
+    if let Some(before) = &asked.replaced {
+        lines.push(match before {
+            Some(before) => format!(
+                "It replaces the cancel asked by {} at {}: {}",
+                before.by, before.at, before.why
+            ),
+            None => "It replaces a cancel file that did not say who wrote it.".to_owned(),
+        });
+    }
+    if asked.unkept {
+        lines.push(format!(
+            "Owlshift keeps no record of {ticket} yet: should its step stop before its first run \
+             has kept anything, nothing is parked, and the file is dropped."
+        ));
+    }
+    if asked.quarantined {
+        lines.push(
+            "The project is quarantined: no watch parks anything until `owlshift unquarantine` \
+             lifts it."
+                .to_owned(),
+        );
+    }
+    if !asked.watching {
+        lines.push(format!(
+            "No watch runs on this project now: {ticket} is parked at the first pass of one, \
+             such as the background service's (`owlshift start`)."
+        ));
+    }
+    lines
+}
+
 /// A step's watch over its ticket's cancel file (OWL-474), from
 /// [`Watcher::start`] until it is dropped: on finding the file it asks the
 /// step's checked stop, `owlshift_platform::process::stop_step`, and its
@@ -352,6 +392,35 @@ mod tests {
         assert_eq!(
             detail(None),
             "Canceled by a cancel file that does not say who wrote it"
+        );
+    }
+
+    /// The command says what follows, and each standing that changes it.
+    #[test]
+    fn it_says_what_follows_and_what_holds_it() {
+        let ticket = TicketId::new("WEB-1").unwrap();
+        let plain = Asked {
+            replaced: None,
+            watching: true,
+            quarantined: false,
+            unkept: false,
+        };
+        let lines = said(&ticket, &plain);
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert!(lines[0].starts_with("Asked to cancel WEB-1: its step under way stops"));
+        let held = Asked {
+            replaced: Some(None),
+            watching: false,
+            quarantined: true,
+            unkept: true,
+        };
+        let lines = said(&ticket, &held).join("\n");
+        assert!(lines.contains("It replaces a cancel file"), "{lines}");
+        assert!(lines.contains("keeps no record of WEB-1 yet"), "{lines}");
+        assert!(lines.contains("The project is quarantined"), "{lines}");
+        assert!(
+            lines.contains("No watch runs on this project now"),
+            "{lines}"
         );
     }
 
