@@ -38,7 +38,7 @@ jobs:
           # A platform's shard count. Raise it by one when the slowest of its
           # shard jobs takes more than 8 minutes on main.
           SHARDS_UBUNTU: 2
-          SHARDS_MACOS: 3
+          SHARDS_MACOS: 4
           SHARDS_WINDOWS: 2
         run: |
           jq -nr --argjson u "$SHARDS_UBUNTU" --argjson m "$SHARDS_MACOS" --argjson w "$SHARDS_WINDOWS" '
