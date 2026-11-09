@@ -24,7 +24,7 @@ use owlshift_contracts::format::{
     BRIEF_FORMAT, CLAIM_FORMAT, EVENT_FORMAT, FOOTER_FORMAT, QUESTIONS_FORMAT, RESULT_FORMAT,
     TICKET_STATE_FORMAT,
 };
-use owlshift_contracts::service::BuildIdentity;
+use owlshift_contracts::service::{BY_UI, BuildIdentity};
 use owlshift_runner::config::{Effective, OWLSHIFT_VERSION};
 use owlshift_runner::doctor;
 use owlshift_runner::events::printable;
@@ -67,6 +67,7 @@ enum Command {
     /// reply has been left unedited for 10 minutes, or ends with `go`, check
     /// the answers, then ask again what is missing or run on to a verified
     /// pull request. Restarts a parked ticket.
+    #[command(group(clap::ArgGroup::new("served_mode").args(["step", "to_watch"])))]
     Continue {
         /// The ticket, such as OWL-12.
         ticket: String,
@@ -79,10 +80,20 @@ enum Command {
         /// envelope (OWL-399): watch's own, never typed.
         #[arg(long, hide = true, value_name = "ENVELOPE")]
         step: Option<String>,
-        /// The step's served project, its watch's (OWL-434): watch's own,
-        /// never typed.
-        #[arg(long, hide = true, requires = "step", value_name = "OWNER/REPO")]
+        /// The step's served project, its watch's (OWL-434), or the served
+        /// project of the web UI's Restart (OWL-473): watch's and the UI's
+        /// own, never typed.
+        #[arg(long, hide = true, requires = "served_mode", value_name = "OWNER/REPO")]
         served: Option<String>,
+        /// The restart is the web UI's (OWL-473), which its `decision`
+        /// event names: the UI's own, never typed.
+        #[arg(
+            long,
+            hide = true,
+            requires_all = ["to_watch", "served"],
+            conflicts_with = "step"
+        )]
+        from_ui: bool,
     },
     /// Watch this project's tickets whose questions wait, in the foreground,
     /// and continue each one as `owlshift continue` would once its decider's
@@ -390,8 +401,14 @@ fn main() -> ExitCode {
             ticket,
             step: None,
             to_watch: true,
+            from_ui,
             ..
-        } => do_cmd::run(&system, &config, do_cmd::Mode::ToWatch(&ticket), None),
+        } => do_cmd::run(
+            &system,
+            &config,
+            do_cmd::Mode::ToWatch(&ticket, from_ui.then_some(BY_UI)),
+            served,
+        ),
         Command::Continue {
             ticket,
             step: Some(envelope),
@@ -572,5 +589,55 @@ mod tests {
         // OWL-437: removing the service while forgetting one project is no
         // one command.
         assert!(Cli::try_parse_from(["owlshift", "stop", "--forget", "--at-login"]).is_err());
+        // OWL-473: the web UI's Restart, on its served project, stops at
+        // once as a typed `continue --to-watch` does.
+        let from_ui = [
+            "continue",
+            "OWL-1",
+            "--to-watch",
+            "--served",
+            "o/r",
+            "--from-ui",
+        ];
+        assert_eq!(of(&from_ui), None);
+        let cli = Cli::try_parse_from([&["owlshift"][..], &from_ui].concat()).unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Continue {
+                to_watch: true,
+                from_ui: true,
+                step: None,
+                served: Some(ref served),
+                ..
+            } if served == "o/r"
+        ));
+        // `--served` goes with a step or `--to-watch` only, `--from-ui` with
+        // both `--to-watch` and `--served`.
+        for args in [
+            &["continue", "OWL-1", "--served", "o/r"][..],
+            &["continue", "OWL-1", "--to-watch", "--from-ui"],
+            &["continue", "OWL-1", "--served", "o/r", "--from-ui"],
+            &[
+                "continue",
+                "OWL-1",
+                "--step",
+                "{}",
+                "--served",
+                "o/r",
+                "--from-ui",
+            ],
+            &["continue", "OWL-1", "--from-ui"],
+        ] {
+            assert!(
+                Cli::try_parse_from([&["owlshift"], args].concat()).is_err(),
+                "{args:?}"
+            );
+        }
+        assert!(
+            Cli::try_parse_from([
+                "owlshift", "continue", "OWL-1", "--step", "{}", "--served", "o/r"
+            ])
+            .is_ok()
+        );
     }
 }

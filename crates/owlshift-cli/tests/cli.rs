@@ -1502,6 +1502,36 @@ fn continue_hides_its_step_and_refuses_an_envelope_that_does_not_read() {
     );
 }
 
+/// OWL-473: the web UI's Restart, `continue --to-watch --served --from-ui`,
+/// runs on the served project, located from the list of served projects
+/// and never from the working directory: one the list does not hold is
+/// refused before any credential, and the hidden flags stay out of the help.
+#[test]
+fn the_uis_restart_runs_on_the_served_project() {
+    let config_dir = tempfile::tempdir().unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let help = owlshift(dir.path(), config_dir.path(), &["continue", "--help"]);
+    assert!(!stdout(&help).contains("--from-ui"), "{}", stdout(&help));
+    let output = owlshift(
+        dir.path(),
+        config_dir.path(),
+        &[
+            "continue",
+            "OWL-1",
+            "--to-watch",
+            "--served",
+            "acme/web",
+            "--from-ui",
+        ],
+    );
+    assert!(!output.status.success());
+    assert_eq!(
+        stderr(&output),
+        "owlshift: acme/web is not served on this machine: `owlshift start` in its checkout \
+         serves it\n"
+    );
+}
+
 /// What `do` refuses before it opens the keychain.
 #[test]
 fn do_refuses_a_project_it_cannot_deliver_before_any_credential() {

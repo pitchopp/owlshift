@@ -248,6 +248,69 @@ fn a_restart_that_cannot_be_shown_or_kept_leaves_the_park() {
     );
 }
 
+/// OWL-473: the web UI's Restart is the command's, its restart's `decision`
+/// event naming `by` = `ui`: on two benches parked alike, the outcome, the
+/// tracker's stage, the ref's state and spend and the events are the same
+/// but for that.
+#[test]
+fn a_restart_from_the_ui_is_the_commands_with_by_ui() {
+    let typed = parked_at_build();
+    let from_ui = parked_at_build();
+    let from = (typed.events().len(), from_ui.events().len());
+    let (typed_outcome, _) = typed.to_watch();
+    let (ui_outcome, printed) =
+        from_ui.with_on_demand(Vec::new(), None, Vec::new(), |on_demand, sink| {
+            on_demand.continue_to_watch_by(&ticket(), Some("ui"), sink)
+        });
+    assert_eq!(ui_outcome, typed_outcome, "{printed}");
+    assert_eq!(from_ui.stage(), typed.stage());
+    assert_eq!(from_ui.stage(), "In Progress");
+    assert_eq!(state_of(&from_ui), state_of(&typed));
+    let spend = |bench: &Bench| {
+        let mut cost = serde_json::to_value(bench.record().cost).unwrap();
+        // When each run ended differs between the benches.
+        strip_times(&mut cost);
+        cost
+    };
+    assert_eq!(spend(&from_ui), spend(&typed));
+    let told = |bench: &Bench, from: usize| -> Vec<(EventKind, Value)> {
+        bench.events()[from..]
+            .iter()
+            .map(|event| (event.kind, Value::Object(event.data.clone())))
+            .collect()
+    };
+    let mut ui_events = told(&from_ui, from.1);
+    let typed_events = told(&typed, from.0);
+    let restart = ui_events
+        .iter_mut()
+        .find(|(kind, data)| *kind == EventKind::Decision && data.get("restarted").is_some())
+        .expect("the restart's decision");
+    assert_eq!(restart.1["by"], json!("ui"));
+    restart.1.as_object_mut().unwrap().remove("by");
+    assert_eq!(ui_events, typed_events);
+    assert!(
+        decisions(&typed, from.0)
+            .iter()
+            .all(|event| event.get("by").is_none())
+    );
+}
+
+/// `value` without the texts that read as times, wherever they are.
+fn strip_times(value: &mut Value) {
+    match value {
+        Value::Object(map) => {
+            map.retain(|_, value| {
+                !value
+                    .as_str()
+                    .is_some_and(|text| text.parse::<jiff::Timestamp>().is_ok())
+            });
+            map.values_mut().for_each(strip_times);
+        }
+        Value::Array(items) => items.iter_mut().for_each(strip_times),
+        _ => {}
+    }
+}
+
 /// A park at Watch whose pull request is followed is restarted to Watch,
 /// shown in review, for watch to follow.
 #[test]

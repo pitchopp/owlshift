@@ -89,11 +89,25 @@ impl OnDemand<'_> {
         ticket: &TicketId,
         sink: &mut EventSink<'_>,
     ) -> Result<Delivered, Stop> {
+        self.continue_to_watch_by(ticket, None, sink)
+    }
+
+    /// [`Self::continue_to_watch`] made by `by` (OWL-473): the web UI's
+    /// Restart passes `ui`, which its restart's `decision` event names; a
+    /// person's `owlshift continue --to-watch` passes `None`. Nothing else
+    /// differs.
+    pub fn continue_to_watch_by(
+        &self,
+        ticket: &TicketId,
+        by: Option<&'static str>,
+        sink: &mut EventSink<'_>,
+    ) -> Result<Delivered, Stop> {
         let mut p = self.prepare(ticket, Command::Continue)?;
         // A cancel still standing is withdrawn (OWL-474).
         self.withdraw_cancel(ticket, sink);
         self.drop_carry(ticket, sink);
         p.to_watch = true;
+        p.restart_by = by;
         self.continue_prepared(p, sink)
     }
 
@@ -241,6 +255,9 @@ impl OnDemand<'_> {
                 owlshift_contracts::step::Settled::Restarted,
                 sink,
             );
+        } else if let Some(by) = p.restart_by {
+            // A restart from the web UI (OWL-473).
+            event.insert("by".to_owned(), json!(by));
         }
         sink.emit(ticket, None, EventKind::Decision, event);
         if handed.is_none()

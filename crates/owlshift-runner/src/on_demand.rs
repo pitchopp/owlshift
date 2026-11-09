@@ -1468,6 +1468,11 @@ struct Prepared {
     /// `owlshift continue --to-watch` (OWL-420): the command restarts a
     /// park and leaves the ticket to watch, running nothing.
     to_watch: bool,
+    /// Who restarts a park handed to watch when it is not the ticket's
+    /// decider typing `continue` on it (OWL-473): `ui` for the web UI's
+    /// Restart, which the restart's `decision` event names as `by`; `None`
+    /// for a person's `owlshift continue --to-watch`, which names no one.
+    restart_by: Option<&'static str>,
     /// The decider's `continue` comment on the ticket that this restart of
     /// a park is (OWL-488), which the restart's `decision` event names; a
     /// refusal `continue` would print is answered there by a REPLY.
@@ -2786,6 +2791,7 @@ impl OnDemand<'_> {
             policy: self.config.gate_policy(),
             stepping: false,
             to_watch: false,
+            restart_by: None,
             typed: None,
             integrated: false,
             slot_held_by: None,
