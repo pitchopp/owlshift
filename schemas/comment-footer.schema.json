@@ -96,6 +96,11 @@
           "description": "The runner merged the pull request under merge on green (D14,\nOWL-445): which head and method.",
           "type": "string",
           "const": "MERGED"
+        },
+        {
+          "description": "The runner re-ran a red check's failed jobs once, and what that came\nto, with both attempts (OWL-513).",
+          "type": "string",
+          "const": "RERUN"
         }
       ]
     },

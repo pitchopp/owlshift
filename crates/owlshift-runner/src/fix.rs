@@ -115,6 +115,7 @@ pub fn check_failure(red: Red<'_>, excerpts: &dyn Excerpts) -> Result<CheckFailu
         base: red.base.map(str::to_owned),
         checks,
         unfinished: red.unfinished.to_vec(),
+        rerun: None,
     })
 }
 

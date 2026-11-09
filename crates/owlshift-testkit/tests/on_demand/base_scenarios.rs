@@ -407,6 +407,7 @@ fn a_held_ticket_with_an_open_pull_request_is_not_rebased() {
         ended: None,
         merging: None,
         merge_retry: None,
+        rerun: None,
     });
     bench.write_record(&record);
     bench.merge_into_main(&[("FIXED", "fixed\n")]);

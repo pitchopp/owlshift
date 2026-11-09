@@ -41,7 +41,7 @@
     "format": {
       "description": "The format version of this document.",
       "type": "integer",
-      "const": 6
+      "const": 7
     },
     "merge_retry": {
       "description": "When a person's `owlshift continue` at Watch last asked for the\nmerge to be tried again (format 6, OWL-445): watch tries again a head\nwhose merge GitHub refused for good before then. Not a refusal: those\nlive in watch's memory only.",
@@ -107,6 +107,17 @@
       "type": [
         "string",
         "null"
+      ]
+    },
+    "rerun": {
+      "description": "The runner's automatic re-run of a head's failed GitHub Actions jobs\n(format 7, OWL-513; architecture section 5, \"The automatic\nre-run\"): kept before the call, so each head gets one; only the\nlatest head's is kept.",
+      "anyOf": [
+        {
+          "$ref": "#/$defs/Rerun"
+        },
+        {
+          "type": "null"
+        }
       ]
     }
   },
@@ -468,6 +479,135 @@
         "commit",
         "kind",
         "base"
+      ]
+    },
+    "Rerun": {
+      "description": "The runner's re-run of one pushed head (OWL-513).",
+      "type": "object",
+      "properties": {
+        "at": {
+          "description": "When the re-run was asked.",
+          "type": "string",
+          "format": "date-time"
+        },
+        "head": {
+          "description": "The pushed commit whose checks were re-run.",
+          "type": "string"
+        },
+        "jobs": {
+          "description": "The failed jobs' first attempts, as the read before the call listed\nthem.",
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/RerunJob"
+          },
+          "minItems": 1
+        },
+        "outcome": {
+          "description": "What it came to; absent until known.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/RerunOutcomeKind"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "reason": {
+          "description": "GitHub's words refusing the re-run, with `refused` only.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "runs": {
+          "description": "The workflow runs whose failed jobs were re-run, one call each.",
+          "type": "array",
+          "items": {
+            "type": "integer",
+            "format": "uint64",
+            "minimum": 0
+          },
+          "minItems": 1
+        },
+        "told": {
+          "description": "The RERUN comment is on the ticket.",
+          "type": "boolean"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "head",
+        "at",
+        "runs",
+        "jobs"
+      ]
+    },
+    "RerunJob": {
+      "description": "One job a re-run re-ran, its first attempt.",
+      "type": "object",
+      "properties": {
+        "again": {
+          "description": "The newer attempt's link, once the outcome is known; absent when\nnone was seen.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "id": {
+          "description": "The check run's id, the job's.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "name": {
+          "description": "The check run's name.",
+          "type": "string"
+        },
+        "run": {
+          "description": "Its workflow run.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "url": {
+          "description": "The first attempt's link, when the forge gave one.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "name",
+        "id",
+        "run"
+      ]
+    },
+    "RerunOutcomeKind": {
+      "description": "What a re-run came to (OWL-513).",
+      "oneOf": [
+        {
+          "description": "Every re-run job's newer attempt passed: a flake.",
+          "type": "string",
+          "const": "passed"
+        },
+        {
+          "description": "A newer attempt failed: a fix run follows.",
+          "type": "string",
+          "const": "failed"
+        },
+        {
+          "description": "A job showed no newer attempt within an hour: a fix run follows.",
+          "type": "string",
+          "const": "unseen"
+        },
+        {
+          "description": "GitHub refused the call: a fix run follows at once.",
+          "type": "string",
+          "const": "refused"
+        }
       ]
     }
   }

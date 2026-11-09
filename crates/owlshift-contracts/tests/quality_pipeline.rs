@@ -600,7 +600,7 @@ fn brief_quality_pipeline_fields_go_to_their_roles_only() {
         ),
         (
             "a newer brief",
-            with(brief("build"), "format", 30.into()),
+            with(brief("build"), "format", 31.into()),
             "upgrade Owlshift",
         ),
     ] {
@@ -701,7 +701,7 @@ fn bumped_ticket_ref_formats_read_older_ones_and_refuse_newer_ones() {
         ),
         (
             "a newer delivery",
-            &|d| d["format"] = 7.into(),
+            &|d| d["format"] = 8.into(),
             "upgrade Owlshift",
         ),
     ] {
@@ -718,7 +718,7 @@ fn bumped_ticket_ref_formats_read_older_ones_and_refuse_newer_ones() {
         TicketDelivery::parse(&format_4.to_string())
             .unwrap()
             .render()
-            .starts_with("{\n  \"format\": 6,")
+            .starts_with("{\n  \"format\": 7,")
     );
     let mut reviews_in_4 = format_4;
     reviews_in_4["pushing"]["report"]["reviews"] = json!([{ "id": 7, "author": "ada" }]);

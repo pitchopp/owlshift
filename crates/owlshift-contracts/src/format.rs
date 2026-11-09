@@ -46,8 +46,9 @@ use crate::Role;
 /// for a held Build's rebase off a broken base (OWL-427); format 28 gives
 /// `result_refusal` to the design role and the review stages' roles too,
 /// design review, verify and the arbiter (OWL-430); format 29 the build
-/// role's `overlaps` (OWL-449).
-pub const BRIEF_FORMAT: u32 = 29;
+/// role's `overlaps` (OWL-449); format 30 `check_failure.rerun`, the
+/// runner's re-run that failed again before the fix run (OWL-513).
+pub const BRIEF_FORMAT: u32 = 30;
 /// The format version of `result.json`. Format 4 added the resolver's
 /// `resolutions` (OWL-138); format 5 the resolver's own `category` on each
 /// decision (OWL-144); format 6 refuses `decisions` from the build role
@@ -97,9 +98,9 @@ pub const QUESTIONS_FORMAT: u32 = 18;
 /// the first delivery's owed report, with its kept `notes`, and a
 /// correction's owed report that pushed nothing (OWL-236); format 5 a review
 /// loop's push and its report's answered `reviews` (OWL-300); format 6 merge
-/// on green's `merging` and `merge_retry` (OWL-445); formats 1 to 5 are
-/// still read.
-pub const DELIVERY_FORMAT: u32 = 6;
+/// on green's `merging` and `merge_retry` (OWL-445); format 7 the automatic
+/// re-run's `rerun` (OWL-513); formats 1 to 6 are still read.
+pub const DELIVERY_FORMAT: u32 = 7;
 /// The format version of a ticket's intake record (`intake.json` on a ticket
 /// ref, OWL-245). Format 2 adds the `zones` and `resources` intake declared
 /// (OWL-402); format 1 is still read, as holding the whole repository.

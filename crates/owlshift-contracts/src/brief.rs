@@ -497,6 +497,45 @@ pub struct CheckFailure {
     /// The checks still unfinished an hour after the first failure was read.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub unfinished: Vec<String>,
+    /// The runner already re-ran these checks once on this head, and they
+    /// failed again or showed no new attempt (format 30, OWL-513): `checks`
+    /// are then the second attempt's, and `rerun.first` the first's.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rerun: Option<RerunAttempt>,
+}
+
+/// The runner's re-run of the head a fix run is given (OWL-513). It names
+/// the first attempt's jobs and links only: the runner's own ids stay in
+/// the ticket ref.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct RerunAttempt {
+    /// When the runner asked the re-run.
+    pub at: Timestamp,
+    /// `failed`: a new attempt failed; `unseen`: a job showed no new
+    /// attempt within an hour.
+    pub outcome: RerunAttemptOutcome,
+    /// The failed jobs of the first attempt, as the read before the re-run
+    /// listed them.
+    #[schemars(length(min = 1))]
+    pub first: Vec<FirstAttemptJob>,
+}
+
+/// What a re-run a fix run follows came to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum RerunAttemptOutcome {
+    Failed,
+    Unseen,
+}
+
+/// One failed job of the first attempt.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct FirstAttemptJob {
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
 }
 
 /// What a rebase run rebases (OWL-210). Every path is data from the
@@ -649,9 +688,19 @@ pub enum BaseState {
 
 impl CheckFailure {
     /// Checks what the types do not carry: at least one check, each with an
-    /// excerpt or why none, an excerpt within [`MAX_EXCERPT_BYTES`], and all
-    /// of them within [`MAX_EXCERPTS_BYTES`].
+    /// excerpt or why none, an excerpt within [`MAX_EXCERPT_BYTES`], all
+    /// of them within [`MAX_EXCERPTS_BYTES`], and a re-run naming a job.
     fn validate(&self) -> Result<(), ContractError> {
+        if self
+            .rerun
+            .as_ref()
+            .is_some_and(|rerun| rerun.first.is_empty())
+        {
+            return Err(ContractError::invalid(
+                CONTRACT,
+                "a check failure's re-run names no job",
+            ));
+        }
         if self.checks.is_empty() {
             return Err(ContractError::invalid(
                 CONTRACT,

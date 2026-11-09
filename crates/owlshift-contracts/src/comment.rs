@@ -61,10 +61,13 @@ pub enum MarkerKind {
     /// The runner merged the pull request under merge on green (D14,
     /// OWL-445): which head and method.
     Merged,
+    /// The runner re-ran a red check's failed jobs once, and what that came
+    /// to, with both attempts (OWL-513).
+    Rerun,
 }
 
 impl MarkerKind {
-    const ALL: [Self; 11] = [
+    const ALL: [Self; 12] = [
         Self::Questions,
         Self::ReAsk,
         Self::Resume,
@@ -76,6 +79,7 @@ impl MarkerKind {
         Self::Plan,
         Self::Waiting,
         Self::Merged,
+        Self::Rerun,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -91,6 +95,7 @@ impl MarkerKind {
             Self::Plan => "PLAN",
             Self::Waiting => "WAITING",
             Self::Merged => "MERGED",
+            Self::Rerun => "RERUN",
         }
     }
 

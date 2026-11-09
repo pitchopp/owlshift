@@ -8783,7 +8783,8 @@ fn brief_body(comment: &Comment) -> String {
         | MarkerKind::Parked
         | MarkerKind::Intake
         | MarkerKind::Waiting
-        | MarkerKind::Merged => {
+        | MarkerKind::Merged
+        | MarkerKind::Rerun => {
             let note = format!(
                 "\n\n(Cut to {MAX_THREAD_COMMENT_BYTES} bytes in this brief: the whole comment \
                  is on the ticket, tracker comment `{}`.)",

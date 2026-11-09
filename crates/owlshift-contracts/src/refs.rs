@@ -1896,6 +1896,83 @@ pub struct TicketDelivery {
     /// live in watch's memory only.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub merge_retry: Option<Timestamp>,
+    /// The runner's automatic re-run of a head's failed GitHub Actions jobs
+    /// (format 7, OWL-513; architecture section 5, "The automatic
+    /// re-run"): kept before the call, so each head gets one; only the
+    /// latest head's is kept.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rerun: Option<Rerun>,
+}
+
+/// The runner's re-run of one pushed head (OWL-513).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct Rerun {
+    /// The pushed commit whose checks were re-run.
+    pub head: String,
+    /// When the re-run was asked.
+    pub at: Timestamp,
+    /// The workflow runs whose failed jobs were re-run, one call each.
+    #[schemars(length(min = 1))]
+    pub runs: Vec<u64>,
+    /// The failed jobs' first attempts, as the read before the call listed
+    /// them.
+    #[schemars(length(min = 1))]
+    pub jobs: Vec<RerunJob>,
+    /// What it came to; absent until known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub outcome: Option<RerunOutcomeKind>,
+    /// GitHub's words refusing the re-run, with `refused` only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    /// The RERUN comment is on the ticket.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub told: bool,
+}
+
+/// One job a re-run re-ran, its first attempt.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct RerunJob {
+    /// The check run's name.
+    pub name: String,
+    /// The check run's id, the job's.
+    pub id: u64,
+    /// Its workflow run.
+    pub run: u64,
+    /// The first attempt's link, when the forge gave one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
+    /// The newer attempt's link, once the outcome is known; absent when
+    /// none was seen.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub again: Option<String>,
+}
+
+/// What a re-run came to (OWL-513).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum RerunOutcomeKind {
+    /// Every re-run job's newer attempt passed: a flake.
+    Passed,
+    /// A newer attempt failed: a fix run follows.
+    Failed,
+    /// A job showed no newer attempt within an hour: a fix run follows.
+    Unseen,
+    /// GitHub refused the call: a fix run follows at once.
+    Refused,
+}
+
+impl RerunOutcomeKind {
+    /// Its name in the ref, the brief and events.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Passed => "passed",
+            Self::Failed => "failed",
+            Self::Unseen => "unseen",
+            Self::Refused => "refused",
+        }
+    }
 }
 
 /// The runner's merge of the pull request under way (OWL-445).
@@ -2063,6 +2140,7 @@ impl TicketDelivery {
             ended: None,
             merging: None,
             merge_retry: None,
+            rerun: None,
         }
     }
 
@@ -2073,8 +2151,9 @@ impl TicketDelivery {
     /// delivery's report was owed (OWL-236), without that, and a format-4
     /// one, written before a review loop's push (OWL-300), without one, and
     /// a format-5 one, written before merge on green (OWL-445), without a
-    /// merge under way or a retry; the next write gives it the current
-    /// format.
+    /// merge under way or a retry, and a format-6 one, written before the
+    /// automatic re-run (OWL-513), without one; the next write gives it the
+    /// current format.
     pub fn parse(input: &str) -> Result<Self, ContractError> {
         let delivery: Self = match Self::from_older_format(input) {
             Some(read) => read?,
@@ -2084,19 +2163,20 @@ impl TicketDelivery {
         Ok(delivery)
     }
 
-    /// A format-1 to 5 document read as the current format, or `None` for
+    /// A format-1 to 6 document read as the current format, or `None` for
     /// any other. Format 1 is format 2 without `owed` and `pushing.report`,
     /// format 2 is format 3 without a correction's push or report, format 3
     /// is format 4 without an owed delivery report, a report's `notes` or an
     /// owed report's `unchanged`, and format 4 is format 5 without a review
     /// loop's push, a report's `reviews` or `delivered_at` (OWL-307), and
-    /// format 5 is format 6 without `merging` or `merge_retry` (OWL-445), so
-    /// each is refused in an older format.
+    /// format 5 is format 6 without `merging` or `merge_retry` (OWL-445), and
+    /// format 6 is format 7 without `rerun` (OWL-513), so each is refused in
+    /// an older format.
     fn from_older_format(input: &str) -> Option<Result<Self, ContractError>> {
         let mut document: serde_json::Value = serde_json::from_str(input).ok()?;
         let fields = document.as_object_mut()?;
         let format = fields.get("format").and_then(serde_json::Value::as_u64)?;
-        if !(1..=5).contains(&format) {
+        if !(1..=6).contains(&format) {
             return None;
         }
         let pushing = fields.get("pushing").and_then(serde_json::Value::as_object);
@@ -2134,6 +2214,7 @@ impl TicketDelivery {
         let delivered_at = fields.contains_key("delivered_at");
         let merging = fields.contains_key("merging");
         let merge_retry = fields.contains_key("merge_retry");
+        let rerun = fields.contains_key("rerun");
         for (field, kept) in [
             ("owed", format == 1 && owed.is_some()),
             ("pushing.report", format == 1 && report),
@@ -2145,8 +2226,9 @@ impl TicketDelivery {
             ("review loop's push", format <= 4 && review),
             ("report's reviews", format <= 4 && reviews),
             ("delivered_at", format <= 4 && delivered_at),
-            ("merging", merging),
-            ("merge_retry", merge_retry),
+            ("merging", format <= 5 && merging),
+            ("merge_retry", format <= 5 && merge_retry),
+            ("rerun", rerun),
         ] {
             if kept {
                 return Some(Err(ContractError::invalid(
@@ -2181,8 +2263,11 @@ impl TicketDelivery {
     /// with its pull request (and for a rebase its base), and is unchanged
     /// only for a correction or a review loop that kept its report (OWL-307),
     /// that a report names questions exactly when it is a correction's and
-    /// keeps notes only for a delivery or a review loop, and that an ended
-    /// delivery pushes nothing.
+    /// keeps notes only for a delivery or a review loop, that an ended
+    /// delivery pushes nothing, and that a re-run is of a full commit, with
+    /// a workflow run and a job, each job's run among its runs, links of a
+    /// newer attempt only with an outcome, a reason only when refused, and
+    /// told only of an outcome a comment tells (OWL-513).
     pub fn validate(&self) -> Result<(), ContractError> {
         let invalid = |reason: String| Err(ContractError::invalid(Self::CONTRACT, reason));
         for (field, branch) in [("branch", &self.branch), ("base_branch", &self.base_branch)] {
@@ -2326,6 +2411,36 @@ impl TicketDelivery {
         }
         if self.ended.is_some() && self.pull_request.is_none() {
             return invalid("a delivery ended with no pull request".to_owned());
+        }
+        if let Some(rerun) = &self.rerun {
+            rerun.validate().map_err(|reason| {
+                ContractError::invalid(Self::CONTRACT, format!("its re-run {reason}"))
+            })?;
+        }
+        Ok(())
+    }
+}
+
+impl Rerun {
+    /// [`TicketDelivery::validate`]'s rules of a re-run, the flaw said.
+    fn validate(&self) -> Result<(), String> {
+        if !is_commit_id(&self.head) {
+            return Err(format!("head {:?} is not a full commit id", self.head));
+        }
+        if self.runs.is_empty() || self.jobs.is_empty() {
+            return Err("names no workflow run or no job".to_owned());
+        }
+        if let Some(job) = self.jobs.iter().find(|job| !self.runs.contains(&job.run)) {
+            return Err(format!("job {:?} is of a run it did not re-run", job.name));
+        }
+        if self.outcome.is_none() && self.jobs.iter().any(|job| job.again.is_some()) {
+            return Err("links a newer attempt with no outcome".to_owned());
+        }
+        if self.reason.is_some() != (self.outcome == Some(RerunOutcomeKind::Refused)) {
+            return Err("gives a reason if and only if it was refused".to_owned());
+        }
+        if self.told && matches!(self.outcome, None | Some(RerunOutcomeKind::Refused)) {
+            return Err("is told with no outcome to tell".to_owned());
         }
         Ok(())
     }

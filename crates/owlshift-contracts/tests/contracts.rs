@@ -1576,7 +1576,7 @@ fn brief_rejections() {
     );
     rejects(
         "newer format",
-        parse(|v| v["format"] = json!(30)),
+        parse(|v| v["format"] = json!(31)),
         "upgrade Owlshift",
     );
     rejects(
@@ -1803,6 +1803,34 @@ fn brief_rejections() {
     };
     let failure = failing(vec![check(Some("error".into())), check(None)]).unwrap();
     assert_eq!(failure.check_failure.unwrap().checks.len(), 2);
+    // OWL-513: after the runner's re-run failed again, the first attempt's
+    // jobs; a re-run naming none is refused.
+    let rerun = |first: Value| {
+        Brief::parse(&edited("brief.json", |v| {
+            v["check_failure"] = json!({ "pull_request": 7,
+                "url": "https://github.com/demo/project/pull/7",
+                "head": "1111111111111111111111111111111111111111",
+                "checks": [{ "name": "ci", "kind": { "type": "check_run" },
+                    "conclusion": "FAILURE", "required": true, "on_base": "passed",
+                    "excerpt": "error" }],
+                "rerun": { "at": "2026-11-09T10:00:00Z", "outcome": "failed",
+                    "first": first } });
+        }))
+    };
+    let again =
+        rerun(json!([{ "name": "ci", "url": "https://github.com/demo/project/runs/10" }])).unwrap();
+    assert_eq!(Brief::parse(&again.render()).unwrap(), again);
+    let attempt = again.check_failure.unwrap().rerun.unwrap();
+    assert_eq!(
+        attempt.outcome,
+        owlshift_contracts::brief::RerunAttemptOutcome::Failed
+    );
+    assert_eq!(attempt.first[0].name, "ci");
+    rejects(
+        "a re-run with no job",
+        rerun(json!([])),
+        "re-run names no job",
+    );
     rejects(
         "a check failure in an answer check's brief",
         parse(|v| {
@@ -2941,6 +2969,15 @@ fn comment_headers() {
     };
     assert_eq!(merged.render(), "[owlshift] MERGED");
     assert_eq!(Header::parse(&merged.render()).unwrap(), merged);
+    // The automatic re-run's RERUN (OWL-513): no round, waits for no one.
+    let rerun = Header {
+        kind: MarkerKind::Rerun,
+        round: None,
+    };
+    assert_eq!(rerun.render(), "[owlshift] RERUN");
+    assert_eq!(Header::parse(&rerun.render()).unwrap(), rerun);
+    assert!(Header::parse("[owlshift] RERUN · round 1").is_err());
+    assert!(!MarkerKind::Rerun.waits_for_decider());
     // A comment that waits for the decider ends its header with their
     // mention, which is passed over (OWL-324).
     let mention = " · https://linear.app/owlshift/profiles/ada";
@@ -3440,7 +3477,7 @@ fn a_ticket_delivery_round_trips_and_is_checked() {
     .unwrap();
     assert!(older.owed.is_none() && older.pushing.as_ref().unwrap().report.is_none());
     assert!(
-        older.render().contains("\"format\": 6"),
+        older.render().contains("\"format\": 7"),
         "{}",
         older.render()
     );
@@ -3472,7 +3509,7 @@ fn a_ticket_delivery_round_trips_and_is_checked() {
     // in format 1. Format 3 keeps one, whose report names its questions,
     // and only a correction's report does.
     let older = parse(|v| v["format"] = json!(2)).unwrap();
-    assert!(older.render().starts_with("{\n  \"format\": 6,"));
+    assert!(older.render().starts_with("{\n  \"format\": 7,"));
     let refused: [(&str, Edit); 3] = [
         ("correction's push", |v| {
             v["format"] = json!(2);
@@ -3624,6 +3661,87 @@ fn a_ticket_delivery_round_trips_and_is_checked() {
         rejects(field, parse(edit), &format!("format 5 keeps no {field}"));
     }
     assert!(parse(|v| v["merging"] = json!({ "commit": "36f0557", "method": "rebase" })).is_err());
+    // OWL-513: format 7 keeps the automatic re-run of a head, with each
+    // outcome; a format-6 document is read without one, and one that keeps
+    // it is refused.
+    let rerun = |outcome: Option<&str>, told: bool| {
+        let mut rerun = json!({
+            "head": "36f0557116ea73f9b0805980e83b360e23b99940",
+            "at": "2026-11-09T10:00:00Z",
+            "runs": [42378288167u64],
+            "jobs": [{ "name": "ci", "id": 128420443766u64, "run": 42378288167u64,
+                "url": "https://github.com/demo/project/runs/1" }],
+        });
+        if let Some(outcome) = outcome {
+            rerun["outcome"] = json!(outcome);
+            if outcome == "refused" {
+                rerun["reason"] = json!("Resource not accessible by integration");
+            } else {
+                rerun["jobs"][0]["again"] = json!("https://github.com/demo/project/runs/2");
+            }
+        }
+        if told {
+            rerun["told"] = json!(true);
+        }
+        rerun
+    };
+    let with = |rerun: Value| {
+        TicketDelivery::parse(&edited("ticket-delivery.json", |v| v["rerun"] = rerun))
+    };
+    for (outcome, told) in [
+        (None, false),
+        (Some("passed"), true),
+        (Some("failed"), false),
+        (Some("unseen"), true),
+        (Some("refused"), false),
+    ] {
+        let delivery = with(rerun(outcome, told)).unwrap();
+        let kept = delivery.rerun.as_ref().unwrap();
+        assert_eq!(kept.outcome.map(|o| o.as_str()), outcome);
+        assert_eq!(kept.told, told);
+        assert_eq!(TicketDelivery::parse(&delivery.render()).unwrap(), delivery);
+    }
+    let older = parse(|v| v["format"] = json!(6)).unwrap();
+    assert!(older.rerun.is_none());
+    let kept = rerun(None, false);
+    rejects(
+        "rerun",
+        TicketDelivery::parse(&edited("ticket-delivery.json", |v| {
+            v["format"] = json!(6);
+            v["rerun"] = kept;
+        })),
+        "format 6 keeps no rerun",
+    );
+    let mut short = rerun(None, false);
+    short["head"] = json!("36f0557");
+    let mut no_jobs = rerun(None, false);
+    no_jobs["jobs"] = json!([]);
+    let mut other_run = rerun(None, false);
+    other_run["jobs"][0]["run"] = json!(7);
+    let mut early_again = rerun(None, false);
+    early_again["jobs"][0]["again"] = json!("https://github.com/demo/project/runs/2");
+    for (case, rerun, needle) in [
+        ("a short head", short, "is not a full commit id"),
+        ("no job", no_jobs, "names no workflow run or no job"),
+        (
+            "a job of another run",
+            other_run,
+            "of a run it did not re-run",
+        ),
+        (
+            "a newer attempt with no outcome",
+            early_again,
+            "with no outcome",
+        ),
+        (
+            "told refused",
+            rerun(Some("refused"), true),
+            "no outcome to tell",
+        ),
+        ("told unsettled", rerun(None, true), "no outcome to tell"),
+    ] {
+        rejects(case, with(rerun), needle);
+    }
 }
 
 /// OWL-500: a follow-up is secondary to the run's outcome. Its `evidence`
