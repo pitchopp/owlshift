@@ -4,7 +4,9 @@
 // ever read as markup. The only secret this page sends is the session, in
 // the `X-Owlshift-Session` header; the login sends the one-time code.
 // The overview (OWL-470) is further down: For you, the columns and list views
-// and the panel of what happened since the last visit.
+// and the panel of what happened since the last visit. A ticket's page and
+// For you's parked entries act too (OWL-473): Restart and Cancel, each posted
+// through `authedFetch` to its command's route.
 "use strict";
 
 const SESSION_KEY = "owlshift.session";
@@ -547,6 +549,7 @@ function openTicket(target) {
   handle.note = make("p", "notice", "Loading…");
   el.appendChild(handle.note);
   for (const [name, title] of [
+    ["actions", "Actions"],
     ["timeline", "Timeline"],
     ["cost", "Cost"],
     ["runs", "Runs"],
@@ -660,6 +663,7 @@ function problemLine(parent, why) {
 // Draws the sections of a snapshot that changed since the one before.
 function renderSnapshot(handle, snapshot) {
   const sections = [
+    ["actions", renderActions],
     ["timeline", renderTimeline],
     ["cost", renderCost],
     ["questions", renderQuestions],
@@ -701,6 +705,100 @@ function renderSnapshot(handle, snapshot) {
     handle.last.runs = null;
     problemLine(handle.runsNotes, "the page cannot draw the runs (" + error + ")");
   }
+}
+
+// What an action's answer says (OWL-473): its lines, or why it was refused,
+// each with the class that colours it; a restart still under way (202) is
+// information.
+function actionSaid(response, value) {
+  if (response.ok) {
+    const className = response.status === 202 ? "state-information" : "state-success";
+    return ((value && value.lines) || []).map((line) => [className, line]);
+  }
+  return [["state-danger", (value && value.error) || "The server answered " + response.status + "."]];
+}
+
+// Posts `body` to an action's route `path` with the session: what it says.
+async function postAction(path, body) {
+  const answer = await authedFetch(path, { method: "POST", body: JSON.stringify(body) });
+  if (!answer) {
+    return null;
+  }
+  let value = null;
+  try {
+    value = await answer.response.json();
+  } catch (_) {
+    // A body that is not JSON: the status says what happened.
+  }
+  return actionSaid(answer.response, value);
+}
+
+function saidLines(parent, said) {
+  for (const [className, line] of said || []) {
+    parent.appendChild(make("p", className + " pre-text", line));
+  }
+}
+
+// One of the ticket's actions, then the snapshot read again at once.
+async function ticketAction(handle, path, extra, button) {
+  button.disabled = true;
+  const said = await postAction(path, Object.assign({ project: handle.project, ticket: handle.ticket }, extra));
+  if (!alive(handle) || !said) {
+    return;
+  }
+  button.disabled = false;
+  handle.actionSaid = said;
+  handle.last.actions = null;
+  window.clearTimeout(handle.snapshotTimer);
+  refresh(handle);
+}
+
+// The ticket's actions (OWL-473): Restart while it is parked, which runs
+// `owlshift continue --to-watch` on the server; Cancel where `owlshift
+// cancel` would write one, after a confirmation, with an optional reason;
+// and the cancel that stands.
+function renderActions(handle, body, actions) {
+  if (actions.restart) {
+    const row = make("div", "control-row");
+    const restart = make("button", "action", "Restart");
+    restart.type = "button";
+    restart.addEventListener("click", () => ticketAction(handle, "/api/restart", {}, restart));
+    row.appendChild(restart);
+    row.appendChild(make("span", "muted", "Restarts the parked ticket and leaves it to its watch, " +
+      "which resumes it at its next pass, as owlshift continue --to-watch does."));
+    body.appendChild(row);
+  }
+  if (actions.cancel) {
+    const row = make("div", "control-row");
+    const reason = make("input", "control-reason");
+    reason.type = "text";
+    reason.placeholder = "reason (optional)";
+    reason.setAttribute("aria-label", "Why " + handle.ticket + " is canceled");
+    const cancel = make("button", "action", "Cancel");
+    cancel.type = "button";
+    cancel.addEventListener("click", () => {
+      if (!window.confirm("Cancel " + handle.ticket + "? Its step under way stops within 5 seconds, " +
+        "and its watch parks it with a PARKED comment on the ticket.")) {
+        return;
+      }
+      ticketAction(handle, "/api/cancel", { reason: reason.value }, cancel);
+    });
+    row.appendChild(reason);
+    row.appendChild(cancel);
+    body.appendChild(row);
+  } else if (actions.cancel_refusal) {
+    body.appendChild(make("p", "notice", "Cancel is not offered: " + actions.cancel_refusal));
+  }
+  const standing = actions.cancel_standing;
+  if (standing) {
+    body.appendChild(make("p", "state-warning", standing.unreadable
+      ? "A cancel file stands that does not say who wrote it."
+      : "A cancel stands, asked by " + standing.by + " at " + shortTime(standing.at) + ": " + standing.why));
+  }
+  if (!actions.restart && !actions.cancel && !standing && !actions.cancel_refusal) {
+    body.appendChild(make("p", "notice", "Nothing to do on this ticket now."));
+  }
+  saidLines(body, handle.actionSaid);
 }
 
 function renderTimeline(handle, body, timeline) {
@@ -1753,6 +1851,30 @@ function shownProjects(overview) {
   return overview.projects.filter((project) => !chosen || project.repository === chosen);
 }
 
+// What each Restart from For you said, by project and ticket, kept across
+// the redraws of the overview (OWL-473).
+const restartSaid = new Map();
+
+// A parked entry's Restart: `owlshift continue --to-watch`, run on the
+// server, as the ticket page's.
+function restartButton(entry) {
+  const button = make("button", "action", "Restart");
+  button.type = "button";
+  button.addEventListener("click", async () => {
+    button.disabled = true;
+    const said = await postAction("/api/restart", { project: entry.project, ticket: entry.ticket });
+    if (!said) {
+      return;
+    }
+    button.disabled = false;
+    restartSaid.set(entry.project + " " + entry.ticket, said);
+    if (lastOverview) {
+      renderForYou(lastOverview);
+    }
+  });
+  return button;
+}
+
 function renderForYou(overview) {
   const body = document.getElementById("for-you-body");
   clear(body);
@@ -1787,6 +1909,10 @@ function renderForYou(overview) {
       }
       for (const question of entry.questions) {
         item.appendChild(make("div", "question", question.id + ": " + question.text));
+      }
+      if (key === "parked") {
+        item.appendChild(restartButton(entry));
+        saidLines(item, restartSaid.get(entry.project + " " + entry.ticket));
       }
       list.appendChild(item);
     }

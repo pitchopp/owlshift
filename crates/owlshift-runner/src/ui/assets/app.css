@@ -552,6 +552,47 @@ pre {
   display: inline-flex;
 }
 
+/* The actions (OWL-473): a row of controls, the reason a pause or a cancel
+   takes, and the personal file's editor. */
+.control-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px 12px;
+  padding: 4px 0;
+  border-bottom: 1px solid var(--border-hairline);
+}
+
+.control-reason,
+.control-input {
+  font: inherit;
+  min-width: 12em;
+}
+
+.control-list {
+  font: inherit;
+  min-width: 18em;
+  min-height: 4em;
+}
+
+.control-said {
+  margin: 4px 0;
+}
+
+.action {
+  background: var(--surface);
+  color: var(--text);
+  border: 1px solid var(--border-strong);
+  border-radius: 4px;
+  padding: 2px 12px;
+  font: inherit;
+  cursor: pointer;
+}
+
+.action:disabled {
+  cursor: progress;
+}
+
 .toggle {
   background: var(--surface);
   color: var(--text);

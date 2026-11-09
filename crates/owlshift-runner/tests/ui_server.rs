@@ -602,6 +602,8 @@ fn no_asset_holds_the_token_and_the_page_sends_only_the_code_and_the_session() {
             "authedFetch(path, init",
             "authedFetch(streamPath(mine.graph",
             "authedFetch(snapshotPath(handle",
+            // The actions' one POST, Restart and Cancel (OWL-473).
+            "authedFetch(path, { method: \"POST\", body: JSON.stringify(body",
             // The reply form's one POST (OWL-475).
             "authedFetch(\"/api/reply\", {\n    method: \"POST\",\n    body: JSON.stringify({\n      project: handle.project,\n      ticket: handle.ticket,\n      ask: reply.ask,\n      answers: answers,\n      go: draft.go,\n    }",
             "authedFetch(logPath(handle, run.id, which, log.from, log.line",
@@ -614,8 +616,9 @@ fn no_asset_holds_the_token_and_the_page_sends_only_the_code_and_the_session() {
     assert!(APP_JS.contains("return current.id + \".\" + current.secret;"));
     assert!(APP_JS.contains("const sent = sessionHeader(current);"));
     assert!(APP_JS.contains("headers[SESSION_HEADER] = sent;"));
-    // The login's code, and the reply's form: its fields and nothing else.
-    assert_eq!(APP_JS.matches("body:").count(), 2);
+    // The login's code, the reply's form and an action's body (OWL-473):
+    // their fields and nothing else.
+    assert_eq!(APP_JS.matches("body:").count(), 3);
     assert!(APP_JS.contains("options.body = init.body;"));
 }
 
@@ -3940,4 +3943,146 @@ fn a_restarts_answer_is_its_commands_own_words() {
         server::run_restart(std::process::Command::new("/nowhere/owlshift"), wait),
         server::Restarted::NotStarted(_)
     ));
+}
+
+/// The routes an asset names in a JavaScript string, `"/api/…"`.
+fn routes_named(asset: &str) -> std::collections::BTreeSet<String> {
+    asset
+        .match_indices("\"/api/")
+        .map(|(at, _)| {
+            let rest = &asset[at + 1..];
+            let end = rest
+                .find(|c: char| !(c.is_ascii_lowercase() || c == '/' || c == '_'))
+                .unwrap_or(rest.len());
+            rest[..end].to_owned()
+        })
+        .collect()
+}
+
+/// OWL-473: the page sends its actions to a closed set of routes, each
+/// through the request helper that carries the session, and offers no way
+/// to start or stop the service or to lift a quarantine: the server has no
+/// such route.
+#[test]
+fn the_page_posts_its_actions_to_their_routes_only() {
+    const GETS: [&str; 10] = [
+        "/api/header",
+        "/api/stream",
+        "/api/overview",
+        "/api/since",
+        "/api/graph",
+        "/api/ticket",
+        "/api/ticket/log",
+        "/api/orchestrator",
+        "/api/spend",
+        "/api/config",
+    ];
+    const POSTS: [&str; 9] = [
+        "/api/login",
+        "/api/reply",
+        "/api/doctor",
+        "/api/pause",
+        "/api/resume",
+        "/api/forget",
+        "/api/cancel",
+        "/api/restart",
+        "/api/config/personal",
+    ];
+    let app = routes_named(APP_JS);
+    let ops = routes_named(OPS_JS);
+    for route in app.iter().chain(&ops) {
+        assert!(
+            GETS.contains(&route.as_str()) || POSTS.contains(&route.as_str()),
+            "an asset names {route}"
+        );
+    }
+    for route in ["/api/cancel", "/api/restart"] {
+        assert!(app.contains(route), "app.js does not post {route}");
+    }
+    for route in [
+        "/api/pause",
+        "/api/resume",
+        "/api/forget",
+        "/api/config/personal",
+    ] {
+        assert!(ops.contains(route), "ops.js does not post {route}");
+    }
+    // Each action goes through the helper of its file that carries the
+    // session (`no_asset_holds_the_token_…` pins their callers): `postAction`
+    // in app.js, `act` or `editKey` in ops.js, which call `request`.
+    for route in ["/api/cancel", "/api/restart"] {
+        for (at, _) in APP_JS.match_indices(&format!("\"{route}\"")) {
+            let before = &APP_JS[at.saturating_sub(40)..at];
+            assert!(
+                before.contains("postAction(") || before.contains("ticketAction(handle, "),
+                "{route}: {before}"
+            );
+        }
+    }
+    for route in ["/api/pause", "/api/resume", "/api/forget"] {
+        for (at, _) in OPS_JS.match_indices(&format!("\"{route}\"")) {
+            assert!(
+                OPS_JS[at.saturating_sub(20)..at].contains("act(state, "),
+                "{route}"
+            );
+        }
+    }
+    assert!(OPS_JS.contains("await request(\"/api/config/personal\", { path: path, value: value"));
+    let ground = Ground::new();
+    for path in [
+        "/api/start",
+        "/api/stop",
+        "/api/unquarantine",
+        "/api/quarantine",
+    ] {
+        assert_eq!(ground.post(path, &json!({})).status, 404, "{path}");
+    }
+}
+
+/// OWL-473: Stop serving and Cancel ask for a confirmation right before they
+/// post; no other action does.
+#[test]
+fn only_stop_serving_and_cancel_ask_for_a_confirmation() {
+    for (asset, route) in [(OPS_JS, "\"/api/forget\""), (APP_JS, "\"/api/cancel\"")] {
+        assert_eq!(asset.matches("confirm(").count(), 1, "{route}");
+        let at = asset.find("window.confirm(").unwrap();
+        let next = asset[at..].find("\"/api/").unwrap();
+        assert!(
+            asset[at + next..].starts_with(route),
+            "the confirmation comes before {route}"
+        );
+        assert!(next < 400, "{route} follows its confirmation at once");
+    }
+}
+
+/// OWL-473: the Config screen has a control for each kind of key the
+/// personal file's table names, and none for a kind it does not.
+#[test]
+fn each_kind_of_key_has_its_control() {
+    let start = OPS_JS.find("const CONTROLS = {").unwrap();
+    let end = start + OPS_JS[start..].find("\n  };").unwrap();
+    let controls: std::collections::BTreeSet<&str> = OPS_JS[start..end]
+        .lines()
+        .skip(1)
+        .filter_map(|line| line.trim().split_once(':').map(|(kind, _)| kind))
+        .collect();
+    let kinds: std::collections::BTreeSet<&str> = owlshift_runner::personal_edit::KEYS
+        .iter()
+        .map(|info| info.kind.key())
+        .collect();
+    assert_eq!(controls, kinds);
+}
+
+/// The page's two scripts read as JavaScript in the test engine.
+#[test]
+fn the_scripts_parse() {
+    use boa_engine::{Context, Source};
+    for (name, asset) in [("app.js", APP_JS), ("ops.js", OPS_JS)] {
+        // Wrapped in a function never called: parsed, not run.
+        let code = format!("(function () {{\n{}\n}});", lf(asset));
+        let mut context = Context::default();
+        if let Err(error) = context.eval(Source::from_bytes(code.as_bytes())) {
+            panic!("{name} does not parse: {error}");
+        }
+    }
 }
