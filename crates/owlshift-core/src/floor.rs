@@ -71,6 +71,11 @@ pub enum Action {
     /// Change infrastructure: environment variables, feature flags, DNS, CI
     /// settings.
     ChangeInfrastructure,
+    /// Re-run the failed GitHub Actions jobs of a followed pull request's
+    /// head, once per head, for watch's automatic re-run (OWL-513,
+    /// architecture section 5, "The automatic re-run"): the one CI action
+    /// the runner takes, never at an agent's request.
+    RerunCheck,
     /// Write a `blocks` relation between two tickets: a dependency intake
     /// found (architecture section 5, "Dependencies to relations").
     Relate,
@@ -170,7 +175,7 @@ pub fn check_from(
             | Action::PushBranch
             | Action::PushRef
             | Action::OpenPullRequest => Ok(()),
-            Action::Relate => Ok(()),
+            Action::Relate | Action::RerunCheck => Ok(()),
             Action::Reply(_) => Err(FloorViolation::ReplyNotFromUi),
         },
         Origin::Ui => match action {
@@ -185,6 +190,7 @@ pub fn check_from(
             | Action::Merge(_)
             | Action::Deploy
             | Action::ChangeInfrastructure
+            | Action::RerunCheck
             | Action::Relate) => Err(FloorViolation::FromUi(other)),
         },
     }
@@ -549,9 +555,15 @@ mod tests {
             Action::PushBranch,
             Action::PushRef,
             Action::OpenPullRequest,
+            Action::RerunCheck,
         ];
         for action in actions {
-            assert_eq!(check_action(action, HumanApproval::Absent), Ok(()));
+            assert_eq!(check_action(action.clone(), HumanApproval::Absent), Ok(()));
+            // The UI makes none of them.
+            assert_eq!(
+                check_from(Origin::Ui, action.clone(), HumanApproval::Absent),
+                Err(FloorViolation::FromUi(action))
+            );
         }
     }
 

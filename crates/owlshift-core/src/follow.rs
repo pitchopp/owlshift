@@ -71,6 +71,67 @@ impl CheckOutcome {
 pub struct CheckRead {
     pub name: String,
     pub outcome: CheckOutcome,
+    /// The check run's id, a GitHub Actions job's id (OWL-513): a re-run's
+    /// new attempt of a job has a greater one.
+    pub id: Option<u64>,
+    /// The workflow run of a GitHub Actions check run, when read.
+    pub run: Option<u64>,
+    /// Whether the runner can re-run it: a GitHub Actions job whose id and
+    /// workflow run were read (OWL-513).
+    pub rerunnable: bool,
+}
+
+impl CheckRead {
+    /// A check known by its name and outcome alone: no id, no workflow run,
+    /// not re-runnable.
+    pub fn named(name: impl Into<String>, outcome: CheckOutcome) -> Self {
+        Self {
+            name: name.into(),
+            outcome,
+            id: None,
+            run: None,
+            rerunnable: false,
+        }
+    }
+}
+
+/// The first attempt of one job the runner re-ran (OWL-513): its check
+/// run's id, its workflow run and its name.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FirstAttempt {
+    pub id: u64,
+    pub run: u64,
+    pub name: String,
+}
+
+/// The runner's re-run of a head (OWL-513, architecture section 5, "The
+/// automatic re-run"): the head, the first attempts of the jobs it re-ran,
+/// empty when GitHub refused the re-run, and how long ago it was asked.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RerunMark<'a> {
+    pub head: &'a str,
+    pub first: &'a [FirstAttempt],
+    pub since: Duration,
+}
+
+/// The checks of `checks` that are newer attempts of `first`'s job: the
+/// same name, the same workflow run and a greater id (OWL-513). A check of
+/// the same name from another workflow run, or with no run or no id, never
+/// is. The one rule the first-attempt view, [`replaced_attempts`],
+/// [`rerun_outcome`] and the runner's links all read.
+pub fn newer_attempts<'c>(
+    checks: &'c [CheckRead],
+    first: &FirstAttempt,
+) -> impl Iterator<Item = &'c CheckRead> {
+    let (name, run, id) = (first.name.clone(), first.run, first.id);
+    checks.iter().filter(move |c| {
+        c.name == name && c.run == Some(run) && c.id.is_some_and(|newer| newer > id)
+    })
+}
+
+/// Whether `check` is `first`'s own attempt, by its id.
+fn is_first(check: &CheckRead, first: &FirstAttempt) -> bool {
+    check.id == Some(first.id)
 }
 
 /// The pull request as read: its state, head, mergeability and the complete
@@ -95,6 +156,9 @@ pub struct Followed<'a> {
     /// section 5, "Tolerated overlap", "The refresh"): the runner's reading,
     /// from git. `None` otherwise.
     pub overlap: Option<&'a str>,
+    /// The runner's re-run kept in `delivery.json` (OWL-513), of whatever
+    /// head: only one of the read's head counts.
+    pub rerun: Option<RerunMark<'a>>,
 }
 
 /// The base branch's head, its checks, and the checks of `base_at_push`
@@ -144,6 +208,10 @@ pub enum Action {
     /// The pull request conflicts with the base head the last rebase run
     /// used: that rebase failed, and no second one runs onto the same head.
     RebaseFailed { onto: String },
+    /// Every failed check a code failure of a re-runnable GitHub Actions
+    /// job, with no re-run made on this head yet: the runner re-runs their
+    /// workflow runs' failed jobs once (OWL-513). Nothing is counted.
+    Rerun,
     /// A fix run. `overdue` names the checks still unfinished an hour after
     /// a failure was first read beside them.
     Fix { overdue: Vec<String> },
@@ -243,7 +311,14 @@ fn act(
             cause: RebaseCause::Overlap,
         };
     }
-    let checks = collapse(&read.checks);
+    // The runner's re-run of this head: its jobs' first attempts give way
+    // to their newer ones, and read as running until those show.
+    let mark = followed.rerun.filter(|mark| mark.head == read.head);
+    let listed = match mark {
+        Some(mark) => first_attempt_view(&read.checks, &mark),
+        None => read.checks.clone(),
+    };
+    let checks = collapse(&listed);
     let failed: Vec<&CheckRead> = checks.iter().filter(|c| c.outcome.failed()).collect();
     let pending: Vec<String> = checks
         .iter()
@@ -301,7 +376,106 @@ fn act(
             };
         }
     }
+    // The checks as listed, not collapsed by name: two workflows' jobs of
+    // one name are each read as they are.
+    let rerunnable = listed
+        .iter()
+        .filter(|c| c.outcome.failed())
+        .all(|c| c.outcome == CheckOutcome::CodeFailure && c.rerunnable);
+    if mark.is_none() && overdue.is_empty() && rerunnable {
+        return Action::Rerun;
+    }
     Action::Fix { overdue }
+}
+
+/// `checks` as the table reads them on the head `mark` re-ran (OWL-513):
+/// each re-run job's listed first attempt is left out; with a newer
+/// attempt, those stand; with none yet, one check of its name stands in,
+/// running until an hour after the call, then failed as its first attempt
+/// read. A job the read does not list at all, such as an aggregate check
+/// whose legs run again, waits the same way.
+fn first_attempt_view(checks: &[CheckRead], mark: &RerunMark<'_>) -> Vec<CheckRead> {
+    let mut out: Vec<CheckRead> = checks
+        .iter()
+        .filter(|c| !mark.first.iter().any(|first| is_first(c, first)))
+        .cloned()
+        .collect();
+    for first in mark.first {
+        if newer_attempts(checks, first).next().is_none() {
+            out.push(CheckRead {
+                name: first.name.clone(),
+                outcome: if mark.since >= OVERDUE_AFTER {
+                    CheckOutcome::CodeFailure
+                } else {
+                    CheckOutcome::Pending
+                },
+                id: Some(first.id),
+                run: Some(first.run),
+                rerunnable: true,
+            });
+        }
+    }
+    out
+}
+
+/// One flag per check of `checks`, in order: whether it is the first
+/// attempt of a job `mark` re-ran that a newer attempt replaces (OWL-513).
+/// A fix run's brief leaves those out.
+pub fn replaced_attempts(checks: &[CheckRead], mark: &RerunMark<'_>) -> Vec<bool> {
+    checks
+        .iter()
+        .map(|check| {
+            mark.first.iter().any(|first| {
+                is_first(check, first) && newer_attempts(checks, first).next().is_some()
+            })
+        })
+        .collect()
+}
+
+/// What the runner's re-run of a head came to (OWL-513).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RerunOutcome {
+    /// Every re-run job's newer attempt passed: a flake.
+    Passed,
+    /// A newer attempt failed.
+    Failed,
+    /// A job showed no newer attempt within an hour of the call.
+    Unseen,
+}
+
+/// The outcome of `mark`'s re-run on `read`, by [`newer_attempts`]:
+/// `None` while a newer attempt runs, or while a job has none and the hour
+/// has not passed, or when the read is of another head or the re-run was
+/// refused (no first attempt). Then failed when a newer attempt failed,
+/// unseen when a job had none, passed otherwise.
+pub fn rerun_outcome(read: &Read, mark: &RerunMark<'_>) -> Option<RerunOutcome> {
+    if read.head != mark.head || mark.first.is_empty() {
+        return None;
+    }
+    let (mut failed, mut unseen) = (false, false);
+    for first in mark.first {
+        let mut newer = newer_attempts(&read.checks, first).peekable();
+        if newer.peek().is_none() {
+            if mark.since < OVERDUE_AFTER {
+                return None;
+            }
+            unseen = true;
+        }
+        for attempt in newer {
+            match attempt.outcome {
+                CheckOutcome::Pending => return None,
+                CheckOutcome::Passed => {}
+                CheckOutcome::CodeFailure | CheckOutcome::OtherFailure => failed = true,
+            }
+        }
+    }
+    Some(if failed {
+        RerunOutcome::Failed
+    } else if unseen {
+        RerunOutcome::Unseen
+    } else {
+        RerunOutcome::Passed
+    })
 }
 
 /// The checks with each name once, at its worst outcome, in the order each
@@ -717,10 +891,7 @@ mod tests {
     const PUSHED: &str = "p";
 
     fn check(name: &str, outcome: CheckOutcome) -> CheckRead {
-        CheckRead {
-            name: name.to_owned(),
-            outcome,
-        }
+        CheckRead::named(name, outcome)
     }
 
     fn read(mergeable: Mergeable, checks: &[(&str, CheckOutcome)]) -> Read {
@@ -738,6 +909,7 @@ mod tests {
             pushing: None,
             rebased_onto: None,
             overlap: None,
+            rerun: None,
         }
     }
 
@@ -1013,6 +1185,297 @@ mod tests {
         assert_eq!(outcome_of(&b.at_head, "ci"), Some(CodeFailure));
         assert_eq!(outcome_of(&running.checks, "ci"), Some(Pending));
         assert_eq!(outcome_of(&running.checks, "lint"), None);
+    }
+
+    /// A job of workflow run `run`, check run `id` (OWL-513).
+    fn job(name: &str, outcome: CheckOutcome, id: u64, run: u64) -> CheckRead {
+        CheckRead {
+            name: name.to_owned(),
+            outcome,
+            id: Some(id),
+            run: Some(run),
+            rerunnable: true,
+        }
+    }
+
+    fn first(name: &str, id: u64, run: u64) -> FirstAttempt {
+        FirstAttempt {
+            id,
+            run,
+            name: name.to_owned(),
+        }
+    }
+
+    fn jobs(checks: Vec<CheckRead>) -> Read {
+        Read {
+            state: PrState::Open,
+            head: PUSHED.to_owned(),
+            mergeable: Mergeable::Mergeable,
+            checks,
+        }
+    }
+
+    /// The read's action with `mark`, re-run of `head`, `since` ago, and a
+    /// base where every check passes.
+    fn rerun_action(read: &Read, head: &str, first: &[FirstAttempt], since: Duration) -> Action {
+        let mark = RerunMark { head, first, since };
+        let followed = Followed {
+            rerun: Some(mark),
+            ..followed()
+        };
+        let base = base("b", &[], None);
+        match decide(read, followed, Some(&base), None) {
+            Decision::Follow { action, .. } => action,
+            other => panic!("{other:?}"),
+        }
+    }
+
+    const SOON: Duration = Duration::from_secs(60);
+
+    /// A red of Actions jobs alone is re-run, once per head: a mark of this
+    /// head gives the fix, one of another head the re-run again.
+    #[test]
+    fn a_red_of_actions_jobs_is_rerun_once_per_head() {
+        let r = jobs(vec![
+            job("check (ubuntu-latest)", CodeFailure, 10, 7),
+            job("check (macos-latest)", Passed, 11, 7),
+            job("ci", CodeFailure, 12, 7),
+        ]);
+        let b = base("b", &[], None);
+        assert_eq!(action(&r, Some(&b), None), Action::Rerun);
+        // Refused for this head: the checks read as they are.
+        assert_eq!(
+            rerun_action(&r, PUSHED, &[], SOON),
+            Action::Fix { overdue: vec![] }
+        );
+        assert_eq!(rerun_action(&r, "older", &[], SOON), Action::Rerun);
+        // Re-run on this head, its newer attempts failed again.
+        let again = jobs(vec![
+            job("check (ubuntu-latest)", CodeFailure, 20, 7),
+            job("check (macos-latest)", Passed, 11, 7),
+            job("ci", CodeFailure, 21, 7),
+        ]);
+        let ran = [first("check (ubuntu-latest)", 10, 7), first("ci", 12, 7)];
+        assert_eq!(
+            rerun_action(&again, PUSHED, &ran, SOON),
+            Action::Fix { overdue: vec![] }
+        );
+        assert_eq!(rerun_action(&again, "older", &ran, SOON), Action::Rerun);
+    }
+
+    /// The base rows come first: a red the base shares waits, one the base
+    /// has fixed since is a refresh, re-runnable jobs or not.
+    #[test]
+    fn the_base_rows_come_before_the_rerun() {
+        let r = jobs(vec![job("ci", CodeFailure, 10, 7)]);
+        let red = base("b", &[("ci", CodeFailure)], None);
+        assert_eq!(action(&r, Some(&red), None), Action::WaitBaseRed);
+        let fixed = base("b2", &[("ci", Passed)], Some(&[("ci", CodeFailure)]));
+        assert_eq!(
+            action(&r, Some(&fixed), None),
+            Action::Rebase {
+                onto: "b2".to_owned(),
+                cause: RebaseCause::BaseFixed
+            }
+        );
+    }
+
+    /// Only finished code failures of re-runnable jobs are re-run.
+    #[test]
+    fn only_finished_code_failures_of_actions_jobs_are_rerun() {
+        let b = base("b", &[], None);
+        let mut cancelled = job("ci", OtherFailure, 10, 7);
+        let other = jobs(vec![cancelled.clone()]);
+        assert_eq!(action(&other, Some(&b), None), Action::Park);
+        let mixed = jobs(vec![cancelled.clone(), job("t", CodeFailure, 11, 7)]);
+        assert_eq!(
+            action(&mixed, Some(&b), None),
+            Action::Fix { overdue: vec![] }
+        );
+        // A status, or a job whose run was not read, beside a re-runnable one.
+        cancelled.outcome = CodeFailure;
+        cancelled.rerunnable = false;
+        let status = jobs(vec![cancelled, job("t", CodeFailure, 11, 7)]);
+        assert_eq!(
+            action(&status, Some(&b), None),
+            Action::Fix { overdue: vec![] }
+        );
+        // A check still running an hour after the failure: the fix.
+        let overdue = jobs(vec![
+            job("t", CodeFailure, 11, 7),
+            job("win", Pending, 12, 7),
+        ]);
+        assert_eq!(action(&overdue, Some(&b), None), Action::WaitChecks);
+        assert_eq!(
+            action(&overdue, Some(&b), Some(OVERDUE_AFTER)),
+            Action::Fix {
+                overdue: vec!["win".to_owned()]
+            }
+        );
+        // Two workflows' jobs of one name: the failing one is not re-runnable,
+        // whatever the passing one listed first is.
+        let mut status_ci = check("ci", CodeFailure);
+        status_ci.run = None;
+        let named = jobs(vec![job("ci", Passed, 9, 6), status_ci]);
+        assert_eq!(
+            action(&named, Some(&b), None),
+            Action::Fix { overdue: vec![] }
+        );
+    }
+
+    /// A re-run job's first attempt waits for its newer one, in both
+    /// listings: the first attempt still listed, or the newest alone.
+    #[test]
+    fn first_attempts_wait_for_the_rerun_then_give_way() {
+        let ran = [first("ci", 10, 7)];
+        let at = |checks: Vec<CheckRead>, since| rerun_action(&jobs(checks), PUSHED, &ran, since);
+        assert_eq!(
+            at(vec![job("ci", CodeFailure, 10, 7)], SOON),
+            Action::WaitChecks
+        );
+        assert_eq!(at(vec![job("ci", Passed, 11, 7)], SOON), Action::Green);
+        assert_eq!(
+            at(
+                vec![job("ci", CodeFailure, 10, 7), job("ci", Passed, 11, 7)],
+                SOON
+            ),
+            Action::Green
+        );
+        assert_eq!(
+            at(vec![job("ci", Pending, 11, 7)], SOON),
+            Action::WaitChecks
+        );
+        assert_eq!(
+            at(vec![job("ci", CodeFailure, 11, 7)], SOON),
+            Action::Fix { overdue: vec![] }
+        );
+        assert_eq!(
+            at(vec![job("ci", CodeFailure, 10, 7)], OVERDUE_AFTER),
+            Action::Fix { overdue: vec![] }
+        );
+    }
+
+    /// A re-run job the read does not list yet, such as an aggregate `ci`
+    /// whose legs run again, keeps the read waiting: never green on the
+    /// legs alone.
+    #[test]
+    fn a_rerun_job_not_listed_yet_keeps_the_read_waiting() {
+        let ran = [first("check (ubuntu-latest)", 10, 7), first("ci", 12, 7)];
+        let legs = vec![
+            job("check (ubuntu-latest)", Passed, 20, 7),
+            job("check (macos-latest)", Passed, 11, 7),
+        ];
+        assert_eq!(
+            rerun_action(&jobs(legs.clone()), PUSHED, &ran, SOON),
+            Action::WaitChecks
+        );
+        assert_eq!(
+            rerun_action(&jobs(legs.clone()), PUSHED, &ran, OVERDUE_AFTER),
+            Action::Fix { overdue: vec![] }
+        );
+        let mut done = legs;
+        done.push(job("ci", Passed, 21, 7));
+        assert_eq!(rerun_action(&jobs(done), PUSHED, &ran, SOON), Action::Green);
+    }
+
+    /// Only a check of the same name, the same workflow run and a greater id
+    /// is a newer attempt.
+    #[test]
+    fn a_same_named_check_of_another_run_does_not_replace_the_first_attempt() {
+        let ran = [first("ci", 10, 7)];
+        let failed = job("ci", CodeFailure, 10, 7);
+        let mut no_run = job("ci", Passed, 11, 7);
+        no_run.run = None;
+        for other in [job("ci", Passed, 11, 8), job("ci", Passed, 9, 7), no_run] {
+            let r = jobs(vec![failed.clone(), other.clone()]);
+            assert_eq!(
+                rerun_action(&r, PUSHED, &ran, SOON),
+                Action::WaitChecks,
+                "{other:?}"
+            );
+            assert_eq!(newer_attempts(&r.checks, &ran[0]).count(), 0, "{other:?}");
+        }
+    }
+
+    /// A refused re-run keeps no first attempt: the checks read as they are.
+    #[test]
+    fn a_refused_rerun_reads_the_checks_as_they_are() {
+        let r = jobs(vec![job("ci", CodeFailure, 10, 7)]);
+        assert_eq!(
+            rerun_action(&r, PUSHED, &[], SOON),
+            Action::Fix { overdue: vec![] }
+        );
+        let mark = RerunMark {
+            head: PUSHED,
+            first: &[],
+            since: OVERDUE_AFTER,
+        };
+        assert_eq!(rerun_outcome(&r, &mark), None);
+    }
+
+    #[test]
+    fn rerun_outcome_reads_passed_failed_or_unseen() {
+        let ran = [first("check", 10, 7), first("ci", 12, 7)];
+        let outcome = |checks: Vec<CheckRead>, since| {
+            let mark = RerunMark {
+                head: PUSHED,
+                first: &ran,
+                since,
+            };
+            rerun_outcome(&jobs(checks), &mark)
+        };
+        let pending = vec![job("check", Pending, 20, 7), job("ci", Passed, 21, 7)];
+        assert_eq!(outcome(pending, SOON), None);
+        let passed = vec![job("check", Passed, 20, 7), job("ci", Passed, 21, 7)];
+        assert_eq!(outcome(passed.clone(), SOON), Some(RerunOutcome::Passed));
+        let failed = vec![job("check", CodeFailure, 20, 7), job("ci", Passed, 21, 7)];
+        assert_eq!(outcome(failed, SOON), Some(RerunOutcome::Failed));
+        // `ci` with no newer attempt: none within the hour, unseen after.
+        let first_only = vec![job("check", Passed, 20, 7), job("ci", CodeFailure, 12, 7)];
+        assert_eq!(outcome(first_only.clone(), SOON), None);
+        assert_eq!(
+            outcome(first_only, OVERDUE_AFTER),
+            Some(RerunOutcome::Unseen)
+        );
+        // Another run's `ci` passing is no newer attempt.
+        let other_run = vec![job("check", Passed, 20, 7), job("ci", Passed, 21, 8)];
+        assert_eq!(outcome(other_run.clone(), SOON), None);
+        assert_eq!(
+            outcome(other_run, OVERDUE_AFTER),
+            Some(RerunOutcome::Unseen)
+        );
+        // `ci` neither listed nor re-attempted.
+        assert_eq!(outcome(vec![job("check", Passed, 20, 7)], SOON), None);
+        // Another head's read says nothing of this re-run.
+        let mut moved = jobs(passed);
+        moved.head = "n".to_owned();
+        let mark = RerunMark {
+            head: PUSHED,
+            first: &ran,
+            since: SOON,
+        };
+        assert_eq!(rerun_outcome(&moved, &mark), None);
+    }
+
+    #[test]
+    fn replaced_attempts_flags_only_the_same_jobs_older_attempt() {
+        let ran = [first("ci", 10, 7), first("t", 30, 7)];
+        let mark = RerunMark {
+            head: PUSHED,
+            first: &ran,
+            since: SOON,
+        };
+        let checks = [
+            job("ci", CodeFailure, 10, 7),
+            job("ci", CodeFailure, 11, 7),
+            job("ci", CodeFailure, 5, 8),
+            // A first attempt with no newer one stays.
+            job("t", CodeFailure, 30, 7),
+        ];
+        assert_eq!(
+            replaced_attempts(&checks, &mark),
+            [true, false, false, false]
+        );
     }
 
     mod merge {
@@ -1340,6 +1803,7 @@ mod tests {
                 pushing: None,
                 rebased_onto: None,
                 overlap: None,
+                rerun: None,
             };
             let base = BaseRead {
                 head: BASE.to_owned(),

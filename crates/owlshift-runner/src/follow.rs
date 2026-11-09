@@ -82,6 +82,9 @@ pub(crate) fn check_read(check: &Check) -> CheckRead {
     CheckRead {
         name: check.name.clone(),
         outcome,
+        id: check.id,
+        run: check.run,
+        rerunnable: false,
     }
 }
 
@@ -181,6 +184,7 @@ fn followed_of<'d>(
         pushing: delivery.pushing.as_ref().map(|p| p.commit.as_str()),
         rebased_onto: delivery.rebased_onto.as_deref(),
         overlap,
+        rerun: None,
     }
 }
 
@@ -262,6 +266,7 @@ fn describe(action: &Action) -> &'static str {
         Action::RebaseFailed { .. } => {
             "it still conflicts with the base head its last rebase used: that rebase failed"
         }
+        Action::Rerun => "a check failed: its failed jobs are re-run once before any fix run",
         Action::Fix { .. } => "a check failed: a fix run is due",
         Action::Park => {
             "only checks a person re-runs failed: re-run them, then `owlshift continue`"
@@ -282,6 +287,7 @@ pub(crate) fn action_name(decision: &Decision) -> &'static str {
             Action::Rebase { cause, .. } if !cause.refresh() => "rebase",
             Action::Rebase { .. } => "refresh_rebase",
             Action::RebaseFailed { .. } => "rebase_failed",
+            Action::Rerun => "rerun",
             Action::Fix { .. } => "fix",
             Action::Park => "park",
         },
@@ -1531,10 +1537,7 @@ mod tests {
             state: follow::PrState::Open,
             head: head.to_owned(),
             mergeable: follow::Mergeable::Mergeable,
-            checks: vec![CheckRead {
-                name: "ci".to_owned(),
-                outcome,
-            }],
+            checks: vec![CheckRead::named("ci", outcome)],
         };
         let failed = read(PUSHED, CheckOutcome::CodeFailure);
         assert_eq!(following.failing_for(&ticket(), &failed, at(0)), None);
