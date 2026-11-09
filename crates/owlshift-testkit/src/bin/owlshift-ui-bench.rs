@@ -32,7 +32,7 @@ use owlshift_testkit::ui_bench;
 
 const DEFAULT_PORT: u16 = 18466;
 
-const USAGE: &str = "usage: owlshift-ui-bench serve <data> [--port N] | link <data> | \
+const USAGE: &str = "usage: owlshift-ui-bench serve <data> [--port N] | link <data> [--port N] | \
                      touch-ready <data> | append-event <data>";
 
 fn link(data: &Path, port: u16) -> Result<String, String> {
@@ -78,20 +78,24 @@ fn serve(data: &Path, port: u16) -> Result<(), String> {
     }
 }
 
+fn parse_port(port: &str) -> Result<u16, String> {
+    port.parse()
+        .map_err(|_| format!("{port} is not a port number"))
+}
+
 fn run(args: &[String]) -> Result<(), String> {
     let (command, rest) = args.split_first().ok_or(USAGE)?;
     let (data, options) = rest.split_first().ok_or(USAGE)?;
     let data = Path::new(data);
     match (command.as_str(), options) {
         ("serve", []) => serve(data, DEFAULT_PORT),
-        ("serve", [flag, port]) if flag == "--port" => {
-            let port = port
-                .parse()
-                .map_err(|_| format!("{port} is not a port number"))?;
-            serve(data, port)
-        }
+        ("serve", [flag, port]) if flag == "--port" => serve(data, parse_port(port)?),
         ("link", []) => {
             println!("{}", link(data, DEFAULT_PORT)?);
+            Ok(())
+        }
+        ("link", [flag, port]) if flag == "--port" => {
+            println!("{}", link(data, parse_port(port)?)?);
             Ok(())
         }
         ("touch-ready", []) => {

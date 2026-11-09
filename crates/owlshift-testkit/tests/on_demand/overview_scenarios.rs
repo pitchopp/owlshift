@@ -578,16 +578,16 @@ fn columns(built: &Overview) -> Vec<(String, String, Option<String>)> {
 
 /// Builds the bench a person drives in Safari and Chrome (OWL-508;
 /// `docs/design/live-checks/owl-508-overview.sh`) and keeps it: it runs only
-/// when `OWLSHIFT_BENCH_KEEP` names an absolute, missing or empty folder, and
-/// fails, naming the variable, otherwise. The bench lands in a folder of that
+/// when `OWLSHIFT_BENCH_KEEP` names an absolute, missing or empty folder: it
+/// returns at once without the variable, and fails, naming it, otherwise. The bench lands in a folder of that
 /// one, which outlives the process; the absolute path of its data directory
 /// is written to `data-path` there.
 #[test]
 #[ignore = "builds the bench of the browsers' checklist; run by owl-508-overview.sh"]
 fn keep_a_bench_for_the_browsers() {
-    let keep = std::env::var_os("OWLSHIFT_BENCH_KEEP")
-        .map(PathBuf::from)
-        .expect("OWLSHIFT_BENCH_KEEP must name the folder to keep the bench in");
+    let Some(keep) = std::env::var_os("OWLSHIFT_BENCH_KEEP").map(PathBuf::from) else {
+        return;
+    };
     assert!(
         keep.is_absolute(),
         "OWLSHIFT_BENCH_KEEP must be an absolute path, not {}",
