@@ -1725,7 +1725,7 @@ fn the_ticket_snapshot_takes_a_percent_encoded_project() {
         assert_eq!(reply.status, 200, "{query}: {}", reply.text());
         reply.assert_secured();
         let value = reply.json();
-        assert_eq!(value["format"], 1);
+        assert_eq!(value["format"], 2);
         assert_eq!(value["ticket"], "OWL-1");
         assert!(value["runs"]["runs"].as_array().unwrap().is_empty());
     }
@@ -3622,4 +3622,322 @@ fn the_log_endpoint_withholds_a_long_partial_line_over_http() {
     let done = ground.log(&format!("&from={next}&line=1")).json();
     assert_eq!(done["records"].as_array().unwrap().len(), 1);
     assert_eq!(done["next"], done["size"]);
+}
+
+// ---------------------------------------------------------------------------
+// The actions (OWL-473): pause, resume, stop serving and restart, on the data
+// directory of `Ground`, which serves `o/r`.
+
+/// The routes of the actions, each the only POSTs the page sends but
+/// `/api/login`, `/api/proof`, `/api/reply`, `/api/doctor` and the
+/// personal file's edit.
+const ACTIONS: [&str; 5] = [
+    "/api/pause",
+    "/api/resume",
+    "/api/forget",
+    "/api/cancel",
+    "/api/restart",
+];
+
+impl Ground {
+    /// `body` posted to `path` under the session.
+    fn post(&self, path: &str, body: &Value) -> Reply {
+        send(
+            self.ui.port(),
+            "POST",
+            path,
+            &[
+                ("Content-Type", "application/json"),
+                ("X-Owlshift-Session", &self.session.header()),
+            ],
+            &body.to_string(),
+        )
+    }
+
+    fn dirs(&self) -> ProjectDirs {
+        ProjectDirs::new(self.data.path(), &self.repo())
+    }
+}
+
+/// The lines of an action's answer.
+fn lines(reply: &Reply) -> Vec<String> {
+    assert_eq!(reply.status, 200, "{}", reply.text());
+    reply.json()["lines"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|line| line.as_str().unwrap().to_owned())
+        .collect()
+}
+
+#[test]
+fn the_actions_need_a_session_and_the_pages_origin() {
+    let ground = Ground::new();
+    for path in ACTIONS {
+        let anonymous = post_json(ground.ui.port(), path, &json!({ "project": "o/r" }));
+        assert_eq!(anonymous.status, 401, "{path}");
+        let foreign = send(
+            ground.ui.port(),
+            "POST",
+            path,
+            &[
+                ("Content-Type", "application/json"),
+                ("Origin", "http://evil.example"),
+                ("X-Owlshift-Session", &ground.session.header()),
+            ],
+            r#"{"project":"o/r"}"#,
+        );
+        assert_eq!(foreign.status, 403, "{path}");
+        assert_eq!(ground.get(path).status, 404, "{path}: GET is no route");
+        // A body that is no object, and a project the service does not
+        // serve, are refused before anything is written.
+        assert_eq!(ground.post(path, &json!([1])).status, 400, "{path}");
+        let unserved = ground.post(
+            path,
+            &json!({ "project": "o/elsewhere", "ticket": "OWL-1" }),
+        );
+        assert_eq!(unserved.status, 404, "{path}: {}", unserved.text());
+    }
+    assert_eq!(requests::machine_pause(ground.data.path()), None);
+    assert_eq!(requests::pause(&ground.dirs()), None);
+}
+
+/// Pause writes the files `owlshift pause` writes, by `ui`, with the reason
+/// given or the UI's, and says what the command says; resume lifts them.
+#[test]
+fn pause_and_resume_write_the_commands_files_by_ui() {
+    let ground = Ground::new();
+    let said = lines(&ground.post("/api/pause", &json!({ "project": "o/r" })));
+    let paused = requests::pause(&ground.dirs()).unwrap().unwrap();
+    assert_eq!(paused.by, "ui");
+    assert_eq!(paused.why, "asked from the web UI");
+    // The command's words for the same request, on a data directory alike.
+    let alike = tempfile::tempdir().unwrap();
+    Registry::in_data_dir(alike.path())
+        .register(&ground.repo(), Path::new("/src/o-r"))
+        .unwrap();
+    assert_eq!(
+        said,
+        owlshift_runner::controls::pause(alike.path(), Some(&ground.repo()), &paused).unwrap()
+    );
+
+    let said = lines(&ground.post(
+        "/api/pause",
+        &json!({ "project": null, "reason": "  lunch  " }),
+    ));
+    assert!(said[0].starts_with("Every project of this machine is paused"));
+    let machine = requests::machine_pause(ground.data.path())
+        .unwrap()
+        .unwrap();
+    assert_eq!((machine.by.as_str(), machine.why.as_str()), ("ui", "lunch"));
+    let blank = ground.post("/api/pause", &json!({ "reason": "" }));
+    assert!(lines(&blank)[1].starts_with("It replaces the pause by ui at "));
+    let machine = requests::machine_pause(ground.data.path())
+        .unwrap()
+        .unwrap();
+    assert_eq!(machine.why, "asked from the web UI");
+    assert_eq!(
+        ground.post("/api/pause", &json!({ "reason": 3 })).status,
+        400
+    );
+
+    let said = lines(&ground.post("/api/resume", &json!({ "project": "o/r" })));
+    assert!(said[0].starts_with("o/r's pause is lifted (it was by ui at "));
+    assert!(said[1].starts_with("Every project of this machine is still paused"));
+    assert_eq!(requests::pause(&ground.dirs()), None);
+    let said = lines(&ground.post("/api/resume", &json!({})));
+    assert!(said[0].starts_with("The pause of every project is lifted"));
+    assert_eq!(requests::machine_pause(ground.data.path()), None);
+}
+
+/// Stop serving leaves the list of served projects as `owlshift stop
+/// --forget` does, under its lock: a project it no longer serves is then
+/// refused 404.
+#[test]
+fn stop_serving_leaves_the_list_as_the_command_does() {
+    let ground = Ground::new();
+    let alike = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(alike.path().join("service")).unwrap();
+    std::fs::copy(
+        Registry::in_data_dir(ground.data.path()).file(),
+        Registry::in_data_dir(alike.path()).file(),
+    )
+    .unwrap();
+    assert!(
+        Registry::in_data_dir(alike.path())
+            .forget(&ground.repo())
+            .unwrap()
+    );
+    assert_eq!(
+        ground.post("/api/forget", &json!({})).status,
+        400,
+        "a stop names its project"
+    );
+    let said = lines(&ground.post("/api/forget", &json!({ "project": "o/r" })));
+    assert_eq!(said, ["o/r is no longer served."]);
+    assert_eq!(
+        std::fs::read_to_string(Registry::in_data_dir(ground.data.path()).file()).unwrap(),
+        std::fs::read_to_string(Registry::in_data_dir(alike.path()).file()).unwrap()
+    );
+    assert_eq!(
+        ground
+            .post("/api/forget", &json!({ "project": "o/r" }))
+            .status,
+        404
+    );
+}
+
+/// Restart runs the restarter with the project and the ticket: its lines
+/// on success, its refusal 409, 202 while it goes on.
+#[test]
+fn restart_answers_what_the_command_came_to() {
+    let asked: Arc<Mutex<Vec<(String, String)>>> = Arc::default();
+    let seen = asked.clone();
+    let restart: server::Restarter = Arc::new(move |repo: &Repo, ticket: &TicketId| {
+        seen.lock()
+            .unwrap()
+            .push((repo.to_string(), ticket.to_string()));
+        match ticket.as_str() {
+            "OWL-1" => server::Restarted::Done(vec!["OWL-1 is restarted at Build".into()]),
+            "OWL-2" => server::Restarted::Refused(
+                "OWL-2 is not parked".into(),
+                vec!["owlshift: OWL-2 is not parked".into()],
+            ),
+            "OWL-3" => server::Restarted::GoesOn,
+            _ => server::Restarted::NotStarted("no binary".into()),
+        }
+    });
+    let ground = Ground::with_options(Options {
+        restart,
+        ..options()
+    });
+    let body = |ticket: &str| json!({ "project": "O/R", "ticket": ticket });
+    assert_eq!(
+        lines(&ground.post("/api/restart", &body("OWL-1"))),
+        ["OWL-1 is restarted at Build"]
+    );
+    let refused = ground.post("/api/restart", &body("OWL-2"));
+    assert_eq!(refused.status, 409);
+    assert_eq!(refused.json()["error"], "OWL-2 is not parked");
+    assert_eq!(refused.json()["lines"][0], "owlshift: OWL-2 is not parked");
+    let going = ground.post("/api/restart", &body("OWL-3"));
+    assert_eq!(going.status, 202);
+    assert!(
+        going.json()["lines"][0]
+            .as_str()
+            .unwrap()
+            .contains("`owlshift why OWL-3` tells its outcome")
+    );
+    assert_eq!(ground.post("/api/restart", &body("OWL-4")).status, 500);
+    assert_eq!(
+        ground
+            .post(
+                "/api/restart",
+                &json!({ "project": "o/r", "ticket": "../x" })
+            )
+            .status,
+        400
+    );
+    assert_eq!(
+        *asked.lock().unwrap(),
+        ["OWL-1", "OWL-2", "OWL-3", "OWL-4"].map(|ticket| ("o/r".to_owned(), ticket.to_owned()))
+    );
+}
+
+/// The restart's command is `owlshift continue --to-watch` on the served
+/// project, from the UI.
+#[test]
+fn the_restart_runs_continue_to_watch_on_the_served_project() {
+    let command = server::restart_command(
+        Path::new("/opt/owlshift"),
+        &Repo::parse("o/r").unwrap(),
+        &TicketId::new("OWL-7").unwrap(),
+    );
+    assert_eq!(command.get_program(), "/opt/owlshift");
+    let args: Vec<&std::ffi::OsStr> = command.get_args().collect();
+    assert_eq!(
+        args,
+        [
+            "continue",
+            "OWL-7",
+            "--to-watch",
+            "--served",
+            "o/r",
+            "--from-ui"
+        ]
+    );
+}
+
+/// What a restart's command came to, from what it printed and how it ended.
+#[cfg(unix)]
+#[test]
+fn a_restarts_answer_is_its_commands_own_words() {
+    let script = |text: &str| {
+        let mut command = std::process::Command::new("/bin/sh");
+        command
+            .args(["-c", text])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        command
+    };
+    let wait = Duration::from_secs(20);
+    assert_eq!(
+        server::run_restart(
+            script("echo '2026 OWL-1 decision restarted=true'; echo; echo 'OWL-1 is restarted'"),
+            wait
+        ),
+        server::Restarted::Done(vec![
+            "2026 OWL-1 decision restarted=true".into(),
+            "OWL-1 is restarted".into()
+        ])
+    );
+    // A refusal before the run: its error output, without `owlshift: `,
+    // a warning passed over.
+    assert_eq!(
+        server::run_restart(
+            script(
+                "echo 'owlshift: no slot' >&2; echo 'owlshift: warning: the log is late' >&2; \
+                 exit 1"
+            ),
+            wait
+        ),
+        server::Restarted::Refused(
+            "no slot".into(),
+            vec![
+                "owlshift: no slot".into(),
+                "owlshift: warning: the log is late".into()
+            ]
+        )
+    );
+    // A refusal of `continue`'s own, on its output.
+    assert_eq!(
+        server::run_restart(script("echo; echo 'OWL-1 shows Todo'; exit 1"), wait),
+        server::Restarted::Refused("OWL-1 shows Todo".into(), vec!["OWL-1 shows Todo".into()])
+    );
+    assert_eq!(
+        server::run_restart(script("exit 3"), wait),
+        server::Restarted::Refused("the restart ended with exit status 3".into(), Vec::new())
+    );
+    // Past the wait it goes on, never killed.
+    let marker = tempfile::tempdir().unwrap();
+    let done = marker.path().join("done");
+    let started = Instant::now();
+    assert_eq!(
+        server::run_restart(
+            script(&format!("sleep 1; touch '{}'", done.display())),
+            Duration::from_millis(200)
+        ),
+        server::Restarted::GoesOn
+    );
+    assert!(started.elapsed() < Duration::from_secs(1));
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while !done.exists() {
+        assert!(Instant::now() < deadline, "the command was stopped");
+        thread::sleep(Duration::from_millis(50));
+    }
+    assert!(matches!(
+        server::run_restart(std::process::Command::new("/nowhere/owlshift"), wait),
+        server::Restarted::NotStarted(_)
+    ));
 }

@@ -60,6 +60,11 @@
 //!   ([`super::reply`]), only when the key's account is that ask's decider.
 //!   One reply at a time per ticket (409), and none to a round that changed
 //!   since the page read it (409).
+//! - `POST /api/pause`, `/api/resume`, `/api/forget`, `/api/cancel` and
+//!   `/api/restart` (OWL-473), under the session as well: the operator's
+//!   actions, each through its command's own code and locks, recorded with
+//!   `by` = `ui`. Starting or stopping the service and
+//!   `owlshift unquarantine` have no route: they stay in the terminal.
 //!
 //! Every response, errors included, carries [`SECURITY_HEADERS`], and none
 //! a CORS header or a cookie. JSON goes out through [`json_text`], which
@@ -84,6 +89,7 @@ use std::fmt;
 use std::io::{self, Cursor, Read, Write};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener};
 use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
@@ -94,7 +100,7 @@ use owlshift_adapters::forge::Repo;
 use owlshift_contracts::config::PersonalConfig;
 use owlshift_contracts::format::Format;
 use owlshift_contracts::ids::TicketId;
-use owlshift_contracts::service::{BuildIdentity, UiRecord};
+use owlshift_contracts::service::{BY_UI, BuildIdentity, Request as Asked, UiRecord};
 use owlshift_core::vocab::Harness;
 use serde_json::{Value, json};
 use tiny_http::{Header as HttpHeader, Method, Request, Response, Server, StatusCode};
@@ -110,9 +116,10 @@ use super::{
 };
 use crate::config::FileState;
 use crate::project::ProjectDirs;
-use crate::served::Registry;
+use crate::served::{self, Registry};
 use crate::status::{self, waits};
 use crate::system::{HostSystem, System};
+use crate::{cancel, controls, on_demand};
 
 /// The page's frame.
 pub const INDEX_HTML: &str = include_str!("assets/index.html");
@@ -191,6 +198,130 @@ pub struct Options {
     /// default opens none, so a bench or a test never reads the system
     /// keychain: the page then names the decider and offers no form.
     pub keys: KeyOpener,
+    /// Restarts a served project's parked ticket (OWL-473): [`spawn_restart`],
+    /// which runs `owlshift continue --to-watch` in a child of this binary;
+    /// a test passes a scripted one.
+    pub restart: Restarter,
+}
+
+/// The web UI's Restart of a served project's ticket (OWL-473).
+pub type Restarter = Arc<dyn Fn(&Repo, &TicketId) -> Restarted + Send + Sync>;
+
+/// What a restart from the web UI came to.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Restarted {
+    /// The command ended in success: what it printed.
+    Done(Vec<String>),
+    /// The command refused or failed: why, and what it printed.
+    Refused(String, Vec<String>),
+    /// The command still ran when the wait ended: it goes on, never killed.
+    GoesOn,
+    /// The command did not start.
+    NotStarted(String),
+}
+
+/// How long the restart route waits for its command before it answers that
+/// the restart goes on.
+pub const RESTART_WAIT: Duration = Duration::from_secs(120);
+
+/// The command of the web UI's Restart of `ticket` on the served project
+/// `repo`, `program` being this binary: `owlshift continue <TICKET>
+/// --to-watch --served <OWNER/REPO> --from-ui`, its input closed and its
+/// outputs captured. Its code, its ticket lock, its tracker credentials and
+/// its events stay in that process: the UI never opens the keychain.
+pub fn restart_command(program: &Path, repo: &Repo, ticket: &TicketId) -> Command {
+    let mut command = Command::new(program);
+    command
+        .args(["continue", ticket.as_str(), "--to-watch", "--served"])
+        .arg(repo.to_string())
+        .arg("--from-ui")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    command
+}
+
+/// Runs `command` and waits `wait` at most: [`Restarted::Done`] with the
+/// lines it printed when it ends in success; [`Restarted::Refused`] with
+/// why and those lines otherwise, why being the last line of its error
+/// output that is not a warning (its `owlshift: ` dropped), else the last
+/// line of its output, where `continue` prints a refusal of its own; and
+/// [`Restarted::GoesOn`] when it still runs, a thread of its own then
+/// waiting for its end, so it is never killed between the stage it shows
+/// and the ref it writes.
+pub fn run_restart(mut command: Command, wait: Duration) -> Restarted {
+    let mut child = match command.spawn() {
+        Ok(child) => child,
+        Err(error) => return Restarted::NotStarted(format!("the restart did not start: {error}")),
+    };
+    fn reader<R: Read + Send + 'static>(pipe: Option<R>) -> JoinHandle<String> {
+        thread::spawn(move || {
+            let mut bytes = Vec::new();
+            if let Some(mut pipe) = pipe {
+                let _ = pipe.read_to_end(&mut bytes);
+            }
+            String::from_utf8_lossy(&bytes).into_owned()
+        })
+    }
+    let out = reader(child.stdout.take());
+    let err = reader(child.stderr.take());
+    let deadline = Instant::now() + wait;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if Instant::now() < deadline => thread::sleep(Duration::from_millis(50)),
+            other => {
+                let failed = other.err();
+                let _ = thread::Builder::new()
+                    .name("ui-restart".into())
+                    .spawn(move || {
+                        let _ = child.wait();
+                        let _ = (out.join(), err.join());
+                    });
+                return match failed {
+                    None => Restarted::GoesOn,
+                    Some(error) => Restarted::NotStarted(format!(
+                        "the restart's end could not be read: {error}"
+                    )),
+                };
+            }
+        }
+    };
+    let stdout = out.join().unwrap_or_default();
+    let stderr = err.join().unwrap_or_default();
+    let said = |text: &str| -> Vec<String> {
+        text.lines()
+            .map(str::trim_end)
+            .filter(|line| !line.trim().is_empty())
+            .map(crate::events::printable)
+            .collect()
+    };
+    let lines: Vec<String> = said(&stdout).into_iter().chain(said(&stderr)).collect();
+    if status.success() {
+        return Restarted::Done(lines);
+    }
+    let refusal = said(&stderr)
+        .into_iter()
+        .rev()
+        .find(|line| !line.starts_with("owlshift: warning:"))
+        .map(|line| line.strip_prefix("owlshift: ").unwrap_or(&line).to_owned())
+        .or_else(|| said(&stdout).pop())
+        .unwrap_or_else(|| match status.code() {
+            Some(code) => format!("the restart ended with exit status {code}"),
+            None => "the restart was ended by a signal".to_owned(),
+        });
+    Restarted::Refused(refusal, lines)
+}
+
+/// The restart of [`Options::default`]: [`restart_command`] on this binary,
+/// waited for [`RESTART_WAIT`] at most.
+pub fn spawn_restart(repo: &Repo, ticket: &TicketId) -> Restarted {
+    match owlshift_platform::process::own_program() {
+        Ok(own) => run_restart(restart_command(&own.spawn, repo, ticket), RESTART_WAIT),
+        Err(error) => Restarted::NotStarted(format!(
+            "this program's own path, which runs the restart: {error}"
+        )),
+    }
 }
 
 /// The opener of [`Options::default`]: no key.
@@ -212,6 +343,7 @@ impl Default for Options {
             personal: Arc::new(super::personal_now),
             system: Arc::new(HostSystem),
             keys: Arc::new(no_key),
+            restart: Arc::new(spawn_restart),
         }
     }
 }
@@ -719,6 +851,16 @@ fn handle(context: &Arc<Context>, mut request: Request) {
                 orchestrator_page(context, &url)
             }
         }
+        (
+            Method::Post,
+            "/api/pause" | "/api/resume" | "/api/forget" | "/api/cancel" | "/api/restart",
+        ) => {
+            if !in_session(context, &request) {
+                error_response(401, "not logged in: run `owlshift ui` in a terminal")
+            } else {
+                action_page(context, &path, &body)
+            }
+        }
         _ => error_response(404, "no such page"),
     };
     let _ = request.respond(response);
@@ -782,6 +924,172 @@ fn doctor_page(context: &Context, body: &[u8]) -> Response<Cursor<Vec<u8>>> {
         Ok(value) => json_response(200, &value),
         Err(why) => error_response(503, &why),
     }
+}
+
+/// The reason a pause or a cancel from the web UI records when its field is
+/// empty (OWL-473).
+pub const UI_REASON: &str = "asked from the web UI";
+
+/// A route's answer: a response either way.
+type Answer = Result<Response<Cursor<Vec<u8>>>, Response<Cursor<Vec<u8>>>>;
+
+/// The JSON object `body`, refused 400 when it is none.
+fn body_object(body: &[u8]) -> Result<serde_json::Map<String, Value>, Response<Cursor<Vec<u8>>>> {
+    match serde_json::from_slice::<Value>(body) {
+        Ok(Value::Object(map)) => Ok(map),
+        _ => Err(error_response(400, "the body is a JSON object")),
+    }
+}
+
+/// The text field `key` of `map`: `None` when absent or null, refused 400
+/// when it is not a text.
+fn text_field(
+    map: &serde_json::Map<String, Value>,
+    key: &str,
+) -> Result<Option<String>, Response<Cursor<Vec<u8>>>> {
+    match map.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(text)) => Ok(Some(text.clone())),
+        Some(_) => Err(error_response(400, &format!("{key} is a text"))),
+    }
+}
+
+/// The served project `text` names, refused 400 when it is not owner/name
+/// and 404 when the service does not serve it.
+fn served_repo(context: &Context, text: &str) -> Result<Repo, Response<Cursor<Vec<u8>>>> {
+    let pairs = [
+        ("project".to_owned(), text.to_owned()),
+        ("ticket".to_owned(), "X-1".to_owned()),
+    ];
+    target(context, &pairs).map(|(repo, _)| as_listed(context, repo))
+}
+
+/// `repo` as the list of served projects writes it, in any letter case:
+/// the words of an action and the restart's `--served` name it so.
+fn as_listed(context: &Context, repo: Repo) -> Repo {
+    Registry::in_data_dir(&context.data)
+        .find(&repo)
+        .ok()
+        .flatten()
+        .and_then(|entry| Repo::parse(&entry.repository).ok())
+        .unwrap_or(repo)
+}
+
+/// The reason of a pause or a cancel: the field `reason` when it holds
+/// anything, [`UI_REASON`] otherwise.
+fn reason_of(map: &serde_json::Map<String, Value>) -> Result<String, Response<Cursor<Vec<u8>>>> {
+    Ok(text_field(map, "reason")?
+        .map(|reason| reason.trim().to_owned())
+        .filter(|reason| !reason.is_empty())
+        .unwrap_or_else(|| UI_REASON.to_owned()))
+}
+
+/// The lines a command says, answered 200, or its refusal, answered 409.
+fn said(done: Result<Vec<String>, String>) -> Response<Cursor<Vec<u8>>> {
+    match done {
+        Ok(lines) => json_response(200, &json!({ "lines": lines })),
+        Err(why) => error_response(409, &why),
+    }
+}
+
+/// The action routes (OWL-473), each through its command's own code and
+/// locks, every request it writes made by [`BY_UI`]:
+///
+/// - `POST /api/pause` `{"project"?, "reason"?}` and `POST /api/resume`
+///   `{"project"?}`: `owlshift pause` and `owlshift resume`, of the machine
+///   when no project is named ([`controls`]);
+/// - `POST /api/forget` `{"project"}`: `owlshift stop --forget`'s change;
+/// - `POST /api/cancel` `{"project", "ticket", "reason"?}`: `owlshift
+///   cancel` on the served project's kept project file;
+/// - `POST /api/restart` `{"project", "ticket"}`: `owlshift continue
+///   --to-watch`, in a child ([`Options::restart`]).
+///
+/// Each answers `{"lines"}`, the command's own words, or `{"error"}`, its
+/// refusal, 409; a body that does not read is refused 400, a project the
+/// service does not serve 404.
+fn action_page(context: &Context, path: &str, body: &[u8]) -> Response<Cursor<Vec<u8>>> {
+    let answer = || -> Answer {
+        let map = body_object(body)?;
+        let project = text_field(&map, "project")?;
+        let data = context.data.as_path();
+        match path {
+            "/api/pause" | "/api/resume" => {
+                let target = project
+                    .map(|project| served_repo(context, &project))
+                    .transpose()?;
+                if path == "/api/resume" {
+                    return Ok(said(controls::resume(data, target.as_ref())));
+                }
+                let request = Asked::new(BY_UI, Timestamp::now(), reason_of(&map)?);
+                Ok(said(controls::pause(data, target.as_ref(), &request)))
+            }
+            "/api/forget" => {
+                let project =
+                    project.ok_or_else(|| error_response(400, "a stop names its project"))?;
+                let repo = served_repo(context, &project)?;
+                Ok(said(controls::forget(data, &repo)))
+            }
+            _ => {
+                let ticket = text_field(&map, "ticket")?;
+                let (Some(project), Some(ticket)) = (project, ticket) else {
+                    return Err(error_response(400, "it names its project and its ticket"));
+                };
+                let pairs = [
+                    ("project".to_owned(), project),
+                    ("ticket".to_owned(), ticket),
+                ];
+                let (repo, ticket) = target(context, &pairs)?;
+                let repo = as_listed(context, repo);
+                if path == "/api/cancel" {
+                    let reason = reason_of(&map)?;
+                    return Ok(said(cancel_ui(context, &repo, &ticket, reason)));
+                }
+                Ok(match (context.options.restart)(&repo, &ticket) {
+                    Restarted::Done(lines) => json_response(200, &json!({ "lines": lines })),
+                    Restarted::Refused(why, lines) => {
+                        json_response(409, &json!({ "error": why, "lines": lines }))
+                    }
+                    Restarted::GoesOn => json_response(
+                        202,
+                        &json!({ "lines": [format!(
+                            "The restart of {ticket} goes on: `owlshift why {ticket}` tells its \
+                             outcome."
+                        )] }),
+                    ),
+                    Restarted::NotStarted(why) => error_response(500, &why),
+                })
+            }
+        }
+    };
+    answer().unwrap_or_else(|response| response)
+}
+
+/// `owlshift cancel` of `ticket` on the served project `repo`, as
+/// `cancel_cmd` runs it in a checkout: the project file is the one the
+/// project is served on, its team checked, then [`cancel::ask`] and its
+/// words. A project whose kept file the personal file no longer accepts is
+/// refused with that reason, as its watch would be.
+fn cancel_ui(
+    context: &Context,
+    repo: &Repo,
+    ticket: &TicketId,
+    reason: String,
+) -> Result<Vec<String>, String> {
+    let dirs = ProjectDirs::new(&context.data, repo);
+    let personal = (context.options.personal)();
+    let effective = served::effective(repo, &dirs, orchestrator::path_of(&personal))?;
+    let FileState::Loaded {
+        config: project, ..
+    } = &effective.project
+    else {
+        return Err(format!(
+            "{repo} is not served: its project file does not load"
+        ));
+    };
+    on_demand::check_team(project, ticket)?;
+    let request = Asked::new(BY_UI, Timestamp::now(), reason);
+    let asked = cancel::ask(&crate::project::runner_git(), &dirs, ticket, &request)?;
+    Ok(cancel::said(ticket, &asked))
 }
 
 /// `GET /api/config[?rev=<hash>]` (OWL-472): the effective configuration with

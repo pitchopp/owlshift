@@ -1435,3 +1435,211 @@ fn no_new_route_writes_to_the_data_directory() {
     // Appending to the log is the test's, not the route's: nothing else changed.
     assert_eq!(listing(ground.data()), before);
 }
+
+// ---------------------------------------------------------------------------
+// The actions (OWL-473): Cancel, on `acme/web` served on `PROJECT`, whose
+// Linear team is `WEB`, and the Orchestrator's controls.
+
+impl Ground {
+    fn post(&self, path: &str, body: &Value) -> Reply {
+        send(
+            self.ui.port(),
+            "POST",
+            path,
+            Some(&self.session),
+            &body.to_string(),
+        )
+    }
+
+    fn web(&self) -> ProjectDirs {
+        ProjectDirs::new(self.data(), &Repo::parse("acme/web").unwrap())
+    }
+
+    /// The ticket ref of `ticket` in `acme/web`'s checkout, at `status`, its
+    /// delivery followed by no watch.
+    fn put_ref(&self, ticket: &str, status: owlshift_core::state::Status) {
+        use owlshift_contracts::refs::PersistedState;
+        use owlshift_core::state::TicketState;
+        use owlshift_runner::ticket_ref::{self, TicketRecord};
+        let checkout = self.web().checkout();
+        std::fs::create_dir_all(&checkout).unwrap();
+        if !checkout.join(".git").exists() {
+            let init = std::process::Command::new("git")
+                .args(["init", "-q"])
+                .current_dir(&checkout)
+                .output()
+                .unwrap();
+            assert!(init.status.success(), "{init:?}");
+        }
+        let git = owlshift_runner::project::runner_git();
+        let ticket = owlshift_contracts::ids::TicketId::new(ticket).unwrap();
+        let state = TicketState::restore(status, 1, 0, 0, 0, 0).unwrap();
+        let record = TicketRecord {
+            state: PersistedState::from(&state),
+            ..ticket_ref::blank(None)
+        };
+        let previous = ticket_ref::read(&git, &checkout, &ticket)
+            .unwrap()
+            .map(|stored| stored.commit);
+        ticket_ref::write(&git, &checkout, &ticket, &record, previous.as_deref()).unwrap();
+    }
+
+    /// The cancel standing on `ticket` of `acme/web`.
+    fn cancel_of(&self, ticket: &str) -> Option<Option<Request>> {
+        owlshift_runner::cancel::read(
+            &self.web(),
+            &owlshift_contracts::ids::TicketId::new(ticket).unwrap(),
+        )
+    }
+
+    fn cancel(&self, body: Value) -> Reply {
+        let mut body = body;
+        body["project"] = json!("acme/web");
+        self.post("/api/cancel", &body)
+    }
+}
+
+/// Cancel refuses what `owlshift cancel` refuses, in its words, writing
+/// nothing: a ticket parked already, one whose delivery ended, one at Ready
+/// or with no ref while its lock is free, another team's ticket.
+#[test]
+fn cancel_refuses_what_the_command_refuses() {
+    use owlshift_core::state::Status;
+    use owlshift_core::vocab::Stage;
+    let ground = Ground::new();
+    ground.serve(&["acme/web"]);
+    keep(&ground, "acme/web", PROJECT, None);
+    ground.put_ref(
+        "WEB-1",
+        Status::Parked {
+            at: Stage::Build,
+            awaiting_input: false,
+        },
+    );
+    ground.put_ref("WEB-2", Status::Active(Stage::Watch));
+    ground.put_ref("WEB-3", Status::Active(Stage::Ready));
+    for (ticket, words) in [
+        (
+            "WEB-1",
+            "WEB-1 is already parked: `owlshift continue WEB-1` restarts it",
+        ),
+        ("WEB-2", "WEB-2's delivery has ended: nothing of it runs"),
+        ("WEB-3", "WEB-3 waits in the ready column"),
+        ("WEB-4", "Owlshift has nothing of WEB-4 in flight"),
+        ("OWL-1", "OWL-1 is not a ticket of team WEB"),
+    ] {
+        let reply = ground.cancel(json!({ "ticket": ticket }));
+        assert_eq!(reply.status, 409, "{ticket}: {}", reply.text);
+        let error = reply.json()["error"].as_str().unwrap().to_owned();
+        assert!(error.starts_with(words), "{ticket}: {error}");
+        assert_eq!(ground.cancel_of(ticket), None, "{ticket}");
+    }
+}
+
+/// Cancel writes the command's file by `ui`, with the reason given or the
+/// UI's, and says what the command says; a ticket at Ready is cancelled
+/// while a step of it runs.
+#[test]
+fn cancel_writes_the_commands_file_by_ui() {
+    use owlshift_core::state::Status;
+    use owlshift_core::vocab::Stage;
+    let ground = Ground::new();
+    ground.serve(&["acme/web"]);
+    keep(&ground, "acme/web", PROJECT, None);
+    ground.put_ref("WEB-5", Status::Active(Stage::Build));
+    let reply = ground.cancel(json!({ "ticket": "WEB-5" }));
+    assert_eq!(reply.status, 200, "{}", reply.text);
+    let said = lines_of(&reply.json()["lines"]);
+    assert!(said[0].starts_with("Asked to cancel WEB-5: its step under way stops"));
+    assert!(
+        said.iter()
+            .any(|line| line.starts_with("No watch runs on this project now"))
+    );
+    let asked = ground.cancel_of("WEB-5").unwrap().unwrap();
+    assert_eq!(asked.by, "ui");
+    assert_eq!(asked.why, "asked from the web UI");
+    let reply = ground.cancel(json!({ "ticket": "WEB-5", "reason": "wrong module" }));
+    let said = lines_of(&reply.json()["lines"]);
+    assert!(
+        said[1].starts_with("It replaces the cancel asked by ui at "),
+        "{said:?}"
+    );
+    assert_eq!(
+        ground.cancel_of("WEB-5").unwrap().unwrap().why,
+        "wrong module"
+    );
+
+    ground.put_ref("WEB-3", Status::Active(Stage::Ready));
+    let ticket = owlshift_contracts::ids::TicketId::new("WEB-3").unwrap();
+    let held = ground.web().ticket_lock(&ticket).unwrap().unwrap();
+    let reply = ground.cancel(json!({ "ticket": "WEB-3" }));
+    drop(held);
+    assert_eq!(reply.status, 200, "{}", reply.text);
+    assert!(
+        lines_of(&reply.json()["lines"])
+            .iter()
+            .any(|line| line.starts_with("Owlshift keeps no record of WEB-3 yet")),
+        "{}",
+        reply.text
+    );
+    assert!(ground.cancel_of("WEB-3").is_some());
+}
+
+/// A project whose kept file the personal file no longer accepts is refused
+/// with that reason, as its watch is, and nothing is written.
+#[test]
+fn cancel_on_a_project_whose_kept_file_is_refused_says_so() {
+    use owlshift_core::state::Status;
+    use owlshift_core::vocab::Stage;
+    let ground = Ground::new();
+    ground.serve(&["acme/web"]);
+    let declaring = PROJECT.replace(
+        "gate = [\"cargo test\"]",
+        "gate = [\"cargo test\"]\ngate_env = [\"DATABASE_URL\"]",
+    );
+    keep(&ground, "acme/web", &declaring, None);
+    ground.put_ref("WEB-5", Status::Active(Stage::Build));
+    let file = ground.data().join("personal.toml");
+    std::fs::write(&file, "allow_gate_env = [\"DATABASE_URL\"]\n").unwrap();
+    *ground.personal.lock().unwrap() = FileState::Loaded {
+        path: file.clone(),
+        config: PersonalConfig::parse("").unwrap(),
+        entries: Vec::new(),
+    };
+    std::fs::write(&file, "").unwrap();
+    let reply = ground.cancel(json!({ "ticket": "WEB-5" }));
+    assert_eq!(reply.status, 409, "{}", reply.text);
+    let error = reply.json()["error"].as_str().unwrap().to_owned();
+    assert!(
+        error.starts_with("acme/web is not served: owlshift.toml at origin/main")
+            && error.contains("is not accepted any more")
+            && error.contains("DATABASE_URL"),
+        "{error}"
+    );
+    assert_eq!(ground.cancel_of("WEB-5"), None);
+    // Allowed again, the cancel is written.
+    std::fs::write(&file, "allow_gate_env = [\"DATABASE_URL\"]\n").unwrap();
+    assert_eq!(ground.cancel(json!({ "ticket": "WEB-5" })).status, 200);
+    assert!(ground.cancel_of("WEB-5").is_some());
+}
+
+/// The Orchestrator's controls show the machine's pause and each served
+/// project's, from their files.
+#[test]
+fn the_controls_show_each_pause() {
+    let ground = Ground::new();
+    ground.serve(&["acme/web", "acme/api"]);
+    let api = ProjectDirs::new(ground.data(), &Repo::parse("acme/api").unwrap());
+    let request = Request::new(BY_PAUSE, Timestamp::now(), "lunch break");
+    requests::ask_pause(ground.data(), Some(&api), &request).unwrap();
+    let controls = ground.json("/api/orchestrator")["controls"].clone();
+    assert_eq!(controls["machine_pause"], Value::Null);
+    assert_eq!(controls["projects"][0]["repository"], "acme/web");
+    assert_eq!(controls["projects"][0]["paused"], Value::Null);
+    assert_eq!(controls["projects"][1]["repository"], "acme/api");
+    assert_eq!(controls["projects"][1]["paused"]["why"], "lunch break");
+    assert_eq!(controls["projects"][1]["paused"]["by"], "owlshift pause");
+    requests::ask_pause(ground.data(), None, &request).unwrap();
+    let controls = ground.json("/api/orchestrator")["controls"].clone();
+    assert_eq!(controls["machine_pause"]["why"], "lunch break");
+}

@@ -21,7 +21,9 @@
 //!   tracker key is its decider's ([`super::reply::section`], OWL-475);
 //! - `plan`: the current plan, the distinct plans of the history with each
 //!   one's diff against the one before, per part, and the review passes;
-//! - `waits`: what the ticket waits on, as `owlshift status --waits` tells it.
+//! - `waits`: what the ticket waits on, as `owlshift status --waits` tells it;
+//! - `actions` (format 2, OWL-473): whether the page offers Restart and
+//!   Cancel, each where its command would act, and the cancel that stands.
 //!
 //! A commit of the ref never changes, so what the history read of one is kept
 //! in the [`Cache`] by commit, and the waits, which read the whole event log
@@ -40,6 +42,7 @@ use owlshift_contracts::config::ProjectConfig;
 use owlshift_contracts::event::{Event, EventKind};
 use owlshift_contracts::ids::TicketId;
 use owlshift_contracts::review::{Plan, PlanPart};
+use owlshift_core::state::{Status, TicketState};
 use serde_json::{Map, Value, json};
 
 use super::events::Reader;
@@ -47,10 +50,10 @@ use super::reply::{self, KeyState};
 use crate::executor::Git;
 use crate::project::ProjectDirs;
 use crate::ticket_ref::{self, Commits, Revision, TicketRecord};
-use crate::{served, status};
+use crate::{cancel, served, status};
 
-/// The snapshot's format.
-pub const FORMAT: u32 = 1;
+/// The snapshot's format: 2 adds `actions` (OWL-473).
+pub const FORMAT: u32 = 2;
 
 /// The most commits of a ticket ref the timeline reads.
 pub const MAX_HISTORY: usize = 400;
@@ -172,6 +175,48 @@ pub fn snapshot(inputs: &Inputs, repo: &Repo, ticket: &TicketId) -> Value {
         "questions": on_record(&|record| questions(record, inputs.key, ticket)),
         "plan": plan,
         "waits": section(waits(inputs, repo, ticket)),
+        "actions": actions(&dirs, ticket, &latest),
+    })
+}
+
+/// What the page offers on the ticket (OWL-473): `restart` while its latest
+/// record is parked, `owlshift continue --to-watch`'s own case; `cancel`
+/// when `owlshift cancel` would write a cancel of it now
+/// ([`cancel::decide`]), `cancel_refusal` saying why not otherwise; and
+/// `cancel_standing`, the cancel that stands on it (`by`, `at`, `why`, or
+/// `{"unreadable": true}`), or null.
+fn actions(
+    dirs: &ProjectDirs,
+    ticket: &TicketId,
+    latest: &Result<Option<&TicketRecord>, String>,
+) -> Value {
+    let (restart, cancel) = match latest {
+        Err(why) => (false, Err(why.clone())),
+        Ok(record) => {
+            let restart = record
+                .and_then(|record| TicketState::try_from(&record.state).ok())
+                .is_some_and(|state| matches!(state.status(), Status::Parked { .. }));
+            let cancel = dirs
+                .ticket_lock_held(ticket)
+                .map_err(|e| format!("{ticket}'s lock could not be read: {e}"))
+                .and_then(|running| cancel::decide(ticket, *record, running));
+            (restart, cancel)
+        }
+    };
+    let standing = match cancel::read(dirs, ticket) {
+        None => Value::Null,
+        Some(Some(request)) => json!({
+            "by": request.by,
+            "at": request.at.to_string(),
+            "why": request.why,
+        }),
+        Some(None) => json!({ "unreadable": true }),
+    };
+    json!({
+        "restart": restart,
+        "cancel": cancel.is_ok(),
+        "cancel_refusal": cancel.err(),
+        "cancel_standing": standing,
     })
 }
 
@@ -959,7 +1004,7 @@ mod tests {
     fn the_timeline_lists_where_the_ticket_changed() {
         let bench = busy();
         let snap = bench.snapshot("OWL-1");
-        assert_eq!(snap["format"], 1);
+        assert_eq!(snap["format"], 2);
         assert_eq!(snap["project"], "o/r");
         assert_eq!(snap["ticket"], "OWL-1");
         let timeline = &snap["timeline"];
@@ -1184,6 +1229,78 @@ mod tests {
         assert_eq!(runs.len(), 1);
         assert_eq!(runs[0]["id"], FIRST_RUN);
         assert_eq!(runs[0]["ended"], false);
+    }
+
+    /// OWL-473: Restart is offered on a parked ticket, Cancel where `owlshift
+    /// cancel` would write one: never on a parked ticket, its lock held or
+    /// not; on a ticket at Ready or with no ref only while a step of it runs;
+    /// and the cancel that stands is shown.
+    #[test]
+    fn the_actions_are_where_their_commands_act() {
+        use owlshift_contracts::service::{BY_UI, Request};
+        let bench = Bench::new(Some(BUDGET_FILE));
+        let id = |name: &str| TicketId::new(name).unwrap();
+        let mut parked = record(Stage::Build);
+        let state = TicketState::restore(
+            Status::Parked {
+                at: Stage::Build,
+                awaiting_input: false,
+            },
+            1,
+            0,
+            0,
+            0,
+            0,
+        )
+        .unwrap();
+        parked.state = PersistedState::from(&state);
+        let commit = bench.write("OWL-1", &parked, None);
+        let actions = bench.snapshot("OWL-1")["actions"].clone();
+        assert_eq!(actions["restart"], true);
+        assert_eq!(actions["cancel"], false);
+        assert!(
+            actions["cancel_refusal"]
+                .as_str()
+                .unwrap()
+                .contains("OWL-1 is already parked"),
+            "{actions}"
+        );
+        let held = bench.dirs.ticket_lock(&id("OWL-1")).unwrap().unwrap();
+        assert_eq!(bench.snapshot("OWL-1")["actions"]["cancel"], false);
+        drop(held);
+
+        bench.write("OWL-1", &record(Stage::Build), Some(&commit));
+        let actions = bench.snapshot("OWL-1")["actions"].clone();
+        assert_eq!(actions["restart"], false);
+        assert_eq!(actions["cancel"], true);
+        assert_eq!(actions["cancel_refusal"], Value::Null);
+        assert_eq!(actions["cancel_standing"], Value::Null);
+        let request = Request::new(BY_UI, Timestamp::now(), "asked from the web UI");
+        crate::step::write_atomically(&cancel::file(&bench.dirs, &id("OWL-1")), &request.render())
+            .unwrap();
+        let standing = bench.snapshot("OWL-1")["actions"]["cancel_standing"].clone();
+        assert_eq!(standing["by"], "ui");
+        assert_eq!(standing["why"], "asked from the web UI");
+
+        bench.write("OWL-2", &record(Stage::Ready), None);
+        for ticket in ["OWL-2", "OWL-3"] {
+            let actions = bench.snapshot(ticket)["actions"].clone();
+            assert_eq!(actions["cancel"], false, "{ticket}");
+            assert_eq!(actions["restart"], false, "{ticket}");
+            let held = bench.dirs.ticket_lock(&id(ticket)).unwrap().unwrap();
+            assert_eq!(
+                bench.snapshot(ticket)["actions"]["cancel"],
+                true,
+                "{ticket}"
+            );
+            drop(held);
+        }
+        assert!(
+            bench.snapshot("OWL-3")["actions"]["cancel_refusal"]
+                .as_str()
+                .unwrap()
+                .contains("Owlshift has nothing of OWL-3 in flight")
+        );
     }
 
     #[test]
