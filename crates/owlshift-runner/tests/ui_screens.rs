@@ -1749,6 +1749,41 @@ fn an_accepted_edit_is_written_and_recorded() {
     assert_eq!(ground.edits()[2]["value"], Value::Null);
 }
 
+/// Saving a key as it stands, or removing one that is not set, changes
+/// nothing: the file, or its absence, and the event log are left as they
+/// are, and the answer says nothing is written.
+#[test]
+fn an_edit_that_changes_nothing_writes_and_records_nothing() {
+    let ground = Ground::new();
+    let file = ground.personal_file(PERSONAL);
+    let events = EventLog::in_dir(ground.data()).path().to_owned();
+    let logged = std::fs::read(&events).ok();
+    for (key, value, said) in [
+        ("concurrent_runs", json!(2), "concurrent_runs = 2 is in "),
+        ("web_tools", Value::Null, "web_tools is not set in "),
+    ] {
+        let rev = ground.editor()["rev"].clone();
+        let reply = ground.edit(key, value);
+        assert_eq!(reply.status, 200, "{}", reply.text);
+        let answer = reply.json();
+        let lines = lines_of(&answer["lines"]);
+        assert!(lines[0].starts_with(said), "{lines:?}");
+        assert!(lines[0].ends_with(": nothing is written."), "{lines:?}");
+        assert_eq!(answer["rev"], rev);
+    }
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), PERSONAL);
+    assert_eq!(std::fs::read(&events).ok(), logged, "no event is written");
+
+    // A removal from a personal file not there leaves it absent.
+    std::fs::remove_file(&file).unwrap();
+    *ground.personal.lock().unwrap() = FileState::Absent(file.clone());
+    let reply = ground.edit_at("ui.port", Value::Null, Value::Null);
+    assert_eq!(reply.status, 200, "{}", reply.text);
+    assert_eq!(reply.json()["rev"], Value::Null);
+    assert!(!file.exists());
+    assert_eq!(std::fs::read(&events).ok(), logged, "no event is written");
+}
+
 /// An edit the loader refuses, a stale one, a key outside the table and a
 /// body that does not read write nothing and record nothing.
 #[test]

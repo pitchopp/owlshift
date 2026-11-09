@@ -1184,6 +1184,21 @@ fn personal_edit_page(context: &Context, body: &[u8]) -> Response<Cursor<Vec<u8>
         Err(refusal) => return error_response(refusal.status(), &refusal.message()),
     };
     let file = file.expect("an edit applied names its file");
+    if !applied.changed {
+        let said = match &applied.value {
+            Some(value) => format!("{} = {value} is in {} already", applied.key, file.display()),
+            None => format!("{} is not set in {}", applied.key, file.display()),
+        };
+        return json_response(
+            200,
+            &json!({
+                "lines": [format!("{said}: nothing is written.")],
+                "applies": applied.applies.key(),
+                "rev": applied.rev,
+                "refused_projects": refused_list(&before, &before),
+            }),
+        );
+    }
     let mut warnings = Vec::new();
     {
         let mut sink = EventSink::new(UI_PROJECT, EventLog::in_dir(&context.data), &mut warnings);
@@ -1219,25 +1234,31 @@ fn personal_edit_page(context: &Context, body: &[u8]) -> Response<Cursor<Vec<u8>
             .filter(|line| line.starts_with("owlshift: warning:"))
             .map(str::to_owned),
     );
-    let refused: Vec<Value> = refused_projects(&context.data, &file)
-        .into_iter()
-        .map(|(repository, why)| {
-            json!({
-                "already": before.contains_key(&repository),
-                "repository": repository,
-                "why": why,
-            })
-        })
-        .collect();
+    let after = refused_projects(&context.data, &file);
     json_response(
         200,
         &json!({
             "lines": lines,
             "applies": applied.applies.key(),
             "rev": applied.rev,
-            "refused_projects": refused,
+            "refused_projects": refused_list(&after, &before),
         }),
     )
+}
+
+/// The served projects the personal file refuses now (`after`), each with
+/// why and whether it was refused `before` the edit.
+fn refused_list(after: &BTreeMap<String, String>, before: &BTreeMap<String, String>) -> Vec<Value> {
+    after
+        .iter()
+        .map(|(repository, why)| {
+            json!({
+                "already": before.contains_key(repository),
+                "repository": repository,
+                "why": why,
+            })
+        })
+        .collect()
 }
 
 /// `GET /api/config[?rev=<hash>]` (OWL-472): the effective configuration with

@@ -457,13 +457,17 @@ pub fn read(file: &Path) -> io::Result<Option<Vec<u8>>> {
 pub struct Applied {
     /// The file's new text.
     pub text: String,
-    /// Its [`rev_of`], which the page's next edit names.
-    pub rev: String,
+    /// Its [`rev_of`], which the page's next edit names: `None` for a file
+    /// still absent.
+    pub rev: Option<String>,
     /// The key, as the file writes it.
     pub key: String,
     /// The value written, as the file writes it; `None` for a key removed.
     pub value: Option<String>,
     pub applies: Applies,
+    /// Whether the edit changed the file: `false` when the key already held
+    /// that value, or a key removed was not set, and nothing was written.
+    pub changed: bool,
 }
 
 /// Why [`apply`] wrote nothing.
@@ -514,7 +518,7 @@ impl Refusal {
 /// the file and written only when it loads; a file that is not TOML at all
 /// is refused with the loader's error on it as it stands. Nothing is
 /// written when the edit is refused, and an edit that changes nothing
-/// writes nothing.
+/// writes nothing, an absent file left absent ([`Applied::changed`]).
 pub fn apply(
     file: Option<&Path>,
     rev: Option<&str>,
@@ -534,10 +538,10 @@ pub fn apply(
     }
     let current =
         read(file).map_err(|error| Refusal::Io(format!("{}: {error}", file.display())))?;
-    if rev_of(current.as_deref()).as_deref() != rev {
+    let current_rev = rev_of(current.as_deref());
+    if current_rev.as_deref() != rev {
         return Err(Refusal::Changed);
     }
-    let existed = current.is_some();
     let text = match current {
         Some(bytes) => String::from_utf8(bytes)
             .map_err(|error| Refusal::Invalid(format!("cannot read it: {}", error.utf8_error())))?,
@@ -553,16 +557,22 @@ pub fn apply(
     if let Some(error) = loader_error(file, &edited.text) {
         return Err(Refusal::Invalid(error));
     }
-    if !existed || edited.text != text {
+    let changed = edited.text != text;
+    if changed {
         write(file, &edited.text)
             .map_err(|error| Refusal::Io(format!("{}: {error}", file.display())))?;
     }
     Ok(Applied {
-        rev: rev_of(Some(edited.text.as_bytes())).unwrap_or_default(),
+        rev: if changed {
+            rev_of(Some(edited.text.as_bytes()))
+        } else {
+            current_rev
+        },
         key: dotted(path),
         value: edited.value,
         applies: edited.info.applies,
         text: edited.text,
+        changed,
     })
 }
 
@@ -878,7 +888,7 @@ budget_usd = 3.0
                 "keep_awake = true\nweb_tools = false\n"
             )
         );
-        assert_eq!(rev(&file).as_deref(), Some(applied.rev.as_str()));
+        assert_eq!(rev(&file), applied.rev);
         let stale = apply(
             Some(&file),
             before.as_deref(),
@@ -892,6 +902,32 @@ budget_usd = 3.0
             apply(Some(&file), None, &path("keep_awake"), &json!(false)).unwrap_err(),
             Refusal::Changed
         );
+    }
+
+    /// An edit that changes nothing writes nothing: a key set to the value
+    /// it holds, a key removed that is not set, and a removal from a file
+    /// not there, which stays absent.
+    #[test]
+    fn an_edit_that_changes_nothing_writes_nothing() {
+        let (_dir, file) = personal_file(Some(COMMENTED));
+        let modified = fs::metadata(&file).unwrap().modified().unwrap();
+        for (key, value) in [("keep_awake", json!(true)), ("ui.port", Json::Null)] {
+            let applied = apply(Some(&file), rev(&file).as_deref(), &path(key), &value).unwrap();
+            assert!(!applied.changed, "{key}");
+            assert_eq!(applied.text, COMMENTED);
+            assert_eq!(applied.rev, rev(&file));
+        }
+        assert_eq!(fs::read_to_string(&file).unwrap(), COMMENTED);
+        assert_eq!(fs::metadata(&file).unwrap().modified().unwrap(), modified);
+
+        let (_dir, file) = personal_file(None);
+        let applied = apply(Some(&file), None, &path("ui.port"), &Json::Null).unwrap();
+        assert!(!applied.changed);
+        assert_eq!(applied.rev, None);
+        assert!(!file.exists());
+        assert!(!file.parent().unwrap().exists());
+        let applied = apply(Some(&file), None, &path("ui.port"), &json!(18500)).unwrap();
+        assert!(applied.changed);
     }
 
     /// An edit the loader refuses answers its error and leaves the file as
@@ -931,7 +967,7 @@ budget_usd = 3.0
         let (_dir, file) = personal_file(None);
         let applied = apply(Some(&file), None, &path("ui.port"), &json!(18500)).unwrap();
         assert_eq!(fs::read_to_string(&file).unwrap(), "[ui]\nport = 18500\n");
-        assert_eq!(rev(&file).as_deref(), Some(applied.rev.as_str()));
+        assert_eq!(rev(&file), applied.rev);
 
         let broken = "concurrent_runs = = 2\n";
         let (_dir, file) = personal_file(Some(broken));
