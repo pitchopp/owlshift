@@ -1643,3 +1643,262 @@ fn the_controls_show_each_pause() {
     let controls = ground.json("/api/orchestrator")["controls"].clone();
     assert_eq!(controls["machine_pause"]["why"], "lunch break");
 }
+
+// ---------------------------------------------------------------------------
+// The personal file's edit (OWL-473): `POST /api/config/personal` on a
+// personal file of the ground's own.
+
+const PERSONAL: &str = "\
+# This machine.
+concurrent_runs = 2 # two at once
+allow_gate_env = [\"DATABASE_URL\"]
+";
+
+impl Ground {
+    /// The personal file, holding `text`, made the ground's.
+    fn personal_file(&self, text: &str) -> PathBuf {
+        let file = self.data().join("config").join("config.toml");
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        std::fs::write(&file, text).unwrap();
+        *self.personal.lock().unwrap() = FileState::Loaded {
+            path: file.clone(),
+            config: PersonalConfig::parse("").unwrap(),
+            entries: Vec::new(),
+        };
+        file
+    }
+
+    /// The editor's part of the Config answer.
+    fn editor(&self) -> Value {
+        self.json("/api/config")["personal_edit"].clone()
+    }
+
+    /// `key` (dotted, no quoted part) set to `value` on the rev the page
+    /// reads now.
+    fn edit(&self, key: &str, value: Value) -> Reply {
+        let rev = self.editor()["rev"].clone();
+        self.edit_at(key, value, rev)
+    }
+
+    fn edit_at(&self, key: &str, value: Value, rev: Value) -> Reply {
+        let path: Vec<&str> = key.split('.').collect();
+        self.post(
+            "/api/config/personal",
+            &json!({ "path": path, "value": value, "rev": rev }),
+        )
+    }
+
+    /// The decisions the event log holds about the personal file.
+    fn edits(&self) -> Vec<serde_json::Map<String, Value>> {
+        let text =
+            std::fs::read_to_string(EventLog::in_dir(self.data()).path()).unwrap_or_default();
+        text.lines()
+            .map(|line| owlshift_contracts::event::Event::parse(line).unwrap())
+            .filter(|event| event.kind == EventKind::Decision && event.data.contains_key("config"))
+            .map(|event| {
+                assert_eq!(event.project, "owlshift ui");
+                assert_eq!(event.ticket, None);
+                event.data
+            })
+            .collect()
+    }
+}
+
+/// An accepted edit writes the key alone, its comments kept, records it,
+/// and says when it applies.
+#[test]
+fn an_accepted_edit_is_written_and_recorded() {
+    let ground = Ground::new();
+    let file = ground.personal_file(PERSONAL);
+    let reply = ground.edit("concurrent_runs", json!(4));
+    assert_eq!(reply.status, 200, "{}", reply.text);
+    let answer = reply.json();
+    assert_eq!(
+        std::fs::read_to_string(&file).unwrap(),
+        PERSONAL.replace("= 2 #", "= 4 #")
+    );
+    assert_eq!(answer["applies"], "next_start");
+    assert_eq!(
+        lines_of(&answer["lines"]),
+        [format!(
+            "concurrent_runs = 4 is written to {}: it applies at the next start of the service.",
+            file.display()
+        )]
+    );
+    assert_eq!(answer["refused_projects"], json!([]));
+    assert_eq!(answer["rev"], ground.editor()["rev"]);
+    let reply = ground.edit("web_tools", json!(false));
+    assert_eq!(reply.json()["applies"], "next_pass");
+    let edits = ground.edits();
+    assert_eq!(edits.len(), 2);
+    assert_eq!(
+        Value::Object(edits[0].clone()),
+        json!({
+            "config": "personal",
+            "key": "concurrent_runs",
+            "value": "4",
+            "by": "ui",
+            "applies": "next_start",
+        })
+    );
+    assert_eq!(edits[1]["key"], "web_tools");
+    assert_eq!(edits[1]["applies"], "next_pass");
+    // A key removed is recorded with no value.
+    let reply = ground.edit("web_tools", Value::Null);
+    assert!(lines_of(&reply.json()["lines"])[0].starts_with("web_tools is removed from "));
+    assert_eq!(ground.edits()[2]["value"], Value::Null);
+}
+
+/// An edit the loader refuses, a stale one, a key outside the table and a
+/// body that does not read write nothing and record nothing.
+#[test]
+fn a_refused_edit_writes_and_records_nothing() {
+    let ground = Ground::new();
+    let file = ground.personal_file(PERSONAL);
+    let refused = ground.edit("concurrent_runs", json!(40));
+    assert_eq!(refused.status, 422, "{}", refused.text);
+    assert!(
+        refused.json()["error"]
+            .as_str()
+            .unwrap()
+            .contains("concurrent_runs must be a whole number from 1 to 16")
+    );
+    let stale = ground.edit_at("concurrent_runs", json!(3), json!("0".repeat(64)));
+    assert_eq!(stale.status, 409, "{}", stale.text);
+    for key in ["foo", "ui.nope"] {
+        assert_eq!(ground.edit(key, json!(1)).status, 400, "{key}");
+    }
+    assert_eq!(ground.edit("keep_awake", json!("yes")).status, 400);
+    for body in [
+        json!({ "path": [], "value": 1, "rev": null }),
+        json!({ "path": "ui.port", "value": 1, "rev": null }),
+        json!({ "path": ["ui", "port"], "rev": null }),
+        json!({ "path": ["ui", "port"], "value": 1 }),
+    ] {
+        assert_eq!(
+            ground.post("/api/config/personal", &body).status,
+            400,
+            "{body}"
+        );
+    }
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), PERSONAL);
+    assert!(ground.edits().is_empty());
+    assert_eq!(
+        send(
+            ground.ui.port(),
+            "POST",
+            "/api/config/personal",
+            None,
+            &json!({ "path": ["keep_awake"], "value": true, "rev": null }).to_string()
+        )
+        .status,
+        401
+    );
+}
+
+/// An edit the loader accepts that a served project's kept file no longer
+/// suits names the project and why, as its watch will be refused.
+#[test]
+fn an_edit_names_the_served_projects_it_refuses() {
+    let ground = Ground::new();
+    ground.serve(&["acme/web"]);
+    let declaring = PROJECT.replace(
+        "gate = [\"cargo test\"]",
+        "gate = [\"cargo test\"]\ngate_env = [\"DATABASE_URL\"]",
+    );
+    keep(&ground, "acme/web", &declaring, None);
+    ground.personal_file(PERSONAL);
+    let reply = ground.edit("allow_gate_env", json!([]));
+    assert_eq!(reply.status, 200, "{}", reply.text);
+    let refused = reply.json()["refused_projects"].clone();
+    assert_eq!(refused.as_array().unwrap().len(), 1, "{refused}");
+    assert_eq!(refused[0]["repository"], "acme/web");
+    assert_eq!(refused[0]["already"], false);
+    assert!(
+        refused[0]["why"].as_str().unwrap().contains("DATABASE_URL"),
+        "{refused}"
+    );
+    // Still refused after another edit: already so.
+    let reply = ground.edit("keep_awake", json!(true));
+    assert_eq!(reply.json()["refused_projects"][0]["already"], true);
+}
+
+/// An event that cannot be recorded leaves the edit written and says so.
+#[test]
+fn an_edit_whose_event_cannot_be_recorded_says_so() {
+    let ground = Ground::new();
+    let file = ground.personal_file(PERSONAL);
+    std::fs::create_dir_all(EventLog::in_dir(ground.data()).path()).unwrap();
+    let reply = ground.edit("keep_awake", json!(false));
+    assert_eq!(reply.status, 200, "{}", reply.text);
+    let said = lines_of(&reply.json()["lines"]);
+    assert_eq!(said.len(), 2, "{said:?}");
+    assert!(
+        said[1].starts_with("owlshift: warning: the event was not recorded"),
+        "{said:?}"
+    );
+    assert!(
+        std::fs::read_to_string(&file)
+            .unwrap()
+            .contains("keep_awake = false")
+    );
+}
+
+/// The Config answer gives the editor every key of the table with its kind,
+/// when it applies, who reads it and its value now, the repositories the
+/// file names and the file's rev; a file not there yet is made by an edit.
+#[test]
+fn the_config_answer_gives_the_editor_every_key() {
+    let ground = Ground::new();
+    let file = ground.personal_file(
+        "concurrent_runs = 3\n[repositories.\"github.com/acme/web\"]\nallow_caches = [\".m2\"]\n",
+    );
+    let editor = ground.editor();
+    assert_eq!(editor["editable"], true);
+    assert_eq!(editor["path"], file.display().to_string());
+    let keys = editor["keys"].as_array().unwrap();
+    let table = owlshift_runner::personal_edit::KEYS;
+    let plain = table
+        .iter()
+        .filter(|info| !info.path.contains(&"*"))
+        .count();
+    assert_eq!(keys.len(), plain);
+    for key in keys {
+        assert!(
+            ["next_pass", "next_start"].contains(&key["applies"].as_str().unwrap()),
+            "{key}"
+        );
+        assert!(!key["about"].as_str().unwrap().is_empty(), "{key}");
+    }
+    let runs = keys
+        .iter()
+        .find(|key| key["key"] == "concurrent_runs")
+        .unwrap();
+    assert_eq!(runs["value"], 3);
+    assert_eq!(runs["kind"], "integer");
+    assert_eq!(runs["applies"], "next_start");
+    let fallback = keys
+        .iter()
+        .find(|key| key["key"] == "harnesses.claude.fallback")
+        .unwrap();
+    assert_eq!(fallback["kind"], "harness");
+    assert_eq!(fallback["value"], Value::Null);
+    let repository = &editor["repositories"][0];
+    assert_eq!(repository["repository"], "github.com/acme/web");
+    assert_eq!(
+        repository["keys"][1]["key"],
+        "repositories.\"github.com/acme/web\".allow_caches"
+    );
+    assert_eq!(repository["keys"][1]["value"], json!([".m2"]));
+    assert_eq!(editor["repository_keys"].as_array().unwrap().len(), 2);
+
+    std::fs::remove_file(&file).unwrap();
+    let editor = ground.editor();
+    assert_eq!(editor["rev"], Value::Null);
+    let reply = ground.edit_at("ui.port", json!(18500), Value::Null);
+    assert_eq!(reply.status, 200, "{}", reply.text);
+    assert_eq!(
+        std::fs::read_to_string(&file).unwrap(),
+        "[ui]\nport = 18500\n"
+    );
+}
