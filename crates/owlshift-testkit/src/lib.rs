@@ -15,6 +15,8 @@
 //!   `owlshift-step-child`, the child (OWL-399).
 //! - [`system`]: a host that reaches nothing of the machine, for `owlshift
 //!   doctor` on the bench (OWL-472).
+//! - [`ui_bench`]: what a check of the web UI in a browser changes in a bench
+//!   data directory (OWL-508).
 //! - [`wait`]: how a test waits for a state, as long as load could make it
 //!   take (OWL-493).
 //!
@@ -29,4 +31,5 @@ pub mod reply;
 pub mod scenario;
 pub mod step_child;
 pub mod system;
+pub mod ui_bench;
 pub mod wait;

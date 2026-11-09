@@ -1231,10 +1231,27 @@ impl Bench {
 
     /// [`Self::build`], with `admit` as the project's admission lines.
     fn build_admitting(author: &str, front: &str, zones: &str, states: &str, admit: &str) -> Self {
-        let tmp = tempfile::Builder::new()
-            .prefix("owlshift do ")
-            .tempdir()
-            .unwrap();
+        Self::build_in(None, author, front, zones, states, admit)
+    }
+
+    /// [`Self::build_admitting`], its directory made under `root` when
+    /// given (OWL-508: the browsers' bench is kept there), else in the
+    /// system's temporary folder.
+    fn build_in(
+        root: Option<&Path>,
+        author: &str,
+        front: &str,
+        zones: &str,
+        states: &str,
+        admit: &str,
+    ) -> Self {
+        let mut builder = tempfile::Builder::new();
+        builder.prefix("owlshift do ");
+        let tmp = match root {
+            Some(root) => builder.tempdir_in(root),
+            None => builder.tempdir(),
+        }
+        .unwrap();
         let project = tmp.path().join("project");
         let ticket = project.join("tickets").join(TICKET);
         fs::create_dir_all(&ticket).unwrap();
@@ -12374,3 +12391,8 @@ mod overview_scenarios;
 /// decider's by the answer check (OWL-475).
 #[path = "on_demand/ui_reply_scenarios.rs"]
 mod ui_reply_scenarios;
+
+/// The web UI served on a bench data directory for a browser's check
+/// (OWL-508).
+#[path = "on_demand/ui_bench_scenarios.rs"]
+mod ui_bench_scenarios;

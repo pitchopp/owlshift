@@ -450,3 +450,209 @@ fn write_record_of(bench: &Bench, ticket: &TicketId, record: &TicketRecord) {
         .map(|stored| stored.commit);
     write_through_run_file(&git, &bench.dirs(), ticket, record, previous.as_deref());
 }
+
+/// The title of the ticket that must show as text (OWL-508).
+const HOSTILE: &str = "<img src=x onerror=alert(1)>";
+
+/// `record` with a question of `category` asked of the decider, the ticket
+/// in `status`.
+fn asking(record: &TicketRecord, category: &str, status: Status) -> TicketRecord {
+    let mut asked = record.clone();
+    asked.questions.asks.push(Ask {
+        kind: AskKind::Questions,
+        round: NonZeroU32::new(1).unwrap(),
+        at: "2026-10-02T09:00:00Z".parse().unwrap(),
+        comment: "c-1".to_owned(),
+        questions: vec![Question {
+            id: QuestionId::new("Q1").unwrap(),
+            category: category.to_owned(),
+            context: "Seeded for the browsers.".to_owned(),
+            text: "Approve?".to_owned(),
+            options: Vec::new(),
+            recommendation: None,
+            replan: false,
+        }],
+        decider: AskDecider {
+            account: "u1".to_owned(),
+            by: DeciderRule::Assignee,
+        },
+        verdicts: Vec::new(),
+        result_refusal: None,
+        labels: Default::default(),
+    });
+    asked.state = PersistedState::from(&TicketState::restore(status, 1, 0, 0, 0, 0).unwrap());
+    asked
+}
+
+/// The bench the browsers' checklist runs on (OWL-508), built under `root`
+/// when given: under a capacity of one, DEMO-1 in flight at Design review,
+/// DEMO-2 blocked by it, DEMO-3 (titled [`HOSTILE`]) waiting for a slot,
+/// DEMO-4 parked, DEMO-5 with a plan to approve, DEMO-6 with a question;
+/// `ready.json` read now, and two dated events in the log. No slot is held:
+/// a holder is a live process, which a kept bench has none of.
+pub(super) fn browsers_bench(root: Option<&Path>) -> Bench {
+    let bench = super::parallel_scenarios::parallel_bench_in(root, "max_in_flight = 1\n");
+    bench.put_ticket(
+        "DEMO-2",
+        "maintainer",
+        "Todo",
+        &["agent"],
+        "blocked_by = [\"DEMO-1\"]\n",
+        "Document it.",
+    );
+    bench.put_ticket_titled(
+        "DEMO-3",
+        HOSTILE,
+        "maintainer",
+        "Todo",
+        &["agent"],
+        "",
+        "Library it.",
+    );
+    registered(&bench);
+    let mut replies: Vec<Reply> = ["app", "docs", "lib"]
+        .iter()
+        .map(|zone| bench.reply(None, Some(&standard_declaring(&[zone]))))
+        .collect();
+    replies.push(bench.read(&planned()));
+    bench.drain_passes(replies, 4, |pass, _| {
+        if pass == 3 {
+            bench.put_ticket("DEMO-9", "maintainer", "Done", &[], "", "A blocker.");
+        }
+    });
+    let template = bench.record();
+    let at = Stage::DesignReview;
+    let seeded = [
+        (
+            "DEMO-4",
+            asking(
+                &template,
+                "scope",
+                Status::Parked {
+                    at,
+                    awaiting_input: false,
+                },
+            ),
+        ),
+        (
+            "DEMO-5",
+            asking(
+                &template,
+                "plan_approval",
+                Status::NeedsInput { return_to: at },
+            ),
+        ),
+        (
+            "DEMO-6",
+            asking(&template, "scope", Status::NeedsInput { return_to: at }),
+        ),
+    ];
+    for (id, record) in &seeded {
+        write_record_of(&bench, &TicketId::new(*id).unwrap(), record);
+    }
+    let now = Timestamp::now();
+    owlshift_testkit::ui_bench::rewrite_ready(&bench.data, now, false).unwrap();
+    owlshift_testkit::ui_bench::append(
+        &bench.data,
+        &owlshift_testkit::ui_bench::seeded_events(now),
+    )
+    .unwrap();
+    bench
+}
+
+/// The cards of the one project of `built`, by ticket: (column, title).
+fn columns(built: &Overview) -> Vec<(String, String, Option<String>)> {
+    built.json()["projects"][0]["cards"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|card| {
+            (
+                card["ticket"].as_str().unwrap().to_owned(),
+                card["column"].as_str().unwrap().to_owned(),
+                card["title"].as_str().map(ToOwned::to_owned),
+            )
+        })
+        .collect()
+}
+
+/// Builds the bench a person drives in Safari and Chrome (OWL-508;
+/// `docs/design/live-checks/owl-508-overview.sh`) and keeps it: it runs only
+/// when `OWLSHIFT_BENCH_KEEP` names an absolute, missing or empty folder: it
+/// returns at once without the variable, and fails, naming it, otherwise. The bench lands in a folder of that
+/// one, which outlives the process; the absolute path of its data directory
+/// is written to `data-path` there.
+#[test]
+#[ignore = "builds the bench of the browsers' checklist; run by owl-508-overview.sh"]
+fn keep_a_bench_for_the_browsers() {
+    let Some(keep) = std::env::var_os("OWLSHIFT_BENCH_KEEP").map(PathBuf::from) else {
+        return;
+    };
+    assert!(
+        keep.is_absolute(),
+        "OWLSHIFT_BENCH_KEEP must be an absolute path, not {}",
+        keep.display()
+    );
+    fs::create_dir_all(&keep).unwrap();
+    assert!(
+        fs::read_dir(&keep).unwrap().next().is_none(),
+        "OWLSHIFT_BENCH_KEEP ({}) must be empty: a bench is already there",
+        keep.display()
+    );
+    let bench = browsers_bench(Some(&keep));
+
+    // The end state, as the page will show it.
+    let mut tail = EventTail::new(&bench.data);
+    let built = overview::gather(&bench.data, &mut tail, 2, Timestamp::now());
+    let cards = columns(&built);
+    let column = |ticket: &str| {
+        cards
+            .iter()
+            .find(|(id, _, _)| id == ticket)
+            .unwrap_or_else(|| panic!("{ticket} has no card: {cards:?}"))
+    };
+    assert_eq!(column("DEMO-1").1, "design_review");
+    assert_eq!(column("DEMO-2").1, "ready");
+    assert_eq!(column("DEMO-3").1, "ready");
+    for parked in ["DEMO-4", "DEMO-5", "DEMO-6"] {
+        assert_eq!(column(parked).1, "design_review");
+    }
+    assert_eq!(column("DEMO-3").2.as_deref(), Some(HOSTILE));
+    let json = built.json();
+    let card_of = |ticket: &str| {
+        json["projects"][0]["cards"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|card| card["ticket"] == ticket)
+            .unwrap()
+            .clone()
+    };
+    assert_eq!(card_of("DEMO-2")["wait"]["reason"], "blocked_by");
+    assert_eq!(card_of("DEMO-3")["wait"]["reason"], "slot");
+    assert_eq!(card_of("DEMO-4")["needs_you"], "parked");
+    assert_eq!(card_of("DEMO-5")["needs_you"], "plan");
+    assert_eq!(card_of("DEMO-6")["needs_you"], "question");
+    assert_eq!(for_you_counts(&built), (2, 0, 1));
+    assert_eq!(for_you_counts(&built), header_counts(&bench));
+    let ready = ready_now(&bench).expect("a ready.json");
+    assert!(
+        !owlshift_runner::ready::stale(&ready, Timestamp::now()),
+        "the snapshot is not stale"
+    );
+
+    // The events a first visit and a reload tell apart.
+    let since = tail.since(None, Timestamp::now()).json();
+    let text = since.to_string();
+    assert!(
+        text.contains("DEMO-6"),
+        "the question is in the last 24 hours: {text}"
+    );
+    assert!(!text.contains("DEMO-4"), "the old park is not: {text}");
+
+    // It outlives the process.
+    let data = bench.data.clone();
+    let kept = bench.tmp.keep();
+    assert!(data.starts_with(&kept));
+    fs::write(keep.join("data-path"), data.to_str().unwrap()).unwrap();
+}
