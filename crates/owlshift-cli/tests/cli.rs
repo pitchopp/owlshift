@@ -1797,6 +1797,10 @@ fn logs_follow_prints_events_as_they_are_recorded() {
     );
 }
 
+/// What CI appends to the test command so each `check` job runs its shard of
+/// the tests (OWL-515).
+const CI_PARTITION: &str = " --partition hash:${{ matrix.shard }}/${{ matrix.shards }}";
+
 /// The repository's own project file, which `owlshift do` reads on
 /// Owlshift's tickets, parses and gates on what CI runs.
 #[test]
@@ -1807,10 +1811,6 @@ fn the_repositorys_own_project_file_gates_on_what_ci_runs() {
     assert_eq!(config.tracker.team.as_deref(), Some("OWL"));
     let ci = fs::read_to_string(root.join(".github/workflows/ci.yml")).unwrap();
     let ci_lines: Vec<&str> = ci.lines().map(str::trim).collect();
-    let runs: Vec<&str> = ci_lines
-        .iter()
-        .filter_map(|line| line.strip_prefix("run: "))
-        .collect();
     assert!(!config.stack.gate.is_empty());
     for command in &config.stack.gate {
         // The gate runs a line through `sh -c`, so a variable CI sets in a
@@ -1842,8 +1842,23 @@ fn the_repositorys_own_project_file_gates_on_what_ci_runs() {
         // Each gate command is a CI step, verbatim: since OWL-355 the gate
         // runs the tests under cargo-nextest and the doctests apart, as the
         // ubuntu and macOS legs do (OWL-241; the Windows leg filters
-        // on_demand out, and no gate runs on Windows).
-        assert!(runs.contains(&command), "{command} is not a CI step");
+        // on_demand out, and no gate runs on Windows). Since OWL-515 CI
+        // splits the tests across shards, so its test step is the gate's
+        // command followed by the partition; the gate runs them all, and
+        // every other gate command runs in shard 1 only.
+        let step = ci_lines
+            .iter()
+            .position(|line| {
+                line.strip_prefix("run: ")
+                    .is_some_and(|run| run == command || run == format!("{command}{CI_PARTITION}"))
+            })
+            .unwrap_or_else(|| panic!("{command} is not a CI step"));
+        let shard_one = ci_lines[step - 1] == "if: matrix.shard == 1";
+        assert_eq!(
+            !command.starts_with("cargo nextest run "),
+            shard_one,
+            "{command}: CI runs it in every shard, or a test step in shard 1 only"
+        );
     }
     for step in [
         "cargo fmt",
@@ -1885,9 +1900,10 @@ fn ci_shows_the_confinement_tests_output() {
         "{text}"
     );
     let ci = fs::read_to_string(root.join(".github/workflows/ci.yml")).unwrap();
+    let test_step =
+        format!("run: cargo nextest run --workspace --locked --no-fail-fast{CI_PARTITION}");
     assert!(
-        ci.lines()
-            .any(|line| line.trim() == "run: cargo nextest run --workspace --locked --no-fail-fast"),
+        ci.lines().any(|line| line.trim() == test_step),
         "CI no longer runs the tests through cargo nextest run"
     );
 }

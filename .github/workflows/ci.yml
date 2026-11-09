@@ -16,12 +16,46 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  # OWL-515: each platform's tests are split across several `check` jobs,
+  # its shards, with nextest's `--partition hash:K/N`: a test's shard depends
+  # on its name only, so a new test moves no other. This job turns the shard
+  # counts below into the `check` matrix, since a matrix cannot read `env`.
+  # Format, lint, rustdoc and doctests run in shard 1 of each platform only.
+  # GitHub runs at most 5 macOS jobs at once on this account's plans (its
+  # limits page, read on 2026-11-09), so a second pull request's macOS shards
+  # can queue behind the first's; the maintainer accepted it. Approved on
+  # OWL-515 on 2026-11-09 ("Approuvé tel quel", comment of 13:37 UTC), as the
+  # CI-settings floor of architecture section 8 requires.
+  plan:
+    name: plan
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.shards.outputs.matrix }}
+    steps:
+      - name: List the test shards
+        id: shards
+        env:
+          # A platform's shard count. Raise it by one when the slowest of its
+          # shard jobs takes more than 8 minutes on main.
+          SHARDS_UBUNTU: 2
+          SHARDS_MACOS: 3
+          SHARDS_WINDOWS: 2
+        run: |
+          jq -nr --argjson u "$SHARDS_UBUNTU" --argjson m "$SHARDS_MACOS" --argjson w "$SHARDS_WINDOWS" '
+            [["ubuntu-latest", $u], ["macos-latest", $m], ["windows-latest", $w]]
+            | map(.[0] as $os | .[1] as $n
+                | if ($n | type) == "number" and $n >= 1 and $n == ($n | floor) then .
+                  else error("\($os): the shard count must be a positive integer, not \($n)") end
+                | range(1; $n + 1) | {os: $os, shard: ., shards: $n})
+            | "matrix=\(tojson)"' | tee -a "$GITHUB_OUTPUT"
+
   check:
-    name: check (${{ matrix.os }})
+    name: check (${{ matrix.os }}, ${{ matrix.shard }}/${{ matrix.shards }})
+    needs: plan
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
+        include: ${{ fromJSON(needs.plan.outputs.matrix) }}
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v7
@@ -95,13 +129,16 @@ jobs:
         if: runner.os != 'Windows'
         run: echo "OWLSHIFT_REQUIRE_FIXTURE_TOOLS=1" >> "$GITHUB_ENV"
       - name: Format
+        if: matrix.shard == 1
         run: cargo fmt --all -- --check
       - name: Lint
+        if: matrix.shard == 1
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
       # OWL-106: a broken link in the docs of a public item goes unnoticed
       # until rustdoc runs. Approved on OWL-106 on 2026-10-01, as the
       # CI-settings floor of architecture section 8 requires.
       - name: Rustdoc
+        if: matrix.shard == 1
         run: cargo doc --workspace --no-deps --locked
         env:
           RUSTDOCFLAGS: -D warnings
@@ -121,28 +158,31 @@ jobs:
           tool: cargo-nextest@0.9.146
       - name: Test
         if: runner.os != 'Windows'
-        run: cargo nextest run --workspace --locked --no-fail-fast
+        run: cargo nextest run --workspace --locked --no-fail-fast --partition hash:${{ matrix.shard }}/${{ matrix.shards }}
       # OWL-241: on_demand runs `owlshift do` without confinement, which a
       # native Windows user cannot reach: `do` refuses there and WSL2 is the
       # supported path (D9, OWL-87). The refusals are tested outside that
       # binary, so they still run here.
       - name: Test, without on_demand
         if: runner.os == 'Windows'
-        run: cargo nextest run --workspace --locked --no-fail-fast -E 'not binary_id(owlshift-testkit::on_demand)'
+        run: cargo nextest run --workspace --locked --no-fail-fast --partition hash:${{ matrix.shard }}/${{ matrix.shards }} -E 'not binary_id(owlshift-testkit::on_demand)'
       - name: Doctests
+        if: matrix.shard == 1
         run: cargo test --workspace --doc --locked
 
-  # The single check to require on main (OWL-21): it succeeds only when every
-  # platform leg succeeded, and fails if one failed, was cancelled or skipped.
+  # The single check to require on main (OWL-21): it succeeds only when the
+  # plan and every shard of every platform succeeded, and fails if one failed,
+  # was cancelled or skipped (OWL-515).
   ci:
     name: ci
     if: always()
-    needs: [check]
+    needs: [plan, check]
     runs-on: ubuntu-latest
     steps:
-      - name: Require every platform leg to pass
+      - name: Require the plan and every shard to pass
         env:
-          RESULT: ${{ needs.check.result }}
+          PLAN: ${{ needs.plan.result }}
+          CHECK: ${{ needs.check.result }}
         run: |
-          echo "check: $RESULT"
-          test "$RESULT" = "success"
+          echo "plan: $PLAN, check: $CHECK"
+          test "$PLAN" = "success" && test "$CHECK" = "success"
