@@ -73,7 +73,9 @@ impl OnDemand<'_> {
     }
 
     /// `merge_due` on the facts this command reads, as watch's next pass
-    /// would read them, its first green read a minute old.
+    /// would read them, its first green read a minute old. Advisory: the
+    /// base may move before that pass, and a head GitHub refused to merge on
+    /// a moved base is in watch's memory alone (OWL-520).
     fn would_merge(
         &self,
         p: &Prepared,
@@ -109,6 +111,24 @@ impl OnDemand<'_> {
         let questions = p.questions();
         let asked = crate::merge::questions(&questions);
         let gate = self.config.gate_policy();
+        // A moved base merges when its move leaves the delivery's paths
+        // alone (OWL-520), read in the checkout this command fetched; watch's
+        // memory of a head GitHub refused on a moved base is not this
+        // command's, so the answer is advisory there.
+        let disjoint = delivery
+            .base_at_push
+            .as_deref()
+            .filter(|at_push| *at_push != p.base.commit)
+            .is_some_and(|at_push| {
+                crate::merge::MovedBase::read(
+                    &self.executor.git,
+                    &p.checkout,
+                    pushed,
+                    at_push,
+                    &p.base.commit,
+                )
+                .disjoint()
+            });
         let facts = MergeFacts {
             decision: &seen.decision,
             pushed,
@@ -118,6 +138,7 @@ impl OnDemand<'_> {
             }),
             base_head: &p.base.commit,
             base_at_push: delivery.base_at_push.as_deref(),
+            disjoint,
             labeled: labels.iter().any(|label| label == core::MERGE_LABEL),
             excluded: tracker
                 .exclude

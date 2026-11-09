@@ -7,6 +7,8 @@
 //! questions with who settled each (OWL-465), the MERGED comment, the events
 //! and the one notification a final refusal gives.
 
+use std::path::Path;
+
 use serde_json::{Value, json};
 
 use owlshift_adapters::forge::CommitId;
@@ -19,7 +21,9 @@ use owlshift_core::vocab::{AnswerClass, MergeSwitch};
 
 use crate::answer_check;
 use crate::events::{Data, EventSink, data};
+use crate::executor::Git;
 use crate::follow::Switch;
+use crate::held;
 use crate::notify;
 use crate::on_demand::OnDemand;
 use crate::project::{self, Base};
@@ -174,12 +178,15 @@ pub(crate) fn tell_merged(
 }
 
 /// The `pr_merged` event of the runner's merge: which pull request, head
-/// and method, and the merge's commit when GitHub's answer gave it.
+/// and method, and the merge's commit when GitHub's answer gave it; with
+/// `bases`, `base_at_push` and the base head the merge was decided on,
+/// which differ for a merge on a moved base (OWL-520).
 pub(crate) fn merged_event(
     ticket: &TicketId,
     number: u64,
     merging: &Merging,
     commit: Option<&CommitId>,
+    bases: Option<(&str, &str)>,
     sink: &mut EventSink<'_>,
 ) {
     let mut event = data([
@@ -191,7 +198,122 @@ pub(crate) fn merged_event(
     if let Some(commit) = commit {
         event.insert("commit".to_owned(), json!(commit.as_str()));
     }
+    if let Some((at_push, base)) = bases {
+        event.insert("base_at_push".to_owned(), json!(at_push));
+        event.insert("base".to_owned(), json!(base));
+    }
     sink.emit(ticket, None, EventKind::PrMerged, event);
+}
+
+/// What merge on green read of a base that moved since the push (OWL-520;
+/// architecture section 5, "Merge on green", "The base the checks ran
+/// on"): whether its move leaves the delivery's paths alone, so the merge
+/// goes on without a refresh rebase.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum MovedBase {
+    /// The move touches none of the delivery's paths.
+    Disjoint,
+    /// The delivery's paths the move touches.
+    Shared(Vec<String>),
+    /// Git could not tell, and why.
+    Unread(String),
+    /// GitHub refused a merge of this head on a moved base: it merges only
+    /// on the base its checks ran on ("Its answers").
+    Refused,
+}
+
+/// How many shared paths a `base_moved` event names.
+const SHARED_TOLD: usize = 20;
+
+impl MovedBase {
+    /// The read of `base_head`'s move since `base_at_push` for the delivery
+    /// `pushed`, in the dedicated `checkout` ([`held::shared_with_base`]).
+    pub(crate) fn read(
+        git: &Git,
+        checkout: &Path,
+        pushed: &str,
+        base_at_push: &str,
+        base_head: &str,
+    ) -> Self {
+        match held::shared_with_base(git, checkout, pushed, Some(base_at_push), base_head) {
+            Ok(shared) if shared.is_empty() => Self::Disjoint,
+            Ok(shared) => Self::Shared(shared),
+            Err(why) => Self::Unread(why),
+        }
+    }
+
+    /// Whether the merge goes on without a refresh rebase:
+    /// `owlshift_core::follow::MergeFacts::disjoint`.
+    pub(crate) fn disjoint(&self) -> bool {
+        matches!(self, Self::Disjoint)
+    }
+
+    /// Its name in events.
+    pub(crate) fn reason(&self) -> &'static str {
+        match self {
+            Self::Disjoint => "disjoint",
+            Self::Shared(_) => "shared",
+            Self::Unread(_) => "unread",
+            Self::Refused => "refused",
+        }
+    }
+
+    /// The `base_moved` decision event of pull request `number` at `head`,
+    /// whose base moved from `base_at_push` to `base`: the reason, whether
+    /// a refresh rebase comes first, the shared paths (at most
+    /// [`SHARED_TOLD`]) and why git could not tell.
+    pub(crate) fn data(&self, number: u64, head: &str, base_at_push: &str, base: &str) -> Data {
+        let mut event = data([
+            ("watch", json!("base_moved")),
+            ("pull_request", json!(number)),
+            ("head", json!(head)),
+            ("base_at_push", json!(base_at_push)),
+            ("base", json!(base)),
+            ("reason", json!(self.reason())),
+            ("refresh", json!(!self.disjoint())),
+        ]);
+        match self {
+            Self::Shared(paths) => {
+                let told: Vec<&String> = paths.iter().take(SHARED_TOLD).collect();
+                event.insert("shared".to_owned(), json!(told));
+            }
+            Self::Unread(why) => {
+                event.insert("why".to_owned(), json!(why));
+            }
+            Self::Disjoint | Self::Refused => {}
+        }
+        event
+    }
+
+    /// Watch's line for pull request `number`'s moved base.
+    pub(crate) fn words(&self, number: u64) -> String {
+        let moved = format!("pull request #{number}'s base moved since the push");
+        let refresh = "a refresh rebase comes first";
+        match self {
+            Self::Disjoint => format!(
+                "{moved}, on paths it does not change: no refresh rebase, it merges once read \
+                 green twice"
+            ),
+            Self::Shared(paths) => {
+                let named: Vec<&str> = paths.iter().take(3).map(String::as_str).collect();
+                let more = match paths.len().saturating_sub(named.len()) {
+                    0 => String::new(),
+                    n => format!(" and {n} more"),
+                };
+                format!(
+                    "{moved}, on paths it changes too ({}{more}): {refresh}",
+                    named.join(", ")
+                )
+            }
+            Self::Unread(why) => format!(
+                "{moved}, and which of its paths the move touches could not be read ({why}): \
+                 {refresh}"
+            ),
+            Self::Refused => {
+                format!("{moved}, and GitHub refused to merge it on a moved base: {refresh}")
+            }
+        }
+    }
 }
 
 /// The `merge_refused` decision event: `final` when it will not pass on
@@ -372,9 +494,9 @@ pub(crate) fn hold_words(blocker: &MergeBlocker, question: Option<&MergeQuestion
             "the ticket owes its DELIVERY report on the tracker first".to_owned()
         }
         MergeBlocker::BaseUnknown => "the base of Owlshift's last push is not known".to_owned(),
-        MergeBlocker::BaseMoved => {
-            "its base moved since the push, so a refresh rebase comes first".to_owned()
-        }
+        MergeBlocker::BaseMoved => "its base moved since the push on a path it changes, or in a \
+                                    way that could not be read, so a refresh rebase comes first"
+            .to_owned(),
         MergeBlocker::GreenOnce => "it was read green only once on this head".to_owned(),
         MergeBlocker::Closed => "it is not open".to_owned(),
         MergeBlocker::HeadMoved => "its head is no longer Owlshift's last push".to_owned(),
@@ -491,7 +613,8 @@ pub(crate) fn wait_words(reason: &str, data: &Data) -> Option<String> {
              base cannot be told: a person merges it",
         ),
         "merge_base_moved" => merge(
-            "its base moved right before the merge call; the next pass gets it a refresh rebase",
+            "its base moved right before the merge call; the next pass decides again, a merge or \
+             a refresh rebase",
         ),
         "merge_closed" => merge("the last read before the merge found it no longer open"),
         "merge_head_moved" => merge(
@@ -640,6 +763,54 @@ mod tests {
              a refresh rebase or merges it"
         );
         assert_eq!(wait_words("slot", &Data::new()), None);
+    }
+
+    /// OWL-520: a moved base is told with its reason, whether a refresh
+    /// comes first, at most 20 shared paths and why git could not tell.
+    #[test]
+    fn a_moved_base_is_told_with_its_reason() {
+        let shared: Vec<String> = (0..25).map(|n| format!("app/{n}.rs")).collect();
+        let cases = [
+            (MovedBase::Disjoint, "disjoint", false),
+            (MovedBase::Shared(shared.clone()), "shared", true),
+            (
+                MovedBase::Unread("git exited 128".to_owned()),
+                "unread",
+                true,
+            ),
+            (MovedBase::Refused, "refused", true),
+        ];
+        for (moved, reason, refresh) in cases {
+            let event = moved.data(7, "h", "a", "b");
+            assert_eq!(
+                (&event["reason"], &event["refresh"], &event["base"]),
+                (&json!(reason), &json!(refresh), &json!("b")),
+                "{moved:?}"
+            );
+            assert_eq!(moved.disjoint(), !refresh);
+            assert!(
+                moved
+                    .words(7)
+                    .starts_with("pull request #7's base moved since the push")
+            );
+        }
+        let event = MovedBase::Shared(shared).data(7, "h", "a", "b");
+        assert_eq!(event["shared"].as_array().unwrap().len(), 20);
+        assert_eq!(
+            MovedBase::Unread("git exited 128".to_owned()).data(7, "h", "a", "b")["why"],
+            json!("git exited 128")
+        );
+        assert_eq!(
+            MovedBase::Shared(vec![
+                "a".to_owned(),
+                "b".to_owned(),
+                "c".to_owned(),
+                "d".to_owned()
+            ])
+            .words(7),
+            "pull request #7's base moved since the push, on paths it changes too (a, b, c and 1 \
+             more): a refresh rebase comes first"
+        );
     }
 
     /// Each round's questions with their latest verdict, a re-ask's and a

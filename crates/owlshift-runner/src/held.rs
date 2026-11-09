@@ -248,15 +248,56 @@ pub fn base_moved_on(
     if overlaps.is_empty() {
         return Ok(false);
     }
+    let changed = base_changes(git, checkout, pushed, since, base)?;
+    Ok(collision::on_overlap(&changed, overlaps))
+}
+
+/// The paths of the delivery `pushed` that the base's move touches (OWL-520,
+/// architecture section 5, "Merge on green", "The base the checks ran on"):
+/// those it changed since it parted from `base`, the base branch's head
+/// (`git diff --name-only --no-renames -z base...pushed`, a rename under
+/// both its paths), that are, hold or lie in a path the base changed as
+/// [`base_moved_on`] reads it, since `since`, the base head read at the
+/// push, compared as zones are ([`collision::on_overlap`]). Empty when the
+/// move leaves the delivery alone, so the merge needs no refresh rebase.
+pub fn shared_with_base(
+    git: &Git,
+    checkout: &Path,
+    pushed: &str,
+    since: Option<&str>,
+    base: &str,
+) -> Result<Vec<String>, String> {
+    let changed = base_changes(git, checkout, pushed, since, base)?;
+    if changed.is_empty() {
+        return Ok(Vec::new());
+    }
+    let delivered = changed_files(git, checkout, base, pushed)?;
+    Ok(delivered
+        .into_iter()
+        .filter(|path| collision::on_overlap(std::slice::from_ref(path), &changed))
+        .collect())
+}
+
+/// The paths `base` changed that the pull request's head `pushed` does not
+/// contain yet: none when `base` is an ancestor of `pushed`; else those it
+/// changed since `since` when `base` descends from it, or since its
+/// merge-base with `pushed`, a superset (`git diff --name-only --no-renames
+/// -z from...base`).
+fn base_changes(
+    git: &Git,
+    checkout: &Path,
+    pushed: &str,
+    since: Option<&str>,
+    base: &str,
+) -> Result<Vec<String>, String> {
     if is_ancestor(git, checkout, base, pushed)? {
-        return Ok(false);
+        return Ok(Vec::new());
     }
     let from = match since {
         Some(since) if is_ancestor(git, checkout, since, base)? => since,
         _ => pushed,
     };
-    let changed = changed_files(git, checkout, from, base)?;
-    Ok(collision::on_overlap(&changed, overlaps))
+    changed_files(git, checkout, from, base)
 }
 
 /// Whether `ancestor` is an ancestor of `of`, itself included
@@ -786,6 +827,35 @@ mod tests {
         assert_eq!(recorded.unkept, [more[0].clone()]);
     }
 
+    /// Writes `files` in `repo`, commits everything there, and returns the
+    /// commit.
+    fn commit_all(git: &Git, repo: &Path, files: &[(&str, &str)]) -> String {
+        for (path, text) in files {
+            let file = repo.join(path);
+            std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+            std::fs::write(file, text).unwrap();
+        }
+        git.run(repo, &["add", "-A"]).unwrap();
+        git.run(
+            repo,
+            &[
+                "-c",
+                "user.name=Bench",
+                "-c",
+                "user.email=bench@example.invalid",
+                "-c",
+                "commit.gpgsign=false",
+                "commit",
+                "-q",
+                "-m",
+                "c",
+            ],
+        )
+        .unwrap();
+        let head = git.run(repo, &["rev-parse", "HEAD"]).unwrap();
+        String::from_utf8(head).unwrap().trim().to_owned()
+    }
+
     /// OWL-449: a base that changes an overlap's path since the pushed head
     /// left it, in any case or inside a shared folder, refreshes; one that
     /// changes another path, or that the head already contains, does not.
@@ -794,32 +864,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let repo = tmp.path();
         let git = crate::project::runner_git();
-        let commit = |files: &[(&str, &str)]| -> String {
-            for (path, text) in files {
-                let file = repo.join(path);
-                std::fs::create_dir_all(file.parent().unwrap()).unwrap();
-                std::fs::write(file, text).unwrap();
-            }
-            git.run(repo, &["add", "-A"]).unwrap();
-            git.run(
-                repo,
-                &[
-                    "-c",
-                    "user.name=Bench",
-                    "-c",
-                    "user.email=bench@example.invalid",
-                    "-c",
-                    "commit.gpgsign=false",
-                    "commit",
-                    "-q",
-                    "-m",
-                    "c",
-                ],
-            )
-            .unwrap();
-            let head = git.run(repo, &["rev-parse", "HEAD"]).unwrap();
-            String::from_utf8(head).unwrap().trim().to_owned()
-        };
+        let commit = |files: &[(&str, &str)]| commit_all(&git, repo, files);
         git.run(repo, &["init", "-q", "-b", "main"]).unwrap();
         commit(&[("app/one.rs", "one\n"), ("docs/a.md", "a\n")]);
         git.run(repo, &["checkout", "-q", "-b", "owl-1"]).unwrap();
@@ -879,6 +924,54 @@ mod tests {
             &strings(&["app/one.rs"]),
         );
         assert!(!contained.unwrap());
+    }
+
+    /// OWL-520: the delivery's paths a base's move touches since the push,
+    /// read from git: none for a move on other paths; the shared one for a
+    /// move on a path the delivery changed, by its old path when the
+    /// delivery renamed it; and, for a base that no longer contains the base
+    /// at the push, every path the base changed since it parted from the
+    /// head.
+    #[test]
+    fn the_paths_a_moved_base_shares_with_the_delivery_are_read_from_git() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path();
+        let git = crate::project::runner_git();
+        let commit = |files: &[(&str, &str)]| commit_all(&git, repo, files);
+        git.run(repo, &["init", "-q", "-b", "main"]).unwrap();
+        let at_push = commit(&[
+            ("app/one.rs", "one\n"),
+            ("app/two.rs", "two\n"),
+            ("docs/a.md", "a\n"),
+        ]);
+        git.run(repo, &["checkout", "-q", "-b", "owl-1"]).unwrap();
+        git.run(repo, &["mv", "app/two.rs", "app/three.rs"])
+            .unwrap();
+        let pushed = commit(&[("app/one.rs", "one, mine\n")]);
+        git.run(repo, &["checkout", "-q", "main"]).unwrap();
+        let other = commit(&[("docs/a.md", "b\n")]);
+        let shared = commit(&[("app/one.rs", "one\nand theirs\n")]);
+        let renamed = commit(&[("app/two.rs", "two, theirs\n")]);
+        let read = |since: &str, base: &str| {
+            shared_with_base(&git, repo, &pushed, Some(since), base).unwrap()
+        };
+        assert_eq!(read(&at_push, &other), Vec::<String>::new());
+        assert_eq!(read(&other, &shared), strings(&["app/one.rs"]));
+        assert_eq!(read(&shared, &renamed), strings(&["app/two.rs"]));
+        assert_eq!(read(&at_push, &at_push), Vec::<String>::new());
+        // A base pushed over: what it changed since it parted from the head.
+        git.run(repo, &["checkout", "-q", "-b", "over", &at_push])
+            .unwrap();
+        let over = commit(&[("app/one.rs", "one, over\n")]);
+        assert_eq!(read(&renamed, &over), strings(&["app/one.rs"]));
+        assert!(
+            shared_with_base(&git, repo, &pushed, None, &other)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            shared_with_base(&git, repo, &pushed, Some(&other), "0".repeat(40).as_str()).is_err()
+        );
     }
 
     /// The plan of the ticket-plan fixture, naming `files`.

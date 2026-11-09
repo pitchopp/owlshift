@@ -379,9 +379,63 @@ fn refresh_in(bench: &Bench) -> During {
     )
 }
 
-/// A sibling's merge into `main`, writing a file of its own.
+/// A sibling's merge into `main`, writing a file of its own: a move that
+/// leaves the delivery's paths alone (OWL-520).
 fn sibling_merged(bench: &Bench) -> String {
     bench.merge_into_main(&[("OTHER.md", "Another ticket's file.\n")])
+}
+
+/// `NOTES.md` as `main` holds it before the ticket's Build: the delivery
+/// changes its last line, a sibling its first, so their merge is clean and
+/// shares a path (OWL-520).
+const NOTES: &str = "one\ntwo\nthree\nfour\nfive\n";
+
+/// `NOTES.md` seeded on `main`, then a Build's reply: the greeting and the
+/// last line of `NOTES.md` changed, its result `result`.
+fn sharing_reply(bench: &Bench, result: &str) -> Reply {
+    bench.merge_into_main(&[("NOTES.md", NOTES)]);
+    let mut reply = bench.reply(Some("Hello"), Some(result));
+    reply.files.insert(
+        RelativePath::new("NOTES.md").unwrap(),
+        NOTES.replace("five", "FIVE"),
+    );
+    reply
+}
+
+/// [`merging`], the delivery also changing `NOTES.md` ([`sharing_reply`]).
+fn sharing(switch: &str) -> Bench {
+    let bench = Bench::with(
+        "maintainer",
+        "assignee = \"maintainer\"\n",
+        &format!("[forge]\nmerge = \"{switch}\"\n"),
+    );
+    let reply = sharing_reply(&bench, DONE);
+    let (outcome, printed) = bench.run(vec![reply], None);
+    outcome.unwrap_or_else(|stop| panic!("{stop}\n{printed}"));
+    bench
+}
+
+/// A sibling's merge into `main` changing the first line of `NOTES.md`, a
+/// path the delivery of [`sharing`] changed: a clean merge whose move needs
+/// a refresh rebase (OWL-520).
+fn sibling_sharing(bench: &Bench) -> String {
+    bench.merge_into_main(&[("NOTES.md", &NOTES.replace("one", "ONE"))])
+}
+
+/// The data of the rebase runs (`watch` `rebase_run`).
+fn rebase_runs(bench: &Bench) -> Vec<Value> {
+    data_of(&bench.events(), EventKind::Decision, "watch")
+        .into_iter()
+        .filter(|data| data["watch"] == "rebase_run")
+        .collect()
+}
+
+/// The data of the moved bases merge on green told (OWL-520).
+fn moved_bases(bench: &Bench) -> Vec<Value> {
+    data_of(&bench.events(), EventKind::Decision, "watch")
+        .into_iter()
+        .filter(|data| data["watch"] == "base_moved")
+        .collect()
 }
 
 /// The data of the waits merge on green told (OWL-499).
@@ -392,19 +446,21 @@ fn waits_told(bench: &Bench) -> Vec<Value> {
         .collect()
 }
 
-/// S18, a base that moved since the push: no merge, a refresh rebase run
-/// instead, and a merge only once the rebased head reads green twice.
+/// S18, a base that moved since the push on a path the delivery changed:
+/// no merge, a refresh rebase run instead, and a merge only once the
+/// rebased head reads green twice.
 #[test]
 fn a_moved_base_gets_a_refresh_rebase_then_two_green_reads_before_the_merge() {
-    refresh_then_merge(&merging("all"), false);
+    refresh_then_merge(&sharing("all"), false);
 }
 
-/// OWL-499: a base a sibling's merge moves while watch follows a green
-/// pull request, after its first green read, gets the refresh rebase at
-/// the next pass, then the merge, with no wait told on the way.
+/// OWL-499: a base a sibling's merge moves on a path the delivery changed
+/// while watch follows a green pull request, after its first green read,
+/// gets the refresh rebase at the next pass, then the merge, with no wait
+/// told on the way.
 #[test]
 fn a_base_moved_by_a_sibling_s_merge_while_watch_follows_gets_its_refresh() {
-    refresh_then_merge(&merging("all"), true);
+    refresh_then_merge(&sharing("all"), true);
 }
 
 /// LOC-1454 on the bench (OWL-457): the same moved base while two other
@@ -415,7 +471,7 @@ fn a_base_moved_by_a_sibling_s_merge_while_watch_follows_gets_its_refresh() {
 /// left as it was: no `worktree prune` ran.
 #[test]
 fn a_moved_base_is_rebased_and_merged_while_other_runs_are_in_flight() {
-    let bench = merging("all");
+    let bench = sharing("all");
     let dirs = bench.dirs();
     let in_flight: Vec<_> = [
         ("DEMO-2", "20261025T210000Z"),
@@ -459,12 +515,14 @@ fn a_moved_base_is_rebased_and_merged_while_other_runs_are_in_flight() {
 
 /// A moved base's refresh rebase run, then the merge once the rebased head
 /// read green twice, played by `watch` on `bench`, a delivered ticket of a
-/// project whose `[forge] merge` is `all`: the base moved before watch
-/// starts, or, `while_watching`, after its first pass read the pull request
-/// green (OWL-499).
+/// project whose `[forge] merge` is `all` ([`sharing`]): the base moved on a
+/// path the delivery changed before watch starts, or, `while_watching`,
+/// after its first pass read the pull request green (OWL-499). The move is
+/// told once, its shared path named (OWL-520).
 fn refresh_then_merge(bench: &Bench, while_watching: bool) {
     let first_push = bench.remote_branch().unwrap();
-    let mut main = (!while_watching).then(|| sibling_merged(bench));
+    let at_push = bench.remote_main();
+    let mut main = (!while_watching).then(|| sibling_sharing(bench));
     let refresh = refresh_in(bench);
     let github = bench.github.clone();
     let clock = bench.clock.clone();
@@ -478,7 +536,7 @@ fn refresh_then_merge(bench: &Bench, while_watching: bool) {
             later(&clock);
             if main.is_none() {
                 assert_eq!(bench.remote_branch().as_deref(), Some(first_push.as_str()));
-                main = Some(sibling_merged(bench));
+                main = Some(sibling_sharing(bench));
             }
             let merges = github.merges.lock().unwrap().len();
             if pushed_at.is_none() && bench.remote_branch().as_deref() != Some(&first_push) {
@@ -495,12 +553,39 @@ fn refresh_then_merge(bench: &Bench, while_watching: bool) {
     let main = main.unwrap();
     // Each wait the next pass settled said nothing (OWL-499).
     assert_eq!(waits_told(bench), Vec::<Value>::new(), "{lines}");
-    let rebased = data_of(&bench.events(), EventKind::Decision, "refresh");
+    let rebased = rebase_runs(bench);
     assert_eq!(rebased.len(), 1, "{rebased:?}");
     assert_eq!(
-        (&rebased[0]["refresh"], &rebased[0]["onto"]),
-        (&json!(true), &json!(main))
+        (
+            &rebased[0]["refresh"],
+            &rebased[0]["onto"],
+            &rebased[0]["cause"]
+        ),
+        (&json!(true), &json!(main), &json!("merge"))
     );
+    let moved = moved_bases(bench);
+    assert_eq!(moved.len(), 1, "{moved:?}");
+    assert_eq!(
+        (
+            &moved[0]["reason"],
+            &moved[0]["refresh"],
+            &moved[0]["shared"],
+            &moved[0]["head"],
+            &moved[0]["base_at_push"],
+            &moved[0]["base"]
+        ),
+        (
+            &json!("shared"),
+            &json!(true),
+            &json!(["NOTES.md"]),
+            &json!(first_push),
+            &json!(at_push),
+            &json!(main)
+        )
+    );
+    let line = "DEMO-1: pull request #1's base moved since the push, on paths it changes too \
+                (NOTES.md): a refresh rebase comes first";
+    assert_eq!(lines.matches(line).count(), 1, "{lines}");
     let head = bench.remote_branch().unwrap();
     assert!(is_ancestor(bench, &main, &head));
     assert!(pushed_at.is_some(), "{lines}");
@@ -508,6 +593,164 @@ fn refresh_then_merge(bench: &Bench, while_watching: bool) {
     assert_eq!(merges, [json!({ "sha": head, "merge_method": "squash" })]);
     assert_eq!(merged_comments(bench).len(), 1);
     assert_ended_merged(bench);
+}
+
+/// OWL-520, S18: a base two siblings' merges moved since the push, each on
+/// paths the delivery leaves alone. `continue` says the next pass would
+/// merge; watch tells each move once as needing no refresh, runs no rebase,
+/// and merges the pushed head on the base it read last, which the
+/// `pr_merged` event names beside the base at the push.
+#[test]
+fn a_base_moved_on_paths_the_delivery_leaves_alone_merges_without_a_refresh() {
+    let bench = merging("all");
+    let pushed = bench.remote_branch().unwrap();
+    let at_push = bench.remote_main();
+    let first = sibling_merged(&bench);
+    let (outcome, printed) = bench.continue_ticket(Vec::new());
+    let said = match &outcome {
+        Err(stop @ Stop::Watched { .. }) => stop.to_string(),
+        other => panic!("{other:?}\n{printed}"),
+    };
+    assert!(
+        said.ends_with("the next pass of `owlshift watch` would merge it, once its read is green again (merge on green)."),
+        "{said}"
+    );
+    let clock = bench.clock.clone();
+    let mut second = None;
+    let mut pass = 0;
+    let (outcomes, lines, printed) = bench.watch(Vec::new(), &mut |_| {
+        pass += 1;
+        later(&clock);
+        // Between the two green reads, a second sibling moves the base.
+        if pass == 1 {
+            second = Some(bench.merge_into_main(&[("THIRD.md", "A third ticket's file.\n")]));
+        }
+        pass < 4
+    });
+    assert!(
+        outcomes.iter().all(Result::is_ok),
+        "{outcomes:?}\n{lines}\n{printed}"
+    );
+    let second = second.unwrap();
+    assert_eq!(rebase_runs(&bench), Vec::<Value>::new(), "{lines}");
+    let moved: Vec<Value> = moved_bases(&bench)
+        .iter()
+        .map(|data| {
+            json!([
+                data["reason"],
+                data["refresh"],
+                data["head"],
+                data["base_at_push"],
+                data["base"]
+            ])
+        })
+        .collect();
+    assert_eq!(
+        moved,
+        [
+            json!(["disjoint", false, pushed, at_push, first]),
+            json!(["disjoint", false, pushed, at_push, second]),
+        ],
+        "{lines}"
+    );
+    let line = "DEMO-1: pull request #1's base moved since the push, on paths it does not \
+                change: no refresh rebase, it merges once read green twice";
+    assert_eq!(lines.matches(line).count(), 2, "{lines}");
+    assert_eq!(
+        github_merges(&bench),
+        [json!({ "sha": pushed, "merge_method": "squash" })],
+        "{lines}"
+    );
+    let merged = merged_events(&bench);
+    assert_eq!(
+        (&merged[0]["base_at_push"], &merged[0]["base"]),
+        (&json!(at_push), &json!(second))
+    );
+    assert_ended_merged(&bench);
+}
+
+/// OWL-520, S18: GitHub refuses the merge of a pull request on a base that
+/// moved since the push on paths the delivery leaves alone, as a repository
+/// that requires its branches up to date would (the words below are not
+/// GitHub's, which were not observed, and the fallback reads none). No one
+/// is notified: one `merge_refused` event, not final, saying a refresh
+/// comes; at the next pass the move is told again with its new reason and
+/// the refresh rebase runs. On the base its checks ran on, the refreshed
+/// head's refusal is taken as before: final, and notified once.
+#[test]
+fn a_merge_refused_on_a_moved_base_falls_back_to_the_refresh() {
+    let bench = merging("all");
+    let pushed = bench.remote_branch().unwrap();
+    let main = sibling_merged(&bench);
+    let final_refusal = "Merge commits are not allowed on this repository.";
+    bench.github.merge_answers.lock().unwrap().extend([
+        MergeAnswer::Refused(405, "Head branch is not up to date with the base branch."),
+        MergeAnswer::Refused(405, final_refusal),
+    ]);
+    let refresh = refresh_in(&bench);
+    let clock = bench.clock.clone();
+    let mut pass = 0;
+    let (outcomes, lines, printed) = bench.watch_during(
+        vec![bench.reply(None, Some(REBASED))],
+        vec![refresh],
+        &mut |_| {
+            pass += 1;
+            later(&clock);
+            pass < 9
+        },
+    );
+    assert!(
+        outcomes.iter().all(Result::is_ok),
+        "{outcomes:?}\n{lines}\n{printed}"
+    );
+    let head = bench.remote_branch().unwrap();
+    assert_ne!(head, pushed, "no refresh rebase was pushed\n{lines}");
+    assert_eq!(
+        github_merges(&bench),
+        [
+            json!({ "sha": pushed, "merge_method": "squash" }),
+            json!({ "sha": head, "merge_method": "squash" }),
+        ],
+        "{lines}"
+    );
+    let refused: Vec<Value> = data_of(&bench.events(), EventKind::Decision, "watch")
+        .into_iter()
+        .filter(|data| data["watch"] == "merge_refused")
+        .map(|data| json!([data["head"], data["final"], data["status"], data["refresh"]]))
+        .collect();
+    assert_eq!(
+        refused,
+        [
+            json!([pushed, false, 405, true]),
+            json!([head, true, 405, null]),
+        ],
+        "{lines}"
+    );
+    let moved: Vec<Value> = moved_bases(&bench)
+        .iter()
+        .map(|data| json!([data["reason"], data["refresh"], data["head"], data["base"]]))
+        .collect();
+    assert_eq!(
+        moved,
+        [
+            json!(["disjoint", false, pushed, main]),
+            json!(["refused", true, pushed, main]),
+        ],
+        "{lines}"
+    );
+    let rebased = rebase_runs(&bench);
+    assert_eq!(rebased.len(), 1, "{rebased:?}\n{lines}");
+    assert_eq!(
+        (&rebased[0]["cause"], &rebased[0]["onto"]),
+        (&json!("merge"), &json!(main))
+    );
+    let line = "DEMO-1: GitHub refused to merge pull request #1 on a base that moved since the \
+                push (Head branch is not up to date with the base branch); the next pass gets it \
+                a refresh rebase";
+    assert_eq!(lines.matches(line).count(), 1, "{lines}");
+    let notified = bench.notified.0.borrow().clone();
+    assert_eq!(notified.len(), 1, "{notified:?}");
+    assert!(notified[0].contains(final_refusal), "{notified:?}");
 }
 
 /// S18's refusals: one that may pass is tried again at the next pass; one
@@ -741,7 +984,7 @@ fn owed_follow_ups_the_tracker_refuses_hold_neither_the_refresh_nor_the_merge() 
         inbox.refuse = Some("the plan holds 250 issues");
     }
     bench.refuse.set(Some("[owlshift] DELIVERY"));
-    let (outcome, printed) = bench.run(vec![bench.reply(Some("Hello"), Some(PROPOSING))], None);
+    let (outcome, printed) = bench.run(vec![sharing_reply(&bench, PROPOSING)], None);
     assert!(
         matches!(&outcome, Err(Stop::Delivery(why)) if why.contains("the next pass posts it")),
         "{outcome:?}\n{printed}"
@@ -754,7 +997,7 @@ fn owed_follow_ups_the_tracker_refuses_hold_neither_the_refresh_nor_the_merge() 
         [refused.clone(), refused.clone()]
     );
     let first_push = bench.remote_branch().unwrap();
-    let main = sibling_merged(&bench);
+    let main = sibling_sharing(&bench);
     let refresh = refresh_in(&bench);
     let clock = bench.clock.clone();
     let mut pass = 0;
@@ -816,9 +1059,12 @@ fn owed_follow_ups_the_tracker_refuses_hold_neither_the_refresh_nor_the_merge() 
                 DELIVERY report on the tracker, which comes first. Owlshift tries again at each \
                 pass, then gets it a refresh rebase or merges it";
     assert_eq!(lines.matches(line).count(), 1, "{lines}");
-    let rebased = data_of(&bench.events(), EventKind::Decision, "refresh");
+    let rebased = rebase_runs(&bench);
     assert_eq!(rebased.len(), 1, "{rebased:?}\n{lines}");
-    assert_eq!(rebased[0]["onto"], json!(main));
+    assert_eq!(
+        (&rebased[0]["onto"], &rebased[0]["cause"]),
+        (&json!(main), &json!("merge"))
+    );
     let head = bench.remote_branch().unwrap();
     assert_eq!(
         github_merges(&bench),
@@ -856,9 +1102,9 @@ fn owed_follow_ups_the_tracker_refuses_hold_neither_the_refresh_nor_the_merge() 
 /// after the hold, the refresh rebase runs and the merge follows.
 #[test]
 fn a_refresh_that_ran_nothing_is_held_and_told() {
-    let bench = merging("all");
+    let bench = sharing("all");
     let at_push = bench.remote_main();
-    let main = sibling_merged(&bench);
+    let main = sibling_sharing(&bench);
     // Watch's first read is green; the refresh's own read, the next one,
     // finds the check running.
     let reads = *bench.github.follow_reads.lock().unwrap();
@@ -908,7 +1154,7 @@ fn a_refresh_that_ran_nothing_is_held_and_told() {
          {until}, or sooner once its ref moves"
     );
     assert_eq!(lines.matches(&line).count(), 1, "{lines}");
-    let rebased = data_of(&bench.events(), EventKind::Decision, "refresh");
+    let rebased = rebase_runs(&bench);
     assert_eq!(rebased.len(), 1, "{rebased:?}\n{lines}");
     assert_eq!(github_merges(&bench).len(), 1, "{lines}");
     assert_ended_merged(&bench);

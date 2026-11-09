@@ -8549,6 +8549,7 @@ Reply `Q1: B`, `ok` to take every recommendation, or in your own words.
             }),
             base_head: HEAD,
             base_at_push: Some(HEAD),
+            disjoint: false,
             labeled: true,
             excluded: false,
             questions: &[],
