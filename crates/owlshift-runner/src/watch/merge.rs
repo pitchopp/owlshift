@@ -4,7 +4,9 @@
 //! decides on, read without the lock but the stage and the ticket ref, read
 //! again under it; then the last read, `confirm_merge`, the merge under way
 //! kept in the ref, the Writer's merge and its answer. A base that moved
-//! since the push gets a refresh rebase, a repair step of its own. Every
+//! since the push merges as it is when its move leaves the delivery's paths
+//! alone (OWL-520); otherwise it gets a refresh rebase, a repair step of its
+//! own. Every
 //! condition the core checks is the core's; this is the reading, the
 //! locking, the writing and the telling.
 
@@ -31,7 +33,7 @@ use owlshift_core::vocab::{MergeSwitch, Stage};
 use super::{Continued, HeldBack, Memory, Seen, Until, Watch};
 use crate::events::{Data, EventSink, data};
 use crate::follow::{self, MergeRefused, Switch};
-use crate::merge;
+use crate::merge::{self, MovedBase};
 use crate::on_demand::PIPELINE;
 use crate::project::{self, ProjectLock, TicketLock};
 use crate::ticket_ref::{self, ProposalsFile, RefAt, Stored, TicketRecord};
@@ -173,6 +175,8 @@ impl Watch<'_> {
                 .map(|(head, ago)| FirstGreen { head, ago: *ago }),
             base_head: &base_head,
             base_at_push: delivery.base_at_push.as_deref(),
+            // Read below when it is the condition that decides (OWL-520).
+            disjoint: false,
             labeled: labels.iter().any(|label| label == core::MERGE_LABEL),
             excluded: tracker
                 .exclude
@@ -203,6 +207,24 @@ impl Watch<'_> {
             };
             facts.draft = draft;
             due = core::merge_due(&policy, &facts, &read);
+        }
+        // A base that moved since the push, the condition that decides: the
+        // merge goes on when its move leaves the delivery's paths alone
+        // (OWL-520; architecture section 5, "The base the checks ran on").
+        if due == MergeDue::Wait(MergeBlocker::BaseMoved)
+            && let Some(at_push) = delivery.base_at_push.as_deref()
+        {
+            let moved = self.moved_base(memory, ticket, pushed, at_push, &base_head);
+            facts.disjoint = moved.disjoint();
+            due = core::merge_due(&policy, &facts, &read);
+            self.tell_moved(
+                memory,
+                sink,
+                out,
+                (ticket, pr),
+                (pushed, at_push, &base_head),
+                &moved,
+            );
         }
         let grant = match due {
             MergeDue::Merge(grant) => grant,
@@ -236,13 +258,10 @@ impl Watch<'_> {
                 return self.merge_read_failed(memory, sink, ticket, ("pull_request", &error), now);
             }
         };
-        let Some(at_push) = delivery.base_at_push.as_deref() else {
-            return;
-        };
         let confirmed = core::confirm_merge(
             grant,
             &delivery.base_branch,
-            at_push,
+            &locked.base_head,
             &LastRead {
                 state: core_state(last.state),
                 head: last.head.as_str(),
@@ -313,6 +332,9 @@ impl Watch<'_> {
         let answer =
             Writer::new(on_demand.tracker).merge_pull_request(on_demand.forge, pr.number, &grant);
         let head = grant.head();
+        // A merge decided on a base that moved since the push (OWL-520).
+        let on_moved_base =
+            locked.delivery.base_at_push.as_deref() != Some(locked.base_head.as_str());
         // What the ref keeps once the merge did not happen: no merge under
         // way.
         let unmerged = |record: &TicketRecord| {
@@ -343,6 +365,33 @@ impl Watch<'_> {
                     self.keep_merge_at(memory, sink, ticket, &locked, &unmerged(&record), &commit);
                 let event = merge::refused_data(pr.number, head, false, Some(409), &message);
                 sink.emit(ticket, None, EventKind::Decision, event);
+            }
+            // Refused on a moved base, whatever GitHub says: that head
+            // merges only on the base its checks ran on, so the next pass
+            // gets it a refresh rebase, and no one is notified (OWL-520;
+            // architecture section 5, "A refusal on a moved base").
+            Ok(MergeAnswer::Refused(refusal)) if on_moved_base => {
+                let _ =
+                    self.keep_merge_at(memory, sink, ticket, &locked, &unmerged(&record), &commit);
+                memory.following.refuse_moved(ticket, head);
+                let mut event = merge::refused_data(
+                    pr.number,
+                    head,
+                    false,
+                    Some(refusal.status),
+                    &refusal.message,
+                );
+                event.insert("refresh".to_owned(), json!(true));
+                sink.emit(ticket, None, EventKind::Decision, event);
+                self.line(
+                    out,
+                    &format!(
+                        "{ticket}: GitHub refused to merge pull request #{} on a base that moved \
+                         since the push ({}); the next pass gets it a refresh rebase",
+                        pr.number,
+                        refusal.message.trim_end_matches('.')
+                    ),
+                );
             }
             Ok(MergeAnswer::Refused(refusal)) if refusal.may_pass => {
                 let _ =
@@ -455,7 +504,12 @@ impl Watch<'_> {
         if written.is_none() {
             return;
         }
-        merge::merged_event(ticket, pr.number, merging, Some(&merged), sink);
+        let bases = locked
+            .delivery
+            .base_at_push
+            .as_deref()
+            .map(|at_push| (at_push, locked.base_head.as_str()));
+        merge::merged_event(ticket, pr.number, merging, Some(&merged), bases, sink);
         if let Some(event) = memory.following.events(ticket, &ended) {
             sink.emit(ticket, None, EventKind::Decision, event);
         }
@@ -533,6 +587,65 @@ impl Watch<'_> {
             ),
         );
         merge::notify_waits(self.on_demand, ticket, pr.number, &reason, sink);
+    }
+
+    /// What merge on green reads of the base's move from `at_push` to
+    /// `base_head` for `ticket`'s delivery `pushed` (OWL-520; architecture
+    /// section 5, "The base the checks ran on"): [`MovedBase::Refused`] once
+    /// GitHub refused this head's merge on a moved base; else read in the
+    /// dedicated checkout, under the project's lock the caller holds,
+    /// fetched first when it lacks one of the three commits. Nothing is
+    /// kept: a reading git could not make is made again at the next pass.
+    fn moved_base(
+        &self,
+        memory: &Memory,
+        ticket: &TicketId,
+        pushed: &str,
+        at_push: &str,
+        base_head: &str,
+    ) -> MovedBase {
+        if memory.following.moved_refused(ticket, pushed) {
+            return MovedBase::Refused;
+        }
+        let on_demand = self.on_demand;
+        let git = &on_demand.executor.git;
+        let checkout = on_demand.dirs.checkout();
+        let held = |commit: &str| {
+            let object = format!("{commit}^{{commit}}");
+            git.output(&checkout, &["cat-file", "-e", &object], None)
+                .is_ok_and(|out| out.success())
+        };
+        if ![pushed, at_push, base_head].into_iter().all(held)
+            && let Err(why) = project::sync_checkout(git, on_demand.dirs, on_demand.remote_url)
+        {
+            return MovedBase::Unread(format!("fetching the dedicated checkout: {why}"));
+        }
+        MovedBase::read(git, &checkout, pushed, at_push, base_head)
+    }
+
+    /// Tells `moved`, what merge on green read of the base of `ticket`'s
+    /// pull request `pr` at `head`, moved from `at_push` to `base`
+    /// (OWL-520): once per head, base head and reason, one `decision` event
+    /// (`watch` `base_moved`) and one line. No notification: a refresh or a
+    /// merge follows by itself.
+    fn tell_moved(
+        &self,
+        memory: &mut Memory,
+        sink: &mut EventSink<'_>,
+        out: &mut dyn Write,
+        (ticket, pr): (&TicketId, &DeliveredPullRequest),
+        (head, at_push, base): (&str, &str, &str),
+        moved: &MovedBase,
+    ) {
+        if !memory
+            .following
+            .moved_told(ticket, head, base, moved.reason())
+        {
+            return;
+        }
+        let event = moved.data(pr.number, head, at_push, base);
+        sink.emit(ticket, None, EventKind::Decision, event);
+        self.line(out, &format!("{ticket}: {}", moved.words(pr.number)));
     }
 
     /// A base that moved since the push, the pull request `pr` of `ticket`

@@ -378,6 +378,12 @@ struct MergeMemory {
     /// The head, and each wait found on it since a step of the ticket last
     /// started, with whether it was told (OWL-499).
     told: Option<(String, Vec<(Data, bool)>)>,
+    /// The head whose merge on a moved base GitHub refused: it merges only
+    /// on the base its checks ran on (OWL-520).
+    moved_refused: Option<String>,
+    /// The head, the base head and the reason of the moved base last told
+    /// (OWL-520).
+    moved_told: Option<(String, String, &'static str)>,
 }
 
 /// How many waits of one head [`Following::merge_told`] keeps.
@@ -827,6 +833,44 @@ impl Following {
         if let Some(memory) = self.merge.get_mut(ticket) {
             memory.told = None;
         }
+    }
+
+    /// GitHub refused the merge of `ticket`'s `head` on a moved base: from
+    /// now on that head merges only on the base its checks ran on, its
+    /// moved base getting a refresh rebase (OWL-520; architecture section 5,
+    /// "Merge on green", "A refusal on a moved base").
+    pub fn refuse_moved(&mut self, ticket: &TicketId, head: &str) {
+        self.merge.entry(ticket.clone()).or_default().moved_refused = Some(head.to_owned());
+    }
+
+    /// Whether GitHub refused a merge of `ticket`'s `head` on a moved base
+    /// ([`Self::refuse_moved`]).
+    pub fn moved_refused(&self, ticket: &TicketId, head: &str) -> bool {
+        self.merge
+            .get(ticket)
+            .and_then(|memory| memory.moved_refused.as_deref())
+            == Some(head)
+    }
+
+    /// Whether to tell what merge on green read of `ticket`'s base moved to
+    /// `base` under `head`, for `reason` (OWL-520): once per head, base head
+    /// and reason. Keeps it as told.
+    pub fn moved_told(
+        &mut self,
+        ticket: &TicketId,
+        head: &str,
+        base: &str,
+        reason: &'static str,
+    ) -> bool {
+        let memory = self.merge.entry(ticket.clone()).or_default();
+        let told = memory
+            .moved_told
+            .as_ref()
+            .is_some_and(|(at, on, why)| at == head && on == base && *why == reason);
+        if !told {
+            memory.moved_told = Some((head.to_owned(), base.to_owned(), reason));
+        }
+        !told
     }
 
     /// The last read found `ticket`'s review clearing: a refusal of its

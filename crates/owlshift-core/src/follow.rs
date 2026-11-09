@@ -417,6 +417,15 @@ pub struct MergeFacts<'a> {
     pub base_head: &'a str,
     /// `delivery.json`'s `base_at_push`: the base CI merged the head with.
     pub base_at_push: Option<&'a str>,
+    /// Whether the base's move from `base_at_push` to `base_head` leaves
+    /// every path the delivery changed alone, as the runner read it from
+    /// git (OWL-520; architecture section 5, "Merge on green", "The base the
+    /// checks ran on"): then the merge goes on without a refresh rebase.
+    /// False when not read, when git could not tell, and for a head whose
+    /// merge on a moved base the forge refused: a moved base then gets its
+    /// refresh. The runner reads it once [`merge_due`] waits on
+    /// [`MergeBlocker::BaseMoved`] alone.
+    pub disjoint: bool,
     /// Whether the ticket carries [`MERGE_LABEL`].
     pub labeled: bool,
     /// Whether the ticket carries the project's `[tracker].exclude` label: a
@@ -468,8 +477,10 @@ pub enum MergeBlocker {
     /// The base Owlshift pushed onto is not known: no merge, and nothing
     /// more is known about the base.
     BaseUnknown,
-    /// The base moved since the push: the checks ran on a merge with the old
-    /// base, so a refresh rebase is due.
+    /// The base moved since the push, and the move touches a path the
+    /// delivery changed, or was not read as leaving them alone
+    /// ([`MergeFacts::disjoint`], OWL-520): a refresh rebase is due. From
+    /// [`confirm_merge`], the base moved again since [`merge_due`] decided.
     BaseMoved,
     /// The head was not read green twice at least [`GREEN_TWICE_AFTER`]
     /// apart.
@@ -546,7 +557,9 @@ fn blocker(policy: &MergePolicy<'_>, facts: &MergeFacts<'_>, read: &Read) -> Opt
     }
     match facts.base_at_push {
         None => return Some(MergeBlocker::BaseUnknown),
-        Some(at_push) if at_push != facts.base_head => return Some(MergeBlocker::BaseMoved),
+        Some(at_push) if at_push != facts.base_head && !facts.disjoint => {
+            return Some(MergeBlocker::BaseMoved);
+        }
         Some(_) => {}
     }
     let green_twice = facts
@@ -659,16 +672,18 @@ pub struct LastRead<'a> {
 }
 
 /// Whether the merge [`merge_due`] granted still goes on, on the last read
-/// (OWL-446): open, at the grant's head, on `base` still at `base_at_push`,
-/// not a draft, and a review decision that clears, in that order, so a base
-/// that moved is found before a review and gets its refresh rebase. The
-/// same grant comes back when it goes on. Neither GitHub merge call refuses
-/// a closed pull request or takes a base to expect, so this narrows them to
-/// the time between the read and the call; it does not pin them.
+/// (OWL-446): open, at the grant's head, on `base` still at `base_head`,
+/// the base head [`merge_due`] decided on (`base_at_push`, or one whose move
+/// left the delivery's paths alone, OWL-520), not a draft, and a review
+/// decision that clears, in that order, so a base that moved again is found
+/// before a review and decided again at the next pass. The same grant
+/// comes back when it goes on. Neither GitHub merge call refuses a closed
+/// pull request or takes a base to expect, so this narrows them to the time
+/// between the read and the call; it does not pin them.
 pub fn confirm_merge(
     grant: MergeGrant,
     base: &str,
-    base_at_push: &str,
+    base_head: &str,
     last: &LastRead<'_>,
 ) -> MergeDue {
     let blocker = if last.state != PrState::Open {
@@ -677,7 +692,7 @@ pub fn confirm_merge(
         Some(MergeBlocker::HeadMoved)
     } else if last.base != base {
         Some(MergeBlocker::BaseRetargeted)
-    } else if last.base_head != base_at_push {
+    } else if last.base_head != base_head {
         Some(MergeBlocker::BaseMoved)
     } else if last.draft {
         Some(MergeBlocker::Draft)
@@ -1050,6 +1065,7 @@ mod tests {
                 }),
                 base_head: BASE,
                 base_at_push: Some(BASE),
+                disjoint: false,
                 labeled: true,
                 excluded: false,
                 questions,
@@ -1253,6 +1269,105 @@ mod tests {
             }
         }
 
+        /// OWL-520: a base that moved since the push merges with no refresh
+        /// once read as leaving the delivery's paths alone, under every other
+        /// condition, two green reads included; unread, or read otherwise,
+        /// the move is a refresh. A base that did not move, or one not known,
+        /// ignores the reading.
+        #[test]
+        fn a_moved_base_that_leaves_the_delivery_alone_merges_without_a_refresh() {
+            use MergeBlocker::*;
+            let gate = gate(DelegationLevel::Discoverable);
+            let at_push = "fedcba9876543210fedcba9876543210fedcba98";
+            let wait = |facts: &MergeFacts<'_>| due(MergeSwitch::All, &gate, facts, &green_read());
+            let moved = MergeFacts {
+                base_at_push: Some(at_push),
+                ..facts(&GREEN, &[])
+            };
+            assert_eq!(wait(&moved), MergeDue::Wait(BaseMoved));
+            let apart = MergeFacts {
+                disjoint: true,
+                ..moved
+            };
+            assert_eq!(
+                wait(&apart),
+                MergeDue::Merge(MergeGrant::new(HEAD, MergeMethod::Rebase))
+            );
+            let cases = [
+                (
+                    MergeFacts {
+                        first_green: None,
+                        ..apart
+                    },
+                    GreenOnce,
+                ),
+                (
+                    MergeFacts {
+                        something_due: true,
+                        ..apart
+                    },
+                    SomethingDue,
+                ),
+                (
+                    MergeFacts {
+                        base_at_push: None,
+                        ..apart
+                    },
+                    BaseUnknown,
+                ),
+            ];
+            for (facts, blocker) in cases {
+                assert_eq!(wait(&facts), MergeDue::Wait(blocker.clone()), "{blocker:?}");
+            }
+            let unmoved = MergeFacts {
+                disjoint: true,
+                ..facts(&GREEN, &[])
+            };
+            assert!(matches!(wait(&unmoved), MergeDue::Merge(_)));
+        }
+
+        /// OWL-520: a conflict with a moved base is a rebase run, cause
+        /// `conflict`, never a merge, whatever the reading of the move.
+        #[test]
+        fn a_conflict_with_a_moved_base_is_a_rebase_never_a_merge() {
+            let gate = gate(DelegationLevel::Discoverable);
+            let conflicting = Read {
+                mergeable: Mergeable::Conflicting,
+                ..green_read()
+            };
+            let pushed = Followed {
+                pushed: HEAD,
+                pushing: None,
+                rebased_onto: None,
+                overlap: None,
+            };
+            let base = BaseRead {
+                head: BASE.to_owned(),
+                at_head: Vec::new(),
+                at_push: None,
+            };
+            let decision = decide(&conflicting, pushed, Some(&base), None);
+            assert_eq!(
+                decision,
+                Decision::Follow {
+                    adopt: false,
+                    action: Action::Rebase {
+                        onto: BASE.to_owned(),
+                        cause: RebaseCause::Conflict,
+                    },
+                }
+            );
+            let moved = MergeFacts {
+                base_at_push: Some("fedcba9876543210fedcba9876543210fedcba98"),
+                disjoint: true,
+                ..facts(&decision, &[])
+            };
+            assert_eq!(
+                due(MergeSwitch::All, &gate, &moved, &conflicting),
+                MergeDue::Wait(MergeBlocker::NotGreen)
+            );
+        }
+
         fn last() -> LastRead<'static> {
             LastRead {
                 state: PrState::Open,
@@ -1274,7 +1389,8 @@ mod tests {
         }
 
         /// OWL-446: the grant goes on, unchanged, on a review approved or
-        /// none required.
+        /// none required; OWL-520: on the base head `merge_due` decided on,
+        /// a moved one included.
         #[test]
         fn the_last_read_passes_the_grant_on_a_review_that_clears() {
             for review in [ReviewState::NotRequired, ReviewState::Approved] {
@@ -1285,6 +1401,16 @@ mod tests {
                     "{review:?}"
                 );
             }
+            let decided = "fedcba9876543210fedcba9876543210fedcba98";
+            let grant = MergeGrant::new(HEAD, MergeMethod::Squash);
+            let moved = LastRead {
+                base_head: decided,
+                ..last()
+            };
+            assert_eq!(
+                confirm_merge(grant.clone(), "main", decided, &moved),
+                MergeDue::Merge(grant)
+            );
         }
 
         /// OWL-446: each condition of the last read, broken alone, stops the

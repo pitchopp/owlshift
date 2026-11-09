@@ -1382,7 +1382,7 @@ impl Watch<'_> {
             on_demand.review_after_working(ticket, sink);
         }
         if let (Some(merging), Some(pr)) = (&runner_merged, &delivery.pull_request) {
-            crate::merge::merged_event(ticket, pr.number, merging, None, sink);
+            crate::merge::merged_event(ticket, pr.number, merging, None, None, sink);
         }
         if let Some(event) = memory.following.events(ticket, &seen) {
             sink.emit(ticket, None, EventKind::Decision, event);
