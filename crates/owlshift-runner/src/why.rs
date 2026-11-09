@@ -27,6 +27,7 @@ use std::path::Path;
 use jiff::Timestamp;
 use owlshift_contracts::event::{Event, EventKind};
 use owlshift_contracts::ids::TicketId;
+use owlshift_contracts::service::BY_UI;
 use owlshift_core::base::{Check, Entry, Verdict};
 use owlshift_core::state::Status;
 use owlshift_core::usage::Standing;
@@ -171,12 +172,12 @@ fn waiting(event: &Event, ticket: &TicketId) -> Option<Waiting> {
         && event.data.get("takes").and_then(Value::as_str) == Some("resume")
     {
         // A restart left to watch's resume (OWL-420), typed on the ticket
-        // too (OWL-488): its word until watch tells a wait or the ticket
-        // runs.
-        if event.data.get("by").and_then(Value::as_str) == Some("tracker") {
-            "tracker_restart".to_owned()
-        } else {
-            "to_watch".to_owned()
+        // too (OWL-488) or made from the web UI (OWL-473): its word until
+        // watch tells a wait or the ticket runs.
+        match event.data.get("by").and_then(Value::as_str) {
+            Some("tracker") => "tracker_restart".to_owned(),
+            Some(BY_UI) => "ui_restart".to_owned(),
+            _ => "to_watch".to_owned(),
         }
     } else {
         return None;
@@ -302,6 +303,9 @@ pub fn phrase(wait: &Waiting) -> String {
         "tracker_restart" => "restarted by its decider's `continue` on the ticket: `owlshift \
                               watch` resumes it at its next pass"
             .to_owned(),
+        "ui_restart" => {
+            "restarted from the web UI: `owlshift watch` resumes it at its next pass".to_owned()
+        }
         "usage_limit" => {
             let harness = data
                 .get("harness")
@@ -1243,6 +1247,24 @@ mod tests {
             phrase(&fold(&[typed], "o/r").current[&id]),
             "restarted by its decider's `continue` on the ticket: `owlshift watch` resumes it at \
              its next pass"
+        );
+        // Made from the web UI (OWL-473): named so, alike.
+        let from_ui = waits(
+            "2026-11-09T09:00:00Z",
+            "OWL-1",
+            data([
+                ("restarted", json!(true)),
+                ("stage", json!("build")),
+                ("to_watch", json!(true)),
+                ("takes", json!("resume")),
+                ("by", json!("ui")),
+            ]),
+        );
+        let folded = fold(&[from_ui], "o/r");
+        assert_eq!(folded.current[&id].reason, "ui_restart");
+        assert_eq!(
+            phrase(&folded.current[&id]),
+            "restarted from the web UI: `owlshift watch` resumes it at its next pass"
         );
     }
 

@@ -29,7 +29,7 @@ use owlshift_runner::notify::{self, DesktopNotifier};
 use owlshift_runner::served::Registry;
 use owlshift_runner::system::System;
 use owlshift_runner::watch::drain_refusal;
-use owlshift_runner::{on_demand, project};
+use owlshift_runner::{controls, on_demand, project};
 
 use crate::do_cmd::loaded_project;
 use crate::{data_dir, fail, own_build};
@@ -564,20 +564,12 @@ pub fn stop(config: &Effective, forget: bool, at_login: bool) -> ExitCode {
             Ok(repo) => repo,
             Err(refusal) => return fail(&refusal),
         };
-        return match Registry::in_data_dir(&data).forget(&repo) {
-            Ok(true) if running.is_some() => {
-                println!(
-                    "{repo} is no longer served: the daemon drains its watch at its next pass, \
-                     within a minute."
-                );
-                ExitCode::SUCCESS
-            }
-            Ok(true) => {
-                println!("{repo} is no longer served.");
-                ExitCode::SUCCESS
-            }
-            Ok(false) => {
-                println!("{repo} was not served.");
+        // The web UI's Stop serving shares it (OWL-473).
+        return match controls::forget(&data, &repo) {
+            Ok(lines) => {
+                for line in lines {
+                    println!("{line}");
+                }
                 ExitCode::SUCCESS
             }
             Err(error) => fail(&error),

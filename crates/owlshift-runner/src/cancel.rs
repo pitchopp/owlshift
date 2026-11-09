@@ -28,7 +28,7 @@ use owlshift_platform::process;
 use crate::daemon::requests;
 use crate::executor::Git;
 use crate::project::ProjectDirs;
-use crate::ticket_ref::{self, Stored};
+use crate::ticket_ref::{self, Stored, TicketRecord};
 use crate::watch::presence;
 
 /// The name of the cancel file in a ticket's folder.
@@ -114,12 +114,45 @@ fn not_parked(status: Status, followed: bool) -> Option<NotParked> {
 
 /// Whether a cancel parks the ticket in `state` whose ref keeps `stored`.
 pub fn parkable(state: &TicketState, stored: &Stored) -> Result<(), NotParked> {
-    let followed = stored
-        .record
+    parkable_record(state, &stored.record)
+}
+
+/// [`parkable`], from the record a ref keeps.
+fn parkable_record(state: &TicketState, record: &TicketRecord) -> Result<(), NotParked> {
+    let followed = record
         .delivery
         .as_ref()
         .is_some_and(|delivery| delivery.followed());
     not_parked(state.status(), followed).map_or(Ok(()), Err)
+}
+
+/// Whether [`ask`] writes a cancel of `ticket`, whose ref keeps `record`
+/// (`None` for a ticket with no ref), while a step of it runs (its lock
+/// held) when `running`: `Ok(unkept)`, `unkept` when a step runs that
+/// Owlshift keeps no record of, or one at Ready; why not otherwise, in the
+/// words `owlshift cancel` refuses with. The web UI's ticket page offers
+/// Cancel on it (OWL-473).
+pub fn decide(
+    ticket: &TicketId,
+    record: Option<&TicketRecord>,
+    running: bool,
+) -> Result<bool, String> {
+    match record {
+        Some(record) => {
+            let state = TicketState::try_from(&record.state)
+                .map_err(|e| format!("{ticket}'s ticket ref keeps no valid state: {e:?}"))?;
+            match parkable_record(&state, record) {
+                Ok(()) => Ok(false),
+                Err(NotParked::Ready) if running => Ok(true),
+                Err(not) => Err(not.words(ticket)),
+            }
+        }
+        None if running => Ok(true),
+        None => Err(format!(
+            "Owlshift has nothing of {ticket} in flight: no step of it runs and it keeps no \
+             record of it"
+        )),
+    }
 }
 
 /// What the PARKED comment says of the cancel `request`, `None` for a file
@@ -174,24 +207,11 @@ pub fn ask(
     let running = dirs
         .ticket_lock_held(ticket)
         .map_err(|e| format!("{ticket}'s lock could not be read: {e}"))?;
-    let unkept = match &stored {
-        Some(stored) => {
-            let state = TicketState::try_from(&stored.record.state)
-                .map_err(|e| format!("{ticket}'s ticket ref keeps no valid state: {e:?}"))?;
-            match parkable(&state, stored) {
-                Ok(()) => false,
-                Err(NotParked::Ready) if running => true,
-                Err(not) => return Err(not.words(ticket)),
-            }
-        }
-        None if running => true,
-        None => {
-            return Err(format!(
-                "Owlshift has nothing of {ticket} in flight: no step of it runs and it keeps no \
-                 record of it"
-            ));
-        }
-    };
+    let unkept = decide(
+        ticket,
+        stored.as_ref().map(|stored| &stored.record),
+        running,
+    )?;
     let path = file(dirs, ticket);
     let replaced = read_at(&path);
     crate::step::write_atomically(&path, &request.render())
@@ -202,6 +222,46 @@ pub fn ask(
         quarantined: dirs.quarantine().ok().flatten().is_some(),
         unkept,
     })
+}
+
+/// What `owlshift cancel`, and the web UI's Cancel, say of the cancel of
+/// `ticket` [`ask`] wrote.
+pub fn said(ticket: &TicketId, asked: &Asked) -> Vec<String> {
+    let mut lines = vec![format!(
+        "Asked to cancel {ticket}: its step under way stops within 5 seconds, its runs stopped and \
+         checked, and the project's watch then parks it, with a PARKED comment on the ticket. \
+         `owlshift continue {ticket}` restarts it from where it was stopped. A step typed in a \
+         terminal (`owlshift continue`, `owlshift do`) is not stopped."
+    )];
+    if let Some(before) = &asked.replaced {
+        lines.push(match before {
+            Some(before) => format!(
+                "It replaces the cancel asked by {} at {}: {}",
+                before.by, before.at, before.why
+            ),
+            None => "It replaces a cancel file that did not say who wrote it.".to_owned(),
+        });
+    }
+    if asked.unkept {
+        lines.push(format!(
+            "Owlshift keeps no record of {ticket} yet: should its step stop before its first run \
+             has kept anything, nothing is parked, and the file is dropped."
+        ));
+    }
+    if asked.quarantined {
+        lines.push(
+            "The project is quarantined: no watch parks anything until `owlshift unquarantine` \
+             lifts it."
+                .to_owned(),
+        );
+    }
+    if !asked.watching {
+        lines.push(format!(
+            "No watch runs on this project now: {ticket} is parked at the first pass of one, \
+             such as the background service's (`owlshift start`)."
+        ));
+    }
+    lines
 }
 
 /// A step's watch over its ticket's cancel file (OWL-474), from
@@ -352,6 +412,35 @@ mod tests {
         assert_eq!(
             detail(None),
             "Canceled by a cancel file that does not say who wrote it"
+        );
+    }
+
+    /// The command says what follows, and each standing that changes it.
+    #[test]
+    fn it_says_what_follows_and_what_holds_it() {
+        let ticket = TicketId::new("WEB-1").unwrap();
+        let plain = Asked {
+            replaced: None,
+            watching: true,
+            quarantined: false,
+            unkept: false,
+        };
+        let lines = said(&ticket, &plain);
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert!(lines[0].starts_with("Asked to cancel WEB-1: its step under way stops"));
+        let held = Asked {
+            replaced: Some(None),
+            watching: false,
+            quarantined: true,
+            unkept: true,
+        };
+        let lines = said(&ticket, &held).join("\n");
+        assert!(lines.contains("It replaces a cancel file"), "{lines}");
+        assert!(lines.contains("keeps no record of WEB-1 yet"), "{lines}");
+        assert!(lines.contains("The project is quarantined"), "{lines}");
+        assert!(
+            lines.contains("No watch runs on this project now"),
+            "{lines}"
         );
     }
 

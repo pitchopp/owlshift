@@ -76,7 +76,9 @@ const HEAD_WAIT: Duration = Duration::from_secs(2);
 pub enum Mode<'a> {
     Do(&'a str),
     Continue(&'a str),
-    ToWatch(&'a str),
+    /// The ticket, and who restarts it when not a person at a terminal:
+    /// `ui` for the web UI's Restart (OWL-473).
+    ToWatch(&'a str, Option<&'static str>),
     Watch,
     Drain,
     Step(&'a str, &'a str),
@@ -87,7 +89,7 @@ impl<'a> Mode<'a> {
         match self {
             Mode::Do(_) => "`owlshift do`",
             Mode::Continue(_) | Mode::Step(..) => "`owlshift continue`",
-            Mode::ToWatch(_) => "`owlshift continue --to-watch`",
+            Mode::ToWatch(..) => "`owlshift continue --to-watch`",
             Mode::Watch => "`owlshift watch`",
             Mode::Drain => "`owlshift watch --drain`",
         }
@@ -98,7 +100,7 @@ impl<'a> Mode<'a> {
         match self {
             Mode::Do(ticket)
             | Mode::Continue(ticket)
-            | Mode::ToWatch(ticket)
+            | Mode::ToWatch(ticket, _)
             | Mode::Step(ticket, _) => Some(ticket),
             Mode::Watch | Mode::Drain => None,
         }
@@ -547,9 +549,10 @@ fn run_with(
     let (ticket, outcome) = match (mode, &ticket) {
         (Mode::Do(_), Some(ticket)) => (ticket, on_demand.run(ticket, &mut sink)),
         (Mode::Continue(_), Some(ticket)) => (ticket, on_demand.continue_ticket(ticket, &mut sink)),
-        (Mode::ToWatch(_), Some(ticket)) => {
-            (ticket, on_demand.continue_to_watch(ticket, &mut sink))
-        }
+        (Mode::ToWatch(_, by), Some(ticket)) => (
+            ticket,
+            on_demand.continue_to_watch_by(ticket, by, &mut sink),
+        ),
         (Mode::Step(..), Some(ticket)) => {
             let envelope = envelope.ok_or("a step without its envelope")?;
             // The machine kept from idle sleep while this child holds its
@@ -1142,7 +1145,7 @@ mod refusals {
         for mode in [
             Mode::Do("OWL-1"),
             Mode::Continue("OWL-1"),
-            Mode::ToWatch("OWL-1"),
+            Mode::ToWatch("OWL-1", None),
             Mode::Watch,
             Mode::Step("OWL-1", &step),
         ] {

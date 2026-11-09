@@ -1,6 +1,8 @@
 // The operations screens of the web UI (OWL-472): the Orchestrator, Spend and
 // Config, at `#/orchestrator`, `#/spend` and `#/config`. They draw what
-// `owlshift status`, `logs`, `doctor` and `config show` tell, read-only.
+// `owlshift status`, `logs`, `doctor` and `config show` tell. Two act
+// (OWL-473): the Orchestrator's controls pause, resume and stop serving, and
+// Config edits the personal file one key at a time.
 // Every text reaches the page through `make` and `text` of app.js, which set
 // `textContent`: nothing an agent, a model or a comment wrote is read as
 // markup. One timer refreshes the screen shown, and stops when it is left:
@@ -335,7 +337,118 @@
     }
   }
 
+  // -------------------------------------------------------------------------
+  // The controls (OWL-473): pause and resume every project of the machine or
+  // one served project, and stop serving one. Each runs its command's own code
+  // on the server, which records the request by `ui`; the command's words, or
+  // its refusal, show below the controls.
+
+  function pauseWords(pause) {
+    if (!pause) {
+      return "not paused";
+    }
+    if (pause.unreadable) {
+      return "paused by a pause file that does not read";
+    }
+    return "paused by " + pause.by + " at " + clock(pause.at) + ": " + pause.why;
+  }
+
+  // What an action's answer says: its lines, or why it was refused.
+  function saidOf(answer) {
+    const value = (answer && answer.value) || {};
+    if (answer && answer.status >= 200 && answer.status < 300) {
+      return (value.lines || []).map((line) => ["state-success", line]);
+    }
+    return [["state-danger", value.error || "The server answered " + (answer ? answer.status : 0) + "."]];
+  }
+
+  function drawSaid(parent, said) {
+    clear(parent);
+    for (const [className, line] of said || []) {
+      parent.appendChild(make("p", className + " pre-text", line));
+    }
+  }
+
+  async function act(state, path, body, button) {
+    button.disabled = true;
+    drawSaid(state.parts.controlsSaid, [["state-information", "Asked…"]]);
+    let answer = null;
+    try {
+      answer = await request(path, body);
+    } catch (error) {
+      answer = { status: 0, value: { error: error.message } };
+    }
+    button.disabled = false;
+    if (!answer || !current || current.state !== state) {
+      return;
+    }
+    drawSaid(state.parts.controlsSaid, saidOf(answer));
+    state.controlsKey = null;
+    tick();
+  }
+
+  function controlButton(label, onClick) {
+    const button = make("button", "action", label);
+    button.type = "button";
+    button.addEventListener("click", () => onClick(button));
+    return button;
+  }
+
+  // One row of controls: the machine's when `project` is null.
+  function controlRow(state, label, pause, project) {
+    const row = make("div", "control-row");
+    row.appendChild(make("strong", "", label));
+    row.appendChild(make("span", pause ? "state-warning" : "muted", pauseWords(pause)));
+    const target = project ? { project: project } : {};
+    const reason = make("input", "control-reason");
+    reason.type = "text";
+    reason.placeholder = "reason (optional)";
+    reason.setAttribute("aria-label", "Why " + label + " is paused");
+    row.appendChild(reason);
+    row.appendChild(controlButton("Pause", (button) =>
+      act(state, "/api/pause", Object.assign({ reason: reason.value }, target), button)));
+    if (pause) {
+      row.appendChild(controlButton("Resume", (button) => act(state, "/api/resume", target, button)));
+    }
+    if (project) {
+      row.appendChild(controlButton("Stop serving", (button) => {
+        if (!window.confirm("Stop serving " + project + "? The daemon drains its watch at its " +
+          "next pass, and only `owlshift start` in its checkout serves it again.")) {
+          return;
+        }
+        act(state, "/api/forget", { project: project }, button);
+      }));
+    }
+    return row;
+  }
+
+  // Drawn again only when what it shows changed, so a reason being typed
+  // stays.
+  function drawControls(state, controls) {
+    const key = JSON.stringify(controls || null) + "|" + chosenProject();
+    if (!controls || state.controlsKey === key) {
+      return;
+    }
+    state.controlsKey = key;
+    const body = state.parts.controls;
+    clear(body);
+    body.appendChild(controlRow(state, "Every project of this machine", controls.machine_pause, null));
+    for (const project of controls.projects) {
+      if (sameProject(project.repository)) {
+        body.appendChild(controlRow(state, project.repository, project.paused, project.repository));
+      }
+    }
+    note(body, "A pause stops dispatching from each watch's next pass; the steps under way finish. " +
+      "The service itself is started and stopped in a terminal, and so is a quarantine lifted.");
+  }
+
   function buildOrchestrator(state, el) {
+    const controls = section("Controls");
+    state.parts.controls = make("div");
+    state.parts.controlsSaid = make("div", "control-said");
+    controls.body.appendChild(state.parts.controls);
+    controls.body.appendChild(state.parts.controlsSaid);
+    el.appendChild(controls.el);
     const status = section("Daemon and watches");
     const usage = section("Usage windows");
     const checks = section("Checks");
@@ -374,6 +487,7 @@
           problem("");
           const value = answer.value;
           state.last = value;
+          drawControls(state, value.controls);
           drawStatus(state, value);
           drawUsage(state, value);
           takeEvents(state, value.events);
@@ -577,7 +691,227 @@
   // Config.
 
   function configState() {
-    return { rev: null, key: null, busy: false, parts: {} };
+    return { rev: null, key: null, busy: false, parts: {}, editRev: null, editSaid: [] };
+  }
+
+  // The personal file's editor (OWL-473): one key saved at a time, each with
+  // the control of its kind, the server writing the TOML type its table names
+  // and checking the file as the loader does. `editRev` is the SHA-256 of the
+  // file this page read (null for a file absent): an edit naming another is
+  // refused, so a hand edit made meanwhile is never overwritten.
+
+  // A choice among `choices`, `[label, value]` pairs.
+  function choiceControl(choices, value) {
+    const select = make("select", "control-input");
+    for (const [label, chosen] of choices) {
+      const option = make("option", "", label);
+      option.value = label;
+      option.selected = chosen === (value === undefined ? null : value);
+      select.appendChild(option);
+    }
+    return {
+      el: select,
+      read: () => ({ value: choices.find(([label]) => label === select.value)[1] }),
+    };
+  }
+
+  function numberControl(value, whole) {
+    const input = make("input", "control-input");
+    input.type = "number";
+    input.step = whole ? "1" : "any";
+    input.value = value === null || value === undefined ? "" : String(value);
+    return {
+      el: input,
+      read: () => {
+        const raw = input.value.trim();
+        if (raw === "") {
+          return { value: null };
+        }
+        const number = Number(raw);
+        if (!Number.isFinite(number) || (whole && !Number.isInteger(number))) {
+          return { error: whole ? "a whole number" : "a number" };
+        }
+        return { value: number };
+      },
+    };
+  }
+
+  function textControl(value) {
+    const input = make("input", "control-input");
+    input.type = "text";
+    input.value = value === null || value === undefined ? "" : String(value);
+    return { el: input, read: () => ({ value: input.value === "" ? null : input.value }) };
+  }
+
+  // A list of texts, one per line; no line at all removes the key.
+  function textsControl(value) {
+    const area = make("textarea", "control-list");
+    area.value = Array.isArray(value) ? value.join("\n") : "";
+    return {
+      el: area,
+      read: () => {
+        const items = area.value.split("\n").map((line) => line.trim()).filter((line) => line !== "");
+        return { value: items.length ? items : null };
+      },
+    };
+  }
+
+  // The control of each kind of key the server's table names: a kind the
+  // page does not know is shown read-only.
+  const CONTROLS = {
+    bool: (value) => choiceControl([["unset", null], ["on", true], ["off", false]], value),
+    integer: (value) => numberControl(value, true),
+    float: (value) => numberControl(value, false),
+    text: textControl,
+    texts: textsControl,
+    harness: (value) => choiceControl([["unset", null], ["claude", "claude"], ["codex", "codex"]], value),
+  };
+
+  function editSaidOf(answer) {
+    const said = saidOf(answer);
+    const value = (answer && answer.value) || {};
+    if (answer && answer.status === 200) {
+      for (const project of value.refused_projects || []) {
+        said.push(["state-warning", project.repository + "'s kept project file is refused with this " +
+          "personal file" + (project.already ? ", as it was before this edit" : "") + ": " + project.why]);
+      }
+    }
+    return said;
+  }
+
+  async function editKey(state, path, value) {
+    let answer = null;
+    try {
+      answer = await request("/api/config/personal", { path: path, value: value, rev: state.editRev });
+    } catch (error) {
+      answer = { status: 0, value: { error: error.message } };
+    }
+    if (answer && answer.status === 200) {
+      state.editRev = answer.value.rev;
+    }
+    return answer;
+  }
+
+  function showEdit(state, said) {
+    state.editSaid = said;
+    drawSaid(state.parts.editSaid, said);
+  }
+
+  async function saveKey(state, key, control, button) {
+    const read = control.read();
+    if (read.error) {
+      showEdit(state, [["state-danger", key.key + " takes " + read.error + "."]]);
+      return;
+    }
+    button.disabled = true;
+    const answer = await editKey(state, key.path, read.value);
+    button.disabled = false;
+    if (!answer || !current || current.state !== state) {
+      return;
+    }
+    showEdit(state, editSaidOf(answer));
+    tick();
+  }
+
+  function keyRow(state, key) {
+    const row = make("div", "control-row");
+    row.appendChild(make("code", "", key.key));
+    const build = CONTROLS[key.kind];
+    if (!build) {
+      row.appendChild(make("span", "muted", JSON.stringify(key.value)));
+      row.appendChild(make("span", "muted", "this page cannot edit a key of kind " + key.kind));
+      return row;
+    }
+    const control = build(key.value);
+    control.el.setAttribute("aria-label", key.key);
+    row.appendChild(control.el);
+    row.appendChild(controlButton("Save", (button) => saveKey(state, key, control, button)));
+    row.appendChild(make("span", key.applies === "next_pass" ? "state-success" : "state-information",
+      "applies " + key.applies_words));
+    row.appendChild(make("span", "muted", key.about));
+    return row;
+  }
+
+  // A new `repositories` entry: one edit per list given, each on the rev the
+  // one before returned; a list refused after another was written leaves the
+  // one written, and says so.
+  async function addRepository(state, name, lists, button) {
+    const repository = name.value.trim();
+    if (!/^github\.com\/[^/\s]+\/[^/\s]+$/i.test(repository)) {
+      showEdit(state, [["state-danger", "A repository is written github.com/<owner>/<name>."]]);
+      return;
+    }
+    const edits = [];
+    for (const [key, control] of lists) {
+      const read = control.read();
+      if (read.value) {
+        edits.push([key, read.value]);
+      }
+    }
+    if (!edits.length) {
+      showEdit(state, [["state-danger", "Give at least one list: an entry with none sets nothing."]]);
+      return;
+    }
+    button.disabled = true;
+    const said = [];
+    for (let at = 0; at < edits.length; at += 1) {
+      const answer = await editKey(state, ["repositories", repository, edits[at][0]], edits[at][1]);
+      if (!answer || !current || current.state !== state) {
+        return;
+      }
+      said.push(...editSaidOf(answer));
+      if (answer.status !== 200) {
+        if (at > 0) {
+          said.push(["state-warning", "The lists before " + edits[at][0] + " are written; it is not."]);
+        }
+        break;
+      }
+    }
+    button.disabled = false;
+    showEdit(state, said);
+    tick();
+  }
+
+  function drawEditor(state, edit) {
+    const part = section("Edit the personal file");
+    if (!edit.editable) {
+      part.body.appendChild(make("p", "state-warning", "The personal file cannot be edited: " +
+        (edit.why_not || "it has no place on this system")));
+      return part.el;
+    }
+    note(part.body, "The personal file: " + edit.path + (edit.rev === null ? " (not there yet)" : "") +
+      ". Each key is saved alone, checked as Owlshift checks the file at its start; the file's " +
+      "comments and order are kept. An empty field removes the key, whose default then applies.");
+    state.parts.editSaid = make("div", "control-said");
+    part.body.appendChild(state.parts.editSaid);
+    drawSaid(state.parts.editSaid, state.editSaid);
+    for (const key of edit.keys) {
+      part.body.appendChild(keyRow(state, key));
+    }
+    for (const entry of edit.repositories) {
+      part.body.appendChild(make("h4", "", entry.repository));
+      for (const key of entry.keys) {
+        part.body.appendChild(keyRow(state, key));
+      }
+    }
+    const form = make("div", "control-row");
+    form.appendChild(make("strong", "", "Add a repository"));
+    const name = make("input", "control-input");
+    name.type = "text";
+    name.placeholder = "github.com/owner/name";
+    name.setAttribute("aria-label", "The repository to add");
+    form.appendChild(name);
+    const lists = [];
+    for (const key of edit.repository_keys) {
+      const control = textsControl([]);
+      control.el.setAttribute("aria-label", key.name + ", one per line");
+      control.el.placeholder = key.name + ", one per line";
+      form.appendChild(control.el);
+      lists.push([key.name, control]);
+    }
+    form.appendChild(controlButton("Add", (button) => addRepository(state, name, lists, button)));
+    part.body.appendChild(form);
+    return part.el;
   }
 
   function drawRecord(parent, record) {
@@ -605,6 +939,9 @@
     const machine = section("The machine");
     machine.body.appendChild(lineBlock(answer.machine.lines));
     body.appendChild(machine.el);
+    if (answer.personal_edit) {
+      body.appendChild(drawEditor(state, answer.personal_edit));
+    }
     const chosen = chosenProject();
     for (const project of answer.projects) {
       if (!sameProject(project.repository)) {
@@ -645,6 +982,9 @@
         } else if (!answer.value.unchanged) {
           problem("");
           state.last = answer.value;
+          if (answer.value.personal_edit) {
+            state.editRev = answer.value.personal_edit.rev;
+          }
           drawConfig(state, answer.value);
         }
       }
@@ -716,6 +1056,7 @@
     }
     const state = current.state;
     if (current.name === "orchestrator" && state.last) {
+      drawControls(state, state.last.controls);
       drawStatus(state, state.last);
       drawFeed(state);
     } else if (current.name === "config" && state.last) {

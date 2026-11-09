@@ -44,6 +44,10 @@ pub const BY_PAUSE: &str = "owlshift pause";
 /// file (OWL-474).
 pub const BY_CANCEL: &str = "owlshift cancel";
 
+/// Who asks in every [`Request`] the local web UI writes, a pause or a
+/// ticket's cancel, and who restarts a ticket from it (OWL-473).
+pub const BY_UI: &str = "ui";
+
 /// The daemon that runs on a data directory, written once it holds the
 /// directory's daemon lock and removed when it ends: a record left by a
 /// daemon killed outright names a process that no longer holds the lock.

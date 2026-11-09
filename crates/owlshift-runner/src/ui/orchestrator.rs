@@ -23,6 +23,9 @@
 //!   the page's cursors do not hold (the log was replaced since its
 //!   generation, `after` is past the log's end, or entries it did not see
 //!   were dropped) and `entries` are then the latest, to read afresh;
+//! - `controls` (OWL-473): what the Pause, Resume and Stop serving controls
+//!   act on, the machine's pause and each served project's, read from their
+//!   files;
 //! - `log`: the daemon's log (`<data>/service/daemon.log`), its last lines
 //!   at first and then the lines that follow `log`, or why it is absent.
 //!
@@ -49,6 +52,7 @@ use super::index::{EventIndex, Item};
 use super::tail::LineTail;
 use crate::config::{Effective, FileState};
 use crate::daemon::digest::HarnessUsage;
+use crate::daemon::requests;
 use crate::project::ProjectDirs;
 use crate::served::{self, Registry};
 use crate::status::{self, Daemon, Part, Report, Watch};
@@ -395,6 +399,43 @@ pub fn answer(inputs: &Inputs<'_>, cursors: Cursors) -> Value {
             "skipped": if feed.reset { Value::Null } else { json!(0) },
         },
         "log": log_json(inputs.data, cursors.log),
+        "controls": controls(inputs.data),
+    })
+}
+
+/// A pause as the controls show it: `by`, `at` and `why`, `{"unreadable":
+/// true}` for a file that does not read, null when none stands.
+fn pause_json(pause: Option<Option<owlshift_contracts::service::Request>>) -> Value {
+    match pause {
+        None => Value::Null,
+        Some(Some(request)) => json!({
+            "by": request.by,
+            "at": time(request.at),
+            "why": request.why,
+        }),
+        Some(None) => json!({ "unreadable": true }),
+    }
+}
+
+/// What the Orchestrator's controls act on (OWL-473), read from the pause
+/// files themselves: the machine's pause, and each served project with its
+/// own.
+fn controls(data: &Path) -> Value {
+    let projects: Vec<Value> = Registry::in_data_dir(data)
+        .read()
+        .map(|served| served.projects)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|entry| {
+            let paused = Repo::parse(&entry.repository)
+                .ok()
+                .and_then(|repo| requests::pause(&ProjectDirs::new(data, &repo)));
+            json!({ "repository": entry.repository, "paused": pause_json(paused) })
+        })
+        .collect();
+    json!({
+        "machine_pause": pause_json(requests::machine_pause(data)),
+        "projects": projects,
     })
 }
 
