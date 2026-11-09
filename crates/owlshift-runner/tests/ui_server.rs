@@ -3717,7 +3717,7 @@ fn pause_and_resume_write_the_commands_files_by_ui() {
     // The command's words for the same request, on a data directory alike.
     let alike = tempfile::tempdir().unwrap();
     Registry::in_data_dir(alike.path())
-        .register(&ground.repo(), Path::new("/src/o-r"))
+        .register(&ground.repo(), &alike.path().join("o-r"))
         .unwrap();
     assert_eq!(
         said,

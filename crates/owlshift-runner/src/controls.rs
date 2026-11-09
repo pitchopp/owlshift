@@ -165,7 +165,7 @@ mod tests {
 
     fn serve(data: &Path, repo: &Repo) {
         Registry::in_data_dir(data)
-            .register(repo, Path::new("/src/web"))
+            .register(repo, &data.join("web"))
             .unwrap();
     }
 
