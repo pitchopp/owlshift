@@ -2697,12 +2697,23 @@ fn a_changed_ready_snapshot_alone_gives_a_line_and_an_unchanged_directory_none()
     let next = next_graph(&mut stream);
     assert_eq!(title(&next), "DEMO-1 renamed");
     // Nothing changed since: no graph line within many refresh periods
-    // (100 ms here), the keepalive being 15 s away.
+    // (100 ms here), the keepalive being 15 s away. The rename changed the
+    // overview too, and its line is built apart from the graph's: on a
+    // loaded host it comes after the graph line, so only graph lines count.
     stream
         .get_ref()
         .set_read_timeout(Some(Duration::from_millis(600)))
         .unwrap();
-    assert_eq!(next_line(&mut stream), None);
+    let mut others = 0;
+    while let Some(line) = next_line(&mut stream) {
+        let value: Value = serde_json::from_str(&line).unwrap();
+        assert!(value.get("graph").is_none(), "{line}");
+        others += 1;
+        assert!(
+            others < 10,
+            "lines keep coming with nothing changed: {line}"
+        );
+    }
 }
 
 #[test]
