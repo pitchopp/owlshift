@@ -31,6 +31,7 @@ pub mod install;
 mod merge;
 pub mod notify;
 pub mod on_demand;
+pub mod personal_edit;
 pub mod pr_reviews;
 pub mod project;
 pub mod proposals;
