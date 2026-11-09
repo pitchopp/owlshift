@@ -26,6 +26,11 @@ use owlshift_runner::ui::token;
 use crate::service_cmd::ON_WINDOWS;
 use crate::{data_dir, fail, own_build};
 
+/// Live check U4: whether a confined run reads other processes' arguments
+/// (OWL-495).
+#[cfg(test)]
+mod argv_check;
+
 /// Why `form` of `owlshift ui` is refused on this platform, `windows` when
 /// it is native Windows, as the daemon is.
 fn refused_on(windows: bool, form: &str) -> Option<String> {
@@ -96,7 +101,11 @@ pub fn opener(link: &str) -> Opener {
 /// is one: `osascript` reads `open location "<link>"` on its standard
 /// input, as the decider chose on OWL-467 (round 4, Q1). On Linux bwrap
 /// gives a confined run its own process namespace, which hides every other
-/// process, and `xdg-open` takes the link as its argument.
+/// process, and `xdg-open` takes the link as its argument. The test
+/// `argv_check::a_confined_run_reads_other_processes_arguments_on_macos_only`
+/// holds both readings on each system, and `argv_check`'s browser check,
+/// `the_login_link_reaches_the_browser_in_no_argument_a_confined_run_reads`,
+/// runs this opener on macOS (live check U4, OWL-495).
 pub fn opener_for(macos: bool, link: &str) -> Opener {
     if macos {
         let quoted = link.replace('\\', "\\\\").replace('"', "\\\"");
