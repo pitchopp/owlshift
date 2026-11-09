@@ -215,6 +215,7 @@ mod tests {
             url: None,
             id,
             description: None,
+            run: None,
         }
     }
 

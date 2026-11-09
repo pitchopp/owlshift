@@ -4808,6 +4808,7 @@ mod tests {
             )),
             id: None,
             description: None,
+            run: None,
         }
     }
 
