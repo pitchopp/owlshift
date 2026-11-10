@@ -122,6 +122,91 @@ struct FakeGitHub {
     merges: Mutex<Vec<Value>>,
     merge_answers: Mutex<VecDeque<MergeAnswer>>,
     during_merge: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+    /// The automatic re-run (OWL-513): GitHub Actions jobs of one workflow
+    /// run, their re-runs and the job logs read.
+    jobs: Mutex<Jobs>,
+}
+
+/// One GitHub Actions job's first attempt, as watch's read lists it
+/// (OWL-513).
+#[derive(Clone)]
+struct Job {
+    name: &'static str,
+    id: u64,
+    conclusion: &'static str,
+}
+
+/// The jobs of one workflow run, re-run once (OWL-513). With no `run`,
+/// watch's read lists the bench's one `ci` check with no workflow run, as
+/// before OWL-513, and nothing can be re-run.
+struct Jobs {
+    run: Option<u64>,
+    first: Vec<Job>,
+    /// Whether the read lists a re-run job's first attempt beside its new
+    /// one; otherwise the newest attempt alone, as GitHub's rollup did on
+    /// 2026-11-09.
+    lists_first: bool,
+    /// How GitHub answers a re-run call: its status and words.
+    answer: (u16, &'static str),
+    /// The conclusion of each new attempt once finished.
+    again: &'static str,
+    /// The workflow runs re-run, one per call.
+    calls: Vec<u64>,
+    /// Watch's reads since the re-run started: a new attempt of a leg runs
+    /// at the first, then concludes; an aggregate `ci` beside other jobs
+    /// shows only once they ended, at the third.
+    reads: Option<u32>,
+    /// The job logs read, by job id.
+    logs: Vec<u64>,
+}
+
+impl Default for Jobs {
+    fn default() -> Self {
+        Self {
+            run: None,
+            first: Vec::new(),
+            lists_first: false,
+            answer: (201, ""),
+            again: "SUCCESS",
+            calls: Vec::new(),
+            reads: None,
+            logs: Vec::new(),
+        }
+    }
+}
+
+impl Jobs {
+    /// The check runs a read lists now, each its name, id and conclusion,
+    /// `None` while it runs; counts the read once a re-run started.
+    fn listed(&mut self) -> Vec<(&'static str, u64, Option<&'static str>)> {
+        if let Some(reads) = self.reads.as_mut() {
+            *reads += 1;
+        }
+        let mut listed = Vec::new();
+        let newest = self.first.iter().map(|job| job.id).max().unwrap_or(0);
+        let mut next = newest;
+        for job in &self.first {
+            let failed = job.conclusion != "SUCCESS";
+            if !failed || self.reads.is_none() || self.lists_first {
+                listed.push((job.name, job.id, Some(job.conclusion)));
+            }
+            let Some(reads) = self.reads.filter(|_| failed) else {
+                continue;
+            };
+            next += 1;
+            let aggregate = job.name == "ci" && self.first.len() > 1;
+            let shown = match (aggregate, reads) {
+                (true, 0..=2) => None,
+                (true, _) => Some(Some(self.again)),
+                (false, 0..=1) => Some(None),
+                (false, _) => Some(Some(self.again)),
+            };
+            if let Some(conclusion) = shown {
+                listed.push((job.name, next, conclusion));
+            }
+        }
+        listed
+    }
 }
 
 /// How GitHub answers a merge call (OWL-445).
@@ -160,6 +245,9 @@ struct Followed {
     mergeable: &'static str,
     conclusion: &'static str,
     base_conclusion: &'static str,
+    /// The checks' conclusion at `base_at_push`, the base's head's when
+    /// `None` (OWL-513).
+    at_push_conclusion: Option<&'static str>,
     /// What the last read before a merge finds (OWL-445): a draft, and
     /// GitHub's review decision, `None` when none is required.
     draft: bool,
@@ -173,6 +261,7 @@ impl Default for Followed {
             mergeable: "MERGEABLE",
             conclusion: "SUCCESS",
             base_conclusion: "SUCCESS",
+            at_push_conclusion: None,
             draft: false,
             review: None,
         }
@@ -280,21 +369,41 @@ impl FakeGitHub {
             };
             let followed = self.followed.lock().unwrap().clone();
             let head = self.tip();
+            let mut jobs = self.jobs.lock().unwrap();
+            let nodes: Vec<Value> = match jobs.run {
+                None => vec![json!({
+                    "__typename": "CheckRun", "databaseId": 2, "name": "ci",
+                    "status": status, "conclusion": conclusion,
+                    "isRequired": true,
+                    "detailsUrl": "https://github.com/demo/project/runs/2",
+                    "checkSuite": { "app": { "slug": "github-actions" },
+                                    "workflowRun": { "workflow": { "name": "CI" } } },
+                })],
+                // OWL-513: each job with its workflow run.
+                Some(run) => jobs
+                    .listed()
+                    .into_iter()
+                    .map(|(name, id, conclusion)| {
+                        json!({
+                            "__typename": "CheckRun", "databaseId": id, "name": name,
+                            "status": if conclusion.is_some() { "COMPLETED" } else { "IN_PROGRESS" },
+                            "conclusion": conclusion, "isRequired": true,
+                            "detailsUrl": format!("https://github.com/demo/project/runs/{id}"),
+                            "checkSuite": { "app": { "slug": "github-actions" },
+                                            "workflowRun": { "databaseId": run,
+                                                             "workflow": { "name": "CI" } } },
+                        })
+                    })
+                    .collect(),
+            };
             json!({ "repository": { "pullRequest": {
                 "state": followed.state, "headRefOid": head, "mergeable": followed.mergeable,
                 "mergeStateStatus": "CLEAN",
                 "commits": { "nodes": [{ "commit": { "oid": head, "statusCheckRollup": {
                     "contexts": {
-                        "totalCount": 1,
+                        "totalCount": nodes.len(),
                         "pageInfo": { "hasNextPage": false, "endCursor": null },
-                        "nodes": [{
-                            "__typename": "CheckRun", "databaseId": 2, "name": "ci",
-                            "status": status, "conclusion": conclusion,
-                            "isRequired": true,
-                            "detailsUrl": "https://github.com/demo/project/runs/2",
-                            "checkSuite": { "app": { "slug": "github-actions" },
-                                            "workflowRun": { "workflow": { "name": "CI" } } },
-                        }],
+                        "nodes": nodes,
                     },
                 } } }] },
             } } })
@@ -322,15 +431,25 @@ impl FakeGitHub {
                 .run(&self.bare, &["rev-parse", "refs/heads/main"])
                 .map(|out| String::from_utf8(out).unwrap().trim().to_owned())
                 .unwrap();
-            let rollup = json!({ "contexts": {
-                "totalCount": 1,
-                "pageInfo": { "hasNextPage": false, "endCursor": null },
-                "nodes": [{ "__typename": "CheckRun", "name": "ci", "status": "COMPLETED",
-                            "conclusion": followed.base_conclusion }],
-            } });
+            let rollup = |conclusion: &str| {
+                json!({ "contexts": {
+                    "totalCount": 1,
+                    "pageInfo": { "hasNextPage": false, "endCursor": null },
+                    "nodes": [{ "__typename": "CheckRun", "name": "ci", "status": "COMPLETED",
+                                "conclusion": conclusion }],
+                } })
+            };
+            let at_push = followed
+                .at_push_conclusion
+                .unwrap_or(followed.base_conclusion);
+            // The commit asked, `base_at_push`, or the base's head.
+            let at_push_oid = request["variables"]["atPush"]
+                .as_str()
+                .filter(|asked| !asked.starts_with("refs/"))
+                .map_or_else(|| base.clone(), str::to_owned);
             json!({ "repository": {
-                "head": { "oid": base, "statusCheckRollup": rollup },
-                "atPush": { "oid": base, "statusCheckRollup": rollup },
+                "head": { "oid": base, "statusCheckRollup": rollup(followed.base_conclusion) },
+                "atPush": { "oid": at_push_oid, "statusCheckRollup": rollup(at_push) },
             } })
         } else if query.starts_with("query Checks") {
             let moved = self.at_checks.lock().unwrap().take();
@@ -447,6 +566,27 @@ impl Transport for Shared {
         Ok(self.0.merge(body))
     }
 
+    /// A re-run of a workflow run's failed jobs (OWL-513), answered as
+    /// scripted: a 2xx starts the new attempts.
+    fn post(&self, path: &str, body: &Value) -> Result<Response, String> {
+        let run = path
+            .strip_prefix("repos/demo/project/actions/runs/")
+            .and_then(|rest| rest.strip_suffix("/rerun-failed-jobs"))
+            .unwrap_or_else(|| panic!("unexpected REST post to {path}"));
+        assert_eq!(*body, json!({}));
+        let mut jobs = self.0.jobs.lock().unwrap();
+        jobs.calls.push(run.parse().unwrap());
+        let (status, message) = jobs.answer;
+        if (200..300).contains(&status) {
+            jobs.reads = Some(0);
+        }
+        Ok(Response {
+            status,
+            body: json!({ "message": message }).to_string(),
+            ..Default::default()
+        })
+    }
+
     /// The red job's log, and a pull request's files (OWL-410), the REST
     /// reads of the bench.
     fn get(&self, path: &str) -> Result<RestAnswer, String> {
@@ -461,7 +601,18 @@ impl Transport for Shared {
             }
             return Ok(RestAnswer::new(200, self.0.files(number.parse().unwrap())));
         }
-        assert_eq!(path, "repos/demo/project/actions/jobs/2/logs");
+        let job: u64 = path
+            .strip_prefix("repos/demo/project/actions/jobs/")
+            .and_then(|rest| rest.strip_suffix("/logs"))
+            .and_then(|id| id.parse().ok())
+            .unwrap_or_else(|| panic!("unexpected REST read of {path}"));
+        {
+            let mut jobs = self.0.jobs.lock().unwrap();
+            if jobs.run.is_none() {
+                assert_eq!(job, 2, "{path}");
+            }
+            jobs.logs.push(job);
+        }
         let mut log = self.0.log.lock().unwrap();
         log.1 += 1;
         Ok(match log.0 {
@@ -1302,6 +1453,7 @@ impl Bench {
             merges: Mutex::new(Vec::new()),
             merge_answers: Mutex::new(VecDeque::new()),
             during_merge: Mutex::new(None),
+            jobs: Mutex::default(),
         });
         let tmp_data = tmp.path().join("data");
         Self {
@@ -11987,6 +12139,10 @@ mod base_scenarios;
 /// A ticket's cancel parked, refused, withdrawn or dropped (OWL-474).
 #[path = "on_demand/cancel_scenarios.rs"]
 mod cancel_scenarios;
+
+/// A red check re-run once by the runner before any fix run (OWL-513).
+#[path = "on_demand/rerun_scenarios.rs"]
+mod rerun_scenarios;
 
 /// OWL-312's acceptance: `[roles.build] rules` reaches Build's brief after
 /// `stack.rules`, and not the resolver's; the `dispatch` event names every

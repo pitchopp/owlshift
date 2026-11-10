@@ -29,7 +29,6 @@ impl OnDemand<'_> {
     /// budget before any run started gives the claim back. A refusal keeps
     /// the outcome `refused` with GitHub's words, warned of, and returns
     /// the delivery as kept, for the fix run that follows.
-    #[allow(clippy::too_many_arguments)]
     pub(super) fn rerun_checks(
         &self,
         p: &mut Prepared,
