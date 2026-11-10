@@ -3728,6 +3728,39 @@ pub fn rebase_keeps_delivery(
     Ok(())
 }
 
+/// [`rebase_keeps_delivery`] for a rebase cycle (OWL-514): the delivery
+/// check reads `rebased`, the commit the rebase run itself made, and
+/// `commit`, the head the cycle reached, must be `rebased` or descend from
+/// it. A Verify pass that reviewed the resolution and its last fix
+/// (OWL-449) may follow the rebase run in its cycle; their commits are
+/// judged by Verify and the gate like any Build's, so a last fix that
+/// removes delivered code on purpose is not refused as a lost rebase
+/// (OWL-460), while a rebase run that dropped delivered work still is,
+/// with [`rebase_keeps_delivery`]'s message naming its commit.
+pub fn rebase_cycle_keeps_delivery(
+    git: &Git,
+    checkout: &Path,
+    lease: &CommitId,
+    onto: &CommitId,
+    rebased: &CommitId,
+    commit: &CommitId,
+) -> Result<(), String> {
+    rebase_keeps_delivery(git, checkout, lease, onto, rebased)?;
+    if commit == rebased {
+        return Ok(());
+    }
+    let descends = git
+        .is_ancestor(checkout, rebased.as_str(), commit.as_str())
+        .map_err(|e| format!("reading the rebase of {lease} onto {onto}: {e}"))?;
+    if !descends {
+        return Err(format!(
+            "{commit} does not descend from {rebased}, the rebase run's commit the delivery \
+             check read: a commit after a rebase in its cycle is pushed on top of it only"
+        ));
+    }
+    Ok(())
+}
+
 pub fn park_reason(reason: ParkReason) -> &'static str {
     match reason {
         ParkReason::FailedRuns => "a run failed again, with no attempt left",
@@ -4077,10 +4110,16 @@ impl<'a> Writer<'a> {
     /// one push that replaces a branch's history: leased on `lease`, the
     /// commit Owlshift last pushed there, as every push to a followed
     /// branch, so a branch a person moved or deleted refuses it; and, before
-    /// git runs, `commit` must be a rebase of the delivery onto `onto`
-    /// ([`rebase_keeps_delivery`]). Both checks, never one instead of the
-    /// other: the lease guards a person's push, the rebase check a run that
-    /// lost the delivered work. A forced update reads as [`Pushed::Forced`].
+    /// git runs, `rebased`, the commit the rebase run itself made, must be a
+    /// rebase of the delivery onto `onto` and `commit` must be it or descend
+    /// from it ([`rebase_cycle_keeps_delivery`], OWL-514): the commits a
+    /// Verify pass and its last fix added in the cycle are judged by Verify
+    /// and the gate, not by the delivery check. A push kept under way by an
+    /// older binary names no `rebased`: `commit` itself must then be a
+    /// rebase of the delivery ([`rebase_keeps_delivery`]). Both checks,
+    /// never one instead of the other: the lease guards a person's push,
+    /// the rebase check a run that lost the delivered work. A forced update
+    /// reads as [`Pushed::Forced`].
     #[allow(clippy::too_many_arguments)]
     pub fn push_rebased(
         &self,
@@ -4091,10 +4130,17 @@ impl<'a> Writer<'a> {
         branch: &Branch,
         lease: &CommitId,
         onto: &CommitId,
+        rebased: Option<&CommitId>,
     ) -> Result<Pushed, WriteError> {
         self.check(Action::PushBranch, HumanApproval::Absent)
             .map_err(WriteError::Floor)?;
-        rebase_keeps_delivery(git, checkout, lease, onto, commit).map_err(push_failed)?;
+        match rebased {
+            Some(rebased) => {
+                rebase_cycle_keeps_delivery(git, checkout, lease, onto, rebased, commit)
+            }
+            None => rebase_keeps_delivery(git, checkout, lease, onto, commit),
+        }
+        .map_err(push_failed)?;
         let command =
             leased_push_command(Path::new("git"), checkout, remote, commit, branch, lease)
                 .map_err(WriteError::Push)?;
@@ -8916,6 +8962,7 @@ Reply `Q1: B`, `ok` to take every recommendation, or in your own words.
                 &f.branch,
                 &head(),
                 &head(),
+                None,
             ))
         }),
         ("open_pull_request", |w, f| {

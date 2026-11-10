@@ -7826,9 +7826,16 @@ impl OnDemand<'_> {
             RepairKind::Fix { .. } | RepairKind::Correction { .. } | RepairKind::Review { .. } => {
                 writer.push_leased(git, &p.checkout, "origin", &commit, &head, pushed)
             }
-            RepairKind::Rebase { onto } => {
-                writer.push_rebased(git, &p.checkout, "origin", &commit, &head, pushed, onto)
-            }
+            RepairKind::Rebase { onto } => writer.push_rebased(
+                git,
+                &p.checkout,
+                "origin",
+                &commit,
+                &head,
+                pushed,
+                onto,
+                None,
+            ),
         };
         match landed {
             Ok(landed) => {

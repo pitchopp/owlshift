@@ -241,6 +241,7 @@ fn a_rebased_push_replaces_the_history_only_with_the_delivery_kept() {
             &branch,
             lease,
             &base,
+            None,
         )
     };
     let lost = bench.commit_on(base.as_str(), Some(("other.txt", "x\n")), "lose it");
@@ -301,4 +302,80 @@ fn a_rebased_push_replaces_the_history_only_with_the_delivery_kept() {
             )
             .is_err()
     );
+}
+
+/// A rebase cycle's push (OWL-514): the delivery check reads the commit the
+/// rebase run made, and the pushed head need only descend from it. A later
+/// commit of the cycle that deletes a delivered file on purpose is pushed
+/// (OWL-460); a rebase commit that lost it is still refused with
+/// `rebase_keeps_delivery`'s message, naming that commit, and a head off the
+/// rebase commit is refused, both before git runs.
+#[test]
+fn a_rebase_cycles_push_reads_the_delivery_on_the_rebase_commit() {
+    let bench = bench();
+    let branch = Branch::new("owl-514-push").unwrap();
+    let seed = bench.head();
+    let delivered = bench.commit_on(seed.as_str(), Some(("file.txt", "delivered\n")), "deliver");
+    assert_eq!(
+        bench.push("origin", &delivered, &branch),
+        Ok(Pushed::Created)
+    );
+    let base = bench.commit_on(seed.as_str(), Some(("main.txt", "merged\n")), "merge");
+    let env = bench.env.clone();
+    let git = Git::with_setup("git", move |command| env.apply(command));
+    let tracker = MarkdownTracker::new(&bench.remote.checkout);
+    let writer = Writer::new(&tracker);
+    let push = |commit: &CommitId, rebased: &CommitId| {
+        writer.push_rebased(
+            &git,
+            &bench.remote.checkout,
+            "origin",
+            commit,
+            &branch,
+            &delivered,
+            &base,
+            Some(rebased),
+        )
+    };
+    let refused = |result: Result<Pushed, WriteError>, why: &str| match result {
+        Err(WriteError::Push(PushError::Failed { message })) => {
+            assert!(message.contains(why), "{why}: {message}");
+            assert_eq!(bench.remote_branch(&branch), delivered.as_str());
+        }
+        other => panic!("{why}: {other:?}"),
+    };
+
+    // The rebase run kept file.txt; the last fix of its cycle deletes it.
+    let rebased = bench.commit_on(base.as_str(), Some(("file.txt", "delivered\n")), "rebase");
+    let dir = &bench.remote.checkout;
+    bench
+        .env
+        .run(dir, &["checkout", "--quiet", "--detach", rebased.as_str()])
+        .unwrap();
+    bench.env.run(dir, &["rm", "--quiet", "file.txt"]).unwrap();
+    bench
+        .env
+        .run(dir, &["commit", "--quiet", "-m", "drop it"])
+        .unwrap();
+    let later = bench.head();
+
+    // A rebase run whose own commit lost file.txt, with a later commit on it.
+    let lost = bench.commit_on(base.as_str(), Some(("other.txt", "x\n")), "lose it");
+    let after_lost = bench.commit_on(lost.as_str(), Some(("more.txt", "y\n")), "more");
+    refused(
+        push(&after_lost, &lost),
+        &format!(
+            "{lost} is not a rebase of {delivered} onto {base}: it no longer changes \
+             file.txt, which the delivery changed"
+        ),
+    );
+    // A head that does not descend from the rebase commit.
+    let elsewhere = bench.commit_on(base.as_str(), Some(("file.txt", "again\n")), "elsewhere");
+    refused(
+        push(&elsewhere, &rebased),
+        &format!("{elsewhere} does not descend from {rebased}"),
+    );
+
+    assert_eq!(push(&later, &rebased), Ok(Pushed::Forced));
+    assert_eq!(bench.remote_branch(&branch), later.as_str());
 }
