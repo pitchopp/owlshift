@@ -405,12 +405,7 @@ impl OnDemand<'_> {
         sink: &mut EventSink<'_>,
     ) -> Option<RefAt> {
         let due = matches!(seen.decision, FollowDecision::Follow { .. })
-            && stored
-                .record
-                .delivery
-                .as_ref()
-                .and_then(|delivery| delivery.rerun.as_ref())
-                .is_some_and(|rerun| rerun.head == seen.head && owes(rerun));
+            && rerun_owed(stored.record.delivery.as_ref(), &seen.head);
         if !due {
             return Some(at);
         }
@@ -523,4 +518,65 @@ fn tells(rerun: &Rerun) -> bool {
 /// to tell.
 fn owes(rerun: &Rerun) -> bool {
     rerun.outcome.is_none() || (tells(rerun) && !rerun.told)
+}
+
+/// Whether `delivery`, as the ref keeps it, has a re-run of `head` still to
+/// settle ([`owes`]): otherwise [`OnDemand::post_rerun_report`] returns at
+/// once, with no lock taken and nothing read.
+fn rerun_owed(delivery: Option<&TicketDelivery>, head: &str) -> bool {
+    delivery
+        .and_then(|delivery| delivery.rerun.as_ref())
+        .is_some_and(|rerun| rerun.head == head && owes(rerun))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use owlshift_contracts::refs::RerunJob;
+
+    const HEAD: &str = "1111111111111111111111111111111111111111";
+    const OTHER: &str = "2222222222222222222222222222222222222222";
+
+    fn kept(head: &str, outcome: Option<RerunOutcomeKind>, told: bool) -> TicketDelivery {
+        TicketDelivery {
+            rerun: Some(Rerun {
+                head: head.to_owned(),
+                at: "2026-11-10T09:00:00Z".parse().unwrap(),
+                runs: vec![7],
+                jobs: vec![RerunJob {
+                    name: "ci".to_owned(),
+                    id: 10,
+                    run: 7,
+                    url: None,
+                    again: None,
+                }],
+                outcome,
+                reason: None,
+                told,
+            }),
+            ..TicketDelivery::new("owlshift/demo-1", "main")
+        }
+    }
+
+    /// Watch's pass settles a re-run only when the ref keeps one of the
+    /// head it read with an outcome to read or to tell; any other ref
+    /// returns before the locks and the forge's read (OWL-513).
+    #[test]
+    fn post_rerun_report_reads_nothing_unless_an_outcome_is_owed() {
+        use RerunOutcomeKind::{Failed, Passed, Refused, Unseen};
+        assert!(!rerun_owed(None, HEAD));
+        assert!(!rerun_owed(
+            Some(&TicketDelivery::new("owlshift/demo-1", "main")),
+            HEAD
+        ));
+        assert!(!rerun_owed(Some(&kept(OTHER, None, false)), HEAD));
+        assert!(!rerun_owed(Some(&kept(OTHER, Some(Passed), false)), HEAD));
+        for outcome in [Passed, Failed, Unseen] {
+            assert!(!rerun_owed(Some(&kept(HEAD, Some(outcome), true)), HEAD));
+            assert!(rerun_owed(Some(&kept(HEAD, Some(outcome), false)), HEAD));
+        }
+        // A refusal has no RERUN comment to tell.
+        assert!(!rerun_owed(Some(&kept(HEAD, Some(Refused), false)), HEAD));
+        assert!(rerun_owed(Some(&kept(HEAD, None, false)), HEAD));
+    }
 }
