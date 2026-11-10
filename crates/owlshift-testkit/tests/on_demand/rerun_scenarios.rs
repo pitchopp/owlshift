@@ -194,6 +194,94 @@ fn a_check_red_again_after_its_rerun_gets_one_fix_run_that_asks_once() {
     );
 }
 
+/// A head red again after its re-run whose RERUN comment the tracker
+/// refuses: the fix run goes on, and its head is red too. When that head's
+/// re-run is claimed, the first head's comment is tried once more: posted
+/// when the tracker `accepts` it then, otherwise dropped with a
+/// `rerun_report_dropped` warning; the ref keeps the new head's re-run
+/// either way. Returns the bench and the first head.
+fn replaced_untold(accepts: bool) -> (Bench, String) {
+    let bench = red_jobs(vec![job("ci", 10, "FAILURE")]);
+    {
+        let mut jobs = bench.github.jobs.lock().unwrap();
+        jobs.lists_first = true;
+        jobs.again = "FAILURE";
+    }
+    bench.refuse.set(Some("[owlshift] RERUN"));
+    let first_push = bench.remote_branch().unwrap();
+    let github = bench.github.clone();
+    let mut pass = 0;
+    let mut moved = false;
+    let (outcomes, lines, printed) = bench.watch_passes(
+        vec![bench.reply(Some("Hello again"), Some(FIXED))],
+        &mut |_| {
+            pass += 1;
+            if !moved && bench.remote_branch().unwrap() != first_push {
+                // CI ran on the fix's head: red, another job, no re-run yet.
+                moved = true;
+                let mut jobs = github.jobs.lock().unwrap();
+                jobs.first = vec![job("ci", 20, "FAILURE")];
+                jobs.reads = None;
+                drop(jobs);
+                if accepts {
+                    bench.refuse.set(None);
+                }
+            }
+            github.jobs.lock().unwrap().calls.len() < 2 && pass < 8
+        },
+    );
+    assert_eq!(
+        github.jobs.lock().unwrap().calls,
+        [RUN, RUN],
+        "{outcomes:?}\n{lines}\n{printed}"
+    );
+    // The first head's outcome was owed, and its post refused, before the
+    // fix run.
+    assert_eq!(
+        warnings(&bench, "rerun_report_unposted").len(),
+        1,
+        "{lines}\n{printed}"
+    );
+    assert_eq!(bench.briefs().len(), 3, "{outcomes:?}\n{lines}\n{printed}");
+    let rerun = bench.record().delivery.unwrap().rerun.unwrap();
+    assert_eq!(rerun.head, bench.remote_branch().unwrap());
+    assert_ne!(rerun.head, first_push);
+    assert_eq!(rerun.outcome, None);
+    (bench, first_push)
+}
+
+/// The tracker takes the first head's RERUN comment when the next head's
+/// re-run is claimed: it is posted then, with no `rerun_report_dropped`.
+#[test]
+fn an_untold_rerun_is_told_when_the_next_heads_rerun_is_claimed() {
+    let (bench, first_push) = replaced_untold(true);
+    let reruns = marked(&bench, "RERUN");
+    assert_eq!(reruns.len(), 1, "{reruns:?}");
+    assert!(
+        reruns[0].contains(&format!("head `{}`", &first_push[..7])),
+        "{}",
+        reruns[0]
+    );
+    assert!(
+        reruns[0].contains("**Outcome:** failed again: a fix run reads the logs next."),
+        "{}",
+        reruns[0]
+    );
+    assert!(warnings(&bench, "rerun_report_dropped").is_empty());
+}
+
+/// The tracker still refuses the first head's RERUN comment when the next
+/// head's re-run is claimed: it is dropped, with one warning naming its
+/// head, and the claim is written all the same.
+#[test]
+fn an_untold_rerun_still_refused_is_dropped_when_the_next_heads_rerun_is_claimed() {
+    let (bench, first_push) = replaced_untold(false);
+    assert!(marked(&bench, "RERUN").is_empty());
+    let dropped = warnings(&bench, "rerun_report_dropped");
+    assert_eq!(dropped.len(), 1, "{dropped:?}");
+    assert_eq!(dropped[0]["head"], first_push.as_str());
+}
+
 /// A red the base shares waits, with no re-run and no run; once the base
 /// passes, its checks having failed at the push, a refresh rebase runs.
 #[test]
