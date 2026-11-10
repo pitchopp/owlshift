@@ -115,6 +115,15 @@ pub fn rerun_mark(delivery: &TicketDelivery, head: &str, now: Timestamp) -> Opti
     })
 }
 
+/// The ref's name of the core's outcome of a re-run (OWL-513).
+pub fn outcome_kind(outcome: follow::RerunOutcome) -> RerunOutcomeKind {
+    match outcome {
+        follow::RerunOutcome::Passed => RerunOutcomeKind::Passed,
+        follow::RerunOutcome::Failed => RerunOutcomeKind::Failed,
+        follow::RerunOutcome::Unseen => RerunOutcomeKind::Unseen,
+    }
+}
+
 /// A re-run as [`rerun_mark`] reads it from the ref: the one conversion of
 /// its jobs into the core's first attempts.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -417,6 +426,9 @@ pub struct Following {
     /// `[forge] merge` and `merge_method` as the project file reads at a
     /// commit, the latest few: a commit's file never changes (OWL-445).
     switches: Vec<(String, Switch)>,
+    /// The head and the refusal of the RERUN comment last warned of, per
+    /// ticket (OWL-513).
+    rerun_unposted: HashMap<TicketId, (String, String)>,
 }
 
 /// `[forge] merge` and `merge_method` as read at a commit (OWL-445).
@@ -729,6 +741,23 @@ impl Following {
         self.unposted.remove(ticket);
     }
 
+    /// Whether the refusal of the RERUN comment of `head` is to be warned
+    /// of: the first one, or `reason` or the head changed since the last
+    /// one warned of for the ticket (OWL-513). Keeps them as warned of.
+    pub fn rerun_unposted(&mut self, ticket: &TicketId, head: &str, reason: &str) -> bool {
+        let warned = (head.to_owned(), reason.to_owned());
+        if self.rerun_unposted.get(ticket) == Some(&warned) {
+            return false;
+        }
+        self.rerun_unposted.insert(ticket.clone(), warned);
+        true
+    }
+
+    /// The RERUN comment was posted: a later refusal is warned of again.
+    pub fn rerun_settled(&mut self, ticket: &TicketId) {
+        self.rerun_unposted.remove(ticket);
+    }
+
     /// What a step of `ticket` in a child process changes of this memory
     /// (OWL-399): its moved stage (OWL-219), its owed report's refusal
     /// (OWL-232), and the forge's pause, handed to the child and merged
@@ -1018,6 +1047,7 @@ impl Following {
         self.reviews_unread.remove(ticket);
         self.green_since.remove(ticket);
         self.merge.remove(ticket);
+        self.rerun_unposted.remove(ticket);
     }
 
     /// Forgets the tickets `kept` does not name.
@@ -1029,6 +1059,7 @@ impl Following {
         self.moved.retain(|t, _| kept.contains(t));
         self.unposted.retain(|t, _| kept.contains(t));
         self.reviews_unread.retain(|t, _| kept.contains(t));
+        self.rerun_unposted.retain(|t, _| kept.contains(t));
         self.green_since.retain(|t, _| kept.contains(t));
         self.merge.retain(|t, _| kept.contains(t));
     }

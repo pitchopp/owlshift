@@ -2902,6 +2902,9 @@ impl OnDemand<'_> {
             sink.emit(&ticket, None, EventKind::Decision, event);
         }
         self.settle_owed_report(p, &mut following, sink)?;
+        // The outcome of the head's re-run, kept before any repair reads it
+        // (OWL-513).
+        self.settle_rerun(p, &mut following, sink)?;
         // A fix run, a rebase run, a park or a re-run the read decided,
         // which the repair reads again under this command's lock (OWL-112,
         // OWL-210, OWL-513).
@@ -6976,6 +6979,9 @@ impl OnDemand<'_> {
                 sink,
             );
         }
+        // The head's re-run, as the ref keeps it after its settling or its
+        // refusal, this command's (OWL-513).
+        let kept_rerun = follow::rerun_mark(&delivery, &pushed, (self.clock)());
         let red = fix::Red {
             pull_request: pr.number,
             url: &pr.url,
@@ -6984,6 +6990,8 @@ impl OnDemand<'_> {
             checks: &fresh.checks.checks,
             base_checks: fresh.base.as_ref().map(|b| b.at_head.as_slice()),
             unfinished: &overdue,
+            rerun: delivery.rerun.as_ref(),
+            mark: kept_rerun.as_ref().map(follow::KeptRerun::mark),
         };
         let failure = fix::check_failure(red, self.forge).map_err(|error| {
             Stop::Refused(match error.kind {

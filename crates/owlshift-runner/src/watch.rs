@@ -1394,6 +1394,12 @@ impl Watch<'_> {
         else {
             return;
         };
+        // The outcome of the head's re-run, told before any repair (OWL-513).
+        let Some(at) =
+            on_demand.post_rerun_report(ticket, stored, &seen, at, &mut memory.following, sink)
+        else {
+            return;
+        };
         if !matches!(
             seen.decision,
             Decision::Follow {

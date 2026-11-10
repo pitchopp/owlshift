@@ -71,7 +71,9 @@ use owlshift_contracts::config::States;
 use owlshift_contracts::drain::{DependencyOutcome, KeptDependency, ProposalOutcome};
 use owlshift_contracts::format::Format;
 use owlshift_contracts::ids::{QuestionId, TicketId};
-use owlshift_contracts::refs::{AnsweredReview, DeliveredPullRequest, KeptDecision, PushKind};
+use owlshift_contracts::refs::{
+    AnsweredReview, DeliveredPullRequest, KeptDecision, PushKind, Rerun, RerunOutcomeKind,
+};
 use owlshift_contracts::result::{
     AnswerClass, Decision, Followup, FollowupSource, Question, RefusedChoice, Routing,
     Verdict as AnswerVerdict, option_index, option_letter,
@@ -218,6 +220,83 @@ impl MergedComment {
         }
         all.push(footer.render());
         let mut body = all.join("\n\n");
+        body.push('\n');
+        body
+    }
+}
+
+/// The RERUN comment (OWL-513; architecture section 5, "The automatic
+/// re-run"): the runner re-ran a red head's failed jobs once, and what that
+/// came to, with the links to both attempts of each job. Rendered from the
+/// ticket ref's re-run alone, so a post retried after a refusal reads
+/// nothing.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RerunComment {
+    pub ticket: TicketId,
+    pub pull_request: DeliveredPullRequest,
+    /// The re-run, its outcome known.
+    pub rerun: Rerun,
+}
+
+impl RerunComment {
+    /// The line a RERUN comment is found by: its pull request and head.
+    fn pull_request_line(&self) -> String {
+        let pr = &self.pull_request;
+        let head = self.rerun.head.get(..7).unwrap_or(&self.rerun.head);
+        format!(
+            "**Pull request:** {}, head {}",
+            link(&format!("#{}", pr.number), &pr.url),
+            code(head)
+        )
+    }
+
+    pub fn render(&self) -> String {
+        let header = Header {
+            kind: MarkerKind::Rerun,
+            round: None,
+        };
+        let footer = Footer {
+            format: Format,
+            kind: MarkerKind::Rerun,
+            ticket: self.ticket.clone(),
+            round: None,
+            run: None,
+        };
+        let outcome = match self.rerun.outcome {
+            Some(RerunOutcomeKind::Passed) => "passed on the re-run: a flake, nothing to fix",
+            Some(RerunOutcomeKind::Failed) => "failed again: a fix run reads the logs next",
+            Some(RerunOutcomeKind::Unseen) => {
+                "no new attempt showed within an hour: a fix run reads the logs next"
+            }
+            Some(RerunOutcomeKind::Refused) | None => "not known",
+        };
+        let rows: Vec<String> = self
+            .rerun
+            .jobs
+            .iter()
+            .map(|job| {
+                let first = job.url.as_deref().map_or_else(
+                    || "first attempt".to_owned(),
+                    |url| link("first attempt", url),
+                );
+                let again = job
+                    .again
+                    .as_deref()
+                    .map_or_else(|| "re-run not seen".to_owned(), |url| link("re-run", url));
+                format!("{}: {first}, {again}", code(&flatten(&job.name)))
+            })
+            .collect();
+        let body = [
+            header.render(),
+            "**Re-run by Owlshift:** its failed checks were re-run once by the runner, before \
+             any fix run."
+                .to_owned(),
+            self.pull_request_line(),
+            format!("**Outcome:** {outcome}."),
+            bullets(&rows),
+            footer.render(),
+        ];
+        let mut body = body.join("\n\n");
         body.push('\n');
         body
     }
@@ -4158,21 +4237,50 @@ impl<'a> Writer<'a> {
     /// returned and nothing is posted, so a merge told before a crash is
     /// never told again.
     pub fn post_merged(&self, comment: &MergedComment) -> Result<Reported, WriteError> {
+        self.post_marked_once(
+            &comment.ticket,
+            MarkerKind::Merged,
+            &comment.pull_request_line(),
+            &comment.render(),
+        )
+    }
+
+    /// Posts a RERUN comment once (OWL-513), as [`Self::post_merged`] posts
+    /// a MERGED one: a RERUN comment on the ticket already naming the same
+    /// pull request and head counts as posted.
+    pub fn post_rerun(&self, comment: &RerunComment) -> Result<Reported, WriteError> {
+        self.post_marked_once(
+            &comment.ticket,
+            MarkerKind::Rerun,
+            &comment.pull_request_line(),
+            &comment.render(),
+        )
+    }
+
+    /// Posts `body` on `ticket` once, after asking the floor: a comment of
+    /// the ticket marked `kind` with a line `line` is returned instead, and
+    /// nothing is posted.
+    fn post_marked_once(
+        &self,
+        ticket: &TicketId,
+        kind: MarkerKind,
+        line: &str,
+        body: &str,
+    ) -> Result<Reported, WriteError> {
         self.check(Action::Comment, HumanApproval::Absent)
             .map_err(WriteError::Floor)?;
-        let line = comment.pull_request_line();
-        let merged = |body: &str| {
+        let found = |posted: &str| {
             matches!(
-                MarkedComment::parse(body),
-                Ok(Some(MarkedComment { header, .. })) if header.kind == MarkerKind::Merged
-            ) && body.lines().any(|l| l.trim_end() == line)
+                MarkedComment::parse(posted),
+                Ok(Some(MarkedComment { header, .. })) if header.kind == kind
+            ) && posted.lines().any(|l| l.trim_end() == line)
         };
         let posted = self
             .tracker
-            .comments(&comment.ticket)
+            .comments(ticket)
             .map_err(WriteError::Tracker)?
             .into_iter()
-            .find(|posted| merged(&posted.body));
+            .find(|posted| found(&posted.body));
         if let Some(posted) = posted {
             return Ok(Reported {
                 comment: posted,
@@ -4181,7 +4289,7 @@ impl<'a> Writer<'a> {
         }
         let posted = self
             .tracker
-            .post_comment(&comment.ticket, &comment.render())
+            .post_comment(ticket, body)
             .map_err(WriteError::Tracker)?;
         Ok(Reported {
             comment: posted,
@@ -7661,6 +7769,86 @@ Reply `Q1: B`, `ok` to take every recommendation, or in your own words.
         assert_eq!(tracker.posts.get(), 2);
     }
 
+    fn rerun_comment(outcome: RerunOutcomeKind, again: Option<&str>) -> RerunComment {
+        RerunComment {
+            ticket: ticket(),
+            pull_request: DeliveredPullRequest {
+                number: 23,
+                url: "https://github.com/pitchopp/owlshift/pull/23".to_owned(),
+            },
+            rerun: Rerun {
+                head: "a".repeat(40),
+                at: "2026-11-09T10:00:00Z".parse().unwrap(),
+                runs: vec![7],
+                jobs: vec![owlshift_contracts::refs::RerunJob {
+                    name: "check (ubuntu-latest)".to_owned(),
+                    id: 10,
+                    run: 7,
+                    url: Some("https://github.com/pitchopp/owlshift/runs/10".to_owned()),
+                    again: again.map(str::to_owned),
+                }],
+                outcome: Some(outcome),
+                reason: None,
+                told: false,
+            },
+        }
+    }
+
+    /// OWL-513: a RERUN comment names the pull request and head, each job
+    /// with both attempts' links ("not seen" for none), and the outcome.
+    #[test]
+    fn a_rerun_comment_tells_both_attempts_and_the_outcome() {
+        let again = Some("https://github.com/pitchopp/owlshift/runs/11");
+        for (outcome, says) in [
+            (
+                RerunOutcomeKind::Passed,
+                "passed on the re-run: a flake, nothing to fix",
+            ),
+            (
+                RerunOutcomeKind::Failed,
+                "failed again: a fix run reads the logs next",
+            ),
+        ] {
+            let body = rerun_comment(outcome, again).render();
+            assert!(body.starts_with("[owlshift] RERUN\n\n"), "{body}");
+            assert!(
+                body.contains("**Pull request:** [#23](https://github.com/pitchopp/owlshift/pull/23), head `aaaaaaa`"),
+                "{body}"
+            );
+            assert!(body.contains(&format!("**Outcome:** {says}.")), "{body}");
+            assert!(
+                body.contains(
+                    "- `check (ubuntu-latest)`: [first attempt](https://github.com/pitchopp/owlshift/runs/10), [re-run](https://github.com/pitchopp/owlshift/runs/11)"
+                ),
+                "{body}"
+            );
+            let marked = MarkedComment::parse(&body).unwrap().unwrap();
+            assert_eq!(marked.footer.unwrap().kind, MarkerKind::Rerun);
+        }
+        let unseen = rerun_comment(RerunOutcomeKind::Unseen, None).render();
+        assert!(
+            unseen.contains("no new attempt showed within an hour: a fix run reads the logs next"),
+            "{unseen}"
+        );
+        assert!(unseen.contains(", re-run not seen"), "{unseen}");
+    }
+
+    /// OWL-513: posted once per pull request and head, as a MERGED is.
+    #[test]
+    fn a_rerun_comment_is_posted_once() {
+        let tracker = FakeTracker::default();
+        let writer = Writer::new(&tracker);
+        let comment = rerun_comment(RerunOutcomeKind::Passed, None);
+        let first = writer.post_rerun(&comment).unwrap();
+        let again = writer.post_rerun(&comment).unwrap();
+        assert!(first.new && !again.new);
+        assert_eq!(again.comment, first.comment);
+        let mut other = comment;
+        other.rerun.head = "b".repeat(40);
+        assert!(writer.post_rerun(&other).unwrap().new);
+        assert_eq!(tracker.posts.get(), 2);
+    }
+
     /// OWL-228: `fit` leaves the shorter texts whole and cuts the longer
     /// ones to one length, so that together they take the room exactly,
     /// counted in characters; `fitted` keeps a body that holds as is, and
@@ -8742,6 +8930,9 @@ Reply `Q1: B`, `ok` to take every recommendation, or in your own words.
         ("rerun_failed_jobs", |w, f| {
             came(w.rerun_failed_jobs(&f.forge, 42_378_288_167))
         }),
+        ("post_rerun", |w, _| {
+            came(w.post_rerun(&rerun_comment(RerunOutcomeKind::Passed, None)))
+        }),
         ("post_merged", |w, _| {
             came(w.post_merged(&MergedComment {
                 ticket: ticket(),
@@ -8886,7 +9077,7 @@ Reply `Q1: B`, `ok` to take every recommendation, or in your own words.
     /// `fold`, which is never an error, says so in its one failure.
     #[test]
     fn a_ui_writer_refuses_every_other_write() {
-        assert_eq!(UI_REFUSED_WRITES.len(), 28);
+        assert_eq!(UI_REFUSED_WRITES.len(), 29);
         for (name, write) in UI_REFUSED_WRITES {
             let tracker = Counting::default();
             tracker.accepts_posts.set(true);
