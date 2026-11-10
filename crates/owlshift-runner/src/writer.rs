@@ -4139,6 +4139,20 @@ impl<'a> Writer<'a> {
             .map_err(WriteError::Forge)
     }
 
+    /// Re-runs the failed jobs of GitHub Actions workflow run `run` once,
+    /// for watch's automatic re-run (OWL-513), after asking the floor
+    /// (`Action::RerunCheck`). The answer is the forge's
+    /// ([`GitHubForge::rerun_failed_jobs`]).
+    pub fn rerun_failed_jobs(
+        &self,
+        forge: &GitHubForge,
+        run: u64,
+    ) -> Result<forge::RerunAnswer, WriteError> {
+        self.check(Action::RerunCheck, HumanApproval::Absent)
+            .map_err(WriteError::Floor)?;
+        forge.rerun_failed_jobs(run).map_err(WriteError::Forge)
+    }
+
     /// Posts a MERGED comment once (OWL-445): when a MERGED comment on the
     /// ticket already names the same pull request and head, that comment is
     /// returned and nothing is posted, so a merge told before a crash is
@@ -8725,6 +8739,9 @@ Reply `Q1: B`, `ok` to take every recommendation, or in your own words.
         ("merge_pull_request", |w, f| {
             came(w.merge_pull_request(&f.forge, 23, &f.grant))
         }),
+        ("rerun_failed_jobs", |w, f| {
+            came(w.rerun_failed_jobs(&f.forge, 42_378_288_167))
+        }),
         ("post_merged", |w, _| {
             came(w.post_merged(&MergedComment {
                 ticket: ticket(),
@@ -8869,7 +8886,7 @@ Reply `Q1: B`, `ok` to take every recommendation, or in your own words.
     /// `fold`, which is never an error, says so in its one failure.
     #[test]
     fn a_ui_writer_refuses_every_other_write() {
-        assert_eq!(UI_REFUSED_WRITES.len(), 27);
+        assert_eq!(UI_REFUSED_WRITES.len(), 28);
         for (name, write) in UI_REFUSED_WRITES {
             let tracker = Counting::default();
             tracker.accepts_posts.set(true);

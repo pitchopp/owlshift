@@ -168,6 +168,7 @@ mod drain;
 mod intake;
 mod limits;
 mod merge_note;
+mod rerun;
 mod review_loop;
 mod to_watch;
 pub mod typed;
@@ -2901,11 +2902,13 @@ impl OnDemand<'_> {
             sink.emit(&ticket, None, EventKind::Decision, event);
         }
         self.settle_owed_report(p, &mut following, sink)?;
-        // A fix run, a rebase run or a park the read decided, which the
-        // repair reads again under this command's lock (OWL-112, OWL-210).
+        // A fix run, a rebase run, a park or a re-run the read decided,
+        // which the repair reads again under this command's lock (OWL-112,
+        // OWL-210, OWL-513).
         if let FollowDecision::Follow {
             action:
                 FollowAction::Fix { .. }
+                | FollowAction::Rerun
                 | FollowAction::Park
                 | FollowAction::Rebase { .. }
                 | FollowAction::RebaseFailed { .. },
@@ -6759,7 +6762,7 @@ impl OnDemand<'_> {
             .stored
             .clone()
             .ok_or_else(|| nothing_to_continue(&ticket))?;
-        let delivery = stored
+        let mut delivery = stored
             .record
             .delivery
             .clone()
@@ -6781,13 +6784,15 @@ impl OnDemand<'_> {
             &pushed,
             |_| failing_for,
             overlap.as_deref(),
+            (self.clock)(),
         )
         .map_err(|e| refused("reading the pull request again", e))?;
-        let action = match &fresh.decision {
+        let mut action = match &fresh.decision {
             FollowDecision::Follow {
                 adopt: false,
                 action:
                     action @ (FollowAction::Fix { .. }
+                    | FollowAction::Rerun
                     | FollowAction::Park
                     | FollowAction::Rebase { .. }
                     | FollowAction::RebaseFailed { .. }),
@@ -6871,6 +6876,15 @@ impl OnDemand<'_> {
             }
             FollowAction::RebaseFailed { .. } => {
                 return Err(self.rebase_failed(p, state, &delivery, &pr, sink));
+            }
+            // The automatic re-run (OWL-513): a refusal goes on to the fix
+            // run, on the delivery as the ref now keeps it.
+            FollowAction::Rerun => {
+                let refused = self.rerun_checks(p, &state, &delivery, &pr, &fresh, sink)?;
+                delivery = refused.delivery;
+                action = FollowAction::Fix {
+                    overdue: Vec::new(),
+                };
             }
             _ => {}
         }

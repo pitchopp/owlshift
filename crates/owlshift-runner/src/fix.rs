@@ -16,6 +16,18 @@ use crate::follow::check_read;
 /// The app whose check runs are GitHub Actions jobs, whose logs are read.
 pub const ACTIONS_APP: &str = "github-actions";
 
+/// The job id of `check` when it is a GitHub Actions job: a check run of
+/// [`ACTIONS_APP`] with its id. Its log is the excerpt, and with its
+/// workflow run it can be re-run (OWL-513).
+pub fn actions_job(check: &Check) -> Option<u64> {
+    match (&check.kind, check.id) {
+        (CheckKind::CheckRun { app, .. }, Some(id)) if app.as_deref() == Some(ACTIONS_APP) => {
+            Some(id)
+        }
+        _ => None,
+    }
+}
+
 /// Where a failed check's excerpt is read.
 pub trait Excerpts {
     /// The excerpt of a GitHub Actions job's log.
@@ -125,10 +137,10 @@ const LEFT_OUT: &str = "left out: the brief's 64 KiB of excerpts went to the che
 /// A failed check's excerpt: an Actions job's log, another app's output,
 /// a status's description; at most [`MAX_EXCERPT_BYTES`].
 fn excerpt(check: &Check, excerpts: &dyn Excerpts) -> Result<String, Error> {
+    if let Some(job) = actions_job(check) {
+        return Ok(head(&excerpts.job_log(job)?, MAX_EXCERPT_BYTES));
+    }
     let text = match (&check.kind, check.id) {
-        (CheckKind::CheckRun { app, .. }, Some(id)) if app.as_deref() == Some(ACTIONS_APP) => {
-            excerpts.job_log(id)?
-        }
         (CheckKind::CheckRun { .. }, Some(id)) => excerpts.output(id)?,
         (CheckKind::CheckRun { .. }, None) => {
             return Err(Error::new(

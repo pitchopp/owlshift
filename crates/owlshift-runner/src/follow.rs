@@ -25,12 +25,13 @@ use owlshift_adapters::forge::{
 };
 use owlshift_contracts::ids::TicketId;
 use owlshift_contracts::refs::{
-    DeliveredPullRequest, Ended, EndedWhy, OwedReport, PushKind, Pushing, TicketDelivery,
+    DeliveredPullRequest, Ended, EndedWhy, OwedReport, PushKind, Pushing, RerunOutcomeKind,
+    TicketDelivery,
 };
 use owlshift_contracts::step::{KeptFollowing, KeptUnposted};
 use owlshift_core::follow::{
-    self, Action, BaseRead, CheckOutcome, CheckRead, Decision, EndReason, Followed, Read,
-    RebaseCause,
+    self, Action, BaseRead, CheckOutcome, CheckRead, Decision, EndReason, FirstAttempt, Followed,
+    Read, RebaseCause, RerunMark,
 };
 use owlshift_core::pipeline::Pipeline;
 use owlshift_core::state::{Event, Status, TicketState, Transition};
@@ -62,7 +63,8 @@ pub fn read_of(set: &CheckSet) -> Read {
 
 /// A check for the core: a code failure is a check run concluding `FAILURE`
 /// or `TIMED_OUT`, or a commit status `FAILURE` or `ERROR`; any other failure
-/// is one a person re-runs. Whether the check is required plays no part.
+/// is one a person re-runs. Whether the check is required plays no part. A
+/// GitHub Actions job whose workflow run was read can be re-run (OWL-513).
 pub(crate) fn check_read(check: &Check) -> CheckRead {
     let outcome = match check.state {
         CheckState::Passed => CheckOutcome::Passed,
@@ -84,7 +86,52 @@ pub(crate) fn check_read(check: &Check) -> CheckRead {
         outcome,
         id: check.id,
         run: check.run,
-        rerunnable: false,
+        rerunnable: crate::fix::actions_job(check).is_some() && check.run.is_some(),
+    }
+}
+
+/// The re-run `delivery` keeps of `head` (OWL-513), as the core reads it
+/// at `now` ([`KeptRerun::mark`]): `None` for another head's or none.
+pub fn rerun_mark(delivery: &TicketDelivery, head: &str, now: Timestamp) -> Option<KeptRerun> {
+    let rerun = delivery.rerun.as_ref().filter(|rerun| rerun.head == head)?;
+    let first = if rerun.outcome == Some(RerunOutcomeKind::Refused) {
+        // Refused: no new attempt will come, the checks read as they are.
+        Vec::new()
+    } else {
+        rerun
+            .jobs
+            .iter()
+            .map(|job| FirstAttempt {
+                id: job.id,
+                run: job.run,
+                name: job.name.clone(),
+            })
+            .collect()
+    };
+    Some(KeptRerun {
+        head: rerun.head.clone(),
+        first,
+        since: Duration::try_from(now.duration_since(rerun.at)).unwrap_or_default(),
+    })
+}
+
+/// A re-run as [`rerun_mark`] reads it from the ref: the one conversion of
+/// its jobs into the core's first attempts.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct KeptRerun {
+    pub head: String,
+    pub first: Vec<FirstAttempt>,
+    pub since: Duration,
+}
+
+impl KeptRerun {
+    /// The core's mark of it.
+    pub fn mark(&self) -> RerunMark<'_> {
+        RerunMark {
+            head: &self.head,
+            first: &self.first,
+            since: self.since,
+        }
     }
 }
 
@@ -132,7 +179,8 @@ impl Fresh {
 /// table needs it. `failing_for` gives how long ago a failure was first read
 /// on the head read. `overlap` is the base head that changes a path one of
 /// the ticket's overlaps names, when the caller found one
-/// ([`crate::held::base_moved_on`], OWL-449). Watch's look and a repair's
+/// ([`crate::held::base_moved_on`], OWL-449). The re-run the ref keeps of
+/// the head read counts from `now` (OWL-513). Watch's look and a repair's
 /// read under the lock (OWL-112) both read through it.
 pub fn read(
     forge: &GitHubForge,
@@ -141,10 +189,15 @@ pub fn read(
     pushed: &str,
     mut failing_for: impl FnMut(&Read) -> Option<Duration>,
     overlap: Option<&str>,
+    now: Timestamp,
 ) -> Result<Fresh, owlshift_adapters::forge::Error> {
     let PullRequestRead { checks, .. } = forge.follow(number)?;
     let core = read_of(&checks);
-    let followed = followed_of(delivery, pushed, overlap);
+    let kept = rerun_mark(delivery, &core.head, now);
+    let followed = Followed {
+        rerun: kept.as_ref().map(KeptRerun::mark),
+        ..followed_of(delivery, pushed, overlap)
+    };
     let failing_for = failing_for(&core);
     let mut decision = follow::decide(&core, followed, None, failing_for);
     let mut base = None;
@@ -435,7 +488,7 @@ impl Following {
             Err(look) => return (*look, warnings),
         };
         let failing = |core: &Read| self.failing_for(ticket, core, now);
-        let fresh = match read(forge, delivery, pr.number, pushed, failing, overlap) {
+        let fresh = match read(forge, delivery, pr.number, pushed, failing, overlap, now) {
             Ok(fresh) => fresh,
             Err(error) => return self.failed(ticket, &error, now, warnings),
         };
@@ -1375,6 +1428,78 @@ mod tests {
             pushed: Some(PUSHED.to_owned()),
             ..TicketDelivery::new("owlshift/demo-1", "main")
         }
+    }
+
+    /// OWL-513: only a GitHub Actions check run with its job id and its
+    /// workflow run can be re-run; the id and the run reach the core.
+    #[test]
+    fn an_actions_job_with_its_run_is_rerunnable() {
+        let job = |app: &str, id: Option<u64>, run: Option<u64>| Check {
+            kind: CheckKind::CheckRun {
+                app: Some(app.to_owned()),
+                workflow: Some("CI".to_owned()),
+            },
+            name: "ci".to_owned(),
+            state: CheckState::Failed,
+            raw: "FAILURE".to_owned(),
+            required: true,
+            url: None,
+            id,
+            description: None,
+            run,
+        };
+        let read = check_read(&job("github-actions", Some(10), Some(7)));
+        assert!(read.rerunnable);
+        assert_eq!((read.id, read.run), (Some(10), Some(7)));
+        assert!(!check_read(&job("github-actions", Some(10), None)).rerunnable);
+        assert!(!check_read(&job("github-actions", None, Some(7))).rerunnable);
+        assert!(!check_read(&job("circleci-checks", Some(10), Some(7))).rerunnable);
+        let status = Check {
+            kind: CheckKind::Status,
+            ..job("github-actions", Some(10), Some(7))
+        };
+        assert!(!check_read(&status).rerunnable);
+    }
+
+    /// OWL-513: the ref's re-run reaches the core for its own head only,
+    /// each job's id, run and name intact, none for a refused one, counted
+    /// from when it was asked.
+    #[test]
+    fn rerun_mark_is_of_the_refs_head_only() {
+        use owlshift_contracts::refs::{Rerun, RerunJob};
+        let mut kept = delivery();
+        assert_eq!(rerun_mark(&kept, PUSHED, at(0)), None);
+        kept.rerun = Some(Rerun {
+            head: PUSHED.to_owned(),
+            at: at(0),
+            runs: vec![7],
+            jobs: vec![RerunJob {
+                name: "ci".to_owned(),
+                id: 10,
+                run: 7,
+                url: None,
+                again: None,
+            }],
+            outcome: None,
+            reason: None,
+            told: false,
+        });
+        let mark = rerun_mark(&kept, PUSHED, at(5)).unwrap();
+        assert_eq!(
+            mark.first,
+            [FirstAttempt {
+                id: 10,
+                run: 7,
+                name: "ci".to_owned()
+            }]
+        );
+        assert_eq!(mark.since, Duration::from_secs(5 * 60));
+        assert_eq!(mark.mark().head, PUSHED);
+        assert_eq!(rerun_mark(&kept, PUSHING, at(5)), None);
+        let refused = kept.rerun.as_mut().unwrap();
+        refused.outcome = Some(RerunOutcomeKind::Refused);
+        refused.reason = Some("HTTP 403 Resource not accessible by integration".to_owned());
+        assert!(rerun_mark(&kept, PUSHED, at(5)).unwrap().first.is_empty());
     }
 
     fn forge() -> (GitHubForge, Canned) {

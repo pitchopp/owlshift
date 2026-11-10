@@ -119,8 +119,16 @@ impl OnDemand<'_> {
             return Err(nothing_to_continue(&ticket));
         };
         let state = TicketState::try_from(&stored.record.state).map_err(core_error)?;
-        let fresh = follow::read(self.forge, &delivery, pr.number, &pushed, |_| None, None)
-            .map_err(|e| refused("reading the pull request again", e))?;
+        let fresh = follow::read(
+            self.forge,
+            &delivery,
+            pr.number,
+            &pushed,
+            |_| None,
+            None,
+            (self.clock)(),
+        )
+        .map_err(|e| refused("reading the pull request again", e))?;
         let look = || Stop::Watched {
             ticket: ticket.clone(),
             seen: Box::new(fresh.seen(pr.number, &pr.url)),
