@@ -92,7 +92,7 @@
     "format": {
       "description": "The format version of this document.",
       "type": "integer",
-      "const": 29
+      "const": 30
     },
     "gate": {
       "description": "The project's full gate, from `stack.gate` in its configuration: the\ncommands the runner runs, in order, from the worktree root, on the\ncommit a Build delivers; a role runs them, or narrows them to its\nchange, before it delivers. The runner is its only author; an empty\nlist means the project has no gate.",
@@ -455,6 +455,17 @@
           "format": "uint64",
           "minimum": 0
         },
+        "rerun": {
+          "description": "The runner already re-ran these checks once on this head, and they\nfailed again or showed no new attempt (format 30, OWL-513): `checks`\nare then the second attempt's, and `rerun.first` the first's.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/RerunAttempt"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "unfinished": {
           "description": "The checks still unfinished an hour after the first failure was read.",
           "type": "array",
@@ -796,6 +807,25 @@
           "type": "string",
           "const": "note"
         }
+      ]
+    },
+    "FirstAttemptJob": {
+      "description": "One failed job of the first attempt.",
+      "type": "object",
+      "properties": {
+        "name": {
+          "type": "string"
+        },
+        "url": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "name"
       ]
     },
     "Fork": {
@@ -1457,6 +1487,43 @@
       "description": "A path relative to the worktree: '/'-separated segments, none empty or '..', with no backslash or colon.",
       "type": "string",
       "pattern": "^(?:[^/\\\\:.][^/\\\\:]*|\\.(?:[^/\\\\:.][^/\\\\:]*)?|\\.\\.[^/\\\\:]+)(?:/(?:[^/\\\\:.][^/\\\\:]*|\\.(?:[^/\\\\:.][^/\\\\:]*)?|\\.\\.[^/\\\\:]+))*$"
+    },
+    "RerunAttempt": {
+      "description": "The runner's re-run of the head a fix run is given (OWL-513). It names\nthe first attempt's jobs and links only: the runner's own ids stay in\nthe ticket ref.",
+      "type": "object",
+      "properties": {
+        "at": {
+          "description": "When the runner asked the re-run.",
+          "type": "string",
+          "format": "date-time"
+        },
+        "first": {
+          "description": "The failed jobs of the first attempt, as the read before the re-run\nlisted them.",
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/FirstAttemptJob"
+          },
+          "minItems": 1
+        },
+        "outcome": {
+          "description": "`failed`: a new attempt failed; `unseen`: a job showed no new\nattempt within an hour.",
+          "$ref": "#/$defs/RerunAttemptOutcome"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "at",
+        "outcome",
+        "first"
+      ]
+    },
+    "RerunAttemptOutcome": {
+      "description": "What a re-run a fix run follows came to.",
+      "type": "string",
+      "enum": [
+        "failed",
+        "unseen"
+      ]
     },
     "ResponseOutcome": {
       "description": "What the author did with a finding (architecture section 5, \"A finding\ngoes to its author\").",

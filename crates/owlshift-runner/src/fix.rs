@@ -7,14 +7,28 @@
 use owlshift_adapters::forge::github::GitHubForge;
 use owlshift_adapters::forge::{Check, CheckKind, CheckState, Error, ErrorKind};
 use owlshift_contracts::brief::{
-    BaseState, CheckFailure, FailedCheck, FailedCheckKind, MAX_EXCERPT_BYTES, MAX_EXCERPTS_BYTES,
+    BaseState, CheckFailure, FailedCheck, FailedCheckKind, FirstAttemptJob, MAX_EXCERPT_BYTES,
+    MAX_EXCERPTS_BYTES, RerunAttempt, RerunAttemptOutcome,
 };
-use owlshift_core::follow::{self, CheckOutcome};
+use owlshift_contracts::refs::{Rerun, RerunOutcomeKind};
+use owlshift_core::follow::{self, CheckOutcome, CheckRead, RerunMark};
 
 use crate::follow::check_read;
 
 /// The app whose check runs are GitHub Actions jobs, whose logs are read.
 pub const ACTIONS_APP: &str = "github-actions";
+
+/// The job id of `check` when it is a GitHub Actions job: a check run of
+/// [`ACTIONS_APP`] with its id. Its log is the excerpt, and with its
+/// workflow run it can be re-run (OWL-513).
+pub fn actions_job(check: &Check) -> Option<u64> {
+    match (&check.kind, check.id) {
+        (CheckKind::CheckRun { app, .. }, Some(id)) if app.as_deref() == Some(ACTIONS_APP) => {
+            Some(id)
+        }
+        _ => None,
+    }
+}
 
 /// Where a failed check's excerpt is read.
 pub trait Excerpts {
@@ -49,6 +63,12 @@ pub struct Red<'a> {
     pub base_checks: Option<&'a [Check]>,
     /// The checks still unfinished an hour after the first failure.
     pub unfinished: &'a [String],
+    /// The runner's re-run of this head, as the ticket ref keeps it
+    /// (OWL-513), and the core's mark of it: a first attempt a newer one
+    /// replaces is left out, and a re-run that failed again or showed no
+    /// new attempt is the brief's `rerun`.
+    pub rerun: Option<&'a Rerun>,
+    pub mark: Option<RerunMark<'a>>,
 }
 
 /// A fix run's `check_failure`, or why no run should start: when no failed
@@ -60,7 +80,18 @@ pub fn check_failure(red: Red<'_>, excerpts: &dyn Excerpts) -> Result<CheckFailu
     let mut total = 0;
     let mut spent = false;
     let mut refused: Option<Error> = None;
-    for check in red.checks.iter().filter(|c| c.state == CheckState::Failed) {
+    let reads: Vec<CheckRead> = red.checks.iter().map(check_read).collect();
+    let replaced = red.mark.map_or_else(
+        || vec![false; reads.len()],
+        |mark| follow::replaced_attempts(&reads, &mark),
+    );
+    let failed = red
+        .checks
+        .iter()
+        .zip(&replaced)
+        .filter(|(c, replaced)| c.state == CheckState::Failed && !**replaced)
+        .map(|(c, _)| c);
+    for check in failed {
         let (excerpt, no_excerpt) = if spent {
             (None, Some(LEFT_OUT.to_owned()))
         } else {
@@ -115,6 +146,41 @@ pub fn check_failure(red: Red<'_>, excerpts: &dyn Excerpts) -> Result<CheckFailu
         base: red.base.map(str::to_owned),
         checks,
         unfinished: red.unfinished.to_vec(),
+        rerun: rerun_attempt(&red, reads),
+    })
+}
+
+/// The brief's `rerun` of `red` (OWL-513): its re-run of the head, when it
+/// failed again or showed no new attempt, as kept or, not kept yet, as the
+/// core reads `reads`, the head's checks.
+fn rerun_attempt(red: &Red<'_>, reads: Vec<CheckRead>) -> Option<RerunAttempt> {
+    let rerun = red.rerun.filter(|rerun| rerun.head == red.head)?;
+    let outcome = rerun.outcome.or_else(|| {
+        let read = follow::Read {
+            state: follow::PrState::Open,
+            head: red.head.to_owned(),
+            mergeable: follow::Mergeable::Unknown,
+            checks: reads,
+        };
+        let mark = red.mark?;
+        follow::rerun_outcome(&read, &mark).map(crate::follow::outcome_kind)
+    })?;
+    let outcome = match outcome {
+        RerunOutcomeKind::Failed => RerunAttemptOutcome::Failed,
+        RerunOutcomeKind::Unseen => RerunAttemptOutcome::Unseen,
+        RerunOutcomeKind::Passed | RerunOutcomeKind::Refused => return None,
+    };
+    Some(RerunAttempt {
+        at: rerun.at,
+        outcome,
+        first: rerun
+            .jobs
+            .iter()
+            .map(|job| FirstAttemptJob {
+                name: job.name.clone(),
+                url: job.url.clone(),
+            })
+            .collect(),
     })
 }
 
@@ -124,10 +190,10 @@ const LEFT_OUT: &str = "left out: the brief's 64 KiB of excerpts went to the che
 /// A failed check's excerpt: an Actions job's log, another app's output,
 /// a status's description; at most [`MAX_EXCERPT_BYTES`].
 fn excerpt(check: &Check, excerpts: &dyn Excerpts) -> Result<String, Error> {
+    if let Some(job) = actions_job(check) {
+        return Ok(head(&excerpts.job_log(job)?, MAX_EXCERPT_BYTES));
+    }
     let text = match (&check.kind, check.id) {
-        (CheckKind::CheckRun { app, .. }, Some(id)) if app.as_deref() == Some(ACTIONS_APP) => {
-            excerpts.job_log(id)?
-        }
         (CheckKind::CheckRun { .. }, Some(id)) => excerpts.output(id)?,
         (CheckKind::CheckRun { .. }, None) => {
             return Err(Error::new(
@@ -215,6 +281,7 @@ mod tests {
             url: None,
             id,
             description: None,
+            run: None,
         }
     }
 
@@ -227,7 +294,126 @@ mod tests {
             checks,
             base_checks: base,
             unfinished: &[],
+            rerun: None,
+            mark: None,
         }
+    }
+
+    const HEAD: &str = "1111111111111111111111111111111111111111";
+
+    /// A job of workflow run 7, check run `id`, with its link (OWL-513).
+    fn job(name: &str, id: u64, state: CheckState) -> Check {
+        Check {
+            url: Some(format!("https://github.com/demo/project/runs/{id}")),
+            run: Some(7),
+            ..run(name, ACTIONS_APP, Some(id), state)
+        }
+    }
+
+    /// The re-run of `HEAD` of `check (ubuntu-latest)`, check run 10 of
+    /// run 7, its outcome `outcome`.
+    fn rerun(outcome: Option<RerunOutcomeKind>) -> Rerun {
+        Rerun {
+            head: HEAD.to_owned(),
+            at: "2026-11-09T10:00:00Z".parse().unwrap(),
+            runs: vec![7],
+            jobs: vec![owlshift_contracts::refs::RerunJob {
+                name: "check (ubuntu-latest)".to_owned(),
+                id: 10,
+                run: 7,
+                url: Some("https://github.com/demo/project/runs/10".to_owned()),
+                again: None,
+            }],
+            outcome,
+            reason: None,
+            told: false,
+        }
+    }
+
+    /// OWL-513: after a re-run that failed again, the brief's `rerun` names
+    /// the first attempt's jobs and links; none for another head's re-run
+    /// or one that passed. Not kept yet, the outcome is the core's on the
+    /// checks given.
+    #[test]
+    fn a_rerun_head_briefs_the_first_attempt() {
+        let checks = [job("check (ubuntu-latest)", 11, CheckState::Failed)];
+        let firsts = [owlshift_core::follow::FirstAttempt {
+            id: 10,
+            run: 7,
+            name: "check (ubuntu-latest)".to_owned(),
+        }];
+        let mark = RerunMark {
+            head: HEAD,
+            first: &firsts,
+            since: std::time::Duration::from_secs(600),
+        };
+        let brief = |kept: &Rerun| {
+            let given = Red {
+                rerun: Some(kept),
+                mark: Some(mark),
+                ..red(&checks, None)
+            };
+            check_failure(given, &Canned::new(vec![Ok("boom".into())]))
+                .unwrap()
+                .rerun
+        };
+        let failed = brief(&rerun(Some(RerunOutcomeKind::Failed))).unwrap();
+        assert_eq!(failed.outcome, RerunAttemptOutcome::Failed);
+        assert_eq!(
+            failed.first,
+            [FirstAttemptJob {
+                name: "check (ubuntu-latest)".to_owned(),
+                url: Some("https://github.com/demo/project/runs/10".to_owned()),
+            }]
+        );
+        assert_eq!(
+            brief(&rerun(None)).unwrap().outcome,
+            RerunAttemptOutcome::Failed
+        );
+        assert_eq!(brief(&rerun(Some(RerunOutcomeKind::Passed))), None);
+        let mut other = rerun(Some(RerunOutcomeKind::Failed));
+        other.head = "2222222222222222222222222222222222222222".to_owned();
+        assert_eq!(brief(&other), None);
+    }
+
+    /// OWL-513: a rollup listing both attempts of a job gives the brief the
+    /// newer one alone, its link and its log; a failed check of the same
+    /// name in another workflow run stays.
+    #[test]
+    fn a_brief_drops_the_replaced_first_attempt() {
+        let mut other_run = job("check (ubuntu-latest)", 5, CheckState::Failed);
+        other_run.run = Some(8);
+        let checks = [
+            job("check (ubuntu-latest)", 10, CheckState::Failed),
+            job("check (ubuntu-latest)", 11, CheckState::Failed),
+            other_run,
+        ];
+        let firsts = [owlshift_core::follow::FirstAttempt {
+            id: 10,
+            run: 7,
+            name: "check (ubuntu-latest)".to_owned(),
+        }];
+        let kept = rerun(Some(RerunOutcomeKind::Failed));
+        let given = Red {
+            rerun: Some(&kept),
+            mark: Some(RerunMark {
+                head: HEAD,
+                first: &firsts,
+                since: std::time::Duration::from_secs(600),
+            }),
+            ..red(&checks, None)
+        };
+        let canned = Canned::new(vec![Ok("again".into()), Ok("other".into())]);
+        let failure = check_failure(given, &canned).unwrap();
+        assert_eq!(*canned.1.borrow(), ["log 11", "log 5"]);
+        let urls: Vec<_> = failure.checks.iter().map(|c| c.url.as_deref()).collect();
+        assert_eq!(
+            urls,
+            [
+                Some("https://github.com/demo/project/runs/11"),
+                Some("https://github.com/demo/project/runs/5"),
+            ]
+        );
     }
 
     fn refused() -> Error {

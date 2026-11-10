@@ -168,6 +168,7 @@ mod drain;
 mod intake;
 mod limits;
 mod merge_note;
+mod rerun;
 mod review_loop;
 mod to_watch;
 pub mod typed;
@@ -2901,11 +2902,16 @@ impl OnDemand<'_> {
             sink.emit(&ticket, None, EventKind::Decision, event);
         }
         self.settle_owed_report(p, &mut following, sink)?;
-        // A fix run, a rebase run or a park the read decided, which the
-        // repair reads again under this command's lock (OWL-112, OWL-210).
+        // The outcome of the head's re-run, kept before any repair reads it
+        // (OWL-513).
+        self.settle_rerun(p, &mut following, sink)?;
+        // A fix run, a rebase run, a park or a re-run the read decided,
+        // which the repair reads again under this command's lock (OWL-112,
+        // OWL-210, OWL-513).
         if let FollowDecision::Follow {
             action:
                 FollowAction::Fix { .. }
+                | FollowAction::Rerun
                 | FollowAction::Park
                 | FollowAction::Rebase { .. }
                 | FollowAction::RebaseFailed { .. },
@@ -6759,7 +6765,7 @@ impl OnDemand<'_> {
             .stored
             .clone()
             .ok_or_else(|| nothing_to_continue(&ticket))?;
-        let delivery = stored
+        let mut delivery = stored
             .record
             .delivery
             .clone()
@@ -6781,13 +6787,15 @@ impl OnDemand<'_> {
             &pushed,
             |_| failing_for,
             overlap.as_deref(),
+            (self.clock)(),
         )
         .map_err(|e| refused("reading the pull request again", e))?;
-        let action = match &fresh.decision {
+        let mut action = match &fresh.decision {
             FollowDecision::Follow {
                 adopt: false,
                 action:
                     action @ (FollowAction::Fix { .. }
+                    | FollowAction::Rerun
                     | FollowAction::Park
                     | FollowAction::Rebase { .. }
                     | FollowAction::RebaseFailed { .. }),
@@ -6871,6 +6879,16 @@ impl OnDemand<'_> {
             }
             FollowAction::RebaseFailed { .. } => {
                 return Err(self.rebase_failed(p, state, &delivery, &pr, sink));
+            }
+            // The automatic re-run (OWL-513): a refusal goes on to the fix
+            // run, on the delivery as the ref now keeps it.
+            FollowAction::Rerun => {
+                let refused =
+                    self.rerun_checks(p, &state, &delivery, &pr, &fresh, following, sink)?;
+                delivery = refused.delivery;
+                action = FollowAction::Fix {
+                    overdue: Vec::new(),
+                };
             }
             _ => {}
         }
@@ -6962,6 +6980,9 @@ impl OnDemand<'_> {
                 sink,
             );
         }
+        // The head's re-run, as the ref keeps it after its settling or its
+        // refusal, this command's (OWL-513).
+        let kept_rerun = follow::rerun_mark(&delivery, &pushed, (self.clock)());
         let red = fix::Red {
             pull_request: pr.number,
             url: &pr.url,
@@ -6970,6 +6991,8 @@ impl OnDemand<'_> {
             checks: &fresh.checks.checks,
             base_checks: fresh.base.as_ref().map(|b| b.at_head.as_slice()),
             unfinished: &overdue,
+            rerun: delivery.rerun.as_ref(),
+            mark: kept_rerun.as_ref().map(follow::KeptRerun::mark),
         };
         let failure = fix::check_failure(red, self.forge).map_err(|error| {
             Stop::Refused(match error.kind {
@@ -8783,7 +8806,8 @@ fn brief_body(comment: &Comment) -> String {
         | MarkerKind::Parked
         | MarkerKind::Intake
         | MarkerKind::Waiting
-        | MarkerKind::Merged => {
+        | MarkerKind::Merged
+        | MarkerKind::Rerun => {
             let note = format!(
                 "\n\n(Cut to {MAX_THREAD_COMMENT_BYTES} bytes in this brief: the whole comment \
                  is on the ticket, tracker comment `{}`.)",

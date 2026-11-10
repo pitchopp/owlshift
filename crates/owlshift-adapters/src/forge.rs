@@ -326,6 +326,28 @@ pub struct Check {
     pub id: Option<u64>,
     /// A commit status's description: given by watch's read (OWL-112).
     pub description: Option<String>,
+    /// The workflow run of a GitHub Actions check run: given by watch's
+    /// read (OWL-513), absent from every other. A re-run's new attempt of a
+    /// job keeps it, with a greater `id`.
+    pub run: Option<u64>,
+}
+
+/// What the forge answered a re-run of a workflow run's failed jobs
+/// (OWL-513, architecture section 5, "The automatic re-run").
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RerunAnswer {
+    /// The forge took it: new attempts of the failed jobs will show.
+    Started,
+    /// The forge refused it. `permission` when the refusal names the
+    /// credential's missing permission (Actions write).
+    Refused {
+        permission: bool,
+        status: u16,
+        message: String,
+    },
+    /// No answer that says whether it started: a timeout, a reset
+    /// connection, a server error.
+    NoVerdict { reason: String },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -615,6 +637,7 @@ mod tests {
             url: None,
             id: None,
             description: None,
+            run: None,
         }
     }
 

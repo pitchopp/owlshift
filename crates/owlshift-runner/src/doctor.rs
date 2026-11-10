@@ -48,7 +48,7 @@ use crate::executor::harness::CLAUDE_AGENT_ACCOUNT;
 use crate::executor::{
     MINIMUM_GIT_VERSION, git_floor_reason, git_install_advice, git_recheck_note,
 };
-use crate::forge::GITHUB_TOKEN_HELP;
+use crate::forge::{AppGrants, GITHUB_TOKEN_HELP};
 use crate::install::ServiceState;
 use crate::secrets::{self, ForgeSecret, Source, TrackerAccounts, TrackerSecrets};
 use crate::served;
@@ -290,10 +290,22 @@ pub fn run(system: &dyn System, config: &Effective, own: &BuildIdentity) -> Repo
             .as_ref()
             .and_then(|found| forge_access_check(system, found)),
     );
+    // The GitHub App's grants, read once for the lines that need them
+    // (OWL-445, OWL-513).
+    let grants = stored
+        .as_ref()
+        .and_then(|found| app_grants(system, config, found));
     checks.extend(
         stored
             .as_ref()
-            .and_then(|found| merge_permission_check(system, config, found)),
+            .zip(grants.as_ref())
+            .and_then(|(found, grants)| merge_permission_check(config, found, grants)),
+    );
+    checks.extend(
+        stored
+            .as_ref()
+            .zip(grants.as_ref())
+            .and_then(|(found, grants)| rerun_permission_check(config, found, grants)),
     );
     let accounts = match &stored {
         Some(Ok(found)) => found.tracker.as_ref().map(|tracker| &tracker.accounts),
@@ -2244,9 +2256,9 @@ fn forge_access_check(
 /// found: information. None for `never`, or when the secrets are unresolved
 /// or no token is stored: the `secrets` line says so.
 fn merge_permission_check(
-    system: &dyn System,
     config: &Effective,
     found: &Result<ProjectSecrets, Unresolved>,
+    grants: &Result<AppGrants, TokenTryError>,
 ) -> Option<Check> {
     const SUBJECT: &str = "merge on green";
     let FileState::Loaded {
@@ -2262,19 +2274,16 @@ fn merge_permission_check(
     let Ok(found) = found else {
         return None;
     };
-    found.forge.token?;
-    let personal = match &config.personal {
-        FileState::Loaded { config, .. } => Some(config),
-        _ => None,
-    };
-    let app = crate::forge::GitHubApp::from_personal(personal);
+    let app = github_app(config);
     let repo = &found.repo;
     let why = "watch merges a green pull request through the GitHub App's token, which needs \
                Contents (read and write) on the repository; GitHub refuses the merge \
                otherwise, a final refusal that is notified.";
-    use crate::forge::MergePermission;
-    Some(match system.github_merge_permission(repo, &app.slug) {
-        Ok(MergePermission::Granted) => Check::ok(
+    Some(match grants {
+        Ok(AppGrants::Installed {
+            contents_write: true,
+            ..
+        }) => Check::ok(
             Section::Project,
             SUBJECT,
             format!(
@@ -2282,7 +2291,7 @@ fn merge_permission_check(
                  write), which watch's merge needs"
             ),
         ),
-        Ok(MergePermission::Missing { installation }) => Check::fail(
+        Ok(AppGrants::Installed { installation, .. }) => Check::fail(
             Section::Project,
             SUBJECT,
             format!(
@@ -2297,7 +2306,7 @@ fn merge_permission_check(
                 app.slug
             ))],
         ),
-        Ok(MergePermission::NotInstalled) => Check::info(
+        Ok(AppGrants::NotInstalled) => Check::info(
             Section::Project,
             SUBJECT,
             format!(
@@ -2306,7 +2315,7 @@ fn merge_permission_check(
                 app.install_link()
             ),
         ),
-        Ok(MergePermission::PersonalToken) => Check::info(
+        Ok(AppGrants::PersonalToken) => Check::info(
             Section::Project,
             SUBJECT,
             "not checked: GitHub does not say what a personal token may do; its merge needs \
@@ -2322,6 +2331,116 @@ fn merge_permission_check(
             format!(
                 "{DOES_NOT_BLOCK} doctor could not read the GitHub App's installation on \
                  github.com/{repo}. Watch's merge needs Contents (read and write)."
+            ),
+        ),
+    })
+}
+
+/// The GitHub App of the personal file, or Owlshift's own.
+fn github_app(config: &Effective) -> crate::forge::GitHubApp {
+    let personal = match &config.personal {
+        FileState::Loaded { config, .. } => Some(config),
+        _ => None,
+    };
+    crate::forge::GitHubApp::from_personal(personal)
+}
+
+/// What the project's GitHub credential was granted, for the lines that
+/// read it ([`merge_permission_check`], [`rerun_permission_check`]): read
+/// once, only when a project file is loaded and a token is stored.
+fn app_grants(
+    system: &dyn System,
+    config: &Effective,
+    found: &Result<ProjectSecrets, Unresolved>,
+) -> Option<Result<AppGrants, TokenTryError>> {
+    let FileState::Loaded { .. } = &config.project else {
+        return None;
+    };
+    let Ok(found) = found else {
+        return None;
+    };
+    found.forge.token?;
+    Some(system.github_app_grants(&found.repo, &github_app(config).slug))
+}
+
+/// The `check re-runs` line (OWL-513; architecture section 5, "The
+/// automatic re-run"): watch re-runs a red check's failed GitHub Actions
+/// jobs once per head through the GitHub App's token, which needs Actions
+/// (read and write). Without it every re-run is refused and the red check
+/// gets a fix run as before, so a missing grant is a warning that blocks
+/// nothing. A personal token's cannot be read, nor an installation not
+/// found: information.
+fn rerun_permission_check(
+    config: &Effective,
+    found: &Result<ProjectSecrets, Unresolved>,
+    grants: &Result<AppGrants, TokenTryError>,
+) -> Option<Check> {
+    const SUBJECT: &str = "check re-runs";
+    let Ok(found) = found else {
+        return None;
+    };
+    let app = github_app(config);
+    let repo = &found.repo;
+    Some(match grants {
+        Ok(AppGrants::Installed {
+            actions_write: true,
+            ..
+        }) => Check::ok(
+            Section::Project,
+            SUBJECT,
+            format!(
+                "the GitHub App's installation on github.com/{repo} grants Actions (read and \
+                 write), which watch's re-run of a red check needs"
+            ),
+        ),
+        Ok(AppGrants::Installed { installation, .. }) => Check {
+            fix: vec![Step::act(format!(
+                "Accept the app's permissions on GitHub, in the installation's settings \
+                 (Settings > Applications > Installed GitHub Apps > {} > Configure), then run \
+                 `owlshift doctor` again",
+                app.slug
+            ))],
+            ..Check::warn(
+                Section::Project,
+                SUBJECT,
+                format!(
+                    "the GitHub App's installation {installation} on github.com/{repo} has not \
+                     granted Actions (read and write): watch cannot re-run a failed check; a red \
+                     check gets a fix run as before"
+                ),
+                format!(
+                    "{DOES_NOT_BLOCK} watch re-runs a red check's failed GitHub Actions jobs \
+                     once before any fix run, which needs Actions (read and write); GitHub \
+                     refuses the re-run otherwise."
+                ),
+            )
+        },
+        Ok(AppGrants::NotInstalled) => Check::info(
+            Section::Project,
+            SUBJECT,
+            format!(
+                "not checked: no installation of the GitHub App lists github.com/{repo}; \
+                 install it from {}",
+                app.install_link()
+            ),
+        ),
+        Ok(AppGrants::PersonalToken) => Check::info(
+            Section::Project,
+            SUBJECT,
+            "not checked: GitHub does not say what a personal token may do; a re-run needs \
+             Actions (read and write), and a red check gets a fix run when GitHub refuses it",
+        ),
+        Err(TokenTryError::Credential(reason)) => {
+            Check::info(Section::Project, SUBJECT, format!("not checked: {reason}"))
+        }
+        Err(TokenTryError::Forge(error)) => Check::warn(
+            Section::Project,
+            SUBJECT,
+            format!("not checked: {error}"),
+            format!(
+                "{DOES_NOT_BLOCK} doctor could not read the GitHub App's installation on \
+                 github.com/{repo}. Watch's re-run of a red check needs Actions (read and \
+                 write)."
             ),
         ),
     })
@@ -4673,7 +4792,11 @@ states = { ready = "Todo", working = "Doing", needs_input = "Asked", review = "R
     /// `never`.
     #[test]
     fn merge_on_green_names_a_missing_contents_write() {
-        use crate::forge::MergePermission;
+        let installed = |contents_write| AppGrants::Installed {
+            installation: 9,
+            contents_write,
+            actions_write: true,
+        };
 
         let system = || logged_in(with_harnesses(with_git(FakeSystem::default())));
         let tracker = r#"kind = "markdown"
@@ -4688,32 +4811,78 @@ states = { ready = "Todo", working = "Doing", needs_input = "Asked", review = "R
         let (_dir, all) = project_tracked_by(&format!("{tracker}\n[forge]\nmerge = \"all\""));
         for (permission, status, says) in [
             (
-                MergePermission::Granted,
+                installed(true),
                 Status::Ok,
                 "grants Contents (read and write)",
             ),
             (
-                MergePermission::Missing { installation: 9 },
+                installed(false),
                 Status::Fail,
                 "installation 9 on github.com/pitchopp/owlshift has not granted Contents (read \
                  and write)",
             ),
-            (
-                MergePermission::NotInstalled,
-                Status::Info,
-                "no installation",
-            ),
-            (
-                MergePermission::PersonalToken,
-                Status::Info,
-                "personal token",
-            ),
+            (AppGrants::NotInstalled, Status::Info, "no installation"),
+            (AppGrants::PersonalToken, Status::Info, "personal token"),
         ] {
-            let report = run(&system().github_merge_permission_is(Ok(permission)), &all);
+            let report = run(&system().github_app_grants_are(Ok(permission)), &all);
             let found = line(&report, "merge on green");
             assert_eq!(found.status, status, "{found:?}");
             assert!(found.detail.contains(says), "{found:?}");
             assert_eq!(report.ready(), status != Status::Fail, "{permission:?}");
+        }
+    }
+
+    /// OWL-513: every project with a stored token gets a `check re-runs`
+    /// line from the GitHub App's installation: ok when it granted Actions
+    /// (read and write), a warning naming it and the installation's
+    /// settings otherwise, which blocks nothing, information for a personal
+    /// token or no installation.
+    #[test]
+    fn check_reruns_name_a_missing_actions_write() {
+        let system = || logged_in(with_harnesses(with_git(FakeSystem::default())));
+        let tracker = r#"kind = "markdown"
+admit = "delegation"
+states = { ready = "Todo", working = "Doing", needs_input = "Asked", review = "Review" }"#;
+        let (_dir, never) = project_tracked_by(&format!("{tracker}\n[forge]\nmerge = \"never\""));
+        let installed = |actions_write| AppGrants::Installed {
+            installation: 9,
+            contents_write: false,
+            actions_write,
+        };
+        for (grants, status, says) in [
+            (
+                installed(true),
+                Status::Ok,
+                "grants Actions (read and write), which watch's re-run of a red check needs",
+            ),
+            (
+                installed(false),
+                Status::Warn,
+                "installation 9 on github.com/pitchopp/owlshift has not granted Actions (read \
+                 and write): watch cannot re-run a failed check; a red check gets a fix run as \
+                 before",
+            ),
+            (AppGrants::NotInstalled, Status::Info, "no installation"),
+            (AppGrants::PersonalToken, Status::Info, "personal token"),
+        ] {
+            let report = run(&system().github_app_grants_are(Ok(grants)), &never);
+            let found = line(&report, "check re-runs");
+            assert_eq!(found.status, status, "{found:?}");
+            assert!(found.detail.contains(says), "{found:?}");
+            if status == Status::Warn {
+                assert!(
+                    matches!(&found.fix[..], [Step::Do(step)] if step.contains("Installed GitHub Apps")),
+                    "{found:?}"
+                );
+                assert!(
+                    found
+                        .why
+                        .as_deref()
+                        .is_some_and(|why| why.contains("Actions (read and write)")),
+                    "{found:?}"
+                );
+                assert!(report.ready(), "{report:?}");
+            }
         }
     }
 

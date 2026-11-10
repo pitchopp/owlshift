@@ -44,8 +44,8 @@ use owlshift_contracts::brief::MAX_EXCERPT_BYTES;
 use crate::forge::{
     BaseChecks, Branch, Capability, Check, CheckKind, CheckSet, CheckState, CommitId,
     DefaultBranch, Error, ErrorKind, InlineComment, MergeAnswer, MergeMethod, MergeRead, Mergeable,
-    PrState, PullRequest, PullRequestRead, RateLimit, Refusal, Repo, Review, ReviewDecision,
-    ReviewsRead,
+    PrState, PullRequest, PullRequestRead, RateLimit, Refusal, Repo, RerunAnswer, Review,
+    ReviewDecision, ReviewsRead,
 };
 pub use crate::graphql::{RateHeaders, Response, RestAnswer, Transport};
 
@@ -84,6 +84,10 @@ pub struct Installation {
     /// merge on green's merge needs (D14, OWL-445): its `permissions`
     /// reading `contents` `write` (C12 read them on 2026-10-19).
     pub contents_write: bool,
+    /// Whether it granted Actions (read and write), which the automatic
+    /// re-run of a red check needs (OWL-513): its `permissions` reading
+    /// `actions` `write`.
+    pub actions_write: bool,
 }
 
 /// A GitHub token: a fine-grained or classic personal access token, or the
@@ -241,13 +245,27 @@ impl Transport for HttpTransport {
         })
     }
 
-    /// Puts `body` at `path` and reads the answer whole, to 1 MiB. A
-    /// redirect is not followed: it is the answer, which a merge reads as
-    /// no verdict (OWL-444).
+    /// Puts `body` at `path`, the answer read whole to 1 MiB.
     fn put(&self, path: &str, body: &Value) -> Result<Response, String> {
-        let mut answer = self
-            .agent
-            .put(&format!("{REST_API}{path}"))
+        self.write(self.agent.put(&format!("{REST_API}{path}")), body)
+    }
+
+    /// Posts `body` to `path` (OWL-513), the answer read as a put's.
+    fn post(&self, path: &str, body: &Value) -> Result<Response, String> {
+        self.write(self.agent.post(&format!("{REST_API}{path}")), body)
+    }
+}
+
+impl HttpTransport {
+    /// Sends `request`, a REST write, with `body` and reads the answer
+    /// whole, to 1 MiB. A redirect is not followed: it is the answer, which
+    /// a merge reads as no verdict (OWL-444).
+    fn write(
+        &self,
+        request: ureq::RequestBuilder<ureq::typestate::WithBody>,
+        body: &Value,
+    ) -> Result<Response, String> {
+        let mut answer = request
             .header("Authorization", &format!("bearer {}", self.token.0))
             .header("Accept", "application/vnd.github+json")
             .send_json(body)
@@ -395,12 +413,22 @@ impl Channel {
     }
 
     /// A REST write. A 401 ran nothing, so the app's retry is safe.
-    fn put(&self, path: &str, body: &Value) -> Result<Response, Unanswered> {
+    fn write(&self, verb: Verb, path: &str, body: &Value) -> Result<Response, Unanswered> {
         self.via(
-            |transport| transport.put(path, body),
+            |transport| match verb {
+                Verb::Put => transport.put(path, body),
+                Verb::Post => transport.post(path, body),
+            },
             |answer| answer.status,
         )
     }
+}
+
+/// The HTTP verb of a REST write.
+#[derive(Clone, Copy)]
+enum Verb {
+    Put,
+    Post,
 }
 
 /// One GitHub repository, as seen through one token. It can open a pull
@@ -824,11 +852,30 @@ impl GitHubForge {
             self.repo.name()
         );
         let body = json!({ "sha": expected.as_str(), "merge_method": method.as_str() });
-        match self.channel.put(&path, &body) {
+        match self.channel.write(Verb::Put, &path, &body) {
             Ok(response) => merge_answer(&response),
             // The token source failed before anything was sent.
             Err(Unanswered::Source(error)) => Err(error),
             Err(Unanswered::Transport(e)) => Ok(MergeAnswer::NoVerdict {
+                reason: format!("GitHub gave no answer: {}", redact(&e)),
+            }),
+        }
+    }
+
+    /// Re-runs the failed jobs of workflow run `run`, and the jobs that
+    /// depend on them (OWL-513): `POST actions/runs/<run>/rerun-failed-jobs`,
+    /// which GitHub documents as answering 201 and needing Actions (write).
+    /// [`rerun_answer`] reads the answer.
+    pub fn rerun_failed_jobs(&self, run: u64) -> Result<RerunAnswer, Error> {
+        let path = format!(
+            "repos/{}/{}/actions/runs/{run}/rerun-failed-jobs",
+            self.repo.owner(),
+            self.repo.name()
+        );
+        match self.channel.write(Verb::Post, &path, &json!({})) {
+            Ok(response) => rerun_answer(&response),
+            Err(Unanswered::Source(error)) => Err(error),
+            Err(Unanswered::Transport(e)) => Ok(RerunAnswer::NoVerdict {
                 reason: format!("GitHub gave no answer: {}", redact(&e)),
             }),
         }
@@ -888,6 +935,10 @@ impl GitHubForge {
                     contents_write: installation
                         .permissions
                         .get("contents")
+                        .is_some_and(|level| level == "write"),
+                    actions_write: installation
+                        .permissions
+                        .get("actions")
                         .is_some_and(|level| level == "write"),
                 }));
             }
@@ -1202,7 +1253,7 @@ const FOLLOW_QUERY: &str = "query Follow($owner: String!, $name: String!, $numbe
     nodes { __typename \
     ... on CheckRun { databaseId name status conclusion \
     isRequired(pullRequestNumber: $number) detailsUrl \
-    checkSuite { app { slug } workflowRun { workflow { name } } } } \
+    checkSuite { app { slug } workflowRun { databaseId workflow { name } } } } \
     ... on StatusContext { context state description isRequired(pullRequestNumber: $number) \
     targetUrl } \
     } } } } } } } } }";
@@ -1517,6 +1568,9 @@ pub fn merge_answer(response: &Response) -> Result<MergeAnswer, Error> {
             .and_then(|e| e.message)
             .unwrap_or_default(),
     );
+    if let Some(error) = ran_nothing(response, &message) {
+        return Err(error);
+    }
     let refused = |may_pass| {
         Ok(MergeAnswer::Refused(Refusal {
             may_pass,
@@ -1535,14 +1589,6 @@ pub fn merge_answer(response: &Response) -> Result<MergeAnswer, Error> {
                 },
                 |commit| MergeAnswer::Merged { commit },
             )),
-        401 => Err(Error::new(
-            ErrorKind::Unauthorized,
-            format!("GitHub refused the token: HTTP 401 {message}"),
-        )),
-        429 => Err(rate_limited(status, response.rate, &message)),
-        403 if spent(status, response.rate, &message) => {
-            Err(rate_limited(status, response.rate, &message))
-        }
         // A timeout on the way: the merge may have run.
         408 => Ok(MergeAnswer::NoVerdict {
             reason: format!("GitHub answered HTTP 408 {message}"),
@@ -1558,6 +1604,62 @@ pub fn merge_answer(response: &Response) -> Result<MergeAnswer, Error> {
             reason: format!("GitHub answered HTTP {status} {message}"),
         }),
     }
+}
+
+/// The error of a REST write's answer that ran nothing and refuses no
+/// call of its own: a rejected token (HTTP 401, after the app's one retry)
+/// or a spent budget. `None` for any other answer. A merge
+/// ([`merge_answer`]) and a re-run ([`rerun_answer`]) read it first.
+fn ran_nothing(response: &Response, message: &str) -> Option<Error> {
+    let status = response.status;
+    match status {
+        401 => Some(Error::new(
+            ErrorKind::Unauthorized,
+            format!("GitHub refused the token: HTTP 401 {message}"),
+        )),
+        429 => Some(rate_limited(status, response.rate, message)),
+        403 if spent(status, response.rate, message) => {
+            Some(rate_limited(status, response.rate, message))
+        }
+        _ => None,
+    }
+}
+
+/// The start of GitHub's message refusing a call the credential has no
+/// permission for, as documented for a GitHub App's token.
+const NOT_ACCESSIBLE: &str = "Resource not accessible by";
+
+/// What GitHub's answer to a re-run of failed jobs says (OWL-513): started
+/// on a 2xx (GitHub documents 201), a refusal on a 4xx but 408, a permission
+/// refusal only on a 403 whose message says the resource is not accessible
+/// by the integration (or the personal token); no verdict otherwise. `Err`
+/// as for a merge: a rejected token or a spent budget.
+pub fn rerun_answer(response: &Response) -> Result<RerunAnswer, Error> {
+    let status = response.status;
+    let message = redact(
+        &serde_json::from_str::<Envelope>(&response.body)
+            .ok()
+            .and_then(|e| e.message)
+            .unwrap_or_default(),
+    );
+    if let Some(error) = ran_nothing(response, &message) {
+        return Err(error);
+    }
+    Ok(match status {
+        200..=299 => RerunAnswer::Started,
+        // A timeout on the way: the re-run may have started.
+        408 => RerunAnswer::NoVerdict {
+            reason: format!("GitHub answered HTTP 408 {message}"),
+        },
+        400..=499 => RerunAnswer::Refused {
+            permission: status == 403 && message.starts_with(NOT_ACCESSIBLE),
+            status,
+            message,
+        },
+        _ => RerunAnswer::NoVerdict {
+            reason: format!("GitHub answered HTTP {status} {message}"),
+        },
+    })
 }
 
 /// A spent budget's error, with when it resets.
@@ -2021,7 +2123,11 @@ struct Slug {
 }
 
 #[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct WorkflowRun {
+    /// Read by watch's query alone (OWL-513).
+    #[serde(default)]
+    database_id: Option<u64>,
     workflow: Named,
 }
 
@@ -2043,12 +2149,16 @@ impl Context {
                 check_suite,
             } => {
                 let state = check_run_state(&status, conclusion.as_deref());
-                let (app, workflow) = match check_suite {
-                    Some(suite) => (
-                        suite.app.map(|a| a.slug),
-                        suite.workflow_run.map(|w| w.workflow.name),
-                    ),
-                    None => (None, None),
+                let (app, workflow, run) = match check_suite {
+                    Some(suite) => {
+                        let run = suite.workflow_run.as_ref().and_then(|w| w.database_id);
+                        (
+                            suite.app.map(|a| a.slug),
+                            suite.workflow_run.map(|w| w.workflow.name),
+                            run,
+                        )
+                    }
+                    None => (None, None, None),
                 };
                 Check {
                     kind: CheckKind::CheckRun { app, workflow },
@@ -2062,6 +2172,7 @@ impl Context {
                     url: details_url,
                     id: database_id,
                     description: None,
+                    run,
                 }
             }
             Self::StatusContext {
@@ -2079,6 +2190,7 @@ impl Context {
                 url: target_url,
                 id: None,
                 description,
+                run: None,
             },
         }
     }
@@ -2774,8 +2886,8 @@ mod tests {
     #[test]
     fn the_apps_installation_is_found_by_slug_then_by_repository() {
         // Permissions as C12 read them (2026-10-19), Contents raised to
-        // write as C19 did (2026-10-23).
-        let two = r#"{"total_count":2,"installations":[{"id":7,"app_slug":"other-app"},{"id":9,"app_slug":"owl-shift","suspended_at":null,"permissions":{"contents":"write","metadata":"read","pull_requests":"write"}}]}"#;
+        // write as C19 did (2026-10-23), Actions as OWL-513 asks.
+        let two = r#"{"total_count":2,"installations":[{"id":7,"app_slug":"other-app"},{"id":9,"app_slug":"owl-shift","suspended_at":null,"permissions":{"actions":"write","contents":"write","metadata":"read","pull_requests":"write"}}]}"#;
         let others: Vec<String> = (0..100)
             .map(|i| format!(r#"{{"full_name":"owner/other{i}"}}"#))
             .collect();
@@ -2802,6 +2914,7 @@ mod tests {
                 id: 9,
                 suspended: false,
                 contents_write: true,
+                actions_write: true,
             })
         );
         // An installation that has not accepted Contents (write) yet.
@@ -2814,13 +2927,20 @@ mod tests {
                 r#"{"total_count":1,"repositories":[{"full_name":"owner/repo"}]}"#,
             ),
         ]);
-        assert!(
-            !forge
-                .app_installation("owl-shift")
-                .unwrap()
-                .unwrap()
-                .contents_write
-        );
+        let read_only = forge.app_installation("owl-shift").unwrap().unwrap();
+        assert!(!read_only.contents_write && read_only.actions_write);
+        // One that has not accepted Actions (write) yet (OWL-513).
+        let actions_read = two.replace(r#""actions":"write""#, r#""actions":"read""#);
+        let forge = paths(&[
+            (INSTALLATIONS, 200, actions_read.as_str()),
+            (
+                "user/installations/9/repositories?per_page=100&page=1",
+                200,
+                r#"{"total_count":1,"repositories":[{"full_name":"owner/repo"}]}"#,
+            ),
+        ]);
+        let installation = forge.app_installation("owl-shift").unwrap().unwrap();
+        assert!(installation.contents_write && !installation.actions_write);
 
         // Not listed by the app's installation, or no installation at all.
         let forge = paths(&[
@@ -3152,5 +3272,167 @@ mod tests {
         })
         .unwrap_err();
         assert!(error.resets_at.is_some(), "{error:?}");
+    }
+
+    /// Answers REST posts in order, keeping each path and body (OWL-513):
+    /// `Err` stands for no answer at all.
+    #[derive(Default)]
+    struct Posts {
+        answers: Mutex<Vec<Result<Response, String>>>,
+        posted: Mutex<Vec<(String, Value)>>,
+    }
+
+    impl Transport for Arc<Posts> {
+        fn send(&self, _: &Value) -> Result<Response, String> {
+            Err("no GraphQL here".to_owned())
+        }
+
+        fn post(&self, path: &str, body: &Value) -> Result<Response, String> {
+            self.posted
+                .lock()
+                .unwrap()
+                .push((path.to_owned(), body.clone()));
+            self.answers.lock().unwrap().remove(0)
+        }
+    }
+
+    fn posts(answers: Vec<Result<Response, String>>) -> (GitHubForge, Arc<Posts>) {
+        let posts = Arc::new(Posts {
+            answers: Mutex::new(answers),
+            ..Posts::default()
+        });
+        let repo = Repo::parse("Owner/Repo").unwrap();
+        (GitHubForge::with_transport(posts.clone(), repo), posts)
+    }
+
+    /// OWL-513: one post to the workflow run's `rerun-failed-jobs`, with
+    /// an empty body; GitHub's documented 201 starts it.
+    #[test]
+    fn rerun_failed_jobs_posts_to_the_workflow_run() {
+        let (forge, posts) = posts(vec![Ok(answer(201, ""))]);
+        assert_eq!(
+            forge.rerun_failed_jobs(42_378_288_167).unwrap(),
+            RerunAnswer::Started
+        );
+        assert_eq!(
+            *posts.posted.lock().unwrap(),
+            [(
+                "repos/Owner/Repo/actions/runs/42378288167/rerun-failed-jobs".to_owned(),
+                json!({})
+            )]
+        );
+    }
+
+    /// Only a 403 that says the resource is not accessible names the
+    /// permission; any other refusal is told as one.
+    #[test]
+    fn a_rerun_refused_for_its_permission_says_so() {
+        let refused = |status: u16, body: &str| {
+            let (forge, _) = posts(vec![Ok(answer(status, body))]);
+            forge.rerun_failed_jobs(7).unwrap()
+        };
+        assert_eq!(
+            refused(
+                403,
+                r#"{"message":"Resource not accessible by integration"}"#
+            ),
+            RerunAnswer::Refused {
+                permission: true,
+                status: 403,
+                message: "Resource not accessible by integration".to_owned(),
+            }
+        );
+        for (status, body) in [
+            (403, r#"{"message":"This workflow run is not completed"}"#),
+            (422, r#"{"message":"Unprocessable Entity"}"#),
+            (404, r#"{"message":"Not Found"}"#),
+        ] {
+            assert!(
+                matches!(
+                    refused(status, body),
+                    RerunAnswer::Refused {
+                        permission: false,
+                        ..
+                    }
+                ),
+                "HTTP {status} {body}"
+            );
+        }
+    }
+
+    /// No answer, or a server error, is no verdict, its words redacted; a
+    /// spent budget and a rejected token are errors, as for a merge.
+    #[test]
+    fn a_rerun_with_no_answer_has_no_verdict() {
+        let (forge, _) = posts(vec![Err(
+            "timeout at https://api.github.com/x?sig=SENTINEL".to_owned(),
+        )]);
+        let RerunAnswer::NoVerdict { reason } = forge.rerun_failed_jobs(7).unwrap() else {
+            panic!("a verdict");
+        };
+        assert!(!reason.contains("SENTINEL"), "{reason}");
+        // A server error, or a timeout on the way: the re-run may have
+        // started.
+        for (status, body) in [
+            (502, "<html>bad gateway</html>"),
+            (408, r#"{"message":"Request Timeout"}"#),
+        ] {
+            let (forge, _) = posts(vec![Ok(answer(status, body))]);
+            assert!(
+                matches!(
+                    forge.rerun_failed_jobs(7).unwrap(),
+                    RerunAnswer::NoVerdict { .. }
+                ),
+                "HTTP {status} {body}"
+            );
+        }
+
+        let spent = Response {
+            status: 403,
+            body: r#"{"message":"API rate limit exceeded"}"#.to_owned(),
+            rate: RateHeaders {
+                remaining: Some(0),
+                reset: Some(1_800_000_000),
+                retry_after: None,
+            },
+        };
+        let (forge, _) = posts(vec![Ok(spent)]);
+        assert_eq!(
+            forge.rerun_failed_jobs(7).unwrap_err().kind,
+            ErrorKind::RateLimited
+        );
+        let (forge, _) = posts(vec![Ok(answer(401, r#"{"message":"Bad credentials"}"#))]);
+        assert_eq!(
+            forge.rerun_failed_jobs(7).unwrap_err().kind,
+            ErrorKind::Unauthorized
+        );
+    }
+
+    /// Watch's read keeps each check run's workflow run (OWL-513); a node
+    /// without it, as every recorded fixture, reads none.
+    #[test]
+    fn follow_reads_each_check_runs_workflow_run() {
+        let with_run = RUN.replace(
+            r#""workflowRun":{"workflow"#,
+            r#""workflowRun":{"databaseId":42378288167,"workflow"#,
+        );
+        let (forge, canned) = forge(vec![page(
+            HEAD,
+            HEAD,
+            2,
+            &format!("{with_run},{RUN}"),
+            None,
+        )]);
+        let read = forge.follow(7).unwrap();
+        assert_eq!(read.checks.checks[0].run, Some(42_378_288_167));
+        assert_eq!(read.checks.checks[1].run, None);
+        let query = canned.requests.lock().unwrap()[0]["query"].clone();
+        assert!(
+            query
+                .as_str()
+                .unwrap()
+                .contains("workflowRun { databaseId workflow { name } }"),
+            "{query}"
+        );
     }
 }

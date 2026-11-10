@@ -595,6 +595,26 @@ fn build_widens_its_checks_once() {
     }
 }
 
+/// OWL-513: a fix run after the runner's re-run asks once about a failure
+/// still outside the branch, citing both attempts, and never asks for
+/// another re-run.
+#[test]
+fn build_cites_both_attempts_after_a_rerun() {
+    let text = build_prompt();
+    for rule in [
+        "When `check_failure.rerun` is present, the runner already re-ran these checks once",
+        "`check_failure.checks` are the second attempt's and `rerun.first` the first's",
+        "A failure still outside the branch is then asked about once, naming the check, the \
+         failing tests you read in the excerpt and both attempts' links, and never asking for \
+         another re-run.",
+    ] {
+        assert!(
+            text.contains(rule),
+            "roles/build.md no longer says {rule:?}"
+        );
+    }
+}
+
 /// Every dotted path the prompt writes as code, such as `checkpoint.plan` or
 /// `author.relation`, exists in the brief or `result.json`, from their root or
 /// from one of their definitions. The project config is left out on purpose:

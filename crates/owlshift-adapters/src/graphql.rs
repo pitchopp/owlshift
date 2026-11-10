@@ -83,6 +83,19 @@ pub trait Transport {
     /// transport and the fakes that stand in for a merge write REST.
     fn put(&self, path: &str, body: &Value) -> Result<Response, String> {
         let _ = body;
-        Err(format!("this transport writes no REST path ({path})"))
+        no_write(path)
     }
+
+    /// Posts the JSON `body` to `path` of the forge's REST API, such as
+    /// `repos/<owner>/<name>/actions/runs/<id>/rerun-failed-jobs`
+    /// (OWL-513), as [`Self::put`] puts it. Refused by default.
+    fn post(&self, path: &str, body: &Value) -> Result<Response, String> {
+        let _ = body;
+        no_write(path)
+    }
+}
+
+/// A transport's default refusal of a REST write.
+fn no_write(path: &str) -> Result<Response, String> {
+    Err(format!("this transport writes no REST path ({path})"))
 }

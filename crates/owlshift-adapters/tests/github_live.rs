@@ -39,7 +39,8 @@ use serde_json::json;
 use owlshift_adapters::forge::github::{GitHubForge, HttpTransport, NewPullRequest, Transport};
 use owlshift_adapters::forge::push::{Pushed, push_command, read_push};
 use owlshift_adapters::forge::{
-    Branch, CheckState, CommitId, ErrorKind, Mergeable, PrState, PullRequestRead, Repo, Verdict,
+    Branch, CheckState, CommitId, ErrorKind, Mergeable, PrState, PullRequestRead, Repo,
+    RerunAnswer, Verdict,
 };
 
 fn git(dir: &Path, args: &[&str]) -> String {
@@ -412,6 +413,202 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - run: echo the failing job; exit 1
+";
+
+/// OWL-513's pending live check: what GitHub answers a re-run of a
+/// workflow run's failed jobs, and how watch's read lists the attempts
+/// after it. It pushes a branch whose workflow has a passing leg, a failing
+/// leg and an aggregate `ci` job that needs both, opens a pull request,
+/// asks a re-run while the run is still in progress (its refusal is
+/// printed, F1 of the plan's review), then once it is red, and reads the
+/// pull request until the failing leg's new attempt has finished. The
+/// token needs Actions (write); the repository is a disposable one, as for
+/// `records_watch_reads`:
+///
+/// ```sh
+/// OWLSHIFT_LIVE_GITHUB=<owner>/<test-repo> \
+///   cargo test -p owlshift-adapters --test github_live -- --ignored --nocapture reruns_a_workflow_runs_failed_jobs
+/// ```
+#[test]
+#[ignore = "live: writes to GitHub and re-runs Actions; set OWLSHIFT_LIVE_GITHUB=<owner>/<test-repo>"]
+fn reruns_a_workflow_runs_failed_jobs() {
+    let repo = std::env::var("OWLSHIFT_LIVE_GITHUB")
+        .expect("this test writes to GitHub: name a disposable repository in OWLSHIFT_LIVE_GITHUB");
+    let repo = Repo::parse(&repo).unwrap();
+    let remote = std::env::var("OWLSHIFT_LIVE_GITHUB_REMOTE")
+        .unwrap_or_else(|_| format!("git@github.com:{repo}.git"));
+    let forge = GitHubForge::new(support::github_token(), repo.clone());
+
+    let dir = tempfile::tempdir().unwrap();
+    let checkout = dir.path().join("checkout");
+    let status = Command::new("git")
+        .args(["clone", "--quiet", "--branch", "main", &remote])
+        .arg(&checkout)
+        .status()
+        .unwrap();
+    assert!(status.success(), "cloning {remote}");
+    let stamp = jiff::Timestamp::now().as_second();
+    let branch = Branch::new(format!("owlshift-live-rerun-{stamp}")).unwrap();
+    let base = Branch::new("main").unwrap();
+    let workflows = checkout.join(".github/workflows");
+    std::fs::create_dir_all(&workflows).unwrap();
+    std::fs::write(workflows.join("owlshift-live.yml"), RERUN_WORKFLOW).unwrap();
+    git(&checkout, &["add", ".github/workflows/owlshift-live.yml"]);
+    let commit = commit_file(
+        &checkout,
+        "owlshift-live-rerun.txt",
+        &format!("run {stamp}\n"),
+        "A red workflow to re-run",
+    );
+    let mut cleanup = Cleanup {
+        checkout: &checkout,
+        branch: &branch,
+        pushed: false,
+        pull_request_id: None,
+    };
+    let mut push = push_command(Path::new("git"), &checkout, "origin", &commit, &branch).unwrap();
+    let pushed = read_push(&branch, &push.output().unwrap());
+    cleanup.pushed = pushed.is_ok();
+    assert_eq!(pushed, Ok(Pushed::Created));
+    let pr = forge
+        .open_pull_request(NewPullRequest {
+            head: &branch,
+            base: &base,
+            title: "Owlshift live test: a re-run",
+            body: "Opened by the Owlshift live test; closed at its end.\n",
+            draft: false,
+        })
+        .unwrap();
+    eprintln!("opened {}", pr.url);
+    cleanup.pull_request_id = Some(node_id(&repo, pr.number));
+
+    let listing = |read: &PullRequestRead| -> Vec<(String, Option<u64>, Option<u64>, CheckState)> {
+        read.checks
+            .checks
+            .iter()
+            .map(|c| (c.name.clone(), c.id, c.run, c.state))
+            .collect()
+    };
+    // The first check run that names its workflow run: a re-run while the
+    // run is in progress, whose answer is printed.
+    let mut read = forge.follow(pr.number).unwrap();
+    for _ in 0..60 {
+        if read.checks.checks.iter().any(|c| c.run.is_some()) {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_secs(2));
+        read = forge.follow(pr.number).unwrap();
+    }
+    let run = read
+        .checks
+        .checks
+        .iter()
+        .find_map(|c| c.run)
+        .expect("watch's read names the check runs' workflow run");
+    if read
+        .checks
+        .checks
+        .iter()
+        .any(|c| c.state == CheckState::Pending)
+    {
+        eprintln!(
+            "re-run while in progress: {:?}",
+            forge.rerun_failed_jobs(run)
+        );
+    }
+
+    let failed_first = |read: &PullRequestRead| {
+        read.checks
+            .checks
+            .iter()
+            .find(|c| c.name == "fails" && c.state == CheckState::Failed)
+            .and_then(|c| c.id)
+    };
+    let settled = |read: &PullRequestRead| {
+        read.checks.head == commit
+            && read.checks.checks.len() == 3
+            && read
+                .checks
+                .checks
+                .iter()
+                .all(|c| c.state != CheckState::Pending)
+    };
+    for _ in 0..60 {
+        if settled(&read) {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_secs(5));
+        read = forge.follow(pr.number).unwrap();
+    }
+    assert!(
+        settled(&read),
+        "the workflow did not finish: {:?}",
+        listing(&read)
+    );
+    eprintln!("red: {:?}", listing(&read));
+    let first = failed_first(&read).expect("the failing leg failed");
+    assert_eq!(read.checks.verdict(), Verdict::Red);
+
+    let answer = forge.rerun_failed_jobs(run).unwrap();
+    eprintln!("re-run: {answer:?}");
+    assert_eq!(answer, RerunAnswer::Started);
+
+    // Every listing until the failing leg's new attempt has finished.
+    let mut last = Vec::new();
+    let mut newer = None;
+    for _ in 0..120 {
+        std::thread::sleep(std::time::Duration::from_secs(5));
+        let read = forge.follow(pr.number).unwrap();
+        let now = listing(&read);
+        if now != last {
+            eprintln!("listed: {now:?}");
+            last = now;
+        }
+        newer = read
+            .checks
+            .checks
+            .iter()
+            .find(|c| {
+                c.name == "fails"
+                    && c.run == Some(run)
+                    && c.id.is_some_and(|id| id > first)
+                    && c.state != CheckState::Pending
+            })
+            .cloned();
+        if newer.is_some() && settled(&read) {
+            break;
+        }
+    }
+    let newer = newer.expect("a newer attempt of the failing leg, in the same workflow run");
+    eprintln!(
+        "newer attempt: id {:?} after {first}, run {:?}; whether the first attempt is still          listed, and whether `ci` was absent while the legs ran, are in the listings above",
+        newer.id, newer.run
+    );
+}
+
+/// The workflow `reruns_a_workflow_runs_failed_jobs` adds: a passing leg, a
+/// failing leg and an aggregate `ci` that needs both.
+const RERUN_WORKFLOW: &str = "\
+name: Owlshift live re-run
+on:
+  push:
+    branches-ignore: [main]
+permissions: {}
+jobs:
+  passes:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo the passing leg
+  fails:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo the failing leg; exit 1
+  ci:
+    if: always()
+    needs: [passes, fails]
+    runs-on: ubuntu-latest
+    steps:
+      - run: test \"${{ needs.fails.result }}\" = success
 ";
 
 /// Live check (c) of the build plan's "Watch after delivery" (OWL-112):

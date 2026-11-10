@@ -143,18 +143,18 @@ pub trait System {
             .map_err(|error| TokenTryError::Credential(error.to_string()))
             .and_then(|keychain| crate::forge::default_branch(&keychain, repo))
     }
-    /// What the project's GitHub credential gives merge on green's merge,
-    /// the GitHub App `slug`'s installation read over the network (OWL-445).
-    /// Only `owlshift doctor` asks, for a project whose `[forge] merge` is
-    /// not `never`.
-    fn github_merge_permission(
+    /// What the project's GitHub credential was granted, the GitHub App
+    /// `slug`'s installation read over the network: Contents (read and
+    /// write) for merge on green's merge (OWL-445), Actions (read and write)
+    /// for watch's re-run (OWL-513). Only `owlshift doctor` asks.
+    fn github_app_grants(
         &self,
         repo: &Repo,
         slug: &str,
-    ) -> Result<crate::forge::MergePermission, TokenTryError> {
+    ) -> Result<crate::forge::AppGrants, TokenTryError> {
         owlshift_platform::keychain::Keychain::system()
             .map_err(|error| TokenTryError::Credential(error.to_string()))
-            .and_then(|keychain| crate::forge::merge_permission(&keychain, repo, slug))
+            .and_then(|keychain| crate::forge::app_grants(&keychain, repo, slug))
     }
     /// The ticket refs of the project whose repository is at `root`, each
     /// with its state ([`ticket_ref::states`]), read in its dedicated
@@ -452,7 +452,7 @@ pub(crate) mod fake {
         github_default_branch: Option<Result<DefaultBranch, TokenTryError>>,
         /// What the GitHub App's installation grants merge on green
         /// (OWL-445); `None`: Contents (read and write).
-        github_merge_permission: Option<Result<crate::forge::MergePermission, TokenTryError>>,
+        github_app_grants: Option<Result<crate::forge::AppGrants, TokenTryError>>,
         /// The repository `origin` names; `None`: `pitchopp/owlshift`.
         origin: Option<Result<Repo, String>>,
         /// What reading the project's ticket refs gives; `None`: no
@@ -628,13 +628,13 @@ pub(crate) mod fake {
             self
         }
 
-        /// Reading the GitHub App's installation for merge on green gives
-        /// this (OWL-445).
-        pub(crate) fn github_merge_permission_is(
+        /// Reading the GitHub App's installation gives this (OWL-445,
+        /// OWL-513).
+        pub(crate) fn github_app_grants_are(
             mut self,
-            answer: Result<crate::forge::MergePermission, TokenTryError>,
+            answer: Result<crate::forge::AppGrants, TokenTryError>,
         ) -> Self {
-            self.github_merge_permission = Some(answer);
+            self.github_app_grants = Some(answer);
             self
         }
 
@@ -881,15 +881,20 @@ pub(crate) mod fake {
             })
         }
 
-        /// As [`Self::github_merge_permission_is`] scripted it.
-        fn github_merge_permission(
+        /// As [`Self::github_app_grants_are`] scripted it: by default an
+        /// installation that granted both.
+        fn github_app_grants(
             &self,
             _repo: &Repo,
             _slug: &str,
-        ) -> Result<crate::forge::MergePermission, TokenTryError> {
-            self.github_merge_permission
+        ) -> Result<crate::forge::AppGrants, TokenTryError> {
+            self.github_app_grants
                 .clone()
-                .unwrap_or(Ok(crate::forge::MergePermission::Granted))
+                .unwrap_or(Ok(crate::forge::AppGrants::Installed {
+                    installation: 9,
+                    contents_write: true,
+                    actions_write: true,
+                }))
         }
 
         #[cfg(unix)]

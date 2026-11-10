@@ -1394,10 +1394,17 @@ impl Watch<'_> {
         else {
             return;
         };
+        // The outcome of the head's re-run, told before any repair (OWL-513).
+        let Some(at) =
+            on_demand.post_rerun_report(ticket, stored, &seen, at, &mut memory.following, sink)
+        else {
+            return;
+        };
         if !matches!(
             seen.decision,
             Decision::Follow {
                 action: Action::Fix { .. }
+                    | Action::Rerun
                     | Action::Park
                     | Action::Rebase { .. }
                     | Action::RebaseFailed { .. },
@@ -1447,9 +1454,11 @@ impl Watch<'_> {
             .failing_for
             .map(|failing| u64::try_from(failing.as_millis()).unwrap_or(u64::MAX));
         // A park runs no model: a usage limit never holds it (OWL-404).
+        // Nor a re-run (OWL-513): a refused one's fix run is held by its own
+        // usage admission, as a fix's below.
         let first = match &seen.decision {
             Decision::Follow {
-                action: Action::Park,
+                action: Action::Park | Action::Rerun,
                 ..
             } => None,
             // Nor a rebase whose gate the machine cut, kept by a rebase's
