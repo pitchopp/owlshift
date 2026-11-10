@@ -27,8 +27,11 @@ impl OnDemand<'_> {
     /// a call with no verdict keeps the claim, warned of, and stops the
     /// same way, the hour's `unseen` outcome bounding the wait; a spent
     /// budget before any run started gives the claim back. A refusal keeps
-    /// the outcome `refused` with GitHub's words, warned of, and returns
-    /// the delivery as kept, for the fix run that follows.
+    /// the outcome `refused` with GitHub's words and returns the delivery as
+    /// kept, for the fix run that follows. Each refusal is warned of once
+    /// per ticket while watch runs, again when GitHub's words change
+    /// ([`Following::rerun_refused`]).
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn rerun_checks(
         &self,
         p: &mut Prepared,
@@ -36,6 +39,7 @@ impl OnDemand<'_> {
         delivery: &TicketDelivery,
         pr: &DeliveredPullRequest,
         fresh: &follow::Fresh,
+        following: &mut Following,
         sink: &mut EventSink<'_>,
     ) -> Result<RerunRefused, Stop> {
         let ticket = p.ticket.clone();
@@ -131,19 +135,21 @@ impl OnDemand<'_> {
                         rerun.reason = Some(reason.clone());
                     }
                     self.keep_rerun(p, state, &claimed)?;
-                    sink.emit(
-                        &ticket,
-                        None,
-                        EventKind::Warning,
-                        data([
-                            ("what", json!("rerun_refused")),
-                            ("pull_request", json!(pr.number)),
-                            ("head", json!(head)),
-                            ("run", json!(run)),
-                            ("permission", json!(permission)),
-                            ("reason", json!(reason)),
-                        ]),
-                    );
+                    if following.rerun_refused(&ticket, &reason) {
+                        sink.emit(
+                            &ticket,
+                            None,
+                            EventKind::Warning,
+                            data([
+                                ("what", json!("rerun_refused")),
+                                ("pull_request", json!(pr.number)),
+                                ("head", json!(head)),
+                                ("run", json!(run)),
+                                ("permission", json!(permission)),
+                                ("reason", json!(reason)),
+                            ]),
+                        );
+                    }
                     return Ok(RerunRefused { delivery: claimed });
                 }
                 // A later run refused after one started: its jobs show no
@@ -154,19 +160,22 @@ impl OnDemand<'_> {
                     status,
                     message,
                 } => {
-                    sink.emit(
-                        &ticket,
-                        None,
-                        EventKind::Warning,
-                        data([
-                            ("what", json!("rerun_refused")),
-                            ("pull_request", json!(pr.number)),
-                            ("head", json!(head)),
-                            ("run", json!(run)),
-                            ("permission", json!(permission)),
-                            ("reason", json!(format!("HTTP {status} {message}"))),
-                        ]),
-                    );
+                    let reason = format!("HTTP {status} {message}");
+                    if following.rerun_refused(&ticket, &reason) {
+                        sink.emit(
+                            &ticket,
+                            None,
+                            EventKind::Warning,
+                            data([
+                                ("what", json!("rerun_refused")),
+                                ("pull_request", json!(pr.number)),
+                                ("head", json!(head)),
+                                ("run", json!(run)),
+                                ("permission", json!(permission)),
+                                ("reason", json!(reason)),
+                            ]),
+                        );
+                    }
                 }
             }
         }

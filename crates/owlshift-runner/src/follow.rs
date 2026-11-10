@@ -429,6 +429,10 @@ pub struct Following {
     /// The head and the refusal of the RERUN comment last warned of, per
     /// ticket (OWL-513).
     rerun_unposted: HashMap<TicketId, (String, String)>,
+    /// GitHub's refusal of the automatic re-run last warned of, per ticket
+    /// (OWL-513): a refusal for the permission is warned of once per ticket,
+    /// whatever head it refuses.
+    rerun_refused: HashMap<TicketId, String>,
 }
 
 /// `[forge] merge` and `merge_method` as read at a commit (OWL-445).
@@ -758,10 +762,22 @@ impl Following {
         self.rerun_unposted.remove(ticket);
     }
 
+    /// Whether GitHub's refusal of a re-run of `ticket`'s checks, `reason`,
+    /// is to be warned of: the first one for the ticket, or one whose words
+    /// changed since the last warned of (OWL-513). Keeps it as warned of.
+    pub fn rerun_refused(&mut self, ticket: &TicketId, reason: &str) -> bool {
+        if self.rerun_refused.get(ticket).map(String::as_str) == Some(reason) {
+            return false;
+        }
+        self.rerun_refused.insert(ticket.clone(), reason.to_owned());
+        true
+    }
+
     /// What a step of `ticket` in a child process changes of this memory
     /// (OWL-399): its moved stage (OWL-219), its owed report's refusal
-    /// (OWL-232), and the forge's pause, handed to the child and merged
-    /// back from its outcome ([`Self::keep`]).
+    /// (OWL-232), the re-run's refusal warned of (OWL-513), and the forge's
+    /// pause, handed to the child and merged back from its outcome
+    /// ([`Self::keep`]).
     pub fn kept(&self, ticket: &TicketId) -> KeptFollowing {
         KeptFollowing {
             moved: self.moved.get(ticket).cloned(),
@@ -773,12 +789,13 @@ impl Following {
                     reason: reason.clone(),
                 }),
             paused_until: self.paused_until,
+            rerun_refused: self.rerun_refused.get(ticket).cloned(),
         }
     }
 
     /// Takes `kept`, what a step of `ticket` left ([`Self::kept`]): the
-    /// ticket's moved stage and owed report's refusal as it says, and the
-    /// later of the two pauses.
+    /// ticket's moved stage, owed report's refusal and re-run's refusal as
+    /// it says, and the later of the two pauses.
     pub fn keep(&mut self, ticket: &TicketId, kept: KeptFollowing) {
         match kept.moved {
             Some(stage) => self.moved.insert(ticket.clone(), stage),
@@ -789,6 +806,10 @@ impl Following {
                 self.unposted.insert(ticket.clone(), (commit, reason))
             }
             None => self.unposted.remove(ticket),
+        };
+        match kept.rerun_refused {
+            Some(reason) => self.rerun_refused.insert(ticket.clone(), reason),
+            None => self.rerun_refused.remove(ticket),
         };
         self.paused_until = self.paused_until.max(kept.paused_until);
     }
@@ -1048,6 +1069,7 @@ impl Following {
         self.green_since.remove(ticket);
         self.merge.remove(ticket);
         self.rerun_unposted.remove(ticket);
+        self.rerun_refused.remove(ticket);
     }
 
     /// Forgets the tickets `kept` does not name.
@@ -1060,6 +1082,7 @@ impl Following {
         self.unposted.retain(|t, _| kept.contains(t));
         self.reviews_unread.retain(|t, _| kept.contains(t));
         self.rerun_unposted.retain(|t, _| kept.contains(t));
+        self.rerun_refused.retain(|t, _| kept.contains(t));
         self.green_since.retain(|t, _| kept.contains(t));
         self.merge.retain(|t, _| kept.contains(t));
     }
@@ -1667,6 +1690,30 @@ mod tests {
         assert!(following.report_unposted(&ticket(), "c2", "rate limited"));
         following.forget(&ticket());
         assert!(following.report_unposted(&ticket(), "c2", "rate limited"));
+    }
+
+    /// GitHub's refusal of a re-run is warned of once per ticket, whatever
+    /// head it refuses, again when its words change, and the memory crosses
+    /// a step's child as its envelope and outcome carry it (OWL-513).
+    #[test]
+    fn a_rerun_refusal_is_warned_of_once() {
+        let permission = "HTTP 403 Resource not accessible by integration";
+        let mut following = Following::default();
+        assert!(following.rerun_refused(&ticket(), permission));
+        assert!(!following.rerun_refused(&ticket(), permission));
+        // A step's child starts from what watch hands it, and gives back
+        // what it warned of.
+        let mut child = Following::default();
+        child.keep(&ticket(), following.kept(&ticket()));
+        assert!(!child.rerun_refused(&ticket(), permission));
+        assert!(child.rerun_refused(&ticket(), "HTTP 422 Unprocessable Entity"));
+        following.keep(&ticket(), child.kept(&ticket()));
+        assert!(!following.rerun_refused(&ticket(), "HTTP 422 Unprocessable Entity"));
+        assert!(following.rerun_refused(&ticket(), permission));
+        following.forget(&ticket());
+        assert!(following.rerun_refused(&ticket(), permission));
+        following.retain(&[]);
+        assert!(following.rerun_refused(&ticket(), permission));
     }
 
     #[test]

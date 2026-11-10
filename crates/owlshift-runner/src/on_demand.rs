@@ -6883,7 +6883,8 @@ impl OnDemand<'_> {
             // The automatic re-run (OWL-513): a refusal goes on to the fix
             // run, on the delivery as the ref now keeps it.
             FollowAction::Rerun => {
-                let refused = self.rerun_checks(p, &state, &delivery, &pr, &fresh, sink)?;
+                let refused =
+                    self.rerun_checks(p, &state, &delivery, &pr, &fresh, following, sink)?;
                 delivery = refused.delivery;
                 action = FollowAction::Fix {
                     overdue: Vec::new(),

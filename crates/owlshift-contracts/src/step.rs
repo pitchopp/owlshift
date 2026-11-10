@@ -103,9 +103,9 @@ pub enum Shown {
 }
 
 /// What watch keeps of a ticket's pull request that a repair or a
-/// correction updates (OWL-219, OWL-232), and the forge's pause, which a
-/// read of the reviews may set: handed to the child and merged back from
-/// its outcome.
+/// correction updates (OWL-219, OWL-232, OWL-513), and the forge's pause,
+/// which a read of the reviews may set: handed to the child and merged back
+/// from its outcome.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct KeptFollowing {
@@ -118,6 +118,9 @@ pub struct KeptFollowing {
     /// No forge read before then: a rate-limited answer.
     #[serde(default)]
     pub paused_until: Option<Timestamp>,
+    /// GitHub's refusal of the automatic re-run last warned of (OWL-513).
+    #[serde(default)]
+    pub rerun_refused: Option<String>,
 }
 
 /// The commit of an owed report and the refusal warned of.
@@ -719,6 +722,7 @@ mod tests {
                     reason: "the tracker is down".to_owned(),
                 }),
                 paused_until: Some("2026-10-20T10:00:00Z".parse().unwrap()),
+                rerun_refused: Some("HTTP 403 Resource not accessible by integration".to_owned()),
             },
         }
     }

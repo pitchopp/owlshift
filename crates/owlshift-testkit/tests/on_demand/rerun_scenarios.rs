@@ -261,29 +261,54 @@ fn a_red_the_base_shares_waits_then_refreshes_once_the_base_passes() {
 
 /// A re-run GitHub refuses for its permission: one `rerun_refused`
 /// warning, and the fix run in the same pass, as before OWL-513; the ref
-/// keeps the refusal.
+/// keeps the refusal. The fix's head, red again and refused again, gets
+/// its own call and fix run, and no second warning while watch runs.
 #[test]
 fn a_rerun_refused_for_its_permission_runs_the_fix_with_one_warning() {
     let bench = red_jobs(vec![job("ci", 10, "FAILURE")]);
     bench.github.jobs.lock().unwrap().answer = (403, "Resource not accessible by integration");
     let first_push = bench.remote_branch().unwrap();
+    let github = bench.github.clone();
+    let mut pass = 0;
+    let mut second_push = None;
     let (outcomes, lines, printed) = bench.watch_passes(
-        vec![bench.reply(Some("Hello again"), Some(FIXED))],
-        &mut |_| false,
+        vec![
+            bench.reply(Some("Hello again"), Some(FIXED)),
+            bench.reply(Some("Hello once more"), Some(FIXED)),
+        ],
+        &mut |_| {
+            pass += 1;
+            let pushed = bench.remote_branch().unwrap();
+            if pushed != first_push && second_push.is_none() {
+                // CI ran on the fix's head: red again, another job.
+                github.jobs.lock().unwrap().first = vec![job("ci", 20, "FAILURE")];
+                second_push = Some(pushed);
+            }
+            github.jobs.lock().unwrap().calls.len() < 2 && pass < 6
+        },
     );
-    assert_eq!(bench.github.jobs.lock().unwrap().calls, [RUN]);
+    assert_eq!(
+        bench.github.jobs.lock().unwrap().calls,
+        [RUN, RUN],
+        "{outcomes:?}\n{lines}\n{printed}"
+    );
     let refused = warnings(&bench, "rerun_refused");
     assert_eq!(refused.len(), 1, "{refused:?}\n{lines}\n{printed}");
     assert_eq!(refused[0]["permission"], true);
-    // The fix run, in the same pass, briefed with no re-run.
+    assert_eq!(refused[0]["head"], first_push.as_str());
+    // A fix run for each head, in the pass that called, briefed with no
+    // re-run.
     let briefs = bench.briefs();
-    assert_eq!(briefs.len(), 3, "{outcomes:?}\n{lines}\n{printed}");
-    let failure = briefs[2].check_failure.as_ref().expect("a fix run");
-    assert!(failure.rerun.is_none(), "{failure:?}");
-    assert_ne!(bench.remote_branch().unwrap(), first_push);
-    assert_eq!(state_of(&bench).fix_passes(), 1);
+    assert_eq!(briefs.len(), 4, "{outcomes:?}\n{lines}\n{printed}");
+    for brief in &briefs[2..] {
+        let failure = brief.check_failure.as_ref().expect("a fix run");
+        assert!(failure.rerun.is_none(), "{failure:?}");
+    }
+    let second_push = second_push.expect("the first fix pushed");
+    assert_ne!(bench.remote_branch().unwrap(), second_push);
+    assert_eq!(state_of(&bench).fix_passes(), 2);
     let rerun = bench.record().delivery.unwrap().rerun.unwrap();
-    assert_eq!(rerun.head, first_push);
+    assert_eq!(rerun.head, second_push);
     assert_eq!(rerun.outcome, Some(RerunOutcomeKind::Refused));
     assert!(
         rerun
