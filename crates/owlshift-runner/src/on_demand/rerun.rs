@@ -378,7 +378,7 @@ impl OnDemand<'_> {
     }
 
     /// For `owlshift watch`, right after the owed report: settles the
-    /// re-run of the head `seen` read ([`Self::settle_rerun_of`]) under the
+    /// re-run of the head `seen` read, as `continue` does, under the
     /// project's lock and the ticket's, while the ticket ref is still at
     /// `at`'s commit, and keeps what changed. Nothing is locked or read
     /// unless the ref, as `stored` keeps it, has that head's re-run with an

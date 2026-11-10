@@ -245,12 +245,12 @@ impl Transport for HttpTransport {
         })
     }
 
-    /// Puts `body` at `path` ([`Self::write`]).
+    /// Puts `body` at `path`, the answer read whole to 1 MiB.
     fn put(&self, path: &str, body: &Value) -> Result<Response, String> {
         self.write(self.agent.put(&format!("{REST_API}{path}")), body)
     }
 
-    /// Posts `body` to `path` ([`Self::write`], OWL-513).
+    /// Posts `body` to `path` (OWL-513), the answer read as a put's.
     fn post(&self, path: &str, body: &Value) -> Result<Response, String> {
         self.write(self.agent.post(&format!("{REST_API}{path}")), body)
     }
@@ -1630,10 +1630,10 @@ fn ran_nothing(response: &Response, message: &str) -> Option<Error> {
 const NOT_ACCESSIBLE: &str = "Resource not accessible by";
 
 /// What GitHub's answer to a re-run of failed jobs says (OWL-513): started
-/// on HTTP 201, a refusal on another 4xx, a permission refusal only on a
-/// 403 whose message says the resource is not accessible by the
-/// integration (or the personal token); no verdict otherwise. `Err` as for
-/// a merge ([`ran_nothing`]).
+/// on a 2xx (GitHub documents 201), a refusal on another 4xx, a permission
+/// refusal only on a 403 whose message says the resource is not accessible
+/// by the integration (or the personal token); no verdict otherwise. `Err`
+/// as for a merge: a rejected token or a spent budget.
 pub fn rerun_answer(response: &Response) -> Result<RerunAnswer, Error> {
     let status = response.status;
     let message = redact(
