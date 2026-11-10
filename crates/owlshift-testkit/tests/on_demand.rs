@@ -2322,6 +2322,7 @@ fn a_ticket_becomes_a_pull_request_with_its_report() {
         kind: owlshift_contracts::refs::PushKind::Delivery,
         base: bench.remote_main(),
         onto: None,
+        rebased: None,
         report: None,
     });
     cut.delivery = Some(pushing);
@@ -8976,6 +8977,7 @@ fn a_crashed_fix_push(bench: &Bench, owed: Option<owlshift_contracts::refs::Owed
         kind: owlshift_contracts::refs::PushKind::Fix,
         base: bench.remote_main(),
         onto: None,
+        rebased: None,
         report: Some(owlshift_contracts::refs::KeptReport {
             summary: "Kept the greeting on every platform.".to_owned(),
             gate: Some(vec!["git grep -q Hello".to_owned()]),

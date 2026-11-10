@@ -41,7 +41,7 @@
     "format": {
       "description": "The format version of this document.",
       "type": "integer",
-      "const": 7
+      "const": 8
     },
     "merge_retry": {
       "description": "When a person's `owlshift continue` at Watch last asked for the\nmerge to be tried again (format 6, OWL-445): watch tries again a head\nwhose merge GitHub refused for good before then. Not a refusal: those\nlive in watch's memory only.",
@@ -457,6 +457,13 @@
         },
         "onto": {
           "description": "For a rebase run's push, the base commit the run rebased onto:\n`rebased_onto` once the push lands or is adopted (OWL-210).",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "rebased": {
+          "description": "For a rebase run's push, the commit the rebase run itself made, its\ngated commit (`run_ended`'s `gate_commit`): the one the delivery\ncheck reads, the pushed `commit` descending from it when a Verify\npass and its last fix followed the rebase in its cycle (OWL-514).\nAbsent from a push kept by an older binary, whose head is checked.\nSince format 8.",
           "type": [
             "string",
             "null"

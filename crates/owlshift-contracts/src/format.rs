@@ -99,8 +99,9 @@ pub const QUESTIONS_FORMAT: u32 = 18;
 /// correction's owed report that pushed nothing (OWL-236); format 5 a review
 /// loop's push and its report's answered `reviews` (OWL-300); format 6 merge
 /// on green's `merging` and `merge_retry` (OWL-445); format 7 the automatic
-/// re-run's `rerun` (OWL-513); formats 1 to 6 are still read.
-pub const DELIVERY_FORMAT: u32 = 7;
+/// re-run's `rerun` (OWL-513); format 8 the rebase run's commit,
+/// `pushing.rebased` (OWL-514); formats 1 to 7 are still read.
+pub const DELIVERY_FORMAT: u32 = 8;
 /// The format version of a ticket's intake record (`intake.json` on a ticket
 /// ref, OWL-245). Format 2 adds the `zones` and `resources` intake declared
 /// (OWL-402); format 1 is still read, as holding the whole repository.

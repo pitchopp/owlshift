@@ -6296,6 +6296,7 @@ impl OnDemand<'_> {
             kind: PushKind::Delivery,
             base: base_at_push.clone(),
             onto: None,
+            rebased: None,
             report: None,
         });
         let questions = p.questions();
@@ -7813,6 +7814,7 @@ impl OnDemand<'_> {
                 | RepairKind::Review { .. } => None,
                 RepairKind::Rebase { onto } => Some(onto.to_string()),
             },
+            rebased: None,
             report: Some(report),
         });
         let questions = p.questions();

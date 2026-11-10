@@ -1931,6 +1931,7 @@ mod tests {
             kind: PushKind::Fix,
             base: BASE.to_owned(),
             onto: None,
+            rebased: None,
             report: None,
         });
         let adopted = seen_with(
@@ -2031,6 +2032,7 @@ mod tests {
             kind: PushKind::Delivery,
             base: BASE.to_owned(),
             onto: None,
+            rebased: None,
             report: None,
         });
         let first = changed(&record(first, watching(0)), pipeline, &adopted, at(0))
@@ -2045,6 +2047,7 @@ mod tests {
             kind: PushKind::Rebase,
             base: BASE.to_owned(),
             onto: Some(ONTO.to_owned()),
+            rebased: None,
             report: None,
         });
         let rebased = changed(&record(rebase, watching(1)), pipeline, &adopted, at(0))
@@ -2254,6 +2257,7 @@ mod tests {
             kind: PushKind::Review,
             base: BASE.to_owned(),
             onto: None,
+            rebased: None,
             report: Some(KeptReport {
                 summary: "Renamed it.".to_owned(),
                 gate: Some(Vec::new()),
