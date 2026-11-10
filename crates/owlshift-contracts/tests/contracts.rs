@@ -3477,7 +3477,7 @@ fn a_ticket_delivery_round_trips_and_is_checked() {
     .unwrap();
     assert!(older.owed.is_none() && older.pushing.as_ref().unwrap().report.is_none());
     assert!(
-        older.render().contains("\"format\": 7"),
+        older.render().contains("\"format\": 8"),
         "{}",
         older.render()
     );
@@ -3509,7 +3509,7 @@ fn a_ticket_delivery_round_trips_and_is_checked() {
     // in format 1. Format 3 keeps one, whose report names its questions,
     // and only a correction's report does.
     let older = parse(|v| v["format"] = json!(2)).unwrap();
-    assert!(older.render().starts_with("{\n  \"format\": 7,"));
+    assert!(older.render().starts_with("{\n  \"format\": 8,"));
     let refused: [(&str, Edit); 3] = [
         ("correction's push", |v| {
             v["format"] = json!(2);
@@ -3741,6 +3741,61 @@ fn a_ticket_delivery_round_trips_and_is_checked() {
         ("told unsettled", rerun(None, true), "no outcome to tell"),
     ] {
         rejects(case, with(rerun), needle);
+    }
+    // OWL-514: format 8 keeps, for a rebase's push under way, the commit its
+    // rebase run made, a full id, and no other push keeps one; a format-7
+    // document is read without it, and one that keeps it is refused.
+    fn rebase_push(v: &mut Value) {
+        v["pushing"]["kind"] = json!("rebase");
+        v["pushing"]["onto"] = json!("c0c0867c0c0867c0c0867c0c0867c0c0867c0c08");
+        v["pushing"]["report"]
+            .as_object_mut()
+            .unwrap()
+            .remove("checks");
+    }
+    let rebased = parse(|v| {
+        rebase_push(v);
+        v["pushing"]["rebased"] = json!("4444444444444444444444444444444444444444");
+    })
+    .unwrap();
+    assert_eq!(
+        rebased.pushing.as_ref().unwrap().rebased.as_deref(),
+        Some("4444444444444444444444444444444444444444")
+    );
+    assert_eq!(TicketDelivery::parse(&rebased.render()).unwrap(), rebased);
+    let older = parse(|v| {
+        rebase_push(v);
+        v["format"] = json!(7);
+    })
+    .unwrap();
+    assert!(older.pushing.as_ref().unwrap().rebased.is_none());
+    assert!(older.render().starts_with("{\n  \"format\": 8,"));
+    let refused: [(&str, Edit, &str); 3] = [
+        (
+            "a format-7 rebase run's commit",
+            |v| {
+                rebase_push(v);
+                v["format"] = json!(7);
+                v["pushing"]["rebased"] = json!("4444444444444444444444444444444444444444");
+            },
+            "format 7 keeps no pushing.rebased",
+        ),
+        (
+            "a fix's push naming a rebase run's commit",
+            |v| v["pushing"]["rebased"] = json!("4444444444444444444444444444444444444444"),
+            "only a rebase's push under way names the commit its rebase run made",
+        ),
+        (
+            "a short rebase run's commit",
+            |v| {
+                rebase_push(v);
+                v["pushing"]["rebased"] = json!("4444444");
+            },
+            "pushing.rebased \"4444444\" is not a full commit id",
+        ),
+    ];
+    for (case, edit, reason) in refused {
+        rejects(case, parse(edit), reason);
     }
 }
 

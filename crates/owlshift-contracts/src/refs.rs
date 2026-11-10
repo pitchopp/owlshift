@@ -2007,6 +2007,14 @@ pub struct Pushing {
     /// `rebased_onto` once the push lands or is adopted (OWL-210).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub onto: Option<String>,
+    /// For a rebase run's push, the commit the rebase run itself made, its
+    /// gated commit (`run_ended`'s `gate_commit`): the one the delivery
+    /// check reads, the pushed `commit` descending from it when a Verify
+    /// pass and its last fix followed the rebase in its cycle (OWL-514).
+    /// Absent from a push kept by an older binary, whose head is checked.
+    /// Since format 8.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rebased: Option<String>,
     /// What a fix, rebase or correction run's DELIVERY report says, kept
     /// before the push so a push a crash cut short is still reported once
     /// adopted (OWL-218). Since format 2.
@@ -2152,8 +2160,9 @@ impl TicketDelivery {
     /// one, written before a review loop's push (OWL-300), without one, and
     /// a format-5 one, written before merge on green (OWL-445), without a
     /// merge under way or a retry, and a format-6 one, written before the
-    /// automatic re-run (OWL-513), without one; the next write gives it the
-    /// current format.
+    /// automatic re-run (OWL-513), without one, and a format-7 one, written
+    /// before a rebase's push kept its rebase run's commit (OWL-514),
+    /// without one; the next write gives it the current format.
     pub fn parse(input: &str) -> Result<Self, ContractError> {
         let delivery: Self = match Self::from_older_format(input) {
             Some(read) => read?,
@@ -2163,23 +2172,25 @@ impl TicketDelivery {
         Ok(delivery)
     }
 
-    /// A format-1 to 6 document read as the current format, or `None` for
+    /// A format-1 to 7 document read as the current format, or `None` for
     /// any other. Format 1 is format 2 without `owed` and `pushing.report`,
     /// format 2 is format 3 without a correction's push or report, format 3
     /// is format 4 without an owed delivery report, a report's `notes` or an
     /// owed report's `unchanged`, and format 4 is format 5 without a review
     /// loop's push, a report's `reviews` or `delivered_at` (OWL-307), and
     /// format 5 is format 6 without `merging` or `merge_retry` (OWL-445), and
-    /// format 6 is format 7 without `rerun` (OWL-513), so each is refused in
+    /// format 6 is format 7 without `rerun` (OWL-513), and format 7 is
+    /// format 8 without `pushing.rebased` (OWL-514), so each is refused in
     /// an older format.
     fn from_older_format(input: &str) -> Option<Result<Self, ContractError>> {
         let mut document: serde_json::Value = serde_json::from_str(input).ok()?;
         let fields = document.as_object_mut()?;
         let format = fields.get("format").and_then(serde_json::Value::as_u64)?;
-        if !(1..=6).contains(&format) {
+        if !(1..=7).contains(&format) {
             return None;
         }
         let pushing = fields.get("pushing").and_then(serde_json::Value::as_object);
+        let rebased = pushing.is_some_and(|pushing| pushing.contains_key("rebased"));
         let owed = fields.get("owed").and_then(serde_json::Value::as_object);
         let report = pushing.is_some_and(|pushing| pushing.contains_key("report"));
         let reports = || {
@@ -2228,7 +2239,8 @@ impl TicketDelivery {
             ("delivered_at", format <= 4 && delivered_at),
             ("merging", format <= 5 && merging),
             ("merge_retry", format <= 5 && merge_retry),
-            ("rerun", rerun),
+            ("rerun", format <= 6 && rerun),
+            ("pushing.rebased", rebased),
         ] {
             if kept {
                 return Some(Err(ContractError::invalid(
@@ -2257,7 +2269,8 @@ impl TicketDelivery {
 
     /// Checks the commits are full ids, the branches git branch names, the
     /// link a plain `https://` URL, that a push under way names its `onto`
-    /// exactly when it is a rebase's and keeps a report only for a fix, a
+    /// exactly when it is a rebase's, and its rebase run's commit only then
+    /// (OWL-514), and keeps a report only for a fix, a
     /// rebase, a correction or a review loop, that an owed report counts
     /// from 1 (exactly 1 for a delivery or a review loop), of a pushed commit
     /// with its pull request (and for a rebase its base), and is unchanged
@@ -2292,6 +2305,10 @@ impl TicketDelivery {
                 self.pushing.as_ref().and_then(|p| p.onto.as_deref()),
             ),
             (
+                "pushing.rebased",
+                self.pushing.as_ref().and_then(|p| p.rebased.as_deref()),
+            ),
+            (
                 "ended.head",
                 self.ended.as_ref().and_then(|e| e.head.as_deref()),
             ),
@@ -2321,6 +2338,14 @@ impl TicketDelivery {
         {
             return invalid(
                 "a push under way names its onto if and only if it is a rebase's".to_owned(),
+            );
+        }
+        if let Some(pushing) = &self.pushing
+            && pushing.kind != PushKind::Rebase
+            && pushing.rebased.is_some()
+        {
+            return invalid(
+                "only a rebase's push under way names the commit its rebase run made".to_owned(),
             );
         }
         if let Some(pushing) = &self.pushing

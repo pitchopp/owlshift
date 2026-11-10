@@ -2322,6 +2322,7 @@ fn a_ticket_becomes_a_pull_request_with_its_report() {
         kind: owlshift_contracts::refs::PushKind::Delivery,
         base: bench.remote_main(),
         onto: None,
+        rebased: None,
         report: None,
     });
     cut.delivery = Some(pushing);
@@ -8976,6 +8977,7 @@ fn a_crashed_fix_push(bench: &Bench, owed: Option<owlshift_contracts::refs::Owed
         kind: owlshift_contracts::refs::PushKind::Fix,
         base: bench.remote_main(),
         onto: None,
+        rebased: None,
         report: Some(owlshift_contracts::refs::KeptReport {
             summary: "Kept the greeting on every platform.".to_owned(),
             gate: Some(vec!["git grep -q Hello".to_owned()]),
@@ -9029,6 +9031,106 @@ fn continue_adopting_a_crashed_push_shows_review_again() {
         "{look:?}\n{printed}"
     );
     assert_eq!(bench.stage(), "In Review");
+}
+
+/// A rebase cycle's push a crash cut short before git gave a verdict
+/// (OWL-514): DEMO-1 delivered with `READER.md` beside its greeting, `main`
+/// moved, and the ticket's branch holds R, the delivery rebased onto `main`,
+/// and on it F, a last fix that deletes `READER.md`. The ref keeps F's push
+/// under way, naming R as the rebase run's commit when `rebased`, as an
+/// older binary's push would not otherwise. The pull request reads
+/// conflicting. Returns the first push, R and F.
+fn a_crashed_rebase_push(rebased: bool) -> (Bench, String, String, String) {
+    let bench = Bench::new(true);
+    let mut reply = bench.reply(Some("Hello"), Some(DONE));
+    reply.files.insert(
+        RelativePath::new("READER.md").unwrap(),
+        "A second reader.\n".to_owned(),
+    );
+    let (outcome, printed) = bench.run(vec![reply], None);
+    outcome.unwrap_or_else(|stop| panic!("{stop}\n{printed}"));
+    let first_push = bench.remote_branch().unwrap();
+    let main = bench.merge_into_main(&[("OTHER.md", "Another ticket's file.\n")]);
+    let (env, worktree) = (bench.env.clone(), bench.worktree());
+    let head = || {
+        let out = env.run(&worktree, &["rev-parse", "HEAD"]).unwrap();
+        String::from_utf8(out).unwrap().trim().to_owned()
+    };
+    env.run(&worktree, &["fetch", "--quiet", "origin", "main"])
+        .unwrap();
+    env.run(&worktree, &["rebase", "--quiet", &main]).unwrap();
+    let rebase = head();
+    env.run(&worktree, &["rm", "--quiet", "--", "READER.md"])
+        .unwrap();
+    env.run(&worktree, &["commit", "--quiet", "-m", "Drop the reader"])
+        .unwrap();
+    let fix = head();
+    // The runs that made R and F moved the branch: its run file says so.
+    let file = bench.dirs().run_file(&ticket());
+    let mut run =
+        owlshift_contracts::step::TicketRun::parse(&fs::read_to_string(&file).unwrap()).unwrap();
+    run.tip = Some(fix.clone());
+    run.generation += 1;
+    fs::write(&file, run.render()).unwrap();
+    let mut record = bench.record();
+    record.delivery.as_mut().unwrap().pushing = Some(owlshift_contracts::refs::Pushing {
+        commit: fix.clone(),
+        kind: owlshift_contracts::refs::PushKind::Rebase,
+        base: main.clone(),
+        onto: Some(main),
+        rebased: rebased.then(|| rebase.clone()),
+        report: Some(owlshift_contracts::refs::KeptReport {
+            summary: "Rebased onto main.".to_owned(),
+            gate: Some(vec!["git grep -q Hello".to_owned()]),
+            checks: Vec::new(),
+            questions: Vec::new(),
+            notes: Vec::new(),
+            followups: Vec::new(),
+            reviews: Vec::new(),
+        }),
+    });
+    bench.write_record(&record);
+    bench.github.followed.lock().unwrap().mergeable = "CONFLICTING";
+    (bench, first_push, rebase, fix)
+}
+
+/// OWL-514: a rebase cycle's push kept under way is pushed again, with no
+/// run, its delivery check on the rebase run's commit the ref keeps: F,
+/// which deletes a delivered file after R, lands. Kept by an older binary,
+/// with no such commit, the same push is checked on F itself, as before,
+/// and refused.
+#[test]
+fn a_rebase_push_kept_under_way_is_checked_on_its_rebase_commit() {
+    let (bench, first_push, rebase, fix) = a_crashed_rebase_push(true);
+    let runs = bench.briefs().len();
+    let (outcomes, lines, printed) = bench.watch(Vec::new(), &mut |_| false);
+    let report = format!("{outcomes:?}\n{lines}\n{printed}");
+    assert_eq!(bench.briefs().len(), runs, "no run\n{report}");
+    assert_ne!(first_push, fix);
+    assert_eq!(
+        bench.remote_branch().as_deref(),
+        Some(fix.as_str()),
+        "{report}"
+    );
+    assert!(is_ancestor(&bench, &rebase, &fix));
+    let delivery = bench.record().delivery.unwrap();
+    assert_eq!(delivery.pushed.as_deref(), Some(fix.as_str()), "{report}");
+    assert!(delivery.pushing.is_none(), "{report}");
+
+    let (bench, first_push, _, _) = a_crashed_rebase_push(false);
+    let runs = bench.briefs().len();
+    let (outcomes, lines, printed) = bench.watch(Vec::new(), &mut |_| false);
+    let report = format!("{outcomes:?}\n{lines}\n{printed}");
+    assert_eq!(bench.briefs().len(), runs, "no run\n{report}");
+    assert_eq!(
+        bench.remote_branch().as_deref(),
+        Some(first_push.as_str()),
+        "{report}"
+    );
+    assert!(
+        report.contains("no longer changes READER.md, which the delivery changed"),
+        "{report}"
+    );
 }
 
 /// The `*_report_replaced` warnings of the events after `from`.
