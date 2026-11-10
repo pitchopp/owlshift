@@ -551,8 +551,11 @@ impl OnDemand<'_> {
     /// rebased commit to push; one that leaves findings gives them to one
     /// last Build-role run at Watch on the rebased head, which fixes,
     /// disagrees with or defers each, as Verify's last fix does, then the
-    /// gate; its commit, which must still be a rebase of the delivery onto
-    /// `onto` ([`rebase_keeps_delivery`]), is what is pushed. The ticket stays
+    /// gate; its commit, which must descend from the rebase run's commit,
+    /// itself a rebase of the delivery onto `onto`
+    /// ([`rebase_cycle_keeps_delivery`], OWL-514), is what is pushed: a fix
+    /// may remove delivered code the findings asked it to (OWL-460), Verify
+    /// and the gate judging it as any Build's. The ticket stays
     /// at Watch: the pass's and the fix's failed runs count as the rebase's
     /// do, and a crash before the push leaves nothing pushed, the next
     /// repair rebasing and reviewing again. The pass is kept in the review
@@ -570,6 +573,7 @@ impl OnDemand<'_> {
         sink: &mut EventSink<'_>,
     ) -> Result<(RepairDone, Vec<Followup>), Stop> {
         let commit = done.repaired.commit.to_string();
+        let rebased = done.repaired.commit.clone();
         let mut state = done.state;
         let diff = self.review_diff(p, &commit)?;
         let next = |outcome: PassOutcome| match outcome {
@@ -626,8 +630,9 @@ impl OnDemand<'_> {
         };
         let git = &self.executor.git;
         let checkout = p.checkout.clone();
-        let accept =
-            |commit: &CommitId| rebase_keeps_delivery(git, &checkout, pushed, onto, commit);
+        let accept = |commit: &CommitId| {
+            rebase_cycle_keeps_delivery(git, &checkout, pushed, onto, &rebased, commit)
+        };
         let (fixed, more) = self.repair_runs(
             p,
             state,

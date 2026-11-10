@@ -273,3 +273,186 @@ fn a_non_trivial_resolution_on_an_overlap_is_reviewed_before_its_push() {
         "{rebased}"
     );
 }
+
+/// The bench of a review after a resolution, DEMO-1 delivered with
+/// `READER.md` beside its greeting: DEMO-2's merge adds `GREETING.md` too, a
+/// conflict that is not trivial, on a path the overlap names. Returns
+/// DEMO-1's first push and `main`'s head.
+fn a_resolution_to_review(bench: &Bench) -> (String, String) {
+    merged_sibling(bench, &["GREETING.md"], false);
+    let first_push = bench.remote_branch().unwrap();
+    let main = bench.merge_into_main(&[("GREETING.md", "Hi from DEMO-2.\n")]);
+    bench.github.followed.lock().unwrap().mergeable = "CONFLICTING";
+    (first_push, main)
+}
+
+/// The agent of a rebase run that resolves `GREETING.md` but drops
+/// `READER.md`, the delivery's file, before continuing: its `run`-th run.
+fn rebase_dropping_the_reader(bench: &Bench, run: usize, onto: String) -> During {
+    let (env, worktree) = (bench.env.clone(), bench.worktree());
+    let act = move || {
+        // The conflict stops the rebase: git exits 1.
+        let _ = env.run(&worktree, &["rebase", "--quiet", &onto]);
+        fs::write(worktree.join("GREETING.md"), "Hello, reader.\n").unwrap();
+        env.run(&worktree, &["add", "--", "GREETING.md"]).unwrap();
+        env.run(&worktree, &["rm", "-f", "--quiet", "--", "READER.md"])
+            .unwrap();
+        env.run(
+            &worktree,
+            &["-c", "core.editor=true", "rebase", "--continue"],
+        )
+        .unwrap();
+    };
+    (run, Box::new(act))
+}
+
+/// OWL-514, the OWL-460 shape: the delivery adds `READER.md`; the rebase
+/// run resolves the conflict and keeps it; Verify asks to drop the second
+/// reader, the arbiter confirms, and the last Build at Watch deletes the
+/// file on purpose. The push's delivery check reads the rebase run's
+/// commit, of which the pushed head descends: the push lands, nothing
+/// parks, and the reader is gone from the branch.
+#[test]
+fn a_last_fix_that_removes_delivered_work_after_a_resolution_is_pushed() {
+    let bench = overlapping(&[("READER.md", "A second reader.\n")], true);
+    let (first_push, main) = a_resolution_to_review(&bench);
+    let rebase = rebase_in(
+        &bench,
+        main.clone(),
+        vec![("GREETING.md", "Hello, reader.\n")],
+    );
+    let (env, worktree) = (bench.env.clone(), bench.worktree());
+    let drop_reader: During = (
+        4,
+        Box::new(move || {
+            env.run(&worktree, &["rm", "--quiet", "--", "READER.md"])
+                .unwrap();
+            env.run(&worktree, &["commit", "--quiet", "-m", "Drop the reader"])
+                .unwrap();
+        }),
+    );
+    let claim = "Drop the second reader: main carries one now.";
+    let replies = vec![
+        bench.reply(None, Some(REBASED)),
+        bench.reviewing(&found(&[("major", claim)])),
+        bench.reviewing(&ruled(&["confirmed"])),
+        bench.reply(
+            Some("Hello, DEMO-2"),
+            Some(&fixed_build(&[("F1", "fixed")])),
+        ),
+    ];
+    let delivered_runs = bench.briefs().len();
+    let delivered_events = bench.events().len();
+    let mut pass = 0;
+    let (outcomes, lines, printed) =
+        bench.watch_during(replies, vec![rebase, drop_reader], &mut |_| {
+            pass += 1;
+            // Merged meanwhile: the pull request reads mergeable again.
+            bench.github.followed.lock().unwrap().mergeable = "MERGEABLE";
+            pass < 3
+        });
+    let report = format!("{outcomes:?}\n{lines}\n{printed}");
+    let roles: Vec<Role> = bench.briefs()[delivered_runs..]
+        .iter()
+        .map(|brief| brief.role)
+        .collect();
+    assert_eq!(
+        roles,
+        [Role::Rebase, Role::Verify, Role::Arbiter, Role::Build],
+        "{report}"
+    );
+    // Pushed: the last fix's commit, on top of the rebase run's, which
+    // alone keeps the reader.
+    let head = bench.remote_branch().unwrap();
+    assert_ne!(head, first_push, "{report}");
+    let events = &bench.events()[delivered_events..];
+    let gate_commit = |role: &str| {
+        let started = events
+            .iter()
+            .rfind(|e| e.kind == EventKind::RunStarted && e.data["role"] == role)
+            .unwrap_or_else(|| panic!("a {role} run\n{report}"));
+        events
+            .iter()
+            .find(|e| e.kind == EventKind::RunEnded && e.run == started.run)
+            .and_then(|e| e.data["gate_commit"].as_str())
+            .unwrap_or_else(|| panic!("a {role} gate commit\n{report}"))
+            .to_owned()
+    };
+    assert_eq!(gate_commit("build"), head, "{report}");
+    let rebased = gate_commit("rebase");
+    assert_ne!(rebased, head);
+    assert!(is_ancestor(&bench, &rebased, &head), "{report}");
+    assert!(is_ancestor(&bench, &main, &head), "{report}");
+    for (commit, kept) in [(&rebased, true), (&head, false)] {
+        let read = bench.env.run(
+            &bench.remote.bare,
+            &["cat-file", "-e", &format!("{commit}:READER.md")],
+        );
+        assert_eq!(read.is_ok(), kept, "READER.md at {commit}\n{report}");
+    }
+    let given = bench.last_of(Role::Build).findings.unwrap();
+    assert_eq!(given.findings[0].claim, claim);
+    let delivery = bench.record().delivery.unwrap();
+    assert_eq!(
+        (
+            delivery.pushed.as_deref(),
+            delivery.rebased_onto.as_deref(),
+            delivery.pushing.is_none()
+        ),
+        (Some(head.as_str()), Some(main.as_str()), true),
+        "{report}"
+    );
+    let comments = bench.comments();
+    assert!(
+        !comments.iter().any(|c| c.starts_with("[owlshift] PARKED")),
+        "{report}"
+    );
+    let rebased_report = comments
+        .iter()
+        .rfind(|body| body.contains("Rebased onto"))
+        .unwrap_or_else(|| panic!("a rebase report\n{report}"));
+    assert!(
+        rebased_report.contains("Verify pass 2 reviewed the resolution"),
+        "{rebased_report}"
+    );
+}
+
+/// OWL-514's regression guard, which passes before it too: a rebase run
+/// whose own commit drops `READER.md`, a path the delivery changed, is
+/// refused before any review with `rebase_keeps_delivery`'s message, on
+/// both attempts; the ticket parks with nothing pushed.
+#[test]
+fn a_rebase_run_that_drops_delivered_work_is_refused_before_any_review() {
+    let bench = overlapping(&[("READER.md", "A second reader.\n")], true);
+    let (first_push, main) = a_resolution_to_review(&bench);
+    let replies = vec![
+        bench.reply(None, Some(REBASED)),
+        bench.reply(None, Some(REBASED)),
+    ];
+    let during = vec![
+        rebase_dropping_the_reader(&bench, 1, main.clone()),
+        rebase_dropping_the_reader(&bench, 2, main),
+    ];
+    let delivered_runs = bench.briefs().len();
+    let mut pass = 0;
+    let (outcomes, lines, printed) = bench.watch_during(replies, during, &mut |_| {
+        pass += 1;
+        pass < 2
+    });
+    let report = format!("{outcomes:?}\n{lines}\n{printed}");
+    let roles: Vec<Role> = bench.briefs()[delivered_runs..]
+        .iter()
+        .map(|brief| brief.role)
+        .collect();
+    assert_eq!(roles, [Role::Rebase, Role::Rebase], "{report}");
+    assert_eq!(bench.remote_branch().unwrap(), first_push, "{report}");
+    let parked = bench
+        .comments()
+        .into_iter()
+        .rfind(|c| c.starts_with("[owlshift] PARKED"))
+        .unwrap_or_else(|| panic!("a PARKED comment\n{report}"));
+    assert!(
+        parked.contains("no longer changes READER.md, which the delivery changed"),
+        "{parked}"
+    );
+}

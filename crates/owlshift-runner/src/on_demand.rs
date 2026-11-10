@@ -139,7 +139,8 @@ use crate::writer::{
     self, Corrected, Decided, DecidedBy, DecisionComment, DecisionGroup, DeliveryReport, FixPass,
     Gate, MentionDropped, ParkedComment, Posted, QuestionsComment, ReaskComment, Reasoning,
     Rebased, ReopenedChoice, ReplyComment, Reported, Restart, ResumeComment, Reviewed,
-    VisibleStage, WriteError, Writer, park_reason, rebase_keeps_delivery,
+    VisibleStage, WriteError, Writer, park_reason, rebase_cycle_keeps_delivery,
+    rebase_keeps_delivery,
 };
 use owlshift_core::follow::{
     Action as FollowAction, Decision as FollowDecision, EndReason as FollowEnd, RebaseCause,
@@ -6595,8 +6596,14 @@ enum RepairKind {
     /// A fix run's, answering these failed checks: a fast-forward.
     Fix { checks: Vec<String> },
     /// A rebase run's, onto this base commit: the one push that replaces
-    /// the branch's history.
-    Rebase { onto: CommitId },
+    /// the branch's history. `rebased` is the commit the rebase run itself
+    /// made, which the delivery check reads, the pushed head being it or a
+    /// last fix on top of it (OWL-514); `None` only for a push kept under
+    /// way by an older binary, whose head is checked instead.
+    Rebase {
+        onto: CommitId,
+        rebased: Option<CommitId>,
+    },
     /// A correction run's, following the decider's replies to the DECISION
     /// comments of these questions (OWL-146): a fast-forward.
     Correction { questions: Vec<String> },
@@ -7350,7 +7357,10 @@ impl OnDemand<'_> {
     /// that keeps its change ([`rebase_keeps_delivery`]); the runner pushes
     /// it, leased on `pushed`, never the agent. A non-trivial conflict on a
     /// path one of the ticket's overlaps names gets a Verify pass on the
-    /// rebased head before the push (OWL-449, [`Self::review_resolution`]).
+    /// rebased head before the push (OWL-449, [`Self::review_resolution`]),
+    /// whose last fix's commit is pushed on top of the rebase run's: the
+    /// push's delivery check reads the rebase run's commit, kept as
+    /// `pushing.rebased` (OWL-514, [`rebase_cycle_keeps_delivery`]).
     #[allow(clippy::too_many_arguments)]
     fn repair_rebase(
         &self,
@@ -7402,6 +7412,12 @@ impl OnDemand<'_> {
                 .map_err(|e| refused("the commit under way", e))?;
             let kept_onto =
                 CommitId::new(kept_onto.as_str()).map_err(|e| refused("the rebase's base", e))?;
+            let rebased = pushing
+                .rebased
+                .as_deref()
+                .map(CommitId::new)
+                .transpose()
+                .map_err(|e| refused("the rebase run's commit", e))?;
             let (repaired, followups) = Repaired::again(commit, pushing, "rebase");
             p.repairing = true;
             return self.push_repair(
@@ -7410,7 +7426,10 @@ impl OnDemand<'_> {
                 delivery,
                 &pushed_id,
                 repaired,
-                RepairKind::Rebase { onto: kept_onto },
+                RepairKind::Rebase {
+                    onto: kept_onto,
+                    rebased,
+                },
                 followups,
                 following,
                 sink,
@@ -7541,8 +7560,11 @@ impl OnDemand<'_> {
             sink,
         );
         // Reviewed before its push when its resolution asks it (OWL-449).
+        // The rebase run's own commit is kept for the push's delivery check,
+        // whatever the last fix adds on top of it (OWL-514).
         let ran = ran.and_then(|(done, followups)| {
-            if review {
+            let rebased = done.repaired.commit.clone();
+            let ran = if review {
                 self.review_resolution(
                     p,
                     &dispatched,
@@ -7555,9 +7577,10 @@ impl OnDemand<'_> {
                 )
             } else {
                 Ok((done, followups))
-            }
+            };
+            ran.map(|ran| (ran, rebased))
         });
-        let (done, followups) = match ran {
+        let ((done, followups), rebased) = match ran {
             Ok(done) => done,
             Err(stop) => {
                 // The ticket's branch goes back to Owlshift's last push, so a
@@ -7584,7 +7607,10 @@ impl OnDemand<'_> {
             delivery,
             &pushed_id,
             done.repaired,
-            RepairKind::Rebase { onto },
+            RepairKind::Rebase {
+                onto,
+                rebased: Some(rebased),
+            },
             followups,
             following,
             sink,
@@ -7767,7 +7793,9 @@ impl OnDemand<'_> {
     /// with the base it was rebased onto, `rebased_onto`), and the DELIVERY
     /// report names the pass or the rebase. A fix is pushed as a
     /// fast-forward ([`Writer::push_leased`]), a rebase replaces the
-    /// branch's history ([`Writer::push_rebased`]). A push the remote
+    /// branch's history ([`Writer::push_rebased`]), checked on the rebase
+    /// run's own commit when its kind names it, which the ref keeps as
+    /// `pushing.rebased` with the push (OWL-514). A push the remote
     /// rejects while the branch is still at `pushed` is the forge refusing
     /// Owlshift's own push, which parks the ticket; one rejected because the
     /// branch moved is someone's push, which ends the following at the next
@@ -7812,9 +7840,14 @@ impl OnDemand<'_> {
                 RepairKind::Fix { .. }
                 | RepairKind::Correction { .. }
                 | RepairKind::Review { .. } => None,
-                RepairKind::Rebase { onto } => Some(onto.to_string()),
+                RepairKind::Rebase { onto, .. } => Some(onto.to_string()),
             },
-            rebased: None,
+            rebased: match &kind {
+                RepairKind::Rebase { rebased, .. } => rebased.as_ref().map(ToString::to_string),
+                RepairKind::Fix { .. }
+                | RepairKind::Correction { .. }
+                | RepairKind::Review { .. } => None,
+            },
             report: Some(report),
         });
         let questions = p.questions();
@@ -7826,7 +7859,7 @@ impl OnDemand<'_> {
             RepairKind::Fix { .. } | RepairKind::Correction { .. } | RepairKind::Review { .. } => {
                 writer.push_leased(git, &p.checkout, "origin", &commit, &head, pushed)
             }
-            RepairKind::Rebase { onto } => writer.push_rebased(
+            RepairKind::Rebase { onto, rebased } => writer.push_rebased(
                 git,
                 &p.checkout,
                 "origin",
@@ -7834,7 +7867,7 @@ impl OnDemand<'_> {
                 &head,
                 pushed,
                 onto,
-                None,
+                rebased.as_ref(),
             ),
         };
         match landed {
