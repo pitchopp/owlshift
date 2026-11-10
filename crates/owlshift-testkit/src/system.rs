@@ -197,11 +197,11 @@ impl System for ScriptedSystem {
         Err(TokenTryError::Credential(Self::scripted("the keychain")))
     }
 
-    fn github_merge_permission(
+    fn github_app_grants(
         &self,
         _repo: &Repo,
         _slug: &str,
-    ) -> Result<owlshift_runner::forge::MergePermission, TokenTryError> {
+    ) -> Result<owlshift_runner::forge::AppGrants, TokenTryError> {
         Err(TokenTryError::Credential(Self::scripted("the keychain")))
     }
 

@@ -74,7 +74,8 @@ impl GitHubApp {
 /// fix run (OWL-112): GitHub documents it, and live check (c) of the build
 /// plan is still to confirm it with a stored token.
 pub const GITHUB_TOKEN_HELP: &str = "a fine-grained token with pull requests (write), contents, \
-     checks, commit statuses, actions and metadata (read) on the project's repository";
+     checks, commit statuses, actions and metadata (read) on the project's repository, and \
+     actions (write) for watch to re-run a red check once";
 
 /// What the GitHub App's token is refreshed with (OWL-384): the keychain it
 /// is stored in, the project's account lock file
@@ -200,15 +201,18 @@ pub fn default_branch(keychain: &Keychain, repo: &Repo) -> Result<DefaultBranch,
         .map_err(TokenTryError::Forge)
 }
 
-/// What the project's GitHub credential gives merge on green's merge (D14,
-/// OWL-445): Contents (read and write), read from the GitHub App
-/// installation's granted permissions, which a personal token has none of.
+/// What the project's GitHub credential was granted, read from the GitHub
+/// App installation's permissions, which a personal token has none of:
+/// Contents (read and write) for merge on green's merge (D14, OWL-445),
+/// Actions (read and write) for watch's re-run of a red check (OWL-513).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum MergePermission {
-    /// The installation granted Contents (read and write).
-    Granted,
-    /// The installation, of this id, has not granted it.
-    Missing { installation: u64 },
+pub enum AppGrants {
+    /// The installation, of this id, and what it granted.
+    Installed {
+        installation: u64,
+        contents_write: bool,
+        actions_write: bool,
+    },
     /// No installation of the app lists the repository.
     NotInstalled,
     /// A personal token: GitHub says nothing of its permissions.
@@ -216,29 +220,30 @@ pub enum MergePermission {
 }
 
 /// What the GitHub credential of the project of `repo`, resolved and read
-/// from `keychain` as `owlshift do` reads it, gives merge on green (OWL-445):
-/// for the GitHub App's token, the installation of the app `slug` that
-/// lists the repository, read-only (C12, 2026-10-19); a personal token is
-/// not asked anything.
-pub fn merge_permission(
+/// from `keychain` as `owlshift do` reads it, was granted (OWL-445,
+/// OWL-513): for the GitHub App's token, the installation of the app `slug`
+/// that lists the repository, read-only (C12, 2026-10-19); a personal token
+/// is not asked anything.
+pub fn app_grants(
     keychain: &Keychain,
     repo: &Repo,
     slug: &str,
-) -> Result<MergePermission, TokenTryError> {
+) -> Result<AppGrants, TokenTryError> {
     let mut read = |account: &str| keychain.read(account).map_err(|error| error.to_string());
     let found = secrets::forge(repo, &mut read).map_err(TokenTryError::Credential)?;
     if found.account.kind == ForgeKind::Personal {
-        return Ok(MergePermission::PersonalToken);
+        return Ok(AppGrants::PersonalToken);
     }
     let token = token_at(&found, Timestamp::now()).map_err(TokenTryError::Credential)?;
     let installation = GitHubForge::new(token, repo.clone())
         .app_installation(slug)
         .map_err(TokenTryError::Forge)?;
     Ok(match installation {
-        None => MergePermission::NotInstalled,
-        Some(installation) if installation.contents_write => MergePermission::Granted,
-        Some(installation) => MergePermission::Missing {
+        None => AppGrants::NotInstalled,
+        Some(installation) => AppGrants::Installed {
             installation: installation.id,
+            contents_write: installation.contents_write,
+            actions_write: installation.actions_write,
         },
     })
 }
