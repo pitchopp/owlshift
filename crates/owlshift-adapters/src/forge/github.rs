@@ -1630,7 +1630,7 @@ fn ran_nothing(response: &Response, message: &str) -> Option<Error> {
 const NOT_ACCESSIBLE: &str = "Resource not accessible by";
 
 /// What GitHub's answer to a re-run of failed jobs says (OWL-513): started
-/// on a 2xx (GitHub documents 201), a refusal on another 4xx, a permission
+/// on a 2xx (GitHub documents 201), a refusal on a 4xx but 408, a permission
 /// refusal only on a 403 whose message says the resource is not accessible
 /// by the integration (or the personal token); no verdict otherwise. `Err`
 /// as for a merge: a rejected token or a spent budget.
@@ -1647,6 +1647,10 @@ pub fn rerun_answer(response: &Response) -> Result<RerunAnswer, Error> {
     }
     Ok(match status {
         200..=299 => RerunAnswer::Started,
+        // A timeout on the way: the re-run may have started.
+        408 => RerunAnswer::NoVerdict {
+            reason: format!("GitHub answered HTTP 408 {message}"),
+        },
         400..=499 => RerunAnswer::Refused {
             permission: status == 403 && message.starts_with(NOT_ACCESSIBLE),
             status,
@@ -3367,11 +3371,21 @@ mod tests {
             panic!("a verdict");
         };
         assert!(!reason.contains("SENTINEL"), "{reason}");
-        let (forge, _) = posts(vec![Ok(answer(502, "<html>bad gateway</html>"))]);
-        assert!(matches!(
-            forge.rerun_failed_jobs(7).unwrap(),
-            RerunAnswer::NoVerdict { .. }
-        ));
+        // A server error, or a timeout on the way: the re-run may have
+        // started.
+        for (status, body) in [
+            (502, "<html>bad gateway</html>"),
+            (408, r#"{"message":"Request Timeout"}"#),
+        ] {
+            let (forge, _) = posts(vec![Ok(answer(status, body))]);
+            assert!(
+                matches!(
+                    forge.rerun_failed_jobs(7).unwrap(),
+                    RerunAnswer::NoVerdict { .. }
+                ),
+                "HTTP {status} {body}"
+            );
+        }
 
         let spent = Response {
             status: 403,
