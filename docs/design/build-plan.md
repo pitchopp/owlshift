@@ -2446,7 +2446,7 @@ Designed on 2026-10-31 with the maintainer, in a session rather than a design ti
 
 The tasks are the parts above, in the Linear project "P8 · Local web UI", OWL-460 and OWL-165 among them.
 
-**Exit gate.** A working day of Locary's drain followed and driven from the UI alone. Run by the maintainer, as P7's was, once P7's gate has passed and the parts are merged:
+**Exit gate.** A working day of Locary's drain followed and driven from the UI alone. Run by the maintainer, as P7's was, once P7's gate has passed and the parts are merged. Shortened on 2026-11-11 by the maintainer's decision ([roadmap](roadmap.md), P8's readings): the days of use since the UI's actions shipped stand for the working day, with the staged cases played on purpose, and a reply and a plan approval from the UI on a real Locary ticket stay a condition of the pass:
 
 1. *Before.* `owlshift doctor` clean; Locary served by the daemon with `start --at-login`; the UI opened with `owlshift ui`; the ready column holding admitted tickets. Locary's questions go to the maintainer, its tickets' assignee and its zones' owner, and the Linear key `owlshift init` stored for Locary is the maintainer's own (confirmed by the maintainer on 2026-10-31), so its replies can be made from the UI.
 2. *The run.* A working day of eight hours or more: the maintainer follows the drain and acts from the UI only, replying and approving there, and reviews and merges pull requests on GitHub as usual.
@@ -2454,4 +2454,34 @@ The tasks are the parts above, in the Linear project "P8 · Local web UI", OWL-4
 4. *Recorded here:* each time the maintainer needed the terminal, Linear or a file, and why; each staged case and what the UI showed; the UI's restarts; the requests it refused.
 5. *Judged.* No terminal or Linear needed beyond `owlshift start`, `owlshift ui` and a quarantine's lift, nor GitHub beyond reviews and merges; at three moments of the day, the overview matched `owlshift status --waits` ticket for ticket and wait for wait.
 
-- [ ] **Exit gate.**
+- [ ] **Exit gate.** Not passed yet. Every staged case is played but the reply and the plan approval from the UI, which wait for Locary's next question and plan; the comparisons with `owlshift status --waits` matched at each moment taken.
+
+**Runs, 2026-11-10 to 11**, on the maintainer's machine (macOS 26.6), Claude Code 2.1.318, Locary and Owlshift served by `owlshift start --at-login`, the UI at `127.0.0.1:18466`. The window opens at 2026-11-10 00:00 UTC, the first day with every action of the UI, OWL-473 having merged on 2026-11-09 at 22:08. Times are UTC; `owlshift status` prints local time (UTC+1), quoted as printed.
+
+- *Before.* `owlshift doctor` ready on 2026-11-11, one warning, the untested Claude Code 2.1.318, as at P7; the UI listening on `127.0.0.1:18466`; the ready column holding admitted tickets. The binary was reinstalled from `0ff64eaf` at 21:37 and `doctor` drained the daemon for the upgrade (21:37 to 21:41, LOC-2063's Verify finishing first).
+- *The drain,* Locary: 355 dispatches (16 tickets), 15 pull requests opened and 14 merged, 177 runs (9 failed), 878 min.
+- *The UI's restarts:* four, at 07:49 and 11:04 on 2026-11-10 and at 14:10 and 21:41 on 2026-11-11, each with its daemon drained for an upgrade ("The web UI ended (signal: 9 (SIGKILL)), as asked", then "Started the web UI"); none on its own.
+- *Requests refused:* none seen. The UI keeps no log of the requests it refuses, so this is the maintainer's account and what the staged cases below showed.
+
+**Staged cases.**
+
+- *A parked ticket restarted.* OWL-507, from its page's Restart, 2026-11-10 08:00:11: `decision by=ui restarted=true stage=watch takes=follow`. LOC-2063 again after its cancel, below.
+- *A pause then a resume of the project,* played by Claude in the desktop app's browser pane on the maintainer's go-ahead, 2026-11-11: Pause on the orchestrator page at 21:50 with the reason "P8 gate staged pause"; the header and the controls showed "paused by ui at 11/11/2026, 10:50:28 PM: P8 gate staged pause", and `owlshift status` "paused by ui at 2026-11-11 22:50: P8 gate staged pause; `owlshift resume <owner/repo>` lifts it". Resume at 21:51: "pitchopp/locary's pause is lifted (it was by ui at 2026-11-11 22:50: P8 gate staged pause): its watch goes on at its next pass". No dispatch in between, though none was due: the one ready ticket, LOC-2089, was blocked by LOC-2063.
+- *A step canceled, then the ticket restarted,* played the same way on the maintainer's authorization, on LOC-2063's Build (run started 21:41). Cancel on the ticket's page at 21:53:27, after the page's confirmation ("Cancel LOC-2063? Its step under way stops within 5 seconds, and its watch parks it with a PARKED comment on the ticket."); the page: "A cancel stands, asked by ui at 2026-11-11 21:53:27 UTC: P8 gate staged cancel". The run ended `stopped` at 21:53:28 (`decision cancel=stopped`), the PARKED comment and the Parked state at 21:53:33 to 34, `parked=Stopped` "Canceled by `ui` at 2026-11-11 21:53 UTC: P8 gate staged cancel": 7 seconds, a Build of 12 minutes lost. Restart on the same page at 21:54:08: `decision by=ui restarted=true stage=build takes=resume`, the page "LOC-2063 is restarted at Build, and nothing runs now: `owlshift watch` resumes it at its next pass, under its usual rules". At the next pass, 21:54:47, the ticket waited on a collision: the maintainer's own pull request #1677, opened at 21:43, held the zone `.github/workflows/deploy.yml` LOC-2063 would touch.
+- *A harness at its usage limit read from the header:* Codex, seen by the maintainer during the window (the digest of 2026-11-11 08:00 has "codex at its limit until Wed 10:22").
+- *A question answered and a plan approved from the UI:* not played. On 2026-11-11 the maintainer answered five questions (LOC-2090, LOC-2055 and LOC-2063 at 10:53, LOC-2090 at 14:20, LOC-2063 at 21:23) and approved three plans (LOC-2055, LOC-2063, LOC-2090) on Linear, out of habit rather than need, so the reply form, which OWL-475's Build left unchecked on a real waiting ticket (part 10, "Not checked by the Build"), has still not been used. The pass waits for the next ones, answered from the ticket's page.
+
+**The terminal, Linear and files.** Besides the answers above, the maintainer typed `owlshift continue LOC-1538` twice, at 21:23:43 and 21:39:07 on 2026-11-11, out of habit: the ticket's Restart would have done (the events carry no `by`, which a restart from the UI or the tracker carries). The maintainer needed nothing else outside the UI.
+
+**The overview and `owlshift status --waits`,** compared through the UI's own `GET /api/overview`, the route the page draws, and `owlshift status --waits --json`, taken within the same minute: project, ticket, stage, whether it runs and its wait's text.
+
+- 2026-11-11 21:45: matched, 3 tickets: LOC-1538 and LOC-2063 at Build, running; LOC-2089 ready, "blocked by LOC-2063".
+- 2026-11-11 21:58, after the cancel and the restart: matched, 3 tickets: LOC-1538 following its pull request; LOC-2063 at Build, "pull request #1677 holds zone `.github/workflows/deploy.yml`, which it would touch"; LOC-2089 ready, "blocked by LOC-2063".
+
+What the run showed:
+
+- Neither a pause nor a resume leaves an event in `events.jsonl`: the pause file alone holds who asked, and it is gone once lifted, so a past pause cannot be read back.
+- The UI points to the terminal where it offers the gesture itself: after a cancel, "`owlshift continue LOC-2063` restarts it" beside the page's Restart; `owlshift status`, for a pause asked from the UI, "`owlshift resume <owner/repo>` lifts it".
+- The header still showed "1 slot" and "1 parked" about 20 seconds after LOC-2063's park; seen once, not looked into.
+- The address `#/` shows "This address is not a page", while the nav's Overview is `/#`.
+- The browser pane of the Claude desktop app answers the page's `window.confirm` with a silent refusal, so a cancel there needs the confirmation answered another way; Safari and Chrome show it.

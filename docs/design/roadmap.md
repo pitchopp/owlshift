@@ -187,6 +187,7 @@ Follow and drive the drain from a browser.
 - `retry` is dropped, restarting a parked ticket being one; `cancel` acts on a ticket, stopping its step checked and parking it. Releasing a claim waits for P10 with the claims.
 - The configuration screen edits the personal file only: a served project runs on its default branch's project file, which changes through a pull request.
 - The drain keeps what it read of the ready column (`ready.json`), so the UI shows the tickets not yet started, their order and their blockers without calling the tracker.
+- The exit gate needs no dedicated working day (decided by the maintainer on 2026-11-11): the maintainer had followed the drain from the UI for days before the gate, so those days stand for it, with the staged cases played on purpose. A reply and a plan approval from the UI on a real Locary ticket stay a condition: no Build checked the reply form on a real waiting ticket.
 
 **Exit gate.** A working day of Locary's drain followed and driven from the UI alone.
 
