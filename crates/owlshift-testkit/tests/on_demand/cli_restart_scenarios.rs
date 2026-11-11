@@ -17,6 +17,39 @@ use owlshift_testkit::step_child::{
 const BIN: &str = env!("CARGO_BIN_EXE_owlshift-cli-bench");
 const FAKE_HARNESS: &str = env!("CARGO_BIN_EXE_owlshift-fake-harness");
 
+/// `text` with each compact time, as in a run's folder or a comment's file
+/// (`20261111T014649Z`), and the suffix a second name in the same second
+/// takes (`-2`, `.2`), read `<time>`.
+fn untimed(text: &str) -> String {
+    let shape = |window: &[u8]| {
+        window.len() == 16
+            && window[..8].iter().all(u8::is_ascii_digit)
+            && window[8] == b'T'
+            && window[9..15].iter().all(u8::is_ascii_digit)
+            && window[15] == b'Z'
+    };
+    let bytes = text.as_bytes();
+    let mut timeless = Vec::new();
+    let mut at = 0;
+    while at < bytes.len() {
+        if bytes.get(at..at + 16).is_some_and(shape) {
+            timeless.extend_from_slice(b"<time>");
+            at += 16;
+            let digits = bytes[(at + 1).min(bytes.len())..]
+                .iter()
+                .take_while(|b| b.is_ascii_digit())
+                .count();
+            if matches!(bytes.get(at), Some(b'-' | b'.')) && digits > 0 {
+                at += 1 + digits;
+            }
+        } else {
+            timeless.push(bytes[at]);
+            at += 1;
+        }
+    }
+    String::from_utf8(timeless).unwrap()
+}
+
 /// A served bench under `root`, DEMO-1 parked at Build, and what its
 /// child prints, then what it left.
 struct Restarted {
@@ -121,27 +154,7 @@ impl Restarted {
             plain.push(c);
         }
         plain.pop();
-        // A compact time, as in a comment's file name: `20261111T014649Z`.
-        let shape = |window: &[u8]| {
-            window.len() == 16
-                && window[..8].iter().all(u8::is_ascii_digit)
-                && window[8] == b'T'
-                && window[9..15].iter().all(u8::is_ascii_digit)
-                && window[15] == b'Z'
-        };
-        let bytes = plain.as_bytes();
-        let mut timeless = Vec::new();
-        let mut at = 0;
-        while at < bytes.len() {
-            if bytes.get(at..at + 16).is_some_and(shape) {
-                timeless.extend_from_slice(b"<time>");
-                at += 16;
-            } else {
-                timeless.push(bytes[at]);
-                at += 1;
-            }
-        }
-        String::from_utf8(timeless).unwrap()
+        untimed(&plain)
     }
 
     /// `value` made plain, its times dropped.
@@ -163,22 +176,39 @@ impl Restarted {
 
     /// Every file under `dir`, by its path from it: its text made plain, or
     /// its size when not text. Locks, the event log (compared as events) and
-    /// git's own folders are left out.
+    /// git's own folders are left out. A name that holds a time, a run's
+    /// folder or a comment's file, is named by its rank among its folder's
+    /// names of the same shape, oldest first: two runs in one second differ
+    /// by a suffix, in two seconds by their time, and either way are runs 1
+    /// and 2.
     fn files(&self, dir: &Path) -> BTreeMap<String, String> {
         let mut files = BTreeMap::new();
-        let mut stack = vec![dir.to_owned()];
-        while let Some(at) = stack.pop() {
-            for entry in fs::read_dir(&at).unwrap() {
-                let path = entry.unwrap().path();
-                let name = path.file_name().unwrap().to_string_lossy().into_owned();
+        let mut stack = vec![(dir.to_owned(), String::new())];
+        while let Some((at, shown)) = stack.pop() {
+            let mut names: Vec<String> = fs::read_dir(&at)
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+                .collect();
+            names.sort();
+            let mut ranks: BTreeMap<String, usize> = BTreeMap::new();
+            for name in names {
+                let path = at.join(&name);
                 if name == ".git" || name.ends_with(".git") && path.is_dir() {
                     continue;
                 }
+                let shape = untimed(&name);
+                let named = if shape == name {
+                    self.plain(&name)
+                } else {
+                    let rank = ranks.entry(shape.clone()).or_default();
+                    *rank += 1;
+                    shape.replacen("<time>", &format!("<time #{rank}>"), 1)
+                };
+                let relative = format!("{shown}{named}");
                 if path.is_dir() {
-                    stack.push(path);
+                    stack.push((path, format!("{relative}/")));
                     continue;
                 }
-                let relative = self.plain(&path.strip_prefix(dir).unwrap().to_string_lossy());
                 if name.ends_with(".lock") || name == "events.jsonl" {
                     files.insert(relative, String::new());
                     continue;
@@ -268,10 +298,19 @@ fn the_uis_restart_child_is_the_typed_restart_with_by_ui() {
         from_ui.files(&from_ui.project.checkout.join("tickets")),
         typed.files(&typed.project.checkout.join("tickets"))
     );
-    assert_eq!(
+    let (ui_files, typed_files) = (
         from_ui.files(&from_ui.project.data),
-        typed.files(&typed.project.data)
+        typed.files(&typed.project.data),
     );
+    // The park's two Build runs, each with its brief, on each side.
+    let runs = |files: &BTreeMap<String, String>| {
+        files
+            .keys()
+            .filter(|path| path.contains("/runs/demo-1/") && path.ends_with("/brief.json"))
+            .count()
+    };
+    assert_eq!(runs(&typed_files), 2, "{typed_files:#?}");
+    assert_eq!(ui_files, typed_files);
     assert_eq!(from_ui.record(), typed.record());
 
     let mut ui_events = from_ui.told();
