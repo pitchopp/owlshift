@@ -30,6 +30,7 @@ use owlshift_contracts::drain::{
 use owlshift_contracts::refs::cut_to;
 use owlshift_contracts::result::{IntakeVerdict, MAX_DEPENDENCIES};
 use owlshift_core::dependency::{self, Node};
+use owlshift_core::floor::same_account;
 
 use super::*;
 use crate::ticket_ref::text_sha256;
@@ -106,7 +107,10 @@ pub(crate) fn read_admission(
             });
         }
     };
-    if !admitters.contains(&account) {
+    if !admitters
+        .iter()
+        .any(|admitter| same_account(&account, admitter))
+    {
         return Err(Unadmitted {
             reason: format!(
                 "the admission gesture on {ticket} was made by {account:?}, whom \
@@ -220,7 +224,11 @@ impl OnDemand<'_> {
         let text = text_sha256(&p.found.title, &p.found.description);
         let kept = p.intake.as_ref().filter(|record| {
             record.text_sha256 == text
-                && admitters.is_some_and(|listed| listed.contains(&record.gesture.account))
+                && admitters.is_some_and(|listed| {
+                    listed
+                        .iter()
+                        .any(|admitter| same_account(&record.gesture.account, admitter))
+                })
         });
         match kept {
             Some(record) => Ok(record.gesture.clone()),
@@ -277,10 +285,11 @@ impl OnDemand<'_> {
         // the account is checked again against the base's admitters.
         let admitters = project::admitters_at(&self.executor.git, &p.checkout, &p.base)
             .map_err(Stop::Refused)?;
-        if !admitters
-            .as_deref()
-            .is_some_and(|admitters| admitters.contains(&gesture.account))
-        {
+        if !admitters.as_deref().is_some_and(|admitters| {
+            admitters
+                .iter()
+                .any(|admitter| same_account(&gesture.account, admitter))
+        }) {
             return Err(Stop::Refused(format!(
                 "the admission gesture of {} names {:?}, whom `[tracker].admitters` on {} does \
                  not list",

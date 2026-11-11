@@ -24,6 +24,7 @@ use owlshift_contracts::Stage;
 use owlshift_contracts::brief::{Correction, MAX_REPLY_BYTES, ReversedDecision};
 use owlshift_contracts::refs::{KeptDecision, Reversal, TicketQuestions};
 use owlshift_contracts::review::TicketPlan;
+use owlshift_core::floor::same_account;
 use owlshift_core::reply::{self, Reply};
 use owlshift_core::state::Event;
 
@@ -95,23 +96,24 @@ pub(crate) fn in_comment(kept: &KeptDecision, decisions: &[KeptDecision]) -> usi
 }
 
 /// Whether `comment` is the decider's: its author's account is the one of
-/// the latest ask before it, or, before any ask, `current`'s.
+/// the latest ask before it, or, before any ask, `current`'s, compared by
+/// [`same_account`].
 fn by_decider(comment: &Comment, questions: &TicketQuestions, current: Current<'_>) -> bool {
     let TrackerAuthor::Account(author) = &comment.author else {
         return false;
     };
-    if author.id.trim().is_empty() {
-        return false;
-    }
     let asked = questions
         .asks
         .iter()
         .rev()
         .find(|ask| ask.at < comment.created_at);
     match (asked, current) {
-        (Some(ask), _) => ask.decider.account == author.id,
-        (None, Current::Known(person)) => person.id == author.id,
-        (None, Current::Unresolved) => true,
+        (Some(ask), _) => same_account(&author.id, &ask.decider.account),
+        (None, Current::Known(person)) => same_account(&author.id, &person.id),
+        // No decider to compare against: any account is a candidate for the
+        // check under the lock, a blank one still none, as `same_account`
+        // has it.
+        (None, Current::Unresolved) => !author.id.trim().is_empty(),
     }
 }
 
@@ -374,6 +376,49 @@ mod tests {
         assert_eq!(ids(&found), [(0, vec!["before", "after-bob"])]);
         let correction = correction(&found, &questions, 7, "https://x/7", "h");
         assert_eq!(correction.reversed[0].reply, "ada: no\n\nbob: no");
+    }
+
+    /// Accounts compare by `floor::same_account`: a blank author is no
+    /// decider's, whether the decider is an ask's, the ticket's now, or
+    /// unresolved; ids match exactly, case included.
+    #[test]
+    fn a_blank_or_differently_cased_author_reverses_nothing() {
+        let ask = |at_minute, account: &str| Ask {
+            kind: AskKind::Questions,
+            round: NonZeroU32::new(1).unwrap(),
+            at: at(at_minute),
+            comment: "q1".into(),
+            questions: Vec::new(),
+            decider: AskDecider {
+                account: account.into(),
+                by: DeciderRule::Assignee,
+            },
+            verdicts: Vec::new(),
+            result_refusal: None,
+            labels: Default::default(),
+        };
+        let comments = [
+            reply("blank", " ", 5, Some("d1")),
+            reply("cased", "Ada", 6, Some("d1")),
+        ];
+        let before_any_ask = TicketQuestions {
+            decisions: vec![kept(1, "d1")],
+            ..TicketQuestions::default()
+        };
+        for current in [person(" "), person("ada")] {
+            let found = reversals(&comments, &before_any_ask, Current::Known(&current));
+            assert!(found.is_empty());
+        }
+        let found = reversals(&comments, &before_any_ask, Current::Unresolved);
+        assert_eq!(ids(&found), [(0, vec!["cased"])]);
+        for decider in [" ", "ada"] {
+            let after_an_ask = TicketQuestions {
+                asks: vec![ask(4, decider)],
+                ..before_any_ask.clone()
+            };
+            let found = reversals(&comments, &after_an_ask, Current::Unresolved);
+            assert!(found.is_empty());
+        }
     }
 
     /// The fixture plan, approved by the comment `c-approval-1`.

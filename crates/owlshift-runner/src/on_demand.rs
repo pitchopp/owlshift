@@ -9122,7 +9122,7 @@ fn name_of(decider: &AskDecider, ticket: &Ticket) -> String {
     ticket
         .assignee
         .as_ref()
-        .filter(|assignee| assignee.id == decider.account)
+        .filter(|assignee| owlshift_core::floor::same_account(&assignee.id, &decider.account))
         .map_or_else(|| decider.account.clone(), |assignee| assignee.name.clone())
 }
 
