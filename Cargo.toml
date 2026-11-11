@@ -16,6 +16,9 @@ owlshift-contracts = { path = "crates/owlshift-contracts" }
 owlshift-adapters = { path = "crates/owlshift-adapters" }
 owlshift-platform = { path = "crates/owlshift-platform" }
 owlshift-runner = { path = "crates/owlshift-runner" }
+# The test bench runs the command line's entry (OWL-522); no shipped crate
+# depends on it.
+owlshift-cli = { path = "crates/owlshift-cli" }
 clap = { version = "4.6", features = ["derive", "string"] }
 dirs = "7.0"
 getrandom = "0.4"

@@ -12,7 +12,9 @@
 //! - [`scenario`]: scenario files, their runner, and the stand-in driver that
 //!   runs roles through the executor and plays the writer until it exists.
 //! - [`step_child`]: a project whose steps run in a real child process, and
-//!   `owlshift-step-child`, the child (OWL-399).
+//!   `owlshift-step-child`, the child (OWL-399); the same project served, a
+//!   ticket parked at Build, for `owlshift-cli-bench`, the command line's own
+//!   entry with a keychain held in memory (OWL-522).
 //! - [`system`]: a host that reaches nothing of the machine, for `owlshift
 //!   doctor` on the bench (OWL-472).
 //! - [`ui_bench`]: what a check of the web UI in a browser changes in a bench

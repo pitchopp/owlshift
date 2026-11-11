@@ -296,7 +296,7 @@ fn a_restart_from_the_ui_is_the_commands_with_by_ui() {
 }
 
 /// `value` without the texts that read as times, wherever they are.
-fn strip_times(value: &mut Value) {
+pub(super) fn strip_times(value: &mut Value) {
     match value {
         Value::Object(map) => {
             map.retain(|_, value| {

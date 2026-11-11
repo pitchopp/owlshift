@@ -18,10 +18,10 @@
 //!
 //! ```sh
 //! # From inside a run already confined, such as a Build: its own scan.
-//! OWLSHIFT_LIVE_UI_ARGV_SELF=1 cargo test -p owlshift-cli --bin owlshift -- --ignored --nocapture ui_cmd::argv_check::a_run_already_confined
+//! OWLSHIFT_LIVE_UI_ARGV_SELF=1 cargo test -p owlshift-cli --lib -- --ignored --nocapture ui_cmd::argv_check::a_run_already_confined
 //! # On macOS, outside any sandbox, once with the default browser open and
 //! # once with it quit: it opens a tab on a throwaway listener.
-//! OWLSHIFT_LIVE_UI_ARGV=1 cargo test -p owlshift-cli --bin owlshift -- --ignored --nocapture ui_cmd::argv_check::the_login_link
+//! OWLSHIFT_LIVE_UI_ARGV=1 cargo test -p owlshift-cli --lib -- --ignored --nocapture ui_cmd::argv_check::the_login_link
 //! ```
 #![cfg(any(target_os = "linux", target_os = "macos"))]
 
