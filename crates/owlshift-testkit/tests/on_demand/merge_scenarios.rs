@@ -141,6 +141,8 @@ fn labeled_merges_once_its_label_is_on_and_no_question_is_kept_for_a_person() {
     );
     // The read that said it was not a draft, then the last read.
     assert_eq!(*github.merge_reads.lock().unwrap(), 2);
+    // A base that did not move is never read for its own checks (OWL-521).
+    assert_eq!(*github.base_reads.lock().unwrap(), 0);
     assert_eq!(unread_facts(&bench), [json!("label")]);
     let merged = merged_comments(&bench);
     assert_eq!(merged.len(), 1, "{merged:?}");
@@ -665,6 +667,61 @@ fn a_base_moved_on_paths_the_delivery_leaves_alone_merges_without_a_refresh() {
     assert_eq!(
         (&merged[0]["base_at_push"], &merged[0]["base"]),
         (&json!(at_push), &json!(second))
+    );
+    assert_ended_merged(&bench);
+}
+
+/// OWL-521, S18: a base a sibling's merge moved since the push, on paths
+/// the delivery leaves alone, whose head's own checks fail (they passed at
+/// `base_at_push`). Watch reads them only once the pull request is read
+/// green twice, merges nothing and runs no rebase while they fail, tells the
+/// wait once, naming the check, and merges the pushed head once they pass.
+#[test]
+fn a_red_base_moved_apart_from_the_delivery_holds_the_merge_until_it_is_green() {
+    let bench = merging("all");
+    let pushed = bench.remote_branch().unwrap();
+    sibling_merged(&bench);
+    {
+        let mut followed = bench.github.followed.lock().unwrap();
+        followed.base_conclusion = "FAILURE";
+        followed.at_push_conclusion = Some("SUCCESS");
+    }
+    let base_reads = || *bench.github.base_reads.lock().unwrap();
+    let before = base_reads();
+    let clock = bench.clock.clone();
+    let mut reads = Vec::new();
+    let mut pass = 0;
+    let (outcomes, lines, printed) = bench.watch(Vec::new(), &mut |_| {
+        pass += 1;
+        later(&clock);
+        reads.push(base_reads() - before);
+        if pass < 4 {
+            assert_eq!(github_merges(&bench), Vec::<Value>::new(), "pass {pass}");
+        }
+        if pass == 3 {
+            bench.github.followed.lock().unwrap().base_conclusion = "SUCCESS";
+        }
+        pass < 4
+    });
+    assert!(
+        outcomes.iter().all(Result::is_ok),
+        "{outcomes:?}\n{lines}\n{printed}"
+    );
+    // Nothing read at the first green read; one read a pass after it.
+    assert_eq!(reads, [0, 1, 2, 3], "{lines}");
+    assert_eq!(rebase_runs(&bench), Vec::<Value>::new(), "{lines}");
+    let told: Vec<Value> = waits_told(&bench)
+        .iter()
+        .map(|data| json!([data["reason"], data["checks"], data["head"]]))
+        .collect();
+    assert_eq!(told, [json!(["merge_base_red", ["ci"], pushed])], "{lines}");
+    let line = "DEMO-1: pull request #1 is green and not merged yet: its base moved since the \
+                push, and the base head's own checks fail (ci); it merges once they pass";
+    assert_eq!(lines.matches(line).count(), 1, "{lines}");
+    assert_eq!(
+        github_merges(&bench),
+        [json!({ "sha": pushed, "merge_method": "squash" })],
+        "{lines}"
     );
     assert_ended_merged(&bench);
 }

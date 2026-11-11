@@ -177,6 +177,8 @@ impl Watch<'_> {
             base_at_push: delivery.base_at_push.as_deref(),
             // Read below when it is the condition that decides (OWL-520).
             disjoint: false,
+            // Read below when it is the condition that decides (OWL-521).
+            base_checks: None,
             labeled: labels.iter().any(|label| label == core::MERGE_LABEL),
             excluded: tracker
                 .exclude
@@ -225,6 +227,32 @@ impl Watch<'_> {
                 (pushed, at_push, &base_head),
                 &moved,
             );
+        }
+        // A base that moved apart from the delivery, every other condition
+        // held: its head's own checks decide last (OWL-521; architecture
+        // section 5, "The base's own checks").
+        let base_read;
+        if due == MergeDue::Wait(MergeBlocker::BaseUnchecked) {
+            let at_push = delivery
+                .base_at_push
+                .as_deref()
+                .and_then(|c| CommitId::new(c).ok());
+            let checks = Branch::new(&delivery.base_branch)
+                .and_then(|branch| on_demand.forge.base_checks(&branch, at_push.as_ref()));
+            match checks {
+                Ok(checks) => base_read = follow::base_read_of(&checks),
+                Err(error) => {
+                    return self.merge_read_failed(
+                        memory,
+                        sink,
+                        ticket,
+                        ("base_checks", &error),
+                        now,
+                    );
+                }
+            }
+            facts.base_checks = Some(&base_read);
+            due = core::merge_due(&policy, &facts, &read);
         }
         let grant = match due {
             MergeDue::Merge(grant) => grant,

@@ -144,7 +144,7 @@ impl KeptRerun {
     }
 }
 
-fn base_read_of(base: &BaseChecks) -> BaseRead {
+pub(crate) fn base_read_of(base: &BaseChecks) -> BaseRead {
     BaseRead {
         head: base.head.to_string(),
         at_head: base.at_head.iter().map(check_read).collect(),

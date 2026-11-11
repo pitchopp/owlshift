@@ -600,6 +600,13 @@ pub struct MergeFacts<'a> {
     /// refresh. The runner reads it once [`merge_due`] waits on
     /// [`MergeBlocker::BaseMoved`] alone.
     pub disjoint: bool,
+    /// The base head's own checks and those of `base_at_push`, as the
+    /// runner read them (OWL-521; architecture section 5, "Merge on green",
+    /// "The base's own checks"): `None` until read. Consulted only for a base
+    /// that moved apart from the delivery, once every other condition holds;
+    /// the runner reads it once [`merge_due`] waits on
+    /// [`MergeBlocker::BaseUnchecked`].
+    pub base_checks: Option<&'a BaseRead>,
     /// Whether the ticket carries [`MERGE_LABEL`].
     pub labeled: bool,
     /// Whether the ticket carries the project's `[tracker].exclude` label: a
@@ -659,6 +666,14 @@ pub enum MergeBlocker {
     /// The head was not read green twice at least [`GREEN_TWICE_AFTER`]
     /// apart.
     GreenOnce,
+    /// The base moved apart from the delivery and its own checks were not
+    /// read, or were read at another head than the one decided on (OWL-521).
+    BaseUnchecked,
+    /// The base head's own checks of these names failed, and did not fail at
+    /// `base_at_push` too (OWL-521).
+    BaseRed(Vec<String>),
+    /// The base head's own checks of these names still run (OWL-521).
+    BasePending(Vec<String>),
     /// The last read found the pull request closed or merged ([`confirm_merge`]).
     Closed,
     /// The last read found another head than the grant's.
@@ -742,7 +757,43 @@ fn blocker(policy: &MergePolicy<'_>, facts: &MergeFacts<'_>, read: &Read) -> Opt
     if !green_twice {
         return Some(MergeBlocker::GreenOnce);
     }
+    // Reaching here with a moved base means a move apart from the delivery.
+    if facts.base_at_push != Some(facts.base_head) {
+        return base_hold(facts.base_head, facts.base_checks);
+    }
     None
+}
+
+/// What the base head's own checks hold (OWL-521; architecture section 5,
+/// "The base's own checks"): a check failed at `head` and not also failed at
+/// `base_at_push`, which the pull request's green checks ran past, every
+/// failed one when those of `base_at_push` were not read; else a check still
+/// running. Checks are taken by name, as [`decide`] takes them. A head with
+/// no checks holds nothing.
+fn base_hold(head: &str, base: Option<&BaseRead>) -> Option<MergeBlocker> {
+    let Some(base) = base.filter(|base| base.head == head) else {
+        return Some(MergeBlocker::BaseUnchecked);
+    };
+    let at_head = collapse(&base.at_head);
+    let ran_past = |name: &str| {
+        base.at_push
+            .as_deref()
+            .and_then(|at_push| outcome_of(at_push, name))
+            .is_some_and(CheckOutcome::failed)
+    };
+    let names = |keep: &dyn Fn(&CheckRead) -> bool| -> Vec<String> {
+        at_head
+            .iter()
+            .filter(|check| keep(check))
+            .map(|check| check.name.clone())
+            .collect()
+    };
+    let red = names(&|check| check.outcome.failed() && !ran_past(&check.name));
+    if !red.is_empty() {
+        return Some(MergeBlocker::BaseRed(red));
+    }
+    let running = names(&|check| check.outcome == CheckOutcome::Pending);
+    (!running.is_empty()).then_some(MergeBlocker::BasePending(running))
 }
 
 /// The question that keeps the ticket for a person, if one does (OWL-465):
@@ -806,6 +857,9 @@ impl MergeBlocker {
             | Self::BaseUnknown
             | Self::BaseMoved
             | Self::GreenOnce
+            | Self::BaseUnchecked
+            | Self::BaseRed(_)
+            | Self::BasePending(_)
             | Self::Closed
             | Self::HeadMoved
             | Self::BaseRetargeted
@@ -1529,6 +1583,7 @@ mod tests {
                 base_head: BASE,
                 base_at_push: Some(BASE),
                 disjoint: false,
+                base_checks: None,
                 labeled: true,
                 excluded: false,
                 questions,
@@ -1748,8 +1803,10 @@ mod tests {
                 ..facts(&GREEN, &[])
             };
             assert_eq!(wait(&moved), MergeDue::Wait(BaseMoved));
+            let green_base = base_read(&[("ci", CheckOutcome::Passed)], None);
             let apart = MergeFacts {
                 disjoint: true,
+                base_checks: Some(&green_base),
                 ..moved
             };
             assert_eq!(
@@ -1787,6 +1844,106 @@ mod tests {
                 ..facts(&GREEN, &[])
             };
             assert!(matches!(wait(&unmoved), MergeDue::Merge(_)));
+        }
+
+        /// The base head [`BASE`]'s checks, and those of `base_at_push` when
+        /// given.
+        fn base_read(
+            at_head: &[(&str, CheckOutcome)],
+            at_push: Option<&[(&str, CheckOutcome)]>,
+        ) -> BaseRead {
+            let checks = |checks: &[(&str, CheckOutcome)]| {
+                checks
+                    .iter()
+                    .map(|(name, outcome)| CheckRead::named(*name, *outcome))
+                    .collect()
+            };
+            BaseRead {
+                head: BASE.to_owned(),
+                at_head: checks(at_head),
+                at_push: at_push.map(checks),
+            }
+        }
+
+        /// OWL-521: a base that moved apart from the delivery merges only
+        /// once its head's own checks are read, none failed and none
+        /// running; a red the pull request ran past at `base_at_push` does
+        /// not hold, every red does when those were not read. A base that did
+        /// not move is never consulted, red or not.
+        #[test]
+        fn a_moved_base_holds_the_merge_while_its_own_checks_are_red_or_running() {
+            use CheckOutcome::*;
+            use MergeBlocker::*;
+            let gate = gate(DelegationLevel::Discoverable);
+            let wait = |facts: &MergeFacts<'_>| due(MergeSwitch::All, &gate, facts, &green_read());
+            let apart = MergeFacts {
+                base_at_push: Some("fedcba9876543210fedcba9876543210fedcba98"),
+                disjoint: true,
+                ..facts(&GREEN, &[])
+            };
+            let merge = MergeDue::Merge(MergeGrant::new(HEAD, MergeMethod::Rebase));
+            let held = |names: &[&str]| names.iter().map(|n| (*n).to_owned()).collect::<Vec<_>>();
+            let elsewhere = BaseRead {
+                head: HEAD.to_owned(),
+                ..base_read(&[("ci", Passed)], None)
+            };
+            let cases: [(Option<BaseRead>, MergeDue); 9] = [
+                // Unread, or read at another head than the one decided on.
+                (None, MergeDue::Wait(BaseUnchecked)),
+                (Some(elsewhere), MergeDue::Wait(BaseUnchecked)),
+                (
+                    Some(base_read(&[("ci", Passed), ("lint", Passed)], None)),
+                    merge.clone(),
+                ),
+                // A branch without CI holds nothing.
+                (Some(base_read(&[], Some(&[("ci", Passed)]))), merge.clone()),
+                (
+                    Some(base_read(&[("ci", CodeFailure), ("lint", Pending)], None)),
+                    MergeDue::Wait(BaseRed(held(&["ci"]))),
+                ),
+                (
+                    Some(base_read(&[("ci", Passed), ("lint", Pending)], None)),
+                    MergeDue::Wait(BasePending(held(&["lint"]))),
+                ),
+                // Ran past at `base_at_push`: only the new red holds.
+                (
+                    Some(base_read(
+                        &[("ci", CodeFailure), ("lint", OtherFailure)],
+                        Some(&[("ci", CodeFailure), ("lint", Passed)]),
+                    )),
+                    MergeDue::Wait(BaseRed(held(&["lint"]))),
+                ),
+                (
+                    Some(base_read(
+                        &[("ci", CodeFailure)],
+                        Some(&[("ci", CodeFailure)]),
+                    )),
+                    merge.clone(),
+                ),
+                (
+                    Some(base_read(&[("ci", CodeFailure)], Some(&[("ci", Pending)]))),
+                    MergeDue::Wait(BaseRed(held(&["ci"]))),
+                ),
+            ];
+            for (read, expected) in &cases {
+                let facts = MergeFacts {
+                    base_checks: read.as_ref(),
+                    ..apart
+                };
+                assert_eq!(wait(&facts), *expected, "{read:?}");
+            }
+            // The other conditions come first: one green read reads nothing.
+            let once = MergeFacts {
+                first_green: None,
+                ..apart
+            };
+            assert_eq!(wait(&once), MergeDue::Wait(GreenOnce));
+            let red = base_read(&[("ci", CodeFailure)], None);
+            let unmoved = MergeFacts {
+                base_checks: Some(&red),
+                ..facts(&GREEN, &[])
+            };
+            assert_eq!(wait(&unmoved), merge);
         }
 
         /// OWL-520: a conflict with a moved base is a rebase run, cause
