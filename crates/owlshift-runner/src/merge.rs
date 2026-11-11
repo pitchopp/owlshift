@@ -498,6 +498,18 @@ pub(crate) fn hold_words(blocker: &MergeBlocker, question: Option<&MergeQuestion
                                     way that could not be read, so a refresh rebase comes first"
             .to_owned(),
         MergeBlocker::GreenOnce => "it was read green only once on this head".to_owned(),
+        MergeBlocker::BaseUnchecked => {
+            "its base moved since the push, and the base head's own checks are not read yet"
+                .to_owned()
+        }
+        MergeBlocker::BaseRed(checks) => format!(
+            "its base moved since the push, and the base head's own checks fail: {}",
+            checks.join(", ")
+        ),
+        MergeBlocker::BasePending(checks) => format!(
+            "its base moved since the push, and the base head's own checks still run: {}",
+            checks.join(", ")
+        ),
         MergeBlocker::Closed => "it is not open".to_owned(),
         MergeBlocker::HeadMoved => "its head is no longer Owlshift's last push".to_owned(),
         MergeBlocker::BaseRetargeted => {
@@ -519,6 +531,20 @@ pub(crate) fn hold_words(blocker: &MergeBlocker, question: Option<&MergeQuestion
 /// after, the following's end included.
 pub(crate) fn owes_first(delivery: &TicketDelivery) -> bool {
     delivery.owed.is_some()
+}
+
+/// The base head's checks a wait names (OWL-521), comma-separated.
+fn checks_named(data: &Data) -> String {
+    data.get("checks")
+        .and_then(Value::as_array)
+        .map(|checks| {
+            checks
+                .iter()
+                .filter_map(Value::as_str)
+                .collect::<Vec<_>>()
+                .join(", ")
+        })
+        .unwrap_or_default()
 }
 
 /// The `decision` event of a wait merge on green tells (OWL-499;
@@ -550,6 +576,14 @@ pub(crate) fn blocker_wait(blocker: &MergeBlocker) -> Option<(&'static str, Data
         MergeBlocker::BaseUnknown => "merge_base_unknown",
         MergeBlocker::BaseMoved => "merge_base_moved",
         MergeBlocker::GreenOnce => "merge_green_once",
+        // Unchecked after the read: the base moved again meanwhile.
+        MergeBlocker::BaseUnchecked => "merge_base_moved",
+        MergeBlocker::BaseRed(checks) => {
+            return Some(("merge_base_red", data([("checks", json!(checks))])));
+        }
+        MergeBlocker::BasePending(checks) => {
+            return Some(("merge_base_pending", data([("checks", json!(checks))])));
+        }
         MergeBlocker::Closed => "merge_closed",
         MergeBlocker::HeadMoved => "merge_head_moved",
         MergeBlocker::BaseRetargeted => "merge_retargeted",
@@ -616,6 +650,16 @@ pub(crate) fn wait_words(reason: &str, data: &Data) -> Option<String> {
             "its base moved right before the merge call; the next pass decides again, a merge or \
              a refresh rebase",
         ),
+        "merge_base_red" => merge(&format!(
+            "its base moved since the push, and the base head's own checks fail ({}); it merges \
+             once they pass",
+            checks_named(data)
+        )),
+        "merge_base_pending" => merge(&format!(
+            "its base moved since the push, and the base head's own checks still run ({}); it \
+             merges once they pass",
+            checks_named(data)
+        )),
         "merge_closed" => merge("the last read before the merge found it no longer open"),
         "merge_head_moved" => merge(
             "the last read before the merge found another head than Owlshift's push; the next \
@@ -721,6 +765,9 @@ mod tests {
             MergeBlocker::BaseUnknown,
             MergeBlocker::BaseMoved,
             MergeBlocker::GreenOnce,
+            MergeBlocker::BaseUnchecked,
+            MergeBlocker::BaseRed(vec!["ci".to_owned()]),
+            MergeBlocker::BasePending(vec!["ci".to_owned()]),
             MergeBlocker::Closed,
             MergeBlocker::HeadMoved,
             MergeBlocker::BaseRetargeted,
@@ -761,6 +808,16 @@ mod tests {
              the docs\" on the tracker, which comes first; the tracker refused the last filing: \
              tracker: the plan holds 250 issues. Owlshift tries again at each pass, then gets it \
              a refresh rebase or merges it"
+        );
+        let (reason, fields) = blocker_wait(&MergeBlocker::BaseRed(vec![
+            "ci".to_owned(),
+            "lint".to_owned(),
+        ]))
+        .unwrap();
+        assert_eq!(
+            wait_words(reason, &wait_data(7, "p", reason, fields)).unwrap(),
+            "pull request #7 is green and not merged yet: its base moved since the push, and the \
+             base head's own checks fail (ci, lint); it merges once they pass"
         );
         assert_eq!(wait_words("slot", &Data::new()), None);
     }

@@ -129,6 +129,22 @@ impl OnDemand<'_> {
                 )
                 .disjoint()
             });
+        // The base head's own checks decide last on a base that moved apart
+        // (OWL-521), read as watch reads them.
+        let moved_apart =
+            disjoint && delivery.base_at_push.as_deref() != Some(p.base.commit.as_str());
+        let base_checks = if moved_apart {
+            let at_push = delivery
+                .base_at_push
+                .as_deref()
+                .and_then(|c| CommitId::new(c).ok());
+            let read = Branch::new(&delivery.base_branch)
+                .and_then(|branch| self.forge.base_checks(&branch, at_push.as_ref()))
+                .map_err(|e| format!("reading the base's checks: {e}"))?;
+            Some(crate::follow::base_read_of(&read))
+        } else {
+            None
+        };
         let facts = MergeFacts {
             decision: &seen.decision,
             pushed,
@@ -139,6 +155,7 @@ impl OnDemand<'_> {
             base_head: &p.base.commit,
             base_at_push: delivery.base_at_push.as_deref(),
             disjoint,
+            base_checks: base_checks.as_ref(),
             labeled: labels.iter().any(|label| label == core::MERGE_LABEL),
             excluded: tracker
                 .exclude
