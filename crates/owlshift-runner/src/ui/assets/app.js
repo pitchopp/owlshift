@@ -990,7 +990,10 @@ function trackerLink(reply) {
 
 function replyForm(handle, reply, questions) {
   const el = make("div", "reply");
-  const decider = reply.decider.account + " (" + String(reply.decider.by).replace(/_/g, " ") + ")";
+  // The decider's name once the UI has read it (OWL-517), else the account
+  // id the ask keeps.
+  const decider = (reply.decider.name || reply.decider.account) + " (" +
+    String(reply.decider.by).replace(/_/g, " ") + ")";
   const posted = handle.posted && handle.posted[reply.ask];
   if (posted) {
     el.appendChild(make("p", "state-success", posted));

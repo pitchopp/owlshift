@@ -18,7 +18,8 @@
 //!   `policy.ticket_budget_usd` of the project file the project is served on;
 //! - `questions`: the asks and the decisions of `questions.json`, and
 //!   `reply`, the reply form of the open ask, offered when the operator's
-//!   tracker key is its decider's ([`super::reply::section`], OWL-475);
+//!   tracker key is its decider's ([`super::reply::section`], OWL-475),
+//!   its decider named once the name is read (OWL-517);
 //! - `plan`: the current plan, the distinct plans of the history with each
 //!   one's diff against the one before, per part, and the review passes;
 //! - `waits`: what the ticket waits on, as `owlshift status --waits` tells it;
@@ -110,6 +111,9 @@ pub struct Inputs<'a> {
     pub now: Timestamp,
     /// The project's tracker key, for the reply form (OWL-475).
     pub key: &'a KeyState,
+    /// The name read so far of a decider's account, which a read key that
+    /// is not theirs is asked for (OWL-517): never waits on a read.
+    pub names: &'a dyn Fn(&str) -> Option<String>,
 }
 
 /// Whether `text` is a run's folder name, as `new_run_dir` makes it:
@@ -172,7 +176,7 @@ pub fn snapshot(inputs: &Inputs, repo: &Repo, ticket: &TicketId) -> Value {
         "timeline": timeline,
         "runs": section(runs(inputs, repo, &dirs, ticket)),
         "cost": on_record(&|record| cost(&dirs, record)),
-        "questions": on_record(&|record| questions(record, inputs.key, ticket)),
+        "questions": on_record(&|record| questions(record, inputs, ticket)),
         "plan": plan,
         "waits": section(waits(inputs, repo, ticket)),
         "actions": actions(&dirs, ticket, &latest),
@@ -582,11 +586,11 @@ fn cost(dirs: &ProjectDirs, record: &TicketRecord) -> Value {
 
 /// The asks and the decisions of the ticket, and the reply form of its
 /// open ask, null when it waits for no answer.
-fn questions(record: &TicketRecord, key: &KeyState, ticket: &TicketId) -> Value {
+fn questions(record: &TicketRecord, inputs: &Inputs, ticket: &TicketId) -> Value {
     json!({
         "asks": as_json!(&record.questions.asks),
         "decisions": as_json!(&record.questions.decisions),
-        "reply": reply::section(record, key, ticket),
+        "reply": reply::section(record, inputs.key, ticket, inputs.names),
     })
 }
 
@@ -899,6 +903,7 @@ mod tests {
                 concurrent_runs: 2,
                 now: Timestamp::now(),
                 key,
+                names: &|_| None,
             };
             snapshot(&inputs, &self.repo, &TicketId::new(ticket).unwrap())
         }

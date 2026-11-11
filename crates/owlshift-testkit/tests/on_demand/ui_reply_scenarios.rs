@@ -83,6 +83,7 @@ fn ready(account: &str) -> KeyState {
     KeyState::Ready(Key {
         account: key_of(account),
         tracker: Box::new(LinearTracker::with_transport(Unreachable)),
+        names: Box::new(|_: &str| Ok(None)),
     })
 }
 
@@ -221,7 +222,7 @@ fn a_ui_reply_without_go_settles() {
 fn the_form_is_absent_and_the_writer_refuses_for_another_decider() {
     let bench = asked();
     let record = bench.record();
-    let offer = section(&record, &ready("someone-else"), &ticket());
+    let offer = section(&record, &ready("someone-else"), &ticket(), &|_| None);
     assert_eq!(offer["offered"], false, "{offer:#}");
     assert_eq!(offer["decider"]["account"], "maintainer");
     assert!(
@@ -232,7 +233,7 @@ fn the_form_is_absent_and_the_writer_refuses_for_another_decider() {
         "{offer:#}"
     );
     assert_eq!(
-        section(&record, &ready("maintainer"), &ticket())["offered"],
+        section(&record, &ready("maintainer"), &ticket(), &|_| None)["offered"],
         true
     );
     let before = bench.comments().len();
@@ -267,7 +268,7 @@ fn awaiting_approval() -> Bench {
         "{outcome:?}\n{printed}"
     );
     let record = bench.record();
-    let offer = section(&record, &ready("maintainer"), &ticket());
+    let offer = section(&record, &ready("maintainer"), &ticket(), &|_| None);
     assert_eq!(offer["approval"], true, "{offer:#}");
     assert_eq!(offer["offered"], true, "{offer:#}");
     bench
@@ -314,7 +315,7 @@ fn a_plan_changed_from_the_ui_goes_back_to_design() {
     let letter = owlshift_contracts::result::option_letter(1);
     // A change option that needs words, as the reply section lists them, is
     // refused without them, nothing posted.
-    let offer = section(&record, &ready("maintainer"), &ticket());
+    let offer = section(&record, &ready("maintainer"), &ticket(), &|_| None);
     let needs_words = offer["words"]["Q1"]
         .as_array()
         .unwrap()
