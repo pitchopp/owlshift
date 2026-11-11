@@ -2557,7 +2557,7 @@ OWL-21 (the `ci` check required on `main`) can be done at once. OWL-163 and OWL-
 
 ## P9 tasks & exit gate
 
-The tasks are the parts above, in the Linear project "P9 · Open-source readiness": OWL-T1 (part 1), OWL-T2 (2), OWL-T3 (3), OWL-T4 (4), OWL-T5 (5), OWL-T6 (6), OWL-T7 (7), OWL-T8 (8), OWL-34 (9), OWL-T10 (10), OWL-T11 (11), OWL-T12 (12) and OWL-T13 (13), with OWL-21, OWL-163 and OWL-164.
+The tasks are the parts above, in the Linear project "P9 · Open-source readiness": OWL-532 (part 1), OWL-533 (2), OWL-534 (3), OWL-535 (4), OWL-536 (5), OWL-537 (6), OWL-538 (7), OWL-539 (8), OWL-34 (9), OWL-540 (10), OWL-541 (11), OWL-542 (12) and OWL-543 (13), with OWL-21, OWL-163 and OWL-164.
 
 **Exit gate.** The second project adopts Owlshift with configuration only, no change to the core. Run by the maintainer with the friend whose project it is (D6), once the parts are merged and release 0.1 is published. How many tickets and how long are set with the maintainer when the gate is prepared, as P7's and P8's runs were:
 
