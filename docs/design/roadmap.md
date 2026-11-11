@@ -194,14 +194,25 @@ Follow and drive the drain from a browser.
 ## P9 · Open-source readiness
 
 - GitHub Issues adapter, public Markdown tracker, conformance suites, `init` stack detection. Scenario S15.
-- A second project on another stack (decision D6); the Docker server image; signed release 0.1; the repository made public.
+- A second project (decision D6); signed release 0.1; the repository made public.
 - `owlshift self-update`, for an install made without a package manager (P7's reading).
+- The [build plan](build-plan.md), "P9 · Open-source readiness", gives the GitHub Issues adapter's rules and its live checks, and says who builds what and how the exit gate is run.
+
+**Readings and deviations** (decided with the maintainer on 2026-11-12).
+
+- The second project (D6) is a project of a friend of the maintainer's, who adopts Owlshift on it. Its stack and its tracker are recorded when the gate is prepared, so "on another stack" is known then, and no part of P9 depends on it: the GitHub Issues adapter is proven on the sandbox repository whatever that project uses.
+- The Docker server image moves to P10, with the team-server mode it serves.
+- The Markdown tracker is published as the mode without an account, on one machine, for `owlshift do` in a checkout: it commits nothing and the daemon does not serve it. A shared mode waits for a real demand.
+- "Signed" is Owlshift's own key: a checksum and a signature that `self-update` verifies. Apple's notarization waits for the P11 app, the first download through a browser.
+- The Markdown tracker's front matter stays TOML (OWL-34).
+- The repository is public already (checked on 2026-11-12), so that line is done.
+- On GitHub Issues Owlshift has no identity of its own: its comments are the signed-in person's, as on Linear through a key without the app. An agent identity there needs a server that holds the app's private key, which is P10's.
 
 **Exit gate.** The second project adopts Owlshift with configuration only, no change to the core.
 
 ## P10 · Teams
 
-Deciders, identity map across tracker and forge, per-developer runners, team-server mode, agent identities (Linear app user, GitHub App), claims with leases on git refs and the takeover of an expired one (S11's part, P7's reading). Scenario S14.
+Deciders, identity map across tracker and forge, per-developer runners, team-server mode and its Docker server image (P9's reading), agent identities (Linear app user, GitHub App), claims with leases on git refs and the takeover of an expired one (S11's part, P7's reading). Scenario S14.
 
 **Exit gate.** Two developers share one project for two weeks.
 
