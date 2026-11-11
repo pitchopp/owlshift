@@ -18,6 +18,10 @@ owlshift-adapters.workspace = true
 owlshift-runner = { workspace = true, features = ["testkit"] }
 # `gh::warm_up` starts gh with a deadline.
 owlshift-platform.workspace = true
+# `owlshift-cli-bench`: the command line's entry, run with a keychain held in
+# memory (OWL-522). The dependency runs this way only: the CLI never depends
+# on the bench.
+owlshift-cli.workspace = true
 clap.workspace = true
 jiff.workspace = true
 serde.workspace = true

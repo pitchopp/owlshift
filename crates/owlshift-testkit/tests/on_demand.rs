@@ -12654,3 +12654,9 @@ mod ui_reply_scenarios;
 /// (OWL-508).
 #[path = "on_demand/ui_bench_scenarios.rs"]
 mod ui_bench_scenarios;
+
+/// The web UI's Restart child run end to end through the command line's own
+/// code, on a served bench (OWL-522).
+#[cfg(unix)]
+#[path = "on_demand/cli_restart_scenarios.rs"]
+mod cli_restart_scenarios;

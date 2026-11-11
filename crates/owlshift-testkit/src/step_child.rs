@@ -48,6 +48,7 @@ use owlshift_runner::executor::{Git, Harness};
 use owlshift_runner::on_demand::{self, OnDemand};
 use owlshift_runner::project::ProjectDirs;
 use owlshift_runner::routing::Router;
+use owlshift_runner::served;
 use owlshift_runner::slots::MachineSlots;
 use owlshift_runner::step::Children;
 use owlshift_runner::ticket_ref::{self, TicketRecord};
@@ -88,6 +89,11 @@ pub struct ChildProject {
     /// ([`FileNotifier`]). None: this machine shows no notification.
     #[serde(default)]
     pub notes: Option<PathBuf>,
+    /// The URL the dedicated checkout clones and fetches, when not the bare
+    /// remote's path: the GitHub URL of a served project, which the bench's
+    /// git configuration sends to the bare remote ([`served_parked_at_build`]).
+    #[serde(default)]
+    pub remote_url: Option<String>,
 }
 
 /// The machine's run slots of [`ChildProject::slots`].
@@ -138,6 +144,7 @@ impl ChildProject {
             reply,
             slots: None,
             notes: None,
+            remote_url: None,
         }
     }
 
@@ -298,7 +305,10 @@ impl ChildProject {
         let tracker = MarkdownTracker::new(&self.checkout);
         let forge = GitHubForge::with_transport(NoForge, Repo::parse(REPO).unwrap());
         let dirs = self.dirs();
-        let remote_url = self.bare.to_string_lossy().into_owned();
+        let remote_url = self
+            .remote_url
+            .clone()
+            .unwrap_or_else(|| self.bare.to_string_lossy().into_owned());
         let usage = UsageStore::in_data_dir(&self.data);
         let notes = self.notes.clone().map(FileNotifier);
         let on_demand = OnDemand {
@@ -380,6 +390,80 @@ pub fn step_children(file: &Path, program: &Path) -> Children<'static> {
         command.arg(&file).arg(ticket.as_str()).arg(envelope);
         command
     })
+}
+
+/// The GitHub URL a served bench's project is registered with. git reads it
+/// through the bench's `core.sshCommand`, which serves the bare remote on
+/// this machine, so nothing reaches GitHub; `url.<base>.insteadOf` would not
+/// do, since `git remote get-url` gives the rewritten URL, which is not
+/// GitHub's.
+pub const SERVED_URL: &str = "git@github.com:demo/project.git";
+
+/// OWL-522: [`ChildProject::seed`] under `root` as the background service
+/// serves it, DEMO-1 parked at Build in this process: the person's checkout,
+/// which holds the tickets, registered in the data directory's list of
+/// served projects with [`SERVED_URL`] as its `origin`, and its project
+/// file kept from the default branch, as `owlshift start` and the served
+/// watch leave them; the park is the one a Build whose result is refused at
+/// each attempt leaves.
+pub fn served_parked_at_build(root: &Path, harness: PathBuf) -> ChildProject {
+    let mut project = ChildProject::seed(root, harness);
+    let env = project.env();
+    // `git@github.com:demo/project.git` is `demo/project.git` under `ssh`,
+    // a link to the bare remote: the "ssh" command runs the git command it
+    // is given there.
+    let ssh = root.join("ssh");
+    fs::create_dir_all(ssh.join("demo")).unwrap();
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(&project.bare, ssh.join("demo/project.git")).unwrap();
+    let command = root.join("local-ssh");
+    fs::write(
+        &command,
+        format!(
+            "#!/bin/sh\n# The git command an ssh host would run, run here.\ncd '{}' && exec sh -c \"$2\"\n",
+            ssh.display()
+        ),
+    )
+    .unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        fs::set_permissions(&command, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let command = command.to_str().expect("a UTF-8 bench path");
+    for (key, value) in [("core.sshCommand", command), ("ssh.variant", "simple")] {
+        env.run(&project.checkout, &["config", "--global", key, value])
+            .unwrap();
+    }
+    env.run(
+        &project.checkout,
+        &["remote", "set-url", "origin", SERVED_URL],
+    )
+    .unwrap();
+    project.remote_url = Some(SERVED_URL.to_owned());
+
+    project.play(Reply::default(), Some(&intake_done()));
+    let ticket = TicketId::new(TICKET).unwrap();
+    let mut out = Vec::new();
+    // `do` takes it in, then its Build plays the intake's result, which is
+    // refused at each attempt: parked at Build.
+    let parked = project.with_on_demand(&mut out, |on_demand, sink| on_demand.run(&ticket, sink));
+    assert!(
+        parked_at_build(&project, TICKET),
+        "{parked:?}\n{}",
+        String::from_utf8_lossy(&out)
+    );
+
+    let repo = Repo::parse(REPO).unwrap();
+    served::Registry::in_data_dir(&project.data)
+        .register(&repo, &project.checkout)
+        .unwrap();
+    let git = Git::with_setup("git", move |command| env.apply(command));
+    let located = served::Served::locate(&git, &project.data, &repo).unwrap();
+    let accept = |text: &str| served::accept(&repo, text, None);
+    let mut sink = EventSink::new(REPO, EventLog::in_dir(&project.data), &mut out);
+    served::prepare(&git, &located, &accept, None, &mut sink).unwrap();
+    project
 }
 
 /// Appends each notification to the file it names, one line each.

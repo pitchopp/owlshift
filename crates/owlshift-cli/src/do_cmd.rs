@@ -108,19 +108,21 @@ impl<'a> Mode<'a> {
 }
 
 /// Runs `mode` on the project of the working directory, or, with `served`,
-/// on that served project (OWL-434).
+/// on that served project (OWL-434), the keychain opened by `open_keychain`
+/// (OWL-522: the binary's own choice, the system's in `owlshift`).
 pub fn run(
     system: &dyn System,
     config: &Effective,
     mode: Mode<'_>,
     served: Option<&Repo>,
+    open_keychain: fn() -> Result<Keychain, KeychainError>,
 ) -> ExitCode {
     let ran = match served {
         None => crate::data_dir()
             .map_err(Refusal::from)
-            .and_then(|data_dir| run_with(system, config, mode, Keychain::system, None, &data_dir))
+            .and_then(|data_dir| run_with(system, config, mode, open_keychain, None, &data_dir))
             .map(Ended::code),
-        Some(repo) => run_served(system, config, mode, repo, Keychain::system),
+        Some(repo) => run_served(system, config, mode, repo, open_keychain),
     };
     ran.unwrap_or_else(|refusal| {
         fail(&refusal.message);
