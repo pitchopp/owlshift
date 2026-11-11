@@ -848,7 +848,7 @@ Five adapter kinds, each declaring its capabilities; `init` refuses a project wh
 
 The forge's merge capability is declared by the GitHub adapter; refusing a `[forge] merge` other than `never` on a forge without it is not built yet, GitHub being the only forge (the forge trait comes with the second adapter).
 
-The Markdown tracker is not a toy: it is the core's test double, the zero-account demo, and the mode for projects without a tracker.
+The Markdown tracker is not a toy: it is the core's test double, the zero-account demo, and the mode for projects without a tracker. As published in P9 it serves one machine, for `owlshift do` in a checkout: it commits nothing and the daemon does not serve it, a shared mode waiting for a real demand ([roadmap](roadmap.md), P9's readings).
 
 **Tracker capabilities.**
 
@@ -1027,7 +1027,7 @@ The costs: slower first iterations than TypeScript, and fewer casual contributor
 
 Twelve small steps, P0 to P11, each shippable and usable on its own; the full list, exit gates and scenario coverage are in the [roadmap](roadmap.md). P2, the question loop on the ticket, is the bet; parallelism waits until P6 because a serial drain cannot collide.
 
-Owlshift works on its own backlog, in a dedicated Linear workspace, from P1; the first external adopter is Locary (Linear, GitHub, a Django and Next.js stack) from P5, whose Linear team already has a Needs Input state and Triage enabled since 2026-09-21. The second project for P9 is still to be chosen (decision D6); without it, neutrality stays a claim.
+Owlshift works on its own backlog, in a dedicated Linear workspace, from P1; the first external adopter is Locary (Linear, GitHub, a Django and Next.js stack) from P5, whose Linear team already has a Needs Input state and Triage enabled since 2026-09-21. The second project for P9 is a project of a friend of the maintainer's (decision D6, 2026-11-12); until it has adopted Owlshift, neutrality stays a claim.
 
 **Out of scope for now:** merging automatically, a hosted service, a board or UI competing with the tracker, version control other than git, running third-party adapters in-process, telemetry of any kind.
 
@@ -1042,7 +1042,7 @@ D1, D2, D3, D4, D5, D7, D8, D9, D10, D11, D13 and D14 are agreed; two decisions 
 | D3 | Product name | Owlshift, hosted on the maintainer's personal GitHub account; `owlshift.dev` not registered according to the `.dev` registry (2026-09-28, [check C6](build-plan.md#results)) | Agreed |
 | D4 | First adapter set (P1 to P5) | Tracker: Linear. Forge: GitHub. Harnesses: Claude Code for building and reviewing (agreed 2026-10-15, OWL-296: in P5 the authoring roles stay on Claude Code whatever the routing verdict. The review roles ran on Codex, on Claude Code where Codex was not usable, until the maintainer decided on 2026-10-18, OWL-347, that they run on Claude Code only, so that no second subscription is required; the Codex adapter stays for a reviewer of another family as an opt-in complement, OWL-348). From P6, a declared fallback harness takes over the review roles only, never the authoring roles (OWL-398, section 5, "Parallel") | Agreed |
 | D5 | Config format | TOML (decided 2026-09-27): a product-owned `owlshift.toml` for pipeline, routing and policy; importing a Symphony-style `WORKFLOW.md` stays an optional later addition | Agreed |
-| D6 | Second validation project for P9 | A project on another stack, ideally on GitHub Issues; to name | Open |
+| D6 | Second validation project for P9 | A project of a friend of the maintainer's, who adopts Owlshift on it (decided 2026-11-12); its stack and tracker are recorded when P9's gate is prepared | Agreed |
 | D7 | Default runner location | The developer's machine; a team server is a P10 mode | Agreed |
 | D8 | Agent identity on Linear from P2 | A Linear app user (decided 2026-10-04, OWL-141, once [check C4](build-plan.md#results) confirmed it works with polling and no public endpoint): an OAuth app the workspace creates with client credentials, no webhook and no mention or delegation scope, whose token the runner requests for each run. In the check, Linear notified the decider of its comment and of its mention of them, and not of a comment posted through their own key; a decider not subscribed to the issue is reached by a mention. The desktop notification stays the operator's channel on their machine. Built in OWL-157, and optional: with the app stored, every comment and stage move comes from its user, the questions, re-asks and replies mention the decider, and an app that cannot be used refuses the run rather than fall back; without it, Owlshift writes through the personal API key and `owlshift doctor` warns | Agreed |
 | D9 | Windows scope | WSL2 from P1; native Windows only when a user needs it. Decided 2026-09-29: native Windows confinement is set aside; a confined run is refused there and WSL2 is the supported path. The live checks (OWL-72: a plain AppContainer cannot run git, a restricted token was compared, [build plan](build-plan.md#results)) are the starting point if native Windows comes back; the `owlshift-launch` launcher that OWL-71 built for it was removed (2026-09-30, OWL-89) | Agreed |

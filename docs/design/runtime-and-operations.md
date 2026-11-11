@@ -66,7 +66,7 @@ Native binary on every developer machine; Windows goes through WSL2 first; Docke
 
 **Where Docker fits.**
 
-1. **Server mode:** an official image and a compose file for a Linux server, where there is no VM overhead. Codex is logged in inside the server once, and the Claude Code token is made with `claude setup-token` and stored by `owlshift init`, as on any machine.
+1. **Server mode** (P10, with the team-server mode: [roadmap](roadmap.md), P9's readings): an official image and a compose file for a Linux server, where there is no VM overhead. Codex is logged in inside the server once, and the Claude Code token is made with `claude setup-token` and stored by `owlshift init`, as on any machine.
 2. **Optional sandbox per project:** each run in a disposable container, a layer of defence on top of the harnesses' own sandboxes, worth it for public repositories.
 
 ## Install, lifecycle & uninstall
@@ -113,7 +113,7 @@ One update path per install method, a restart that never loses work, and a versi
 
 **The binary.**
 
-- Installed by a package manager: `brew upgrade owlshift`. Installed by hand: `owlshift self-update`, which downloads a signed release and verifies its checksum, comes with the first signed release (P9). `self-update` refuses on a package-managed install and points to the package manager, so the two never fight.
+- Installed by a package manager: `brew upgrade owlshift`. Installed by hand: `owlshift self-update`, which downloads a signed release and verifies its signature, made with Owlshift's own key, and its checksum, comes with the first signed release (P9; [build plan](build-plan.md), "P9 · Open-source readiness"). `self-update` refuses on a package-managed install and points to the package manager, so the two never fight.
 - The service points to a stable path (`/opt/homebrew/bin/owlshift`), never to a versioned directory, so an upgrade cannot break it.
 - Graceful restart (P7): the new binary, at `start` or `doctor`, asks the running daemon of an older version, or at the same version of an older build of another commit or a dirty one (OWL-462: `owlshift --version` names the build), to drain, when the service at login started it and starts this binary (otherwise it says to run `owlshift stop`, then `owlshift start`); the watches stop dispatching, let the steps under way finish, and exit, then the daemon exits with 75 and the service manager starts the new binary. The daemon and its children keep running the binary resolved when the daemon started, so a step is never spawned from a half-upgraded install. Safe because state lives in the tracker, git and the files P6 keeps.
 - Rollback: the previous version stays installable (`brew install owlshift@0.4`), and the local store is backed up before each migration.
