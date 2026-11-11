@@ -33,6 +33,7 @@ use owlshift_contracts::config::{Admit, ProjectConfig, States, Tracker, TrackerK
 use owlshift_contracts::ids::TicketId;
 use owlshift_contracts::service::BuildIdentity;
 use owlshift_contracts::{DelegationLevel, Harness};
+use owlshift_core::floor::same_account;
 use owlshift_core::gate::PassLimit;
 use owlshift_core::schedule::{holds_slot, natural_cmp};
 use owlshift_core::vocab::Stage;
@@ -1822,7 +1823,7 @@ fn drain_admission_check(
             }
             let mut accounts = false;
             for id in tracker.admitters.iter().flatten() {
-                match found.accounts.iter().find(|a| &a.id == id) {
+                match found.accounts.iter().find(|a| same_account(&a.id, id)) {
                     None => {
                         problems.push(format!("admitter {id:?} is no account of the workspace"))
                     }

@@ -25,6 +25,7 @@ use owlshift_contracts::brief::{
 };
 use owlshift_contracts::comment::MarkedComment;
 use owlshift_contracts::refs::AnsweredReview;
+use owlshift_core::floor::same_account;
 
 /// A review due: its author's login as `[forge].reviewers` lists it, and
 /// the tracker account that login maps to.
@@ -35,10 +36,10 @@ pub struct Due<'r> {
 }
 
 impl Due<'_> {
-    /// Whether it is the decider's: an instruction on the change. An empty
-    /// account matches nothing.
+    /// Whether it is the decider's: an instruction on the change. Accounts
+    /// compare by [`same_account`]: a blank one matches nothing.
     pub fn instructs(&self, decider: &str) -> bool {
-        !decider.trim().is_empty() && self.account == decider
+        same_account(self.account, decider)
     }
 }
 
@@ -258,6 +259,11 @@ mod tests {
         assert!(instructed(&due, ANN));
         assert!(!instructed(&due[1..], ANN));
         assert!(!instructed(&due, ""), "an empty account decides nothing");
+        let blank = Due {
+            account: " ",
+            ..due[0]
+        };
+        assert!(!blank.instructs(" "), "a blank account is no decider's");
         assert_eq!(newest(&due), Some(at(10)));
     }
 
