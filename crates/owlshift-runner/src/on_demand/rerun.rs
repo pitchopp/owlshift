@@ -26,7 +26,8 @@ impl OnDemand<'_> {
     /// run started stops the repair with a look, nothing run or counted;
     /// a call with no verdict keeps the claim, warned of, and stops the
     /// same way, the hour's `unseen` outcome bounding the wait; a spent
-    /// budget before any run started gives the claim back. A refusal keeps
+    /// budget, or a workflow run still in progress (OWL-525), before any run
+    /// started gives the claim back, for a later read. A refusal keeps
     /// the outcome `refused` with GitHub's words and returns the delivery as
     /// kept, for the fix run that follows. Each refusal is warned of once
     /// per ticket while watch runs, again when GitHub's words change
@@ -91,12 +92,13 @@ impl OnDemand<'_> {
                 Err(WriteError::Forge(error))
                     if error.kind == ErrorKind::RateLimited && started.is_empty() =>
                 {
-                    self.keep_rerun(p, state, delivery)?;
-                    return Err(Stop::Refused(format!(
-                        "re-running pull request #{}'s failed checks: GitHub's rate limit is \
-                         spent ({error}); the next read tries again",
-                        pr.number
-                    )));
+                    return Err(self.give_back(
+                        p,
+                        state,
+                        delivery,
+                        pr,
+                        &format!("GitHub's rate limit is spent ({error})"),
+                    ));
                 }
                 Err(error) => RerunAnswer::Refused {
                     permission: false,
@@ -104,8 +106,27 @@ impl OnDemand<'_> {
                     message: error.to_string(),
                 },
             };
+            // A run still in progress after another started: the claim is
+            // spent, so it is told as a later refusal.
+            let answer = match answer {
+                RerunAnswer::Running { message } if !started.is_empty() => RerunAnswer::Refused {
+                    permission: false,
+                    status: 403,
+                    message,
+                },
+                answer => answer,
+            };
             match answer {
                 RerunAnswer::Started => started.push(*run),
+                RerunAnswer::Running { message } => {
+                    return Err(self.give_back(
+                        p,
+                        state,
+                        delivery,
+                        pr,
+                        &format!("GitHub says workflow run {run} is still running ({message})"),
+                    ));
+                }
                 RerunAnswer::NoVerdict { reason } => {
                     sink.emit(
                         &ticket,
@@ -204,6 +225,31 @@ impl OnDemand<'_> {
                     .to_owned(),
             ),
         })
+    }
+
+    /// Gives the claim back when nothing ran: keeps `delivery`, the ref's
+    /// delivery before the claim, with no re-run, and stops the repair, `why`
+    /// saying what GitHub answered, so a later read claims and calls again.
+    /// A re-run `delivery` kept was of an earlier head, its outcome told or
+    /// dropped by [`Self::tell_replaced_rerun`] before the claim, so it is
+    /// not tried again at each later claim.
+    fn give_back(
+        &self,
+        p: &mut Prepared,
+        state: &TicketState,
+        delivery: &TicketDelivery,
+        pr: &DeliveredPullRequest,
+        why: &str,
+    ) -> Stop {
+        let mut back = delivery.clone();
+        back.rerun = None;
+        if let Err(stop) = self.keep_rerun(p, state, &back) {
+            return stop;
+        }
+        Stop::Refused(format!(
+            "re-running pull request #{}'s failed checks: {why}; a later read tries again",
+            pr.number
+        ))
     }
 
     /// Keeps `delivery`, its re-run as changed, in the ticket ref.

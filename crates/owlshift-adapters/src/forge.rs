@@ -345,6 +345,10 @@ pub enum RerunAnswer {
         status: u16,
         message: String,
     },
+    /// The forge refused it while the workflow run is still in progress
+    /// (OWL-525): nothing started, and a later call, once the run has
+    /// ended, may.
+    Running { message: String },
     /// No answer that says whether it started: a timeout, a reset
     /// connection, a server error.
     NoVerdict { reason: String },

@@ -1629,11 +1629,19 @@ fn ran_nothing(response: &Response, message: &str) -> Option<Error> {
 /// permission for, as documented for a GitHub App's token.
 const NOT_ACCESSIBLE: &str = "Resource not accessible by";
 
+/// The words of GitHub's refusal of a re-run while the workflow run is in
+/// progress, matched without case: HTTP 403 "This workflow is already
+/// running", observed on 2026-11-11 with a user's OAuth token (OWL-525).
+const ALREADY_RUNNING: &str = "already running";
+
 /// What GitHub's answer to a re-run of failed jobs says (OWL-513): started
 /// on a 2xx (GitHub documents 201), a refusal on a 4xx but 408, a permission
 /// refusal only on a 403 whose message says the resource is not accessible
-/// by the integration (or the personal token); no verdict otherwise. `Err`
-/// as for a merge: a rejected token or a spent budget.
+/// by the integration (or the personal token), and a run still in progress
+/// on a 403 saying the workflow is already running
+/// (OWL-525); no verdict otherwise. Reworded, that last refusal reads as
+/// any other, which sends the head to its fix run. `Err` as for a merge: a
+/// rejected token or a spent budget.
 pub fn rerun_answer(response: &Response) -> Result<RerunAnswer, Error> {
     let status = response.status;
     let message = redact(
@@ -1651,6 +1659,9 @@ pub fn rerun_answer(response: &Response) -> Result<RerunAnswer, Error> {
         408 => RerunAnswer::NoVerdict {
             reason: format!("GitHub answered HTTP 408 {message}"),
         },
+        403 if message.to_ascii_lowercase().contains(ALREADY_RUNNING) => {
+            RerunAnswer::Running { message }
+        }
         400..=499 => RerunAnswer::Refused {
             permission: status == 403 && message.starts_with(NOT_ACCESSIBLE),
             status,
@@ -3343,7 +3354,10 @@ mod tests {
             }
         );
         for (status, body) in [
-            (403, r#"{"message":"This workflow run is not completed"}"#),
+            (
+                403,
+                r#"{"message":"Unable to re-run this workflow run because it was created over a month ago"}"#,
+            ),
             (422, r#"{"message":"Unprocessable Entity"}"#),
             (404, r#"{"message":"Not Found"}"#),
         ] {
@@ -3358,6 +3372,22 @@ mod tests {
                 "HTTP {status} {body}"
             );
         }
+    }
+
+    /// OWL-525: GitHub's refusal of a re-run while the workflow run is in
+    /// progress, in its words of 2026-11-11, asks for a later call.
+    #[test]
+    fn a_rerun_of_a_run_in_progress_is_told_as_running() {
+        let (forge, _) = posts(vec![Ok(answer(
+            403,
+            r#"{"message":"This workflow is already running","documentation_url":"https://docs.github.com/rest/actions/workflow-runs#re-run-failed-jobs-from-a-workflow-run","status":"403"}"#,
+        ))]);
+        assert_eq!(
+            forge.rerun_failed_jobs(7).unwrap(),
+            RerunAnswer::Running {
+                message: "This workflow is already running".to_owned(),
+            }
+        );
     }
 
     /// No answer, or a server error, is no verdict, its words redacted; a

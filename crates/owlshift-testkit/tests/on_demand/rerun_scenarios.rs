@@ -347,6 +347,65 @@ fn a_red_the_base_shares_waits_then_refreshes_once_the_base_passes() {
     assert_ne!(bench.remote_branch().unwrap(), first_push);
 }
 
+/// A re-run GitHub answers without running anything, its workflow run still
+/// in progress (OWL-525, its words of 2026-11-11) or its rate limit spent:
+/// the claim is given back, no fix run starts and nothing is warned of as
+/// refused; once watch's hold of a step that left the ref as it was has
+/// passed, a pass re-runs, and the head, green on its re-run, gets no fix
+/// run at all.
+#[test]
+fn a_rerun_github_ran_nothing_for_is_tried_again_after_the_hold() {
+    for refusal in [
+        "This workflow is already running",
+        "API rate limit exceeded",
+    ] {
+        let bench = red_jobs(vec![job("ci", 10, "FAILURE")]);
+        bench.github.jobs.lock().unwrap().answer = (403, refusal);
+        let github = bench.github.clone();
+        let clock = bench.clock.clone();
+        let mut given_back = false;
+        let mut pass = 0;
+        let (outcomes, lines, printed) = bench.watch_passes(Vec::new(), &mut |_| {
+            pass += 1;
+            let mut jobs = github.jobs.lock().unwrap();
+            if jobs.calls.len() == 1 && !given_back {
+                let delivery = bench.record().delivery.unwrap();
+                assert!(delivery.rerun.is_none(), "{refusal}: {delivery:?}");
+                assert_eq!(bench.briefs().len(), 2, "{refusal}: a fix run");
+                given_back = true;
+                jobs.answer = (201, "");
+                // Past watch's hold of a step that left the ref as it was.
+                clock.set(
+                    clock
+                        .get()
+                        .checked_add(SignedDuration::from_mins(11))
+                        .unwrap(),
+                );
+            }
+            pass < 8
+        });
+        assert!(given_back, "{refusal}: {outcomes:?}\n{lines}\n{printed}");
+        assert_eq!(
+            github.jobs.lock().unwrap().calls,
+            [RUN, RUN],
+            "{refusal}: {outcomes:?}\n{lines}\n{printed}"
+        );
+        assert!(
+            outcomes.iter().any(|outcome| matches!(
+                outcome,
+                Err(Stop::Refused(why))
+                    if why.contains(refusal) && why.contains("a later read tries again")
+            )),
+            "{refusal}: {outcomes:?}"
+        );
+        assert!(warnings(&bench, "rerun_refused").is_empty(), "{refusal}");
+        assert_eq!(bench.briefs().len(), 2, "{refusal}: {lines}\n{printed}");
+        assert_eq!(state_of(&bench).fix_passes(), 0);
+        let rerun = bench.record().delivery.unwrap().rerun.unwrap();
+        assert_eq!(rerun.outcome, Some(RerunOutcomeKind::Passed), "{refusal}");
+    }
+}
+
 /// A re-run GitHub refuses for its permission: one `rerun_refused`
 /// warning, and the fix run in the same pass, as before OWL-513; the ref
 /// keeps the refusal. The fix's head, red again and refused again, gets
