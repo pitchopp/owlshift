@@ -201,6 +201,13 @@
 //!   `active` and `app`, and leaves an unknown id out, where `user(id:)`
 //!   fails with an input error.
 //!
+//! Read only, for the local web UI's decider name (OWL-517, checked
+//! 2026-11-11 through a personal key): the same `users` filter, `first: 1`
+//! and one id, answers the account's `displayName`, the key's own account
+//! included; an id shaped as a Linear id that no account has answers no
+//! node and no error; an id not shaped as one (`not-a-uuid`) fails with
+//! `INVALID_INPUT`, so [`LinearTracker::account_name`] asks for none.
+//!
 //! A rate-limited answer was not observed; it surfaces as
 //! [`ErrorKind::Other`] with Linear's code and message.
 
@@ -542,6 +549,36 @@ impl LinearTracker {
             workspace: data.organization.url_key,
         })
     }
+
+    /// The name Linear shows for the account `id`, deactivated or not, read
+    /// through the key: what the local web UI names a ticket's decider by
+    /// when the key is not theirs (OWL-517). `None` for an account Linear
+    /// does not know, for an id not shaped as a Linear id (asked for
+    /// nothing: Linear refuses one as invalid input), and for a blank name.
+    pub fn account_name(&self, id: &str) -> Result<Option<String>, Error> {
+        if !is_linear_id(id) {
+            return Ok(None);
+        }
+        let data: AccountNameData = self.call(ACCOUNT_NAME_QUERY, json!({ "ids": [id] }))?;
+        Ok(data
+            .users
+            .nodes
+            .into_iter()
+            .find(|user| user.id == id)
+            .map(|user| user.display_name.trim().to_owned())
+            .filter(|name| !name.is_empty()))
+    }
+}
+
+/// Whether `id` is shaped as a Linear id: a UUID, 8-4-4-4-12 hexadecimal
+/// digits.
+fn is_linear_id(id: &str) -> bool {
+    let parts: Vec<&str> = id.split('-').collect();
+    parts.len() == 5
+        && parts
+            .iter()
+            .zip([8, 4, 4, 4, 12])
+            .all(|(part, len)| part.len() == len && part.bytes().all(|b| b.is_ascii_hexdigit()))
 }
 
 /// What `owlshift doctor` learns of a team's admission and proposals setup
@@ -1439,6 +1476,11 @@ const ADMISSION_USERS_QUERY: &str = "query AdmissionUsers($ids: [ID!]) { \
     users(first: 50, includeDisabled: true, filter: { id: { in: $ids } }) { \
     nodes { id active app } } }";
 
+/// One account's name, by id (OWL-517).
+const ACCOUNT_NAME_QUERY: &str = "query AccountName($ids: [ID!]) { \
+    users(first: 1, includeDisabled: true, filter: { id: { in: $ids } }) { \
+    nodes { id displayName } } }";
+
 const PROPOSE_MUTATION: &str = "mutation Propose($input: IssueCreateInput!) { \
     issueCreate(input: $input) { success issue { id identifier state { id name } } } }";
 
@@ -2278,6 +2320,18 @@ struct AdmissionUsersData {
 }
 
 #[derive(Deserialize)]
+struct AccountNameData {
+    users: Teams<NamedUser>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct NamedUser {
+    id: String,
+    display_name: String,
+}
+
+#[derive(Deserialize)]
 struct AdmissionUser {
     id: String,
     active: bool,
@@ -2975,6 +3029,34 @@ mod tests {
                 .unwrap()
                 .app
         );
+    }
+
+    /// An account's name is read by its id through the key; a blank name, an
+    /// account Linear does not know, and an id that is no Linear id are none,
+    /// the last asked for nothing.
+    #[test]
+    fn an_account_name_is_read_by_id() {
+        const ID: &str = "0a1b2c3d-0000-4000-8000-00000000000a";
+        let named =
+            |name: &str| json!({ "users": { "nodes": [ { "id": ID, "displayName": name } ] } });
+        let key = Scripted::new(vec![
+            ("AccountName", named("person-1")),
+            ("AccountName", named("  ")),
+            ("AccountName", json!({ "users": { "nodes": [] } })),
+        ]);
+        let (asked, sent) = (key.asked.clone(), key.sent.clone());
+        let tracker = LinearTracker::with_transport(key);
+        assert_eq!(
+            tracker.account_name(ID).unwrap().as_deref(),
+            Some("person-1")
+        );
+        assert_eq!(tracker.account_name(ID).unwrap(), None);
+        assert_eq!(tracker.account_name(ID).unwrap(), None);
+        assert_eq!(sent.lock().unwrap()[0], json!({ "ids": [ID] }));
+        for not_an_id in ["", "maintainer", "0a1b2c3d-0000-4000-8000-00000000000g"] {
+            assert_eq!(tracker.account_name(not_an_id).unwrap(), None);
+        }
+        assert_eq!(asked.lock().unwrap().len(), 3);
     }
 
     #[test]

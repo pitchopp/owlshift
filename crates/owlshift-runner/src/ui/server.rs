@@ -1459,6 +1459,7 @@ fn ticket_page(context: &Context, url: &str) -> Response<Cursor<Vec<u8>>> {
         concurrent_runs: crate::usage::concurrent_runs(&personal),
         now: Timestamp::now(),
         key: &key,
+        names: &|account| context.keys.decider_name(&repo, &key, account),
     };
     json_response(200, &ticket::snapshot(&inputs, &repo, &ticket))
 }
@@ -1581,7 +1582,7 @@ fn reply_page(context: &Context, body: &[u8]) -> Response<Cursor<Vec<u8>>> {
         Ok(None) => return error_response(409, "the ticket waits for no answer"),
         Err(why) => return error_response(503, &format!("the ticket cannot be read: {why}")),
     };
-    let offer = reply::section(&stored.record, &state, &ticket);
+    let offer = reply::section(&stored.record, &state, &ticket, &|_| None);
     if offer["offered"] != Value::Bool(true) {
         if offer.is_null() || offer["ask"] != Value::String(form.ask.clone()) {
             return error_response(

@@ -3187,6 +3187,8 @@ impl ReplyGround {
                     workspace: "owlshift".into(),
                 },
                 tracker: Box::new(tracker.clone()),
+                // The decider of the bench's asks has a name on the tracker.
+                names: Box::new(|id: &str| Ok((id == "maintainer").then(|| "person-1".into()))),
             })
         });
         let ground = Ground::with_options(Options { keys, ..options() });
@@ -3304,11 +3306,18 @@ fn the_reply_form_is_offered_to_the_asks_decider_only() {
             .contains("not the decider's"),
         "{reply:#}"
     );
-    assert_eq!(
-        reply["decider"],
-        json!({ "account": "maintainer", "by": "assignee" })
-    );
+    assert_eq!(reply["decider"]["account"], "maintainer");
+    assert_eq!(reply["decider"]["by"], "assignee");
     assert_eq!(reply["link"], "https://linear.app/owlshift/issue/OWL-1");
+    // The decider's name is read off the page request, which never waits on
+    // it: a later snapshot names them (OWL-517).
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut named = reply;
+    while named["decider"]["name"].is_null() && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(20));
+        named = other.reply();
+    }
+    assert_eq!(named["decider"]["name"], "person-1", "{named:#}");
     // Without a key opener, no key: the decider named, no form, no link.
     let bare = Ground::new();
     let keyless = ReplyGround {

@@ -11,6 +11,9 @@
 //!   form is offered, only when the key's account is the open ask's decider
 //!   ([`owlshift_core::floor::same_account`]), and otherwise who the decider
 //!   is and why the form is not offered.
+//! - *The decider's name* ([`Keys::decider_name`], OWL-517): read through
+//!   the key on a thread of its own, once per project and account, the page
+//!   request never waiting on it; the account id stands for it meanwhile.
 //! - *The composition* ([`compose`]): the picked options and the texts in the
 //!   answer check's form (`Q1: B`, `ok` for every recommendation), with a
 //!   last line `go` unless "count it now" is unticked.
@@ -21,6 +24,7 @@ use std::collections::HashMap;
 use std::fmt;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use owlshift_adapters::forge::Repo;
 use owlshift_adapters::tracker::linear::{ApiKey, KeyAccount, LinearTracker};
@@ -40,11 +44,16 @@ use crate::secrets;
 use crate::ticket_ref::TicketRecord;
 use crate::writer::{WriteError, Writer};
 
-/// The operator's tracker key, opened: its account and the adapter that
-/// posts through it.
+/// Reads the name the tracker shows for an account id, through a key:
+/// `None` for an account it does not know.
+pub type NameReader = Box<dyn Fn(&str) -> Result<Option<String>, String> + Send + Sync>;
+
+/// The operator's tracker key, opened: its account, the adapter that posts
+/// through it, and the read of another account's name through it.
 pub struct Key {
     pub account: KeyAccount,
     pub tracker: Box<dyn Tracker + Send + Sync>,
+    pub names: NameReader,
 }
 
 impl fmt::Debug for Key {
@@ -69,13 +78,32 @@ pub enum KeyState {
     Unavailable(String),
 }
 
+/// How long a decider's name that could not be read stays unread before the
+/// next need of it reads it again.
+pub const NAME_RETRY: Duration = Duration::from_secs(5 * 60);
+
+/// Where the name of a decider stands, by project and account.
+#[derive(Debug)]
+enum NameState {
+    /// Being read.
+    Reading,
+    /// Read, kept while the UI runs: `None` for an account the tracker does
+    /// not know.
+    Known(Option<String>),
+    /// Could not be read, at that instant.
+    Failed(Instant),
+}
+
 /// The keys of the served projects, each read once, by lower-cased
 /// `owner/repo`: those served when the UI starts at its start
 /// ([`Keys::read_all`]), one served later at the first need of it
 /// ([`Keys::state`]). Never read again while the UI runs; a failure is kept.
+/// With them, the names of the deciders that are not the key's account
+/// ([`Keys::decider_name`]).
 pub struct Keys {
     opener: KeyOpener,
     states: Mutex<HashMap<String, Arc<KeyState>>>,
+    names: Mutex<HashMap<(String, String), NameState>>,
 }
 
 impl fmt::Debug for Keys {
@@ -93,7 +121,82 @@ impl Keys {
         Arc::new(Self {
             opener,
             states: Mutex::new(HashMap::new()),
+            names: Mutex::new(HashMap::new()),
         })
+    }
+
+    fn names(&self) -> std::sync::MutexGuard<'_, HashMap<(String, String), NameState>> {
+        self.names
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// The name of `account`, the decider of an open ask of `repo`, whose
+    /// key is `key`, as far as it is read; never waits for it. Only a read
+    /// key's, for an account that is not the key's own (whose name the key
+    /// holds): the first need of it starts its read on a thread of its own,
+    /// through the key, and answers `None`, as each need does while it is
+    /// read. A name read, or an account the tracker does not know, is kept
+    /// while the UI runs; a failed read is read again at the first need
+    /// [`NAME_RETRY`] after it.
+    pub fn decider_name(
+        self: &Arc<Self>,
+        repo: &Repo,
+        key: &Arc<KeyState>,
+        account: &str,
+    ) -> Option<String> {
+        self.decider_name_at(repo, key, account, Instant::now())
+    }
+
+    fn decider_name_at(
+        self: &Arc<Self>,
+        repo: &Repo,
+        key: &Arc<KeyState>,
+        account: &str,
+        now: Instant,
+    ) -> Option<String> {
+        let KeyState::Ready(ready) = &**key else {
+            return None;
+        };
+        if account.trim().is_empty() || same_account(&ready.account.id, account) {
+            return None;
+        }
+        let entry = (name(repo), account.to_owned());
+        {
+            let mut names = self.names();
+            match names.get(&entry) {
+                Some(NameState::Known(known)) => return known.clone(),
+                Some(NameState::Reading) => return None,
+                Some(NameState::Failed(at)) if now.saturating_duration_since(*at) < NAME_RETRY => {
+                    return None;
+                }
+                _ => {}
+            }
+            names.insert(entry.clone(), NameState::Reading);
+        }
+        let read = NameRead {
+            keys: self.clone(),
+            entry: entry.clone(),
+            outcome: None,
+        };
+        let (key, account) = (key.clone(), account.to_owned());
+        let spawned = std::thread::Builder::new()
+            .name("ui-names".into())
+            .spawn(move || {
+                // The whole guard moves in, so it keeps the outcome when the
+                // thread ends, by its end or by a panic.
+                let mut read = read;
+                if let KeyState::Ready(ready) = &*key {
+                    read.outcome = Some(match (ready.names)(&account) {
+                        Ok(known) => NameState::Known(known),
+                        Err(_) => NameState::Failed(Instant::now()),
+                    });
+                }
+            });
+        if spawned.is_err() {
+            self.names().insert(entry, NameState::Failed(now));
+        }
+        None
     }
 
     fn states(&self) -> std::sync::MutexGuard<'_, HashMap<String, Arc<KeyState>>> {
@@ -174,6 +277,26 @@ impl Keys {
     }
 }
 
+/// A decider's name being read: keeps its outcome when dropped, a failure
+/// when there is none, so a read that panicked is read again in time.
+struct NameRead {
+    keys: Arc<Keys>,
+    entry: (String, String),
+    outcome: Option<NameState>,
+}
+
+impl Drop for NameRead {
+    fn drop(&mut self) {
+        let outcome = self
+            .outcome
+            .take()
+            .unwrap_or_else(|| NameState::Failed(Instant::now()));
+        self.keys
+            .names()
+            .insert(std::mem::take(&mut self.entry), outcome);
+    }
+}
+
 /// The production opener: the key `owlshift init` stored for the project of
 /// `repo`, its own accounts or the shared ones ([`secrets::tracker`]), read
 /// from the system keychain, and its account read once through it. The
@@ -202,9 +325,11 @@ pub fn open_key(data: &Path, repo: &Repo) -> Result<Key, String> {
     let account = tracker
         .key_account()
         .map_err(|e| format!("the Linear key's account could not be read: {e}"))?;
+    let reader = LinearTracker::new(ApiKey::new(key.expose()));
     Ok(Key {
         account,
         tracker: Box::new(tracker),
+        names: Box::new(move |id: &str| reader.account_name(id).map_err(|e| e.to_string())),
     })
 }
 
@@ -248,10 +373,18 @@ fn link(account: &KeyAccount, ticket: &TicketId) -> Option<String> {
 /// key as it stands: null when the ticket waits for no answer. `offered`
 /// only when the key is read, no app's, and its account the open ask's
 /// decider; `why_not` otherwise. The decider is named by the rule and the
-/// account the ask keeps, the ref holding no name. `link` comes from the
-/// workspace the key read, so it is null until it is read, and when it
-/// could not be.
-pub fn section(record: &TicketRecord, key: &KeyState, ticket: &TicketId) -> Value {
+/// account the ask keeps, the ref holding no name, and by the name the
+/// tracker shows for that account: the key's own when it is the decider's,
+/// otherwise what `names` has read of it so far ([`Keys::decider_name`]),
+/// asked only of a read key that is not the decider's; null while none is.
+/// `link` comes from the workspace the key read, so it is null until it is
+/// read, and when it could not be.
+pub fn section(
+    record: &TicketRecord,
+    key: &KeyState,
+    ticket: &TicketId,
+    names: &dyn Fn(&str) -> Option<String>,
+) -> Value {
     let Some(ask) = open_ask(record) else {
         return Value::Null;
     };
@@ -272,6 +405,7 @@ pub fn section(record: &TicketRecord, key: &KeyState, ticket: &TicketId) -> Valu
         words.insert(question.id.to_string(), json!(letters));
     }
     let decider = &ask.decider;
+    let mut decider_name = None;
     let (key_value, offered, why_not, link) = match key {
         KeyState::Reading => (
             json!({ "reading": true }),
@@ -286,6 +420,11 @@ pub fn section(record: &TicketRecord, key: &KeyState, ticket: &TicketId) -> Valu
             Value::Null,
         ),
         KeyState::Ready(Key { account, .. }) => {
+            decider_name = if same_account(&account.id, &decider.account) {
+                Some(account.name.clone())
+            } else {
+                names(&decider.account)
+            };
             let why_not = if account.app {
                 Some("the project's tracker key is an app's, not an operator's".to_owned())
             } else if !same_account(&account.id, &decider.account) {
@@ -310,7 +449,7 @@ pub fn section(record: &TicketRecord, key: &KeyState, ticket: &TicketId) -> Valu
         "kind": ask.kind,
         "approval": approval,
         "words": words,
-        "decider": { "account": decider.account, "by": decider.by },
+        "decider": { "account": decider.account, "by": decider.by, "name": decider_name },
         "key": key_value,
         "offered": offered,
         "why_not": why_not,
@@ -979,6 +1118,7 @@ pub(crate) mod tests {
             tracker: Box::new(
                 owlshift_adapters::tracker::linear::LinearTracker::with_transport(Unreachable),
             ),
+            names: Box::new(|_: &str| Ok(None)),
         })
     }
 
@@ -994,7 +1134,7 @@ pub(crate) mod tests {
     #[test]
     fn the_form_is_offered_to_the_asks_decider_only() {
         let record = waiting();
-        let offered = section(&record, &ready("maintainer"), &ticket());
+        let offered = section(&record, &ready("maintainer"), &ticket(), &|_| None);
         assert_eq!(offered["offered"], true);
         assert!(offered["why_not"].is_null());
         assert_eq!(offered["ask"], "ask-1");
@@ -1003,7 +1143,7 @@ pub(crate) mod tests {
         assert_eq!(offered["words"], json!({ "Q1": [], "Q2": [] }));
         assert_eq!(offered["key"]["name"], "Ada");
         assert_eq!(offered["link"], "https://linear.app/owlshift/issue/OWL-1");
-        let other = section(&record, &ready("someone-else"), &ticket());
+        let other = section(&record, &ready("someone-else"), &ticket(), &|_| None);
         assert_eq!(other["offered"], false);
         assert!(
             other["why_not"]
@@ -1013,7 +1153,7 @@ pub(crate) mod tests {
         );
         assert_eq!(
             other["decider"],
-            json!({ "account": "maintainer", "by": "assignee" })
+            json!({ "account": "maintainer", "by": "assignee", "name": null })
         );
         assert_eq!(other["link"], "https://linear.app/owlshift/issue/OWL-1");
         let mut app = account("maintainer");
@@ -1023,8 +1163,12 @@ pub(crate) mod tests {
             tracker: Box::new(
                 owlshift_adapters::tracker::linear::LinearTracker::with_transport(Unreachable),
             ),
+            names: Box::new(|_: &str| Ok(None)),
         });
-        assert_eq!(section(&record, &app, &ticket())["offered"], false);
+        assert_eq!(
+            section(&record, &app, &ticket(), &|_| None)["offered"],
+            false
+        );
         // A workspace key that is not plain gives no link.
         let mut odd = account("maintainer");
         odd.workspace = "x/../y".to_owned();
@@ -1033,15 +1177,18 @@ pub(crate) mod tests {
             tracker: Box::new(
                 owlshift_adapters::tracker::linear::LinearTracker::with_transport(Unreachable),
             ),
+            names: Box::new(|_: &str| Ok(None)),
         });
-        assert!(section(&record, &odd, &ticket())["link"].is_null());
+        assert!(section(&record, &odd, &ticket(), &|_| None)["link"].is_null());
         // Without a read key, no form and no link: the workspace is the
         // key's to tell.
         for state in [
             KeyState::Reading,
             KeyState::Unavailable("no Linear API key is stored".into()),
         ] {
-            let none = section(&record, &state, &ticket());
+            let none = section(&record, &state, &ticket(), &|_| {
+                panic!("a key not read asks for no name")
+            });
             if matches!(state, KeyState::Unavailable(_)) {
                 assert_eq!(
                     none["why_not"],
@@ -1057,7 +1204,140 @@ pub(crate) mod tests {
         // A ticket that waits for no answer has no reply section.
         let mut resumed = waiting();
         resumed.state.waiting = None;
-        assert!(section(&resumed, &ready("maintainer"), &ticket()).is_null());
+        assert!(section(&resumed, &ready("maintainer"), &ticket(), &|_| None).is_null());
+    }
+
+    /// The decider is named by the key's name when the key is theirs, else
+    /// by the name read of their account so far; asked of no other account.
+    #[test]
+    fn the_decider_is_named_once_read() {
+        let record = waiting();
+        let asked = RefCell::new(Vec::new());
+        let names = |account: &str| {
+            asked.borrow_mut().push(account.to_owned());
+            Some("person-1".to_owned())
+        };
+        let other = section(&record, &ready("someone-else"), &ticket(), &names);
+        assert_eq!(other["decider"]["name"], "person-1");
+        assert_eq!(other["decider"]["account"], "maintainer");
+        assert_eq!(*asked.borrow(), ["maintainer"]);
+        let not_yet = section(&record, &ready("someone-else"), &ticket(), &|_| None);
+        assert!(not_yet["decider"]["name"].is_null());
+        let theirs = section(&record, &ready("maintainer"), &ticket(), &|_| {
+            panic!("the key's own account is not read")
+        });
+        assert_eq!(theirs["decider"]["name"], "Ada");
+    }
+
+    /// Keys whose one project's key is `key`, its names read by `reader`,
+    /// each read counted.
+    fn named_keys(
+        reader: impl Fn(&str) -> Result<Option<String>, String> + Send + Sync + 'static,
+    ) -> (
+        Arc<Keys>,
+        Arc<KeyState>,
+        Arc<std::sync::atomic::AtomicUsize>,
+    ) {
+        let reads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = reads.clone();
+        let key = Arc::new(KeyState::Ready(Key {
+            account: account("operator"),
+            tracker: Box::new(LinearTracker::with_transport(Unreachable)),
+            names: Box::new(move |id: &str| {
+                counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                reader(id)
+            }),
+        }));
+        let keys = Keys::new(Arc::new(|_: &Path, _: &Repo| Err("unused".into())));
+        (keys, key, reads)
+    }
+
+    /// Waits until no name of `keys` is being read.
+    fn settle(keys: &Keys) {
+        while keys
+            .names()
+            .values()
+            .any(|state| matches!(state, NameState::Reading))
+        {
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+    }
+
+    #[test]
+    fn a_deciders_name_is_read_once_off_the_page() {
+        let (gate_tx, gate_rx) = std::sync::mpsc::channel::<()>();
+        let gate = Mutex::new(gate_rx);
+        let (keys, key, reads) = named_keys(move |id| {
+            gate.lock().unwrap().recv().unwrap();
+            Ok((id == "maintainer").then(|| "person-1".to_owned()))
+        });
+        let repo = Repo::parse("o/r").unwrap();
+        // The first need starts the read and does not wait for it; the next
+        // ones, while it reads, start none.
+        assert_eq!(keys.decider_name(&repo, &key, "maintainer"), None);
+        assert_eq!(keys.decider_name(&repo, &key, "maintainer"), None);
+        gate_tx.send(()).unwrap();
+        settle(&keys);
+        assert_eq!(
+            keys.decider_name(&repo, &key, "maintainer").as_deref(),
+            Some("person-1")
+        );
+        // An account the tracker does not know is kept as none.
+        assert_eq!(keys.decider_name(&repo, &key, "unknown"), None);
+        gate_tx.send(()).unwrap();
+        settle(&keys);
+        assert_eq!(keys.decider_name(&repo, &key, "unknown"), None);
+        assert_eq!(reads.load(std::sync::atomic::Ordering::SeqCst), 2);
+        // The key's own account, a blank one, and a key not read: no read.
+        assert_eq!(keys.decider_name(&repo, &key, "OPERATOR"), None);
+        assert_eq!(keys.decider_name(&repo, &key, "  "), None);
+        for state in [KeyState::Reading, KeyState::Unavailable("none".into())] {
+            assert_eq!(keys.decider_name(&repo, &Arc::new(state), "other"), None);
+        }
+        assert_eq!(reads.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn a_failed_name_is_read_again_after_a_while() {
+        let failing = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let fails = failing.clone();
+        let (keys, key, reads) = named_keys(move |_| {
+            if fails.load(std::sync::atomic::Ordering::SeqCst) {
+                Err("Linear: unreachable".into())
+            } else {
+                Ok(Some("person-1".into()))
+            }
+        });
+        let repo = Repo::parse("o/r").unwrap();
+        let start = Instant::now();
+        assert_eq!(keys.decider_name_at(&repo, &key, "maintainer", start), None);
+        settle(&keys);
+        failing.store(false, std::sync::atomic::Ordering::SeqCst);
+        // Within the while, the failure is kept and nothing is read.
+        assert_eq!(keys.decider_name_at(&repo, &key, "maintainer", start), None);
+        assert_eq!(reads.load(std::sync::atomic::Ordering::SeqCst), 1);
+        // Past it, the next need reads it again, once.
+        let later = start + NAME_RETRY + std::time::Duration::from_secs(1);
+        assert_eq!(keys.decider_name_at(&repo, &key, "maintainer", later), None);
+        settle(&keys);
+        assert_eq!(
+            keys.decider_name_at(&repo, &key, "maintainer", later)
+                .as_deref(),
+            Some("person-1")
+        );
+        assert_eq!(reads.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn a_read_that_panics_is_a_failure() {
+        let (keys, key, _) = named_keys(|_| panic!("the reader broke"));
+        let repo = Repo::parse("o/r").unwrap();
+        assert_eq!(keys.decider_name(&repo, &key, "maintainer"), None);
+        settle(&keys);
+        assert!(matches!(
+            keys.names().values().next(),
+            Some(NameState::Failed(_))
+        ));
     }
 
     #[test]
@@ -1070,14 +1350,14 @@ pub(crate) mod tests {
         let mut record = waiting();
         let question = approval_question(&plan(vec![fork("Markdown", "Plain text")]), Some(link));
         record.questions.asks[0].questions = vec![question];
-        let reply = section(&record, &ready("maintainer"), &ticket);
+        let reply = section(&record, &ready("maintainer"), &ticket, &|_| None);
         assert_eq!(reply["approval"], true);
         assert_eq!(reply["words"], json!({ "Q1": ["B"] }));
         record.questions.asks[0].questions = vec![approval_question(
             &plan(vec![fork("Markdown", "Plain text")]),
             None,
         )];
-        let reply = section(&record, &ready("maintainer"), &ticket);
+        let reply = section(&record, &ready("maintainer"), &ticket, &|_| None);
         assert_eq!(reply["words"], json!({ "Q1": [] }));
     }
 
