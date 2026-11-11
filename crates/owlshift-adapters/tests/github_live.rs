@@ -419,10 +419,12 @@ jobs:
 /// workflow run's failed jobs, and how watch's read lists the attempts
 /// after it. It pushes a branch whose workflow has a passing leg, a failing
 /// leg and an aggregate `ci` job that needs both, opens a pull request,
-/// asks a re-run while the run is still in progress (its refusal is
-/// printed, F1 of the plan's review), then once it is red, and reads the
-/// pull request until the failing leg's new attempt has finished. The
-/// token needs Actions (write); the repository is a disposable one, as for
+/// asks a re-run while the run is still in progress, which GitHub refuses
+/// as already running (OWL-525), then once it is red, and reads the pull
+/// request until the failing leg's new attempt has finished. The passing
+/// leg asks a re-run of its own run with a token holding Actions (read)
+/// only, whose refusal it prints in its log. The token needs Actions
+/// (write); the repository is a disposable one, as for
 /// `records_watch_reads`:
 ///
 /// ```sh
@@ -505,16 +507,60 @@ fn reruns_a_workflow_runs_failed_jobs() {
         .iter()
         .find_map(|c| c.run)
         .expect("watch's read names the check runs' workflow run");
-    if read
-        .checks
-        .checks
-        .iter()
-        .any(|c| c.state == CheckState::Pending)
-    {
-        eprintln!(
-            "re-run while in progress: {:?}",
-            forge.rerun_failed_jobs(run)
+    // Re-runs of the run in progress, each answer printed, each told as
+    // running (OWL-525): before any job has ended; once the failing leg has
+    // failed while the passing one still sleeps; and, when a read catches
+    // it, once every listed check has ended while the aggregate `ci` is not
+    // listed yet.
+    let in_progress = |when: &str, read: &PullRequestRead| {
+        let answer = forge.rerun_failed_jobs(run);
+        eprintln!("re-run, {when}: {:?} {answer:?}", listing(read));
+        assert!(
+            matches!(answer, Ok(RerunAnswer::Running { .. })),
+            "{when}: {answer:?}"
         );
+    };
+    in_progress("nothing ended", &read);
+    let fails_failed = |read: &PullRequestRead| {
+        read.checks
+            .checks
+            .iter()
+            .any(|c| c.name == "fails" && c.state == CheckState::Failed)
+    };
+    let any_pending = |read: &PullRequestRead| {
+        read.checks
+            .checks
+            .iter()
+            .any(|c| c.state == CheckState::Pending)
+    };
+    let mut caught = false;
+    for _ in 0..120 {
+        read = forge.follow(pr.number).unwrap();
+        if fails_failed(&read) && any_pending(&read) {
+            in_progress("the failing leg failed, the passing leg running", &read);
+            caught = true;
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_secs(1));
+    }
+    assert!(
+        caught,
+        "no read showed the failing leg failed while the passing leg ran"
+    );
+    for _ in 0..180 {
+        read = forge.follow(pr.number).unwrap();
+        if read.checks.checks.iter().any(|c| c.name == "ci") {
+            eprintln!(
+                "no read caught the legs ended with `ci` unlisted: {:?}",
+                listing(&read)
+            );
+            break;
+        }
+        if read.checks.checks.len() == 2 && !any_pending(&read) {
+            in_progress("every listed check ended, `ci` not listed", &read);
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(500));
     }
 
     let failed_first = |read: &PullRequestRead| {
@@ -546,6 +592,22 @@ fn reruns_a_workflow_runs_failed_jobs() {
         listing(&read)
     );
     eprintln!("red: {:?}", listing(&read));
+    // The passing leg's own re-run of its run with a token holding Actions
+    // (read) only: GitHub's refusal for the permission.
+    let passing = read
+        .checks
+        .checks
+        .iter()
+        .find(|c| c.name == "passes")
+        .and_then(|c| c.id)
+        .expect("the passing leg's job id");
+    match forge.job_log_excerpt(passing) {
+        Ok(log) => log
+            .lines()
+            .filter(|line| line.contains("probe: "))
+            .for_each(|line| eprintln!("{line}")),
+        Err(error) => eprintln!("the passing leg's log: {error}"),
+    }
     let first = failed_first(&read).expect("the failing leg failed");
     assert_eq!(read.checks.verdict(), Verdict::Red);
 
@@ -597,8 +659,16 @@ permissions: {}
 jobs:
   passes:
     runs-on: ubuntu-latest
+    permissions:
+      actions: read
     steps:
-      - run: echo the passing leg
+      - run: |
+          code=$(curl -s -o answer.json -w '%{http_code}' -X POST \\
+            -H 'Authorization: Bearer ${{ github.token }}' \\
+            -H 'Accept: application/vnd.github+json' \\
+            \"$GITHUB_API_URL/repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/rerun-failed-jobs\")
+          echo \"probe: HTTP $code $(tr -d '\\n' < answer.json)\"
+      - run: sleep 60
   fails:
     runs-on: ubuntu-latest
     steps:
