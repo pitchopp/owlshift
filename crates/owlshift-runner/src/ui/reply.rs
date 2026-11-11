@@ -1288,12 +1288,15 @@ pub(crate) mod tests {
         settle(&keys);
         assert_eq!(keys.decider_name(&repo, &key, "unknown"), None);
         assert_eq!(reads.load(std::sync::atomic::Ordering::SeqCst), 2);
-        // The key's own account, a blank one, and a key not read: no read.
-        assert_eq!(keys.decider_name(&repo, &key, "OPERATOR"), None);
+        // The key's own account (compared exactly, as `same_account` does), a
+        // blank one, and a key not read: no read is even started, so the
+        // names hold the two accounts read above and nothing else.
+        assert_eq!(keys.decider_name(&repo, &key, "operator"), None);
         assert_eq!(keys.decider_name(&repo, &key, "  "), None);
         for state in [KeyState::Reading, KeyState::Unavailable("none".into())] {
             assert_eq!(keys.decider_name(&repo, &Arc::new(state), "other"), None);
         }
+        assert_eq!(keys.names().len(), 2);
         assert_eq!(reads.load(std::sync::atomic::Ordering::SeqCst), 2);
     }
 
