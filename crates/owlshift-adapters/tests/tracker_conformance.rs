@@ -388,3 +388,270 @@ impl Drop for Restore {
 fn today() -> String {
     jiff::Zoned::now().date().to_string()
 }
+
+/// The GitHub Issues tracker (OWL-535), on recorded exchanges of the private
+/// repository `pitchopp/owlshift-live-sandbox`, whose issue #11 was opened
+/// and commented on by live check G1 and G2 (build plan, "P9 ·
+/// Open-source readiness"). Its reads were recorded live; its writes, the
+/// comment and the labels, are made up in the shape GitHub answers them and
+/// flagged `synthesized`, the reads after them amended to show them. To
+/// record again, with a token that reads the repository in
+/// `OWLSHIFT_GITHUB_TOKEN` or a logged-in `gh`:
+///
+/// ```sh
+/// cargo test -p owlshift-adapters --test tracker_conformance -- --ignored record_github
+/// ```
+///
+/// With `OWLSHIFT_RECORD_WRITES=11` the writes are sent, through the token,
+/// on issue #11, and nothing is made up.
+mod github {
+    use std::path::PathBuf;
+    use std::sync::{Arc, Mutex};
+
+    use serde_json::{Value, json};
+
+    use owlshift_adapters::forge::Repo;
+    use owlshift_adapters::forge::github::{GitHubForge, HttpTransport};
+    use owlshift_adapters::tracker::github::GitHubTracker;
+    use owlshift_adapters::tracker::{ErrorKind, Tracker};
+    use owlshift_contracts::Priority;
+    use owlshift_contracts::config;
+
+    use super::support::{self, Recorder, Replay};
+    use super::{BODY, Case, check, check_stage, id, today};
+
+    const SANDBOX: &str = "pitchopp/owlshift-live-sandbox";
+    /// Issue #11, G1's: three comments, two of them in one second (G2).
+    const ISSUE: &str = "11";
+    /// Pull request #18, G5's.
+    const PULL_REQUEST: &str = "18";
+    const CONFORMANCE: &str = "conformance.json";
+    const STAGE: &str = "stage.json";
+    const THERE: &str = "agent:needs-input";
+    const BACK: &str = "agent:in-progress";
+
+    fn dir() -> PathBuf {
+        support::fixtures("github-tracker")
+    }
+
+    fn states() -> config::Tracker {
+        config::Tracker {
+            kind: config::TrackerKind::Github,
+            team: None,
+            admit: config::Admit::Label("agent:ready".to_owned()),
+            admitters: None,
+            exclude: None,
+            states: config::States {
+                ready: "agent:ready".to_owned(),
+                working: BACK.to_owned(),
+                needs_input: THERE.to_owned(),
+                review: "agent:review".to_owned(),
+                parked: None,
+            },
+            priorities: None,
+        }
+    }
+
+    fn tracker(
+        transport: impl owlshift_adapters::graphql::Transport + Send + Sync + 'static,
+    ) -> GitHubTracker {
+        let forge = GitHubForge::with_transport(transport, Repo::parse(SANDBOX).unwrap());
+        GitHubTracker::new(forge, &states())
+    }
+
+    fn case() -> Case {
+        Case {
+            existing: id(ISSUE),
+            title: "Owlshift live check: G1",
+            description_start: "Probe of OWL-532",
+            priority: Priority::Unset,
+            assigned: false,
+            // Never an account on GitHub, as on Linear (OWL-74).
+            author_is_assignee: false,
+            labels: &[],
+            missing: id("9999"),
+            body: BODY,
+        }
+    }
+
+    /// What the stage fixture checks beyond [`check_stage`]: issue #11 is
+    /// closed, so it reads `closed` whatever its labels, and a pull
+    /// request's number names no ticket (G5).
+    fn check_reads(tracker: &dyn Tracker) {
+        assert_eq!(tracker.stage(&id(ISSUE)).unwrap(), "closed");
+        let pull = tracker.ticket(&id(PULL_REQUEST)).unwrap_err();
+        assert_eq!(pull.kind, ErrorKind::NotFound, "{pull}");
+    }
+
+    #[test]
+    fn the_github_tracker_conforms() {
+        let replay = Replay::of(&dir(), CONFORMANCE);
+        check(&tracker(replay.clone()), &case());
+        replay.assert_done();
+    }
+
+    #[test]
+    fn the_github_tracker_moves_the_visible_stage() {
+        let replay = Replay::of(&dir(), STAGE);
+        let tracker = tracker(replay.clone());
+        let case = case();
+        check_stage(&tracker, &case.existing, &case.missing, THERE, BACK);
+        check_reads(&tracker);
+        replay.assert_done();
+    }
+
+    /// No GitHub account of a recording is a real one: each user object is
+    /// a pseudonym, `person-n` with the id n.
+    #[test]
+    fn the_github_tracker_fixtures_name_no_real_account() {
+        fn users(value: &Value, found: &mut Vec<Value>) {
+            match value {
+                Value::Object(map) if map.contains_key("login") => found.push(value.clone()),
+                Value::Object(map) => map.values().for_each(|v| users(v, found)),
+                Value::Array(items) => items.iter().for_each(|v| users(v, found)),
+                _ => {}
+            }
+        }
+        for name in [CONFORMANCE, STAGE] {
+            let fixture = support::load(&dir(), name);
+            let mut found = Vec::new();
+            for exchange in &fixture.exchanges {
+                users(&exchange.response, &mut found);
+            }
+            assert!(!found.is_empty(), "{name}: no user at all");
+            for user in found {
+                let n = user["id"].as_u64().expect("a numeric id");
+                assert_eq!(user["login"], format!("person-{n}"), "{name}: {user}");
+                assert_eq!(user.as_object().unwrap().len(), 3, "{name}: {user}");
+            }
+        }
+    }
+
+    /// What the recording made up on issue #11: the comments posted and the
+    /// labels it carries since.
+    #[derive(Default)]
+    struct Made {
+        comments: Vec<Value>,
+        labels: Vec<String>,
+    }
+
+    /// The recorder over the live API. Without `OWLSHIFT_RECORD_WRITES=11`
+    /// every write is made up and the reads of issue #11 amended to show
+    /// it; any other write is refused.
+    fn recorder() -> (Recorder, &'static str) {
+        let live = Recorder::over(HttpTransport::new(support::github_token()), dir())
+            .pseudonymizing_github_users();
+        if std::env::var("OWLSHIFT_RECORD_WRITES").ok().as_deref() == Some(ISSUE) {
+            return (live, "recorded live");
+        }
+        let viewer = live.live_get("user");
+        let issue = format!("repos/{SANDBOX}/issues/{ISSUE}");
+        let made = Arc::new(Mutex::new(Made::default()));
+        let (written, path) = (Arc::clone(&made), issue.clone());
+        let recorder = live
+            .making_up(move |request| {
+                let method = request["method"].as_str()?;
+                let at = request["path"].as_str()?;
+                let mut made = written.lock().unwrap();
+                match (method, at.strip_prefix(&path)) {
+                    ("POST", Some("/comments")) => {
+                        let now = jiff::Timestamp::now()
+                            .round(jiff::Unit::Second)
+                            .unwrap()
+                            .to_string();
+                        let comment = json!({
+                            "id": 9_000_000_001_u64 + made.comments.len() as u64,
+                            "issue_url": format!("https://api.github.com/{path}"),
+                            "user": viewer.clone(),
+                            "created_at": now,
+                            "updated_at": now,
+                            "author_association": "OWNER",
+                            "body": request["body"]["body"],
+                            "performed_via_github_app": { "slug": "owl-shift" },
+                        });
+                        made.comments.push(comment.clone());
+                        Some((
+                            comment,
+                            "not posted: shaped like the recorded comments".to_owned(),
+                        ))
+                    }
+                    ("POST", Some("/labels")) => {
+                        for label in request["body"]["labels"].as_array()? {
+                            made.labels.push(label.as_str()?.to_owned());
+                        }
+                        Some((
+                            labels(&made.labels),
+                            "not sent: GitHub answers the issue's labels".to_owned(),
+                        ))
+                    }
+                    ("DELETE", Some(rest)) => {
+                        let gone = rest.strip_prefix("/labels/")?.replace("%3A", ":");
+                        made.labels.retain(|label| *label != gone);
+                        Some((
+                            labels(&made.labels),
+                            "not sent: GitHub answers the issue's labels".to_owned(),
+                        ))
+                    }
+                    _ => panic!(
+                        "refusing to write {method} {at} without OWLSHIFT_RECORD_WRITES={ISSUE}"
+                    ),
+                }
+            })
+            .amending(move |at, response| {
+                let made = made.lock().unwrap();
+                if at == issue && !made.labels.is_empty() {
+                    response["labels"] = labels(&made.labels);
+                    return Some("recorded, with the labels made up since".to_owned());
+                }
+                if at.starts_with(&format!("{issue}/comments?")) && !made.comments.is_empty() {
+                    let page = response.as_array_mut()?;
+                    page.extend(made.comments.iter().cloned());
+                    return Some("recorded, plus the made-up comment".to_owned());
+                }
+                None
+            });
+        (
+            recorder,
+            "recorded live, except the writes on issue #11, made up (see `synthesized`)",
+        )
+    }
+
+    /// Labels as GitHub answers them, made up.
+    fn labels(names: &[String]) -> Value {
+        json!(
+            names
+                .iter()
+                .map(|name| json!({ "name": name, "color": "ededed", "default": false }))
+                .collect::<Vec<_>>()
+        )
+    }
+
+    #[test]
+    #[ignore = "records against the live GitHub API"]
+    fn record_github_conformance_fixture() {
+        let (recorder, how) = recorder();
+        let tracker = tracker(recorder.clone());
+        let outcome =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| check(&tracker, &case())));
+        recorder.write(CONFORMANCE, &format!("{} on {SANDBOX}, {how}", today()));
+        if let Err(panic) = outcome {
+            std::panic::resume_unwind(panic);
+        }
+    }
+
+    #[test]
+    #[ignore = "records against the live GitHub API"]
+    fn record_github_stage_fixture() {
+        let (recorder, how) = recorder();
+        let tracker = tracker(recorder.clone());
+        let case = case();
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            check_stage(&tracker, &case.existing, &case.missing, THERE, BACK);
+            check_reads(&tracker);
+        }));
+        recorder.write(STAGE, &format!("{} on {SANDBOX}, {how}", today()));
+        if let Err(panic) = outcome {
+            std::panic::resume_unwind(panic);
+        }
+    }
+}

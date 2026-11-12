@@ -32,5 +32,11 @@ toml.workspace = true
 
 # Reads whether a slot's holder runs in the tests, with no `ps` (OWL-110,
 # OWL-425).
+[dev-dependencies]
+# The releases `owlshift self-update` reads, signed and served (OWL-541).
+minisign.workspace = true
+sha2.workspace = true
+tiny_http.workspace = true
+
 [target.'cfg(target_os = "macos")'.dev-dependencies]
 libc.workspace = true

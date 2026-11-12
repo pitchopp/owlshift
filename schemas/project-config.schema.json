@@ -417,6 +417,37 @@
         "always_human"
       ]
     },
+    "Priorities": {
+      "description": "`[tracker.priorities]`: the label of each priority, every one optional.\nA ticket carrying several reads the most urgent; labels are matched\nwithout regard to case, as GitHub names them (OWL-535).",
+      "type": "object",
+      "properties": {
+        "high": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "low": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "medium": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "urgent": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
     "ResolverPasses": {
       "description": "A whole number of runs from 1 to 50, or \"unlimited\".",
       "oneOf": [
@@ -580,6 +611,17 @@
         "kind": {
           "$ref": "#/$defs/TrackerKind"
         },
+        "priorities": {
+          "description": "The labels that give a ticket its priority on a tracker without a\npriority of its own (GitHub Issues); optional, every ticket reading\n`unset` without it (OWL-535).",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Priorities"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "states": {
           "description": "The tracker states that show a ticket's visible stage.",
           "$ref": "#/$defs/States"
@@ -600,10 +642,19 @@
       ]
     },
     "TrackerKind": {
-      "type": "string",
-      "enum": [
-        "linear",
-        "markdown"
+      "oneOf": [
+        {
+          "type": "string",
+          "enum": [
+            "linear",
+            "markdown"
+          ]
+        },
+        {
+          "description": "The issues of the project's own GitHub repository, reached with the\nproject's forge credential (OWL-535); `[tracker.states]` names labels.",
+          "type": "string",
+          "const": "github"
+        }
       ]
     },
     "Usd": {

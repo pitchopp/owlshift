@@ -8,6 +8,10 @@ name: Release
 # draft release holding them, which the maintainer checks and publishes. It
 # also renders the Homebrew formula the maintainer then commits as
 # Formula/owlshift.rb (build plan, "P9 · Open-source readiness", part 10).
+# OWL-548: each archive also holds THIRD-PARTY-NOTICES.txt, the licences of
+# the crates and fonts its binary carries, which `notices` writes with
+# cargo-about; a crate under a licence scripts/release/about.toml does not
+# accept stops the release before any build.
 #
 # Each job holds only what it needs. The builds, which run the dependencies'
 # build scripts, get no secret and a read-only token. `sign` alone holds the
@@ -56,9 +60,38 @@ jobs:
             exit 1
           fi
 
+  # OWL-548: the notices of every target, from Cargo.lock alone, on one
+  # runner. cargo-about 0.9.2 comes as a prebuilt binary whose SHA-256 the
+  # action checks, the action pinned to the commit ci.yml pins. The job holds
+  # no secret and a read-only token, like the builds. Approved by the
+  # maintainer on OWL-548 on 2026-11-12 (Q2), with the allow-list (Q1), as
+  # the CI-settings floor of architecture section 8 requires.
+  notices:
+    name: notices
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install the pinned toolchain
+        run: rustup toolchain install
+      - name: Install cargo-about
+        uses: taiki-e/install-action@f7e5d7c961414b23f5b25b2da9294395d08513ad # v2.87.26
+        with:
+          tool: cargo-about@0.9.2
+      - name: Write the notices of each target
+        run: |
+          cargo fetch --locked
+          sh scripts/release/notices.sh notices
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: notices
+          path: notices
+          if-no-files-found: error
+
   build:
     name: build (${{ matrix.target }})
-    needs: version
+    needs: [version, notices]
     strategy:
       fail-fast: true
       matrix:
@@ -103,11 +136,16 @@ jobs:
             echo "::error::the binary reports '$reported', not 'owlshift $VERSION'"
             exit 1
           fi
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: notices
+          path: notices
       - name: Pack the archive
         run: |
           name="owlshift-$VERSION-$TARGET"
           mkdir -p "dist/$name"
-          cp "target/$TARGET/release/owlshift" LICENSE README.md "dist/$name/"
+          test -s "notices/$TARGET/THIRD-PARTY-NOTICES.txt"
+          cp "target/$TARGET/release/owlshift" LICENSE README.md "notices/$TARGET/THIRD-PARTY-NOTICES.txt" "dist/$name/"
           COPYFILE_DISABLE=1 tar -C dist -czf "dist/$name.tar.gz" "$name"
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:

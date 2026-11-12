@@ -68,11 +68,25 @@ fn the_release_workflow_keeps_its_guards() {
     assert_eq!(holding("environment: release"), ["sign"]);
     assert_eq!(holding("secrets."), ["sign"]);
     assert_eq!(holding("contents: write"), ["publish"]);
-    let sign = &jobs.iter().find(|(name, _)| name == "sign").unwrap().1;
+    let job = |name: &str| &jobs.iter().find(|(job, _)| job == name).unwrap().1;
+    assert!(
+        job("build").contains("needs: [version, notices]"),
+        "no archive is built before the notices"
+    );
+    let sign = job("sign");
     assert!(
         !sign.contains("uses:"),
         "the job holding the key runs no action"
     );
+    // OWL-548: every archive carries its target's notices, written before
+    // any build.
+    for guard in [
+        "sh scripts/release/notices.sh notices",
+        "test -s \"notices/$TARGET/THIRD-PARTY-NOTICES.txt\"",
+        "cp \"target/$TARGET/release/owlshift\" LICENSE README.md \"notices/$TARGET/THIRD-PARTY-NOTICES.txt\" \"dist/$name/\"",
+    ] {
+        assert!(lines.contains(&guard), "release.yml lost `{guard}`");
+    }
     // The key the release is checked against: minisign's two lines.
     let key = read("minisign.pub");
     let key: Vec<&str> = key.lines().collect();
@@ -82,6 +96,24 @@ fn the_release_workflow_keeps_its_guards() {
             && key[1].starts_with("RW"),
         "{key:?}"
     );
+}
+
+/// `owlshift self-update` (OWL-541) asks for the archives the release
+/// workflow builds, by the name `install.sh` asks for.
+#[test]
+fn self_update_names_the_archives_of_the_release() {
+    let update = read("crates/owlshift-cli/src/self_update_cmd.rs");
+    assert!(update.contains("format!(\"owlshift-{version}-{target}\")"));
+    assert!(read("install.sh").contains("name=owlshift-$version-$target"));
+    let workflow = read(".github/workflows/release.yml");
+    let targets: Vec<&str> = workflow
+        .lines()
+        .filter_map(|line| line.trim().strip_prefix("- target: "))
+        .collect();
+    assert_eq!(targets.len(), 4, "{targets:?}");
+    for target in targets {
+        assert!(update.contains(&format!("Some(\"{target}\")")), "{target}");
+    }
 }
 
 #[cfg(unix)]
@@ -300,4 +332,117 @@ fn the_install_script_installs_only_an_archive_whose_checksum_matches() {
         );
         assert!(!into.exists(), "{folder}: nothing is installed");
     }
+}
+
+/// The targets whose notices `notices.sh` writes by default are the targets
+/// the release builds, so no archive lacks its notices.
+#[test]
+fn the_notices_cover_every_target_the_release_builds() {
+    let workflow = read(".github/workflows/release.yml");
+    let mut built: Vec<&str> = workflow
+        .lines()
+        .filter_map(|line| line.trim().strip_prefix("- target: "))
+        .collect();
+    let script = read("scripts/release/notices.sh");
+    let listed = script
+        .lines()
+        .find_map(|line| line.strip_prefix("TARGETS=\""))
+        .and_then(|rest| rest.strip_suffix('"'))
+        .expect("notices.sh lists its targets");
+    let mut listed: Vec<&str> = listed.split(' ').collect();
+    built.sort_unstable();
+    listed.sort_unstable();
+    assert_eq!(built.len(), 4, "{built:?}");
+    assert_eq!(built, listed);
+    // CI writes them too, so a refused licence fails its pull request.
+    assert!(
+        read(".github/workflows/ci.yml")
+            .lines()
+            .any(|line| line.trim() == "sh scripts/release/notices.sh \"$RUNNER_TEMP/notices\""),
+        "ci.yml no longer checks the licences"
+    );
+}
+
+/// `notices.sh` with a stand-in `cargo`: it asks cargo-about for one
+/// target's notices, offline and failing on a refused licence, appends the
+/// fonts' licences, and writes no file when cargo-about fails.
+#[cfg(unix)]
+#[test]
+fn the_notices_hold_the_crates_and_the_fonts_or_nothing() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let script = root().join("scripts/release/notices.sh");
+    let dir = tempfile::tempdir().unwrap();
+    let bin = dir.path().join("bin");
+    fs::create_dir(&bin).unwrap();
+    // Records its arguments, then writes the file `-o` names, or fails when
+    // FAKE_FAIL is set.
+    let cargo = bin.join("cargo");
+    fs::write(
+        &cargo,
+        "#!/bin/sh\n\
+         printf '%s\\n' \"$@\" > \"$FAKE_ARGS\"\n\
+         [ -z \"${FAKE_FAIL:-}\" ] || exit 1\n\
+         while [ \"$#\" -gt 0 ]; do\n\
+         \x20   if [ \"$1\" = -o ]; then echo 'crate notices' > \"$2\"; fi\n\
+         \x20   shift\n\
+         done\n",
+    )
+    .unwrap();
+    fs::set_permissions(&cargo, fs::Permissions::from_mode(0o755)).unwrap();
+    let path = format!("{}:{}", bin.display(), std::env::var("PATH").unwrap());
+    let args = dir.path().join("args");
+    let out = dir.path().join("out");
+    let run = |fail: &str| {
+        sh(
+            &script,
+            &[out.to_str().unwrap(), "x86_64-unknown-linux-musl"],
+            &[
+                ("PATH", path.as_str()),
+                ("FAKE_ARGS", args.to_str().unwrap()),
+                ("FAKE_FAIL", fail),
+            ],
+        )
+    };
+    let file = out.join("x86_64-unknown-linux-musl/THIRD-PARTY-NOTICES.txt");
+
+    let written = run("");
+    assert!(written.status.success(), "{}", text(&written.stderr));
+    let recorded = fs::read_to_string(&args).unwrap();
+    let recorded: Vec<&str> = recorded.lines().collect();
+    for wanted in ["about", "generate", "--frozen", "--fail"] {
+        assert!(recorded.contains(&wanted), "{recorded:?}");
+    }
+    assert!(
+        recorded
+            .windows(2)
+            .any(|pair| pair == ["--target", "x86_64-unknown-linux-musl"]),
+        "{recorded:?}"
+    );
+    let notices = fs::read_to_string(&file).unwrap();
+    assert!(notices.starts_with("crate notices\n"), "{notices}");
+    let fonts = root().join("crates/owlshift-runner/src/ui/assets/fonts");
+    for licence in ["OFL-BricolageGrotesque.txt", "OFL-JetBrainsMono.txt"] {
+        assert!(
+            notices.contains(&format!("SIL Open Font License 1.1 ({licence})")),
+            "{licence}"
+        );
+        assert!(notices.contains(&fs::read_to_string(fonts.join(licence)).unwrap()));
+    }
+
+    let refused = run("1");
+    assert!(!refused.status.success());
+    assert!(
+        text(&refused.stderr)
+            .contains("the notices of x86_64-unknown-linux-musl could not be written"),
+        "{}",
+        text(&refused.stderr)
+    );
+    assert!(!file.exists(), "no notices are left behind");
+    assert_eq!(
+        fs::read_dir(out.join("x86_64-unknown-linux-musl"))
+            .unwrap()
+            .count(),
+        0
+    );
 }

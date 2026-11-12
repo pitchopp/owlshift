@@ -1,0 +1,19 @@
+Third-party notices for owlshift
+
+The owlshift binary in this archive is built from Owlshift's own code, under
+the LICENSE file beside this one, and from the Rust crates listed below, each
+under the licence named with it. The source of each crate is available on
+crates.io at the version listed (https://crates.io/crates/<name>/<version>).
+The fonts the local web UI serves follow the crates.
+{{#each licenses}}
+
+================================================================================
+{{{name}}} ({{{id}}})
+
+Used by:
+{{#each used_by}}
+- {{{crate.name}}} {{{crate.version}}}
+{{/each}}
+
+{{{text}}}
+{{/each}}

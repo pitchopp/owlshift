@@ -72,8 +72,10 @@ The maintainer makes releases. The workflow is `.github/workflows/release.yml`, 
 1. In a pull request, set the version in `Cargo.toml` (`[workspace.package]`) and add its `## <version>` section to `CHANGELOG.md`, which becomes the release's notes. A test fails while the version has no section.
 2. Once it is merged, tag a commit of main and push the tag: `git tag v0.1.0 origin/main && git push origin v0.1.0`.
 3. The run builds, then waits for your approval of the environment `release`. Approve it only for a run whose commit is a commit of main. The workflow refuses others, but that check is in the very file a run on another commit could change.
-4. Check the draft release: one `owlshift-<version>-<target>.tar.gz` per target, `SHA256SUMS` and `SHA256SUMS.minisig`. Then publish it.
+4. Check the draft release: one `owlshift-<version>-<target>.tar.gz` per target, `SHA256SUMS` and `SHA256SUMS.minisig`. Each archive holds `owlshift`, `LICENSE`, `README.md` and `THIRD-PARTY-NOTICES.txt` (`tar -tzf <archive>`). Then publish it.
 5. Commit the run's `homebrew-formula` artifact, also shown in the run's summary, as `Formula/owlshift.rb` on main. The repository is its own tap. Check that the formula installs on a Mac with `brew tap pitchopp/owlshift https://github.com/pitchopp/owlshift`, `brew trust --formula pitchopp/owlshift/owlshift` and `brew install owlshift`: the release's own URLs are checked only there.
+
+The job `notices` fails when a crate of the binary is under a licence `scripts/release/about.toml` does not accept. Accepting it is a legal decision, recorded on a ticket before the licence is added there; otherwise replace the crate.
 
 If a run fails, delete the draft if there is one and the tag (`git push origin :refs/tags/v0.1.0`), fix the cause on main, and tag again. Approving a run of another ref, as for the probe of OWL-540, means reading that ref's `release.yml` first.
 

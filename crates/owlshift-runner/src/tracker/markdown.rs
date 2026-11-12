@@ -12,7 +12,7 @@ use owlshift_contracts::config::{self, ProjectConfig};
 use owlshift_contracts::ids::TicketId;
 use owlshift_platform::keychain::Secret;
 
-use super::{Kind, Opener, StatesError};
+use super::{ForgeCredential, Kind, Opener, StatesError};
 use crate::doctor::{Check, DOES_NOT_BLOCK, Section};
 use crate::init::SecretSpec;
 use crate::secrets::{TrackerAccounts, TrackerSecrets};
@@ -54,6 +54,7 @@ kind = \"markdown\"
         _tracker: &'a config::Tracker,
         root: &'a Path,
         _secrets: Option<&'a TrackerSecrets<Secret>>,
+        _forge: ForgeCredential<'a>,
     ) -> Result<Opener<'a>, String> {
         Ok(Opener::new(move || {
             Ok(Box::new(MarkdownTracker::new(root)) as Box<dyn Tracker>)

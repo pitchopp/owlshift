@@ -10,7 +10,8 @@ The first release. Owlshift works a team's existing backlog with coding agents, 
 
 - macOS, Apple silicon and Intel: `brew tap pitchopp/owlshift https://github.com/pitchopp/owlshift`, `brew trust --formula pitchopp/owlshift/owlshift` (Homebrew loads no formula of a tap it was not told to trust), then `brew install owlshift`. The archive of the release can also be downloaded with `curl` and unpacked by hand.
 - Linux, x86_64 and arm64, as static binaries: `curl -fsSL https://raw.githubusercontent.com/pitchopp/owlshift/main/install.sh | sh`. The script checks the archive against the release's `SHA256SUMS` before it installs `owlshift` in `~/.local/bin`.
-- Each release holds one archive per target, `owlshift-<version>-<target>.tar.gz`, their `SHA256SUMS`, and `SHA256SUMS.minisig`, its signature with Owlshift's own key: check it with `minisign -Vm SHA256SUMS -p minisign.pub`, the public key at the repository's root.
+- An install made by the script or by hand updates itself with `owlshift self-update`, which verifies the release's signature with the key built into the binary, then its checksum, before it replaces the binary; `owlshift self-update --check` only says whether a newer release is out. Homebrew installs update with `brew upgrade owlshift`.
+- Each release holds one archive per target, `owlshift-<version>-<target>.tar.gz`, their `SHA256SUMS`, and `SHA256SUMS.minisig`, its signature with Owlshift's own key: check it with `minisign -Vm SHA256SUMS -p minisign.pub`, the public key at the repository's root. Each archive holds `THIRD-PARTY-NOTICES.txt`, the licences of the crates and fonts the binary carries.
 - Prerequisites: git 2.39.0 or later, and Claude Code installed. `owlshift doctor` says what is missing and how to fix it.
 
 ### What it does
