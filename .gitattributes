@@ -4,3 +4,6 @@ crates/owlshift-contracts/tests/fixtures/** text eol=lf
 schemas/*.json text eol=lf
 tests/scenarios/** text eol=lf
 crates/owlshift-adapters/tests/fixtures/codex/** text eol=lf
+# Shell scripts run as they are checked out, the install script by `sh`
+# straight from the repository (OWL-540).
+*.sh text eol=lf
