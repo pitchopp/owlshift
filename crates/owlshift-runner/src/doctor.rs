@@ -24,9 +24,7 @@ use std::path::{MAIN_SEPARATOR, Path};
 
 use owlshift_adapters::forge::{ErrorKind as ForgeErrorKind, Repo};
 use owlshift_adapters::harness::{self, Login, tested};
-use owlshift_adapters::tracker::linear::{
-    AdmissionFacts, LinearTracker, StateMismatch, find_state,
-};
+use owlshift_adapters::tracker::linear::{AdmissionFacts, StateMismatch, find_state};
 use owlshift_adapters::tracker::markdown::MarkdownTracker;
 use owlshift_adapters::tracker::{Capability, ErrorKind, PROPOSED_LABEL};
 use owlshift_contracts::config::{Admit, ProjectConfig, States, Tracker, TrackerKind};
@@ -1311,10 +1309,8 @@ fn tracker_check(config: &Effective) -> Check {
             "no project configuration, no adapter to check",
         );
     };
-    let (kind, declared) = match config.tracker.kind {
-        TrackerKind::Linear => ("linear", LinearTracker::CAPABILITIES),
-        TrackerKind::Markdown => ("markdown", MarkdownTracker::CAPABILITIES),
-    };
+    let tracker = crate::tracker::of(config.tracker.kind);
+    let (kind, declared) = (tracker.name(), tracker.capabilities());
     let list = |capabilities: &[Capability]| {
         capabilities
             .iter()

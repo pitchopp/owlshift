@@ -5,17 +5,62 @@
 //! (architecture section 8). The token of the Linear app lives in the
 //! runner's memory alone, for one command (OWL-157). Which accounts hold a
 //! project's credentials is [`crate::secrets`]'s to say (OWL-308).
+//!
+//! It is also where the runner chooses between its trackers (OWL-533,
+//! build plan "P9 · Open-source readiness", part 2): [`of`] gives the
+//! [`Kind`] of the project's tracker, which holds what differs by tracker,
+//! and `doctor`, `init`, `owlshift do` and the UI reach a tracker through
+//! it. Each kind is a file of its own under `tracker/`.
+
+mod linear;
+mod markdown;
 
 use std::fmt;
 
 use owlshift_adapters::tracker;
-use owlshift_adapters::tracker::ErrorKind;
 use owlshift_adapters::tracker::linear::app::{AppTransport, ClientCredentials, HttpOAuth};
 use owlshift_adapters::tracker::linear::{AdmissionFacts, ApiKey, AppUser, LinearTracker};
+use owlshift_adapters::tracker::{Capability, ErrorKind};
+use owlshift_contracts::config::{self, TrackerKind};
+use owlshift_contracts::ids::TicketId;
 use owlshift_platform::keychain::{Keychain, SERVICE, Secret};
 
+use crate::init::SecretSpec;
 use crate::refusal::Refusal;
 use crate::secrets::{Source, TrackerAccounts, TrackerSecrets};
+
+/// What differs by tracker, for one kind of tracker a project file names
+/// (`[tracker].kind`): [`of`] gives it.
+pub trait Kind: Sync {
+    /// Its name in a project file, `kind = "…"`.
+    fn name(&self) -> &'static str;
+
+    /// The capabilities its adapter declares (architecture section 6).
+    fn capabilities(&self) -> &'static [Capability];
+
+    /// The secrets of the tracker that `owlshift do` reads from the
+    /// keychain, in the order `init` asks for them: none when it needs none
+    /// of its own.
+    fn secret_specs(&self) -> &'static [SecretSpec];
+
+    /// The lines `init` writes under `[tracker]` of a new project file, the
+    /// team key being `team` as `--team` gave it; the error says what is
+    /// missing.
+    fn project_file_lines(&self, team: Option<&str>) -> Result<String, String>;
+
+    /// Refuses `ticket` when its id says it is not one of the project's,
+    /// before anything is read ([`crate::on_demand::check_team`]).
+    fn check_ticket(&self, tracker: &config::Tracker, ticket: &TicketId) -> Result<(), String>;
+}
+
+/// The kind of the tracker a project file names: the one place the runner
+/// chooses between its trackers.
+pub fn of(kind: TrackerKind) -> &'static dyn Kind {
+    match kind {
+        TrackerKind::Linear => &linear::Linear,
+        TrackerKind::Markdown => &markdown::Markdown,
+    }
+}
 
 /// The keychain account, under [`SERVICE`], that every project of a machine
 /// shared for the Linear API key before OWL-308, still read for a project
@@ -286,6 +331,18 @@ mod tests {
 
     fn own() -> TrackerAccounts {
         TrackerAccounts::project(&Repo::parse("pitchopp/owlshift").unwrap())
+    }
+
+    /// A kind's name is the value `[tracker].kind` takes for it, and the
+    /// lines `init` writes say it.
+    #[test]
+    fn each_kind_is_named_as_the_project_file_names_it() {
+        for kind in [TrackerKind::Linear, TrackerKind::Markdown] {
+            let name = of(kind).name();
+            assert_eq!(serde_json::to_value(kind).unwrap(), name, "{kind:?}");
+            let lines = of(kind).project_file_lines(Some("OWL")).unwrap();
+            assert!(lines.contains(&format!("kind = \"{name}\"")), "{lines}");
+        }
     }
 
     /// OWL-479: a Linear that gave no answer waits for the network, one

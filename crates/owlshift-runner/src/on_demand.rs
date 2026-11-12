@@ -85,7 +85,7 @@ use owlshift_contracts::brief::{
     TicketBrief,
 };
 use owlshift_contracts::comment::{MarkedComment, MarkerKind};
-use owlshift_contracts::config::{Admit, ProjectConfig, States, TrackerKind};
+use owlshift_contracts::config::{Admit, ProjectConfig, States};
 use owlshift_contracts::drain::{TicketIntake, TicketProposals};
 use owlshift_contracts::event::EventKind;
 use owlshift_contracts::format::Format;
@@ -242,18 +242,7 @@ pub fn check_origin(url: &str) -> Result<Repo, String> {
 /// build another team's ticket and report there. The key is compared
 /// without regard to case, as Linear reads identifiers.
 pub fn check_team(config: &ProjectConfig, ticket: &TicketId) -> Result<(), String> {
-    let (TrackerKind::Linear, Some(team)) = (config.tracker.kind, &config.tracker.team) else {
-        return Ok(());
-    };
-    let key = ticket.as_str().rsplit_once('-').map(|(key, _)| key);
-    if key.is_some_and(|key| key.eq_ignore_ascii_case(team)) {
-        Ok(())
-    } else {
-        Err(format!(
-            "{ticket} is not a ticket of team {team}, the project's `tracker.team`: \
-             `owlshift do` runs this project's tickets only"
-        ))
-    }
+    crate::tracker::of(config.tracker.kind).check_ticket(&config.tracker, ticket)
 }
 
 /// The core event a run's outcome maps onto (the table of
