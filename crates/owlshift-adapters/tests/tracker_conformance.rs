@@ -7,11 +7,12 @@ mod support;
 
 use std::collections::BTreeMap;
 use std::fs;
+use std::sync::{Arc, Mutex};
 
 use owlshift_adapters::tracker::linear::{ApiKey, LinearTracker};
 use owlshift_adapters::tracker::markdown::MarkdownTracker;
 use owlshift_adapters::tracker::{
-    Author, Blocker, Capability, Column, ErrorKind, Person, StateType, Tracker,
+    Author, Blocker, Capability, Column, ErrorKind, Person, Proposal, StateType, Tracker,
 };
 use owlshift_contracts::Priority;
 use owlshift_contracts::config::Admit;
@@ -434,6 +435,85 @@ fn check_links(tracker: &dyn Tracker, case: &LinksCase) {
     }
 }
 
+/// What the Proposals check knows about the tracker.
+struct ProposalsCase {
+    team: Option<&'static str>,
+    /// The ticket the proposal follows up.
+    parent: TicketId,
+    /// A ready state's name that is not the inbox.
+    ready: &'static str,
+    /// The name of the state the inbox is.
+    inbox: &'static str,
+}
+
+/// Filing a proposal and finding it again: it is filed in the inbox, with
+/// nothing gone wrong; it is found by its title in any case and by its
+/// marker, each ticket once; another title and marker find nothing; a blank
+/// title or marker is refused; and a ready state that is the inbox is
+/// refused before anything is written.
+fn check_proposals(tracker: &dyn Tracker, case: &ProposalsCase) {
+    assert!(
+        tracker.capabilities().contains(&Capability::ProposalsInbox),
+        "ProposalsInbox is not declared"
+    );
+    const TITLE: &str = "Cap the retries";
+    const MARKER: &str = "fingerprint 0123456789ab";
+    let description = format!("Why.\n\n[owlshift] PROPOSAL · OWL-252 · {MARKER}");
+    let proposal = Proposal {
+        parent: &case.parent,
+        title: TITLE,
+        description: &description,
+        blocked_by_parent: true,
+        ready: case.ready,
+    };
+    let team = case.team;
+    let none = tracker.proposed(team, TITLE, MARKER).unwrap();
+    assert!(none.is_empty(), "found before filing: {none:?}");
+
+    let filed = tracker.propose(&proposal).unwrap();
+    assert_eq!(filed.state, case.inbox, "{filed:?}");
+    assert!(filed.problems.is_empty(), "{:?}", filed.problems);
+
+    // By its title alone, in another case; by its marker alone; by both,
+    // where it is still listed once.
+    for (title, marker) in [
+        (TITLE.to_uppercase(), "no such marker"),
+        ("Another title".to_owned(), MARKER),
+        (TITLE.to_owned(), MARKER),
+    ] {
+        let found = tracker.proposed(team, &title, marker).unwrap();
+        let ours: Vec<_> = found.iter().filter(|f| f.id == filed.id).collect();
+        assert_eq!(ours.len(), 1, "{title:?} {marker:?}: {found:?}");
+        assert!(ours[0].description.contains(MARKER), "{:?}", ours[0]);
+    }
+    let found = tracker
+        .proposed(team, "Another title", "fingerprint ffffffffffff")
+        .unwrap();
+    assert!(found.is_empty(), "{found:?}");
+    for (title, marker) in [(" ", MARKER), (TITLE, " ")] {
+        let refused = tracker.proposed(team, title, marker);
+        assert!(refused.is_err(), "{title:?} {marker:?}: {refused:?}");
+    }
+
+    // A proposal filed in the ready column would enter the queue without a
+    // person: refused, and nothing is written.
+    let refused = Proposal {
+        title: "Never filed",
+        description: "Why.\n\n[owlshift] PROPOSAL · OWL-252 · fingerprint aaaaaaaaaaaa",
+        ready: case.inbox,
+        ..proposal
+    };
+    let error = tracker.propose(&refused).unwrap_err();
+    assert_eq!(error.kind, ErrorKind::Other, "{error}");
+    let found = tracker
+        .proposed(team, refused.title, "fingerprint aaaaaaaaaaaa")
+        .unwrap();
+    assert!(
+        found.is_empty(),
+        "the refused proposal was filed: {found:?}"
+    );
+}
+
 const BODY: &str = "[owlshift] OWL-13 conformance check: a comment posted by the Linear \
                     adapter's fixture recorder · safe to delete.\n\nSecond line.";
 
@@ -616,6 +696,22 @@ fn markdown() -> Adapter {
                 },
             );
         })
+        .case(Check::Proposals, || {
+            let (world, tracker) = markdown_world();
+            let tickets = || fs::read_dir(world.path().join("tickets")).unwrap().count();
+            let before = tickets();
+            check_proposals(
+                &tracker,
+                &ProposalsCase {
+                    team: None,
+                    parent: id("DEMO-1"),
+                    ready: "Todo",
+                    inbox: MarkdownTracker::TRIAGE,
+                },
+            );
+            // The proposal is a ticket of its own, and the refused one none.
+            assert_eq!(tickets(), before + 1);
+        })
 }
 
 fn markdown_blocked_case() -> BlockedCase {
@@ -728,9 +824,97 @@ fn linear() -> Adapter {
             );
             replay.assert_done();
         })
+        .case(Check::Proposals, || {
+            // MADE UP: no recording holds these answers (see `Fake`).
+            let (fake, stored) = linear_proposals();
+            check_proposals(
+                &LinearTracker::with_transport(fake),
+                &ProposalsCase {
+                    team: Some("owl"),
+                    parent: id("OWL-252"),
+                    ready: "Todo",
+                    inbox: "Triage",
+                },
+            );
+            // One issue was created: the refused proposal never was.
+            assert_eq!(stored.lock().unwrap().len(), 1);
+        })
 }
 
 const LINKS_FIXTURE: &str = "links.json";
+
+/// The issues the made-up Linear stores: identifier, title, description.
+type Stored = Vec<(String, String, String)>;
+
+/// MADE UP: a Linear whose team `OWL` has triage on, in the answer shapes of
+/// the unit tests of `src/tracker/linear.rs`. It stores each issue
+/// `Propose` creates, which `Proposed` finds again by the title, whatever
+/// its case, and by the description's marker, as the two filters do.
+fn linear_proposals() -> (Fake, Arc<Mutex<Stored>>) {
+    let stored: Arc<Mutex<Stored>> = Arc::default();
+    let kept = Arc::clone(&stored);
+    let states = [
+        ("In Review", "started", 2.6),
+        ("Triage", "triage", 0.0),
+        ("Backlog", "backlog", 0.0),
+        ("Todo", "unstarted", 1.0),
+        ("Done", "completed", 3.0),
+        ("Canceled", "canceled", 4.0),
+    ];
+    let fake = Fake::new(move |name, variables| match name {
+        "ProposalTarget" => {
+            let nodes: Vec<Value> = states
+                .iter()
+                .map(|(name, kind, position)| {
+                    json!({ "id": format!("s-{name}"), "name": name, "type": kind,
+                        "position": position })
+                })
+                .collect();
+            Answer::Data(
+                json!({ "issue": { "id": "parent-id", "project": { "id": "p4" },
+                "team": { "id": "team-owl", "key": "OWL", "triageEnabled": true,
+                    "states": { "nodes": nodes, "pageInfo": { "hasNextPage": false } } } } }),
+            )
+        }
+        "Propose" => {
+            let input = &variables["input"];
+            let mut stored = kept.lock().unwrap();
+            let identifier = format!("OWL-{}", 266 + stored.len());
+            stored.push((
+                identifier.clone(),
+                input["title"].as_str().unwrap().to_owned(),
+                input["description"].as_str().unwrap().to_owned(),
+            ));
+            let state = input["stateId"].as_str().unwrap();
+            Answer::Data(json!({ "issueCreate": { "success": true, "issue": {
+                "id": "new-id", "identifier": identifier,
+                "state": { "id": state, "name": state.trim_start_matches("s-") } } } }))
+        }
+        "Relate" => Answer::Data(json!({ "issueRelationCreate": { "success": true } })),
+        "Proposed" => {
+            let filter = &variables["filter"];
+            let by_title = filter["title"]["eqIgnoreCase"].as_str();
+            let by_marker = filter["description"]["contains"].as_str();
+            let nodes: Vec<Value> = kept
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(_, title, description)| {
+                    by_title.is_some_and(|t| t.to_lowercase() == title.to_lowercase())
+                        || by_marker.is_some_and(|m| description.contains(m))
+                })
+                .map(|(identifier, _, description)| {
+                    json!({ "identifier": identifier, "description": description,
+                        "state": { "type": "triage" } })
+                })
+                .collect();
+            Answer::Data(json!({ "issues": { "nodes": nodes,
+                "pageInfo": { "hasNextPage": false, "endCursor": null } } }))
+        }
+        other => panic!("the made-up Linear does not answer {other}"),
+    });
+    (fake, stored)
+}
 
 fn linear_blocked_case() -> BlockedCase {
     BlockedCase {
