@@ -25,7 +25,7 @@ use jiff::Timestamp;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-use owlshift_adapters::graphql::{RateHeaders, Response, Transport};
+use owlshift_adapters::graphql::{RateHeaders, Response, RestAnswer, Transport};
 use owlshift_adapters::tracker::linear::{ApiKey, HttpTransport};
 
 /// One request and its answer.
@@ -159,6 +159,24 @@ impl Transport for Replay {
     fn put(&self, path: &str, body: &Value) -> Result<Response, String> {
         self.send(&rest_request("PUT", path, body))
     }
+
+    /// A REST read, held as [`rest_request`] with no body (OWL-535).
+    fn get(&self, path: &str) -> Result<RestAnswer, String> {
+        let answer = self.send(&rest_request("GET", path, &Value::Null))?;
+        Ok(RestAnswer {
+            status: answer.status,
+            rate: answer.rate,
+            body: Box::new(std::io::Cursor::new(answer.body.into_bytes())),
+        })
+    }
+
+    fn post(&self, path: &str, body: &Value) -> Result<Response, String> {
+        self.send(&rest_request("POST", path, body))
+    }
+
+    fn delete(&self, path: &str) -> Result<Response, String> {
+        self.send(&rest_request("DELETE", path, &Value::Null))
+    }
 }
 
 /// How a fixture holds a REST write (OWL-444): its method, its path and its
@@ -230,7 +248,16 @@ pub struct Recorder {
     log: Arc<Mutex<Vec<Exchange>>>,
     synthesize: Option<Synthesize>,
     make_up: Option<MakeUp>,
+    /// Changes a recorded REST read before it is kept, with a note saying
+    /// how (OWL-535).
+    amend: Option<Amend>,
+    /// Whether the answers' GitHub users are pseudonymized ([`github_users`]).
+    github_users: bool,
 }
+
+/// Changes the answer to a REST read, `GET` and its path, returning a note
+/// when it did.
+type Amend = Arc<dyn Fn(&str, &mut Value) -> Option<String> + Send + Sync>;
 
 /// Makes up the answer to a request that must not reach the live API, such
 /// as a write, with a note saying why.
@@ -257,7 +284,34 @@ impl Recorder {
             log: Arc::default(),
             synthesize: None,
             make_up: None,
+            amend: None,
+            github_users: false,
         }
+    }
+
+    /// Changes each REST read's answer with `amend` before keeping it,
+    /// flagging the exchange with its note when it changed it.
+    pub fn amending(
+        mut self,
+        amend: impl Fn(&str, &mut Value) -> Option<String> + Send + Sync + 'static,
+    ) -> Self {
+        self.amend = Some(Arc::new(amend));
+        self
+    }
+
+    /// Pseudonymizes the GitHub users of the answers when written
+    /// ([`github_users`]).
+    pub fn pseudonymizing_github_users(mut self) -> Self {
+        self.github_users = true;
+        self
+    }
+
+    /// Sends one REST read to the live API, outside the recording.
+    pub fn live_get(&self, path: &str) -> Value {
+        let mut answer = self.live.get(path).unwrap();
+        let mut body = String::new();
+        std::io::Read::read_to_string(&mut answer.body, &mut body).unwrap();
+        serde_json::from_str(&body).unwrap()
     }
 
     /// Answers with `make_up` instead of the live API whenever it returns an
@@ -288,6 +342,9 @@ impl Recorder {
         let mut people = BTreeMap::new();
         for exchange in &mut exchanges {
             pseudonymize(&mut exchange.response, &mut people);
+            if self.github_users {
+                github_users(&mut exchange.response, &mut people);
+            }
         }
         let fixture = Fixture {
             recorded: recorded.to_owned(),
@@ -393,9 +450,64 @@ impl Transport for Recorder {
             synthesized: None,
         }))
     }
+
+    /// A REST read, sent and recorded, then amended when the recorder
+    /// amends (OWL-535).
+    fn get(&self, path: &str) -> Result<RestAnswer, String> {
+        let mut answer = self.live.get(path)?;
+        let mut body = String::new();
+        std::io::Read::read_to_string(&mut answer.body, &mut body).map_err(|e| e.to_string())?;
+        let mut response: Value = serde_json::from_str(&body).unwrap_or(Value::String(body));
+        let synthesized = self
+            .amend
+            .as_ref()
+            .and_then(|amend| amend(path, &mut response));
+        let kept = self.keep(Exchange {
+            request: rest_request("GET", path, &Value::Null),
+            status: answer.status,
+            response,
+            rate: Rate::of(answer.rate),
+            synthesized,
+        });
+        Ok(RestAnswer {
+            status: kept.status,
+            rate: kept.rate,
+            body: Box::new(std::io::Cursor::new(kept.body.into_bytes())),
+        })
+    }
+
+    /// A REST write: made up when the recorder makes it up, sent otherwise.
+    fn post(&self, path: &str, body: &Value) -> Result<Response, String> {
+        self.rest_write("POST", path, body)
+    }
+
+    fn delete(&self, path: &str) -> Result<Response, String> {
+        self.rest_write("DELETE", path, &Value::Null)
+    }
 }
 
 impl Recorder {
+    /// A REST write `method` of `body` to `path`: answered by the make-up
+    /// when it answers, sent live otherwise.
+    fn rest_write(&self, method: &str, path: &str, body: &Value) -> Result<Response, String> {
+        let request = rest_request(method, path, body);
+        if let Some(exchange) = self.made_up(&request) {
+            return Ok(self.keep(exchange));
+        }
+        let answer = match method {
+            "POST" => self.live.post(path, body)?,
+            "DELETE" => self.live.delete(path)?,
+            other => panic!("no REST write {other}"),
+        };
+        Ok(self.keep(Exchange {
+            request,
+            status: answer.status,
+            response: serde_json::from_str(&answer.body).unwrap_or(Value::String(answer.body)),
+            rate: Rate::of(answer.rate),
+            synthesized: None,
+        }))
+    }
+
     /// Logs `exchange` and returns its answer.
     fn keep(&self, exchange: Exchange) -> Response {
         let answer = Response {
@@ -405,6 +517,29 @@ impl Recorder {
         };
         self.log.lock().unwrap().push(exchange);
         answer
+    }
+}
+
+/// Replaces every GitHub user (an object with a `login`) by a stable
+/// pseudonym, keeping its `type` alone: `person-1` with the id 1 for the
+/// first account met, and so on, shared with the Linear accounts' count.
+/// Its URLs, which name its login, are dropped.
+pub fn github_users(value: &mut Value, people: &mut BTreeMap<String, usize>) {
+    match value {
+        Value::Object(map) => {
+            if let Some(Value::String(login)) = map.get("login") {
+                let next = people.len() + 1;
+                let n = *people.entry(login.clone()).or_insert(next);
+                let kind = map.get("type").cloned().unwrap_or(Value::Null);
+                *value = json!({ "login": format!("person-{n}"), "id": n, "type": kind });
+                return;
+            }
+            for inner in map.values_mut() {
+                github_users(inner, people);
+            }
+        }
+        Value::Array(items) => items.iter_mut().for_each(|v| github_users(v, people)),
+        _ => {}
     }
 }
 
