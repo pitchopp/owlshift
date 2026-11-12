@@ -3796,6 +3796,36 @@ fn pause_and_resume_write_the_commands_files_by_ui() {
     assert!(said[0].starts_with("The pause of every project is lifted"));
     assert_eq!(requests::machine_pause(ground.data.path()), None);
 
+    // OWL-528: each gesture left one `decision` event, by `ui`.
+    let log = std::fs::read_to_string(ground.data.path().join("events.jsonl")).unwrap();
+    let events: Vec<serde_json::Value> = log
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    let seen: Vec<(&str, &str, &str)> = events
+        .iter()
+        .map(|event| {
+            (
+                event["project"].as_str().unwrap(),
+                event["data"]["pause"].as_str().unwrap(),
+                event["data"]["by"].as_str().unwrap(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        seen,
+        [
+            ("o/r", "asked", "ui"),
+            ("machine", "asked", "ui"),
+            ("machine", "asked", "ui"),
+            ("o/r", "lifted", "ui"),
+            ("machine", "lifted", "ui"),
+        ],
+        "{log}"
+    );
+    assert_eq!(events[0]["data"]["why"], "asked from the web UI");
+    assert_eq!(events[1]["data"]["why"], "lunch");
+
     // A project paused on its own while the machine is paused stands after
     // the machine's resume, and the UI names its button for it too.
     ground.post("/api/pause", &json!({ "project": "o/r" }));
