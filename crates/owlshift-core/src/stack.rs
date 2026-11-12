@@ -242,11 +242,19 @@ fn pyproject(root: &RootFiles, text: &str) -> Result<Option<Found>, String> {
         found.source = "pyproject.toml (uv.lock)".to_string();
         "uv run "
     } else {
-        found.notes.push(
-            "pyproject.toml's tools are run bare and no setup was written: the gate needs a \
-             setup that installs them"
+        let manager = ["poetry", "pdm"]
+            .into_iter()
+            .find(|m| root.has(&format!("{m}.lock")));
+        found.notes.push(match manager {
+            Some(m) => format!(
+                "pyproject.toml's tools are run bare and no setup was written, but {m}.lock \
+                 names {m}: the gate needs `{m} run` in front of them and a setup that \
+                 installs the project (not checked here)"
+            ),
+            None => "pyproject.toml's tools are run bare and no setup was written: the gate \
+                     needs a setup that installs them"
                 .to_string(),
-        );
+        });
         ""
     };
     for (command, from) in tools {
@@ -489,6 +497,15 @@ check::
             assert_eq!(commands(d.gate()), ["ruff check .", "pytest"], "{names:?}");
             assert_eq!(d.found[0].notes.len(), 1);
             assert!(d.found[0].notes[0].contains("setup"));
+        }
+    }
+
+    #[test]
+    fn a_poetry_or_pdm_root_names_the_manager_in_its_note() {
+        for m in ["poetry", "pdm"] {
+            let lock = format!("{m}.lock");
+            let d = detect(&root(&[lock.as_str()], &[("pyproject.toml", PY)]));
+            assert!(d.found[0].notes[0].contains(&format!("`{m} run`")), "{m}");
         }
     }
 
