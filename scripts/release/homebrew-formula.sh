@@ -2,9 +2,12 @@
 # Prints the Homebrew formula of release VERSION from the release's
 # SHA256SUMS (OWL-540). The repository is its own tap: once a release is
 # published, the maintainer commits this output as Formula/owlshift.rb on
-# main (CONTRIBUTING.md, "Releasing"), and people install with
+# main (CONTRIBUTING.md, "Releasing"), and people install with the lines
+# below. Homebrew 7 loads no formula of a tap it was not told to trust
+# (R1, build plan), hence the second one.
 #
 #   brew tap pitchopp/owlshift https://github.com/pitchopp/owlshift
+#   brew trust --formula pitchopp/owlshift/owlshift
 #   brew install owlshift
 #
 #   sh scripts/release/homebrew-formula.sh VERSION SHA256SUMS

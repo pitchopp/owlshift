@@ -70,7 +70,7 @@ The maintainer makes releases. The workflow is `.github/workflows/release.yml`, 
 2. Once it is merged, tag a commit of main and push the tag: `git tag v0.1.0 origin/main && git push origin v0.1.0`.
 3. The run builds, then waits for your approval of the environment `release`. Approve it only for a run whose commit is a commit of main. The workflow refuses others, but that check is in the very file a run on another commit could change.
 4. Check the draft release: one `owlshift-<version>-<target>.tar.gz` per target, `SHA256SUMS` and `SHA256SUMS.minisig`. Then publish it.
-5. Commit the run's `homebrew-formula` artifact, also shown in the run's summary, as `Formula/owlshift.rb` on main. The repository is its own tap, so on a Mac, `brew tap pitchopp/owlshift https://github.com/pitchopp/owlshift` then `brew install owlshift` installs it.
+5. Commit the run's `homebrew-formula` artifact, also shown in the run's summary, as `Formula/owlshift.rb` on main. The repository is its own tap. Check that the formula installs on a Mac with `brew tap pitchopp/owlshift https://github.com/pitchopp/owlshift`, `brew trust --formula pitchopp/owlshift/owlshift` and `brew install owlshift`: the release's own URLs are checked only there.
 
 If a run fails, delete the draft if there is one and the tag (`git push origin :refs/tags/v0.1.0`), fix the cause on main, and tag again. Approving a run of another ref, as for the probe of OWL-540, means reading that ref's `release.yml` first.
 

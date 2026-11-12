@@ -12,7 +12,7 @@
 # SHA256SUMS.minisig, checked with `minisign -Vm SHA256SUMS -p minisign.pub`
 # (the public key at the repository's root). On macOS, use the tap instead:
 # `brew tap pitchopp/owlshift https://github.com/pitchopp/owlshift`, then
-# `brew install owlshift`.
+# `brew trust --formula pitchopp/owlshift/owlshift` and `brew install owlshift`.
 #
 # Settings, from the environment:
 #   OWLSHIFT_VERSION       the version to install, 0.1.0 or v0.1.0; the latest
@@ -69,7 +69,7 @@ latest_version() {
 
 main() {
     if [ "$(uname -s)" != Linux ]; then
-        fail "this script installs Owlshift on Linux; on macOS, run: brew tap pitchopp/owlshift $REPOSITORY && brew install owlshift"
+        fail "this script installs Owlshift on Linux; on macOS, run: brew tap pitchopp/owlshift $REPOSITORY && brew trust --formula pitchopp/owlshift/owlshift && brew install owlshift"
     fi
     machine=$(uname -m)
     case $machine in
