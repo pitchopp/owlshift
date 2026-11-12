@@ -456,7 +456,8 @@ fn the_notices_hold_the_crates_and_the_fonts_or_nothing() {
 /// script, which never force-pushes.
 #[test]
 fn the_formula_workflow_keeps_its_guards() {
-    let workflow = read(".github/workflows/formula.yml");
+    // A Windows checkout may have CRLF line endings.
+    let workflow = read(".github/workflows/formula.yml").replace("\r\n", "\n");
     let lines: Vec<&str> = workflow.lines().map(str::trim).collect();
     for guard in [
         "types: [published]",
