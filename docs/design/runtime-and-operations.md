@@ -74,7 +74,7 @@ Native binary on every developer machine; Windows goes through WSL2 first; Docke
 Four commands cover the whole life of an install, and uninstalling removes exactly what was installed, because background services that outlive their binary are the classic failure of this kind of tool.
 
 ```bash
-brew install owlshift        # or cargo install, or the Linux install script
+brew install owlshift        # after `brew tap pitchopp/owlshift https://github.com/pitchopp/owlshift`; or the Linux install script, or cargo install
 owlshift init                # in each repository to adopt
 owlshift start --at-login    # plain `start` runs for this session only
 owlshift stop                # ends after the steps under way; --forget stops serving this project
