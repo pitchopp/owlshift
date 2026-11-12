@@ -208,6 +208,13 @@ function usageText(usage) {
   return usage.harness + " " + Math.round(usage.share * 100) + "%, resets " + usage.resets_at;
 }
 
+// A project's run slots and the tickets holding them: "0 slots",
+// "1 slot: LOC-1538", "2 slots: LOC-1, LOC-2" (OWL-530).
+function slotsText(project) {
+  return project.slots_held + " slot" + (project.slots_held === 1 ? "" : "s") +
+    (project.slot_holders.length ? ": " + project.slot_holders.join(", ") : "");
+}
+
 function waitingText(waiting) {
   return waiting.questions + " to answer, " + waiting.reviews + " to review, " +
     waiting.parked + " parked";
@@ -262,8 +269,7 @@ function render(header) {
   for (const project of shown) {
     const item = make("span", "fact project");
     item.appendChild(make("span", "fact-value", project.repository));
-    item.appendChild(make("span", "fact-label",
-      project.slots_held + " slot" + (project.slots_held === 1 ? "" : "s")));
+    item.appendChild(make("span", "fact-label", slotsText(project)));
     if (project.paused) {
       item.appendChild(make("span", "state-warning", "paused: " + project.paused.why));
     }
