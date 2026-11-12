@@ -254,6 +254,26 @@ impl Transport for HttpTransport {
     fn post(&self, path: &str, body: &Value) -> Result<Response, String> {
         self.write(self.agent.post(&format!("{REST_API}{path}")), body)
     }
+
+    /// Deletes `path` (OWL-535), the answer read as a put's.
+    fn delete(&self, path: &str) -> Result<Response, String> {
+        let mut answer = self
+            .agent
+            .delete(&format!("{REST_API}{path}"))
+            .header("Authorization", &format!("bearer {}", self.token.0))
+            .header("Accept", "application/vnd.github+json")
+            .call()
+            .map_err(|e| redact(&e.to_string()))?;
+        let status = answer.status().as_u16();
+        let rate = rate_headers(answer.headers());
+        let body = answer
+            .body_mut()
+            .with_config()
+            .limit(MAX_REST_BYTES)
+            .read_to_string()
+            .map_err(|e| redact(&e.to_string()))?;
+        Ok(Response { status, body, rate })
+    }
 }
 
 impl HttpTransport {
@@ -418,6 +438,7 @@ impl Channel {
             |transport| match verb {
                 Verb::Put => transport.put(path, body),
                 Verb::Post => transport.post(path, body),
+                Verb::Delete => transport.delete(path),
             },
             |answer| answer.status,
         )
@@ -426,9 +447,11 @@ impl Channel {
 
 /// The HTTP verb of a REST write.
 #[derive(Clone, Copy)]
-enum Verb {
+pub(crate) enum Verb {
     Put,
     Post,
+    /// Sent with no body (OWL-535).
+    Delete,
 }
 
 /// One GitHub repository, as seen through one token. It can open a pull
@@ -995,30 +1018,67 @@ impl GitHubForge {
         }
         let mut body = String::new();
         let _ = (&mut answer.body).take(4096).read_to_string(&mut body);
-        let message = serde_json::from_str::<Envelope>(&body)
-            .ok()
-            .and_then(|e| e.message)
-            .unwrap_or_default();
-        let rate = answer.rate;
-        let status = answer.status;
-        Err(match status {
-            403 | 429 if rate.remaining == Some(0) || rate.retry_after.is_some() => Error::new(
-                ErrorKind::RateLimited,
-                format!("GitHub's rate limit: HTTP {status} {message}"),
-            )
-            .with_reset(resets_at(rate, Timestamp::now())),
-            401 | 403 => Error::new(
-                ErrorKind::Unauthorized,
-                format!("GitHub refused the token: HTTP {status} {message}"),
-            ),
-            404 | 410 => Error::new(
-                ErrorKind::NotFound,
-                format!("GitHub has no such {path}: HTTP {status} {message}"),
-            ),
-            _ => invalid(format!("GitHub answered HTTP {status} {message}")),
-        })
+        Err(status_error(answer.status, &body, answer.rate, path))
     }
 
+    /// One REST read of the answer whole, to 1 MiB: its text, or the error
+    /// its status says (OWL-535).
+    pub(crate) fn rest_text(&self, path: &str) -> Result<String, Error> {
+        let mut answer = self.rest(path)?;
+        let mut body = String::new();
+        (&mut answer.body)
+            .take(MAX_REST_BYTES)
+            .read_to_string(&mut body)
+            .map_err(|_| invalid(format!("reading {path} from GitHub failed")))?;
+        Ok(body)
+    }
+
+    /// One REST write: its answer's text when GitHub took it, or the error
+    /// its status says, as a read's (OWL-535).
+    pub(crate) fn rest_write(&self, verb: Verb, path: &str, body: &Value) -> Result<String, Error> {
+        let answer =
+            self.channel
+                .write(verb, path, body)
+                .map_err(|unanswered| match unanswered {
+                    Unanswered::Source(error) => error,
+                    Unanswered::Transport(e) => Error::new(
+                        ErrorKind::Unreachable,
+                        format!("GitHub could not be reached: {}", redact(&e)),
+                    ),
+                })?;
+        if (200..300).contains(&answer.status) {
+            return Ok(answer.body);
+        }
+        Err(status_error(answer.status, &answer.body, answer.rate, path))
+    }
+}
+
+/// The error a REST answer of HTTP `status` says, from its `body` and its
+/// rate-limit headers, for the request to `path`.
+fn status_error(status: u16, body: &str, rate: RateHeaders, path: &str) -> Error {
+    let message = serde_json::from_str::<Envelope>(body)
+        .ok()
+        .and_then(|e| e.message)
+        .unwrap_or_default();
+    match status {
+        403 | 429 if rate.remaining == Some(0) || rate.retry_after.is_some() => Error::new(
+            ErrorKind::RateLimited,
+            format!("GitHub's rate limit: HTTP {status} {message}"),
+        )
+        .with_reset(resets_at(rate, Timestamp::now())),
+        401 | 403 => Error::new(
+            ErrorKind::Unauthorized,
+            format!("GitHub refused the token: HTTP {status} {message}"),
+        ),
+        404 | 410 => Error::new(
+            ErrorKind::NotFound,
+            format!("GitHub has no such {path}: HTTP {status} {message}"),
+        ),
+        _ => invalid(format!("GitHub answered HTTP {status} {message}")),
+    }
+}
+
+impl GitHubForge {
     /// The checks of a commit from the first page `rollup`, reading its
     /// other pages; refused when the pages do not advance or their count
     /// differs from GitHub's total.
