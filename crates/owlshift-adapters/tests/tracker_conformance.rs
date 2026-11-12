@@ -554,6 +554,59 @@ fn check_documents(tracker: &dyn Tracker, case: &DocumentsCase) {
     assert!(refused.is_err(), "content past the cap was accepted");
 }
 
+/// Resolving a comment, which the tracker then shows folded: the comment is
+/// still listed, unedited; one that does not exist is not found.
+fn check_fold_comments(tracker: &dyn Tracker, ticket: &TicketId) {
+    assert!(
+        tracker.capabilities().contains(&Capability::FoldComments),
+        "FoldComments is not declared"
+    );
+    let posted = tracker
+        .post_comment(ticket, "[owlshift] QUESTIONS")
+        .unwrap();
+    tracker.resolve_comment(&posted.id).unwrap();
+    let listed = tracker.comments(ticket).unwrap();
+    let folded = listed.iter().find(|c| c.id == posted.id);
+    let folded = folded.unwrap_or_else(|| panic!("{} is no longer listed", posted.id));
+    assert_eq!(folded.body, posted.body);
+    assert_eq!(folded.edited_at, None, "resolving a comment edits it");
+    let unknown = tracker.resolve_comment("no-such-comment").unwrap_err();
+    assert_eq!(unknown.kind, ErrorKind::NotFound, "{unknown}");
+}
+
+/// What the Reactions check knows about the tracker: a ticket with a
+/// comment that carries a thumbs-up and one that carries none.
+struct ReactionsCase {
+    ticket: TicketId,
+    reacted: &'static str,
+    plain: &'static str,
+}
+
+/// Reading a comment's reactions: the thumbs-up of an account reads with
+/// its author and its time, and a comment without one reads none.
+fn check_reactions(tracker: &dyn Tracker, case: &ReactionsCase) {
+    assert!(
+        tracker.capabilities().contains(&Capability::Reactions),
+        "Reactions is not declared"
+    );
+    let comments = tracker.comments(&case.ticket).unwrap();
+    let find = |id: &str| {
+        let comment = comments.iter().find(|c| c.id == id);
+        comment.unwrap_or_else(|| panic!("no comment {id}: {comments:?}"))
+    };
+    let reacted = find(case.reacted);
+    let up: Vec<_> = reacted
+        .reactions
+        .iter()
+        .filter(|r| r.is_thumbs_up())
+        .collect();
+    assert_eq!(up.len(), 1, "{:?}", reacted.reactions);
+    assert!(matches!(up[0].author, Author::Account(_)), "{:?}", up[0]);
+    assert!(up[0].created_at >= reacted.created_at, "{:?}", up[0]);
+    let plain = find(case.plain);
+    assert!(plain.reactions.is_empty(), "{:?}", plain.reactions);
+}
+
 const BODY: &str = "[owlshift] OWL-13 conformance check: a comment posted by the Linear \
                     adapter's fixture recorder · safe to delete.\n\nSecond line.";
 
@@ -921,6 +974,76 @@ fn linear() -> Adapter {
                 ]
             );
         })
+        .case(Check::Folding, || {
+            // MADE UP: no recording holds these answers (see `Fake`).
+            check_fold_comments(
+                &LinearTracker::with_transport(linear_comments()),
+                &id("OWL-1"),
+            );
+        })
+        .case(Check::Reactions, || {
+            // MADE UP: the comments and their reactions are in the shape of
+            // `reactions_are_read_with_their_authors` in the adapter's unit
+            // tests; Linear answered such reactions on 2026-10-19.
+            check_reactions(
+                &LinearTracker::with_transport(linear_comments()),
+                &ReactionsCase {
+                    ticket: id("OWL-1"),
+                    reacted: "c1",
+                    plain: "c2",
+                },
+            );
+        })
+}
+
+/// MADE UP: a Linear whose issue OWL-1 holds two comments, `c1` with a
+/// thumbs-up of an account and `c2` with none. It keeps the comments posted,
+/// and `Resolve` of a comment it holds succeeds without touching it: a
+/// resolved comment is still listed, unedited. An unknown comment is
+/// `Entity not found: Comment`. Shapes as in the unit tests of
+/// `src/tracker/linear.rs`.
+fn linear_comments() -> Fake {
+    let user = json!({ "id": "u1", "displayName": "person-1", "app": false });
+    let app = json!({ "id": "app-1", "displayName": "Owlshift", "app": true });
+    let reactor = user.clone();
+    let comment = move |id: &str, at: &str, reactions: Value| {
+        json!({ "id": id, "body": format!("body of {id}"), "createdAt": at, "editedAt": null,
+            "user": user, "botActor": null, "externalUser": null, "parent": null,
+            "reactions": reactions })
+    };
+    let mut comments = vec![
+        comment(
+            "c1",
+            "2026-10-19T20:07:00.000Z",
+            json!([{ "emoji": "+1", "createdAt": "2026-10-19T20:07:35.000Z",
+                "externalUser": null, "user": reactor }]),
+        ),
+        comment("c2", "2026-10-19T20:08:00.000Z", json!([])),
+    ];
+    Fake::new(move |name, variables| match name {
+        "PostComment" => {
+            let id = format!("c{}", comments.len() + 1);
+            let mut posted = comment(&id, &jiff::Timestamp::now().to_string(), json!([]));
+            posted["body"] = variables["body"].clone();
+            posted["user"] = app.clone();
+            comments.push(posted.clone());
+            Answer::Data(json!({ "commentCreate": { "success": true, "comment": posted } }))
+        }
+        "Comments" => {
+            // Linear lists the newest first.
+            let nodes: Vec<&Value> = comments.iter().rev().collect();
+            Answer::Data(json!({ "issue": { "comments": { "nodes": nodes,
+                "pageInfo": { "hasNextPage": false, "endCursor": null } } } }))
+        }
+        "Resolve" => {
+            if comments.iter().any(|c| c["id"] == variables["id"]) {
+                Answer::Data(json!({ "commentResolve": { "success": true } }))
+            } else {
+                Answer::NotFound("Entity not found: Comment")
+            }
+        }
+        other => panic!("the made-up Linear does not answer {other}"),
+    })
 }
 
 /// MADE UP: a Linear that knows the issue OWL-1 and keeps the documents
