@@ -152,6 +152,91 @@ fn missing_cases(adapter: &Adapter) -> Vec<Capability> {
         .collect()
 }
 
+/// The capabilities that have no trait method: no adapter may declare one,
+/// since nothing could check it. An adapter that does fails until a real
+/// check replaces this one.
+fn check_undeclared(declared: &[Capability]) {
+    for capability in Capability::ALL {
+        if check_of(capability) == [Check::Undeclared] {
+            assert!(
+                !declared.contains(&capability),
+                "{capability:?} is declared, and no check covers it"
+            );
+        }
+    }
+}
+
+/// The three adapters, each with the cases it runs.
+fn adapters() -> [Adapter; 3] {
+    [markdown(), linear(), github::adapter()]
+}
+
+/// An adapter that declares a capability must have a case for each check of
+/// it: a capability cannot be declared, GitHub's included, without its
+/// checks.
+#[test]
+fn every_declared_capability_has_a_case() {
+    for adapter in adapters() {
+        let missing = missing_cases(&adapter);
+        assert!(
+            missing.is_empty(),
+            "{} declares {missing:?} without a case",
+            adapter.name
+        );
+    }
+}
+
+/// Every check of every capability is run by some adapter's case, so a
+/// capability the trait declares cannot lack a check.
+#[test]
+fn every_capability_has_a_check() {
+    let covered: Vec<Check> = adapters()
+        .iter()
+        .flat_map(|a| a.cases.iter().map(|(check, _)| *check))
+        .collect();
+    for capability in Capability::ALL {
+        for check in check_of(capability) {
+            assert!(
+                covered.contains(check),
+                "no adapter runs the {check:?} check of {capability:?}"
+            );
+        }
+    }
+}
+
+/// A check other than Read (ReadTicket and Comments) and Undeclared
+/// (AgentIdentity and Webhooks) serves one capability, so a new capability
+/// cannot be mapped onto the check of another unnoticed.
+#[test]
+fn check_of_serves_one_capability_per_check() {
+    let all: Vec<Check> = Capability::ALL
+        .into_iter()
+        .flat_map(|c| check_of(c).iter().copied())
+        .collect();
+    for check in all {
+        let served: Vec<Capability> = Capability::ALL
+            .into_iter()
+            .filter(|c| check_of(*c).contains(&check))
+            .collect();
+        let wanted = match check {
+            Check::Read => 2,
+            Check::Undeclared => 2,
+            _ => 1,
+        };
+        assert_eq!(served.len(), wanted, "{check:?} serves {served:?}");
+    }
+}
+
+#[test]
+fn an_adapter_that_declares_a_capability_nothing_checks_fails() {
+    check_undeclared(&[Capability::ReadTicket]);
+    for capability in [Capability::AgentIdentity, Capability::Webhooks] {
+        let declared = [capability];
+        let outcome = std::panic::catch_unwind(|| check_undeclared(&declared));
+        assert!(outcome.is_err(), "{capability:?} was accepted");
+    }
+}
+
 #[test]
 fn a_declared_capability_without_a_case_is_reported() {
     let none = Adapter::new("none", &[Capability::FoldComments]);
@@ -739,6 +824,9 @@ fn markdown_case() -> Case {
 /// The Markdown tracker, on a tree of files built for each case.
 fn markdown() -> Adapter {
     Adapter::new("the Markdown tracker", MarkdownTracker::CAPABILITIES)
+        .case(Check::Undeclared, || {
+            check_undeclared(MarkdownTracker::CAPABILITIES)
+        })
         .case(Check::Read, || {
             let (_world, tracker) = markdown_world();
             let case = markdown_case();
@@ -879,6 +967,9 @@ const STAGE_FIXTURE: &str = "stage-owl-137.json";
 /// Linear, on its recorded exchanges.
 fn linear() -> Adapter {
     Adapter::new("Linear", LinearTracker::CAPABILITIES)
+        .case(Check::Undeclared, || {
+            check_undeclared(LinearTracker::CAPABILITIES)
+        })
         .case(Check::Read, || {
             let replay = Replay::new(LINEAR_FIXTURE);
             check(
@@ -1461,7 +1552,9 @@ mod github {
     use owlshift_contracts::config;
 
     use super::support::{self, Recorder, Replay};
-    use super::{Adapter, BODY, Case, Check, check, check_stage, id, run, run_check, today};
+    use super::{
+        Adapter, BODY, Case, Check, check, check_stage, check_undeclared, id, run, run_check, today,
+    };
 
     const SANDBOX: &str = "pitchopp/owlshift-live-sandbox";
     /// Issue #11, G1's: three comments, two of them in one second (G2).
@@ -1527,11 +1620,20 @@ mod github {
     }
 
     /// GitHub Issues, on its recorded exchanges. It declares ReadTicket,
-    /// Comments and VisibleStage today: the cases of the capabilities that
-    /// arrive with the drain's ticket (OWL-536) are added with them, and
-    /// `every_declared_capability_has_a_case` fails until they are.
+    /// Comments and VisibleStage on their own fixtures, and ListAdmitted,
+    /// BlockedBy, ProposalsInbox and Reactions, which the drain's replay
+    /// (OWL-536) reads: each of their checks runs that replay, which reads
+    /// all four.
     pub fn adapter() -> Adapter {
+        let drain = || {
+            let replay = Replay::of(&dir(), DRAIN);
+            check_drain(&tracker(replay.clone()));
+            replay.assert_done();
+        };
         Adapter::new("GitHub Issues", GitHubTracker::CAPABILITIES)
+            .case(Check::Undeclared, || {
+                check_undeclared(GitHubTracker::CAPABILITIES)
+            })
             .case(Check::Read, || {
                 let replay = Replay::of(&dir(), CONFORMANCE);
                 check(&tracker(replay.clone()), &case());
@@ -1545,6 +1647,11 @@ mod github {
                 check_reads(&tracker);
                 replay.assert_done();
             })
+            .case(Check::Admitted, drain)
+            .case(Check::Blocked, drain)
+            .case(Check::Links, drain)
+            .case(Check::Proposals, drain)
+            .case(Check::Reactions, drain)
     }
 
     #[test]

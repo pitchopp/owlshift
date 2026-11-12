@@ -38,6 +38,14 @@
 //! What the drain needs, admission, blockers, proposals and the working
 //! state, is in `drain` (OWL-536).
 //!
+//! The conformance suite (`tests/tracker_conformance.rs`) runs one case for
+//! each check of each capability in [`GitHubTracker::CAPABILITIES`]: reading a
+//! ticket and its comments, and the visible stage. The drain's recorded
+//! replay (OWL-536) reads ListAdmitted, BlockedBy, ProposalsInbox and
+//! Reactions, so each of their checks has a case that runs it. Documents and
+//! FoldComments are not declared in P9. Declaring a capability without its
+//! case fails `every_declared_capability_has_a_case`.
+//!
 //! The tracker's errors have no rate-limit kind: a spent budget is
 //! [`ErrorKind::Other`], its message saying so and until when every call of
 //! the tracker waits. The forge holds them (OWL-554; architecture section 5,
