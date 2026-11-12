@@ -2124,10 +2124,7 @@ fn project_secrets(
             .map(|found| found.then_some(()))
     };
     let found = (|| {
-        let tracker = match config.tracker.kind {
-            TrackerKind::Linear => Some(secrets::tracker(&repo, &mut look)?),
-            TrackerKind::Markdown => None,
-        };
+        let tracker = crate::tracker::keychain_set(config, &repo, &mut look)?;
         let forge = secrets::forge(&repo, &mut look)?;
         Ok((tracker, forge))
     })();

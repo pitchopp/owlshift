@@ -2,13 +2,17 @@
 //! repository ("The test tracker" in the build plan), with no secret of
 //! their own and nothing to read over the network.
 
-use owlshift_adapters::tracker::Capability;
+use std::path::Path;
+
 use owlshift_adapters::tracker::markdown::MarkdownTracker;
+use owlshift_adapters::tracker::{Capability, Tracker};
 use owlshift_contracts::config;
 use owlshift_contracts::ids::TicketId;
+use owlshift_platform::keychain::Secret;
 
-use super::Kind;
+use super::{Kind, Opener};
 use crate::init::SecretSpec;
+use crate::secrets::TrackerSecrets;
 
 pub struct Markdown;
 
@@ -37,5 +41,17 @@ kind = \"markdown\"
     /// Any ticket id: the project's tickets are the files of its checkout.
     fn check_ticket(&self, _tracker: &config::Tracker, _ticket: &TicketId) -> Result<(), String> {
         Ok(())
+    }
+
+    /// The tickets under `root`, the project's checkout.
+    fn opener<'a>(
+        &self,
+        _tracker: &'a config::Tracker,
+        root: &'a Path,
+        _secrets: Option<&'a TrackerSecrets<Secret>>,
+    ) -> Result<Opener<'a>, String> {
+        Ok(Opener::new(move || {
+            Ok(Box::new(MarkdownTracker::new(root)) as Box<dyn Tracker>)
+        }))
     }
 }

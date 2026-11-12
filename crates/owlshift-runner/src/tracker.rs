@@ -16,18 +16,20 @@ mod linear;
 mod markdown;
 
 use std::fmt;
+use std::path::Path;
 
+use owlshift_adapters::forge::Repo;
 use owlshift_adapters::tracker;
 use owlshift_adapters::tracker::linear::app::{AppTransport, ClientCredentials, HttpOAuth};
 use owlshift_adapters::tracker::linear::{AdmissionFacts, ApiKey, AppUser, LinearTracker};
 use owlshift_adapters::tracker::{Capability, ErrorKind};
-use owlshift_contracts::config::{self, TrackerKind};
+use owlshift_contracts::config::{self, ProjectConfig, TrackerKind};
 use owlshift_contracts::ids::TicketId;
 use owlshift_platform::keychain::{Keychain, SERVICE, Secret};
 
 use crate::init::SecretSpec;
 use crate::refusal::Refusal;
-use crate::secrets::{Source, TrackerAccounts, TrackerSecrets};
+use crate::secrets::{Lookup, Source, TrackerAccounts, TrackerSecrets};
 
 /// What differs by tracker, for one kind of tracker a project file names
 /// (`[tracker].kind`): [`of`] gives it.
@@ -51,6 +53,16 @@ pub trait Kind: Sync {
     /// Refuses `ticket` when its id says it is not one of the project's,
     /// before anything is read ([`crate::on_demand::check_team`]).
     fn check_ticket(&self, tracker: &config::Tracker, ticket: &TicketId) -> Result<(), String>;
+
+    /// What opens the adapter of the project whose `[tracker]` is `tracker`,
+    /// checked out at `root`, with the tracker secrets [`keychain_set`]
+    /// read: the error says what the project file or the keychain lacks.
+    fn opener<'a>(
+        &self,
+        tracker: &'a config::Tracker,
+        root: &'a Path,
+        secrets: Option<&'a TrackerSecrets<Secret>>,
+    ) -> Result<Opener<'a>, String>;
 }
 
 /// The kind of the tracker a project file names: the one place the runner
@@ -59,6 +71,39 @@ pub fn of(kind: TrackerKind) -> &'static dyn Kind {
     match kind {
         TrackerKind::Linear => &linear::Linear,
         TrackerKind::Markdown => &markdown::Markdown,
+    }
+}
+
+/// The tracker set of the project of `repo`, each account looked up by
+/// `look` as [`crate::secrets::tracker`] says: `None` when the project's
+/// tracker needs no secret of its own, and then no account is looked up.
+pub fn keychain_set<T>(
+    config: &ProjectConfig,
+    repo: &Repo,
+    look: &mut Lookup<'_, T>,
+) -> Result<Option<TrackerSecrets<T>>, String> {
+    if of(config.tracker.kind).secret_specs().is_empty() {
+        return Ok(None);
+    }
+    crate::secrets::tracker(repo, look).map(Some)
+}
+
+/// Opens the project's tracker adapter, afresh on each call: `owlshift do`
+/// opens it again on each try while the tracker does not answer (OWL-479).
+pub struct Opener<'a> {
+    open: Box<dyn Fn() -> Result<Box<dyn tracker::Tracker>, Refusal> + 'a>,
+}
+
+impl<'a> Opener<'a> {
+    fn new(open: impl Fn() -> Result<Box<dyn tracker::Tracker>, Refusal> + 'a) -> Self {
+        Self {
+            open: Box::new(open),
+        }
+    }
+
+    /// The adapter, opened now.
+    pub fn open(&self) -> Result<Box<dyn tracker::Tracker>, Refusal> {
+        (self.open)()
     }
 }
 

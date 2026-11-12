@@ -2,13 +2,17 @@
 //! a Linear API key and, when one is stored, the Linear app Owlshift writes
 //! as (decision D8, OWL-157).
 
-use owlshift_adapters::tracker::Capability;
+use std::path::Path;
+
 use owlshift_adapters::tracker::linear::LinearTracker;
+use owlshift_adapters::tracker::{Capability, Tracker};
 use owlshift_contracts::config;
 use owlshift_contracts::ids::TicketId;
+use owlshift_platform::keychain::Secret;
 
-use super::Kind;
+use super::{Kind, Opener};
 use crate::init::{LINEAR_KEY, SecretSpec};
+use crate::secrets::TrackerSecrets;
 
 pub struct Linear;
 
@@ -59,5 +63,23 @@ team = {}
                  `owlshift do` runs this project's tickets only"
             ))
         }
+    }
+
+    /// Opens [`super::linear()`] with the project's team, which a Linear
+    /// project names; its set is read whenever the kind is Linear.
+    fn opener<'a>(
+        &self,
+        tracker: &'a config::Tracker,
+        _root: &'a Path,
+        secrets: Option<&'a TrackerSecrets<Secret>>,
+    ) -> Result<Opener<'a>, String> {
+        let team = tracker
+            .team
+            .as_deref()
+            .ok_or("a Linear project names its team in `tracker.team`")?;
+        let secrets = secrets.ok_or("the Linear key and app were not read from the keychain")?;
+        Ok(Opener::new(move || {
+            Ok(Box::new(super::linear(secrets, team)?) as Box<dyn Tracker>)
+        }))
     }
 }
