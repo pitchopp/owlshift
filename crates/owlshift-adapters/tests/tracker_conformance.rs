@@ -9,8 +9,11 @@ use std::fs;
 
 use owlshift_adapters::tracker::linear::{ApiKey, LinearTracker};
 use owlshift_adapters::tracker::markdown::MarkdownTracker;
-use owlshift_adapters::tracker::{Author, Capability, ErrorKind, Person, Tracker};
+use owlshift_adapters::tracker::{
+    Author, Blocker, Capability, Column, ErrorKind, Person, StateType, Tracker,
+};
 use owlshift_contracts::Priority;
+use owlshift_contracts::config::Admit;
 use owlshift_contracts::ids::TicketId;
 
 use support::{Recorder, Replay};
@@ -248,6 +251,81 @@ fn check_stage(
     assert_eq!(missing.kind, ErrorKind::NotFound, "{missing}");
 }
 
+/// What the Admitted check knows about the tracker.
+struct AdmittedCase {
+    team: Option<&'static str>,
+    ready: &'static str,
+    admit: Admit,
+    /// Tickets the listing must show, each with the blockers it must carry.
+    expected: Vec<(TicketId, Vec<Blocker>)>,
+    /// Tickets the listing must not show: the ones that carry the wrong
+    /// label or sit in another stage. Where the tracker filters on its
+    /// server a recording cannot show that filter working: the check then
+    /// only shows the adapter does not invent tickets.
+    absent: Vec<TicketId>,
+    /// Admission gestures to read, in order.
+    gestures: Vec<(TicketId, Admit)>,
+    /// Who made each of them.
+    by: Author,
+    /// Whether the tracker keeps times: a ticket's creation in the listing
+    /// and a gesture's time. A tracker that keeps none gives `None`.
+    times: bool,
+}
+
+/// Listing the admitted tickets and reading who admitted them. `list` makes
+/// the listing calls and `gestures` the gesture reads, which are the same
+/// tracker for an adapter that is not replayed.
+fn check_admitted(list: &dyn Tracker, gestures: &dyn Tracker, case: &AdmittedCase) {
+    assert!(
+        list.capabilities().contains(&Capability::ListAdmitted),
+        "ListAdmitted is not declared"
+    );
+    let column = Column {
+        team: case.team,
+        ready: case.ready,
+        admit: &case.admit,
+    };
+    let listed = list.admitted(&column).unwrap();
+    for (n, one) in listed.iter().enumerate() {
+        let id = &one.ticket.id;
+        assert!(listed[..n].iter().all(|l| l.ticket.id != *id), "{id} twice");
+        assert_eq!(one.created_at.is_some(), case.times, "{id}: {one:?}");
+        for (m, blocker) in one.blockers.iter().enumerate() {
+            let twice = one.blockers[..m].iter().any(|b| b.id == blocker.id);
+            assert!(!twice, "{id}: blocker {} twice", blocker.id);
+        }
+    }
+    for (id, blockers) in &case.expected {
+        let one = listed.iter().find(|l| l.ticket.id == *id);
+        let one = one.unwrap_or_else(|| panic!("{id} is not listed: {listed:?}"));
+        assert_eq!(one.blockers, *blockers, "the blockers of {id}");
+    }
+    for id in &case.absent {
+        assert!(
+            listed.iter().all(|l| l.ticket.id != *id),
+            "{id} is listed though it is not admitted"
+        );
+    }
+
+    // The `delegation` gesture is not built: both reads refuse it.
+    let refused = list
+        .admitted(&Column {
+            admit: &Admit::Delegation,
+            ..column
+        })
+        .unwrap_err();
+    assert_eq!(refused.kind, ErrorKind::Other, "{refused}");
+
+    for (id, admit) in &case.gestures {
+        let gesture = gestures.gesture(id, admit).unwrap();
+        assert_eq!(gesture.account, case.by, "the gesture on {id}");
+        assert_eq!(gesture.at.is_some(), case.times, "{id}: {gesture:?}");
+    }
+    let (first, _) = &case.gestures[0];
+    let refused = gestures.gesture(first, &Admit::Delegation).unwrap_err();
+    assert_eq!(refused.kind, ErrorKind::Other, "{refused}");
+}
+
 const BODY: &str = "[owlshift] OWL-13 conformance check: a comment posted by the Linear \
                     adapter's fixture recorder · safe to delete.\n\nSecond line.";
 
@@ -274,8 +352,93 @@ fn markdown_world() -> (tempfile::TempDir, MarkdownTracker) {
         "Second.\n",
     )
     .unwrap();
+    // The tickets the other checks read: `DEMO-2` and `DEMO-6` are the
+    // admitted ones (Todo, the label), `DEMO-2` blocked by a ticket Done and
+    // one still In Progress; `DEMO-1`, `DEMO-5` (Todo without the label),
+    // `DEMO-3` and `DEMO-4` (labelled, in other stages) are not.
+    let agent = &["agent"][..];
+    for (id, title, stage, labels, blocked_by) in [
+        (
+            "DEMO-2",
+            "Greet by name",
+            "Todo",
+            agent,
+            &["DEMO-3", "DEMO-4"][..],
+        ),
+        ("DEMO-3", "Add a README", "Done", agent, &[][..]),
+        ("DEMO-4", "Add a licence", "In Progress", agent, &[][..]),
+        ("DEMO-5", "Add a changelog", "Todo", &[][..], &[][..]),
+        ("DEMO-6", "Add a contributing guide", "Todo", agent, &[][..]),
+    ] {
+        add_ticket(root.path(), id, title, stage, labels, blocked_by);
+    }
     let tracker = MarkdownTracker::new(root.path());
     (root, tracker)
+}
+
+/// Writes the ticket folder `id` under `root`, authored by the maintainer.
+fn add_ticket(
+    root: &std::path::Path,
+    id: &str,
+    title: &str,
+    stage: &str,
+    labels: &[&str],
+    blocked_by: &[&str],
+) {
+    let dir = root.join("tickets").join(id);
+    fs::create_dir_all(dir.join("comments")).unwrap();
+    let list = |names: &[&str]| {
+        let quoted: Vec<String> = names.iter().map(|n| format!("\"{n}\"")).collect();
+        format!("[{}]", quoted.join(", "))
+    };
+    let mut front = format!(
+        "title = \"{title}\"\nauthor = \"maintainer\"\nstage = \"{stage}\"\nlabels = {}\n",
+        list(labels)
+    );
+    if !blocked_by.is_empty() {
+        front += &format!("blocked_by = {}\n", list(blocked_by));
+    }
+    fs::write(
+        dir.join("ticket.md"),
+        format!("+++\n{front}+++\n\n{title}.\n"),
+    )
+    .unwrap();
+}
+
+fn markdown_admitted_case() -> AdmittedCase {
+    let maintainer = Person {
+        id: "maintainer".to_owned(),
+        name: "maintainer".to_owned(),
+    };
+    AdmittedCase {
+        team: None,
+        ready: "Todo",
+        admit: Admit::Label("agent".to_owned()),
+        expected: vec![
+            (
+                id("DEMO-2"),
+                vec![
+                    // A ticket Done is completed; one In Progress has no type.
+                    Blocker {
+                        id: id("DEMO-3"),
+                        state: Some(StateType::Completed),
+                    },
+                    Blocker {
+                        id: id("DEMO-4"),
+                        state: None,
+                    },
+                ],
+            ),
+            (id("DEMO-6"), vec![]),
+        ],
+        absent: vec![id("DEMO-1"), id("DEMO-3"), id("DEMO-4"), id("DEMO-5")],
+        gestures: vec![
+            (id("DEMO-2"), Admit::Label("agent".to_owned())),
+            (id("DEMO-6"), Admit::State("Todo".to_owned())),
+        ],
+        by: Author::Account(maintainer),
+        times: false,
+    }
 }
 
 fn markdown_case() -> Case {
@@ -319,6 +482,15 @@ fn markdown() -> Adapter {
                 "In Progress",
             );
             assert_eq!(tracker.ticket(&case.existing).unwrap().stage, "In Progress");
+        })
+        .case(Check::Admitted, || {
+            let (_world, tracker) = markdown_world();
+            let case = markdown_admitted_case();
+            // The tickets that must not be listed are there to be left out.
+            for id in &case.absent {
+                Tracker::ticket(&tracker, id).unwrap();
+            }
+            check_admitted(&tracker, &tracker, &case);
         })
 }
 
@@ -372,6 +544,51 @@ fn linear() -> Adapter {
             );
             replay.assert_done();
         })
+        .case(Check::Admitted, || {
+            // Team `OWL`'s Todo on 2026-10-13 (a state gesture), then the
+            // four gestures recorded for the drain, each from its fixture.
+            let listing = Replay::new("admitted-todo.json");
+            let gestures = Replay::new("gestures.json");
+            check_admitted(
+                &LinearTracker::with_transport(listing.clone()),
+                &LinearTracker::with_transport(gestures.clone()),
+                &linear_admitted_case(),
+            );
+            listing.assert_done();
+            gestures.assert_done();
+        })
+}
+
+fn linear_admitted_case() -> AdmittedCase {
+    let blocker = |id: &str| Blocker {
+        id: TicketId::new(id).unwrap(),
+        state: Some(StateType::Started),
+    };
+    let label = |name: &str| Admit::Label(name.to_owned());
+    let by = Person {
+        id: "00000000-0000-4000-8000-000000000001".to_owned(),
+        name: "person-1".to_owned(),
+    };
+    AdmittedCase {
+        team: Some("owl"),
+        ready: "Todo",
+        admit: Admit::State("Todo".to_owned()),
+        expected: vec![(id("OWL-155"), vec![blocker("OWL-246"), blocker("OWL-245")])],
+        // Linear filters on its server, so a recording only shows that the
+        // adapter lists no ticket the answer does not hold.
+        absent: vec![id("OWL-99999")],
+        // A label added by an account (OWL-129), a label set at creation and
+        // a move by an account (OWL-179), a ticket created in the state
+        // (OWL-249): the maintainer's account each time.
+        gestures: vec![
+            (id("OWL-129"), label("zone:backend/billing")),
+            (id("OWL-179"), label("agent")),
+            (id("OWL-179"), Admit::State("Canceled".to_owned())),
+            (id("OWL-249"), Admit::State("Todo".to_owned())),
+        ],
+        by: Author::Account(by),
+        times: true,
+    }
 }
 
 #[test]
