@@ -44,6 +44,7 @@ use owlshift_runner::project::ProjectDirs;
 use owlshift_runner::quarantine;
 use owlshift_runner::served::{self, Registry};
 use owlshift_runner::ui::{record, token};
+use owlshift_runner::voice::Voice;
 use owlshift_runner::watch;
 use owlshift_testkit::step_child::{
     ChildProject, REPO, build_asks, ended_as, events, holding_harness, intake_declaring, reply_for,
@@ -1527,7 +1528,7 @@ fn status_lines(data: &Path) -> Vec<String> {
             project.watch = status::watch_state(&events, &project.repository, since);
         }
     }
-    status::parts(&report, &jiff::tz::TimeZone::system())
+    status::parts(&report, &jiff::tz::TimeZone::system(), Voice::Ui)
         .into_iter()
         .filter(|(part, _)| part.on_the_page())
         .map(|(_, line)| line)
@@ -1699,6 +1700,10 @@ fn the_real_ui_answers_what_the_commands_print_for_the_bench() {
         text.contains("Paused: every project of this machine"),
         "{text}"
     );
+    // The real UI names its Resume button for the machine's pause, not the
+    // command (OWL-529): the Orchestrator passes the UI's voice.
+    assert!(text.contains("its Resume button lifts it."), "{text}");
+    assert!(!text.contains("owlshift resume"), "{text}");
     assert!(
         text.contains("quarantined: Run r1 of OWL-1 broke isolation"),
         "{text}"

@@ -58,6 +58,7 @@ use crate::served::{self, Registry};
 use crate::status::{self, Daemon, Part, Report, Watch};
 use crate::system::System;
 use crate::usage::{self as machine_usage, UsageStore};
+use crate::voice::Voice;
 use crate::{doctor, events};
 
 /// How many feed entries a first answer, or a reset one, carries.
@@ -335,7 +336,7 @@ pub fn answer(inputs: &Inputs<'_>, cursors: Cursors) -> Value {
         .into_iter()
         .map(|why| format!("the event log cannot be read: {why}"))
         .collect();
-    let shown: Vec<(Part, String)> = status::parts(&report, &inputs.tz)
+    let shown: Vec<(Part, String)> = status::parts(&report, &inputs.tz, Voice::Ui)
         .into_iter()
         .filter(|(part, _)| part.on_the_page())
         .collect();

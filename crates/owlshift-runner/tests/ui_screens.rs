@@ -29,6 +29,7 @@ use owlshift_runner::ui::auth::{self, RunSecret, Session};
 use owlshift_runner::ui::server::{self, Options, Serving};
 use owlshift_runner::ui::token;
 use owlshift_runner::usage::UsageStore;
+use owlshift_runner::voice::Voice;
 use owlshift_runner::{status, why};
 use serde_json::{Value, json};
 
@@ -208,7 +209,7 @@ fn reference(data: &Path, tz: &TimeZone) -> Vec<(status::Part, String)> {
             project.watch = status::watch_state(&events, &project.repository, since);
         }
     }
-    status::parts(&report, tz)
+    status::parts(&report, tz, Voice::Ui)
 }
 
 fn daemon_record(since: Timestamp) -> DaemonRecord {
