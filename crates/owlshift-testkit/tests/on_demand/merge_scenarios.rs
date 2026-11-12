@@ -726,6 +726,114 @@ fn a_red_base_moved_apart_from_the_delivery_holds_the_merge_until_it_is_green() 
     assert_ended_merged(&bench);
 }
 
+/// What `continue` says of the next pass of watch on a ticket at Watch.
+fn continue_says(bench: &Bench) -> String {
+    let (outcome, printed) = bench.continue_ticket(Vec::new());
+    match &outcome {
+        Err(stop @ Stop::Watched { .. }) => stop.to_string(),
+        other => panic!("{other:?}\n{printed}"),
+    }
+}
+
+/// OWL-526, S18: a base a sibling's merge moved since the push, on paths
+/// the delivery leaves alone, whose head carries a deployment still in
+/// progress beside a passed `ci`. The pull request does not run `deploy`,
+/// so it holds nothing: `continue` says the next pass would merge it, and
+/// watch merges the pushed head without telling a pending base.
+#[test]
+fn a_pending_base_check_the_pull_request_does_not_carry_holds_nothing() {
+    let bench = merging("all");
+    let pushed = bench.remote_branch().unwrap();
+    sibling_merged(&bench);
+    bench.github.followed.lock().unwrap().base_head_checks =
+        Some(vec![("ci", Some("SUCCESS")), ("deploy", None)]);
+    let said = continue_says(&bench);
+    assert!(
+        said.ends_with(
+            "the next pass of `owlshift watch` would merge it, once its read is green again \
+             (merge on green)."
+        ),
+        "{said}"
+    );
+    let clock = bench.clock.clone();
+    let mut pass = 0;
+    let (outcomes, lines, printed) = bench.watch(Vec::new(), &mut |_| {
+        pass += 1;
+        later(&clock);
+        pass < 3
+    });
+    assert!(
+        outcomes.iter().all(Result::is_ok),
+        "{outcomes:?}\n{lines}\n{printed}"
+    );
+    let pending: Vec<Value> = waits_told(&bench)
+        .into_iter()
+        .filter(|data| data["reason"] == "merge_base_pending")
+        .collect();
+    assert_eq!(pending, Vec::<Value>::new(), "{lines}");
+    assert_eq!(
+        github_merges(&bench),
+        [json!({ "sha": pushed, "merge_method": "squash" })],
+        "{lines}"
+    );
+    assert_ended_merged(&bench);
+}
+
+/// OWL-526, S18: the same moved base, whose head's `ci`, a check the pull
+/// request carries too, is still in progress. `continue` says the next pass
+/// would not merge it, naming `ci`; watch merges nothing while it runs,
+/// tells the wait once, naming it, and merges the pushed head once it
+/// passes.
+#[test]
+fn a_pending_base_check_the_pull_request_carries_holds_the_merge_until_it_passes() {
+    let bench = merging("all");
+    let pushed = bench.remote_branch().unwrap();
+    sibling_merged(&bench);
+    bench.github.followed.lock().unwrap().base_head_checks = Some(vec![("ci", None)]);
+    let said = continue_says(&bench);
+    assert!(
+        said.ends_with(
+            "the next pass of `owlshift watch` would not merge it: its base moved since the \
+             push, and the base head's own checks still run: ci."
+        ),
+        "{said}"
+    );
+    let clock = bench.clock.clone();
+    let mut pass = 0;
+    let (outcomes, lines, printed) = bench.watch(Vec::new(), &mut |_| {
+        pass += 1;
+        later(&clock);
+        if pass < 4 {
+            assert_eq!(github_merges(&bench), Vec::<Value>::new(), "pass {pass}");
+        }
+        if pass == 3 {
+            bench.github.followed.lock().unwrap().base_head_checks =
+                Some(vec![("ci", Some("SUCCESS"))]);
+        }
+        pass < 4
+    });
+    assert!(
+        outcomes.iter().all(Result::is_ok),
+        "{outcomes:?}\n{lines}\n{printed}"
+    );
+    assert_eq!(rebase_runs(&bench), Vec::<Value>::new(), "{lines}");
+    let told: Vec<Value> = waits_told(&bench)
+        .iter()
+        .map(|data| json!([data["reason"], data["checks"], data["head"]]))
+        .collect();
+    assert_eq!(
+        told,
+        [json!(["merge_base_pending", ["ci"], pushed])],
+        "{lines}"
+    );
+    assert_eq!(
+        github_merges(&bench),
+        [json!({ "sha": pushed, "merge_method": "squash" })],
+        "{lines}"
+    );
+    assert_ended_merged(&bench);
+}
+
 /// OWL-520, S18: GitHub refuses the merge of a pull request on a base that
 /// moved since the push on paths the delivery leaves alone, as a repository
 /// that requires its branches up to date would (the words below are not

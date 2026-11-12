@@ -603,9 +603,10 @@ pub struct MergeFacts<'a> {
     /// The base head's own checks and those of `base_at_push`, as the
     /// runner read them (OWL-521; architecture section 5, "Merge on green",
     /// "The base's own checks"): `None` until read. Consulted only for a base
-    /// that moved apart from the delivery, once every other condition holds;
-    /// the runner reads it once [`merge_due`] waits on
-    /// [`MergeBlocker::BaseUnchecked`].
+    /// that moved apart from the delivery, once every other condition holds,
+    /// and only under the names the pull request's head carries in the
+    /// [`Read`] given to [`merge_due`] (OWL-526); the runner reads it once
+    /// [`merge_due`] waits on [`MergeBlocker::BaseUnchecked`].
     pub base_checks: Option<&'a BaseRead>,
     /// Whether the ticket carries [`MERGE_LABEL`].
     pub labeled: bool,
@@ -669,10 +670,12 @@ pub enum MergeBlocker {
     /// The base moved apart from the delivery and its own checks were not
     /// read, or were read at another head than the one decided on (OWL-521).
     BaseUnchecked,
-    /// The base head's own checks of these names failed, and did not fail at
+    /// The base head's own checks of these names, which the pull request's
+    /// head carries too (OWL-526), failed, and did not fail at
     /// `base_at_push` too (OWL-521).
     BaseRed(Vec<String>),
-    /// The base head's own checks of these names still run (OWL-521).
+    /// The base head's own checks of these names, which the pull request's
+    /// head carries too (OWL-526), still run (OWL-521).
     BasePending(Vec<String>),
     /// The last read found the pull request closed or merged ([`confirm_merge`]).
     Closed,
@@ -705,7 +708,9 @@ pub enum MergeDue {
 /// [`Action::Green`] on the head `read` shows, that head is Owlshift's pushed
 /// commit and every condition of the design holds. `Green` keeps its
 /// meaning; this decides on top of it. The grant carries the pushed head as
-/// the merge's expected head.
+/// the merge's expected head. `read.checks` must be the head's checks the
+/// decision read: on a moved base they name the base checks that count
+/// (OWL-526), and a read without them counts none.
 pub fn merge_due(policy: &MergePolicy<'_>, facts: &MergeFacts<'_>, read: &Read) -> MergeDue {
     match blocker(policy, facts, read) {
         Some(blocker) => MergeDue::Wait(blocker),
@@ -759,7 +764,7 @@ fn blocker(policy: &MergePolicy<'_>, facts: &MergeFacts<'_>, read: &Read) -> Opt
     }
     // Reaching here with a moved base means a move apart from the delivery.
     if facts.base_at_push != Some(facts.base_head) {
-        return base_hold(facts.base_head, facts.base_checks);
+        return base_hold(facts.base_head, facts.base_checks, &read.checks);
     }
     None
 }
@@ -768,13 +773,16 @@ fn blocker(policy: &MergePolicy<'_>, facts: &MergeFacts<'_>, read: &Read) -> Opt
 /// "The base's own checks"): a check failed at `head` and not also failed at
 /// `base_at_push`, which the pull request's green checks ran past, every
 /// failed one when those of `base_at_push` were not read; else a check still
-/// running. Checks are taken by name, as [`decide`] takes them. A head with
-/// no checks holds nothing.
-fn base_hold(head: &str, base: Option<&BaseRead>) -> Option<MergeBlocker> {
+/// running. Only a check under a name the pull request's head carries, in
+/// `carried`, counts (OWL-526): one it does not run says nothing of its
+/// code. Checks are taken by name, as [`decide`] takes them, names compared
+/// exactly. A head with no counted check holds nothing.
+fn base_hold(head: &str, base: Option<&BaseRead>, carried: &[CheckRead]) -> Option<MergeBlocker> {
     let Some(base) = base.filter(|base| base.head == head) else {
         return Some(MergeBlocker::BaseUnchecked);
     };
-    let at_head = collapse(&base.at_head);
+    let mut at_head = collapse(&base.at_head);
+    at_head.retain(|check| carried.iter().any(|own| own.name == check.name));
     let ran_past = |name: &str| {
         base.at_push
             .as_deref()
@@ -1556,7 +1564,10 @@ mod tests {
                 state: PrState::Open,
                 head: HEAD.to_owned(),
                 mergeable: Mergeable::Mergeable,
-                checks: Vec::new(),
+                checks: vec![
+                    CheckRead::named("ci", CheckOutcome::Passed),
+                    CheckRead::named("lint", CheckOutcome::Passed),
+                ],
             }
         }
 
@@ -1944,6 +1955,77 @@ mod tests {
                 ..facts(&GREEN, &[])
             };
             assert_eq!(wait(&unmoved), merge);
+        }
+
+        /// OWL-526: on a moved-apart base only the checks under a name the
+        /// pull request's head carries hold, red or running; any other (a
+        /// deployment, a nightly job) holds nothing. The holds on carried
+        /// names are the table above's, whose read carries `ci` and `lint`.
+        #[test]
+        fn a_moved_base_holds_only_on_checks_the_pull_request_carries() {
+            use CheckOutcome::*;
+            use MergeBlocker::*;
+            let gate = gate(DelegationLevel::Discoverable);
+            let apart = MergeFacts {
+                base_at_push: Some("fedcba9876543210fedcba9876543210fedcba98"),
+                disjoint: true,
+                ..facts(&GREEN, &[])
+            };
+            let merge = MergeDue::Merge(MergeGrant::new(HEAD, MergeMethod::Rebase));
+            let held = |names: &[&str]| names.iter().map(|n| (*n).to_owned()).collect::<Vec<_>>();
+            let ci_alone = Read {
+                checks: vec![CheckRead::named("ci", Passed)],
+                ..green_read()
+            };
+            type AtHead = &'static [(&'static str, CheckOutcome)];
+            let cases: [(AtHead, &Read, MergeDue); 6] = [
+                // A pending or failed check the pull request does not run.
+                (
+                    &[("ci", Passed), ("deploy", Pending)],
+                    &green_read(),
+                    merge.clone(),
+                ),
+                (
+                    &[("ci", Passed), ("nightly", CodeFailure)],
+                    &green_read(),
+                    merge.clone(),
+                ),
+                (
+                    &[("deploy", Pending), ("nightly", CodeFailure)],
+                    &green_read(),
+                    merge.clone(),
+                ),
+                // Beside a counted one, only the counted one is named.
+                (
+                    &[
+                        ("nightly", CodeFailure),
+                        ("deploy", Pending),
+                        ("lint", Pending),
+                    ],
+                    &green_read(),
+                    MergeDue::Wait(BasePending(held(&["lint"]))),
+                ),
+                // The names come from the read's checks.
+                (
+                    &[("ci", Passed), ("lint", Pending)],
+                    &ci_alone,
+                    merge.clone(),
+                ),
+                (
+                    &[("ci", Pending), ("lint", Pending)],
+                    &ci_alone,
+                    MergeDue::Wait(BasePending(held(&["ci"]))),
+                ),
+            ];
+            for (at_head, read, expected) in &cases {
+                let base = base_read(at_head, None);
+                let facts = MergeFacts {
+                    base_checks: Some(&base),
+                    ..apart
+                };
+                let got = due(MergeSwitch::All, &gate, &facts, read);
+                assert_eq!(got, *expected, "{at_head:?} with {:?}", read.checks);
+            }
         }
 
         /// OWL-520: a conflict with a moved base is a rebase run, cause

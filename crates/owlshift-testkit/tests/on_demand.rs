@@ -245,6 +245,10 @@ struct Followed {
     mergeable: &'static str,
     conclusion: &'static str,
     base_conclusion: &'static str,
+    /// The base head's check runs, by name and conclusion, `None` for one
+    /// still in progress (OWL-526): a single `ci` of `base_conclusion` when
+    /// `None`.
+    base_head_checks: Option<Vec<(&'static str, Option<&'static str>)>>,
     /// The checks' conclusion at `base_at_push`, the base's head's when
     /// `None` (OWL-513).
     at_push_conclusion: Option<&'static str>,
@@ -261,6 +265,7 @@ impl Default for Followed {
             mergeable: "MERGEABLE",
             conclusion: "SUCCESS",
             base_conclusion: "SUCCESS",
+            base_head_checks: None,
             at_push_conclusion: None,
             draft: false,
             review: None,
@@ -431,14 +436,26 @@ impl FakeGitHub {
                 .run(&self.bare, &["rev-parse", "refs/heads/main"])
                 .map(|out| String::from_utf8(out).unwrap().trim().to_owned())
                 .unwrap();
-            let rollup = |conclusion: &str| {
+            let rollup = |checks: &[(&str, Option<&str>)]| {
+                let nodes: Vec<Value> = checks
+                    .iter()
+                    .map(|(name, conclusion)| match conclusion {
+                        Some(conclusion) => json!({ "__typename": "CheckRun", "name": name,
+                            "status": "COMPLETED", "conclusion": conclusion }),
+                        None => json!({ "__typename": "CheckRun", "name": name,
+                            "status": "IN_PROGRESS", "conclusion": null }),
+                    })
+                    .collect();
                 json!({ "contexts": {
-                    "totalCount": 1,
+                    "totalCount": nodes.len(),
                     "pageInfo": { "hasNextPage": false, "endCursor": null },
-                    "nodes": [{ "__typename": "CheckRun", "name": "ci", "status": "COMPLETED",
-                                "conclusion": conclusion }],
+                    "nodes": nodes,
                 } })
             };
+            let at_head = followed
+                .base_head_checks
+                .clone()
+                .unwrap_or_else(|| vec![("ci", Some(followed.base_conclusion))]);
             let at_push = followed
                 .at_push_conclusion
                 .unwrap_or(followed.base_conclusion);
@@ -448,8 +465,8 @@ impl FakeGitHub {
                 .filter(|asked| !asked.starts_with("refs/"))
                 .map_or_else(|| base.clone(), str::to_owned);
             json!({ "repository": {
-                "head": { "oid": base, "statusCheckRollup": rollup(followed.base_conclusion) },
-                "atPush": { "oid": at_push_oid, "statusCheckRollup": rollup(at_push) },
+                "head": { "oid": base, "statusCheckRollup": rollup(&at_head) },
+                "atPush": { "oid": at_push_oid, "statusCheckRollup": rollup(&[("ci", Some(at_push))]) },
             } })
         } else if query.starts_with("query Checks") {
             let moved = self.at_checks.lock().unwrap().take();

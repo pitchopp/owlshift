@@ -192,7 +192,7 @@ impl Watch<'_> {
             draft: false,
             something_due: merge::owes_first(delivery),
         };
-        let read = core_read(seen);
+        let read = seen.merge_read();
         let mut due = core::merge_due(&policy, &facts, &read);
         if needs_draft(&due) {
             let draft = match on_demand.forge.merge_read(pr.number) {
@@ -1030,22 +1030,6 @@ fn needs_draft(due: &MergeDue) -> bool {
                     | MergeBlocker::GreenOnce
             )
     )
-}
-
-/// The pass's read as `merge_due` takes it: its state and head. A
-/// `Follow` decision is only ever made on an open pull request.
-fn core_read(seen: &follow::Seen) -> core::Read {
-    let open = matches!(seen.decision, Decision::Follow { .. });
-    core::Read {
-        state: if open {
-            core::PrState::Open
-        } else {
-            core::PrState::Closed
-        },
-        head: seen.head.clone(),
-        mergeable: core::Mergeable::Mergeable,
-        checks: Vec::new(),
-    }
 }
 
 fn core_state(state: forge::PrState) -> core::PrState {

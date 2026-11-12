@@ -166,12 +166,8 @@ impl OnDemand<'_> {
             draft,
             something_due: crate::merge::owes_first(delivery),
         };
-        let read = core::Read {
-            state: core::PrState::Open,
-            head: seen.head.clone(),
-            mergeable: core::Mergeable::Mergeable,
-            checks: Vec::new(),
-        };
+        // Green, so open: the read watch's merge pass takes too.
+        let read = seen.merge_read();
         let policy = MergePolicy {
             switch,
             method,
