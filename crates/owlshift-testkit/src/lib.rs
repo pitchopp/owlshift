@@ -6,6 +6,8 @@
 //! - [`gh`]: the real gh, started once before the credential probes time it.
 //! - [`git`]: git with none of the host's configuration, and a project
 //!   seeded into a local bare remote.
+//! - [`release`]: the key the bench trusts for `owlshift self-update`
+//!   (OWL-541).
 //! - [`reply`]: what the fake harness (`owlshift-fake-harness`) does in one
 //!   run.
 //! - [`harness`]: the fake harness as the executor drives it.
@@ -29,6 +31,7 @@ pub mod fixture_gate;
 pub mod gh;
 pub mod git;
 pub mod harness;
+pub mod release;
 pub mod reply;
 pub mod scenario;
 pub mod step_child;

@@ -11,6 +11,9 @@
 //! a command that runs this program again (a watch's steps, the service's
 //! install) runs this bench, not `owlshift`. Never shipped: this crate is
 //! test only, and the shipped binary's entry passes the system keychain.
+//!
+//! `owlshift self-update` trusts the bench's release key,
+//! [`BENCH_RELEASE_KEY`], not Owlshift's (OWL-541).
 
 use std::process::ExitCode;
 
@@ -18,6 +21,7 @@ use owlshift_adapters::forge::Repo;
 use owlshift_platform::keychain::{Keychain, KeychainError, Secret};
 use owlshift_runner::executor::harness::CLAUDE_AGENT_ACCOUNT;
 use owlshift_runner::secrets::ForgeAccount;
+use owlshift_testkit::release::BENCH_RELEASE_KEY;
 use owlshift_testkit::step_child::REPO;
 
 /// What each entry holds: plainly not a token.
@@ -33,5 +37,5 @@ fn bench_keychain() -> Result<Keychain, KeychainError> {
 }
 
 fn main() -> ExitCode {
-    owlshift_cli::main_with(bench_keychain)
+    owlshift_cli::main_with(bench_keychain, BENCH_RELEASE_KEY)
 }
