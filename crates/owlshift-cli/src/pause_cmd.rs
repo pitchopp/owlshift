@@ -49,6 +49,6 @@ pub fn resume(repo: Option<&str>) -> ExitCode {
         let target = repo
             .map(|repo| Repo::parse(repo).map_err(|error| error.to_string()))
             .transpose()?;
-        controls::resume(&data, target.as_ref(), Voice::Terminal, None)
+        controls::resume(&data, target.as_ref(), Voice::Terminal)
     }))
 }
