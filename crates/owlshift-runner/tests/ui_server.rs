@@ -2764,6 +2764,8 @@ fn the_graph_is_a_route_of_its_own_next_to_the_ticket_page() {
     let app_js = lf(APP_JS);
     // The route table: the graph, a ticket's page, and what is neither.
     let parse = block(&app_js, "function parseRoute(hash) {", "");
+    // The overview is the empty hash, `#` and `#/`, the root of the routes.
+    assert!(parse.contains(r##"hash === "#/") {"##), "{parse}");
     assert!(parse.contains(r##"if (hash === "#/graph") {"##), "{parse}");
     assert!(parse.contains(r#"return "graph";"#));
     assert!(parse.contains(r##"const prefix = "#/ticket/";"##));
