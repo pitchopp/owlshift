@@ -179,6 +179,7 @@ impl Fresh {
             decision: self.decision.clone(),
             base_head: self.base.as_ref().map(|base| base.head.to_string()),
             failing_for: self.failing_for,
+            checks: self.checks.checks.iter().map(check_read).collect(),
         }
     }
 }
@@ -275,9 +276,31 @@ pub struct Seen {
     /// How long ago watch first read a failure on this head, when it had
     /// read one before: a repair decides again with it (OWL-112).
     pub failing_for: Option<Duration>,
+    /// The head's checks as the decision read them, which `merge_due` takes
+    /// as the names that count on a moved base (OWL-526).
+    pub checks: Vec<CheckRead>,
 }
 
 impl Seen {
+    /// The read as `merge_due` takes it: its state, head and checks. A
+    /// `Follow` decision is only ever made on an open pull request, and a
+    /// green one only on a mergeable one. Watch's merge pass and `owlshift
+    /// continue`'s note both take it from here, so the checks that count on
+    /// a moved base (OWL-526) reach both.
+    pub fn merge_read(&self) -> Read {
+        let open = matches!(self.decision, Decision::Follow { .. });
+        Read {
+            state: if open {
+                follow::PrState::Open
+            } else {
+                follow::PrState::Closed
+            },
+            head: self.head.clone(),
+            mergeable: follow::Mergeable::Mergeable,
+            checks: self.checks.clone(),
+        }
+    }
+
     /// What a person reads of it.
     pub fn describe(&self) -> String {
         match &self.decision {
@@ -1515,6 +1538,64 @@ mod tests {
         assert!(!check_read(&status).rerunnable);
     }
 
+    /// OWL-526: what a look sees carries the checks its decision read, in
+    /// order, and `merge_due` reads them from it.
+    #[test]
+    fn seen_carries_the_checks_of_its_read() {
+        let check = |name: &str, state: CheckState, raw: &str| Check {
+            kind: CheckKind::CheckRun {
+                app: Some("github-actions".to_owned()),
+                workflow: Some("CI".to_owned()),
+            },
+            name: name.to_owned(),
+            state,
+            raw: raw.to_owned(),
+            required: false,
+            url: None,
+            id: None,
+            description: None,
+            run: None,
+        };
+        let fresh = Fresh {
+            checks: CheckSet {
+                pull_request: 7,
+                head: CommitId::new(PUSHED).unwrap(),
+                state: PrState::Open,
+                mergeable: Mergeable::Mergeable,
+                merge_state: "CLEAN".to_owned(),
+                checks: vec![
+                    check("ci", CheckState::Passed, "SUCCESS"),
+                    check("lint", CheckState::Pending, "IN_PROGRESS"),
+                ],
+            },
+            base: None,
+            decision: Decision::Follow {
+                adopt: false,
+                action: Action::WaitChecks,
+            },
+            failing_for: None,
+        };
+        let seen = fresh.seen(7, "https://github.com/demo/project/pull/7");
+        let named: Vec<(&str, CheckOutcome)> = seen
+            .checks
+            .iter()
+            .map(|check| (check.name.as_str(), check.outcome))
+            .collect();
+        assert_eq!(
+            named,
+            [
+                ("ci", CheckOutcome::Passed),
+                ("lint", CheckOutcome::Pending)
+            ]
+        );
+        let read = seen.merge_read();
+        assert_eq!(read.checks, seen.checks);
+        assert_eq!(
+            (read.state, read.head.as_str()),
+            (follow::PrState::Open, PUSHED)
+        );
+    }
+
     /// OWL-513: the ref's re-run reaches the core for its own head only,
     /// each job's id, run and name intact, none for a refused one, counted
     /// from when it was asked.
@@ -1869,6 +1950,7 @@ mod tests {
             decision,
             base_head: None,
             failing_for: None,
+            checks: Vec::new(),
         }
     }
 
