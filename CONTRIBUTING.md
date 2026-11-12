@@ -15,8 +15,11 @@ The gate every change must pass, locally and in CI on macOS, Linux and Windows:
 ```bash
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets -- -D warnings
-cargo test --workspace
+cargo nextest run --workspace
+cargo test --workspace --doc
 ```
+
+The tests run under [cargo-nextest](https://nexte.st/) (`cargo install cargo-nextest --locked`), one process per test, as CI and `owlshift.toml` run them: some stop or lock what their own process started, which under `cargo test` reaches the other tests of the same binary. nextest runs no doctests, hence the last line.
 
 CI adds `--locked` to the clippy and test steps, so a change to a `Cargo.toml` must come with its updated `Cargo.lock`.
 

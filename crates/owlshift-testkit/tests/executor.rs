@@ -1915,9 +1915,17 @@ mod setup {
                     fs::create_dir_all(bench.tmp.path().join("run").join(SETUP_LOG)).unwrap();
                     "exit 1"
                 }
-                // Out of the tree's group before the shell ends, so stopping
-                // the tree does not stop it.
-                _ => "perl -e 'setpgrp(0, 0); sleep 8' & sleep 0.5; exit 1",
+                // Out of the tree's group before the command ends, so
+                // stopping the tree once it ended does not stop it. A fixed
+                // pause raced that end against `setpgrp` on a loaded machine
+                // (OWL-550): the child leaves the group, then closes its end
+                // of a pipe, whose end of file the parent waits for before it
+                // exits 1; the child holds the output on.
+                _ => concat!(
+                    "perl -e 'pipe(my $r, my $w) or die; defined(my $pid = fork) or die; ",
+                    "if ($pid) { close $w; <$r>; exit 1 } ",
+                    "close $r; setpgrp(0, 0); close $w; sleep 8'",
+                ),
             };
             let executor = Executor {
                 gate_timeout: Duration::from_secs(6),

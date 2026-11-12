@@ -2150,12 +2150,18 @@ fn write_stream(
     }
     head.push_str("\r\n");
     writer.write_all(head.as_bytes())?;
-    let mut written = json_text(&json!({ "header": header_now(context).json() }));
-    chunk(writer, &written)?;
+    // The generations are read before the stream reads its own header and
+    // graph (OWL-550): what the refresher shares after that point is newer,
+    // so the loop below writes it when it differs. Read after, a header
+    // shared between the two would count as written and never be, until
+    // the next change. A line the refresher read before the stream's own
+    // and shared after is written once more, its next refresh correcting it.
     let (mut seen, mut seen_graph) = {
         let state = context.hub.lock();
         (state.generation, state.graph_generation)
     };
+    let mut written = json_text(&json!({ "header": header_now(context).json() }));
+    chunk(writer, &written)?;
     let (mut written_overview, mut seen_overview) = first_overview(context);
     chunk(writer, &written_overview)?;
     // The graph the stream wrote last, without its `at`: what the
