@@ -232,6 +232,25 @@ fallback = "claude"
 
 **Dollar budget.** Decided on 2026-10-01 (OWL-117). `budget_usd`, under `[harnesses.<name>]`, is a dollar cap on each run of a harness, not on a day's total, whatever the billing. It stops one runaway run; bounding what runs take of a subscription over time is the usage cap's job, above. Owlshift passes it to Claude Code as `--max-budget-usd` whatever the billing, since it cannot know the billing before a run and agent runs log in with a subscription token anyway (OWL-94). Checked on 2026-10-01 with Claude Code 2.1.284, twice: `claude -p --model haiku --max-budget-usd 0.001 --tools ""` on a subscription login (`apiKeySource` `none`, cost basis `list`) ran one turn, ended at $0.19 and $0.29 of list-price cost, and exited 1 with `subtype` `error_max_budget_usd` and `terminal_reason` `budget_exhausted`. So the cap holds for one invocation, holds on a subscription against the list-price estimate, and a run can end above it. The adapter reads that exit as a failed run, unless a usage limit is still in force at the end of the stream, so two budget stops park the ticket as [S10](scenarios.md#s10-circuit-breakers-and-usage-limits) says: a ticket that needs more than its cap twice is going in circles. Codex has no such option (`codex exec --help`, codex-cli 0.154.0), so nothing enforces a Codex `budget_usd`. Rejected: a daily total, which needs Owlshift to keep run costs across restarts and to choose a day boundary; a daily key can come later beside this one. `owlshift do`, the one command that runs agents so far, passes the Claude key on every run. What one ticket's runs cost in all, every run counted across its commands, is the project's `policy.ticket_budget_usd` since OWL-378 ([architecture](architecture.md) section 4, "Ticket budget").
 
+### Stack detection (P9)
+
+`owlshift init` reads the repository root and writes what it finds as the `[stack]` of the project file (OWL-539). Its rules rest on live calls made on 2026-11-12 (OWL-539), on scratch projects in a temporary folder outside the repository, with the tool versions of the machine; each was run for real, the exact command is given, and a call that could not be made is `not checked`, its rule left out of the detection.
+
+| Command run | Observed |
+| --- | --- |
+| `npm install --package-lock-only` then `npm ci` (npm 11.12.1), then `npm run test` | exit 0; `npm ci` installed from `package-lock.json`, the script ran |
+| `pnpm install --lockfile-only` then `pnpm install --frozen-lockfile` (pnpm 10.33.2), then `pnpm run test` | exit 0; `pnpm-lock.yaml` written, the install and the script succeeded |
+| `bun install` (current bun, through `npx`) wrote `bun.lock`, not `bun.lockb`; then `bun install --frozen-lockfile` | exit 0; a current bun writes `bun.lock`. `bun.lockb` was not made, so it is recognised by name only |
+| `yarn install` then `yarn install --frozen-lockfile` (yarn 1.22.22, classic), then `yarn run test` | exit 0; `yarn.lock` written, the script ran |
+| `yarn install --immutable` (yarn 4.5.0, berry, with a `.yarnrc.yml` and a `yarn.lock`), then `yarn run test` | exit 0 |
+| `uv run ruff check .` and `uv run pytest` in a fresh `git clone` of a committed project holding `pyproject.toml`, `uv.lock` and a `dev` dependency group, no install step | exit 0 for both: `uv run` syncs the locked environment itself, so no setup is needed |
+| `ruff check .` in the same clone | exit 127, `command not found` (ruff is not installed on this machine, and a fresh clone has no environment): a bare tool needs a setup |
+| `uv run pytest -v` with the pytest table renamed `[tool.pytest]` | exit 0, but the run found the test by default discovery and so does not show that the table is read: `[tool.pytest]` is `not checked` and not detected; `[tool.pytest.ini_options]` is |
+| `poetry run ...` | not checked: poetry failed on this machine (`PermissionError` on its own virtualenv folder under the sandbox) |
+| `pdm run ...` | not checked: pdm is not installed |
+
+The Python check was made by hand in a local clone, with no installed environment, the way a gate's dedicated checkout starts; it is not `owlshift gate`, and shows a command's behaviour without a setup, not the sandboxed gate's.
+
 ## Observability & the local web UI
 
 Every action is a recorded event, readable from the CLI from P1 and from a local web UI from P8, where the CLI's gestures can also be made; the tray app of P11 wraps that same UI instead of rebuilding it.
