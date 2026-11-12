@@ -2590,3 +2590,37 @@ fn a_taken_ui_port_is_named() {
     );
     drop(silent);
 }
+
+/// OWL-528: `owlshift pause` and `owlshift resume` each leave one `decision`
+/// event in the data directory's log, naming the project, and none carries
+/// a `by`: the terminal is the default asker.
+#[test]
+fn pause_and_resume_leave_an_event_without_by() {
+    let config_dir = tempfile::tempdir().unwrap();
+    let paused = owlshift(
+        config_dir.path(),
+        config_dir.path(),
+        &["pause", "acme/web", "--reason", "lunch"],
+    );
+    assert!(paused.status.success(), "{}", stderr(&paused));
+    let resumed = owlshift(
+        config_dir.path(),
+        config_dir.path(),
+        &["resume", "acme/web"],
+    );
+    assert!(resumed.status.success(), "{}", stderr(&resumed));
+    let log = fs::read_to_string(config_dir.path().join("data/events.jsonl")).unwrap();
+    let events: Vec<serde_json::Value> = log
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert_eq!(events.len(), 2, "{log}");
+    for (event, pause) in events.iter().zip(["asked", "lifted"]) {
+        assert_eq!(event["kind"], "decision", "{log}");
+        assert_eq!(event["project"], "acme/web", "{log}");
+        assert_eq!(event["data"]["pause"], pause, "{log}");
+        assert!(event["data"].get("by").is_none(), "{log}");
+    }
+    assert_eq!(events[0]["data"]["why"], "lunch", "{log}");
+    assert_eq!(events[1]["data"]["was"]["why"], "lunch", "{log}");
+}
