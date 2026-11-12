@@ -26,6 +26,7 @@
 //! | A harness's usage limits: windows, episodes, the probe, the effective harness | [`usage`] |
 //! | A broken base: whose a gate failure is, the base checks and holds | [`base`] |
 //! | When the background service starts a served project's watch again | [`restart`] |
+//! | Stack detection for `owlshift init`: the gate read from the root files | [`stack`] |
 
 pub mod agent_env;
 pub mod base;
@@ -44,6 +45,7 @@ pub mod review;
 pub mod roster;
 pub mod routing;
 pub mod schedule;
+pub mod stack;
 pub mod state;
 pub mod ticket;
 pub mod usage;

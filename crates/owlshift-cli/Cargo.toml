@@ -22,6 +22,7 @@ path = "src/main.rs"
 owlshift-runner.workspace = true
 owlshift-adapters.workspace = true
 owlshift-contracts.workspace = true
+owlshift-core.workspace = true
 owlshift-platform.workspace = true
 clap.workspace = true
 # The daemon's record and the stop request say when (OWL-435).
