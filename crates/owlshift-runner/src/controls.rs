@@ -20,6 +20,7 @@ use owlshift_contracts::service::{BY_DAEMON, Request};
 use crate::daemon::{self, requests};
 use crate::project::ProjectDirs;
 use crate::served::Registry;
+use crate::voice::Voice;
 
 /// Who asked `request`, when and why, its time local.
 pub fn asked(request: Option<&Request>) -> String {
@@ -41,8 +42,14 @@ pub fn asked(request: Option<&Request>) -> String {
 
 /// Pauses `target`, or every project of the machine of `data` when `None`,
 /// with `request`, which replaces whatever pause stood: what follows, in
-/// `owlshift pause`'s words.
-pub fn pause(data: &Path, target: Option<&Repo>, request: &Request) -> Result<Vec<String>, String> {
+/// `owlshift pause`'s words, the way to lift it being the command's for a
+/// terminal and the Orchestrator screen's Resume button for the UI (OWL-529).
+pub fn pause(
+    data: &Path,
+    target: Option<&Repo>,
+    request: &Request,
+    voice: Voice,
+) -> Result<Vec<String>, String> {
     let dirs = target.map(|repo| ProjectDirs::new(data, repo));
     let replaced = requests::ask_pause(data, dirs.as_ref(), request)
         .map_err(|error| format!("the pause could not be written: {error}"))?;
@@ -50,11 +57,17 @@ pub fn pause(data: &Path, target: Option<&Repo>, request: &Request) -> Result<Ve
         Some(repo) => format!("{repo} is paused"),
         None => "Every project of this machine is paused".to_owned(),
     };
+    let lifts = match voice {
+        Voice::Terminal => format!(
+            "`owlshift resume{}` lifts it.",
+            target.map_or_else(String::new, |repo| format!(" {repo}"))
+        ),
+        Voice::Ui => "The Resume button of the Orchestrator screen lifts it.".to_owned(),
+    };
     let mut lines = vec![format!(
         "{what}: from each watch's next pass, no ticket is dispatched and no step starts, nor a \
          merge on green; the steps under way finish, and answers, pull requests and stages are \
-         still read. `owlshift resume{}` lifts it.",
-        target.map_or_else(String::new, |repo| format!(" {repo}"))
+         still read. {lifts}"
     )];
     if let Some(before) = replaced {
         lines.push(format!("It replaces the pause {}.", asked(before.as_ref())));
@@ -72,8 +85,8 @@ pub fn pause(data: &Path, target: Option<&Repo>, request: &Request) -> Result<Ve
 
 /// Lifts the pause of `target`, or of every project of the machine of
 /// `data` when `None`: what follows, in `owlshift resume`'s words, with the
-/// pauses that still stand.
-pub fn resume(data: &Path, target: Option<&Repo>) -> Result<Vec<String>, String> {
+/// pauses that still stand, which it names as `pause` names how to lift one.
+pub fn resume(data: &Path, target: Option<&Repo>, voice: Voice) -> Result<Vec<String>, String> {
     let dirs = target.map(|repo| ProjectDirs::new(data, repo));
     let lifted = requests::lift_pause(data, dirs.as_ref())
         .map_err(|error| format!("the pause could not be removed: {error}"))?;
@@ -106,10 +119,15 @@ pub fn resume(data: &Path, target: Option<&Repo>) -> Result<Vec<String>, String>
     match target {
         Some(_) => {
             if requests::machine_pause(data).is_some() {
-                said.push(
-                    "Every project of this machine is still paused: `owlshift resume` lifts that."
-                        .to_owned(),
-                );
+                said.push(match voice {
+                    Voice::Terminal => {
+                        "Every project of this machine is still paused: `owlshift resume` lifts that."
+                    }
+                    Voice::Ui => {
+                        "Every project of this machine is still paused: its Resume button lifts that."
+                    }
+                }
+                .to_owned());
             }
         }
         None => {
@@ -125,8 +143,12 @@ pub fn resume(data: &Path, target: Option<&Repo>) -> Result<Vec<String>, String>
                 .map(|entry| entry.repository)
                 .collect();
             if !still.is_empty() {
+                let lifts = match voice {
+                    Voice::Terminal => "`owlshift resume <owner/repo>`",
+                    Voice::Ui => "each has its own Resume button",
+                };
                 said.push(format!(
-                    "Still paused on their own: {} (`owlshift resume <owner/repo>`).",
+                    "Still paused on their own: {} ({lifts}).",
                     still.join(", ")
                 ));
             }
@@ -178,13 +200,13 @@ mod tests {
         serve(data.path(), &repo);
         let dirs = ProjectDirs::new(data.path(), &repo);
         let first = Request::new(BY_UI, Timestamp::now(), "asked from the web UI");
-        let lines = pause(data.path(), Some(&repo), &first).unwrap();
+        let lines = pause(data.path(), Some(&repo), &first, Voice::Terminal).unwrap();
         assert_eq!(lines.len(), 1, "{lines:?}");
         assert!(lines[0].starts_with("acme/web is paused: from each watch's next pass"));
         assert!(lines[0].ends_with("`owlshift resume acme/web` lifts it."));
         assert_eq!(requests::pause(&dirs), Some(Some(first.clone())));
         let second = Request::new(BY_PAUSE, Timestamp::now(), "lunch");
-        let lines = pause(data.path(), Some(&repo), &second).unwrap();
+        let lines = pause(data.path(), Some(&repo), &second, Voice::Terminal).unwrap();
         assert_eq!(lines.len(), 2, "{lines:?}");
         assert!(
             lines[1].starts_with("It replaces the pause by ui at "),
@@ -200,12 +222,12 @@ mod tests {
     fn the_machine_pause_and_an_unserved_projects_say_so() {
         let data = tempfile::tempdir().unwrap();
         let request = Request::new(BY_UI, Timestamp::now(), "asked from the web UI");
-        let lines = pause(data.path(), Some(&repo()), &request).unwrap();
+        let lines = pause(data.path(), Some(&repo()), &request, Voice::Terminal).unwrap();
         assert!(
             lines[1].starts_with("acme/web is not served by the background service"),
             "{lines:?}"
         );
-        let lines = pause(data.path(), None, &request).unwrap();
+        let lines = pause(data.path(), None, &request, Voice::Terminal).unwrap();
         assert_eq!(lines.len(), 1, "{lines:?}");
         assert!(lines[0].starts_with("Every project of this machine is paused:"));
         assert!(lines[0].ends_with("`owlshift resume` lifts it."));
@@ -225,18 +247,21 @@ mod tests {
         requests::ask_pause(data.path(), Some(&dirs), &own).unwrap();
         let machine = Request::new(BY_UI, Timestamp::now(), "asked from the web UI");
         requests::ask_pause(data.path(), None, &machine).unwrap();
-        let lines = resume(data.path(), Some(&repo)).unwrap();
+        let lines = resume(data.path(), Some(&repo), Voice::Terminal).unwrap();
         assert_eq!(lines.len(), 3, "{lines:?}");
         assert!(lines[0].starts_with("acme/web's pause is lifted (it was by owlshift daemon at "));
         assert!(lines[1].starts_with("That pause was the daemon's own"));
-        assert!(lines[2].starts_with("Every project of this machine is still paused"));
+        assert_eq!(
+            lines[2],
+            "Every project of this machine is still paused: `owlshift resume` lifts that."
+        );
         assert_eq!(requests::pause(&dirs), None);
         assert_eq!(
-            resume(data.path(), Some(&repo)).unwrap()[0],
+            resume(data.path(), Some(&repo), Voice::Terminal).unwrap()[0],
             "acme/web was not paused."
         );
         requests::ask_pause(data.path(), Some(&dirs), &machine).unwrap();
-        let lines = resume(data.path(), None).unwrap();
+        let lines = resume(data.path(), None, Voice::Terminal).unwrap();
         assert!(lines[0].starts_with("The pause of every project is lifted (it was by ui at "));
         assert_eq!(
             lines[1],
@@ -244,9 +269,72 @@ mod tests {
         );
         assert_eq!(requests::machine_pause(data.path()), None);
         assert_eq!(
-            resume(data.path(), None).unwrap()[0],
+            resume(data.path(), None, Voice::Terminal).unwrap()[0],
             "Every project of this machine was not paused."
         );
+    }
+
+    /// The UI's pause lines name the Resume button where the terminal's name
+    /// `owlshift resume`, whole, and name no command to lift it (OWL-529).
+    #[test]
+    fn a_pause_from_the_ui_names_the_resume_button() {
+        let data = tempfile::tempdir().unwrap();
+        let repo = repo();
+        serve(data.path(), &repo);
+        let request = Request::new(BY_UI, Timestamp::now(), "asked from the web UI");
+        let button = "The Resume button of the Orchestrator screen lifts it.";
+        let lines = pause(data.path(), Some(&repo), &request, Voice::Ui).unwrap();
+        assert!(lines[0].starts_with("acme/web is paused: from each watch's next pass"));
+        assert!(lines[0].ends_with(button), "{lines:?}");
+        let lines = pause(data.path(), None, &request, Voice::Ui).unwrap();
+        assert!(lines[0].starts_with("Every project of this machine is paused:"));
+        assert!(lines[0].ends_with(button), "{lines:?}");
+        // The rest of a pause's lines is the same in both voices.
+        let terminal = pause(data.path(), Some(&repo), &request, Voice::Terminal).unwrap();
+        let ui = pause(data.path(), Some(&repo), &request, Voice::Ui).unwrap();
+        assert_eq!(terminal.len(), ui.len());
+        assert_eq!(terminal[1..], ui[1..]);
+        let unserved = Request::new(BY_UI, Timestamp::now(), "x");
+        let other = Repo::parse("acme/api").unwrap();
+        for voice in [Voice::Terminal, Voice::Ui] {
+            let lines = pause(data.path(), Some(&other), &unserved, voice).unwrap();
+            assert!(
+                lines.iter().any(
+                    |line| line.starts_with("acme/api is not served by the background service")
+                ),
+                "{lines:?}"
+            );
+        }
+    }
+
+    /// The UI's resume lines name the Resume buttons, whole, for the machine's
+    /// pause that stands over a project and for the projects paused on their
+    /// own under it; none names `owlshift resume`.
+    #[test]
+    fn a_resume_from_the_ui_names_the_resume_buttons() {
+        let data = tempfile::tempdir().unwrap();
+        let repo = repo();
+        serve(data.path(), &repo);
+        let dirs = ProjectDirs::new(data.path(), &repo);
+        let machine = Request::new(BY_UI, Timestamp::now(), "asked from the web UI");
+        requests::ask_pause(data.path(), Some(&dirs), &machine).unwrap();
+        requests::ask_pause(data.path(), None, &machine).unwrap();
+        let lines = resume(data.path(), Some(&repo), Voice::Ui).unwrap();
+        assert_eq!(lines.len(), 2, "{lines:?}");
+        assert_eq!(
+            lines[1],
+            "Every project of this machine is still paused: its Resume button lifts that."
+        );
+        requests::ask_pause(data.path(), Some(&dirs), &machine).unwrap();
+        let lines = resume(data.path(), None, Voice::Ui).unwrap();
+        assert_eq!(lines.len(), 2, "{lines:?}");
+        assert_eq!(
+            lines[1],
+            "Still paused on their own: acme/web (each has its own Resume button)."
+        );
+        for line in &lines {
+            assert!(!line.contains("owlshift resume"), "{line}");
+        }
     }
 
     /// Forget removes the project from the list, and says it was not served

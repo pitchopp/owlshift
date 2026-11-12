@@ -26,6 +26,7 @@ use owlshift_runner::ui::server::{
     SUPERSEDED_LINE, ServeError, Serving,
 };
 use owlshift_runner::ui::{personal_at, probe, record, token};
+use owlshift_runner::voice::Voice;
 use serde_json::{Value, json};
 
 /// A response as the wire carries it.
@@ -3732,14 +3733,22 @@ fn pause_and_resume_write_the_commands_files_by_ui() {
         .unwrap();
     assert_eq!(
         said,
-        owlshift_runner::controls::pause(alike.path(), Some(&ground.repo()), &paused).unwrap()
+        owlshift_runner::controls::pause(alike.path(), Some(&ground.repo()), &paused, Voice::Ui)
+            .unwrap()
     );
+    // The UI names its Resume button, not the command that lifts the pause
+    // (OWL-529): the route passes the UI's voice.
+    let button = "The Resume button of the Orchestrator screen lifts it.";
+    assert!(said[0].ends_with(button), "{said:?}");
+    assert!(!said[0].contains("owlshift resume"), "{said:?}");
 
     let said = lines(&ground.post(
         "/api/pause",
         &json!({ "project": null, "reason": "  lunch  " }),
     ));
     assert!(said[0].starts_with("Every project of this machine is paused"));
+    assert!(said[0].ends_with(button), "{said:?}");
+    assert!(!said[0].contains("owlshift resume"), "{said:?}");
     let machine = requests::machine_pause(ground.data.path())
         .unwrap()
         .unwrap();
@@ -3757,10 +3766,32 @@ fn pause_and_resume_write_the_commands_files_by_ui() {
 
     let said = lines(&ground.post("/api/resume", &json!({ "project": "o/r" })));
     assert!(said[0].starts_with("o/r's pause is lifted (it was by ui at "));
-    assert!(said[1].starts_with("Every project of this machine is still paused"));
+    assert_eq!(
+        said[1],
+        "Every project of this machine is still paused: its Resume button lifts that."
+    );
+    assert!(
+        said.iter().all(|line| !line.contains("owlshift resume")),
+        "{said:?}"
+    );
     assert_eq!(requests::pause(&ground.dirs()), None);
     let said = lines(&ground.post("/api/resume", &json!({})));
     assert!(said[0].starts_with("The pause of every project is lifted"));
+    assert_eq!(requests::machine_pause(ground.data.path()), None);
+
+    // A project paused on its own while the machine is paused stands after
+    // the machine's resume, and the UI names its button for it too.
+    ground.post("/api/pause", &json!({ "project": "o/r" }));
+    ground.post("/api/pause", &json!({}));
+    let said = lines(&ground.post("/api/resume", &json!({})));
+    assert_eq!(
+        said[1],
+        "Still paused on their own: o/r (each has its own Resume button)."
+    );
+    assert!(
+        said.iter().all(|line| !line.contains("owlshift resume")),
+        "{said:?}"
+    );
     assert_eq!(requests::machine_pause(ground.data.path()), None);
 }
 

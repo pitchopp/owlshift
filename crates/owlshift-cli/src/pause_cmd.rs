@@ -14,6 +14,7 @@ use owlshift_adapters::forge::Repo;
 use owlshift_contracts::service::{BY_PAUSE, Request};
 use owlshift_runner::controls;
 use owlshift_runner::events::printable;
+use owlshift_runner::voice::Voice;
 
 use crate::{data_dir, fail};
 
@@ -38,7 +39,7 @@ pub fn pause(repo: Option<&str>, reason: Option<&str>) -> ExitCode {
         let target = repo
             .map(|repo| Repo::parse(repo).map_err(|error| error.to_string()))
             .transpose()?;
-        controls::pause(&data, target.as_ref(), &request)
+        controls::pause(&data, target.as_ref(), &request, Voice::Terminal)
     }))
 }
 
@@ -48,6 +49,6 @@ pub fn resume(repo: Option<&str>) -> ExitCode {
         let target = repo
             .map(|repo| Repo::parse(repo).map_err(|error| error.to_string()))
             .transpose()?;
-        controls::resume(&data, target.as_ref())
+        controls::resume(&data, target.as_ref(), Voice::Terminal)
     }))
 }
