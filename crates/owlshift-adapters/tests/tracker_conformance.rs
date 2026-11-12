@@ -2,6 +2,25 @@
 //! each of them. It asserts relative times only (order, last edit not before
 //! creation), never absolute ones, so a tracker that stamps comments with its
 //! own clock passes the same checks as one replayed from a recording.
+//!
+//! Every capability of the `Tracker` trait has a shared check, run on each
+//! adapter that declares it. [`check_of`] maps a capability to its checks
+//! with an exhaustive `match`, each adapter is an [`Adapter`] built from its
+//! own `CAPABILITIES` and one case per check, and the registry tests fail
+//! when a declared capability has no case, when a check no
+//! adapter runs covers a capability, and when a capability is declared that
+//! no check can exercise. A broken adapter ([`Broken`]) is shown to make
+//! each check fail.
+//!
+//! What is recorded and what is made up. The Markdown tracker runs on a tree
+//! of files built for each case. Linear runs the reads, the visible stage,
+//! the admitted listing, the gestures and the links on recorded exchanges;
+//! the rest of its cases (the state type, the relations and the relation
+//! write, the proposals, the documents, the resolved comments and the
+//! reactions) run on `support::Fake`, answers made up in the shapes of the
+//! adapter's unit tests, and are marked MADE UP where they are written, until
+//! a later ticket records them. GitHub Issues runs on its own recordings; its
+//! other capabilities come with the drain's ticket (OWL-536).
 
 mod support;
 
@@ -12,8 +31,9 @@ use std::sync::{Arc, Mutex};
 use owlshift_adapters::tracker::linear::{ApiKey, LinearTracker};
 use owlshift_adapters::tracker::markdown::MarkdownTracker;
 use owlshift_adapters::tracker::{
-    Author, Blocker, Capability, Column, ErrorKind, MAX_DOCUMENT_CHARS, Person, Proposal,
-    StateType, Tracker,
+    Author, Blocker, Capability, Column, Comment, Document, Error as TrackerError, ErrorKind,
+    Filed, Found, Gesture, Links, Listed, MAX_DOCUMENT_CHARS, Person, Proposal, Relations,
+    StateType, Ticket, Tracker,
 };
 use owlshift_contracts::Priority;
 use owlshift_contracts::config::Admit;
@@ -1521,6 +1541,294 @@ impl Drop for Restore {
 
 fn today() -> String {
     jiff::Zoned::now().date().to_string()
+}
+
+/// One behaviour a [`Broken`] adapter gets wrong, each of a method the
+/// check of one family calls: an adapter that does so must fail the build.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Flaw {
+    /// Read: a comment posted is never listed.
+    HidesPostedComments,
+    /// Stage: a move of a ticket that does not exist succeeds.
+    MovesAMissingTicket,
+    /// Admitted: the listing ignores the label and the stage.
+    ListsEverything,
+    /// Admitted: the listed blockers lose their state type.
+    LosesBlockerTypes,
+    /// Blocked: `block` answers success and writes nothing.
+    DropsBlocks,
+    /// Links: the tickets a ticket blocks are left out.
+    DropsBlocksLinks,
+    /// Proposals: the search finds nothing.
+    ForgetsProposals,
+    /// Documents: an update makes a new document.
+    CreatesOnUpdate,
+    /// Folding: a resolved comment is no longer listed.
+    HidesResolvedComments,
+    /// Reactions: comments are read without their reactions.
+    DropsReactions,
+}
+
+/// An adapter with one behaviour broken: every call goes to `inner`, but for
+/// the one the flaw names. The checks are shown to fail on it, so a check
+/// that asserts nothing cannot pass for an adapter that is wrong.
+struct Broken<T> {
+    inner: T,
+    flaw: Flaw,
+    /// The comments the flaw hides.
+    hidden: std::cell::RefCell<Vec<String>>,
+}
+
+impl<T: Tracker> Broken<T> {
+    fn new(inner: T, flaw: Flaw) -> Self {
+        Self {
+            inner,
+            flaw,
+            hidden: Default::default(),
+        }
+    }
+}
+
+impl<T: Tracker> Tracker for Broken<T> {
+    fn capabilities(&self) -> &'static [Capability] {
+        self.inner.capabilities()
+    }
+
+    fn ticket(&self, id: &TicketId) -> Result<Ticket, TrackerError> {
+        self.inner.ticket(id)
+    }
+
+    fn comments(&self, id: &TicketId) -> Result<Vec<Comment>, TrackerError> {
+        let mut comments = self.inner.comments(id)?;
+        comments.retain(|c| !self.hidden.borrow().contains(&c.id));
+        if self.flaw == Flaw::DropsReactions {
+            comments.iter_mut().for_each(|c| c.reactions.clear());
+        }
+        Ok(comments)
+    }
+
+    fn post_comment(&self, id: &TicketId, body: &str) -> Result<Comment, TrackerError> {
+        let posted = self.inner.post_comment(id, body)?;
+        if self.flaw == Flaw::HidesPostedComments {
+            self.hidden.borrow_mut().push(posted.id.clone());
+        }
+        Ok(posted)
+    }
+
+    fn set_stage(&self, id: &TicketId, state: &str) -> Result<(), TrackerError> {
+        match self.inner.set_stage(id, state) {
+            Err(e) if e.kind == ErrorKind::NotFound && self.flaw == Flaw::MovesAMissingTicket => {
+                Ok(())
+            }
+            moved => moved,
+        }
+    }
+
+    fn stage(&self, id: &TicketId) -> Result<String, TrackerError> {
+        self.inner.stage(id)
+    }
+
+    fn admitted(&self, column: &Column<'_>) -> Result<Vec<Listed>, TrackerError> {
+        match self.flaw {
+            Flaw::ListsEverything if *column.admit != Admit::Delegation => {
+                let mut every = Vec::new();
+                for stage in ["Todo", "Done", "In Progress"] {
+                    every.extend(self.inner.admitted(&Column {
+                        ready: stage,
+                        admit: &Admit::State(stage.to_owned()),
+                        ..*column
+                    })?);
+                }
+                Ok(every)
+            }
+            Flaw::LosesBlockerTypes => {
+                let mut listed = self.inner.admitted(column)?;
+                for one in &mut listed {
+                    one.blockers.iter_mut().for_each(|b| b.state = None);
+                }
+                Ok(listed)
+            }
+            _ => self.inner.admitted(column),
+        }
+    }
+
+    fn gesture(&self, id: &TicketId, admit: &Admit) -> Result<Gesture, TrackerError> {
+        self.inner.gesture(id, admit)
+    }
+
+    fn state_type(&self, id: &TicketId) -> Result<Option<StateType>, TrackerError> {
+        self.inner.state_type(id)
+    }
+
+    fn propose(&self, proposal: &Proposal<'_>) -> Result<Filed, TrackerError> {
+        self.inner.propose(proposal)
+    }
+
+    fn proposed(
+        &self,
+        team: Option<&str>,
+        title: &str,
+        marker: &str,
+    ) -> Result<Vec<Found>, TrackerError> {
+        if self.flaw == Flaw::ForgetsProposals {
+            return Ok(Vec::new());
+        }
+        self.inner.proposed(team, title, marker)
+    }
+
+    fn relations(&self, id: &TicketId) -> Result<Relations, TrackerError> {
+        self.inner.relations(id)
+    }
+
+    fn links(&self, id: &TicketId) -> Result<Links, TrackerError> {
+        let mut links = self.inner.links(id)?;
+        if self.flaw == Flaw::DropsBlocksLinks {
+            links.blocks.clear();
+        }
+        Ok(links)
+    }
+
+    fn block(&self, blocker: &TicketId, blocked: &TicketId) -> Result<(), TrackerError> {
+        if self.flaw == Flaw::DropsBlocks {
+            return Ok(());
+        }
+        self.inner.block(blocker, blocked)
+    }
+
+    fn publish_document(
+        &self,
+        id: &TicketId,
+        document: Option<&str>,
+        title: &str,
+        content: &str,
+    ) -> Result<Document, TrackerError> {
+        let document = document.filter(|_| self.flaw != Flaw::CreatesOnUpdate);
+        self.inner.publish_document(id, document, title, content)
+    }
+
+    fn resolve_comment(&self, comment: &str) -> Result<(), TrackerError> {
+        self.inner.resolve_comment(comment)?;
+        if self.flaw == Flaw::HidesResolvedComments {
+            self.hidden.borrow_mut().push(comment.to_owned());
+        }
+        Ok(())
+    }
+}
+
+/// Whether the check panics.
+fn fails(check: impl FnOnce()) -> bool {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(check)).is_err()
+}
+
+#[test]
+fn a_broken_adapter_fails_the_read_check() {
+    let (_world, markdown) = markdown_world();
+    let broken = Broken::new(markdown, Flaw::HidesPostedComments);
+    assert!(fails(|| check(&broken, &markdown_case())));
+}
+
+#[test]
+fn a_broken_adapter_fails_the_stage_check() {
+    let (_world, markdown) = markdown_world();
+    let broken = Broken::new(markdown, Flaw::MovesAMissingTicket);
+    let case = markdown_case();
+    assert!(fails(|| check_stage(
+        &broken,
+        &case.existing,
+        &case.missing,
+        "Needs Input",
+        "In Progress"
+    )));
+}
+
+#[test]
+fn a_broken_adapter_fails_the_admitted_check() {
+    for flaw in [Flaw::ListsEverything, Flaw::LosesBlockerTypes] {
+        let (_world, markdown) = markdown_world();
+        let broken = Broken::new(markdown, flaw);
+        assert!(
+            fails(|| check_admitted(&broken, &broken, &markdown_admitted_case())),
+            "{flaw:?}"
+        );
+    }
+}
+
+#[test]
+fn a_broken_adapter_fails_the_blocked_check() {
+    let (_world, markdown) = markdown_world();
+    let broken = Broken::new(markdown, Flaw::DropsBlocks);
+    assert!(fails(|| check_blocked_by(
+        &broken,
+        &markdown_blocked_case()
+    )));
+}
+
+#[test]
+fn a_broken_adapter_fails_the_links_check() {
+    let (_world, markdown) = markdown_world();
+    let broken = Broken::new(markdown, Flaw::DropsBlocksLinks);
+    let case = LinksCase {
+        blocked: id("DEMO-2"),
+        blocker: id("DEMO-3"),
+    };
+    assert!(fails(|| check_links(&broken, &case)));
+}
+
+#[test]
+fn a_broken_adapter_fails_the_proposals_check() {
+    let (_world, markdown) = markdown_world();
+    let broken = Broken::new(markdown, Flaw::ForgetsProposals);
+    let case = ProposalsCase {
+        team: None,
+        parent: id("DEMO-1"),
+        ready: "Todo",
+        inbox: MarkdownTracker::TRIAGE,
+    };
+    assert!(fails(|| check_proposals(&broken, &case)));
+}
+
+#[test]
+fn a_broken_adapter_fails_the_documents_check() {
+    let (_world, markdown) = markdown_world();
+    let broken = Broken::new(markdown, Flaw::CreatesOnUpdate);
+    let case = DocumentsCase {
+        ticket: id("DEMO-1"),
+        missing: id("DEMO-404"),
+    };
+    assert!(fails(|| check_documents(&broken, &case)));
+}
+
+#[test]
+fn a_broken_adapter_fails_the_folding_check() {
+    let broken = Broken::new(
+        LinearTracker::with_transport(linear_comments()),
+        Flaw::HidesResolvedComments,
+    );
+    assert!(fails(|| check_fold_comments(&broken, &id("OWL-1"))));
+}
+
+#[test]
+fn a_broken_adapter_fails_the_reactions_check() {
+    let broken = Broken::new(
+        LinearTracker::with_transport(linear_comments()),
+        Flaw::DropsReactions,
+    );
+    let case = ReactionsCase {
+        ticket: id("OWL-1"),
+        reacted: "c1",
+        plain: "c2",
+    };
+    assert!(fails(|| check_reactions(&broken, &case)));
+}
+
+/// The wrapper alone, with no flaw that matters to a check, passes it: the
+/// failures above are the flaws', not the wrapper's.
+#[test]
+fn the_wrapper_does_not_break_what_it_does_not_touch() {
+    let (_world, markdown) = markdown_world();
+    let broken = Broken::new(markdown, Flaw::DropsReactions);
+    check(&broken, &markdown_case());
+    check_blocked_by(&broken, &markdown_blocked_case());
 }
 
 /// The GitHub Issues tracker (OWL-535), on recorded exchanges of the private

@@ -1,5 +1,6 @@
 //! Recorded GraphQL exchanges: replaying them in tests, and recording them
-//! again against the live API.
+//! again against the live API. [`Fake`] is the exception: made-up answers for
+//! what no fixture holds, flagged as such wherever it is used.
 //!
 //! A fixture is a JSON file under `tests/fixtures/<adapter>/`: the exchanges one
 //! test makes, in order, each holding the request body, the HTTP status and
