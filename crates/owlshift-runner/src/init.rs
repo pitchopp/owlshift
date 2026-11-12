@@ -66,6 +66,16 @@ requires = \">={}.{}\"
     text.push_str(
         &crate::tracker::of(options.tracker).project_file_lines(options.team.as_deref())?,
     );
+    if options.tracker == TrackerKind::Markdown {
+        text.push_str(&format!(
+            "\
+# The Markdown tracker serves one machine: run `owlshift do TICKET` and
+# `owlshift continue TICKET` in a checkout. Owlshift commits none of its
+# files, and the daemon does not serve it, so `owlshift start` refuses such
+# a project. Its format: {MARKDOWN_PAGE}
+"
+        ));
+    }
     // A gate given by hand wins over the detected one, and only over it.
     let by_hand = !options.gate.is_empty();
     let mut gate = String::new();
@@ -241,6 +251,74 @@ pub fn write_project_file(root: &Path, text: &str) -> io::Result<Written> {
         Err(error) if error.kind() == io::ErrorKind::AlreadyExists => Ok(Written::Kept),
         Err(error) => Err(error),
     }
+}
+
+/// Where the Markdown tracker's format and limits are published.
+pub const MARKDOWN_PAGE: &str =
+    "https://github.com/pitchopp/owlshift/blob/main/docs/markdown-tracker.md";
+
+/// The Markdown tracker's limits in one line, which `init` prints.
+pub const MARKDOWN_LIMITS: &str = "The Markdown tracker serves one machine: run `owlshift do` and `owlshift continue` in a \
+     checkout. Owlshift commits none of its files, and the daemon does not serve it, so \
+     `owlshift start` refuses such a project.";
+
+/// The folder of the first ticket `init` writes for a Markdown project.
+pub const EXAMPLE_TICKET: &str = "DEMO-1";
+
+/// The placeholder decider of [`example_ticket`], for the user to replace.
+pub const EXAMPLE_ASSIGNEE: &str = "maintainer";
+
+/// The first ticket of a Markdown project: its folder under `tickets/` and
+/// its `ticket.md`. Ready for `owlshift do` once its assignee, the ticket's
+/// decider, is the user's own name.
+pub fn example_ticket() -> (&'static str, String) {
+    let text = format!(
+        "\
++++
+title = \"Try Owlshift on a first ticket\"
+author = \"{EXAMPLE_ASSIGNEE}\"
+stage = \"Todo\"
+assignee = \"{EXAMPLE_ASSIGNEE}\"
+labels = [\"agent\"]
++++
+
+This ticket is an example that `owlshift init` wrote.
+
+1. Replace `{EXAMPLE_ASSIGNEE}` in the `assignee` line above, and in `author`, with your own
+   name (ASCII letters, digits, `_` or `-`). The assignee is the ticket's decider: the person
+   Owlshift asks when it needs a decision.
+2. Replace this text with what you want built.
+3. Run `owlshift do {EXAMPLE_TICKET}` in this checkout.
+
+{MARKDOWN_LIMITS}
+The format is described at {MARKDOWN_PAGE}
+"
+    );
+    (EXAMPLE_TICKET, text)
+}
+
+/// Writes [`example_ticket`] under `root`'s `tickets/`, unless that folder
+/// already holds a ticket (or anything): then nothing is written.
+pub fn write_example_ticket(root: &Path) -> io::Result<Written> {
+    let tickets = root.join("tickets");
+    match std::fs::read_dir(&tickets) {
+        Ok(mut entries) => {
+            if entries.next().is_some() {
+                return Ok(Written::Kept);
+            }
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => std::fs::create_dir_all(&tickets)?,
+        Err(error) => return Err(error),
+    }
+    let (folder, text) = example_ticket();
+    let folder = tickets.join(folder);
+    match std::fs::create_dir(&folder) {
+        Ok(()) => {}
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => return Ok(Written::Kept),
+        Err(error) => return Err(error),
+    }
+    std::fs::write(folder.join("ticket.md"), text)?;
+    Ok(Written::Created)
 }
 
 /// A secret `owlshift do` reads from the keychain.
@@ -723,6 +801,51 @@ mod tests {
         assert_eq!(config.stack.setup, ["pnpm install --frozen-lockfile"]);
         assert!(!text.contains("pnpm run test"));
         assert!(text.contains("# read from pnpm-lock.yaml, the lock file of pnpm\n"));
+    }
+
+    #[test]
+    fn the_markdown_project_file_names_the_limits_and_the_page() {
+        let text = project_file(&options(TrackerKind::Markdown, None, &[])).unwrap();
+        assert!(text.contains("serves one machine"), "{text}");
+        assert!(text.contains("`owlshift do TICKET` and\n# `owlshift continue TICKET`"));
+        assert!(text.contains("commits none of its\n# files"), "{text}");
+        assert!(text.contains("`owlshift start` refuses"), "{text}");
+        assert!(text.contains(MARKDOWN_PAGE), "{text}");
+        let linear = project_file(&options(TrackerKind::Linear, Some("OWL"), &[])).unwrap();
+        assert!(!linear.contains("serves one machine"));
+    }
+
+    #[test]
+    fn the_example_ticket_loads_and_is_written_once() {
+        use owlshift_adapters::tracker::markdown::MarkdownTracker;
+        use owlshift_contracts::ids::TicketId;
+
+        let (folder, text) = example_ticket();
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(write_example_ticket(dir.path()).unwrap(), Written::Created);
+        let path = dir.path().join("tickets").join(folder).join("ticket.md");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), text);
+        let ticket = MarkdownTracker::new(dir.path())
+            .ticket(&TicketId::new(folder).unwrap())
+            .unwrap();
+        assert_eq!(ticket.stage, "Todo");
+        assert_eq!(ticket.labels, ["agent"]);
+        assert_eq!(ticket.assignee.as_deref(), Some(EXAMPLE_ASSIGNEE));
+        assert!(ticket.description.contains("owlshift do DEMO-1"));
+        assert!(ticket.description.contains(MARKDOWN_LIMITS));
+
+        // An edit survives a second write, which keeps the ticket.
+        std::fs::write(&path, "edited").unwrap();
+        assert_eq!(write_example_ticket(dir.path()).unwrap(), Written::Kept);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "edited");
+    }
+
+    #[test]
+    fn the_example_ticket_is_not_written_beside_other_tickets() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("tickets/OWL-1")).unwrap();
+        assert_eq!(write_example_ticket(dir.path()).unwrap(), Written::Kept);
+        assert!(!dir.path().join("tickets").join(EXAMPLE_TICKET).exists());
     }
 
     #[test]

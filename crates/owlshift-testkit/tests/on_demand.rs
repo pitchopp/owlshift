@@ -12655,6 +12655,10 @@ mod ui_reply_scenarios;
 #[path = "on_demand/ui_bench_scenarios.rs"]
 mod ui_bench_scenarios;
 
+/// `do` on the first ticket `init --tracker markdown` writes (OWL-34).
+#[path = "on_demand/init_example_scenarios.rs"]
+mod init_example_scenarios;
+
 /// The web UI's Restart child run end to end through the command line's own
 /// code, on a served bench (OWL-522).
 #[cfg(unix)]
