@@ -84,6 +84,24 @@ fn the_release_workflow_keeps_its_guards() {
     );
 }
 
+/// `owlshift self-update` (OWL-541) asks for the archives the release
+/// workflow builds, by the name `install.sh` asks for.
+#[test]
+fn self_update_names_the_archives_of_the_release() {
+    let update = read("crates/owlshift-cli/src/self_update_cmd.rs");
+    assert!(update.contains("format!(\"owlshift-{version}-{target}\")"));
+    assert!(read("install.sh").contains("name=owlshift-$version-$target"));
+    let workflow = read(".github/workflows/release.yml");
+    let targets: Vec<&str> = workflow
+        .lines()
+        .filter_map(|line| line.trim().strip_prefix("- target: "))
+        .collect();
+    assert_eq!(targets.len(), 4, "{targets:?}");
+    for target in targets {
+        assert!(update.contains(&format!("Some(\"{target}\")")), "{target}");
+    }
+}
+
 #[cfg(unix)]
 fn sh(script: &Path, args: &[&str], envs: &[(&str, &str)]) -> std::process::Output {
     std::process::Command::new("sh")
