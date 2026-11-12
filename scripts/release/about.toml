@@ -1,0 +1,30 @@
+# cargo-about's configuration for the release's third-party notices
+# (OWL-548), read by scripts/release/notices.sh.
+#
+# `accepted` is the licences a crate linked into `owlshift` may be under, the
+# first one a crate offers being the one its notice uses. A crate whose
+# licence expression offers none of them fails the notices, and with them the
+# release and CI's licence step. Adding a licence here is a legal decision
+# recorded on its ticket, never a fix to get a build green.
+accepted = [
+    "Apache-2.0",
+    "MIT",
+    "Apache-2.0 WITH LLVM-exception",
+    "ISC",
+    "BSD-3-Clause",
+    "Unicode-3.0",
+    "Unlicense",
+    # webpki-roots: Mozilla's root certificates as data.
+    "CDLA-Permissive-2.0",
+    # option-ext (dirs, dirs-sys): file-level copyleft. The binary may carry
+    # it unchanged when its source is said to be available, which the
+    # notices' header does.
+    "MPL-2.0",
+]
+
+# Only what is linked into the binary: build scripts and test-only crates
+# run on the build machine and are not shipped. Owlshift's own crates
+# (`publish = false`) are under the archive's LICENSE.
+ignore-build-dependencies = true
+ignore-dev-dependencies = true
+private = { ignore = true }
