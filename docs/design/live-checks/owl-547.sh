@@ -162,7 +162,10 @@ sign_in() {
             interval=$(field .interval "$WORK/poll.body")
             interval=${interval:-10}
             ;;
-        '') break ;;
+        '')
+            # A token, or a garbled answer (no body, curl failed), which is polled again.
+            if [ -n "$(field .access_token "$WORK/poll.body")" ]; then break; fi
+            ;;
         *)
             fail "sign-in: $err after $polls polls"
             return 1
@@ -180,9 +183,25 @@ sign_in() {
     report "sign-in: signed in after $polls polls; the token is kept in memory and a file of this run only"
 }
 
+# The token's read of OTHER, every 5 s for up to 60 s while it still answers 200 (an installation's change reaches a
+# token with a delay); prints the last status and the seconds waited.
+other_read() {
+    local status waited=0
+    status=$(rest other "repos/$OTHER")
+    while [ "$status" = 200 ] && [ "$waited" -lt 60 ]; do
+        sleep 5
+        waited=$((waited + 5))
+        status=$(rest other "repos/$OTHER")
+    done
+    printf '%s %s\n' "$status" "$waited"
+}
+
+# GitHub's clock, from the Date header of answer NAME, in seconds since the epoch; nothing when it does not parse.
+github_clock() { header date "$WORK/$1.head" | jq -R -r 'strptime("%a, %d %b %Y %H:%M:%S GMT") | mktime' 2>/dev/null; }
+
 # The checks every part needs; sets ME_ID, G4_SKIP and OTHER_REMOVED.
 start() {
-    local status issues gh_id private
+    local status issues gh_id private read
     section start
     status=$(rest user user)
     ME_ID=$(field .id "$WORK/user.body")
@@ -218,8 +237,14 @@ start() {
     if [ "$status" = 200 ] && [ -z "$G4_SKIP" ]; then
         if pause "Remove $OTHER from the owl-shift app's installation: github.com/settings/installations > owl-shift > Configure > Repository access > Only select repositories: remove it > Save. The run says at the end to add it back."; then
             OTHER_REMOVED=yes
-            status=$(rest other "repos/$OTHER")
-            report "start: after the removal, the token reads OTHER: HTTP $status"
+            read=$(other_read)
+            status=${read%% *}
+            report "start: after the removal, the token reads OTHER: HTTP $status (waited ${read#* } s)"
+            if [ "$status" = 200 ] && pause "The token still reads $OTHER. Check that it is gone from the installation's selected repositories and saved."; then
+                read=$(other_read)
+                status=${read%% *}
+                report "start: after the second check, the token reads OTHER: HTTP $status (waited ${read#* } s)"
+            fi
         fi
         if [ "$status" = 200 ]; then G4_SKIP="the token still reads OTHER"; fi
     fi
@@ -266,7 +291,7 @@ g3_add() {
 }
 
 g3_open() {
-    local status number created q vars url repo_id label_id
+    local status number created url clock age
     section G3
 
     # The web UI, as a person opens an issue there.
@@ -274,11 +299,18 @@ g3_open() {
         say "Type the new issue's number, then Enter:"
         read -r number || number=
         if is_number "$number"; then
-            OPENED+=("$number")
             status=$(rest g3web "repos/$REPO/issues/$number")
             created=$(field .created_at "$WORK/g3web.body")
-            report "G3: #$number opened in the web UI: read HTTP $status, the label on it: $(has_label "$WORK/g3web.body"), its author equals the signed-in user: $(yes_no "$(field .user.id "$WORK/g3web.body")" "$ME_ID") (its times below count from the number typed)"
-            g3_add "$number" "web UI, the person" "$(date +%s)" "$created"
+            clock=$(github_clock g3web)
+            age=$(jq -r --argjson now "${clock:-0}" 'if .pull_request == null and ((.title // "") | startswith("OWL-547 G3"))
+                then $now - (.created_at | fromdateiso8601) else empty end' <"$WORK/g3web.body" 2>/dev/null)
+            if [ -n "$clock" ] && is_number "$age" && [ "$age" -lt 1800 ]; then
+                OPENED+=("$number")
+                report "G3: #$number opened in the web UI $age s ago: read HTTP $status, the label on it: $(has_label "$WORK/g3web.body"), its author equals the signed-in user: $(yes_no "$(field .user.id "$WORK/g3web.body")" "$ME_ID")"
+                g3_add "$number" "web UI, the person" "$(($(date +%s) - age))" "$created"
+            else
+                report "G3: #$number is not an issue this run's web UI step opened (its title, its age or GitHub's clock): not used, not closed"
+            fi
         else
             report "G3: the web UI path: no number typed, skipped"
         fi
@@ -290,28 +322,6 @@ g3_open() {
     open_issue g3rest "OWL-547 G3: opened with the label (REST, the app's token)" "$LABEL"
     report "G3: open #$OPEN_NUMBER with the label through REST, the token: HTTP $OPEN_STATUS; $(perms g3rest); the label on it: $(has_label "$WORK/g3rest.body")"
     if [ -n "$OPEN_NUMBER" ]; then g3_add "$OPEN_NUMBER" "REST, the token" "$(date +%s)" "$(field .created_at "$WORK/g3rest.body")"; fi
-
-    # GraphQL's createIssue with labelIds, through the token.
-    vars=$(jq -n -c --arg o "$OWNER" --arg n "$NAME" --arg l "$LABEL" '{o: $o, n: $n, l: $l}')
-    # shellcheck disable=SC2016 # GraphQL's variables
-    q='query($o: String!, $n: String!, $l: String!) { repository(owner: $o, name: $n) { id label(name: $l) { id } } }'
-    status=$(graphql g3ids "$q" "$vars")
-    repo_id=$(field .data.repository.id "$WORK/g3ids.body")
-    label_id=$(field .data.repository.label.id "$WORK/g3ids.body")
-    if [ -n "$repo_id" ] && [ -n "$label_id" ]; then
-        # shellcheck disable=SC2016
-        q='mutation($i: CreateIssueInput!) { createIssue(input: $i) { issue { number createdAt labels(first: 10) { nodes { name } } } } }'
-        status=$(graphql g3gql "$q" "$(jq -n -c --arg r "$repo_id" --arg l "$label_id" --arg b "$BODY" \
-            '{i: {repositoryId: $r, title: "OWL-547 G3: opened with the label (GraphQL createIssue, the token)", body: $b, labelIds: [$l]}}')")
-        number=$(field .data.createIssue.issue.number "$WORK/g3gql.body")
-        report "G3: open #$number with the label through GraphQL's createIssue, the token: HTTP $status, errors=$(gql_errors "$WORK/g3gql.body"), the label on it: $(jq -r --arg l "$LABEL" '[.data.createIssue.issue.labels.nodes[]?.name] | index($l) != null' <"$WORK/g3gql.body" 2>/dev/null)"
-        if [ -n "$number" ]; then
-            OPENED+=("$number")
-            g3_add "$number" "GraphQL createIssue, the token" "$(date +%s)" "$(field .data.createIssue.issue.createdAt "$WORK/g3gql.body")"
-        fi
-    else
-        fail "G3: GraphQL path not run: repository or label id not read (HTTP $status, errors=$(gql_errors "$WORK/g3ids.body"))"
-    fi
 
     # gh issue create --label, the person's own login.
     if [ "$GH_OK" = yes ]; then
@@ -431,6 +441,15 @@ g3_summary() {
 REL_N=
 REL_IDS=()
 OTHER_ISSUE=
+# The event types of #REL_N's events and timeline as the token reads them, and the keys of those naming a block.
+g4_events() {
+    local status
+    status=$(rest g4ev "repos/$REPO/issues/$REL_N/events?per_page=100")
+    report "G4 $1: the token's events of #$REL_N: HTTP $status, types $(jq -c '[.[]?.event] | group_by(.) | map({(.[0]): length}) | add // {}' <"$WORK/g4ev.body" 2>/dev/null)"
+    status=$(rest g4tl "repos/$REPO/issues/$REL_N/timeline?per_page=100")
+    report "G4 $1: the token's timeline of #$REL_N: HTTP $status, types $(jq -c '[.[]?.event] | group_by(.) | map({(.[0]): length}) | add // {}' <"$WORK/g4tl.body" 2>/dev/null), the keys of those naming a block: $(jq -c '[.[]? | select((.event // "") | test("block")) | keys] | unique' <"$WORK/g4tl.body" 2>/dev/null)"
+}
+
 # The token's view of #REL_N's blockers: REST list, the issue's summary, GraphQL's blockedBy.
 g4_read() {
     local status gstatus q
@@ -491,6 +510,8 @@ g4() {
     report "G4: the person's read of #$REL_N's blocked_by through gh: $(jq -r --arg o "$OTHER" '
         "entries \(length), of OTHER \([.[] | select(.repository_url // "" | ascii_downcase | endswith("/repos/" + ($o | ascii_downcase)))] | length)"' \
         <"$WORK/g4gh.json" 2>/dev/null)"
+    report "G4: the person's timeline of #$REL_N through gh: types $(gh api "repos/$REPO/issues/$REL_N/timeline?per_page=100" \
+        --jq '[.[].event] | group_by(.) | map({(.[0]): length}) | add // {}' </dev/null 2>/dev/null)"
     status=$(rest g4m "repos/$OTHER/issues/$OTHER_ISSUE")
     report "G4: the token reads OTHER's issue: HTTP $status"
     for off in 2 10 30 60; do
@@ -498,14 +519,36 @@ g4() {
         if [ "$now" -lt $((t + off)) ]; then sleep $((t + off - now)); fi
         g4_read "+${off}s"
     done
+    g4_events "+60s"
 }
 
-# core.used from /rate_limit, which reading does not move (OWL-532), read 2 s after the last request so that the
-# counter has settled.
+# core.used from /rate_limit, which reading does not move (OWL-532), read 3 s after the last request so that the
+# counter has settled; nothing when it does not read.
 rate_used() {
-    sleep 2
+    local used
+    sleep 3
     rest rl rate_limit >/dev/null
-    field .resources.core.used "$WORK/rl.body"
+    used=$(field .resources.core.used "$WORK/rl.body")
+    if is_number "$used"; then printf '%s\n' "$used"; fi
+}
+
+# etag_check NAME PATH: a plain read, then reads with its ETag, up to 3, until one answers 304; prints the outcome.
+etag_check() {
+    local name=$1 path=$2 etag status tries=0
+    status=$(rest "$name" "$path")
+    etag=$(header etag "$WORK/$name.head")
+    if [ -z "$etag" ]; then
+        printf 'HTTP %s, no ETag\n' "$status"
+        return 0
+    fi
+    while [ "$tries" -lt 3 ]; do
+        tries=$((tries + 1))
+        sleep 2
+        status=$(rest "$name" "$path" GET "" "If-None-Match: $etag")
+        if [ "$status" = 304 ]; then break; fi
+        etag=$(header etag "$WORK/$name.head")
+    done
+    printf 'an ETag; read again with it: HTTP %s after %s tries\n' "$status" "$tries"
 }
 
 # g6_phase plain|cond COUNT: COUNT reads of G6_URL; sets PH_200, PH_304, PH_OTHER and PH_U (the x-ratelimit-used
@@ -527,7 +570,10 @@ g6_phase() {
             if [ "$kind" = cond ]; then G6_ETAG=$(header etag "$WORK/g6.head"); fi
             ;;
         304) PH_304=$((PH_304 + 1)) ;;
-        *) PH_OTHER=$((PH_OTHER + 1)) ;;
+        *)
+            PH_OTHER=$((PH_OTHER + 1))
+            OTHER_TOTAL=$((OTHER_TOTAL + 1))
+            ;;
         esac
         last=$(header x-ratelimit-used "$WORK/g6.head")
         if [ -z "$first" ]; then first=${last:-absent}; fi
@@ -537,7 +583,8 @@ g6_phase() {
 }
 
 g6() {
-    local q status tries=0 limit a b r0 r1 r2 r3 c t0 d_u1 d_c d_u2 min_c=999999 min_u=999999 line idle sum_u=0 sum_c=0 gap
+    local q status tries=0 limit a b r0 r1 r2 r3 c t0 d_u1 d_c d_u2 line idle gap clock reset bad=''
+    local min_c=999999 max_c=0 min_u=999999 max_u=0 sum_u=0 sum_c=0 cond_200=0
     section G6
     open_issue g6i "OWL-547 G6: an issue whose comments are read again"
     q=$OPEN_NUMBER
@@ -563,11 +610,25 @@ g6() {
         fail "G6: no 304 to count; not run"
         return 0
     fi
+    report "G6: the other reads of a pass, read twice: the list by label: $(etag_check g6l "repos/$REPO/issues?labels=$LABEL&state=open&per_page=100")"
+    report "G6: #$q's events: $(etag_check g6e "repos/$REPO/issues/$q/events?per_page=100")"
+    report "G6: #$q's blocked_by: $(etag_check g6b "repos/$REPO/issues/$q/dependencies/blocked_by")"
+
     rest rl rate_limit >/dev/null
     limit=$(field .resources.core.limit "$WORK/rl.body")
+    reset=$(field .resources.core.reset "$WORK/rl.body")
+    clock=$(github_clock rl)
+    if is_number "$reset" && is_number "$clock" && [ $((reset - clock)) -lt 360 ]; then
+        report "G6: the hourly window resets in $((reset - clock)) s: the measure waits for it"
+        sleep $((reset - clock + 5))
+    fi
     a=$(rate_used)
     sleep 30
     b=$(rate_used)
+    if [ -z "$a" ] || [ -z "$b" ]; then
+        fail "G6: /rate_limit did not read; not measured"
+        return 0
+    fi
     idle=$((b - a))
     report "G6: core limit=$limit; /rate_limit's core.used moved by $idle while the token was idle for 30 s (other clients)"
     for c in 1 2 3; do
@@ -577,35 +638,54 @@ g6() {
         line="30 plain reads (200: $PH_200, other: $PH_OTHER, x-ratelimit-used $PH_U)"
         r1=$(rate_used)
         g6_phase cond 30
+        COND_200=$PH_200
         line="$line; 30 conditional reads (304: $PH_304, 200: $PH_200, other: $PH_OTHER, x-ratelimit-used $PH_U)"
         r2=$(rate_used)
         g6_phase plain 30
         line="$line; 30 plain reads (200: $PH_200, other: $PH_OTHER, x-ratelimit-used $PH_U)"
         r3=$(rate_used)
+        if [ -z "$r0" ] || [ -z "$r1" ] || [ -z "$r2" ] || [ -z "$r3" ]; then
+            bad="/rate_limit did not read in cycle $c"
+            break
+        fi
         d_u1=$((r1 - r0))
         d_c=$((r2 - r1))
         d_u2=$((r3 - r2))
         report "G6 cycle $c, $(($(date +%s) - t0)) s: /rate_limit's core.used moved by $d_u1, then $d_c over the conditional reads, then $d_u2; $line"
+        if [ "$d_u1" -lt 0 ] || [ "$d_c" -lt 0 ] || [ "$d_u2" -lt 0 ]; then bad="core.used went down in cycle $c (the window reset?)"; fi
+        # A conditional read answered 200 is a plain read: taken off the conditional phase's count.
+        d_c=$((d_c - COND_200))
+        cond_200=$((cond_200 + COND_200))
         if [ "$d_c" -lt "$min_c" ]; then min_c=$d_c; fi
-        if [ "$d_u1" -lt "$min_u" ]; then min_u=$d_u1; fi
-        if [ "$d_u2" -lt "$min_u" ]; then min_u=$d_u2; fi
+        if [ "$d_c" -gt "$max_c" ]; then max_c=$d_c; fi
+        for d in "$d_u1" "$d_u2"; do
+            if [ "$d" -lt "$min_u" ]; then min_u=$d; fi
+            if [ "$d" -gt "$max_u" ]; then max_u=$d; fi
+        done
         sum_u=$((sum_u + d_u1 + d_u2))
         sum_c=$((sum_c + d_c))
     done
-    # Per cycle, the plain phases' mean minus the conditional phase: about 30 if a 304 is free, about 0 if it counts,
-    # whatever the others spend at a steady rate. Times 6 to stay in integers: 6 plain phases, 3 conditional ones.
-    gap=$(((sum_u - 2 * sum_c) / 6))
-    report "G6: over the 3 cycles, a plain phase moved core.used by $((sum_u / 6)) on average, a conditional one by $((sum_c / 3)): a gap of $gap per 30 reads"
-    if [ "$min_c" -le 3 ] && [ "$min_u" -ge 25 ]; then
-        report "G6 result: a 304 is not counted: 30 of them moved core.used by $min_c in one cycle, while 30 plain reads never moved it by less than $min_u (other clients can only add)"
-    elif [ "$min_c" -ge 25 ] && [ "$idle" -le 2 ]; then
-        report "G6 result: a 304 is counted: 30 of them never moved core.used by less than $min_c, the budget otherwise quiet"
-    elif [ "$gap" -ge 20 ]; then
-        report "G6 result: a 304 is not counted, read from the gap: the others spent meanwhile"
-    elif [ "$gap" -le 8 ]; then
-        report "G6 result: a 304 is counted, read from the gap: the others spent meanwhile"
+    if [ "$OTHER_TOTAL" -gt 0 ]; then bad="$OTHER_TOTAL reads answered neither 200 nor 304"; fi
+    if [ -n "$bad" ]; then
+        report "G6 result: not measured: $bad"
     else
-        report "G6 result: unclear: see the cycles"
+        # The plain phases' mean minus the conditional phase's: about 30 if a 304 is free, about 0 if it counts,
+        # whatever the others spend at a steady rate. Times 6 to stay in integers: 6 plain phases, 3 conditional.
+        gap=$(((sum_u - 2 * sum_c) / 6))
+        report "G6: over the 3 cycles, a plain phase moved core.used by $((sum_u / 6)) on average (from $min_u to $max_u), a conditional one by $((sum_c / 3)) (from $min_c to $max_c, $cond_200 conditional reads answered 200 taken off): a gap of $gap per 30 reads"
+        # Thresholds: a free 304 lets a conditional phase move by others' spending only, which can only add; a counted
+        # one needs the budget quiet (idle at most 2 in 30 s) to be told from that spending.
+        if [ "$max_c" -le 3 ] && [ "$min_u" -ge 25 ]; then
+            report "G6 result: a 304 is not counted: 30 of them moved core.used by $max_c at most, in every cycle, while 30 plain reads moved it by $min_u at least"
+        elif [ "$min_c" -ge 25 ] && [ "$idle" -le 2 ] && [ "$max_u" -le 40 ]; then
+            report "G6 result: a 304 is counted: 30 of them moved core.used by $min_c at least, the budget otherwise quiet"
+        elif [ "$idle" -le 5 ] && [ "$gap" -ge 20 ]; then
+            report "G6 result: probably not counted, from the gap alone: others spent $idle in 30 s idle"
+        elif [ "$idle" -le 5 ] && [ "$gap" -le 8 ]; then
+            report "G6 result: probably counted, from the gap alone: others spent $idle in 30 s idle"
+        else
+            report "G6 result: unclear: others spent $idle in 30 s idle; see the cycles"
+        fi
     fi
 
     if [ "$GH_OK" = yes ]; then
@@ -618,7 +698,11 @@ g6() {
             c=$((c + 1))
         done
         r0=$(rate_used)
-        report "G6: idle 15 s, others moved core.used by $((b - a)); then 10 reads through gh, the person's own login: the token's core.used moved by $((r0 - b))"
+        if [ -n "$a" ] && [ -n "$b" ] && [ -n "$r0" ]; then
+            report "G6: idle 15 s, others moved core.used by $((b - a)); then 10 reads through gh, the person's own login: the token's core.used moved by $((r0 - b))"
+        else
+            report "G6: whether gh shares the token's budget: not measured, /rate_limit did not read"
+        fi
     fi
 }
 
@@ -639,7 +723,7 @@ cleanup() {
             if gh issue close -R "$OTHER" "$OTHER_ISSUE" --reason "not planned" </dev/null >/dev/null 2>&1; then
                 report "cleanup: OTHER's issue closed as not planned through gh: yes"
             else
-                report "cleanup: OTHER's issue closed as not planned through gh: no"
+                report "cleanup: OTHER's issue closed as not planned through gh: no; close OTHER's #$OTHER_ISSUE by hand"
             fi
         fi
         jq -n -c '{state: "closed", state_reason: "not_planned"}' >"$WORK/close.json"
@@ -702,6 +786,8 @@ ME_ID=0
 G4_SKIP="gh is not installed"
 G4_CONTROL=0
 OTHER_REMOVED=no
+OTHER_TOTAL=0
+COND_200=0
 trap cleanup EXIT
 trap 'exit 130' INT TERM
 
@@ -722,5 +808,10 @@ while [ "$off" -lt "$G3_WINDOW" ]; do
 done
 g3_poll_at "$G3_WINDOW"
 g3_summary
+if [ "${#REL_IDS[@]}" -gt 0 ]; then
+    section "G4, read again after G3's window"
+    g4_read "+$(($(date +%s) - G3_BASE))s after G3's control"
+    g4_events "again"
+fi
 g6
 exit "$FAILED"
