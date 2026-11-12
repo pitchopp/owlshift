@@ -63,7 +63,9 @@ jobs:
   # OWL-548: the notices of every target, from Cargo.lock alone, on one
   # runner. cargo-about 0.9.2 comes as a prebuilt binary whose SHA-256 the
   # action checks, the action pinned to the commit ci.yml pins. The job holds
-  # no secret and a read-only token, like the builds.
+  # no secret and a read-only token, like the builds. Approved by the
+  # maintainer on OWL-548 on 2026-11-12 (Q2), with the allow-list (Q1), as
+  # the CI-settings floor of architecture section 8 requires.
   notices:
     name: notices
     runs-on: ubuntu-latest
