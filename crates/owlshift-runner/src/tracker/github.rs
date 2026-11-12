@@ -85,7 +85,8 @@ kind = \"github\"
         Vec::new()
     }
 
-    /// None: admission on GitHub Issues comes with OWL-536.
+    /// None: the adapter reads admission since OWL-536; doctor's lines on it
+    /// come with OWL-537.
     fn admission_facts(
         &self,
         _system: &dyn System,
@@ -95,7 +96,8 @@ kind = \"github\"
         None
     }
 
-    /// None: proposals on GitHub Issues come with OWL-536.
+    /// None: the adapter files proposals since OWL-536; doctor's line on its
+    /// inbox comes with OWL-537.
     fn proposals_inbox(
         &self,
         _config: &ProjectConfig,
