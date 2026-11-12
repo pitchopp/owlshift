@@ -123,6 +123,7 @@ use crate::project::ProjectDirs;
 use crate::served::{self, Registry};
 use crate::status::{self, waits};
 use crate::system::{HostSystem, System};
+use crate::voice::Voice;
 use crate::{cancel, controls, on_demand, personal_edit};
 
 /// The page's frame.
@@ -1103,8 +1104,14 @@ fn cancel_ui(
     };
     on_demand::check_team(project, ticket)?;
     let request = Asked::new(BY_UI, Timestamp::now(), reason);
-    let asked = cancel::ask(&crate::project::runner_git(), &dirs, ticket, &request)?;
-    Ok(cancel::said(ticket, &asked))
+    let asked = cancel::ask(
+        &crate::project::runner_git(),
+        &dirs,
+        ticket,
+        &request,
+        Voice::Ui,
+    )?;
+    Ok(cancel::said(ticket, &asked, Voice::Ui))
 }
 
 /// The project an event of the web UI's own is recorded under, as the

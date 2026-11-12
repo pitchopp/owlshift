@@ -40,6 +40,7 @@ use crate::events::{Data, EventSink, data};
 use crate::on_demand::{Canceled, Stop};
 use crate::project;
 use crate::ticket_ref::Stored;
+use crate::voice::Voice;
 
 /// The key of a failing read of the tickets' folder in
 /// `Memory::cancel_failing`, which no ticket's folder can be named.
@@ -154,7 +155,14 @@ impl Watch<'_> {
             }
             Some(Ok(Canceled::NotParked(not))) => {
                 memory.cancel_failing.remove(name);
-                self.cancel_dropped(sink, out, Some(ticket), name, &not.words(ticket), path);
+                self.cancel_dropped(
+                    sink,
+                    out,
+                    Some(ticket),
+                    name,
+                    &not.words(ticket, Voice::Terminal),
+                    path,
+                );
             }
             Some(Err(stop)) => {
                 let text = format!("the cancel of {ticket} waits: {stop}");

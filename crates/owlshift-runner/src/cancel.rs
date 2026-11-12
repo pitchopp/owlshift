@@ -29,6 +29,7 @@ use crate::daemon::requests;
 use crate::executor::Git;
 use crate::project::ProjectDirs;
 use crate::ticket_ref::{self, Stored, TicketRecord};
+use crate::voice::Voice;
 use crate::watch::presence;
 
 /// The name of the cancel file in a ticket's folder.
@@ -84,12 +85,18 @@ pub enum NotParked {
 }
 
 impl NotParked {
-    /// What it is, in words for a person.
-    pub fn words(self, ticket: &TicketId) -> String {
+    /// What it is, in words for a person, in `voice`.
+    pub fn words(self, ticket: &TicketId, voice: Voice) -> String {
         match self {
-            Self::Parked => {
-                format!("{ticket} is already parked: `owlshift continue {ticket}` restarts it")
-            }
+            Self::Parked => match voice {
+                Voice::Terminal => {
+                    format!("{ticket} is already parked: `owlshift continue {ticket}` restarts it")
+                }
+                Voice::Ui => format!(
+                    "{ticket} is already parked: the Restart button on its page restarts it, or \
+                     tells what to run when it cannot"
+                ),
+            },
             Self::Ready => format!(
                 "{ticket} waits in the ready column, where nothing of it runs: removing its \
                  admission keeps it there"
@@ -130,12 +137,13 @@ fn parkable_record(state: &TicketState, record: &TicketRecord) -> Result<(), Not
 /// (`None` for a ticket with no ref), while a step of it runs (its lock
 /// held) when `running`: `Ok(unkept)`, `unkept` when a step runs that
 /// Owlshift keeps no record of, or one at Ready; why not otherwise, in the
-/// words `owlshift cancel` refuses with. The web UI's ticket page offers
-/// Cancel on it (OWL-473).
+/// words `owlshift cancel` refuses with, in `voice`. The web UI's ticket
+/// page offers Cancel on it (OWL-473).
 pub fn decide(
     ticket: &TicketId,
     record: Option<&TicketRecord>,
     running: bool,
+    voice: Voice,
 ) -> Result<bool, String> {
     match record {
         Some(record) => {
@@ -144,7 +152,7 @@ pub fn decide(
             match parkable_record(&state, record) {
                 Ok(()) => Ok(false),
                 Err(NotParked::Ready) if running => Ok(true),
-                Err(not) => Err(not.words(ticket)),
+                Err(not) => Err(not.words(ticket, voice)),
             }
         }
         None if running => Ok(true),
@@ -189,13 +197,14 @@ pub struct Asked {
 /// ref with `git` from the dedicated checkout. Refused, writing nothing, for
 /// a ticket already parked or whose delivery ended, and for one of which
 /// Owlshift keeps no ref, or a ref at Ready, while no step of it runs (its
-/// lock free): a ticket in the ready column is its admission's. The caller
-/// checks the ticket is the project's.
+/// lock free): a ticket in the ready column is its admission's. The refusal
+/// is in `voice`. The caller checks the ticket is the project's.
 pub fn ask(
     git: &Git,
     dirs: &ProjectDirs,
     ticket: &TicketId,
     request: &Request,
+    voice: Voice,
 ) -> Result<Asked, String> {
     let checkout = dirs.checkout();
     let stored = if fs::symlink_metadata(&checkout).is_ok() {
@@ -211,6 +220,7 @@ pub fn ask(
         ticket,
         stored.as_ref().map(|stored| &stored.record),
         running,
+        voice,
     )?;
     let path = file(dirs, ticket);
     let replaced = read_at(&path);
@@ -225,13 +235,22 @@ pub fn ask(
 }
 
 /// What `owlshift cancel`, and the web UI's Cancel, say of the cancel of
-/// `ticket` [`ask`] wrote.
-pub fn said(ticket: &TicketId, asked: &Asked) -> Vec<String> {
+/// `ticket` [`ask`] wrote, in `voice`: the way to restart the ticket is the
+/// command's for a person typing, the page's Restart button for one clicking
+/// (OWL-529).
+pub fn said(ticket: &TicketId, asked: &Asked, voice: Voice) -> Vec<String> {
+    let restart = match voice {
+        Voice::Terminal => {
+            format!("`owlshift continue {ticket}` restarts it from where it was stopped.")
+        }
+        Voice::Ui => "The Restart button on the ticket's page restarts it from where it was \
+                      stopped, or tells what to run when it cannot."
+            .to_owned(),
+    };
     let mut lines = vec![format!(
         "Asked to cancel {ticket}: its step under way stops within 5 seconds, its runs stopped and \
          checked, and the project's watch then parks it, with a PARKED comment on the ticket. \
-         `owlshift continue {ticket}` restarts it from where it was stopped. A step typed in a \
-         terminal (`owlshift continue`, `owlshift do`) is not stopped."
+         {restart} A step typed in a terminal (`owlshift continue`, `owlshift do`) is not stopped."
     )];
     if let Some(before) = &asked.replaced {
         lines.push(match before {
@@ -425,7 +444,7 @@ mod tests {
             quarantined: false,
             unkept: false,
         };
-        let lines = said(&ticket, &plain);
+        let lines = said(&ticket, &plain, Voice::Terminal);
         assert_eq!(lines.len(), 1, "{lines:?}");
         assert!(lines[0].starts_with("Asked to cancel WEB-1: its step under way stops"));
         let held = Asked {
@@ -434,7 +453,7 @@ mod tests {
             quarantined: true,
             unkept: true,
         };
-        let lines = said(&ticket, &held).join("\n");
+        let lines = said(&ticket, &held, Voice::Terminal).join("\n");
         assert!(lines.contains("It replaces a cancel file"), "{lines}");
         assert!(lines.contains("keeps no record of WEB-1 yet"), "{lines}");
         assert!(lines.contains("The project is quarantined"), "{lines}");
@@ -442,6 +461,104 @@ mod tests {
             lines.contains("No watch runs on this project now"),
             "{lines}"
         );
+    }
+
+    /// The terminal's cancel line names the command that restarts the ticket;
+    /// the UI's names the Restart button and keeps the clause on steps typed
+    /// in a terminal; every other line is the same in both voices (OWL-529).
+    #[test]
+    fn the_cancel_line_names_the_command_or_the_button() {
+        let ticket = TicketId::new("WEB-1").unwrap();
+        let held = Asked {
+            replaced: Some(None),
+            watching: false,
+            quarantined: true,
+            unkept: true,
+        };
+        let head = "Asked to cancel WEB-1: its step under way stops within 5 seconds, its runs \
+                    stopped and checked, and the project's watch then parks it, with a PARKED \
+                    comment on the ticket. ";
+        let tail =
+            " A step typed in a terminal (`owlshift continue`, `owlshift do`) is not stopped.";
+        let terminal = said(&ticket, &held, Voice::Terminal);
+        let ui = said(&ticket, &held, Voice::Ui);
+        assert_eq!(
+            terminal[0],
+            format!("{head}`owlshift continue WEB-1` restarts it from where it was stopped.{tail}")
+        );
+        assert_eq!(
+            ui[0],
+            format!(
+                "{head}The Restart button on the ticket's page restarts it from where it was \
+                 stopped, or tells what to run when it cannot.{tail}"
+            )
+        );
+        assert!(!ui[0].contains("`owlshift continue WEB-1` restarts it"));
+        assert_eq!(terminal[1..], ui[1..]);
+        let rest = terminal[1..].join("\n");
+        assert!(rest.contains("`owlshift unquarantine`"), "{rest}");
+        assert!(rest.contains("`owlshift start`"), "{rest}");
+    }
+
+    /// A ticket already parked is refused in the command's words for a
+    /// person typing and in the Restart button's for one clicking; the other
+    /// refusals are the same in both voices.
+    #[test]
+    fn the_parked_refusal_names_the_command_or_the_button() {
+        let ticket = TicketId::new("WEB-1").unwrap();
+        assert_eq!(
+            NotParked::Parked.words(&ticket, Voice::Terminal),
+            "WEB-1 is already parked: `owlshift continue WEB-1` restarts it"
+        );
+        assert_eq!(
+            NotParked::Parked.words(&ticket, Voice::Ui),
+            "WEB-1 is already parked: the Restart button on its page restarts it, or tells what \
+             to run when it cannot"
+        );
+        for not in [NotParked::Ready, NotParked::Ended] {
+            assert_eq!(
+                not.words(&ticket, Voice::Terminal),
+                not.words(&ticket, Voice::Ui)
+            );
+        }
+    }
+
+    /// `decide` words its refusal in the voice it is given, for a park at any
+    /// stage, Intake's included: the park Restart cannot take, whose
+    /// refusal says what to run (`on_demand::to_watch`).
+    #[test]
+    fn decide_refuses_a_parked_ticket_in_its_voice() {
+        use crate::ticket_ref::fixtures::record;
+        use owlshift_contracts::refs::PersistedState;
+        let ticket = TicketId::new("WEB-1").unwrap();
+        for at in [Stage::Build, Stage::Intake] {
+            let state = TicketState::restore(
+                Status::Parked {
+                    at,
+                    awaiting_input: false,
+                },
+                1,
+                0,
+                0,
+                0,
+                0,
+            )
+            .unwrap();
+            let mut record = record(at);
+            record.state = PersistedState::from(&state);
+            let terminal = decide(&ticket, Some(&record), false, Voice::Terminal).unwrap_err();
+            let ui = decide(&ticket, Some(&record), false, Voice::Ui).unwrap_err();
+            assert_eq!(
+                terminal, "WEB-1 is already parked: `owlshift continue WEB-1` restarts it",
+                "{at:?}"
+            );
+            assert_eq!(
+                ui,
+                "WEB-1 is already parked: the Restart button on its page restarts it, or tells \
+                 what to run when it cannot",
+                "{at:?}"
+            );
+        }
     }
 
     /// A step's watcher asks the step's stop once the file appears, and its

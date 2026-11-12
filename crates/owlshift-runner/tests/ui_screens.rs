@@ -1521,7 +1521,8 @@ fn cancel_refuses_what_the_command_refuses() {
     for (ticket, words) in [
         (
             "WEB-1",
-            "WEB-1 is already parked: `owlshift continue WEB-1` restarts it",
+            "WEB-1 is already parked: the Restart button on its page restarts it, or tells what to run \
+             when it cannot",
         ),
         ("WEB-2", "WEB-2's delivery has ended: nothing of it runs"),
         ("WEB-3", "WEB-3 waits in the ready column"),
@@ -1551,6 +1552,22 @@ fn cancel_writes_the_commands_file_by_ui() {
     assert_eq!(reply.status, 200, "{}", reply.text);
     let said = lines_of(&reply.json()["lines"]);
     assert!(said[0].starts_with("Asked to cancel WEB-5: its step under way stops"));
+    // The UI names its Restart button, not the command, for the way back
+    // (OWL-529): the route passes the UI's voice.
+    assert!(
+        said[0].contains(
+            "The Restart button on the ticket's page restarts it from where it was stopped, or \
+             tells what to run when it cannot. A step typed in a terminal (`owlshift continue`, \
+             `owlshift do`) is not stopped."
+        ),
+        "{}",
+        said[0]
+    );
+    assert!(
+        !said[0].contains("`owlshift continue WEB-5` restarts it"),
+        "{}",
+        said[0]
+    );
     assert!(
         said.iter()
             .any(|line| line.starts_with("No watch runs on this project now"))

@@ -56,6 +56,7 @@ pub mod ticket_run;
 pub mod tracker;
 pub mod ui;
 pub mod usage;
+pub mod voice;
 pub mod watch;
 pub mod why;
 pub mod writer;
