@@ -55,6 +55,29 @@ git rebase --signoff main           # every commit of the branch
 
 A pull request with an unsigned commit cannot be merged.
 
+## Releasing
+
+The maintainer makes releases. The workflow is `.github/workflows/release.yml`, and the formats are in the [build plan](docs/design/build-plan.md), "P9 · Open-source readiness", part 10.
+
+**Once.** These steps were done for 0.1.0, on 2026-11-12.
+
+1. Make Owlshift's signing key without a password, since nobody could type one in the workflow: `minisign -G -W -p minisign.pub -s owlshift-release.key`. Keep the secret key offline, for instance in a password manager. Commit `minisign.pub` at the repository's root.
+2. Create the environment `release`: deployment tags `v*`, and yourself as required reviewer. Store the key in it with `gh secret set MINISIGN_SECRET_KEY --env release -R pitchopp/owlshift < owlshift-release.key`. The reviewer guards against another account's tag. It does not stop a tool that holds your own GitHub token: never let one approve a deployment.
+
+**Each release.**
+
+1. In a pull request, set the version in `Cargo.toml` (`[workspace.package]`) and add its `## <version>` section to `CHANGELOG.md`, which becomes the release's notes. A test fails while the version has no section.
+2. Once it is merged, tag a commit of main and push the tag: `git tag v0.1.0 origin/main && git push origin v0.1.0`.
+3. The run builds, then waits for your approval of the environment `release`. Approve it only for a run whose commit is a commit of main. The workflow refuses others, but that check is in the very file a run on another commit could change.
+4. Check the draft release: one `owlshift-<version>-<target>.tar.gz` per target, `SHA256SUMS` and `SHA256SUMS.minisig`. Then publish it.
+5. Commit the run's `homebrew-formula` artifact, also shown in the run's summary, as `Formula/owlshift.rb` on main. The repository is its own tap. Check that the formula installs on a Mac with `brew tap pitchopp/owlshift https://github.com/pitchopp/owlshift`, `brew trust --formula pitchopp/owlshift/owlshift` and `brew install owlshift`: the release's own URLs are checked only there.
+
+If a run fails, delete the draft if there is one and the tag (`git push origin :refs/tags/v0.1.0`), fix the cause on main, and tag again. Approving a run of another ref, as for the probe of OWL-540, means reading that ref's `release.yml` first.
+
+**Checking a release.** `minisign -Vm SHA256SUMS -p minisign.pub` checks the signature, then `sha256sum -c --ignore-missing SHA256SUMS` checks the archives. The Linux install script checks the archive's checksum only. That catches a damaged download, not someone able to replace the release's files: the signature is what says the files are Owlshift's.
+
+**A leaked key.** Make a new key, replace `minisign.pub` and the secret, and release again. A binary that carries the old key (`owlshift self-update`, OWL-541) refuses the new release until it is reinstalled by hand.
+
 ## Licence
 
 Contributions are accepted under the [Apache License 2.0](LICENSE), the licence of the project. No other agreement is required.

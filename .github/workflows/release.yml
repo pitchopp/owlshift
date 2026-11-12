@@ -1,0 +1,273 @@
+name: Release
+
+# OWL-540: a release of Owlshift, started by the tag v<version> the
+# maintainer pushes on a commit of main (CONTRIBUTING.md, "Releasing"). It
+# builds the binaries of macOS and Linux, arm64 and x86_64, packs one archive
+# per target, writes their SHA256SUMS, signs it with Owlshift's minisign key,
+# checks the signature with the repository's minisign.pub, and creates a
+# draft release holding them, which the maintainer checks and publishes. It
+# also renders the Homebrew formula the maintainer then commits as
+# Formula/owlshift.rb (build plan, "P9 · Open-source readiness", part 10).
+#
+# Each job holds only what it needs. The builds, which run the dependencies'
+# build scripts, get no secret and a read-only token. `sign` alone holds the
+# signing key, through the environment `release` (tags v* only, a required
+# reviewer), with a read-only token and no action at all. `publish` alone
+# holds a token that writes, and no key. Nothing is cached: a release is
+# built from scratch. Every action is pinned to its full commit. Approved on
+# OWL-540 on 2026-11-12 (Q1, with the environment and its secret), as the
+# CI-settings floor of architecture section 8 requires.
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  TAG: ${{ github.ref_name }}
+
+jobs:
+  version:
+    name: version
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - name: Check the tag against the version and the changelog
+        id: version
+        run: |
+          version=$(sh scripts/release/version.sh "$TAG")
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+      - name: Require a commit of main
+        run: |
+          if ! git merge-base --is-ancestor "$GITHUB_SHA" origin/main; then
+            echo "::error::$TAG names $GITHUB_SHA, which is not a commit of main: tag a commit of main"
+            exit 1
+          fi
+
+  build:
+    name: build (${{ matrix.target }})
+    needs: version
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - target: aarch64-apple-darwin
+            os: macos-latest
+          # Cross-built on the arm64 runner.
+          - target: x86_64-apple-darwin
+            os: macos-latest
+          # Static binaries: musl, chosen by live check R2 (build plan).
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-latest
+          - target: aarch64-unknown-linux-musl
+            os: ubuntu-24.04-arm
+    runs-on: ${{ matrix.os }}
+    env:
+      VERSION: ${{ needs.version.outputs.version }}
+      TARGET: ${{ matrix.target }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install the pinned toolchain and the target
+        run: |
+          rustup toolchain install
+          rustup target add "$TARGET"
+      - name: Install musl's C compiler
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq musl-tools
+          echo "CC_$(echo "$TARGET" | tr - _)=musl-gcc" >> "$GITHUB_ENV"
+      - name: Build
+        run: cargo build --release --locked -p owlshift-cli --target "$TARGET"
+      # The x86_64 macOS binary is built on an arm64 runner, so it is not run
+      # here.
+      - name: Check the version the binary reports
+        if: matrix.target != 'x86_64-apple-darwin'
+        run: |
+          reported=$("target/$TARGET/release/owlshift" --version | head -n 1)
+          if [ "$reported" != "owlshift $VERSION" ]; then
+            echo "::error::the binary reports '$reported', not 'owlshift $VERSION'"
+            exit 1
+          fi
+      - name: Pack the archive
+        run: |
+          name="owlshift-$VERSION-$TARGET"
+          mkdir -p "dist/$name"
+          cp "target/$TARGET/release/owlshift" LICENSE README.md "dist/$name/"
+          COPYFILE_DISABLE=1 tar -C dist -czf "dist/$name.tar.gz" "$name"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: owlshift-${{ matrix.target }}
+          path: dist/*.tar.gz
+          if-no-files-found: error
+
+  checksums:
+    name: checksums
+    needs: [version, build]
+    runs-on: ubuntu-latest
+    env:
+      VERSION: ${{ needs.version.outputs.version }}
+    outputs:
+      sums: ${{ steps.sums.outputs.sums }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          path: dist
+          pattern: owlshift-*
+          merge-multiple: true
+      # SHA256SUMS goes to `sign` and `publish` as this job's output, so the
+      # job that holds the key needs no artifact action.
+      - name: Write SHA256SUMS
+        id: sums
+        working-directory: dist
+        run: |
+          sha256sum -- *.tar.gz > SHA256SUMS
+          cat SHA256SUMS
+          {
+            echo 'sums<<END_OF_SUMS'
+            cat SHA256SUMS
+            echo 'END_OF_SUMS'
+          } >> "$GITHUB_OUTPUT"
+      - name: Render the Homebrew formula
+        run: |
+          mkdir formula
+          sh scripts/release/homebrew-formula.sh "$VERSION" dist/SHA256SUMS > formula/owlshift.rb
+          {
+            echo '### Formula/owlshift.rb'
+            echo
+            echo 'Commit it on main once the release is published (CONTRIBUTING.md, "Releasing").'
+            echo
+            echo '```ruby'
+            cat formula/owlshift.rb
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: homebrew-formula
+          path: formula/owlshift.rb
+          if-no-files-found: error
+
+  sign:
+    name: sign
+    needs: [version, checksums]
+    runs-on: ubuntu-latest
+    environment: release
+    env:
+      VERSION: ${{ needs.version.outputs.version }}
+      SUMS: ${{ needs.checksums.outputs.sums }}
+    outputs:
+      signature: ${{ steps.sign.outputs.signature }}
+    steps:
+      - name: Install minisign
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq minisign
+      # The key is a file of the runner's temporary folder for this step
+      # only. It is made without a password (`minisign -G -W`): nothing could
+      # type one here, so standard input is closed.
+      - name: Sign SHA256SUMS
+        id: sign
+        env:
+          MINISIGN_SECRET_KEY: ${{ secrets.MINISIGN_SECRET_KEY }}
+        run: |
+          if [ -z "$MINISIGN_SECRET_KEY" ]; then
+            echo "::error::the environment release holds no secret MINISIGN_SECRET_KEY"
+            exit 1
+          fi
+          key="$RUNNER_TEMP/minisign.key"
+          trap 'rm -f "$key"' EXIT
+          (umask 077 && printf '%s\n' "$MINISIGN_SECRET_KEY" > "$key")
+          printf '%s\n' "$SUMS" > SHA256SUMS
+          if ! minisign -S -s "$key" -m SHA256SUMS -t "owlshift $VERSION" < /dev/null; then
+            echo "::error::minisign could not sign with MINISIGN_SECRET_KEY, which must be a key made without a password (minisign -G -W)"
+            exit 1
+          fi
+          rm -f "$key"
+          {
+            echo 'signature<<END_OF_SIGNATURE'
+            cat SHA256SUMS.minisig
+            echo 'END_OF_SIGNATURE'
+          } >> "$GITHUB_OUTPUT"
+
+  publish:
+    name: publish
+    needs: [version, checksums, sign]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      VERSION: ${{ needs.version.outputs.version }}
+      SUMS: ${{ needs.checksums.outputs.sums }}
+      SIGNATURE: ${{ needs.sign.outputs.signature }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # The run may have waited hours for the environment's reviewer: the
+      # release's tag must still name the commit its archives were built from.
+      - name: Require the tag to name the commit built
+        run: |
+          tagged=$(gh api "repos/$GITHUB_REPOSITORY/commits/$TAG" --jq .sha)
+          if [ "$tagged" != "$GITHUB_SHA" ]; then
+            echo "::error::$TAG now names $tagged, not $GITHUB_SHA, the commit built"
+            exit 1
+          fi
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          path: dist
+          pattern: owlshift-*
+          merge-multiple: true
+      # The very text `sign` signed, then the archives checked against it.
+      - name: Write SHA256SUMS and its signature
+        working-directory: dist
+        run: |
+          printf '%s\n' "$SUMS" > SHA256SUMS
+          printf '%s\n' "$SIGNATURE" > SHA256SUMS.minisig
+          sha256sum -c SHA256SUMS
+      - name: Install minisign
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq minisign
+      - name: Verify the signature with the repository's public key
+        working-directory: dist
+        run: minisign -V -p ../minisign.pub -m SHA256SUMS
+      - name: Write the release notes
+        run: |
+          {
+            awk -v heading="## $VERSION" '
+              $0 == heading { inside = 1; next }
+              inside && /^## / { exit }
+              inside { print }' CHANGELOG.md
+            echo
+            echo '### Check the files'
+            echo
+            echo '`SHA256SUMS.minisig` is the signature of `SHA256SUMS` with Owlshift'"'"'s key, [`minisign.pub`](https://github.com/'"$GITHUB_REPOSITORY"'/blob/main/minisign.pub) at the repository'"'"'s root:'
+            echo
+            echo '```sh'
+            echo 'minisign -Vm SHA256SUMS -p minisign.pub'
+            echo 'sha256sum -c --ignore-missing SHA256SUMS'
+            echo '```'
+          } > "$RUNNER_TEMP/notes.md"
+      - name: Create the draft release
+        run: |
+          gh release create "$TAG" -R "$GITHUB_REPOSITORY" --draft --verify-tag \
+            --title "Owlshift $VERSION" --notes-file "$RUNNER_TEMP/notes.md" \
+            dist/*.tar.gz dist/SHA256SUMS dist/SHA256SUMS.minisig
