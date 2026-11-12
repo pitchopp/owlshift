@@ -161,7 +161,7 @@ fn list_marker(text: &str) -> Option<&str> {
 /// Every `KEY-n` identifier of a text: an uppercase ASCII letter, uppercase
 /// letters or digits, a hyphen and digits, not inside a longer word; and every
 /// `#n`, given as its digits, when the `#` starts the text or follows
-/// whitespace, `(`, `[`, `,`, `;`, `:` or emphasis, and the digits end at a
+/// whitespace, `(`, `[`, `,`, `;`, `:` or `*` emphasis, and the digits end at a
 /// non-word byte. `owner/repo#n`, `page#n` and a link destination's fragment
 /// (`](#n)`, `]( #n)`) name nothing.
 fn identifiers(text: &str) -> impl Iterator<Item = &str> {
@@ -212,7 +212,7 @@ fn hash_number_end(bytes: &[u8], from: usize) -> Option<usize> {
     let boundary = from == 0
         || matches!(
             bytes[from - 1],
-            b' ' | b'\t' | b'\r' | b'\n' | b'(' | b'[' | b',' | b';' | b':' | b'*' | b'_'
+            b' ' | b'\t' | b'\r' | b'\n' | b'(' | b'[' | b',' | b';' | b':' | b'*'
         );
     if !boundary {
         return None;
@@ -308,6 +308,8 @@ mod tests {
             "Blocked by #12-3",
             "Blocked by #",
             "Blocked by &#12;",
+            "Blocked by foo_#12",
+            "Blocked by _#12_",
             "See #12",
         ] {
             assert!(text_blockers(description).is_empty(), "{description:?}");
