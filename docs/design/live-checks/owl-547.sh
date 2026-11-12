@@ -11,6 +11,7 @@
 # clients spend while the token is idle (they can only add to a count, never take from it).
 #
 #   bash docs/design/live-checks/owl-547.sh OWNER/REPO OTHER_OWNER/OTHER_REPO      (--help: what to prepare)
+#   OWL547_ONLY=G4 bash docs/design/live-checks/owl-547.sh OWNER/REPO OTHER         G4 alone, read again at +5 min
 #
 # Needs bash (3.2 is enough), curl, jq, and gh signed in as the person who writes G4's relations. The access token
 # reaches curl only through a file of mode 600 in a private scratch folder, removed at the end; nothing is stored.
@@ -28,6 +29,7 @@ SLUG=owl-shift
 LABEL=owlshift-547-ready
 BODY="A probe of OWL-547 (docs/design/live-checks/owl-547.sh), closed at the end of its run."
 G3_WINDOW=${OWL547_G3_WINDOW:-600}
+ONLY=${OWL547_ONLY:-}
 OLD_ISSUE=${OWL547_OLD_ISSUE:-12}
 
 usage() {
@@ -36,10 +38,13 @@ Usage: bash $PROGRAM OWNER/REPO OTHER_OWNER/OTHER_REPO
 
   OWNER/REPO  the sandbox the owl-shift app is installed on, Issues (read and write)
               accepted: pitchopp/owlshift-live-sandbox
-  OTHER       a private repository you can write to, with issues on, that the app's
-              installation does not hold, so that the token cannot read its issues:
-              pitchopp/owlshift-merge-sandbox. If the installation holds it, the run
-              asks you to remove it, and at the end says to add it back.
+  OTHER       a PRIVATE repository you can write to, with issues on, that the app's
+              installation does not hold, so that the token cannot read its issues (a
+              public one is read whatever the installation). If the installation holds
+              it, the run asks you to remove it, and at the end says to add it back.
+
+  OWL547_ONLY=G4 runs G4 alone (a few minutes): sign-in, the relations, their reads at
+  +2 s to +60 s and again at +5 min, the cleanup.
 
 Before the run (about 15 minutes):
   - gh signed in as you (gh auth status): G4's relations are written by you, through gh.
@@ -231,6 +236,7 @@ start() {
         private=$(gh api "repos/$OTHER" --jq .private </dev/null 2>/dev/null)
         report "start: gh reads OTHER: $([ -n "$private" ] && echo yes || echo no), private=${private:-unknown}"
         if [ -z "$private" ]; then G4_SKIP="gh cannot read OTHER"; fi
+        if [ "$private" = false ]; then G4_SKIP="OTHER is public: the token reads it whatever the installation holds"; fi
     fi
     status=$(rest other "repos/$OTHER")
     report "start: the token reads OTHER: HTTP $status"
@@ -249,9 +255,12 @@ start() {
         if [ "$status" = 200 ]; then G4_SKIP="the token still reads OTHER"; fi
     fi
 
-    jq -n -c --arg l "$LABEL" '{name: $l, color: "0e8a16"}' >"$WORK/label.json"
-    status=$(rest label "repos/$REPO/labels" POST "$WORK/label.json")
-    report "start: create label $LABEL: HTTP $status"
+    if [ "$ONLY" != G4 ]; then
+        jq -n -c --arg l "$LABEL" '{name: $l, color: "0e8a16"}' >"$WORK/label.json"
+        status=$(rest label "repos/$REPO/labels" POST "$WORK/label.json")
+        report "start: create label $LABEL: HTTP $status"
+        LABEL_MADE=yes
+    fi
 }
 
 OPENED=()
@@ -734,8 +743,10 @@ cleanup() {
             report "cleanup: close #$n as not planned: HTTP $status"
             i=$((i + 1))
         done
-        status=$(rest dellabel "repos/$REPO/labels/$LABEL" DELETE)
-        report "cleanup: delete label $LABEL: HTTP $status"
+        if [ "${LABEL_MADE:-no}" = yes ]; then
+            status=$(rest dellabel "repos/$REPO/labels/$LABEL" DELETE)
+            report "cleanup: delete label $LABEL: HTTP $status"
+        fi
         if [ "${OTHER_REMOVED:-no}" = yes ]; then
             say ""
             say "If another check needs it, add $OTHER back to the owl-shift app's installation (github.com/settings/installations > owl-shift > Configure > Repository access)."
@@ -798,6 +809,17 @@ if [ "$GH_OK" = no ]; then
     report "start: gh not installed: G4 and G3's gh path are not run"
 fi
 start || exit 1
+if [ "$ONLY" = G4 ]; then
+    g4
+    if [ "${#REL_IDS[@]}" -gt 0 ]; then
+        say "Waiting 4 minutes for G4's last read..."
+        sleep 240
+        section "G4, read again"
+        g4_read "+5 min"
+        g4_events "+5 min"
+    fi
+    exit "$FAILED"
+fi
 g3_open
 for off in 2 5 10 20; do g3_poll_at "$off"; done
 g4
