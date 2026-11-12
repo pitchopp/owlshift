@@ -1034,7 +1034,12 @@ fn action_page(context: &Context, path: &str, body: &[u8]) -> Response<Cursor<Ve
                     .map(|project| served_repo(context, &project))
                     .transpose()?;
                 if path == "/api/resume" {
-                    return Ok(said(controls::resume(data, target.as_ref(), Voice::Ui)));
+                    return Ok(said(controls::resume(
+                        data,
+                        target.as_ref(),
+                        Voice::Ui,
+                        Some(BY_UI),
+                    )));
                 }
                 let request = Asked::new(BY_UI, Timestamp::now(), reason_of(&map)?);
                 Ok(said(controls::pause(

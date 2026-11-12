@@ -8,19 +8,80 @@
 //! prints, or why it could not act.
 //!
 //! The writing is [`crate::daemon::requests`] for a pause and
-//! [`Registry::forget`] for the list of served projects. None of them writes
-//! an event, as their commands write none.
+//! [`Registry::forget`] for the list of served projects. A pause and a
+//! resume that lifts one also record a `decision` event (OWL-528), `pause` =
+//! `asked` or `lifted`, so the log says why nothing was dispatched for a
+//! while; the others write none.
 
 use std::path::Path;
 
+use jiff::Timestamp;
 use jiff::tz::TimeZone;
 use owlshift_adapters::forge::Repo;
-use owlshift_contracts::service::{BY_DAEMON, Request};
+use owlshift_contracts::event::{Event, EventKind};
+use owlshift_contracts::format::Format;
+use owlshift_contracts::service::{BY_DAEMON, BY_PAUSE, Request};
+use serde_json::{Value, json};
 
 use crate::daemon::{self, requests};
+use crate::events::{Data, EventLog, printable};
 use crate::project::ProjectDirs;
 use crate::served::Registry;
 use crate::voice::Voice;
+
+/// The project of the events of a pause or a resume of the whole machine.
+pub const MACHINE_PROJECT: &str = "machine";
+
+/// A pause that stood, as an event's data holds it: `{by, at, why}`, or `{}`
+/// when its file did not read.
+fn standing(request: Option<&Request>) -> Value {
+    request.map_or_else(
+        || json!({}),
+        |request| json!({ "by": request.by, "at": request.at, "why": request.why }),
+    )
+}
+
+/// Appends a `decision` event of the pause of `target` holding `pairs`, and
+/// returns the line that says so when it could not be written: the pause
+/// already stands (or is lifted), so a failed append never fails the gesture.
+fn record(
+    data_dir: &Path,
+    target: Option<&Repo>,
+    pairs: Vec<(&str, Value)>,
+    by: Option<&str>,
+) -> Option<String> {
+    let mut data: Data = pairs
+        .into_iter()
+        .map(|(key, value)| (key.to_owned(), value))
+        .collect();
+    data.insert(
+        "scope".to_owned(),
+        json!(if target.is_some() {
+            "project"
+        } else {
+            "machine"
+        }),
+    );
+    if let Some(by) = by {
+        data.insert("by".to_owned(), json!(by));
+    }
+    let log = EventLog::in_dir(data_dir);
+    let event = Event {
+        format: Format,
+        at: Timestamp::now(),
+        project: target.map_or_else(|| MACHINE_PROJECT.to_owned(), ToString::to_string),
+        ticket: None,
+        run: None,
+        kind: EventKind::Decision,
+        data,
+    };
+    log.append(&event).err().map(|error| {
+        printable(&format!(
+            "owlshift: warning: the event was not recorded in {}: {error}",
+            log.path().display()
+        ))
+    })
+}
 
 /// Who asked `request`, when and why, its time local.
 pub fn asked(request: Option<&Request>) -> String {
@@ -53,6 +114,16 @@ pub fn pause(
     let dirs = target.map(|repo| ProjectDirs::new(data, repo));
     let replaced = requests::ask_pause(data, dirs.as_ref(), request)
         .map_err(|error| format!("the pause could not be written: {error}"))?;
+    let mut pairs = vec![("pause", json!("asked")), ("why", json!(request.why))];
+    if let Some(before) = &replaced {
+        pairs.push(("replaced", standing(before.as_ref())));
+    }
+    let warning = record(
+        data,
+        target,
+        pairs,
+        Some(request.by.as_str()).filter(|by| *by != BY_PAUSE),
+    );
     let what = match target {
         Some(repo) => format!("{repo} is paused"),
         None => "Every project of this machine is paused".to_owned(),
@@ -80,16 +151,31 @@ pub fn pause(
              is paused too."
         ));
     }
+    lines.extend(warning);
     Ok(lines)
 }
 
 /// Lifts the pause of `target`, or of every project of the machine of
 /// `data` when `None`: what follows, in `owlshift resume`'s words, with the
-/// pauses that still stand, which it names as `pause` names how to lift one.
-pub fn resume(data: &Path, target: Option<&Repo>, voice: Voice) -> Result<Vec<String>, String> {
+/// pauses that still stand, which it names as `pause` names how to lift one. `by`
+/// is who asked, `None` for the terminal; a pause that stood is recorded as
+/// lifted, none otherwise.
+pub fn resume(
+    data: &Path,
+    target: Option<&Repo>,
+    voice: Voice,
+    by: Option<&str>,
+) -> Result<Vec<String>, String> {
     let dirs = target.map(|repo| ProjectDirs::new(data, repo));
     let lifted = requests::lift_pause(data, dirs.as_ref())
         .map_err(|error| format!("the pause could not be removed: {error}"))?;
+    let warning = lifted.as_ref().and_then(|before| {
+        let pairs = vec![
+            ("pause", json!("lifted")),
+            ("was", standing(before.as_ref())),
+        ];
+        record(data, target, pairs, by)
+    });
     let mut said = Vec::new();
     match (target, &lifted) {
         (Some(repo), Some(before)) => {
@@ -154,6 +240,7 @@ pub fn resume(data: &Path, target: Option<&Repo>, voice: Voice) -> Result<Vec<St
             }
         }
     }
+    said.extend(warning);
     Ok(said)
 }
 
@@ -247,7 +334,7 @@ mod tests {
         requests::ask_pause(data.path(), Some(&dirs), &own).unwrap();
         let machine = Request::new(BY_UI, Timestamp::now(), "asked from the web UI");
         requests::ask_pause(data.path(), None, &machine).unwrap();
-        let lines = resume(data.path(), Some(&repo), Voice::Terminal).unwrap();
+        let lines = resume(data.path(), Some(&repo), Voice::Terminal, None).unwrap();
         assert_eq!(lines.len(), 3, "{lines:?}");
         assert!(lines[0].starts_with("acme/web's pause is lifted (it was by owlshift daemon at "));
         assert!(lines[1].starts_with("That pause was the daemon's own"));
@@ -257,11 +344,11 @@ mod tests {
         );
         assert_eq!(requests::pause(&dirs), None);
         assert_eq!(
-            resume(data.path(), Some(&repo), Voice::Terminal).unwrap()[0],
+            resume(data.path(), Some(&repo), Voice::Terminal, None).unwrap()[0],
             "acme/web was not paused."
         );
         requests::ask_pause(data.path(), Some(&dirs), &machine).unwrap();
-        let lines = resume(data.path(), None, Voice::Terminal).unwrap();
+        let lines = resume(data.path(), None, Voice::Terminal, None).unwrap();
         assert!(lines[0].starts_with("The pause of every project is lifted (it was by ui at "));
         assert_eq!(
             lines[1],
@@ -269,7 +356,7 @@ mod tests {
         );
         assert_eq!(requests::machine_pause(data.path()), None);
         assert_eq!(
-            resume(data.path(), None, Voice::Terminal).unwrap()[0],
+            resume(data.path(), None, Voice::Terminal, None).unwrap()[0],
             "Every project of this machine was not paused."
         );
     }
@@ -319,14 +406,14 @@ mod tests {
         let machine = Request::new(BY_UI, Timestamp::now(), "asked from the web UI");
         requests::ask_pause(data.path(), Some(&dirs), &machine).unwrap();
         requests::ask_pause(data.path(), None, &machine).unwrap();
-        let lines = resume(data.path(), Some(&repo), Voice::Ui).unwrap();
+        let lines = resume(data.path(), Some(&repo), Voice::Ui, Some(BY_UI)).unwrap();
         assert_eq!(lines.len(), 2, "{lines:?}");
         assert_eq!(
             lines[1],
             "Every project of this machine is still paused: the machine's Resume button lifts that."
         );
         requests::ask_pause(data.path(), Some(&dirs), &machine).unwrap();
-        let lines = resume(data.path(), None, Voice::Ui).unwrap();
+        let lines = resume(data.path(), None, Voice::Ui, Some(BY_UI)).unwrap();
         assert_eq!(lines.len(), 2, "{lines:?}");
         assert_eq!(
             lines[1],
@@ -335,6 +422,84 @@ mod tests {
         for line in &lines {
             assert!(!line.contains("owlshift resume"), "{line}");
         }
+    }
+
+    /// The events of the log in `data`, as JSON.
+    fn events(data: &Path) -> Vec<Value> {
+        std::fs::read_to_string(EventLog::in_dir(data).path())
+            .unwrap_or_default()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect()
+    }
+
+    /// A pause and a resume each leave one `decision` event naming the
+    /// target, the reason, what the pause replaced or lifted, and `by` only
+    /// when it is not the terminal; a resume with nothing standing leaves
+    /// none.
+    #[test]
+    fn a_pause_and_a_resume_are_recorded() {
+        let data = tempfile::tempdir().unwrap();
+        let repo = repo();
+        let first = Request::new(BY_UI, Timestamp::now(), "asked from the web UI");
+        let lines = pause(data.path(), Some(&repo), &first, Voice::Terminal).unwrap();
+        assert_eq!(lines.len(), 2, "{lines:?}");
+        let second = Request::new(BY_PAUSE, Timestamp::now(), "lunch");
+        pause(data.path(), Some(&repo), &second, Voice::Terminal).unwrap();
+        let seen = events(data.path());
+        assert_eq!(seen.len(), 2, "{seen:?}");
+        assert_eq!(seen[0]["kind"], "decision");
+        assert_eq!(seen[0]["project"], "acme/web");
+        assert_eq!(seen[0]["data"]["pause"], "asked");
+        assert_eq!(seen[0]["data"]["scope"], "project");
+        assert_eq!(seen[0]["data"]["by"], "ui");
+        assert!(seen[0]["data"].get("replaced").is_none());
+        assert_eq!(seen[1]["data"]["why"], "lunch");
+        assert!(seen[1]["data"].get("by").is_none(), "{seen:?}");
+        assert_eq!(seen[1]["data"]["replaced"]["by"], "ui");
+        assert_eq!(seen[1]["data"]["replaced"]["why"], "asked from the web UI");
+
+        resume(data.path(), Some(&repo), Voice::Ui, Some(BY_UI)).unwrap();
+        resume(data.path(), Some(&repo), Voice::Ui, Some(BY_UI)).unwrap();
+        let seen = events(data.path());
+        assert_eq!(seen.len(), 3, "nothing standing records nothing: {seen:?}");
+        assert_eq!(seen[2]["data"]["pause"], "lifted");
+        assert_eq!(seen[2]["data"]["by"], "ui");
+        assert_eq!(seen[2]["data"]["was"]["why"], "lunch");
+    }
+
+    /// The machine's pause and resume are events of [`MACHINE_PROJECT`], and
+    /// a resume from the terminal carries no `by`.
+    #[test]
+    fn the_machines_pause_and_resume_are_recorded() {
+        let data = tempfile::tempdir().unwrap();
+        let request = Request::new(BY_PAUSE, Timestamp::now(), "night");
+        pause(data.path(), None, &request, Voice::Terminal).unwrap();
+        resume(data.path(), None, Voice::Terminal, None).unwrap();
+        let seen = events(data.path());
+        assert_eq!(seen.len(), 2, "{seen:?}");
+        for event in &seen {
+            assert_eq!(event["project"], MACHINE_PROJECT);
+            assert_eq!(event["data"]["scope"], "machine");
+            assert!(event["data"].get("by").is_none(), "{event}");
+        }
+        assert_eq!(seen[1]["data"]["pause"], "lifted");
+    }
+
+    /// An event that cannot be appended adds a warning line and fails
+    /// nothing.
+    #[test]
+    fn a_failed_append_adds_a_warning() {
+        let data = tempfile::tempdir().unwrap();
+        std::fs::create_dir(EventLog::in_dir(data.path()).path()).unwrap();
+        let request = Request::new(BY_PAUSE, Timestamp::now(), "night");
+        let lines = pause(data.path(), None, &request, Voice::Terminal).unwrap();
+        assert_eq!(lines.len(), 2, "{lines:?}");
+        assert!(lines[1].starts_with("owlshift: warning: the event was not recorded"));
+        assert!(requests::machine_pause(data.path()).is_some());
+        let lines = resume(data.path(), None, Voice::Terminal, None).unwrap();
+        assert!(lines.last().unwrap().starts_with("owlshift: warning:"));
+        assert_eq!(requests::machine_pause(data.path()), None);
     }
 
     /// Forget removes the project from the list, and says it was not served
