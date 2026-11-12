@@ -199,7 +199,9 @@ fn the_flag_restarts_what_watch_takes_and_refuses_the_rest() {
         "{outcome:?}"
     );
 
-    // A park at Intake: watch does not take it.
+    // A park at Intake: watch does not take it. The refusal names the command
+    // to run: the UI's words after a cancel say its Restart button "tells what
+    // to run when it cannot" (OWL-529), which holds only while this does.
     bench.put(parked(Stage::Intake, false));
     let (commit, events) = (bench.ref_commit(), bench.events().len());
     let (outcome, _) = bench.to_watch();

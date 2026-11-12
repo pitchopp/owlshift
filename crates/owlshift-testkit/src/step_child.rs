@@ -609,8 +609,14 @@ pub fn cancel(project: &ChildProject, id: &str, why: &str) -> owlshift_runner::c
         Timestamp::now(),
         why,
     );
-    owlshift_runner::cancel::ask(&git, &project.dirs(), &TicketId::new(id).unwrap(), &request)
-        .unwrap()
+    owlshift_runner::cancel::ask(
+        &git,
+        &project.dirs(),
+        &TicketId::new(id).unwrap(),
+        &request,
+        owlshift_runner::voice::Voice::Terminal,
+    )
+    .unwrap()
 }
 
 /// Every event of the log in the data directory `data`, oldest first.

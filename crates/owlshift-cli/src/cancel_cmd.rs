@@ -14,6 +14,7 @@ use owlshift_runner::config::Effective;
 use owlshift_runner::events::printable;
 use owlshift_runner::on_demand;
 use owlshift_runner::project::{self, ProjectDirs};
+use owlshift_runner::voice::Voice;
 
 use crate::fail;
 
@@ -41,6 +42,6 @@ fn ask(config: &Effective, ticket: &str, reason: Option<&str>) -> Result<Vec<Str
     let dirs = ProjectDirs::new(&crate::data_dir()?, &repo);
     let why = reason.unwrap_or("asked by `owlshift cancel`");
     let request = Request::new(BY_CANCEL, Timestamp::now(), why);
-    let asked = cancel::ask(&git, &dirs, &ticket, &request)?;
-    Ok(cancel::said(&ticket, &asked))
+    let asked = cancel::ask(&git, &dirs, &ticket, &request, Voice::Terminal)?;
+    Ok(cancel::said(&ticket, &asked, Voice::Terminal))
 }

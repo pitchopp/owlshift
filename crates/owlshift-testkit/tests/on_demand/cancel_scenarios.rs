@@ -9,6 +9,7 @@
 use owlshift_contracts::service::{BY_CANCEL, Request};
 use owlshift_runner::cancel::{self, Asked};
 use owlshift_runner::on_demand::Takes;
+use owlshift_runner::voice::Voice;
 use owlshift_runner::watch::presence;
 
 use super::*;
@@ -25,7 +26,7 @@ impl Bench {
         let env = self.env.clone();
         let git = Git::with_setup("git", move |command| env.apply(command));
         let request = Request::new(BY_CANCEL, Timestamp::now(), WHY);
-        cancel::ask(&git, &self.dirs(), &ticket(), &request)
+        cancel::ask(&git, &self.dirs(), &ticket(), &request, Voice::Terminal)
     }
 
     /// The ticket ref rewritten at `status`, its counters kept.

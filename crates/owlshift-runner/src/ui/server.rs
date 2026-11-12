@@ -123,6 +123,7 @@ use crate::project::ProjectDirs;
 use crate::served::{self, Registry};
 use crate::status::{self, waits};
 use crate::system::{HostSystem, System};
+use crate::voice::Voice;
 use crate::{cancel, controls, on_demand, personal_edit};
 
 /// The page's frame.
@@ -1033,10 +1034,15 @@ fn action_page(context: &Context, path: &str, body: &[u8]) -> Response<Cursor<Ve
                     .map(|project| served_repo(context, &project))
                     .transpose()?;
                 if path == "/api/resume" {
-                    return Ok(said(controls::resume(data, target.as_ref())));
+                    return Ok(said(controls::resume(data, target.as_ref(), Voice::Ui)));
                 }
                 let request = Asked::new(BY_UI, Timestamp::now(), reason_of(&map)?);
-                Ok(said(controls::pause(data, target.as_ref(), &request)))
+                Ok(said(controls::pause(
+                    data,
+                    target.as_ref(),
+                    &request,
+                    Voice::Ui,
+                )))
             }
             "/api/forget" => {
                 let project =
@@ -1103,8 +1109,14 @@ fn cancel_ui(
     };
     on_demand::check_team(project, ticket)?;
     let request = Asked::new(BY_UI, Timestamp::now(), reason);
-    let asked = cancel::ask(&crate::project::runner_git(), &dirs, ticket, &request)?;
-    Ok(cancel::said(ticket, &asked))
+    let asked = cancel::ask(
+        &crate::project::runner_git(),
+        &dirs,
+        ticket,
+        &request,
+        Voice::Ui,
+    )?;
+    Ok(cancel::said(ticket, &asked, Voice::Ui))
 }
 
 /// The project an event of the web UI's own is recorded under, as the

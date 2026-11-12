@@ -47,6 +47,7 @@ use crate::events::{EventLog, printable};
 use crate::project::{ProjectDirs, TicketHolder};
 use crate::served::{self, Registry};
 use crate::slots::{HeldSlot, MachineSlots};
+use crate::voice::Voice;
 use crate::{ticket_ref, watch, why};
 
 pub mod waits;
@@ -711,15 +712,17 @@ impl Part {
 /// The report as text, its times in `tz`, safe for a terminal.
 pub fn render(report: &Report, tz: &TimeZone) -> String {
     let mut out = String::new();
-    for (_, text) in parts(report, tz) {
+    for (_, text) in parts(report, tz, Voice::Terminal) {
         let _ = writeln!(out, "{text}");
     }
     out
 }
 
 /// The lines [`render`] prints, each with its kind and already passed
-/// through [`printable`]: `render` is their join, one per line.
-pub fn parts(report: &Report, tz: &TimeZone) -> Vec<(Part, String)> {
+/// through [`printable`]: `render` is their join, one per line. In the
+/// terminal's `voice` a pause is lifted by `owlshift resume`; in the UI's, which
+/// shows them on the Orchestrator screen, by its Resume button (OWL-529).
+pub fn parts(report: &Report, tz: &TimeZone, voice: Voice) -> Vec<(Part, String)> {
     let mut out: Vec<(Part, String)> = Vec::new();
     let mut line = |part: Part, text: String| out.push((part, printable(&text)));
     line(
@@ -776,11 +779,15 @@ pub fn parts(report: &Report, tz: &TimeZone) -> Vec<(Part, String)> {
         );
     }
     if let Some(request) = &report.machine_pause {
+        let lifts = match voice {
+            Voice::Terminal => "`owlshift resume` lifts it.",
+            Voice::Ui => "the machine's Resume button lifts it.",
+        };
         line(
             Part::MachinePause,
             format!(
                 "Paused: every project of this machine, {}. Nothing is dispatched and no step \
-                 starts; `owlshift resume` lifts it.",
+                 starts; {lifts}",
                 asked(request.as_ref(), tz)
             ),
         );
@@ -870,7 +877,10 @@ pub fn parts(report: &Report, tz: &TimeZone) -> Vec<(Part, String)> {
                 Some(request) if request.by == BY_DAEMON => {
                     "; the daemon tries it again at each of its passes"
                 }
-                _ => "; `owlshift resume <owner/repo>` lifts it",
+                _ => match voice {
+                    Voice::Terminal => "; `owlshift resume <owner/repo>` lifts it",
+                    Voice::Ui => "; its Resume button lifts it",
+                },
             };
             line(
                 Part::ProjectPause,
@@ -1207,6 +1217,65 @@ mod tests {
         has(": lunch break; `owlshift resume <owner/repo>` lifts it");
         has("Steps under way: none (0 of 2 run slots).");
         has("Latest digest: none yet.");
+
+        // OWL-529: the terminal names the command that lifts a pause, the UI
+        // its Resume button; every other line is the same in both voices.
+        let tz = TimeZone::UTC;
+        let terminal = parts(&report, &tz, Voice::Terminal);
+        let ui = parts(&report, &tz, Voice::Ui);
+        assert_eq!(terminal.len(), ui.len());
+        let is_pause = |part: &Part| matches!(part, Part::MachinePause | Part::ProjectPause);
+        let others = |all: &[(Part, String)]| -> Vec<(Part, String)> {
+            all.iter()
+                .filter(|(part, _)| !is_pause(part))
+                .cloned()
+                .collect()
+        };
+        assert_eq!(others(&terminal), others(&ui));
+        let pause_line = |all: &[(Part, String)], kind: Part, start: &str| -> String {
+            let found: Vec<&String> = all
+                .iter()
+                .filter(|(part, line)| *part == kind && line.starts_with(start))
+                .map(|(_, line)| line)
+                .collect();
+            assert_eq!(found.len(), 1, "{kind:?}: {all:?}");
+            found[0].clone()
+        };
+        let machine = "Paused: every project of this machine, by owlshift pause at";
+        let terminal_machine = pause_line(&terminal, Part::MachinePause, machine);
+        let ui_machine = pause_line(&ui, Part::MachinePause, machine);
+        assert!(
+            terminal_machine.ends_with(": travelling. Nothing is dispatched and no step starts; `owlshift resume` lifts it."),
+            "{terminal_machine}"
+        );
+        assert!(
+            ui_machine.ends_with(
+                ": travelling. Nothing is dispatched and no step starts; the machine's Resume button lifts it."
+            ),
+            "{ui_machine}"
+        );
+        let project = "  paused by owlshift pause at ";
+        let terminal_project = pause_line(&terminal, Part::ProjectPause, project);
+        let ui_project = pause_line(&ui, Part::ProjectPause, project);
+        assert!(
+            terminal_project.ends_with(": lunch break; `owlshift resume <owner/repo>` lifts it"),
+            "{terminal_project}"
+        );
+        assert!(
+            ui_project.ends_with(": lunch break; its Resume button lifts it"),
+            "{ui_project}"
+        );
+        for (_, line) in &ui {
+            assert!(!line.contains("owlshift resume"), "{line}");
+        }
+        // `render`, which `owlshift status` prints, is the terminal's.
+        assert_eq!(
+            render(&report, &tz),
+            terminal
+                .iter()
+                .map(|(_, line)| format!("{line}\n"))
+                .collect::<String>()
+        );
     }
 
     /// OWL-478: a ticket lock a command holds with no run slot is a step
@@ -1616,7 +1685,7 @@ mod tests {
     fn the_parts_are_the_lines_render_prints_by_kind() {
         let report = full_report();
         let tz = TimeZone::UTC;
-        let parts = parts(&report, &tz);
+        let parts = parts(&report, &tz, Voice::Terminal);
         let text = render(&report, &tz);
         let joined: String = parts.iter().map(|(_, line)| format!("{line}\n")).collect();
         assert_eq!(joined, text);
@@ -1635,7 +1704,7 @@ mod tests {
             ..report.clone()
         };
         assert!(
-            super::parts(&bare, &tz)
+            super::parts(&bare, &tz, Voice::Terminal)
                 .iter()
                 .any(|(kind, _)| *kind == Part::NoProject)
         );
@@ -1663,7 +1732,7 @@ mod tests {
         let mut report = report;
         report.notes = vec!["bad\u{1b}[31m".to_owned()];
         assert!(
-            super::parts(&report, &tz)
+            super::parts(&report, &tz, Voice::Terminal)
                 .iter()
                 .all(|(_, line)| !line.contains('\u{1b}'))
         );

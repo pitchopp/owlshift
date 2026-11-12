@@ -51,6 +51,7 @@ use super::reply::{self, KeyState};
 use crate::executor::Git;
 use crate::project::ProjectDirs;
 use crate::ticket_ref::{self, Commits, Revision, TicketRecord};
+use crate::voice::Voice;
 use crate::{cancel, served, status};
 
 /// The snapshot's format: 2 adds `actions` (OWL-473).
@@ -203,7 +204,7 @@ fn actions(
             let cancel = dirs
                 .ticket_lock_held(ticket)
                 .map_err(|e| format!("{ticket}'s lock could not be read: {e}"))
-                .and_then(|running| cancel::decide(ticket, *record, running));
+                .and_then(|running| cancel::decide(ticket, *record, running, Voice::Ui));
             (restart, cancel)
         }
     };
@@ -1263,11 +1264,10 @@ mod tests {
         let actions = bench.snapshot("OWL-1")["actions"].clone();
         assert_eq!(actions["restart"], true);
         assert_eq!(actions["cancel"], false);
-        assert!(
-            actions["cancel_refusal"]
-                .as_str()
-                .unwrap()
-                .contains("OWL-1 is already parked"),
+        assert_eq!(
+            actions["cancel_refusal"],
+            "OWL-1 is already parked: the Restart button on its page restarts it, or tells what to \
+             run when it cannot",
             "{actions}"
         );
         let held = bench.dirs.ticket_lock(&id("OWL-1")).unwrap().unwrap();
