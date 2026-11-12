@@ -52,12 +52,14 @@ use crate::install::ServiceState;
 use crate::secrets::{self, ForgeSecret, Source, TrackerAccounts, TrackerSecrets};
 use crate::served;
 use crate::system::{
-    AppError, DataDirSource, DefaultBranch, DefaultBranchFile, MarkerState, RunError, Running,
-    RunningBuilds, StatesError, System, TokenTryError, exact_version_of, older_than, version_of,
+    AppError, AppUser, DataDirSource, DefaultBranch, DefaultBranchFile, MarkerState, RunError,
+    Running, RunningBuilds, StatesError, System, TokenTryError, exact_version_of, older_than,
+    version_of,
 };
 #[cfg(unix)]
 use crate::system::{SentinelProbe, SentinelStatus};
 use crate::ticket_ref::RefState;
+use crate::tracker::{Probe as TrackerProbe, Probed};
 use crate::ui::probe::Probe;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1626,7 +1628,7 @@ fn tracker_states_check(
     let fail = |detail: String, why: &str, fix: Vec<Step>| {
         Some(Check::fail(Section::Project, SUBJECT, detail, why, fix))
     };
-    let names = match system.linear_states(accounts, team) {
+    let names = match linear_states(system, accounts, team) {
         Ok(names) => names,
         Err(StatesError::NoKey) => {
             return fail(
@@ -1752,7 +1754,14 @@ fn admission_facts(
         .flatten()
         .map(String::as_str)
         .collect();
-    Some(system.linear_admission(secrets, team, &tracker.states.ready, &labels, &accounts))
+    Some(linear_admission(
+        system,
+        secrets,
+        team,
+        &tracker.states.ready,
+        &labels,
+        &accounts,
+    ))
 }
 
 /// Whether the project is set up to admit tickets to the drain (OWL-155,
@@ -2032,7 +2041,7 @@ fn tracker_identity_check(
     };
     let fail =
         |detail: String, fix: Vec<Step>| Check::fail(Section::Project, SUBJECT, detail, why, fix);
-    Some(match system.linear_app(accounts, team) {
+    Some(match linear_app(system, accounts, team) {
         Ok(Some(user)) => Check::ok(
             Section::Project,
             SUBJECT,
@@ -2084,6 +2093,52 @@ fn tracker_identity_check(
             },
         ),
     })
+}
+
+/// The workflow states of the Linear team `team`, as the host reads them.
+fn linear_states(
+    system: &dyn System,
+    accounts: &TrackerAccounts,
+    team: &str,
+) -> Result<Vec<String>, StatesError> {
+    match system.tracker_probe(&TrackerProbe::LinearStates { accounts, team }) {
+        Probed::States(answer) => answer,
+        other => unreachable!("the host answered a Linear states probe with {other:?}"),
+    }
+}
+
+/// The admission facts of the Linear team `team`, as the host reads them.
+fn linear_admission(
+    system: &dyn System,
+    accounts: &TrackerAccounts,
+    team: &str,
+    ready: &str,
+    labels: &[&str],
+    people: &[&str],
+) -> Result<AdmissionFacts, StatesError> {
+    let probe = TrackerProbe::LinearAdmission {
+        accounts,
+        team,
+        ready,
+        labels,
+        people,
+    };
+    match system.tracker_probe(&probe) {
+        Probed::Admission(answer) => answer,
+        other => unreachable!("the host answered a Linear admission probe with {other:?}"),
+    }
+}
+
+/// The Linear app user Owlshift writes as, as the host checks it.
+fn linear_app(
+    system: &dyn System,
+    accounts: &TrackerAccounts,
+    team: &str,
+) -> Result<Option<AppUser>, AppError> {
+    match system.tracker_probe(&TrackerProbe::LinearApp { accounts, team }) {
+        Probed::App(answer) => answer,
+        other => unreachable!("the host answered a Linear app probe with {other:?}"),
+    }
 }
 
 /// The project's tracker and forge secrets as doctor finds them (OWL-308):

@@ -88,6 +88,78 @@ pub fn keychain_set<T>(
     crate::secrets::tracker(repo, look).map(Some)
 }
 
+/// What `owlshift doctor` asks of the project's tracker over the network,
+/// through [`crate::system::System::tracker_probe`].
+#[derive(Clone, Copy, Debug)]
+pub enum Probe<'a> {
+    /// The names of the workflow states of the Linear team `team`
+    /// ([`linear_team_states`], OWL-147).
+    LinearStates {
+        accounts: &'a TrackerAccounts,
+        team: &'a str,
+    },
+    /// What the admission and proposals setup of the Linear team `team`
+    /// looks like ([`linear_admission`], OWL-155).
+    LinearAdmission {
+        accounts: &'a TrackerAccounts,
+        team: &'a str,
+        ready: &'a str,
+        labels: &'a [&'a str],
+        people: &'a [&'a str],
+    },
+    /// The Linear app user Owlshift writes as ([`linear_app_user`],
+    /// OWL-157).
+    LinearApp {
+        accounts: &'a TrackerAccounts,
+        team: &'a str,
+    },
+}
+
+/// The answer to a [`Probe`], of the variant named as the probe's.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Probed {
+    States(Result<Vec<String>, StatesError>),
+    Admission(Result<AdmissionFacts, StatesError>),
+    App(Result<Option<AppUser>, AppError>),
+}
+
+impl Probe<'_> {
+    /// The answer, read with the tracker set stored under the probe's
+    /// accounts in the system keychain, over the network.
+    pub fn read(&self) -> Probed {
+        let keychain = match Keychain::system() {
+            Ok(keychain) => keychain,
+            Err(error) => return self.keychain_error(error.to_string()),
+        };
+        match *self {
+            Self::LinearStates { accounts, team } => {
+                Probed::States(linear_team_states(&keychain, accounts, team))
+            }
+            Self::LinearAdmission {
+                accounts,
+                team,
+                ready,
+                labels,
+                people,
+            } => Probed::Admission(linear_admission(
+                &keychain, accounts, team, ready, labels, people,
+            )),
+            Self::LinearApp { accounts, team } => {
+                Probed::App(linear_app_user(&keychain, accounts, team))
+            }
+        }
+    }
+
+    /// The answer of a keychain that could not be read, for `reason`.
+    pub fn keychain_error(&self, reason: String) -> Probed {
+        match self {
+            Self::LinearStates { .. } => Probed::States(Err(StatesError::Keychain(reason))),
+            Self::LinearAdmission { .. } => Probed::Admission(Err(StatesError::Keychain(reason))),
+            Self::LinearApp { .. } => Probed::App(Err(AppError::Keychain(reason))),
+        }
+    }
+}
+
 /// Opens the project's tracker adapter, afresh on each call: `owlshift do`
 /// opens it again on each try while the tracker does not answer (OWL-479).
 pub struct Opener<'a> {
