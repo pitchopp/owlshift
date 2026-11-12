@@ -5,6 +5,9 @@
 //! of the shipped binary reaches it. The test bench's `owlshift-cli-bench`
 //! calls the same entry with a keychain held in memory, to run the web UI's
 //! Restart child end to end (OWL-522).
+//!
+//! The key `owlshift self-update` trusts is chosen the same way: the shipped
+//! binary passes [`RELEASE_KEY`], the bench a test key of its own (OWL-541).
 
 mod cancel_cmd;
 mod do_cmd;
@@ -13,6 +16,7 @@ mod gate_cmd;
 mod init_cmd;
 mod logs_cmd;
 mod pause_cmd;
+mod self_update_cmd;
 mod service_cmd;
 mod status_cmd;
 mod ui_cmd;
@@ -37,6 +41,11 @@ use owlshift_runner::doctor;
 use owlshift_runner::events::printable;
 use owlshift_runner::system::HostSystem;
 use owlshift_runner::watch::stop::CHECKED_STOP_BOUND;
+
+/// Owlshift's release key, `minisign.pub` at the repository's root: the
+/// public half of the key the release workflow signs `SHA256SUMS` with, and
+/// the one key `owlshift self-update` trusts in the shipped binary.
+pub const RELEASE_KEY: &str = include_str!("../../../minisign.pub");
 
 /// Works a team's backlog with coding agents, and asks a human on the ticket
 /// when a decision is theirs.
@@ -278,6 +287,16 @@ enum Command {
     /// it once its watches drained, a second (or SIGTERM) stops their steps
     /// checking their runs, a third stops everything now.
     Daemon,
+    /// Update an install made by hand, by install.sh or from an archive, to
+    /// the latest release: its signature and checksum verified with the key
+    /// built into this binary, then the binary replaced at its own path. An
+    /// install by Homebrew or cargo is refused, with the command that
+    /// updates it; an older release is never installed.
+    SelfUpdate {
+        /// Only say whether a newer release is published; change nothing.
+        #[arg(long)]
+        check: bool,
+    },
     /// Print the events `owlshift do`, `continue`, `watch` and `forget`
     /// recorded, oldest first.
     Logs {
@@ -322,7 +341,12 @@ fn long_version() -> String {
 /// The `owlshift` binary, `do`, `continue` and `watch` opening their
 /// credentials with `open_keychain`: `Keychain::system` in the shipped binary.
 /// Every other command that reads the keychain opens the system's.
-pub fn main_with(open_keychain: fn() -> Result<Keychain, KeychainError>) -> ExitCode {
+/// `self-update` trusts `release_key` alone: [`RELEASE_KEY`] in the shipped
+/// binary.
+pub fn main_with(
+    open_keychain: fn() -> Result<Keychain, KeychainError>,
+    release_key: &'static str,
+) -> ExitCode {
     // Before any probe or run starts: on Unix each runs in a process group of
     // its own, out of reach of the terminal's Ctrl-C, and on Windows one that
     // ignores Ctrl-C would outlive Owlshift, so Owlshift stops them itself.
@@ -476,6 +500,7 @@ pub fn main_with(open_keychain: fn() -> Result<Keychain, KeychainError>) -> Exit
         } => ui_cmd::run(&config, print, new_token),
         Command::Uninstall { purge } => service_cmd::uninstall(purge),
         Command::Daemon => service_cmd::daemon(&system, &config),
+        Command::SelfUpdate { check } => self_update_cmd::run(check, release_key),
         Command::Logs {
             ticket,
             last,
@@ -529,7 +554,7 @@ mod tests {
     fn the_shipped_binary_opens_the_system_keychain_only() {
         let main = include_str!("main.rs");
         assert!(
-            main.contains("owlshift_cli::main_with(Keychain::system)"),
+            main.contains("owlshift_cli::main_with(Keychain::system, owlshift_cli::RELEASE_KEY)"),
             "{main}"
         );
         assert!(!main.contains("env::var"), "{main}");
@@ -559,6 +584,17 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// OWL-541: the key the shipped binary trusts is `minisign.pub`, the
+    /// release workflow's, and reads as a minisign public key.
+    #[test]
+    fn the_shipped_binary_trusts_the_release_key() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let key = std::fs::read_to_string(root.join("minisign.pub")).unwrap();
+        assert_eq!(RELEASE_KEY, key);
+        assert!(RELEASE_KEY.lines().nth(1).unwrap().starts_with("RW"));
+        minisign_verify::PublicKey::decode(RELEASE_KEY).unwrap();
     }
 
     /// OWL-161: `watch`, served or not, stops by degrees with the checked

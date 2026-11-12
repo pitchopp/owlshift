@@ -12,6 +12,7 @@
 //! and `doctor`, `init`, `owlshift do` and the UI reach a tracker through
 //! it. Each kind is a file of its own under `tracker/`.
 
+mod github;
 mod linear;
 mod markdown;
 
@@ -30,7 +31,7 @@ use owlshift_platform::keychain::{Keychain, SERVICE, Secret};
 use crate::doctor::Check;
 use crate::init::SecretSpec;
 use crate::refusal::Refusal;
-use crate::secrets::{Lookup, Source, TrackerAccounts, TrackerSecrets};
+use crate::secrets::{ForgeSecret, Lookup, Source, TrackerAccounts, TrackerSecrets};
 use crate::system::System;
 
 /// What differs by tracker, for one kind of tracker a project file names
@@ -58,12 +59,15 @@ pub trait Kind: Sync {
 
     /// What opens the adapter of the project whose `[tracker]` is `tracker`,
     /// checked out at `root`, with the tracker secrets [`keychain_set`]
-    /// read: the error says what the project file or the keychain lacks.
+    /// read and the project's forge credential, which a tracker of the
+    /// forge's own reaches it with (OWL-535): the error says what the
+    /// project file or the keychain lacks.
     fn opener<'a>(
         &self,
         tracker: &'a config::Tracker,
         root: &'a Path,
         secrets: Option<&'a TrackerSecrets<Secret>>,
+        forge: ForgeCredential<'a>,
     ) -> Result<Opener<'a>, String>;
 
     /// The lines `owlshift doctor` reports on the tracker itself, after the
@@ -112,7 +116,17 @@ pub fn of(kind: TrackerKind) -> &'static dyn Kind {
     match kind {
         TrackerKind::Linear => &linear::Linear,
         TrackerKind::Markdown => &markdown::Markdown,
+        TrackerKind::Github => &github::Github,
     }
+}
+
+/// The project's forge credential, as `owlshift do` read it, for a tracker
+/// reached through it (OWL-535).
+#[derive(Clone, Copy)]
+pub struct ForgeCredential<'a> {
+    pub secret: &'a ForgeSecret<Secret>,
+    pub repo: &'a Repo,
+    pub access: &'a crate::forge::AppAccess,
 }
 
 /// The tracker set of the project of `repo`, each account looked up by
@@ -495,7 +509,11 @@ mod tests {
     /// lines `init` writes say it.
     #[test]
     fn each_kind_is_named_as_the_project_file_names_it() {
-        for kind in [TrackerKind::Linear, TrackerKind::Markdown] {
+        for kind in [
+            TrackerKind::Linear,
+            TrackerKind::Markdown,
+            TrackerKind::Github,
+        ] {
             let name = of(kind).name();
             assert_eq!(serde_json::to_value(kind).unwrap(), name, "{kind:?}");
             let lines = of(kind).project_file_lines(Some("OWL")).unwrap();

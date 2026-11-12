@@ -12,6 +12,7 @@
 //! with P5 too (OWL-353), a comment's reactions with P5 too (OWL-371), a
 //! ticket's links for intake's brief (OWL-416).
 
+pub mod github;
 pub mod linear;
 pub mod markdown;
 

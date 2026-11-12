@@ -344,11 +344,6 @@ fn run_with(
     {
         eprintln!("owlshift: {notice}");
     }
-    let opener = tracker::of(project.tracker.kind).opener(
-        &project.tracker,
-        root,
-        tracker_secrets.as_ref(),
-    )?;
     let dirs = ProjectDirs::new(data_dir, &repo);
     let access = forge::AppAccess {
         keychain: keychain.clone(),
@@ -358,6 +353,16 @@ fn run_with(
             _ => None,
         }),
     };
+    let opener = tracker::of(project.tracker.kind).opener(
+        &project.tracker,
+        root,
+        tracker_secrets.as_ref(),
+        tracker::ForgeCredential {
+            secret: &forge_secret,
+            repo: &repo,
+            access: &access,
+        },
+    )?;
     // With the Linear app stored, its token is requested here, before any
     // work, and revoked when the tracker is dropped (OWL-157). The GitHub
     // App's token is refreshed under the project's account lock (OWL-384);
