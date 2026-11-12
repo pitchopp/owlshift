@@ -27,9 +27,11 @@ use owlshift_contracts::config::{self, ProjectConfig, TrackerKind};
 use owlshift_contracts::ids::TicketId;
 use owlshift_platform::keychain::{Keychain, SERVICE, Secret};
 
+use crate::doctor::Check;
 use crate::init::SecretSpec;
 use crate::refusal::Refusal;
 use crate::secrets::{Lookup, Source, TrackerAccounts, TrackerSecrets};
+use crate::system::System;
 
 /// What differs by tracker, for one kind of tracker a project file names
 /// (`[tracker].kind`): [`of`] gives it.
@@ -63,6 +65,36 @@ pub trait Kind: Sync {
         root: &'a Path,
         secrets: Option<&'a TrackerSecrets<Secret>>,
     ) -> Result<Opener<'a>, String>;
+
+    /// The lines `owlshift doctor` reports on the tracker itself, after the
+    /// secrets and forge lines, for the loaded project `config` whose
+    /// tracker set is stored under `accounts` (`None` when doctor could not
+    /// tell, which its `secrets` line says).
+    fn doctor_lines(
+        &self,
+        system: &dyn System,
+        config: &ProjectConfig,
+        accounts: Option<&TrackerAccounts>,
+    ) -> Vec<Check>;
+
+    /// What the tracker says of the project's admission and proposals
+    /// setup (OWL-155), read once for doctor's `drain admission` and
+    /// `proposals inbox` lines: `None` when the tracker is not asked.
+    fn admission_facts(
+        &self,
+        system: &dyn System,
+        config: &ProjectConfig,
+        accounts: Option<&TrackerAccounts>,
+    ) -> Option<Result<AdmissionFacts, StatesError>>;
+
+    /// Doctor's `proposals inbox` line (OWL-155): whether a follow-up
+    /// Owlshift proposes can be filed, given what [`Kind::admission_facts`]
+    /// read.
+    fn proposals_inbox(
+        &self,
+        config: &ProjectConfig,
+        facts: Option<&Result<AdmissionFacts, StatesError>>,
+    ) -> Option<Check>;
 }
 
 /// The kind of the tracker a project file names: the one place the runner

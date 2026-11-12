@@ -24,10 +24,11 @@ use std::path::{MAIN_SEPARATOR, Path};
 
 use owlshift_adapters::forge::{ErrorKind as ForgeErrorKind, Repo};
 use owlshift_adapters::harness::{self, Login, tested};
-use owlshift_adapters::tracker::linear::{AdmissionFacts, StateMismatch, find_state};
-use owlshift_adapters::tracker::markdown::MarkdownTracker;
-use owlshift_adapters::tracker::{Capability, ErrorKind, PROPOSED_LABEL};
-use owlshift_contracts::config::{Admit, ProjectConfig, States, Tracker, TrackerKind};
+use owlshift_adapters::tracker::Capability;
+#[cfg(test)]
+use owlshift_adapters::tracker::ErrorKind;
+use owlshift_adapters::tracker::linear::AdmissionFacts;
+use owlshift_contracts::config::{Admit, ProjectConfig, States, Tracker};
 use owlshift_contracts::ids::TicketId;
 use owlshift_contracts::service::BuildIdentity;
 use owlshift_contracts::{DelegationLevel, Harness};
@@ -49,17 +50,17 @@ use crate::executor::{
 };
 use crate::forge::{AppGrants, GITHUB_TOKEN_HELP};
 use crate::install::ServiceState;
-use crate::secrets::{self, ForgeSecret, Source, TrackerAccounts, TrackerSecrets};
+#[cfg(test)]
+use crate::secrets::TrackerAccounts;
+use crate::secrets::{self, ForgeSecret, Source, TrackerSecrets};
 use crate::served;
 use crate::system::{
-    AppError, AppUser, DataDirSource, DefaultBranch, DefaultBranchFile, MarkerState, RunError,
-    Running, RunningBuilds, StatesError, System, TokenTryError, exact_version_of, older_than,
-    version_of,
+    DataDirSource, DefaultBranch, DefaultBranchFile, MarkerState, RunError, Running, RunningBuilds,
+    StatesError, System, TokenTryError, exact_version_of, older_than, version_of,
 };
 #[cfg(unix)]
 use crate::system::{SentinelProbe, SentinelStatus};
 use crate::ticket_ref::RefState;
-use crate::tracker::{Probe as TrackerProbe, Probed};
 use crate::ui::probe::Probe;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -131,21 +132,21 @@ pub enum Step {
 }
 
 impl Step {
-    fn run(command: &str) -> Self {
+    pub(crate) fn run(command: &str) -> Self {
         Self::Run {
             command: command.to_owned(),
             note: None,
         }
     }
 
-    fn run_noting(command: &str, note: &str) -> Self {
+    pub(crate) fn run_noting(command: &str, note: &str) -> Self {
         Self::Run {
             command: command.to_owned(),
             note: Some(note.to_owned()),
         }
     }
 
-    fn act(text: impl Into<String>) -> Self {
+    pub(crate) fn act(text: impl Into<String>) -> Self {
         Self::Do(text.into())
     }
 }
@@ -165,15 +166,20 @@ pub struct Check {
 }
 
 impl Check {
-    fn ok(section: Section, subject: &str, detail: impl Into<String>) -> Self {
+    pub(crate) fn ok(section: Section, subject: &str, detail: impl Into<String>) -> Self {
         Self::new(section, subject, Status::Ok, detail)
     }
 
-    fn info(section: Section, subject: &str, detail: impl Into<String>) -> Self {
+    pub(crate) fn info(section: Section, subject: &str, detail: impl Into<String>) -> Self {
         Self::new(section, subject, Status::Info, detail)
     }
 
-    fn warn(section: Section, subject: &str, detail: impl Into<String>, why: String) -> Self {
+    pub(crate) fn warn(
+        section: Section,
+        subject: &str,
+        detail: impl Into<String>,
+        why: String,
+    ) -> Self {
         Self {
             why: Some(why),
             ..Self::new(section, subject, Status::Warn, detail)
@@ -181,7 +187,7 @@ impl Check {
     }
 
     /// A failure always says why it matters and how to fix it.
-    fn fail(
+    pub(crate) fn fail(
         section: Section,
         subject: &str,
         detail: impl Into<String>,
@@ -253,7 +259,7 @@ impl Report {
 }
 
 /// The note of every warning: none blocks `owlshift do`.
-const DOES_NOT_BLOCK: &str = "Does not block `owlshift do`:";
+pub(crate) const DOES_NOT_BLOCK: &str = "Does not block `owlshift do`:";
 
 /// Runs every check against the host and the loaded configuration, this
 /// binary's build being `own` (OWL-462).
@@ -312,11 +318,20 @@ pub fn run(system: &dyn System, config: &Effective, own: &BuildIdentity) -> Repo
         Some(Ok(found)) => found.tracker.as_ref().map(|tracker| &tracker.accounts),
         _ => None,
     };
-    checks.extend(tracker_states_check(system, config, accounts));
-    checks.extend(tracker_identity_check(system, config, accounts));
-    let facts = admission_facts(system, config, accounts);
+    // The tracker's own lines, for a loaded project only.
+    let tracker = match &config.project {
+        FileState::Loaded {
+            config: project, ..
+        } => Some((crate::tracker::of(project.tracker.kind), project)),
+        _ => None,
+    };
+    if let Some((kind, project)) = tracker {
+        checks.extend(kind.doctor_lines(system, project, accounts));
+    }
+    let facts = tracker.and_then(|(kind, project)| kind.admission_facts(system, project, accounts));
     checks.extend(drain_admission_check(config, facts.as_ref()));
-    checks.extend(proposals_inbox_check(config, facts.as_ref()));
+    checks
+        .extend(tracker.and_then(|(kind, project)| kind.proposals_inbox(project, facts.as_ref())));
     checks.extend(forge_reviewers_check(config));
     checks.extend(resolver_check(config));
     checks.extend(codex_reviewer_check(system, config));
@@ -850,7 +865,7 @@ fn codex_requirements_check(system: &dyn System) -> Option<Check> {
 }
 
 /// The step that fixes a keychain doctor cannot read.
-const KEYCHAIN_FIX: &str = "Make the system keychain available: unlock it on macOS; on Linux, \
+pub(crate) const KEYCHAIN_FIX: &str = "Make the system keychain available: unlock it on macOS; on Linux, \
                             start a Secret Service such as GNOME Keyring";
 
 /// The harnesses doctor checks (scenario S15): Claude Code, which runs every
@@ -1301,7 +1316,8 @@ fn served_check(system: &dyn System, config: &Effective) -> Option<Check> {
 /// implement yet is a warning, not a failure: `owlshift do` needs only to
 /// read tickets and comments and move the visible stage, and refusing a project is `init`'s job. The
 /// check reads the adapter's constants: it opens neither the tracker nor the
-/// keychain; [`tracker_states_check`] does, for a Linear project.
+/// keychain; the tracker's own lines do, for a Linear project
+/// ([`crate::tracker::Kind::doctor_lines`]).
 fn tracker_check(config: &Effective) -> Check {
     const SUBJECT: &str = "tracker";
     let FileState::Loaded { config, .. } = &config.project else {
@@ -1599,171 +1615,6 @@ fn budget_check(config: &Effective) -> Option<Check> {
     Some(Check::info(Section::Project, "budget", detail))
 }
 
-/// Whether each state named under `[tracker].states` is exactly one
-/// workflow state of the project's Linear team (OWL-147): the rule by which
-/// the stage moves. A name that matches none or several only keeps the stage
-/// from moving, which never stops `owlshift do`, so it is a warning; what
-/// keeps `do` from reading the ticket at all (no key, a rejected key, a
-/// keychain it cannot read, a team Linear does not know) is a failure. None
-/// for a Markdown project or none loaded: only a Linear project opens the
-/// keychain and the network here, once each.
-fn tracker_states_check(
-    system: &dyn System,
-    config: &Effective,
-    accounts: Option<&TrackerAccounts>,
-) -> Option<Check> {
-    const SUBJECT: &str = "tracker states";
-    let FileState::Loaded { config, .. } = &config.project else {
-        return None;
-    };
-    let (TrackerKind::Linear, Some(team)) = (config.tracker.kind, &config.tracker.team) else {
-        return None;
-    };
-    // Unresolved, the `secrets` line says why.
-    let accounts = accounts?;
-    let place = format!(
-        "in the system keychain (service `{SERVICE}`, account `{}`)",
-        accounts.key
-    );
-    let fail = |detail: String, why: &str, fix: Vec<Step>| {
-        Some(Check::fail(Section::Project, SUBJECT, detail, why, fix))
-    };
-    let names = match linear_states(system, accounts, team) {
-        Ok(names) => names,
-        Err(StatesError::NoKey) => {
-            return fail(
-                format!("not checked: no Linear API key {place}"),
-                "`owlshift do` reads the ticket with the Linear API key Owlshift keeps in the \
-                 system keychain, and doctor reads the team's workflow states with it.",
-                vec![Step::run_noting(
-                    "owlshift init",
-                    "paste the key when asked",
-                )],
-            );
-        }
-        Err(StatesError::Keychain(reason)) => {
-            return fail(
-                format!("not checked: could not read the Linear API key {place}: {reason}"),
-                "`owlshift do` reads the Linear API key in the system keychain before each run.",
-                vec![Step::act(KEYCHAIN_FIX)],
-            );
-        }
-        Err(StatesError::Tracker(error)) => {
-            return match error.kind {
-                ErrorKind::Unauthorized => fail(
-                    format!("not checked: Linear refused the API key stored {place}: {error}"),
-                    "`owlshift do` reads the ticket with this key, so Linear would refuse it too.",
-                    vec![Step::run_noting(
-                        "owlshift init --replace-secrets",
-                        "paste a valid Linear API key when asked",
-                    )],
-                ),
-                ErrorKind::NotFound => fail(
-                    format!("not checked: {error}, which `[tracker].team` names (`{team}`)"),
-                    "`owlshift do` runs the tickets of the team `[tracker].team` names, and moves \
-                     their stage among that team's workflow states.",
-                    vec![Step::act(
-                        "Set `team` under `[tracker]` in owlshift.toml to the key your team's \
-                         issue identifiers start with, such as `OWL` for `OWL-12`",
-                    )],
-                ),
-                ErrorKind::Unreachable | ErrorKind::Other => Some(Check::warn(
-                    Section::Project,
-                    SUBJECT,
-                    format!("not checked: {error}"),
-                    format!(
-                        "{DOES_NOT_BLOCK} doctor could not read the workflow states of team \
-                         `{team}`. A name under `[tracker].states` that matches none only keeps \
-                         the ticket's visible stage from moving."
-                    ),
-                )),
-            };
-        }
-    };
-    let mut configured = configured_states(&config.tracker.states);
-    if let Admit::State(name) = &config.tracker.admit {
-        configured.push(("admit.state".to_owned(), name.clone()));
-    }
-    let mut problems = Vec::new();
-    let mut ambiguous = false;
-    for (key, name) in &configured {
-        match find_state(names.iter().map(String::as_str), name) {
-            Ok(_) => {}
-            Err(StateMismatch::Missing) => {
-                problems.push(format!("no state named {name:?} (`{key}`)"));
-            }
-            Err(StateMismatch::Ambiguous) => {
-                ambiguous = true;
-                problems.push(format!("several named {name:?} (`{key}`)"));
-            }
-        }
-    }
-    let keys: Vec<&str> = configured.iter().map(|(key, _)| key.as_str()).collect();
-    if problems.is_empty() {
-        return Some(Check::ok(
-            Section::Project,
-            SUBJECT,
-            format!(
-                "each of {} is one workflow state of team `{team}`",
-                keys.join(", ")
-            ),
-        ));
-    }
-    let mut why = format!(
-        "{DOES_NOT_BLOCK} a move to a state that matches none, or several, fails with a \
-         `stage_not_moved` warning event, and the ticket's visible stage stays where it was. Set \
-         each under `[tracker].states` in owlshift.toml to one of the team's states, exactly, \
-         case included: {}.",
-        names.join(", ")
-    );
-    if ambiguous {
-        why.push_str(" A name several states share must first be made unique in Linear.");
-    }
-    Some(Check::warn(
-        Section::Project,
-        SUBJECT,
-        format!("team `{team}` has {}", problems.join("; ")),
-        why,
-    ))
-}
-
-/// What Linear says of the admission and proposals setup of a Linear
-/// project: the labels it names, its admitters, and its proposals inbox
-/// (OWL-155). None for a Markdown project or none loaded.
-fn admission_facts(
-    system: &dyn System,
-    config: &Effective,
-    secrets: Option<&TrackerAccounts>,
-) -> Option<Result<AdmissionFacts, StatesError>> {
-    let FileState::Loaded { config, .. } = &config.project else {
-        return None;
-    };
-    let (TrackerKind::Linear, Some(team)) = (config.tracker.kind, &config.tracker.team) else {
-        return None;
-    };
-    let secrets = secrets?;
-    let tracker = &config.tracker;
-    let mut labels = vec![PROPOSED_LABEL];
-    if let Admit::Label(label) = &tracker.admit {
-        labels.push(label);
-    }
-    labels.extend(tracker.exclude.as_deref());
-    let accounts: Vec<&str> = tracker
-        .admitters
-        .iter()
-        .flatten()
-        .map(String::as_str)
-        .collect();
-    Some(linear_admission(
-        system,
-        secrets,
-        team,
-        &tracker.states.ready,
-        &labels,
-        &accounts,
-    ))
-}
-
 /// Whether the project is set up to admit tickets to the drain (OWL-155,
 /// build plan "P4 · The drain", part D): a gesture that can be made, the
 /// admission and exclusion labels on the team or the workspace, and
@@ -1889,97 +1740,11 @@ fn drain_admission_check(
     ))
 }
 
-/// Whether a follow-up Owlshift proposes can be filed (OWL-155): the team's
-/// triage inbox, or the label fallback `agent:proposed` on its first backlog
-/// state, chosen as the adapter chooses (`propose`). A warning when neither
-/// works. For a Linear project, none unless its facts were read; a tracker
-/// error is the admission line's to report. A Markdown project files at the
-/// stage `Triage` (OWL-267), read from its file alone: a warning when that
-/// is its ready state, where `propose` refuses every filing.
-fn proposals_inbox_check(
-    config: &Effective,
-    facts: Option<&Result<AdmissionFacts, StatesError>>,
-) -> Option<Check> {
-    const SUBJECT: &str = "proposals inbox";
-    let FileState::Loaded { config, .. } = &config.project else {
-        return None;
-    };
-    if config.tracker.kind == TrackerKind::Markdown {
-        let triage = MarkdownTracker::TRIAGE;
-        return Some(if config.tracker.states.ready == triage {
-            Check::warn(
-                Section::Project,
-                SUBJECT,
-                format!("the ready state is {triage:?}, the stage proposals are filed at"),
-                format!(
-                    "{DOES_NOT_BLOCK} Owlshift cannot file the follow-ups it proposes, since a \
-                     proposal there would enter the queue without a person. Name another \
-                     state under `[tracker].states.ready`."
-                ),
-            )
-        } else {
-            Check::ok(
-                Section::Project,
-                SUBJECT,
-                format!("proposals are filed as tickets at the stage {triage:?}"),
-            )
-        });
-    }
-    let team = config.tracker.team.as_deref()?;
-    let Some(Ok(found)) = facts else {
-        return None;
-    };
-    let labelled = match &found.inbox {
-        Ok(false) => {
-            return Some(Check::ok(
-                Section::Project,
-                SUBJECT,
-                format!("team `{team}` files proposals in its triage inbox"),
-            ));
-        }
-        Ok(true) if found.labels.iter().any(|l| l == PROPOSED_LABEL) => {
-            return Some(Check::ok(
-                Section::Project,
-                SUBJECT,
-                format!(
-                    "team `{team}` has no triage inbox: proposals go to its first backlog state \
-                     with the label {PROPOSED_LABEL:?}"
-                ),
-            ));
-        }
-        Ok(true) => true,
-        Err(_) => false,
-    };
-    let detail = match &found.inbox {
-        Err(reason) => reason.clone(),
-        Ok(_) => format!(
-            "team `{team}` has no triage inbox, and neither it nor the workspace has the label \
-             {PROPOSED_LABEL:?} that marks a proposal in its backlog"
-        ),
-    };
-    let fix = if labelled {
-        format!("Create the label {PROPOSED_LABEL:?} in Linear, on the team or the workspace.")
-    } else {
-        "Turn Triage on for the team in Linear (team settings), or give it a backlog state \
-         other than the ready state."
-            .to_owned()
-    };
-    Some(Check::warn(
-        Section::Project,
-        SUBJECT,
-        detail,
-        format!(
-            "{DOES_NOT_BLOCK} Owlshift cannot file the follow-ups it proposes, and `owlshift \
-             watch --drain` refuses to start, until a proposals inbox exists. {fix}"
-        ),
-    ))
-}
-
 /// Each key set under `[tracker].states` and the state it names, keys in
 /// alphabetical order. Read from the configuration as it serializes, so a
 /// key added later is checked once set and an optional one left unset is
 /// not.
-fn configured_states(states: &States) -> Vec<(String, String)> {
+pub(crate) fn configured_states(states: &States) -> Vec<(String, String)> {
     state_entries(serde_json::to_value(states).expect("the states are strings"))
 }
 
@@ -1995,150 +1760,6 @@ fn state_entries(states: Value) -> Vec<(String, String)> {
             _ => None,
         })
         .collect()
-}
-
-/// Where `owlshift do` keeps its event log, dedicated checkouts and
-/// worktrees (OWL-109). Information only, never a failure or a warning: what
-/// blocks a run is `do`'s own refusal. Only the path is reported: the folder
-/// is never opened, created or listed.
-/// Who Owlshift writes as on Linear (OWL-157): the Linear app's user,
-/// checked as `owlshift do` checks it when it opens the tracker, or the API
-/// key's account. No app is a warning: Owlshift then writes through the key,
-/// as before. An app `do` would refuse fails: half of it stored, Linear
-/// refusing it or not answering, since `do` never falls back to the key.
-/// None for a Markdown project or none loaded.
-fn tracker_identity_check(
-    system: &dyn System,
-    config: &Effective,
-    accounts: Option<&TrackerAccounts>,
-) -> Option<Check> {
-    const SUBJECT: &str = "tracker identity";
-    let FileState::Loaded { config, .. } = &config.project else {
-        return None;
-    };
-    let (TrackerKind::Linear, Some(team)) = (config.tracker.kind, &config.tracker.team) else {
-        return None;
-    };
-    // Unresolved, the `secrets` line says why.
-    let accounts = accounts?;
-    let place = format!(
-        "in the system keychain (service `{SERVICE}`, accounts `{}` and `{}`)",
-        accounts.app_id, accounts.app_secret
-    );
-    let why = "With the Linear app stored, `owlshift do` writes as its app user, checked before \
-               any work, and refuses rather than write through the API key.";
-    let shared = accounts.source == Source::Shared;
-    let store_both = || {
-        vec![Step::run_noting(
-            "owlshift init --replace-secrets",
-            if shared {
-                "give this project a Linear key of its own, then its Linear app's client ID and \
-                 secret, when asked"
-            } else {
-                "give the Linear app's client ID and secret when asked"
-            },
-        )]
-    };
-    let fail =
-        |detail: String, fix: Vec<Step>| Check::fail(Section::Project, SUBJECT, detail, why, fix);
-    Some(match linear_app(system, accounts, team) {
-        Ok(Some(user)) => Check::ok(
-            Section::Project,
-            SUBJECT,
-            format!("Owlshift writes on Linear as the app user `{}`", user.name),
-        ),
-        Ok(None) => Check::warn(
-            Section::Project,
-            SUBJECT,
-            format!("no Linear app {place}: Owlshift writes through the API key"),
-            format!(
-                "{DOES_NOT_BLOCK} Linear does not notify a person of what their own API key \
-                 writes, so a decider who holds the key learns of a question from this \
-                 machine's desktop notification alone. A workspace admin can create an OAuth \
-                 application with client credentials in Linear's API settings; `owlshift init` \
-                 stores its client ID and secret."
-            ),
-        ),
-        Err(AppError::NoKey { .. }) => Check::info(
-            Section::Project,
-            SUBJECT,
-            "not checked: no Linear API key, which the Linear app's check needs",
-        ),
-        Err(AppError::Keychain(reason)) => fail(
-            format!("not checked: could not read the Linear app's credentials {place}: {reason}"),
-            vec![Step::act(KEYCHAIN_FIX)],
-        ),
-        Err(AppError::Incomplete { missing, .. }) => fail(
-            format!(
-                "half of the Linear app is stored: nothing under service `{SERVICE}`, account \
-                 `{missing}`"
-            ),
-            store_both(),
-        ),
-        Err(AppError::Tracker { error, .. }) => fail(
-            format!("the Linear app stored {place} cannot be used: {error}"),
-            match error.kind {
-                // The shared entries may serve another project: never
-                // advise deleting them (OWL-308).
-                ErrorKind::Unreachable | ErrorKind::Other if shared => vec![Step::act(
-                    "Check that Linear is reachable from this machine, then run `owlshift \
-                     doctor` again",
-                )],
-                ErrorKind::Unreachable | ErrorKind::Other => vec![Step::act(
-                    "Check that Linear is reachable from this machine, then run `owlshift \
-                     doctor` again; or delete both of the app's keychain entries to write \
-                     through the API key",
-                )],
-                ErrorKind::Unauthorized | ErrorKind::NotFound => store_both(),
-            },
-        ),
-    })
-}
-
-/// The workflow states of the Linear team `team`, as the host reads them.
-fn linear_states(
-    system: &dyn System,
-    accounts: &TrackerAccounts,
-    team: &str,
-) -> Result<Vec<String>, StatesError> {
-    match system.tracker_probe(&TrackerProbe::LinearStates { accounts, team }) {
-        Probed::States(answer) => answer,
-        other => unreachable!("the host answered a Linear states probe with {other:?}"),
-    }
-}
-
-/// The admission facts of the Linear team `team`, as the host reads them.
-fn linear_admission(
-    system: &dyn System,
-    accounts: &TrackerAccounts,
-    team: &str,
-    ready: &str,
-    labels: &[&str],
-    people: &[&str],
-) -> Result<AdmissionFacts, StatesError> {
-    let probe = TrackerProbe::LinearAdmission {
-        accounts,
-        team,
-        ready,
-        labels,
-        people,
-    };
-    match system.tracker_probe(&probe) {
-        Probed::Admission(answer) => answer,
-        other => unreachable!("the host answered a Linear admission probe with {other:?}"),
-    }
-}
-
-/// The Linear app user Owlshift writes as, as the host checks it.
-fn linear_app(
-    system: &dyn System,
-    accounts: &TrackerAccounts,
-    team: &str,
-) -> Result<Option<AppUser>, AppError> {
-    match system.tracker_probe(&TrackerProbe::LinearApp { accounts, team }) {
-        Probed::App(answer) => answer,
-        other => unreachable!("the host answered a Linear app probe with {other:?}"),
-    }
 }
 
 /// The project's tracker and forge secrets as doctor finds them (OWL-308):
@@ -3185,6 +2806,10 @@ fn what_to_do(
     }
 }
 
+/// Where `owlshift do` keeps its event log, dedicated checkouts and
+/// worktrees (OWL-109). Information only, never a failure or a warning: what
+/// blocks a run is `do`'s own refusal. Only the path is reported: the folder
+/// is never opened, created or listed.
 fn data_dir_check(system: &dyn System, home: Option<&Path>) -> Check {
     const SUBJECT: &str = "data directory";
     match system.data_dir() {
