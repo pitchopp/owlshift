@@ -512,7 +512,7 @@ mod github {
                 _ => {}
             }
         }
-        for name in [CONFORMANCE, STAGE] {
+        for name in [CONFORMANCE, STAGE, DRAIN] {
             let fixture = support::load(&dir(), name);
             let mut found = Vec::new();
             for exchange in &fixture.exchanges {
@@ -634,6 +634,189 @@ mod github {
         let outcome =
             std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| check(&tracker, &case())));
         recorder.write(CONFORMANCE, &format!("{} on {SANDBOX}, {how}", today()));
+        if let Err(panic) = outcome {
+            std::panic::resume_unwind(panic);
+        }
+    }
+
+    /// The label of OWL-547's gesture checks (G3): #30 got it through the
+    /// app's token, #31 through the maintainer's own `gh`, #32 added after
+    /// the opening, through the token.
+    const GESTURE_LABEL: &str = "owlshift-547-ready";
+    const DRAIN: &str = "drain.json";
+    const PROPOSAL_TITLE: &str = "Owlshift live check: OWL-536 proposal";
+    const PROPOSAL_MARKER: &str = "fingerprint 0536abcdef01";
+
+    /// What the drain reads (OWL-536), on the sandbox's probes of G1, G3 and
+    /// G4, then the writes it makes, made up when recorded.
+    fn check_drain(tracker: &dyn Tracker) {
+        use owlshift_adapters::tracker::{Author, Column, Proposal, StateType};
+        use owlshift_contracts::config::Admit;
+
+        let admit = Admit::Label(GESTURE_LABEL.to_owned());
+        let listed = tracker
+            .admitted(&Column {
+                team: None,
+                ready: GESTURE_LABEL,
+                admit: &admit,
+            })
+            .unwrap();
+        let ids: Vec<&str> = listed.iter().map(|l| l.ticket.id.as_str()).collect();
+        assert_eq!(ids, ["31"]);
+        assert!(listed[0].blockers.is_empty());
+
+        // G3: a label put through a person's own login is their gesture; one
+        // put through the app's token is no account's; one removed since
+        // stands nowhere.
+        let gesture = tracker.gesture(&id("31"), &admit).unwrap();
+        assert!(matches!(gesture.account, Author::Account(_)), "{gesture:?}");
+        assert_eq!(gesture.at.unwrap().to_string(), "2026-11-12T19:44:38Z");
+        for through_app in ["30", "32"] {
+            let gesture = tracker.gesture(&id(through_app), &admit).unwrap();
+            let Author::Other { name } = gesture.account else {
+                panic!("{through_app}: {gesture:?}");
+            };
+            assert!(name.ends_with("through the GitHub App owl-shift"), "{name}");
+        }
+        let removed = Admit::Label("owlshift-check:ready".to_owned());
+        assert!(tracker.gesture(&id("12"), &removed).is_err());
+
+        // G4 and G5: the closing reasons, and a pull request's number.
+        for (number, state) in [
+            ("14", Some(StateType::Completed)),
+            ("15", Some(StateType::Canceled)),
+            ("16", Some(StateType::Duplicate)),
+            ("29", None),
+        ] {
+            assert_eq!(tracker.state_type(&id(number)).unwrap(), state, "#{number}");
+        }
+        let pull = tracker.state_type(&id(PULL_REQUEST)).unwrap_err();
+        assert_eq!(pull.kind, ErrorKind::NotFound);
+        let relations = tracker.relations(&id("13")).unwrap();
+        let blockers: Vec<(&str, Option<StateType>)> = relations
+            .blockers
+            .iter()
+            .map(|b| (b.id.as_str(), b.state))
+            .collect();
+        assert_eq!(
+            blockers,
+            [
+                ("15", Some(StateType::Canceled)),
+                ("16", Some(StateType::Duplicate))
+            ]
+        );
+        let links = tracker.links(&id("13")).unwrap();
+        assert_eq!(links.blocked_by.len(), 2);
+
+        // G1: a comment's reactions, its thumbs-up a person's.
+        let comments = tracker.comments(&id(ISSUE)).unwrap();
+        let reacted: Vec<_> = comments
+            .iter()
+            .flat_map(|comment| &comment.reactions)
+            .collect();
+        assert!(
+            reacted
+                .iter()
+                .any(|r| r.is_thumbs_up() && matches!(r.author, Author::Account(_))),
+            "{reacted:?}"
+        );
+        assert!(tracker.working(None, BACK).unwrap().is_empty());
+
+        // The proposals: none yet, then one filed, blocked by its parent; a
+        // relation written once.
+        assert!(
+            tracker
+                .proposed(None, PROPOSAL_TITLE, PROPOSAL_MARKER)
+                .unwrap()
+                .is_empty()
+        );
+        let parent = id("29");
+        let filed = tracker
+            .propose(&Proposal {
+                parent: &parent,
+                title: PROPOSAL_TITLE,
+                description: &format!("Why.\n\n[owlshift] PROPOSAL · 29 · {PROPOSAL_MARKER}"),
+                blocked_by_parent: true,
+                ready: "agent:ready",
+            })
+            .unwrap();
+        assert_eq!(filed.state, "agent:proposed");
+        assert!(filed.problems.is_empty(), "{:?}", filed.problems);
+        tracker.block(&id("14"), &parent).unwrap();
+    }
+
+    #[test]
+    fn the_github_tracker_drains() {
+        let replay = Replay::of(&dir(), DRAIN);
+        check_drain(&tracker(replay.clone()));
+        replay.assert_done();
+    }
+
+    /// The recorder of the drain's reads, which only reads the sandbox:
+    /// the list of the gesture's label shows #31 open with its label, as
+    /// when its gesture was made (it is closed since, its labels removed),
+    /// and the writes, an issue and two relations, are made up.
+    fn drain_recorder() -> Recorder {
+        let live = Recorder::over(HttpTransport::new(support::github_token()), dir())
+            .pseudonymizing_github_users();
+        let repo = format!("repos/{SANDBOX}");
+        let mut opened = live.live_get(&format!("{repo}/issues/31"));
+        opened["state"] = json!("open");
+        opened["state_reason"] = Value::Null;
+        opened["closed_at"] = Value::Null;
+        opened["labels"] = labels(&[GESTURE_LABEL.to_owned()]);
+        let shape = live.live_get(&format!("{repo}/issues/29"));
+        let list = format!("{repo}/issues?state=open&labels={GESTURE_LABEL}&");
+        let issues = format!("{repo}/issues");
+        live.making_up(move |request| {
+            let method = request["method"].as_str()?;
+            let at = request["path"].as_str()?;
+            match method {
+                "POST" if at == issues => {
+                    let mut issue = shape.clone();
+                    for (key, value) in [
+                        ("id", json!(9_000_536_u64)),
+                        ("number", json!(9001)),
+                        ("title", request["body"]["title"].clone()),
+                        ("body", request["body"]["body"].clone()),
+                        ("labels", labels(&["agent:proposed".to_owned()])),
+                        ("url", json!(format!("https://api.github.com/{issues}/9001"))),
+                    ] {
+                        issue[key] = value;
+                    }
+                    Some((issue, "not opened: shaped like issue #29".to_owned()))
+                }
+                "POST" if at.ends_with("/dependencies/blocked_by") => Some((
+                    json!({}),
+                    "not written: G4 wrote such a relation with 201".to_owned(),
+                )),
+                _ => panic!("refusing to write {method} {at} while recording the drain"),
+            }
+        })
+        .amending(move |at, response| {
+            at.starts_with(&list).then(|| {
+                *response = json!([opened.clone()]);
+                "recorded, then #31 shown open with its label, as when its gesture was made"
+                    .to_owned()
+            })
+        })
+    }
+
+    #[test]
+    #[ignore = "records against the live GitHub API"]
+    fn record_github_drain_fixture() {
+        let recorder = drain_recorder();
+        let tracker = tracker(recorder.clone());
+        let outcome =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| check_drain(&tracker)));
+        recorder.write(
+            DRAIN,
+            &format!(
+                "{} on {SANDBOX}, recorded live, read-only: one list amended and the writes made \
+                 up (see `synthesized`)",
+                today()
+            ),
+        );
         if let Err(panic) = outcome {
             std::panic::resume_unwind(panic);
         }
