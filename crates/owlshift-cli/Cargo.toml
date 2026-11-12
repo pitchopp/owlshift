@@ -29,11 +29,16 @@ clap.workspace = true
 jiff.workspace = true
 # Hidden input for the secrets `owlshift init` asks for on a terminal.
 rpassword.workspace = true
+# `owlshift self-update` (OWL-541): the release's signature, its checksum,
+# its version, and the folder the archive is opened in.
+minisign-verify.workspace = true
+semver.workspace = true
+sha2.workspace = true
+tempfile.workspace = true
 
 [dev-dependencies]
 # Reads `owlshift doctor --json` (OWL-99).
 serde_json.workspace = true
-tempfile.workspace = true
 
 # Reads a process's state in the tests, with no `ps` (OWL-110).
 [target.'cfg(target_os = "macos")'.dev-dependencies]

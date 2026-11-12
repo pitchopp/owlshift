@@ -1,0 +1,481 @@
+{
+  "recorded": "2026-11-12 on pitchopp/owlshift-live-sandbox, recorded live, except the writes on issue #11, made up (see `synthesized`)",
+  "exchanges": [
+    {
+      "request": {
+        "body": null,
+        "method": "GET",
+        "path": "repos/pitchopp/owlshift-live-sandbox/issues/11"
+      },
+      "status": 200,
+      "response": {
+        "active_lock_reason": null,
+        "assignee": null,
+        "assignees": [],
+        "author_association": "OWNER",
+        "body": "Probe of OWL-532, closed by the script.",
+        "closed_at": "2026-11-12T15:25:05Z",
+        "closed_by": {
+          "id": 1,
+          "login": "person-1",
+          "type": "User"
+        },
+        "comments": 3,
+        "comments_url": "https://api.github.com/repos/pitchopp/owlshift-live-sandbox/issues/11/comments",
+        "created_at": "2026-11-12T15:23:06Z",
+        "events_url": "https://api.github.com/repos/pitchopp/owlshift-live-sandbox/issues/11/events",
+        "html_url": "https://github.com/pitchopp/owlshift-live-sandbox/issues/11",
+        "id": 6353004771,
+        "issue_dependencies_summary": {
+          "blocked_by": 0,
+          "blocking": 0,
+          "total_blocked_by": 0,
+          "total_blocking": 0
+        },
+        "issue_field_values": [],
+        "labels": [],
+        "labels_url": "https://api.github.com/repos/pitchopp/owlshift-live-sandbox/issues/11/labels{/name}",
+        "locked": false,
+        "milestone": null,
+        "node_id": "I_kwDOVFw-Bs8AAAABeqso4w",
+        "number": 11,
+        "performed_via_github_app": {
+          "client_id": "Iv23li5EhBqiuljIPbiK",
+          "created_at": "2026-10-19T21:59:44Z",
+          "description": "",
+          "events": [],
+          "external_url": "https://github.com/pitchopp/owlshift",
+          "html_url": "https://github.com/apps/owl-shift",
+          "id": 5387697,
+          "name": "owl-shift",
+          "node_id": "A_kwDOAXLW384AUjWx",
+          "owner": {
+            "id": 1,
+            "login": "person-1",
+            "type": "User"
+          },
+          "permissions": {
+            "actions": "write",
+            "checks": "read",
+            "contents": "write",
+            "issues": "write",
+            "metadata": "read",
+            "pull_requests": "write",
+            "statuses": "read"
+          },
+          "slug": "owl-shift",
+          "updated_at": "2026-11-12T15:21:23Z"
+        },
+        "pinned_comment": null,
+        "reactions": {
+          "+1": 0,
+          "-1": 0,
+          "confused": 0,
+          "eyes": 0,
+          "heart": 0,
+          "hooray": 0,
+          "laugh": 0,
+          "rocket": 0,
+          "total_count": 0,
+          "url": "https://api.github.com/repos/pitchopp/owlshift-live-sandbox/issues/11/reactions"
+        },
+        "repository_url": "https://api.github.com/repos/pitchopp/owlshift-live-sandbox",
+        "state": "closed",
+        "state_reason": "not_planned",
+        "sub_issues_summary": {
+          "completed": 0,
+          "percent_completed": 0,
+          "total": 0
+        },
+        "timeline_url": "https://api.github.com/repos/pitchopp/owlshift-live-sandbox/issues/11/timeline",
+        "title": "Owlshift live check: G1",
+        "type": null,
+        "updated_at": "2026-11-12T15:25:05Z",
+        "url": "https://api.github.com/repos/pitchopp/owlshift-live-sandbox/issues/11",
+        "user": {
+          "id": 1,
+          "login": "person-1",
+          "type": "User"
+        }
+      }
+    },
+    {
+      "request": {
+        "body": {
+          "labels": [
+            "agent:needs-input"
+          ]
+        },
+        "method": "POST",
+        "path": "repos/pitchopp/owlshift-live-sandbox/issues/11/labels"
+      },
+      "status": 200,
+      "response": [
+        {
+          "color": "ededed",
+          "default": false,
+          "name": "agent:needs-input"
+        }
+      ],
+      "synthesized": "not sent: GitHub answers the issue's labels"
+    },
+    {
+      "request": {
+        "body": null,
+        "method": "GET",
+        "path": "repos/pitchopp/owlshift-live-sandbox/issues/11"
+      },
+      "status": 200,
+      "response": {
+        "active_lock_reason": null,
+        "assignee": null,
+        "assignees": [],
+        "author_association": "OWNER",
+        "body": "Probe of OWL-532, closed by the script.",
+        "closed_at": "2026-11-12T15:25:05Z",
+        "closed_by": {
+          "id": 1,
+          "login": "person-1",
+          "type": "User"
+        },
+        "comments": 3,
+        "comments_url": "https://api.github.com/repos/pitchopp/owlshift-live-sandbox/issues/11/comments",
+        "created_at": "2026-11-12T15:23:06Z",
+        "events_url": "https://api.github.com/repos/pitchopp/owlshift-live-sandbox/issues/11/events",
+        "html_url": "https://github.com/pitchopp/owlshift-live-sandbox/issues/11",
+        "id": 6353004771,
+        "issue_dependencies_summary": {
+          "blocked_by": 0,
+          "blocking": 0,
+          "total_blocked_by": 0,
+          "total_blocking": 0
+        },
+        "issue_field_values": [],
+        "labels": [
+          {
+            "color": "ededed",
+            "default": false,
+            "name": "agent:needs-input"
+          }
+        ],
+        "labels_url": "https://api.github.com/repos/pitchopp/owlshift-live-sandbox/issues/11/labels{/name}",
+        "locked": false,
+        "milestone": null,
+        "node_id": "I_kwDOVFw-Bs8AAAABeqso4w",
+        "number": 11,
+        "performed_via_github_app": {
+          "client_id": "Iv23li5EhBqiuljIPbiK",
+          "created_at": "2026-10-19T21:59:44Z",
+          "description": "",
+          "events": [],
+          "external_url": "https://github.com/pitchopp/owlshift",
+          "html_url": "https://github.com/apps/owl-shift",
+          "id": 5387697,
+          "name": "owl-shift",
+          "node_id": "A_kwDOAXLW384AUjWx",
+          "owner": {
+            "id": 1,
+            "login": "person-1",
+            "type": "User"
+          },
+          "permissions": {
+            "actions": "write",
+            "checks": "read",
+            "contents": "write",
+            "issues": "write",
+            "metadata": "read",
+            "pull_requests": "write",
+            "statuses": "read"
+          },
+          "slug": "owl-shift",
+          "updated_at": "2026-11-12T15:21:23Z"
+        },
+        "pinned_comment": null,
+        "reactions": {
+          "+1": 0,
+          "-1": 0,
+          "confused": 0,
+          "eyes": 0,
+          "heart": 0,
+          "hooray": 0,
+          "laugh": 0,
+          "rocket": 0,
+          "total_count": 0,
+          "url": "https://api.github.com/repos/pitchopp/owlshift-live-sandbox/issues/11/reactions"
+        },
+        "repository_url": "https://api.github.com/repos/pitchopp/owlshift-live-sandbox",
+        "state": "closed",
+        "state_reason": "not_planned",
+        "sub_issues_summary": {
+          "completed": 0,
+          "percent_completed": 0,
+          "total": 0
+        },
+        "timeline_url": "https://api.github.com/repos/pitchopp/owlshift-live-sandbox/issues/11/timeline",
+        "title": "Owlshift live check: G1",
+        "type": null,
+        "updated_at": "2026-11-12T15:25:05Z",
+        "url": "https://api.github.com/repos/pitchopp/owlshift-live-sandbox/issues/11",
+        "user": {
+          "id": 1,
+          "login": "person-1",
+          "type": "User"
+        }
+      },
+      "synthesized": "recorded, with the labels made up since"
+    },
+    {
+      "request": {
+        "body": {
+          "labels": [
+            "agent:in-progress"
+          ]
+        },
+        "method": "POST",
+        "path": "repos/pitchopp/owlshift-live-sandbox/issues/11/labels"
+      },
+      "status": 200,
+      "response": [
+        {
+          "color": "ededed",
+          "default": false,
+          "name": "agent:needs-input"
+        },
+        {
+          "color": "ededed",
+          "default": false,
+          "name": "agent:in-progress"
+        }
+      ],
+      "synthesized": "not sent: GitHub answers the issue's labels"
+    },
+    {
+      "request": {
+        "body": null,
+        "method": "DELETE",
+        "path": "repos/pitchopp/owlshift-live-sandbox/issues/11/labels/agent%3Aneeds-input"
+      },
+      "status": 200,
+      "response": [
+        {
+          "color": "ededed",
+          "default": false,
+          "name": "agent:in-progress"
+        }
+      ],
+      "synthesized": "not sent: GitHub answers the issue's labels"
+    },
+    {
+      "request": {
+        "body": null,
+        "method": "GET",
+        "path": "repos/pitchopp/owlshift-live-sandbox/issues/9999"
+      },
+      "status": 404,
+      "response": {
+        "documentation_url": "https://docs.github.com/rest/issues/issues#get-an-issue",
+        "message": "Not Found",
+        "status": "404"
+      }
+    },
+    {
+      "request": {
+        "body": null,
+        "method": "GET",
+        "path": "repos/pitchopp/owlshift-live-sandbox/issues/11"
+      },
+      "status": 200,
+      "response": {
+        "active_lock_reason": null,
+        "assignee": null,
+        "assignees": [],
+        "author_association": "OWNER",
+        "body": "Probe of OWL-532, closed by the script.",
+        "closed_at": "2026-11-12T15:25:05Z",
+        "closed_by": {
+          "id": 1,
+          "login": "person-1",
+          "type": "User"
+        },
+        "comments": 3,
+        "comments_url": "https://api.github.com/repos/pitchopp/owlshift-live-sandbox/issues/11/comments",
+        "created_at": "2026-11-12T15:23:06Z",
+        "events_url": "https://api.github.com/repos/pitchopp/owlshift-live-sandbox/issues/11/events",
+        "html_url": "https://github.com/pitchopp/owlshift-live-sandbox/issues/11",
+        "id": 6353004771,
+        "issue_dependencies_summary": {
+          "blocked_by": 0,
+          "blocking": 0,
+          "total_blocked_by": 0,
+          "total_blocking": 0
+        },
+        "issue_field_values": [],
+        "labels": [
+          {
+            "color": "ededed",
+            "default": false,
+            "name": "agent:in-progress"
+          }
+        ],
+        "labels_url": "https://api.github.com/repos/pitchopp/owlshift-live-sandbox/issues/11/labels{/name}",
+        "locked": false,
+        "milestone": null,
+        "node_id": "I_kwDOVFw-Bs8AAAABeqso4w",
+        "number": 11,
+        "performed_via_github_app": {
+          "client_id": "Iv23li5EhBqiuljIPbiK",
+          "created_at": "2026-10-19T21:59:44Z",
+          "description": "",
+          "events": [],
+          "external_url": "https://github.com/pitchopp/owlshift",
+          "html_url": "https://github.com/apps/owl-shift",
+          "id": 5387697,
+          "name": "owl-shift",
+          "node_id": "A_kwDOAXLW384AUjWx",
+          "owner": {
+            "id": 1,
+            "login": "person-1",
+            "type": "User"
+          },
+          "permissions": {
+            "actions": "write",
+            "checks": "read",
+            "contents": "write",
+            "issues": "write",
+            "metadata": "read",
+            "pull_requests": "write",
+            "statuses": "read"
+          },
+          "slug": "owl-shift",
+          "updated_at": "2026-11-12T15:21:23Z"
+        },
+        "pinned_comment": null,
+        "reactions": {
+          "+1": 0,
+          "-1": 0,
+          "confused": 0,
+          "eyes": 0,
+          "heart": 0,
+          "hooray": 0,
+          "laugh": 0,
+          "rocket": 0,
+          "total_count": 0,
+          "url": "https://api.github.com/repos/pitchopp/owlshift-live-sandbox/issues/11/reactions"
+        },
+        "repository_url": "https://api.github.com/repos/pitchopp/owlshift-live-sandbox",
+        "state": "closed",
+        "state_reason": "not_planned",
+        "sub_issues_summary": {
+          "completed": 0,
+          "percent_completed": 0,
+          "total": 0
+        },
+        "timeline_url": "https://api.github.com/repos/pitchopp/owlshift-live-sandbox/issues/11/timeline",
+        "title": "Owlshift live check: G1",
+        "type": null,
+        "updated_at": "2026-11-12T15:25:05Z",
+        "url": "https://api.github.com/repos/pitchopp/owlshift-live-sandbox/issues/11",
+        "user": {
+          "id": 1,
+          "login": "person-1",
+          "type": "User"
+        }
+      },
+      "synthesized": "recorded, with the labels made up since"
+    },
+    {
+      "request": {
+        "body": null,
+        "method": "GET",
+        "path": "repos/pitchopp/owlshift-live-sandbox/issues/18"
+      },
+      "status": 200,
+      "response": {
+        "active_lock_reason": null,
+        "assignee": null,
+        "assignees": [],
+        "author_association": "OWNER",
+        "body": "Probe of OWL-532.\n\nCloses #17",
+        "closed_at": "2026-11-12T15:24:18Z",
+        "closed_by": {
+          "id": 1,
+          "login": "person-1",
+          "type": "User"
+        },
+        "comments": 0,
+        "comments_url": "https://api.github.com/repos/pitchopp/owlshift-live-sandbox/issues/18/comments",
+        "created_at": "2026-11-12T15:24:11Z",
+        "draft": false,
+        "events_url": "https://api.github.com/repos/pitchopp/owlshift-live-sandbox/issues/18/events",
+        "html_url": "https://github.com/pitchopp/owlshift-live-sandbox/pull/18",
+        "id": 6353026725,
+        "issue_field_values": [],
+        "labels": [],
+        "labels_url": "https://api.github.com/repos/pitchopp/owlshift-live-sandbox/issues/18/labels{/name}",
+        "locked": false,
+        "milestone": null,
+        "node_id": "PR_kwDOVFw-Bs8AAAABOrhKew",
+        "number": 18,
+        "performed_via_github_app": {
+          "client_id": "Iv23li5EhBqiuljIPbiK",
+          "created_at": "2026-10-19T21:59:44Z",
+          "description": "",
+          "events": [],
+          "external_url": "https://github.com/pitchopp/owlshift",
+          "html_url": "https://github.com/apps/owl-shift",
+          "id": 5387697,
+          "name": "owl-shift",
+          "node_id": "A_kwDOAXLW384AUjWx",
+          "owner": {
+            "id": 1,
+            "login": "person-1",
+            "type": "User"
+          },
+          "permissions": {
+            "actions": "write",
+            "checks": "read",
+            "contents": "write",
+            "issues": "write",
+            "metadata": "read",
+            "pull_requests": "write",
+            "statuses": "read"
+          },
+          "slug": "owl-shift",
+          "updated_at": "2026-11-12T15:21:23Z"
+        },
+        "pull_request": {
+          "diff_url": "https://github.com/pitchopp/owlshift-live-sandbox/pull/18.diff",
+          "html_url": "https://github.com/pitchopp/owlshift-live-sandbox/pull/18",
+          "merged_at": "2026-11-12T15:24:18Z",
+          "patch_url": "https://github.com/pitchopp/owlshift-live-sandbox/pull/18.patch",
+          "url": "https://api.github.com/repos/pitchopp/owlshift-live-sandbox/pulls/18"
+        },
+        "reactions": {
+          "+1": 0,
+          "-1": 0,
+          "confused": 0,
+          "eyes": 0,
+          "heart": 0,
+          "hooray": 0,
+          "laugh": 0,
+          "rocket": 0,
+          "total_count": 0,
+          "url": "https://api.github.com/repos/pitchopp/owlshift-live-sandbox/issues/18/reactions"
+        },
+        "repository_url": "https://api.github.com/repos/pitchopp/owlshift-live-sandbox",
+        "state": "closed",
+        "state_reason": null,
+        "timeline_url": "https://api.github.com/repos/pitchopp/owlshift-live-sandbox/issues/18/timeline",
+        "title": "Owlshift live check G5",
+        "type": null,
+        "updated_at": "2026-11-12T15:25:30Z",
+        "url": "https://api.github.com/repos/pitchopp/owlshift-live-sandbox/issues/18",
+        "user": {
+          "id": 1,
+          "login": "person-1",
+          "type": "User"
+        }
+      }
+    }
+  ]
+}
