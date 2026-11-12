@@ -676,3 +676,47 @@ impl fmt::Display for Error {
 }
 
 impl std::error::Error for Error {}
+
+#[cfg(test)]
+mod tests {
+    use super::Capability;
+
+    /// The number of variants of [`Capability`].
+    const VARIANTS: usize = 11;
+
+    /// A distinct index per capability. The match is exhaustive and has no
+    /// wildcard: a variant added to the enum does not compile here until it
+    /// is given the next index.
+    fn index(capability: Capability) -> usize {
+        match capability {
+            Capability::ReadTicket => 0,
+            Capability::ListAdmitted => 1,
+            Capability::Comments => 2,
+            Capability::VisibleStage => 3,
+            Capability::BlockedBy => 4,
+            Capability::ProposalsInbox => 5,
+            Capability::Documents => 6,
+            Capability::FoldComments => 7,
+            Capability::Reactions => 8,
+            Capability::AgentIdentity => 9,
+            Capability::Webhooks => 10,
+        }
+    }
+
+    /// `Capability::ALL` is kept by hand: the conformance suite walks it to
+    /// find a capability without a check, so one missing from it would escape.
+    #[test]
+    fn all_holds_every_capability_once() {
+        assert_eq!(Capability::ALL.len(), VARIANTS);
+        let mut seen = [0_usize; VARIANTS];
+        for capability in Capability::ALL {
+            let at = index(capability);
+            assert!(at < VARIANTS, "{capability:?} has the index {at}");
+            seen[at] += 1;
+        }
+        assert_eq!(
+            seen, [1; VARIANTS],
+            "a capability is missing from ALL or listed twice"
+        );
+    }
+}

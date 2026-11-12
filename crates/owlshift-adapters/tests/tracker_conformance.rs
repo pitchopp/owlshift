@@ -39,6 +39,123 @@ fn id(id: &str) -> TicketId {
     TicketId::new(id).unwrap()
 }
 
+/// One shared check. A capability is covered by the checks [`check_of`]
+/// names for it, and an adapter that declares the capability must have a
+/// case for each of them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Check {
+    /// Reading a ticket and its comments, and posting a comment.
+    Read,
+    /// Moving and reading the visible stage.
+    Stage,
+    /// Listing the admitted tickets and reading who admitted them.
+    Admitted,
+    /// The state type, the relations and the `blocked_by` write.
+    Blocked,
+    /// The links an intake brief reads.
+    Links,
+    /// Filing a proposal and finding it again.
+    Proposals,
+    /// Publishing and updating a document.
+    Documents,
+    /// Resolving a comment.
+    Folding,
+    /// Reading a comment's reactions.
+    Reactions,
+    /// A capability with no trait method: no adapter may declare it.
+    Undeclared,
+}
+
+/// The checks that cover a capability. The match is exhaustive and has no
+/// wildcard, so a capability added to the trait does not compile here until
+/// it is given a check.
+fn check_of(capability: Capability) -> &'static [Check] {
+    match capability {
+        Capability::ReadTicket | Capability::Comments => &[Check::Read],
+        Capability::VisibleStage => &[Check::Stage],
+        Capability::ListAdmitted => &[Check::Admitted],
+        // Both halves: an adapter cannot satisfy it with the relations alone.
+        Capability::BlockedBy => &[Check::Blocked, Check::Links],
+        Capability::ProposalsInbox => &[Check::Proposals],
+        Capability::Documents => &[Check::Documents],
+        Capability::FoldComments => &[Check::Folding],
+        Capability::Reactions => &[Check::Reactions],
+        Capability::AgentIdentity | Capability::Webhooks => &[Check::Undeclared],
+    }
+}
+
+/// An adapter under test: what it declares and one case per check it runs.
+/// `declared` is the adapter's own `CAPABILITIES`, so the registry cannot
+/// drift from what the adapter says it does. A case builds its own world
+/// and transport, calls the shared check and, where it replays a recording,
+/// ends by asserting that every recorded exchange was used.
+struct Adapter {
+    name: &'static str,
+    declared: &'static [Capability],
+    cases: Vec<(Check, Box<dyn Fn()>)>,
+}
+
+impl Adapter {
+    fn new(name: &'static str, declared: &'static [Capability]) -> Self {
+        Self {
+            name,
+            declared,
+            cases: Vec::new(),
+        }
+    }
+
+    fn case(mut self, check: Check, case: impl Fn() + 'static) -> Self {
+        self.cases.push((check, Box::new(case)));
+        self
+    }
+}
+
+/// Runs every case of the adapter.
+fn run(adapter: &Adapter) {
+    for (check, case) in &adapter.cases {
+        eprintln!("{}: the {check:?} check", adapter.name);
+        case();
+    }
+}
+
+/// Runs the cases of one check, and fails if the adapter has none.
+fn run_check(adapter: &Adapter, wanted: Check) {
+    let mut ran = false;
+    for (check, case) in &adapter.cases {
+        if *check == wanted {
+            eprintln!("{}: the {check:?} check", adapter.name);
+            case();
+            ran = true;
+        }
+    }
+    assert!(ran, "{} has no {wanted:?} case", adapter.name);
+}
+
+/// The capabilities the adapter declares for which a check has no case.
+fn missing_cases(adapter: &Adapter) -> Vec<Capability> {
+    adapter
+        .declared
+        .iter()
+        .copied()
+        .filter(|capability| {
+            check_of(*capability)
+                .iter()
+                .any(|check| !adapter.cases.iter().any(|(have, _)| have == check))
+        })
+        .collect()
+}
+
+#[test]
+fn a_declared_capability_without_a_case_is_reported() {
+    let none = Adapter::new("none", &[Capability::FoldComments]);
+    assert_eq!(missing_cases(&none), [Capability::FoldComments]);
+    // BlockedBy needs both halves.
+    let half = Adapter::new("half", &[Capability::BlockedBy]).case(Check::Blocked, || {});
+    assert_eq!(missing_cases(&half), [Capability::BlockedBy]);
+    let whole = half.case(Check::Links, || {});
+    assert!(missing_cases(&whole).is_empty());
+}
+
 /// Runs the whole suite. The calls are always made in the same order, which
 /// is the order of the recorded Linear exchanges.
 fn check(tracker: &dyn Tracker, case: &Case) {
@@ -134,8 +251,9 @@ fn check_stage(
 const BODY: &str = "[owlshift] OWL-13 conformance check: a comment posted by the Linear \
                     adapter's fixture recorder · safe to delete.\n\nSecond line.";
 
-#[test]
-fn the_markdown_tracker_conforms() {
+/// A fresh Markdown tracker over a temporary tree holding `DEMO-1`, with two
+/// comments. Each case builds its own, so no check depends on another.
+fn markdown_world() -> (tempfile::TempDir, MarkdownTracker) {
     let root = tempfile::tempdir().unwrap();
     let dir = root.path().join("tickets/DEMO-1");
     fs::create_dir_all(dir.join("comments")).unwrap();
@@ -156,8 +274,12 @@ fn the_markdown_tracker_conforms() {
         "Second.\n",
     )
     .unwrap();
+    let tracker = MarkdownTracker::new(root.path());
+    (root, tracker)
+}
 
-    let case = Case {
+fn markdown_case() -> Case {
+    Case {
         existing: id("DEMO-1"),
         title: "Add a greeting",
         description_start: "Say hello",
@@ -167,25 +289,42 @@ fn the_markdown_tracker_conforms() {
         labels: &["Feature", "Docs"],
         missing: id("DEMO-404"),
         body: BODY,
-    };
-    let tracker = MarkdownTracker::new(root.path());
-    check(&tracker, &case);
-    check_stage(
-        &tracker,
-        &case.existing,
-        &case.missing,
-        "Needs Input",
-        "In Progress",
-    );
-    assert_eq!(tracker.ticket(&case.existing).unwrap().stage, "In Progress");
-    let maintainer = Person {
-        id: "maintainer".to_owned(),
-        name: "maintainer".to_owned(),
-    };
-    assert_eq!(
-        Tracker::ticket(&tracker, &case.existing).unwrap().assignee,
-        Some(maintainer)
-    );
+    }
+}
+
+/// The Markdown tracker, on a tree of files built for each case.
+fn markdown() -> Adapter {
+    Adapter::new("the Markdown tracker", MarkdownTracker::CAPABILITIES)
+        .case(Check::Read, || {
+            let (_world, tracker) = markdown_world();
+            let case = markdown_case();
+            check(&tracker, &case);
+            let maintainer = Person {
+                id: "maintainer".to_owned(),
+                name: "maintainer".to_owned(),
+            };
+            assert_eq!(
+                Tracker::ticket(&tracker, &case.existing).unwrap().assignee,
+                Some(maintainer)
+            );
+        })
+        .case(Check::Stage, || {
+            let (_world, tracker) = markdown_world();
+            let case = markdown_case();
+            check_stage(
+                &tracker,
+                &case.existing,
+                &case.missing,
+                "Needs Input",
+                "In Progress",
+            );
+            assert_eq!(tracker.ticket(&case.existing).unwrap().stage, "In Progress");
+        })
+}
+
+#[test]
+fn the_markdown_tracker_conforms() {
+    run(&markdown());
 }
 
 fn linear_case() -> Case {
@@ -206,14 +345,38 @@ fn linear_case() -> Case {
 
 const LINEAR_FIXTURE: &str = "conformance.json";
 
+/// The ticket the stage fixture moves, from In Progress to Needs Input and
+/// back: the issue of the change that recorded it.
+const STAGE_TICKET: &str = "OWL-137";
+const STAGE_FIXTURE: &str = "stage-owl-137.json";
+
+/// Linear, on its recorded exchanges.
+fn linear() -> Adapter {
+    Adapter::new("Linear", LinearTracker::CAPABILITIES)
+        .case(Check::Read, || {
+            let replay = Replay::new(LINEAR_FIXTURE);
+            check(
+                &LinearTracker::with_transport(replay.clone()),
+                &linear_case(),
+            );
+            replay.assert_done();
+        })
+        .case(Check::Stage, || {
+            let replay = Replay::new(STAGE_FIXTURE);
+            check_stage(
+                &LinearTracker::with_transport(replay.clone()),
+                &id(STAGE_TICKET),
+                &linear_case().missing,
+                "Needs Input",
+                "In Progress",
+            );
+            replay.assert_done();
+        })
+}
+
 #[test]
 fn the_linear_tracker_conforms() {
-    let replay = Replay::new(LINEAR_FIXTURE);
-    check(
-        &LinearTracker::with_transport(replay.clone()),
-        &linear_case(),
-    );
-    replay.assert_done();
+    run(&linear());
 }
 
 /// Records the Linear conformance fixture by running the suite against the
@@ -251,22 +414,9 @@ fn record_conformance_fixture() {
     }
 }
 
-/// The ticket the stage fixture moves, from In Progress to Needs Input and
-/// back: the issue of the change that recorded it.
-const STAGE_TICKET: &str = "OWL-137";
-const STAGE_FIXTURE: &str = "stage-owl-137.json";
-
 #[test]
 fn the_linear_tracker_moves_the_visible_stage() {
-    let replay = Replay::new(STAGE_FIXTURE);
-    check_stage(
-        &LinearTracker::with_transport(replay.clone()),
-        &id(STAGE_TICKET),
-        &linear_case().missing,
-        "Needs Input",
-        "In Progress",
-    );
-    replay.assert_done();
+    run_check(&linear(), Check::Stage);
 }
 
 /// Records the stage fixture against the live API. It writes to Linear:
@@ -418,7 +568,7 @@ mod github {
     use owlshift_contracts::config;
 
     use super::support::{self, Recorder, Replay};
-    use super::{BODY, Case, check, check_stage, id, today};
+    use super::{Adapter, BODY, Case, Check, check, check_stage, id, run, run_check, today};
 
     const SANDBOX: &str = "pitchopp/owlshift-live-sandbox";
     /// Issue #11, G1's: three comments, two of them in one second (G2).
@@ -483,21 +633,35 @@ mod github {
         assert_eq!(pull.kind, ErrorKind::NotFound, "{pull}");
     }
 
+    /// GitHub Issues, on its recorded exchanges. It declares ReadTicket,
+    /// Comments and VisibleStage today: the cases of the capabilities that
+    /// arrive with the drain's ticket (OWL-536) are added with them, and
+    /// `every_declared_capability_has_a_case` fails until they are.
+    pub fn adapter() -> Adapter {
+        Adapter::new("GitHub Issues", GitHubTracker::CAPABILITIES)
+            .case(Check::Read, || {
+                let replay = Replay::of(&dir(), CONFORMANCE);
+                check(&tracker(replay.clone()), &case());
+                replay.assert_done();
+            })
+            .case(Check::Stage, || {
+                let replay = Replay::of(&dir(), STAGE);
+                let tracker = tracker(replay.clone());
+                let case = case();
+                check_stage(&tracker, &case.existing, &case.missing, THERE, BACK);
+                check_reads(&tracker);
+                replay.assert_done();
+            })
+    }
+
     #[test]
     fn the_github_tracker_conforms() {
-        let replay = Replay::of(&dir(), CONFORMANCE);
-        check(&tracker(replay.clone()), &case());
-        replay.assert_done();
+        run(&adapter());
     }
 
     #[test]
     fn the_github_tracker_moves_the_visible_stage() {
-        let replay = Replay::of(&dir(), STAGE);
-        let tracker = tracker(replay.clone());
-        let case = case();
-        check_stage(&tracker, &case.existing, &case.missing, THERE, BACK);
-        check_reads(&tracker);
-        replay.assert_done();
+        run_check(&adapter(), Check::Stage);
     }
 
     /// No GitHub account of a recording is a real one: each user object is
