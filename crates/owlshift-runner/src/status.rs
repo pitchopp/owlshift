@@ -781,7 +781,7 @@ pub fn parts(report: &Report, tz: &TimeZone, voice: Voice) -> Vec<(Part, String)
     if let Some(request) = &report.machine_pause {
         let lifts = match voice {
             Voice::Terminal => "`owlshift resume` lifts it.",
-            Voice::Ui => "its Resume button lifts it.",
+            Voice::Ui => "the machine's Resume button lifts it.",
         };
         line(
             Part::MachinePause,
@@ -1250,7 +1250,7 @@ mod tests {
         );
         assert!(
             ui_machine.ends_with(
-                ": travelling. Nothing is dispatched and no step starts; its Resume button lifts it."
+                ": travelling. Nothing is dispatched and no step starts; the machine's Resume button lifts it."
             ),
             "{ui_machine}"
         );

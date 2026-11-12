@@ -124,7 +124,7 @@ pub fn resume(data: &Path, target: Option<&Repo>, voice: Voice) -> Result<Vec<St
                         "Every project of this machine is still paused: `owlshift resume` lifts that."
                     }
                     Voice::Ui => {
-                        "Every project of this machine is still paused: its Resume button lifts that."
+                        "Every project of this machine is still paused: the machine's Resume button lifts that."
                     }
                 }
                 .to_owned());
@@ -323,7 +323,7 @@ mod tests {
         assert_eq!(lines.len(), 2, "{lines:?}");
         assert_eq!(
             lines[1],
-            "Every project of this machine is still paused: its Resume button lifts that."
+            "Every project of this machine is still paused: the machine's Resume button lifts that."
         );
         requests::ask_pause(data.path(), Some(&dirs), &machine).unwrap();
         let lines = resume(data.path(), None, Voice::Ui).unwrap();

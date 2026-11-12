@@ -3768,7 +3768,7 @@ fn pause_and_resume_write_the_commands_files_by_ui() {
     assert!(said[0].starts_with("o/r's pause is lifted (it was by ui at "));
     assert_eq!(
         said[1],
-        "Every project of this machine is still paused: its Resume button lifts that."
+        "Every project of this machine is still paused: the machine's Resume button lifts that."
     );
     assert!(
         said.iter().all(|line| !line.contains("owlshift resume")),

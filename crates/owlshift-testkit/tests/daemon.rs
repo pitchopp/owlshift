@@ -1702,7 +1702,10 @@ fn the_real_ui_answers_what_the_commands_print_for_the_bench() {
     );
     // The real UI names its Resume button for the machine's pause, not the
     // command (OWL-529): the Orchestrator passes the UI's voice.
-    assert!(text.contains("its Resume button lifts it."), "{text}");
+    assert!(
+        text.contains("the machine's Resume button lifts it."),
+        "{text}"
+    );
     assert!(!text.contains("owlshift resume"), "{text}");
     assert!(
         text.contains("quarantined: Run r1 of OWL-1 broke isolation"),
