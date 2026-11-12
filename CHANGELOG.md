@@ -8,7 +8,7 @@ The first release. Owlshift works a team's existing backlog with coding agents, 
 
 ### Install
 
-- macOS, Apple silicon and Intel: `brew tap pitchopp/owlshift https://github.com/pitchopp/owlshift`, `brew trust --formula pitchopp/owlshift/owlshift` (Homebrew 7 loads no formula of a tap it was not told to trust), then `brew install owlshift`. The archive of the release can also be downloaded with `curl` and unpacked by hand.
+- macOS, Apple silicon and Intel: `brew tap pitchopp/owlshift https://github.com/pitchopp/owlshift`, `brew trust --formula pitchopp/owlshift/owlshift` (Homebrew loads no formula of a tap it was not told to trust), then `brew install owlshift`. The archive of the release can also be downloaded with `curl` and unpacked by hand.
 - Linux, x86_64 and arm64, as static binaries: `curl -fsSL https://raw.githubusercontent.com/pitchopp/owlshift/main/install.sh | sh`. The script checks the archive against the release's `SHA256SUMS` before it installs `owlshift` in `~/.local/bin`.
 - Each release holds one archive per target, `owlshift-<version>-<target>.tar.gz`, their `SHA256SUMS`, and `SHA256SUMS.minisig`, its signature with Owlshift's own key: check it with `minisign -Vm SHA256SUMS -p minisign.pub`, the public key at the repository's root.
 - Prerequisites: git 2.39.0 or later, and Claude Code installed. `owlshift doctor` says what is missing and how to fix it.
