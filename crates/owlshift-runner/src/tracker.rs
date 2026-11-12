@@ -95,6 +95,15 @@ pub trait Kind: Sync {
         config: &ProjectConfig,
         facts: Option<&Result<AdmissionFacts, StatesError>>,
     ) -> Option<Check>;
+
+    /// The operator's key that the UI posts a decider's reply through, for
+    /// the project of `repo`, opened with its account read once
+    /// ([`crate::ui::reply::open_key`]); the error says why there is none.
+    fn reply_key(&self, repo: &Repo) -> Result<crate::ui::reply::Key, String>;
+
+    /// Whether `owlshift init` stores the client ID and secret of an app the
+    /// tracker writes as (OWL-157).
+    fn stores_app(&self) -> bool;
 }
 
 /// The kind of the tracker a project file names: the one place the runner

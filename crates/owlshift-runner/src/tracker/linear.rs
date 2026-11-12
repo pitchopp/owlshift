@@ -4,19 +4,21 @@
 
 use std::path::Path;
 
+use owlshift_adapters::forge::Repo;
 use owlshift_adapters::tracker::linear::{
-    AdmissionFacts, AppUser, LinearTracker, StateMismatch, find_state,
+    AdmissionFacts, ApiKey, AppUser, LinearTracker, StateMismatch, find_state,
 };
 use owlshift_adapters::tracker::{Capability, ErrorKind, PROPOSED_LABEL, Tracker};
 use owlshift_contracts::config::{self, Admit, ProjectConfig};
 use owlshift_contracts::ids::TicketId;
-use owlshift_platform::keychain::{SERVICE, Secret};
+use owlshift_platform::keychain::{Keychain, SERVICE, Secret};
 
 use super::{AppError, Kind, Opener, Probe, Probed, StatesError};
 use crate::doctor::{Check, DOES_NOT_BLOCK, KEYCHAIN_FIX, Section, Step, configured_states};
 use crate::init::{LINEAR_KEY, SecretSpec};
 use crate::secrets::{Source, TrackerAccounts, TrackerSecrets};
 use crate::system::System;
+use crate::ui::reply::Key;
 
 pub struct Linear;
 
@@ -115,6 +117,39 @@ team = {}
         facts: Option<&Result<AdmissionFacts, StatesError>>,
     ) -> Option<Check> {
         proposals_inbox_check(config, facts)
+    }
+
+    /// The key `owlshift init` stored for the project of `repo`, its own
+    /// accounts or the shared ones ([`crate::secrets::tracker`]), read from
+    /// the system keychain. The Linear app's pair is never used: a reply goes
+    /// through the key, whose account is the operator's.
+    fn reply_key(&self, repo: &Repo) -> Result<Key, String> {
+        let keychain =
+            Keychain::system().map_err(|e| format!("the keychain cannot be read: {e}"))?;
+        let mut look = |account: &str| keychain.read(account).map_err(|e| e.to_string());
+        let found = crate::secrets::tracker(repo, &mut look)?;
+        let Some(key) = found.key else {
+            return Err(format!(
+                "no Linear API key is stored for this project (account `{}`): run `owlshift init`",
+                found.accounts.key
+            ));
+        };
+        let tracker = LinearTracker::new(ApiKey::new(key.expose()));
+        let account = tracker
+            .key_account()
+            .map_err(|e| format!("the Linear key's account could not be read: {e}"))?;
+        let reader = LinearTracker::new(ApiKey::new(key.expose()));
+        Ok(Key {
+            account,
+            tracker: Box::new(tracker),
+            names: Box::new(move |id: &str| reader.account_name(id).map_err(|e| e.to_string())),
+        })
+    }
+
+    /// The app Owlshift writes as, so that Linear notifies the decider
+    /// (decision D8).
+    fn stores_app(&self) -> bool {
+        true
     }
 }
 

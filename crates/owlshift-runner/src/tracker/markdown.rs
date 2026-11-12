@@ -4,6 +4,7 @@
 
 use std::path::Path;
 
+use owlshift_adapters::forge::Repo;
 use owlshift_adapters::tracker::linear::AdmissionFacts;
 use owlshift_adapters::tracker::markdown::MarkdownTracker;
 use owlshift_adapters::tracker::{Capability, Tracker};
@@ -16,6 +17,7 @@ use crate::doctor::{Check, DOES_NOT_BLOCK, Section};
 use crate::init::SecretSpec;
 use crate::secrets::{TrackerAccounts, TrackerSecrets};
 use crate::system::System;
+use crate::ui::reply::Key;
 
 pub struct Markdown;
 
@@ -107,5 +109,16 @@ kind = \"markdown\"
                 format!("proposals are filed as tickets at the stage {triage:?}"),
             )
         })
+    }
+
+    fn reply_key(&self, _repo: &Repo) -> Result<Key, String> {
+        Err(
+            "the project's tracker is not Linear: a reply from the UI goes through a Linear key"
+                .into(),
+        )
+    }
+
+    fn stores_app(&self) -> bool {
+        false
     }
 }

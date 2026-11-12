@@ -186,8 +186,8 @@ pub fn run(args: &Args, config: &Effective) -> ExitCode {
         Err(error) => return fail(&error.to_string()),
     };
     // The Linear app goes with the project's own key (OWL-308).
-    let app_ready = match (tracker, &repo) {
-        (TrackerKind::Linear, Ok(repo)) => linear_app(
+    let app_ready = match &repo {
+        Ok(repo) if tracker::of(tracker).stores_app() => linear_app(
             &keychain,
             &TrackerAccounts::project(repo),
             args.replace_secrets,
