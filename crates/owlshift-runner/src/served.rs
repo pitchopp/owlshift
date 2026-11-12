@@ -377,13 +377,13 @@ fn check(effective: &Effective) -> Result<&ProjectConfig, String> {
 /// registered, and a watch in a checkout, are judged as they were.
 pub fn served_refusal(config: &ProjectConfig) -> Option<String> {
     if config.tracker.kind == TrackerKind::Markdown {
-        return Some(
+        return Some(format!(
             "the Markdown tracker serves one machine and is not served by the daemon: its \
              tickets are files in your checkout, which the daemon does not read. Run \
              `owlshift do TICKET` or `owlshift continue TICKET` in that checkout instead (see \
-             docs/markdown-tracker.md)"
-                .to_owned(),
-        );
+             {})",
+            crate::init::MARKDOWN_PAGE
+        ));
     }
     watch::drain_refusal(config)
 }

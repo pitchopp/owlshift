@@ -520,8 +520,6 @@ fn report_detection(options: &InitOptions) {
     }
 }
 
-/// The last lines of a successful `init`: the gate line is last. A run that
-/// fails before here (a secret missing or refused) ends with its own error.
 /// Writes the first ticket of a new Markdown project and says what to do
 /// with it, and what the tracker cannot do. Nothing is committed.
 fn report_example(root: &std::path::Path) {
@@ -542,6 +540,8 @@ fn report_example(root: &std::path::Path) {
     println!("{MARKDOWN_LIMITS} Format: {MARKDOWN_PAGE}");
 }
 
+/// The last lines of a successful `init`: the gate line is last. A run that
+/// fails before here (a secret missing or refused) ends with its own error.
 fn next_steps() -> ExitCode {
     println!(
         "Next: `owlshift doctor` checks git, the harnesses and the Claude Code token for agent runs; `owlshift do TICKET` runs \
