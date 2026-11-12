@@ -18,9 +18,12 @@ name: Release
 # OWL-540 on 2026-11-12 (Q1, with the environment and its secret), as the
 # CI-settings floor of architecture section 8 requires.
 
+# OWL-540 PROBE, never merged: runs on pushes of branch owl-540-probe as
+# if v0.1.0 were pushed, makes a draft (no tag is created), and runs live
+# checks R1 and R2 on the archives.
 on:
   push:
-    tags: ['v*']
+    branches: [owl-540-probe]
 
 permissions:
   contents: read
@@ -31,7 +34,7 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
-  TAG: ${{ github.ref_name }}
+  TAG: v0.1.0
 
 jobs:
   version:
@@ -49,12 +52,6 @@ jobs:
         run: |
           version=$(sh scripts/release/version.sh "$TAG")
           echo "version=$version" >> "$GITHUB_OUTPUT"
-      - name: Require a commit of main
-        run: |
-          if ! git merge-base --is-ancestor "$GITHUB_SHA" origin/main; then
-            echo "::error::$TAG names $GITHUB_SHA, which is not a commit of main: tag a commit of main"
-            exit 1
-          fi
 
   build:
     name: build (${{ matrix.target }})
@@ -195,7 +192,7 @@ jobs:
           trap 'rm -f "$key"' EXIT
           (umask 077 && printf '%s\n' "$MINISIGN_SECRET_KEY" > "$key")
           printf '%s\n' "$SUMS" > SHA256SUMS
-          if ! minisign -S -s "$key" -m SHA256SUMS -t "owlshift $VERSION" < /dev/null; then
+          if ! minisign -S -s "$key" -m SHA256SUMS -t "owlshift $VERSION probe, not a release" < /dev/null; then
             echo "::error::minisign could not sign with MINISIGN_SECRET_KEY, which must be a key made without a password (minisign -G -W)"
             exit 1
           fi
@@ -223,13 +220,6 @@ jobs:
           persist-credentials: false
       # The run may have waited hours for the environment's reviewer: the
       # release's tag must still name the commit its archives were built from.
-      - name: Require the tag to name the commit built
-        run: |
-          tagged=$(gh api "repos/$GITHUB_REPOSITORY/commits/$TAG" --jq .sha)
-          if [ "$tagged" != "$GITHUB_SHA" ]; then
-            echo "::error::$TAG now names $tagged, not $GITHUB_SHA, the commit built"
-            exit 1
-          fi
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           path: dist
@@ -268,6 +258,97 @@ jobs:
           } > "$RUNNER_TEMP/notes.md"
       - name: Create the draft release
         run: |
-          gh release create "$TAG" -R "$GITHUB_REPOSITORY" --draft --verify-tag \
+          gh release create "$TAG" -R "$GITHUB_REPOSITORY" --draft --target "$GITHUB_SHA" \
             --title "Owlshift $VERSION" --notes-file "$RUNNER_TEMP/notes.md" \
             dist/*.tar.gz dist/SHA256SUMS dist/SHA256SUMS.minisig
+
+  r1:
+    name: R1 (${{ matrix.target }} on ${{ matrix.os }})
+    needs: [version, checksums]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: aarch64-apple-darwin
+            os: macos-latest
+          - target: x86_64-apple-darwin
+            os: macos-15-intel
+    runs-on: ${{ matrix.os }}
+    env:
+      SUMS: ${{ needs.checksums.outputs.sums }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          path: release
+          pattern: owlshift-*-apple-darwin
+          merge-multiple: true
+      - name: R1
+        run: |
+          printf '%s\n' "$SUMS" > release/SHA256SUMS
+          sh .github/owl540-probe/r1.sh "${{ matrix.target }}" "$PWD/release"
+
+  r2-native:
+    name: R2 (${{ matrix.target }} on ${{ matrix.os }})
+    needs: [version, checksums]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-22.04
+          - target: aarch64-unknown-linux-musl
+            os: ubuntu-22.04-arm
+    runs-on: ${{ matrix.os }}
+    env:
+      SUMS: ${{ needs.checksums.outputs.sums }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          path: release/v0.1.0
+          pattern: owlshift-*-linux-musl
+          merge-multiple: true
+      - name: R2
+        run: |
+          printf '%s\n' "$SUMS" > release/v0.1.0/SHA256SUMS
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq bubblewrap file
+          sh .github/owl540-probe/r2.sh "${{ matrix.target }}" "$PWD/release" pass
+
+  r2-container:
+    name: R2 (${{ matrix.target }} in ${{ matrix.image }})
+    needs: [version, checksums]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { target: x86_64-unknown-linux-musl, os: ubuntu-latest, image: 'debian:12', gate: pass }
+          - { target: x86_64-unknown-linux-musl, os: ubuntu-latest, image: 'ubuntu:22.04', gate: git-too-old }
+          - { target: aarch64-unknown-linux-musl, os: ubuntu-24.04-arm, image: 'debian:12', gate: pass }
+          - { target: aarch64-unknown-linux-musl, os: ubuntu-24.04-arm, image: 'ubuntu:22.04', gate: git-too-old }
+    runs-on: ${{ matrix.os }}
+    env:
+      SUMS: ${{ needs.checksums.outputs.sums }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          path: release/v0.1.0
+          pattern: owlshift-*-linux-musl
+          merge-multiple: true
+      # This throwaway runner only: unprivileged user namespaces for bwrap
+      # inside the container.
+      - name: R2
+        run: |
+          printf '%s\n' "$SUMS" > release/v0.1.0/SHA256SUMS
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
+          docker run --rm --security-opt seccomp=unconfined --security-opt apparmor=unconfined \
+            --security-opt systempaths=unconfined -v "$PWD:/probe:ro" -v "$PWD/release:/release:ro" \
+            "${{ matrix.image }}" sh /probe/.github/owl540-probe/container.sh "${{ matrix.target }}" "${{ matrix.gate }}"
