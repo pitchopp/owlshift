@@ -780,7 +780,10 @@ mod github {
                         ("title", request["body"]["title"].clone()),
                         ("body", request["body"]["body"].clone()),
                         ("labels", labels(&["agent:proposed".to_owned()])),
-                        ("url", json!(format!("https://api.github.com/{issues}/9001"))),
+                        (
+                            "url",
+                            json!(format!("https://api.github.com/{issues}/9001")),
+                        ),
                     ] {
                         issue[key] = value;
                     }

@@ -84,7 +84,12 @@ fn the_ready_column_lists_issues_with_their_blockers() {
         .on(
             &format!("GET {READY}"),
             200,
-            json!([listed(1, &["agent:ready"]), pull, listed(2, &["Agent:Ready"]), listed(1, &["agent:ready"])]),
+            json!([
+                listed(1, &["agent:ready"]),
+                pull,
+                listed(2, &["Agent:Ready"]),
+                listed(1, &["agent:ready"])
+            ]),
         )
         .on(
             &blocked_by(1),
@@ -136,12 +141,22 @@ fn the_ready_column_lists_issues_with_their_blockers() {
         json!([]),
     );
     let admit = Admit::Label("needs owl".to_owned());
-    assert!(tracker(&canned).admitted(&column(&admit)).unwrap().is_empty());
+    assert!(
+        tracker(&canned)
+            .admitted(&column(&admit))
+            .unwrap()
+            .is_empty()
+    );
 
     // The ready state is the ready label.
     let canned = Canned::default().on(&format!("GET {READY}"), 200, json!([]));
     let admit = Admit::State("agent:ready".to_owned());
-    assert!(tracker(&canned).admitted(&column(&admit)).unwrap().is_empty());
+    assert!(
+        tracker(&canned)
+            .admitted(&column(&admit))
+            .unwrap()
+            .is_empty()
+    );
 }
 
 /// A blocker list that cannot be read fails the listing: never a ticket
@@ -149,7 +164,11 @@ fn the_ready_column_lists_issues_with_their_blockers() {
 #[test]
 fn a_listing_whose_blockers_are_unread_fails() {
     let canned = Canned::default()
-        .on(&format!("GET {READY}"), 200, json!([listed(1, &["agent:ready"])]))
+        .on(
+            &format!("GET {READY}"),
+            200,
+            json!([listed(1, &["agent:ready"])]),
+        )
         .on(&blocked_by(1), 502, json!({ "message": "Server Error" }));
     assert!(tracker(&canned).admitted(&column(&label())).is_err());
 
@@ -159,7 +178,11 @@ fn a_listing_whose_blockers_are_unread_fails() {
             .admitted(&column(&Admit::Delegation))
             .is_err()
     );
-    assert!(tracker(&canned).gesture(&id("7"), &Admit::Delegation).is_err());
+    assert!(
+        tracker(&canned)
+            .gesture(&id("7"), &Admit::Delegation)
+            .is_err()
+    );
     assert!(canned.calls().is_empty());
 }
 
@@ -170,7 +193,12 @@ fn a_listing_whose_blockers_are_unread_fails() {
 fn the_gesture_is_the_last_label_event_standing() {
     let bot = json!({ "login": "a-bot[bot]", "id": 9, "type": "Bot" });
     let bea = json!({ "login": "bea", "id": 2, "type": "User" });
-    let mut by_app = event("labeled", "agent:ready", "2026-11-12T15:30:00Z", bea.clone());
+    let mut by_app = event(
+        "labeled",
+        "agent:ready",
+        "2026-11-12T15:30:00Z",
+        bea.clone(),
+    );
     by_app["performed_via_github_app"] = json!({ "slug": "owl-shift" });
     for (list, read) in [
         (
@@ -178,7 +206,12 @@ fn the_gesture_is_the_last_label_event_standing() {
                 event("labeled", "agent:ready", "2026-11-12T15:00:00Z", ann()),
                 event("labeled", "Bug", "2026-11-12T15:05:00Z", bea.clone()),
                 event("unlabeled", "Agent:Ready", "2026-11-12T15:10:00Z", ann()),
-                event("labeled", "Agent:Ready", "2026-11-12T15:20:00Z", bea.clone()),
+                event(
+                    "labeled",
+                    "Agent:Ready",
+                    "2026-11-12T15:20:00Z",
+                    bea.clone(),
+                ),
             ],
             Ok(("2", "2026-11-12T15:20:00Z")),
         ),
@@ -190,7 +223,10 @@ fn the_gesture_is_the_last_label_event_standing() {
             Err("put the label on the issue again"),
         ),
         (
-            vec![event("labeled", "agent:ready", "2026-11-12T15:00:00Z", ann()), by_app],
+            vec![
+                event("labeled", "agent:ready", "2026-11-12T15:00:00Z", ann()),
+                by_app,
+            ],
             Err("bea through the GitHub App owl-shift"),
         ),
         (
@@ -231,13 +267,16 @@ fn every_page_of_events_is_read() {
         .map(|_| event("labeled", "Bug", "2026-11-12T15:00:00Z", ann()))
         .collect();
     full[0] = event("labeled", "agent:ready", "2026-11-12T15:00:00Z", ann());
-    let canned = Canned::default()
-        .on(&events(7), 200, json!(full))
-        .on(
-            &format!("GET {ISSUES}/7/events?per_page=100&page=2"),
-            200,
-            json!([event("unlabeled", "agent:ready", "2026-11-12T15:01:00Z", ann())]),
-        );
+    let canned = Canned::default().on(&events(7), 200, json!(full)).on(
+        &format!("GET {ISSUES}/7/events?per_page=100&page=2"),
+        200,
+        json!([event(
+            "unlabeled",
+            "agent:ready",
+            "2026-11-12T15:01:00Z",
+            ann()
+        )]),
+    );
     assert!(tracker(&canned).gesture(&id("7"), &label()).is_err());
 }
 
@@ -417,7 +456,10 @@ fn reactions_are_read_only_where_counted() {
         );
     let comments = tracker(&canned).comments(&id("7")).unwrap();
     assert!(comments[0].reactions[0].is_thumbs_up());
-    assert!(matches!(comments[0].reactions[0].author, Author::Account(_)));
+    assert!(matches!(
+        comments[0].reactions[0].author,
+        Author::Account(_)
+    ));
     assert!(comments[1].reactions.is_empty());
     assert_eq!(canned.calls().len(), 3);
 }
@@ -452,7 +494,10 @@ fn a_ticket_is_named_and_closed_by_its_number() {
     let tracker = tracker(&canned);
     assert_eq!(tracker.reference(&id("12")), "#12");
     assert_eq!(tracker.reference(&id("OWL-12")), "OWL-12");
-    assert_eq!(tracker.closing_line(&id("12")).as_deref(), Some("Closes #12"));
+    assert_eq!(
+        tracker.closing_line(&id("12")).as_deref(),
+        Some("Closes #12")
+    );
     assert_eq!(tracker.closing_line(&id("OWL-12")), None);
 }
 

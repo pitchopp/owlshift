@@ -434,7 +434,12 @@ impl Tracker for GitHubTracker {
         self.open_proposal(proposal)
     }
 
-    fn proposed(&self, _team: Option<&str>, title: &str, marker: &str) -> Result<Vec<Found>, Error> {
+    fn proposed(
+        &self,
+        _team: Option<&str>,
+        title: &str,
+        marker: &str,
+    ) -> Result<Vec<Found>, Error> {
         self.find_proposals(title, marker)
     }
 }
@@ -670,9 +675,12 @@ mod tests {
     /// answers HTTP 304, kept as `GET <path> (304)`.
     #[derive(Clone, Default)]
     pub(super) struct Canned {
-        answers: Arc<Mutex<Vec<(String, u16, Value, Option<String>)>>>,
+        answers: Arc<Mutex<Vec<Answer>>>,
         calls: Arc<Mutex<Vec<String>>>,
     }
+
+    /// A call, its status, its body and its `ETag`.
+    type Answer = (String, u16, Value, Option<String>);
 
     impl Canned {
         pub(super) fn on(self, call: &str, status: u16, body: Value) -> Self {

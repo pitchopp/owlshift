@@ -86,7 +86,11 @@ impl GitHubTracker {
             ));
         }
         let asked: Vec<String> = labels.iter().map(|l| encode(l)).collect();
-        let path = format!("{}?state=open&labels={}", self.issues_path(), asked.join(","));
+        let path = format!(
+            "{}?state=open&labels={}",
+            self.issues_path(),
+            asked.join(",")
+        );
         let mut issues: Vec<Issue> = self.every(&path, what)?;
         let mut seen = Vec::new();
         issues.retain(|issue| {
@@ -357,7 +361,10 @@ impl GitHubTracker {
         if !labelled {
             problems.push(Error::new(
                 ErrorKind::Other,
-                format!("GitHub filed #{} without the label {PROPOSED_LABEL:?}", created.number),
+                format!(
+                    "GitHub filed #{} without the label {PROPOSED_LABEL:?}",
+                    created.number
+                ),
             ));
         }
         if proposal.blocked_by_parent

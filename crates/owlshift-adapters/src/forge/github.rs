@@ -1128,10 +1128,10 @@ fn whole(mut answer: RestAnswer, path: &str) -> Result<String, Error> {
     Ok(body)
 }
 
-/// The most paths [`GitHubForge::rest_text_cached`] keeps.
+/// The most paths the forge's conditional reads keep (OWL-536).
 pub const MAX_CACHED: usize = 4096;
 
-/// The most bytes of bodies it keeps.
+/// The most bytes of bodies they keep.
 pub const MAX_CACHED_BYTES: usize = 16 * 1024 * 1024;
 
 /// The bodies of conditional reads, each with its `ETag`, by path.

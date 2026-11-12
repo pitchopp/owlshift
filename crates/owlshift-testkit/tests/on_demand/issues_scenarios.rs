@@ -33,7 +33,13 @@ impl Bench {
             .collect();
         fs::write(&path, text.join("\n") + "\n").unwrap();
         for args in [
-            &["commit", "--quiet", "--all", "-m", "Track the project's issues"][..],
+            &[
+                "commit",
+                "--quiet",
+                "--all",
+                "-m",
+                "Track the project's issues",
+            ][..],
             &["push", "--quiet", "origin", "HEAD:refs/heads/main"][..],
         ] {
             bench.env.run(checkout, args).unwrap();
@@ -57,10 +63,31 @@ fn a_drain_on_github_issues() {
     let by = |account| [("agent:ready", account)];
     let decider = Some(&maintainer);
     let greeting = "Add GREETING.md saying Hello.";
-    issues.open(1, "Add a greeting", greeting, &maintainer, decider, &by(&maintainer));
-    issues.open(2, "Greet again", "Greet again.", &maintainer, decider, &by(&maintainer));
+    issues.open(
+        1,
+        "Add a greeting",
+        greeting,
+        &maintainer,
+        decider,
+        &by(&maintainer),
+    );
+    issues.open(
+        2,
+        "Greet again",
+        "Greet again.",
+        &maintainer,
+        decider,
+        &by(&maintainer),
+    );
     issues.block(1, 2);
-    issues.open(3, "Greet all", "Greet the world.", &stranger, decider, &by(&stranger));
+    issues.open(
+        3,
+        "Greet all",
+        "Greet the world.",
+        &stranger,
+        decider,
+        &by(&stranger),
+    );
     let bench = Bench::on_github_issues(&maintainer, &issues);
 
     let mut proposing: Value = serde_json::from_str(&done_for("1")).unwrap();
@@ -134,7 +161,9 @@ fn a_drain_on_github_issues() {
     assert_eq!(proposal.labels, ["agent:proposed"]);
     assert_eq!(proposal.blocked_by, [1]);
     assert!(
-        proposal.body.contains("**Blocked by** #1, whose code it needs."),
+        proposal
+            .body
+            .contains("**Blocked by** #1, whose code it needs."),
         "{}",
         proposal.body
     );

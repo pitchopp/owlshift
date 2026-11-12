@@ -85,7 +85,11 @@ fn recorded(path: &str) -> Value {
     let exchanges = fixture["exchanges"].as_array().expect("its exchanges");
     let found = exchanges
         .iter()
-        .find(|e| e["request"]["path"].as_str().is_some_and(|p| p.contains(path)))
+        .find(|e| {
+            e["request"]["path"]
+                .as_str()
+                .is_some_and(|p| p.contains(path))
+        })
         .unwrap_or_else(|| panic!("no recorded exchange of {path}"));
     let response = &found["response"];
     match response.as_array() {
@@ -387,7 +391,10 @@ impl State {
                 let mut comment = recorded("/comments?");
                 for (key, value) in [
                     ("id", json!(self.next_id)),
-                    ("issue_url", json!(format!("{}/issues/{number}", self.api()))),
+                    (
+                        "issue_url",
+                        json!(format!("{}/issues/{number}", self.api())),
+                    ),
                     ("user", self.viewer.json()),
                     ("created_at", json!(at.to_string())),
                     ("updated_at", json!(at.to_string())),
@@ -502,7 +509,11 @@ mod tests {
     #[test]
     fn answers_are_shaped_from_the_recording_and_a_merge_closes() {
         let ann = Account::new("ann", 1);
-        let fake = FakeIssues::new("demo/project", ann.clone(), "2026-11-12T15:00:00Z".parse().unwrap());
+        let fake = FakeIssues::new(
+            "demo/project",
+            ann.clone(),
+            "2026-11-12T15:00:00Z".parse().unwrap(),
+        );
         fake.open(1, "One", "Body", &ann, Some(&ann), &[("agent:ready", &ann)]);
         let answer = fake.get("repos/demo/project/issues/1").unwrap();
         let mut text = String::new();

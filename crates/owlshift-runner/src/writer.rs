@@ -5399,7 +5399,10 @@ Merge state reported by the forge: `CLEAN`.
         description.parent = TicketId::new("12").unwrap();
         description.followup.blocked_by_parent = true;
         let body = description.render("#12");
-        assert!(body.contains("**Blocked by** #12, whose code it needs."), "{body}");
+        assert!(
+            body.contains("**Blocked by** #12, whose code it needs."),
+            "{body}"
+        );
         assert_eq!(text_blockers(&body), ["12"], "{body}");
         assert_eq!(
             ProposalDescription::footer_of(&body),
@@ -5412,8 +5415,14 @@ Merge state reported by the forge: `CLEAN`.
     #[test]
     fn a_closing_line_ends_the_body_once() {
         let line = || Some("Closes #12".to_owned());
-        assert_eq!(with_closing_line("Says hello.\n", line()), "Says hello.\n\nCloses #12");
-        assert_eq!(with_closing_line("Says hello.\n\nCloses #12\n", line()), "Says hello.\n\nCloses #12");
+        assert_eq!(
+            with_closing_line("Says hello.\n", line()),
+            "Says hello.\n\nCloses #12"
+        );
+        assert_eq!(
+            with_closing_line("Says hello.\n\nCloses #12\n", line()),
+            "Says hello.\n\nCloses #12"
+        );
         assert_eq!(with_closing_line("  ", line()), "Closes #12");
         assert_eq!(with_closing_line("Says hello.", None), "Says hello.");
     }
