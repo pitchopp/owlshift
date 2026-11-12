@@ -15,13 +15,15 @@ use owlshift_adapters::forge::Repo;
 use owlshift_adapters::forge::github_app::{DeviceFlow, HttpLogin};
 use owlshift_contracts::config::TrackerKind;
 use owlshift_contracts::service::KeychainEntry;
+use owlshift_core::stack::{Detection, detect};
 use owlshift_platform::keychain::{Keychain, SERVICE, Secret};
 use owlshift_runner::config::{Effective, FileState};
 use owlshift_runner::forge::GitHubApp;
 use owlshift_runner::github_sign_in::{self, Ask, GitHub, Outcome, SystemWait};
 use owlshift_runner::init::{
     AppStored, GITHUB_TOKEN, InitOptions, SecretsReport, Wanted, Written, project_file,
-    required_secrets, store_app_credentials, store_secrets, wanted_secrets, write_project_file,
+    read_root_files, required_secrets, store_app_credentials, store_secrets, wanted_secrets,
+    write_project_file,
 };
 use owlshift_runner::install::Manifests;
 use owlshift_runner::project::ProjectDirs;
@@ -74,6 +76,16 @@ pub fn run(args: &Args, config: &Effective) -> ExitCode {
             (config.tracker.kind, path)
         }
         FileState::Absent(path) => {
+            let root = path.parent().unwrap_or(path);
+            // Detection only reads the root's file names and manifests: what
+            // it finds is written, never run.
+            let detected = match read_root_files(root) {
+                Ok(files) => detect(&files),
+                Err(error) => {
+                    println!("The stack was not detected: {}: {error}", root.display());
+                    Detection::default()
+                }
+            };
             let options = InitOptions {
                 tracker: match args.tracker {
                     TrackerChoice::Linear => TrackerKind::Linear,
@@ -81,23 +93,28 @@ pub fn run(args: &Args, config: &Effective) -> ExitCode {
                 },
                 team: args.team.clone(),
                 gate: args.gate.clone(),
+                detected,
             };
             let text = match project_file(&options) {
                 Ok(text) => text,
                 Err(error) => return fail(&error),
             };
-            let root = path.parent().unwrap_or(path);
             match write_project_file(root, &text) {
-                Ok(Written::Created) => println!(
-                    "Wrote {}: review it, then commit it.{}",
-                    path.display(),
-                    if options.gate.is_empty() {
-                        " Its gate is empty: list your lint, formatter and test commands in \
-                         `stack.gate`, or `owlshift do` refuses to start a ticket."
-                    } else {
-                        ""
-                    }
-                ),
+                Ok(Written::Created) => {
+                    let has_gate =
+                        !options.gate.is_empty() || options.detected.gate().next().is_some();
+                    println!(
+                        "Wrote {}: review it, then commit it.{}",
+                        path.display(),
+                        if has_gate {
+                            ""
+                        } else {
+                            " Its gate is empty: list your lint, formatter and test commands in \
+                             `stack.gate`, or `owlshift do` refuses to start a ticket."
+                        }
+                    );
+                    report_detection(&options);
+                }
                 Ok(Written::Kept) => {
                     return fail(&format!(
                         "{} appeared while `owlshift init` ran: run it again",
@@ -479,11 +496,35 @@ fn usable_app(keychain: &Keychain, accounts: &TrackerAccounts) -> bool {
     }
 }
 
+/// What detection read and what it left out, the notes included.
+fn report_detection(options: &InitOptions) {
+    let detected = &options.detected;
+    for found in &detected.found {
+        let (gate, setup) = (found.gate.len(), found.setup.len());
+        println!(
+            "Detected {}: {gate} gate command(s), {setup} setup command(s).",
+            found.source
+        );
+        for note in &found.notes {
+            println!("  Note: {note}.");
+        }
+    }
+    for skipped in &detected.skipped {
+        println!("Skipped {skipped}.");
+    }
+    if !options.gate.is_empty() && detected.gate().next().is_some() {
+        println!("The gate given with --gate wins over the detected one.");
+    }
+}
+
+/// The last lines of a successful `init`: the gate line is last. A run that
+/// fails before here (a secret missing or refused) ends with its own error.
 fn next_steps() -> ExitCode {
     println!(
         "Next: `owlshift doctor` checks git, the harnesses and the Claude Code token for agent runs; `owlshift do TICKET` runs \
          a ticket."
     );
+    println!("Nothing detected was run: `owlshift gate` runs the gate to check it.");
     ExitCode::SUCCESS
 }
 

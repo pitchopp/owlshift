@@ -22,6 +22,7 @@ use semver::Version;
 
 use owlshift_adapters::forge::Repo;
 use owlshift_contracts::config::{ProjectConfig, TrackerKind};
+use owlshift_core::stack::{Detection, MANIFESTS, RootFiles};
 use owlshift_platform::keychain::{Keychain, KeychainError, SERVICE, Secret};
 
 use crate::config::{OWLSHIFT_VERSION, PROJECT_FILE};
@@ -38,6 +39,9 @@ pub struct InitOptions {
     pub team: Option<String>,
     /// The project's gate commands, in order.
     pub gate: Vec<String>,
+    /// What [`owlshift_core::stack::detect`] read from the root: its gate
+    /// is written unless `gate` is given, its setup always.
+    pub detected: Detection,
 }
 
 /// The commented project file for `options`, checked to parse as the
@@ -62,15 +66,35 @@ requires = \">={}.{}\"
     text.push_str(
         &crate::tracker::of(options.tracker).project_file_lines(options.team.as_deref())?,
     );
-    let gate = if options.gate.is_empty() {
-        "gate = []\n".to_owned()
+    // A gate given by hand wins over the detected one, and only over it.
+    let by_hand = !options.gate.is_empty();
+    let mut gate = String::new();
+    for found in &options.detected.found {
+        if (!by_hand && !found.gate.is_empty()) || !found.setup.is_empty() {
+            for note in &found.notes {
+                gate.push_str(&format!("# note: {}\n", one_line(note)));
+            }
+        }
+    }
+    let gate_lines: Vec<(Option<&str>, &str)> = if by_hand {
+        options.gate.iter().map(|c| (None, c.as_str())).collect()
     } else {
-        let commands: Vec<String> = options
-            .gate
-            .iter()
-            .map(|command| format!("    {},\n", quote(command)))
-            .collect();
-        format!("gate = [\n{}]\n", commands.concat())
+        options
+            .detected
+            .gate()
+            .map(|l| (Some(l.read_from.as_str()), l.command.as_str()))
+            .collect()
+    };
+    gate.push_str(&commands_block("gate", &gate_lines, &quote));
+    let setup_lines: Vec<(Option<&str>, &str)> = options
+        .detected
+        .setup()
+        .map(|l| (Some(l.read_from.as_str()), l.command.as_str()))
+        .collect();
+    let setup = if setup_lines.is_empty() {
+        "# setup = [\"pnpm install --frozen-lockfile\"]\n".to_owned()
+    } else {
+        commands_block("setup", &setup_lines, &quote)
     };
     text.push_str(&format!(
         "\
@@ -98,8 +122,7 @@ states = {{ ready = \"Todo\", working = \"In Progress\", needs_input = \"Needs I
 # network open before a Build's agent starts and again before the gate. The
 # run's temporary folder is kept between them; the worktree may change only
 # in ignored files, so install with a frozen or locked lockfile.
-# setup = [\"pnpm install --frozen-lockfile\"]
-# Folders of your home, such as a package store, that the setup, the agent
+{setup}# Folders of your home, such as a package store, that the setup, the agent
 # and the gate read, never write. Each machine that runs Owlshift opens only
 # the folders its operator lists in `allow_caches` in the personal
 # configuration; a folder holding credentials is refused.
@@ -134,6 +157,66 @@ always_human = []
     ProjectConfig::parse(&text)
         .map_err(|error| format!("the project file this would write is invalid: {error}"))?;
     Ok(text)
+}
+
+/// A `key = [...]` block, each command preceded by the comment saying what it
+/// was read from; an empty list is `key = []`.
+fn commands_block(
+    key: &str,
+    lines: &[(Option<&str>, &str)],
+    quote: &dyn Fn(&str) -> String,
+) -> String {
+    if lines.is_empty() {
+        return format!("{key} = []\n");
+    }
+    let mut out = format!("{key} = [\n");
+    for (from, command) in lines {
+        if let Some(from) = from {
+            out.push_str(&format!("    # read from {}\n", one_line(from)));
+        }
+        out.push_str(&format!("    {},\n", quote(command)));
+    }
+    out.push_str("]\n");
+    out
+}
+
+fn one_line(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// The most a manifest read for stack detection may weigh.
+const MANIFEST_LIMIT: u64 = 1 << 20;
+
+/// Reads the root of a repository for [`owlshift_core::stack::detect`]: the
+/// names of its files, and the contents of the manifests it recognises. A
+/// manifest over 1 MiB or not UTF-8 is left unread, which detection reports as
+/// skipped; only a root that cannot be listed is an error.
+pub fn read_root_files(root: &Path) -> io::Result<RootFiles> {
+    let mut names = Vec::new();
+    for entry in std::fs::read_dir(root)? {
+        let entry = entry?;
+        if let Some(name) = entry.file_name().to_str() {
+            names.push(name.to_owned());
+        }
+    }
+    names.sort();
+    let mut files = Vec::new();
+    for name in MANIFESTS {
+        if !names.iter().any(|n| n == name) {
+            continue;
+        }
+        let path = root.join(name);
+        let Ok(meta) = std::fs::metadata(&path) else {
+            continue;
+        };
+        if !meta.is_file() || meta.len() > MANIFEST_LIMIT {
+            continue;
+        }
+        if let Ok(text) = std::fs::read_to_string(&path) {
+            files.push((name.to_owned(), text));
+        }
+    }
+    Ok(RootFiles { names, files })
 }
 
 /// What [`write_project_file`] did.
@@ -507,6 +590,7 @@ mod tests {
             tracker,
             team: team.map(ToOwned::to_owned),
             gate: gate.iter().map(|c| (*c).to_owned()).collect(),
+            detected: Detection::default(),
         }
     }
 
@@ -542,6 +626,131 @@ mod tests {
 
         let error = project_file(&options(TrackerKind::Linear, Some(" "), &[])).unwrap_err();
         assert!(error.contains("--team"), "{error}");
+    }
+
+    fn detected(names: &[&str], files: &[(&str, &str)]) -> Detection {
+        owlshift_core::stack::detect(&RootFiles {
+            names: names
+                .iter()
+                .chain(files.iter().map(|(n, _)| n))
+                .map(|n| (*n).to_owned())
+                .collect(),
+            files: files
+                .iter()
+                .map(|(n, c)| ((*n).to_owned(), (*c).to_owned()))
+                .collect(),
+        })
+    }
+
+    fn with(detected: Detection, gate: &[&str]) -> InitOptions {
+        InitOptions {
+            detected,
+            ..options(TrackerKind::Markdown, None, gate)
+        }
+    }
+
+    #[test]
+    fn nothing_detected_writes_the_template_as_before() {
+        let text = project_file(&with(Detection::default(), &[])).unwrap();
+        assert!(
+            text.contains(
+                "\n# `owlshift do` refuses to start a ticket.\ngate = []\n# Agents start"
+            )
+        );
+        assert!(text.contains("# network open before"));
+        assert!(
+            text.contains(
+                "\n# setup = [\"pnpm install --frozen-lockfile\"]\n# Folders of your home"
+            )
+        );
+        assert!(!text.contains("read from") && !text.contains("# note:"));
+    }
+
+    #[test]
+    fn a_detected_cargo_and_npm_root_is_written_with_its_sources_and_loads() {
+        let d = detected(
+            &["Cargo.lock", "package-lock.json"],
+            &[
+                ("Cargo.toml", "[package]\nname = \"x\"\n"),
+                ("package.json", r#"{"scripts":{"test":"jest"}}"#),
+            ],
+        );
+        let text = project_file(&with(d, &[])).unwrap();
+        let config = ProjectConfig::parse(&text).unwrap();
+        assert_eq!(
+            config.stack.gate,
+            [
+                "cargo fmt --all -- --check",
+                "cargo clippy --workspace --all-targets --locked -- -D warnings",
+                "cargo test --workspace --locked",
+                "npm run test"
+            ]
+        );
+        assert_eq!(config.stack.setup, ["npm ci"]);
+        assert_eq!(text.matches("    # read from ").count(), 5, "{text}");
+        assert!(
+            text.contains(
+                "    # read from the `test` script of package.json\n    \"npm run test\","
+            )
+        );
+        assert!(
+            text.contains("# read from package-lock.json, the lock file of npm\n    \"npm ci\",")
+        );
+    }
+
+    #[test]
+    fn a_python_root_carries_its_note_and_still_loads() {
+        let d = detected(&[], &[("pyproject.toml", "[tool.ruff]\n")]);
+        let text = project_file(&with(d, &[])).unwrap();
+        assert!(
+            text.contains("# note: pyproject.toml's tools are run bare"),
+            "{text}"
+        );
+        let config = ProjectConfig::parse(&text).unwrap();
+        assert_eq!(config.stack.gate, ["ruff check ."]);
+        assert!(config.stack.setup.is_empty());
+    }
+
+    #[test]
+    fn a_gate_given_by_hand_wins_and_the_detected_setup_stays() {
+        let d = detected(
+            &["pnpm-lock.yaml"],
+            &[("package.json", r#"{"scripts":{"test":"vitest"}}"#)],
+        );
+        let text = project_file(&with(d, &["make ci"])).unwrap();
+        let config = ProjectConfig::parse(&text).unwrap();
+        assert_eq!(config.stack.gate, ["make ci"]);
+        assert_eq!(config.stack.setup, ["pnpm install --frozen-lockfile"]);
+        assert!(!text.contains("pnpm run test"));
+        assert!(text.contains("# read from pnpm-lock.yaml, the lock file of pnpm\n"));
+    }
+
+    #[test]
+    fn the_root_is_read_for_its_names_and_its_manifests() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("Cargo.toml"), "[package]\n").unwrap();
+        std::fs::write(dir.path().join("package.json"), vec![b'x'; (1 << 20) + 1]).unwrap();
+        std::fs::write(dir.path().join("pyproject.toml"), [0xff, 0xfe]).unwrap();
+        std::fs::write(dir.path().join("pnpm-lock.yaml"), "lock").unwrap();
+        std::fs::create_dir(dir.path().join("Makefile")).unwrap();
+        let root = read_root_files(dir.path()).unwrap();
+        assert_eq!(
+            root.names,
+            [
+                "Cargo.toml",
+                "Makefile",
+                "package.json",
+                "pnpm-lock.yaml",
+                "pyproject.toml"
+            ]
+        );
+        assert_eq!(
+            root.files,
+            [("Cargo.toml".to_owned(), "[package]\n".to_owned())]
+        );
+        let d = owlshift_core::stack::detect(&root);
+        assert_eq!(d.skipped.len(), 3, "{:?}", d.skipped);
+        assert_eq!(d.found.len(), 1);
     }
 
     #[test]

@@ -1362,6 +1362,90 @@ mod windows_ctrl_c {
     }
 }
 
+fn init_markdown(repo: &Path, config_dir: &Path, extra: &[&str]) -> String {
+    let mut args = vec!["init", "--tracker", "markdown", "--skip-secrets"];
+    args.extend_from_slice(extra);
+    let output = owlshift(repo, config_dir, &args);
+    assert!(output.status.success(), "{}", stderr(&output));
+    stdout(&output)
+}
+
+fn project_config(repo: &Path) -> owlshift_contracts::config::ProjectConfig {
+    let written = fs::read_to_string(repo.join("owlshift.toml")).unwrap();
+    owlshift_contracts::config::ProjectConfig::parse(&written).unwrap()
+}
+
+#[test]
+fn init_detects_the_stack_and_never_runs_it() {
+    let config_dir = tempfile::tempdir().unwrap();
+    let repo = tempfile::tempdir().unwrap();
+    git_init(repo.path());
+    fs::write(repo.path().join("Cargo.toml"), "[package]\nname = \"x\"\n").unwrap();
+    fs::write(
+        repo.path().join("package.json"),
+        r#"{"scripts":{"test":"touch ran-by-init"}}"#,
+    )
+    .unwrap();
+    fs::write(repo.path().join("pnpm-lock.yaml"), "").unwrap();
+    let out = init_markdown(repo.path(), config_dir.path(), &[]);
+    let config = project_config(repo.path());
+    assert_eq!(config.stack.gate.len(), 4, "{:?}", config.stack.gate);
+    assert_eq!(config.stack.gate[3], "pnpm run test");
+    assert_eq!(config.stack.setup, ["pnpm install --frozen-lockfile"]);
+    assert!(out.contains("Detected Cargo.toml"), "{out}");
+    assert!(
+        out.contains("Detected package.json (pnpm-lock.yaml)"),
+        "{out}"
+    );
+    assert!(!out.contains("gate is empty"), "{out}");
+    let last = out.lines().last().unwrap();
+    assert!(last.contains("owlshift gate"), "{out}");
+    assert!(!repo.path().join("ran-by-init").exists());
+}
+
+#[test]
+fn init_says_what_a_python_root_needs() {
+    let config_dir = tempfile::tempdir().unwrap();
+    let repo = tempfile::tempdir().unwrap();
+    git_init(repo.path());
+    fs::write(repo.path().join("pyproject.toml"), "[tool.ruff]\n").unwrap();
+    let out = init_markdown(repo.path(), config_dir.path(), &[]);
+    assert!(
+        out.contains("Note: pyproject.toml's tools are run bare"),
+        "{out}"
+    );
+    assert_eq!(project_config(repo.path()).stack.gate, ["ruff check ."]);
+}
+
+#[test]
+fn a_gate_given_with_init_wins_over_the_detected_one() {
+    let config_dir = tempfile::tempdir().unwrap();
+    let repo = tempfile::tempdir().unwrap();
+    git_init(repo.path());
+    fs::write(
+        repo.path().join("package.json"),
+        r#"{"scripts":{"test":"jest"}}"#,
+    )
+    .unwrap();
+    fs::write(repo.path().join("package-lock.json"), "").unwrap();
+    let out = init_markdown(repo.path(), config_dir.path(), &["--gate", "make ci"]);
+    let config = project_config(repo.path());
+    assert_eq!(config.stack.gate, ["make ci"]);
+    assert_eq!(config.stack.setup, ["npm ci"]);
+    assert!(out.contains("--gate wins"), "{out}");
+}
+
+#[test]
+fn init_on_an_empty_root_leaves_the_gate_empty() {
+    let config_dir = tempfile::tempdir().unwrap();
+    let repo = tempfile::tempdir().unwrap();
+    git_init(repo.path());
+    let out = init_markdown(repo.path(), config_dir.path(), &[]);
+    assert!(project_config(repo.path()).stack.gate.is_empty());
+    assert!(out.contains("Its gate is empty"), "{out}");
+    assert!(!out.contains("Detected"), "{out}");
+}
+
 #[test]
 fn init_writes_a_commented_project_file_once() {
     let config_dir = tempfile::tempdir().unwrap();
