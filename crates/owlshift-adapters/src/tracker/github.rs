@@ -4,7 +4,7 @@
 //! token is refreshed as the forge's is and no second secret exists.
 //!
 //! The rules are build plan "P9 · Open-source readiness", "The GitHub Issues
-//! adapter", as live checks G1, G2 and G5 confirmed them on 2026-11-12:
+//! adapter", as live checks G1 to G6 confirmed them on 2026-11-12:
 //!
 //! - A ticket's id is the issue's number. A number that names a pull request
 //!   names no ticket: its answer carries a `pull_request` key (G5), and the
@@ -30,6 +30,14 @@
 //! - The priority is a label named under `[tracker.priorities]`; without it
 //!   every ticket reads `unset`.
 //!
+//! - Every read is conditional (OWL-536, G6): the forge keeps each answer's
+//!   `ETag` with its body, and a 304 reuses the body without counting
+//!   against the hourly limit.
+//! - A comment's reactions are read when its answer counts any (G1).
+//!
+//! What the drain needs, admission, blockers, proposals and the working
+//! state, is in `drain` (OWL-536).
+//!
 //! The tracker's errors have no rate-limit kind: a spent budget is
 //! [`ErrorKind::Other`], its message saying so.
 //!
@@ -43,14 +51,21 @@ use owlshift_contracts::Priority;
 use owlshift_contracts::config::{self, Priorities};
 use owlshift_contracts::ids::TicketId;
 
-use super::{Author, Capability, Comment, Error, ErrorKind, Person, Ticket, Tracker};
+use owlshift_contracts::config::Admit;
+
+use super::{
+    Author, Capability, Column, Comment, Error, ErrorKind, Filed, Found, Gesture, Links, Listed,
+    Person, Proposal, Reaction, Relations, StateType, Ticket, Tracker,
+};
 use crate::forge;
 use crate::forge::github::{GitHubForge, Verb};
 
-/// The most comments a page lists, GitHub's cap.
+mod drain;
+
+/// The most items a page lists, GitHub's cap.
 const PAGE: usize = 100;
 
-/// The most pages of comments read: ten thousand comments.
+/// The most pages of one list read: ten thousand items.
 const MAX_PAGES: usize = 100;
 
 /// The account GitHub names for one it no longer knows.
@@ -68,8 +83,12 @@ impl GitHubTracker {
     /// The capabilities this build implements.
     pub const CAPABILITIES: &'static [Capability] = &[
         Capability::ReadTicket,
+        Capability::ListAdmitted,
         Capability::Comments,
         Capability::VisibleStage,
+        Capability::BlockedBy,
+        Capability::ProposalsInbox,
+        Capability::Reactions,
     ];
 
     /// The issues of the repository `forge` reaches, through its credential,
@@ -109,7 +128,7 @@ impl GitHubTracker {
     fn issue(&self, id: &TicketId) -> Result<(u64, Issue), Error> {
         let number = number(id)?;
         let path = self.issue_path(number);
-        let issue: Issue = parse(&self.forge.rest_text(&path).map_err(tracker_error)?, id)?;
+        let issue: Issue = parse(&self.read(&path)?, id)?;
         if issue.pull_request.is_some() {
             return Err(Error::new(
                 ErrorKind::NotFound,
@@ -158,39 +177,81 @@ impl GitHubTracker {
             .map_or(Priority::Unset, |(priority, _)| priority)
     }
 
-    /// Every comment of issue `number`, every page read.
-    fn every_comment(&self, number: u64, id: &TicketId) -> Result<Vec<Comment>, Error> {
-        let path = format!("{}/comments", self.issue_path(number));
-        let mut read: Vec<RestComment> = Vec::new();
+    /// `repos/<owner>/<name>`, which every path of the tracker starts with.
+    fn repo_path(&self) -> String {
+        let repo = self.forge.repo();
+        format!("repos/{}/{}", repo.owner(), repo.name())
+    }
+
+    /// One read, conditional on the answer kept from the last
+    /// ([`GitHubForge::rest_text_cached`], OWL-536).
+    fn read(&self, path: &str) -> Result<String, Error> {
+        self.forge.rest_text_cached(path).map_err(tracker_error)
+    }
+
+    /// Every item of the list at `path`, [`PAGE`] a page to the first
+    /// short page, `what` naming it in an error. More than [`MAX_PAGES`]
+    /// pages is an error, never a list cut short.
+    fn every<T: for<'de> Deserialize<'de>>(&self, path: &str, what: &str) -> Result<Vec<T>, Error> {
+        let sep = if path.contains('?') { '&' } else { '?' };
+        let mut read: Vec<T> = Vec::new();
         for page in 1..=MAX_PAGES {
-            let text = self
-                .forge
-                .rest_text(&format!("{path}?per_page={PAGE}&page={page}"))
-                .map_err(tracker_error)?;
-            let more: Vec<RestComment> = parse(&text, id)?;
+            let text = self.read(&format!("{path}{sep}per_page={PAGE}&page={page}"))?;
+            let more: Vec<T> = parse(&text, &what)?;
             let last = more.len() < PAGE;
             read.extend(more);
             if last {
-                return in_order(read, |url| self.is_this_issue(url, number));
+                return Ok(read);
             }
         }
         Err(Error::new(
             ErrorKind::Other,
-            format!("the comments of {id} run past {MAX_PAGES} pages"),
+            format!("{what} run past {MAX_PAGES} pages"),
         ))
     }
-}
 
-impl Tracker for GitHubTracker {
-    fn capabilities(&self) -> &'static [Capability] {
-        Self::CAPABILITIES
+    /// Every comment of issue `number`, every page read, with the reactions
+    /// of each that has any (OWL-536): a comment's answer counts them, so a
+    /// comment without one costs no read.
+    fn every_comment(&self, number: u64, id: &TicketId) -> Result<Vec<Comment>, Error> {
+        let path = format!("{}/comments", self.issue_path(number));
+        let read: Vec<RestComment> = self.every(&path, &format!("the comments of {id}"))?;
+        let reacted: Vec<String> = read
+            .iter()
+            .filter(|c| c.reactions.as_ref().is_some_and(|r| r.total_count > 0))
+            .map(|c| c.id.to_string())
+            .collect();
+        let mut comments = in_order(read, |url| self.is_this_issue(url, number))?;
+        for comment in &mut comments {
+            if reacted.contains(&comment.id) {
+                comment.reactions = self.reactions(&comment.id)?;
+            }
+        }
+        Ok(comments)
     }
 
-    fn ticket(&self, id: &TicketId) -> Result<Ticket, Error> {
-        let (_, issue) = self.issue(id)?;
+    /// The reactions on comment `comment`, in GitHub's order, each by the
+    /// rule of a comment's author (G1).
+    fn reactions(&self, comment: &str) -> Result<Vec<Reaction>, Error> {
+        let path = format!("{}/issues/comments/{comment}/reactions", self.repo_path());
+        let read: Vec<RestReaction> =
+            self.every(&path, &format!("the reactions of comment {comment}"))?;
+        read.into_iter()
+            .map(|reaction| {
+                Ok(Reaction {
+                    emoji: reaction.content,
+                    author: reaction.user.map_or_else(Author::unknown, User::author),
+                    created_at: timestamp(&reaction.created_at)?,
+                })
+            })
+            .collect()
+    }
+
+    /// The ticket an issue's answer reads as, under `id`.
+    fn to_ticket(&self, id: TicketId, issue: Issue) -> Ticket {
         let labels: Vec<String> = issue.labels.into_iter().map(|l| l.name).collect();
-        Ok(Ticket {
-            id: id.clone(),
+        Ticket {
+            id,
             title: issue.title,
             description: issue.body.unwrap_or_default(),
             priority: self.priority(&labels),
@@ -207,7 +268,18 @@ impl Tracker for GitHubTracker {
                 Some(other) => other,
                 None => Author::unknown(),
             },
-        })
+        }
+    }
+}
+
+impl Tracker for GitHubTracker {
+    fn capabilities(&self) -> &'static [Capability] {
+        Self::CAPABILITIES
+    }
+
+    fn ticket(&self, id: &TicketId) -> Result<Ticket, Error> {
+        let (_, issue) = self.issue(id)?;
+        Ok(self.to_ticket(id.clone(), issue))
     }
 
     fn comments(&self, id: &TicketId) -> Result<Vec<Comment>, Error> {
@@ -313,6 +385,58 @@ impl Tracker for GitHubTracker {
             repo.name()
         ))
     }
+
+    /// `#12`, which the text convention reads; anything that is no issue
+    /// number as it is.
+    fn reference(&self, id: &TicketId) -> String {
+        match number(id) {
+            Ok(n) => format!("#{n}"),
+            Err(_) => id.as_str().to_owned(),
+        }
+    }
+
+    /// `Closes #12`: GitHub links the pull request to the issue, and closes
+    /// it as completed when the pull request merges (G5).
+    fn closing_line(&self, id: &TicketId) -> Option<String> {
+        number(id).ok().map(|n| format!("Closes #{n}"))
+    }
+
+    fn admitted(&self, column: &Column<'_>) -> Result<Vec<Listed>, Error> {
+        self.listed(column)
+    }
+
+    fn working(&self, _team: Option<&str>, state: &str) -> Result<Vec<Ticket>, Error> {
+        self.labelled(state)
+    }
+
+    fn gesture(&self, id: &TicketId, admit: &Admit) -> Result<Gesture, Error> {
+        self.label_gesture(id, admit)
+    }
+
+    fn state_type(&self, id: &TicketId) -> Result<Option<StateType>, Error> {
+        let (_, issue) = self.issue(id)?;
+        Ok(drain::state_type(&issue))
+    }
+
+    fn relations(&self, id: &TicketId) -> Result<Relations, Error> {
+        self.issue_relations(id)
+    }
+
+    fn links(&self, id: &TicketId) -> Result<Links, Error> {
+        self.issue_links(id)
+    }
+
+    fn block(&self, blocker: &TicketId, blocked: &TicketId) -> Result<(), Error> {
+        self.write_block(blocker, blocked)
+    }
+
+    fn propose(&self, proposal: &Proposal<'_>) -> Result<Filed, Error> {
+        self.open_proposal(proposal)
+    }
+
+    fn proposed(&self, _team: Option<&str>, title: &str, marker: &str) -> Result<Vec<Found>, Error> {
+        self.find_proposals(title, marker)
+    }
 }
 
 /// The issue number `id` names: digits only, without a leading zero.
@@ -367,11 +491,14 @@ fn timestamp(text: &str) -> Result<Timestamp, Error> {
 }
 
 /// Parses an answer, without repeating its words in the error.
-fn parse<T: for<'de> Deserialize<'de>>(text: &str, id: &TicketId) -> Result<T, Error> {
+fn parse<T: for<'de> Deserialize<'de>>(
+    text: &str,
+    what: &dyn std::fmt::Display,
+) -> Result<T, Error> {
     serde_json::from_str(text).map_err(|e| {
         Error::new(
             ErrorKind::Other,
-            format!("unexpected answer from GitHub for {id}: {e}"),
+            format!("unexpected answer from GitHub for {what}: {e}"),
         )
     })
 }
@@ -414,7 +541,16 @@ fn encode(text: &str) -> String {
 
 #[derive(Deserialize)]
 struct Issue {
+    /// The issue's database id, which the dependency API names it by (G4).
+    #[serde(default)]
+    id: u64,
+    #[serde(default)]
+    number: u64,
     url: String,
+    /// The API URL of its repository, which tells a blocker of another
+    /// repository (G4).
+    #[serde(default)]
+    repository_url: String,
     title: String,
     body: Option<String>,
     user: Option<User>,
@@ -423,7 +559,21 @@ struct Issue {
     #[serde(default)]
     labels: Vec<Label>,
     state: String,
-    pull_request: Option<Value>,
+    /// `completed`, `not_planned`, `duplicate` or `reopened` (G4); null for
+    /// an open issue, and for one closed before GitHub recorded a reason.
+    #[serde(default)]
+    state_reason: Option<String>,
+    #[serde(default)]
+    created_at: Option<String>,
+    /// Set for a pull request (G5).
+    pull_request: Option<PullLink>,
+}
+
+/// The `pull_request` key of an issue's answer.
+#[derive(Deserialize)]
+struct PullLink {
+    #[serde(default)]
+    merged_at: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -463,6 +613,23 @@ struct RestComment {
     created_at: String,
     updated_at: String,
     body: Option<String>,
+    /// The counts of its reactions (G1).
+    #[serde(default)]
+    reactions: Option<ReactionCounts>,
+}
+
+#[derive(Deserialize)]
+struct ReactionCounts {
+    #[serde(default)]
+    total_count: u64,
+}
+
+/// A reaction as GitHub lists it (G1).
+#[derive(Deserialize)]
+struct RestReaction {
+    content: String,
+    user: Option<User>,
+    created_at: String,
 }
 
 impl RestComment {
@@ -496,35 +663,46 @@ mod tests {
     use crate::forge::Repo;
     use crate::graphql::{Response, RestAnswer, Transport};
 
-    const ISSUE: &str = "repos/demo/project/issues/7";
+    pub(super) const ISSUE: &str = "repos/demo/project/issues/7";
 
     /// Answers each REST call from its method and path, and keeps the calls.
+    /// A read answered with an `ETag` (`on_tagged`) and asked again with it
+    /// answers HTTP 304, kept as `GET <path> (304)`.
     #[derive(Clone, Default)]
-    struct Canned {
-        answers: Arc<Mutex<Vec<(String, u16, Value)>>>,
+    pub(super) struct Canned {
+        answers: Arc<Mutex<Vec<(String, u16, Value, Option<String>)>>>,
         calls: Arc<Mutex<Vec<String>>>,
     }
 
     impl Canned {
-        fn on(self, call: &str, status: u16, body: Value) -> Self {
+        pub(super) fn on(self, call: &str, status: u16, body: Value) -> Self {
             self.answers
                 .lock()
                 .unwrap()
-                .push((call.to_owned(), status, body));
+                .push((call.to_owned(), status, body, None));
             self
         }
 
-        fn answer(&self, call: String) -> (u16, String) {
-            self.calls.lock().unwrap().push(call.clone());
-            let answers = self.answers.lock().unwrap();
-            let (_, status, body) = answers
-                .iter()
-                .find(|(c, _, _)| *c == call)
-                .unwrap_or_else(|| panic!("no answer for {call}"));
-            (*status, body.to_string())
+        /// [`Self::on`], the answer carrying the `ETag` `etag`.
+        pub(super) fn on_tagged(self, call: &str, body: Value, etag: &str) -> Self {
+            self.answers
+                .lock()
+                .unwrap()
+                .push((call.to_owned(), 200, body, Some(etag.to_owned())));
+            self
         }
 
-        fn calls(&self) -> Vec<String> {
+        fn answer(&self, call: String) -> (u16, String, Option<String>) {
+            self.calls.lock().unwrap().push(call.clone());
+            let answers = self.answers.lock().unwrap();
+            let (_, status, body, etag) = answers
+                .iter()
+                .find(|(c, _, _, _)| *c == call)
+                .unwrap_or_else(|| panic!("no answer for {call}"));
+            (*status, body.to_string(), etag.clone())
+        }
+
+        pub(super) fn calls(&self) -> Vec<String> {
             self.calls.lock().unwrap().clone()
         }
     }
@@ -535,22 +713,41 @@ mod tests {
         }
 
         fn get(&self, path: &str) -> Result<RestAnswer, String> {
-            let (status, body) = self.answer(format!("GET {path}"));
-            Ok(RestAnswer::new(status, body))
+            let (status, body, etag) = self.answer(format!("GET {path}"));
+            let answer = RestAnswer::new(status, body);
+            Ok(match etag {
+                Some(etag) => answer.with_etag(etag),
+                None => answer,
+            })
+        }
+
+        fn get_if_none_match(&self, path: &str, etag: &str) -> Result<RestAnswer, String> {
+            let kept = self
+                .answers
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|(c, _, _, _)| *c == format!("GET {path}"))
+                .and_then(|(_, _, _, tag)| tag.clone());
+            if kept.as_deref() == Some(etag) {
+                self.calls.lock().unwrap().push(format!("GET {path} (304)"));
+                return Ok(RestAnswer::new(304, "").with_etag(etag));
+            }
+            self.get(path)
         }
 
         fn post(&self, path: &str, body: &Value) -> Result<Response, String> {
-            let (status, answer) = self.answer(format!("POST {path} {body}"));
+            let (status, answer, _) = self.answer(format!("POST {path} {body}"));
             Ok(Response::new(status, answer))
         }
 
         fn delete(&self, path: &str) -> Result<Response, String> {
-            let (status, answer) = self.answer(format!("DELETE {path}"));
+            let (status, answer, _) = self.answer(format!("DELETE {path}"));
             Ok(Response::new(status, answer))
         }
     }
 
-    fn config(priorities: Option<Priorities>) -> config::Tracker {
+    pub(super) fn config(priorities: Option<Priorities>) -> config::Tracker {
         config::Tracker {
             kind: config::TrackerKind::Github,
             team: None,
@@ -568,7 +765,7 @@ mod tests {
         }
     }
 
-    fn tracker(canned: &Canned) -> GitHubTracker {
+    pub(super) fn tracker(canned: &Canned) -> GitHubTracker {
         tracker_with(canned, None)
     }
 
@@ -578,7 +775,7 @@ mod tests {
         GitHubTracker::new(forge, &config(priorities))
     }
 
-    fn issue(labels: &[&str], state: &str) -> Value {
+    pub(super) fn issue(labels: &[&str], state: &str) -> Value {
         json!({
             "url": "https://api.github.com/repos/Demo/Project/issues/7",
             "number": 7,
@@ -594,7 +791,7 @@ mod tests {
         })
     }
 
-    fn comment(id: u64, created: &str, updated: &str, user: Value) -> Value {
+    pub(super) fn comment(id: u64, created: &str, updated: &str, user: Value) -> Value {
         json!({
             "id": id,
             "issue_url": format!("https://api.github.com/{ISSUE}"),
@@ -605,7 +802,7 @@ mod tests {
         })
     }
 
-    fn id(text: &str) -> TicketId {
+    pub(super) fn id(text: &str) -> TicketId {
         TicketId::new(text).unwrap()
     }
 

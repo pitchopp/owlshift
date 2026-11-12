@@ -10,7 +10,8 @@
 //! drain"), filing proposals and finding them again with P4 too (OWL-252),
 //! publishing a ticket's document with P5 (OWL-350), resolving a comment
 //! with P5 too (OWL-353), a comment's reactions with P5 too (OWL-371), a
-//! ticket's links for intake's brief (OWL-416).
+//! ticket's links for intake's brief (OWL-416), how text names a ticket and
+//! the closing line of a pull request with P9 (OWL-536).
 
 pub mod github;
 pub mod linear;
@@ -64,6 +65,25 @@ pub trait Tracker {
         None
     }
 
+    /// How a ticket's text names ticket `id` so that the text convention
+    /// reads it ("Blocked by", architecture section 5, "Blockers"): on
+    /// GitHub Issues `#12`, since a number alone names nothing (OWL-536).
+    /// The identifier as it is by default.
+    fn reference(&self, id: &TicketId) -> String {
+        id.as_str().to_owned()
+    }
+
+    /// The line that ends the body of the pull request delivering ticket
+    /// `id`, when the forge closes the ticket on its merge through it: on
+    /// GitHub Issues `Closes #12` (build plan, "The GitHub Issues adapter",
+    /// "Delivery", G5). Kept apart from [`reference`](Self::reference):
+    /// closing is the forge's reading of a pull request, not the text
+    /// convention. `None` by default: Linear links a pull request by its
+    /// branch's name.
+    fn closing_line(&self, _id: &TicketId) -> Option<String> {
+        None
+    }
+
     /// The text that, written in a comment, makes the tracker notify the
     /// account `account` (OWL-157): on Linear, the person's profile link.
     /// The runner writes it at the end of a comment's header line
@@ -107,7 +127,9 @@ pub trait Tracker {
     /// state), or the ticket's creator when none did (architecture section
     /// 5, "By whom"). Read once, before the ticket's first intake, so it is
     /// not part of the listing. An error by default, and for the
-    /// `delegation` gesture.
+    /// `delegation` gesture. On GitHub Issues a label with no `labeled` event
+    /// standing is an error, never the creator: anyone opens an issue there
+    /// (OWL-536).
     fn gesture(&self, _id: &TicketId, _admit: &Admit) -> Result<Gesture, Error> {
         Err(Error::new(
             ErrorKind::Other,
