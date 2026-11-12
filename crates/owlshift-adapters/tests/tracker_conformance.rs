@@ -5,6 +5,7 @@
 
 mod support;
 
+use std::collections::BTreeMap;
 use std::fs;
 
 use owlshift_adapters::tracker::linear::{ApiKey, LinearTracker};
@@ -15,8 +16,9 @@ use owlshift_adapters::tracker::{
 use owlshift_contracts::Priority;
 use owlshift_contracts::config::Admit;
 use owlshift_contracts::ids::TicketId;
+use serde_json::{Value, json};
 
-use support::{Recorder, Replay};
+use support::{Answer, Fake, Recorder, Replay};
 
 /// What the suite knows about the tracker it checks.
 struct Case {
@@ -326,6 +328,112 @@ fn check_admitted(list: &dyn Tracker, gestures: &dyn Tracker, case: &AdmittedCas
     assert_eq!(refused.kind, ErrorKind::Other, "{refused}");
 }
 
+/// What the Blocked check knows about the tracker.
+struct BlockedCase {
+    /// A ticket whose state is a completed one, and one whose state is not.
+    done: TicketId,
+    open: TicketId,
+    /// A ticket that does not exist.
+    missing: TicketId,
+    /// A ticket, and the blockers its relations must show.
+    blocked: TicketId,
+    blockers: Vec<Blocker>,
+    /// Two tickets with no relation: the check writes that the first blocks
+    /// the second.
+    new_blocker: TicketId,
+    new_blocked: TicketId,
+    /// A ticket the tracker refuses to relate, when the adapter says so:
+    /// the trait promises nothing about an unknown ticket, and the adapters
+    /// differ, so only a case that knows its adapter refuses sets it.
+    unknown_blocked: Option<TicketId>,
+}
+
+/// The state type, the relations and the `blocked_by` write: a ticket done
+/// is completed and one open is not; an unknown ticket is not found; the
+/// relations name the blockers; a relation written shows in them, and
+/// writing it twice changes nothing.
+fn check_blocked_by(tracker: &dyn Tracker, case: &BlockedCase) {
+    assert!(
+        tracker.capabilities().contains(&Capability::BlockedBy),
+        "BlockedBy is not declared"
+    );
+    let done = tracker.state_type(&case.done).unwrap();
+    assert_eq!(done, Some(StateType::Completed), "{}", case.done);
+    let open = tracker.state_type(&case.open).unwrap();
+    assert_ne!(open, Some(StateType::Completed), "{}", case.open);
+    let missing = tracker.state_type(&case.missing).unwrap_err();
+    assert_eq!(missing.kind, ErrorKind::NotFound, "{missing}");
+
+    let relations = tracker.relations(&case.blocked).unwrap();
+    assert_eq!(relations.id, case.blocked);
+    assert_eq!(relations.blockers, case.blockers);
+    let missing = tracker.relations(&case.missing).unwrap_err();
+    assert_eq!(missing.kind, ErrorKind::NotFound, "{missing}");
+
+    let before = tracker.relations(&case.new_blocked).unwrap().blockers;
+    assert!(
+        before.iter().all(|b| b.id != case.new_blocker),
+        "{} already blocks {}",
+        case.new_blocker,
+        case.new_blocked
+    );
+    tracker.block(&case.new_blocker, &case.new_blocked).unwrap();
+    let after = tracker.relations(&case.new_blocked).unwrap().blockers;
+    assert_eq!(after.len(), before.len() + 1, "{after:?}");
+    assert_eq!(
+        after.iter().filter(|b| b.id == case.new_blocker).count(),
+        1,
+        "the new blocker is shown once: {after:?}"
+    );
+    tracker.block(&case.new_blocker, &case.new_blocked).unwrap();
+    let again = tracker.relations(&case.new_blocked).unwrap().blockers;
+    assert_eq!(again, after, "writing a relation twice changes nothing");
+
+    if let Some(unknown) = &case.unknown_blocked {
+        let refused = tracker.block(&case.new_blocker, unknown);
+        assert!(refused.is_err(), "a relation to {unknown} was accepted");
+    }
+}
+
+/// What the Links check knows about the tracker: a ticket `blocked` that is
+/// blocked by `blocker`.
+struct LinksCase {
+    blocked: TicketId,
+    blocker: TicketId,
+}
+
+/// Intake's links: the blocked ticket lists its blocker in `blocked_by` and
+/// the blocker lists it in `blocks`, each once, with a title and a state.
+fn check_links(tracker: &dyn Tracker, case: &LinksCase) {
+    assert!(
+        tracker.capabilities().contains(&Capability::BlockedBy),
+        "BlockedBy is not declared"
+    );
+    let blocked = tracker.links(&case.blocked).unwrap();
+    let blocker = tracker.links(&case.blocker).unwrap();
+    for (list, wanted) in [
+        (&blocked.blocked_by, &case.blocker),
+        (&blocker.blocks, &case.blocked),
+    ] {
+        let found: Vec<_> = list.iter().filter(|l| l.id == *wanted).collect();
+        assert_eq!(found.len(), 1, "{wanted} in {list:?}");
+        assert!(found[0].title.as_deref().is_some_and(|t| !t.is_empty()));
+        assert!(found[0].state.as_ref().is_some_and(|s| !s.name.is_empty()));
+    }
+    for list in [
+        &blocked.blocked_by,
+        &blocked.blocks,
+        &blocked.related,
+        &blocker.blocked_by,
+        &blocker.blocks,
+        &blocker.related,
+    ] {
+        for (n, linked) in list.iter().enumerate() {
+            assert!(list[..n].iter().all(|earlier| earlier.id != linked.id));
+        }
+    }
+}
+
 const BODY: &str = "[owlshift] OWL-13 conformance check: a comment posted by the Linear \
                     adapter's fixture recorder · safe to delete.\n\nSecond line.";
 
@@ -492,6 +600,45 @@ fn markdown() -> Adapter {
             }
             check_admitted(&tracker, &tracker, &case);
         })
+        .case(Check::Blocked, || {
+            let (_world, tracker) = markdown_world();
+            check_blocked_by(&tracker, &markdown_blocked_case());
+        })
+        .case(Check::Links, || {
+            // `DEMO-2`'s `blocked_by` names `DEMO-3`: the file of `DEMO-3`
+            // says nothing, so its `blocks` comes from the scan of the tree.
+            let (_world, tracker) = markdown_world();
+            check_links(
+                &tracker,
+                &LinksCase {
+                    blocked: id("DEMO-2"),
+                    blocker: id("DEMO-3"),
+                },
+            );
+        })
+}
+
+fn markdown_blocked_case() -> BlockedCase {
+    BlockedCase {
+        done: id("DEMO-3"),
+        open: id("DEMO-4"),
+        missing: id("DEMO-404"),
+        blocked: id("DEMO-2"),
+        blockers: vec![
+            Blocker {
+                id: id("DEMO-3"),
+                state: Some(StateType::Completed),
+            },
+            Blocker {
+                id: id("DEMO-4"),
+                state: None,
+            },
+        ],
+        new_blocker: id("DEMO-6"),
+        new_blocked: id("DEMO-5"),
+        // The Markdown tracker refuses a relation on a ticket it lacks.
+        unknown_blocked: Some(id("DEMO-404")),
+    }
 }
 
 #[test]
@@ -557,6 +704,112 @@ fn linear() -> Adapter {
             listing.assert_done();
             gestures.assert_done();
         })
+        .case(Check::Blocked, || {
+            // MADE UP: no recording holds these answers. `Fake` answers the
+            // state type, the relations and the relation write in the
+            // shapes of the unit tests of `src/tracker/linear.rs`, and keeps
+            // the relations written so that the next read shows them. To be
+            // recorded live by a later ticket.
+            check_blocked_by(
+                &LinearTracker::with_transport(linear_relations()),
+                &linear_blocked_case(),
+            );
+        })
+        .case(Check::Links, || {
+            // Recorded on 2026-10-21: OWL-254 is blocked by OWL-267, which
+            // blocks it.
+            let replay = Replay::new(LINKS_FIXTURE);
+            check_links(
+                &LinearTracker::with_transport(replay.clone()),
+                &LinksCase {
+                    blocked: id("OWL-254"),
+                    blocker: id("OWL-267"),
+                },
+            );
+            replay.assert_done();
+        })
+}
+
+const LINKS_FIXTURE: &str = "links.json";
+
+fn linear_blocked_case() -> BlockedCase {
+    BlockedCase {
+        done: id("OWL-1"),
+        open: id("OWL-2"),
+        missing: id("OWL-99999"),
+        blocked: id("OWL-7"),
+        blockers: vec![Blocker {
+            id: id("OWL-2"),
+            state: Some(StateType::Started),
+        }],
+        new_blocker: id("OWL-3"),
+        new_blocked: id("OWL-4"),
+        // Linear's answer to a relation on an unknown blocked ticket was
+        // never checked live: only the unknown blocker was (check (d)).
+        unknown_blocked: None,
+    }
+}
+
+/// MADE UP: a Linear that knows the tickets OWL-1 (completed), OWL-2
+/// (started), OWL-3 and OWL-4 (unstarted) and OWL-7, blocked by OWL-2, and
+/// answers every other issue `Entity not found: Issue`. A `blocks` relation
+/// written is kept once and read back by `Relations`, as Linear answers a
+/// relation already there (OWL-292).
+fn linear_relations() -> Fake {
+    let mut blockers: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    blockers.insert("OWL-7".to_owned(), vec!["OWL-2".to_owned()]);
+    let kind = |id: &str| match id {
+        "OWL-1" => Some("completed"),
+        "OWL-2" => Some("started"),
+        "OWL-3" | "OWL-4" | "OWL-7" => Some("unstarted"),
+        _ => None,
+    };
+    Fake::new(move |name, variables| match name {
+        "TicketStateType" => match kind(variables["id"].as_str().unwrap()) {
+            Some(kind) => Answer::Data(json!({ "issue": { "state": { "type": kind } } })),
+            None => Answer::NotFound("Entity not found: Issue"),
+        },
+        "Relations" => {
+            let id = variables["id"].as_str().unwrap();
+            let Some(own) = kind(id) else {
+                return Answer::NotFound("Entity not found: Issue");
+            };
+            let nodes: Vec<Value> = blockers
+                .get(id)
+                .into_iter()
+                .flatten()
+                .map(|blocker| {
+                    json!({ "type": "blocks", "issue": {
+                        "identifier": blocker, "state": { "type": kind(blocker) } } })
+                })
+                .collect();
+            Answer::Data(json!({ "issue": {
+                "identifier": id, "description": null, "state": { "type": own },
+                "inverseRelations": { "nodes": nodes, "pageInfo": { "hasNextPage": false } } } }))
+        }
+        "Relate" => {
+            let input = &variables["input"];
+            assert_eq!(input["type"], "blocks", "{input}");
+            let list = blockers
+                .entry(input["relatedIssueId"].as_str().unwrap().to_owned())
+                .or_default();
+            let blocker = input["issueId"].as_str().unwrap().to_owned();
+            if !list.contains(&blocker) {
+                list.push(blocker);
+            }
+            Answer::Data(json!({ "issueRelationCreate": { "success": true } }))
+        }
+        other => panic!("the made-up Linear does not answer {other}"),
+    })
+}
+
+/// A `NotFound` answer of the fake reads as [`ErrorKind::NotFound`] through
+/// the adapter, as Linear's own does.
+#[test]
+fn a_not_found_answer_of_the_fake_is_not_found() {
+    let tracker = LinearTracker::with_transport(linear_relations());
+    let missing = tracker.state_type(&id("OWL-99999")).unwrap_err();
+    assert_eq!(missing.kind, ErrorKind::NotFound, "{missing}");
 }
 
 fn linear_admitted_case() -> AdmittedCase {
