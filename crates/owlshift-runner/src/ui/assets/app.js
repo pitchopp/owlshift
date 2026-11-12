@@ -417,7 +417,7 @@ function alive(handle) {
 // The route in `hash`: null for none, false for one that is not a ticket
 // page's, else its owner, repository and ticket.
 function parseRoute(hash) {
-  if (!hash || hash === "#") {
+  if (!hash || hash === "#" || hash === "#/") {
     return null;
   }
   if (hash === "#/graph") {
