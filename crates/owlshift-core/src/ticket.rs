@@ -99,8 +99,8 @@ pub enum BlockerState {
 
 /// The blockers a description names by the text convention (architecture,
 /// section 5, "Blockers"): on a line that starts, after list markers, heading
-/// marks or emphasis, with "Blocked by" in any case, every `KEY-n` identifier,
-/// each once, in the order they appear. "Blocked by" in the middle of a
+/// marks or emphasis, with "Blocked by" in any case, every `KEY-n` identifier
+/// and every `#n` (given as `n`, a GitHub issue's id), each once, in the order they appear. "Blocked by" in the middle of a
 /// sentence, or a heading whose identifiers are on the next line, names none.
 pub fn text_blockers(description: &str) -> Vec<&str> {
     let mut found: Vec<&str> = Vec::new();
@@ -159,7 +159,11 @@ fn list_marker(text: &str) -> Option<&str> {
 }
 
 /// Every `KEY-n` identifier of a text: an uppercase ASCII letter, uppercase
-/// letters or digits, a hyphen and digits, not inside a longer word.
+/// letters or digits, a hyphen and digits, not inside a longer word; and every
+/// `#n`, given as its digits, when the `#` starts the text or follows
+/// whitespace, `(`, `[`, `,`, `;`, `:` or emphasis, and the digits end at a
+/// non-word byte. `owner/repo#n`, `page#n` and a link destination's fragment
+/// (`](#n)`, `]( #n)`) name nothing.
 fn identifiers(text: &str) -> impl Iterator<Item = &str> {
     let bytes = text.as_bytes();
     let word = |b: u8| b.is_ascii_alphanumeric() || b == b'-' || b == b'_';
@@ -167,6 +171,14 @@ fn identifiers(text: &str) -> impl Iterator<Item = &str> {
     std::iter::from_fn(move || {
         while start < bytes.len() {
             let from = start;
+            if bytes[from] == b'#' {
+                start += 1;
+                if let Some(end) = hash_number_end(bytes, from) {
+                    start = end;
+                    return Some(&text[from + 1..end]);
+                }
+                continue;
+            }
             if !bytes[from].is_ascii_uppercase() || (from > 0 && word(bytes[from - 1])) {
                 start += 1;
                 continue;
@@ -193,6 +205,33 @@ fn identifiers(text: &str) -> impl Iterator<Item = &str> {
         }
         None
     })
+}
+
+/// The end of the `#n` that starts at `from` (a `#`), if it is a blocker.
+fn hash_number_end(bytes: &[u8], from: usize) -> Option<usize> {
+    let boundary = from == 0
+        || matches!(
+            bytes[from - 1],
+            b' ' | b'\t' | b'\r' | b'\n' | b'(' | b'[' | b',' | b';' | b':' | b'*' | b'_'
+        );
+    if !boundary {
+        return None;
+    }
+    // A link destination: `](#n)`, with optional whitespace after the `(`.
+    let mut before = from;
+    while before > 0 && bytes[before - 1].is_ascii_whitespace() {
+        before -= 1;
+    }
+    if before >= 2 && bytes[before - 1] == b'(' && bytes[before - 2] == b']' {
+        return None;
+    }
+    let digits = from + 1;
+    let mut end = digits;
+    while end < bytes.len() && bytes[end].is_ascii_digit() {
+        end += 1;
+    }
+    let word = |b: u8| b.is_ascii_alphanumeric() || b == b'-' || b == b'_';
+    (end > digits && (end == bytes.len() || !word(bytes[end]))).then_some(end)
 }
 
 #[cfg(test)]
@@ -233,6 +272,46 @@ mod tests {
             text_blockers("Blocked by owl-1, XOWL-2x, OWL-3a, OWL-, -OWL-4, (OWL-5), A1-7"),
             ["OWL-5", "A1-7"]
         );
+    }
+
+    #[test]
+    fn hash_numbers_are_blockers() {
+        let cases: [(&str, &[&str]); 8] = [
+            ("Blocked by #12 and #15.", &["12", "15"]),
+            ("Blocked by #12, #12", &["12"]),
+            ("Blocked by OWL-1 and #2", &["OWL-1", "2"]),
+            ("Blocked by (#7)", &["7"]),
+            ("- **Blocked by** #3", &["3"]),
+            ("Blocked by **#12** and *#13*", &["12", "13"]),
+            ("Blocked by #OWL-1", &["OWL-1"]),
+            // `after_blocked_by` hands over the tail, so a `#` glued to the
+            // phrase starts it: accepted.
+            ("Blocked by#12", &["12"]),
+        ];
+        for (description, expected) in cases {
+            assert_eq!(text_blockers(description), expected, "{description:?}");
+        }
+    }
+
+    #[test]
+    fn hash_numbers_in_other_shapes_name_nothing() {
+        for description in [
+            "Blocked by 12",
+            "Blocked by owner/repo#12",
+            "Blocked by page#12",
+            "Blocked by https://example.com/page#12",
+            "Blocked by https://example.com/#12",
+            "Blocked by [x](https://a.b/c#12)",
+            "Blocked by [x](#12)",
+            "Blocked by [x]( #12)",
+            "Blocked by #12abc",
+            "Blocked by #12-3",
+            "Blocked by #",
+            "Blocked by &#12;",
+            "See #12",
+        ] {
+            assert!(text_blockers(description).is_empty(), "{description:?}");
+        }
     }
 
     #[test]
