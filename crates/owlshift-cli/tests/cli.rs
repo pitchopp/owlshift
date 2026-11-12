@@ -1447,6 +1447,46 @@ fn init_on_an_empty_root_leaves_the_gate_empty() {
 }
 
 #[test]
+fn init_markdown_writes_an_example_ticket_and_says_the_limits() {
+    let config_dir = tempfile::tempdir().unwrap();
+    let repo = tempfile::tempdir().unwrap();
+    git_init(repo.path());
+    let out = init_markdown(repo.path(), config_dir.path(), &[]);
+    let ticket = repo.path().join("tickets/DEMO-1/ticket.md");
+    let text = fs::read_to_string(&ticket).unwrap();
+    assert!(text.contains("assignee = \"maintainer\""), "{text}");
+    assert!(out.contains("tickets"), "{out}");
+    assert!(out.contains("replace its assignee `maintainer`"), "{out}");
+    assert!(out.contains("serves one machine"), "{out}");
+    assert!(out.contains("`owlshift start` refuses"), "{out}");
+    let written = fs::read_to_string(repo.path().join("owlshift.toml")).unwrap();
+    assert!(written.contains("serves one machine"), "{written}");
+    assert!(written.contains("docs/markdown-tracker.md"), "{written}");
+
+    // A rerun keeps the project file, so it writes no ticket: an edit stays.
+    fs::write(&ticket, "edited").unwrap();
+    init_markdown(repo.path(), config_dir.path(), &[]);
+    assert_eq!(fs::read_to_string(&ticket).unwrap(), "edited");
+
+    // Tickets already there are left alone, and Linear has no files to write.
+    let other = tempfile::tempdir().unwrap();
+    git_init(other.path());
+    fs::create_dir_all(other.path().join("tickets/OWL-1")).unwrap();
+    let out = init_markdown(other.path(), config_dir.path(), &[]);
+    assert!(!other.path().join("tickets/DEMO-1").exists());
+    assert!(out.contains("already holds tickets"), "{out}");
+    let linear = tempfile::tempdir().unwrap();
+    git_init(linear.path());
+    let output = owlshift(
+        linear.path(),
+        config_dir.path(),
+        &["init", "--team", "OWL", "--skip-secrets"],
+    );
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert!(!linear.path().join("tickets").exists());
+}
+
+#[test]
 fn init_writes_a_commented_project_file_once() {
     let config_dir = tempfile::tempdir().unwrap();
     let repo = tempfile::tempdir().unwrap();

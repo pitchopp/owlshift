@@ -21,9 +21,9 @@ use owlshift_runner::config::{Effective, FileState};
 use owlshift_runner::forge::GitHubApp;
 use owlshift_runner::github_sign_in::{self, Ask, GitHub, Outcome, SystemWait};
 use owlshift_runner::init::{
-    AppStored, GITHUB_TOKEN, InitOptions, SecretsReport, Wanted, Written, project_file,
-    read_root_files, required_secrets, store_app_credentials, store_secrets, wanted_secrets,
-    write_project_file,
+    AppStored, EXAMPLE_ASSIGNEE, EXAMPLE_TICKET, GITHUB_TOKEN, InitOptions, MARKDOWN_LIMITS,
+    MARKDOWN_PAGE, SecretsReport, Wanted, Written, project_file, read_root_files, required_secrets,
+    store_app_credentials, store_secrets, wanted_secrets, write_example_ticket, write_project_file,
 };
 use owlshift_runner::install::Manifests;
 use owlshift_runner::project::ProjectDirs;
@@ -114,6 +114,9 @@ pub fn run(args: &Args, config: &Effective) -> ExitCode {
                         }
                     );
                     report_detection(&options);
+                    if options.tracker == TrackerKind::Markdown {
+                        report_example(root);
+                    }
                 }
                 Ok(Written::Kept) => {
                     return fail(&format!(
@@ -519,6 +522,26 @@ fn report_detection(options: &InitOptions) {
 
 /// The last lines of a successful `init`: the gate line is last. A run that
 /// fails before here (a secret missing or refused) ends with its own error.
+/// Writes the first ticket of a new Markdown project and says what to do
+/// with it, and what the tracker cannot do. Nothing is committed.
+fn report_example(root: &std::path::Path) {
+    let path = root.join("tickets").join(EXAMPLE_TICKET).join("ticket.md");
+    match write_example_ticket(root) {
+        Ok(Written::Created) => println!(
+            "Wrote {} as an example: replace its assignee `{EXAMPLE_ASSIGNEE}`, the ticket's \
+             decider, with your own name, then run `owlshift do {EXAMPLE_TICKET}`. Nothing is \
+             committed.",
+            path.display()
+        ),
+        Ok(Written::Kept) => println!("tickets/ already holds tickets: no example ticket written."),
+        Err(error) => println!(
+            "The example ticket was not written: {}: {error}",
+            path.display()
+        ),
+    }
+    println!("{MARKDOWN_LIMITS} Format: {MARKDOWN_PAGE}");
+}
+
 fn next_steps() -> ExitCode {
     println!(
         "Next: `owlshift doctor` checks git, the harnesses and the Claude Code token for agent runs; `owlshift do TICKET` runs \
