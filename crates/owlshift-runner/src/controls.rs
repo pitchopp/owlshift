@@ -495,9 +495,9 @@ mod tests {
         std::fs::create_dir_all(file.parent().unwrap()).unwrap();
         std::fs::write(&file, "not json").unwrap();
         let request = Request::new(BY_PAUSE, Timestamp::now(), "night");
-        pause(data.path(), None, &request).unwrap();
+        pause(data.path(), None, &request, Voice::Terminal).unwrap();
         std::fs::write(&file, "not json").unwrap();
-        resume(data.path(), None, None).unwrap();
+        resume(data.path(), None, Voice::Terminal, None).unwrap();
         let seen = events(data.path());
         assert_eq!(seen.len(), 2, "{seen:?}");
         assert_eq!(seen[0]["data"]["replaced"], json!({}));
