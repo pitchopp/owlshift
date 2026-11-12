@@ -24,9 +24,8 @@ use std::time::{Duration, Instant};
 use jiff::Timestamp;
 use owlshift_adapters::forge::Repo;
 use owlshift_adapters::notifier::Notifier;
-use owlshift_adapters::tracker::markdown::MarkdownTracker;
 use owlshift_adapters::tracker::{Capability, Tracker};
-use owlshift_contracts::config::{Models, ProjectConfig, TrackerKind};
+use owlshift_contracts::config::{Models, ProjectConfig};
 use owlshift_contracts::format::{Format, strip_role_front_matter};
 use owlshift_contracts::ids::TicketId;
 use owlshift_contracts::service::WatchRecord;
@@ -334,10 +333,7 @@ fn run_with(
     // The project's own secrets, or the shared ones it has none of its own
     // for, each entry read once (OWL-308).
     let mut read = |account: &str| keychain.read(account).map_err(|error| error.to_string());
-    let tracker_secrets = match project.tracker.kind {
-        TrackerKind::Linear => Some(secrets::tracker(&repo, &mut read)?),
-        TrackerKind::Markdown => None,
-    };
+    let tracker_secrets = tracker::keychain_set(project, &repo, &mut read)?;
     let forge_secret = secrets::forge(&repo, &mut read)?;
     // A step's child does not say again what its watch said at its start.
     if let Some(notice) = secrets::shared_notice(
@@ -348,16 +344,11 @@ fn run_with(
     {
         eprintln!("owlshift: {notice}");
     }
-    let team = match &tracker_secrets {
-        Some(_) => Some(
-            project
-                .tracker
-                .team
-                .as_deref()
-                .ok_or("a Linear project names its team in `tracker.team`")?,
-        ),
-        None => None,
-    };
+    let opener = tracker::of(project.tracker.kind).opener(
+        &project.tracker,
+        root,
+        tracker_secrets.as_ref(),
+    )?;
     let dirs = ProjectDirs::new(data_dir, &repo);
     let access = forge::AppAccess {
         keychain: keychain.clone(),
@@ -372,10 +363,7 @@ fn run_with(
     // App's token is refreshed under the project's account lock (OWL-384);
     // one already expired is refreshed here, before any work.
     let mut open = || -> Result<(Box<dyn Tracker>, _), Refusal> {
-        let tracker: Box<dyn Tracker> = match (&tracker_secrets, team) {
-            (Some(found), Some(team)) => Box::new(tracker::linear(found, team)?),
-            _ => Box::new(MarkdownTracker::new(root)),
-        };
+        let tracker = opener.open()?;
         let forge = forge::github(&forge_secret, repo.clone(), &access)?;
         Ok((tracker, forge))
     };

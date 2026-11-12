@@ -18,9 +18,8 @@ use owlshift_adapters::forge::Repo;
 pub use crate::forge::TokenTryError;
 pub use crate::project::DefaultBranchFile;
 pub use crate::quarantine::MarkerState;
-use crate::secrets::TrackerAccounts;
 use crate::ticket_ref::{self, RefState};
-pub use crate::tracker::{AppError, StatesError};
+pub use crate::tracker::{AppError, Probe, Probed, StatesError};
 pub use owlshift_adapters::tracker::linear::{AccountFact, AdmissionFacts, AppUser};
 
 /// How long a probe such as `git --version` may take. C8 measured about
@@ -89,51 +88,15 @@ pub trait System {
     fn origin_repo(&self, root: &Path) -> Result<Repo, String> {
         crate::config::origin_repo(self, root)
     }
-    /// The names of the workflow states of the Linear team `team`, read
-    /// over the network with the Linear API key stored under `accounts`
-    /// (OWL-147). Only `owlshift doctor` asks, and only for a Linear project.
-    fn linear_states(
-        &self,
-        accounts: &TrackerAccounts,
-        team: &str,
-    ) -> Result<Vec<String>, StatesError> {
-        owlshift_platform::keychain::Keychain::system()
-            .map_err(|error| StatesError::Keychain(error.to_string()))
-            .and_then(|keychain| crate::tracker::linear_team_states(&keychain, accounts, team))
-    }
-    /// What the admission and proposals setup of the Linear team `team`
-    /// looks like (OWL-155): which of `labels` the team can carry, which of
-    /// `people` the workspace knows, and where a proposal would be filed,
-    /// given the ready state `ready`. Read over the network with the key
-    /// stored under `accounts`. Only `owlshift doctor` asks, and only for a
-    /// Linear project.
-    fn linear_admission(
-        &self,
-        accounts: &TrackerAccounts,
-        team: &str,
-        ready: &str,
-        labels: &[&str],
-        people: &[&str],
-    ) -> Result<AdmissionFacts, StatesError> {
-        owlshift_platform::keychain::Keychain::system()
-            .map_err(|error| StatesError::Keychain(error.to_string()))
-            .and_then(|keychain| {
-                crate::tracker::linear_admission(&keychain, accounts, team, ready, labels, people)
-            })
-    }
-    /// The Linear app user Owlshift writes as, with the credentials stored
-    /// under `accounts`, checked over the network as `owlshift do` checks it
-    /// for team `team`, its token revoked after: `None` when no app is
-    /// stored (OWL-157). Only `owlshift doctor` asks, and only for a Linear
-    /// project.
-    fn linear_app(
-        &self,
-        accounts: &TrackerAccounts,
-        team: &str,
-    ) -> Result<Option<AppUser>, AppError> {
-        owlshift_platform::keychain::Keychain::system()
-            .map_err(|error| AppError::Keychain(error.to_string()))
-            .and_then(|keychain| crate::tracker::linear_app_user(&keychain, accounts, team))
+    /// What the project's tracker answers to `probe`, read over the network
+    /// with the tracker set stored in the system keychain under the probe's
+    /// accounts: a Linear team's workflow states (OWL-147), its admission and
+    /// proposals setup (OWL-155), or the Linear app user Owlshift writes as,
+    /// checked as `owlshift do` checks it, its token revoked after
+    /// (OWL-157). Only `owlshift doctor` asks, and only for a tracker whose
+    /// kind probes it.
+    fn tracker_probe(&self, probe: &Probe<'_>) -> Probed {
+        probe.read()
     }
     /// What the GitHub token of the project of `repo` reads of the
     /// repository's default branch, the token resolved and read as `owlshift
@@ -417,6 +380,7 @@ pub(crate) mod fake {
     use std::collections::HashMap;
 
     use super::*;
+    use crate::secrets::TrackerAccounts;
 
     pub(crate) enum Answer {
         Exit(i32, &'static str, &'static str),
@@ -790,6 +754,67 @@ pub(crate) mod fake {
                 .unwrap_or_else(|| Ok(Repo::parse("pitchopp/owlshift").unwrap()))
         }
 
+        fn tracker_probe(&self, probe: &Probe<'_>) -> Probed {
+            match *probe {
+                Probe::LinearStates { accounts, team } => {
+                    Probed::States(self.linear_states(accounts, team))
+                }
+                Probe::LinearAdmission {
+                    accounts,
+                    team,
+                    ready,
+                    labels,
+                    people,
+                } => {
+                    Probed::Admission(self.linear_admission(accounts, team, ready, labels, people))
+                }
+                Probe::LinearApp { accounts, team } => Probed::App(self.linear_app(accounts, team)),
+            }
+        }
+
+        /// As [`Self::github_default_branch_is`] scripted it, whatever is
+        /// stored; never the keychain or the network.
+        fn github_default_branch(&self, _repo: &Repo) -> Result<DefaultBranch, TokenTryError> {
+            self.github_default_branch.clone().unwrap_or_else(|| {
+                Ok(DefaultBranch::Readable(
+                    owlshift_adapters::forge::Branch::new("main").unwrap(),
+                ))
+            })
+        }
+
+        /// As [`Self::github_app_grants_are`] scripted it: by default an
+        /// installation that granted both.
+        fn github_app_grants(
+            &self,
+            _repo: &Repo,
+            _slug: &str,
+        ) -> Result<crate::forge::AppGrants, TokenTryError> {
+            self.github_app_grants
+                .clone()
+                .unwrap_or(Ok(crate::forge::AppGrants::Installed {
+                    installation: 9,
+                    contents_write: true,
+                    actions_write: true,
+                }))
+        }
+
+        #[cfg(unix)]
+        fn sentinel(&self) -> SentinelStatus {
+            self.sentinel
+                .clone()
+                .unwrap_or(SentinelStatus::Running { pid: 4242 })
+        }
+
+        #[cfg(unix)]
+        fn sentinel_probe(&self) -> SentinelProbe {
+            self.sentinel_probe.clone().unwrap_or(SentinelProbe::Works {
+                elapsed: Duration::from_millis(3),
+            })
+        }
+    }
+
+    /// What its `tracker_probe` answers, by probe.
+    impl FakeSystem {
         /// The key's presence follows [`Self::unstored`] and
         /// [`Self::keychain_fails`]; never the network.
         fn linear_states(
@@ -869,46 +894,6 @@ pub(crate) mod fake {
                         })
                 }
             }
-        }
-
-        /// As [`Self::github_default_branch_is`] scripted it, whatever is
-        /// stored; never the keychain or the network.
-        fn github_default_branch(&self, _repo: &Repo) -> Result<DefaultBranch, TokenTryError> {
-            self.github_default_branch.clone().unwrap_or_else(|| {
-                Ok(DefaultBranch::Readable(
-                    owlshift_adapters::forge::Branch::new("main").unwrap(),
-                ))
-            })
-        }
-
-        /// As [`Self::github_app_grants_are`] scripted it: by default an
-        /// installation that granted both.
-        fn github_app_grants(
-            &self,
-            _repo: &Repo,
-            _slug: &str,
-        ) -> Result<crate::forge::AppGrants, TokenTryError> {
-            self.github_app_grants
-                .clone()
-                .unwrap_or(Ok(crate::forge::AppGrants::Installed {
-                    installation: 9,
-                    contents_write: true,
-                    actions_write: true,
-                }))
-        }
-
-        #[cfg(unix)]
-        fn sentinel(&self) -> SentinelStatus {
-            self.sentinel
-                .clone()
-                .unwrap_or(SentinelStatus::Running { pid: 4242 })
-        }
-
-        #[cfg(unix)]
-        fn sentinel_probe(&self) -> SentinelProbe {
-            self.sentinel_probe.clone().unwrap_or(SentinelProbe::Works {
-                elapsed: Duration::from_millis(3),
-            })
         }
     }
 }

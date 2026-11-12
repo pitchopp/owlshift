@@ -27,20 +27,19 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use owlshift_adapters::forge::Repo;
-use owlshift_adapters::tracker::linear::{ApiKey, KeyAccount, LinearTracker};
+use owlshift_adapters::tracker::linear::KeyAccount;
+#[cfg(test)]
+use owlshift_adapters::tracker::linear::LinearTracker;
 use owlshift_adapters::tracker::{Comment, Tracker};
-use owlshift_contracts::config::TrackerKind;
 use owlshift_contracts::ids::TicketId;
 use owlshift_contracts::refs::{Ask, Waiting};
 use owlshift_contracts::result::{Question, option_index, option_letter};
 use owlshift_core::floor::same_account;
 use owlshift_core::reply::ends_with_go;
-use owlshift_platform::keychain::Keychain;
 use serde_json::{Map, Value, json};
 
 use crate::on_demand::{APPROVAL_CATEGORY, change_needs_words};
 use crate::project::ProjectDirs;
-use crate::secrets;
 use crate::ticket_ref::TicketRecord;
 use crate::writer::{WriteError, Writer};
 
@@ -298,7 +297,7 @@ impl Drop for NameRead {
 }
 
 /// The production opener: the key `owlshift init` stored for the project of
-/// `repo`, its own accounts or the shared ones ([`secrets::tracker`]), read
+/// `repo`, its own accounts or the shared ones ([`crate::secrets::tracker`]), read
 /// from the system keychain, and its account read once through it. The
 /// Linear app's pair is never used: a reply goes through the key, whose
 /// account is the operator's. Only a project served on a Linear project file
@@ -306,31 +305,7 @@ impl Drop for NameRead {
 /// asked.
 pub fn open_key(data: &Path, repo: &Repo) -> Result<Key, String> {
     let config = super::ticket::served_config(&ProjectDirs::new(data, repo))?;
-    if config.tracker.kind != TrackerKind::Linear {
-        return Err(
-            "the project's tracker is not Linear: a reply from the UI goes through a Linear key"
-                .into(),
-        );
-    }
-    let keychain = Keychain::system().map_err(|e| format!("the keychain cannot be read: {e}"))?;
-    let mut look = |account: &str| keychain.read(account).map_err(|e| e.to_string());
-    let found = secrets::tracker(repo, &mut look)?;
-    let Some(key) = found.key else {
-        return Err(format!(
-            "no Linear API key is stored for this project (account `{}`): run `owlshift init`",
-            found.accounts.key
-        ));
-    };
-    let tracker = LinearTracker::new(ApiKey::new(key.expose()));
-    let account = tracker
-        .key_account()
-        .map_err(|e| format!("the Linear key's account could not be read: {e}"))?;
-    let reader = LinearTracker::new(ApiKey::new(key.expose()));
-    Ok(Key {
-        account,
-        tracker: Box::new(tracker),
-        names: Box::new(move |id: &str| reader.account_name(id).map_err(|e| e.to_string())),
-    })
+    crate::tracker::of(config.tracker.kind).reply_key(repo)
 }
 
 /// The ask a ticket's newest record waits on: its latest, while its state

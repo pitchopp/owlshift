@@ -5,17 +5,220 @@
 //! (architecture section 8). The token of the Linear app lives in the
 //! runner's memory alone, for one command (OWL-157). Which accounts hold a
 //! project's credentials is [`crate::secrets`]'s to say (OWL-308).
+//!
+//! It is also where the runner chooses between its trackers (OWL-533,
+//! build plan "P9 · Open-source readiness", part 2): [`of`] gives the
+//! [`Kind`] of the project's tracker, which holds what differs by tracker,
+//! and `doctor`, `init`, `owlshift do` and the UI reach a tracker through
+//! it. Each kind is a file of its own under `tracker/`.
+
+mod linear;
+mod markdown;
 
 use std::fmt;
+use std::path::Path;
 
+use owlshift_adapters::forge::Repo;
 use owlshift_adapters::tracker;
-use owlshift_adapters::tracker::ErrorKind;
 use owlshift_adapters::tracker::linear::app::{AppTransport, ClientCredentials, HttpOAuth};
 use owlshift_adapters::tracker::linear::{AdmissionFacts, ApiKey, AppUser, LinearTracker};
+use owlshift_adapters::tracker::{Capability, ErrorKind};
+use owlshift_contracts::config::{self, ProjectConfig, TrackerKind};
+use owlshift_contracts::ids::TicketId;
 use owlshift_platform::keychain::{Keychain, SERVICE, Secret};
 
+use crate::doctor::Check;
+use crate::init::SecretSpec;
 use crate::refusal::Refusal;
-use crate::secrets::{Source, TrackerAccounts, TrackerSecrets};
+use crate::secrets::{Lookup, Source, TrackerAccounts, TrackerSecrets};
+use crate::system::System;
+
+/// What differs by tracker, for one kind of tracker a project file names
+/// (`[tracker].kind`): [`of`] gives it.
+pub trait Kind: Sync {
+    /// Its name in a project file, `kind = "…"`.
+    fn name(&self) -> &'static str;
+
+    /// The capabilities its adapter declares (architecture section 6).
+    fn capabilities(&self) -> &'static [Capability];
+
+    /// The secrets of the tracker that `owlshift do` reads from the
+    /// keychain, in the order `init` asks for them: none when it needs none
+    /// of its own.
+    fn secret_specs(&self) -> &'static [SecretSpec];
+
+    /// The lines `init` writes under `[tracker]` of a new project file, the
+    /// team key being `team` as `--team` gave it; the error says what is
+    /// missing.
+    fn project_file_lines(&self, team: Option<&str>) -> Result<String, String>;
+
+    /// Refuses `ticket` when its id says it is not one of the project's,
+    /// before anything is read ([`crate::on_demand::check_team`]).
+    fn check_ticket(&self, tracker: &config::Tracker, ticket: &TicketId) -> Result<(), String>;
+
+    /// What opens the adapter of the project whose `[tracker]` is `tracker`,
+    /// checked out at `root`, with the tracker secrets [`keychain_set`]
+    /// read: the error says what the project file or the keychain lacks.
+    fn opener<'a>(
+        &self,
+        tracker: &'a config::Tracker,
+        root: &'a Path,
+        secrets: Option<&'a TrackerSecrets<Secret>>,
+    ) -> Result<Opener<'a>, String>;
+
+    /// The lines `owlshift doctor` reports on the tracker itself, after the
+    /// secrets and forge lines, for the loaded project `config` whose
+    /// tracker set is stored under `accounts` (`None` when doctor could not
+    /// tell, which its `secrets` line says).
+    fn doctor_lines(
+        &self,
+        system: &dyn System,
+        config: &ProjectConfig,
+        accounts: Option<&TrackerAccounts>,
+    ) -> Vec<Check>;
+
+    /// What the tracker says of the project's admission and proposals
+    /// setup (OWL-155), read once for doctor's `drain admission` and
+    /// `proposals inbox` lines: `None` when the tracker is not asked.
+    fn admission_facts(
+        &self,
+        system: &dyn System,
+        config: &ProjectConfig,
+        accounts: Option<&TrackerAccounts>,
+    ) -> Option<Result<AdmissionFacts, StatesError>>;
+
+    /// Doctor's `proposals inbox` line (OWL-155): whether a follow-up
+    /// Owlshift proposes can be filed, given what [`Kind::admission_facts`]
+    /// read.
+    fn proposals_inbox(
+        &self,
+        config: &ProjectConfig,
+        facts: Option<&Result<AdmissionFacts, StatesError>>,
+    ) -> Option<Check>;
+
+    /// The operator's key that the UI posts a decider's reply through, for
+    /// the project of `repo`, opened with its account read once
+    /// ([`crate::ui::reply::open_key`]); the error says why there is none.
+    fn reply_key(&self, repo: &Repo) -> Result<crate::ui::reply::Key, String>;
+
+    /// Whether `owlshift init` stores the client ID and secret of an app the
+    /// tracker writes as (OWL-157).
+    fn stores_app(&self) -> bool;
+}
+
+/// The kind of the tracker a project file names: the one place the runner
+/// chooses between its trackers.
+pub fn of(kind: TrackerKind) -> &'static dyn Kind {
+    match kind {
+        TrackerKind::Linear => &linear::Linear,
+        TrackerKind::Markdown => &markdown::Markdown,
+    }
+}
+
+/// The tracker set of the project of `repo`, each account looked up by
+/// `look` as [`crate::secrets::tracker`] says: `None` when the project's
+/// tracker needs no secret of its own, and then no account is looked up.
+pub fn keychain_set<T>(
+    config: &ProjectConfig,
+    repo: &Repo,
+    look: &mut Lookup<'_, T>,
+) -> Result<Option<TrackerSecrets<T>>, String> {
+    if of(config.tracker.kind).secret_specs().is_empty() {
+        return Ok(None);
+    }
+    crate::secrets::tracker(repo, look).map(Some)
+}
+
+/// What `owlshift doctor` asks of the project's tracker over the network,
+/// through [`crate::system::System::tracker_probe`].
+#[derive(Clone, Copy, Debug)]
+pub enum Probe<'a> {
+    /// The names of the workflow states of the Linear team `team`
+    /// ([`linear_team_states`], OWL-147).
+    LinearStates {
+        accounts: &'a TrackerAccounts,
+        team: &'a str,
+    },
+    /// What the admission and proposals setup of the Linear team `team`
+    /// looks like ([`linear_admission`], OWL-155).
+    LinearAdmission {
+        accounts: &'a TrackerAccounts,
+        team: &'a str,
+        ready: &'a str,
+        labels: &'a [&'a str],
+        people: &'a [&'a str],
+    },
+    /// The Linear app user Owlshift writes as ([`linear_app_user`],
+    /// OWL-157).
+    LinearApp {
+        accounts: &'a TrackerAccounts,
+        team: &'a str,
+    },
+}
+
+/// The answer to a [`Probe`], of the variant named as the probe's.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Probed {
+    States(Result<Vec<String>, StatesError>),
+    Admission(Result<AdmissionFacts, StatesError>),
+    App(Result<Option<AppUser>, AppError>),
+}
+
+impl Probe<'_> {
+    /// The answer, read with the tracker set stored under the probe's
+    /// accounts in the system keychain, over the network.
+    pub fn read(&self) -> Probed {
+        let keychain = match Keychain::system() {
+            Ok(keychain) => keychain,
+            Err(error) => return self.keychain_error(error.to_string()),
+        };
+        match *self {
+            Self::LinearStates { accounts, team } => {
+                Probed::States(linear_team_states(&keychain, accounts, team))
+            }
+            Self::LinearAdmission {
+                accounts,
+                team,
+                ready,
+                labels,
+                people,
+            } => Probed::Admission(linear_admission(
+                &keychain, accounts, team, ready, labels, people,
+            )),
+            Self::LinearApp { accounts, team } => {
+                Probed::App(linear_app_user(&keychain, accounts, team))
+            }
+        }
+    }
+
+    /// The answer of a keychain that could not be read, for `reason`.
+    pub fn keychain_error(&self, reason: String) -> Probed {
+        match self {
+            Self::LinearStates { .. } => Probed::States(Err(StatesError::Keychain(reason))),
+            Self::LinearAdmission { .. } => Probed::Admission(Err(StatesError::Keychain(reason))),
+            Self::LinearApp { .. } => Probed::App(Err(AppError::Keychain(reason))),
+        }
+    }
+}
+
+/// Opens the project's tracker adapter, afresh on each call: `owlshift do`
+/// opens it again on each try while the tracker does not answer (OWL-479).
+pub struct Opener<'a> {
+    open: Box<dyn Fn() -> Result<Box<dyn tracker::Tracker>, Refusal> + 'a>,
+}
+
+impl<'a> Opener<'a> {
+    fn new(open: impl Fn() -> Result<Box<dyn tracker::Tracker>, Refusal> + 'a) -> Self {
+        Self {
+            open: Box::new(open),
+        }
+    }
+
+    /// The adapter, opened now.
+    pub fn open(&self) -> Result<Box<dyn tracker::Tracker>, Refusal> {
+        (self.open)()
+    }
+}
 
 /// The keychain account, under [`SERVICE`], that every project of a machine
 /// shared for the Linear API key before OWL-308, still read for a project
@@ -286,6 +489,18 @@ mod tests {
 
     fn own() -> TrackerAccounts {
         TrackerAccounts::project(&Repo::parse("pitchopp/owlshift").unwrap())
+    }
+
+    /// A kind's name is the value `[tracker].kind` takes for it, and the
+    /// lines `init` writes say it.
+    #[test]
+    fn each_kind_is_named_as_the_project_file_names_it() {
+        for kind in [TrackerKind::Linear, TrackerKind::Markdown] {
+            let name = of(kind).name();
+            assert_eq!(serde_json::to_value(kind).unwrap(), name, "{kind:?}");
+            let lines = of(kind).project_file_lines(Some("OWL")).unwrap();
+            assert!(lines.contains(&format!("kind = \"{name}\"")), "{lines}");
+        }
     }
 
     /// OWL-479: a Linear that gave no answer waits for the network, one

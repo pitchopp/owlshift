@@ -59,33 +59,9 @@ requires = \">={}.{}\"
 ",
         version.major, version.minor
     );
-    match options.tracker {
-        TrackerKind::Linear => {
-            let team = options
-                .team
-                .as_deref()
-                .map(str::trim)
-                .filter(|team| !team.is_empty())
-                .ok_or("a Linear project needs its team key: pass --team, such as --team OWL")?;
-            text.push_str(&format!(
-                "\
-# Where the tickets live: \"linear\", or \"markdown\" for tickets kept in
-# this repository, one folder per ticket under tickets/.
-kind = \"linear\"
-# The Linear team key: the prefix of its ticket ids, OWL in OWL-12.
-team = {}
-",
-                quote(team)
-            ));
-        }
-        TrackerKind::Markdown => text.push_str(
-            "\
-# Where the tickets live: \"markdown\" for tickets kept in this repository,
-# one folder per ticket under tickets/, or \"linear\" with its `team` key.
-kind = \"markdown\"
-",
-        ),
-    }
+    text.push_str(
+        &crate::tracker::of(options.tracker).project_file_lines(options.team.as_deref())?,
+    );
     let gate = if options.gate.is_empty() {
         "gate = []\n".to_owned()
     } else {
@@ -253,10 +229,9 @@ pub const LINEAR_APP_SECRET: SecretSpec = SecretSpec {
 /// and the agent runs' Claude Code token always, since `do` runs Claude
 /// Code, and the tracker's for Linear.
 pub fn required_secrets(tracker: TrackerKind) -> Vec<SecretSpec> {
-    match tracker {
-        TrackerKind::Linear => vec![LINEAR_KEY, GITHUB_TOKEN, CLAUDE_TOKEN],
-        TrackerKind::Markdown => vec![GITHUB_TOKEN, CLAUDE_TOKEN],
-    }
+    let mut specs = crate::tracker::of(tracker).secret_specs().to_vec();
+    specs.extend([GITHUB_TOKEN, CLAUDE_TOKEN]);
+    specs
 }
 
 /// A secret `init` makes sure of, with the account it is stored under.

@@ -11,10 +11,9 @@ use std::time::Duration;
 
 use owlshift_adapters::forge::Repo;
 use owlshift_contracts::ids::TicketId;
-use owlshift_runner::secrets::TrackerAccounts;
 use owlshift_runner::system::{
-    AdmissionFacts, AppError, AppUser, Captured, DataDirSource, DefaultBranch, DefaultBranchFile,
-    MarkerState, RunError, RunningBuilds, StatesError, System, TokenTryError,
+    Captured, DataDirSource, DefaultBranch, DefaultBranchFile, MarkerState, Probe, Probed,
+    RunError, RunningBuilds, System, TokenTryError,
 };
 #[cfg(unix)]
 use owlshift_runner::system::{SentinelProbe, SentinelStatus};
@@ -166,31 +165,8 @@ impl System for ScriptedSystem {
         Ok(self.origin_of(root))
     }
 
-    fn linear_states(
-        &self,
-        _accounts: &TrackerAccounts,
-        _team: &str,
-    ) -> Result<Vec<String>, StatesError> {
-        Err(StatesError::Keychain(Self::scripted("the keychain")))
-    }
-
-    fn linear_admission(
-        &self,
-        _accounts: &TrackerAccounts,
-        _team: &str,
-        _ready: &str,
-        _labels: &[&str],
-        _people: &[&str],
-    ) -> Result<AdmissionFacts, StatesError> {
-        Err(StatesError::Keychain(Self::scripted("the keychain")))
-    }
-
-    fn linear_app(
-        &self,
-        _accounts: &TrackerAccounts,
-        _team: &str,
-    ) -> Result<Option<AppUser>, AppError> {
-        Err(AppError::Keychain(Self::scripted("the keychain")))
+    fn tracker_probe(&self, probe: &Probe<'_>) -> Probed {
+        probe.keychain_error(Self::scripted("the keychain"))
     }
 
     fn github_default_branch(&self, _repo: &Repo) -> Result<DefaultBranch, TokenTryError> {
