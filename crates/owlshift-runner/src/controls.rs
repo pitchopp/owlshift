@@ -486,6 +486,24 @@ mod tests {
         assert_eq!(seen[1]["data"]["pause"], "lifted");
     }
 
+    /// A pause file that does not read still stands: the events hold `{}`
+    /// for what it replaced and what was lifted.
+    #[test]
+    fn an_unreadable_pause_file_is_recorded_as_an_empty_object() {
+        let data = tempfile::tempdir().unwrap();
+        let file = requests::machine_pause_file(data.path());
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        std::fs::write(&file, "not json").unwrap();
+        let request = Request::new(BY_PAUSE, Timestamp::now(), "night");
+        pause(data.path(), None, &request).unwrap();
+        std::fs::write(&file, "not json").unwrap();
+        resume(data.path(), None, None).unwrap();
+        let seen = events(data.path());
+        assert_eq!(seen.len(), 2, "{seen:?}");
+        assert_eq!(seen[0]["data"]["replaced"], json!({}));
+        assert_eq!(seen[1]["data"]["was"], json!({}));
+    }
+
     /// An event that cannot be appended adds a warning line and fails
     /// nothing.
     #[test]
