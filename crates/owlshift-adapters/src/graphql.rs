@@ -93,6 +93,14 @@ pub trait Transport {
         let _ = body;
         no_write(path)
     }
+
+    /// Deletes `path` of the forge's REST API, such as an issue's label
+    /// `repos/<owner>/<name>/issues/<n>/labels/<label>` (OWL-535), and
+    /// returns the answer as [`Self::put`] does. A REST call alone: a GraphQL
+    /// transport leaves it refused, as it is by default.
+    fn delete(&self, path: &str) -> Result<Response, String> {
+        no_write(path)
+    }
 }
 
 /// A transport's default refusal of a REST write.

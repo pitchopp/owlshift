@@ -21,7 +21,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::format::ContractError;
 use crate::ids::{check_name, is_repository_part};
-use crate::{Harness, PlanApproval, Role, Variant};
+use crate::{Harness, PlanApproval, Priority, Role, Variant};
 
 const PROJECT: &str = "owlshift.toml";
 const PERSONAL: &str = "personal configuration";
@@ -120,6 +120,11 @@ pub struct Tracker {
     pub exclude: Option<String>,
     /// The tracker states that show a ticket's visible stage.
     pub states: States,
+    /// The labels that give a ticket its priority on a tracker without a
+    /// priority of its own (GitHub Issues); optional, every ticket reading
+    /// `unset` without it (OWL-535).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub priorities: Option<Priorities>,
 }
 
 /// What `[tracker]` may say, before `admit = "ready"` is resolved: the same
@@ -153,6 +158,10 @@ struct TrackerForm {
     exclude: Option<String>,
     /// The tracker states that show a ticket's visible stage.
     states: States,
+    /// The labels that give a ticket its priority on a tracker without a
+    /// priority of its own (GitHub Issues); optional, every ticket reading
+    /// `unset` without it (OWL-535).
+    priorities: Option<Priorities>,
 }
 
 impl From<TrackerForm> for Tracker {
@@ -170,6 +179,7 @@ impl From<TrackerForm> for Tracker {
             admitters: form.admitters,
             exclude: form.exclude,
             states: form.states,
+            priorities: form.priorities,
         }
     }
 }
@@ -197,7 +207,45 @@ enum AdmitForm {
 pub enum TrackerKind {
     Linear,
     Markdown,
+    /// The issues of the project's own GitHub repository, reached with the
+    /// project's forge credential (OWL-535); `[tracker.states]` names labels.
+    Github,
 }
+
+/// `[tracker.priorities]`: the label of each priority, every one optional.
+/// A ticket carrying several reads the most urgent; labels are matched
+/// without regard to case, as GitHub names them (OWL-535).
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct Priorities {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub urgent: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub high: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub medium: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub low: Option<String>,
+}
+
+impl Priorities {
+    /// Each label named, with its priority, most urgent first.
+    pub fn labels(&self) -> Vec<(Priority, &str)> {
+        [
+            (Priority::Urgent, &self.urgent),
+            (Priority::High, &self.high),
+            (Priority::Medium, &self.medium),
+            (Priority::Low, &self.low),
+        ]
+        .into_iter()
+        .filter_map(|(priority, label)| label.as_deref().map(|label| (priority, label)))
+        .collect()
+    }
+}
+
+/// The names a GitHub Issues tracker reads as an issue's stage when it
+/// carries no stage label: never a stage label's (OWL-535).
+pub const GITHUB_ISSUE_STATES: [&str; 2] = ["open", "closed"];
 
 /// The admission gesture: delegating the ticket to Owlshift, a label, or a
 /// state.
@@ -881,6 +929,45 @@ impl Tracker {
                 }
                 if admitters[..i].contains(account) {
                     return Err(format!("tracker.admitters: {account:?} is listed twice"));
+                }
+            }
+        }
+        if let Some(priorities) = &self.priorities {
+            let labels = priorities.labels();
+            for (i, (_, label)) in labels.iter().enumerate() {
+                if let Err(broken) = check_name(label) {
+                    return Err(format!("tracker.priorities: {label:?} {broken}"));
+                }
+                if labels[..i]
+                    .iter()
+                    .any(|(_, other)| other.eq_ignore_ascii_case(label))
+                {
+                    return Err(format!(
+                        "tracker.priorities: {label:?} names two priorities"
+                    ));
+                }
+            }
+        }
+        if self.kind == TrackerKind::Github {
+            let states = &self.states;
+            for state in [
+                Some(&states.ready),
+                Some(&states.working),
+                Some(&states.needs_input),
+                Some(&states.review),
+                states.parked.as_ref(),
+            ]
+            .into_iter()
+            .flatten()
+            {
+                if GITHUB_ISSUE_STATES
+                    .iter()
+                    .any(|name| name.eq_ignore_ascii_case(state))
+                {
+                    return Err(format!(
+                        "tracker.states: {state:?} is how GitHub Issues reads an issue \
+                         without a stage label: name the stage's label otherwise"
+                    ));
                 }
             }
         }
@@ -1588,6 +1675,77 @@ mod tests {
             {tail}
             "#
         ))
+    }
+
+    /// A GitHub Issues project file with `tracker` added to `[tracker]`.
+    fn github(tracker: &str) -> Result<ProjectConfig, ContractError> {
+        ProjectConfig::parse(&format!(
+            r#"
+            requires = ">=0.1"
+            [tracker]
+            kind = "github"
+            admit = {{ label = "agent:ready" }}
+            states = {{ ready = "agent:ready", working = "agent:working", needs_input = "agent:asked", review = "agent:review" }}
+            {tracker}
+            [stack]
+            gate = ["make test"]
+            [pipeline]
+            default = "trivial"
+            plan_approval = "never"
+            [models]
+            [policy]
+            always_human = []
+            "#
+        ))
+    }
+
+    #[test]
+    fn a_github_tracker_reads_its_optional_priorities() {
+        let bare = github("").unwrap();
+        assert_eq!(bare.tracker.kind, TrackerKind::Github);
+        assert_eq!(bare.tracker.priorities, None);
+        assert!(!bare.render().contains("priorities"));
+
+        let config = github("priorities = { urgent = \"P0\", low = \"P3\" }").unwrap();
+        let priorities = config.tracker.priorities.as_ref().unwrap();
+        assert_eq!(
+            priorities.labels(),
+            [(Priority::Urgent, "P0"), (Priority::Low, "P3")]
+        );
+        assert_eq!(ProjectConfig::parse(&config.render()).unwrap(), config);
+
+        for (tracker, reason) in [
+            ("priorities = { high = \"P1\", low = \"p1\" }", "names two priorities"),
+            ("priorities = { high = \" P1\" }", "tracker.priorities"),
+            ("priorities = { highest = \"P0\" }", "unknown field"),
+        ] {
+            let error = github(tracker).unwrap_err().to_string();
+            assert!(error.contains(reason), "{tracker}: {error}");
+        }
+    }
+
+    #[test]
+    fn a_github_stage_is_never_named_open_or_closed() {
+        let error = ProjectConfig::parse(
+            r#"
+            requires = ">=0.1"
+            [tracker]
+            kind = "github"
+            admit = { label = "agent:ready" }
+            states = { ready = "agent:ready", working = "agent:working", needs_input = "agent:asked", review = "Closed" }
+            [stack]
+            gate = ["make test"]
+            [pipeline]
+            default = "trivial"
+            plan_approval = "never"
+            [models]
+            [policy]
+            always_human = []
+            "#,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("without a stage label"), "{error}");
     }
 
     #[test]
