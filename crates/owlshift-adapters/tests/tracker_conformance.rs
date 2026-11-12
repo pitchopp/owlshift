@@ -12,7 +12,8 @@ use std::sync::{Arc, Mutex};
 use owlshift_adapters::tracker::linear::{ApiKey, LinearTracker};
 use owlshift_adapters::tracker::markdown::MarkdownTracker;
 use owlshift_adapters::tracker::{
-    Author, Blocker, Capability, Column, ErrorKind, Person, Proposal, StateType, Tracker,
+    Author, Blocker, Capability, Column, ErrorKind, MAX_DOCUMENT_CHARS, Person, Proposal,
+    StateType, Tracker,
 };
 use owlshift_contracts::Priority;
 use owlshift_contracts::config::Admit;
@@ -514,6 +515,45 @@ fn check_proposals(tracker: &dyn Tracker, case: &ProposalsCase) {
     );
 }
 
+/// What the Documents check knows about the tracker.
+struct DocumentsCase {
+    /// A ticket that exists, and one that does not.
+    ticket: TicketId,
+    missing: TicketId,
+}
+
+/// Publishing a document: it is created, then its content is replaced in
+/// place under the same identifier; a document the tracker does not show is
+/// not found, so the runner creates another; a document of an unknown ticket
+/// is an error (the trait promises no more, and Linear's answer to it was
+/// never checked live); and content past the cap is refused.
+fn check_documents(tracker: &dyn Tracker, case: &DocumentsCase) {
+    assert!(
+        tracker.capabilities().contains(&Capability::Documents),
+        "Documents is not declared"
+    );
+    let title = format!("Plan · {}", case.ticket);
+    let created = tracker
+        .publish_document(&case.ticket, None, &title, "v1")
+        .unwrap();
+    assert!(!created.id.is_empty(), "{created:?}");
+    let updated = tracker
+        .publish_document(&case.ticket, Some(&created.id), &title, "v2")
+        .unwrap();
+    assert_eq!(updated.id, created.id, "an update is in place");
+
+    let gone = tracker
+        .publish_document(&case.ticket, Some("does-not-exist"), &title, "v2")
+        .unwrap_err();
+    assert_eq!(gone.kind, ErrorKind::NotFound, "{gone}");
+    let unknown = tracker.publish_document(&case.missing, None, &title, "v1");
+    assert!(unknown.is_err(), "{unknown:?}");
+
+    let long = "y".repeat(MAX_DOCUMENT_CHARS + 1);
+    let refused = tracker.publish_document(&case.ticket, None, &title, &long);
+    assert!(refused.is_err(), "content past the cap was accepted");
+}
+
 const BODY: &str = "[owlshift] OWL-13 conformance check: a comment posted by the Linear \
                     adapter's fixture recorder · safe to delete.\n\nSecond line.";
 
@@ -712,6 +752,24 @@ fn markdown() -> Adapter {
             // The proposal is a ticket of its own, and the refused one none.
             assert_eq!(tickets(), before + 1);
         })
+        .case(Check::Documents, || {
+            let (world, tracker) = markdown_world();
+            check_documents(
+                &tracker,
+                &DocumentsCase {
+                    ticket: id("DEMO-1"),
+                    missing: id("DEMO-404"),
+                },
+            );
+            // One file, its content replaced in place under its title; the
+            // refused calls wrote none.
+            let dir = world.path().join("tickets/DEMO-1/documents");
+            let files: Vec<_> = fs::read_dir(&dir).unwrap().collect();
+            assert_eq!(files.len(), 1, "{files:?}");
+            let text = fs::read_to_string(dir.join("1.md")).unwrap();
+            assert!(text.starts_with("# Plan · DEMO-1"), "{text:?}");
+            assert!(text.contains("v2") && !text.contains("v1"), "{text:?}");
+        })
 }
 
 fn markdown_blocked_case() -> BlockedCase {
@@ -839,6 +897,64 @@ fn linear() -> Adapter {
             // One issue was created: the refused proposal never was.
             assert_eq!(stored.lock().unwrap().len(), 1);
         })
+        .case(Check::Documents, || {
+            // MADE UP: no recording holds these answers (see `Fake`). The
+            // answer to a document of an unknown issue is not even in a
+            // unit test: it is unverified, and the check asks only for an
+            // error.
+            let fake = linear_documents();
+            check_documents(
+                &LinearTracker::with_transport(fake.clone()),
+                &DocumentsCase {
+                    ticket: id("OWL-1"),
+                    missing: id("OWL-99999"),
+                },
+            );
+            // The refused content was never sent.
+            assert_eq!(
+                fake.asked(),
+                [
+                    "CreateDocument",
+                    "UpdateDocument",
+                    "UpdateDocument",
+                    "CreateDocument"
+                ]
+            );
+        })
+}
+
+/// MADE UP: a Linear that knows the issue OWL-1 and keeps the documents
+/// made on it, in the answer shapes of the unit tests of
+/// `src/tracker/linear.rs`. An update of a document it does not hold is
+/// `Entity not found: Document`; a document of another issue is
+/// `Entity not found: Issue`, UNVERIFIED: nothing recorded or tested says
+/// how Linear answers it.
+fn linear_documents() -> Fake {
+    let mut documents: BTreeMap<String, String> = BTreeMap::new();
+    let written = |id: &str| {
+        json!({ "success": true, "document": { "id": id,
+            "url": format!("https://linear.app/owlshift/document/{id}"), "archivedAt": null } })
+    };
+    Fake::new(move |name, variables| match name {
+        "CreateDocument" => {
+            let input = &variables["input"];
+            if input["issueId"] != "OWL-1" {
+                return Answer::NotFound("Entity not found: Issue");
+            }
+            let id = format!("d{}", documents.len() + 1);
+            documents.insert(id.clone(), input["content"].as_str().unwrap().to_owned());
+            Answer::Data(json!({ "documentCreate": written(&id) }))
+        }
+        "UpdateDocument" => {
+            let id = variables["id"].as_str().unwrap();
+            let Some(content) = documents.get_mut(id) else {
+                return Answer::NotFound("Entity not found: Document");
+            };
+            *content = variables["input"]["content"].as_str().unwrap().to_owned();
+            Answer::Data(json!({ "documentUpdate": written(id) }))
+        }
+        other => panic!("the made-up Linear does not answer {other}"),
+    })
 }
 
 const LINKS_FIXTURE: &str = "links.json";
