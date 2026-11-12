@@ -14,7 +14,12 @@ use owlshift_adapters::tracker::markdown::MarkdownTracker;
 use owlshift_contracts::Priority;
 use owlshift_contracts::ids::TicketId;
 
-const PAGE: &str = include_str!("../../../docs/markdown-tracker.md");
+const RAW_PAGE: &str = include_str!("../../../docs/markdown-tracker.md");
+
+/// The page with `\n` line ends, whatever the checkout made of them (CRLF on Windows).
+fn page() -> String {
+    RAW_PAGE.replace("\r\n", "\n")
+}
 
 struct Example {
     kind: String,
@@ -30,7 +35,8 @@ fn id(id: &str) -> TicketId {
 fn examples() -> Vec<Example> {
     let mut found = Vec::new();
     let mut open: Option<Option<Example>> = None;
-    for line in PAGE.lines() {
+    let page = page();
+    for line in page.lines() {
         match (&mut open, line.strip_prefix("```")) {
             (None, Some(info)) => {
                 let mut words = info.split_whitespace();
@@ -195,7 +201,7 @@ fn the_document_and_proposal_examples_are_what_the_tracker_writes() {
 
 #[test]
 fn an_unknown_key_is_refused_as_the_page_says() {
-    assert!(PAGE.contains("An unknown key is refused"));
+    assert!(page().contains("An unknown key is refused"));
     let all = examples();
     let root = repository(&all);
     let path = root.path().join("tickets/DEMO-1/ticket.md");
@@ -213,8 +219,9 @@ fn an_unknown_key_is_refused_as_the_page_says() {
 
 /// The page's "Limits" section, which opens it.
 fn limits() -> String {
-    let start = PAGE.find("\n## Limits\n").expect("a Limits section");
-    let rest = &PAGE[start + 1..];
+    let page = page();
+    let start = page.find("\n## Limits\n").expect("a Limits section");
+    let rest = &page[start + 1..];
     let end = rest[3..].find("\n## ").map_or(rest.len(), |at| at + 3);
     rest[..end].to_lowercase()
 }
@@ -232,6 +239,7 @@ fn the_limits_are_written_and_come_first() {
     ] {
         assert!(limits.contains(phrase), "the Limits section lacks {phrase}");
     }
-    let first = PAGE.find("\n## ").expect("a first section");
-    assert!(PAGE[first..].starts_with("\n## Limits\n"));
+    let page = page();
+    let first = page.find("\n## ").expect("a first section");
+    assert!(page[first..].starts_with("\n## Limits\n"));
 }
