@@ -1486,6 +1486,36 @@ fn init_markdown_writes_an_example_ticket_and_says_the_limits() {
     assert!(!linear.path().join("tickets").exists());
 }
 
+/// OWL-34: `start` refuses a Markdown project with the reason, before it
+/// registers anything or starts a daemon. (On Windows `start` refuses every
+/// project earlier, for another reason.)
+#[cfg(unix)]
+#[test]
+fn start_refuses_a_markdown_project_and_registers_nothing() {
+    let config_dir = tempfile::tempdir().unwrap();
+    let repo = tempfile::tempdir().unwrap();
+    git_init(repo.path());
+    git(
+        repo.path(),
+        &["remote", "add", "origin", "https://github.com/acme/web.git"],
+    );
+    init_markdown(repo.path(), config_dir.path(), &[]);
+    let output = owlshift(repo.path(), config_dir.path(), &["start"]);
+    assert_eq!(output.status.code(), Some(1), "{}", stdout(&output));
+    let said = stderr(&output);
+    assert!(
+        said.contains("the Markdown tracker serves one machine and is not served by the daemon"),
+        "{said}"
+    );
+    assert!(said.contains("docs/markdown-tracker.md"), "{said}");
+    let data = config_dir.path().join("data");
+    assert!(!data.join("service").exists(), "a daemon was started");
+    assert!(
+        !data.join("service/projects.json").exists(),
+        "a project was registered"
+    );
+}
+
 #[test]
 fn init_writes_a_commented_project_file_once() {
     let config_dir = tempfile::tempdir().unwrap();

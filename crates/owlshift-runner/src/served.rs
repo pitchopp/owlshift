@@ -21,7 +21,7 @@ use std::time::{Duration, Instant};
 use jiff::Timestamp;
 use owlshift_adapters::forge::Repo;
 use owlshift_adapters::notifier::Notifier;
-use owlshift_contracts::config::ProjectConfig;
+use owlshift_contracts::config::{ProjectConfig, TrackerKind};
 use owlshift_contracts::event::EventKind;
 use owlshift_contracts::service::{
     KeptFile, RefusedFile, ServedConfig, ServedProject, ServedProjects,
@@ -370,6 +370,24 @@ fn check(effective: &Effective) -> Result<&ProjectConfig, String> {
     Ok(config)
 }
 
+/// Why `owlshift start` refuses to serve a project with `config`, if it does:
+/// a Markdown project, whose tickets are files in a checkout on one machine
+/// and which the daemon, reading its own clone, cannot serve (OWL-34);
+/// otherwise [`watch::drain_refusal`]. Only `start` asks: a project already
+/// registered, and a watch in a checkout, are judged as they were.
+pub fn served_refusal(config: &ProjectConfig) -> Option<String> {
+    if config.tracker.kind == TrackerKind::Markdown {
+        return Some(
+            "the Markdown tracker serves one machine and is not served by the daemon: its \
+             tickets are files in your checkout, which the daemon does not read. Run \
+             `owlshift do TICKET` or `owlshift continue TICKET` in that checkout instead (see \
+             docs/markdown-tracker.md)"
+                .to_owned(),
+        );
+    }
+    watch::drain_refusal(config)
+}
+
 /// Why `repo` is not served, from its record: the refusal it holds.
 pub fn not_served(repo: &Repo, record: Option<&ServedConfig>) -> String {
     let reason = record
@@ -696,6 +714,31 @@ always_human = []
 
     fn repo() -> Repo {
         Repo::parse("acme/web").unwrap()
+    }
+
+    #[test]
+    fn start_refuses_a_markdown_project_and_says_why() {
+        let linear = ProjectConfig::parse(PROJECT).unwrap();
+        assert_eq!(served_refusal(&linear), None);
+        let markdown = ProjectConfig::parse(
+            &PROJECT
+                .replace("kind = \"linear\"\nteam = \"WEB\"", "kind = \"markdown\"")
+                .replace("admitters = [\"u1\"]\n", ""),
+        )
+        .unwrap();
+        assert_eq!(markdown.tracker.kind, TrackerKind::Markdown);
+        let reason = served_refusal(&markdown).unwrap();
+        assert!(reason.contains("not served by the daemon"), "{reason}");
+        assert!(reason.contains("one machine"), "{reason}");
+        assert!(reason.contains("`owlshift do TICKET`"), "{reason}");
+        // The refusal of a watch's drain is what it was.
+        let without_admitters =
+            ProjectConfig::parse(&PROJECT.replace("admitters = [\"u1\"]\n", "")).unwrap();
+        assert_eq!(
+            served_refusal(&without_admitters),
+            watch::drain_refusal(&without_admitters)
+        );
+        assert!(served_refusal(&without_admitters).is_some());
     }
 
     #[test]

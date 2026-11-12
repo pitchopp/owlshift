@@ -26,9 +26,8 @@ use owlshift_runner::events::printable;
 use owlshift_runner::install::uninstall::{self, Personal, Stopped};
 use owlshift_runner::install::{self, Install, Installed};
 use owlshift_runner::notify::{self, DesktopNotifier};
-use owlshift_runner::served::Registry;
+use owlshift_runner::served::{Registry, served_refusal};
 use owlshift_runner::system::System;
-use owlshift_runner::watch::drain_refusal;
 use owlshift_runner::{controls, on_demand, project};
 
 use crate::do_cmd::loaded_project;
@@ -183,7 +182,7 @@ pub fn start(config: &Effective, at_login: bool) -> ExitCode {
     };
     // A served watch drains: a project file that does not suit the drain
     // is told now, before the service reads it from the default branch.
-    if let Some(refusal) = drain_refusal(project) {
+    if let Some(refusal) = served_refusal(project) {
         return fail(&refusal);
     }
     let checkout = project_file.parent().unwrap_or(project_file);
