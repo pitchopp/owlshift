@@ -823,12 +823,16 @@ fn s11_a_checked_stop_resumes_both_builds_and_a_kill_quarantines() {
 /// - DEMO-1 is then parked at Build, a pass the design does not bound and
 ///   load slows (OWL-491), the PARKED comment naming `owlshift cancel` and
 ///   why, the cancel file gone;
+/// - at the park, DEMO-1's run slot is already free and DEMO-2's held, as
+///   the web UI's header shows them (OWL-530);
 /// - `owlshift continue --to-watch DEMO-1` restarts it, and the watch
 ///   resumes its Build from its checkpoint.
 #[test]
 fn a_canceled_build_is_stopped_checked_and_parked_then_resumed_from_its_checkpoint() {
     use owlshift_runner::on_demand::Stop;
+    use owlshift_runner::status::gather_files;
     use owlshift_testkit::step_child::{cancel, parked_at_build};
+    use serde_json::json;
 
     let mut bench = Bench::new();
     let root = bench.tmp.path().to_owned();
@@ -846,8 +850,8 @@ fn a_canceled_build_is_stopped_checked_and_parked_then_resumed_from_its_checkpoi
         CHECKPOINT,
         &format!("exec sleep {}", wait::OUTLASTS.as_secs()),
     );
-    let machine = root.join("machine");
-    let mut project = ChildProject::seed_parallel(&root, harness, 2, 2, (&machine, 2));
+    // The slots in the data directory the header reads (OWL-530).
+    let mut project = ChildProject::seed_parallel(&root, harness, 2, 2, (&bench.data(), 2));
     project.notes = Some(bench.notes_file());
     let file = root.join("project.toml");
     project.save(&file);
@@ -874,6 +878,36 @@ fn a_canceled_build_is_stopped_checked_and_parked_then_resumed_from_its_checkpoi
         !alive(one)
     });
     bench.wait_for("DEMO-1 parked", || parked_at_build(&project, "DEMO-1"));
+    // The header read now, at the park (OWL-530). The watch's own probes
+    // each hold a free slot for a moment, a slot then held with no holder
+    // record: such a read alone is read again, at once, a few times.
+    let mut report = gather_files(&bench.data(), 2, &[], Timestamp::now());
+    for _ in 0..5 {
+        let probed = report
+            .slots
+            .as_ref()
+            .is_some_and(|(held, _)| held.iter().any(|slot| slot.holder.is_none()));
+        if !probed {
+            break;
+        }
+        report = gather_files(&bench.data(), 2, &[], Timestamp::now());
+    }
+    let header = owlshift_runner::ui::header::of(&report);
+    let header = header.json();
+    assert_eq!(
+        header["slots"],
+        json!({ "held": 1, "of": 2 }),
+        "{}",
+        bench.output()
+    );
+    assert_eq!(header["projects"][0]["slots_held"], 1, "{}", bench.output());
+    assert_eq!(
+        header["projects"][0]["slot_holders"],
+        json!(["DEMO-2"]),
+        "{}",
+        bench.output()
+    );
+    assert_eq!(header["waiting"]["parked"], 1, "{}", bench.output());
     assert!(alive(two), "DEMO-2's run was stopped\n{}", bench.output());
     let passes = bench.passes();
     bench.wait_for("three more passes of the watch", || {

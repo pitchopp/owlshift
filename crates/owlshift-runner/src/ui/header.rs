@@ -18,8 +18,10 @@
 //! - `waiting`: `{"questions", "reviews", "parked"}`, summed over projects:
 //!   the tickets whose questions wait (plans to approve included), the pull
 //!   requests to review, the parked tickets;
-//! - `projects`: each `{"repository", "slots_held", "paused", "quarantined",
-//!   "waiting"}`;
+//! - `projects`: each `{"repository", "slots_held", "slot_holders",
+//!   "paused", "quarantined", "waiting"}`, `slot_holders` being the tickets
+//!   whose steps hold the project's run slots, in slot order, and
+//!   `slots_held` their count (OWL-530);
 //! - `notes`: what could not be read.
 
 use jiff::Timestamp;
@@ -111,11 +113,12 @@ pub fn of(report: &Report) -> Header {
         .projects
         .iter()
         .map(|project| {
-            let slots_held = report.slots.as_ref().map_or(0, |(held, _)| {
+            let slot_holders: Vec<&str> = report.slots.as_ref().map_or(Vec::new(), |(held, _)| {
                 held.iter()
                     .filter_map(|slot| slot.holder.as_ref())
                     .filter(|holder| holder.project.eq_ignore_ascii_case(&project.repository))
-                    .count()
+                    .map(|holder| holder.ticket.as_str())
+                    .collect()
             });
             let counts = (
                 project.waiting.len(),
@@ -125,7 +128,8 @@ pub fn of(report: &Report) -> Header {
             total = (total.0 + counts.0, total.1 + counts.1, total.2 + counts.2);
             json!({
                 "repository": project.repository,
-                "slots_held": slots_held,
+                "slots_held": slot_holders.len(),
+                "slot_holders": slot_holders,
                 "paused": project
                     .pause
                     .as_ref()
@@ -212,27 +216,41 @@ mod tests {
         let data = tempfile::tempdir().unwrap();
         let data = data.path();
         serve(data, &["acme/web", "acme/api"]);
-        let slots = MachineSlots::new(data, 2);
-        let _held = slots
-            .take(&Holder {
-                project: "Acme/Web".to_owned(),
-                ticket: TicketId::new("OWL-1").unwrap(),
-                pid: std::process::id(),
-                since: Timestamp::now(),
-            })
-            .unwrap()
-            .unwrap();
+        let slots = MachineSlots::new(data, 3);
+        let take = |project: &str, ticket: &str| {
+            slots
+                .take(&Holder {
+                    project: project.to_owned(),
+                    ticket: TicketId::new(ticket).unwrap(),
+                    pid: std::process::id(),
+                    since: Timestamp::now(),
+                })
+                .unwrap()
+                .unwrap()
+        };
+        // Taken in this order, so held in slot order; the third is an
+        // unserved project's, counted for the machine only.
+        let _held = [
+            take("Acme/Web", "OWL-1"),
+            take("Acme/Web", "OWL-2"),
+            take("acme/other", "OWL-3"),
+        ];
         let api = ProjectDirs::new(data, &Repo::parse("acme/api").unwrap());
         let reason = Request::new(BY_PAUSE, Timestamp::now(), "lunch break");
         requests::ask_pause(data, Some(&api), &reason).unwrap();
 
         let header = header(data, &[], Timestamp::now());
         assert_eq!(header["daemon"]["state"], "not_running");
-        assert_eq!(header["slots"], json!({ "held": 1, "of": 2 }));
+        assert_eq!(header["slots"]["held"], 3);
         assert_eq!(header["projects"][0]["repository"], "acme/web");
-        assert_eq!(header["projects"][0]["slots_held"], 1);
+        assert_eq!(header["projects"][0]["slots_held"], 2);
+        assert_eq!(
+            header["projects"][0]["slot_holders"],
+            json!(["OWL-1", "OWL-2"])
+        );
         assert_eq!(header["projects"][0]["paused"], Value::Null);
         assert_eq!(header["projects"][1]["slots_held"], 0);
+        assert_eq!(header["projects"][1]["slot_holders"], json!([]));
         assert_eq!(header["projects"][1]["paused"]["why"], "lunch break");
         assert_eq!(header["projects"][1]["quarantined"], Value::Null);
         assert_eq!(header["machine_pause"], Value::Null);

@@ -906,6 +906,23 @@ fn each_state_shows_its_symbol_beside_its_colour() {
 }
 
 #[test]
+fn the_header_names_the_tickets_holding_each_projects_slots() {
+    // OWL-530: "0 slots", "1 slot: LOC-1538", "2 slots: LOC-1, LOC-2". The
+    // tests run no script, so the label's whole function is pinned.
+    let app_js = lf(APP_JS);
+    let text = block(&app_js, "function slotsText(project) {", "");
+    assert_eq!(
+        text,
+        "\n  return project.slots_held + \" slot\" + (project.slots_held === 1 ? \"\" : \"s\") +\n    \
+         (project.slot_holders.length ? \": \" + project.slot_holders.join(\", \") : \"\");",
+    );
+    assert!(
+        app_js.contains(r#"item.appendChild(make("span", "fact-label", slotsText(project)));"#),
+        "the header does not label a project's slots with slotsText"
+    );
+}
+
+#[test]
 fn a_hidden_element_stays_hidden_and_a_logout_empties_the_header() {
     // `.bar-row` sets `display: flex`, which beats the browser's own
     // `[hidden]` rule: the sheet's rule must win over any class.

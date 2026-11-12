@@ -280,7 +280,7 @@ Every action is a recorded event, readable from the CLI from P1 and from a local
 
 **The local web UI (P8)** is served by a child of the daemon on `127.0.0.1` only. A browser logs in through `owlshift ui`, which opens a one-time link; no website open in the browser and no agent run can drive it (architecture section 5, "The local web UI"). It is the same on macOS, Linux and WSL2, and reachable on a server through an SSH tunnel. It shows the served projects, all of them or one, reads only what Owlshift keeps on the machine, and updates itself as that changes.
 
-- **Header,** on every page: each served project and the capacity it uses, the machine's run slots, each harness's usage and reset, how many tickets wait for you, the daemon's state.
+- **Header,** on every page: each served project, the run slots its steps hold and the tickets holding them, the machine's run slots, each harness's usage and reset, how many tickets wait for you, the daemon's state.
 - **For you,** first on the overview: the questions waiting for an answer, the plans to approve, the pull requests to review, the parked tickets. (As built by part 4: each pull request to review links to its page on the forge, built from local state.)
 - **Overview:** the tickets in flight and those admitted but not started, in three views with a switch, the browser keeping the last one used:
   - *Columns,* one per stage from "not started" to an open pull request, each card saying what its ticket does or waits on;
