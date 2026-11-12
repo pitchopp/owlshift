@@ -49,6 +49,10 @@ pub const OUTPUT: &str = "argv-probe.out";
 /// How often a watching reader scans.
 const EVERY: Duration = Duration::from_millis(20);
 
+/// How long a scan waits for a process it started to be listed with its
+/// arguments, which a loaded machine may delay.
+const SETTLE: Duration = Duration::from_secs(20);
+
 /// What one scan, or the scans of one watch, saw.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Scan {
@@ -160,6 +164,36 @@ pub fn hold(needle: &str) -> Holder {
     hold_for("while :; do sleep 1; done", needle)
 }
 
+/// Scans until the process holding `needle` shows its arguments, or
+/// [`SETTLE`] ends, and gives everything the scans saw. A process that has
+/// just been spawned is not always listed with its arguments yet.
+fn scan_until_held(needles: &[&str], needle: &str) -> Scan {
+    let end = Instant::now() + SETTLE;
+    let mut seen = scan(needles);
+    while Instant::now() < end && !holds(&seen, needles, needle) {
+        std::thread::sleep(EVERY);
+        merge(&mut seen, scan(needles));
+    }
+    seen
+}
+
+/// Whether `seen` found `needle`, one of `needles`.
+fn holds(seen: &Scan, needles: &[&str], needle: &str) -> bool {
+    needles
+        .iter()
+        .zip(&seen.found)
+        .any(|(candidate, found)| *candidate == needle && *found)
+}
+
+/// Folds `next` into `seen`: the larger counts, every needle found by either.
+fn merge(seen: &mut Scan, next: Scan) {
+    seen.processes = seen.processes.max(next.processes);
+    seen.read = seen.read.max(next.read);
+    for (found, now) in seen.found.iter_mut().zip(next.found) {
+        *found |= now;
+    }
+}
+
 /// The needles and the watch of a request.
 fn parse_request(text: &str) -> (Vec<String>, Duration) {
     let mut needles = Vec::new();
@@ -202,15 +236,13 @@ fn answer(dir: &Path) {
     needles.push(own);
     let needles: Vec<&str> = needles.iter().map(String::as_str).collect();
     let end = Instant::now() + watch;
-    let mut seen = scan(&needles);
+    // The control first: it is held a moment before this scan, and must be
+    // listed for the scan to count.
+    let control = needles.last().copied().expect("the own needle");
+    let mut seen = scan_until_held(&needles, control);
     while Instant::now() < end {
         std::thread::sleep(EVERY);
-        let next = scan(&needles);
-        seen.processes = seen.processes.max(next.processes);
-        seen.read = seen.read.max(next.read);
-        for (found, now) in seen.found.iter_mut().zip(next.found) {
-            *found |= now;
-        }
+        merge(&mut seen, scan(&needles));
     }
     drop(holder);
     let flag = |found: bool| if found { "1" } else { "0" };
@@ -240,7 +272,7 @@ fn reader() {
 fn the_scan_finds_the_argument_of_a_process_and_no_needle_nobody_holds() {
     let (held, nobody) = (needle(), needle());
     let _holder = hold(&held);
-    let seen = scan(&[&held, &nobody]);
+    let seen = scan_until_held(&[&held, &nobody], &held);
     assert_eq!(seen.found, [true, false], "{seen:?}");
     assert!(seen.read >= 1 && seen.processes >= seen.read, "{seen:?}");
 }
@@ -249,6 +281,9 @@ fn the_scan_finds_the_argument_of_a_process_and_no_needle_nobody_holds() {
 fn the_reader_writes_its_counts_from_a_request_file() {
     let (held, nobody) = (needle(), needle());
     let _holder = hold(&held);
+    // The reader's scan runs in another process: the held one must already
+    // be listed when it starts.
+    scan_until_held(&[&held], &held);
     let seen = Reader::start(None, &[&held, &nobody], 0).finish();
     assert_eq!(value(&seen, "own"), "1", "{seen:?}");
     assert_eq!(value(&seen, "found_0"), "1", "{seen:?}");
