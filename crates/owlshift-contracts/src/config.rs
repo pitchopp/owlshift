@@ -1715,7 +1715,10 @@ mod tests {
         assert_eq!(ProjectConfig::parse(&config.render()).unwrap(), config);
 
         for (tracker, reason) in [
-            ("priorities = { high = \"P1\", low = \"p1\" }", "names two priorities"),
+            (
+                "priorities = { high = \"P1\", low = \"p1\" }",
+                "names two priorities",
+            ),
             ("priorities = { high = \" P1\" }", "tracker.priorities"),
             ("priorities = { highest = \"P0\" }", "unknown field"),
         ] {

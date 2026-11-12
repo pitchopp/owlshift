@@ -13,7 +13,7 @@ use owlshift_contracts::config::{self, Admit, ProjectConfig};
 use owlshift_contracts::ids::TicketId;
 use owlshift_platform::keychain::{Keychain, SERVICE, Secret};
 
-use super::{AppError, Kind, Opener, Probe, Probed, StatesError};
+use super::{AppError, ForgeCredential, Kind, Opener, Probe, Probed, StatesError};
 use crate::doctor::{Check, DOES_NOT_BLOCK, KEYCHAIN_FIX, Section, Step, configured_states};
 use crate::init::{LINEAR_KEY, SecretSpec};
 use crate::secrets::{Source, TrackerAccounts, TrackerSecrets};
@@ -78,6 +78,7 @@ team = {}
         tracker: &'a config::Tracker,
         _root: &'a Path,
         secrets: Option<&'a TrackerSecrets<Secret>>,
+        _forge: ForgeCredential<'a>,
     ) -> Result<Opener<'a>, String> {
         let team = tracker
             .team
