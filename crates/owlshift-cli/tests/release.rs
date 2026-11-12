@@ -4,7 +4,6 @@
 
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::Output;
 
 fn root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../..")
@@ -86,7 +85,7 @@ fn the_release_workflow_keeps_its_guards() {
 }
 
 #[cfg(unix)]
-fn sh(script: &Path, args: &[&str], envs: &[(&str, &str)]) -> Output {
+fn sh(script: &Path, args: &[&str], envs: &[(&str, &str)]) -> std::process::Output {
     std::process::Command::new("sh")
         .arg(script)
         .args(args)
