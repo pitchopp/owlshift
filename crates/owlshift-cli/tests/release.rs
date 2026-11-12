@@ -336,6 +336,13 @@ fn the_notices_cover_every_target_the_release_builds() {
     listed.sort_unstable();
     assert_eq!(built.len(), 4, "{built:?}");
     assert_eq!(built, listed);
+    // CI writes them too, so a refused licence fails its pull request.
+    assert!(
+        read(".github/workflows/ci.yml")
+            .lines()
+            .any(|line| line.trim() == "sh scripts/release/notices.sh \"$RUNNER_TEMP/notices\""),
+        "ci.yml no longer checks the licences"
+    );
 }
 
 /// `notices.sh` with a stand-in `cargo`: it asks cargo-about for one
