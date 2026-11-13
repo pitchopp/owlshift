@@ -16,14 +16,19 @@ mod github;
 mod linear;
 mod markdown;
 
+#[cfg(test)]
+pub(crate) use github::named_labels;
+
 use std::fmt;
 use std::path::Path;
 
 use owlshift_adapters::forge::Repo;
+use owlshift_adapters::forge::github::GitHubForge;
 use owlshift_adapters::tracker;
+use owlshift_adapters::tracker::github::{GitHubTracker, IssuesAccess};
 use owlshift_adapters::tracker::linear::app::{AppTransport, ClientCredentials, HttpOAuth};
 use owlshift_adapters::tracker::linear::{AdmissionFacts, ApiKey, AppUser, LinearTracker};
-use owlshift_adapters::tracker::{Capability, ErrorKind};
+use owlshift_adapters::tracker::{AccountFact, Capability, ErrorKind};
 use owlshift_contracts::config::{self, ProjectConfig, TrackerKind};
 use owlshift_contracts::ids::TicketId;
 use owlshift_platform::keychain::{Keychain, SERVICE, Secret};
@@ -70,29 +75,24 @@ pub trait Kind: Sync {
         forge: ForgeCredential<'a>,
     ) -> Result<Opener<'a>, String>;
 
-    /// The lines `owlshift doctor` reports on the tracker itself, after the
+    /// What `owlshift doctor` reports on the tracker itself, after the
     /// secrets and forge lines, for the loaded project `config` whose
     /// tracker set is stored under `accounts` (`None` when doctor could not
-    /// tell, which its `secrets` line says).
-    fn doctor_lines(
+    /// tell, which its `secrets` line says) and whose repository is `repo`
+    /// (`None` when `origin` names none): its own lines, and what it says of
+    /// the project's admission and proposals setup (OWL-155), read once for
+    /// doctor's `drain admission` and `proposals inbox` lines (`None` when
+    /// the tracker is not asked).
+    fn doctor(
         &self,
         system: &dyn System,
         config: &ProjectConfig,
         accounts: Option<&TrackerAccounts>,
-    ) -> Vec<Check>;
-
-    /// What the tracker says of the project's admission and proposals
-    /// setup (OWL-155), read once for doctor's `drain admission` and
-    /// `proposals inbox` lines: `None` when the tracker is not asked.
-    fn admission_facts(
-        &self,
-        system: &dyn System,
-        config: &ProjectConfig,
-        accounts: Option<&TrackerAccounts>,
-    ) -> Option<Result<AdmissionFacts, StatesError>>;
+        repo: Option<&Repo>,
+    ) -> Doctored;
 
     /// Doctor's `proposals inbox` line (OWL-155): whether a follow-up
-    /// Owlshift proposes can be filed, given what [`Kind::admission_facts`]
+    /// Owlshift proposes can be filed, given what [`Kind::doctor`]
     /// read.
     fn proposals_inbox(
         &self,
@@ -108,7 +108,98 @@ pub trait Kind: Sync {
     /// Whether `owlshift init` stores the client ID and secret of an app the
     /// tracker writes as (OWL-157).
     fn stores_app(&self) -> bool;
+
+    /// The `admit`, `admitters` and `states` lines `init` writes under
+    /// `[tracker]` of a new project file, `admitter` being the account it
+    /// signed in as, when it asked the tracker (OWL-537).
+    fn admission_lines(&self, admitter: Option<&str>) -> String {
+        let _ = admitter;
+        ADMISSION_LINES.to_owned()
+    }
+
+    /// What `owlshift init` asks of the tracker before it writes the
+    /// project file, for every tracker (OWL-537; build plan "P9 ·
+    /// Open-source readiness", part 6): whether it answers, with the
+    /// credentials `init` just stored, and what it sets up on it. The
+    /// error says why it did not answer.
+    fn connect(&self, setup: &Setup<'_>) -> Result<Connected, String>;
+
+    /// The words of doctor's `drain admission` line for this tracker.
+    fn admission_words(&self) -> &'static AdmissionWords {
+        &LINEAR_WORDS
+    }
 }
+
+/// The lines `init` has written under `[tracker]` since P4 for Linear and
+/// Markdown: a label to admit, Linear's default states.
+pub(crate) const ADMISSION_LINES: &str = "\
+# How a person admits a ticket to Owlshift's queue: { label = \"...\" },
+# \"ready\" (the move to the ready state below, which { state = \"...\" }
+# would repeat) or \"delegation\". `owlshift do TICKET` does not use it: it
+# runs the ticket it is given.
+admit = { label = \"agent\" }
+# The tracker states that show where a ticket stands.
+states = { ready = \"Todo\", working = \"In Progress\", needs_input = \"Needs Input\", review = \"In Review\" }
+";
+
+/// What [`Kind::doctor`] reports.
+#[derive(Default)]
+pub struct Doctored {
+    pub lines: Vec<Check>,
+    pub facts: Option<Result<AdmissionFacts, StatesError>>,
+}
+
+/// What [`Kind::connect`] works with: the project's `[tracker]`, the
+/// repository `origin` names (or why it names none), the keychain `init`
+/// stored the secrets in, and how the GitHub App's token is refreshed.
+pub struct Setup<'a> {
+    pub tracker: &'a config::Tracker,
+    pub repo: Result<&'a Repo, &'a str>,
+    pub keychain: &'a Keychain,
+    pub access: &'a crate::forge::AppAccess,
+}
+
+/// What [`Kind::connect`] found and did.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Connected {
+    /// The account the credential signs in as, written as the admitter.
+    pub admitter: Option<String>,
+    /// The labels created, in order.
+    pub created: Vec<String>,
+}
+
+/// The tracker's words in doctor's `drain admission` line (OWL-537).
+pub struct AdmissionWords {
+    /// After "the admission label \"x\"".
+    pub label_missing: &'static str,
+    pub label_fix: &'static str,
+    /// After "admitter \"id\"".
+    pub no_account: &'static str,
+    pub app_account: &'static str,
+    pub deactivated: &'static str,
+    pub accounts_fix: &'static str,
+    pub admitters_unset_fix: &'static str,
+    pub delegation_fix: &'static str,
+    /// The scope of an ok line once the tracker was asked.
+    pub checked: &'static str,
+}
+
+/// Linear's words, which a Markdown project reads too.
+pub const LINEAR_WORDS: AdmissionWords = AdmissionWords {
+    label_missing: "exists on neither team nor workspace",
+    label_fix: "Create the label in Linear, on the team or the workspace, or set the name as Linear \
+                has it: names match exactly, case included.",
+    no_account: "is no account of the workspace",
+    app_account: "is an app user, which never admits",
+    deactivated: "is a deactivated account",
+    accounts_fix: "Set `admitters` to the ids of active people of the workspace, as Linear gives \
+                   them (a user's `id`).",
+    admitters_unset_fix: "List under `admitters` the Linear user ids whose gesture admits a \
+                          ticket; with none, no ticket is ever admitted.",
+    delegation_fix: "Decision D8's app takes no delegation scope, so nothing can be delegated to \
+                     Owlshift: set `admit` under `[tracker]` to `{ label = … }` or `\"ready\"`.",
+    checked: "labels and admitters exist in Linear",
+};
 
 /// The kind of the tracker a project file names: the one place the runner
 /// chooses between its trackers.
@@ -168,6 +259,12 @@ pub enum Probe<'a> {
         accounts: &'a TrackerAccounts,
         team: &'a str,
     },
+    /// What a GitHub Issues project's repository says of its setup
+    /// ([`github_facts`], OWL-537).
+    GithubFacts {
+        repo: &'a Repo,
+        tracker: &'a config::Tracker,
+    },
 }
 
 /// The answer to a [`Probe`], of the variant named as the probe's.
@@ -176,6 +273,17 @@ pub enum Probed {
     States(Result<Vec<String>, StatesError>),
     Admission(Result<AdmissionFacts, StatesError>),
     App(Result<Option<AppUser>, AppError>),
+    Github(Result<GithubFacts, StatesError>),
+}
+
+/// What doctor reads of a GitHub Issues project (OWL-537): whether the
+/// credential reads the issues, then, when it does, the repository's labels
+/// and which admitters are GitHub accounts.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GithubFacts {
+    pub access: IssuesAccess,
+    pub labels: Option<Vec<String>>,
+    pub accounts: Option<Vec<AccountFact>>,
 }
 
 impl Probe<'_> {
@@ -202,6 +310,9 @@ impl Probe<'_> {
             Self::LinearApp { accounts, team } => {
                 Probed::App(linear_app_user(&keychain, accounts, team))
             }
+            Self::GithubFacts { repo, tracker } => {
+                Probed::Github(github_facts(&keychain, repo, tracker))
+            }
         }
     }
 
@@ -211,6 +322,7 @@ impl Probe<'_> {
             Self::LinearStates { .. } => Probed::States(Err(StatesError::Keychain(reason))),
             Self::LinearAdmission { .. } => Probed::Admission(Err(StatesError::Keychain(reason))),
             Self::LinearApp { .. } => Probed::App(Err(AppError::Keychain(reason))),
+            Self::GithubFacts { .. } => Probed::Github(Err(StatesError::Keychain(reason))),
         }
     }
 }
@@ -487,6 +599,43 @@ pub fn linear_admission(
     }
 }
 
+/// What doctor reads of the GitHub Issues project of `repo` whose
+/// `[tracker]` is `tracker` (OWL-537), with the forge token stored for it,
+/// read as doctor's other forge probes read it, without its refresh: one
+/// issue list, then, when it reads, the labels and each admitter.
+pub fn github_facts(
+    keychain: &Keychain,
+    repo: &Repo,
+    tracker: &config::Tracker,
+) -> Result<GithubFacts, StatesError> {
+    let mut read = |account: &str| keychain.read(account).map_err(|error| error.to_string());
+    let found = crate::secrets::forge(repo, &mut read).map_err(StatesError::Keychain)?;
+    let token =
+        crate::forge::token_at(&found, jiff::Timestamp::now()).map_err(StatesError::Keychain)?;
+    let issues = GitHubTracker::new(GitHubForge::new(token, repo.clone()), tracker);
+    let access = issues.issues_access().map_err(StatesError::Tracker)?;
+    if access != IssuesAccess::Granted {
+        return Ok(GithubFacts {
+            access,
+            labels: None,
+            accounts: None,
+        });
+    }
+    let labels = issues.labels().map_err(StatesError::Tracker)?;
+    let ids: Vec<&str> = tracker
+        .admitters
+        .iter()
+        .flatten()
+        .map(String::as_str)
+        .collect();
+    let accounts = issues.accounts(&ids).map_err(StatesError::Tracker)?;
+    Ok(GithubFacts {
+        access,
+        labels: Some(labels),
+        accounts: Some(accounts),
+    })
+}
+
 fn read_key(keychain: &Keychain, accounts: &TrackerAccounts) -> Result<Option<ApiKey>, String> {
     keychain
         .read(&accounts.key)
@@ -519,6 +668,57 @@ mod tests {
             let lines = of(kind).project_file_lines(Some("OWL")).unwrap();
             assert!(lines.contains(&format!("kind = \"{name}\"")), "{lines}");
         }
+    }
+
+    /// OWL-537: `init` asks a Linear project's tracker with the key it
+    /// stored, and a Markdown project's not at all; with no key, or no
+    /// repository to name it by, the tracker does not answer.
+    #[test]
+    fn init_asks_linear_with_its_stored_key_and_markdown_nothing() {
+        let project = |kind: &str, team: &str| {
+            ProjectConfig::parse(&format!(
+                "requires = \">=0.1\"\n[tracker]\nkind = \"{kind}\"\n{team}\
+                 admit = {{ label = \"agent\" }}\n\
+                 states = {{ ready = \"Todo\", working = \"Doing\", needs_input = \"Asked\", review = \"Review\" }}\n\
+                 [stack]\ngate = [\"make\"]\n[pipeline]\ndefault = \"trivial\"\n\
+                 plan_approval = \"never\"\n[models]\n[policy]\nalways_human = []\n"
+            ))
+            .unwrap()
+            .tracker
+        };
+        let repo = Repo::parse("pitchopp/owlshift").unwrap();
+        let keychain = Keychain::in_memory();
+        let dir = tempfile::tempdir().unwrap();
+        let access = crate::forge::AppAccess {
+            keychain: std::sync::Arc::new(Keychain::in_memory()),
+            lock: dir.path().join("lock"),
+            app: crate::forge::GitHubApp::from_personal(None),
+        };
+        let linear = project("linear", "team = \"OWL\"\n");
+        let setup = |tracker, repo| Setup {
+            tracker,
+            repo,
+            keychain: &keychain,
+            access: &access,
+        };
+        let error = of(TrackerKind::Linear)
+            .connect(&setup(&linear, Ok(&repo)))
+            .unwrap_err();
+        assert!(
+            error.contains("no Linear API key")
+                && error.contains("`github.com/pitchopp/owlshift/linear`"),
+            "{error}"
+        );
+        let error = of(TrackerKind::Linear)
+            .connect(&setup(&linear, Err("`origin` is not set")))
+            .unwrap_err();
+        assert!(error.ends_with("`origin` is not set"), "{error}");
+
+        let markdown = project("markdown", "");
+        assert_eq!(
+            of(TrackerKind::Markdown).connect(&setup(&markdown, Err("no origin"))),
+            Ok(Connected::default())
+        );
     }
 
     /// OWL-479: a Linear that gave no answer waits for the network, one

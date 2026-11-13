@@ -13,7 +13,9 @@ use owlshift_contracts::config::{self, Admit, ProjectConfig};
 use owlshift_contracts::ids::TicketId;
 use owlshift_platform::keychain::{Keychain, SERVICE, Secret};
 
-use super::{AppError, ForgeCredential, Kind, Opener, Probe, Probed, StatesError};
+use super::{
+    AppError, Connected, Doctored, ForgeCredential, Kind, Opener, Probe, Probed, Setup, StatesError,
+};
 use crate::doctor::{Check, DOES_NOT_BLOCK, KEYCHAIN_FIX, Section, Step, configured_states};
 use crate::init::{LINEAR_KEY, SecretSpec};
 use crate::secrets::{Source, TrackerAccounts, TrackerSecrets};
@@ -90,26 +92,23 @@ team = {}
         }))
     }
 
-    /// `tracker states`, then `tracker identity`.
-    fn doctor_lines(
+    /// `tracker states`, then `tracker identity`; then the team's admission
+    /// facts.
+    fn doctor(
         &self,
         system: &dyn System,
         config: &ProjectConfig,
         accounts: Option<&TrackerAccounts>,
-    ) -> Vec<Check> {
-        tracker_states_check(system, config, accounts)
+        _repo: Option<&Repo>,
+    ) -> Doctored {
+        let lines = tracker_states_check(system, config, accounts)
             .into_iter()
             .chain(tracker_identity_check(system, config, accounts))
-            .collect()
-    }
-
-    fn admission_facts(
-        &self,
-        system: &dyn System,
-        config: &ProjectConfig,
-        accounts: Option<&TrackerAccounts>,
-    ) -> Option<Result<AdmissionFacts, StatesError>> {
-        admission_facts(system, config, accounts)
+            .collect();
+        Doctored {
+            lines,
+            facts: admission_facts(system, config, accounts),
+        }
     }
 
     fn proposals_inbox(
@@ -152,6 +151,52 @@ team = {}
     fn stores_app(&self) -> bool {
         true
     }
+
+    /// Reads the team's workflow states with the key `init` stored, the
+    /// project's own or the shared one, read once (OWL-537).
+    fn connect(&self, setup: &Setup<'_>) -> Result<Connected, String> {
+        let team = setup
+            .tracker
+            .team
+            .as_deref()
+            .ok_or("a Linear project names its team in `tracker.team`")?;
+        let repo = setup.repo.map_err(|reason| {
+            format!(
+                "Owlshift keeps the Linear API key under a keychain account named by the \
+                 project's GitHub repository, and {reason}"
+            )
+        })?;
+        let mut look = |account: &str| setup.keychain.read(account).map_err(|e| e.to_string());
+        let found = crate::secrets::tracker(repo, &mut look)?;
+        let Some(key) = found.key else {
+            return Err(format!(
+                "no Linear API key is stored for this project (service `{SERVICE}`, account \
+                 `{}`): run `owlshift init` in a terminal and give it",
+                found.accounts.key
+            ));
+        };
+        team_answers(&LinearTracker::new(ApiKey::new(key.expose())), team)?;
+        Ok(Connected::default())
+    }
+}
+
+/// Whether Linear answers for team `team` with the key `tracker` holds: its
+/// workflow states read, or why not.
+pub(crate) fn team_answers(tracker: &LinearTracker, team: &str) -> Result<(), String> {
+    tracker
+        .team_states(team)
+        .map(drop)
+        .map_err(|error| match error.kind {
+            ErrorKind::Unauthorized => format!(
+                "Linear refused the API key: {error}. Run `owlshift init --replace-secrets` and \
+                 give a valid key"
+            ),
+            ErrorKind::NotFound => format!(
+                "{error}: `--team` (or `team` under `[tracker]`) is the key your team's issue \
+                 identifiers start with, such as `OWL` for `OWL-12`"
+            ),
+            ErrorKind::Unreachable | ErrorKind::Other => format!("Linear did not answer: {error}"),
+        })
 }
 
 /// Whether each state named under `[tracker].states` is exactly one
