@@ -10,7 +10,9 @@
 //! build plan "P9 · Open-source readiness", part 2): [`of`] gives the
 //! [`Kind`] of the project's tracker, which holds what differs by tracker,
 //! and `doctor`, `init`, `owlshift do` and the UI reach a tracker through
-//! it. Each kind is a file of its own under `tracker/`.
+//! it. Each kind is a file of its own under `tracker/`, which declares its
+//! keychain secret set ([`Kind::secret_set`]) and defines doctor's probes
+//! of its tracker ([`Probe`], OWL-544).
 
 mod github;
 mod linear;
@@ -245,7 +247,7 @@ pub fn keychain_set<T>(
 
 /// What `owlshift doctor` asks of the project's tracker over the network,
 /// through [`System::tracker_probe`]: each kind defines its own probes, in
-/// its file, and reads their answers with [`ask`] (OWL-544).
+/// its file, and reads their answers with `ask` (OWL-544).
 pub trait Probe: Any + fmt::Debug + Sync {
     /// The answer, read with the secrets stored in `keychain`, over the
     /// network.
@@ -261,7 +263,7 @@ pub trait Probe: Any + fmt::Debug + Sync {
     fn fake(&self, host: &crate::system::fake::FakeSystem) -> Probed;
 }
 
-/// The answer to a [`Probe`], of the type its kind reads it as ([`ask`]).
+/// The answer to a [`Probe`], of the type its kind reads it as (`ask`).
 pub struct Probed(Box<dyn Any + Send>);
 
 impl Probed {
