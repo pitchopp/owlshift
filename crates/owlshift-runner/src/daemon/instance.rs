@@ -32,6 +32,14 @@ pub fn record_file(data: &Path) -> PathBuf {
     service_dir(data).join("daemon.json")
 }
 
+/// Where the daemon of `data` keeps the copy of its binary that its
+/// children run where the system cannot pin it (OWL-553, architecture
+/// section 5, "An upgrade"): `<data>/service/pinned`. Only the daemon that
+/// holds the lock writes in it.
+pub fn pinned_dir(data: &Path) -> PathBuf {
+    service_dir(data).join("pinned")
+}
+
 /// This process as the daemon of its data directory: holds the lock, and
 /// removes its record when dropped.
 #[derive(Debug)]
@@ -45,20 +53,48 @@ pub struct Instance {
 #[derive(Debug)]
 pub struct Held(pub Option<DaemonRecord>);
 
+/// This process holding the lock of its data directory, not yet recorded:
+/// a probe sees a daemon whose record does not read until
+/// [`Locked::publish`] (OWL-553: the daemon pins its binary in between).
+#[derive(Debug)]
+pub struct Locked {
+    lock: File,
+}
+
 /// Makes this process the daemon of `data`, recorded as `record` says:
 /// [`Held`] when another daemon holds the lock.
 pub fn take(data: &Path, record: &DaemonRecord) -> io::Result<Result<Instance, Held>> {
+    match lock(data)? {
+        Ok(locked) => locked.publish(data, record).map(Ok),
+        Err(held) => Ok(Err(held)),
+    }
+}
+
+/// Takes the lock of `data` for this process, removing the record a daemon
+/// killed outright left: [`Held`] when another daemon holds the lock.
+pub fn lock(data: &Path) -> io::Result<Result<Locked, Held>> {
     fs::create_dir_all(service_dir(data))?;
     let Some(lock) = project::lock_file_within(&lock_file(data), TAKE_WAIT, TAKE_POLL)? else {
         return Ok(Err(Held(read(data))));
     };
-    let path = record_file(data);
-    step::write_atomically(&path, &record.render())?;
-    Ok(Ok(Instance {
-        _lock: lock,
-        record: path,
-        pid: record.pid,
-    }))
+    match fs::remove_file(record_file(data)) {
+        Err(error) if error.kind() != io::ErrorKind::NotFound => return Err(error),
+        _ => {}
+    }
+    Ok(Ok(Locked { lock }))
+}
+
+impl Locked {
+    /// Writes the record of the daemon that holds the lock, `record`.
+    pub fn publish(self, data: &Path, record: &DaemonRecord) -> io::Result<Instance> {
+        let path = record_file(data);
+        step::write_atomically(&path, &record.render())?;
+        Ok(Instance {
+            _lock: self.lock,
+            record: path,
+            pid: record.pid,
+        })
+    }
 }
 
 impl Drop for Instance {
@@ -123,13 +159,16 @@ mod tests {
         assert!(running(data).unwrap().is_none());
         assert!(!record_file(data).exists(), "its record goes with it");
 
-        // A record left by a daemon killed outright is replaced.
+        // A record left by a daemon killed outright is gone once the lock is
+        // taken, and the new one shows only once published (OWL-553).
         fs::write(record_file(data), record(3).render()).unwrap();
         assert!(
             running(data).unwrap().is_none(),
             "a record alone is no daemon"
         );
-        let second = take(data, &record(4)).unwrap().unwrap();
+        let locked = lock(data).unwrap().unwrap();
+        assert_eq!(running(data).unwrap(), Some(None), "held, not recorded");
+        let second = locked.publish(data, &record(4)).unwrap();
         assert_eq!(record_at(data).pid, 4);
         drop(second);
     }
