@@ -52,7 +52,7 @@ older() {
     }'
 }
 
-work=$(mktemp -d)
+work=$(mktemp -d "${TMPDIR:-/tmp}/owlshift-formula.XXXXXX")
 trap 'rm -rf "$work"' EXIT
 
 message=$(printf 'Update the Homebrew formula to %s\n\nRendered by .github/workflows/formula.yml from the signed SHA256SUMS of\nrelease v%s.\n\nSigned-off-by: %s <%s>' \
