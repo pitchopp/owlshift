@@ -6308,12 +6308,18 @@ impl OnDemand<'_> {
             ]),
         );
 
+        // The agent's text closes no issue: its closing keywords are broken,
+        // in the title too, which a squash merge makes the commit's subject;
+        // the ticket's own title, a person's, is kept (OWL-556). On GitHub
+        // Issues the body then ends with `Closes #n` (OWL-536).
         let (title, body) = match &built.pr {
-            Some(pr) => (pr.title.clone(), pr.body.clone()),
+            Some(pr) => (
+                crate::writer::neutralise_closing_keywords(&pr.title),
+                pr.body.clone(),
+            ),
             None => (p.found.title.clone(), built.summary.clone()),
         };
-        // On GitHub Issues the body ends with `Closes #n` (OWL-536).
-        let body = crate::writer::with_closing_line(&body, self.tracker.closing_line(ticket));
+        let body = crate::writer::pull_request_body(&body, self.tracker.closing_line(ticket));
         let opened = writer
             .open_pull_request(self.forge, head, base, &title, &body)
             .map_err(|e| delivery("opening the pull request", &e))?;
