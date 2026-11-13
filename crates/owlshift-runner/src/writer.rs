@@ -501,6 +501,53 @@ pub(crate) fn with_closing_line(body: &str, line: Option<String>) -> String {
     format!("{body}\n\n{line}")
 }
 
+/// GitHub's closing keywords: one of them before an issue's reference in a
+/// pull request's body closes that issue when it merges.
+const CLOSING_KEYWORDS: [&str; 9] = [
+    "close", "closes", "closed", "fix", "fixes", "fixed", "resolve", "resolves", "resolved",
+];
+
+/// `text` with every closing keyword, as a whole word in any case, broken by
+/// a zero-width space after its second letter (`fi\u{200B}xes`), which GitHub
+/// does not read as a keyword (OWL-556, build-plan.md, "The GitHub Issues
+/// adapter", Delivery): so a "Fixes #5" an agent writes closes nothing. A
+/// word is a run of alphanumeric characters, so any other character next to
+/// a keyword, the zero-width space included, leaves it a keyword to break;
+/// a broken one reads as two words, neither a keyword.
+pub(crate) fn neutralise_closing_keywords(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while !rest.is_empty() {
+        let end = rest
+            .find(|c: char| !c.is_alphanumeric())
+            .unwrap_or(rest.len());
+        let (word, after) = rest.split_at(end);
+        if CLOSING_KEYWORDS
+            .iter()
+            .any(|k| word.eq_ignore_ascii_case(k))
+        {
+            // Every keyword is ASCII: its second letter ends at byte 2.
+            out.push_str(&word[..2]);
+            out.push('\u{200B}');
+            out.push_str(&word[2..]);
+        } else {
+            out.push_str(word);
+        }
+        let skip = after.chars().next().map_or(0, char::len_utf8);
+        out.push_str(&after[..skip]);
+        rest = &after[skip..];
+    }
+    out
+}
+
+/// The body of a pull request the runner opens: the agent's text, its
+/// closing keywords broken ([`neutralise_closing_keywords`]), then the
+/// tracker's closing line ([`with_closing_line`]), the only one that closes
+/// an issue (OWL-556).
+pub(crate) fn pull_request_body(agent: &str, line: Option<String>) -> String {
+    with_closing_line(&neutralise_closing_keywords(agent), line)
+}
+
 /// A correction a DELIVERY report names (OWL-146, architecture section 5, "A
 /// reversed decision").
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -5425,6 +5472,65 @@ Merge state reported by the forge: `CLEAN`.
         );
         assert_eq!(with_closing_line("  ", line()), "Closes #12");
         assert_eq!(with_closing_line("Says hello.", None), "Says hello.");
+    }
+
+    /// Every closing keyword, as a whole word in any case and whatever
+    /// surrounds it, is broken after its second letter; other words, and a
+    /// keyword already broken, are left as they are (OWL-556).
+    #[test]
+    fn closing_keywords_are_broken_by_a_zero_width_space() {
+        let cases = [
+            ("Fixes #5", "Fi\u{200B}xes #5"),
+            ("fix: o/r#5", "fi\u{200B}x: o/r#5"),
+            (
+                "CLOSED https://github.com/o/r/issues/5",
+                "CL\u{200B}OSED https://github.com/o/r/issues/5",
+            ),
+            (
+                "Resolves \\#5, closes &#35;6",
+                "Re\u{200B}solves \\#5, cl\u{200B}oses &#35;6",
+            ),
+            (
+                "close#5 resolve resolved fixed",
+                "cl\u{200B}ose#5 re\u{200B}solve re\u{200B}solved fi\u{200B}xed",
+            ),
+            (
+                "`Fixes #5`\n**Closes** #6",
+                "`Fi\u{200B}xes #5`\n**Cl\u{200B}oses** #6",
+            ),
+            (
+                "\u{200B}Fixes\u{200B} #5",
+                "\u{200B}Fi\u{200B}xes\u{200B} #5",
+            ),
+            (
+                "Prefixes, fixture, closet, unresolved: #5 é",
+                "Prefixes, fixture, closet, unresolved: #5 é",
+            ),
+        ];
+        for (text, broken) in cases {
+            assert_eq!(neutralise_closing_keywords(text), broken, "{text}");
+            assert_eq!(neutralise_closing_keywords(broken), broken, "{broken}");
+        }
+    }
+
+    /// An agent's "Fixes #5" reaches the pull request broken, and the
+    /// tracker's closing line ends it whole, once, even when the agent wrote
+    /// it too: the only closing reference left is the runner's (OWL-556).
+    #[test]
+    fn only_the_runners_closing_line_closes_an_issue() {
+        let line = || Some("Closes #12".to_owned());
+        let body = pull_request_body("Fixes #5.\n\nCloses #12\n", line());
+        assert_eq!(
+            body,
+            "Fi\u{200B}xes #5.\n\nCl\u{200B}oses #12\n\nCloses #12"
+        );
+        let live: Vec<&str> = body
+            .split(|c: char| !c.is_alphanumeric())
+            .filter(|w| CLOSING_KEYWORDS.iter().any(|k| w.eq_ignore_ascii_case(k)))
+            .collect();
+        assert_eq!(live, ["Closes"]);
+        assert!(body.ends_with("\n\nCloses #12"));
+        assert_eq!(pull_request_body("Fixes #5", None), "Fi\u{200B}xes #5");
     }
 
     /// The INTAKE comment (OWL-248): the verdict, each dependency with its
