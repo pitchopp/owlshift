@@ -2,30 +2,29 @@
 # OWL-556 live check, quoted next to "The GitHub Issues adapter" of docs/design/build-plan.md, "P9 · Open-source
 # readiness": which rewriting of a closing keyword ("Fixes #5") GitHub ignores when the pull request whose body holds
 # it merges, so that the runner can neutralise the agent's text and leave its own `Closes #n` line as the only one
-# that closes an issue. Through a user token of Owlshift's GitHub App, `owl-shift`, signed in with the device flow
-# and its client ID, as G1 to G6 were (owl-547.sh).
+# that closes an issue.
 #
 # One pull request carries every form, each naming an issue of its own (a victim), and ends with `Closes #T`, T the
-# run's target. It is squash-merged through the token with a commit message of the probe's own, which names no
-# issue, so that only the body can close one. Then each issue is read: a victim still open is a form GitHub ignores.
-# Controls: the plain forms (`Fixes #n`, `Fixes owner/repo#n`, `Fixes <issue URL>`) must close their victims, and T
-# must close, or the run proves nothing.
+# run's target. It is squash-merged with a commit message of the probe's own, which names no issue, so that only the
+# body can close one. Then each issue is read: a victim still open is a form GitHub ignores. Controls: the plain forms
+# (`Fixes #n`, `Fixes owner/repo#n`, `Fixes <issue URL>`) must close their victims, and T must close, or the run
+# proves nothing. Who opens and merges the pull request does not change how GitHub reads its body: the run goes
+# through the person's own `gh` login, not the app's token (G5 settled that a pull request the token opens closes
+# its issue alike).
 #
-#   bash docs/design/live-checks/owl-556.sh OWNER/REPO      (--help: what to prepare)
+#   bash docs/design/live-checks/owl-556.sh pitchopp/owlshift-live-sandbox      (--help: what it does)
 #
-# Needs bash (3.2 is enough), curl and jq. The access token reaches curl only through a file of mode 600 in a private
-# scratch folder, removed at the end; nothing is stored. The report, on standard output, holds no token and no
-# account identifier.
+# Needs bash (3.2 is enough), jq, and gh signed in (gh auth status) as an account that can write the sandbox's issues
+# and contents and merge its pull requests. It runs alone in about 2 minutes. It creates on the sandbox 17 issues, a
+# branch `owl-556-probe-<time>` with one file, and a pull request, which it squash-merges into the default branch;
+# then it deletes the branch, removes the file from the default branch in a commit of its own, and closes as not
+# planned every issue the merge left open. It refuses pitchopp/owlshift. The report, on standard output, holds no
+# token and no account identifier: paste it on OWL-556.
 
 set -u -o pipefail
 umask 077
 
 PROGRAM=${0##*/}
-API=https://api.github.com
-LOGIN=https://github.com
-# owl-shift's client ID, as crates/owlshift-adapters/src/forge/github_app.rs ships it (not a secret).
-CLIENT_ID=${OWL556_CLIENT_ID:-Iv23li5EhBqiuljIPbiK}
-SLUG=owl-shift
 BODY="A probe of OWL-556 (docs/design/live-checks/owl-556.sh). The run ends it as not planned unless its pull request ends it first."
 # The repository this check must never write to: Owlshift's own.
 FORBIDDEN=pitchopp/owlshift
@@ -74,11 +73,10 @@ usage() {
     cat <<EOF
 Usage: bash $PROGRAM OWNER/REPO
 
-  OWNER/REPO  the sandbox the owl-shift app is installed on, Issues (read and write) and
-              Contents (write) accepted: pitchopp/owlshift-live-sandbox. Never $FORBIDDEN.
+  OWNER/REPO  the sandbox: pitchopp/owlshift-live-sandbox. Never $FORBIDDEN.
 
-Before the run (about 3 minutes): nothing but a browser to sign in. It signs in through
-the device flow (enter the code it shows), then runs alone: it opens $((${#FORM_NAME[@]} + 1)) issues, a
+Needs jq and gh signed in as an account that writes the sandbox. About 2 minutes, alone:
+it opens $((${#FORM_NAME[@]} + 1)) issues, a
 branch with one file, and a pull request, squash-merges it into the default branch, reads
 the issues, then deletes the file and the branch and ends the issues still open as not
 planned. Paste everything it prints on standard output on OWL-556.
@@ -94,33 +92,19 @@ fail() {
 }
 is_number() { case $1 in '' | *[!0-9]*) return 1 ;; *) return 0 ;; esac }
 
-# The one place a secret is printed: into a file of mode 600, read by curl.
-write_secret_file() {
-    rm -f "$1"
-    (umask 077 && printf '%s\n' "$2" >"$1")
-    chmod 600 "$1"
-}
-
 field() { jq -r "$1 // empty" <"$2" 2>/dev/null; }
 
-# call NAME METHOD URL [BODY_FILE] [AUTH_FILE]: the answer in $WORK/NAME.body, the status printed.
-call() {
-    local name=$1 method=$2 url=$3 body=${4:-} auth=${5:-} accept status
-    case $url in
-    "$LOGIN"/*) accept='Accept: application/json' ;;
-    *) accept='Accept: application/vnd.github+json' ;;
-    esac
-    local args=(-sS -X "$method" -o "$WORK/$name.body" -w '%{http_code}'
-        -H "$accept" -H 'X-GitHub-Api-Version: 2022-11-28')
-    if [ -n "$body" ]; then args+=(--data "@$body"); fi
-    if [ -n "$auth" ]; then args+=(-H "@$auth"); fi
-    : >"$WORK/$name.body"
-    status=$(curl "${args[@]}" "$url" 2>"$WORK/$name.err") || true
-    printf '%s\n' "${status:-000}"
+# rest NAME PATH [METHOD] [BODY_FILE]: `gh api` as the signed-in person; the answer in $WORK/NAME.body, the status
+# printed. PATH is relative to the API's root, or `graphql`.
+rest() {
+    local name=$1 path=$2 method=${3:-GET} body=${4:-}
+    local args=(api -i -X "$method" -H 'X-GitHub-Api-Version: 2022-11-28' "$path")
+    if [ -n "$body" ]; then args+=(--input "$body"); fi
+    gh "${args[@]}" </dev/null >"$WORK/$name.raw" 2>"$WORK/$name.err" || true
+    # The status line, the headers, a blank line, then the body.
+    awk '{ sub(/\r$/, "") } body { print; next } /^$/ { body = 1 }' "$WORK/$name.raw" >"$WORK/$name.body"
+    awk 'NR == 1 { print ($2 == "" ? "000" : $2); exit } END { if (NR == 0) print "000" }' "$WORK/$name.raw"
 }
-
-# rest NAME PATH [METHOD] [BODY_FILE]: a call with the signed-in token.
-rest() { call "$1" "${3:-GET}" "$API/$2" "${4:-}" "$WORK/auth"; }
 
 script_sha() {
     if command -v shasum >/dev/null 2>&1; then
@@ -132,71 +116,16 @@ script_sha() {
     fi
 }
 
-sign_in() {
-    local status interval life device polls=0 err token
-    printf 'client_id=%s\n' "$CLIENT_ID" >"$WORK/device.form"
-    status=$(call device POST "$LOGIN/login/device/code" "$WORK/device.form")
-    device=$(field .device_code "$WORK/device.body")
-    if [ -z "$device" ]; then
-        fail "sign-in: no device code: HTTP $status $(field .error "$WORK/device.body")"
-        return 1
-    fi
-    interval=$(field .interval "$WORK/device.body")
-    interval=${interval:-5}
-    life=$(field .expires_in "$WORK/device.body")
-    life=${life:-900}
-    write_secret_file "$WORK/poll.form" \
-        "client_id=$CLIENT_ID&device_code=$device&grant_type=urn:ietf:params:oauth:grant-type:device_code"
-    say ""
-    say "Open $(field .verification_uri "$WORK/device.body") and enter the code $(field .user_code "$WORK/device.body")"
-    say "Waiting for the code to be entered..."
-    while [ $((polls * interval)) -lt "$life" ]; do
-        sleep "$interval"
-        polls=$((polls + 1))
-        call poll POST "$LOGIN/login/oauth/access_token" "$WORK/poll.form" >/dev/null
-        err=$(field .error "$WORK/poll.body")
-        case $err in
-        authorization_pending) ;;
-        slow_down)
-            interval=$(field .interval "$WORK/poll.body")
-            interval=${interval:-10}
-            ;;
-        '')
-            if [ -n "$(field .access_token "$WORK/poll.body")" ]; then break; fi
-            ;;
-        *)
-            fail "sign-in: $err after $polls polls"
-            return 1
-            ;;
-        esac
-    done
-    token=$(field .access_token "$WORK/poll.body")
-    rm -f "$WORK/poll.body" "$WORK/poll.form" "$WORK/device.body"
-    if [ -z "$token" ]; then
-        fail "sign-in: no token after $polls polls"
-        return 1
-    fi
-    write_secret_file "$WORK/auth" "Authorization: Bearer $token"
-    token=
-    report "sign-in: signed in after $polls polls; the token is kept in a file of this run only"
-}
-
 # Sets BASE (the default branch) and BASE_SHA.
 start() {
-    local status issues contents push
+    local status push
     section start
-    status=$(rest inst user/installations)
-    issues=$(jq -r --arg s "$SLUG" '[.installations[]? | select(.app_slug == $s)][0].permissions.issues // "none"' \
-        <"$WORK/inst.body" 2>/dev/null)
-    contents=$(jq -r --arg s "$SLUG" '[.installations[]? | select(.app_slug == $s)][0].permissions.contents // "none"' \
-        <"$WORK/inst.body" 2>/dev/null)
-    report "start: GET /user/installations: HTTP $status, the app's installation holds issues: ${issues:-none}, contents: ${contents:-none}"
     status=$(rest repo "repos/$REPO")
     push=$(field .permissions.push "$WORK/repo.body")
     BASE=$(field .default_branch "$WORK/repo.body")
-    report "start: the token reads REPO: HTTP $status, push: ${push:-unknown}, private: $(field .private "$WORK/repo.body")"
-    if [ "$issues" != write ] || [ "$contents" != write ] || [ "$status" != 200 ] || [ -z "$BASE" ]; then
-        fail "start: the token cannot write REPO's issues and contents; nothing run"
+    report "start: gh reads REPO: HTTP $status, push: ${push:-unknown}, private: $(field .private "$WORK/repo.body")"
+    if [ "$status" != 200 ] || [ "$push" != true ] || [ -z "$BASE" ]; then
+        fail "start: gh's account cannot write REPO ($(head -n 1 "$WORK/repo.err")); nothing run"
         return 1
     fi
     status=$(rest ref "repos/$REPO/git/ref/heads/$BASE")
@@ -304,7 +233,7 @@ closing_refs() {
     # shellcheck disable=SC2016
     q='query($o: String!, $n: String!, $p: Int!) { repository(owner: $o, name: $n) { pullRequest(number: $p) { closingIssuesReferences(first: 50) { nodes { number } } } } }'
     jq -n -c --arg q "$q" --arg o "$OWNER" --arg n "$NAME" --argjson p "$PR" '{query: $q, variables: {o: $o, n: $n, p: $p}}' >"$WORK/cir.json"
-    status=$(call cir POST "$API/graphql" "$WORK/cir.json" "$WORK/auth")
+    status=$(rest cir graphql POST "$WORK/cir.json")
     report "pull request: closingIssuesReferences $1: HTTP $status, $(jq -c '[.data.repository.pullRequest.closingIssuesReferences.nodes[]?.number]' <"$WORK/cir.body" 2>/dev/null)"
 }
 
@@ -351,7 +280,7 @@ cleanup() {
     local i n status sha
     if [ "${CLEANED:-}" = yes ]; then return 0; fi
     CLEANED=yes
-    if [ -f "${WORK:-}/auth" ]; then
+    if [ "${STARTED:-no}" = yes ]; then
         section cleanup
         if [ -n "$PR" ] && [ "$MERGED" = no ]; then
             jq -n -c '{state: "closed"}' >"$WORK/prclose.json"
@@ -381,7 +310,7 @@ cleanup() {
             i=$((i + 1))
         done
         report ""
-        report "done, failures: $FAILED. The access token expires on its own (8 h); nothing was stored."
+        report "done, failures: $FAILED."
     fi
     rm -rf "${WORK:-/nonexistent}"
 }
@@ -412,7 +341,7 @@ if [ "$(printf '%s' "$REPO" | tr '[:upper:]' '[:lower:]')" = "$FORBIDDEN" ]; the
 fi
 OWNER=${REPO%%/*}
 NAME=${REPO#*/}
-for tool in curl jq base64; do
+for tool in gh jq base64; do
     if ! command -v "$tool" >/dev/null 2>&1; then
         say "$PROGRAM: $tool is needed"
         exit 2
@@ -424,9 +353,12 @@ FAILED=0
 trap cleanup EXIT
 trap 'exit 130' INT TERM
 
-report "OWL-556 check, $(date -u +%Y-%m-%dT%H:%M:%SZ), $(curl --version | head -n 1 | cut -d' ' -f1-2), $(jq --version), $(uname -s), script sha256 $(script_sha)"
-section sign-in
-sign_in || exit 1
+report "OWL-556 check, $(date -u +%Y-%m-%dT%H:%M:%SZ), $(gh --version | head -n 1 | cut -d' ' -f1-3), $(jq --version), $(uname -s), script sha256 $(script_sha)"
+if ! gh auth status >/dev/null 2>&1 </dev/null; then
+    say "$PROGRAM: gh is not signed in (gh auth status)"
+    exit 2
+fi
+STARTED=yes
 start || exit 1
 probe || exit 1
 read_back
