@@ -16,9 +16,7 @@ mod github;
 mod linear;
 mod markdown;
 
-#[cfg(test)]
-pub(crate) use github::named_labels;
-
+use std::any::Any;
 use std::fmt;
 use std::path::Path;
 
@@ -246,45 +244,50 @@ pub fn keychain_set<T>(
 }
 
 /// What `owlshift doctor` asks of the project's tracker over the network,
-/// through [`crate::system::System::tracker_probe`].
-#[derive(Clone, Copy, Debug)]
-pub enum Probe<'a> {
-    /// The names of the workflow states of the Linear team `team`
-    /// ([`linear_team_states`], OWL-147).
-    LinearStates {
-        accounts: &'a TrackerAccounts,
-        team: &'a str,
-    },
-    /// What the admission and proposals setup of the Linear team `team`
-    /// looks like ([`linear_admission`], OWL-155).
-    LinearAdmission {
-        accounts: &'a TrackerAccounts,
-        team: &'a str,
-        ready: &'a str,
-        labels: &'a [&'a str],
-        people: &'a [&'a str],
-    },
-    /// The Linear app user Owlshift writes as ([`linear_app_user`],
-    /// OWL-157).
-    LinearApp {
-        accounts: &'a TrackerAccounts,
-        team: &'a str,
-    },
-    /// What a GitHub Issues project's repository says of its setup
-    /// ([`github_facts`], OWL-537).
-    GithubFacts {
-        repo: &'a Repo,
-        tracker: &'a config::Tracker,
-    },
+/// through [`System::tracker_probe`]: each kind defines its own probes, in
+/// its file, and reads their answers with [`ask`] (OWL-544).
+pub trait Probe: Any + fmt::Debug + Sync {
+    /// The answer, read with the secrets stored in `keychain`, over the
+    /// network.
+    fn read(&self, keychain: &Keychain) -> Probed;
+
+    /// The answer of a keychain that could not be read, for `reason`.
+    fn keychain_error(&self, reason: String) -> Probed;
+
+    /// The answer of the test host, as the kind scripts it
+    /// ([`crate::system::fake::FakeSystem::script`]); never the keychain or
+    /// the network.
+    #[cfg(test)]
+    fn fake(&self, host: &crate::system::fake::FakeSystem) -> Probed;
 }
 
-/// The answer to a [`Probe`], of the variant named as the probe's.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum Probed {
-    States(Result<Vec<String>, StatesError>),
-    Admission(Result<AdmissionFacts, StatesError>),
-    App(Result<Option<AppUser>, AppError>),
-    Github(Result<GithubFacts, StatesError>),
+/// The answer to a [`Probe`], of the type its kind reads it as ([`ask`]).
+pub struct Probed(Box<dyn Any + Send>);
+
+impl Probed {
+    pub fn new<A: Any + Send>(answer: A) -> Self {
+        Self(Box::new(answer))
+    }
+
+    /// The answer, when it is an `A`.
+    pub fn take<A: Any>(self) -> Option<A> {
+        self.0.downcast().ok().map(|answer| *answer)
+    }
+}
+
+/// No value: an answer may carry what a tracker said.
+impl fmt::Debug for Probed {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("Probed(..)")
+    }
+}
+
+/// The answer of `system` to `probe`, of the type the probe's kind reads.
+pub(crate) fn ask<A: Any>(system: &dyn System, probe: &dyn Probe) -> A {
+    system
+        .tracker_probe(probe)
+        .take()
+        .unwrap_or_else(|| unreachable!("the host answered {probe:?} with another type"))
 }
 
 /// What doctor reads of a GitHub Issues project (OWL-537): whether the
@@ -295,47 +298,6 @@ pub struct GithubFacts {
     pub access: IssuesAccess,
     pub labels: Option<Vec<String>>,
     pub accounts: Option<Vec<AccountFact>>,
-}
-
-impl Probe<'_> {
-    /// The answer, read with the tracker set stored under the probe's
-    /// accounts in the system keychain, over the network.
-    pub fn read(&self) -> Probed {
-        let keychain = match Keychain::system() {
-            Ok(keychain) => keychain,
-            Err(error) => return self.keychain_error(error.to_string()),
-        };
-        match *self {
-            Self::LinearStates { accounts, team } => {
-                Probed::States(linear_team_states(&keychain, accounts, team))
-            }
-            Self::LinearAdmission {
-                accounts,
-                team,
-                ready,
-                labels,
-                people,
-            } => Probed::Admission(linear_admission(
-                &keychain, accounts, team, ready, labels, people,
-            )),
-            Self::LinearApp { accounts, team } => {
-                Probed::App(linear_app_user(&keychain, accounts, team))
-            }
-            Self::GithubFacts { repo, tracker } => {
-                Probed::Github(github_facts(&keychain, repo, tracker))
-            }
-        }
-    }
-
-    /// The answer of a keychain that could not be read, for `reason`.
-    pub fn keychain_error(&self, reason: String) -> Probed {
-        match self {
-            Self::LinearStates { .. } => Probed::States(Err(StatesError::Keychain(reason))),
-            Self::LinearAdmission { .. } => Probed::Admission(Err(StatesError::Keychain(reason))),
-            Self::LinearApp { .. } => Probed::App(Err(AppError::Keychain(reason))),
-            Self::GithubFacts { .. } => Probed::Github(Err(StatesError::Keychain(reason))),
-        }
-    }
 }
 
 /// Opens the project's tracker adapter, afresh on each call: `owlshift do`
@@ -724,6 +686,53 @@ mod tests {
             }
         }
         assert_eq!(of(TrackerKind::Linear).secret_set(), Some(&LINEAR_SECRETS));
+    }
+
+    /// OWL-544: a probe of a kind of its own, with a script of its own, is
+    /// answered through the host by the kind-neutral API alone.
+    #[test]
+    fn a_probe_of_another_kind_is_answered_through_the_host() {
+        use crate::system::fake::FakeSystem;
+
+        type Acme = Result<u32, String>;
+        #[derive(Debug)]
+        struct AcmeProbe;
+        #[derive(Default)]
+        struct AcmeScript {
+            answer: Option<u32>,
+        }
+        impl Probe for AcmeProbe {
+            fn read(&self, _keychain: &Keychain) -> Probed {
+                Probed::new::<Acme>(Err("no network in tests".to_owned()))
+            }
+
+            fn keychain_error(&self, reason: String) -> Probed {
+                Probed::new::<Acme>(Err(reason))
+            }
+
+            fn fake(&self, host: &FakeSystem) -> Probed {
+                if let Err(reason) = host.secret_stored("acme") {
+                    return self.keychain_error(reason);
+                }
+                let answer = host.scripted::<AcmeScript>().and_then(|s| s.answer);
+                Probed::new::<Acme>(answer.ok_or_else(|| "not scripted".to_owned()))
+            }
+        }
+
+        let host = FakeSystem::default().script(|s: &mut AcmeScript| s.answer = Some(7));
+        assert_eq!(ask::<Acme>(&host, &AcmeProbe), Ok(7));
+        assert_eq!(
+            ask::<Acme>(&FakeSystem::default(), &AcmeProbe),
+            Err("not scripted".to_owned())
+        );
+        let locked = FakeSystem::default()
+            .script(|s: &mut AcmeScript| s.answer = Some(7))
+            .keychain_fails("locked");
+        assert_eq!(ask::<Acme>(&locked, &AcmeProbe), Err("locked".to_owned()));
+        // An answer is never shown, and only its own type takes it.
+        let probed = Probed::new::<Acme>(Ok(7));
+        assert_eq!(format!("{probed:?}"), "Probed(..)");
+        assert_eq!(probed.take::<u32>(), None);
     }
 
     /// OWL-537: `init` asks a Linear project's tracker with the key it

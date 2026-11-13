@@ -1,6 +1,7 @@
 //! The Linear tracker's [`Kind`]: a team's issues, read and written through
 //! a Linear API key and, when one is stored, the Linear app Owlshift writes
-//! as (decision D8, OWL-157).
+//! as (decision D8, OWL-157). Doctor's probes of the team are its own
+//! ([`Probe`], OWL-544).
 
 use std::path::Path;
 
@@ -552,10 +553,13 @@ fn linear_states(
     accounts: &TrackerAccounts,
     team: &str,
 ) -> Result<Vec<String>, StatesError> {
-    match system.tracker_probe(&Probe::LinearStates { accounts, team }) {
-        Probed::States(answer) => answer,
-        other => unreachable!("the host answered a Linear states probe with {other:?}"),
-    }
+    super::ask::<States>(
+        system,
+        &StatesProbe {
+            accounts: accounts.clone(),
+            team: team.to_owned(),
+        },
+    )
 }
 
 /// The admission facts of the Linear team `team`, as the host reads them.
@@ -567,17 +571,17 @@ fn linear_admission(
     labels: &[&str],
     people: &[&str],
 ) -> Result<AdmissionFacts, StatesError> {
-    let probe = Probe::LinearAdmission {
-        accounts,
-        team,
-        ready,
-        labels,
-        people,
-    };
-    match system.tracker_probe(&probe) {
-        Probed::Admission(answer) => answer,
-        other => unreachable!("the host answered a Linear admission probe with {other:?}"),
-    }
+    let owned = |names: &[&str]| names.iter().map(|&name| name.to_owned()).collect();
+    super::ask::<Admission>(
+        system,
+        &AdmissionProbe {
+            accounts: accounts.clone(),
+            team: team.to_owned(),
+            ready: ready.to_owned(),
+            labels: owned(labels),
+            people: owned(people),
+        },
+    )
 }
 
 /// The Linear app user Owlshift writes as, as the host checks it.
@@ -586,8 +590,212 @@ fn linear_app(
     accounts: &TrackerAccounts,
     team: &str,
 ) -> Result<Option<AppUser>, AppError> {
-    match system.tracker_probe(&Probe::LinearApp { accounts, team }) {
-        Probed::App(answer) => answer,
-        other => unreachable!("the host answered a Linear app probe with {other:?}"),
+    super::ask::<App>(
+        system,
+        &AppProbe {
+            accounts: accounts.clone(),
+            team: team.to_owned(),
+        },
+    )
+}
+
+type States = Result<Vec<String>, StatesError>;
+type Admission = Result<AdmissionFacts, StatesError>;
+type App = Result<Option<AppUser>, AppError>;
+
+/// The names of the workflow states of team `team`, read with the key
+/// stored under `accounts` ([`super::linear_team_states`], OWL-147).
+#[derive(Debug)]
+struct StatesProbe {
+    accounts: TrackerAccounts,
+    team: String,
+}
+
+impl Probe for StatesProbe {
+    fn read(&self, keychain: &Keychain) -> Probed {
+        Probed::new::<States>(super::linear_team_states(
+            keychain,
+            &self.accounts,
+            &self.team,
+        ))
+    }
+
+    fn keychain_error(&self, reason: String) -> Probed {
+        Probed::new::<States>(Err(StatesError::Keychain(reason)))
+    }
+
+    #[cfg(test)]
+    fn fake(&self, host: &crate::system::fake::FakeSystem) -> Probed {
+        Probed::new::<States>(fake::states(host, self))
+    }
+}
+
+/// What the admission and proposals setup of team `team` looks like
+/// ([`super::linear_admission`], OWL-155).
+#[derive(Debug)]
+struct AdmissionProbe {
+    accounts: TrackerAccounts,
+    team: String,
+    ready: String,
+    labels: Vec<String>,
+    people: Vec<String>,
+}
+
+impl Probe for AdmissionProbe {
+    fn read(&self, keychain: &Keychain) -> Probed {
+        let labels: Vec<&str> = self.labels.iter().map(String::as_str).collect();
+        let people: Vec<&str> = self.people.iter().map(String::as_str).collect();
+        Probed::new::<Admission>(super::linear_admission(
+            keychain,
+            &self.accounts,
+            &self.team,
+            &self.ready,
+            &labels,
+            &people,
+        ))
+    }
+
+    fn keychain_error(&self, reason: String) -> Probed {
+        Probed::new::<Admission>(Err(StatesError::Keychain(reason)))
+    }
+
+    #[cfg(test)]
+    fn fake(&self, host: &crate::system::fake::FakeSystem) -> Probed {
+        Probed::new::<Admission>(fake::admission(host, self))
+    }
+}
+
+/// The Linear app user Owlshift writes as ([`super::linear_app_user`],
+/// OWL-157).
+#[derive(Debug)]
+struct AppProbe {
+    accounts: TrackerAccounts,
+    team: String,
+}
+
+impl Probe for AppProbe {
+    fn read(&self, keychain: &Keychain) -> Probed {
+        Probed::new::<App>(super::linear_app_user(keychain, &self.accounts, &self.team))
+    }
+
+    fn keychain_error(&self, reason: String) -> Probed {
+        Probed::new::<App>(Err(AppError::Keychain(reason)))
+    }
+
+    #[cfg(test)]
+    fn fake(&self, host: &crate::system::fake::FakeSystem) -> Probed {
+        Probed::new::<App>(fake::app(host, self))
+    }
+}
+
+/// What the test host answers Linear's probes, as a test scripts it.
+#[cfg(test)]
+mod fake {
+    use owlshift_adapters::tracker::{Error, ErrorKind};
+
+    use super::*;
+    use crate::system::fake::FakeSystem;
+
+    /// What Linear answers the test host.
+    #[derive(Default)]
+    struct Script {
+        /// For a team's workflow states, the key being stored; `None`: it
+        /// cannot be reached.
+        states: Option<Result<Vec<String>, Error>>,
+        /// For a team's admission facts, the key being stored; `None`: it
+        /// cannot be reached.
+        admission: Option<Result<AdmissionFacts, Error>>,
+        /// What checking the Linear app gives, both of its entries being
+        /// stored; `None`: no app is stored.
+        app: Option<Result<String, Error>>,
+    }
+
+    impl FakeSystem {
+        /// Linear answers so for a team's workflow states.
+        pub(crate) fn linear_states_are(self, answer: Result<&[&str], Error>) -> Self {
+            let answer = answer.map(|names| names.iter().map(|&n| n.to_owned()).collect());
+            self.script(|script: &mut Script| script.states = Some(answer))
+        }
+
+        /// Linear answers so for a team's admission facts.
+        pub(crate) fn linear_admission_is(self, answer: Result<AdmissionFacts, Error>) -> Self {
+            self.script(|script: &mut Script| script.admission = Some(answer))
+        }
+
+        /// Checking the Linear app gives its user's name, or this error.
+        pub(crate) fn linear_app_is(self, answer: Result<&str, Error>) -> Self {
+            let answer = answer.map(str::to_owned);
+            self.script(|script: &mut Script| script.app = Some(answer))
+        }
+    }
+
+    fn unreachable() -> Error {
+        Error::new(ErrorKind::Other, "Linear: no network in tests")
+    }
+
+    /// The key's presence follows [`FakeSystem::unstored`] and
+    /// [`FakeSystem::keychain_fails`].
+    pub(super) fn states(host: &FakeSystem, probe: &StatesProbe) -> States {
+        match host.secret_stored(probe.accounts.of(LINEAR_ACCOUNT)) {
+            Err(reason) => Err(StatesError::Keychain(reason)),
+            Ok(false) => Err(StatesError::NoKey),
+            Ok(true) => host
+                .scripted::<Script>()
+                .and_then(|script| script.states.clone())
+                .unwrap_or_else(|| Err(unreachable()))
+                .map_err(StatesError::Tracker),
+        }
+    }
+
+    /// Follows [`states`]'s key rules. Only the labels and accounts the
+    /// probe asks of come back.
+    pub(super) fn admission(host: &FakeSystem, probe: &AdmissionProbe) -> Admission {
+        match host.secret_stored(probe.accounts.of(LINEAR_ACCOUNT)) {
+            Err(reason) => Err(StatesError::Keychain(reason)),
+            Ok(false) => Err(StatesError::NoKey),
+            Ok(true) => host
+                .scripted::<Script>()
+                .and_then(|script| script.admission.clone())
+                .unwrap_or_else(|| Err(unreachable()))
+                .map(|mut facts| {
+                    facts.labels.retain(|l| probe.labels.contains(l));
+                    facts.accounts.retain(|a| probe.people.contains(&a.id));
+                    facts
+                })
+                .map_err(StatesError::Tracker),
+        }
+    }
+
+    /// No app unless [`FakeSystem::linear_app_is`] gave one; then its
+    /// entries follow [`FakeSystem::unstored`] and
+    /// [`FakeSystem::keychain_fails`].
+    pub(super) fn app(host: &FakeSystem, probe: &AppProbe) -> App {
+        let Some(answer) = host
+            .scripted::<Script>()
+            .and_then(|script| script.app.clone())
+        else {
+            return Ok(None);
+        };
+        let accounts = &probe.accounts;
+        let stored = |account| host.secret_stored(account).map_err(AppError::Keychain);
+        let incomplete = |missing: &str| AppError::Incomplete {
+            missing: missing.to_owned(),
+            source: accounts.source,
+        };
+        let id = accounts.of(LINEAR_APP_ID_ACCOUNT);
+        let secret = accounts.of(LINEAR_APP_SECRET_ACCOUNT);
+        match (stored(id)?, stored(secret)?) {
+            (false, false) => Ok(None),
+            (true, false) => Err(incomplete(secret)),
+            (false, true) => Err(incomplete(id)),
+            (true, true) => {
+                answer
+                    .map(|name| Some(AppUser { name }))
+                    .map_err(|error| AppError::Tracker {
+                        error,
+                        accounts: accounts.clone(),
+                    })
+            }
+        }
     }
 }

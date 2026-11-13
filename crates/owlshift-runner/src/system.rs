@@ -19,8 +19,8 @@ pub use crate::forge::TokenTryError;
 pub use crate::project::DefaultBranchFile;
 pub use crate::quarantine::MarkerState;
 use crate::ticket_ref::{self, RefState};
-pub use crate::tracker::{AppError, Probe, Probed, StatesError};
-pub use owlshift_adapters::tracker::linear::{AccountFact, AdmissionFacts, AppUser};
+pub use crate::tracker::{Probe, Probed, StatesError};
+pub use owlshift_adapters::tracker::linear::{AccountFact, AdmissionFacts};
 
 /// How long a probe such as `git --version` may take. C8 measured about
 /// 0.1 s for the harness status commands.
@@ -88,15 +88,15 @@ pub trait System {
     fn origin_repo(&self, root: &Path) -> Result<Repo, String> {
         crate::config::origin_repo(self, root)
     }
-    /// What the project's tracker answers to `probe`, read over the network
-    /// with the tracker set stored in the system keychain under the probe's
-    /// accounts: a Linear team's workflow states (OWL-147), its admission and
-    /// proposals setup (OWL-155), or the Linear app user Owlshift writes as,
-    /// checked as `owlshift do` checks it, its token revoked after
-    /// (OWL-157). Only `owlshift doctor` asks, and only for a tracker whose
-    /// kind probes it.
-    fn tracker_probe(&self, probe: &Probe<'_>) -> Probed {
-        probe.read()
+    /// What the project's tracker answers to `probe`, one of its kind's
+    /// own (OWL-544), read over the network with the secrets stored in the
+    /// system keychain. Only `owlshift doctor` asks, and only for a tracker
+    /// whose kind probes it.
+    fn tracker_probe(&self, probe: &dyn Probe) -> Probed {
+        match owlshift_platform::keychain::Keychain::system() {
+            Ok(keychain) => probe.read(&keychain),
+            Err(error) => probe.keychain_error(error.to_string()),
+        }
     }
     /// What the GitHub token of the project of `repo` reads of the
     /// repository's default branch, the token resolved and read as `owlshift
@@ -374,13 +374,14 @@ fn rebuild(token: &str) -> String {
 }
 
 #[cfg(test)]
-pub(crate) mod fake {
+// Public, though test-only, because `tracker::Probe::fake` names its host.
+pub mod fake {
     //! A scripted host for tests.
 
+    use std::any::{Any, TypeId};
     use std::collections::HashMap;
 
     use super::*;
-    use crate::secrets::TrackerAccounts;
 
     pub(crate) enum Answer {
         Exit(i32, &'static str, &'static str),
@@ -388,7 +389,7 @@ pub(crate) mod fake {
     }
 
     #[derive(Default)]
-    pub(crate) struct FakeSystem {
+    pub struct FakeSystem {
         located: HashMap<String, PathBuf>,
         answers: HashMap<String, Answer>,
         /// The data directory; `None`: the platform's, `~/.local/share/owlshift`.
@@ -405,19 +406,10 @@ pub(crate) mod fake {
         only_shared: bool,
         /// Why the keychain cannot be read; `None`: it can.
         keychain_error: Option<String>,
-        /// What Linear answers for a team's workflow states, the key being
-        /// stored; `None`: it cannot be reached.
-        linear_states: Option<Result<Vec<String>, owlshift_adapters::tracker::Error>>,
-        /// What Linear answers for a team's admission facts, the key being
-        /// stored; `None`: it cannot be reached.
-        linear_admission: Option<Result<AdmissionFacts, owlshift_adapters::tracker::Error>>,
-        /// What checking the Linear app gives, both of its entries being
-        /// stored; `None`: no app is stored.
-        linear_app: Option<Result<String, owlshift_adapters::tracker::Error>>,
-        /// What a GitHub Issues project's repository answers (OWL-537);
-        /// `None`: the issues read, every label exists, every admitter is a
-        /// person's account.
-        github_facts: Option<Result<crate::tracker::GithubFacts, StatesError>>,
+        /// What each tracker kind's probes answer, by the type of its
+        /// script ([`Self::script`]): a kind keeps its script in its own
+        /// file (OWL-544).
+        scripts: HashMap<TypeId, Box<dyn Any + Send + Sync>>,
         /// What trying the GitHub token on its repository gives; `None`: its
         /// default branch `main` is readable.
         github_default_branch: Option<Result<DefaultBranch, TokenTryError>>,
@@ -556,41 +548,31 @@ pub(crate) mod fake {
             self
         }
 
-        /// Linear answers so for a team's workflow states.
-        pub(crate) fn linear_states_are(
+        /// The tracker probes' script of type `S`, as `edit` changes it
+        /// from what it was, or from its default.
+        pub(crate) fn script<S: Default + Any + Send + Sync>(
             mut self,
-            answer: Result<&[&str], owlshift_adapters::tracker::Error>,
+            edit: impl FnOnce(&mut S),
         ) -> Self {
-            let answer = answer.map(|names| names.iter().map(|&n| n.to_owned()).collect());
-            self.linear_states = Some(answer);
+            let script = self
+                .scripts
+                .entry(TypeId::of::<S>())
+                .or_insert_with(|| Box::new(S::default()));
+            edit(
+                script
+                    .as_mut()
+                    .downcast_mut()
+                    .expect("a script is kept under its own type"),
+            );
             self
         }
 
-        /// Linear answers so for a team's admission facts.
-        pub(crate) fn linear_admission_is(
-            mut self,
-            answer: Result<AdmissionFacts, owlshift_adapters::tracker::Error>,
-        ) -> Self {
-            self.linear_admission = Some(answer);
-            self
-        }
-
-        /// A GitHub Issues project's repository answers so (OWL-537).
-        pub(crate) fn github_facts_are(
-            mut self,
-            answer: Result<crate::tracker::GithubFacts, StatesError>,
-        ) -> Self {
-            self.github_facts = Some(answer);
-            self
-        }
-
-        /// Checking the Linear app gives its user's name, or this error.
-        pub(crate) fn linear_app_is(
-            mut self,
-            answer: Result<&str, owlshift_adapters::tracker::Error>,
-        ) -> Self {
-            self.linear_app = Some(answer.map(str::to_owned));
-            self
+        /// The tracker probes' script of type `S`; `None` when none was
+        /// given.
+        pub(crate) fn scripted<S: Any>(&self) -> Option<&S> {
+            self.scripts
+                .get(&TypeId::of::<S>())
+                .and_then(|script| script.as_ref().downcast_ref())
         }
 
         /// Trying the GitHub token on its repository gives this.
@@ -767,47 +749,10 @@ pub(crate) mod fake {
                 .unwrap_or_else(|| Ok(Repo::parse("pitchopp/owlshift").unwrap()))
         }
 
-        fn tracker_probe(&self, probe: &Probe<'_>) -> Probed {
-            match *probe {
-                Probe::LinearStates { accounts, team } => {
-                    Probed::States(self.linear_states(accounts, team))
-                }
-                Probe::LinearAdmission {
-                    accounts,
-                    team,
-                    ready,
-                    labels,
-                    people,
-                } => {
-                    Probed::Admission(self.linear_admission(accounts, team, ready, labels, people))
-                }
-                Probe::LinearApp { accounts, team } => Probed::App(self.linear_app(accounts, team)),
-                Probe::GithubFacts { tracker, .. } => {
-                    Probed::Github(self.github_facts.clone().unwrap_or_else(|| {
-                        Ok(crate::tracker::GithubFacts {
-                            access: owlshift_adapters::tracker::github::IssuesAccess::Granted,
-                            labels: Some(
-                                crate::tracker::named_labels(tracker)
-                                    .into_iter()
-                                    .map(str::to_owned)
-                                    .collect(),
-                            ),
-                            accounts: Some(
-                                tracker
-                                    .admitters
-                                    .iter()
-                                    .flatten()
-                                    .map(|id| AccountFact {
-                                        id: id.clone(),
-                                        app: false,
-                                        active: true,
-                                    })
-                                    .collect(),
-                            ),
-                        })
-                    }))
-                }
-            }
+        /// As the probe's kind scripts it, never the keychain or the
+        /// network.
+        fn tracker_probe(&self, probe: &dyn Probe) -> Probed {
+            probe.fake(self)
         }
 
         /// As [`Self::github_default_branch_is`] scripted it, whatever is
@@ -848,92 +793,6 @@ pub(crate) mod fake {
             self.sentinel_probe.clone().unwrap_or(SentinelProbe::Works {
                 elapsed: Duration::from_millis(3),
             })
-        }
-    }
-
-    /// What its `tracker_probe` answers, by probe.
-    impl FakeSystem {
-        /// The key's presence follows [`Self::unstored`] and
-        /// [`Self::keychain_fails`]; never the network.
-        fn linear_states(
-            &self,
-            accounts: &TrackerAccounts,
-            _team: &str,
-        ) -> Result<Vec<String>, StatesError> {
-            use owlshift_adapters::tracker::{Error, ErrorKind};
-            match self.secret_stored(accounts.of(crate::tracker::LINEAR_ACCOUNT)) {
-                Err(reason) => Err(StatesError::Keychain(reason)),
-                Ok(false) => Err(StatesError::NoKey),
-                Ok(true) => self
-                    .linear_states
-                    .clone()
-                    .unwrap_or_else(|| {
-                        Err(Error::new(ErrorKind::Other, "Linear: no network in tests"))
-                    })
-                    .map_err(StatesError::Tracker),
-            }
-        }
-
-        /// Follows [`Self::linear_states`]'s key rules; never the network.
-        /// Only the labels and accounts the answer holds come back.
-        fn linear_admission(
-            &self,
-            accounts: &TrackerAccounts,
-            _team: &str,
-            _ready: &str,
-            labels: &[&str],
-            people: &[&str],
-        ) -> Result<AdmissionFacts, StatesError> {
-            use owlshift_adapters::tracker::{Error, ErrorKind};
-            match self.secret_stored(accounts.of(crate::tracker::LINEAR_ACCOUNT)) {
-                Err(reason) => Err(StatesError::Keychain(reason)),
-                Ok(false) => Err(StatesError::NoKey),
-                Ok(true) => self
-                    .linear_admission
-                    .clone()
-                    .unwrap_or_else(|| {
-                        Err(Error::new(ErrorKind::Other, "Linear: no network in tests"))
-                    })
-                    .map(|mut facts| {
-                        facts.labels.retain(|l| labels.contains(&l.as_str()));
-                        facts.accounts.retain(|a| people.contains(&a.id.as_str()));
-                        facts
-                    })
-                    .map_err(StatesError::Tracker),
-            }
-        }
-
-        /// No app unless [`Self::linear_app_is`] gave one; then its entries
-        /// follow [`Self::unstored`] and [`Self::keychain_fails`]. Never the
-        /// network.
-        fn linear_app(
-            &self,
-            accounts: &TrackerAccounts,
-            _team: &str,
-        ) -> Result<Option<AppUser>, AppError> {
-            let Some(answer) = self.linear_app.clone() else {
-                return Ok(None);
-            };
-            let stored = |account| self.secret_stored(account).map_err(AppError::Keychain);
-            let incomplete = |missing: &str| AppError::Incomplete {
-                missing: missing.to_owned(),
-                source: accounts.source,
-            };
-            let id = accounts.of(crate::tracker::LINEAR_APP_ID_ACCOUNT);
-            let secret = accounts.of(crate::tracker::LINEAR_APP_SECRET_ACCOUNT);
-            match (stored(id)?, stored(secret)?) {
-                (false, false) => Ok(None),
-                (true, false) => Err(incomplete(secret)),
-                (false, true) => Err(incomplete(id)),
-                (true, true) => {
-                    answer
-                        .map(|name| Some(AppUser { name }))
-                        .map_err(|error| AppError::Tracker {
-                            error,
-                            accounts: accounts.clone(),
-                        })
-                }
-            }
         }
     }
 }
