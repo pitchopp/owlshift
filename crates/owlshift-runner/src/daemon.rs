@@ -58,7 +58,7 @@ use owlshift_adapters::forge::Repo;
 use owlshift_adapters::notifier::Notifier;
 use owlshift_core::restart::RestartPolicy;
 
-pub use instance::{Held, Instance, running, service_dir};
+pub use instance::{Held, Instance, pinned_dir, running, service_dir};
 pub use requests::ask_stop;
 
 /// The exit code of a served watch that refused to start for a reason no

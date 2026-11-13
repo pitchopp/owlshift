@@ -32,6 +32,14 @@ pub fn record_file(data: &Path) -> PathBuf {
     service_dir(data).join("daemon.json")
 }
 
+/// Where the daemon of `data` keeps the copy of its binary that its
+/// children run where the system cannot pin it (OWL-553, architecture
+/// section 5, "An upgrade"): `<data>/service/pinned`. Only the daemon that
+/// holds the lock writes in it.
+pub fn pinned_dir(data: &Path) -> PathBuf {
+    service_dir(data).join("pinned")
+}
+
 /// This process as the daemon of its data directory: holds the lock, and
 /// removes its record when dropped.
 #[derive(Debug)]

@@ -36,6 +36,7 @@ pub use tree::{ExitWatch, ProcessTree};
 
 use std::ffi::OsStr;
 use std::fmt;
+use std::fs;
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -92,12 +93,15 @@ impl std::error::Error for RunError {}
 /// This process's own binary, as a process it starts runs it (OWL-435,
 /// architecture section 5, "An upgrade"): the binary resolved when this
 /// process started, so that a binary replaced on disk since then is not the
-/// one a later spawn runs, where the system allows it.
+/// one a later spawn runs, where the system allows it. A process started
+/// from the copy [`pin_own_program`] made is that copy here, so the
+/// daemon's children spawn their own children from it too (OWL-553).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct OwnProgram {
     /// What to spawn: on Linux `/proc/self/exe`, which the kernel resolves to
     /// the very file this process runs, even once removed or replaced on
-    /// disk (checked on 2026-10-25 in debian:12); elsewhere [`Self::path`].
+    /// disk (checked on 2026-10-25 in debian:12); elsewhere [`Self::path`],
+    /// or the copy [`pin_own_program`] made.
     pub spawn: PathBuf,
     /// Where the binary was when this process started, for a person to read.
     pub path: PathBuf,
@@ -120,6 +124,85 @@ pub fn own_program() -> io::Result<OwnProgram> {
         spawn: path.clone(),
         path,
     })
+}
+
+/// This process's own binary, pinned for every process it starts until this
+/// is dropped (OWL-553, architecture section 5, "An upgrade"): on Linux
+/// [`own_program`]'s `/proc/self/exe`, which needs no copy; elsewhere a copy
+/// of the binary, which no upgrade replaces, removed with its folder when
+/// this is dropped. macOS has no path to a file replaced on disk since a
+/// process started from it, and does not execute a descriptor held open on
+/// it: executing `/dev/fd/3` was refused ("permission denied") on
+/// 2026-11-13, on macOS 26.6.2.
+#[derive(Debug)]
+pub struct Pinned {
+    /// What to spawn, and where the binary was.
+    pub program: OwnProgram,
+    /// The copy's folder, when a copy was made.
+    folder: Option<PathBuf>,
+}
+
+impl Drop for Pinned {
+    fn drop(&mut self) {
+        if let Some(folder) = &self.folder {
+            // A folder that stays is removed by the next pin.
+            let _ = fs::remove_dir_all(folder);
+        }
+    }
+}
+
+/// Pins this process's own binary for the processes it starts ([`Pinned`]).
+///
+/// A copy goes to `dir/<pid>/`, under the binary's own file name, so that it
+/// names itself as the binary does; whatever else `dir` holds is removed
+/// first, being what an earlier pin left. So only one process may pin into
+/// `dir` at a time, which the daemon's lock ensures. The copy is a clone
+/// where the file system makes one (APFS), else a plain copy, as across two
+/// volumes (`std::fs::copy`: `fclonefileat`, then `fcopyfile`, on macOS).
+pub fn pin_own_program(dir: &Path) -> io::Result<Pinned> {
+    let own = own_program()?;
+    #[cfg(target_os = "linux")]
+    {
+        if own.spawn != own.path {
+            return Ok(Pinned {
+                program: own,
+                folder: None,
+            });
+        }
+    }
+    pin_copy(own.path, dir, std::process::id())
+}
+
+/// [`pin_own_program`]'s copy of `binary`, in `dir/<id>/`.
+fn pin_copy(binary: PathBuf, dir: &Path, id: u32) -> io::Result<Pinned> {
+    let name = binary.file_name().map(ToOwned::to_owned).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{} names no file", binary.display()),
+        )
+    })?;
+    fs::create_dir_all(dir)?;
+    for entry in fs::read_dir(dir)? {
+        let left = entry?.path();
+        if fs::symlink_metadata(&left)?.is_dir() {
+            fs::remove_dir_all(&left)?;
+        } else {
+            fs::remove_file(&left)?;
+        }
+    }
+    let folder = dir.join(id.to_string());
+    fs::create_dir(&folder)?;
+    let copy = folder.join(name);
+    // Made before the copy, so a copy that fails takes its folder with it.
+    let pinned = Pinned {
+        program: OwnProgram {
+            spawn: copy.clone(),
+            path: binary,
+        },
+        folder: Some(folder),
+    };
+    fs::copy(&pinned.program.path, &copy)?;
+    Ok(pinned)
 }
 
 /// Finds a program on the `PATH`, with the `PATHEXT` extensions on Windows,
@@ -1355,5 +1438,83 @@ mod tests {
             "pinned\n",
             "{output:?}"
         );
+
+        // OWL-553: so the daemon pins it with no copy.
+        let pinned_dir = dir.path().join("pinned");
+        let pinned = pin_own_program(&pinned_dir).unwrap();
+        assert_eq!(pinned.program, own);
+        assert!(!pinned_dir.exists(), "no copy on Linux");
+    }
+
+    /// OWL-553: the copy a daemon's children run where the system cannot pin
+    /// its binary keeps the build it was made from, whether the binary is
+    /// replaced by a rename (`self-update`) or its folder removed (a package
+    /// manager's upgrade, then its cleanup). A pin removes what an earlier
+    /// one left, and its end removes its copy.
+    #[cfg(unix)]
+    #[test]
+    fn a_pinned_copy_keeps_the_build_it_was_made_from() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = tempfile::tempdir().unwrap();
+        let script = |path: &Path, says: &str| {
+            fs::write(path, format!("#!/bin/sh\necho {says}\n")).unwrap();
+            fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
+        };
+        let said = |program: &Path| {
+            let output = Command::new(program).output().unwrap();
+            String::from_utf8_lossy(&output.stdout).into_owned()
+        };
+        let installed = root.path().join("cellar/1.0");
+        fs::create_dir_all(&installed).unwrap();
+        let binary = installed.join("prog");
+        script(&binary, "old");
+        let dir = root.path().join("pinned");
+        fs::create_dir_all(dir.join("41")).unwrap();
+        fs::write(dir.join("41/prog"), "an earlier pin's copy").unwrap();
+
+        let pinned = pin_copy(binary.clone(), &dir, 42).unwrap();
+        assert_eq!(pinned.program.path, binary);
+        assert_eq!(pinned.program.spawn, dir.join("42/prog"));
+        let left: Vec<_> = fs::read_dir(&dir)
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .collect();
+        assert_eq!(left, [dir.join("42")]);
+        assert_eq!(said(&pinned.program.spawn), "old\n");
+
+        let staged = installed.join(".prog.new");
+        script(&staged, "new");
+        fs::rename(&staged, &binary).unwrap();
+        assert_eq!(said(&binary), "new\n");
+        assert_eq!(said(&pinned.program.spawn), "old\n", "after a rename");
+
+        fs::remove_dir_all(&installed).unwrap();
+        assert_eq!(said(&pinned.program.spawn), "old\n", "after a cleanup");
+
+        drop(pinned);
+        assert_eq!(fs::read_dir(&dir).unwrap().count(), 0);
+    }
+
+    /// OWL-553: on macOS the daemon's children run a copy of its binary,
+    /// which runs: its signature holds once copied.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn the_daemons_children_run_a_copy_of_its_binary_on_macos() {
+        let dir = tempfile::tempdir().unwrap();
+        let pinned = pin_own_program(dir.path()).unwrap();
+        let exe = std::env::current_exe().unwrap();
+        assert_eq!(pinned.program.path, exe);
+        assert_eq!(
+            pinned.program.spawn,
+            dir.path()
+                .join(std::process::id().to_string())
+                .join(exe.file_name().unwrap())
+        );
+        let listed = Command::new(&pinned.program.spawn)
+            .args(["--list", "the_daemons_children_run"])
+            .output()
+            .unwrap();
+        assert!(listed.status.success(), "{listed:?}");
     }
 }

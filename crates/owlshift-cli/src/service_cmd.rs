@@ -53,10 +53,8 @@ pub fn daemon(system: &dyn System, config: &Effective) -> ExitCode {
         Ok(data) => data,
         Err(error) => return fail(&error),
     };
-    // The binary every watch runs, resolved now (architecture section 5,
-    // "An upgrade").
-    let own = match owlshift_platform::process::own_program() {
-        Ok(own) => own,
+    let binary = match std::env::current_exe() {
+        Ok(binary) => binary,
         Err(error) => {
             return fail(&format!(
                 "this program's own path, which runs every watch: {error}"
@@ -67,7 +65,7 @@ pub fn daemon(system: &dyn System, config: &Effective) -> ExitCode {
         format: Format,
         pid: std::process::id(),
         version: OWLSHIFT_VERSION.to_owned(),
-        binary: own.path.display().to_string(),
+        binary: binary.display().to_string(),
         since: Timestamp::now(),
         build: Some(own_build()),
     };
@@ -81,6 +79,21 @@ pub fn daemon(system: &dyn System, config: &Effective) -> ExitCode {
             ));
         }
     };
+    // The binary every child runs, pinned now that this daemon alone holds
+    // the data directory: on macOS a copy in `pinned/`, which an upgrade
+    // does not replace (architecture section 5, "An upgrade", OWL-553).
+    // Declared after `instance`, so dropped before it on every return.
+    let pinned_dir = daemon::pinned_dir(&data);
+    let pinned = match owlshift_platform::process::pin_own_program(&pinned_dir) {
+        Ok(pinned) => pinned,
+        Err(error) => {
+            return fail(&format!(
+                "the copy of this program that every watch runs, in {}: {error}",
+                pinned_dir.display()
+            ));
+        }
+    };
+    let own = &pinned.program;
     let desktop = notify::desktop_enabled(&config.personal)
         .then(|| DesktopNotifier::for_this_machine(system))
         .flatten();
@@ -105,6 +118,9 @@ pub fn daemon(system: &dyn System, config: &Effective) -> ExitCode {
         }),
     };
     let ended = daemon.run(&mut io::stdout());
+    // A stop or an upgrade returns once every child has ended, so the copy
+    // goes now, while the lock is held: never a next daemon's.
+    drop(pinned);
     drop(instance);
     match ended {
         daemon::Ended::Stopped => ExitCode::SUCCESS,
