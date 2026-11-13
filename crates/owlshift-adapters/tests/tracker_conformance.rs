@@ -1074,6 +1074,10 @@ fn linear() -> Adapter {
                     missing: id("OWL-99999"),
                 },
             );
+            // The update went to the created document, with the new content.
+            let calls = fake.calls();
+            assert_eq!(calls[1].1["id"], "d1");
+            assert_eq!(calls[1].1["input"]["content"], "v2");
             // The refused content was never sent.
             assert_eq!(
                 fake.asked(),
