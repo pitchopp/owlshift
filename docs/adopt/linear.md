@@ -121,12 +121,25 @@ With a first pull request through, let Owlshift take tickets as you admit them:
 owlshift start
 ```
 
-`start` registers the project and starts the background service for this login session; `owlshift start --at-login` also starts it at each login. The service reads the project file of your default branch, so push `owlshift.toml` first. From then on:
+`start` registers the project and starts the background service for this login session; `owlshift start --at-login` also starts it at each login. On a clean Debian 12 machine it printed:
 
-- **Admit a ticket** by putting the `agent` label on it in its ready state (`Todo`), as one of the `admitters`. A label anyone else puts admits nothing. The service checks every minute.
+```text
+acme/shop is served from /home/dev/shop. Started the daemon for this session (pid 8671): its output is in /home/dev/.local/share/owlshift/service/daemon.log; `owlshift stop` stops it.
+```
+
+The service reads the project file of your default branch, never your checkout's, so push `owlshift.toml` first. Otherwise `owlshift status` says so, and the service tries again every minute:
+
+```text
+acme/shop (from /home/dev/shop)
+  not served: origin/main (7fd1a60b01f9) holds no owlshift.toml
+```
+
+From then on:
+
+- **Admit a ticket** by putting the `agent` label on it in its ready state (`Todo`), as one of the `admitters`. A label anyone else puts admits nothing. The `admitters` are read from the project file of your default branch, never from your checkout: a list only in your local file admits nothing. The service checks every minute.
 - Admitted tickets are taken in priority order, blockers respected (Linear's "blocked by" relations, or a line `Blocked by ENG-10` in the description), one at a time unless `policy.max_in_flight` says more.
 - `owlshift status` says what the service does and which tickets wait for you; `owlshift why` says why an admitted ticket is not running; `owlshift logs ENG-12` prints what Owlshift recorded for one.
-- `owlshift stop` stops the service once the steps under way finish; `owlshift stop --forget` stops serving this project only.
+- `owlshift stop` stops the service once the steps under way finish (`Stopping the daemon (pid 8671): each watch ends once its steps under way finish, then the daemon exits.`); `owlshift stop --forget` stops serving this project only.
 
 ## Next
 
