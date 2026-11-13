@@ -61,6 +61,7 @@ use crate::system::{
 #[cfg(unix)]
 use crate::system::{SentinelProbe, SentinelStatus};
 use crate::ticket_ref::RefState;
+#[cfg(test)]
 use crate::tracker::{LINEAR_ACCOUNT, LINEAR_APP_ID_ACCOUNT, LINEAR_APP_SECRET_ACCOUNT};
 use crate::ui::probe::Probe;
 
@@ -1758,7 +1759,9 @@ fn state_entries(states: Value) -> Vec<(String, String)> {
 /// the repository that names them and what is stored, presence only.
 struct ProjectSecrets {
     repo: Repo,
-    /// For a Linear project.
+    /// The kind of the project's tracker, which describes its set.
+    kind: &'static dyn crate::tracker::Kind,
+    /// For a tracker with a set of its own ([`crate::tracker::Kind::secret_set`]).
     tracker: Option<TrackerSecrets<()>>,
     forge: ForgeSecret<()>,
 }
@@ -1799,6 +1802,7 @@ fn project_secrets(
     Some(match found {
         Ok((tracker, forge)) => Ok(ProjectSecrets {
             repo,
+            kind: crate::tracker::of(config.tracker.kind),
             tracker,
             forge,
         }),
@@ -2142,42 +2146,11 @@ fn secrets_check(found: &Result<ProjectSecrets, Unresolved>) -> Check {
             );
         }
     };
-    let under = |account: &str, source: Source| match source {
-        Source::Project => format!("`{account}`"),
-        Source::Shared => format!("the shared `{account}`"),
-    };
     let mut parts = Vec::new();
     let mut shared = false;
     if let Some(tracker) = &found.tracker {
-        let accounts = &tracker.accounts;
-        shared |= accounts.source == Source::Shared;
-        let key = accounts.of(LINEAR_ACCOUNT);
-        parts.push(match tracker.get(LINEAR_ACCOUNT) {
-            Some(()) => format!("Linear API key under {}", under(key, accounts.source)),
-            None => format!("no Linear API key under `{key}`"),
-        });
-        let (id, secret) = (
-            accounts.of(LINEAR_APP_ID_ACCOUNT),
-            accounts.of(LINEAR_APP_SECRET_ACCOUNT),
-        );
-        parts.push(
-            match (
-                tracker.get(LINEAR_APP_ID_ACCOUNT),
-                tracker.get(LINEAR_APP_SECRET_ACCOUNT),
-            ) {
-                (None, None) => "no Linear app".to_owned(),
-                (Some(()), Some(())) => {
-                    format!(
-                        "Linear app under {} and `{secret}`",
-                        under(id, accounts.source)
-                    )
-                }
-                _ => format!(
-                    "half of the Linear app under {} and `{secret}`",
-                    under(id, accounts.source)
-                ),
-            },
-        );
+        shared |= tracker.accounts.source == Source::Shared;
+        parts.extend(found.kind.secrets_detail(tracker));
     }
     let forge = &found.forge;
     parts.push(match forge.token {
@@ -2185,7 +2158,7 @@ fn secrets_check(found: &Result<ProjectSecrets, Unresolved>) -> Check {
             shared |= forge.account.source == Source::Shared;
             format!(
                 "GitHub token under {}",
-                under(&forge.account.token, forge.account.source)
+                secrets::named(&forge.account.token, forge.account.source)
             )
         }
         None => format!("no GitHub token under `{}`", forge.account.token),

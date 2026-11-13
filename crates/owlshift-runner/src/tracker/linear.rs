@@ -19,7 +19,7 @@ use super::{
 };
 use crate::doctor::{Check, DOES_NOT_BLOCK, KEYCHAIN_FIX, Section, Step, configured_states};
 use crate::init::{LINEAR_KEY, SecretSpec};
-use crate::secrets::{SecretSet, Source, TrackerAccounts, TrackerSecrets};
+use crate::secrets::{SecretSet, Source, TrackerAccounts, TrackerSecrets, named};
 use crate::system::System;
 use crate::ui::reply::Key;
 
@@ -41,6 +41,36 @@ impl Kind for Linear {
     /// The key and the app's pair, read whole from one place ([`LINEAR_SECRETS`]).
     fn secret_set(&self) -> Option<&'static SecretSet> {
         Some(&LINEAR_SECRETS)
+    }
+
+    /// The key, then the app's pair: whole, half or absent.
+    fn secrets_detail(&self, found: &TrackerSecrets<()>) -> Vec<String> {
+        let accounts = &found.accounts;
+        let key = accounts.of(LINEAR_ACCOUNT);
+        let (id, secret) = (
+            accounts.of(LINEAR_APP_ID_ACCOUNT),
+            accounts.of(LINEAR_APP_SECRET_ACCOUNT),
+        );
+        vec![
+            match found.get(LINEAR_ACCOUNT) {
+                Some(()) => format!("Linear API key under {}", named(key, accounts.source)),
+                None => format!("no Linear API key under `{key}`"),
+            },
+            match (
+                found.get(LINEAR_APP_ID_ACCOUNT),
+                found.get(LINEAR_APP_SECRET_ACCOUNT),
+            ) {
+                (None, None) => "no Linear app".to_owned(),
+                (Some(()), Some(())) => format!(
+                    "Linear app under {} and `{secret}`",
+                    named(id, accounts.source)
+                ),
+                _ => format!(
+                    "half of the Linear app under {} and `{secret}`",
+                    named(id, accounts.source)
+                ),
+            },
+        ]
     }
 
     fn project_file_lines(&self, team: Option<&str>) -> Result<String, String> {

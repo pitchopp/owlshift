@@ -45,6 +45,11 @@ impl Kind for Github {
         None
     }
 
+    /// Nothing: it declares no set.
+    fn secrets_detail(&self, _found: &TrackerSecrets<()>) -> Vec<String> {
+        Vec::new()
+    }
+
     fn project_file_lines(&self, _team: Option<&str>) -> Result<String, String> {
         Ok("\
 # Where the tickets live: \"github\" for the issues of this repository,

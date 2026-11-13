@@ -58,6 +58,11 @@ pub trait Kind: Sync {
     /// own. Every account of [`Kind::secret_specs`] is one of its entries.
     fn secret_set(&self) -> Option<&'static SecretSet>;
 
+    /// What doctor's `secrets` line says of the set [`Kind::secret_set`]
+    /// declares, as `found` (presence only): one part per thing stored or
+    /// missing, naming its accounts, never a value.
+    fn secrets_detail(&self, found: &TrackerSecrets<()>) -> Vec<String>;
+
     /// The lines `init` writes under `[tracker]` of a new project file, the
     /// team key being `team` as `--team` gave it; the error says what is
     /// missing.
