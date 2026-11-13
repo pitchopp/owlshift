@@ -5498,9 +5498,15 @@ Merge state reported by the forge: `CLEAN`.
                 "`Fixes #5`\n**Closes** #6",
                 "`Fi\u{200B}xes #5`\n**Cl\u{200B}oses** #6",
             ),
+            // An invisible character next to a keyword is no letter: GitHub
+            // still closes on "\u{200B}Fixes #5" (OWL-556, 2026-11-13).
             (
                 "\u{200B}Fixes\u{200B} #5",
                 "\u{200B}Fi\u{200B}xes\u{200B} #5",
+            ),
+            (
+                "\u{2060}Fixes #5 \u{FEFF}closes #6\u{A0}resolved #7",
+                "\u{2060}Fi\u{200B}xes #5 \u{FEFF}cl\u{200B}oses #6\u{A0}re\u{200B}solved #7",
             ),
             (
                 "Prefixes, fixture, closet, unresolved: #5 é",
