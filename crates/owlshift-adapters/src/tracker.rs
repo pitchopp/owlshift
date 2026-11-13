@@ -343,6 +343,18 @@ pub struct LinkedState {
 /// section 6, "A proposals inbox for follow-ups").
 pub const PROPOSED_LABEL: &str = "agent:proposed";
 
+/// One account a tracker knows, as doctor's admission line reads it: a
+/// workspace's on Linear (OWL-155), a GitHub account on GitHub Issues
+/// (OWL-537).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AccountFact {
+    pub id: String,
+    /// An app user or a bot, never a person: it never admits.
+    pub app: bool,
+    /// Not deactivated.
+    pub active: bool,
+}
+
 /// A follow-up to file, as the runner rendered it.
 #[derive(Clone, Copy, Debug)]
 pub struct Proposal<'a> {

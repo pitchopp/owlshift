@@ -8,27 +8,30 @@
 //! from a personal token asked for like the others.
 
 use std::io::{self, IsTerminal};
+use std::path::Path;
 use std::process::ExitCode;
+use std::sync::Arc;
 
 use clap::ValueEnum;
 use owlshift_adapters::forge::Repo;
 use owlshift_adapters::forge::github_app::{DeviceFlow, HttpLogin};
-use owlshift_contracts::config::TrackerKind;
+use owlshift_contracts::config::{ProjectConfig, TrackerKind};
 use owlshift_contracts::service::KeychainEntry;
 use owlshift_core::stack::{Detection, detect};
 use owlshift_platform::keychain::{Keychain, SERVICE, Secret};
 use owlshift_runner::config::{Effective, FileState};
-use owlshift_runner::forge::GitHubApp;
+use owlshift_runner::forge::{AppAccess, GitHubApp};
 use owlshift_runner::github_sign_in::{self, Ask, GitHub, Outcome, SystemWait};
 use owlshift_runner::init::{
     AppStored, EXAMPLE_ASSIGNEE, EXAMPLE_TICKET, GITHUB_TOKEN, InitOptions, MARKDOWN_LIMITS,
     MARKDOWN_PAGE, SecretsReport, Wanted, Written, project_file, read_root_files, required_secrets,
-    store_app_credentials, store_secrets, wanted_secrets, write_example_ticket, write_project_file,
+    store_app_credentials, store_secrets, wanted_secrets, write_example_ticket,
+    write_once_connected, write_project_file,
 };
 use owlshift_runner::install::Manifests;
 use owlshift_runner::project::ProjectDirs;
 use owlshift_runner::secrets::{ForgeAccount, TrackerAccounts};
-use owlshift_runner::tracker::{self, app_credentials};
+use owlshift_runner::tracker::{self, Setup, app_credentials};
 use owlshift_runner::{on_demand, project};
 
 use crate::fail;
@@ -64,16 +67,24 @@ pub struct Args {
 enum TrackerChoice {
     Linear,
     Markdown,
+    /// The issues of this repository on GitHub (OWL-537).
+    Github,
+}
+
+/// The project file `init` keeps, or the one it would write.
+enum File<'a> {
+    Kept(&'a Path),
+    New(&'a Path, InitOptions),
 }
 
 pub fn run(args: &Args, config: &Effective) -> ExitCode {
-    let (tracker, file) = match &config.project {
+    let (project, file) = match &config.project {
         FileState::Loaded { path, config, .. } => {
             println!(
                 "{} exists: kept as it is. Its values win over --tracker, --team and --gate.",
                 path.display()
             );
-            (config.tracker.kind, path)
+            (config.tracker.clone(), File::Kept(path))
         }
         FileState::Absent(path) => {
             let root = path.parent().unwrap_or(path);
@@ -90,43 +101,22 @@ pub fn run(args: &Args, config: &Effective) -> ExitCode {
                 tracker: match args.tracker {
                     TrackerChoice::Linear => TrackerKind::Linear,
                     TrackerChoice::Markdown => TrackerKind::Markdown,
+                    TrackerChoice::Github => TrackerKind::Github,
                 },
                 team: args.team.clone(),
                 gate: args.gate.clone(),
                 detected,
+                admitter: None,
             };
-            let text = match project_file(&options) {
-                Ok(text) => text,
+            // Rendered now so that a missing `--team` stops `init` before it
+            // asks for anything; written once the tracker answered.
+            let tracker = match project_file(&options)
+                .and_then(|text| ProjectConfig::parse(&text).map_err(|e| e.to_string()))
+            {
+                Ok(parsed) => parsed.tracker,
                 Err(error) => return fail(&error),
             };
-            match write_project_file(root, &text) {
-                Ok(Written::Created) => {
-                    let has_gate =
-                        !options.gate.is_empty() || options.detected.gate().next().is_some();
-                    println!(
-                        "Wrote {}: review it, then commit it.{}",
-                        path.display(),
-                        if has_gate {
-                            ""
-                        } else {
-                            " Its gate is empty: list your lint, formatter and test commands in \
-                             `stack.gate`, or `owlshift do` refuses to start a ticket."
-                        }
-                    );
-                    report_detection(&options);
-                    if options.tracker == TrackerKind::Markdown {
-                        report_example(root);
-                    }
-                }
-                Ok(Written::Kept) => {
-                    return fail(&format!(
-                        "{} appeared while `owlshift init` ran: run it again",
-                        path.display()
-                    ));
-                }
-                Err(error) => return fail(&format!("{}: {error}", path.display())),
-            }
-            (options.tracker, path)
+            (tracker, File::New(path, options))
         }
         FileState::Invalid { path, error } => {
             return fail(&format!(
@@ -142,17 +132,37 @@ pub fn run(args: &Args, config: &Effective) -> ExitCode {
         }
         FileState::Unavailable(reason) => return fail(reason),
     };
+    let tracker = project.kind;
+    let path = match &file {
+        File::Kept(path) | File::New(path, _) => *path,
+    };
 
     if args.skip_secrets {
+        if let File::New(path, options) = &file
+            && let Err(error) = write(path, options)
+        {
+            return error;
+        }
         println!("No secret stored (--skip-secrets).");
+        if tracker != TrackerKind::Markdown {
+            println!(
+                "The tracker was not checked (--skip-secrets): `owlshift doctor` checks it.{}",
+                if tracker == TrackerKind::Github {
+                    " No label was created and no admitter written: `owlshift init` without \
+                     --skip-secrets creates the labels."
+                } else {
+                    ""
+                }
+            );
+        }
         return next_steps();
     }
     let keychain = match Keychain::system() {
-        Ok(keychain) => keychain,
+        Ok(keychain) => Arc::new(keychain),
         Err(error) => return fail(&error.to_string()),
     };
     // The project's secrets are named by its GitHub repository (OWL-308).
-    let root = file.parent().unwrap_or(file);
+    let root = path.parent().unwrap_or(path);
     let repo = project::origin_url(&project::runner_git(), root)
         .and_then(|url| on_demand::check_origin(&url));
     let (mut wanted, unnamed) =
@@ -245,22 +255,22 @@ pub fn run(args: &Args, config: &Effective) -> ExitCode {
             );
         }
     }
+    let app = GitHubApp::from_personal(match &config.personal {
+        FileState::Loaded { config, .. } => Some(config),
+        _ => None,
+    });
+    // A stored token is refreshed under the project's account lock, as
+    // `owlshift do` refreshes it (OWL-384). Without a data directory no `do`
+    // runs to share it with, so any lock file does.
+    let lock = match (&repo, crate::data_dir()) {
+        (Ok(repo), Ok(dir)) => ProjectDirs::new(&dir, repo).account_lock_file(),
+        _ => std::env::temp_dir().join("owlshift-github-app.lock"),
+    };
     let github_ready = match &repo {
         Ok(repo) if args.github_token => personal_token_chosen(&keychain, repo, &report),
         Ok(repo) => {
-            let app = GitHubApp::from_personal(match &config.personal {
-                FileState::Loaded { config, .. } => Some(config),
-                _ => None,
-            });
-            // A stored token is refreshed under the project's account lock,
-            // as `owlshift do` refreshes it (OWL-384). Without a data
-            // directory no `do` runs to share it with, so any lock file does.
-            let lock = crate::data_dir().map_or_else(
-                |_| std::env::temp_dir().join("owlshift-github-app.lock"),
-                |dir| ProjectDirs::new(&dir, repo).account_lock_file(),
-            );
             let flow = DeviceFlow::new(HttpLogin::new(), &app.client_id);
-            let github = GitHub::live(flow, repo, lock);
+            let github = GitHub::live(flow, repo, lock.clone());
             let ask = Ask {
                 replace: args.replace_secrets,
                 terminal,
@@ -284,13 +294,62 @@ pub fn run(args: &Args, config: &Effective) -> ExitCode {
         Err(_) => true,
     };
     record_in_manifest(crate::data_dir(), &stored);
-    if report.missing.is_empty()
+    // The tracker is asked before the project file is written, with what
+    // was just stored (OWL-537).
+    let access = AppAccess {
+        keychain: keychain.clone(),
+        lock,
+        app,
+    };
+    let setup = Setup {
+        tracker: &project,
+        repo: repo.as_ref().map_err(String::as_str),
+        keychain: &keychain,
+        access: &access,
+    };
+    let connected = tracker::of(tracker).connect(&setup);
+    let mut answered = true;
+    match (&connected, &file) {
+        (Ok(connected), _) => {
+            for name in &connected.created {
+                println!("Created the label {name:?} on GitHub.");
+            }
+        }
+        (Err(reason), File::Kept(path)) => {
+            eprintln!(
+                "owlshift: the tracker did not answer: {reason}. {} is kept as it is.",
+                path.display()
+            );
+            answered = false;
+        }
+        (Err(_), File::New(..)) => {}
+    }
+    if let File::New(path, options) = &file {
+        let root = path.parent().unwrap_or(path);
+        match write_once_connected(root, options, connected.as_ref().map_err(String::as_str)) {
+            Ok(Written::Created) => said_written(path, options),
+            Ok(Written::Kept) => {
+                return fail(&format!(
+                    "{} appeared while `owlshift init` ran: run it again",
+                    path.display()
+                ));
+            }
+            Err(error) => {
+                eprintln!("owlshift: {error}");
+                answered = false;
+            }
+        }
+    }
+    let secrets_ready = report.missing.is_empty()
         && report.refused.is_empty()
         && unnamed.is_empty()
         && app_ready
-        && github_ready
-    {
+        && github_ready;
+    if secrets_ready && answered {
         return next_steps();
+    }
+    if secrets_ready {
+        return ExitCode::FAILURE;
     }
     for one in &report.missing {
         eprintln!("owlshift: missing: the {one}: {}.", one.spec.help);
@@ -311,6 +370,43 @@ pub fn run(args: &Args, config: &Effective) -> ExitCode {
         );
     }
     ExitCode::FAILURE
+}
+
+/// Writes the project file of `options` at `path` without asking the
+/// tracker (`--skip-secrets`), and says so; the error is `init`'s exit.
+fn write(path: &Path, options: &InitOptions) -> Result<(), ExitCode> {
+    let text = project_file(options).map_err(|error| fail(&error))?;
+    let root = path.parent().unwrap_or(path);
+    match write_project_file(root, &text) {
+        Ok(Written::Created) => {
+            said_written(path, options);
+            Ok(())
+        }
+        Ok(Written::Kept) => Err(fail(&format!(
+            "{} appeared while `owlshift init` ran: run it again",
+            path.display()
+        ))),
+        Err(error) => Err(fail(&format!("{}: {error}", path.display()))),
+    }
+}
+
+/// What `init` says once it wrote the project file at `path`.
+fn said_written(path: &Path, options: &InitOptions) {
+    let has_gate = !options.gate.is_empty() || options.detected.gate().next().is_some();
+    println!(
+        "Wrote {}: review it, then commit it.{}",
+        path.display(),
+        if has_gate {
+            ""
+        } else {
+            " Its gate is empty: list your lint, formatter and test commands in \
+             `stack.gate`, or `owlshift do` refuses to start a ticket."
+        }
+    );
+    report_detection(options);
+    if options.tracker == TrackerKind::Markdown {
+        report_example(path.parent().unwrap_or(path));
+    }
 }
 
 /// Lists in the install manifest of the data directory `data` the keychain

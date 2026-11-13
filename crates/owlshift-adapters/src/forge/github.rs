@@ -1072,6 +1072,23 @@ impl GitHubForge {
         Ok(body)
     }
 
+    /// One plain REST read whose status the caller reads itself (OWL-537):
+    /// the status and the first 4 KiB of the body, whatever the status; an
+    /// error only when GitHub gave no answer, or for a spent budget, whose
+    /// error says when it resets.
+    pub(crate) fn rest_status(&self, path: &str) -> Result<(u16, String), Error> {
+        let mut answer = self.channel.get(path).map_err(unanswered)?;
+        if answer.status == 403 || answer.status == 429 {
+            let rate = answer.rate;
+            if rate.remaining == Some(0) || rate.retry_after.is_some() {
+                return Err(status_error(answer.status, "", rate, path));
+            }
+        }
+        let mut body = String::new();
+        let _ = (&mut answer.body).take(4096).read_to_string(&mut body);
+        Ok((answer.status, body))
+    }
+
     /// The cache, taken back after a panic elsewhere while it was held.
     fn cached(&self) -> std::sync::MutexGuard<'_, RestCache> {
         self.cache.lock().unwrap_or_else(PoisonError::into_inner)

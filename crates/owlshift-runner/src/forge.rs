@@ -143,9 +143,9 @@ fn refusal(error: Error) -> Refusal {
 
 /// The token sent for `found` at the instant `now`, without the refresh:
 /// a GitHub App token past its stored expiry is refused, naming `owlshift
-/// init`. Only doctor's forge access probe reads it ([`default_branch`]),
-/// until GA4 puts that probe on the Writer's refresh.
-fn token_at(found: &ForgeSecret<Secret>, now: Timestamp) -> Result<Token, String> {
+/// init`. Only doctor's forge probes read it ([`default_branch`], and the
+/// GitHub Issues facts, OWL-537), until GA4 puts them on the Writer's refresh.
+pub(crate) fn token_at(found: &ForgeSecret<Secret>, now: Timestamp) -> Result<Token, String> {
     let account = &found.account.token;
     match (&found.token, found.account.kind) {
         (Some(entry), ForgeKind::App) => {

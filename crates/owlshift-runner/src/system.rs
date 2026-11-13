@@ -411,6 +411,10 @@ pub(crate) mod fake {
         /// What checking the Linear app gives, both of its entries being
         /// stored; `None`: no app is stored.
         linear_app: Option<Result<String, owlshift_adapters::tracker::Error>>,
+        /// What a GitHub Issues project's repository answers (OWL-537);
+        /// `None`: the issues read, every label exists, every admitter is a
+        /// person's account.
+        github_facts: Option<Result<crate::tracker::GithubFacts, StatesError>>,
         /// What trying the GitHub token on its repository gives; `None`: its
         /// default branch `main` is readable.
         github_default_branch: Option<Result<DefaultBranch, TokenTryError>>,
@@ -571,6 +575,15 @@ pub(crate) mod fake {
             answer: Result<AdmissionFacts, owlshift_adapters::tracker::Error>,
         ) -> Self {
             self.linear_admission = Some(answer);
+            self
+        }
+
+        /// A GitHub Issues project's repository answers so (OWL-537).
+        pub(crate) fn github_facts_are(
+            mut self,
+            answer: Result<crate::tracker::GithubFacts, StatesError>,
+        ) -> Self {
+            self.github_facts = Some(answer);
             self
         }
 
@@ -769,6 +782,31 @@ pub(crate) mod fake {
                     Probed::Admission(self.linear_admission(accounts, team, ready, labels, people))
                 }
                 Probe::LinearApp { accounts, team } => Probed::App(self.linear_app(accounts, team)),
+                Probe::GithubFacts { tracker, .. } => {
+                    Probed::Github(self.github_facts.clone().unwrap_or_else(|| {
+                        Ok(crate::tracker::GithubFacts {
+                            access: owlshift_adapters::tracker::github::IssuesAccess::Granted,
+                            labels: Some(
+                                crate::tracker::named_labels(tracker)
+                                    .into_iter()
+                                    .map(str::to_owned)
+                                    .collect(),
+                            ),
+                            accounts: Some(
+                                tracker
+                                    .admitters
+                                    .iter()
+                                    .flatten()
+                                    .map(|id| AccountFact {
+                                        id: id.clone(),
+                                        app: false,
+                                        active: true,
+                                    })
+                                    .collect(),
+                            ),
+                        })
+                    }))
+                }
             }
         }
 
