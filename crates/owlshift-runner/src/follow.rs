@@ -40,9 +40,6 @@ use owlshift_core::vocab::{MergeMethod, MergeSwitch, Stage};
 use crate::events::{Data, data};
 use crate::ticket_ref::TicketRecord;
 
-/// How long a rate-limited answer that gives no reset holds the forge reads.
-pub const RATE_LIMIT_FALLBACK: Duration = Duration::from_secs(5 * 60);
-
 /// The core's read of a pull request's check set.
 pub fn read_of(set: &CheckSet) -> Read {
     Read {
@@ -646,10 +643,7 @@ impl Following {
         mut warnings: Vec<Warning>,
     ) -> (Look, Vec<Warning>) {
         if error.kind == ErrorKind::RateLimited {
-            let until = error.resets_at.filter(|at| *at > now).unwrap_or_else(|| {
-                now.checked_add(RATE_LIMIT_FALLBACK)
-                    .unwrap_or(Timestamp::MAX)
-            });
+            let until = error.held_until(now);
             self.paused_until = Some(until);
             warnings.push(data([
                 ("what", json!("forge_rate_limited")),

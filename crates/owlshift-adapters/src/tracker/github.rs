@@ -39,7 +39,10 @@
 //! state, is in `drain` (OWL-536).
 //!
 //! The tracker's errors have no rate-limit kind: a spent budget is
-//! [`ErrorKind::Other`], its message saying so.
+//! [`ErrorKind::Other`], its message saying so and until when every call of
+//! the tracker waits. The forge holds them (OWL-554; architecture section 5,
+//! "Rate limits"): after an answer GitHub rate-limits, each call fails with
+//! that error and sends nothing until the reset it gave, or for 5 minutes.
 //!
 //! [`stage`]: Tracker::stage
 
@@ -669,7 +672,7 @@ mod tests {
 
     use super::*;
     use crate::forge::Repo;
-    use crate::graphql::{Response, RestAnswer, Transport};
+    use crate::graphql::{RateHeaders, Response, RestAnswer, Transport};
 
     pub(super) const ISSUE: &str = "repos/demo/project/issues/7";
 
@@ -682,42 +685,57 @@ mod tests {
         calls: Arc<Mutex<Vec<String>>>,
     }
 
-    /// A call, its status, its body and its `ETag`.
-    type Answer = (String, u16, Value, Option<String>);
+    /// A call, its status, its body, its `ETag` and its rate-limit headers.
+    type Answer = (String, u16, Value, Option<String>, RateHeaders);
 
     impl Canned {
         pub(super) fn on(self, call: &str, status: u16, body: Value) -> Self {
+            self.on_rated(call, status, body, RateHeaders::default())
+        }
+
+        /// [`Self::on`], the answer carrying the rate-limit headers `rate`
+        /// (OWL-554).
+        pub(super) fn on_rated(
+            self,
+            call: &str,
+            status: u16,
+            body: Value,
+            rate: RateHeaders,
+        ) -> Self {
             self.answers
                 .lock()
                 .unwrap()
-                .push((call.to_owned(), status, body, None));
+                .push((call.to_owned(), status, body, None, rate));
             self
         }
 
         /// [`Self::on`], the answer carrying the `ETag` `etag`.
         pub(super) fn on_tagged(self, call: &str, body: Value, etag: &str) -> Self {
-            self.answers
-                .lock()
-                .unwrap()
-                .push((call.to_owned(), 200, body, Some(etag.to_owned())));
+            self.answers.lock().unwrap().push((
+                call.to_owned(),
+                200,
+                body,
+                Some(etag.to_owned()),
+                RateHeaders::default(),
+            ));
             self
         }
 
         /// The first answer given for `call`; one given again later for the
         /// same call replaces it once it has answered, so a call can answer
         /// differently on its next asking (OWL-537).
-        fn answer(&self, call: String) -> (u16, String, Option<String>) {
+        fn answer(&self, call: String) -> (u16, String, Option<String>, RateHeaders) {
             self.calls.lock().unwrap().push(call.clone());
             let mut answers = self.answers.lock().unwrap();
             let at = answers
                 .iter()
-                .position(|(c, _, _, _)| *c == call)
+                .position(|(c, ..)| *c == call)
                 .unwrap_or_else(|| panic!("no answer for {call}"));
-            let (_, status, body, etag) = answers[at].clone();
-            if answers[at + 1..].iter().any(|(c, _, _, _)| *c == call) {
+            let (_, status, body, etag, rate) = answers[at].clone();
+            if answers[at + 1..].iter().any(|(c, ..)| *c == call) {
                 answers.remove(at);
             }
-            (status, body.to_string(), etag)
+            (status, body.to_string(), etag, rate)
         }
 
         pub(super) fn calls(&self) -> Vec<String> {
@@ -731,8 +749,9 @@ mod tests {
         }
 
         fn get(&self, path: &str) -> Result<RestAnswer, String> {
-            let (status, body, etag) = self.answer(format!("GET {path}"));
-            let answer = RestAnswer::new(status, body);
+            let (status, body, etag, rate) = self.answer(format!("GET {path}"));
+            let mut answer = RestAnswer::new(status, body);
+            answer.rate = rate;
             Ok(match etag {
                 Some(etag) => answer.with_etag(etag),
                 None => answer,
@@ -745,8 +764,8 @@ mod tests {
                 .lock()
                 .unwrap()
                 .iter()
-                .find(|(c, _, _, _)| *c == format!("GET {path}"))
-                .and_then(|(_, _, _, tag)| tag.clone());
+                .find(|(c, ..)| *c == format!("GET {path}"))
+                .and_then(|(_, _, _, tag, _)| tag.clone());
             if kept.as_deref() == Some(etag) {
                 self.calls.lock().unwrap().push(format!("GET {path} (304)"));
                 return Ok(RestAnswer::new(304, "").with_etag(etag));
@@ -755,13 +774,19 @@ mod tests {
         }
 
         fn post(&self, path: &str, body: &Value) -> Result<Response, String> {
-            let (status, answer, _) = self.answer(format!("POST {path} {body}"));
-            Ok(Response::new(status, answer))
+            let (status, answer, _, rate) = self.answer(format!("POST {path} {body}"));
+            Ok(Response {
+                rate,
+                ..Response::new(status, answer)
+            })
         }
 
         fn delete(&self, path: &str) -> Result<Response, String> {
-            let (status, answer, _) = self.answer(format!("DELETE {path}"));
-            Ok(Response::new(status, answer))
+            let (status, answer, _, rate) = self.answer(format!("DELETE {path}"));
+            Ok(Response {
+                rate,
+                ..Response::new(status, answer)
+            })
         }
     }
 
@@ -876,6 +901,8 @@ mod tests {
         );
     }
 
+    /// A refusal that is no spent budget names the permission, and holds
+    /// nothing: the next call is sent (OWL-554).
     #[test]
     fn a_refused_token_names_the_issues_permission() {
         let canned = Canned::default().on(
@@ -883,9 +910,67 @@ mod tests {
             403,
             json!({ "message": "Resource not accessible by integration" }),
         );
-        let error = tracker(&canned).ticket(&id("7")).unwrap_err();
+        let tracker = tracker(&canned);
+        let error = tracker.ticket(&id("7")).unwrap_err();
         assert_eq!(error.kind, ErrorKind::Unauthorized);
         assert!(error.message.contains("Issues (read and write)"), "{error}");
+        tracker.ticket(&id("7")).unwrap_err();
+        assert_eq!(canned.calls().len(), 2);
+    }
+
+    /// OWL-554: a spent budget, met by a write or by a secondary limit's
+    /// message alone, holds every call of the tracker, reads, writes and
+    /// `doctor`'s probe alike, until the time its error names: each fails
+    /// with that one error and no request. One error for the whole hold is
+    /// what lets watch's drain tell it once; that line is the runner's.
+    #[test]
+    fn a_spent_budget_holds_every_call_of_the_tracker() {
+        let spent = RateHeaders {
+            remaining: Some(0),
+            reset: Some(4_102_444_800),
+            retry_after: None,
+        };
+        let comment = format!(r#"POST {ISSUE}/comments {{"body":"hello"}}"#);
+        let canned = Canned::default()
+            .on(&format!("GET {ISSUE}"), 200, issue(&[], "open"))
+            .on_rated(
+                &comment,
+                403,
+                json!({ "message": "API rate limit exceeded" }),
+                spent,
+            );
+        let issues = tracker(&canned);
+        let first = issues.post_comment(&id("7"), "hello").unwrap_err();
+        assert_eq!(first.kind, ErrorKind::Other);
+        assert!(first.message.contains("API rate limit exceeded"), "{first}");
+        assert!(
+            first.message.ends_with("wait until 2100-01-01T00:00:00Z"),
+            "{first}"
+        );
+        assert_eq!(issues.ticket(&id("7")).unwrap_err(), first);
+        assert_eq!(
+            issues.set_stage(&id("7"), "agent:review").unwrap_err(),
+            first
+        );
+        assert_eq!(issues.issues_access().unwrap_err(), first);
+        assert_eq!(canned.calls(), [format!("GET {ISSUE}"), comment]);
+
+        // A secondary limit may give no header: its message says it.
+        let canned = Canned::default().on(
+            &format!("GET {ISSUE}"),
+            403,
+            json!({ "message": "You have exceeded a secondary rate limit." }),
+        );
+        let issues = tracker(&canned);
+        let first = issues.ticket(&id("7")).unwrap_err();
+        assert!(first.message.contains("secondary rate limit"), "{first}");
+        assert!(first.message.contains("wait until"), "{first}");
+        assert!(
+            !first.message.contains("Issues (read and write)"),
+            "{first}"
+        );
+        assert_eq!(issues.comments(&id("7")).unwrap_err(), first);
+        assert_eq!(canned.calls().len(), 1);
     }
 
     #[test]

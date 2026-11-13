@@ -495,6 +495,8 @@ pub struct GitHubForge {
     check_page: u32,
     /// The answers of the conditional reads, by path (OWL-536).
     cache: Mutex<RestCache>,
+    /// The tracker's REST calls held on a spent budget (OWL-554).
+    spent: RestHold,
 }
 
 impl fmt::Debug for GitHubForge {
@@ -530,6 +532,7 @@ impl GitHubForge {
             repo,
             check_page: MAX_PAGE,
             cache: Mutex::default(),
+            spent: RestHold::default(),
         }
     }
 
@@ -548,6 +551,7 @@ impl GitHubForge {
             repo,
             check_page: MAX_PAGE,
             cache: Mutex::default(),
+            spent: RestHold::default(),
         }
     }
 
@@ -1042,6 +1046,17 @@ impl GitHubForge {
         successful(answer, path)
     }
 
+    /// `call`, one of the GitHub tracker's REST calls, held on a spent
+    /// budget (OWL-554; architecture section 5, "Rate limits"): while a hold
+    /// stands, its error at once and no request; a rate-limited answer
+    /// starts one. `rest_text_cached`, `rest_status` and `rest_write`, which
+    /// only the tracker calls, go through it; the forge's own REST calls do
+    /// not, watch holding them itself.
+    fn holding<T>(&self, call: impl FnOnce() -> Result<T, Error>) -> Result<T, Error> {
+        self.spent.check(Timestamp::now())?;
+        call().map_err(|error| self.spent.learn(Timestamp::now(), error))
+    }
+
     /// One REST read of the answer whole, to 1 MiB: its text, or the error
     /// its status says (OWL-535), read again conditionally (OWL-536; build plan,
     /// "The GitHub Issues adapter", "Polling", G6): the forge keeps each
@@ -1049,8 +1064,14 @@ impl GitHubForge {
     /// `If-None-Match`, so an answer of HTTP 304, which GitHub does not count
     /// against the hourly limit, gives the body kept. The cache lives as
     /// long as the forge; past [`MAX_CACHED`] paths or [`MAX_CACHED_BYTES`]
-    /// it is emptied, and the next reads are plain ones.
+    /// it is emptied, and the next reads are plain ones. Held on a spent
+    /// budget ([`Self::holding`]), a body kept included: a 304 is still a
+    /// request.
     pub(crate) fn rest_text_cached(&self, path: &str) -> Result<String, Error> {
+        self.holding(|| self.read_cached(path))
+    }
+
+    fn read_cached(&self, path: &str) -> Result<String, Error> {
         let kept = self.cached().entries.get(path).cloned();
         let answer = match &kept {
             Some((etag, _)) => self.channel.get_if_none_match(path, etag),
@@ -1075,18 +1096,18 @@ impl GitHubForge {
     /// One plain REST read whose status the caller reads itself (OWL-537):
     /// the status and the first 4 KiB of the body, whatever the status; an
     /// error only when GitHub gave no answer, or for a spent budget, whose
-    /// error says when it resets.
+    /// error says when it resets. Held on a spent budget
+    /// ([`Self::holding`]).
     pub(crate) fn rest_status(&self, path: &str) -> Result<(u16, String), Error> {
-        let mut answer = self.channel.get(path).map_err(unanswered)?;
-        if answer.status == 403 || answer.status == 429 {
-            let rate = answer.rate;
-            if rate.remaining == Some(0) || rate.retry_after.is_some() {
-                return Err(status_error(answer.status, "", rate, path));
+        self.holding(|| {
+            let mut answer = self.channel.get(path).map_err(unanswered)?;
+            let mut body = String::new();
+            let _ = (&mut answer.body).take(4096).read_to_string(&mut body);
+            if spent(answer.status, answer.rate, &said(&body)) {
+                return Err(status_error(answer.status, &body, answer.rate, path));
             }
-        }
-        let mut body = String::new();
-        let _ = (&mut answer.body).take(4096).read_to_string(&mut body);
-        Ok((answer.status, body))
+            Ok((answer.status, body))
+        })
     }
 
     /// The cache, taken back after a panic elsewhere while it was held.
@@ -1095,8 +1116,13 @@ impl GitHubForge {
     }
 
     /// One REST write: its answer's text when GitHub took it, or the error
-    /// its status says, as a read's (OWL-535).
+    /// its status says, as a read's (OWL-535). Held on a spent budget
+    /// ([`Self::holding`]).
     pub(crate) fn rest_write(&self, verb: Verb, path: &str, body: &Value) -> Result<String, Error> {
+        self.holding(|| self.write_rest(verb, path, body))
+    }
+
+    fn write_rest(&self, verb: Verb, path: &str, body: &Value) -> Result<String, Error> {
         let answer =
             self.channel
                 .write(verb, path, body)
@@ -1182,15 +1208,76 @@ impl RestCache {
     }
 }
 
-/// The error a REST answer of HTTP `status` says, from its `body` and its
-/// rate-limit headers, for the request to `path`.
-fn status_error(status: u16, body: &str, rate: RateHeaders, path: &str) -> Error {
-    let message = serde_json::from_str::<Envelope>(body)
+/// The hold of the GitHub tracker's REST calls on a spent budget (OWL-554):
+/// until when they fail at once, and the error they fail with.
+#[derive(Default)]
+struct RestHold(Mutex<Option<(Timestamp, Error)>>);
+
+impl RestHold {
+    /// The hold, taken back after a panic elsewhere while it was held.
+    fn standing(&self) -> std::sync::MutexGuard<'_, Option<(Timestamp, Error)>> {
+        self.0.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// The hold's error while it stands at `now`, before its time; a hold
+    /// whose time has come is lifted.
+    fn check(&self, now: Timestamp) -> Result<(), Error> {
+        let mut standing = self.standing();
+        match standing.as_ref() {
+            Some((until, error)) if now < *until => Err(error.clone()),
+            Some(_) => {
+                *standing = None;
+                Ok(())
+            }
+            None => Ok(()),
+        }
+    }
+
+    /// `error` as the call that met it returns it, at `now`. A spent
+    /// budget's starts the hold until [`Error::held_until`], its message
+    /// naming that time; when a hold stands already, its error is returned
+    /// instead, so every call of one hold says the same. Any other error is
+    /// returned as it is.
+    fn learn(&self, now: Timestamp, error: Error) -> Error {
+        if error.kind != ErrorKind::RateLimited {
+            return error;
+        }
+        let mut standing = self.standing();
+        if let Some((until, held)) = standing.as_ref()
+            && now < *until
+        {
+            return held.clone();
+        }
+        let until = error.held_until(now);
+        let held = Error::new(
+            ErrorKind::RateLimited,
+            format!(
+                "{}; the GitHub tracker's calls wait until {until}",
+                error.message
+            ),
+        )
+        .with_reset(Some(until));
+        *standing = Some((until, held.clone()));
+        held
+    }
+}
+
+/// The `message` of an error answer's `body`, or nothing.
+fn said(body: &str) -> String {
+    serde_json::from_str::<Envelope>(body)
         .ok()
         .and_then(|e| e.message)
-        .unwrap_or_default();
+        .unwrap_or_default()
+}
+
+/// The error a REST answer of HTTP `status` says, from its `body` and its
+/// rate-limit headers, for the request to `path`. A spent budget is any
+/// answer [`spent`] reads as one, a secondary limit's message included
+/// (OWL-554).
+fn status_error(status: u16, body: &str, rate: RateHeaders, path: &str) -> Error {
+    let message = said(body);
     match status {
-        403 | 429 if rate.remaining == Some(0) || rate.retry_after.is_some() => Error::new(
+        403 | 429 if spent(status, rate, &message) => Error::new(
             ErrorKind::RateLimited,
             format!("GitHub's rate limit: HTTP {status} {message}"),
         )
@@ -3678,5 +3765,44 @@ mod tests {
         assert_eq!(cache.entries.len(), MAX_CACHED);
         cache.keep("one more", "e".into(), "");
         assert_eq!(cache.entries.len(), 1);
+    }
+
+    /// OWL-554: a spent budget holds the tracker's REST calls until the
+    /// reset it gives, or 5 minutes when it gives none or one already past
+    /// (`Retry-After: 0` among them); while the hold stands every call
+    /// fails with the one error, and at its time the next call is sent. An
+    /// error that is no spent budget holds nothing.
+    #[test]
+    fn a_spent_budget_holds_the_tracker_calls_until_its_reset() {
+        let t = |second: i64| Timestamp::from_second(second).unwrap();
+        let five_minutes = 300;
+        for (reset, held_for) in [
+            (Some(1_060), 60),
+            (None, five_minutes),
+            (Some(990), five_minutes),
+            (Some(1_000), five_minutes),
+        ] {
+            let hold = RestHold::default();
+            let spent = Error::new(ErrorKind::RateLimited, "GitHub's rate limit: HTTP 403")
+                .with_reset(reset.map(t));
+            let held = hold.learn(t(1_000), spent);
+            assert_eq!(held.kind, ErrorKind::RateLimited);
+            let until = t(1_000 + held_for);
+            assert_eq!(held.resets_at, Some(until), "{reset:?}");
+            assert!(
+                held.message.ends_with(&format!("wait until {until}")),
+                "{held}"
+            );
+            assert_eq!(hold.check(t(1_000 + held_for - 1)), Err(held.clone()));
+            // Learned again while it stands: the same error, the same time.
+            let again = Error::new(ErrorKind::RateLimited, "another").with_reset(Some(t(9_999)));
+            assert_eq!(hold.learn(t(1_001), again), held);
+            assert_eq!(hold.check(t(1_000 + held_for)), Ok(()), "{reset:?}");
+            assert_eq!(hold.check(t(1_000)), Ok(()), "lifted: {reset:?}");
+        }
+        let hold = RestHold::default();
+        let refused = Error::new(ErrorKind::Unauthorized, "GitHub refused the token");
+        assert_eq!(hold.learn(t(1_000), refused.clone()), refused);
+        assert_eq!(hold.check(t(1_000)), Ok(()));
     }
 }
