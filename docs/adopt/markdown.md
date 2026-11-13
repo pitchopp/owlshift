@@ -24,7 +24,7 @@ owlshift init --tracker markdown
 `init` does four things:
 
 1. It reads the repository's root files (`Cargo.toml`, `package.json`, `pyproject.toml`, `Makefile`) and writes the gate it suggests, your lint, formatter and test commands, in a commented `owlshift.toml`. It never runs them. If it finds nothing, or guesses wrong, give the gate yourself, one `--gate` per command, as in `owlshift init --tracker markdown --gate "make lint" --gate "make test"`.
-2. It signs you in to GitHub through Owlshift's GitHub App. It prints a code and asks you to open `https://github.com/login/device` and enter it. If the app is not yet installed on the repository, it prints the install link and waits until you have installed it.
+2. It signs you in to GitHub through Owlshift's GitHub App. It prints a code and asks you to open `https://github.com/login/device` and enter it. If the app is not yet installed on the repository, it prints the install link and waits until you have installed it. If the code expires before you enter it, `init` says so and exits with an error: run it again for a new code.
 3. It asks for the token agent runs log in to Claude Code with. Make it in another terminal with `claude setup-token`, then paste it. It is asked once per machine. Owlshift never asks for a model API key.
 4. It writes an example ticket, `tickets/DEMO-1/ticket.md`.
 
@@ -115,7 +115,13 @@ Then run it:
 owlshift do DEMO-1
 ```
 
-`owlshift do` works in the foreground and says what it does. It runs the ticket through intake, design, design review, build and verify, each step by a fresh agent run, with the gate run on the result. It works in its own clone and worktrees under Owlshift's data folder, never in your checkout, and it pushes a branch `owlshift/demo-1` and opens a pull request on GitHub. The ticket's `stage` moves as it goes, and Owlshift writes its comments, such as the plan and the delivery report, as files in `tickets/DEMO-1/comments/`.
+`owlshift do` works in the foreground and says what it does. It runs the ticket through design, design review, build and verify, each step by a fresh agent run, with the gate run on the result; it prints each step as it goes. It works in its own clone and worktrees under Owlshift's data folder, never in your checkout, and it pushes a branch `owlshift/demo-1` and opens a pull request on GitHub. The ticket's `stage` moves as it goes, and Owlshift writes its comments, such as the plan and the delivery report, as files in `tickets/DEMO-1/comments/`: a `[owlshift] PLAN` comment that points to the whole plan in `tickets/DEMO-1/documents/1.md`, then a `[owlshift] DELIVERY` report with the pull request, its checks, the gate's result, the decisions taken without you and what remains for you to do.
+
+A one-line change to the README took a little over a minute and about 0.28 USD of Claude usage. The run ended with:
+
+```text
+Delivered: pull request #101 https://github.com/…/pull/101 (opened), checks not finished yet; the delivery report is on the ticket. Owlshift never merges: review and merge it.
+```
 
 Review the pull request and merge it yourself: Owlshift never merges unless you turn that on.
 

@@ -34,12 +34,30 @@ owlshift init --tracker github
 `init` does five things, in this order:
 
 1. It reads the repository's root files (`Cargo.toml`, `package.json`, `pyproject.toml`, `Makefile`) to suggest a gate: your lint, formatter and test commands. It never runs them. If it finds nothing, or guesses wrong, give the gate yourself, one `--gate` per command, as in `owlshift init --tracker github --gate "make lint" --gate "make test"`.
-2. It signs you in to GitHub through Owlshift's GitHub App. It prints a code and asks you to open `https://github.com/login/device` and enter it. If the app is not installed on the repository, it prints the install link and waits until you have installed it.
+2. It signs you in to GitHub through Owlshift's GitHub App. It prints a code and asks you to open `https://github.com/login/device` and enter it. If the app is not installed on the repository, it prints the install link and waits until you have installed it. If the code expires before you enter it, `init` says so and exits with an error: run it again for a new code.
 3. It asks for the token agent runs log in to Claude Code with. Make it in another terminal with `claude setup-token`, then paste it. It is asked once per machine. Owlshift never asks for a model API key.
 4. It checks that the repository's issues answer, creates the labels that are missing, one line each, and reads your GitHub account's numeric id, which it writes as the one admitter: the person whose `agent:ready` label admits an issue.
 5. It writes a commented `owlshift.toml`.
 
-The secrets go to the system keychain, never to a file. If the issues do not answer, `init` says why and writes no file.
+The secrets go to the system keychain, never to a file. If the issues do not answer, `init` says why and writes no file. On a repository that had none of the labels, it printed:
+
+```text
+Created the label "agent:ready" on GitHub.
+Created the label "agent:working" on GitHub.
+Created the label "agent:needs-input" on GitHub.
+Created the label "agent:review" on GitHub.
+Created the label "agent:proposed" on GitHub.
+Wrote ~/code/shop/owlshift.toml: review it, then commit it.
+```
+
+and the `[tracker]` table of the file it wrote reads:
+
+```toml
+kind = "github"
+admit = "ready"
+admitters = ["24303327"]
+states = { ready = "agent:ready", working = "agent:working", needs_input = "agent:needs-input", review = "agent:review" }
+```
 
 Read `owlshift.toml`: each setting is explained in a comment above it. Check the gate under `[stack]`, which every agent's work must pass, and `admitters` under `[tracker]`: add the numeric ids of the other people whose label should admit an issue (`gh api users/<login> --jq .id` prints one). Then commit the file and push it to your default branch: the background service reads the project file of the default branch, and each run the file of the commit its branch starts from.
 
@@ -100,7 +118,15 @@ Open an issue for something small and clear, such as a typo to fix or a line to 
 owlshift do 12
 ```
 
-`owlshift do` works in the foreground and says what it does. It runs the issue through intake, design, design review, build and verify, each step by a fresh agent run, with the gate run on the result. It works in its own clone and worktrees under Owlshift's data folder, never in your checkout. It pushes a branch `owlshift/12` and opens a pull request whose description ends with `Closes #12`, so merging it closes the issue. The issue's labels move as it goes, and Owlshift comments on it: the plan, then the delivery report.
+`owlshift do` works in the foreground and says what it does. It runs the issue through design, design review, build and verify, each step by a fresh agent run, with the gate run on the result; it prints each step as it goes. It works in its own clone and worktrees under Owlshift's data folder, never in your checkout. It pushes a branch `owlshift/12` and opens a pull request whose description ends with `Closes #12`, so merging it closes the issue. The issue's labels move as it goes, and Owlshift comments on it: the plan, then the delivery report.
+
+A ticket can also wait rather than run. Owlshift never builds two changes to the same files at once: while one of its pull requests that touches those files is open, a new ticket that would touch them waits, and `owlshift do` says so and stops. An issue whose plan touched the README, run while an earlier pull request on the README was open, ended with:
+
+```text
+Not run: 102 waits: pull request #101 holds zone `README.md`, which its Build would take: its Build is admitted once pull request #101 no longer holds it. `owlshift why 102` says why it waits.
+```
+
+Merge or close that pull request, then run `owlshift do 102` again. Under `owlshift watch --drain` or the service, Owlshift also posts a `[owlshift] WAITING` comment on the issue saying what it waits for, and goes on by itself once that is gone.
 
 Review the pull request and merge it yourself: Owlshift never merges unless you turn merge on green on for the project (`[forge] merge` in `owlshift.toml`).
 
@@ -142,7 +168,13 @@ acme/shop (from /home/dev/shop)
 From then on:
 
 - **Admit an issue** by putting the `agent:ready` label on it, as an account listed in `admitters`. A label anyone else puts admits nothing, so on a public repository strangers cannot start work. The `admitters` are read from the project file of your default branch, never from your checkout: a list only in your local file admits nothing. The service checks every minute; it may take a pass or two to see a label put that instant.
-- Admitted issues are taken in priority order, blockers respected, one at a time unless `policy.max_in_flight` says more.
+- An admitted issue first gets an intake run, which posts an `[owlshift] INTAKE` comment (its size, its routing, its dependencies), then waits its turn for a Build. Admitted issues are taken in priority order, blockers respected, one at a time unless `policy.max_in_flight` says more. An issue dispatched and not yet delivered keeps its place, whether it waits for your answers or for another pull request: answer it, or merge or close what it waits for, and the next one goes. `owlshift why` says which:
+
+```text
+103 [ready] in acme/shop
+  2026-11-13T13:23:13.899429Z waits: the project's slot is held by 102
+now: the project's slot is held by 102
+```
 - `owlshift status` says what the service does and which issues wait for you; `owlshift why` says why an admitted issue is not running; `owlshift logs 12` prints what Owlshift recorded for one.
 - `owlshift stop` stops the service once the steps under way finish (`Stopping the daemon (pid 8671): each watch ends once its steps under way finish, then the daemon exits.`); `owlshift stop --forget` stops serving this project only.
 

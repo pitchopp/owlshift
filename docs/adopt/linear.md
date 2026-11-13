@@ -38,7 +38,7 @@ Linear is the default tracker, so `--tracker linear` can be left out. `init` doe
 
 1. It reads the repository's root files (`Cargo.toml`, `package.json`, `pyproject.toml`, `Makefile`) to suggest a gate: your lint, formatter and test commands. It never runs them. If it finds nothing, or guesses wrong, give the gate yourself, one `--gate` per command, as in `owlshift init --team ENG --gate "make lint" --gate "make test"`.
 2. It asks for the Linear API key, then for the optional app's client ID and secret: leave both empty to go without.
-3. It signs you in to GitHub through Owlshift's GitHub App. It prints a code and asks you to open `https://github.com/login/device` and enter it. If the app is not installed on the repository, it prints the install link and waits until you have installed it.
+3. It signs you in to GitHub through Owlshift's GitHub App. It prints a code and asks you to open `https://github.com/login/device` and enter it. If the app is not installed on the repository, it prints the install link and waits until you have installed it. If the code expires before you enter it, `init` says so and exits with an error: run it again for a new code.
 4. It asks for the token agent runs log in to Claude Code with. Make it in another terminal with `claude setup-token`, then paste it. It is asked once per machine. Owlshift never asks for a model API key.
 5. It reads the team's workflow states with the key, then writes a commented `owlshift.toml`. If Linear does not answer, it says why and writes no file.
 
@@ -95,7 +95,7 @@ Create a ticket for something small and clear, such as a typo to fix or a line t
 owlshift do ENG-12
 ```
 
-`owlshift do` works in the foreground and says what it does. It runs the ticket through intake, design, design review, build and verify, each step by a fresh agent run, with the gate run on the result. It works in its own clone and worktrees under Owlshift's data folder, never in your checkout. It pushes a branch `owlshift/eng-12` and opens a pull request; if your workspace uses Linear's GitHub integration, the branch's name links the pull request to the ticket. The ticket moves through the states as it goes, and Owlshift comments on it: the plan, then the delivery report.
+`owlshift do` works in the foreground and says what it does. It runs the ticket through design, design review, build and verify, each step by a fresh agent run, with the gate run on the result; it prints each step as it goes. It works in its own clone and worktrees under Owlshift's data folder, never in your checkout. It pushes a branch `owlshift/eng-12` and opens a pull request; if your workspace uses Linear's GitHub integration, the branch's name links the pull request to the ticket. The ticket moves through the states as it goes, and Owlshift comments on it: the plan, then the delivery report.
 
 Review the pull request and merge it yourself: Owlshift never merges unless you turn merge on green on for the project (`[forge] merge` in `owlshift.toml`).
 
@@ -137,7 +137,7 @@ acme/shop (from /home/dev/shop)
 From then on:
 
 - **Admit a ticket** by putting the `agent` label on it in its ready state (`Todo`), as one of the `admitters`. A label anyone else puts admits nothing. The `admitters` are read from the project file of your default branch, never from your checkout: a list only in your local file admits nothing. The service checks every minute.
-- Admitted tickets are taken in priority order, blockers respected (Linear's "blocked by" relations, or a line `Blocked by ENG-10` in the description), one at a time unless `policy.max_in_flight` says more.
+- An admitted ticket first gets an intake run, which posts an `[owlshift] INTAKE` comment (its size, its routing, its dependencies), then waits its turn for a Build. Admitted tickets are taken in priority order, blockers respected (Linear's "blocked by" relations, or a line `Blocked by ENG-10` in the description), one at a time unless `policy.max_in_flight` says more. A ticket dispatched and not yet delivered keeps its place, whether it waits for your answers or for another pull request: answer it, or merge or close what it waits for, and the next one goes.
 - `owlshift status` says what the service does and which tickets wait for you; `owlshift why` says why an admitted ticket is not running; `owlshift logs ENG-12` prints what Owlshift recorded for one.
 - `owlshift stop` stops the service once the steps under way finish (`Stopping the daemon (pid 8671): each watch ends once its steps under way finish, then the daemon exits.`); `owlshift stop --forget` stops serving this project only.
 
