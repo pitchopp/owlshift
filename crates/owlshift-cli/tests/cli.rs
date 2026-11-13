@@ -1578,6 +1578,37 @@ fn init_writes_a_commented_project_file_once() {
     );
 }
 
+/// OWL-537: `init --tracker github --skip-secrets` asks GitHub nothing: it
+/// writes the project file with its labels as stages and a commented
+/// admitter, and says the tracker was not checked.
+#[test]
+fn init_github_without_secrets_writes_the_file_and_says_it_checked_nothing() {
+    let config_dir = tempfile::tempdir().unwrap();
+    let repo = tempfile::tempdir().unwrap();
+    git_init(repo.path());
+    let output = owlshift(
+        repo.path(),
+        config_dir.path(),
+        &["init", "--tracker", "github", "--skip-secrets"],
+    );
+    assert!(output.status.success(), "{}", stderr(&output));
+    let said = stdout(&output);
+    assert!(
+        said.contains("The tracker was not checked (--skip-secrets)")
+            && said.contains("No label was created"),
+        "{said}"
+    );
+    let written = fs::read_to_string(repo.path().join("owlshift.toml")).unwrap();
+    let config = owlshift_contracts::config::ProjectConfig::parse(&written).unwrap();
+    assert_eq!(
+        config.tracker.kind,
+        owlshift_contracts::config::TrackerKind::Github
+    );
+    assert_eq!(config.tracker.states.ready, "agent:ready");
+    assert_eq!(config.tracker.admitters, None);
+    assert!(written.contains("# admitters = ["), "{written}");
+}
+
 /// OWL-383: `--github-token` asks for a personal token, so it goes with the
 /// secrets and is refused with `--skip-secrets`, before any file is written.
 #[test]

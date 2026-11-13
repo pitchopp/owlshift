@@ -92,7 +92,7 @@ pub trait Kind: Sync {
     ) -> Doctored;
 
     /// Doctor's `proposals inbox` line (OWL-155): whether a follow-up
-    /// Owlshift proposes can be filed, given what [`Kind::admission_facts`]
+    /// Owlshift proposes can be filed, given what [`Kind::doctor`]
     /// read.
     fn proposals_inbox(
         &self,

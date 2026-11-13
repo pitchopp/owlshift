@@ -1,11 +1,13 @@
-//! `owlshift init`: writes the commented project file, then stores the
-//! secrets `owlshift do` needs, asking for them on a terminal only, with
-//! hidden input (`owlshift_runner::init`): the tracker's under the accounts
-//! of the project's GitHub repository, read from `origin`, the Claude Code
-//! token for agent runs once per machine (OWL-308). The forge's comes from
-//! signing in to GitHub through Owlshift's GitHub App
-//! (`owlshift_runner::github_sign_in`, OWL-336), or with `--github-token`
-//! from a personal token asked for like the others.
+//! `owlshift init`: stores the secrets `owlshift do` needs, asking for them
+//! on a terminal only, with hidden input (`owlshift_runner::init`): the
+//! tracker's under the accounts of the project's GitHub repository, read
+//! from `origin`, the Claude Code token for agent runs once per machine
+//! (OWL-308). The forge's comes from signing in to GitHub through Owlshift's
+//! GitHub App (`owlshift_runner::github_sign_in`, OWL-336), or with
+//! `--github-token` from a personal token asked for like the others. Then it
+//! asks the tracker whether it answers, setting up a GitHub Issues project's
+//! labels, and writes the commented project file only once it did (OWL-537);
+//! `--skip-secrets` writes it without asking anything.
 
 use std::io::{self, IsTerminal};
 use std::path::Path;

@@ -1324,8 +1324,8 @@ fn served_check(system: &dyn System, config: &Effective) -> Option<Check> {
 /// implement yet is a warning, not a failure: `owlshift do` needs only to
 /// read tickets and comments and move the visible stage, and refusing a project is `init`'s job. The
 /// check reads the adapter's constants: it opens neither the tracker nor the
-/// keychain; the tracker's own lines do, for a Linear project
-/// ([`crate::tracker::Kind::doctor_lines`]).
+/// keychain; the tracker's own lines do, for a Linear or GitHub Issues project
+/// ([`crate::tracker::Kind::doctor`]).
 fn tracker_check(config: &Effective) -> Check {
     const SUBJECT: &str = "tracker";
     let FileState::Loaded { config, .. } = &config.project else {
