@@ -14,11 +14,12 @@ use owlshift_contracts::ids::TicketId;
 use owlshift_platform::keychain::{Keychain, SERVICE, Secret};
 
 use super::{
-    AppError, Connected, Doctored, ForgeCredential, Kind, Opener, Probe, Probed, Setup, StatesError,
+    AppError, Connected, Doctored, ForgeCredential, Kind, LINEAR_ACCOUNT, LINEAR_APP_ID_ACCOUNT,
+    LINEAR_APP_SECRET_ACCOUNT, LINEAR_SECRETS, Opener, Probe, Probed, Setup, StatesError,
 };
 use crate::doctor::{Check, DOES_NOT_BLOCK, KEYCHAIN_FIX, Section, Step, configured_states};
 use crate::init::{LINEAR_KEY, SecretSpec};
-use crate::secrets::{Source, TrackerAccounts, TrackerSecrets};
+use crate::secrets::{SecretSet, Source, TrackerAccounts, TrackerSecrets};
 use crate::system::System;
 use crate::ui::reply::Key;
 
@@ -35,6 +36,11 @@ impl Kind for Linear {
 
     fn secret_specs(&self) -> &'static [SecretSpec] {
         &[LINEAR_KEY]
+    }
+
+    /// The key and the app's pair, read whole from one place ([`LINEAR_SECRETS`]).
+    fn secret_set(&self) -> Option<&'static SecretSet> {
+        Some(&LINEAR_SECRETS)
     }
 
     fn project_file_lines(&self, team: Option<&str>) -> Result<String, String> {
@@ -127,11 +133,11 @@ team = {}
         let keychain =
             Keychain::system().map_err(|e| format!("the keychain cannot be read: {e}"))?;
         let mut look = |account: &str| keychain.read(account).map_err(|e| e.to_string());
-        let found = crate::secrets::tracker(repo, &mut look)?;
-        let Some(key) = found.key else {
+        let found = crate::secrets::tracker(repo, &LINEAR_SECRETS, &mut look)?;
+        let Some(key) = found.get(LINEAR_ACCOUNT) else {
             return Err(format!(
                 "no Linear API key is stored for this project (account `{}`): run `owlshift init`",
-                found.accounts.key
+                found.accounts.of(LINEAR_ACCOUNT)
             ));
         };
         let tracker = LinearTracker::new(ApiKey::new(key.expose()));
@@ -167,12 +173,12 @@ team = {}
             )
         })?;
         let mut look = |account: &str| setup.keychain.read(account).map_err(|e| e.to_string());
-        let found = crate::secrets::tracker(repo, &mut look)?;
-        let Some(key) = found.key else {
+        let found = crate::secrets::tracker(repo, &LINEAR_SECRETS, &mut look)?;
+        let Some(key) = found.get(LINEAR_ACCOUNT) else {
             return Err(format!(
                 "no Linear API key is stored for this project (service `{SERVICE}`, account \
                  `{}`): run `owlshift init` in a terminal and give it",
-                found.accounts.key
+                found.accounts.of(LINEAR_ACCOUNT)
             ));
         };
         team_answers(&LinearTracker::new(ApiKey::new(key.expose())), team)?;
@@ -220,7 +226,7 @@ fn tracker_states_check(
     let accounts = accounts?;
     let place = format!(
         "in the system keychain (service `{SERVICE}`, account `{}`)",
-        accounts.key
+        accounts.of(LINEAR_ACCOUNT)
     );
     let fail = |detail: String, why: &str, fix: Vec<Step>| {
         Some(Check::fail(Section::Project, SUBJECT, detail, why, fix))
@@ -437,7 +443,8 @@ fn tracker_identity_check(
     let accounts = accounts?;
     let place = format!(
         "in the system keychain (service `{SERVICE}`, accounts `{}` and `{}`)",
-        accounts.app_id, accounts.app_secret
+        accounts.of(LINEAR_APP_ID_ACCOUNT),
+        accounts.of(LINEAR_APP_SECRET_ACCOUNT)
     );
     let why = "With the Linear app stored, `owlshift do` writes as its app user, checked before \
                any work, and refuses rather than write through the API key.";

@@ -400,6 +400,9 @@ pub(crate) mod fake {
         unstored: Vec<String>,
         /// Whether a project's GitHub App account holds an entry.
         app_token_stored: bool,
+        /// Whether no account of the project's own holds an entry
+        /// ([`Self::only_shared`]).
+        only_shared: bool,
         /// Why the keychain cannot be read; `None`: it can.
         keychain_error: Option<String>,
         /// What Linear answers for a team's workflow states, the key being
@@ -530,16 +533,10 @@ pub(crate) mod fake {
         }
 
         /// The project's own tracker and forge accounts hold nothing, so
-        /// its secrets come from the shared accounts (OWL-308).
+        /// its secrets come from the shared accounts (OWL-308): every
+        /// account named by `pitchopp/owlshift` is empty.
         pub(crate) fn only_shared(mut self) -> Self {
-            let repo = Repo::parse("pitchopp/owlshift").unwrap();
-            let own = crate::secrets::TrackerAccounts::project(&repo);
-            self.unstored.extend([
-                own.key,
-                own.app_id,
-                own.app_secret,
-                crate::secrets::ForgeAccount::project(&repo).token,
-            ]);
+            self.only_shared = true;
             self
         }
 
@@ -755,7 +752,10 @@ pub(crate) mod fake {
                 Some(reason) => Err(reason.clone()),
                 None => {
                     let app = format!("/{}", crate::forge::GITHUB_APP_ACCOUNT);
+                    let repo = Repo::parse("pitchopp/owlshift").unwrap();
+                    let own = crate::secrets::project_account(&repo, "");
                     Ok(!self.unstored.iter().any(|unstored| unstored == account)
+                        && !(self.only_shared && account.starts_with(&own))
                         && (self.app_token_stored || !account.ends_with(&app)))
                 }
             }
@@ -861,7 +861,7 @@ pub(crate) mod fake {
             _team: &str,
         ) -> Result<Vec<String>, StatesError> {
             use owlshift_adapters::tracker::{Error, ErrorKind};
-            match self.secret_stored(&accounts.key) {
+            match self.secret_stored(accounts.of(crate::tracker::LINEAR_ACCOUNT)) {
                 Err(reason) => Err(StatesError::Keychain(reason)),
                 Ok(false) => Err(StatesError::NoKey),
                 Ok(true) => self
@@ -885,7 +885,7 @@ pub(crate) mod fake {
             people: &[&str],
         ) -> Result<AdmissionFacts, StatesError> {
             use owlshift_adapters::tracker::{Error, ErrorKind};
-            match self.secret_stored(&accounts.key) {
+            match self.secret_stored(accounts.of(crate::tracker::LINEAR_ACCOUNT)) {
                 Err(reason) => Err(StatesError::Keychain(reason)),
                 Ok(false) => Err(StatesError::NoKey),
                 Ok(true) => self
@@ -919,10 +919,12 @@ pub(crate) mod fake {
                 missing: missing.to_owned(),
                 source: accounts.source,
             };
-            match (stored(&accounts.app_id)?, stored(&accounts.app_secret)?) {
+            let id = accounts.of(crate::tracker::LINEAR_APP_ID_ACCOUNT);
+            let secret = accounts.of(crate::tracker::LINEAR_APP_SECRET_ACCOUNT);
+            match (stored(id)?, stored(secret)?) {
                 (false, false) => Ok(None),
-                (true, false) => Err(incomplete(&accounts.app_secret)),
-                (false, true) => Err(incomplete(&accounts.app_id)),
+                (true, false) => Err(incomplete(secret)),
+                (false, true) => Err(incomplete(id)),
                 (true, true) => {
                     answer
                         .map(|name| Some(AppUser { name }))

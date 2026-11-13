@@ -20,7 +20,7 @@ use super::{
 };
 use crate::doctor::{Check, DOES_NOT_BLOCK, Section, Step};
 use crate::init::SecretSpec;
-use crate::secrets::{TrackerAccounts, TrackerSecrets};
+use crate::secrets::{SecretSet, TrackerAccounts, TrackerSecrets};
 use crate::system::System;
 use crate::ui::reply::Key;
 
@@ -38,6 +38,11 @@ impl Kind for Github {
     /// None: the forge's credential reaches the issues.
     fn secret_specs(&self) -> &'static [SecretSpec] {
         &[]
+    }
+
+    /// None: the forge's credential reaches the issues.
+    fn secret_set(&self) -> Option<&'static SecretSet> {
+        None
     }
 
     fn project_file_lines(&self, _team: Option<&str>) -> Result<String, String> {

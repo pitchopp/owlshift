@@ -33,7 +33,10 @@ use owlshift_runner::init::{
 use owlshift_runner::install::Manifests;
 use owlshift_runner::project::ProjectDirs;
 use owlshift_runner::secrets::{ForgeAccount, TrackerAccounts};
-use owlshift_runner::tracker::{self, Setup, app_credentials};
+use owlshift_runner::tracker::{
+    self, LINEAR_ACCOUNT, LINEAR_APP_ID_ACCOUNT, LINEAR_APP_SECRET_ACCOUNT, LINEAR_SECRETS, Setup,
+    app_credentials,
+};
 use owlshift_runner::{on_demand, project};
 
 use crate::fail;
@@ -167,11 +170,15 @@ pub fn run(args: &Args, config: &Effective) -> ExitCode {
     let root = path.parent().unwrap_or(path);
     let repo = project::origin_url(&project::runner_git(), root)
         .and_then(|url| on_demand::check_origin(&url));
-    let (mut wanted, unnamed) =
-        match wanted_secrets(&keychain, &required_secrets(tracker), repo.as_ref().ok()) {
-            Ok(found) => found,
-            Err(error) => return fail(&error),
-        };
+    let (mut wanted, unnamed) = match wanted_secrets(
+        &keychain,
+        &required_secrets(tracker),
+        tracker::of(tracker).secret_set(),
+        repo.as_ref().ok(),
+    ) {
+        Ok(found) => found,
+        Err(error) => return fail(&error),
+    };
     // Since OWL-336 the GitHub credential comes from the sign-in below; the
     // personal token is asked for with `--github-token` only. Without a
     // repository it stays among the secrets that cannot be named.
@@ -221,7 +228,7 @@ pub fn run(args: &Args, config: &Effective) -> ExitCode {
     let app_ready = match &repo {
         Ok(repo) if tracker::of(tracker).stores_app() => linear_app(
             &keychain,
-            &TrackerAccounts::project(repo),
+            &TrackerAccounts::project(repo, &LINEAR_SECRETS),
             args.replace_secrets,
             &mut ask,
             &mut stored,
@@ -513,13 +520,15 @@ fn linear_app(
     ask: &mut dyn FnMut(&Wanted) -> Option<Secret>,
     stored_now: &mut Vec<String>,
 ) -> bool {
-    let shared = TrackerAccounts::shared();
+    let shared = TrackerAccounts::shared(&LINEAR_SECRETS);
     let contains = |account: &str| keychain.contains(account).map_err(|e| e.to_string());
     let found = (|| {
         Ok::<_, String>((
-            contains(&own.key)?,
-            contains(&own.app_id)? || contains(&own.app_secret)?,
-            contains(&shared.app_id)? || contains(&shared.app_secret)?,
+            contains(own.of(LINEAR_ACCOUNT))?,
+            contains(own.of(LINEAR_APP_ID_ACCOUNT))?
+                || contains(own.of(LINEAR_APP_SECRET_ACCOUNT))?,
+            contains(shared.of(LINEAR_APP_ID_ACCOUNT))?
+                || contains(shared.of(LINEAR_APP_SECRET_ACCOUNT))?,
         ))
     })();
     let (own_key, own_app, shared_app) = match found {
@@ -554,7 +563,10 @@ fn linear_app(
     };
     match stored {
         AppStored::Stored => {
-            stored_now.extend([own.app_id.clone(), own.app_secret.clone()]);
+            stored_now.extend([
+                own.of(LINEAR_APP_ID_ACCOUNT).to_owned(),
+                own.of(LINEAR_APP_SECRET_ACCOUNT).to_owned(),
+            ]);
             println!(
                 "Stored the Linear app's client ID and secret: Owlshift comments as its app user."
             );
@@ -652,9 +664,6 @@ fn next_steps() -> ExitCode {
 #[cfg(test)]
 mod tests {
     use owlshift_adapters::forge::Repo;
-    use owlshift_runner::tracker::{
-        LINEAR_ACCOUNT, LINEAR_APP_ID_ACCOUNT, LINEAR_APP_SECRET_ACCOUNT,
-    };
 
     use super::*;
 
@@ -663,7 +672,8 @@ mod tests {
     #[test]
     fn a_half_shared_app_fails_a_project_without_its_own_key() {
         let keychain = Keychain::in_memory();
-        let own = TrackerAccounts::project(&Repo::parse("pitchopp/owlshift").unwrap());
+        let own =
+            TrackerAccounts::project(&Repo::parse("pitchopp/owlshift").unwrap(), &LINEAR_SECRETS);
         for account in [LINEAR_ACCOUNT, LINEAR_APP_ID_ACCOUNT] {
             keychain.store(account, &Secret::new("x")).unwrap();
         }
@@ -728,7 +738,7 @@ mod tests {
         keychain
             .store(&app, &Secret::new("{\"v\":1,\"access_token\":\"ghu_x\"}"))
             .unwrap();
-        let wanted = wanted_secrets(&keychain, &[GITHUB_TOKEN], Some(&repo))
+        let wanted = wanted_secrets(&keychain, &[GITHUB_TOKEN], None, Some(&repo))
             .unwrap()
             .0;
 

@@ -36,7 +36,7 @@ use owlshift_platform::keychain::{Keychain, SERVICE, Secret};
 use crate::doctor::Check;
 use crate::init::SecretSpec;
 use crate::refusal::Refusal;
-use crate::secrets::{ForgeSecret, Lookup, Source, TrackerAccounts, TrackerSecrets};
+use crate::secrets::{ForgeSecret, Lookup, SecretSet, Source, TrackerAccounts, TrackerSecrets};
 use crate::system::System;
 
 /// What differs by tracker, for one kind of tracker a project file names
@@ -53,6 +53,11 @@ pub trait Kind: Sync {
     /// of its own.
     fn secret_specs(&self) -> &'static [SecretSpec];
 
+    /// The keychain set of the tracker that `owlshift do` reads, by the rule
+    /// of [`crate::secrets::tracker`]: none when it needs no secret of its
+    /// own. Every account of [`Kind::secret_specs`] is one of its entries.
+    fn secret_set(&self) -> Option<&'static SecretSet>;
+
     /// The lines `init` writes under `[tracker]` of a new project file, the
     /// team key being `team` as `--team` gave it; the error says what is
     /// missing.
@@ -64,7 +69,8 @@ pub trait Kind: Sync {
 
     /// What opens the adapter of the project whose `[tracker]` is `tracker`,
     /// checked out at `root`, with the tracker secrets [`keychain_set`]
-    /// read and the project's forge credential, which a tracker of the
+    /// read, the set [`Kind::secret_set`] declares, and the project's forge
+    /// credential, which a tracker of the
     /// forge's own reaches it with (OWL-535): the error says what the
     /// project file or the keychain lacks.
     fn opener<'a>(
@@ -228,10 +234,10 @@ pub fn keychain_set<T>(
     repo: &Repo,
     look: &mut Lookup<'_, T>,
 ) -> Result<Option<TrackerSecrets<T>>, String> {
-    if of(config.tracker.kind).secret_specs().is_empty() {
-        return Ok(None);
-    }
-    crate::secrets::tracker(repo, look).map(Some)
+    of(config.tracker.kind)
+        .secret_set()
+        .map(|set| crate::secrets::tracker(repo, set, look))
+        .transpose()
 }
 
 /// What `owlshift doctor` asks of the project's tracker over the network,
@@ -360,6 +366,17 @@ pub const LINEAR_APP_ID_ACCOUNT: &str = "linear-app-client-id";
 /// The shared keychain account of that app's client secret.
 pub const LINEAR_APP_SECRET_ACCOUNT: &str = "linear-app-client-secret";
 
+/// The Linear kind's keychain set ([`Kind::secret_set`]): its API key and
+/// its app's client ID and secret, read whole from one place.
+pub static LINEAR_SECRETS: SecretSet = SecretSet {
+    name: "the Linear key and app",
+    entries: &[
+        LINEAR_ACCOUNT,
+        LINEAR_APP_ID_ACCOUNT,
+        LINEAR_APP_SECRET_ACCOUNT,
+    ],
+};
+
 /// The Linear adapter, with the API key of the tracker set `secrets`:
 /// `owlshift do` reads the ticket with it and hands it to the
 /// [writer](crate::writer); `owlshift init` stores the key.
@@ -375,11 +392,11 @@ pub const LINEAR_APP_SECRET_ACCOUNT: &str = "linear-app-client-secret";
 /// Every refusal is lasting but a Linear that did not answer the token's
 /// request, which a restart may mend (OWL-435, [`Refusal`]).
 pub fn linear(secrets: &TrackerSecrets<Secret>, team: &str) -> Result<LinearTracker, Refusal> {
-    let Some(key) = &secrets.key else {
+    let Some(key) = secrets.get(LINEAR_ACCOUNT) else {
         return Err(format!(
             "no Linear API key in the system keychain: run `owlshift init` in a terminal, or \
              store one under service `{SERVICE}`, account `{}`",
-            secrets.accounts.key
+            secrets.accounts.of(LINEAR_ACCOUNT)
         )
         .into());
     };
@@ -461,7 +478,8 @@ impl fmt::Display for AppError {
                         "fix the app, run `owlshift init --replace-secrets` to store other \
                          credentials, or delete both of the app's keychain entries (service \
                          `{SERVICE}`, accounts `{}` and `{}`) to write through the API key",
-                        accounts.app_id, accounts.app_secret
+                        accounts.of(LINEAR_APP_ID_ACCOUNT),
+                        accounts.of(LINEAR_APP_SECRET_ACCOUNT)
                     ),
                     Source::Shared => write!(f, "fix the app, or {SHARED_FIX}"),
                 }
@@ -486,25 +504,31 @@ pub fn app_credentials(
         missing: missing.to_owned(),
         source: accounts.source,
     };
-    match (&secrets.app_id, &secrets.app_secret) {
+    match (
+        secrets.get(LINEAR_APP_ID_ACCOUNT),
+        secrets.get(LINEAR_APP_SECRET_ACCOUNT),
+    ) {
         (None, None) => Ok(None),
         (Some(id), Some(secret)) => Ok(Some(ClientCredentials::new(id.expose(), secret.expose()))),
-        (Some(_), None) => Err(incomplete(&accounts.app_secret)),
-        (None, Some(_)) => Err(incomplete(&accounts.app_id)),
+        (Some(_), None) => Err(incomplete(accounts.of(LINEAR_APP_SECRET_ACCOUNT))),
+        (None, Some(_)) => Err(incomplete(accounts.of(LINEAR_APP_ID_ACCOUNT))),
     }
 }
 
-/// The tracker set stored under `accounts`, each entry read once.
+/// The tracker set stored under `accounts`, each entry read once, in the
+/// set's order.
 pub fn read(
     keychain: &Keychain,
     accounts: &TrackerAccounts,
 ) -> Result<TrackerSecrets<Secret>, String> {
-    let read = |account: &str| keychain.read(account).map_err(|error| error.to_string());
+    let values = accounts
+        .accounts
+        .iter()
+        .map(|account| keychain.read(account).map_err(|error| error.to_string()))
+        .collect::<Result<_, _>>()?;
     Ok(TrackerSecrets {
-        key: read(&accounts.key)?,
-        app_id: read(&accounts.app_id)?,
-        app_secret: read(&accounts.app_secret)?,
         accounts: accounts.clone(),
+        values,
     })
 }
 
@@ -521,8 +545,8 @@ pub fn linear_app_user(
     let Some(credentials) = app_credentials(&secrets)? else {
         return Ok(None);
     };
-    let key = secrets.key.ok_or_else(|| AppError::NoKey {
-        account: accounts.key.clone(),
+    let key = secrets.get(LINEAR_ACCOUNT).ok_or_else(|| AppError::NoKey {
+        account: accounts.of(LINEAR_ACCOUNT).to_owned(),
     })?;
     open_app(
         LinearTracker::new(ApiKey::new(key.expose())),
@@ -638,7 +662,7 @@ pub fn github_facts(
 
 fn read_key(keychain: &Keychain, accounts: &TrackerAccounts) -> Result<Option<ApiKey>, String> {
     keychain
-        .read(&accounts.key)
+        .read(accounts.of(LINEAR_ACCOUNT))
         .map(|key| key.map(|key| ApiKey::new(key.expose())))
         .map_err(|error| error.to_string())
 }
@@ -651,7 +675,7 @@ mod tests {
     use super::*;
 
     fn own() -> TrackerAccounts {
-        TrackerAccounts::project(&Repo::parse("pitchopp/owlshift").unwrap())
+        TrackerAccounts::project(&Repo::parse("pitchopp/owlshift").unwrap(), &LINEAR_SECRETS)
     }
 
     /// A kind's name is the value `[tracker].kind` takes for it, and the
@@ -668,6 +692,33 @@ mod tests {
             let lines = of(kind).project_file_lines(Some("OWL")).unwrap();
             assert!(lines.contains(&format!("kind = \"{name}\"")), "{lines}");
         }
+    }
+
+    /// OWL-544: each kind's secrets are entries of the set it declares, and
+    /// a kind declares a set exactly when it has secrets, so that
+    /// [`keychain_set`] looks no account up for a kind with none.
+    #[test]
+    fn each_kind_reads_the_set_it_declares() {
+        for kind in [
+            TrackerKind::Linear,
+            TrackerKind::Markdown,
+            TrackerKind::Github,
+        ] {
+            let kind = of(kind);
+            let specs = kind.secret_specs();
+            assert_eq!(
+                kind.secret_set().is_none(),
+                specs.is_empty(),
+                "{}",
+                kind.name()
+            );
+            if let Some(set) = kind.secret_set() {
+                for spec in specs {
+                    assert!(set.entries.contains(&spec.account), "{}", spec.account);
+                }
+            }
+        }
+        assert_eq!(of(TrackerKind::Linear).secret_set(), Some(&LINEAR_SECRETS));
     }
 
     /// OWL-537: `init` asks a Linear project's tracker with the key it
@@ -760,12 +811,14 @@ mod tests {
         );
 
         keychain
-            .store(&own().key, &Secret::new("lin_api_test"))
+            .store(own().of(LINEAR_ACCOUNT), &Secret::new("lin_api_test"))
             .unwrap();
         assert!(linear(&read(&keychain, &own()).unwrap(), "OWL").is_ok());
         // The shared account is another entry.
         assert_eq!(
-            read(&keychain, &TrackerAccounts::shared()).unwrap().key,
+            read(&keychain, &TrackerAccounts::shared(&LINEAR_SECRETS))
+                .unwrap()
+                .get(LINEAR_ACCOUNT),
             None
         );
     }
@@ -782,24 +835,24 @@ mod tests {
         assert_eq!(linear_app_user(&keychain, &accounts, "OWL"), Ok(None));
 
         keychain
-            .store(&accounts.app_id, &Secret::new(SENTINEL))
+            .store(accounts.of(LINEAR_APP_ID_ACCOUNT), &Secret::new(SENTINEL))
             .unwrap();
         assert_eq!(
             app_credentials(&set()).unwrap_err(),
             AppError::Incomplete {
-                missing: accounts.app_secret.clone(),
+                missing: accounts.of(LINEAR_APP_SECRET_ACCOUNT).to_owned(),
                 source: Source::Project,
             }
         );
         assert_eq!(
             linear_app_user(&keychain, &accounts, "OWL"),
             Err(AppError::Incomplete {
-                missing: accounts.app_secret.clone(),
+                missing: accounts.of(LINEAR_APP_SECRET_ACCOUNT).to_owned(),
                 source: Source::Project,
             })
         );
         keychain
-            .store(&accounts.key, &Secret::new("lin_api_test"))
+            .store(accounts.of(LINEAR_ACCOUNT), &Secret::new("lin_api_test"))
             .unwrap();
         let refused = linear(&set(), "OWL").unwrap_err();
         assert!(refused.lasting(), "{refused}");
@@ -810,19 +863,22 @@ mod tests {
         );
         assert!(!refused.contains("SENTINEL"), "{refused}");
 
-        keychain.delete(&accounts.app_id).unwrap();
+        keychain.delete(accounts.of(LINEAR_APP_ID_ACCOUNT)).unwrap();
         keychain
-            .store(&accounts.app_secret, &Secret::new(SENTINEL))
+            .store(
+                accounts.of(LINEAR_APP_SECRET_ACCOUNT),
+                &Secret::new(SENTINEL),
+            )
             .unwrap();
         assert_eq!(
             app_credentials(&set()).unwrap_err(),
             AppError::Incomplete {
-                missing: accounts.app_id.clone(),
+                missing: accounts.of(LINEAR_APP_ID_ACCOUNT).to_owned(),
                 source: Source::Project,
             }
         );
         keychain
-            .store(&accounts.app_id, &Secret::new(SENTINEL))
+            .store(accounts.of(LINEAR_APP_ID_ACCOUNT), &Secret::new(SENTINEL))
             .unwrap();
         let both = format!("{:?}", app_credentials(&set()).unwrap().unwrap());
         assert!(!both.contains("SENTINEL"), "{both}");
@@ -848,7 +904,7 @@ mod tests {
         for shared in [
             AppError::Tracker {
                 error,
-                accounts: TrackerAccounts::shared(),
+                accounts: TrackerAccounts::shared(&LINEAR_SECRETS),
             },
             AppError::Incomplete {
                 missing: LINEAR_APP_SECRET_ACCOUNT.to_owned(),

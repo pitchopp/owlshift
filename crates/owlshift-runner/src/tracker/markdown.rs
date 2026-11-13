@@ -15,7 +15,7 @@ use owlshift_platform::keychain::Secret;
 use super::{Connected, Doctored, ForgeCredential, Kind, Opener, Setup, StatesError};
 use crate::doctor::{Check, DOES_NOT_BLOCK, Section};
 use crate::init::SecretSpec;
-use crate::secrets::{TrackerAccounts, TrackerSecrets};
+use crate::secrets::{SecretSet, TrackerAccounts, TrackerSecrets};
 use crate::system::System;
 use crate::ui::reply::Key;
 
@@ -32,6 +32,11 @@ impl Kind for Markdown {
 
     fn secret_specs(&self) -> &'static [SecretSpec] {
         &[]
+    }
+
+    /// None: the tickets are files of the checkout.
+    fn secret_set(&self) -> Option<&'static SecretSet> {
+        None
     }
 
     fn project_file_lines(&self, _team: Option<&str>) -> Result<String, String> {

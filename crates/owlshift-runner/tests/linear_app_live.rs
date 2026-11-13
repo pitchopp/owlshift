@@ -58,7 +58,7 @@ use owlshift_contracts::review::{Plan, PlanChange, PlanStep};
 use owlshift_platform::keychain::{Keychain, Secret};
 use owlshift_runner::secrets::TrackerAccounts;
 use owlshift_runner::tracker::{
-    LINEAR_ACCOUNT, LINEAR_APP_ID_ACCOUNT, LINEAR_APP_SECRET_ACCOUNT, linear, read,
+    LINEAR_ACCOUNT, LINEAR_APP_ID_ACCOUNT, LINEAR_APP_SECRET_ACCOUNT, LINEAR_SECRETS, linear, read,
 };
 use owlshift_runner::writer::{
     MAX_COMMENT_CHARS, MAX_POINTER_CHARS, PlanDocument, PlanNext, PlanPointer, QuestionsComment,
@@ -210,7 +210,7 @@ fn a_question_round_through_the_app_reaches_its_decider() {
             .store(account, &Secret::new(value.as_str()))
             .unwrap();
     }
-    let stored = read(&keychain, &TrackerAccounts::shared()).unwrap();
+    let stored = read(&keychain, &TrackerAccounts::shared(&LINEAR_SECRETS)).unwrap();
     let tracker = linear(&stored, TEAM).unwrap_or_else(|e| panic!("{e}"));
     println!("tracker opened with the app: ok");
 
@@ -460,7 +460,7 @@ fn a_maximal_question_round_reaches_linear_in_parts() {
             .store(account, &Secret::new(value.as_str()))
             .unwrap();
     }
-    let stored = read(&keychain, &TrackerAccounts::shared()).unwrap();
+    let stored = read(&keychain, &TrackerAccounts::shared(&LINEAR_SECRETS)).unwrap();
     let tracker = linear(&stored, TEAM).unwrap_or_else(|e| panic!("{e}"));
     let round = maximal_round(ticket.clone());
     let whole = round.render().chars().count();
@@ -586,7 +586,7 @@ fn a_plan_document_reaches_linear_through_the_app() {
             .store(account, &Secret::new(value.as_str()))
             .unwrap();
     }
-    let stored = read(&keychain, &TrackerAccounts::shared()).unwrap();
+    let stored = read(&keychain, &TrackerAccounts::shared(&LINEAR_SECRETS)).unwrap();
     let tracker = linear(&stored, TEAM).unwrap_or_else(|e| panic!("{e}"));
     let writer = Writer::new(&tracker);
     let plan = |approach: &str| PlanDocument {
