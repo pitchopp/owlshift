@@ -361,6 +361,12 @@ fn a_command_the_binary_lacks_is_refused() {
     assert!(refused("owlshift logs --last N").is_some());
     assert!(refused("owlshift watch --drain --served acme/web").is_some());
     assert!(refused("owlshift do DEMO-1 DEMO-2").is_some());
+    // An option shown without its value is no command, unlike an omitted
+    // positional.
+    assert!(refused("owlshift logs --last").is_some());
+    assert!(refused("owlshift init --tracker").is_some());
+    assert!(refused("owlshift cancel DEMO-1 --reason").is_some());
+    assert!(refused("owlshift gate --at").is_some());
     // Shown without what it needs, in a sentence: still a command.
     assert_eq!(refused("owlshift do"), None);
     assert_eq!(refused("owlshift config"), None);
