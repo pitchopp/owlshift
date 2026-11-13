@@ -7,15 +7,16 @@
 # One pull request carries every form, each naming an issue of its own (a victim), and ends with `Closes #T`, T the
 # run's target. It is squash-merged with a commit message of the probe's own, which names no issue, so that only the
 # body can close one. Then each issue is read: a victim still open is a form GitHub ignores. Controls: the plain forms
-# (`Fixes #n`, `Fixes owner/repo#n`, `Fixes <issue URL>`) must close their victims, and T must close, or the run
-# proves nothing. Who opens and merges the pull request does not change how GitHub reads its body: the run goes
+# (`Fixes #n`, `Fixes owner/repo#n`, `Fixes <issue URL>`, `Closes #n`, `Resolves #n`) must close their victims, and T must close, or the run
+# proves nothing. The "shipped" rows are the form the runner writes (U+200B after the keyword's second letter),
+# for each of GitHub's nine keywords. Who opens and merges the pull request does not change how GitHub reads its body: the run goes
 # through the person's own `gh` login, not the app's token (G5 settled that a pull request the token opens closes
 # its issue alike).
 #
 #   bash docs/design/live-checks/owl-556.sh pitchopp/owlshift-live-sandbox      (--help: what it does)
 #
 # Needs bash (3.2 is enough), jq, and gh signed in (gh auth status) as an account that can write the sandbox's issues
-# and contents and merge its pull requests. It runs alone in about 2 minutes. It creates on the sandbox 17 issues, a
+# and contents and merge its pull requests. It runs alone in about 2 minutes. It creates on the sandbox 30 issues, a
 # branch `owl-556-probe-<time>` with one file, and a pull request, which it squash-merges into the default branch;
 # then it deletes the branch, removes the file from the default branch in a commit of its own, and closes as not
 # planned every issue the merge left open. It refuses pitchopp/owlshift. The report, on standard output, holds no
@@ -48,6 +49,19 @@ FORM_NAME=(
     "control: Fixes <issue URL>"
     "code span: \`Fixes <issue URL>\`"
     "zero-width space inside the keyword, <issue URL>"
+    "control: Closes #n"
+    "control: Resolves #n"
+    "shipped: fi<U+200B>x #n"
+    "shipped: fi<U+200B>xes #n"
+    "shipped: fi<U+200B>xed #n"
+    "shipped: cl<U+200B>ose #n"
+    "shipped: cl<U+200B>oses #n"
+    "shipped: cl<U+200B>osed #n"
+    "shipped: re<U+200B>solve #n"
+    "shipped: re<U+200B>solves #n"
+    "shipped: re<U+200B>solved #n"
+    "zero-width space (U+200B) before the keyword"
+    "zero-width space (U+200B) between the keyword and the space"
 )
 FORM_JQ=(
     '"Fixes #\($n)"'
@@ -66,8 +80,21 @@ FORM_JQ=(
     '"Fixes \($u)"'
     '"`Fixes \($u)`"'
     '"Fix\u200bes \($u)"'
+    '"Closes #\($n)"'
+    '"Resolves #\($n)"'
+    '"Fi\u200bx #\($n)"'
+    '"Fi\u200bxes #\($n)"'
+    '"Fi\u200bxed #\($n)"'
+    '"Cl\u200bose #\($n)"'
+    '"Cl\u200boses #\($n)"'
+    '"Cl\u200bosed #\($n)"'
+    '"Re\u200bsolve #\($n)"'
+    '"Re\u200bsolves #\($n)"'
+    '"Re\u200bsolved #\($n)"'
+    '"\u200bFixes #\($n)"'
+    '"Fixes\u200b #\($n)"'
 )
-CONTROLS=(0 10 13)
+CONTROLS=(0 10 13 16 17)
 
 usage() {
     cat <<EOF
