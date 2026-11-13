@@ -1,7 +1,8 @@
-//! The answers below follow GitHub's documented shapes and G1's observed
-//! statuses (2026-11-12). `GET user/<id>` and a create refused for a name
-//! that exists are `synthesized`: this session's proxy refuses paths outside
-//! a repository, so they wait on `docs/design/live-checks/owl-537.sh`.
+//! The answers below follow G1's observed statuses (2026-11-12) and
+//! `docs/design/live-checks/owl-537.sh`'s run of 2026-11-13: `GET user/<id>`
+//! answers 200 with the account, or 404 `Not Found` for an id GitHub does not
+//! know; a label created again, in the same case or another, answers 422
+//! `Validation Failed`, error code `already_exists`.
 
 use serde_json::{Value, json};
 
@@ -116,7 +117,7 @@ fn only_the_missing_labels_are_created_and_a_second_run_creates_none() {
 
 /// A create refused as invalid is read again: a label made meanwhile is
 /// taken; one still missing fails naming it. A refused token is not read
-/// again and keeps its own error, which names Issues. (synthesized)
+/// again and keeps its own error, which names Issues.
 #[test]
 fn a_refused_create_is_taken_only_when_the_label_is_there_after_all() {
     let exists = json!({
@@ -161,7 +162,7 @@ fn a_refused_create_is_taken_only_when_the_label_is_there_after_all() {
 
 /// The signed-in account's numeric id; each admitter asked by its id: a
 /// person, a bot, an account GitHub does not know, and a name that is no
-/// id, which is not asked. (`user/<id>` synthesized)
+/// id, which is not asked.
 #[test]
 fn the_signed_in_account_and_the_admitters_are_read_by_id() {
     let canned = Canned::default()
