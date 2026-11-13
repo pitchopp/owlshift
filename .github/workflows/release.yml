@@ -10,7 +10,8 @@ name: Release
 # is published, formula.yml commits it as Formula/owlshift.rb on main (build
 # plan, "P9 · Open-source readiness", part 10; OWL-549).
 # OWL-548: each archive also holds THIRD-PARTY-NOTICES.txt, the licences of
-# the crates and fonts its binary carries, which `notices` writes with
+# the crates, fonts, Rust standard library and (Linux) musl its binary
+# carries (OWL-551), which `notices` writes with
 # cargo-about; a crate under a licence scripts/release/about.toml does not
 # accept stops the release before any build.
 #
