@@ -545,6 +545,9 @@ fn exit_code(success: bool) -> ExitCode {
 }
 
 #[cfg(test)]
+mod doc_commands;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
