@@ -1,8 +1,9 @@
 #!/bin/sh
 # Prints the Homebrew formula of release VERSION from the release's
 # SHA256SUMS (OWL-540). The repository is its own tap: once a release is
-# published, the maintainer commits this output as Formula/owlshift.rb on
-# main (CONTRIBUTING.md, "Releasing"), and people install with the lines
+# published, .github/workflows/formula.yml commits this output as
+# Formula/owlshift.rb on main (OWL-549, CONTRIBUTING.md, "Releasing"), after
+# formula-verify.sh has verified the release, and people install with the lines
 # below. Homebrew loads no formula of a tap it was not told to trust
 # (R1, build plan), hence the second one.
 #

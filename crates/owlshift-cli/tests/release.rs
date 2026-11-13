@@ -1,6 +1,8 @@
 //! The release (OWL-540): the guards of `release.yml`, which only a tag
-//! runs; the tag's check; the Homebrew formula; the Linux install script.
-//! The scripts are run with `sh`, as the workflow and a user run them.
+//! runs; the tag's check; the Homebrew formula; the Linux install script;
+//! and (OWL-549) the guards of `formula.yml`, which only a published release
+//! runs, with the scripts that verify the release and commit its formula.
+//! The scripts are run with `sh`, as the workflows and a user run them.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -445,4 +447,302 @@ fn the_notices_hold_the_crates_and_the_fonts_or_nothing() {
             .count(),
         0
     );
+}
+
+/// `formula.yml` (OWL-549), which only a published release runs: it commits
+/// the formula on main with no review, so its guards are pinned here. The
+/// release is verified with a read-only token; the job that writes is the
+/// only one with `contents: write`, holds no secret and runs the commit
+/// script, which never force-pushes.
+#[test]
+fn the_formula_workflow_keeps_its_guards() {
+    // A Windows checkout may have CRLF line endings.
+    let workflow = read(".github/workflows/formula.yml").replace("\r\n", "\n");
+    let lines: Vec<&str> = workflow.lines().map(str::trim).collect();
+    for guard in [
+        "types: [published]",
+        "if: ${{ !github.event.release.prerelease }}",
+        "status=$(gh api \"repos/$GITHUB_REPOSITORY/compare/main...$GITHUB_SHA\" --jq .status)",
+        "sh scripts/release/formula-verify.sh \"$VERSION\" \"$RUNNER_TEMP/release\"",
+        "needs: formula",
+        "printf '%s\\n' \"$FORMULA\" > \"$RUNNER_TEMP/owlshift.rb\"",
+        "sh scripts/release/formula-commit.sh \"$VERSION\" \"$RUNNER_TEMP/owlshift.rb\" \"$GITHUB_REPOSITORY\"",
+    ] {
+        assert!(lines.contains(&guard), "formula.yml lost `{guard}`");
+    }
+    let top = workflow.split("\njobs:").next().unwrap();
+    assert!(top.contains("\npermissions:\n  contents: read\n"), "{top}");
+    let jobs = jobs(&workflow);
+    let holding = |text: &str| -> Vec<&str> {
+        jobs.iter()
+            .filter(|(_, body)| body.contains(text))
+            .map(|(name, _)| name.as_str())
+            .collect()
+    };
+    assert_eq!(holding("contents: write"), ["commit"]);
+    assert_eq!(holding("formula-verify.sh"), ["formula"]);
+    assert_eq!(holding("formula-commit.sh"), ["commit"]);
+    let code: Vec<&str> = lines
+        .iter()
+        .copied()
+        .filter(|line| !line.starts_with('#'))
+        .collect();
+    for banned in ["secrets.", "git push", "--force", "pull_request"] {
+        assert!(
+            !code.iter().any(|line| line.contains(banned)),
+            "formula.yml uses `{banned}`"
+        );
+    }
+    let commit = read("scripts/release/formula-commit.sh");
+    assert!(
+        !commit.contains("git "),
+        "the commit goes through the API alone"
+    );
+}
+
+/// Writes an executable stand-in for a command into `bin`.
+#[cfg(unix)]
+fn stand_in(bin: &Path, name: &str, body: &str) {
+    use std::os::unix::fs::PermissionsExt;
+
+    let file = bin.join(name);
+    fs::write(&file, format!("#!/bin/sh\n{body}")).unwrap();
+    fs::set_permissions(&file, fs::Permissions::from_mode(0o755)).unwrap();
+}
+
+/// `formula-verify.sh` on a copy of a release served from files, with a
+/// stand-in `minisign`: it renders the formula only when the signature
+/// verifies, its trusted comment names the version, and each macOS archive
+/// has the checksum SHA256SUMS lists; otherwise it leaves no formula.
+#[cfg(unix)]
+#[test]
+fn the_formula_is_rendered_only_from_a_release_that_verifies() {
+    use sha2::{Digest, Sha256};
+
+    let script = root().join("scripts/release/formula-verify.sh");
+    let dir = tempfile::tempdir().unwrap();
+    let bin = dir.path().join("bin");
+    fs::create_dir(&bin).unwrap();
+    // Records its arguments, prints the trusted comment FAKE_COMMENT, or
+    // fails when FAKE_FAIL is set.
+    stand_in(
+        &bin,
+        "minisign",
+        "printf '%s\\n' \"$@\" > \"$FAKE_ARGS\"\n\
+         [ -z \"${FAKE_FAIL:-}\" ] || exit 1\n\
+         printf '%s\\n' \"$FAKE_COMMENT\"\n",
+    );
+    let release = dir.path().join("releases/v0.1.0");
+    fs::create_dir_all(&release).unwrap();
+    let mut sums = String::new();
+    for target in [
+        "aarch64-apple-darwin",
+        "aarch64-unknown-linux-musl",
+        "x86_64-apple-darwin",
+        "x86_64-unknown-linux-musl",
+    ] {
+        let archive = format!("owlshift-0.1.0-{target}.tar.gz");
+        let bytes = format!("archive of {target}");
+        fs::write(release.join(&archive), &bytes).unwrap();
+        let digest: String = Sha256::digest(bytes.as_bytes())
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
+        sums.push_str(&format!("{digest}  {archive}\n"));
+    }
+    fs::write(release.join("SHA256SUMS"), &sums).unwrap();
+    fs::write(release.join("SHA256SUMS.minisig"), "signature\n").unwrap();
+    let path = format!("{}:{}", bin.display(), std::env::var("PATH").unwrap());
+    let releases = format!("file://{}", dir.path().join("releases").display());
+    let args = dir.path().join("args");
+    let out = dir.path().join("out");
+    let run = |version: &str, comment: &str, fail: &str| {
+        sh(
+            &script,
+            &[version, out.to_str().unwrap()],
+            &[
+                ("PATH", path.as_str()),
+                ("OWLSHIFT_RELEASES_URL", releases.as_str()),
+                ("FAKE_ARGS", args.to_str().unwrap()),
+                ("FAKE_COMMENT", comment),
+                ("FAKE_FAIL", fail),
+            ],
+        )
+    };
+    let formula = out.join("owlshift.rb");
+
+    let verified = run("0.1.0", "owlshift 0.1.0", "");
+    assert!(verified.status.success(), "{}", text(&verified.stderr));
+    let recorded = fs::read_to_string(&args).unwrap();
+    let recorded: Vec<&str> = recorded.lines().collect();
+    assert_eq!(recorded[..3], ["-V", "-Q", "-p"], "{recorded:?}");
+    assert!(recorded[3].ends_with("/minisign.pub"), "{recorded:?}");
+    assert_eq!(
+        recorded[4..],
+        ["-m", out.join("SHA256SUMS").to_str().unwrap()]
+    );
+    let rendered = fs::read_to_string(&formula).unwrap();
+    assert!(rendered.contains("  version \"0.1.0\"\n"), "{rendered}");
+    assert!(rendered.contains(&sums[..64]), "{rendered}");
+
+    let mut refusals = vec![
+        (run("0.1", "owlshift 0.1", ""), "'0.1' is not a version"),
+        (
+            run("0.1.0", "owlshift 0.1.0", "1"),
+            "does not verify with minisign.pub",
+        ),
+        (
+            run("0.1.0", "owlshift 0.0.9", ""),
+            "signed as 'owlshift 0.0.9', not 'owlshift 0.1.0'",
+        ),
+    ];
+    fs::write(
+        release.join("owlshift-0.1.0-x86_64-apple-darwin.tar.gz"),
+        "another archive",
+    )
+    .unwrap();
+    refusals.push((
+        run("0.1.0", "owlshift 0.1.0", ""),
+        "owlshift-0.1.0-x86_64-apple-darwin.tar.gz has the checksum",
+    ));
+    for (refused, reason) in refusals {
+        assert!(!refused.status.success());
+        assert!(
+            text(&refused.stderr).contains(reason),
+            "{}",
+            text(&refused.stderr)
+        );
+        assert!(!formula.exists(), "no formula is left behind: {reason}");
+    }
+}
+
+/// `formula-commit.sh` with a stand-in `gh` holding main's formula: one
+/// commit through the contents API on main, by the Actions bot and signed
+/// off by it, guarded by the blob it read; nothing when main already has
+/// this formula or a newer one; one more try when main's formula changed in
+/// between, and none for any other refusal.
+#[cfg(unix)]
+#[test]
+fn the_formula_is_committed_on_main_once_and_never_backwards() {
+    let script = root().join("scripts/release/formula-commit.sh");
+    let dir = tempfile::tempdir().unwrap();
+    let bin = dir.path().join("bin");
+    fs::create_dir(&bin).unwrap();
+    // A read prints the blob and the content of $FAKE/main.rb, or a 404; the
+    // Nth write records its arguments and decodes its content, failing with
+    // $FAKE/refusal.N when there is one.
+    stand_in(
+        &bin,
+        "gh",
+        "case \"$*\" in\n\
+         *'--method PUT'*)\n\
+         \x20   n=$(($(cat \"$FAKE/writes\" 2>/dev/null || echo 0) + 1))\n\
+         \x20   echo \"$n\" > \"$FAKE/writes\"\n\
+         \x20   printf '%s\\n' \"$@\" > \"$FAKE/args.$n\"\n\
+         \x20   if [ -f \"$FAKE/refusal.$n\" ]; then cat \"$FAKE/refusal.$n\" >&2; exit 1; fi\n\
+         \x20   for arg in \"$@\"; do\n\
+         \x20       case $arg in content=*) printf '%s' \"${arg#content=}\" | base64 -d > \"$FAKE/main.rb\" ;; esac\n\
+         \x20   done\n\
+         \x20   echo 0123abcd ;;\n\
+         *)\n\
+         \x20   if [ ! -f \"$FAKE/main.rb\" ]; then echo 'gh: Not Found (HTTP 404)' >&2; exit 1; fi\n\
+         \x20   echo blob1\n\
+         \x20   base64 < \"$FAKE/main.rb\" ;;\n\
+         esac\n",
+    );
+    let path = format!("{}:{}", bin.display(), std::env::var("PATH").unwrap());
+    let formula_of =
+        |version: &str| format!("class Owlshift < Formula\n  version \"{version}\"\nend\n");
+    let formula = dir.path().join("owlshift.rb");
+    fs::write(&formula, formula_of("0.2.0")).unwrap();
+    let fake = dir.path().join("fake");
+    let run = |main: Option<String>, refusals: &[&str]| {
+        let _ = fs::remove_dir_all(&fake);
+        fs::create_dir(&fake).unwrap();
+        if let Some(main) = main {
+            fs::write(fake.join("main.rb"), main).unwrap();
+        }
+        for (n, refusal) in refusals.iter().enumerate() {
+            fs::write(fake.join(format!("refusal.{}", n + 1)), refusal).unwrap();
+        }
+        let output = sh(
+            &script,
+            &["0.2.0", formula.to_str().unwrap(), "pitchopp/owlshift"],
+            &[("PATH", path.as_str()), ("FAKE", fake.to_str().unwrap())],
+        );
+        let count = fs::read_to_string(fake.join("writes"))
+            .map_or(0, |n| n.trim().parse::<usize>().unwrap());
+        let writes: Vec<String> = (1..=count)
+            .map(|n| fs::read_to_string(fake.join(format!("args.{n}"))).unwrap())
+            .collect();
+        let main = fs::read_to_string(fake.join("main.rb")).ok();
+        (output, writes, main)
+    };
+
+    // No formula on main yet: one write, with no blob to guard.
+    let (output, writes, main) = run(None, &[]);
+    assert!(output.status.success(), "{}", text(&output.stderr));
+    assert_eq!(writes.len(), 1);
+    let args: Vec<&str> = writes[0].lines().collect();
+    for wanted in [
+        "repos/pitchopp/owlshift/contents/Formula/owlshift.rb",
+        "branch=main",
+        "author[name]=github-actions[bot]",
+        "author[email]=41898282+github-actions[bot]@users.noreply.github.com",
+    ] {
+        assert!(args.contains(&wanted), "{args:?}");
+    }
+    assert!(!args.iter().any(|arg| arg.starts_with("sha=")), "{args:?}");
+    let signed_off = "\nSigned-off-by: github-actions[bot] \
+                      <41898282+github-actions[bot]@users.noreply.github.com>\n";
+    assert!(
+        writes[0].contains("message=Update the Homebrew formula to 0.2.0\n")
+            && writes[0].contains(signed_off),
+        "{}",
+        writes[0]
+    );
+    assert_eq!(main.unwrap(), formula_of("0.2.0"));
+
+    // The same formula, or a newer one, on main: nothing written.
+    for on_main in [formula_of("0.2.0"), formula_of("0.10.0")] {
+        let (output, writes, _) = run(Some(on_main.clone()), &[]);
+        assert!(output.status.success(), "{}", text(&output.stderr));
+        assert!(writes.is_empty(), "{on_main}");
+        assert!(
+            text(&output.stdout).starts_with("::notice::"),
+            "{}",
+            text(&output.stdout)
+        );
+    }
+
+    // An older one: replaced, guarded by its blob, once more after a 409.
+    let (output, writes, main) = run(Some(formula_of("0.1.9")), &["gh: Conflict (HTTP 409)"]);
+    assert!(output.status.success(), "{}", text(&output.stderr));
+    assert_eq!(writes.len(), 2);
+    assert!(
+        writes[1].lines().any(|arg| arg == "sha=blob1"),
+        "{}",
+        writes[1]
+    );
+    assert_eq!(main.unwrap(), formula_of("0.2.0"));
+
+    // Refused twice for a changed formula, or once for anything else: it
+    // fails, saying why.
+    for (refusals, tries, reason) in [
+        (
+            &["HTTP 409", "gh: Unprocessable (HTTP 422)"][..],
+            2,
+            "HTTP 422",
+        ),
+        (&["gh: Forbidden (HTTP 403)"][..], 1, "HTTP 403"),
+    ] {
+        let (output, writes, _) = run(Some(formula_of("0.1.9")), refusals);
+        assert!(!output.status.success());
+        assert_eq!(writes.len(), tries, "{reason}");
+        assert!(
+            text(&output.stderr).contains(reason),
+            "{}",
+            text(&output.stderr)
+        );
+    }
 }

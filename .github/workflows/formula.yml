@@ -1,0 +1,103 @@
+name: Formula
+
+# OWL-549: once the maintainer publishes a release, commit its Homebrew
+# formula as Formula/owlshift.rb on main, so `brew install owlshift` from the
+# tap installs it with no hand edit (CONTRIBUTING.md, "Releasing"). The
+# maintainer's decision on OWL-549, 2026-11-12, as the CI-settings floor of
+# architecture section 8 requires: a direct commit with the workflow's own
+# token, no pull request, so nobody reviews the formula before users get it
+# and no CI runs on that commit. What guards it is the signed SHA256SUMS:
+# `formula` verifies the release's signature and its archives before
+# anything is written (scripts/release/formula-verify.sh). The commit relies
+# on main having no branch protection that refuses the Actions bot; if one is
+# added, `commit` fails visibly.
+#
+# A run reads this file, the scripts and minisign.pub at the release's tag,
+# which `formula` requires to be a commit of main. `formula` holds a
+# read-only token and downloads the release; `commit` alone writes, runs
+# nothing it downloads and changes Formula/owlshift.rb only
+# (scripts/release/formula-commit.sh). A prerelease leaves the tap alone. A
+# failed run is retried with "Re-run failed jobs", which keeps the release.
+
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: formula
+  cancel-in-progress: false
+
+env:
+  TAG: ${{ github.event.release.tag_name }}
+
+jobs:
+  formula:
+    name: formula
+    if: ${{ !github.event.release.prerelease }}
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      formula: ${{ steps.formula.outputs.formula }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Require a tag of main
+        id: version
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          status=$(gh api "repos/$GITHUB_REPOSITORY/compare/main...$GITHUB_SHA" --jq .status)
+          if [ "$status" != identical ] && [ "$status" != behind ]; then
+            echo "::error::$TAG names $GITHUB_SHA, which is not a commit of main"
+            exit 1
+          fi
+          echo "version=${TAG#v}" >> "$GITHUB_OUTPUT"
+      - name: Install minisign
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq minisign
+      - name: Verify the release and render its formula
+        id: formula
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          sh scripts/release/formula-verify.sh "$VERSION" "$RUNNER_TEMP/release"
+          {
+            echo 'formula<<END_OF_FORMULA'
+            cat "$RUNNER_TEMP/release/owlshift.rb"
+            echo 'END_OF_FORMULA'
+          } >> "$GITHUB_OUTPUT"
+          {
+            echo "### Formula/owlshift.rb for $TAG"
+            echo
+            echo 'Its signature and its two archives verified; the job commit puts it on main.'
+            echo
+            echo '```ruby'
+            cat "$RUNNER_TEMP/release/owlshift.rb"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  commit:
+    name: commit
+    needs: formula
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      VERSION: ${{ needs.formula.outputs.version }}
+      FORMULA: ${{ needs.formula.outputs.formula }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # A job output loses the file's last newline.
+      - name: Commit the formula on main
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          printf '%s\n' "$FORMULA" > "$RUNNER_TEMP/owlshift.rb"
+          sh scripts/release/formula-commit.sh "$VERSION" "$RUNNER_TEMP/owlshift.rb" "$GITHUB_REPOSITORY"

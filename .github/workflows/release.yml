@@ -6,8 +6,9 @@ name: Release
 # per target, writes their SHA256SUMS, signs it with Owlshift's minisign key,
 # checks the signature with the repository's minisign.pub, and creates a
 # draft release holding them, which the maintainer checks and publishes. It
-# also renders the Homebrew formula the maintainer then commits as
-# Formula/owlshift.rb (build plan, "P9 · Open-source readiness", part 10).
+# also renders the Homebrew formula into the run's summary; once the release
+# is published, formula.yml commits it as Formula/owlshift.rb on main (build
+# plan, "P9 · Open-source readiness", part 10; OWL-549).
 # OWL-548: each archive also holds THIRD-PARTY-NOTICES.txt, the licences of
 # the crates and fonts its binary carries, which `notices` writes with
 # cargo-about; a crate under a licence scripts/release/about.toml does not
@@ -190,17 +191,12 @@ jobs:
           {
             echo '### Formula/owlshift.rb'
             echo
-            echo 'Commit it on main once the release is published (CONTRIBUTING.md, "Releasing").'
+            echo 'Once the release is published, formula.yml commits it on main (CONTRIBUTING.md, "Releasing").'
             echo
             echo '```ruby'
             cat formula/owlshift.rb
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
-      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
-        with:
-          name: homebrew-formula
-          path: formula/owlshift.rb
-          if-no-files-found: error
 
   sign:
     name: sign
