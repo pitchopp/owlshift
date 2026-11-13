@@ -11,6 +11,8 @@
 //! - [`reply`]: what the fake harness (`owlshift-fake-harness`) does in one
 //!   run.
 //! - [`harness`]: the fake harness as the executor drives it.
+//! - [`issues`]: GitHub's Issues API held in memory, for the GitHub Issues
+//!   tracker on the bench (OWL-536).
 //! - [`scenario`]: scenario files, their runner, and the stand-in driver that
 //!   runs roles through the executor and plays the writer until it exists.
 //! - [`step_child`]: a project whose steps run in a real child process, and
@@ -31,6 +33,7 @@ pub mod fixture_gate;
 pub mod gh;
 pub mod git;
 pub mod harness;
+pub mod issues;
 pub mod release;
 pub mod reply;
 pub mod scenario;

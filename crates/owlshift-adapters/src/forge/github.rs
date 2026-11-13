@@ -215,35 +215,12 @@ impl Transport for HttpTransport {
     }
 
     fn get(&self, path: &str) -> Result<RestAnswer, String> {
-        let answer = self
-            .agent
-            .get(&format!("{REST_API}{path}"))
-            .header("Authorization", &format!("bearer {}", self.token.0))
-            .header("Accept", "application/vnd.github+json")
-            .call()
-            .map_err(|e| redact(&e.to_string()))?;
-        let status = answer.status().as_u16();
-        let rate = rate_headers(answer.headers());
-        let location = header(answer.headers(), "location");
-        let answer = match redirect_target(status, location.as_deref())? {
-            // A fresh request through an agent that never held the token.
-            Some(target) => agent(Duration::from_secs(120))
-                .get(&target)
-                .call()
-                .map_err(|e| redact(&e.to_string()))?,
-            None => answer,
-        };
-        let status = answer.status().as_u16();
-        let body = answer
-            .into_body()
-            .into_with_config()
-            .limit(u64::MAX)
-            .reader();
-        Ok(RestAnswer {
-            status,
-            rate,
-            body: Box::new(body),
-        })
+        self.read(path, None)
+    }
+
+    /// A 304 is answered as it is, never read as a redirect (OWL-536).
+    fn get_if_none_match(&self, path: &str, etag: &str) -> Result<RestAnswer, String> {
+        self.read(path, Some(etag))
     }
 
     /// Puts `body` at `path`, the answer read whole to 1 MiB.
@@ -278,6 +255,52 @@ impl Transport for HttpTransport {
 }
 
 impl HttpTransport {
+    /// A REST read of `path`, conditional on `etag` when given: a redirect
+    /// is followed without the token, a 304 is the answer as it is.
+    fn read(&self, path: &str, etag: Option<&str>) -> Result<RestAnswer, String> {
+        let mut request = self
+            .agent
+            .get(&format!("{REST_API}{path}"))
+            .header("Authorization", &format!("bearer {}", self.token.0))
+            .header("Accept", "application/vnd.github+json");
+        if let Some(etag) = etag {
+            request = request.header("If-None-Match", etag);
+        }
+        let answer = request.call().map_err(|e| redact(&e.to_string()))?;
+        let status = answer.status().as_u16();
+        let rate = rate_headers(answer.headers());
+        let etag = header(answer.headers(), "etag");
+        if status == 304 {
+            return Ok(RestAnswer {
+                status,
+                rate,
+                etag,
+                body: Box::new(io::empty()),
+            });
+        }
+        let location = header(answer.headers(), "location");
+        let answer = match redirect_target(status, location.as_deref())? {
+            // A fresh request through an agent that never held the token.
+            Some(target) => agent(Duration::from_secs(120))
+                .get(&target)
+                .call()
+                .map_err(|e| redact(&e.to_string()))?,
+            None => answer,
+        };
+        let status = answer.status().as_u16();
+        let body = answer
+            .into_body()
+            .into_with_config()
+            .limit(u64::MAX)
+            .reader();
+        Ok(RestAnswer {
+            status,
+            rate,
+            etag,
+            body: Box::new(body),
+        })
+    }
+
     /// Sends `request`, a REST write, with `body` and reads the answer
     /// whole, to 1 MiB. A redirect is not followed: it is the answer, which
     /// a merge reads as no verdict (OWL-444).
@@ -433,6 +456,13 @@ impl Channel {
         self.via(|transport| transport.get(path), |answer| answer.status)
     }
 
+    fn get_if_none_match(&self, path: &str, etag: &str) -> Result<RestAnswer, Unanswered> {
+        self.via(
+            |transport| transport.get_if_none_match(path, etag),
+            |answer| answer.status,
+        )
+    }
+
     /// A REST write. A 401 ran nothing, so the app's retry is safe.
     fn write(&self, verb: Verb, path: &str, body: &Value) -> Result<Response, Unanswered> {
         self.via(
@@ -463,6 +493,8 @@ pub struct GitHubForge {
     channel: Channel,
     repo: Repo,
     check_page: u32,
+    /// The answers of the conditional reads, by path (OWL-536).
+    cache: Mutex<RestCache>,
 }
 
 impl fmt::Debug for GitHubForge {
@@ -497,6 +529,7 @@ impl GitHubForge {
             channel: Channel::Fixed(Box::new(transport)),
             repo,
             check_page: MAX_PAGE,
+            cache: Mutex::default(),
         }
     }
 
@@ -514,6 +547,7 @@ impl GitHubForge {
             })),
             repo,
             check_page: MAX_PAGE,
+            cache: Mutex::default(),
         }
     }
 
@@ -1004,34 +1038,43 @@ impl GitHubForge {
 
     /// One REST read: a successful answer, or the error its status says.
     fn rest(&self, path: &str) -> Result<RestAnswer, Error> {
-        let mut answer = self
-            .channel
-            .get(path)
-            .map_err(|unanswered| match unanswered {
-                Unanswered::Source(error) => error,
-                Unanswered::Transport(e) => Error::new(
-                    ErrorKind::Unreachable,
-                    format!("GitHub could not be reached: {}", redact(&e)),
-                ),
-            })?;
-        if (200..300).contains(&answer.status) {
-            return Ok(answer);
-        }
-        let mut body = String::new();
-        let _ = (&mut answer.body).take(4096).read_to_string(&mut body);
-        Err(status_error(answer.status, &body, answer.rate, path))
+        let answer = self.channel.get(path).map_err(unanswered)?;
+        successful(answer, path)
     }
 
     /// One REST read of the answer whole, to 1 MiB: its text, or the error
-    /// its status says (OWL-535).
-    pub(crate) fn rest_text(&self, path: &str) -> Result<String, Error> {
-        let mut answer = self.rest(path)?;
-        let mut body = String::new();
-        (&mut answer.body)
-            .take(MAX_REST_BYTES)
-            .read_to_string(&mut body)
-            .map_err(|_| invalid(format!("reading {path} from GitHub failed")))?;
+    /// its status says (OWL-535), read again conditionally (OWL-536; build plan,
+    /// "The GitHub Issues adapter", "Polling", G6): the forge keeps each
+    /// path's last `ETag` with its body and sends it back as
+    /// `If-None-Match`, so an answer of HTTP 304, which GitHub does not count
+    /// against the hourly limit, gives the body kept. The cache lives as
+    /// long as the forge; past [`MAX_CACHED`] paths or [`MAX_CACHED_BYTES`]
+    /// it is emptied, and the next reads are plain ones.
+    pub(crate) fn rest_text_cached(&self, path: &str) -> Result<String, Error> {
+        let kept = self.cached().entries.get(path).cloned();
+        let answer = match &kept {
+            Some((etag, _)) => self.channel.get_if_none_match(path, etag),
+            None => self.channel.get(path),
+        }
+        .map_err(unanswered)?;
+        if answer.status == 304
+            && let Some((_, body)) = kept
+        {
+            return Ok(body);
+        }
+        let etag = answer.etag.clone();
+        let body = whole(successful(answer, path)?, path)?;
+        let mut cache = self.cached();
+        match etag {
+            Some(etag) => cache.keep(path, etag, &body),
+            None => cache.forget(path),
+        }
         Ok(body)
+    }
+
+    /// The cache, taken back after a panic elsewhere while it was held.
+    fn cached(&self) -> std::sync::MutexGuard<'_, RestCache> {
+        self.cache.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
     /// One REST write: its answer's text when GitHub took it, or the error
@@ -1051,6 +1094,74 @@ impl GitHubForge {
             return Ok(answer.body);
         }
         Err(status_error(answer.status, &answer.body, answer.rate, path))
+    }
+}
+
+/// The forge's error for a request that had no answer.
+fn unanswered(unanswered: Unanswered) -> Error {
+    match unanswered {
+        Unanswered::Source(error) => error,
+        Unanswered::Transport(e) => Error::new(
+            ErrorKind::Unreachable,
+            format!("GitHub could not be reached: {}", redact(&e)),
+        ),
+    }
+}
+
+/// `answer` when it is a success, else the error its status says.
+fn successful(mut answer: RestAnswer, path: &str) -> Result<RestAnswer, Error> {
+    if (200..300).contains(&answer.status) {
+        return Ok(answer);
+    }
+    let mut body = String::new();
+    let _ = (&mut answer.body).take(4096).read_to_string(&mut body);
+    Err(status_error(answer.status, &body, answer.rate, path))
+}
+
+/// The text of `answer`, read whole to [`MAX_REST_BYTES`].
+fn whole(mut answer: RestAnswer, path: &str) -> Result<String, Error> {
+    let mut body = String::new();
+    (&mut answer.body)
+        .take(MAX_REST_BYTES)
+        .read_to_string(&mut body)
+        .map_err(|_| invalid(format!("reading {path} from GitHub failed")))?;
+    Ok(body)
+}
+
+/// The most paths the forge's conditional reads keep (OWL-536).
+pub const MAX_CACHED: usize = 4096;
+
+/// The most bytes of bodies they keep.
+pub const MAX_CACHED_BYTES: usize = 16 * 1024 * 1024;
+
+/// The bodies of conditional reads, each with its `ETag`, by path.
+#[derive(Default)]
+struct RestCache {
+    entries: std::collections::HashMap<String, (String, String)>,
+    bytes: usize,
+}
+
+impl RestCache {
+    /// Keeps `body` under `etag` for `path`, the cache emptied first when it
+    /// would pass a bound. A body past the bytes bound alone is not kept.
+    fn keep(&mut self, path: &str, etag: String, body: &str) {
+        self.forget(path);
+        if body.len() > MAX_CACHED_BYTES {
+            return;
+        }
+        if self.entries.len() >= MAX_CACHED || self.bytes + body.len() > MAX_CACHED_BYTES {
+            self.entries.clear();
+            self.bytes = 0;
+        }
+        self.bytes += body.len();
+        self.entries
+            .insert(path.to_owned(), (etag, body.to_owned()));
+    }
+
+    fn forget(&mut self, path: &str) {
+        if let Some((_, body)) = self.entries.remove(path) {
+            self.bytes -= body.len();
+        }
     }
 }
 
@@ -3525,5 +3636,30 @@ mod tests {
                 .contains("workflowRun { databaseId workflow { name } }"),
             "{query}"
         );
+    }
+
+    /// The conditional reads' cache never holds more than its bounds: past
+    /// either, it is emptied before the next body is kept (OWL-536).
+    #[test]
+    fn the_rest_cache_is_emptied_past_its_bounds() {
+        let mut cache = RestCache::default();
+        let big = "x".repeat(MAX_CACHED_BYTES / 2 + 1);
+        cache.keep("a", "1".into(), &big);
+        cache.keep("b", "2".into(), "small");
+        assert_eq!(cache.entries.len(), 2);
+        cache.keep("c", "3".into(), &big);
+        assert_eq!(cache.entries.len(), 1);
+        assert_eq!(cache.bytes, big.len());
+        cache.keep("c", "4".into(), "again");
+        assert_eq!((cache.entries.len(), cache.bytes), (1, 5));
+        cache.keep("d", "5".into(), &"y".repeat(MAX_CACHED_BYTES + 1));
+        assert!(!cache.entries.contains_key("d"));
+        let mut cache = RestCache::default();
+        for n in 0..MAX_CACHED {
+            cache.keep(&n.to_string(), "e".into(), "");
+        }
+        assert_eq!(cache.entries.len(), MAX_CACHED);
+        cache.keep("one more", "e".into(), "");
+        assert_eq!(cache.entries.len(), 1);
     }
 }

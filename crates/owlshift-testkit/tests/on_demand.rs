@@ -26,6 +26,7 @@ use owlshift_adapters::forge::{Repo, Verdict};
 use owlshift_adapters::graphql::{Response, RestAnswer, Transport};
 use owlshift_adapters::harness::codex;
 use owlshift_adapters::notifier::{Error as NotifierError, Notifier};
+use owlshift_adapters::tracker::github::GitHubTracker;
 use owlshift_adapters::tracker::markdown::MarkdownTracker;
 use owlshift_adapters::tracker::{self, Capability, Comment, Ticket, Tracker};
 use owlshift_contracts::brief::{
@@ -62,6 +63,7 @@ use owlshift_runner::watch::{POLL_INTERVAL, Watch};
 use owlshift_testkit::gh;
 use owlshift_testkit::git::{GitEnv, Remote, seed};
 use owlshift_testkit::harness::FakeHarness;
+use owlshift_testkit::issues::FakeIssues;
 use owlshift_testkit::reply::Reply;
 
 const TICKET: &str = "DEMO-1";
@@ -1271,6 +1273,10 @@ struct Bench {
     /// (OWL-489, [`LockProbe`]): an `Arc<Mutex<…>>`, not a `Cell`, as the
     /// runner's git setup must be `Send + Sync`.
     lock_probe: Arc<Mutex<Option<LockProbe>>>,
+    /// GitHub's issues, when the project's tracker is GitHub Issues
+    /// (OWL-536): the runner then reads and writes them through the real
+    /// adapter, in place of the Markdown tracker.
+    issues: RefCell<Option<FakeIssues>>,
 }
 
 /// What the runner's git found of the project's lock at each command
@@ -1506,6 +1512,7 @@ impl Bench {
             usage_cap: Cell::new(None),
             web_tools: Cell::new(true),
             lock_probe: Arc::default(),
+            issues: RefCell::new(None),
         }
     }
 
@@ -2003,6 +2010,14 @@ impl Bench {
             fold: &self.fold,
             reactions: &self.reactions,
         };
+        let issues = self.issues.borrow().clone().map(|fake| {
+            let reached = GitHubForge::with_transport(fake, Repo::parse(REPO).unwrap());
+            GitHubTracker::new(reached, &config.tracker)
+        });
+        let tracker: &dyn Tracker = match &issues {
+            Some(issues) => issues,
+            None => &tracker,
+        };
         let forge =
             GitHubForge::with_transport(Shared(self.github.clone()), Repo::parse(REPO).unwrap());
         let dirs = self.dirs();
@@ -2012,7 +2027,7 @@ impl Bench {
         let usage = self.usage_store();
         let on_demand = OnDemand {
             executor: &executor,
-            tracker: &tracker,
+            tracker,
             forge: &forge,
             // One harness plays every run, a reply each, whatever its role.
             build: &harness,
@@ -12219,6 +12234,10 @@ fn the_drain_keeps_the_failed_runs_of_an_intake_left_at_intake() {
 /// (OWL-254, build plan part K).
 #[path = "on_demand/drain_scenarios.rs"]
 mod drain_scenarios;
+
+/// The drain on GitHub Issues (OWL-536).
+#[path = "on_demand/issues_scenarios.rs"]
+mod issues_scenarios;
 
 #[path = "on_demand/design_scenarios.rs"]
 mod design_scenarios;

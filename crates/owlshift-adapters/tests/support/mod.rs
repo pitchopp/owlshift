@@ -166,6 +166,7 @@ impl Transport for Replay {
         Ok(RestAnswer {
             status: answer.status,
             rate: answer.rate,
+            etag: None,
             body: Box::new(std::io::Cursor::new(answer.body.into_bytes())),
         })
     }
@@ -472,6 +473,7 @@ impl Transport for Recorder {
         Ok(RestAnswer {
             status: kept.status,
             rate: kept.rate,
+            etag: None,
             body: Box::new(std::io::Cursor::new(kept.body.into_bytes())),
         })
     }

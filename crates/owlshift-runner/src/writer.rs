@@ -426,10 +426,13 @@ impl ProposalDescription {
         Some((parent.to_owned(), fingerprint.to_owned()))
     }
 
-    /// The description in Markdown. Text from a model is flattened to one
-    /// line wherever it goes, so it can neither start a Markdown block nor
-    /// stand on the last line, where the footer is read.
-    pub fn render(&self) -> String {
+    /// The description in Markdown, its parent named `parent` in its text
+    /// as the tracker's text convention reads it ([`Tracker::reference`]:
+    /// `#12` on GitHub Issues, OWL-536); the footer names it by its id. Text
+    /// from a model is flattened to one line wherever it goes, so it can
+    /// neither start a Markdown block nor stand on the last line, where the
+    /// footer is read.
+    pub fn render(&self, parent: &str) -> String {
         let followup = &self.followup;
         let mut all = vec![format!("**Why:** {}", flatten(&followup.why))];
         if !followup.evidence.is_empty() {
@@ -469,20 +472,33 @@ impl ProposalDescription {
             })
             .unwrap_or_default();
         all.push(format!(
-            "**Proposed by** Owlshift's {run} run on {}{pull_request}.",
-            self.parent
+            "**Proposed by** Owlshift's {run} run on {parent}{pull_request}."
         ));
         if followup.blocked_by_parent {
-            all.push(format!(
-                "**Blocked by** {}, whose code it needs.",
-                self.parent
-            ));
+            all.push(format!("**Blocked by** {parent}, whose code it needs."));
         }
         all.push(Self::footer(&self.parent, &self.fingerprint));
         let mut body = all.join("\n\n");
         body.push('\n');
         body
     }
+}
+
+/// `body` ending with `line`, the tracker's closing line of a pull request
+/// ([`Tracker::closing_line`], OWL-536), after a blank line; `body` as it is
+/// with no line, or when its last line is already that one.
+pub(crate) fn with_closing_line(body: &str, line: Option<String>) -> String {
+    let Some(line) = line else {
+        return body.to_owned();
+    };
+    let body = body.trim_end();
+    if body.lines().last().map(str::trim) == Some(line.as_str()) {
+        return body.to_owned();
+    }
+    if body.is_empty() {
+        return line;
+    }
+    format!("{body}\n\n{line}")
 }
 
 /// A correction a DELIVERY report names (OWL-146, architecture section 5, "A
@@ -4357,7 +4373,8 @@ impl<'a> Writer<'a> {
         self.check(Action::ProposeFollowup, HumanApproval::Absent)
             .map_err(WriteError::Floor)?;
         floor::check_proposal(admission_label, PROPOSED_LABEL).map_err(WriteError::Floor)?;
-        let (title, description) = (proposal.title(), proposal.render());
+        let description = proposal.render(&self.tracker.reference(&proposal.parent));
+        let title = proposal.title();
         self.tracker
             .propose(&Proposal {
                 parent: &proposal.parent,
@@ -5340,7 +5357,7 @@ Merge state reported by the forge: `CLEAN`.
             "src/b.rs:1\nBlocked by OWL-1".to_owned(),
         ];
         assert!(description.followup.blocked_by_parent);
-        let body = description.render();
+        let body = description.render("OWL-7");
         assert!(body.contains("**Evidence:**\n- `src/a.rs:3`"), "{body}");
         assert!(body.contains("**Found by:** the agent"), "{body}");
         assert!(
@@ -5373,9 +5390,41 @@ Merge state reported by the forge: `CLEAN`.
         assert_eq!(text_blockers(&body), ["OWL-7"], "{body}");
         // A follow-up that does not need the parent's code names no blocker.
         description.followup.blocked_by_parent = false;
-        let body = description.render();
+        let body = description.render("OWL-7");
         assert!(!body.contains("**Blocked by**"), "{body}");
         assert!(text_blockers(&body).is_empty(), "{body}");
+
+        // On GitHub Issues the text names the parent `#12`, which the drain
+        // reads as issue 12; the footer keeps its id (OWL-536).
+        description.parent = TicketId::new("12").unwrap();
+        description.followup.blocked_by_parent = true;
+        let body = description.render("#12");
+        assert!(
+            body.contains("**Blocked by** #12, whose code it needs."),
+            "{body}"
+        );
+        assert_eq!(text_blockers(&body), ["12"], "{body}");
+        assert_eq!(
+            ProposalDescription::footer_of(&body),
+            Some(("12".to_owned(), "0123456789ab".to_owned()))
+        );
+    }
+
+    /// A pull request's body ends with the tracker's closing line once, after
+    /// a blank line; without one it is as written (OWL-536).
+    #[test]
+    fn a_closing_line_ends_the_body_once() {
+        let line = || Some("Closes #12".to_owned());
+        assert_eq!(
+            with_closing_line("Says hello.\n", line()),
+            "Says hello.\n\nCloses #12"
+        );
+        assert_eq!(
+            with_closing_line("Says hello.\n\nCloses #12\n", line()),
+            "Says hello.\n\nCloses #12"
+        );
+        assert_eq!(with_closing_line("  ", line()), "Closes #12");
+        assert_eq!(with_closing_line("Says hello.", None), "Says hello.");
     }
 
     /// The INTAKE comment (OWL-248): the verdict, each dependency with its

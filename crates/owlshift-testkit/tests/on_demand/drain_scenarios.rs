@@ -117,7 +117,7 @@ impl Bench {
     }
 
     /// The next pull request read is the one opened since the merge: open.
-    fn reopened(&self) {
+    pub(super) fn reopened(&self) {
         self.github.followed.lock().unwrap().state = "OPEN";
     }
 
@@ -155,7 +155,7 @@ impl Bench {
     }
 
     /// Each run's role and ticket, oldest first.
-    fn runs(&self) -> Vec<(Role, String)> {
+    pub(super) fn runs(&self) -> Vec<(Role, String)> {
         self.briefs()
             .iter()
             .map(|brief| (brief.role, brief.ticket.id.as_str().to_owned()))

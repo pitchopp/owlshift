@@ -47,17 +47,28 @@ pub struct RateHeaders {
 pub struct RestAnswer {
     pub status: u16,
     pub rate: RateHeaders,
+    /// The answer's `ETag`, which a conditional read sends back
+    /// ([`Transport::get_if_none_match`], OWL-536). An entity tag names a
+    /// version of the answer and holds no credential.
+    pub etag: Option<String>,
     pub body: Box<dyn Read>,
 }
 
 impl RestAnswer {
-    /// An answer without rate-limit headers.
+    /// An answer without rate-limit headers or `ETag`.
     pub fn new(status: u16, body: impl Into<Vec<u8>>) -> Self {
         Self {
             status,
             rate: RateHeaders::default(),
+            etag: None,
             body: Box::new(std::io::Cursor::new(body.into())),
         }
+    }
+
+    /// The answer with `ETag` `etag`.
+    pub fn with_etag(mut self, etag: impl Into<String>) -> Self {
+        self.etag = Some(etag.into());
+        self
     }
 }
 
@@ -74,6 +85,16 @@ pub trait Transport {
     /// a job's log read REST.
     fn get(&self, path: &str) -> Result<RestAnswer, String> {
         Err(format!("this transport reads no REST path ({path})"))
+    }
+
+    /// [`Self::get`], sending `etag` as `If-None-Match` (OWL-536): an
+    /// answer of HTTP 304 then says the version `etag` names is still the
+    /// current one, and GitHub does not count it against the hourly limit
+    /// (build plan, live check G6). A plain read by default, which a fake
+    /// that keeps no versions answers.
+    fn get_if_none_match(&self, path: &str, etag: &str) -> Result<RestAnswer, String> {
+        let _ = etag;
+        self.get(path)
     }
 
     /// Puts the JSON `body` at `path` of the forge's REST API, such as

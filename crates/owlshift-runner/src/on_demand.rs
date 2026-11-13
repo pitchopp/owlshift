@@ -6312,6 +6312,8 @@ impl OnDemand<'_> {
             Some(pr) => (pr.title.clone(), pr.body.clone()),
             None => (p.found.title.clone(), built.summary.clone()),
         };
+        // On GitHub Issues the body ends with `Closes #n` (OWL-536).
+        let body = crate::writer::with_closing_line(&body, self.tracker.closing_line(ticket));
         let opened = writer
             .open_pull_request(self.forge, head, base, &title, &body)
             .map_err(|e| delivery("opening the pull request", &e))?;

@@ -97,6 +97,10 @@
           "login": "person-1",
           "type": "User"
         }
+      },
+      "rate": {
+        "remaining": 4857,
+        "reset": 1794522925
       }
     },
     {
@@ -110,6 +114,10 @@
         "documentation_url": "https://docs.github.com/rest/issues/issues#get-an-issue",
         "message": "Not Found",
         "status": "404"
+      },
+      "rate": {
+        "remaining": 4856,
+        "reset": 1794522925
       }
     },
     {
@@ -208,6 +216,10 @@
           "login": "person-1",
           "type": "User"
         }
+      },
+      "rate": {
+        "remaining": 4855,
+        "reset": 1794522925
       }
     },
     {
@@ -389,19 +401,35 @@
             "type": "User"
           }
         }
-      ]
+      ],
+      "rate": {
+        "remaining": 4854,
+        "reset": 1794522925
+      }
     },
     {
       "request": {
         "body": null,
         "method": "GET",
-        "path": "repos/pitchopp/owlshift-live-sandbox/issues/9999"
+        "path": "repos/pitchopp/owlshift-live-sandbox/issues/comments/6827737502/reactions?per_page=100&page=1"
       },
-      "status": 404,
-      "response": {
-        "documentation_url": "https://docs.github.com/rest/issues/issues#get-an-issue",
-        "message": "Not Found",
-        "status": "404"
+      "status": 200,
+      "response": [
+        {
+          "content": "+1",
+          "created_at": "2026-11-12T15:23:15Z",
+          "id": 469599332,
+          "node_id": "REA_lALOVFw-Bs8AAAABlvcBns4b_YRk",
+          "user": {
+            "id": 1,
+            "login": "person-1",
+            "type": "User"
+          }
+        }
+      ],
+      "rate": {
+        "remaining": 4984,
+        "reset": 1794523857
       }
     },
     {
@@ -415,6 +443,27 @@
         "documentation_url": "https://docs.github.com/rest/issues/issues#get-an-issue",
         "message": "Not Found",
         "status": "404"
+      },
+      "rate": {
+        "remaining": 4853,
+        "reset": 1794522925
+      }
+    },
+    {
+      "request": {
+        "body": null,
+        "method": "GET",
+        "path": "repos/pitchopp/owlshift-live-sandbox/issues/9999"
+      },
+      "status": 404,
+      "response": {
+        "documentation_url": "https://docs.github.com/rest/issues/issues#get-an-issue",
+        "message": "Not Found",
+        "status": "404"
+      },
+      "rate": {
+        "remaining": 4852,
+        "reset": 1794522925
       }
     },
     {
@@ -513,6 +562,10 @@
           "login": "person-1",
           "type": "User"
         }
+      },
+      "rate": {
+        "remaining": 4851,
+        "reset": 1794522925
       }
     },
     {
@@ -527,13 +580,13 @@
       "response": {
         "author_association": "OWNER",
         "body": "[owlshift] OWL-13 conformance check: a comment posted by the Linear adapter's fixture recorder · safe to delete.\n\nSecond line.",
-        "created_at": "2026-11-12T17:22:18Z",
+        "created_at": "2026-11-12T22:26:19Z",
         "id": 9000000001,
         "issue_url": "https://api.github.com/repos/pitchopp/owlshift-live-sandbox/issues/11",
         "performed_via_github_app": {
           "slug": "owl-shift"
         },
-        "updated_at": "2026-11-12T17:22:18Z",
+        "updated_at": "2026-11-12T22:26:19Z",
         "user": {
           "id": 1,
           "login": "person-1",
@@ -724,13 +777,13 @@
         {
           "author_association": "OWNER",
           "body": "[owlshift] OWL-13 conformance check: a comment posted by the Linear adapter's fixture recorder · safe to delete.\n\nSecond line.",
-          "created_at": "2026-11-12T17:22:18Z",
+          "created_at": "2026-11-12T22:26:19Z",
           "id": 9000000001,
           "issue_url": "https://api.github.com/repos/pitchopp/owlshift-live-sandbox/issues/11",
           "performed_via_github_app": {
             "slug": "owl-shift"
           },
-          "updated_at": "2026-11-12T17:22:18Z",
+          "updated_at": "2026-11-12T22:26:19Z",
           "user": {
             "id": 1,
             "login": "person-1",
@@ -738,7 +791,36 @@
           }
         }
       ],
+      "rate": {
+        "remaining": 4850,
+        "reset": 1794522925
+      },
       "synthesized": "recorded, plus the made-up comment"
+    },
+    {
+      "request": {
+        "body": null,
+        "method": "GET",
+        "path": "repos/pitchopp/owlshift-live-sandbox/issues/comments/6827737502/reactions?per_page=100&page=1"
+      },
+      "status": 200,
+      "response": [
+        {
+          "content": "+1",
+          "created_at": "2026-11-12T15:23:15Z",
+          "id": 469599332,
+          "node_id": "REA_lALOVFw-Bs8AAAABlvcBns4b_YRk",
+          "user": {
+            "id": 1,
+            "login": "person-1",
+            "type": "User"
+          }
+        }
+      ],
+      "rate": {
+        "remaining": 4983,
+        "reset": 1794523857
+      }
     },
     {
       "request": {
@@ -836,6 +918,10 @@
           "login": "person-1",
           "type": "User"
         }
+      },
+      "rate": {
+        "remaining": 4849,
+        "reset": 1794522925
       }
     },
     {
@@ -1020,13 +1106,13 @@
         {
           "author_association": "OWNER",
           "body": "[owlshift] OWL-13 conformance check: a comment posted by the Linear adapter's fixture recorder · safe to delete.\n\nSecond line.",
-          "created_at": "2026-11-12T17:22:18Z",
+          "created_at": "2026-11-12T22:26:19Z",
           "id": 9000000001,
           "issue_url": "https://api.github.com/repos/pitchopp/owlshift-live-sandbox/issues/11",
           "performed_via_github_app": {
             "slug": "owl-shift"
           },
-          "updated_at": "2026-11-12T17:22:18Z",
+          "updated_at": "2026-11-12T22:26:19Z",
           "user": {
             "id": 1,
             "login": "person-1",
@@ -1034,7 +1120,36 @@
           }
         }
       ],
+      "rate": {
+        "remaining": 4848,
+        "reset": 1794522925
+      },
       "synthesized": "recorded, plus the made-up comment"
+    },
+    {
+      "request": {
+        "body": null,
+        "method": "GET",
+        "path": "repos/pitchopp/owlshift-live-sandbox/issues/comments/6827737502/reactions?per_page=100&page=1"
+      },
+      "status": 200,
+      "response": [
+        {
+          "content": "+1",
+          "created_at": "2026-11-12T15:23:15Z",
+          "id": 469599332,
+          "node_id": "REA_lALOVFw-Bs8AAAABlvcBns4b_YRk",
+          "user": {
+            "id": 1,
+            "login": "person-1",
+            "type": "User"
+          }
+        }
+      ],
+      "rate": {
+        "remaining": 4982,
+        "reset": 1794523857
+      }
     }
   ]
 }
