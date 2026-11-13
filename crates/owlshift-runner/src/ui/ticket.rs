@@ -1328,6 +1328,41 @@ mod tests {
         assert!(snap["waits"]["ticket"]["waits"].is_null());
     }
 
+    /// The page offers the Restart button on a parked ticket, and its wait
+    /// names that button, not the command the terminal types.
+    #[test]
+    fn a_parked_tickets_wait_names_the_restart_button() {
+        let bench = Bench::new(Some(BUDGET_FILE));
+        let mut parked = record(Stage::Build);
+        parked.state = PersistedState::from(
+            &TicketState::restore(
+                Status::Parked {
+                    at: Stage::Build,
+                    awaiting_input: false,
+                },
+                1,
+                0,
+                0,
+                0,
+                0,
+            )
+            .unwrap(),
+        );
+        bench.write("OWL-1", &parked, None);
+        let snap = bench.snapshot("OWL-1");
+        assert_eq!(snap["actions"]["restart"], true);
+        assert_eq!(snap["waits"]["ticket"]["waits"]["reason"], "parked");
+        assert_eq!(
+            snap["waits"]["ticket"]["waits"]["text"],
+            "parked: waits for a person's Restart, and keeps what it holds"
+        );
+        assert!(
+            !snap["waits"].to_string().contains("owlshift continue"),
+            "{}",
+            snap["waits"]
+        );
+    }
+
     #[test]
     fn a_ref_with_a_corrupt_file_errors_in_its_sections_only() {
         let bench = busy();

@@ -2563,6 +2563,45 @@ impl Drain {
         );
     }
 
+    /// Writes the ticket ref of `ticket` in the checkout of `o/r`, made a
+    /// repository on the first call, with the ticket parked at Build.
+    fn parked(&self, ticket: &str) {
+        use owlshift_contracts::refs::PersistedState;
+        use owlshift_core::state::{Status, TicketState};
+        use owlshift_core::vocab::Stage;
+        use owlshift_runner::ticket_ref::{self, TicketRecord};
+        // Where the status reader looks for the ticket refs of `o/r`.
+        let checkout = ProjectDirs::new(self.data.path(), &Repo::parse("o/r").unwrap()).checkout();
+        std::fs::create_dir_all(&checkout).unwrap();
+        let git = owlshift_runner::project::runner_git();
+        if !checkout.join(".git").exists() {
+            let init = std::process::Command::new("git")
+                .args(["init", "-q"])
+                .current_dir(&checkout)
+                .output()
+                .unwrap();
+            assert!(init.status.success(), "{init:?}");
+        }
+        let ticket = TicketId::new(ticket).unwrap();
+        let state = TicketState::restore(
+            Status::Parked {
+                at: Stage::Build,
+                awaiting_input: false,
+            },
+            0,
+            0,
+            0,
+            0,
+            0,
+        )
+        .unwrap();
+        let record = TicketRecord {
+            state: PersistedState::from(&state),
+            ..ticket_ref::blank(None)
+        };
+        ticket_ref::write(&git, &checkout, &ticket, &record, None).unwrap();
+    }
+
     fn stream(&self) -> BufReader<TcpStream> {
         open_stream_on(self.ui.port(), &self.session, "/api/stream?graph=1")
     }
@@ -2654,6 +2693,30 @@ fn the_graph_needs_a_session_and_comes_back_as_escaped_json_text() {
         [("DEMO-2".to_owned(), "DEMO-1".to_owned())]
     );
     assert_eq!(graph["projects"][0]["ready"]["stale"], false);
+}
+
+/// A parked ticket's node names the Restart button, never the command, in
+/// the route's reply and in the whole read the tail's lines must equal.
+#[test]
+fn a_parked_ticket_in_the_graph_names_the_restart_button() {
+    const RESTART: &str = "parked: waits for a person's Restart, and keeps what it holds";
+    let drain = Drain::new();
+    drain.parked("DEMO-1");
+    let reply = drain.get("/api/graph");
+    assert_eq!(reply.status, 200, "{}", reply.text());
+    let graph = reply.json();
+    let node = graph["projects"][0]["live"]["nodes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|node| node["id"] == "DEMO-1")
+        .unwrap_or_else(|| panic!("DEMO-1 has no node in {graph}"));
+    assert_eq!(node["reason"], "parked");
+    assert_eq!(node["text"], RESTART);
+    assert!(!reply.text().contains("owlshift continue"), "{graph}");
+    let whole = drain.whole().to_string();
+    assert!(whole.contains(RESTART), "{whole}");
+    assert!(!whole.contains("owlshift continue"), "{whole}");
 }
 
 #[test]
