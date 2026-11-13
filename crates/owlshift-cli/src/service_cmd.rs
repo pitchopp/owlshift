@@ -18,6 +18,7 @@ use owlshift_adapters::notifier::Notifier;
 use owlshift_contracts::format::Format;
 use owlshift_contracts::service::{BY_STOP, DaemonRecord, Request};
 use owlshift_platform::keychain::Keychain;
+use owlshift_platform::process::OwnProgram;
 use owlshift_platform::service::{HostManager, Layout, Manager};
 use owlshift_runner::config::{Effective, FileState, OWLSHIFT_VERSION};
 use owlshift_runner::daemon::upgrade::Binary;
@@ -69,20 +70,16 @@ pub fn daemon(system: &dyn System, config: &Effective) -> ExitCode {
         since: Timestamp::now(),
         build: Some(own_build()),
     };
-    let instance = match daemon::instance::take(&data, &record) {
-        Ok(Ok(instance)) => instance,
+    let shown = |error: io::Error| format!("{}: {error}", daemon::service_dir(&data).display());
+    let locked = match daemon::instance::lock(&data) {
+        Ok(Ok(locked)) => locked,
         Ok(Err(Held(holder))) => return fail(&already_runs(&data, holder.as_ref())),
-        Err(error) => {
-            return fail(&format!(
-                "{}: {error}",
-                daemon::service_dir(&data).display()
-            ));
-        }
+        Err(error) => return fail(&shown(error)),
     };
     // The binary every child runs, pinned now that this daemon alone holds
-    // the data directory: on macOS a copy in `pinned/`, which an upgrade
-    // does not replace (architecture section 5, "An upgrade", OWL-553).
-    // Declared after `instance`, so dropped before it on every return.
+    // the data directory, and before its record says it runs: on macOS a
+    // copy in `pinned/`, which an upgrade does not replace (architecture
+    // section 5, "An upgrade", OWL-553).
     let pinned_dir = daemon::pinned_dir(&data);
     let pinned = match owlshift_platform::process::pin_own_program(&pinned_dir) {
         Ok(pinned) => pinned,
@@ -92,6 +89,13 @@ pub fn daemon(system: &dyn System, config: &Effective) -> ExitCode {
                 pinned_dir.display()
             ));
         }
+    };
+    if let Err(refusal) = pinned_is_own_build(&pinned.program) {
+        return fail(&refusal);
+    }
+    let instance = match locked.publish(&data, &record) {
+        Ok(instance) => instance,
+        Err(error) => return fail(&shown(error)),
     };
     let own = &pinned.program;
     let desktop = notify::desktop_enabled(&config.personal)
@@ -119,7 +123,7 @@ pub fn daemon(system: &dyn System, config: &Effective) -> ExitCode {
     };
     let ended = daemon.run(&mut io::stdout());
     // A stop or an upgrade returns once every child has ended, so the copy
-    // goes now, while the lock is held: never a next daemon's.
+    // goes now, while the lock is held.
     drop(pinned);
     drop(instance);
     match ended {
@@ -154,6 +158,46 @@ pub fn hand_over(data: &Path, by: &str) -> Option<String> {
             "warning: the daemon was not handed over to this binary: {error}"
         )),
     }
+}
+
+/// How long the pinned binary has to answer `--version`: its first run on
+/// macOS includes the system's scan of a new file, about a second.
+const PIN_CHECK_WAIT: Duration = Duration::from_secs(30);
+
+/// `Ok` when the binary the daemon's children run, `pinned`, is this very
+/// build (OWL-553): a binary replaced between this daemon's start and its
+/// copy would otherwise run every child on another build than the daemon's.
+/// Refused so, the daemon ends, and the next start runs the new binary.
+fn pinned_is_own_build(pinned: &OwnProgram) -> Result<(), String> {
+    let refused = |why: String| {
+        format!(
+            "the copy of this program that every watch runs, {}, {why}: the daemon ends rather \
+             than run its watches on another build; started again, it runs the binary now at {}",
+            pinned.spawn.display(),
+            pinned.path.display()
+        )
+    };
+    let captured =
+        owlshift_platform::process::run(&pinned.spawn, &["--version"], None, PIN_CHECK_WAIT)
+            .map_err(|error| refused(format!("did not tell its build ({error})")))?;
+    let said = String::from_utf8_lossy(&captured.stdout);
+    if captured.success() && names_own_build(&said) {
+        return Ok(());
+    }
+    Err(refused(format!(
+        "is not this daemon's build ({}), the binary having been replaced as the daemon \
+         started",
+        own_build().short()
+    )))
+}
+
+/// Whether `said`, what a binary printed for `--version`, names this
+/// binary's version and build.
+fn names_own_build(said: &str) -> bool {
+    let mut lines = said.lines();
+    let version = lines.next().and_then(|line| line.split_whitespace().last());
+    let build = format!("build: {}", own_build());
+    version == Some(OWLSHIFT_VERSION) && lines.next() == Some(build.as_str())
 }
 
 /// The watch of the served project `repo`: `program`, this binary, as
@@ -868,6 +912,28 @@ fn repo_of(checkout: &Path) -> Result<Repo, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// OWL-553: the pinned copy passes only when its `--version` names this
+    /// very build; one built at another time, or of another version, fails.
+    #[test]
+    fn only_this_build_passes_as_the_pinned_copy() {
+        let own = format!(
+            "owlshift {OWLSHIFT_VERSION}\nbuild: {}\nformats: …\n",
+            own_build()
+        );
+        assert!(names_own_build(&own));
+        let later = owlshift_contracts::service::BuildIdentity::from_build(
+            &"b".repeat(40),
+            "1",
+            "1861600600",
+            "",
+        );
+        let other = format!("owlshift {OWLSHIFT_VERSION}\nbuild: {later}\nformats: …\n");
+        assert!(!names_own_build(&other));
+        let newer = format!("owlshift 99.0.0\nbuild: {}\n", own_build());
+        assert!(!names_own_build(&newer));
+        assert!(!names_own_build(""));
+    }
 
     /// OWL-437: the service at login, on temp folders and a recording
     /// manager, never `launchctl` or `systemctl`.
