@@ -14,9 +14,9 @@
 # Nothing here calls `launchctl`, so a service of the person's own stays as it is: a stand-in supervisor writes the
 # launcher's `launched` marker, runs `owlshift daemon` and runs it again on any exit but 0, as the LaunchAgent does
 # (OWL-437); the manifest lists a systemd unit in the scratch folder, so a manager call, which no step here should
-# make, reaches the stand-in `systemctl` first on the PATH, which records it and fails. Git reads no system or
-# global configuration and every GitHub URL is rewritten to a path that does not exist, so no fetch leaves the
-# machine; the served projects do not exist, so no keychain entry matches them. It prints results only.
+# make, reaches the stand-in `systemctl` first on the PATH, which records it and fails. Git reads no system or global
+# configuration but a local proxy, which every HTTPS request is sent to, so nothing leaves the machine; the served
+# project does not exist, so no keychain entry matches it. It prints results only.
 #
 # Usage: bash owl-553-mac.sh rename|brew <binary A> <binary B> <new scratch folder> [<data parent>]
 set -u
@@ -63,22 +63,33 @@ say "data folder: $data, on $(df "$data" | awk 'NR == 2 { print $1 }'); binary o
 
 printf '#!/bin/sh\necho "systemctl $*" >> "%s/manager-calls"\nexit 1\n' "$root" > "$root/stand-in/systemctl"
 chmod +x "$root/stand-in/systemctl"
-printf '[url "file:///nonexistent/"]\n\tinsteadOf = https://github.com/\n' > "$root/gitconfig"
+free_port() { python3 -c 'import socket; s = socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1])'; }
+# Every HTTPS request, git's included, goes through a local proxy that accepts and answers nothing for 20 s, then
+# closes: a served watch's first clone lives that long, so the file it runs can be read, then fails, and the daemon
+# starts the watch again on backoff.
+hole=$(free_port)
+python3 -c '
+import socket, sys, threading, time
+s = socket.socket(); s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1); s.bind(("127.0.0.1", int(sys.argv[1]))); s.listen()
+def hold(c): time.sleep(20); c.close()
+while True: threading.Thread(target=hold, args=(s.accept()[0],), daemon=True).start()
+' "$hole" &
+server=$!
+printf '[http]\n\tproxy = http://127.0.0.1:%s\n' "$hole" > "$root/gitconfig"
 export PATH="$root/stand-in:$PATH" GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL="$root/gitconfig" GIT_TERMINAL_PROMPT=0
+export HTTPS_PROXY="http://127.0.0.1:$hole" https_proxy="http://127.0.0.1:$hole" ALL_PROXY="http://127.0.0.1:$hole"
 export OWLSHIFT_DATA_DIR="$data" OWLSHIFT_CONFIG_DIR="$root/config"
 # `start` and `stop` name the scratch folders once more, so neither reaches a daemon of the person's own.
 owl() { OWLSHIFT_DATA_DIR="$data" OWLSHIFT_CONFIG_DIR="$root/config" "$bin" "$@"; }
-port=$(python3 -c 'import socket; s = socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1])')
+port=$(free_port)
 printf '[notifications]\ndesktop = false\n\n[ui]\nport = %s\n' "$port" > "$root/config/config.toml"
 touch "$root/units/owlshift.service"
 printf '{"format": 1, "service": {"manager": "systemd", "unit": "%s", "launcher": "%s", "binary": "%s"}, "keychain": []}\n' \
   "$root/units/owlshift.service" "$root/units/owlshift-launcher.sh" "$bin" > "$service/manifest.json"
-# A served project whose checkout is gone: its watch refuses before any credential, the project is paused, and the
-# daemon starts its watch again at each pass, every 60 s.
-printf '{"format": 1, "projects": [{"repository": "owl553-r3/gone", "checkout": "%s/gone"}]}\n' "$root" \
-  > "$service/projects.json"
-# The checkout `owlshift start` runs in.
+# The served project, a repository that does not exist, and the checkout `owlshift start` runs in.
 checkout=$root/checkout
+printf '{"format": 1, "projects": [{"repository": "owl553-r3/scratch", "checkout": "%s"}]}\n' "$checkout" \
+  > "$service/projects.json"
 mkdir -p "$checkout"
 git -C "$checkout" init -q
 git -C "$checkout" remote add origin https://github.com/owl553-r3/scratch.git
@@ -137,8 +148,8 @@ watcher=$!
 cleanup() {
   kill "$watcher" 2> /dev/null
   pid=$(daemon_pid)
-  if [ -n "$pid" ] && kill -0 "$pid" 2> /dev/null; then owl stop > /dev/null 2>&1; sleep 5; fi
-  kill "$supervisor" 2> /dev/null
+  if [ -n "$pid" ] && kill -0 "$pid" 2> /dev/null; then owl stop > /dev/null 2>&1; sleep 25; fi
+  kill "$supervisor" "$server" 2> /dev/null
 }
 trap cleanup EXIT
 
@@ -146,9 +157,13 @@ started=$(date +%s)
 wait_for "daemon" 30 'test -s "$service/daemon.json"'
 first=$(daemon_pid)
 ui_of() { pgrep -P "$1" -f 'ui --daemon' | head -1; }
+watch_of() { pgrep -P "$1" -f 'watch --drain' | head -1; }
 wait_for "UI child" 30 'test -n "$(ui_of "$first")"'
-ui=$(ui_of "$first")
-say "daemon $first ($(daemon_build)) runs $(runs "$first"); its UI $ui started $(($(date +%s) - started)) s after it, runs $(runs "$ui")"
+wait_for "watch" 90 'test -n "$(watch_of "$first")"'
+ui=$(ui_of "$first") watch=$(watch_of "$first")
+say "daemon $first ($(daemon_build)) runs $(runs "$first")"
+say "its UI $ui, up $(($(date +%s) - started)) s after the daemon's start, runs $(runs "$ui")"
+say "its watch $watch runs $(runs "$watch")"
 say "pinned: $(cd "$service/pinned" && find . -type f) ($(version "$service/pinned/$first/owlshift"))"
 cmp -s "$service/pinned/$first/owlshift" "$a" && say "the copy is A" || say "FAIL: the copy is not A"
 
@@ -167,12 +182,14 @@ case $mode in
     ;;
 esac
 say "$bin is now: $(version "$bin")"
-kill -9 "$ui"
-wait_for "UI started again" 60 'test -n "$(ui_of "$first")"'
-ui=$(ui_of "$first")
-say "after a kill the daemon started its UI again: $ui runs $(runs "$ui") ($(version "$(runs "$ui")"))"
-say "waiting 65 s for the daemon's next pass, which starts the paused project's watch again"
-sleep 65
+old_ui=$ui old_watch=$(watch_of "$first")
+kill -9 "$old_ui" $old_watch
+say "killed the UI $old_ui and the watch $old_watch"
+wait_for "UI started again" 60 'u=$(ui_of "$first"); test -n "$u" && test "$u" != "$old_ui"'
+wait_for "watch started again" 120 'w=$(watch_of "$first"); test -n "$w" && test "$w" != "$old_watch"'
+ui=$(ui_of "$first") watch=$(watch_of "$first")
+say "the daemon started its UI again: $ui runs $(runs "$ui") ($(version "$(runs "$ui")"))"
+say "the daemon started its watch again: $watch runs $(runs "$watch") ($(version "$(runs "$watch")"))"
 awk -v t="$swapped" '$1 > t' "$root/spawned" | sed 's/^/  /'
 cmp -s "$service/pinned/$first/owlshift" "$a" && say "the copy is still A" || say "FAIL: the copy changed"
 
@@ -182,8 +199,10 @@ wait_for "new daemon" 120 'p=$(daemon_pid); test -n "$p" && test "$p" != "$first
 second=$(daemon_pid)
 grep -E "drain|exits with|supervisor" "$service/daemon.log" | sed 's/^/  log: /'
 wait_for "new UI" 30 'test -n "$(ui_of "$second")"'
-ui=$(ui_of "$second")
-say "daemon $second ($(daemon_build)) runs $(runs "$second"); its UI $ui runs $(runs "$ui")"
+wait_for "new watch" 90 'test -n "$(watch_of "$second")"'
+ui=$(ui_of "$second") watch=$(watch_of "$second")
+say "daemon $second ($(daemon_build)) runs $(runs "$second")"
+say "its UI $ui runs $(runs "$ui"); its watch $watch runs $(runs "$watch")"
 say "pinned: $(cd "$service/pinned" && find . -type f)"
 cmp -s "$service/pinned/$second/owlshift" "$b" && say "the copy is B" || say "FAIL: the copy is not B"
 
