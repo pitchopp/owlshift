@@ -18,6 +18,7 @@ pub mod github_app;
 pub mod push;
 
 use std::fmt;
+use std::time::Duration;
 
 use jiff::Timestamp;
 use owlshift_contracts::ids::is_repository_part;
@@ -563,8 +564,10 @@ pub enum ErrorKind {
     /// [`Error::head`] is the head read, when one was.
     HeadMoved,
     /// The forge's budget is spent: a GraphQL `RATE_LIMITED` error, or HTTP
-    /// 403 or 429 with no budget left or a `Retry-After`. Nothing is read
-    /// again before [`Error::resets_at`], when the answer gave it.
+    /// 403 or 429 with no budget left or a `Retry-After`, or, for a REST
+    /// call, a message naming a rate limit, which a secondary limit may give
+    /// without either header (OWL-554). Nothing is read again before
+    /// [`Error::held_until`].
     RateLimited,
     /// The GitHub App's token can no longer be refreshed: GitHub refused
     /// its refresh (a revoked authorization, a refresh token past its life
@@ -613,7 +616,22 @@ impl Error {
         self.resets_at = at;
         self
     }
+
+    /// Until when a spent budget's error holds the calls it spent, read at
+    /// `now`: the reset it gives while that is still ahead, else `now` and
+    /// [`RATE_LIMIT_FALLBACK`]. Watch's forge reads and the GitHub tracker's
+    /// calls hold by it (architecture section 5, "Rate limits").
+    pub fn held_until(&self, now: Timestamp) -> Timestamp {
+        self.resets_at.filter(|at| *at > now).unwrap_or_else(|| {
+            now.checked_add(RATE_LIMIT_FALLBACK)
+                .unwrap_or(Timestamp::MAX)
+        })
+    }
 }
+
+/// How long a rate-limited answer that gives no reset, or one already past,
+/// holds the calls it spent ([`Error::held_until`]).
+pub const RATE_LIMIT_FALLBACK: Duration = Duration::from_secs(5 * 60);
 
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
