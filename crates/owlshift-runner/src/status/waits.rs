@@ -49,6 +49,7 @@ use crate::ready;
 use crate::served;
 use crate::slots::{HeldSlot, MachineSlots};
 use crate::ticket_ref::{self, RefState};
+use crate::voice::Voice;
 use crate::why::{self, Folded, Waiting};
 
 /// The reasons the drain tells a ticket of the ready column that is not
@@ -349,15 +350,27 @@ fn paused(request: Option<&Request>) -> Paused {
     }
 }
 
-/// The document of `read`.
-pub fn build(read: &Read) -> StatusWaits {
+/// What `owlshift status --waits` prints for `read`: the document in the
+/// terminal's voice, as JSON or as the human text. The command prints this
+/// and nothing else, so the web UI's voice never reaches it.
+pub fn report(read: &Read, json: bool, tz: &TimeZone) -> String {
+    let waits = build(read, Voice::Terminal);
+    if json {
+        waits.render()
+    } else {
+        render(&waits, tz)
+    }
+}
+
+/// The document of `read`, a parked ticket's wait worded in `voice`.
+pub fn build(read: &Read, voice: Voice) -> StatusWaits {
     let held: &[HeldSlot] = read.slots.as_ref().map_or(&[], |(held, _)| held);
     let mut notes = read.notes.clone();
     let projects = read
         .projects
         .iter()
         .map(|project| {
-            let (waits, left_out) = build_project(project, held);
+            let (waits, left_out) = build_project(project, held, voice);
             if left_out > 0 {
                 notes.push(format!(
                     "{}: no ready snapshot reads, so the waits of {left_out} ticket(s) not in \
@@ -383,7 +396,7 @@ pub fn build(read: &Read) -> StatusWaits {
 
 /// The project's document, and how many tickets with a told wait were left
 /// out for want of a ready snapshot that reads.
-fn build_project(project: &ProjectRead, held: &[HeldSlot]) -> (ProjectWaits, usize) {
+fn build_project(project: &ProjectRead, held: &[HeldSlot], voice: Voice) -> (ProjectWaits, usize) {
     let running: BTreeSet<&TicketId> = held
         .iter()
         .filter_map(|slot| slot.holder.as_ref())
@@ -467,7 +480,14 @@ fn build_project(project: &ProjectRead, held: &[HeldSlot]) -> (ProjectWaits, usi
             )),
             RefStatus::Parked => Some(person(
                 "parked",
-                "parked: waits for a person's `owlshift continue`, and keeps what it holds",
+                match voice {
+                    Voice::Terminal => {
+                        "parked: waits for a person's `owlshift continue`, and keeps what it holds"
+                    }
+                    // The Restart button is offered exactly when the latest
+                    // record is parked (`ui::ticket::actions`).
+                    Voice::Ui => "parked: waits for a person's Restart, and keeps what it holds",
+                },
             )),
             _ => project.folded.current.get(&row.ticket).map(told),
         };
@@ -914,6 +934,11 @@ mod tests {
             projects,
             notes: Vec::new(),
         }
+    }
+
+    /// The document in the terminal's voice, which most tests read.
+    fn build(read: &Read) -> StatusWaits {
+        super::build(read, Voice::Terminal)
     }
 
     fn row<'a>(waits: &'a StatusWaits, ticket: &str) -> &'a TicketWaits {
@@ -1411,5 +1436,110 @@ mod tests {
         ));
         assert_eq!(parked.status, RefStatus::Parked);
         assert_eq!(parked.pull_request, None);
+    }
+
+    const PARKED_TERMINAL: &str =
+        "parked: waits for a person's `owlshift continue`, and keeps what it holds";
+    const PARKED_UI: &str = "parked: waits for a person's Restart, and keeps what it holds";
+
+    fn parked_read() -> Read {
+        read(
+            vec![project(
+                vec![(
+                    "DEMO-1",
+                    at(Status::Parked {
+                        at: Stage::Build,
+                        awaiting_input: false,
+                    }),
+                )],
+                &[],
+            )],
+            Vec::new(),
+        )
+    }
+
+    /// A parked ticket's wait names the command in the terminal's voice and
+    /// the Restart button in the UI's, and nothing else of the wait differs.
+    #[test]
+    fn a_parked_wait_is_worded_by_voice() {
+        let read = parked_read();
+        let terminal = super::build(&read, Voice::Terminal);
+        let ui = super::build(&read, Voice::Ui);
+        let in_terminal = row(&terminal, "DEMO-1").waits.clone().unwrap();
+        let in_ui = row(&ui, "DEMO-1").waits.clone().unwrap();
+        assert_eq!(in_terminal.text, PARKED_TERMINAL);
+        assert_eq!(in_ui.text, PARKED_UI);
+        assert_eq!(in_terminal.reason, "parked");
+        assert_eq!(
+            Wait {
+                text: String::new(),
+                ..in_terminal
+            },
+            Wait {
+                text: String::new(),
+                ..in_ui
+            }
+        );
+    }
+
+    /// The why phrases of a refused merge and of a restart left to `watch`
+    /// have no button to name: both voices read the same.
+    #[test]
+    fn the_why_phrases_read_the_same_in_both_voices() {
+        let events = [
+            waits(
+                "2026-10-28T09:00:00Z",
+                "DEMO-1",
+                vec![
+                    ("watch", json!("merge_refused")),
+                    ("pull_request", json!(12)),
+                    ("final", json!(true)),
+                    ("reason", json!("Base branch was modified.")),
+                ],
+            ),
+            waits(
+                "2026-10-28T09:00:00Z",
+                "DEMO-2",
+                vec![
+                    ("restarted", json!(true)),
+                    ("stage", json!("build")),
+                    ("to_watch", json!(true)),
+                    ("takes", json!("resume")),
+                ],
+            ),
+        ];
+        let read = read(
+            vec![project(
+                vec![
+                    ("DEMO-1", at(Status::Active(Stage::Watch))),
+                    ("DEMO-2", at(Status::Active(Stage::Build))),
+                ],
+                &events,
+            )],
+            Vec::new(),
+        );
+        let terminal = super::build(&read, Voice::Terminal);
+        let ui = super::build(&read, Voice::Ui);
+        for ticket in ["DEMO-1", "DEMO-2"] {
+            let wait = row(&terminal, ticket).waits.as_ref().unwrap();
+            assert_eq!(Some(wait), row(&ui, ticket).waits.as_ref());
+            assert!(wait.text.contains("`owlshift continue"), "{}", wait.text);
+        }
+    }
+
+    /// What the command prints, as JSON and as text, keeps the command.
+    #[test]
+    fn the_report_the_command_prints_names_the_command() {
+        let read = parked_read();
+        let json = report(&read, true, &TimeZone::UTC);
+        let document: Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            document["projects"][0]["tickets"][0]["waits"]["text"],
+            PARKED_TERMINAL
+        );
+        assert!(!json.contains("Restart"), "{json}");
+        let text = report(&read, false, &TimeZone::UTC);
+        assert!(text.contains("`owlshift continue`"), "{text}");
+        assert!(!text.contains("Restart"), "{text}");
     }
 }

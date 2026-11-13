@@ -18,7 +18,8 @@
 //! - a card: `ticket`, `project`, `title` (ready.json's, else the dispatch
 //!   event's), `priority`, `column`, `stage`, `ref_status`, `running`
 //!   (`slot`, `since`, `role` of the ticket's latest run), `wait` (the shape
-//!   `status --waits --json` prints, worded by `why::phrase`), `needs_you`
+//!   `status --waits --json` prints, worded by `why::phrase` or, for a parked
+//!   ticket, in the UI's voice), `needs_you`
 //!   (`question`, `plan`, `review`, `parked` or null), `pull_request`,
 //!   `strip` (eight cells in pipeline order, `done`, `current` or `todo`),
 //!   `position` in `ready.json`, `drain` (what the drain made of a ticket
@@ -48,6 +49,7 @@ use super::eventtail::{EventTail, Run, lookup};
 use crate::project::ProjectDirs;
 use crate::ready;
 use crate::status::waits::{self, RefDetail};
+use crate::voice::Voice;
 
 /// The column a card is in.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -592,7 +594,7 @@ pub fn gather(data: &Path, tail: &mut EventTail, concurrent_runs: u32, now: Time
         &mut |repository| tail.folded(repository),
         notes,
     );
-    let built = waits::build(&read);
+    let built = waits::build(&read, Voice::Ui);
     let aux: Vec<Aux> = read
         .projects
         .iter()

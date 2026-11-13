@@ -1917,7 +1917,7 @@ pub fn graph_read(
             (project.repository.clone(), input)
         })
         .collect();
-    graph::of(&waits::build(&read), &ready)
+    graph::of(&waits::build(&read, Voice::Ui), &ready)
 }
 
 /// The graph now, the personal file read again for `concurrent_runs`.

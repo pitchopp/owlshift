@@ -7,6 +7,7 @@ use owlshift_contracts::refs::{Ended, EndedWhy};
 use owlshift_contracts::service::{KeptFile, ServedConfig};
 use owlshift_contracts::waits::{Behind, RefStatus, StatusWaits, WaitResource};
 use owlshift_runner::status::waits;
+use owlshift_runner::voice::Voice;
 use owlshift_runner::{ready, served, why};
 
 use super::parallel_scenarios::{
@@ -19,7 +20,7 @@ use super::*;
 fn waits_of(bench: &Bench) -> (StatusWaits, String) {
     let repo = Repo::parse(REPO).unwrap();
     let read = waits::gather(&bench.data, Some(&repo), 2, bench.clock.get());
-    let built = waits::build(&read);
+    let built = waits::build(&read, Voice::Terminal);
     let text = waits::render(&built, &TimeZone::UTC);
     (built, text)
 }
@@ -166,7 +167,7 @@ fn graph_and_document(
 ) -> (Value, StatusWaits) {
     let now = bench.clock.get();
     let graph = owlshift_runner::ui::server::graph_read(&bench.data, tail, 2, now);
-    let document = waits::build(&waits::gather(&bench.data, None, 2, now));
+    let document = waits::build(&waits::gather(&bench.data, None, 2, now), Voice::Ui);
     (serde_json::to_value(graph).unwrap(), document)
 }
 

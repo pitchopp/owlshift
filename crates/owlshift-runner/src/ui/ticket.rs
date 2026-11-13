@@ -701,7 +701,7 @@ fn waits(inputs: &Inputs, repo: &Repo, ticket: &TicketId) -> Result<Value, Strin
         return Ok(value.clone());
     }
     let read = status::waits::gather(inputs.data, Some(repo), inputs.concurrent_runs, inputs.now);
-    let built = status::waits::build(&read);
+    let built = status::waits::build(&read, Voice::Ui);
     let name = repo.to_string();
     let project = built
         .projects

@@ -17,6 +17,7 @@ use owlshift_runner::status::{gather_files, waits};
 use owlshift_runner::ui::eventtail::EventTail;
 use owlshift_runner::ui::header;
 use owlshift_runner::ui::overview::{self, Overview};
+use owlshift_runner::voice::Voice;
 
 use super::drain_scenarios::ready_now;
 use super::parallel_scenarios::{parallel_bench, planned, standard_declaring};
@@ -33,7 +34,10 @@ fn registered(bench: &Bench) {
 
 /// What `owlshift status --waits` reads of the served projects now.
 fn waits_doc(bench: &Bench) -> StatusWaits {
-    waits::build(&waits::gather(&bench.data, None, 2, bench.clock.get()))
+    waits::build(
+        &waits::gather(&bench.data, None, 2, bench.clock.get()),
+        Voice::Ui,
+    )
 }
 
 fn log_size(bench: &Bench) -> u64 {
@@ -384,6 +388,31 @@ fn the_overview_matches_status_waits_and_ready_json_pass_by_pass() {
     let built = watched.build(&bench);
     let _ = matches_status(&bench, &built, &waits_doc(&bench), &report);
     assert_eq!(card(&built, "DEMO-1")["needs_you"], "parked");
+    // The card says Restart, the button the page offers; the command's own
+    // document keeps `owlshift continue`. Both give the same reason.
+    let shown = card(&built, "DEMO-1")["wait"].clone();
+    assert_eq!(shown["reason"], "parked");
+    assert_eq!(
+        shown["text"],
+        "parked: waits for a person's Restart, and keeps what it holds"
+    );
+    let printed = waits::build(
+        &waits::gather(&bench.data, None, 2, bench.clock.get()),
+        Voice::Terminal,
+    );
+    let printed = printed.projects[0]
+        .tickets
+        .iter()
+        .find(|row| row.ticket.as_str() == "DEMO-1")
+        .and_then(|row| row.waits.as_ref())
+        .expect("the parked ticket's wait");
+    assert_eq!(printed.reason, "parked");
+    assert!(
+        printed.text.contains("`owlshift continue`"),
+        "{}",
+        printed.text
+    );
+    assert!(!printed.text.contains("Restart"), "{}", printed.text);
     assert_eq!(for_you_counts(&built), header_counts(&bench));
     assert_eq!(for_you_counts(&built), (0, 0, 1));
     // The parked ticket is first in the list.
