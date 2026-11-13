@@ -17,26 +17,66 @@ Owlshift is an open-source runner that works a team's existing backlog continuou
 
 ## Status
 
-Early development. Steps P0 and P1 of the roadmap are built: the CLI runs one ticket to a verified pull request in the foreground. P2, questions on the ticket, is in progress: a run's questions are posted on the ticket, and `owlshift continue` picks the ticket up once they are answered. P3 has started with `owlshift watch`, which does that by itself. The commands available today:
+Release 0.1.0 is the first ([changelog](CHANGELOG.md)). Owlshift takes tickets from Linear, from GitHub Issues, or from Markdown files in your repository, runs each through intake, design, design review, build and verify with Claude Code, asks on the ticket when a decision is yours, and opens a verified pull request. A background service drains a project's ready tickets, several at a time without collisions, and repairs its own red or conflicting pull requests. It runs on macOS and Linux, and on Windows through WSL2. Owlshift is still young: the roadmap's later steps (shared team servers, more trackers and forges, a desktop app) are in [`docs/design/`](docs/design/).
 
-- `owlshift doctor`: check whether this machine is ready (git, the harness CLIs and their logins, the agent runs' isolation and Claude Code token, the configuration files, whether the GitHub credential can read the repository's branches), and say why each problem matters and how to fix it. Designed, not built yet: lines for Owlshift's GitHub App, installed on the repository, its token valid and each permission it asks, and a warning on a personal token, the expert option ([design](docs/design/build-plan.md), "GitHub App sign-in (OWL-336)").
-- `owlshift config show`: print the effective configuration and the file each value comes from.
-- `owlshift init`: write a commented `owlshift.toml` for this repository, then store its tracker and forge secrets (under keychain accounts named by its GitHub repository) and the agent runs' Claude Code token that `owlshift do` needs in the system keychain. Designed, not built yet: signing in to GitHub through Owlshift's GitHub App, with a code to enter on GitHub and no token to make, a personal token through `--github-token` staying the expert option.
-- `owlshift do TICKET`: run one ticket to a verified pull request, in the foreground; questions the run needs answered are posted on the ticket. The gate and rules come from the `owlshift.toml` of the commit the ticket's branch was made from, so a change to them applies once merged ([design](docs/design/architecture.md), "Which commit configures a run").
-- `owlshift continue TICKET`: once the ticket's questions are answered there and the answer has been left unedited for 10 minutes, or the project's `policy.quiet_window_minutes` (or ends with `go`), check the answers, then ask again what is missing or run on to a verified pull request; restarts a parked ticket. With `--to-watch`, restarts it and returns without running it, leaving `owlshift watch` to drive it from its next pass.
-- `owlshift watch`: in the foreground, continue each ticket whose questions wait, as `owlshift continue` would, once its decider's reply counts. A first Ctrl-C ends it once the steps under way finish, a second (or SIGTERM) stops them and checks their runs, a third stops everything at once. It also resumes a ticket at Intake, Design, Design review, Build or Verify that an answered round (round > 0) left shown working or needing input, a refusal after the answer check included. A parked ticket, or one left at Build before any question round, still needs `owlshift continue`. With `--drain`, it also takes in the admitted tickets of the ready column (`[tracker].admit` by an account `[tracker].admitters` lists), intake first, and builds them one at a time.
-- `owlshift forget TICKET`: start over what Owlshift keeps on a ticket when that record has no room left or cannot be read; its asks and decisions go, their comments staying on the ticket, and its round count and the refusals its next runs are told stay.
-- `owlshift gate [--at COMMIT]`: run the project's gate once, as a Build's gate runs it: in a fresh worktree of origin's default branch (or of `COMMIT`, a full commit id or a branch such as `origin/fix-gate`), confined, with the variables `stack.gate_env` declares and `allow_gate_env` allows and the home caches `stack.caches` declares and `allow_caches` allows, after the project's `stack.setup` commands; the gate is the project file's at that commit, or yours when it has none. It prints each command's last lines, status and time, then removes the worktree, unless the gate broke isolation, which leaves the project refused until a person looks.
-- `owlshift unquarantine`: clear the quarantine a run whose isolation check did not pass leaves on this project, which makes every command refuse it; Owlshift notifies you of it once, and tells each ticket it holds up. It shows what the marker says, then clears it once you type the project's name (`owner/repo`) at a terminal; the dedicated checkout and the worktrees stay as they are.
-- `owlshift logs [TICKET] [--last N] [--follow]`: print the events `owlshift do`, `owlshift continue`, `owlshift watch` and `owlshift forget` recorded, oldest first, optionally only one ticket's, only the last N with `--last N`, and keep printing new ones with `--follow`.
+## Requirements
 
-There is no packaged release yet. Install from source:
+- **Operating system:** macOS or Linux, on Apple silicon, Intel, x86_64 or arm64; Windows through WSL2, running as Linux. Native Windows is refused, since Owlshift cannot confine an agent there.
+- **On Linux, bubblewrap (`bwrap`):** every agent run is confined with it, and Owlshift runs no agent without it. `owlshift doctor` says whether it can confine a run, and how to fix it when it cannot.
+- **On Linux, a Secret Service** such as GNOME Keyring, where Owlshift keeps its secrets, as macOS keeps them in the Keychain. A server or WSL2 without a desktop session may need one started.
+- **git 2.39.0 or later.**
+- **Claude Code (`claude`) installed, and a Claude subscription:** Claude Code runs every role, reviewers included. Agent runs log in with a long-lived token of your subscription that you make with `claude setup-token`; Owlshift never asks for a model API key. Codex is optional.
+- **A repository on GitHub,** where Owlshift pushes branches and opens pull requests through its GitHub App, which you sign in to during `owlshift init`.
+
+## Quick start
+
+Install the latest release.
 
 ```bash
-cargo install --path crates/owlshift-cli --locked
+# macOS
+brew tap pitchopp/owlshift https://github.com/pitchopp/owlshift
+brew trust --formula pitchopp/owlshift/owlshift
+brew install owlshift
+
+# Linux, and Windows through WSL2: installs ~/.local/bin/owlshift
+curl -fsSL https://raw.githubusercontent.com/pitchopp/owlshift/main/install.sh | sh
 ```
 
-The "Development" section of [CONTRIBUTING.md](CONTRIBUTING.md#development) covers the rest. The design is in [`docs/design/`](docs/design/):
+Homebrew asks for `brew trust` because the repository is its own tap, not one of Homebrew's. The Linux script checks the archive against the release's `SHA256SUMS` before it installs anything; [SECURITY.md](SECURITY.md) says how to check the release's signature too. Then check the install:
+
+```bash
+owlshift --version
+owlshift doctor
+```
+
+Outside a repository, `owlshift doctor` checks the machine: git, Claude Code, and whether agent runs can be confined. To update later, run `brew upgrade owlshift` on macOS, or `owlshift self-update` for an install made by the script.
+
+To build from source instead, with Rust 1.98 or later: `cargo install --git https://github.com/pitchopp/owlshift --locked owlshift-cli`.
+
+### Adopt a project
+
+Then follow the page of the tracker your tickets live in. Each takes you from `owlshift init` in your repository to a first pull request, then to the background service:
+
+| Your tickets live in | Page |
+| --- | --- |
+| Linear | [Adopt a project on Linear](docs/adopt/linear.md) |
+| GitHub Issues, in the repository itself | [Adopt a project on GitHub Issues](docs/adopt/github-issues.md) |
+| Nowhere yet, or you want to try without an account | [Adopt a project with Markdown tickets](docs/adopt/markdown.md) |
+
+The commands, in the order the pages use them:
+
+- `owlshift init`: write a commented `owlshift.toml` for the repository, with a gate guessed from its stack, sign in to GitHub, and keep the secrets in the system keychain.
+- `owlshift doctor`: check this machine and this project, and say how to fix each problem.
+- `owlshift gate`: run the project's gate once, confined as an agent's run, to check it before any agent depends on it.
+- `owlshift do TICKET`: run one ticket to a verified pull request, in the foreground; its questions are posted on the ticket.
+- `owlshift continue TICKET`: go on once the ticket's questions are answered there.
+- `owlshift start`: serve the project with the background service, which takes the tickets you admit; `owlshift status`, `owlshift why` and `owlshift logs` say what it does and why a ticket waits; `owlshift stop` stops it.
+
+`owlshift --help` lists every command, and `owlshift help` followed by a command's name, as in `owlshift help do`, explains it. [SECURITY.md](SECURITY.md) says what the confinement of agent runs protects, and what it does not.
+
+## Design
+
+The design is in [`docs/design/`](docs/design/):
 
 | Document | What it holds |
 | --- | --- |
@@ -44,32 +84,10 @@ The "Development" section of [CONTRIBUTING.md](CONTRIBUTING.md#development) cove
 | [Scenarios](docs/design/scenarios.md) | Seventeen user stories with acceptance criteria; each becomes an end-to-end test |
 | [Runtime & operations](docs/design/runtime-and-operations.md) | How it runs, platforms, install and uninstall, updates, configuration, observability, testing |
 | [Roadmap](docs/design/roadmap.md) | Twelve shippable steps, P0 to P11, with their exit gates |
-| [Build plan](docs/design/build-plan.md) | Checks to run first, workspace layout, contracts, CLI, tasks for P0 and P1 |
+| [Build plan](docs/design/build-plan.md) | Checks to run first, workspace layout, contracts, CLI, tasks for each step |
 | [Visual identity](docs/design/visual-identity.md) | Personality, voice, logo, colours, typefaces, and how each surface applies them |
 
-## Requirements
-
-- **Operating system:** macOS or Linux; Windows through WSL2, running as Linux ([Platforms](docs/design/runtime-and-operations.md#platforms)).
-- **git:** 2.39.0 or later, a prerequisite that `owlshift doctor` checks ([Install, lifecycle & uninstall](docs/design/runtime-and-operations.md#install-lifecycle--uninstall)).
-- **Claude Code (`claude`),** on your own subscription, which runs every role, reviewers included; Codex is not required, and a project can add a Codex reviewer to each review with `pipeline.codex_reviewer` ([Install, lifecycle & uninstall](docs/design/runtime-and-operations.md#install-lifecycle--uninstall)).
-- **Tracker and forge accounts:** one on the tracker whose tickets Owlshift works and one on the forge that hosts the repository; `owlshift init` keeps their secrets in the system keychain ([Adapters & contracts](docs/design/architecture.md#6-adapters--contracts)).
-- **Rust toolchain 1.98 or later**, only for a build from source ([Technology choices](docs/design/architecture.md#10-technology-choices)).
-
-## Quick start
-
-From a clone of the repository you want worked, once `owlshift` is installed:
-
-```bash
-owlshift init
-owlshift doctor
-owlshift do OWL-12
-owlshift watch
-```
-
-- `owlshift init`: write a commented `owlshift.toml` and store the tracker and forge secrets and the agent runs' Claude Code token in the system keychain.
-- `owlshift doctor`: check that this machine is ready, and say how to fix what is not.
-- `owlshift do OWL-12`: run that ticket to a verified pull request, in the foreground; if the run needs a decision, it posts its questions on the ticket.
-- `owlshift watch`: continue the ticket once its questions are answered there, until Ctrl-C.
+The "Development" section of [CONTRIBUTING.md](CONTRIBUTING.md#development) covers building and testing Owlshift itself.
 
 ## Project tracking
 

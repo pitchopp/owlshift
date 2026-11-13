@@ -91,4 +91,4 @@ Contributions are accepted under the [Apache License 2.0](LICENSE), the licence 
 
 ## Security
 
-Do not open a public issue for a vulnerability. Use GitHub's private vulnerability reporting on this repository once it is public; until then, contact the maintainer directly.
+Do not open a public issue for a vulnerability: report it through GitHub's private vulnerability reporting, as [SECURITY.md](SECURITY.md) says. SECURITY.md also says what the confinement of agent runs protects, and what it does not.
