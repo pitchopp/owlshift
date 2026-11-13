@@ -12,7 +12,7 @@ use owlshift_contracts::config::{self, ProjectConfig};
 use owlshift_contracts::ids::TicketId;
 use owlshift_platform::keychain::Secret;
 
-use super::{ForgeCredential, Kind, Opener, StatesError};
+use super::{Connected, Doctored, ForgeCredential, Kind, Opener, Setup, StatesError};
 use crate::doctor::{Check, DOES_NOT_BLOCK, Section};
 use crate::init::SecretSpec;
 use crate::secrets::{TrackerAccounts, TrackerSecrets};
@@ -61,25 +61,16 @@ kind = \"markdown\"
         }))
     }
 
-    /// None: nothing of a Markdown tracker is read over the network.
-    fn doctor_lines(
+    /// Nothing: nothing of a Markdown tracker is read over the network, and
+    /// the drain admission line has only the faults that need no tracker.
+    fn doctor(
         &self,
         _system: &dyn System,
         _config: &ProjectConfig,
         _accounts: Option<&TrackerAccounts>,
-    ) -> Vec<Check> {
-        Vec::new()
-    }
-
-    /// None: the drain admission line has only the faults that need no
-    /// tracker.
-    fn admission_facts(
-        &self,
-        _system: &dyn System,
-        _config: &ProjectConfig,
-        _accounts: Option<&TrackerAccounts>,
-    ) -> Option<Result<AdmissionFacts, StatesError>> {
-        None
+        _repo: Option<&Repo>,
+    ) -> Doctored {
+        Doctored::default()
     }
 
     /// A Markdown project files a proposal at the stage `Triage` (OWL-267),
@@ -121,5 +112,10 @@ kind = \"markdown\"
 
     fn stores_app(&self) -> bool {
         false
+    }
+
+    /// Nothing to ask: the tickets are files of the checkout (OWL-537).
+    fn connect(&self, _setup: &Setup<'_>) -> Result<Connected, String> {
+        Ok(Connected::default())
     }
 }

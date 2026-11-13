@@ -42,6 +42,10 @@ pub struct InitOptions {
     /// What [`owlshift_core::stack::detect`] read from the root: its gate
     /// is written unless `gate` is given, its setup always.
     pub detected: Detection,
+    /// The account `init` signed in to the tracker as, written as the
+    /// admitter where the tracker names one (GitHub Issues, OWL-537); `None`
+    /// when the tracker was not asked.
+    pub admitter: Option<String>,
 }
 
 /// The commented project file for `options`, checked to parse as the
@@ -106,16 +110,11 @@ requires = \">={}.{}\"
     } else {
         commands_block("setup", &setup_lines, &quote)
     };
+    let admission =
+        crate::tracker::of(options.tracker).admission_lines(options.admitter.as_deref());
     text.push_str(&format!(
         "\
-# How a person admits a ticket to Owlshift's queue: {{ label = \"...\" }},
-# \"ready\" (the move to the ready state below, which {{ state = \"...\" }}
-# would repeat) or \"delegation\". `owlshift do TICKET` does not use it: it
-# runs the ticket it is given.
-admit = {{ label = \"agent\" }}
-# The tracker states that show where a ticket stands.
-states = {{ ready = \"Todo\", working = \"In Progress\", needs_input = \"Needs Input\", review = \"In Review\" }}
-
+{admission}
 [stack]
 # The project's full gate: lint, formatter and tests, run in order from the
 # repository root. Owlshift runs it on the commit it delivers; the build
@@ -167,6 +166,30 @@ always_human = []
     ProjectConfig::parse(&text)
         .map_err(|error| format!("the project file this would write is invalid: {error}"))?;
     Ok(text)
+}
+
+/// Writes the project file of `options` at `root` once the tracker
+/// answered (OWL-537; build plan "P9 · Open-source readiness", part 6):
+/// `connected` is what [`crate::tracker::Kind::connect`] gave, its account
+/// written as the admitter. When the tracker did not answer, nothing is
+/// written and the error says why.
+pub fn write_once_connected(
+    root: &Path,
+    options: &InitOptions,
+    connected: Result<&crate::tracker::Connected, &str>,
+) -> Result<Written, String> {
+    let connected = connected.map_err(|reason| {
+        format!(
+            "the tracker did not answer: {reason}. {PROJECT_FILE} was not written: fix that, then \
+             run `owlshift init` again"
+        )
+    })?;
+    let options = InitOptions {
+        admitter: connected.admitter.clone(),
+        ..options.clone()
+    };
+    let text = project_file(&options)?;
+    write_project_file(root, &text).map_err(|error| format!("{PROJECT_FILE}: {error}"))
 }
 
 /// A `key = [...]` block, each command preceded by the comment saying what it
@@ -669,7 +692,86 @@ mod tests {
             team: team.map(ToOwned::to_owned),
             gate: gate.iter().map(|c| (*c).to_owned()).collect(),
             detected: Detection::default(),
+            admitter: None,
         }
+    }
+
+    /// OWL-537: a GitHub Issues project names its stages as labels, its
+    /// admitter by numeric id when `init` signed in, a placeholder when it
+    /// did not; its priorities are commented out and valid once uncommented.
+    /// Linear's lines are the ones written before.
+    #[test]
+    fn a_github_project_names_its_labels_and_its_admitter() {
+        let github = |admitter: Option<&str>| {
+            project_file(&InitOptions {
+                admitter: admitter.map(ToOwned::to_owned),
+                ..options(TrackerKind::Github, None, &[])
+            })
+            .unwrap()
+        };
+        let signed_in = github(Some("583231"));
+        let config = ProjectConfig::parse(&signed_in).unwrap();
+        assert_eq!(config.tracker.kind, TrackerKind::Github);
+        assert_eq!(
+            config.tracker.admitters.as_deref(),
+            Some(&["583231".to_owned()][..])
+        );
+        assert_eq!(config.tracker.states.ready, "agent:ready");
+        assert_eq!(config.tracker.states.needs_input, "agent:needs-input");
+        assert_eq!(config.tracker.priorities, None);
+        let prioritised = signed_in.replace("# [tracker.priorities]", "[tracker.priorities]");
+        let prioritised = ["urgent", "high", "medium", "low"]
+            .iter()
+            .fold(prioritised, |text, p| {
+                text.replace(&format!("# {p} = "), &format!("{p} = "))
+            });
+        let priorities = ProjectConfig::parse(&prioritised)
+            .unwrap()
+            .tracker
+            .priorities;
+        assert_eq!(
+            priorities.unwrap().urgent.as_deref(),
+            Some("priority:urgent")
+        );
+
+        let unchecked = github(None);
+        assert_eq!(
+            ProjectConfig::parse(&unchecked).unwrap().tracker.admitters,
+            None
+        );
+        assert!(unchecked.contains("# admitters = ["), "{unchecked}");
+
+        let linear = project_file(&options(TrackerKind::Linear, Some("OWL"), &[])).unwrap();
+        assert!(
+            linear.contains(&format!("{}\n[stack]\n", crate::tracker::ADMISSION_LINES)),
+            "{linear}"
+        );
+    }
+
+    /// OWL-537: the project file is written only once the tracker answered,
+    /// with the account it gave as the admitter.
+    #[test]
+    fn the_project_file_is_written_only_once_the_tracker_answered() {
+        let root = tempfile::tempdir().unwrap();
+        let options = options(TrackerKind::Github, None, &[]);
+        let error =
+            write_once_connected(root.path(), &options, Err("HTTP 403 refused")).unwrap_err();
+        assert!(
+            error.contains("HTTP 403 refused") && error.contains("was not written"),
+            "{error}"
+        );
+        assert!(!root.path().join(PROJECT_FILE).exists());
+
+        let connected = crate::tracker::Connected {
+            admitter: Some("7".into()),
+            created: Vec::new(),
+        };
+        assert_eq!(
+            write_once_connected(root.path(), &options, Ok(&connected)),
+            Ok(Written::Created)
+        );
+        let text = std::fs::read_to_string(root.path().join(PROJECT_FILE)).unwrap();
+        assert!(text.contains("admitters = [\"7\"]"), "{text}");
     }
 
     #[test]

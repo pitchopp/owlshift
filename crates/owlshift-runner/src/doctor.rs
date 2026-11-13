@@ -325,11 +325,19 @@ pub fn run(system: &dyn System, config: &Effective, own: &BuildIdentity) -> Repo
         } => Some((crate::tracker::of(project.tracker.kind), project)),
         _ => None,
     };
-    if let Some((kind, project)) = tracker {
-        checks.extend(kind.doctor_lines(system, project, accounts));
-    }
-    let facts = tracker.and_then(|(kind, project)| kind.admission_facts(system, project, accounts));
-    checks.extend(drain_admission_check(config, facts.as_ref()));
+    let repo = match &stored {
+        Some(Ok(found)) => Some(&found.repo),
+        _ => None,
+    };
+    let doctored = tracker.map(|(kind, project)| kind.doctor(system, project, accounts, repo));
+    let facts = doctored.and_then(|doctored| {
+        checks.extend(doctored.lines);
+        doctored.facts
+    });
+    let words = tracker.map_or(&crate::tracker::LINEAR_WORDS, |(kind, _)| {
+        kind.admission_words()
+    });
+    checks.extend(drain_admission_check(config, facts.as_ref(), words));
     checks
         .extend(tracker.and_then(|(kind, project)| kind.proposals_inbox(project, facts.as_ref())));
     checks.extend(forge_reviewers_check(config));
@@ -1316,8 +1324,8 @@ fn served_check(system: &dyn System, config: &Effective) -> Option<Check> {
 /// implement yet is a warning, not a failure: `owlshift do` needs only to
 /// read tickets and comments and move the visible stage, and refusing a project is `init`'s job. The
 /// check reads the adapter's constants: it opens neither the tracker nor the
-/// keychain; the tracker's own lines do, for a Linear project
-/// ([`crate::tracker::Kind::doctor_lines`]).
+/// keychain; the tracker's own lines do, for a Linear or GitHub Issues project
+/// ([`crate::tracker::Kind::doctor`]).
 fn tracker_check(config: &Effective) -> Check {
     const SUBJECT: &str = "tracker";
     let FileState::Loaded { config, .. } = &config.project else {
@@ -1627,6 +1635,7 @@ fn budget_check(config: &Effective) -> Option<Check> {
 fn drain_admission_check(
     config: &Effective,
     facts: Option<&Result<AdmissionFacts, StatesError>>,
+    words: &crate::tracker::AdmissionWords,
 ) -> Option<Check> {
     const SUBJECT: &str = "drain admission";
     let FileState::Loaded { config, .. } = &config.project else {
@@ -1638,28 +1647,20 @@ fn drain_admission_check(
     match &tracker.admit {
         Admit::Delegation => {
             problems.push("`admit = \"delegation\"` is not built".to_owned());
-            fixes.push(
-                "Decision D8's app takes no delegation scope, so nothing can be delegated to \
-                 Owlshift: set `admit` under `[tracker]` to `{ label = … }` or `\"ready\"`.",
-            );
+            fixes.push(words.delegation_fix);
         }
         Admit::Label(_) | Admit::State(_) => {}
     }
     if tracker.admitters.is_none() {
         problems.push("`admitters` is not set under `[tracker]`".to_owned());
-        fixes.push(
-            "List under `admitters` the Linear user ids whose gesture admits a ticket; with none, \
-             no ticket is ever admitted.",
-        );
+        fixes.push(words.admitters_unset_fix);
     }
     let checked = matches!(facts, Some(Ok(_)));
     match facts {
         Some(Ok(found)) => {
             let mut missing_label = |what: &str, name: &str| {
                 if !found.labels.iter().any(|l| l == name) {
-                    problems.push(format!(
-                        "the {what} label {name:?} exists on neither team nor workspace"
-                    ));
+                    problems.push(format!("the {what} label {name:?} {}", words.label_missing));
                     return true;
                 }
                 false
@@ -1672,34 +1673,24 @@ fn drain_admission_check(
                 absent |= missing_label("exclusion", exclude);
             }
             if absent {
-                fixes.push(
-                    "Create the label in Linear, on the team or the workspace, or set the name \
-                     as Linear has it: names match exactly, case included.",
-                );
+                fixes.push(words.label_fix);
             }
             let mut accounts = false;
             for id in tracker.admitters.iter().flatten() {
                 match found.accounts.iter().find(|a| same_account(&a.id, id)) {
-                    None => {
-                        problems.push(format!("admitter {id:?} is no account of the workspace"))
-                    }
+                    None => problems.push(format!("admitter {id:?} {}", words.no_account)),
                     Some(a) if a.app => {
-                        problems.push(format!(
-                            "admitter {id:?} is an app user, which never admits"
-                        ));
+                        problems.push(format!("admitter {id:?} {}", words.app_account));
                     }
                     Some(a) if !a.active => {
-                        problems.push(format!("admitter {id:?} is a deactivated account"));
+                        problems.push(format!("admitter {id:?} {}", words.deactivated));
                     }
                     Some(_) => continue,
                 }
                 accounts = true;
             }
             if accounts {
-                fixes.push(
-                    "Set `admitters` to the ids of active people of the workspace, as Linear \
-                     gives them (a user's `id`).",
-                );
+                fixes.push(words.accounts_fix);
             }
         }
         Some(Err(StatesError::Tracker(error))) => {
@@ -1715,7 +1706,7 @@ fn drain_admission_check(
         };
         let admitters = tracker.admitters.iter().flatten().count();
         let scope = if checked {
-            "labels and admitters exist in Linear"
+            words.checked
         } else {
             "not checked against the tracker"
         };
@@ -4863,6 +4854,85 @@ states = { ready = "Todo", working = "Doing", needs_input = "Asked", review = "R
         // No project file: nothing to check.
         let report = run(&system, &no_config());
         assert!(report.checks.iter().all(|c| c.subject != "drain admission"));
+    }
+
+    /// OWL-537: a GitHub Issues project's lines, from one read of its
+    /// repository: the Issues permission refused fails with its fix; a label
+    /// the project names that the repository lacks, and an admitter GitHub
+    /// does not know, warn, in GitHub's words; the proposals inbox is the
+    /// `agent:proposed` label.
+    #[test]
+    fn a_github_project_names_a_missing_permission_label_and_admitter() {
+        use crate::tracker::GithubFacts;
+        use owlshift_adapters::tracker::github::IssuesAccess;
+        let ready = || logged_in(with_harnesses(with_git(FakeSystem::default())));
+        let (_dir, config) = project_tracked_by(
+            r#"kind = "github"
+admit = "ready"
+admitters = ["1", "404"]
+states = { ready = "agent:ready", working = "agent:working", needs_input = "agent:needs-input", review = "agent:review" }"#,
+        );
+        let report = run(&ready(), &config);
+        assert_eq!(line(&report, "tracker access").status, Status::Ok);
+        assert_eq!(line(&report, "tracker labels").status, Status::Ok);
+        assert_eq!(line(&report, "proposals inbox").status, Status::Ok);
+        let admission = line(&report, "drain admission");
+        assert!(
+            admission.detail.ends_with("exist on GitHub"),
+            "{admission:?}"
+        );
+
+        let refused = run(
+            &ready().github_facts_are(Ok(GithubFacts {
+                access: IssuesAccess::Refused(
+                    "HTTP 403 Resource not accessible by integration".into(),
+                ),
+                labels: None,
+                accounts: None,
+            })),
+            &config,
+        );
+        let access = line(&refused, "tracker access");
+        assert_eq!(access.status, Status::Fail);
+        assert!(access.detail.contains("HTTP 403"), "{access:?}");
+        assert!(
+            format!("{:?}", access.fix).contains("Issues (read and write) permission"),
+            "{access:?}"
+        );
+        assert!(!refused.ready());
+        assert!(refused.checks.iter().all(|c| c.subject != "tracker labels"));
+
+        let lacking = run(
+            &ready().github_facts_are(Ok(GithubFacts {
+                access: IssuesAccess::Granted,
+                labels: Some(vec![
+                    "Agent:Ready".into(),
+                    "agent:working".into(),
+                    "agent:review".into(),
+                ]),
+                accounts: Some(vec![crate::system::AccountFact {
+                    id: "1".into(),
+                    app: false,
+                    active: true,
+                }]),
+            })),
+            &config,
+        );
+        let labels = line(&lacking, "tracker labels");
+        assert_eq!(labels.status, Status::Warn);
+        assert_eq!(
+            labels.detail,
+            "github.com/pitchopp/owlshift has no label \"agent:needs-input\", \"agent:proposed\""
+        );
+        let admission = line(&lacking, "drain admission");
+        assert_eq!(admission.status, Status::Warn);
+        assert_eq!(admission.detail, "admitter \"404\" is no GitHub account");
+        assert!(
+            admission.why.as_deref().unwrap().contains("numeric ids"),
+            "{admission:?}"
+        );
+        assert_eq!(line(&lacking, "proposals inbox").status, Status::Warn);
+        assert!(lacking.ready(), "{lacking}");
     }
 
     /// OWL-155: a proposal goes to the triage inbox, else to the backlog

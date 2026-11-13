@@ -597,15 +597,8 @@ pub struct AdmissionFacts {
     pub accounts: Vec<AccountFact>,
 }
 
-/// One account of the workspace.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct AccountFact {
-    pub id: String,
-    /// An app user, which never admits.
-    pub app: bool,
-    /// Not deactivated.
-    pub active: bool,
-}
+/// One account of the workspace, as [`super::AccountFact`] says it.
+pub use super::AccountFact;
 
 impl LinearTracker {
     /// The facts behind doctor's admission lines, read only (checked

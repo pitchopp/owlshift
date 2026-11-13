@@ -61,6 +61,9 @@ use crate::forge;
 use crate::forge::github::{GitHubForge, Verb};
 
 mod drain;
+mod setup;
+
+pub use setup::IssuesAccess;
 
 /// The most items a page lists, GitHub's cap.
 const PAGE: usize = 100;
@@ -700,14 +703,21 @@ mod tests {
             self
         }
 
+        /// The first answer given for `call`; one given again later for the
+        /// same call replaces it once it has answered, so a call can answer
+        /// differently on its next asking (OWL-537).
         fn answer(&self, call: String) -> (u16, String, Option<String>) {
             self.calls.lock().unwrap().push(call.clone());
-            let answers = self.answers.lock().unwrap();
-            let (_, status, body, etag) = answers
+            let mut answers = self.answers.lock().unwrap();
+            let at = answers
                 .iter()
-                .find(|(c, _, _, _)| *c == call)
+                .position(|(c, _, _, _)| *c == call)
                 .unwrap_or_else(|| panic!("no answer for {call}"));
-            (*status, body.to_string(), etag.clone())
+            let (_, status, body, etag) = answers[at].clone();
+            if answers[at + 1..].iter().any(|(c, _, _, _)| *c == call) {
+                answers.remove(at);
+            }
+            (status, body.to_string(), etag)
         }
 
         pub(super) fn calls(&self) -> Vec<String> {
