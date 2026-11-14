@@ -65,8 +65,8 @@ use owlshift_contracts::ids::TicketId;
 use owlshift_contracts::config::Admit;
 
 use super::{
-    Author, Capability, Column, Comment, Error, ErrorKind, Filed, Found, Gesture, Links, Listed,
-    Person, Proposal, Reaction, Relations, StateType, Ticket, Tracker,
+    Author, Capability, Column, Comment, Error, ErrorKind, Filed, Found, Gesture, KeyAccount,
+    Links, Listed, Person, Proposal, Reaction, Relations, StateType, Ticket, Tracker,
 };
 use crate::forge;
 use crate::forge::github::{GitHubForge, Verb};
@@ -458,6 +458,53 @@ impl Tracker for GitHubTracker {
     }
 }
 
+impl GitHubTracker {
+    /// The account of the credential this adapter reads with: `GET user`,
+    /// which a token acting as a person answers with that person's account,
+    /// the one a comment posted through it comes from (G1, G7). Its numeric
+    /// id as text is what the decider of an ask holds ([`User::author`]), its
+    /// login the name, and any type but `User` is an app's, which is never an
+    /// operator's. A GitHub account has no workspace, so the page gets no link.
+    pub fn key_account(&self) -> Result<KeyAccount, Error> {
+        let text = self.read_account("user")?;
+        let user: User = parse(&text, &"the signed-in account")?;
+        Ok(KeyAccount {
+            id: user.id.to_string(),
+            name: user.login,
+            app: user.kind != "User",
+            workspace: String::new(),
+        })
+    }
+
+    /// The login GitHub shows for the account `id`, read through the
+    /// credential (`GET user/<id>`): what the local web UI names a ticket's
+    /// decider by when the key is not theirs. `None` for an id that is not
+    /// digits (asked for nothing), for an account GitHub does not know (404),
+    /// for an answer about another id, and for a blank login.
+    pub fn account_name(&self, id: &str) -> Result<Option<String>, Error> {
+        if id.is_empty() || !id.bytes().all(|b| b.is_ascii_digit()) {
+            return Ok(None);
+        }
+        let text = match self.read_account(&format!("user/{id}")) {
+            Ok(text) => text,
+            Err(error) if error.kind == ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error),
+        };
+        let user: User = parse(&text, &format!("account {id}"))?;
+        Ok((user.id.to_string() == id)
+            .then(|| user.login.trim().to_owned())
+            .filter(|login| !login.is_empty()))
+    }
+
+    /// A read of an account: [`Self::read`] without the advice about the
+    /// Issues permission, which has nothing to do with it.
+    fn read_account(&self, path: &str) -> Result<String, Error> {
+        self.forge
+            .rest_text_cached(path)
+            .map_err(|error| Error::new(error_kind(error.kind), error.message))
+    }
+}
+
 /// The issue number `id` names: digits only, without a leading zero.
 /// Anything else names no issue of GitHub's, and is not found without a
 /// request.
@@ -522,16 +569,21 @@ fn parse<T: for<'de> Deserialize<'de>>(
     })
 }
 
-/// The tracker's error for the forge's.
-fn tracker_error(error: forge::Error) -> Error {
-    let kind = match error.kind {
+/// The tracker's kind of error for the forge's.
+fn error_kind(kind: forge::ErrorKind) -> ErrorKind {
+    match kind {
         forge::ErrorKind::NotFound => ErrorKind::NotFound,
         forge::ErrorKind::Unauthorized | forge::ErrorKind::SignInAgain => ErrorKind::Unauthorized,
         forge::ErrorKind::Unreachable => ErrorKind::Unreachable,
         forge::ErrorKind::RateLimited | forge::ErrorKind::HeadMoved | forge::ErrorKind::Other => {
             ErrorKind::Other
         }
-    };
+    }
+}
+
+/// The tracker's error for the forge's.
+fn tracker_error(error: forge::Error) -> Error {
+    let kind = error_kind(error.kind);
     let message = if error.kind == forge::ErrorKind::Unauthorized {
         format!(
             "{}: the token needs Issues (read and write) on the repository, which a GitHub \
@@ -1190,5 +1242,100 @@ mod tests {
             .set_stage(&id("7"), "agent:review")
             .unwrap_err();
         assert!(error.message.contains("still agent:working"), "{error}");
+    }
+
+    /// The answer to `GET <path>` in `fixtures/github-tracker/account.json`,
+    /// docs-shaped until live check G7 records it.
+    fn account_answer(path: &str) -> (u16, Value) {
+        let fixture: Value = serde_json::from_str(include_str!(
+            "../../tests/fixtures/github-tracker/account.json"
+        ))
+        .expect("the account fixture");
+        let found = fixture["exchanges"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|e| e["request"]["path"] == path)
+            .unwrap_or_else(|| panic!("no exchange of {path}"));
+        (
+            u16::try_from(found["status"].as_u64().unwrap()).unwrap(),
+            found["response"].clone(),
+        )
+    }
+
+    fn canned_account(path: &str) -> Canned {
+        let (status, body) = account_answer(path);
+        Canned::default().on(&format!("GET {path}"), status, body)
+    }
+
+    /// The key's account is `GET user`'s: the numeric id as text, the login
+    /// as the name, no workspace; a type other than `User` is an app's.
+    #[test]
+    fn the_key_account_is_the_signed_in_user() {
+        let canned = canned_account("user");
+        let account = tracker(&canned).key_account().unwrap();
+        assert_eq!(
+            account,
+            KeyAccount {
+                id: "1".into(),
+                name: "person-1".into(),
+                app: false,
+                workspace: String::new(),
+            }
+        );
+        assert_eq!(canned.calls(), ["GET user"]);
+
+        for kind in ["Bot", "Organization"] {
+            let (status, mut body) = account_answer("user");
+            body["type"] = json!(kind);
+            let canned = Canned::default().on("GET user", status, body);
+            assert!(tracker(&canned).key_account().unwrap().app, "{kind}");
+        }
+    }
+
+    /// An account read that fails says so without the advice about the
+    /// Issues permission, which is no cause of it.
+    #[test]
+    fn a_failed_account_read_does_not_name_the_issues_permission() {
+        let canned = Canned::default().on("GET user", 401, json!({ "message": "Bad credentials" }));
+        let error = tracker(&canned).key_account().unwrap_err();
+        assert_eq!(error.kind, ErrorKind::Unauthorized);
+        assert!(!error.message.contains("Issues"), "{error}");
+        let canned = Canned::default().on("GET user/2", 500, json!({ "message": "Server Error" }));
+        let error = tracker(&canned).account_name("2").unwrap_err();
+        assert_ne!(error.kind, ErrorKind::NotFound);
+        assert!(!error.message.contains("Issues"), "{error}");
+    }
+
+    /// Another account is named by its id: the login; nothing for an id that
+    /// is no number (no call made), for an account GitHub does not know, for
+    /// an answer about another id and for a blank login.
+    #[test]
+    fn an_account_is_named_by_its_numeric_id() {
+        let canned = canned_account("user/1");
+        assert_eq!(
+            tracker(&canned).account_name("1").unwrap().as_deref(),
+            Some("person-1")
+        );
+        assert_eq!(canned.calls(), ["GET user/1"]);
+
+        let canned = Canned::default();
+        for id in ["abc", "", "-1", "1/2"] {
+            assert_eq!(tracker(&canned).account_name(id).unwrap(), None, "{id:?}");
+        }
+        assert!(canned.calls().is_empty());
+
+        let (status, body) = account_answer("user/999999999999");
+        let canned = Canned::default().on("GET user/999999999999", status, body);
+        assert_eq!(tracker(&canned).account_name("999999999999").unwrap(), None);
+
+        let (status, body) = account_answer("user/1");
+        let canned = Canned::default().on("GET user/2", status, body);
+        assert_eq!(tracker(&canned).account_name("2").unwrap(), None);
+
+        let (status, mut body) = account_answer("user/1");
+        body["login"] = json!("  ");
+        let canned = Canned::default().on("GET user/1", status, body);
+        assert_eq!(tracker(&canned).account_name("1").unwrap(), None);
     }
 }
