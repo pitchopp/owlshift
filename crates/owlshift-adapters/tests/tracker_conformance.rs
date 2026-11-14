@@ -1976,6 +1976,29 @@ mod github {
         run_check(&adapter(), Check::Stage);
     }
 
+    /// A gesture carries the issue's last text edit (OWL-557), on the
+    /// exchanges of `owl-557.sh`'s issues: #104 labelled at 10:33:51, its
+    /// title then its description edited, its title again at 10:34:19,
+    /// which the runner holds; #105 opened with its label and never edited,
+    /// which it admits.
+    #[test]
+    fn the_github_tracker_reads_the_last_edit_of_a_gestures_issue() {
+        use owlshift_adapters::tracker::Author;
+        use owlshift_contracts::config::Admit;
+
+        let replay = Replay::of(&dir(), "gesture-edited.json");
+        let tracker = tracker(replay.clone());
+        let admit = Admit::Label("owl-557-probe".to_owned());
+        let held = tracker.gesture(&id("104"), &admit).unwrap();
+        assert!(matches!(held.account, Author::Account(_)), "{held:?}");
+        assert_eq!(held.at.unwrap().to_string(), "2026-11-14T10:33:51Z");
+        assert_eq!(held.edited_at.unwrap().to_string(), "2026-11-14T10:34:19Z");
+        let admitted = tracker.gesture(&id("105"), &admit).unwrap();
+        assert_eq!(admitted.at.unwrap().to_string(), "2026-11-14T10:34:24Z");
+        assert_eq!(admitted.edited_at, None);
+        replay.assert_done();
+    }
+
     /// No GitHub account of a recording is a real one: each user object is
     /// a pseudonym, `person-n` with the id n.
     #[test]
@@ -2147,6 +2170,8 @@ mod github {
         let gesture = tracker.gesture(&id("31"), &admit).unwrap();
         assert!(matches!(gesture.account, Author::Account(_)), "{gesture:?}");
         assert_eq!(gesture.at.unwrap().to_string(), "2026-11-12T19:44:38Z");
+        // Never edited (OWL-557).
+        assert_eq!(gesture.edited_at, None);
         for through_app in ["30", "32"] {
             let gesture = tracker.gesture(&id(through_app), &admit).unwrap();
             let Author::Other { name } = gesture.account else {

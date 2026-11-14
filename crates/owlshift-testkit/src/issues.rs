@@ -552,8 +552,25 @@ fn decode(text: &str) -> String {
 }
 
 impl Transport for FakeIssues {
+    /// GraphQL answers one query alone: an issue's `lastEditedAt`, which a
+    /// person's gesture reads (OWL-557). The fake never edits an issue's
+    /// text, so a known issue answers null, an unknown one no issue.
     fn send(&self, request: &Value) -> Result<Response, String> {
-        panic!("the Issues fake answers no GraphQL: {request}")
+        let query = request["query"].as_str().unwrap_or_default();
+        assert!(
+            query.contains("lastEditedAt"),
+            "the Issues fake answers no other GraphQL: {request}"
+        );
+        let mut state = self.state();
+        state
+            .calls
+            .push(format!("GRAPHQL {}", request["variables"]));
+        let issue = request["variables"]["number"]
+            .as_u64()
+            .filter(|number| state.issues.contains_key(number))
+            .map(|_| json!({ "lastEditedAt": null }));
+        let answer = json!({ "data": { "repository": { "issue": issue } } });
+        Ok(Response::new(200, answer.to_string()))
     }
 
     fn get(&self, path: &str) -> Result<RestAnswer, String> {

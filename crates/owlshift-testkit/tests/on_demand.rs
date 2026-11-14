@@ -866,6 +866,10 @@ struct Clocked<'a> {
     fold: &'a RefCell<FakeFold>,
     /// Reactions on comments, when they are read (OWL-371).
     reactions: &'a RefCell<FakeReactions>,
+    /// The gestures whose ticket's text a person edited (OWL-557): each
+    /// ticket's gesture time and last edit, which the Markdown tracker
+    /// does not keep.
+    edits: &'a RefCell<Vec<(TicketId, Timestamp, Timestamp)>>,
 }
 
 /// Reactions on the tracker's comments, which the Markdown tracker's files
@@ -1122,7 +1126,12 @@ impl Tracker for Clocked<'_> {
     }
 
     fn gesture(&self, id: &TicketId, admit: &Admit) -> Result<tracker::Gesture, tracker::Error> {
-        Tracker::gesture(&self.inner, id, admit)
+        let mut gesture = Tracker::gesture(&self.inner, id, admit)?;
+        if let Some((_, at, edited)) = self.edits.borrow().iter().find(|(on, ..)| on == id) {
+            gesture.at = Some(*at);
+            gesture.edited_at = Some(*edited);
+        }
+        Ok(gesture)
     }
 
     fn relations(&self, id: &TicketId) -> Result<tracker::Relations, tracker::Error> {
@@ -1241,6 +1250,9 @@ struct Bench {
     fold: RefCell<FakeFold>,
     /// The reactions on the tracker's comments (OWL-371).
     reactions: RefCell<FakeReactions>,
+    /// Tickets whose text was edited after their gesture (OWL-557): see
+    /// [`Clocked::edits`].
+    edits: RefCell<Vec<(TicketId, Timestamp, Timestamp)>>,
     /// The routing each routed harness was asked for, in order (OWL-305).
     routed: Rc<RefCell<Vec<RunRouting>>>,
     /// The verify seats play from the bench's reply queue, as every other
@@ -1501,6 +1513,7 @@ impl Bench {
             inbox: RefCell::default(),
             fold: RefCell::default(),
             reactions: RefCell::default(),
+            edits: RefCell::default(),
             routed: Rc::default(),
             verify_plays: Cell::new(false),
             sessions: Cell::new(false),
@@ -2009,6 +2022,7 @@ impl Bench {
             inbox: &self.inbox,
             fold: &self.fold,
             reactions: &self.reactions,
+            edits: &self.edits,
         };
         let issues = self.issues.borrow().clone().map(|fake| {
             let reached = GitHubForge::with_transport(fake, Repo::parse(REPO).unwrap());

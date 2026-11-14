@@ -656,6 +656,7 @@ impl shared::Tracker for MarkdownTracker {
         Ok(shared::Gesture {
             account: account(ticket.author),
             at: None,
+            edited_at: None,
         })
     }
 

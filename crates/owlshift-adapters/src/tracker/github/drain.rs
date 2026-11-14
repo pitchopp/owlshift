@@ -4,6 +4,7 @@
 //! The rules are build plan "P9 · Open-source readiness", "The GitHub
 //! Issues adapter", as live checks G1, G3, G4 and G6 confirmed them.
 
+use jiff::Timestamp;
 use serde::Deserialize;
 use serde_json::json;
 
@@ -42,6 +43,10 @@ pub(super) fn state_type(issue: &Issue) -> Option<StateType> {
         Some(_) => None,
     }
 }
+
+/// The last edit of an issue's description (OWL-557).
+const LAST_EDITED_QUERY: &str = "query($owner: String!, $name: String!, $number: Int!) { \
+     repository(owner: $owner, name: $name) { issue(number: $number) { lastEditedAt } } }";
 
 /// An issue event (G3): the issues' events, ascending by id.
 #[derive(Deserialize)]
@@ -151,18 +156,28 @@ impl GitHubTracker {
     /// return to the ready column), whose event names the token's holder. A
     /// label with no such event is an error asking to put it again, never
     /// the issue's opener: anyone opens an issue on a public repository.
+    ///
+    /// A person's gesture carries the issue's last text edit (OWL-557): the
+    /// later of its last `renamed` event, a title edit, and GraphQL's
+    /// `lastEditedAt`, a description edit, which no REST answer gives and
+    /// which a title edit, a label or a comment does not move (checked live
+    /// on 2026-11-14). An app's or a bot's gesture never admits, so its
+    /// issue's edits are not read.
     pub(super) fn label_gesture(&self, id: &TicketId, admit: &Admit) -> Result<Gesture, Error> {
         let label = match admit {
             Admit::Label(label) | Admit::State(label) => label,
             Admit::Delegation => return Err(no_delegation()),
         };
-        let path = format!("{}/events", self.issue_path(number(id)?));
+        let number = number(id)?;
+        let path = format!("{}/events", self.issue_path(number));
         let events: Vec<Event> = self.every(&path, &format!("the events of {id}"))?;
         let mut standing = None;
+        let mut renamed = None;
         for event in events {
             match event.event.as_str() {
                 "labeled" if event.of_label(label) => standing = Some(event),
                 "unlabeled" if event.of_label(label) => standing = None,
+                "renamed" => renamed = Some(timestamp(&event.created_at)?),
                 _ => {}
             }
         }
@@ -192,10 +207,48 @@ impl GitHubTracker {
             (None, Some(actor)) => actor.author(),
             (None, None) => Author::unknown(),
         };
+        let edited_at = match account {
+            Author::Account(_) => renamed.max(self.last_edited(number, id)?),
+            Author::Other { .. } => None,
+        };
         Ok(Gesture {
             account,
             at: Some(timestamp(&created_at)?),
+            edited_at,
         })
+    }
+
+    /// GraphQL's `lastEditedAt` of issue `number`: the last edit of its
+    /// description, `None` when never edited (checked live on 2026-11-14,
+    /// OWL-557). An issue GraphQL does not answer is an error, never one
+    /// that was not edited.
+    fn last_edited(&self, number: u64, id: &TicketId) -> Result<Option<Timestamp>, Error> {
+        #[derive(Deserialize)]
+        struct Data {
+            repository: Option<Repository>,
+        }
+        #[derive(Deserialize)]
+        struct Repository {
+            issue: Option<Edited>,
+        }
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Edited {
+            last_edited_at: Option<String>,
+        }
+        let repo = self.forge.repo();
+        let variables = json!({ "owner": repo.owner(), "name": repo.name(), "number": number });
+        let data: Data = self
+            .forge
+            .tracker_query(LAST_EDITED_QUERY, variables)
+            .map_err(tracker_error)?;
+        let Some(issue) = data.repository.and_then(|repository| repository.issue) else {
+            return Err(Error::new(
+                ErrorKind::NotFound,
+                format!("GitHub's GraphQL API answered no issue {id}, so its last edit is unknown"),
+            ));
+        };
+        issue.last_edited_at.as_deref().map(timestamp).transpose()
     }
 
     /// The blockers of issue `number` by GitHub's `blocked_by` list, never

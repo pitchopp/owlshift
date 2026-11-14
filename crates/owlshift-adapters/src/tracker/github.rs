@@ -805,8 +805,16 @@ mod tests {
     }
 
     impl Transport for Canned {
+        /// A GraphQL request, answered by its variables (`GRAPHQL
+        /// <variables>`): only the gesture's read of an issue's last edit
+        /// asks one (OWL-557).
         fn send(&self, request: &Value) -> Result<Response, String> {
-            panic!("no GraphQL here: {request}")
+            let (status, answer, _, rate) =
+                self.answer(format!("GRAPHQL {}", request["variables"]));
+            Ok(Response {
+                rate,
+                ..Response::new(status, answer)
+            })
         }
 
         fn get(&self, path: &str) -> Result<RestAnswer, String> {

@@ -190,6 +190,19 @@ fn waiting(event: &Event, ticket: &TicketId) -> Option<Waiting> {
     })
 }
 
+/// The words of a `not_admitted` wait: why its gesture does not admit, as
+/// the drain's warning said it (`why`, OWL-557: a text edited after its
+/// label asks for the label again), else the reason of a wait told before
+/// the drain kept it.
+pub(crate) fn not_admitted(why: Option<&str>) -> String {
+    match why {
+        Some(why) => format!("its admission gesture does not admit it: {why}"),
+        None => {
+            "its admission gesture is not from an account `[tracker].admitters` lists".to_owned()
+        }
+    }
+}
+
 /// The phrase a wait is shown as.
 pub fn phrase(wait: &Waiting) -> String {
     let data = &wait.data;
@@ -275,9 +288,7 @@ pub fn phrase(wait: &Waiting) -> String {
             )
         }
         "duplicate" => "the column lists it twice; the first is taken".to_owned(),
-        "not_admitted" => {
-            "its admission gesture is not from an account `[tracker].admitters` lists".to_owned()
-        }
+        "not_admitted" => not_admitted(data.get("why").and_then(Value::as_str)),
         "excluded" => "it carries the exclusion label".to_owned(),
         "no_decider" => {
             "it has no decider: give it an assignee, or a `zone:` label whose zone has an owner"

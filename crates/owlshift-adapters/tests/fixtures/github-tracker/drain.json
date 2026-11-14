@@ -1,5 +1,5 @@
 {
-  "recorded": "2026-11-12 on pitchopp/owlshift-live-sandbox, recorded live, read-only: one list amended and the writes made up (see `synthesized`)",
+  "recorded": "2026-11-12 on pitchopp/owlshift-live-sandbox, recorded live, read-only: one list amended and the writes made up (see `synthesized`); the GraphQL read of #31's last edit recorded on 2026-11-14 (OWL-557), live through the maintainer's gh login, read-only",
   "exchanges": [
     {
       "request": {
@@ -148,6 +148,26 @@
       "rate": {
         "remaining": 4876,
         "reset": 1794522925
+      }
+    },
+    {
+      "request": {
+        "query": "query($owner: String!, $name: String!, $number: Int!) { repository(owner: $owner, name: $name) { issue(number: $number) { lastEditedAt } } }",
+        "variables": {
+          "owner": "pitchopp",
+          "name": "owlshift-live-sandbox",
+          "number": 31
+        }
+      },
+      "status": 200,
+      "response": {
+        "data": {
+          "repository": {
+            "issue": {
+              "lastEditedAt": null
+            }
+          }
+        }
       }
     },
     {
