@@ -13,7 +13,7 @@ impl Bench {
     /// tracker is GitHub Issues, its stages labels, admitting with the label
     /// `agent:ready` by `admitter`'s numeric id alone, committed on `main`
     /// as the drain reads it at its base.
-    fn on_github_issues(admitter: &Account, issues: &FakeIssues) -> Self {
+    pub(super) fn on_github_issues(admitter: &Account, issues: &FakeIssues) -> Self {
         let bench = Bench::draining("maintainer");
         let checkout = &bench.remote.checkout;
         let path = checkout.join("owlshift.toml");

@@ -18,6 +18,14 @@ mod github;
 mod linear;
 mod markdown;
 
+/// The reply key of a GitHub Issues project from two opened forges of its
+/// credential (OWL-552): what `Kind::reply_key` builds once it has opened
+/// them, public so that a bench builds the same key over a fake.
+pub use github::key_of as github_key;
+
+#[cfg(test)]
+pub(crate) use github::named_labels;
+
 use std::any::Any;
 use std::fmt;
 use std::path::Path;

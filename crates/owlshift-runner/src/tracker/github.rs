@@ -436,7 +436,7 @@ impl crate::system::fake::FakeSystem {
 /// same credential: `writer` posts through the adapter, `reader` reads the
 /// key's own account and, later, the name of another (as Linear's opens two
 /// adapters, so the key's reads never wait on a post).
-pub(crate) fn key_of(
+pub fn key_of(
     writer: GitHubForge,
     reader: GitHubForge,
     tracker: &config::Tracker,

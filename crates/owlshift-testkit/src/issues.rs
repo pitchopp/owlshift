@@ -227,6 +227,11 @@ impl FakeIssues {
         self.state().issues[&number].clone()
     }
 
+    /// The comments of issue `number`, oldest first, as GitHub answers them.
+    pub fn comments(&self, number: u64) -> Vec<Value> {
+        self.state().issues[&number].comments.clone()
+    }
+
     /// The numbers of every issue.
     pub fn numbers(&self) -> Vec<u64> {
         self.state().issues.keys().copied().collect()
