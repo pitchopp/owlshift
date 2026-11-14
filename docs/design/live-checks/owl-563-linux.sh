@@ -48,9 +48,20 @@ security find-generic-password -s owlshift -a claude-agent -w | docker run --rm 
     cat > "$OWLSHIFT_LIVE_TOKEN_FILE"
     test -s "$OWLSHIFT_LIVE_TOKEN_FILE" || { echo "no token on standard input"; exit 1; }
     echo "kernel=$(uname -r) arch=$(uname -m) $(. /etc/os-release; echo "$PRETTY_NAME") $(bwrap --version) claude=$(claude --version) user=$(id -un) uid=$(id -u)"
+    failed=0
     for test in a_read_only_bash_run_reads_and_never_writes a_bash_session_resumes_under_the_read_only_profile; do
       echo "== $test"
-      cargo test -q -p owlshift-testkit --test executor_live --locked -- --ignored --nocapture --exact "$test" 2>&1 \
-        | grep -v "^\s*Compiling" || true
+      log=/tmp/owl563-$test.log
+      if cargo test -q -p owlshift-testkit --test executor_live --locked -- --ignored --nocapture --exact "$test" \
+        >"$log" 2>&1; then status=0; else status=$?; fi
+      grep -v "^\s*Compiling" "$log" || true
+      # A test filtered out reports "0 passed" with status 0: that is no pass either.
+      if [ "$status" -eq 0 ] && grep -q "test result: ok. 1 passed" "$log"; then
+        echo "PASS $test"
+      else
+        echo "FAIL $test (cargo status $status)"
+        failed=1
+      fi
     done
+    exit "$failed"
   '
