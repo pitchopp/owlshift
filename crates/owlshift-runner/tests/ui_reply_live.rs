@@ -49,7 +49,7 @@ use owlshift_platform::keychain::{Keychain, Secret};
 use owlshift_runner::answer_check::{Readiness, new_answer, readiness};
 use owlshift_runner::on_demand::account_author;
 use owlshift_runner::secrets;
-use owlshift_runner::tracker::{LINEAR_ACCOUNT, linear};
+use owlshift_runner::tracker::{LINEAR_ACCOUNT, LINEAR_SECRETS, linear};
 
 fn required(name: &str) -> String {
     std::env::var(name).unwrap_or_else(|_| panic!("this test writes to Linear: set {name}"))
@@ -138,7 +138,11 @@ fn a_reply_through_the_operators_key_is_the_deciders_and_counts_at_once() {
     let repo = Repo::parse("pitchopp/owlshift").unwrap();
     let mut look = |account: &str| keychain.read(account).map_err(|e| e.to_string());
     let team = ticket.as_str().rsplit_once('-').unwrap().0;
-    let tracker = linear(&secrets::tracker(&repo, &mut look).unwrap(), team).unwrap();
+    let tracker = linear(
+        &secrets::tracker(&repo, &LINEAR_SECRETS, &mut look).unwrap(),
+        team,
+    )
+    .unwrap();
 
     // The decider as the runner resolves it for an ask: the assignee.
     let read = tracker.ticket(&ticket).unwrap();

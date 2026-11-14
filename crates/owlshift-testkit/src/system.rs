@@ -165,7 +165,7 @@ impl System for ScriptedSystem {
         Ok(self.origin_of(root))
     }
 
-    fn tracker_probe(&self, probe: &Probe<'_>) -> Probed {
+    fn tracker_probe(&self, probe: &dyn Probe) -> Probed {
         probe.keychain_error(Self::scripted("the keychain"))
     }
 

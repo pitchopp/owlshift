@@ -2,7 +2,8 @@
 //! project's own repository, reached with the project's forge credential, so
 //! it has no secret of its own (build plan, "The GitHub Issues adapter").
 //! `owlshift init --tracker github` sets it up and `owlshift doctor` checks
-//! it (OWL-537, part 6): the Issues permission, the labels, the admitters.
+//! it (OWL-537, part 6): the Issues permission, the labels, the admitters,
+//! through a probe of its own ([`Probe`], OWL-544).
 
 use std::path::Path;
 
@@ -12,7 +13,7 @@ use owlshift_adapters::tracker::linear::AdmissionFacts;
 use owlshift_adapters::tracker::{Capability, PROPOSED_LABEL, Tracker};
 use owlshift_contracts::config::{self, Admit, ProjectConfig};
 use owlshift_contracts::ids::TicketId;
-use owlshift_platform::keychain::Secret;
+use owlshift_platform::keychain::{Keychain, Secret};
 
 use super::{
     AdmissionWords, Connected, Doctored, ForgeCredential, GithubFacts, Kind, Opener, Probe, Probed,
@@ -20,7 +21,7 @@ use super::{
 };
 use crate::doctor::{Check, DOES_NOT_BLOCK, Section, Step};
 use crate::init::SecretSpec;
-use crate::secrets::{TrackerAccounts, TrackerSecrets};
+use crate::secrets::{SecretSet, TrackerAccounts, TrackerSecrets};
 use crate::system::System;
 use crate::ui::reply::Key;
 
@@ -38,6 +39,16 @@ impl Kind for Github {
     /// None: the forge's credential reaches the issues.
     fn secret_specs(&self) -> &'static [SecretSpec] {
         &[]
+    }
+
+    /// None: the forge's credential reaches the issues.
+    fn secret_set(&self) -> Option<&'static SecretSet> {
+        None
+    }
+
+    /// Nothing: it declares no set.
+    fn secrets_detail(&self, _found: &TrackerSecrets<()>) -> Vec<String> {
+        Vec::new()
     }
 
     fn project_file_lines(&self, _team: Option<&str>) -> Result<String, String> {
@@ -91,14 +102,11 @@ kind = \"github\"
         let Some(repo) = repo else {
             return Doctored::default();
         };
-        let probe = Probe::GithubFacts {
-            repo,
-            tracker: &config.tracker,
+        let probe = FactsProbe {
+            repo: repo.clone(),
+            tracker: config.tracker.clone(),
         };
-        match system.tracker_probe(&probe) {
-            Probed::Github(answer) => doctored(&config.tracker, repo, answer),
-            other => unreachable!("the host answered a GitHub probe with {other:?}"),
-        }
+        doctored(&config.tracker, repo, super::ask::<Facts>(system, &probe))
     }
 
     /// The label fallback of architecture section 6: proposals are issues
@@ -325,6 +333,74 @@ pub(crate) fn set_up(
         admitter: Some(id.to_string()),
         created,
     })
+}
+
+type Facts = Result<GithubFacts, StatesError>;
+
+/// What a GitHub Issues project's repository says of its setup
+/// ([`super::github_facts`], OWL-537).
+#[derive(Debug)]
+struct FactsProbe {
+    repo: Repo,
+    tracker: config::Tracker,
+}
+
+impl Probe for FactsProbe {
+    fn read(&self, keychain: &Keychain) -> Probed {
+        Probed::new::<Facts>(super::github_facts(keychain, &self.repo, &self.tracker))
+    }
+
+    fn keychain_error(&self, reason: String) -> Probed {
+        Probed::new::<Facts>(Err(StatesError::Keychain(reason)))
+    }
+
+    /// As [`crate::system::fake::FakeSystem::github_facts_are`] scripted
+    /// it; by default the issues read, every label the project names
+    /// exists, every admitter is a person's account.
+    #[cfg(test)]
+    fn fake(&self, host: &crate::system::fake::FakeSystem) -> Probed {
+        let scripted = host
+            .scripted::<Script>()
+            .and_then(|script| script.facts.clone());
+        Probed::new::<Facts>(scripted.unwrap_or_else(|| {
+            Ok(GithubFacts {
+                access: IssuesAccess::Granted,
+                labels: Some(
+                    named_labels(&self.tracker)
+                        .into_iter()
+                        .map(str::to_owned)
+                        .collect(),
+                ),
+                accounts: Some(
+                    self.tracker
+                        .admitters
+                        .iter()
+                        .flatten()
+                        .map(|id| owlshift_adapters::tracker::AccountFact {
+                            id: id.clone(),
+                            app: false,
+                            active: true,
+                        })
+                        .collect(),
+                ),
+            })
+        }))
+    }
+}
+
+/// What a GitHub Issues project's repository answers the test host.
+#[cfg(test)]
+#[derive(Default)]
+struct Script {
+    facts: Option<Facts>,
+}
+
+#[cfg(test)]
+impl crate::system::fake::FakeSystem {
+    /// A GitHub Issues project's repository answers so (OWL-537).
+    pub(crate) fn github_facts_are(self, answer: Facts) -> Self {
+        self.script(|script: &mut Script| script.facts = Some(answer))
+    }
 }
 
 /// Doctor's lines and admission facts from what the repository answered.

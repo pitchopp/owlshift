@@ -28,7 +28,7 @@ use owlshift_contracts::result::Decision;
 use owlshift_platform::keychain::{Keychain, Secret};
 use owlshift_runner::forge::{AppAccess, GITHUB_ACCOUNT, GitHubApp, github};
 use owlshift_runner::secrets;
-use owlshift_runner::tracker::{LINEAR_ACCOUNT, linear};
+use owlshift_runner::tracker::{LINEAR_ACCOUNT, LINEAR_SECRETS, linear};
 use owlshift_runner::writer::{DeliveryReport, Gate, Writer};
 
 fn required(name: &str) -> String {
@@ -74,7 +74,11 @@ fn posts_the_delivery_report_on_a_real_ticket() {
     let team = ticket.as_str().rsplit_once('-').unwrap().0;
     // Resolved as `owlshift do` resolves them: the shared accounts here.
     let mut look = |account: &str| keychain.read(account).map_err(|e| e.to_string());
-    let tracker = linear(&secrets::tracker(&repo, &mut look).unwrap(), team).unwrap();
+    let tracker = linear(
+        &secrets::tracker(&repo, &LINEAR_SECRETS, &mut look).unwrap(),
+        team,
+    )
+    .unwrap();
     // A personal token: the app's account lock is never taken.
     let dir = tempfile::tempdir().unwrap();
     let access = AppAccess {

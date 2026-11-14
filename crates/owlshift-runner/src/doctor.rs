@@ -61,6 +61,8 @@ use crate::system::{
 #[cfg(unix)]
 use crate::system::{SentinelProbe, SentinelStatus};
 use crate::ticket_ref::RefState;
+#[cfg(test)]
+use crate::tracker::{LINEAR_ACCOUNT, LINEAR_APP_ID_ACCOUNT, LINEAR_APP_SECRET_ACCOUNT};
 use crate::ui::probe::Probe;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1757,7 +1759,9 @@ fn state_entries(states: Value) -> Vec<(String, String)> {
 /// the repository that names them and what is stored, presence only.
 struct ProjectSecrets {
     repo: Repo,
-    /// For a Linear project.
+    /// The kind of the project's tracker, which describes its set.
+    kind: &'static dyn crate::tracker::Kind,
+    /// For a tracker with a set of its own ([`crate::tracker::Kind::secret_set`]).
     tracker: Option<TrackerSecrets<()>>,
     forge: ForgeSecret<()>,
 }
@@ -1798,6 +1802,7 @@ fn project_secrets(
     Some(match found {
         Ok((tracker, forge)) => Ok(ProjectSecrets {
             repo,
+            kind: crate::tracker::of(config.tracker.kind),
             tracker,
             forge,
         }),
@@ -2141,35 +2146,11 @@ fn secrets_check(found: &Result<ProjectSecrets, Unresolved>) -> Check {
             );
         }
     };
-    let under = |account: &str, source: Source| match source {
-        Source::Project => format!("`{account}`"),
-        Source::Shared => format!("the shared `{account}`"),
-    };
     let mut parts = Vec::new();
     let mut shared = false;
     if let Some(tracker) = &found.tracker {
-        let accounts = &tracker.accounts;
-        shared |= accounts.source == Source::Shared;
-        parts.push(match tracker.key {
-            Some(()) => format!(
-                "Linear API key under {}",
-                under(&accounts.key, accounts.source)
-            ),
-            None => format!("no Linear API key under `{}`", accounts.key),
-        });
-        parts.push(match (tracker.app_id, tracker.app_secret) {
-            (None, None) => "no Linear app".to_owned(),
-            (Some(()), Some(())) => format!(
-                "Linear app under {} and `{}`",
-                under(&accounts.app_id, accounts.source),
-                accounts.app_secret
-            ),
-            _ => format!(
-                "half of the Linear app under {} and `{}`",
-                under(&accounts.app_id, accounts.source),
-                accounts.app_secret
-            ),
-        });
+        shared |= tracker.accounts.source == Source::Shared;
+        parts.extend(found.kind.secrets_detail(tracker));
     }
     let forge = &found.forge;
     parts.push(match forge.token {
@@ -2177,7 +2158,7 @@ fn secrets_check(found: &Result<ProjectSecrets, Unresolved>) -> Check {
             shared |= forge.account.source == Source::Shared;
             format!(
                 "GitHub token under {}",
-                under(&forge.account.token, forge.account.source)
+                secrets::named(&forge.account.token, forge.account.source)
             )
         }
         None => format!("no GitHub token under `{}`", forge.account.token),
@@ -2829,7 +2810,10 @@ mod tests {
 
     /// The tracker accounts of the fake's repository, `pitchopp/owlshift`.
     fn own() -> TrackerAccounts {
-        TrackerAccounts::project(&Repo::parse("pitchopp/owlshift").unwrap())
+        TrackerAccounts::project(
+            &Repo::parse("pitchopp/owlshift").unwrap(),
+            &crate::tracker::LINEAR_SECRETS,
+        )
     }
 
     const CLAUDE_STATUS: &str = "claude auth status --json";
@@ -4053,7 +4037,10 @@ states = { ready = "Todo", working = "Doing", needs_input = "Needs Input", revie
         );
         let refused = Error::new(ErrorKind::Unauthorized, "Linear: AUTHENTICATION_ERROR: no");
         let failures: [(FakeSystem, &[&str]); 3] = [
-            (ready().unstored(&own().key), &["owlshift init"]),
+            (
+                ready().unstored(own().of(LINEAR_ACCOUNT)),
+                &["owlshift init"],
+            ),
             (
                 ready().linear_states_are(Err(refused)),
                 &["owlshift init --replace-secrets"],
@@ -4229,7 +4216,7 @@ states = { ready = "Todo", working = "Doing", needs_input = "Needs Input", revie
             (
                 ready()
                     .linear_app_is(Ok("owlshiftbot"))
-                    .unstored(&own().app_secret),
+                    .unstored(own().of(LINEAR_APP_SECRET_ACCOUNT)),
                 &["owlshift init --replace-secrets"],
             ),
             (
@@ -4417,7 +4404,7 @@ states = { ready = "Todo", working = "In Progress", needs_input = "Needs Input",
             refused.detail.contains("not checked: Linear: AUTH"),
             "{refused:?}"
         );
-        let report = run(&ready().unstored(&own().key), &config);
+        let report = run(&ready().unstored(own().of(LINEAR_ACCOUNT)), &config);
         assert_eq!(line(&report, "drain admission").status, Status::Ok);
     }
 
@@ -5215,7 +5202,9 @@ states = { ready = "Todo", working = "Doing", needs_input = "Asked", review = "R
              `github.com/pitchopp/owlshift/github`"
         );
         assert!(report.ready(), "{report}");
-        let no_app = ready().unstored(&own().app_id).unstored(&own().app_secret);
+        let no_app = ready()
+            .unstored(own().of(LINEAR_APP_ID_ACCOUNT))
+            .unstored(own().of(LINEAR_APP_SECRET_ACCOUNT));
         assert!(
             secrets_line(&no_app).0.detail.contains("; no Linear app; "),
             "the app's pair is reported missing"
