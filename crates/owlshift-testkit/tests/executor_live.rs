@@ -24,14 +24,14 @@ use owlshift_contracts::brief::{
     Author, Brief, PermissionLevel, Permissions, Relation, ReviewBrief, TicketBrief,
 };
 use owlshift_contracts::format::{Format, RESULT_FORMAT};
-use owlshift_contracts::ids::{RelativePath, TicketId};
+use owlshift_contracts::ids::{RelativePath, SessionId, TicketId};
 use owlshift_contracts::result::{RunResult, Status};
 use owlshift_platform::keychain::{Keychain, Secret};
 use owlshift_runner::agent_env::AgentEnv;
 use owlshift_runner::executor::harness::{CLAUDE_AGENT_ACCOUNT, ClaudeHarness};
 use owlshift_runner::executor::{
-    Executor, Git, Harness, HarnessEnd, HarnessError, HarnessRun, Outcome, REDACTED, RunLog,
-    RunReport, RunSpec, SandboxNeeds, Violation,
+    Executor, Git, Harness, HarnessEnd, HarnessError, HarnessRun, Outcome, REDACTED, ResumeFrom,
+    RunLog, RunReport, RunSpec, SandboxNeeds, SessionPlan, Violation,
 };
 use owlshift_testkit::git::{GitEnv, seed};
 use serde_json::Value;
@@ -301,23 +301,27 @@ fn a_build_edits_claude_files_and_the_runners_guards_still_hold() {
     );
 }
 
-/// The resolver's run on Claude Code (OWL-344, OWL-386): bare Bash under
-/// `dontAsk`, inside the read-only profile, the result given as the last
-/// message. It replays the probes of OWL-344's live check (build plan,
-/// "The live check, how it was run") and adds one: reading the brief in the
-/// run's own files, outside the working directory, with the Read tool and
-/// with Bash. Run it after each Claude Code update, with `--nocapture`: it
-/// prints one line per probe, for the dated record in the build plan.
+/// A run with Bash on Claude Code (OWL-344, OWL-386, OWL-563): bare Bash
+/// under `dontAsk`, beside the web tools, inside the read-only profile, the
+/// result given as the last message. It replays the probes of OWL-344's
+/// live check (build plan, "The live check, how it was run") and adds two:
+/// reading the brief in the run's own files, outside the working directory,
+/// with the Read tool and with Bash; and finding the file of a test named
+/// by its name alone, with `grep` (OWL-563, for a ticket such as OWL-555's
+/// before its edit). Run it after each Claude Code update, with
+/// `--nocapture`: it prints one line per probe, for the dated record in the
+/// build plan.
 ///
-/// Resolver-shaped by its fields: the CLI's `do_cmd::resolver_router` makes
-/// the resolver's harness from the shared one with `bash: true` and nothing
-/// else (pinned by its test `the_resolver_is_built_with_bash`), and the
+/// Design-shaped: a read-only Design brief with network, as the runner
+/// gives Design, Design review, Verify, the arbiter and the resolver unless
+/// the operator turns the web tools off. The CLI's `do_cmd::role_harness`
+/// makes each of their harnesses from the shared one with `bash: true`
+/// (pinned by `each_roles_harness_takes_bash_as_its_role_says`), and the
 /// argv it gives is pinned whole by the adapter's contract test
-/// `the_resolver_argv_allows_bash_without_an_edit_rule`. This test asserts
-/// the parts of the argv the probes rest on, as spawned. The brief is a
-/// read-only Verify brief: the argv and the profile depend on `bash` and the
-/// permission level, not the role, and a resolver brief would tie the test
-/// to the questions' format.
+/// `the_resolver_argv_allows_bash_without_an_edit_rule`, with and without
+/// network. This test asserts the parts of the argv the probes rest on, as
+/// spawned. The argv and the profile depend on `bash`, the network and the
+/// permission level, not the role.
 ///
 /// A refused Read on the brief is printed, not failed: Bash's `cat` reads
 /// it then. A first Read, of `README.md` in the working directory, is the
@@ -328,7 +332,7 @@ fn a_build_edits_claude_files_and_the_runners_guards_still_hold() {
 /// is then required.
 #[test]
 #[ignore = "live: runs `claude -p` on your token for agent runs; set OWLSHIFT_LIVE_CLAUDE=1"]
-fn the_resolvers_bash_reads_and_never_writes() {
+fn a_read_only_bash_run_reads_and_never_writes() {
     let outside = cfg!(target_os = "linux").then(outside_probe);
     // The token's file, when the test read the token from one: the run must
     // not see it.
@@ -345,11 +349,14 @@ fn the_resolvers_bash_reads_and_never_writes() {
         .unwrap()
         .subsec_nanos();
     let title = format!("Sundial {nanos}");
+    // A test the run knows by its name alone, as a ticket names it.
+    let named_test = format!("the_dial_casts_its_shadow_{nanos}");
+    let test_file = format!("#[test]\nfn {named_test}() {{}}\n");
 
     // Each probe: a label, and the exact Bash command the run makes.
     let mut commands: Vec<(&str, String)> = Vec::new();
     let live = run_live_seeded(
-        &[],
+        &[(NAMED_TEST_FILE, &test_file)],
         |paths| {
             let (g, r) = (&paths.git_dir, &paths.root);
             commands = vec![
@@ -357,6 +364,10 @@ fn the_resolvers_bash_reads_and_never_writes() {
                 ("git log", "git log --oneline -5".into()),
                 ("git blame", "git blame README.md".into()),
                 ("grep", "grep -rn hello README.md".into()),
+                (
+                    "find a test by its name",
+                    format!("grep -rl {named_test} ."),
+                ),
                 ("write in the worktree", "echo probe > probe.txt".into()),
                 (
                     "write in .git by a redirection",
@@ -414,25 +425,20 @@ fn the_resolvers_bash_reads_and_never_writes() {
                  at the end of this prompt, unquoted.\n\
                  {steps}\
                  Then give your result: a JSON object with exactly the fields `format` (the \
-                 number {RESULT_FORMAT}), `status` (the string \"done\") and `summary` (the \
-                 brief's `ticket.title`, verbatim)."
+                 number {RESULT_FORMAT}), `status` (the string \"done\"), `summary` (the \
+                 brief's `ticket.title`, verbatim) and `plan`, {PLAN_NAMING_THE_TEST}"
             )
         },
         Shape {
             model: "sonnet",
             bash: true,
+            network: true,
             timeout: Duration::from_secs(600),
         },
-        Role::Verify,
+        Role::Design,
         PermissionLevel::ReadOnly,
         &title,
-        Some(ReviewBrief {
-            mandates: vec![owlshift_contracts::review::Mandate::Critic],
-            pass: std::num::NonZeroU32::MIN,
-            diff: None,
-            since: None,
-            earlier: Vec::new(),
-        }),
+        None,
     );
     let transcript = Transcript::of(&live);
     let report = &transcript.report;
@@ -479,25 +485,28 @@ fn the_resolvers_bash_reads_and_never_writes() {
             .collect()
     };
     assert_eq!(after("--permission-mode"), ["dontAsk"], "{args:?}");
-    assert_eq!(after("--allowedTools"), ["Bash"], "{args:?}");
+    assert_eq!(
+        after("--allowedTools"),
+        ["Bash", "WebFetch", "WebSearch"],
+        "{args:?}"
+    );
     assert!(!args.iter().any(|arg| arg.starts_with("Edit(")), "{args:?}");
     let disallowed = after("--disallowedTools");
     assert!(
-        ["WebFetch", "WebSearch"]
+        !["WebFetch", "WebSearch"]
             .iter()
-            .all(|tool| disallowed.contains(tool)),
+            .any(|tool| disallowed.contains(tool)),
         "{args:?}"
     );
     let init = transcript.init();
     assert_eq!(init["permissionMode"], "dontAsk", "{report}");
     let tools = init["tools"].as_array().expect("init lists its tools");
-    assert!(tools.iter().any(|tool| tool == "Bash"), "{report}");
-    assert!(
-        !tools
-            .iter()
-            .any(|tool| tool == "WebFetch" || tool == "WebSearch"),
-        "{report}"
-    );
+    for offered in ["Bash", "WebFetch", "WebSearch"] {
+        assert!(
+            tools.iter().any(|tool| tool == offered),
+            "{offered}\n{report}"
+        );
+    }
     println!(
         "Claude Code {}, model {}",
         init["claude_code_version"], init["model"]
@@ -588,6 +597,7 @@ fn the_resolvers_bash_reads_and_never_writes() {
         ("git log", ""),
         ("git blame", "hello"),
         ("grep", "README.md:1:hello"),
+        ("find a test by its name", NAMED_TEST_FILE),
     ] {
         let (failed, text) = bash(command(label));
         assert!(!failed && text.contains(shows), "{label}: {text}\n{report}");
@@ -691,6 +701,135 @@ fn the_resolvers_bash_reads_and_never_writes() {
     let result = live.result();
     assert_eq!(result.status, Status::Done, "{report}");
     assert_eq!(result.summary, title, "{report}");
+    assert_plan_names_the_test(result, report);
+}
+
+/// Where the test a run knows by its name alone is, from the repository's
+/// root (OWL-563).
+const NAMED_TEST_FILE: &str = "crates/dial/tests/shadow.rs";
+
+/// The plan a Design-shaped live run gives: one naming the file it found
+/// the named test in, as a plan from a ticket naming tests alone would.
+const PLAN_NAMING_THE_TEST: &str = "an object with exactly the fields `goal` (the string \
+     \"Report the title\"), `criteria` (the one string \"The title is reported\"), \
+     `approach` (the string \"Read the brief\"), `files` (one string: the path of the file \
+     that defines the named test, from the working directory, without a leading `./`) and \
+     `steps` (one object with exactly the fields `what`, the string \"Report the title\", and \
+     `test`, the string \"None\").";
+
+/// The result's plan names [`NAMED_TEST_FILE`], and no other file.
+fn assert_plan_names_the_test(result: &RunResult, report: &str) {
+    let plan = result
+        .plan
+        .as_ref()
+        .expect("a done Design run gives a plan");
+    assert_eq!(plan.files, [NAMED_TEST_FILE], "{report}");
+    println!("plan: names {NAMED_TEST_FILE}, the file of the test named by name alone");
+}
+
+/// Design keeps its session with Bash, under the read-only profile
+/// (OWL-563): a Design-shaped run that asks keeps its transcript, and the
+/// next run resumes it, told its new brief file and to give its result as
+/// its last message ([`resume_prompt_with_brief_file`]). A word given in the
+/// first run's prompt only, and in no file, comes back from the resumed run,
+/// which can know it only from the session. The resumed run also finds a
+/// test by its name alone, as the first run was told.
+///
+/// [`resume_prompt_with_brief_file`]:
+///     owlshift_runner::executor::harness::resume_prompt_with_brief_file
+#[test]
+#[ignore = "live: runs `claude -p` on your token for agent runs; set OWLSHIFT_LIVE_CLAUDE=1"]
+fn a_bash_session_resumes_under_the_read_only_profile() {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .subsec_nanos();
+    let named_test = format!("the_gnomon_points_north_{nanos}");
+    let word = format!("vesper{nanos}");
+    let title = format!("Gnomon {nanos}");
+    let test_file = format!("#[test]\nfn {named_test}() {{}}\n");
+    let rig = Rig::new(&[(NAMED_TEST_FILE, &test_file)]);
+    let shape = Shape {
+        model: "sonnet",
+        bash: true,
+        network: true,
+        timeout: Duration::from_secs(600),
+    };
+    let brief = live_brief(Role::Design, PermissionLevel::ReadOnly, true, &title, None);
+    let mut id = [0u8; 16];
+    id[..4].copy_from_slice(&nanos.to_be_bytes());
+    id[4..8].copy_from_slice(&std::process::id().to_be_bytes());
+    let own = SessionId::from_bytes(id);
+
+    // The asking run: it learns the word and the task, and asks. Its
+    // prompt is the role's, which the session keeps: the resumed run gets
+    // only the harness's resume prompt.
+    let prompt = format!(
+        "You are a test role in a throwaway scratch repository; nothing here is real. Remember \
+         the word `{word}`: it is in no file. This run only asks: read the brief with Bash \
+         `cat` and its path, then give your result: a JSON object with exactly the fields \
+         `format` (the number {RESULT_FORMAT}), `status` (the string \"questions\"), \
+         `summary` (the brief's `ticket.title`, verbatim) and `questions`, a list of one object \
+         with exactly the fields `id` (\"Q1\"), `category` (\"scope\"), `context` (\"A live \
+         test.\"), `text` (\"May the task go on?\") and `recommendation` (an object with exactly \
+         the field `why`, the string \"Yes, go on.\"). When this session is resumed, the \
+         question answered, read the brief again, then find with Bash `grep` the file that \
+         defines the test `{named_test}`, and give your result: a JSON object with exactly the \
+         fields `format` (the number {RESULT_FORMAT}), `status` (the string \"done\"), \
+         `summary` (the word you were asked to remember, alone) and `plan`, \
+         {PLAN_NAMING_THE_TEST}"
+    );
+    let plan = SessionPlan {
+        own: own.clone(),
+        resume: None,
+    };
+    let (asked, first_brief, _) = rig.run(prompt, &shape, &brief, Some(&plan), "run-1");
+    let report = format!("{asked:?}");
+    let Outcome::Finished { result, .. } = &asked.outcome else {
+        panic!("the asking run did not finish\n{report}");
+    };
+    assert_eq!(result.status, Status::Questions, "{report}");
+    let kept = asked
+        .session
+        .as_ref()
+        .unwrap_or_else(|| panic!("the asking run's session was not kept\n{report}"));
+    assert_eq!(kept.id, own);
+    println!(
+        "asking run: session kept under the read-only profile, {:.0} s",
+        asked.elapsed.as_secs_f64()
+    );
+
+    // The resumed run, with its own brief file.
+    let plan = SessionPlan {
+        own: SessionId::from_bytes([7; 16]),
+        resume: Some(ResumeFrom {
+            id: kept.id.clone(),
+            folder: kept.folder.clone(),
+            cost_micros: kept.cost_micros.unwrap_or(0),
+        }),
+    };
+    // The harness builds the resumed run's prompt itself: the role's
+    // prompt, given empty here, is never sent again.
+    let (resumed, second_brief, args) =
+        rig.run(String::new(), &shape, &brief, Some(&plan), "run-2");
+    let report = format!("{resumed:?}");
+    assert_eq!(resumed.resumed, Some(true), "{report}");
+    assert!(
+        args.windows(2)
+            .any(|pair| pair[0] == "--resume" && pair[1] == kept.id.as_str()),
+        "{args:?}"
+    );
+    assert_ne!(first_brief, second_brief);
+    let Outcome::Finished { result, .. } = &resumed.outcome else {
+        panic!("the resumed run did not finish\n{report}");
+    };
+    assert_eq!(result.status, Status::Done, "{report}");
+    assert_eq!(result.summary, word, "{report}");
+    assert_plan_names_the_test(result, &report);
+    println!(
+        "resumed run: resumed, the word given back, its brief read anew, {:.0} s",
+        resumed.elapsed.as_secs_f64()
+    );
 }
 
 /// A file the run is asked to write in `OWLSHIFT_LIVE_OUTSIDE_DIR`, which
@@ -774,8 +913,12 @@ fn run_live(
 /// runs': `haiku` without Bash, 300 seconds.
 struct Shape {
     model: &'static str,
-    /// [`ClaudeHarness::bash`]: the resolver's run.
+    /// [`ClaudeHarness::bash`]: the run of a role that searches the
+    /// worktree (OWL-344, OWL-563).
     bash: bool,
+    /// The brief's `permissions.network`: with Bash, the web tools allowed
+    /// beside it (OWL-415).
+    network: bool,
     timeout: Duration,
 }
 
@@ -784,6 +927,7 @@ impl Default for Shape {
         Self {
             model: "haiku",
             bash: false,
+            network: false,
             timeout: Duration::from_secs(300),
         }
     }
@@ -931,6 +1075,14 @@ impl<H: Harness> Harness for Kept<H> {
     fn login_kept(&self, original: &[u8], updated: &[u8]) -> Result<(), String> {
         self.inner.login_kept(original, updated)
     }
+
+    fn session_key(&self) -> Option<String> {
+        self.inner.session_key()
+    }
+
+    fn session_transcript(&self, folder: &Path, id: &SessionId) -> io::Result<Option<String>> {
+        self.inner.session_transcript(folder, id)
+    }
 }
 
 /// Where a live run's files are, resolved, for a prompt to name them.
@@ -954,57 +1106,136 @@ fn run_live_seeded(
     title: &str,
     review: Option<ReviewBrief>,
 ) -> Live {
-    assert_eq!(
-        std::env::var("OWLSHIFT_LIVE_CLAUDE").as_deref(),
-        Ok("1"),
-        "this test spends subscription usage: set OWLSHIFT_LIVE_CLAUDE=1 to run it"
-    );
-    let tmp = tempfile::Builder::new()
-        .prefix("owlshift live ")
-        .tempdir()
-        .unwrap();
-    // Resolved: Claude Code matches paths once resolved, and a write named
-    // through a link to the temporary folder can miss (build plan, OWL-327).
-    let root = fs::canonicalize(tmp.path()).unwrap();
-    let project = root.join("project");
-    fs::create_dir_all(&project).unwrap();
-    fs::write(project.join("README.md"), "hello\n").unwrap();
-    for (path, content) in files {
-        let path = project.join(path);
-        fs::create_dir_all(path.parent().unwrap()).unwrap();
-        fs::write(path, content).unwrap();
+    let rig = Rig::new(files);
+    let prompt = prompt(&rig.paths);
+    let brief = live_brief(role, level, shape.network, title, review);
+    let (report, brief_file, args) = rig.run(prompt, &shape, &brief, None, "run");
+    Live {
+        _tmp: rig.tmp,
+        report,
+        paths: rig.paths,
+        brief_file,
+        args,
     }
-    let env = GitEnv::create(root.join("home")).unwrap();
-    let remote = seed(&env, &root, &project).unwrap();
-    let paths = Paths {
-        worktree: root.join("worktree"),
-        git_dir: remote.checkout.join(".git"),
-        root,
-    };
-    let prompt = prompt(&paths);
-    let runner = env.clone();
-    let executor = Executor {
-        git: Git::with_setup("git", move |command| runner.apply(command)),
-        agent: AgentEnv::from_runner(&[], &[], &[]).unwrap(),
-        forge_hosts: vec!["github.com".into()],
-        timeout: shape.timeout,
-        gate_timeout: Duration::from_secs(300),
-    };
-    let harness = Kept {
-        inner: ClaudeHarness {
-            // Found on the PATH.
-            program: "claude".into(),
-            prompt,
-            model: Some(shape.model.into()),
-            effort: Some(Effort::Low),
-            max_budget_usd: None,
-            login: Some(agent_login()),
-            bash: shape.bash,
-        },
-        brief_file: Mutex::new(None),
-        args: Mutex::new(Vec::new()),
-    };
-    let brief = Brief {
+}
+
+/// A scratch project, its checkout and the run's worktree, and the
+/// executor that runs in them; one or more runs, each in a run directory of
+/// its own, share the worktree.
+struct Rig {
+    tmp: tempfile::TempDir,
+    paths: Paths,
+    checkout: PathBuf,
+    executor: Executor,
+}
+
+impl Rig {
+    /// The rig, with `files` (path, content) committed beside the README.
+    fn new(files: &[(&str, &str)]) -> Self {
+        assert_eq!(
+            std::env::var("OWLSHIFT_LIVE_CLAUDE").as_deref(),
+            Ok("1"),
+            "this test spends subscription usage: set OWLSHIFT_LIVE_CLAUDE=1 to run it"
+        );
+        let tmp = tempfile::Builder::new()
+            .prefix("owlshift live ")
+            .tempdir()
+            .unwrap();
+        // Resolved: Claude Code matches paths once resolved, and a write named
+        // through a link to the temporary folder can miss (build plan, OWL-327).
+        let root = fs::canonicalize(tmp.path()).unwrap();
+        let project = root.join("project");
+        fs::create_dir_all(&project).unwrap();
+        fs::write(project.join("README.md"), "hello\n").unwrap();
+        for (path, content) in files {
+            let path = project.join(path);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, content).unwrap();
+        }
+        let env = GitEnv::create(root.join("home")).unwrap();
+        let remote = seed(&env, &root, &project).unwrap();
+        let paths = Paths {
+            worktree: root.join("worktree"),
+            git_dir: remote.checkout.join(".git"),
+            root,
+        };
+        let runner = env.clone();
+        let executor = Executor {
+            git: Git::with_setup("git", move |command| runner.apply(command)),
+            agent: AgentEnv::from_runner(&[], &[], &[]).unwrap(),
+            forge_hosts: vec!["github.com".into()],
+            timeout: Duration::from_secs(300),
+            gate_timeout: Duration::from_secs(300),
+        };
+        Self {
+            tmp,
+            paths,
+            checkout: remote.checkout,
+            executor,
+        }
+    }
+
+    /// One run of `brief` with `prompt` on the harness of `shape`, given
+    /// `session`, in the run directory `run_dir` of the rig's folder: its
+    /// report, the brief's file the executor gave the harness and the
+    /// command's arguments.
+    fn run(
+        &self,
+        prompt: String,
+        shape: &Shape,
+        brief: &Brief,
+        session: Option<&SessionPlan>,
+        run_dir: &str,
+    ) -> (RunReport, PathBuf, Vec<String>) {
+        let harness = Kept {
+            inner: ClaudeHarness {
+                // Found on the PATH.
+                program: "claude".into(),
+                prompt,
+                model: Some(shape.model.into()),
+                effort: Some(Effort::Low),
+                max_budget_usd: None,
+                login: Some(agent_login()),
+                bash: shape.bash,
+            },
+            brief_file: Mutex::new(None),
+            args: Mutex::new(Vec::new()),
+        };
+        let executor = Executor {
+            timeout: shape.timeout,
+            ..self.executor.clone()
+        };
+        let spec = RunSpec {
+            main: &self.checkout,
+            worktree: &self.paths.worktree,
+            branch: "owlshift/LIVE-1",
+            base: "origin/main",
+            run_dir: &self.paths.root.join(run_dir),
+            brief,
+            setup: &[],
+            session,
+            siblings: None,
+        };
+        let report = executor.run(&spec, &harness).unwrap();
+        let brief_file = harness
+            .brief_file
+            .into_inner()
+            .unwrap()
+            .expect("the executor built the harness's command");
+        (report, brief_file, harness.args.into_inner().unwrap())
+    }
+}
+
+/// The brief of a live run: ticket `LIVE-1` titled `title`, whose
+/// description asks only to report the title.
+fn live_brief(
+    role: Role,
+    level: PermissionLevel,
+    network: bool,
+    title: &str,
+    review: Option<ReviewBrief>,
+) -> Brief {
+    Brief {
         format: Format,
         role,
         project: "live".into(),
@@ -1030,7 +1261,7 @@ fn run_live_seeded(
         rules: Vec::new(),
         permissions: Permissions {
             level,
-            network: false,
+            network,
             browser: false,
         },
         gate: Vec::new(),
@@ -1052,29 +1283,6 @@ fn run_live_seeded(
         review,
         pull_request_reviews: Vec::new(),
         overlaps: Vec::new(),
-    };
-    let spec = RunSpec {
-        main: &remote.checkout,
-        worktree: &paths.worktree,
-        branch: "owlshift/LIVE-1",
-        base: "origin/main",
-        run_dir: &paths.root.join("run"),
-        brief: &brief,
-        setup: &[],
-        session: None,
-        siblings: None,
-    };
-    let report = executor.run(&spec, &harness).unwrap();
-    Live {
-        _tmp: tmp,
-        report,
-        paths,
-        brief_file: harness
-            .brief_file
-            .into_inner()
-            .unwrap()
-            .expect("the executor built the harness's command"),
-        args: harness.args.into_inner().unwrap(),
     }
 }
 

@@ -102,6 +102,22 @@ impl Role {
             Self::Intake | Self::AnswerCheck | Self::Build | Self::Rebase => false,
         }
     }
+
+    /// Whether a read-only run of this role is given a shell to search the
+    /// worktree with, Bash on Claude Code, inside the read-only profile,
+    /// whatever the operator's web tools (OWL-563, architecture section 8,
+    /// "Bash for the read-only roles"): the roles that plan, review and
+    /// decide from the code, and the resolver (OWL-344). Intake stays
+    /// offline, the answer check has nothing to search, and Build and rebase
+    /// write in the worktree, where every tool is allowed already.
+    pub fn takes_bash(self) -> bool {
+        match self {
+            Self::Design | Self::DesignReview | Self::Verify | Self::Arbiter | Self::Resolver => {
+                true
+            }
+            Self::Intake | Self::AnswerCheck | Self::Build | Self::Rebase => false,
+        }
+    }
 }
 
 /// A model tier; the configuration maps each tier to a model per harness.
@@ -455,11 +471,12 @@ mod tests {
         }
     }
 
-    /// OWL-415: the planning and review roles and the resolver take the web
-    /// tools; intake, the answer check, Build and rebase do not.
+    /// OWL-415 and OWL-563: the planning and review roles and the resolver
+    /// take the web tools and Bash; intake, the answer check, Build and
+    /// rebase take neither.
     #[test]
-    fn only_the_planning_review_and_resolver_roles_take_web_tools() {
-        let takes: Vec<Role> = [
+    fn only_the_planning_review_and_resolver_roles_take_web_tools_and_bash() {
+        let roles = [
             Role::Intake,
             Role::Resolver,
             Role::AnswerCheck,
@@ -469,20 +486,18 @@ mod tests {
             Role::Verify,
             Role::Rebase,
             Role::Arbiter,
-        ]
-        .into_iter()
-        .filter(|role| role.takes_web_tools())
-        .collect();
-        assert_eq!(
-            takes,
-            [
-                Role::Resolver,
-                Role::Design,
-                Role::DesignReview,
-                Role::Verify,
-                Role::Arbiter
-            ]
-        );
+        ];
+        let expected = [
+            Role::Resolver,
+            Role::Design,
+            Role::DesignReview,
+            Role::Verify,
+            Role::Arbiter,
+        ];
+        for takes in [Role::takes_web_tools, Role::takes_bash] {
+            let taking: Vec<Role> = roles.into_iter().filter(|role| takes(*role)).collect();
+            assert_eq!(taking, expected);
+        }
     }
 
     #[test]

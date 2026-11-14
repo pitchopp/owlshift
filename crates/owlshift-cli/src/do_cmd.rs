@@ -25,7 +25,7 @@ use jiff::Timestamp;
 use owlshift_adapters::forge::Repo;
 use owlshift_adapters::notifier::Notifier;
 use owlshift_adapters::tracker::{Capability, Tracker};
-use owlshift_contracts::config::{Models, ProjectConfig};
+use owlshift_contracts::config::ProjectConfig;
 use owlshift_contracts::format::{Format, strip_role_front_matter};
 use owlshift_contracts::ids::TicketId;
 use owlshift_contracts::service::WatchRecord;
@@ -408,7 +408,9 @@ fn run_with(
         _ => None,
     };
     // The standard tier without an effort, as section 9 routes intake and
-    // the answer check; the resolver's router routes each of its runs.
+    // the answer check; the resolver's router routes each of its runs. Each
+    // role's harness is this one with its prompt and, for a role that
+    // searches the worktree, Bash (`role_harness`).
     let harness = ClaudeHarness {
         program: claude,
         prompt,
@@ -418,48 +420,32 @@ fn run_with(
         login,
         bash: false,
     };
-    // Build on the ticket's routing (OWL-305): the tier of each run picks
-    // its model from `[models]`.
-    let build = ClaudeRouter {
-        harness: harness.clone(),
+    let routed = |role: Role, prompt: String| ClaudeRouter {
+        harness: role_harness(&harness, role, prompt),
         models: project.models.clone(),
     };
+    // Build on the ticket's routing (OWL-305): the tier of each run picks
+    // its model from `[models]`.
+    let build = routed(Role::Build, harness.prompt.clone());
     // The answer check runs on the same harness, model and login, with its
     // own prompt.
-    let check = ClaudeHarness {
-        prompt: check_prompt,
-        ..harness.clone()
-    };
-    let resolver = resolver_router(&harness, resolver_prompt, &project.models);
+    let check = role_harness(&harness, Role::AnswerCheck, check_prompt);
+    // The resolver on the tier and effort `OnDemand::resolve` routes each
+    // run to (OWL-344).
+    let resolver = routed(Role::Resolver, resolver_prompt);
     // Intake (OWL-248) on the standard tier.
-    let intake = ClaudeHarness {
-        prompt: intake_prompt,
-        ..harness.clone()
-    };
+    let intake = role_harness(&harness, Role::Intake, intake_prompt);
     // A rebase run (OWL-210) on the fast tier for a trivial conflict's first
     // run, `[models].fast` else the standard tier's model, then on the
     // ticket's tier.
-    let rebase = ClaudeRouter {
-        harness: ClaudeHarness {
-            prompt: rebase_prompt,
-            ..harness.clone()
-        },
-        models: project.models.clone(),
-    };
+    let rebase = routed(Role::Rebase, rebase_prompt);
     // Design on the ticket's routing, its reviewers on Claude Code on
     // another model than the author's (OWL-303, OWL-347), the arbiter on the
     // standard tier.
-    let routed = |prompt: &str| ClaudeRouter {
-        harness: ClaudeHarness {
-            prompt: prompt.to_owned(),
-            ..harness.clone()
-        },
-        models: project.models.clone(),
-    };
-    let design = routed(&design_prompt);
-    let reviewer = routed(&design_review_prompt);
-    let verifier = routed(&verify_prompt);
-    let arbiter = routed(&arbiter_prompt);
+    let design = routed(Role::Design, design_prompt);
+    let reviewer = routed(Role::DesignReview, design_review_prompt.clone());
+    let verifier = routed(Role::Verify, verify_prompt.clone());
+    let arbiter = routed(Role::Arbiter, arbiter_prompt);
     // The opt-in Codex reviewer (OWL-348), with each review stage's prompt,
     // when the project asks for it: whether Codex can serve is asked again
     // at each command's start, so a `codex login` made while `owlshift
@@ -783,17 +769,16 @@ fn step_command(
     command
 }
 
-/// The resolver's router (OWL-344): the shared harness with the resolver's
-/// prompt and Bash, inside the read-only profile, on the tier and effort
-/// `OnDemand::resolve` routes each run to.
-fn resolver_router(harness: &ClaudeHarness, prompt: String, models: &Models) -> ClaudeRouter {
-    ClaudeRouter {
-        harness: ClaudeHarness {
-            prompt,
-            bash: true,
-            ..harness.clone()
-        },
-        models: models.clone(),
+/// The harness of `role`: the shared one with the role's prompt and, for a
+/// role that searches the worktree (`Role::takes_bash`: the resolver since
+/// OWL-344; Design, Design review, Verify and the arbiter since OWL-563),
+/// Bash inside the read-only profile; its program, model, login and budget
+/// kept.
+fn role_harness(shared: &ClaudeHarness, role: Role, prompt: String) -> ClaudeHarness {
+    ClaudeHarness {
+        prompt,
+        bash: role.takes_bash(),
+        ..shared.clone()
     }
 }
 
@@ -933,10 +918,12 @@ mod tests {
         }
     }
 
-    /// OWL-344: the resolver runs with Bash, on its own prompt, the shared
-    /// harness's program, login and budget kept.
+    /// OWL-344 and OWL-563: each role's harness has its own prompt and the
+    /// shared harness's program, model, login and budget; the resolver,
+    /// Design, Design review, Verify and the arbiter run with Bash, Intake,
+    /// the answer check, Build and rebase without.
     #[test]
-    fn the_resolver_is_built_with_bash() {
+    fn each_roles_harness_takes_bash_as_its_role_says() {
         let shared = ClaudeHarness {
             program: PathBuf::from("/opt/claude"),
             prompt: "# Build".to_owned(),
@@ -946,23 +933,28 @@ mod tests {
             login: None,
             bash: false,
         };
-        let models = Models {
-            deep: None,
-            standard: None,
-            fast: None,
-        };
-        let router = resolver_router(&shared, "# Resolver".to_owned(), &models);
-        assert_eq!(
-            router,
-            ClaudeRouter {
-                harness: ClaudeHarness {
-                    prompt: "# Resolver".to_owned(),
-                    bash: true,
+        for (role, bash) in [
+            (Role::Resolver, true),
+            (Role::Design, true),
+            (Role::DesignReview, true),
+            (Role::Verify, true),
+            (Role::Arbiter, true),
+            (Role::Intake, false),
+            (Role::AnswerCheck, false),
+            (Role::Build, false),
+            (Role::Rebase, false),
+        ] {
+            let prompt = format!("# {}", role.as_str());
+            assert_eq!(
+                role_harness(&shared, role, prompt.clone()),
+                ClaudeHarness {
+                    prompt,
+                    bash,
                     ..shared.clone()
                 },
-                models,
-            }
-        );
+                "{role:?}"
+            );
+        }
     }
 
     /// What the end of a refused run writes, on stdout and on stderr.

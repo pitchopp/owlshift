@@ -458,7 +458,9 @@ pub struct ClaudeHarness {
     /// The token agent runs log in with, made by `claude setup-token` and
     /// read by the runner from the keychain ([`CLAUDE_AGENT_ACCOUNT`]).
     pub login: Option<Secret>,
-    /// The resolver's run (OWL-344): bare Bash allowed
+    /// A run of a role that searches the worktree
+    /// (`Role::takes_bash`: the resolver since OWL-344; Design, Design
+    /// review, Verify and the arbiter since OWL-563): bare Bash allowed
     /// ([`claude::Request::bash`]), inside the read-only profile, which
     /// bounds what its commands read and write, the result given as the
     /// run's last message.
@@ -490,7 +492,8 @@ impl Harness for ClaudeHarness {
     /// result. A run with Bash is told where its brief is in the run's own
     /// files, and to give its result as its last message. A resumed session
     /// is told only to read its brief again and carry on ([`resume_prompt`],
-    /// OWL-394): its role's prompt is already in the session.
+    /// OWL-394): its role's prompt is already in the session; with Bash, as
+    /// [`resume_prompt_with_brief_file`] says (OWL-563).
     fn drive(
         &self,
         run: &HarnessRun<'_>,
@@ -498,6 +501,9 @@ impl Harness for ClaudeHarness {
         log: &mut RunLog,
     ) -> io::Result<HarnessEnd> {
         let prompt = match run.session {
+            Some(RunSession::Resume(_)) if self.bash => {
+                resume_prompt_with_brief_file(run.brief_file)
+            }
             Some(RunSession::Resume(_)) => resume_prompt(),
             _ => self.prompt_with(run.brief_file),
         };
@@ -509,12 +515,17 @@ impl Harness for ClaudeHarness {
     }
 
     /// A confined run keeps its sessions in its configuration folder,
-    /// under the model it asks for (OWL-394); a bare one, on the user's own
-    /// login, keeps none.
+    /// under the model it asks for (OWL-394), and, with Bash, under a key
+    /// of its own, so that a session kept by a run without Bash, whose
+    /// transcript names its brief in the worktree and its result as a file,
+    /// is never resumed by one with it (OWL-563); a bare one, on the user's
+    /// own login, keeps none.
     fn session_key(&self) -> Option<String> {
-        self.login
-            .as_ref()
-            .map(|_| format!("claude-code:{}", self.model.as_deref().unwrap_or("default")))
+        self.login.as_ref().map(|_| {
+            let model = self.model.as_deref().unwrap_or("default");
+            let bash = if self.bash { ":bash" } else { "" };
+            format!("claude-code:{model}{bash}")
+        })
     }
 
     fn usage_harness(&self) -> Option<HarnessKind> {
@@ -562,16 +573,26 @@ impl Harness for ClaudeHarness {
 
 impl ClaudeHarness {
     /// The role's prompt, then where its brief is: `brief_file`, in the
-    /// run's own files, for a run with Bash, which gives its result as its
-    /// last message; [`BRIEF_PATH`] in the worktree otherwise.
+    /// run's own files, for a run with Bash, which reads it with Bash
+    /// ([`READ_THE_BRIEF_WITH_BASH`]) and gives its result as its last
+    /// message; [`BRIEF_PATH`] in the worktree otherwise.
     fn prompt_with(&self, brief_file: &Path) -> String {
         if self.bash {
-            prompt_with_brief_file(&self.prompt, brief_file, "")
+            format!(
+                "{}{READ_THE_BRIEF_WITH_BASH}",
+                prompt_with_brief_file(&self.prompt, brief_file, "")
+            )
         } else {
             prompt_with_brief(&self.prompt)
         }
     }
 }
+
+/// How a Claude Code run with Bash reads its brief: out of the working
+/// directory, the file is refused to the Read tool under `dontAsk` and read
+/// by `cat` (OWL-386, OWL-387, again with 2.1.318 for OWL-563).
+const READ_THE_BRIEF_WITH_BASH: &str = "Read the brief with Bash, `cat` and its path: the Read \
+     tool cannot reach a file outside the working directory.\n";
 
 /// The folders a harness program is installed in, read: the one on the
 /// agent's `PATH` (or of its absolute path) and the one its link leads to.
@@ -604,6 +625,22 @@ pub fn resume_prompt() -> String {
          anew. Read it again: its thread holds the decisions and the answers. Then carry on from \
          where you stopped, as your role's instructions say, and end as they say, with a new \
          `result.json`.\n"
+    )
+}
+
+/// The prompt of a resumed session with Bash (OWL-563): as
+/// [`resume_prompt`], but its brief is `brief_file`, in this run's own
+/// files, read with Bash, and its result is its last message, as the run
+/// that started the session was told for its own brief file.
+pub fn resume_prompt_with_brief_file(brief_file: &Path) -> String {
+    format!(
+        "Owlshift resumes this session: the questions you asked are now decided or answered. \
+         The brief of this run is the file `{}`, written anew in this run's own files, not the \
+         file the session started with. {READ_THE_BRIEF_WITH_BASH}Read it again: its thread \
+         holds the decisions and the answers. Then carry on from where you stopped, as your \
+         role's instructions say, and end as this harness asks: do not write `result.json`, and \
+         make your last message that JSON, whole, with nothing after it.\n",
+        brief_file.display()
     )
 }
 
@@ -800,6 +837,13 @@ mod tests {
             Some("I could not decide.".into())
         );
         assert_eq!(message(&block, false), Some(block.clone()));
+        // OWL-563: a Design plan of about 100 KB comes whole.
+        let plan = format!(
+            r#"{{"status":"done","plan":{{"text":"{}"}}}}"#,
+            "step. ".repeat(17_000)
+        );
+        assert!(plan.len() > 100_000);
+        assert_eq!(message(&plan, true), Some(plan.clone()));
     }
 
     #[test]
@@ -1090,6 +1134,38 @@ mod tests {
                 && !prompt.contains("schema"),
             "{prompt}"
         );
+        // OWL-563: the Read tool cannot reach the brief, out of the working
+        // directory, so the prompt says to read it with Bash.
+        assert!(prompt.ends_with(READ_THE_BRIEF_WITH_BASH), "{prompt}");
+    }
+
+    /// OWL-563: a resumed session with Bash is told its brief's file in this
+    /// run's own files, read with Bash, and to give its result as its last
+    /// message; without Bash, the prompt of OWL-394. Its sessions are kept
+    /// under a key of their own, so one kept without Bash is never resumed
+    /// with it.
+    #[test]
+    fn a_bash_session_resumes_with_its_own_brief_file_and_key() {
+        let brief_file = Path::new("/tmp/run-2/run-files/brief.json");
+        let prompt = resume_prompt_with_brief_file(brief_file);
+        assert!(
+            prompt.contains("The brief of this run is the file `/tmp/run-2/run-files/brief.json`")
+                && prompt.contains(READ_THE_BRIEF_WITH_BASH)
+                && prompt.contains("make your last message that JSON, whole, with nothing")
+                && !prompt.contains(BRIEF_PATH),
+            "{prompt}"
+        );
+        assert!(resume_prompt().contains(BRIEF_PATH));
+
+        let mut harness = claude(Some("token"));
+        harness.model = Some("sonnet".to_owned());
+        assert_eq!(harness.session_key().as_deref(), Some("claude-code:sonnet"));
+        harness.bash = true;
+        assert_eq!(
+            harness.session_key().as_deref(),
+            Some("claude-code:sonnet:bash")
+        );
+        assert_eq!(claude(None).session_key(), None);
     }
 
     /// Codex's prompt is the shared one with its schema's words, as it was
