@@ -336,8 +336,14 @@ pub(crate) fn unusable(why: &str) -> String {
 
 /// The ticket's link on Linear, from the workspace the key read, with no
 /// title slug; none for a workspace key that is not plain letters, digits,
-/// `-` and `_`, so the page is never handed another address.
-fn link(account: &KeyAccount, ticket: &TicketId) -> Option<String> {
+/// `-` and `_`, so the page is never handed another address. An account
+/// with no workspace is a GitHub account (OWL-566): the link is the key
+/// tracker's own, `https://github.com/<owner>/<repo>/issues/<n>`, built from
+/// the project's repository with no call.
+fn link(account: &KeyAccount, tracker: &dyn Tracker, ticket: &TicketId) -> Option<String> {
+    if account.workspace.is_empty() {
+        return tracker.ticket_url(ticket);
+    }
     let plain = !account.workspace.is_empty()
         && account
             .workspace
@@ -354,8 +360,9 @@ fn link(account: &KeyAccount, ticket: &TicketId) -> Option<String> {
 /// tracker shows for that account: the key's own when it is the decider's,
 /// otherwise what `names` has read of it so far ([`Keys::decider_name`]),
 /// asked only of a read key that is not the decider's; null while none is.
-/// `link` comes from the workspace the key read, so it is null until it is
-/// read, and when it could not be.
+/// `link` comes from the workspace the key read on Linear and from the key's
+/// tracker on GitHub Issues, so it is null until the key is read,
+/// and when it could not be.
 pub fn section(
     record: &TicketRecord,
     key: &KeyState,
@@ -396,7 +403,9 @@ pub fn section(
             Some(unusable(why)),
             Value::Null,
         ),
-        KeyState::Ready(Key { account, .. }) => {
+        KeyState::Ready(Key {
+            account, tracker, ..
+        }) => {
             decider_name = if same_account(&account.id, &decider.account) {
                 Some(account.name.clone())
             } else {
@@ -416,7 +425,7 @@ pub fn section(
                 json!({ "name": account.name, "account": account.id }),
                 why_not.is_none(),
                 why_not,
-                json!(self::link(account, ticket)),
+                json!(self::link(account, tracker.as_ref(), ticket)),
             )
         }
     };
@@ -1185,10 +1194,34 @@ pub(crate) mod tests {
     }
 
     /// A GitHub Issues key (OWL-552) has no workspace: the form is offered to
-    /// the decider by the numeric id, and the page links no ticket, whoever
-    /// the key is.
+    /// the decider by the numeric id, and the page links the issue on
+    /// github.com (OWL-566), whoever the key is, as it links Linear's.
     #[test]
-    fn a_github_key_is_offered_to_the_decider_with_no_link() {
+    fn a_github_key_is_offered_to_the_decider_and_links_the_issue() {
+        /// What `GitHubTracker::ticket_url` answers, with no call.
+        struct Github(bool);
+        impl Tracker for Github {
+            fn capabilities(&self) -> &'static [Capability] {
+                &[Capability::Comments]
+            }
+            fn ticket(&self, _: &TicketId) -> Result<Ticket, TrackerError> {
+                unreachable!()
+            }
+            fn comments(&self, _: &TicketId) -> Result<Vec<Comment>, TrackerError> {
+                unreachable!()
+            }
+            fn post_comment(&self, _: &TicketId, _: &str) -> Result<Comment, TrackerError> {
+                unreachable!()
+            }
+            fn set_stage(&self, _: &TicketId, _: &str) -> Result<(), TrackerError> {
+                unreachable!()
+            }
+            fn ticket_url(&self, id: &TicketId) -> Option<String> {
+                self.0
+                    .then(|| format!("https://github.com/demo/project/issues/{id}"))
+            }
+        }
+        let url = "https://github.com/demo/project/issues/OWL-1";
         let github = |id: &str| {
             KeyState::Ready(Key {
                 account: KeyAccount {
@@ -1197,14 +1230,14 @@ pub(crate) mod tests {
                     app: false,
                     workspace: String::new(),
                 },
-                tracker: Box::new(LinearTracker::with_transport(Unreachable)),
+                tracker: Box::new(Github(true)),
                 names: Box::new(|_: &str| Ok(None)),
             })
         };
         let record = waiting();
         let offered = section(&record, &github("maintainer"), &ticket(), &|_| None);
         assert_eq!(offered["offered"], true);
-        assert!(offered["link"].is_null());
+        assert_eq!(offered["link"], url);
         assert_eq!(offered["key"]["name"], "bea");
         let other = section(&record, &github("7"), &ticket(), &|_| None);
         assert_eq!(other["offered"], false);
@@ -1214,7 +1247,19 @@ pub(crate) mod tests {
                 .unwrap()
                 .contains("not the decider's")
         );
-        assert!(other["link"].is_null());
+        assert_eq!(other["link"], url);
+        // A tracker with no link for the ticket leaves the page none.
+        let none = KeyState::Ready(Key {
+            account: KeyAccount {
+                id: "7".to_owned(),
+                name: "bea".to_owned(),
+                app: false,
+                workspace: String::new(),
+            },
+            tracker: Box::new(Github(false)),
+            names: Box::new(|_: &str| Ok(None)),
+        });
+        assert!(section(&record, &none, &ticket(), &|_| None)["link"].is_null());
     }
 
     /// The decider is named by the key's name when the key is theirs, else
