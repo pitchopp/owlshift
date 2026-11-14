@@ -160,6 +160,24 @@ impl Drop for Pinned {
 /// where the file system makes one (APFS), else a plain copy, as across two
 /// volumes (`std::fs::copy`: `fclonefileat`, then `fcopyfile`, on macOS).
 pub fn pin_own_program(dir: &Path) -> io::Result<Pinned> {
+    pin_own(dir, Sweep::All)
+}
+
+/// [`pin_own_program`] for a process that may share `dir` with others
+/// running at the same time, a watch typed in a terminal (OWL-560): the copy
+/// goes to `dir/<pid>/` as well, but what the pin removes first is only the
+/// folders, named by a process id, of processes that have ended, and its own
+/// pid's, left by an ended process that had the same id. Whatever else `dir`
+/// holds is left alone. A folder whose id another process has taken since
+/// stays until that process ends.
+#[cfg(unix)]
+pub fn pin_own_program_among(dir: &Path) -> io::Result<Pinned> {
+    pin_own(dir, Sweep::Ended)
+}
+
+/// This process's own binary pinned: on Linux with no copy, elsewhere by
+/// [`pin_copy`].
+fn pin_own(dir: &Path, sweep: Sweep) -> io::Result<Pinned> {
     let own = own_program()?;
     #[cfg(target_os = "linux")]
     {
@@ -170,11 +188,71 @@ pub fn pin_own_program(dir: &Path) -> io::Result<Pinned> {
             });
         }
     }
-    pin_copy(own.path, dir, std::process::id())
+    pin_copy(own.path, dir, std::process::id(), sweep)
 }
 
-/// [`pin_own_program`]'s copy of `binary`, in `dir/<id>/`.
-fn pin_copy(binary: PathBuf, dir: &Path, id: u32) -> io::Result<Pinned> {
+/// What a pin removes of what `dir` holds before it makes its copy.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Sweep {
+    /// Everything: the pinner is alone in `dir` ([`pin_own_program`]).
+    All,
+    /// The folders of processes that have ended
+    /// ([`pin_own_program_among`]).
+    #[cfg(unix)]
+    Ended,
+}
+
+impl Sweep {
+    /// Whether a pin by process `id` removes `left`, an entry of its folder.
+    fn removes(self, left: &Path, id: u32) -> io::Result<bool> {
+        match self {
+            Self::All => Ok(true),
+            #[cfg(unix)]
+            Self::Ended => {
+                let pid = left
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .and_then(|name| name.parse::<u32>().ok());
+                let Some(pid) = pid else {
+                    return Ok(false);
+                };
+                if !fs::symlink_metadata(left)?.is_dir() {
+                    return Ok(false);
+                }
+                Ok(pid == id || !runs(pid))
+            }
+        }
+    }
+}
+
+/// Whether process `pid` still runs: one this process may not signal runs
+/// too. A zombie runs until it is reaped.
+#[cfg(unix)]
+fn runs(pid: u32) -> bool {
+    let Some(pid) = i32::try_from(pid)
+        .ok()
+        .and_then(rustix::process::Pid::from_raw)
+    else {
+        return false;
+    };
+    !matches!(
+        rustix::process::test_kill_process(pid),
+        Err(rustix::io::Errno::SRCH)
+    )
+}
+
+/// `result` of removing a file or folder, one already gone, as another pin
+/// removed it meanwhile, counting as removed.
+fn removed(result: io::Result<()>) -> io::Result<()> {
+    match result {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        other => other,
+    }
+}
+
+/// [`pin_own_program`]'s copy of `binary`, in `dir/<id>/`, what `sweep`
+/// removes of `dir` removed first.
+fn pin_copy(binary: PathBuf, dir: &Path, id: u32, sweep: Sweep) -> io::Result<Pinned> {
     let name = binary.file_name().map(ToOwned::to_owned).ok_or_else(|| {
         io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -184,10 +262,21 @@ fn pin_copy(binary: PathBuf, dir: &Path, id: u32) -> io::Result<Pinned> {
     fs::create_dir_all(dir)?;
     for entry in fs::read_dir(dir)? {
         let left = entry?.path();
-        if fs::symlink_metadata(&left)?.is_dir() {
-            fs::remove_dir_all(&left)?;
+        let removes = match sweep.removes(&left, id) {
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            removes => removes?,
+        };
+        if !removes {
+            continue;
+        }
+        let metadata = match fs::symlink_metadata(&left) {
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            metadata => metadata?,
+        };
+        if metadata.is_dir() {
+            removed(fs::remove_dir_all(&left))?;
         } else {
-            fs::remove_file(&left)?;
+            removed(fs::remove_file(&left))?;
         }
     }
     let folder = dir.join(id.to_string());
@@ -1473,7 +1562,7 @@ mod tests {
         fs::create_dir_all(dir.join("41")).unwrap();
         fs::write(dir.join("41/prog"), "an earlier pin's copy").unwrap();
 
-        let pinned = pin_copy(binary.clone(), &dir, 42).unwrap();
+        let pinned = pin_copy(binary.clone(), &dir, 42, Sweep::All).unwrap();
         assert_eq!(pinned.program.path, binary);
         assert_eq!(pinned.program.spawn, dir.join("42/prog"));
         let left: Vec<_> = fs::read_dir(&dir)
@@ -1494,6 +1583,63 @@ mod tests {
 
         drop(pinned);
         assert_eq!(fs::read_dir(&dir).unwrap().count(), 0);
+    }
+
+    /// OWL-560: a watch typed in a terminal pins its binary among the copies
+    /// of other watches running at the same time. Its pin keeps theirs,
+    /// removes the folders of processes that ended and its own pid's, leaves
+    /// alone whatever else the folder holds, and its copy keeps its build.
+    #[cfg(unix)]
+    #[test]
+    fn a_pin_among_others_keeps_the_copies_of_running_processes() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = tempfile::tempdir().unwrap();
+        let binary = root.path().join("prog");
+        fs::write(&binary, "#!/bin/sh\necho old\n").unwrap();
+        fs::set_permissions(&binary, fs::Permissions::from_mode(0o755)).unwrap();
+        let mut ended = Command::new("true").spawn().unwrap();
+        let ended_pid = ended.id();
+        ended.wait().unwrap();
+        let running = std::os::unix::process::parent_id();
+        let own = std::process::id();
+        let dir = root.path().join("pinned");
+        for left in [running, ended_pid, own] {
+            fs::create_dir_all(dir.join(left.to_string())).unwrap();
+            fs::write(dir.join(format!("{left}/prog")), "a copy").unwrap();
+        }
+        fs::create_dir_all(dir.join("notes")).unwrap();
+        fs::write(dir.join("README"), "kept").unwrap();
+
+        let pinned = pin_copy(binary.clone(), &dir, own, Sweep::Ended).unwrap();
+        let mut left: Vec<_> = fs::read_dir(&dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().into_string().unwrap())
+            .collect();
+        left.sort();
+        let mut expected = vec![
+            running.to_string(),
+            own.to_string(),
+            "README".to_owned(),
+            "notes".to_owned(),
+        ];
+        expected.sort();
+        assert_eq!(left, expected);
+        assert_eq!(
+            fs::read_to_string(dir.join(format!("{running}/prog"))).unwrap(),
+            "a copy"
+        );
+
+        let staged = root.path().join(".prog.new");
+        fs::write(&staged, "#!/bin/sh\necho new\n").unwrap();
+        fs::set_permissions(&staged, fs::Permissions::from_mode(0o755)).unwrap();
+        fs::rename(&staged, &binary).unwrap();
+        let output = Command::new(&pinned.program.spawn).output().unwrap();
+        assert_eq!(String::from_utf8_lossy(&output.stdout), "old\n");
+
+        drop(pinned);
+        assert!(!dir.join(own.to_string()).exists());
+        assert!(dir.join(running.to_string()).exists());
     }
 
     /// OWL-553: on macOS the daemon's children run a copy of its binary,
