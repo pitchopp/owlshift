@@ -1933,15 +1933,17 @@ mod github {
 
     /// GitHub Issues, on its recorded exchanges. It declares ReadTicket,
     /// Comments and VisibleStage on their own fixtures, and ListAdmitted,
-    /// BlockedBy, ProposalsInbox and Reactions, which the drain's replay
-    /// (OWL-536) reads: each of their checks runs that replay, which reads
-    /// all four.
+    /// BlockedBy, ProposalsInbox and Reactions, which the drain's fixture
+    /// (OWL-536) holds: each of their five checks replays only its own
+    /// slice of it ([`DRAIN_BLOCKS`]), so a failure names the capability.
     pub fn adapter() -> Adapter {
-        let drain = || {
-            let replay = Replay::of(&dir(), DRAIN);
-            check_drain(&tracker(replay.clone()));
-            replay.assert_done();
-        };
+        fn drain(block: usize, check: fn(&dyn Tracker)) -> impl Fn() {
+            move || {
+                let replay = drain_block(block);
+                check(&tracker(replay.clone()));
+                replay.assert_done();
+            }
+        }
         Adapter::new("GitHub Issues", GitHubTracker::CAPABILITIES)
             .case(Check::Undeclared, || {
                 check_undeclared(GitHubTracker::CAPABILITIES)
@@ -1959,11 +1961,11 @@ mod github {
                 check_reads(&tracker);
                 replay.assert_done();
             })
-            .case(Check::Admitted, drain)
-            .case(Check::Blocked, drain)
-            .case(Check::Links, drain)
-            .case(Check::Proposals, drain)
-            .case(Check::Reactions, drain)
+            .case(Check::Admitted, drain(0, check_drain_admitted))
+            .case(Check::Blocked, drain(1, check_drain_blocked))
+            .case(Check::Links, drain(2, check_drain_links))
+            .case(Check::Reactions, drain(3, check_drain_reactions))
+            .case(Check::Proposals, drain(4, check_drain_proposals))
     }
 
     #[test]
@@ -2146,10 +2148,43 @@ mod github {
     const PROPOSAL_TITLE: &str = "Owlshift live check: OWL-536 proposal";
     const PROPOSAL_MARKER: &str = "fingerprint 0536abcdef01";
 
+    /// The exchanges each part of the drain makes, in the order
+    /// [`check_drain`] runs the parts: admitted and gestures (G3), state
+    /// types (G4, G5) and relations, links, a comment's reactions (G1),
+    /// then the working list, the proposals and the writes they make. The
+    /// lengths sum to the fixture's, which a re-recording that moves a
+    /// request between parts fails to match (see [`drain_block`]).
+    const DRAIN_BLOCKS: [usize; 5] = [7, 7, 3, 3, 8];
+
+    /// A replay of one part of the drain: its slice of the fixture.
+    fn drain_block(block: usize) -> Replay {
+        let exchanges = support::load(&dir(), DRAIN).exchanges;
+        assert_eq!(
+            exchanges.len(),
+            DRAIN_BLOCKS.iter().sum::<usize>(),
+            "{DRAIN}: the parts of the drain no longer cover it; update DRAIN_BLOCKS"
+        );
+        let start: usize = DRAIN_BLOCKS[..block].iter().sum();
+        let slice = exchanges[start..start + DRAIN_BLOCKS[block]].to_vec();
+        Replay::from_exchanges(&format!("{DRAIN}, part {block}"), slice)
+    }
+
     /// What the drain reads (OWL-536), on the sandbox's probes of G1, G3 and
     /// G4, then the writes it makes, made up when recorded.
     fn check_drain(tracker: &dyn Tracker) {
-        use owlshift_adapters::tracker::{Author, Column, Proposal, StateType};
+        check_drain_admitted(tracker);
+        check_drain_blocked(tracker);
+        check_drain_links(tracker);
+        check_drain_reactions(tracker);
+        check_drain_proposals(tracker);
+    }
+
+    /// ListAdmitted: the list of the gesture's label and each issue's
+    /// gesture (G3): a label put through a person's own login is their
+    /// gesture; one put through the app's token is no account's; one
+    /// removed since stands nowhere.
+    fn check_drain_admitted(tracker: &dyn Tracker) {
+        use owlshift_adapters::tracker::{Author, Column};
         use owlshift_contracts::config::Admit;
 
         let admit = Admit::Label(GESTURE_LABEL.to_owned());
@@ -2164,9 +2199,6 @@ mod github {
         assert_eq!(ids, ["31"]);
         assert!(listed[0].blockers.is_empty());
 
-        // G3: a label put through a person's own login is their gesture; one
-        // put through the app's token is no account's; one removed since
-        // stands nowhere.
         let gesture = tracker.gesture(&id("31"), &admit).unwrap();
         assert!(matches!(gesture.account, Author::Account(_)), "{gesture:?}");
         assert_eq!(gesture.at.unwrap().to_string(), "2026-11-12T19:44:38Z");
@@ -2181,8 +2213,13 @@ mod github {
         }
         let removed = Admit::Label("owlshift-check:ready".to_owned());
         assert!(tracker.gesture(&id("12"), &removed).is_err());
+    }
 
-        // G4 and G5: the closing reasons, and a pull request's number.
+    /// BlockedBy, its relations half: the closing reasons (G4), a pull
+    /// request's number (G5), and an issue's blockers with their states.
+    fn check_drain_blocked(tracker: &dyn Tracker) {
+        use owlshift_adapters::tracker::StateType;
+
         for (number, state) in [
             ("14", Some(StateType::Completed)),
             ("15", Some(StateType::Canceled)),
@@ -2206,10 +2243,18 @@ mod github {
                 ("16", Some(StateType::Duplicate))
             ]
         );
+    }
+
+    /// BlockedBy, its links half.
+    fn check_drain_links(tracker: &dyn Tracker) {
         let links = tracker.links(&id("13")).unwrap();
         assert_eq!(links.blocked_by.len(), 2);
+    }
 
-        // G1: a comment's reactions, its thumbs-up a person's.
+    /// Reactions (G1): a comment's reactions, its thumbs-up a person's.
+    fn check_drain_reactions(tracker: &dyn Tracker) {
+        use owlshift_adapters::tracker::Author;
+
         let comments = tracker.comments(&id(ISSUE)).unwrap();
         let reacted: Vec<_> = comments
             .iter()
@@ -2221,10 +2266,14 @@ mod github {
                 .any(|r| r.is_thumbs_up() && matches!(r.author, Author::Account(_))),
             "{reacted:?}"
         );
-        assert!(tracker.working(None, BACK).unwrap().is_empty());
+    }
 
-        // The proposals: none yet, then one filed, blocked by its parent; a
-        // relation written once.
+    /// ProposalsInbox: the working list, then the proposals: none yet, then
+    /// one filed, blocked by its parent; a relation written once.
+    fn check_drain_proposals(tracker: &dyn Tracker) {
+        use owlshift_adapters::tracker::Proposal;
+
+        assert!(tracker.working(None, BACK).unwrap().is_empty());
         assert!(
             tracker
                 .proposed(None, PROPOSAL_TITLE, PROPOSAL_MARKER)
