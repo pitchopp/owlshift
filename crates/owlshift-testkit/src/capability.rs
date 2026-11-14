@@ -73,6 +73,16 @@ pub fn refuses_writes_to_read_only_folder() -> Result<(), String> {
 /// runner's `restore` issues it. Err only for git's own rejection of the
 /// option; any other failure, the probe's setup included, panics.
 pub fn git_takes_reset_end_of_options() -> Result<(), String> {
+    git_takes_reset_end_of_options_with("git")
+}
+
+/// The probe with the git program as a parameter, so a stub can stand in. The
+/// scratch repository is made with the real `git`; only the probed command
+/// and the version report go through `git`.
+fn git_takes_reset_end_of_options_with(git: impl AsRef<std::ffi::OsStr>) -> Result<(), String> {
+    use std::process::{Command, Stdio};
+
+    let git = git.as_ref();
     let dir = tempfile::tempdir().expect("a scratch folder");
     let env = GitEnv::create(dir.path().join("home")).expect("the bench's git environment");
     let repo = dir.path().join("repo");
@@ -83,21 +93,27 @@ pub fn git_takes_reset_end_of_options() -> Result<(), String> {
     ] {
         env.run(&repo, args).expect("the scratch repository");
     }
+    let go = |args: &[&str]| {
+        let mut command = Command::new(git);
+        command.args(args).current_dir(&repo).stdin(Stdio::null());
+        env.apply(&mut command);
+        command.output().expect("the git program runs")
+    };
     let args = ["reset", "--hard", "--quiet", "--end-of-options", "HEAD"];
-    match env.run(&repo, &args) {
-        Ok(_) => Ok(()),
-        Err(error) => {
-            let detail = error.to_string();
-            if detail.contains("option '--end-of-options' must come before") {
-                let version = env
-                    .run(&repo, &["--version"])
-                    .map(|v| String::from_utf8_lossy(&v).trim().to_owned())
-                    .unwrap_or_default();
-                Err(format!("{version} rejects `git {}`", args.join(" ")))
-            } else {
-                panic!("the git probe failed otherwise: {detail}")
-            }
-        }
+    let output = go(&args);
+    if output.status.success() {
+        return Ok(());
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+    if output.status.code() == Some(128)
+        && stderr.contains("option '--end-of-options' must come before")
+    {
+        let version = String::from_utf8_lossy(&go(&["--version"]).stdout)
+            .trim()
+            .to_owned();
+        Err(format!("{version} rejects `git {}`", args.join(" ")))
+    } else {
+        panic!("the git probe failed otherwise: {} {stderr}", output.status)
     }
 }
 
@@ -112,6 +128,68 @@ mod tests {
         assert_eq!(gate(Ok(()), true), Gate::Run);
         assert_eq!(gate(Err("why".into()), false), Gate::Skip("why".into()));
         assert_eq!(gate(Err("why".into()), true), Gate::Fail("why".into()));
+    }
+
+    /// A stub `git` script running `body` in place of the program.
+    #[cfg(unix)]
+    fn stub(dir: &std::path::Path, body: &str) -> std::path::PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let path = dir.join("git-stub");
+        std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        path
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_git_that_takes_the_option_passes_the_probe() {
+        let dir = tempfile::tempdir().unwrap();
+        let git = stub(dir.path(), "exit 0");
+        assert_eq!(git_takes_reset_end_of_options_with(&git), Ok(()));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_git_that_rejects_the_option_fails_the_probe_naming_version_and_command() {
+        let dir = tempfile::tempdir().unwrap();
+        let git = stub(
+            dir.path(),
+            "if [ \"$1\" = --version ]; then echo 'git version 2.43.0'; exit 0; fi\n\
+echo \"fatal: option '--end-of-options' must come before non-option arguments\" >&2\nexit 128",
+        );
+        let err = git_takes_reset_end_of_options_with(&git).unwrap_err();
+        assert!(err.contains("git version 2.43.0"), "{err}");
+        assert!(
+            err.contains("git reset --hard --quiet --end-of-options HEAD"),
+            "{err}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[should_panic(expected = "the git probe failed otherwise")]
+    fn a_git_that_fails_otherwise_panics_the_probe() {
+        let dir = tempfile::tempdir().unwrap();
+        let git = stub(dir.path(), "echo 'fatal: something else' >&2\nexit 1");
+        let _ = git_takes_reset_end_of_options_with(&git);
+    }
+
+    /// The write probe agrees with a direct write into a read-only folder.
+    #[cfg(unix)]
+    #[test]
+    fn the_write_probe_matches_a_direct_write() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let folder = dir.path().join("shut");
+        std::fs::create_dir(&folder).unwrap();
+        std::fs::set_permissions(&folder, std::fs::Permissions::from_mode(0o500)).unwrap();
+        let refused = std::fs::write(folder.join("x"), "").is_err();
+        std::fs::set_permissions(&folder, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let probe = refuses_writes_to_read_only_folder();
+        assert_eq!(probe.is_ok(), refused);
+        if let Err(why) = probe {
+            assert!(why.contains("root"), "{why}");
+        }
     }
 
     /// The real probes run on the machine: they pass, or skip with a reason
