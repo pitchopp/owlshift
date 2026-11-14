@@ -8,9 +8,13 @@
 //! asks the tracker whether it answers, setting up a GitHub Issues project's
 //! labels, and writes the commented project file only once it did (OWL-537);
 //! `--skip-secrets` writes it without asking anything.
+//!
+//! `--replace-agent-token` asks for the Claude Code token for agent runs
+//! alone and stores it in place of the stored one, in any folder, touching
+//! nothing else (OWL-562): the answer to a token that leaked.
 
 use std::io::{self, IsTerminal};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::Arc;
 
@@ -25,9 +29,9 @@ use owlshift_runner::config::{Effective, FileState};
 use owlshift_runner::forge::{AppAccess, GitHubApp};
 use owlshift_runner::github_sign_in::{self, Ask, GitHub, Outcome, SystemWait};
 use owlshift_runner::init::{
-    AppStored, EXAMPLE_ASSIGNEE, EXAMPLE_TICKET, GITHUB_TOKEN, InitOptions, MARKDOWN_LIMITS,
-    MARKDOWN_PAGE, SecretsReport, Wanted, Written, project_file, read_root_files, required_secrets,
-    store_app_credentials, store_secrets, wanted_secrets, write_example_ticket,
+    AppStored, CLAUDE_TOKEN, EXAMPLE_ASSIGNEE, EXAMPLE_TICKET, GITHUB_TOKEN, InitOptions,
+    MARKDOWN_LIMITS, MARKDOWN_PAGE, SecretsReport, Wanted, Written, project_file, read_root_files,
+    required_secrets, store_app_credentials, store_secrets, wanted_secrets, write_example_ticket,
     write_once_connected, write_project_file,
 };
 use owlshift_runner::install::Manifests;
@@ -56,9 +60,11 @@ pub struct Args {
     /// Write the project file only, and store no secret.
     #[arg(long, conflicts_with = "replace_secrets")]
     skip_secrets: bool,
-    /// Ask again for this project's secrets already stored, and replace
-    /// them, signing in to GitHub again; a secret shared by every project of
-    /// this machine is never replaced, and an empty answer keeps reading it.
+    /// Ask again for the secrets already stored, this project's and the
+    /// Claude Code token for agent runs, and replace them, signing in to
+    /// GitHub again. An empty answer keeps the one in use. The tracker and
+    /// GitHub accounts every project of this machine used to share are
+    /// never written.
     #[arg(long)]
     replace_secrets: bool,
     /// Ask for a personal GitHub token instead of signing in through
@@ -66,6 +72,15 @@ pub struct Args {
     /// GitHub App token, so the personal token is the one used.
     #[arg(long, conflicts_with = "skip_secrets")]
     github_token: bool,
+    /// Ask only for a new Claude Code token for agent runs, the one every
+    /// project of this machine shares, and store it in place of the stored
+    /// one, as when it leaked, expired or was revoked. Nothing else is
+    /// asked, written or checked, and it runs in any folder.
+    #[arg(
+        long,
+        conflicts_with_all = ["skip_secrets", "replace_secrets", "github_token", "tracker", "team", "gate"]
+    )]
+    replace_agent_token: bool,
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -83,6 +98,9 @@ enum File<'a> {
 }
 
 pub fn run(args: &Args, config: &Effective) -> ExitCode {
+    if args.replace_agent_token {
+        return replace_agent_token();
+    }
     let (project, file) = match &config.project {
         FileState::Loaded { path, config, .. } => {
             println!(
@@ -205,9 +223,7 @@ pub fn run(args: &Args, config: &Effective) -> ExitCode {
                  machine shares (account `{shared}`): leave it empty to keep using that one."
             );
         }
-        rpassword::prompt_password(format!("{}: ", one.spec.label))
-            .ok()
-            .map(Secret::new)
+        read_hidden(one)
     };
     let report = store_secrets(&keychain, &wanted, args.replace_secrets, &mut ask);
     // What this run stored, which the install manifest lists for `owlshift
@@ -396,6 +412,86 @@ fn write(path: &Path, options: &InitOptions) -> Result<(), ExitCode> {
             path.display()
         ))),
         Err(error) => Err(fail(&format!("{}: {error}", path.display()))),
+    }
+}
+
+/// `--replace-agent-token` (OWL-562): asks on a terminal for the Claude
+/// Code token for agent runs alone and stores it in place of the stored
+/// one. No project, repository or tracker is involved, so it runs in any
+/// folder. Off a terminal it fails before it opens the keychain.
+fn replace_agent_token() -> ExitCode {
+    if !io::stdin().is_terminal() {
+        return fail(
+            "`owlshift init --replace-agent-token` asks for the token on a terminal only: run it \
+             again in one.",
+        );
+    }
+    let keychain = match Keychain::system() {
+        Ok(keychain) => keychain,
+        Err(error) => return fail(&error.to_string()),
+    };
+    println!(
+        "Owlshift keeps it in the system keychain, never in a file. Input is hidden; leave it \
+         empty to keep the token stored."
+    );
+    let mut ask = |one: &Wanted| {
+        println!("{}: {}.", one.spec.label, one.spec.help);
+        read_hidden(one)
+    };
+    match agent_token(&keychain, &mut ask, crate::data_dir()) {
+        Ok(said) => {
+            println!("{said}");
+            ExitCode::SUCCESS
+        }
+        Err(said) => fail(&said),
+    }
+}
+
+/// Asks `ask` for the Claude Code token for agent runs and stores it in
+/// `keychain` in place of the stored one, listing the entry in the install
+/// manifest of the data directory `data` (OWL-437). What to say once
+/// stored, or why nothing was: neither ever holds the token.
+fn agent_token(
+    keychain: &Keychain,
+    ask: &mut dyn FnMut(&Wanted) -> Option<Secret>,
+    data: Result<PathBuf, String>,
+) -> Result<String, String> {
+    let (wanted, _) = wanted_secrets(keychain, &[CLAUDE_TOKEN], None, None)?;
+    let report = store_secrets(keychain, &wanted, true, ask).map_err(|e| e.to_string())?;
+    if let Some(one) = report.stored.first() {
+        record_in_manifest(data, std::slice::from_ref(&one.account));
+        return Ok(format!(
+            "Stored the {one}, in place of any token stored before: agent runs started from now \
+             on log in with it."
+        ));
+    }
+    Err(match (report.refused.first(), report.kept.first()) {
+        (Some(one), _) => format!(
+            "not stored: the {one}: what was given holds a space or a control character, as a \
+             secret pasted across lines does; the keychain is unchanged."
+        ),
+        (None, Some(one)) => {
+            format!("nothing given: the {one} already stored stays in use.")
+        }
+        (None, None) => format!(
+            "nothing given, and no {} is stored: {}.",
+            wanted[0], CLAUDE_TOKEN.help
+        ),
+    })
+}
+
+/// Reads one secret at the terminal with hidden input. `None` when nothing
+/// could be read, which is said, never what was typed.
+fn read_hidden(one: &Wanted) -> Option<Secret> {
+    match rpassword::prompt_password(format!("{}: ", one.spec.label)) {
+        Ok(answer) => Some(Secret::new(answer)),
+        Err(error) => {
+            eprintln!(
+                "owlshift: the {} could not be read: {error}",
+                one.spec.label
+            );
+            None
+        }
     }
 }
 
@@ -696,6 +792,69 @@ mod tests {
             &mut ask,
             &mut Vec::new()
         ));
+    }
+
+    /// OWL-562: `--replace-agent-token` asks for the machine's Claude Code
+    /// token alone, stores it in place of the stored one and lists it in the
+    /// install manifest; an empty answer or one pasted across lines changes
+    /// nothing and fails. No message ever holds a token.
+    #[test]
+    fn the_agent_token_is_replaced_alone_and_never_shown() {
+        const AGENT: &str = owlshift_runner::executor::harness::CLAUDE_AGENT_ACCOUNT;
+        let read =
+            |keychain: &Keychain| keychain.read(AGENT).unwrap().map(|s| s.expose().to_owned());
+        let data = tempfile::tempdir().unwrap();
+        let keychain = Keychain::in_memory();
+        let other = "github.com/a/b/linear";
+        keychain.store(other, &Secret::new("lin_OTHER")).unwrap();
+
+        // Nothing stored and nothing given.
+        let said = agent_token(&keychain, &mut |_| None, Ok(data.path().to_owned()));
+        assert!(
+            said.unwrap_err()
+                .contains("no Claude Code token for agent runs")
+        );
+
+        keychain.store(AGENT, &Secret::new("OLD_SENTINEL")).unwrap();
+        let mut asked = Vec::new();
+        let said = agent_token(
+            &keychain,
+            &mut |one| {
+                asked.push(one.account.clone());
+                Some(Secret::new("  NEW_SENTINEL\n"))
+            },
+            Ok(data.path().to_owned()),
+        )
+        .unwrap();
+        assert_eq!(asked, [AGENT]);
+        assert_eq!(read(&keychain).as_deref(), Some("NEW_SENTINEL"));
+        assert_eq!(keychain.read(other).unwrap().unwrap().expose(), "lin_OTHER");
+        assert!(said.contains("account `claude-agent`"), "{said}");
+        let listed = Manifests::in_data_dir(data.path()).read().unwrap().keychain;
+        assert_eq!(listed.len(), 1);
+        assert_eq!(
+            (listed[0].service.as_str(), listed[0].account.as_str()),
+            (SERVICE, AGENT)
+        );
+
+        let mut said = vec![said];
+        for answer in ["", "sk-ant-oat01-SENTINEL\nrest"] {
+            let refusal = agent_token(
+                &keychain,
+                &mut |_| Some(Secret::new(answer)),
+                Ok(data.path().to_owned()),
+            )
+            .unwrap_err();
+            assert_eq!(read(&keychain).as_deref(), Some("NEW_SENTINEL"));
+            said.push(refusal);
+        }
+        assert!(said[1].contains("stays in use"), "{}", said[1]);
+        assert!(
+            said[2].contains("holds a space or a control character"),
+            "{}",
+            said[2]
+        );
+        assert!(said.iter().all(|one| !one.contains("SENTINEL")), "{said:?}");
     }
 
     /// OWL-437: what `init` stored is listed in the install manifest once,
