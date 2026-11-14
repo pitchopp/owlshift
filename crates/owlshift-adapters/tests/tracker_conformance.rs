@@ -2,18 +2,45 @@
 //! each of them. It asserts relative times only (order, last edit not before
 //! creation), never absolute ones, so a tracker that stamps comments with its
 //! own clock passes the same checks as one replayed from a recording.
+//!
+//! Every capability of the `Tracker` trait has a shared check, run on each
+//! adapter that declares it. [`check_of`] maps a capability to its checks
+//! with an exhaustive `match`, each adapter is an [`Adapter`] built from its
+//! own `CAPABILITIES` and one case per check, and the registry tests fail
+//! when a declared capability has no case, when a check no
+//! adapter runs covers a capability, and when a capability is declared that
+//! no check can exercise. A broken adapter ([`Broken`]) is shown to make
+//! each check fail.
+//!
+//! What is recorded and what is made up. The Markdown tracker runs on a tree
+//! of files built for each case. Linear runs the reads, the visible stage,
+//! the admitted listing, the gestures and the links on recorded exchanges;
+//! the rest of its cases (the state type, the relations and the relation
+//! write, the proposals, the documents, the resolved comments and the
+//! reactions) run on `support::Fake`, answers made up in the shapes of the
+//! adapter's unit tests, and are marked MADE UP where they are written, until
+//! a later ticket records them. GitHub Issues runs on its own recordings; its
+//! other capabilities come with the drain's ticket (OWL-536).
 
 mod support;
 
+use std::collections::BTreeMap;
 use std::fs;
+use std::sync::{Arc, Mutex};
 
 use owlshift_adapters::tracker::linear::{ApiKey, LinearTracker};
 use owlshift_adapters::tracker::markdown::MarkdownTracker;
-use owlshift_adapters::tracker::{Author, Capability, ErrorKind, Person, Tracker};
+use owlshift_adapters::tracker::{
+    Author, Blocker, Capability, Column, Comment, Document, Error as TrackerError, ErrorKind,
+    Filed, Found, Gesture, Links, Listed, MAX_DOCUMENT_CHARS, Person, Proposal, Relations,
+    StateType, Ticket, Tracker,
+};
 use owlshift_contracts::Priority;
+use owlshift_contracts::config::Admit;
 use owlshift_contracts::ids::TicketId;
+use serde_json::{Value, json};
 
-use support::{Recorder, Replay};
+use support::{Answer, Fake, Recorder, Replay};
 
 /// What the suite knows about the tracker it checks.
 struct Case {
@@ -37,6 +64,208 @@ struct Case {
 
 fn id(id: &str) -> TicketId {
     TicketId::new(id).unwrap()
+}
+
+/// One shared check. A capability is covered by the checks [`check_of`]
+/// names for it, and an adapter that declares the capability must have a
+/// case for each of them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Check {
+    /// Reading a ticket and its comments, and posting a comment.
+    Read,
+    /// Moving and reading the visible stage.
+    Stage,
+    /// Listing the admitted tickets and reading who admitted them.
+    Admitted,
+    /// The state type, the relations and the `blocked_by` write.
+    Blocked,
+    /// The links an intake brief reads.
+    Links,
+    /// Filing a proposal and finding it again.
+    Proposals,
+    /// Publishing and updating a document.
+    Documents,
+    /// Resolving a comment.
+    Folding,
+    /// Reading a comment's reactions.
+    Reactions,
+    /// A capability with no trait method: no adapter may declare it.
+    Undeclared,
+}
+
+/// The checks that cover a capability. The match is exhaustive and has no
+/// wildcard, so a capability added to the trait does not compile here until
+/// it is given a check.
+fn check_of(capability: Capability) -> &'static [Check] {
+    match capability {
+        Capability::ReadTicket | Capability::Comments => &[Check::Read],
+        Capability::VisibleStage => &[Check::Stage],
+        Capability::ListAdmitted => &[Check::Admitted],
+        // Both halves: an adapter cannot satisfy it with the relations alone.
+        Capability::BlockedBy => &[Check::Blocked, Check::Links],
+        Capability::ProposalsInbox => &[Check::Proposals],
+        Capability::Documents => &[Check::Documents],
+        Capability::FoldComments => &[Check::Folding],
+        Capability::Reactions => &[Check::Reactions],
+        Capability::AgentIdentity | Capability::Webhooks => &[Check::Undeclared],
+    }
+}
+
+/// An adapter under test: what it declares and one case per check it runs.
+/// `declared` is the adapter's own `CAPABILITIES`, so the registry cannot
+/// drift from what the adapter says it does. A case builds its own world
+/// and transport, calls the shared check and, where it replays a recording,
+/// ends by asserting that every recorded exchange was used.
+struct Adapter {
+    name: &'static str,
+    declared: &'static [Capability],
+    cases: Vec<(Check, Box<dyn Fn()>)>,
+}
+
+impl Adapter {
+    fn new(name: &'static str, declared: &'static [Capability]) -> Self {
+        Self {
+            name,
+            declared,
+            cases: Vec::new(),
+        }
+    }
+
+    fn case(mut self, check: Check, case: impl Fn() + 'static) -> Self {
+        self.cases.push((check, Box::new(case)));
+        self
+    }
+}
+
+/// Runs every case of the adapter.
+fn run(adapter: &Adapter) {
+    for (check, case) in &adapter.cases {
+        eprintln!("{}: the {check:?} check", adapter.name);
+        case();
+    }
+}
+
+/// Runs the cases of one check, and fails if the adapter has none.
+fn run_check(adapter: &Adapter, wanted: Check) {
+    let mut ran = false;
+    for (check, case) in &adapter.cases {
+        if *check == wanted {
+            eprintln!("{}: the {check:?} check", adapter.name);
+            case();
+            ran = true;
+        }
+    }
+    assert!(ran, "{} has no {wanted:?} case", adapter.name);
+}
+
+/// The capabilities the adapter declares for which a check has no case.
+fn missing_cases(adapter: &Adapter) -> Vec<Capability> {
+    adapter
+        .declared
+        .iter()
+        .copied()
+        .filter(|capability| {
+            check_of(*capability)
+                .iter()
+                .any(|check| !adapter.cases.iter().any(|(have, _)| have == check))
+        })
+        .collect()
+}
+
+/// The capabilities that have no trait method: no adapter may declare one,
+/// since nothing could check it. An adapter that does fails until a real
+/// check replaces this one.
+fn check_undeclared(declared: &[Capability]) {
+    for capability in Capability::ALL {
+        if check_of(capability) == [Check::Undeclared] {
+            assert!(
+                !declared.contains(&capability),
+                "{capability:?} is declared, and no check covers it"
+            );
+        }
+    }
+}
+
+/// The three adapters, each with the cases it runs.
+fn adapters() -> [Adapter; 3] {
+    [markdown(), linear(), github::adapter()]
+}
+
+/// An adapter that declares a capability must have a case for each check of
+/// it: a capability cannot be declared, GitHub's included, without its
+/// checks.
+#[test]
+fn every_declared_capability_has_a_case() {
+    for adapter in adapters() {
+        let missing = missing_cases(&adapter);
+        assert!(
+            missing.is_empty(),
+            "{} declares {missing:?} without a case",
+            adapter.name
+        );
+    }
+}
+
+/// Every check of every capability is run by some adapter's case, so a
+/// capability the trait declares cannot lack a check.
+#[test]
+fn every_capability_has_a_check() {
+    let covered: Vec<Check> = adapters()
+        .iter()
+        .flat_map(|a| a.cases.iter().map(|(check, _)| *check))
+        .collect();
+    for capability in Capability::ALL {
+        for check in check_of(capability) {
+            assert!(
+                covered.contains(check),
+                "no adapter runs the {check:?} check of {capability:?}"
+            );
+        }
+    }
+}
+
+/// A check other than Read (ReadTicket and Comments) and Undeclared
+/// (AgentIdentity and Webhooks) serves one capability, so a new capability
+/// cannot be mapped onto the check of another unnoticed.
+#[test]
+fn check_of_serves_one_capability_per_check() {
+    let all: Vec<Check> = Capability::ALL
+        .into_iter()
+        .flat_map(|c| check_of(c).iter().copied())
+        .collect();
+    for check in all {
+        let served: Vec<Capability> = Capability::ALL
+            .into_iter()
+            .filter(|c| check_of(*c).contains(&check))
+            .collect();
+        let wanted = match check {
+            Check::Read => 2,
+            Check::Undeclared => 2,
+            _ => 1,
+        };
+        assert_eq!(served.len(), wanted, "{check:?} serves {served:?}");
+    }
+}
+
+#[test]
+fn an_adapter_that_declares_a_capability_nothing_checks_fails() {
+    check_undeclared(&[Capability::ReadTicket]);
+    for capability in [Capability::AgentIdentity, Capability::Webhooks] {
+        let declared = [capability];
+        let outcome = std::panic::catch_unwind(|| check_undeclared(&declared));
+        assert!(outcome.is_err(), "{capability:?} was accepted");
+    }
+}
+
+#[test]
+fn a_declared_capability_without_a_case_is_reported() {
+    let none = Adapter::new("none", &[Capability::FoldComments]);
+    assert_eq!(missing_cases(&none), [Capability::FoldComments]);
+    // BlockedBy needs both halves.
+    let half = Adapter::new("half", &[Capability::BlockedBy]).case(Check::Blocked, || {});
+    assert_eq!(missing_cases(&half), [Capability::BlockedBy]);
+    let whole = half.case(Check::Links, || {});
+    assert!(missing_cases(&whole).is_empty());
 }
 
 /// Runs the whole suite. The calls are always made in the same order, which
@@ -131,11 +360,364 @@ fn check_stage(
     assert_eq!(missing.kind, ErrorKind::NotFound, "{missing}");
 }
 
+/// What the Admitted check knows about the tracker.
+struct AdmittedCase {
+    team: Option<&'static str>,
+    ready: &'static str,
+    admit: Admit,
+    /// Tickets the listing must show, each with the blockers it must carry.
+    expected: Vec<(TicketId, Vec<Blocker>)>,
+    /// Tickets the listing must not show: the ones that carry the wrong
+    /// label or sit in another stage. Where the tracker filters on its
+    /// server a recording cannot show that filter working: the check then
+    /// only shows the adapter does not invent tickets.
+    absent: Vec<TicketId>,
+    /// Admission gestures to read, in order.
+    gestures: Vec<(TicketId, Admit)>,
+    /// Who made each of them.
+    by: Author,
+    /// Whether the tracker keeps times: a ticket's creation in the listing
+    /// and a gesture's time. A tracker that keeps none gives `None`.
+    times: bool,
+}
+
+/// Listing the admitted tickets and reading who admitted them. `list` makes
+/// the listing calls and `gestures` the gesture reads, which are the same
+/// tracker for an adapter that is not replayed.
+fn check_admitted(list: &dyn Tracker, gestures: &dyn Tracker, case: &AdmittedCase) {
+    assert!(
+        list.capabilities().contains(&Capability::ListAdmitted),
+        "ListAdmitted is not declared"
+    );
+    let column = Column {
+        team: case.team,
+        ready: case.ready,
+        admit: &case.admit,
+    };
+    let listed = list.admitted(&column).unwrap();
+    for (n, one) in listed.iter().enumerate() {
+        let id = &one.ticket.id;
+        assert!(listed[..n].iter().all(|l| l.ticket.id != *id), "{id} twice");
+        assert_eq!(one.created_at.is_some(), case.times, "{id}: {one:?}");
+        for (m, blocker) in one.blockers.iter().enumerate() {
+            let twice = one.blockers[..m].iter().any(|b| b.id == blocker.id);
+            assert!(!twice, "{id}: blocker {} twice", blocker.id);
+        }
+    }
+    for (id, blockers) in &case.expected {
+        let one = listed.iter().find(|l| l.ticket.id == *id);
+        let one = one.unwrap_or_else(|| panic!("{id} is not listed: {listed:?}"));
+        assert_eq!(one.blockers, *blockers, "the blockers of {id}");
+    }
+    for id in &case.absent {
+        assert!(
+            listed.iter().all(|l| l.ticket.id != *id),
+            "{id} is listed though it is not admitted"
+        );
+    }
+
+    // The `delegation` gesture is not built: both reads refuse it.
+    let refused = list
+        .admitted(&Column {
+            admit: &Admit::Delegation,
+            ..column
+        })
+        .unwrap_err();
+    assert_eq!(refused.kind, ErrorKind::Other, "{refused}");
+
+    for (id, admit) in &case.gestures {
+        let gesture = gestures.gesture(id, admit).unwrap();
+        assert_eq!(gesture.account, case.by, "the gesture on {id}");
+        assert_eq!(gesture.at.is_some(), case.times, "{id}: {gesture:?}");
+    }
+    let (first, _) = &case.gestures[0];
+    let refused = gestures.gesture(first, &Admit::Delegation).unwrap_err();
+    assert_eq!(refused.kind, ErrorKind::Other, "{refused}");
+}
+
+/// What the Blocked check knows about the tracker.
+struct BlockedCase {
+    /// A ticket whose state is a completed one, and one whose state is not.
+    done: TicketId,
+    open: TicketId,
+    /// A ticket that does not exist.
+    missing: TicketId,
+    /// A ticket, and the blockers its relations must show.
+    blocked: TicketId,
+    blockers: Vec<Blocker>,
+    /// Two tickets with no relation: the check writes that the first blocks
+    /// the second.
+    new_blocker: TicketId,
+    new_blocked: TicketId,
+    /// A ticket the tracker refuses to relate, when the adapter says so:
+    /// the trait promises nothing about an unknown ticket, and the adapters
+    /// differ, so only a case that knows its adapter refuses sets it.
+    unknown_blocked: Option<TicketId>,
+}
+
+/// The state type, the relations and the `blocked_by` write: a ticket done
+/// is completed and one open is not; an unknown ticket is not found; the
+/// relations name the blockers; a relation written shows in them, and
+/// writing it twice changes nothing.
+fn check_blocked_by(tracker: &dyn Tracker, case: &BlockedCase) {
+    assert!(
+        tracker.capabilities().contains(&Capability::BlockedBy),
+        "BlockedBy is not declared"
+    );
+    let done = tracker.state_type(&case.done).unwrap();
+    assert_eq!(done, Some(StateType::Completed), "{}", case.done);
+    let open = tracker.state_type(&case.open).unwrap();
+    assert_ne!(open, Some(StateType::Completed), "{}", case.open);
+    let missing = tracker.state_type(&case.missing).unwrap_err();
+    assert_eq!(missing.kind, ErrorKind::NotFound, "{missing}");
+
+    let relations = tracker.relations(&case.blocked).unwrap();
+    assert_eq!(relations.id, case.blocked);
+    assert_eq!(relations.blockers, case.blockers);
+    let missing = tracker.relations(&case.missing).unwrap_err();
+    assert_eq!(missing.kind, ErrorKind::NotFound, "{missing}");
+
+    let before = tracker.relations(&case.new_blocked).unwrap().blockers;
+    assert!(
+        before.iter().all(|b| b.id != case.new_blocker),
+        "{} already blocks {}",
+        case.new_blocker,
+        case.new_blocked
+    );
+    tracker.block(&case.new_blocker, &case.new_blocked).unwrap();
+    let after = tracker.relations(&case.new_blocked).unwrap().blockers;
+    assert_eq!(after.len(), before.len() + 1, "{after:?}");
+    assert_eq!(
+        after.iter().filter(|b| b.id == case.new_blocker).count(),
+        1,
+        "the new blocker is shown once: {after:?}"
+    );
+    tracker.block(&case.new_blocker, &case.new_blocked).unwrap();
+    let again = tracker.relations(&case.new_blocked).unwrap().blockers;
+    assert_eq!(again, after, "writing a relation twice changes nothing");
+
+    if let Some(unknown) = &case.unknown_blocked {
+        let refused = tracker.block(&case.new_blocker, unknown);
+        assert!(refused.is_err(), "a relation to {unknown} was accepted");
+    }
+}
+
+/// What the Links check knows about the tracker: a ticket `blocked` that is
+/// blocked by `blocker`.
+struct LinksCase {
+    blocked: TicketId,
+    blocker: TicketId,
+}
+
+/// Intake's links: the blocked ticket lists its blocker in `blocked_by` and
+/// the blocker lists it in `blocks`, each once, with a title and a state.
+fn check_links(tracker: &dyn Tracker, case: &LinksCase) {
+    assert!(
+        tracker.capabilities().contains(&Capability::BlockedBy),
+        "BlockedBy is not declared"
+    );
+    let blocked = tracker.links(&case.blocked).unwrap();
+    let blocker = tracker.links(&case.blocker).unwrap();
+    for (list, wanted) in [
+        (&blocked.blocked_by, &case.blocker),
+        (&blocker.blocks, &case.blocked),
+    ] {
+        let found: Vec<_> = list.iter().filter(|l| l.id == *wanted).collect();
+        assert_eq!(found.len(), 1, "{wanted} in {list:?}");
+        assert!(found[0].title.as_deref().is_some_and(|t| !t.is_empty()));
+        assert!(found[0].state.as_ref().is_some_and(|s| !s.name.is_empty()));
+    }
+    for list in [
+        &blocked.blocked_by,
+        &blocked.blocks,
+        &blocked.related,
+        &blocker.blocked_by,
+        &blocker.blocks,
+        &blocker.related,
+    ] {
+        for (n, linked) in list.iter().enumerate() {
+            assert!(list[..n].iter().all(|earlier| earlier.id != linked.id));
+        }
+    }
+}
+
+/// What the Proposals check knows about the tracker.
+struct ProposalsCase {
+    team: Option<&'static str>,
+    /// The ticket the proposal follows up.
+    parent: TicketId,
+    /// A ready state's name that is not the inbox.
+    ready: &'static str,
+    /// The name of the state the inbox is.
+    inbox: &'static str,
+}
+
+/// Filing a proposal and finding it again: it is filed in the inbox, with
+/// nothing gone wrong; it is found by its title in any case and by its
+/// marker, each ticket once; another title and marker find nothing; a blank
+/// title or marker is refused; and a ready state that is the inbox is
+/// refused before anything is written.
+fn check_proposals(tracker: &dyn Tracker, case: &ProposalsCase) {
+    assert!(
+        tracker.capabilities().contains(&Capability::ProposalsInbox),
+        "ProposalsInbox is not declared"
+    );
+    const TITLE: &str = "Cap the retries";
+    const MARKER: &str = "fingerprint 0123456789ab";
+    let description = format!("Why.\n\n[owlshift] PROPOSAL · OWL-252 · {MARKER}");
+    let proposal = Proposal {
+        parent: &case.parent,
+        title: TITLE,
+        description: &description,
+        blocked_by_parent: true,
+        ready: case.ready,
+    };
+    let team = case.team;
+    let none = tracker.proposed(team, TITLE, MARKER).unwrap();
+    assert!(none.is_empty(), "found before filing: {none:?}");
+
+    let filed = tracker.propose(&proposal).unwrap();
+    assert_eq!(filed.state, case.inbox, "{filed:?}");
+    assert!(filed.problems.is_empty(), "{:?}", filed.problems);
+
+    // By its title alone, in another case; by its marker alone; by both,
+    // where it is still listed once.
+    for (title, marker) in [
+        (TITLE.to_uppercase(), "no such marker"),
+        ("Another title".to_owned(), MARKER),
+        (TITLE.to_owned(), MARKER),
+    ] {
+        let found = tracker.proposed(team, &title, marker).unwrap();
+        let ours: Vec<_> = found.iter().filter(|f| f.id == filed.id).collect();
+        assert_eq!(ours.len(), 1, "{title:?} {marker:?}: {found:?}");
+        assert!(ours[0].description.contains(MARKER), "{:?}", ours[0]);
+    }
+    let found = tracker
+        .proposed(team, "Another title", "fingerprint ffffffffffff")
+        .unwrap();
+    assert!(found.is_empty(), "{found:?}");
+    for (title, marker) in [(" ", MARKER), (TITLE, " ")] {
+        let refused = tracker.proposed(team, title, marker);
+        assert!(refused.is_err(), "{title:?} {marker:?}: {refused:?}");
+    }
+
+    // A proposal filed in the ready column would enter the queue without a
+    // person: refused, and nothing is written.
+    let refused = Proposal {
+        title: "Never filed",
+        description: "Why.\n\n[owlshift] PROPOSAL · OWL-252 · fingerprint aaaaaaaaaaaa",
+        ready: case.inbox,
+        ..proposal
+    };
+    let error = tracker.propose(&refused).unwrap_err();
+    assert_eq!(error.kind, ErrorKind::Other, "{error}");
+    let found = tracker
+        .proposed(team, refused.title, "fingerprint aaaaaaaaaaaa")
+        .unwrap();
+    assert!(
+        found.is_empty(),
+        "the refused proposal was filed: {found:?}"
+    );
+}
+
+/// What the Documents check knows about the tracker.
+struct DocumentsCase {
+    /// A ticket that exists, and one that does not.
+    ticket: TicketId,
+    missing: TicketId,
+}
+
+/// Publishing a document: it is created, then its content is replaced in
+/// place under the same identifier; a document the tracker does not show is
+/// not found, so the runner creates another; a document of an unknown ticket
+/// is an error (the trait promises no more, and Linear's answer to it was
+/// never checked live); and content past the cap is refused.
+fn check_documents(tracker: &dyn Tracker, case: &DocumentsCase) {
+    assert!(
+        tracker.capabilities().contains(&Capability::Documents),
+        "Documents is not declared"
+    );
+    let title = format!("Plan · {}", case.ticket);
+    let created = tracker
+        .publish_document(&case.ticket, None, &title, "v1")
+        .unwrap();
+    assert!(!created.id.is_empty(), "{created:?}");
+    let updated = tracker
+        .publish_document(&case.ticket, Some(&created.id), &title, "v2")
+        .unwrap();
+    assert_eq!(updated.id, created.id, "an update is in place");
+
+    let gone = tracker
+        .publish_document(&case.ticket, Some("does-not-exist"), &title, "v2")
+        .unwrap_err();
+    assert_eq!(gone.kind, ErrorKind::NotFound, "{gone}");
+    let unknown = tracker.publish_document(&case.missing, None, &title, "v1");
+    assert!(unknown.is_err(), "{unknown:?}");
+
+    let long = "y".repeat(MAX_DOCUMENT_CHARS + 1);
+    let refused = tracker.publish_document(&case.ticket, None, &title, &long);
+    assert!(refused.is_err(), "content past the cap was accepted");
+}
+
+/// Resolving a comment, which the tracker then shows folded: the comment is
+/// still listed, unedited; one that does not exist is not found.
+fn check_fold_comments(tracker: &dyn Tracker, ticket: &TicketId) {
+    assert!(
+        tracker.capabilities().contains(&Capability::FoldComments),
+        "FoldComments is not declared"
+    );
+    let posted = tracker
+        .post_comment(ticket, "[owlshift] QUESTIONS")
+        .unwrap();
+    tracker.resolve_comment(&posted.id).unwrap();
+    let listed = tracker.comments(ticket).unwrap();
+    let folded = listed.iter().find(|c| c.id == posted.id);
+    let folded = folded.unwrap_or_else(|| panic!("{} is no longer listed", posted.id));
+    assert_eq!(folded.body, posted.body);
+    assert_eq!(folded.edited_at, None, "resolving a comment edits it");
+    let unknown = tracker.resolve_comment("no-such-comment").unwrap_err();
+    assert_eq!(unknown.kind, ErrorKind::NotFound, "{unknown}");
+}
+
+/// What the Reactions check knows about the tracker: a ticket with a
+/// comment that carries a thumbs-up and one that carries none.
+struct ReactionsCase {
+    ticket: TicketId,
+    reacted: &'static str,
+    plain: &'static str,
+}
+
+/// Reading a comment's reactions: the thumbs-up of an account reads with
+/// its author and its time, and a comment without one reads none.
+fn check_reactions(tracker: &dyn Tracker, case: &ReactionsCase) {
+    assert!(
+        tracker.capabilities().contains(&Capability::Reactions),
+        "Reactions is not declared"
+    );
+    let comments = tracker.comments(&case.ticket).unwrap();
+    let find = |id: &str| {
+        let comment = comments.iter().find(|c| c.id == id);
+        comment.unwrap_or_else(|| panic!("no comment {id}: {comments:?}"))
+    };
+    let reacted = find(case.reacted);
+    let up: Vec<_> = reacted
+        .reactions
+        .iter()
+        .filter(|r| r.is_thumbs_up())
+        .collect();
+    assert_eq!(up.len(), 1, "{:?}", reacted.reactions);
+    assert!(matches!(up[0].author, Author::Account(_)), "{:?}", up[0]);
+    assert!(up[0].created_at >= reacted.created_at, "{:?}", up[0]);
+    let plain = find(case.plain);
+    assert!(plain.reactions.is_empty(), "{:?}", plain.reactions);
+}
+
 const BODY: &str = "[owlshift] OWL-13 conformance check: a comment posted by the Linear \
                     adapter's fixture recorder · safe to delete.\n\nSecond line.";
 
-#[test]
-fn the_markdown_tracker_conforms() {
+/// A fresh Markdown tracker over a temporary tree holding `DEMO-1`, with two
+/// comments. Each case builds its own, so no check depends on another.
+fn markdown_world() -> (tempfile::TempDir, MarkdownTracker) {
     let root = tempfile::tempdir().unwrap();
     let dir = root.path().join("tickets/DEMO-1");
     fs::create_dir_all(dir.join("comments")).unwrap();
@@ -156,8 +738,97 @@ fn the_markdown_tracker_conforms() {
         "Second.\n",
     )
     .unwrap();
+    // The tickets the other checks read: `DEMO-2` and `DEMO-6` are the
+    // admitted ones (Todo, the label), `DEMO-2` blocked by a ticket Done and
+    // one still In Progress; `DEMO-1`, `DEMO-5` (Todo without the label),
+    // `DEMO-3` and `DEMO-4` (labelled, in other stages) are not.
+    let agent = &["agent"][..];
+    for (id, title, stage, labels, blocked_by) in [
+        (
+            "DEMO-2",
+            "Greet by name",
+            "Todo",
+            agent,
+            &["DEMO-3", "DEMO-4"][..],
+        ),
+        ("DEMO-3", "Add a README", "Done", agent, &[][..]),
+        ("DEMO-4", "Add a licence", "In Progress", agent, &[][..]),
+        ("DEMO-5", "Add a changelog", "Todo", &[][..], &[][..]),
+        ("DEMO-6", "Add a contributing guide", "Todo", agent, &[][..]),
+    ] {
+        add_ticket(root.path(), id, title, stage, labels, blocked_by);
+    }
+    let tracker = MarkdownTracker::new(root.path());
+    (root, tracker)
+}
 
-    let case = Case {
+/// Writes the ticket folder `id` under `root`, authored by the maintainer.
+fn add_ticket(
+    root: &std::path::Path,
+    id: &str,
+    title: &str,
+    stage: &str,
+    labels: &[&str],
+    blocked_by: &[&str],
+) {
+    let dir = root.join("tickets").join(id);
+    fs::create_dir_all(dir.join("comments")).unwrap();
+    let list = |names: &[&str]| {
+        let quoted: Vec<String> = names.iter().map(|n| format!("\"{n}\"")).collect();
+        format!("[{}]", quoted.join(", "))
+    };
+    let mut front = format!(
+        "title = \"{title}\"\nauthor = \"maintainer\"\nstage = \"{stage}\"\nlabels = {}\n",
+        list(labels)
+    );
+    if !blocked_by.is_empty() {
+        front += &format!("blocked_by = {}\n", list(blocked_by));
+    }
+    fs::write(
+        dir.join("ticket.md"),
+        format!("+++\n{front}+++\n\n{title}.\n"),
+    )
+    .unwrap();
+}
+
+fn markdown_admitted_case() -> AdmittedCase {
+    let maintainer = Person {
+        id: "maintainer".to_owned(),
+        name: "maintainer".to_owned(),
+    };
+    AdmittedCase {
+        team: None,
+        ready: "Todo",
+        admit: Admit::Label("agent".to_owned()),
+        expected: vec![
+            (
+                id("DEMO-2"),
+                vec![
+                    // A ticket Done is completed; one In Progress has no type.
+                    Blocker {
+                        id: id("DEMO-3"),
+                        state: Some(StateType::Completed),
+                    },
+                    Blocker {
+                        id: id("DEMO-4"),
+                        state: None,
+                    },
+                ],
+            ),
+            (id("DEMO-6"), vec![]),
+        ],
+        absent: vec![id("DEMO-1"), id("DEMO-3"), id("DEMO-4"), id("DEMO-5")],
+        gestures: vec![
+            (id("DEMO-2"), Admit::Label("agent".to_owned())),
+            (id("DEMO-6"), Admit::State("Todo".to_owned())),
+        ],
+        by: Author::Account(maintainer),
+        times: false,
+    }
+}
+
+fn markdown_case() -> Case {
+    Case {
         existing: id("DEMO-1"),
         title: "Add a greeting",
         description_start: "Say hello",
@@ -167,25 +838,127 @@ fn the_markdown_tracker_conforms() {
         labels: &["Feature", "Docs"],
         missing: id("DEMO-404"),
         body: BODY,
-    };
-    let tracker = MarkdownTracker::new(root.path());
-    check(&tracker, &case);
-    check_stage(
-        &tracker,
-        &case.existing,
-        &case.missing,
-        "Needs Input",
-        "In Progress",
-    );
-    assert_eq!(tracker.ticket(&case.existing).unwrap().stage, "In Progress");
-    let maintainer = Person {
-        id: "maintainer".to_owned(),
-        name: "maintainer".to_owned(),
-    };
-    assert_eq!(
-        Tracker::ticket(&tracker, &case.existing).unwrap().assignee,
-        Some(maintainer)
-    );
+    }
+}
+
+/// The Markdown tracker, on a tree of files built for each case.
+fn markdown() -> Adapter {
+    Adapter::new("the Markdown tracker", MarkdownTracker::CAPABILITIES)
+        .case(Check::Undeclared, || {
+            check_undeclared(MarkdownTracker::CAPABILITIES)
+        })
+        .case(Check::Read, || {
+            let (_world, tracker) = markdown_world();
+            let case = markdown_case();
+            check(&tracker, &case);
+            let maintainer = Person {
+                id: "maintainer".to_owned(),
+                name: "maintainer".to_owned(),
+            };
+            assert_eq!(
+                Tracker::ticket(&tracker, &case.existing).unwrap().assignee,
+                Some(maintainer)
+            );
+        })
+        .case(Check::Stage, || {
+            let (_world, tracker) = markdown_world();
+            let case = markdown_case();
+            check_stage(
+                &tracker,
+                &case.existing,
+                &case.missing,
+                "Needs Input",
+                "In Progress",
+            );
+            assert_eq!(tracker.ticket(&case.existing).unwrap().stage, "In Progress");
+        })
+        .case(Check::Admitted, || {
+            let (_world, tracker) = markdown_world();
+            let case = markdown_admitted_case();
+            // The tickets that must not be listed are there to be left out.
+            for id in &case.absent {
+                Tracker::ticket(&tracker, id).unwrap();
+            }
+            check_admitted(&tracker, &tracker, &case);
+        })
+        .case(Check::Blocked, || {
+            let (_world, tracker) = markdown_world();
+            check_blocked_by(&tracker, &markdown_blocked_case());
+        })
+        .case(Check::Links, || {
+            // `DEMO-2`'s `blocked_by` names `DEMO-3`: the file of `DEMO-3`
+            // says nothing, so its `blocks` comes from the scan of the tree.
+            let (_world, tracker) = markdown_world();
+            check_links(
+                &tracker,
+                &LinksCase {
+                    blocked: id("DEMO-2"),
+                    blocker: id("DEMO-3"),
+                },
+            );
+        })
+        .case(Check::Proposals, || {
+            let (world, tracker) = markdown_world();
+            let tickets = || fs::read_dir(world.path().join("tickets")).unwrap().count();
+            let before = tickets();
+            check_proposals(
+                &tracker,
+                &ProposalsCase {
+                    team: None,
+                    parent: id("DEMO-1"),
+                    ready: "Todo",
+                    inbox: MarkdownTracker::TRIAGE,
+                },
+            );
+            // The proposal is a ticket of its own, and the refused one none.
+            assert_eq!(tickets(), before + 1);
+        })
+        .case(Check::Documents, || {
+            let (world, tracker) = markdown_world();
+            check_documents(
+                &tracker,
+                &DocumentsCase {
+                    ticket: id("DEMO-1"),
+                    missing: id("DEMO-404"),
+                },
+            );
+            // One file, its content replaced in place under its title; the
+            // refused calls wrote none.
+            let dir = world.path().join("tickets/DEMO-1/documents");
+            let files: Vec<_> = fs::read_dir(&dir).unwrap().collect();
+            assert_eq!(files.len(), 1, "{files:?}");
+            let text = fs::read_to_string(dir.join("1.md")).unwrap();
+            assert!(text.starts_with("# Plan · DEMO-1"), "{text:?}");
+            assert!(text.contains("v2") && !text.contains("v1"), "{text:?}");
+        })
+}
+
+fn markdown_blocked_case() -> BlockedCase {
+    BlockedCase {
+        done: id("DEMO-3"),
+        open: id("DEMO-4"),
+        missing: id("DEMO-404"),
+        blocked: id("DEMO-2"),
+        blockers: vec![
+            Blocker {
+                id: id("DEMO-3"),
+                state: Some(StateType::Completed),
+            },
+            Blocker {
+                id: id("DEMO-4"),
+                state: None,
+            },
+        ],
+        new_blocker: id("DEMO-6"),
+        new_blocked: id("DEMO-5"),
+        // The Markdown tracker refuses a relation on a ticket it lacks.
+        unknown_blocked: Some(id("DEMO-404")),
+    }
+}
+
+#[test]
+fn the_markdown_tracker_conforms() {
+    run(&markdown());
 }
 
 fn linear_case() -> Case {
@@ -206,14 +979,412 @@ fn linear_case() -> Case {
 
 const LINEAR_FIXTURE: &str = "conformance.json";
 
+/// The ticket the stage fixture moves, from In Progress to Needs Input and
+/// back: the issue of the change that recorded it.
+const STAGE_TICKET: &str = "OWL-137";
+const STAGE_FIXTURE: &str = "stage-owl-137.json";
+
+/// Linear, on its recorded exchanges.
+fn linear() -> Adapter {
+    Adapter::new("Linear", LinearTracker::CAPABILITIES)
+        .case(Check::Undeclared, || {
+            check_undeclared(LinearTracker::CAPABILITIES)
+        })
+        .case(Check::Read, || {
+            let replay = Replay::new(LINEAR_FIXTURE);
+            check(
+                &LinearTracker::with_transport(replay.clone()),
+                &linear_case(),
+            );
+            replay.assert_done();
+        })
+        .case(Check::Stage, || {
+            let replay = Replay::new(STAGE_FIXTURE);
+            check_stage(
+                &LinearTracker::with_transport(replay.clone()),
+                &id(STAGE_TICKET),
+                &linear_case().missing,
+                "Needs Input",
+                "In Progress",
+            );
+            replay.assert_done();
+        })
+        .case(Check::Admitted, || {
+            // Team `OWL`'s Todo on 2026-10-13 (a state gesture), then the
+            // four gestures recorded for the drain, each from its fixture.
+            let listing = Replay::new("admitted-todo.json");
+            let gestures = Replay::new("gestures.json");
+            check_admitted(
+                &LinearTracker::with_transport(listing.clone()),
+                &LinearTracker::with_transport(gestures.clone()),
+                &linear_admitted_case(),
+            );
+            listing.assert_done();
+            gestures.assert_done();
+        })
+        .case(Check::Blocked, || {
+            // MADE UP: no recording holds these answers. `Fake` answers the
+            // state type, the relations and the relation write in the
+            // shapes of the unit tests of `src/tracker/linear.rs`, and keeps
+            // the relations written so that the next read shows them. To be
+            // recorded live by a later ticket.
+            check_blocked_by(
+                &LinearTracker::with_transport(linear_relations()),
+                &linear_blocked_case(),
+            );
+        })
+        .case(Check::Links, || {
+            // Recorded on 2026-10-21: OWL-254 is blocked by OWL-267, which
+            // blocks it.
+            let replay = Replay::new(LINKS_FIXTURE);
+            check_links(
+                &LinearTracker::with_transport(replay.clone()),
+                &LinksCase {
+                    blocked: id("OWL-254"),
+                    blocker: id("OWL-267"),
+                },
+            );
+            replay.assert_done();
+        })
+        .case(Check::Proposals, || {
+            // MADE UP: no recording holds these answers (see `Fake`).
+            let (fake, stored) = linear_proposals();
+            check_proposals(
+                &LinearTracker::with_transport(fake),
+                &ProposalsCase {
+                    team: Some("owl"),
+                    parent: id("OWL-252"),
+                    ready: "Todo",
+                    inbox: "Triage",
+                },
+            );
+            // One issue was created: the refused proposal never was.
+            assert_eq!(stored.lock().unwrap().len(), 1);
+        })
+        .case(Check::Documents, || {
+            // MADE UP: no recording holds these answers (see `Fake`). The
+            // answer to a document of an unknown issue is not even in a
+            // unit test: it is unverified, and the check asks only for an
+            // error.
+            let fake = linear_documents();
+            check_documents(
+                &LinearTracker::with_transport(fake.clone()),
+                &DocumentsCase {
+                    ticket: id("OWL-1"),
+                    missing: id("OWL-99999"),
+                },
+            );
+            // The update went to the created document, with the new content.
+            let calls = fake.calls();
+            assert_eq!(calls[1].1["id"], "d1");
+            assert_eq!(calls[1].1["input"]["content"], "v2");
+            // The refused content was never sent.
+            assert_eq!(
+                fake.asked(),
+                [
+                    "CreateDocument",
+                    "UpdateDocument",
+                    "UpdateDocument",
+                    "CreateDocument"
+                ]
+            );
+        })
+        .case(Check::Folding, || {
+            // MADE UP: no recording holds these answers (see `Fake`).
+            check_fold_comments(
+                &LinearTracker::with_transport(linear_comments()),
+                &id("OWL-1"),
+            );
+        })
+        .case(Check::Reactions, || {
+            // MADE UP: the comments and their reactions are in the shape of
+            // `reactions_are_read_with_their_authors` in the adapter's unit
+            // tests; Linear answered such reactions on 2026-10-19.
+            check_reactions(
+                &LinearTracker::with_transport(linear_comments()),
+                &ReactionsCase {
+                    ticket: id("OWL-1"),
+                    reacted: "c1",
+                    plain: "c2",
+                },
+            );
+        })
+}
+
+/// MADE UP: a Linear whose issue OWL-1 holds two comments, `c1` with a
+/// thumbs-up of an account and `c2` with none. It keeps the comments posted,
+/// and `Resolve` of a comment it holds succeeds without touching it: a
+/// resolved comment is still listed, unedited. An unknown comment is
+/// `Entity not found: Comment`. Shapes as in the unit tests of
+/// `src/tracker/linear.rs`.
+fn linear_comments() -> Fake {
+    let user = json!({ "id": "u1", "displayName": "person-1", "app": false });
+    let app = json!({ "id": "app-1", "displayName": "Owlshift", "app": true });
+    let reactor = user.clone();
+    let comment = move |id: &str, at: &str, reactions: Value| {
+        json!({ "id": id, "body": format!("body of {id}"), "createdAt": at, "editedAt": null,
+            "user": user, "botActor": null, "externalUser": null, "parent": null,
+            "reactions": reactions })
+    };
+    let mut comments = vec![
+        comment(
+            "c1",
+            "2026-10-19T20:07:00.000Z",
+            json!([{ "emoji": "+1", "createdAt": "2026-10-19T20:07:35.000Z",
+                "externalUser": null, "user": reactor }]),
+        ),
+        comment("c2", "2026-10-19T20:08:00.000Z", json!([])),
+    ];
+    Fake::new(move |name, variables| match name {
+        "PostComment" => {
+            let id = format!("c{}", comments.len() + 1);
+            let mut posted = comment(&id, &jiff::Timestamp::now().to_string(), json!([]));
+            posted["body"] = variables["body"].clone();
+            posted["user"] = app.clone();
+            comments.push(posted.clone());
+            Answer::Data(json!({ "commentCreate": { "success": true, "comment": posted } }))
+        }
+        "Comments" => {
+            // Linear lists the newest first.
+            let nodes: Vec<&Value> = comments.iter().rev().collect();
+            Answer::Data(json!({ "issue": { "comments": { "nodes": nodes,
+                "pageInfo": { "hasNextPage": false, "endCursor": null } } } }))
+        }
+        "Resolve" => {
+            if comments.iter().any(|c| c["id"] == variables["id"]) {
+                Answer::Data(json!({ "commentResolve": { "success": true } }))
+            } else {
+                Answer::NotFound("Entity not found: Comment")
+            }
+        }
+        other => panic!("the made-up Linear does not answer {other}"),
+    })
+}
+
+/// MADE UP: a Linear that knows the issue OWL-1 and keeps the documents
+/// made on it, in the answer shapes of the unit tests of
+/// `src/tracker/linear.rs`. An update of a document it does not hold is
+/// `Entity not found: Document`; a document of another issue is
+/// `Entity not found: Issue`, UNVERIFIED: nothing recorded or tested says
+/// how Linear answers it.
+fn linear_documents() -> Fake {
+    let mut documents: BTreeMap<String, String> = BTreeMap::new();
+    let written = |id: &str| {
+        json!({ "success": true, "document": { "id": id,
+            "url": format!("https://linear.app/owlshift/document/{id}"), "archivedAt": null } })
+    };
+    Fake::new(move |name, variables| match name {
+        "CreateDocument" => {
+            let input = &variables["input"];
+            if input["issueId"] != "OWL-1" {
+                return Answer::NotFound("Entity not found: Issue");
+            }
+            let id = format!("d{}", documents.len() + 1);
+            documents.insert(id.clone(), input["content"].as_str().unwrap().to_owned());
+            Answer::Data(json!({ "documentCreate": written(&id) }))
+        }
+        "UpdateDocument" => {
+            let id = variables["id"].as_str().unwrap();
+            let Some(content) = documents.get_mut(id) else {
+                return Answer::NotFound("Entity not found: Document");
+            };
+            *content = variables["input"]["content"].as_str().unwrap().to_owned();
+            Answer::Data(json!({ "documentUpdate": written(id) }))
+        }
+        other => panic!("the made-up Linear does not answer {other}"),
+    })
+}
+
+const LINKS_FIXTURE: &str = "links.json";
+
+/// The issues the made-up Linear stores: identifier, title, description.
+type Stored = Vec<(String, String, String)>;
+
+/// MADE UP: a Linear whose team `OWL` has triage on, in the answer shapes of
+/// the unit tests of `src/tracker/linear.rs`. It stores each issue
+/// `Propose` creates, which `Proposed` finds again by the title, whatever
+/// its case, and by the description's marker, as the two filters do.
+fn linear_proposals() -> (Fake, Arc<Mutex<Stored>>) {
+    let stored: Arc<Mutex<Stored>> = Arc::default();
+    let kept = Arc::clone(&stored);
+    let states = [
+        ("In Review", "started", 2.6),
+        ("Triage", "triage", 0.0),
+        ("Backlog", "backlog", 0.0),
+        ("Todo", "unstarted", 1.0),
+        ("Done", "completed", 3.0),
+        ("Canceled", "canceled", 4.0),
+    ];
+    let fake = Fake::new(move |name, variables| match name {
+        "ProposalTarget" => {
+            let nodes: Vec<Value> = states
+                .iter()
+                .map(|(name, kind, position)| {
+                    json!({ "id": format!("s-{name}"), "name": name, "type": kind,
+                        "position": position })
+                })
+                .collect();
+            Answer::Data(
+                json!({ "issue": { "id": "parent-id", "project": { "id": "p4" },
+                "team": { "id": "team-owl", "key": "OWL", "triageEnabled": true,
+                    "states": { "nodes": nodes, "pageInfo": { "hasNextPage": false } } } } }),
+            )
+        }
+        "Propose" => {
+            let input = &variables["input"];
+            let mut stored = kept.lock().unwrap();
+            let identifier = format!("OWL-{}", 266 + stored.len());
+            stored.push((
+                identifier.clone(),
+                input["title"].as_str().unwrap().to_owned(),
+                input["description"].as_str().unwrap().to_owned(),
+            ));
+            let state = input["stateId"].as_str().unwrap();
+            Answer::Data(json!({ "issueCreate": { "success": true, "issue": {
+                "id": "new-id", "identifier": identifier,
+                "state": { "id": state, "name": state.trim_start_matches("s-") } } } }))
+        }
+        "Relate" => Answer::Data(json!({ "issueRelationCreate": { "success": true } })),
+        "Proposed" => {
+            let filter = &variables["filter"];
+            let by_title = filter["title"]["eqIgnoreCase"].as_str();
+            let by_marker = filter["description"]["contains"].as_str();
+            let nodes: Vec<Value> = kept
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(_, title, description)| {
+                    by_title.is_some_and(|t| t.to_lowercase() == title.to_lowercase())
+                        || by_marker.is_some_and(|m| description.contains(m))
+                })
+                .map(|(identifier, _, description)| {
+                    json!({ "identifier": identifier, "description": description,
+                        "state": { "type": "triage" } })
+                })
+                .collect();
+            Answer::Data(json!({ "issues": { "nodes": nodes,
+                "pageInfo": { "hasNextPage": false, "endCursor": null } } }))
+        }
+        other => panic!("the made-up Linear does not answer {other}"),
+    });
+    (fake, stored)
+}
+
+fn linear_blocked_case() -> BlockedCase {
+    BlockedCase {
+        done: id("OWL-1"),
+        open: id("OWL-2"),
+        missing: id("OWL-99999"),
+        blocked: id("OWL-7"),
+        blockers: vec![Blocker {
+            id: id("OWL-2"),
+            state: Some(StateType::Started),
+        }],
+        new_blocker: id("OWL-3"),
+        new_blocked: id("OWL-4"),
+        // Linear's answer to a relation on an unknown blocked ticket was
+        // never checked live: only the unknown blocker was (check (d)).
+        unknown_blocked: None,
+    }
+}
+
+/// MADE UP: a Linear that knows the tickets OWL-1 (completed), OWL-2
+/// (started), OWL-3 and OWL-4 (unstarted) and OWL-7, blocked by OWL-2, and
+/// answers every other issue `Entity not found: Issue`. A `blocks` relation
+/// written is kept once and read back by `Relations`, as Linear answers a
+/// relation already there (OWL-292).
+fn linear_relations() -> Fake {
+    let mut blockers: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    blockers.insert("OWL-7".to_owned(), vec!["OWL-2".to_owned()]);
+    let kind = |id: &str| match id {
+        "OWL-1" => Some("completed"),
+        "OWL-2" => Some("started"),
+        "OWL-3" | "OWL-4" | "OWL-7" => Some("unstarted"),
+        _ => None,
+    };
+    Fake::new(move |name, variables| match name {
+        "TicketStateType" => match kind(variables["id"].as_str().unwrap()) {
+            Some(kind) => Answer::Data(json!({ "issue": { "state": { "type": kind } } })),
+            None => Answer::NotFound("Entity not found: Issue"),
+        },
+        "Relations" => {
+            let id = variables["id"].as_str().unwrap();
+            let Some(own) = kind(id) else {
+                return Answer::NotFound("Entity not found: Issue");
+            };
+            let nodes: Vec<Value> = blockers
+                .get(id)
+                .into_iter()
+                .flatten()
+                .map(|blocker| {
+                    json!({ "type": "blocks", "issue": {
+                        "identifier": blocker, "state": { "type": kind(blocker) } } })
+                })
+                .collect();
+            Answer::Data(json!({ "issue": {
+                "identifier": id, "description": null, "state": { "type": own },
+                "inverseRelations": { "nodes": nodes, "pageInfo": { "hasNextPage": false } } } }))
+        }
+        "Relate" => {
+            let input = &variables["input"];
+            assert_eq!(input["type"], "blocks", "{input}");
+            let list = blockers
+                .entry(input["relatedIssueId"].as_str().unwrap().to_owned())
+                .or_default();
+            let blocker = input["issueId"].as_str().unwrap().to_owned();
+            if !list.contains(&blocker) {
+                list.push(blocker);
+            }
+            Answer::Data(json!({ "issueRelationCreate": { "success": true } }))
+        }
+        other => panic!("the made-up Linear does not answer {other}"),
+    })
+}
+
+/// A `NotFound` answer of the fake reads as [`ErrorKind::NotFound`] through
+/// the adapter, as Linear's own does.
+#[test]
+fn a_not_found_answer_of_the_fake_is_not_found() {
+    let tracker = LinearTracker::with_transport(linear_relations());
+    let missing = tracker.state_type(&id("OWL-99999")).unwrap_err();
+    assert_eq!(missing.kind, ErrorKind::NotFound, "{missing}");
+}
+
+fn linear_admitted_case() -> AdmittedCase {
+    let blocker = |id: &str| Blocker {
+        id: TicketId::new(id).unwrap(),
+        state: Some(StateType::Started),
+    };
+    let label = |name: &str| Admit::Label(name.to_owned());
+    let by = Person {
+        id: "00000000-0000-4000-8000-000000000001".to_owned(),
+        name: "person-1".to_owned(),
+    };
+    AdmittedCase {
+        team: Some("owl"),
+        ready: "Todo",
+        admit: Admit::State("Todo".to_owned()),
+        expected: vec![(id("OWL-155"), vec![blocker("OWL-246"), blocker("OWL-245")])],
+        // Linear filters on its server, so a recording only shows that the
+        // adapter lists no ticket the answer does not hold.
+        absent: vec![id("OWL-99999")],
+        // A label added by an account (OWL-129), a label set at creation and
+        // a move by an account (OWL-179), a ticket created in the state
+        // (OWL-249): the maintainer's account each time.
+        gestures: vec![
+            (id("OWL-129"), label("zone:backend/billing")),
+            (id("OWL-179"), label("agent")),
+            (id("OWL-179"), Admit::State("Canceled".to_owned())),
+            (id("OWL-249"), Admit::State("Todo".to_owned())),
+        ],
+        by: Author::Account(by),
+        times: true,
+    }
+}
+
 #[test]
 fn the_linear_tracker_conforms() {
-    let replay = Replay::new(LINEAR_FIXTURE);
-    check(
-        &LinearTracker::with_transport(replay.clone()),
-        &linear_case(),
-    );
-    replay.assert_done();
+    run(&linear());
 }
 
 /// Records the Linear conformance fixture by running the suite against the
@@ -251,22 +1422,9 @@ fn record_conformance_fixture() {
     }
 }
 
-/// The ticket the stage fixture moves, from In Progress to Needs Input and
-/// back: the issue of the change that recorded it.
-const STAGE_TICKET: &str = "OWL-137";
-const STAGE_FIXTURE: &str = "stage-owl-137.json";
-
 #[test]
 fn the_linear_tracker_moves_the_visible_stage() {
-    let replay = Replay::new(STAGE_FIXTURE);
-    check_stage(
-        &LinearTracker::with_transport(replay.clone()),
-        &id(STAGE_TICKET),
-        &linear_case().missing,
-        "Needs Input",
-        "In Progress",
-    );
-    replay.assert_done();
+    run_check(&linear(), Check::Stage);
 }
 
 /// Records the stage fixture against the live API. It writes to Linear:
@@ -389,6 +1547,294 @@ fn today() -> String {
     jiff::Zoned::now().date().to_string()
 }
 
+/// One behaviour a [`Broken`] adapter gets wrong, each of a method the
+/// check of one family calls: an adapter that does so must fail the build.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Flaw {
+    /// Read: a comment posted is never listed.
+    HidesPostedComments,
+    /// Stage: a move of a ticket that does not exist succeeds.
+    MovesAMissingTicket,
+    /// Admitted: the listing ignores the label and the stage.
+    ListsEverything,
+    /// Admitted: the listed blockers lose their state type.
+    LosesBlockerTypes,
+    /// Blocked: `block` answers success and writes nothing.
+    DropsBlocks,
+    /// Links: the tickets a ticket blocks are left out.
+    DropsBlocksLinks,
+    /// Proposals: the search finds nothing.
+    ForgetsProposals,
+    /// Documents: an update makes a new document.
+    CreatesOnUpdate,
+    /// Folding: a resolved comment is no longer listed.
+    HidesResolvedComments,
+    /// Reactions: comments are read without their reactions.
+    DropsReactions,
+}
+
+/// An adapter with one behaviour broken: every call goes to `inner`, but for
+/// the one the flaw names. The checks are shown to fail on it, so a check
+/// that asserts nothing cannot pass for an adapter that is wrong.
+struct Broken<T> {
+    inner: T,
+    flaw: Flaw,
+    /// The comments the flaw hides.
+    hidden: std::cell::RefCell<Vec<String>>,
+}
+
+impl<T: Tracker> Broken<T> {
+    fn new(inner: T, flaw: Flaw) -> Self {
+        Self {
+            inner,
+            flaw,
+            hidden: Default::default(),
+        }
+    }
+}
+
+impl<T: Tracker> Tracker for Broken<T> {
+    fn capabilities(&self) -> &'static [Capability] {
+        self.inner.capabilities()
+    }
+
+    fn ticket(&self, id: &TicketId) -> Result<Ticket, TrackerError> {
+        self.inner.ticket(id)
+    }
+
+    fn comments(&self, id: &TicketId) -> Result<Vec<Comment>, TrackerError> {
+        let mut comments = self.inner.comments(id)?;
+        comments.retain(|c| !self.hidden.borrow().contains(&c.id));
+        if self.flaw == Flaw::DropsReactions {
+            comments.iter_mut().for_each(|c| c.reactions.clear());
+        }
+        Ok(comments)
+    }
+
+    fn post_comment(&self, id: &TicketId, body: &str) -> Result<Comment, TrackerError> {
+        let posted = self.inner.post_comment(id, body)?;
+        if self.flaw == Flaw::HidesPostedComments {
+            self.hidden.borrow_mut().push(posted.id.clone());
+        }
+        Ok(posted)
+    }
+
+    fn set_stage(&self, id: &TicketId, state: &str) -> Result<(), TrackerError> {
+        match self.inner.set_stage(id, state) {
+            Err(e) if e.kind == ErrorKind::NotFound && self.flaw == Flaw::MovesAMissingTicket => {
+                Ok(())
+            }
+            moved => moved,
+        }
+    }
+
+    fn stage(&self, id: &TicketId) -> Result<String, TrackerError> {
+        self.inner.stage(id)
+    }
+
+    fn admitted(&self, column: &Column<'_>) -> Result<Vec<Listed>, TrackerError> {
+        match self.flaw {
+            Flaw::ListsEverything if *column.admit != Admit::Delegation => {
+                let mut every = Vec::new();
+                for stage in ["Todo", "Done", "In Progress"] {
+                    every.extend(self.inner.admitted(&Column {
+                        ready: stage,
+                        admit: &Admit::State(stage.to_owned()),
+                        ..*column
+                    })?);
+                }
+                Ok(every)
+            }
+            Flaw::LosesBlockerTypes => {
+                let mut listed = self.inner.admitted(column)?;
+                for one in &mut listed {
+                    one.blockers.iter_mut().for_each(|b| b.state = None);
+                }
+                Ok(listed)
+            }
+            _ => self.inner.admitted(column),
+        }
+    }
+
+    fn gesture(&self, id: &TicketId, admit: &Admit) -> Result<Gesture, TrackerError> {
+        self.inner.gesture(id, admit)
+    }
+
+    fn state_type(&self, id: &TicketId) -> Result<Option<StateType>, TrackerError> {
+        self.inner.state_type(id)
+    }
+
+    fn propose(&self, proposal: &Proposal<'_>) -> Result<Filed, TrackerError> {
+        self.inner.propose(proposal)
+    }
+
+    fn proposed(
+        &self,
+        team: Option<&str>,
+        title: &str,
+        marker: &str,
+    ) -> Result<Vec<Found>, TrackerError> {
+        if self.flaw == Flaw::ForgetsProposals {
+            return Ok(Vec::new());
+        }
+        self.inner.proposed(team, title, marker)
+    }
+
+    fn relations(&self, id: &TicketId) -> Result<Relations, TrackerError> {
+        self.inner.relations(id)
+    }
+
+    fn links(&self, id: &TicketId) -> Result<Links, TrackerError> {
+        let mut links = self.inner.links(id)?;
+        if self.flaw == Flaw::DropsBlocksLinks {
+            links.blocks.clear();
+        }
+        Ok(links)
+    }
+
+    fn block(&self, blocker: &TicketId, blocked: &TicketId) -> Result<(), TrackerError> {
+        if self.flaw == Flaw::DropsBlocks {
+            return Ok(());
+        }
+        self.inner.block(blocker, blocked)
+    }
+
+    fn publish_document(
+        &self,
+        id: &TicketId,
+        document: Option<&str>,
+        title: &str,
+        content: &str,
+    ) -> Result<Document, TrackerError> {
+        let document = document.filter(|_| self.flaw != Flaw::CreatesOnUpdate);
+        self.inner.publish_document(id, document, title, content)
+    }
+
+    fn resolve_comment(&self, comment: &str) -> Result<(), TrackerError> {
+        self.inner.resolve_comment(comment)?;
+        if self.flaw == Flaw::HidesResolvedComments {
+            self.hidden.borrow_mut().push(comment.to_owned());
+        }
+        Ok(())
+    }
+}
+
+/// Whether the check panics.
+fn fails(check: impl FnOnce()) -> bool {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(check)).is_err()
+}
+
+#[test]
+fn a_broken_adapter_fails_the_read_check() {
+    let (_world, markdown) = markdown_world();
+    let broken = Broken::new(markdown, Flaw::HidesPostedComments);
+    assert!(fails(|| check(&broken, &markdown_case())));
+}
+
+#[test]
+fn a_broken_adapter_fails_the_stage_check() {
+    let (_world, markdown) = markdown_world();
+    let broken = Broken::new(markdown, Flaw::MovesAMissingTicket);
+    let case = markdown_case();
+    assert!(fails(|| check_stage(
+        &broken,
+        &case.existing,
+        &case.missing,
+        "Needs Input",
+        "In Progress"
+    )));
+}
+
+#[test]
+fn a_broken_adapter_fails_the_admitted_check() {
+    for flaw in [Flaw::ListsEverything, Flaw::LosesBlockerTypes] {
+        let (_world, markdown) = markdown_world();
+        let broken = Broken::new(markdown, flaw);
+        assert!(
+            fails(|| check_admitted(&broken, &broken, &markdown_admitted_case())),
+            "{flaw:?}"
+        );
+    }
+}
+
+#[test]
+fn a_broken_adapter_fails_the_blocked_check() {
+    let (_world, markdown) = markdown_world();
+    let broken = Broken::new(markdown, Flaw::DropsBlocks);
+    assert!(fails(|| check_blocked_by(
+        &broken,
+        &markdown_blocked_case()
+    )));
+}
+
+#[test]
+fn a_broken_adapter_fails_the_links_check() {
+    let (_world, markdown) = markdown_world();
+    let broken = Broken::new(markdown, Flaw::DropsBlocksLinks);
+    let case = LinksCase {
+        blocked: id("DEMO-2"),
+        blocker: id("DEMO-3"),
+    };
+    assert!(fails(|| check_links(&broken, &case)));
+}
+
+#[test]
+fn a_broken_adapter_fails_the_proposals_check() {
+    let (_world, markdown) = markdown_world();
+    let broken = Broken::new(markdown, Flaw::ForgetsProposals);
+    let case = ProposalsCase {
+        team: None,
+        parent: id("DEMO-1"),
+        ready: "Todo",
+        inbox: MarkdownTracker::TRIAGE,
+    };
+    assert!(fails(|| check_proposals(&broken, &case)));
+}
+
+#[test]
+fn a_broken_adapter_fails_the_documents_check() {
+    let (_world, markdown) = markdown_world();
+    let broken = Broken::new(markdown, Flaw::CreatesOnUpdate);
+    let case = DocumentsCase {
+        ticket: id("DEMO-1"),
+        missing: id("DEMO-404"),
+    };
+    assert!(fails(|| check_documents(&broken, &case)));
+}
+
+#[test]
+fn a_broken_adapter_fails_the_folding_check() {
+    let broken = Broken::new(
+        LinearTracker::with_transport(linear_comments()),
+        Flaw::HidesResolvedComments,
+    );
+    assert!(fails(|| check_fold_comments(&broken, &id("OWL-1"))));
+}
+
+#[test]
+fn a_broken_adapter_fails_the_reactions_check() {
+    let broken = Broken::new(
+        LinearTracker::with_transport(linear_comments()),
+        Flaw::DropsReactions,
+    );
+    let case = ReactionsCase {
+        ticket: id("OWL-1"),
+        reacted: "c1",
+        plain: "c2",
+    };
+    assert!(fails(|| check_reactions(&broken, &case)));
+}
+
+/// The wrapper alone, with no flaw that matters to a check, passes it: the
+/// failures above are the flaws', not the wrapper's.
+#[test]
+fn the_wrapper_does_not_break_what_it_does_not_touch() {
+    let (_world, markdown) = markdown_world();
+    let broken = Broken::new(markdown, Flaw::DropsReactions);
+    check(&broken, &markdown_case());
+    check_blocked_by(&broken, &markdown_blocked_case());
+}
+
 /// The GitHub Issues tracker (OWL-535), on recorded exchanges of the private
 /// repository `pitchopp/owlshift-live-sandbox`, whose issue #11 was opened
 /// and commented on by live check G1 and G2 (build plan, "P9 ·
@@ -418,7 +1864,9 @@ mod github {
     use owlshift_contracts::config;
 
     use super::support::{self, Recorder, Replay};
-    use super::{BODY, Case, check, check_stage, id, today};
+    use super::{
+        Adapter, BODY, Case, Check, check, check_stage, check_undeclared, id, run, run_check, today,
+    };
 
     const SANDBOX: &str = "pitchopp/owlshift-live-sandbox";
     /// Issue #11, G1's: three comments, two of them in one second (G2).
@@ -483,21 +1931,49 @@ mod github {
         assert_eq!(pull.kind, ErrorKind::NotFound, "{pull}");
     }
 
+    /// GitHub Issues, on its recorded exchanges. It declares ReadTicket,
+    /// Comments and VisibleStage on their own fixtures, and ListAdmitted,
+    /// BlockedBy, ProposalsInbox and Reactions, which the drain's replay
+    /// (OWL-536) reads: each of their checks runs that replay, which reads
+    /// all four.
+    pub fn adapter() -> Adapter {
+        let drain = || {
+            let replay = Replay::of(&dir(), DRAIN);
+            check_drain(&tracker(replay.clone()));
+            replay.assert_done();
+        };
+        Adapter::new("GitHub Issues", GitHubTracker::CAPABILITIES)
+            .case(Check::Undeclared, || {
+                check_undeclared(GitHubTracker::CAPABILITIES)
+            })
+            .case(Check::Read, || {
+                let replay = Replay::of(&dir(), CONFORMANCE);
+                check(&tracker(replay.clone()), &case());
+                replay.assert_done();
+            })
+            .case(Check::Stage, || {
+                let replay = Replay::of(&dir(), STAGE);
+                let tracker = tracker(replay.clone());
+                let case = case();
+                check_stage(&tracker, &case.existing, &case.missing, THERE, BACK);
+                check_reads(&tracker);
+                replay.assert_done();
+            })
+            .case(Check::Admitted, drain)
+            .case(Check::Blocked, drain)
+            .case(Check::Links, drain)
+            .case(Check::Proposals, drain)
+            .case(Check::Reactions, drain)
+    }
+
     #[test]
     fn the_github_tracker_conforms() {
-        let replay = Replay::of(&dir(), CONFORMANCE);
-        check(&tracker(replay.clone()), &case());
-        replay.assert_done();
+        run(&adapter());
     }
 
     #[test]
     fn the_github_tracker_moves_the_visible_stage() {
-        let replay = Replay::of(&dir(), STAGE);
-        let tracker = tracker(replay.clone());
-        let case = case();
-        check_stage(&tracker, &case.existing, &case.missing, THERE, BACK);
-        check_reads(&tracker);
-        replay.assert_done();
+        run_check(&adapter(), Check::Stage);
     }
 
     /// No GitHub account of a recording is a real one: each user object is

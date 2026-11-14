@@ -1,5 +1,6 @@
 //! Recorded GraphQL exchanges: replaying them in tests, and recording them
-//! again against the live API.
+//! again against the live API. [`Fake`] is the exception: made-up answers for
+//! what no fixture holds, flagged as such wherever it is used.
 //!
 //! A fixture is a JSON file under `tests/fixtures/<adapter>/`: the exchanges one
 //! test makes, in order, each holding the request body, the HTTP status and
@@ -177,6 +178,80 @@ impl Transport for Replay {
 
     fn delete(&self, path: &str) -> Result<Response, String> {
         self.send(&rest_request("DELETE", path, &Value::Null))
+    }
+}
+
+/// What a [`Fake`] answers to one request.
+pub enum Answer {
+    /// The `data` of an answer, wrapped by the fake as `{"data": ..}`.
+    Data(Value),
+    /// Linear's answer to an entity it does not know, as the unit tests of
+    /// the adapter give it: the whole body `{"data": null, "errors": [..]}`
+    /// with the message (`Entity not found: Issue`) and the code
+    /// `INPUT_ERROR`.
+    NotFound(&'static str),
+}
+
+/// How a [`Fake`] answers: from an operation's name and its variables.
+type Responder = Box<dyn FnMut(&str, &Value) -> Answer + Send>;
+
+/// A made-up Linear: it answers each request by its operation's name (the
+/// word after `query` or `mutation`, as the adapter's own constants name
+/// them) and its variables, from a closure that may keep what was written.
+///
+/// Nothing here was recorded. It stands in for a capability whose writes no
+/// fixture holds, on answer shapes copied from the unit tests of
+/// `src/tracker/linear.rs`, so a case that runs on it checks the adapter
+/// against the shared contract and those shapes, never against Linear
+/// itself. Every case on a `Fake` says so where it is written, until a
+/// later ticket records it live.
+#[derive(Clone)]
+pub struct Fake {
+    respond: Arc<Mutex<Responder>>,
+    calls: Arc<Mutex<Vec<(String, Value)>>>,
+}
+
+impl Fake {
+    pub fn new(respond: impl FnMut(&str, &Value) -> Answer + Send + 'static) -> Self {
+        Self {
+            respond: Arc::new(Mutex::new(Box::new(respond))),
+            calls: Arc::default(),
+        }
+    }
+
+    /// The operations asked so far, in order, with their variables.
+    pub fn calls(&self) -> Vec<(String, Value)> {
+        self.calls.lock().unwrap().clone()
+    }
+
+    /// The names of the operations asked so far.
+    pub fn asked(&self) -> Vec<String> {
+        self.calls().into_iter().map(|(name, _)| name).collect()
+    }
+}
+
+impl Transport for Fake {
+    fn send(&self, request: &Value) -> Result<Response, String> {
+        let query = request["query"].as_str().expect("a query");
+        let name = query.split([' ', '(']).nth(1).expect("an operation name");
+        let variables = &request["variables"];
+        self.calls
+            .lock()
+            .unwrap()
+            .push((name.to_owned(), variables.clone()));
+        let mut respond = self.respond.lock().unwrap();
+        let body = match respond(name, variables) {
+            Answer::Data(data) => json!({ "data": data }),
+            Answer::NotFound(message) => json!({
+                "data": null,
+                "errors": [{ "message": message, "extensions": { "code": "INPUT_ERROR" } }],
+            }),
+        };
+        Ok(Response {
+            status: 200,
+            body: body.to_string(),
+            rate: RateHeaders::default(),
+        })
     }
 }
 
