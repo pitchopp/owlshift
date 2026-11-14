@@ -844,6 +844,7 @@ impl Tracker for LinearTracker {
         let creator = Gesture {
             account: author(creator.map(Actor::into_user), bot, external),
             at: Some(created_at),
+            edited_at: None,
         };
         if let Admit::State(ready) = admit {
             return Ok(state_gesture(entries, ready, creator, ours));
@@ -853,6 +854,7 @@ impl Tracker for LinearTracker {
             Some((at, latest)) => Gesture {
                 account: one_author(latest),
                 at: Some(at),
+                edited_at: None,
             },
             None => creator,
         })
@@ -1870,6 +1872,7 @@ fn state_gesture(
         return Gesture {
             account,
             at: Some(at),
+            edited_at: None,
         };
     }
     let oldest = by_apps.iter().map(|entry| entry.created_at).min();
