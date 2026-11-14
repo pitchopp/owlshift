@@ -1,6 +1,8 @@
 //! Owlshift's test bench: a ticket played end to end with no model, no
 //! network and no tracker account.
 //!
+//! - [`capability`]: probes that skip a test where root or an older git
+//!   cannot honour what it relies on (OWL-555).
 //! - [`fixture_gate`]: whether a fixture project's test runs, skips or fails
 //!   (OWL-330).
 //! - [`gh`]: the real gh, started once before the credential probes time it.
@@ -29,6 +31,7 @@
 //! This crate is test only: it is never published and no shipped crate
 //! depends on it. See "The test bench" in `docs/design/build-plan.md`.
 
+pub mod capability;
 pub mod fixture_gate;
 pub mod gh;
 pub mod git;
