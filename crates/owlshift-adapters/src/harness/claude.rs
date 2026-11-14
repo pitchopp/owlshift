@@ -203,10 +203,11 @@ pub struct Request {
     /// total, whatever the billing. On a subscription the CLI counts the
     /// run's cost at list price.
     pub max_budget_usd: Option<f64>,
-    /// A read-only run allowed Bash, and nothing else, in place of its
-    /// result's rule: the resolver's (OWL-344), which gives its result as
-    /// its last message. Refused at the write-in-worktree level, which
-    /// already allows every tool.
+    /// A read-only run allowed Bash, beside its web tools when it has
+    /// network, in place of its result's rule, which gives its result as its
+    /// last message: the resolver's (OWL-344) and, since OWL-563, Design's,
+    /// Design review's, Verify's and the arbiter's. Refused at the
+    /// write-in-worktree level, which already allows every tool.
     pub bash: bool,
     /// The session the run starts or resumes (OWL-394); `None` keeps no
     /// session at all (`--no-session-persistence`).
@@ -314,7 +315,8 @@ impl std::error::Error for CommandError {}
 ///   reads and writes is bounded by the executor's read-only sandbox profile
 ///   (worktree and git folder read, never written), never by the CLI, and
 ///   the network stays open to Bash. Checked live with Claude Code 2.1.302
-///   on macOS and Linux (OWL-344, recorded in `docs/design/build-plan.md`);
+///   on macOS and Linux (OWL-344), then with 2.1.318 for a Design-shaped
+///   run with network (OWL-563), recorded in `docs/design/build-plan.md`;
 /// - write in worktree: `--permission-mode bypassPermissions`, so no tool
 ///   asks. What the run writes is bounded by the executor, never by the CLI:
 ///   the operating system's sandbox (`AgentEnv::confine`) keeps every write

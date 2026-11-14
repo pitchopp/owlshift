@@ -1278,6 +1278,89 @@ fn a_resume_without_its_transcript_starts_the_runs_own_session() {
     assert_eq!(report.session, None);
 }
 
+/// The fake harness asking the read-only profile and giving its result as
+/// its last message, as Claude Code with Bash does (OWL-563).
+struct ReadOnlyProfile(FakeHarness);
+
+impl Harness for ReadOnlyProfile {
+    fn command(&self, run: &HarnessRun<'_>) -> Result<Command, HarnessError> {
+        self.0.command(run)
+    }
+
+    fn drive(
+        &self,
+        run: &HarnessRun<'_>,
+        child: &mut Child,
+        log: &mut RunLog,
+    ) -> io::Result<HarnessEnd> {
+        self.0.drive(run, child, log)
+    }
+
+    fn sandbox_needs(&self, agent: &AgentEnv) -> Result<SandboxNeeds, HarnessError> {
+        Ok(SandboxNeeds {
+            read_only: true,
+            result_in_message: true,
+            ..self.0.sandbox_needs(agent)?
+        })
+    }
+
+    fn session_key(&self) -> Option<String> {
+        self.0.session_key()
+    }
+
+    fn session_transcript(&self, folder: &Path, id: &SessionId) -> io::Result<Option<String>> {
+        self.0.session_transcript(folder, id)
+    }
+}
+
+/// OWL-563: a harness asking the read-only profile is given its session as
+/// any harness that keeps them, where OWL-394 refused it: a resume whose
+/// transcript is missing starts the run's own session, said in a warning;
+/// one that keeps no sessions is still refused one.
+#[test]
+fn a_read_only_profile_harness_keeps_its_session() {
+    let bench = Bench::new();
+    let mut brief = bench.brief.clone();
+    brief.role = Role::Design;
+    brief.permissions.level = PermissionLevel::ReadOnly;
+    let plan = SessionPlan {
+        own: SessionId::new("33333333-3333-4333-8333-333333333333").unwrap(),
+        resume: Some(ResumeFrom {
+            id: SessionId::new("44444444-4444-4444-8444-444444444444").unwrap(),
+            folder: bench.tmp.path().join("no-such-session"),
+            cost_micros: 0,
+        }),
+    };
+    let run = |harness: &ReadOnlyProfile| {
+        let spec = RunSpec {
+            main: &bench.main,
+            worktree: &bench.worktree,
+            branch: BRANCH,
+            base: "origin/main",
+            run_dir: &bench.tmp.path().join("run"),
+            brief: &brief,
+            setup: &[],
+            session: Some(&plan),
+            siblings: None,
+        };
+        bench.executor.run(&spec, harness)
+    };
+    let mut harness = ReadOnlyProfile(bench.fake(Reply::default()));
+    assert!(matches!(run(&harness), Err(ExecutorError::Spec(_))));
+
+    harness.0.sessions = true;
+    let report = run(&harness).unwrap();
+    assert_eq!(report.resumed, Some(false));
+    assert!(
+        report
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("could not be resumed")),
+        "{:?}",
+        report.warnings
+    );
+}
+
 /// OWL-369: a run that amends a commit its branch held at the start is
 /// quarantined, its valid result notwithstanding, and the breach names the
 /// rewrite.

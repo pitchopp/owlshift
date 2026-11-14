@@ -359,7 +359,7 @@ fn sorted<'a>(names: impl IntoIterator<Item = &'a str>) -> Vec<&'a str> {
 }
 
 /// The command line of every kind of launch: both permission levels and the
-/// resolver's read-only launch with Bash (OWL-344), with and without network,
+/// read-only launch with Bash (OWL-344, OWL-563), with and without network,
 /// with a JSON Schema.
 fn every_launch() -> Vec<(PermissionLevel, bool, Vec<String>)> {
     let mut launches = Vec::new();
@@ -404,78 +404,69 @@ fn launch_args(request: &Request) -> Result<Vec<String>, CommandError> {
         .collect())
 }
 
-/// The resolver's launch (OWL-344): `dontAsk` with bare `Bash` as its one
-/// allowed tool and no `Edit(...)` rule, with or without network, the argv
-/// of the live check recorded in `docs/design/build-plan.md`. Bash is a
-/// flag of the read-only level only: a run that writes the worktree already
-/// allows every tool, so the flag there is refused.
+/// The launch with Bash of the resolver (OWL-344) and, since OWL-563, of
+/// Design, Design review, Verify and the arbiter: `dontAsk` with bare
+/// `Bash`, beside the web tools with network, and no `Edit(...)` rule; the
+/// argv of the live checks recorded in `docs/design/build-plan.md`, whole
+/// with and without network. Bash is a flag of the read-only level only: a
+/// run that writes the worktree already allows every tool, so the flag
+/// there is refused.
 #[test]
 fn the_resolver_argv_allows_bash_without_an_edit_rule() {
-    for network in [true, false] {
-        let args = launch_args(&launch(PermissionLevel::ReadOnly, network, true)).unwrap();
-        let case = format!("network {network}: {args:?}");
-        let mode = positions(&args, "--permission-mode");
-        assert_eq!(mode.len(), 1, "{case}");
-        assert_eq!(args[mode[0] + 1], "dontAsk", "{case}");
-        let allowed = positions(&args, "--allowedTools");
-        assert_eq!(allowed.len(), 1, "{case}");
-        let tools: Vec<&String> = args[allowed[0] + 1..]
-            .iter()
-            .take_while(|arg| !arg.starts_with("--"))
-            .collect();
-        // With network, its web tools too (OWL-415).
-        let expected: &[&str] = if network {
-            &["Bash", "WebFetch", "WebSearch"]
+    for network in [false, true] {
+        let mut run = launch(PermissionLevel::ReadOnly, network, true);
+        run.json_schema = None;
+        run.model = Some("claude-sonnet-5-5".into());
+        run.effort = Some(Effort::Low);
+        let head = [
+            "-p",
+            "--output-format",
+            "stream-json",
+            "--verbose",
+            "--model",
+            "claude-sonnet-5-5",
+            "--effort",
+            "low",
+            "--permission-mode",
+            "dontAsk",
+            "--allowedTools",
+            "Bash",
+        ];
+        // The web tools are allowed with network, removed without.
+        let (allowed, removed): (&[&str], &[&str]) = if network {
+            (&["WebFetch", "WebSearch"], &[])
         } else {
-            &["Bash"]
+            (&[], &["WebFetch", "WebSearch"])
         };
-        assert_eq!(tools, expected, "{case}");
-        assert!(!args.iter().any(|arg| arg.starts_with("Edit(")), "{case}");
+        let middle = [
+            "--permission-prompts",
+            "none",
+            "--disallowedTools",
+            "RemoteTrigger",
+            "PushNotification",
+            "DesignSync",
+            "Workflow",
+            "CronCreate",
+            "CronDelete",
+            "CronList",
+            "SendMessage",
+            "ListAgents",
+            "EnterWorktree",
+            "ExitWorktree",
+            "Agent",
+        ];
+        let tail = [
+            "--setting-sources",
+            "",
+            "--strict-mcp-config",
+            "--disable-slash-commands",
+            "--settings",
+            r#"{"crossSessionInbound":"refuse"}"#,
+            "--no-session-persistence",
+        ];
+        let expected: Vec<&str> = [&head[..], allowed, &middle, removed, &tail].concat();
+        assert_eq!(launch_args(&run).unwrap(), expected, "network {network}");
     }
-
-    let mut resolver = launch(PermissionLevel::ReadOnly, false, true);
-    resolver.json_schema = None;
-    resolver.model = Some("claude-sonnet-5-5".into());
-    resolver.effort = Some(Effort::Low);
-    let expected = [
-        "-p",
-        "--output-format",
-        "stream-json",
-        "--verbose",
-        "--model",
-        "claude-sonnet-5-5",
-        "--effort",
-        "low",
-        "--permission-mode",
-        "dontAsk",
-        "--allowedTools",
-        "Bash",
-        "--permission-prompts",
-        "none",
-        "--disallowedTools",
-        "RemoteTrigger",
-        "PushNotification",
-        "DesignSync",
-        "Workflow",
-        "CronCreate",
-        "CronDelete",
-        "CronList",
-        "SendMessage",
-        "ListAgents",
-        "EnterWorktree",
-        "ExitWorktree",
-        "Agent",
-        "WebFetch",
-        "WebSearch",
-        "--setting-sources",
-        "",
-        "--strict-mcp-config",
-        "--disable-slash-commands",
-        "--settings",
-        r#"{"crossSessionInbound":"refuse"}"#,
-        "--no-session-persistence",
-    ];
-    assert_eq!(launch_args(&resolver).unwrap(), expected);
 
     assert!(matches!(
         launch_args(&launch(PermissionLevel::WriteWorktree, true, true)),

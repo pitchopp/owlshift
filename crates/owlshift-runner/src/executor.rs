@@ -64,7 +64,10 @@
 //! there for a home folder of its own holding a copy of the user's login
 //! ([`SandboxNeeds::home`]), and give its result as its last message
 //! ([`SandboxNeeds::result_in_message`]): Codex does both
-//! ([`CodexHarness`], OWL-299).
+//! ([`CodexHarness`], OWL-299), Claude Code with Bash the second (OWL-344,
+//! OWL-563). A harness that keeps sessions keeps them under either profile:
+//! the configuration folder that holds a transcript is in the run's own
+//! temporary folder, written under both.
 
 pub mod codex;
 pub mod gate;
@@ -603,11 +606,12 @@ impl Executor {
             ));
         }
         // A session needs a harness that keeps them, in a folder of the
-        // run's own (OWL-394).
+        // run's own (OWL-394), under either profile: since OWL-563 Design
+        // keeps its session with Bash, under the read-only profile.
         let session_variable = match spec.session {
             None => None,
             Some(_) => match (harness.session_key(), needs.session_variable) {
-                (Some(_), Some(variable)) if !needs.read_only => Some(variable),
+                (Some(_), Some(variable)) => Some(variable),
                 _ => {
                     return Err(ExecutorError::Spec(
                         "the run is given a session, which its harness does not keep".to_owned(),
