@@ -23,9 +23,6 @@ mod markdown;
 /// them, public so that a bench builds the same key over a fake.
 pub use github::key_of as github_key;
 
-#[cfg(test)]
-pub(crate) use github::named_labels;
-
 use std::any::Any;
 use std::fmt;
 use std::path::Path;

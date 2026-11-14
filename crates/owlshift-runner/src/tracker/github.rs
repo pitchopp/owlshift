@@ -364,7 +364,7 @@ pub(crate) fn set_up(
     })
 }
 
-type Facts =Result<GithubFacts, StatesError>;
+type Facts = Result<GithubFacts, StatesError>;
 
 /// What a GitHub Issues project's repository says of its setup
 /// ([`super::github_facts`], OWL-537).
