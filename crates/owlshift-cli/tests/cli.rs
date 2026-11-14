@@ -1578,6 +1578,47 @@ fn init_writes_a_commented_project_file_once() {
     );
 }
 
+/// OWL-562: `init --replace-agent-token` needs no repository and writes no
+/// project file; off a terminal it fails before it opens the keychain, so
+/// this test never reaches the real one. It goes with no other choice.
+#[test]
+fn init_replace_agent_token_runs_anywhere_and_asks_on_a_terminal_only() {
+    let config_dir = tempfile::tempdir().unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    let output = owlshift(
+        outside.path(),
+        config_dir.path(),
+        &["init", "--replace-agent-token"],
+    );
+    assert_eq!(output.status.code(), Some(1), "{}", stderr(&output));
+    assert!(
+        stderr(&output).contains("asks for the token on a terminal only"),
+        "{}",
+        stderr(&output)
+    );
+    assert!(stdout(&output).is_empty(), "{}", stdout(&output));
+    assert!(!outside.path().join("owlshift.toml").exists());
+    assert!(!config_dir.path().join("data").exists());
+
+    // One flag, and one choice that has a default value: clap refuses both.
+    for other in [&["--replace-secrets"][..], &["--tracker", "markdown"]] {
+        let mut args = vec!["init", "--replace-agent-token"];
+        args.extend(other);
+        let output = owlshift(outside.path(), config_dir.path(), &args);
+        assert_eq!(
+            output.status.code(),
+            Some(2),
+            "{other:?}: {}",
+            stderr(&output)
+        );
+        assert!(
+            stderr(&output).contains("cannot be used with"),
+            "{other:?}: {}",
+            stderr(&output)
+        );
+    }
+}
+
 /// OWL-537: `init --tracker github --skip-secrets` asks GitHub nothing: it
 /// writes the project file with its labels as stages and a commented
 /// admitter, and says the tracker was not checked.
