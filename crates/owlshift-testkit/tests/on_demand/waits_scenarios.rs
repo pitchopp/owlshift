@@ -159,8 +159,9 @@ fn a_chain_of_blockers_then_the_queue_for_the_capacity() {
 }
 
 /// What the web UI's graph reads of the bench through the server's own
-/// read, `tail` kept from one call to the next, with the `--json` document
-/// of `status --waits` read at the same time.
+/// read, `tail` kept from one call to the next, with the waits document read
+/// at the same time, in the UI's voice: the `--json` words of `status
+/// --waits`, except that a parked wait names Restart.
 fn graph_and_document(
     bench: &Bench,
     tail: &mut owlshift_runner::ui::eventtail::EventTail,

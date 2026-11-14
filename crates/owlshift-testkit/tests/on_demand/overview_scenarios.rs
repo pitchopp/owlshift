@@ -32,7 +32,9 @@ fn registered(bench: &Bench) {
         .unwrap();
 }
 
-/// What `owlshift status --waits` reads of the served projects now.
+/// The waits document of the served projects now, in the UI's voice: the
+/// words of `owlshift status --waits`, except that a parked wait names
+/// Restart, which is what the overview's cards show.
 fn waits_doc(bench: &Bench) -> StatusWaits {
     waits::build(
         &waits::gather(&bench.data, None, 2, bench.clock.get()),
