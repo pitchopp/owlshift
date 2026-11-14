@@ -154,8 +154,10 @@ impl GitHubTracker {
     /// an app user never admits (the [`Gesture`] contract), and the runner
     /// puts the ready label back through the app's token itself (`intake`'s
     /// return to the ready column), whose event names the token's holder. A
-    /// label with no such event is an error asking to put it again, never
-    /// the issue's opener: anyone opens an issue on a public repository.
+    /// label with no such event is an [`ErrorKind::NoGesture`] error asking
+    /// to put it again, never the issue's opener: anyone opens an issue on a
+    /// public repository. Only an events read made in full gives it: a page
+    /// that fails fails the read as it is (OWL-568).
     ///
     /// A person's gesture carries the issue's last text edit (OWL-557): the
     /// later of its last `renamed` event, a title edit, and GraphQL's
@@ -183,7 +185,7 @@ impl GitHubTracker {
         }
         let Some(event) = standing else {
             return Err(Error::new(
-                ErrorKind::Other,
+                ErrorKind::NoGesture,
                 format!(
                     "no `labeled` event of {label:?} stands on {id}: GitHub records none of the \
                      label as it is, so put the label on the issue again"

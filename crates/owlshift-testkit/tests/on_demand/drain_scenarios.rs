@@ -2363,6 +2363,87 @@ fn a_ticket_edited_after_its_label_waits_for_the_label_again() {
     );
 }
 
+/// OWL-568: DEMO-1 carries its label with no `labeled` event GitHub
+/// records, so no account's gesture. The drain does not take it in: one
+/// `not_admitted` warning, its account `none`, asks for the label again, and
+/// so does its wait in each ready snapshot; read again after each hold, it
+/// is not warned of again, and no refusal is printed. The label put on
+/// again admits it.
+#[test]
+fn a_label_with_no_labeled_event_is_warned_of_once() {
+    let bench = Bench::build_admitting(
+        "maintainer",
+        "assignee = \"maintainer\"\nlabels = [\"agent\"]\n",
+        "",
+        ", parked = \"Parked\"",
+        "admit = { label = \"agent\" }\nadmitters = [\"maintainer\"]",
+    );
+    let ticket = TicketId::new(TICKET).unwrap();
+    bench.ungestured.borrow_mut().push(ticket);
+    let intake = bench.reply(None, Some(&intake_result("done", None, "")));
+    let snapshots = RefCell::new(Vec::new());
+    // Four passes, each after the hold: the fourth takes it in.
+    let (outcomes, lines, printed) = bench.drain_passes(vec![intake], 4, |pass, _| {
+        snapshots
+            .borrow_mut()
+            .push(ready_now(&bench).expect("a snapshot"));
+        if pass == 3 {
+            // The label put on again: GitHub records its event.
+            bench.ungestured.borrow_mut().clear();
+        }
+        let later = bench.clock.get().checked_add(SignedDuration::from_mins(11));
+        bench.clock.set(later.unwrap());
+    });
+    let report = format!("{outcomes:?}\n{lines}\n{printed}");
+    let mut snapshots = snapshots.into_inner();
+    snapshots.push(ready_now(&bench).expect("the last pass's snapshot"));
+    let not_admitted = vec![made(TICKET, "not_admitted", "not_admitted", &[])];
+    assert_eq!(
+        snapshots.iter().map(made_of).collect::<Vec<_>>(),
+        [
+            not_admitted.clone(),
+            not_admitted.clone(),
+            not_admitted,
+            vec![made(TICKET, "taken_in", "", &[])],
+        ],
+        "{report}"
+    );
+    assert_eq!(bench.runs(), [(Role::Intake, TICKET.to_owned())]);
+
+    let events = bench.events();
+    let warned: Vec<&Event> = events
+        .iter()
+        .filter(|e| e.kind == EventKind::Warning && e.data["what"] == json!("not_admitted"))
+        .collect();
+    assert_eq!(warned.len(), 1, "{report}");
+    assert_eq!(warned[0].data["account"], json!("none"));
+    let reason = warned[0].data["reason"].as_str().unwrap();
+    assert!(reason.contains("no `labeled` event"), "{reason}");
+    assert!(
+        reason.contains("put the label on the issue again"),
+        "{reason}"
+    );
+    for snapshot in &snapshots[..3] {
+        let Outcome::NotAdmitted { wait } = &snapshot.tickets[0].drain else {
+            panic!("{report}");
+        };
+        assert_eq!(
+            wait.text,
+            format!("its admission gesture does not admit it: {reason}")
+        );
+    }
+    // Told once, never as a refusal.
+    assert_eq!(
+        lines
+            .matches(&format!("{TICKET} is not taken in: {reason}"))
+            .count(),
+        1,
+        "{report}"
+    );
+    assert!(!lines.contains("refused"), "{report}");
+    assert!(!lines.contains("reading the admission gesture"), "{report}");
+}
+
 // OWL-485: a dark wake holds the dispatches and the steps' starts.
 
 /// The `watch` decisions a dark wake told, oldest first.

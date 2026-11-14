@@ -264,6 +264,9 @@ fn the_gesture_is_the_last_label_event_standing() {
             }
             (Err(message), Err(error)) => {
                 assert!(error.message.contains(message), "{error}");
+                // Read in full, it shows no gesture (OWL-568).
+                assert!(error.message.contains("no `labeled` event"), "{error}");
+                assert_eq!(error.kind, ErrorKind::NoGesture);
                 assert_eq!(canned.calls(), [events(7)]);
             }
             (want, got) => panic!("{want:?}: {got:?}"),
@@ -360,6 +363,21 @@ fn every_page_of_events_is_read() {
         )]),
     );
     assert!(tracker(&canned).gesture(&id("7"), &label()).is_err());
+
+    // A page that fails or does not parse fails the read: never a gesture
+    // found missing (OWL-568).
+    for (status, body) in [
+        (502, json!({ "message": "Server Error" })),
+        (200, json!({})),
+    ] {
+        let canned = Canned::default().on(&events(7), 200, json!(full)).on(
+            &format!("GET {ISSUES}/7/events?per_page=100&page=2"),
+            status,
+            body,
+        );
+        let error = tracker(&canned).gesture(&id("7"), &label()).unwrap_err();
+        assert_ne!(error.kind, ErrorKind::NoGesture, "{error}");
+    }
 }
 
 /// A ticket's state: a pull request's number is not found; an open issue

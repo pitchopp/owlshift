@@ -239,7 +239,9 @@ pub(crate) fn team_answers(tracker: &LinearTracker, team: &str) -> Result<(), St
                 "{error}: `--team` (or `team` under `[tracker]`) is the key your team's issue \
                  identifiers start with, such as `OWL` for `OWL-12`"
             ),
-            ErrorKind::Unreachable | ErrorKind::Other => format!("Linear did not answer: {error}"),
+            ErrorKind::Unreachable | ErrorKind::NoGesture | ErrorKind::Other => {
+                format!("Linear did not answer: {error}")
+            }
         })
 }
 
@@ -308,16 +310,18 @@ fn tracker_states_check(
                          issue identifiers start with, such as `OWL` for `OWL-12`",
                     )],
                 ),
-                ErrorKind::Unreachable | ErrorKind::Other => Some(Check::warn(
-                    Section::Project,
-                    SUBJECT,
-                    format!("not checked: {error}"),
-                    format!(
-                        "{DOES_NOT_BLOCK} doctor could not read the workflow states of team \
+                ErrorKind::Unreachable | ErrorKind::NoGesture | ErrorKind::Other => {
+                    Some(Check::warn(
+                        Section::Project,
+                        SUBJECT,
+                        format!("not checked: {error}"),
+                        format!(
+                            "{DOES_NOT_BLOCK} doctor could not read the workflow states of team \
                          `{team}`. A name under `[tracker].states` that matches none only keeps \
                          the ticket's visible stage from moving."
-                    ),
-                )),
+                        ),
+                    ))
+                }
             };
         }
     };
@@ -543,11 +547,13 @@ fn tracker_identity_check(
                     "Check that Linear is reachable from this machine, then run `owlshift \
                      doctor` again",
                 )],
-                ErrorKind::Unreachable | ErrorKind::Other => vec![Step::act(
-                    "Check that Linear is reachable from this machine, then run `owlshift \
+                ErrorKind::Unreachable | ErrorKind::NoGesture | ErrorKind::Other => {
+                    vec![Step::act(
+                        "Check that Linear is reachable from this machine, then run `owlshift \
                      doctor` again; or delete both of the app's keychain entries to write \
                      through the API key",
-                )],
+                    )]
+                }
                 ErrorKind::Unauthorized | ErrorKind::NotFound => store_both(),
             },
         ),
