@@ -1,12 +1,14 @@
 //! Replies from the UI (P8 part 10, OWL-475, architecture section 5, "Replies
 //! from the UI"): the decider answers a ticket's open questions, or approves
 //! or changes its plan, from the ticket's page, and the reply is posted
-//! through the operator's own tracker key as the decider's own comment,
-//! which the answer check reads as any reply on the tracker.
+//! through the operator's own credential for the project's tracker as the
+//! decider's own comment, which the answer check reads as any reply on the
+//! tracker.
 //!
-//! - *The key* ([`open_key`], [`Keys`]): the key `owlshift init` stored for
-//!   the project, its own or the shared one (OWL-308), never the Linear
-//!   app's, and its account, read once per served project.
+//! - *The key* ([`open_key`], [`Keys`]): on Linear the key `owlshift init`
+//!   stored for the project, its own or the shared one (OWL-308), never the
+//!   app's; on GitHub Issues the forge credential (OWL-552); and its
+//!   account, read once per served project.
 //! - *The offer* ([`section`]): the snapshot's `questions.reply`, whether the
 //!   form is offered, only when the key's account is the open ask's decider
 //!   ([`owlshift_core::floor::same_account`]), and otherwise who the decider
@@ -27,10 +29,9 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use owlshift_adapters::forge::Repo;
-use owlshift_adapters::tracker::linear::KeyAccount;
 #[cfg(test)]
 use owlshift_adapters::tracker::linear::LinearTracker;
-use owlshift_adapters::tracker::{Comment, Tracker};
+use owlshift_adapters::tracker::{Comment, KeyAccount, Tracker};
 use owlshift_contracts::ids::TicketId;
 use owlshift_contracts::refs::{Ask, Waiting};
 use owlshift_contracts::result::{Question, option_index, option_letter};
@@ -296,16 +297,17 @@ impl Drop for NameRead {
     }
 }
 
-/// The production opener: the key `owlshift init` stored for the project of
-/// `repo`, its own accounts or the shared ones ([`crate::secrets::tracker`]), read
-/// from the system keychain, and its account read once through it. The
-/// Linear app's pair is never used: a reply goes through the key, whose
-/// account is the operator's. Only a project served on a Linear project file
-/// has one; any other answers why there is none, before the keychain is
-/// asked.
+/// The production opener: the credential the project's tracker kind says
+/// ([`crate::tracker::Kind::reply_key`]), read from the system keychain, and
+/// its account read once through it. On Linear that is the key `owlshift
+/// init` stored for the project of `repo`, its own accounts or the shared
+/// ones ([`crate::secrets::tracker`]), never the app's pair; on GitHub Issues
+/// the forge credential. A reply goes through it because its account is the
+/// operator's. A project whose tracker has no such credential, the Markdown
+/// tracker, answers why there is none, before the keychain is asked.
 pub fn open_key(data: &Path, repo: &Repo) -> Result<Key, String> {
     let config = super::ticket::served_config(&ProjectDirs::new(data, repo))?;
-    crate::tracker::of(config.tracker.kind).reply_key(repo)
+    crate::tracker::of(config.tracker.kind).reply_key(data, repo, &config, &super::personal_now())
 }
 
 /// The ask a ticket's newest record waits on: its latest, while its state
@@ -1182,6 +1184,39 @@ pub(crate) mod tests {
         assert!(section(&resumed, &ready("maintainer"), &ticket(), &|_| None).is_null());
     }
 
+    /// A GitHub Issues key (OWL-552) has no workspace: the form is offered to
+    /// the decider by the numeric id, and the page links no ticket, whoever
+    /// the key is.
+    #[test]
+    fn a_github_key_is_offered_to_the_decider_with_no_link() {
+        let github = |id: &str| {
+            KeyState::Ready(Key {
+                account: KeyAccount {
+                    id: id.to_owned(),
+                    name: "bea".to_owned(),
+                    app: false,
+                    workspace: String::new(),
+                },
+                tracker: Box::new(LinearTracker::with_transport(Unreachable)),
+                names: Box::new(|_: &str| Ok(None)),
+            })
+        };
+        let record = waiting();
+        let offered = section(&record, &github("maintainer"), &ticket(), &|_| None);
+        assert_eq!(offered["offered"], true);
+        assert!(offered["link"].is_null());
+        assert_eq!(offered["key"]["name"], "bea");
+        let other = section(&record, &github("7"), &ticket(), &|_| None);
+        assert_eq!(other["offered"], false);
+        assert!(
+            other["why_not"]
+                .as_str()
+                .unwrap()
+                .contains("not the decider's")
+        );
+        assert!(other["link"].is_null());
+    }
+
     /// The decider is named by the key's name when the key is theirs, else
     /// by the name read of their account so far; asked of no other account.
     #[test]
@@ -1340,7 +1375,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn a_project_not_on_linear_has_no_key_and_the_keychain_is_not_asked() {
+    fn a_markdown_project_has_no_key_and_the_keychain_is_not_asked() {
         let data = tempfile::tempdir().unwrap();
         let repo = Repo::parse("o/r").unwrap();
         let dirs = ProjectDirs::new(data.path(), &repo);
@@ -1363,7 +1398,7 @@ pub(crate) mod tests {
         std::fs::create_dir_all(crate::served::record_file(&dirs).parent().unwrap()).unwrap();
         std::fs::write(crate::served::record_file(&dirs), record.render()).unwrap();
         let markdown = open_key(data.path(), &repo).unwrap_err();
-        assert!(markdown.contains("not Linear"), "{markdown}");
+        assert!(markdown.contains("Markdown tracker"), "{markdown}");
     }
 
     /// The keys are read once each, whatever asks; a failure is kept.

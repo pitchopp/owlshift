@@ -10,7 +10,7 @@ use owlshift_adapters::tracker::linear::{
     AdmissionFacts, ApiKey, AppUser, LinearTracker, StateMismatch, find_state,
 };
 use owlshift_adapters::tracker::{Capability, ErrorKind, PROPOSED_LABEL, Tracker};
-use owlshift_contracts::config::{self, Admit, ProjectConfig};
+use owlshift_contracts::config::{self, Admit, PersonalConfig, ProjectConfig};
 use owlshift_contracts::ids::TicketId;
 use owlshift_platform::keychain::{Keychain, SERVICE, Secret};
 
@@ -18,6 +18,7 @@ use super::{
     AppError, Connected, Doctored, ForgeCredential, Kind, LINEAR_ACCOUNT, LINEAR_APP_ID_ACCOUNT,
     LINEAR_APP_SECRET_ACCOUNT, LINEAR_SECRETS, Opener, Probe, Probed, Setup, StatesError,
 };
+use crate::config::FileState;
 use crate::doctor::{Check, DOES_NOT_BLOCK, KEYCHAIN_FIX, Section, Step, configured_states};
 use crate::init::{LINEAR_KEY, SecretSpec};
 use crate::secrets::{SecretSet, Source, TrackerAccounts, TrackerSecrets, named};
@@ -160,7 +161,13 @@ team = {}
     /// accounts or the shared ones ([`crate::secrets::tracker`]), read from
     /// the system keychain. The Linear app's pair is never used: a reply goes
     /// through the key, whose account is the operator's.
-    fn reply_key(&self, repo: &Repo) -> Result<Key, String> {
+    fn reply_key(
+        &self,
+        _data: &Path,
+        repo: &Repo,
+        _config: &ProjectConfig,
+        _personal: &FileState<PersonalConfig>,
+    ) -> Result<Key, String> {
         let keychain =
             Keychain::system().map_err(|e| format!("the keychain cannot be read: {e}"))?;
         let mut look = |account: &str| keychain.read(account).map_err(|e| e.to_string());
