@@ -82,7 +82,7 @@ impl Bench {
     }
 
     /// The head of the ticket's branch in Owlshift's checkout.
-    fn branch_head(&self) -> String {
+    pub(super) fn branch_head(&self) -> String {
         let out = self
             .env
             .run(
@@ -834,6 +834,52 @@ fn a_pass_run_again_after_a_failed_delivery_takes_its_records_place() {
     let report = bench.comments().pop().unwrap();
     assert!(report.starts_with("[owlshift] DELIVERY"), "{report}");
     assert!(!report.contains("Proposed follow-up"), "{report}");
+}
+
+/// OWL-558: a delivery whose Build commit says "Fixes #5" moves the branch
+/// to that commit's neutral image before its push, which the remote
+/// refuses. `continue` takes the branch at the image for the Build Verify
+/// reviewed, runs the pass again and delivers that very image: a push made
+/// again sends the same ids.
+#[test]
+fn a_refused_delivery_leaves_the_branch_at_its_neutral_image_for_continue() {
+    let bench = Bench::verifying();
+    let checkout = &bench.remote.checkout;
+    for args in [
+        &["switch", "--quiet", "-c", BRANCH][..],
+        &["commit", "--quiet", "--allow-empty", "-m", "Other"],
+        &["push", "--quiet", "origin", BRANCH],
+        &["switch", "--quiet", "main"],
+    ] {
+        bench.env.run(checkout, args).unwrap();
+    }
+    let main = bench.remote_main();
+    let mut build = bench.reply(Some("Hello"), Some(DONE));
+    build.commit = Some("Add a greeting\n\nFixes #5".to_owned());
+    let (outcome, printed) = bench.run(vec![build, bench.reviewing(&found(&[]))], None);
+    assert!(
+        matches!(&outcome, Err(Stop::Delivery(why)) if why.contains("rejected")),
+        "{outcome:?}\n{printed}"
+    );
+    let built = bench.record().review.unwrap().build.unwrap().commit;
+    let image = bench.branch_head();
+    assert_ne!(
+        image, built,
+        "the branch moved to the image before the push"
+    );
+
+    bench
+        .env
+        .run(checkout, &["push", "--quiet", "origin", "--delete", BRANCH])
+        .unwrap();
+    let (outcome, printed) = bench.continue_ticket(vec![bench.reviewing(&found(&[]))]);
+    outcome.unwrap_or_else(|stop| panic!("{stop}\n{printed}"));
+    assert_eq!(bench.remote_branch(), Some(image.clone()));
+    assert_eq!(bench.branch_head(), image);
+    assert_eq!(
+        pushed_messages(&bench, &main, &image),
+        ["Add a greeting\n\nFi\u{200B}xes #5"]
+    );
 }
 
 /// A usage limit cuts a Verify pass short: the Build Verify reviews is

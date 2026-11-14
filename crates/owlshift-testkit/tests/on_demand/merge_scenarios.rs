@@ -1324,3 +1324,122 @@ fn a_refresh_that_ran_nothing_is_held_and_told() {
     assert_eq!(github_merges(&bench).len(), 1, "{lines}");
     assert_ended_merged(&bench);
 }
+
+/// OWL-558: an agent's commit message closes no issue. The Build's "Fixes
+/// #5" reaches the remote as `Fi\u{200B}xes #5`, which GitHub reads as no
+/// keyword (live check of 2026-11-14, `owl-558.sh`; a bench sees messages,
+/// not GitHub's closing); a fix run's "Closes #6" lands as a fast-forward
+/// of that image, broken too; the ticket's branch follows each push, its
+/// run file with it, or the fix run would not have started; and the merge
+/// on green is of the head so pushed.
+#[test]
+fn an_agent_s_closing_keywords_are_broken_in_every_commit_pushed_and_merged() {
+    let bench = Bench::with(
+        "maintainer",
+        "assignee = \"maintainer\"\n",
+        "[forge]\nmerge = \"all\"\n",
+    );
+    let main = bench.remote_main();
+    let mut build = bench.reply(Some("Hello"), Some(DONE));
+    build.commit = Some("Add a greeting\n\nFixes #5".to_owned());
+    let (outcome, printed) = bench.run(vec![build], None);
+    outcome.unwrap_or_else(|stop| panic!("{stop}\n{printed}"));
+    let delivered = bench.remote_branch().unwrap();
+    assert_eq!(
+        pushed_messages(&bench, &main, &delivered),
+        ["Add a greeting\n\nFi\u{200B}xes #5"]
+    );
+    assert_eq!(bench.branch_head(), delivered);
+
+    let github = bench.github.clone();
+    let clock = bench.clock.clone();
+    github.followed.lock().unwrap().conclusion = "FAILURE";
+    let mut fix = bench.reply(Some("Hello again"), Some(FIXED));
+    fix.commit = Some("Closes #6 with a second greeting".to_owned());
+    let mut pass = 0;
+    let (outcomes, lines, printed) = bench.watch(vec![fix], &mut |_| {
+        pass += 1;
+        later(&clock);
+        github.followed.lock().unwrap().conclusion = "SUCCESS";
+        pass < 6
+    });
+    assert!(
+        outcomes.iter().all(Result::is_ok),
+        "{outcomes:?}\n{lines}\n{printed}"
+    );
+    let head = bench.remote_branch().unwrap();
+    assert_eq!(
+        pushed_messages(&bench, &main, &head),
+        [
+            "Cl\u{200B}oses #6 with a second greeting",
+            "Add a greeting\n\nFi\u{200B}xes #5"
+        ]
+    );
+    let parent = bench
+        .env
+        .run(&bench.remote.bare, &["rev-parse", &format!("{head}^")])
+        .unwrap();
+    assert_eq!(String::from_utf8(parent).unwrap().trim(), delivered);
+    assert_eq!(bench.branch_head(), head);
+    assert_eq!(
+        github_merges(&bench),
+        [json!({ "sha": head, "merge_method": "squash" })],
+        "{lines}\n{printed}"
+    );
+    assert_ended_merged(&bench);
+}
+
+/// OWL-558 on a refresh rebase (OWL-520): the rebase run's own commit says
+/// "Closes #7"; the push sends its neutral image, the delivery check made
+/// on that image as the rebase run's commit, and the merge is of it.
+#[test]
+fn a_rebase_run_s_closing_keyword_is_broken_before_its_push() {
+    let bench = sharing("all");
+    let main = sibling_sharing(&bench);
+    let (env, worktree) = (bench.env.clone(), bench.worktree());
+    let rebase: During = (
+        1,
+        Box::new(move || {
+            env.run(&worktree, &["rebase", "--quiet", "origin/main"])
+                .unwrap();
+            env.run(
+                &worktree,
+                &[
+                    "commit",
+                    "--quiet",
+                    "--amend",
+                    "-m",
+                    "Add a greeting\n\nCloses #7",
+                ],
+            )
+            .unwrap();
+        }),
+    );
+    let clock = bench.clock.clone();
+    let mut pass = 0;
+    let (outcomes, lines, printed) = bench.watch_during(
+        vec![bench.reply(None, Some(REBASED))],
+        vec![rebase],
+        &mut |_| {
+            pass += 1;
+            later(&clock);
+            pass < 6
+        },
+    );
+    assert!(
+        outcomes.iter().all(Result::is_ok),
+        "{outcomes:?}\n{lines}\n{printed}"
+    );
+    assert_eq!(rebase_runs(&bench).len(), 1, "{lines}");
+    let head = bench.remote_branch().unwrap();
+    assert_eq!(
+        pushed_messages(&bench, &main, &head),
+        ["Add a greeting\n\nCl\u{200B}oses #7"]
+    );
+    assert_eq!(bench.branch_head(), head);
+    assert_eq!(
+        github_merges(&bench),
+        [json!({ "sha": head, "merge_method": "squash" })],
+        "{lines}\n{printed}"
+    );
+}

@@ -684,10 +684,11 @@ impl OnDemand<'_> {
     /// Whether `continue` may run again the Verify pass of a ticket at
     /// Verify, parked there or cut short (OWL-304), checked before a park
     /// is restarted or anything kept: its ref keeps the Build to review, its
-    /// branch is still at that Build's commit, and the decider of its latest
-    /// ask has not commented since that Build read the thread, which only a
-    /// Build run would follow (OWL-139). Otherwise `owlshift do` builds it
-    /// again.
+    /// branch is still at that Build's commit, or at its neutral image, where
+    /// a delivery whose push did not land left it (OWL-558), and the decider
+    /// of its latest ask has not commented since that Build read the thread,
+    /// which only a Build run would follow (OWL-139). Otherwise `owlshift do`
+    /// builds it again.
     pub(super) fn verify_resumable(&self, p: &Prepared) -> Result<(), Stop> {
         let ticket = &p.ticket;
         let again = format!("`owlshift do {ticket}` builds it again");
@@ -697,7 +698,12 @@ impl OnDemand<'_> {
             )));
         };
         let head = self.branch_head(p);
-        if head.as_deref() != Some(built.commit.as_str()) {
+        let at_build = head.as_deref() == Some(built.commit.as_str())
+            || CommitId::new(built.commit.as_str())
+                .ok()
+                .and_then(|commit| self.neutral_image(p, &commit))
+                .is_some_and(|image| head.as_deref() == Some(image.as_str()));
+        if !at_build {
             return Err(Stop::Refused(format!(
                 "{ticket}'s branch is at {}, not at {}, the commit its Build delivered for \
                  review: {again}",

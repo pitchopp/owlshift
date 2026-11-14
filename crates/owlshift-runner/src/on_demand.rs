@@ -169,6 +169,7 @@ mod drain;
 mod intake;
 mod limits;
 mod merge_note;
+mod neutral_push;
 mod rerun;
 mod review_loop;
 mod to_watch;
@@ -6235,8 +6236,11 @@ impl OnDemand<'_> {
 
     /// Delivers the Build Verify passed, as `review.json` keeps it
     /// ([`KeptBuild`], OWL-304): its gated commit, its pull request and what
-    /// its report says. The push leaves from the dedicated checkout, never
-    /// from the worktree (`Writer::push_branch`). The ticket ref keeps the
+    /// its report says. The push sends the gated commit's neutral image, its
+    /// tree, with the closing keywords of the agent's commit messages broken
+    /// and the ticket's branch moved there ([`Self::neutral_push`], OWL-558),
+    /// from the dedicated checkout, never from the worktree
+    /// (`Writer::push_branch`). The ticket ref keeps the
     /// push under way (`pushing`, OWL-209) before it, with `state`, the
     /// state Verify left; once the forge shows the commit as the pull
     /// request's head, the ref keeps the pull request, `pushed`,
@@ -6270,6 +6274,11 @@ impl OnDemand<'_> {
         // The base head at the push, `base_at_push` once the push lands:
         // what CI merges the head with.
         let base_at_push = self.base_head(p, base, ticket, sink);
+        // No agent commit message closes an issue (OWL-558): from here on
+        // `commit` is the gated commit's neutral image, the branch moved there.
+        let neutral = self.neutral_push(p, &commit, &[base_at_push.as_str()], sink)?;
+        let built_commit = commit;
+        let commit = neutral.head.commit().clone();
         let mut kept = TicketDelivery::new(head.as_str(), base.as_str());
         // Dated before the pull request can be reviewed, and kept by a
         // retry of this same delivery, one that never reached its pull
@@ -6293,20 +6302,23 @@ impl OnDemand<'_> {
         self.store_delivery(p, state, questions, Some(kept.clone()))
             .map_err(|e| delivery("keeping the push in the ticket's ref", &e))?;
         let pushed = writer
-            .push_branch(&self.executor.git, &p.checkout, "origin", &commit, head)
+            .push_branch(
+                &self.executor.git,
+                &p.checkout,
+                "origin",
+                &neutral.head,
+                head,
+            )
             .map_err(|e| delivery("pushing the branch", &e))?;
-        sink.emit(
-            ticket,
-            None,
-            EventKind::TrackerWrite,
-            data([
-                ("target", json!("forge")),
-                ("action", json!("push")),
-                ("branch", json!(head.as_str())),
-                ("commit", json!(commit.as_str())),
-                ("pushed", json!(pushed_name(pushed))),
-            ]),
-        );
+        let mut event = data([
+            ("target", json!("forge")),
+            ("action", json!("push")),
+            ("branch", json!(head.as_str())),
+            ("commit", json!(commit.as_str())),
+            ("pushed", json!(pushed_name(pushed))),
+        ]);
+        neutral_push::tell(&mut event, &built_commit, &neutral);
+        sink.emit(ticket, None, EventKind::TrackerWrite, event);
 
         // The agent's text closes no issue: its closing keywords are broken,
         // in the title too, which a squash merge makes the commit's subject;
@@ -7821,8 +7833,23 @@ impl OnDemand<'_> {
         let head = Branch::new(&delivery.branch).map_err(|e| refused("the ticket's branch", e))?;
         let base = Branch::new(&delivery.base_branch).map_err(|e| refused("the base branch", e))?;
         let report = repaired.kept(&kind, &followups);
-        let commit = repaired.commit;
         let base_at_push = self.base_head(p, &base, &ticket, sink);
+        // No agent commit message closes an issue (OWL-558): the push sends
+        // the neutral image of what the repair added above the lease, a
+        // rebase's rebased commits above its base, the branch moved there.
+        let mut bases = vec![pushed.as_str(), base_at_push.as_str()];
+        if let RepairKind::Rebase { onto, .. } = &kind {
+            bases.push(onto.as_str());
+        }
+        let neutral = self.neutral_push(p, &repaired.commit, &bases, sink)?;
+        let commit = neutral.head.commit().clone();
+        let kind = match kind {
+            RepairKind::Rebase { onto, rebased } => RepairKind::Rebase {
+                onto,
+                rebased: rebased.map(|rebased| neutral.image(&rebased)),
+            },
+            other => other,
+        };
         let mut kept = delivery.clone();
         kept.pushing = Some(Pushing {
             commit: commit.to_string(),
@@ -7854,13 +7881,13 @@ impl OnDemand<'_> {
         let git = &self.executor.git;
         let landed = match &kind {
             RepairKind::Fix { .. } | RepairKind::Correction { .. } | RepairKind::Review { .. } => {
-                writer.push_leased(git, &p.checkout, "origin", &commit, &head, pushed)
+                writer.push_leased(git, &p.checkout, "origin", &neutral.head, &head, pushed)
             }
             RepairKind::Rebase { onto, rebased } => writer.push_rebased(
                 git,
                 &p.checkout,
                 "origin",
-                &commit,
+                &neutral.head,
                 &head,
                 pushed,
                 onto,
@@ -7869,19 +7896,16 @@ impl OnDemand<'_> {
         };
         match landed {
             Ok(landed) => {
-                sink.emit(
-                    &ticket,
-                    None,
-                    EventKind::TrackerWrite,
-                    data([
-                        ("target", json!("forge")),
-                        ("action", json!("push")),
-                        ("branch", json!(head.as_str())),
-                        ("commit", json!(commit.as_str())),
-                        ("pushed", json!(pushed_name(landed))),
-                        ("lease", json!(pushed.as_str())),
-                    ]),
-                );
+                let mut event = data([
+                    ("target", json!("forge")),
+                    ("action", json!("push")),
+                    ("branch", json!(head.as_str())),
+                    ("commit", json!(commit.as_str())),
+                    ("pushed", json!(pushed_name(landed))),
+                    ("lease", json!(pushed.as_str())),
+                ]);
+                neutral_push::tell(&mut event, &repaired.commit, &neutral);
+                sink.emit(&ticket, None, EventKind::TrackerWrite, event);
             }
             Err(WriteError::Push(PushError::Rejected { reason })) => {
                 kept.pushing = None;

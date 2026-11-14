@@ -29,6 +29,7 @@ pub mod in_flight;
 pub mod init;
 pub mod install;
 mod merge;
+pub mod neutral_commits;
 pub mod notify;
 pub mod on_demand;
 pub mod personal_edit;

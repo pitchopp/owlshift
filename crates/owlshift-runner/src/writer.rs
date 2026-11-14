@@ -92,6 +92,7 @@ use owlshift_core::state::{Event, MAX_FIX_PASSES, MAX_REASKS, MAX_REPAIRS, ParkR
 use owlshift_core::vocab::{Harness, MergeMethod, MergeSwitch, Stage, Tier, Variant};
 
 use crate::executor::Git;
+use crate::neutral_commits::NeutralHead;
 use crate::resolver::{Fallback, Logged};
 
 /// What the delivery report says about one ticket.
@@ -4095,8 +4096,10 @@ impl<'a> Writer<'a> {
     }
 
     /// Pushes exactly `commit` to `branch` on `remote`, with the runner's own
-    /// git and the person's own git credentials: the commit the gate passed
-    /// on, never whatever the branch points to by then. A plain push, never
+    /// git and the person's own git credentials: the neutral image of the
+    /// commit the gate passed on, its tree, never whatever the branch points
+    /// to by then. Only a [`NeutralHead`] is pushed, so no agent commit
+    /// message carries a live closing keyword (OWL-558). A plain push, never
     /// a force: the remote refuses anything but creating the branch or
     /// moving it forward (`owlshift_adapters::forge::push`).
     ///
@@ -4114,11 +4117,12 @@ impl<'a> Writer<'a> {
         git: &Git,
         checkout: &Path,
         remote: &str,
-        commit: &CommitId,
+        commit: &NeutralHead,
         branch: &Branch,
     ) -> Result<Pushed, WriteError> {
         self.check(Action::PushBranch, HumanApproval::Absent)
             .map_err(WriteError::Floor)?;
+        let commit = commit.commit();
         // The adapter builds the push; the runner's git runs it, so a test
         // bench's hermetic setup applies to the push too.
         let command = push_command(Path::new("git"), checkout, remote, commit, branch)
@@ -4138,12 +4142,13 @@ impl<'a> Writer<'a> {
         git: &Git,
         checkout: &Path,
         remote: &str,
-        commit: &CommitId,
+        commit: &NeutralHead,
         branch: &Branch,
         lease: &CommitId,
     ) -> Result<Pushed, WriteError> {
         self.check(Action::PushBranch, HumanApproval::Absent)
             .map_err(WriteError::Floor)?;
+        let commit = commit.commit();
         let descends = git
             .output(
                 checkout,
@@ -4189,7 +4194,7 @@ impl<'a> Writer<'a> {
         git: &Git,
         checkout: &Path,
         remote: &str,
-        commit: &CommitId,
+        commit: &NeutralHead,
         branch: &Branch,
         lease: &CommitId,
         onto: &CommitId,
@@ -4197,6 +4202,7 @@ impl<'a> Writer<'a> {
     ) -> Result<Pushed, WriteError> {
         self.check(Action::PushBranch, HumanApproval::Absent)
             .map_err(WriteError::Floor)?;
+        let commit = commit.commit();
         match rebased {
             Some(rebased) => {
                 rebase_cycle_keeps_delivery(git, checkout, lease, onto, rebased, commit)
@@ -9110,17 +9116,19 @@ Reply `Q1: B`, `ok` to take every recommendation, or in your own words.
     /// it: the floor must refuse each before any call.
     const UI_REFUSED_WRITES: &[(&str, Write)] = &[
         ("push_branch", |w, f| {
-            came(w.push_branch(&f.git, f.checkout(), "origin", &head(), &f.branch))
+            let neutral = NeutralHead::assumed(head());
+            came(w.push_branch(&f.git, f.checkout(), "origin", &neutral, &f.branch))
         }),
         ("push_leased", |w, f| {
-            came(w.push_leased(&f.git, f.checkout(), "origin", &head(), &f.branch, &head()))
+            let neutral = NeutralHead::assumed(head());
+            came(w.push_leased(&f.git, f.checkout(), "origin", &neutral, &f.branch, &head()))
         }),
         ("push_rebased", |w, f| {
             came(w.push_rebased(
                 &f.git,
                 f.checkout(),
                 "origin",
-                &head(),
+                &NeutralHead::assumed(head()),
                 &f.branch,
                 &head(),
                 &head(),
