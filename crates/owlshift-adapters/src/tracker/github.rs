@@ -462,9 +462,10 @@ impl GitHubTracker {
     /// The account of the credential this adapter reads with: `GET user`,
     /// which a token acting as a person answers with that person's account,
     /// the one a comment posted through it comes from (G1, G7). Its numeric
-    /// id as text is what the decider of an ask holds ([`User::author`]), its
-    /// login the name, and any type but `User` is an app's, which is never an
-    /// operator's. A GitHub account has no workspace, so the page gets no link.
+    /// id as text is what the decider of an ask holds, an issue's assignee,
+    /// its login the name, and any type but `User` is an app's, which is
+    /// never an operator's. A GitHub account has no workspace, so the page
+    /// gets no link.
     pub fn key_account(&self) -> Result<KeyAccount, Error> {
         let text = self.read_account("user")?;
         let user: User = parse(&text, &"the signed-in account")?;
