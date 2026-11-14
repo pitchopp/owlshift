@@ -48,13 +48,20 @@ musl="$here/musl-COPYRIGHT"
 # The Rust standard library's notice, converted once for every target. Both
 # rustc calls run from the repository root, so rust-toolchain.toml picks the
 # pinned toolchain, the one whose std is linked, wherever the script is run.
-std_html="$(cd "$root" && rustc --print sysroot)/share/doc/rust/COPYRIGHT-library.html"
-std_version=$(cd "$root" && rustc --version)
 std_text=$(mktemp "${TMPDIR:-/tmp}/owlshift-std-notice.XXXXXX")
 part=
 trap 'rm -f "$std_text" ${part:+"$part"}' EXIT
-if ! python3 -I "$here/html2text.py" "$std_html" > "$std_text"; then
-    echo "error: the Rust standard library notice could not be read from $std_html" >&2
+std_html=
+std_version=
+if sysroot=$(cd "$root" && rustc --print sysroot) && std_version=$(cd "$root" && rustc --version); then
+    std_html="$sysroot/share/doc/rust/COPYRIGHT-library.html"
+fi
+if [ -z "$std_html" ] || ! python3 -I "$here/html2text.py" "$std_html" > "$std_text"; then
+    # No target keeps a file from an earlier run.
+    for target in "$@"; do
+        rm -f "$out/$target/THIRD-PARTY-NOTICES.txt" "$out/$target/THIRD-PARTY-NOTICES.txt.part"
+    done
+    echo "error: the Rust standard library notice could not be read from ${std_html:-the toolchain (rustc failed)}" >&2
     exit 1
 fi
 

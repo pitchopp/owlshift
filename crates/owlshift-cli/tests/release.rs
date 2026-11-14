@@ -526,6 +526,12 @@ fn the_notices_hold_the_crates_and_the_fonts_or_nothing() {
     // A std notice that is missing, converts to nothing, or cannot be
     // located leaves no file either.
     let saved = fs::read_to_string(&html).unwrap();
+    let written_before = || {
+        let ok = run("");
+        assert!(ok.status.success(), "{}", text(&ok.stderr));
+        assert!(file.exists(), "a file from an earlier run exists");
+    };
+    written_before();
     fs::write(&html, "<html><script>x</script> \n</html>").unwrap();
     let empty = run("");
     assert!(!empty.status.success());
@@ -536,12 +542,15 @@ fn the_notices_hold_the_crates_and_the_fonts_or_nothing() {
     );
     assert!(!file.exists());
     assert_eq!(left(), 0);
+    fs::write(&html, &saved).unwrap();
+    written_before();
     fs::remove_file(&html).unwrap();
     let missing = run("");
     assert!(!missing.status.success());
     assert!(!file.exists());
     assert_eq!(left(), 0);
     fs::write(&html, saved).unwrap();
+    written_before();
     let no_rustc = run_with("", "1", &["x86_64-unknown-linux-musl"]);
     assert!(!no_rustc.status.success());
     assert!(!file.exists());
