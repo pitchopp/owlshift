@@ -129,7 +129,8 @@ pub trait Tracker {
     /// not part of the listing. An error by default, and for the
     /// `delegation` gesture. On GitHub Issues a label with no `labeled` event
     /// standing is an error, never the creator: anyone opens an issue there
-    /// (OWL-536).
+    /// (OWL-536); a person's gesture there carries the issue's last text
+    /// edit, [`Gesture::edited_at`] (OWL-557).
     fn gesture(&self, _id: &TicketId, _admit: &Admit) -> Result<Gesture, Error> {
         Err(Error::new(
             ErrorKind::Other,
@@ -472,6 +473,12 @@ pub struct Gesture {
     /// The tracker's time of the gesture; `None` on a tracker that keeps
     /// no history (the Markdown tracker).
     pub at: Option<Timestamp>,
+    /// The last edit of the ticket's title or description, when the
+    /// tracker reads it: on GitHub Issues, for a person's gesture, whose
+    /// issue anyone may have edited since (OWL-557). `None` when the text
+    /// was never edited or the tracker does not tell. A gesture made at or
+    /// before it does not admit: it vouches only for the text read then.
+    pub edited_at: Option<Timestamp>,
 }
 
 /// The `delegation` gesture is not built: decision D8's app takes no

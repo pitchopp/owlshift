@@ -234,7 +234,11 @@ fn the_gesture_is_the_last_label_event_standing() {
             Err("a-bot[bot]"),
         ),
     ] {
-        let canned = Canned::default().on(&events(7), 200, json!(list));
+        let canned = Canned::default().on(&events(7), 200, json!(list)).on(
+            &last_edited(7),
+            200,
+            edited(None),
+        );
         let gesture = tracker(&canned).gesture(&id("7"), &label());
         match (read, gesture) {
             (Ok((account, at)), Ok(gesture)) => {
@@ -243,6 +247,9 @@ fn the_gesture_is_the_last_label_event_standing() {
                 };
                 assert_eq!(person.id, account);
                 assert_eq!(gesture.at.unwrap().to_string(), at);
+                assert_eq!(gesture.edited_at, None);
+                // A person's gesture reads the issue's last edit too.
+                assert_eq!(canned.calls(), [events(7), last_edited(7)]);
             }
             (Err(name), Ok(gesture)) => {
                 assert_eq!(
@@ -251,13 +258,88 @@ fn the_gesture_is_the_last_label_event_standing() {
                         name: name.to_owned()
                     }
                 );
+                // One that never admits reads the events alone.
+                assert_eq!(gesture.edited_at, None);
+                assert_eq!(canned.calls(), [events(7)]);
             }
-            (Err(message), Err(error)) => assert!(error.message.contains(message), "{error}"),
+            (Err(message), Err(error)) => {
+                assert!(error.message.contains(message), "{error}");
+                assert_eq!(canned.calls(), [events(7)]);
+            }
             (want, got) => panic!("{want:?}: {got:?}"),
         }
-        // The events alone are read.
-        assert_eq!(canned.calls(), [events(7)]);
     }
+}
+
+/// The GraphQL read of issue `n`'s last edit, by its variables.
+fn last_edited(n: u64) -> String {
+    format!(
+        "GRAPHQL {}",
+        json!({ "owner": "demo", "name": "project", "number": n })
+    )
+}
+
+/// GraphQL's answer of an issue last edited at `at`, never when `None`.
+fn edited(at: Option<&str>) -> Value {
+    json!({ "data": { "repository": { "issue": { "lastEditedAt": at } } } })
+}
+
+/// A person's gesture carries the issue's last text edit (OWL-557): the
+/// later of its last `renamed` event (a title edit) and GraphQL's
+/// `lastEditedAt` (a description edit), as the live check of 2026-11-14
+/// gave them; none when never edited. The runner compares it with the
+/// gesture's time. An issue GraphQL does not answer is an error.
+#[test]
+fn a_persons_gesture_carries_the_last_edit_of_the_text() {
+    let labeled = || event("labeled", "agent:ready", "2026-11-14T10:33:51Z", ann());
+    let mut renamed = event("renamed", "", "2026-11-14T10:34:19Z", ann());
+    renamed["label"] = Value::Null;
+    renamed["rename"] = json!({ "from": "Old", "to": "New" });
+    for (list, last, want) in [
+        // Never edited.
+        (vec![labeled()], None, None),
+        // The description edited before the label.
+        (
+            vec![labeled()],
+            Some("2026-11-14T10:33:44Z"),
+            Some("2026-11-14T10:33:44Z"),
+        ),
+        // The description edited after it.
+        (
+            vec![labeled()],
+            Some("2026-11-14T10:34:12Z"),
+            Some("2026-11-14T10:34:12Z"),
+        ),
+        // The title renamed after the description's edit: the later.
+        (
+            vec![labeled(), renamed.clone()],
+            Some("2026-11-14T10:34:12Z"),
+            Some("2026-11-14T10:34:19Z"),
+        ),
+    ] {
+        let canned = Canned::default().on(&events(7), 200, json!(list)).on(
+            &last_edited(7),
+            200,
+            edited(last),
+        );
+        let gesture = tracker(&canned).gesture(&id("7"), &label()).unwrap();
+        assert_eq!(gesture.at.unwrap().to_string(), "2026-11-14T10:33:51Z");
+        assert_eq!(
+            gesture.edited_at.map(|at| at.to_string()).as_deref(),
+            want,
+            "{last:?}"
+        );
+    }
+
+    let canned = Canned::default()
+        .on(&events(7), 200, json!([labeled()]))
+        .on(
+            &last_edited(7),
+            200,
+            json!({ "data": { "repository": { "issue": null } } }),
+        );
+    let error = tracker(&canned).gesture(&id("7"), &label()).unwrap_err();
+    assert_eq!(error.kind, ErrorKind::NotFound, "{error}");
 }
 
 /// A full page of events reads the next one.

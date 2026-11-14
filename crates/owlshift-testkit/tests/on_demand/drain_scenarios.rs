@@ -2267,6 +2267,102 @@ fn the_ready_snapshot_keeps_what_each_pass_made_of_the_column() {
     );
 }
 
+/// OWL-557: DEMO-1's text was edited after its admitter's label. The drain
+/// does not take it in: one `not_admitted` warning names the edit and asks
+/// for the label again, and so do its wait in the ready snapshot and its
+/// `decision` event. Edited once more, it is warned of again once read
+/// again after the hold; the label put on again after the edit admits it.
+#[test]
+fn a_ticket_edited_after_its_label_waits_for_the_label_again() {
+    let bench = Bench::build_admitting(
+        "maintainer",
+        "assignee = \"maintainer\"\nlabels = [\"agent\"]\n",
+        "",
+        ", parked = \"Parked\"",
+        "admit = { label = \"agent\" }\nadmitters = [\"maintainer\"]",
+    );
+    let at = |time: &str| -> Timestamp { time.parse().unwrap() };
+    bench.edits.borrow_mut().push((
+        TicketId::new(TICKET).unwrap(),
+        at("2026-10-02T08:00:00Z"),
+        at("2026-10-02T08:05:00Z"),
+    ));
+    let intake = bench.reply(None, Some(&intake_result("done", None, "")));
+    let snapshots = RefCell::new(Vec::new());
+    // Three passes: the third takes it in, and none dispatches it.
+    let (outcomes, lines, printed) = bench.drain_passes(vec![intake], 3, |pass, _| {
+        snapshots
+            .borrow_mut()
+            .push(ready_now(&bench).expect("a snapshot"));
+        let mut edits = bench.edits.borrow_mut();
+        if pass == 1 {
+            // Edited once more; read again after the hold.
+            edits[0].2 = at("2026-10-02T08:30:00Z");
+        } else {
+            // The label put on again after the last edit.
+            edits[0].1 = at("2026-10-02T08:40:00Z");
+        }
+        let later = bench.clock.get().checked_add(SignedDuration::from_mins(11));
+        bench.clock.set(later.unwrap());
+    });
+    let report = format!("{outcomes:?}\n{lines}\n{printed}");
+    let mut snapshots = snapshots.into_inner();
+    snapshots.push(ready_now(&bench).expect("the last pass's snapshot"));
+    assert_eq!(
+        snapshots.iter().map(made_of).collect::<Vec<_>>(),
+        [
+            vec![made(TICKET, "not_admitted", "not_admitted", &[])],
+            vec![made(TICKET, "not_admitted", "not_admitted", &[])],
+            vec![made(TICKET, "taken_in", "", &[])],
+        ],
+        "{report}"
+    );
+    assert_eq!(bench.runs(), [(Role::Intake, TICKET.to_owned())]);
+
+    let asks = "remove \"agent\" and put it on again";
+    let events = bench.events();
+    let warned: Vec<String> = events
+        .iter()
+        .filter(|e| e.kind == EventKind::Warning && e.data["what"] == json!("not_admitted"))
+        .map(|e| {
+            assert_eq!(e.data["account"], json!("maintainer"));
+            e.data["reason"].as_str().unwrap().to_owned()
+        })
+        .collect();
+    // Each reason told once as the ticket's wait, which carries it.
+    let told: Vec<&str> = events
+        .iter()
+        .filter(|e| {
+            e.kind == EventKind::Decision && e.data.get("reason") == Some(&json!("not_admitted"))
+        })
+        .map(|e| e.data["why"].as_str().unwrap())
+        .collect();
+    assert_eq!(told, warned, "{report}");
+    for (pass, edited) in ["08:05:00Z", "08:30:00Z"].into_iter().enumerate() {
+        let reason = &warned[pass];
+        assert!(
+            reason.contains(&format!("edited at 2026-10-02T{edited}")),
+            "{reason}"
+        );
+        assert!(reason.contains(asks), "{reason}");
+        let Outcome::NotAdmitted { wait } = &snapshots[pass].tickets[0].drain else {
+            panic!("{report}");
+        };
+        assert_eq!(
+            wait.text,
+            format!("its admission gesture does not admit it: {reason}")
+        );
+    }
+    assert_eq!(warned.len(), 2, "{report}");
+    // Watch's line words the wait as `why` does.
+    assert!(
+        lines.contains(&format!(
+            "{TICKET} waits: its admission gesture does not admit it: "
+        )),
+        "{report}"
+    );
+}
+
 // OWL-485: a dark wake holds the dispatches and the steps' starts.
 
 /// The `watch` decisions a dark wake told, oldest first.

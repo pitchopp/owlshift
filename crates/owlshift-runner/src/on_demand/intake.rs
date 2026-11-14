@@ -42,7 +42,11 @@ use crate::writer::IntakeComment;
 /// on the tracker's identifier exactly. An app user, a bot or an
 /// integration never admits, nor does anyone when `admitters` is absent. A
 /// tracker that keeps no history gives no time: the gesture's time is then
-/// `now`, when it was read.
+/// `now`, when it was read. A gesture made at or before the last edit of the
+/// ticket's title or description, which the tracker reads where anyone may
+/// edit a ticket (GitHub Issues, OWL-557), does not admit either: it vouches
+/// only for the text its admitter read. The same second counts as after,
+/// the times being whole seconds.
 pub fn admission(
     tracker: &dyn Tracker,
     admit: &Admit,
@@ -56,7 +60,8 @@ pub fn admission(
 /// Why no gesture admits a ticket. `account` names who made the gesture the
 /// tracker read, the account's identifier or what the tracker calls a bot,
 /// when one was read and does not admit: the drain warns of it once per
-/// ticket and account (OWL-250). `None` when nothing was read: delegation,
+/// ticket, account and reason (OWL-250, OWL-557). `None` when nothing was
+/// read: delegation,
 /// no `admitters`, or a read that failed.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Unadmitted {
@@ -92,7 +97,11 @@ pub(crate) fn read_admission(
                 .to_owned(),
         ));
     };
-    let TrackerGesture { account, at } = tracker
+    let TrackerGesture {
+        account,
+        at,
+        edited_at,
+    } = tracker
         .gesture(ticket, admit)
         .map_err(|e| unread(format!("reading the admission gesture of {ticket}: {e}")))?;
     let account = match account {
@@ -115,6 +124,18 @@ pub(crate) fn read_admission(
             reason: format!(
                 "the admission gesture on {ticket} was made by {account:?}, whom \
                  `[tracker].admitters` does not list"
+            ),
+            account: Some(account),
+        });
+    }
+    if let (Some(at), Some(edited)) = (at, edited_at)
+        && edited >= at
+    {
+        return Err(Unadmitted {
+            reason: format!(
+                "the title or description of {ticket} was edited at {edited}, at or after its \
+                 admission gesture {name:?} at {at}: the gesture vouches only for the text read \
+                 then, so once the text is read, remove {name:?} and put it on again"
             ),
             account: Some(account),
         });
@@ -861,8 +882,9 @@ mod tests {
 
     use super::*;
 
-    /// A tracker whose admission gesture was made by `account`.
-    struct Gestured(TrackerAuthor, Option<Timestamp>);
+    /// A tracker whose admission gesture was made by `account`, at the
+    /// time given, the ticket's text last edited at the second.
+    struct Gestured(TrackerAuthor, Option<Timestamp>, Option<Timestamp>);
 
     impl Tracker for Gestured {
         fn capabilities(&self) -> &'static [Capability] {
@@ -884,6 +906,7 @@ mod tests {
             Ok(TrackerGesture {
                 account: self.0.clone(),
                 at: self.1,
+                edited_at: self.2,
             })
         }
     }
@@ -937,7 +960,11 @@ mod tests {
             admission(tracker, &label, admitters, &ticket, now)
         };
 
-        let gesture = admit(&Gestured(account("u-ann", "Ann"), Some(at)), Some(&listed)).unwrap();
+        let gesture = admit(
+            &Gestured(account("u-ann", "Ann"), Some(at), None),
+            Some(&listed),
+        )
+        .unwrap();
         assert_eq!(
             (
                 gesture.kind,
@@ -948,12 +975,16 @@ mod tests {
             (GestureKind::Label, "agent", "u-ann", at)
         );
         // A tracker that keeps no history: the time it was read.
-        let gesture = admit(&Gestured(account("u-ann", "Ann"), None), Some(&listed)).unwrap();
+        let gesture = admit(
+            &Gestured(account("u-ann", "Ann"), None, None),
+            Some(&listed),
+        )
+        .unwrap();
         assert_eq!(gesture.at, now);
 
         for (tracker, admitters, why) in [
             (
-                Gestured(account("u-bob", "u-ann"), Some(at)),
+                Gestured(account("u-bob", "u-ann"), Some(at), None),
                 Some(&listed[..]),
                 "does not list",
             ),
@@ -963,12 +994,13 @@ mod tests {
                         name: "u-ann".to_owned(),
                     },
                     Some(at),
+                    None,
                 ),
                 Some(&listed[..]),
                 "not a person's account",
             ),
             (
-                Gestured(account("u-ann", "Ann"), Some(at)),
+                Gestured(account("u-ann", "Ann"), Some(at), None),
                 None,
                 "lists no account",
             ),
@@ -977,12 +1009,42 @@ mod tests {
             assert!(error.contains(why), "{why}: {error}");
         }
         let delegation = admission(
-            &Gestured(account("u-ann", "Ann"), Some(at)),
+            &Gestured(account("u-ann", "Ann"), Some(at), None),
             &Admit::Delegation,
             Some(&listed),
             &ticket,
             now,
         );
         assert!(delegation.unwrap_err().contains("not built"));
+    }
+
+    /// A listed admitter's gesture made at or before the last edit of the
+    /// ticket's text does not admit, the same second counting as after; one
+    /// made after it does (OWL-557). The refusal names the edit and asks
+    /// for the label again, and keeps the account, so the drain warns of it.
+    #[test]
+    fn a_gesture_older_than_the_texts_last_edit_does_not_admit() {
+        let ticket = TicketId::new("12").unwrap();
+        let label = Admit::Label("agent:ready".to_owned());
+        let listed = ["7".to_owned()];
+        let now: Timestamp = "2026-11-14T11:00:00Z".parse().unwrap();
+        let at: Timestamp = "2026-11-14T10:33:51Z".parse().unwrap();
+        let read = |edited: &str| {
+            let tracker = Gestured(account("7", "ann"), Some(at), Some(edited.parse().unwrap()));
+            read_admission(&tracker, &label, Some(&listed), &ticket, now)
+        };
+        for edited in ["2026-11-14T10:34:12Z", "2026-11-14T10:33:51Z"] {
+            let refusal = read(edited).unwrap_err();
+            assert_eq!(refusal.account.as_deref(), Some("7"));
+            for part in [
+                format!("edited at {edited}"),
+                "at 2026-11-14T10:33:51Z".to_owned(),
+                "remove \"agent:ready\" and put it on again".to_owned(),
+            ] {
+                assert!(refusal.reason.contains(&part), "{part}: {}", refusal.reason);
+            }
+        }
+        let gesture = read("2026-11-14T10:33:44Z").unwrap();
+        assert_eq!((gesture.account.as_str(), gesture.at), ("7", at));
     }
 }

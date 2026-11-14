@@ -1,0 +1,141 @@
+{
+  "recorded": "2026-11-14 (OWL-557) on pitchopp/owlshift-live-sandbox, recorded live through the maintainer's gh login, read-only, after docs/design/live-checks/owl-557.sh made the issues: #104 labelled, then its title and its description edited; #105 opened with its label, never edited. The run's `closed` events, its cleanup, are left out and every actor is person-1.",
+  "exchanges": [
+    {
+      "request": {
+        "body": null,
+        "method": "GET",
+        "path": "repos/pitchopp/owlshift-live-sandbox/issues/104/events?per_page=100&page=1"
+      },
+      "status": 200,
+      "response": [
+        {
+          "actor": {
+            "id": 1,
+            "login": "person-1",
+            "type": "User"
+          },
+          "commit_id": null,
+          "commit_url": null,
+          "created_at": "2026-11-14T10:33:51Z",
+          "event": "labeled",
+          "id": 36117558153,
+          "label": {
+            "name": "owl-557-probe",
+            "color": "ededed"
+          },
+          "node_id": "LE_lADOVFw-Bs8AAAABfM3HSs8AAAAIaMYziQ",
+          "performed_via_github_app": null,
+          "url": "https://api.github.com/repos/pitchopp/owlshift-live-sandbox/issues/events/36117558153"
+        },
+        {
+          "actor": {
+            "id": 1,
+            "login": "person-1",
+            "type": "User"
+          },
+          "commit_id": null,
+          "commit_url": null,
+          "created_at": "2026-11-14T10:34:05Z",
+          "event": "renamed",
+          "id": 36117570378,
+          "node_id": "RTE_lADOVFw-Bs8AAAABfM3HSs8AAAAIaMZjSg",
+          "performed_via_github_app": null,
+          "rename": {
+            "from": "OWL-557 probe A",
+            "to": "OWL-557 probe A, title edited"
+          },
+          "url": "https://api.github.com/repos/pitchopp/owlshift-live-sandbox/issues/events/36117570378"
+        },
+        {
+          "actor": {
+            "id": 1,
+            "login": "person-1",
+            "type": "User"
+          },
+          "commit_id": null,
+          "commit_url": null,
+          "created_at": "2026-11-14T10:34:19Z",
+          "event": "renamed",
+          "id": 36117581890,
+          "node_id": "RTE_lADOVFw-Bs8AAAABfM3HSs8AAAAIaMaQQg",
+          "performed_via_github_app": null,
+          "rename": {
+            "from": "OWL-557 probe A, title edited",
+            "to": "OWL-557 probe A, title edited twice"
+          },
+          "url": "https://api.github.com/repos/pitchopp/owlshift-live-sandbox/issues/events/36117581890"
+        }
+      ]
+    },
+    {
+      "request": {
+        "query": "query($owner: String!, $name: String!, $number: Int!) { repository(owner: $owner, name: $name) { issue(number: $number) { lastEditedAt } } }",
+        "variables": {
+          "owner": "pitchopp",
+          "name": "owlshift-live-sandbox",
+          "number": 104
+        }
+      },
+      "status": 200,
+      "response": {
+        "data": {
+          "repository": {
+            "issue": {
+              "lastEditedAt": "2026-11-14T10:34:12Z"
+            }
+          }
+        }
+      }
+    },
+    {
+      "request": {
+        "body": null,
+        "method": "GET",
+        "path": "repos/pitchopp/owlshift-live-sandbox/issues/105/events?per_page=100&page=1"
+      },
+      "status": 200,
+      "response": [
+        {
+          "actor": {
+            "id": 1,
+            "login": "person-1",
+            "type": "User"
+          },
+          "commit_id": null,
+          "commit_url": null,
+          "created_at": "2026-11-14T10:34:24Z",
+          "event": "labeled",
+          "id": 36117585978,
+          "label": {
+            "name": "owl-557-probe",
+            "color": "ededed"
+          },
+          "node_id": "LE_lADOVFw-Bs8AAAABfM3geM8AAAAIaMagOg",
+          "performed_via_github_app": null,
+          "url": "https://api.github.com/repos/pitchopp/owlshift-live-sandbox/issues/events/36117585978"
+        }
+      ]
+    },
+    {
+      "request": {
+        "query": "query($owner: String!, $name: String!, $number: Int!) { repository(owner: $owner, name: $name) { issue(number: $number) { lastEditedAt } } }",
+        "variables": {
+          "owner": "pitchopp",
+          "name": "owlshift-live-sandbox",
+          "number": 105
+        }
+      },
+      "status": 200,
+      "response": {
+        "data": {
+          "repository": {
+            "issue": {
+              "lastEditedAt": null
+            }
+          }
+        }
+      }
+    }
+  ]
+}

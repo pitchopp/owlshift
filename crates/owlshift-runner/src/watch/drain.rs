@@ -17,8 +17,9 @@
 //!
 //! Each change of a waiting ticket's reason is one `decision` event (`drain`
 //! = `waits`) and one line; a gesture that does not admit is one `warning`
-//! event (`not_admitted`) and one line per ticket and account, and the ticket
-//! is tried again after [`RETRY_AFTER`]. An intake or a dispatch is held as
+//! event (`not_admitted`) and one line per ticket, account and reason, which
+//! its wait then carries (OWL-557), and the ticket is tried again after
+//! [`RETRY_AFTER`]. An intake or a dispatch is held as
 //! a continue is, in watch's own [`Holds`](super::Holds). Neither starts
 //! while the harness its first run needs is held by a usage limit, which
 //! the machine's usage state says (OWL-404): the drain then takes nothing in
@@ -101,9 +102,8 @@ pub(super) struct Memory {
     pub(super) listed: Vec<TicketId>,
     /// Each waiting ticket's reason as last told.
     waits: HashMap<TicketId, String>,
-    /// The account of each gesture warned of as not admitting, and when
-    /// the ticket is tried again.
-    warned: HashMap<TicketId, (String, Timestamp)>,
+    /// Each gesture warned of as not admitting.
+    warned: HashMap<TicketId, Warned>,
     /// Why the column could not be read, as last said.
     unlisted: Option<String>,
     /// The ticket refs that could not be read, as last said.
@@ -113,6 +113,15 @@ pub(super) struct Memory {
     capped: bool,
     /// Why the ready snapshot could not be written, as last said.
     unwritten: Option<String>,
+}
+
+/// A gesture warned of as not admitting: who made it, why it does not
+/// admit, and when the ticket is tried again. A new reason is told again:
+/// a text edited once more after its label (OWL-557), an admitter dropped.
+struct Warned {
+    account: String,
+    reason: String,
+    retry: Timestamp,
 }
 
 /// What the pass's intake did.
@@ -554,7 +563,17 @@ impl Watch<'_> {
             let Some(row) = rows.iter().find(|row| row.id().as_str() == id) else {
                 continue;
             };
-            let detail = wait_data(wait, &memory.outside.kinds);
+            let mut detail = wait_data(wait, &memory.outside.kinds);
+            // Why the gesture does not admit, as its warning said (OWL-557):
+            // a text edited after its label asks for the label again.
+            let why_not = match wait {
+                Wait::NotAdmitted => memory.drain.warned.get(row.id()),
+                _ => None,
+            }
+            .map(|warned| warned.reason.clone());
+            if let Some(why) = &why_not {
+                detail.insert("why".to_owned(), json!(why));
+            }
             let outcome = match (wait, &intake) {
                 (Wait::NotAdmitted | Wait::Excluded, _) => Outcome::NotAdmitted {
                     wait: ready::wait(row.id(), wait.key(), detail.clone()),
@@ -577,7 +596,13 @@ impl Watch<'_> {
             if *wait == Wait::PrCap {
                 continue;
             }
-            let told = format!("{}{:?}{:?}", wait.key(), wait.tickets(), wait.resource());
+            let told = format!(
+                "{}{:?}{:?}{:?}",
+                wait.key(),
+                wait.tickets(),
+                wait.resource(),
+                why_not
+            );
             if memory.drain.waits.get(row.id()) == Some(&told) {
                 continue;
             }
@@ -586,7 +611,10 @@ impl Watch<'_> {
             let mut event = data([("drain", json!("waits")), ("reason", json!(wait.key()))]);
             event.extend(detail);
             sink.emit(row.id(), None, EventKind::Decision, event);
-            let reason = in_flight::said(wait, exclude, &memory.outside.kinds);
+            let reason = match &why_not {
+                Some(why) => crate::why::not_admitted(Some(why)),
+                None => in_flight::said(wait, exclude, &memory.outside.kinds),
+            };
             self.line(out, &format!("{} waits: {reason}", row.id()));
             memory.drain.waits.insert(row.id().clone(), told);
         }
@@ -794,7 +822,7 @@ impl Watch<'_> {
                 .drain
                 .warned
                 .get(ticket)
-                .is_some_and(|(_, retry)| now < *retry)
+                .is_some_and(|warned| now < warned.retry)
             {
                 continue;
             }
@@ -999,9 +1027,9 @@ impl Watch<'_> {
     }
 
     /// A gesture by `account` that does not admit `ticket`: one `warning`
-    /// event and one line per ticket and account; the ticket is tried again
-    /// after [`RETRY_AFTER`], so an account added to `admitters` since
-    /// admits it.
+    /// event and one line per ticket, account and reason; the ticket is
+    /// tried again after [`RETRY_AFTER`], so an account added to
+    /// `admitters` since, or a label put on again after an edit, admits it.
     fn not_admitted(
         &self,
         memory: &mut WatchMemory,
@@ -1017,7 +1045,7 @@ impl Watch<'_> {
             .drain
             .warned
             .get(ticket)
-            .is_some_and(|(warned, _)| *warned == account);
+            .is_some_and(|warned| warned.account == account && warned.reason == reason);
         if !told {
             sink.emit(
                 ticket,
@@ -1031,7 +1059,14 @@ impl Watch<'_> {
             );
             self.line(out, &format!("{ticket} is not taken in: {reason}"));
         }
-        memory.drain.warned.insert(ticket.clone(), (account, retry));
+        memory.drain.warned.insert(
+            ticket.clone(),
+            Warned {
+                account,
+                reason: reason.to_owned(),
+                retry,
+            },
+        );
     }
 
     /// The core's view of a row: its admission, decider, text and intake,
@@ -1059,7 +1094,7 @@ impl Watch<'_> {
             .drain
             .warned
             .get(row.id())
-            .is_some_and(|(_, retry)| now < *retry);
+            .is_some_and(|warned| now < warned.retry);
         let admission = if row.excluded(exclude) {
             Admission::Excluded
         } else if warned {

@@ -1110,6 +1110,18 @@ impl GitHubForge {
         })
     }
 
+    /// One GraphQL read of the tracker's: its `data`, decoded. Only the
+    /// admission gesture's read of an issue's last edit makes it (OWL-557),
+    /// GraphQL alone giving the time of a description edit. Held on a spent
+    /// budget as the tracker's REST calls are ([`Self::holding`]).
+    pub(crate) fn tracker_query<T: DeserializeOwned>(
+        &self,
+        query: &str,
+        variables: Value,
+    ) -> Result<T, Error> {
+        self.holding(|| self.call(query, variables))
+    }
+
     /// The cache, taken back after a panic elsewhere while it was held.
     fn cached(&self) -> std::sync::MutexGuard<'_, RestCache> {
         self.cache.lock().unwrap_or_else(PoisonError::into_inner)
