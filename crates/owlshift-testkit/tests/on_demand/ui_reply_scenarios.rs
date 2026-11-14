@@ -455,7 +455,11 @@ fn a_reply_from_the_ui_lands_on_the_github_issue_and_resumes_it() {
     );
     assert_eq!(offer["offered"], true, "{offer:#}");
     assert_eq!(offer["decider"]["account"], "1");
-    assert!(offer["link"].is_null(), "{offer:#}");
+    assert_eq!(
+        offer["link"],
+        format!("https://github.com/{REPO}/issues/1"),
+        "{offer:#}"
+    );
 
     let before = issues.comments(1).len();
     let form = bench.issue_form(vec![pick("Q1", "B", ""), recommended("Q2")], true);
@@ -554,7 +558,11 @@ fn the_form_is_absent_and_the_writer_refuses_for_another_github_account() {
             offer["why_not"].as_str().unwrap().contains(why),
             "{offer:#}"
         );
-        assert!(offer["link"].is_null());
+        assert_eq!(
+            offer["link"],
+            format!("https://github.com/{REPO}/issues/1"),
+            "{offer:#}"
+        );
         let form = bench.issue_form(vec![pick("Q1", "B", "")], true);
         let refused = send(key.tracker.as_ref(), &key.account, &record, &issue(), &form);
         assert!(
