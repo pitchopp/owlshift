@@ -738,6 +738,7 @@ struct StepProgram {
 /// Where a watch typed in a terminal keeps the copy of its binary that its
 /// steps run (OWL-560): `<data>/pinned/<pid>/`, beside the copies of the
 /// other typed watches; the daemon's is in `<data>/service/pinned/`.
+#[cfg(unix)]
 fn typed_pinned_dir(data_dir: &Path) -> PathBuf {
     data_dir.join("pinned")
 }
@@ -745,7 +746,7 @@ fn typed_pinned_dir(data_dir: &Path) -> PathBuf {
 /// The program a drain's steps run (architecture section 5, "An upgrade").
 /// A served watch runs the daemon's copy already, so its own binary is
 /// that copy. A watch typed in a terminal pins its binary (OWL-560): on
-/// macOS a copy in [`typed_pinned_dir`], refused, the copy removed, when
+/// macOS a copy in `<data>/pinned/<pid>/`, refused, the copy removed, when
 /// `differs`, the build check, finds it is not this build. On Windows its
 /// own path, which no upgrade runs under it there.
 fn step_program(

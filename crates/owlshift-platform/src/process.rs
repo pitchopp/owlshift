@@ -204,6 +204,7 @@ enum Sweep {
 
 impl Sweep {
     /// Whether a pin by process `id` removes `left`, an entry of its folder.
+    #[cfg_attr(not(unix), allow(unused_variables))]
     fn removes(self, left: &Path, id: u32) -> io::Result<bool> {
         match self {
             Self::All => Ok(true),
