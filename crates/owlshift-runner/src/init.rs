@@ -143,8 +143,8 @@ requires = \">={}.{}\"
 
 [pipeline]
 # A ticket's pipeline variant, unless intake or a label picks another:
-# \"trivial\", \"standard\" or \"risky\". In this version, `owlshift do` runs
-# the build stage only.
+# \"trivial\", \"standard\" or \"risky\". `owlshift do` runs design, design
+# review, build and verify; \"trivial\" skips design and design review.
 default = \"standard\"
 # When a human approves the plan: \"always\", \"on-fork\" or \"never\".
 plan_approval = \"on-fork\"
@@ -849,6 +849,10 @@ mod tests {
             )
         );
         assert!(text.contains("# network open before"));
+        assert!(
+            text.contains("`owlshift do` runs design, design\n# review, build and verify;")
+                && !text.contains("build stage only")
+        );
         assert!(
             text.contains(
                 "\n# setup = [\"pnpm install --frozen-lockfile\"]\n# Folders of your home"
