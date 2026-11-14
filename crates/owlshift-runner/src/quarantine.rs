@@ -887,8 +887,18 @@ mod tests {
         bench.mark(BREACH);
         let root = bench.dirs.root();
         fs::set_permissions(root, fs::Permissions::from_mode(0o000)).unwrap();
-        // A superuser looks through any folder: nothing to check then.
-        let superuser = fs::read_dir(root).is_ok();
+        // A superuser looks through any folder: nothing to check then, and
+        // where the fixtures are required (CI) that is a failure (OWL-555).
+        if fs::read_dir(root).is_ok() {
+            fs::set_permissions(root, fs::Permissions::from_mode(0o700)).unwrap();
+            assert!(
+                std::env::var_os("OWLSHIFT_REQUIRE_FIXTURE_TOOLS").is_none(),
+                "OWLSHIFT_REQUIRE_FIXTURE_TOOLS is set, but: running as root: a folder with no \
+                 mode is still readable"
+            );
+            eprintln!("skipped: running as root: a folder with no mode is still readable");
+            return;
+        }
         let mut ask = |_: &str| -> io::Result<String> { unreachable!("nothing is shown") };
         let mut out = Vec::new();
         let mut sink = EventSink::new("acme/app", bench.log.clone(), &mut out);
@@ -899,13 +909,11 @@ mod tests {
             &mut sink,
         );
         fs::set_permissions(root, fs::Permissions::from_mode(0o700)).unwrap();
-        if !superuser {
-            let refused = cleared.unwrap_err();
-            assert!(
-                refused.starts_with("the project's quarantine: "),
-                "{refused}"
-            );
-        }
+        let refused = cleared.unwrap_err();
+        assert!(
+            refused.starts_with("the project's quarantine: "),
+            "{refused}"
+        );
         assert_eq!(bench.dirs.quarantine().unwrap().as_deref(), Some(BREACH));
     }
 
