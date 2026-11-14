@@ -260,8 +260,8 @@ pub const CLAUDE_AGENT_ACCOUNT: &str = "claude-agent";
 
 /// How to give agent runs their Claude Code login, or a new one.
 pub const AGENT_LOGIN_FIX: &str = "run `claude setup-token`, then `owlshift init` and paste \
-     the token it printed; `owlshift init --replace-secrets` replaces a stored token that \
-     expired, was revoked or was pasted wrong";
+     the token it printed, or `owlshift init --replace-agent-token` to replace a stored token \
+     that expired, was revoked or was pasted wrong";
 
 /// Claude Code has no usable login for agent runs: the run is refused with
 /// the fix. Neither variant carries the token.
@@ -1011,7 +1011,10 @@ mod tests {
             let text = claude(login).sandbox_needs(&agent).unwrap_err().to_string();
             assert!(text.contains(refusal), "{text}");
             assert!(text.contains("`claude setup-token`"), "{text}");
-            assert!(text.contains("`owlshift init --replace-secrets`"), "{text}");
+            assert!(
+                text.contains("`owlshift init --replace-agent-token`"),
+                "{text}"
+            );
             assert!(!text.contains("SENTINEL"), "{text}");
         }
 
