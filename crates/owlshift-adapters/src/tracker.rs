@@ -129,8 +129,9 @@ pub trait Tracker {
     /// not part of the listing. An error by default, and for the
     /// `delegation` gesture. On GitHub Issues a label with no `labeled` event
     /// standing is an [`ErrorKind::NoGesture`] error, never the creator:
-    /// anyone opens an issue there (OWL-536, OWL-568); a person's gesture there carries the issue's last text
-    /// edit, [`Gesture::edited_at`] (OWL-557).
+    /// anyone opens an issue there (OWL-536, OWL-568); a person's gesture
+    /// there carries the issue's last text edit, [`Gesture::edited_at`]
+    /// (OWL-557).
     fn gesture(&self, _id: &TicketId, _admit: &Admit) -> Result<Gesture, Error> {
         Err(Error::new(
             ErrorKind::Other,
