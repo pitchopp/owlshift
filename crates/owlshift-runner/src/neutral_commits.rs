@@ -66,7 +66,7 @@ impl Neutral {
 
 /// The neutral image of `head`'s history down to `bases`, its rewritten
 /// commits written to the object store of `checkout`.
-pub(crate) fn neutral_history(
+pub fn neutral_history(
     git: &Git,
     checkout: &Path,
     head: &CommitId,
