@@ -14,14 +14,14 @@
 //! app's pair. It is read whole from one place, since an app belongs to one
 //! workspace: the project's accounts when any of its entries is stored
 //! there, otherwise the shared ones when any of those is, otherwise the
-//! project's, which then hold nothing. The GitHub credential is resolved on its own, in the order of "Which
-//! credential a command uses" (build plan, "`init`", OWL-336): the
-//! project's GitHub App token ([`GITHUB_APP_ACCOUNT`]), else the project's
-//! personal token, else the shared personal token. `init` writes project
-//! accounts only, so no shared app account is read. Each account is
-//! looked up once, by a function the caller gives: a read for a command, so
-//! the macOS Keychain asks once per entry, or a presence check for
-//! `owlshift doctor`.
+//! project's, which then hold nothing. The GitHub credential is resolved
+//! on its own, in the order of "Which credential a command uses" (build
+//! plan, "`init`", OWL-336): the project's GitHub App token
+//! ([`GITHUB_APP_ACCOUNT`]), else the project's personal token, else the
+//! shared personal token. `init` writes project accounts only, so no shared
+//! app account is read. Each account is looked up once, by a function the
+//! caller gives: a read for a command, so the macOS Keychain asks once per
+//! entry, or a presence check for `owlshift doctor`.
 
 use owlshift_adapters::forge::Repo;
 use owlshift_platform::keychain::SERVICE;
