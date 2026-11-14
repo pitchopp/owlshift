@@ -23,23 +23,49 @@ use owlshift_adapters::graphql::{Response, RestAnswer, Transport};
 const RECORDED: &str =
     include_str!("../../owlshift-adapters/tests/fixtures/github-tracker/drain.json");
 
-/// A GitHub account: its login and numeric id.
+/// The account exchanges `GET user` and `GET user/<id>` answer from, which
+/// live check G7 replaces with recorded ones.
+const ACCOUNTS: &str =
+    include_str!("../../owlshift-adapters/tests/fixtures/github-tracker/account.json");
+
+/// A GitHub account: its login, numeric id and type.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Account {
     pub login: String,
     pub id: u64,
+    /// `User` for a person, `Bot` for an app's account.
+    pub kind: String,
 }
 
 impl Account {
+    /// A person's account.
     pub fn new(login: &str, id: u64) -> Self {
         Self {
             login: login.to_owned(),
             id,
+            kind: "User".to_owned(),
+        }
+    }
+
+    /// An app's account, of type `Bot`: never an operator's.
+    pub fn bot(login: &str, id: u64) -> Self {
+        Self {
+            kind: "Bot".to_owned(),
+            ..Self::new(login, id)
         }
     }
 
     fn json(&self) -> Value {
-        json!({ "login": self.login, "id": self.id, "type": "User" })
+        json!({ "login": self.login, "id": self.id, "type": self.kind })
+    }
+
+    /// The account an embedded `{ login, id, type }` object names.
+    fn from_json(value: &Value) -> Option<Self> {
+        Some(Self {
+            login: value["login"].as_str()?.to_owned(),
+            id: value["id"].as_u64()?,
+            kind: value["type"].as_str()?.to_owned(),
+        })
     }
 }
 
@@ -96,6 +122,27 @@ fn recorded(path: &str) -> Value {
         Some(items) => items[0].clone(),
         None => response.clone(),
     }
+}
+
+/// The answer of `ACCOUNTS`' exchange at `path` (`user` or `user/1`), its
+/// `login`, `id` and `type` set to `account`'s.
+fn account_answer(path: &str, account: &Account) -> Value {
+    let fixture: Value = serde_json::from_str(ACCOUNTS).expect("the account fixture");
+    let mut answer = fixture["exchanges"]
+        .as_array()
+        .expect("its exchanges")
+        .iter()
+        .find(|e| e["request"]["path"] == path)
+        .unwrap_or_else(|| panic!("no exchange of {path}"))["response"]
+        .clone();
+    for (key, value) in [
+        ("login", json!(account.login)),
+        ("id", json!(account.id)),
+        ("type", json!(account.kind)),
+    ] {
+        answer[key] = value;
+    }
+    answer
 }
 
 impl FakeIssues {
@@ -280,6 +327,23 @@ impl State {
         answer
     }
 
+    /// The accounts `GET user/<id>` knows: the viewer, and every author,
+    /// assignee and label actor of the issues.
+    fn accounts(&self) -> Vec<Account> {
+        let mut known = vec![self.viewer.clone()];
+        for issue in self.issues.values() {
+            known.push(issue.author.clone());
+            known.extend(issue.assignee.clone());
+            known.extend(
+                issue
+                    .events
+                    .iter()
+                    .filter_map(|e| Account::from_json(&e["actor"])),
+            );
+        }
+        known
+    }
+
     /// The open (or every, for `all`) issue carrying each of `labels`.
     fn list(&self, state: &str, labels: &[String]) -> Value {
         let found: Vec<Value> = self
@@ -305,6 +369,15 @@ impl State {
             .collect();
         if params.get("page").is_some_and(|page| page != "1") {
             return (200, json!([]));
+        }
+        if route == "user" {
+            return (200, account_answer("user", &self.viewer));
+        }
+        if let Some(id) = route.strip_prefix("user/") {
+            return match self.accounts().into_iter().find(|a| a.id.to_string() == id) {
+                Some(account) => (200, account_answer("user/1", &account)),
+                None => not_found(),
+            };
         }
         let prefix = format!("repos/{}/issues", self.repo);
         let Some(rest) = route.strip_prefix(&prefix) else {
@@ -526,5 +599,67 @@ mod tests {
         assert_eq!(fake.merged("Says hello.\n\nCloses #1"), Some(1));
         assert_eq!(fake.issue(1).state_reason.as_deref(), Some("completed"));
         assert_eq!(fake.merged("Says hello."), None);
+    }
+
+    /// The answer of `GET <path>` through the fake, as status and JSON.
+    fn read(fake: &FakeIssues, path: &str) -> (u16, Value) {
+        let answer = fake.get(path).unwrap();
+        let status = answer.status;
+        let mut text = String::new();
+        std::io::Read::read_to_string(&mut { answer.body }, &mut text).unwrap();
+        (status, serde_json::from_str(&text).unwrap())
+    }
+
+    /// `GET user` is the viewer and `GET user/<id>` each account the issues
+    /// hold, with the type it has, a 404 for any other; the account of a
+    /// comment POSTed through the fake is the one `GET user` names.
+    #[test]
+    fn the_accounts_are_the_viewers_and_those_the_issues_hold() {
+        let ann = Account::new("ann", 1);
+        let stranger = Account::new("stranger", 7);
+        let app = Account::bot("an-app[bot]", 9);
+        let fake = FakeIssues::new(
+            "demo/project",
+            ann.clone(),
+            "2026-11-12T15:00:00Z".parse().unwrap(),
+        );
+        fake.open(
+            1,
+            "One",
+            "Body",
+            &stranger,
+            Some(&ann),
+            &[("agent:ready", &app)],
+        );
+
+        let (status, me) = read(&fake, "user");
+        assert_eq!(
+            (status, me["id"].clone(), me["type"].clone()),
+            (200, json!(1), json!("User"))
+        );
+        assert_eq!(me["login"], "ann");
+        for (id, login, kind) in [
+            (1, "ann", "User"),
+            (7, "stranger", "User"),
+            (9, "an-app[bot]", "Bot"),
+        ] {
+            let (status, user) = read(&fake, &format!("user/{id}"));
+            assert_eq!(status, 200, "{id}");
+            assert_eq!(
+                (user["login"].as_str(), user["type"].as_str()),
+                (Some(login), Some(kind))
+            );
+            assert_eq!(user["id"], id);
+        }
+        assert_eq!(read(&fake, "user/99").0, 404);
+
+        let body = json!({ "body": "hello" });
+        let posted = Transport::post(&fake, "repos/demo/project/issues/1/comments", &body).unwrap();
+        let posted: Value = serde_json::from_str(&posted.body).unwrap();
+        assert_eq!(posted["user"]["id"], me["id"]);
+        assert_eq!(posted["user"]["login"], me["login"]);
+
+        let bot = FakeIssues::new("demo/project", app, "2026-11-12T15:00:00Z".parse().unwrap());
+        assert_eq!(read(&bot, "user").1["type"], "Bot");
     }
 }
