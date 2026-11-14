@@ -6,6 +6,7 @@
 # numeric id as text).
 #   G7a `GET /user` answers 200 with `login`, a numeric `id` and `type` "User".
 #   G7b `GET /user/{id}` of that id answers 200 with the same login, id and type; of an id no account holds, 404.
+#       Of another account (the repository's owner, or OWL552_OTHER_ID), 200 with a login: the read the UI makes of the decider.
 #   G7c An issue opened through the token with the signed-in account as assignee names that id as its assignee; a
 #       comment the token posts on it is that account's: `user.id` the same id, `user.type` "User", and the list of
 #       the issue's comments shows it with that author. The comment's `performed_via_github_app` is reported.
@@ -40,6 +41,9 @@ It signs in through the device flow (enter the code it shows), reads GET /user a
 GET /user/{id}, opens one issue assigned to you, posts one comment on it and compares the
 ids. At the end it deletes its comment and closes its issue as not planned. Paste everything
 it prints on standard output on OWL-552.
+
+OWL552_OTHER_ID=<id>  the account GET /user/{id} reads besides your own (default: the repository's
+              owner; set it when you own the sandbox, so the owner is you)
 EOF
 }
 
@@ -169,10 +173,20 @@ g7b() {
     status=$(rest unknown "user/$UNKNOWN_ID")
     report "G7b: GET user/<an id no account holds>: HTTP $status $(field .message "$WORK/unknown.body")"
     if [ "$status" != 404 ]; then fail "G7b: FAILED: an unknown id did not answer 404"; fi
+    # The UI reads another account's login by its id (the decider's, when the key is not theirs): by default the
+    # repository's owner, when it is not the signed-in account; OWL552_OTHER_ID names another one.
     other=${OWL552_OTHER_ID:-}
-    if [ -n "$other" ]; then
+    if [ -z "$other" ]; then
+        status=$(rest repo "repos/$REPO")
+        other=$(field .owner.id "$WORK/repo.body")
+        if [ "$other" = "$ME_ID" ]; then other=; fi
+    fi
+    if is_number "$other"; then
         status=$(rest other "user/$other")
-        report "G7b: GET user/<OWL552_OTHER_ID>: HTTP $status; type: $(field .type "$WORK/other.body"); login present: $(yes_no "$([ -n "$(field .login "$WORK/other.body")" ] && echo y)" y)"
+        report "G7b: GET user/<another account>: HTTP $status; type: $(field .type "$WORK/other.body"); login present: $(yes_no "$([ -n "$(field .login "$WORK/other.body")" ] && echo y)" y); a login other than the signed-in one: $(yes_no "$([ "$(field .login "$WORK/other.body")" != "$ME_LOGIN" ] && echo y)" y)"
+        if [ "$status" != 200 ]; then fail "G7b: FAILED: GET user/<another account> did not answer 200: $(field .message "$WORK/other.body")"; fi
+    else
+        report "G7b: GET user/<another account>: NOT CHECKED, the repository's owner is the signed-in account; run again with OWL552_OTHER_ID set to the id of another account"
     fi
 }
 

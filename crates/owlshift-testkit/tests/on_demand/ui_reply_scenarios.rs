@@ -533,7 +533,18 @@ fn the_form_is_absent_and_the_writer_refuses_for_another_github_account() {
             ReplyRefusal::AppKey,
         ),
     ] {
+        // The viewer's own copy of the issue: a reply the floor let through
+        // would land on it, so its comments are what the refusal keeps.
         let others = FakeIssues::new(REPO, viewer.clone(), start);
+        others.open(
+            1,
+            "Add a greeting",
+            "Add GREETING.md saying Hello.",
+            &maintainer(),
+            Some(&maintainer()),
+            &[("agent:ready", &maintainer())],
+        );
+        let posted = others.comments(1).len();
         let key = bench.github_key(&others);
         assert_eq!(key.account.app, viewer.kind == "Bot");
         let state = KeyState::Ready(bench.github_key(&others));
@@ -554,7 +565,7 @@ fn the_form_is_absent_and_the_writer_refuses_for_another_github_account() {
             "{refused:?}"
         );
         // Nothing was posted through the stranger's or the app's key.
-        assert!(others.numbers().is_empty());
+        assert_eq!(others.comments(1).len(), posted);
     }
     assert_eq!(issues.comments(1).len(), before);
 }
