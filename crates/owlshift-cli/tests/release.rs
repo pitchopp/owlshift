@@ -392,21 +392,96 @@ fn the_notices_hold_the_crates_and_the_fonts_or_nothing() {
     )
     .unwrap();
     fs::set_permissions(&cargo, fs::Permissions::from_mode(0o755)).unwrap();
+    // OWL-551: answers `--print sysroot` with FAKE_SYSROOT, `--version`, and
+    // fails when FAKE_RUSTC_FAIL is set.
+    let rustc = bin.join("rustc");
+    fs::write(
+        &rustc,
+        "#!/bin/sh\n\
+         [ -z \"${FAKE_RUSTC_FAIL:-}\" ] || exit 1\n\
+         case \"$1\" in\n\
+         --version) echo 'rustc 9.9.9 (stand-in)' ;;\n\
+         --print) echo \"$FAKE_SYSROOT\" ;;\n\
+         esac\n",
+    )
+    .unwrap();
+    fs::set_permissions(&rustc, fs::Permissions::from_mode(0o755)).unwrap();
+    let sysroot = dir.path().join("sysroot");
+    let doc = sysroot.join("share/doc/rust");
+    fs::create_dir_all(&doc).unwrap();
+    let html = doc.join("COPYRIGHT-library.html");
+    let pre = "Copyright (c) A <a@example.org>\n    indented line\nlast line";
+    fs::write(
+        &html,
+        "<html><head><title>T</title><style>p{}</style></head><body>\
+         <h1>Std notices</h1><script>var secret = 1;</script>\
+         <p>Fish &amp; chips</p>\
+         <pre>Copyright (c) A &lt;a@example.org&gt;\n    indented line\nlast line</pre>\
+         </body></html>",
+    )
+    .unwrap();
     let path = format!("{}:{}", bin.display(), std::env::var("PATH").unwrap());
     let args = dir.path().join("args");
     let out = dir.path().join("out");
-    let run = |fail: &str| {
+    let targets = [
+        "aarch64-apple-darwin",
+        "x86_64-apple-darwin",
+        "x86_64-unknown-linux-musl",
+        "aarch64-unknown-linux-musl",
+    ];
+    let run_with = |fail: &str, rustc_fail: &str, targets: &[&str]| {
+        let mut argv = vec![out.to_str().unwrap()];
+        argv.extend_from_slice(targets);
         sh(
             &script,
-            &[out.to_str().unwrap(), "x86_64-unknown-linux-musl"],
+            &argv,
             &[
                 ("PATH", path.as_str()),
                 ("FAKE_ARGS", args.to_str().unwrap()),
                 ("FAKE_FAIL", fail),
+                ("FAKE_RUSTC_FAIL", rustc_fail),
+                ("FAKE_SYSROOT", sysroot.to_str().unwrap()),
             ],
         )
     };
+    let run = |fail: &str| run_with(fail, "", &["x86_64-unknown-linux-musl"]);
     let file = out.join("x86_64-unknown-linux-musl/THIRD-PARTY-NOTICES.txt");
+
+    // Every target's file holds the std section after the fonts, as text;
+    // only the Linux files hold musl's.
+    let all = run_with("", "", &targets);
+    assert!(all.status.success(), "{}", text(&all.stderr));
+    let musl = fs::read_to_string(root().join("scripts/release/musl-COPYRIGHT")).unwrap();
+    let fonts_dir = root().join("crates/owlshift-runner/src/ui/assets/fonts");
+    let last_font = fs::read_to_string(fonts_dir.join("OFL-JetBrainsMono.txt")).unwrap();
+    let rule = "=".repeat(80);
+    for target in targets {
+        let notices = fs::read_to_string(out.join(target).join("THIRD-PARTY-NOTICES.txt")).unwrap();
+        let header = format!(
+            "{rule}\nThe Rust standard library (COPYRIGHT-library.html of rustc 9.9.9 (stand-in))\n\n"
+        );
+        let at = notices
+            .find(&header)
+            .unwrap_or_else(|| panic!("{target}: no std section"));
+        assert!(
+            at > notices.find(&last_font).unwrap(),
+            "{target}: std follows the fonts"
+        );
+        let section = &notices[at + header.len()..];
+        let std = section.split(&rule).next().unwrap();
+        assert!(std.contains("Std notices"), "{target}: {std}");
+        assert!(std.contains("Fish & chips"), "{target}: {std}");
+        assert!(std.contains(pre), "{target}: <pre> is kept as it is: {std}");
+        assert!(!std.contains("secret") && !std.contains("<h1>") && !std.contains("&amp;"));
+        let linux = target.ends_with("-linux-musl");
+        assert_eq!(
+            notices.contains(&format!(
+                "{rule}\nmusl libc (scripts/release/musl-COPYRIGHT)\n\n{musl}"
+            )),
+            linux,
+            "{target}: musl only on Linux"
+        );
+    }
 
     let written = run("");
     assert!(written.status.success(), "{}", text(&written.stderr));
@@ -441,12 +516,53 @@ fn the_notices_hold_the_crates_and_the_fonts_or_nothing() {
         text(&refused.stderr)
     );
     assert!(!file.exists(), "no notices are left behind");
-    assert_eq!(
+    let left = || {
         fs::read_dir(out.join("x86_64-unknown-linux-musl"))
             .unwrap()
-            .count(),
-        0
+            .count()
+    };
+    assert_eq!(left(), 0);
+
+    // A std notice that is missing, converts to nothing, or cannot be
+    // located leaves no file either.
+    let saved = fs::read_to_string(&html).unwrap();
+    let written_before = || {
+        let ok = run("");
+        assert!(ok.status.success(), "{}", text(&ok.stderr));
+        assert!(file.exists(), "a file from an earlier run exists");
+    };
+    written_before();
+    fs::write(&html, "<html><script>x</script> \n</html>").unwrap();
+    let empty = run("");
+    assert!(!empty.status.success());
+    assert!(
+        text(&empty.stderr).contains("standard library notice"),
+        "{}",
+        text(&empty.stderr)
     );
+    assert!(!file.exists());
+    assert_eq!(left(), 0);
+    fs::write(&html, &saved).unwrap();
+    written_before();
+    fs::remove_file(&html).unwrap();
+    let missing = run("");
+    assert!(!missing.status.success());
+    assert!(!file.exists());
+    assert_eq!(left(), 0);
+    fs::write(&html, saved).unwrap();
+    written_before();
+    let no_rustc = run_with("", "1", &["x86_64-unknown-linux-musl"]);
+    assert!(!no_rustc.status.success());
+    assert!(!file.exists());
+    assert_eq!(left(), 0);
+}
+
+/// The vendored musl notice is the licence text, with its version first.
+#[test]
+fn the_vendored_musl_notice_names_its_version_and_holds_the_licence() {
+    let musl = read("scripts/release/musl-COPYRIGHT");
+    assert!(musl.starts_with("musl "), "{musl}");
+    assert!(musl.contains("standard MIT license"));
 }
 
 /// `formula.yml` (OWL-549), which only a published release runs: it commits
