@@ -27,12 +27,14 @@ pub const STOP_POLL: Duration = Duration::from_millis(250);
 /// The entries of the data directory Owlshift makes, by their exact names:
 /// each project's folder (its dedicated clone, worktrees, run logs, ticket
 /// folders and obligations), the service's files, the usage and slot files,
-/// the event log and its lock; and Finder's `.DS_Store`.
-const OWN_ENTRIES: [&str; 7] = [
+/// the copies typed watches run their steps from (OWL-560), the event log
+/// and its lock; and Finder's `.DS_Store`.
+const OWN_ENTRIES: [&str; 8] = [
     "projects",
     "service",
     "usage",
     "slots",
+    "pinned",
     events::EVENTS_FILE,
     events::LOCK_FILE,
     ".DS_Store",
@@ -465,6 +467,7 @@ mod tests {
         drop(dirs.lock().unwrap().unwrap());
         for file in [
             "slots/1.lock",
+            "pinned/41/owlshift",
             "usage/claude.json",
             "events.jsonl",
             "events.lock",

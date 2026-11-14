@@ -169,26 +169,38 @@ const PIN_CHECK_WAIT: Duration = Duration::from_secs(30);
 /// copy would otherwise run every child on another build than the daemon's.
 /// Refused so, the daemon ends, and the next start runs the new binary.
 fn pinned_is_own_build(pinned: &OwnProgram) -> Result<(), String> {
-    let refused = |why: String| {
-        format!(
+    match pinned_build_differs(pinned, "daemon") {
+        None => Ok(()),
+        Some(why) => Err(format!(
             "the copy of this program that every watch runs, {}, {why}: the daemon ends rather \
              than run its watches on another build; started again, it runs the binary now at {}",
             pinned.spawn.display(),
             pinned.path.display()
-        )
+        )),
+    }
+}
+
+/// Why `pinned`, a copy of this program pinned for the processes it starts,
+/// is not this build, `by` naming what pinned it ("daemon", "watch"): none
+/// when it is (OWL-553, OWL-560).
+pub(crate) fn pinned_build_differs(pinned: &OwnProgram, by: &str) -> Option<String> {
+    let captured = match owlshift_platform::process::run(
+        &pinned.spawn,
+        &["--version"],
+        None,
+        PIN_CHECK_WAIT,
+    ) {
+        Ok(captured) => captured,
+        Err(error) => return Some(format!("did not tell its build ({error})")),
     };
-    let captured =
-        owlshift_platform::process::run(&pinned.spawn, &["--version"], None, PIN_CHECK_WAIT)
-            .map_err(|error| refused(format!("did not tell its build ({error})")))?;
     let said = String::from_utf8_lossy(&captured.stdout);
     if captured.success() && names_own_build(&said) {
-        return Ok(());
+        return None;
     }
-    Err(refused(format!(
-        "is not this daemon's build ({}), the binary having been replaced as the daemon \
-         started",
+    Some(format!(
+        "is not this {by}'s build ({}), the binary having been replaced as the {by} started",
         own_build().short()
-    )))
+    ))
 }
 
 /// Whether `said`, what a binary printed for `--version`, names this
