@@ -685,12 +685,13 @@ fn run_with(
                 // Each step in a child, this binary itself (OWL-399), on the
                 // served project's kept file when served (OWL-434): the one
                 // this process runs, where the system can tell, even once
-                // replaced on disk (OWL-435).
-                let program = owlshift_platform::process::own_program()
-                    .map(|own| own.spawn)
-                    .map_err(|error| {
-                        format!("this program's own path, which runs each step: {error}")
-                    })?;
+                // replaced on disk (OWL-435). A typed watch pins its own
+                // copy (OWL-560); it stays bound until the loop below has
+                // reaped every child, and goes when this branch returns.
+                let step_program = step_program(data_dir, served.is_some(), &|pinned| {
+                    crate::service_cmd::pinned_build_differs(pinned, "watch")
+                })?;
+                let program = step_program.spawn.clone();
                 let served_repo = served.map(|served| served.repo.clone());
                 // Each takes one of the machine's run slots (OWL-409).
                 let children = Children::new(move |ticket, envelope| {
@@ -723,6 +724,76 @@ fn run_with(
         &outcome,
         &mut sink,
     )))
+}
+
+/// What a drain spawns its steps from, and the copy it keeps for them.
+struct StepProgram {
+    /// The program each step runs.
+    spawn: PathBuf,
+    /// The typed watch's copy, removed when this is dropped: held while a
+    /// step may still start.
+    _pinned: Option<owlshift_platform::process::Pinned>,
+}
+
+/// Where a watch typed in a terminal keeps the copy of its binary that its
+/// steps run (OWL-560): `<data>/pinned/<pid>/`, beside the copies of the
+/// other typed watches; the daemon's is in `<data>/service/pinned/`.
+#[cfg(unix)]
+fn typed_pinned_dir(data_dir: &Path) -> PathBuf {
+    data_dir.join("pinned")
+}
+
+/// The program a drain's steps run (architecture section 5, "An upgrade").
+/// A served watch runs the daemon's copy already, so its own binary is
+/// that copy. A watch typed in a terminal pins its binary (OWL-560): on
+/// macOS a copy in `<data>/pinned/<pid>/`, refused, the copy removed, when
+/// `differs`, the build check, finds it is not this build. On Windows its
+/// own path, which no upgrade runs under it there.
+fn step_program(
+    data_dir: &Path,
+    served: bool,
+    differs: &dyn Fn(&owlshift_platform::process::OwnProgram) -> Option<String>,
+) -> Result<StepProgram, String> {
+    #[cfg(unix)]
+    if !served {
+        return pin_typed(data_dir, differs);
+    }
+    #[cfg(not(unix))]
+    let _ = (data_dir, served, differs);
+    let own = owlshift_platform::process::own_program()
+        .map_err(|error| format!("this program's own path, which runs each step: {error}"))?;
+    Ok(StepProgram {
+        spawn: own.spawn,
+        _pinned: None,
+    })
+}
+
+/// [`step_program`] of a watch typed in a terminal.
+#[cfg(unix)]
+fn pin_typed(
+    data_dir: &Path,
+    differs: &dyn Fn(&owlshift_platform::process::OwnProgram) -> Option<String>,
+) -> Result<StepProgram, String> {
+    let dir = typed_pinned_dir(data_dir);
+    let pinned = owlshift_platform::process::pin_own_program_among(&dir).map_err(|error| {
+        format!(
+            "the copy of this program that each step runs, in {}: {error}",
+            dir.display()
+        )
+    })?;
+    if let Some(why) = differs(&pinned.program) {
+        // `pinned` goes as this returns, and its copy with it.
+        return Err(format!(
+            "the copy of this program that each step runs, {}, {why}: the watch ends rather than \
+             run its steps on another build; started again, it runs the binary now at {}",
+            pinned.program.spawn.display(),
+            pinned.program.path.display()
+        ));
+    }
+    Ok(StepProgram {
+        spawn: pinned.program.spawn.clone(),
+        _pinned: Some(pinned),
+    })
 }
 
 /// Shares the served lock of `repo`'s project in `data_dir` for a watch typed
@@ -1290,5 +1361,56 @@ mod refusals {
                 "acme/web"
             ]
         );
+    }
+}
+
+/// OWL-560: the program a drain's steps run.
+#[cfg(all(test, unix))]
+mod step_programs {
+    use super::{step_program, typed_pinned_dir};
+
+    /// A watch typed in a terminal runs its steps from a copy of its own
+    /// binary on macOS, which no upgrade replaces, removed at its end; on
+    /// Linux from `/proc/self/exe`, with no copy.
+    #[test]
+    fn a_typed_watch_runs_its_steps_from_its_own_pinned_build() {
+        let data = tempfile::tempdir().unwrap();
+        let step = step_program(data.path(), false, &|_| None).unwrap();
+        let exe = std::env::current_exe().unwrap();
+        let folder = typed_pinned_dir(data.path()).join(std::process::id().to_string());
+        if cfg!(target_os = "macos") {
+            assert_eq!(step.spawn, folder.join(exe.file_name().unwrap()));
+            assert!(step.spawn.is_file());
+        } else {
+            assert_eq!(step.spawn, std::path::PathBuf::from("/proc/self/exe"));
+        }
+        assert!(step._pinned.is_some());
+        drop(step);
+        assert!(!folder.exists());
+    }
+
+    /// A copy of another build refuses the watch, and goes.
+    #[test]
+    fn a_typed_watch_refuses_a_copy_of_another_build() {
+        let data = tempfile::tempdir().unwrap();
+        let refused = step_program(data.path(), false, &|_| Some("is another".to_owned()))
+            .err()
+            .unwrap();
+        assert!(refused.contains("is another: the watch ends"), "{refused}");
+        let folder = typed_pinned_dir(data.path()).join(std::process::id().to_string());
+        assert!(!folder.exists());
+    }
+
+    /// A served watch already runs the daemon's copy: no second one.
+    #[test]
+    fn a_served_watch_makes_no_copy() {
+        let data = tempfile::tempdir().unwrap();
+        let step = step_program(data.path(), true, &|_| panic!("no copy to check")).unwrap();
+        assert_eq!(
+            step.spawn,
+            owlshift_platform::process::own_program().unwrap().spawn
+        );
+        assert!(step._pinned.is_none());
+        assert!(!typed_pinned_dir(data.path()).exists());
     }
 }
