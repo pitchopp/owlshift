@@ -226,6 +226,9 @@ use owlshift_contracts::config::Admit;
 use owlshift_contracts::ids::TicketId;
 
 pub use crate::graphql::{Response, Transport};
+/// Moved to the parent module when GitHub Issues got a key too (OWL-552);
+/// kept here so every path that reads it as Linear's still resolves.
+pub use crate::tracker::KeyAccount;
 use crate::tracker::{
     Author, Blocker, Capability, Column, Comment, Document, Error, ErrorKind, Filed, Found,
     Gesture, Linked, LinkedState, Links, Listed, MAX_DOCUMENT_CHARS, PROPOSED_LABEL, Person,
@@ -515,22 +518,6 @@ impl LinearTracker {
         one_page(&team)?;
         Ok(team.states.nodes.into_iter().map(|s| s.name).collect())
     }
-}
-
-/// The account of the API key the adapter reads with, and its workspace:
-/// what the local web UI reads once per served project to tell whether the
-/// operator's key is the decider of a ticket's open ask (architecture
-/// section 5, "Replies from the UI").
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct KeyAccount {
-    /// The account's identifier, the one an ask's decider holds.
-    pub id: String,
-    /// The name Linear shows for it.
-    pub name: String,
-    /// Whether it is an app user: a key of an app is never an operator's.
-    pub app: bool,
-    /// The workspace's URL key, as in `https://linear.app/<workspace>/…`.
-    pub workspace: String,
 }
 
 impl LinearTracker {

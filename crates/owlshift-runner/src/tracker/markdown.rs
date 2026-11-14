@@ -8,11 +8,12 @@ use owlshift_adapters::forge::Repo;
 use owlshift_adapters::tracker::linear::AdmissionFacts;
 use owlshift_adapters::tracker::markdown::MarkdownTracker;
 use owlshift_adapters::tracker::{Capability, Tracker};
-use owlshift_contracts::config::{self, ProjectConfig};
+use owlshift_contracts::config::{self, PersonalConfig, ProjectConfig};
 use owlshift_contracts::ids::TicketId;
 use owlshift_platform::keychain::Secret;
 
 use super::{Connected, Doctored, ForgeCredential, Kind, Opener, Setup, StatesError};
+use crate::config::FileState;
 use crate::doctor::{Check, DOES_NOT_BLOCK, Section};
 use crate::init::SecretSpec;
 use crate::secrets::{SecretSet, TrackerAccounts, TrackerSecrets};
@@ -113,9 +114,16 @@ kind = \"markdown\"
         })
     }
 
-    fn reply_key(&self, _repo: &Repo) -> Result<Key, String> {
+    fn reply_key(
+        &self,
+        _data: &Path,
+        _repo: &Repo,
+        _config: &ProjectConfig,
+        _personal: &FileState<PersonalConfig>,
+    ) -> Result<Key, String> {
         Err(
-            "the project's tracker is not Linear: a reply from the UI goes through a Linear key"
+            "the project's tracker is the Markdown tracker: it has no account a reply from the UI \
+             could go through"
                 .into(),
         )
     }

@@ -18,6 +18,11 @@ mod github;
 mod linear;
 mod markdown;
 
+/// The reply key of a GitHub Issues project from two opened forges of its
+/// credential (OWL-552): what `Kind::reply_key` builds once it has opened
+/// them, public so that a bench builds the same key over a fake.
+pub use github::key_of as github_key;
+
 use std::any::Any;
 use std::fmt;
 use std::path::Path;
@@ -29,10 +34,11 @@ use owlshift_adapters::tracker::github::{GitHubTracker, IssuesAccess};
 use owlshift_adapters::tracker::linear::app::{AppTransport, ClientCredentials, HttpOAuth};
 use owlshift_adapters::tracker::linear::{AdmissionFacts, ApiKey, AppUser, LinearTracker};
 use owlshift_adapters::tracker::{AccountFact, Capability, ErrorKind};
-use owlshift_contracts::config::{self, ProjectConfig, TrackerKind};
+use owlshift_contracts::config::{self, PersonalConfig, ProjectConfig, TrackerKind};
 use owlshift_contracts::ids::TicketId;
 use owlshift_platform::keychain::{Keychain, SERVICE, Secret};
 
+use crate::config::FileState;
 use crate::doctor::Check;
 use crate::init::SecretSpec;
 use crate::refusal::Refusal;
@@ -112,9 +118,18 @@ pub trait Kind: Sync {
     ) -> Option<Check>;
 
     /// The operator's key that the UI posts a decider's reply through, for
-    /// the project of `repo`, opened with its account read once
-    /// ([`crate::ui::reply::open_key`]); the error says why there is none.
-    fn reply_key(&self, repo: &Repo) -> Result<crate::ui::reply::Key, String>;
+    /// the project of `repo` served from `data` on `config`, opened with its
+    /// account read once ([`crate::ui::reply::open_key`]); the error says why
+    /// there is none. Linear's is the API key `init` stored, GitHub Issues'
+    /// the forge credential, which needs the personal file's GitHub App
+    /// settings (`personal`) to refresh the App's token (OWL-552).
+    fn reply_key(
+        &self,
+        data: &Path,
+        repo: &Repo,
+        config: &ProjectConfig,
+        personal: &FileState<PersonalConfig>,
+    ) -> Result<crate::ui::reply::Key, String>;
 
     /// Whether `owlshift init` stores the client ID and secret of an app the
     /// tracker writes as (OWL-157).

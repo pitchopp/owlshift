@@ -343,6 +343,25 @@ pub struct LinkedState {
 /// section 6, "A proposals inbox for follow-ups").
 pub const PROPOSED_LABEL: &str = "agent:proposed";
 
+/// The account of the credential the operator holds for a tracker, and its
+/// workspace: what the local web UI reads once per served project to tell
+/// whether the operator is the decider of a ticket's open ask (architecture
+/// section 5, "Replies from the UI"). Linear reads it from its API key
+/// ([`linear::LinearTracker::key_account`]), GitHub Issues from the forge
+/// credential ([`github::GitHubTracker::key_account`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct KeyAccount {
+    /// The account's identifier, the one an ask's decider holds.
+    pub id: String,
+    /// The name the tracker shows for it.
+    pub name: String,
+    /// Whether it is an app user: a key of an app is never an operator's.
+    pub app: bool,
+    /// Linear's workspace URL key, as in `https://linear.app/<workspace>/…`;
+    /// empty on a tracker with no workspace, which gives the page no link.
+    pub workspace: String,
+}
+
 /// One account a tracker knows, as doctor's admission line reads it: a
 /// workspace's on Linear (OWL-155), a GitHub account on GitHub Issues
 /// (OWL-537).

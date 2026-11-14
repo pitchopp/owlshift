@@ -8,12 +8,15 @@
 use owlshift_adapters::graphql::Response as GraphQlResponse;
 use owlshift_adapters::tracker::linear::{KeyAccount, LinearTracker};
 use owlshift_core::floor::{FloorViolation, ReplyRefusal};
+use owlshift_runner::tracker::github_key;
 use owlshift_runner::ui::reply::{
     Answer, Choice, ComposeError, Form, Key, KeyState, ReplyError, section, send,
 };
 use owlshift_runner::writer::WriteError;
+use owlshift_testkit::issues::Account;
 
 use super::design_scenarios::{REVISED, answered, designed, reviewed};
+use super::drain_scenarios::done_for;
 use super::*;
 
 /// The operator's key on the bench: the Markdown tracker, its comments
@@ -357,4 +360,212 @@ fn a_plan_changed_from_the_ui_goes_back_to_design() {
     let kept = bench.record().plan.unwrap();
     assert!(kept.plan.approach.contains("the word checked"));
     assert!(kept.approval.is_none());
+}
+
+// GitHub Issues (OWL-552): the same reply on a bench whose tracker is the
+// real GitHub Issues adapter over the Issues fake, the key built as
+// `Kind::reply_key` builds it, from the credential's forge.
+
+/// The decider, the project's viewer on the fake, a person.
+fn maintainer() -> Account {
+    Account::new("maintainer", 1)
+}
+
+/// The ticket of the GitHub bench: issue #1.
+fn issue() -> TicketId {
+    TicketId::new("1").unwrap()
+}
+
+/// A GitHub Issues bench whose issue #1, assigned to the maintainer, was
+/// taken by `owlshift do 1`, whose Build asked `LETTERED`.
+fn github_asked() -> (Bench, FakeIssues) {
+    let start = "2026-10-02T08:00:00Z".parse().unwrap();
+    let issues = FakeIssues::new(REPO, maintainer(), start);
+    issues.open(
+        1,
+        "Add a greeting",
+        "Add GREETING.md saying Hello.",
+        &maintainer(),
+        Some(&maintainer()),
+        &[("agent:ready", &maintainer())],
+    );
+    let bench = Bench::on_github_issues(&maintainer(), &issues);
+    let replies = vec![bench.reply(None, Some(LETTERED))];
+    let (asked, printed) = bench.with_on_demand(replies, None, Vec::new(), |on_demand, sink| {
+        on_demand.run(&issue(), sink)
+    });
+    assert!(
+        matches!(&asked, Err(Stop::NeedsInput { posted: Ok(_), .. })),
+        "{asked:?}\n{printed}"
+    );
+    (bench, issues)
+}
+
+impl Bench {
+    /// What the ticket ref of issue #1 holds.
+    fn issue_record(&self) -> TicketRecord {
+        self.record_of("1").expect("a ticket ref")
+    }
+
+    /// The reply key of the project as `Kind::reply_key` builds it once its
+    /// credential is open: two forges over `issues`, whose token is its
+    /// viewer's.
+    fn github_key(&self, issues: &FakeIssues) -> Key {
+        let config_text = fs::read_to_string(self.remote.checkout.join("owlshift.toml")).unwrap();
+        let config = ProjectConfig::parse(&config_text).unwrap();
+        let forge = || GitHubForge::with_transport(issues.clone(), Repo::parse(REPO).unwrap());
+        github_key(forge(), forge(), &config.tracker).unwrap()
+    }
+
+    /// The form answering the newest ask of issue #1.
+    fn issue_form(&self, answers: Vec<Answer>, go: bool) -> Form {
+        let record = self.issue_record();
+        Form {
+            ask: record
+                .questions
+                .asks
+                .last()
+                .expect("an ask")
+                .comment
+                .clone(),
+            answers,
+            go,
+        }
+    }
+}
+
+/// The acceptance (OWL-552): on a GitHub Issues project the decider's key is
+/// the credential's account, `GET user`; the form is offered to them, a reply
+/// sent from the UI lands as a comment on the issue, authored by that
+/// account with no Owlshift marker, the answer check's brief reads it as the
+/// decider's, counts it at once for its `go`, and the ticket resumes and
+/// delivers. The page links no issue.
+#[test]
+fn a_reply_from_the_ui_lands_on_the_github_issue_and_resumes_it() {
+    let (bench, issues) = github_asked();
+    let key = bench.github_key(&issues);
+    assert_eq!(key.account.id, "1");
+    assert_eq!(key.account.name, "maintainer");
+    assert!(!key.account.app && key.account.workspace.is_empty());
+    let offer = section(
+        &bench.issue_record(),
+        &KeyState::Ready(bench.github_key(&issues)),
+        &issue(),
+        &|_| None,
+    );
+    assert_eq!(offer["offered"], true, "{offer:#}");
+    assert_eq!(offer["decider"]["account"], "1");
+    assert!(offer["link"].is_null(), "{offer:#}");
+
+    let before = issues.comments(1).len();
+    let form = bench.issue_form(vec![pick("Q1", "B", ""), recommended("Q2")], true);
+    let posted = send(
+        key.tracker.as_ref(),
+        &key.account,
+        &bench.issue_record(),
+        &issue(),
+        &form,
+    )
+    .unwrap();
+    assert_eq!(posted.body, "Q1: B\nQ2: B\n\ngo");
+
+    // On the issue: one more comment, the key's account's, no marker.
+    let comments = issues.comments(1);
+    assert_eq!(comments.len(), before + 1);
+    let landed = comments.last().unwrap();
+    assert_eq!(landed["body"], "Q1: B\nQ2: B\n\ngo");
+    assert_eq!(landed["user"]["id"], 1);
+    assert_eq!(landed["user"]["login"], "maintainer");
+    assert!(!landed["body"].as_str().unwrap().contains("[owlshift]"));
+
+    // Read at once: only `go` makes it count.
+    bench.waited.set(SignedDuration::ZERO);
+    let both = check(&[
+        ("Q1", "answered", "B, French."),
+        ("Q2", "answered", "B, no sign-off."),
+    ]);
+    let replies = vec![
+        bench.reply(None, Some(&both)),
+        bench.reply(Some("Hello"), Some(&done_for("1"))),
+    ];
+    let (delivered, printed) =
+        bench.with_on_demand(replies, None, Vec::new(), |on_demand, sink| {
+            on_demand.continue_ticket(&issue(), sink)
+        });
+    delivered.unwrap_or_else(|stop| panic!("{stop}\n{printed}"));
+    let check_brief = bench
+        .briefs()
+        .into_iter()
+        .rfind(|brief| brief.role == Role::AnswerCheck)
+        .expect("the answer check ran");
+    assert_eq!(
+        Bench::decider_comments(&check_brief),
+        ["Q1: B\nQ2: B\n\ngo"]
+    );
+    let last = issues.comments(1).pop().unwrap();
+    assert!(
+        last["body"]
+            .as_str()
+            .unwrap()
+            .starts_with("[owlshift] DELIVERY"),
+        "{last}"
+    );
+}
+
+/// A key of another account than the ask's decider: no form, the Writer
+/// refuses the reply, and the issue's comments are as they were. A key of an
+/// app (type `Bot`) is no operator's either.
+#[test]
+fn the_form_is_absent_and_the_writer_refuses_for_another_github_account() {
+    let (bench, issues) = github_asked();
+    let record = bench.issue_record();
+    let start = "2026-10-02T09:00:00Z".parse().unwrap();
+    let before = issues.comments(1).len();
+    for (viewer, why, refusal) in [
+        (
+            Account::new("stranger", 7),
+            "not the decider's",
+            ReplyRefusal::NotTheDecider,
+        ),
+        (
+            Account::bot("owl-shift[bot]", 1),
+            "app",
+            ReplyRefusal::AppKey,
+        ),
+    ] {
+        // The viewer's own copy of the issue: a reply the floor let through
+        // would land on it, so its comments are what the refusal keeps.
+        let others = FakeIssues::new(REPO, viewer.clone(), start);
+        others.open(
+            1,
+            "Add a greeting",
+            "Add GREETING.md saying Hello.",
+            &maintainer(),
+            Some(&maintainer()),
+            &[("agent:ready", &maintainer())],
+        );
+        let posted = others.comments(1).len();
+        let key = bench.github_key(&others);
+        assert_eq!(key.account.app, viewer.kind == "Bot");
+        let state = KeyState::Ready(bench.github_key(&others));
+        let offer = section(&record, &state, &issue(), &|_| None);
+        assert_eq!(offer["offered"], false, "{offer:#}");
+        assert!(
+            offer["why_not"].as_str().unwrap().contains(why),
+            "{offer:#}"
+        );
+        assert!(offer["link"].is_null());
+        let form = bench.issue_form(vec![pick("Q1", "B", "")], true);
+        let refused = send(key.tracker.as_ref(), &key.account, &record, &issue(), &form);
+        assert!(
+            matches!(
+                &refused,
+                Err(ReplyError::Write(WriteError::Floor(FloorViolation::Reply(r)))) if *r == refusal
+            ),
+            "{refused:?}"
+        );
+        // Nothing was posted through the stranger's or the app's key.
+        assert_eq!(others.comments(1).len(), posted);
+    }
+    assert_eq!(issues.comments(1).len(), before);
 }

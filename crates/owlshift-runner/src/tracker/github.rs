@@ -6,12 +6,14 @@
 //! through a probe of its own ([`Probe`], OWL-544).
 
 use std::path::Path;
+use std::sync::Arc;
 
 use owlshift_adapters::forge::Repo;
+use owlshift_adapters::forge::github::GitHubForge;
 use owlshift_adapters::tracker::github::{GitHubTracker, IssuesAccess};
 use owlshift_adapters::tracker::linear::AdmissionFacts;
 use owlshift_adapters::tracker::{Capability, PROPOSED_LABEL, Tracker};
-use owlshift_contracts::config::{self, Admit, ProjectConfig};
+use owlshift_contracts::config::{self, Admit, PersonalConfig, ProjectConfig};
 use owlshift_contracts::ids::TicketId;
 use owlshift_platform::keychain::{Keychain, Secret};
 
@@ -19,8 +21,11 @@ use super::{
     AdmissionWords, Connected, Doctored, ForgeCredential, GithubFacts, Kind, Opener, Probe, Probed,
     Setup, StatesError,
 };
+use crate::config::FileState;
 use crate::doctor::{Check, DOES_NOT_BLOCK, Section, Step};
+use crate::forge::AppAccess;
 use crate::init::SecretSpec;
+use crate::project::ProjectDirs;
 use crate::secrets::{SecretSet, TrackerAccounts, TrackerSecrets};
 use crate::system::System;
 use crate::ui::reply::Key;
@@ -139,12 +144,36 @@ kind = \"github\"
         })
     }
 
-    fn reply_key(&self, _repo: &Repo) -> Result<Key, String> {
-        Err(
-            "the project's tracker is GitHub Issues: a reply from the UI goes through a Linear \
-             key, and the UI cannot reply on GitHub yet"
-                .into(),
-        )
+    /// The project's forge credential, opened as `owlshift do` opens it:
+    /// the GitHub App's user token, refreshed under the project's account
+    /// lock so a long-lived UI keeps posting after the token's 8 hours, or
+    /// the personal token. Both act as the signed-in person, so a comment
+    /// through the adapter is theirs (G1) and `GET user` names its account
+    /// (OWL-552).
+    fn reply_key(
+        &self,
+        data: &Path,
+        repo: &Repo,
+        config: &ProjectConfig,
+        personal: &FileState<PersonalConfig>,
+    ) -> Result<Key, String> {
+        let keychain =
+            Arc::new(Keychain::system().map_err(|e| format!("the keychain cannot be read: {e}"))?);
+        let mut look = |account: &str| keychain.read(account).map_err(|e| e.to_string());
+        let found = crate::secrets::forge(repo, &mut look)?;
+        let access = AppAccess {
+            keychain: keychain.clone(),
+            lock: ProjectDirs::new(data, repo).account_lock_file(),
+            app: crate::forge::GitHubApp::from_personal(match personal {
+                FileState::Loaded { config, .. } => Some(config),
+                _ => None,
+            }),
+        };
+        let open = || {
+            crate::forge::github(&found, repo.clone(), &access)
+                .map_err(|refusal| refusal.to_string())
+        };
+        key_of(open()?, open()?, &config.tracker)
     }
 
     fn stores_app(&self) -> bool {
@@ -403,6 +432,26 @@ impl crate::system::fake::FakeSystem {
     }
 }
 
+/// The reply key of a GitHub Issues project from two opened forges of the
+/// same credential: `writer` posts through the adapter, `reader` reads the
+/// key's own account and, later, the name of another (as Linear's opens two
+/// adapters, so the key's reads never wait on a post).
+pub fn key_of(
+    writer: GitHubForge,
+    reader: GitHubForge,
+    tracker: &config::Tracker,
+) -> Result<Key, String> {
+    let reader = GitHubTracker::new(reader, tracker);
+    let account = reader
+        .key_account()
+        .map_err(|e| format!("the GitHub account of the project's token could not be read: {e}"))?;
+    Ok(Key {
+        account,
+        tracker: Box::new(GitHubTracker::new(writer, tracker)),
+        names: Box::new(move |id: &str| reader.account_name(id).map_err(|e| e.to_string())),
+    })
+}
+
 /// Doctor's lines and admission facts from what the repository answered.
 fn doctored(
     tracker: &config::Tracker,
@@ -557,7 +606,13 @@ mod tests {
         }
 
         fn post(&self, path: &str, body: &Value) -> Result<Response, String> {
-            let (status, answer) = self.answer(format!("POST {path} {}", body["name"]));
+            // A label is named by its `name`; any other write by its body.
+            let said = if body["name"].is_null() {
+                body.to_string()
+            } else {
+                body["name"].to_string()
+            };
+            let (status, answer) = self.answer(format!("POST {path} {said}"));
             Ok(Response::new(status, answer))
         }
     }
@@ -638,6 +693,102 @@ mod tests {
             "{error}"
         );
         assert_eq!(refused.calls.lock().unwrap().len(), 1);
+    }
+
+    const ISSUE: &str = "repos/demo/project/issues/7";
+
+    /// The reply key of a GitHub Issues project is the credential's own
+    /// account (OWL-552): the forge's `GET user` gives its numeric id, its
+    /// login and its type; a comment posted through the key's tracker is
+    /// read back under that account; another account's name is read by its
+    /// id, an unknown one is none.
+    #[test]
+    fn the_reply_key_is_the_forges_account_and_posts_as_it() {
+        let repo = Repo::parse("demo/project").unwrap();
+        let tracker = github_tracker();
+        let bea = json!({ "login": "bea", "id": 2, "type": "User" });
+        let comment = json!({
+            "id": 50,
+            "issue_url": format!("https://api.github.com/{ISSUE}"),
+            "user": bea,
+            "created_at": "2026-11-13T10:00:00Z",
+            "updated_at": "2026-11-13T10:00:00Z",
+            "body": "Q1: B",
+        });
+        let rest = Rest::new(&[
+            ("GET user", 200, bea.clone()),
+            (
+                "GET user/3",
+                200,
+                json!({ "login": "cy", "id": 3, "type": "User" }),
+            ),
+            ("GET user/4", 404, json!({ "message": "Not Found" })),
+            (
+                "GET repos/demo/project/issues/7",
+                200,
+                json!({
+                    "url": format!("https://api.github.com/{ISSUE}"),
+                    "number": 7,
+                    "title": "Say hello",
+                    "body": null,
+                    "user": bea,
+                    "assignees": [bea],
+                    "labels": [],
+                    "state": "open",
+                }),
+            ),
+            (
+                "POST repos/demo/project/issues/7/comments {\"body\":\"Q1: B\"}",
+                201,
+                comment.clone(),
+            ),
+            (
+                "GET repos/demo/project/issues/7/comments?per_page=100&page=1",
+                200,
+                json!([comment]),
+            ),
+        ]);
+        let forge = || GitHubForge::with_transport(rest.clone(), repo.clone());
+        let key = key_of(forge(), forge(), &tracker).unwrap();
+        assert_eq!(
+            key.account,
+            owlshift_adapters::tracker::KeyAccount {
+                id: "2".into(),
+                name: "bea".into(),
+                app: false,
+                workspace: String::new(),
+            }
+        );
+        let posted = key
+            .tracker
+            .post_comment(&TicketId::new("7").unwrap(), "Q1: B")
+            .unwrap();
+        assert_eq!(posted.body, "Q1: B");
+        assert_eq!(
+            posted.author,
+            owlshift_adapters::tracker::Author::Account(owlshift_adapters::tracker::Person {
+                id: "2".into(),
+                name: "bea".into(),
+            })
+        );
+        assert_eq!((key.names)("3"), Ok(Some("cy".to_owned())));
+        assert_eq!((key.names)("4"), Ok(None));
+        assert_eq!((key.names)("cy"), Ok(None));
+    }
+
+    /// A credential whose account cannot be read gives no key, and the text
+    /// says so without blaming the Issues permission.
+    #[test]
+    fn a_credential_that_cannot_read_its_account_gives_no_key() {
+        let repo = Repo::parse("demo/project").unwrap();
+        let rest = Rest::new(&[("GET user", 401, json!({ "message": "Bad credentials" }))]);
+        let forge = || GitHubForge::with_transport(rest.clone(), repo.clone());
+        let error = key_of(forge(), forge(), &github_tracker()).unwrap_err();
+        assert!(
+            error.starts_with("the GitHub account of the project's token could not be read: "),
+            "{error}"
+        );
+        assert!(!error.contains("Issues"), "{error}");
     }
 
     #[test]
