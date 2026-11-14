@@ -11,8 +11,17 @@ use owlshift_adapters::forge::push::{
 use owlshift_adapters::forge::{Branch, CommitId};
 use owlshift_adapters::tracker::markdown::MarkdownTracker;
 use owlshift_runner::executor::Git;
+use owlshift_runner::neutral_commits::{NeutralHead, neutral_history};
 use owlshift_runner::writer::{WriteError, Writer};
 use owlshift_testkit::git::{GitEnv, Remote, seed};
+
+/// `commit` as the Writer pushes it (OWL-558): its history's messages hold
+/// no closing keyword, so it is its own neutral image.
+fn neutral(git: &Git, checkout: &Path, commit: &CommitId) -> NeutralHead {
+    let neutral = neutral_history(git, checkout, commit, &[]).unwrap();
+    assert!(neutral.rewritten.is_empty(), "{:?}", neutral.rewritten);
+    neutral.head
+}
 
 struct Bench {
     env: GitEnv,
@@ -186,7 +195,7 @@ fn a_leased_push_moves_the_branch_forward_from_its_lease_only() {
             &git,
             &bench.remote.checkout,
             "origin",
-            &first,
+            &neutral(&git, &bench.remote.checkout, &first),
             &branch,
             &third,
         )
@@ -202,7 +211,7 @@ fn a_leased_push_moves_the_branch_forward_from_its_lease_only() {
             &git,
             &bench.remote.checkout,
             "origin",
-            &fourth,
+            &neutral(&git, &bench.remote.checkout, &fourth),
             &branch,
             &third
         ),
@@ -237,7 +246,7 @@ fn a_rebased_push_replaces_the_history_only_with_the_delivery_kept() {
             &git,
             &bench.remote.checkout,
             "origin",
-            commit,
+            &neutral(&git, &bench.remote.checkout, commit),
             &branch,
             lease,
             &base,
@@ -330,7 +339,7 @@ fn a_rebase_cycles_push_reads_the_delivery_on_the_rebase_commit() {
             &git,
             &bench.remote.checkout,
             "origin",
-            commit,
+            &neutral(&git, &bench.remote.checkout, commit),
             &branch,
             &delivered,
             &base,

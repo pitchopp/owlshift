@@ -136,6 +136,17 @@ pub fn write_run_diff(
     worktree::write_run_file(worktree, path, content)
 }
 
+/// Writes `content` as the file `path` of [`RUN_DIR`] in `worktree`, as
+/// [`write_run_diff`] does: the Build ledger, whose commit ids follow a
+/// push that rewrote them (OWL-558). Returns the file's path.
+pub fn write_run_file(
+    worktree: &Path,
+    path: &str,
+    content: &[u8],
+) -> Result<PathBuf, ExecutorError> {
+    worktree::write_run_file(worktree, path, content)
+}
+
 /// Where the role writes `result.json`, relative to the worktree: the
 /// brief's `result_path`.
 pub const RESULT_PATH: &str = ".owlshift/run/result.json";
