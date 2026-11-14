@@ -6238,9 +6238,9 @@ impl OnDemand<'_> {
     /// ([`KeptBuild`], OWL-304): its gated commit, its pull request and what
     /// its report says. The push sends the gated commit's neutral image, its
     /// tree, with the closing keywords of the agent's commit messages broken
-    /// and the ticket's branch moved there ([`Self::neutral_push`], OWL-558).
-    /// It leaves from the dedicated checkout, never
-    /// from the worktree (`Writer::push_branch`). The ticket ref keeps the
+    /// and the ticket's branch moved there ([`Self::neutral_push`], OWL-558),
+    /// from the dedicated checkout, never from the worktree
+    /// (`Writer::push_branch`). The ticket ref keeps the
     /// push under way (`pushing`, OWL-209) before it, with `state`, the
     /// state Verify left; once the forge shows the commit as the pull
     /// request's head, the ref keeps the pull request, `pushed`,
@@ -6302,7 +6302,13 @@ impl OnDemand<'_> {
         self.store_delivery(p, state, questions, Some(kept.clone()))
             .map_err(|e| delivery("keeping the push in the ticket's ref", &e))?;
         let pushed = writer
-            .push_branch(&self.executor.git, &p.checkout, "origin", &neutral.head, head)
+            .push_branch(
+                &self.executor.git,
+                &p.checkout,
+                "origin",
+                &neutral.head,
+                head,
+            )
             .map_err(|e| delivery("pushing the branch", &e))?;
         let mut event = data([
             ("target", json!("forge")),

@@ -10,7 +10,7 @@
 //! sends the *neutral image* of the commits that push brings: every commit
 //! reachable from the pushed one and not from the push's bases (the base,
 //! the commit Owlshift last pushed), rewritten byte for byte with its
-//! message passed through [`neutralise_closing_keywords`], its parents
+//! message passed through `writer::neutralise_closing_keywords`, its parents
 //! replaced by their images, and the headers a rewrite invalidates
 //! (`gpgsig`, `gpgsig-sha256`, `mergetag`) dropped. Its tree, author,
 //! committer and dates are kept. An image is thus a function of the commit
@@ -28,7 +28,7 @@ use crate::writer::neutralise_closing_keywords;
 
 /// A commit whose history, down to the bases of its push, holds no live
 /// closing keyword: the only commit the Writer pushes. Only
-/// [`neutral_history`] makes one.
+/// the rewrite of a push's history makes one.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct NeutralHead(CommitId);
 
@@ -196,7 +196,8 @@ fn neutral_object(raw: &[u8], images: &HashMap<String, String>) -> Option<Vec<u8
     }
     entries.retain(|entry| {
         let name = entry.split(|&byte| byte == b' ').next().unwrap_or_default();
-        !matches!(name, b"gpgsig" | b"gpgsig-sha256" | b"mergetag") && !(lossy && name == b"encoding")
+        !matches!(name, b"gpgsig" | b"gpgsig-sha256" | b"mergetag")
+            && !(lossy && name == b"encoding")
     });
     let mut object = entries.join(&b'\n');
     object.extend_from_slice(b"\n\n");
@@ -216,12 +217,9 @@ pub(crate) fn remap_ledger(ledger: &str, rewritten: &[(CommitId, CommitId)]) -> 
     let steps = value.get("steps")?.as_array()?;
     let mut text = ledger.to_owned();
     let mut seen = HashSet::new();
-    for named in steps
-        .iter()
-        .filter_map(|step| step.get("commit")?.as_str())
-    {
-        let abbreviation = (7..=64).contains(&named.len())
-            && named.bytes().all(|byte| byte.is_ascii_hexdigit());
+    for named in steps.iter().filter_map(|step| step.get("commit")?.as_str()) {
+        let abbreviation =
+            (7..=64).contains(&named.len()) && named.bytes().all(|byte| byte.is_ascii_hexdigit());
         if !abbreviation || !seen.insert(named) {
             continue;
         }
@@ -306,17 +304,27 @@ mod tests {
         let plain = format!("tree {a}\nparent {a}\nauthor A <a@x> 1 +0000\n\nAdd x\n");
         assert_eq!(
             neutral_object(plain.as_bytes(), &images(&[(&a, &c)])),
-            Some(plain.replace(&format!("parent {a}"), &format!("parent {c}")).into_bytes())
+            Some(
+                plain
+                    .replace(&format!("parent {a}"), &format!("parent {c}"))
+                    .into_bytes()
+            )
         );
         assert_eq!(neutral_object(plain.as_bytes(), &HashMap::new()), None);
-        assert_eq!(neutral_object(raw.replace("Fixes", "Adds").as_bytes(), &HashMap::new()), None);
+        assert_eq!(
+            neutral_object(raw.replace("Fixes", "Adds").as_bytes(), &HashMap::new()),
+            None
+        );
     }
 
     /// A message that is not UTF-8 is read lossily: written back in UTF-8,
     /// its `encoding` header dropped, only when it holds a keyword.
     #[test]
     fn a_message_not_in_utf8_is_rewritten_only_for_a_keyword() {
-        let head = format!("tree {}\nauthor A <a@x> 1 +0000\nencoding ISO-8859-1\n\n", id('a'));
+        let head = format!(
+            "tree {}\nauthor A <a@x> 1 +0000\nencoding ISO-8859-1\n\n",
+            id('a')
+        );
         let mut latin = head.clone().into_bytes();
         latin.extend_from_slice(b"Caf\xe9 fixes #5\n");
         let neutral = neutral_object(&latin, &HashMap::new()).unwrap();
@@ -348,7 +356,10 @@ mod tests {
         assert_eq!(
             remap_ledger(&ledger, &rewritten).unwrap(),
             ledger
-                .replace(&format!("\"commit\": \"{b}\""), &format!("\"commit\": \"{}\"", id('d')))
+                .replace(
+                    &format!("\"commit\": \"{b}\""),
+                    &format!("\"commit\": \"{}\"", id('d'))
+                )
                 .replace("BBBBBBB", "ddddddd")
         );
         assert_eq!(remap_ledger(&ledger, &[]), None);
@@ -443,10 +454,18 @@ mod tests {
         repo.run(&["switch", "--quiet", "main"]);
         let newer = repo.commit("three", "Closes #2 on the base");
         repo.run(&["switch", "--quiet", "ticket"]);
-        repo.run(&["merge", "--quiet", "--no-edit", "-m", "Merge the base", "main"]);
+        repo.run(&[
+            "merge",
+            "--quiet",
+            "--no-edit",
+            "-m",
+            "Merge the base",
+            "main",
+        ]);
         let merge = CommitId::new(repo.run(&["rev-parse", "HEAD"])).unwrap();
 
-        let neutral = neutral_history(git, checkout, &merge, &[base.clone(), newer.clone()]).unwrap();
+        let neutral =
+            neutral_history(git, checkout, &merge, &[base.clone(), newer.clone()]).unwrap();
         let agents: Vec<&CommitId> = neutral.rewritten.iter().map(|(agent, _)| agent).collect();
         assert_eq!(agents, [&fixes, &child, &merge]);
         let head = neutral.head.commit().clone();
@@ -469,7 +488,8 @@ mod tests {
 
         let again = neutral_history(git, checkout, &merge, &[base.clone(), newer.clone()]).unwrap();
         assert_eq!(again.rewritten, neutral.rewritten);
-        let settled = neutral_history(git, checkout, &head, &[base.clone(), newer.clone()]).unwrap();
+        let settled =
+            neutral_history(git, checkout, &head, &[base.clone(), newer.clone()]).unwrap();
         assert_eq!((settled.head.commit(), settled.rewritten.len()), (&head, 0));
         assert_eq!(image(git, checkout, &merge, &[base, newer]), Ok(head));
 

@@ -9548,6 +9548,37 @@ fn is_ancestor(bench: &Bench, ancestor: &str, of: &str) -> bool {
         .is_ok()
 }
 
+/// The messages of the remote's commits from `base` to `head`, newest
+/// first, each without its last line break; a check that none holds a live
+/// closing keyword (OWL-558).
+fn pushed_messages(bench: &Bench, base: &str, head: &str) -> Vec<String> {
+    let out = bench
+        .env
+        .run(
+            &bench.remote.bare,
+            &["log", "--format=%B%x00", &format!("{base}..{head}")],
+        )
+        .unwrap();
+    let messages: Vec<String> = String::from_utf8(out)
+        .unwrap()
+        .split('\0')
+        .map(|message| message.trim().to_owned())
+        .filter(|message| !message.is_empty())
+        .collect();
+    for message in &messages {
+        let live = message.split(|c: char| !c.is_alphanumeric()).find(|word| {
+            [
+                "close", "closes", "closed", "fix", "fixes", "fixed", "resolve", "resolves",
+                "resolved",
+            ]
+            .iter()
+            .any(|keyword| word.eq_ignore_ascii_case(keyword))
+        });
+        assert_eq!(live, None, "a live keyword pushed in {message:?}");
+    }
+    messages
+}
+
 /// Scenario S9's conflict (OWL-210): another merge changed the line the
 /// delivery changed, a trivial conflict. The rebase run is on the fast
 /// tier, briefed with the base, the branch and the conflicting path; the
