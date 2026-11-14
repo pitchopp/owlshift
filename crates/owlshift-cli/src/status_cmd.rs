@@ -45,11 +45,9 @@ pub fn waits(config: &Effective, repo: Option<&str>, json: bool) -> ExitCode {
         owlshift_runner::usage::concurrent_runs(&config.personal),
         Timestamp::now(),
     );
-    let waits = status::waits::build(&read);
-    if json {
-        print!("{}", waits.render());
-    } else {
-        print!("{}", status::waits::render(&waits, &TimeZone::system()));
-    }
+    print!(
+        "{}",
+        status::waits::report(&read, json, &TimeZone::system())
+    );
     ExitCode::SUCCESS
 }
