@@ -60,6 +60,7 @@ use owlshift_runner::routing::{ClaudeRouter, Router};
 use owlshift_runner::ticket_ref::{self, TicketRecord};
 use owlshift_runner::usage::UsageStore;
 use owlshift_runner::watch::{POLL_INTERVAL, Watch};
+#[cfg(unix)]
 use owlshift_testkit::capability;
 use owlshift_testkit::gh;
 use owlshift_testkit::git::{GitEnv, Remote, seed};

@@ -5,6 +5,7 @@ use std::fs::{self, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
+use owlshift_adapters::forge::CommitId;
 use owlshift_contracts::brief::Brief;
 
 use super::git::{Git, GitError};
@@ -285,6 +286,17 @@ pub(super) fn start_from_base(
 /// --hard` there. Untracked and ignored files stay, the Build's plan and
 /// ledger among them; what the run left of tracked changes goes, the
 /// rebase having started from a clean worktree.
+///
+/// `commit` must be a full commit id ([`CommitId`]), refused otherwise
+/// before any git runs, and is passed as `reset --hard --quiet <commit> --`,
+/// not after `--end-of-options` (OWL-572): checked on 2026-11-15, git 2.39.5
+/// (`debian:bookworm`) and 2.43.0 (`ubuntu:24.04`) exit 128 on `reset --hard
+/// --quiet --end-of-options <commit>` ("option '--end-of-options' must come
+/// before non-option arguments") while 2.54.0 takes it, and all three move
+/// the branch with `reset --hard --quiet <commit> --`. The `--` alone does not
+/// keep a revision from being read as an option (`reset --hard --quiet
+/// --soft --` exits 0 and moves nothing), so the full-id check is what does:
+/// hexadecimal digits never start with `-`.
 pub(super) fn restore(
     git: &Git,
     main: &Path,
@@ -292,14 +304,22 @@ pub(super) fn restore(
     branch: &str,
     commit: &str,
 ) -> Result<(), ExecutorError> {
+    let commit = CommitId::new(commit)
+        .map_err(|e| ExecutorError::Worktree(format!("moving {branch} back: {e}")))?;
     check_spec(git, main, worktree, branch)?;
     check_kept(git, main, worktree, branch)?;
     git.run(
         worktree,
-        &["reset", "--hard", "--quiet", "--end-of-options", commit],
+        &["reset", "--hard", "--quiet", commit.as_str(), "--"],
     )
     .map(drop)
-    .map_err(|e| ExecutorError::Worktree(format!("moving {branch} back to {commit}: {}", e.detail)))
+    .map_err(|e| {
+        ExecutorError::Worktree(format!(
+            "moving {branch} back to {}: {}",
+            commit.as_str(),
+            e.detail
+        ))
+    })
 }
 
 /// The commit a new branch starts from. A full object id is taken as the
@@ -517,6 +537,32 @@ mod tests {
             "a/diff.patch",
         ] {
             assert!(write_run_file(tmp.path(), path, b"").is_err(), "{path}");
+        }
+    }
+
+    /// `restore` refuses what is not a full commit id before any git runs,
+    /// so nothing option-like reaches `reset` (OWL-572); a full id goes on
+    /// to the worktree checks, which refuse these missing paths.
+    #[test]
+    fn restore_takes_only_a_full_commit_id() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (main, worktree) = (tmp.path().join("main"), tmp.path().join("wt"));
+        let git = Git::new("git-that-never-runs");
+        let short = "a".repeat(39);
+        let upper = "A".repeat(40);
+        for commit in ["--soft", "HEAD", "abc1234", short.as_str(), upper.as_str()] {
+            let err = restore(&git, &main, &worktree, "b", commit).unwrap_err();
+            assert!(
+                err.to_string().contains("is not a full commit id"),
+                "{commit}: {err}"
+            );
+        }
+        for commit in ["a".repeat(40), "0".repeat(64)] {
+            let err = restore(&git, &main, &worktree, "b", &commit).unwrap_err();
+            assert!(
+                !err.to_string().contains("is not a full commit id"),
+                "{err}"
+            );
         }
     }
 

@@ -227,11 +227,6 @@ fn watch_rebases_a_held_done_build_onto_a_head_that_passes() {
 /// delivers.
 #[test]
 fn a_rebase_that_drops_the_work_parks_with_the_branch_where_it_was() {
-    // The runner moves the branch back with `reset --end-of-options`, which
-    // git 2.43 rejects (OWL-555).
-    if !capability::skip_unless(capability::git_takes_reset_end_of_options()) {
-        return;
-    }
     let bench = Bench::parking();
     let marker = bench.tmp.path().join("store-has-rollup");
     let (held, start) = held_done_build(&bench, &marker);

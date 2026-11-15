@@ -1,8 +1,8 @@
 //! Owlshift's test bench: a ticket played end to end with no model, no
 //! network and no tracker account.
 //!
-//! - [`capability`]: probes that skip a test where root or an older git
-//!   cannot honour what it relies on (OWL-555).
+//! - [`capability`]: probes that skip a test where root cannot honour what
+//!   it relies on (OWL-555).
 //! - [`fixture_gate`]: whether a fixture project's test runs, skips or fails
 //!   (OWL-330).
 //! - [`gh`]: the real gh, started once before the credential probes time it.
