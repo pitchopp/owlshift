@@ -21,7 +21,9 @@
 # non-closing word. A victim whose state turns `completed` is a form Linear closes on; the control `Fixes KEY-n` must,
 # or the Linear rows prove nothing (the repository is not connected to the workspace's GitHub integration, or the
 # team's merge status is not a completed one). The branch, the pull request's title and every commit message name
-# no Linear issue, so the integration links the pull request only through its body.
+# no Linear issue, so the integration links the pull request only through its body. OWL-570 adds each non-closing
+# word, a control that must move its victim to a `started` state, and the runner's broken form of each, which must
+# not move its victim (a failure if it does), and a relation word, which must not move its victim either.
 #
 #   bash docs/design/live-checks/owl-556.sh pitchopp/owlshift-live-sandbox [SANDBOX_TEAM_KEY]   (--help: what it does)
 #
@@ -30,7 +32,7 @@
 # deletes issues in that team. It runs alone in about 3 minutes. It creates on the sandbox 41 issues, a branch
 # `closing-probe-<time>` with one file, and a pull request, which it squash-merges into the default branch; then it
 # deletes the branch, removes the file from the default branch in a commit of its own, and closes as not planned
-# every issue the merge left open. With a team key it creates 21 Linear issues in that team and deletes them at the
+# every issue the merge left open. With a team key it creates 35 Linear issues in that team and deletes them at the
 # end. It refuses pitchopp/owlshift and the team OWL. The report, on standard output, holds no token and no account
 # identifier: paste it on the ticket.
 
@@ -137,7 +139,9 @@ CONTROLS=(0 10 13 16 17)
 # https://linear.app/docs/github listed them on 2026-11-14: close, closes, closed, closing, fix, fixes, fixed,
 # fixing, resolve, resolves, resolved, resolving, complete, completes, completed, completing, implement, implements,
 # implemented, implementing, linear issue; non-closing: ref, refs, references, part of, contributes to, toward,
-# towards. The nine GitHub shares are probed through one form per verb; the twelve others each.
+# towards. The nine GitHub shares are probed through one form per verb; the twelve others each. OWL-570: the
+# non-closing words, as https://linear.app/docs/github listed them on 2026-11-15 (the same seven), each plain and
+# broken, and the relation word `relates to`, which the page says links with no status change.
 LFORM_NAME=(
     "control: Fixes KEY-n"
     "shipped: Fi<U+200B>xes KEY-n"
@@ -159,7 +163,21 @@ LFORM_NAME=(
     "broken: Co<U+200B>mpletes KEY-n"
     "broken: Im<U+200B>plements KEY-n"
     "broken: Li<U+200B>near issue KEY-n"
-    "non-closing: Refs KEY-n"
+    "control (non-closing): Refs KEY-n"
+    "control (non-closing): Ref KEY-n"
+    "control (non-closing): References KEY-n"
+    "control (non-closing): Part of KEY-n"
+    "control (non-closing): Contributes to KEY-n"
+    "control (non-closing): Toward KEY-n"
+    "control (non-closing): Towards KEY-n"
+    "broken: Re<U+200B>fs KEY-n"
+    "broken: Re<U+200B>f KEY-n"
+    "broken: Re<U+200B>ferences KEY-n"
+    "broken: Pa<U+200B>rt of KEY-n"
+    "broken: Co<U+200B>ntributes to KEY-n"
+    "broken: To<U+200B>ward KEY-n"
+    "broken: To<U+200B>wards KEY-n"
+    "relation: Relates to KEY-n"
 )
 LFORM_JQ=(
     '"Fixes \($k)"'
@@ -183,8 +201,26 @@ LFORM_JQ=(
     '"Im\u200bplements \($k)"'
     '"Li\u200bnear issue \($k)"'
     '"Refs \($k)"'
+    '"Ref \($k)"'
+    '"References \($k)"'
+    '"Part of \($k)"'
+    '"Contributes to \($k)"'
+    '"Toward \($k)"'
+    '"Towards \($k)"'
+    '"Re\u200bfs \($k)"'
+    '"Re\u200bf \($k)"'
+    '"Re\u200bferences \($k)"'
+    '"Pa\u200brt of \($k)"'
+    '"Co\u200bntributes to \($k)"'
+    '"To\u200bward \($k)"'
+    '"To\u200bwards \($k)"'
+    '"Relates to \($k)"'
 )
 LCONTROLS=(0)
+# OWL-570: the non-closing controls, which must move their victim to a `started` state, and the forms that must not
+# move theirs: the runner's broken non-closing words and the relation word.
+LMOVES=(20 21 22 23 24 25 26)
+LSTILL=(27 28 29 30 31 32 33 34)
 
 usage() {
     cat <<EOF
@@ -440,6 +476,14 @@ linear_state() {
         <"$WORK/lst.body" 2>/dev/null
 }
 
+# in_list N ITEM...: whether N is one of the items.
+in_list() {
+    local n=$1 c
+    shift
+    for c in "$@"; do if [ "$c" = "$n" ]; then return 0; fi; done
+    return 1
+}
+
 is_control() {
     local c
     for c in "${CONTROLS[@]}"; do if [ "$c" = "$1" ]; then return 0; fi; done
@@ -477,12 +521,31 @@ read_back() {
         i=0
         while [ "$i" -lt "${#LOPENED[@]}" ]; do
             s=$(linear_state "${LOPENED[$i]}")
-            case $s in completed/*) verdict=closes ;; *) verdict=ignored ;; esac
+            # OWL-570: a victim in a `started` state was moved; one with a link and no move, linked.
+            case $s in
+            completed/*) verdict=closes ;;
+            started/*) verdict=moves ;;
+            *", links 0") verdict=ignored ;;
+            unread) verdict=unread ;;
+            *) verdict=links ;;
+            esac
             if [ "$i" = "${LCONTROLS[0]}" ]; then
                 if [ "$verdict" = closes ]; then verdict="closes (control, as expected)"; else
-                    verdict="ignored (CONTROL FAILED: the Linear forms prove nothing)"
+                    verdict="$verdict (CONTROL FAILED: the Linear forms prove nothing)"
                     FAILED=$((FAILED + 1))
                 fi
+            elif in_list "$i" "${LMOVES[@]}"; then
+                if [ "$verdict" = moves ]; then verdict="moves (control, as expected)"; else
+                    verdict="$verdict (CONTROL FAILED: the non-closing word moved nothing)"
+                    FAILED=$((FAILED + 1))
+                fi
+            elif in_list "$i" "${LSTILL[@]}"; then
+                case $verdict in
+                closes | moves | unread)
+                    verdict="$verdict (FAILED: this form must not move its issue)"
+                    FAILED=$((FAILED + 1))
+                    ;;
+                esac
             fi
             report "| $((i + 1)) | ${LFORM_NAME[$i]} | ${LVICTIM[$i]} | ${LBEFORE[$i]:-unread} | $s | $verdict |"
             i=$((i + 1))
@@ -591,7 +654,7 @@ FAILED=0
 trap cleanup EXIT
 trap 'exit 130' INT TERM
 
-report "OWL-556/OWL-559 check, $(date -u +%Y-%m-%dT%H:%M:%SZ), $(gh --version | head -n 1 | cut -d' ' -f1-3), $(jq --version), $(uname -s), script sha256 $(script_sha), Linear team: ${TEAM:-none}"
+report "OWL-556/OWL-559/OWL-570 check,$(date -u +%Y-%m-%dT%H:%M:%SZ), $(gh --version | head -n 1 | cut -d' ' -f1-3), $(jq --version), $(uname -s), script sha256 $(script_sha), Linear team: ${TEAM:-none}"
 if ! gh auth status >/dev/null 2>&1 </dev/null; then
     say "$PROGRAM: gh is not signed in (gh auth status)"
     exit 2
