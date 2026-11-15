@@ -505,7 +505,7 @@ pub(crate) fn with_closing_line(body: &str, line: Option<String>) -> String {
 /// The closing keywords: one of them before an issue's reference in a pull
 /// request's body closes that issue when it merges. GitHub's nine, then the
 /// words Linear's GitHub integration also closes on (OWL-559, checked on
-/// 2026-11-15); its last one, `linear issue`, is two words ([`LINEAR`]).
+/// 2026-11-15); its last one, `linear issue`, is two words ([`PHRASES`]).
 const CLOSING_KEYWORDS: [&str; 20] = [
     "close",
     "closes",
@@ -529,9 +529,18 @@ const CLOSING_KEYWORDS: [&str; 20] = [
     "implementing",
 ];
 
-/// The first word of Linear's two-word closing keyword `linear issue`,
-/// broken only when `issue` follows it.
-const LINEAR: &str = "linear";
+/// Linear's one-word non-closing magic words: one of them before a Linear
+/// issue's reference in a pull request's title, body or commit message moves
+/// that issue to a started status when the pull request opens, where its
+/// merge leaves it (OWL-570, listed by Linear's documentation on
+/// 2026-11-15). Broken like a closing keyword, so that only the runner moves
+/// a ticket; its two-word ones are in [`PHRASES`].
+const NON_CLOSING_WORDS: [&str; 5] = ["ref", "refs", "references", "toward", "towards"];
+
+/// Linear's two-word magic words: the closing `linear issue` (OWL-559) and
+/// the non-closing `part of` and `contributes to` (OWL-570). The first word
+/// is broken only when white space, then the second word, follow it.
+const PHRASES: [(&str, &str); 3] = [("linear", "issue"), ("part", "of"), ("contributes", "to")];
 
 /// The punctuation a plain word may hold, and the only characters beside
 /// white space and the zero-width space that may stand between a closing
@@ -558,7 +567,10 @@ const PLAIN_PUNCTUATION: [char; 16] = [
 /// keyword, close nothing. Linear closes an issue on more words, which are
 /// broken alike, and on `linear issue`, whose `linear` is broken when `issue`
 /// follows it after white space and a reference may follow `issue`
-/// (OWL-559). A text broken once is broken alike again: a break lands after
+/// (OWL-559). Linear's non-closing magic words, which move an issue's status
+/// without closing it, are broken by the same rule ([`NON_CLOSING_WORDS`],
+/// and `part of` and `contributes to` as `linear issue`, [`PHRASES`];
+/// OWL-570). A text broken once is broken alike again: a break lands after
 /// a keyword's second letter, never where the test of a following word looks.
 pub(crate) fn neutralise_closing_keywords(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
@@ -570,7 +582,7 @@ pub(crate) fn neutralise_closing_keywords(text: &str) -> String {
         let (word, after) = rest.split_at(end);
         let at = closing_keyword_break(word)
             .filter(|_| reference_may_follow(after))
-            .or_else(|| linear_issue_break(word, after));
+            .or_else(|| phrase_break(word, after));
         if let Some(at) = at {
             out.push_str(&word[..at]);
             out.push('\u{200B}');
@@ -585,9 +597,11 @@ pub(crate) fn neutralise_closing_keywords(text: &str) -> String {
     out
 }
 
-/// Where to break `word` when GitHub reads it as a closing keyword: the byte
-/// offset just past the character that holds its second letter, once `ſ` is
-/// folded to `s` and `ﬁ` to `fi` (OWL-559). `None` for any other word.
+/// Where to break `word` when GitHub or Linear reads it as a closing
+/// keyword, or Linear as a non-closing magic word ([`NON_CLOSING_WORDS`]):
+/// the byte offset just past the character that holds its second letter,
+/// once `ſ` is folded to `s` and `ﬁ` to `fi` (OWL-559). `None` for any other
+/// word.
 fn closing_keyword_break(word: &str) -> Option<usize> {
     let mut folded = String::with_capacity(word.len());
     let mut at = None;
@@ -604,19 +618,21 @@ fn closing_keyword_break(word: &str) -> Option<usize> {
     }
     CLOSING_KEYWORDS
         .iter()
+        .chain(&NON_CLOSING_WORDS)
         .any(|k| folded.eq_ignore_ascii_case(k))
         .then_some(at)
         .flatten()
 }
 
-/// Where to break `word` when it is the `linear` of Linear's `linear issue`,
-/// `after` the text that follows it: after its second letter when white
-/// space, then the word `issue`, follow, and a reference may follow `issue`
-/// ([`reference_may_follow`]). `None` otherwise.
-fn linear_issue_break(word: &str, after: &str) -> Option<usize> {
-    if !word.eq_ignore_ascii_case(LINEAR) {
-        return None;
-    }
+/// Where to break `word` when it is the first word of one of Linear's
+/// two-word magic words ([`PHRASES`]), `after` the text that follows it:
+/// after its second letter when white space, then the phrase's second word,
+/// follow, and a reference may follow that word ([`reference_may_follow`]).
+/// `None` otherwise.
+fn phrase_break(word: &str, after: &str) -> Option<usize> {
+    let (_, second) = PHRASES
+        .iter()
+        .find(|(first, _)| word.eq_ignore_ascii_case(first))?;
     let next = after.trim_start();
     if next.len() == after.len() {
         return None;
@@ -624,7 +640,7 @@ fn linear_issue_break(word: &str, after: &str) -> Option<usize> {
     let end = next
         .find(|c: char| !c.is_alphanumeric())
         .unwrap_or(next.len());
-    (next[..end].eq_ignore_ascii_case("issue") && reference_may_follow(&next[end..])).then_some(2)
+    (next[..end].eq_ignore_ascii_case(second) && reference_may_follow(&next[end..])).then_some(2)
 }
 
 /// Whether an issue's reference may start `after`, the text that follows a
@@ -668,8 +684,8 @@ fn reference_may_follow(after: &str) -> bool {
 }
 
 /// The body of a pull request the runner opens: the agent's text, the
-/// closing keywords a reference may follow broken
-/// ([`neutralise_closing_keywords`]), then the
+/// closing keywords and Linear's non-closing magic words a reference may
+/// follow broken ([`neutralise_closing_keywords`]), then the
 /// tracker's closing line ([`with_closing_line`]), the only one that closes
 /// an issue (OWL-556).
 pub(crate) fn pull_request_body(agent: &str, line: Option<String>) -> String {
@@ -5698,6 +5714,24 @@ Merge state reported by the forge: `CLEAN`.
                 "Linear issue A-12, linear\n  ISSUE A-13, Linear issues, linear, Linear: issue, nonlinear issue",
                 "Li\u{200B}near issue A-12, li\u{200B}near\n  ISSUE A-13, Linear issues, linear, Linear: issue, nonlinear issue",
             ),
+            // Linear's non-closing magic words move an issue's status
+            // (OWL-570, 2026-11-15): each is broken alike.
+            (
+                "Refs A-1, ref #2, References: A-3, toward A-4, TOWARDS https://linear.app/w/issue/A-5/t",
+                "Re\u{200B}fs A-1, re\u{200B}f #2, Re\u{200B}ferences: A-3, to\u{200B}ward A-4, TO\u{200B}WARDS https://linear.app/w/issue/A-5/t",
+            ),
+            // A two-word one on its first word, whatever white space stands
+            // between its words or before the reference.
+            (
+                "Part of A-6, part\n of A-7, Contributes to A-8, CONTRIBUTES TO\n\nA-9, part of\nA-10",
+                "Pa\u{200B}rt of A-6, pa\u{200B}rt\n of A-7, Co\u{200B}ntributes to A-8, CO\u{200B}NTRIBUTES TO\n\nA-9, pa\u{200B}rt of\nA-10",
+            ),
+            // Shapes the rule cannot tell from a reference, broken all the
+            // same: a path, a code span, a number (OWL-570, accepted).
+            (
+                "ref(A-11), refs/heads/main, ref `HEAD`, towards 2.0",
+                "re\u{200B}f(A-11), re\u{200B}fs/heads/main, re\u{200B}f `HEAD`, to\u{200B}wards 2.0",
+            ),
         ];
         for (text, broken) in cases {
             assert_eq!(neutralise_closing_keywords(text), broken, "{text}");
@@ -5725,6 +5759,12 @@ Merge state reported by the forge: `CLEAN`.
             "Prefixes, fixture, closet, unresolved: #5 é",
             "completeness, implementation, incomplete, closings, prefixing, linearissue",
             "clos\u{435}s #5 f\u{131}xes #6 F\u{130}XES #7 \u{FF26}\u{FF49}\u{FF58}\u{FF45}\u{FF53} #8 \u{65E5}Fixes #9 \u{E9}Fixes #10 1Fixes #11 Fixes\u{65E5} #12 \u{FB01}xture",
+            // Linear's non-closing magic words before no reference
+            // (OWL-570).
+            "the ref is main, ref --no-deref, refs (the old ones), references below, toward v2, towards it. Refs",
+            "part of the plan, contributes to the parser, Part of. Contributes to: the fix, part of",
+            "Part: of A-1, contributes, to A-2, parts of A-3, counterpart of A-4, part ofA-5, partof A-6",
+            "refsA-7, prefs A-8, preference A-9, towardsA-10, Relates to A-11, related to A-12",
         ];
         for text in kept {
             assert_eq!(neutralise_closing_keywords(text), text, "{text}");
