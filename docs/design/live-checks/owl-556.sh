@@ -14,7 +14,7 @@
 # does not see: a letter replaced by a non-ASCII one, or a non-ASCII letter or a digit stuck to the keyword, which
 # makes one word of both. Who opens and merges the pull request does not change how GitHub reads its body: the run goes
 # through the person's own `gh` login, not the app's token (G5 settled that a pull request the token opens closes
-# its issue alike).
+# its issue alike). The last two rows (OWL-571) are the runner's broken form of the two lookalikes GitHub folds.
 #
 # With a Linear team's key as second argument (OWL-559), the body also carries one line per Linear form, each naming
 # an issue the run opens in that team: Linear's closing magic words, the runner's broken form of some, and a
@@ -29,7 +29,7 @@
 #
 # Needs bash (3.2 is enough), jq, and gh signed in (gh auth status) as an account that can write the sandbox's issues
 # and contents and merge its pull requests; with a team key, also curl and LINEAR_API_KEY, a key that creates and
-# deletes issues in that team. It runs alone in about 3 minutes. It creates on the sandbox 41 issues, a branch
+# deletes issues in that team. It runs alone in about 3 minutes. It creates on the sandbox 43 issues, a branch
 # `closing-probe-<time>` with one file, and a pull request, which it squash-merges into the default branch; then it
 # deletes the branch, removes the file from the default branch in a commit of its own, and closes as not planned
 # every issue the merge left open. With a team key it creates 35 Linear issues in that team and deletes them at the
@@ -90,6 +90,8 @@ FORM_NAME=(
     "glued: <U+00E9>Fixes #n (a Latin letter before)"
     "glued: 1Fixes #n (an ASCII digit before)"
     "glued: Fixes<U+65E5> #n (a CJK letter after)"
+    "shipped: cl<U+200B>o<U+017F>es #n (long s, broken)"
+    "shipped: <U+FB01><U+200B>xes #n (fi ligature, broken)"
 )
 FORM_JQ=(
     '"Fixes #\($n)"'
@@ -132,6 +134,8 @@ FORM_JQ=(
     '"\u00e9Fixes #\($n)"'
     '"1Fixes #\($n)"'
     '"Fixes\u65e5 #\($n)"'
+    '"Cl\u200bo\u017fes #\($n)"'
+    '"\ufb01\u200bxes #\($n)"'
 )
 CONTROLS=(0 10 13 16 17)
 
