@@ -128,9 +128,10 @@ pub trait Tracker {
     /// 5, "By whom"). Read once, before the ticket's first intake, so it is
     /// not part of the listing. An error by default, and for the
     /// `delegation` gesture. On GitHub Issues a label with no `labeled` event
-    /// standing is an error, never the creator: anyone opens an issue there
-    /// (OWL-536); a person's gesture there carries the issue's last text
-    /// edit, [`Gesture::edited_at`] (OWL-557).
+    /// standing is an [`ErrorKind::NoGesture`] error, never the creator:
+    /// anyone opens an issue there (OWL-536, OWL-568); a person's gesture
+    /// there carries the issue's last text edit, [`Gesture::edited_at`]
+    /// (OWL-557).
     fn gesture(&self, _id: &TicketId, _admit: &Admit) -> Result<Gesture, Error> {
         Err(Error::new(
             ErrorKind::Other,
@@ -675,6 +676,12 @@ pub enum ErrorKind {
     /// TLS failed, or the request timed out (OWL-479). Never an answer the
     /// tracker gave, whatever its status.
     Unreachable,
+    /// The tracker was read in full and shows the admission label with no
+    /// gesture of an account behind it: on GitHub Issues, every page of the
+    /// issue's events read and no `labeled` event of the label standing
+    /// (OWL-568). A read that failed, in part or whole, is never this. The
+    /// ticket is not admitted, as for any gesture that does not admit.
+    NoGesture,
     /// Anything else: a refused request, a malformed answer.
     Other,
 }

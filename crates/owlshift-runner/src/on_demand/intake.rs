@@ -59,15 +59,20 @@ pub fn admission(
 
 /// Why no gesture admits a ticket. `account` names who made the gesture the
 /// tracker read, the account's identifier or what the tracker calls a bot,
-/// when one was read and does not admit: the drain warns of it once per
-/// ticket, account and reason (OWL-250, OWL-557). `None` when nothing was
-/// read: delegation,
-/// no `admitters`, or a read that failed.
+/// when one was read and does not admit, or [`NO_ACCOUNT`] when the tracker,
+/// read in full, shows no gesture at all: the drain warns of it once per
+/// ticket, account and reason (OWL-250, OWL-557, OWL-568). `None` when
+/// nothing was read: delegation, no `admitters`, or a read that failed.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Unadmitted {
     pub account: Option<String>,
     pub reason: String,
 }
+
+/// The account of a gesture the tracker does not show, as the drain's
+/// `not_admitted` warning names it: a GitHub label with no `labeled` event
+/// standing (OWL-568). No admitter is named so, GitHub's being numeric ids.
+pub(crate) const NO_ACCOUNT: &str = "none";
 
 /// [`admission`], with the account of a gesture that does not admit.
 pub(crate) fn read_admission(
@@ -101,9 +106,14 @@ pub(crate) fn read_admission(
         account,
         at,
         edited_at,
-    } = tracker
-        .gesture(ticket, admit)
-        .map_err(|e| unread(format!("reading the admission gesture of {ticket}: {e}")))?;
+    } = tracker.gesture(ticket, admit).map_err(|e| match e.kind {
+        // Read in full, with no gesture to read: warned of, never admitted.
+        ErrorKind::NoGesture => Unadmitted {
+            account: Some(NO_ACCOUNT.to_owned()),
+            reason: e.message,
+        },
+        _ => unread(format!("reading the admission gesture of {ticket}: {e}")),
+    })?;
     let account = match account {
         TrackerAuthor::Account(person) => person.id,
         TrackerAuthor::Other { name } => {
@@ -911,6 +921,30 @@ mod tests {
         }
     }
 
+    /// A tracker whose admission gesture cannot be read, by `kind`.
+    struct Unread(ErrorKind);
+
+    impl Tracker for Unread {
+        fn capabilities(&self) -> &'static [Capability] {
+            &[]
+        }
+        fn ticket(&self, _: &TicketId) -> Result<Ticket, TrackerError> {
+            Err(TrackerError::new(ErrorKind::Other, "unused"))
+        }
+        fn comments(&self, _: &TicketId) -> Result<Vec<Comment>, TrackerError> {
+            Err(TrackerError::new(ErrorKind::Other, "unused"))
+        }
+        fn post_comment(&self, _: &TicketId, _: &str) -> Result<Comment, TrackerError> {
+            Err(TrackerError::new(ErrorKind::Other, "unused"))
+        }
+        fn set_stage(&self, _: &TicketId, _: &str) -> Result<(), TrackerError> {
+            Err(TrackerError::new(ErrorKind::Other, "unused"))
+        }
+        fn gesture(&self, _: &TicketId, _: &Admit) -> Result<TrackerGesture, TrackerError> {
+            Err(TrackerError::new(self.0, "no gesture to read"))
+        }
+    }
+
     fn account(id: &str, name: &str) -> TrackerAuthor {
         TrackerAuthor::Account(Person {
             id: id.to_owned(),
@@ -1046,5 +1080,39 @@ mod tests {
         }
         let gesture = read("2026-11-14T10:33:44Z").unwrap();
         assert_eq!((gesture.account.as_str(), gesture.at), ("7", at));
+    }
+
+    /// A tracker read in full that shows no gesture (OWL-568) does not
+    /// admit and names [`NO_ACCOUNT`], keeping the tracker's own words as
+    /// the reason, so the drain warns of it once; any read that failed
+    /// names no account, so the drain refuses as before.
+    #[test]
+    fn no_gesture_shown_is_warned_of_and_a_failed_read_refused() {
+        let ticket = TicketId::new("12").unwrap();
+        let label = Admit::Label("agent:ready".to_owned());
+        let listed = ["7".to_owned()];
+        let now: Timestamp = "2026-11-14T11:00:00Z".parse().unwrap();
+        let read = |kind| read_admission(&Unread(kind), &label, Some(&listed), &ticket, now);
+        assert_eq!(
+            read(ErrorKind::NoGesture),
+            Err(Unadmitted {
+                account: Some(NO_ACCOUNT.to_owned()),
+                reason: "no gesture to read".to_owned(),
+            })
+        );
+        for kind in [
+            ErrorKind::NotFound,
+            ErrorKind::Unauthorized,
+            ErrorKind::Unreachable,
+            ErrorKind::Other,
+        ] {
+            let refusal = read(kind).unwrap_err();
+            assert_eq!(refusal.account, None, "{kind:?}");
+            assert!(
+                refusal
+                    .reason
+                    .starts_with("reading the admission gesture of 12")
+            );
+        }
     }
 }

@@ -400,7 +400,7 @@ fn app_refusal(error: AppError) -> Refusal {
     match &error {
         AppError::Tracker { error: answer, .. } => match answer.kind {
             ErrorKind::Unreachable => Refusal::unreachable(error.to_string()),
-            ErrorKind::Other => Refusal::passing(error.to_string()),
+            ErrorKind::Other | ErrorKind::NoGesture => Refusal::passing(error.to_string()),
             ErrorKind::Unauthorized | ErrorKind::NotFound => error.to_string().into(),
         },
         _ => error.to_string().into(),

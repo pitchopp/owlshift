@@ -870,6 +870,9 @@ struct Clocked<'a> {
     /// ticket's gesture time and last edit, which the Markdown tracker
     /// does not keep.
     edits: &'a RefCell<Vec<(TicketId, Timestamp, Timestamp)>>,
+    /// The tickets whose label GitHub records no `labeled` event of
+    /// (OWL-568): their gesture, read in full, shows none.
+    ungestured: &'a RefCell<Vec<TicketId>>,
 }
 
 /// Reactions on the tracker's comments, which the Markdown tracker's files
@@ -1126,6 +1129,12 @@ impl Tracker for Clocked<'_> {
     }
 
     fn gesture(&self, id: &TicketId, admit: &Admit) -> Result<tracker::Gesture, tracker::Error> {
+        if self.ungestured.borrow().contains(id) {
+            return Err(tracker::Error::new(
+                tracker::ErrorKind::NoGesture,
+                format!("no `labeled` event stands on {id}: put the label on the issue again"),
+            ));
+        }
         let mut gesture = Tracker::gesture(&self.inner, id, admit)?;
         if let Some((_, at, edited)) = self.edits.borrow().iter().find(|(on, ..)| on == id) {
             gesture.at = Some(*at);
@@ -1253,6 +1262,9 @@ struct Bench {
     /// Tickets whose text was edited after their gesture (OWL-557): see
     /// [`Clocked::edits`].
     edits: RefCell<Vec<(TicketId, Timestamp, Timestamp)>>,
+    /// Tickets whose gesture shows none (OWL-568): see
+    /// [`Clocked::ungestured`].
+    ungestured: RefCell<Vec<TicketId>>,
     /// The routing each routed harness was asked for, in order (OWL-305).
     routed: Rc<RefCell<Vec<RunRouting>>>,
     /// The verify seats play from the bench's reply queue, as every other
@@ -1514,6 +1526,7 @@ impl Bench {
             fold: RefCell::default(),
             reactions: RefCell::default(),
             edits: RefCell::default(),
+            ungestured: RefCell::default(),
             routed: Rc::default(),
             verify_plays: Cell::new(false),
             sessions: Cell::new(false),
@@ -2023,6 +2036,7 @@ impl Bench {
             fold: &self.fold,
             reactions: &self.reactions,
             edits: &self.edits,
+            ungestured: &self.ungestured,
         };
         let issues = self.issues.borrow().clone().map(|fake| {
             let reached = GitHubForge::with_transport(fake, Repo::parse(REPO).unwrap());
