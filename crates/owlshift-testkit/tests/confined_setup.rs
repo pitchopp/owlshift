@@ -41,6 +41,7 @@ use owlshift_runner::agent_env::AgentEnv;
 use owlshift_runner::config::{Effective, FileState};
 use owlshift_runner::executor::{Executor, GateRun, GateSpec, Git, Outcome, RunReport, RunSpec};
 use owlshift_runner::system::HostSystem;
+use owlshift_testkit::capability;
 use owlshift_testkit::fixture_gate::{FixtureGate, REQUIRE_FIXTURE_TOOLS, fixture_gate};
 use owlshift_testkit::git::{GitEnv, Remote, seed};
 use owlshift_testkit::harness::FakeHarness;
@@ -545,6 +546,10 @@ fn a_python_project_passes_a_confined_gate() {
 /// run that cannot nest the sandbox can check of them.
 fn keeps_its_install_unconfined(fixture: &'static Fixture) {
     if !runs(fixture, false) {
+        return;
+    }
+    // The cache is read-only by its modes, which root bypasses (OWL-555).
+    if !capability::skip_unless(capability::refuses_writes_to_read_only_folder()) {
         return;
     }
     let mut bench = Bench::new(fixture);

@@ -60,6 +60,7 @@ use owlshift_runner::routing::{ClaudeRouter, Router};
 use owlshift_runner::ticket_ref::{self, TicketRecord};
 use owlshift_runner::usage::UsageStore;
 use owlshift_runner::watch::{POLL_INTERVAL, Watch};
+use owlshift_testkit::capability;
 use owlshift_testkit::gh;
 use owlshift_testkit::git::{GitEnv, Remote, seed};
 use owlshift_testkit::harness::FakeHarness;
@@ -5946,6 +5947,10 @@ fn scenario_a_build_whose_session_is_missing_starts_fresh() {
 #[test]
 fn a_session_the_resolver_settled_outlives_a_build_that_cannot_start() {
     use std::os::unix::fs::PermissionsExt;
+    // The run directory is refused by its mode, which root bypasses (OWL-555).
+    if !capability::skip_unless(capability::refuses_writes_to_read_only_folder()) {
+        return;
+    }
     let bench = Bench::new(true);
     bench.sessions.set(true);
     let runs = bench.dirs().runs(&ticket());
