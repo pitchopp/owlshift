@@ -502,11 +502,36 @@ pub(crate) fn with_closing_line(body: &str, line: Option<String>) -> String {
     format!("{body}\n\n{line}")
 }
 
-/// GitHub's closing keywords: one of them before an issue's reference in a
-/// pull request's body closes that issue when it merges.
-const CLOSING_KEYWORDS: [&str; 9] = [
-    "close", "closes", "closed", "fix", "fixes", "fixed", "resolve", "resolves", "resolved",
+/// The closing keywords: one of them before an issue's reference in a pull
+/// request's body closes that issue when it merges. GitHub's nine, then the
+/// words Linear's GitHub integration also closes on (OWL-559, checked on
+/// 2026-11-15); its last one, `linear issue`, is two words ([`LINEAR`]).
+const CLOSING_KEYWORDS: [&str; 20] = [
+    "close",
+    "closes",
+    "closed",
+    "fix",
+    "fixes",
+    "fixed",
+    "resolve",
+    "resolves",
+    "resolved",
+    "closing",
+    "fixing",
+    "resolving",
+    "complete",
+    "completes",
+    "completed",
+    "completing",
+    "implement",
+    "implements",
+    "implemented",
+    "implementing",
 ];
+
+/// The first word of Linear's two-word closing keyword `linear issue`,
+/// broken only when `issue` follows it.
+const LINEAR: &str = "linear";
 
 /// `text` with every closing keyword, as a whole word in any case, broken by
 /// a zero-width space after its second letter (`fi\u{200B}xes`), which GitHub
@@ -514,7 +539,12 @@ const CLOSING_KEYWORDS: [&str; 9] = [
 /// adapter", Delivery): so a "Fixes #5" an agent writes closes nothing. A
 /// word is a run of alphanumeric characters, so any other character next to
 /// a keyword, the zero-width space included, leaves it a keyword to break;
-/// a broken one reads as two words, neither a keyword.
+/// a broken one reads as two words, neither a keyword. GitHub folds a long s
+/// (`ſ`) to `s` and the ligature `ﬁ` to `fi`, so `cloſes #5` and `ﬁxes #5`
+/// close too, and are broken alike (OWL-559); its other lookalikes, and a
+/// letter stuck to a keyword, close nothing. Linear closes an issue on more
+/// words, which are broken alike, and on `linear issue`, whose `linear` is
+/// broken when `issue` follows it after white space (OWL-559).
 pub(crate) fn neutralise_closing_keywords(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     let mut rest = text;
@@ -523,14 +553,10 @@ pub(crate) fn neutralise_closing_keywords(text: &str) -> String {
             .find(|c: char| !c.is_alphanumeric())
             .unwrap_or(rest.len());
         let (word, after) = rest.split_at(end);
-        if CLOSING_KEYWORDS
-            .iter()
-            .any(|k| word.eq_ignore_ascii_case(k))
-        {
-            // Every keyword is ASCII: its second letter ends at byte 2.
-            out.push_str(&word[..2]);
+        if let Some(at) = closing_keyword_break(word).or_else(|| linear_issue_break(word, after)) {
+            out.push_str(&word[..at]);
             out.push('\u{200B}');
-            out.push_str(&word[2..]);
+            out.push_str(&word[at..]);
         } else {
             out.push_str(word);
         }
@@ -539,6 +565,47 @@ pub(crate) fn neutralise_closing_keywords(text: &str) -> String {
         rest = &after[skip..];
     }
     out
+}
+
+/// Where to break `word` when GitHub reads it as a closing keyword: the byte
+/// offset just past the character that holds its second letter, once `ſ` is
+/// folded to `s` and `ﬁ` to `fi` (OWL-559). `None` for any other word.
+fn closing_keyword_break(word: &str) -> Option<usize> {
+    let mut folded = String::with_capacity(word.len());
+    let mut at = None;
+    for (i, c) in word.char_indices() {
+        match c {
+            '\u{17F}' => folded.push('s'),
+            '\u{FB01}' => folded.push_str("fi"),
+            c if c.is_ascii() => folded.push(c),
+            _ => return None,
+        }
+        if at.is_none() && folded.len() >= 2 {
+            at = Some(i + c.len_utf8());
+        }
+    }
+    CLOSING_KEYWORDS
+        .iter()
+        .any(|k| folded.eq_ignore_ascii_case(k))
+        .then_some(at)
+        .flatten()
+}
+
+/// Where to break `word` when it is the `linear` of Linear's `linear issue`,
+/// `after` the text that follows it: after its second letter when white
+/// space, then the word `issue`, follow. `None` otherwise.
+fn linear_issue_break(word: &str, after: &str) -> Option<usize> {
+    if !word.eq_ignore_ascii_case(LINEAR) {
+        return None;
+    }
+    let next = after.trim_start();
+    if next.len() == after.len() {
+        return None;
+    }
+    let end = next
+        .find(|c: char| !c.is_alphanumeric())
+        .unwrap_or(next.len());
+    next[..end].eq_ignore_ascii_case("issue").then_some(2)
 }
 
 /// The body of a pull request the runner opens: the agent's text, its
@@ -5517,6 +5584,35 @@ Merge state reported by the forge: `CLEAN`.
             (
                 "Prefixes, fixture, closet, unresolved: #5 é",
                 "Prefixes, fixture, closet, unresolved: #5 é",
+            ),
+            // GitHub folds `ſ` to `s` and `ﬁ` to `fi`: both closed their
+            // issue (OWL-559, 2026-11-15), so both are broken.
+            (
+                "clo\u{17F}es #5 \u{FB01}xes #6 RE\u{17F}OLVED #7 \u{FB01}x #8",
+                "cl\u{200B}o\u{17F}es #5 \u{FB01}\u{200B}xes #6 RE\u{200B}\u{17F}OLVED #7 \u{FB01}\u{200B}x #8",
+            ),
+            // Linear closes on more words (OWL-559, 2026-11-15).
+            (
+                "Closing A-1, fixing A-2, RESOLVING A-3, complete A-4, Completes A-5, completed A-6",
+                "Cl\u{200B}osing A-1, fi\u{200B}xing A-2, RE\u{200B}SOLVING A-3, co\u{200B}mplete A-4, Co\u{200B}mpletes A-5, co\u{200B}mpleted A-6",
+            ),
+            (
+                "Completing A-7: implement A-8, Implements A-9, implemented A-10, IMPLEMENTING A-11",
+                "Co\u{200B}mpleting A-7: im\u{200B}plement A-8, Im\u{200B}plements A-9, im\u{200B}plemented A-10, IM\u{200B}PLEMENTING A-11",
+            ),
+            // `linear` is broken only before `issue`.
+            (
+                "Linear issue A-12, linear\n  ISSUE A-13, Linear issues, linear, Linear: issue, nonlinear issue",
+                "Li\u{200B}near issue A-12, li\u{200B}near\n  ISSUE A-13, Linear issues, linear, Linear: issue, nonlinear issue",
+            ),
+            (
+                "completeness, implementation, incomplete, closings, prefixing, linearissue",
+                "completeness, implementation, incomplete, closings, prefixing, linearissue",
+            ),
+            // The lookalikes and glued letters GitHub ignored are kept.
+            (
+                "clos\u{435}s #5 f\u{131}xes #6 F\u{130}XES #7 \u{FF26}\u{FF49}\u{FF58}\u{FF45}\u{FF53} #8 \u{65E5}Fixes #9 \u{E9}Fixes #10 1Fixes #11 Fixes\u{65E5} #12 \u{FB01}xture",
+                "clos\u{435}s #5 f\u{131}xes #6 F\u{130}XES #7 \u{FF26}\u{FF49}\u{FF58}\u{FF45}\u{FF53} #8 \u{65E5}Fixes #9 \u{E9}Fixes #10 1Fixes #11 Fixes\u{65E5} #12 \u{FB01}xture",
             ),
         ];
         for (text, broken) in cases {
