@@ -533,18 +533,33 @@ const CLOSING_KEYWORDS: [&str; 20] = [
 /// broken only when `issue` follows it.
 const LINEAR: &str = "linear";
 
-/// `text` with every closing keyword, as a whole word in any case, broken by
-/// a zero-width space after its second letter (`fi\u{200B}xes`), which GitHub
-/// does not read as a keyword (OWL-556, build-plan.md, "The GitHub Issues
-/// adapter", Delivery): so a "Fixes #5" an agent writes closes nothing. A
-/// word is a run of alphanumeric characters, so any other character next to
-/// a keyword, the zero-width space included, leaves it a keyword to break;
-/// a broken one reads as two words, neither a keyword. GitHub folds a long s
-/// (`ſ`) to `s` and the ligature `ﬁ` to `fi`, so `cloſes #5` and `ﬁxes #5`
-/// close too, and are broken alike (OWL-559); its other lookalikes, and a
-/// letter stuck to a keyword, close nothing. Linear closes an issue on more
-/// words, which are broken alike, and on `linear issue`, whose `linear` is
-/// broken when `issue` follows it after white space (OWL-559).
+/// The punctuation a plain word may hold, and the only characters beside
+/// white space and the zero-width space that may stand between a closing
+/// keyword and the word after it for the keyword to be kept whole: no issue
+/// reference GitHub or Linear reads is made of them, letters and digits
+/// alone (OWL-569, [`reference_may_follow`]).
+const PLAIN_PUNCTUATION: [char; 16] = [
+    ':', '(', ')', '!', ',', '.', ';', '-', '\'', '"', '?', '_', '\u{2018}', '\u{2019}',
+    '\u{201C}', '\u{201D}',
+];
+
+/// `text` with every closing keyword an issue's reference may follow, as a
+/// whole word in any case, broken by a zero-width space after its second
+/// letter (`fi\u{200B}xes`), which GitHub does not read as a keyword
+/// (OWL-556, build-plan.md, "The GitHub Issues adapter", Delivery): so a
+/// "Fixes #5" an agent writes closes nothing. A keyword no reference follows
+/// is kept, so that a "fix: handle empty input" subject reaches the default
+/// branch as it was written (OWL-569, [`reference_may_follow`]). A word is a
+/// run of alphanumeric characters, so any other character next to a keyword,
+/// the zero-width space included, leaves it a keyword; a broken one reads as
+/// two words, neither a keyword. GitHub folds a long s (`ſ`) to `s` and the
+/// ligature `ﬁ` to `fi`, so `cloſes #5` and `ﬁxes #5` close too, and are
+/// broken alike (OWL-559); its other lookalikes, and a letter stuck to a
+/// keyword, close nothing. Linear closes an issue on more words, which are
+/// broken alike, and on `linear issue`, whose `linear` is broken when `issue`
+/// follows it after white space and a reference may follow `issue`
+/// (OWL-559). A text broken once is broken alike again: a break lands after
+/// a keyword's second letter, never where the test of a following word looks.
 pub(crate) fn neutralise_closing_keywords(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     let mut rest = text;
@@ -553,7 +568,10 @@ pub(crate) fn neutralise_closing_keywords(text: &str) -> String {
             .find(|c: char| !c.is_alphanumeric())
             .unwrap_or(rest.len());
         let (word, after) = rest.split_at(end);
-        if let Some(at) = closing_keyword_break(word).or_else(|| linear_issue_break(word, after)) {
+        let at = closing_keyword_break(word)
+            .filter(|_| reference_may_follow(after))
+            .or_else(|| linear_issue_break(word, after));
+        if let Some(at) = at {
             out.push_str(&word[..at]);
             out.push('\u{200B}');
             out.push_str(&word[at..]);
@@ -593,7 +611,8 @@ fn closing_keyword_break(word: &str) -> Option<usize> {
 
 /// Where to break `word` when it is the `linear` of Linear's `linear issue`,
 /// `after` the text that follows it: after its second letter when white
-/// space, then the word `issue`, follow. `None` otherwise.
+/// space, then the word `issue`, follow, and a reference may follow `issue`
+/// ([`reference_may_follow`]). `None` otherwise.
 fn linear_issue_break(word: &str, after: &str) -> Option<usize> {
     if !word.eq_ignore_ascii_case(LINEAR) {
         return None;
@@ -605,11 +624,52 @@ fn linear_issue_break(word: &str, after: &str) -> Option<usize> {
     let end = next
         .find(|c: char| !c.is_alphanumeric())
         .unwrap_or(next.len());
-    next[..end].eq_ignore_ascii_case("issue").then_some(2)
+    (next[..end].eq_ignore_ascii_case("issue") && reference_may_follow(&next[end..])).then_some(2)
 }
 
-/// The body of a pull request the runner opens: the agent's text, its
-/// closing keywords broken ([`neutralise_closing_keywords`]), then the
+/// Whether an issue's reference may start `after`, the text that follows a
+/// closing keyword (OWL-569): anything but a plain word, or the end of the
+/// text, reached through white space, zero-width spaces and plain
+/// punctuation ([`PLAIN_PUNCTUATION`]) alone. A plain word runs up to white
+/// space, starts with a letter, holds only letters, digits and plain
+/// punctuation, and holds no `-` before a digit (`GH-5`, `OWL-12`) nor
+/// before the word `new` (Linear's `OWL-NEW`). So `fix: handle`,
+/// `fix(parser): handle` and `Fix the parser (#5)` keep their keyword, which
+/// neither GitHub nor Linear closed an issue on, and anything else, `#5`,
+/// `o/r#5`, a URL, a link, `&#35;5`, an unknown character, breaks it
+/// (build-plan.md, "The GitHub Issues adapter", Delivery). A zero-width
+/// space in the word is not read, so a break inside it, after a keyword's
+/// second letter, leaves the verdict on a second pass as it was.
+fn reference_may_follow(after: &str) -> bool {
+    let rest = after.trim_start_matches(|c: char| {
+        c.is_whitespace() || c == '\u{200B}' || PLAIN_PUNCTUATION.contains(&c)
+    });
+    let word: String = rest
+        .split(char::is_whitespace)
+        .next()
+        .unwrap_or_default()
+        .chars()
+        .filter(|&c| c != '\u{200B}')
+        .collect();
+    let Some(first) = word.chars().next() else {
+        return false;
+    };
+    !first.is_alphabetic()
+        || word
+            .chars()
+            .any(|c| !c.is_alphanumeric() && !PLAIN_PUNCTUATION.contains(&c))
+        || word.match_indices('-').any(|(at, _)| {
+            let tail = &word[at + 1..];
+            let end = tail
+                .find(|c: char| !c.is_alphanumeric())
+                .unwrap_or(tail.len());
+            tail.starts_with(char::is_numeric) || tail[..end].eq_ignore_ascii_case("new")
+        })
+}
+
+/// The body of a pull request the runner opens: the agent's text, the
+/// closing keywords a reference may follow broken
+/// ([`neutralise_closing_keywords`]), then the
 /// tracker's closing line ([`with_closing_line`]), the only one that closes
 /// an issue (OWL-556).
 pub(crate) fn pull_request_body(agent: &str, line: Option<String>) -> String {
@@ -5547,11 +5607,13 @@ Merge state reported by the forge: `CLEAN`.
         assert_eq!(with_closing_line("Says hello.", None), "Says hello.");
     }
 
-    /// Every closing keyword, as a whole word in any case and whatever
-    /// surrounds it, is broken after its second letter; other words, and a
-    /// keyword already broken, are left as they are (OWL-556).
+    /// Every closing keyword a reference may follow, as a whole word in any
+    /// case and whatever stands before it, is broken after its second
+    /// letter, and a second pass changes nothing (OWL-556, OWL-569): each
+    /// form GitHub or Linear closed an issue on, and the shapes the rule
+    /// cannot tell from one, which it breaks too.
     #[test]
-    fn closing_keywords_are_broken_by_a_zero_width_space() {
+    fn a_closing_keyword_before_a_reference_is_broken() {
         let cases = [
             ("Fixes #5", "Fi\u{200B}xes #5"),
             ("fix: o/r#5", "fi\u{200B}x: o/r#5"),
@@ -5564,8 +5626,43 @@ Merge state reported by the forge: `CLEAN`.
                 "Re\u{200B}solves \\#5, cl\u{200B}oses &#35;6",
             ),
             (
-                "close#5 resolve resolved fixed",
-                "cl\u{200B}ose#5 re\u{200B}solve re\u{200B}solved fi\u{200B}xed",
+                "close#5 resolve GH-6 resolved\n#7 fixed &num;8",
+                "cl\u{200B}ose#5 re\u{200B}solve GH-6 re\u{200B}solved\n#7 fi\u{200B}xed &num;8",
+            ),
+            // The forms GitHub and Linear closed on (OWL-569, 2026-11-15).
+            (
+                "Fixes: #5 FIXES: A-6",
+                "Fi\u{200B}xes: #5 FI\u{200B}XES: A-6",
+            ),
+            (
+                "Fixes [#5](https://github.com/o/r/issues/5), fixes [the bug](https://github.com/o/r/issues/6), fixes [](https://github.com/o/r/issues/7)",
+                "Fi\u{200B}xes [#5](https://github.com/o/r/issues/5), fi\u{200B}xes [the bug](https://github.com/o/r/issues/6), fi\u{200B}xes [](https://github.com/o/r/issues/7)",
+            ),
+            (
+                "Fixes <https://github.com/o/r/issues/5> fixes https://linear.app/w/issue/A-6/title",
+                "Fi\u{200B}xes <https://github.com/o/r/issues/5> fi\u{200B}xes https://linear.app/w/issue/A-6/title",
+            ),
+            (
+                "Fixes GH-5, #6 and fixes a-7, A-8 or fixes A-NEW",
+                "Fi\u{200B}xes GH-5, #6 and fi\u{200B}xes a-7, A-8 or fi\u{200B}xes A-NEW",
+            ),
+            // Shapes both ignored, broken all the same: not a plain word.
+            (
+                "fix(#5): handle empty input\nfix(A-6): handle empty input",
+                "fi\u{200B}x(#5): handle empty input\nfi\u{200B}x(A-6): handle empty input",
+            ),
+            (
+                "Fixes (#5), fixes **#6**, fix\n\n#7",
+                "Fi\u{200B}xes (#5), fi\u{200B}xes **#6**, fi\u{200B}x\n\n#7",
+            ),
+            (
+                "Fixes \u{2060}#5, fixes \u{FF03}6, fixes 7, fixes `#8`, fixes \u{200B}#9, fix\u{200B}\n#10, fixes GH\u{200B}-11",
+                "Fi\u{200B}xes \u{2060}#5, fi\u{200B}xes \u{FF03}6, fi\u{200B}xes 7, fi\u{200B}xes `#8`, fi\u{200B}xes \u{200B}#9, fi\u{200B}x\u{200B}\n#10, fi\u{200B}xes GH\u{200B}-11",
+            ),
+            // A keyword before a keyword: only the one a reference follows.
+            (
+                "Fix fixes #5, Linear issue fixes #6",
+                "Fix fi\u{200B}xes #5, Linear issue fi\u{200B}xes #6",
             ),
             (
                 "`Fixes #5`\n**Closes** #6",
@@ -5580,10 +5677,6 @@ Merge state reported by the forge: `CLEAN`.
             (
                 "\u{2060}Fixes #5 \u{FEFF}closes #6\u{A0}resolved #7",
                 "\u{2060}Fi\u{200B}xes #5 \u{FEFF}cl\u{200B}oses #6\u{A0}re\u{200B}solved #7",
-            ),
-            (
-                "Prefixes, fixture, closet, unresolved: #5 é",
-                "Prefixes, fixture, closet, unresolved: #5 é",
             ),
             // GitHub folds `ſ` to `s` and `ﬁ` to `fi`: both closed their
             // issue (OWL-559, 2026-11-15), so both are broken.
@@ -5605,19 +5698,36 @@ Merge state reported by the forge: `CLEAN`.
                 "Linear issue A-12, linear\n  ISSUE A-13, Linear issues, linear, Linear: issue, nonlinear issue",
                 "Li\u{200B}near issue A-12, li\u{200B}near\n  ISSUE A-13, Linear issues, linear, Linear: issue, nonlinear issue",
             ),
-            (
-                "completeness, implementation, incomplete, closings, prefixing, linearissue",
-                "completeness, implementation, incomplete, closings, prefixing, linearissue",
-            ),
-            // The lookalikes and glued letters GitHub ignored are kept.
-            (
-                "clos\u{435}s #5 f\u{131}xes #6 F\u{130}XES #7 \u{FF26}\u{FF49}\u{FF58}\u{FF45}\u{FF53} #8 \u{65E5}Fixes #9 \u{E9}Fixes #10 1Fixes #11 Fixes\u{65E5} #12 \u{FB01}xture",
-                "clos\u{435}s #5 f\u{131}xes #6 F\u{130}XES #7 \u{FF26}\u{FF49}\u{FF58}\u{FF45}\u{FF53} #8 \u{65E5}Fixes #9 \u{E9}Fixes #10 1Fixes #11 Fixes\u{65E5} #12 \u{FB01}xture",
-            ),
         ];
         for (text, broken) in cases {
             assert_eq!(neutralise_closing_keywords(text), broken, "{text}");
             assert_eq!(neutralise_closing_keywords(broken), broken, "{broken}");
+        }
+    }
+
+    /// A closing keyword no reference follows, a plain word or the end of
+    /// the text, is kept whole, so a Conventional Commits `fix:` subject
+    /// reaches the default branch as written (OWL-569); so are words that
+    /// are no keyword, the lookalikes GitHub ignored, and a text broken once.
+    #[test]
+    fn a_closing_keyword_before_no_reference_is_kept() {
+        let kept = [
+            "fix: handle empty input",
+            "fix(parser): handle empty input\n\nfix(on_demand)!: drop the flag",
+            "Fix the parser. Fixed. Closes the loop; resolves nothing\nResolves\nCloses:\n",
+            // A word between the keyword and the reference: neither GitHub
+            // nor Linear closed on these (OWL-569, 2026-11-15).
+            "Fixes issue #5, fix: handle #6, fix(parser): #7, Fix the parser (#8), Fixes the bug in #9",
+            "Fixes issue A-5, fix: handle A-6, fix(parser): A-7, Fix the parser (A-8)",
+            "Implement OAuth2 login, resolve re-runs, complete parser\u{2019}s state, \u{201C}fix\u{201D} \u{2018}this\u{2019}",
+            "a Linear issue's state, Linear issue, linear issue: the parser",
+            "Fi\u{200B}xes #5 and Fix fi\u{200B}xes #6, Fixes\u{200B} the parser",
+            "Prefixes, fixture, closet, unresolved: #5 é",
+            "completeness, implementation, incomplete, closings, prefixing, linearissue",
+            "clos\u{435}s #5 f\u{131}xes #6 F\u{130}XES #7 \u{FF26}\u{FF49}\u{FF58}\u{FF45}\u{FF53} #8 \u{65E5}Fixes #9 \u{E9}Fixes #10 1Fixes #11 Fixes\u{65E5} #12 \u{FB01}xture",
+        ];
+        for text in kept {
+            assert_eq!(neutralise_closing_keywords(text), text, "{text}");
         }
     }
 
@@ -5639,6 +5749,12 @@ Merge state reported by the forge: `CLEAN`.
         assert_eq!(live, ["Closes"]);
         assert!(body.ends_with("\n\nCloses #12"));
         assert_eq!(pull_request_body("Fixes #5", None), "Fi\u{200B}xes #5");
+        // A keyword ending the agent's text stays whole: the closing line's
+        // own keyword stands between it and the reference.
+        assert_eq!(
+            pull_request_body("Says what it fixes", line()),
+            "Says what it fixes\n\nCloses #12"
+        );
     }
 
     /// The INTAKE comment (OWL-248): the verdict, each dependency with its

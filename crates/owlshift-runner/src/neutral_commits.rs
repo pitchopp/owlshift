@@ -15,8 +15,9 @@
 //! (`gpgsig`, `gpgsig-sha256`, `mergetag`) dropped. Its tree, author,
 //! committer and dates are kept. An image is thus a function of the commit
 //! and its ancestry alone: a push made again after a crash sends the same
-//! ids, and a commit with no keyword whose parents are unchanged keeps its
-//! id, no object written.
+//! ids, and a commit with no keyword a reference follows (a `fix: handle
+//! empty input` subject keeps its keyword, OWL-569) whose parents are
+//! unchanged keeps its id, no object written.
 
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
@@ -149,8 +150,8 @@ fn rewrite(
 /// The raw commit object `raw` with its message's closing keywords broken
 /// and each parent named in `images` replaced by its image; `None` when
 /// neither changes anything. A message that is not UTF-8 is read lossily,
-/// and only when that reading holds a keyword is it written back, in UTF-8,
-/// its `encoding` header dropped. Once anything changes, the signatures and
+/// and only when that reading holds a keyword to break is it written back,
+/// in UTF-8, its `encoding` header dropped. Once anything changes, the signatures and
 /// the merged tags' headers, which no longer match, are dropped.
 fn neutral_object(raw: &[u8], images: &HashMap<String, String>) -> Option<Vec<u8>> {
     let (headers, message) = match raw.windows(2).position(|pair| pair == b"\n\n") {
@@ -318,7 +319,8 @@ mod tests {
     }
 
     /// A message that is not UTF-8 is read lossily: written back in UTF-8,
-    /// its `encoding` header dropped, only when it holds a keyword.
+    /// its `encoding` header dropped, only when it holds a keyword to break,
+    /// one a reference follows (OWL-569).
     #[test]
     fn a_message_not_in_utf8_is_rewritten_only_for_a_keyword() {
         let head = format!(
@@ -335,9 +337,12 @@ mod tests {
                 id('a')
             )
         );
-        let mut plain = head.into_bytes();
+        let mut plain = head.clone().into_bytes();
         plain.extend_from_slice(b"Caf\xe9\n");
         assert_eq!(neutral_object(&plain, &HashMap::new()), None);
+        let mut unreferenced = head.into_bytes();
+        unreferenced.extend_from_slice(b"fix: handle the Caf\xe9 input\n");
+        assert_eq!(neutral_object(&unreferenced, &HashMap::new()), None);
     }
 
     /// Only a step's `commit` naming one rewritten commit alone changes, at
@@ -441,7 +446,8 @@ mod tests {
     /// image keeps its tree, author, committer and dates, its parents the
     /// images or the base's; the same call gives the same ids, a call on the
     /// image changes nothing, and `image` computes the head's without
-    /// writing it. A history with no keyword keeps its head.
+    /// writing it. A history with no keyword, or with a `fix:` subject no
+    /// reference follows (OWL-569), keeps its head.
     #[test]
     fn a_history_is_rewritten_above_its_bases_alone_and_always_alike() {
         let repo = Repo::new();
@@ -494,7 +500,10 @@ mod tests {
         assert_eq!(image(git, checkout, &merge, &[base, newer]), Ok(head));
 
         let plain = repo.commit("four", "Add four");
-        let kept = neutral_history(git, checkout, &plain, &[merge]).unwrap();
+        let kept = neutral_history(git, checkout, &plain, std::slice::from_ref(&merge)).unwrap();
         assert_eq!((kept.head.commit(), kept.rewritten.len()), (&plain, 0));
+        let fix = repo.commit("five", "fix(parser): handle empty input");
+        let kept = neutral_history(git, checkout, &fix, &[merge]).unwrap();
+        assert_eq!((kept.head.commit(), kept.rewritten.len()), (&fix, 0));
     }
 }
