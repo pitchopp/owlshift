@@ -1782,7 +1782,7 @@ function drawRunHead(run, info) {
   run.el.classList.toggle("run-failed", stateClass === "state-danger");
   clear(run.summary);
   run.summary.appendChild(make("span", "run-id", info.id));
-  run.summary.appendChild(make("span", "run-role", (info.role || "run") +
+  run.summary.appendChild(make("span", "run-role", (info.role || "run").replace(/_/g, " ") +
     (info.attempt ? " #" + info.attempt : "")));
   run.summary.appendChild(make("span", stateClass, state));
   if (typeof info.elapsed_ms === "number") {

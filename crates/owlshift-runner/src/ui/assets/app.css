@@ -175,6 +175,10 @@ code,
   font-family: "JetBrains Mono", ui-monospace, "SF Mono", Menlo, Consolas, monospace;
 }
 
+code {
+  overflow-wrap: anywhere;
+}
+
 /* Section 5's scale: 32 a screen's title, 20 a section's or a card's, 16
    text, 13 and 12 labels and metadata, 48 a figure. */
 h1,
@@ -765,7 +769,7 @@ main {
 /* Figures: a count at 48 px, its label above, its first identifiers below. */
 .tiles {
   display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(160px, 1fr));
+  grid-template-columns: repeat(auto-fill, minmax(200px, 1fr));
   gap: 12px;
 }
 
@@ -794,6 +798,8 @@ main {
   font-weight: 800;
   line-height: 1.15;
   font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+  overflow-wrap: normal;
 }
 
 .tile-figure.state-success::before,

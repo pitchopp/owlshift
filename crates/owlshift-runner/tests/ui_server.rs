@@ -1243,9 +1243,8 @@ fn every_text_pair_of_the_contrast_table_holds_in_both_themes() {
         // The danger tint of a failed run's row (OWL-575) is danger at 8 %
         // over the surface, and every text the row holds reads on it.
         let tint = at("danger-tint");
-        let mixed = [0, 1, 2].map(|channel| {
-            (0.08 * at("danger")[channel] + 0.92 * at("surface")[channel]).round()
-        });
+        let mixed = [0, 1, 2]
+            .map(|channel| (0.08 * at("danger")[channel] + 0.92 * at("surface")[channel]).round());
         assert_eq!(tint, mixed, "{theme} danger-tint");
         let on_tint: [(&str, f64, f64); 5] = [
             ("text", 14.53, 13.20),
@@ -1589,7 +1588,13 @@ fn every_button_is_at_least_44px_tall() {
     }
     for part in INDEX_HTML.split("<button ").skip(1) {
         let tag = &part[..part.find('>').unwrap()];
-        let class = tag.split("class=\"").nth(1).unwrap().split('"').next().unwrap();
+        let class = tag
+            .split("class=\"")
+            .nth(1)
+            .unwrap()
+            .split('"')
+            .next()
+            .unwrap();
         classes.insert(class.split_whitespace().next().unwrap().to_owned());
     }
     assert!(classes.len() >= 4, "{classes:?}");
