@@ -16,6 +16,9 @@
 //! - *The decider's name* ([`Keys::decider_name`], OWL-517): read through
 //!   the key on a thread of its own, once per project and account, the page
 //!   request never waiting on it; the account id stands for it meanwhile.
+//! - *The ticket's link* ([`tracker_link`], OWL-580): its issue on the
+//!   tracker, from the key's workspace on Linear and the repository on
+//!   GitHub Issues, which the ticket page's header draws.
 //! - *The composition* ([`compose`]): the picked options and the texts in the
 //!   answer check's form (`Q1: B`, `ok` for every recommendation), with a
 //!   last line `go` unless "count it now" is unticked.
@@ -334,21 +337,31 @@ pub(crate) fn unusable(why: &str) -> String {
     )
 }
 
-/// The ticket's link on Linear, from the workspace the key read, with no
-/// title slug; none for a workspace key that is not plain letters, digits,
-/// `-` and `_`, so the page is never handed another address. An account
-/// with no workspace is a GitHub account (OWL-566): the link is the key
-/// tracker's own, `https://github.com/<owner>/<repo>/issues/<n>`, built from
-/// the project's repository with no call.
-fn link(account: &KeyAccount, tracker: &dyn Tracker, ticket: &TicketId) -> Option<String> {
+/// The ticket's link on its tracker, which the page's header draws for
+/// every ticket (OWL-580) and the reply form beside it, from the project's
+/// key once read: none while it is read or when it could not be, so none on
+/// the Markdown tracker, which has no key. On Linear, the workspace the key
+/// read, with no title slug; none for a workspace key that is not plain
+/// letters, digits, `-` and `_`, so the page is never handed another
+/// address. An account with no workspace is a GitHub account (OWL-566): the
+/// link is the key tracker's own,
+/// `https://github.com/<owner>/<repo>/issues/<n>`, built from the project's
+/// repository with no call. No text an agent or a tracker user wrote goes
+/// into it.
+pub fn tracker_link(key: &KeyState, ticket: &TicketId) -> Option<String> {
+    let KeyState::Ready(Key {
+        account, tracker, ..
+    }) = key
+    else {
+        return None;
+    };
     if account.workspace.is_empty() {
         return tracker.ticket_url(ticket);
     }
-    let plain = !account.workspace.is_empty()
-        && account
-            .workspace
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_');
+    let plain = account
+        .workspace
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_');
     plain.then(|| format!("https://linear.app/{}/issue/{}", account.workspace, ticket))
 }
 
@@ -360,13 +373,11 @@ fn link(account: &KeyAccount, tracker: &dyn Tracker, ticket: &TicketId) -> Optio
 /// tracker shows for that account: the key's own when it is the decider's,
 /// otherwise what `names` has read of it so far ([`Keys::decider_name`]),
 /// asked only of a read key that is not the decider's; null while none is.
-/// `link` comes from the workspace the key read on Linear and from the key's
-/// tracker on GitHub Issues, so it is null until the key is read,
-/// and when it could not be.
+/// The ticket's link is the snapshot's own ([`tracker_link`]), not the
+/// section's.
 pub fn section(
     record: &TicketRecord,
     key: &KeyState,
-    ticket: &TicketId,
     names: &dyn Fn(&str) -> Option<String>,
 ) -> Value {
     let Some(ask) = open_ask(record) else {
@@ -390,22 +401,14 @@ pub fn section(
     }
     let decider = &ask.decider;
     let mut decider_name = None;
-    let (key_value, offered, why_not, link) = match key {
+    let (key_value, offered, why_not) = match key {
         KeyState::Reading => (
             json!({ "reading": true }),
             false,
             Some("the account of the project's tracker key is still being read".to_owned()),
-            Value::Null,
         ),
-        KeyState::Unavailable(why) => (
-            json!({ "why": why }),
-            false,
-            Some(unusable(why)),
-            Value::Null,
-        ),
-        KeyState::Ready(Key {
-            account, tracker, ..
-        }) => {
+        KeyState::Unavailable(why) => (json!({ "why": why }), false, Some(unusable(why))),
+        KeyState::Ready(Key { account, .. }) => {
             decider_name = if same_account(&account.id, &decider.account) {
                 Some(account.name.clone())
             } else {
@@ -425,7 +428,6 @@ pub fn section(
                 json!({ "name": account.name, "account": account.id }),
                 why_not.is_none(),
                 why_not,
-                json!(self::link(account, tracker.as_ref(), ticket)),
             )
         }
     };
@@ -439,7 +441,6 @@ pub fn section(
         "key": key_value,
         "offered": offered,
         "why_not": why_not,
-        "link": link,
     })
 }
 
@@ -1120,7 +1121,7 @@ pub(crate) mod tests {
     #[test]
     fn the_form_is_offered_to_the_asks_decider_only() {
         let record = waiting();
-        let offered = section(&record, &ready("maintainer"), &ticket(), &|_| None);
+        let offered = section(&record, &ready("maintainer"), &|_| None);
         assert_eq!(offered["offered"], true);
         assert!(offered["why_not"].is_null());
         assert_eq!(offered["ask"], "ask-1");
@@ -1128,8 +1129,7 @@ pub(crate) mod tests {
         assert_eq!(offered["approval"], false);
         assert_eq!(offered["words"], json!({ "Q1": [], "Q2": [] }));
         assert_eq!(offered["key"]["name"], "Ada");
-        assert_eq!(offered["link"], "https://linear.app/owlshift/issue/OWL-1");
-        let other = section(&record, &ready("someone-else"), &ticket(), &|_| None);
+        let other = section(&record, &ready("someone-else"), &|_| None);
         assert_eq!(other["offered"], false);
         assert!(
             other["why_not"]
@@ -1141,7 +1141,6 @@ pub(crate) mod tests {
             other["decider"],
             json!({ "account": "maintainer", "by": "assignee", "name": null })
         );
-        assert_eq!(other["link"], "https://linear.app/owlshift/issue/OWL-1");
         let mut app = account("maintainer");
         app.app = true;
         let app = KeyState::Ready(Key {
@@ -1151,28 +1150,13 @@ pub(crate) mod tests {
             ),
             names: Box::new(|_: &str| Ok(None)),
         });
-        assert_eq!(
-            section(&record, &app, &ticket(), &|_| None)["offered"],
-            false
-        );
-        // A workspace key that is not plain gives no link.
-        let mut odd = account("maintainer");
-        odd.workspace = "x/../y".to_owned();
-        let odd = KeyState::Ready(Key {
-            account: odd,
-            tracker: Box::new(
-                owlshift_adapters::tracker::linear::LinearTracker::with_transport(Unreachable),
-            ),
-            names: Box::new(|_: &str| Ok(None)),
-        });
-        assert!(section(&record, &odd, &ticket(), &|_| None)["link"].is_null());
-        // Without a read key, no form and no link: the workspace is the
-        // key's to tell.
+        assert_eq!(section(&record, &app, &|_| None)["offered"], false);
+        // Without a read key, no form.
         for state in [
             KeyState::Reading,
             KeyState::Unavailable("no Linear API key is stored".into()),
         ] {
-            let none = section(&record, &state, &ticket(), &|_| {
+            let none = section(&record, &state, &|_| {
                 panic!("a key not read asks for no name")
             });
             if matches!(state, KeyState::Unavailable(_)) {
@@ -1183,19 +1167,45 @@ pub(crate) mod tests {
                 );
             }
             assert_eq!(none["offered"], false, "{state:?}");
-            assert!(none["link"].is_null(), "{state:?}");
             assert!(none["why_not"].is_string(), "{state:?}");
             assert_eq!(none["decider"]["account"], "maintainer");
         }
         // A ticket that waits for no answer has no reply section.
         let mut resumed = waiting();
         resumed.state.waiting = None;
-        assert!(section(&resumed, &ready("maintainer"), &ticket(), &|_| None).is_null());
+        assert!(section(&resumed, &ready("maintainer"), &|_| None).is_null());
+    }
+
+    /// The ticket's link on Linear is built from the workspace the key read
+    /// and the identifier (OWL-580): none for a workspace that is not plain,
+    /// and none without a read key, the workspace being the key's to tell.
+    #[test]
+    fn the_linear_link_is_the_keys_workspace_and_the_ticket() {
+        assert_eq!(
+            tracker_link(&ready("someone-else"), &ticket()).as_deref(),
+            Some("https://linear.app/owlshift/issue/OWL-1")
+        );
+        let mut odd = account("maintainer");
+        odd.workspace = "x/../y".to_owned();
+        let odd = KeyState::Ready(Key {
+            account: odd,
+            tracker: Box::new(
+                owlshift_adapters::tracker::linear::LinearTracker::with_transport(Unreachable),
+            ),
+            names: Box::new(|_: &str| Ok(None)),
+        });
+        assert_eq!(tracker_link(&odd, &ticket()), None);
+        for state in [
+            KeyState::Reading,
+            KeyState::Unavailable("no Linear API key is stored".into()),
+        ] {
+            assert_eq!(tracker_link(&state, &ticket()), None, "{state:?}");
+        }
     }
 
     /// A GitHub Issues key (OWL-552) has no workspace: the form is offered to
-    /// the decider by the numeric id, and the page links the issue on
-    /// github.com (OWL-566), whoever the key is, as it links Linear's.
+    /// the decider by the numeric id, and the link is the issue on github.com
+    /// the key's tracker builds (OWL-566), whoever the key is.
     #[test]
     fn a_github_key_is_offered_to_the_decider_and_links_the_issue() {
         /// What `GitHubTracker::ticket_url` answers, with no call.
@@ -1235,11 +1245,10 @@ pub(crate) mod tests {
             })
         };
         let record = waiting();
-        let offered = section(&record, &github("maintainer"), &ticket(), &|_| None);
+        let offered = section(&record, &github("maintainer"), &|_| None);
         assert_eq!(offered["offered"], true);
-        assert_eq!(offered["link"], url);
         assert_eq!(offered["key"]["name"], "bea");
-        let other = section(&record, &github("7"), &ticket(), &|_| None);
+        let other = section(&record, &github("7"), &|_| None);
         assert_eq!(other["offered"], false);
         assert!(
             other["why_not"]
@@ -1247,7 +1256,7 @@ pub(crate) mod tests {
                 .unwrap()
                 .contains("not the decider's")
         );
-        assert_eq!(other["link"], url);
+        assert_eq!(tracker_link(&github("7"), &ticket()).as_deref(), Some(url));
         // A tracker with no link for the ticket leaves the page none.
         let none = KeyState::Ready(Key {
             account: KeyAccount {
@@ -1259,7 +1268,7 @@ pub(crate) mod tests {
             tracker: Box::new(Github(false)),
             names: Box::new(|_: &str| Ok(None)),
         });
-        assert!(section(&record, &none, &ticket(), &|_| None)["link"].is_null());
+        assert_eq!(tracker_link(&none, &ticket()), None);
     }
 
     /// The decider is named by the key's name when the key is theirs, else
@@ -1272,13 +1281,13 @@ pub(crate) mod tests {
             asked.borrow_mut().push(account.to_owned());
             Some("person-1".to_owned())
         };
-        let other = section(&record, &ready("someone-else"), &ticket(), &names);
+        let other = section(&record, &ready("someone-else"), &names);
         assert_eq!(other["decider"]["name"], "person-1");
         assert_eq!(other["decider"]["account"], "maintainer");
         assert_eq!(*asked.borrow(), ["maintainer"]);
-        let not_yet = section(&record, &ready("someone-else"), &ticket(), &|_| None);
+        let not_yet = section(&record, &ready("someone-else"), &|_| None);
         assert!(not_yet["decider"]["name"].is_null());
-        let theirs = section(&record, &ready("maintainer"), &ticket(), &|_| {
+        let theirs = section(&record, &ready("maintainer"), &|_| {
             panic!("the key's own account is not read")
         });
         assert_eq!(theirs["decider"]["name"], "Ada");
@@ -1408,14 +1417,14 @@ pub(crate) mod tests {
         let mut record = waiting();
         let question = approval_question(&plan(vec![fork("Markdown", "Plain text")]), Some(link));
         record.questions.asks[0].questions = vec![question];
-        let reply = section(&record, &ready("maintainer"), &ticket, &|_| None);
+        let reply = section(&record, &ready("maintainer"), &|_| None);
         assert_eq!(reply["approval"], true);
         assert_eq!(reply["words"], json!({ "Q1": ["B"] }));
         record.questions.asks[0].questions = vec![approval_question(
             &plan(vec![fork("Markdown", "Plain text")]),
             None,
         )];
-        let reply = section(&record, &ready("maintainer"), &ticket, &|_| None);
+        let reply = section(&record, &ready("maintainer"), &|_| None);
         assert_eq!(reply["words"], json!({ "Q1": [] }));
     }
 

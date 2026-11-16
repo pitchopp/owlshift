@@ -636,7 +636,7 @@ fn the_approval_form_is_drawn_in_the_plan_section() {
         "",
     );
     assert!(questions.contains("reply.approval"), "{questions}");
-    assert!(questions.contains("replyForm(handle, reply, questions)"));
+    assert!(questions.contains("replyForm(handle, reply, questions, snapshot.tracker_link)"));
     // A plan section that cannot draw the plan draws no form: the questions
     // section draws the approval's then, and says so.
     assert!(
@@ -659,7 +659,7 @@ fn the_approval_form_is_drawn_in_the_plan_section() {
         "",
     );
     assert!(plan.contains("reply && reply.approval"), "{plan}");
-    assert!(plan.contains("replyForm(handle, reply, snapshot.questions)"));
+    assert!(plan.contains("replyForm(handle, reply, snapshot.questions, snapshot.tracker_link)"));
     let diff = plan.find("diffEl(newest.diff)").unwrap();
     assert!(plan.find("planEl(plan.current.plan)").unwrap() < diff);
     assert!(diff < plan.find("replyForm(").unwrap());
@@ -673,7 +673,7 @@ fn the_approval_form_is_drawn_in_the_plan_section() {
     assert!(question.contains("words.required = needed;"));
     let form = block(
         &app_js,
-        "function replyForm(handle, reply, questions) {",
+        "function replyForm(handle, reply, questions, given) {",
         "",
     );
     assert!(form.contains("go.checked = draft.go;"));
@@ -1658,12 +1658,13 @@ fn egress(text: &str) -> Option<String> {
 #[test]
 fn no_asset_names_a_place_off_the_origin_and_the_policy_allows_none() {
     // The one address the page names: the prefix of a pull request's link
-    // (OWL-470), which a click navigates to. The page fetches nothing from it,
-    // and the policy allows no fetch.
+    // (OWL-470) and of an issue's on GitHub (OWL-580), which a click
+    // navigates to. The page fetches nothing from it, and the policy allows
+    // no fetch.
     const PULL_REQUEST_LINK: &str = "https://github.com/";
     assert_eq!(APP_JS.matches(PULL_REQUEST_LINK).count(), 1);
-    // And the prefix of a ticket's link on the tracker beside the reply form
-    // (OWL-475), which a click navigates to as well.
+    // And the prefix of a ticket's link on Linear (OWL-475, OWL-580), which
+    // a click navigates to as well.
     const TRACKER_LINK: &str = "https://linear.app/";
     assert_eq!(APP_JS.matches(TRACKER_LINK).count(), 1);
     let script = APP_JS
@@ -1952,7 +1953,7 @@ fn the_ticket_snapshot_takes_a_percent_encoded_project() {
         assert_eq!(reply.status, 200, "{query}: {}", reply.text());
         reply.assert_secured();
         let value = reply.json();
-        assert_eq!(value["format"], 2);
+        assert_eq!(value["format"], 3);
         assert_eq!(value["ticket"], "OWL-1");
         assert!(value["runs"]["runs"].as_array().unwrap().is_empty());
     }
@@ -2622,29 +2623,60 @@ fn since_counts_the_last_24_hours_when_it_is_given_no_time() {
 fn the_overview_page_links_only_a_guarded_pull_request_and_keeps_the_view_and_the_visit() {
     let app_js = lf(APP_JS);
     // The `.href` assignments are the pull request's, guarded by the
-    // repository and number patterns, and the tracker's link of the reply
-    // form (OWL-475), guarded by its own; the other links are ticket pages'
-    // hash routes, set as attributes from encoded parts.
+    // repository and number patterns, and the ticket's issue on its tracker
+    // (OWL-475, OWL-580), guarded by Linear's pattern or GitHub's and the
+    // page's own repository; the other links are ticket pages' hash routes,
+    // set as attributes from encoded parts.
     assert_eq!(app_js.matches(".href =").count(), 2);
-    let tracker = block(&app_js, "function trackerLink(reply) {", "");
+    let tracker = block(&app_js, "function trackerLink(given, project) {", "");
     let (guard, assigned) = tracker.split_once(".href =").unwrap();
-    assert!(guard.contains("given.startsWith(LINEAR_LINK)"), "{tracker}");
     assert!(
-        guard.contains("TRACKER_LINK_PATTERN.test(path)"),
+        guard.contains(
+            "url.startsWith(LINEAR_LINK) && TRACKER_LINK_PATTERN.test(url.slice(LINEAR_LINK.length))"
+        ),
         "{tracker}"
     );
-    assert!(guard.contains("return null;"), "{tracker}");
-    assert!(assigned.starts_with(" LINEAR_LINK + path;"), "{tracker}");
+    assert!(
+        guard.contains("GITHUB_ISSUE_PATTERN.exec(url.slice(GITHUB_LINK.length))"),
+        "{tracker}"
+    );
+    assert!(
+        guard.contains(
+            "plainRepository(issue[1]) && issue[1].toLowerCase() === project.toLowerCase()"
+        ),
+        "{tracker}"
+    );
+    assert!(
+        guard.contains("if (!host) {\n    return null;"),
+        "{tracker}"
+    );
+    assert!(assigned.starts_with(" host + path;"), "{tracker}");
     assert!(app_js.contains(
         "const TRACKER_LINK_PATTERN = /^[A-Za-z0-9_-]+\\/issue\\/[A-Za-z0-9]+-[0-9]+$/;"
     ));
+    assert!(
+        app_js
+            .contains("const GITHUB_ISSUE_PATTERN = /^([^/]+\\/[^/]+)\\/issues\\/([1-9][0-9]*)$/;")
+    );
+    // The header draws the ticket's issue whatever the ticket waits on.
+    let head = block(&app_js, "function renderHead(handle, snapshot) {", "");
+    assert!(
+        head.contains("trackerLink(snapshot.tracker_link, handle.project)"),
+        "{head}"
+    );
+    let plain = block(&app_js, "function plainRepository(project) {", "");
+    assert!(
+        plain.contains("REPOSITORY_PATTERN.test(project)"),
+        "{plain}"
+    );
+    assert!(plain.contains("n !== \".\" && n !== \"..\""), "{plain}");
     let link = block(&app_js, "function pullRequestLink(project, number) {", "");
     let (guard, assigned) = link.split_once(".href =").unwrap();
-    assert!(guard.contains("REPOSITORY_PATTERN.test(project)"), "{link}");
+    assert!(guard.contains("!plainRepository(project)"), "{link}");
     assert!(guard.contains("Number.isInteger(number)"), "{link}");
     assert!(guard.contains("return make(\"span\""), "{link}");
     assert!(
-        assigned.starts_with(" \"https://github.com/\" + project + \"/pull/\" + number;"),
+        assigned.starts_with(" GITHUB_LINK + project + \"/pull/\" + number;"),
         "{link}"
     );
     assert!(link.contains("link.rel = \"noopener noreferrer\";"));
@@ -3521,18 +3553,24 @@ impl ReplyGround {
         ticket_ref::write(&git, &checkout, &ticket, &record, None).unwrap();
     }
 
-    /// The snapshot's reply section, once the key's account is read.
-    fn reply(&self) -> Value {
+    /// The ticket's snapshot, once the key's account is read.
+    fn snapshot(&self) -> Value {
         let deadline = Instant::now() + Duration::from_secs(10);
         loop {
             let reply = self.ground.get("/api/ticket?project=o%2Fr&ticket=OWL-1");
             assert_eq!(reply.status, 200, "{}", reply.text());
-            let section = reply.json()["questions"]["reply"].clone();
-            if section["key"]["reading"] != true || Instant::now() > deadline {
-                return section;
+            let snapshot = reply.json();
+            if snapshot["questions"]["reply"]["key"]["reading"] != true || Instant::now() > deadline
+            {
+                return snapshot;
             }
             thread::sleep(Duration::from_millis(20));
         }
+    }
+
+    /// The snapshot's reply section, once the key's account is read.
+    fn reply(&self) -> Value {
+        self.snapshot()["questions"]["reply"].clone()
     }
 
     fn post(&self, body: &Value, headers: &[(&str, &str)]) -> Reply {
@@ -3575,7 +3613,10 @@ fn the_reply_form_is_offered_to_the_asks_decider_only() {
     assert_eq!(reply["offered"], true, "{reply:#}");
     assert_eq!(reply["ask"], "ask-1");
     assert_eq!(reply["key"]["name"], "Ada");
-    assert_eq!(reply["link"], "https://linear.app/owlshift/issue/OWL-1");
+    assert_eq!(
+        decider.snapshot()["tracker_link"],
+        "https://linear.app/owlshift/issue/OWL-1"
+    );
     for _ in 0..3 {
         decider.reply();
     }
@@ -3597,7 +3638,6 @@ fn the_reply_form_is_offered_to_the_asks_decider_only() {
     );
     assert_eq!(reply["decider"]["account"], "maintainer");
     assert_eq!(reply["decider"]["by"], "assignee");
-    assert_eq!(reply["link"], "https://linear.app/owlshift/issue/OWL-1");
     // The decider's name is read off the page request, which never waits on
     // it: a later snapshot names them (OWL-517).
     let deadline = Instant::now() + Duration::from_secs(10);
@@ -3617,7 +3657,7 @@ fn the_reply_form_is_offered_to_the_asks_decider_only() {
     keyless.waiting(REPLY_QUESTIONS);
     let reply = keyless.reply();
     assert_eq!(reply["offered"], false);
-    assert!(reply["link"].is_null());
+    assert!(keyless.snapshot()["tracker_link"].is_null());
     assert!(reply["key"]["why"].is_string(), "{reply:#}");
 }
 
