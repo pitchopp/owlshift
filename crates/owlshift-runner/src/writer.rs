@@ -570,8 +570,12 @@ const PLAIN_PUNCTUATION: [char; 16] = [
 /// (OWL-559). Linear's non-closing magic words, which move an issue's status
 /// without closing it, are broken by the same rule ([`NON_CLOSING_WORDS`],
 /// and `part of` and `contributes to` as `linear issue`, [`PHRASES`];
-/// OWL-570). A text broken once is broken alike again: a break lands after
-/// a keyword's second letter, never where the test of a following word looks.
+/// OWL-570). Linear's new-issue placeholder, `OWL-NEW`, from which Linear
+/// creates an issue, is broken after its hyphen (`OWL-\u{200B}NEW`), with or
+/// without a keyword before it ([`new_placeholder_follows`]; OWL-574). A
+/// text broken once is broken alike again: a break lands after a keyword's
+/// second letter or a placeholder's hyphen, never where the test of a
+/// following word looks.
 pub(crate) fn neutralise_closing_keywords(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     let mut rest = text;
@@ -592,6 +596,9 @@ pub(crate) fn neutralise_closing_keywords(text: &str) -> String {
         }
         let skip = after.chars().next().map_or(0, char::len_utf8);
         out.push_str(&after[..skip]);
+        if new_placeholder_follows(word, after) {
+            out.push('\u{200B}');
+        }
         rest = &after[skip..];
     }
     out
@@ -649,8 +656,9 @@ fn phrase_break(word: &str, after: &str) -> Option<usize> {
 /// punctuation ([`PLAIN_PUNCTUATION`]) alone. A plain word runs up to white
 /// space, starts with a letter, holds only letters, digits and plain
 /// punctuation, and holds no `-` before a digit (`GH-5`, `OWL-12`) nor
-/// before the word `new` (Linear's `OWL-NEW`). So `fix: handle`,
-/// `fix(parser): handle` and `Fix the parser (#5)` keep their keyword, which
+/// before the word `new` (Linear's `OWL-NEW`, in any case here, more widely
+/// than the placeholder's own break, [`new_placeholder_follows`]). So
+/// `fix: handle`, `fix(parser): handle` and `Fix the parser (#5)` keep their keyword, which
 /// neither GitHub nor Linear closed an issue on, and anything else, `#5`,
 /// `o/r#5`, a URL, a link, `&#35;5`, an unknown character, breaks it
 /// (build-plan.md, "The GitHub Issues adapter", Delivery). A zero-width
@@ -681,6 +689,29 @@ fn reference_may_follow(after: &str) -> bool {
                 .unwrap_or(tail.len());
             tail.starts_with(char::is_numeric) || tail[..end].eq_ignore_ascii_case("new")
         })
+}
+
+/// Whether `word`, a whole run of alphanumeric characters, and `after`, the
+/// text that follows it, make Linear's new-issue placeholder: a team's key
+/// in ASCII capitals and digits, starting with a capital, then `-NEW` with
+/// no letter or digit after it (`OWL-NEW`, `(OWL-NEW)`, `**OWL-NEW**.`).
+/// Linear's GitHub integration creates an issue from it in a pull request's
+/// body, the keyword before it broken or not; it ignored the placeholder
+/// broken after its hyphen, in the title, and in lower case (`owl-new`,
+/// `OWL-new`, `owl-NEW`) (OWL-574, build-plan.md, "The GitHub Issues
+/// adapter"). So the test is exact in case, where [`reference_may_follow`]
+/// reads `-new` in any case to keep a keyword before it broken. It sits
+/// beside the keyword break, not inside it: a key that is itself a keyword
+/// (`REF-NEW`) is broken as a placeholder all the same.
+fn new_placeholder_follows(word: &str, after: &str) -> bool {
+    let Some(tail) = after.strip_prefix("-NEW") else {
+        return false;
+    };
+    word.starts_with(|c: char| c.is_ascii_uppercase())
+        && word
+            .chars()
+            .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit())
+        && !tail.starts_with(char::is_alphanumeric)
 }
 
 /// The body of a pull request the runner opens: the agent's text, the
@@ -5659,8 +5690,16 @@ Merge state reported by the forge: `CLEAN`.
                 "Fi\u{200B}xes <https://github.com/o/r/issues/5> fi\u{200B}xes https://linear.app/w/issue/A-6/title",
             ),
             (
-                "Fixes GH-5, #6 and fixes a-7, A-8 or fixes A-NEW",
-                "Fi\u{200B}xes GH-5, #6 and fi\u{200B}xes a-7, A-8 or fi\u{200B}xes A-NEW",
+                "Fixes GH-5, #6 and fixes a-7, A-8 or fixes A-NEW, fixes a-new",
+                "Fi\u{200B}xes GH-5, #6 and fi\u{200B}xes a-7, A-8 or fi\u{200B}xes A-\u{200B}NEW, fi\u{200B}xes a-new",
+            ),
+            // Linear creates an issue from its placeholder, `KEY-NEW`, with
+            // or without a keyword before it (OWL-574, 2026-11-16): broken
+            // after its hyphen, wherever punctuation wraps it, and whatever
+            // the key, a keyword included.
+            (
+                "OWL-NEW\n(OWL-NEW), **A1-NEW**. `OWL-NEW`, _OWL-NEW\nRef REF-NEW",
+                "OWL-\u{200B}NEW\n(OWL-\u{200B}NEW), **A1-\u{200B}NEW**. `OWL-\u{200B}NEW`, _OWL-\u{200B}NEW\nRe\u{200B}f REF-\u{200B}NEW",
             ),
             // Shapes both ignored, broken all the same: not a plain word.
             (
@@ -5765,6 +5804,9 @@ Merge state reported by the forge: `CLEAN`.
             "part of the plan, contributes to the parser, Part of. Contributes to: the fix, part of",
             "Part: of A-1, contributes, to A-2, parts of A-3, counterpart of A-4, part ofA-5, partof A-6",
             "refsA-7, prefs A-8, preference A-9, towardsA-10, Relates to A-11, related to A-12",
+            // Words like Linear's placeholder that are not it, which Linear
+            // ignored in lower case (OWL-574, 2026-11-16).
+            "brand-new, OWL-new, owl-NEW, OWL-NEWS, xOWL-NEW, OWL-NEW1, 1OWL-NEW, \u{C9}-NEW",
         ];
         for text in kept {
             assert_eq!(neutralise_closing_keywords(text), text, "{text}");
