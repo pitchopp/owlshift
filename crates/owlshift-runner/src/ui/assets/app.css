@@ -1,7 +1,10 @@
 /* The web UI's style (OWL-467): the palette Dawn of visual identity
    section 4 as CSS variables, light on :root, dark under the system's dark
    setting unless the switch says light, and under the switch's dark. Only
-   classes: the Content-Security-Policy refuses style attributes. */
+   classes: the Content-Security-Policy refuses style attributes.
+   The layout (OWL-575) follows visual identity section 6, "The local web
+   UI's layout": a side bar and a top bar, cards on the surface, figures
+   before lists, sizes on section 5's scale and spacing on a 4 px grid. */
 
 /* The typefaces of visual identity section 5, carried in the binary and
    served from the same origin; Latin only. */
@@ -69,6 +72,9 @@
   --focus: #D9572A;
   --badge-fill: #FFDCCB;
   --badge-text: #7A2E10;
+  --accent: #D9572A;
+  --accent-text: #A83E17;
+  --danger-tint: #F9EEF0;
   /* States, light */
   --success: #1E7A52;
   --warning: #8A5A00;
@@ -93,6 +99,9 @@
     --focus: #FF8E5E;
     --badge-fill: #5A2A1E;
     --badge-text: #FFD2BD;
+    --accent: #FF8E5E;
+    --accent-text: #FF8E5E;
+    --danger-tint: #3C1D3E;
     --success: #7FE0B0;
     --warning: #FFD166;
     --danger: #FF6B81;
@@ -116,6 +125,9 @@
   --focus: #FF8E5E;
   --badge-fill: #5A2A1E;
   --badge-text: #FFD2BD;
+  --accent: #FF8E5E;
+  --accent-text: #FF8E5E;
+  --danger-tint: #3C1D3E;
   --success: #7FE0B0;
   --warning: #FFD166;
   --danger: #FF6B81;
@@ -126,8 +138,8 @@
   box-sizing: border-box;
 }
 
-/* A class's display, such as .bar-row's flex, would show an element the
-   page hides. */
+/* A class's display, such as .shell's grid, would show an element the page
+   hides. */
 [hidden] {
   display: none !important;
 }
@@ -138,7 +150,7 @@ body {
   color: var(--text);
   font-family: "Bricolage Grotesque", system-ui, -apple-system, "Segoe UI", sans-serif;
   font-optical-sizing: auto;
-  font-size: 15px;
+  font-size: 16px;
   line-height: 1.5;
 }
 
@@ -151,84 +163,340 @@ a {
   outline-offset: 2px;
 }
 
-code {
+/* Identifiers, durations, token counts and amounts: JetBrains Mono, so
+   columns of them align (section 6, "Type"). */
+code,
+.mono,
+.ticket-link,
+.run-id,
+.run-fact,
+.amount,
+.when {
   font-family: "JetBrains Mono", ui-monospace, "SF Mono", Menlo, Consolas, monospace;
 }
 
+/* Section 5's scale: 32 a screen's title, 20 a section's or a card's, 16
+   text, 13 and 12 labels and metadata, 48 a figure. */
 h1,
 h2,
-h3 {
+h3,
+h4,
+h5 {
   font-weight: 800;
   line-height: 1.15;
 }
 
-.bar {
-  background: var(--surface);
-  border-bottom: 1px solid var(--border-hairline);
-  padding: 8px 16px;
+h1 {
+  font-size: 32px;
+  letter-spacing: -0.01em;
 }
 
-.bar-row {
+h2 {
+  font-size: 20px;
+}
+
+h3 {
+  font-size: 16px;
+}
+
+h4,
+h5 {
+  font-size: 14px;
+  font-weight: 600;
+}
+
+summary,
+th,
+td,
+input,
+select,
+textarea,
+button {
+  font-size: 16px;
+}
+
+/* The frame: a side bar and a column with the top bar and the screen. */
+.shell {
+  display: grid;
+  grid-template-columns: 240px minmax(0, 1fr);
+  min-height: 100vh;
+}
+
+.side {
+  position: sticky;
+  top: 0;
+  height: 100vh;
+  overflow-y: auto;
   display: flex;
-  flex-wrap: wrap;
-  align-items: center;
-  gap: 8px 20px;
+  flex-direction: column;
+  gap: 24px;
+  padding: 20px 16px;
+  background: var(--surface);
+  border-right: 1px solid var(--border-hairline);
 }
 
-.bar-row + .bar-row {
-  margin-top: 6px;
+.brand {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  color: var(--text);
+  text-decoration: none;
+}
+
+.mark {
+  display: block;
+  border-radius: 8px;
 }
 
 .wordmark {
   font-family: "JetBrains Mono", ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  font-size: 20px;
   font-weight: 500;
-  letter-spacing: 0.02em;
-  margin-right: auto;
 }
 
-.switch {
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
-  color: var(--text-secondary);
-}
-
-.control {
-  background: var(--surface);
-  color: var(--text);
-  border: 1px solid var(--border-strong);
-  border-radius: 4px;
-  padding: 2px 6px;
-  font: inherit;
-}
-
-.facts {
-  color: var(--text-secondary);
-}
-
-.fact {
-  display: inline-flex;
+.nav {
+  display: flex;
+  flex-direction: column;
   gap: 4px;
 }
 
-.fact-label {
-  color: var(--text-muted);
+.nav a {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  min-height: 44px;
+  padding: 8px 12px;
+  border-radius: 8px;
+  color: var(--text-secondary);
+  font-weight: 600;
+  text-decoration: none;
 }
 
-.project {
+.nav a[aria-current=page] {
   background: var(--raised);
-  border-radius: 4px;
-  padding: 0 6px;
+  color: var(--text);
+}
+
+.icon {
+  width: 20px;
+  height: 20px;
+  flex: none;
 }
 
 .badge {
   background: var(--badge-fill);
   color: var(--badge-text);
-  border-radius: 10px;
+  border-radius: 12px;
   padding: 0 8px;
+  font-size: 13px;
   font-weight: 600;
 }
 
+.nav .badge {
+  margin-left: auto;
+}
+
+.side-label {
+  margin: 0 0 8px;
+  color: var(--text-muted);
+  font-size: 12px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.project-list {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.project-button {
+  display: block;
+  width: 100%;
+  min-height: 44px;
+  padding: 8px 12px;
+  border: 0;
+  border-radius: 8px;
+  background: var(--surface);
+  color: var(--text);
+  text-align: left;
+  cursor: pointer;
+  overflow-wrap: anywhere;
+}
+
+.project-button[aria-pressed=true] {
+  background: var(--raised);
+}
+
+.project-name {
+  display: block;
+  font-size: 14px;
+  font-weight: 600;
+}
+
+.project-slots,
+.project-state {
+  display: block;
+  font-size: 12px;
+}
+
+.project-slots {
+  color: var(--text-muted);
+}
+
+.side-foot {
+  margin-top: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.side-daemon {
+  margin: 0;
+  font-size: 13px;
+}
+
+.main-col {
+  min-width: 0;
+}
+
+.top {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 12px 24px;
+  padding: 20px 28px;
+  border-bottom: 1px solid var(--border-hairline);
+}
+
+.screen-title {
+  margin: 0 auto 0 0;
+  overflow-wrap: anywhere;
+}
+
+.gauges {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px 24px;
+}
+
+.gauge {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  width: 160px;
+}
+
+.gauge-head {
+  display: flex;
+  justify-content: space-between;
+  gap: 8px;
+  font-size: 13px;
+  color: var(--text-secondary);
+}
+
+.gauge-value {
+  color: var(--text);
+}
+
+.gauge-foot {
+  font-size: 12px;
+  color: var(--text-muted);
+}
+
+.header-notes {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 16px;
+  padding: 12px 28px 0;
+  font-size: 13px;
+}
+
+main {
+  padding: 24px 28px 48px;
+}
+
+.notice {
+  color: var(--text-secondary);
+}
+
+.problem {
+  color: var(--danger);
+}
+
+.muted {
+  color: var(--text-muted);
+}
+
+.small {
+  font-size: 13px;
+}
+
+.plain {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+/* Below 768 px the side bar becomes a bar across the top that wraps. */
+@media (max-width: 767px) {
+  .shell {
+    display: block;
+  }
+
+  .side {
+    position: static;
+    height: auto;
+    flex-direction: row;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 8px 16px;
+    padding: 12px 16px;
+    border-right: 0;
+    border-bottom: 1px solid var(--border-hairline);
+  }
+
+  .nav {
+    flex-direction: row;
+    flex-wrap: wrap;
+  }
+
+  .side-projects {
+    flex-basis: 100%;
+  }
+
+  .project-list {
+    flex-direction: row;
+    flex-wrap: wrap;
+  }
+
+  .project-button {
+    width: auto;
+  }
+
+  .side-foot {
+    margin-top: 0;
+    flex-direction: row;
+    flex-wrap: wrap;
+    align-items: center;
+  }
+
+  .top {
+    padding: 16px;
+  }
+
+  .header-notes {
+    padding: 12px 16px 0;
+  }
+
+  main {
+    padding: 16px 16px 32px;
+  }
+}
+
+/* States keep their symbol, so colour never carries a meaning alone
+   (visual identity section 4, "States"). */
 .state-success {
   color: var(--success);
 }
@@ -245,8 +513,6 @@ h3 {
   color: var(--information);
 }
 
-/* Each state keeps its symbol, so colour never carries a meaning alone
-   (visual identity section 4, "States"). */
 .state-success::before,
 .state-warning::before,
 .state-danger::before,
@@ -271,42 +537,634 @@ h3 {
   content: "\00B7";
 }
 
-main {
-  padding: 16px;
+/* Surfaces: a card on the surface colour, a hairline border and 14 px
+   corners; no shadow, gradient or coloured side border. */
+.screen {
+  display: flex;
+  flex-direction: column;
+  gap: 28px;
 }
 
-.notice {
-  color: var(--text-secondary);
+.home-section h2 {
+  margin: 0 0 12px;
 }
 
-.problem {
-  color: var(--danger);
+.section-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px 16px;
+  margin-bottom: 12px;
 }
 
-/* A ticket's page (OWL-471). Colours only from the roles above. */
-.ticket {
-  max-width: 1100px;
+.section-head h2 {
+  margin: 0;
 }
 
-.ticket-title {
-  margin: 0 0 4px;
-}
-
-.section {
+.panel,
+.section,
+.graph-project {
   background: var(--surface);
   border: 1px solid var(--border-hairline);
-  border-radius: 6px;
-  margin-top: 14px;
-  padding: 4px 14px 12px;
+  border-radius: 14px;
+  padding: 20px;
+  min-width: 0;
 }
 
-.section h3 {
-  margin: 10px 0 6px;
+.section + .section,
+.graph-project + .graph-project {
+  margin-top: 12px;
+}
+
+.panel > h2,
+.section > h3,
+.graph-project > h3 {
+  margin: 0 0 12px;
+  font-size: 20px;
 }
 
 .section h4,
-.section h5 {
-  margin: 10px 0 4px;
+.section h5,
+.panel h4 {
+  margin: 12px 0 4px;
+}
+
+.stack {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  min-width: 0;
+}
+
+.cards {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
+  gap: 12px;
+}
+
+/* A card that needs you takes the "Needs input" badge's fill as its border:
+   it only marks the card, whose words and action say what it waits for. */
+.needs-you {
+  border: 1px solid var(--badge-fill);
+}
+
+.for-you-card {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  background: var(--surface);
+  border-radius: 14px;
+  padding: 20px;
+  overflow-wrap: anywhere;
+}
+
+.card-kind {
+  margin: 0;
+  color: var(--text-secondary);
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.card-line {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 4px 12px;
+}
+
+.card-question {
+  margin: 0;
+  color: var(--text-secondary);
+}
+
+.card-action {
+  margin-top: auto;
+  padding-top: 8px;
+}
+
+/* Chips: on the raised colour. */
+.chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.chip {
+  display: inline-block;
+  background: var(--raised);
+  border-radius: 12px;
+  padding: 4px 12px;
+  font-size: 13px;
+  font-weight: 600;
+}
+
+/* Actions: the one primary action of a card is section 4's; any other has
+   the strong border and no fill. Every button is at least 44 px tall. */
+.action-primary {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 44px;
+  padding: 8px 20px;
+  border: 0;
+  border-radius: 8px;
+  background: var(--action-fill);
+  color: var(--action-text);
+  font-weight: 600;
+  text-decoration: none;
+  cursor: pointer;
+}
+
+.action,
+.control {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 44px;
+  padding: 8px 16px;
+  border: 1px solid var(--border-strong);
+  border-radius: 8px;
+  background: var(--surface);
+  color: var(--text);
+  font-weight: 600;
+  text-decoration: none;
+  cursor: pointer;
+}
+
+.action-primary:disabled,
+.action:disabled,
+.control:disabled {
+  background: var(--raised);
+  color: var(--text-muted);
+  cursor: not-allowed;
+}
+
+.control-input,
+.control-reason {
+  min-height: 44px;
+  padding: 8px 12px;
+  border: 1px solid var(--border-strong);
+  border-radius: 8px;
+  background: var(--surface);
+  color: var(--text);
+  min-width: 12em;
+}
+
+.control-list {
+  min-height: 4em;
+  min-width: 18em;
+  padding: 8px 12px;
+  border: 1px solid var(--border-strong);
+  border-radius: 8px;
+  background: var(--surface);
+  color: var(--text);
+}
+
+.control-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px 12px;
+  padding: 8px 0;
+  border-bottom: 1px solid var(--border-hairline);
+}
+
+.control-said {
+  margin: 4px 0;
+}
+
+/* A choice between views or periods is a segmented switch, its selected item
+   on the raised colour. */
+.segmented {
+  display: inline-flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  padding: 4px;
+  border: 1px solid var(--border-strong);
+  border-radius: 12px;
+  background: var(--surface);
+}
+
+.toggle {
+  min-height: 44px;
+  padding: 8px 16px;
+  border: 0;
+  border-radius: 8px;
+  background: var(--surface);
+  color: var(--text-secondary);
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.toggle[aria-pressed=true] {
+  background: var(--raised);
+  color: var(--text);
+}
+
+/* Figures: a count at 48 px, its label above, its first identifiers below. */
+.tiles {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(160px, 1fr));
+  gap: 12px;
+}
+
+.tile {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  background: var(--surface);
+  border: 1px solid var(--border-hairline);
+  border-radius: 14px;
+  padding: 20px;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.tile-label {
+  margin: 0;
+  color: var(--text-secondary);
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.tile-figure {
+  margin: 0;
+  font-size: 48px;
+  font-weight: 800;
+  line-height: 1.15;
+  font-variant-numeric: tabular-nums;
+}
+
+.tile-figure.state-success::before,
+.tile-figure.state-warning::before {
+  font-weight: 800;
+}
+
+.figure-accent {
+  color: var(--accent-text);
+}
+
+.tile-ids {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 8px;
+  margin: 0;
+  font-size: 13px;
+}
+
+.tile-more > summary {
+  cursor: pointer;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--link);
+}
+
+.since-from {
+  margin: 0 0 12px;
+  color: var(--text-muted);
+  font-size: 13px;
+}
+
+/* Empty means said once, with the signature. */
+.empty {
+  margin: 0;
+  color: var(--text-secondary);
+}
+
+.signature {
+  margin-right: 8px;
+  font-family: "JetBrains Mono", ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  color: var(--text);
+}
+
+.signature-eyes {
+  color: var(--accent-text);
+}
+
+/* Charts: SVG drawn by the script and sized by classes. A bar is plum-400
+   (the strong border's role) or the accent; its track a hairline. */
+.hbars {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.hbar-row {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  min-width: 0;
+}
+
+.hbar-head {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  font-size: 13px;
+  overflow-wrap: anywhere;
+}
+
+.hbar {
+  display: block;
+  width: 100%;
+  height: 8px;
+}
+
+.bar-track {
+  fill: var(--border-hairline);
+}
+
+.bar-fill {
+  fill: var(--accent);
+}
+
+.chart {
+  display: block;
+  width: 100%;
+  height: 160px;
+}
+
+.chart-bar {
+  fill: var(--border-strong);
+}
+
+.chart-bar-top {
+  fill: var(--accent);
+}
+
+.chart-axis {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  margin-top: 8px;
+  color: var(--text-muted);
+  font-size: 12px;
+}
+
+/* An inner scroll box: a wide table, the columns or the graph scroll inside
+   it, never the page. */
+.scroll-x {
+  max-width: 100%;
+  overflow-x: auto;
+}
+
+/* The overview's columns and list. */
+.project-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 4px 12px;
+  margin: 0 0 12px;
+}
+
+.project-block + .project-block {
+  margin-top: 24px;
+}
+
+.columns {
+  display: grid;
+  grid-auto-flow: column;
+  grid-auto-columns: minmax(200px, 1fr);
+  gap: 12px;
+  padding-bottom: 8px;
+}
+
+.column {
+  background: var(--raised);
+  border-radius: 14px;
+  padding: 12px;
+  min-width: 0;
+}
+
+.column-empty {
+  background: var(--page);
+  border: 1px dashed var(--border-strong);
+}
+
+.column-head {
+  display: flex;
+  justify-content: space-between;
+  margin: 0 0 8px;
+  color: var(--text-secondary);
+  font-size: 13px;
+}
+
+.column-count {
+  color: var(--text-muted);
+}
+
+.ticket-card {
+  background: var(--surface);
+  border: 1px solid var(--border-hairline);
+  border-radius: 8px;
+  margin-top: 8px;
+  padding: 12px;
+  overflow-wrap: anywhere;
+}
+
+.ticket-card.needs-you {
+  border: 1px solid var(--badge-fill);
+}
+
+.card-head {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: space-between;
+  gap: 4px 8px;
+}
+
+.card-state {
+  font-size: 13px;
+}
+
+.card-title,
+.row-title,
+.entry-title {
+  color: var(--text);
+}
+
+.card-why {
+  color: var(--text-muted);
+  font-size: 13px;
+}
+
+.rows .row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px 16px;
+  padding: 8px 12px;
+  border-bottom: 1px solid var(--border-hairline);
+}
+
+.row-needs-you {
+  background: var(--raised);
+}
+
+.strip {
+  display: inline-flex;
+  gap: 4px;
+}
+
+.strip-cell {
+  width: 12px;
+  height: 8px;
+  border: 1px solid var(--border-strong);
+  border-radius: 4px;
+}
+
+.strip-done {
+  background: var(--badge-fill);
+  color: var(--badge-text);
+}
+
+.strip-current {
+  background: var(--action-fill);
+  color: var(--action-text);
+}
+
+.strip-todo {
+  background: transparent;
+}
+
+/* A ticket's page (OWL-471): its header, its stages as a stepper, then two
+   columns. */
+.ticket {
+  max-width: 1200px;
+}
+
+.ticket-head {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  margin-bottom: 24px;
+}
+
+.ticket-name {
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+
+.ticket-project {
+  margin: 0;
+  color: var(--text-muted);
+  font-size: 13px;
+}
+
+.ticket-links {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 16px;
+}
+
+.ticket-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px 12px;
+}
+
+.ticket-status {
+  margin: 0;
+  color: var(--text-muted);
+  font-size: 12px;
+}
+
+.stepper {
+  display: grid;
+  grid-template-columns: repeat(8, minmax(112px, 1fr));
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.step {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 4px;
+  padding: 0 4px;
+  text-align: center;
+}
+
+.step::after {
+  content: "";
+  position: absolute;
+  top: 16px;
+  left: calc(50% + 20px);
+  right: calc(-50% + 20px);
+  border-top: 1px solid var(--border-hairline);
+}
+
+.step:last-child::after {
+  display: none;
+}
+
+.step-dot {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 32px;
+  height: 32px;
+  border-radius: 16px;
+  font-weight: 800;
+}
+
+.step-done .step-dot {
+  background: var(--raised);
+  border: 2px solid var(--success);
+  color: var(--success);
+}
+
+.step-current .step-dot {
+  background: var(--surface);
+  border: 2px solid var(--accent);
+  color: var(--text);
+}
+
+.step-ahead .step-dot {
+  background: var(--surface);
+  border: 1px solid var(--border-strong);
+  color: var(--text-muted);
+}
+
+.step-name {
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.step-ahead .step-name {
+  color: var(--text-muted);
+}
+
+.step-at,
+.step-what {
+  font-size: 12px;
+  color: var(--text-muted);
+}
+
+.step-what {
+  color: var(--text-secondary);
+}
+
+.ticket-grid {
+  display: grid;
+  grid-template-columns: minmax(0, 3fr) minmax(0, 2fr);
+  gap: 12px;
+  align-items: start;
+  margin-top: 12px;
+}
+
+.ticket-wide {
+  margin-top: 12px;
+}
+
+@media (max-width: 1023px) {
+  .ticket-grid {
+    grid-template-columns: minmax(0, 1fr);
+  }
 }
 
 .timeline {
@@ -318,8 +1176,8 @@ main {
 .entry {
   display: flex;
   flex-wrap: wrap;
-  gap: 4px 14px;
-  padding: 3px 0;
+  gap: 4px 16px;
+  padding: 4px 0;
   border-bottom: 1px solid var(--border-hairline);
 }
 
@@ -330,11 +1188,6 @@ main {
 
 .entry-stage {
   font-weight: 600;
-}
-
-.budget {
-  width: 100%;
-  max-width: 420px;
 }
 
 .pre-text {
@@ -352,20 +1205,23 @@ pre {
 
 .ask,
 .decision,
-.finding {
-  border-left: 3px solid var(--border-strong);
+.finding,
+.reply {
+  background: var(--surface);
+  border: 1px solid var(--border-hairline);
+  border-radius: 8px;
   margin: 8px 0;
-  padding-left: 10px;
+  padding: 12px;
 }
 
 .question-text {
   font-weight: 600;
-  margin: 6px 0 2px;
+  margin: 8px 0 4px;
 }
 
 .options,
 .plan-list {
-  margin: 2px 0 6px;
+  margin: 4px 0 8px;
 }
 
 .recommendation {
@@ -378,57 +1234,38 @@ pre {
 }
 
 /* The reply form (OWL-475). */
-.reply {
-  border-left: 3px solid var(--border-strong);
-  margin: 8px 0;
-  padding-left: 10px;
-}
-
 .reply-question {
   border: 0;
-  margin: 6px 0;
+  margin: 8px 0;
   padding: 0;
 }
 
 .reply-choice {
   display: flex;
   align-items: baseline;
-  gap: 6px;
+  gap: 8px;
+  min-height: 32px;
 }
 
 .reply-text {
   display: block;
   width: 100%;
-  box-sizing: border-box;
   margin-top: 4px;
 }
 
 .reply-actions {
   display: flex;
+  flex-wrap: wrap;
   align-items: center;
   gap: 16px;
   margin-top: 8px;
 }
 
-.reply-send {
-  background: var(--action-fill);
-  color: var(--action-text);
-  border: 1px solid var(--border-strong);
-  border-radius: 4px;
-  padding: 2px 12px;
-  font: inherit;
-  cursor: pointer;
-}
-
-.reply-send:disabled {
-  cursor: progress;
-}
-
 .diff-added,
 .diff-removed {
   background: var(--raised);
-  margin: 2px 0;
-  padding: 2px 6px;
+  margin: 4px 0;
+  padding: 4px 8px;
 }
 
 .diff-added {
@@ -439,22 +1276,40 @@ pre {
   color: var(--danger);
 }
 
-.fold,
+.fold > summary,
+.notes-kind > summary {
+  cursor: pointer;
+  min-height: 32px;
+}
+
+.fold + .fold {
+  border-top: 1px solid var(--border-hairline);
+}
+
+/* The runs: a row each, a failed one tinted with danger at 8 %. */
 .run {
   border-top: 1px solid var(--border-hairline);
-  padding: 4px 0;
 }
 
 .run-summary {
   display: flex;
   flex-wrap: wrap;
-  gap: 2px 14px;
+  align-items: center;
+  gap: 4px 16px;
+  min-height: 44px;
+  padding: 8px 12px;
+  border-radius: 8px;
   cursor: pointer;
+}
+
+.run-failed > .run-summary {
+  background: var(--danger-tint);
 }
 
 .run-id,
 .run-fact {
   color: var(--text-muted);
+  font-size: 13px;
 }
 
 .run-role {
@@ -462,14 +1317,22 @@ pre {
 }
 
 .run-facts {
-  margin: 4px 0 8px;
+  margin: 4px 12px 8px;
+}
+
+.latest-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px 16px;
+  margin-bottom: 8px;
 }
 
 .log {
   background: var(--page);
   border: 1px solid var(--border-hairline);
-  border-radius: 4px;
-  padding: 6px 8px;
+  border-radius: 8px;
+  padding: 8px 12px;
   max-height: 70vh;
   overflow: auto;
 }
@@ -478,8 +1341,12 @@ pre {
   display: none;
 }
 
+.log-stderr {
+  margin-top: 4px;
+}
+
 .rec {
-  margin: 3px 0;
+  margin: 4px 0;
 }
 
 .rec-label {
@@ -515,7 +1382,7 @@ pre {
 }
 
 .rec-result-body {
-  border-left: 3px solid var(--border-hairline);
+  border-left: 2px solid var(--border-hairline);
   padding-left: 8px;
 }
 
@@ -527,241 +1394,16 @@ pre {
   padding: 4px 8px;
 }
 
-.log-stderr {
-  margin-top: 4px;
+.notes-count {
+  margin-right: 8px;
 }
 
-/* The overview (OWL-470): For you, the columns and list views, and since
-   your last visit. Colours only from the theme roles above. */
-.home-section {
-  margin-bottom: 22px;
-}
-
-.home-section h2 {
-  margin: 0 0 8px;
-}
-
-.section-head {
+/* The operations screens (OWL-472). */
+.spend-figures {
   display: flex;
-  flex-wrap: wrap;
-  align-items: center;
-  gap: 8px 16px;
-}
-
-.view-switch {
-  display: inline-flex;
-}
-
-/* The actions (OWL-473): a row of controls, the reason a pause or a cancel
-   takes, and the personal file's editor. */
-.control-row {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: center;
-  gap: 6px 12px;
-  padding: 4px 0;
-  border-bottom: 1px solid var(--border-hairline);
-}
-
-.control-reason,
-.control-input {
-  font: inherit;
-  min-width: 12em;
-}
-
-.control-list {
-  font: inherit;
-  min-width: 18em;
-  min-height: 4em;
-}
-
-.control-said {
-  margin: 4px 0;
-}
-
-.action {
-  background: var(--surface);
-  color: var(--text);
-  border: 1px solid var(--border-strong);
-  border-radius: 4px;
-  padding: 2px 12px;
-  font: inherit;
-  cursor: pointer;
-}
-
-.action:disabled {
-  cursor: progress;
-}
-
-.toggle {
-  background: var(--surface);
-  color: var(--text);
-  border: 1px solid var(--border-strong);
-  padding: 2px 12px;
-  font: inherit;
-  cursor: pointer;
-}
-
-.toggle:first-child {
-  border-radius: 4px 0 0 4px;
-}
-
-.toggle:last-child {
-  border-radius: 0 4px 4px 0;
-  border-left: 0;
-}
-
-.toggle[aria-pressed=true] {
-  background: var(--action-fill);
-  color: var(--action-text);
-}
-
-.plain {
-  list-style: none;
-  margin: 0;
-  padding: 0;
-}
-
-.muted {
-  color: var(--text-muted);
-}
-
-.for-you-group h3,
-.project-head {
-  margin: 10px 0 4px;
-}
-
-.project-head span {
-  margin-left: 12px;
-  font-size: 0.85em;
-  font-weight: 400;
-}
-
-.for-you-entry,
-.since-line {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: baseline;
-  gap: 2px 12px;
-  padding: 3px 0;
-  border-bottom: 1px solid var(--border-hairline);
-}
-
-.since-title {
-  color: var(--text-secondary);
-  font-weight: 600;
-}
-
-.question {
-  flex-basis: 100%;
-  color: var(--text-secondary);
-}
-
-.entry-title,
-.row-title,
-.card-title {
-  color: var(--text);
-}
-
-.columns {
-  display: grid;
-  grid-auto-flow: column;
-  grid-auto-columns: minmax(210px, 1fr);
-  gap: 10px;
-  overflow-x: auto;
-  padding-bottom: 8px;
-}
-
-.column {
-  background: var(--raised);
-  border: 1px solid var(--border-hairline);
-  border-radius: 6px;
-  padding: 6px 8px;
-  min-width: 0;
-}
-
-.column-head {
-  display: flex;
-  justify-content: space-between;
-  margin: 2px 0 6px;
-  color: var(--text-secondary);
-}
-
-.column-count {
-  color: var(--text-muted);
-}
-
-.card {
-  background: var(--surface);
-  border: 1px solid var(--border-hairline);
-  border-radius: 4px;
-  margin-bottom: 6px;
-  padding: 6px 8px;
-  overflow-wrap: anywhere;
-}
-
-.card-head {
-  display: flex;
-  justify-content: space-between;
-  gap: 8px;
-}
-
-.card-state {
-  font-size: 0.85em;
-}
-
-.card-why {
-  color: var(--text-muted);
-  font-size: 0.9em;
-}
-
-.rows .row {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: center;
-  gap: 2px 14px;
-  padding: 4px 6px;
-  border-bottom: 1px solid var(--border-hairline);
-}
-
-.row-needs-you {
-  background: var(--raised);
-}
-
-.strip {
-  display: inline-flex;
-  gap: 2px;
-}
-
-.strip-cell {
-  width: 12px;
-  height: 8px;
-  border: 1px solid var(--border-strong);
-  border-radius: 2px;
-}
-
-.strip-done {
-  background: var(--badge-fill);
-  color: var(--badge-text);
-}
-
-.strip-current {
-  background: var(--action-fill);
-  color: var(--action-text);
-}
-
-.strip-todo {
-  background: transparent;
-}
-
-/* The operations screens (OWL-472). Layout only: colours come from the roles
-   above, through the classes the other screens use. */
-.nav {
-  gap: 4px 18px;
-}
-
-.nav a[aria-current=page] {
-  font-weight: 800;
+  flex-direction: column;
+  gap: 12px;
+  margin-bottom: 24px;
 }
 
 .table {
@@ -772,9 +1414,15 @@ pre {
 .table th,
 .table td {
   text-align: left;
-  padding: 2px 14px 2px 0;
+  padding: 4px 16px 4px 0;
   border-bottom: 1px solid var(--border-hairline);
   vertical-align: top;
+}
+
+.table th {
+  color: var(--text-secondary);
+  font-size: 13px;
+  font-weight: 600;
 }
 
 .usage-head {
@@ -790,7 +1438,6 @@ pre {
   gap: 8px;
 }
 
-
 /* The drain's graph (OWL-460). A shape takes its colour from its group's
    `color` through `currentColor`, so every colour is a role of the table
    above; a node says its state in words as well. */
@@ -800,53 +1447,31 @@ pre {
   flex-wrap: wrap;
   align-items: center;
   gap: 8px 20px;
+  margin-bottom: 12px;
 }
 
-.graph-title {
-  margin: 0 auto 0 0;
-}
-
-.layer-switch {
-  display: inline-flex;
-  gap: 6px;
-}
-
-.layer-switch .control {
-  cursor: pointer;
-}
-
-.layer-switch .control[aria-pressed=true] {
-  background: var(--raised);
-  border: 2px solid var(--focus);
-  font-weight: 600;
-}
-
-.graph-project {
-  background: var(--surface);
-  border: 1px solid var(--border-hairline);
-  border-radius: 6px;
-  margin-top: 14px;
-  padding: 4px 14px 12px;
-}
-
-.graph-project h3 {
-  margin: 10px 0 6px;
+.graph-facts {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-bottom: 12px;
 }
 
 .graph-age {
   color: var(--text-muted);
-  margin: 2px 0;
+  margin: 4px 0;
+  font-size: 13px;
 }
 
 .graph-age .state-warning {
-  margin-left: 10px;
+  margin-left: 12px;
 }
 
 .graph-layout {
   display: flex;
   flex-wrap: wrap;
   align-items: flex-start;
-  gap: 14px 24px;
+  gap: 12px 24px;
 }
 
 .graph-frame {
@@ -856,6 +1481,7 @@ pre {
 
 .queue {
   min-width: 240px;
+  max-width: 100%;
 }
 
 .queue h4 {
@@ -864,7 +1490,7 @@ pre {
 
 .queue-list {
   margin: 0;
-  padding-left: 22px;
+  padding-left: 24px;
 }
 
 .queue-reason,
@@ -915,7 +1541,6 @@ pre {
 
 .edge-label {
   color: var(--text-secondary);
-  font-size: 11px;
 }
 
 a:focus-visible .node-box {
