@@ -196,6 +196,7 @@ Follow and drive the drain from a browser.
 - GitHub Issues adapter, public Markdown tracker, conformance suites, `init` stack detection. Scenario S15.
 - A second project (decision D6); signed release 0.1; the repository made public.
 - `owlshift self-update`, for an install made without a package manager (P7's reading).
+- After the exit gate, the public site: one page (a reading below).
 - The [build plan](build-plan.md), "P9 · Open-source readiness", gives the GitHub Issues adapter's rules and its live checks, and says who builds what and how the exit gate is run.
 
 **Readings and deviations** (decided with the maintainer on 2026-11-12).
@@ -207,6 +208,7 @@ Follow and drive the drain from a browser.
 - The Markdown tracker's front matter stays TOML (OWL-34).
 - The repository is public already (checked on 2026-11-12), so that line is done.
 - On GitHub Issues Owlshift has no identity of its own: its comments are the signed-in person's, as on Linear through a key without the app. An agent identity there needs a server that holds the app's private key, which is P10's.
+- The public site (decided with the maintainer on 2026-11-16) is one page, part of P9 and outside its exit gate: it is built right after the gate, which does not wait for it, and Owlshift is not announced before the page is live. The [build plan](build-plan.md), "The public site", says what the page holds and how it is built and served; the [visual identity](visual-identity.md), section 6, says how it looks.
 
 **Exit gate.** The second project adopts Owlshift with configuration only, no change to the core.
 
