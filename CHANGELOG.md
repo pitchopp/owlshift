@@ -2,6 +2,10 @@
 
 What changes in each release of Owlshift, newest first. Versions follow [Semantic Versioning](https://semver.org/). A release's notes on GitHub are its section below, and the release workflow refuses a tag whose version has none.
 
+## 0.1.1
+
+- The local web UI (`owlshift ui`) is laid out as Owlshift's visual identity says: the frame, the overview of projects and tickets, the ticket page with its stage stepper and runs, and the spend page, in light and dark, down to a phone's width (OWL-575).
+
 ## 0.1.0
 
 The first release. Owlshift works a team's existing backlog with coding agents, one ticket or many, asks on the ticket whenever a decision is a person's, and delivers verified pull requests that a person merges.
