@@ -27,9 +27,9 @@
     return document.getElementById("ops");
   }
 
+  // The project the side bar chose, or "" for every project (app.js).
   function chosenProject() {
-    const select = document.getElementById("project");
-    return select ? select.value : "";
+    return selectedProject();
   }
 
   function sameProject(name) {
@@ -85,6 +85,7 @@
     return { status: response.status, value: value };
   }
 
+  // A card of the screen (visual identity section 6, "Surfaces").
   function section(title) {
     const el = make("section", "section");
     el.appendChild(make("h3", "", title));
@@ -462,7 +463,7 @@
     state.parts.log = make("pre", "pre-text log");
     log.body.appendChild(state.parts.log);
     const bar = make("div", "section-head");
-    const all = make("button", "toggle", "Run the checks");
+    const all = make("button", "action", "Run the checks");
     all.type = "button";
     all.addEventListener("click", () => runDoctor(state, chosenProject(), all));
     bar.appendChild(all);
@@ -550,14 +551,108 @@
 
   function budgetBar(counted, budget) {
     const wrap = make("span", "budget-cell");
-    const bar = make("progress", "budget");
-    bar.max = budget;
-    bar.value = Math.min(counted, budget);
-    wrap.appendChild(bar);
     const over = counted >= budget;
-    wrap.appendChild(make("span", over ? "state-danger" : "muted",
+    wrap.appendChild(make("span", (over ? "state-danger" : "muted") + " amount",
       usd(counted) + " of " + usd(budget)));
     return wrap;
+  }
+
+  // A table in its own scroll box: a wide one scrolls, never the page.
+  function scrolled(el) {
+    const box = make("div", "scroll-x");
+    box.appendChild(el);
+    return box;
+  }
+
+  // The days of the period, every one of them, with what each cost: the
+  // answer lists only the days that cost something. "All" runs from the
+  // first day with a cost to today.
+  const DAY_MS = 86400000;
+  const CHART_DAYS = 90;
+
+  function dayKey(date) {
+    const pad = (value) => String(value).padStart(2, "0");
+    return date.getFullYear() + "-" + pad(date.getMonth() + 1) + "-" + pad(date.getDate());
+  }
+
+  function everyDay(answer) {
+    const cost = new Map(answer.days.map((day) => [day.day, day.micros]));
+    const today = new Date();
+    today.setHours(12, 0, 0, 0);
+    let count = answer.period === "all" ? 0 : Number(answer.period) || 0;
+    if (answer.period === "all" && answer.days.length) {
+      const first = new Date(answer.days[0].day + "T12:00:00");
+      count = Math.max(1, Math.round((today - first) / DAY_MS) + 1);
+    }
+    const days = [];
+    for (let back = count - 1; back >= 0; back -= 1) {
+      const key = dayKey(new Date(today.getTime() - back * DAY_MS));
+      days.push({ day: key, micros: cost.get(key) || 0 });
+    }
+    // A day the answer has and the walk missed (a clock change) still counts.
+    for (const day of answer.days) {
+      if (!days.some((one) => one.day === day.day)) {
+        days.push({ day: day.day, micros: day.micros });
+      }
+    }
+    days.sort((a, b) => (a.day < b.day ? -1 : a.day > b.day ? 1 : 0));
+    return days;
+  }
+
+  // Spend per day as bars: plum-400, the period's costliest day in the
+  // accent, each bar's value as its title. Sized by the SVG's class.
+  function dayChart(days) {
+    const shown = days.slice(-CHART_DAYS);
+    const top = shown.reduce((most, day) => Math.max(most, day.micros), 0);
+    const wrap = make("div", "day-chart");
+    const svg = svgEl("svg", {
+      class: "chart",
+      viewBox: "0 0 " + shown.length * 10 + " 100",
+      preserveAspectRatio: "none",
+      role: "img",
+      "aria-label": "Spend per day, " + shown.length + " days" +
+        (top ? ", the costliest " + usd(top) : ""),
+    });
+    svg.appendChild(svgEl("rect", { class: "bar-track", x: 0, y: 99, width: shown.length * 10, height: 1 }));
+    let marked = false;
+    shown.forEach((day, at) => {
+      if (!day.micros) {
+        return;
+      }
+      const height = Math.max(1, Math.round((day.micros / top) * 96));
+      const costliest = !marked && day.micros === top;
+      marked = marked || costliest;
+      const bar = svgEl("rect", {
+        class: costliest ? "chart-bar-top" : "chart-bar",
+        x: at * 10 + 1,
+        y: 99 - height,
+        width: 8,
+        height: height,
+      });
+      bar.appendChild(svgEl("title", {}, day.day + ": " + usd(day.micros)));
+      svg.appendChild(bar);
+    });
+    wrap.appendChild(svg);
+    const axis = make("div", "chart-axis when");
+    axis.appendChild(make("span", "", shown.length ? shown[0].day : ""));
+    axis.appendChild(make("span", "", shown.length ? shown[shown.length - 1].day : ""));
+    wrap.appendChild(axis);
+    if (days.length > shown.length) {
+      wrap.appendChild(make("p", "notice small", "The chart shows the last " + CHART_DAYS +
+        " days; the table below has every day."));
+    }
+    return wrap;
+  }
+
+  function ticketHref(ticket) {
+    return "#/ticket/" + ticket.project.split("/").map(encodeURIComponent).join("/") +
+      "/" + encodeURIComponent(ticket.ticket);
+  }
+
+  function ticketAnchor(ticket) {
+    const link = make("a", "ticket-link", ticket.ticket);
+    link.href = ticketHref(ticket);
+    return link;
   }
 
   function drawSpend(state, answer) {
@@ -566,15 +661,56 @@
     for (const key of ["total", "days", "tickets", "roles", "harnesses", "usage"]) {
       clear(parts[key]);
     }
-    note(parts.total, "The last " + (answer.period === "all" ? "recorded history" : answer.period + " days") +
-      " by the usage events: " + usd(answer.events.total_micros) + " in " + answer.events.records +
-      " runs reported. A run whose harness reports no cost adds nothing.");
+    const period = answer.period === "all" ? "recorded history" : "the last " + answer.period + " days";
+    const days = everyDay(answer);
+    const costliest = answer.days.reduce((most, day) => (!most || day.micros > most.micros ? day : most), null);
+    const spending = answer.tickets.filter((ticket) => ticket.events_micros > 0);
+    // Figures for the period, from the answer's own numbers.
+    const tiles = make("div", "tiles");
+    const spent = figureTile("Spent", figureUsd(answer.events.total_micros / 1000000), "figure-accent", []);
+    spent.setAttribute("title", usd(answer.events.total_micros));
+    tiles.appendChild(spent);
+    tiles.appendChild(figureTile("Runs reported", answer.events.records, "", []));
+    tiles.appendChild(figureTile("Tickets that spent", spending.length, "", []));
+    tiles.appendChild(figureTile("Costliest day", figureUsd(costliest ? costliest.micros / 1000000 : 0), "",
+      costliest ? [make("span", "when", costliest.day)] : []));
+    parts.total.appendChild(tiles);
+    note(parts.total, "Over " + period + ", by the usage events. A run whose harness reports no cost adds nothing.");
     for (const message of answer.notes) {
       parts.total.appendChild(make("p", "notice state-information", message));
     }
-    parts.days.appendChild(table(["Day", "Cost"],
-      answer.days.map((day) => [day.day, usd(day.micros)])));
-    parts.tickets.appendChild(table(
+    if (answer.days.length) {
+      parts.days.appendChild(dayChart(days));
+    } else {
+      parts.days.appendChild(emptyLine("Nothing spent over " + period + "."));
+    }
+    parts.days.appendChild(scrolled(table(["Day", "Cost"],
+      answer.days.map((day) => [day.day, usd(day.micros)]))));
+    // The costliest tickets of the period, then each ticket's budget.
+    const ranked = spending.slice().sort((a, b) => b.events_micros - a.events_micros).slice(0, 10);
+    if (ranked.length) {
+      const top = ranked[0].events_micros;
+      parts.tickets.appendChild(make("h4", "", "Costliest in the period"));
+      parts.tickets.appendChild(hbars(ranked.map((ticket) => ({
+        label: ticketAnchor(ticket),
+        value: usd(ticket.events_micros),
+        share: ticket.events_micros / top,
+        title: ticket.ticket + ": " + usd(ticket.events_micros),
+      }))));
+    }
+    const budgeted = answer.tickets.filter((ticket) => ticket.cost && ticket.cost.budget_micros !== null);
+    if (budgeted.length) {
+      parts.tickets.appendChild(make("h4", "", "Against the ticket budget"));
+      parts.tickets.appendChild(hbars(budgeted.map((ticket) => ({
+        label: ticketAnchor(ticket),
+        value: usd(ticket.cost.counted_micros) + " of " + usd(ticket.cost.budget_micros),
+        valueClass: ticket.cost.counted_micros >= ticket.cost.budget_micros ? "state-danger" : "",
+        share: ticket.cost.budget_micros ? ticket.cost.counted_micros / ticket.cost.budget_micros : 0,
+        title: ticket.ticket + ": " + usd(ticket.cost.counted_micros) + " of " + usd(ticket.cost.budget_micros),
+      }))));
+    }
+    parts.tickets.appendChild(make("h4", "", "Every ticket"));
+    parts.tickets.appendChild(scrolled(table(
       ["Ticket", "Project", "Events in the period", "Every run (cost.json)", "Runs", "Budget"],
       answer.tickets.map((ticket) => {
         const cost = ticket.cost;
@@ -585,23 +721,18 @@
           budget = make("td", "muted", "no budget");
         }
         return [
-          cell(make("a", "", ticket.ticket)),
+          cell(ticketAnchor(ticket)),
           ticket.project,
           usd(ticket.events_micros),
           cost ? usd(cost.spent_micros) : "",
           cost ? cost.runs + (cost.unreported_runs ? " (" + cost.unreported_runs + " without a cost)" : "") : "",
           budget,
         ];
-      })));
-    answer.tickets.forEach((ticket, at) => {
-      const link = parts.tickets.querySelectorAll("tr")[at + 1].querySelector("a");
-      link.href = "#/ticket/" + ticket.project.split("/").map(encodeURIComponent).join("/") +
-        "/" + encodeURIComponent(ticket.ticket);
-    });
-    parts.roles.appendChild(table(["Role", "Cost"],
-      answer.roles.map((role) => [role.role, usd(role.micros)])));
-    parts.harnesses.appendChild(table(["Harness", "Cost"],
-      answer.harnesses.map((harness) => [harness.harness, usd(harness.micros)])));
+      }))));
+    parts.roles.appendChild(scrolled(table(["Role", "Cost"],
+      answer.roles.map((role) => [role.role, usd(role.micros)]))));
+    parts.harnesses.appendChild(scrolled(table(["Harness", "Cost"],
+      answer.harnesses.map((harness) => [harness.harness, usd(harness.micros)]))));
     for (const harness of answer.usage) {
       const head = make("div", "usage-head");
       head.appendChild(make("strong", "", harness.name));
@@ -611,8 +742,8 @@
       for (const window_ of harness.windows) {
         const row = make("div", "entry");
         row.appendChild(make("span", "entry-stage", window_.name));
-        row.appendChild(make("span", "", percent(window_.share)));
-        row.appendChild(make("span", "entry-at", "resets " + clock(window_.resets_at)));
+        row.appendChild(make("span", "amount", percent(window_.share)));
+        row.appendChild(make("span", "entry-at when", "resets " + clock(window_.resets_at)));
         if (window_.under_way && window_.holds) {
           row.appendChild(make("span", "state-warning", "holds the harness"));
         }
@@ -622,26 +753,34 @@
   }
 
   function buildSpend(state, el) {
-    const bar = make("div", "section-head");
-    bar.appendChild(make("span", "switch-label", "Period"));
-    const select = make("select", "control");
-    select.setAttribute("aria-label", "Period");
-    for (const [value, label] of [["7", "7 days"], ["30", "30 days"], ["90", "90 days"], ["all", "All recorded history"]]) {
-      const option = make("option", "", label);
-      option.value = value;
-      select.appendChild(option);
+    // The period: a segmented switch.
+    const bar = make("div", "section-head screen-bar");
+    const periods = make("div", "segmented");
+    periods.setAttribute("role", "group");
+    periods.setAttribute("aria-label", "Period");
+    const buttons = [];
+    for (const [value, label] of [["7", "7 days"], ["30", "30 days"], ["90", "90 days"], ["all", "All"]]) {
+      const button = make("button", "toggle", label);
+      button.type = "button";
+      button.setAttribute("aria-pressed", String(value === state.days));
+      button.addEventListener("click", () => {
+        state.days = value;
+        store("owlshift.spendDays", state.days);
+        for (const [one, other] of buttons) {
+          other.setAttribute("aria-pressed", String(one === value));
+        }
+        state.rev = null;
+        tick();
+      });
+      buttons.push([value, button]);
+      periods.appendChild(button);
     }
-    select.value = state.days;
-    select.addEventListener("change", () => {
-      state.days = select.value;
-      store("owlshift.spendDays", state.days);
-      state.rev = null;
-      tick();
-    });
-    bar.appendChild(select);
+    bar.appendChild(periods);
     el.appendChild(bar);
+    const total = make("div", "spend-figures");
+    state.parts.total = total;
+    el.appendChild(total);
     for (const [key, title] of [
-      ["total", "Total"],
       ["days", "Per day"],
       ["tickets", "Per ticket"],
       ["roles", "Per role"],
@@ -1041,7 +1180,7 @@
     epoch += 1;
     const el = root();
     clear(el);
-    el.appendChild(make("h2", "ticket-title", screen.title));
+    screenTitle(screen.title, false);
     const state = screen.state();
     current = { name: name, screen: screen, state: state };
     screen.build(state, el);

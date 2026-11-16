@@ -129,10 +129,15 @@ The web UI, the menu-bar app and the site follow the system's light or dark sett
 | Link | `apricot-ink` | `apricot-light` |
 | Focus ring | `apricot-burnt` | `apricot` |
 | "Needs input" badge | `#FFDCCB` fill, `#7A2E10` text | `#5A2A1E` fill, `#FFD2BD` text |
+| Accent as a graphic (a chart's bar, a gauge, the current stage's ring) | `apricot-burnt` | `apricot` |
+| Accent as text (a figure of spend) | `apricot-ink` | `apricot` |
+| Danger tint (a failed run's row) | `#F9EEF0`: danger at 8 % over the surface | `#3C1D3E`: danger at 8 % over the surface |
+
+The last three rows came with the web UI's layout (section 6, OWL-575, 2026-11-16). The accent as a graphic takes the focus ring's values; the danger tint is written as the colour it gives on the surface, so the contrast tests can read it.
 
 ### Contrast
 
-WCAG 2.2 AA, computed on 2026-10-04 from the hex values above: text at least 4.5:1 on every background it is listed for, a graphic (an icon, a focus ring, an input's border, a part of the mark) at least 3:1. Hairline borders only separate areas that differ otherwise and are exempt.
+WCAG 2.2 AA, computed on 2026-10-04 from the hex values above: text at least 4.5:1 on every background it is listed for, a graphic (an icon, a focus ring, an input's border, a part of the mark) at least 3:1. Hairline borders only separate areas that differ otherwise and are exempt. So is the "Needs input" badge's fill used as the border of a card that needs you (section 6): the border only marks the card, whose words and primary action say what it waits for. A state's colour may also fill a small shape whose symbol is in the surface colour, as a stage done on the ticket page's stepper: the pair is the one the table lists for that state on the surface.
 
 | Text | Light: page · surface · raised | Dark: page · surface · raised |
 | --- | --- | --- |
@@ -143,6 +148,9 @@ WCAG 2.2 AA, computed on 2026-10-04 from the hex values above: text at least 4.5
 | Success | 5.04 · 5.30 · 4.79 | 11.58 · 10.35 · 8.61 |
 | Warning | 5.63 · 5.93 · 5.36 | 12.79 · 11.43 · 9.51 |
 | Danger | 5.85 · 6.15 · 5.56 | 6.74 · 6.02 · 5.01 |
+| Accent as text | 5.93 · 6.24 · 5.64 | 8.15 · 7.28 · 6.06 |
+
+On the danger tint, computed on 2026-11-16 (OWL-575): text 14.53 light, 13.20 dark; secondary text 8.27 · 7.58; muted text 5.62 · 5.11; link 5.50 · 8.42; danger 5.42 · 5.34.
 
 | Pair | Ratio |
 | --- | --- |
@@ -153,6 +161,8 @@ WCAG 2.2 AA, computed on 2026-10-04 from the hex values above: text at least 4.5
 | Focus ring, dark (`apricot` on `night-deep` · `night`) | 8.15 · 7.28 |
 | Strong border (`plum-400`), light: page · surface · raised | 3.77 · 3.96 · 3.58 |
 | Strong border (`plum-400`), dark: page · surface · raised | 4.65 · 4.16 · 3.46 |
+| Accent as a graphic, light (`apricot-burnt`): page · surface · raised | 3.73 · 3.93 · 3.55 |
+| Accent as a graphic, dark (`apricot`): page · surface · raised | 8.15 · 7.28 · 6.06 |
 | Mark, dark: braces · eyes on the tile | 14.89 · 7.28 |
 | Mark, light: braces · eyes on the tile | 14.89 · 3.55 |
 | Dark tile on white · on `paper` | 16.48 · 15.66 |
@@ -191,7 +201,7 @@ A terminal has its user's theme, light or dark, and its user's palette. Owlshift
 | CLI: the voice | Section 2 applied to every message of `doctor`, `init`, `do`, `continue`, `watch`, `logs` and `config show`, and to desktop notifications; the build plan's fixed wording and the tests that check it change with it | Follow-up, OWL-163 |
 | CLI: the signature | `{o,o}` in the header of the CLI's reports, its eyes coloured as section 4 says | Follow-up, OWL-164 |
 | Ticket comments | The voice applies to their human-readable text, with a light hand since a whole team reads them; their markers, numbering and structure stay as they are (section 2, rule 4) | With the CLI's voice, OWL-163 |
-| Local web UI (P8) | The themes and both typefaces, carried in the binary; the mark as favicon; the layout below ("The local web UI's layout") | Themes, typefaces and favicon done in OWL-165: both typefaces from `crates/owlshift-runner/src/ui/assets/fonts/` (sources and hashes in its README), the mark at `/favicon.svg`, the contrast table checked by tests in both themes. The layout, decided on 2026-11-16: follow-up, OWL-575 |
+| Local web UI (P8) | The themes and both typefaces, carried in the binary; the mark as favicon; the layout below ("The local web UI's layout") | Themes, typefaces and favicon done in OWL-165: both typefaces from `crates/owlshift-runner/src/ui/assets/fonts/` (sources and hashes in its README), the mark at `/favicon.svg`, the contrast table checked by tests in both themes. The layout, decided on 2026-11-16, done in OWL-575: the frame, the figures, the ticket page's stepper and the charts, with the accent and danger-tint roles of section 4 checked by the same tests |
 | Menu-bar app (P11) | The app icon from the dark mark on macOS's icon grid; the menu-bar icon from the one-colour mark as a template image (black with transparency, which macOS tints) | Follow-up, P11, OWL-166 |
 | Public site | The themes and typefaces of the web UI, the lockups, the social preview's art direction; the layout below ("The public site's layout") | The layout, decided on 2026-11-16: built right after P9's exit gate ([build plan](build-plan.md), "The public site"): OWL-576 to OWL-579 |
 
@@ -210,7 +220,7 @@ Chosen with the maintainer on 2026-11-16, from mock-ups of the Overview, a ticke
 - **One primary action per card.** It is section 4's primary action; any other is drawn with the strong border and no fill, and an action not offered stays visible, disabled, with the reason as its title. Buttons are at least 44 px tall. A choice between views or periods is a segmented switch.
 - **Empty means said once.** An area with nothing to show says so in one line, in the voice, with the `{o,o}` signature; it never draws a grid of zeros. A stage with no ticket in the columns view is a dashed outline; a ticket page leaves out a section that has nothing to show rather than drawing it with "Nothing yet".
 - **The ticket page.** It opens with the identifier in JetBrains Mono, the ticket's title when local state keeps one, chips for its stage, its round and its delivery, and links to the pull request and to the tracker. Then its stages as a horizontal stepper: a stage done is a filled circle with `✓` in success, the current one a ring in the accent, one ahead an outline in the strong border; each says when it started and, in one line, what happened in it (review passes, questions, a failed run). Below, two columns: on the left the latest run, its summary and its log's link, then the runs, a failed one marked `✗` on a row tinted with danger at 8 % opacity; on the right the cost by role, the questions and their answers, and what watch noted, grouped by kind with a count.
-- **Charts.** Spend per day is a bar chart, its bars in `plum-400` and the period's costliest day in the accent; a ticket's cost and a ticket's budget are horizontal bars in the accent on a hairline-coloured track. Each bar reads at least 3:1 against the surface in both themes (`plum-400`: 4.16 on dark, 3.96 on light; the accent: 7.28 and 3.93), and none needs a palette of categories: what a bar is, its label says, never its hue. The UI's own script draws them as SVG, sized by attributes, since the Content-Security-Policy refuses style attributes ([architecture](architecture.md), section 5, "The local web UI"); no chart library is added. Each bar carries its value as its title, and the table of exact figures stays below the chart.
+- **Charts.** Spend per day is a bar chart, its bars in `plum-400` and the period's costliest day in the accent; a ticket's cost and a ticket's budget are horizontal bars in the accent on a hairline-coloured track. Each bar reads at least 3:1 against the surface in both themes (`plum-400`: 4.16 on dark, 3.96 on light; the accent: 7.28 and 3.93), and none needs a palette of categories: what a bar is, its label says, never its hue. The UI's own script draws them as SVG, sized by attributes, since the Content-Security-Policy refuses style attributes ([architecture](architecture.md), section 5, "The local web UI"); no chart library is added. Each bar carries its value as its title, and the table of exact figures stays below the chart. A bar's track is a hairline and exempt, like any hairline: the accent reaches only 2.99:1 on it on light, but the bar is read against the surface around it.
 - **Both themes, every time.** Every colour comes from a role of section 4, light and dark, so a screen's layout is the same in both; a mock-up or a change to the UI shows both themes.
 
 ### The public site's layout

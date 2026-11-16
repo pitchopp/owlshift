@@ -11,59 +11,63 @@
 <script src="/ops.js" defer></script>
 </head>
 <body>
-<header class="bar">
-  <div class="bar-row">
-    <span class="wordmark">owlshift</span>
-    <label class="switch">
-      <span class="switch-label">Project</span>
-      <select id="project" class="control" aria-label="Project">
-        <option value="">All projects</option>
-      </select>
-    </label>
-    <label class="switch">
-      <span class="switch-label">Theme</span>
-      <select id="theme" class="control" aria-label="Theme">
-        <option value="system">System</option>
-        <option value="light">Light</option>
-        <option value="dark">Dark</option>
-      </select>
-    </label>
-  </div>
-  <nav class="bar-row nav" aria-label="Screens">
-    <a href="/#" data-screen="overview">Overview</a>
-    <a href="/#/orchestrator" data-screen="orchestrator">Orchestrator</a>
-    <a href="/#/graph" data-screen="graph">Graph</a>
-    <a href="/#/spend" data-screen="spend">Spend</a>
-    <a href="/#/config" data-screen="config">Config</a>
+<div class="shell">
+<aside class="side" aria-label="Owlshift">
+  <a class="brand" href="/#"><img class="mark" src="/favicon.svg" alt="" width="32" height="32"><span class="wordmark">owlshift</span></a>
+  <nav class="nav" aria-label="Screens">
+    <a href="/#" data-screen="overview"><svg class="icon" viewBox="0 0 24 24" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/></svg><span class="nav-label">Overview</span><span id="needs-badge" class="badge" hidden></span></a>
+    <a href="/#/graph" data-screen="graph"><svg class="icon" viewBox="0 0 24 24" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="5" cy="6" r="2"/><circle cx="5" cy="18" r="2"/><circle cx="19" cy="12" r="2"/><path d="M7 6h4l6 5M7 18h4l6-5"/></svg><span class="nav-label">Graph</span></a>
+    <a href="/#/spend" data-screen="spend"><svg class="icon" viewBox="0 0 24 24" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 21h18M6 17v-6M11 17V5M16 17v-9M21 17v-3"/></svg><span class="nav-label">Spend</span></a>
+    <a href="/#/orchestrator" data-screen="orchestrator"><svg class="icon" viewBox="0 0 24 24" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 12h4l3-8 4 16 3-8h4"/></svg><span class="nav-label">Orchestrator</span></a>
+    <a href="/#/config" data-screen="config"><svg class="icon" viewBox="0 0 24 24" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 6h9M17 6h3M4 12h3M11 12h9M4 18h11M19 18h1"/><circle cx="15" cy="6" r="2"/><circle cx="9" cy="12" r="2"/><circle cx="17" cy="18" r="2"/></svg><span class="nav-label">Config</span></a>
   </nav>
-  <div id="header" class="bar-row facts" hidden></div>
-</header>
-<main>
-  <p id="logged-out" class="notice">Not logged in: run <code>owlshift ui</code> in a terminal.</p>
-  <p id="problem" class="notice problem" hidden></p>
-  <div id="home" hidden>
-    <section id="for-you" class="home-section" aria-labelledby="for-you-title">
-      <h2 id="for-you-title">For you</h2>
-      <div id="for-you-body"></div>
-    </section>
-    <section id="overview" class="home-section" aria-labelledby="overview-title">
-      <div class="section-head">
-        <h2 id="overview-title">Overview</h2>
-        <div class="view-switch" role="group" aria-label="View">
-          <button type="button" id="view-columns" class="toggle" aria-pressed="true">Columns</button>
-          <button type="button" id="view-list" class="toggle" aria-pressed="false">List</button>
-        </div>
-      </div>
-      <div id="overview-body"></div>
-    </section>
-    <section id="since" class="home-section" aria-labelledby="since-title">
-      <h2 id="since-title">Since your last visit</h2>
-      <div id="since-body"></div>
-    </section>
+  <div class="side-projects" role="group" aria-label="Project">
+    <p class="side-label">Projects</p>
+    <div id="project-list" class="project-list"></div>
   </div>
-  <section id="view" class="view" hidden></section>
-  <section id="ticket" class="ticket" hidden></section>
-  <section id="ops" class="ticket" hidden></section>
-</main>
+  <div class="side-foot">
+    <p id="side-daemon" class="side-daemon"></p>
+    <div class="segmented" role="group" aria-label="Theme">
+      <button type="button" class="toggle" data-theme-choice="dark">Dark</button>
+      <button type="button" class="toggle" data-theme-choice="light">Light</button>
+      <button type="button" class="toggle" data-theme-choice="system">Auto</button>
+    </div>
+  </div>
+</aside>
+<div class="main-col">
+  <header class="top">
+    <h1 id="screen-title" class="screen-title">Overview</h1>
+    <div id="header" class="gauges" hidden></div>
+  </header>
+  <div id="header-notes" class="header-notes" hidden></div>
+  <main>
+    <p id="logged-out" class="notice">Not logged in: run <code>owlshift ui</code> in a terminal.</p>
+    <p id="problem" class="notice problem" hidden></p>
+    <div id="home" class="screen" hidden>
+      <section id="for-you" class="home-section" aria-labelledby="for-you-title">
+        <h2 id="for-you-title">For you</h2>
+        <div id="for-you-body"></div>
+      </section>
+      <section id="since" class="home-section" aria-labelledby="since-title">
+        <h2 id="since-title">Since your last visit</h2>
+        <div id="since-body"></div>
+      </section>
+      <section id="overview" class="home-section" aria-labelledby="overview-title">
+        <div class="section-head">
+          <h2 id="overview-title">Tickets</h2>
+          <div class="segmented" role="group" aria-label="View">
+            <button type="button" id="view-columns" class="toggle" aria-pressed="true">Columns</button>
+            <button type="button" id="view-list" class="toggle" aria-pressed="false">List</button>
+          </div>
+        </div>
+        <div id="overview-body"></div>
+      </section>
+    </div>
+    <section id="view" class="view" hidden></section>
+    <section id="ticket" class="ticket" hidden></section>
+    <section id="ops" class="ticket" hidden></section>
+  </main>
+</div>
+</div>
 </body>
 </html>

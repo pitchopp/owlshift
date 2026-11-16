@@ -916,9 +916,10 @@ fn the_header_names_the_tickets_holding_each_projects_slots() {
         "\n  return project.slots_held + \" slot\" + (project.slots_held === 1 ? \"\" : \"s\") +\n    \
          (project.slot_holders.length ? \": \" + project.slot_holders.join(\", \") : \"\");",
     );
+    // The side bar labels each served project with it (OWL-575).
     assert!(
-        app_js.contains(r#"item.appendChild(make("span", "fact-label", slotsText(project)));"#),
-        "the header does not label a project's slots with slotsText"
+        app_js.contains(r#"const lines = [["project-slots amount", slotsText(project)]];"#),
+        "the side bar does not label a project's slots with slotsText"
     );
 }
 
@@ -1166,7 +1167,7 @@ fn contrast(a: [f64; 3], b: [f64; 3]) -> f64 {
 fn every_text_pair_of_the_contrast_table_holds_in_both_themes() {
     // Visual identity section 4, "Contrast": page · surface · raised, light
     // then dark. The table lists two decimals, hence the tolerance.
-    let text_rows: [(&str, [f64; 3], [f64; 3]); 7] = [
+    let text_rows: [(&str, [f64; 3], [f64; 3]); 8] = [
         ("text", [15.66, 16.48, 14.89], [16.66, 14.89, 12.39]),
         ("text-secondary", [8.91, 9.38, 8.47], [9.57, 8.55, 7.12]),
         ("text-muted", [6.06, 6.37, 5.76], [6.45, 5.76, 4.79]),
@@ -1174,12 +1175,18 @@ fn every_text_pair_of_the_contrast_table_holds_in_both_themes() {
         ("success", [5.04, 5.30, 4.79], [11.58, 10.35, 8.61]),
         ("warning", [5.63, 5.93, 5.36], [12.79, 11.43, 9.51]),
         ("danger", [5.85, 6.15, 5.56], [6.74, 6.02, 5.01]),
+        // The accent as text, a figure of spend (OWL-575).
+        ("accent-text", [5.93, 6.24, 5.64], [8.15, 7.28, 6.06]),
     ];
-    let graphic_rows: [(&str, [f64; 3], [f64; 3]); 2] = [
+    let graphic_rows: [(&str, [f64; 3], [f64; 3]); 3] = [
+        // Also a chart's ordinary bar, `plum-400` (OWL-575).
         ("border-strong", [3.77, 3.96, 3.58], [4.65, 4.16, 3.46]),
         // The ring's table lists it on page and surface only; on raised it
         // is held to the 3:1 floor below.
         ("focus", [3.73, 3.93, 3.0], [8.15, 7.28, 3.0]),
+        // The accent as a graphic: a bar, a gauge, the current stage's ring
+        // (OWL-575).
+        ("accent", [3.73, 3.93, 3.55], [8.15, 7.28, 6.06]),
     ];
     let light = colours(block(APP_CSS, ":root {", ""));
     let system_dark = colours(block(APP_CSS, ":root:not([data-theme=light]) {", "  "));
@@ -1233,8 +1240,30 @@ fn every_text_pair_of_the_contrast_table_holds_in_both_themes() {
         // Section 4 has no row for the information state: it shares the
         // secondary text's colour, so its row is that one.
         assert_eq!(at("information"), at("text-secondary"), "{theme}");
+        // The danger tint of a failed run's row (OWL-575) is danger at 8 %
+        // over the surface, and every text the row holds reads on it.
+        let tint = at("danger-tint");
+        let mixed = [0, 1, 2]
+            .map(|channel| (0.08 * at("danger")[channel] + 0.92 * at("surface")[channel]).round());
+        assert_eq!(tint, mixed, "{theme} danger-tint");
+        let on_tint: [(&str, f64, f64); 5] = [
+            ("text", 14.53, 13.20),
+            ("text-secondary", 8.27, 7.58),
+            ("text-muted", 5.62, 5.11),
+            ("link", 5.50, 8.42),
+            ("danger", 5.42, 5.34),
+        ];
+        for (role, on_light, on_dark) in on_tint {
+            let ratio = contrast(at(role), tint);
+            let listed = if column == 0 { on_light } else { on_dark };
+            assert!(
+                (ratio - listed).abs() <= 0.005 && ratio >= 4.5,
+                "{theme} {role} on danger-tint: {ratio:.3}"
+            );
+            checked += 1;
+        }
     }
-    assert_eq!(checked, 3 * (7 + 2) * 3);
+    assert_eq!(checked, 3 * (8 + 3) * 3 + 3 * 5);
 }
 
 /// The rules of `css` outside the theme blocks and the font faces, as
@@ -1311,7 +1340,7 @@ fn roles(value: &str) -> Vec<&str> {
 /// with its text, and a border or outline of the strong or focus role
 /// (3:1), the hairline exempt. Any other colour is an unchecked pair.
 fn audit(css: &str) -> Result<(), String> {
-    const TEXT: [&str; 7] = [
+    const TEXT: [&str; 8] = [
         "text",
         "text-secondary",
         "text-muted",
@@ -1319,12 +1348,29 @@ fn audit(css: &str) -> Result<(), String> {
         "success",
         "warning",
         "danger",
+        "accent-text",
     ];
     // `information` shares the secondary text's colour, which the contrast
     // test asserts.
     const TEXT_LIKE: [&str; 1] = ["information"];
-    const FILLS: [&str; 3] = ["page", "surface", "raised"];
+    // The danger tint carries the text roles the contrast test checks on it.
+    const FILLS: [&str; 4] = ["page", "surface", "raised", "danger-tint"];
+    // A graphic at 3:1 on page, surface and raised (a bar, a ring, a border),
+    // and the hairline, which only separates areas.
+    const GRAPHIC: [&str; 4] = ["border-strong", "focus", "accent", "border-hairline"];
+    const STATES: [&str; 3] = ["success", "warning", "danger"];
+    let state_fill = |background: Option<&str>| {
+        STATES
+            .iter()
+            .any(|state| background == Some(format!("var(--{state})").as_str()))
+    };
     for (selector, declarations) in style_rules(css) {
+        // Visual identity section 6, "Surfaces": no shadow, no gradient.
+        for (name, value) in &declarations {
+            if name == "box-shadow" || name == "text-shadow" || value.contains("gradient(") {
+                return Err(format!("{selector}: {name} is a shadow or a gradient"));
+            }
+        }
         let value_of = |wanted: &str| {
             declarations
                 .iter()
@@ -1347,7 +1393,9 @@ fn audit(css: &str) -> Result<(), String> {
             let coloured = name == "color"
                 || name.starts_with("background")
                 || (name.starts_with("border") && name != "border-radius")
-                || name.starts_with("outline") && !name.ends_with("offset");
+                || name.starts_with("outline") && !name.ends_with("offset")
+                || name == "fill"
+                || name == "stroke";
             // Any other property that carries a colour has no pair in the
             // table, whatever its name.
             let holds_colour = value.contains("var(--")
@@ -1373,11 +1421,29 @@ fn audit(css: &str) -> Result<(), String> {
                             && value_of("background") == Some("var(--badge-fill)"))
                         || (role == "action-text"
                             && value_of("background") == Some("var(--action-fill)"))
+                        // The surface's colour on a state's fill: the pair
+                        // section 4 lists as that state on the surface (a
+                        // stage done, OWL-575).
+                        || (role == "surface" && state_fill(value_of("background")))
                 } else if name.starts_with("background") {
-                    FILLS.contains(&role) || role == "badge-fill" || role == "action-fill"
+                    FILLS.contains(&role)
+                        || role == "badge-fill"
+                        || role == "action-fill"
+                        || (STATES.contains(&role) && value_of("color") == Some("var(--surface)"))
+                } else if name == "fill" || name == "stroke" {
+                    GRAPHIC.contains(&role) || TEXT.contains(&role) || TEXT_LIKE.contains(&role)
+                } else if name.starts_with("outline") {
+                    role == "focus"
+                } else if name == "border" || name == "border-color" {
+                    // The hairline only separates areas that differ otherwise;
+                    // the badge's fill only marks a card that needs you, whose
+                    // words say it (section 4, "Contrast").
+                    GRAPHIC.contains(&role)
+                        || STATES.contains(&role)
+                        || (role == "badge-fill" && selector.contains("needs-you"))
                 } else {
-                    // The hairline only separates areas that differ otherwise.
-                    role == "border-hairline" || role == "border-strong" || role == "focus"
+                    // One side's border: no coloured side border (section 6).
+                    role == "border-hairline"
                 };
                 if !fine {
                     return Err(format!(
@@ -1411,17 +1477,155 @@ fn every_colour_the_style_sheet_uses_is_a_pair_of_the_contrast_table() {
         ".new { text-decoration: underline var(--text-muted); }",
         ".new { -webkit-text-stroke: 1px var(--text); }",
         ".new { text-emphasis-color: #000; }",
+        // The layout's own refusals (OWL-575): a coloured side border, a
+        // shadow, a gradient, the badge's fill on a card that does not need
+        // you, a bar in a colour outside the graphic roles.
+        ".new { border-left: 3px solid var(--accent); }",
+        ".new { border-top: 2px solid var(--border-strong); }",
+        ".new { box-shadow: 0 1px 2px; }",
+        ".new { background: linear-gradient(red, blue); }",
+        ".card { border: 1px solid var(--badge-fill); }",
+        ".new { fill: var(--badge-fill); }",
+        ".new { stroke: var(--page); }",
+        ".new { background: var(--accent); }",
+        ".new { color: var(--accent); }",
+        ".new { background: var(--success); color: var(--text); }",
+        ".new { background: var(--success); }",
+        ".new { color: var(--surface); }",
     ] {
         assert!(audit(css).is_err(), "{css}");
     }
     for css in [
         ".new { color: var(--text-muted); }",
+        ".new { fill: var(--border-strong); }",
+        ".new { fill: var(--accent); }",
+        ".new { border: 2px solid var(--accent); }",
+        ".new-needs-you { border: 1px solid var(--badge-fill); }",
+        ".new { color: var(--text); background: var(--danger-tint); }",
+        ".new { border-right: 1px solid var(--border-hairline); }",
+        ".new { background: var(--success); color: var(--surface); }",
         ".new { color: var(--badge-text); background: var(--badge-fill); }",
         ".new { border-bottom: 1px solid var(--border-hairline); }",
         ".new { border: 1px solid var(--border-strong); border-radius: 4px; }",
         ".new { outline: 2px solid var(--focus); outline-offset: 2px; }",
     ] {
         assert!(audit(css).is_ok(), "{css}");
+    }
+}
+
+/// Section 5's scale, in pixels.
+const TYPE_SCALE: [u32; 8] = [12, 13, 14, 16, 20, 24, 32, 48];
+
+/// Why `css` sets a size off the type scale or a spacing off the 4 px grid
+/// (visual identity sections 5 and 6), if it does. A spacing may also be
+/// `0`, `auto`, or relative (`em`, `%`).
+fn sizes(css: &str) -> Result<(), String> {
+    for (selector, declarations) in style_rules(css) {
+        for (name, value) in &declarations {
+            if name == "font-size" {
+                let on_scale = value
+                    .strip_suffix("px")
+                    .and_then(|px| px.parse::<u32>().ok())
+                    .is_some_and(|px| TYPE_SCALE.contains(&px));
+                if !on_scale {
+                    return Err(format!("{selector}: font-size {value} is off the scale"));
+                }
+            }
+            let spacing = name.starts_with("margin")
+                || name.starts_with("padding")
+                || name == "gap"
+                || name == "row-gap"
+                || name == "column-gap";
+            if !spacing {
+                continue;
+            }
+            for token in value.split_whitespace() {
+                let fine = token == "0"
+                    || token == "auto"
+                    || token.ends_with("em")
+                    || token.ends_with('%')
+                    || token
+                        .strip_suffix("px")
+                        .and_then(|px| px.parse::<u32>().ok())
+                        .is_some_and(|px| px % 4 == 0);
+                if !fine {
+                    return Err(format!("{selector}: {name} {value} is off the 4 px grid"));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn every_size_is_on_the_type_scale_and_every_spacing_on_the_4px_grid() {
+    sizes(APP_CSS).unwrap();
+    // Headings are sized by the sheet, never left to the browser's own
+    // sizes, which are off the scale.
+    let rules = style_rules(APP_CSS);
+    for heading in ["h1", "h2", "h3", "h4"] {
+        assert!(
+            rules.iter().any(|(selector, declarations)| {
+                selector.split(',').any(|part| part.trim() == heading)
+                    && declarations.iter().any(|(name, _)| name == "font-size")
+            }),
+            "{heading} has no size of its own"
+        );
+    }
+    for css in [
+        ".new { font-size: 15px; }",
+        ".new { font-size: 0.85em; }",
+        ".new { padding: 6px 8px; }",
+        ".new { gap: 10px; }",
+        ".new { margin: 0 0 2px; }",
+    ] {
+        assert!(sizes(css).is_err(), "{css}");
+    }
+    for css in [
+        ".new { font-size: 13px; }",
+        ".new { padding: 20px 28px; margin: 0 auto 0 0; gap: 12px 24px; }",
+        ".new { margin-right: 0.3em; }",
+    ] {
+        assert!(sizes(css).is_ok(), "{css}");
+    }
+}
+
+#[test]
+fn every_button_is_at_least_44px_tall() {
+    // Visual identity section 6: buttons are at least 44 px tall. Each class
+    // a button is made with, in the scripts and the page, has a rule of its
+    // own that says so.
+    let rules = style_rules(APP_CSS);
+    let mut classes = std::collections::BTreeSet::new();
+    for script in [APP_JS, OPS_JS] {
+        for part in script.split(r#"make("button", ""#).skip(1) {
+            let class = part.split('"').next().unwrap();
+            classes.insert(class.split_whitespace().next().unwrap().to_owned());
+        }
+    }
+    for part in INDEX_HTML.split("<button ").skip(1) {
+        let tag = &part[..part.find('>').unwrap()];
+        let class = tag
+            .split("class=\"")
+            .nth(1)
+            .unwrap()
+            .split('"')
+            .next()
+            .unwrap();
+        classes.insert(class.split_whitespace().next().unwrap().to_owned());
+    }
+    assert!(classes.len() >= 4, "{classes:?}");
+    for class in &classes {
+        let wanted = format!(".{class}");
+        assert!(
+            rules.iter().any(|(selector, declarations)| {
+                selector.split(',').any(|part| part.trim() == wanted)
+                    && declarations
+                        .iter()
+                        .any(|(name, value)| name == "min-height" && value == "44px")
+            }),
+            "{wanted} is not held to 44 px"
+        );
     }
 }
 
@@ -1532,10 +1736,12 @@ fn the_style_sheet_sets_both_typefaces_from_the_binary_with_the_identity_stacks(
     }
     assert!(css.contains("font-weight: 200 800;"));
     assert!(block(&css, "\nbody {", "").contains(&format!("font-family: {SANS_STACK};")));
-    assert!(block(&css, "\ncode {", "").contains(&format!("font-family: {MONO_STACK};")));
+    // Code, and the identifiers, durations and amounts set beside it (OWL-575).
+    assert!(block(&css, "\ncode,\n.mono,", "").contains(&format!("font-family: {MONO_STACK};")));
     assert!(block(&css, "\n.wordmark {", "").contains(&format!("font-family: {MONO_STACK};")));
     assert!(block(&css, "\nbody {", "").contains("line-height: 1.5;"));
-    assert!(block(&css, "\nh1,\nh2,\nh3 {", "").contains("line-height: 1.15;"));
+    assert!(block(&css, "\nh1,\nh2,\nh3,\nh4,\nh5 {", "").contains("line-height: 1.15;"));
+    assert!(block(&css, "\nh1 {", "").contains("letter-spacing: -0.01em;"));
     // Section 5's weights: 400, 600 and 800 for the sans, 400 and 500 for the
     // mono; nothing else, not even 700.
     for rule in css.split('}') {
@@ -2898,7 +3104,8 @@ fn the_graph_is_a_route_of_its_own_next_to_the_ticket_page() {
     assert!(logged_out.contains("endStream();"), "{logged_out}");
     assert!(app_js.contains("} else if (message.graph) {\n          lastGraph = message.graph;"));
     // The frame: a link to the graph, and the container the graph draws in.
-    assert!(INDEX_HTML.contains(r##"<a href="/#/graph" data-screen="graph">Graph</a>"##));
+    assert!(INDEX_HTML.contains(r##"<a href="/#/graph" data-screen="graph">"##));
+    assert!(INDEX_HTML.contains(r#"<span class="nav-label">Graph</span></a>"#));
     assert!(INDEX_HTML.contains(r#"<section id="view" class="view" hidden></section>"#));
     assert!(INDEX_HTML.contains(r#"<section id="ticket" class="ticket" hidden></section>"#));
 }
@@ -2920,17 +3127,16 @@ fn the_layer_switch_is_kept_by_the_browser_and_the_project_switch_filters_the_gr
     // The graph draws the projects the header's switch chose, again when it
     // is changed.
     let draw = block(&app_js, "function drawGraph() {", "");
-    assert!(
-        draw.contains(r#"document.getElementById("project").value"#),
-        "{draw}"
-    );
+    assert!(draw.contains("const chosen = selectedProject();"), "{draw}");
     assert!(draw.contains("!chosen || project.repository === chosen"));
     assert!(draw.contains("aria-pressed"));
-    let start = block(&app_js, "async function start() {", "");
-    assert!(start.contains("store(PROJECT_KEY, project.value || null);"));
+    // The side bar's projects are the switch (OWL-575): a choice is stored,
+    // then every screen draws again.
+    let choose = block(&app_js, "function chooseProject(name) {", "");
+    assert!(choose.contains("store(PROJECT_KEY, name || null);"));
     assert!(
-        start.contains("    renderHome();\n    drawGraph();\n"),
-        "{start}"
+        choose.contains("  renderHome();\n  drawGraph();\n"),
+        "{choose}"
     );
 }
 
