@@ -24,7 +24,10 @@
 //!   one's diff against the one before, per part, and the review passes;
 //! - `waits`: what the ticket waits on, as `owlshift status --waits` tells it;
 //! - `actions` (format 2, OWL-473): whether the page offers Restart and
-//!   Cancel, each where its command would act, and the cancel that stands.
+//!   Cancel, each where its command would act, and the cancel that stands;
+//! - `tracker_link` (format 3, OWL-580): the ticket's issue on its tracker,
+//!   which the header draws, from the project's key once read
+//!   ([`super::reply::tracker_link`]), null when there is none.
 //!
 //! A commit of the ref never changes, so what the history read of one is kept
 //! in the [`Cache`] by commit, and the waits, which read the whole event log
@@ -54,8 +57,10 @@ use crate::ticket_ref::{self, Commits, Revision, TicketRecord};
 use crate::voice::Voice;
 use crate::{cancel, served, status};
 
-/// The snapshot's format: 2 adds `actions` (OWL-473).
-pub const FORMAT: u32 = 2;
+/// The snapshot's format: 2 adds `actions` (OWL-473); 3 adds
+/// `tracker_link` and drops `questions.reply.link`, which it replaces
+/// (OWL-580).
+pub const FORMAT: u32 = 3;
 
 /// The most commits of a ticket ref the timeline reads.
 pub const MAX_HISTORY: usize = 400;
@@ -177,10 +182,11 @@ pub fn snapshot(inputs: &Inputs, repo: &Repo, ticket: &TicketId) -> Value {
         "timeline": timeline,
         "runs": section(runs(inputs, repo, &dirs, ticket)),
         "cost": on_record(&|record| cost(&dirs, record)),
-        "questions": on_record(&|record| questions(record, inputs, ticket)),
+        "questions": on_record(&|record| questions(record, inputs)),
         "plan": plan,
         "waits": section(waits(inputs, repo, ticket)),
         "actions": actions(&dirs, ticket, &latest),
+        "tracker_link": reply::tracker_link(inputs.key, ticket),
     })
 }
 
@@ -587,11 +593,11 @@ fn cost(dirs: &ProjectDirs, record: &TicketRecord) -> Value {
 
 /// The asks and the decisions of the ticket, and the reply form of its
 /// open ask, null when it waits for no answer.
-fn questions(record: &TicketRecord, inputs: &Inputs, ticket: &TicketId) -> Value {
+fn questions(record: &TicketRecord, inputs: &Inputs) -> Value {
     json!({
         "asks": as_json!(&record.questions.asks),
         "decisions": as_json!(&record.questions.decisions),
-        "reply": reply::section(record, inputs.key, ticket, inputs.names),
+        "reply": reply::section(record, inputs.key, inputs.names),
     })
 }
 
@@ -1010,7 +1016,7 @@ mod tests {
     fn the_timeline_lists_where_the_ticket_changed() {
         let bench = busy();
         let snap = bench.snapshot("OWL-1");
-        assert_eq!(snap["format"], 2);
+        assert_eq!(snap["format"], 3);
         assert_eq!(snap["project"], "o/r");
         assert_eq!(snap["ticket"], "OWL-1");
         let timeline = &snap["timeline"];
@@ -1123,7 +1129,6 @@ mod tests {
         let reply = &bench.snapshot("OWL-1")["questions"]["reply"];
         assert_eq!(reply["offered"], false);
         assert_eq!(reply["approval"], false);
-        assert!(reply["link"].is_null());
         assert_eq!(reply["decider"]["account"], "maintainer");
         let snap = bench.snapshot_with("OWL-1", &reply::tests::ready("maintainer"));
         let reply = &snap["questions"]["reply"];
@@ -1133,6 +1138,21 @@ mod tests {
         quiet.write("OWL-1", &record(Stage::Build), None);
         let snap = quiet.snapshot_with("OWL-1", &reply::tests::ready("maintainer"));
         assert!(snap["questions"]["reply"].is_null());
+    }
+
+    /// Every ticket links its issue on the tracker once the project's key is
+    /// read, an ask open or not (OWL-580); none without a read key.
+    #[test]
+    fn the_ticket_links_its_tracker_issue_whatever_it_waits_on() {
+        let quiet = Bench::new(Some(BUDGET_FILE));
+        quiet.write("OWL-1", &record(Stage::Build), None);
+        let snap = quiet.snapshot_with("OWL-1", &reply::tests::ready("maintainer"));
+        assert!(snap["questions"]["reply"].is_null());
+        assert_eq!(
+            snap["tracker_link"],
+            "https://linear.app/owlshift/issue/OWL-1"
+        );
+        assert!(quiet.snapshot("OWL-1")["tracker_link"].is_null());
     }
 
     /// A ticket waiting on its plan's approval: the approval question is the

@@ -951,8 +951,8 @@ function renderHead(handle, snapshot) {
       }
     }
   }
-  const questions = snapshot.questions;
-  const tracker = questions && !questions.error && questions.reply ? trackerLink(questions.reply) : null;
+  // The ticket's issue on its tracker, whatever it waits on (OWL-580).
+  const tracker = trackerLink(snapshot.tracker_link, handle.project);
   if (tracker) {
     handle.links.appendChild(tracker);
   }
@@ -1349,7 +1349,7 @@ function renderQuestions(handle, body, questions, snapshot) {
       body.appendChild(make("p", "notice",
         "This round asks for the plan's approval, and the plan cannot be drawn: its reply form is here."));
     }
-    body.appendChild(replyForm(handle, reply, questions));
+    body.appendChild(replyForm(handle, reply, questions, snapshot.tracker_link));
   }
   for (const ask of questions.asks) {
     const el = make("div", "ask");
@@ -1395,27 +1395,41 @@ function replyDraft(handle, reply) {
   return handle.drafts[reply.ask];
 }
 
-// The address a reply form links its ticket to: Linear's, the one tracker
-// whose key the UI reads, then the workspace and the ticket as the server
-// built them. A click navigates there; the page fetches nothing from it.
+// The addresses the page links a ticket's issue to (OWL-580): Linear's, then
+// the workspace and the ticket as the server built them, or GitHub's, then
+// the page's own repository and the issue's number. A click navigates there;
+// the page fetches nothing from it.
 const LINEAR_LINK = "https://linear.app/";
 const TRACKER_LINK_PATTERN = /^[A-Za-z0-9_-]+\/issue\/[A-Za-z0-9]+-[0-9]+$/;
+const GITHUB_LINK = "https://github.com/";
+const GITHUB_ISSUE_PATTERN = /^([^/]+\/[^/]+)\/issues\/([1-9][0-9]*)$/;
 
-// The ticket's link on the tracker, or null when the server gave none that
-// is Linear's workspace and ticket.
-function trackerLink(reply) {
-  const given = typeof reply.link === "string" ? reply.link : "";
-  const path = given.startsWith(LINEAR_LINK) ? given.slice(LINEAR_LINK.length) : "";
-  if (!TRACKER_LINK_PATTERN.test(path)) {
+// The ticket's issue on its tracker, from the snapshot's `tracker_link`, or
+// null when the server gave none that is Linear's workspace and ticket or an
+// issue of `project` on GitHub.
+function trackerLink(given, project) {
+  const url = typeof given === "string" ? given : "";
+  let host = "";
+  let path = "";
+  let name = "";
+  if (url.startsWith(LINEAR_LINK) && TRACKER_LINK_PATTERN.test(url.slice(LINEAR_LINK.length))) {
+    [host, path, name] = [LINEAR_LINK, url.slice(LINEAR_LINK.length), "Linear"];
+  } else if (url.startsWith(GITHUB_LINK)) {
+    const issue = GITHUB_ISSUE_PATTERN.exec(url.slice(GITHUB_LINK.length));
+    if (issue && plainRepository(issue[1]) && issue[1].toLowerCase() === project.toLowerCase()) {
+      [host, path, name] = [GITHUB_LINK, issue[1] + "/issues/" + issue[2], "GitHub"];
+    }
+  }
+  if (!host) {
     return null;
   }
-  const link = make("a", "tracker-link", "Open the ticket on the tracker");
-  link.href = LINEAR_LINK + path;
+  const link = make("a", "tracker-link", "issue on " + name);
+  link.href = host + path;
   link.rel = "noopener noreferrer";
   return link;
 }
 
-function replyForm(handle, reply, questions) {
+function replyForm(handle, reply, questions, given) {
   const el = make("div", "reply");
   // The decider's name once the UI has read it (OWL-517), else the account
   // id the ask keeps.
@@ -1428,7 +1442,7 @@ function replyForm(handle, reply, questions) {
   if (!reply.offered) {
     el.appendChild(make("p", "notice", "Round " + reply.round + " waits for its decider, " + decider +
       ". No reply form here: " + (reply.why_not || "it is not offered") + "."));
-    const link = trackerLink(reply);
+    const link = trackerLink(given, handle.project);
     if (link) {
       el.appendChild(link);
     }
@@ -1463,7 +1477,7 @@ function replyForm(handle, reply, questions) {
   actions.appendChild(button);
   el.appendChild(actions);
   el.appendChild(status);
-  const link = trackerLink(reply);
+  const link = trackerLink(given, handle.project);
   if (link) {
     el.appendChild(link);
   }
@@ -1700,7 +1714,7 @@ function renderPlan(handle, body, plan, snapshot) {
       body.appendChild(make("h4", "", "What changed since the plan before"));
       body.appendChild(diffEl(newest.diff));
     }
-    body.appendChild(replyForm(handle, reply, snapshot.questions));
+    body.appendChild(replyForm(handle, reply, snapshot.questions, snapshot.tracker_link));
   }
   plan.revisions.forEach((revision, index) => {
     const el = fold(handle, "revision:" + revision.commit,
@@ -2307,18 +2321,21 @@ function ticketLink(project, ticket) {
   return link;
 }
 
+// Whether `project` is two plain names, `owner/repo`, neither `.` nor `..`.
+function plainRepository(project) {
+  return REPOSITORY_PATTERN.test(project) && project.split("/").every((n) => n !== "." && n !== "..");
+}
+
 // A pull request, linked to the forge when the project is two plain names and
 // the number a whole number; the address is built here, from local state, and
 // the forge is not called.
 function pullRequestLink(project, number) {
   const label = "pull request #" + number;
-  const names = project.split("/");
-  const plain = REPOSITORY_PATTERN.test(project) && names.every((n) => n !== "." && n !== "..");
-  if (!plain || !Number.isInteger(number) || number < 1) {
+  if (!plainRepository(project) || !Number.isInteger(number) || number < 1) {
     return make("span", "pr-link", label);
   }
   const link = make("a", "pr-link", label);
-  link.href = "https://github.com/" + project + "/pull/" + number;
+  link.href = GITHUB_LINK + project + "/pull/" + number;
   link.rel = "noopener noreferrer";
   return link;
 }

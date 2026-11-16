@@ -1594,7 +1594,7 @@ fn reply_page(context: &Context, body: &[u8]) -> Response<Cursor<Vec<u8>>> {
         Ok(None) => return error_response(409, "the ticket waits for no answer"),
         Err(why) => return error_response(503, &format!("the ticket cannot be read: {why}")),
     };
-    let offer = reply::section(&stored.record, &state, &ticket, &|_| None);
+    let offer = reply::section(&stored.record, &state, &|_| None);
     if offer["offered"] != Value::Bool(true) {
         if offer.is_null() || offer["ask"] != Value::String(form.ask.clone()) {
             return error_response(

@@ -10,7 +10,7 @@ use owlshift_adapters::tracker::linear::{KeyAccount, LinearTracker};
 use owlshift_core::floor::{FloorViolation, ReplyRefusal};
 use owlshift_runner::tracker::github_key;
 use owlshift_runner::ui::reply::{
-    Answer, Choice, ComposeError, Form, Key, KeyState, ReplyError, section, send,
+    Answer, Choice, ComposeError, Form, Key, KeyState, ReplyError, section, send, tracker_link,
 };
 use owlshift_runner::writer::WriteError;
 use owlshift_testkit::issues::Account;
@@ -225,7 +225,7 @@ fn a_ui_reply_without_go_settles() {
 fn the_form_is_absent_and_the_writer_refuses_for_another_decider() {
     let bench = asked();
     let record = bench.record();
-    let offer = section(&record, &ready("someone-else"), &ticket(), &|_| None);
+    let offer = section(&record, &ready("someone-else"), &|_| None);
     assert_eq!(offer["offered"], false, "{offer:#}");
     assert_eq!(offer["decider"]["account"], "maintainer");
     assert!(
@@ -236,7 +236,7 @@ fn the_form_is_absent_and_the_writer_refuses_for_another_decider() {
         "{offer:#}"
     );
     assert_eq!(
-        section(&record, &ready("maintainer"), &ticket(), &|_| None)["offered"],
+        section(&record, &ready("maintainer"), &|_| None)["offered"],
         true
     );
     let before = bench.comments().len();
@@ -271,7 +271,7 @@ fn awaiting_approval() -> Bench {
         "{outcome:?}\n{printed}"
     );
     let record = bench.record();
-    let offer = section(&record, &ready("maintainer"), &ticket(), &|_| None);
+    let offer = section(&record, &ready("maintainer"), &|_| None);
     assert_eq!(offer["approval"], true, "{offer:#}");
     assert_eq!(offer["offered"], true, "{offer:#}");
     bench
@@ -318,7 +318,7 @@ fn a_plan_changed_from_the_ui_goes_back_to_design() {
     let letter = owlshift_contracts::result::option_letter(1);
     // A change option that needs words, as the reply section lists them, is
     // refused without them, nothing posted.
-    let offer = section(&record, &ready("maintainer"), &ticket(), &|_| None);
+    let offer = section(&record, &ready("maintainer"), &|_| None);
     let needs_words = offer["words"]["Q1"]
         .as_array()
         .unwrap()
@@ -439,7 +439,7 @@ impl Bench {
 /// sent from the UI lands as a comment on the issue, authored by that
 /// account with no Owlshift marker, the answer check's brief reads it as the
 /// decider's, counts it at once for its `go`, and the ticket resumes and
-/// delivers. The page links no issue.
+/// delivers. The page links the issue (OWL-566, OWL-580).
 #[test]
 fn a_reply_from_the_ui_lands_on_the_github_issue_and_resumes_it() {
     let (bench, issues) = github_asked();
@@ -447,18 +447,13 @@ fn a_reply_from_the_ui_lands_on_the_github_issue_and_resumes_it() {
     assert_eq!(key.account.id, "1");
     assert_eq!(key.account.name, "maintainer");
     assert!(!key.account.app && key.account.workspace.is_empty());
-    let offer = section(
-        &bench.issue_record(),
-        &KeyState::Ready(bench.github_key(&issues)),
-        &issue(),
-        &|_| None,
-    );
+    let state = KeyState::Ready(bench.github_key(&issues));
+    let offer = section(&bench.issue_record(), &state, &|_| None);
     assert_eq!(offer["offered"], true, "{offer:#}");
     assert_eq!(offer["decider"]["account"], "1");
     assert_eq!(
-        offer["link"],
-        format!("https://github.com/{REPO}/issues/1"),
-        "{offer:#}"
+        tracker_link(&state, &issue()),
+        Some(format!("https://github.com/{REPO}/issues/1"))
     );
 
     let before = issues.comments(1).len();
@@ -552,16 +547,15 @@ fn the_form_is_absent_and_the_writer_refuses_for_another_github_account() {
         let key = bench.github_key(&others);
         assert_eq!(key.account.app, viewer.kind == "Bot");
         let state = KeyState::Ready(bench.github_key(&others));
-        let offer = section(&record, &state, &issue(), &|_| None);
+        let offer = section(&record, &state, &|_| None);
         assert_eq!(offer["offered"], false, "{offer:#}");
         assert!(
             offer["why_not"].as_str().unwrap().contains(why),
             "{offer:#}"
         );
         assert_eq!(
-            offer["link"],
-            format!("https://github.com/{REPO}/issues/1"),
-            "{offer:#}"
+            tracker_link(&state, &issue()),
+            Some(format!("https://github.com/{REPO}/issues/1"))
         );
         let form = bench.issue_form(vec![pick("Q1", "B", "")], true);
         let refused = send(key.tracker.as_ref(), &key.account, &record, &issue(), &form);
