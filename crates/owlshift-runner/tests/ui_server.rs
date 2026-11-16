@@ -1358,6 +1358,12 @@ fn audit(css: &str) -> Result<(), String> {
     // A graphic at 3:1 on page, surface and raised (a bar, a ring, a border),
     // and the hairline, which only separates areas.
     const GRAPHIC: [&str; 4] = ["border-strong", "focus", "accent", "border-hairline"];
+    const STATES: [&str; 3] = ["success", "warning", "danger"];
+    let state_fill = |background: Option<&str>| {
+        STATES
+            .iter()
+            .any(|state| background == Some(format!("var(--{state})").as_str()))
+    };
     for (selector, declarations) in style_rules(css) {
         // Visual identity section 6, "Surfaces": no shadow, no gradient.
         for (name, value) in &declarations {
@@ -1415,8 +1421,15 @@ fn audit(css: &str) -> Result<(), String> {
                             && value_of("background") == Some("var(--badge-fill)"))
                         || (role == "action-text"
                             && value_of("background") == Some("var(--action-fill)"))
+                        // The surface's colour on a state's fill: the pair
+                        // section 4 lists as that state on the surface (a
+                        // stage done, OWL-575).
+                        || (role == "surface" && state_fill(value_of("background")))
                 } else if name.starts_with("background") {
-                    FILLS.contains(&role) || role == "badge-fill" || role == "action-fill"
+                    FILLS.contains(&role)
+                        || role == "badge-fill"
+                        || role == "action-fill"
+                        || (STATES.contains(&role) && value_of("color") == Some("var(--surface)"))
                 } else if name == "fill" || name == "stroke" {
                     GRAPHIC.contains(&role) || TEXT.contains(&role) || TEXT_LIKE.contains(&role)
                 } else if name.starts_with("outline") {
@@ -1426,7 +1439,7 @@ fn audit(css: &str) -> Result<(), String> {
                     // the badge's fill only marks a card that needs you, whose
                     // words say it (section 4, "Contrast").
                     GRAPHIC.contains(&role)
-                        || ["success", "warning", "danger"].contains(&role)
+                        || STATES.contains(&role)
                         || (role == "badge-fill" && selector.contains("needs-you"))
                 } else {
                     // One side's border: no coloured side border (section 6).
@@ -1476,6 +1489,9 @@ fn every_colour_the_style_sheet_uses_is_a_pair_of_the_contrast_table() {
         ".new { stroke: var(--page); }",
         ".new { background: var(--accent); }",
         ".new { color: var(--accent); }",
+        ".new { background: var(--success); color: var(--text); }",
+        ".new { background: var(--success); }",
+        ".new { color: var(--surface); }",
     ] {
         assert!(audit(css).is_err(), "{css}");
     }
@@ -1487,6 +1503,7 @@ fn every_colour_the_style_sheet_uses_is_a_pair_of_the_contrast_table() {
         ".new-needs-you { border: 1px solid var(--badge-fill); }",
         ".new { color: var(--text); background: var(--danger-tint); }",
         ".new { border-right: 1px solid var(--border-hairline); }",
+        ".new { background: var(--success); color: var(--surface); }",
         ".new { color: var(--badge-text); background: var(--badge-fill); }",
         ".new { border-bottom: 1px solid var(--border-hairline); }",
         ".new { border: 1px solid var(--border-strong); border-radius: 4px; }",

@@ -667,10 +667,12 @@
     const spending = answer.tickets.filter((ticket) => ticket.events_micros > 0);
     // Figures for the period, from the answer's own numbers.
     const tiles = make("div", "tiles");
-    tiles.appendChild(figureTile("Spent", usd(answer.events.total_micros), "figure-accent", []));
+    const spent = figureTile("Spent", figureUsd(answer.events.total_micros / 1000000), "figure-accent", []);
+    spent.setAttribute("title", usd(answer.events.total_micros));
+    tiles.appendChild(spent);
     tiles.appendChild(figureTile("Runs reported", answer.events.records, "", []));
     tiles.appendChild(figureTile("Tickets that spent", spending.length, "", []));
-    tiles.appendChild(figureTile("Costliest day", costliest ? usd(costliest.micros) : usd(0), "",
+    tiles.appendChild(figureTile("Costliest day", figureUsd(costliest ? costliest.micros / 1000000 : 0), "",
       costliest ? [make("span", "when", costliest.day)] : []));
     parts.total.appendChild(tiles);
     note(parts.total, "Over " + period + ", by the usage events. A run whose harness reports no cost adds nothing.");
@@ -752,7 +754,7 @@
 
   function buildSpend(state, el) {
     // The period: a segmented switch.
-    const bar = make("div", "section-head");
+    const bar = make("div", "section-head screen-bar");
     const periods = make("div", "segmented");
     periods.setAttribute("role", "group");
     periods.setAttribute("aria-label", "Period");

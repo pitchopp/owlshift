@@ -361,6 +361,17 @@ button {
   font-size: 13px;
 }
 
+/* The theme switch's three segments hold on one line of the side bar. */
+.side .segmented {
+  display: flex;
+  flex-wrap: nowrap;
+}
+
+.side .toggle {
+  flex: 1 1 0;
+  padding: 8px 4px;
+}
+
 .main-col {
   min-width: 0;
 }
@@ -407,6 +418,7 @@ button {
 .gauge-foot {
   font-size: 12px;
   color: var(--text-muted);
+  white-space: nowrap;
 }
 
 .header-notes {
@@ -578,7 +590,11 @@ main {
 
 .section + .section,
 .graph-project + .graph-project {
-  margin-top: 12px;
+  margin-top: 24px;
+}
+
+.screen-bar {
+  margin-bottom: 24px;
 }
 
 .panel > h2,
@@ -769,7 +785,7 @@ main {
 /* Figures: a count at 48 px, its label above, its first identifiers below. */
 .tiles {
   display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(200px, 1fr));
+  grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
   gap: 12px;
 }
 
@@ -928,29 +944,49 @@ main {
   margin-top: 24px;
 }
 
+/* Every stage fits from 1280 px: a stage with tickets shares the width, an
+   empty one keeps a narrow dashed outline. Narrower, the row scrolls in its
+   own box. */
 .columns {
-  display: grid;
-  grid-auto-flow: column;
-  grid-auto-columns: minmax(200px, 1fr);
-  gap: 12px;
+  display: flex;
+  gap: 8px;
   padding-bottom: 8px;
 }
 
 .column {
+  flex: 1 1 0;
+  min-width: 96px;
   background: var(--raised);
   border-radius: 14px;
-  padding: 12px;
-  min-width: 0;
+  padding: 8px;
 }
 
 .column-empty {
+  flex: 0 0 88px;
+  min-width: 88px;
   background: var(--page);
   border: 1px dashed var(--border-strong);
 }
 
+.column .ticket-card {
+  padding: 8px;
+}
+
+.column .ticket-link,
+.column .card-title {
+  font-size: 14px;
+}
+
+.column .card-state,
+.column .card-why {
+  font-size: 12px;
+}
+
 .column-head {
   display: flex;
+  flex-wrap: wrap;
   justify-content: space-between;
+  gap: 0 4px;
   margin: 0 0 8px;
   color: var(--text-secondary);
   font-size: 13px;
@@ -1118,10 +1154,12 @@ main {
   font-weight: 800;
 }
 
+/* A stage done: a circle filled with success, its ✓ in the surface colour,
+   the pair section 4 lists as success on the surface. */
 .step-done .step-dot {
-  background: var(--raised);
+  background: var(--success);
   border: 2px solid var(--success);
-  color: var(--success);
+  color: var(--surface);
 }
 
 .step-current .step-dot {
@@ -1297,15 +1335,34 @@ pre {
   border-top: 1px solid var(--border-hairline);
 }
 
+/* One row per run, its figures in aligned columns: role, state, duration
+   and cost; the tokens and the run's id are in its facts. */
 .run-summary {
-  display: flex;
-  flex-wrap: wrap;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 7em 5em 6em;
   align-items: center;
-  gap: 4px 16px;
+  gap: 4px 12px;
   min-height: 44px;
   padding: 8px 12px;
   border-radius: 8px;
   cursor: pointer;
+}
+
+.run-summary > * {
+  overflow-wrap: anywhere;
+}
+
+.run-elapsed,
+.run-cost {
+  text-align: right;
+}
+
+@media (max-width: 767px) {
+  .run-summary {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 4px 12px;
+  }
 }
 
 .run-failed > .run-summary {

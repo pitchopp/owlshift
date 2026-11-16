@@ -323,13 +323,33 @@ function gauge(label, value, share, foot, footClass) {
   return el;
 }
 
+// A time on the machine's clock, short enough for a gauge: "16 Nov, 13:47".
+function shortClock(iso) {
+  const date = new Date(iso);
+  if (Number.isNaN(date.getTime())) {
+    return String(iso);
+  }
+  return date.toLocaleString(undefined, { day: "numeric", month: "short", hour: "2-digit", minute: "2-digit" });
+}
+
+// An amount as a figure: cents below $1,000, whole dollars with their
+// thousands from there, so a figure keeps to one line of its tile; the exact
+// amount is the tile's title and the tables'.
+function figureUsd(amount) {
+  const value = Number(amount) || 0;
+  if (value < 1000) {
+    return "$" + value.toFixed(2);
+  }
+  return "$" + Math.round(value).toLocaleString("en-US");
+}
+
 function usageGauge(usage) {
   if (usage.state === "limited") {
     return gauge(usage.harness, "limited", 1,
-      "limited" + (usage.until ? " until " + shortTime(usage.until) : ""), "state-warning");
+      "limited" + (usage.until ? " until " + shortClock(usage.until) : ""), "state-warning");
   }
   return gauge(usage.harness, Math.round(usage.share * 100) + " %", usage.share,
-    "resets " + shortTime(usage.resets_at));
+    "resets " + shortClock(usage.resets_at));
 }
 
 // A project's run slots and the tickets holding them: "0 slots",
@@ -845,8 +865,10 @@ function usd(amount) {
   return "$" + amount.toFixed(amount !== 0 && amount < 1 ? 4 : 2);
 }
 
-function plural(count, word) {
-  return count + " " + word + (count === 1 ? "" : "s");
+// `count` and its word, `many` when it is not one (a word ending in s, such
+// as "review pass", says its plural).
+function plural(count, word, many) {
+  return count + " " + (count === 1 ? word : many || word + "s");
 }
 
 // An element's open state survives a refresh through `key`.
@@ -1166,7 +1188,7 @@ function stepperEl(entries, failed, asks, truncated) {
       step.appendChild(make("span", "step-at when", shortTime(span.from)));
       const what = [];
       if (span.passes) {
-        what.push(plural(span.passes, "review pass"));
+        what.push(plural(span.passes, "review pass", "review passes"));
       }
       const asked = within(asks, span);
       if (asked) {
@@ -1219,7 +1241,7 @@ function renderTimeline(handle, body, timeline, snapshot) {
       facts.push("round " + entry.round);
     }
     if (entry.review_passes) {
-      facts.push(plural(entry.review_passes, "review pass"));
+      facts.push(plural(entry.review_passes, "review pass", "review passes"));
     }
     if (entry.has_plan) {
       facts.push("plan");
@@ -1781,25 +1803,26 @@ function drawRunHead(run, info) {
   // A failed run is marked ✗ on a row tinted with danger at 8 %.
   run.el.classList.toggle("run-failed", stateClass === "state-danger");
   clear(run.summary);
-  run.summary.appendChild(make("span", "run-id", info.id));
+  run.summary.setAttribute("title", "run " + info.id);
   run.summary.appendChild(make("span", "run-role", (info.role || "run").replace(/_/g, " ") +
     (info.attempt ? " #" + info.attempt : "")));
   run.summary.appendChild(make("span", stateClass, state));
-  if (typeof info.elapsed_ms === "number") {
-    run.summary.appendChild(make("span", "run-fact", (info.elapsed_ms / 1000).toFixed(1) + " s"));
-  }
+  run.summary.appendChild(make("span", "run-fact run-elapsed",
+    typeof info.elapsed_ms === "number" ? (info.elapsed_ms / 1000).toFixed(1) + " s" : ""));
+  run.summary.appendChild(make("span", "run-fact run-cost",
+    info.usage && typeof info.usage.cost_usd === "number" ? usd(info.usage.cost_usd) : ""));
+  clear(run.facts);
   const usage = usageLine(info.usage);
   if (usage) {
-    run.summary.appendChild(make("span", "run-fact", usage));
+    run.facts.appendChild(make("p", "run-fact", usage));
   }
-  clear(run.facts);
   if (info.summary) {
     run.facts.appendChild(make("p", "pre-text", info.summary));
   }
   if (info.reason) {
     run.facts.appendChild(make("p", "state-danger", info.reason));
   }
-  const more = [];
+  const more = ["run " + info.id];
   if (info.gate) {
     more.push("gate " + info.gate);
   }
@@ -1815,9 +1838,7 @@ function drawRunHead(run, info) {
   if (info.ended_at) {
     more.push("ended " + shortTime(info.ended_at));
   }
-  if (more.length) {
-    run.facts.appendChild(make("p", "notice", more.join(" · ")));
-  }
+  run.facts.appendChild(make("p", "notice", more.join(" · ")));
 }
 
 function makeRun(handle, info, open) {
@@ -2073,6 +2094,10 @@ function appendRecords(run, which, records) {
     batch.appendChild(el);
   }
   container.appendChild(batch);
+  // Standard error shows once it holds something: empty means said once.
+  if (which === "stderr") {
+    run.errBox.hidden = !run.err.firstChild;
+  }
 }
 
 // How a log is followed: at once while a read makes progress and there is
@@ -2190,9 +2215,6 @@ function startLog(handle, run, which) {
   }
   log.started = true;
   log.lastData = Date.now();
-  if (which === "stderr") {
-    run.errBox.hidden = false;
-  }
   pollLog(handle, run, which);
 }
 
@@ -2641,7 +2663,9 @@ function renderSince() {
   for (const [label, ids, className] of groups) {
     tiles.appendChild(figureTile(label, ids.length, ids.length ? className : "", ids));
   }
-  tiles.appendChild(figureTile("Spent", "$" + spent.toFixed(2), "figure-accent", []));
+  const spentTile = figureTile("Spent", figureUsd(spent), "figure-accent", []);
+  spentTile.setAttribute("title", "$" + spent.toFixed(2));
+  tiles.appendChild(spentTile);
   body.appendChild(tiles);
 }
 

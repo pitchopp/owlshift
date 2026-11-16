@@ -137,7 +137,7 @@ The last three rows came with the web UI's layout (section 6, OWL-575, 2026-11-1
 
 ### Contrast
 
-WCAG 2.2 AA, computed on 2026-10-04 from the hex values above: text at least 4.5:1 on every background it is listed for, a graphic (an icon, a focus ring, an input's border, a part of the mark) at least 3:1. Hairline borders only separate areas that differ otherwise and are exempt. So is the "Needs input" badge's fill used as the border of a card that needs you (section 6): the border only marks the card, whose words and primary action say what it waits for.
+WCAG 2.2 AA, computed on 2026-10-04 from the hex values above: text at least 4.5:1 on every background it is listed for, a graphic (an icon, a focus ring, an input's border, a part of the mark) at least 3:1. Hairline borders only separate areas that differ otherwise and are exempt. So is the "Needs input" badge's fill used as the border of a card that needs you (section 6): the border only marks the card, whose words and primary action say what it waits for. A state's colour may also fill a small shape whose symbol is in the surface colour, as a stage done on the ticket page's stepper: the pair is the one the table lists for that state on the surface.
 
 | Text | Light: page · surface · raised | Dark: page · surface · raised |
 | --- | --- | --- |
