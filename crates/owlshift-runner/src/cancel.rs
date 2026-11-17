@@ -305,8 +305,7 @@ impl Watcher {
         let path = file(dirs, ticket);
         let fired = Arc::new(AtomicBool::new(false));
         if fs::symlink_metadata(&path).is_ok() {
-            process::stop_step();
-            fired.store(true, Ordering::SeqCst);
+            fire(&fired, process::stop_step);
             return Self {
                 stop: None,
                 thread: None,
@@ -321,8 +320,7 @@ impl Watcher {
             .spawn(move || {
                 while let Err(RecvTimeoutError::Timeout) = stopped.recv_timeout(POLL) {
                     if fs::symlink_metadata(&path).is_ok() {
-                        process::stop_step();
-                        flag.store(true, Ordering::SeqCst);
+                        fire(&flag, process::stop_step);
                         return;
                     }
                 }
@@ -359,6 +357,16 @@ impl Drop for Watcher {
         }
         process::end_step_stop();
     }
+}
+
+/// Records on `fired` that a watcher found its ticket's cancel file, then
+/// asks the step's stop with `stop`,
+/// `owlshift_platform::process::stop_step`, in that order (OWL-592):
+/// whoever sees the stop asked sees [`Watcher::fired`] true. The stop is a
+/// parameter so that a test reads the flag at the moment it is asked.
+fn fire(fired: &AtomicBool, stop: impl FnOnce()) {
+    fired.store(true, Ordering::SeqCst);
+    stop();
 }
 
 #[cfg(test)]
@@ -585,5 +593,16 @@ mod tests {
         assert_eq!(read(&dirs, &ticket), Some(Some(request)));
         drop(watcher);
         assert!(!process::step_stop_asked());
+    }
+
+    /// A watcher that found the file has fired by the time the step's stop
+    /// is asked, so no reader sees the stop asked and the watcher not fired
+    /// (OWL-592).
+    #[test]
+    fn a_watcher_has_fired_by_the_time_the_stop_is_asked() {
+        let fired = AtomicBool::new(false);
+        let mut at_the_stop = None;
+        fire(&fired, || at_the_stop = Some(fired.load(Ordering::SeqCst)));
+        assert_eq!(at_the_stop, Some(true));
     }
 }
