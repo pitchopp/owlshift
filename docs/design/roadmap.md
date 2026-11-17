@@ -234,8 +234,9 @@ Several developers on one project, each with a runner on their own machine and t
 - On a team the admission gesture is personal: a label each developer puts on their own tickets. A state gesture's account is whoever moved the ticket to the ready column, often not the person whose runner should take it.
 - Caps are per runner: `policy.max_in_flight` and `policy.max_open_prs` count the tickets of the runner that reads them, so a project's total grows with its developers.
 - A claim publishes on the remote a ticket's identifier, its operator's handle and the paths it holds, never its text, its plan or its questions; the project turns claims on.
+- The exit gate waits on no third party, as P9's since D6's amendment of the same day. A second developer's time would have held it for two weeks; the second developer is instead a second set of accounts, a second member of the tracker and GitHub's one machine account, with a runner of its own, and the maintainer holds both. It runs 72 hours, P7's bound, on a project tracked in Linear, with the cases a colleague would bring staged. What two people's habits bring is not measured: a team's adoption is recorded when it happens and holds nothing.
 
-**Exit gate.** Two developers share one project for two weeks. Judged on outcomes ([build plan](build-plan.md), "P10 tasks & exit gate"): no ticket worked by two runners, no run spent on a ticket its runner's operator did not admit, no colleague's review acted on before its decider's answer, and one handover ended in a delivery.
+**Exit gate.** Two operators share one project, the maintainer holding both, for 72 hours at least. Judged on outcomes ([build plan](build-plan.md), "P10 tasks & exit gate"): no ticket worked by two runners, no run spent on a ticket its runner's operator did not admit, no colleague's review acted on before its decider's answer, and one handover ended in a delivery. Reworded on 2026-11-17 with the maintainer from "Two developers share one project for two weeks" (the reading above).
 
 ## P11 · Menu-bar app
 
