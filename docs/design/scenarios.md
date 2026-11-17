@@ -112,7 +112,7 @@ The scanner sees the admitted ticket; intake finds no question and records resou
 *Sleep, reboot or crash: nothing is lost and nothing starts twice.*
 
 - State is rebuilt from the tracker, the forge and the git refs alone.
-- A claim whose lease expired is taken over; a live claim is never.
+- A claim whose lease expired is taken over; a live claim is never. Until a shared runner is built, an expired claim is released by a person and no runner takes one over ([roadmap](roadmap.md), P10's readings).
 - A ticket in progress with no live run resumes from its checkpoint.
 
 ### S12. The human keeps control
@@ -144,7 +144,8 @@ The scanner sees the admitted ticket; intake finds no question and records resou
 - A runner never takes a ticket its operator did not delegate; a team-server runner takes every admitted ticket.
 - Only the decider's answers (the assignee, or for a ticket without one, the owner of its zones) count; other comments are context, and the answer check says so.
 - A PR review comment and a ticket comment from the same person count as one decider, through the identity map.
-- Two runners on two machines never claim the same ticket.
+- A colleague's review on the pull request reaches the decider as a question on the ticket, and starts nothing until the decider answers it.
+- Two runners on two machines never claim the same ticket, on a project that turns claims on the remote on (`[policy] claims = "remote"`).
 
 ### S15. Adopting a project
 

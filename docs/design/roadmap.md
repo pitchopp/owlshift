@@ -1,6 +1,6 @@
 # Owlshift — roadmap
 
-Status: draft, 2026-09-27. Twelve steps (P0 to P11), each shippable, testable and usable on its own before the next one starts. Owlshift works on its own backlog from P1 and on Locary's from P5.
+Status: draft, 2026-09-27. Thirteen steps (P0 to P12; P12 added on 2026-11-17, P10's readings), each shippable, testable and usable on its own before the next one starts. Owlshift works on its own backlog from P1 and on Locary's from P5.
 
 | Step | Name | What you can do at the end |
 | --- | --- | --- |
@@ -14,8 +14,9 @@ Status: draft, 2026-09-27. Twelve steps (P0 to P11), each shippable, testable an
 | P7 | Background service | Starts at login, survives sleep, logouts and restarts, notifies you only when you are the blocker |
 | P8 | Local web UI | Follow and drive the drain from the browser: what runs and waits, what blocks what, logs, spend, configuration, replies |
 | P9 | Open-source readiness | First public 0.x release: GitHub Issues, Markdown tracker, `init` detection, a second project |
-| P10 | Teams | Several developers on one project; a team-server mode |
+| P10 | Teams | Several developers on one project, each with a runner on their own machine |
 | P11 | Menu-bar app | A Tauri shell around the web UI, with native notifications |
+| P12 | A runner without a desktop | A runner on a Linux server or in a container, followed and driven from another machine |
 
 Three choices shape this order. The central bet, the question loop, comes at P2, before anything else is polished. Parallelism comes late (P6): run serially, tickets cannot collide, so the backlog drains from P4 without the hardest scheduling problem solved. And `/parallel`-style batch orchestration becomes unnecessary for Owlshift's own backlog at P4, and for Locary's at P6.
 
@@ -202,27 +203,54 @@ Follow and drive the drain from a browser.
 **Readings and deviations** (decided with the maintainer on 2026-11-12).
 
 - The second project (D6, amended 2026-11-17) is the maintainer's `portfolio`, a Next.js and TypeScript site tracked in GitHub Issues. The friend's project chosen on 2026-11-12 would have held the gate on a third party's time; a friend's adoption is recorded when it happens and holds nothing. No part of P9 depends on the project: the GitHub Issues adapter is proven on the sandbox repository, and the gate then runs it on a real one.
-- The Docker server image moves to P10, with the team-server mode it serves.
+- The Docker server image moves to P10, with the team-server mode it serves. P10's readings move it on to P12.
 - The Markdown tracker is published as the mode without an account, on one machine, for `owlshift do` in a checkout: it commits nothing and the daemon does not serve it. A shared mode waits for a real demand.
 - "Signed" is Owlshift's own key: a checksum and a signature that `self-update` verifies. Apple's notarization waits for the P11 app, the first download through a browser.
 - The Markdown tracker's front matter stays TOML (OWL-34).
 - The repository is public already (checked on 2026-11-12), so that line is done.
-- On GitHub Issues Owlshift has no identity of its own: its comments are the signed-in person's, as on Linear through a key without the app. An agent identity there needs a server that holds the app's private key, which is P10's.
+- On GitHub Issues Owlshift has no identity of its own: its comments are the signed-in person's, as on Linear through a key without the app. An agent identity there needs a server that holds the app's private key, which is a shared runner's (P10's readings).
 - The public site (decided with the maintainer on 2026-11-16) is one page, part of P9 and outside its exit gate: it is built right after the gate, which does not wait for it, and Owlshift is not announced before the page is live. The [build plan](build-plan.md), "The public site", says what the page holds and how it is built and served; the [visual identity](visual-identity.md), section 6, says how it looks.
 
 **Exit gate.** The second project adopts Owlshift with configuration only, no change to the core.
 
 ## P10 · Teams
 
-Deciders, identity map across tracker and forge, per-developer runners, team-server mode and its Docker server image (P9's reading), agent identities (Linear app user, GitHub App), claims with leases on git refs and the takeover of an expired one (S11's part, P7's reading). Scenario S14.
+Several developers on one project, each with a runner on their own machine and their own subscription.
 
-**Exit gate.** Two developers share one project for two weeks.
+- The people table: one handle a person, with their tracker and forge accounts, which admitters, zone owners and reviewers name (the identity map).
+- A runner knows its operator and takes only the tickets its operator admitted; it notifies its operator only of what is theirs to decide.
+- A colleague's review on the pull request is relayed to the ticket's decider, whose answer makes it an instruction or sets it aside.
+- Claims on git refs, a project's opt-in: a ticket is claimed on the remote before its first run, and every runner reads the others' claims, so a ticket is never taken twice and a Build waits for the files another machine's ticket holds; an expired claim is released by a person. Scenario S14.
+- The rules are [architecture](architecture.md) section 7, and section 5, "Review comments on the pull request"; the [build plan](build-plan.md), "P10 · Teams", gives the rules as designed, the live checks, who builds what and how the exit gate is run.
+
+**Readings and deviations** (decided with the maintainer on 2026-11-17). This step's first wording was: "Deciders, identity map across tracker and forge, per-developer runners, team-server mode and its Docker server image (P9's reading), agent identities (Linear app user, GitHub App), claims with leases on git refs and the takeover of an expired one (S11's part, P7's reading)."
+
+- No Owlshift server is built. The "team-server mode" is two settings of one runner, where it runs and which tickets it takes; runners coordinate through the tracker and the git remote, with nothing central to host (architecture section 7).
+- The Docker server image, which P9 moved here, moves on to P12 with everything a machine without a desktop needs.
+- S14's "a team-server runner takes every admitted ticket" is the personal `takes = "all"`, which is what every runner did before P10. The rest of a shared runner waits for a demand, after P12: an identity of its own on GitHub (a GitHub App acting as itself, which needs a server that holds the private key of an app each team registers), and the takeover below.
+- S11's "a claim whose lease expired is taken over": an expired claim is shown and released by a person, never taken over by a runner. A ticket's state lives on the machine that works it, and a runner takes only its operator's tickets, so only a shared runner could resume another's; pushing that state to the remote also publishes plans and questions (architecture section 7, "Privacy"). A live claim is never taken, as S11 says.
+- "Per-developer runners" is `takes = "mine"`, the default. Deciders are P2's, unchanged.
+- Agent identities: the Linear app user is built (D8), and on a team each developer's `init` takes the workspace app's client credentials, or leaves them out and writes through their own key. On GitHub a developer's pull requests are opened with their own credential, so they are theirs and a colleague reviews them: assumed since C11 did not read the author, and read by P10's live check T5.
+- On a team the admission gesture is personal: a label each developer puts on their own tickets. A state gesture's account is whoever moved the ticket to the ready column, often not the person whose runner should take it.
+- Caps are per runner: `policy.max_in_flight` and `policy.max_open_prs` count the tickets of the runner that reads them, so a project's total grows with its developers.
+- A claim publishes on the remote a ticket's identifier, its operator's handle and the paths it holds, never its text, its plan or its questions; the project turns claims on.
+- The exit gate waits on no third party, as P9's since D6's amendment of the same day. A second developer's time would have held it for two weeks; the second developer is instead a second set of accounts, a second member of the tracker and GitHub's one machine account, with a runner of its own, and the maintainer holds both. It runs 72 hours, P7's bound, on a project tracked in Linear, with the cases a colleague would bring staged. What two people's habits bring is not measured: a team's adoption is recorded when it happens and holds nothing.
+
+**Exit gate.** Two operators share one project, the maintainer holding both, for 72 hours at least. Judged on outcomes ([build plan](build-plan.md), "P10 tasks & exit gate"): no ticket worked by two runners, no run spent on a ticket its runner's operator did not admit, no colleague's review acted on before its decider's answer, and one handover ended in a delivery. Reworded on 2026-11-17 with the maintainer from "Two developers share one project for two weeks" (the reading above).
 
 ## P11 · Menu-bar app
 
 A Tauri 2 shell around the P8 UI: tray icon, native notifications, login item, answering a gate from the app with the UI's own reply form (P8).
 
 **Exit gate.** The app replaces the terminal for daily use on macOS and Windows.
+
+## P12 · A runner without a desktop
+
+A runner on a Linux server or in a container, for one developer or for a team: the machine that stays on when the laptop's lid closes. Added on 2026-11-17 with the maintainer (P10's readings). It is numbered after the menu-bar app so that no step is renamed; which of the two is built first is the maintainer's to say when P10's gate passes.
+
+An official image and a compose file (the Docker server image of P9's and P10's readings); secrets kept without a keychain; a notification channel that needs no desktop; the UI reached from another machine; the sandbox inside a container; a systemd system unit. A shared runner (P10's readings) is built on it, on demand. Not designed yet: its build plan section comes with its design.
+
+**Exit gate.** A runner on a server without a desktop drains a project for a week, followed and driven from another machine.
 
 ## Scenario coverage
 
@@ -234,6 +262,6 @@ A Tauri 2 shell around the P8 UI: tray icon, native notifications, login item, a
 | S3, S4, S6, S12, S13 | P4 |
 | S8 | P5 |
 | S5, S10, S16, S17 | P6 (S17's fallback for the review roles only; S5's browser slot, S16's ports and priorities across projects later: P6's readings) |
-| S11, S18 | P7 (S18 outside P7's exit gate; claims and leases in P10, a run cut by a crash checked later: P7's readings) |
+| S11, S18 | P7 (S18 outside P7's exit gate; claims and leases in P10, a run cut by a crash checked later: P7's readings; the takeover of an expired claim with a shared runner: P10's readings) |
 | S15 | P9 |
-| S14 | P10 |
+| S14 | P10 (its team-server line is `takes = "all"`; a shared runner later: P10's readings) |
