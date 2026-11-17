@@ -2922,7 +2922,7 @@ forge = "lea-martin"                               # the forge login; optional: 
 
 ## P10 tasks & exit gate
 
-The tasks are the parts above, in the Linear project "P10 · Teams".
+The tasks are the parts above, in the Linear project "P10 · Teams": OWL-581 (part 1), OWL-582 (2), OWL-583 (3), OWL-584 (4), OWL-585 (5), OWL-586 (6), OWL-587 (7), OWL-588 (8), OWL-589 (9), OWL-590 (10) and OWL-591 (11).
 
 **Exit gate.** Two developers share one project for two weeks. Run by the maintainer with a second developer, once the parts are merged and released. Which project and which developer are recorded when the gate is prepared, as P9's second project was; no part depends on them.
 
