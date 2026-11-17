@@ -2498,7 +2498,7 @@ What the run showed:
 
 Designed on 2026-11-12 with the maintainer, in a session rather than a design ticket, as P8 was. The [roadmap](roadmap.md) gives P9's scope and records its readings; [architecture](architecture.md) section 6 gives the tracker's capabilities and their fallbacks, which the GitHub Issues adapter follows; [runtime and operations](runtime-and-operations.md), "Install, lifecycle & uninstall" and "Updates & versions", give the install and update paths. Decided with the maintainer on 2026-11-12:
 
-- *The second project* (D6) is a project of a friend of the maintainer's, who adopts Owlshift on it. Its stack, its tracker and its machine are recorded when the gate is prepared: no part below depends on them.
+- *The second project* (D6, amended 2026-11-17) is the maintainer's `portfolio` repository, a Next.js and TypeScript site built with npm, with GitHub Issues as its tracker. Locary's front end is Next.js too; its back end, its tests and its tracker are not. A friend's project was chosen on 2026-11-12; the gate would then have waited on a third party's time, so a friend's adoption is recorded when it happens and holds nothing. No part below depends on the project.
 - *The Docker server image* moves to P10, with the team-server mode it serves; nobody needs it for 0.1. P10's design moved it on to P12, the runner without a desktop (2026-11-17, "P10 · Teams").
 - *The Markdown tracker* is published in 0.1 as the mode without an account, on one machine, for `owlshift do` in a checkout, its limits written. A shared mode, with commits and under the daemon, waits for a real demand: it is a part of its own size.
 - *Release 0.1 is signed with Owlshift's own key:* a checksum and a signature that `self-update` verifies. Apple's notarization, which only a download through a browser needs, waits for the P11 app.
@@ -2723,12 +2723,12 @@ OWL-21 (the `ci` check required on `main`) can be done at once. OWL-163 and OWL-
 
 The tasks are the parts above, in the Linear project "P9 · Open-source readiness": OWL-532 (part 1), OWL-533 (2), OWL-534 (3), OWL-535 (4), OWL-536 (5), OWL-537 (6), OWL-538 (7), OWL-539 (8), OWL-34 (9), OWL-540 (10), OWL-541 (11), OWL-542 (12) and OWL-543 (13), with OWL-21, OWL-163 and OWL-164.
 
-**Exit gate.** The second project adopts Owlshift with configuration only, no change to the core. Run by the maintainer with the friend whose project it is (D6), once the parts are merged and release 0.1 is published. How many tickets and how long are set with the maintainer when the gate is prepared, as P7's and P8's runs were:
+**Exit gate.** The second project adopts Owlshift with configuration only, no change to the core. Run by the maintainer on the second project (D6), once the parts are merged and release 0.1 is published. The maintainer knows Owlshift's code, so S15 is measured by a rule: the adoption uses only the README, the adoption page of the project's tracker and Owlshift's messages, and each time it needs anything else counts. How many tickets and how long are set with the maintainer when the gate is prepared, as P7's and P8's runs were:
 
 1. *Before.* The project's stack, tracker, forge and machine, recorded here. Owlshift installed from release 0.1, by the tap or the install script, not built from source.
 2. *The adoption.* `owlshift init` in the project's repository, `owlshift doctor` until it is clean, `owlshift gate`, then a first ticket to a verified pull request with `owlshift do`.
-3. *The run.* The project's tickets drained by `owlshift start`, the friend answering questions on the tracker.
-4. *Recorded here:* the time from the install to the first pull request; each time the friend needed the maintainer or Owlshift's code rather than its documentation and its messages, and why (S15); each change the adoption needed outside the project's own files, a change to Owlshift's code first: the gate passes if there is none, and a defect found on the way gets its ticket.
+3. *The run.* The project's tickets drained by `owlshift start`, the maintainer answering questions on the tracker.
+4. *Recorded here:* the time from the install to the first pull request; each time the adoption needed the maintainer's knowledge or Owlshift's code rather than its documentation and its messages, and why (S15); each change the adoption needed outside the project's own files, a change to Owlshift's code first: the gate passes if there is none, and a defect found on the way gets its ticket.
 
 ## The public site
 
