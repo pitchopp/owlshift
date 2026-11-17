@@ -17,7 +17,7 @@ Owlshift is an open-source runner that works a team's existing backlog continuou
 
 ## Status
 
-Release 0.1.0 is the first ([changelog](CHANGELOG.md)). Owlshift takes tickets from Linear, from GitHub Issues, or from Markdown files in your repository, runs each through intake, design, design review, build and verify with Claude Code, asks on the ticket when a decision is yours, and opens a verified pull request. A background service drains a project's ready tickets, several at a time without collisions, and repairs its own red or conflicting pull requests. It runs on macOS and Linux, and on Windows through WSL2. Owlshift is still young: the roadmap's later steps (shared team servers, more trackers and forges, a desktop app) are in [`docs/design/`](docs/design/).
+Release 0.1.0 is the first ([changelog](CHANGELOG.md)). Owlshift takes tickets from Linear, from GitHub Issues, or from Markdown files in your repository, runs each through intake, design, design review, build and verify with Claude Code, asks on the ticket when a decision is yours, and opens a verified pull request. A background service drains a project's ready tickets, several at a time without collisions, and repairs its own red or conflicting pull requests. It runs on macOS and Linux, and on Windows through WSL2. Owlshift is still young: the roadmap's later steps (several developers on one project, a runner on a server, more trackers and forges, a desktop app) are in [`docs/design/`](docs/design/).
 
 ## Requirements
 
@@ -83,7 +83,7 @@ The design is in [`docs/design/`](docs/design/):
 | [Design & architecture](docs/design/architecture.md) | Positioning, principles, core model, pipeline and gates, architecture, adapters, state and coordination, policy, cost, technology, milestones, decisions |
 | [Scenarios](docs/design/scenarios.md) | Seventeen user stories with acceptance criteria; each becomes an end-to-end test |
 | [Runtime & operations](docs/design/runtime-and-operations.md) | How it runs, platforms, install and uninstall, updates, configuration, observability, testing |
-| [Roadmap](docs/design/roadmap.md) | Twelve shippable steps, P0 to P11, with their exit gates |
+| [Roadmap](docs/design/roadmap.md) | Thirteen shippable steps, P0 to P12, with their exit gates |
 | [Build plan](docs/design/build-plan.md) | Checks to run first, workspace layout, contracts, CLI, tasks for each step |
 | [Visual identity](docs/design/visual-identity.md) | Personality, voice, logo, colours, typefaces, and how each surface applies them |
 
