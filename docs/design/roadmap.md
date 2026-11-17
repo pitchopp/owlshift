@@ -201,7 +201,7 @@ Follow and drive the drain from a browser.
 
 **Readings and deviations** (decided with the maintainer on 2026-11-12).
 
-- The second project (D6) is a project of a friend of the maintainer's, who adopts Owlshift on it. Its stack and its tracker are recorded when the gate is prepared, so "on another stack" is known then, and no part of P9 depends on it: the GitHub Issues adapter is proven on the sandbox repository whatever that project uses.
+- The second project (D6, amended 2026-11-17) is the maintainer's `portfolio`, a Next.js and TypeScript site tracked in GitHub Issues. The friend's project chosen on 2026-11-12 would have held the gate on a third party's time; a friend's adoption is recorded when it happens and holds nothing. No part of P9 depends on the project: the GitHub Issues adapter is proven on the sandbox repository, and the gate then runs it on a real one.
 - The Docker server image moves to P10, with the team-server mode it serves.
 - The Markdown tracker is published as the mode without an account, on one machine, for `owlshift do` in a checkout: it commits nothing and the daemon does not serve it. A shared mode waits for a real demand.
 - "Signed" is Owlshift's own key: a checksum and a signature that `self-update` verifies. Apple's notarization waits for the P11 app, the first download through a browser.
