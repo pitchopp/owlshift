@@ -1,0 +1,789 @@
+/* The public site's style (OWL-576): visual identity section 6, "The public
+   site's layout". The palette Dawn of section 4 as CSS variables: light on
+   :root, dark under the system's dark setting unless the switch says light,
+   and under the switch's dark. The night band takes the dark roles whatever
+   the theme. Sizes come from section 5's scale only (12, 13, 14, 16, 20, 24,
+   32, 48). Only classes: the Content-Security-Policy refuses style
+   attributes, and every URL here is relative, so the page works under a path
+   prefix. */
+
+/* The typefaces of section 5, the web UI's own files, copied beside the page
+   by scripts/site/build.sh; Latin only. */
+@font-face {
+  font-family: "Bricolage Grotesque";
+  src: url(fonts/BricolageGrotesque-latin.woff2) format("woff2");
+  font-weight: 200 800;
+  font-style: normal;
+  font-display: swap;
+  unicode-range: U+0020-007E, U+00A0-00FF, U+2010-2027, U+2030-205E, U+20AC;
+}
+
+@font-face {
+  font-family: "JetBrains Mono";
+  src: url(fonts/JetBrainsMono-Regular-latin.woff2) format("woff2");
+  font-weight: 400;
+  font-style: normal;
+  font-display: swap;
+  unicode-range: U+0020-007E, U+00A0-00FF, U+2010-2027, U+2030-205E, U+20AC, U+2713, U+2717;
+}
+
+@font-face {
+  font-family: "JetBrains Mono";
+  src: url(fonts/JetBrainsMono-Medium-latin.woff2) format("woff2");
+  font-weight: 500;
+  font-style: normal;
+  font-display: swap;
+  unicode-range: U+0020-007E, U+00A0-00FF, U+2010-2027, U+2030-205E, U+20AC, U+2713, U+2717;
+}
+
+/* Theme roles, light. The accent has two pairs (section 6): as text
+   (`apricot-ink` on light, `apricot` on dark) and as a shape (`apricot-burnt`
+   on light, `apricot` on dark, the focus ring's pair). */
+:root {
+  color-scheme: light;
+  --page: #FFF8F2;
+  --surface: #FFFFFF;
+  --raised: #FFF1E6;
+  --text: #2B1638;
+  --text-secondary: #5A3A68;
+  --text-muted: #725480;
+  --border-hairline: #EBDDE4;
+  --border-strong: #8E7899;
+  --action-fill: #2B1638;
+  --action-text: #FFF1E6;
+  --link: #A83E17;
+  --focus: #D9572A;
+  --accent-text: #A83E17;
+  --accent-shape: #D9572A;
+  --success: #1E7A52;
+  --sans: "Bricolage Grotesque", system-ui, -apple-system, "Segoe UI", sans-serif;
+  --mono: "JetBrains Mono", ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+}
+
+/* Theme roles, dark: under the system's dark setting unless the switch says
+   light... */
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme=light]) {
+    color-scheme: dark;
+    --page: #1C0E25;
+    --surface: #2B1638;
+    --raised: #3D2150;
+    --text: #FFF1E6;
+    --text-secondary: #C9B3D6;
+    --text-muted: #A692AE;
+    --border-hairline: #4A2D5C;
+    --border-strong: #8E7899;
+    --action-fill: #FF8E5E;
+    --action-text: #2B1638;
+    --link: #FFB38F;
+    --focus: #FF8E5E;
+    --accent-text: #FF8E5E;
+    --accent-shape: #FF8E5E;
+    --success: #7FE0B0;
+  }
+}
+
+/* ...under the switch's dark, and on the night band in both themes. */
+:root[data-theme=dark],
+.band {
+  color-scheme: dark;
+  --page: #1C0E25;
+  --surface: #2B1638;
+  --raised: #3D2150;
+  --text: #FFF1E6;
+  --text-secondary: #C9B3D6;
+  --text-muted: #A692AE;
+  --border-hairline: #4A2D5C;
+  --border-strong: #8E7899;
+  --action-fill: #FF8E5E;
+  --action-text: #2B1638;
+  --link: #FFB38F;
+  --focus: #FF8E5E;
+  --accent-text: #FF8E5E;
+  --accent-shape: #FF8E5E;
+  --success: #7FE0B0;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+/* The theme switch is hidden until theme.js reveals it: a class's display
+   must not show it to a page without a script. */
+[hidden] {
+  display: none !important;
+}
+
+body {
+  margin: 0;
+  background: var(--page);
+  color: var(--text);
+  font-family: var(--sans);
+  font-optical-sizing: auto;
+  font-size: 16px;
+  line-height: 1.5;
+}
+
+a {
+  color: var(--link);
+}
+
+h1,
+h2,
+h3 {
+  margin: 0;
+  font-weight: 800;
+  line-height: 1.15;
+}
+
+p,
+ul,
+ol,
+pre {
+  margin: 0;
+}
+
+code,
+pre {
+  font-family: var(--mono);
+}
+
+code {
+  padding: 0 4px;
+  border-radius: 4px;
+  background: var(--raised);
+}
+
+:focus-visible {
+  outline: 2px solid var(--focus);
+  outline-offset: 2px;
+}
+
+/* The content: 1120 px at most, 24 px at each side. */
+.wrap {
+  max-width: 1168px;
+  margin: 0 auto;
+  padding: 0 24px;
+}
+
+/* Buttons: at least 44 px tall; one primary action, any other drawn with the
+   strong border and no fill. */
+.button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 44px;
+  padding: 8px 20px;
+  border: 1px solid transparent;
+  border-radius: 8px;
+  font-size: 16px;
+  font-weight: 600;
+  text-decoration: none;
+}
+
+.primary {
+  background: var(--action-fill);
+  color: var(--action-text);
+}
+
+.outline {
+  border-color: var(--border-strong);
+  color: var(--text);
+}
+
+/* Cards: the surface colour, a hairline border, 14 px corners, 20 px inside;
+   no shadow or gradient. */
+.card {
+  padding: 20px;
+  border: 1px solid var(--border-hairline);
+  border-radius: 14px;
+  background: var(--surface);
+}
+
+/* The bar: on the theme's page colour, 68 px tall, a hairline under it. */
+.bar {
+  height: 68px;
+  border-bottom: 1px solid var(--border-hairline);
+  background: var(--page);
+}
+
+.bar-inner {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 24px;
+  height: 100%;
+}
+
+.bar-home {
+  display: block;
+  flex: none;
+}
+
+.lockup {
+  display: block;
+  width: auto;
+  height: 30px;
+}
+
+.lockup-dark {
+  display: none;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme=light]) .lockup-light {
+    display: none;
+  }
+
+  :root:not([data-theme=light]) .lockup-dark {
+    display: block;
+  }
+}
+
+:root[data-theme=dark] .lockup-light {
+  display: none;
+}
+
+:root[data-theme=dark] .lockup-dark {
+  display: block;
+}
+
+.bar-links {
+  display: flex;
+  align-items: center;
+  gap: 24px;
+}
+
+.bar-section {
+  color: var(--text-secondary);
+  font-size: 14px;
+  font-weight: 600;
+  text-decoration: none;
+}
+
+.bar-section:hover {
+  color: var(--text);
+}
+
+.bar-links .button {
+  padding: 8px 16px;
+  font-size: 14px;
+}
+
+/* The night band: dark in both themes, the social preview's dawn at its
+   bottom edge. */
+.band {
+  overflow: hidden;
+  background: var(--page);
+  color: var(--text);
+  text-align: center;
+  padding: 88px 0 0;
+}
+
+.band-text {
+  padding: 0 24px;
+}
+
+.facts {
+  color: var(--text-muted);
+  font-size: 13px;
+}
+
+.band h1 {
+  max-width: 760px;
+  margin: 20px auto 0;
+  font-size: 48px;
+  letter-spacing: -0.01em;
+  text-wrap: balance;
+}
+
+.band-lead {
+  max-width: 640px;
+  margin: 20px auto 0;
+  color: var(--text-secondary);
+  font-size: 20px;
+}
+
+.actions {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: center;
+  gap: 12px;
+  margin-top: 28px;
+}
+
+/* The dawn: 640 px wide or 1.4 times the band's, whichever is less, 0.4 times
+   as tall as wide; its discs are centred on the band's bottom edge, and the
+   band's sides cut the largest on a phone. 40 px between the buttons and the
+   top of the largest disc, at every width. */
+.dawn {
+  display: block;
+  width: min(640px, 140%);
+  height: auto;
+  aspect-ratio: 5 / 2;
+  margin: 40px 0 0 50%;
+  transform: translateX(-50%);
+}
+
+/* The sections after the band. */
+.section {
+  padding: 72px 0;
+}
+
+.section h2 {
+  max-width: 720px;
+  font-size: 32px;
+  letter-spacing: -0.01em;
+}
+
+.lead {
+  max-width: 720px;
+  margin-top: 16px;
+  color: var(--text-secondary);
+  font-size: 20px;
+}
+
+.section .wrap > h2 + :not(.lead),
+.section .wrap > .lead + * {
+  margin-top: 40px;
+}
+
+/* One night as a timeline: 860 px at most; each moment three columns, 88 px,
+   24 px and the rest, 16 px apart, 36 px between two moments. */
+.timeline {
+  max-width: 860px;
+  padding: 0;
+  list-style: none;
+}
+
+.moment {
+  position: relative;
+  display: grid;
+  grid-template-columns: 88px 24px minmax(0, 1fr);
+  column-gap: 16px;
+  padding-bottom: 36px;
+}
+
+.moment:last-child {
+  padding-bottom: 0;
+}
+
+/* The 2 px line that joins the moments, from a ring's centre to the next. */
+.moment::before {
+  content: "";
+  position: absolute;
+  top: 13px;
+  bottom: -13px;
+  left: 115px;
+  width: 2px;
+  background: var(--border-hairline);
+}
+
+.moment:last-child::before {
+  display: none;
+}
+
+.when {
+  text-align: right;
+}
+
+.when time {
+  display: block;
+  color: var(--accent-text);
+  font-family: var(--mono);
+  font-size: 20px;
+  font-weight: 500;
+  line-height: 26px;
+}
+
+.part {
+  display: block;
+  color: var(--text-muted);
+  font-size: 13px;
+}
+
+.ring {
+  position: relative;
+  z-index: 1;
+  display: block;
+  width: 16px;
+  height: 16px;
+  margin: 5px auto 0;
+  border: 3px solid var(--accent-shape);
+  border-radius: 50%;
+  background: var(--page);
+}
+
+.done .ring {
+  border-color: var(--success);
+  background: var(--success);
+}
+
+.moment-body {
+  min-width: 0;
+}
+
+.moment-body h3 {
+  font-size: 20px;
+}
+
+.moment-body > p {
+  margin-top: 8px;
+  color: var(--text-secondary);
+}
+
+/* The question, redrawn as the ticket shows it. */
+.question {
+  margin-top: 16px;
+}
+
+.question-kind {
+  color: var(--text-muted);
+  font-family: var(--mono);
+  font-size: 13px;
+}
+
+.question-text {
+  margin-top: 8px;
+  font-weight: 600;
+}
+
+.options {
+  display: grid;
+  gap: 8px;
+  margin-top: 12px;
+  padding: 0;
+  list-style: none;
+}
+
+.option {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  column-gap: 12px;
+  align-items: baseline;
+  padding: 8px 12px;
+  border: 1px solid var(--border-hairline);
+  border-radius: 8px;
+  font-size: 14px;
+}
+
+.option.recommended {
+  border-color: var(--raised);
+  background: var(--raised);
+}
+
+.option-letter {
+  color: var(--text-muted);
+  font-family: var(--mono);
+  font-weight: 500;
+}
+
+.option-tag {
+  color: var(--accent-text);
+  font-size: 13px;
+  font-weight: 600;
+  white-space: nowrap;
+}
+
+.question-reply {
+  margin-top: 12px;
+  color: var(--text-muted);
+  font-size: 13px;
+}
+
+/* The pull request, in success. */
+.pull-request {
+  display: inline-flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 4px 12px;
+  margin-top: 16px;
+  font-size: 14px;
+}
+
+.pull-request-state {
+  color: var(--success);
+  font-family: var(--mono);
+  font-weight: 500;
+}
+
+.pull-request-number {
+  font-family: var(--mono);
+}
+
+/* Rows of cards: 12 px apart. */
+.cards {
+  display: grid;
+  gap: 12px;
+}
+
+.cards.three {
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+}
+
+.number {
+  color: var(--accent-text);
+  font-family: var(--mono);
+  font-size: 13px;
+  font-weight: 500;
+}
+
+.card h3 {
+  font-size: 20px;
+}
+
+.card .number + h3,
+.card h3 + p {
+  margin-top: 8px;
+}
+
+.card h3 + p {
+  color: var(--text-secondary);
+}
+
+/* It stays yours: the page's one change of ground after the band. */
+.ground {
+  border-top: 1px solid var(--border-hairline);
+  border-bottom: 1px solid var(--border-hairline);
+  background: var(--surface);
+}
+
+.yours {
+  display: grid;
+  grid-template-columns: minmax(0, 2fr) minmax(0, 1fr);
+  gap: 40px;
+  align-items: start;
+}
+
+.facts-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 28px 40px;
+}
+
+.facts-grid h3 {
+  font-size: 20px;
+}
+
+.facts-grid p {
+  margin-top: 8px;
+  color: var(--text-secondary);
+}
+
+.is-not {
+  background: var(--page);
+}
+
+.is-not ul {
+  display: grid;
+  gap: 8px;
+  margin-top: 12px;
+  padding-left: 20px;
+  color: var(--text-secondary);
+}
+
+/* Install: the commands wrap, never scroll or clip. */
+.commands {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 12px;
+}
+
+.command-block {
+  min-width: 0;
+}
+
+.command-os {
+  color: var(--text-muted);
+  font-size: 13px;
+  font-weight: 600;
+  line-height: 1.5;
+}
+
+.command-block pre {
+  margin-top: 8px;
+  padding: 20px;
+  border-radius: 14px;
+  background: var(--raised);
+  font-size: 13px;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.command-block code {
+  padding: 0;
+  background: none;
+}
+
+.doctor {
+  margin-top: 20px;
+  color: var(--text-secondary);
+}
+
+.adopt-title {
+  margin-top: 40px;
+  font-size: 20px;
+}
+
+.adopt {
+  margin-top: 20px;
+}
+
+.link-card {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  color: var(--text);
+  text-decoration: none;
+}
+
+.link-card-title {
+  font-size: 20px;
+  font-weight: 800;
+  line-height: 1.15;
+}
+
+.link-card-text {
+  color: var(--text-secondary);
+}
+
+.link-card-go {
+  margin-top: auto;
+  padding-top: 4px;
+  color: var(--link);
+  font-weight: 600;
+}
+
+.link-card:hover .link-card-go {
+  text-decoration: underline;
+}
+
+.young {
+  margin-top: 40px;
+  color: var(--text-muted);
+  font-size: 14px;
+}
+
+/* The foot. */
+.foot {
+  padding: 32px 0 48px;
+  border-top: 1px solid var(--border-hairline);
+  color: var(--text-muted);
+  font-size: 14px;
+}
+
+.foot-inner {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 16px 24px;
+}
+
+.signature {
+  color: var(--text);
+  font-family: var(--mono);
+  font-size: 16px;
+  font-weight: 500;
+}
+
+.signature-eyes {
+  color: var(--accent-text);
+}
+
+.foot-links {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px 24px;
+}
+
+.foot a {
+  color: var(--text-secondary);
+  font-weight: 600;
+  text-decoration: none;
+}
+
+.foot a:hover {
+  color: var(--text);
+}
+
+/* The theme switch, the web UI's segmented switch: Dark, Light, Auto. */
+.switch {
+  display: inline-flex;
+  gap: 4px;
+  padding: 4px;
+  border: 1px solid var(--border-strong);
+  border-radius: 12px;
+  background: var(--surface);
+}
+
+.switch button {
+  min-height: 44px;
+  padding: 8px 16px;
+  border: 0;
+  border-radius: 8px;
+  background: var(--surface);
+  color: var(--text-secondary);
+  font: inherit;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.switch button[aria-pressed=true] {
+  background: var(--raised);
+  color: var(--text);
+}
+
+.foot-line {
+  margin-left: auto;
+}
+
+/* Below 900 px: one column everywhere, smaller titles, the bar keeps the
+   lockup and the repository's link, the timeline's time column narrows. */
+@media (max-width: 899.98px) {
+  .band {
+    padding-top: 56px;
+  }
+
+  .band h1 {
+    font-size: 32px;
+  }
+
+  .section {
+    padding: 48px 0;
+  }
+
+  .section h2 {
+    font-size: 24px;
+    letter-spacing: 0;
+  }
+
+  .bar-section {
+    display: none;
+  }
+
+  .cards.three,
+  .yours,
+  .facts-grid,
+  .commands {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .moment {
+    grid-template-columns: 64px 24px minmax(0, 1fr);
+  }
+
+  .moment::before {
+    left: 91px;
+  }
+
+  .when time {
+    font-size: 16px;
+  }
+}
+
+/* Below 560 px: an option's "recommended" tag goes under its label. */
+@media (max-width: 559.98px) {
+  .option-tag {
+    grid-column: 2;
+  }
+}
