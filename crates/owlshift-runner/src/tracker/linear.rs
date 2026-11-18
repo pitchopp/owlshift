@@ -7,7 +7,7 @@ use std::path::Path;
 
 use owlshift_adapters::forge::Repo;
 use owlshift_adapters::tracker::linear::{
-    AdmissionFacts, ApiKey, AppUser, LinearTracker, StateMismatch, find_state,
+    AdmissionFacts, ApiKey, AppUser, LinearTracker, StateMismatch, TeamName, find_state,
 };
 use owlshift_adapters::tracker::{Capability, ErrorKind, PROPOSED_LABEL, Tracker};
 use owlshift_contracts::config::{self, Admit, PersonalConfig, ProjectConfig};
@@ -240,23 +240,43 @@ team = {}
             .team
             .as_deref()
             .ok_or("a Linear project names its team in `tracker.team`")?;
-        let repo = setup.repo.map_err(|reason| {
-            format!(
-                "Owlshift keeps the Linear API key under a keychain account named by the \
-                 project's GitHub repository, and {reason}"
-            )
-        })?;
-        let mut look = |account: &str| setup.keychain.read(account).map_err(|e| e.to_string());
-        let found = crate::secrets::tracker(repo, &LINEAR_SECRETS, &mut look)?;
-        let Some(key) = found.get(LINEAR_ACCOUNT) else {
-            return Err(format!(
-                "no Linear API key is stored for this project (service `{SERVICE}`, account \
-                 `{}`): run `owlshift init` in a terminal and give it",
-                found.accounts.of(LINEAR_ACCOUNT)
-            ));
-        };
+        let key = stored_key(setup.keychain, setup.repo)?;
         team_answers(&LinearTracker::new(ApiKey::new(key.expose())), team)?;
         Ok(Connected::default())
+    }
+}
+
+/// The teams of the workspace of the Linear key `init` stored for the
+/// project of `repo`, its own or the shared one, sorted by key: what `init`
+/// offers to pick from when no `--team` was given (OWL-596).
+pub fn workspace_teams(
+    keychain: &Keychain,
+    repo: Result<&Repo, &str>,
+) -> Result<Vec<TeamName>, String> {
+    let key = stored_key(keychain, repo)?;
+    LinearTracker::new(ApiKey::new(key.expose()))
+        .teams()
+        .map_err(|error| key_refused(&error))
+}
+
+/// The Linear API key stored for the project of `repo`, its own or the
+/// shared one, or why there is none.
+fn stored_key(keychain: &Keychain, repo: Result<&Repo, &str>) -> Result<Secret, String> {
+    let repo = repo.map_err(|reason| {
+        format!(
+            "Owlshift keeps the Linear API key under a keychain account named by the project's \
+             GitHub repository, and {reason}"
+        )
+    })?;
+    let mut look = |account: &str| keychain.read(account).map_err(|e| e.to_string());
+    let found = crate::secrets::tracker(repo, &LINEAR_SECRETS, &mut look)?;
+    match found.get(LINEAR_ACCOUNT) {
+        Some(key) => Ok(Secret::new(key.expose())),
+        None => Err(format!(
+            "no Linear API key is stored for this project (service `{SERVICE}`, account `{}`): \
+             run `owlshift init` in a terminal and give it",
+            found.accounts.of(LINEAR_ACCOUNT)
+        )),
     }
 }
 
@@ -267,18 +287,24 @@ pub(crate) fn team_answers(tracker: &LinearTracker, team: &str) -> Result<(), St
         .team_states(team)
         .map(drop)
         .map_err(|error| match error.kind {
-            ErrorKind::Unauthorized => format!(
-                "Linear refused the API key: {error}. Run `owlshift init --replace-secrets` and \
-                 give a valid key"
-            ),
             ErrorKind::NotFound => format!(
                 "{error}: `--team` (or `team` under `[tracker]`) is the key your team's issue \
                  identifiers start with, such as `OWL` for `OWL-12`"
             ),
-            ErrorKind::Unreachable | ErrorKind::NoGesture | ErrorKind::Other => {
-                format!("Linear did not answer: {error}")
-            }
+            _ => key_refused(&error),
         })
+}
+
+/// Why a read through the stored key failed: the key refused, or Linear
+/// not answering.
+fn key_refused(error: &owlshift_adapters::tracker::Error) -> String {
+    match error.kind {
+        ErrorKind::Unauthorized => format!(
+            "Linear refused the API key: {error}. Run `owlshift init --replace-secrets` and give \
+             a valid key"
+        ),
+        _ => format!("Linear did not answer: {error}"),
+    }
 }
 
 /// Whether each state named under `[tracker].states` is exactly one

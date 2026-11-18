@@ -27,20 +27,20 @@ Optionally, a workspace admin can create an OAuth application in Linear's API se
 
 ## 2. Write the project file: `owlshift init`
 
-In your clone, at the repository's root, with your team's key:
+In your clone, at the repository's root:
 
 ```bash
 cd ~/code/shop
-owlshift init --team ENG
+owlshift init
 ```
 
-Linear is the default tracker, so `--tracker linear` can be left out. `init` does five things, in this order:
+Every flag is optional at a terminal: `init` asks for what none gave. Give them to skip the questions, or in a script, where nothing is asked and Linear needs `--team`: `owlshift init --tracker linear --team ENG`. `init` does five things, in this order:
 
-1. It reads the repository's root files (`Cargo.toml`, `package.json`, `pyproject.toml`, `Makefile`) to suggest a gate: your lint, formatter and test commands. It never runs them. If it finds nothing, or guesses wrong, give the gate yourself, one `--gate` per command, as in `owlshift init --team ENG --gate "make lint" --gate "make test"`.
+1. It asks where the tickets live: press Enter for Linear. It reads the repository's root files (`Cargo.toml`, `package.json`, `pyproject.toml`, `Makefile`) to suggest a gate: your lint, formatter and test commands. It never runs them. It shows the gate found: press Enter to keep it, or type your own commands, one per line, an empty line ending them; with `--gate`, one per command, as in `owlshift init --team ENG --gate "make lint" --gate "make test"`, nothing is asked.
 2. It asks for the Linear API key, then for the optional app's client ID and secret: leave both empty to go without.
 3. It signs you in to GitHub through Owlshift's GitHub App. It prints a code and asks you to open `https://github.com/login/device` and enter it. If the app is not installed on the repository, it prints the install link and waits until you have installed it. If the code expires before you enter it, `init` says so and exits with an error: run it again for a new code.
 4. It asks for the token agent runs log in to Claude Code with. Make it in another terminal with `claude setup-token`, then paste it. It is asked once per machine. Owlshift never asks for a model API key.
-5. It reads the team's workflow states with the key, then writes a commented `owlshift.toml`. If Linear does not answer, it says why and writes no file.
+5. It lists your workspace's teams with the key and asks which one is the project's (a workspace of one team is taken as it is; `--team` skips the question). It then reads the team's workflow states and writes a commented `owlshift.toml`. If Linear does not answer, it says why and writes no file.
 
 The secrets go to the system keychain, never to a file. Here is what it printed for a project whose secrets were left for later (`owlshift init --team ENG --gate "test -f README.md" --skip-secrets`):
 
