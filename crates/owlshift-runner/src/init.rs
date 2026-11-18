@@ -110,6 +110,17 @@ requires = \">={}.{}\"
     } else {
         commands_block("setup", &setup_lines, &quote)
     };
+    // The caches the detected setup reads confined (OWL-593), or the example.
+    let cache_lines: Vec<(Option<&str>, &str)> = options
+        .detected
+        .caches()
+        .map(|l| (Some(l.read_from.as_str()), l.command.as_str()))
+        .collect();
+    let caches = if cache_lines.is_empty() {
+        "# caches = [\"Library/pnpm\"]\n".to_owned()
+    } else {
+        commands_block("caches", &cache_lines, &quote)
+    };
     let admission =
         crate::tracker::of(options.tracker).admission_lines(options.admitter.as_deref());
     text.push_str(&format!(
@@ -135,8 +146,7 @@ requires = \">={}.{}\"
 # and the gate read, never write. Each machine that runs Owlshift opens only
 # the folders its operator lists in `allow_caches` in the personal
 # configuration; a folder holding credentials is refused.
-# caches = [\"Library/pnpm\"]
-# The files agents receive as the project's rules, taken whole from the
+{caches}# The files agents receive as the project's rules, taken whole from the
 # default branch. Left out, the root AGENTS.md is used when there is one.
 # Once set, every file listed must exist there; [] sends no rule.
 # rules = [\"AGENTS.md\", \".claude/rules/testing.md\"]
@@ -276,6 +286,57 @@ pub fn people_entry(config: &ProjectConfig, signed_in: &SignedIn) -> Option<Peop
         },
         None => PeopleEntry::Add(entry),
     })
+}
+
+/// The cache folders of `folders` this machine does not open yet, given the
+/// folders its personal file allows (`allowed`, from
+/// [`crate::config::Effective::allowed_caches`]), in order (OWL-593). None
+/// when the personal file could not be read or parsed: its own error comes
+/// first, and nothing here can be added to it.
+pub fn caches_to_allow<'a>(
+    folders: impl IntoIterator<Item = &'a str>,
+    allowed: Option<&[&str]>,
+) -> Vec<String> {
+    let Some(allowed) = allowed else {
+        return Vec::new();
+    };
+    folders
+        .into_iter()
+        .filter(|folder| !allowed.contains(folder))
+        .map(ToOwned::to_owned)
+        .collect()
+}
+
+/// The personal file's lines that let the project of `repo` open `folders`
+/// as caches (OWL-593): its `[repositories."github.com/<owner>/<name>"]`
+/// table, or the machine-wide `allow_caches` without a GitHub repository.
+/// `init` prints them and `doctor` gives them as the fix; neither writes
+/// the personal file, the operator's to change.
+pub fn allow_caches_lines(repo: Option<&Repo>, folders: &[String]) -> String {
+    let quote = |text: &str| toml::Value::String(text.to_owned()).to_string();
+    let list: Vec<String> = folders.iter().map(|folder| quote(folder)).collect();
+    let key = format!("allow_caches = [{}]\n", list.join(", "));
+    match repo {
+        Some(repo) => format!(
+            "[repositories.{}]\n{key}",
+            quote(&format!("github.com/{repo}"))
+        ),
+        None => key,
+    }
+}
+
+/// How to add [`allow_caches_lines`] to the personal file at `personal`
+/// (shown as the caller shows paths), without defining a key or a table
+/// twice, which would make the file invalid (OWL-593).
+pub fn allow_caches_advice(repo: Option<&Repo>, folders: &[String], personal: &str) -> String {
+    let lines = allow_caches_lines(repo, folders);
+    let place = if repo.is_some() {
+        "when the file has that table already, add the folders to its `allow_caches`"
+    } else {
+        "at the top of the file, before any table; when it has `allow_caches` already, add the \
+         folders to it"
+    };
+    format!("Add to {personal} ({place}):\n\n{lines}")
 }
 
 /// A `key = [...]` block, each command preceded by the comment saying what it
@@ -1054,16 +1115,66 @@ mod tests {
                 "npm run test"
             ]
         );
-        assert_eq!(config.stack.setup, ["npm ci"]);
-        assert_eq!(text.matches("    # read from ").count(), 5, "{text}");
+        assert_eq!(config.stack.setup, [owlshift_core::stack::NPM_SETUP]);
+        assert_eq!(config.stack.caches, [".npm"]);
+        assert_eq!(text.matches("    # read from ").count(), 6, "{text}");
         assert!(
             text.contains(
                 "    # read from the `test` script of package.json\n    \"npm run test\","
             )
         );
+        assert!(text.contains(
+            "# read from package-lock.json, the lock file of npm\n    'npm ci --prefer-offline \
+             --cache \"$HOME/.npm\" --logs-dir \"$TMPDIR/npm-logs\"',"
+        ));
         assert!(
-            text.contains("# read from package-lock.json, the lock file of npm\n    \"npm ci\",")
+            text.contains("caches = [\n    # read from package-lock.json, the lock file of npm\n    \".npm\",\n]\n"),
+            "{text}"
         );
+        assert!(!text.contains("# caches = "), "{text}");
+        assert!(text.contains("# note: the setup installs from npm's cache"));
+    }
+
+    /// OWL-593: the lines `init` prints and `doctor` gives let a project
+    /// declaring `.npm` load once added to the personal file, with or
+    /// without its repository: the key is the one the loader reads.
+    #[test]
+    fn the_allow_caches_lines_let_the_project_load() {
+        let d = detected(&["package-lock.json"], &[("package.json", "{}")]);
+        let project = project_file(&with(d, &["make"])).unwrap();
+        let repo = Repo::parse("acme/web").unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let personal = dir.path().join("config.toml");
+        let load = || {
+            crate::config::Effective::served(
+                &repo,
+                dir.path().join(PROJECT_FILE),
+                &project,
+                Some(personal.clone()),
+            )
+        };
+        let wanted = vec![".npm".to_owned()];
+        assert_eq!(caches_to_allow([".npm"], Some(&[])), wanted);
+        assert_eq!(caches_to_allow([".npm"], None), Vec::<String>::new());
+        assert!(matches!(
+            load().project,
+            crate::config::FileState::Invalid { .. }
+        ));
+        for scope in [Some(&repo), None] {
+            std::fs::write(&personal, allow_caches_lines(scope, &wanted)).unwrap();
+            let loaded = load();
+            assert!(
+                matches!(loaded.project, crate::config::FileState::Loaded { .. }),
+                "{:?}",
+                loaded.project
+            );
+            let allowed = loaded.allowed_caches(Some(&repo)).unwrap();
+            assert!(caches_to_allow([".npm"], Some(&allowed)).is_empty());
+        }
+        assert!(allow_caches_advice(Some(&repo), &wanted, "~/x.toml").contains(
+            "Add to ~/x.toml (when the file has that table already, add the folders to its \
+             `allow_caches`):\n\n[repositories.\"github.com/acme/web\"]\nallow_caches = [\".npm\"]\n"
+        ));
     }
 
     #[test]

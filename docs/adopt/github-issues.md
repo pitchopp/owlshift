@@ -108,7 +108,11 @@ $ test -f README.md
 Gate green on 2fe46e01ea43: 1 command in 2.2 s.
 ```
 
-When a gate needs its dependencies installed first, list the install commands under `stack.setup` in `owlshift.toml` (the file's comments show how), and the caches it reads under `stack.caches`.
+When a gate needs its dependencies installed first, list the install commands under `stack.setup` in `owlshift.toml` (the file's comments show how), and the caches they read under `stack.caches`. The gate runs with your home folder closed: a package manager reaches its cache only through `stack.caches`, read-only, and only on a machine whose personal configuration lists that folder in `allow_caches`. Until it does, every run and gate refuses the project, and `owlshift doctor` gives the lines to add.
+
+- **npm.** `owlshift init` writes the setup `npm ci --prefer-offline --cache "$HOME/.npm" --logs-dir "$TMPDIR/npm-logs"` and `caches = [".npm"]`, and prints the lines that allow `.npm` for your repository. Run `npm ci` once in your checkout so that `~/.npm` holds the project's packages, and again when the lock file gains one: the confined setup cannot write a missing package into the read-only cache. npm then fails with `EPERM`, says your cache folder "contains root-owned files" and suggests `sudo chown`. Under Owlshift that message means the sandbox, or a package missing from the cache: `sudo` changes nothing.
+- **yarn and bun.** For yarn 2 or later (a `.yarnrc.yml`), `init` writes `caches = [".yarn/berry"]`, yarn's global cache, which works the same way. yarn 1 and bun need no cache: they fetch the packages from the registry in each run.
+- **pnpm.** pnpm writes into its store on every install, so a read-only store needs an overlay. Declare the folder that holds the store (`pnpm store path` prints it; `Library/pnpm` on macOS) and follow the recipe in the build plan's [Preparing a gate's dependencies](../design/build-plan.md): link the store's `files` and `index` into an ignored `.pnpm-overlay/` folder of the worktree, then run `pnpm install --offline --frozen-lockfile --store-dir .pnpm-overlay`.
 
 ## 5. Run a first ticket: `owlshift do`
 
