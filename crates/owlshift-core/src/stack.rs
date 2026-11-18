@@ -1,5 +1,6 @@
-//! Stack detection for `owlshift init` (P9, OWL-539): the gate, and the setup it
-//! needs, read from the names and contents of the repository's root files.
+//! Stack detection for `owlshift init` (P9, OWL-539): the gate, the setup it
+//! needs and the caches of the home that setup reads confined (OWL-593), read
+//! from the names and contents of the repository's root files.
 //!
 //! A pure function: the caller reads the root and passes in the file names and
 //! the contents of the four manifests it recognises (`Cargo.toml`,
@@ -48,6 +49,9 @@ pub struct Found {
     pub source: String,
     pub gate: Vec<Line>,
     pub setup: Vec<Line>,
+    /// The folders of the home the setup reads, as `stack.caches` names
+    /// them: each line's `command` is the folder (OWL-593).
+    pub caches: Vec<Line>,
     /// What the person should know about the lines above.
     pub notes: Vec<String>,
 }
@@ -72,10 +76,20 @@ impl Detection {
     pub fn setup(&self) -> impl Iterator<Item = &Line> {
         self.found.iter().flat_map(|f| f.setup.iter())
     }
+
+    /// The detected cache folders, in order; a line's `command` is the folder.
+    pub fn caches(&self) -> impl Iterator<Item = &Line> {
+        self.found.iter().flat_map(|f| f.caches.iter())
+    }
 }
 
 /// The manifests [`detect`] reads, which the runner must read.
 pub const MANIFESTS: [&str; 4] = ["Cargo.toml", "package.json", "pyproject.toml", "Makefile"];
+
+/// The other root files [`detect`] reads when the runner could, for what
+/// they say of a manifest's setup: yarn's settings (OWL-593). One missing
+/// or unread counts as empty.
+pub const SETTINGS: [&str; 1] = [".yarnrc.yml"];
 
 /// Detect the stack of a root.
 pub fn detect(root: &RootFiles) -> Detection {
@@ -134,31 +148,131 @@ fn cargo(root: &RootFiles, text: &str) -> Result<Option<Found>, String> {
             line(format!("cargo test --workspace{locked}"), from),
         ],
         setup: vec![],
+        caches: vec![],
         notes: vec![],
     }))
 }
 
-/// The package manager a lock file names, with its install command.
-fn node_manager(root: &RootFiles) -> Option<(&'static str, &'static str, String)> {
+/// A Node package manager, as the lock file at the root names it.
+struct NodeManager {
+    name: &'static str,
+    lock: &'static str,
+    /// The setup's install command.
+    install: String,
+    /// The folder of the home the install must read, read-only, in a
+    /// confined run: its cache, which it cannot do without (OWL-593), with
+    /// what it was read from.
+    cache: Option<(&'static str, String)>,
+    /// What the person should know about the cache, when none is declared.
+    note: Option<String>,
+}
+
+/// yarn 2 or later's global cache, `~/.yarn/berry` (OWL-593).
+const YARN_BERRY: &str = ".yarn/berry";
+
+/// Whether a yarn 2 or later project installs from yarn's global cache in
+/// the home (OWL-593): only when that is established, since a project file
+/// declaring a cache no machine needs is refused until each operator allows
+/// it. It is when the root's `.yarnrc.yml` sets `enableGlobalCache: true`,
+/// or when `package.json`'s `packageManager` names yarn 4 or later, whose
+/// default it is; and in neither case when `.yarnrc.yml` sets
+/// `enableGlobalCache: false`, a `cacheFolder` or a `globalFolder`, which
+/// move it. Only the top-level keys of `.yarnrc.yml` are read, line by line.
+fn yarn_global_cache(root: &RootFiles, package: &serde_json::Value) -> Option<String> {
+    let rc = root.content(".yarnrc.yml").unwrap_or_default();
+    let setting = |key: &str| {
+        rc.lines().find_map(|raw| {
+            let value = raw.strip_prefix(key)?.strip_prefix(':')?;
+            let value = value.split('#').next().unwrap_or_default().trim();
+            Some(value.trim_matches(['"', '\'']).to_owned())
+        })
+    };
+    if setting("cacheFolder").is_some() || setting("globalFolder").is_some() {
+        return None;
+    }
+    match setting("enableGlobalCache").as_deref() {
+        Some("false") => return None,
+        Some("true") => return Some("`enableGlobalCache: true` in .yarnrc.yml".to_owned()),
+        _ => {}
+    }
+    let manager = package.get("packageManager")?.as_str()?;
+    let major: u32 = manager
+        .strip_prefix("yarn@")?
+        .split('.')
+        .next()?
+        .parse()
+        .ok()?;
+    (major >= 4).then(|| format!("`{manager}`, the `packageManager` of package.json"))
+}
+
+/// npm's install under the sandbox (OWL-593): the home is closed, so npm
+/// reads its cache, `~/.npm`, as a cache the operator allows, read-only.
+/// `--prefer-offline` takes what the cache holds without asking the
+/// registry, and `--logs-dir` writes npm's log in the run's temporary
+/// folder, its default being inside the read-only cache. A package missing
+/// from the cache fails the install: npm cannot write it there.
+pub const NPM_SETUP: &str =
+    "npm ci --prefer-offline --cache \"$HOME/.npm\" --logs-dir \"$TMPDIR/npm-logs\"";
+
+/// Which manager the lock file names, its install, and the cache it needs
+/// confined. Checked live (OWL-593): yarn 1 skips a cache it cannot write
+/// and bun falls back to one of its own, both fetching from the registry,
+/// so they need none; npm, and yarn 4 on its global cache, fail with
+/// `EPERM` unless they read theirs ([`yarn_global_cache`]); pnpm needs an
+/// overlay store, which `init` does not write.
+fn node_manager(root: &RootFiles, package: &serde_json::Value) -> Option<NodeManager> {
+    let plain = |name, lock, install: String| NodeManager {
+        name,
+        lock,
+        install,
+        cache: None,
+        note: None,
+    };
     if root.has("pnpm-lock.yaml") {
-        Some((
+        Some(plain(
             "pnpm",
             "pnpm-lock.yaml",
             "pnpm install --frozen-lockfile".into(),
         ))
     } else if root.has("yarn.lock") {
-        let flag = if root.has(".yarnrc.yml") {
-            "--immutable"
+        // `.yarnrc.yml` is yarn 2 or later.
+        Some(if root.has(".yarnrc.yml") {
+            let berry = plain("yarn", "yarn.lock", "yarn install --immutable".into());
+            match yarn_global_cache(root, package) {
+                Some(from) => NodeManager {
+                    cache: Some((YARN_BERRY, from)),
+                    ..berry
+                },
+                None => NodeManager {
+                    note: Some(format!(
+                        "no yarn cache was declared, yarn's global cache not being established \
+                         here: when the setup installs from `~/{YARN_BERRY}`, add \
+                         `caches = [\"{YARN_BERRY}\"]`, which each machine allows in \
+                         `allow_caches`"
+                    )),
+                    ..berry
+                },
+            }
         } else {
-            "--frozen-lockfile"
-        };
-        Some(("yarn", "yarn.lock", format!("yarn install {flag}")))
+            plain("yarn", "yarn.lock", "yarn install --frozen-lockfile".into())
+        })
     } else if root.has("bun.lock") {
-        Some(("bun", "bun.lock", "bun install --frozen-lockfile".into()))
+        Some(plain(
+            "bun",
+            "bun.lock",
+            "bun install --frozen-lockfile".into(),
+        ))
     } else if root.has("bun.lockb") {
-        Some(("bun", "bun.lockb", "bun install --frozen-lockfile".into()))
+        Some(plain(
+            "bun",
+            "bun.lockb",
+            "bun install --frozen-lockfile".into(),
+        ))
     } else if root.has("package-lock.json") {
-        Some(("npm", "package-lock.json", "npm ci".into()))
+        Some(NodeManager {
+            cache: Some((".npm", "package-lock.json, the lock file of npm".into())),
+            ..plain("npm", "package-lock.json", NPM_SETUP.into())
+        })
     } else {
         None
     }
@@ -173,15 +287,27 @@ fn package_json(root: &RootFiles, text: &str) -> Result<Option<Found>, String> {
         source: "package.json".to_string(),
         gate: vec![],
         setup: vec![],
+        caches: vec![],
         notes: vec![],
     };
-    let manager = match node_manager(root) {
-        Some((manager, lock, install)) => {
+    let manager = match node_manager(root, &value) {
+        Some(manager) => {
+            let (name, lock) = (manager.name, manager.lock);
             found.source = format!("package.json ({lock})");
-            found
-                .setup
-                .push(line(install, format!("{lock}, the lock file of {manager}")));
-            manager
+            found.setup.push(line(
+                manager.install,
+                format!("{lock}, the lock file of {name}"),
+            ));
+            found.notes.extend(manager.note);
+            if let Some((folder, from)) = manager.cache {
+                found.caches.push(line(folder, from));
+                found.notes.push(format!(
+                    "the setup installs from {name}'s cache, `~/{folder}`, read-only: each \
+                     machine allows `{folder}` in `allow_caches` of its personal configuration, \
+                     and its cache must hold the project's packages"
+                ));
+            }
+            name
         }
         None => {
             // An install here would write a lock file into the repository.
@@ -234,6 +360,7 @@ fn pyproject(root: &RootFiles, text: &str) -> Result<Option<Found>, String> {
         source: "pyproject.toml".to_string(),
         gate: vec![],
         setup: vec![],
+        caches: vec![],
         notes: vec![],
     };
     // Only `uv run` was checked to install the locked environment itself; a
@@ -305,6 +432,7 @@ fn makefile(text: &str) -> Option<Found> {
         source: "Makefile".to_string(),
         gate,
         setup: vec![],
+        caches: vec![],
         notes: vec![],
     })
 }
@@ -420,33 +548,85 @@ check::
     #[test]
     fn each_node_manager_gives_its_install_and_its_scripts() {
         let pkg = r#"{"scripts":{"test":"jest","lint":"eslint .","build":"tsc"}}"#;
-        let cases: [(&[&str], &str, &str); 6] = [
+        let cases: [(&[&str], &str, &str, &[&str]); 6] = [
             (
                 &["pnpm-lock.yaml"],
                 "pnpm install --frozen-lockfile",
                 "pnpm",
+                &[],
             ),
-            (&["yarn.lock"], "yarn install --frozen-lockfile", "yarn"),
+            (
+                &["yarn.lock"],
+                "yarn install --frozen-lockfile",
+                "yarn",
+                &[],
+            ),
             (
                 &["yarn.lock", ".yarnrc.yml"],
                 "yarn install --immutable",
                 "yarn",
+                &[],
             ),
-            (&["bun.lock"], "bun install --frozen-lockfile", "bun"),
-            (&["bun.lockb"], "bun install --frozen-lockfile", "bun"),
-            (&["package-lock.json"], "npm ci", "npm"),
+            (&["bun.lock"], "bun install --frozen-lockfile", "bun", &[]),
+            (&["bun.lockb"], "bun install --frozen-lockfile", "bun", &[]),
+            (&["package-lock.json"], NPM_SETUP, "npm", &[".npm"]),
         ];
-        for (names, setup, manager) in cases {
+        for (names, setup, manager, caches) in cases {
             let d = detect(&root(names, &[("package.json", pkg)]));
             assert_eq!(commands(d.setup()), [setup], "{names:?}");
+            assert_eq!(commands(d.caches()), caches, "{names:?}");
             assert_eq!(
                 commands(d.gate()),
                 [format!("{manager} run lint"), format!("{manager} run test")],
                 "{names:?}"
             );
-            assert!(d.found[0].notes.is_empty());
+            // A manager reading a cache says what each machine must allow;
+            // yarn 2 or later, its cache unknown, says what to declare.
+            let noted = !caches.is_empty() || names.contains(&".yarnrc.yml");
+            assert_eq!(d.found[0].notes.len(), usize::from(noted));
+            assert!(d.found[0].notes.iter().all(|n| n.contains("allow_caches")));
             assert!(d.found[0].source.starts_with("package.json ("));
-            assert!(d.setup().all(|l| l.read_from.contains(manager)));
+            assert!(
+                d.setup()
+                    .chain(d.caches())
+                    .all(|l| l.read_from.contains(manager))
+            );
+        }
+    }
+
+    /// OWL-593: yarn 2 or later declares `~/.yarn/berry` only when its
+    /// global cache is established: yarn 4 by `packageManager`, or
+    /// `enableGlobalCache: true`, unless `.yarnrc.yml` turns it off or moves
+    /// it; otherwise a note says what to declare.
+    #[test]
+    fn yarns_global_cache_is_declared_only_when_established() {
+        let cases: [(&str, &str, bool); 7] = [
+            ("yarn@4.5.0", "nodeLinker: node-modules\n", true),
+            ("", "enableGlobalCache: true # on\n", true),
+            ("yarn@3.6.4", "nodeLinker: node-modules\n", false),
+            ("", "nodeLinker: node-modules\n", false),
+            ("yarn@4.5.0", "enableGlobalCache: false\n", false),
+            ("yarn@4.5.0", "cacheFolder: ./.yarn/cache\n", false),
+            ("yarn@4.5.0", "globalFolder: /opt/yarn\n", false),
+        ];
+        for (manager, rc, global) in cases {
+            let pkg = if manager.is_empty() {
+                "{}".to_owned()
+            } else {
+                format!(r#"{{"packageManager":"{manager}"}}"#)
+            };
+            let d = detect(&root(
+                &["yarn.lock"],
+                &[("package.json", pkg.as_str()), (".yarnrc.yml", rc)],
+            ));
+            let caches = if global { &[YARN_BERRY][..] } else { &[] };
+            assert_eq!(commands(d.caches()), caches, "{manager} {rc:?}");
+            assert_eq!(d.found[0].notes.len(), 1, "{manager} {rc:?}");
+            assert_eq!(
+                d.found[0].notes[0].starts_with("no yarn cache"),
+                !global,
+                "{manager} {rc:?}"
+            );
         }
     }
 
@@ -466,7 +646,7 @@ check::
     #[test]
     fn a_package_json_without_scripts_gives_the_setup_only() {
         let d = detect(&root(&["package-lock.json"], &[("package.json", "{}")]));
-        assert_eq!(commands(d.setup()), ["npm ci"]);
+        assert_eq!(commands(d.setup()), [NPM_SETUP]);
         assert_eq!(commands(d.gate()), Vec::<&str>::new());
     }
 
@@ -475,7 +655,7 @@ check::
         let pkg = r#"{"scripts":{"test":"echo \"Error: no test specified\" && exit 1"}}"#;
         let d = detect(&root(&["package-lock.json"], &[("package.json", pkg)]));
         assert_eq!(commands(d.gate()), Vec::<&str>::new());
-        assert!(d.found[0].notes[0].contains("placeholder"));
+        assert!(d.found[0].notes.iter().any(|n| n.contains("placeholder")));
     }
 
     const PY: &str =

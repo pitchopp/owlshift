@@ -292,6 +292,7 @@ pub fn run(system: &dyn System, config: &Effective, own: &BuildIdentity) -> Repo
         checks.extend(codex_requirements_check(system));
     }
     checks.push(project_config_check(system, &config.project, home));
+    checks.extend(caches_check(system, config, home));
     checks.extend(served_check(system, config));
     checks.push(file_check("personal config", &config.personal, home));
     checks.push(tracker_check(config));
@@ -1262,6 +1263,52 @@ fn project_config_check(
         SUBJECT,
         format!("{local}; gate of {} command(s) from {source}", gate.len()),
     )
+}
+
+/// The cache folders the project file lists and the personal file does not
+/// allow for its repository (OWL-593), which make the project file invalid
+/// on this machine: the line gives the personal file's lines that allow
+/// them, where the `project config` line's error names only the key. The
+/// file is read again, its load having kept only the error; no line when it
+/// loaded, does not parse, lists no refused folder, or when the personal
+/// file cannot be read, its own line failing then.
+fn caches_check(system: &dyn System, config: &Effective, home: Option<&Path>) -> Option<Check> {
+    let FileState::Invalid { path, .. } = &config.project else {
+        return None;
+    };
+    let text = std::fs::read_to_string(path).ok()?;
+    let project = ProjectConfig::parse(&text).ok()?;
+    let repo = system.origin_repo(path.parent().unwrap_or(path)).ok();
+    let allowed = config.allowed_caches(repo.as_ref());
+    let refused = crate::init::caches_to_allow(project.stack.cache_folders(), allowed.as_deref());
+    if refused.is_empty() {
+        return None;
+    }
+    let personal = match &config.personal {
+        FileState::Loaded { path, .. } | FileState::Absent(path) => shown(path, home),
+        _ => "the personal configuration".to_owned(),
+    };
+    let listed: Vec<String> = refused.iter().map(|folder| format!("{folder:?}")).collect();
+    let scope = match &repo {
+        Some(repo) => format!("github.com/{repo}"),
+        None => "this repository".to_owned(),
+    };
+    Some(Check::fail(
+        Section::Project,
+        "caches",
+        format!(
+            "{} in {PROJECT_FILE}'s `stack.caches`, not allowed for {scope} in the personal \
+             configuration",
+            listed.join(", ")
+        ),
+        "No run and no gate starts while the project lists a folder of the home this machine \
+         does not allow: the setup, the agents and the gate read it, read-only.",
+        vec![Step::act(crate::init::allow_caches_advice(
+            repo.as_ref(),
+            &refused,
+            &personal,
+        ))],
+    ))
 }
 
 /// The project file the service runs this checkout's project on, when it
@@ -3863,6 +3910,61 @@ mod tests {
             allowed.detail.ends_with("`/etc/codex/hooks`"),
             "{allowed:?}"
         );
+    }
+
+    /// OWL-593: a cache folder the project file lists and the personal file
+    /// does not allow fails a line of its own, whose fix holds the lines to
+    /// add for the checkout's repository; once allowed, there is no line.
+    #[test]
+    fn a_cache_the_personal_file_does_not_allow_is_named_with_its_lines() {
+        let system = logged_in(with_harnesses(with_git(FakeSystem::default())));
+        let detected = owlshift_core::stack::detect(&owlshift_core::stack::RootFiles {
+            names: vec!["package-lock.json".into(), "package.json".into()],
+            files: vec![("package.json".into(), "{}".into())],
+        });
+        let text = crate::init::project_file(&crate::init::InitOptions {
+            tracker: TrackerKind::Markdown,
+            team: None,
+            gate: vec!["make".into()],
+            detected,
+            admitter: None,
+        })
+        .unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("owlshift.toml");
+        std::fs::write(&path, &text).unwrap();
+        let personal = PathBuf::from("/home/ada/.config/owlshift/config.toml");
+        let refused = Effective {
+            project: FileState::Invalid {
+                path: path.clone(),
+                error: "stack.caches: \".npm\" may not be read".into(),
+            },
+            personal: FileState::Absent(personal.clone()),
+        };
+        let report = run(&system, &refused);
+        let found = line(&report, "caches");
+        assert_eq!(found.status, Status::Fail);
+        assert!(found.detail.contains("\".npm\""), "{found:?}");
+        assert!(found.detail.contains("github.com/pitchopp/owlshift"));
+        let [Step::Do(fix)] = &found.fix[..] else {
+            panic!("{found:?}");
+        };
+        assert!(fix.contains(
+            "[repositories.\"github.com/pitchopp/owlshift\"]\nallow_caches = [\".npm\"]\n"
+        ));
+        let allowed = Effective {
+            personal: FileState::Loaded {
+                path: personal,
+                config: PersonalConfig::parse(&crate::init::allow_caches_lines(
+                    None,
+                    &[".npm".to_owned()],
+                ))
+                .unwrap(),
+                entries: Vec::new(),
+            },
+            ..refused
+        };
+        assert!(caches_check(&system, &allowed, None).is_none());
     }
 
     /// The next command follows the project file: `owlshift do` with one,

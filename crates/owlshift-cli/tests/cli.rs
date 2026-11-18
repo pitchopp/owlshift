@@ -1428,11 +1428,32 @@ fn a_gate_given_with_init_wins_over_the_detected_one() {
     )
     .unwrap();
     fs::write(repo.path().join("package-lock.json"), "").unwrap();
+    git(
+        repo.path(),
+        &["remote", "add", "origin", "https://github.com/acme/web.git"],
+    );
     let out = init_markdown(repo.path(), config_dir.path(), &["--gate", "make ci"]);
     let config = project_config(repo.path());
     assert_eq!(config.stack.gate, ["make ci"]);
-    assert_eq!(config.stack.setup, ["npm ci"]);
+    // OWL-593: npm's install reads its cache, which this machine must allow.
+    assert_eq!(
+        config.stack.setup,
+        ["npm ci --prefer-offline --cache \"$HOME/.npm\" --logs-dir \"$TMPDIR/npm-logs\""]
+    );
+    assert_eq!(config.stack.caches, [".npm"]);
     assert!(out.contains("--gate wins"), "{out}");
+    let allow = "[repositories.\"github.com/acme/web\"]\nallow_caches = [\".npm\"]\n";
+    assert!(out.contains("The setup reads `~/.npm` read-only"), "{out}");
+    assert!(out.contains(allow), "{out}");
+    // Run again, the file is refused until the folder is allowed: it says
+    // how once more.
+    let again = owlshift(repo.path(), config_dir.path(), &["init", "--skip-secrets"]);
+    assert!(!again.status.success());
+    assert!(stderr(&again).contains(allow), "{}", stderr(&again));
+    fs::write(config_dir.path().join("config.toml"), allow).unwrap();
+    let allowed = owlshift(repo.path(), config_dir.path(), &["init", "--skip-secrets"]);
+    assert!(allowed.status.success(), "{}", stderr(&allowed));
+    assert!(!stdout(&allowed).contains("allow_caches"));
 }
 
 #[test]

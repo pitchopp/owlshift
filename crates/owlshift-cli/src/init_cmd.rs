@@ -30,9 +30,10 @@ use owlshift_runner::forge::{AppAccess, GitHubApp};
 use owlshift_runner::github_sign_in::{self, Ask, GitHub, Outcome, SystemWait};
 use owlshift_runner::init::{
     AppStored, CLAUDE_TOKEN, EXAMPLE_ASSIGNEE, EXAMPLE_TICKET, GITHUB_TOKEN, InitOptions,
-    MARKDOWN_LIMITS, MARKDOWN_PAGE, PeopleEntry, SecretsReport, Wanted, Written, people_entry,
-    project_file, read_root_files, required_secrets, store_app_credentials, store_secrets,
-    wanted_secrets, write_example_ticket, write_once_connected, write_project_file,
+    MARKDOWN_LIMITS, MARKDOWN_PAGE, PeopleEntry, SecretsReport, Wanted, Written,
+    allow_caches_advice, caches_to_allow, people_entry, project_file, read_root_files,
+    required_secrets, store_app_credentials, store_secrets, wanted_secrets, write_example_ticket,
+    write_once_connected, write_project_file,
 };
 use owlshift_runner::install::Manifests;
 use owlshift_runner::project::ProjectDirs;
@@ -142,6 +143,17 @@ pub fn run(args: &Args, config: &Effective) -> ExitCode {
             (tracker, File::New(path, options))
         }
         FileState::Invalid { path, error } => {
+            // A file this run wrote is refused here until the personal
+            // file allows its caches (OWL-593): say how, again.
+            let root = path.parent().unwrap_or(path);
+            let folders = std::fs::read_to_string(path)
+                .ok()
+                .and_then(|text| ProjectConfig::parse(&text).ok())
+                .map(|kept| kept.stack.caches)
+                .unwrap_or_default();
+            if let Some(advice) = cache_advice(config, &folders, origin_repo(root).ok().as_ref()) {
+                eprintln!("{advice}");
+            }
             return fail(&format!(
                 "{} is invalid: {error}\nFix it, then run `owlshift init` again to store the \
                  secrets.",
@@ -160,9 +172,12 @@ pub fn run(args: &Args, config: &Effective) -> ExitCode {
         File::Kept(path) | File::New(path, _) => *path,
     };
 
+    // The project's secrets and caches are named by its GitHub repository
+    // (OWL-308, OWL-593).
+    let repo = origin_repo(path.parent().unwrap_or(path));
     if args.skip_secrets {
         if let File::New(path, options) = &file
-            && let Err(error) = write(path, options)
+            && let Err(error) = write(path, options, config, repo.as_ref().ok())
         {
             return error;
         }
@@ -184,10 +199,6 @@ pub fn run(args: &Args, config: &Effective) -> ExitCode {
         Ok(keychain) => Arc::new(keychain),
         Err(error) => return fail(&error.to_string()),
     };
-    // The project's secrets are named by its GitHub repository (OWL-308).
-    let root = path.parent().unwrap_or(path);
-    let repo = project::origin_url(&project::runner_git(), root)
-        .and_then(|url| on_demand::check_origin(&url));
     let (mut wanted, unnamed) = match wanted_secrets(
         &keychain,
         &required_secrets(tracker),
@@ -378,7 +389,7 @@ pub fn run(args: &Args, config: &Effective) -> ExitCode {
     if let File::New(path, options) = &file {
         let root = path.parent().unwrap_or(path);
         match write_once_connected(root, options, connected.as_ref().map_err(String::as_str)) {
-            Ok(Written::Created) => said_written(path, options),
+            Ok(Written::Created) => said_written(path, options, config, repo.as_ref().ok()),
             Ok(Written::Kept) => {
                 return fail(&format!(
                     "{} appeared while `owlshift init` ran: run it again",
@@ -425,12 +436,17 @@ pub fn run(args: &Args, config: &Effective) -> ExitCode {
 
 /// Writes the project file of `options` at `path` without asking the
 /// tracker (`--skip-secrets`), and says so; the error is `init`'s exit.
-fn write(path: &Path, options: &InitOptions) -> Result<(), ExitCode> {
+fn write(
+    path: &Path,
+    options: &InitOptions,
+    config: &Effective,
+    repo: Option<&Repo>,
+) -> Result<(), ExitCode> {
     let text = project_file(options).map_err(|error| fail(&error))?;
     let root = path.parent().unwrap_or(path);
     match write_project_file(root, &text) {
         Ok(Written::Created) => {
-            said_written(path, options);
+            said_written(path, options, config, repo);
             Ok(())
         }
         Ok(Written::Kept) => Err(fail(&format!(
@@ -521,8 +537,9 @@ fn read_hidden(one: &Wanted) -> Option<Secret> {
     }
 }
 
-/// What `init` says once it wrote the project file at `path`.
-fn said_written(path: &Path, options: &InitOptions) {
+/// What `init` says once it wrote the project file at `path`; `config` and
+/// `repo` say which of its caches this machine allows already.
+fn said_written(path: &Path, options: &InitOptions, config: &Effective, repo: Option<&Repo>) {
     let has_gate = !options.gate.is_empty() || options.detected.gate().next().is_some();
     println!(
         "Wrote {}: review it, then commit it.{}",
@@ -535,9 +552,56 @@ fn said_written(path: &Path, options: &InitOptions) {
         }
     );
     report_detection(options);
+    let folders: Vec<String> = options
+        .detected
+        .caches()
+        .map(|line| line.command.clone())
+        .collect();
+    if let Some(advice) = cache_advice(config, &folders, repo) {
+        println!("{advice}");
+    }
     if options.tracker == TrackerKind::Markdown {
         report_example(path.parent().unwrap_or(path));
     }
+}
+
+/// The GitHub repository of the checkout at `root`'s `origin`, as `owlshift
+/// do` reads it.
+fn origin_repo(root: &Path) -> Result<Repo, String> {
+    project::origin_url(&project::runner_git(), root).and_then(|url| on_demand::check_origin(&url))
+}
+
+/// What to add to the personal file so that this machine opens the cache
+/// folders `folders` of the project of `repo` (OWL-593): the project file
+/// is refused until it does. `None` when it allows them all, or when the
+/// personal file cannot be read, its own error then coming first.
+fn cache_advice(config: &Effective, folders: &[String], repo: Option<&Repo>) -> Option<String> {
+    let allowed = config.allowed_caches(repo);
+    let missing = caches_to_allow(folders.iter().map(String::as_str), allowed.as_deref());
+    if missing.is_empty() {
+        return None;
+    }
+    let personal = match &config.personal {
+        FileState::Loaded { path, .. }
+        | FileState::Absent(path)
+        | FileState::Invalid { path, .. } => path.display().to_string(),
+        FileState::NotApplicable(_) | FileState::Unavailable(_) => {
+            "your personal configuration file".to_owned()
+        }
+    };
+    let shown: Vec<String> = missing
+        .iter()
+        .map(|folder| format!("`~/{folder}`"))
+        .collect();
+    Some(format!(
+        "The setup reads {} read-only, and this machine opens a folder of your home only once \
+         its personal configuration allows it: until then every run and gate refuses the \
+         project. {}\nThen install the project once in this checkout yourself (`npm ci`, `yarn \
+         install`), so the folder holds its packages: the confined setup cannot add a missing \
+         one, and npm then says `EPERM` and \"root-owned files\", which `sudo` does not fix.",
+        shown.join(", "),
+        allow_caches_advice(repo, &missing, &personal)
+    ))
 }
 
 /// Lists in the install manifest of the data directory `data` the keychain
