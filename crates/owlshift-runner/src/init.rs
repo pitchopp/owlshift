@@ -22,7 +22,7 @@ use semver::Version;
 
 use owlshift_adapters::forge::Repo;
 use owlshift_contracts::config::{ProjectConfig, TrackerKind};
-use owlshift_core::stack::{Detection, MANIFESTS, RootFiles};
+use owlshift_core::stack::{Detection, MANIFESTS, RootFiles, SETTINGS};
 use owlshift_platform::keychain::{Keychain, KeychainError, SERVICE, Secret};
 
 use crate::config::{OWLSHIFT_VERSION, PROJECT_FILE};
@@ -368,9 +368,10 @@ fn one_line(text: &str) -> String {
 const MANIFEST_LIMIT: u64 = 1 << 20;
 
 /// Reads the root of a repository for [`owlshift_core::stack::detect`]: the
-/// names of its files, and the contents of the manifests it recognises. A
-/// manifest over 1 MiB or not UTF-8 is left unread, which detection reports as
-/// skipped; only a root that cannot be listed is an error.
+/// names of its files, and the contents of the manifests it recognises and
+/// of the settings files it reads beside them ([`SETTINGS`]). A file over
+/// 1 MiB or not UTF-8 is left unread, which detection reports as skipped for
+/// a manifest; only a root that cannot be listed is an error.
 pub fn read_root_files(root: &Path) -> io::Result<RootFiles> {
     let mut names = Vec::new();
     for entry in std::fs::read_dir(root)? {
@@ -381,7 +382,7 @@ pub fn read_root_files(root: &Path) -> io::Result<RootFiles> {
     }
     names.sort();
     let mut files = Vec::new();
-    for name in MANIFESTS {
+    for name in MANIFESTS.into_iter().chain(SETTINGS) {
         if !names.iter().any(|n| n == name) {
             continue;
         }
