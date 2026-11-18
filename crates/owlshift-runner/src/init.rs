@@ -192,13 +192,29 @@ pub fn write_once_connected(
     write_project_file(root, &text).map_err(|error| format!("{PROJECT_FILE}: {error}"))
 }
 
-/// The entry `init` prints for a project file kept as it is whose
-/// `[people]` does not list the accounts it signed in as (OWL-582, build plan
-/// "P10 · Teams", "People"): the file changes through a pull request, so
-/// `init` writes nothing to it. `None` without the table, when nothing was
-/// read, and when every account read is listed, both under one handle.
-/// The handle is the one a listed account has, else a placeholder.
-pub fn people_entry(config: &ProjectConfig, signed_in: &SignedIn) -> Option<String> {
+/// What `init` prints of `[people]` for the accounts it signed in as
+/// ([`people_entry`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PeopleEntry {
+    /// An entry to add: no account read is listed. Its handle is a
+    /// placeholder for the person to choose.
+    Add(String),
+    /// The entry of `handle`, which lists one of the accounts read, with
+    /// the other corrected: it replaces that entry, as a table is defined
+    /// once.
+    Replace { handle: String, entry: String },
+    /// The tracker account is listed under the handle `tracker` and the
+    /// forge login under `forge`: one person in two entries, which a person
+    /// sorts out by hand.
+    Split { tracker: String, forge: String },
+}
+
+/// What `init` prints for a project file kept as it is whose `[people]`
+/// does not list the accounts it signed in as (OWL-582, build plan "P10 ·
+/// Teams", "People"): the file changes through a pull request, so `init`
+/// writes nothing to it. `None` without the table, when nothing was read,
+/// and when every account read is listed, both under one handle.
+pub fn people_entry(config: &ProjectConfig, signed_in: &SignedIn) -> Option<PeopleEntry> {
     let people = config.people.as_ref()?;
     if signed_in.tracker.is_none() && signed_in.forge.is_none() {
         return None;
@@ -226,6 +242,14 @@ pub fn people_entry(config: &ProjectConfig, signed_in: &SignedIn) -> Option<Stri
     if listed {
         return None;
     }
+    if let (Some(tracker), Some(forge)) = (by_tracker, by_forge)
+        && tracker != forge
+    {
+        return Some(PeopleEntry::Split {
+            tracker: tracker.to_owned(),
+            forge: forge.to_owned(),
+        });
+    }
     let handle = by_tracker.or(by_forge);
     let person = handle.and_then(|handle| people.get(handle));
     let quote = |text: &str| toml::Value::String(text.to_owned()).to_string();
@@ -245,7 +269,13 @@ pub fn people_entry(config: &ProjectConfig, signed_in: &SignedIn) -> Option<Stri
     {
         entry.push_str(&format!("forge = {}\n", quote(forge)));
     }
-    Some(entry)
+    Some(match handle {
+        Some(handle) => PeopleEntry::Replace {
+            handle: handle.to_owned(),
+            entry,
+        },
+        None => PeopleEntry::Add(entry),
+    })
 }
 
 /// A `key = [...]` block, each command preceded by the comment saying what it
@@ -770,9 +800,11 @@ mod tests {
     fn the_people_entry_names_the_accounts_signed_in() {
         let text = project_file(&options(TrackerKind::Markdown, None, &["make"])).unwrap();
         let kept = ProjectConfig::parse(&format!(
-            "{text}\n[people.ann]\ntracker = \"u-ann\"\nforge = \"Ann-Dev\"\n"
+            "{text}\n[people.ann]\ntracker = \"u-ann\"\nforge = \"Ann-Dev\"\n\
+             [people.bob]\ntracker = \"u-bob\"\nforge = \"bob-dev\"\n"
         ))
         .unwrap();
+        let add = |entry: &str| Some(PeopleEntry::Add(entry.to_owned()));
         let signed = |tracker: Option<&str>, forge: Option<&str>| SignedIn {
             tracker: tracker.map(ToOwned::to_owned),
             forge: forge.map(ToOwned::to_owned),
@@ -786,16 +818,63 @@ mod tests {
             assert_eq!(people_entry(&kept, &listed), None, "{listed:?}");
         }
         assert_eq!(
-            people_entry(&kept, &signed(Some("u-ann"), Some("ann2"))).as_deref(),
-            Some("[people.ann]\ntracker = \"u-ann\"\nforge = \"ann2\"\n")
+            people_entry(&kept, &signed(Some("u-cy"), Some("cy"))),
+            add("[people.<handle>]\ntracker = \"u-cy\"\nforge = \"cy\"\n")
         );
         assert_eq!(
-            people_entry(&kept, &signed(Some("u-bob"), Some("bob"))).as_deref(),
-            Some("[people.<handle>]\ntracker = \"u-bob\"\nforge = \"bob\"\n")
+            people_entry(&kept, &signed(None, Some("cy"))),
+            add("[people.<handle>]\ntracker = \"<your tracker account>\"\nforge = \"cy\"\n")
+        );
+    }
+
+    /// OWL-582: one account read is listed and the other is new or changed:
+    /// that person's entry is replaced, never defined a second time; the two
+    /// listed under two handles are named, and no merged entry is printed.
+    #[test]
+    fn a_listed_person_is_replaced_and_two_handles_are_named() {
+        let text = project_file(&options(TrackerKind::Markdown, None, &["make"])).unwrap();
+        let kept = ProjectConfig::parse(&format!(
+            "{text}\n[people.ann]\ntracker = \"u-ann\"\nforge = \"Ann-Dev\"\n\
+             [people.bob]\ntracker = \"u-bob\"\n"
+        ))
+        .unwrap();
+        let signed = |tracker: Option<&str>, forge: Option<&str>| SignedIn {
+            tracker: tracker.map(ToOwned::to_owned),
+            forge: forge.map(ToOwned::to_owned),
+        };
+        let replace = |handle: &str, entry: &str| {
+            Some(PeopleEntry::Replace {
+                handle: handle.to_owned(),
+                entry: entry.to_owned(),
+            })
+        };
+        assert_eq!(
+            people_entry(&kept, &signed(Some("u-ann"), Some("ann2"))),
+            replace(
+                "ann",
+                "[people.ann]\ntracker = \"u-ann\"\nforge = \"ann2\"\n"
+            )
         );
         assert_eq!(
-            people_entry(&kept, &signed(None, Some("bob"))).as_deref(),
-            Some("[people.<handle>]\ntracker = \"<your tracker account>\"\nforge = \"bob\"\n")
+            people_entry(&kept, &signed(Some("u-bob"), Some("bob-dev"))),
+            replace(
+                "bob",
+                "[people.bob]\ntracker = \"u-bob\"\nforge = \"bob-dev\"\n"
+            )
+        );
+        assert_eq!(
+            people_entry(&kept, &signed(Some("u-new"), Some("ann-dev"))),
+            replace(
+                "ann",
+                "[people.ann]\ntracker = \"u-new\"\nforge = \"ann-dev\"\n"
+            )
+        );
+        assert_eq!(
+            people_entry(&kept, &signed(Some("u-bob"), Some("ann-dev"))),
+            Some(PeopleEntry::Split {
+                tracker: "bob".to_owned(),
+                forge: "ann".to_owned(),
+            })
         );
         let without = ProjectConfig::parse(&text).unwrap();
         assert_eq!(people_entry(&without, &signed(Some("u-bob"), None)), None);
