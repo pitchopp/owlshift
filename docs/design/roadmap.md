@@ -211,7 +211,7 @@ Follow and drive the drain from a browser.
 - On GitHub Issues Owlshift has no identity of its own: its comments are the signed-in person's, as on Linear through a key without the app. An agent identity there needs a server that holds the app's private key, which is a shared runner's (P10's readings).
 - The public site (decided with the maintainer on 2026-11-16) is one page, part of P9 and outside its exit gate: it is built right after the gate, which does not wait for it, and Owlshift is not announced before the page is live. The [build plan](build-plan.md), "The public site", says what the page holds and how it is built and served; the [visual identity](visual-identity.md), section 6, says how it looks.
 
-**Exit gate.** The second project adopts Owlshift with configuration only, no change to the core.
+**Exit gate.** The second project adopts Owlshift with configuration only, no change to the core. Passed on 2026-11-18 on the maintainer's `portfolio` (D6); the run is recorded in the [build plan](build-plan.md) ("P9 tasks & exit gate").
 
 ## P10 · Teams
 
