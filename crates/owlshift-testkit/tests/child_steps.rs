@@ -160,6 +160,7 @@ fn a_stale_envelope_is_refused_spending_nothing() {
         answer: None,
         generation: 0,
         kept: Default::default(),
+        operator: None,
     };
     let dirs = s.project.dirs();
     let mut lines = Vec::new();

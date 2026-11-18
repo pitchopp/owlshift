@@ -29,7 +29,7 @@ use owlshift_adapters::tracker::ErrorKind;
 use owlshift_adapters::tracker::linear::AdmissionFacts;
 use owlshift_adapters::tracker::{Capability, KeyAccount};
 use owlshift_contracts::config::{
-    Admit, PersonalConfig, ProjectConfig, States, Tracker, TrackerKind,
+    Admit, PersonalConfig, ProjectConfig, States, Takes, Tracker, TrackerKind,
 };
 use owlshift_contracts::ids::TicketId;
 use owlshift_contracts::service::BuildIdentity;
@@ -354,6 +354,8 @@ pub fn run(system: &dyn System, config: &Effective, own: &BuildIdentity) -> Repo
         kind.operator(system, project, accounts, repo)
     });
     checks.extend(people_check(config, operator.as_ref()));
+    checks.extend(team_gesture_check(config));
+    checks.extend(markdown_takes_check(config, repo));
     checks.extend(forge_reviewers_check(config));
     checks.extend(resolver_check(config));
     checks.extend(codex_reviewer_check(system, config));
@@ -1496,6 +1498,71 @@ fn people_check(config: &Effective, operator: Option<&Operator>) -> Option<Check
 /// `[forge].reviewers` lists, read from the working tree here, while watch
 /// reads the base commit. Without `[forge]` no review is read, which blocks
 /// nothing: a warning. None without a project configuration.
+/// A state gesture in a project file that lists several people (OWL-583,
+/// build plan "P10 · Teams", "The gesture on a team"): its account is
+/// whoever moved the ticket to the ready column, often the person who
+/// grooms the backlog, whose runner then takes it. A note pointing to a
+/// label, which each developer puts on their own tickets. Several people:
+/// `[people]` lists two or more, or, without it, `[tracker].admitters` does.
+fn team_gesture_check(config: &Effective) -> Option<Check> {
+    let FileState::Loaded { config, .. } = &config.project else {
+        return None;
+    };
+    if !matches!(config.tracker.admit, Admit::State(_)) {
+        return None;
+    }
+    let people = match &config.people {
+        Some(people) => people.len(),
+        None => config.tracker.admitters.as_ref().map_or(0, Vec::len),
+    };
+    (people >= 2).then(|| {
+        Check::warn(
+            Section::Project,
+            "team gesture",
+            format!(
+                "tickets are admitted by a move to the ready state, and the file lists {people} \
+                 people: a runner takes a ticket whose move is its own operator's, often the \
+                 person who grooms the backlog"
+            ),
+            format!(
+                "{DOES_NOT_BLOCK} on a team, admit with a label each developer puts on their own \
+                 tickets: `admit = {{ label = \"agent\" }}` under `[tracker]`."
+            ),
+        )
+    })
+}
+
+/// A Markdown project whose personal file names no `identity.tracker`
+/// (OWL-583): with no operator to compare, its drain takes every admitted
+/// ticket, as before P10, even under `takes = "mine"`. Said once, as a note.
+fn markdown_takes_check(config: &Effective, repo: Option<&Repo>) -> Option<Check> {
+    let FileState::Loaded {
+        config: project, ..
+    } = &config.project
+    else {
+        return None;
+    };
+    if project.tracker.kind != TrackerKind::Markdown {
+        return None;
+    }
+    let personal = match &config.personal {
+        FileState::Loaded { config, .. } => Some(config),
+        _ => None,
+    };
+    let key = repo.map(|repo| format!("github.com/{repo}"));
+    let takes = personal.map_or(Takes::Mine, |personal| personal.takes_for(key.as_deref()));
+    let named = personal.and_then(|personal| personal.identity.tracker.as_deref());
+    (takes == Takes::Mine && named.is_none_or(|id| id.trim().is_empty())).then(|| {
+        Check::info(
+            Section::Project,
+            "takes",
+            "the personal configuration sets no `identity.tracker`, the operator of a Markdown \
+             project, so the drain takes every admitted ticket; set it to take only the tickets \
+             whose author it is",
+        )
+    })
+}
+
 fn forge_reviewers_check(config: &Effective) -> Option<Check> {
     const SUBJECT: &str = "forge reviewers";
     let FileState::Loaded { config, .. } = &config.project else {
@@ -4751,6 +4818,62 @@ states = { ready = "Todo", working = "Doing", needs_input = "Asked", review = "R
                 .ends_with("the personal configuration sets no `identity.tracker`"),
             "{unread:?}"
         );
+    }
+
+    /// OWL-583: a state gesture in a file that lists several people is
+    /// noted, pointing to a label; one person, or a label, says nothing.
+    #[test]
+    fn a_state_gesture_is_noted_when_several_people_are_listed() {
+        let ready = LABELLED_TRACKER.replace("admit = { label = \"agent\" }", "admit = \"ready\"");
+        let two = ready.replace(r#"["u-ann"]"#, r#"["u-ann", "u-bob"]"#);
+        let (_dir, config) = project_tracked_by(&two);
+        let noted = team_gesture_check(&config).unwrap();
+        assert_eq!(noted.status, Status::Warn);
+        assert!(noted.detail.contains("lists 2 people"), "{noted:?}");
+        assert!(
+            noted
+                .why
+                .as_deref()
+                .is_some_and(|why| why.contains("label")),
+            "{noted:?}"
+        );
+        for quiet in [
+            ready,
+            LABELLED_TRACKER.replace(r#"["u-ann"]"#, r#"["u-ann", "u-bob"]"#),
+        ] {
+            let (_dir, config) = project_tracked_by(&quiet);
+            assert!(team_gesture_check(&config).is_none(), "{quiet}");
+        }
+    }
+
+    /// OWL-583: a Markdown project whose personal file names no
+    /// `identity.tracker` takes every admitted ticket, which doctor says;
+    /// with one, or under `takes = "all"`, it says nothing.
+    #[test]
+    fn a_markdown_drain_without_an_identity_is_said_to_take_every_ticket() {
+        let tracker = r#"kind = "markdown"
+admit = { label = "agent" }
+admitters = ["ann"]
+states = { ready = "Todo", working = "Doing", needs_input = "Asked", review = "Review" }"#;
+        let (dir, _) = project_tracked_by(tracker);
+        let with = |text: &str| Effective {
+            project: FileState::load(
+                dir.path().join("owlshift.toml"),
+                owlshift_contracts::config::ProjectConfig::parse,
+            ),
+            personal: FileState::Loaded {
+                path: PathBuf::from("/home/ada/.config/owlshift/config.toml"),
+                config: owlshift_contracts::config::PersonalConfig::parse(text).unwrap(),
+                entries: Vec::new(),
+            },
+        };
+        let said = markdown_takes_check(&with(""), None).unwrap();
+        assert!(
+            said.detail.contains("takes every admitted ticket"),
+            "{said:?}"
+        );
+        assert!(markdown_takes_check(&with("[identity]\ntracker = \"ann\"\n"), None).is_none());
+        assert!(markdown_takes_check(&with("takes = \"all\"\n"), None).is_none());
     }
 
     /// OWL-307: without `[forge].reviewers` no review is read, a warning

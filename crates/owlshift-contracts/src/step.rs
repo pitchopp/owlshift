@@ -13,8 +13,8 @@ use serde::{Deserialize, Serialize};
 use owlshift_core::gate::{Chain, ChainCost};
 
 use crate::format::{
-    self, CARRY_FORMAT, ContractError, Format, OBLIGATION_FORMAT, OUTSIDE_FORMAT, RUN_FORMAT,
-    STEP_ENVELOPE_FORMAT, STEP_OUTCOME_FORMAT, TICKET_RESTART_FORMAT,
+    self, CARRY_FORMAT, ContractError, Format, NOT_MINE_FORMAT, OBLIGATION_FORMAT, OUTSIDE_FORMAT,
+    RUN_FORMAT, STEP_ENVELOPE_FORMAT, STEP_OUTCOME_FORMAT, TICKET_RESTART_FORMAT,
 };
 use crate::ids::TicketId;
 use crate::{Role, Stage};
@@ -53,6 +53,12 @@ pub struct StepEnvelope {
     /// which the step may change and its outcome gives back.
     #[serde(default)]
     pub kept: KeptFollowing,
+    /// The operator's tracker account when the drain takes only the
+    /// tickets its operator admitted (`takes = "mine"`, OWL-583): an intake
+    /// or a dispatch whose gesture is another account's ends `not_mine`.
+    /// Absent: every admitted ticket is taken.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub operator: Option<String>,
 }
 
 /// The kind of a step, with what each kind needs that watch alone knows.
@@ -203,6 +209,9 @@ pub enum StepEnd {
     Capped { open_prs: u32, max_open_prs: u32 },
     /// The admission gesture is not an admitter's: nothing ran.
     NotAdmitted { account: String, reason: String },
+    /// The admission gesture is `account`'s, not the operator's, under
+    /// `takes = "mine"` (OWL-583): nothing ran. Format 6.
+    NotMine { account: String },
     /// Another command held the project or the ticket: nothing ran.
     Busy,
     /// Every run slot of the machine was taken (OWL-409): nothing ran, and
@@ -281,13 +290,14 @@ pub enum StepHold {
 impl StepOutcome {
     const CONTRACT: &str = "step outcome";
 
-    /// Parses an outcome record. A format-1 to 4 one, which a watch that
-    /// ran before OWL-409, OWL-404, OWL-418 or OWL-161 may have left for its
-    /// successor, is read as the current format: format 2 only adds the
-    /// `no_slot` end, refused in format 1, format 3 only drops the `paused`
-    /// hold, read as none, since the machine's usage state now holds a
-    /// harness at its limit, format 4 only adds the `base_held` end, refused
-    /// before, and format 5 only adds the `stopped` end, refused before.
+    /// Parses an outcome record. A format-1 to 5 one, which a watch that
+    /// ran before OWL-409, OWL-404, OWL-418, OWL-161 or OWL-583 may have
+    /// left for its successor, is read as the current format: format 2 only
+    /// adds the `no_slot` end, refused in format 1, format 3 only drops the
+    /// `paused` hold, read as none, since the machine's usage state now
+    /// holds a harness at its limit, format 4 only adds the `base_held` end,
+    /// refused before, format 5 only adds the `stopped` end, refused before,
+    /// and format 6 only adds the `not_mine` end, refused before.
     pub fn parse(input: &str) -> Result<Self, ContractError> {
         let outcome: Self = match Self::from_older_format(input) {
             Some(read) => read?,
@@ -297,18 +307,24 @@ impl StepOutcome {
         Ok(outcome)
     }
 
-    /// A format-1 to 4 record read as the current format, or `None` for any
+    /// A format-1 to 5 record read as the current format, or `None` for any
     /// other.
     fn from_older_format(input: &str) -> Option<Result<Self, ContractError>> {
         let mut document: serde_json::Value = serde_json::from_str(input).ok()?;
         let format = document.get("format").and_then(serde_json::Value::as_u64)?;
-        if !matches!(format, 1..=4) {
+        if !matches!(format, 1..=5) {
             return None;
         }
         let end = document
             .pointer("/end/end")
             .and_then(serde_json::Value::as_str);
-        if end == Some("stopped") {
+        if end == Some("not_mine") {
+            return Some(Err(ContractError::invalid(
+                Self::CONTRACT,
+                "formats before 6 have no `not_mine` end",
+            )));
+        }
+        if format < 5 && end == Some("stopped") {
             return Some(Err(ContractError::invalid(
                 Self::CONTRACT,
                 "formats before 5 have no `stopped` end",
@@ -455,6 +471,42 @@ impl TicketRestart {
 
     pub fn parse(input: &str) -> Result<Self, ContractError> {
         format::parse_json(Self::CONTRACT, TICKET_RESTART_FORMAT, input)
+    }
+
+    pub fn render(&self) -> String {
+        format::render_json(self)
+    }
+}
+
+/// A ticket of the ready column found not the operator's (P10, OWL-583;
+/// build plan "P10 · Teams", "The operator, and whose tickets a runner
+/// takes"), kept in `not_mine.json` in the ticket's folder by the draining
+/// watch: while it stands, under `takes = "mine"` for the same operator, the
+/// drain starts no step for the ticket until the tracker's update time of
+/// it has moved and ten minutes passed since `read_at`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+#[schemars(title = "Owlshift ticket not mine")]
+pub struct TicketNotMine {
+    pub format: Format<NOT_MINE_FORMAT>,
+    /// The account of the admission gesture read.
+    pub account: String,
+    /// The operator it was compared with: a record for another operator
+    /// counts as absent.
+    pub operator: String,
+    /// When the step that read it started.
+    pub read_at: Timestamp,
+    /// The tracker's update time of the ticket the pass that started that
+    /// step listed; `null` when the tracker gives none.
+    #[serde(default)]
+    pub updated_at: Option<Timestamp>,
+}
+
+impl TicketNotMine {
+    const CONTRACT: &str = "ticket not mine";
+
+    pub fn parse(input: &str) -> Result<Self, ContractError> {
+        format::parse_json(Self::CONTRACT, NOT_MINE_FORMAT, input)
     }
 
     pub fn render(&self) -> String {
@@ -724,6 +776,7 @@ mod tests {
                 paused_until: Some("2026-10-20T10:00:00Z".parse().unwrap()),
                 rerun_refused: Some("HTTP 403 Resource not accessible by integration".to_owned()),
             },
+            operator: Some("maintainer".to_owned()),
         }
     }
 
@@ -831,7 +884,7 @@ mod tests {
         };
         let as_format_1 = |outcome: &StepOutcome| {
             let mut document: serde_json::Value = serde_json::from_str(&outcome.render()).unwrap();
-            assert_eq!(document["format"], 5);
+            assert_eq!(document["format"], 6);
             document["format"] = 1.into();
             document.to_string()
         };
@@ -955,6 +1008,48 @@ mod tests {
             ..outcome
         };
         assert_eq!(StepOutcome::parse(&as_format_4(&held)).unwrap(), held);
+    }
+
+    /// OWL-583: format 6 adds `not_mine`; a format-5 record still reads,
+    /// as format 6, but never with that end. The not-mine record reads back.
+    #[test]
+    fn not_mine_is_format_6s() {
+        let outcome = StepOutcome {
+            format: Format,
+            ticket: TicketId::new("OWL-1").unwrap(),
+            attempt: "1-2-3".to_owned(),
+            commit: None,
+            progress: "p".to_owned(),
+            answer: None,
+            end: StepEnd::NotMine {
+                account: "lea".to_owned(),
+            },
+            after: RefAfter::Absent,
+            hold: None,
+            kept: KeptFollowing::default(),
+            at: "2026-11-18T09:00:00Z".parse().unwrap(),
+        };
+        assert_eq!(StepOutcome::parse(&outcome.render()).unwrap(), outcome);
+        let as_format_5 = |outcome: &StepOutcome| {
+            let mut document: serde_json::Value = serde_json::from_str(&outcome.render()).unwrap();
+            document["format"] = 5.into();
+            document.to_string()
+        };
+        let error = StepOutcome::parse(&as_format_5(&outcome)).unwrap_err();
+        assert!(error.to_string().contains("no `not_mine`"), "{error}");
+        let stopped = StepOutcome {
+            end: StepEnd::Stopped,
+            ..outcome
+        };
+        assert_eq!(StepOutcome::parse(&as_format_5(&stopped)).unwrap(), stopped);
+        let record = TicketNotMine {
+            format: Format,
+            account: "lea".to_owned(),
+            operator: "maintainer".to_owned(),
+            read_at: "2026-11-18T09:00:00Z".parse().unwrap(),
+            updated_at: None,
+        };
+        assert_eq!(TicketNotMine::parse(&record.render()).unwrap(), record);
     }
 
     /// A run file and an obligation read back as written, a write under way

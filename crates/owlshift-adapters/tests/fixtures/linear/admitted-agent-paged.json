@@ -1,9 +1,9 @@
 {
-  "recorded": "2026-10-13 on the Owlshift workspace, recorded live",
+  "recorded": "2026-10-13 on the Owlshift workspace, recorded live; each issue's updatedAt added by hand as its createdAt (OWL-583)",
   "exchanges": [
     {
       "request": {
-        "query": "query Admitted($filter: IssueFilter!, $first: Int!, $after: String) { issues(first: $first, after: $after, filter: $filter) { nodes { identifier title description priority assignee { id displayName } creator { id displayName } botActor { name } externalUserCreator { name } labels(first: 50) { nodes { name } pageInfo { hasNextPage } } createdAt inverseRelations(first: 50, includeArchived: true) { nodes { type issue { identifier state { type } } } pageInfo { hasNextPage } } } pageInfo { hasNextPage endCursor } } }",
+        "query": "query Admitted($filter: IssueFilter!, $first: Int!, $after: String) { issues(first: $first, after: $after, filter: $filter) { nodes { identifier title description priority assignee { id displayName } creator { id displayName } botActor { name } externalUserCreator { name } labels(first: 50) { nodes { name } pageInfo { hasNextPage } } createdAt updatedAt inverseRelations(first: 50, includeArchived: true) { nodes { type issue { identifier state { type } } } pageInfo { hasNextPage } } } pageInfo { hasNextPage endCursor } } }",
         "variables": {
           "after": null,
           "filter": {
@@ -38,6 +38,7 @@
                 },
                 "botActor": null,
                 "createdAt": "2026-10-07T08:44:52.263Z",
+                "updatedAt": "2026-10-07T08:44:52.263Z",
                 "creator": {
                   "displayName": "person-1",
                   "id": "00000000-0000-4000-8000-000000000001"
@@ -77,6 +78,7 @@
                 },
                 "botActor": null,
                 "createdAt": "2026-10-06T18:59:54.797Z",
+                "updatedAt": "2026-10-06T18:59:54.797Z",
                 "creator": {
                   "displayName": "person-1",
                   "id": "00000000-0000-4000-8000-000000000001"
@@ -120,7 +122,7 @@
     },
     {
       "request": {
-        "query": "query Admitted($filter: IssueFilter!, $first: Int!, $after: String) { issues(first: $first, after: $after, filter: $filter) { nodes { identifier title description priority assignee { id displayName } creator { id displayName } botActor { name } externalUserCreator { name } labels(first: 50) { nodes { name } pageInfo { hasNextPage } } createdAt inverseRelations(first: 50, includeArchived: true) { nodes { type issue { identifier state { type } } } pageInfo { hasNextPage } } } pageInfo { hasNextPage endCursor } } }",
+        "query": "query Admitted($filter: IssueFilter!, $first: Int!, $after: String) { issues(first: $first, after: $after, filter: $filter) { nodes { identifier title description priority assignee { id displayName } creator { id displayName } botActor { name } externalUserCreator { name } labels(first: 50) { nodes { name } pageInfo { hasNextPage } } createdAt updatedAt inverseRelations(first: 50, includeArchived: true) { nodes { type issue { identifier state { type } } } pageInfo { hasNextPage } } } pageInfo { hasNextPage endCursor } } }",
         "variables": {
           "after": "f26ce2df-ee2c-4123-a86f-9c3718d23efe",
           "filter": {
@@ -155,6 +157,7 @@
                 },
                 "botActor": null,
                 "createdAt": "2026-10-06T18:37:21.670Z",
+                "updatedAt": "2026-10-06T18:37:21.670Z",
                 "creator": {
                   "displayName": "person-1",
                   "id": "00000000-0000-4000-8000-000000000001"
@@ -194,6 +197,7 @@
                 },
                 "botActor": null,
                 "createdAt": "2026-10-06T18:37:21.444Z",
+                "updatedAt": "2026-10-06T18:37:21.444Z",
                 "creator": {
                   "displayName": "person-1",
                   "id": "00000000-0000-4000-8000-000000000001"
@@ -237,7 +241,7 @@
     },
     {
       "request": {
-        "query": "query Admitted($filter: IssueFilter!, $first: Int!, $after: String) { issues(first: $first, after: $after, filter: $filter) { nodes { identifier title description priority assignee { id displayName } creator { id displayName } botActor { name } externalUserCreator { name } labels(first: 50) { nodes { name } pageInfo { hasNextPage } } createdAt inverseRelations(first: 50, includeArchived: true) { nodes { type issue { identifier state { type } } } pageInfo { hasNextPage } } } pageInfo { hasNextPage endCursor } } }",
+        "query": "query Admitted($filter: IssueFilter!, $first: Int!, $after: String) { issues(first: $first, after: $after, filter: $filter) { nodes { identifier title description priority assignee { id displayName } creator { id displayName } botActor { name } externalUserCreator { name } labels(first: 50) { nodes { name } pageInfo { hasNextPage } } createdAt updatedAt inverseRelations(first: 50, includeArchived: true) { nodes { type issue { identifier state { type } } } pageInfo { hasNextPage } } } pageInfo { hasNextPage endCursor } } }",
         "variables": {
           "after": "cf6530f1-c6b2-4bb5-96e2-263c9d50ca07",
           "filter": {
@@ -272,6 +276,7 @@
                 },
                 "botActor": null,
                 "createdAt": "2026-10-06T18:37:21.240Z",
+                "updatedAt": "2026-10-06T18:37:21.240Z",
                 "creator": {
                   "displayName": "person-1",
                   "id": "00000000-0000-4000-8000-000000000001"

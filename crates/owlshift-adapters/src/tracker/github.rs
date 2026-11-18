@@ -296,6 +296,11 @@ impl Tracker for GitHubTracker {
         Ok(self.to_ticket(id.clone(), issue))
     }
 
+    /// The key's account ([`Self::key_account`]).
+    fn operator(&self) -> Result<Option<KeyAccount>, Error> {
+        self.key_account().map(Some)
+    }
+
     fn comments(&self, id: &TicketId) -> Result<Vec<Comment>, Error> {
         let (number, _) = self.issue(id)?;
         self.every_comment(number, id)
@@ -637,6 +642,10 @@ struct Issue {
     state_reason: Option<String>,
     #[serde(default)]
     created_at: Option<String>,
+    /// Moved by a label or a state change too (checked on 2026-11-18,
+    /// OWL-583).
+    #[serde(default)]
+    updated_at: Option<String>,
     /// Set for a pull request (G5).
     pull_request: Option<PullLink>,
 }

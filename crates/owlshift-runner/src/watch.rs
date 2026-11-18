@@ -1607,6 +1607,7 @@ impl Watch<'_> {
             answer: seen.answer,
             generation: step::carry_generation(self.on_demand.dirs, ticket, &seen.commit),
             kept: memory.following.kept(ticket),
+            operator: self.on_demand.takes.operator().map(ToOwned::to_owned),
         }
     }
 

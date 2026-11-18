@@ -43,6 +43,7 @@ use owlshift_runner::executor::codex::user_login;
 use owlshift_runner::executor::harness::{CLAUDE_AGENT_ACCOUNT, ClaudeHarness};
 use owlshift_runner::notify::{self, DesktopNotifier};
 use owlshift_runner::on_demand::{self, CodexReviewer, Delivered, OnDemand, Stop};
+use owlshift_runner::operator::Taking;
 use owlshift_runner::project::{self, ProjectDirs};
 use owlshift_runner::refusal::Refusal;
 use owlshift_runner::roles::{
@@ -367,14 +368,23 @@ fn run_with(
     // work, and revoked when the tracker is dropped (OWL-157). The GitHub
     // App's token is refreshed under the project's account lock (OWL-384);
     // one already expired is refreshed here, before any work.
-    let mut open = || -> Result<(Box<dyn Tracker>, _), Refusal> {
+    // Which admitted tickets the drain takes (OWL-583): under `takes =
+    // "mine"`, the account of the tracker key, read once here, a key that
+    // cannot be read refusing the drain's start; a step's child takes what
+    // its watch read, from its envelope; any other command reads no gesture.
+    let mut open = || -> Result<(Box<dyn Tracker>, _, Taking), Refusal> {
         let tracker = opener.open()?;
         let forge = forge::github(&forge_secret, repo.clone(), &access)?;
-        Ok((tracker, forge))
+        let takes = match (mode, &envelope) {
+            (Mode::Drain, _) => config.taking(tracker.as_ref(), project.tracker.kind, &repo)?,
+            (_, Some(envelope)) => Taking::of_envelope(envelope.operator.as_deref()),
+            _ => Taking::All,
+        };
+        Ok((tracker, forge, takes))
     };
     // A watch the daemon starts waits for the network rather than end while
     // neither answers at all (OWL-479); any other command refuses at once.
-    let (tracker, forge) = if waits_for_network(served.is_some(), mode) {
+    let (tracker, forge, takes) = if waits_for_network(served.is_some(), mode) {
         let mut out = io::stdout();
         let mut sink = EventSink::new(repo.to_string(), EventLog::in_dir(data_dir), &mut out);
         match offline::open(
@@ -524,6 +534,7 @@ fn run_with(
         notifier: desktop,
         usage: &usage,
         web_tools: owlshift_runner::config::web_tools_enabled(&config.personal),
+        takes,
     };
     let mut stdout = io::stdout();
     let mut sink = EventSink::new(repo.to_string(), EventLog::in_dir(data_dir), &mut stdout);
@@ -1325,6 +1336,7 @@ mod refusals {
             answer: None,
             generation: 0,
             kept: Default::default(),
+            operator: None,
         }
     }
 

@@ -362,6 +362,7 @@ fn a_dispatch_decided_before_a_do_builds_nothing_once_the_do_took_its_zone() {
                 answer: None,
                 generation: 0,
                 kept: KeptFollowing::default(),
+                operator: None,
             };
             step::run(
                 on_demand,

@@ -48,6 +48,13 @@
         "unposted": null
       }
     },
+    "operator": {
+      "description": "The operator's tracker account when the drain takes only the\ntickets its operator admitted (`takes = \"mine\"`, OWL-583): an intake\nor a dispatch whose gesture is another account's ends `not_mine`.\nAbsent: every admitted ticket is taken.",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
     "progress": {
       "description": "What the ref kept but its runs' cost when watch read it, as watch\ncompares it: the hold the child computes keys on it.",
       "type": "string"

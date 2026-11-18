@@ -39,7 +39,7 @@
     "format": {
       "description": "The format version of this document.",
       "type": "integer",
-      "const": 5
+      "const": 6
     },
     "hold": {
       "description": "The hold the step calls for, by watch's rule, none when it calls for\nnone.",
@@ -289,6 +289,24 @@
             "end",
             "account",
             "reason"
+          ]
+        },
+        {
+          "description": "The admission gesture is `account`'s, not the operator's, under\n`takes = \"mine\"` (OWL-583): nothing ran. Format 6.",
+          "type": "object",
+          "properties": {
+            "account": {
+              "type": "string"
+            },
+            "end": {
+              "type": "string",
+              "const": "not_mine"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "end",
+            "account"
           ]
         },
         {

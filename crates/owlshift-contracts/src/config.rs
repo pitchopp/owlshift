@@ -1418,6 +1418,13 @@ pub struct PersonalConfig {
     /// the answer check, Build and rebase never get them from this key.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub web_tools: Option<bool>,
+    /// Which admitted tickets `owlshift watch --drain` takes on this machine
+    /// (P10, OWL-583): `"mine"`, those whose admission gesture is the
+    /// operator's, the account of the project's tracker key; or `"all"`,
+    /// every admitted ticket, as every runner did before. Absent: `"mine"`.
+    /// `repositories` sets it for one repository.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub takes: Option<Takes>,
     /// Settings for one repository, keyed `github.com/<owner>/<name>` in any
     /// letter case. The repository of a project is read from its checkout's
     /// `origin` remote, which the committed project file cannot set.
@@ -1438,6 +1445,23 @@ pub struct RepositorySettings {
     /// rules.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub allow_caches: Vec<String>,
+    /// Which admitted tickets the drain takes for this repository, in place
+    /// of the machine-wide `takes`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub takes: Option<Takes>,
+}
+
+/// Which admitted tickets a runner takes (P10, OWL-583; build plan "P10 ·
+/// Teams", "The operator, and whose tickets a runner takes").
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum Takes {
+    // Those whose admission gesture is the operator's. (Plain comments: the
+    // schema keeps a plain `enum`, which the UI's editor reads as a choice.)
+    #[default]
+    Mine,
+    // Every admitted ticket.
+    All,
 }
 
 /// The host part of a repository key of [`PersonalConfig::repositories`]:
@@ -1653,6 +1677,19 @@ impl PersonalConfig {
             .chain(scoped)
             .map(String::as_str)
             .collect()
+    }
+
+    /// Which admitted tickets the drain takes for `repository`
+    /// (`github.com/<owner>/<name>`, compared in any letter case): the
+    /// [`PersonalConfig::repositories`] entry's `takes`, else the
+    /// machine-wide one, else [`Takes::Mine`] (OWL-583).
+    pub fn takes_for(&self, repository: Option<&str>) -> Takes {
+        self.repositories
+            .iter()
+            .filter(|(key, _)| repository.is_some_and(|r| key.eq_ignore_ascii_case(r)))
+            .find_map(|(_, settings)| settings.takes)
+            .or(self.takes)
+            .unwrap_or_default()
     }
 
     /// How many steps of `owlshift watch --drain` this machine runs at once,
@@ -2785,6 +2822,24 @@ mod tests {
                 "{names}: {error}"
             );
         }
+    }
+
+    /// OWL-583: `takes` is `mine` by default, set machine-wide or for one
+    /// repository, whose own wins; any other value is refused.
+    #[test]
+    fn takes_is_mine_unless_set_and_a_repository_overrides_it() {
+        assert_eq!(
+            PersonalConfig::parse("").unwrap().takes_for(None),
+            Takes::Mine
+        );
+        let personal = PersonalConfig::parse(
+            "takes = \"all\"\n[repositories.\"github.com/Acme/API\"]\ntakes = \"mine\"\n",
+        )
+        .unwrap();
+        assert_eq!(personal.takes_for(Some("github.com/acme/api")), Takes::Mine);
+        assert_eq!(personal.takes_for(Some("github.com/acme/web")), Takes::All);
+        assert_eq!(personal.takes_for(None), Takes::All);
+        assert!(PersonalConfig::parse("takes = \"some\"\n").is_err());
     }
 
     /// OWL-75: a name allowed for one repository is not allowed for another.

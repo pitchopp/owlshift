@@ -19,7 +19,8 @@ use crate::service::{
     WatchRecord,
 };
 use crate::step::{
-    RunObligation, StepEnvelope, StepOutcome, StepOutside, TicketCarry, TicketRestart, TicketRun,
+    RunObligation, StepEnvelope, StepOutcome, StepOutside, TicketCarry, TicketNotMine,
+    TicketRestart, TicketRun,
 };
 use crate::usage::HarnessUsage;
 use crate::waits::StatusWaits;
@@ -48,6 +49,7 @@ pub fn all() -> Vec<(&'static str, Schema)> {
         ("step-outcome", schema::<StepOutcome>()),
         ("ticket-carry", schema::<TicketCarry>()),
         ("ticket-restart", schema::<TicketRestart>()),
+        ("ticket-not-mine", schema::<TicketNotMine>()),
         ("ticket-run", schema::<TicketRun>()),
         ("run-obligation", schema::<RunObligation>()),
         ("step-outside", schema::<StepOutside>()),

@@ -1943,7 +1943,7 @@ fn the_config_answer_gives_the_editor_every_key() {
         "repositories.\"github.com/acme/web\".allow_caches"
     );
     assert_eq!(repository["keys"][1]["value"], json!([".m2"]));
-    assert_eq!(editor["repository_keys"].as_array().unwrap().len(), 2);
+    assert_eq!(editor["repository_keys"].as_array().unwrap().len(), 3);
 
     std::fs::remove_file(&file).unwrap();
     let editor = ground.editor();

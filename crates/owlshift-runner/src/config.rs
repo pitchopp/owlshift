@@ -12,13 +12,18 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 use owlshift_adapters::forge::Repo;
+use owlshift_adapters::tracker::Tracker;
 use owlshift_contracts::ContractError;
 use owlshift_contracts::DelegationLevel;
-use owlshift_contracts::config::{PersonalConfig, Policy, ProjectConfig, check_requires, entries};
+use owlshift_contracts::config::{
+    PersonalConfig, Policy, ProjectConfig, TrackerKind, check_requires, entries,
+};
 use owlshift_core::floor::{FloorCategory, is_human_category};
 use owlshift_core::gate::{PassLimit, ResolverPolicy, normalized_categories};
 use semver::Version;
 
+use crate::operator::{self, Taking};
+use crate::refusal::Refusal;
 use crate::system::System;
 use crate::{on_demand, project};
 
@@ -186,6 +191,23 @@ impl Effective {
             FileState::Absent(_) | FileState::NotApplicable(_) => Some(Vec::new()),
             FileState::Unavailable(_) | FileState::Invalid { .. } => None,
         }
+    }
+
+    /// What the drain of the project of `repository`, on a tracker of
+    /// `kind` opened as `tracker`, takes (OWL-583, [`operator::resolve`]):
+    /// the personal `takes` for that repository, `mine` without a personal
+    /// file that reads.
+    pub fn taking(
+        &self,
+        tracker: &dyn Tracker,
+        kind: TrackerKind,
+        repository: &Repo,
+    ) -> Result<Taking, Refusal> {
+        let personal = match &self.personal {
+            FileState::Loaded { config, .. } => Some(config),
+            _ => None,
+        };
+        operator::resolve(tracker, kind, personal, &repository_key(repository))
     }
 
     /// Refuses, as invalid, a project that declares a cache folder the

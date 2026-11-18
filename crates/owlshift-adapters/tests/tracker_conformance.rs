@@ -399,6 +399,9 @@ fn check_admitted(list: &dyn Tracker, gestures: &dyn Tracker, case: &AdmittedCas
         let id = &one.ticket.id;
         assert!(listed[..n].iter().all(|l| l.ticket.id != *id), "{id} twice");
         assert_eq!(one.created_at.is_some(), case.times, "{id}: {one:?}");
+        // Every tracker gives an update time, the Markdown tracker its
+        // file's (OWL-583).
+        assert!(one.updated_at.is_some(), "{id}: {one:?}");
         for (m, blocker) in one.blockers.iter().enumerate() {
             let twice = one.blockers[..m].iter().any(|b| b.id == blocker.id);
             assert!(!twice, "{id}: blocker {} twice", blocker.id);

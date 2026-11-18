@@ -27,6 +27,7 @@ use std::path::Path;
 use jiff::Timestamp;
 use owlshift_contracts::event::{Event, EventKind};
 use owlshift_contracts::ids::TicketId;
+use owlshift_contracts::ready::{Outcome, ReadySnapshot};
 use owlshift_contracts::service::BY_UI;
 use owlshift_core::base::{Check, Entry, Verdict};
 use owlshift_core::state::Status;
@@ -136,6 +137,42 @@ impl Folded {
             EventKind::Dispatch | EventKind::RunStarted | EventKind::PrMerged
         ) {
             self.current.remove(ticket);
+        }
+    }
+}
+
+impl Folded {
+    /// Adds the waits the drain's ready snapshot `snapshot` alone tells: a
+    /// ticket of another person's (`not_mine`, OWL-583), which no event
+    /// tells, is current as of the snapshot's time unless an event told a
+    /// newer wait of it. Its words are the snapshot's. What `why` and
+    /// `status --waits` share.
+    pub fn absorb_ready(&mut self, snapshot: &ReadySnapshot) {
+        for ready in &snapshot.tickets {
+            let Outcome::Waits { wait } = &ready.drain else {
+                continue;
+            };
+            if wait.reason != "not_mine" {
+                continue;
+            }
+            let newer = self
+                .current
+                .get(&ready.ticket)
+                .is_some_and(|told| told.at > snapshot.at);
+            if newer {
+                continue;
+            }
+            let waiting = Waiting {
+                at: snapshot.at,
+                ticket: ready.ticket.clone(),
+                reason: wait.reason.clone(),
+                data: crate::events::data([("text", serde_json::json!(wait.text))]),
+            };
+            self.history
+                .entry(ready.ticket.clone())
+                .or_default()
+                .push(waiting.clone());
+            self.current.insert(ready.ticket.clone(), waiting);
         }
     }
 }
@@ -289,6 +326,20 @@ pub fn phrase(wait: &Waiting) -> String {
         }
         "duplicate" => "the column lists it twice; the first is taken".to_owned(),
         "not_admitted" => not_admitted(data.get("why").and_then(Value::as_str)),
+        // Another person's ticket (OWL-583): as the ready snapshot worded it
+        // (`text`), or by the handle or account of its gesture.
+        "not_mine" => match data.get("text").and_then(Value::as_str) {
+            Some(text) => text.to_owned(),
+            None => {
+                let who = data
+                    .get("name")
+                    .or_else(|| data.get("account"))
+                    .and_then(Value::as_str)
+                    .filter(|who| !who.is_empty())
+                    .unwrap_or("another person");
+                format!("admitted by {who}: their runner's")
+            }
+        },
         "excluded" => "it carries the exclusion label".to_owned(),
         "no_decider" => {
             "it has no decider: give it an assignee, or a `zone:` label whose zone has an owner"
@@ -519,7 +570,11 @@ pub fn gather(
     // flight, holds a run slot, or the latest ready snapshot lists it
     // (OWL-484, as `status --waits`, OWL-477).
     let in_flight = in_flight(dirs);
-    let listed = crate::ready::listed(dirs, now, "", &mut notes);
+    let snapshot = crate::ready::read(dirs);
+    let listed = crate::ready::listed_of(&snapshot, now, "", &mut notes);
+    if let Ok(Some(snapshot)) = &snapshot {
+        folded.absorb_ready(snapshot);
+    }
     let running = |ticket: &TicketId| {
         slots.iter().flat_map(|(held, _)| held).any(|slot| {
             slot.holder
@@ -977,6 +1032,55 @@ mod tests {
 
     fn waits(at: &str, ticket: &str, details: Data) -> Event {
         event(at, Some(ticket), EventKind::Decision, details)
+    }
+
+    /// OWL-583: another person's ticket, which no event tells, is current
+    /// from the ready snapshot, with its words, over an older told wait; a
+    /// wait told after the snapshot stays.
+    #[test]
+    fn a_not_mine_wait_comes_from_the_ready_snapshot() {
+        use owlshift_contracts::Priority;
+        use owlshift_contracts::ready::ReadyTicket;
+
+        let id = |id: &str| TicketId::new(id).unwrap();
+        let named = crate::ready::wait(
+            &id("OWL-2"),
+            "not_mine",
+            data([("account", json!("u-lea")), ("name", json!("lea"))]),
+        );
+        assert_eq!(named.text, "admitted by lea: their runner's");
+        let bare = crate::ready::wait(
+            &id("OWL-3"),
+            "not_mine",
+            data([("account", json!("u-lea"))]),
+        );
+        assert_eq!(bare.text, "admitted by u-lea: their runner's");
+        let ticket = |ticket: &str, wait: owlshift_contracts::waits::Wait| ReadyTicket {
+            ticket: id(ticket),
+            title: "t".to_owned(),
+            priority: Priority::Unset,
+            blockers: Vec::new(),
+            drain: Outcome::Waits { wait },
+        };
+        let snapshot = ReadySnapshot {
+            format: Default::default(),
+            at: "2026-11-18T10:00:00Z".parse().unwrap(),
+            interval_ms: 60_000,
+            tickets: vec![ticket("OWL-2", named), ticket("OWL-3", bare)],
+        };
+        let no_intake = data([("drain", json!("waits")), ("reason", json!("no_intake"))]);
+        let mut folded = fold(
+            &[
+                waits("2026-11-18T09:00:00Z", "OWL-2", no_intake.clone()),
+                waits("2026-11-18T10:30:00Z", "OWL-3", no_intake),
+            ],
+            "o/r",
+        );
+        folded.absorb_ready(&snapshot);
+        let current = &folded.current[&id("OWL-2")];
+        assert_eq!(current.reason, "not_mine");
+        assert_eq!(phrase(current), "admitted by lea: their runner's");
+        assert_eq!(folded.current[&id("OWL-3")].reason, "no_intake");
     }
 
     /// OWL-470: folding event by event, in batches, is folding the slice.

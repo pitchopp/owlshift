@@ -68,6 +68,8 @@ pub enum Stepped {
     Capped { open_prs: u32, max_open_prs: u32 },
     /// The drain's gesture was not an admitter's.
     NotAdmitted { account: String, reason: String },
+    /// The drain's gesture was `account`'s, not the operator's (OWL-583).
+    NotMine { account: String },
     /// The step ran, or was refused, with this outcome, as `continue`'s.
     Ran(Result<Delivered, Stop>),
 }
@@ -131,6 +133,7 @@ fn step(
             Some(Taken::NotAdmitted { account, reason }) => {
                 Stepped::NotAdmitted { account, reason }
             }
+            Some(Taken::NotMine { account }) => Stepped::NotMine { account },
             Some(Taken::Ran(outcome)) => Stepped::Ran(as_reported(ticket, outcome)),
         };
     }
@@ -159,6 +162,7 @@ fn step(
             Some(DispatchSeen::Taken(Taken::NotAdmitted { account, reason })) => {
                 Stepped::NotAdmitted { account, reason }
             }
+            Some(DispatchSeen::Taken(Taken::NotMine { account })) => Stepped::NotMine { account },
             Some(DispatchSeen::Taken(Taken::Ran(outcome))) => Stepped::Ran(outcome),
         },
         StepKind::Resume { shown, .. } => ran(on_demand.continue_shown(
@@ -332,6 +336,11 @@ pub fn end(stepped: &Stepped) -> StepEnd {
                 reason: reason.clone(),
             };
         }
+        Stepped::NotMine { account } => {
+            return StepEnd::NotMine {
+                account: account.clone(),
+            };
+        }
         Stepped::Ran(Ok(_)) => return StepEnd::Other,
         Stepped::Ran(Err(stop)) => stop,
     };
@@ -395,7 +404,10 @@ fn landed_kind(landed: Landed) -> LandedKind {
 /// Whether a step ran nothing: what it carried stands, and no hold is due.
 fn ran_nothing(stepped: &Stepped) -> bool {
     match stepped {
-        Stepped::Stale | Stepped::Capped { .. } | Stepped::NotAdmitted { .. } => true,
+        Stepped::Stale
+        | Stepped::Capped { .. }
+        | Stepped::NotAdmitted { .. }
+        | Stepped::NotMine { .. } => true,
         Stepped::Ran(Err(stop)) => stop.is_busy(),
         Stepped::Ran(Ok(_)) => false,
     }
@@ -824,6 +836,7 @@ mod tests {
             answer: None,
             generation: 2,
             kept: KeptFollowing::default(),
+            operator: None,
         }
     }
 
@@ -863,6 +876,9 @@ mod tests {
             Stepped::NotAdmitted {
                 account: "stranger".to_owned(),
                 reason: "not listed".to_owned(),
+            },
+            Stepped::NotMine {
+                account: "lea".to_owned(),
             },
             Stepped::Ran(Err(Stop::Busy(PathBuf::from("/p")))),
             stepped(),

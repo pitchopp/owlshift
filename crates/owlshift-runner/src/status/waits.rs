@@ -296,6 +296,10 @@ fn project(
     }
     let snapshot = ready::read(&dirs);
     let ready = ready::listed_of(&snapshot, now, &format!("{repository}: "), notes);
+    // Another person's tickets, which only the snapshot tells (OWL-583).
+    if let Ok(Some(snapshot)) = &snapshot {
+        folded.absorb_ready(snapshot);
+    }
     let quarantined = match dirs.quarantine() {
         Ok(marker) => marker.is_some(),
         Err(error) => {
