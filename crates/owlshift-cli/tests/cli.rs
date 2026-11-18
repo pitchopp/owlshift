@@ -1391,7 +1391,9 @@ fn init_detects_the_stack_and_never_runs_it() {
     let config = project_config(repo.path());
     assert_eq!(config.stack.gate.len(), 4, "{:?}", config.stack.gate);
     assert_eq!(config.stack.gate[3], "pnpm run test");
-    assert_eq!(config.stack.setup, ["pnpm install --frozen-lockfile"]);
+    assert_eq!(config.stack.setup, [owlshift_core::stack::PNPM_SETUP]);
+    assert_eq!(config.stack.caches, ["Library/pnpm"]);
+    assert!(out.contains("allow_caches = [\"Library/pnpm\"]"), "{out}");
     assert!(out.contains("Detected Cargo.toml"), "{out}");
     assert!(
         out.contains("Detected package.json (pnpm-lock.yaml)"),
