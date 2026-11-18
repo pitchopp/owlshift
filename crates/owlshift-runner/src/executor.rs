@@ -100,6 +100,7 @@ use owlshift_platform::sandbox;
 
 use crate::agent_env::{AgentEnv, CredentialFinding, RunPaths};
 use crate::artifact::{ArtifactContents, ArtifactError, MAX_ARTIFACT_BYTES, read_artifacts};
+use crate::cache_offer;
 use crate::ticket_run::{Marks, Siblings};
 
 pub use codex::CodexHarness;
@@ -434,7 +435,9 @@ pub enum Failure {
     Gate(Box<GateFailure>),
     /// The project's setup failed before a Build's harness (OWL-330), which
     /// was never spawned: on a worktree with no work of the Build's own, or
-    /// for a reason other than the command's own failure.
+    /// for a reason other than the command's own failure. Its reason ends
+    /// with the folders of the home the sandbox refused, when the command's
+    /// output names some (OWL-597).
     Setup(Box<GateFailure>),
 }
 
@@ -700,8 +703,16 @@ impl Executor {
                 &spec.run_dir.join(SETUP_LOG),
                 &|| before.check_files(spec.worktree),
             );
-            let stopped = after_check(&ran.report, check, |failure| {
-                (!ran.recoverable()).then_some(Failure::Setup(failure))
+            // A folder of the home the sandbox refused is named at the end of
+            // the reason, never in the brief (OWL-597): the next run's brief
+            // takes the setup's own report, not this copy.
+            let stopped = after_check(&ran.report, check, |mut failure| {
+                (!ran.recoverable()).then(|| {
+                    if let Some(note) = self.refused_note(&failure.output, &brief.project, spec) {
+                        failure.reason = format!("{}; {note}", failure.reason);
+                    }
+                    Failure::Setup(failure)
+                })
             });
             if let Some(outcome) = stopped {
                 log.finish();
@@ -738,10 +749,14 @@ impl Executor {
                 brief.setup_failure = Some(failure.clone());
                 worktree::write_run_files(spec.worktree, &brief)?;
                 fs::write(spec.run_dir.join("brief.json"), brief.render()).map_err(run_dir)?;
-                warnings.push(format!(
+                let mut warning = format!(
                     "the project setup failed before the harness: {}",
                     failure.command.as_deref().unwrap_or(&failure.reason)
-                ));
+                );
+                if let Some(note) = self.refused_note(&failure.output, &brief.project, spec) {
+                    warning.push_str(&format!("; {note}"));
+                }
+                warnings.push(warning);
             }
             setup = Some(ran.report);
         }
@@ -1154,6 +1169,21 @@ impl Executor {
             siblings: spec.siblings,
             marks,
         })
+    }
+
+    /// What a Build's setup failure adds to its reason when `output`, the
+    /// failing command's, names folders of the home the sandbox refused
+    /// (OWL-597, [`cache_offer::reason_note`]) for the repository `project`,
+    /// `<owner>/<name>`: Owlshift's own folders and the run's checkout,
+    /// worktree and run folder never named. `None` when it names none.
+    fn refused_note(&self, output: &str, project: &str, spec: &RunSpec<'_>) -> Option<String> {
+        let own: Vec<PathBuf> = cache_offer::own_folders()
+            .into_iter()
+            .chain([spec.main, spec.worktree, spec.run_dir].map(Path::to_owned))
+            .collect();
+        let context =
+            cache_offer::Context::for_agent(&self.agent, &own, &cache_offer::host_is_folder)?;
+        cache_offer::reason_note(&cache_offer::refused(output, &context), project)
     }
 }
 

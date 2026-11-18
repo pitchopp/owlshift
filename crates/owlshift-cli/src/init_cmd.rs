@@ -26,6 +26,7 @@ use owlshift_contracts::service::KeychainEntry;
 use owlshift_core::stack::{Detection, detect};
 use owlshift_platform::keychain::{Keychain, SERVICE, Secret};
 use owlshift_runner::config::{Effective, FileState};
+use owlshift_runner::events::printable;
 use owlshift_runner::forge::{AppAccess, GitHubApp};
 use owlshift_runner::github_sign_in::{self, Ask, GitHub, Outcome, SystemWait};
 use owlshift_runner::init::{
@@ -42,7 +43,7 @@ use owlshift_runner::tracker::{
     self, LINEAR_ACCOUNT, LINEAR_APP_ID_ACCOUNT, LINEAR_APP_SECRET_ACCOUNT, LINEAR_SECRETS, Setup,
     app_credentials,
 };
-use owlshift_runner::{on_demand, project};
+use owlshift_runner::{cache_offer, on_demand, project};
 
 use crate::fail;
 
@@ -151,8 +152,15 @@ pub fn run(args: &Args, config: &Effective) -> ExitCode {
                 .and_then(|text| ProjectConfig::parse(&text).ok())
                 .map(|kept| kept.stack.caches)
                 .unwrap_or_default();
-            if let Some(advice) = cache_advice(config, &folders, origin_repo(root).ok().as_ref()) {
+            let repo = origin_repo(root).ok();
+            if let Some(advice) = cache_advice(config, &folders, repo.as_ref()) {
                 eprintln!("{advice}");
+                if offer_allow(config, &folders, repo.as_ref()) {
+                    return fail(
+                        "this machine allows the project's caches now: run `owlshift init` again \
+                         to store the secrets",
+                    );
+                }
             }
             return fail(&format!(
                 "{} is invalid: {error}\nFix it, then run `owlshift init` again to store the \
@@ -559,6 +567,7 @@ fn said_written(path: &Path, options: &InitOptions, config: &Effective, repo: Op
         .collect();
     if let Some(advice) = cache_advice(config, &folders, repo) {
         println!("{advice}");
+        offer_allow(config, &folders, repo);
     }
     if options.tracker == TrackerKind::Markdown {
         report_example(path.parent().unwrap_or(path));
@@ -602,6 +611,40 @@ fn cache_advice(config: &Effective, folders: &[String], repo: Option<&Repo>) -> 
         shown.join(", "),
         allow_caches_advice(repo, &missing, &personal)
     ))
+}
+
+/// At a terminal, offers to add to the personal file the lines
+/// [`cache_advice`] printed, for the GitHub repository `repo` only, never
+/// the machine-wide ones (OWL-597): whether it wrote them. Off a terminal,
+/// or without a personal file that reads, it asks nothing.
+fn offer_allow(config: &Effective, folders: &[String], repo: Option<&Repo>) -> bool {
+    let Some(repo) = repo else {
+        return false;
+    };
+    let path = match &config.personal {
+        FileState::Loaded { path, .. } | FileState::Absent(path) => path,
+        _ => return false,
+    };
+    let allowed = config.allowed_caches(Some(repo));
+    let missing = caches_to_allow(folders.iter().map(String::as_str), allowed.as_deref());
+    if missing.is_empty()
+        || crate::confirm(&format!("Add these lines to {}? [y/N] ", path.display())) != Some(true)
+    {
+        return false;
+    }
+    match cache_offer::allow(path, repo, &missing) {
+        Ok(_) => {
+            println!(
+                "Added to {}: the repository's allow_caches.",
+                path.display()
+            );
+            true
+        }
+        Err(error) => {
+            eprintln!("owlshift: nothing written: {}", printable(&error));
+            false
+        }
+    }
 }
 
 /// Lists in the install manifest of the data directory `data` the keychain

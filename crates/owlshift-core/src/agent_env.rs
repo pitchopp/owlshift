@@ -510,6 +510,42 @@ pub fn check_home_folders(paths: &[&str]) -> Result<(), String> {
     Ok(())
 }
 
+/// How a folder of the home stands to the credential paths of
+/// [`HIDDEN_IN_HOME`] (OWL-597).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CredentialRelation {
+    /// It is a credential path or lies in one: no folder under it opens
+    /// either.
+    Within,
+    /// It holds one: a folder under it may open.
+    Holds,
+}
+
+/// How `path`, from the home, `/` between its parts, stands to the
+/// credential paths of [`HIDDEN_IN_HOME`], compared in any letter case as
+/// [`check_home_folders`] compares them; `None` when it touches none.
+/// [`CredentialRelation::Within`] wins when it both lies in one and holds
+/// another.
+pub fn credential_relation(path: &str) -> Option<CredentialRelation> {
+    let parts = path.split('/').count();
+    let mut relation = None;
+    for hidden in HIDDEN_IN_HOME.iter().filter(|hidden| touches(path, hidden)) {
+        if parts >= hidden.split('/').count() {
+            return Some(CredentialRelation::Within);
+        }
+        relation = Some(CredentialRelation::Holds);
+    }
+    relation
+}
+
+/// Whether `path` and `hidden`, both from the home, share every part of the
+/// shorter, in any letter case.
+fn touches(path: &str, hidden: &str) -> bool {
+    path.split('/')
+        .zip(hidden.split('/'))
+        .all(|(a, b)| a.eq_ignore_ascii_case(b))
+}
+
 /// The entry of [`HIDDEN_IN_HOME`] that `path`, from the home, is, lies in or
 /// holds, in any letter case; `None` when it touches none.
 fn touched_credential(path: &str) -> Option<&'static str> {
