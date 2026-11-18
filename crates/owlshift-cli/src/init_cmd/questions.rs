@@ -8,6 +8,8 @@
 
 use std::io;
 
+use owlshift_adapters::tracker::linear::TeamList;
+#[cfg(test)]
 use owlshift_adapters::tracker::linear::TeamName;
 use owlshift_contracts::config::TrackerKind;
 use owlshift_core::stack::Detection;
@@ -109,48 +111,73 @@ pub(super) fn team_key(ask: &mut Ask<'_>, say: &mut dyn FnMut(&str)) -> Result<S
     }
 }
 
-/// The key of the team picked among the workspace's `teams`, by its number
-/// in the list or its key; a workspace of one team takes it, and one with
-/// none is refused.
+/// The key of the team picked among the workspace's teams `list`, by its
+/// number in the list or its key; a workspace of one team takes it, and one
+/// with none is refused. When the list holds only the first page, a key not
+/// listed is taken too, and the tracker check that follows reads that team.
 pub(super) fn team(
-    teams: &[TeamName],
+    list: &TeamList,
     ask: &mut Ask<'_>,
     say: &mut dyn FnMut(&str),
 ) -> Result<String, String> {
-    match teams {
-        [] => Err(
-            "the Linear workspace of this key has no team: create one in Linear, then run \
-             `owlshift init` again"
-                .to_owned(),
-        ),
-        [one] => {
+    let teams = &list.teams;
+    match (teams.as_slice(), list.more) {
+        ([], false) => {
+            return Err(
+                "the Linear workspace of this key has no team: create one in Linear, then run \
+                 `owlshift init` again"
+                    .to_owned(),
+            );
+        }
+        ([one], false) => {
             say(&format!(
                 "The Linear workspace has one team, {} ({}): it is the project's.",
                 one.key, one.name
             ));
-            Ok(one.key.clone())
+            return Ok(one.key.clone());
         }
-        _ => {
-            say("The Linear workspace's teams:");
-            for (n, team) in teams.iter().enumerate() {
-                say(&format!("  {}. {}  {}", n + 1, team.key, team.name));
-            }
-            loop {
-                let answer = answer(ask, "Team (number or key): ").ok_or("no team was chosen")?;
-                if let Ok(n) = answer.parse::<usize>()
-                    && let Some(team) = n.checked_sub(1).and_then(|i| teams.get(i))
-                {
-                    return Ok(team.key.clone());
-                }
-                if let Some(team) = teams.iter().find(|t| t.key.eq_ignore_ascii_case(&answer)) {
-                    return Ok(team.key.clone());
-                }
-                say(&format!(
-                    "Answer a number from 1 to {}, or one of the keys listed.",
-                    teams.len()
-                ));
-            }
+        _ => {}
+    }
+    if list.more {
+        say(&format!(
+            "The Linear workspace has more teams than these first {}: type the key of another \
+             to take it.",
+            teams.len()
+        ));
+    } else {
+        say("The Linear workspace's teams:");
+    }
+    for (n, team) in teams.iter().enumerate() {
+        say(&format!("  {}. {}  {}", n + 1, team.key, team.name));
+    }
+    loop {
+        let answer = answer(ask, "Team (number or key): ").ok_or("no team was chosen")?;
+        let number = answer.parse::<usize>().ok();
+        if let Some(team) = number
+            .and_then(|n| n.checked_sub(1))
+            .and_then(|i| teams.get(i))
+        {
+            return Ok(team.key.clone());
         }
+        if let Some(team) = teams.iter().find(|t| t.key.eq_ignore_ascii_case(&answer)) {
+            return Ok(team.key.clone());
+        }
+        if list.more
+            && number.is_none()
+            && !answer.is_empty()
+            && !answer.contains(char::is_whitespace)
+        {
+            return Ok(answer.to_ascii_uppercase());
+        }
+        say(&format!(
+            "Answer a number from 1 to {}, or {}.",
+            teams.len(),
+            if list.more {
+                "a team key"
+            } else {
+                "one of the keys listed"
+            }
+        ));
     }
 }
 
@@ -178,13 +205,17 @@ mod tests {
         }
     }
 
-    fn teams(keys: &[&str]) -> Vec<TeamName> {
-        keys.iter()
-            .map(|key| TeamName {
-                key: (*key).to_owned(),
-                name: format!("Team {key}"),
-            })
-            .collect()
+    fn teams(keys: &[&str], more: bool) -> TeamList {
+        TeamList {
+            teams: keys
+                .iter()
+                .map(|key| TeamName {
+                    key: (*key).to_owned(),
+                    name: format!("Team {key}"),
+                })
+                .collect(),
+            more,
+        }
     }
 
     /// Enter keeps Linear; a number or a name in any case picks; anything
@@ -209,22 +240,29 @@ mod tests {
     }
 
     /// Several teams: picked by number or key, a wrong answer asked again;
-    /// one: taken without a question; none: refused with a reason.
+    /// one: taken without a question; none: refused with a reason. A
+    /// partial list says so and takes a key it does not show.
     #[test]
     fn the_team_is_picked_taken_when_alone_and_refused_when_none() {
-        let several = teams(&["OWL", "SBX"]);
-        let cases: [(&[TeamName], Script<'_>, Result<&str, &str>); 5] = [
+        let several = teams(&["OWL", "SBX"], false);
+        let partial = teams(&["OWL"], true);
+        let cases: [(&TeamList, Script<'_>, Result<&str, &str>); 7] = [
             (&several, &[Some("2")], Ok("SBX")),
-            (&several, &[Some("3"), Some("owl")], Ok("OWL")),
+            (&several, &[Some("3"), Some("eng"), Some("owl")], Ok("OWL")),
             (&several, &[None], Err("no team was chosen")),
-            (&several[..1], &[], Ok("OWL")),
-            (&[], &[], Err("has no team")),
+            (&teams(&["OWL"], false), &[], Ok("OWL")),
+            (&teams(&[], false), &[], Err("has no team")),
+            (&partial, &[Some("7"), Some("eng")], Ok("ENG")),
+            (&partial, &[Some("1")], Ok("OWL")),
         ];
-        for (teams, answers, expected) in cases {
+        for (list, answers, expected) in cases {
             let mut said = Vec::new();
-            let got = team(teams, &mut scripted(answers), &mut |l| {
+            let got = team(list, &mut scripted(answers), &mut |l| {
                 said.push(l.to_owned())
             });
+            if list.more {
+                assert!(said[0].contains("more teams than these"), "{said:?}");
+            }
             match (got, expected) {
                 (Ok(key), Ok(want)) => assert_eq!(key, want),
                 (Err(error), Err(want)) => assert!(error.contains(want), "{error}"),

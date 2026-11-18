@@ -7,7 +7,7 @@ use std::path::Path;
 
 use owlshift_adapters::forge::Repo;
 use owlshift_adapters::tracker::linear::{
-    AdmissionFacts, ApiKey, AppUser, LinearTracker, StateMismatch, TeamName, find_state,
+    AdmissionFacts, ApiKey, AppUser, LinearTracker, StateMismatch, TeamList, find_state,
 };
 use owlshift_adapters::tracker::{Capability, ErrorKind, PROPOSED_LABEL, Tracker};
 use owlshift_contracts::config::{self, Admit, PersonalConfig, ProjectConfig};
@@ -249,10 +249,7 @@ team = {}
 /// The teams of the workspace of the Linear key `init` stored for the
 /// project of `repo`, its own or the shared one, sorted by key: what `init`
 /// offers to pick from when no `--team` was given (OWL-596).
-pub fn workspace_teams(
-    keychain: &Keychain,
-    repo: Result<&Repo, &str>,
-) -> Result<Vec<TeamName>, String> {
+pub fn workspace_teams(keychain: &Keychain, repo: Result<&Repo, &str>) -> Result<TeamList, String> {
     let key = stored_key(keychain, repo)?;
     LinearTracker::new(ApiKey::new(key.expose()))
         .teams()

@@ -526,14 +526,25 @@ impl LinearTracker {
 
     /// The teams of the key's workspace, by key and name, sorted by key:
     /// what `owlshift init` offers to pick from (OWL-596). Read only. One
-    /// page of at most [`MAX_PAGE`]: a workspace with more names its team
-    /// with `--team`.
-    pub fn teams(&self) -> Result<Vec<TeamName>, Error> {
+    /// page of at most [`MAX_PAGE`], which says whether more teams exist.
+    pub fn teams(&self) -> Result<TeamList, Error> {
         let data: TeamListData = self.call(TEAMS_QUERY, json!({}))?;
         let mut teams = data.teams.nodes;
         teams.sort_by(|a, b| a.key.cmp(&b.key));
-        Ok(teams)
+        Ok(TeamList {
+            teams,
+            more: data.teams.page_info.has_next_page,
+        })
     }
+}
+
+/// The first page of the workspace's teams, as [`LinearTracker::teams`]
+/// reads it.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct TeamList {
+    pub teams: Vec<TeamName>,
+    /// Whether the workspace has more teams than the page lists.
+    pub more: bool,
 }
 
 /// A team of the workspace, as [`LinearTracker::teams`] lists it.
@@ -1451,7 +1462,8 @@ const TEAM_STATES_QUERY: &str = "query TeamStates($key: String!) { \
     nodes { key states(first: 50) { nodes { name } pageInfo { hasNextPage } } } } }";
 
 /// What [`LinearTracker::teams`] asks (OWL-596).
-const TEAMS_QUERY: &str = "query Teams { teams(first: 50) { nodes { key name } } }";
+const TEAMS_QUERY: &str =
+    "query Teams { teams(first: 50) { nodes { key name } pageInfo { hasNextPage } } }";
 
 const STAGE_MUTATION: &str = "mutation SetStage($id: String!, $stateId: String!) { \
     issueUpdate(id: $id, input: { stateId: $stateId }) { success issue { state { id name } } } }";
@@ -2157,7 +2169,7 @@ struct TeamsData {
 
 #[derive(Deserialize)]
 struct TeamListData {
-    teams: Teams<TeamName>,
+    teams: Connection<TeamName>,
 }
 
 #[derive(Deserialize)]
@@ -3358,17 +3370,20 @@ mod tests {
     }
 
     /// OWL-596: the workspace's teams, in the shape checked live on
-    /// 2026-11-18, come back sorted by key.
+    /// 2026-11-18, come back sorted by key, saying whether the page holds
+    /// them all.
     #[test]
     fn the_workspace_teams_are_listed_by_key() {
         let body = r#"{"data":{"teams":{"nodes":[{"key":"SBX","name":"Sandbox"},
-            {"key":"OWL","name":"Owlshift"}]}}}"#;
-        let teams = tracker(vec![body]).teams().unwrap();
-        let keys: Vec<(&str, &str)> = teams
+            {"key":"OWL","name":"Owlshift"}],"pageInfo":{"hasNextPage":true}}}}"#;
+        let list = tracker(vec![body]).teams().unwrap();
+        let keys: Vec<(&str, &str)> = list
+            .teams
             .iter()
             .map(|t| (t.key.as_str(), t.name.as_str()))
             .collect();
         assert_eq!(keys, [("OWL", "Owlshift"), ("SBX", "Sandbox")]);
+        assert!(list.more);
     }
 
     /// OWL-155, checked live on 2026-10-14: the team's inbox as `propose`
