@@ -1,7 +1,7 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "Owlshift watch",
-  "description": "A watch that runs on a project (OWL-462): `watches/<pid>.json` in the\nproject's folder, written once the watch holds `watches/<pid>.lock` and\nremoved at its end, so `owlshift doctor` tells which build each watch\nruns. A record whose lock is free is a dead watch's.",
+  "description": "A watch that runs on a project (OWL-462): `watches/<pid>.json` in the\nproject's folder, written once the watch holds `watches/<pid>.lock` and\nremoved at its end, so `owlshift doctor` tells which build each watch\nruns. A record whose lock is free is a dead watch's. Format 2 adds the\nwatch's operator (OWL-584), which the daemon's digest reads; format 1 is\nstill read, as an operator unknown.",
   "type": "object",
   "properties": {
     "binary": {
@@ -15,7 +15,14 @@
     "format": {
       "description": "The format version of this document.",
       "type": "integer",
-      "const": 1
+      "const": 2
+    },
+    "operator": {
+      "description": "Its operator's tracker account, read as it started (format 2,\nOWL-584): the tracker key's person, or `identity.tracker` on the\nMarkdown tracker. Absent when it could not be told.",
+      "type": [
+        "string",
+        "null"
+      ]
     },
     "pid": {
       "description": "Its process id.",

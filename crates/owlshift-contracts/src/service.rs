@@ -90,23 +90,7 @@ impl DaemonRecord {
     /// A format-1 record read as the current format, or `None` for any
     /// other: format 1 is format 2 without `build`, refused in it.
     fn from_format_1(input: &str) -> Option<Result<Self, ContractError>> {
-        let mut document: serde_json::Value = serde_json::from_str(input).ok()?;
-        if document.get("format").and_then(serde_json::Value::as_u64) != Some(1) {
-            return None;
-        }
-        if document.get("build").is_some() {
-            return Some(Err(ContractError::invalid(
-                Self::CONTRACT,
-                "format 1 records no build",
-            )));
-        }
-        document["format"] = DAEMON_FORMAT.into();
-        Some(
-            serde_json::from_value(document).map_err(|source| ContractError::Json {
-                contract: Self::CONTRACT,
-                source,
-            }),
-        )
+        format::parse_json_older(Self::CONTRACT, 1, DAEMON_FORMAT, "build", input)
     }
 
     pub fn render(&self) -> String {
@@ -218,7 +202,9 @@ fn full_commit(text: &str) -> bool {
 /// A watch that runs on a project (OWL-462): `watches/<pid>.json` in the
 /// project's folder, written once the watch holds `watches/<pid>.lock` and
 /// removed at its end, so `owlshift doctor` tells which build each watch
-/// runs. A record whose lock is free is a dead watch's.
+/// runs. A record whose lock is free is a dead watch's. Format 2 adds the
+/// watch's operator (OWL-584), which the daemon's digest reads; format 1 is
+/// still read, as an operator unknown.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 #[schemars(title = "Owlshift watch")]
@@ -239,13 +225,24 @@ pub struct WatchRecord {
     pub version: String,
     /// The build of its binary.
     pub build: BuildIdentity,
+    /// Its operator's tracker account, read as it started (format 2,
+    /// OWL-584): the tracker key's person, or `identity.tracker` on the
+    /// Markdown tracker. Absent when it could not be told.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub operator: Option<String>,
 }
 
 impl WatchRecord {
     const CONTRACT: &str = "watch record";
 
+    /// Parses a record; a format-1 one is read as the current format with
+    /// no operator.
     pub fn parse(input: &str) -> Result<Self, ContractError> {
-        let record: Self = format::parse_json(Self::CONTRACT, WATCH_FORMAT, input)?;
+        let record: Self =
+            match format::parse_json_older(Self::CONTRACT, 1, WATCH_FORMAT, "operator", input) {
+                Some(read) => read?,
+                None => format::parse_json(Self::CONTRACT, WATCH_FORMAT, input)?,
+            };
         record.build.validate(Self::CONTRACT)?;
         Ok(record)
     }
@@ -785,8 +782,24 @@ mod tests {
             binary: "/opt/homebrew/bin/owlshift".to_owned(),
             version: "0.4.0".to_owned(),
             build: build("", false, "2026-10-25T07:00:00Z"),
+            operator: Some("u-1".to_owned()),
         };
-        assert_eq!(WatchRecord::parse(&watch.render()).unwrap(), watch);
+        let text = watch.render();
+        assert_eq!(WatchRecord::parse(&text).unwrap(), watch);
+        // OWL-584: a format-1 record, written before the operator, reads
+        // with none; one that names an operator is refused; a newer one is
+        // of a newer Owlshift's.
+        let older = WatchRecord {
+            operator: None,
+            ..watch.clone()
+        };
+        let format_1 = older.render().replace("\"format\": 2", "\"format\": 1");
+        assert_eq!(WatchRecord::parse(&format_1).unwrap(), older);
+        assert!(WatchRecord::parse(&text.replace("\"format\": 2", "\"format\": 1")).is_err());
+        assert!(matches!(
+            WatchRecord::parse(&text.replace("\"format\": 2", "\"format\": 3")),
+            Err(ContractError::NewerFormat { .. })
+        ));
     }
 
     /// What the build script sets reads back; a commit that is no commit id

@@ -6,17 +6,19 @@
 
 use std::num::NonZeroU32;
 
+use owlshift_contracts::format::Format;
 use owlshift_contracts::ids::QuestionId;
 use owlshift_contracts::ready::Outcome;
 use owlshift_contracts::refs::{Ask, AskKind};
 use owlshift_contracts::result::Question;
+use owlshift_contracts::service::{BuildIdentity, WatchRecord};
 use owlshift_contracts::waits::{RefStatus, StatusWaits};
 use owlshift_runner::served::Registry;
 use owlshift_runner::slots::{Holder, MachineSlots};
 use owlshift_runner::status::{gather_files, waits};
 use owlshift_runner::ui::eventtail::EventTail;
 use owlshift_runner::ui::header;
-use owlshift_runner::ui::overview::{self, Overview};
+use owlshift_runner::ui::overview::{self, Deciders, Overview};
 use owlshift_runner::voice::Voice;
 
 use super::drain_scenarios::ready_now;
@@ -67,7 +69,13 @@ impl Watched {
     fn build(&mut self, bench: &Bench) -> Overview {
         let (read_before, size_before) = (self.tail.bytes_read(), self.tail.offset());
         let size = log_size(bench);
-        let built = overview::gather(&bench.data, &mut self.tail, 2, bench.clock.get());
+        let built = overview::gather(
+            &bench.data,
+            &mut self.tail,
+            2,
+            bench.clock.get(),
+            &Deciders::NONE,
+        );
         assert_eq!(self.tail.restarts(), 0, "the tail started over");
         assert_eq!(
             self.tail.bytes_read() - read_before,
@@ -210,7 +218,8 @@ fn header_counts(bench: &Bench) -> (usize, usize, usize) {
 fn for_you_counts(built: &Overview) -> (usize, usize, usize) {
     let you = &built.for_you;
     (
-        you.questions.len() + you.plans.len(),
+        // The header counts the asks other people decide too (OWL-584).
+        you.questions.len() + you.plans.len() + you.others.len(),
         you.reviews.len(),
         you.parked.len(),
     )
@@ -634,7 +643,7 @@ fn keep_a_bench_for_the_browsers() {
 
     // The end state, as the page will show it.
     let mut tail = EventTail::new(&bench.data);
-    let built = overview::gather(&bench.data, &mut tail, 2, Timestamp::now());
+    let built = overview::gather(&bench.data, &mut tail, 2, Timestamp::now(), &Deciders::NONE);
     let cards = columns(&built);
     let column = |ticket: &str| {
         cards
@@ -686,4 +695,157 @@ fn keep_a_bench_for_the_browsers() {
     let kept = bench.tmp.keep();
     assert!(data.starts_with(&kept));
     fs::write(keep.join("data-path"), data.to_str().unwrap()).unwrap();
+}
+
+// ---------------------------------------------------------------------------
+// OWL-584: the operator is told only of what is theirs to decide.
+// ---------------------------------------------------------------------------
+
+/// The operator of this machine in the scenario below.
+const OPERATOR: &str = "maintainer";
+
+/// The lines `owlshift do`'s report shows for `outcome` on the bench's
+/// recording notifier, this machine's operator being [`OPERATOR`].
+fn notified_of(bench: &Bench, outcome: &Result<Delivered, Stop>) -> Vec<String> {
+    let notifier = Notified::default();
+    let tracker = MarkdownTracker::new(&bench.remote.checkout);
+    let mut out = Vec::new();
+    let mut sink = EventSink::new(REPO, EventLog::in_dir(&bench.data), &mut out);
+    owlshift_runner::notify::notify_blocker(
+        Some(&notifier),
+        &tracker,
+        &ticket(),
+        outcome,
+        &|| Some(OPERATOR.to_owned()),
+        &mut sink,
+    );
+    notifier.0.into_inner()
+}
+
+/// The overview of the bench's served project, [`OPERATOR`] its operator.
+fn overview_of(bench: &Bench) -> Overview {
+    let operator = |_: &str| Some(OPERATOR.to_owned());
+    let deciders = Deciders {
+        operator: &operator,
+        name: &|_, _| None,
+    };
+    overview::gather(
+        &bench.data,
+        &mut EventTail::new(&bench.data),
+        2,
+        bench.clock.get(),
+        &deciders,
+    )
+}
+
+/// OWL-584's acceptance: a question whose decider is another person, lea,
+/// shows no notification on the bench's notifier, is listed under her name
+/// after the operator's asks in the UI's snapshot, and is left out of the
+/// digest's count while a watch that told the operator runs; a question the
+/// operator decides notifies as before and is theirs; a park notifies
+/// whoever decides the ticket.
+#[test]
+fn an_ask_another_person_decides_is_theirs_and_not_the_operators() {
+    // lea, the ticket's assignee, decides its round.
+    let bench = Bench::with("maintainer", "assignee = \"lea\"\n", "");
+    registered(&bench);
+    let (asked, printed) = bench.run(vec![bench.reply(None, Some(ROUND_1))], None);
+    assert!(
+        matches!(&asked, Err(Stop::NeedsInput { decider: Some(decider), .. }) if decider.as_str() == "lea"),
+        "{asked:?}\n{printed}"
+    );
+    assert_eq!(notified_of(&bench, &asked), Vec::<String>::new());
+
+    let built = overview_of(&bench);
+    assert!(built.for_you.questions.is_empty(), "{:#?}", built.for_you);
+    assert_eq!(built.for_you.others.len(), 1, "{:#?}", built.for_you);
+    let json = built.json();
+    let other = &json["for_you"]["others"][0];
+    assert_eq!(other["ticket"], "DEMO-1");
+    assert_eq!(other["kind"], "question");
+    assert_eq!(other["decider"]["account"], "lea");
+    assert_eq!(
+        other["decider"]["name"], "lea",
+        "the account stands for an unread name"
+    );
+    // The header still counts every ask waiting on a person.
+    assert_eq!(for_you_counts(&built), header_counts(&bench));
+
+    // The daily digest counts the operator's own: lea's question is left out
+    // while a watch that told its operator runs, and counted with none.
+    let repo = Repo::parse(REPO).unwrap();
+    let dirs = bench.dirs();
+    let digest = || {
+        let now = bench.clock.get();
+        let projects = [(&repo, &dirs)];
+        owlshift_runner::daemon::digest::gather(
+            &bench.data,
+            &projects,
+            &[],
+            now,
+            now,
+            &mut Vec::new(),
+        )
+        .waiting
+    };
+    assert_eq!(
+        digest().len(),
+        1,
+        "no watch tells the operator: counted, as before"
+    );
+    let watch = WatchRecord {
+        format: Format,
+        pid: std::process::id(),
+        project: REPO.to_owned(),
+        served: true,
+        since: bench.clock.get(),
+        binary: "/bin/owlshift".to_owned(),
+        version: "0.0.0".to_owned(),
+        build: BuildIdentity::from_build("", "0", "0", ""),
+        operator: Some(OPERATOR.to_owned()),
+    };
+    let running = owlshift_runner::watch::presence::record(&dirs, &watch)
+        .unwrap()
+        .expect("recorded");
+    assert!(digest().is_empty(), "lea's question is not the operator's");
+    drop(running);
+
+    // A park notifies whoever decides the ticket: here after refused
+    // results, as OWL-183's scenario parks it.
+    let parked_bench = Bench::with("maintainer", "assignee = \"lea\"\n", "");
+    let misnumbered = NAMING.replace(r#""id":"Q1""#, r#""id":"Q2""#);
+    let (parked, printed) = parked_bench.run(
+        vec![
+            parked_bench.reply(None, None),
+            parked_bench.reply(None, Some(&misnumbered)),
+            parked_bench.reply(None, Some(&misnumbered)),
+        ],
+        None,
+    );
+    assert!(
+        matches!(&parked, Err(Stop::Parked { .. })),
+        "{parked:?}\n{printed}"
+    );
+    assert_eq!(
+        notified_of(&parked_bench, &parked),
+        ["DEMO-1 is parked: a person must look"]
+    );
+
+    // The operator decides: notified as before, and the ask is theirs.
+    let mine = Bench::new(true);
+    registered(&mine);
+    let (asked, printed) = mine.run(vec![mine.reply(None, Some(ROUND_1))], None);
+    assert!(
+        matches!(&asked, Err(Stop::NeedsInput { .. })),
+        "{asked:?}\n{printed}"
+    );
+    let lines = notified_of(&mine, &asked);
+    assert_eq!(lines.len(), 1, "{lines:?}");
+    assert!(
+        lines[0].starts_with("DEMO-1: questions wait for an answer on the ticket"),
+        "{lines:?}"
+    );
+    let built = overview_of(&mine);
+    assert_eq!(built.for_you.questions.len(), 1, "{:#?}", built.for_you);
+    assert!(built.for_you.others.is_empty());
 }

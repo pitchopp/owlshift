@@ -653,9 +653,9 @@ fn in_flight(dirs: &ProjectDirs) -> Option<BTreeSet<TicketId>> {
 /// while its checkout does not exist. What cannot be read is said in
 /// `notes`. Shared with the daily digest (OWL-440).
 pub(crate) fn statuses(dirs: &ProjectDirs, notes: &mut Vec<String>) -> Vec<(TicketId, Status)> {
-    standings(dirs, notes)
+    read_standings(dirs, notes)
         .into_iter()
-        .map(|(ticket, status, _)| (ticket, status))
+        .map(|standing| (standing.ticket, standing.status))
         .collect()
 }
 
@@ -666,6 +666,28 @@ pub(crate) fn standings(
     dirs: &ProjectDirs,
     notes: &mut Vec<String>,
 ) -> Vec<(TicketId, Status, bool)> {
+    read_standings(dirs, notes)
+        .into_iter()
+        .map(|standing| (standing.ticket, standing.status, standing.followed))
+        .collect()
+}
+
+/// A ticket ref's standing, as [`read_standings`] reads it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct RefStanding {
+    pub ticket: TicketId,
+    pub status: Status,
+    /// Whether watch follows its pull request.
+    pub followed: bool,
+    /// The tracker account of the decider of the ask it waits on
+    /// ([`ticket_ref::TicketRecord::open_ask`]), which the daily digest
+    /// tells the operator's own by (OWL-584).
+    pub decider: Option<String>,
+}
+
+/// Each ticket ref's [`RefStanding`] in the project of `dirs`, as [`statuses`]
+/// reads them.
+pub(crate) fn read_standings(dirs: &ProjectDirs, notes: &mut Vec<String>) -> Vec<RefStanding> {
     let mut standings = Vec::new();
     if !dirs.checkout().exists() {
         return standings;
@@ -683,8 +705,15 @@ pub(crate) fn standings(
                 match ticket_ref::state_of(&stored) {
                     RefState::Read(Some(state)) | RefState::Unadmitted(state) => {
                         let status = state.status();
-                        let followed = crate::watch::followed(status, &stored);
-                        standings.push((ticket, status, followed));
+                        standings.push(RefStanding {
+                            followed: crate::watch::followed(status, &stored),
+                            decider: stored
+                                .record
+                                .open_ask()
+                                .map(|ask| ask.decider.account.clone()),
+                            ticket,
+                            status,
+                        });
                     }
                     RefState::Read(None) => {}
                     RefState::Unread(why) => {

@@ -30,6 +30,7 @@ use owlshift_contracts::event::EventKind;
 use owlshift_contracts::format::{ContractError, Format};
 use owlshift_contracts::ids::TicketId;
 use owlshift_contracts::service::{BY_DAEMON, DigestRecord};
+use owlshift_core::floor::same_account;
 use owlshift_core::state::Status;
 use owlshift_core::vocab::Harness;
 use serde_json::{Value, json};
@@ -40,6 +41,7 @@ use crate::config::FileState;
 use crate::events::{EventLog, EventSink, data as event_data, printable};
 use crate::project::ProjectDirs;
 use crate::usage::{self as machine_usage, UsageStore};
+use crate::watch::presence;
 use crate::why::{self, Limit};
 use crate::{notify, step};
 
@@ -118,7 +120,8 @@ pub struct Summary {
     /// The tickets whose pull request a delivery opened or pushed since the
     /// latest digest.
     pub delivered: BTreeSet<TicketId>,
-    /// The tickets that wait for a person's answer.
+    /// The tickets that wait for the operator's answer: those whose open ask
+    /// another person decides are left out (OWL-584).
     pub waiting: BTreeSet<TicketId>,
     pub parked: BTreeSet<TicketId>,
     /// Whether `<data>/service/pause` stands.
@@ -170,10 +173,21 @@ pub fn gather(
         Err(error) => notes.push(format!("the event log cannot be read: {error}")),
     }
     for (repo, dirs) in projects {
-        for (ticket, status) in why::statuses(dirs, &mut notes) {
-            match status {
+        // The operator its watch read as it started (OWL-584): a ticket
+        // whose open ask another person decides is not counted; with no
+        // operator told, every waiting ticket is, as before P10.
+        let operator = presence::operator(dirs);
+        for standing in why::read_standings(dirs, &mut notes) {
+            let ticket = standing.ticket;
+            match standing.status {
                 Status::NeedsInput { .. } => {
-                    summary.waiting.insert(ticket);
+                    let theirs = matches!(
+                        (&operator, &standing.decider),
+                        (Some(operator), Some(decider)) if !same_account(operator, decider)
+                    );
+                    if !theirs {
+                        summary.waiting.insert(ticket);
+                    }
                 }
                 Status::Parked { .. } => {
                     summary.parked.insert(ticket);

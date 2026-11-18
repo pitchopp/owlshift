@@ -15,6 +15,7 @@
 //! on the project file kept from its default branch (OWL-434,
 //! `owlshift_runner::served`), never on a working tree's.
 
+use std::cell::OnceCell;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
@@ -43,7 +44,7 @@ use owlshift_runner::executor::codex::user_login;
 use owlshift_runner::executor::harness::{CLAUDE_AGENT_ACCOUNT, ClaudeHarness};
 use owlshift_runner::notify::{self, DesktopNotifier};
 use owlshift_runner::on_demand::{self, CodexReviewer, Delivered, OnDemand, Stop};
-use owlshift_runner::operator::Taking;
+use owlshift_runner::operator::{self, Taking};
 use owlshift_runner::project::{self, ProjectDirs};
 use owlshift_runner::refusal::Refusal;
 use owlshift_runner::roles::{
@@ -403,6 +404,34 @@ fn run_with(
     if mode == Mode::Drain && !tracker.capabilities().contains(&Capability::ListAdmitted) {
         return Err("`owlshift watch --drain` needs a tracker that lists admitted tickets".into());
     }
+    // This machine's operator, told only of the asks they decide (OWL-584):
+    // the drain's under `takes = "mine"`; a watch reads it as it starts,
+    // for its record, which the daemon's digest reads; any other command
+    // at the first ask it would notify. One that cannot be told is a
+    // warning, never a refusal: every ask then notifies, as before P10.
+    let operator_cell: OnceCell<Option<String>> = OnceCell::new();
+    let personal_file = match &config.personal {
+        FileState::Loaded { config, .. } => Some(config),
+        _ => None,
+    };
+    let read_operator =
+        || match operator::known(tracker.as_ref(), project.tracker.kind, personal_file) {
+            Ok(operator) => operator,
+            Err(why) => {
+                let _ = writeln!(
+                    io::stderr(),
+                    "owlshift: warning: this machine's operator cannot be told ({why}), so every \
+                 question notifies it, whoever decides it"
+                );
+                None
+            }
+        };
+    if let Some(operator) = takes.operator() {
+        let _ = operator_cell.set(Some(operator.to_owned()));
+    } else if matches!(mode, Mode::Watch | Mode::Drain) {
+        let _ = operator_cell.set(read_operator());
+    }
+    let operator_now = || operator_cell.get_or_init(read_operator).clone();
     // The token agent runs log in with (OWL-94), read with the other
     // secrets and set on the harness command alone. None stored refuses the
     // run, with the fix, before anything is cloned.
@@ -561,7 +590,15 @@ fn run_with(
             // its watch reads once this process has ended.
             let mut code = ExitCode::SUCCESS;
             let mut reported = |outcome: &_, sink: &mut EventSink<'_>| {
-                code = report(system, desktop, tracker.as_ref(), ticket, outcome, sink);
+                code = report(
+                    system,
+                    desktop,
+                    tracker.as_ref(),
+                    ticket,
+                    outcome,
+                    &operator_now,
+                    sink,
+                );
             };
             step::child(&on_demand, &envelope, &mut sink, &mut reported).map_err(|error| {
                 format!("the step's outcome record could not be written: {error}")
@@ -622,6 +659,7 @@ fn run_with(
                     .unwrap_or_default(),
                 version: OWLSHIFT_VERSION.to_owned(),
                 build: own_build(),
+                operator: operator_cell.get().cloned().flatten(),
             };
             let _recorded = match presence::record(&dirs, &watch_record) {
                 Ok(recorded) => recorded,
@@ -639,7 +677,15 @@ fn run_with(
                 interval: POLL_INTERVAL,
             };
             let mut continued = |ticket: &TicketId, outcome: &_, sink: &mut EventSink<'_>| {
-                report(system, desktop, tracker.as_ref(), ticket, outcome, sink);
+                report(
+                    system,
+                    desktop,
+                    tracker.as_ref(),
+                    ticket,
+                    outcome,
+                    &operator_now,
+                    sink,
+                );
             };
             // A served watch reads its default branch again between two
             // passes, and ends once a newer project file is accepted there,
@@ -719,6 +765,7 @@ fn run_with(
         tracker.as_ref(),
         ticket,
         &outcome,
+        &operator_now,
         &mut sink,
     )))
 }
@@ -895,17 +942,19 @@ pub(crate) fn loaded_project<'c>(
 /// The end of one run of a ticket, `do`'s, `continue`'s, or each continue
 /// `watch` runs: its outcome printed ([`finish`]), then (OWL-140) a desktop
 /// notification when it makes the operator the blocker, a failure of which
-/// is a warning event.
+/// is a warning event; an ask another person decides notifies nothing, the
+/// operator given by `operator` (OWL-584).
 fn report(
     system: &dyn System,
     desktop: Option<&dyn Notifier>,
     tracker: &dyn Tracker,
     ticket: &TicketId,
     outcome: &Result<Delivered, Stop>,
+    operator: &dyn Fn() -> Option<String>,
     sink: &mut EventSink<'_>,
 ) -> ExitCode {
     let code = finish(system, outcome, &mut io::stdout(), &mut io::stderr());
-    notify::notify_blocker(desktop, tracker, ticket, outcome, sink);
+    notify::notify_blocker(desktop, tracker, ticket, outcome, operator, sink);
     code
 }
 

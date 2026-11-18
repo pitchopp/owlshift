@@ -11,6 +11,13 @@
 //! progress, a delivery or a green check. A notification that cannot be
 //! shown is a warning event, never an error: the run's outcome and exit code
 //! stay as they were.
+//!
+//! Since P10 (OWL-584; build plan "P10 · Teams", "What the operator is
+//! told"), a question round, a re-ask or a reply to a counter-question that
+//! reached the ticket notifies only when its decider is this machine's
+//! operator (`floor::same_account`): another decider is reached through the
+//! tracker's mention. What only the operator can lift notifies as before,
+//! and so does everything while the operator is unknown, as before P10.
 
 use std::path::{Path, PathBuf};
 
@@ -22,6 +29,7 @@ use owlshift_contracts::config::PersonalConfig;
 use owlshift_contracts::event::EventKind;
 use owlshift_contracts::ids::TicketId;
 use owlshift_contracts::result;
+use owlshift_core::floor::same_account;
 use owlshift_core::state::ParkReason;
 
 use crate::config::FileState;
@@ -178,16 +186,49 @@ fn shown_link(url: &str) -> Option<&str> {
     (url.starts_with("https://") && url.len() <= LINK_MAX && plain).then_some(url)
 }
 
+/// The decider whose answer `stop` waits for, when it is a question round,
+/// a premise-false decision, a re-ask or a reply to a counter-question that
+/// reached the ticket (OWL-584). `None` for every other stop, the lines only
+/// this machine's operator can lift: a park, questions that could not be
+/// posted (they are in the operator's terminal alone), and a comment whose
+/// state was not kept ([`Stop::NotKept`]), since the ticket's ref is this
+/// machine's to repair.
+fn asked_of(stop: &Stop) -> Option<&str> {
+    match stop {
+        Stop::NeedsInput {
+            posted: Ok(_),
+            decider,
+            ..
+        } => decider.as_deref().map(String::as_str),
+        Stop::Reasked { decider, .. } | Stop::CounterQuestion { decider, .. } => Some(decider),
+        _ => None,
+    }
+}
+
+/// Whether the line of `stop` is for `operator`, this machine's operator
+/// when known: every line but an ask another person decides. An unknown
+/// operator is told everything, as before P10.
+fn for_operator(stop: &Stop, operator: Option<&str>) -> bool {
+    match (asked_of(stop), operator) {
+        (Some(decider), Some(operator)) => same_account(operator, decider),
+        _ => true,
+    }
+}
+
 /// Notifies the operator when `outcome` makes them the blocker, with the
 /// ticket's link when the tracker gives one fit to show. `notifier` is
 /// `None` when this machine shows no notification (`desktop = false`, or no
-/// desktop session): then nothing is asked of the tracker either. A failure
-/// is recorded as a warning event.
+/// desktop session): then nothing is asked of the tracker either. An ask
+/// whose decider is not the operator shows nothing (OWL-584); `operator`
+/// gives this machine's operator, `None` when it is unknown, and is called
+/// only for an ask that would notify. A failure is recorded as a warning
+/// event.
 pub fn notify_blocker(
     notifier: Option<&dyn Notifier>,
     tracker: &dyn Tracker,
     ticket: &TicketId,
     outcome: &Result<Delivered, Stop>,
+    operator: &dyn Fn() -> Option<String>,
     sink: &mut EventSink<'_>,
 ) {
     let (Some(notifier), Err(stop)) = (notifier, outcome) else {
@@ -196,6 +237,9 @@ pub fn notify_blocker(
     let Some(line) = blocker_line(ticket, stop) else {
         return;
     };
+    if asked_of(stop).is_some() && !for_operator(stop, operator().as_deref()) {
+        return;
+    }
     if let Err(error) = notifier.notify(&with_link(line, tracker, ticket)) {
         sink.emit(ticket, None, EventKind::Warning, not_shown(&error));
     }
@@ -430,6 +474,7 @@ mod tests {
             status,
             summary: "s".to_owned(),
             questions: Vec::new(),
+            decider: posted.is_ok().then(|| Box::new("me".to_owned())),
             posted,
         }
     }
@@ -453,7 +498,8 @@ mod tests {
         let tracker = Linked::new(url);
         let mut out = Vec::new();
         let mut sink = EventSink::new("demo", log.clone(), &mut out);
-        notify_blocker(notifier, &tracker, &owl_7(), outcome, &mut sink);
+        let operator = || Some("me".to_owned());
+        notify_blocker(notifier, &tracker, &owl_7(), outcome, &operator, &mut sink);
         let events = std::fs::read_to_string(log.path())
             .unwrap_or_default()
             .lines()
@@ -493,6 +539,7 @@ mod tests {
                     round: round(1),
                     reask: 2,
                     open: Vec::new(),
+                    decider: "me".to_owned(),
                 },
                 "OWL-7: questions asked again on the ticket (round 1, re-ask 2)",
             ),
@@ -501,6 +548,7 @@ mod tests {
                     ticket: owl_7(),
                     replied: "c1".to_owned(),
                     asked: Vec::new(),
+                    decider: "me".to_owned(),
                 },
                 "OWL-7: the decider's question has a reply on the ticket; answers wait",
             ),
@@ -616,6 +664,88 @@ mod tests {
             let (asked, events, _) = notify(Some(&recording), Some(LINK), &outcome);
             assert!(recording.0.borrow().is_empty(), "{outcome:?}");
             assert_eq!((asked, events.len()), (0, 0), "{outcome:?}");
+        }
+    }
+
+    /// OWL-584: an ask notifies only the operator who decides it; another
+    /// decider's shows nothing and asks the tracker nothing, while a park, an
+    /// unposted round and a state not kept notify whoever decides. An
+    /// unknown operator is told everything, and the operator is read only
+    /// for an ask.
+    #[test]
+    fn an_ask_notifies_only_when_its_decider_is_the_operator() {
+        let asks = |decider: &str| {
+            let premise = Stop::NeedsInput {
+                ticket: owl_7(),
+                status: result::Status::PremiseFalse,
+                summary: "s".to_owned(),
+                questions: Vec::new(),
+                posted: Ok(round(1)),
+                decider: Some(Box::new(decider.to_owned())),
+            };
+            let mut questions = premise.clone();
+            if let Stop::NeedsInput { status, .. } = &mut questions {
+                *status = result::Status::Questions;
+            }
+            [
+                questions,
+                premise,
+                Stop::Reasked {
+                    ticket: owl_7(),
+                    round: round(1),
+                    reask: 1,
+                    open: Vec::new(),
+                    decider: decider.to_owned(),
+                },
+                Stop::CounterQuestion {
+                    ticket: owl_7(),
+                    replied: "c1".to_owned(),
+                    asked: Vec::new(),
+                    decider: decider.to_owned(),
+                },
+            ]
+        };
+        let lines = |stop: &Stop, operator: Option<&str>| {
+            let recording = Recording::default();
+            let dir = tempfile::tempdir().unwrap();
+            let tracker = Linked::new(Some(LINK));
+            let mut out = Vec::new();
+            let mut sink = EventSink::new("demo", EventLog::in_dir(dir.path()), &mut out);
+            let read = Cell::new(0);
+            let operator = || {
+                read.set(read.get() + 1);
+                operator.map(str::to_owned)
+            };
+            let outcome = Err(stop.clone());
+            notify_blocker(
+                Some(&recording),
+                &tracker,
+                &owl_7(),
+                &outcome,
+                &operator,
+                &mut sink,
+            );
+            (
+                recording.0.into_inner().len(),
+                tracker.asked.get(),
+                read.get(),
+            )
+        };
+        for ask in asks("lea") {
+            assert_eq!(lines(&ask, Some("me")), (0, 0, 1), "{ask:?}");
+            assert_eq!(lines(&ask, None), (1, 1, 1), "{ask:?}");
+        }
+        for ask in asks("me") {
+            assert_eq!(lines(&ask, Some("me")), (1, 1, 1), "{ask:?}");
+        }
+        for theirs in [
+            parked(),
+            needs_input(result::Status::Questions, Err("Linear: down".to_owned())),
+            not_kept(Landed::Questions),
+            not_kept(Landed::Reask),
+            not_kept(Landed::Reply),
+        ] {
+            assert_eq!(lines(&theirs, Some("me")), (1, 1, 0), "{theirs:?}");
         }
     }
 

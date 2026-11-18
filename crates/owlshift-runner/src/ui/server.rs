@@ -99,7 +99,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use jiff::Timestamp;
 use owlshift_adapters::forge::Repo;
-use owlshift_contracts::config::PersonalConfig;
+use owlshift_contracts::config::{PersonalConfig, TrackerKind};
 use owlshift_contracts::event::EventKind;
 use owlshift_contracts::format::Format;
 use owlshift_contracts::ids::TicketId;
@@ -1836,6 +1836,32 @@ fn header_now(context: &Context) -> header::Header {
 /// ready snapshots read (OWL-470).
 fn overview_now(context: &Context) -> overview::Overview {
     let personal = (context.options.personal)();
+    let identity = match &personal {
+        FileState::Loaded { config, .. } => crate::operator::markdown_identity(Some(config)),
+        _ => None,
+    };
+    // A served project's operator (OWL-584): the person of its tracker key,
+    // which the reply form compares the decider with; on the Markdown
+    // tracker, whose key has no account, the personal file's identity.
+    let operator = |repository: &str| -> Option<String> {
+        let repo = Repo::parse(repository).ok()?;
+        match &*context.keys.state(&context.data, &repo) {
+            KeyState::Ready(key) => crate::operator::person(key.account.clone()).ok(),
+            KeyState::Reading | KeyState::Unavailable(_) => identity.clone().filter(|_| {
+                ticket::served_config(&ProjectDirs::new(&context.data, &repo))
+                    .is_ok_and(|config| config.tracker.kind == TrackerKind::Markdown)
+            }),
+        }
+    };
+    let name = |repository: &str, account: &str| -> Option<String> {
+        let repo = Repo::parse(repository).ok()?;
+        let key = context.keys.state(&context.data, &repo);
+        context.keys.decider_name(&repo, &key, account)
+    };
+    let deciders = overview::Deciders {
+        operator: &operator,
+        name: &name,
+    };
     let mut tail = context
         .tail
         .lock()
@@ -1845,6 +1871,7 @@ fn overview_now(context: &Context) -> overview::Overview {
         &mut tail,
         crate::usage::concurrent_runs(&personal),
         Timestamp::now(),
+        &deciders,
     )
 }
 

@@ -6,6 +6,9 @@
 //!   (`owlshift_runner::ui::server`) on `127.0.0.1`, prints the login link,
 //!   and prints a fresh one each time a line is read on its standard input,
 //!   since a code lasts a minute. It refreshes the overview every second.
+//!   With `OWLSHIFT_UI_BENCH_OPERATOR=<account>` (letters, digits and `-`),
+//!   that account is the operator, as the personal file's
+//!   `identity.tracker` names it on the Markdown tracker (OWL-584).
 //! - `owlshift-ui-bench link <data>` prints one link, which logs in only
 //!   while a `serve` runs on the same token.
 //! - `owlshift-ui-bench touch-ready <data>` rewrites `ready.json` as read
@@ -24,6 +27,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use jiff::Timestamp;
+use owlshift_contracts::config::PersonalConfig;
 use owlshift_runner::config::FileState;
 use owlshift_runner::ui::auth::{self, RunSecret};
 use owlshift_runner::ui::server::{self, Options};
@@ -47,6 +51,29 @@ fn link(data: &Path, port: u16) -> Result<String, String> {
     Ok(format!("http://127.0.0.1:{port}/#login={code}"))
 }
 
+/// The bench's personal file: none, or one whose `identity.tracker` is
+/// `OWLSHIFT_UI_BENCH_OPERATOR`, so the overview tells the operator's asks
+/// from other people's (OWL-584).
+fn bench_personal() -> FileState<PersonalConfig> {
+    let path = PathBuf::from("/nowhere/owlshift.toml");
+    let operator = std::env::var("OWLSHIFT_UI_BENCH_OPERATOR").unwrap_or_default();
+    if operator.is_empty()
+        || !operator
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-')
+    {
+        return FileState::Absent(path);
+    }
+    match PersonalConfig::parse(&format!("[identity]\ntracker = \"{operator}\"\n")) {
+        Ok(config) => FileState::Loaded {
+            path,
+            config,
+            entries: Vec::new(),
+        },
+        Err(_) => FileState::Absent(path),
+    }
+}
+
 fn serve(data: &Path, port: u16) -> Result<(), String> {
     ui_bench::seeded(data)?;
     let listener = TcpListener::bind(("127.0.0.1", port))
@@ -54,8 +81,10 @@ fn serve(data: &Path, port: u16) -> Result<(), String> {
     let options = Options {
         refresh: Duration::from_secs(1),
         overview_refresh: Duration::from_secs(1),
-        // The bench reads nothing of the person's own configuration.
-        personal: Arc::new(|| FileState::Absent(PathBuf::from("/nowhere/owlshift.toml"))),
+        // The bench reads nothing of the person's own configuration; with
+        // `OWLSHIFT_UI_BENCH_OPERATOR` set, its personal file names that
+        // account as the Markdown tracker's operator (OWL-584).
+        personal: Arc::new(bench_personal),
         ..Options::default()
     };
     let run = RunSecret::new().map_err(|error| format!("no run secret: {error}"))?;

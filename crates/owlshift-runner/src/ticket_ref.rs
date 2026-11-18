@@ -47,9 +47,9 @@ use sha2::{Digest, Sha256};
 use owlshift_contracts::drain::{TicketIntake, TicketProposals};
 use owlshift_contracts::ids::TicketId;
 use owlshift_contracts::refs::{
-    COST_FILE, DELIVERY_FILE, HELD_FILE, INTAKE_FILE, PLAN_FILE, PROPOSALS_FILE, PersistedState,
-    QUESTIONS_FILE, REVIEW_FILE, SESSION_FILE, STATE_FILE, TICKETS_PREFIX, TicketCost,
-    TicketDelivery, TicketHeld, TicketQuestions, TicketSession, ticket_ref,
+    Ask, COST_FILE, DELIVERY_FILE, HELD_FILE, INTAKE_FILE, PLAN_FILE, PROPOSALS_FILE,
+    PersistedState, QUESTIONS_FILE, REVIEW_FILE, SESSION_FILE, STATE_FILE, TICKETS_PREFIX,
+    TicketCost, TicketDelivery, TicketHeld, TicketQuestions, TicketSession, Waiting, ticket_ref,
 };
 use owlshift_contracts::review::{TicketPlan, TicketReview};
 use owlshift_core::state::{Status, TicketState};
@@ -91,6 +91,18 @@ pub struct TicketRecord {
     /// dispatch: `None` when the tree holds no [`HELD_FILE`] (OWL-403), as
     /// for a ticket dispatched before it was kept.
     pub held: Option<TicketHeld>,
+}
+
+impl TicketRecord {
+    /// The ask the ticket waits on: its latest, while its state waits for
+    /// answers. A ticket parked while questions waited has none: an answer
+    /// alone does not restart it.
+    pub fn open_ask(&self) -> Option<&Ask> {
+        if self.state.waiting != Some(Waiting::NeedsInput) {
+            return None;
+        }
+        self.questions.asks.last()
+    }
 }
 
 /// The hash an intake record keeps of a ticket's text (architecture section

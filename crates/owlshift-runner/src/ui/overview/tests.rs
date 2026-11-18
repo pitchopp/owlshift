@@ -92,6 +92,7 @@ fn detail(status: RefStatus) -> RefDetail {
         pull_request: None,
         questions: Vec::new(),
         plan_to_approve: false,
+        decider: None,
     }
 }
 
@@ -104,6 +105,7 @@ fn view(waits: &StatusWaits, aux: Aux) -> Overview {
         ts("2026-11-06T10:00:30Z"),
         0,
         Vec::new(),
+        &Deciders::NONE,
     )
 }
 
@@ -386,6 +388,7 @@ fn a_running_card_names_the_role_of_its_latest_run() {
         ts("2026-11-06T10:00:00Z"),
         0,
         Vec::new(),
+        &Deciders::NONE,
     );
     let running = card(&overview, "T-1").running.clone().unwrap();
     assert_eq!((running.slot, running.role.as_deref()), (2, Some("build")));
@@ -436,6 +439,7 @@ fn a_stale_snapshot_is_marked_and_a_title_with_markup_is_escaped() {
         ts("2026-11-06T10:05:00Z"),
         3,
         vec!["a note".to_owned()],
+        &Deciders::NONE,
     );
     assert!(overview.projects[0].ready.as_ref().unwrap().stale);
     assert_eq!(overview.highlights, 3);
@@ -459,6 +463,7 @@ fn a_stale_snapshot_is_marked_and_a_title_with_markup_is_escaped() {
         ts("2026-11-06T10:01:00Z"),
         0,
         Vec::new(),
+        &Deciders::NONE,
     );
     assert!(!fresh.projects[0].ready.as_ref().unwrap().stale);
 }

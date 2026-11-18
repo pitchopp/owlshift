@@ -190,20 +190,39 @@ pub struct RunningWatch {
 pub fn running(data: &Path) -> io::Result<Vec<RunningWatch>> {
     let mut running = Vec::new();
     for dirs in ProjectDirs::all(data)? {
-        let dir = records_dir(&dirs);
-        for pid in pids(&dir)? {
-            let (lock, record) = files(&dir, pid);
-            if held_alone(&lock)? {
-                running.push(RunningWatch {
-                    pid,
-                    record: fs::read_to_string(&record)
-                        .ok()
-                        .and_then(|text| WatchRecord::parse(&text).ok()),
-                });
-            }
+        running.extend(running_on(&dirs)?);
+    }
+    Ok(running)
+}
+
+/// The watches that run now on `dirs`'s project, as [`running`] reads them.
+fn running_on(dirs: &ProjectDirs) -> io::Result<Vec<RunningWatch>> {
+    let mut running = Vec::new();
+    let dir = records_dir(dirs);
+    for pid in pids(&dir)? {
+        let (lock, record) = files(&dir, pid);
+        if held_alone(&lock)? {
+            running.push(RunningWatch {
+                pid,
+                // A record of a newer format, a newer Owlshift's, reads as
+                // none, as one not written yet.
+                record: fs::read_to_string(&record)
+                    .ok()
+                    .and_then(|text| WatchRecord::parse(&text).ok()),
+            });
         }
     }
     Ok(running)
+}
+
+/// The operator a watch that runs now on `dirs`'s project read as it started
+/// (OWL-584), whose waiting tickets the daily digest counts: `None` when no
+/// watch runs, none could tell it, or its record does not read. Read only.
+pub fn operator(dirs: &ProjectDirs) -> Option<String> {
+    running_on(dirs)
+        .ok()?
+        .into_iter()
+        .find_map(|watch| watch.record.and_then(|record| record.operator))
 }
 
 #[cfg(test)]
@@ -235,8 +254,10 @@ mod tests {
             binary: "/bin/owlshift".to_owned(),
             version: "0.0.0".to_owned(),
             build: BuildIdentity::from_build("", "0", "0", ""),
+            operator: Some("u-1".to_owned()),
         };
         assert_eq!(running(data.path()).unwrap(), []);
+        assert_eq!(operator(&dirs), None);
         let held = record(&dirs, &watch(7)).unwrap().expect("recorded");
         let seen = running(data.path()).unwrap();
         assert_eq!(
@@ -246,8 +267,11 @@ mod tests {
                 record: Some(watch(7))
             }]
         );
+        // OWL-584: the operator it read, which the digest reads.
+        assert_eq!(operator(&dirs).as_deref(), Some("u-1"));
         drop(held);
         assert_eq!(running(data.path()).unwrap(), []);
+        assert_eq!(operator(&dirs), None, "an ended watch tells no operator");
         assert!(!records_dir(&dirs).join("7.json").exists());
 
         // A watch killed outright leaves both files, its lock free.
