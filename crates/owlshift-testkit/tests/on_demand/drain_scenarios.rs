@@ -743,6 +743,52 @@ fn the_owner_of_a_zone_intake_declared_decides_a_ticket_without_an_assignee() {
     );
 }
 
+/// OWL-582: the same project written with `[people]`, its admitter and the
+/// owner of `docs` named by handles, gives the core the same accounts.
+/// DEMO-1 is admitted by `maintainer`, the account of the handle `mai`; its
+/// assignee leaves after intake declared `docs`, and its Build's round goes
+/// to `owner`, the account of the handle `own`, as by a zone owner.
+#[test]
+fn a_project_naming_people_by_handle_admits_and_decides_by_their_accounts() {
+    let bench = Bench::build_admitting(
+        "maintainer",
+        "assignee = \"maintainer\"\nlabels = [\"agent\"]\n",
+        "[zones.docs]\nowner = \"own\"\n[people.mai]\ntracker = \"maintainer\"\n\
+         [people.own]\ntracker = \"owner\"\nforge = \"owner-dev\"\n",
+        ", parked = \"Parked\"",
+        "admit = { label = \"agent\" }\nadmitters = [\"mai\"]",
+    );
+    let replies = vec![
+        bench.reply(None, Some(&intake_declaring(&["docs"], &[]))),
+        bench.reply(None, Some(ROUND_1)),
+    ];
+    let (outcomes, lines, printed) = bench.drain_passes(replies, 3, |pass, _| {
+        if pass == 1 {
+            let text = fs::read_to_string(bench.ticket_file()).unwrap();
+            fs::write(
+                bench.ticket_file(),
+                text.replace("assignee = \"maintainer\"\n", ""),
+            )
+            .unwrap();
+        }
+    });
+    assert!(
+        outcomes
+            .iter()
+            .any(|outcome| matches!(outcome, Err(Stop::NeedsInput { posted: Ok(_), .. }))),
+        "{outcomes:?}\n{lines}\n{printed}"
+    );
+    assert_eq!(bench.record().intake.unwrap().zones, ["docs"]);
+    assert_eq!(bench.last_of(Role::Build).decider, "owner");
+    assert_eq!(
+        bench.record().questions.asks[0].decider,
+        AskDecider {
+            account: "owner".to_owned(),
+            by: DeciderRule::ZoneOwner,
+        }
+    );
+}
+
 /// Each `decision` event of `events` that `key` names `waits` with the reason
 /// `collision`: its ticket, the holder and the resource.
 pub(super) fn collisions(events: &[Event], key: &str) -> Vec<(String, Value, Value)> {

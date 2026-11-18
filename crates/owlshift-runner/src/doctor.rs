@@ -24,11 +24,13 @@ use std::path::{MAIN_SEPARATOR, Path};
 
 use owlshift_adapters::forge::{ErrorKind as ForgeErrorKind, Repo};
 use owlshift_adapters::harness::{self, Login, tested};
-use owlshift_adapters::tracker::Capability;
 #[cfg(test)]
 use owlshift_adapters::tracker::ErrorKind;
 use owlshift_adapters::tracker::linear::AdmissionFacts;
-use owlshift_contracts::config::{Admit, ProjectConfig, States, Tracker};
+use owlshift_adapters::tracker::{Capability, KeyAccount};
+use owlshift_contracts::config::{
+    Admit, PersonalConfig, ProjectConfig, States, Tracker, TrackerKind,
+};
 use owlshift_contracts::ids::TicketId;
 use owlshift_contracts::service::BuildIdentity;
 use owlshift_contracts::{DelegationLevel, Harness};
@@ -61,6 +63,7 @@ use crate::system::{
 #[cfg(unix)]
 use crate::system::{SentinelProbe, SentinelStatus};
 use crate::ticket_ref::RefState;
+use crate::tracker::Operator;
 #[cfg(test)]
 use crate::tracker::{LINEAR_ACCOUNT, LINEAR_APP_ID_ACCOUNT, LINEAR_APP_SECRET_ACCOUNT};
 use crate::ui::probe::Probe;
@@ -342,6 +345,14 @@ pub fn run(system: &dyn System, config: &Effective, own: &BuildIdentity) -> Repo
     checks.extend(drain_admission_check(config, facts.as_ref(), words));
     checks
         .extend(tracker.and_then(|(kind, project)| kind.proposals_inbox(project, facts.as_ref())));
+    let operator = tracker.and_then(|(kind, project)| {
+        project.people.as_ref()?;
+        if project.tracker.kind == TrackerKind::Markdown {
+            return Some(personal_operator(&config.personal));
+        }
+        kind.operator(system, project, accounts, repo)
+    });
+    checks.extend(people_check(config, operator.as_ref()));
     checks.extend(forge_reviewers_check(config));
     checks.extend(resolver_check(config));
     checks.extend(codex_reviewer_check(system, config));
@@ -1366,6 +1377,73 @@ fn tracker_check(config: &Effective) -> Check {
     }
 }
 
+/// The operator of a Markdown project, whose tracker has no key: the
+/// personal file's `identity.tracker` (build plan "P10 · Teams", "The
+/// operator").
+fn personal_operator(personal: &FileState<PersonalConfig>) -> Operator {
+    let FileState::Loaded { config, .. } = personal else {
+        return Err("no personal configuration is loaded".to_owned());
+    };
+    let id = config
+        .identity
+        .tracker
+        .clone()
+        .ok_or("the personal configuration sets no `identity.tracker`")?;
+    Ok(KeyAccount {
+        name: id.clone(),
+        id,
+        app: false,
+        workspace: String::new(),
+    })
+}
+
+/// The project's people (OWL-582, build plan "P10 · Teams", "People"):
+/// how many `[people]` lists in the working tree, and whether this
+/// machine's operator, as [`crate::tracker::Kind::operator`] read it, is
+/// one of them, a warning when not. An operator that could not be read,
+/// or a key that is an app's, says so and warns of nothing. None without
+/// the table or a project configuration.
+fn people_check(config: &Effective, operator: Option<&Operator>) -> Option<Check> {
+    const SUBJECT: &str = "people";
+    let FileState::Loaded { config, .. } = &config.project else {
+        return None;
+    };
+    let people = config.people.as_ref()?;
+    let count = format!(
+        "{} person(s) in `[people]` of the working tree (watch reads the base commit)",
+        people.len()
+    );
+    let ok = |detail: String| Check::ok(Section::Project, SUBJECT, detail);
+    Some(match operator {
+        Some(Ok(account)) if account.app => ok(format!(
+            "{count}; the tracker key is the account of an app, {:?}, so this machine's \
+             operator was not read",
+            account.name
+        )),
+        Some(Ok(account)) => match config.handle_of(&account.id) {
+            Some(handle) => ok(format!("{count}; this machine's operator is {handle}")),
+            None => Check::warn(
+                Section::Project,
+                SUBJECT,
+                format!(
+                    "{count}, and this machine's operator, {:?} ({:?}), is not one of them",
+                    account.name, account.id
+                ),
+                format!(
+                    "{DOES_NOT_BLOCK} the people of the project file are who admit, decide and \
+                     review. Add this machine's operator as `[people.<handle>]` with `tracker = \
+                     {:?}` through a pull request: `owlshift init` prints the entry.",
+                    account.id
+                ),
+            ),
+        },
+        Some(Err(reason)) => ok(format!(
+            "{count}; this machine's operator could not be read: {reason}"
+        )),
+        None => ok(format!("{count}; this machine's operator was not read")),
+    })
+}
+
 /// Whose reviews on Owlshift's pull requests are read (OWL-307, build plan
 /// "P5 · Quality pipeline", "Contracts and formats"): the logins
 /// `[forge].reviewers` lists, read from the working tree here, while watch
@@ -1376,6 +1454,36 @@ fn forge_reviewers_check(config: &Effective) -> Option<Check> {
     let FileState::Loaded { config, .. } = &config.project else {
         return None;
     };
+    let reviewers = config
+        .forge
+        .as_ref()
+        .map_or(0, |forge| forge.reviewers.len());
+    // With `[people]`, the reviewers are its people with a forge login.
+    if config.people.is_some() {
+        return Some(if reviewers > 0 {
+            Check::ok(
+                Section::Project,
+                SUBJECT,
+                format!(
+                    "{reviewers} reviewer(s) from `[people]` in the working tree (watch reads \
+                     the base commit): a review of the ticket's decider on a delivered pull \
+                     request goes back to Build"
+                ),
+            )
+        } else {
+            Check::warn(
+                Section::Project,
+                SUBJECT,
+                "no person of `[people]` has a forge login: no review on Owlshift's pull \
+                 requests is read",
+                format!(
+                    "{DOES_NOT_BLOCK} to have the decider's reviews on a delivered pull request \
+                     handled, give each person who reviews their forge login, as `forge = \
+                     \"login\"` under their `[people.<handle>]`."
+                ),
+            )
+        });
+    }
     Some(match &config.forge {
         Some(forge) => Check::ok(
             Section::Project,
@@ -1678,8 +1786,10 @@ fn drain_admission_check(
                 fixes.push(words.label_fix);
             }
             let mut accounts = false;
-            for id in tracker.admitters.iter().flatten() {
-                match found.accounts.iter().find(|a| same_account(&a.id, id)) {
+            for account in tracker.admitters.iter().flatten() {
+                // Named as the file names it: by handle beside `[people]`.
+                let id = config.handle_of(account).unwrap_or(account);
+                match found.accounts.iter().find(|a| same_account(&a.id, account)) {
                     None => problems.push(format!("admitter {id:?} {}", words.no_account)),
                     Some(a) if a.app => {
                         problems.push(format!("admitter {id:?} {}", words.app_account));
@@ -4408,6 +4518,139 @@ states = { ready = "Todo", working = "In Progress", needs_input = "Needs Input",
         assert_eq!(line(&report, "drain admission").status, Status::Ok);
     }
 
+    /// OWL-582: with `[people]`, the `people` line counts them and says
+    /// whether the Linear key's account, this machine's operator, is one;
+    /// the reviewers are the people with a forge login; the admission line
+    /// names an admitter by its handle. No `people` line without the table.
+    #[test]
+    fn the_people_line_names_the_operator_or_warns() {
+        use owlshift_adapters::tracker::Error;
+
+        let ready = || logged_in(with_harnesses(with_git(FakeSystem::default())));
+        let tracker = LABELLED_TRACKER.replace(r#"["u-ann"]"#, r#"["ann"]"#);
+        let (_dir, config) = project_tracked_with(
+            &tracker,
+            "[people.ann]\ntracker = \"u-ann\"\nforge = \"ann-dev\"\n[people.bob]\ntracker = \"u-bob\"",
+        );
+        let account = |id: &str, app: bool| KeyAccount {
+            id: id.to_owned(),
+            name: format!("name of {id}"),
+            app,
+            workspace: "owl".to_owned(),
+        };
+        let people = |system: FakeSystem| {
+            let report = run(&system, &config);
+            assert!(report.ready(), "{report}");
+            (
+                line(&report, "people").clone(),
+                line(&report, "forge reviewers").clone(),
+                line(&report, "drain admission").clone(),
+            )
+        };
+
+        let (listed, reviewers, admission) = people(
+            ready()
+                .linear_operator_is(Ok(account("u-bob", false)))
+                .linear_admission_is(Ok(facts(Ok(false), &["agent", "hold"], &[]))),
+        );
+        assert_eq!(listed.status, Status::Ok, "{listed:?}");
+        assert!(
+            listed.detail.starts_with("2 person(s) in `[people]`")
+                && listed.detail.ends_with("this machine's operator is bob"),
+            "{listed:?}"
+        );
+        assert_eq!(reviewers.status, Status::Ok);
+        assert!(
+            reviewers
+                .detail
+                .starts_with("1 reviewer(s) from `[people]`"),
+            "{reviewers:?}"
+        );
+        assert!(
+            admission.detail.contains("admitter \"ann\""),
+            "{admission:?}"
+        );
+
+        let (unlisted, ..) = people(ready().linear_operator_is(Ok(account("u-eve", false))));
+        assert_eq!(unlisted.status, Status::Warn);
+        assert!(
+            unlisted.detail.ends_with(
+                "this machine's operator, \"name of u-eve\" (\"u-eve\"), is not one of them"
+            ),
+            "{unlisted:?}"
+        );
+        assert!(
+            unlisted
+                .why
+                .as_deref()
+                .unwrap_or_default()
+                .contains("tracker = \"u-eve\""),
+            "{unlisted:?}"
+        );
+
+        let (app, ..) = people(ready().linear_operator_is(Ok(account("app-1", true))));
+        assert_eq!(app.status, Status::Ok);
+        assert!(app.detail.contains("operator was not read"), "{app:?}");
+
+        let refused = Error::new(ErrorKind::Unauthorized, "Linear: no").to_string();
+        let (unread, ..) = people(ready().linear_operator_is(Err(refused)));
+        assert_eq!(unread.status, Status::Ok);
+        assert!(
+            unread
+                .detail
+                .ends_with("this machine's operator could not be read: Linear: no"),
+            "{unread:?}"
+        );
+
+        let (_dir, without) = project_tracked_by(LABELLED_TRACKER);
+        let report = run(&ready(), &without);
+        assert!(
+            report.checks.iter().all(|c| c.subject != "people"),
+            "{report}"
+        );
+    }
+
+    /// OWL-582: a Markdown project's operator is the personal file's
+    /// `identity.tracker`; nobody with a forge login reads no review.
+    #[test]
+    fn a_markdown_operator_is_the_personal_identity() {
+        let system = logged_in(with_harnesses(with_git(FakeSystem::default())));
+        let tracker = r#"kind = "markdown"
+admit = "delegation"
+states = { ready = "Todo", working = "Doing", needs_input = "Asked", review = "Review" }"#;
+        let (dir, _) = project_tracked_with(tracker, "[people.ann]\ntracker = \"ann\"");
+        let with_identity = |text: &str| Effective {
+            project: FileState::load(
+                dir.path().join("owlshift.toml"),
+                owlshift_contracts::config::ProjectConfig::parse,
+            ),
+            personal: FileState::Loaded {
+                path: PathBuf::from("/home/ada/.config/owlshift/config.toml"),
+                config: owlshift_contracts::config::PersonalConfig::parse(text).unwrap(),
+                entries: Vec::new(),
+            },
+        };
+        let report = run(&system, &with_identity("[identity]\ntracker = \"ann\"\n"));
+        let listed = line(&report, "people");
+        assert!(listed.detail.ends_with("operator is ann"), "{listed:?}");
+        let silent = line(&report, "forge reviewers");
+        assert_eq!(silent.status, Status::Warn);
+        assert!(
+            silent
+                .detail
+                .starts_with("no person of `[people]` has a forge login"),
+            "{silent:?}"
+        );
+        let report = run(&system, &with_identity(""));
+        let unread = line(&report, "people");
+        assert!(
+            unread
+                .detail
+                .ends_with("the personal configuration sets no `identity.tracker`"),
+            "{unread:?}"
+        );
+    }
+
     /// OWL-307: without `[forge].reviewers` no review is read, a warning
     /// that blocks nothing; with it, how many are listed.
     #[test]
@@ -4848,6 +5091,27 @@ states = { ready = "Todo", working = "Doing", needs_input = "Asked", review = "R
     /// the project names that the repository lacks, and an admitter GitHub
     /// does not know, warn, in GitHub's words; the proposals inbox is the
     /// `agent:proposed` label.
+    #[test]
+    fn a_github_operator_is_the_credentials_account() {
+        let ready = || logged_in(with_harnesses(with_git(FakeSystem::default())));
+        let (_dir, config) = project_tracked_with(
+            r#"kind = "github"
+admit = "ready"
+admitters = ["ann"]
+states = { ready = "agent:ready", working = "agent:working", needs_input = "agent:needs-input", review = "agent:review" }"#,
+            "[people.ann]\ntracker = \"583231\"\nforge = \"ann\"",
+        );
+        let account = KeyAccount {
+            id: "583231".to_owned(),
+            name: "ann".to_owned(),
+            app: false,
+            workspace: String::new(),
+        };
+        let report = run(&ready().github_operator_is(Ok(account)), &config);
+        let listed = line(&report, "people");
+        assert!(listed.detail.ends_with("operator is ann"), "{listed:?}");
+    }
+
     #[test]
     fn a_github_project_names_a_missing_permission_label_and_admitter() {
         use crate::tracker::GithubFacts;

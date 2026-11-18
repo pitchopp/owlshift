@@ -157,6 +157,42 @@ team = {}
         proposals_inbox_check(config, facts)
     }
 
+    /// The Linear key's account and the forge credential's login
+    /// (OWL-582).
+    fn signed_in(&self, setup: &Setup<'_>) -> super::SignedIn {
+        let tracker = setup.repo.ok().and_then(|repo| {
+            let mut look = |account: &str| setup.keychain.read(account).map_err(|e| e.to_string());
+            let found = crate::secrets::tracker(repo, &LINEAR_SECRETS, &mut look).ok()?;
+            let key = found.get(LINEAR_ACCOUNT)?;
+            LinearTracker::new(ApiKey::new(key.expose()))
+                .key_account()
+                .ok()
+                .filter(|account| !account.app)
+                .map(|account| account.id)
+        });
+        super::SignedIn {
+            tracker,
+            forge: super::forge_login(setup),
+        }
+    }
+
+    /// The account of the Linear key `init` stored (OWL-582).
+    fn operator(
+        &self,
+        system: &dyn System,
+        _config: &ProjectConfig,
+        accounts: Option<&TrackerAccounts>,
+        _repo: Option<&Repo>,
+    ) -> Option<super::Operator> {
+        let accounts = accounts?;
+        Some(super::ask::<super::Operator>(
+            system,
+            &OperatorProbe {
+                accounts: accounts.clone(),
+            },
+        ))
+    }
+
     /// The key `owlshift init` stored for the project of `repo`, its own
     /// accounts or the shared ones ([`crate::secrets::tracker`]), read from
     /// the system keychain. The Linear app's pair is never used: a reply goes
@@ -678,6 +714,28 @@ impl Probe for AdmissionProbe {
     }
 }
 
+/// The account of the Linear key stored under `accounts`
+/// ([`super::linear_operator`], OWL-582).
+#[derive(Debug)]
+struct OperatorProbe {
+    accounts: TrackerAccounts,
+}
+
+impl Probe for OperatorProbe {
+    fn read(&self, keychain: &Keychain) -> Probed {
+        Probed::new::<super::Operator>(super::linear_operator(keychain, &self.accounts))
+    }
+
+    fn keychain_error(&self, reason: String) -> Probed {
+        Probed::new::<super::Operator>(Err(reason))
+    }
+
+    #[cfg(test)]
+    fn fake(&self, host: &crate::system::fake::FakeSystem) -> Probed {
+        Probed::new::<super::Operator>(fake::operator(host))
+    }
+}
+
 /// The Linear app user Owlshift writes as ([`super::linear_app_user`],
 /// OWL-157).
 #[derive(Debug)]
@@ -721,6 +779,16 @@ mod fake {
         /// What checking the Linear app gives, both of its entries being
         /// stored; `None`: no app is stored.
         app: Option<Result<String, Error>>,
+        /// The key's account; `None`: it cannot be reached.
+        operator: Option<super::super::Operator>,
+    }
+
+    /// The key's account as [`FakeSystem::linear_operator_is`] scripted
+    /// it, else unreachable.
+    pub(super) fn operator(host: &FakeSystem) -> super::super::Operator {
+        host.scripted::<Script>()
+            .and_then(|script| script.operator.clone())
+            .unwrap_or_else(|| Err(unreachable().to_string()))
     }
 
     impl FakeSystem {
@@ -739,6 +807,11 @@ mod fake {
         pub(crate) fn linear_app_is(self, answer: Result<&str, Error>) -> Self {
             let answer = answer.map(str::to_owned);
             self.script(|script: &mut Script| script.app = Some(answer))
+        }
+
+        /// The Linear key's account reads so (OWL-582).
+        pub(crate) fn linear_operator_is(self, answer: super::super::Operator) -> Self {
+            self.script(|script: &mut Script| script.operator = Some(answer))
         }
     }
 
