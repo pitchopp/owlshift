@@ -2,6 +2,10 @@
 
 What changes in each release of Owlshift, newest first. Versions follow [Semantic Versioning](https://semver.org/). A release's notes on GitHub are its section below, and the release workflow refuses a tag whose version has none.
 
+## Unreleased
+
+- A draining runner takes only the tickets its operator admitted, the account of the project's tracker key (on the Markdown tracker, the personal file's `identity.tracker`): the personal `takes` is `"mine"` by default. A project whose several admitters are served by one runner sets `takes = "all"` in that machine's personal file, at the top or under the repository's `[repositories."github.com/<owner>/<name>"]` (OWL-583).
+
 ## 0.1.1
 
 - The local web UI (`owlshift ui`) is laid out as Owlshift's visual identity says: the frame, the overview of projects and tickets, the ticket page with its stage stepper and runs, and the spend page, in light and dark, down to a phone's width (OWL-575).

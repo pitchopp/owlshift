@@ -1,0 +1,42 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Owlshift ticket not mine",
+  "description": "A ticket of the ready column found not the operator's (P10, OWL-583;\nbuild plan \"P10 · Teams\", \"The operator, and whose tickets a runner\ntakes\"), kept in `not_mine.json` in the ticket's folder by the draining\nwatch: while it stands, under `takes = \"mine\"` for the same operator, the\ndrain starts no step for the ticket until the tracker's update time of\nit has moved and ten minutes passed since `read_at`.",
+  "type": "object",
+  "properties": {
+    "account": {
+      "description": "The account of the admission gesture read.",
+      "type": "string"
+    },
+    "format": {
+      "description": "The format version of this document.",
+      "type": "integer",
+      "const": 1
+    },
+    "operator": {
+      "description": "The operator it was compared with: a record for another operator\ncounts as absent.",
+      "type": "string"
+    },
+    "read_at": {
+      "description": "When the step that read it started.",
+      "type": "string",
+      "format": "date-time"
+    },
+    "updated_at": {
+      "description": "The tracker's update time of the ticket the pass that started that\nstep listed; `null` when the tracker gives none.",
+      "type": [
+        "string",
+        "null"
+      ],
+      "format": "date-time",
+      "default": null
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "format",
+    "account",
+    "operator",
+    "read_at"
+  ]
+}

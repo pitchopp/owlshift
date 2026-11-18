@@ -82,6 +82,17 @@
       "$ref": "#/$defs/ServiceSettings",
       "default": {}
     },
+    "takes": {
+      "description": "Which admitted tickets `owlshift watch --drain` takes on this machine\n(P10, OWL-583): `\"mine\"`, those whose admission gesture is the\noperator's, the account of the project's tracker key; or `\"all\"`,\nevery admitted ticket, as every runner did before. Absent: `\"mine\"`.\n`repositories` sets it for one repository.",
+      "anyOf": [
+        {
+          "$ref": "#/$defs/Takes"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
     "ui": {
       "description": "The local web UI (P8, OWL-467).",
       "$ref": "#/$defs/UiSettings",
@@ -217,6 +228,17 @@
           "items": {
             "type": "string"
           }
+        },
+        "takes": {
+          "description": "Which admitted tickets the drain takes for this repository, in place\nof the machine-wide `takes`.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Takes"
+            },
+            {
+              "type": "null"
+            }
+          ]
         }
       },
       "additionalProperties": false
@@ -244,6 +266,14 @@
         }
       },
       "additionalProperties": false
+    },
+    "Takes": {
+      "description": "Which admitted tickets a runner takes (P10, OWL-583; build plan \"P10 ·\nTeams\", \"The operator, and whose tickets a runner takes\").",
+      "type": "string",
+      "enum": [
+        "mine",
+        "all"
+      ]
     },
     "UiSettings": {
       "description": "The local web UI's settings (P8, OWL-467).",

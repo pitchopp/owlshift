@@ -610,9 +610,15 @@ impl shared::Tracker for MarkdownTracker {
                 continue;
             }
             let blockers = self.blockers(&ticket)?;
+            // The file's modification time: any write of it moves it.
+            let updated_at = fs::metadata(self.ticket_file(&id))
+                .and_then(|metadata| metadata.modified())
+                .ok()
+                .and_then(|time| Timestamp::try_from(time).ok());
             listed.push(shared::Listed {
                 ticket: shared_ticket(ticket),
                 created_at: None,
+                updated_at,
                 blockers,
             });
         }

@@ -136,15 +136,19 @@ pub const STEP_ENVELOPE_FORMAT: u32 = 1;
 /// in a ticket's folder, OWL-399). Format 2 adds the `no_slot` end
 /// (OWL-409); format 3 drops the `paused` hold, a usage limit holding its
 /// harness machine-wide instead (OWL-404); format 4 adds the `base_held` end
-/// (OWL-418); format 5 adds the `stopped` end (OWL-161). Formats 1 to 4 are
-/// still read, a `paused` hold read as none.
-pub const STEP_OUTCOME_FORMAT: u32 = 5;
+/// (OWL-418); format 5 adds the `stopped` end (OWL-161); format 6 adds the
+/// `not_mine` end (OWL-583). Formats 1 to 5 are still read, a `paused` hold
+/// read as none.
+pub const STEP_OUTCOME_FORMAT: u32 = 6;
 /// The format version of what a step carries to the next (`carry.json` in a
 /// ticket's folder, OWL-399).
 pub const CARRY_FORMAT: u32 = 1;
 /// The format version of the last `continue` comment the runner settled
 /// (`restart.json` in a ticket's folder, OWL-488).
 pub const TICKET_RESTART_FORMAT: u32 = 1;
+/// The format version of a ticket found not the operator's (`not_mine.json`
+/// in a ticket's folder, OWL-583).
+pub const NOT_MINE_FORMAT: u32 = 1;
 /// The format version of what the runner knows of a ticket's branch and ref
 /// between its runs (`run.json` in a ticket's folder, OWL-400).
 pub const RUN_FORMAT: u32 = 1;

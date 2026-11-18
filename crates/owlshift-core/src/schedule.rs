@@ -69,6 +69,9 @@ pub enum Wait<K> {
     /// Another ticket with the same id comes first; one id starts once.
     Duplicate,
     NotAdmitted,
+    /// Admitted by another person than this runner's operator, under
+    /// `takes = "mine"` (OWL-583): their runner takes it.
+    NotMine,
     Excluded,
     /// No decider (architecture, section 4).
     NoDecider,
@@ -114,6 +117,7 @@ impl<K> Wait<K> {
         match self {
             Wait::Duplicate => "duplicate",
             Wait::NotAdmitted => "not_admitted",
+            Wait::NotMine => "not_mine",
             Wait::Excluded => "excluded",
             Wait::NoDecider => "no_decider",
             Wait::NoIntake => "no_intake",
@@ -481,6 +485,8 @@ pub fn ready_set<K: Clone + Ord + AsRef<str>>(
             Some(Wait::Duplicate)
         } else if ticket.admission == Admission::NotAdmitted {
             Some(Wait::NotAdmitted)
+        } else if ticket.admission == Admission::NotMine {
+            Some(Wait::NotMine)
         } else if ticket.admission == Admission::Excluded {
             Some(Wait::Excluded)
         } else if !ticket.has_decider {
@@ -659,6 +665,10 @@ mod tests {
             }),
             with("A-9", &open),
             with("A-10", &|_| {}),
+            with("A-11", &|t| {
+                t.admission = Admission::NotMine;
+                t.has_decider = false;
+            }),
         ];
         let ready = ready_set(
             &tickets,
@@ -687,6 +697,7 @@ mod tests {
                 ("A-8", Wait::BlockerUnknown(vec!["UTF-8"])),
                 ("A-9", Wait::BlockedBy(vec!["X-1"])),
                 ("A-10", Wait::PrCap),
+                ("A-11", Wait::NotMine),
             ]
         );
     }

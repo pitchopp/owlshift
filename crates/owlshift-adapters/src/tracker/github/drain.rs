@@ -127,10 +127,12 @@ impl GitHubTracker {
         let mut listed = Vec::with_capacity(issues.len());
         for issue in issues {
             let created_at = issue.created_at.as_deref().map(timestamp).transpose()?;
+            let updated_at = issue.updated_at.as_deref().map(timestamp).transpose()?;
             let blockers = self.blockers(issue.number)?;
             listed.push(Listed {
                 ticket: self.listed_ticket(issue)?,
                 created_at,
+                updated_at,
                 blockers,
             });
         }

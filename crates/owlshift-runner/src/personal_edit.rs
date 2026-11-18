@@ -50,6 +50,8 @@ pub enum Kind {
     Texts,
     /// A harness's name, `claude` or `codex`.
     Harness,
+    /// Which tickets the drain takes, `mine` or `all` (OWL-583).
+    Takes,
 }
 
 impl Kind {
@@ -62,6 +64,7 @@ impl Kind {
             Self::Text => "text",
             Self::Texts => "texts",
             Self::Harness => "harness",
+            Self::Takes => "takes",
         }
     }
 
@@ -74,6 +77,7 @@ impl Kind {
             Self::Text => "a text",
             Self::Texts => "a list of texts",
             Self::Harness => "a harness's name",
+            Self::Takes => "\"mine\" or \"all\"",
         }
     }
 }
@@ -147,13 +151,23 @@ pub const KEYS: &[KeyInfo] = &[
         applies: Applies::NextPass,
         about: "Checked at every load of the file: the next step's included.",
     },
-    // No reader in a running process: `owlshift init` and the commands a
-    // person types.
+    // The drain of a Markdown project at its start (do_cmd.rs, `taking`,
+    // OWL-583), which hands the operator to its steps.
     KeyInfo {
         path: &["identity", "tracker"],
         kind: Kind::Text,
-        applies: Applies::NextPass,
-        about: NO_READER,
+        applies: Applies::NextStart,
+        about: "On a Markdown project, the drain reads it as its watch starts: the operator whose \
+                tickets it takes under `takes = \"mine\"` (OWL-583).",
+    },
+    // do_cmd.rs, `taking`, as the drain's watch starts (OWL-583): its steps
+    // get it in their envelope.
+    KeyInfo {
+        path: &["takes"],
+        kind: Kind::Takes,
+        applies: Applies::NextStart,
+        about: "The drain reads it once as its watch starts, with the operator's account, and \
+                hands it to its steps.",
     },
     KeyInfo {
         path: &["identity", "forge"],
@@ -195,6 +209,13 @@ pub const KEYS: &[KeyInfo] = &[
         kind: Kind::Texts,
         applies: Applies::NextPass,
         about: "Each step of this repository reads it as it starts, as the machine-wide list.",
+    },
+    KeyInfo {
+        path: &["repositories", REPOSITORY, "takes"],
+        kind: Kind::Takes,
+        applies: Applies::NextStart,
+        about: "The drain of this repository's project reads it as its watch starts, in place of \
+                the machine-wide `takes`.",
     },
     // do_cmd.rs:545, the step child's `OnDemand`.
     KeyInfo {
@@ -425,7 +446,9 @@ fn toml_value(info: &KeyInfo, path: &[String], value: &Json) -> Result<Value, Ed
         (Kind::Bool, Json::Bool(on)) => Ok(Value::from(*on)),
         (Kind::Integer, Json::Number(number)) => number.as_i64().map(Value::from).ok_or_else(bad),
         (Kind::Float, Json::Number(number)) => number.as_f64().map(Value::from).ok_or_else(bad),
-        (Kind::Text | Kind::Harness, Json::String(text)) => Ok(Value::from(text.as_str())),
+        (Kind::Text | Kind::Harness | Kind::Takes, Json::String(text)) => {
+            Ok(Value::from(text.as_str()))
+        }
         (Kind::Texts, Json::Array(items)) => {
             let mut array = Array::new();
             for item in items {
@@ -661,7 +684,12 @@ mod tests {
             Json::Array(many) => many.iter().filter_map(Json::as_str).collect(),
             _ => Vec::new(),
         };
-        let kind = if schema.get("enum").is_some() {
+        let kind = if schema
+            .get("enum")
+            .is_some_and(|values| values == &json!(["mine", "all"]))
+        {
+            Kind::Takes
+        } else if schema.get("enum").is_some() {
             Kind::Harness
         } else if types.contains(&"boolean") {
             Kind::Bool
@@ -705,7 +733,6 @@ mod tests {
     fn each_key_applies_as_its_readers_read_it() {
         let next_pass = [
             "requires",
-            "identity.tracker",
             "identity.forge",
             "keep_awake",
             "allow_gate_env",
@@ -728,6 +755,9 @@ mod tests {
             "harnesses.codex.usage_cap_percent",
             "github_app_client_id",
             "github_app_slug",
+            "identity.tracker",
+            "takes",
+            "repositories.*.takes",
         ];
         assert_eq!(next_pass.len() + next_start.len(), KEYS.len());
         for info in KEYS {

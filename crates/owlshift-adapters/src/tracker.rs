@@ -33,6 +33,13 @@ pub trait Tracker {
     /// Reads a ticket.
     fn ticket(&self, id: &TicketId) -> Result<Ticket, Error>;
 
+    /// The account of the key this adapter reads with: the runner's
+    /// operator (P10, OWL-583). `None` on a tracker whose key has no
+    /// account, the Markdown tracker.
+    fn operator(&self) -> Result<Option<KeyAccount>, Error> {
+        Ok(None)
+    }
+
     /// Every comment on a ticket, oldest first.
     fn comments(&self, id: &TicketId) -> Result<Vec<Comment>, Error>;
 
@@ -435,6 +442,11 @@ pub struct Listed {
     /// When the tracker created it; `None` on a tracker that keeps no time
     /// (the Markdown tracker), whose ties then go to the identifier.
     pub created_at: Option<Timestamp>,
+    /// When the tracker last updated it, a label or a state change included
+    /// (checked on 2026-11-18 on Linear and GitHub, OWL-583); `None` when the
+    /// tracker gives no time. The drain reads a colleague's gesture again
+    /// once it has moved.
+    pub updated_at: Option<Timestamp>,
     /// The tickets that block it by the tracker's relations, once each. The
     /// text convention is read by the core, not here.
     pub blockers: Vec<Blocker>,

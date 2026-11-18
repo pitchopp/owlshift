@@ -11,6 +11,7 @@ use owlshift_adapters::tracker::markdown;
 use owlshift_contracts::ready::{BlockerState as ReadyState, Outcome, ReadyBlocker, ReadySnapshot};
 use owlshift_contracts::waits::Behind;
 use owlshift_runner::notify;
+use owlshift_runner::operator::Taking;
 
 use super::*;
 
@@ -2488,6 +2489,162 @@ fn a_label_with_no_labeled_event_is_warned_of_once() {
     );
     assert!(!lines.contains("refused"), "{report}");
     assert!(!lines.contains("reading the admission gesture"), "{report}");
+}
+
+// OWL-583: a runner takes only the tickets its operator admitted.
+
+/// A bench admitting by the label with two people listed, the operator
+/// "maintainer" (DEMO-1, its author) and "lea", the author of DEMO-2, whose
+/// Markdown gesture is that author.
+fn two_people() -> Bench {
+    let bench = Bench::build_admitting(
+        "maintainer",
+        "assignee = \"maintainer\"\nlabels = [\"agent\"]\n",
+        "",
+        ", parked = \"Parked\"",
+        "admit = { label = \"agent\" }\nadmitters = [\"maintainer\", \"lea\"]",
+    );
+    bench.put_ticket("DEMO-2", "lea", "Todo", &["agent"], "", "Lea's.");
+    bench
+}
+
+/// What the ready snapshot made of `id`: its kind and its wait's words.
+fn made_now(bench: &Bench, id: &str) -> (&'static str, String) {
+    let snapshot = ready_now(bench).expect("a snapshot");
+    let ticket = snapshot
+        .tickets
+        .iter()
+        .find(|ticket| ticket.ticket.as_str() == id)
+        .unwrap_or_else(|| panic!("{id} is not listed: {snapshot:?}"));
+    match &ticket.drain {
+        Outcome::TakenIn => ("taken_in", String::new()),
+        Outcome::Running => ("running", String::new()),
+        Outcome::Dispatched => ("dispatched", String::new()),
+        Outcome::Waits { wait } => ("waits", wait.text.clone()),
+        Outcome::NotAdmitted { wait } => ("not_admitted", wait.text.clone()),
+    }
+}
+
+/// Scenario S14, "a runner never takes a ticket its operator did not
+/// delegate": under `takes = "mine"`, of DEMO-1 (the operator's) and
+/// DEMO-2 (lea's), the drain takes in and dispatches DEMO-1. DEMO-2's one
+/// step ends not mine: no run, no comment, no intake record, no warning,
+/// no event and no line; a record in its folder keeps it out of the next
+/// passes, worded "admitted by lea: their runner's". Admitted again by the
+/// operator (its author changed, so its update time moved), it is taken in
+/// at the first pass ten minutes after its gesture was read.
+#[test]
+fn scenario_s14_a_runner_takes_only_its_operators_tickets() {
+    let bench = two_people();
+    *bench.takes.borrow_mut() = Taking::Mine("maintainer".to_owned());
+    let intake = || bench.reply(None, Some(&intake_result("done", None, "")));
+    let replies = vec![
+        intake(),
+        bench.reply(Some("Hello"), Some(&done_for("DEMO-1"))),
+        intake(),
+    ];
+    let record =
+        || owlshift_runner::operator::read(&bench.dirs(), &TicketId::new("DEMO-2").unwrap());
+    let made = RefCell::new(Vec::new());
+    let read_at = RefCell::new(Vec::new());
+    let untouched = RefCell::new(Vec::new());
+    let (outcomes, lines, printed) = bench.drain_passes(replies, 4, |pass, _| {
+        made.borrow_mut().push(made_now(&bench, "DEMO-2"));
+        read_at
+            .borrow_mut()
+            .push(record().map(|record| record.read_at));
+        // No comment and no ticket ref of it while it is lea's.
+        untouched
+            .borrow_mut()
+            .push(bench.comments_on("DEMO-2").is_empty() && bench.record_of("DEMO-2").is_none());
+        let minutes = if pass == 3 {
+            // The operator admits it again: its author is the operator now,
+            // and its file was written after the record.
+            bench.put_ticket("DEMO-2", "maintainer", "Todo", &["agent"], "", "Lea's.");
+            let file = bench.remote.checkout.join("tickets/DEMO-2/ticket.md");
+            let later = std::time::SystemTime::now() + Duration::from_secs(3600);
+            fs::File::options()
+                .write(true)
+                .open(file)
+                .unwrap()
+                .set_modified(later)
+                .unwrap();
+            10
+        } else {
+            1
+        };
+        let later = bench
+            .clock
+            .get()
+            .checked_add(SignedDuration::from_mins(minutes));
+        bench.clock.set(later.unwrap());
+    });
+    let report = format!("{outcomes:?}\n{lines}\n{printed}");
+    made.borrow_mut().push(made_now(&bench, "DEMO-2"));
+    let not_mine = ("waits", "admitted by lea: their runner's".to_owned());
+    assert_eq!(
+        made.into_inner(),
+        [
+            ("waits", "its intake has not run yet".to_owned()),
+            not_mine.clone(),
+            not_mine,
+            ("taken_in", String::new()),
+        ],
+        "{report}"
+    );
+    // Read once, at pass 2, and not again while it rested.
+    let read_at = read_at.into_inner();
+    assert!(read_at[0].is_none() && read_at[1].is_some(), "{read_at:?}");
+    assert_eq!(read_at[1], read_at[2], "{report}");
+    assert!(record().is_none(), "taken in, its record is gone");
+    assert_eq!(untouched.into_inner(), [true, true, true], "{report}");
+    assert_eq!(
+        bench.runs(),
+        [
+            (Role::Intake, "DEMO-1".to_owned()),
+            (Role::Build, "DEMO-1".to_owned()),
+            (Role::Verify, "DEMO-1".to_owned()),
+            (Role::Intake, "DEMO-2".to_owned()),
+        ],
+        "{report}"
+    );
+    // No warning, no event and no line ever named it before its own
+    // operator's gesture.
+    let events = bench.events();
+    let told = |e: &&Event| e.ticket.as_ref().is_some_and(|t| t.as_str() == "DEMO-2");
+    assert!(
+        events
+            .iter()
+            .filter(told)
+            .all(|e| e.kind != EventKind::Warning
+                && e.data.get("reason") != Some(&json!("not_mine"))),
+        "{report}"
+    );
+    assert!(!lines.contains("their runner"), "{report}");
+}
+
+/// Under `takes = "all"`, as before P10, both people's tickets are taken.
+#[test]
+fn under_takes_all_a_runner_takes_every_admitted_ticket() {
+    let bench = two_people();
+    let intake = || bench.reply(None, Some(&intake_result("done", None, "")));
+    let replies = vec![
+        intake(),
+        intake(),
+        bench.reply(Some("Hello"), Some(&done_for("DEMO-1"))),
+    ];
+    let (outcomes, lines, printed) = bench.drain_passes(replies, 2, |_, _| {});
+    let report = format!("{outcomes:?}\n{lines}\n{printed}");
+    assert_eq!(
+        bench.runs(),
+        [
+            (Role::Intake, "DEMO-1".to_owned()),
+            (Role::Intake, "DEMO-2".to_owned()),
+            (Role::Build, "DEMO-1".to_owned()),
+            (Role::Verify, "DEMO-1".to_owned()),
+        ],
+        "{report}"
+    );
 }
 
 // OWL-485: a dark wake holds the dispatches and the steps' starts.

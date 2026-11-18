@@ -123,6 +123,7 @@ use crate::fix;
 use crate::follow::{self, Following, Look, Seen};
 use crate::held;
 use crate::in_flight::{self, Kind, Outside};
+use crate::operator::Taking;
 use crate::project::{self, Base, ProjectDirs, ProjectLock, TicketLock};
 use crate::proposals::{self, Filing};
 use crate::quarantine;
@@ -548,6 +549,11 @@ pub struct OnDemand<'a> {
     /// get them, `permissions.network` in their briefs: the personal file's
     /// `web_tools` ([`crate::config::web_tools_enabled`], OWL-415).
     pub web_tools: bool,
+    /// Which admitted tickets the drain's intake and dispatch take
+    /// (OWL-583, [`crate::operator`]): under [`Taking::Mine`], one whose
+    /// gesture is another account's ends not mine. Every other command
+    /// reads no gesture, and runs under [`Taking::All`].
+    pub takes: Taking,
 }
 
 /// The opt-in Codex reviewer (OWL-348, architecture section 5, "Codex"):

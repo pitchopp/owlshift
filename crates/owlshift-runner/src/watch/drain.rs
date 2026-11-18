@@ -35,6 +35,12 @@
 //! (OWL-313), so a pull request another command delivered since the
 //! snapshot holds it too, told the same way.
 //!
+//! Under `takes = "mine"` (OWL-583, [`crate::operator`]) a ticket whose
+//! intake or dispatch found its gesture another person's keeps a not-mine
+//! record in its folder: while it rests, the pass starts no step for the
+//! ticket, which waits as `not_mine` in the ready snapshot alone, with no
+//! warning, no event and no line.
+//!
 //! The ready snapshot (OWL-468, [`crate::ready`]): a pass that listed the
 //! column writes, at its end, every ticket of it in the core's order with
 //! what the pass made of it (taken in, running, dispatched, waiting and
@@ -67,6 +73,7 @@ use super::{Admit, Continued, Memory as WatchMemory, RETRY_AFTER, Seen, Then, Wa
 use crate::events::{Data, EventSink, data};
 use crate::in_flight::{self, Kind, Outside};
 use crate::on_demand::{self, delivery_followed};
+use crate::operator::{self, Taking};
 use crate::quarantine::Held;
 use crate::ticket_ref::{self, RefAt, Stored, text_sha256};
 use crate::usage as machine_usage;
@@ -113,6 +120,14 @@ pub(super) struct Memory {
     capped: bool,
     /// Why the ready snapshot could not be written, as last said.
     unwritten: Option<String>,
+    /// The tickets of this pass whose not-mine record rests (OWL-583), with
+    /// the account of their gesture: read at the pass's start, and added to
+    /// by a step of the pass that ended not mine.
+    resting: HashMap<TicketId, String>,
+    /// For each intake or dispatch started, when, and the tracker's update
+    /// time of its ticket the pass listed: what its not-mine record keeps
+    /// should it end so, whenever its child ends.
+    probing: HashMap<TicketId, (Timestamp, Option<Timestamp>)>,
 }
 
 /// A gesture warned of as not admitting: who made it, why it does not
@@ -145,6 +160,8 @@ enum Dispatch {
     Held,
     /// Build's harness is held by a usage limit until `until_ms`.
     UsageLimit { harness: Harness, until_ms: i64 },
+    /// Its gesture is `account`'s, not the operator's (OWL-583).
+    NotMine { account: String },
     /// Its step found the project, the ticket or the machine's run slots
     /// taken, or the ref moved: the next pass tries again.
     NotStarted,
@@ -227,6 +244,16 @@ impl Memory {
         self.waits.retain(|ticket, _| listed.contains(ticket));
         self.warned.retain(|ticket, _| listed.contains(ticket));
     }
+}
+
+/// What the ready snapshot's `not_mine` wait carries: the gesture's account
+/// and, when the project's `[people]` lists it, its handle (OWL-583).
+fn not_mine_data(config: &ProjectConfig, account: &str) -> Data {
+    let mut data = data([("account", json!(account))]);
+    if let Some(handle) = config.handle_of(account) {
+        data.insert("name".to_owned(), json!(handle));
+    }
+    data
 }
 
 /// A ticket of the column with what its ticket ref keeps.
@@ -432,6 +459,7 @@ impl Watch<'_> {
             }
         }
         rows.sort_by(Row::order);
+        self.rest(memory, &rows);
         // What the pass made of each ticket, for the ready snapshot.
         let mut made: HashMap<TicketId, Outcome> = HashMap::new();
         for row in &unread_rows {
@@ -574,6 +602,15 @@ impl Watch<'_> {
             if let Some(why) = &why_not {
                 detail.insert("why".to_owned(), json!(why));
             }
+            // Another person's ticket (OWL-583): worded in the snapshot
+            // alone, told by no event and no line.
+            if *wait == Wait::NotMine {
+                let account = memory.drain.resting.get(row.id()).cloned();
+                let data = not_mine_data(on_demand.config, account.as_deref().unwrap_or(""));
+                made.insert(row.id().clone(), waits(row.id(), wait.key(), data));
+                memory.drain.waits.remove(row.id());
+                continue;
+            }
             let outcome = match (wait, &intake) {
                 (Wait::NotAdmitted | Wait::Excluded, _) => Outcome::NotAdmitted {
                     wait: ready::wait(row.id(), wait.key(), detail.clone()),
@@ -660,6 +697,10 @@ impl Watch<'_> {
                 continue;
             }
             let outside = memory.outside.current();
+            memory.drain.probing.insert(
+                row.id().clone(),
+                ((on_demand.clock)(), row.listed.updated_at),
+            );
             let dispatched = self.dispatch(
                 memory,
                 row.id(),
@@ -669,12 +710,17 @@ impl Watch<'_> {
                 out,
                 continued,
             );
-            let outcome = match dispatched {
+            let outcome = match &dispatched {
                 Dispatch::Started => Outcome::Dispatched,
                 Dispatch::Held => waits(row.id(), "held", Data::new()),
                 Dispatch::UsageLimit { harness, until_ms } => {
-                    waits(row.id(), "usage_limit", usage_data(harness, until_ms))
+                    waits(row.id(), "usage_limit", usage_data(*harness, *until_ms))
                 }
+                Dispatch::NotMine { account } => waits(
+                    row.id(),
+                    Wait::<String>::NotMine.key(),
+                    not_mine_data(on_demand.config, account),
+                ),
                 Dispatch::NotStarted => waits(row.id(), "next_pass", Data::new()),
             };
             made.insert(row.id().clone(), outcome);
@@ -817,6 +863,10 @@ impl Watch<'_> {
             .filter(|row| row.intake_due(exclude) && !busy.contains(row.id()))
         {
             let ticket = row.id();
+            // Another person's ticket at rest (OWL-583): no step.
+            if memory.drain.resting.contains_key(ticket) {
+                continue;
+            }
             let now = (on_demand.clock)();
             if memory
                 .drain
@@ -840,12 +890,17 @@ impl Watch<'_> {
             }
             let envelope = self.envelope(memory, ticket, StepKind::Intake, &seen);
             let then = Then::Intake { seen };
+            memory
+                .drain
+                .probing
+                .insert(ticket.clone(), (now, row.listed.updated_at));
             match self.step(memory, sink, out, continued, envelope, None, None, then) {
                 // The ref moved, or the ticket left the column: the next
                 // pass reads it again.
                 Some(StepEnd::Stale) => return Intake::None,
-                // Told: the next candidate is tried.
-                Some(StepEnd::NotAdmitted { .. }) => {}
+                // Told, or another person's (OWL-583): the next candidate
+                // is tried.
+                Some(StepEnd::NotAdmitted { .. } | StepEnd::NotMine { .. }) => {}
                 end => {
                     return Intake::Took {
                         ticket: ticket.clone(),
@@ -868,14 +923,78 @@ impl Watch<'_> {
         sink: &mut EventSink<'_>,
         out: &mut dyn Write,
     ) {
+        self.settle_not_mine(memory, ticket, end, out);
         match end {
-            StepEnd::Stale => {}
+            StepEnd::Stale | StepEnd::NotMine { .. } => {}
             StepEnd::NotAdmitted { account, reason } => {
                 self.not_admitted(memory, ticket, account.clone(), reason, sink, out);
             }
             end => {
                 memory.drain.warned.remove(ticket);
                 self.ran(memory, ticket, seen, end, sink, out);
+            }
+        }
+    }
+
+    /// What an intake's or a dispatch's end `end` makes of `ticket`'s
+    /// not-mine record (OWL-583): another person's gesture writes it, with
+    /// when its step started and the update time its pass listed; any end
+    /// that read the gesture otherwise removes it. One that ran nothing, the
+    /// ref having moved or the ticket or a run slot being taken, keeps it.
+    fn settle_not_mine(
+        &self,
+        memory: &mut WatchMemory,
+        ticket: &TicketId,
+        end: &StepEnd,
+        out: &mut dyn Write,
+    ) {
+        let on_demand = self.on_demand;
+        let probed = memory.drain.probing.remove(ticket);
+        match end {
+            StepEnd::Stale | StepEnd::Busy | StepEnd::NoSlot | StepEnd::Stopped => {}
+            StepEnd::NotMine { account } => {
+                let Taking::Mine(operator) = &on_demand.takes else {
+                    return;
+                };
+                let (read_at, updated_at) = probed.unwrap_or_else(|| ((on_demand.clock)(), None));
+                let written = operator::write(
+                    on_demand.dirs,
+                    ticket,
+                    account,
+                    operator,
+                    read_at,
+                    updated_at,
+                );
+                if let Err(error) = written {
+                    self.line(
+                        out,
+                        &format!("{ticket}'s not-mine record could not be written: {error}"),
+                    );
+                }
+                memory.drain.resting.insert(ticket.clone(), account.clone());
+            }
+            _ => operator::remove(on_demand.dirs, ticket),
+        }
+    }
+
+    /// Reads the not-mine records of `rows` for this pass (OWL-583): under
+    /// `takes = "mine"`, each that rests keeps its ticket out of the pass;
+    /// under `all`, none does.
+    fn rest(&self, memory: &mut WatchMemory, rows: &[Row]) {
+        let on_demand = self.on_demand;
+        memory.drain.resting.clear();
+        let Taking::Mine(operator) = &on_demand.takes else {
+            return;
+        };
+        let now = (on_demand.clock)();
+        for row in rows {
+            if let Some(record) = operator::read(on_demand.dirs, row.id())
+                && operator::rests(&record, operator, row.listed.updated_at, now)
+            {
+                memory
+                    .drain
+                    .resting
+                    .insert(row.id().clone(), record.account);
             }
         }
     }
@@ -909,6 +1028,7 @@ impl Watch<'_> {
         let envelope = self.envelope(memory, ticket, StepKind::Dispatch, &seen);
         let then = Then::Dispatch { seen };
         match self.step(memory, sink, out, continued, envelope, None, outside, then) {
+            Some(StepEnd::NotMine { account }) => Dispatch::NotMine { account },
             Some(end) if !super::running::ran(&end) => Dispatch::NotStarted,
             _ => Dispatch::Started,
         }
@@ -928,8 +1048,9 @@ impl Watch<'_> {
         sink: &mut EventSink<'_>,
         out: &mut dyn Write,
     ) {
+        self.settle_not_mine(memory, ticket, end, out);
         match end {
-            StepEnd::Stale => {}
+            StepEnd::Stale | StepEnd::NotMine { .. } => {}
             // A pull request delivered since the snapshot (OWL-313): nothing
             // ran, so nothing is held; the next pass counts again.
             StepEnd::Capped {
@@ -1099,6 +1220,8 @@ impl Watch<'_> {
             Admission::Excluded
         } else if warned {
             Admission::NotAdmitted
+        } else if memory.drain.resting.contains_key(row.id()) {
+            Admission::NotMine
         } else {
             Admission::Admitted
         };

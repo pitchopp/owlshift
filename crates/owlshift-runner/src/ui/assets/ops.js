@@ -904,6 +904,7 @@
     text: textControl,
     texts: textsControl,
     harness: (value) => choiceControl([["unset", null], ["claude", "claude"], ["codex", "codex"]], value),
+    takes: (value) => choiceControl([["unset", null], ["mine", "mine"], ["all", "all"]], value),
   };
 
   function editSaidOf(answer) {

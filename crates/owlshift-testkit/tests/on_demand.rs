@@ -1295,6 +1295,9 @@ struct Bench {
     /// The personal file's `web_tools` as the runner reads it (OWL-415): on
     /// by default.
     web_tools: Cell<bool>,
+    /// What the drain takes (OWL-583): every admitted ticket unless a
+    /// scenario names an operator.
+    takes: RefCell<owlshift_runner::operator::Taking>,
     /// The runner's git commands a test probes, once it turns it on
     /// (OWL-489, [`LockProbe`]): an `Arc<Mutex<…>>`, not a `Cell`, as the
     /// runner's git setup must be `Send + Sync`.
@@ -1539,6 +1542,7 @@ impl Bench {
             usage: RefCell::new(tmp_data.join("usage")),
             usage_cap: Cell::new(None),
             web_tools: Cell::new(true),
+            takes: RefCell::new(owlshift_runner::operator::Taking::All),
             lock_probe: Arc::default(),
             issues: RefCell::new(None),
         }
@@ -2080,6 +2084,7 @@ impl Bench {
             notifier: Some(&self.notified),
             usage: &usage,
             web_tools: self.web_tools.get(),
+            takes: self.takes.borrow().clone(),
         };
         let mut out = Vec::new();
         let mut sink = EventSink::new(REPO, EventLog::in_dir(&self.data), &mut out);
@@ -3444,6 +3449,7 @@ fn a_do_whose_agent_cannot_run_is_refused_before_anything() {
         notifier: None,
         usage: &UsageStore::in_data_dir(&bench.data),
         web_tools: true,
+        takes: owlshift_runner::operator::Taking::All,
     };
     let mut out = Vec::new();
     let mut sink = EventSink::new(REPO, EventLog::in_dir(&bench.data), &mut out);
@@ -3529,6 +3535,7 @@ fn a_git_older_than_the_floor_is_refused_before_the_lock_and_the_tracker() {
         notifier: None,
         usage: &UsageStore::in_data_dir(&bench.data),
         web_tools: true,
+        takes: owlshift_runner::operator::Taking::All,
     };
     for command in ["do", "continue"] {
         let mut out = Vec::new();

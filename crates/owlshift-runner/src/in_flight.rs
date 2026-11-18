@@ -441,6 +441,8 @@ pub fn said(wait: &Wait<String>, exclude: Option<&str>, kinds: &HashMap<String, 
         Wait::NotAdmitted => {
             "its admission gesture is not from an account `[tracker].admitters` lists".to_owned()
         }
+        // Never told by a line (OWL-583): the ready snapshot words it.
+        Wait::NotMine => "another person admitted it: their runner's".to_owned(),
         Wait::Excluded => format!(
             "it carries the exclusion label {:?}",
             exclude.unwrap_or_default()

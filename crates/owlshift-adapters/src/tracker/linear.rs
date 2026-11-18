@@ -717,6 +717,11 @@ impl Tracker for LinearTracker {
         data.issue.into_ticket()
     }
 
+    /// The key's account ([`Self::key_account`]).
+    fn operator(&self) -> Result<Option<KeyAccount>, Error> {
+        self.key_account().map(Some)
+    }
+
     fn comments(&self, id: &TicketId) -> Result<Vec<Comment>, Error> {
         let variables = json!({ "id": id.as_str(), "first": self.comment_page });
         let mut comments: Vec<Comment> = self
@@ -1345,7 +1350,7 @@ const ADMITTED_QUERY: &str = concat!(
     "query Admitted($filter: IssueFilter!, $first: Int!, $after: String) { \
      issues(first: $first, after: $after, filter: $filter) { nodes { ",
     issue_fields!(),
-    " createdAt ",
+    " createdAt updatedAt ",
     blocker_fields!(),
     " } pageInfo { hasNextPage endCursor } } }"
 );
@@ -1624,6 +1629,7 @@ struct AdmittedIssue {
     #[serde(flatten)]
     issue: Issue,
     created_at: Timestamp,
+    updated_at: Timestamp,
     inverse_relations: Connection<Relation>,
 }
 
@@ -1656,6 +1662,7 @@ impl AdmittedIssue {
         Ok(Listed {
             ticket,
             created_at: Some(self.created_at),
+            updated_at: Some(self.updated_at),
             blockers,
         })
     }
@@ -3720,7 +3727,7 @@ mod tests {
             "priority": 0, "assignee": null, "creator": null, "botActor": null,
             "externalUserCreator": null,
             "labels": { "nodes": [], "pageInfo": { "hasNextPage": false } },
-            "createdAt": "2026-10-01T00:00:00Z",
+            "createdAt": "2026-10-01T00:00:00Z", "updatedAt": "2026-10-02T00:00:00Z",
             "inverseRelations": { "nodes": relations, "pageInfo": { "hasNextPage": more } } });
         json!({ "data": { "issues": { "nodes": [issue],
             "pageInfo": { "hasNextPage": false, "endCursor": null } } } })

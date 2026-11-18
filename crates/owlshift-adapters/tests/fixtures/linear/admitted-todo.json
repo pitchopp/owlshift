@@ -1,9 +1,9 @@
 {
-  "recorded": "2026-10-13 on the Owlshift workspace, recorded live",
+  "recorded": "2026-10-13 on the Owlshift workspace, recorded live; each issue's updatedAt added by hand as its createdAt (OWL-583)",
   "exchanges": [
     {
       "request": {
-        "query": "query Admitted($filter: IssueFilter!, $first: Int!, $after: String) { issues(first: $first, after: $after, filter: $filter) { nodes { identifier title description priority assignee { id displayName } creator { id displayName } botActor { name } externalUserCreator { name } labels(first: 50) { nodes { name } pageInfo { hasNextPage } } createdAt inverseRelations(first: 50, includeArchived: true) { nodes { type issue { identifier state { type } } } pageInfo { hasNextPage } } } pageInfo { hasNextPage endCursor } } }",
+        "query": "query Admitted($filter: IssueFilter!, $first: Int!, $after: String) { issues(first: $first, after: $after, filter: $filter) { nodes { identifier title description priority assignee { id displayName } creator { id displayName } botActor { name } externalUserCreator { name } labels(first: 50) { nodes { name } pageInfo { hasNextPage } } createdAt updatedAt inverseRelations(first: 50, includeArchived: true) { nodes { type issue { identifier state { type } } } pageInfo { hasNextPage } } } pageInfo { hasNextPage endCursor } } }",
         "variables": {
           "after": null,
           "filter": {
@@ -30,6 +30,7 @@
                 "assignee": null,
                 "botActor": null,
                 "createdAt": "2026-10-13T19:04:14.558Z",
+                "updatedAt": "2026-10-13T19:04:14.558Z",
                 "creator": {
                   "displayName": "person-1",
                   "id": "00000000-0000-4000-8000-000000000001"
@@ -63,6 +64,7 @@
                 "assignee": null,
                 "botActor": null,
                 "createdAt": "2026-10-13T09:33:47.665Z",
+                "updatedAt": "2026-10-13T09:33:47.665Z",
                 "creator": {
                   "displayName": "person-1",
                   "id": "00000000-0000-4000-8000-000000000001"
@@ -124,6 +126,7 @@
                 "assignee": null,
                 "botActor": null,
                 "createdAt": "2026-10-13T09:33:47.475Z",
+                "updatedAt": "2026-10-13T09:33:47.475Z",
                 "creator": {
                   "displayName": "person-1",
                   "id": "00000000-0000-4000-8000-000000000001"
@@ -194,6 +197,7 @@
                 "assignee": null,
                 "botActor": null,
                 "createdAt": "2026-10-13T09:33:47.132Z",
+                "updatedAt": "2026-10-13T09:33:47.132Z",
                 "creator": {
                   "displayName": "person-1",
                   "id": "00000000-0000-4000-8000-000000000001"
@@ -246,6 +250,7 @@
                 "assignee": null,
                 "botActor": null,
                 "createdAt": "2026-10-13T09:33:46.914Z",
+                "updatedAt": "2026-10-13T09:33:46.914Z",
                 "creator": {
                   "displayName": "person-1",
                   "id": "00000000-0000-4000-8000-000000000001"
@@ -289,6 +294,7 @@
                 "assignee": null,
                 "botActor": null,
                 "createdAt": "2026-10-13T09:33:46.647Z",
+                "updatedAt": "2026-10-13T09:33:46.647Z",
                 "creator": {
                   "displayName": "person-1",
                   "id": "00000000-0000-4000-8000-000000000001"
@@ -341,6 +347,7 @@
                 "assignee": null,
                 "botActor": null,
                 "createdAt": "2026-10-13T09:33:46.408Z",
+                "updatedAt": "2026-10-13T09:33:46.408Z",
                 "creator": {
                   "displayName": "person-1",
                   "id": "00000000-0000-4000-8000-000000000001"
@@ -402,6 +409,7 @@
                 "assignee": null,
                 "botActor": null,
                 "createdAt": "2026-10-13T09:33:46.135Z",
+                "updatedAt": "2026-10-13T09:33:46.135Z",
                 "creator": {
                   "displayName": "person-1",
                   "id": "00000000-0000-4000-8000-000000000001"
@@ -445,6 +453,7 @@
                 "assignee": null,
                 "botActor": null,
                 "createdAt": "2026-10-13T09:33:45.860Z",
+                "updatedAt": "2026-10-13T09:33:45.860Z",
                 "creator": {
                   "displayName": "person-1",
                   "id": "00000000-0000-4000-8000-000000000001"
@@ -488,6 +497,7 @@
                 "assignee": null,
                 "botActor": null,
                 "createdAt": "2026-10-04T09:15:59.736Z",
+                "updatedAt": "2026-10-04T09:15:59.736Z",
                 "creator": {
                   "displayName": "person-1",
                   "id": "00000000-0000-4000-8000-000000000001"

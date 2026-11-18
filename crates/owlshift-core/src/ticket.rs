@@ -54,6 +54,9 @@ pub enum Admission {
     NotAdmitted,
     /// Admitted by delegation, a label or a state, from a listed person.
     Admitted,
+    /// Admitted by a listed person who is not this runner's operator, under
+    /// `takes = "mine"` (P10, OWL-583): their runner's to take.
+    NotMine,
     /// An exclusion label keeps it out for good, whatever else it carries.
     Excluded,
 }

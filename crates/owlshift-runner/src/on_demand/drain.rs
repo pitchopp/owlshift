@@ -29,6 +29,9 @@ pub enum Taken<T> {
     /// The gesture the tracker shows was made by `account`, which does not
     /// admit; nothing ran.
     NotAdmitted { account: String, reason: String },
+    /// The gesture admits, and `account` made it, not the operator, under
+    /// `takes = "mine"` (OWL-583): nothing ran, no intake, no comment.
+    NotMine { account: String },
 }
 
 /// What the drain's dispatch did, once it ran at all.
@@ -169,9 +172,10 @@ impl OnDemand<'_> {
     }
 
     /// What both commands check once the ref is the one seen: the ticket
-    /// still in the column ([`still_ready`]), then its gesture at the base.
-    /// `None` when it left the column; `Some(Err)` when its stage or the
-    /// base cannot be read, or its gesture does not admit.
+    /// still in the column ([`still_ready`]), then its gesture at the base,
+    /// then, under [`Taking::Mine`], whose it is (OWL-583). `None` when it
+    /// left the column; `Some(Err)` when its stage or the base cannot be
+    /// read, its gesture does not admit, or it is another person's.
     fn drain_checks<T>(&self, p: &Prepared) -> Option<Result<Gesture, Taken<T>>> {
         let shown = match self.tracker.stage(&p.ticket) {
             Ok(shown) => shown,
@@ -187,16 +191,25 @@ impl OnDemand<'_> {
             Ok(admitters) => admitters,
             Err(why) => return Some(Err(Taken::Ran(Err(Stop::Refused(why))))),
         };
-        Some(
-            self.gesture_for(p, admitters.as_deref())
-                .map_err(|refusal| match refusal.account {
-                    Some(account) => Taken::NotAdmitted {
-                        account,
-                        reason: refusal.reason,
-                    },
-                    None => Taken::Ran(Err(Stop::Refused(refusal.reason))),
-                }),
-        )
+        let gesture = self
+            .gesture_for(p, admitters.as_deref())
+            .map_err(|refusal| match refusal.account {
+                Some(account) => Taken::NotAdmitted {
+                    account,
+                    reason: refusal.reason,
+                },
+                None => Taken::Ran(Err(Stop::Refused(refusal.reason))),
+            });
+        Some(gesture.and_then(|gesture| match &self.takes {
+            Taking::Mine(operator)
+                if !owlshift_core::floor::same_account(&gesture.account, operator) =>
+            {
+                Err(Taken::NotMine {
+                    account: gesture.account,
+                })
+            }
+            _ => Ok(gesture),
+        }))
     }
 }
 
