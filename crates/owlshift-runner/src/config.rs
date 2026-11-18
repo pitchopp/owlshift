@@ -193,6 +193,23 @@ impl Effective {
         }
     }
 
+    /// The cache folders the personal file's own entry for `repository`
+    /// allows, the machine-wide ones left out: what that entry's
+    /// `allow_caches` holds, as written (OWL-597). Empty without a personal
+    /// file that reads, or without the entry.
+    pub fn scoped_caches(&self, repository: &Repo) -> Vec<String> {
+        let FileState::Loaded { config, .. } = &self.personal else {
+            return Vec::new();
+        };
+        let key = repository_key(repository);
+        config
+            .repositories
+            .iter()
+            .filter(|(name, _)| name.eq_ignore_ascii_case(&key))
+            .flat_map(|(_, settings)| settings.allow_caches.iter().cloned())
+            .collect()
+    }
+
     /// What the drain of the project of `repository`, on a tracker of
     /// `kind` opened as `tracker`, takes (OWL-583, [`operator::resolve`]):
     /// the personal `takes` for that repository, `mine` without a personal
@@ -314,10 +331,39 @@ fn project_root(system: &dyn System, cwd: &Path) -> Result<Option<PathBuf>, Stri
     ))
 }
 
-/// The key of `repo` under the personal `repositories`, as the data
-/// directory places it: `github.com/<owner>/<name>`.
-fn repository_key(repo: &Repo) -> String {
+/// The key of `repo`, `<owner>/<name>`, under the personal `repositories`,
+/// as the data directory places it: `github.com/<owner>/<name>`.
+pub(crate) fn repository_key(repo: &impl fmt::Display) -> String {
     format!("github.com/{repo}")
+}
+
+/// Writes `text` as the configuration file at `file`, whole or not at all:
+/// into the folder of its real path, so a link stays a link and its target
+/// is written, its permissions kept; a file not there yet is made, with its
+/// folder, readable by its owner alone. Callers check the text with the
+/// file's loader first: the web UI's edit of the personal file
+/// (`personal_edit`), and the cache folders offered after a refusal
+/// (`cache_offer`, OWL-597).
+pub(crate) fn write_file(file: &Path, text: &str) -> io::Result<()> {
+    use std::io::Write;
+    let target = match fs::symlink_metadata(file) {
+        Ok(_) => fs::canonicalize(file)?,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => file.to_owned(),
+        Err(error) => return Err(error),
+    };
+    let dir = target
+        .parent()
+        .ok_or_else(|| io::Error::other("the file has no folder"))?;
+    fs::create_dir_all(dir)?;
+    let permissions = fs::metadata(&target).ok().map(|meta| meta.permissions());
+    let mut partial = tempfile::NamedTempFile::new_in(dir)?;
+    partial.write_all(text.as_bytes())?;
+    partial.as_file().sync_all()?;
+    if let Some(permissions) = permissions {
+        partial.as_file().set_permissions(permissions)?;
+    }
+    partial.persist(&target).map_err(|error| error.error)?;
+    Ok(())
 }
 
 /// The GitHub repository of the `origin` remote of the checkout at `root`,

@@ -1778,6 +1778,43 @@ mod setup {
         }
     }
 
+    /// OWL-597: a setup refused a folder of the home that is on the machine
+    /// names it at the end of its failure's reason, with the lines that open
+    /// it for the brief's repository; a credential path it was refused too
+    /// is never named.
+    #[test]
+    fn a_setup_refused_a_home_folder_names_it_in_its_reason() {
+        let bench = Bench::new();
+        fs::create_dir_all(bench.env.home().join(".cache/demo")).unwrap();
+        let setup = by_shell(
+            "echo \"open '$HOME/.cache/demo/x': Operation not permitted\" && echo \"open \
+             '$HOME/.aws/credentials': Operation not permitted\" && exit 1",
+            "echo open '%HOME%/.cache/demo/x': Operation not permitted && echo open \
+             '%HOME%/.aws/credentials': Operation not permitted && exit 1",
+        );
+        let report = bench.build_set_up(&[setup], &bench.commit("refs/remotes/origin/main"));
+        let failure = failed_before_the_harness(&bench, &report);
+        let reason = &failure.reason;
+        assert!(
+            reason.starts_with(
+                "setup: exit status 1; the sandbox closes the home and refused ~/.cache/demo: to \
+                 open it read-only, add \".cache/demo\" to stack.caches"
+            ),
+            "{reason}"
+        );
+        assert!(
+            reason.contains(&format!(
+                "[repositories.\"github.com/{}\"]",
+                bench.brief.project
+            )),
+            "{reason}"
+        );
+        assert!(
+            !reason.contains(".aws") && !reason.contains('\n'),
+            "{reason}"
+        );
+    }
+
     /// A Build fixing the runner's gate failure whose setup then fails on
     /// its own work is told both (OWL-389): the setup's failure beside the
     /// gate's, which it no longer replaces; only an earlier failure of the

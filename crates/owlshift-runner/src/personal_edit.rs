@@ -21,10 +21,11 @@
 //!   since the page read it (its SHA-256, [`rev_of`]), edited, checked with
 //!   the loader (`FileState::from_text` with `PersonalConfig::parse`), then
 //!   written whole into the folder of its real path, a link kept a link and
-//!   the file's permissions kept. A refused edit writes nothing.
+//!   the file's permissions kept (`config::write_file`). A refused edit writes
+//!   nothing.
 
 use std::fs;
-use std::io::{self, Write};
+use std::io;
 use std::path::Path;
 
 use owlshift_contracts::config::PersonalConfig;
@@ -32,7 +33,7 @@ use serde_json::Value as Json;
 use sha2::{Digest, Sha256};
 use toml_edit::{Array, DocumentMut, Item, Key, Table, TableLike, Value};
 
-use crate::config::FileState;
+use crate::config::{FileState, write_file};
 
 /// What a key holds, which gives the page its control and the server the
 /// TOML type it writes.
@@ -582,7 +583,7 @@ pub fn apply(
     }
     let changed = edited.text != text;
     if changed {
-        write(file, &edited.text)
+        write_file(file, &edited.text)
             .map_err(|error| Refusal::Io(format!("{}: {error}", file.display())))?;
     }
     Ok(Applied {
@@ -605,31 +606,6 @@ fn loader_error(file: &Path, text: &str) -> Option<String> {
         FileState::Invalid { error, .. } => Some(error),
         _ => None,
     }
-}
-
-/// Writes `text` as the file at `file`, whole or not at all: into the
-/// folder of its real path, so a link stays a link and its target is
-/// written, its permissions kept; a file not there yet is made, with its
-/// folder, readable by its owner alone.
-fn write(file: &Path, text: &str) -> io::Result<()> {
-    let target = match fs::symlink_metadata(file) {
-        Ok(_) => fs::canonicalize(file)?,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => file.to_owned(),
-        Err(error) => return Err(error),
-    };
-    let dir = target
-        .parent()
-        .ok_or_else(|| io::Error::other("the file has no folder"))?;
-    fs::create_dir_all(dir)?;
-    let permissions = fs::metadata(&target).ok().map(|meta| meta.permissions());
-    let mut partial = tempfile::NamedTempFile::new_in(dir)?;
-    partial.write_all(text.as_bytes())?;
-    partial.as_file().sync_all()?;
-    if let Some(permissions) = permissions {
-        partial.as_file().set_permissions(permissions)?;
-    }
-    partial.persist(&target).map_err(|error| error.error)?;
-    Ok(())
 }
 
 #[cfg(test)]

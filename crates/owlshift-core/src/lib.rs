@@ -18,7 +18,7 @@
 //! | When the decider's reply counts: the quiet window, `go` | [`reply`] |
 //! | Resource; who holds back whom | [`resource`]; [`collision`] |
 //! | Scheduler | [`schedule`]; dependencies to relations, [`dependency`] |
-//! | Policy floor | [`floor`]; what an agent process inherits, [`agent_env`] |
+//! | Policy floor | [`floor`]; what an agent process inherits, [`agent_env`]; the home folders a confined command was refused, [`closed_home`] |
 //! | A follow-up proposal's title, for its fingerprint | [`proposal`] |
 //! | A review pass settled: each finding's fate, where the ticket goes | [`review`] |
 //! | Who reviews, per variant, and on which model | [`roster`] |
@@ -30,6 +30,7 @@
 
 pub mod agent_env;
 pub mod base;
+pub mod closed_home;
 pub mod collision;
 pub mod decider;
 pub mod dependency;

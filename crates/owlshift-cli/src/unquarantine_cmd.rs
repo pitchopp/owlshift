@@ -7,17 +7,17 @@
 //! a non-interactive shell gets a refusal, and there is no flag to skip the
 //! question.
 
-use std::io::{self, BufRead, IsTerminal, Write};
+use std::io::{self, IsTerminal};
 use std::path::Path;
 use std::process::ExitCode;
 
 use owlshift_runner::config::{Effective, FileState};
-use owlshift_runner::events::{EventLog, EventSink, printable};
+use owlshift_runner::events::{EventLog, EventSink};
 use owlshift_runner::on_demand;
 use owlshift_runner::project::{self, ProjectDirs};
 use owlshift_runner::quarantine::{self, Cleared};
 
-use crate::fail;
+use crate::{ask, fail};
 
 pub fn run(config: &Effective) -> ExitCode {
     match run_with(config) {
@@ -73,15 +73,4 @@ fn repository_root<T>(project: &FileState<T>) -> Result<&Path, String> {
     };
     path.parent()
         .ok_or_else(|| format!("{} is in no folder", path.display()))
-}
-
-/// Shows `prompt`, safe for a terminal, and reads one line of standard
-/// input.
-fn ask(prompt: &str) -> io::Result<String> {
-    let mut stdout = io::stdout();
-    write!(stdout, "{}", printable(prompt))?;
-    stdout.flush()?;
-    let mut line = String::new();
-    io::stdin().lock().read_line(&mut line)?;
-    Ok(line)
 }

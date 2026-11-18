@@ -23,6 +23,7 @@ mod ui_cmd;
 mod unquarantine_cmd;
 mod why_cmd;
 
+use std::io::{self, BufRead, IsTerminal, Write};
 use std::num::NonZeroUsize;
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -544,6 +545,41 @@ fn exit_code(success: bool) -> ExitCode {
     }
 }
 
+/// Shows `prompt`, safe for a terminal, and reads one line of standard
+/// input.
+fn ask(prompt: &str) -> io::Result<String> {
+    let mut stdout = io::stdout();
+    write!(stdout, "{}", printable(prompt))?;
+    stdout.flush()?;
+    let mut line = String::new();
+    io::stdin().lock().read_line(&mut line)?;
+    Ok(line)
+}
+
+/// Asks the yes-or-no question `prompt`, whose answer is no unless typed:
+/// `None` off a terminal, where nothing is asked (standard input or output
+/// is not one: a piped input cannot answer, and a redirected output would
+/// hide the question).
+fn confirm(prompt: &str) -> Option<bool> {
+    let terminal = io::stdin().is_terminal() && io::stdout().is_terminal();
+    confirm_with(terminal, prompt, &mut ask)
+}
+
+/// [`confirm`] with `terminal` and the asking given: yes for `y` or `yes`
+/// in any case, no for anything else, an unread line included.
+fn confirm_with(
+    terminal: bool,
+    prompt: &str,
+    ask: &mut dyn FnMut(&str) -> io::Result<String>,
+) -> Option<bool> {
+    if !terminal {
+        return None;
+    }
+    let answer = ask(prompt).unwrap_or_default();
+    let answer = answer.trim();
+    Some(answer.eq_ignore_ascii_case("y") || answer.eq_ignore_ascii_case("yes"))
+}
+
 #[cfg(test)]
 mod doc_commands;
 
@@ -553,6 +589,42 @@ mod site_page;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// OWL-597: off a terminal nothing is asked; at one, only `y` or `yes`
+    /// is a yes, and an unread answer a no.
+    #[test]
+    fn a_question_is_asked_at_a_terminal_and_answered_yes_only_by_yes() {
+        let answer = |reply: &'static str| {
+            move |prompt: &str| -> io::Result<String> {
+                assert_eq!(prompt, "Add? [y/N] ");
+                if reply == "unreadable" {
+                    Err(io::Error::other("closed"))
+                } else {
+                    Ok(reply.to_owned())
+                }
+            }
+        };
+        let mut asked = false;
+        let mut ask = |_: &str| -> io::Result<String> {
+            asked = true;
+            Ok("y\n".to_owned())
+        };
+        assert_eq!(confirm_with(false, "Add? [y/N] ", &mut ask), None);
+        assert!(!asked);
+        for (reply, yes) in [
+            ("y\n", true),
+            (" YES \n", true),
+            ("\n", false),
+            ("no\n", false),
+            ("unreadable", false),
+        ] {
+            assert_eq!(
+                confirm_with(true, "Add? [y/N] ", &mut answer(reply)),
+                Some(yes),
+                "{reply:?}"
+            );
+        }
+    }
 
     /// OWL-522: the shipped binary opens the system keychain, and nothing in
     /// this crate holds another or depends on the test bench, which does.
