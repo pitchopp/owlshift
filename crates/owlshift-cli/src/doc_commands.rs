@@ -92,7 +92,7 @@ fn tokens(line: &str) -> Vec<Token> {
 
 /// The `owlshift` commands of one shell line: each piece between operators
 /// whose first word, past `NAME=value` assignments, is the binary.
-fn commands_of_line(line: &str) -> Vec<Vec<String>> {
+pub(super) fn commands_of_line(line: &str) -> Vec<Vec<String>> {
     let mut commands = Vec::new();
     let mut piece: Vec<String> = Vec::new();
     let mut flush = |piece: &mut Vec<String>| {
@@ -205,7 +205,7 @@ fn inline_code(line: &str) -> Vec<&str> {
 }
 
 /// Why `command` is not a command of the binary, if it is not.
-fn refusal(command: &[String]) -> Option<String> {
+pub(super) fn refusal(command: &[String]) -> Option<String> {
     let mut args = command.to_vec();
     args[0] = "owlshift".to_string();
     if let Err(error) = Cli::command().try_get_matches_from(&args) {

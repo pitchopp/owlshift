@@ -1,0 +1,248 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'self'; font-src 'self'; img-src 'self'; script-src 'self'; base-uri 'none'; form-action 'none'">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Owlshift · Your backlog works the night shift.</title>
+<meta name="description" content="Coding agents take the ready tickets of your tracker and deliver verified pull requests. The questions they could not settle are waiting on the ticket at breakfast.">
+<link rel="icon" type="image/svg+xml" href="brand/owlshift-mark.svg">
+<meta property="og:type" content="website">
+<meta property="og:title" content="Owlshift · Your backlog works the night shift.">
+<meta property="og:description" content="Coding agents take the ready tickets of your tracker and deliver verified pull requests. The questions they could not settle are waiting on the ticket at breakfast.">
+<meta property="og:url" content="https://pitchopp.github.io/owlshift/">
+<meta property="og:image" content="https://pitchopp.github.io/owlshift/brand/owlshift-social.png">
+<meta property="og:image:width" content="1280">
+<meta property="og:image:height" content="640">
+<meta property="og:image:alt" content="The Owlshift lockup and its tagline, Your backlog works the night shift, over a rising dawn.">
+<link rel="stylesheet" href="site.css">
+<script src="theme.js"></script>
+</head>
+<body id="top">
+
+<!-- The public site's page (OWL-576): docs/design/build-plan.md, "The public
+     site", says what it holds; docs/design/visual-identity.md, section 6,
+     "The public site's layout", says how it looks. No inline script and no
+     style attribute: the Content-Security-Policy above refuses both. -->
+
+<header class="bar">
+  <div class="wrap bar-inner">
+    <a class="bar-home" href="#top">
+      <img class="lockup lockup-light" src="brand/owlshift-lockup.svg" alt="Owlshift" width="215" height="30">
+      <img class="lockup lockup-dark" src="brand/owlshift-lockup-on-dark.svg" alt="Owlshift" width="215" height="30">
+    </a>
+    <nav class="bar-links" aria-label="Page">
+      <a class="bar-section" href="#how">How it works</a>
+      <a class="bar-section" href="#different">What's different</a>
+      <a class="bar-section" href="#install">Install</a>
+      <a class="bar-section" href="https://github.com/pitchopp/owlshift#adopt-a-project">Docs</a>
+      <a class="button outline" href="https://github.com/pitchopp/owlshift">GitHub</a>
+    </nav>
+  </div>
+</header>
+
+<main>
+
+<section class="band" aria-labelledby="tagline">
+  <div class="band-text">
+    <p class="facts">Open source · Apache-2.0</p>
+    <h1 id="tagline">Your backlog works the night shift.</h1>
+    <p class="band-lead">Coding agents take the ready tickets of your tracker and deliver verified pull requests. The questions they could not settle are waiting on the ticket at breakfast.</p>
+    <div class="actions">
+      <a class="button primary" href="#install">Install Owlshift</a>
+      <a class="button outline" href="https://github.com/pitchopp/owlshift">View on GitHub</a>
+    </div>
+  </div>
+  <svg class="dawn" viewBox="0 0 640 256" width="640" height="256" aria-hidden="true" focusable="false">
+    <circle cx="320" cy="256" r="256" fill="#2B1638"/>
+    <circle cx="320" cy="256" r="192" fill="#3D2150"/>
+    <circle cx="320" cy="256" r="128" fill="#FF8E5E"/>
+  </svg>
+</section>
+
+<section id="how" class="section">
+  <div class="wrap">
+    <h2>One night, one ticket</h2>
+    <p class="lead">No new board to learn: the questions, the answers and the delivery report live on the ticket you already write.</p>
+
+    <!-- AN EXAMPLE, NOT A REAL RUN. OWL-42, its times, its question and
+         pull request #128 are made up. The page is not served until the
+         demo run (OWL-577) replaces this timeline with its own facts and the
+         links to where each moment happened, under a comment naming the
+         issue (build plan, "The public site", "The demo"). -->
+    <ol class="timeline">
+      <li class="moment">
+        <p class="when"><time>18:12</time><span class="part">evening</span></p>
+        <span class="ring" aria-hidden="true"></span>
+        <div class="moment-body">
+          <h3>You mark the ticket ready</h3>
+          <p>OWL-42 is marked ready in the tracker you already use. Its blockers are done, so it is next in line.</p>
+        </div>
+      </li>
+      <li class="moment">
+        <p class="when"><time>22:04</time><span class="part">night</span></p>
+        <span class="ring" aria-hidden="true"></span>
+        <div class="moment-body">
+          <h3>A plan, before any code</h3>
+          <p>Intake sizes the ticket. A design is written, then reviewed by a fresh run, on another model when the configuration names one.</p>
+        </div>
+      </li>
+      <li class="moment">
+        <p class="when"><time>23:41</time></p>
+        <span class="ring" aria-hidden="true"></span>
+        <div class="moment-body">
+          <h3>A question only you can answer</h3>
+          <p>It is posted on the ticket, with a recommendation. OWL-42 waits; the other tickets go on.</p>
+          <div class="card question">
+            <p class="question-kind">QUESTIONS · round 1</p>
+            <p class="question-text">Q1 · Should the export include refunded invoices?</p>
+            <ul class="options">
+              <li class="option"><span class="option-letter">A.</span><span class="option-label">Leave refunds out</span></li>
+              <li class="option recommended"><span class="option-letter">B.</span><span class="option-label">Include them, with a status column</span><span class="option-tag">recommended</span></li>
+            </ul>
+            <p class="question-reply">Reply <code>Q1: B</code>, <code>ok</code> to take every recommendation, or in your own words.</p>
+          </div>
+        </div>
+      </li>
+      <li class="moment">
+        <p class="when"><time>07:58</time><span class="part">breakfast</span></p>
+        <span class="ring" aria-hidden="true"></span>
+        <div class="moment-body">
+          <h3>You answer over breakfast</h3>
+          <p><code>ok go</code> takes the recommendation. The answer is checked before anything resumes: half an answer is asked again.</p>
+        </div>
+      </li>
+      <li class="moment done">
+        <p class="when"><time>08:31</time></p>
+        <span class="ring" aria-hidden="true"></span>
+        <div class="moment-body">
+          <h3>A verified pull request</h3>
+          <p>The project's gate passed, and a fresh run reviewed the diff. A red check or a conflict is Owlshift's to repair. You merge.</p>
+          <p class="card pull-request"><span class="pull-request-state">✓</span><span class="pull-request-number">#128</span><span>Export invoices as CSV</span></p>
+        </div>
+      </li>
+    </ol>
+  </div>
+</section>
+
+<section id="different" class="section">
+  <div class="wrap">
+    <h2>What's different</h2>
+    <p class="lead">Ticket-to-agent runners exist. Owlshift makes three bets of its own.</p>
+    <div class="cards three">
+      <div class="card">
+        <p class="number">01</p>
+        <h3>The question loop is the product</h3>
+        <p>Questions can come at any stage, and they are asked on the ticket. The answer is checked before anything resumes, and there is no limit on rounds.</p>
+      </div>
+      <div class="card">
+        <p class="number">02</p>
+        <h3>Scheduling is enforced</h3>
+        <p>Blockers gate dispatch. Declared resources keep two tickets in flight from colliding, whether an agent or a person holds them.</p>
+      </div>
+      <div class="card">
+        <p class="number">03</p>
+        <h3>A ticket is a pipeline, not a session</h3>
+        <p>A plan before code, review by a fresh run, on another model when the configuration names one, the project's gate run confined, and the cost measured for each ticket.</p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section id="yours" class="section ground">
+  <div class="wrap">
+    <h2>It stays yours</h2>
+    <div class="yours">
+      <div class="facts-grid">
+        <div>
+          <h3>Your tracker</h3>
+          <p>Linear, GitHub Issues or Markdown files in your repository. Questions, answers and delivery reports live on the ticket: no new board.</p>
+        </div>
+        <div>
+          <h3>Your agents</h3>
+          <p>Claude Code, with Codex if you want it, on your own subscription. Owlshift never asks for a model API key.</p>
+        </div>
+        <div>
+          <h3>Your machine</h3>
+          <p>One light native background service. Agent runs are confined, and secrets are kept in the system keychain.</p>
+        </div>
+        <div>
+          <h3>Your merge</h3>
+          <p>No agent merges. Owlshift opens the pull request and repairs it; merging stays a person's unless the project opts in.</p>
+        </div>
+      </div>
+      <div class="card is-not">
+        <h3>What it is not</h3>
+        <ul>
+          <li>Not an IDE, a chat or a new board.</li>
+          <li>Not an auto-merger by default.</li>
+          <li>Not a hosted service.</li>
+        </ul>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section id="install" class="section">
+  <div class="wrap">
+    <h2>Install</h2>
+    <p class="lead">Install the latest release, on macOS, on Linux, or on Windows through WSL2.</p>
+    <div class="commands">
+      <div class="command-block">
+        <h3 class="command-os">macOS</h3>
+        <pre><code>brew tap pitchopp/owlshift https://github.com/pitchopp/owlshift
+brew trust --formula pitchopp/owlshift/owlshift
+brew install owlshift</code></pre>
+      </div>
+      <div class="command-block">
+        <h3 class="command-os">Linux, and Windows through WSL2</h3>
+        <pre><code>curl -fsSL https://raw.githubusercontent.com/pitchopp/owlshift/main/install.sh | sh</code></pre>
+      </div>
+    </div>
+    <p class="doctor">Then <code>owlshift doctor</code> checks the machine: git, Claude Code, and whether agent runs can be confined.</p>
+
+    <h3 class="adopt-title">Adopt a project</h3>
+    <div class="cards three adopt">
+      <a class="card link-card" href="https://github.com/pitchopp/owlshift/blob/main/docs/adopt/linear.md">
+        <span class="link-card-title">Linear</span>
+        <span class="link-card-text">From <code>owlshift init</code> in your repository to a first pull request, then to the background service.</span>
+        <span class="link-card-go">Adopt a project on Linear</span>
+      </a>
+      <a class="card link-card" href="https://github.com/pitchopp/owlshift/blob/main/docs/adopt/github-issues.md">
+        <span class="link-card-title">GitHub Issues</span>
+        <span class="link-card-text">Your tickets are the repository's own issues.</span>
+        <span class="link-card-go">Adopt a project on GitHub Issues</span>
+      </a>
+      <a class="card link-card" href="https://github.com/pitchopp/owlshift/blob/main/docs/adopt/markdown.md">
+        <span class="link-card-title">Markdown files</span>
+        <span class="link-card-text">Your tickets live nowhere yet, or you want to try without an account.</span>
+        <span class="link-card-go">Adopt a project with Markdown tickets</span>
+      </a>
+    </div>
+    <p class="young">Owlshift is young: several developers on one project, a runner on a server, more trackers and forges and a desktop app are later steps of the <a href="https://github.com/pitchopp/owlshift/blob/main/docs/design/roadmap.md">roadmap</a>. See the <a href="https://github.com/pitchopp/owlshift/releases/latest">latest release</a>.</p>
+  </div>
+</section>
+
+</main>
+
+<footer class="foot">
+  <div class="wrap foot-inner">
+    <span class="signature">{<span class="signature-eyes">o,o</span>}</span>
+    <nav class="foot-links" aria-label="Repository">
+      <a href="https://github.com/pitchopp/owlshift">GitHub</a>
+      <a href="https://github.com/pitchopp/owlshift/blob/main/CHANGELOG.md">Changelog</a>
+      <a href="https://github.com/pitchopp/owlshift/blob/main/SECURITY.md">Security</a>
+      <a href="https://github.com/pitchopp/owlshift/blob/main/CONTRIBUTING.md">Contributing</a>
+    </nav>
+    <a class="licence" href="https://github.com/pitchopp/owlshift/blob/main/LICENSE">Apache-2.0</a>
+    <div class="switch" role="group" aria-label="Theme" hidden>
+      <button type="button" data-theme-choice="dark" aria-pressed="false">Dark</button>
+      <button type="button" data-theme-choice="light" aria-pressed="false">Light</button>
+      <button type="button" data-theme-choice="auto" aria-pressed="false">Auto</button>
+    </div>
+    <p class="foot-line">The night is young.</p>
+  </div>
+</footer>
+
+</body>
+</html>
