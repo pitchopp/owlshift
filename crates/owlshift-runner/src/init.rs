@@ -29,7 +29,7 @@ use crate::config::{OWLSHIFT_VERSION, PROJECT_FILE};
 use crate::executor::harness::CLAUDE_AGENT_ACCOUNT;
 use crate::forge::{GITHUB_ACCOUNT, GITHUB_TOKEN_HELP};
 use crate::secrets::{self, SecretSet, Source, TrackerAccounts};
-use crate::tracker::{LINEAR_ACCOUNT, LINEAR_APP_ID_ACCOUNT, LINEAR_APP_SECRET_ACCOUNT};
+use crate::tracker::{LINEAR_ACCOUNT, LINEAR_APP_ID_ACCOUNT, LINEAR_APP_SECRET_ACCOUNT, SignedIn};
 
 /// The values of a new project file.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -190,6 +190,62 @@ pub fn write_once_connected(
     };
     let text = project_file(&options)?;
     write_project_file(root, &text).map_err(|error| format!("{PROJECT_FILE}: {error}"))
+}
+
+/// The entry `init` prints for a project file kept as it is whose
+/// `[people]` does not list the accounts it signed in as (OWL-582, build plan
+/// "P10 · Teams", "People"): the file changes through a pull request, so
+/// `init` writes nothing to it. `None` without the table, when nothing was
+/// read, and when every account read is listed, both under one handle.
+/// The handle is the one a listed account has, else a placeholder.
+pub fn people_entry(config: &ProjectConfig, signed_in: &SignedIn) -> Option<String> {
+    let people = config.people.as_ref()?;
+    if signed_in.tracker.is_none() && signed_in.forge.is_none() {
+        return None;
+    }
+    let by_tracker = signed_in
+        .tracker
+        .as_deref()
+        .and_then(|account| config.handle_of(account));
+    let by_forge = signed_in.forge.as_deref().and_then(|login| {
+        people
+            .iter()
+            .find(|(_, person)| {
+                person
+                    .forge
+                    .as_deref()
+                    .is_some_and(|listed| listed.eq_ignore_ascii_case(login))
+            })
+            .map(|(handle, _)| handle.as_str())
+    });
+    let listed = match (&signed_in.tracker, &signed_in.forge) {
+        (Some(_), Some(_)) => by_tracker.is_some() && by_tracker == by_forge,
+        (Some(_), None) => by_tracker.is_some(),
+        (None, _) => by_forge.is_some(),
+    };
+    if listed {
+        return None;
+    }
+    let handle = by_tracker.or(by_forge);
+    let person = handle.and_then(|handle| people.get(handle));
+    let quote = |text: &str| toml::Value::String(text.to_owned()).to_string();
+    let mut entry = format!("[people.{}]\n", handle.unwrap_or("<handle>"));
+    match signed_in
+        .tracker
+        .as_deref()
+        .or(person.map(|p| p.tracker.as_str()))
+    {
+        Some(tracker) => entry.push_str(&format!("tracker = {}\n", quote(tracker))),
+        None => entry.push_str("tracker = \"<your tracker account>\"\n"),
+    }
+    if let Some(forge) = signed_in
+        .forge
+        .as_deref()
+        .or(person.and_then(|p| p.forge.as_deref()))
+    {
+        entry.push_str(&format!("forge = {}\n", quote(forge)));
+    }
+    Some(entry)
 }
 
 /// A `key = [...]` block, each command preceded by the comment saying what it
@@ -705,6 +761,44 @@ mod tests {
             detected: Detection::default(),
             admitter: None,
         }
+    }
+
+    /// OWL-582: beside a kept `[people]`, the entry printed for the accounts
+    /// signed in: none when they are listed under one handle or nothing was
+    /// read; the listed handle when one account is; a placeholder else.
+    #[test]
+    fn the_people_entry_names_the_accounts_signed_in() {
+        let text = project_file(&options(TrackerKind::Markdown, None, &["make"])).unwrap();
+        let kept = ProjectConfig::parse(&format!(
+            "{text}\n[people.ann]\ntracker = \"u-ann\"\nforge = \"Ann-Dev\"\n"
+        ))
+        .unwrap();
+        let signed = |tracker: Option<&str>, forge: Option<&str>| SignedIn {
+            tracker: tracker.map(ToOwned::to_owned),
+            forge: forge.map(ToOwned::to_owned),
+        };
+        for listed in [
+            signed(Some("u-ann"), Some("ann-dev")),
+            signed(Some("u-ann"), None),
+            signed(None, Some("ANN-DEV")),
+            signed(None, None),
+        ] {
+            assert_eq!(people_entry(&kept, &listed), None, "{listed:?}");
+        }
+        assert_eq!(
+            people_entry(&kept, &signed(Some("u-ann"), Some("ann2"))).as_deref(),
+            Some("[people.ann]\ntracker = \"u-ann\"\nforge = \"ann2\"\n")
+        );
+        assert_eq!(
+            people_entry(&kept, &signed(Some("u-bob"), Some("bob"))).as_deref(),
+            Some("[people.<handle>]\ntracker = \"u-bob\"\nforge = \"bob\"\n")
+        );
+        assert_eq!(
+            people_entry(&kept, &signed(None, Some("bob"))).as_deref(),
+            Some("[people.<handle>]\ntracker = \"<your tracker account>\"\nforge = \"bob\"\n")
+        );
+        let without = ProjectConfig::parse(&text).unwrap();
+        assert_eq!(people_entry(&without, &signed(Some("u-bob"), None)), None);
     }
 
     /// OWL-537: a GitHub Issues project names its stages as labels, its

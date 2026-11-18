@@ -114,6 +114,37 @@ kind = \"github\"
         doctored(&config.tracker, repo, super::ask::<Facts>(system, &probe))
     }
 
+    /// The forge credential's account: its numeric id as the tracker
+    /// account and its login (OWL-582).
+    fn signed_in(&self, setup: &Setup<'_>) -> super::SignedIn {
+        match super::forge_account(setup).filter(|account| !account.app) {
+            Some(account) => super::SignedIn {
+                tracker: Some(account.id),
+                forge: Some(account.name),
+            },
+            None => super::SignedIn::default(),
+        }
+    }
+
+    /// The account of the project's forge credential, which is its tracker
+    /// key (OWL-582).
+    fn operator(
+        &self,
+        system: &dyn System,
+        config: &ProjectConfig,
+        _accounts: Option<&TrackerAccounts>,
+        repo: Option<&Repo>,
+    ) -> Option<super::Operator> {
+        let repo = repo?;
+        Some(super::ask::<super::Operator>(
+            system,
+            &OperatorProbe {
+                repo: repo.clone(),
+                tracker: config.tracker.clone(),
+            },
+        ))
+    }
+
     /// The label fallback of architecture section 6: proposals are issues
     /// carrying [`PROPOSED_LABEL`], which `init` creates.
     fn proposals_inbox(
@@ -417,11 +448,41 @@ impl Probe for FactsProbe {
     }
 }
 
+/// The account of the forge credential stored for the project of `repo`
+/// ([`super::github_operator`], OWL-582).
+#[derive(Debug)]
+struct OperatorProbe {
+    repo: Repo,
+    tracker: config::Tracker,
+}
+
+impl Probe for OperatorProbe {
+    fn read(&self, keychain: &Keychain) -> Probed {
+        Probed::new::<super::Operator>(super::github_operator(keychain, &self.repo, &self.tracker))
+    }
+
+    fn keychain_error(&self, reason: String) -> Probed {
+        Probed::new::<super::Operator>(Err(reason))
+    }
+
+    /// As [`crate::system::fake::FakeSystem::github_operator_is`] scripted
+    /// it, else unreachable.
+    #[cfg(test)]
+    fn fake(&self, host: &crate::system::fake::FakeSystem) -> Probed {
+        Probed::new::<super::Operator>(
+            host.scripted::<Script>()
+                .and_then(|script| script.operator.clone())
+                .unwrap_or_else(|| Err("GitHub: no network in tests".to_owned())),
+        )
+    }
+}
+
 /// What a GitHub Issues project's repository answers the test host.
 #[cfg(test)]
 #[derive(Default)]
 struct Script {
     facts: Option<Facts>,
+    operator: Option<super::Operator>,
 }
 
 #[cfg(test)]
@@ -429,6 +490,12 @@ impl crate::system::fake::FakeSystem {
     /// A GitHub Issues project's repository answers so (OWL-537).
     pub(crate) fn github_facts_are(self, answer: Facts) -> Self {
         self.script(|script: &mut Script| script.facts = Some(answer))
+    }
+
+    /// The account of a GitHub Issues project's credential reads so
+    /// (OWL-582).
+    pub(crate) fn github_operator_is(self, answer: super::Operator) -> Self {
+        self.script(|script: &mut Script| script.operator = Some(answer))
     }
 }
 

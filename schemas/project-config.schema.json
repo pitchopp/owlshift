@@ -18,6 +18,20 @@
     "models": {
       "$ref": "#/$defs/Models"
     },
+    "people": {
+      "description": "The project's people (P10, OWL-582), keyed by handle: each person\nonce, with their tracker account and their forge login. With it,\n`tracker.admitters` and each zone's `owner` name handles, every\nperson with a forge login is a reviewer, and `forge.reviewers` is\nrefused; without it, the file reads as before. Optional, but at\nleast one person when set. A file using it requires an Owlshift that\nreads it.\n\nHandles are resolved when the file is parsed: a parsed\nconfiguration's admitters, zone owners and reviewers hold accounts,\nas in a file without the table, so every rule compares accounts.\nRendering the configuration writes the handles back.",
+      "type": [
+        "object",
+        "null"
+      ],
+      "additionalProperties": {
+        "$ref": "#/$defs/Person"
+      },
+      "minProperties": 1,
+      "propertyNames": {
+        "pattern": "^[a-z][a-z0-9_-]{0,31}$"
+      }
+    },
     "pipeline": {
       "$ref": "#/$defs/Pipeline"
     },
@@ -172,7 +186,7 @@
           ]
         },
         "reviewers": {
-          "description": "The forge logins whose reviews on Owlshift's pull requests are read,\neach written exactly and mapped to its tracker account's identifier,\nwritten as a zone's owner is. A review is an instruction when that\naccount is the ticket's decider, and context otherwise; anyone\nelse's review is ignored. No login listed twice, even in another\ncase. Absent or empty, no review is read; a `[forge]` table sets it\nor `merge`.",
+          "description": "The forge logins whose reviews on Owlshift's pull requests are read,\neach written exactly and mapped to its tracker account's identifier,\nwritten as a zone's owner is. A review is an instruction when that\naccount is the ticket's decider, and context otherwise; anyone\nelse's review is ignored. No login listed twice, even in another\ncase. Absent or empty, no review is read; a `[forge]` table sets it\nor `merge`. Refused beside `[people]`, which replaces it: there,\nevery person with a `forge` login is a reviewer, and a parsed\nconfiguration holds them here (OWL-582).",
           "type": "object",
           "additionalProperties": {
             "type": "string"
@@ -271,6 +285,27 @@
           "type": "string",
           "const": "rebase"
         }
+      ]
+    },
+    "Person": {
+      "description": "One person of `[people]` (P10, OWL-582): their accounts as the project\nlists them, as the personal file's `identity` lists the operator's own.",
+      "type": "object",
+      "properties": {
+        "forge": {
+          "description": "Their forge login, compared without case; optional: without it, no\nreview of theirs is read. No two people share one.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "tracker": {
+          "description": "Their tracker account's identifier as the tracker reports it (a\nLinear user's id, a GitHub account's numeric id, the name on the\nMarkdown tracker), written exactly. No two people share one.",
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "tracker"
       ]
     },
     "Pipeline": {
@@ -591,7 +626,7 @@
           "$ref": "#/$defs/Admit"
         },
         "admitters": {
-          "description": "The tracker accounts whose gesture admits a ticket to the drain\n(`owlshift watch --drain`), each by its identifier as the tracker\nreports it (a Linear user's id, the name on the Markdown tracker),\nwritten exactly, as a zone's owner is. Optional for the file;\n`--drain` refuses to start without it. When set, at least one, each\nonce, none blank, padded or holding a control character. A file\nusing it requires an Owlshift that reads it (OWL-245).",
+          "description": "The tracker accounts whose gesture admits a ticket to the drain\n(`owlshift watch --drain`), each by its identifier as the tracker\nreports it (a Linear user's id, the name on the Markdown tracker),\nwritten exactly, as a zone's owner is. Optional for the file;\n`--drain` refuses to start without it. When set, at least one, each\nonce, none blank, padded or holding a control character. A file\nusing it requires an Owlshift that reads it (OWL-245). With\n`[people]`, each is a handle of that table instead (OWL-582).",
           "type": [
             "array",
             "null"
@@ -676,7 +711,7 @@
       "type": "object",
       "properties": {
         "owner": {
-          "description": "The tracker account that decides the tickets without an assignee\ntouching this zone: its identifier as the tracker reports it (a\nLinear user's id, the name on the Markdown tracker), written exactly.",
+          "description": "The tracker account that decides the tickets without an assignee\ntouching this zone: its identifier as the tracker reports it (a\nLinear user's id, the name on the Markdown tracker), written exactly.\nBeside `[people]` the file names a handle, and a parsed configuration\nholds its tracker account (OWL-582).",
           "type": "string"
         }
       },

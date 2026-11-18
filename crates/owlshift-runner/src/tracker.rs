@@ -154,6 +154,64 @@ pub trait Kind: Sync {
     fn admission_words(&self) -> &'static AdmissionWords {
         &LINEAR_WORDS
     }
+
+    /// The accounts `init` signed in as, with the credentials it just
+    /// stored, for the entry it prints when `[people]` does not list them
+    /// (OWL-582): the tracker key's account and the forge credential's
+    /// login, each read as the UI's reply key reads it (`key_account`) and
+    /// left out when it cannot be read or is an app's. Nothing on a tracker
+    /// whose key has no account.
+    fn signed_in(&self, setup: &Setup<'_>) -> SignedIn {
+        let _ = setup;
+        SignedIn::default()
+    }
+
+    /// This machine's operator for doctor's `people` line (OWL-582): the
+    /// account of the tracker key `init` stored (build plan "P10 · Teams",
+    /// "The operator"), read as the UI's reply key reads it
+    /// (`key_account`), for the loaded project `config`, with the tracker
+    /// set stored under `accounts` or the credential of `repo`. `None` when
+    /// it cannot be asked, which the `secrets` line says, and on a tracker
+    /// whose key has no account.
+    fn operator(
+        &self,
+        system: &dyn System,
+        config: &ProjectConfig,
+        accounts: Option<&TrackerAccounts>,
+        repo: Option<&Repo>,
+    ) -> Option<Operator> {
+        let _ = (system, config, accounts, repo);
+        None
+    }
+}
+
+/// The operator's account as [`Kind::operator`] read it, or why not.
+pub type Operator = Result<tracker::KeyAccount, String>;
+
+/// The accounts [`Kind::signed_in`] read, each when it could.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SignedIn {
+    /// The tracker account's identifier.
+    pub tracker: Option<String>,
+    /// The forge login.
+    pub forge: Option<String>,
+}
+
+/// The account of the forge credential `init` stored for the project, as
+/// `GET user` gives it (`key_account`); `None` when it cannot be read.
+pub(crate) fn forge_account(setup: &Setup<'_>) -> Option<tracker::KeyAccount> {
+    let repo = setup.repo.ok()?;
+    let mut read = |account: &str| setup.keychain.read(account).map_err(|e| e.to_string());
+    let found = crate::secrets::forge(repo, &mut read).ok()?;
+    let forge = crate::forge::github(&found, repo.clone(), setup.access).ok()?;
+    GitHubTracker::new(forge, setup.tracker).key_account().ok()
+}
+
+/// The login of [`forge_account`], unless it is an app's.
+pub(crate) fn forge_login(setup: &Setup<'_>) -> Option<String> {
+    forge_account(setup)
+        .filter(|account| !account.app)
+        .map(|account| account.name)
 }
 
 /// The lines `init` has written under `[tracker]` since P4 for Linear and
@@ -642,6 +700,29 @@ pub fn github_facts(
         labels: Some(labels),
         accounts: Some(accounts),
     })
+}
+
+/// The account of the Linear key stored under `accounts`: this machine's
+/// operator, for doctor's `people` line (OWL-582).
+pub fn linear_operator(keychain: &Keychain, accounts: &TrackerAccounts) -> Operator {
+    match read_key(keychain, accounts)? {
+        Some(key) => LinearTracker::new(key)
+            .key_account()
+            .map_err(|error| error.to_string()),
+        None => Err("no Linear API key is stored for this project".to_owned()),
+    }
+}
+
+/// The account of the forge credential stored for the GitHub Issues project
+/// of `repo`: this machine's operator, for doctor's `people` line (OWL-582).
+/// Read as [`github_facts`] opens the credential.
+pub fn github_operator(keychain: &Keychain, repo: &Repo, tracker: &config::Tracker) -> Operator {
+    let mut read = |account: &str| keychain.read(account).map_err(|error| error.to_string());
+    let found = crate::secrets::forge(repo, &mut read)?;
+    let token = crate::forge::token_at(&found, jiff::Timestamp::now())?;
+    GitHubTracker::new(GitHubForge::new(token, repo.clone()), tracker)
+        .key_account()
+        .map_err(|error| error.to_string())
 }
 
 fn read_key(keychain: &Keychain, accounts: &TrackerAccounts) -> Result<Option<ApiKey>, String> {

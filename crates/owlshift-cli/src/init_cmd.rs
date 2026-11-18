@@ -30,9 +30,9 @@ use owlshift_runner::forge::{AppAccess, GitHubApp};
 use owlshift_runner::github_sign_in::{self, Ask, GitHub, Outcome, SystemWait};
 use owlshift_runner::init::{
     AppStored, CLAUDE_TOKEN, EXAMPLE_ASSIGNEE, EXAMPLE_TICKET, GITHUB_TOKEN, InitOptions,
-    MARKDOWN_LIMITS, MARKDOWN_PAGE, SecretsReport, Wanted, Written, project_file, read_root_files,
-    required_secrets, store_app_credentials, store_secrets, wanted_secrets, write_example_ticket,
-    write_once_connected, write_project_file,
+    MARKDOWN_LIMITS, MARKDOWN_PAGE, SecretsReport, Wanted, Written, people_entry, project_file,
+    read_root_files, required_secrets, store_app_credentials, store_secrets, wanted_secrets,
+    write_example_ticket, write_once_connected, write_project_file,
 };
 use owlshift_runner::install::Manifests;
 use owlshift_runner::project::ProjectDirs;
@@ -348,6 +348,20 @@ pub fn run(args: &Args, config: &Effective) -> ExitCode {
             answered = false;
         }
         (Err(_), File::New(..)) => {}
+    }
+    // A kept file is a person's to change, through a pull request: with
+    // `[people]`, the entry of the accounts signed in, when it lists them
+    // not, is printed and never written (OWL-582).
+    if let (Ok(_), File::Kept(path), FileState::Loaded { config: kept, .. }) =
+        (&connected, &file, &config.project)
+        && kept.people.is_some()
+        && let Some(entry) = people_entry(kept, &tracker::of(tracker).signed_in(&setup))
+    {
+        println!(
+            "`[people]` in {} does not list the accounts this machine signed in as. Add this \
+             entry through a pull request, choosing its handle if it shows `<handle>`:\n\n{entry}",
+            path.display()
+        );
     }
     if let File::New(path, options) = &file {
         let root = path.parent().unwrap_or(path);

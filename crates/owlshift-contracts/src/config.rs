@@ -49,6 +49,22 @@ pub struct ProjectConfig {
     /// `backend/billing`: who owns each.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub zones: BTreeMap<String, ZoneSettings>,
+    /// The project's people (P10, OWL-582), keyed by handle: each person
+    /// once, with their tracker account and their forge login. With it,
+    /// `tracker.admitters` and each zone's `owner` name handles, every
+    /// person with a forge login is a reviewer, and `forge.reviewers` is
+    /// refused; without it, the file reads as before. Optional, but at
+    /// least one person when set. A file using it requires an Owlshift that
+    /// reads it.
+    ///
+    /// Handles are resolved when the file is parsed: a parsed
+    /// configuration's admitters, zone owners and reviewers hold accounts,
+    /// as in a file without the table, so every rule compares accounts.
+    /// Rendering the configuration writes the handles back.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("propertyNames" = { "pattern": "^[a-z][a-z0-9_-]{0,31}$" }))]
+    #[schemars(extend("minProperties" = 1))]
+    pub people: Option<BTreeMap<String, Person>>,
     /// Settings per role (OWL-312), keyed by the role's name as its prompt
     /// file is (`build`, `resolver`, `intake`, `design`, `design_review`,
     /// `verify`, `arbiter`): rules added to that role's brief alone. Only a role whose
@@ -56,6 +72,34 @@ pub struct ProjectConfig {
     /// requires an Owlshift that reads it.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub roles: BTreeMap<String, RoleSettings>,
+}
+
+/// One person of `[people]` (P10, OWL-582): their accounts as the project
+/// lists them, as the personal file's `identity` lists the operator's own.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct Person {
+    /// Their tracker account's identifier as the tracker reports it (a
+    /// Linear user's id, a GitHub account's numeric id, the name on the
+    /// Markdown tracker), written exactly. No two people share one.
+    pub tracker: String,
+    /// Their forge login, compared without case; optional: without it, no
+    /// review of theirs is read. No two people share one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub forge: Option<String>,
+}
+
+/// The most characters a handle of `[people]` holds.
+pub const HANDLE_MAX: usize = 32;
+
+/// Whether `text` is a handle of `[people]`: 1 to [`HANDLE_MAX`] lowercase
+/// letters, digits, `-` or `_`, starting with a letter.
+pub fn is_handle(text: &str) -> bool {
+    (1..=HANDLE_MAX).contains(&text.len())
+        && text.starts_with(|c: char| c.is_ascii_lowercase())
+        && text
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-' || b == b'_')
 }
 
 /// The settings of one role (OWL-312).
@@ -110,7 +154,9 @@ pub struct Tracker {
     /// written exactly, as a zone's owner is. Optional for the file;
     /// `--drain` refuses to start without it. When set, at least one, each
     /// once, none blank, padded or holding a control character. A file
-    /// using it requires an Owlshift that reads it (OWL-245).
+    /// using it requires an Owlshift that reads it (OWL-245). Beside
+    /// `[people]` the file names handles, and a parsed configuration holds
+    /// their tracker accounts (OWL-582).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(length(min = 1))]
     pub admitters: Option<Vec<String>>,
@@ -150,7 +196,8 @@ struct TrackerForm {
     /// written exactly, as a zone's owner is. Optional for the file;
     /// `--drain` refuses to start without it. When set, at least one, each
     /// once, none blank, padded or holding a control character. A file
-    /// using it requires an Owlshift that reads it (OWL-245).
+    /// using it requires an Owlshift that reads it (OWL-245). With
+    /// `[people]`, each is a handle of that table instead (OWL-582).
     #[schemars(length(min = 1))]
     admitters: Option<Vec<String>>,
     /// A label that keeps a ticket out of the drain, whatever else it
@@ -508,7 +555,7 @@ impl Pipeline {
 }
 
 /// The forge and how Owlshift reads it (OWL-300).
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct Forge {
     /// The forge logins whose reviews on Owlshift's pull requests are read,
@@ -517,7 +564,9 @@ pub struct Forge {
     /// account is the ticket's decider, and context otherwise; anyone
     /// else's review is ignored. No login listed twice, even in another
     /// case. Absent or empty, no review is read; a `[forge]` table sets it
-    /// or `merge`.
+    /// or `merge`. Refused beside `[people]`, which replaces it: there,
+    /// every person with a `forge` login is a reviewer, and a parsed
+    /// configuration holds them here (OWL-582).
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub reviewers: BTreeMap<String, String>,
     /// Which pull requests the runner merges once green (D14): `never`, the
@@ -543,11 +592,12 @@ impl Forge {
         self.merge_method.unwrap_or_default()
     }
 
-    /// Checks the table: it sets the reviewers or the merge; each login and
-    /// account a name written exactly, no login twice ignoring case (forge
-    /// logins are compared without case).
-    fn check_reviewers(&self) -> Result<(), String> {
-        if self.reviewers.is_empty() && self.merge.is_none() {
+    /// Checks the table: it sets the reviewers or the merge, unless the file
+    /// lists `[people]` (`people`), whose forge logins are the reviewers;
+    /// each login and account a name written exactly, no login twice
+    /// ignoring case (forge logins are compared without case).
+    fn check_reviewers(&self, people: bool) -> Result<(), String> {
+        if self.reviewers.is_empty() && self.merge.is_none() && !people {
             return Err(
                 "forge.reviewers lists no reviewer and forge.merge is not set: list at least \
                  one reviewer, set merge, or leave [forge] out"
@@ -666,7 +716,7 @@ pub struct Policy {
 
 /// `policy.resolver_passes`: a whole number of runs, or `"unlimited"`
 /// (OWL-328). A number outside 1 to 50 parses, and
-/// [`ProjectConfig::validate`] refuses it, naming the key.
+/// [`ProjectConfig::parse`] refuses it, naming the key.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum ResolverPasses {
     Runs(u32),
@@ -741,7 +791,7 @@ impl JsonSchema for ResolverPasses {
 
 /// An amount in dollars, as `policy.resolver_budget_usd` and
 /// `policy.ticket_budget_usd` write it: a positive finite number of at least
-/// [`MIN_USD`] once [`ProjectConfig::validate`] passed it.
+/// [`MIN_USD`] once [`ProjectConfig::parse`] passed it.
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct Usd(pub f64);
@@ -995,29 +1045,180 @@ pub struct ZoneSettings {
     /// The tracker account that decides the tickets without an assignee
     /// touching this zone: its identifier as the tracker reports it (a
     /// Linear user's id, the name on the Markdown tracker), written exactly.
+    /// Beside `[people]` the file names a handle, and a parsed configuration
+    /// holds its tracker account (OWL-582).
     pub owner: String,
 }
 
 impl ProjectConfig {
-    /// Parses and validates `owlshift.toml`.
+    /// Parses and validates `owlshift.toml`, then resolves the handles of
+    /// `[people]` to their accounts (OWL-582): the one place they are
+    /// resolved, for every reader of admitters, zone owners and reviewers.
     pub fn parse(input: &str) -> Result<Self, ContractError> {
-        let config: Self = toml::from_str(input).map_err(|source| ContractError::Toml {
+        let mut config: Self = toml::from_str(input).map_err(|source| ContractError::Toml {
             contract: PROJECT,
             source: Box::new(source),
         })?;
         config.validate()?;
+        config.resolve();
         Ok(config)
     }
 
-    /// Renders `owlshift.toml`, without comments.
+    /// Renders `owlshift.toml`, without comments: with `[people]`, the
+    /// admitters and zone owners by handle again and without the reviewers
+    /// the table gives, so that [`Self::parse`] reads it back.
     pub fn render(&self) -> String {
-        toml::to_string(self).expect("contract types always serialize to TOML")
+        toml::to_string(&self.unresolved()).expect("contract types always serialize to TOML")
     }
 
-    /// Checks what the file alone decides. Whether the operator allows the
-    /// names of `stack.gate_env` depends on the personal file:
-    /// [`Self::check_gate_env`] checks that where both are known.
-    pub fn validate(&self) -> Result<(), ContractError> {
+    /// The handle of the person of `[people]` whose tracker account is
+    /// `account`; `None` without the table or for an account it does not list.
+    pub fn handle_of(&self, account: &str) -> Option<&str> {
+        self.people
+            .as_ref()?
+            .iter()
+            .find(|(_, person)| person.tracker == account)
+            .map(|(handle, _)| handle.as_str())
+    }
+
+    /// Replaces each handle the file names by its tracker account, and
+    /// makes every person with a forge login a reviewer. Run on a file
+    /// [`Self::validate`] accepted, where every handle named is listed.
+    fn resolve(&mut self) {
+        let Some(people) = &self.people else {
+            return;
+        };
+        let account = |handle: &str| {
+            people
+                .get(handle)
+                .map_or_else(|| handle.to_owned(), |person| person.tracker.clone())
+        };
+        for admitter in self.tracker.admitters.iter_mut().flatten() {
+            *admitter = account(admitter);
+        }
+        for settings in self.zones.values_mut() {
+            settings.owner = account(&settings.owner);
+        }
+        let reviewers: BTreeMap<String, String> = people
+            .values()
+            .filter_map(|person| Some((person.forge.clone()?, person.tracker.clone())))
+            .collect();
+        if !reviewers.is_empty() {
+            self.forge.get_or_insert_with(Forge::default).reviewers = reviewers;
+        }
+    }
+
+    /// The file form of a parsed configuration: [`Self::resolve`] undone.
+    /// An account the table does not list is left as it is.
+    fn unresolved(&self) -> std::borrow::Cow<'_, Self> {
+        if self.people.is_none() {
+            return std::borrow::Cow::Borrowed(self);
+        }
+        let mut file = self.clone();
+        let handle = |account: &str| self.handle_of(account).unwrap_or(account).to_owned();
+        for admitter in file.tracker.admitters.iter_mut().flatten() {
+            *admitter = handle(admitter);
+        }
+        for settings in file.zones.values_mut() {
+            settings.owner = handle(&settings.owner);
+        }
+        if let Some(forge) = &mut file.forge {
+            forge.reviewers.clear();
+        }
+        std::borrow::Cow::Owned(file)
+    }
+
+    /// Checks `[people]` and the handles the file names (OWL-582): the
+    /// table lists someone; each handle has its form, each account its
+    /// name's, no tracker account twice and no forge login twice ignoring
+    /// case; `forge.reviewers` is not set beside it; and every admitter and
+    /// zone owner is one of its handles. Nothing without the table.
+    fn check_people(&self) -> Result<(), String> {
+        let Some(people) = &self.people else {
+            return Ok(());
+        };
+        if people.is_empty() {
+            return Err(
+                "people lists no one: list at least one person as [people.<handle>], or leave \
+                 the table out"
+                    .to_owned(),
+            );
+        }
+        let mut accounts: Vec<(&str, &str)> = Vec::new();
+        let mut logins: Vec<(String, &str)> = Vec::new();
+        for (handle, person) in people {
+            if !is_handle(handle) {
+                return Err(format!(
+                    "people.{handle:?}: a handle is 1 to {HANDLE_MAX} lowercase letters, digits, \
+                     `-` or `_`, starting with a letter"
+                ));
+            }
+            let tracker = person.tracker.as_str();
+            if let Err(broken) = check_name(tracker) {
+                return Err(format!("people.{handle}.tracker: {tracker:?} {broken}"));
+            }
+            if let Some((_, other)) = accounts.iter().find(|(account, _)| *account == tracker) {
+                return Err(format!(
+                    "people.{handle}.tracker: {tracker:?} is also people.{other}.tracker: a \
+                     tracker account is listed once"
+                ));
+            }
+            accounts.push((tracker, handle));
+            if let Some(login) = &person.forge {
+                if let Err(broken) = check_name(login) {
+                    return Err(format!("people.{handle}.forge: {login:?} {broken}"));
+                }
+                let lower = login.to_lowercase();
+                if let Some((_, other)) = logins.iter().find(|(seen, _)| *seen == lower) {
+                    return Err(format!(
+                        "people.{handle}.forge: {login:?} is also people.{other}.forge, logins \
+                         being compared without case: a forge login is listed once"
+                    ));
+                }
+                logins.push((lower, handle));
+            }
+        }
+        if self
+            .forge
+            .as_ref()
+            .is_some_and(|forge| !forge.reviewers.is_empty())
+        {
+            return Err(
+                "forge.reviewers is refused beside [people], which replaces it: give each \
+                 reviewer a `forge` login under their [people.<handle>]"
+                    .to_owned(),
+            );
+        }
+        let known = || {
+            let handles: Vec<&str> = people.keys().map(String::as_str).collect();
+            handles.join(", ")
+        };
+        for admitter in self.tracker.admitters.iter().flatten() {
+            if !people.contains_key(admitter) {
+                return Err(format!(
+                    "tracker.admitters: {admitter:?} is no handle of [people], which lists {}",
+                    known()
+                ));
+            }
+        }
+        for (zone, settings) in &self.zones {
+            if !people.contains_key(&settings.owner) {
+                return Err(format!(
+                    "zones.{zone:?}.owner: {:?} is no handle of [people], which lists {}",
+                    settings.owner,
+                    known()
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// Checks what the file alone decides, as written: with `[people]`,
+    /// before its handles are resolved, so [`Self::parse`] alone runs it.
+    /// Whether the operator allows the names of `stack.gate_env` depends on
+    /// the personal file: [`Self::check_gate_env`] checks that where both
+    /// are known.
+    fn validate(&self) -> Result<(), ContractError> {
         if self.tracker.kind == TrackerKind::Linear && self.tracker.team.is_none() {
             return Err(ContractError::invalid(
                 PROJECT,
@@ -1026,6 +1227,7 @@ impl ProjectConfig {
         }
         self.tracker
             .check_admission()
+            .and_then(|()| self.check_people())
             .map_err(|reason| ContractError::invalid(PROJECT, reason))?;
         self.stack
             .check_rules()
@@ -1061,7 +1263,7 @@ impl ProjectConfig {
             .map_err(|reason| ContractError::invalid(PROJECT, reason))?;
         if let Some(forge) = &self.forge {
             forge
-                .check_reviewers()
+                .check_reviewers(self.people.is_some())
                 .map_err(|reason| ContractError::invalid(PROJECT, reason))?;
         }
         self.zone_owners()?;
@@ -1102,7 +1304,7 @@ impl ProjectConfig {
     /// this project, from the personal file
     /// ([`PersonalConfig::allow_gate_env_names`]): the rule the agent
     /// environment applies (`owlshift_core::agent_env::check_declared`,
-    /// OWL-63). The names already passed `check_names` in [`Self::validate`],
+    /// OWL-63). The names already passed `check_names` in [`Self::parse`],
     /// so on a parsed file only a name the operator does not allow fails.
     pub fn check_gate_env(&self, allowed: &[&str]) -> Result<(), ContractError> {
         check_declared(&self.stack.gate_env_names(), allowed).map_err(gate_env_error)
@@ -1697,6 +1899,166 @@ mod tests {
             always_human = []
             "#
         ))
+    }
+
+    /// A Markdown project file with `tracker` added to `[tracker]` and
+    /// `tail` after its last table.
+    fn team(tracker: &str, tail: &str) -> Result<ProjectConfig, ContractError> {
+        ProjectConfig::parse(&format!(
+            r#"
+            requires = ">=0.1"
+            [tracker]
+            kind = "markdown"
+            admit = {{ label = "owlshift" }}
+            states = {{ ready = "Todo", working = "Doing", needs_input = "Asked", review = "Review" }}
+            {tracker}
+            [stack]
+            gate = ["make test"]
+            [pipeline]
+            default = "trivial"
+            plan_approval = "never"
+            [models]
+            [policy]
+            always_human = []
+            {tail}
+            "#
+        ))
+    }
+
+    const PEOPLE: &str = r#"
+            [people.lea]
+            tracker = "u-lea"
+            forge = "Lea-Martin"
+            [people.bob]
+            tracker = "u-bob"
+            "#;
+
+    /// OWL-582: a file with `[people]` gives the same accounts as the same
+    /// file written with raw accounts, and renders back to its handles.
+    #[test]
+    fn people_resolve_to_the_accounts_a_file_without_them_names() {
+        let with = team(
+            r#"admitters = ["lea", "bob"]"#,
+            &format!("[zones.docs]\nowner = \"bob\"\n{PEOPLE}"),
+        )
+        .unwrap();
+        let without = team(
+            r#"admitters = ["u-lea", "u-bob"]"#,
+            "[zones.docs]\nowner = \"u-bob\"\n[forge]\nreviewers = { Lea-Martin = \"u-lea\" }",
+        )
+        .unwrap();
+        assert_eq!(with.tracker.admitters, without.tracker.admitters);
+        assert_eq!(with.zone_owners().unwrap(), without.zone_owners().unwrap());
+        assert_eq!(with.forge, without.forge);
+        assert_eq!(with.handle_of("u-lea"), Some("lea"));
+        assert_eq!(without.handle_of("u-lea"), None);
+
+        let rendered = with.render();
+        assert!(
+            rendered.contains(r#"admitters = ["lea", "bob"]"#),
+            "{rendered}"
+        );
+        assert!(!rendered.contains("reviewers"), "{rendered}");
+        assert_eq!(ProjectConfig::parse(&rendered).unwrap(), with);
+
+        // A handle may be another person's account: each is looked up once.
+        let swapped = team(
+            r#"admitters = ["alice"]"#,
+            "[people.alice]\ntracker = \"bob\"\n[people.bob]\ntracker = \"alice\"",
+        )
+        .unwrap();
+        assert_eq!(swapped.tracker.admitters, Some(vec!["bob".to_owned()]));
+        assert_eq!(ProjectConfig::parse(&swapped.render()).unwrap(), swapped);
+    }
+
+    /// OWL-582: beside `[people]`, `[forge]` may hold the merge alone or be
+    /// left out, and nobody with a forge login reads no review.
+    #[test]
+    fn a_forge_table_beside_people_holds_the_merge_alone() {
+        let merging = team(
+            r#"admitters = ["lea"]"#,
+            &format!("[forge]\nmerge_method = \"rebase\"\n{PEOPLE}"),
+        )
+        .unwrap();
+        let forge = merging.forge.as_ref().unwrap();
+        assert_eq!(forge.merge_method(), MergeMethod::Rebase);
+        assert_eq!(forge.reviewers.len(), 1);
+        assert_eq!(ProjectConfig::parse(&merging.render()).unwrap(), merging);
+
+        let silent = team("", "[forge]\n[people.bob]\ntracker = \"u-bob\"").unwrap();
+        assert!(silent.forge.unwrap().reviewers.is_empty());
+        let absent = team("", "[people.bob]\ntracker = \"u-bob\"").unwrap();
+        assert_eq!(absent.forge, None);
+        assert_eq!(ProjectConfig::parse(&absent.render()).unwrap(), absent);
+    }
+
+    /// OWL-582: each refusal names its key.
+    #[test]
+    fn people_and_the_handles_named_are_checked() {
+        for (tracker, tail, reason) in [
+            ("", "[people]", "people lists no one"),
+            (
+                "",
+                "[people.Lea]\ntracker = \"u\"",
+                "people.\"Lea\": a handle is",
+            ),
+            (
+                "",
+                "[people.1a]\ntracker = \"u\"",
+                "people.\"1a\": a handle is",
+            ),
+            (
+                "",
+                "[people.abcdefghijklmnopqrstuvwxyzabcdefg]\ntracker = \"u\"",
+                "a handle is 1 to 32",
+            ),
+            ("", "[people.lea]\ntracker = \" u\"", "people.lea.tracker"),
+            ("", "[people.lea]\nforge = \"x\"", "missing field `tracker`"),
+            (
+                "",
+                "[people.lea]\ntracker = \"u\"\nemail = \"x\"",
+                "unknown field",
+            ),
+            (
+                "",
+                "[people.lea]\ntracker = \"u\"\n[people.bob]\ntracker = \"u\"",
+                "people.lea.tracker: \"u\" is also people.bob.tracker",
+            ),
+            (
+                "",
+                "[people.lea]\ntracker = \"u1\"\nforge = \"Lea\"\n[people.bob]\ntracker = \"u2\"\nforge = \"lea\"",
+                "people.lea.forge: \"Lea\" is also people.bob.forge, logins being compared \
+                 without case",
+            ),
+            (
+                r#"admitters = ["lea", "eve"]"#,
+                PEOPLE,
+                "tracker.admitters: \"eve\" is no handle of [people], which lists bob, lea",
+            ),
+            (
+                r#"admitters = ["u-lea"]"#,
+                PEOPLE,
+                "tracker.admitters: \"u-lea\" is no handle",
+            ),
+            (
+                r#"admitters = ["lea", "lea"]"#,
+                PEOPLE,
+                "tracker.admitters: \"lea\" is listed twice",
+            ),
+            (
+                "",
+                &format!("[zones.\"backend/api\"]\nowner = \"u-bob\"\n{PEOPLE}"),
+                "zones.\"backend/api\".owner: \"u-bob\" is no handle of [people]",
+            ),
+            (
+                "",
+                &format!("[forge]\nreviewers = {{ Lea-Martin = \"lea\" }}\n{PEOPLE}"),
+                "forge.reviewers is refused beside [people]",
+            ),
+        ] {
+            let error = team(tracker, tail).unwrap_err().to_string();
+            assert!(error.contains(reason), "{tail}: {error}");
+        }
     }
 
     #[test]
