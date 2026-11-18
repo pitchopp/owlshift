@@ -24,10 +24,15 @@
 //!   `strip` (eight cells in pipeline order, `done`, `current` or `todo`),
 //!   `position` in `ready.json`, `drain` (what the drain made of a ticket
 //!   without a ref);
-//! - `for_you`: `{"questions", "plans", "reviews", "parked"}`, entries
-//!   `{"ticket", "project", "title", "kind", "pull_request", "questions",
-//!   "card"}` built from every ticket ref the way the header counts them
-//!   (`why::standings`), whether or not the ticket has a card;
+//! - `for_you`: `{"questions", "plans", "reviews", "parked", "others"}`,
+//!   entries `{"ticket", "project", "title", "kind", "pull_request",
+//!   "questions", "card", "decider"}` built from every ticket ref the way the
+//!   header counts them (`why::standings`), whether or not the ticket has a
+//!   card. `decider` is `{"account", "name"}` of a question's or a plan's
+//!   ask, `name` the account itself when no name was read, else null.
+//!   `others` holds the questions and plans another person than the
+//!   operator decides (OWL-584), after the operator's own; with no operator
+//!   told, every ask is the operator's, as before P10;
 //! - `highlights`: how many highlights the event log's tail absorbed, which
 //!   only goes up: the page asks for the "since" panel again when it moves;
 //! - `notes`: what could not be read, and the lines of the log that are not
@@ -41,6 +46,7 @@ use owlshift_adapters::forge::Repo;
 use owlshift_contracts::ids::TicketId;
 use owlshift_contracts::ready::{Outcome, ReadySnapshot};
 use owlshift_contracts::waits::{Paused, ProjectWaits, RefStatus, StatusWaits, TicketWaits, Wait};
+use owlshift_core::floor::same_account;
 use owlshift_core::schedule::natural_cmp;
 use owlshift_core::vocab::{Priority, Stage};
 use serde_json::{Value, json};
@@ -171,15 +177,44 @@ pub struct Entry {
     pub questions: Vec<Value>,
     /// Whether the ticket has a card in its project.
     pub card: bool,
+    /// Who decides a question's or a plan's ask, when its ref names them.
+    pub decider: Option<Decider>,
 }
 
-/// What waits for you: questions, plans, pull requests, parked tickets.
+/// The decider of an entry's ask.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Decider {
+    /// Their tracker account.
+    pub account: String,
+    /// The name the tracker shows for it, when read.
+    pub name: Option<String>,
+}
+
+/// Whose asks are whose (OWL-584): `operator` gives a served project's
+/// operator by its repository, `None` when it cannot be told, and `name`
+/// the name read for a decider's account in a project, when there is one.
+pub struct Deciders<'a> {
+    pub operator: &'a dyn Fn(&str) -> Option<String>,
+    pub name: &'a dyn Fn(&str, &str) -> Option<String>,
+}
+
+impl Deciders<'_> {
+    /// Every ask the operator's, no name read: as before P10.
+    pub const NONE: Deciders<'static> = Deciders {
+        operator: &|_| None,
+        name: &|_, _| None,
+    };
+}
+
+/// What waits for you: questions, plans, pull requests, parked tickets;
+/// then the questions and plans other people decide (OWL-584).
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct ForYou {
     pub questions: Vec<Entry>,
     pub plans: Vec<Entry>,
     pub reviews: Vec<Entry>,
     pub parked: Vec<Entry>,
+    pub others: Vec<Entry>,
 }
 
 /// The overview.
@@ -289,6 +324,10 @@ impl Entry {
             "pull_request": self.pull_request,
             "questions": self.questions,
             "card": self.card,
+            "decider": self.decider.as_ref().map(|decider| json!({
+                "account": decider.account,
+                "name": decider.name.as_deref().unwrap_or(&decider.account),
+            })),
         })
     }
 }
@@ -304,6 +343,7 @@ impl Overview {
                 "plans": entries(&self.for_you.plans),
                 "reviews": entries(&self.for_you.reviews),
                 "parked": entries(&self.for_you.parked),
+                "others": entries(&self.for_you.others),
             },
             "highlights": self.highlights,
             "notes": self.notes,
@@ -323,7 +363,9 @@ pub struct Aux {
 type Titles = BTreeMap<(String, TicketId), String>;
 type Runs = BTreeMap<(String, TicketId), Run>;
 
-/// The overview of `waits`, whose `n`th project `aux[n]` completes.
+/// The overview of `waits`, whose `n`th project `aux[n]` completes, each
+/// ask told the operator's or another person's by `deciders`.
+#[allow(clippy::too_many_arguments)]
 pub fn build(
     waits: &StatusWaits,
     aux: &[Aux],
@@ -332,6 +374,7 @@ pub fn build(
     now: Timestamp,
     highlights: u64,
     extra_notes: Vec<String>,
+    deciders: &Deciders<'_>,
 ) -> Overview {
     let empty = Aux::default();
     let mut projects = Vec::new();
@@ -339,7 +382,7 @@ pub fn build(
     for (n, project) in waits.projects.iter().enumerate() {
         let aux = aux.get(n).unwrap_or(&empty);
         let view = project_view(project, aux, titles, runs, now);
-        for_you.extend(entries(&view, aux, titles));
+        for_you.extend(entries(&view, aux, titles, deciders));
         projects.push(view);
     }
     for_you.sort_by(|a, b| {
@@ -348,7 +391,24 @@ pub fn build(
             .then_with(|| natural_cmp(a.ticket.as_str(), b.ticket.as_str()))
     });
     let mut lists = ForYou::default();
+    let operators: BTreeMap<&str, Option<String>> = waits
+        .projects
+        .iter()
+        .map(|project| {
+            let repository = project.repository.as_str();
+            (repository, (deciders.operator)(repository))
+        })
+        .collect();
     for entry in for_you {
+        let operator = operators.get(entry.project.as_str()).cloned().flatten();
+        let theirs = matches!(
+            (&operator, &entry.decider),
+            (Some(operator), Some(decider)) if !same_account(operator, &decider.account)
+        );
+        if theirs {
+            lists.others.push(entry);
+            continue;
+        }
         match entry.kind {
             NeedsYou::Question => lists.questions.push(entry),
             NeedsYou::Plan => lists.plans.push(entry),
@@ -534,7 +594,7 @@ fn list_order(cards: &[Card]) -> Vec<TicketId> {
 }
 
 /// The "for you" entries of a project, from every ref that reads.
-fn entries(view: &ProjectView, aux: &Aux, titles: &Titles) -> Vec<Entry> {
+fn entries(view: &ProjectView, aux: &Aux, titles: &Titles, deciders: &Deciders<'_>) -> Vec<Entry> {
     aux.details
         .iter()
         .filter_map(|(ticket, detail)| {
@@ -563,6 +623,14 @@ fn entries(view: &ProjectView, aux: &Aux, titles: &Titles) -> Vec<Entry> {
                     _ => Vec::new(),
                 },
                 card: card.is_some(),
+                decider: detail
+                    .decider
+                    .as_ref()
+                    .filter(|_| matches!(kind, NeedsYou::Question | NeedsYou::Plan))
+                    .map(|account| Decider {
+                        account: account.clone(),
+                        name: (deciders.name)(&view.repository, account),
+                    }),
             })
         })
         .collect()
@@ -571,8 +639,15 @@ fn entries(view: &ProjectView, aux: &Aux, titles: &Titles) -> Vec<Entry> {
 /// Reads the overview of the data directory `data` at `now`: advances
 /// `tail`, then reads what `owlshift status --waits` reads for every served
 /// project, with the tail's folds in place of a whole read of the log, and
-/// each project's `ready.json`.
-pub fn gather(data: &Path, tail: &mut EventTail, concurrent_runs: u32, now: Timestamp) -> Overview {
+/// each project's `ready.json`; each ask told the operator's or another
+/// person's by `deciders`.
+pub fn gather(
+    data: &Path,
+    tail: &mut EventTail,
+    concurrent_runs: u32,
+    now: Timestamp,
+    deciders: &Deciders<'_>,
+) -> Overview {
     let mut notes = Vec::new();
     if let Err(why) = tail.advance() {
         notes.push(format!("the event log cannot be read: {why}"));
@@ -617,6 +692,7 @@ pub fn gather(data: &Path, tail: &mut EventTail, concurrent_runs: u32, now: Time
         now,
         tail.highlights(),
         tail.notes(),
+        deciders,
     )
 }
 

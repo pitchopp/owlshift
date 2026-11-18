@@ -708,6 +708,10 @@ pub enum Stop {
         summary: String,
         questions: Vec<Question>,
         posted: Result<NonZeroU32, String>,
+        /// The tracker account of the decider the round went to, when it was
+        /// posted: whose the desktop notification is (OWL-584). Boxed, so
+        /// that a stop stays small.
+        decider: Option<Box<String>>,
     },
     /// Questions wait for the decider, who has not commented since they
     /// were asked, or since the last answer check read their answers.
@@ -738,6 +742,8 @@ pub enum Stop {
         reask: u32,
         /// The questions asked again, each with the answer check's verdict.
         open: Vec<(Question, AnswerVerdict)>,
+        /// The tracker account of the round's decider (OWL-584).
+        decider: String,
     },
     /// The decider asked a counter-question instead of answering: the
     /// verdicts that say so, each with its reply, and the REPLY comment
@@ -746,6 +752,8 @@ pub enum Stop {
         ticket: TicketId,
         replied: String,
         asked: Vec<AnswerVerdict>,
+        /// The tracker account of the round's decider (OWL-584).
+        decider: String,
     },
     /// The answer check failed; it runs again on the same answers.
     CheckFailed { ticket: TicketId, detail: String },
@@ -886,6 +894,7 @@ impl fmt::Display for Stop {
                 summary,
                 questions,
                 posted,
+                ..
             } => {
                 if *status == result::Status::PremiseFalse {
                     writeln!(f, "Stopped: the run found the ticket's premise false.")?;
@@ -952,6 +961,7 @@ impl fmt::Display for Stop {
                 round,
                 reask,
                 open,
+                ..
             } => {
                 writeln!(
                     f,
@@ -970,6 +980,7 @@ impl fmt::Display for Stop {
                 ticket,
                 replied,
                 asked,
+                ..
             } => {
                 writeln!(
                     f,
@@ -3846,11 +3857,18 @@ impl OnDemand<'_> {
             opened.insert("reopened".to_owned(), json!(reopened));
         }
         sink.emit(&ticket, Some(run), EventKind::Gate, opened);
-        let stop = |posted| Stop::NeedsInput {
+        // Whose the round is, once posted: the notification's (OWL-584).
+        let to = p
+            .decider
+            .as_ref()
+            .ok()
+            .map(|decider| decider.account.clone());
+        let stop = |posted: Result<NonZeroU32, String>| Stop::NeedsInput {
             ticket: ticket.clone(),
             status,
             summary: summary.to_owned(),
             questions: questions.clone(),
+            decider: posted.is_ok().then(|| to.clone().map(Box::new)).flatten(),
             posted,
         };
         let Some(round) = NonZeroU32::new(state.round()) else {
@@ -4485,7 +4503,7 @@ impl OnDemand<'_> {
                     at: posted.created_at,
                     comment: posted.id.clone(),
                     questions: open.iter().map(|(question, _)| question.clone()).collect(),
-                    decider: asked,
+                    decider: asked.clone(),
                     verdicts: Vec::new(),
                     result_refusal: None,
                     labels: BTreeMap::new(),
@@ -4509,6 +4527,7 @@ impl OnDemand<'_> {
                     round,
                     reask: next.reasks(),
                     open,
+                    decider: asked.account,
                 })
             }
             Event::CounterQuestion => {
@@ -4570,6 +4589,7 @@ impl OnDemand<'_> {
                         .into_iter()
                         .filter(|verdict| verdict.class == AnswerClass::CounterQuestion)
                         .collect(),
+                    decider: asked.account,
                 })
             }
             // A refused result freed at the last attempt keeps the ticket

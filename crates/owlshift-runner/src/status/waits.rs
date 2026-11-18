@@ -118,6 +118,10 @@ pub struct RefDetail {
     /// its latest ask holds a question of the approval category, which the
     /// runner marks its approval round with (`on_demand::APPROVAL_CATEGORY`).
     pub plan_to_approve: bool,
+    /// The tracker account of the decider of the ask it waits on
+    /// ([`ticket_ref::TicketRecord::open_ask`]), which the web UI tells the
+    /// operator's asks from other people's by (OWL-584).
+    pub decider: Option<String>,
 }
 
 /// The detail of the ref `stored`, `state` being what [`ticket_ref::state_of`]
@@ -133,6 +137,7 @@ fn detail(stored: &ticket_ref::Stored, state: &RefState) -> RefDetail {
             pull_request: None,
             questions: Vec::new(),
             plan_to_approve: false,
+            decider: None,
         };
     };
     let status = state.status();
@@ -161,6 +166,10 @@ fn detail(stored: &ticket_ref::Stored, state: &RefState) -> RefDetail {
                 .iter()
                 .any(|question| question.category == crate::on_demand::APPROVAL_CATEGORY),
         questions,
+        decider: stored
+            .record
+            .open_ask()
+            .map(|ask| ask.decider.account.clone()),
     }
 }
 

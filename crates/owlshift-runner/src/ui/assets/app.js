@@ -2411,6 +2411,13 @@ function forYouAction(key, entry) {
     entry.project, entry.ticket);
 }
 
+// The kind of an ask another person decides, naming them: the name the
+// tracker shows, else their account.
+function othersKind(entry) {
+  const who = entry.decider ? entry.decider.name || entry.decider.account : "another person";
+  return (entry.kind === "plan" ? "Plan for " : "Question for ") + who;
+}
+
 function renderForYou(overview) {
   const body = document.getElementById("for-you-body");
   clear(body);
@@ -2420,13 +2427,17 @@ function renderForYou(overview) {
     ["plans", "Plan to approve"],
     ["reviews", "Pull request to review"],
     ["parked", "Parked"],
+    // The asks another person decides, after the operator's own (OWL-584).
+    ["others", ""],
   ];
   const cards = make("div", "cards");
   for (const [key, kind] of lists) {
-    const entries = overview.for_you[key].filter((entry) => !chosen || entry.project === chosen);
+    const entries = (overview.for_you[key] || []).filter((entry) => !chosen || entry.project === chosen);
     for (const entry of entries) {
-      const card = make("article", "for-you-card needs-you");
-      card.appendChild(make("p", "card-kind" + (key === "parked" ? " state-warning" : ""), kind));
+      const theirs = key === "others";
+      const card = make("article", "for-you-card" + (theirs ? "" : " needs-you"));
+      card.appendChild(make("p", "card-kind" + (key === "parked" ? " state-warning" : ""),
+        theirs ? othersKind(entry) : kind));
       const line = make("div", "card-line");
       line.appendChild(ticketLink(entry.project, entry.ticket));
       if (!chosen) {

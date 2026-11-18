@@ -19,7 +19,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use jiff::Timestamp;
-use owlshift_adapters::tracker::{ErrorKind, Tracker};
+use owlshift_adapters::tracker::{ErrorKind, KeyAccount, Tracker};
 use owlshift_contracts::config::{PersonalConfig, Takes, TrackerKind};
 use owlshift_contracts::format::Format;
 use owlshift_contracts::ids::TicketId;
@@ -87,23 +87,15 @@ pub fn resolve(
         return Ok(Taking::All);
     }
     if kind == TrackerKind::Markdown {
-        let identity = personal.and_then(|personal| personal.identity.tracker.as_deref());
-        return Ok(identity
-            .map(str::trim)
-            .filter(|id| !id.is_empty())
-            .map_or(Taking::All, |id| Taking::Mine(id.to_owned())));
+        return Ok(markdown_identity(personal).map_or(Taking::All, Taking::Mine));
     }
     const FIX: &str = "the drain takes only the tickets its operator admitted (`takes = \"mine\"` \
                        in the personal file); set `takes = \"all\"` there to take every admitted \
                        ticket";
     match tracker.operator() {
-        Ok(Some(account)) if account.app => Err(format!(
-            "the tracker key is the account of an app, {:?}, not a person's, so this runner has no \
-             operator: {FIX}",
-            account.name
-        )
-        .into()),
-        Ok(Some(account)) => Ok(Taking::Mine(account.id)),
+        Ok(Some(account)) => person(account)
+            .map(Taking::Mine)
+            .map_err(|why| format!("{why}, so this runner has no operator: {FIX}").into()),
         Ok(None) => Err(format!("the tracker key has no account to read: {FIX}").into()),
         Err(error) => {
             let message = format!("the tracker key's account could not be read ({error}): {FIX}");
@@ -115,6 +107,53 @@ pub fn resolve(
                 }
             })
         }
+    }
+}
+
+/// The operator on the Markdown tracker, whose key has no account: the
+/// personal file's `identity.tracker`, when it names one.
+pub fn markdown_identity(personal: Option<&PersonalConfig>) -> Option<String> {
+    personal
+        .and_then(|personal| personal.identity.tracker.as_deref())
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+        .map(str::to_owned)
+}
+
+/// The operator a tracker key's `account` names: its id, unless it is an
+/// app's, which is no person's.
+pub fn person(account: KeyAccount) -> Result<String, String> {
+    if account.app {
+        Err(format!(
+            "the tracker key is the account of an app, {:?}, not a person's",
+            account.name
+        ))
+    } else {
+        Ok(account.id)
+    }
+}
+
+/// This machine's operator for the project on `kind`'s tracker opened as
+/// `tracker`, under the personal file `personal`, when it can be told, for
+/// what is told to the operator alone (OWL-584): the Markdown tracker's
+/// [`markdown_identity`], else the [`person`] of the tracker key's account,
+/// read now. `Ok(None)` when there is none to read; `Err` says why a key's
+/// account could not be read or is no person's. Never refuses anything: a
+/// command whose operator is unknown tells it everything, as before P10.
+pub fn known(
+    tracker: &dyn Tracker,
+    kind: TrackerKind,
+    personal: Option<&PersonalConfig>,
+) -> Result<Option<String>, String> {
+    if kind == TrackerKind::Markdown {
+        return Ok(markdown_identity(personal));
+    }
+    match tracker.operator() {
+        Ok(Some(account)) => person(account).map(Some),
+        Ok(None) => Ok(None),
+        Err(error) => Err(format!(
+            "the tracker key's account could not be read: {error}"
+        )),
     }
 }
 
@@ -182,7 +221,7 @@ pub fn rests(
 mod tests {
     use std::cell::RefCell;
 
-    use owlshift_adapters::tracker::{Capability, Comment, Error, KeyAccount, Ticket};
+    use owlshift_adapters::tracker::{Capability, Comment, Error, Ticket};
 
     use super::*;
 
@@ -273,6 +312,34 @@ mod tests {
         assert_eq!(
             resolve(&none, markdown, Some(&named), REPO).unwrap(),
             Taking::Mine("lea".to_owned())
+        );
+    }
+
+    /// OWL-584: the operator told of what is theirs, under any `takes`: the
+    /// key's person, the Markdown identity, and none, never a refusal, for
+    /// an app's key, a key that does not answer or no identity.
+    #[test]
+    fn the_known_operator_never_refuses() {
+        let linear = TrackerKind::Linear;
+        let read = |answer| known(&key(answer), linear, None);
+        assert_eq!(
+            read(Ok(Some(account("u-1", false)))),
+            Ok(Some("u-1".to_owned()))
+        );
+        assert!(
+            read(Ok(Some(account("app-1", true))))
+                .unwrap_err()
+                .contains("an app")
+        );
+        assert!(read(Err(Error::new(ErrorKind::Unreachable, "down"))).is_err());
+        assert_eq!(read(Ok(None)), Ok(None));
+        let none = Keyed(RefCell::new(None));
+        let markdown = TrackerKind::Markdown;
+        assert_eq!(known(&none, markdown, None), Ok(None));
+        let named = PersonalConfig::parse("[identity]\ntracker = \" lea \"\n").unwrap();
+        assert_eq!(
+            known(&none, markdown, Some(&named)),
+            Ok(Some("lea".to_owned()))
         );
     }
 

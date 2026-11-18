@@ -180,8 +180,9 @@ pub const SERVED_CONFIG_FORMAT: u32 = 1;
 /// binary (OWL-462); format 1 is still read, as an unknown build.
 pub const DAEMON_FORMAT: u32 = 2;
 /// The format version of a running watch's record (`watches/<pid>.json` in
-/// a project's folder, OWL-462).
-pub const WATCH_FORMAT: u32 = 1;
+/// a project's folder, OWL-462). Format 2 adds its operator (OWL-584);
+/// format 1 is still read, as an operator unknown.
+pub const WATCH_FORMAT: u32 = 2;
 /// The format version of the install manifest
 /// (`<data>/service/manifest.json`, OWL-437).
 pub const MANIFEST_FORMAT: u32 = 1;
@@ -353,6 +354,33 @@ pub(crate) fn parse_json<T: DeserializeOwned>(
         }
     }
     serde_json::from_str(input).map_err(|source| ContractError::Json { contract, source })
+}
+
+/// A JSON document of format `older` read as format `current`, which only
+/// adds the optional field `added`: `None` when `input` is not of format
+/// `older`, and an invalid document when it holds `added`, which `older`
+/// never wrote.
+pub(crate) fn parse_json_older<T: DeserializeOwned>(
+    contract: &'static str,
+    older: u32,
+    current: u32,
+    added: &str,
+    input: &str,
+) -> Option<Result<T, ContractError>> {
+    let mut document: serde_json::Value = serde_json::from_str(input).ok()?;
+    if document.get("format").and_then(serde_json::Value::as_u64) != Some(u64::from(older)) {
+        return None;
+    }
+    if document.get(added).is_some() {
+        return Some(Err(ContractError::invalid(
+            contract,
+            format!("format {older} records no {added}"),
+        )));
+    }
+    document["format"] = current.into();
+    Some(
+        serde_json::from_value(document).map_err(|source| ContractError::Json { contract, source }),
+    )
 }
 
 /// Renders a contract document as pretty JSON with a final newline.

@@ -36,7 +36,7 @@ use owlshift_adapters::forge::Repo;
 use owlshift_adapters::tracker::linear::LinearTracker;
 use owlshift_adapters::tracker::{Comment, KeyAccount, Tracker};
 use owlshift_contracts::ids::TicketId;
-use owlshift_contracts::refs::{Ask, Waiting};
+use owlshift_contracts::refs::Ask;
 use owlshift_contracts::result::{Question, option_index, option_letter};
 use owlshift_core::floor::same_account;
 use owlshift_core::reply::ends_with_go;
@@ -313,14 +313,9 @@ pub fn open_key(data: &Path, repo: &Repo) -> Result<Key, String> {
     crate::tracker::of(config.tracker.kind).reply_key(data, repo, &config, &super::personal_now())
 }
 
-/// The ask a ticket's newest record waits on: its latest, while its state
-/// waits for answers. A ticket parked while questions waited gets none: an
-/// answer alone does not restart it.
+/// The ask a ticket's newest record waits on ([`TicketRecord::open_ask`]).
 pub fn open_ask(record: &TicketRecord) -> Option<&Ask> {
-    if record.state.waiting != Some(Waiting::NeedsInput) {
-        return None;
-    }
-    record.questions.asks.last()
+    record.open_ask()
 }
 
 /// Whether `question` is the plan's approval question.
@@ -700,7 +695,7 @@ pub(crate) mod tests {
     use std::cell::RefCell;
 
     use owlshift_adapters::tracker::{Author, Capability, Error as TrackerError, Person, Ticket};
-    use owlshift_contracts::refs::{PersistedState, TicketQuestions};
+    use owlshift_contracts::refs::{PersistedState, TicketQuestions, Waiting};
     use owlshift_contracts::review::{Fork, Plan};
     use owlshift_core::vocab::Stage;
 
