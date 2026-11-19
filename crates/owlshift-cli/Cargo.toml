@@ -39,6 +39,9 @@ tempfile.workspace = true
 [dev-dependencies]
 # Reads `owlshift doctor --json` (OWL-99).
 serde_json.workspace = true
+# The public site's rules, GitHub's anchors and the site's floors, which the
+# page's test shares with the documentation's renderer (OWL-607).
+owlshift-site-docs.workspace = true
 
 # Reads a process's state in the tests, with no `ps` (OWL-110).
 [target.'cfg(target_os = "macos")'.dev-dependencies]

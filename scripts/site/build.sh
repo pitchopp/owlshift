@@ -4,6 +4,11 @@
 # the two lockups, the mark and the social preview in brand/. The repository
 # keeps one copy of each font and logo; this script copies them beside the
 # page. See docs/design/build-plan.md, "The public site", "How it is built".
+#
+# Then (OWL-607) the documentation in docs/: the renderer of scripts/site/docs
+# turns the repository's Markdown pages into the site's, in the page's frame,
+# so the build needs the toolchain pinned in rust-toolchain.toml ("The
+# documentation").
 
 set -eu
 
@@ -48,5 +53,10 @@ for file in \
     owlshift-social.png; do
     cp "$brand/$file" "$out/brand/$file"
 done
+
+# From the repository's root, so rustup picks the pinned toolchain; the
+# folder is passed whole, since the renderer runs from there.
+out=$(cd "$out" && pwd)
+(cd "$root" && cargo run --quiet --locked -p owlshift-site-docs -- "$root" "$out")
 
 echo "Site written to $out"

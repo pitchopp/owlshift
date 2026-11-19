@@ -1,6 +1,8 @@
 [workspace]
 resolver = "3"
-members = ["crates/*"]
+# The public site's documentation renderer (OWL-607) is a member too, so it
+# shares the lock, the toolchain, clippy and the tests; it ships nothing.
+members = ["crates/*", "scripts/site/docs"]
 
 [workspace.package]
 version = "0.1.1"
@@ -19,6 +21,9 @@ owlshift-runner = { path = "crates/owlshift-runner" }
 # The test bench runs the command line's entry (OWL-522); no shipped crate
 # depends on it.
 owlshift-cli = { path = "crates/owlshift-cli" }
+# The public site's documentation renderer (OWL-607): its library holds the
+# page's rules, which the page's test reads; no shipped crate depends on it.
+owlshift-site-docs = { path = "scripts/site/docs" }
 clap = { version = "4.6", features = ["derive", "string"] }
 dirs = "7.0"
 getrandom = "0.4"

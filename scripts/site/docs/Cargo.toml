@@ -1,0 +1,30 @@
+[package]
+name = "owlshift-site-docs"
+description = "Renders the user documentation into the public site (OWL-607)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+# The public site's documentation (build plan, "The public site", "The
+# documentation"): `scripts/site/build.sh` runs the program; `owlshift-cli`
+# takes the library as a dev-dependency for the page's rules. Ships nothing.
+[lib]
+name = "owlshift_site_docs"
+path = "src/lib.rs"
+
+[[bin]]
+name = "owlshift-site-docs"
+path = "src/main.rs"
+
+[dependencies]
+# The CommonMark parser mdBook uses, with GitHub's tables; its HTML writer
+# escapes the text.
+pulldown-cmark = { version = "0.13", default-features = false, features = ["html"] }
+# The search index, written as JSON.
+serde_json.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

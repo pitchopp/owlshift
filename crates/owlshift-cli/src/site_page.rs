@@ -6,28 +6,31 @@
 //! - its install commands are the README's quick start, character for
 //!   character;
 //! - each `owlshift` command it shows parses with the binary's own [`Cli`];
-//! - each link to a file of the repository names a file that exists, and each
-//!   anchor resolves, on the page or in the Markdown file it points into;
+//! - each link to a file of the repository names a file that exists, each
+//!   link into the served documentation (OWL-607) names a page the site
+//!   serves, and each anchor resolves, on the page or in the Markdown file
+//!   the link points into;
 //! - nothing it loads is absolute, and everything it loads exists, in `site/`
 //!   or among the files `scripts/site/build.sh` copies beside it;
 //! - its Content-Security-Policy is the build plan's, word for word, and it
-//!   holds no inline script and no style attribute, which that policy refuses;
+//!   holds nothing that policy refuses, such as an inline script;
 //! - the README's two images of its timeline were exported from the timeline
 //!   it has now (OWL-579, `scripts/site/export-timeline.sh`).
 //!
-//! The page is written by hand with double-quoted attributes, so plain string
-//! scanning reads it; a page that stopped being so would fail the floors.
+//! The rules the documentation's pages share with the page, GitHub's anchors
+//! and the site's floors, are the documentation renderer's
+//! (`scripts/site/docs`), read here as a dev-dependency.
 //!
 //! [`Cli`]: super::Cli
 
 use std::path::{Path, PathBuf};
 
+use owlshift_site_docs::html::{attributes, decode, floor_failures, is_absolute, loads, tags};
+use owlshift_site_docs::markdown::{REPOSITORY, heading_ids};
+use owlshift_site_docs::page_source;
 use sha2::{Digest, Sha256};
 
 use super::doc_commands::{commands_of_line, refusal};
-
-/// The repository's address on GitHub, the prefix of the page's links into it.
-const REPOSITORY: &str = "https://github.com/pitchopp/owlshift";
 
 fn root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../..")
@@ -39,16 +42,6 @@ fn read(path: &str) -> String {
 
 fn page() -> String {
     read("site/index.html")
-}
-
-/// The text of `value` with the page's character references replaced.
-fn decode(value: &str) -> String {
-    value
-        .replace("&lt;", "<")
-        .replace("&gt;", ">")
-        .replace("&quot;", "\"")
-        .replace("&#39;", "'")
-        .replace("&amp;", "&")
 }
 
 /// `html` without its tags.
@@ -66,29 +59,6 @@ fn strip_tags(html: &str) -> String {
     out
 }
 
-/// The values of every `name="…"` attribute in `html`.
-fn attributes(html: &str, name: &str) -> Vec<String> {
-    let pattern = format!("{name}=\"");
-    html.match_indices(&pattern)
-        .filter(|(at, _)| html[..*at].ends_with(char::is_whitespace))
-        .map(|(at, _)| {
-            let value = &html[at + pattern.len()..];
-            decode(&value[..value.find('"').expect("a closed attribute")])
-        })
-        .collect()
-}
-
-/// Every opening tag `<tag …>` of `html`, whole.
-fn tags<'a>(html: &'a str, tag: &str) -> Vec<&'a str> {
-    let open = format!("<{tag}");
-    html.match_indices(&open)
-        .filter(|(at, _)| {
-            html[at + open.len()..].starts_with(|c: char| c.is_whitespace() || c == '>')
-        })
-        .map(|(at, _)| &html[at..at + html[at..].find('>').expect("a closed tag") + 1])
-        .collect()
-}
-
 /// The decoded text of every `<element>…</element>` of `html`.
 fn contents(html: &str, element: &str) -> Vec<String> {
     let close = format!("</{element}>");
@@ -100,35 +70,6 @@ fn contents(html: &str, element: &str) -> Vec<String> {
             decode(&strip_tags(&html[start..end]))
         })
         .collect()
-}
-
-/// The anchor GitHub gives a Markdown heading: lower case, punctuation
-/// dropped, each space a hyphen.
-fn slug(heading: &str) -> String {
-    heading
-        .trim()
-        .to_lowercase()
-        .chars()
-        .filter(|c| c.is_alphanumeric() || matches!(c, ' ' | '-' | '_'))
-        .map(|c| if c == ' ' { '-' } else { c })
-        .collect()
-}
-
-/// The anchors of a Markdown text's headings, code blocks left out.
-fn heading_anchors(markdown: &str) -> Vec<String> {
-    let mut fenced = false;
-    let mut anchors = Vec::new();
-    for line in markdown.lines() {
-        if line.trim_start().starts_with("```") {
-            fenced = !fenced;
-            continue;
-        }
-        let hashes = line.chars().take_while(|c| *c == '#').count();
-        if !fenced && (1..=6).contains(&hashes) && line[hashes..].starts_with(' ') {
-            anchors.push(slug(&line[hashes..]));
-        }
-    }
-    anchors
 }
 
 #[test]
@@ -189,16 +130,33 @@ fn each_repository_link_names_a_file_and_each_anchor_resolves() {
     let ids = attributes(&html, "id");
     let mut failures = Vec::new();
     let mut files = 0;
+    let mut served = 0;
     let anchor_in = |path: &str, fragment: &str| -> bool {
         let text = std::fs::read_to_string(root.join(path)).unwrap_or_default();
-        heading_anchors(&text)
-            .iter()
-            .any(|anchor| anchor == fragment)
+        heading_ids(&text).iter().any(|anchor| anchor == fragment)
     };
-    for href in attributes(&html, "href") {
+    let links = tags(&html, "a");
+    for href in links.iter().flat_map(|a| attributes(a, "href")) {
         if let Some(id) = href.strip_prefix('#') {
             if !ids.iter().any(|known| known == id) {
                 failures.push(format!("{href}: no element of the page has this id"));
+            }
+            continue;
+        }
+        // A page of the served documentation (OWL-607), rendered from a
+        // Markdown file whose headings give its anchors.
+        if !is_absolute(&href) {
+            let (path, fragment) = href.split_once('#').unwrap_or((&href, ""));
+            served += 1;
+            if path == "docs/index.html" && fragment.is_empty() {
+                continue;
+            }
+            match page_source(path) {
+                None => failures.push(format!("{href}: not a page the site serves")),
+                Some(file) if !fragment.is_empty() && !anchor_in(&file, fragment) => {
+                    failures.push(format!("{href}: {file} has no heading #{fragment}"));
+                }
+                Some(_) => {}
             }
             continue;
         }
@@ -238,10 +196,15 @@ fn each_repository_link_names_a_file_and_each_anchor_resolves() {
         }
     }
     assert!(failures.is_empty(), "{}", failures.join("\n"));
-    // The bar, the band, the tracker cards, the roadmap and the foot.
+    // The bar, the band, the roadmap and the foot.
     assert!(
-        files >= 10,
-        "{files} links into the repository, at least 10 expected"
+        files >= 8,
+        "{files} links into the repository, at least 8 expected"
+    );
+    // The bar's Docs and the three tracker cards.
+    assert!(
+        served >= 4,
+        "{served} links into the served documentation, at least 4 expected"
     );
 }
 
@@ -251,10 +214,7 @@ fn the_page_loads_nothing_absolute_and_everything_it_loads_exists() {
     let html = page();
     let css = read("site/site.css");
     let build = read("scripts/site/build.sh");
-    let mut loads = attributes(&html, "src");
-    for link in tags(&html, "link") {
-        loads.extend(attributes(link, "href"));
-    }
+    let mut loads = loads(&html);
     for (at, _) in css.match_indices("url(") {
         let value = &css[at + 4..];
         loads.push(
@@ -278,7 +238,7 @@ fn the_page_loads_nothing_absolute_and_everything_it_loads_exists() {
         "fonts/OFL-JetBrainsMono.txt".to_owned(),
     ];
     for url in &loads {
-        if url.contains(':') || url.starts_with('/') {
+        if is_absolute(url) {
             failures.push(format!(
                 "{url}: absolute; the page is served under a path prefix"
             ));
@@ -330,17 +290,8 @@ fn the_policy_is_the_build_plans_and_the_page_runs_no_inline_code() {
         "<meta http-equiv=\"Content-Security-Policy\" content=\"{}\">",
         policies[0]
     );
-    assert!(
-        html.contains(&meta),
-        "the page lacks, word for word: {meta}"
-    );
-    let scripts = tags(&html, "script");
-    assert!(!scripts.is_empty());
-    for script in scripts {
-        assert!(script.contains(" src=\""), "an inline script: {script}");
-    }
-    assert!(attributes(&html, "style").is_empty(), "a style attribute");
-    assert!(tags(&html, "style").is_empty(), "a <style> element");
+    let failures = floor_failures(&html, &meta);
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
 }
 
 /// The timeline's markup as `scripts/site/export-timeline.sh` hashes it: the
@@ -379,15 +330,4 @@ fn the_readmes_timeline_images_are_exported_from_the_pages_timeline() {
         assert!(bytes.starts_with(b"\x89PNG"), "{image} is not a PNG");
         assert!(readme.contains(&image), "the README does not show {image}");
     }
-}
-
-#[test]
-fn a_heading_anchor_is_githubs() {
-    assert_eq!(slug("Adopt a project"), "adopt-a-project");
-    assert_eq!(slug("What's different"), "whats-different");
-    assert_eq!(
-        slug("8. Policy, security & trust"),
-        "8-policy-security--trust"
-    );
-    assert_eq!(slug("`owlshift do` once"), "owlshift-do-once");
 }
