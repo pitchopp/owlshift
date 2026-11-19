@@ -102,7 +102,7 @@ allow_caches = ["Library/pnpm"]
 gate = ["uv run ruff check .", "uv run pytest"]
 ```
 
-`uv run` installs the locked environment itself, so there is no setup. Without `uv.lock`, the tools run bare and the gate needs a `setup` that installs them. `init` guesses `ruff` and `pytest` only from a `[tool.ruff]` and a `[tool.pytest.ini_options]` table in `pyproject.toml`. This was not checked confined: uv keeps a cache in your home, so if `owlshift gate` fails on it, it prints the `caches` and `allow_caches` lines to add.
+`uv run` syncs the project's environment from `uv.lock` itself, updating the lock when `pyproject.toml` changed, so there is no setup. A project that wants the gate to fail on a stale lock instead writes `uv run --locked ruff check .` and `uv run --locked pytest` (`--locked` asserts that `uv.lock` stays unchanged, as `uv run --help` says). Without `uv.lock`, the tools run bare and the gate needs a `setup` that installs them. `init` guesses `ruff` and `pytest` only from a `[tool.ruff]` and a `[tool.pytest.ini_options]` table in `pyproject.toml`. This was not checked confined: uv keeps a cache in your home, so if `owlshift gate` fails on it, it prints the `caches` and `allow_caches` lines to add.
 
 **A Makefile**
 
