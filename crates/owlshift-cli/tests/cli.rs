@@ -1482,6 +1482,11 @@ fn a_gate_given_with_init_wins_over_the_detected_one() {
     );
     assert_eq!(config.stack.caches, [".npm"]);
     assert!(out.contains("--gate wins"), "{out}");
+    // OWL-595: the notes about the detected gate are not written above a
+    // gate given by hand.
+    let written = fs::read_to_string(repo.path().join("owlshift.toml")).unwrap();
+    assert!(!written.contains("a guess"), "{written}");
+    assert!(!out.contains("a guess"), "{out}");
     let allow = "[repositories.\"github.com/acme/web\"]\nallow_caches = [\".npm\"]\n";
     assert!(out.contains("The setup reads `~/.npm` read-only"), "{out}");
     assert!(out.contains(allow), "{out}");

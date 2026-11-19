@@ -55,6 +55,10 @@ pub struct Found {
     pub caches: Vec<Line>,
     /// What the person should know about the lines above.
     pub notes: Vec<String>,
+    /// What the person should know about the gate lines alone, written only
+    /// where the detected gate is used, never above a gate given by hand
+    /// (OWL-595).
+    pub gate_notes: Vec<String>,
 }
 
 /// The result of [`detect`].
@@ -151,6 +155,7 @@ fn cargo(root: &RootFiles, text: &str) -> Result<Option<Found>, String> {
         setup: vec![],
         caches: vec![],
         notes: vec![],
+        gate_notes: vec![],
     }))
 }
 
@@ -346,6 +351,7 @@ fn package_json(root: &RootFiles, text: &str) -> Result<Option<Found>, String> {
         setup: vec![],
         caches: vec![],
         notes: vec![],
+        gate_notes: vec![],
     };
     let manager = match node_manager(root, &value) {
         Some(manager) => {
@@ -411,7 +417,7 @@ fn package_json(root: &RootFiles, text: &str) -> Result<Option<Found>, String> {
             .into_iter()
             .find(|key| script(key).is_some())
         {
-            found.notes.push(format!(
+            found.gate_notes.push(format!(
                 "package.json has a `{chain}` script, which the project may run before any work \
                  is done: compare it with this gate"
             ));
@@ -431,7 +437,7 @@ fn package_json(root: &RootFiles, text: &str) -> Result<Option<Found>, String> {
         } else {
             names(&left_out)
         };
-        found.notes.push(format!(
+        found.gate_notes.push(format!(
             "this gate is a guess from package.json, to review: it read the scripts {}; \
              it left out {out}",
             names(&read)
@@ -466,6 +472,7 @@ fn pyproject(root: &RootFiles, text: &str) -> Result<Option<Found>, String> {
         setup: vec![],
         caches: vec![],
         notes: vec![],
+        gate_notes: vec![],
     };
     // Only `uv run` was checked to install the locked environment itself; a
     // bare tool needs a setup, as does a manager not checked (poetry, pdm).
@@ -538,6 +545,7 @@ fn makefile(text: &str) -> Option<Found> {
         setup: vec![],
         caches: vec![],
         notes: vec![],
+        gate_notes: vec![],
     })
 }
 
@@ -685,15 +693,16 @@ check::
             );
             // A manager reading a cache says what each machine must allow;
             // yarn 2 or later, its cache unknown, says what to declare;
-            // pnpm also says where its overlay lies; the last note is always
-            // the gate's guess (OWL-595).
+            // pnpm also says where its overlay lies; the gate's own note is
+            // a guess (OWL-595).
             let notes = &d.found[0].notes;
             let noted = !caches.is_empty() || names.contains(&".yarnrc.yml");
             let pnpm = usize::from(manager == "pnpm");
-            assert_eq!(notes.len(), usize::from(noted) + pnpm + 1, "{notes:?}");
-            let (guess, rest) = notes.split_last().unwrap();
-            assert!(guess.contains("a guess"), "{guess}");
-            assert!(rest[pnpm..].iter().all(|n| n.contains("allow_caches")));
+            assert_eq!(notes.len(), usize::from(noted) + pnpm, "{notes:?}");
+            assert!(notes[pnpm..].iter().all(|n| n.contains("allow_caches")));
+            let gate_notes = &d.found[0].gate_notes;
+            assert_eq!(gate_notes.len(), 1, "{gate_notes:?}");
+            assert!(gate_notes[0].contains("a guess"), "{gate_notes:?}");
             assert!(d.found[0].source.starts_with("package.json ("));
             assert!(
                 d.setup()
@@ -785,9 +794,9 @@ check::
         assert_eq!(commands(d.setup()), Vec::<&str>::new());
         assert_eq!(commands(d.gate()), ["npm run test"]);
         assert_eq!(d.found[0].source, "package.json");
-        assert_eq!(d.found[0].notes.len(), 2);
+        assert_eq!(d.found[0].notes.len(), 1);
         assert!(d.found[0].notes[0].contains("no lock file"));
-        assert!(d.found[0].notes[1].contains("a guess"));
+        assert!(d.found[0].gate_notes[0].contains("a guess"));
     }
 
     /// OWL-595: the project's own scripts, in the order a developer runs them.
@@ -805,7 +814,7 @@ check::
                 "npm run build"
             ]
         );
-        let notes = &d.found[0].notes;
+        let notes = &d.found[0].gate_notes;
         let check = notes.iter().find(|n| n.contains("`check`")).unwrap();
         assert!(check.contains("compare"), "{check}");
         let guess = notes.last().unwrap();
@@ -825,11 +834,11 @@ check::
         let both = r#"{"scripts":{"typecheck":"a","type-check":"b","ci":"c"}}"#;
         let d = detect(&root(&["yarn.lock"], &[("package.json", both)]));
         assert_eq!(commands(d.gate()), ["yarn run typecheck"]);
-        assert!(d.found[0].notes.iter().any(|n| n.contains("`ci`")));
+        assert!(d.found[0].gate_notes.iter().any(|n| n.contains("`ci`")));
         let dashed = r#"{"scripts":{"type-check":"b"}}"#;
         let d = detect(&root(&["yarn.lock"], &[("package.json", dashed)]));
         assert_eq!(commands(d.gate()), ["yarn run type-check"]);
-        assert!(!d.found[0].notes.iter().any(|n| n.contains("compare")));
+        assert!(!d.found[0].gate_notes.iter().any(|n| n.contains("compare")));
     }
 
     #[test]
@@ -846,7 +855,7 @@ check::
         assert_eq!(commands(d.gate()), Vec::<&str>::new());
         assert!(d.found[0].notes.iter().any(|n| n.contains("placeholder")));
         // No gate, so no guess to review.
-        assert!(!d.found[0].notes.iter().any(|n| n.contains("a guess")));
+        assert!(d.found[0].gate_notes.is_empty());
     }
 
     #[test]
@@ -854,7 +863,7 @@ check::
         let pkg =
             r#"{"scripts":{"lint":"x","test":"echo \"Error: no test specified\" && exit 1"}}"#;
         let d = detect(&root(&["package-lock.json"], &[("package.json", pkg)]));
-        let guess = d.found[0].notes.last().unwrap();
+        let guess = d.found[0].gate_notes.last().unwrap();
         assert!(guess.ends_with("left out `test`"), "{guess}");
     }
 

@@ -963,7 +963,9 @@ fn report_detection(options: &InitOptions) {
             "Detected {}: {gate} gate command(s), {setup} setup command(s).",
             found.source
         );
-        for note in &found.notes {
+        // The gate's own notes say nothing true about a gate given by hand.
+        let own = (options.gate.is_empty() && !found.gate.is_empty()).then_some(&found.gate_notes);
+        for note in found.notes.iter().chain(own.into_iter().flatten()) {
             println!("  Note: {note}.");
         }
     }
