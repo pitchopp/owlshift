@@ -1251,6 +1251,14 @@ mod tests {
             ]
         );
         assert!(verdicts.iter().all(|v| v.reply.is_none()));
+        // The recommendation's option, when it names one (OWL-585); a
+        // thumbs-up kept before format 19, with none, still reads as one.
+        let options: Vec<Option<&str>> = verdicts.iter().map(|v| v.option.as_deref()).collect();
+        assert_eq!(options, [Some("B"), None]);
+        let questions = [lettered("Q1")];
+        let mut kept = thumbs_up_verdicts(&questions);
+        kept[0].option = None;
+        assert!(resumed_by_thumbs_up(&kept, &questions));
     }
 
     #[test]

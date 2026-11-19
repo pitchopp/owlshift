@@ -1266,6 +1266,11 @@ pub fn changed(
                     review.build = None;
                 }
             }
+            // A colleague's reviews relayed to the decider end with the
+            // following, answered or not (OWL-585): no loop answers them.
+            if let Some(review) = next.review.as_mut() {
+                review.relayed.clear();
+            }
             let why = ended_why(*reason);
             delivery.pushing = None;
             // Told by the caller first when the runner merged (OWL-445).
@@ -2318,6 +2323,49 @@ mod tests {
             assert_eq!(review.answered_reviews, [3]);
             assert_eq!(ended.delivery.unwrap().ended.unwrap().why, EndedWhy::Merged);
         }
+    }
+
+    /// A colleague's review relayed to the decider (OWL-585) ends with the
+    /// following, the round waiting at Watch closed with it.
+    #[test]
+    fn an_end_drops_the_reviews_relayed() {
+        let pipeline = Pipeline::new(owlshift_core::vocab::Variant::Trivial);
+        let waiting = TicketState::restore(
+            Status::NeedsInput {
+                return_to: Stage::Watch,
+            },
+            2,
+            0,
+            0,
+            0,
+            0,
+        )
+        .unwrap();
+        let mut relaying = record(delivery(), waiting);
+        let mut review = under_way();
+        let asked = review.answering.remove(0);
+        review.build = None;
+        review.relayed = vec![owlshift_contracts::review::RelayedReview {
+            round: std::num::NonZeroU32::new(2).unwrap(),
+            question: owlshift_contracts::ids::QuestionId::nth(1),
+            answer: None,
+            review: asked,
+        }];
+        relaying.review = Some(review);
+        let ended = changed(
+            &relaying,
+            pipeline,
+            &seen_with(Decision::End(EndReason::Closed), PUSHED),
+            at(5),
+        )
+        .unwrap()
+        .unwrap()
+        .record;
+        let state = TicketState::try_from(&ended.state).unwrap();
+        assert_eq!(state.status(), Status::Active(Stage::Watch));
+        let review = ended.review.unwrap();
+        assert!(review.relayed.is_empty());
+        assert_eq!(review.answered_reviews, [3]);
     }
 
     /// A review loop's push a crash cut short, adopted by a read (OWL-307),

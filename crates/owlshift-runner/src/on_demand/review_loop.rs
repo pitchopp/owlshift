@@ -10,7 +10,10 @@
 //!   Watch, read the pull request again under the lock: only a read that
 //!   asks for no repair goes on. The reviews due ([`pr_reviews::due`]) are
 //!   judged with `[forge].reviewers` at the base commit and the ticket's
-//!   decider resolved now: none of the decider's starts nothing. Otherwise
+//!   decider resolved now: none of the decider's starts nothing, but a
+//!   colleague's review the decider was not asked about, which is relayed
+//!   to them ([`OnDemand::relay`], OWL-585), and one they answered, which
+//!   starts the loop as theirs would. Otherwise
 //!   the ticket loops back to Build, the reviews due kept in `review.json`
 //!   (`answering`) in the same write, which marks the loop: each of its
 //!   Build runs, Verify's fix runs included, is given them as read then.
@@ -173,7 +176,21 @@ impl OnDemand<'_> {
             .unwrap_or_default();
         let due = pr_reviews::due(&read.reviews, &reviewers, delivered_at, &answered);
         let decider = p.current()?.account.clone();
-        if !pr_reviews::instructed(&due, &decider) {
+        let relayed = p
+            .review
+            .as_ref()
+            .map(|review| review.relayed.clone())
+            .unwrap_or_default();
+        // A colleague's review the decider was not asked about yet is
+        // relayed to them instead, unless a review the decider wrote or
+        // answered starts the loop (OWL-585).
+        let starts = pr_reviews::starts(&due, &decider, &relayed);
+        let to_relay = if starts {
+            Vec::new()
+        } else {
+            pr_reviews::to_relay(&due, &decider, &relayed)
+        };
+        if !starts && to_relay.is_empty() {
             return Err(look());
         }
         let stage = self
@@ -187,7 +204,10 @@ impl OnDemand<'_> {
                 pr.number
             )));
         }
-        let given = pr_reviews::given(&due, &decider);
+        if !to_relay.is_empty() {
+            return Err(self.relay(p, &state, &to_relay, &pr, sink));
+        }
+        let given = pr_reviews::given(&due, &decider, &relayed);
         let pushed_id =
             CommitId::new(pushed.as_str()).map_err(|e| refused("the pushed commit", e))?;
         self.fix_branch(p, &pushed_id)?;
@@ -203,6 +223,9 @@ impl OnDemand<'_> {
         );
         let review = p.review.get_or_insert_with(TicketReview::new);
         review.answering = given;
+        // The answers to the reviews relayed are in the loop's reviews now
+        // (OWL-585).
+        review.relayed.clear();
         review.build = None;
         review.last_fix = None;
         self.keep(p, &building)?;

@@ -611,6 +611,10 @@ struct Memory<'c> {
     /// When each ticket whose following ended, and which still owes a
     /// follow-up, was last tried (OWL-501).
     ended_filings: ended::EndedFilings,
+    /// The colleagues' reviews of each followed ticket that has no decider
+    /// to relay them to, as last warned of (OWL-585): warned of again only
+    /// when they change, forgotten once the ticket has a decider.
+    unrelayed: HashMap<TicketId, Vec<u64>>,
 }
 
 /// What a correction's or the reviews' read found due at a pass (OWL-445):
@@ -1029,6 +1033,9 @@ impl Watch<'_> {
         memory
             .stale
             .retain(&[&followed[..], &read[..], &unread[..], &busy[..]].concat());
+        memory
+            .unrelayed
+            .retain(|ticket, _| followed.contains(ticket) || unread.contains(ticket));
         // The slot's turn for this pass's stage steps (OWL-367), the first
         // holders by dispatch time up to the project's capacity (OWL-401),
         // among those no collision holds back (OWL-403): one that waits for
@@ -1668,7 +1675,11 @@ impl Watch<'_> {
     /// by a newer review. The decider is the ticket's assignee, read only
     /// once a review is due; a ticket whose zones' owners decide is left to
     /// the loop, which reads them under the lock with the reviewers at the
-    /// base commit. A delivery made before OWL-307 is dated first, and no
+    /// base commit. A colleague's review the decider was not asked about
+    /// is relayed to them instead, by the same step, which then runs nothing
+    /// (OWL-585); a ticket with no decider at all, which the ticket alone
+    /// tells, is asked nothing, its colleagues' reviews warned of once and
+    /// still due. A delivery made before OWL-307 is dated first, and no
     /// review is due at that pass. Returns what it found due (OWL-445):
     /// nothing only when the reviews read and none is due, or the project
     /// lists no reviewer.
@@ -1727,19 +1738,72 @@ impl Watch<'_> {
         if due.is_empty() {
             return Due::Nothing;
         }
-        let decider = match on_demand.tracker.ticket(ticket) {
-            Ok(found) => on_demand::known_decider(&found),
+        let found = match on_demand.tracker.ticket(ticket) {
+            Ok(found) => found,
             Err(e) => {
                 let reason = format!("reading the ticket: {e}");
                 self.unreadable(memory, sink, ticket, reason);
                 return Due::Waits;
             }
         };
-        if decider
+        let relayed = stored
+            .record
+            .review
             .as_ref()
-            .is_some_and(|decider| !pr_reviews::instructed(&due, &decider.id))
-        {
-            return Due::Nothing;
+            .map(|review| review.relayed.as_slice())
+            .unwrap_or_default();
+        // The step's first run: the loop's Build, or none for a colleague's
+        // review relayed to the decider, which runs nothing (OWL-585).
+        let mut first = Some(Role::Build);
+        match on_demand::known_decider(&found) {
+            Some(decider) => {
+                memory.unrelayed.remove(ticket);
+                if !pr_reviews::starts(&due, &decider.id, relayed) {
+                    if pr_reviews::to_relay(&due, &decider.id, relayed).is_empty() {
+                        return Due::Nothing;
+                    }
+                    first = None;
+                }
+            }
+            // No decider at all, which the ticket alone tells (OWL-585): a
+            // colleague's review stays due, unrelayed, warned of once, and
+            // merge on green waits.
+            None => {
+                let zones = stored
+                    .record
+                    .intake
+                    .as_ref()
+                    .map(|intake| intake.zones.as_slice())
+                    .unwrap_or_default();
+                let asking: Vec<u64> = due
+                    .iter()
+                    .filter(|due| !due.asks_nothing())
+                    .map(|due| due.review.id)
+                    .collect();
+                if !on_demand::has_decider(&found, zones) && !asking.is_empty() {
+                    if memory.unrelayed.get(ticket) != Some(&asking) {
+                        sink.emit(
+                            ticket,
+                            None,
+                            EventKind::Warning,
+                            data([
+                                ("what", json!("review_not_relayed")),
+                                ("reviews", json!(asking)),
+                                (
+                                    "reason",
+                                    json!(format!(
+                                        "{ticket} has no decider to ask about the reviews of \
+                                         listed colleagues on its pull request; they stay due \
+                                         until it has one"
+                                    )),
+                                ),
+                            ]),
+                        );
+                        memory.unrelayed.insert(ticket.clone(), asking);
+                    }
+                    return Due::Pending;
+                }
+            }
         }
         // A review loop's start is a repair at Watch, which needs no room in
         // the project's capacity (OWL-401; architecture section 5, "Three
@@ -1753,7 +1817,7 @@ impl Watch<'_> {
             continued,
             ticket,
             held,
-            (StepKind::Review, Some(Role::Build)),
+            (StepKind::Review, first),
             Some(read),
         );
         if started(&run) {

@@ -194,6 +194,9 @@ fn a_deciders_review_loops_back_to_build_and_pushes_to_the_same_pull_request() {
     assert_eq!(looped[0]["outcome"], "loop");
     assert_eq!(looped[0]["instructions"], json!([5_547_776_064u64]));
     assert_eq!(looped[0]["context"], json!([5_547_776_257u64]));
+    // The colleague's review rides as context, unasked (OWL-585).
+    assert!(bench.questions_posted().is_empty());
+    assert!(bench.review_record().relayed.is_empty());
     let routed = data_of(events, EventKind::Decision, "routing");
     assert!(
         routed.iter().all(|event| event["command"] == "continue"),
@@ -741,4 +744,260 @@ fn a_review_loop_parked_at_verify_is_restarted_before_its_build_runs_again() {
     let kept = bench.review_record();
     assert_eq!(kept.answered_reviews, [7_000_000_005]);
     assert_eq!(state_of(&bench).status(), Status::Active(Stage::Watch));
+}
+
+/// Bob's review, a listed colleague of the decider (OWL-585), with a body
+/// and two inline comments.
+const COLLEAGUES: u64 = 8_000_000_001;
+
+/// The colleague's review of [`COLLEAGUES`].
+fn colleagues() -> Value {
+    review(
+        COLLEAGUES,
+        "bob",
+        "Rename the file to HELLO.md.",
+        &[("GREETING.md", 1, "Here."), ("GREETING.md", 2, "And here.")],
+    )
+}
+
+/// The answer check's verdict on Q1, answered, with the option chosen.
+fn chose(option: Option<&str>, reason: &str) -> String {
+    let mut verdict = json!({ "question": "Q1", "class": "answered", "reason": reason });
+    if let Some(option) = option {
+        verdict["option"] = json!(option);
+    }
+    json!({ "format": 15, "status": "done", "summary": "Checked.", "verdicts": [verdict] })
+        .to_string()
+}
+
+impl Bench {
+    /// The QUESTIONS comments on the ticket.
+    fn questions_posted(&self) -> Vec<String> {
+        self.comments()
+            .into_iter()
+            .filter(|comment| comment.starts_with("[owlshift] QUESTIONS"))
+            .collect()
+    }
+
+    /// A delivered ticket whose pull request a colleague reviewed, relayed
+    /// to its decider by `owlshift continue` at Watch (OWL-585).
+    fn relayed() -> Self {
+        let bench = Bench::reviewed();
+        bench.reviews_on_github(vec![colleagues()]);
+        let (asked, printed) = bench.continue_ticket(Vec::new());
+        assert!(
+            matches!(&asked, Err(Stop::NeedsInput { posted: Ok(_), .. })),
+            "{asked:?}\n{printed}"
+        );
+        bench
+    }
+}
+
+/// OWL-585: a colleague's review asks the decider once and starts nothing.
+/// At the pass that would start a loop, watch asks instead, the runner's own
+/// round of one question naming the reviewer, the pull request and what the
+/// review holds, at Watch and through no resolver; the ticket shows needs
+/// input, and later passes ask nothing more. An approval of theirs beside it
+/// asks nothing.
+#[test]
+fn a_colleagues_review_asks_the_decider_once_and_starts_nothing() {
+    let bench = Bench::reviewed();
+    let mut approval = review(8_000_000_002, "bob", "Fine by me.", &[]);
+    approval["state"] = json!("APPROVED");
+    bench.reviews_on_github(vec![colleagues(), approval]);
+    let briefs = bench.briefs().len();
+    let from = bench.events().len();
+    let mut pass = 0;
+    let (outcomes, lines, printed) = bench.watch(Vec::new(), &mut |_| {
+        pass += 1;
+        bench.wait(11);
+        pass < 3
+    });
+    let [Err(Stop::NeedsInput { posted: Ok(_), .. })] = &outcomes[..] else {
+        panic!("{outcomes:?}\n{lines}\n{printed}");
+    };
+    assert_eq!(
+        bench.briefs().len(),
+        briefs,
+        "no run: no Build, no resolver"
+    );
+    assert_eq!(
+        bench.state(),
+        (
+            Status::NeedsInput {
+                return_to: Stage::Watch
+            },
+            1
+        )
+    );
+    assert_eq!(bench.stage(), "Needs Input");
+    let asked = bench.questions_posted();
+    assert_eq!(asked.len(), 1, "asked once");
+    let round = &asked[0];
+    assert!(round.contains("`bob`") && round.contains("#1"), "{round}");
+    assert!(round.contains("a body and 2 inline comments"), "{round}");
+    assert!(
+        round.contains("Apply it as written") && !round.contains("Q2"),
+        "{round}"
+    );
+    let relayed = bench.review_record().relayed;
+    assert_eq!(relayed.len(), 1);
+    assert_eq!(
+        (relayed[0].review.id, relayed[0].answer),
+        (COLLEAGUES, None)
+    );
+    let events = &bench.events()[from..];
+    let relays: Vec<Value> = data_of(events, EventKind::Decision, "outcome")
+        .into_iter()
+        .filter(|event| event["outcome"] == "relay")
+        .collect();
+    assert_eq!(
+        relays,
+        [json!({ "watch": "review", "outcome": "relay", "reviews": [COLLEAGUES] })]
+    );
+}
+
+/// OWL-585: "apply" (option A) runs the loop on the next look, the
+/// colleague's review in its Build's brief as an instruction, as it was
+/// asked about; the push lands on the same pull request and the review is
+/// answered once.
+#[test]
+fn a_colleagues_review_applied_runs_the_loop_as_an_instruction() {
+    let bench = Bench::relayed();
+    bench.answer("A. Go.\n");
+    let (looped, printed) = bench.continue_ticket(vec![
+        bench.reply(None, Some(&chose(Some("A"), "A, apply it as written."))),
+        bench.reply(Some("Hello there"), Some(RENAMED)),
+    ]);
+    looped.unwrap_or_else(|stop| panic!("{stop}\n{printed}"));
+    let brief = bench.last_of(Role::Build);
+    let given: Vec<(u64, Relation)> = brief
+        .pull_request_reviews
+        .iter()
+        .map(|review| (review.id, review.author.relation))
+        .collect();
+    assert_eq!(given, [(COLLEAGUES, Relation::Decider)]);
+    assert_eq!(brief.pull_request_reviews[0].comments.len(), 2);
+    assert_eq!(bench.github.created.lock().unwrap().len(), 1);
+    let kept = bench.review_record();
+    assert_eq!(kept.answered_reviews, [COLLEAGUES]);
+    assert!(kept.relayed.is_empty() && kept.answering.is_empty());
+    assert_eq!(bench.state().0, Status::Active(Stage::Watch));
+    assert_eq!(bench.questions_posted().len(), 1);
+}
+
+/// OWL-585: the decider's own words (no option) run the loop with them as
+/// the instruction, in the thread, and the review quoted beside them.
+#[test]
+fn a_colleagues_review_answered_in_the_deciders_words_runs_the_loop_quoting_it() {
+    let bench = Bench::relayed();
+    bench.answer("Only add a heading to GREETING.md; keep its name. Go.\n");
+    let (looped, printed) = bench.continue_ticket(vec![
+        bench.reply(
+            None,
+            Some(&chose(
+                None,
+                "In the decider's words: only add a heading to GREETING.md; keep its name.",
+            )),
+        ),
+        bench.reply(Some("Hello there"), Some(RENAMED)),
+    ]);
+    looped.unwrap_or_else(|stop| panic!("{stop}\n{printed}"));
+    let brief = bench.last_of(Role::Build);
+    assert_eq!(brief.pull_request_reviews.len(), 1);
+    assert_eq!(
+        brief.pull_request_reviews[0].author.relation,
+        Relation::Other
+    );
+    let thread = serde_json::to_string(&brief.thread).unwrap();
+    assert!(
+        thread.contains("only add a heading to GREETING.md"),
+        "{thread}"
+    );
+    assert_eq!(bench.review_record().answered_reviews, [COLLEAGUES]);
+}
+
+/// OWL-585: "set aside" (option B) answers the review at once: no loop, no
+/// push, nothing asked again.
+#[test]
+fn a_colleagues_review_set_aside_starts_nothing_and_is_not_asked_again() {
+    let bench = Bench::relayed();
+    let delivered = bench.remote_branch().unwrap();
+    let briefs = bench.briefs().len();
+    bench.answer("B. Go.\n");
+    let (looked, printed) = bench.continue_ticket(vec![
+        bench.reply(None, Some(&chose(Some("B"), "B, set it aside."))),
+    ]);
+    assert!(
+        matches!(&looked, Err(Stop::Watched { .. })),
+        "{looked:?}\n{printed}"
+    );
+    assert_eq!(bench.briefs().len(), briefs + 1, "the answer check alone");
+    let kept = bench.review_record();
+    assert_eq!(kept.answered_reviews, [COLLEAGUES]);
+    assert!(kept.relayed.is_empty());
+    let (again, printed) = bench.continue_ticket(Vec::new());
+    assert!(
+        matches!(&again, Err(Stop::Watched { .. })),
+        "{again:?}\n{printed}"
+    );
+    assert_eq!(bench.questions_posted().len(), 1);
+    assert_eq!(bench.remote_branch().unwrap(), delivered, "nothing pushed");
+    assert_eq!(bench.state().0, Status::Active(Stage::Watch));
+    assert_eq!(bench.stage(), "In Review");
+}
+
+/// OWL-585: an approval of a colleague's asks nothing, as before P10.
+#[test]
+fn a_colleagues_approval_asks_nothing() {
+    let bench = Bench::reviewed();
+    let mut approval = review(8_000_000_003, "bob", "Ship it.", &[]);
+    approval["state"] = json!("APPROVED");
+    bench.reviews_on_github(vec![approval]);
+    let (looked, printed) = bench.continue_ticket(Vec::new());
+    assert!(
+        matches!(&looked, Err(Stop::Watched { .. })),
+        "{looked:?}\n{printed}"
+    );
+    assert!(bench.questions_posted().is_empty());
+    assert_eq!(bench.state().0, Status::Active(Stage::Watch));
+}
+
+/// OWL-585: a ticket with no decider is asked nothing; its colleague's
+/// review stays due, warned of once over several passes, and is relayed
+/// once the ticket has a decider again.
+#[test]
+fn a_colleagues_review_waits_for_a_decider_warned_of_once() {
+    let bench = Bench::reviewed();
+    bench.reviews_on_github(vec![colleagues()]);
+    let unassigned = fs::read_to_string(bench.ticket_file())
+        .unwrap()
+        .replace("assignee = \"maintainer\"\n", "");
+    let assigned = fs::read_to_string(bench.ticket_file()).unwrap();
+    assert_ne!(unassigned, assigned);
+    fs::write(bench.ticket_file(), unassigned).unwrap();
+    let from = bench.events().len();
+    let mut pass = 0;
+    let (outcomes, lines, printed) = bench.watch(Vec::new(), &mut |_| {
+        pass += 1;
+        bench.wait(11);
+        if pass == 2 {
+            assert!(
+                bench.questions_posted().is_empty(),
+                "no decider: asked nothing"
+            );
+            fs::write(bench.ticket_file(), &assigned).unwrap();
+        }
+        pass < 3
+    });
+    let [Err(Stop::NeedsInput { posted: Ok(_), .. })] = &outcomes[..] else {
+        panic!("{outcomes:?}\n{lines}\n{printed}");
+    };
+    let warned: Vec<Value> = data_of(&bench.events()[from..], EventKind::Warning, "what")
+        .into_iter()
+        .filter(|event| event["what"] == "review_not_relayed")
+        .collect();
+    assert_eq!(warned.len(), 1, "{warned:?}");
+    assert_eq!(warned[0]["reviews"], json!([COLLEAGUES]));
+    assert_eq!(bench.questions_posted().len(), 1);
 }

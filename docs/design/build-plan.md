@@ -2937,6 +2937,7 @@ forge = "lea-martin"                               # the forge login; optional: 
 - *With no decider.* A ticket that has lost its decider when the ask is due is asked nothing: the review stays due, a `warning` says so once, and the ask is made once the ticket has a decider again.
 - *Cost.* The ask is the runner's and costs no run; its answer costs the answer check's run.
 - *Rejected.* A listed person's review as an instruction, which lets a second person direct a ticket its decider answers for, and which section 8 forbids; a project switch for it, the same rule made optional; relaying nothing and telling the decider to review their own pull request, which is the friction found.
+- *Built (OWL-585).* The ask is the review step's at Watch (`on_demand/relay.rs`), through `ask` with no run; `review.json` format 2 keeps the reviews relayed, as asked about; the answer check's verdict names the option chosen (result format 15, `questions.json` format 19), which the RESUME's write reads over the round's asks; a review set aside is answered there, one applied is given to the loop as the decider's, one answered in words as quoted data beside the answer. No decider: a `review_not_relayed` warning once, held in watch. Architecture section 5, "A colleague's review, as built", has the details.
 
 **Claims.** A claim says, on the remote, which runner works a ticket. It keeps two machines off one ticket where `takes` alone does not, one person's two machines or a runner under `all`, and it lets a runner see the files another machine's ticket holds.
 

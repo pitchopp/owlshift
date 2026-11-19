@@ -411,7 +411,7 @@ impl OnDemand<'_> {
                             result.status,
                             &result.summary,
                             round,
-                            &ran.run,
+                            Some(&ran.run),
                             sink,
                         ));
                     }
@@ -448,7 +448,7 @@ impl OnDemand<'_> {
                                 result.status,
                                 &result.summary,
                                 round,
-                                &ran.run,
+                                Some(&ran.run),
                                 sink,
                             ));
                         }
