@@ -1,8 +1,8 @@
 //! OWL-542: every `owlshift` command the user documentation names exists,
 //! with the flags it shows, as `tests/cli.rs` pins the CI's run strings.
 //!
-//! The documents are every Markdown file at the repository's root, in `docs/`
-//! and in `docs/adopt/`; `docs/design/` is left out, since it records history
+//! The documents are every Markdown file at the repository's root, in `docs/`,
+//! `docs/adopt/` and `docs/reference/`; `docs/design/` is left out, since it records history
 //! and commands still to be built. A command is read from a shell code block
 //! (no info string, or `bash`, `sh`, `shell`, `console` or `zsh`) and from
 //! inline code, wherever its first word, after any `NAME=value` assignments,
@@ -241,14 +241,15 @@ pub(super) fn refusal(command: &[String]) -> Option<String> {
     None
 }
 
-/// The user documentation: the root's, `docs/`'s and `docs/adopt/`'s
-/// Markdown files.
+/// The user documentation: the root's, `docs/`'s, `docs/adopt/`'s and
+/// `docs/reference/`'s Markdown files.
 fn documents(root: &Path) -> Vec<PathBuf> {
     let mut files = Vec::new();
     for dir in [
         root.to_path_buf(),
         root.join("docs"),
         root.join("docs/adopt"),
+        root.join("docs/reference"),
     ] {
         for entry in std::fs::read_dir(&dir).unwrap() {
             let path = entry.unwrap().path();
@@ -290,6 +291,7 @@ fn every_command_the_documentation_names_exists_with_its_flags() {
         "docs/faq.md",
         "docs/troubleshooting.md",
         "docs/concepts.md",
+        "docs/reference/configuration.md",
     ] {
         let count = counted
             .iter()

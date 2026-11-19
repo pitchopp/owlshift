@@ -74,6 +74,8 @@ The commands, in the order the pages use them:
 - `owlshift continue TICKET`: go on once the ticket's questions are answered there.
 - `owlshift start`: serve the project with the background service, which takes the tickets you admit; `owlshift status`, `owlshift why` and `owlshift logs` say what it does and why a ticket waits; `owlshift stop` stops it.
 
+The [configuration reference](docs/reference/configuration.md) lists every key of `owlshift.toml` and of the personal file, with its values and its default.
+
 The [command reference](docs/reference/cli.md) lists every command with its arguments and options. `owlshift --help` lists every command, and `owlshift help` followed by a command's name, as in `owlshift help do`, explains it. [SECURITY.md](SECURITY.md) says what the confinement of agent runs protects, and what it does not.
 
 When something does not work, [Troubleshooting](docs/troubleshooting.md) is ordered by what you see: the `owlshift doctor` lines that fail, a gate that passes on your laptop and not under Owlshift, a ticket that does not start, a parked ticket, a usage limit, a quarantined or paused project, and where the logs are.

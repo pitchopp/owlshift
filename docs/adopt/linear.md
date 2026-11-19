@@ -52,7 +52,7 @@ Next: `owlshift doctor` checks git, the harnesses and the Claude Code token for 
 Nothing detected was run: `owlshift gate` runs the gate to check it.
 ```
 
-Read `owlshift.toml`: it lists every setting, each with a comment above it that says what it decides, its values and its default; a setting commented out with its default value changes nothing once uncommented. Check the gate under `[stack]`, which every agent's work must pass, and the state names under `[tracker.states]`. Then list the people whose `agent` label admits a ticket, by their Linear user id, in the commented-out `admitters` under `[tracker]`:
+Read `owlshift.toml`: it lists every setting, each with a comment above it that says what it decides, its values and its default; a setting commented out with its default value changes nothing once uncommented. The [configuration reference](../reference/configuration.md) lists the same settings, and those of your personal file. Check the gate under `[stack]`, which every agent's work must pass, and the state names under `[tracker.states]`. Then list the people whose `agent` label admits a ticket, by their Linear user id, in the commented-out `admitters` under `[tracker]`:
 
 ```toml
 admitters = ["2f9c51d0-6a3e-4b7e-9d41-0c8a7e5b3f12"]
