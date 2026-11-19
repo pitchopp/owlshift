@@ -193,7 +193,7 @@ fn waits_for_a_person(bench: &Bench) -> Vec<Value> {
 }
 
 /// A Build round asking one question under `security`.
-const SECURITY_ROUND: &str = r#"{"format":14,"status":"questions",
+const SECURITY_ROUND: &str = r#"{"format":15,"status":"questions",
 "summary":"Who may read the greeting is not given.",
 "questions":[
   {"id":"Q1","category":"security","context":"The greeting file is public.",

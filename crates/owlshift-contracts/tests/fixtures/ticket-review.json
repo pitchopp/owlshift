@@ -1,5 +1,5 @@
 {
-  "format": 1,
+  "format": 2,
   "passes": [
     {
       "stage": "design_review",
@@ -55,5 +55,18 @@
   ],
   "answered_reviews": [
     3141592653
+  ],
+  "relayed": [
+    {
+      "round": 2,
+      "question": "Q1",
+      "answer": "instead",
+      "review": {
+        "id": 3141592654,
+        "author": { "name": "bob", "relation": "other" },
+        "body": "Rename the greeting file.",
+        "comments": [{ "path": "GREETING.md", "line": 1, "body": "Here." }]
+      }
+    }
   ]
 }

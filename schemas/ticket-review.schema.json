@@ -35,7 +35,7 @@
     "format": {
       "description": "The format version of this document.",
       "type": "integer",
-      "const": 1
+      "const": 2
     },
     "last_fix": {
       "description": "The Verify pass, the record's last, whose `minor` findings one last\nBuild fixes (OWL-356): that Build is delivered with no Verify pass\nafter it. Kept with the pass; dropped when that Build asks, takes\nlate comments or follows a decider's reply to a DECISION comment,\nwhen another pass is kept, and at the delivery.",
@@ -52,6 +52,13 @@
       "default": [],
       "items": {
         "$ref": "#/$defs/ReviewPass"
+      }
+    },
+    "relayed": {
+      "description": "The reviews of colleagues relayed to the ticket's decider (format 2,\nOWL-585): each listed reviewer's review that is neither the\ndecider's nor an approval, asked about at Watch, with the decider's\nanswer once the answer check read it. Kept from the ask until the\nreview loop that answers them starts, or watch stops following the\npull request; one set aside moves to `answered_reviews` at once.",
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/RelayedReview"
       }
     }
   },
@@ -507,6 +514,11 @@
         "author"
       ]
     },
+    "QuestionId": {
+      "description": "A question's identifier within a round: Q1, Q2, and so on.",
+      "type": "string",
+      "pattern": "^Q[1-9][0-9]*$"
+    },
     "Relation": {
       "description": "Whether a text comes from the decider, from the runner, or from someone\nelse (whose text is quoted as data).",
       "type": "string",
@@ -514,6 +526,58 @@
         "decider",
         "owlshift",
         "other"
+      ]
+    },
+    "RelayAnswer": {
+      "description": "The decider's answer about a colleague's review that starts a review\nloop (OWL-585); a review set aside is answered at once instead.",
+      "oneOf": [
+        {
+          "description": "Applied as written: the loop's instruction, as the decider's own\nreview is.",
+          "type": "string",
+          "const": "apply"
+        },
+        {
+          "description": "The decider said what to do instead: their answer is the\ninstruction, the review quoted data beside it.",
+          "type": "string",
+          "const": "instead"
+        }
+      ]
+    },
+    "RelayedReview": {
+      "description": "A colleague's review relayed to the ticket's decider (OWL-585): the\nquestion that asks about it and, once answered, what the decider chose.",
+      "type": "object",
+      "properties": {
+        "answer": {
+          "description": "What the decider chose, once the answer check read their answer.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/RelayAnswer"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "question": {
+          "description": "Its question in that round.",
+          "$ref": "#/$defs/QuestionId"
+        },
+        "review": {
+          "description": "The review as it was asked about, quoted data, within the bytes a\nbrief gives one: \"apply as written\" gives a review loop this copy.",
+          "$ref": "#/$defs/PullRequestReview"
+        },
+        "round": {
+          "description": "The question round that asks about it.",
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 1
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "round",
+        "question",
+        "review"
       ]
     },
     "ResponseOutcome": {

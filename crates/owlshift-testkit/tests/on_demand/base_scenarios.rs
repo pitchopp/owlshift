@@ -66,7 +66,7 @@ fn fixable_setup(marker: &Path) -> String {
 
 /// A held Build's rebase run's `done`.
 const REBASED_HELD: &str =
-    r#"{"format":14,"status":"done","summary":"Rebased onto the fix; nothing conflicted."}"#;
+    r#"{"format":15,"status":"done","summary":"Rebased onto the fix; nothing conflicted."}"#;
 
 /// What the agent of the `run`th run does in the ticket's worktree: `git`
 /// with `args`, which must succeed.

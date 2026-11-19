@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::brief::{PullRequestReview, pull_request_review_problem};
 use crate::format::{self, ContractError, Format, PLAN_FORMAT, REVIEW_FORMAT};
-use crate::ids::{FindingId, check_name, is_commit_id, is_lower_hex};
+use crate::ids::{FindingId, QuestionId, check_name, is_commit_id, is_lower_hex};
 use crate::result::{Decision, Followup, PullRequest};
 use crate::{Harness, Role, Stage};
 
@@ -644,6 +644,14 @@ pub struct TicketReview {
     /// stops following the pull request.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub answering: Vec<PullRequestReview>,
+    /// The reviews of colleagues relayed to the ticket's decider (format 2,
+    /// OWL-585): each listed reviewer's review that is neither the
+    /// decider's nor an approval, asked about at Watch, with the decider's
+    /// answer once the answer check read it. Kept from the ask until the
+    /// review loop that answers them starts, or watch stops following the
+    /// pull request; one set aside moves to `answered_reviews` at once.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub relayed: Vec<RelayedReview>,
     /// What the Build that Verify reviews gave for its delivery (OWL-304):
     /// kept once a Build is done and its gate passed, so that `continue`
     /// runs a Verify pass cut short again and delivers. Dropped when the
@@ -657,6 +665,36 @@ pub struct TicketReview {
     /// when another pass is kept, and at the delivery.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_fix: Option<NonZeroU32>,
+}
+
+/// A colleague's review relayed to the ticket's decider (OWL-585): the
+/// question that asks about it and, once answered, what the decider chose.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct RelayedReview {
+    /// The question round that asks about it.
+    pub round: NonZeroU32,
+    /// Its question in that round.
+    pub question: QuestionId,
+    /// What the decider chose, once the answer check read their answer.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub answer: Option<RelayAnswer>,
+    /// The review as it was asked about, quoted data, within the bytes a
+    /// brief gives one: "apply as written" gives a review loop this copy.
+    pub review: PullRequestReview,
+}
+
+/// The decider's answer about a colleague's review that starts a review
+/// loop (OWL-585); a review set aside is answered at once instead.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum RelayAnswer {
+    /// Applied as written: the loop's instruction, as the decider's own
+    /// review is.
+    Apply,
+    /// The decider said what to do instead: their answer is the
+    /// instruction, the review quoted data beside it.
+    Instead,
 }
 
 /// One review pass: the roster's findings on the plan or the diff.
@@ -912,14 +950,21 @@ impl TicketReview {
             passes: Vec::new(),
             answered_reviews: Vec::new(),
             answering: Vec::new(),
+            relayed: Vec::new(),
             build: None,
             last_fix: None,
         }
     }
 
-    /// Parses and validates a `review.json`.
+    /// Parses and validates a `review.json`. A format-1 one, written before
+    /// a colleague's review was relayed (OWL-585), is read as the current
+    /// format.
     pub fn parse(input: &str) -> Result<Self, ContractError> {
-        let review: Self = format::parse_json(Self::CONTRACT, REVIEW_FORMAT, input)?;
+        let review: Self =
+            match format::parse_json_older(Self::CONTRACT, 1, REVIEW_FORMAT, "relayed", input) {
+                Some(read) => read?,
+                None => format::parse_json(Self::CONTRACT, REVIEW_FORMAT, input)?,
+            };
         review.validate()?;
         Ok(review)
     }
@@ -1144,6 +1189,29 @@ impl TicketReview {
                 return invalid(format!("pull request review {} {broken}", review.id));
             }
         }
+        // Each review relayed once, neither answered nor under way, each
+        // question asked about one review (OWL-585).
+        for (n, relayed) in self.relayed.iter().enumerate() {
+            let review = &relayed.review;
+            let earlier = &self.relayed[..n];
+            let broken = if earlier.iter().any(|seen| seen.review.id == review.id) {
+                Some("is relayed twice")
+            } else if earlier
+                .iter()
+                .any(|seen| (seen.round, &seen.question) == (relayed.round, &relayed.question))
+            {
+                Some("is relayed by a question that asks about another")
+            } else if self.answered_reviews.contains(&review.id) {
+                Some("is relayed although answered")
+            } else if self.answering.iter().any(|under| under.id == review.id) {
+                Some("is relayed although under way")
+            } else {
+                pull_request_review_problem(review)
+            };
+            if let Some(broken) = broken {
+                return invalid(format!("pull request review {} {broken}", review.id));
+            }
+        }
         if let Some(build) = &self.build
             && !is_commit_id(&build.commit)
         {
@@ -1208,7 +1276,11 @@ mod tests {
 
     fn ticket_review() -> Value {
         json!({
-            "format": 1,
+            "format": 2,
+            "relayed": [{
+                "round": 2, "question": "Q1", "answer": "apply",
+                "review": { "id": 11, "author": { "name": "bob", "relation": "other" }, "body": "Rename it." }
+            }],
             "passes": [{
                 "stage": "design_review",
                 "pass": 1,
@@ -1436,9 +1508,50 @@ mod tests {
                 ),
                 (&|d| d["build"]["extra"] = 1.into(), "unknown field"),
                 (&|d| d["passes"][0]["pass"] = 0.into(), "nonzero"),
-                (&|d| d["format"] = 2.into(), "upgrade Owlshift"),
+                (&|d| d["format"] = 3.into(), "upgrade Owlshift"),
+                // A colleague's review relayed (OWL-585).
+                (
+                    &|d| {
+                        let kept = d["relayed"][0].clone();
+                        d["relayed"] = json!([kept.clone(), kept]);
+                    },
+                    "pull request review 11 is relayed twice",
+                ),
+                (
+                    &|d| {
+                        let mut other = d["relayed"][0].clone();
+                        other["review"]["id"] = 12.into();
+                        d["relayed"].as_array_mut().unwrap().push(other);
+                    },
+                    "pull request review 12 is relayed by a question that asks about another",
+                ),
+                (
+                    &|d| d["answered_reviews"] = json!([7, 11]),
+                    "pull request review 11 is relayed although answered",
+                ),
+                (
+                    &|d| d["answering"] = json!([d["relayed"][0]["review"].clone()]),
+                    "pull request review 11 is relayed although under way",
+                ),
+                (
+                    &|d| d["relayed"][0]["review"]["body"] = "".into(),
+                    "has neither a body nor a comment",
+                ),
+                (
+                    &|d| d["relayed"][0]["answer"] = "set_aside".into(),
+                    "unknown variant `set_aside`",
+                ),
+                (&|d| d["format"] = 1.into(), "format 1 records no relayed"),
             ],
         );
+        // Format 1, before a review was relayed (OWL-585): read as format 2.
+        let mut older = ticket_review();
+        older["format"] = 1.into();
+        older.as_object_mut().unwrap().remove("relayed");
+        let read = TicketReview::parse(&older.to_string()).unwrap();
+        assert!(read.relayed.is_empty());
+        assert!(read.render().starts_with("{\n  \"format\": 2,"));
+        assert_eq!(parsed.relayed[0].answer, Some(RelayAnswer::Apply));
     }
 
     /// The fixture's finding with `judgment` (`ruling` or `response`) of

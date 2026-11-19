@@ -137,6 +137,8 @@ pub fn thumbs_up_verdicts(questions: &[Question]) -> Vec<Verdict> {
             class: AnswerClass::Answered,
             reason: thumbs_up_reading(question),
             reply: None,
+            // The recommendation's option, as `ok` takes it (OWL-585).
+            option: question.recommended_option().map(option_letter),
         })
         .collect()
 }
@@ -178,7 +180,14 @@ pub fn answering_comment(
 /// gave ([`thumbs_up_verdicts`]): what the ticket ref keeps of a resume by
 /// thumbs-up, the reaction itself being read live only.
 pub fn resumed_by_thumbs_up(verdicts: &[Verdict], questions: &[Question]) -> bool {
-    !verdicts.is_empty() && verdicts == thumbs_up_verdicts(questions).as_slice()
+    let given = thumbs_up_verdicts(questions);
+    // A verdict kept before format 19 has no option (OWL-585).
+    !verdicts.is_empty()
+        && verdicts.len() == given.len()
+        && verdicts
+            .iter()
+            .zip(&given)
+            .all(|(kept, given)| kept.same_but_option(given))
 }
 
 /// The newest last edit among the decider's comments, if they wrote any.
@@ -797,6 +806,7 @@ mod tests {
             class: AnswerClass::Partial,
             reason: "m".repeat(2 * MAX_COMMENT_CHARS),
             reply: None,
+            option: None,
         };
         let open = vec![(question.clone(), verdict.clone())];
         let bodies = [
@@ -1286,6 +1296,7 @@ mod tests {
                 class: AnswerClass::Answered,
                 reason: "Approved as it is.".into(),
                 reply: None,
+                option: None,
             }],
             12,
         );
@@ -1360,7 +1371,7 @@ mod tests {
             })
             .collect();
         finished(&format!(
-            r#"{{"format":14,"status":"done","summary":"s","verdicts":[{}]}}"#,
+            r#"{{"format":15,"status":"done","summary":"s","verdicts":[{}]}}"#,
             verdicts.join(",")
         ))
     }
@@ -1395,12 +1406,12 @@ mod tests {
         assert_eq!(event_of(&done(&[])), Event::RunFailed);
         for status in ["failed", "blocked", "premise_false"] {
             let outcome = finished(&format!(
-                r#"{{"format":14,"status":"{status}","summary":"s"}}"#
+                r#"{{"format":15,"status":"{status}","summary":"s"}}"#
             ));
             assert_eq!(event_of(&outcome), Event::RunFailed, "{status}");
         }
         let asking = finished(
-            r#"{"format":14,"status":"questions","summary":"s","questions":[
+            r#"{"format":15,"status":"questions","summary":"s","questions":[
                 {"id":"Q1","category":"scope","context":"c","text":"t",
                 "recommendation":{"why":"r"}}]}"#,
         );
@@ -1470,7 +1481,7 @@ mod tests {
             question("Q3"),
         ));
         let verdicts = RunResult::parse(
-            r#"{"format":14,"status":"done","summary":"s","verdicts":[
+            r#"{"format":15,"status":"done","summary":"s","verdicts":[
                 {"question":"Q2","class":"answered","reason":"Settled."},
                 {"question":"Q3","class":"partial","reason":"The tone is missing."}]}"#,
         )
@@ -1493,7 +1504,7 @@ mod tests {
             question("Q3"),
         ));
         let verdicts = RunResult::parse(
-            r#"{"format":14,"status":"done","summary":"s","verdicts":[
+            r#"{"format":15,"status":"done","summary":"s","verdicts":[
                 {"question":"Q1","class":"counter_question","reason":"Asks back.","reply":"R1"},
                 {"question":"Q2","class":"unanswered","reason":"Nothing."},
                 {"question":"Q3","class":"counter_question","reason":"Asks back.","reply":"R3"}]}"#,
@@ -1526,6 +1537,7 @@ mod tests {
             class,
             reason: reason.into(),
             reply: None,
+            option: None,
         };
         let round = [question("Q1"), question("Q2"), question("Q3")];
         let first = [

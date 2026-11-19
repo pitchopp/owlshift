@@ -6534,6 +6534,7 @@ Merge state reported by the forge: `CLEAN`.
             class,
             reason: reason.to_owned(),
             reply: None,
+            option: None,
         };
         let comment = ReaskComment {
             ticket: ticket(),
@@ -6639,6 +6640,7 @@ Merge state reported by the forge: `CLEAN`.
             class,
             reason: reason.to_owned(),
             reply: None,
+            option: None,
         }
     }
 

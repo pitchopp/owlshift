@@ -1087,7 +1087,7 @@ fn a_run_that_redirects_its_git_link_is_quarantined_before_any_git() {
             }),
             ..bench.executor.clone()
         };
-        let done = r#"{"format":14,"status":"done","summary":"s","pr":{"branch":"owlshift/T-1","title":"t","body":"b"}}"#;
+        let done = r#"{"format":15,"status":"done","summary":"s","pr":{"branch":"owlshift/T-1","title":"t","body":"b"}}"#;
         let write_result = format!("printf '%s' '{done}' > .owlshift/run/result.json");
         let mut brief = bench.brief.clone();
         let script = if case == "the harness" {
@@ -1111,7 +1111,7 @@ fn a_run_that_redirects_its_git_link_is_quarantined_before_any_git() {
 }
 
 /// The build role's `done`, as a prepared result.
-const DONE: &str = r#"{"format":14,"status":"done","summary":"s","pr":{"branch":"owlshift/T-1","title":"t","body":"b"}}"#;
+const DONE: &str = r#"{"format":15,"status":"done","summary":"s","pr":{"branch":"owlshift/T-1","title":"t","body":"b"}}"#;
 
 impl Bench {
     /// The fake harness playing `reply`, its prepared result `DONE`.
@@ -1378,7 +1378,7 @@ fn a_run_that_rewrites_its_start_is_quarantined_and_named() {
         .run(&bench.worktree, &["commit", "--quiet", "-m", "Mine"])
         .unwrap();
     let start = bench.head_of(&bench.worktree);
-    let done = r#"{"format":14,"status":"done","summary":"s","pr":{"branch":"owlshift/T-1","title":"t","body":"b"}}"#;
+    let done = r#"{"format":15,"status":"done","summary":"s","pr":{"branch":"owlshift/T-1","title":"t","body":"b"}}"#;
     let script = format!(
         "git commit --quiet --amend -m 'Mine, again' && printf '%s' '{done}' > .owlshift/run/result.json"
     );

@@ -66,7 +66,7 @@ fn brief(role: &str) -> Value {
 }
 
 fn base_result(status: &str) -> Value {
-    json!({ "format": 14, "status": status, "summary": "s" })
+    json!({ "format": 15, "status": status, "summary": "s" })
 }
 
 fn question(replan: bool) -> Value {
@@ -624,7 +624,7 @@ fn bumped_ticket_ref_formats_read_older_ones_and_refuse_newer_ones() {
         TicketQuestions::parse(&older.to_string())
             .unwrap()
             .render()
-            .starts_with("{\n  \"format\": 18,")
+            .starts_with("{\n  \"format\": 19,")
     );
     for path in [
         &["asks", "0", "questions", "0"][..],
@@ -652,7 +652,7 @@ fn bumped_ticket_ref_formats_read_older_ones_and_refuse_newer_ones() {
     eleven["format"] = 11.into();
     assert!(TicketQuestions::parse(&eleven.to_string()).unwrap().asks[0].questions[0].replan);
     let mut newer = questions;
-    newer["format"] = 19.into();
+    newer["format"] = 20.into();
     let error = TicketQuestions::parse(&newer.to_string())
         .unwrap_err()
         .to_string();
@@ -903,7 +903,7 @@ fn a_later_pass_is_told_what_changed_and_the_last_fix_is_kept() {
     let mut build = brief("build");
     build["findings"] = notes.clone();
     let parsed = Brief::parse(&build.to_string()).unwrap();
-    let done = json!({ "format": 14, "status": "done", "summary": "s",
+    let done = json!({ "format": 15, "status": "done", "summary": "s",
         "finding_responses": [{ "finding": "F1", "outcome": "fixed", "reason": "r" }] });
     assert!(
         RunResult::parse_against(&done.to_string(), &parsed).is_err(),
