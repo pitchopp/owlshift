@@ -38,7 +38,9 @@ use crate::{data_dir, fail, own_build};
 pub(crate) const ON_WINDOWS: &str = "the background service runs on macOS and Linux, and on Windows through \
      WSL2: native Windows runs no agent (D9)";
 
-/// How long `owlshift start` waits for the daemon it launched to run.
+/// How long `owlshift start` waits for the daemon it launched to take its
+/// lock. Once it holds it, start waits for its record while the daemon pins
+/// its binary, up to [`PIN_CHECK_WAIT`] more (OWL-608).
 const LAUNCH_WAIT: Duration = Duration::from_secs(10);
 
 /// How often that wait looks.
@@ -160,9 +162,15 @@ pub fn hand_over(data: &Path, by: &str) -> Option<String> {
     }
 }
 
-/// How long the pinned binary has to answer `--version`: its first run on
-/// macOS includes the system's scan of a new file, about a second.
-const PIN_CHECK_WAIT: Duration = Duration::from_secs(30);
+/// How long the pinned binary has to answer `--version`. Its first run on
+/// macOS waits for the system's scan of a new file, and the system scans new
+/// executables one at a time: measured on 2026-11-19 (OWL-608), about 1.7 s
+/// per 80 MB debug binary, and 5.6 to 25.7 s for this check while about 12
+/// daemons pinned at once (three `cargo nextest run -p owlshift-cli`). The
+/// bound only cuts a copy that never answers, so it stands well past that
+/// worst case, more than four times it; a terminal watch's pin shares it
+/// (OWL-560).
+const PIN_CHECK_WAIT: Duration = Duration::from_secs(120);
 
 /// `Ok` when the binary the daemon's children run, `pinned`, is this very
 /// build (OWL-553): a binary replaced between this daemon's start and its
@@ -582,26 +590,56 @@ fn launch_session_daemon(launch: &Launch<'_>) -> Result<Box<dyn Launched>, Strin
 }
 
 /// Waits until a daemon started at `since` or later runs on `data`, its
-/// record written: refused once `launched` ended, or after [`LAUNCH_WAIT`].
+/// record written, within [`LAUNCH_WAIT`] and [`PIN_CHECK_WAIT`]: see
+/// [`wait_running_within`].
 fn wait_running(
     data: &Path,
     since: Timestamp,
     launched: &mut dyn Launched,
 ) -> Result<DaemonRecord, String> {
-    let deadline = Instant::now() + LAUNCH_WAIT;
+    wait_running_within(data, since, launched, LAUNCH_WAIT, PIN_CHECK_WAIT)
+}
+
+/// Waits until a daemon started at `since` or later runs on `data`, its
+/// record written (OWL-608). Refused once `launched` ended; after `launch`
+/// while no daemon holds the lock; and, while one holds it without a record
+/// that reads, pinning its binary before it writes one, after `launch` and
+/// `pinning` together, counted from the start of the wait. The daemon takes
+/// the lock within `launch` or the first refusal is given, and its pin check
+/// is bounded by `pinning`, so a daemon whose copy answers in time is never
+/// given up on. A daemon that lets the lock go without a record, as when its
+/// pin check failed, is told by the first refusal, `launched` telling its end
+/// first when start launched it itself.
+fn wait_running_within(
+    data: &Path,
+    since: Timestamp,
+    launched: &mut dyn Launched,
+    launch: Duration,
+    pinning: Duration,
+) -> Result<DaemonRecord, String> {
+    let start = Instant::now();
     loop {
-        if let Ok(Some(Some(record))) = daemon::running(data)
-            && record.since >= since
-        {
-            return Ok(record);
-        }
+        let pins = match daemon::running(data) {
+            Ok(Some(Some(record))) if record.since >= since => return Ok(record),
+            Ok(Some(None)) => true,
+            _ => false,
+        };
         if let Some(ended) = launched.ended() {
             return Err(ended);
         }
-        if Instant::now() >= deadline {
+        let waited = start.elapsed();
+        if !pins && waited >= launch {
             return Err(format!(
                 "it was not running {} seconds later: see {}",
-                LAUNCH_WAIT.as_secs(),
+                launch.as_secs(),
+                log_file(data).display()
+            ));
+        }
+        if waited >= launch + pinning {
+            return Err(format!(
+                "it held its lock but had not written its record {} seconds later, the copy of \
+                 this program it runs not having answered `--version`: see {}",
+                (launch + pinning).as_secs(),
                 log_file(data).display()
             ));
         }
@@ -945,6 +983,127 @@ mod tests {
         let newer = format!("owlshift 99.0.0\nbuild: {}\n", own_build());
         assert!(!names_own_build(&newer));
         assert!(!names_own_build(""));
+    }
+
+    /// OWL-608: `start` waits for a daemon that holds its lock without a
+    /// record, as one does while it pins its binary, past the bound on taking
+    /// the lock, up to that bound and the pin check's together; bounds
+    /// injected, the daemon's lock taken and its record written in-process.
+    #[cfg(unix)]
+    mod start_wait {
+        use jiff::SignedDuration;
+        use owlshift_runner::daemon::instance::{self, Instance, Locked};
+
+        use super::super::*;
+
+        /// The daemon `start` launched: at the first look, it ends, or writes
+        /// its record, or does neither.
+        struct Starting<'a> {
+            data: &'a Path,
+            locked: Option<Locked>,
+            then: Then,
+            published: Option<Instance>,
+        }
+
+        enum Then {
+            Ends,
+            Publishes(DaemonRecord),
+            Waits,
+        }
+
+        impl Launched for Starting<'_> {
+            fn ended(&mut self) -> Option<String> {
+                match std::mem::replace(&mut self.then, Then::Waits) {
+                    Then::Ends => Some("it ended at once".to_owned()),
+                    Then::Publishes(record) => {
+                        let locked = self.locked.take().unwrap();
+                        self.published = Some(locked.publish(self.data, &record).unwrap());
+                        None
+                    }
+                    Then::Waits => None,
+                }
+            }
+        }
+
+        fn record(since: Timestamp) -> DaemonRecord {
+            DaemonRecord {
+                format: Format,
+                pid: 4242,
+                version: OWLSHIFT_VERSION.to_owned(),
+                binary: "/bin/owlshift".to_owned(),
+                since,
+                build: None,
+            }
+        }
+
+        fn wait(
+            data: &Path,
+            since: Timestamp,
+            then: Then,
+            pinning: Duration,
+        ) -> Result<u32, String> {
+            let mut starting = Starting {
+                data,
+                locked: Some(instance::lock(data).unwrap().unwrap()),
+                then,
+                published: None,
+            };
+            wait_running_within(data, since, &mut starting, Duration::ZERO, pinning)
+                .map(|record| record.pid)
+        }
+
+        #[test]
+        fn start_waits_for_a_daemon_that_holds_its_lock_within_both_bounds() {
+            let data = tempfile::tempdir().unwrap();
+            let data = data.path();
+            let since = Timestamp::now();
+
+            // Holding the lock, it writes its record after the bound on
+            // taking the lock.
+            let publishes = Then::Publishes(record(since));
+            assert_eq!(wait(data, since, publishes, PIN_CHECK_WAIT), Ok(4242));
+
+            // Holding the lock, it ends: told at once.
+            let ended = wait(data, since, Then::Ends, PIN_CHECK_WAIT).unwrap_err();
+            assert_eq!(ended, "it ended at once");
+
+            // Holding the lock, it writes nothing within both bounds.
+            let silent = wait(data, since, Then::Waits, Duration::ZERO).unwrap_err();
+            assert!(
+                silent
+                    .starts_with("it held its lock but had not written its record 0 seconds later"),
+                "{silent}"
+            );
+
+            // No daemon holds the lock.
+            let none =
+                wait_running_within(data, since, &mut ByNone, Duration::ZERO, PIN_CHECK_WAIT)
+                    .unwrap_err();
+            assert!(
+                none.starts_with("it was not running 0 seconds later"),
+                "{none}"
+            );
+
+            // An older daemon's record is not the one start waits for.
+            let older = since.checked_sub(SignedDuration::from_hours(1)).unwrap();
+            let _older = instance::take(data, &record(older)).unwrap().unwrap();
+            let stale =
+                wait_running_within(data, since, &mut ByNone, Duration::ZERO, PIN_CHECK_WAIT)
+                    .unwrap_err();
+            assert!(
+                stale.starts_with("it was not running 0 seconds later"),
+                "{stale}"
+            );
+        }
+
+        /// No process of start's own to watch.
+        struct ByNone;
+
+        impl Launched for ByNone {
+            fn ended(&mut self) -> Option<String> {
+                None
+            }
+        }
     }
 
     /// OWL-437: the service at login, on temp folders and a recording
