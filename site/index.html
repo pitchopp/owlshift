@@ -62,63 +62,64 @@
 
 <section id="how" class="section">
   <div class="wrap">
-    <h2>One night, one ticket</h2>
-    <p class="lead">No new board to learn: the questions, the answers and the delivery report live on the ticket you already write.</p>
+    <h2>One ticket, start to merge</h2>
+    <p class="lead">No new board to learn: the questions, the answers and the delivery report live on the ticket you already write. Below, a real run of Owlshift on its own backlog, in UTC: the ticket is kept in a private Linear workspace, the pull request is public.</p>
 
-    <!-- AN EXAMPLE, NOT A REAL RUN. OWL-42, its times, its question and
-         pull request #128 are made up. The page is not served until the
-         demo run (OWL-577) replaces this timeline with its own facts and the
-         links to where each moment happened, under a comment naming the
-         issue (build plan, "The public site", "The demo"). -->
+    <!-- OWL-513, "Re-run a red check failing only outside the branch before
+         asking or parking", on Owlshift's Linear workspace, delivered as
+         pull request #486. Every time, the question, its options and the
+         reply are the ticket's own, quoted as they are (build plan, "The
+         public site", "The demo"). -->
     <ol class="timeline">
       <li class="moment">
-        <p class="when"><time>18:12</time><span class="part">evening</span></p>
+        <p class="when"><time datetime="2026-11-08T09:17Z">09:17</time><span class="part">Nov 8</span></p>
         <span class="ring" aria-hidden="true"></span>
         <div class="moment-body">
           <h3>You mark the ticket ready</h3>
-          <p>OWL-42 is marked ready in the tracker you already use. Its blockers are done, so it is next in line.</p>
+          <p>OWL-513 asks for a red check that fails outside the branch to be re-run before anything is repaired. You file it ready; intake reads it four minutes later.</p>
         </div>
       </li>
       <li class="moment">
-        <p class="when"><time>22:04</time><span class="part">night</span></p>
-        <span class="ring" aria-hidden="true"></span>
-        <div class="moment-body">
-          <h3>A plan, before any code</h3>
-          <p>Intake sizes the ticket. A design is written, then reviewed by a fresh run, on another model when the configuration names one.</p>
-        </div>
-      </li>
-      <li class="moment">
-        <p class="when"><time>23:41</time></p>
+        <p class="when"><time datetime="2026-11-08T15:10Z">15:10</time></p>
         <span class="ring" aria-hidden="true"></span>
         <div class="moment-body">
           <h3>A question only you can answer</h3>
-          <p>It is posted on the ticket, with a recommendation. OWL-42 waits; the other tickets go on.</p>
+          <p>Re-running a job needs a permission Owlshift's GitHub App does not ask today. Owlshift settled five other points itself, and asked you this one on the ticket.</p>
           <div class="card question">
             <p class="question-kind">QUESTIONS · round 1</p>
-            <p class="question-text">Q1 · Should the export include refunded invoices?</p>
+            <p class="question-text">Q1 · May Owlshift's GitHub App ask Actions (write) so the runner can re-run jobs?</p>
             <ul class="options">
-              <li class="option"><span class="option-letter">A.</span><span class="option-label">Leave refunds out</span></li>
-              <li class="option recommended"><span class="option-letter">B.</span><span class="option-label">Include them, with a status column</span><span class="option-tag">recommended</span></li>
+              <li class="option recommended"><span class="option-letter">A.</span><span class="option-label">Ask Actions (write); fall back without it</span><span class="option-tag">recommended</span></li>
+              <li class="option"><span class="option-letter">B.</span><span class="option-label">Keep Actions (read); re-run only with a personal token that has write</span></li>
+              <li class="option"><span class="option-letter">C.</span><span class="option-label">Ask write, re-run only on projects that opt in</span></li>
             </ul>
-            <p class="question-reply">Reply <code>Q1: B</code>, <code>ok</code> to take every recommendation, or in your own words.</p>
+            <p class="question-reply">Reply <code>Q1: A</code>, <code>ok</code> to take every recommendation, or in your own words.</p>
           </div>
         </div>
       </li>
       <li class="moment">
-        <p class="when"><time>07:58</time><span class="part">breakfast</span></p>
+        <p class="when"><time datetime="2026-11-08T19:27Z">19:27</time></p>
         <span class="ring" aria-hidden="true"></span>
         <div class="moment-body">
-          <h3>You answer over breakfast</h3>
-          <p><code>ok go</code> takes the recommendation. The answer is checked before anything resumes: half an answer is asked again.</p>
+          <h3>You answer when you have a minute</h3>
+          <p><code>Q1: A</code>, then <code>go</code>. The answer is checked before anything resumes: half an answer is asked again.</p>
+        </div>
+      </li>
+      <li class="moment">
+        <p class="when"><time datetime="2026-11-08T20:57Z">20:57</time></p>
+        <span class="ring" aria-hidden="true"></span>
+        <div class="moment-body">
+          <h3>A plan, before any code</h3>
+          <p>The design is written with your answer, reviewed by a fresh run, then put to you for approval. You approve it at 23:49.</p>
         </div>
       </li>
       <li class="moment done">
-        <p class="when"><time>08:31</time></p>
+        <p class="when"><time datetime="2026-11-10T01:28Z">01:28</time><span class="part">Nov 10</span></p>
         <span class="ring" aria-hidden="true"></span>
         <div class="moment-body">
           <h3>A verified pull request</h3>
-          <p>The project's gate passed, and a fresh run reviewed the diff. A red check or a conflict is Owlshift's to repair. You merge.</p>
-          <p class="card pull-request"><span class="pull-request-state">✓</span><span class="pull-request-number">#128</span><span>Export invoices as CSV</span></p>
+          <p>The build waited a day, while other tickets held a design document it would change. The project's gate passed, and Verify's findings were answered. You merged it at 07:49.</p>
+          <p class="card pull-request"><span class="pull-request-state">✓</span><a class="pull-request-number" href="https://github.com/pitchopp/owlshift/pull/486">#486</a><span>Re-run a red check once before any fix run</span></p>
         </div>
       </li>
     </ol>

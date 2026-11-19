@@ -205,6 +205,13 @@ fn each_repository_link_names_a_file_and_each_anchor_resolves() {
         let file = match path {
             // GitHub redirects it to the latest release: no file to check.
             "/releases/latest" => continue,
+            // A pull request, such as the timeline's: no file to check.
+            pull if pull.strip_prefix("/pull/").is_some_and(|number| {
+                !number.is_empty() && number.bytes().all(|b| b.is_ascii_digit())
+            }) =>
+            {
+                continue;
+            }
             // The repository's page shows its README, anchors included.
             "" => "README.md",
             _ => match path.strip_prefix("/blob/main/") {
