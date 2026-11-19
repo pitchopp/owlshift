@@ -26,7 +26,7 @@ PROGRAM=${0##*/}
 root=$(cd "$(dirname "$0")/../.." && pwd)
 out="$root/assets/readme"
 chrome=${CHROME:-"/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"}
-width=1000
+width=800
 
 if [ "$#" -ne 0 ]; then
     echo "Usage: $PROGRAM" >&2
