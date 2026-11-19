@@ -263,6 +263,52 @@ fn a_renewal_tells_the_lost_claim_from_the_others() {
     assert!(again.lost.is_empty(), "{again:?}");
 }
 
+/// A data directory whose runner identifier was made again keeps records
+/// of claims the old identity took: none is the new runner's. Its take
+/// finds the claim lost, naming the old runner, its renewal finds the
+/// other lost, and no held set is pushed under the old identity.
+#[test]
+fn a_record_of_another_runner_identity_is_not_this_runners() {
+    let bench = Bench::new();
+    let ada = bench.runner("ada", "ada");
+    let (one, two, three) = (ticket("OWL-1"), ticket("OWL-2"), ticket("OWL-3"));
+    for each in [&one, &two, &three] {
+        assert!(matches!(ada.take(each, None), Ok(Took::Taken { .. })));
+    }
+    let old = ada.id.clone();
+    fs::remove_file(ada.dirs.data_dir().join(claims::RUNNER_FILE)).unwrap();
+    let new = claims::runner_id(ada.dirs.data_dir()).unwrap();
+    assert_ne!(new, old);
+
+    let taken = claims::take(
+        ada.at(),
+        &one,
+        &new,
+        "ada",
+        ClaimHeld::default(),
+        Timestamp::now(),
+        None,
+    );
+    let Err(NotTaken::Lost(Some(holder))) = taken else {
+        panic!("{taken:?}");
+    };
+    assert_eq!(holder.runner, old.as_str());
+    assert!(claims::read_record(&ada.dirs, &one).is_none());
+
+    let held = ClaimHeld {
+        files: vec!["src/lib.rs".to_owned()],
+        ..ClaimHeld::default()
+    };
+    assert!(claims::update_held(ada.at(), &three, held, Timestamp::now()).is_err());
+    assert!(bench.remote_claim(&three).held.is_empty());
+
+    let renewal = claims::renew(ada.at(), &|_| ClaimHeld::default(), Timestamp::now());
+    assert!(renewal.renewed.is_empty(), "{renewal:?}");
+    let lost: Vec<&TicketId> = renewal.lost.iter().map(|(ticket, _)| ticket).collect();
+    assert_eq!(lost, [&two, &three], "{renewal:?}");
+    assert_eq!(bench.remote_claim(&two).runner, old.as_str());
+}
+
 /// What a take reads back after a crash or another machine's gesture: a
 /// claim gone is lost; a claim of this runner's its record missed is
 /// adopted; a take never confirmed whose claim is absent is taken afresh; a

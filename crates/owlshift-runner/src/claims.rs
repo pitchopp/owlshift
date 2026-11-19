@@ -214,6 +214,19 @@ pub fn take(
     }
     let heads = ls_remote(at.git, &checkout, &names).map_err(NotTaken::Unreachable)?;
     let remote = heads.get(&name).cloned();
+    // A record whose claim names another runner, this data directory's
+    // identifier having been made again since, is not this runner's: lost
+    // once confirmed, forgotten otherwise.
+    let record = match record {
+        Some(record) if record.claim.runner != runner.as_str() => {
+            remove_record(at.dirs, ticket);
+            if record.commit.is_some() {
+                return Err(NotTaken::Lost(read_holder(at.git, &checkout, ticket)));
+            }
+            None
+        }
+        record => record,
+    };
     if let Some(record) = record {
         let known = |oid: &str| {
             record.commit.as_deref() == Some(oid) || record.next.as_deref() == Some(oid)
@@ -361,6 +374,13 @@ pub fn renew(
 ) -> Renewal {
     let checkout = at.dirs.checkout();
     let mut renewal = Renewal::default();
+    let runner = match runner_id(at.dirs.data_dir()) {
+        Ok(runner) => runner,
+        Err(error) => {
+            renewal.failed = Some(format!("this machine's runner identifier: {error}"));
+            return renewal;
+        }
+    };
     let mut locks = Vec::new();
     let mut due: Vec<(TicketClaimed, String, CommitId)> = Vec::new();
     for record in recorded(at.dirs) {
@@ -385,6 +405,14 @@ pub fn renew(
         let Some(record) = read_record(at.dirs, &ticket) else {
             continue;
         };
+        // A record of another runner's identity is not this runner's: lost
+        // once confirmed, as a take finds it.
+        if record.claim.runner != runner.as_str() {
+            remove_record(at.dirs, &ticket);
+            let holder = read_holder(at.git, &checkout, &ticket);
+            renewal.lost.push((ticket, holder));
+            continue;
+        }
         let Some(expected) = record.commit.clone().filter(|commit| *commit == expected) else {
             renewal.busy.push(ticket);
             continue;
@@ -467,7 +495,7 @@ pub fn renew(
                 }
                 Some(oid) if *oid == expected => again.push((record, expected, commit)),
                 Some(oid) => match read_remote(at.git, &checkout, &ticket) {
-                    Ok(Some(claim)) if claim.runner == record.claim.runner => {
+                    Ok(Some(claim)) if claim.runner == runner.as_str() => {
                         match adopt(at.dirs, &ticket, oid, claim) {
                             Ok(()) => renewal.adopted.push(ticket),
                             Err(why) => renewal.failed = Some(why),
@@ -530,6 +558,16 @@ pub fn update_held(
     let Some(expected) = record.commit.clone().filter(|_| !record.deleting) else {
         return Ok(false);
     };
+    // A record of another runner's identity is not this runner's to push:
+    // the next take or renewal tells it lost.
+    let runner = runner_id(at.dirs.data_dir()).map_err(|e| e.to_string())?;
+    if record.claim.runner != runner.as_str() {
+        return Err(format!(
+            "the claim's record names runner {}, not this runner, {}",
+            record.claim.runner,
+            runner.as_str()
+        ));
+    }
     if record.claim.held == held && record.next.is_none() {
         return Ok(false);
     }
