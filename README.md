@@ -78,6 +78,10 @@ The [command reference](docs/reference/cli.md) lists every command with its argu
 
 When something does not work, [Troubleshooting](docs/troubleshooting.md) is ordered by what you see: the `owlshift doctor` lines that fail, a gate that passes on your laptop and not under Owlshift, a ticket that does not start, a parked ticket, a usage limit, a quarantined or paused project, and where the logs are.
 
+## Concepts
+
+[What Owlshift does with a ticket](docs/concepts.md) follows one ticket from admission to merge: the pipeline and its variants, the roles and tiers, how questions are asked and answered, how tickets wait for each other, and what Owlshift never does.
+
 ## Design
 
 The design is in [`docs/design/`](docs/design/):
