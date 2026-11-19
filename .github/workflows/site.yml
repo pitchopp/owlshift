@@ -1,0 +1,76 @@
+name: Site
+
+# OWL-578: the public site, served by GitHub Pages at
+# https://pitchopp.github.io/owlshift/ (build plan, "The public site", "How
+# it is served"). `build` writes the site with scripts/site/build.sh on a
+# pull request and on a push to main, so a file the script copies cannot go
+# missing unnoticed. `deploy`, on a push to main or by hand on main, deploys
+# what `build` uploaded.
+#
+# The token reads contents. `deploy` alone gets `pages: write` and
+# `id-token: write`, in the environment github-pages, which keeps deploys to
+# main; it runs no code of the repository. Live check W1 (2026-11-19) found
+# each of the two permissions needed and actions/configure-pages not, so it
+# is left out. Every action is pinned to its full commit, resolved on
+# 2026-11-19. Approved by the maintainer on OWL-578 on 2026-11-19, as the
+# CI-settings floor of architecture section 8 requires.
+
+on:
+  pull_request:
+    paths:
+      - 'site/**'
+      - 'scripts/site/**'
+      - 'assets/brand/**'
+      - 'crates/owlshift-runner/src/ui/assets/fonts/**'
+      - '.github/workflows/site.yml'
+  push:
+    branches: [main]
+    paths:
+      - 'site/**'
+      - 'scripts/site/**'
+      - 'assets/brand/**'
+      - 'crates/owlshift-runner/src/ui/assets/fonts/**'
+      - '.github/workflows/site.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# One run at a time per ref, the whole run: two pushes to main build and
+# deploy in their order, so an older build cannot deploy after a newer one.
+# A pending run of main gives way to a newer one; a running deploy is never
+# cut. A pull request's runs are keyed by its own ref, so they never wait on
+# a deploy, and a newer push to it cancels the older run.
+concurrency:
+  group: site-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  build:
+    name: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Write the site
+        run: scripts/site/build.sh _site
+      - if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+        uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9 # v5.0.0
+        with:
+          path: _site
+
+  deploy:
+    name: deploy
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@368f82528645a54fb793d4d04e342629a3f51346 # v5.0.1
