@@ -686,8 +686,8 @@ fn answer_check_prompt_names_its_fields_classes_and_inputs() {
         .into();
     assert_eq!(classes, four, "the answer check's classes changed");
     let words = [
-        "format", "status", "summary", "verdicts", "question", "class", "reason", "reply", "done",
-        "failed",
+        "format", "status", "summary", "verdicts", "question", "class", "reason", "reply",
+        "option", "done", "failed",
     ];
     let missing: Vec<_> = words
         .iter()

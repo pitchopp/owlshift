@@ -454,6 +454,33 @@ pub struct Verdict {
     )]
     #[schemars(with = "String", regex(pattern = r"\S"))]
     pub reply: Option<String>,
+    /// The letter of the question's option the decider chose, as the runner
+    /// letters them ([`option_letter`]), when they chose one (format 15,
+    /// OWL-585): with `class: answered` only, and refused when it names none
+    /// of the options the question offers. Left out when the decider
+    /// answered in words of their own. The runner reads it where the option
+    /// decides what follows: a colleague's review relayed to the decider.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "present_string"
+    )]
+    #[schemars(with = "String", regex(pattern = r"^[A-Z]+$"))]
+    pub option: Option<String>,
+}
+
+impl Verdict {
+    /// Whether it is `other` but for the option each holds: a verdict kept
+    /// before format 15 has none (OWL-585).
+    pub fn same_but_option(&self, other: &Self) -> bool {
+        Self {
+            option: None,
+            ..self.clone()
+        } == Self {
+            option: None,
+            ..other.clone()
+        }
+    }
 }
 
 /// The resolver's outcome on one question it was given: decided, with its
@@ -969,6 +996,26 @@ impl RunResult {
                 CONTRACT,
                 format!("no verdict for {} of round {round}", question.id),
             ));
+        }
+        // A chosen option is one the question offers (OWL-585).
+        for verdict in &self.verdicts {
+            let Some(letter) = verdict.option.as_deref() else {
+                continue;
+            };
+            let offered = asked
+                .iter()
+                .find(|q| q.id == verdict.question)
+                .is_some_and(|q| option_index(&q.options, letter).is_some());
+            if !offered {
+                return Err(ContractError::invalid(
+                    CONTRACT,
+                    format!(
+                        "the verdict for {} names option {letter}, which the question does not \
+                         offer",
+                        verdict.question
+                    ),
+                ));
+            }
         }
         Ok(())
     }
@@ -1536,6 +1583,12 @@ pub(crate) fn check_verdicts(
         let counter_question = verdict.class == AnswerClass::CounterQuestion;
         let broken = if verdict.reason.trim().is_empty() {
             "has no reason"
+        } else if verdict.option.is_some() && verdict.class != AnswerClass::Answered {
+            "names an option but is not answered"
+        } else if verdict.option.as_deref().is_some_and(|letter| {
+            letter.is_empty() || !letter.bytes().all(|b| b.is_ascii_uppercase())
+        }) {
+            "names an option that is not a letter"
         } else {
             match &verdict.reply {
                 None if counter_question => "is a counter-question without a reply",

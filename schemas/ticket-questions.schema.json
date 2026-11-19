@@ -52,7 +52,7 @@
     "format": {
       "description": "The format version of this document.",
       "type": "integer",
-      "const": 18
+      "const": 19
     },
     "resolver_refusal": {
       "description": "Why the runner refused the latest resolver result (format 7,\nOWL-191): what the next resolver run is told, whatever command runs\nit. Its questions went to the decider in a fallback round; it is kept\nfor the case where that round's post or keeping failed, and a later\ncommand's Build asks them again. A later refusal replaces it; an\naccepted resolver result, or any round kept, clears it; at most\n[`MAX_RESULT_REFUSAL_BYTES`].",
@@ -515,6 +515,11 @@
       "properties": {
         "class": {
           "$ref": "#/$defs/AnswerClass"
+        },
+        "option": {
+          "description": "The letter of the question's option the decider chose, as the runner\nletters them ([`option_letter`]), when they chose one (format 15,\nOWL-585): with `class: answered` only, and refused when it names none\nof the options the question offers. Left out when the decider\nanswered in words of their own. The runner reads it where the option\ndecides what follows: a colleague's review relayed to the decider.",
+          "type": "string",
+          "pattern": "^[A-Z]+$"
         },
         "question": {
           "$ref": "#/$defs/QuestionId"

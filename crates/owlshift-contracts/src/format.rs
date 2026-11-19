@@ -63,8 +63,9 @@ pub const BRIEF_FORMAT: u32 = 30;
 /// `judgment` basis kind and a decision's `option` (OWL-343); format 13
 /// `finding_responses` to findings to `fix` too, and their `disagreed` and
 /// `deferred` outcomes (OWL-377); format 14 intake's `zones` and
-/// `resources` (OWL-402).
-pub const RESULT_FORMAT: u32 = 14;
+/// `resources` (OWL-402); format 15 the answer check's chosen `option` on a
+/// verdict (OWL-585).
+pub const RESULT_FORMAT: u32 = 15;
 /// The format version of an event. Format 2 added the `warning` kind (OWL-134);
 /// the log is append-only, so [`Event::parse`](crate::event::Event::parse)
 /// still reads the format-1 lines already written.
@@ -89,9 +90,10 @@ pub const TICKET_STATE_FORMAT: u32 = 4;
 /// format 15 a decision's `number` in its DECISION comment and the
 /// `decisions_document` (OWL-351); format 16 a decision's `recommendation`
 /// basis kind (OWL-375); format 17 drops a decision's `asked_by`
-/// (OWL-379); format 18 an ask's resolver `labels` (OWL-482); formats 2 to
-/// 17 are still read, formats 14 to 16 without a decision's `asked_by`.
-pub const QUESTIONS_FORMAT: u32 = 18;
+/// (OWL-379); format 18 an ask's resolver `labels` (OWL-482); format 19 a
+/// verdict's chosen `option` (OWL-585); formats 2 to 18 are still read,
+/// formats 14 to 16 without a decision's `asked_by`.
+pub const QUESTIONS_FORMAT: u32 = 19;
 /// The format version of a ticket's delivery (`delivery.json` on a ticket
 /// ref, OWL-209). Format 2 adds the `owed` report and the push's kept
 /// `report` (OWL-218); format 3 a correction run's push (OWL-146); format 4
@@ -114,8 +116,9 @@ pub const PROPOSALS_FORMAT: u32 = 2;
 /// OWL-300).
 pub const PLAN_FORMAT: u32 = 1;
 /// The format version of a ticket's review record (`review.json` on a ticket
-/// ref, OWL-300).
-pub const REVIEW_FORMAT: u32 = 1;
+/// ref, OWL-300). Format 2 adds the colleagues' reviews `relayed` to the
+/// decider (OWL-585); format 1 is still read.
+pub const REVIEW_FORMAT: u32 = 2;
 /// The format version of what a ticket's runs cost (`cost.json` on a ticket
 /// ref, OWL-378).
 pub const COST_FORMAT: u32 = 1;

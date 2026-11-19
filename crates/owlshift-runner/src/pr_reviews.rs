@@ -13,6 +13,12 @@
 //!   or an inline comment. A body Owlshift wrote never counts: one that
 //!   reads as a marked comment, as the brief's thread demotes it
 //!   ([`MarkedComment::parse`]).
+//! - *A colleague's review* (OWL-585; build plan, "P10 · Teams", "A
+//!   colleague's review"). A listed reviewer's review that is neither the
+//!   decider's nor an approval (nor dismissed) is relayed to the decider
+//!   ([`to_relay`]), who applies it, sets it aside or says what to do
+//!   instead. An applied one instructs as the decider's own; one answered
+//!   otherwise is quoted data, the decider's answer being the instruction.
 
 use std::collections::BTreeMap;
 use std::num::NonZeroU32;
@@ -25,7 +31,12 @@ use owlshift_contracts::brief::{
 };
 use owlshift_contracts::comment::MarkedComment;
 use owlshift_contracts::refs::AnsweredReview;
+use owlshift_contracts::review::{RelayAnswer, RelayedReview};
 use owlshift_core::floor::same_account;
+
+/// The most reviews one round relays to the decider: the rest are asked
+/// about at the next pass (OWL-585).
+pub const MAX_RELAYED: usize = 10;
 
 /// A review due: its author's login as `[forge].reviewers` lists it, and
 /// the tracker account that login maps to.
@@ -41,6 +52,62 @@ impl Due<'_> {
     pub fn instructs(&self, decider: &str) -> bool {
         same_account(self.account, decider)
     }
+
+    /// Whether it asks for nothing of the decider (OWL-585): an approval,
+    /// or a review dismissed, in GitHub's state compared without case.
+    pub fn asks_nothing(&self) -> bool {
+        ["APPROVED", "DISMISSED"]
+            .iter()
+            .any(|state| self.review.state.eq_ignore_ascii_case(state))
+    }
+
+    /// The review as a brief gives it, with `relation`, within
+    /// [`MAX_PULL_REQUEST_REVIEW_BYTES`].
+    pub fn quoted(&self, relation: Relation) -> PullRequestReview {
+        let review = self.review;
+        fit(PullRequestReview {
+            id: review.id,
+            author: Author {
+                name: review.author.clone().unwrap_or_default(),
+                relation,
+            },
+            body: body(review).to_owned(),
+            comments: comments(review),
+        })
+    }
+}
+
+/// What the decider answered about review `id`, relayed to them
+/// (OWL-585): `None` when it was not relayed, or not answered yet.
+pub fn relay_answer(relayed: &[RelayedReview], id: u64) -> Option<RelayAnswer> {
+    relayed
+        .iter()
+        .find(|relayed| relayed.review.id == id)
+        .and_then(|relayed| relayed.answer)
+}
+
+/// Whether `due` starts a review loop: a review of the decider's is due,
+/// or one the decider answered when it was relayed to them (OWL-585).
+pub fn starts(due: &[Due<'_>], decider: &str, relayed: &[RelayedReview]) -> bool {
+    instructed(due, decider)
+        || due
+            .iter()
+            .any(|due| relay_answer(relayed, due.review.id).is_some())
+}
+
+/// The reviews of `due` to relay to the decider (OWL-585), at most
+/// [`MAX_RELAYED`], oldest first: a colleague's, neither the decider's nor
+/// one that asks nothing, that no answer of the decider's covers yet.
+pub fn to_relay<'r>(due: &[Due<'r>], decider: &str, relayed: &[RelayedReview]) -> Vec<Due<'r>> {
+    due.iter()
+        .filter(|due| {
+            !due.instructs(decider)
+                && !due.asks_nothing()
+                && relay_answer(relayed, due.review.id).is_none()
+        })
+        .take(MAX_RELAYED)
+        .copied()
+        .collect()
 }
 
 /// The reviews of `reviews` that are due, oldest first: by a login listed in
@@ -81,24 +148,33 @@ pub fn newest(due: &[Due<'_>]) -> Option<Timestamp> {
 /// decider's (account `decider`) as instructions and every other one as
 /// quoted data, each within [`MAX_PULL_REQUEST_REVIEW_BYTES`]: past it, its
 /// last inline comments are left out, then its body is cut, and its body
-/// says so.
-pub fn given(due: &[Due<'_>], decider: &str) -> Vec<PullRequestReview> {
+/// says so. A review `relayed` to the decider and answered is given as it
+/// was asked about (OWL-585): as an instruction when they applied it, as
+/// quoted data beside their answer otherwise.
+pub fn given(due: &[Due<'_>], decider: &str, relayed: &[RelayedReview]) -> Vec<PullRequestReview> {
     due.iter()
         .map(|due| {
-            let review = due.review;
-            fit(PullRequestReview {
-                id: review.id,
-                author: Author {
-                    name: review.author.clone().unwrap_or_default(),
-                    relation: if due.instructs(decider) {
-                        Relation::Decider
-                    } else {
-                        Relation::Other
+            if due.instructs(decider) {
+                return due.quoted(Relation::Decider);
+            }
+            let answered = relayed
+                .iter()
+                .find(|relayed| relayed.review.id == due.review.id)
+                .and_then(|relayed| relayed.answer.map(|answer| (answer, &relayed.review)));
+            match answered {
+                Some((answer, asked)) => PullRequestReview {
+                    author: Author {
+                        relation: if answer == RelayAnswer::Apply {
+                            Relation::Decider
+                        } else {
+                            Relation::Other
+                        },
+                        ..asked.author.clone()
                     },
+                    ..asked.clone()
                 },
-                body: body(review).to_owned(),
-                comments: comments(review),
-            })
+                None => due.quoted(Relation::Other),
+            }
         })
         .collect()
 }
@@ -277,7 +353,7 @@ mod tests {
         let reviews = vec![ann, review(2, "bob", 11, "Looks off.")];
         let reviewers = reviewers();
         let due = due(&reviews, &reviewers, at(0), &[]);
-        let given = given(&due, ANN);
+        let given = given(&due, ANN, &[]);
         assert_eq!(given[0].author.relation, Relation::Decider);
         assert_eq!(given[0].author.name, "ann-dev");
         assert_eq!(given[0].comments[0].line, None);
@@ -299,6 +375,64 @@ mod tests {
         );
     }
 
+    /// A colleague's review relayed (OWL-585): one that is neither the
+    /// decider's nor an approval nor dismissed is relayed, until the decider
+    /// answers; an answer starts a loop, which gives the review as it was
+    /// asked about, applied as an instruction, otherwise as data.
+    #[test]
+    fn a_colleagues_review_is_relayed_until_answered_then_given_as_answered() {
+        let mut approved = review(3, "bob", 10, "Fine by me.");
+        approved.state = "APPROVED".to_owned();
+        let mut dismissed = review(4, "bob", 10, "Stale.");
+        dismissed.state = "dismissed".to_owned();
+        let reviews = vec![
+            review(1, "bob", 10, "Rename it."),
+            review(2, "ann-dev", 11, "Use capitals."),
+            approved,
+            dismissed,
+            review(5, "bob", 12, "And a comma."),
+        ];
+        let reviewers = reviewers();
+        let due = due(&reviews, &reviewers, at(0), &[]);
+        let ids_of = |due: Vec<Due<'_>>| due.iter().map(|due| due.review.id).collect::<Vec<_>>();
+        assert_eq!(ids_of(to_relay(&due, ANN, &[])), [1, 5]);
+        assert!(starts(&due, ANN, &[]), "the decider's own review");
+        let colleagues: Vec<Due<'_>> = due.iter().filter(|d| d.review.id != 2).copied().collect();
+        assert!(!starts(&colleagues, ANN, &[]));
+
+        let asked = |id: u64, answer| RelayedReview {
+            round: NonZeroU32::new(2).unwrap(),
+            question: owlshift_contracts::ids::QuestionId::nth(1),
+            answer,
+            review: PullRequestReview {
+                body: format!("As asked about, {id}."),
+                ..colleagues[0].quoted(Relation::Other)
+            },
+        };
+        let waiting = [asked(1, None)];
+        assert_eq!(ids_of(to_relay(&colleagues, ANN, &waiting)), [1, 5]);
+        assert!(!starts(&colleagues, ANN, &waiting));
+        for (answer, relation) in [
+            (RelayAnswer::Apply, Relation::Decider),
+            (RelayAnswer::Instead, Relation::Other),
+        ] {
+            let answered = [asked(1, Some(answer))];
+            assert_eq!(ids_of(to_relay(&colleagues, ANN, &answered)), [5]);
+            assert!(starts(&colleagues, ANN, &answered));
+            let given = given(&colleagues, ANN, &answered);
+            assert_eq!(
+                given[0].body, "As asked about, 1.",
+                "the review as asked about"
+            );
+            assert_eq!(given[0].author.relation, relation);
+            assert_eq!(
+                given[3].author.relation,
+                Relation::Other,
+                "not relayed: data"
+            );
+        }
+    }
+
     /// A review over the bytes a brief gives one keeps what fits and says
     /// what it left out, so the brief that carries it is valid.
     #[test]
@@ -310,7 +444,7 @@ mod tests {
         let reviews = vec![long];
         let reviewers = reviewers();
         let due = due(&reviews, &reviewers, at(0), &[]);
-        let [given] = &given(&due, ANN)[..] else {
+        let [given] = &given(&due, ANN, &[])[..] else {
             panic!("one review");
         };
         assert!(weight(given) <= MAX_PULL_REQUEST_REVIEW_BYTES);

@@ -444,7 +444,9 @@ pub struct Review {
     /// Its author's login; `None` for an account GitHub no longer knows.
     pub author: Option<String>,
     /// `COMMENTED`, `APPROVED`, `CHANGES_REQUESTED` or `DISMISSED`, as
-    /// GitHub writes it: the state plays no part in what Owlshift does.
+    /// GitHub writes it: an approval, or a review dismissed, of a colleague
+    /// is not relayed to the decider (OWL-585); the state plays no other
+    /// part in what Owlshift does.
     pub state: String,
     pub submitted_at: Timestamp,
     /// Empty when the review has inline comments only.

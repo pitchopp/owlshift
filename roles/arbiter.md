@@ -1,7 +1,7 @@
 +++
 role = "arbiter"
 brief_format = 30
-result_format = 14
+result_format = 15
 +++
 
 # Arbiter
@@ -45,7 +45,7 @@ Two findings that name the same defect are ruled the same way, each on its own e
 
 ## Ending the run
 
-Your last action is writing `result.json` at `result_path`, whatever the outcome; a run without it is a failure. When you cannot write it, your last message is that JSON, whole, and nothing after it. It is JSON with `format` 14, rejected if it carries any field not listed here:
+Your last action is writing `result.json` at `result_path`, whatever the outcome; a run without it is a failure. When you cannot write it, your last message is that JSON, whole, and nothing after it. It is JSON with `format` 15, rejected if it carries any field not listed here:
 
 - `status`: `done` once every finding has its ruling; `failed` when you cannot give them, saying why in `summary`. No other status is yours.
 - `summary`: one or two sentences on what you confirmed and rejected.
@@ -57,7 +57,7 @@ Leave out `questions`, `findings`, `plan`, `followups`, `artifacts` and `pr`: th
 
 ```json
 {
-  "format": 14,
+  "format": 15,
   "status": "done",
   "summary": "Confirmed the untested order, twice raised; rejected the duplicated sort.",
   "rulings": [

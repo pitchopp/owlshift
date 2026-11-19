@@ -171,6 +171,7 @@ mod intake;
 mod limits;
 mod merge_note;
 mod neutral_push;
+mod relay;
 mod rerun;
 mod review_loop;
 mod to_watch;
@@ -3486,7 +3487,7 @@ impl OnDemand<'_> {
                         result::Status::Questions,
                         LATE_SUMMARY,
                         late_round(&late),
-                        &ran.run,
+                        Some(&ran.run),
                         sink,
                     ));
                 }
@@ -3535,7 +3536,7 @@ impl OnDemand<'_> {
                         result.status,
                         &summary,
                         round,
-                        &ran.run,
+                        Some(&ran.run),
                         sink,
                     ));
                 }
@@ -3819,7 +3820,9 @@ impl OnDemand<'_> {
     /// the Writer posts the questions, and the ticket ref keeps the ask and
     /// the state. Returns the stop that says so. A false premise with no
     /// question, or a post that failed, keeps nothing: the questions are
-    /// printed.
+    /// printed. `run` is the run that asked; `None` for the runner's own
+    /// round that no run asked, a colleague's review relayed to the decider
+    /// (OWL-585).
     #[allow(clippy::too_many_arguments)]
     fn ask(
         &self,
@@ -3828,7 +3831,7 @@ impl OnDemand<'_> {
         status: result::Status,
         summary: &str,
         left: Round,
-        run: &str,
+        run: Option<&str>,
         sink: &mut EventSink<'_>,
     ) -> Stop {
         let ticket = p.ticket.clone();
@@ -3856,7 +3859,7 @@ impl OnDemand<'_> {
                 .collect();
             opened.insert("reopened".to_owned(), json!(reopened));
         }
-        sink.emit(&ticket, Some(run), EventKind::Gate, opened);
+        sink.emit(&ticket, run, EventKind::Gate, opened);
         // Whose the round is, once posted: the notification's (OWL-584).
         let to = p
             .decider
@@ -3913,25 +3916,29 @@ impl OnDemand<'_> {
         };
         sink.emit(
             &ticket,
-            Some(run),
+            run,
             EventKind::TrackerWrite,
             comment_written("QUESTIONS", &posted),
         );
-        self.fold(&ticket, Some(run), &posted, sink);
+        self.fold(&ticket, run, &posted, sink);
         if let Some(dropped) = &mention_dropped {
             sink.emit(
                 &ticket,
-                Some(run),
+                run,
                 EventKind::Warning,
                 dropped_mention("QUESTIONS", &posted, dropped),
             );
         }
         // The questions are on the ticket: it waits for the decider, even if
         // keeping them below fails.
-        self.show_after(&ticket, Some(run), Event::Questions, sink);
+        self.show_after(&ticket, run, Event::Questions, sink);
         // The session the asking run left waits for this round's answers
         // (OWL-394): kept with it, the round named.
-        if let Some(session) = p.session.as_mut().filter(|session| session.run == run) {
+        if let Some(session) = p
+            .session
+            .as_mut()
+            .filter(|session| run.is_some_and(|run| session.run == run))
+        {
             session.round = Some(round);
         }
         let mut asked = p.questions();
@@ -4657,6 +4664,9 @@ impl OnDemand<'_> {
         {
             session.settled = true;
         }
+        // A colleague's reviews relayed in this round (OWL-585): what the
+        // decider answered about each, kept in the same write.
+        self.settle_relayed(p, round, &questions, sink);
         // The ref still waits for answers: nothing resumes Build but
         // a person, so the stop says the RESUME landed (OWL-169).
         self.store(p, &next, questions).map_err(|e| Stop::NotKept {
@@ -7342,7 +7352,15 @@ impl OnDemand<'_> {
                     "The {} run of pull request #{} asks before it can go on. {}",
                     run.what, run.pull_request, result.summary
                 );
-                return Err(self.ask(p, &waiting, result.status, &summary, round, &ran.run, sink));
+                return Err(self.ask(
+                    p,
+                    &waiting,
+                    result.status,
+                    &summary,
+                    round,
+                    Some(&ran.run),
+                    sink,
+                ));
             }
             match state.apply(PIPELINE, event) {
                 Ok(Transition::To(next)) => {
@@ -10038,6 +10056,7 @@ mod tests {
                     class: *class,
                     reason: (*reason).into(),
                     reply: None,
+                    option: None,
                 })
                 .collect()
         };
@@ -10665,12 +10684,12 @@ mod tests {
     fn a_build_refusal_is_kept_until_heeded() {
         let finished = |status: &str| {
             let result = RunResult::parse(&format!(
-                r#"{{"format":14,"status":"{status}","summary":"s","questions":[{{"id":"Q1",
+                r#"{{"format":15,"status":"{status}","summary":"s","questions":[{{"id":"Q1",
                 "category":"scope","context":"c","text":"t","recommendation":{{"why":"r"}}}}]}}"#
             ))
             .or_else(|_| {
                 RunResult::parse(&format!(
-                    r#"{{"format":14,"status":"{status}","summary":"s"}}"#
+                    r#"{{"format":15,"status":"{status}","summary":"s"}}"#
                 ))
             })
             .unwrap();
@@ -10754,7 +10773,7 @@ mod tests {
         // A `premise_false` with no question asks nothing either (OWL-193).
         let unasked_premise = Outcome::Finished {
             result: Box::new(
-                RunResult::parse(r#"{"format":14,"status":"premise_false","summary":"s"}"#)
+                RunResult::parse(r#"{"format":15,"status":"premise_false","summary":"s"}"#)
                     .unwrap(),
             ),
             artifacts: crate::artifact::ArtifactContents::default(),
@@ -10854,7 +10873,7 @@ mod tests {
                 .map(|c| format!(r#"{{"question":"{c}","decision":"{c}: d","basis":"b"}}"#))
                 .collect();
             format!(
-                r#"{{"format":14,"status":"done","summary":"s","decisions":[{}]}}"#,
+                r#"{{"format":15,"status":"done","summary":"s","decisions":[{}]}}"#,
                 decisions.join(",")
             )
         };
@@ -10891,7 +10910,7 @@ mod tests {
             .map(|n| vec![format!("List {n} first"), format!("List {n} second")])
             .collect();
         let mut results: Vec<String> = lists.iter().map(|l| listing(l)).collect();
-        results.push(r#"{"format":14,"status":"done","summary":"s"}"#.to_owned());
+        results.push(r#"{"format":15,"status":"done","summary":"s"}"#.to_owned());
         let (told, _) = refuse_in_turn(&results);
         assert!(told.decisions_refused);
         assert_eq!(told_questions(&told), lists.concat());
@@ -10957,7 +10976,7 @@ mod tests {
                     \"Which file\" (recorded: \"config.toml\"); \"Every key\" (recorded: \"yes\")";
         let format_8 = serde_json::json!({ "format": 8, "build_refusal": { "lists": [held] } });
         let questions = TicketQuestions::parse(&format_8.to_string()).unwrap();
-        assert!(questions.render().starts_with("{\n  \"format\": 18,"));
+        assert!(questions.render().starts_with("{\n  \"format\": 19,"));
         let kept = questions.build_refusal.clone().unwrap();
         assert_eq!(
             (&kept.lists[..], kept.choices.len()),
@@ -10979,7 +10998,7 @@ mod tests {
         };
         let asking = |named: &str| {
             format!(
-                r#"{{"format":14,"status":"questions","summary":"s","questions":[{{"id":"Q1",
+                r#"{{"format":15,"status":"questions","summary":"s","questions":[{{"id":"Q1",
                 "category":"scope","context":"c","text":"Which file, and every key?",
                 "recommendation":{{"why":"r"}}}}]{named}}}"#
             )
@@ -10996,7 +11015,7 @@ mod tests {
             (true, 0, Some(held))
         );
         // Its `done` is refused, and the hold kept with the latest reason.
-        let done = validated(r#"{"format":14,"status":"done","summary":"s"}"#, &text_only);
+        let done = validated(r#"{"format":15,"status":"done","summary":"s"}"#, &text_only);
         let refused = done.unwrap_err();
         assert!(
             matches!(
@@ -11017,7 +11036,7 @@ mod tests {
 
         // Mixed with typed choices, a later refusal's: only those have a
         // place, and an ask naming them all clears the text lists too.
-        let listing = r#"{"format":14,"status":"done","summary":"s","decisions":[
+        let listing = r#"{"format":15,"status":"done","summary":"s","decisions":[
             {"question":"Where the README lists it","decision":"d","basis":"b"},
             {"question":"Which default","decision":"d","basis":"b"}]}"#;
         let refused = validated(listing, &text_only).unwrap_err();

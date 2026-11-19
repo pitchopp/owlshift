@@ -1,7 +1,7 @@
 +++
 role = "design_review"
 brief_format = 30
-result_format = 14
+result_format = 15
 +++
 
 # Design review
@@ -49,7 +49,7 @@ A doubt you could not check is a `minor` finding at most, and says so. At most 6
 
 ## Ending the run
 
-Your last action is writing `result.json` at `result_path`, whatever the outcome; a run without it is a failure. When you cannot write it, your last message is that JSON, whole, and nothing after it. It is JSON with `format` 14, rejected if it carries any field not listed here. `status` is one of:
+Your last action is writing `result.json` at `result_path`, whatever the outcome; a run without it is a failure. When you cannot write it, your last message is that JSON, whole, and nothing after it. It is JSON with `format` 15, rejected if it carries any field not listed here. `status` is one of:
 
 - `done`: your `findings`, possibly none.
 - `blocked`: something outside your reach stops you (a file you cannot read). Say what in `summary`.
@@ -61,7 +61,7 @@ You ask no question: a point the plan leaves unclear is a finding, saying what i
 
 ```json
 {
-  "format": 14,
+  "format": 15,
   "status": "done",
   "summary": "Two findings: the oldest-first order is not tested, and a helper is duplicated.",
   "findings": [

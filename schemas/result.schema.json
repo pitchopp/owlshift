@@ -54,7 +54,7 @@
     "format": {
       "description": "The format version of this document.",
       "type": "integer",
-      "const": 14
+      "const": 15
     },
     "intake": {
       "description": "The intake role's record (format 8, OWL-245): required from it when\nit ends `done` or `questions`, refused with any other status and from\nany other role.",
@@ -1211,6 +1211,11 @@
       "properties": {
         "class": {
           "$ref": "#/$defs/AnswerClass"
+        },
+        "option": {
+          "description": "The letter of the question's option the decider chose, as the runner\nletters them ([`option_letter`]), when they chose one (format 15,\nOWL-585): with `class: answered` only, and refused when it names none\nof the options the question offers. Left out when the decider\nanswered in words of their own. The runner reads it where the option\ndecides what follows: a colleague's review relayed to the decider.",
+          "type": "string",
+          "pattern": "^[A-Z]+$"
         },
         "question": {
           "$ref": "#/$defs/QuestionId"

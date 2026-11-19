@@ -1434,7 +1434,9 @@ impl TicketQuestions {
     /// a format-12 one, written before a decision kept its basis kind
     /// (OWL-343), and a format-13 one, written before it kept its asking
     /// role (OWL-345), and a format-14 one, written before it kept its
-    /// number and the decisions document (OWL-351), are read as the
+    /// number and the decisions document (OWL-351), and those of formats 15
+    /// to 18, written before a verdict kept its chosen option (OWL-585), are
+    /// read as the
     /// current format with what they lack empty, a format-6 or 7
     /// Build refusal upgraded (`LegacyBuildRefusal::upgrade`), a format-8
     /// one's lists kept as text, and every question's options and
@@ -1451,7 +1453,7 @@ impl TicketQuestions {
         Ok(questions)
     }
 
-    /// A format-2 to 17 document read as the current format, or `None` for
+    /// A format-2 to 18 document read as the current format, or `None` for
     /// any other. Each older format up to 7 is a strict subset of the next,
     /// so a field a later format added is refused in it, whatever its
     /// value; format 8 reshaped Build's refusal, which formats 6 and 7 keep
@@ -1463,13 +1465,20 @@ impl TicketQuestions {
     /// document, format 16 the runner's `recommendation` basis kind
     /// (OWL-375); format 17 drops the asking role, which formats 14 to 16
     /// are read without (OWL-379); format 18 adds an ask's resolver labels
-    /// (OWL-482).
+    /// (OWL-482), format 19 a verdict's chosen option (OWL-585).
     fn from_older_format(input: &str) -> Option<Result<Self, ContractError>> {
         let mut document: serde_json::Value = serde_json::from_str(input).ok()?;
         let format = document.get("format").and_then(serde_json::Value::as_u64)?;
-        if !(2..=17).contains(&format) {
+        if !(2..=18).contains(&format) {
             return None;
         }
+        // Format 19 added a verdict's chosen option (OWL-585).
+        let chose = document["asks"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .flat_map(|ask| ask["verdicts"].as_array().into_iter().flatten())
+            .any(|verdict| verdict.get("option").is_some());
         let kinded = format <= 12
             && document["decisions"].as_array().is_some_and(|decisions| {
                 decisions
@@ -1517,7 +1526,9 @@ impl TicketQuestions {
                 .as_array()
                 .is_some_and(|asks| asks.iter().any(|ask| ask.get(field).is_some()))
         };
-        let refused = if in_an_ask("labels") {
+        let refused = if chose {
+            Some("verdict's option")
+        } else if format <= 17 && in_an_ask("labels") {
             Some("resolver label")
         } else if replan {
             Some("replan")
