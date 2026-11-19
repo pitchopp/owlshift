@@ -18,12 +18,12 @@ In your clone, at the repository's root:
 
 ```bash
 cd ~/code/shop
-owlshift init --tracker markdown
+owlshift init
 ```
 
-`init` does four things:
+At a terminal, `init` asks for what no flag gave: answer `3` (or `markdown`) when it asks where the tickets live, or pass `--tracker markdown` to skip the question. In a script nothing is asked, and the tracker is Linear unless `--tracker markdown` says otherwise. `init` does four things:
 
-1. It reads the repository's root files (`Cargo.toml`, `package.json`, `pyproject.toml`, `Makefile`) and writes the gate it suggests, your lint, formatter and test commands, in a commented `owlshift.toml`. It never runs them. If it finds nothing, or guesses wrong, give the gate yourself, one `--gate` per command, as in `owlshift init --tracker markdown --gate "make lint" --gate "make test"`.
+1. It reads the repository's root files (`Cargo.toml`, `package.json`, `pyproject.toml`, `Makefile`) and writes the gate it suggests, your lint, formatter and test commands, in a commented `owlshift.toml`. It never runs them. It shows the gate found first: press Enter to keep it, or type your own commands, one per line, an empty line ending them; with `--gate`, one per command, as in `owlshift init --tracker markdown --gate "make lint" --gate "make test"`, nothing is asked.
 2. It signs you in to GitHub through Owlshift's GitHub App. It prints a code and asks you to open `https://github.com/login/device` and enter it. If the app is not yet installed on the repository, it prints the install link and waits until you have installed it. If the code expires before you enter it, `init` says so and exits with an error: run it again for a new code.
 3. It asks for the token agent runs log in to Claude Code with. Make it in another terminal with `claude setup-token`, then paste it. It is asked once per machine. Owlshift never asks for a model API key.
 4. It writes an example ticket, `tickets/DEMO-1/ticket.md`.

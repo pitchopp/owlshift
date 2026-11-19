@@ -7,7 +7,10 @@
 //! `--github-token` from a personal token asked for like the others. Then it
 //! asks the tracker whether it answers, setting up a GitHub Issues project's
 //! labels, and writes the commented project file only once it did (OWL-537);
-//! `--skip-secrets` writes it without asking anything.
+//! `--skip-secrets` writes it without asking for any secret. At a terminal,
+//! a new project file's tracker, gate and Linear team that no flag gave are
+//! asked for (`questions`, OWL-596): the team picked among the workspace's
+//! teams once the key is stored, or typed with `--skip-secrets`.
 //!
 //! `--replace-agent-token` asks for the Claude Code token for agent runs
 //! alone and stores it in place of the stored one, in any folder, touching
@@ -21,7 +24,7 @@ use std::sync::Arc;
 use clap::ValueEnum;
 use owlshift_adapters::forge::Repo;
 use owlshift_adapters::forge::github_app::{DeviceFlow, HttpLogin};
-use owlshift_contracts::config::{ProjectConfig, TrackerKind};
+use owlshift_contracts::config::{self, ProjectConfig, TrackerKind};
 use owlshift_contracts::service::KeychainEntry;
 use owlshift_core::stack::{Detection, detect};
 use owlshift_platform::keychain::{Keychain, SERVICE, Secret};
@@ -47,16 +50,21 @@ use owlshift_runner::{cache_offer, on_demand, project};
 
 use crate::fail;
 
+mod questions;
+
 #[derive(clap::Args)]
 pub struct Args {
-    /// Where the tickets live.
-    #[arg(long, value_enum, default_value_t = TrackerChoice::Linear)]
-    tracker: TrackerChoice,
-    /// The Linear team key, the prefix of its ticket ids: OWL in OWL-12.
+    /// Where the tickets live. Asked at a terminal when left out; Linear
+    /// otherwise.
+    #[arg(long, value_enum)]
+    tracker: Option<TrackerChoice>,
+    /// The Linear team key, the prefix of its ticket ids: OWL in OWL-12. At a
+    /// terminal, picked among the workspace's teams when left out.
     #[arg(long)]
     team: Option<String>,
     /// One command of the project's gate (lint, formatter, tests), run from
-    /// the repository root; repeat it for each command, in order.
+    /// the repository root; repeat it for each command, in order. Asked at a
+    /// terminal when left out.
     #[arg(long = "gate", value_name = "COMMAND")]
     gate: Vec<String>,
     /// Write the project file only, and store no secret.
@@ -93,9 +101,20 @@ enum TrackerChoice {
     Github,
 }
 
-/// The project file `init` keeps, or the one it would write.
+impl TrackerChoice {
+    fn kind(self) -> TrackerKind {
+        match self {
+            TrackerChoice::Linear => TrackerKind::Linear,
+            TrackerChoice::Markdown => TrackerKind::Markdown,
+            TrackerChoice::Github => TrackerKind::Github,
+        }
+    }
+}
+
+/// The project file `init` keeps, with its tracker, or the one it would
+/// write.
 enum File<'a> {
-    Kept(&'a Path),
+    Kept(&'a Path, &'a config::Tracker),
     New(&'a Path, InitOptions),
 }
 
@@ -103,13 +122,16 @@ pub fn run(args: &Args, config: &Effective) -> ExitCode {
     if args.replace_agent_token {
         return replace_agent_token();
     }
-    let (project, file) = match &config.project {
+    // The questions for what no flag gave are asked only where a person
+    // reads and answers them (OWL-596), as `crate::confirm` asks.
+    let at_terminal = io::stdin().is_terminal() && io::stdout().is_terminal();
+    let (tracker, mut file) = match &config.project {
         FileState::Loaded { path, config, .. } => {
             println!(
                 "{} exists: kept as it is. Its values win over --tracker, --team and --gate.",
                 path.display()
             );
-            (config.tracker.clone(), File::Kept(path))
+            (config.tracker.kind, File::Kept(path, &config.tracker))
         }
         FileState::Absent(path) => {
             let root = path.parent().unwrap_or(path);
@@ -122,26 +144,19 @@ pub fn run(args: &Args, config: &Effective) -> ExitCode {
                     Detection::default()
                 }
             };
-            let options = InitOptions {
-                tracker: match args.tracker {
-                    TrackerChoice::Linear => TrackerKind::Linear,
-                    TrackerChoice::Markdown => TrackerKind::Markdown,
-                    TrackerChoice::Github => TrackerKind::Github,
-                },
-                team: args.team.clone(),
-                gate: args.gate.clone(),
-                detected,
-                admitter: None,
-            };
-            // Rendered now so that a missing `--team` stops `init` before it
-            // asks for anything; written once the tracker answered.
-            let tracker = match project_file(&options)
-                .and_then(|text| ProjectConfig::parse(&text).map_err(|e| e.to_string()))
-            {
-                Ok(parsed) => parsed.tracker,
+            let options = match ask_options(args, detected, at_terminal) {
+                Ok(options) => options,
                 Err(error) => return fail(&error),
             };
-            (tracker, File::New(path, options))
+            // Rendered now so that a missing `--team` stops `init` before it
+            // asks for any secret, unless the team is picked once the key is
+            // stored (OWL-596); written once the tracker answered.
+            if !(at_terminal && team_to_pick(&options))
+                && let Err(error) = tracker_of(&options)
+            {
+                return fail(&error);
+            }
+            (options.tracker, File::New(path, options))
         }
         FileState::Invalid { path, error } => {
             // A file this run wrote is refused here until the personal
@@ -175,9 +190,8 @@ pub fn run(args: &Args, config: &Effective) -> ExitCode {
         }
         FileState::Unavailable(reason) => return fail(reason),
     };
-    let tracker = project.kind;
     let path = match &file {
-        File::Kept(path) | File::New(path, _) => *path,
+        File::Kept(path, _) | File::New(path, _) => *path,
     };
 
     // The project's secrets and caches are named by its GitHub repository
@@ -345,71 +359,36 @@ pub fn run(args: &Args, config: &Effective) -> ExitCode {
         lock,
         app,
     };
-    let setup = Setup {
-        tracker: &project,
-        repo: repo.as_ref().map_err(String::as_str),
-        keychain: &keychain,
-        access: &access,
+    // A Linear team left to pick is picked now, among the teams the key just
+    // stored reads (OWL-596).
+    let project = match &mut file {
+        File::Kept(_, kept) => Ok((*kept).clone()),
+        File::New(_, options) => {
+            pick_team(options, &keychain, repo.as_ref().map_err(String::as_str))
+                .and_then(|()| tracker_of(options))
+        }
     };
-    let connected = tracker::of(tracker).connect(&setup);
-    let mut answered = true;
-    match (&connected, &file) {
-        (Ok(connected), _) => {
-            for name in &connected.created {
-                println!("Created the label {name:?} on GitHub.");
+    let answered = match project {
+        Ok(project) => {
+            let setup = Setup {
+                tracker: &project,
+                repo: repo.as_ref().map_err(String::as_str),
+                keychain: &keychain,
+                access: &access,
+            };
+            match connect_and_write(&file, &setup, config, repo.as_ref().ok()) {
+                Ok(answered) => answered,
+                Err(code) => return code,
             }
         }
-        (Err(reason), File::Kept(path)) => {
+        Err(reason) => {
             eprintln!(
-                "owlshift: the tracker did not answer: {reason}. {} is kept as it is.",
+                "owlshift: {reason}. {} was not written: fix that, then run `owlshift init` again.",
                 path.display()
             );
-            answered = false;
+            false
         }
-        (Err(_), File::New(..)) => {}
-    }
-    // A kept file is a person's to change, through a pull request: with
-    // `[people]`, the entry of the accounts signed in, when it lists them
-    // not, is printed and never written (OWL-582).
-    if let (Ok(_), File::Kept(path), FileState::Loaded { config: kept, .. }) =
-        (&connected, &file, &config.project)
-        && kept.people.is_some()
-        && let Some(entry) = people_entry(kept, &tracker::of(tracker).signed_in(&setup))
-    {
-        let path = path.display();
-        match entry {
-            PeopleEntry::Add(entry) => println!(
-                "`[people]` in {path} does not list the accounts this machine signed in as. Add \
-                 this entry through a pull request, choosing its handle:\n\n{entry}"
-            ),
-            PeopleEntry::Replace { handle, entry } => println!(
-                "`[people.{handle}]` in {path} lists one of the accounts this machine signed in \
-                 as, not the other. Replace that entry with this one through a pull request:\
-                 \n\n{entry}"
-            ),
-            PeopleEntry::Split { tracker, forge } => println!(
-                "`[people]` in {path} lists the tracker account this machine signed in as under \
-                 `[people.{tracker}]` and its forge login under `[people.{forge}]`. One person \
-                 is one entry: fix the file by hand, through a pull request."
-            ),
-        }
-    }
-    if let File::New(path, options) = &file {
-        let root = path.parent().unwrap_or(path);
-        match write_once_connected(root, options, connected.as_ref().map_err(String::as_str)) {
-            Ok(Written::Created) => said_written(path, options, config, repo.as_ref().ok()),
-            Ok(Written::Kept) => {
-                return fail(&format!(
-                    "{} appeared while `owlshift init` ran: run it again",
-                    path.display()
-                ));
-            }
-            Err(error) => {
-                eprintln!("owlshift: {error}");
-                answered = false;
-            }
-        }
-    }
+    };
     let secrets_ready = report.missing.is_empty()
         && report.refused.is_empty()
         && unnamed.is_empty()
@@ -440,6 +419,143 @@ pub fn run(args: &Args, config: &Effective) -> ExitCode {
         );
     }
     ExitCode::FAILURE
+}
+
+/// The options of a new project file: each value a flag gave; else, at a
+/// terminal, its answer (OWL-596); else today's default, Linear, the
+/// detected gate, no team. The Linear team is left to [`pick_team`] once
+/// the key is stored, unless `--skip-secrets`, which stores none, asks for
+/// it as text.
+fn ask_options(args: &Args, detected: Detection, at_terminal: bool) -> Result<InitOptions, String> {
+    let mut say = |line: &str| println!("{line}");
+    let tracker = match args.tracker {
+        Some(choice) => choice.kind(),
+        None if at_terminal => questions::tracker(&mut crate::ask, &mut say)?,
+        None => TrackerKind::Linear,
+    };
+    let gate = if args.gate.is_empty() && at_terminal {
+        questions::gate(&detected, &mut crate::ask, &mut say)?
+    } else {
+        args.gate.clone()
+    };
+    let team = match &args.team {
+        Some(team) => Some(team.clone()),
+        None if at_terminal && args.skip_secrets && tracker == TrackerKind::Linear => {
+            Some(questions::team_key(&mut crate::ask, &mut say)?)
+        }
+        None => None,
+    };
+    Ok(InitOptions {
+        tracker,
+        team,
+        gate,
+        detected,
+        admitter: None,
+    })
+}
+
+/// Whether `options` are a Linear project's with no team yet.
+fn team_to_pick(options: &InitOptions) -> bool {
+    options.tracker == TrackerKind::Linear && options.team.is_none()
+}
+
+/// Picks the Linear team of `options` when none was given, among the teams
+/// of the workspace of the key stored for the project of `repo` (OWL-596).
+/// Only reached at a terminal: elsewhere a missing team failed `init` first.
+fn pick_team(
+    options: &mut InitOptions,
+    keychain: &Keychain,
+    repo: Result<&Repo, &str>,
+) -> Result<(), String> {
+    if !team_to_pick(options) {
+        return Ok(());
+    }
+    let teams = tracker::linear_teams(keychain, repo)
+        .map_err(|reason| format!("the tracker did not answer: {reason}"))?;
+    let key = questions::team(&teams, &mut crate::ask, &mut |line| println!("{line}"))?;
+    options.team = Some(key);
+    Ok(())
+}
+
+/// The `[tracker]` of the project file `options` render, checked to parse
+/// as `owlshift do` reads it.
+fn tracker_of(options: &InitOptions) -> Result<config::Tracker, String> {
+    project_file(options)
+        .and_then(|text| ProjectConfig::parse(&text).map_err(|e| e.to_string()))
+        .map(|parsed| parsed.tracker)
+}
+
+/// Asks the tracker of `setup` whether it answers, then writes the new
+/// project file of `file` once it did (OWL-537), or, for a kept file, says
+/// what its `[people]` lacks (OWL-582): whether the tracker answered and the
+/// file stands. An `Err` is `init`'s exit.
+fn connect_and_write(
+    file: &File<'_>,
+    setup: &Setup<'_>,
+    config: &Effective,
+    repo: Option<&Repo>,
+) -> Result<bool, ExitCode> {
+    let tracker = setup.tracker.kind;
+    let connected = tracker::of(tracker).connect(setup);
+    let mut answered = true;
+    match (&connected, file) {
+        (Ok(connected), _) => {
+            for name in &connected.created {
+                println!("Created the label {name:?} on GitHub.");
+            }
+        }
+        (Err(reason), File::Kept(path, _)) => {
+            eprintln!(
+                "owlshift: the tracker did not answer: {reason}. {} is kept as it is.",
+                path.display()
+            );
+            answered = false;
+        }
+        (Err(_), File::New(..)) => {}
+    }
+    // A kept file is a person's to change, through a pull request: with
+    // `[people]`, the entry of the accounts signed in, when it lists them
+    // not, is printed and never written (OWL-582).
+    if let (Ok(_), File::Kept(path, _), FileState::Loaded { config: kept, .. }) =
+        (&connected, file, &config.project)
+        && kept.people.is_some()
+        && let Some(entry) = people_entry(kept, &tracker::of(tracker).signed_in(setup))
+    {
+        let path = path.display();
+        match entry {
+            PeopleEntry::Add(entry) => println!(
+                "`[people]` in {path} does not list the accounts this machine signed in as. Add \
+                 this entry through a pull request, choosing its handle:\n\n{entry}"
+            ),
+            PeopleEntry::Replace { handle, entry } => println!(
+                "`[people.{handle}]` in {path} lists one of the accounts this machine signed in \
+                 as, not the other. Replace that entry with this one through a pull request:\
+                 \n\n{entry}"
+            ),
+            PeopleEntry::Split { tracker, forge } => println!(
+                "`[people]` in {path} lists the tracker account this machine signed in as under \
+                 `[people.{tracker}]` and its forge login under `[people.{forge}]`. One person \
+                 is one entry: fix the file by hand, through a pull request."
+            ),
+        }
+    }
+    if let File::New(path, options) = file {
+        let root = path.parent().unwrap_or(path);
+        match write_once_connected(root, options, connected.as_ref().map_err(String::as_str)) {
+            Ok(Written::Created) => said_written(path, options, config, repo),
+            Ok(Written::Kept) => {
+                return Err(fail(&format!(
+                    "{} appeared while `owlshift init` ran: run it again",
+                    path.display()
+                )));
+            }
+            Err(error) => {
+                eprintln!("owlshift: {error}");
+                answered = false;
+            }
+        }
+    }
+    Ok(answered)
 }
 
 /// Writes the project file of `options` at `path` without asking the

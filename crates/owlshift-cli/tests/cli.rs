@@ -1583,10 +1583,14 @@ fn init_writes_a_commented_project_file_once() {
     // Linear needs its team; outside a repository there is no project.
     let other = tempfile::tempdir().unwrap();
     git_init(other.path());
-    let output = owlshift(other.path(), config_dir.path(), &["init", "--skip-secrets"]);
-    assert!(!output.status.success());
-    assert!(stderr(&output).contains("--team"), "{}", stderr(&output));
-    assert!(!other.path().join("owlshift.toml").exists());
+    // Off a terminal nothing is asked, with or without the secrets (OWL-596):
+    // the missing team fails before any secret, naming its flag.
+    for init in [&["init", "--skip-secrets"][..], &["init"]] {
+        let output = owlshift(other.path(), config_dir.path(), init);
+        assert!(!output.status.success());
+        assert!(stderr(&output).contains("--team"), "{}", stderr(&output));
+        assert!(!other.path().join("owlshift.toml").exists());
+    }
     let outside = tempfile::tempdir().unwrap();
     let output = owlshift(
         outside.path(),

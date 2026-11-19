@@ -22,6 +22,8 @@ mod markdown;
 /// credential (OWL-552): what `Kind::reply_key` builds once it has opened
 /// them, public so that a bench builds the same key over a fake.
 pub use github::key_of as github_key;
+/// The Linear workspace's teams `init` offers to pick from (OWL-596).
+pub use linear::workspace_teams as linear_teams;
 
 use std::any::Any;
 use std::fmt;

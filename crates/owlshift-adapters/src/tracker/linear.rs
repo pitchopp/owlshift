@@ -51,6 +51,11 @@
 //! workflow states in one page, and an unknown key (`NOPE`) answers
 //! `nodes: []`, HTTP 200, no error.
 //!
+//! Checked live on 2026-11-18 (OWL-596; build plan, "P9 · Open-source
+//! readiness", part 6): `teams(first: 50) { nodes { key name } }` through a
+//! personal API key answers the workspace's two teams, `SBX` and `OWL`, with
+//! their names, HTTP 200, `pageInfo.hasNextPage` false.
+//!
 //! Checked live on 2026-10-04 (OWL-153): that key filter is case-sensitive,
 //! `eq: "OWL"` answers the team and `eq: "owl"` answers `nodes: []`, HTTP
 //! 200, so the key is sent upper case.
@@ -518,6 +523,36 @@ impl LinearTracker {
         one_page(&team)?;
         Ok(team.states.nodes.into_iter().map(|s| s.name).collect())
     }
+
+    /// The teams of the key's workspace, by key and name, sorted by key:
+    /// what `owlshift init` offers to pick from (OWL-596). Read only. One
+    /// page of at most [`MAX_PAGE`], which says whether more teams exist.
+    pub fn teams(&self) -> Result<TeamList, Error> {
+        let data: TeamListData = self.call(TEAMS_QUERY, json!({}))?;
+        let mut teams = data.teams.nodes;
+        teams.sort_by(|a, b| a.key.cmp(&b.key));
+        Ok(TeamList {
+            teams,
+            more: data.teams.page_info.has_next_page,
+        })
+    }
+}
+
+/// The first page of the workspace's teams, as [`LinearTracker::teams`]
+/// reads it.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct TeamList {
+    pub teams: Vec<TeamName>,
+    /// Whether the workspace has more teams than the page lists.
+    pub more: bool,
+}
+
+/// A team of the workspace, as [`LinearTracker::teams`] lists it.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+pub struct TeamName {
+    /// The prefix of its ticket ids: `OWL` in `OWL-12`.
+    pub key: String,
+    pub name: String,
 }
 
 impl LinearTracker {
@@ -1426,6 +1461,10 @@ const TEAM_STATES_QUERY: &str = "query TeamStates($key: String!) { \
     teams(filter: { key: { eq: $key } }) { \
     nodes { key states(first: 50) { nodes { name } pageInfo { hasNextPage } } } } }";
 
+/// What [`LinearTracker::teams`] asks (OWL-596).
+const TEAMS_QUERY: &str =
+    "query Teams { teams(first: 50) { nodes { key name } pageInfo { hasNextPage } } }";
+
 const STAGE_MUTATION: &str = "mutation SetStage($id: String!, $stateId: String!) { \
     issueUpdate(id: $id, input: { stateId: $stateId }) { success issue { state { id name } } } }";
 
@@ -2126,6 +2165,11 @@ struct Team<S> {
 #[derive(Deserialize)]
 struct TeamsData {
     teams: Teams<Team<StateName>>,
+}
+
+#[derive(Deserialize)]
+struct TeamListData {
+    teams: Connection<TeamName>,
 }
 
 #[derive(Deserialize)]
@@ -3323,6 +3367,23 @@ mod tests {
         let error = tracker(vec![more]).team_states("OWL").unwrap_err();
         assert_eq!(error.kind, ErrorKind::Other);
         assert!(error.message.contains("more than 50"), "{error}");
+    }
+
+    /// OWL-596: the workspace's teams, in the shape checked live on
+    /// 2026-11-18, come back sorted by key, saying whether the page holds
+    /// them all.
+    #[test]
+    fn the_workspace_teams_are_listed_by_key() {
+        let body = r#"{"data":{"teams":{"nodes":[{"key":"SBX","name":"Sandbox"},
+            {"key":"OWL","name":"Owlshift"}],"pageInfo":{"hasNextPage":true}}}}"#;
+        let list = tracker(vec![body]).teams().unwrap();
+        let keys: Vec<(&str, &str)> = list
+            .teams
+            .iter()
+            .map(|t| (t.key.as_str(), t.name.as_str()))
+            .collect();
+        assert_eq!(keys, [("OWL", "Owlshift"), ("SBX", "Sandbox")]);
+        assert!(list.more);
     }
 
     /// OWL-155, checked live on 2026-10-14: the team's inbox as `propose`
