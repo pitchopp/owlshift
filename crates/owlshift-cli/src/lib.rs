@@ -581,6 +581,9 @@ fn confirm_with(
 }
 
 #[cfg(test)]
+mod cli_reference;
+
+#[cfg(test)]
 mod doc_commands;
 
 #[cfg(test)]
