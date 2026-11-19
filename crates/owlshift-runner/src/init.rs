@@ -90,7 +90,8 @@ requires = \">={}.{}\"
     let mut gate = String::new();
     for found in &options.detected.found {
         if (!by_hand && !found.gate.is_empty()) || !found.setup.is_empty() {
-            for note in &found.notes {
+            let own = (!by_hand && !found.gate.is_empty()).then_some(&found.gate_notes);
+            for note in found.notes.iter().chain(own.into_iter().flatten()) {
                 gate.push_str(&format!("# note: {}\n", one_line(note)));
             }
         }
