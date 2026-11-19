@@ -36,6 +36,15 @@ on:
 permissions:
   contents: read
 
+# One run at a time per ref, the whole run: two pushes to main build and
+# deploy in their order, so an older build cannot deploy after a newer one.
+# A pending run of main gives way to a newer one; a running deploy is never
+# cut. A pull request's runs are keyed by its own ref, so they never wait on
+# a deploy, and a newer push to it cancels the older run.
+concurrency:
+  group: site-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
   build:
     name: build
@@ -62,10 +71,6 @@ jobs:
     environment:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}
-    # One deploy at a time, none cut short; pull requests never wait on it.
-    concurrency:
-      group: pages
-      cancel-in-progress: false
     steps:
       - id: deployment
         uses: actions/deploy-pages@368f82528645a54fb793d4d04e342629a3f51346 # v5.0.1
