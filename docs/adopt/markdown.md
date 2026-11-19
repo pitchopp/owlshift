@@ -183,6 +183,7 @@ Keep using `owlshift do` and `owlshift continue` in your checkout. To move to a 
 
 ## Next
 
+- [Configuration recipes](../recipes.md) set Owlshift up for your stack and your team: the gate, Codex, tickets that touch the same area, labels, plan approval, merge on green and caps.
 - More tickets: one folder each, `tickets/DEMO-2/`, `tickets/DEMO-3/`, in the format of [The Markdown tracker](../markdown-tracker.md). Follow-ups Owlshift proposes appear as new folders at the stage `Triage`; accept one by giving it an assignee and moving its stage to `Todo`.
 - Commit the ticket files when you want them in the repository's history: Owlshift never does.
 - `owlshift logs DEMO-1` prints what Owlshift recorded for the ticket.
