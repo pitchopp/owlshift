@@ -217,15 +217,30 @@ pub(crate) fn forge_login(setup: &Setup<'_>) -> Option<String> {
 }
 
 /// The lines `init` has written under `[tracker]` since P4 for Linear and
-/// Markdown: a label to admit, Linear's default states.
+/// Markdown: a label to admit, Linear's default states; and since OWL-594
+/// the admission keys it leaves unset, commented out.
 pub(crate) const ADMISSION_LINES: &str = "\
-# How a person admits a ticket to Owlshift's queue: { label = \"...\" },
-# \"ready\" (the move to the ready state below, which { state = \"...\" }
-# would repeat) or \"delegation\". `owlshift do TICKET` does not use it: it
-# runs the ticket it is given.
+# How a person admits a ticket to Owlshift's queue (`owlshift do TICKET`
+# ignores it): { label = \"...\" }, or \"ready\", the move to states.ready, which
+# { state = \"...\" } would repeat; \"delegation\" is not built. Required.
 admit = { label = \"agent\" }
-# The tracker states that show where a ticket stands.
-states = { ready = \"Todo\", working = \"In Progress\", needs_input = \"Needs Input\", review = \"In Review\" }
+# The accounts whose admission counts, as the tracker reports them (a Linear
+# user's id, the name on the Markdown tracker), or handles of [people].
+# Default: none, and `owlshift watch --drain` refuses to start.
+# admitters = [\"<account id>\"]
+# A label that keeps a ticket out of the drain, whatever else it carries;
+# never the admission label. Default: none, no ticket is kept out.
+# exclude = \"no-agent\"
+
+[tracker.states]
+# The tracker states that show where a ticket stands. Required, but for
+# `parked`, the state of a ticket Owlshift stopped. Default for `parked`:
+# none, such a ticket shows needs_input, its PARKED comment saying why.
+ready = \"Todo\"
+working = \"In Progress\"
+needs_input = \"Needs Input\"
+review = \"In Review\"
+# parked = \"Parked\"
 ";
 
 /// What [`Kind::doctor`] reports.

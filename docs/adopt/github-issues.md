@@ -50,16 +50,21 @@ Created the label "agent:proposed" on GitHub.
 Wrote ~/code/shop/owlshift.toml: review it, then commit it.
 ```
 
-and the `[tracker]` table of the file it wrote reads:
+and the `[tracker]` table of the file it wrote reads, its comments and commented-out keys left out:
 
 ```toml
 kind = "github"
 admit = "ready"
 admitters = ["24303327"]
-states = { ready = "agent:ready", working = "agent:working", needs_input = "agent:needs-input", review = "agent:review" }
+
+[tracker.states]
+ready = "agent:ready"
+working = "agent:working"
+needs_input = "agent:needs-input"
+review = "agent:review"
 ```
 
-Read `owlshift.toml`: each setting is explained in a comment above it. Check the gate under `[stack]`, which every agent's work must pass, and `admitters` under `[tracker]`: add the numeric ids of the other people whose label should admit an issue (`gh api users/<login> --jq .id` prints one). Then commit the file and push it to your default branch: the background service reads the project file of the default branch, and each run the file of the commit its branch starts from.
+Read `owlshift.toml`: it lists every setting, each with a comment above it that says what it decides, its values and its default; a setting commented out with its default value changes nothing once uncommented. Check the gate under `[stack]`, which every agent's work must pass, and `admitters` under `[tracker]`: add the numeric ids of the other people whose label should admit an issue (`gh api users/<login> --jq .id` prints one). Then commit the file and push it to your default branch: the background service reads the project file of the default branch, and each run the file of the commit its branch starts from.
 
 ## 3. Check the machine and the project: `owlshift doctor`
 
@@ -200,6 +205,18 @@ now: the project's slot is held by 102
 - `owlshift stop` stops the service once the steps under way finish (`Stopping the daemon (pid 8671): each watch ends once its steps under way finish, then the daemon exits.`); `owlshift stop --forget` stops serving this project only.
 
 Priorities are labels too, optional: name them under `[tracker.priorities]` in `owlshift.toml` and create them on GitHub; without them every issue has the same priority.
+
+### How much Owlshift decides alone
+
+Out of the box Owlshift asks rather than guesses, works one issue at a time and never merges. These keys of `owlshift.toml`, each explained in the file, let it do more alone:
+
+- `pipeline.plan_approval`: `"never"` lets a plan through without your approval; `"on-fork"`, which `init` writes, asks only when the plan leaves a choice open; `"always"` asks every time.
+- `policy.resolver_delegation`: what the resolver decides without you, from `"none"` to `"all"` (`"discoverable"` by default). `policy.resolver_passes` (5 runs by default) and `policy.resolver_budget_usd` bound how long it goes on before it asks.
+- `policy.ticket_budget_usd`: what one issue's runs may cost before it parks; no budget by default.
+- `policy.max_in_flight`: how many issues are worked at once, 1 by default.
+- `[forge] merge`: `"labeled"` (issues carrying the label `owlshift:merge`) or `"all"` turns merge on green on: Owlshift merges a pull request it follows once its checks are green, into your default branch, by `merge_method` (`"squash"` by default). `"never"`, the default, leaves every merge to you.
+
+Whatever they say, a question on security or on an irreversible action always reaches a person, and so do the categories listed in `policy.always_human`. Under merge on green, an issue that asked a security question is never merged by Owlshift, nor one whose other such question no person settled.
 
 ## Next
 

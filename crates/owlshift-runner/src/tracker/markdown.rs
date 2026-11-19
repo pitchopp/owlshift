@@ -47,8 +47,9 @@ impl Kind for Markdown {
 
     fn project_file_lines(&self, _team: Option<&str>) -> Result<String, String> {
         Ok("\
-# Where the tickets live: \"markdown\" for tickets kept in this repository,
-# one folder per ticket under tickets/, or \"linear\" with its `team` key.
+# Where the tickets live: \"markdown\" (here) for tickets kept in this
+# repository, one folder each under tickets/, \"linear\" with its `team` key,
+# or \"github\" for the repository's issues. Required.
 kind = \"markdown\"
 "
         .to_owned())
