@@ -18,7 +18,7 @@ use serde_json::{Value, json};
 
 use owlshift_contracts::drain::TicketIntake;
 use owlshift_contracts::ids::TicketId;
-use owlshift_contracts::refs::{EndedWhy, MAX_HELD_FILES, TicketHeld};
+use owlshift_contracts::refs::{ClaimHeld, EndedWhy, MAX_HELD_FILES, TicketHeld};
 use owlshift_contracts::review::Plan;
 use owlshift_core::collision::{self, Dispatched, InFlight, Shared};
 use owlshift_core::decider::brief_zones;
@@ -73,6 +73,34 @@ pub fn dispatched(stored: &Stored) -> Dispatched {
         .map_or(Dispatched::Unrecorded, |at| {
             Dispatched::At(at.as_millisecond())
         })
+}
+
+/// What a claim publishes the ticket of `stored` holds (OWL-586; build plan
+/// "Claims", the claim's `held`): its `held.json`'s paths, while it is in
+/// flight ([`holds`]), as [`of`] weighs them: nothing with no ref or out of
+/// flight; the whole repository for a ref from before `held.json` was kept,
+/// or one admitted with no zone; the files a widening added before its
+/// Build's admission.
+pub fn claim_held(stored: Option<&Stored>) -> ClaimHeld {
+    let Some(stored) = stored.filter(|stored| holds(stored)) else {
+        return ClaimHeld::default();
+    };
+    match &stored.record.held {
+        None => ClaimHeld {
+            repository: true,
+            ..ClaimHeld::default()
+        },
+        Some(held) if held.admitted() => ClaimHeld {
+            repository: held.whole(),
+            zones: held.zones.clone(),
+            resources: held.resources.clone(),
+            files: held.files.clone(),
+        },
+        Some(held) => ClaimHeld {
+            files: held.files.clone(),
+            ..ClaimHeld::default()
+        },
+    }
 }
 
 /// A ticket ref that cannot be read: the whole repository, dispatched
@@ -600,6 +628,34 @@ mod tests {
                 &vec![zone(""), Resource::Named("lock".to_owned())]
             )
         );
+    }
+
+    /// OWL-586: a claim publishes what the in-flight set weighs: nothing at
+    /// Ready nor for a ticket in Design not admitted, the files of an
+    /// admitted plan, the whole repository for an admission with no zone or
+    /// a ref from before `held.json`.
+    #[test]
+    fn a_claim_holds_what_the_ticket_holds_in_flight() {
+        assert!(claim_held(None).is_empty());
+        assert!(claim_held(Some(&at(Status::Active(Stage::Ready), None))).is_empty());
+        let mut designing = at(Status::Active(Stage::Design), None);
+        designing.record.held = Some(TicketHeld::dispatched(minute(0)));
+        assert!(claim_held(Some(&designing)).is_empty());
+        let mut building = at(Status::Active(Stage::Build), None);
+        let mut admitted = TicketHeld::dispatched(minute(0));
+        admitted.admitted_at = Some(minute(1));
+        admitted.zones = strings(&["src/lib.rs"]);
+        admitted.files = strings(&["Cargo.lock"]);
+        building.record.held = Some(admitted.clone());
+        let held = claim_held(Some(&building));
+        assert_eq!(
+            (held.repository, held.zones, held.files),
+            (false, strings(&["src/lib.rs"]), strings(&["Cargo.lock"]))
+        );
+        admitted.zones.clear();
+        building.record.held = Some(admitted);
+        assert!(claim_held(Some(&building)).repository);
+        assert!(claim_held(Some(&at(Status::Active(Stage::Build), None))).repository);
     }
 
     /// OWL-448: a ticket in Design, dispatched and not admitted, holds

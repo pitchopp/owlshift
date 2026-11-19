@@ -14,7 +14,7 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError, Sender};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
@@ -283,29 +283,59 @@ pub fn said(ticket: &TicketId, asked: &Asked, voice: Voice) -> Vec<String> {
     lines
 }
 
-/// A step's watch over its ticket's cancel file (OWL-474), from
-/// [`Watcher::start`] until it is dropped: on finding the file it asks the
-/// step's checked stop, `owlshift_platform::process::stop_step`, and its
-/// drop ends that stop. The stop is the process's, so at most one step of a
-/// process is watched at a time: plain `owlshift watch` runs one step at a
-/// time, and a step's child runs one.
+/// What stopped a step its [`Watcher`] watched.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Cause {
+    /// Its ticket's cancel file (OWL-474).
+    Cancel,
+    /// Its ticket's lost claim (OWL-586, `crate::claims::lost_file`): the
+    /// ticket is another runner's now.
+    ClaimLost,
+}
+
+impl Cause {
+    fn code(self) -> u8 {
+        match self {
+            Cause::Cancel => 1,
+            Cause::ClaimLost => 2,
+        }
+    }
+}
+
+/// A step's watch over its ticket's cancel file (OWL-474), and over the
+/// record of its lost claim (OWL-586), from [`Watcher::start`] until it is
+/// dropped: on finding either it asks the step's checked stop,
+/// `owlshift_platform::process::stop_step`, and its drop ends that stop. The
+/// stop is the process's, so at most one step of a process is watched at a
+/// time: plain `owlshift watch` runs one step at a time, and a step's child
+/// runs one.
 pub struct Watcher {
     stop: Option<Sender<()>>,
     thread: Option<JoinHandle<()>>,
-    fired: Arc<AtomicBool>,
+    fired: Arc<AtomicU8>,
     watching: bool,
 }
 
 impl Watcher {
-    /// Starts watching `ticket`'s cancel file in `dirs`'s project: once now,
-    /// before the step makes anything, then every [`POLL`] on a thread of
-    /// its own. A thread that could not start leaves the step unwatched
-    /// ([`Watcher::watching`]): its ticket is still parked at the next pass.
+    /// Starts watching `ticket`'s cancel file and lost claim in `dirs`'s
+    /// project: once now, before the step makes anything, then every
+    /// [`POLL`] on a thread of its own. A thread that could not start leaves
+    /// the step unwatched ([`Watcher::watching`]): its ticket is still
+    /// parked at the next pass, or left out of it once its claim is lost.
     pub fn start(dirs: &ProjectDirs, ticket: &TicketId) -> Self {
-        let path = file(dirs, ticket);
-        let fired = Arc::new(AtomicBool::new(false));
-        if fs::symlink_metadata(&path).is_ok() {
-            fire(&fired, process::stop_step);
+        let paths = [
+            (file(dirs, ticket), Cause::Cancel),
+            (crate::claims::lost_file(dirs, ticket), Cause::ClaimLost),
+        ];
+        let fired = Arc::new(AtomicU8::new(0));
+        let found = |paths: &[(PathBuf, Cause)]| {
+            paths
+                .iter()
+                .find(|(path, _)| fs::symlink_metadata(path).is_ok())
+                .map(|(_, cause)| *cause)
+        };
+        if let Some(cause) = found(&paths) {
+            fire(&fired, cause, process::stop_step);
             return Self {
                 stop: None,
                 thread: None,
@@ -319,8 +349,8 @@ impl Watcher {
             .name("owlshift-cancel".to_owned())
             .spawn(move || {
                 while let Err(RecvTimeoutError::Timeout) = stopped.recv_timeout(POLL) {
-                    if fs::symlink_metadata(&path).is_ok() {
-                        fire(&flag, process::stop_step);
+                    if let Some(cause) = found(&paths) {
+                        fire(&flag, cause, process::stop_step);
                         return;
                     }
                 }
@@ -335,13 +365,22 @@ impl Watcher {
         }
     }
 
-    /// Whether it found the file and stopped the step.
+    /// Whether it found a file and stopped the step.
     pub fn fired(&self) -> bool {
-        self.fired.load(Ordering::SeqCst)
+        self.cause().is_some()
     }
 
-    /// Whether it watches the file: its thread started, or the file stood
-    /// at its start.
+    /// What it found, once it stopped the step.
+    pub fn cause(&self) -> Option<Cause> {
+        match self.fired.load(Ordering::SeqCst) {
+            1 => Some(Cause::Cancel),
+            2 => Some(Cause::ClaimLost),
+            _ => None,
+        }
+    }
+
+    /// Whether it watches the files: its thread started, or one stood at
+    /// its start.
     pub fn watching(&self) -> bool {
         self.watching
     }
@@ -359,13 +398,13 @@ impl Drop for Watcher {
     }
 }
 
-/// Records on `fired` that a watcher found its ticket's cancel file, then
+/// Records on `fired` that a watcher found its ticket's file, `cause`, then
 /// asks the step's stop with `stop`,
 /// `owlshift_platform::process::stop_step`, in that order (OWL-592):
 /// whoever sees the stop asked sees [`Watcher::fired`] true. The stop is a
 /// parameter so that a test reads the flag at the moment it is asked.
-fn fire(fired: &AtomicBool, stop: impl FnOnce()) {
-    fired.store(true, Ordering::SeqCst);
+fn fire(fired: &AtomicU8, cause: Cause, stop: impl FnOnce()) {
+    fired.store(cause.code(), Ordering::SeqCst);
     stop();
 }
 
@@ -600,9 +639,32 @@ mod tests {
     /// (OWL-592).
     #[test]
     fn a_watcher_has_fired_by_the_time_the_stop_is_asked() {
-        let fired = AtomicBool::new(false);
+        let fired = AtomicU8::new(0);
         let mut at_the_stop = None;
-        fire(&fired, || at_the_stop = Some(fired.load(Ordering::SeqCst)));
-        assert_eq!(at_the_stop, Some(true));
+        fire(&fired, Cause::Cancel, || {
+            at_the_stop = Some(fired.load(Ordering::SeqCst));
+        });
+        assert_eq!(at_the_stop, Some(1));
+    }
+
+    /// OWL-586: a lost claim's record stops the step as a cancel does, and
+    /// says so.
+    #[test]
+    fn a_watcher_stops_the_step_once_its_claim_is_lost() {
+        let data = tempfile::tempdir().unwrap();
+        let dirs = ProjectDirs::new(data.path(), &Repo::parse("acme/web").unwrap());
+        let ticket = TicketId::new("WEB-1").unwrap();
+        let watcher = Watcher::start(&dirs, &ticket);
+        assert!(watcher.watching());
+        assert_eq!(watcher.cause(), None);
+        crate::claims::record_lost(&dirs, &ticket, None, jiff::Timestamp::now()).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !process::step_stop_asked() {
+            assert!(Instant::now() < deadline, "the step was not stopped");
+            thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(watcher.cause(), Some(Cause::ClaimLost));
+        drop(watcher);
+        assert!(!process::step_stop_asked());
     }
 }

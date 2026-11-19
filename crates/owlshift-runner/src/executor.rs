@@ -105,7 +105,7 @@ use crate::ticket_run::{Marks, Siblings};
 
 pub use codex::CodexHarness;
 pub use gate::{DEFAULT_GATE_TIMEOUT, GateReport, GateStep, SETUP_LOG, SETUP_PREFIX, SETUP_SHARE};
-pub use git::{Git, GitError, MINIMUM_GIT_VERSION};
+pub use git::{GIT_TIMEOUT, Git, GitError, MINIMUM_GIT_VERSION};
 pub(crate) use git::{git_floor_reason, git_install_advice, git_recheck_note};
 pub use harness::{
     Harness, HarnessEnd, HarnessError, HarnessHome, HarnessLogin, HarnessRun, HarnessStatus,

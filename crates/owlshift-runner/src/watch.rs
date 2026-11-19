@@ -149,6 +149,7 @@ use owlshift_core::vocab::{Harness, Overlap, Stage};
 
 use crate::answer_check::{self, Readiness};
 use crate::base;
+use crate::claims;
 use crate::events::{Data, EventSink, data, printable};
 use crate::follow::{self, Following, Look};
 use crate::held;
@@ -615,6 +616,13 @@ struct Memory<'c> {
     /// to relay them to, as last warned of (OWL-585): warned of again only
     /// when they change, forgotten once the ticket has a decider.
     unrelayed: HashMap<TicketId, Vec<u64>>,
+    /// When this runner's claims are next renewed (OWL-586): at the first
+    /// pass, then every [`claims::RENEW_EVERY`], or [`claims::RENEW_RETRY`]
+    /// after a renewal that left some for later.
+    claims_due: Option<Timestamp>,
+    /// Why the last renewal could not be made, as warned of: warned of
+    /// again only when it changes.
+    claims_failing: Option<String>,
 }
 
 /// What a correction's or the reviews' read found due at a pass (OWL-445):
@@ -870,6 +878,9 @@ impl Watch<'_> {
             }
             Err(project) => return self.note(memory, out, project),
         };
+        // This runner's claims, swept and renewed when due (OWL-586); a
+        // ticket whose claim it finds lost leaves the pass.
+        let read = self.tend_claims(memory, sink, out, read);
         // A harness's usage limit, told when it changed (OWL-404).
         self.read_usage(memory, sink, out);
         // The cancels standing (OWL-474): each ticket whose step does not
@@ -2295,6 +2306,9 @@ impl Watch<'_> {
         // in a fixed number of git commands (OWL-492).
         drop(lock);
         let refs = ticket_ref::read_listed_refs(git, &checkout, listing);
+        // A ticket whose claim this runner lost is out of every count, and
+        // gets no step (OWL-586).
+        let refs = claims::drop_lost(dirs, refs);
         Ok(Snapshot { refs, quarantine })
     }
 
@@ -3190,6 +3204,118 @@ impl Watch<'_> {
     fn line(&self, out: &mut dyn Write, text: &str) {
         let now = (self.on_demand.clock)();
         let _ = writeln!(out, "{}", printable(&format!("{now} watch: {text}")));
+    }
+
+    /// This runner's claims in the project (OWL-586; build plan "Claims"):
+    /// first the sweep, which deletes those of tickets it no longer follows,
+    /// their ref gone or their following ended, each under its ticket's
+    /// lock; then, when due, the renewal of the others in one push, each
+    /// holding what its ticket ref holds now. A claim found lost is told
+    /// once ([`OnDemand::claim_lost`]), and its ticket leaves `read`. A
+    /// project with no claim recorded does nothing here, so a project whose
+    /// claims are local reaches no remote.
+    fn tend_claims(
+        &self,
+        memory: &mut Memory,
+        sink: &mut EventSink<'_>,
+        out: &mut dyn Write,
+        read: Vec<(TicketId, Result<Stored, String>)>,
+    ) -> Vec<(TicketId, Result<Stored, String>)> {
+        let dirs = self.on_demand.dirs;
+        if claims::recorded(dirs).is_empty() {
+            return read;
+        }
+        let git = &self.on_demand.executor.git;
+        let checkout = dirs.checkout();
+        let at = claims::ClaimsAt { git, dirs };
+        let followed = |stored: &Stored| {
+            let at_watch = TicketState::try_from(&stored.record.state)
+                .is_ok_and(|state| state.stage() == Stage::Watch);
+            !at_watch || delivery_followed(stored)
+        };
+        // The snapshot keeps a ticket it shows followed, or whose ref does
+        // not read; any other is read again under its lock, so the sweep
+        // costs no git command while every claimed ticket is followed.
+        let follows = |ticket: &TicketId| {
+            let shown = read
+                .iter()
+                .find(|(id, _)| id == ticket)
+                .map(|(_, stored)| match stored {
+                    Ok(stored) => followed(stored),
+                    Err(_) => true,
+                });
+            if shown == Some(true) {
+                return Ok(true);
+            }
+            ticket_ref::read(git, &checkout, ticket)
+                .map(|stored| stored.is_some_and(|stored| followed(&stored)))
+        };
+        for swept in claims::sweep(at, &follows) {
+            match swept.deleted {
+                Ok(claims::Deleted::None) => {}
+                Ok(deleted) => {
+                    let how = match deleted {
+                        claims::Deleted::Deleted => "deleted",
+                        _ => "not_ours",
+                    };
+                    sink.emit(
+                        &swept.ticket,
+                        None,
+                        EventKind::Decision,
+                        data([("claim", json!("deleted")), ("found", json!(how))]),
+                    );
+                }
+                Err(why) => {
+                    sink.emit(
+                        &swept.ticket,
+                        None,
+                        EventKind::Warning,
+                        data([("what", json!("claim_delete")), ("reason", json!(why))]),
+                    );
+                }
+            }
+        }
+        let now = (self.on_demand.clock)();
+        if memory.claims_due.is_none_or(|due| now >= due) {
+            let held_of = |ticket: &TicketId| {
+                held::claim_held(
+                    ticket_ref::read(git, &checkout, ticket)
+                        .ok()
+                        .flatten()
+                        .as_ref(),
+                )
+            };
+            let renewal = claims::renew(at, &held_of, now);
+            for (ticket, holder) in renewal.lost.clone() {
+                self.line(
+                    out,
+                    &format!(
+                        "{ticket}: its claim on origin was lost; this runner writes nothing more \
+                         on it, and `owlshift forget {ticket}` starts it over here"
+                    ),
+                );
+                self.on_demand.claim_lost(&ticket, holder, sink);
+            }
+            match &renewal.failed {
+                Some(why) if memory.claims_failing.as_ref() != Some(why) => {
+                    self.line(out, &format!("the claims could not be renewed: {why}"));
+                    sink.emit_project(
+                        None,
+                        EventKind::Warning,
+                        data([("what", json!("claim_renewal")), ("reason", json!(why))]),
+                    );
+                }
+                _ => {}
+            }
+            memory.claims_failing = renewal.failed.clone();
+            let next = if renewal.settled() {
+                claims::RENEW_EVERY
+            } else {
+                claims::RENEW_RETRY
+            };
+            memory.claims_due = Some(now.checked_add(next).unwrap_or(now));
+        }
+        claims::drop_lost(dirs, read)
     }
 }
 

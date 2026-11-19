@@ -70,11 +70,7 @@ pub fn push_command(
     commit: &CommitId,
     branch: &Branch,
 ) -> Result<Command, PushError> {
-    if remote.is_empty() || remote.starts_with('-') {
-        return Err(PushError::Failed {
-            message: format!("{remote:?} is not a remote"),
-        });
-    }
+    check_remote(remote)?;
     let mut command = Command::new(git);
     command
         .current_dir(worktree)
@@ -105,11 +101,7 @@ pub fn leased_push_command(
     branch: &Branch,
     lease: &CommitId,
 ) -> Result<Command, PushError> {
-    if remote.is_empty() || remote.starts_with('-') {
-        return Err(PushError::Failed {
-            message: format!("{remote:?} is not a remote"),
-        });
-    }
+    check_remote(remote)?;
     let mut command = Command::new(git);
     command
         .current_dir(worktree)
@@ -169,17 +161,7 @@ fn read_parts(
 ) -> Result<Pushed, PushError> {
     let target = format!("refs/heads/{branch}");
     let stdout = String::from_utf8_lossy(stdout);
-    // `<flag>\t<from>:<to>\t<summary>`; Git for Windows ends lines with CRLF.
-    let line = stdout
-        .lines()
-        .map(|l| l.trim_end_matches('\r'))
-        .find_map(|line| {
-            let mut fields = line.splitn(3, '\t');
-            let flag = fields.next()?;
-            let (_, to) = fields.next()?.split_once(':')?;
-            (to == target && flag.chars().count() == 1).then(|| (flag, fields.next().unwrap_or("")))
-        });
-    match line {
+    match porcelain_line(&stdout, &target) {
         Some(("!", summary)) => Err(PushError::Rejected {
             reason: summary.trim().to_owned(),
         }),
@@ -192,13 +174,172 @@ fn read_parts(
                 message: format!("unexpected update {other:?} of {target}"),
             }),
         },
-        _ => Err(PushError::Failed {
-            message: format!(
-                "git push exited with {ended}: {}",
-                tail(&String::from_utf8_lossy(stderr))
-            ),
-        }),
+        _ => Err(no_verdict(ended, stderr)),
     }
+}
+
+/// The flag and the summary of `target`'s line in a `git push --porcelain`
+/// output: `<flag>\t<from>:<to>\t<summary>`, `<from>` being empty or
+/// `(delete)` for a deletion. Git for Windows ends lines with CRLF.
+fn porcelain_line<'a>(stdout: &'a str, target: &str) -> Option<(&'a str, &'a str)> {
+    stdout
+        .lines()
+        .map(|l| l.trim_end_matches('\r'))
+        .find_map(|line| {
+            let mut fields = line.splitn(3, '\t');
+            let flag = fields.next()?;
+            let (_, to) = fields.next()?.split_once(':')?;
+            (to == target && flag.chars().count() == 1).then(|| (flag, fields.next().unwrap_or("")))
+        })
+}
+
+/// A push that gave no verdict for a ref: how git ended, with the end of
+/// its standard error.
+fn no_verdict(ended: &str, stderr: &[u8]) -> PushError {
+    PushError::Failed {
+        message: format!(
+            "git push exited with {ended}: {}",
+            tail(&String::from_utf8_lossy(stderr))
+        ),
+    }
+}
+
+/// One ref of a push of Owlshift's own refs (OWL-586), each leased on what
+/// the remote must hold for it: the claims under `refs/owlshift/claims/`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RefUpdate<'a> {
+    /// `name` made at `commit`, only while the remote has no such ref:
+    /// `--force-with-lease=<name>:`, which the remote applies as a
+    /// compare-and-swap (live check C3).
+    Create { name: &'a str, commit: &'a CommitId },
+    /// `name` moved to `commit`, only while the remote holds `expected`
+    /// there (live check T1).
+    Update {
+        name: &'a str,
+        commit: &'a CommitId,
+        expected: &'a CommitId,
+    },
+    /// `name` deleted, only while the remote holds `expected` there.
+    Delete {
+        name: &'a str,
+        expected: &'a CommitId,
+    },
+}
+
+impl RefUpdate<'_> {
+    /// The ref it names.
+    pub fn name(&self) -> &str {
+        match self {
+            Self::Create { name, .. } | Self::Update { name, .. } | Self::Delete { name, .. } => {
+                name
+            }
+        }
+    }
+}
+
+/// What a landed [`RefUpdate`] did.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RefPushed {
+    /// The ref was made.
+    Created,
+    /// The ref moved from the expected commit.
+    Updated,
+    /// The ref was deleted.
+    Deleted,
+}
+
+/// `git push --porcelain [--atomic] --force-with-lease=<name>:<expected>…
+/// <remote> <commit>:<name>…`, run in `dir`: every update leased, a deletion
+/// pushed as `:<name>`. `atomic`: the remote applies all of them or none
+/// (live check T1). A ref that is not under `refs/owlshift/` is refused, as
+/// is a remote that git would read as an option.
+pub fn ref_push_command(
+    git: &Path,
+    dir: &Path,
+    remote: &str,
+    updates: &[RefUpdate<'_>],
+    atomic: bool,
+) -> Result<Command, PushError> {
+    check_remote(remote)?;
+    if updates.is_empty() {
+        return Err(PushError::Failed {
+            message: "no ref to push".to_owned(),
+        });
+    }
+    let mut command = Command::new(git);
+    command.current_dir(dir).args(["push", "--porcelain"]);
+    if atomic {
+        command.arg("--atomic");
+    }
+    for update in updates {
+        let name = update.name();
+        if !name.starts_with("refs/owlshift/") || name.contains(':') {
+            return Err(PushError::Failed {
+                message: format!("{name:?} is not one of Owlshift's own refs"),
+            });
+        }
+        command.arg(match update {
+            RefUpdate::Create { .. } => format!("--force-with-lease={name}:"),
+            RefUpdate::Update { expected, .. } | RefUpdate::Delete { expected, .. } => {
+                format!("--force-with-lease={name}:{expected}")
+            }
+        });
+    }
+    command.arg(remote);
+    for update in updates {
+        command.arg(match update {
+            RefUpdate::Create { name, commit } | RefUpdate::Update { name, commit, .. } => {
+                format!("{commit}:{name}")
+            }
+            RefUpdate::Delete { name, .. } => format!(":{name}"),
+        });
+    }
+    command.stdin(Stdio::null());
+    Ok(command)
+}
+
+/// Reads a [`ref_push_command`]'s output, one verdict per ref of `updates`,
+/// in their order, from each ref's porcelain flag: `*` made, `+` moved under
+/// its lease, `-` deleted, `!` rejected, whether by git, its lease stale
+/// against the refs the remote advertised, by the remote's own
+/// compare-and-swap, or because an atomic push failed for another ref. A
+/// ref with no line, or a success flag while git failed, has no verdict.
+pub fn read_ref_push_parts(
+    updates: &[RefUpdate<'_>],
+    success: bool,
+    ended: &str,
+    stdout: &[u8],
+    stderr: &[u8],
+) -> Vec<Result<RefPushed, PushError>> {
+    let stdout = String::from_utf8_lossy(stdout);
+    updates
+        .iter()
+        .map(|update| {
+            let name = update.name();
+            match (porcelain_line(&stdout, name), update) {
+                (Some(("!", summary)), _) => Err(PushError::Rejected {
+                    reason: summary.trim().to_owned(),
+                }),
+                (Some(("*", _)), RefUpdate::Create { .. }) if success => Ok(RefPushed::Created),
+                (Some(("+", _)), RefUpdate::Update { .. }) if success => Ok(RefPushed::Updated),
+                (Some(("-", _)), RefUpdate::Delete { .. }) if success => Ok(RefPushed::Deleted),
+                (Some((flag, _)), _) if success => Err(PushError::Failed {
+                    message: format!("unexpected update {flag:?} of {name}"),
+                }),
+                _ => Err(no_verdict(ended, stderr)),
+            }
+        })
+        .collect()
+}
+
+/// Refuses a remote git would read as an option, or none.
+fn check_remote(remote: &str) -> Result<(), PushError> {
+    if remote.is_empty() || remote.starts_with('-') {
+        return Err(PushError::Failed {
+            message: format!("{remote:?} is not a remote"),
+        });
+    }
+    Ok(())
 }
 
 /// The last lines of git's standard error, without credentials.
@@ -322,6 +463,124 @@ mod tests {
         );
         assert!(matches!(
             forced(1, "+", "aaa...bbb (forced update)"),
+            Err(PushError::Failed { .. })
+        ));
+    }
+
+    const CLAIM: &str = "refs/owlshift/claims/OWL-1";
+    const OTHER: &str = "refs/owlshift/claims/OWL-2";
+
+    /// OWL-586: a claim's take, renewal and delete, leased, read ref by ref,
+    /// from the porcelain git 2.54 printed against a bare remote.
+    #[test]
+    fn a_ref_push_is_leased_and_read_ref_by_ref() {
+        let commit = CommitId::new(OID).unwrap();
+        let expected = CommitId::new("1111111111111111111111111111111111111111").unwrap();
+        let updates = [
+            RefUpdate::Create {
+                name: CLAIM,
+                commit: &commit,
+            },
+            RefUpdate::Update {
+                name: OTHER,
+                commit: &commit,
+                expected: &expected,
+            },
+        ];
+        let command =
+            ref_push_command(Path::new("git"), Path::new("."), "origin", &updates, true).unwrap();
+        let args: Vec<_> = command.get_args().map(|a| a.to_string_lossy()).collect();
+        assert_eq!(
+            args,
+            [
+                "push",
+                "--porcelain",
+                "--atomic",
+                &format!("--force-with-lease={CLAIM}:"),
+                &format!("--force-with-lease={OTHER}:{expected}"),
+                "origin",
+                &format!("{OID}:{CLAIM}"),
+                &format!("{OID}:{OTHER}"),
+            ]
+        );
+        let delete = [RefUpdate::Delete {
+            name: CLAIM,
+            expected: &expected,
+        }];
+        let command =
+            ref_push_command(Path::new("git"), Path::new("."), "origin", &delete, false).unwrap();
+        let args: Vec<_> = command.get_args().map(|a| a.to_string_lossy()).collect();
+        assert_eq!(args.last().unwrap(), &format!(":{CLAIM}"));
+        // Only Owlshift's own refs, and never an option as remote.
+        let branch = [RefUpdate::Create {
+            name: "refs/heads/main",
+            commit: &commit,
+        }];
+        assert!(
+            ref_push_command(Path::new("git"), Path::new("."), "origin", &branch, false).is_err()
+        );
+        assert!(
+            ref_push_command(
+                Path::new("git"),
+                Path::new("."),
+                "--mirror",
+                &updates,
+                false
+            )
+            .is_err()
+        );
+        assert!(ref_push_command(Path::new("git"), Path::new("."), "origin", &[], false).is_err());
+
+        let read = |code: i32, stdout: &str, updates: &[RefUpdate<'_>]| {
+            let out = output(code, stdout, "error: failed to push some refs");
+            read_ref_push_parts(
+                updates,
+                out.status.success(),
+                "exit",
+                &out.stdout,
+                &out.stderr,
+            )
+        };
+        let taken = format!("To ../r\n*\t{OID}:{CLAIM}\t[new reference]\nDone\n");
+        assert_eq!(read(0, &taken, &updates[..1]), [Ok(RefPushed::Created)]);
+        let renewed =
+            format!("To ../r\n+\t{OID}:{OTHER}\t1111111...0123456 (forced update)\nDone\n");
+        assert_eq!(read(0, &renewed, &updates[1..]), [Ok(RefPushed::Updated)]);
+        let deleted = format!("To ../r\n-\t:{CLAIM}\t[deleted]\nDone\n");
+        assert_eq!(read(0, &deleted, &delete), [Ok(RefPushed::Deleted)]);
+        // A take of a claim that exists, and a delete of one that does not.
+        let stale = format!("To ../r\n!\t{OID}:{CLAIM}\t[rejected] (stale info)\nDone\n");
+        assert!(matches!(
+            read(1, &stale, &updates[..1])[0],
+            Err(PushError::Rejected { .. })
+        ));
+        let gone = format!("To ../r\n!\t(delete):{CLAIM}\t[rejected] (stale info)\nDone\n");
+        assert!(matches!(
+            read(1, &gone, &delete)[0],
+            Err(PushError::Rejected { .. })
+        ));
+        // An atomic push refused for one ref refuses the other.
+        let atomic = format!(
+            "To ../r\n!\t{OID}:{CLAIM}\t[rejected] (stale info)\n\
+             !\t{OID}:{OTHER}\t[rejected] (atomic push failed)\nDone\n"
+        );
+        let both = read(1, &atomic, &updates);
+        assert!(
+            both.iter()
+                .all(|r| matches!(r, Err(PushError::Rejected { .. }))),
+            "{both:?}"
+        );
+        // A ref with no line, or a flag that is not its update's, has no verdict.
+        assert!(matches!(
+            read(128, "", &updates[..1])[0],
+            Err(PushError::Failed { .. })
+        ));
+        assert!(matches!(
+            read(0, &deleted, &updates[..1])[0],
+            Err(PushError::Failed { .. })
+        ));
+        assert!(matches!(
+            read(1, &taken, &updates[..1])[0],
             Err(PushError::Failed { .. })
         ));
     }

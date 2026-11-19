@@ -29,7 +29,7 @@ use owlshift_adapters::tracker::ErrorKind;
 use owlshift_adapters::tracker::linear::AdmissionFacts;
 use owlshift_adapters::tracker::{Capability, KeyAccount};
 use owlshift_contracts::config::{
-    Admit, PersonalConfig, ProjectConfig, States, Takes, Tracker, TrackerKind,
+    Admit, Claims, PersonalConfig, ProjectConfig, States, Takes, Tracker, TrackerKind,
 };
 use owlshift_contracts::ids::TicketId;
 use owlshift_contracts::service::BuildIdentity;
@@ -355,6 +355,7 @@ pub fn run(system: &dyn System, config: &Effective, own: &BuildIdentity) -> Repo
     });
     checks.extend(people_check(config, operator.as_ref()));
     checks.extend(team_gesture_check(config));
+    checks.extend(claims_check(config));
     checks.extend(markdown_takes_check(config, repo));
     checks.extend(forge_reviewers_check(config));
     checks.extend(resolver_check(config));
@@ -1527,6 +1528,39 @@ fn team_gesture_check(config: &Effective) -> Option<Check> {
             format!(
                 "{DOES_NOT_BLOCK} on a team, admit with a label each developer puts on their own \
                  tickets: `admit = {{ label = \"agent\" }}` under `[tracker]`."
+            ),
+        )
+    })
+}
+
+/// Claims kept local in a project file that lists several people (OWL-586,
+/// build plan "P10 · Teams", "Claims"): only the ticket locks of one machine
+/// keep a ticket to one runner, so two people's runners, or one person's two
+/// machines, can work one ticket. Several people as [`team_gesture_check`]
+/// counts them. A warning, read from the working tree; the runner reads the
+/// base commit.
+fn claims_check(config: &Effective) -> Option<Check> {
+    let FileState::Loaded { config, .. } = &config.project else {
+        return None;
+    };
+    if config.policy.claims() != Claims::Local {
+        return None;
+    }
+    let people = match &config.people {
+        Some(people) => people.len(),
+        None => config.tracker.admitters.as_ref().map_or(0, Vec::len),
+    };
+    (people >= 2).then(|| {
+        Check::warn(
+            Section::Project,
+            "claims",
+            format!(
+                "claims are local, and the file lists {people} people: two machines can work \
+                 one ticket, each holding only its own ticket locks"
+            ),
+            format!(
+                "{DOES_NOT_BLOCK} on a team, claim tickets on the git remote: `claims = \"remote\"` \
+                 under `[policy]`, merged to the default branch."
             ),
         )
     })
@@ -4845,6 +4879,21 @@ states = { ready = "Todo", working = "Doing", needs_input = "Asked", review = "R
             let (_dir, config) = project_tracked_by(&quiet);
             assert!(team_gesture_check(&config).is_none(), "{quiet}");
         }
+    }
+
+    /// OWL-586: claims left local in a file that lists several people are
+    /// warned of; remote claims, or one person, say nothing.
+    #[test]
+    fn local_claims_are_warned_of_when_several_people_are_listed() {
+        let two = LABELLED_TRACKER.replace(r#"["u-ann"]"#, r#"["u-ann", "u-bob"]"#);
+        let (_dir, config) = project_tracked_by(&two);
+        let warned = claims_check(&config).unwrap();
+        assert_eq!(warned.status, Status::Warn);
+        assert!(warned.detail.contains("lists 2 people"), "{warned:?}");
+        let (_dir, config) = project_tracked_with(&two, "claims = \"remote\"");
+        assert!(claims_check(&config).is_none());
+        let (_dir, config) = project_tracked_by(LABELLED_TRACKER);
+        assert!(claims_check(&config).is_none());
     }
 
     /// OWL-583: a Markdown project whose personal file names no

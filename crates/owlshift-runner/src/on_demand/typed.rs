@@ -160,7 +160,7 @@ impl OnDemand<'_> {
         comment: &str,
         sink: &mut EventSink<'_>,
     ) -> Option<Result<Delivered, Stop>> {
-        let mut p = match self.prepare(ticket, Command::Continue) {
+        let mut p = match self.prepare(ticket, Command::Continue, sink) {
             Ok(p) => p,
             Err(stop @ Stop::Refused(_)) => {
                 unread(ticket, comment, &stop, sink);

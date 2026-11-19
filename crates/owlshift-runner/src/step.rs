@@ -82,7 +82,9 @@ pub enum Stepped {
 /// Since OWL-474 the step watches its ticket's cancel file for its whole
 /// length ([`cancel::Watcher`]): once it stands, the step stops itself
 /// checked, as a checked stop of its process would stop it, the process
-/// going on; a `decision` event (`cancel` `stopped`) says so.
+/// going on; a `decision` event (`cancel` `stopped`) says so. Since OWL-586
+/// the record of its lost claim stops it the same way (`claim`
+/// `lost_stopped`).
 pub fn run(
     on_demand: &OnDemand<'_>,
     envelope: &StepEnvelope,
@@ -102,14 +104,20 @@ pub fn run(
         );
     }
     let stepped = step(on_demand, envelope, following, reviews, outside, sink);
-    let fired = watcher.fired();
+    let cause = watcher.cause();
     drop(watcher);
-    if fired {
+    // A lost claim stops the step as a cancel does (OWL-586).
+    let said = match cause {
+        Some(cancel::Cause::Cancel) => Some(("cancel", "stopped")),
+        Some(cancel::Cause::ClaimLost) => Some(("claim", "lost_stopped")),
+        None => None,
+    };
+    if let Some((key, value)) = said {
         sink.emit(
             ticket,
             None,
             EventKind::Decision,
-            data([("cancel", json!("stopped"))]),
+            data([(key, json!(value))]),
         );
     }
     keep_carry(on_demand, envelope, &stepped, sink);
@@ -367,7 +375,10 @@ pub fn end(stepped: &Stepped) -> StepEnd {
             landed: landed_kind(*landed),
         },
         Stop::Stepped { stage, .. } => StepEnd::Stepped { stage: *stage },
+        // A ticket another runner claims (OWL-586): tried again after the
+        // retry delay, as any step that left its ref; part 7 counts it.
         Stop::Refused(_)
+        | Stop::Claimed { .. }
         | Stop::Waits { .. }
         | Stop::Unverified { .. }
         | Stop::NeedsInput { .. }

@@ -712,6 +712,25 @@ pub struct Policy {
     /// requires an Owlshift that reads it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub overlap: Option<Overlap>,
+    /// Whether a ticket is claimed on the git remote (P10, OWL-586;
+    /// architecture section 7, "Claims"): `local`, the default, keeps the
+    /// ticket locks of one machine alone and pushes nothing; `remote` takes a
+    /// claim ref on `origin` before a command works a ticket, so that one
+    /// runner alone works it across machines. Read at the base commit. A
+    /// file using it requires an Owlshift that reads it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub claims: Option<Claims>,
+}
+
+/// `policy.claims` (OWL-586): where a ticket's claim lives.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum Claims {
+    /// The ticket locks of this machine alone: nothing is pushed.
+    #[default]
+    Local,
+    /// A claim ref on `origin`, taken, renewed and deleted by the runner.
+    Remote,
 }
 
 /// `policy.resolver_passes`: a whole number of runs, or `"unlimited"`
@@ -885,6 +904,11 @@ impl Policy {
     /// The project's `overlap` (OWL-449), `exclusive` when absent.
     pub fn overlap(&self) -> Overlap {
         self.overlap.unwrap_or_default()
+    }
+
+    /// The project's `claims` (OWL-586), `local` when absent.
+    pub fn claims(&self) -> Claims {
+        self.claims.unwrap_or_default()
     }
 
     /// The project's capacity (OWL-401): the project's `max_in_flight`, or
@@ -2218,8 +2242,15 @@ mod tests {
             resolver_budget_usd: None,
             ticket_budget_usd: None,
             overlap: None,
+            claims: None,
         };
         assert_eq!(built.quiet_window(), Duration::from_secs(60));
+        // `claims` (OWL-586): local when absent, remote when set.
+        assert_eq!(built.claims(), Claims::Local);
+        let remote = project("", "claims = \"remote\"").unwrap();
+        assert_eq!(remote.policy.claims(), Claims::Remote);
+        assert_eq!(ProjectConfig::parse(&remote.render()).unwrap(), remote);
+        assert!(project("", "claims = \"git\"").is_err());
 
         for ok in ["1", "1440"] {
             project("", &format!("quiet_window_minutes = {ok}")).unwrap();

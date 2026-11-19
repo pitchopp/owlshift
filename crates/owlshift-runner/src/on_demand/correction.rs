@@ -22,7 +22,7 @@ impl OnDemand<'_> {
         following: &mut Following,
         sink: &mut EventSink<'_>,
     ) -> Option<Result<Delivered, Stop>> {
-        let mut p = match self.prepare_at_watch(ticket, seen, Command::Correct)? {
+        let mut p = match self.prepare_at_watch(ticket, seen, Command::Correct, sink)? {
             Ok(p) => p,
             Err(stop) => return Some(Err(stop)),
         };

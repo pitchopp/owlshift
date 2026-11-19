@@ -1,33 +1,79 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "Owlshift claim",
-  "description": "A runner's lease on a ticket.",
+  "description": "Which runner works a ticket (P10, OWL-586; build plan \"P10 · Teams\",\n\"Claims\"): the content of `claim.json` on the ticket's claim ref,\n[`claim_ref`], a commit without a parent on `origin`. It publishes the\nrunner's identifier, its operator, two times and the paths the ticket\nholds; never the ticket's text, a plan or a question.",
   "type": "object",
   "properties": {
+    "claimed_at": {
+      "description": "When the runner took the claim.",
+      "type": "string",
+      "format": "date-time"
+    },
     "expires_at": {
-      "description": "When the lease may be taken over if not renewed.",
+      "description": "24 hours after its last renewal: once past, by the reader's clock, a\nperson may release it; no runner takes it over.",
       "type": "string",
       "format": "date-time"
     },
     "format": {
       "description": "The format version of this document.",
       "type": "integer",
-      "const": 1
+      "const": 2
     },
-    "machine": {
-      "description": "The machine the holding runner runs on.",
-      "type": "string"
+    "held": {
+      "description": "What the ticket holds, as its `held.json` has it: empty before its\nBuild's admission.",
+      "$ref": "#/$defs/ClaimHeld",
+      "default": {}
     },
     "operator": {
-      "description": "The person operating that runner.",
+      "description": "The holding runner's operator: their handle in the project's\n`[people]`, else their tracker account.",
       "type": "string"
+    },
+    "runner": {
+      "description": "The holding runner's identifier: 16 lowercase hexadecimal digits made\nonce per data directory, never a host name.",
+      "type": "string",
+      "pattern": "^[0-9a-f]{16}$"
     }
   },
   "additionalProperties": false,
   "required": [
     "format",
-    "machine",
+    "runner",
     "operator",
+    "claimed_at",
     "expires_at"
-  ]
+  ],
+  "$defs": {
+    "ClaimHeld": {
+      "description": "What a claimed ticket holds (OWL-586): its `held.json`'s zones, named\nresources and files, the paths alone.",
+      "type": "object",
+      "properties": {
+        "files": {
+          "description": "The files its branch changed.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "repository": {
+          "description": "The whole repository: a ticket admitted with no zone, or one whose\nref dates from before what it holds was kept.",
+          "type": "boolean"
+        },
+        "resources": {
+          "description": "The named resources admitted, by name.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "zones": {
+          "description": "The zones admitted, as written.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      },
+      "additionalProperties": false
+    }
+  }
 }

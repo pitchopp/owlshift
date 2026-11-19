@@ -163,6 +163,8 @@ pub fn blocker_line(ticket: &TicketId, stop: &Stop) -> Option<String> {
         | Stop::Busy(_)
         | Stop::TicketBusy(_)
         | Stop::Refused(_)
+        // Another runner's ticket (OWL-586): nobody here is the blocker.
+        | Stop::Claimed { .. }
         | Stop::Waits { .. }
         | Stop::Unverified { .. }
         | Stop::Waiting { .. }

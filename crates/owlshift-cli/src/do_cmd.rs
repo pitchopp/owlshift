@@ -35,6 +35,7 @@ use owlshift_contracts::{Harness, Role, Tier};
 use owlshift_platform::awake::KeepAwake;
 use owlshift_platform::keychain::{Keychain, KeychainError};
 use owlshift_runner::agent_env::AgentEnv;
+use owlshift_runner::claims::{self, ClaimIdentity};
 use owlshift_runner::codex_machine::codex_critic;
 use owlshift_runner::config::{Effective, FileState, OWLSHIFT_VERSION};
 use owlshift_runner::daemon::UNSERVABLE_EXIT;
@@ -432,6 +433,34 @@ fn run_with(
         let _ = operator_cell.set(read_operator());
     }
     let operator_now = || operator_cell.get_or_init(read_operator).clone();
+    // Who this machine claims tickets as (OWL-586): read at the first take
+    // under `policy.claims = "remote"` alone, its runner's identifier made
+    // then, and its operator read as the notifications read it. One that
+    // cannot be read refuses the take: a claim names its operator.
+    let takes_operator = takes.operator().map(str::to_owned);
+    let claimant_cell: OnceCell<Result<ClaimIdentity, String>> = OnceCell::new();
+    let claimant = || {
+        claimant_cell
+            .get_or_init(|| {
+                let runner = claims::runner_id(data_dir).map_err(|error| {
+                    format!(
+                        "this machine's runner identifier, in {}: {error}",
+                        data_dir.display()
+                    )
+                })?;
+                let account = match &takes_operator {
+                    Some(operator) => operator.clone(),
+                    None => operator::known(tracker.as_ref(), project.tracker.kind, personal_file)?
+                        .ok_or_else(|| {
+                            "the Markdown tracker's key names no account: set `identity.tracker` \
+                             in the personal file to your tracker account"
+                                .to_owned()
+                        })?,
+                };
+                Ok(ClaimIdentity { runner, account })
+            })
+            .clone()
+    };
     // The token agent runs log in with (OWL-94), read with the other
     // secrets and set on the harness command alone. None stored refuses the
     // run, with the fix, before anything is cloned.
@@ -564,6 +593,7 @@ fn run_with(
         usage: &usage,
         web_tools: owlshift_runner::config::web_tools_enabled(&config.personal),
         takes,
+        claimant: &claimant,
     };
     let mut stdout = io::stdout();
     let mut sink = EventSink::new(repo.to_string(), EventLog::in_dir(data_dir), &mut stdout);

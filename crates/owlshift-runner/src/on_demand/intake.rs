@@ -198,7 +198,9 @@ impl OnDemand<'_> {
         gesture: Gesture,
         sink: &mut EventSink<'_>,
     ) -> Result<TicketIntake, Stop> {
-        let mut p = self.prepare(ticket, Command::Intake)?;
+        let mut p = self.prepare(ticket, Command::Intake, sink)?;
+        // Its gesture was checked by its caller: the claim now (OWL-586).
+        self.claim_after_checks(&p, sink)?;
         self.intake_prepared(&mut p, gesture, sink)
     }
 

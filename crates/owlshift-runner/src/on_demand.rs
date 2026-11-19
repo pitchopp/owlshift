@@ -85,15 +85,15 @@ use owlshift_contracts::brief::{
     TicketBrief,
 };
 use owlshift_contracts::comment::{MarkedComment, MarkerKind};
-use owlshift_contracts::config::{Admit, ProjectConfig, States};
+use owlshift_contracts::config::{Admit, Claims, ProjectConfig, States};
 use owlshift_contracts::drain::{TicketIntake, TicketProposals};
 use owlshift_contracts::event::EventKind;
 use owlshift_contracts::format::Format;
 use owlshift_contracts::ids::{QuestionId, RelativePath, TicketId};
 use owlshift_contracts::refs::{
-    self, AnsweredReview, Ask, AskDecider, AskKind, BuildRefusal, DeliveredPullRequest,
-    KeptDecision, KeptReport, OwedReport, PersistedState, PushKind, Pushing, TicketCost,
-    TicketDelivery, TicketHeld, TicketQuestions, TicketSession, cut_reason, cut_to,
+    self, AnsweredReview, Ask, AskDecider, AskKind, BuildRefusal, ClaimHolder,
+    DeliveredPullRequest, KeptDecision, KeptReport, OwedReport, PersistedState, PushKind, Pushing,
+    TicketCost, TicketDelivery, TicketHeld, TicketQuestions, TicketSession, cut_reason, cut_to,
 };
 use owlshift_contracts::result::{
     self, AnswerClass, Decision, DecisionsRefusal, Followup, Question, Resolution, RunResult,
@@ -114,6 +114,7 @@ use owlshift_core::state::{Event, MAX_REASKS, ParkReason, Status, TicketState, T
 
 use crate::agent_env::AgentEnv;
 use crate::answer_check::{self, Readiness};
+use crate::claims::{self, ClaimIdentity, ClaimsAt, NotTaken, Took};
 use crate::events::{Data, EventSink, data};
 use crate::executor::{
     DEFAULT_GATE_TIMEOUT, Executor, ExecutorError, Failure, Git, Harness, Outcome, RESULT_PATH,
@@ -555,6 +556,12 @@ pub struct OnDemand<'a> {
     /// gesture is another account's ends not mine. Every other command
     /// reads no gesture, and runs under [`Taking::All`].
     pub takes: Taking,
+    /// Who this machine claims tickets as (OWL-586, [`crate::claims`]):
+    /// called at a take under `policy.claims = "remote"` alone, so that a
+    /// project that keeps its claims local reads no operator and makes no
+    /// runner identifier. An error says why the operator cannot be read,
+    /// which refuses the command: a claim names its operator.
+    pub claimant: &'a dyn Fn() -> Result<ClaimIdentity, String>,
 }
 
 /// The opt-in Codex reviewer (OWL-348, architecture section 5, "Codex"):
@@ -688,6 +695,15 @@ pub enum Stop {
     TicketBusy(TicketId),
     /// Nothing ran, or nothing more could: the reason and its fix.
     Refused(String),
+    /// Another runner holds the ticket's claim on the git remote (OWL-586;
+    /// build plan "Claims", "Taken"): nothing was written on the tracker,
+    /// the forge, the ticket ref or the branch, and watch tries again at a
+    /// later pass. `holder` is `None` when its claim does not read. What
+    /// `Wait::Claimed` of part 7 names.
+    Claimed {
+        ticket: TicketId,
+        holder: Option<Box<ClaimHolder>>,
+    },
     /// The admission holds the ticket back (OWL-401; architecture section
     /// 5, "Admission, one transaction"): the project's capacity, the open
     /// pull requests' cap or what another holds, `said` as `owlshift why`
@@ -874,6 +890,19 @@ impl fmt::Display for Stop {
                  it ends."
             ),
             Self::Refused(reason) => write!(f, "Not run: {reason}"),
+            Self::Claimed { ticket, holder } => match holder {
+                Some(holder) => write!(
+                    f,
+                    "Not run: {ticket} is claimed on origin by {}'s runner {}, until {}: that \
+                     runner works it, and this one touches nothing of it.",
+                    holder.operator, holder.runner, holder.expires_at
+                ),
+                None => write!(
+                    f,
+                    "Not run: {ticket} is claimed on origin by another runner, whose claim does \
+                     not read: this runner touches nothing of it."
+                ),
+            },
             Self::Waits { ticket, said, .. } => write!(
                 f,
                 "Not run: {ticket} waits: {said}. `owlshift why {ticket}` says why it waits."
@@ -1171,6 +1200,16 @@ fn core_error(error: impl fmt::Debug) -> Stop {
     Stop::Refused(format!("the core state machine: {error:?}"))
 }
 
+/// The refusal of every command on a ticket whose claim this runner lost
+/// (OWL-586; build plan "Claims", "Lost").
+fn lost_refusal(ticket: &TicketId) -> Stop {
+    Stop::Refused(format!(
+        "this runner lost its claim on {ticket} to another runner, or it was released: it \
+         writes nothing more on the ticket, and keeps it out of every count. `owlshift forget \
+         {ticket}` starts it over here, at Ready, once no other runner holds it"
+    ))
+}
+
 fn nothing_to_continue(ticket: &TicketId) -> Stop {
     Stop::Refused(format!(
         "nothing to continue: Owlshift keeps nothing on {ticket}; run `owlshift do {ticket}`"
@@ -1376,6 +1415,21 @@ impl Command {
             Command::Fix | Command::Correct => &[Role::Build],
             Command::Rebase => &[],
             Command::Intake => &[Role::Intake, Role::Resolver],
+        }
+    }
+
+    /// Whether [`OnDemand::prepare`] takes the ticket's claim (OWL-586):
+    /// every command that runs or writes on a ticket needs it, and all but
+    /// the drain's two take it once prepared; the drain's take it after
+    /// their gesture's checks ([`OnDemand::claim_after_checks`]), so that a
+    /// runner never claims a ticket that is not its to take. No wildcard: a
+    /// new command does not compile until it is placed.
+    fn claims_in_prepare(self) -> bool {
+        match self {
+            Command::Do | Command::Continue | Command::Fix | Command::Rebase | Command::Correct => {
+                true
+            }
+            Command::Intake | Command::Drain => false,
         }
     }
 
@@ -1770,7 +1824,7 @@ impl OnDemand<'_> {
     /// `owlshift do`: runs `ticket` to a delivered pull request, from Ready;
     /// see the module documentation. Refused while its questions wait.
     pub fn run(&self, ticket: &TicketId, sink: &mut EventSink<'_>) -> Result<Delivered, Stop> {
-        let mut p = self.prepare(ticket, Command::Do)?;
+        let mut p = self.prepare(ticket, Command::Do, sink)?;
         self.drop_carry(ticket, sink);
         self.run_prepared(&mut p, Command::Do, None, sink)
     }
@@ -1940,7 +1994,8 @@ impl OnDemand<'_> {
         outside: Option<&Outside>,
         named: &NamedResources,
     ) -> Result<Locked, Stop> {
-        let others = ticket_ref::others(&self.executor.git, &p.checkout, &p.ticket)
+        let others = self
+            .others(p)
             .map_err(|e| refused("reading the project's ticket refs for the admission", e))?;
         let mut locked = Locked {
             load: Load {
@@ -2290,8 +2345,7 @@ impl OnDemand<'_> {
     /// ([`held::overlaps_of`], OWL-449); its own alone when the refs cannot
     /// be listed.
     fn overlaps(&self, p: &Prepared) -> Vec<(TicketId, Vec<String>)> {
-        let others =
-            ticket_ref::others(&self.executor.git, &p.checkout, &p.ticket).unwrap_or_default();
+        let others = self.others(p).unwrap_or_default();
         held::overlaps_of(&p.ticket, p.held.as_ref(), &others)
     }
 
@@ -2328,7 +2382,7 @@ impl OnDemand<'_> {
         ticket: &TicketId,
         sink: &mut EventSink<'_>,
     ) -> Result<Delivered, Stop> {
-        let p = self.prepare(ticket, Command::Continue)?;
+        let p = self.prepare(ticket, Command::Continue, sink)?;
         // A cancel still standing is withdrawn (OWL-474).
         self.withdraw_cancel(ticket, sink);
         self.drop_carry(ticket, sink);
@@ -2404,7 +2458,7 @@ impl OnDemand<'_> {
         decision: Data,
         sink: &mut EventSink<'_>,
     ) -> Option<Result<Delivered, Stop>> {
-        let mut p = match self.prepare(ticket, Command::Continue) {
+        let mut p = match self.prepare(ticket, Command::Continue, sink) {
             Ok(p) => p,
             Err(stop) => return Some(Err(stop)),
         };
@@ -2580,7 +2634,12 @@ impl OnDemand<'_> {
     /// lock is held for two short sections only: the look at the quarantine,
     /// then the fetch with the reads that follow it, the ticket read on the
     /// tracker between them.
-    fn prepare(&self, ticket: &TicketId, command: Command) -> Result<Prepared, Stop> {
+    fn prepare(
+        &self,
+        ticket: &TicketId,
+        command: Command,
+        sink: &mut EventSink<'_>,
+    ) -> Result<Prepared, Stop> {
         check_team(self.config, ticket).map_err(Stop::Refused)?;
         // An old git is refused before any side effect: the lock creates the
         // project's folder, and the ticket is read from the tracker (OWL-207).
@@ -2680,8 +2739,9 @@ impl OnDemand<'_> {
             .ticket(ticket)
             .map_err(|e| refused(&format!("reading {ticket}"), e))?;
         // The fetch, the ticket ref, the kept worktree's link and the run
-        // file in the project's second section, let go when this returns.
-        let _section = self.section()?;
+        // file in the project's second section, let go before the claim's
+        // take, which reaches the network (OWL-586).
+        let section = self.section()?;
         // `do` needs a decider: refused before anything is cloned when the
         // ticket alone says it has none and no ticket ref can add the zones
         // of an intake record: an intake run counts none, and without a
@@ -2752,8 +2812,9 @@ impl OnDemand<'_> {
         ) {
             return Err(self.run_fault(ticket, fault));
         }
+        drop(section);
         let labels = route_labels(found.labels.iter().map(String::as_str));
-        Ok(Prepared {
+        let prepared = Prepared {
             _ticket_lock: ticket_lock,
             ticket: ticket.clone(),
             found,
@@ -2805,7 +2866,204 @@ impl OnDemand<'_> {
             typed: None,
             integrated: false,
             slot_held_by: None,
-        })
+        };
+        // The claim (OWL-586), outside every section, before anything is
+        // written: the drain's commands take it after their gesture's checks.
+        if command.claims_in_prepare() {
+            self.take_claim(&prepared, sink)?;
+        }
+        Ok(prepared)
+    }
+
+    /// The drain's take of the claim, once its checks passed (OWL-586): the
+    /// one place an intake's or a dispatch's command takes it, so a ticket
+    /// another person admitted, or one that left the column, is never
+    /// claimed.
+    fn claim_after_checks(&self, p: &Prepared, sink: &mut EventSink<'_>) -> Result<(), Stop> {
+        self.take_claim(p, sink)
+    }
+
+    /// Takes the claim of `p`'s ticket on the git remote under
+    /// `policy.claims = "remote"`, read at the base the command fetched
+    /// (OWL-586; build plan "Claims", "Who holds it works the ticket"):
+    /// goes on when it is this runner's, takes it when the ticket has none,
+    /// and refuses when it is another's, nothing written. A ticket whose
+    /// claim this runner lost is refused whatever the switch, until
+    /// `owlshift forget`.
+    fn take_claim(&self, p: &Prepared, sink: &mut EventSink<'_>) -> Result<(), Stop> {
+        let ticket = &p.ticket;
+        if claims::lost(self.dirs, ticket).is_some() {
+            return Err(lost_refusal(ticket));
+        }
+        let git = &self.executor.git;
+        let file = project::project_file_at(git, &p.checkout, &p.base).map_err(Stop::Refused)?;
+        if file
+            .as_ref()
+            .map_or(Claims::Local, |file| file.policy.claims())
+            == Claims::Local
+        {
+            return Ok(());
+        }
+        let identity = (self.claimant)().map_err(|why| {
+            Stop::Refused(format!(
+                "this project claims its tickets on the git remote (`policy.claims = \"remote\"` \
+                 at {}), and a claim names this machine's operator, who cannot be read: {why}",
+                p.base.remote_ref
+            ))
+        })?;
+        let operator = file
+            .as_ref()
+            .and_then(|file| file.handle_of(&identity.account))
+            .unwrap_or(&identity.account)
+            .to_owned();
+        // The branch refuses a new take only when this runner never pushed
+        // it: its ticket ref keeps no delivery.
+        let pushed = p
+            .stored
+            .as_ref()
+            .is_some_and(|stored| stored.record.delivery.is_some());
+        let branch = (!pushed).then_some(p.branch.as_str());
+        let at = ClaimsAt {
+            git,
+            dirs: self.dirs,
+        };
+        let held = held::claim_held(p.stored.as_ref());
+        let took = claims::take(
+            at,
+            ticket,
+            &identity.runner,
+            &operator,
+            held,
+            (self.clock)(),
+            branch,
+        );
+        match took {
+            Ok(Took::Own) => Ok(()),
+            Ok(Took::Taken { ref commit } | Took::Adopted { ref commit }) => {
+                let what = if matches!(took, Ok(Took::Taken { .. })) {
+                    "taken"
+                } else {
+                    "adopted"
+                };
+                sink.emit(
+                    ticket,
+                    None,
+                    EventKind::Decision,
+                    data([
+                        ("claim", json!(what)),
+                        ("runner", json!(identity.runner.as_str())),
+                        ("operator", json!(operator)),
+                        ("commit", json!(commit)),
+                    ]),
+                );
+                Ok(())
+            }
+            Err(NotTaken::Claimed(holder)) => Err(Stop::Claimed {
+                ticket: ticket.clone(),
+                holder: holder.map(Box::new),
+            }),
+            Err(NotTaken::Lost(holder)) => {
+                self.claim_lost(ticket, holder, sink);
+                Err(lost_refusal(ticket))
+            }
+            Err(NotTaken::Branch { branch }) => {
+                let found = Branch::new(&branch)
+                    .ok()
+                    .zip(Branch::new(&p.base.branch).ok())
+                    .and_then(|(head, base)| self.forge.find_open_pull_request(&head, &base).ok())
+                    .flatten();
+                let pull = found.map_or(String::new(), |pr| {
+                    format!(", with its pull request #{} open", pr.number)
+                });
+                Err(Stop::Refused(format!(
+                    "the branch {branch} is on origin{pull}, and this runner never pushed it: \
+                     what an earlier runner left is a person's to close, so close its pull \
+                     request and delete the branch, or finish it by hand, before a runner takes \
+                     {ticket}"
+                )))
+            }
+            Err(NotTaken::Unreachable(why)) => Err(Stop::Refused(format!(
+                "the claim of {ticket} could not be read or pushed on origin ({why}): nothing \
+                 ran, and the next command or pass tries again"
+            ))),
+            Err(NotTaken::Busy) => Err(Stop::TicketBusy(ticket.clone())),
+        }
+    }
+
+    /// Records that this runner lost the claim of `ticket`, held now by
+    /// `holder` (OWL-586; build plan "Claims", "Lost"): the `claim_lost`
+    /// warning, and the operator told, once, when the record is first
+    /// written; a step under way of the ticket stops on finding it.
+    pub(crate) fn claim_lost(
+        &self,
+        ticket: &TicketId,
+        holder: Option<ClaimHolder>,
+        sink: &mut EventSink<'_>,
+    ) {
+        let mut event = data([("what", json!("claim_lost"))]);
+        if let Some(holder) = &holder {
+            event.insert("operator".to_owned(), json!(holder.operator));
+            event.insert("runner".to_owned(), json!(holder.runner));
+        }
+        let line = match &holder {
+            Some(holder) => format!(
+                "{ticket}: its claim on origin is now {}'s runner {}: this runner writes nothing \
+                 more on it; `owlshift forget {ticket}` starts it over here",
+                holder.operator, holder.runner
+            ),
+            None => format!(
+                "{ticket}: its claim is gone from origin: this runner writes nothing more on it; \
+                 `owlshift forget {ticket}` starts it over here"
+            ),
+        };
+        match claims::record_lost(self.dirs, ticket, holder, (self.clock)()) {
+            Ok(false) => {}
+            Ok(true) => {
+                sink.emit(ticket, None, EventKind::Warning, event);
+                if let Some(notifier) = self.notifier {
+                    let _ = notifier.notify(&line);
+                }
+            }
+            Err(error) => {
+                event.insert("unkept".to_owned(), json!(error.to_string()));
+                sink.emit(ticket, None, EventKind::Warning, event);
+                if let Some(notifier) = self.notifier {
+                    let _ = notifier.notify(&line);
+                }
+            }
+        }
+    }
+
+    /// Pushes what `p`'s ticket holds to its claim, after the section that
+    /// changed it (OWL-586; build plan "Claims", "Its held set"), when the
+    /// ticket has a claim of this runner's: a failure is a warning, the
+    /// Build staying admitted, and the next renewal pushes it again.
+    fn push_claim_held(&self, p: &Prepared, sink: &mut EventSink<'_>) {
+        if claims::read_record(self.dirs, &p.ticket).is_none() {
+            return;
+        }
+        let at = ClaimsAt {
+            git: &self.executor.git,
+            dirs: self.dirs,
+        };
+        let held = held::claim_held(p.stored.as_ref());
+        if let Err(why) = claims::update_held(at, &p.ticket, held, (self.clock)()) {
+            sink.emit(
+                &p.ticket,
+                None,
+                EventKind::Warning,
+                data([("what", json!("claim_held")), ("reason", json!(why))]),
+            );
+        }
+    }
+
+    /// The project's other ticket refs, read in the section the caller
+    /// holds ([`ticket_ref::others`]), without those whose claim this runner
+    /// lost (OWL-586): every count of an admission, a delivery's check or a
+    /// refresh reads them here.
+    fn others(&self, p: &Prepared) -> Result<Vec<RefRead>, String> {
+        ticket_ref::others(&self.executor.git, &p.checkout, &p.ticket)
+            .map(|refs| claims::drop_lost(self.dirs, refs))
     }
 
     /// `owlshift continue` on a ticket at Watch whose pull request is
@@ -3284,6 +3542,8 @@ impl OnDemand<'_> {
         // check and any rebase run it starts, whose widening it then
         // covers: a Build held for its base keeps what it was admitted.
         self.admit_build(p, &state, sink)?;
+        // What it admitted, to its claim, out of the section (OWL-586).
+        self.push_claim_held(p, sink);
         let confirmation = self.config.pipeline.findings();
         let mut gathered = Gathered::default();
         // The delivery's notes and follow-ups gathered so far, kept with the
@@ -3673,7 +3933,8 @@ impl OnDemand<'_> {
             }
         };
         let _section = self.section()?;
-        let others = ticket_ref::others(&self.executor.git, &p.checkout, &p.ticket)
+        let others = self
+            .others(p)
             .map_err(|e| refused("reading the project's ticket refs before the delivery", e))?;
         let none = NamedResources::default();
         let named = rules.resources().unwrap_or(&none);
@@ -5296,7 +5557,7 @@ impl OnDemand<'_> {
         now: Timestamp,
     ) -> Result<held::Recorded, String> {
         let named = self.config.stack.named_resources().unwrap_or_default();
-        let others = ticket_ref::others(&self.executor.git, &p.checkout, &p.ticket)?;
+        let others = self.others(p)?;
         let in_flight: Vec<InFlight<String>> = others
             .iter()
             .filter_map(|(ticket, read)| match read {
@@ -5720,6 +5981,10 @@ impl OnDemand<'_> {
                 // what its branch widened.
                 self.keep_cost(p, &run, sink);
                 drop(section);
+                // What the branch widened, to its claim (OWL-586).
+                if widened.is_some() {
+                    self.push_claim_held(p, sink);
+                }
                 report
             }
             Err(error) => {
@@ -6049,7 +6314,9 @@ impl OnDemand<'_> {
         outcome: &Result<Delivered, Stop>,
         sink: &mut EventSink<'_>,
     ) {
-        if !p.repairing {
+        // A ticket whose claim was lost meanwhile is another runner's: its
+        // stage is theirs (OWL-586).
+        if !p.repairing || claims::lost(self.dirs, &p.ticket).is_some() {
             return;
         }
         let moved_itself = match outcome {
@@ -6060,6 +6327,7 @@ impl OnDemand<'_> {
                 Stop::Busy(_)
                 | Stop::TicketBusy(_)
                 | Stop::Refused(_)
+                | Stop::Claimed { .. }
                 | Stop::Waits { .. }
                 | Stop::Unverified { .. }
                 | Stop::Waiting { .. }
@@ -6740,7 +7008,7 @@ impl OnDemand<'_> {
         following: &mut Following,
         sink: &mut EventSink<'_>,
     ) -> Option<Result<Delivered, Stop>> {
-        let mut p = match self.prepare_at_watch(ticket, seen, Command::Fix)? {
+        let mut p = match self.prepare_at_watch(ticket, seen, Command::Fix, sink)? {
             Ok(p) => p,
             Err(stop) => return Some(Err(stop)),
         };
@@ -6759,8 +7027,9 @@ impl OnDemand<'_> {
         ticket: &TicketId,
         seen: &str,
         command: Command,
+        sink: &mut EventSink<'_>,
     ) -> Option<Result<Prepared, Stop>> {
-        let p = match self.prepare(ticket, command) {
+        let p = match self.prepare(ticket, command, sink) {
             Ok(p) => p,
             Err(stop) if stop.is_busy() => return None,
             Err(stop) => return Some(Err(stop)),

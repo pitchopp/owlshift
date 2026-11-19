@@ -70,8 +70,17 @@ pub const RESULT_FORMAT: u32 = 15;
 /// the log is append-only, so [`Event::parse`](crate::event::Event::parse)
 /// still reads the format-1 lines already written.
 pub const EVENT_FORMAT: u32 = 2;
-/// The format version of a claim (`claim.json` on a claim ref).
-pub const CLAIM_FORMAT: u32 = 1;
+/// The format version of a claim (`claim.json` on a claim ref). Format 2
+/// (OWL-586) names the runner by its identifier, keeps when it was claimed
+/// and what the ticket holds; format 1, P0's, was never written and is not
+/// read.
+pub const CLAIM_FORMAT: u32 = 2;
+/// The format version of the record of a ticket's claim this runner last
+/// pushed (`claimed.json` in a ticket's folder, OWL-586).
+pub const CLAIMED_FORMAT: u32 = 1;
+/// The format version of the record of a ticket whose claim this runner
+/// lost (`claim_lost.json` in a ticket's folder, OWL-586).
+pub const CLAIM_LOST_FORMAT: u32 = 1;
 /// The format version of a ticket's state (`state.json` on a ticket ref).
 /// Format 3 adds the fix passes and repairs at Watch (OWL-55); format 4 the
 /// review passes of the current stage (OWL-300); formats 2 and 3 are still

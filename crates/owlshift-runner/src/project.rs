@@ -624,7 +624,7 @@ pub(crate) fn held_alone(path: &Path) -> io::Result<bool> {
 }
 
 /// The folders in `dir`, by name; none when `dir` is not there.
-fn subdirectories(dir: &Path) -> io::Result<Vec<PathBuf>> {
+pub(crate) fn subdirectories(dir: &Path) -> io::Result<Vec<PathBuf>> {
     let entries = match fs::read_dir(dir) {
         Ok(entries) => entries,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),

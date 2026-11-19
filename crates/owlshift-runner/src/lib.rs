@@ -11,6 +11,7 @@ pub mod artifact;
 pub mod base;
 pub mod cache_offer;
 pub mod cancel;
+pub mod claims;
 pub mod codex_machine;
 pub mod config;
 pub mod controls;

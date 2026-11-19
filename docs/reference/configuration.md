@@ -378,6 +378,14 @@ Whether two Owlshift tickets may build on the same file at once: "exclusive" (th
 # overlap = "exclusive"
 ```
 
+#### `policy.claims`
+
+Where a ticket is claimed, so that one runner alone works it: "local" (the ticket locks of each machine alone; nothing is pushed) or "remote" (a claim ref on origin, for a team's runners or one person's two machines; the default branch's file decides it). Under "remote", a command whose operator cannot be read, the tracker key's account or, on the Markdown tracker, `identity.tracker`, is refused: a claim names its operator. Set back to "local", the claims on origin expire, a person's to release. Default: `"local"`.
+
+```toml
+# claims = "local"
+```
+
 #### `policy.resolver_delegation`
 
 What the resolver decides without the decider: "none", "facts", "discoverable", "ticket" (also scope questions the ticket's text answers) or "all" (everything but the floor). Default: `"discoverable"`.

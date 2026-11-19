@@ -95,7 +95,7 @@ impl OnDemand<'_> {
         seen: Option<&str>,
         sink: &mut EventSink<'_>,
     ) -> Option<Taken<TicketIntake>> {
-        let mut p = match self.prepare(ticket, Command::Intake) {
+        let mut p = match self.prepare(ticket, Command::Intake, sink) {
             Ok(p) => p,
             Err(stop) => return Some(Taken::Ran(Err(stop))),
         };
@@ -107,6 +107,10 @@ impl OnDemand<'_> {
             Some(Err(taken)) => return Some(taken),
             None => return None,
         };
+        // The claim, once the ticket is this runner's to take (OWL-586).
+        if let Err(stop) = self.claim_after_checks(&p, sink) {
+            return Some(Taken::Ran(Err(stop)));
+        }
         sink.emit(
             ticket,
             None,
@@ -136,7 +140,7 @@ impl OnDemand<'_> {
         outside: Option<Outside>,
         sink: &mut EventSink<'_>,
     ) -> Option<DispatchSeen> {
-        let mut p = match self.prepare(ticket, Command::Drain) {
+        let mut p = match self.prepare(ticket, Command::Drain, sink) {
             Ok(p) => p,
             Err(stop) => return Some(DispatchSeen::Taken(Taken::Ran(Err(stop)))),
         };
@@ -151,6 +155,12 @@ impl OnDemand<'_> {
             Some(Ok(_)) => {}
             Some(Err(taken)) => return Some(DispatchSeen::Taken(taken)),
             None => return None,
+        }
+        // The claim, once the ticket is this runner's to take (OWL-586):
+        // its intake took it already, and a ticket from before claims takes
+        // it now.
+        if let Err(stop) = self.claim_after_checks(&p, sink) {
+            return Some(DispatchSeen::Taken(Taken::Ran(Err(stop))));
         }
         // The dispatch runs the ticket's first stage step (OWL-367): watch
         // resumes it at a later pass. Its admission checks the cap, the
