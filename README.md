@@ -65,6 +65,8 @@ Then follow the page of the tracker your tickets live in. Each takes you from `o
 
 Questions before you install, on cost, subscription terms, merging, the sandbox or privacy: the [FAQ](docs/faq.md).
 
+Once the first pull request is open, [Configuration recipes](docs/recipes.md) set Owlshift up for your stack and your team.
+
 The commands, in the order the pages use them:
 
 - `owlshift init`: write a commented `owlshift.toml` for the repository, with a gate guessed from its stack, sign in to GitHub, and keep the secrets in the system keychain.

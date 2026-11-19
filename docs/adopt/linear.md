@@ -161,6 +161,7 @@ Whatever they say, a question on security or on an irreversible action always re
 
 ## Next
 
+- [Configuration recipes](../recipes.md) set Owlshift up for your stack and your team: the gate, Codex, tickets that touch the same area, labels, plan approval, merge on green and caps.
 - Follow-ups Owlshift proposes arrive in the team's Triage. Accept one by giving it an assignee and the `agent` label, or decline it.
 - [SECURITY.md](../../SECURITY.md) says what the confinement of agent runs protects and what it does not.
 - `owlshift stop --at-login` removes the service installed at login; `owlshift uninstall` removes everything Owlshift installed on this machine, the keychain entries `init` stored included. Neither touches a repository, a ticket or a branch.
