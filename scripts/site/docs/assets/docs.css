@@ -1,0 +1,298 @@
+/* The documentation's pages (OWL-607): visual identity section 6, "The
+   public site's layout", "The documentation's pages". Loaded after site.css,
+   whose theme roles, typefaces, bar and foot it keeps. Only classes, and
+   nothing loaded from here: the pages are served under a path prefix and the
+   policy refuses style attributes. Sizes come from section 5's scale only. */
+
+/* Two columns inside the content's width: the pages' list, 240 px, and the
+   text, at most 760 px; from 1200 px a third lists the page's sections. */
+.docs {
+  display: grid;
+  grid-template-columns: 240px minmax(0, 760px);
+  gap: 40px;
+  align-items: start;
+  padding-top: 40px;
+  padding-bottom: 72px;
+}
+
+.docs-toc {
+  display: none;
+}
+
+@media (min-width: 1200px) {
+  .docs {
+    grid-template-columns: 240px minmax(0, 1fr) 200px;
+  }
+
+  .docs-toc {
+    display: block;
+  }
+}
+
+/* The search box: an input with the strong border, 44 px tall. */
+.search-label {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
+}
+
+.search-box {
+  width: 100%;
+  min-height: 44px;
+  padding: 8px 12px;
+  border: 1px solid var(--border-strong);
+  border-radius: 8px;
+  background: var(--surface);
+  color: var(--text);
+  font: inherit;
+  font-size: 16px;
+}
+
+.search-status {
+  margin-top: 8px;
+  color: var(--text-muted);
+  font-size: 13px;
+}
+
+.search-status:empty {
+  display: none;
+}
+
+.search-results {
+  margin: 8px 0 0;
+  padding: 0;
+  list-style: none;
+}
+
+.search-results li {
+  padding: 8px 0;
+  border-bottom: 1px solid var(--border-hairline);
+}
+
+.search-results a {
+  display: block;
+  font-size: 14px;
+  font-weight: 600;
+}
+
+.search-page {
+  display: block;
+  color: var(--text-muted);
+  font-size: 12px;
+}
+
+/* The pages' list: a group's name at 12 px, weight 600, muted; its pages at
+   14 px, secondary; the current one on the raised colour, in the text's. */
+.pages-group {
+  margin: 24px 0 4px;
+  color: var(--text-muted);
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.pages-list {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.pages-list a {
+  display: block;
+  padding: 6px 12px;
+  border-radius: 8px;
+  color: var(--text-secondary);
+  font-size: 14px;
+  text-decoration: none;
+}
+
+.pages-list a:hover {
+  color: var(--text);
+}
+
+.pages-list a[aria-current=page] {
+  background: var(--raised);
+  color: var(--text);
+}
+
+/* Below 900 px the list sits behind a disclosure that opens without a
+   script; above, it is always shown. */
+.pages-narrow {
+  display: none;
+  margin-top: 12px;
+}
+
+.pages-narrow summary {
+  display: flex;
+  align-items: center;
+  min-height: 44px;
+  padding: 8px 12px;
+  border: 1px solid var(--border-strong);
+  border-radius: 8px;
+  color: var(--text);
+  font-weight: 600;
+  cursor: pointer;
+}
+
+/* The text: section 5's scale. */
+.docs-text {
+  min-width: 0;
+  overflow-wrap: break-word;
+}
+
+.docs-text h1 {
+  margin-bottom: 20px;
+  font-size: 32px;
+  letter-spacing: -0.01em;
+}
+
+.docs-text h2 {
+  margin: 40px 0 12px;
+  font-size: 24px;
+}
+
+.docs-text h3 {
+  margin: 28px 0 8px;
+  font-size: 20px;
+}
+
+.docs-text h4,
+.docs-text h5,
+.docs-text h6 {
+  margin: 20px 0 8px;
+  font-size: 16px;
+  font-weight: 600;
+}
+
+.docs-text p,
+.docs-text ul,
+.docs-text ol,
+.docs-text pre,
+.docs-text blockquote,
+.docs-text .table {
+  margin: 0 0 16px;
+}
+
+.docs-text ul,
+.docs-text ol {
+  padding-left: 24px;
+}
+
+.docs-text li + li {
+  margin-top: 4px;
+}
+
+.docs-text li > p,
+.docs-text li > ul,
+.docs-text li > ol {
+  margin-bottom: 8px;
+}
+
+.docs-text code {
+  font-size: 14px;
+  overflow-wrap: anywhere;
+}
+
+/* A code block: 13 px on the raised colour; long lines wrap, as the Install
+   part's do. */
+.docs-text pre {
+  padding: 12px 16px;
+  border-radius: 8px;
+  background: var(--raised);
+  font-size: 13px;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.docs-text pre code {
+  padding: 0;
+  background: none;
+  font-size: 13px;
+}
+
+.docs-text blockquote {
+  padding-left: 16px;
+  border-left: 1px solid var(--border-hairline);
+  color: var(--text-secondary);
+}
+
+.docs-text hr {
+  margin: 32px 0;
+  border: 0;
+  border-top: 1px solid var(--border-hairline);
+}
+
+/* A table: hairline borders, 14 px; one wider than the text scrolls inside
+   its own box, never the page. */
+.docs-text .table {
+  max-width: 100%;
+  overflow-x: auto;
+}
+
+.docs-text table {
+  border-collapse: collapse;
+  font-size: 14px;
+}
+
+.docs-text th,
+.docs-text td {
+  padding: 8px 12px;
+  border: 1px solid var(--border-hairline);
+  text-align: left;
+  vertical-align: top;
+}
+
+.docs-text th {
+  background: var(--raised);
+}
+
+.docs-text td code,
+.docs-text th code {
+  font-size: 13px;
+}
+
+/* The page's sections. */
+.toc-title {
+  margin-bottom: 8px;
+  color: var(--text-muted);
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.docs-toc ul {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.docs-toc a {
+  display: block;
+  padding: 4px 0;
+  color: var(--text-secondary);
+  font-size: 13px;
+  text-decoration: none;
+}
+
+.docs-toc a:hover {
+  color: var(--text);
+}
+
+/* Below 900 px: one column, the list behind its disclosure above the text. */
+@media (max-width: 899.98px) {
+  .docs {
+    grid-template-columns: minmax(0, 1fr);
+    gap: 24px;
+    padding-top: 24px;
+    padding-bottom: 48px;
+  }
+
+  .pages-wide {
+    display: none;
+  }
+
+  .pages-narrow {
+    display: block;
+  }
+}

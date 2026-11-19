@@ -811,6 +811,8 @@ One repository, a Cargo workspace of six shipped crates split along the design's
 
 Beside the crates: `roles/` (default role prompts in Markdown, versioned with the contract), `schemas/` (generated JSON Schemas), `tests/scenarios/` (S1 to S17 with their fixtures, played by the testkit; those that need `owlshift watch`, P3's S9 and P4's S3, S4, S6, S12 and S13, are played in `owlshift-testkit/tests/on_demand.rs` instead: "P4 · The drain", part K), `docs/`.
 
+One more member of the workspace sits outside `crates/`: `scripts/site/docs/`, the package `owlshift-site-docs`, which renders the documentation into the public site (OWL-607, "The public site", "The documentation"). It is `publish = false` and ships nothing: `scripts/site/build.sh` runs its program, and `owlshift-cli` takes its library as a dev-dependency for the page's test. It depends on `pulldown-cmark` and `serde_json`.
+
 **Git through the `git` CLI**, not a library: worktrees, pushes and credential helpers then behave exactly as in the user's own terminal. **Harnesses through their own CLI**, never through a model API: the user's subscription login is what runs. Library choices (async runtime, HTTP client, SQLite binding, CLI parser, keychain access) are made at implementation time against current documentation. Made so far: the HTTP client and keychain access (OWL-13, see C4 in the results).
 
 **Repository hygiene from the first commit:** Apache-2.0 licence, English, a contribution guide, and a CI matrix on macOS, Linux and Windows.

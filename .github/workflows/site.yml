@@ -15,6 +15,15 @@ name: Site
 # is left out. Every action is pinned to its full commit, resolved on
 # 2026-11-19. Approved by the maintainer on OWL-578 on 2026-11-19, as the
 # CI-settings floor of architecture section 8 requires.
+#
+# OWL-607: the site serves the documentation too, rendered by build.sh with
+# the renderer of scripts/site/docs (build plan, "The public site", "The
+# documentation", "Served with the page"). The paths gain the served
+# Markdown files exactly, so a change to the documentation merged into main
+# is deployed without a hand and a change to docs/design/ is not; the build
+# job installs the toolchain pinned in rust-toolchain.toml first, as ci.yml
+# does. A change to Cargo.lock alone deploys nothing: the renderer's test
+# runs with the workspace's in ci.yml.
 
 on:
   pull_request:
@@ -23,6 +32,9 @@ on:
       - 'scripts/site/**'
       - 'assets/brand/**'
       - 'crates/owlshift-runner/src/ui/assets/fonts/**'
+      - 'docs/*.md'
+      - 'docs/adopt/*.md'
+      - 'docs/reference/*.md'
       - '.github/workflows/site.yml'
   push:
     branches: [main]
@@ -31,6 +43,9 @@ on:
       - 'scripts/site/**'
       - 'assets/brand/**'
       - 'crates/owlshift-runner/src/ui/assets/fonts/**'
+      - 'docs/*.md'
+      - 'docs/adopt/*.md'
+      - 'docs/reference/*.md'
       - '.github/workflows/site.yml'
   workflow_dispatch:
 
@@ -54,6 +69,10 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+      # The runner images ship rustup; it installs the toolchain pinned in
+      # rust-toolchain.toml, which build.sh's renderer is built with.
+      - name: Install the pinned toolchain
+        run: rustup toolchain install
       - name: Write the site
         run: scripts/site/build.sh _site
       - if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
