@@ -64,7 +64,7 @@ needs_input = "agent:needs-input"
 review = "agent:review"
 ```
 
-Read `owlshift.toml`: it lists every setting, each with a comment above it that says what it decides, its values and its default; a setting commented out with its default value changes nothing once uncommented. Check the gate under `[stack]`, which every agent's work must pass, and `admitters` under `[tracker]`: add the numeric ids of the other people whose label should admit an issue (`gh api users/<login> --jq .id` prints one). Then commit the file and push it to your default branch: the background service reads the project file of the default branch, and each run the file of the commit its branch starts from.
+Read `owlshift.toml`: it lists every setting, each with a comment above it that says what it decides, its values and its default; a setting commented out with its default value changes nothing once uncommented. The [configuration reference](../reference/configuration.md) lists the same settings, and those of your personal file. Check the gate under `[stack]`, which every agent's work must pass, and `admitters` under `[tracker]`: add the numeric ids of the other people whose label should admit an issue (`gh api users/<login> --jq .id` prints one). Then commit the file and push it to your default branch: the background service reads the project file of the default branch, and each run the file of the commit its branch starts from.
 
 ## 3. Check the machine and the project: `owlshift doctor`
 

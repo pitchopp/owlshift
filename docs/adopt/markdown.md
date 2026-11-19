@@ -39,7 +39,7 @@ Next: `owlshift doctor` checks git, the harnesses and the Claude Code token for 
 Nothing detected was run: `owlshift gate` runs the gate to check it.
 ```
 
-Read `owlshift.toml`: it lists every setting, each with a comment above it that says what it decides, its values and its default; a setting commented out with its default value changes nothing once uncommented. Check the gate under `[stack]`: it is what every agent's work must pass. Then commit the file and push it to your default branch. Each run reads the project file of the commit its branch starts from, and until the default branch holds one, your local file is used.
+Read `owlshift.toml`: it lists every setting, each with a comment above it that says what it decides, its values and its default; a setting commented out with its default value changes nothing once uncommented. The [configuration reference](../reference/configuration.md) lists the same settings, and those of your personal file. Check the gate under `[stack]`: it is what every agent's work must pass. Then commit the file and push it to your default branch. Each run reads the project file of the commit its branch starts from, and until the default branch holds one, your local file is used.
 
 ## 2. Check the machine and the project: `owlshift doctor`
 

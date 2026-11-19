@@ -82,6 +82,7 @@ requires = \">={}.{}\"
 # `owlshift continue TICKET` in a checkout. Owlshift commits none of its
 # files, and the daemon does not serve it, so `owlshift start` refuses such
 # a project. Its format: {MARKDOWN_PAGE}
+
 "
         ));
     }
@@ -922,6 +923,9 @@ fn store_pair(
 }
 
 #[cfg(test)]
+mod reference;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::tracker::LINEAR_SECRETS;
@@ -1135,14 +1139,14 @@ mod tests {
         assert!(error.contains("--team"), "{error}");
     }
 
-    const TRACKERS: [TrackerKind; 3] = [
+    pub(super) const TRACKERS: [TrackerKind; 3] = [
         TrackerKind::Linear,
         TrackerKind::Github,
         TrackerKind::Markdown,
     ];
 
     /// The project file `init` writes for `kind`, with a gate.
-    fn written(kind: TrackerKind) -> String {
+    pub(super) fn written(kind: TrackerKind) -> String {
         let team = (kind == TrackerKind::Linear).then_some("OWL");
         project_file(&options(kind, team, &["make test"])).unwrap()
     }
@@ -1164,12 +1168,13 @@ mod tests {
         key.len() >= of.len() && of.iter().zip(&key).all(|(o, k)| *o == "*" || o == k)
     }
 
-    /// The leaf keys of the project file's JSON schema, dotted, `*` for a
-    /// key a person names (`zones.*.owner`).
-    fn schema_keys() -> Vec<String> {
+    /// The leaf keys of the JSON schema `stem` (`project-config`,
+    /// `personal-config`), dotted, `*` for a key a person names
+    /// (`zones.*.owner`).
+    pub(super) fn schema_keys(stem: &str) -> Vec<String> {
         let (_, schema) = owlshift_contracts::schema::all()
             .into_iter()
-            .find(|(stem, _)| *stem == "project-config")
+            .find(|(name, _)| *name == stem)
             .unwrap();
         let root = schema.as_value();
         let mut keys = Vec::new();
@@ -1232,7 +1237,7 @@ mod tests {
 
     /// The leaves of a parsed TOML table, dotted under `prefix`; an empty
     /// table is a leaf.
-    fn toml_leaves(table: &toml::Table, prefix: &str, out: &mut Vec<String>) {
+    pub(super) fn toml_leaves(table: &toml::Table, prefix: &str, out: &mut Vec<String>) {
         for (key, value) in table {
             let path = if prefix.is_empty() {
                 key.clone()
@@ -1250,7 +1255,7 @@ mod tests {
     /// `Some((true, table))` for a table header, `Some((false, keys))` for
     /// a key line (`key = [` opening an array counting as `key = []`),
     /// `None` for prose and the rest.
-    fn toml_line(line: &str) -> Option<(bool, toml::Table)> {
+    pub(super) fn toml_line(line: &str) -> Option<(bool, toml::Table)> {
         let bare = line.strip_prefix("# ").unwrap_or(line);
         let bare = match bare.strip_suffix(" = [") {
             Some(key) => format!("{key} = []"),
@@ -1262,7 +1267,7 @@ mod tests {
 
     /// The keys `text` names, set or commented out, dotted under their
     /// table.
-    fn file_keys(text: &str) -> Vec<String> {
+    pub(super) fn file_keys(text: &str) -> Vec<String> {
         let mut table = String::new();
         let mut keys = Vec::new();
         for line in text.lines() {
@@ -1287,7 +1292,7 @@ mod tests {
     /// schema fails here until the file documents it.
     #[test]
     fn every_key_that_applies_is_in_the_file() {
-        let schema = schema_keys();
+        let schema = schema_keys("project-config");
         for key in ["policy.max_in_flight", "forge.merge", "people.*.forge"] {
             assert!(schema.iter().any(|k| k == key), "{key}: {schema:?}");
         }
