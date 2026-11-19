@@ -74,7 +74,10 @@ Usage: bash $PROGRAM OWNER/REPO [ISSUE]
 OWL581_CHECKS="T1 T2 T3" (the default) runs those checks, in that order;
               any of T1 to T6.
 OWL581_READONLY_REPO  T4's public repository where the machine account has
-              read access alone (default $READONLY_DEFAULT).
+              read access alone (default $READONLY_DEFAULT); check by hand
+              that owl-shift's installation covers it (Settings >
+              Applications > Installed GitHub Apps > owl-shift > Configure),
+              which no token the script holds can read.
 OWL581_LINEAR_KEY_B   member B's Linear key; typed, not echoed, when unset.
               Prefer typing it: a variable stays in the process's environment
               and, set on the command line, in the shell's history.
@@ -823,9 +826,10 @@ machine_identity() {
         mrest "minst-$id" "user/installations/$id/repositories?per_page=100" >/dev/null
         jq -r '.repositories[]?.full_name | ascii_downcase' <"$WORK/minst-$id.body" >>"$WORK/m-repos" 2>/dev/null
     done
+    # A user token lists only the installation's repositories its account is a collaborator of (2026-11-19: the
+    # read-only repository, covered by the installation, was not listed), so this reads the sandbox's coverage alone.
     M_COVERS=$(grep -qx "$(printf '%s' "$REPO" | tr '[:upper:]' '[:lower:]')" "$WORK/m-repos" && echo yes || echo no)
-    M_COVERS_RO=$(grep -qx "$(printf '%s' "$READONLY" | tr '[:upper:]' '[:lower:]')" "$WORK/m-repos" && echo yes || echo no)
-    report "machine: the app's installations the token reaches: $(jq '.installations | length' <"$WORK/minst.body" 2>/dev/null); they cover the sandbox: $M_COVERS, the read-only repository: $M_COVERS_RO"
+    report "machine: the app's installations the token reaches: $(jq '.installations | length' <"$WORK/minst.body" 2>/dev/null); they cover the sandbox: $M_COVERS"
     if [ "$perm" != write ] || [ "$role" != write ]; then
         fail "machine: FAILED: the machine account must be a write collaborator, no admin, on the sandbox; T4 and T5 not run"
         return 1
@@ -907,9 +911,12 @@ t4() {
     report "T4 the ref on that repository afterwards: $([ -n "$(remote_oid "$RO_SSH" "$ro")" ] && echo present || echo absent)"
     if [ "$st" = 0 ] || [ -n "$(remote_oid "$RO_SSH" "$ro")" ]; then
         fail "T4 read access: FAILED: the push was accepted"
-    elif [ "$M_COVERS_RO" != yes ]; then
-        fail "T4 read access: INCONCLUSIVE: the app's installation does not cover that repository, so the app may be what refused"
+    elif ! grep -q 'denied to <machine>' <<<"$(push_reason)"; then
+        fail "T4 read access: INCONCLUSIVE: the refusal does not name the machine account's permission"
     fi
+    # Neither the user token nor gh can read the installation's repositories (GET repos/R/installation needs the
+    # app's JWT: HTTP 401 with gh on 2026-11-19), so its coverage of the read-only repository is read by hand.
+    report "T4 to read by hand: whether owl-shift's installation covers that repository (Settings > Applications > Installed GitHub Apps > owl-shift > Configure > Repository access); when it does, the refusal is the account's read access and not the app's"
 }
 
 # ---------------------------------------------------------------------------------------------------------------- T5
@@ -1305,7 +1312,6 @@ M_LOGIN=
 GH_LOGIN=
 M_OK=
 M_COVERS=
-M_COVERS_RO=
 L_A=
 L_B=
 A_ID=
