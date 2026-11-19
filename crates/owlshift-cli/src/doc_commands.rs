@@ -127,7 +127,7 @@ fn is_assignment(word: &str) -> bool {
 }
 
 /// The `owlshift` commands a Markdown text names, each with its line number.
-fn commands(text: &str) -> Vec<(usize, Vec<String>)> {
+pub(super) fn commands(text: &str) -> Vec<(usize, Vec<String>)> {
     let mut found = Vec::new();
     // The fence that opened the current code block, and whether it is shell.
     let mut fence: Option<(String, bool)> = None;

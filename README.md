@@ -74,7 +74,7 @@ The commands, in the order the pages use them:
 - `owlshift continue TICKET`: go on once the ticket's questions are answered there.
 - `owlshift start`: serve the project with the background service, which takes the tickets you admit; `owlshift status`, `owlshift why` and `owlshift logs` say what it does and why a ticket waits; `owlshift stop` stops it.
 
-`owlshift --help` lists every command, and `owlshift help` followed by a command's name, as in `owlshift help do`, explains it. [SECURITY.md](SECURITY.md) says what the confinement of agent runs protects, and what it does not.
+The [command reference](docs/reference/cli.md) lists every command with its arguments and options. `owlshift --help` lists every command, and `owlshift help` followed by a command's name, as in `owlshift help do`, explains it. [SECURITY.md](SECURITY.md) says what the confinement of agent runs protects, and what it does not.
 
 ## Design
 
