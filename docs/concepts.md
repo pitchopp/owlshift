@@ -152,11 +152,12 @@ Decided in: [architecture, section 5](design/architecture.md#5-architecture-over
 
 These rules are code, and no configuration loosens them:
 
-- **No agent merges, deploys, or changes infrastructure.** The only merge is the runner's own under merge on green, which the floor checks against the project file of your default branch.
+- **No agent merges.** The only merge is the runner's own under merge on green, which the floor checks against the project file of your default branch.
+- **No deploy or infrastructure change** (environment variables, feature flags, DNS, CI settings) without an explicit human approval recorded on the ticket.
 - **No agent holds a credential** for the tracker, the forge or a cloud. Each run starts from an empty environment, confined to its worktree; the runner is the only writer to the tracker and the forge.
 - **No agent pushes.** The runner pushes the ticket's own branch, and force-pushes it only after a rebase run.
 - **Nothing written by a stranger is an instruction.** Only admitters admit, only the decider answers, and follow-ups never enter the queue without a person.
-- **No model API key** is asked for, stored or passed.
+- **No model API key is asked for.** Claude Code runs log in with your subscription's token; a Codex reviewer runs on whatever login your Codex already has, an API key included.
 - **Security and irreversible actions** always reach a person.
 
 [SECURITY.md](../SECURITY.md) says what the confinement of agent runs protects, and what it does not.
