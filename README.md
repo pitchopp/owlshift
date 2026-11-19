@@ -12,7 +12,7 @@ Owlshift is an open-source runner that works a team's existing backlog continuou
 - **Your tracker stays the interface.** No new board to adopt: questions, answers and delivery reports live on the ticket.
 - **The human decision loop is the product.** Questions can come at any stage; answers are checked before anything resumes; there is no limit on rounds.
 - **Scheduling is enforced.** Blockers gate dispatch, and declared resources keep two in-flight tickets (agent or human) from colliding.
-- **Bring your own agents, on your own subscription.** Claude Code, Codex, or a mix, per project, per role or per ticket. Owlshift drives the CLIs on your subscription (Codex through your login, Claude Code agent runs through a `claude setup-token` token that `owlshift init` stores, never your own Claude Code login) and never asks for an API key.
+- **Bring your own agents, on your own subscription.** Claude Code runs every role, and a project can add Codex as an extra reviewer. Owlshift drives the CLIs on your subscription (Codex through your login, Claude Code agent runs through a `claude setup-token` token that `owlshift init` stores, never your own Claude Code login) and never asks for an API key.
 - **Runs on your machine.** One light native background service; zero tokens at rest.
 
 ## Status
@@ -62,6 +62,8 @@ Then follow the page of the tracker your tickets live in. Each takes you from `o
 | Linear | [Adopt a project on Linear](docs/adopt/linear.md) |
 | GitHub Issues, in the repository itself | [Adopt a project on GitHub Issues](docs/adopt/github-issues.md) |
 | Nowhere yet, or you want to try without an account | [Adopt a project with Markdown tickets](docs/adopt/markdown.md) |
+
+Questions before you install, on cost, subscription terms, merging, the sandbox or privacy: the [FAQ](docs/faq.md).
 
 The commands, in the order the pages use them:
 
