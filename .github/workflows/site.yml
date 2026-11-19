@@ -1,8 +1,9 @@
 name: Site
 
-# OWL-578: the public site, served by GitHub Pages at
-# https://pitchopp.github.io/owlshift/ (build plan, "The public site", "How
-# it is served"). `build` writes the site with scripts/site/build.sh on a
+# OWL-578: the public site, served by GitHub Pages at https://owlshift.dev/
+# (build plan, "The public site", "How it is served"). The domain is set in
+# the repository's Pages settings: with a workflow, Pages ignores a CNAME
+# file, so the site holds none. `build` writes the site with scripts/site/build.sh on a
 # pull request and on a push to main, so a file the script copies cannot go
 # missing unnoticed. `deploy`, on a push to main or by hand on main, deploys
 # what `build` uploaded.
