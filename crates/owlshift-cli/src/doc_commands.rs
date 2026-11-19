@@ -289,6 +289,7 @@ fn every_command_the_documentation_names_exists_with_its_flags() {
         "docs/markdown-tracker.md",
         "docs/faq.md",
         "docs/troubleshooting.md",
+        "docs/concepts.md",
     ] {
         let count = counted
             .iter()
