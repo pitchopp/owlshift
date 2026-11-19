@@ -8,7 +8,7 @@ Owlshift is free and open source, and costs zero tokens at rest: no model runs w
 
 ## Do I need an API key?
 
-No. Owlshift never asks for, stores or passes a model API key ([design](design/architecture.md#2-design-principles), principle 9). Claude Code agent runs log in with a long-lived token of your own subscription, which you make with `claude setup-token` and `owlshift init` keeps in the system keychain, handed to the Claude Code process alone ([SECURITY.md](../SECURITY.md#what-confinement-protects)). The optional Codex reviewer keeps whatever login you configured in Codex itself.
+No. Owlshift never asks for a model API key ([design](design/architecture.md#2-design-principles), principle 9). Claude Code agent runs log in with a long-lived token of your own subscription, which you make with `claude setup-token` and `owlshift init` keeps in the system keychain, handed to the Claude Code process alone ([SECURITY.md](../SECURITY.md#what-confinement-protects)). The optional Codex reviewer runs on whatever login Codex already has, copied into the run, and is billed as that login is: to your ChatGPT subscription, or to the API for a login made with an API key ([runtime and operations](design/runtime-and-operations.md#how-it-runs), "Harness authentication").
 
 ## Is unattended use within my Claude subscription's terms?
 
