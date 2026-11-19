@@ -7,6 +7,15 @@
 
 <p align="center"><strong>Your backlog works the night shift.</strong></p>
 
+<!-- Exported from the public site's timeline by scripts/site/export-timeline.sh,
+     which also records the markup's hash; a test fails when they drift apart. -->
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="assets/readme/timeline-dark.png">
+    <img alt="A real run of Owlshift on its own backlog, ticket OWL-513, as a timeline: the ticket is marked ready, a question only the maintainer can answer is asked on the ticket with three options, the answer comes hours later, a plan is written and approved, and a verified pull request, #486, is delivered and merged." src="assets/readme/timeline-light.png" width="800">
+  </picture>
+</p>
+
 Owlshift is an open-source runner that works a team's existing backlog continuously with coding agents. It pulls ready tickets from your tracker, takes each one through a plan-review-build-verify pipeline, stops and asks **on the ticket** whenever a decision is yours, and delivers a verified pull request. Humans merge.
 
 - **Your tracker stays the interface.** No new board to adopt: questions, answers and delivery reports live on the ticket.

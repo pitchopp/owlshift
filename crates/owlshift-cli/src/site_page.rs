@@ -11,7 +11,9 @@
 //! - nothing it loads is absolute, and everything it loads exists, in `site/`
 //!   or among the files `scripts/site/build.sh` copies beside it;
 //! - its Content-Security-Policy is the build plan's, word for word, and it
-//!   holds no inline script and no style attribute, which that policy refuses.
+//!   holds no inline script and no style attribute, which that policy refuses;
+//! - the README's two images of its timeline were exported from the timeline
+//!   it has now (OWL-579, `scripts/site/export-timeline.sh`).
 //!
 //! The page is written by hand with double-quoted attributes, so plain string
 //! scanning reads it; a page that stopped being so would fail the floors.
@@ -19,6 +21,8 @@
 //! [`Cli`]: super::Cli
 
 use std::path::{Path, PathBuf};
+
+use sha2::{Digest, Sha256};
 
 use super::doc_commands::{commands_of_line, refusal};
 
@@ -337,6 +341,44 @@ fn the_policy_is_the_build_plans_and_the_page_runs_no_inline_code() {
     }
     assert!(attributes(&html, "style").is_empty(), "a style attribute");
     assert!(tags(&html, "style").is_empty(), "a <style> element");
+}
+
+/// The timeline's markup as `scripts/site/export-timeline.sh` hashes it: the
+/// lines from the first holding `<ol class="timeline">` to the first holding
+/// `</ol>` after it, each ended by a newline.
+fn timeline_markup(html: &str) -> String {
+    let mut markup = String::new();
+    for line in html
+        .lines()
+        .skip_while(|l| !l.contains("<ol class=\"timeline\">"))
+    {
+        markup.push_str(line);
+        markup.push('\n');
+        if line.contains("</ol>") {
+            return markup;
+        }
+    }
+    panic!("site/index.html has no complete timeline");
+}
+
+#[test]
+fn the_readmes_timeline_images_are_exported_from_the_pages_timeline() {
+    let digest = Sha256::digest(timeline_markup(&page()).as_bytes());
+    let actual: String = digest.iter().map(|byte| format!("{byte:02x}")).collect();
+    let recorded = read("assets/readme/timeline.sha256");
+    assert_eq!(
+        recorded.trim(),
+        actual,
+        "the timeline in site/index.html changed since the README's images were \
+         exported: run scripts/site/export-timeline.sh and commit assets/readme/"
+    );
+    let readme = read("README.md");
+    for theme in ["light", "dark"] {
+        let image = format!("assets/readme/timeline-{theme}.png");
+        let bytes = std::fs::read(root().join(&image)).unwrap_or_else(|e| panic!("{image}: {e}"));
+        assert!(bytes.starts_with(b"\x89PNG"), "{image} is not a PNG");
+        assert!(readme.contains(&image), "the README does not show {image}");
+    }
 }
 
 #[test]

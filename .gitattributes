@@ -9,3 +9,7 @@ crates/owlshift-cli/tests/fixtures/self-update/** text eol=lf
 # Shell scripts run as they are checked out, the install script by `sh`
 # straight from the repository (OWL-540).
 *.sh text eol=lf
+# The timeline's markup is hashed byte for byte, and its images are binary (OWL-579).
+site/index.html text eol=lf
+assets/readme/*.png binary
+assets/readme/timeline.sha256 text eol=lf
