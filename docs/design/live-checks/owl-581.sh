@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# OWL-581 live checks T1 to T3, quoted under "Live checks" of docs/design/build-plan.md, "P10 · Teams": what GitHub
+# shellcheck disable=SC2016 # `$name` in single quotes are GraphQL variables and jq's, not the shell's
+# OWL-581 live checks T1 to T6, quoted under "Live checks" of docs/design/build-plan.md, "P10 · Teams": what GitHub
 # does with the refs `refs/owlshift/claims/<ticket>` a runner's claims are, pushed with a person's own git access, over
 # SSH and over HTTPS with the credential helper git is configured with.
 #   T1 An update and a delete with the commit last written as the expected value (`--force-with-lease=<ref>:<oid>`):
@@ -17,17 +18,34 @@
 #      part alone (rulesets need GitHub Pro on a private one), no ruleset restricting the creation, update and
 #      deletion of every branch and tag refuses them, the ruleset shown live by a branch and a tag it refuses; and
 #      what GitHub's public pages show of the ref.
+#   T4 The machine account, a collaborator with write access who is no admin, signed in through Owlshift's GitHub
+#      App (device flow, its user token as git's credential over HTTPS), takes, renews and deletes a claim; its push
+#      of a claim to a public repository where it has read access alone (OWL581_READONLY_REPO) is refused.
+#   T5 A pull request the machine account opens with that token has it as its author; its own APPROVE and
+#      REQUEST_CHANGES reviews are refused; gh's account submits both, read back as the forge adapter reads reviews.
+#      The pull request is closed and its branch deleted.
+#   T6 On an existing Linear issue of team SBX (ISSUE, none created), member A (LINEAR_API_KEY) posts a comment that
+#      mentions member B as the runner does ("Waiting for <B's profile link>"); B's notifications, read with B's key,
+#      say whether B was notified. A control assigns the issue to B, then back. The comment is deleted.
 #
-#   bash docs/design/live-checks/owl-581.sh OWNER/REPO            (--help; --restore OWNER/REPO after a killed run)
+#   bash docs/design/live-checks/owl-581.sh OWNER/REPO [ISSUE]    (--help; --restore OWNER/REPO [ISSUE] after a kill)
 #
-# Needs bash (3.2 is enough), git, gh signed in as the repository's admin with the `repo` and `workflow` scopes, jq,
-# curl, base64 and perl (a millisecond clock: bash 3.2 and macOS's date have none). About 10 minutes. Every ref it
-# writes is under `refs/owlshift/claims/PROBE581-<run>-`, or `refs/heads/owl581-probe-<run>` and
-# `refs/tags/owl581-probe-<run>` for T3's controls, and is deleted at the end; T3 adds then removes one workflow file
-# on the default branch, deletes the runs it started, creates then deletes two rulesets and makes the repository
-# public, then private again, the EXIT trap included. It refuses pitchopp/owlshift. The report, on standard output,
-# holds no token and no account identifier: paste it on the ticket.
+# Needs bash (3.2 is enough), git 2.32 or later, gh signed in as the repository's admin with the `repo` and `workflow`
+# scopes, jq, curl, base64 and perl (a millisecond clock: bash 3.2 and macOS's date have none). T1 to T3 take about 10
+# minutes. Every ref it writes is under `refs/owlshift/claims/PROBE581-<run>-`, or `refs/heads/owl581-probe-<run>`
+# and `refs/tags/owl581-probe-<run>` for T3's controls and T5's branch, and is deleted at the end; T3 adds then
+# removes one workflow file on the default branch, deletes the runs it started, creates then deletes two rulesets and
+# makes the repository public, then private again, the EXIT trap included. T5's pull request stays, closed. T6 puts
+# the issue back as it found it, archived or in the trash. It refuses pitchopp/owlshift. The report, on standard
+# output, holds no token and no account identifier: paste it on the ticket.
+#
+# Secrets (T4 to T6): the machine account's token comes from the device flow during the run; member A's Linear key
+# from LINEAR_API_KEY, else the LINEAR_API_KEY line of the repository root's .env; member B's from
+# OWL581_LINEAR_KEY_B, else typed on the terminal, not echoed. Each is written only to a mode-600 file of the run's
+# temporary directory, which curl and git's credential helper read, and the variables are unset before any command
+# runs: no secret is printed or passed on a command line. The trap deletes the directory.
 
+set +x
 set -u -o pipefail
 umask 077
 
@@ -35,23 +53,42 @@ PROGRAM=${0##*/}
 FORBIDDEN=pitchopp/owlshift
 CLAIMS=refs/owlshift/claims
 WF_PATH=.github/workflows/owl581-probe.yml
+READONLY_DEFAULT=pitchopp/owlshift-merge-sandbox
+# Owlshift's GitHub App, `owl-shift` (crates/owlshift-adapters/src/forge/github_app.rs, CLIENT_ID).
+CLIENT_ID=Iv23li5EhBqiuljIPbiK
+LINEAR_URL=https://api.linear.app/graphql
+T6_MARK="OWL-581 probe T6"
 # T1's racing rounds: runners per round, rounds.
 RACERS=4
 ROUNDS=2
 
 usage() {
     cat <<EOF
-Usage: bash $PROGRAM OWNER/REPO
-       bash $PROGRAM --restore OWNER/REPO
+Usage: bash $PROGRAM OWNER/REPO [ISSUE]
+       bash $PROGRAM --restore OWNER/REPO [ISSUE]
 
   OWNER/REPO  the sandbox, private, that gh's account administers:
               pitchopp/owlshift-live-sandbox. Never $FORBIDDEN.
+  ISSUE       an existing Linear issue of team SBX, for T6 (none is created).
 
-OWL581_CHECKS="T1 T2 T3" (the default) runs those checks, in that order.
+OWL581_CHECKS="T1 T2 T3" (the default) runs those checks, in that order;
+              any of T1 to T6.
+OWL581_READONLY_REPO  T4's public repository where the machine account has
+              read access alone (default $READONLY_DEFAULT); check by hand
+              that owl-shift's installation covers it (Settings >
+              Applications > Installed GitHub Apps > owl-shift > Configure),
+              which no token the script holds can read.
+OWL581_LINEAR_KEY_B   member B's Linear key; typed, not echoed, when unset.
+              Prefer typing it: a variable stays in the process's environment
+              and, set on the command line, in the shell's history.
+T4 and T5 sign the machine account in through Owlshift's GitHub App: open the
+              page shown in a browser signed in as that account, enter the code.
 --restore     after a run killed beyond its trap: deletes the owl581-probe
               rulesets (readable only while the repository is public), makes
-              it private, deletes every PROBE581 claim and owl581-probe ref,
-              removes the probe workflow file.
+              it private, deletes every PROBE581 claim and owl581-probe ref of
+              both repositories, closes the owl581-probe pull requests, removes
+              the probe workflow file; with ISSUE, deletes the T6 probe
+              comments and says what to do with the issue.
 Paste everything it prints on standard output on the ticket.
 EOF
 }
@@ -651,6 +688,467 @@ t3_remove_workflow() {
     fi
 }
 
+# ------------------------------------------------------------------------------------------------------- credentials
+
+# hcall NAME METHOD URL [BODY_FILE] [AUTH_FILE]: curl, ~/.curlrc ignored, the body and the Authorization header read
+# from files (never an argument); the answer in $WORK/NAME.body, the status printed.
+hcall() {
+    local name=$1 method=$2 url=$3 body=${4:-} auth=${5:-} status
+    local args=(-q -sS -X "$method" -o "$WORK/$name.body" -w '%{http_code}')
+    case $url in
+    https://api.github.com/*) args+=(-H 'Accept: application/vnd.github+json' -H 'X-GitHub-Api-Version: 2022-11-28') ;;
+    "$LINEAR_URL") args+=(-H 'Accept: application/json' -H 'Content-Type: application/json') ;;
+    *) args+=(-H 'Accept: application/json') ;;
+    esac
+    if [ -n "$body" ]; then args+=(--data-binary "@$body"); fi
+    if [ -n "$auth" ]; then args+=(-H "@$auth"); fi
+    : >"$WORK/$name.body"
+    status=$(curl "${args[@]}" "$url" 2>"$WORK/$name.err") || true
+    printf '%s\n' "${status:-000}"
+}
+
+# mrest NAME PATH [METHOD] [BODY_FILE]: a REST call as the machine account (`rest` is gh's account).
+mrest() { hcall "$1" "${3:-GET}" "https://api.github.com/$2" "${4:-}" "$WORK/m.auth"; }
+
+# lin NAME A|B QUERY [VARIABLES_JSON]: a Linear GraphQL call with member A's or B's key.
+lin() {
+    local v=${4:-}
+    if [ -z "$v" ]; then v='{}'; fi
+    jq -n -c --arg q "$3" --argjson v "$v" '{query: $q, variables: $v}' >"$WORK/$1.json"
+    hcall "$1" POST "$LINEAR_URL" "$WORK/$1.json" "$WORK/lin-$2.auth"
+}
+lin_errors() { jq -r '[.errors[]?.message] | join("; ")' <"$WORK/$1.body" 2>/dev/null; }
+
+# scrub: replaces the two GitHub logins by <machine> and <admin>, and object ids by <oid>.
+scrub() {
+    local args=(-e 's/[0-9a-f]\{40\}/<oid>/g')
+    if [ -n "$M_LOGIN" ]; then args+=(-e "s/$M_LOGIN/<machine>/g"); fi
+    if [ -n "$GH_LOGIN" ]; then args+=(-e "s/$GH_LOGIN/<admin>/g"); fi
+    sed "${args[@]}"
+}
+
+# The machine account's git: the maintainer's global and system configuration left out (no insteadOf may send the
+# push over his SSH key, no helper of his is asked, used or erased), no askpass, no trace; the credential is the
+# token file's, read by the helper with shell builtins.
+M_HELPER='!f() { test "$1" = get || exit 0; IFS= read -r t <"$OWL581_TOKEN_FILE"; echo username=x-access-token; printf "password=%s\n" "$t"; }; f'
+mgit() {
+    env -u GIT_ASKPASS -u SSH_ASKPASS -u GIT_TRACE -u GIT_TRACE_CURL -u GIT_TRACE_PACKET -u GIT_CURL_VERBOSE \
+        -u GIT_SSH_COMMAND GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 OWL581_TOKEN_FILE="$WORK/m.token" \
+        git -C "$LOCAL" -c credential.helper= -c "credential.helper=$M_HELPER" "$@"
+}
+# mpush URL ARGS...: `git push --porcelain` as the machine account, its output in $WORK/push.out.
+mpush() {
+    local url=$1
+    shift
+    mgit push --porcelain "$url" "$@" >"$WORK/push.out" 2>&1
+}
+# over_https: whether the last push went to github.com over HTTPS, as its porcelain `To` line says.
+over_https() { if grep -q '^To https://github\.com/' "$WORK/push.out"; then echo yes; else echo no; fi; }
+# push_reason: what git and the server said of a refused push, logins and ids replaced.
+push_reason() {
+    grep -E '^(remote: |fatal: |error: |!)' "$WORK/push.out" | grep -v '^remote: *$' | scrub | tail -n 3 | tr '\n' ' '
+}
+
+# machine_sign_in: the device flow of Owlshift's app (as scripts/github-app-checks.sh, C9 and C10, did it), the
+# person entering the code in a browser signed in as the machine account. The token goes to two mode-600 files.
+machine_sign_in() {
+    local status code interval life waited=0 err tok
+    printf 'client_id=%s' "$CLIENT_ID" >"$WORK/device.form"
+    status=$(hcall device POST https://github.com/login/device/code "$WORK/device.form")
+    code=$(field .device_code "$WORK/device.body")
+    interval=$(field .interval "$WORK/device.body")
+    life=$(field .expires_in "$WORK/device.body")
+    report "sign-in: device code asked of Owlshift's app: HTTP $status"
+    if [ -z "$code" ]; then
+        fail "sign-in: FAILED: no device code: $(field .error "$WORK/device.body")"
+        return 1
+    fi
+    interval=${interval:-5}
+    life=${life:-900}
+    say ""
+    say "In a browser signed in as the MACHINE account (not yours), open $(field .verification_uri "$WORK/device.body")"
+    say "and enter the code $(field .user_code "$WORK/device.body"). Waiting up to $life s..."
+    rm -f "$WORK/device.body"
+    while [ "$waited" -lt "$life" ]; do
+        sleep "$interval"
+        waited=$((waited + interval))
+        printf 'client_id=%s&device_code=%s&grant_type=urn:ietf:params:oauth:grant-type:device_code' "$CLIENT_ID" "$code" >"$WORK/poll.form"
+        status=$(hcall poll POST https://github.com/login/oauth/access_token "$WORK/poll.form")
+        err=$(field .error "$WORK/poll.body")
+        case $err in
+        authorization_pending) continue ;;
+        slow_down)
+            interval=$(field .interval "$WORK/poll.body")
+            interval=${interval:-10}
+            continue
+            ;;
+        esac
+        break
+    done
+    rm -f "$WORK/poll.form"
+    tok=$(field .access_token "$WORK/poll.body")
+    if [ -z "$tok" ]; then
+        rm -f "$WORK/poll.body"
+        fail "sign-in: FAILED: no token after ${waited} s: HTTP $status ${err:-no answer}"
+        return 1
+    fi
+    printf 'Authorization: Bearer %s\n' "$tok" >"$WORK/m.auth"
+    printf '%s\n' "$tok" >"$WORK/m.token"
+    tok=
+    M_EXPIRY=$([ -n "$(field .expires_in "$WORK/poll.body")" ] && echo expiring || echo "no expiry")
+    rm -f "$WORK/poll.body"
+    SIGNED_IN=yes
+    report "sign-in: a user token of the app, after ${waited} s: $M_EXPIRY"
+}
+
+# machine_identity: who the token is, compared with gh's account and read through it; what the app's installations
+# give the token. Sets M_OK when T4 and T5 can run.
+machine_identity() {
+    local status perm role roperm id
+    status=$(mrest muser user)
+    M_LOGIN=$(field .login "$WORK/muser.body")
+    GH_LOGIN=$(gh api user --jq .login </dev/null 2>/dev/null)
+    report "machine: GET /user with its token: HTTP $status, type $(field .type "$WORK/muser.body"); not gh's account: $([ -n "$M_LOGIN" ] && [ "$M_LOGIN" != "$GH_LOGIN" ] && echo yes || echo no)"
+    if [ -z "$M_LOGIN" ] || [ -z "$GH_LOGIN" ] || [ "$M_LOGIN" = "$GH_LOGIN" ]; then
+        fail "machine: FAILED: the token is not a second account's (sign in as the machine account); T4 and T5 not run"
+        return 1
+    fi
+    rest mperm "repos/$REPO/collaborators/$M_LOGIN/permission" >/dev/null
+    perm=$(field .permission "$WORK/mperm.body")
+    role=$(field .role_name "$WORK/mperm.body")
+    rest mroperm "repos/$READONLY/collaborators/$M_LOGIN/permission" >/dev/null
+    roperm=$(field .permission "$WORK/mroperm.body")
+    rest roinfo "repos/$READONLY" >/dev/null
+    report "machine: read by gh: on the sandbox permission $perm, role $role; on the read-only repository permission $roperm, that repository private: $(bool .private "$WORK/roinfo.body")"
+    : >"$WORK/m-repos"
+    mrest minst "user/installations?per_page=100" >/dev/null
+    for id in $(jq -r '.installations[]?.id' <"$WORK/minst.body" 2>/dev/null); do
+        mrest "minst-$id" "user/installations/$id/repositories?per_page=100" >/dev/null
+        jq -r '.repositories[]?.full_name | ascii_downcase' <"$WORK/minst-$id.body" >>"$WORK/m-repos" 2>/dev/null
+    done
+    # A user token lists only the installation's repositories its account is a collaborator of (2026-11-19: the
+    # read-only repository, covered by the installation, was not listed), so this reads the sandbox's coverage alone.
+    M_COVERS=$(grep -qx "$(printf '%s' "$REPO" | tr '[:upper:]' '[:lower:]')" "$WORK/m-repos" && echo yes || echo no)
+    report "machine: the app's installations the token reaches: $(jq '.installations | length' <"$WORK/minst.body" 2>/dev/null); they cover the sandbox: $M_COVERS"
+    if [ "$perm" != write ] || [ "$role" != write ]; then
+        fail "machine: FAILED: the machine account must be a write collaborator, no admin, on the sandbox; T4 and T5 not run"
+        return 1
+    fi
+    if [ "$M_COVERS" != yes ]; then
+        fail "machine: FAILED: the app is not installed on the sandbox for this token; T4 and T5 not run"
+        return 1
+    fi
+    M_OK=yes
+}
+
+# read_linear_keys: member A's and B's keys into mode-600 header files, the variables unset; L_OK when both are well
+# formed. A key is written only when it is one line of the form lin_api_<letters and digits>.
+read_linear_keys() {
+    local a=${LINEAR_API_KEY:-} b=${OWL581_LINEAR_KEY_B:-} top
+    unset LINEAR_API_KEY OWL581_LINEAR_KEY_B
+    if [ -z "$a" ]; then
+        top=$(git rev-parse --show-toplevel 2>/dev/null || pwd)
+        if [ -f "$top/.env" ]; then
+            a=$(grep -E '^LINEAR_API_KEY=' "$top/.env" | tail -n 1 | cut -d= -f2-)
+        fi
+    fi
+    a=${a%$'\r'}
+    a=${a#\"}
+    a=${a%\"}
+    if [ -z "$b" ] && [ "$MODE" = run ]; then
+        if { : </dev/tty; } 2>/dev/null; then
+            printf "Member B's Linear API key (not echoed): " >/dev/tty
+            IFS= read -r -s b </dev/tty || b=
+            printf '\n' >/dev/tty
+        fi
+    fi
+    b=${b%$'\r'}
+    if [[ $a =~ ^lin_api_[A-Za-z0-9]+$ ]]; then
+        printf 'Authorization: %s\n' "$a" >"$WORK/lin-A.auth"
+        L_A=yes
+    fi
+    if [[ $b =~ ^lin_api_[A-Za-z0-9]+$ ]]; then
+        printf 'Authorization: %s\n' "$b" >"$WORK/lin-B.auth"
+        L_B=yes
+    fi
+    a=
+    b=
+}
+
+# ---------------------------------------------------------------------------------------------------------------- T4
+
+t4() {
+    local r ro c1 c2 c3 st https
+    section "T4 · who may write one"
+    if [ "$M_OK" != yes ]; then
+        fail "T4: not run: no machine account signed in"
+        return 1
+    fi
+    r=$P-t4
+    if ! { c1=$(claim_commit t4-1) && c2=$(claim_commit t4-2) && c3=$(claim_commit t4-ro); }; then
+        fail "T4: FAILED: no local commit"
+        return 1
+    fi
+    mpush "$HTTPS_URL" "--force-with-lease=$r:" "$c1:$r"
+    st=$?
+    https=$(over_https)
+    report "T4 the machine account, write access, takes a claim with its token over HTTPS (over https: $https): exit $st, flag $(flag "$r"); remote holds it: $(yes_no "$(remote_oid "$SSH_URL" "$r")" "$c1")"
+    expect "T4 take" "$st $(flag_char "$r") $https" "0 * yes"
+    if [ "$st" != 0 ]; then report "T4 git said: $(push_reason)"; fi
+    mpush "$HTTPS_URL" "--force-with-lease=$r:$c1" "$c2:$r"
+    st=$?
+    report "T4 renews it, expected the commit last written: exit $st, flag $(flag "$r"); remote holds the new one: $(yes_no "$(remote_oid "$SSH_URL" "$r")" "$c2")"
+    expect "T4 renew" "$st $(flag_char "$r")" "0 +"
+    mpush "$HTTPS_URL" "--force-with-lease=$r:$c2" ":$r"
+    st=$?
+    report "T4 deletes it, expected the commit last written: exit $st, flag $(flag "$r"); remote absent: $(yes_no "$(remote_oid "$SSH_URL" "$r")" "")"
+    expect "T4 delete" "$st $(flag_char "$r") $(remote_oid "$SSH_URL" "$r")" "0 - "
+
+    ro=$P-t4-ro
+    mpush "$RO_HTTPS" "--force-with-lease=$ro:" "$c3:$ro"
+    st=$?
+    report "T4 the machine account, read access alone (public repository, not a collaborator), pushes a claim there with the same token: exit $st, flag $(flag "$ro"); git said: $(push_reason)"
+    report "T4 the ref on that repository afterwards: $([ -n "$(remote_oid "$RO_SSH" "$ro")" ] && echo present || echo absent)"
+    if [ "$st" = 0 ] || [ -n "$(remote_oid "$RO_SSH" "$ro")" ]; then
+        fail "T4 read access: FAILED: the push was accepted"
+    elif ! grep -q 'denied to <machine>' <<<"$(push_reason)"; then
+        fail "T4 read access: INCONCLUSIVE: the refusal does not name the machine account's permission"
+    fi
+    # Neither the user token nor gh can read the installation's repositories (GET repos/R/installation needs the
+    # app's JWT: HTTP 401 with gh on 2026-11-19), so its coverage of the read-only repository is read by hand.
+    report "T4 to read by hand: whether owl-shift's installation covers that repository (Settings > Applications > Installed GitHub Apps > owl-shift > Configure > Repository access); when it does, the refusal is the account's read access and not the app's"
+}
+
+# ---------------------------------------------------------------------------------------------------------------- T5
+
+T5_AUTHOR_Q='query($o: String!, $r: String!, $n: Int!) { repository(owner: $o, name: $r) { pullRequest(number: $n) {
+  author { login __typename } state reviews(first: 20) { nodes { author { login } state } } } } }'
+
+# t5_read NAME: the pull request read through gh's GraphQL, as the forge adapter reads author and reviews.
+t5_read() {
+    jq -n -c --arg q "$T5_AUTHOR_Q" --arg o "${REPO%%/*}" --arg r "${REPO#*/}" --argjson n "$PR_NUMBER" \
+        '{query: $q, variables: {o: $o, r: $r, n: $n}}' >"$WORK/$1.json"
+    rest "$1" graphql POST "$WORK/$1.json"
+}
+
+t5() {
+    local status base blob tree commit br ev st state msg author
+    section "T5 · whose pull request it is"
+    if [ "$M_OK" != yes ]; then
+        fail "T5: not run: no machine account signed in"
+        return 1
+    fi
+    rest t5repo "repos/$REPO" >/dev/null
+    BASE=$(field .default_branch "$WORK/t5repo.body")
+    if [ -z "$BASE" ] || ! lg fetch -q "$SSH_URL" "refs/heads/$BASE"; then
+        fail "T5: FAILED: the default branch was not fetched"
+        return 1
+    fi
+    base=$(lg rev-parse FETCH_HEAD)
+    blob=$(printf 'OWL-581 probe T5, run %s\n' "$RUN" | lg hash-object -w --stdin)
+    tree=$({
+        lg ls-tree "$base"
+        printf '100644 blob %s\towl581-probe-%s.txt\n' "$blob" "$RUN"
+    } | lg mktree)
+    commit=$(lg commit-tree "$tree" -p "$base" -m "OWL-581 probe T5, run $RUN")
+    br=owl581-probe-$RUN-t5
+    mpush "$HTTPS_URL" "$commit:refs/heads/$br"
+    st=$?
+    report "T5 the machine account pushes a branch, one commit on $BASE: exit $st, flag $(flag "refs/heads/$br"), over https: $(over_https)"
+    if [ "$st" != 0 ]; then
+        fail "T5: FAILED: the branch was not pushed: $(push_reason)"
+        return 1
+    fi
+    jq -n -c --arg t "OWL-581 probe T5, run $RUN" --arg h "$br" --arg b "$BASE" \
+        '{title: $t, head: $h, base: $b, body: "A live check of OWL-581; closed at the end of the run.", draft: false}' >"$WORK/pr.json"
+    status=$(mrest pr "repos/$REPO/pulls" POST "$WORK/pr.json")
+    PR_NUMBER=$(field .number "$WORK/pr.body")
+    report "T5 the machine account opens a pull request with the app's user token: HTTP $status"
+    if [ -z "$PR_NUMBER" ]; then
+        fail "T5: FAILED: no pull request: $(field .message "$WORK/pr.body" | scrub)"
+        return 1
+    fi
+    t5_read t5a >/dev/null
+    author=$(field .data.repository.pullRequest.author.login "$WORK/t5a.body")
+    rest t5i "repos/$REPO/issues/$PR_NUMBER" >/dev/null
+    report "T5 read by gh: GraphQL author is the machine account: $(yes_no "$author" "$M_LOGIN"), gh's account: $(yes_no "$author" "$GH_LOGIN"), __typename $(field .data.repository.pullRequest.author.__typename "$WORK/t5a.body"); REST user.login the machine account: $(yes_no "$(field .user.login "$WORK/t5i.body")" "$M_LOGIN"); performed_via_github_app: $(field .performed_via_github_app.slug "$WORK/t5i.body" | grep . || echo none)"
+    expect "T5 author" "$author" "$M_LOGIN"
+    for ev in APPROVE REQUEST_CHANGES; do
+        jq -n -c --arg e "$ev" '{event: $e, body: "OWL-581 probe: the author reviews its own pull request."}' >"$WORK/rev.json"
+        status=$(mrest "srev-$ev" "repos/$REPO/pulls/$PR_NUMBER/reviews" POST "$WORK/rev.json")
+        msg=$(jq -r '[.message // empty, (.errors[]? | if type == "string" then . else (.message // tostring) end)] | join(": ")' <"$WORK/srev-$ev.body" 2>/dev/null | scrub)
+        report "T5 its author submits $ev on it: HTTP $status, $msg"
+        expect "T5 the author's own $ev is refused" "$status" 422
+    done
+    for ev in APPROVE REQUEST_CHANGES; do
+        jq -n -c --arg e "$ev" '{event: $e, body: "OWL-581 probe: a colleague reviews."}' >"$WORK/rev.json"
+        status=$(rest "rev-$ev" "repos/$REPO/pulls/$PR_NUMBER/reviews" POST "$WORK/rev.json")
+        state=$(field .state "$WORK/rev-$ev.body")
+        report "T5 gh's account submits $ev: HTTP $status, state $state"
+        if [ "$ev" = APPROVE ]; then
+            expect "T5 gh's approval" "$status $state" "200 APPROVED"
+        else
+            expect "T5 gh's changes requested" "$status $state" "200 CHANGES_REQUESTED"
+        fi
+    done
+    t5_read t5b >/dev/null
+    report "T5 its reviews, read as the forge adapter reads them (GraphQL reviews, author and state): $(jq -r --arg m "$M_LOGIN" --arg g "$GH_LOGIN" '[.data.repository.pullRequest.reviews.nodes[] | "\(.state) by \(if .author.login == $g then "gh'"'"'s account" elif .author.login == $m then "the author" else "another" end)"] | join(", ")' <"$WORK/t5b.body" 2>/dev/null)"
+    t5_close
+}
+
+# t5_close: closes the pull request with gh's account and deletes its branch over SSH.
+t5_close() {
+    local status
+    if [ -n "$PR_NUMBER" ]; then
+        printf '{"state":"closed"}' >"$WORK/close.json"
+        status=$(rest close "repos/$REPO/pulls/$PR_NUMBER" PATCH "$WORK/close.json")
+        report "T5 close the pull request: HTTP $status, state $(field .state "$WORK/close.body")"
+        if [ "$(field .state "$WORK/close.body")" = closed ]; then PR_NUMBER=; else fail "T5 cleanup: FAILED: the pull request is still open"; fi
+    fi
+    if [ -n "$(remote_oid "$SSH_URL" "refs/heads/owl581-probe-$RUN-t5")" ]; then
+        push "$SSH_URL" ":refs/heads/owl581-probe-$RUN-t5"
+        report "T5 delete its branch: flag $(flag_char "refs/heads/owl581-probe-$RUN-t5")"
+    fi
+}
+
+# ---------------------------------------------------------------------------------------------------------------- T6
+
+T6_NOTES_Q='query { notifications(first: 50) { nodes { id type createdAt actor { id }
+  ... on IssueNotification { comment { id } issue { id } } } } }'
+
+# t6_notes NAME: member B's notifications, newest first, as "id type actor-is-A comment-id issue-id" lines in NAME.
+t6_notes() {
+    lin "$1" B "$T6_NOTES_Q" >/dev/null
+    jq -r --arg a "$A_ID" '.data.notifications.nodes[]? | "\(.id) \(.type) \(if .actor.id == $a then "A" else "other" end) \(.comment.id // "-") \(.issue.id // "-")"' \
+        <"$WORK/$1.body" >"$WORK/$1" 2>/dev/null
+}
+
+# t6_wait LABEL AWK_FILTER: polls B's notifications every 5 s up to 120 s for a new one that AWK_FILTER matches (on
+# the lines of t6_notes); T6_GOT holds the matching lines, T6_WAITED the seconds.
+t6_wait() {
+    T6_WAITED=0
+    T6_GOT=
+    while [ "$T6_WAITED" -le 120 ]; do
+        t6_notes "notes-$1"
+        T6_GOT=$(awk 'NR == FNR { seen[$1] = 1; next } !($1 in seen)' "$WORK/notes-before" "$WORK/notes-$1" | awk "$2")
+        if [ -n "$T6_GOT" ]; then return 0; fi
+        sleep 5
+        T6_WAITED=$((T6_WAITED + 5))
+    done
+}
+
+t6() {
+    local org_b b_id mention control
+    section "T6 · a question through a colleague's key"
+    if [ "$L_A" != yes ] || [ "$L_B" != yes ]; then
+        fail "T6: not run: member A's key $([ "$L_A" = yes ] && echo read || echo "missing or malformed"), member B's $([ "$L_B" = yes ] && echo read || echo "missing or malformed")"
+        return 1
+    fi
+    lin la A '{ viewer { id } organization { id } }' >/dev/null
+    lin lb B '{ viewer { id url } organization { id } }' >/dev/null
+    A_ID=$(field .data.viewer.id "$WORK/la.body")
+    b_id=$(field .data.viewer.id "$WORK/lb.body")
+    B_URL=$(field .data.viewer.url "$WORK/lb.body")
+    org_b=$(field .data.organization.id "$WORK/lb.body")
+    report "T6 the keys: A's answers: $([ -n "$A_ID" ] && echo yes || echo no), B's: $([ -n "$b_id" ] && echo yes || echo no); one workspace: $(yes_no "$(field .data.organization.id "$WORK/la.body")" "$org_b"); two members: $([ -n "$b_id" ] && [ "$A_ID" != "$b_id" ] && echo yes || echo no); B's profile link a plain https://linear.app/ link: $([[ $B_URL == https://linear.app/* ]] && echo yes || echo no)"
+    if [ -z "$A_ID" ] || [ -z "$b_id" ] || [ "$A_ID" = "$b_id" ] || [ -z "$org_b" ] || [ "$(field .data.organization.id "$WORK/la.body")" != "$org_b" ]; then
+        fail "T6: not run: two members of one workspace are needed: $(lin_errors la) $(lin_errors lb)"
+        return 1
+    fi
+    lin issue A 'query($i: String!) { issue(id: $i) { id identifier team { key } archivedAt trashed assignee { id } } }' \
+        "$(jq -n -c --arg i "$ISSUE" '{i: $i}')" >/dev/null
+    ISSUE_ID=$(field .data.issue.id "$WORK/issue.body")
+    ISSUE_ASSIGNEE=$(field .data.issue.assignee.id "$WORK/issue.body")
+    report "T6 the issue, read by A: found: $([ -n "$ISSUE_ID" ] && echo yes || echo no), team $(field .data.issue.team.key "$WORK/issue.body"), archived: $([ -n "$(field .data.issue.archivedAt "$WORK/issue.body")" ] && echo yes || echo no), in the trash: $(bool .data.issue.trashed "$WORK/issue.body"), assigned: $([ -n "$ISSUE_ASSIGNEE" ] && echo yes || echo no)"
+    if [ -z "$ISSUE_ID" ] || [ "$(field .data.issue.team.key "$WORK/issue.body")" != SBX ]; then
+        fail "T6: not run: $ISSUE is not an issue of team SBX that A reads: $(lin_errors issue)"
+        ISSUE_ID=
+        return 1
+    fi
+    if [ "$(bool .data.issue.trashed "$WORK/issue.body")" = true ]; then
+        ISSUE_PUT_BACK=trash
+    elif [ -n "$(field .data.issue.archivedAt "$WORK/issue.body")" ]; then
+        ISSUE_PUT_BACK=archive
+    fi
+    if [ -n "$ISSUE_PUT_BACK" ]; then
+        lin unarch A 'mutation($i: String!) { issueUnarchive(id: $i) { success } }' "$(jq -n -c --arg i "$ISSUE_ID" '{i: $i}')" >/dev/null
+        report "T6 restore it from the $ISSUE_PUT_BACK for the check (put back at the end): success $(bool .data.issueUnarchive.success "$WORK/unarch.body") $(lin_errors unarch)"
+        if [ "$(bool .data.issueUnarchive.success "$WORK/unarch.body")" != true ]; then
+            fail "T6: not run: the issue could not be restored"
+            ISSUE_PUT_BACK=
+            return 1
+        fi
+    fi
+    lin issueb B 'query($i: String!) { issue(id: $i) { id subscribers { nodes { id } } } }' "$(jq -n -c --arg i "$ISSUE_ID" '{i: $i}')" >/dev/null
+    report "T6 B reads the issue: $([ -n "$(field .data.issue.id "$WORK/issueb.body")" ] && echo yes || echo no); B subscribed to it: $(jq -r --arg b "$b_id" '[.data.issue.subscribers.nodes[]?.id] | if index($b) then "yes" else "no" end' <"$WORK/issueb.body" 2>/dev/null)"
+    t6_notes notes-before
+    report "T6 B's notifications before: $(wc -l <"$WORK/notes-before" | tr -d ' ') listed (first 50)"
+
+    jq -n -c --arg i "$ISSUE_ID" --arg b "$T6_MARK, run $RUN: a question, deleted at the end of the run.
+
+Waiting for $B_URL" '{input: {issueId: $i, body: $b}}' >"$WORK/cvars.json"
+    lin cc A 'mutation($input: CommentCreateInput!) { commentCreate(input: $input) { success comment { id body user { id } } } }' \
+        "$(cat "$WORK/cvars.json")" >/dev/null
+    T6_COMMENT=$(field .data.commentCreate.comment.id "$WORK/cc.body")
+    report "T6 A posts a comment holding the line \"Waiting for <B's profile link>\" through A's key: success $(bool .data.commentCreate.success "$WORK/cc.body"); its author A: $(yes_no "$(field .data.commentCreate.comment.user.id "$WORK/cc.body")" "$A_ID"); the link kept verbatim: $(jq -r --arg u "$B_URL" '.data.commentCreate.comment.body | if contains("Waiting for " + $u) then "yes" else "no" end' <"$WORK/cc.body" 2>/dev/null) $(lin_errors cc)"
+    if [ -z "$T6_COMMENT" ]; then
+        fail "T6: FAILED: no comment"
+        return 1
+    fi
+    t6_wait mention "\$4 == \"$T6_COMMENT\""
+    mention=$([ -n "$T6_GOT" ] && echo yes || echo no)
+    report "T6 B's notifications for that comment, polled every 5 s: $(printf '%s\n' "$T6_GOT" | awk 'NF { printf "%s%s from %s", s, $2, ($3 == "A" ? "A" : "another"); s = ", " }' | grep . || echo none) after ${T6_WAITED} s"
+    report "T6 B's other new notifications on the issue: $(awk 'NR == FNR { seen[$1] = 1; next } !($1 in seen)' "$WORK/notes-before" "$WORK/notes-mention" | awk -v c="$T6_COMMENT" -v i="$ISSUE_ID" '$5 == i && $4 != c { printf "%s%s", s, $2; s = ", " }' | grep . || echo none)"
+
+    # The control: an assignment by A, which Linear notifies to the assignee.
+    lin asg A 'mutation($i: String!, $a: String) { issueUpdate(id: $i, input: { assigneeId: $a }) { success } }' \
+        "$(jq -n -c --arg i "$ISSUE_ID" --arg a "$b_id" '{i: $i, a: $a}')" >/dev/null
+    T6_ASSIGNED=yes
+    cp "$WORK/notes-mention" "$WORK/notes-before"
+    t6_wait control "\$2 == \"issueAssignedToYou\" && \$5 == \"$ISSUE_ID\""
+    control=$([ -n "$T6_GOT" ] && echo yes || echo no)
+    report "T6 control: A assigns the issue to B: success $(bool .data.issueUpdate.success "$WORK/asg.body"); B notified (issueAssignedToYou): $control after ${T6_WAITED} s"
+    t6_cleanup
+    if [ "$mention" = yes ]; then
+        report "T6 result: a comment through a member's key that mentions another member notifies them: the adoption page advises Owlshift's app"
+    elif [ "$control" = yes ]; then
+        report "T6 result: B's notifications work (the control) but the mention through A's key notified nothing: the adoption page requires Owlshift's app"
+    else
+        fail "T6: INCONCLUSIVE: neither the mention nor the control notified B within 120 s"
+    fi
+    expect "T6 the control notifies B" "$control" yes
+}
+
+# t6_cleanup: the assignee as it was, the comment deleted, the issue back in the archive or the trash.
+t6_cleanup() {
+    local vars
+    if [ "$T6_ASSIGNED" = yes ]; then
+        vars=$(jq -n -c --arg i "$ISSUE_ID" --arg a "$ISSUE_ASSIGNEE" '{i: $i, a: (if $a == "" then null else $a end)}')
+        lin unasg A 'mutation($i: String!, $a: String) { issueUpdate(id: $i, input: { assigneeId: $a }) { success } }' "$vars" >/dev/null
+        report "T6 give the issue back its assignee: success $(bool .data.issueUpdate.success "$WORK/unasg.body")"
+        if [ "$(bool .data.issueUpdate.success "$WORK/unasg.body")" = true ]; then T6_ASSIGNED=; else fail "T6 cleanup: FAILED: the issue stays assigned to B"; fi
+    fi
+    if [ -n "$T6_COMMENT" ]; then
+        lin cd A 'mutation($i: String!) { commentDelete(id: $i) { success } }' "$(jq -n -c --arg i "$T6_COMMENT" '{i: $i}')" >/dev/null
+        report "T6 delete the comment: success $(bool .data.commentDelete.success "$WORK/cd.body")"
+        if [ "$(bool .data.commentDelete.success "$WORK/cd.body")" = true ]; then
+            t6_notes notes-after
+            report "T6 B's notification of that comment, after the delete: $(awk -v c="$T6_COMMENT" '$4 == c' "$WORK/notes-after" | grep -q . && echo "still listed" || echo gone)"
+            T6_COMMENT=
+        else
+            fail "T6 cleanup: FAILED: the comment is left: bash $PROGRAM --restore $REPO $ISSUE"
+        fi
+    fi
+    case $ISSUE_PUT_BACK in
+    trash) lin back A 'mutation($i: String!) { r: issueDelete(id: $i) { success } }' "$(jq -n -c --arg i "$ISSUE_ID" '{i: $i}')" >/dev/null ;;
+    archive) lin back A 'mutation($i: String!) { r: issueArchive(id: $i) { success } }' "$(jq -n -c --arg i "$ISSUE_ID" '{i: $i}')" >/dev/null ;;
+    *) return 0 ;;
+    esac
+    lin backr A 'query($i: String!) { issue(id: $i) { archivedAt trashed } }' "$(jq -n -c --arg i "$ISSUE_ID" '{i: $i}')" >/dev/null
+    report "T6 put the issue back in the $ISSUE_PUT_BACK: success $(bool .data.r.success "$WORK/back.body"); read back: archived $([ -n "$(field .data.issue.archivedAt "$WORK/backr.body")" ] && echo yes || echo no), in the trash $(bool .data.issue.trashed "$WORK/backr.body")"
+    if [ "$(bool .data.r.success "$WORK/back.body")" = true ]; then ISSUE_PUT_BACK=; else fail "T6 cleanup: FAILED: the issue is not back in the archive or the trash"; fi
+}
+
 # ----------------------------------------------------------------------------------------------------------- cleanup
 
 # shellcheck disable=SC2329 # run by the EXIT trap
@@ -658,12 +1156,25 @@ cleanup() {
     local left all
     if [ "${CLEANED:-}" = yes ]; then return 0; fi
     CLEANED=yes
-    trap '' INT TERM
+    trap '' INT TERM HUP
+    { stty echo </dev/tty; } 2>/dev/null || true
+    # The machine account's token first: nothing below needs it.
+    rm -f "$WORK/m.token" "$WORK/m.auth" "$WORK/poll.body" "$WORK/poll.form" "$WORK/lin-B.auth"
     if [ "${STARTED:-no}" = yes ]; then
         section cleanup
+        t6_cleanup
+        rm -f "$WORK/lin-A.auth"
+        if [ "$T5_RAN" = yes ]; then t5_close; fi
         t3_close_window
         run_refs "$SSH_URL" >"$WORK/left"
         report "cleanup: this run's refs on the remote: $(wc -l <"$WORK/left" | tr -d ' '), left after deleting them: $(delete_refs "$SSH_URL" "$WORK/left")"
+        if [ "$T4_RAN" = yes ]; then
+            lg ls-remote "$RO_SSH" "$P-*" >"$WORK/roleft" 2>/dev/null
+            if [ -s "$WORK/roleft" ]; then
+                while read -r _ ref; do push "$RO_SSH" ":$ref" || true; done <"$WORK/roleft"
+            fi
+            report "cleanup: this run's refs on the read-only repository: $(wc -l <"$WORK/roleft" | tr -d ' '), left: $(lg ls-remote "$RO_SSH" "$P-*" 2>/dev/null | wc -l | tr -d ' ')"
+        fi
         t3_remove_workflow
         left=$(run_refs "$SSH_URL" | wc -l | tr -d ' ')
         all=$(lg ls-remote "$SSH_URL" "$CLAIMS/PROBE581-*" "refs/heads/owl581-probe-*" "refs/tags/owl581-probe-*" | wc -l | tr -d ' ')
@@ -677,6 +1188,11 @@ cleanup() {
         report "done, failures: $FAILED."
     fi
     rm -rf "${WORK:-/nonexistent}"
+    if [ "$SIGNED_IN" = yes ]; then
+        say ""
+        say "The machine account's token ($M_EXPIRY) is deleted from this machine but stays valid until it expires:"
+        say "signed in as the machine account, revoke it in Settings > Applications > Authorized GitHub Apps > owl-shift."
+    fi
 }
 
 restore() {
@@ -702,6 +1218,28 @@ restore() {
         WF_ADDED=yes
         t3_remove_workflow
     fi
+    lg ls-remote "$RO_SSH" "$CLAIMS/PROBE581-*" >"$WORK/roleft" 2>/dev/null
+    while read -r _ ref; do push "$RO_SSH" ":$ref" || true; done <"$WORK/roleft"
+    report "restore: PROBE581 claims on the read-only repository: $(wc -l <"$WORK/roleft" | tr -d ' '), left: $(lg ls-remote "$RO_SSH" "$CLAIMS/PROBE581-*" 2>/dev/null | wc -l | tr -d ' ')"
+    rest prs "repos/$REPO/pulls?state=open&per_page=100" >/dev/null
+    for PR_NUMBER in $(jq -r '.[] | select(.head.ref | startswith("owl581-probe-")) | .number' <"$WORK/prs.body" 2>/dev/null); do
+        printf '{"state":"closed"}' >"$WORK/close.json"
+        report "restore: close an owl581-probe pull request: HTTP $(rest close "repos/$REPO/pulls/$PR_NUMBER" PATCH "$WORK/close.json")"
+    done
+    PR_NUMBER=
+    if [ -n "$ISSUE" ]; then
+        if [ "$L_A" != yes ]; then
+            fail "restore: member A's Linear key is missing or malformed; the T6 comments are not looked for"
+            return 0
+        fi
+        lin rissue A 'query($i: String!) { issue(id: $i) { archivedAt trashed comments(first: 50) { nodes { id body } } } }' \
+            "$(jq -n -c --arg i "$ISSUE" '{i: $i}')" >/dev/null
+        for id in $(jq -r --arg m "$T6_MARK" '.data.issue.comments.nodes[]? | select(.body | startswith($m)) | .id' <"$WORK/rissue.body" 2>/dev/null); do
+            lin rcd A 'mutation($i: String!) { commentDelete(id: $i) { success } }' "$(jq -n -c --arg i "$id" '{i: $i}')" >/dev/null
+            report "restore: delete a T6 probe comment: success $(bool .data.commentDelete.success "$WORK/rcd.body")"
+        done
+        report "restore: the issue: archived $([ -n "$(field .data.issue.archivedAt "$WORK/rissue.body")" ] && echo yes || echo no), in the trash $(bool .data.issue.trashed "$WORK/rissue.body"); if the run restored it, move it back to the trash (or archive it) in Linear, and unassign the second member if it is still assigned"
+    fi
 }
 
 # -------------------------------------------------------------------------------------------------------------- main
@@ -717,20 +1255,29 @@ case ${1:-} in
     shift
     ;;
 esac
-if [ $# -ne 1 ]; then
+if [ $# -lt 1 ] || [ $# -gt 2 ]; then
     usage >&2
     exit 2
 fi
 REPO=$1
-case $REPO in
-*/*) ;;
-*)
-    say "$PROGRAM: $REPO must have the form owner/name"
-    exit 2
-    ;;
-esac
-if [ "$(printf '%s' "$REPO" | tr '[:upper:]' '[:lower:]')" = "$FORBIDDEN" ]; then
-    say "$PROGRAM: never run against $FORBIDDEN"
+ISSUE=${2:-}
+READONLY=${OWL581_READONLY_REPO:-$READONLY_DEFAULT}
+lower() { printf '%s' "$1" | tr '[:upper:]' '[:lower:]'; }
+for r in "$REPO" "$READONLY"; do
+    case $r in
+    */*) ;;
+    *)
+        say "$PROGRAM: $r must have the form owner/name"
+        exit 2
+        ;;
+    esac
+    if [ "$(lower "$r")" = "$FORBIDDEN" ]; then
+        say "$PROGRAM: never run against $FORBIDDEN"
+        exit 2
+    fi
+done
+if [ "$(lower "$REPO")" = "$(lower "$READONLY")" ]; then
+    say "$PROGRAM: OWL581_READONLY_REPO must be another repository than $REPO"
     exit 2
 fi
 for tool in git gh jq curl base64 perl; do
@@ -742,15 +1289,48 @@ done
 CHECKS=${OWL581_CHECKS:-T1 T2 T3}
 for c in $CHECKS; do
     case $c in
-    T1 | T2 | T3) ;;
+    T1 | T2 | T3 | T4 | T5 | T6) ;;
     *)
         say "$PROGRAM: unknown check $c in OWL581_CHECKS"
         exit 2
         ;;
     esac
 done
+case " $CHECKS " in
+*" T6 "*)
+    if [ -z "$ISSUE" ]; then
+        say "$PROGRAM: T6 needs ISSUE, an existing Linear issue of team SBX"
+        exit 2
+    fi
+    ;;
+esac
 
 WORK=$(mktemp -d "${TMPDIR:-/tmp}/owl581.XXXXXX") || exit 2
+SIGNED_IN=
+M_EXPIRY=
+M_LOGIN=
+GH_LOGIN=
+M_OK=
+M_COVERS=
+L_A=
+L_B=
+A_ID=
+B_URL=
+ISSUE_ID=
+ISSUE_ASSIGNEE=
+ISSUE_PUT_BACK=
+T6_COMMENT=
+T6_ASSIGNED=
+T6_GOT=
+T6_WAITED=0
+PR_NUMBER=
+T4_RAN=
+T5_RAN=
+case " $CHECKS " in
+*" T6 "*) read_linear_keys ;;
+*) if [ "$MODE" = restore ] && [ -n "$ISSUE" ]; then read_linear_keys; fi ;;
+esac
+unset LINEAR_API_KEY OWL581_LINEAR_KEY_B
 LOCAL=$WORK/local
 git init -q "$LOCAL" || exit 2
 export GIT_AUTHOR_NAME="OWL-581 probe" GIT_AUTHOR_EMAIL=probe@invalid
@@ -760,6 +1340,8 @@ export GIT_TERMINAL_PROMPT=0
 export GIT_SSH_COMMAND="ssh -o ControlMaster=no -o ControlPath=none"
 SSH_URL="git@github.com:$REPO.git"
 HTTPS_URL="https://github.com/$REPO.git"
+RO_SSH="git@github.com:$READONLY.git"
+RO_HTTPS="https://github.com/$READONLY.git"
 RUN=$(date -u +%Y%m%d%H%M%S)-$(od -An -N2 -tx1 /dev/urandom | tr -d ' \n')
 P=$CLAIMS/PROBE581-$RUN
 FAILED=0
@@ -772,10 +1354,10 @@ WINDOW=
 VISIBILITY=
 RULESETS=()
 trap cleanup EXIT
-trap 'exit 130' INT TERM
+trap 'exit 130' INT TERM HUP
 
 report "OWL-581 checks $CHECKS, $(date -u +%Y-%m-%dT%H:%M:%SZ), $(git --version), $(gh --version | head -n 1 | cut -d' ' -f1-3), $(uname -s), script sha256 $(script_sha), run $RUN"
-report "If this run is killed beyond its trap: bash docs/design/live-checks/$PROGRAM --restore $REPO"
+report "If this run is killed beyond its trap: bash docs/design/live-checks/$PROGRAM --restore $REPO${ISSUE:+ $ISSUE}"
 if ! gh auth status >/dev/null 2>&1 </dev/null; then
     say "$PROGRAM: gh is not signed in (gh auth status)"
     exit 2
@@ -797,6 +1379,11 @@ for url in "$SSH_URL" "$HTTPS_URL"; do
     fi
 done
 STARTED=yes
+case " $CHECKS " in
+*" T4 "* | *" T5 "*)
+    if machine_sign_in; then machine_identity; fi
+    ;;
+esac
 for c in $CHECKS; do
     case $c in
     T1)
@@ -808,6 +1395,15 @@ for c in $CHECKS; do
         T3_RAN=yes
         t3
         ;;
+    T4)
+        T4_RAN=yes
+        t4
+        ;;
+    T5)
+        T5_RAN=yes
+        t5
+        ;;
+    T6) t6 ;;
     esac
 done
 exit "$FAILED"
