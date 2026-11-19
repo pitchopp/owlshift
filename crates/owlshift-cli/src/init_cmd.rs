@@ -722,7 +722,7 @@ fn cache_advice(config: &Effective, folders: &[String], repo: Option<&Repo>) -> 
         "The setup reads {} read-only, and this machine opens a folder of your home only once \
          its personal configuration allows it: until then every run and gate refuses the \
          project. {}\nThen install the project once in this checkout yourself (`npm ci`, `yarn \
-         install`), so the folder holds its packages: the confined setup cannot add a missing \
+         install`, `pnpm install`), so the folder holds its packages: the confined setup cannot add a missing \
          one, and npm then says `EPERM` and \"root-owned files\", which `sudo` does not fix.",
         shown.join(", "),
         allow_caches_advice(repo, &missing, &personal)
