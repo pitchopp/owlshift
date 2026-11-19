@@ -1200,9 +1200,12 @@ mod tests {
         let text = project_file(&with(d, &["make ci"])).unwrap();
         let config = ProjectConfig::parse(&text).unwrap();
         assert_eq!(config.stack.gate, ["make ci"]);
-        assert_eq!(config.stack.setup, ["pnpm install --frozen-lockfile"]);
+        // OWL-598: pnpm's overlay setup and its store load as written.
+        assert_eq!(config.stack.setup, [owlshift_core::stack::PNPM_SETUP]);
+        assert_eq!(config.stack.caches, ["Library/pnpm"]);
         assert!(!text.contains("pnpm run test"));
         assert!(text.contains("# read from pnpm-lock.yaml, the lock file of pnpm\n"));
+        assert!(text.contains("# note: the setup installs through an overlay"));
     }
 
     #[test]
