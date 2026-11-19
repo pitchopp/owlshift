@@ -52,7 +52,7 @@ Next: `owlshift doctor` checks git, the harnesses and the Claude Code token for 
 Nothing detected was run: `owlshift gate` runs the gate to check it.
 ```
 
-Read `owlshift.toml`: each setting is explained in a comment above it. Check the gate under `[stack]`, which every agent's work must pass, and the state names under `[tracker]`. Then add the people whose `agent` label admits a ticket, by their Linear user id, under `[tracker]`:
+Read `owlshift.toml`: it lists every setting, each with a comment above it that says what it decides, its values and its default; a setting commented out with its default value changes nothing once uncommented. Check the gate under `[stack]`, which every agent's work must pass, and the state names under `[tracker.states]`. Then list the people whose `agent` label admits a ticket, by their Linear user id, in the commented-out `admitters` under `[tracker]`:
 
 ```toml
 admitters = ["2f9c51d0-6a3e-4b7e-9d41-0c8a7e5b3f12"]
@@ -161,6 +161,18 @@ From then on:
 - An admitted ticket first gets an intake run, which posts an `[owlshift] INTAKE` comment (its size, its routing, its dependencies), then waits its turn for a Build. Admitted tickets are taken in priority order, blockers respected (Linear's "blocked by" relations, or a line `Blocked by ENG-10` in the description), one at a time unless `policy.max_in_flight` says more. A ticket dispatched and not yet delivered keeps its place, whether it waits for your answers or for another pull request: answer it, or merge or close what it waits for, and the next one goes.
 - `owlshift status` says what the service does and which tickets wait for you; `owlshift why` says why an admitted ticket is not running; `owlshift logs ENG-12` prints what Owlshift recorded for one.
 - `owlshift stop` stops the service once the steps under way finish (`Stopping the daemon (pid 8671): each watch ends once its steps under way finish, then the daemon exits.`); `owlshift stop --forget` stops serving this project only.
+
+### How much Owlshift decides alone
+
+Out of the box Owlshift asks rather than guesses, works one ticket at a time and never merges. These keys of `owlshift.toml`, each explained in the file, let it do more alone:
+
+- `pipeline.plan_approval`: `"never"` lets a plan through without your approval; `"on-fork"`, which `init` writes, asks only when the plan leaves a choice open; `"always"` asks every time.
+- `policy.resolver_delegation`: what the resolver decides without you, from `"none"` to `"all"` (`"discoverable"` by default). `policy.resolver_passes` (5 runs by default) and `policy.resolver_budget_usd` bound how long it goes on before it asks.
+- `policy.ticket_budget_usd`: what one ticket's runs may cost before it parks; no budget by default.
+- `policy.max_in_flight`: how many tickets are worked at once, 1 by default.
+- `[forge] merge`: `"labeled"` (tickets carrying the label `owlshift:merge`) or `"all"` turns merge on green on: Owlshift merges a pull request it follows once its checks are green, into your default branch, by `merge_method` (`"squash"` by default). `"never"`, the default, leaves every merge to you.
+
+Whatever they say, a question on security or on an irreversible action always reaches a person, and so do the categories listed in `policy.always_human`. Under merge on green, a ticket that asked a security question is never merged by Owlshift, nor one whose other such question no person settled.
 
 ## Next
 

@@ -58,8 +58,9 @@ impl Kind for Github {
 
     fn project_file_lines(&self, _team: Option<&str>) -> Result<String, String> {
         Ok("\
-# Where the tickets live: \"github\" for the issues of this repository,
-# reached with the project's GitHub credential; the states are labels.
+# Where the tickets live: \"github\" (here) for the issues of this repository,
+# reached with its GitHub credential, the states being labels; \"linear\"; or
+# \"markdown\", one folder per ticket under tickets/. Required.
 kind = \"github\"
 "
         .to_owned())
@@ -216,16 +217,17 @@ kind = \"github\"
         let admitters = match admitter {
             Some(id) => format!(
                 "\
-# The GitHub accounts whose label admits an issue, by numeric id, which a
-# rename does not change: the account `owlshift init` signed in as.
+# The GitHub accounts whose label admits an issue, by numeric id (or handles
+# of [people]): the account `owlshift init` signed in as. Left out,
+# `owlshift watch --drain` refuses to start.
 admitters = [{}]
 ",
                 quote(id)
             ),
             None => "\
-# The GitHub accounts whose label admits an issue, by numeric id, which a
-# rename does not change. `owlshift init --skip-secrets` did not sign in:
-# put yours here (`gh api user --jq .id` prints it).
+# The GitHub accounts whose label admits an issue, by numeric id (or handles
+# of [people]); `gh api user --jq .id` prints yours. Default: none, and
+# `owlshift watch --drain` refuses to start.
 # admitters = [\"<your numeric GitHub account id>\"]
 "
             .to_owned(),
@@ -233,15 +235,26 @@ admitters = [{}]
         let [ready, working, needs_input, review] = STAGES;
         format!(
             "\
-# How a person admits an issue to Owlshift's queue: \"ready\" (putting the
-# ready label below on it) or {{ label = \"...\" }}. `owlshift do TICKET` does
-# not use it: it runs the issue it is given.
+# How a person admits an issue to Owlshift's queue (`owlshift do TICKET`
+# ignores it): \"ready\", the ready label below, which {{ state = \"...\" }}
+# would repeat, or {{ label = \"...\" }}; \"delegation\" is not built. Required.
 admit = \"ready\"
-{admitters}# The labels that show where an issue stands; `owlshift init` creates the
-# missing ones.
-states = {{ ready = {}, working = {}, needs_input = {}, review = {} }}
-# The label of each priority, every one optional; without them every issue
-# reads `unset`.
+{admitters}# A label that keeps an issue out of the drain, whatever else it carries;
+# never the admission label. Default: none, no issue is kept out.
+# exclude = \"agent:skip\"
+
+[tracker.states]
+# The labels that show where an issue stands; `owlshift init` creates the
+# missing ones. Required, but for `parked`, the label of an issue Owlshift
+# stopped. Default for `parked`: none, such an issue shows needs_input.
+ready = {}
+working = {}
+needs_input = {}
+review = {}
+# parked = \"agent:parked\"
+
+# The label of each priority, every one optional; an issue carrying several
+# reads the most urgent. Default: none, every issue reads `unset`.
 # [tracker.priorities]
 # urgent = \"priority:urgent\"
 # high = \"priority:high\"

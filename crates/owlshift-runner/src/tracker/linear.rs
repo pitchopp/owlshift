@@ -83,10 +83,12 @@ impl Kind for Linear {
             .ok_or("a Linear project needs its team key: pass --team, such as --team OWL")?;
         Ok(format!(
             "\
-# Where the tickets live: \"linear\", or \"markdown\" for tickets kept in
-# this repository, one folder per ticket under tickets/.
+# Where the tickets live: \"linear\" (here), \"github\" for the issues of this
+# repository, or \"markdown\" for tickets kept in it, one folder each under
+# tickets/. Required.
 kind = \"linear\"
 # The Linear team key: the prefix of its ticket ids, OWL in OWL-12.
+# Required for \"linear\".
 team = {}
 ",
             quote(team)

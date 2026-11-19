@@ -39,7 +39,7 @@ Next: `owlshift doctor` checks git, the harnesses and the Claude Code token for 
 Nothing detected was run: `owlshift gate` runs the gate to check it.
 ```
 
-Read `owlshift.toml`: each setting is explained in a comment above it. Check the gate under `[stack]`: it is what every agent's work must pass. Then commit the file and push it to your default branch. Each run reads the project file of the commit its branch starts from, and until the default branch holds one, your local file is used.
+Read `owlshift.toml`: it lists every setting, each with a comment above it that says what it decides, its values and its default; a setting commented out with its default value changes nothing once uncommented. Check the gate under `[stack]`: it is what every agent's work must pass. Then commit the file and push it to your default branch. Each run reads the project file of the commit its branch starts from, and until the default branch holds one, your local file is used.
 
 ## 2. Check the machine and the project: `owlshift doctor`
 
@@ -173,6 +173,18 @@ owlshift continue DEMO-1
 `continue` checks your answers. If one is missing or unclear, it asks again in a new comment; otherwise the work goes on to a pull request. Answer as many rounds as it takes: there is no limit.
 
 If a ticket stops for a reason it cannot settle itself, such as a run that fails twice, its stage becomes `Needs Input` with a comment marked `PARKED` that says why. Fix what it names, then `owlshift continue DEMO-1` restarts it.
+
+### How much Owlshift decides alone
+
+Out of the box Owlshift asks rather than guesses, works one ticket at a time and never merges. These keys of `owlshift.toml`, each explained in the file, let it do more alone:
+
+- `pipeline.plan_approval`: `"never"` lets a plan through without your approval; `"on-fork"`, which `init` writes, asks only when the plan leaves a choice open; `"always"` asks every time.
+- `policy.resolver_delegation`: what the resolver decides without you, from `"none"` to `"all"` (`"discoverable"` by default). `policy.resolver_passes` (5 runs by default) and `policy.resolver_budget_usd` bound how long it goes on before it asks.
+- `policy.ticket_budget_usd`: what one ticket's runs may cost before it parks; no budget by default.
+- `policy.max_in_flight`: how many tickets are worked at once, 1 by default.
+- `[forge] merge`: `"labeled"` (tickets carrying the label `owlshift:merge`) or `"all"` turns merge on green on: Owlshift merges a pull request it follows once its checks are green, into your default branch, by `merge_method` (`"squash"` by default). `"never"`, the default, leaves every merge to you.
+
+Whatever they say, a question on security or on an irreversible action always reaches a person, and so do the categories listed in `policy.always_human`. Under merge on green, a ticket that asked a security question is never merged by Owlshift, nor one whose other such question no person settled.
 
 ## 6. The background service
 

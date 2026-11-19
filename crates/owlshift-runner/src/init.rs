@@ -59,8 +59,13 @@ pub fn project_file(options: &InitOptions) -> Result<String, String> {
 # runner of the project read this file. It holds no secret: the tracker and
 # forge credentials, and the token agent runs log in to Claude Code with,
 # live in each machine's system keychain (`owlshift init` stores them).
+#
+# Every key that applies to this tracker is listed, with what it decides, its
+# values and its default. A key commented out with its default value changes
+# nothing once uncommented; one with an example value is unset until set.
 
-# The Owlshift versions that can read this file.
+# The Owlshift versions that can read this file: a semantic version
+# requirement. Required.
 requires = \">={}.{}\"
 
 [tracker]
@@ -127,50 +132,125 @@ requires = \">={}.{}\"
         "\
 {admission}
 [stack]
-# The project's full gate: lint, formatter and tests, run in order from the
-# repository root. Owlshift runs it on the commit it delivers; the build
-# role first runs the commands that cover its change. With no command,
-# `owlshift do` refuses to start a ticket.
-{gate}# Agents start from an almost empty environment. Name here the variables of
-# your environment the gate needs, such as a feature flag; the whole agent
-# run sees them. Credential variables are refused, and each machine that
-# runs Owlshift passes only the names its operator lists in `allow_gate_env`
-# in the personal configuration. A path under your home stays unreadable to
-# the sandboxed run unless it is on the PATH.
+# The project's full gate, run in order from the repository root on the
+# commit Owlshift delivers: lint, formatter and tests. Required: with no
+# command, `owlshift do` refuses to start a ticket.
+{gate}# Variables of your environment the gate needs, such as a feature flag, seen
+# by the whole agent run; credential variables are refused, and a machine
+# passes only those its personal `allow_gate_env` lists. Default: none.
 # gate_env = [\"FEATURE_FLAGS\"]
-# The commands that install the gate's dependencies, run in order with the
-# network open before a Build's agent starts and again before the gate. The
-# run's temporary folder is kept between them; the worktree may change only
-# in ignored files, so install with a frozen or locked lockfile.
+# Commands that install the gate's dependencies, run in order with the
+# network open before a Build's agent and before the gate; they may change
+# only ignored files, so install from a frozen lockfile. Default: none.
 {setup}# Folders of your home, such as a package store, that the setup, the agent
-# and the gate read, never write. Each machine that runs Owlshift opens only
-# the folders its operator lists in `allow_caches` in the personal
-# configuration; a folder holding credentials is refused.
+# and the gate read, never write; a machine opens only those its personal
+# `allow_caches` lists, never one holding credentials. Default: none.
 {caches}# The files agents receive as the project's rules, taken whole from the
-# default branch. Left out, the root AGENTS.md is used when there is one.
-# Once set, every file listed must exist there; [] sends no rule.
+# default branch, at most 32 and 64 KiB together, each required to exist.
+# Left out, the root AGENTS.md when there is one; [] sends no rule.
 # rules = [\"AGENTS.md\", \".claude/rules/testing.md\"]
+# Named resources a ticket can hold, each with the paths it covers (`*` one
+# path part, `**` any number); two tickets holding one never run together.
+# Default: none.
+# [stack.resources]
+# migrations = \"backend/*/migrations/**\"
 
 [pipeline]
 # A ticket's pipeline variant, unless intake or a label picks another:
-# \"trivial\", \"standard\" or \"risky\". `owlshift do` runs design, design
-# review, build and verify; \"trivial\" skips design and design review.
+# \"trivial\" (build and verify), \"standard\" (design, design review, build
+# and verify) or \"risky\" (standard, a person approving the plan). Required.
 default = \"standard\"
-# When a human approves the plan: \"always\", \"on-fork\" or \"never\".
+# When a person approves the plan before Build: \"always\", \"on-fork\" (when
+# the plan leaves a choice open) or \"never\". Required.
 plan_approval = \"on-fork\"
+# Who confirms a review finding before it is acted on: \"author\" (the next
+# design or fix run answers it) or \"arbiter\" (one arbiter run per review
+# pass). Default: `\"author\"`.
+# findings = \"author\"
+# Whether every design review and verify pass adds a Codex reviewer beside
+# the Claude Code ones, a Codex that cannot serve dropping its seat: true or
+# false. Default: `false`.
+# codex_reviewer = false
 
 [models]
-# The model of each tier, per harness; left out, a harness runs its own
-# default model, but `fast` falls back to `standard`. A ticket's Build runs
-# on the tier of its routing verdict, or of its `tier:` label. For example:
-# deep = {{ claude = \"claude-opus-5-5\" }}
-# standard = {{ claude = \"claude-sonnet-5\" }}
-# fast = {{ claude = \"claude-haiku-4-5\" }}
+# The model of each tier, per harness (`claude`, `codex`). Left out, a harness
+# runs its own default model, but Claude's `fast` falls back to `standard`.
+# A ticket's Build runs on its routing verdict's tier, or its `tier:` label's.
+# deep = {{ claude = \"claude-opus-5-5\", codex = \"<a Codex model>\" }}
+# standard = {{ claude = \"claude-sonnet-5\", codex = \"<a Codex model>\" }}
+# fast = {{ claude = \"claude-haiku-4-5\", codex = \"<a Codex model>\" }}
 
 [policy]
-# Question categories always left to a human, on top of the floor's
-# security, data_loss, money, legal, irreversible and scope.
+# Question categories always left to a person, on top of those the delegation
+# level keeps and the floor's, `security` and `irreversible`, which reach a
+# person at every level. Required.
 always_human = []
+# How long the decider's latest comment must stay unedited before their
+# answer counts: whole minutes, 1 to 1440; ending it with `go` counts it at
+# once. Default: `10`.
+# quiet_window_minutes = 10
+# How many of the project's tickets may be worked at once, between Ready and
+# Watch: 1 to 10; each machine's personal `concurrent_runs` caps it too.
+# Default: `1`.
+# max_in_flight = 1
+# How many pull requests Owlshift delivered may be open at once before the
+# drain starts no new Build: 1 to 20. Default: `3`.
+# max_open_prs = 3
+# Whether two Owlshift tickets may build on the same file at once:
+# \"exclusive\" (the later one waits) or \"rebase\" (both build, the later one
+# refreshed onto the first's merge). Default: `\"exclusive\"`.
+# overlap = \"exclusive\"
+# What the resolver decides without the decider: \"none\", \"facts\",
+# \"discoverable\", \"ticket\" (also scope questions the ticket's text answers)
+# or \"all\" (everything but the floor). Default: `\"discoverable\"`.
+# resolver_delegation = \"discoverable\"
+# The runs in a row the resolver may unblock in one command: 1 to 50, or
+# \"unlimited\", which needs resolver_budget_usd. Default: `5`.
+# resolver_passes = 5
+# A ceiling, in dollars, on what the resolver runs of one chain cost; past
+# it, the next questions go to the decider. A positive number. Default:
+# none, no ceiling; required with resolver_passes = \"unlimited\".
+# resolver_budget_usd = 20.0
+# What one ticket's runs may cost in all, in dollars, every run counted
+# across its commands; reached, the ticket parks until a person restarts it.
+# A positive number. Default: none, no budget.
+# ticket_budget_usd = 100.0
+
+# The forge. Merge on green: the runner merges a pull request it follows,
+# once green, into the default branch; read at that branch's head, never
+# from a ticket's branch or the personal file.
+# [forge]
+# Which pull requests the runner merges once green: \"never\", \"labeled\"
+# (a ticket carrying the label `owlshift:merge`) or \"all\". Default: `\"never\"`.
+# merge = \"never\"
+# How the runner merges: \"squash\", \"merge\" or \"rebase\". Default: `\"squash\"`.
+# merge_method = \"squash\"
+# The forge logins whose reviews on Owlshift's pull requests are read, each
+# mapped to its tracker account: the decider's sends the ticket back to
+# Build. Default: none, no review is read. Refused beside [people].
+# [forge.reviewers]
+# octocat = \"<account id>\"
+
+# Code zones, keyed by their folder from the repository root: `owner` is the
+# tracker account (or [people] handle) that decides the tickets without an
+# assignee touching the zone. Default: none.
+# [zones.\"backend/billing\"]
+# owner = \"<account id>\"
+
+# The project's people, each once under a handle (a lowercase letter, then up
+# to 31 lowercase letters, digits, `-` or `_`): `tracker`, their account as the
+# tracker reports it, and `forge`, their login (optional). Default: none.
+# With it, admitters and owners name handles, every person with a `forge`
+# login is a reviewer, and [forge.reviewers] is refused.
+# [people.ann]
+# tracker = \"<account id>\"
+# forge = \"<forge login>\"
+
+# Rules added to one role's brief alone, after stack.rules and within its
+# limits: build, resolver, intake, design, design_review, verify or arbiter.
+# Default: none.
+# [roles.verify]
+# rules = [\"docs/review.md\"]
 "
     ));
     ProjectConfig::parse(&text)
@@ -1054,6 +1134,317 @@ mod tests {
         assert!(error.contains("--team"), "{error}");
     }
 
+    const TRACKERS: [TrackerKind; 3] = [
+        TrackerKind::Linear,
+        TrackerKind::Github,
+        TrackerKind::Markdown,
+    ];
+
+    /// The project file `init` writes for `kind`, with a gate.
+    fn written(kind: TrackerKind) -> String {
+        let team = (kind == TrackerKind::Linear).then_some("OWL");
+        project_file(&options(kind, team, &["make test"])).unwrap()
+    }
+
+    /// The keys of the project file that do not apply to `kind`'s tracker.
+    fn not_applying(kind: TrackerKind) -> &'static [&'static str] {
+        match kind {
+            TrackerKind::Linear => &["tracker.priorities"],
+            TrackerKind::Github => &["tracker.team"],
+            TrackerKind::Markdown => &["tracker.team", "tracker.priorities"],
+        }
+    }
+
+    /// Whether the dotted key `key` is `of` or a key under it, a `*` of `of`
+    /// standing for any one part (`people.ann.forge` is under `people.*`).
+    fn is_under(key: &str, of: &str) -> bool {
+        let key: Vec<&str> = key.split('.').collect();
+        let of: Vec<&str> = of.split('.').collect();
+        key.len() >= of.len() && of.iter().zip(&key).all(|(o, k)| *o == "*" || o == k)
+    }
+
+    /// The leaf keys of the project file's JSON schema, dotted, `*` for a
+    /// key a person names (`zones.*.owner`).
+    fn schema_keys() -> Vec<String> {
+        let (_, schema) = owlshift_contracts::schema::all()
+            .into_iter()
+            .find(|(stem, _)| *stem == "project-config")
+            .unwrap();
+        let root = schema.as_value();
+        let mut keys = Vec::new();
+        schema_leaves(root, &root["$defs"], "", &mut keys);
+        keys
+    }
+
+    /// The leaves of `node`: a reference is followed, an optional value
+    /// (one branch besides null) read as that branch, an object's keys
+    /// walked, a map's under `*`; anything else, a choice included, is a
+    /// leaf.
+    fn schema_leaves(
+        node: &serde_json::Value,
+        defs: &serde_json::Value,
+        prefix: &str,
+        out: &mut Vec<String>,
+    ) {
+        let null = serde_json::json!("null");
+        let mut node = node;
+        loop {
+            if let Some(name) = node
+                .get("$ref")
+                .and_then(serde_json::Value::as_str)
+                .and_then(|reference| reference.strip_prefix("#/$defs/"))
+            {
+                node = &defs[name];
+                continue;
+            }
+            let branches: Vec<&serde_json::Value> = ["anyOf", "oneOf"]
+                .iter()
+                .filter_map(|word| node.get(*word).and_then(serde_json::Value::as_array))
+                .flatten()
+                .filter(|branch| branch.get("type") != Some(&null))
+                .collect();
+            match branches[..] {
+                [one] => node = one,
+                _ => break,
+            }
+        }
+        let under = |key: &str| {
+            if prefix.is_empty() {
+                key.to_owned()
+            } else {
+                format!("{prefix}.{key}")
+            }
+        };
+        if let Some(properties) = node
+            .get("properties")
+            .and_then(serde_json::Value::as_object)
+        {
+            for (name, inner) in properties {
+                schema_leaves(inner, defs, &under(name), out);
+            }
+        } else if let Some(map) = node.get("additionalProperties").filter(|v| v.is_object()) {
+            schema_leaves(map, defs, &under("*"), out);
+        } else {
+            out.push(prefix.to_owned());
+        }
+    }
+
+    /// The leaves of a parsed TOML table, dotted under `prefix`; an empty
+    /// table is a leaf.
+    fn toml_leaves(table: &toml::Table, prefix: &str, out: &mut Vec<String>) {
+        for (key, value) in table {
+            let path = if prefix.is_empty() {
+                key.clone()
+            } else {
+                format!("{prefix}.{key}")
+            };
+            match value {
+                toml::Value::Table(inner) if !inner.is_empty() => toml_leaves(inner, &path, out),
+                _ => out.push(path),
+            }
+        }
+    }
+
+    /// One line of a project file, one leading `# ` taken off, read as TOML:
+    /// `Some((true, table))` for a table header, `Some((false, keys))` for
+    /// a key line (`key = [` opening an array counting as `key = []`),
+    /// `None` for prose and the rest.
+    fn toml_line(line: &str) -> Option<(bool, toml::Table)> {
+        let bare = line.strip_prefix("# ").unwrap_or(line);
+        let bare = match bare.strip_suffix(" = [") {
+            Some(key) => format!("{key} = []"),
+            None => bare.to_owned(),
+        };
+        let table = bare.parse::<toml::Table>().ok().filter(|t| !t.is_empty())?;
+        Some((bare.starts_with('['), table))
+    }
+
+    /// The keys `text` names, set or commented out, dotted under their
+    /// table.
+    fn file_keys(text: &str) -> Vec<String> {
+        let mut table = String::new();
+        let mut keys = Vec::new();
+        for line in text.lines() {
+            let Some((header, parsed)) = toml_line(line) else {
+                continue;
+            };
+            let mut found = Vec::new();
+            if header {
+                toml_leaves(&parsed, "", &mut found);
+                table = found.pop().unwrap();
+            } else {
+                toml_leaves(&parsed, &table, &mut found);
+                keys.extend(found);
+            }
+        }
+        keys
+    }
+
+    /// OWL-594: the file `init` writes names every key of the project
+    /// file's schema that applies to its tracker, set or commented out, and
+    /// none that does not apply or the schema lacks: a key added to the
+    /// schema fails here until the file documents it.
+    #[test]
+    fn every_key_that_applies_is_in_the_file() {
+        let schema = schema_keys();
+        for key in ["policy.max_in_flight", "forge.merge", "people.*.forge"] {
+            assert!(schema.iter().any(|k| k == key), "{key}: {schema:?}");
+        }
+        for kind in TRACKERS {
+            let text = written(kind);
+            let file = file_keys(&text);
+            for key in &schema {
+                let applies = !not_applying(kind).iter().any(|out| is_under(key, out));
+                let named = file.iter().any(|f| is_under(f, key));
+                assert_eq!(named, applies, "{kind:?}, {key}:\n{text}");
+            }
+            for key in &file {
+                assert!(
+                    schema.iter().any(|s| is_under(key, s)),
+                    "{kind:?}: {key} is no key of the project file"
+                );
+            }
+        }
+    }
+
+    /// `text` with each commented-out key whose comment gives its value as
+    /// the default (``Default: `value`.``) uncommented, with its commented
+    /// table header; and the keys uncommented, in order.
+    fn with_defaults_uncommented(text: &str) -> (String, Vec<String>) {
+        let mut lines: Vec<String> = text.lines().map(str::to_owned).collect();
+        let mut header = None;
+        let mut prose = String::new();
+        let mut keys = Vec::new();
+        for i in 0..lines.len() {
+            let line = lines[i].clone();
+            match toml_line(&line) {
+                Some((true, _)) => header = Some(i),
+                Some((false, _)) => {
+                    let (key, value) = line.split_once(" = ").unwrap();
+                    if let Some(key) = key.strip_prefix("# ")
+                        && prose.contains(&format!("Default: `{value}`"))
+                    {
+                        lines[i] = line[2..].to_owned();
+                        if let Some(at) = header
+                            && let Some(bare) = lines[at].strip_prefix("# ")
+                        {
+                            lines[at] = bare.to_owned();
+                        }
+                        keys.push(key.to_owned());
+                    }
+                }
+                None => {
+                    if let Some(words) = line.strip_prefix('#') {
+                        prose.push(' ');
+                        prose.push_str(words.trim());
+                        continue;
+                    }
+                }
+            }
+            prose.clear();
+        }
+        (lines.join("\n") + "\n", keys)
+    }
+
+    /// What `config` decides: the values its keys with a default take, read
+    /// through their accessors, and the rest of it with those keys left out.
+    /// A `[forge]` decides only its merge, method and reviewers.
+    fn effective(mut config: ProjectConfig) -> (String, ProjectConfig) {
+        let forge = config.forge.take().unwrap_or_default();
+        let (policy, pipeline) = (&config.policy, &config.pipeline);
+        let decided = format!(
+            "{:?}",
+            (
+                policy.quiet_window(),
+                policy.max_in_flight(),
+                policy.max_open_prs(),
+                policy.overlap(),
+                policy.resolver(),
+                pipeline.findings(),
+                pipeline.codex_reviewer(),
+                (forge.merge(), forge.merge_method(), forge.reviewers),
+            )
+        );
+        let policy = &mut config.policy;
+        policy.quiet_window_minutes = None;
+        policy.max_in_flight = None;
+        policy.max_open_prs = None;
+        policy.overlap = None;
+        policy.resolver_delegation = None;
+        policy.resolver_passes = None;
+        config.pipeline.findings = None;
+        config.pipeline.codex_reviewer = None;
+        (decided, config)
+    }
+
+    /// OWL-594: uncommenting every key the file gives with its default
+    /// leaves the effective configuration as it was.
+    #[test]
+    fn uncommenting_the_defaults_changes_nothing() {
+        for kind in TRACKERS {
+            let text = written(kind);
+            let (uncommented, keys) = with_defaults_uncommented(&text);
+            assert_eq!(
+                keys,
+                [
+                    "findings",
+                    "codex_reviewer",
+                    "quiet_window_minutes",
+                    "max_in_flight",
+                    "max_open_prs",
+                    "overlap",
+                    "resolver_delegation",
+                    "resolver_passes",
+                    "merge",
+                    "merge_method",
+                ],
+                "{kind:?}"
+            );
+            let before = ProjectConfig::parse(&text).unwrap();
+            let after =
+                ProjectConfig::parse(&uncommented).unwrap_or_else(|e| panic!("{e}\n{uncommented}"));
+            assert_ne!(before, after, "{kind:?}");
+            assert_eq!(effective(before), effective(after), "{kind:?}");
+        }
+    }
+
+    /// OWL-594: the file sets the values it set before every key was
+    /// listed, so `doctor` and every command read the same configuration.
+    #[test]
+    fn the_file_sets_what_it_set_before() {
+        let version = Version::parse(OWLSHIFT_VERSION).unwrap();
+        let labels = "states = { ready = \"Todo\", working = \"In Progress\", needs_input = \
+                      \"Needs Input\", review = \"In Review\" }";
+        for (kind, tracker) in [
+            (
+                TrackerKind::Linear,
+                format!("kind = \"linear\"\nteam = \"OWL\"\nadmit = {{ label = \"agent\" }}\n{labels}"),
+            ),
+            (
+                TrackerKind::Github,
+                "kind = \"github\"\nadmit = \"ready\"\nstates = { ready = \"agent:ready\", working = \
+                 \"agent:working\", needs_input = \"agent:needs-input\", review = \"agent:review\" }"
+                    .to_owned(),
+            ),
+            (
+                TrackerKind::Markdown,
+                format!("kind = \"markdown\"\nadmit = {{ label = \"agent\" }}\n{labels}"),
+            ),
+        ] {
+            let before = format!(
+                "requires = \">={}.{}\"\n[tracker]\n{tracker}\n[stack]\ngate = [\"make test\"]\n\
+                 [pipeline]\ndefault = \"standard\"\nplan_approval = \"on-fork\"\n[models]\n\
+                 [policy]\nalways_human = []\n",
+                version.major, version.minor
+            );
+            assert_eq!(
+                ProjectConfig::parse(&written(kind)).unwrap(),
+                ProjectConfig::parse(&before).unwrap(),
+                "{kind:?}"
+            );
+        }
+    }
+
     fn detected(names: &[&str], files: &[(&str, &str)]) -> Detection {
         owlshift_core::stack::detect(&RootFiles {
             names: names
@@ -1078,14 +1469,12 @@ mod tests {
     #[test]
     fn nothing_detected_writes_the_template_as_before() {
         let text = project_file(&with(Detection::default(), &[])).unwrap();
-        assert!(
-            text.contains(
-                "\n# `owlshift do` refuses to start a ticket.\ngate = []\n# Agents start"
-            )
-        );
+        assert!(text.contains(
+            "\n# command, `owlshift do` refuses to start a ticket.\ngate = []\n# Variables of"
+        ));
         assert!(text.contains("# network open before"));
         assert!(
-            text.contains("`owlshift do` runs design, design\n# review, build and verify;")
+            text.contains("\"standard\" (design, design review, build\n# and verify)")
                 && !text.contains("build stage only")
         );
         assert!(
