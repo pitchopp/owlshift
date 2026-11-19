@@ -1599,7 +1599,7 @@ fn forge_reviewers_check(config: &Effective) -> Option<Check> {
         });
     }
     Some(match &config.forge {
-        Some(forge) => Check::ok(
+        Some(forge) if !forge.reviewers.is_empty() => Check::ok(
             Section::Project,
             SUBJECT,
             format!(
@@ -1608,7 +1608,8 @@ fn forge_reviewers_check(config: &Effective) -> Option<Check> {
                 forge.reviewers.len()
             ),
         ),
-        None => Check::warn(
+        // No `[forge]` table, or one that sets only other keys such as `merge`.
+        _ => Check::warn(
             Section::Project,
             SUBJECT,
             "`[forge].reviewers` is not set: no review on Owlshift's pull requests is read",
@@ -4902,6 +4903,25 @@ states = { ready = "Todo", working = "Doing", needs_input = "Asked", review = "R
             named.detail.starts_with("2 reviewer(s)"),
             "{}",
             named.detail
+        );
+    }
+
+    /// OWL-600: a `[forge]` table that sets no reviewer (only `merge`, say)
+    /// warns like a project without the table: nobody is asked to review.
+    #[test]
+    fn forge_table_without_reviewers_is_warned_of() {
+        let system = logged_in(with_harnesses(with_git(FakeSystem::default())));
+        let tracker = r#"kind = "markdown"
+admit = "delegation"
+states = { ready = "Todo", working = "Doing", needs_input = "Asked", review = "Review" }"#;
+        let (_dir, only_merge) =
+            project_tracked_by(&format!("{tracker}\n[forge]\nmerge = \"never\""));
+        let report = run(&system, &only_merge);
+        let warned = line(&report, "forge reviewers");
+        assert_eq!(warned.status, Status::Warn);
+        assert_eq!(
+            warned.detail,
+            "`[forge].reviewers` is not set: no review on Owlshift's pull requests is read"
         );
     }
 
