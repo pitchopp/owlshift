@@ -1720,7 +1720,7 @@ fn tree_entries(git: &Git, checkout: &Path, commit: &str) -> Result<Vec<Entry>, 
 }
 
 /// Writes `content` as a blob, with no filter, and returns its id.
-fn blob(git: &Git, checkout: &Path, content: &[u8]) -> Result<String, String> {
+pub(crate) fn blob(git: &Git, checkout: &Path, content: &[u8]) -> Result<String, String> {
     with_input(
         git,
         checkout,
@@ -1730,7 +1730,12 @@ fn blob(git: &Git, checkout: &Path, content: &[u8]) -> Result<String, String> {
 }
 
 /// Runs git with `input` on its standard input; returns its output, trimmed.
-fn with_input(git: &Git, checkout: &Path, args: &[&str], input: &[u8]) -> Result<String, String> {
+pub(crate) fn with_input(
+    git: &Git,
+    checkout: &Path,
+    args: &[&str],
+    input: &[u8],
+) -> Result<String, String> {
     let output = git
         .output(checkout, args, Some(input))
         .map_err(|e| e.to_string())?;

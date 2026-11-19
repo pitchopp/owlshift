@@ -336,6 +336,7 @@ impl ChildProject {
             usage: &usage,
             web_tools: true,
             takes: owlshift_runner::operator::Taking::All,
+            claimant: &|| Err("no operator on this bench".to_owned()),
         };
         let mut sink = EventSink::new(REPO, EventLog::in_dir(&self.data), out);
         act(&on_demand, &mut sink)

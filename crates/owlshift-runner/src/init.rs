@@ -202,6 +202,15 @@ always_human = []
 # \"exclusive\" (the later one waits) or \"rebase\" (both build, the later one
 # refreshed onto the first's merge). Default: `\"exclusive\"`.
 # overlap = \"exclusive\"
+# Where a ticket is claimed, so that one runner alone works it: \"local\" (the
+# ticket locks of each machine alone; nothing is pushed) or \"remote\" (a claim
+# ref on origin, for a team's runners or one person's two machines; the
+# default branch's file decides it). Under \"remote\", a command whose operator cannot be
+# read, the tracker key's account or, on the Markdown tracker,
+# `identity.tracker`, is refused: a claim names its operator. Set back to
+# \"local\", the claims on origin expire, a person's to release. Default:
+# `\"local\"`.
+# claims = \"local\"
 # What the resolver decides without the decider: \"none\", \"facts\",
 # \"discoverable\", \"ticket\" (also scope questions the ticket's text answers)
 # or \"all\" (everything but the floor). Default: `\"discoverable\"`.
@@ -1365,6 +1374,7 @@ mod tests {
                 policy.max_in_flight(),
                 policy.max_open_prs(),
                 policy.overlap(),
+                policy.claims(),
                 policy.resolver(),
                 pipeline.findings(),
                 pipeline.codex_reviewer(),
@@ -1376,6 +1386,7 @@ mod tests {
         policy.max_in_flight = None;
         policy.max_open_prs = None;
         policy.overlap = None;
+        policy.claims = None;
         policy.resolver_delegation = None;
         policy.resolver_passes = None;
         config.pipeline.findings = None;
@@ -1399,6 +1410,7 @@ mod tests {
                     "max_in_flight",
                     "max_open_prs",
                     "overlap",
+                    "claims",
                     "resolver_delegation",
                     "resolver_passes",
                     "merge",

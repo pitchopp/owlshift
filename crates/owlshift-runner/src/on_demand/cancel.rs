@@ -44,7 +44,7 @@ impl OnDemand<'_> {
         request: Option<&Request>,
         sink: &mut EventSink<'_>,
     ) -> Option<Result<Canceled, Stop>> {
-        let mut p = match self.prepare(ticket, Command::Continue) {
+        let mut p = match self.prepare(ticket, Command::Continue, sink) {
             Ok(p) => p,
             Err(stop) if stop.is_busy() => return None,
             Err(stop) => return Some(Err(stop)),

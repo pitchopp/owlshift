@@ -114,6 +114,21 @@
         }
       ]
     },
+    "Claims": {
+      "description": "`policy.claims` (OWL-586): where a ticket's claim lives.",
+      "oneOf": [
+        {
+          "description": "The ticket locks of this machine alone: nothing is pushed.",
+          "type": "string",
+          "const": "local"
+        },
+        {
+          "description": "A claim ref on `origin`, taken, renewed and deleted by the runner.",
+          "type": "string",
+          "const": "remote"
+        }
+      ]
+    },
     "DelegationLevel": {
       "description": "What a project lets the resolver decide without its decider\n(`policy.resolver_delegation`, architecture section 4, \"Delegation\nlevel\", OWL-328). `Ord` sorts the levels from nothing to everything but\nthe floor.",
       "oneOf": [
@@ -360,6 +375,17 @@
           "items": {
             "type": "string"
           }
+        },
+        "claims": {
+          "description": "Whether a ticket is claimed on the git remote (P10, OWL-586;\narchitecture section 7, \"Claims\"): `local`, the default, keeps the\nticket locks of one machine alone and pushes nothing; `remote` takes a\nclaim ref on `origin` before a command works a ticket, so that one\nrunner alone works it across machines. Read at the base commit. A\nfile using it requires an Owlshift that reads it.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Claims"
+            },
+            {
+              "type": "null"
+            }
+          ]
         },
         "max_in_flight": {
           "description": "How many of the project's tickets may be worked at once, a whole\nnumber from 1 to 10 (OWL-401; architecture section 5, \"Parallel\",\n\"Three counts\"): the tickets at a stage after Ready and before Watch\nat which the drain dispatches no other, and the most whose stage steps\nrun. Absent: 1, one ticket at a time. A file using it requires an\nOwlshift that reads it.",

@@ -102,7 +102,7 @@ impl OnDemand<'_> {
         by: Option<&'static str>,
         sink: &mut EventSink<'_>,
     ) -> Result<Delivered, Stop> {
-        let mut p = self.prepare(ticket, Command::Continue)?;
+        let mut p = self.prepare(ticket, Command::Continue, sink)?;
         // A cancel still standing is withdrawn (OWL-474).
         self.withdraw_cancel(ticket, sink);
         self.drop_carry(ticket, sink);

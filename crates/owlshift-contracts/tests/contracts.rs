@@ -14,10 +14,11 @@ use owlshift_contracts::comment::{Footer, Header, MarkedComment, MarkerKind};
 use owlshift_contracts::config::{Admit, PersonalConfig, ProjectConfig, peek_requires};
 use owlshift_contracts::drain::{TicketIntake, TicketProposals};
 use owlshift_contracts::event::Event;
+use owlshift_contracts::format::Format;
 use owlshift_contracts::ids::TicketId;
 use owlshift_contracts::refs::{
-    AskKind, BuildRefusal, Claim, EndedWhy, PersistedState, PushKind, TicketDelivery,
-    TicketQuestions, claim_ref, ticket_ref,
+    AskKind, BuildRefusal, Claim, EndedWhy, PersistedState, PushKind, TicketClaimLost,
+    TicketClaimed, TicketDelivery, TicketQuestions, claim_ref, ticket_ref,
 };
 use owlshift_contracts::result::{
     AnswerClass, DecisionsRefusal, MAX_QUESTION_BYTES, MAX_QUESTIONS, MAX_QUESTIONS_BYTES,
@@ -2188,9 +2189,79 @@ fn event_claim_and_state_rejections() {
     );
     rejects(
         "newer claim",
-        claim(|v| v["format"] = json!(2)),
+        claim(|v| v["format"] = json!(3)),
         "upgrade Owlshift",
     );
+    // P0's format 1 was never written, and is not read (OWL-586).
+    rejects(
+        "claim of format 1",
+        claim(|v| v["format"] = json!(1)),
+        "unknown format 1",
+    );
+    rejects(
+        "claim's runner is a host name",
+        claim(|v| v["runner"] = json!("ada-laptop")),
+        "16 lowercase hexadecimal digits",
+    );
+    rejects(
+        "claim's operator blank",
+        claim(|v| v["operator"] = json!(" ")),
+        "is blank",
+    );
+    rejects(
+        "claim expiring before it was taken",
+        claim(|v| v["expires_at"] = json!("2026-11-19T08:00:00Z")),
+        "is before claimed_at",
+    );
+    rejects(
+        "claim holding an empty path",
+        claim(|v| v["held"]["files"] = json!([""])),
+        "held.files holds the path",
+    );
+    let empty = Claim::parse(&edited("claim.json", |v| {
+        v.as_object_mut().unwrap().remove("held");
+    }))
+    .unwrap();
+    assert!(empty.held.is_empty());
+    assert!(!empty.render().contains("repository"), "{}", empty.render());
+
+    // The records a runner keeps of its claims (OWL-586).
+    let claim = Claim::parse(&fixture("claim.json")).unwrap();
+    let commit = "0123456789abcdef0123456789abcdef01234567".to_owned();
+    let record = TicketClaimed {
+        format: Format,
+        ticket: TicketId::new("OWL-12").unwrap(),
+        commit: None,
+        next: Some(commit.clone()),
+        deleting: false,
+        claim: claim.clone(),
+    };
+    assert_eq!(TicketClaimed::parse(&record.render()).unwrap(), record);
+    let neither = TicketClaimed {
+        next: None,
+        ..record.clone()
+    };
+    rejects(
+        "a record of no commit",
+        TicketClaimed::parse(&neither.render()),
+        "names neither a commit",
+    );
+    let short = TicketClaimed {
+        commit: Some("abc".to_owned()),
+        ..record
+    };
+    rejects(
+        "a record of a short commit",
+        TicketClaimed::parse(&short.render()),
+        "is not a full commit id",
+    );
+    let lost = TicketClaimLost {
+        format: Format,
+        ticket: TicketId::new("OWL-12").unwrap(),
+        at: "2026-11-19T10:00:00Z".parse().unwrap(),
+        holder: Some(claim.holder()),
+    };
+    assert_eq!(TicketClaimLost::parse(&lost.render()).unwrap(), lost);
 
     let state = |edit: fn(&mut Value)| PersistedState::parse(&edited("ticket-state.json", edit));
     rejects(

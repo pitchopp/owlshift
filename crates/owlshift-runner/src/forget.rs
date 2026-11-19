@@ -145,6 +145,31 @@ pub fn forget(
             ]),
         );
     }
+    // The ticket's claim on the git remote (OWL-586), out of the project's
+    // section, the ticket's lock still held: deleted while it is this
+    // runner's, and a lost one forgotten, so the ticket can be taken again.
+    drop(_lock);
+    let at = crate::claims::ClaimsAt { git, dirs };
+    match crate::claims::forget(at, ticket) {
+        Ok(crate::claims::Deleted::None) => {}
+        Ok(_) => {
+            sink.emit(
+                ticket,
+                None,
+                EventKind::Decision,
+                data([("claim", json!("deleted"))]),
+            );
+        }
+        Err(why) => {
+            sink.emit(
+                ticket,
+                None,
+                EventKind::Warning,
+                data([("what", json!("claim_delete")), ("reason", json!(why))]),
+            );
+        }
+    }
+    drop(ticket_lock);
     Ok(Forgotten {
         ticket: ticket.clone(),
         forgot,

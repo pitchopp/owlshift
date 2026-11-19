@@ -48,6 +48,7 @@ use owlshift_core::vocab::Harness as HarnessKind;
 use owlshift_core::vocab::{Effort, Tier};
 use owlshift_platform::wake::Wake;
 use owlshift_runner::agent_env::AgentEnv;
+use owlshift_runner::claims::{self, ClaimIdentity};
 use owlshift_runner::events::{Data, EventLog, EventSink};
 use owlshift_runner::executor::harness::ClaudeHarness;
 use owlshift_runner::executor::{
@@ -1306,6 +1307,9 @@ struct Bench {
     /// (OWL-536): the runner then reads and writes them through the real
     /// adapter, in place of the Markdown tracker.
     issues: RefCell<Option<FakeIssues>>,
+    /// The operator this runner claims tickets as (OWL-586): `maintainer`
+    /// unless a scenario plays another person.
+    operator: RefCell<String>,
 }
 
 /// What the runner's git found of the project's lock at each command
@@ -1545,6 +1549,7 @@ impl Bench {
             takes: RefCell::new(owlshift_runner::operator::Taking::All),
             lock_probe: Arc::default(),
             issues: RefCell::new(None),
+            operator: RefCell::new("maintainer".to_owned()),
         }
     }
 
@@ -2059,6 +2064,13 @@ impl Bench {
         let now = || self.clock.get().checked_add(self.waited.get()).unwrap();
         let probe = || self.probe();
         let usage = self.usage_store();
+        // Its runner, and the maintainer as its operator (OWL-586).
+        let claimant = || {
+            Ok(ClaimIdentity {
+                runner: claims::runner_id(&self.data).map_err(|e| e.to_string())?,
+                account: self.operator.borrow().clone(),
+            })
+        };
         let on_demand = OnDemand {
             executor: &executor,
             tracker,
@@ -2085,6 +2097,7 @@ impl Bench {
             usage: &usage,
             web_tools: self.web_tools.get(),
             takes: self.takes.borrow().clone(),
+            claimant: &claimant,
         };
         let mut out = Vec::new();
         let mut sink = EventSink::new(REPO, EventLog::in_dir(&self.data), &mut out);
@@ -3450,6 +3463,7 @@ fn a_do_whose_agent_cannot_run_is_refused_before_anything() {
         usage: &UsageStore::in_data_dir(&bench.data),
         web_tools: true,
         takes: owlshift_runner::operator::Taking::All,
+        claimant: &|| Err("no operator in this test".to_owned()),
     };
     let mut out = Vec::new();
     let mut sink = EventSink::new(REPO, EventLog::in_dir(&bench.data), &mut out);
@@ -3536,6 +3550,7 @@ fn a_git_older_than_the_floor_is_refused_before_the_lock_and_the_tracker() {
         usage: &UsageStore::in_data_dir(&bench.data),
         web_tools: true,
         takes: owlshift_runner::operator::Taking::All,
+        claimant: &|| Err("no operator in this test".to_owned()),
     };
     for command in ["do", "continue"] {
         let mut out = Vec::new();
@@ -12349,6 +12364,11 @@ mod base_scenarios;
 /// A ticket's cancel parked, refused, withdrawn or dropped (OWL-474).
 #[path = "on_demand/cancel_scenarios.rs"]
 mod cancel_scenarios;
+
+/// A ticket claimed on the git remote, lost to another runner, swept and
+/// renewed; nothing pushed under local claims (OWL-586).
+#[path = "on_demand/claims_scenarios.rs"]
+mod claims_scenarios;
 
 /// A red check re-run once by the runner before any fix run (OWL-513).
 #[path = "on_demand/rerun_scenarios.rs"]

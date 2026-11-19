@@ -115,6 +115,8 @@ pub fn origin_text(url: Vec<u8>) -> Result<String, String> {
 /// Where one project's files live under the data directory.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ProjectDirs {
+    /// The data directory the project's folder is under.
+    data: PathBuf,
     root: PathBuf,
     /// How long a command waits for the project's lock
     /// ([`ProjectDirs::lock`]): [`PROJECT_LOCK_WAIT`].
@@ -125,6 +127,7 @@ impl ProjectDirs {
     /// The directory of `repo`, a GitHub repository, under `data_dir`.
     pub fn new(data_dir: &Path, repo: &Repo) -> Self {
         Self {
+            data: data_dir.to_owned(),
             root: data_dir
                 .join("projects")
                 .join("github.com")
@@ -143,6 +146,7 @@ impl ProjectDirs {
         for owner in subdirectories(&host)? {
             for root in subdirectories(&owner)? {
                 all.push(Self {
+                    data: data_dir.to_owned(),
                     root,
                     lock_wait: PROJECT_LOCK_WAIT,
                 });
@@ -164,6 +168,12 @@ impl ProjectDirs {
 
     pub fn root(&self) -> &Path {
         &self.root
+    }
+
+    /// The data directory the project's folder is under, whose `runner`
+    /// file names this install's runner (OWL-586, [`crate::claims`]).
+    pub fn data_dir(&self) -> &Path {
+        &self.data
     }
 
     /// The dedicated clone.
@@ -624,7 +634,7 @@ pub(crate) fn held_alone(path: &Path) -> io::Result<bool> {
 }
 
 /// The folders in `dir`, by name; none when `dir` is not there.
-fn subdirectories(dir: &Path) -> io::Result<Vec<PathBuf>> {
+pub(crate) fn subdirectories(dir: &Path) -> io::Result<Vec<PathBuf>> {
     let entries = match fs::read_dir(dir) {
         Ok(entries) => entries,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),

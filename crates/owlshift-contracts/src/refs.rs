@@ -9,7 +9,8 @@
 //! followed a run [`COST_FILE`] (OWL-378), once a Design or Build run asked
 //! [`SESSION_FILE`] (OWL-394), and, later, the ticket's
 //! artifacts. Since OWL-122 the runner keeps the ticket ref in its dedicated
-//! checkout only; pushing it to the remote comes with claims (P7).
+//! checkout only. Since OWL-586 the claim ref is on `origin` alone, under
+//! `[policy] claims = "remote"`; the ticket ref is still never pushed.
 
 use std::collections::BTreeMap;
 use std::num::NonZeroU32;
@@ -27,8 +28,8 @@ use crate::brief::{
     ShortQuestion, ThreadEntry, validate_thread,
 };
 use crate::format::{
-    self, CLAIM_FORMAT, COST_FORMAT, ContractError, DELIVERY_FORMAT, Format, HELD_FORMAT,
-    QUESTIONS_FORMAT, SESSION_FORMAT, TICKET_STATE_FORMAT,
+    self, CLAIM_FORMAT, CLAIM_LOST_FORMAT, CLAIMED_FORMAT, COST_FORMAT, ContractError,
+    DELIVERY_FORMAT, Format, HELD_FORMAT, QUESTIONS_FORMAT, SESSION_FORMAT, TICKET_STATE_FORMAT,
 };
 use crate::ids::{QuestionId, SessionId, TicketId, check_name, is_commit_id, is_lower_hex};
 use crate::result::{
@@ -88,17 +89,80 @@ pub fn ticket_ref(ticket: &TicketId) -> String {
     format!("{TICKETS_PREFIX}{ticket}")
 }
 
-/// A runner's lease on a ticket.
+/// The most bytes a claim's `claim.json` may hold: a claim is read from a
+/// remote every collaborator writes to, so a larger one is refused unread.
+pub const MAX_CLAIM_BYTES: usize = 256 * 1024;
+
+/// The most characters a claim's operator holds.
+pub const MAX_OPERATOR_CHARS: usize = 200;
+
+/// Which runner works a ticket (P10, OWL-586; build plan "P10 · Teams",
+/// "Claims"): the content of `claim.json` on the ticket's claim ref,
+/// [`claim_ref`], a commit without a parent on `origin`. It publishes the
+/// runner's identifier, its operator, two times and the paths the ticket
+/// holds; never the ticket's text, a plan or a question.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 #[schemars(title = "Owlshift claim")]
 pub struct Claim {
     pub format: Format<CLAIM_FORMAT>,
-    /// The machine the holding runner runs on.
-    pub machine: String,
-    /// The person operating that runner.
+    /// The holding runner's identifier: 16 lowercase hexadecimal digits made
+    /// once per data directory, never a host name.
+    #[schemars(regex(pattern = r"^[0-9a-f]{16}$"))]
+    pub runner: String,
+    /// The holding runner's operator: their handle in the project's
+    /// `[people]`, else their tracker account.
     pub operator: String,
-    /// When the lease may be taken over if not renewed.
+    /// When the runner took the claim.
+    pub claimed_at: Timestamp,
+    /// 24 hours after its last renewal: once past, by the reader's clock, a
+    /// person may release it; no runner takes it over.
+    pub expires_at: Timestamp,
+    /// What the ticket holds, as its `held.json` has it: empty before its
+    /// Build's admission.
+    #[serde(default)]
+    pub held: ClaimHeld,
+}
+
+/// What a claimed ticket holds (OWL-586): its `held.json`'s zones, named
+/// resources and files, the paths alone.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ClaimHeld {
+    /// The whole repository: a ticket admitted with no zone, or one whose
+    /// ref dates from before what it holds was kept.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub repository: bool,
+    /// The zones admitted, as written.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub zones: Vec<String>,
+    /// The named resources admitted, by name.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub resources: Vec<String>,
+    /// The files its branch changed.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub files: Vec<String>,
+}
+
+impl ClaimHeld {
+    /// Whether it holds nothing.
+    pub fn is_empty(&self) -> bool {
+        !self.repository
+            && self.zones.is_empty()
+            && self.resources.is_empty()
+            && self.files.is_empty()
+    }
+}
+
+/// Who holds a claim, as a refusal or a lost claim names them.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ClaimHolder {
+    /// The holding runner's identifier.
+    pub runner: String,
+    /// Its operator.
+    pub operator: String,
+    /// When the claim expires.
     pub expires_at: Timestamp,
 }
 
@@ -106,7 +170,162 @@ impl Claim {
     const CONTRACT: &str = "claim";
 
     pub fn parse(input: &str) -> Result<Self, ContractError> {
-        format::parse_json(Self::CONTRACT, CLAIM_FORMAT, input)
+        if input.len() > MAX_CLAIM_BYTES {
+            return Err(ContractError::invalid(
+                Self::CONTRACT,
+                format!(
+                    "holds {} bytes, past the {MAX_CLAIM_BYTES} a claim may hold",
+                    input.len()
+                ),
+            ));
+        }
+        let claim: Self = format::parse_json(Self::CONTRACT, CLAIM_FORMAT, input)?;
+        claim
+            .check()
+            .map_err(|reason| ContractError::invalid(Self::CONTRACT, reason))?;
+        Ok(claim)
+    }
+
+    pub fn render(&self) -> String {
+        format::render_json(self)
+    }
+
+    /// Who holds it.
+    pub fn holder(&self) -> ClaimHolder {
+        ClaimHolder {
+            runner: self.runner.clone(),
+            operator: self.operator.clone(),
+            expires_at: self.expires_at,
+        }
+    }
+
+    /// The rules beyond its shape: a runner's identifier, an operator a
+    /// person can read, an expiry not before the take, and a held set that
+    /// fits.
+    pub fn check(&self) -> Result<(), String> {
+        if !is_lower_hex(&self.runner, 16) {
+            return Err(format!(
+                "runner {:?} is not 16 lowercase hexadecimal digits",
+                self.runner
+            ));
+        }
+        if let Err(broken) = check_name(&self.operator) {
+            return Err(format!("operator {:?} {broken}", self.operator));
+        }
+        if self.operator.chars().count() > MAX_OPERATOR_CHARS {
+            return Err(format!(
+                "operator holds more than {MAX_OPERATOR_CHARS} characters"
+            ));
+        }
+        if self.expires_at < self.claimed_at {
+            return Err(format!(
+                "expires_at {} is before claimed_at {}",
+                self.expires_at, self.claimed_at
+            ));
+        }
+        let held = &self.held;
+        for (name, paths) in [
+            ("zones", &held.zones),
+            ("resources", &held.resources),
+            ("files", &held.files),
+        ] {
+            if paths.len() > MAX_HELD_FILES {
+                return Err(format!(
+                    "held.{name} lists {} paths, past the {MAX_HELD_FILES} a claim holds",
+                    paths.len()
+                ));
+            }
+            if let Some(bad) = paths
+                .iter()
+                .find(|path| path.is_empty() || path.chars().any(char::is_control))
+            {
+                return Err(format!("held.{name} holds the path {bad:?}"));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// The claim of a ticket this runner last pushed, kept in `claimed.json` in
+/// the ticket's folder of the data directory (OWL-586): no local ref holds
+/// it, since a ref of the dedicated checkout that moved during a run would
+/// breach the isolation check. `commit` is the expected value of the next
+/// push, and what says the claim on `origin` is this runner's.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+#[schemars(title = "Owlshift ticket claimed")]
+pub struct TicketClaimed {
+    pub format: Format<CLAIMED_FORMAT>,
+    pub ticket: TicketId,
+    /// The commit of the claim last confirmed on `origin`, a full id; none
+    /// while the first take is not confirmed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub commit: Option<String>,
+    /// The commit of a push under way, written before it: the take's, a
+    /// renewal's or a new held set's. Cleared once the push is confirmed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next: Option<String>,
+    /// The claim is being deleted: written before the delete's push, so a
+    /// claim found gone afterwards is no loss.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub deleting: bool,
+    /// The claim the latest commit written holds, `next`'s when one is
+    /// under way.
+    pub claim: Claim,
+}
+
+impl TicketClaimed {
+    const CONTRACT: &str = "ticket claimed";
+
+    pub fn parse(input: &str) -> Result<Self, ContractError> {
+        let record: Self = format::parse_json(Self::CONTRACT, CLAIMED_FORMAT, input)?;
+        let commits = record.commit.iter().chain(&record.next);
+        if let Some(bad) = commits.clone().find(|id| !is_commit_id(id)) {
+            return Err(ContractError::invalid(
+                Self::CONTRACT,
+                format!("{bad:?} is not a full commit id"),
+            ));
+        }
+        if commits.count() == 0 {
+            return Err(ContractError::invalid(
+                Self::CONTRACT,
+                "names neither a commit nor a next one",
+            ));
+        }
+        record
+            .claim
+            .check()
+            .map_err(|reason| ContractError::invalid(Self::CONTRACT, reason))?;
+        Ok(record)
+    }
+
+    pub fn render(&self) -> String {
+        format::render_json(self)
+    }
+}
+
+/// A ticket whose claim this runner found gone or another's (OWL-586),
+/// kept in `claim_lost.json` in the ticket's folder: while it stands, the
+/// runner writes nothing more on the ticket, its step under way is stopped,
+/// and its local state is out of every count, until `owlshift forget`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+#[schemars(title = "Owlshift ticket claim lost")]
+pub struct TicketClaimLost {
+    pub format: Format<CLAIM_LOST_FORMAT>,
+    pub ticket: TicketId,
+    /// When this runner found it.
+    pub at: Timestamp,
+    /// The claim `origin` held then; none when it was gone or did not read.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub holder: Option<ClaimHolder>,
+}
+
+impl TicketClaimLost {
+    const CONTRACT: &str = "ticket claim lost";
+
+    pub fn parse(input: &str) -> Result<Self, ContractError> {
+        format::parse_json(Self::CONTRACT, CLAIM_LOST_FORMAT, input)
     }
 
     pub fn render(&self) -> String {
