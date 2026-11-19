@@ -115,26 +115,11 @@ Gate green on 2fe46e01ea43: 1 command in 2.2 s.
 
 When a gate needs its dependencies installed first, list the install commands under `stack.setup` in `owlshift.toml` (the file's comments show how), and the caches they read under `stack.caches`. The gate runs with your home folder closed: a package manager reaches its cache only through `stack.caches`, read-only, and only on a machine whose personal configuration lists that folder in `allow_caches`. Until it does, every run and gate refuses the project, and `owlshift doctor` gives the lines to add.
 
-- **npm.** `owlshift init` writes the setup `npm ci --prefer-offline --cache "$HOME/.npm" --logs-dir "$TMPDIR/npm-logs"` and `caches = [".npm"]`, and prints the lines that allow `.npm` for your repository. Run `npm ci` once in your checkout so that `~/.npm` holds the project's packages, and again when the lock file gains one: the confined setup cannot write a missing package into the read-only cache. npm then fails with `EPERM`, says your cache folder "contains root-owned files" and suggests `sudo chown`. Under Owlshift that message means the sandbox, or a package missing from the cache: `sudo` changes nothing.
+- **npm.** `owlshift init` writes the setup `npm ci --prefer-offline --cache "$HOME/.npm" --logs-dir "$TMPDIR/npm-logs"` and `caches = [".npm"]`, and prints the lines that allow `.npm` for your repository. Run `npm ci` once in your checkout so that `~/.npm` holds the project's packages, and again when the lock file gains one: the confined setup cannot write a missing package into the read-only cache. If npm fails with `EPERM` anyway, see [Troubleshooting](../troubleshooting.md#the-gate-passes-on-your-laptop-and-fails-under-owlshift-gate).
 - **yarn and bun.** For yarn 4 on its global cache (a `.yarnrc.yml`, and `packageManager` naming yarn 4 or later or `enableGlobalCache: true`), `init` writes `caches = [".yarn/berry"]`, which works the same way; for another yarn 2 or later its output notes when to declare it. yarn 1 and bun need no cache: they fetch the packages from the registry in each run.
 - **pnpm.** pnpm writes into its store on every install, so a read-only store needs an overlay. Declare the folder that holds the store (`pnpm store path` prints it; `Library/pnpm` on macOS) and follow the recipe in the build plan's [Preparing a gate's dependencies](../design/build-plan.md): link the store's `files` and `index` into an ignored `.pnpm-overlay/` folder of the worktree, then run `pnpm install --offline --frozen-lockfile --store-dir .pnpm-overlay`.
 
-### When the gate fails under the sandbox
-
-The sandbox closes your home folder to every setup, gate and agent run. A tool that reads or writes there fails with its own message: npm's `EPERM` and "run `sudo chown`", `Operation not permitted`, `Read-only file system`, or on Linux `No such file or directory`. When the failing command's output names a folder of your home, `owlshift gate` says so after the gate's result and gives the two lines that open it read-only:
-
-```text
-The sandbox closes your home to every run and gate. The failing command was refused:
-  ~/.cache/demo
-A folder of your home opens to runs, read-only, once the project declares it and this machine allows it:
-  in ~/src/web/owlshift.toml, under [stack]:
-    caches = [".cache/demo"]
-  in ~/Library/Application Support/owlshift/config.toml:
-    [repositories."github.com/acme/web"]
-    allow_caches = [".cache/demo"]
-```
-
-At a terminal it asks whether to add them; answer `y` and it writes both files, your personal file first, then commit `owlshift.toml`. Off a terminal it only prints them. Every run of the project can then read that folder: allow caches, never secrets. Read-only, a folder still refuses writes, so keep the tool from writing there (npm's `--prefer-offline`), fill it outside the sandbox, or point the tool's writable folder into `$TMPDIR`, the run's own folder. `sudo` never helps. A folder that holds credentials (`~/.ssh`, `~/.config/gh` and the like) is never opened, whatever the configuration. A Build whose setup fails the same way names the folders at the end of its reason, and `owlshift init` offers the line for each cache the project file declares that your machine does not allow yet. On Linux a write to a new path under the home does not fail: it lands in a throwaway home that the run loses.
+If the gate fails here though it passes on your laptop, or npm fails with `EPERM`, see [Troubleshooting](../troubleshooting.md#the-gate-passes-on-your-laptop-and-fails-under-owlshift-gate).
 
 ## 5. Run a first ticket: `owlshift do`
 

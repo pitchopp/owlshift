@@ -76,6 +76,8 @@ The commands, in the order the pages use them:
 
 The [command reference](docs/reference/cli.md) lists every command with its arguments and options. `owlshift --help` lists every command, and `owlshift help` followed by a command's name, as in `owlshift help do`, explains it. [SECURITY.md](SECURITY.md) says what the confinement of agent runs protects, and what it does not.
 
+When something does not work, [Troubleshooting](docs/troubleshooting.md) is ordered by what you see: the `owlshift doctor` lines that fail, a gate that passes on your laptop and not under Owlshift, a ticket that does not start, a parked ticket, a usage limit, a quarantined or paused project, and where the logs are.
+
 ## Design
 
 The design is in [`docs/design/`](docs/design/):
