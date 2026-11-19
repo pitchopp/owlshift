@@ -1765,9 +1765,11 @@ impl Watch<'_> {
                     first = None;
                 }
             }
-            // No decider at all, which the ticket alone tells (OWL-585): a
-            // colleague's review stays due, unrelayed, warned of once, and
-            // merge on green waits.
+            // No decider at all, which the ticket alone tells (OWL-585): no
+            // review is the decider's, so one that asks nothing is due for
+            // nothing, and a colleague's review stays due, unrelayed, warned
+            // of once, merge on green waiting. A decider of the zones is
+            // resolved under the lock, by the step.
             None => {
                 let zones = stored
                     .record
@@ -1780,7 +1782,10 @@ impl Watch<'_> {
                     .filter(|due| !due.asks_nothing())
                     .map(|due| due.review.id)
                     .collect();
-                if !on_demand::has_decider(&found, zones) && !asking.is_empty() {
+                if !on_demand::has_decider(&found, zones) {
+                    if asking.is_empty() {
+                        return Due::Nothing;
+                    }
                     if memory.unrelayed.get(ticket) != Some(&asking) {
                         sink.emit(
                             ticket,

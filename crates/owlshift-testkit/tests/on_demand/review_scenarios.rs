@@ -963,6 +963,39 @@ fn a_colleagues_approval_asks_nothing() {
     assert_eq!(bench.state().0, Status::Active(Stage::Watch));
 }
 
+/// OWL-585: on a ticket with no decider, a colleague's approval is due for
+/// nothing: watch starts no step for it, warns of nothing and asks nothing.
+#[test]
+fn a_colleagues_approval_without_a_decider_starts_no_step() {
+    let bench = Bench::reviewed();
+    let mut approval = review(8_000_000_004, "bob", "Ship it.", &[]);
+    approval["state"] = json!("APPROVED");
+    bench.reviews_on_github(vec![approval]);
+    let unassigned = fs::read_to_string(bench.ticket_file())
+        .unwrap()
+        .replace("assignee = \"maintainer\"\n", "");
+    fs::write(bench.ticket_file(), unassigned).unwrap();
+    let briefs = bench.briefs().len();
+    let from = bench.events().len();
+    let mut pass = 0;
+    let (outcomes, lines, printed) = bench.watch(Vec::new(), &mut |_| {
+        pass += 1;
+        bench.wait(11);
+        pass < 2
+    });
+    assert!(outcomes.is_empty(), "{outcomes:?}\n{lines}\n{printed}");
+    assert_eq!(bench.briefs().len(), briefs);
+    let warned = data_of(&bench.events()[from..], EventKind::Warning, "what");
+    assert!(
+        warned
+            .iter()
+            .all(|event| event["what"] != "review_not_relayed"),
+        "{warned:?}"
+    );
+    assert!(bench.questions_posted().is_empty());
+    assert_eq!(bench.state().0, Status::Active(Stage::Watch));
+}
+
 /// OWL-585: a ticket with no decider is asked nothing; its colleague's
 /// review stays due, warned of once over several passes, and is relayed
 /// once the ticket has a decider again.
