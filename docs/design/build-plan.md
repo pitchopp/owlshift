@@ -2834,6 +2834,9 @@ Designed on 2026-11-16 with the maintainer, in a session rather than a design ti
     - *Typefaces:* `document.fonts` listed Bricolage Grotesque, JetBrains Mono 400 and JetBrains Mono 500, all `loaded`. `document.fonts.check` answered true for `800 48px "Bricolage Grotesque"` and `500 20px "JetBrains Mono"`.
     - *The switch:* with the system dark, Light set `data-theme="light"` and turned the page `paper`. It kept `light` under `owlshift.theme` in local storage and across a reload. Dark held under a light system. Auto removed the attribute and the stored value, and the page followed the system again.
     - *Scripts disabled:* the page was whole in both schemes and followed the system. A stored `light` stayed unused, and the switch stayed hidden.
+  - *Second run, 2026-11-19* (OWL-578): **passed.** The page was served by Pages at `https://pitchopp.github.io/owlshift/` after the first deploy from `main` (run 44563812356, commit `0ac4d58a`, both jobs succeeded).
+    - *Served files,* read with `curl -sI`: the page `text/html`, `site.css` `text/css`, `theme.js` `application/javascript`, the lockup `image/svg+xml`, and the three fonts `font/woff2`, all `200`.
+    - *Browsers:* the maintainer opened the page in Safari, Chrome and Firefox on macOS, with the developer tools. In each one, every request went to the page's own origin, the console showed no refusal of the policy, both typefaces loaded, and the switch changed the theme and kept it across a reload.
 
 **Parts,** in the Linear project "P9 · Open-source readiness", outside the exit gate and after it: OWL-576 (part 1), OWL-577 (2), OWL-578 (3) and OWL-579 (4), each waiting for OWL-543.
 
