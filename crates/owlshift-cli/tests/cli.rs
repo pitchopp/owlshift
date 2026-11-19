@@ -1407,6 +1407,43 @@ fn init_detects_the_stack_and_never_runs_it() {
 }
 
 #[test]
+fn init_offers_the_typecheck_and_build_scripts_and_says_the_gate_is_a_guess() {
+    let config_dir = tempfile::tempdir().unwrap();
+    let repo = tempfile::tempdir().unwrap();
+    git_init(repo.path());
+    fs::write(
+        repo.path().join("package.json"),
+        r#"{"scripts":{"lint":"eslint .","typecheck":"tsc","test":"vitest","build":"next build","smoke":"node s.js","check":"npm run lint"}}"#,
+    )
+    .unwrap();
+    fs::write(repo.path().join("package-lock.json"), "").unwrap();
+    let out = init_markdown(repo.path(), config_dir.path(), &[]);
+    assert_eq!(
+        project_config(repo.path()).stack.gate,
+        [
+            "npm run lint",
+            "npm run typecheck",
+            "npm run test",
+            "npm run build"
+        ]
+    );
+    assert!(
+        out.contains("Note: this gate is a guess from package.json, to review"),
+        "{out}"
+    );
+    assert!(out.contains("left out `check`, `smoke`"), "{out}");
+    assert!(
+        out.contains("Note: package.json has a `check` script"),
+        "{out}"
+    );
+    let written = fs::read_to_string(repo.path().join("owlshift.toml")).unwrap();
+    assert!(
+        written.contains("# note: this gate is a guess"),
+        "{written}"
+    );
+}
+
+#[test]
 fn init_says_what_a_python_root_needs() {
     let config_dir = tempfile::tempdir().unwrap();
     let repo = tempfile::tempdir().unwrap();

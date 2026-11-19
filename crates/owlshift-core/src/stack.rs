@@ -376,18 +376,65 @@ fn package_json(root: &RootFiles, text: &str) -> Result<Option<Found>, String> {
             "npm"
         }
     };
-    for key in ["lint", "test"] {
+    // The order a developer runs them in: lint, typecheck, test, build.
+    let typecheck = ["typecheck", "type-check"]
+        .into_iter()
+        .find(|key| script(key).is_some());
+    let mut read: Vec<&str> = vec![];
+    let mut left_out: Vec<&str> = vec![];
+    for key in ["lint", typecheck.unwrap_or("typecheck"), "test", "build"] {
         let Some(body) = script(key) else { continue };
         if key == "test" && body.contains("no test specified") {
             found.notes.push(
                 "the `test` script is npm's placeholder, which always fails: it was left out"
                     .to_string(),
             );
+            left_out.push(key);
             continue;
         }
+        read.push(key);
         found.gate.push(line(
             format!("{manager} run {key}"),
             format!("the `{key}` script of package.json"),
+        ));
+    }
+    if !found.gate.is_empty() {
+        // Every other script is named, sorted, so the operator sees what the
+        // guess does not cover.
+        let others: Vec<&str> = scripts
+            .into_iter()
+            .flat_map(|s| s.keys().map(String::as_str))
+            .filter(|key| !read.contains(key) && !left_out.contains(key))
+            .collect();
+        left_out.extend(others);
+        if let Some(chain) = ["check", "ci"]
+            .into_iter()
+            .find(|key| script(key).is_some())
+        {
+            found.notes.push(format!(
+                "package.json has a `{chain}` script, which the project may run before any work \
+                 is done: compare it with this gate"
+            ));
+        }
+        let names = |keys: &[&str]| {
+            let shown: Vec<String> = keys.iter().take(8).map(|k| format!("`{k}`")).collect();
+            let more = keys.len().saturating_sub(8);
+            let tail = if more > 0 {
+                format!(" and {more} more")
+            } else {
+                String::new()
+            };
+            format!("{}{tail}", shown.join(", "))
+        };
+        let out = if left_out.is_empty() {
+            "none".to_string()
+        } else {
+            names(&left_out)
+        };
+        found.notes.push(format!(
+            "this gate is a guess from package.json, to review: it read the scripts {}; \
+             it left out {out}",
+            names(&read)
         ));
     }
     Ok(Some(found))
@@ -629,17 +676,24 @@ check::
             assert_eq!(commands(d.caches()), caches, "{names:?}");
             assert_eq!(
                 commands(d.gate()),
-                [format!("{manager} run lint"), format!("{manager} run test")],
+                [
+                    format!("{manager} run lint"),
+                    format!("{manager} run test"),
+                    format!("{manager} run build")
+                ],
                 "{names:?}"
             );
             // A manager reading a cache says what each machine must allow;
             // yarn 2 or later, its cache unknown, says what to declare;
-            // pnpm also says where its overlay lies.
+            // pnpm also says where its overlay lies; the last note is always
+            // the gate's guess (OWL-595).
             let notes = &d.found[0].notes;
             let noted = !caches.is_empty() || names.contains(&".yarnrc.yml");
             let pnpm = usize::from(manager == "pnpm");
-            assert_eq!(notes.len(), usize::from(noted) + pnpm, "{notes:?}");
-            assert!(notes[pnpm..].iter().all(|n| n.contains("allow_caches")));
+            assert_eq!(notes.len(), usize::from(noted) + pnpm + 1, "{notes:?}");
+            let (guess, rest) = notes.split_last().unwrap();
+            assert!(guess.contains("a guess"), "{guess}");
+            assert!(rest[pnpm..].iter().all(|n| n.contains("allow_caches")));
             assert!(d.found[0].source.starts_with("package.json ("));
             assert!(
                 d.setup()
@@ -731,8 +785,51 @@ check::
         assert_eq!(commands(d.setup()), Vec::<&str>::new());
         assert_eq!(commands(d.gate()), ["npm run test"]);
         assert_eq!(d.found[0].source, "package.json");
-        assert_eq!(d.found[0].notes.len(), 1);
+        assert_eq!(d.found[0].notes.len(), 2);
         assert!(d.found[0].notes[0].contains("no lock file"));
+        assert!(d.found[0].notes[1].contains("a guess"));
+    }
+
+    /// OWL-595: the project's own scripts, in the order a developer runs them.
+    #[test]
+    fn a_package_json_offers_lint_typecheck_test_and_build_in_order() {
+        let pkg = r#"{"scripts":{"build":"next build","check":"npm run lint && npm run build",
+            "test":"vitest","smoke":"node smoke.js","typecheck":"tsc","lint":"eslint ."}}"#;
+        let d = detect(&root(&["package-lock.json"], &[("package.json", pkg)]));
+        assert_eq!(
+            commands(d.gate()),
+            [
+                "npm run lint",
+                "npm run typecheck",
+                "npm run test",
+                "npm run build"
+            ]
+        );
+        let notes = &d.found[0].notes;
+        let check = notes.iter().find(|n| n.contains("`check`")).unwrap();
+        assert!(check.contains("compare"), "{check}");
+        let guess = notes.last().unwrap();
+        assert!(
+            guess.contains("a guess") && guess.contains("review"),
+            "{guess}"
+        );
+        assert!(
+            guess.contains("read the scripts `lint`, `typecheck`, `test`, `build`"),
+            "{guess}"
+        );
+        assert!(guess.contains("left out `check`, `smoke`"), "{guess}");
+    }
+
+    #[test]
+    fn type_check_is_used_only_when_typecheck_is_absent() {
+        let both = r#"{"scripts":{"typecheck":"a","type-check":"b","ci":"c"}}"#;
+        let d = detect(&root(&["yarn.lock"], &[("package.json", both)]));
+        assert_eq!(commands(d.gate()), ["yarn run typecheck"]);
+        assert!(d.found[0].notes.iter().any(|n| n.contains("`ci`")));
+        let dashed = r#"{"scripts":{"type-check":"b"}}"#;
+        let d = detect(&root(&["yarn.lock"], &[("package.json", dashed)]));
+        assert_eq!(commands(d.gate()), ["yarn run type-check"]);
+        assert!(!d.found[0].notes.iter().any(|n| n.contains("compare")));
     }
 
     #[test]
@@ -748,6 +845,17 @@ check::
         let d = detect(&root(&["package-lock.json"], &[("package.json", pkg)]));
         assert_eq!(commands(d.gate()), Vec::<&str>::new());
         assert!(d.found[0].notes.iter().any(|n| n.contains("placeholder")));
+        // No gate, so no guess to review.
+        assert!(!d.found[0].notes.iter().any(|n| n.contains("a guess")));
+    }
+
+    #[test]
+    fn the_placeholder_test_is_named_among_the_scripts_left_out() {
+        let pkg =
+            r#"{"scripts":{"lint":"x","test":"echo \"Error: no test specified\" && exit 1"}}"#;
+        let d = detect(&root(&["package-lock.json"], &[("package.json", pkg)]));
+        let guess = d.found[0].notes.last().unwrap();
+        assert!(guess.ends_with("left out `test`"), "{guess}");
     }
 
     const PY: &str =
