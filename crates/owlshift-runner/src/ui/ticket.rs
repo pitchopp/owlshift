@@ -25,6 +25,8 @@
 //! - `waits`: what the ticket waits on, as `owlshift status --waits` tells it;
 //! - `actions` (format 2, OWL-473): whether the page offers Restart and
 //!   Cancel, each where its command would act, and the cancel that stands;
+//!   and (format 4, OWL-588) who holds the ticket's claim on the git remote,
+//!   `claim`, and whether the page offers Release, `release`;
 //! - `tracker_link` (format 3, OWL-580): the ticket's issue on its tracker,
 //!   which the header draws, from the project's key once read
 //!   ([`super::reply::tracker_link`]), null when there is none.
@@ -55,12 +57,12 @@ use crate::executor::Git;
 use crate::project::ProjectDirs;
 use crate::ticket_ref::{self, Commits, Revision, TicketRecord};
 use crate::voice::Voice;
-use crate::{cancel, served, status};
+use crate::{cancel, served, status, why};
 
 /// The snapshot's format: 2 adds `actions` (OWL-473); 3 adds
 /// `tracker_link` and drops `questions.reply.link`, which it replaces
-/// (OWL-580).
-pub const FORMAT: u32 = 3;
+/// (OWL-580); 4 adds `actions.claim` and `actions.release` (OWL-588).
+pub const FORMAT: u32 = 4;
 
 /// The most commits of a ticket ref the timeline reads.
 pub const MAX_HISTORY: usize = 400;
@@ -185,7 +187,7 @@ pub fn snapshot(inputs: &Inputs, repo: &Repo, ticket: &TicketId) -> Value {
         "questions": on_record(&|record| questions(record, inputs)),
         "plan": plan,
         "waits": section(waits(inputs, repo, ticket)),
-        "actions": actions(&dirs, ticket, &latest),
+        "actions": actions(&dirs, ticket, &latest, inputs.now),
         "tracker_link": reply::tracker_link(inputs.key, ticket),
     })
 }
@@ -195,11 +197,15 @@ pub fn snapshot(inputs: &Inputs, repo: &Repo, ticket: &TicketId) -> Value {
 /// when `owlshift cancel` would write a cancel of it now
 /// ([`cancel::decide`]), `cancel_refusal` saying why not otherwise; and
 /// `cancel_standing`, the cancel that stands on it (`by`, `at`, `why`, or
-/// `{"unreadable": true}`), or null.
+/// `{"unreadable": true}`), or null; `claim`, who holds the ticket's claim
+/// on the git remote at `now` in `owlshift why`'s words, or null, and
+/// `release` when one is known that `owlshift release` would read
+/// (OWL-588), the command deciding whether this machine may release it.
 fn actions(
     dirs: &ProjectDirs,
     ticket: &TicketId,
     latest: &Result<Option<&TicketRecord>, String>,
+    now: Timestamp,
 ) -> Value {
     let (restart, cancel) = match latest {
         Err(why) => (false, Err(why.clone())),
@@ -223,11 +229,14 @@ fn actions(
         }),
         Some(None) => json!({ "unreadable": true }),
     };
+    let claim = why::known_claim(dirs, ticket, now);
     json!({
         "restart": restart,
         "cancel": cancel.is_ok(),
         "cancel_refusal": cancel.err(),
         "cancel_standing": standing,
+        "claim": claim.words,
+        "release": claim.releasable,
     })
 }
 
@@ -1016,7 +1025,7 @@ mod tests {
     fn the_timeline_lists_where_the_ticket_changed() {
         let bench = busy();
         let snap = bench.snapshot("OWL-1");
-        assert_eq!(snap["format"], 3);
+        assert_eq!(snap["format"], 4);
         assert_eq!(snap["project"], "o/r");
         assert_eq!(snap["ticket"], "OWL-1");
         let timeline = &snap["timeline"];
@@ -1326,6 +1335,41 @@ mod tests {
                 .unwrap()
                 .contains("Owlshift has nothing of OWL-3 in flight")
         );
+    }
+
+    /// OWL-588: the page names who holds the ticket's claim, in `owlshift
+    /// why`'s words, and offers Release once a claim of it is known here.
+    #[test]
+    fn the_claim_is_named_and_release_offered_once_one_is_known() {
+        use owlshift_contracts::refs::{Claim, TicketClaimed};
+        let bench = Bench::new(Some(BUDGET_FILE));
+        let actions = bench.snapshot("OWL-1")["actions"].clone();
+        assert_eq!(actions["claim"], Value::Null);
+        assert_eq!(actions["release"], false);
+        let record = TicketClaimed {
+            format: Format,
+            ticket: TicketId::new("OWL-1").unwrap(),
+            commit: Some("a".repeat(40)),
+            next: None,
+            deleting: false,
+            claim: Claim {
+                format: Format,
+                runner: "0123456789abcdef".to_owned(),
+                operator: "ada".to_owned(),
+                claimed_at: "2026-11-18T09:00:00Z".parse().unwrap(),
+                expires_at: "2099-11-19T09:00:00Z".parse().unwrap(),
+                held: Default::default(),
+            },
+        };
+        let file = crate::claims::record_file(&bench.dirs, &record.ticket);
+        fs::create_dir_all(file.parent().unwrap()).unwrap();
+        fs::write(&file, record.render()).unwrap();
+        let actions = bench.snapshot("OWL-1")["actions"].clone();
+        assert_eq!(
+            actions["claim"],
+            "held by this runner, as ada, until 2099-11-19T09:00:00Z"
+        );
+        assert_eq!(actions["release"], true);
     }
 
     #[test]

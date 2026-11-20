@@ -101,6 +101,11 @@
           "description": "The runner re-ran a red check's failed jobs once, and what that came\nto, with both attempts (OWL-513).",
           "type": "string",
           "const": "RERUN"
+        },
+        {
+          "description": "A person released the ticket's claim on the git remote (OWL-588):\nwho released it, who held it, and how to have it worked again.",
+          "type": "string",
+          "const": "RELEASED"
         }
       ]
     },

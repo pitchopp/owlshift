@@ -1100,6 +1100,13 @@ main {
   gap: 4px 16px;
 }
 
+.held-head {
+  margin: 16px 0 4px;
+  color: var(--text-muted);
+  font-size: 13px;
+  font-weight: 600;
+}
+
 .ticket-actions {
   display: flex;
   flex-wrap: wrap;

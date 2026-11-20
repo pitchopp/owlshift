@@ -7,7 +7,9 @@
 //! `merge_waits` and final `merge_refused`, OWL-464), the project's ticket
 //! refs, the machine's usage files,
 //! the project's base checks (OWL-418), the quarantine marker and the run
-//! slots. It takes no lock the writers hold:
+//! slots; for one ticket, who holds its claim on the git remote (OWL-588):
+//! this runner by its record, or another runner by the claim the dedicated
+//! checkout last fetched, nothing fetched. It takes no lock the writers hold:
 //! the project's lock and the tickets' locks are never tried, so it runs
 //! while `owlshift watch` does. [`fold`] and [`render`] are pure; [`gather`]
 //! does the reading. The one thing it touches that a writer can notice is
@@ -36,6 +38,7 @@ use owlshift_core::vocab::{Harness, Stage};
 use serde_json::Value;
 
 use crate::base;
+use crate::claims::{self, FetchedClaim};
 use crate::events::{Data, printable};
 use crate::project::ProjectDirs;
 use crate::slots::{HeldSlot, MachineSlots};
@@ -265,7 +268,8 @@ fn claimed(data: &serde_json::Map<String, Value>, at: jiff::Timestamp) -> String
         .and_then(|at| at.parse::<jiff::Timestamp>().ok());
     match expires {
         Some(expires) if expires < at => format!(
-            "claimed by {operator}'s runner, whose claim expired at {expires}: theirs, until a              person releases it"
+            "claimed by {operator}'s runner, whose claim expired at {expires}: theirs, until a \
+             person releases it"
         ),
         Some(expires) => format!("claimed by {operator}'s runner until {expires}: theirs to work"),
         None => format!("claimed by {operator}'s runner: theirs to work"),
@@ -535,6 +539,9 @@ pub struct Report {
     /// The waits the events still tell that are not shown as current: their
     /// ticket is neither in flight nor listed by the drain (OWL-484).
     pub left_out: Left,
+    /// Who holds the claim of the ticket asked about on the git remote
+    /// (OWL-588), in words: [`claim_words`].
+    pub claim: Option<String>,
 }
 
 /// The tickets whose latest told wait is left out of `folded.current`
@@ -660,6 +667,11 @@ pub fn gather(
     } else {
         Vec::new()
     };
+    let claim = only.as_ref().and_then(|ticket| {
+        let known = known_claim(dirs, ticket, now);
+        notes.extend(known.unread);
+        known.words
+    });
     Ok(Report {
         project: project.to_owned(),
         only,
@@ -672,6 +684,120 @@ pub fn gather(
         bases,
         overlaps,
         left_out,
+        claim,
+    })
+}
+
+/// What this machine knows of a ticket's claim on the git remote
+/// (OWL-588), read with nothing fetched: what `owlshift why TICKET` and the
+/// web UI's ticket page show.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct KnownClaim {
+    /// Who holds it, in [`claim_words`]' words; `None` when none is known.
+    pub words: Option<String>,
+    /// Whether one is known that `owlshift release` would read: this
+    /// runner's by its record, or another runner's that reads, as the
+    /// dedicated checkout last fetched it.
+    pub releasable: bool,
+    /// Why the claims last fetched cannot be read.
+    pub unread: Option<String>,
+}
+
+/// What this machine knows of the claim of `ticket` in the project of
+/// `dirs` at `now`: this runner's record, a lost one, and the claim the
+/// dedicated checkout last fetched, another runner's.
+pub fn known_claim(dirs: &ProjectDirs, ticket: &TicketId, now: Timestamp) -> KnownClaim {
+    let mut known = KnownClaim::default();
+    let fetched = if dirs.checkout().exists() {
+        match claims::last_fetched(&crate::project::runner_git(), &dirs.checkout()) {
+            Ok(fetched) => fetched.into_iter().find(|claim| claim.ticket == *ticket),
+            Err(why) => {
+                known.unread = Some(format!("the claims of origin cannot be read: {why}"));
+                None
+            }
+        }
+    } else {
+        None
+    };
+    let own = claims::read_record(dirs, ticket)
+        .filter(|record| record.commit.is_some() && !record.deleting)
+        .map(|record| record.claim);
+    let lost = claims::lost(dirs, ticket);
+    let runner = claims::this_runner(dirs.data_dir());
+    let theirs = fetched.filter(|claim| runner.as_ref().is_none_or(|r| !claim.is_of(r)));
+    known.releasable = own.is_some() || theirs.as_ref().is_some_and(|claim| claim.claim.is_ok());
+    known.words = claim_words(
+        ticket,
+        own.as_ref(),
+        lost.as_ref().map(Option::as_ref),
+        theirs.as_ref(),
+        now,
+    );
+    known
+}
+
+/// Who holds the claim of `ticket` on the git remote, in `why`'s words at
+/// `now` (OWL-588): this runner, by `own`, its record; a claim this runner
+/// lost or released here, by `lost`, its record; another runner, by
+/// `theirs`, the claim last fetched. `None` when none is known.
+pub fn claim_words(
+    ticket: &TicketId,
+    own: Option<&owlshift_contracts::refs::Claim>,
+    lost: Option<Option<&owlshift_contracts::refs::TicketClaimLost>>,
+    theirs: Option<&FetchedClaim>,
+    now: Timestamp,
+) -> Option<String> {
+    let lease = |expires: Timestamp| {
+        if expires < now {
+            format!("whose claim expired at {expires}")
+        } else {
+            format!("until {expires}")
+        }
+    };
+    if let Some(lost) = lost {
+        let holder = lost
+            .and_then(|lost| lost.holder.as_ref())
+            .map_or_else(String::new, |holder| {
+                format!(", now {}'s runner {}'s", holder.operator, holder.runner)
+            });
+        return Some(format!(
+            "this runner lost its claim, or it was released here{holder}: it writes nothing more \
+             on {ticket} and leaves it out of every count; `owlshift forget {ticket}` starts it \
+             over here"
+        ));
+    }
+    if let Some(claim) = own {
+        return Some(format!(
+            "held by this runner, as {}, {}",
+            claim.operator,
+            lease(claim.expires_at)
+        ));
+    }
+    let theirs = theirs?;
+    Some(match &theirs.claim {
+        Ok(claim) if claim.expires_at < now => format!(
+            "held by {}'s runner {}, {} (as last fetched): theirs, until a person releases it \
+             with `owlshift release {ticket}`",
+            claim.operator,
+            claim.runner,
+            lease(claim.expires_at)
+        ),
+        Ok(claim) => format!(
+            "held by {}'s runner {} {} (as last fetched): theirs to work; {} may release it from \
+             any of their machines",
+            claim.operator,
+            claim.runner,
+            lease(claim.expires_at),
+            claim.operator
+        ),
+        Err(unread) if unread.newer => {
+            "held on origin by a claim a later Owlshift wrote: upgrade Owlshift to read it"
+                .to_owned()
+        }
+        Err(unread) => format!(
+            "held on origin by a claim that does not read: {}",
+            unread.reason
+        ),
     })
 }
 
@@ -890,6 +1016,9 @@ pub fn render(report: &Report) -> String {
                     let _ = writeln!(out, "now: not waiting (it was dispatched or ran since)");
                 }
                 None => {}
+            }
+            if let Some(claim) = &report.claim {
+                let _ = writeln!(out, "claim: {claim}");
             }
         }
         None => {
@@ -1721,8 +1850,13 @@ mod tests {
             slots: None,
             bases: Vec::new(),
             overlaps: Vec::new(),
+            claim: Some("held by this runner, as ada, until 2026-10-27T10:00:00Z".to_owned()),
         };
         let text = render(&report);
+        assert!(
+            text.contains("\nclaim: held by this runner, as ada, until 2026-10-27T10:00:00Z\n"),
+            "{text}"
+        );
         assert!(
             text.contains(
                 "  2026-10-26T10:00:00Z narrowed at its Build to its plan's files: dropped zone \
@@ -1739,6 +1873,79 @@ mod tests {
         );
     }
 
+    /// OWL-588: `why TICKET` names who holds the ticket's claim: this
+    /// runner by its record, a claim lost or released here, another runner
+    /// by the claim last fetched, live or expired, or one that does not
+    /// read; nothing when none is known.
+    #[test]
+    fn the_claim_names_its_holder() {
+        use owlshift_contracts::refs::{Claim, ClaimHolder, TicketClaimLost};
+        let ticket = TicketId::new("OWL-7").unwrap();
+        let now: Timestamp = "2026-11-20T10:00:00Z".parse().unwrap();
+        let claim = |operator: &str, expires: &str| Claim {
+            format: owlshift_contracts::format::Format,
+            runner: "0123456789abcdef".to_owned(),
+            operator: operator.to_owned(),
+            claimed_at: "2026-11-18T09:00:00Z".parse().unwrap(),
+            expires_at: expires.parse().unwrap(),
+            held: Default::default(),
+        };
+        let fetched = |claim| FetchedClaim {
+            ticket: ticket.clone(),
+            commit: "b".repeat(40),
+            claim,
+        };
+        let words = |own, lost, theirs| claim_words(&ticket, own, lost, theirs, now);
+        assert_eq!(words(None, None, None), None);
+        let ours = claim("ada", "2026-11-21T09:00:00Z");
+        assert_eq!(
+            words(Some(&ours), None, None).unwrap(),
+            "held by this runner, as ada, until 2026-11-21T09:00:00Z"
+        );
+        let lost = TicketClaimLost {
+            format: owlshift_contracts::format::Format,
+            ticket: ticket.clone(),
+            at: now,
+            holder: Some(ClaimHolder {
+                runner: "fedcba9876543210".to_owned(),
+                operator: "lea".to_owned(),
+                expires_at: now,
+            }),
+        };
+        let said = words(Some(&ours), Some(Some(&lost)), None).unwrap();
+        assert!(
+            said.starts_with(
+                "this runner lost its claim, or it was released here, now lea's runner \
+                 fedcba9876543210's"
+            ),
+            "{said}"
+        );
+        assert!(
+            said.ends_with("`owlshift forget OWL-7` starts it over here"),
+            "{said}"
+        );
+        let live = fetched(Ok(claim("lea", "2026-11-21T09:00:00Z")));
+        assert_eq!(
+            words(None, None, Some(&live)).unwrap(),
+            "held by lea's runner 0123456789abcdef until 2026-11-21T09:00:00Z (as last fetched): \
+             theirs to work; lea may release it from any of their machines"
+        );
+        let expired = fetched(Ok(claim("lea", "2026-11-19T09:00:00Z")));
+        assert_eq!(
+            words(None, None, Some(&expired)).unwrap(),
+            "held by lea's runner 0123456789abcdef, whose claim expired at 2026-11-19T09:00:00Z \
+             (as last fetched): theirs, until a person releases it with `owlshift release OWL-7`"
+        );
+        let unread = fetched(Err(claims::ClaimUnread {
+            reason: "not JSON".to_owned(),
+            newer: false,
+        }));
+        assert_eq!(
+            words(None, None, Some(&unread)).unwrap(),
+            "held on origin by a claim that does not read: not JSON"
+        );
+    }
+
     #[test]
     fn render_names_the_marker_the_slots_the_limits_and_a_waiting_person() {
         let id = |t| TicketId::new(t).unwrap();
@@ -1752,6 +1959,7 @@ mod tests {
             project: "o/r".to_owned(),
             only: None,
             left_out: Left::default(),
+            claim: None,
             folded: Folded::default(),
             stages: HashMap::from([(id("OWL-4"), "verify, parked".to_owned())]),
             quarantined: true,

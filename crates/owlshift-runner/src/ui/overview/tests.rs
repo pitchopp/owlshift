@@ -172,6 +172,7 @@ fn a_row_is_one_card_in_the_column_its_ref_and_the_snapshot_give_it() {
         Aux {
             details: BTreeMap::new(),
             ready: Some(ready),
+            ..Aux::default()
         },
     );
     let column = |ticket: &str| card(&overview, ticket).column;
@@ -254,6 +255,7 @@ fn the_list_is_every_card_once_those_needing_you_first() {
         Aux {
             details,
             ready: Some(ready),
+            ..Aux::default()
         },
     );
     let project = &overview.projects[0];
@@ -315,6 +317,7 @@ fn for_you_counts_every_ref_as_the_header_does() {
         Aux {
             details: details.clone(),
             ready: None,
+            ..Aux::default()
         },
     );
     let you = &overview.for_you;
@@ -421,6 +424,55 @@ fn the_strip_has_eight_cells_with_the_stage_current() {
     );
 }
 
+/// OWL-588: the tickets other runners hold by their claims, by whom and
+/// until when, an expired one said so, and one whose claim does not read.
+#[test]
+fn other_runners_tickets_are_shown_as_held() {
+    let claim = |operator: &str, expires: &str| owlshift_contracts::refs::Claim {
+        format: Format,
+        runner: "0123456789abcdef".to_owned(),
+        operator: operator.to_owned(),
+        claimed_at: ts("2026-11-05T09:00:00Z"),
+        expires_at: ts(expires),
+        held: Default::default(),
+    };
+    let fetched = |ticket: &str, claim| FetchedClaim {
+        ticket: id(ticket),
+        commit: "c".repeat(40),
+        claim,
+    };
+    let aux = Aux {
+        held: vec![
+            fetched("T-7", Ok(claim("lea", "2026-11-07T09:00:00Z"))),
+            fetched("T-8", Ok(claim("sam", "2026-11-06T09:00:00Z"))),
+            fetched(
+                "T-9",
+                Err(crate::claims::ClaimUnread {
+                    reason: "not JSON".to_owned(),
+                    newer: false,
+                }),
+            ),
+        ],
+        ..Aux::default()
+    };
+    let overview = view(&waits_of(Vec::new()), aux);
+    let held = &overview.json()["projects"][0]["held"];
+    assert_eq!(
+        held[0],
+        json!({
+            "ticket": "T-7",
+            "operator": "lea",
+            "runner": "0123456789abcdef",
+            "expires_at": "2026-11-07T09:00:00Z",
+            "expired": false,
+            "unread": null,
+        })
+    );
+    assert_eq!(held[1]["expired"], json!(true));
+    assert_eq!(held[2]["operator"], Value::Null);
+    assert_eq!(held[2]["unread"], json!("not JSON"));
+}
+
 /// A snapshot older than two intervals is stale; a title with markup is
 /// text, and is escaped on the wire.
 #[test]
@@ -433,6 +485,7 @@ fn a_stale_snapshot_is_marked_and_a_title_with_markup_is_escaped() {
         &[Aux {
             details: BTreeMap::new(),
             ready: Some(old),
+            ..Aux::default()
         }],
         &BTreeMap::new(),
         &BTreeMap::new(),
@@ -457,6 +510,7 @@ fn a_stale_snapshot_is_marked_and_a_title_with_markup_is_escaped() {
         &[Aux {
             details: BTreeMap::new(),
             ready: Some(snapshot(Vec::new())),
+            ..Aux::default()
         }],
         &BTreeMap::new(),
         &BTreeMap::new(),

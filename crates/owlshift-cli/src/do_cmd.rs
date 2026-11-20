@@ -26,14 +26,14 @@ use jiff::Timestamp;
 use owlshift_adapters::forge::Repo;
 use owlshift_adapters::notifier::Notifier;
 use owlshift_adapters::tracker::{Capability, Tracker};
-use owlshift_contracts::config::ProjectConfig;
+use owlshift_contracts::config::{PersonalConfig, ProjectConfig};
 use owlshift_contracts::format::{Format, strip_role_front_matter};
 use owlshift_contracts::ids::TicketId;
 use owlshift_contracts::service::WatchRecord;
 use owlshift_contracts::step::StepEnvelope;
 use owlshift_contracts::{Harness, Role, Tier};
 use owlshift_platform::awake::KeepAwake;
-use owlshift_platform::keychain::{Keychain, KeychainError};
+use owlshift_platform::keychain::{Keychain, KeychainError, Secret};
 use owlshift_runner::agent_env::AgentEnv;
 use owlshift_runner::claims::{self, ClaimIdentity};
 use owlshift_runner::codex_machine::codex_critic;
@@ -53,6 +53,7 @@ use owlshift_runner::roles::{
     REBASE_ROLE, RESOLVER_ROLE, VERIFY_ROLE,
 };
 use owlshift_runner::routing::{ClaudeRouter, CodexRouter, claude_model};
+use owlshift_runner::secrets::{ForgeSecret, TrackerSecrets};
 use owlshift_runner::served::{self, Between, Served, ServedLock};
 use owlshift_runner::slots::MachineSlots;
 use owlshift_runner::step::{self, Children};
@@ -332,40 +333,18 @@ fn run_with(
         .map_err(|error| format!("the agent environment: {error}"))?;
 
     // From here on, the credentials: the runner's own, never an agent's.
-    let keychain = Arc::new(open_keychain().map_err(|error| error.to_string())?);
-    // The project's own secrets, or the shared ones it has none of its own
-    // for, each entry read once (OWL-308).
-    let mut read = |account: &str| keychain.read(account).map_err(|error| error.to_string());
-    let tracker_secrets = tracker::keychain_set(project, &repo, &mut read)?;
-    let forge_secret = secrets::forge(&repo, &mut read)?;
+    let dirs = ProjectDirs::new(data_dir, &repo);
+    let secrets = Secrets::read(open_keychain, project, &repo, &dirs, &config.personal)?;
     // A step's child does not say again what its watch said at its start.
     if let Some(notice) = secrets::shared_notice(
         &repo,
-        tracker_secrets.as_ref().map(|found| &found.accounts),
-        &forge_secret.account,
+        secrets.tracker.as_ref().map(|found| &found.accounts),
+        &secrets.forge.account,
     ) && envelope.is_none()
     {
         eprintln!("owlshift: {notice}");
     }
-    let dirs = ProjectDirs::new(data_dir, &repo);
-    let access = forge::AppAccess {
-        keychain: keychain.clone(),
-        lock: dirs.account_lock_file(),
-        app: forge::GitHubApp::from_personal(match &config.personal {
-            FileState::Loaded { config, .. } => Some(config),
-            _ => None,
-        }),
-    };
-    let opener = tracker::of(project.tracker.kind).opener(
-        &project.tracker,
-        root,
-        tracker_secrets.as_ref(),
-        tracker::ForgeCredential {
-            secret: &forge_secret,
-            repo: &repo,
-            access: &access,
-        },
-    )?;
+    let opener = secrets.opener(project, root, &repo)?;
     // With the Linear app stored, its token is requested here, before any
     // work, and revoked when the tracker is dropped (OWL-157). The GitHub
     // App's token is refreshed under the project's account lock (OWL-384);
@@ -376,7 +355,7 @@ fn run_with(
     // its watch read, from its envelope; any other command reads no gesture.
     let mut open = || -> Result<(Box<dyn Tracker>, _, Taking), Refusal> {
         let tracker = opener.open()?;
-        let forge = forge::github(&forge_secret, repo.clone(), &access)?;
+        let forge = forge::github(&secrets.forge, repo.clone(), &secrets.access)?;
         let takes = match (mode, &envelope) {
             (Mode::Drain, _) => config.taking(tracker.as_ref(), project.tracker.kind, &repo)?,
             (_, Some(envelope)) => Taking::of_envelope(envelope.operator.as_deref()),
@@ -464,7 +443,8 @@ fn run_with(
     // The token agent runs log in with (OWL-94), read with the other
     // secrets and set on the harness command alone. None stored refuses the
     // run, with the fix, before anything is cloned.
-    let login = keychain
+    let login = secrets
+        .keychain
         .read(CLAUDE_AGENT_ACCOUNT)
         .map_err(|error| error.to_string())?;
     let budget = match &config.personal {
@@ -938,6 +918,69 @@ fn role_harness(shared: &ClaudeHarness, role: Role, prompt: String) -> ClaudeHar
         prompt,
         bash: role.takes_bash(),
         ..shared.clone()
+    }
+}
+
+/// What a command reads of the keychain for a project's tracker and forge
+/// (OWL-308): the tracker's set, the forge credential and the GitHub App's
+/// access, each entry read once, the project's own or the shared ones it has
+/// none of its own for. `do`, `continue` and `watch` read them, and
+/// `release`, which posts its comment through the same tracker (OWL-588).
+pub(crate) struct Secrets {
+    pub(crate) keychain: Arc<Keychain>,
+    pub(crate) tracker: Option<TrackerSecrets<Secret>>,
+    pub(crate) forge: ForgeSecret<Secret>,
+    pub(crate) access: forge::AppAccess,
+}
+
+impl Secrets {
+    /// Opens the keychain with `open_keychain` and reads `project`'s
+    /// secrets for `repo`, the App's token refreshed under the account lock
+    /// of `dirs`, with the App's settings of the personal file `personal`.
+    pub(crate) fn read(
+        open_keychain: fn() -> Result<Keychain, KeychainError>,
+        project: &ProjectConfig,
+        repo: &Repo,
+        dirs: &ProjectDirs,
+        personal: &FileState<PersonalConfig>,
+    ) -> Result<Self, Refusal> {
+        let keychain = Arc::new(open_keychain().map_err(|error| error.to_string())?);
+        let mut read = |account: &str| keychain.read(account).map_err(|error| error.to_string());
+        let tracker = tracker::keychain_set(project, repo, &mut read)?;
+        let forge = secrets::forge(repo, &mut read)?;
+        let access = forge::AppAccess {
+            keychain: keychain.clone(),
+            lock: dirs.account_lock_file(),
+            app: forge::GitHubApp::from_personal(match personal {
+                FileState::Loaded { config, .. } => Some(config),
+                _ => None,
+            }),
+        };
+        Ok(Self {
+            keychain,
+            tracker,
+            forge,
+            access,
+        })
+    }
+
+    /// What opens `project`'s tracker, its checkout at `root`, for `repo`.
+    pub(crate) fn opener<'a>(
+        &'a self,
+        project: &'a ProjectConfig,
+        root: &'a Path,
+        repo: &'a Repo,
+    ) -> Result<tracker::Opener<'a>, Refusal> {
+        Ok(tracker::of(project.tracker.kind).opener(
+            &project.tracker,
+            root,
+            self.tracker.as_ref(),
+            tracker::ForgeCredential {
+                secret: &self.forge,
+                repo,
+                access: &self.access,
+            },
+        )?)
     }
 }
 

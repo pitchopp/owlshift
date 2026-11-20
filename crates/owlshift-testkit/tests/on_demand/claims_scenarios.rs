@@ -4,11 +4,18 @@
 //! writes nothing more on it; under `local` nothing is pushed; the sweep
 //! deletes the claim of a ticket the runner no longer follows, and a
 //! renewal renews the others. The claims module's races and crash windows
-//! are `tests/claims.rs`'s.
+//! are `tests/claims.rs`'s. OWL-588: `owlshift release` from another
+//! machine and from the holder's.
 
+use std::sync::mpsc;
+use std::thread;
+
+use owlshift_contracts::config::Person;
 use owlshift_contracts::ready::Outcome;
 use owlshift_contracts::refs::{Claim, ClaimHeld, claim_ref};
+use owlshift_runner::cancel;
 use owlshift_runner::claims::{ClaimsAt, RunnerId, Took};
+use owlshift_runner::release;
 
 use super::drain_scenarios::{collisions, intake_declaring, ready_now};
 use super::*;
@@ -583,4 +590,314 @@ fn the_sections_read_the_claims_in_a_fixed_number_of_git_commands() {
         "no listing of the claims under the lock: {few:?}"
     );
     assert_eq!(few, many);
+}
+
+/// How long a release waits for a watched step it stopped: well past the
+/// watcher's poll.
+const STEP_WAIT: Duration = Duration::from_secs(10);
+
+impl Bench {
+    /// The bench's project file with `[people]` listing the maintainer and
+    /// lea, by their Markdown tracker names (OWL-588).
+    fn people_config(&self) -> ProjectConfig {
+        let text = fs::read_to_string(self.remote.checkout.join("owlshift.toml")).unwrap();
+        let mut config = ProjectConfig::parse(&text).unwrap();
+        config.people = Some(
+            ["maintainer", "lea"]
+                .map(|name| {
+                    let person = Person {
+                        tracker: name.to_owned(),
+                        forge: None,
+                    };
+                    (name.to_owned(), person)
+                })
+                .into(),
+        );
+        config
+    }
+
+    /// `owlshift release DEMO-1` from the data directory of `dirs`, as
+    /// `account`, a step under way waited for `step_wait` at most, with
+    /// `between` happening between the release's read and its delete.
+    fn release_from(
+        &self,
+        dirs: &ProjectDirs,
+        account: &str,
+        step_wait: Duration,
+        between: &mut dyn FnMut(),
+    ) -> Result<release::Released, String> {
+        let git = self.git();
+        let config = self.people_config();
+        let tracker = MarkdownTracker::new(&self.remote.checkout);
+        let operator = release::Operator::of(&config, account);
+        let remote_url = self.remote.bare.to_string_lossy().into_owned();
+        let clock = Timestamp::now;
+        let releasing = release::Release {
+            git: &git,
+            dirs,
+            remote_url: &remote_url,
+            config: &config,
+            tracker: &tracker,
+            operator: &operator,
+            clock: &clock,
+            step_wait,
+            from_ui: false,
+        };
+        let mut out = Vec::new();
+        let mut sink = EventSink::new(REPO.to_owned(), EventLog::in_dir(dirs.data_dir()), &mut out);
+        let read = release::read(&releasing, &ticket())?;
+        between();
+        release::apply(&releasing, read, &mut sink)
+    }
+
+    /// `colleague` claims DEMO-1 for `operator`, its claim taken two days
+    /// ago and expired a day ago.
+    fn claimed_expired(&self, colleague: &Colleague, operator: &str) {
+        let git = self.git();
+        let took = claims::take(
+            ClaimsAt {
+                git: &git,
+                dirs: &colleague.dirs,
+            },
+            &ticket(),
+            &colleague.runner,
+            operator,
+            ClaimHeld::default(),
+            Timestamp::now() - SignedDuration::from_hours(48),
+            None,
+        );
+        assert!(matches!(took, Ok(Took::Taken { .. })), "{took:?}");
+    }
+
+    /// The RELEASED comments on the ticket.
+    fn released_comments(&self) -> Vec<String> {
+        self.comments()
+            .into_iter()
+            .filter(|body| body.starts_with("[owlshift] RELEASED"))
+            .collect()
+    }
+}
+
+/// OWL-588's acceptance from another machine: another person's live claim
+/// is refused, naming its holder, its runner and its expiry, and kept; once
+/// expired, a person `[people]` lists releases it. The claim is gone, a
+/// RELEASED comment says who released it and names the branch the earlier
+/// runner left, the ticket's stage is left as it is, and nothing of it is
+/// kept here. Then taken again here by `owlshift do`, it is refused while
+/// that branch is on origin, and claimed once the branch is deleted.
+#[test]
+fn a_live_claim_of_another_person_is_refused_and_an_expired_one_released() {
+    let bench = Bench::new(true);
+    bench.claims_on_remote();
+    let colleague = bench.colleague();
+    bench.claimed_by(&colleague, TICKET, &[]);
+    let stage = bench.stage();
+    let live = bench.claim_commit(&ticket());
+    let refused = bench
+        .release_from(&bench.dirs(), "maintainer", STEP_WAIT, &mut || {})
+        .unwrap_err();
+    let holder = format!(
+        "DEMO-1 is claimed by lea's runner {} until",
+        colleague.runner.as_str()
+    );
+    assert!(refused.contains(&holder), "{refused}");
+    assert!(refused.contains(" UTC, a live claim"), "{refused}");
+    assert_eq!(bench.claim_commit(&ticket()), live);
+    assert!(bench.released_comments().is_empty());
+
+    // Taken again by the colleague's runner two days ago, left to expire.
+    let git = bench.git();
+    let colleague_at = ClaimsAt {
+        git: &git,
+        dirs: &colleague.dirs,
+    };
+    claims::forget(colleague_at, &ticket()).unwrap();
+    bench.claimed_expired(&colleague, "lea");
+    bench
+        .env
+        .run(
+            &bench.remote.checkout,
+            &[
+                "push",
+                "--quiet",
+                "origin",
+                &format!("HEAD:refs/heads/{BRANCH}"),
+            ],
+        )
+        .unwrap();
+    let released = bench
+        .release_from(&bench.dirs(), "maintainer", STEP_WAIT, &mut || {})
+        .unwrap();
+    assert!(
+        released.lines[0].starts_with("Released DEMO-1's claim on origin, lea's runner"),
+        "{released:?}"
+    );
+    assert_eq!(released.warning, None);
+    assert_eq!(bench.claim_commit(&ticket()), None);
+    let posted = bench.released_comments();
+    assert_eq!(posted.len(), 1, "{posted:?}");
+    for says in [
+        "**Released by** `maintainer` with `owlshift release`",
+        &format!(
+            "`lea`'s runner `{}`, which expired at",
+            colleague.runner.as_str()
+        ),
+        "**The branch `owlshift/demo-1` is still on origin,**",
+    ] {
+        assert!(posted[0].contains(says), "{says}\n{}", posted[0]);
+    }
+    assert_eq!(bench.stage(), stage);
+    assert!(claims::lost(&bench.dirs(), &ticket()).is_none());
+    assert!(!bench.fetched_claims().contains(TICKET));
+    let told = data_of(&bench.events(), EventKind::Decision, "claim");
+    assert_eq!(told.len(), 1, "{told:?}");
+    assert_eq!(told[0]["claim"], json!("released"));
+    assert_eq!(told[0]["operator"], json!("lea"));
+    assert_eq!(told[0]["expired"], json!(true));
+    assert_eq!(told[0]["released_by"], json!("maintainer"));
+
+    let (refused, printed) = bench.run(Vec::new(), None);
+    let Err(Stop::Refused(why)) = &refused else {
+        panic!("{refused:?}\n{printed}");
+    };
+    assert!(
+        why.contains("the branch owlshift/demo-1 is on origin"),
+        "{why}"
+    );
+    assert_eq!(bench.claim_commit(&ticket()), None);
+    bench
+        .env
+        .run(
+            &bench.remote.bare,
+            &["update-ref", "-d", &format!("refs/heads/{BRANCH}")],
+        )
+        .unwrap();
+    let (asked, printed) = bench.run(vec![bench.reply(None, Some(ROUND_1))], None);
+    assert!(
+        matches!(asked, Err(Stop::NeedsInput { .. })),
+        "{asked:?}\n{printed}"
+    );
+    let runner = claims::runner_id(&bench.data).unwrap();
+    assert_eq!(bench.remote_claim(&ticket()).runner, runner.as_str());
+}
+
+/// OWL-588's acceptance: the operator's own live claim is released from a
+/// second data directory, as after one was lost; a holder that renewed
+/// between the release's read and its delete keeps its claim, and nothing
+/// is posted.
+#[test]
+fn the_operators_own_claim_is_released_from_a_second_data_directory_unless_renewed() {
+    let bench = Bench::new(true);
+    bench.claims_on_remote();
+    let colleague = bench.colleague();
+    let git = bench.git();
+    let at = ClaimsAt {
+        git: &git,
+        dirs: &colleague.dirs,
+    };
+    let took = claims::take(
+        at,
+        &ticket(),
+        &colleague.runner,
+        "maintainer",
+        ClaimHeld::default(),
+        Timestamp::now(),
+        None,
+    );
+    assert!(matches!(took, Ok(Took::Taken { .. })), "{took:?}");
+    let mut renewed = None;
+    let refused = bench
+        .release_from(&bench.dirs(), "maintainer", STEP_WAIT, &mut || {
+            let renewal = claims::renew(
+                at,
+                &|_| ClaimHeld::default(),
+                Timestamp::now() + SignedDuration::from_hours(1),
+            );
+            assert_eq!(renewal.renewed, [ticket()], "{renewal:?}");
+            renewed = bench.claim_commit(&ticket());
+        })
+        .unwrap_err();
+    assert!(
+        refused.contains("moved on origin since it was read"),
+        "{refused}"
+    );
+    assert!(renewed.is_some());
+    assert_eq!(bench.claim_commit(&ticket()), renewed);
+    assert!(bench.released_comments().is_empty());
+
+    bench
+        .release_from(&bench.dirs(), "maintainer", STEP_WAIT, &mut || {})
+        .unwrap();
+    assert_eq!(bench.claim_commit(&ticket()), None);
+    assert_eq!(bench.released_comments().len(), 1);
+}
+
+/// OWL-588: on the holder's machine the ticket's step under way is stopped
+/// first, its watcher finding the lost record, and waited for; then its
+/// claim is deleted, its record with it, and the ticket is left out of
+/// every count here. A step no watcher stops, as a run typed in a
+/// terminal, is waited for in vain: the claim is kept and no longer
+/// renewed.
+#[test]
+fn on_the_holders_machine_the_step_under_way_is_stopped_first() {
+    let bench = Bench::new(true);
+    bench.claims_on_remote();
+    let dirs = bench.dirs();
+    let remote = bench.remote.bare.to_string_lossy().into_owned();
+    project::sync_checkout(&bench.git(), &dirs, &remote).unwrap();
+    bench.claim(&ticket());
+    let (ready, started) = mpsc::channel();
+    let step_dirs = dirs.clone();
+    let step = thread::spawn(move || {
+        let lock = step_dirs.ticket_lock(&ticket()).unwrap().unwrap();
+        let watcher = cancel::Watcher::start(&step_dirs, &ticket());
+        ready.send(()).unwrap();
+        while !watcher.fired() {
+            thread::sleep(Duration::from_millis(10));
+        }
+        let cause = watcher.cause();
+        drop(watcher);
+        drop(lock);
+        cause
+    });
+    started.recv().unwrap();
+    let released = bench
+        .release_from(&dirs, "maintainer", STEP_WAIT, &mut || {})
+        .unwrap();
+    assert_eq!(step.join().unwrap(), Some(cancel::Cause::ClaimLost));
+    assert!(
+        released
+            .lines
+            .iter()
+            .any(|line| line.starts_with("This runner's step of DEMO-1 was stopped")),
+        "{released:?}"
+    );
+    assert_eq!(bench.claim_commit(&ticket()), None);
+    assert!(claims::read_record(&dirs, &ticket()).is_none());
+    assert!(claims::lost_tickets(&dirs).contains(&ticket()));
+
+    // A step no watcher stops holds the ticket's lock past the wait.
+    fs::remove_file(claims::lost_file(&dirs, &ticket())).unwrap();
+    bench.claim(&ticket());
+    let held = dirs.ticket_lock(&ticket()).unwrap().unwrap();
+    let kept = bench.claim_commit(&ticket());
+    let refused = bench
+        .release_from(&dirs, "maintainer", Duration::from_secs(1), &mut || {})
+        .unwrap_err();
+    assert!(refused.contains("has not ended within 1 s:"), "{refused}");
+    assert!(refused.contains("A run typed in a terminal"), "{refused}");
+    assert_eq!(bench.claim_commit(&ticket()), kept);
+    assert!(claims::lost(&dirs, &ticket()).is_some());
+    let git = bench.git();
+    let renewal = claims::renew(
+        ClaimsAt {
+            git: &git,
+            dirs: &dirs,
+        },
+        &|_| ClaimHeld::default(),
+        Timestamp::now() + SignedDuration::from_hours(1),
+    );
+    assert!(renewal.renewed.is_empty(), "{renewal:?}");
+    assert_eq!(bench.claim_commit(&ticket()), kept);
+    drop(held);
 }

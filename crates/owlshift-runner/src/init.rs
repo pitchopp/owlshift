@@ -207,9 +207,9 @@ always_human = []
 # ref on origin, for a team's runners or one person's two machines; the
 # default branch's file decides it). Under \"remote\", a command whose operator cannot be
 # read, the tracker key's account or, on the Markdown tracker,
-# `identity.tracker`, is refused: a claim names its operator. Set back to
-# \"local\", the claims on origin expire, a person's to release. Default:
-# `\"local\"`.
+# `identity.tracker`, is refused: a claim names its operator. A person
+# releases a claim with `owlshift release`; set back to \"local\", the claims
+# on origin expire, a person's to release. Default: `\"local\"`.
 # claims = \"local\"
 # What the resolver decides without the decider: \"none\", \"facts\",
 # \"discoverable\", \"ticket\" (also scope questions the ticket's text answers)

@@ -107,6 +107,13 @@ owlshift why ENG-12
 - **Blocked.** `blocked by <tickets>`; `its blocker <ticket> was canceled: a person removes the relation or the line`; or `its "Blocked by" line names <ticket>, which the tracker does not know`.
 - **A resource is held.** `<ticket> holds <resource>, which it would touch`, or `its Build waits: <ticket> holds <resource>, which its Build would take`: the ticket goes on once the holder's pull request is merged or closed. `the project's slot is held by <ticket>` and `every run slot of this machine is taken` say the same for the project and the machine, and `the open pull requests reached their cap (<n> of <cap>)` waits for a merge.
 - **Being worked, or waiting for a person.** `it is being worked, waits for an answer, is parked, or its pull request is followed`: see [A ticket is parked](#a-ticket-is-parked), or answer the questions on the ticket.
+- **Another runner holds it.** Under `claims = "remote"`, `claimed by <operator>'s runner until <time>: theirs to work`: a colleague's machine, or another of yours, works the ticket, and `owlshift status` lists every claim it knows. Once that claim has expired, a person the project's `[people]` lists releases it, and the claim's operator may at any time, from any of their machines:
+
+  ```bash
+  owlshift release ENG-12
+  ```
+
+  The release posts a `[owlshift] RELEASED` comment on the ticket saying how to have it worked again: the person whose runner should take it admits it again, after the branch the earlier runner pushed is closed and deleted. A live claim of another person's is refused; ask them.
 - **A pause, a quarantine or a usage limit.** See the sections below: `owlshift why` prints ``the project is quarantined (`owlshift unquarantine`)``, and `<harness> is at its usage limit until <time>`.
 - **A dark wake, on macOS.** The service prints `the machine is in a dark wake (macOS keeps it up without graphics): no ticket is dispatched and no step starts; ...`. Nothing is wrong: it lifts at the next full wake, and `the machine is in a full wake again` follows in the log.
 

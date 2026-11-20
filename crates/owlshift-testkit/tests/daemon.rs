@@ -1751,6 +1751,7 @@ fn the_real_ui_answers_what_the_commands_print_for_the_bench() {
             "waiting",
             "parked",
             "merges",
+            "claims",
             "drain_steps",
             "slots",
             "digest"

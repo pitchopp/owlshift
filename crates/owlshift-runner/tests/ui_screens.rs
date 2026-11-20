@@ -381,6 +381,7 @@ fn the_orchestrators_lines_are_the_status_lines_it_shows_in_order() {
             "waiting",
             "parked",
             "merges",
+            "claims",
             "drain_steps",
             "slots",
             "digest"

@@ -43,6 +43,7 @@ pub mod quarantine;
 pub mod ready;
 pub mod rebase;
 pub mod refusal;
+pub mod release;
 pub mod resolver;
 pub mod resume;
 pub mod reversal;
