@@ -3,8 +3,10 @@
 //! looks at the harness CLIs installed.
 
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
+use std::sync::OnceLock;
+use std::time::{Duration, UNIX_EPOCH};
 
 /// Runs `owlshift` in `dir`, with the personal configuration directory and
 /// git's own environment overrides pointed away from the host's.
@@ -31,7 +33,7 @@ fn owlshift(dir: &Path, config_dir: &Path, args: &[&str]) -> Output {
 }
 
 fn command(dir: &Path, config_dir: &Path, args: &[&str]) -> Command {
-    let mut command = Command::new(env!("CARGO_BIN_EXE_owlshift"));
+    let mut command = Command::new(binary());
     command
         .args(args)
         .current_dir(dir)
@@ -44,6 +46,83 @@ fn command(dir: &Path, config_dir: &Path, args: &[&str]) -> Command {
         .env_remove("GIT_INDEX_FILE")
         .env_remove("GIT_CEILING_DIRECTORIES");
     command
+}
+
+/// The `owlshift` binary under test, as a copy of cargo's that no cargo
+/// command replaces (OWL-610), made by the first test of a build and started
+/// by every test after it.
+///
+/// `CARGO_BIN_EXE_owlshift` is cargo's `target/debug/owlshift`, which every
+/// cargo command building this package in the same target directory removes
+/// and writes again, on macOS even when it rebuilds nothing: cargo copies the
+/// binary out of `deps/` there rather than hard-linking it (cargo issue
+/// 10060), so it never finds it already in place. A process started in
+/// between fails with "No such file or directory", and so may the binary's
+/// runs of itself, which start the file it was started from (`start`'s
+/// daemon, the copy the daemon pins, `doctor`'s sentinel). The copy is made
+/// as cargo makes its own, while the test holds cargo's lock on that
+/// directory shared: cargo replaces the binary only while it holds that lock
+/// exclusively. Its folder is named by the binary's size and modification
+/// time, which cargo's copy keeps, so a build that compiles nothing finds the
+/// copy in place. Copies of other builds made more than an hour before are
+/// removed when a copy is made: a run still starting one then, which takes a
+/// rebuild during the run, fails.
+///
+/// Checked on 2026-11-20 with cargo 1.98.1 on macOS. A build that compiled
+/// nothing gave `target/debug/owlshift` a new inode, the path missing for 25
+/// to 186 µs each time, with the size and modification time of
+/// `deps/owlshift-<hash>` to the nanosecond. Cargo held `.cargo-artifact-lock`
+/// exclusively from its start until after it replaced the binary; a shared
+/// lock held on it made a build wait ("Blocking waiting for file lock on
+/// artifact directory"), and `.cargo-lock` no longer did. Neither `cargo
+/// test` nor nextest holds it while the tests run. Starting the binary in a
+/// loop while cargo rebuilt nothing every 2.5 seconds, 14 of 140,047 starts of
+/// `target/debug/owlshift` failed so, and none of 254,785 of
+/// `deps/owlshift-<hash>`. A fresh hard link of the binary, instead of a
+/// copy, was killed by the system 13 times in 12,576 starts.
+fn binary() -> &'static Path {
+    static BINARY: OnceLock<PathBuf> = OnceLock::new();
+    BINARY.get_or_init(|| {
+        let cargo = Path::new(env!("CARGO_BIN_EXE_owlshift"));
+        let lock = cargo.parent().unwrap().join(".cargo-artifact-lock");
+        // Released when dropped, once the copy is in place.
+        let _cargo = fs::File::open(&lock)
+            .and_then(|file| file.lock_shared().map(|()| file))
+            .unwrap_or_else(|error| panic!("{}: {error}, cargo's lock (OWL-610)", lock.display()));
+        let built = fs::metadata(cargo).unwrap();
+        let modified = built.modified().unwrap();
+        let since = modified.duration_since(UNIX_EPOCH).unwrap();
+        // In the target directory: on its file system, so that the copy is a
+        // clone where cargo's is one (APFS), and gone with `cargo clean`.
+        let copies = Path::new(env!("CARGO_TARGET_TMPDIR")).join("owlshift-bin");
+        let folder = copies.join(format!("{}-{}", built.len(), since.as_nanos()));
+        let copy = folder.join(cargo.file_name().unwrap());
+        fs::create_dir_all(&folder).unwrap();
+        // One test copies, the others wait for it: they all start one file,
+        // which macOS scans once.
+        let one = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(folder.join("lock"))
+            .unwrap();
+        one.lock().unwrap();
+        if !copy.exists() {
+            let staged = folder.join(format!("staged-{}", std::process::id()));
+            fs::copy(cargo, &staged).unwrap();
+            fs::rename(&staged, &copy).unwrap();
+            for entry in fs::read_dir(&copies).unwrap().flatten() {
+                let made = entry.metadata().and_then(|meta| meta.modified());
+                let old = made.is_ok_and(|made| {
+                    made.elapsed()
+                        .is_ok_and(|age| age > Duration::from_secs(3600))
+                });
+                if old && entry.path() != folder {
+                    let _ = fs::remove_dir_all(entry.path());
+                }
+            }
+        }
+        copy
+    })
 }
 
 fn git(dir: &Path, args: &[&str]) {
@@ -776,7 +855,7 @@ impl HungProbe {
 
         let config_dir = tempfile::tempdir().unwrap();
         let report = config_dir.path().join("report");
-        let mut owlshift = Command::new(env!("CARGO_BIN_EXE_owlshift"))
+        let mut owlshift = Command::new(binary())
             .arg("doctor")
             .current_dir(config_dir.path())
             .env("PATH", format!("{}:/usr/bin:/bin", bin.path().display()))
@@ -1200,7 +1279,7 @@ mod windows_ctrl_c {
             system_root.clone(),
         ])
         .unwrap();
-        let mut owlshift = Command::new(env!("CARGO_BIN_EXE_owlshift"))
+        let mut owlshift = Command::new(super::binary())
             .arg("doctor")
             .current_dir(&config_dir)
             .env("PATH", path)
