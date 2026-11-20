@@ -1953,7 +1953,7 @@ fn the_ticket_snapshot_takes_a_percent_encoded_project() {
         assert_eq!(reply.status, 200, "{query}: {}", reply.text());
         reply.assert_secured();
         let value = reply.json();
-        assert_eq!(value["format"], 3);
+        assert_eq!(value["format"], 4);
         assert_eq!(value["ticket"], "OWL-1");
         assert!(value["runs"]["runs"].as_array().unwrap().is_empty());
     }
@@ -4245,6 +4245,45 @@ fn restart_answers_what_the_command_came_to() {
     );
 }
 
+/// OWL-588: Release runs the releaser with the project and the ticket: the
+/// command's lines on success, its refusal 409 with what it printed; its
+/// command is `owlshift release` on the served project, from the UI.
+#[test]
+fn release_answers_what_the_command_came_to() {
+    let release: server::Restarter =
+        Arc::new(|_: &Repo, ticket: &TicketId| match ticket.as_str() {
+            "OWL-1" => server::Restarted::Done(vec!["Released OWL-1's claim on origin".into()]),
+            _ => server::Restarted::Refused(
+                "OWL-2 is claimed by lea's runner until 2026-11-21 09:00 UTC, a live claim".into(),
+                vec!["owlshift: OWL-2 is claimed by lea's runner".into()],
+            ),
+        });
+    let ground = Ground::with_options(Options {
+        release,
+        ..options()
+    });
+    let body = |ticket: &str| json!({ "project": "o/r", "ticket": ticket });
+    assert_eq!(
+        lines(&ground.post("/api/release", &body("OWL-1"))),
+        ["Released OWL-1's claim on origin"]
+    );
+    let refused = ground.post("/api/release", &body("OWL-2"));
+    assert_eq!(refused.status, 409);
+    assert!(
+        refused.json()["error"]
+            .as_str()
+            .unwrap()
+            .ends_with("a live claim")
+    );
+    let command = server::release_command(
+        Path::new("/opt/owlshift"),
+        &Repo::parse("o/r").unwrap(),
+        &TicketId::new("OWL-7").unwrap(),
+    );
+    let args: Vec<&std::ffi::OsStr> = command.get_args().collect();
+    assert_eq!(args, ["release", "OWL-7", "--served", "o/r", "--from-ui"]);
+}
+
 /// The restart's command is `owlshift continue --to-watch` on the served
 /// project, from the UI.
 #[test]
@@ -4375,7 +4414,7 @@ fn the_page_posts_its_actions_to_their_routes_only() {
         "/api/spend",
         "/api/config",
     ];
-    const POSTS: [&str; 9] = [
+    const POSTS: [&str; 10] = [
         "/api/login",
         "/api/reply",
         "/api/doctor",
@@ -4384,6 +4423,7 @@ fn the_page_posts_its_actions_to_their_routes_only() {
         "/api/forget",
         "/api/cancel",
         "/api/restart",
+        "/api/release",
         "/api/config/personal",
     ];
     let app = routes_named(APP_JS);
@@ -4394,7 +4434,7 @@ fn the_page_posts_its_actions_to_their_routes_only() {
             "an asset names {route}"
         );
     }
-    for route in ["/api/cancel", "/api/restart"] {
+    for route in ["/api/cancel", "/api/restart", "/api/release"] {
         assert!(app.contains(route), "app.js does not post {route}");
     }
     for route in [
@@ -4408,7 +4448,7 @@ fn the_page_posts_its_actions_to_their_routes_only() {
     // Each action goes through the helper of its file that carries the
     // session (`no_asset_holds_the_token_…` pins their callers): `postAction`
     // in app.js, `act` or `editKey` in ops.js, which call `request`.
-    for route in ["/api/cancel", "/api/restart"] {
+    for route in ["/api/cancel", "/api/restart", "/api/release"] {
         for (at, _) in APP_JS.match_indices(&format!("\"{route}\"")) {
             let before = &APP_JS[at.saturating_sub(40)..at];
             assert!(
@@ -4438,18 +4478,26 @@ fn the_page_posts_its_actions_to_their_routes_only() {
 }
 
 /// OWL-473: Stop serving and Cancel ask for a confirmation right before they
-/// post; no other action does.
+/// post, and Release too (OWL-588); no other action does.
 #[test]
-fn only_stop_serving_and_cancel_ask_for_a_confirmation() {
-    for (asset, route) in [(OPS_JS, "\"/api/forget\""), (APP_JS, "\"/api/cancel\"")] {
-        assert_eq!(asset.matches("confirm(").count(), 1, "{route}");
-        let at = asset.find("window.confirm(").unwrap();
-        let next = asset[at..].find("\"/api/").unwrap();
-        assert!(
-            asset[at + next..].starts_with(route),
-            "the confirmation comes before {route}"
+fn only_stop_serving_cancel_and_release_ask_for_a_confirmation() {
+    for (asset, routes) in [
+        (OPS_JS, &["\"/api/forget\""][..]),
+        (APP_JS, &["\"/api/cancel\"", "\"/api/release\""]),
+    ] {
+        assert_eq!(
+            asset.matches("confirm(").count(),
+            routes.len(),
+            "{routes:?}"
         );
-        assert!(next < 400, "{route} follows its confirmation at once");
+        for ((at, _), route) in asset.match_indices("window.confirm(").zip(routes) {
+            let next = asset[at..].find("\"/api/").unwrap();
+            assert!(
+                asset[at + next..].starts_with(route),
+                "the confirmation comes before {route}"
+            );
+            assert!(next < 400, "{route} follows its confirmation at once");
+        }
     }
 }
 

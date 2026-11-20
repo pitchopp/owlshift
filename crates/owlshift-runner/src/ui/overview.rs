@@ -8,13 +8,17 @@
 //! [`build`] is pure. Its JSON is the UI's own, versioned with the binary:
 //!
 //! - `projects`: each `{"repository", "served", "paused", "quarantined",
-//!   "ready", "cards", "list"}`. `ready` is `{"at", "stale"}` of the drain's
+//!   "ready", "cards", "list", "held"}`. `ready` is `{"at", "stale"}` of the drain's
 //!   latest snapshot, or null. `cards` has one card for each row of
 //!   `owlshift status --waits` and one for each admitted ticket of
 //!   `ready.json` that has neither a ref nor a row, in a column:
 //!   `not_started`, one of the eight stages, `starting` (a run holds a slot
 //!   and its ref is not written yet) or `unreadable` (its ref does not
 //!   read). `list` names the cards' tickets in the list view's order.
+//! - `held` (OWL-588): the tickets other runners hold by their claims on
+//!   the git remote, as the dedicated checkout last fetched them, each
+//!   `{"ticket", "operator", "runner", "expires_at", "expired", "unread"}`:
+//!   by whom and until when, or why the claim does not read;
 //! - a card: `ticket`, `project`, `title` (ready.json's, else the dispatch
 //!   event's), `priority`, `column`, `stage`, `ref_status`, `running`
 //!   (`slot`, `since`, `role` of the ticket's latest run), `wait` (the shape
@@ -52,6 +56,7 @@ use owlshift_core::vocab::{Priority, Stage};
 use serde_json::{Value, json};
 
 use super::eventtail::{EventTail, Run, lookup};
+use crate::claims::FetchedClaim;
 use crate::project::ProjectDirs;
 use crate::ready;
 use crate::status::waits::{self, RefDetail};
@@ -162,6 +167,58 @@ pub struct ProjectView {
     pub cards: Vec<Card>,
     /// The tickets of `cards`, in the list view's order, each once.
     pub list: Vec<TicketId>,
+    /// The tickets other runners hold by their claims (OWL-588).
+    pub held: Vec<Held>,
+}
+
+/// A ticket another runner holds by its claim on the git remote, as the
+/// dedicated checkout last fetched it (OWL-588).
+#[derive(Clone, Debug, PartialEq)]
+pub struct Held {
+    pub ticket: TicketId,
+    /// Its holder's operator and runner, and its expiry, when it reads.
+    pub operator: Option<String>,
+    pub runner: Option<String>,
+    pub expires_at: Option<Timestamp>,
+    /// It expired by this machine's clock: a person may release it.
+    pub expired: bool,
+    /// Why it does not read.
+    pub unread: Option<String>,
+}
+
+impl Held {
+    /// `claim` as held at `now`.
+    pub fn of(claim: &FetchedClaim, now: Timestamp) -> Self {
+        match &claim.claim {
+            Ok(read) => Self {
+                ticket: claim.ticket.clone(),
+                operator: Some(read.operator.clone()),
+                runner: Some(read.runner.clone()),
+                expires_at: Some(read.expires_at),
+                expired: read.expires_at < now,
+                unread: None,
+            },
+            Err(unread) => Self {
+                ticket: claim.ticket.clone(),
+                operator: None,
+                runner: None,
+                expires_at: None,
+                expired: false,
+                unread: Some(unread.reason.clone()),
+            },
+        }
+    }
+
+    fn json(&self) -> Value {
+        json!({
+            "ticket": self.ticket,
+            "operator": self.operator,
+            "runner": self.runner,
+            "expires_at": self.expires_at.map(|at| at.to_string()),
+            "expired": self.expired,
+            "unread": self.unread,
+        })
+    }
 }
 
 /// One ticket "for you".
@@ -310,6 +367,7 @@ impl ProjectView {
             })),
             "cards": self.cards.iter().map(Card::json).collect::<Vec<_>>(),
             "list": self.list,
+            "held": self.held.iter().map(Held::json).collect::<Vec<_>>(),
         })
     }
 }
@@ -358,6 +416,8 @@ pub struct Aux {
     pub details: BTreeMap<TicketId, RefDetail>,
     /// The drain's latest snapshot, when there is one that reads.
     pub ready: Option<ReadySnapshot>,
+    /// The other runners' claims, as last fetched (OWL-588).
+    pub held: Vec<FetchedClaim>,
 }
 
 type Titles = BTreeMap<(String, TicketId), String>;
@@ -554,6 +614,7 @@ fn project_view(
         }),
         cards,
         list,
+        held: aux.held.iter().map(|claim| Held::of(claim, now)).collect(),
     }
 }
 
@@ -681,6 +742,7 @@ pub fn gather(
             Aux {
                 details: project.details.clone(),
                 ready: snapshot,
+                held: project.claims.clone(),
             }
         })
         .collect();

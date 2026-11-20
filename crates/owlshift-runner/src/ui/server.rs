@@ -61,9 +61,9 @@
 //!   One reply at a time per ticket (409), and none to a round that changed
 //!   since the page read it (409).
 //! - `POST /api/pause`, `/api/resume`, `/api/forget`, `/api/cancel` and
-//!   `/api/restart` (OWL-473), under the session as well: the operator's
-//!   actions, each through its command's own code and locks, recorded with
-//!   `by` = `ui`; and `POST /api/config/personal` `{"path", "value", "rev"}`,
+//!   `/api/restart` (OWL-473), and `/api/release` (OWL-588), under the
+//!   session as well: the operator's actions, each through its command's
+//!   own code and locks, recorded with `by` = `ui`; and `POST /api/config/personal` `{"path", "value", "rev"}`,
 //!   one key of the personal file edited ([`crate::personal_edit`]), the
 //!   edit recorded as an event. Starting or stopping the service and
 //!   `owlshift unquarantine` have no route: they stay in the terminal.
@@ -207,12 +207,17 @@ pub struct Options {
     /// which runs `owlshift continue --to-watch` in a child of this binary;
     /// a test passes a scripted one.
     pub restart: Restarter,
+    /// Releases a served project's ticket's claim on the git remote
+    /// (OWL-588): [`spawn_release`], which runs `owlshift release` in a
+    /// child of this binary; a test passes a scripted one.
+    pub release: Restarter,
 }
 
-/// The web UI's Restart of a served project's ticket (OWL-473).
+/// The web UI's Restart of a served project's ticket (OWL-473), and its
+/// Release (OWL-588): a command run in a child of this binary.
 pub type Restarter = Arc<dyn Fn(&Repo, &TicketId) -> Restarted + Send + Sync>;
 
-/// What a restart from the web UI came to.
+/// What a restart or a release from the web UI came to.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Restarted {
     /// The command ended in success: what it printed.
@@ -225,8 +230,8 @@ pub enum Restarted {
     NotStarted(String),
 }
 
-/// How long the restart route waits for its command before it answers that
-/// the restart goes on.
+/// How long the restart and release routes wait for their command before
+/// they answer that it goes on.
 pub const RESTART_WAIT: Duration = Duration::from_secs(120);
 
 /// The command of the web UI's Restart of `ticket` on the served project
@@ -254,10 +259,16 @@ pub fn restart_command(program: &Path, repo: &Repo, ticket: &TicketId) -> Comman
 /// [`Restarted::GoesOn`] when it still runs, a thread of its own then
 /// waiting for its end, so it is never killed between the stage it shows
 /// and the ref it writes.
-pub fn run_restart(mut command: Command, wait: Duration) -> Restarted {
+pub fn run_restart(command: Command, wait: Duration) -> Restarted {
+    run_child(command, wait, "restart")
+}
+
+/// [`run_restart`] for the web UI's `what`, `restart` or `release`, which
+/// its own words name.
+fn run_child(mut command: Command, wait: Duration, what: &str) -> Restarted {
     let mut child = match command.spawn() {
         Ok(child) => child,
-        Err(error) => return Restarted::NotStarted(format!("the restart did not start: {error}")),
+        Err(error) => return Restarted::NotStarted(format!("the {what} did not start: {error}")),
     };
     fn reader<R: Read + Send + 'static>(pipe: Option<R>) -> JoinHandle<String> {
         thread::spawn(move || {
@@ -278,7 +289,7 @@ pub fn run_restart(mut command: Command, wait: Duration) -> Restarted {
             other => {
                 let failed = other.err();
                 let _ = thread::Builder::new()
-                    .name("ui-restart".into())
+                    .name(format!("ui-{what}"))
                     .spawn(move || {
                         let _ = child.wait();
                         let _ = (out.join(), err.join());
@@ -286,7 +297,7 @@ pub fn run_restart(mut command: Command, wait: Duration) -> Restarted {
                 return match failed {
                     None => Restarted::GoesOn,
                     Some(error) => Restarted::NotStarted(format!(
-                        "the restart's end could not be read: {error}"
+                        "the {what}'s end could not be read: {error}"
                     )),
                 };
             }
@@ -312,8 +323,8 @@ pub fn run_restart(mut command: Command, wait: Duration) -> Restarted {
         .map(|line| line.strip_prefix("owlshift: ").unwrap_or(&line).to_owned())
         .or_else(|| said(&stdout).pop())
         .unwrap_or_else(|| match status.code() {
-            Some(code) => format!("the restart ended with exit status {code}"),
-            None => "the restart was ended by a signal".to_owned(),
+            Some(code) => format!("the {what} ended with exit status {code}"),
+            None => format!("the {what} was ended by a signal"),
         });
     Restarted::Refused(refusal, lines)
 }
@@ -325,6 +336,38 @@ pub fn spawn_restart(repo: &Repo, ticket: &TicketId) -> Restarted {
         Ok(own) => run_restart(restart_command(&own.spawn, repo, ticket), RESTART_WAIT),
         Err(error) => Restarted::NotStarted(format!(
             "this program's own path, which runs the restart: {error}"
+        )),
+    }
+}
+
+/// The command of the web UI's Release of `ticket`'s claim on the served
+/// project `repo` (OWL-588), `program` being this binary: `owlshift release
+/// <TICKET> --served <OWNER/REPO> --from-ui`, its input closed and its
+/// outputs captured. Its keychain, its tracker and its events stay in that
+/// process, as the Restart's do.
+pub fn release_command(program: &Path, repo: &Repo, ticket: &TicketId) -> Command {
+    let mut command = Command::new(program);
+    command
+        .args(["release", ticket.as_str(), "--served"])
+        .arg(repo.to_string())
+        .arg("--from-ui")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    command
+}
+
+/// The release of [`Options::default`]: [`release_command`] on this
+/// binary, waited for [`RESTART_WAIT`] at most.
+pub fn spawn_release(repo: &Repo, ticket: &TicketId) -> Restarted {
+    match owlshift_platform::process::own_program() {
+        Ok(own) => run_child(
+            release_command(&own.spawn, repo, ticket),
+            RESTART_WAIT,
+            "release",
+        ),
+        Err(error) => Restarted::NotStarted(format!(
+            "this program's own path, which runs the release: {error}"
         )),
     }
 }
@@ -349,6 +392,7 @@ impl Default for Options {
             system: Arc::new(HostSystem),
             keys: Arc::new(no_key),
             restart: Arc::new(spawn_restart),
+            release: Arc::new(spawn_release),
         }
     }
 }
@@ -869,7 +913,8 @@ fn handle(context: &Arc<Context>, mut request: Request) {
         }
         (
             Method::Post,
-            "/api/pause" | "/api/resume" | "/api/forget" | "/api/cancel" | "/api/restart",
+            "/api/pause" | "/api/resume" | "/api/forget" | "/api/cancel" | "/api/restart"
+            | "/api/release",
         ) => {
             if !in_session(context, &request) {
                 error_response(401, "not logged in: run `owlshift ui` in a terminal")
@@ -1018,7 +1063,9 @@ fn said(done: Result<Vec<String>, String>) -> Response<Cursor<Vec<u8>>> {
 /// - `POST /api/cancel` `{"project", "ticket", "reason"?}`: `owlshift
 ///   cancel` on the served project's kept project file;
 /// - `POST /api/restart` `{"project", "ticket"}`: `owlshift continue
-///   --to-watch`, in a child ([`Options::restart`]).
+///   --to-watch`, in a child ([`Options::restart`]);
+/// - `POST /api/release` `{"project", "ticket"}`: `owlshift release`, in a
+///   child ([`Options::release`], OWL-588).
 ///
 /// Each answers `{"lines"}`, the command's own words, or `{"error"}`, its
 /// refusal, 409; a body that does not read is refused 400, a project the
@@ -1065,7 +1112,12 @@ fn action_page(context: &Context, path: &str, body: &[u8]) -> Response<Cursor<Ve
                     let reason = reason_of(&map)?;
                     return Ok(said(cancel_ui(context, &repo, &ticket, reason)));
                 }
-                Ok(match (context.options.restart)(&repo, &ticket) {
+                let (run, what) = if path == "/api/release" {
+                    (&context.options.release, "release")
+                } else {
+                    (&context.options.restart, "restart")
+                };
+                Ok(match run(&repo, &ticket) {
                     Restarted::Done(lines) => json_response(200, &json!({ "lines": lines })),
                     Restarted::Refused(why, lines) => {
                         json_response(409, &json!({ "error": why, "lines": lines }))
@@ -1073,7 +1125,7 @@ fn action_page(context: &Context, path: &str, body: &[u8]) -> Response<Cursor<Ve
                     Restarted::GoesOn => json_response(
                         202,
                         &json!({ "lines": [format!(
-                            "The restart of {ticket} goes on: `owlshift why {ticket}` tells its \
+                            "The {what} of {ticket} goes on: `owlshift why {ticket}` tells its \
                              outcome."
                         )] }),
                     ),

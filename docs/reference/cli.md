@@ -22,6 +22,7 @@ Works a team's backlog with coding agents, and asks a human on the ticket when a
 - [`owlshift watch`](#owlshift-watch)
 - [`owlshift forget`](#owlshift-forget)
 - [`owlshift cancel`](#owlshift-cancel)
+- [`owlshift release`](#owlshift-release)
 - [`owlshift gate`](#owlshift-gate)
 - [`owlshift unquarantine`](#owlshift-unquarantine)
 - [`owlshift why`](#owlshift-why)
@@ -146,6 +147,18 @@ Arguments and options:
 
 - `<TICKET>`: The ticket, such as OWL-12.
 - `--reason <TEXT>`: Why, said in the PARKED comment.
+
+## `owlshift release`
+
+Release a ticket's claim on the git remote, so that another runner can take it: on the machine that holds it at any time, its step under way stopped first; from another machine when the claim's operator is yours, or once it expired, by a person the project's `[people]` lists. Any other live claim is refused, with its holder and its expiry. A RELEASED comment on the ticket says who released it and how to have it worked again; its stage is left as it is.
+
+```text
+owlshift release <TICKET>
+```
+
+Arguments and options:
+
+- `<TICKET>`: The ticket, such as OWL-12.
 
 ## `owlshift gate`
 

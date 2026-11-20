@@ -1106,8 +1106,11 @@ async function ticketAction(handle, path, extra, button) {
 // The ticket's actions (OWL-473): Restart while it is parked, which runs
 // `owlshift continue --to-watch` on the server; Cancel where `owlshift
 // cancel` would write one, after a confirmation, with an optional reason;
-// and the cancel that stands. An action not offered stays visible, disabled,
-// with the reason as its title (visual identity section 6).
+// and the cancel that stands. Release (OWL-588) once a claim of the ticket
+// on the git remote is known here, after a confirmation, which runs
+// `owlshift release` on the server, and who holds that claim. An action not
+// offered stays visible, disabled, with the reason as its title (visual
+// identity section 6).
 function renderActions(handle, body, actions) {
   const row = make("div", "ticket-actions");
   const restart = make("button", "action-primary", "Restart");
@@ -1142,7 +1145,28 @@ function renderActions(handle, body, actions) {
     cancel.setAttribute("title", actions.cancel_refusal || "Cancel is not offered on this ticket now.");
     row.appendChild(cancel);
   }
+  const release = make("button", "action", "Release");
+  release.type = "button";
+  if (actions.release) {
+    release.setAttribute("title", "Releases the ticket's claim on the git remote, as owlshift " +
+      "release does, which refuses a live claim of another person's.");
+    release.addEventListener("click", () => {
+      if (!window.confirm("Release " + handle.ticket + "'s claim? On the machine that holds it, its " +
+        "step under way is stopped first; a RELEASED comment says on the ticket how to have it " +
+        "worked again.")) {
+        return;
+      }
+      ticketAction(handle, "/api/release", {}, release);
+    });
+  } else {
+    release.disabled = true;
+    release.setAttribute("title", "Release is offered once a claim of this ticket is known here.");
+  }
+  row.appendChild(release);
   body.appendChild(row);
+  if (actions.claim) {
+    body.appendChild(make("p", "ticket-status", "Claim: " + actions.claim));
+  }
   if (!actions.cancel && actions.cancel_refusal) {
     body.appendChild(make("p", "ticket-status", "Cancel is not offered: " + actions.cancel_refusal));
   }
@@ -2614,6 +2638,35 @@ function renderList(project, into) {
   into.appendChild(list);
 }
 
+// The tickets other runners hold by their claims on the git remote
+// (OWL-588), as the dedicated checkout last fetched them: by whom and until
+// when; an expired one is a person's to release, from its page.
+function renderHeld(project, into) {
+  const held = project.held || [];
+  if (!held.length) {
+    return;
+  }
+  into.appendChild(make("h4", "held-head", "Held by other runners"));
+  const list = make("ul", "plain rows");
+  for (const claim of held) {
+    const row = make("li", "row");
+    row.appendChild(ticketLink(project.repository, claim.ticket));
+    let words = claim.operator + "'s runner until " + shortTime(claim.expires_at);
+    let className = "card-why";
+    if (claim.unread) {
+      words = "its claim does not read: " + claim.unread;
+      className += " state-warning";
+    } else if (claim.expired) {
+      words = claim.operator + "'s runner, its claim expired " + shortTime(claim.expires_at) +
+        ": a person may release it from its page";
+      className += " state-warning";
+    }
+    row.appendChild(make("span", className, words));
+    list.appendChild(row);
+  }
+  into.appendChild(list);
+}
+
 function renderView(overview) {
   const body = document.getElementById("overview-body");
   clear(body);
@@ -2642,6 +2695,7 @@ function renderView(overview) {
     } else {
       renderColumns(project, block);
     }
+    renderHeld(project, block);
     body.appendChild(block);
   }
 }

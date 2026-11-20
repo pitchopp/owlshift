@@ -67,12 +67,12 @@ use owlshift_adapters::tracker::{
 use owlshift_contracts::comment::{
     FOOTER_OPEN, Footer, HEADER_PREFIX, HEADER_SEPARATOR, Header, MarkedComment, MarkerKind,
 };
-use owlshift_contracts::config::States;
+use owlshift_contracts::config::{Admit, States};
 use owlshift_contracts::drain::{DependencyOutcome, KeptDependency, ProposalOutcome};
 use owlshift_contracts::format::Format;
 use owlshift_contracts::ids::{QuestionId, TicketId};
 use owlshift_contracts::refs::{
-    AnsweredReview, DeliveredPullRequest, KeptDecision, PushKind, Rerun, RerunOutcomeKind,
+    AnsweredReview, Claim, DeliveredPullRequest, KeptDecision, PushKind, Rerun, RerunOutcomeKind,
 };
 use owlshift_contracts::result::{
     AnswerClass, Decision, Followup, FollowupSource, Question, RefusedChoice, Routing,
@@ -298,6 +298,129 @@ impl RerunComment {
             footer.render(),
         ];
         let mut body = body.join("\n\n");
+        body.push('\n');
+        body
+    }
+}
+
+/// The RELEASED comment (OWL-588; build plan "P10 · Teams", "Releasing a
+/// claim"): a person released the ticket's claim on the git remote. It says
+/// who released it, whose claim it was, and how to have the ticket worked
+/// again; it moves no stage and parks nothing. The claim's operator, read
+/// from a remote every collaborator writes to, is shown as code, and not at
+/// all outside [`shown_operator`]'s characters.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ReleasedComment {
+    pub ticket: TicketId,
+    /// The commit of the claim released: the line the comment is found by.
+    pub commit: String,
+    /// The claim released.
+    pub claim: Claim,
+    /// Whether it had expired, by the releasing machine's clock.
+    pub expired: bool,
+    /// Who released it: this machine's operator, by handle, else account.
+    pub by: String,
+    /// Released from the web UI's button rather than `owlshift release`.
+    pub from_ui: bool,
+    pub at: Timestamp,
+    /// The project's admission gesture.
+    pub admit: Admit,
+    /// The tracker state of the ready column.
+    pub ready: String,
+    /// The ticket's branch, while it is on `origin`.
+    pub branch: Option<String>,
+}
+
+/// `operator` as a comment shows it: as code when it holds only letters,
+/// digits and `.`, `_`, `@`, `+`, `-`, 64 at most, which a handle and every
+/// tracker's account identifier do; otherwise not shown, since a claim's
+/// operator is whatever a collaborator with push access wrote (OWL-588).
+pub fn shown_operator(operator: &str) -> String {
+    let plain = (1..=64).contains(&operator.chars().count())
+        && operator
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '@' | '+' | '-'));
+    if plain {
+        code(operator)
+    } else {
+        "an operator whose name is not shown".to_owned()
+    }
+}
+
+impl ReleasedComment {
+    /// The line a RELEASED comment is found by: the claim's commit.
+    fn claim_line(&self) -> String {
+        format!("**Claim:** commit {}", code(&self.commit))
+    }
+
+    pub fn render(&self) -> String {
+        let header = Header {
+            kind: MarkerKind::Released,
+            round: None,
+        };
+        let footer = Footer {
+            format: Format,
+            kind: MarkerKind::Released,
+            ticket: self.ticket.clone(),
+            round: None,
+            run: None,
+        };
+        let ticket = &self.ticket;
+        let how = if self.from_ui {
+            "from the web UI"
+        } else {
+            "with `owlshift release`"
+        };
+        let held = self.claim.expires_at.strftime("%Y-%m-%d %H:%M UTC");
+        let lease = if self.expired {
+            format!("which expired at {held}")
+        } else {
+            format!("which held it until {held}")
+        };
+        let again = match &self.admit {
+            Admit::Label(label) => format!(
+                "move it back to {} and take the label {} off and put it on again",
+                code(&self.ready),
+                code(label)
+            ),
+            Admit::State(_) => format!("move it back to {}", code(&self.ready)),
+            Admit::Delegation => format!(
+                "move it back to {} and delegate it to Owlshift again",
+                code(&self.ready)
+            ),
+        };
+        let mut all = vec![
+            header.render(),
+            format!(
+                "**Released by** {} {how}, at {}: the claim of {}'s runner {}, {lease}.",
+                code(&self.by),
+                self.at.strftime("%Y-%m-%d %H:%M UTC"),
+                shown_operator(&self.claim.operator),
+                code(&self.claim.runner)
+            ),
+            self.claim_line(),
+            format!(
+                "**No runner works {ticket} now.** Its stage on the tracker is left as it is, \
+                 and it is not parked: no `continue` restarts it."
+            ),
+            format!(
+                "**To have it worked again,** the person whose runner should take it admits it \
+                 again: they {again}, so that the gesture is theirs. That runner starts from the \
+                 ticket's text and this thread. Should the runner that held it take it again, \
+                 `owlshift forget {ticket}` on its machine first."
+            ),
+        ];
+        if let Some(branch) = &self.branch {
+            all.push(format!(
+                "**The branch {} is still on origin,** with what the earlier runner pushed, and \
+                 no runner takes {ticket} while it is there: close its pull request and delete \
+                 the branch first, or finish that pull request by hand instead of admitting the \
+                 ticket again.",
+                code(branch)
+            ));
+        }
+        all.push(footer.render());
+        let mut body = all.join("\n\n");
         body.push('\n');
         body
     }
@@ -4807,6 +4930,18 @@ impl<'a> Writer<'a> {
         self.post(&comment.ticket, &comment.render())
     }
 
+    /// Posts the RELEASED comment of a claim a person released (OWL-588),
+    /// once: a RELEASED comment naming the same claim's commit is returned
+    /// instead.
+    pub fn post_released(&self, comment: &ReleasedComment) -> Result<Reported, WriteError> {
+        self.post_marked_once(
+            &comment.ticket,
+            MarkerKind::Released,
+            &comment.claim_line(),
+            &comment.render(),
+        )
+    }
+
     /// Posts a PARKED comment and returns it as the tracker recorded it.
     pub fn post_parked(&self, comment: &ParkedComment) -> Result<Comment, WriteError> {
         self.post(&comment.ticket, &comment.render())
@@ -8358,6 +8493,79 @@ Reply `Q1: B`, `ok` to take every recommendation, or in your own words.
         assert_eq!(tracker.posts.get(), 2);
     }
 
+    fn released_comment(admit: Admit, branch: Option<&str>) -> ReleasedComment {
+        ReleasedComment {
+            ticket: TicketId::new("OWL-7").unwrap(),
+            commit: "c".repeat(40),
+            claim: Claim {
+                format: Format,
+                runner: "0123456789abcdef".to_owned(),
+                operator: "lea".to_owned(),
+                claimed_at: "2026-11-18T09:00:00Z".parse().unwrap(),
+                expires_at: "2026-11-19T09:00:00Z".parse().unwrap(),
+                held: Default::default(),
+            },
+            expired: true,
+            by: "ada".to_owned(),
+            from_ui: false,
+            at: "2026-11-20T10:05:00Z".parse().unwrap(),
+            admit,
+            ready: "Todo".to_owned(),
+            branch: branch.map(str::to_owned),
+        }
+    }
+
+    /// OWL-588: the RELEASED comment says who released the claim, whose it
+    /// was, how to have the ticket worked again by the admission gesture,
+    /// and the branch left on origin; it is posted once per claim, and an
+    /// operator a collaborator could have crafted is never shown raw.
+    #[test]
+    fn a_released_comment_says_who_whose_and_how_to_restart() {
+        let label = released_comment(Admit::Label("owlshift".to_owned()), Some("owlshift/owl-7"));
+        let body = label.render();
+        assert!(body.starts_with("[owlshift] RELEASED\n\n"), "{body}");
+        for says in [
+            "**Released by** `ada` with `owlshift release`, at 2026-11-20 10:05 UTC: the claim of \
+             `lea`'s runner `0123456789abcdef`, which expired at 2026-11-19 09:00 UTC.",
+            "**No runner works OWL-7 now.** Its stage on the tracker is left as it is, and it is \
+             not parked: no `continue` restarts it.",
+            "they move it back to `Todo` and take the label `owlshift` off and put it on again, \
+             so that the gesture is theirs.",
+            "`owlshift forget OWL-7` on its machine first.",
+            "**The branch `owlshift/owl-7` is still on origin,**",
+        ] {
+            assert!(body.contains(says), "{says}\n{body}");
+        }
+        let marked = MarkedComment::parse(&body).unwrap().unwrap();
+        assert_eq!(marked.footer.unwrap().kind, MarkerKind::Released);
+        let mut state = released_comment(Admit::State("Todo".to_owned()), None);
+        state.from_ui = true;
+        state.expired = false;
+        let body = state.render();
+        assert!(body.contains("from the web UI"), "{body}");
+        assert!(
+            body.contains("which held it until 2026-11-19 09:00 UTC"),
+            "{body}"
+        );
+        assert!(
+            body.contains("they move it back to `Todo`, so that"),
+            "{body}"
+        );
+        assert!(!body.contains("branch"), "{body}");
+        for crafted in ["@all see [this](https://x.test)", "a`b", ""] {
+            assert_eq!(
+                shown_operator(crafted),
+                "an operator whose name is not shown"
+            );
+        }
+        assert_eq!(shown_operator("2f9c51d0-6a3e-4b7e"), "`2f9c51d0-6a3e-4b7e`");
+        let tracker = FakeTracker::default();
+        let writer = Writer::new(&tracker);
+        let first = writer.post_released(&label).unwrap();
+        assert!(first.new && !writer.post_released(&label).unwrap().new);
+        assert_eq!(tracker.posts.get(), 1);
+    }
+
     /// OWL-228: `fit` leaves the shorter texts whole and cuts the longer
     /// ones to one length, so that together they take the room exactly,
     /// counted in characters; `fitted` keeps a body that holds as is, and
@@ -9446,6 +9654,9 @@ Reply `Q1: B`, `ok` to take every recommendation, or in your own words.
         ("post_rerun", |w, _| {
             came(w.post_rerun(&rerun_comment(RerunOutcomeKind::Passed, None)))
         }),
+        ("post_released", |w, _| {
+            came(w.post_released(&released_comment(Admit::Delegation, None)))
+        }),
         ("post_merged", |w, _| {
             came(w.post_merged(&MergedComment {
                 ticket: ticket(),
@@ -9590,7 +9801,7 @@ Reply `Q1: B`, `ok` to take every recommendation, or in your own words.
     /// `fold`, which is never an error, says so in its one failure.
     #[test]
     fn a_ui_writer_refuses_every_other_write() {
-        assert_eq!(UI_REFUSED_WRITES.len(), 29);
+        assert_eq!(UI_REFUSED_WRITES.len(), 30);
         for (name, write) in UI_REFUSED_WRITES {
             let tracker = Counting::default();
             tracker.accepts_posts.set(true);

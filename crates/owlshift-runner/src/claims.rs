@@ -41,7 +41,7 @@ use owlshift_adapters::forge::CommitId;
 use owlshift_adapters::forge::push::{
     PushError, RefPushed, RefUpdate, read_ref_push_parts, ref_push_command,
 };
-use owlshift_contracts::format::Format;
+use owlshift_contracts::format::{ContractError, Format};
 use owlshift_contracts::ids::TicketId;
 use owlshift_contracts::refs::{
     CLAIM_FILE, Claim, ClaimHeld, ClaimHolder, MAX_CLAIM_BYTES, TicketClaimLost, TicketClaimed,
@@ -342,6 +342,14 @@ pub fn runner_id(data_dir: &Path) -> io::Result<RunnerId> {
     })
 }
 
+/// This data directory's runner identifier when one was made, read and
+/// never made: what `owlshift status`, `owlshift why` and the web UI tell
+/// this runner's claims by (OWL-588), which write nothing. One that does
+/// not read is none.
+pub fn this_runner(data_dir: &Path) -> Option<RunnerId> {
+    read_runner(&data_dir.join(RUNNER_FILE)).ok().flatten()
+}
+
 fn read_runner(path: &Path) -> io::Result<Option<RunnerId>> {
     match fs::read_to_string(path) {
         Ok(text) => RunnerId::parse(text.trim()).map(Some).ok_or_else(|| {
@@ -606,6 +614,12 @@ pub fn renew(
         let Some(expected) = record.commit.clone().filter(|_| !record.deleting) else {
             continue;
         };
+        // A ticket this runner stopped working, its claim released here
+        // and its delete not made (OWL-588), is not renewed: its claim is
+        // left to expire.
+        if lost(at.dirs, &ticket).is_some() {
+            continue;
+        }
         match lock(at.dirs, &ticket, Duration::ZERO) {
             Ok(Some(held)) => locks.push(held),
             Ok(None) => {
@@ -845,26 +859,19 @@ pub fn delete(at: ClaimsAt<'_>, ticket: &TicketId) -> Result<Deleted, String> {
     // Once more at most: a claim of this runner's at a commit its record
     // missed is deleted at that commit.
     for _ in 0..2 {
-        let lease = CommitId::new(&expected).map_err(|e| e.to_string())?;
-        let update = RefUpdate::Delete {
-            name: &name,
-            expected: &lease,
-        };
-        match push(at.git, &checkout, &[update], false).remove(0) {
-            Ok(_) => {
+        let oid = match push_delete(at.git, &checkout, &name, &expected)? {
+            Lifted::Deleted => {
                 remove_record(at.dirs, ticket);
                 return Ok(Deleted::Deleted);
             }
-            Err(PushError::Failed { message }) => return Err(message),
-            Err(PushError::Rejected { .. }) => {}
-        }
-        let heads = ls_remote(at.git, &checkout, std::slice::from_ref(&name))?;
-        let Some(oid) = heads.get(&name) else {
-            remove_record(at.dirs, ticket);
-            return Ok(Deleted::NotOurs);
+            Lifted::Moved(None) => {
+                remove_record(at.dirs, ticket);
+                return Ok(Deleted::NotOurs);
+            }
+            Lifted::Moved(Some(oid)) => oid,
         };
         match read_remote(at.git, &checkout, ticket)? {
-            Some(claim) if claim.runner == deleting.claim.runner => expected = oid.clone(),
+            Some(claim) if claim.runner == deleting.claim.runner => expected = oid,
             _ => {
                 remove_record(at.dirs, ticket);
                 return Ok(Deleted::NotOurs);
@@ -872,6 +879,128 @@ pub fn delete(at: ClaimsAt<'_>, ticket: &TicketId) -> Result<Deleted, String> {
         }
     }
     Err(format!("origin refused the delete of {name} twice"))
+}
+
+/// Where a leased delete of a claim left `origin` (OWL-588).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Lifted {
+    /// The claim was deleted.
+    Deleted,
+    /// The delete was refused: `origin` holds another commit than the one
+    /// expected, renewed or taken again since, which it keeps; `None` when
+    /// the claim is gone.
+    Moved(Option<String>),
+}
+
+/// Deletes `name` on `origin` from `checkout`, leased on `expected`
+/// (live check T1): [`Lifted::Moved`], with what `origin` holds now, when
+/// refused. A push that fails otherwise is an error, nothing deleted.
+fn push_delete(git: &Git, checkout: &Path, name: &str, expected: &str) -> Result<Lifted, String> {
+    let lease = CommitId::new(expected).map_err(|e| e.to_string())?;
+    let update = RefUpdate::Delete {
+        name,
+        expected: &lease,
+    };
+    match push(git, checkout, &[update], false).remove(0) {
+        Ok(_) => Ok(Lifted::Deleted),
+        Err(PushError::Failed { message }) => Err(message),
+        Err(PushError::Rejected { .. }) => {
+            let heads = ls_remote(git, checkout, &[name.to_owned()])?;
+            Ok(Lifted::Moved(heads.get(name).cloned()))
+        }
+    }
+}
+
+/// A claim of `origin` as a release reads it (OWL-588).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Found {
+    /// The commit read, which the release's delete is leased on.
+    pub commit: String,
+    /// What it says, or why it does not read.
+    pub claim: Result<Claim, ClaimUnread>,
+    /// Whether the ticket's branch is on `origin`: what an earlier runner
+    /// pushed, which a new take refuses (build plan "Claims", "Taken").
+    pub branch: bool,
+}
+
+/// The claim `origin` holds of `ticket`, read for a release (OWL-588;
+/// build plan "Releasing a claim"): one `ls-remote` of the claim and of the
+/// ticket's `branch`, then the claim fetched to [`FETCHED_PREFIX`] and read
+/// at the commit the fetch left there. `None` when `origin` holds none.
+pub fn read_on_origin(
+    git: &Git,
+    checkout: &Path,
+    ticket: &TicketId,
+    branch: &str,
+) -> Result<Option<Found>, String> {
+    let name = claim_ref(ticket);
+    let head = format!("refs/heads/{branch}");
+    let heads = ls_remote(git, checkout, &[name.clone(), head.clone()])?;
+    if !heads.contains_key(&name) {
+        return Ok(None);
+    }
+    let (commit, claim) = fetch_claim(git, checkout, ticket)?;
+    Ok(Some(Found {
+        commit,
+        claim,
+        branch: heads.contains_key(&head),
+    }))
+}
+
+/// Deletes `ticket`'s claim from `origin` for a release (OWL-588; build
+/// plan "Releasing a claim"), leased on `expected`, the commit the release
+/// just read: a claim moved since, its holder having renewed it, is kept.
+/// Under the claim's lock, as every write of a claim here. A record of this
+/// runner's that knows `expected` says a delete is under way before the
+/// push, as [`delete`]'s does, so a crash after it is never read as a loss;
+/// it goes once the claim is gone, and is restored as it was otherwise. The
+/// claim fetched to [`FETCHED_PREFIX`] goes with the claim, so that what
+/// this machine shows of `origin`'s claims no longer names it.
+pub fn lift(at: ClaimsAt<'_>, ticket: &TicketId, expected: &str) -> Result<Lifted, String> {
+    let checkout = at.dirs.checkout();
+    let Some(_lock) = lock(at.dirs, ticket, LOCK_WAIT).map_err(|e| e.to_string())? else {
+        return Err("another process of this runner holds the claim's lock".to_owned());
+    };
+    let record = read_record(at.dirs, ticket).filter(|record| {
+        record.commit.as_deref() == Some(expected) || record.next.as_deref() == Some(expected)
+    });
+    if let Some(record) = &record {
+        let deleting = TicketClaimed {
+            deleting: true,
+            ..record.clone()
+        };
+        write_record(at.dirs, &deleting)?;
+    }
+    let lifted = push_delete(at.git, &checkout, &claim_ref(ticket), expected);
+    match (&lifted, &record) {
+        (Ok(Lifted::Deleted | Lifted::Moved(None)), _) => {
+            if record.is_some() {
+                remove_record(at.dirs, ticket);
+            }
+            let _ = at.git.run(
+                &checkout,
+                &["update-ref", "-d", &format!("{FETCHED_PREFIX}{ticket}")],
+            );
+        }
+        (_, Some(record)) => {
+            let _ = write_record(at.dirs, record);
+        }
+        (_, None) => {}
+    }
+    lifted
+}
+
+/// The claims of `origin` as the dedicated checkout at `checkout` last
+/// fetched them, read or not, nothing fetched (OWL-588): what `owlshift
+/// status`, `owlshift why`, the web UI and `owlshift doctor` show, each
+/// claim by its ref under [`FETCHED_PREFIX`]. The checkout must exist.
+pub fn last_fetched(git: &Git, checkout: &Path) -> Result<Vec<FetchedClaim>, String> {
+    let listing = crate::ticket_ref::listing_with(git, checkout, true)?;
+    let listing = crate::ticket_ref::Listing {
+        refs: Vec::new(),
+        ..listing
+    };
+    Ok(crate::ticket_ref::read_listing(git, checkout, listing).1)
 }
 
 /// What the sweep did for one ticket.
@@ -1106,6 +1235,20 @@ fn ls_remote(
 /// `refs/remotes/owlshift/claims/<ticket>` and read: `None` when it is gone
 /// or does not read as a claim, past [`MAX_CLAIM_BYTES`] included.
 fn read_remote(git: &Git, checkout: &Path, ticket: &TicketId) -> Result<Option<Claim>, String> {
+    fetch_claim(git, checkout, ticket).map(|(_, claim)| claim.ok())
+}
+
+/// Fetches `ticket`'s claim from `origin` to
+/// `refs/remotes/owlshift/claims/<ticket>` and reads it at the commit the
+/// fetch left there: that commit, and the claim or why it does not read
+/// (past [`MAX_CLAIM_BYTES`], or of a later format). A fetch that failed,
+/// the network or the claim gone since it was listed, tells nothing: an
+/// error, never read as another's claim, which would lose this runner's.
+fn fetch_claim(
+    git: &Git,
+    checkout: &Path,
+    ticket: &TicketId,
+) -> Result<(String, Result<Claim, ClaimUnread>), String> {
     let fetched = format!("{FETCHED_PREFIX}{ticket}");
     let refspec = format!("+{}:{fetched}", claim_ref(ticket));
     let out = git
@@ -1122,9 +1265,6 @@ fn read_remote(git: &Git, checkout: &Path, ticket: &TicketId) -> Result<Option<C
             None,
         )
         .map_err(|e| format!("reading {ticket}'s claim on {REMOTE}: {e}"))?;
-    // A fetch that failed, the network or the claim gone since it was
-    // listed, tells nothing: never read as another's claim, which would
-    // lose this runner's.
     if !out.success() {
         let stderr = String::from_utf8_lossy(&out.stderr);
         let last = stderr.lines().rev().find(|line| !line.trim().is_empty());
@@ -1133,18 +1273,38 @@ fn read_remote(git: &Git, checkout: &Path, ticket: &TicketId) -> Result<Option<C
             last.unwrap_or("no error output").trim()
         ));
     }
-    let file = format!("{fetched}:{CLAIM_FILE}");
+    let commit = git
+        .run(
+            checkout,
+            &["rev-parse", "--verify", &format!("{fetched}^{{commit}}")],
+        )
+        .map_err(|e| format!("reading {ticket}'s claim on {REMOTE}: {e}"))?;
+    let commit = String::from_utf8_lossy(&commit).trim().to_owned();
+    let file = format!("{commit}:{CLAIM_FILE}");
+    let unread = |reason: String| ClaimUnread {
+        reason,
+        newer: false,
+    };
     let size = git
         .run(checkout, &["cat-file", "-s", &file])
         .ok()
         .and_then(|size| String::from_utf8_lossy(&size).trim().parse::<usize>().ok());
-    if size.is_none_or(|size| size > MAX_CLAIM_BYTES) {
-        return Ok(None);
-    }
-    let text = git
-        .run(checkout, &["cat-file", "blob", &file])
-        .map_err(|e| e.to_string())?;
-    Ok(Claim::parse(&String::from_utf8_lossy(&text)).ok())
+    let claim = match size {
+        None => Err(unread(format!("its commit holds no {CLAIM_FILE}"))),
+        Some(size) if size > MAX_CLAIM_BYTES => Err(unread(format!(
+            "its {CLAIM_FILE} holds {size} bytes, past the {MAX_CLAIM_BYTES} a claim may hold"
+        ))),
+        Some(_) => {
+            let text = git
+                .run(checkout, &["cat-file", "blob", &file])
+                .map_err(|e| e.to_string())?;
+            Claim::parse(&String::from_utf8_lossy(&text)).map_err(|error| ClaimUnread {
+                newer: matches!(error, ContractError::NewerFormat { .. }),
+                reason: error.to_string(),
+            })
+        }
+    };
+    Ok((commit, claim))
 }
 
 /// Who holds the claim of `ticket` on `origin` now, when it reads.

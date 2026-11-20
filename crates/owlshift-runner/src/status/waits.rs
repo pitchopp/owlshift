@@ -41,6 +41,7 @@ use owlshift_core::state::Status;
 use owlshift_core::vocab::Stage;
 use serde_json::Value;
 
+use crate::claims::FetchedClaim;
 use crate::daemon::requests;
 use crate::events::printable;
 use crate::held;
@@ -99,6 +100,10 @@ pub struct ProjectRead {
     /// What the web UI's overview needs of every ref that reads, the ones
     /// `refs` holds but no row of the document shows included (OWL-470).
     pub details: BTreeMap<TicketId, RefDetail>,
+    /// The other runners' claims on the git remote, read or not, as the
+    /// dedicated checkout last fetched them, which the web UI's overview
+    /// shows as held (OWL-588): read with the refs, nothing fetched.
+    pub claims: Vec<FetchedClaim>,
 }
 
 /// What a ticket ref says that the document's rows do not: for the web UI's
@@ -275,9 +280,16 @@ fn project(
     let dirs = ProjectDirs::new(data, repo);
     let mut refs = Vec::new();
     let mut details = BTreeMap::new();
+    let mut claims = Vec::new();
     if dirs.checkout().exists() {
-        match ticket_ref::all(&crate::project::runner_git(), &dirs.checkout()) {
-            Ok(all) => {
+        let git = crate::project::runner_git();
+        match ticket_ref::read_all_with(&git, &dirs.checkout(), None, true) {
+            Ok((all, fetched)) => {
+                let runner = crate::claims::this_runner(data);
+                claims = fetched
+                    .into_iter()
+                    .filter(|claim| runner.as_ref().is_none_or(|runner| !claim.is_of(runner)))
+                    .collect();
                 refs = all
                     .into_iter()
                     .map(|(ticket, stored)| match stored {
@@ -351,6 +363,7 @@ fn project(
         ready,
         details,
         snapshot,
+        claims,
     }
 }
 
@@ -936,6 +949,7 @@ mod tests {
             ready: Some(listed),
             details: BTreeMap::new(),
             snapshot: Ok(None),
+            claims: Vec::new(),
         }
     }
 

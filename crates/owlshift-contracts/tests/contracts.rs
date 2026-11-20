@@ -3113,6 +3113,15 @@ fn comment_headers() {
     assert_eq!(Header::parse(&rerun.render()).unwrap(), rerun);
     assert!(Header::parse("[owlshift] RERUN · round 1").is_err());
     assert!(!MarkerKind::Rerun.waits_for_decider());
+    // A release's RELEASED (OWL-588): no round, waits for no one.
+    let released = Header {
+        kind: MarkerKind::Released,
+        round: None,
+    };
+    assert_eq!(released.render(), "[owlshift] RELEASED");
+    assert_eq!(Header::parse(&released.render()).unwrap(), released);
+    assert!(Header::parse("[owlshift] RELEASED · round 1").is_err());
+    assert!(!MarkerKind::Released.waits_for_decider());
     // A comment that waits for the decider ends its header with their
     // mention, which is passed over (OWL-324).
     let mention = " · https://linear.app/owlshift/profiles/ada";

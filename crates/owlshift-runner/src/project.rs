@@ -243,7 +243,17 @@ impl ProjectDirs {
     /// [`TicketHolder`] is written, best effort; both files are removed
     /// before the lock is let go. Watch's single tries record nothing.
     pub fn ticket_lock(&self, ticket: &TicketId) -> io::Result<Option<TicketLock>> {
-        let Some(mut lock) = self.ticket_lock_within(ticket, LOCK_GRACE)? else {
+        self.ticket_lock_waiting(ticket, LOCK_GRACE)
+    }
+
+    /// [`ProjectDirs::ticket_lock`] waited for `wait` at most: `owlshift
+    /// release` waits so for the holder's step it stopped to end (OWL-588).
+    pub fn ticket_lock_waiting(
+        &self,
+        ticket: &TicketId,
+        wait: Duration,
+    ) -> io::Result<Option<TicketLock>> {
+        let Some(mut lock) = self.ticket_lock_within(ticket, wait)? else {
             return Ok(None);
         };
         let record = self.ticket_holder_file(ticket);

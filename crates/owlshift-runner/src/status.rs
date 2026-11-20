@@ -20,6 +20,11 @@
 //! wait for a person to merge them ([`merge_waits`]), from watch's
 //! `merge_waits` and final `merge_refused` events and the ticket refs.
 //!
+//! Since OWL-588 each served project lists its claims on the git remote
+//! ([`gather`] alone): this runner's, by its records, and the other
+//! runners' as the dedicated checkout last fetched them, each with its
+//! operator and its expiry. Nothing is fetched.
+//!
 //! [`gather`] does the reading; [`watch_state`] and [`render`] are pure.
 //! [`gather_files`] reads all of it but the event log, for the web UI's
 //! header (OWL-467), which reads no event log.
@@ -41,6 +46,9 @@ use owlshift_core::state::{Status, TicketState};
 use owlshift_core::vocab::{Harness, Stage};
 use serde_json::Value;
 
+use owlshift_contracts::refs::TicketClaimed;
+
+use crate::claims::{self, FetchedClaim};
 use crate::daemon::digest::{self, HarnessUsage};
 use crate::daemon::{self, requests};
 use crate::events::{EventLog, printable};
@@ -57,6 +65,8 @@ pub mod waits;
 /// while a daemon runs, and `merges_waiting` and `drain_steps` are empty.
 #[derive(Clone, Debug)]
 pub struct Report {
+    /// When it was read: the claims' leases are weighed then (OWL-588).
+    pub at: Timestamp,
     pub daemon: Daemon,
     /// The daemon's stop request, while it stands: the daemon drains.
     pub stop_asked: Option<Request>,
@@ -145,6 +155,13 @@ pub struct Project {
     /// Its green pull requests that wait for a person to merge them
     /// (OWL-464), by [`merge_waits`].
     pub merges_waiting: Vec<MergeWait>,
+    /// The claims on the git remote this runner holds, confirmed and not
+    /// being deleted, by its records (OWL-588), read by [`gather`] alone.
+    pub own_claims: Vec<TicketClaimed>,
+    /// The other runners' claims on the git remote, read or not, as the
+    /// dedicated checkout last fetched them (OWL-588), read by [`gather`]
+    /// alone.
+    pub other_claims: Vec<FetchedClaim>,
 }
 
 /// A green pull request merge on green leaves for a person (OWL-464;
@@ -374,6 +391,25 @@ pub fn gather(data: &Path, concurrent_runs: u32, caps: &[(Harness, u8)], now: Ti
         project.merges_waiting = merge_waits(&events, &project.repository, |ticket| {
             followed_head(&dirs, ticket, &mut report.notes)
         });
+        project.own_claims = claims::recorded(&dirs)
+            .into_iter()
+            .filter(|record| record.commit.is_some() && !record.deleting)
+            .collect();
+        if dirs.checkout().exists() {
+            match claims::last_fetched(&crate::project::runner_git(), &dirs.checkout()) {
+                Ok(fetched) => {
+                    let runner = claims::this_runner(data);
+                    project.other_claims = fetched
+                        .into_iter()
+                        .filter(|claim| runner.as_ref().is_none_or(|runner| !claim.is_of(runner)))
+                        .collect();
+                }
+                Err(why) => report.notes.push(format!(
+                    "{}: the claims of origin cannot be read: {why}",
+                    project.repository
+                )),
+            }
+        }
     }
     report.drain_steps = match (&report.daemon, &report.slots) {
         (Daemon::Running(_), Some((held, _)))
@@ -429,6 +465,8 @@ pub fn gather_files(
             parked,
             in_review,
             merges_waiting: Vec::new(),
+            own_claims: Vec::new(),
+            other_claims: Vec::new(),
         });
     }
     let slots = match MachineSlots::new(data, concurrent_runs).holders() {
@@ -455,6 +493,7 @@ pub fn gather_files(
         }
     };
     Report {
+        at: now,
         daemon,
         stop_asked: requests::stop_asked(data),
         drain_asked: requests::drain_asked(data),
@@ -584,6 +623,16 @@ fn folder_name(root: &Path) -> String {
     format!("{}/{}", name(root.parent()), name(Some(root)))
 }
 
+/// A claim's lease at `now`, its expiry in `tz`: until when it holds, or
+/// when it expired.
+fn lease(expires: Timestamp, now: Timestamp, tz: &TimeZone) -> String {
+    if expires < now {
+        format!("expired {}", time(expires, tz))
+    } else {
+        format!("until {}", time(expires, tz))
+    }
+}
+
 /// `at` in `tz`, to the minute.
 fn time(at: Timestamp, tz: &TimeZone) -> String {
     at.to_zoned(tz.clone())
@@ -638,6 +687,9 @@ pub enum Part {
     Parked,
     /// The green pull requests that wait for a person to merge.
     Merges,
+    /// The claims on the git remote: this runner's and the others'
+    /// (OWL-588).
+    Claims,
     /// The steps a draining daemon waits on.
     DrainSteps,
     /// The steps under way, each holder, and the ones typed in a terminal.
@@ -649,7 +701,7 @@ pub enum Part {
 
 impl Part {
     /// Every kind, in the order [`render`] prints them.
-    pub const ALL: [Part; 17] = [
+    pub const ALL: [Part; 18] = [
         Part::Daemon,
         Part::MachinePause,
         Part::NoProject,
@@ -662,6 +714,7 @@ impl Part {
         Part::Waiting,
         Part::Parked,
         Part::Merges,
+        Part::Claims,
         Part::DrainSteps,
         Part::Slots,
         Part::Usage,
@@ -671,7 +724,7 @@ impl Part {
 
     /// Whether the Orchestrator screen shows this kind. The others belong
     /// to the overview (waits for a person, parked tickets, merge waits,
-    /// the digest), the graph (steps under way and typed in a terminal) and
+    /// the claims, the digest), the graph (steps under way and typed in a terminal) and
     /// the daemon's drain (the steps it waits on) and are left out here.
     pub fn on_the_page(self) -> bool {
         !matches!(
@@ -679,6 +732,7 @@ impl Part {
             Part::Waiting
                 | Part::Parked
                 | Part::Merges
+                | Part::Claims
                 | Part::DrainSteps
                 | Part::Slots
                 | Part::Digest
@@ -700,6 +754,7 @@ impl Part {
             Part::Waiting => "waiting",
             Part::Parked => "parked",
             Part::Merges => "merges",
+            Part::Claims => "claims",
             Part::DrainSteps => "drain_steps",
             Part::Slots => "slots",
             Part::Usage => "usage",
@@ -937,6 +992,47 @@ pub fn parts(report: &Report, tz: &TimeZone, voice: Voice) -> Vec<(Part, String)
                 ),
             );
         }
+        for record in &project.own_claims {
+            line(
+                Part::Claims,
+                format!(
+                    "  claimed by this runner, as {}: {}, {}",
+                    record.claim.operator,
+                    record.ticket,
+                    lease(record.claim.expires_at, report.at, tz)
+                ),
+            );
+        }
+        for fetched in &project.other_claims {
+            let ticket = &fetched.ticket;
+            line(
+                Part::Claims,
+                match &fetched.claim {
+                    Ok(claim) => {
+                        let expired = claim.expires_at < report.at;
+                        let release = if expired {
+                            format!(": `owlshift release {ticket}` releases it")
+                        } else {
+                            String::new()
+                        };
+                        format!(
+                            "  claimed by {}'s runner {} (as last fetched): {ticket}, {}{release}",
+                            claim.operator,
+                            claim.runner,
+                            lease(claim.expires_at, report.at, tz)
+                        )
+                    }
+                    Err(unread) if unread.newer => format!(
+                        "  {ticket}'s claim on origin was written by a later Owlshift: upgrade \
+                         Owlshift to read it"
+                    ),
+                    Err(unread) => format!(
+                        "  {ticket}'s claim on origin does not read: {}",
+                        unread.reason
+                    ),
+                },
+            );
+        }
     }
     match &report.slots {
         Some((held, count)) if held.is_empty() && report.typed.is_empty() => {
@@ -1035,6 +1131,7 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+    use crate::claims::ClaimUnread;
     use crate::events::{EventSink, data};
 
     fn record(since: Timestamp) -> DaemonRecord {
@@ -1622,8 +1719,21 @@ mod tests {
                 reason: "a person merges it".to_owned(),
                 refused: false,
             }],
+            own_claims: vec![claimed("OWL-7", "ada", "2026-11-06T09:00:00Z")],
+            other_claims: vec![
+                fetched("OWL-8", Ok(claim("lea", "2026-11-06T09:00:00Z"))),
+                fetched("OWL-9", Ok(claim("lea", "2026-11-04T09:00:00Z"))),
+                fetched(
+                    "OWL-10",
+                    Err(ClaimUnread {
+                        reason: "not JSON".to_owned(),
+                        newer: false,
+                    }),
+                ),
+            ],
         };
         Report {
+            at: at("2026-11-05T10:00:00Z"),
             daemon: Daemon::Running(Some(record(at("2026-11-05T08:00:00Z")))),
             stop_asked: Some(ask("stop", "maintenance")),
             drain_asked: Some(ask("upgrade", "a new build")),
@@ -1675,6 +1785,57 @@ mod tests {
                 line: Some("3 delivered".to_owned()),
             }),
             notes: vec!["the run slots cannot be probed: nope".to_owned()],
+        }
+    }
+
+    fn claim(operator: &str, expires: &str) -> owlshift_contracts::refs::Claim {
+        owlshift_contracts::refs::Claim {
+            format: Format,
+            runner: "0123456789abcdef".to_owned(),
+            operator: operator.to_owned(),
+            claimed_at: "2026-11-03T09:00:00Z".parse().unwrap(),
+            expires_at: expires.parse().unwrap(),
+            held: Default::default(),
+        }
+    }
+
+    fn claimed(ticket: &str, operator: &str, expires: &str) -> TicketClaimed {
+        TicketClaimed {
+            format: Format,
+            ticket: TicketId::new(ticket).unwrap(),
+            commit: Some("a".repeat(40)),
+            next: None,
+            deleting: false,
+            claim: claim(operator, expires),
+        }
+    }
+
+    fn fetched(
+        ticket: &str,
+        claim: Result<owlshift_contracts::refs::Claim, ClaimUnread>,
+    ) -> FetchedClaim {
+        FetchedClaim {
+            ticket: TicketId::new(ticket).unwrap(),
+            commit: "b".repeat(40),
+            claim,
+        }
+    }
+
+    /// OWL-588: a project's claims, this runner's and the others' as last
+    /// fetched, each with its operator and its lease; an expired one says
+    /// how to release it, and one that does not read says why.
+    #[test]
+    fn the_claims_are_listed_with_their_operator_and_lease() {
+        let text = render(&full_report(), &TimeZone::UTC);
+        for says in [
+            "  claimed by this runner, as ada: OWL-7, until 2026-11-06 09:00\n",
+            "  claimed by lea's runner 0123456789abcdef (as last fetched): OWL-8, until \
+             2026-11-06 09:00\n",
+            "  claimed by lea's runner 0123456789abcdef (as last fetched): OWL-9, expired \
+             2026-11-04 09:00: `owlshift release OWL-9` releases it\n",
+            "  OWL-10's claim on origin does not read: not JSON\n",
+        ] {
+            assert!(text.contains(says), "{says}\n{text}");
         }
     }
 

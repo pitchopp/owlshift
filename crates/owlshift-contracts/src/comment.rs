@@ -64,10 +64,13 @@ pub enum MarkerKind {
     /// The runner re-ran a red check's failed jobs once, and what that came
     /// to, with both attempts (OWL-513).
     Rerun,
+    /// A person released the ticket's claim on the git remote (OWL-588):
+    /// who released it, who held it, and how to have it worked again.
+    Released,
 }
 
 impl MarkerKind {
-    const ALL: [Self; 12] = [
+    const ALL: [Self; 13] = [
         Self::Questions,
         Self::ReAsk,
         Self::Resume,
@@ -80,6 +83,7 @@ impl MarkerKind {
         Self::Waiting,
         Self::Merged,
         Self::Rerun,
+        Self::Released,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -96,6 +100,7 @@ impl MarkerKind {
             Self::Waiting => "WAITING",
             Self::Merged => "MERGED",
             Self::Rerun => "RERUN",
+            Self::Released => "RELEASED",
         }
     }
 

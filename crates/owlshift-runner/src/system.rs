@@ -156,13 +156,8 @@ pub trait System {
             return Ok(None);
         }
         // git's own words stay out of the report (live check C8).
-        let listing = ticket_ref::listing_with(&git, &checkout, true)
+        let claims = crate::claims::last_fetched(&git, &checkout)
             .map_err(|_| "git could not list them in the dedicated checkout".to_owned())?;
-        let listing = ticket_ref::Listing {
-            refs: Vec::new(),
-            ..listing
-        };
-        let (_, claims) = ticket_ref::read_listing(&git, &checkout, listing);
         Ok(Some(
             claims
                 .into_iter()

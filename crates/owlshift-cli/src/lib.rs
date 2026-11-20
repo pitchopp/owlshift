@@ -16,6 +16,7 @@ mod gate_cmd;
 mod init_cmd;
 mod logs_cmd;
 mod pause_cmd;
+mod release_cmd;
 mod self_update_cmd;
 mod service_cmd;
 mod status_cmd;
@@ -154,6 +155,25 @@ enum Command {
         /// Why, said in the PARKED comment.
         #[arg(long, value_name = "TEXT")]
         reason: Option<String>,
+    },
+    /// Release a ticket's claim on the git remote, so that another runner can
+    /// take it: on the machine that holds it at any time, its step under way
+    /// stopped first; from another machine when the claim's operator is
+    /// yours, or once it expired, by a person the project's `[people]`
+    /// lists. Any other live claim is refused, with its holder and its
+    /// expiry. A RELEASED comment on the ticket says who released it and how
+    /// to have it worked again; its stage is left as it is.
+    Release {
+        /// The ticket, such as OWL-12.
+        ticket: String,
+        /// The served project the web UI's Release runs on (OWL-588): the
+        /// UI's own, never typed.
+        #[arg(long, hide = true, requires = "from_ui", value_name = "OWNER/REPO")]
+        served: Option<String>,
+        /// The release is the web UI's, which its comment and its event
+        /// name: the UI's own, never typed.
+        #[arg(long, hide = true, requires = "served")]
+        from_ui: bool,
     },
     /// Run the project's gate once, as a Build's gate runs it: in a fresh
     /// worktree of origin's default branch, confined, with the variables
@@ -394,6 +414,9 @@ pub fn main_with(
         }
         | Command::Continue {
             served: Some(repo), ..
+        }
+        | Command::Release {
+            served: Some(repo), ..
         } => match Repo::parse(repo) {
             Ok(repo) => Some(repo),
             Err(error) => return fail(&format!("--served: {error}")),
@@ -476,6 +499,9 @@ pub fn main_with(
         }
         Command::Forget { ticket } => forget_cmd::run(&config, &ticket),
         Command::Cancel { ticket, reason } => cancel_cmd::run(&config, &ticket, reason.as_deref()),
+        Command::Release {
+            ticket, from_ui, ..
+        } => release_cmd::run(&config, &ticket, served, from_ui, open_keychain),
         Command::Gate { at } => gate_cmd::run(&system, &config, at.as_deref()),
         Command::Unquarantine => unquarantine_cmd::run(&config),
         Command::Why { ticket } => why_cmd::run(&config, ticket.as_deref()),
@@ -718,6 +744,9 @@ mod tests {
             // OWL-459.
             &["status", "--waits"],
             &["status", "--waits", "--json", "acme/web"],
+            // OWL-588.
+            &["release", "OWL-1"],
+            &["release", "OWL-1", "--served", "o/r", "--from-ui"],
             // OWL-474.
             &["cancel", "OWL-1"],
             &[
@@ -759,6 +788,18 @@ mod tests {
                 "--print",
             ],
             &["ui", "--listener-fd", "3"],
+        ] {
+            assert!(
+                Cli::try_parse_from([&["owlshift"], args].concat()).is_err(),
+                "{args:?}"
+            );
+        }
+        // OWL-588: the web UI's Release names its served project and itself,
+        // both or neither.
+        for args in [
+            &["release", "OWL-1", "--served", "o/r"][..],
+            &["release", "OWL-1", "--from-ui"],
+            &["release"],
         ] {
             assert!(
                 Cli::try_parse_from([&["owlshift"], args].concat()).is_err(),

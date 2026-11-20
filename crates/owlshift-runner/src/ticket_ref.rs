@@ -1354,8 +1354,10 @@ pub fn others_with_claims(
     read_all_with(git, checkout, Some(own), claims)
 }
 
-/// [`read_all`], with the claims fetched from `origin` when `claims`.
-fn read_all_with(
+/// [`all`], the ref of `skip` left out, with the claims fetched from
+/// `origin` when `claims`, read in the same five git commands whatever their
+/// number: the web UI's overview reads them so beside the refs (OWL-588).
+pub fn read_all_with(
     git: &Git,
     checkout: &Path,
     skip: Option<&TicketId>,
