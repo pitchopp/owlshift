@@ -41,6 +41,10 @@
 //! ticket, which waits as `not_mine` in the ready snapshot alone, with no
 //! warning, no event and no line.
 //!
+//! A ticket another runner claims on the git remote (OWL-587), its claim
+//! read or not, is neither taken in nor dispatched, whatever `takes` says:
+//! it waits as `claimed` in the ready snapshot alone, as a not-mine one.
+//!
 //! The ready snapshot (OWL-468, [`crate::ready`]): a pass that listed the
 //! column writes, at its end, every ticket of it in the core's order with
 //! what the pass made of it (taken in, running, dispatched, waiting and
@@ -71,6 +75,7 @@ use owlshift_core::vocab::{Harness, Stage};
 
 use super::{Admit, Continued, Memory as WatchMemory, RETRY_AFTER, Seen, Then, Watch};
 use crate::events::{Data, EventSink, data};
+use crate::claims::FetchedClaim;
 use crate::in_flight::{self, Kind, Outside};
 use crate::on_demand::{self, delivery_followed};
 use crate::operator::{self, Taking};
@@ -254,6 +259,23 @@ fn not_mine_data(config: &ProjectConfig, account: &str) -> Data {
         data.insert("name".to_owned(), json!(handle));
     }
     data
+}
+
+/// What the ready snapshot's `claimed` wait carries (OWL-587): the claim's
+/// operator, runner and expiry, or why it does not read.
+fn claimed_data(claim: &FetchedClaim) -> Data {
+    match &claim.claim {
+        Ok(claim) => data([
+            ("operator", json!(claim.operator)),
+            ("runner", json!(claim.runner)),
+            ("expires_at", json!(claim.expires_at.to_string())),
+        ]),
+        Err(unread) => data([
+            ("unread", json!(true)),
+            ("newer", json!(unread.newer)),
+            ("reason", json!(unread.reason)),
+        ]),
+    }
 }
 
 /// A ticket of the column with what its ticket ref keeps.
@@ -602,6 +624,16 @@ impl Watch<'_> {
             if let Some(why) = &why_not {
                 detail.insert("why".to_owned(), json!(why));
             }
+            // Another runner's ticket (OWL-587): worded in the snapshot
+            // alone, told by no event and no line.
+            if *wait == Wait::Claimed
+                && let Some(claim) = memory.claimed.of(row.id())
+            {
+                let data = claimed_data(claim);
+                made.insert(row.id().clone(), waits(row.id(), wait.key(), data));
+                memory.drain.waits.remove(row.id());
+                continue;
+            }
             // Another person's ticket (OWL-583): worded in the snapshot
             // alone, told by no event and no line.
             if *wait == Wait::NotMine {
@@ -863,8 +895,9 @@ impl Watch<'_> {
             .filter(|row| row.intake_due(exclude) && !busy.contains(row.id()))
         {
             let ticket = row.id();
-            // Another person's ticket at rest (OWL-583): no step.
-            if memory.drain.resting.contains_key(ticket) {
+            // Another person's ticket at rest (OWL-583), or one another
+            // runner claims (OWL-587): no step.
+            if memory.drain.resting.contains_key(ticket) || memory.claimed.of(ticket).is_some() {
                 continue;
             }
             let now = (on_demand.clock)();
@@ -1218,6 +1251,8 @@ impl Watch<'_> {
             .is_some_and(|warned| now < warned.retry);
         let admission = if row.excluded(exclude) {
             Admission::Excluded
+        } else if memory.claimed.of(row.id()).is_some() {
+            Admission::Claimed
         } else if warned {
             Admission::NotAdmitted
         } else if memory.drain.resting.contains_key(row.id()) {

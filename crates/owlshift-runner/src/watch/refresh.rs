@@ -102,6 +102,9 @@ impl Watch<'_> {
     /// pass reads it again.
     pub(super) fn overlap_refreshes(&self, memory: &mut Memory, read: &[RefRead]) {
         memory.refreshes.due.clear();
+        // A sibling another runner claims counts while its claim stands
+        // (OWL-587).
+        let claimed = memory.claimed.tickets();
         let on_demand = self.on_demand;
         let git = &on_demand.executor.git;
         let checkout = on_demand.dirs.checkout();
@@ -118,7 +121,8 @@ impl Watch<'_> {
             if !delivery_followed(stored) {
                 continue;
             }
-            let paths: Vec<String> = held::overlaps_of(ticket, stored.record.held.as_ref(), read)
+            let paths: Vec<String> =
+                held::overlaps_of(ticket, stored.record.held.as_ref(), read, &claimed)
                 .into_iter()
                 .flat_map(|(_, paths)| paths)
                 .collect();

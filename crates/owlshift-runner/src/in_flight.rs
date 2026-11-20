@@ -11,6 +11,11 @@
 //! core: a pull request by `#<number>`, which no ticket identifier can
 //! start with, a person's ticket by its identifier.
 //!
+//! Under remote claims (P10, OWL-587; build plan "Other runners' tickets"),
+//! another runner's claim is an Owlshift ticket in flight, holding what its
+//! `held` names, weighed at its claim's time, delivered once its pull request
+//! is open, and never a person's ticket.
+//!
 //! What cannot be read is never taken as free: a failed read of the open
 //! pull requests, of one's files or of the working state is an error, and
 //! the caller then starts nothing that the rule would check.
@@ -28,12 +33,15 @@ use owlshift_contracts::config::ProjectConfig;
 use owlshift_contracts::format::Format;
 use owlshift_contracts::ids::TicketId;
 use owlshift_contracts::step::{OutsidePull, OutsideTicket, StepOutside};
+use jiff::Timestamp;
 use owlshift_core::collision::{Collision, Dispatched, InFlight};
 use owlshift_core::decider::declared_zones;
 use owlshift_core::resource::{self, NamedResources, Resource};
 use owlshift_core::schedule::Wait;
 
+use crate::claims::FetchedClaim;
 use crate::held;
+use crate::on_demand::branch_for;
 use crate::ticket_ref::Stored;
 
 /// The files of the pull requests read, by number, each kept with the head
@@ -182,7 +190,7 @@ pub fn read(
 }
 
 /// What holds a resource, as a reason names it.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum Kind {
     /// One of Owlshift's tickets of the project.
     Ticket,
@@ -190,10 +198,17 @@ pub enum Kind {
     PullRequest(u64),
     /// A ticket a person works on.
     Person,
+    /// A ticket another runner claims (OWL-587): its operator, its runner
+    /// and when its claim expires.
+    Claimed {
+        operator: String,
+        runner: String,
+        expires_at: Timestamp,
+    },
 }
 
 /// A holder named for an event or a line.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub struct Named<'a> {
     pub id: &'a str,
     pub kind: Kind,
@@ -201,22 +216,36 @@ pub struct Named<'a> {
 
 impl Named<'_> {
     /// The event's fields naming it: `tickets` with the identifier, and
-    /// `person` for a person's ticket; `pull_request` with its number.
+    /// `person` for a person's ticket, `operator`, `runner` and
+    /// `expires_at` for another runner's; `pull_request` with its number.
     pub fn data(&self) -> Vec<(&'static str, Value)> {
-        match self.kind {
+        match &self.kind {
             Kind::Ticket => vec![("tickets", json!([self.id]))],
             Kind::Person => vec![("tickets", json!([self.id])), ("person", json!(true))],
             Kind::PullRequest(number) => vec![("pull_request", json!(number))],
+            Kind::Claimed {
+                operator,
+                runner,
+                expires_at,
+            } => vec![
+                ("tickets", json!([self.id])),
+                ("operator", json!(operator)),
+                ("runner", json!(runner)),
+                ("expires_at", json!(expires_at.to_string())),
+            ],
         }
     }
 }
 
 impl fmt::Display for Named<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self.kind {
+        match &self.kind {
             Kind::Ticket => f.write_str(self.id),
             Kind::Person => write!(f, "{}, which a person works on,", self.id),
             Kind::PullRequest(number) => write!(f, "pull request #{number}"),
+            Kind::Claimed { operator, .. } => {
+                write!(f, "{}, which {operator}'s runner works,", self.id)
+            }
         }
     }
 }
@@ -269,27 +298,31 @@ impl Holders {
 pub fn named<'a>(kinds: &HashMap<String, Kind>, id: &'a str) -> Named<'a> {
     Named {
         id,
-        kind: kinds.get(id).copied().unwrap_or(Kind::Ticket),
+        kind: kinds.get(id).cloned().unwrap_or(Kind::Ticket),
     }
 }
 
 impl Outside {
     /// The outside holders against the project's ticket refs `refs`, each
-    /// with its ref, `None` for one that cannot be read; closed with
-    /// `named`.
+    /// with its ref, `None` for one that cannot be read, and the claims
+    /// other runners hold, `claims` (OWL-587); closed with `named`.
     ///
     /// A pull request is Owlshift's own when a ref that holds
-    /// ([`held::holds`]) delivered it: its files join that ticket. Any other
-    /// is another pull request, one a ticket delivered and no longer follows
-    /// included. A ticket of the working state is a person's unless a ref
-    /// that holds, or one that cannot be read, is its own; it holds its
-    /// labels' zones, the whole repository for a malformed `zone:` label,
-    /// and with no label it is counted only through a pull request whose
-    /// head branch names it, or left out and listed in
-    /// [`Holders::unknown`].
+    /// ([`held::holds`]) delivered it: its files join that ticket. One whose
+    /// head branch is the branch of a ticket another runner's claim reads
+    /// for joins that claim, delivered. Any other is another pull request,
+    /// one a ticket delivered and no longer follows included. A claim that
+    /// reads, of a ticket no ref of the project holds, is an Owlshift ticket
+    /// weighed at its claim's time ([`claimed`]). A ticket of the working
+    /// state is a person's unless a ref that holds, one that cannot be read,
+    /// or a claim, read or not, is its own; it holds its labels' zones, the
+    /// whole repository for a malformed `zone:` label, and with no label it
+    /// is counted only through a pull request whose head branch names it, or
+    /// left out and listed in [`Holders::unknown`].
     pub fn holders<'a>(
         &self,
         refs: impl IntoIterator<Item = (&'a TicketId, Option<&'a Stored>)>,
+        claims: &[FetchedClaim],
         named: &NamedResources,
     ) -> Holders {
         let mut ours = HashSet::new();
@@ -314,9 +347,48 @@ impl Outside {
             }
         }
         let mut holders = Holders::default();
+        // Another runner's tickets, by their claims (OWL-587): a ticket a ref
+        // of this project holds is this runner's until its claim is found
+        // lost.
+        let by_claim: HashSet<&str> = claims.iter().map(|claim| claim.ticket.as_str()).collect();
+        let mut elsewhere: Vec<InFlight<String>> = Vec::new();
+        for fetched in claims {
+            let id = fetched.ticket.as_str();
+            let Ok(claim) = &fetched.claim else {
+                continue;
+            };
+            if ours.contains(id) || elsewhere.iter().any(|entry| entry.id == id) {
+                continue;
+            }
+            holders.kinds.insert(
+                id.to_owned(),
+                Kind::Claimed {
+                    operator: claim.operator.clone(),
+                    runner: claim.runner.clone(),
+                    expires_at: claim.expires_at,
+                },
+            );
+            elsewhere.push(claimed(
+                id.to_owned(),
+                claim.claimed_at,
+                held::claim_resources(&claim.held, named),
+            ));
+        }
         for pull in &self.pulls {
             if let Some(ticket) = own_pulls.get(&pull.number) {
                 holders.own.insert(ticket.clone(), pull.files.clone());
+                continue;
+            }
+            let theirs = elsewhere.iter_mut().find(|entry| {
+                TicketId::new(&entry.id).is_ok_and(|ticket| branch_for(&ticket) == pull.head_branch)
+            });
+            if let Some(entry) = theirs {
+                entry.delivered = true;
+                for resource in files_held(&pull.files, named) {
+                    if !entry.held.contains(&resource) {
+                        entry.held.push(resource);
+                    }
+                }
                 continue;
             }
             let id = format!("#{}", pull.number);
@@ -331,6 +403,10 @@ impl Outside {
             let id = ticket.id.as_str();
             if ours.contains(id) {
                 holders.labels.insert(id.to_owned(), ticket.labels.clone());
+                continue;
+            }
+            // Counted by its claim alone (OWL-587).
+            if by_claim.contains(id) {
                 continue;
             }
             let held = match declared_zones(ticket.labels.iter().map(String::as_str)) {
@@ -359,7 +435,22 @@ impl Outside {
             holders.kinds.insert(id.to_owned(), Kind::Person);
             holders.others.push(outside(id.to_owned(), held));
         }
+        holders.others.extend(elsewhere);
         holders
+    }
+}
+
+/// Another runner's ticket, by its claim taken at `claimed_at` (OWL-587;
+/// build plan "Other runners' tickets", "Which goes on"): an Owlshift ticket,
+/// so `rebase` tolerates it, weighed at its claim's time, the one order key
+/// every runner reads of it; delivered once its pull request is open.
+fn claimed(id: String, claimed_at: Timestamp, held: Vec<Resource>) -> InFlight<String> {
+    InFlight {
+        id,
+        dispatched: Dispatched::At(claimed_at.as_millisecond()),
+        delivered: false,
+        outside: false,
+        held,
     }
 }
 
@@ -443,6 +534,8 @@ pub fn said(wait: &Wait<String>, exclude: Option<&str>, kinds: &HashMap<String, 
         }
         // Never told by a line (OWL-583): the ready snapshot words it.
         Wait::NotMine => "another person admitted it: their runner's".to_owned(),
+        // Never told by a line (OWL-587): the ready snapshot words it.
+        Wait::Claimed => "another runner claims it: its runner's".to_owned(),
         Wait::Excluded => format!(
             "it carries the exclusion label {:?}",
             exclude.unwrap_or_default()
@@ -608,6 +701,7 @@ mod tests {
                 (&six, Some(&ended)),
                 (&seven, Some(&designing)),
             ],
+            &[],
             &named,
         );
         assert_eq!(holders.labels["DEMO-7"], ["zone:web"]);
@@ -667,6 +761,121 @@ mod tests {
         };
         let found = collision(&ready, &in_flight).unwrap();
         assert_eq!(found.holder, "DEMO-1");
+    }
+
+    /// A claim of another runner's, taken at `claimed_ms`, expiring at
+    /// `expires_ms`, holding `files`.
+    fn fetched(ticket: &str, claimed_ms: i64, expires_ms: i64, files: &[&str]) -> FetchedClaim {
+        let at = |ms| Timestamp::from_millisecond(ms).unwrap();
+        FetchedClaim {
+            ticket: id(ticket),
+            commit: "d".repeat(40),
+            claim: Ok(owlshift_contracts::refs::Claim {
+                format: owlshift_contracts::format::Format,
+                runner: "0123456789abcdef".to_owned(),
+                operator: "lea".to_owned(),
+                claimed_at: at(claimed_ms),
+                expires_at: at(expires_ms),
+                held: owlshift_contracts::refs::ClaimHeld {
+                    files: files.iter().map(|f| (*f).to_owned()).collect(),
+                    ..Default::default()
+                },
+            }),
+        }
+    }
+
+    /// OWL-587: another runner's claims are Owlshift tickets in flight,
+    /// expired or not, weighed at their claim's time; one whose
+    /// `owlshift/<id>` pull request is open is delivered, that pull request
+    /// no other holder; a claimed ticket of the working state is no
+    /// person's, warned of or not; a claim that does not read holds nothing;
+    /// a ticket a ref of this project holds stays this runner's.
+    #[test]
+    fn another_runners_claims_are_owlshift_tickets_in_flight() {
+        let outside = Outside {
+            pulls: vec![
+                pull(10, "owlshift/demo-42", &["web/y.ts"]),
+                pull(11, "someone/demo-41", &["lib/z.rs"]),
+            ],
+            working: vec![person("DEMO-40", &[]), person("DEMO-41", &[])],
+        };
+        let mut unread = fetched("DEMO-41", 5, 6, &[]);
+        unread.claim = Err(crate::claims::ClaimUnread {
+            reason: "a later format".to_owned(),
+            newer: true,
+        });
+        let far = i64::from(i32::MAX);
+        let claims = vec![
+            // Expired long ago: it holds all the same.
+            fetched("DEMO-40", 100, 200, &["app/one.rs"]),
+            unread,
+            fetched("DEMO-42", 300, far, &["web/x.ts"]),
+            fetched("DEMO-43", 400, far, &["app/two.rs"]),
+        ];
+        let ours = id("DEMO-43");
+        let held = stored(Status::Active(Stage::Build), None);
+        let none = NamedResources::default();
+        let holders = outside.holders([(&ours, Some(&held))], &claims, &none);
+        let others: Vec<(&str, Dispatched, bool, bool, &[Resource])> = holders
+            .others
+            .iter()
+            .map(|entry| {
+                (
+                    entry.id.as_str(),
+                    entry.dispatched,
+                    entry.delivered,
+                    entry.outside,
+                    entry.held.as_slice(),
+                )
+            })
+            .collect();
+        let one = [zone("app/one.rs")];
+        let both = [zone("web/x.ts"), zone("web/y.ts")];
+        assert_eq!(
+            others,
+            [
+                ("#11", Dispatched::Unrecorded, true, true, &[zone("lib/z.rs")][..]),
+                ("DEMO-40", Dispatched::At(100), false, false, &one[..]),
+                ("DEMO-42", Dispatched::At(300), true, false, &both[..]),
+            ]
+        );
+        assert!(holders.unknown.is_empty(), "{:?}", holders.unknown);
+        assert_eq!(
+            holders.named("DEMO-40").to_string(),
+            "DEMO-40, which lea's runner works,"
+        );
+        let data = holders.named("DEMO-40").data();
+        assert_eq!(data[0], ("tickets", json!(["DEMO-40"])));
+        assert_eq!(data[1], ("operator", json!("lea")));
+        assert_eq!(holders.named("DEMO-43").to_string(), "DEMO-43");
+    }
+
+    /// OWL-587, the order: tickets of this runner's X and Y and another
+    /// runner's Z share a file, none delivered. X was dispatched before Y,
+    /// but Y's claim was taken first, then Z's, then X's. Each ticket with a
+    /// claim is weighed at its claim's time on both runners, so Y goes on,
+    /// Z waits for Y on its runner and X waits here: no cycle. Ordered by
+    /// dispatch between X and Y, Y would wait for X, X for Z and Z for Y.
+    #[test]
+    fn every_claimed_ticket_is_weighed_at_its_claims_time_on_both_runners() {
+        let entry = |id: &str, dispatched| InFlight {
+            id: id.to_owned(),
+            dispatched,
+            delivered: false,
+            outside: false,
+            held: vec![zone("app/f.rs")],
+        };
+        let times = std::collections::BTreeMap::from([(id("OWL-1"), 30), (id("OWL-2"), 10)]);
+        let x = held::by_claim(entry("OWL-1", Dispatched::At(1)), &times);
+        let y = held::by_claim(entry("OWL-2", Dispatched::At(2)), &times);
+        let z = entry("OWL-3", Dispatched::At(20));
+        // This runner's view.
+        let here = [x.clone(), y.clone(), z.clone()];
+        assert_eq!(collision(&y, &here), None);
+        assert!(collision(&x, &here).is_some());
+        // The other runner's: Z by its own claim, X and Y by theirs.
+        let there = [x, y, z.clone()];
+        assert_eq!(collision(&z, &there).unwrap().holder, "OWL-2");
     }
 
     /// The forge as GitHub answers: the open pull requests, from a list the

@@ -57,6 +57,9 @@ pub enum Admission {
     /// Admitted by a listed person who is not this runner's operator, under
     /// `takes = "mine"` (P10, OWL-583): their runner's to take.
     NotMine,
+    /// Another runner claims it on the git remote, its claim read or not
+    /// (P10, OWL-587): never taken here, whatever `takes` says.
+    Claimed,
     /// An exclusion label keeps it out for good, whatever else it carries.
     Excluded,
 }

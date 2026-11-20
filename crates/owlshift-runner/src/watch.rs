@@ -167,6 +167,7 @@ use crate::why;
 use crate::writer::VisibleStage;
 
 mod cancel;
+mod claimed;
 mod drain;
 mod ended;
 mod limits;
@@ -623,6 +624,8 @@ struct Memory<'c> {
     /// Why the last renewal could not be made, as warned of: warned of
     /// again only when it changes.
     claims_failing: Option<String>,
+    /// The claims of `origin` as watch fetched and read them (OWL-587).
+    claimed: claimed::ClaimedMemory,
 }
 
 /// What a correction's or the reviews' read found due at a pass (OWL-445):
@@ -866,6 +869,11 @@ impl Watch<'_> {
         // and the base heads of merge on green (OWL-445).
         memory.outside.new_pass();
         memory.base_heads.clear();
+        // Other runners' claims (OWL-587): the switch at `origin/HEAD`, and
+        // watch's own fetch of them when it is due, before the snapshot
+        // reads them with the ticket refs.
+        memory.claimed.remote = self.claims_switch();
+        self.fetch_claims(memory, sink, out);
         let read = match self.snapshot(memory, sink) {
             Ok(Snapshot {
                 quarantine: Some(marker),
@@ -878,9 +886,12 @@ impl Watch<'_> {
             }
             Err(project) => return self.note(memory, out, project),
         };
-        // This runner's claims, swept and renewed when due (OWL-586); a
-        // ticket whose claim it finds lost leaves the pass.
+        // This runner's claims, swept, checked against a fetch made this
+        // pass (OWL-587) and renewed when due (OWL-586); a ticket whose
+        // claim it finds lost leaves the pass. Another runner's claim that
+        // does not read is told.
         let read = self.tend_claims(memory, sink, out, read);
+        self.warn_unread_claims(memory, sink, out);
         // A harness's usage limit, told when it changed (OWL-404).
         self.read_usage(memory, sink, out);
         // The cancels standing (OWL-474): each ticket whose step does not
@@ -2297,15 +2308,17 @@ impl Watch<'_> {
             });
         }
         let git = &self.on_demand.executor.git;
-        let listing = match ticket_ref::listing(git, &checkout) {
+        // The claims fetched from `origin` with them under `remote` (OWL-587).
+        let listing = match ticket_ref::listing_with(git, &checkout, memory.claimed.remote) {
             Ok(listing) => listing,
-            Err(_) if quarantine.is_some() => Vec::new(),
+            Err(_) if quarantine.is_some() => ticket_ref::Listing::default(),
             Err(e) => return Err(Project::Unread(e)),
         };
         // The lock goes before the records are read (OWL-489), all of them
         // in a fixed number of git commands (OWL-492).
         drop(lock);
-        let refs = ticket_ref::read_listed_refs(git, &checkout, listing);
+        let (refs, fetched) = ticket_ref::read_listing(git, &checkout, listing);
+        self.keep_claims(memory, fetched);
         // A ticket whose claim this runner lost is out of every count, and
         // gets no step (OWL-586).
         let refs = claims::drop_lost(dirs, refs);
@@ -3054,10 +3067,12 @@ impl Watch<'_> {
             .iter()
             .filter_map(|(ticket, stored)| stored.as_ref().ok().map(|stored| (ticket, stored)))
             .collect();
+        // Each ticket with a claim weighed at its claim's time (OWL-587).
+        let times = claims::claimed_times(on_demand.dirs);
         let mut in_flight: Vec<_> = refs
             .iter()
             .filter(|(_, stored)| held::holds(stored))
-            .map(|(ticket, stored)| held::in_flight(ticket, stored, &named))
+            .map(|(ticket, stored)| held::by_claim(held::in_flight(ticket, stored, &named), &times))
             .collect();
         if let Some(outside) = outside {
             outside.join(&mut in_flight, &named);
@@ -3069,7 +3084,7 @@ impl Watch<'_> {
             if !holds(stored) || delivery_followed(stored) {
                 continue;
             }
-            let own = held::in_flight(ticket, stored, &named);
+            let own = held::by_claim(held::in_flight(ticket, stored, &named), &times);
             if let Some(collided) = weigh(&own, &in_flight, overlap).collision {
                 found.insert(ticket.clone(), (collided, false));
                 continue;
@@ -3223,6 +3238,7 @@ impl Watch<'_> {
     ) -> Vec<(TicketId, Result<Stored, String>)> {
         let dirs = self.on_demand.dirs;
         if claims::recorded(dirs).is_empty() {
+            memory.claimed.fresh = None;
             return read;
         }
         let git = &self.on_demand.executor.git;
@@ -3275,6 +3291,9 @@ impl Watch<'_> {
                 }
             }
         }
+        // A loss the fetch of this pass shows, found within the minute
+        // rather than at the hourly renewal (OWL-587).
+        self.check_claims(memory, sink, out, at);
         let now = (self.on_demand.clock)();
         if memory.claims_due.is_none_or(|due| now >= due) {
             let held_of = |ticket: &TicketId| {

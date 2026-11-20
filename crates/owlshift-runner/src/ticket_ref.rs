@@ -45,16 +45,19 @@ use std::path::Path;
 use sha2::{Digest, Sha256};
 
 use owlshift_contracts::drain::{TicketIntake, TicketProposals};
+use owlshift_contracts::format::ContractError;
 use owlshift_contracts::ids::TicketId;
 use owlshift_contracts::refs::{
-    Ask, COST_FILE, DELIVERY_FILE, HELD_FILE, INTAKE_FILE, PLAN_FILE, PROPOSALS_FILE,
-    PersistedState, QUESTIONS_FILE, REVIEW_FILE, SESSION_FILE, STATE_FILE, TICKETS_PREFIX,
-    TicketCost, TicketDelivery, TicketHeld, TicketQuestions, TicketSession, Waiting, ticket_ref,
+    Ask, CLAIM_FILE, COST_FILE, Claim, DELIVERY_FILE, HELD_FILE, INTAKE_FILE, MAX_CLAIM_BYTES,
+    PLAN_FILE, PROPOSALS_FILE, PersistedState, QUESTIONS_FILE, REVIEW_FILE, SESSION_FILE,
+    STATE_FILE, TICKETS_PREFIX, TicketCost, TicketDelivery, TicketHeld, TicketQuestions,
+    TicketSession, Waiting, ticket_ref,
 };
 use owlshift_contracts::review::{TicketPlan, TicketReview};
 use owlshift_core::state::{Status, TicketState};
 use owlshift_core::vocab::Stage;
 
+use crate::claims::{ClaimUnread, FETCHED_PREFIX, FetchedClaim};
 use crate::executor::Git;
 
 /// The most a file of the ticket ref may hold, in bytes: [`read()`] refuses
@@ -392,32 +395,44 @@ type Named = (TicketId, String, Option<String>);
 
 /// Every ticket ref of `checkout`, in the order git lists the refs, a name
 /// below the namespace that is no ticket id left out (no ticket's ref is
-/// named so). The objects are not read: `%(objecttype)` would make one ref
-/// to a missing object fail the whole listing (`fatal: missing object`,
-/// checked on 2026-11-04 with git 2.54.0), where each other ref still reads.
-/// `%(symref)` is empty for a ref that is not symbolic, so the line has
-/// three fields.
-fn named(git: &Git, checkout: &Path) -> Result<Vec<Named>, String> {
-    let out = git
-        .run(
-            checkout,
-            &[
-                "for-each-ref",
-                "--format=%(objectname) %(symref) %(refname)",
-                TICKETS_PREFIX,
-            ],
-        )
-        .map_err(|e| e.to_string())?;
-    Ok(String::from_utf8_lossy(&out)
-        .lines()
-        .filter_map(|line| {
-            let mut fields = line.splitn(3, ' ');
-            let (oid, symref, refname) = (fields.next()?, fields.next()?, fields.next()?);
-            let ticket = TicketId::new(refname.strip_prefix(TICKETS_PREFIX)?).ok()?;
-            let symref = (!symref.is_empty()).then(|| symref.to_owned());
-            Some((ticket, oid.to_owned(), symref))
-        })
-        .collect())
+/// named so); with `claims`, the claims fetched from `origin` too, under
+/// [`FETCHED_PREFIX`] (OWL-587), in the same `for-each-ref`. The objects are
+/// not read: `%(objecttype)` would make one ref to a missing object fail the
+/// whole listing (`fatal: missing object`, checked on 2026-11-04 with git
+/// 2.54.0), where each other ref still reads. `%(symref)` is empty for a ref
+/// that is not symbolic, so the line has three fields.
+fn named(git: &Git, checkout: &Path, claims: bool) -> Result<(Vec<Named>, Vec<Named>), String> {
+    let mut args = vec![
+        "for-each-ref",
+        "--format=%(objectname) %(symref) %(refname)",
+        TICKETS_PREFIX,
+    ];
+    if claims {
+        args.push(FETCHED_PREFIX);
+    }
+    let out = git.run(checkout, &args).map_err(|e| e.to_string())?;
+    let (mut refs, mut fetched) = (Vec::new(), Vec::new());
+    for line in String::from_utf8_lossy(&out).lines() {
+        let mut fields = line.splitn(3, ' ');
+        let (Some(oid), Some(symref), Some(refname)) = (fields.next(), fields.next(), fields.next())
+        else {
+            continue;
+        };
+        let (prefix, into) = if refname.starts_with(TICKETS_PREFIX) {
+            (TICKETS_PREFIX, &mut refs)
+        } else {
+            (FETCHED_PREFIX, &mut fetched)
+        };
+        let Some(ticket) = refname
+            .strip_prefix(prefix)
+            .and_then(|id| TicketId::new(id).ok())
+        else {
+            continue;
+        };
+        let symref = (!symref.is_empty()).then(|| symref.to_owned());
+        into.push((ticket, oid.to_owned(), symref));
+    }
+    Ok((refs, fetched))
 }
 
 /// The type of each of `named`'s objects, in order, by one `git cat-file
@@ -458,19 +473,21 @@ fn kinds(git: &Git, checkout: &Path, named: &[Named]) -> Result<Vec<String>, Str
         .collect()
 }
 
-/// Why a ticket ref could not be read.
+/// Why a ticket ref, or a claim, could not be read.
 enum ReadError {
     /// What it holds is not a ticket record: the ref is broken.
     Invalid(String),
     /// Git could not show it: nothing is known of the record.
     Git(String),
+    /// A claim written in a format later than this binary reads (OWL-587).
+    Newer(String),
 }
 
 impl ReadError {
     /// Why, as [`read`] answers it.
     fn into_message(self) -> String {
         match self {
-            Self::Invalid(why) | Self::Git(why) => why,
+            Self::Invalid(why) | Self::Git(why) | Self::Newer(why) => why,
         }
     }
 }
@@ -482,7 +499,7 @@ fn read_listed(
     name: &str,
     listed: &Listed,
 ) -> Result<Stored, ReadError> {
-    precheck(name, listed)?;
+    precheck("ticket ref", name, listed)?;
     let entries = tree_entries(git, checkout, &listed.oid).map_err(ReadError::Git)?;
     let wanted = wanted(&entries);
     let texts = read_files(git, checkout, &entries, &wanted, false).map_err(ReadError::Git)?;
@@ -490,23 +507,24 @@ fn read_listed(
 }
 
 /// What [`read_listed`] refuses before git is asked anything: a symbolic
-/// ref, a missing object, an object that is not a commit.
-fn precheck(name: &str, listed: &Listed) -> Result<(), ReadError> {
+/// ref, a missing object, an object that is not a commit. `what` names the
+/// ref: a ticket ref, or a claim (OWL-587).
+fn precheck(what: &str, name: &str, listed: &Listed) -> Result<(), ReadError> {
     if let Some(target) = &listed.symref {
         return Err(ReadError::Invalid(format!(
-            "the ticket ref {name} is a symbolic ref to {target}, which Owlshift never writes"
+            "the {what} {name} is a symbolic ref to {target}, which Owlshift never writes"
         )));
     }
     // Only [`listing`] answers `missing`: [`listed`]'s `for-each-ref` fails.
     if listed.kind == "missing" {
         return Err(ReadError::Git(format!(
-            "the ticket ref {name} points to {}, which the repository does not hold",
+            "the {what} {name} points to {}, which the repository does not hold",
             listed.oid
         )));
     }
     if listed.kind != "commit" {
         return Err(ReadError::Invalid(format!(
-            "the ticket ref {name} points to a {}, not a commit",
+            "the {what} {name} points to a {}, not a commit",
             listed.kind
         )));
     }
@@ -668,20 +686,21 @@ fn regular<'e>(entries: &'e [Entry], file: &str) -> Result<&'e Entry, String> {
 }
 
 /// Each of `files` among `entries` checked: the blob to read for one that
-/// is a regular blob of at most [`MAX_FILE`] bytes, or why the ref is
-/// broken for that file; and how many are read: unless `past_invalid`,
-/// none after the first that is refused.
+/// is a regular blob of at most `cap` bytes ([`MAX_FILE`] for a ticket ref),
+/// or why the ref is broken for that file; and how many are read: unless
+/// `past_invalid`, none after the first that is refused.
 fn check_files<'e>(
     entries: &'e [Entry],
     files: &[&str],
     past_invalid: bool,
+    cap: u64,
 ) -> (Vec<Result<&'e str, String>>, usize) {
     let checked: Vec<Result<&str, String>> = files
         .iter()
         .map(|&file| {
             let entry = regular(entries, file)?;
-            if entry.size.is_none_or(|size| size > MAX_FILE) {
-                return Err(format!("holds {file} past {MAX_FILE} bytes"));
+            if entry.size.is_none_or(|size| size > cap) {
+                return Err(format!("holds {file} past {cap} bytes"));
             }
             Ok(entry.oid.as_str())
         })
@@ -740,7 +759,7 @@ fn read_files(
     files: &[&str],
     past_invalid: bool,
 ) -> Result<Vec<Result<String, String>>, String> {
-    let (checked, stop) = check_files(entries, files, past_invalid);
+    let (checked, stop) = check_files(entries, files, past_invalid, MAX_FILE);
     let oids = picked(&checked, stop);
     let blobs = if oids.is_empty() {
         Vec::new()
@@ -908,21 +927,80 @@ fn batch(git: &Git, checkout: &Path, format: &str, asked: &[&str]) -> Result<Vec
     parse_objects(&out, asked, format == "--batch").map_err(|e| format!("git cat-file {what}: {e}"))
 }
 
-/// Reads each ref of `refs`, a name and what [`listing`] listed for it, as
-/// [`read_listed`] reads it, the files of all of them in three git
+/// What a ref of a batch is read as (OWL-587): a ticket record, or a claim
+/// another runner pushed, fetched from `origin`.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Want {
+    Ticket,
+    Claim,
+}
+
+impl Want {
+    /// How a message names a ref of this kind.
+    fn what(self) -> &'static str {
+        match self {
+            Want::Ticket => "ticket ref",
+            Want::Claim => "claim",
+        }
+    }
+
+    /// The files read of its tree, in the order they are judged.
+    fn wanted(self, entries: &[Entry]) -> Vec<&'static str> {
+        match self {
+            Want::Ticket => wanted(entries),
+            Want::Claim => vec![CLAIM_FILE],
+        }
+    }
+
+    /// The most bytes one of its files may hold.
+    fn cap(self) -> u64 {
+        match self {
+            Want::Ticket => MAX_FILE,
+            Want::Claim => u64::try_from(MAX_CLAIM_BYTES).unwrap_or(u64::MAX),
+        }
+    }
+}
+
+/// A ref of a batch, as read.
+enum Got {
+    Ticket(Box<Stored>),
+    Claim(Claim),
+}
+
+/// The claim the ref `name` holds, from the text of its `claim.json`, as
+/// [`read_files`] gives it: a later format is [`ReadError::Newer`].
+fn parse_claim(name: &str, texts: Vec<Result<String, String>>) -> Result<Got, ReadError> {
+    let broken = |why: String| ReadError::Invalid(format!("the claim {name} {why}"));
+    let text = match texts.into_iter().next() {
+        Some(Ok(text)) => text,
+        Some(Err(why)) => return Err(broken(why)),
+        None => unreachable!("{CLAIM_FILE} was asked for"),
+    };
+    match Claim::parse(&text) {
+        Ok(claim) => Ok(Got::Claim(claim)),
+        Err(error @ ContractError::NewerFormat { .. }) => Err(ReadError::Newer(format!(
+            "the claim {name} holds a {CLAIM_FILE} {error}"
+        ))),
+        Err(error) => Err(broken(format!("holds an invalid {CLAIM_FILE}: {error}"))),
+    }
+}
+
+/// Reads each ref of `refs`, a name, what [`listing`] listed for it and
+/// what it is read as: a ticket ref as [`read_listed`] reads it, a claim's
+/// `claim.json` (OWL-587). The files of all of them are read in three git
 /// commands whatever their number (OWL-492): one `cat-file --batch` of
 /// their trees, by `<commit>^{tree}`; one `cat-file --batch-check` of the
-/// sizes of the files they hold, so that a file past [`MAX_FILE`] is never
-/// read, which bounds what the last one prints; one `cat-file --batch` of
-/// the files' contents. Each ref is judged as alone: its first refusal is
-/// its error, and a git failure on an object it asked for is its own
-/// alone. A command that fails is the error of each ref that asked it
-/// something, the others read on.
+/// sizes of the files they hold, so that a file past its cap is never read,
+/// which bounds what the last one prints; one `cat-file --batch` of the
+/// files' contents. Each ref is judged as alone: its first refusal is its
+/// error, and a git failure on an object it asked for is its own alone. A
+/// command that fails is the error of each ref that asked it something, the
+/// others read on.
 fn read_batch(
     git: &Git,
     checkout: &Path,
-    refs: &[(String, &Listed)],
-) -> Vec<Result<Stored, String>> {
+    refs: &[(String, &Listed, Want)],
+) -> Vec<Result<Got, ReadError>> {
     /// A ref whose tree was read: its place in `refs`, the tree's entries
     /// and the files it wants.
     struct Open {
@@ -930,10 +1008,10 @@ fn read_batch(
         entries: Vec<Entry>,
         wanted: Vec<&'static str>,
     }
-    let mut done: Vec<Option<Result<Stored, ReadError>>> = refs.iter().map(|_| None).collect();
+    let mut done: Vec<Option<Result<Got, ReadError>>> = refs.iter().map(|_| None).collect();
     let mut pending = Vec::new();
-    for (at, (name, listed)) in refs.iter().enumerate() {
-        match precheck(name, listed) {
+    for (at, (name, listed, want)) in refs.iter().enumerate() {
+        match precheck(want.what(), name, listed) {
             Ok(()) => pending.push(at),
             Err(why) => done[at] = Some(Err(why)),
         }
@@ -954,19 +1032,20 @@ fn read_batch(
         }
         Ok(answers) => {
             for (&at, answer) in pending.iter().zip(answers) {
-                let (name, listed) = &refs[at];
+                let (name, listed, want) = &refs[at];
                 let entries = match answer {
                     Answer::Object {
                         kind, oid, content, ..
                     } if kind == "tree" => tree_of(&oid, &content),
                     Answer::Object { header, .. } | Answer::Not { header, .. } => Err(format!(
-                        "the tree of {} in the ticket ref {name} cannot be read: {header}",
-                        listed.oid
+                        "the tree of {} in the {} {name} cannot be read: {header}",
+                        listed.oid,
+                        want.what()
                     )),
                 };
                 match entries {
                     Ok(entries) => {
-                        let wanted = wanted(&entries);
+                        let wanted = want.wanted(&entries);
                         open.push(Open {
                             at,
                             entries,
@@ -1028,7 +1107,7 @@ fn read_batch(
     // Their contents, as [`read_files`] picks them.
     let checks: Vec<_> = open
         .iter()
-        .map(|open| check_files(&open.entries, &open.wanted, false))
+        .map(|open| check_files(&open.entries, &open.wanted, false, refs[open.at].2.cap()))
         .collect();
     let picks: Vec<Vec<&str>> = checks
         .iter()
@@ -1052,20 +1131,21 @@ fn read_batch(
                 blobs.into_iter().collect()
             }
         };
-        let (name, listed) = &refs[open.at];
+        let (name, listed, want) = &refs[open.at];
         done[open.at] = Some(match blobs {
             Err(why) => Err(ReadError::Git(why)),
             Ok(blobs) => {
                 let texts = texts_of(checked, &open.wanted, stop, blobs);
-                parse_record(name, &listed.oid, &open.entries, texts)
+                match want {
+                    Want::Ticket => parse_record(name, &listed.oid, &open.entries, texts)
+                        .map(|stored| Got::Ticket(Box::new(stored))),
+                    Want::Claim => parse_claim(name, texts),
+                }
             }
         });
     }
     done.into_iter()
-        .map(|read| {
-            read.expect("every ref is judged")
-                .map_err(ReadError::into_message)
-        })
+        .map(|read| read.expect("every ref is judged"))
         .collect()
 }
 
@@ -1082,19 +1162,74 @@ pub fn read_listed_refs(
     checkout: &Path,
     listing: Vec<(TicketId, Listed)>,
 ) -> Vec<RefRead> {
-    let (tickets, listed): (Vec<TicketId>, Vec<Listed>) = listing.into_iter().unzip();
-    let refs: Vec<(String, &Listed)> = tickets.iter().map(ticket_ref).zip(&listed).collect();
-    tickets
+    let listing = Listing {
+        refs: listing,
+        claims: Vec::new(),
+    };
+    read_listing(git, checkout, listing).0
+}
+
+/// [`read_listed_refs`] for `listing`'s ticket refs and its claims together
+/// (OWL-587): the same three git commands read both, whatever their number.
+/// A claim that does not read is kept, with why ([`ClaimUnread`]).
+pub fn read_listing(
+    git: &Git,
+    checkout: &Path,
+    listing: Listing,
+) -> (Vec<RefRead>, Vec<FetchedClaim>) {
+    let Listing { refs, claims } = listing;
+    let named: Vec<(String, &Listed, Want)> = refs
+        .iter()
+        .map(|(ticket, listed)| (ticket_ref(ticket), listed, Want::Ticket))
+        .chain(
+            claims
+                .iter()
+                .map(|(ticket, listed)| (format!("{FETCHED_PREFIX}{ticket}"), listed, Want::Claim)),
+        )
+        .collect();
+    let mut read = read_batch(git, checkout, &named).into_iter();
+    let refs: Vec<RefRead> = refs
+        .iter()
+        .map(|(ticket, _)| {
+            let stored = match read.next().expect("one answer per ref") {
+                Ok(Got::Ticket(stored)) => Ok(*stored),
+                Ok(Got::Claim(_)) => unreachable!("a ticket ref reads as one"),
+                Err(why) => Err(why.into_message()),
+            };
+            (ticket.clone(), stored)
+        })
+        .collect();
+    let claims = claims
         .into_iter()
-        .zip(read_batch(git, checkout, &refs))
-        .collect()
+        .map(|(ticket, listed)| {
+            let claim = match read.next().expect("one answer per claim") {
+                Ok(Got::Claim(claim)) => Ok(claim),
+                Ok(Got::Ticket(_)) => unreachable!("a claim reads as one"),
+                Err(ReadError::Newer(reason)) => Err(ClaimUnread {
+                    reason,
+                    newer: true,
+                }),
+                Err(why) => Err(ClaimUnread {
+                    reason: why.into_message(),
+                    newer: false,
+                }),
+            };
+            FetchedClaim {
+                ticket,
+                commit: listed.oid,
+                claim,
+            }
+        })
+        .collect();
+    (refs, claims)
 }
 
 /// The tickets that have a ticket ref in `checkout`, in the order git lists
 /// the refs (OWL-152). A ref below the namespace whose name is not a ticket
 /// id is left out: no ticket's ref is named so.
 pub fn list(git: &Git, checkout: &Path) -> Result<Vec<TicketId>, String> {
-    Ok(named(git, checkout)?
+    Ok(named(git, checkout, false)?
+        .0
         .into_iter()
         .map(|(ticket, _, _)| ticket)
         .collect())
@@ -1106,13 +1241,35 @@ pub fn list(git: &Git, checkout: &Path) -> Result<Vec<TicketId>, String> {
 /// commit. Watch's snapshot lists so under the project's lock and reads
 /// once it let go (OWL-489).
 pub fn listing(git: &Git, checkout: &Path) -> Result<Vec<(TicketId, Listed)>, String> {
-    let named = named(git, checkout)?;
-    let kinds = kinds(git, checkout, &named)?;
-    Ok(named
+    listing_with(git, checkout, false).map(|listing| listing.refs)
+}
+
+/// The ticket refs and, with claims, the claims fetched from `origin`
+/// (OWL-587), listed at one moment by [`listing`]'s two git commands.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Listing {
+    pub refs: Vec<(TicketId, Listed)>,
+    pub claims: Vec<(TicketId, Listed)>,
+}
+
+/// [`listing`], the claims fetched from `origin` under [`FETCHED_PREFIX`]
+/// listed too when `claims` (OWL-587), by the same two git commands.
+pub fn listing_with(git: &Git, checkout: &Path, claims: bool) -> Result<Listing, String> {
+    let (refs, fetched) = named(git, checkout, claims)?;
+    let split = refs.len();
+    let mut all = refs;
+    all.extend(fetched);
+    let kinds = kinds(git, checkout, &all)?;
+    let mut listed: Vec<(TicketId, Listed)> = all
         .into_iter()
         .zip(kinds)
         .map(|((ticket, oid, symref), kind)| (ticket, Listed { oid, kind, symref }))
-        .collect())
+        .collect();
+    let claims = listed.split_off(split);
+    Ok(Listing {
+        refs: listed,
+        claims,
+    })
 }
 
 /// A ticket ref as the drain's slot weighs it (OWL-291).
@@ -1182,11 +1339,30 @@ pub fn others(git: &Git, checkout: &Path, own: &TicketId) -> Result<Vec<RefRead>
 
 /// [`all`], the ref of `skip` left out before any is read.
 fn read_all(git: &Git, checkout: &Path, skip: Option<&TicketId>) -> Result<Vec<RefRead>, String> {
-    let listing = listing(git, checkout)?
-        .into_iter()
-        .filter(|(ticket, _)| Some(ticket) != skip)
-        .collect();
-    Ok(read_listed_refs(git, checkout, listing))
+    read_all_with(git, checkout, skip, false).map(|(refs, _)| refs)
+}
+
+/// [`others`], and with `claims` the claims fetched from `origin` (OWL-587),
+/// read in the same five git commands whatever their number.
+pub fn others_with_claims(
+    git: &Git,
+    checkout: &Path,
+    own: &TicketId,
+    claims: bool,
+) -> Result<(Vec<RefRead>, Vec<FetchedClaim>), String> {
+    read_all_with(git, checkout, Some(own), claims)
+}
+
+/// [`read_all`], with the claims fetched from `origin` when `claims`.
+fn read_all_with(
+    git: &Git,
+    checkout: &Path,
+    skip: Option<&TicketId>,
+    claims: bool,
+) -> Result<(Vec<RefRead>, Vec<FetchedClaim>), String> {
+    let mut listing = listing_with(git, checkout, claims)?;
+    listing.refs.retain(|(ticket, _)| Some(ticket) != skip);
+    Ok(read_listing(git, checkout, listing))
 }
 
 /// One commit of a ticket ref's history (OWL-471): the commit, when it was
@@ -1223,7 +1399,7 @@ pub fn commits(
     let Some(tip) = listed(git, checkout, &name)? else {
         return Ok(Commits::default());
     };
-    precheck(&name, &tip).map_err(ReadError::into_message)?;
+    precheck("ticket ref", &name, &tip).map_err(ReadError::into_message)?;
     let limit = format!("-n{}", max.saturating_add(1));
     let out = git
         .run(
@@ -1262,10 +1438,17 @@ pub fn read_commits(
             symref: None,
         })
         .collect();
-    let refs: Vec<(String, &Listed)> = tips.iter().map(|tip| (name.clone(), tip)).collect();
+    let refs: Vec<(String, &Listed, Want)> = tips
+        .iter()
+        .map(|tip| (name.clone(), tip, Want::Ticket))
+        .collect();
     read_batch(git, checkout, &refs)
         .into_iter()
-        .map(|read| read.map(|stored| stored.record))
+        .map(|read| match read {
+            Ok(Got::Ticket(stored)) => Ok(stored.record),
+            Ok(Got::Claim(_)) => unreachable!("a ticket ref reads as one"),
+            Err(why) => Err(why.into_message()),
+        })
         .collect()
 }
 
@@ -1540,7 +1723,8 @@ pub fn forget_guarded(
                 (kept, ProposalsFile::Keep),
             )
         }
-        Err(ReadError::Git(error)) => return Err(error),
+        // A ticket ref never reads as a later claim format.
+        Err(ReadError::Git(error) | ReadError::Newer(error)) => return Err(error),
         Err(ReadError::Invalid(why)) if listed.symref.is_some() || listed.kind != "commit" => {
             // `--no-deref`: a symbolic ref goes, not the ref it points to.
             move_ref(

@@ -143,8 +143,8 @@ impl Folded {
 
 impl Folded {
     /// Adds the waits the drain's ready snapshot `snapshot` alone tells: a
-    /// ticket of another person's (`not_mine`, OWL-583), which no event
-    /// tells, is current as of the snapshot's time unless an event told a
+    /// ticket of another person's (`not_mine`, OWL-583) or one another
+    /// runner claims (`claimed`, OWL-587), which no event tells, is current as of the snapshot's time unless an event told a
     /// newer wait of it. Its words are the snapshot's. What `why` and
     /// `status --waits` share.
     pub fn absorb_ready(&mut self, snapshot: &ReadySnapshot) {
@@ -152,7 +152,7 @@ impl Folded {
             let Outcome::Waits { wait } = &ready.drain else {
                 continue;
             };
-            if wait.reason != "not_mine" {
+            if wait.reason != "not_mine" && wait.reason != "claimed" {
                 continue;
             }
             let newer = self
@@ -241,6 +241,37 @@ pub(crate) fn not_admitted(why: Option<&str>) -> String {
 }
 
 /// The phrase a wait is shown as.
+/// A ticket another runner claims, as the ready snapshot's `claimed` wait
+/// carries it at `at` (OWL-587): by its operator and its lease, or as a
+/// claim this binary cannot read.
+fn claimed(data: &serde_json::Map<String, Value>, at: jiff::Timestamp) -> String {
+    if data.get("unread").and_then(Value::as_bool) == Some(true) {
+        let upgrade = if data.get("newer").and_then(Value::as_bool) == Some(true) {
+            ", written by a later Owlshift: upgrade Owlshift to read it"
+        } else {
+            ""
+        };
+        return format!(
+            "another runner claims it on origin, by a claim this runner cannot read{upgrade}"
+        );
+    }
+    let operator = data
+        .get("operator")
+        .and_then(Value::as_str)
+        .unwrap_or("another person");
+    let expires = data
+        .get("expires_at")
+        .and_then(Value::as_str)
+        .and_then(|at| at.parse::<jiff::Timestamp>().ok());
+    match expires {
+        Some(expires) if expires < at => format!(
+            "claimed by {operator}'s runner, whose claim expired at {expires}: theirs, until a              person releases it"
+        ),
+        Some(expires) => format!("claimed by {operator}'s runner until {expires}: theirs to work"),
+        None => format!("claimed by {operator}'s runner: theirs to work"),
+    }
+}
+
 pub fn phrase(wait: &Waiting) -> String {
     let data = &wait.data;
     // Merge on green's waits (OWL-499), worded where they are told.
@@ -278,6 +309,22 @@ pub fn phrase(wait: &Waiting) -> String {
                 format!("pull request #{number} holds")
             } else if data.get("person").and_then(Value::as_bool) == Some(true) {
                 format!("{}, which a person works on, holds", list("tickets"))
+            } else if let Some(operator) = data.get("operator").and_then(Value::as_str) {
+                // Another runner's claim (OWL-587), its lease told once over.
+                let expired = data
+                    .get("expires_at")
+                    .and_then(Value::as_str)
+                    .and_then(|at| at.parse::<jiff::Timestamp>().ok())
+                    .is_some_and(|at| at < wait.at);
+                let lease = if expired {
+                    ", its claim expired,"
+                } else {
+                    ""
+                };
+                format!(
+                    "{}, which {operator}'s runner works{lease}, holds",
+                    list("tickets")
+                )
             } else if shared {
                 // Two tickets share the path already (OWL-449).
                 format!("{} hold", list("tickets").replace(", ", " and "))
@@ -339,6 +386,12 @@ pub fn phrase(wait: &Waiting) -> String {
                     .unwrap_or("another person");
                 format!("admitted by {who}: their runner's")
             }
+        },
+        // Another runner's claim (OWL-587): as the ready snapshot worded it
+        // (`text`), or by its operator.
+        "claimed" => match data.get("text").and_then(Value::as_str) {
+            Some(text) => text.to_owned(),
+            None => claimed(data, wait.at),
         },
         "excluded" => "it carries the exclusion label".to_owned(),
         "no_decider" => {

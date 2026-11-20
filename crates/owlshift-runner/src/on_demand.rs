@@ -1555,6 +1555,11 @@ struct Prepared {
     /// Under `owlshift watch`, the ticket that holds the project's slot when
     /// another does, which the RESUME of an answer check names (OWL-367).
     slot_held_by: Option<TicketId>,
+    /// The project's `policy.claims` at the base the command fetched
+    /// (OWL-587): under `remote`, its sections read other runners' claims
+    /// with the ticket refs. A file that does not read there is `local`
+    /// here; the claim's take refuses it.
+    claims: Claims,
     /// The opt-in Codex reviewer for this command (OWL-348).
     codex: CodexSeat,
     /// The session of the latest Design or Build run that asked, as the
@@ -1662,6 +1667,19 @@ struct Locked {
     unread: Vec<String>,
     /// How the outside holders are named.
     kinds: HashMap<String, Kind>,
+    /// When each claim this runner recorded was taken (OWL-587): the order
+    /// key of its ticket against another runner's claim.
+    times: BTreeMap<TicketId, i64>,
+}
+
+/// The project's other ticket refs as a section reads them, with the claims
+/// other runners hold under `policy.claims = "remote"` and when this
+/// runner's own were taken (OWL-587).
+#[derive(Default)]
+struct Others {
+    refs: Vec<RefRead>,
+    claims: Vec<claims::FetchedClaim>,
+    times: BTreeMap<TicketId, i64>,
 }
 
 /// A ticket's routing as read now, and what it was read from: its labels
@@ -1994,7 +2012,11 @@ impl OnDemand<'_> {
         outside: Option<&Outside>,
         named: &NamedResources,
     ) -> Result<Locked, Stop> {
-        let others = self
+        let Others {
+            refs: others,
+            claims: elsewhere,
+            times,
+        } = self
             .others(p)
             .map_err(|e| refused("reading the project's ticket refs for the admission", e))?;
         let mut locked = Locked {
@@ -2006,6 +2028,7 @@ impl OnDemand<'_> {
             holding: Vec::new(),
             unread: Vec::new(),
             kinds: HashMap::new(),
+            times: BTreeMap::new(),
         };
         for (ticket, read) in &others {
             let id = ticket.as_str().to_owned();
@@ -2022,7 +2045,7 @@ impl OnDemand<'_> {
                     if held::holds(stored) {
                         locked
                             .in_flight
-                            .push(held::in_flight(ticket, stored, named));
+                            .push(held::by_claim(held::in_flight(ticket, stored, named), &times));
                     }
                 }
                 Err(_) => {
@@ -2037,10 +2060,11 @@ impl OnDemand<'_> {
                 .iter()
                 .map(|(ticket, read)| (ticket, read.as_ref().ok()))
                 .chain([(&p.ticket, None)]);
-            let holders = outside.holders(refs, named);
+            let holders = outside.holders(refs, &elsewhere, named);
             holders.join(&mut locked.in_flight, named);
             locked.kinds = holders.kinds;
         }
+        locked.times = times;
         Ok(locked)
     }
 
@@ -2120,11 +2144,14 @@ impl OnDemand<'_> {
         let _section = self.section()?;
         let locked = self.locked_load(p, Some(&outside), &named)?;
         p.outside = Some(outside);
-        let own = held::of(
-            &p.ticket,
-            p.held.as_ref(),
-            p.stored.as_ref().is_some_and(delivery_followed),
-            &named,
+        let own = held::by_claim(
+            held::of(
+                &p.ticket,
+                p.held.as_ref(),
+                p.stored.as_ref().is_some_and(delivery_followed),
+                &named,
+            ),
+            &locked.times,
         );
         let mut holding = locked.holding.clone();
         holding.push((own.id.clone(), own.dispatched));
@@ -2346,7 +2373,12 @@ impl OnDemand<'_> {
     /// be listed.
     fn overlaps(&self, p: &Prepared) -> Vec<(TicketId, Vec<String>)> {
         let others = self.others(p).unwrap_or_default();
-        held::overlaps_of(&p.ticket, p.held.as_ref(), &others)
+        let claimed: Vec<TicketId> = others
+            .claims
+            .iter()
+            .map(|claim| claim.ticket.clone())
+            .collect();
+        held::overlaps_of(&p.ticket, p.held.as_ref(), &others.refs, &claimed)
     }
 
     /// What the ticket holds from this dispatch (OWL-448; architecture
@@ -2813,6 +2845,10 @@ impl OnDemand<'_> {
             return Err(self.run_fault(ticket, fault));
         }
         drop(section);
+        let claims = project::project_file_at(git, &checkout, &base)
+            .ok()
+            .flatten()
+            .map_or(Claims::Local, |file| file.policy.claims());
         let labels = route_labels(found.labels.iter().map(String::as_str));
         let prepared = Prepared {
             _ticket_lock: ticket_lock,
@@ -2866,6 +2902,7 @@ impl OnDemand<'_> {
             typed: None,
             integrated: false,
             slot_held_by: None,
+            claims,
         };
         // The claim (OWL-586), outside every section, before anything is
         // written: the drain's commands take it after their gesture's checks.
@@ -3060,10 +3097,27 @@ impl OnDemand<'_> {
     /// The project's other ticket refs, read in the section the caller
     /// holds ([`ticket_ref::others`]), without those whose claim this runner
     /// lost (OWL-586): every count of an admission, a delivery's check or a
-    /// refresh reads them here.
-    fn others(&self, p: &Prepared) -> Result<Vec<RefRead>, String> {
-        ticket_ref::others(&self.executor.git, &p.checkout, &p.ticket)
-            .map(|refs| claims::drop_lost(self.dirs, refs))
+    /// refresh reads them here. Under `policy.claims = "remote"` at the
+    /// command's base, with the claims of other runners the dedicated
+    /// checkout last fetched, read in the same git commands (OWL-587).
+    fn others(&self, p: &Prepared) -> Result<Others, String> {
+        let remote = p.claims == Claims::Remote;
+        let (refs, fetched) =
+            ticket_ref::others_with_claims(&self.executor.git, &p.checkout, &p.ticket, remote)?;
+        let elsewhere = if fetched.is_empty() {
+            Vec::new()
+        } else {
+            let runner = claims::runner_id(self.dirs.data_dir()).map_err(|e| e.to_string())?;
+            fetched
+                .into_iter()
+                .filter(|claim| !claim.is_of(&runner))
+                .collect()
+        };
+        Ok(Others {
+            refs: claims::drop_lost(self.dirs, refs),
+            claims: elsewhere,
+            times: claims::claimed_times(self.dirs),
+        })
     }
 
     /// `owlshift continue` on a ticket at Watch whose pull request is
@@ -3939,10 +3993,11 @@ impl OnDemand<'_> {
         let none = NamedResources::default();
         let named = rules.resources().unwrap_or(&none);
         let refs = others
+            .refs
             .iter()
             .map(|(ticket, read)| (ticket, read.as_ref().ok()))
             .chain([(&p.ticket, None)]);
-        let holders = outside.holders(refs, named);
+        let holders = outside.holders(refs, &others.claims, named);
         let Some(found) = self.delivery_collision(p, rules, &others, &holders)? else {
             return Ok(None);
         };
@@ -3968,20 +4023,23 @@ impl OnDemand<'_> {
         &self,
         p: &Prepared,
         rules: &ProjectRules,
-        others: &[RefRead],
+        others: &Others,
         outside: &in_flight::Holders,
     ) -> Result<Option<Collision<String>>, Stop> {
         let none = NamedResources::default();
         let named = rules.resources().unwrap_or(&none);
+        let times = &others.times;
         let mut in_flight: Vec<InFlight<String>> = others
+            .refs
             .iter()
             .filter_map(|(ticket, read)| match read {
-                Ok(stored) => held::holds(stored).then(|| held::in_flight(ticket, stored, named)),
+                Ok(stored) => held::holds(stored)
+                    .then(|| held::by_claim(held::in_flight(ticket, stored, named), times)),
                 Err(_) => Some(held::unread(ticket, named)),
             })
             .collect();
         outside.join(&mut in_flight, named);
-        let own = held::of(&p.ticket, p.held.as_ref(), false, named);
+        let own = held::by_claim(held::of(&p.ticket, p.held.as_ref(), false, named), times);
         Ok(collision::weigh(&own, &in_flight, self.overlap_policy(p)).collision)
     }
 
@@ -5558,13 +5616,22 @@ impl OnDemand<'_> {
     ) -> Result<held::Recorded, String> {
         let named = self.config.stack.named_resources().unwrap_or_default();
         let others = self.others(p)?;
-        let in_flight: Vec<InFlight<String>> = others
+        // Another runner's claims are siblings too (OWL-587).
+        let none = in_flight::Outside::default();
+        let mut in_flight: Vec<InFlight<String>> = others
+            .refs
             .iter()
             .filter_map(|(ticket, read)| match read {
                 Ok(stored) => held::holds(stored).then(|| held::in_flight(ticket, stored, &named)),
                 Err(_) => None,
             })
             .collect();
+        let refs = others
+            .refs
+            .iter()
+            .map(|(ticket, read)| (ticket, read.as_ref().ok()))
+            .chain([(&p.ticket, None)]);
+        in_flight.extend(none.holders(refs, &others.claims, &named).others);
         let delivered = p.stored.as_ref().is_some_and(delivery_followed);
         let own = held::of(&p.ticket, p.held.as_ref(), delivered, &named);
         let found = collision::weigh(&own, &in_flight, Overlap::Rebase);

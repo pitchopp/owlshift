@@ -72,6 +72,9 @@ pub enum Wait<K> {
     /// Admitted by another person than this runner's operator, under
     /// `takes = "mine"` (OWL-583): their runner takes it.
     NotMine,
+    /// Another runner claims it on the git remote (P10, OWL-587): theirs
+    /// to work, never taken in, dispatched or continued here.
+    Claimed,
     Excluded,
     /// No decider (architecture, section 4).
     NoDecider,
@@ -118,6 +121,7 @@ impl<K> Wait<K> {
             Wait::Duplicate => "duplicate",
             Wait::NotAdmitted => "not_admitted",
             Wait::NotMine => "not_mine",
+            Wait::Claimed => "claimed",
             Wait::Excluded => "excluded",
             Wait::NoDecider => "no_decider",
             Wait::NoIntake => "no_intake",
@@ -483,6 +487,8 @@ pub fn ready_set<K: Clone + Ord + AsRef<str>>(
     for ticket in candidates {
         let wait = if !seen.insert(&ticket.id) {
             Some(Wait::Duplicate)
+        } else if ticket.admission == Admission::Claimed {
+            Some(Wait::Claimed)
         } else if ticket.admission == Admission::NotAdmitted {
             Some(Wait::NotAdmitted)
         } else if ticket.admission == Admission::NotMine {
@@ -669,6 +675,11 @@ mod tests {
                 t.admission = Admission::NotMine;
                 t.has_decider = false;
             }),
+            // Another runner's claim (OWL-587): before any other reason.
+            with("A-12", &|t| {
+                t.admission = Admission::Claimed;
+                t.has_decider = false;
+            }),
         ];
         let ready = ready_set(
             &tickets,
@@ -698,6 +709,7 @@ mod tests {
                 ("A-9", Wait::BlockedBy(vec!["X-1"])),
                 ("A-10", Wait::PrCap),
                 ("A-11", Wait::NotMine),
+                ("A-12", Wait::Claimed),
             ]
         );
     }

@@ -103,6 +103,49 @@ pub fn claim_held(stored: Option<&Stored>) -> ClaimHeld {
     }
 }
 
+/// `entry`, a ticket of this runner's, weighed at the time its claim was
+/// taken when `times`, this runner's claims, has one (OWL-587; build plan
+/// "Other runners' tickets", "Which goes on"): every ticket that has a
+/// claim, this runner's or another's, is ordered by its claim's time, so
+/// the order is one on every runner; one with none keeps its dispatch
+/// time.
+pub fn by_claim(
+    mut entry: InFlight<String>,
+    times: &std::collections::BTreeMap<TicketId, i64>,
+) -> InFlight<String> {
+    if let Some(at) = TicketId::new(&entry.id)
+        .ok()
+        .and_then(|ticket| times.get(&ticket))
+    {
+        entry.dispatched = Dispatched::At(*at);
+    }
+    entry
+}
+
+/// What a claim's `held` holds, as the rule weighs it, closed with `named`
+/// (OWL-587): as [`of`] weighs the `held.json` it was written from
+/// ([`claim_held`]): the whole repository, or its zones, with its files and
+/// resources; only the files, a widening's before its Build's admission,
+/// with no zone; nothing for nothing.
+pub fn claim_resources(held: &ClaimHeld, named: &NamedResources) -> Vec<Resource> {
+    if held.repository || !held.zones.is_empty() {
+        let zones = if held.repository {
+            &[][..]
+        } else {
+            &held.zones[..]
+        };
+        return resource::closed(zones, &held.files, &held.resources, named);
+    }
+    let mut holds = files_held(&held.files, named);
+    for name in &held.resources {
+        let resource = Resource::Named(name.clone());
+        if !holds.contains(&resource) {
+            holds.push(resource);
+        }
+    }
+    holds
+}
+
 /// A ticket ref that cannot be read: the whole repository, dispatched
 /// first, its pull request taken as not open.
 pub fn unread(ticket: &TicketId, named: &NamedResources) -> InFlight<String> {
@@ -153,14 +196,17 @@ pub fn of(
 /// counts while its ref holds, and once its following ended merged or by
 /// someone's push, whose change may still reach the base; not once its pull
 /// request was closed unmerged, at Ready, or once its ref is gone. A ref
-/// that cannot be read counts, since nothing tells it does not.
+/// that cannot be read counts, since nothing tells it does not. A sibling
+/// with no ref here that `claimed`, another runner's claim, names counts
+/// while that claim stands (OWL-587).
 pub fn overlaps_of(
     ticket: &TicketId,
     own: Option<&TicketHeld>,
     refs: &[RefRead],
+    claimed: &[TicketId],
 ) -> Vec<(TicketId, Vec<String>)> {
     let counts = |sibling: &TicketId| match refs.iter().find(|(id, _)| id == sibling) {
-        None => false,
+        None => claimed.contains(sibling),
         Some((_, Err(_))) => true,
         Some((_, Ok(stored))) => {
             holds(stored)
@@ -574,6 +620,35 @@ mod tests {
         Resource::Zone(path.to_owned())
     }
 
+    /// OWL-587: a claim's `held` is weighed as the `held.json` it was
+    /// written from: the whole repository, which `rebase` never tolerates,
+    /// its zones with its files and resources, a widening's files alone,
+    /// or nothing.
+    #[test]
+    fn a_claims_held_set_is_weighed_as_its_held_json() {
+        let named = NamedResources::new([("migrations", "db/**")]).unwrap();
+        let held = |repository, zones: &[&str], files: &[&str]| ClaimHeld {
+            repository,
+            zones: strings(zones),
+            resources: Vec::new(),
+            files: strings(files),
+        };
+        let migrations = Resource::Named("migrations".to_owned());
+        assert_eq!(
+            claim_resources(&held(true, &[], &["a.rs"]), &named),
+            [zone(""), zone("a.rs"), migrations.clone()]
+        );
+        assert_eq!(
+            claim_resources(&held(false, &["app"], &["db/1.sql"]), &named),
+            [zone("app"), zone("db/1.sql"), migrations.clone()]
+        );
+        assert_eq!(
+            claim_resources(&held(false, &[], &["db/1.sql"]), &named),
+            [zone("db/1.sql"), migrations]
+        );
+        assert!(claim_resources(&ClaimHeld::default(), &named).is_empty());
+    }
+
     /// From the dispatch until the pull request ends, waiting and parked
     /// included; not at Ready, nor at Watch once the following ended.
     #[test]
@@ -835,16 +910,25 @@ mod tests {
             (id("DEMO-6"), Err("unreadable".to_owned())),
         ];
         assert_eq!(
-            overlaps_of(&id("DEMO-1"), Some(&me), &refs),
+            overlaps_of(&id("DEMO-1"), Some(&me), &refs, &[]),
             [
                 (id("DEMO-2"), strings(&["app/one.rs", "app/two.rs"])),
                 (id("DEMO-3"), strings(&["app/three.rs"])),
             ]
         );
+        // OWL-587: DEMO-5, with no ref here, counts while another runner's
+        // claim of it stands.
+        assert_eq!(
+            overlaps_of(&id("DEMO-1"), Some(&me), &refs, &[id("DEMO-5")]).len(),
+            3
+        );
         let mut unread = me.clone();
         unread.record_overlap(&id("DEMO-6"), &strings(&["lib/a.rs"]), minute(4));
-        assert_eq!(overlaps_of(&id("DEMO-1"), Some(&unread), &refs).len(), 3);
-        assert!(overlaps_of(&id("DEMO-9"), None, &refs).is_empty());
+        assert_eq!(
+            overlaps_of(&id("DEMO-1"), Some(&unread), &refs, &[]).len(),
+            3
+        );
+        assert!(overlaps_of(&id("DEMO-9"), None, &refs, &[]).is_empty());
     }
 
     /// OWL-449: what an admission or a widening records, the siblings it

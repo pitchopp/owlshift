@@ -95,7 +95,8 @@ impl Watch<'_> {
             }
         };
         let named = on_demand.config.stack.named_resources().unwrap_or_default();
-        let holders = outside.holders(refs, &named);
+        // Other runners' claims as the snapshot read them (OWL-587).
+        let holders = outside.holders(refs, &memory.claimed.elsewhere, &named);
         if kept.told.take().is_some() {
             self.line(out, "the work in flight outside Owlshift reads again");
         }
