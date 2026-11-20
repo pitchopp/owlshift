@@ -186,6 +186,11 @@ impl System for ScriptedSystem {
         Ok(None)
     }
 
+    fn unread_claims(&self, root: &Path) -> Result<Option<Vec<(TicketId, bool)>>, String> {
+        self.note("unread_claims", root);
+        Ok(None)
+    }
+
     fn quarantine(&self, root: &Path) -> Result<MarkerState, String> {
         self.note("quarantine", root);
         Ok(MarkerState::default())

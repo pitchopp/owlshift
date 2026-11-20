@@ -3,18 +3,20 @@
 //! git: two runners, each with its data directory and its dedicated
 //! checkout, take, renew, push a held set and delete one ticket's claim.
 
+use std::collections::BTreeMap;
 use std::fs;
-
 use std::sync::Barrier;
+use std::time::SystemTime;
 
 use jiff::Timestamp;
 
 use owlshift_adapters::forge::Repo;
 use owlshift_contracts::ids::TicketId;
 use owlshift_contracts::refs::{Claim, ClaimHeld, claim_ref};
-use owlshift_runner::claims::{self, ClaimsAt, Deleted, NotTaken, RunnerId, Took};
+use owlshift_runner::claims::{self, Checked, ClaimsAt, Deleted, NotTaken, RunnerId, Took};
 use owlshift_runner::executor::Git;
 use owlshift_runner::project::{self, ProjectDirs};
+use owlshift_runner::ticket_ref;
 use owlshift_testkit::git::{GitEnv, Remote, seed};
 
 const REPO: &str = "acme/web";
@@ -131,6 +133,65 @@ impl Bench {
 
 fn ticket(id: &str) -> TicketId {
     TicketId::new(id).unwrap()
+}
+
+/// `runner`'s own fetch of the claims, as watch makes it (OWL-587), then
+/// its own claims as the listing reads them, by commit.
+fn fetch_own(runner: &Runner) -> BTreeMap<TicketId, String> {
+    let checkout = runner.dirs.checkout();
+    claims::fetch(&runner.git, &checkout).unwrap();
+    let listing = ticket_ref::listing_with(&runner.git, &checkout, true).unwrap();
+    let (_, fetched) = ticket_ref::read_listing(&runner.git, &checkout, listing);
+    fetched
+        .into_iter()
+        .filter(|claim| claim.is_of(&runner.id))
+        .map(|claim| (claim.ticket, claim.commit))
+        .collect()
+}
+
+/// OWL-587: a pass's check of this runner's claims against its own fetch.
+/// Nothing moved: nothing lost. A claim taken once the fetch started, which
+/// the fetch does not show, is kept with no read of the remote. A claim
+/// another runner took over since is lost, its holder named, its record
+/// removed; the other claim stays.
+#[test]
+fn a_fetch_finds_a_claim_lost_and_keeps_a_take_newer_than_it() {
+    let bench = Bench::new();
+    let ann = bench.runner("ann", "ann");
+    let bob = bench.runner("bob", "bob");
+    let (one, two) = (ticket("DEMO-1"), ticket("DEMO-2"));
+    assert!(matches!(ann.take(&one, None), Ok(Took::Taken { .. })));
+    std::thread::sleep(std::time::Duration::from_millis(20));
+    let since = SystemTime::now();
+    let fetched = fetch_own(&ann);
+    assert_eq!(fetched.len(), 1);
+    assert_eq!(
+        claims::check_fetched(ann.at(), &fetched, since),
+        Checked::default()
+    );
+
+    assert!(matches!(ann.take(&two, None), Ok(Took::Taken { .. })));
+    assert_eq!(
+        claims::check_fetched(ann.at(), &fetched, since),
+        Checked::default()
+    );
+
+    bench.release(&one);
+    assert!(matches!(bob.take(&one, None), Ok(Took::Taken { .. })));
+    std::thread::sleep(std::time::Duration::from_millis(20));
+    let since = SystemTime::now();
+    let fetched = fetch_own(&ann);
+    let checked = claims::check_fetched(ann.at(), &fetched, since);
+    assert!(
+        checked.adopted.is_empty() && checked.failed.is_none(),
+        "{checked:?}"
+    );
+    let [(lost, Some(holder))] = checked.lost.as_slice() else {
+        panic!("{checked:?}");
+    };
+    assert_eq!((lost, holder.operator.as_str()), (&one, "bob"));
+    assert!(claims::read_record(&ann.dirs, &one).is_none());
+    assert!(claims::read_record(&ann.dirs, &two).is_some());
 }
 
 /// The acceptance's first case: twenty rounds of two runners taking one

@@ -1137,6 +1137,88 @@ fn every_ticket_ref_is_read_in_a_fixed_number_of_git_commands() {
     assert_eq!(counts, [((5, 2), (5, 1)), ((5, 12), (5, 11))]);
 }
 
+/// A claim as another runner pushes it (OWL-586), fetched to
+/// `refs/remotes/owlshift/claims/<id>`: `claim.json` alone, holding `text`.
+fn fetched_claim(repo: &Repo, id: &str, text: &str) {
+    let blob = repo.blob(text);
+    repo.plant_at(
+        &format!("refs/remotes/owlshift/claims/{id}"),
+        &[("100644", &blob, "claim.json")],
+    );
+}
+
+/// A claim of format 2, taken by `runner` for `operator`.
+fn claim_text(runner: &str, operator: &str) -> String {
+    format!(
+        r#"{{"format":2,"runner":"{runner}","operator":"{operator}","claimed_at":"2026-11-20T09:00:00Z","expires_at":"2026-11-21T09:00:00Z","held":{{"files":["app/one.rs"]}}}}"#
+    )
+}
+
+/// OWL-587: the claims fetched from `origin` are read with the ticket
+/// refs, in the same five git commands whatever their number, and only when
+/// asked; one of a later format, or one that is no claim, is kept unread
+/// with why, the others read on.
+#[test]
+fn the_claims_fetched_are_read_with_the_ticket_refs_in_the_same_commands() {
+    let repo = Repo::new();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let git = counted(&repo, &calls);
+    for n in 1..=3 {
+        let id = TicketId::new(format!("DEMO-{n}")).unwrap();
+        ticket_ref::write(&repo.git, &repo.root, &id, &record(WAITING, 1), None).unwrap();
+    }
+    let mut counts = Vec::new();
+    for n in 1..=12 {
+        fetched_claim(
+            &repo,
+            &format!("OWL-{n}"),
+            &claim_text("0123456789abcdef", "lea"),
+        );
+        if n == 2 || n == 12 {
+            calls.store(0, Ordering::SeqCst);
+            let (refs, claims) =
+                ticket_ref::others_with_claims(&git, &repo.root, &ticket(), true).unwrap();
+            counts.push((calls.load(Ordering::SeqCst), refs.len(), claims.len()));
+            assert!(refs.iter().all(|(_, stored)| stored.is_ok()), "{refs:?}");
+            assert!(claims.iter().all(|claim| claim.claim.is_ok()), "{claims:?}");
+        }
+    }
+    assert_eq!(counts, [(5, 2, 2), (5, 2, 12)]);
+    let (_, none) = ticket_ref::others_with_claims(&git, &repo.root, &ticket(), false).unwrap();
+    assert!(none.is_empty());
+
+    fetched_claim(
+        &repo,
+        "OWL-20",
+        &claim_text("0123456789abcdef", "lea").replace(r#""format":2"#, r#""format":3"#),
+    );
+    let state = repo.blob(WAITING);
+    repo.plant_at(
+        "refs/remotes/owlshift/claims/OWL-21",
+        &[("100644", &state, "state.json")],
+    );
+    let (refs, claims) = ticket_ref::others_with_claims(&git, &repo.root, &ticket(), true).unwrap();
+    assert_eq!(refs.len(), 2);
+    let unread = |id: &str| {
+        claims
+            .iter()
+            .find(|claim| claim.ticket.as_str() == id)
+            .unwrap()
+            .claim
+            .clone()
+            .unwrap_err()
+    };
+    let newer = unread("OWL-20");
+    assert!(newer.newer, "{newer:?}");
+    let missing = unread("OWL-21");
+    assert!(!missing.newer, "{missing:?}");
+    assert!(missing.reason.contains("has no claim.json"), "{missing:?}");
+    assert_eq!(
+        claims.iter().filter(|claim| claim.claim.is_ok()).count(),
+        12
+    );
+}
+
 /// OWL-492: the ticket refs read together read each as `read` reads it
 /// alone, refusals and their messages included, one broken ref leaving the
 /// others whole: the first broken file is the error, whatever a later one

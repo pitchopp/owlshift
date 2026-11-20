@@ -78,6 +78,222 @@ const REMOTE: &str = "origin";
 /// Where a claim read from `origin` is fetched to: a remote-tracking
 /// ref, which the isolation check leaves out (live check T2).
 pub const FETCHED_PREFIX: &str = "refs/remotes/owlshift/claims/";
+/// The refspec that fetches every claim of `origin` to [`FETCHED_PREFIX`]
+/// (live check T2): every fetch of the dedicated checkout adds it, and
+/// watch's own fetch of the claims is it alone (OWL-587).
+pub const CLAIMS_REFSPEC: &str = "+refs/owlshift/claims/*:refs/remotes/owlshift/claims/*";
+/// How often a watch fetches the claims of `origin` on its own (OWL-587):
+/// at most once a minute, as a served watch fetches its default branch.
+pub const FETCH_EVERY: SignedDuration = SignedDuration::from_secs(60);
+
+/// A claim of `origin` as the dedicated checkout last fetched it, under
+/// [`FETCHED_PREFIX`] (OWL-587): its ticket, by its ref's name, the commit
+/// it is at, and what it says or why it does not read.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FetchedClaim {
+    pub ticket: TicketId,
+    pub commit: String,
+    pub claim: Result<Claim, ClaimUnread>,
+}
+
+impl FetchedClaim {
+    /// Whether this runner's: a claim that does not read names no runner,
+    /// so it is another's (build plan "Other runners' tickets").
+    pub fn is_of(&self, runner: &RunnerId) -> bool {
+        self.claim
+            .as_ref()
+            .is_ok_and(|claim| claim.runner == runner.as_str())
+    }
+}
+
+/// Why a fetched claim does not read: what it holds is never named, and
+/// it is never taken (build plan "Other runners' tickets", "A claim this
+/// binary cannot read").
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ClaimUnread {
+    pub reason: String,
+    /// Written in a later format than this binary reads: an upgrade reads it.
+    pub newer: bool,
+}
+
+/// Fetches every claim of `origin` alone into [`FETCHED_PREFIX`], the
+/// claims deleted there pruned, nothing else touched (live check T2): what
+/// watch makes once a minute under `remote` (OWL-587), within the runner
+/// git's deadline. A failed fetch says why, in git's last line.
+pub fn fetch(git: &Git, checkout: &Path) -> Result<(), String> {
+    fetch_within(git, checkout, None)
+}
+
+/// [`fetch`] within `deadline`, the runner git's when `None`: a first
+/// clone's fetch of the claims shares the clone's own.
+pub fn fetch_within(git: &Git, checkout: &Path, deadline: Option<Duration>) -> Result<(), String> {
+    let args = [
+        "fetch",
+        "--quiet",
+        "--no-tags",
+        "--prune",
+        "--no-write-fetch-head",
+        REMOTE,
+        CLAIMS_REFSPEC,
+    ];
+    let out = match deadline {
+        Some(deadline) => git.output_within(checkout, &args, None, deadline),
+        None => git.output(checkout, &args, None),
+    }
+    .map_err(|e| format!("fetching {REMOTE}'s claims: {e}"))?;
+    if out.success() {
+        return Ok(());
+    }
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let last = stderr.lines().rev().find(|line| !line.trim().is_empty());
+    Err(format!(
+        "fetching {REMOTE}'s claims: git fetch failed: {}",
+        last.unwrap_or("no error output").trim()
+    ))
+}
+
+/// When each claim this runner recorded in the project was taken, in
+/// milliseconds: the order key of its ticket against another runner's
+/// claim (OWL-587; build plan "Other runners' tickets", "Which goes on").
+pub fn claimed_times(dirs: &ProjectDirs) -> BTreeMap<TicketId, i64> {
+    recorded(dirs)
+        .into_iter()
+        .map(|record| (record.ticket, record.claim.claimed_at.as_millisecond()))
+        .collect()
+}
+
+/// What a check of this runner's claims against a fetch found (OWL-587).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Checked {
+    /// Found this runner's at another commit, now recorded.
+    pub adopted: Vec<TicketId>,
+    /// Found gone from `origin`, or another's: their records removed.
+    pub lost: Vec<(TicketId, Option<ClaimHolder>)>,
+    /// Why some could not be checked: nothing was lost for it.
+    pub failed: Option<String>,
+}
+
+/// Checks this runner's claims against `fetched`, the claims a fetch that
+/// started at `since` left, by ticket and commit (OWL-587; build plan
+/// "Claims", "Lost", at a pass). A claim confirmed and not being deleted,
+/// whose record was written before the fetch started, and that the fetch
+/// shows gone or at a commit its record does not know, is read again under
+/// its claim's lock, a single try: one `ls-remote` for all such, then as a
+/// renewal reads a refusal. A record written since, a command
+/// having just taken or pushed it, or any read that fails, loses nothing.
+pub fn check_fetched(
+    at: ClaimsAt<'_>,
+    fetched: &BTreeMap<TicketId, String>,
+    since: std::time::SystemTime,
+) -> Checked {
+    let checkout = at.dirs.checkout();
+    let mut checked = Checked::default();
+    let runner = match runner_id(at.dirs.data_dir()) {
+        Ok(runner) => runner,
+        Err(error) => {
+            checked.failed = Some(format!("this machine's runner identifier: {error}"));
+            return checked;
+        }
+    };
+    let known = |record: &TicketClaimed, oid: &str| {
+        record.commit.as_deref() == Some(oid) || record.next.as_deref() == Some(oid)
+    };
+    let mut locks = Vec::new();
+    let mut due = Vec::new();
+    for record in recorded(at.dirs) {
+        let ticket = record.ticket.clone();
+        let Some(commit) = record.commit.clone().filter(|_| !record.deleting) else {
+            continue;
+        };
+        if record.claim.runner != runner.as_str()
+            || fetched.get(&ticket).is_some_and(|oid| known(&record, oid))
+        {
+            continue;
+        }
+        let written = fs::metadata(record_file(at.dirs, &ticket)).and_then(|meta| meta.modified());
+        if !written.is_ok_and(|written| written < since) {
+            continue;
+        }
+        match lock(at.dirs, &ticket, Duration::ZERO) {
+            Ok(Some(held)) => locks.push(held),
+            Ok(None) => continue,
+            Err(error) => {
+                checked.failed = Some(error.to_string());
+                continue;
+            }
+        }
+        // Read again under its lock: a command may have just written it.
+        let Some(record) = read_record(at.dirs, &ticket) else {
+            continue;
+        };
+        if record.commit.as_deref() == Some(commit.as_str()) && !record.deleting {
+            due.push(record);
+        }
+    }
+    if due.is_empty() {
+        return checked;
+    }
+    let names: Vec<String> = due.iter().map(|record| claim_ref(&record.ticket)).collect();
+    let heads = match ls_remote(at.git, &checkout, &names) {
+        Ok(heads) => heads,
+        Err(why) => {
+            checked.failed = Some(why);
+            return checked;
+        }
+    };
+    for record in due {
+        let head = heads.get(&claim_ref(&record.ticket));
+        if head.is_some_and(|oid| known(&record, oid)) {
+            continue;
+        }
+        let ticket = record.ticket;
+        match settle(at, &checkout, &ticket, head.map(String::as_str), &runner) {
+            Ok(Settled::Adopted) => checked.adopted.push(ticket),
+            Ok(Settled::Lost(holder)) => checked.lost.push((ticket, holder)),
+            Err(why) => checked.failed = Some(why),
+        }
+    }
+    drop(locks);
+    checked
+}
+
+/// What `origin`'s claim of a ticket says of this runner's, at none of the
+/// commits its record knows.
+enum Settled {
+    /// This runner's at another commit, a crash having come between a push
+    /// and its record: now recorded.
+    Adopted,
+    /// Gone, or another's: the record removed.
+    Lost(Option<ClaimHolder>),
+}
+
+/// Settles `ticket`'s claim, which `origin` holds at `head` (`None`: gone),
+/// a commit its record does not know, for `runner`: the claim read, adopted
+/// when it is this runner's, lost otherwise, its record removed. A read
+/// that fails settles nothing. A renewal's refusal and a pass's check read
+/// it so (OWL-586, OWL-587).
+fn settle(
+    at: ClaimsAt<'_>,
+    checkout: &Path,
+    ticket: &TicketId,
+    head: Option<&str>,
+    runner: &RunnerId,
+) -> Result<Settled, String> {
+    let Some(oid) = head else {
+        remove_record(at.dirs, ticket);
+        return Ok(Settled::Lost(None));
+    };
+    match read_remote(at.git, checkout, ticket)? {
+        Some(claim) if claim.runner == runner.as_str() => {
+            adopt(at.dirs, ticket, oid, claim)?;
+            Ok(Settled::Adopted)
+        }
+        found => {
+            remove_record(at.dirs, ticket);
+            Ok(Settled::Lost(found.map(|claim| claim.holder())))
+        }
+    }
+}
 
 /// This install's runner identifier: 16 lowercase hexadecimal digits, made
 /// once per data directory, never a host name, which a public repository
@@ -494,25 +710,11 @@ pub fn renew(
                     confirm(at.dirs, record, oid, &mut renewal);
                 }
                 Some(oid) if *oid == expected => again.push((record, expected, commit)),
-                Some(oid) => match read_remote(at.git, &checkout, &ticket) {
-                    Ok(Some(claim)) if claim.runner == runner.as_str() => {
-                        match adopt(at.dirs, &ticket, oid, claim) {
-                            Ok(()) => renewal.adopted.push(ticket),
-                            Err(why) => renewal.failed = Some(why),
-                        }
-                    }
-                    Ok(found) => {
-                        remove_record(at.dirs, &ticket);
-                        renewal
-                            .lost
-                            .push((ticket, found.map(|claim| claim.holder())));
-                    }
+                head => match settle(at, &checkout, &ticket, head.map(String::as_str), &runner) {
+                    Ok(Settled::Adopted) => renewal.adopted.push(ticket),
+                    Ok(Settled::Lost(holder)) => renewal.lost.push((ticket, holder)),
                     Err(why) => renewal.failed = Some(why),
                 },
-                None => {
-                    remove_record(at.dirs, &ticket);
-                    renewal.lost.push((ticket, None));
-                }
             }
         }
         due = again;

@@ -356,6 +356,7 @@ pub fn run(system: &dyn System, config: &Effective, own: &BuildIdentity) -> Repo
     checks.extend(people_check(config, operator.as_ref()));
     checks.extend(team_gesture_check(config));
     checks.extend(claims_check(config));
+    checks.extend(unread_claims_check(system, config));
     checks.extend(markdown_takes_check(config, repo));
     checks.extend(forge_reviewers_check(config));
     checks.extend(resolver_check(config));
@@ -1564,6 +1565,59 @@ fn claims_check(config: &Effective) -> Option<Check> {
             ),
         )
     })
+}
+
+/// The claims of other runners this binary cannot read, under `claims =
+/// "remote"` (OWL-587; build plan "Other runners' tickets", "A claim this
+/// binary cannot read"), as the dedicated checkout last fetched them: each
+/// is never taken and holds nothing this runner can name. A warning that
+/// says to upgrade when one is of a later format; nothing when all read or
+/// none was fetched.
+fn unread_claims_check(system: &dyn System, config: &Effective) -> Option<Check> {
+    const SUBJECT: &str = "claims";
+    let FileState::Loaded {
+        path,
+        config: project,
+        ..
+    } = &config.project
+    else {
+        return None;
+    };
+    if project.policy.claims() != Claims::Remote {
+        return None;
+    }
+    let unread = match system.unread_claims(path.parent()?) {
+        Ok(Some(unread)) if !unread.is_empty() => unread,
+        Ok(_) => return None,
+        Err(why) => {
+            return Some(Check::info(
+                Section::Project,
+                SUBJECT,
+                format!("the claims of other runners were not read: {why}"),
+            ));
+        }
+    };
+    let tickets: Vec<&str> = unread.iter().map(|(ticket, _)| ticket.as_str()).collect();
+    let newer = unread.iter().any(|(_, newer)| *newer);
+    let fix = if newer {
+        "upgrade Owlshift: a later version wrote them, and this one cannot read them".to_owned()
+    } else {
+        format!(
+            "their claims on origin do not read: the people whose runners hold {} release them \
+             or claim them again",
+            tickets.join(", ")
+        )
+    };
+    Some(Check::warn(
+        Section::Project,
+        SUBJECT,
+        format!(
+            "{} claimed on origin by a claim this runner cannot read: never taken here, and \
+             holding nothing it can name",
+            tickets.join(", ")
+        ),
+        format!("{DOES_NOT_BLOCK} {fix}."),
+    ))
 }
 
 /// A Markdown project whose personal file names no `identity.tracker`
@@ -4894,6 +4948,30 @@ states = { ready = "Todo", working = "Doing", needs_input = "Asked", review = "R
         assert!(claims_check(&config).is_none());
         let (_dir, config) = project_tracked_by(LABELLED_TRACKER);
         assert!(claims_check(&config).is_none());
+    }
+
+    /// OWL-587: under remote claims, a claim of a later format says to
+    /// upgrade; claims that all read, or a project whose claims are local,
+    /// say nothing.
+    #[test]
+    fn a_claim_of_a_later_format_says_to_upgrade() {
+        let (_dir, remote) = project_tracked_with(LABELLED_TRACKER, "claims = \"remote\"");
+        let unread =
+            |answer: Vec<(TicketId, bool)>| FakeSystem::default().unread_claims_are(Ok(answer));
+        let demo = TicketId::new("DEMO-7").unwrap();
+        let warned = unread_claims_check(&unread(vec![(demo.clone(), true)]), &remote).unwrap();
+        assert_eq!(warned.status, Status::Warn);
+        assert!(
+            warned.detail.starts_with("DEMO-7 claimed on origin"),
+            "{warned:?}"
+        );
+        assert!(
+            warned.why.as_deref().unwrap().contains("upgrade Owlshift"),
+            "{warned:?}"
+        );
+        assert!(unread_claims_check(&unread(Vec::new()), &remote).is_none());
+        let (_dir, local) = project_tracked_by(LABELLED_TRACKER);
+        assert!(unread_claims_check(&unread(vec![(demo, true)]), &local).is_none());
     }
 
     /// OWL-583: a Markdown project whose personal file names no

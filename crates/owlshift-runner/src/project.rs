@@ -926,6 +926,9 @@ pub fn sync_checkout_within(
                 message
             })?;
         remove_file_if_any(&marker).map_err(|e| io_failed(&marker, e))?;
+        // A clone brings no claim: other runners' come with the first
+        // command too (OWL-587).
+        crate::claims::fetch_within(git, &checkout, Some(clone_timeout))?;
     } else {
         // Runs in flight read what this writes (OWL-400, live check (f)):
         // `set-url` takes `config.lock`, which a second writer at the same
@@ -952,12 +955,17 @@ pub fn sync_checkout_within(
             ];
             git.run(&checkout, &args).map_err(usable)?;
         }
-        let fetch: &[&str] = if in_flight {
-            &["fetch", "--quiet", "--no-tags", "--prune", "origin"]
-        } else {
-            &["fetch", "--quiet", "--prune", "origin"]
-        };
-        git.run(&checkout, fetch).map_err(failed)?;
+        // The claims of other runners come with it (OWL-587): the refspec
+        // added for this fetch alone, the configured one left as it was
+        // (checked 2026-11-20, git 2.54.0), so a claim deleted on `origin`
+        // is pruned too.
+        let claims = format!("remote.origin.fetch={}", crate::claims::CLAIMS_REFSPEC);
+        let mut fetch: Vec<&str> = vec!["-c", &claims, "fetch", "--quiet"];
+        if in_flight {
+            fetch.push("--no-tags");
+        }
+        fetch.extend(["--prune", "origin"]);
+        git.run(&checkout, &fetch).map_err(failed)?;
         set_head(git, &checkout)?;
     }
     // `worktree prune` removes entries a run in flight's check reads: it

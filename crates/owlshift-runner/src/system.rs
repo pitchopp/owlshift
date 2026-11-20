@@ -140,6 +140,36 @@ pub trait System {
             .map(Some)
             .map_err(|_| "git could not list them in the dedicated checkout".to_owned())
     }
+    /// Whether the claims of other runners the dedicated checkout of the
+    /// project whose repository is at `root` last fetched read (OWL-587):
+    /// one entry per claim that does not, `true` when written in a later
+    /// format; `None` when the project has no dedicated checkout yet.
+    /// Nothing is fetched. Only `owlshift doctor` asks.
+    fn unread_claims(&self, root: &Path) -> Result<Option<Vec<(TicketId, bool)>>, String> {
+        let git = crate::project::runner_git();
+        let repo = crate::on_demand::check_origin(&crate::project::origin_url(&git, root)?)?;
+        let (data_dir, _) = self
+            .data_dir()
+            .ok_or_else(|| "this system has no data directory".to_owned())?;
+        let checkout = crate::project::ProjectDirs::new(&data_dir, &repo).checkout();
+        if !checkout_exists(&checkout)? {
+            return Ok(None);
+        }
+        // git's own words stay out of the report (live check C8).
+        let listing = ticket_ref::listing_with(&git, &checkout, true)
+            .map_err(|_| "git could not list them in the dedicated checkout".to_owned())?;
+        let listing = ticket_ref::Listing {
+            refs: Vec::new(),
+            ..listing
+        };
+        let (_, claims) = ticket_ref::read_listing(&git, &checkout, listing);
+        Ok(Some(
+            claims
+                .into_iter()
+                .filter_map(|claim| claim.claim.err().map(|why| (claim.ticket, why.newer)))
+                .collect(),
+        ))
+    }
     /// Where the quarantine of the project whose repository is at `root`
     /// stands, with its runs' obligations ([`crate::quarantine::state`],
     /// OWL-368, OWL-400), found
@@ -421,6 +451,9 @@ pub mod fake {
         /// What reading the project's ticket refs gives; `None`: no
         /// dedicated checkout.
         ticket_refs: Option<Result<Vec<(TicketId, RefState)>, String>>,
+        /// The claims of other runners that do not read, each `true` when of
+        /// a later format (OWL-587); `None`: no dedicated checkout.
+        unread_claims: Option<Result<Vec<(TicketId, bool)>, String>>,
         /// Where the project's marker stands; `None`: there is none.
         quarantine: Option<Result<MarkerState, String>>,
         /// What reading the project file at the default branch gives;
@@ -594,6 +627,15 @@ pub mod fake {
             self
         }
 
+        /// The claims that do not read are these, or this error (OWL-587).
+        pub(crate) fn unread_claims_are(
+            mut self,
+            answer: Result<Vec<(TicketId, bool)>, String>,
+        ) -> Self {
+            self.unread_claims = Some(answer);
+            self
+        }
+
         /// Reading the project's ticket refs gives these, or this error.
         pub(crate) fn ticket_refs_are(
             mut self,
@@ -696,6 +738,12 @@ pub mod fake {
         /// answer; never git.
         fn ticket_refs(&self, _root: &Path) -> Result<Option<Vec<(TicketId, RefState)>>, String> {
             self.ticket_refs.clone().transpose()
+        }
+
+        /// No dedicated checkout unless [`Self::unread_claims_are`] gave an
+        /// answer; never git.
+        fn unread_claims(&self, _root: &Path) -> Result<Option<Vec<(TicketId, bool)>>, String> {
+            self.unread_claims.clone().transpose()
         }
 
         /// As [`Self::service_is`] scripted it; never the disk.
