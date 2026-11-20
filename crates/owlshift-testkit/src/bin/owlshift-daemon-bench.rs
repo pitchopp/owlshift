@@ -14,7 +14,8 @@
 //!
 //! The real watch is `owlshift watch --drain` on that project: the Markdown
 //! tracker, the harness the file names, each step in a child,
-//! `owlshift-step-child` beside this binary, taking the project's machine
+//! `owlshift-step-child` at the path `OWLSHIFT_BENCH_STEP_CHILD` gives (the
+//! test's copy of it, OWL-611), taking the project's machine
 //! slots. It stops by degrees as `owlshift watch` does, its checked stop
 //! bounded by `CHECKED_STOP_BOUND`, and passes until a stop is asked of it,
 //! adding a byte to `<data>/bench/demo-project/passes` after each pass.
@@ -198,11 +199,10 @@ fn run_drain(data: &Path, repo: &str) -> ExitCode {
         );
         return ExitCode::from(2);
     }
-    let exe = std::env::current_exe().unwrap();
-    let child = exe.with_file_name(format!(
-        "owlshift-step-child{}",
-        std::env::consts::EXE_SUFFIX
-    ));
+    // Not cargo's, which a cargo command may be writing again (OWL-611).
+    let child = PathBuf::from(
+        std::env::var_os("OWLSHIFT_BENCH_STEP_CHILD").expect("OWLSHIFT_BENCH_STEP_CHILD"),
+    );
     let parsed = Repo::parse(repo).unwrap();
     let bench = bench_dir(data, &parsed);
     fs::create_dir_all(&bench).unwrap();

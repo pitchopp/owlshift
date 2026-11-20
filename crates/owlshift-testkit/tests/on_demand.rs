@@ -1959,7 +1959,7 @@ impl Bench {
             })
             .collect();
         let harness = Replies {
-            program: PathBuf::from(env!("CARGO_BIN_EXE_owlshift-fake-harness")),
+            program: owlshift_testkit::binary!("owlshift-fake-harness").to_path_buf(),
             replies: RefCell::new(replies),
             current: RefCell::new(None),
             first: RefCell::new(first),

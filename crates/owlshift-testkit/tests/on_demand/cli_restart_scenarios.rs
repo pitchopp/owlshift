@@ -14,8 +14,12 @@ use owlshift_testkit::step_child::{
     self, ChildProject, REPO, TICKET, record_of, served_parked_at_build,
 };
 
-const BIN: &str = env!("CARGO_BIN_EXE_owlshift-cli-bench");
-const FAKE_HARNESS: &str = env!("CARGO_BIN_EXE_owlshift-fake-harness");
+fn cli_bench() -> &'static Path {
+    owlshift_testkit::binary!("owlshift-cli-bench")
+}
+fn fake_harness() -> &'static Path {
+    owlshift_testkit::binary!("owlshift-fake-harness")
+}
 
 /// `text` with each compact time, as in a run's folder or a comment's file
 /// (`20261111T014649Z`), and the suffix a second name in the same second
@@ -66,7 +70,7 @@ struct Restarted {
 /// no route to the network: git reaches the bare remote through the bench's
 /// configuration, and anything else goes to a proxy that answers nothing.
 fn restart_on(root: &Path, from_ui: bool) -> Restarted {
-    let project = served_parked_at_build(root, PathBuf::from(FAKE_HARNESS));
+    let project = served_parked_at_build(root, fake_harness().to_path_buf());
     let before = step_child::events(&project.data).len();
     // `claude` only has to be found: a restart runs nothing.
     let bin = root.join("bin");
@@ -78,7 +82,7 @@ fn restart_on(root: &Path, from_ui: bool) -> Restarted {
     fs::create_dir_all(&config).unwrap();
 
     let mut command = restart_command(
-        Path::new(BIN),
+        cli_bench(),
         &Repo::parse(REPO).unwrap(),
         &TicketId::new(TICKET).unwrap(),
     );
@@ -89,7 +93,7 @@ fn restart_on(root: &Path, from_ui: bool) -> Restarted {
             .filter(|arg| *arg != "--from-ui")
             .map(ToOwned::to_owned)
             .collect();
-        let mut typed = Command::new(BIN);
+        let mut typed = Command::new(cli_bench());
         typed
             .args(args)
             .stdin(std::process::Stdio::null())

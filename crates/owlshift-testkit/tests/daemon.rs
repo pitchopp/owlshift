@@ -51,9 +51,17 @@ use owlshift_testkit::step_child::{
 };
 use owlshift_testkit::wait;
 
-const BENCH: &str = env!("CARGO_BIN_EXE_owlshift-daemon-bench");
+fn daemon_bench() -> &'static Path {
+    owlshift_testkit::binary!("owlshift-daemon-bench")
+}
+/// The step's child the daemon bench's real watch starts.
+fn step_child_binary() -> &'static Path {
+    owlshift_testkit::binary!("owlshift-step-child")
+}
 /// The fake harness.
-const FAKE: &str = env!("CARGO_BIN_EXE_owlshift-fake-harness");
+fn fake() -> &'static Path {
+    owlshift_testkit::binary!("owlshift-fake-harness")
+}
 
 /// The bench's timings, in milliseconds: a pass a second, a look every
 /// 50 ms, restarts after 300 ms doubling up to 1.2 s, reset after 5 s.
@@ -127,7 +135,7 @@ impl Bench {
                 .open(self.tmp.path().join(name))
                 .unwrap()
         };
-        let mut daemon = Command::new(BENCH);
+        let mut daemon = Command::new(daemon_bench());
         daemon
             .arg("daemon")
             .env("OWLSHIFT_DATA_DIR", self.data())
@@ -137,7 +145,9 @@ impl Bench {
             .stdout(output("out"))
             .stderr(output("err"));
         if let Some(project) = &self.project {
-            daemon.env("OWLSHIFT_BENCH_PROJECT", project);
+            daemon
+                .env("OWLSHIFT_BENCH_PROJECT", project)
+                .env("OWLSHIFT_BENCH_STEP_CHILD", step_child_binary());
         }
         if let Some((commit, built_at)) = &self.build {
             daemon
@@ -530,7 +540,7 @@ fn a_watch_that_cannot_serve_pauses_its_project_until_one_serves() {
 fn real_watch(bench: &mut Bench) {
     let root = bench.tmp.path().to_owned();
     let machine = root.join("machine");
-    let mut project = ChildProject::seed_parallel(&root, PathBuf::from(FAKE), 0, 1, (&machine, 1));
+    let mut project = ChildProject::seed_parallel(&root, fake().to_path_buf(), 0, 1, (&machine, 1));
     project.notes = Some(bench.notes_file());
     let file = root.join("project.toml");
     project.save(&file);
@@ -712,7 +722,7 @@ fn s11_a_checked_stop_resumes_both_builds_and_a_kill_quarantines() {
     fs::write(plays.join("hold"), "").unwrap();
     let harness = holding_harness(
         &plays,
-        Path::new(FAKE),
+        fake(),
         "build",
         CHECKPOINT,
         &format!("exec sleep {}", wait::OUTLASTS.as_secs()),
@@ -845,7 +855,7 @@ fn a_canceled_build_is_stopped_checked_and_parked_then_resumed_from_its_checkpoi
     fs::write(plays.join("hold"), "").unwrap();
     let harness = holding_harness(
         &plays,
-        Path::new(FAKE),
+        fake(),
         "build",
         CHECKPOINT,
         &format!("exec sleep {}", wait::OUTLASTS.as_secs()),
@@ -1005,7 +1015,7 @@ fn an_upgrade_drain_lets_the_steps_under_way_finish_then_exits_75() {
     fs::write(plays.join("hold"), "").unwrap();
     let harness = holding_harness(
         &plays,
-        Path::new(FAKE),
+        fake(),
         "build",
         CHECKPOINT,
         "while [ -e \"$dir/hold\" ]; do sleep 0.1; done",
@@ -1044,7 +1054,7 @@ fn an_upgrade_drain_lets_the_steps_under_way_finish_then_exits_75() {
     install::install(&Install {
         data: &data,
         layout: &layout,
-        binary: Path::new(BENCH),
+        binary: daemon_bench(),
         config_dir: None,
         path: None,
     })
@@ -1062,7 +1072,7 @@ fn an_upgrade_drain_lets_the_steps_under_way_finish_then_exits_75() {
         "two builds: {running:?}"
     );
     assert_eq!(
-        upgrade::hand_over(&data, own, Path::new(BENCH), "owlshift start"),
+        upgrade::hand_over(&data, own, daemon_bench(), "owlshift start"),
         Ok(Handover::Ask(running))
     );
     bench.wait_for("the watch to drain on its stop file", || {

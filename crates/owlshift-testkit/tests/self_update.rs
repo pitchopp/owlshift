@@ -22,7 +22,9 @@ use std::sync::{Arc, Mutex};
 
 use sha2::{Digest, Sha256};
 
-const BIN: &str = env!("CARGO_BIN_EXE_owlshift-cli-bench");
+fn bin() -> &'static Path {
+    owlshift_testkit::binary!("owlshift-cli-bench")
+}
 
 /// The secret half of `owlshift_testkit::release::BENCH_RELEASE_KEY`, made
 /// with the `minisign` crate on 2026-11-12: test only, it signs nothing
@@ -201,8 +203,8 @@ fn bench_key() -> minisign::SecretKey {
 fn install(folder: &Path) -> PathBuf {
     fs::create_dir_all(folder).unwrap();
     let at = folder.join("owlshift");
-    if fs::hard_link(BIN, &at).is_err() {
-        fs::copy(BIN, &at).unwrap();
+    if fs::hard_link(bin(), &at).is_err() {
+        fs::copy(bin(), &at).unwrap();
     }
     at
 }

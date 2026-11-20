@@ -14,7 +14,9 @@ use owlshift_runner::ui::token;
 use super::overview_scenarios::browsers_bench;
 use super::*;
 
-const BIN: &str = env!("CARGO_BIN_EXE_owlshift-ui-bench");
+fn ui_bench_binary() -> &'static Path {
+    owlshift_testkit::binary!("owlshift-ui-bench")
+}
 
 /// The server, ended with the test.
 struct Serving(Child);
@@ -75,7 +77,7 @@ fn request(port: u16, method: &str, path: &str, session: Option<&str>, body: &st
 }
 
 fn bin(command: &str, data: &Path) -> std::process::Output {
-    Command::new(BIN)
+    Command::new(ui_bench_binary())
         .arg(command)
         .arg(data)
         .output()
@@ -98,7 +100,7 @@ fn the_bench_binary_serves_the_overview_and_its_mutators_change_it() {
     let bench = browsers_bench(None);
     let data = bench.data.clone();
 
-    let mut child = Command::new(BIN)
+    let mut child = Command::new(ui_bench_binary())
         .arg("serve")
         .arg(&data)
         .args(["--port", "0"])
