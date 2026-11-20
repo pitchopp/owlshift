@@ -74,8 +74,8 @@ use owlshift_core::ticket::{Admission, Blocker, BlockerState, Ticket, text_block
 use owlshift_core::vocab::{Harness, Stage};
 
 use super::{Admit, Continued, Memory as WatchMemory, RETRY_AFTER, Seen, Then, Watch};
-use crate::events::{Data, EventSink, data};
 use crate::claims::FetchedClaim;
+use crate::events::{Data, EventSink, data};
 use crate::in_flight::{self, Kind, Outside};
 use crate::on_demand::{self, delivery_followed};
 use crate::operator::{self, Taking};

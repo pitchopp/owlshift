@@ -414,7 +414,8 @@ fn named(git: &Git, checkout: &Path, claims: bool) -> Result<(Vec<Named>, Vec<Na
     let (mut refs, mut fetched) = (Vec::new(), Vec::new());
     for line in String::from_utf8_lossy(&out).lines() {
         let mut fields = line.splitn(3, ' ');
-        let (Some(oid), Some(symref), Some(refname)) = (fields.next(), fields.next(), fields.next())
+        let (Some(oid), Some(symref), Some(refname)) =
+            (fields.next(), fields.next(), fields.next())
         else {
             continue;
         };

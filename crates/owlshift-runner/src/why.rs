@@ -316,11 +316,7 @@ pub fn phrase(wait: &Waiting) -> String {
                     .and_then(Value::as_str)
                     .and_then(|at| at.parse::<jiff::Timestamp>().ok())
                     .is_some_and(|at| at < wait.at);
-                let lease = if expired {
-                    ", its claim expired,"
-                } else {
-                    ""
-                };
+                let lease = if expired { ", its claim expired," } else { "" };
                 format!(
                     "{}, which {operator}'s runner works{lease}, holds",
                     list("tickets")

@@ -4956,13 +4956,15 @@ states = { ready = "Todo", working = "Doing", needs_input = "Asked", review = "R
     #[test]
     fn a_claim_of_a_later_format_says_to_upgrade() {
         let (_dir, remote) = project_tracked_with(LABELLED_TRACKER, "claims = \"remote\"");
-        let unread = |answer: Vec<(TicketId, bool)>| {
-            FakeSystem::default().unread_claims_are(Ok(answer))
-        };
+        let unread =
+            |answer: Vec<(TicketId, bool)>| FakeSystem::default().unread_claims_are(Ok(answer));
         let demo = TicketId::new("DEMO-7").unwrap();
         let warned = unread_claims_check(&unread(vec![(demo.clone(), true)]), &remote).unwrap();
         assert_eq!(warned.status, Status::Warn);
-        assert!(warned.detail.starts_with("DEMO-7 claimed on origin"), "{warned:?}");
+        assert!(
+            warned.detail.starts_with("DEMO-7 claimed on origin"),
+            "{warned:?}"
+        );
         assert!(
             warned.why.as_deref().unwrap().contains("upgrade Owlshift"),
             "{warned:?}"

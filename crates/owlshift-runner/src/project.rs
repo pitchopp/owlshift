@@ -926,6 +926,9 @@ pub fn sync_checkout_within(
                 message
             })?;
         remove_file_if_any(&marker).map_err(|e| io_failed(&marker, e))?;
+        // A clone brings no claim: other runners' come with the first
+        // command too (OWL-587).
+        crate::claims::fetch_within(git, &checkout, Some(clone_timeout))?;
     } else {
         // Runs in flight read what this writes (OWL-400, live check (f)):
         // `set-url` takes `config.lock`, which a second writer at the same

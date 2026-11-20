@@ -118,24 +118,29 @@ pub struct ClaimUnread {
 
 /// Fetches every claim of `origin` alone into [`FETCHED_PREFIX`], the
 /// claims deleted there pruned, nothing else touched (live check T2): what
-/// watch makes once a minute under `remote` (OWL-587). A failed fetch says
-/// why, in git's last line.
+/// watch makes once a minute under `remote` (OWL-587), within the runner
+/// git's deadline. A failed fetch says why, in git's last line.
 pub fn fetch(git: &Git, checkout: &Path) -> Result<(), String> {
-    let out = git
-        .output(
-            checkout,
-            &[
-                "fetch",
-                "--quiet",
-                "--no-tags",
-                "--prune",
-                "--no-write-fetch-head",
-                REMOTE,
-                CLAIMS_REFSPEC,
-            ],
-            None,
-        )
-        .map_err(|e| format!("fetching {REMOTE}'s claims: {e}"))?;
+    fetch_within(git, checkout, None)
+}
+
+/// [`fetch`] within `deadline`, the runner git's when `None`: a first
+/// clone's fetch of the claims shares the clone's own.
+pub fn fetch_within(git: &Git, checkout: &Path, deadline: Option<Duration>) -> Result<(), String> {
+    let args = [
+        "fetch",
+        "--quiet",
+        "--no-tags",
+        "--prune",
+        "--no-write-fetch-head",
+        REMOTE,
+        CLAIMS_REFSPEC,
+    ];
+    let out = match deadline {
+        Some(deadline) => git.output_within(checkout, &args, None, deadline),
+        None => git.output(checkout, &args, None),
+    }
+    .map_err(|e| format!("fetching {REMOTE}'s claims: {e}"))?;
     if out.success() {
         return Ok(());
     }
@@ -174,7 +179,7 @@ pub struct Checked {
 /// whose record was written before the fetch started, and that the fetch
 /// shows gone or at a commit its record does not know, is read again under
 /// its claim's lock, a single try: one `ls-remote` for all such, then as a
-/// renewal reads a refusal ([`settle`]). A record written since, a command
+/// renewal reads a refusal. A record written since, a command
 /// having just taken or pushed it, or any read that fails, loses nothing.
 pub fn check_fetched(
     at: ClaimsAt<'_>,
@@ -201,9 +206,7 @@ pub fn check_fetched(
             continue;
         };
         if record.claim.runner != runner.as_str()
-            || fetched
-                .get(&ticket)
-                .is_some_and(|oid| known(&record, oid))
+            || fetched.get(&ticket).is_some_and(|oid| known(&record, oid))
         {
             continue;
         }

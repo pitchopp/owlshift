@@ -2043,9 +2043,10 @@ impl OnDemand<'_> {
                         locked.load.open_prs = locked.load.open_prs.saturating_add(1);
                     }
                     if held::holds(stored) {
-                        locked
-                            .in_flight
-                            .push(held::by_claim(held::in_flight(ticket, stored, named), &times));
+                        locked.in_flight.push(held::by_claim(
+                            held::in_flight(ticket, stored, named),
+                            &times,
+                        ));
                     }
                 }
                 Err(_) => {

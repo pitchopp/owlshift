@@ -123,9 +123,9 @@ impl Watch<'_> {
             }
             let paths: Vec<String> =
                 held::overlaps_of(ticket, stored.record.held.as_ref(), read, &claimed)
-                .into_iter()
-                .flat_map(|(_, paths)| paths)
-                .collect();
+                    .into_iter()
+                    .flat_map(|(_, paths)| paths)
+                    .collect();
             if paths.is_empty() {
                 memory.refreshes.checked.remove(ticket);
                 continue;

@@ -25,6 +25,7 @@ use std::fmt;
 
 use serde_json::{Value, json};
 
+use jiff::Timestamp;
 use owlshift_adapters::forge::github::GitHubForge;
 use owlshift_adapters::forge::{CommitId, OpenPullRequest, PullFiles};
 use owlshift_adapters::tracker::{Author, Ticket, Tracker};
@@ -33,7 +34,6 @@ use owlshift_contracts::config::ProjectConfig;
 use owlshift_contracts::format::Format;
 use owlshift_contracts::ids::TicketId;
 use owlshift_contracts::step::{OutsidePull, OutsideTicket, StepOutside};
-use jiff::Timestamp;
 use owlshift_core::collision::{Collision, Dispatched, InFlight};
 use owlshift_core::decider::declared_zones;
 use owlshift_core::resource::{self, NamedResources, Resource};
@@ -313,7 +313,7 @@ impl Outside {
     /// for joins that claim, delivered. Any other is another pull request,
     /// one a ticket delivered and no longer follows included. A claim that
     /// reads, of a ticket no ref of the project holds, is an Owlshift ticket
-    /// weighed at its claim's time ([`claimed`]). A ticket of the working
+    /// weighed at its claim's time. A ticket of the working
     /// state is a person's unless a ref that holds, one that cannot be read,
     /// or a claim, read or not, is its own; it holds its labels' zones, the
     /// whole repository for a malformed `zone:` label, and with no label it
@@ -834,7 +834,13 @@ mod tests {
         assert_eq!(
             others,
             [
-                ("#11", Dispatched::Unrecorded, true, true, &[zone("lib/z.rs")][..]),
+                (
+                    "#11",
+                    Dispatched::Unrecorded,
+                    true,
+                    true,
+                    &[zone("lib/z.rs")][..]
+                ),
                 ("DEMO-40", Dispatched::At(100), false, false, &one[..]),
                 ("DEMO-42", Dispatched::At(300), true, false, &both[..]),
             ]
