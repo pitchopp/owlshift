@@ -12370,6 +12370,11 @@ mod cancel_scenarios;
 #[path = "on_demand/claims_scenarios.rs"]
 mod claims_scenarios;
 
+/// Scenario S14 with two runners on one remote and one tracker folder
+/// (OWL-589).
+#[path = "on_demand/team_scenarios.rs"]
+mod team_scenarios;
+
 /// A red check re-run once by the runner before any fix run (OWL-513).
 #[path = "on_demand/rerun_scenarios.rs"]
 mod rerun_scenarios;

@@ -2509,7 +2509,7 @@ fn two_people() -> Bench {
 }
 
 /// What the ready snapshot made of `id`: its kind and its wait's words.
-fn made_now(bench: &Bench, id: &str) -> (&'static str, String) {
+pub(super) fn made_now(bench: &Bench, id: &str) -> (&'static str, String) {
     let snapshot = ready_now(bench).expect("a snapshot");
     let ticket = snapshot
         .tickets
