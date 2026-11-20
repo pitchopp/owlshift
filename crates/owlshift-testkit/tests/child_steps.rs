@@ -36,9 +36,13 @@ use owlshift_testkit::step_child::{
 use owlshift_testkit::wait;
 
 /// The step's child.
-const CHILD: &str = env!("CARGO_BIN_EXE_owlshift-step-child");
+fn child() -> &'static Path {
+    owlshift_testkit::binary!("owlshift-step-child")
+}
 /// The fake harness.
-const FAKE: &str = env!("CARGO_BIN_EXE_owlshift-fake-harness");
+fn fake() -> &'static Path {
+    owlshift_testkit::binary!("owlshift-fake-harness")
+}
 
 fn ticket() -> TicketId {
     TicketId::new(TICKET).unwrap()
@@ -59,7 +63,7 @@ fn setup(harness: Option<PathBuf>) -> Setup {
         .prefix("owlshift child ")
         .tempdir()
         .unwrap();
-    let harness = harness.unwrap_or_else(|| PathBuf::from(FAKE));
+    let harness = harness.unwrap_or_else(|| fake().to_path_buf());
     let project = ChildProject::seed(tmp.path(), harness);
     project.play(Reply::default(), Some(&intake_done()));
     let file = tmp.path().join("project.toml");
@@ -69,7 +73,7 @@ fn setup(harness: Option<PathBuf>) -> Setup {
 
 /// The children of the project whose paths `file` keeps.
 fn children(file: &Path) -> Children<'static> {
-    step_children(file, Path::new(CHILD))
+    step_children(file, child())
 }
 
 /// One pass of `owlshift watch --drain`, its steps in children: watch's
@@ -435,9 +439,10 @@ fn two_watches_of_two_projects_share_the_machine_s_slots() {
         &script,
         format!(
             "#!/bin/sh\nmkdir '{running}/'$$\nls '{running}' | wc -l >> '{counts}'\nsleep 1\n\
-             rmdir '{running}/'$$\nexec '{FAKE}' \"$@\"\n",
+             rmdir '{running}/'$$\nexec '{fake}' \"$@\"\n",
             running = running.display(),
             counts = counts.display(),
+            fake = fake().display(),
         ),
     )
     .unwrap();
@@ -531,8 +536,9 @@ fn playing_harness(dir: &Path, group: &str, builds: usize, typed: Option<&str>) 
              ls \"$dir/running\" | wc -l | tr -d ' ' >> \"$dir/counts\"\n  \
              touch \"$dir/counted/{group}/$ticket\"\n  gather counted\n{stay}  \
              rmdir \"$dir/running/$$\"\nfi\n\
-             exec '{FAKE}' --brief \"$brief\" --reply \"$reply\"\n",
+             exec '{fake}' --brief \"$brief\" --reply \"$reply\"\n",
             dir = dir.display(),
+            fake = fake().display(),
         ),
     )
     .unwrap();
@@ -599,7 +605,7 @@ fn three_tickets_build_at_once_and_a_do_typed_meanwhile_waits() {
     reply_for(&plays, "build", None, &build_asks());
     // The file the project's paths will be kept in, which `do` reads.
     let file = tmp.path().join("project.toml");
-    let typed = format!("'{CHILD}' '{}' DEMO-4 do", file.display());
+    let typed = format!("'{}' '{}' DEMO-4 do", child().display(), file.display());
     let harness = playing_harness(&plays, "one", 3, Some(&typed));
     let s = parallel_setup(&harness, 3, 4, (&machine, 3));
     s.project.add_ticket("DEMO-4", &[], "");
@@ -825,7 +831,7 @@ fn a_drain_lets_the_step_under_way_finish() {
     let stop = owlshift_runner::watch::stop::file(&dirs);
     let before = format!("touch '{}'", stop.display());
     let mut project = s.project.clone();
-    project.harness = holding_harness(&plays, Path::new(FAKE), "intake", &before, "sleep 1");
+    project.harness = holding_harness(&plays, fake(), "intake", &before, "sleep 1");
     project.add_ticket("DEMO-2", &["agent"], "");
     project.save(&s.file);
     let lines = drain_every(&project, &children(&s.file), POLL_INTERVAL, |pass| {
@@ -870,7 +876,7 @@ fn a_pause_lets_the_step_under_way_finish_and_starts_nothing_until_resumed() {
     // Only DEMO-1's intake writes it: the hold goes with it.
     let before = format!("touch '{}'; rm \"$dir/hold\"", pause.display());
     let mut project = s.project.clone();
-    project.harness = holding_harness(&plays, Path::new(FAKE), "intake", &before, "sleep 1");
+    project.harness = holding_harness(&plays, fake(), "intake", &before, "sleep 1");
     project.add_ticket("DEMO-2", &["agent"], "");
     project.save(&s.file);
     let demo2 = TicketId::new("DEMO-2").unwrap();
@@ -956,7 +962,7 @@ fn a_sigterm_during_two_builds_checks_both_and_both_resume() {
     }
     reply_for(&plays, "build", None, &build_asks());
     fs::write(plays.join("hold"), "").unwrap();
-    let harness = holding_harness(&plays, Path::new(FAKE), "build", ":", &hold_until_cut());
+    let harness = holding_harness(&plays, fake(), "build", ":", &hold_until_cut());
     let s = parallel_setup(&harness, 2, 2, (&machine, 2));
     s.project.move_ticket("DEMO-9", "Done");
     let log = tmp.path().join("watch.log");
@@ -1030,7 +1036,7 @@ fn a_build_canceled_in_watch_s_own_process_stops_and_parks_the_watch_going_on() 
     reply_for(&plays, "intake", Some(TICKET), &intake_declaring(&["a"]));
     reply_for(&plays, "build", None, &build_asks());
     fs::write(plays.join("hold"), "").unwrap();
-    let harness = holding_harness(&plays, Path::new(FAKE), "build", ":", &hold_until_cut());
+    let harness = holding_harness(&plays, fake(), "build", ":", &hold_until_cut());
     let s = parallel_setup(&harness, 1, 1, (&machine, 1));
     s.project.move_ticket("DEMO-9", "Done");
     let log = tmp.path().join("watch.log");
@@ -1096,13 +1102,7 @@ fn a_breach_found_at_a_checked_stop_quarantines() {
     let dirs = s.project.dirs();
     let planted = format!("echo planted > '{}/planted'", dirs.checkout().display());
     let mut project = s.project.clone();
-    project.harness = holding_harness(
-        &plays,
-        Path::new(FAKE),
-        "intake",
-        &planted,
-        &hold_until_cut(),
-    );
+    project.harness = holding_harness(&plays, fake(), "intake", &planted, &hold_until_cut());
     project.save(&s.file);
     let log = s.tmp.path().join("watch.log");
     let mut watch = start_watch(&s.file, true, None, &log);
@@ -1148,8 +1148,7 @@ fn sigquit_and_sigkill_of_watch_stop_now_leaving_the_obligation() {
         fs::create_dir_all(&plays).unwrap();
         fs::write(plays.join("hold"), "").unwrap();
         let mut project = s.project.clone();
-        project.harness =
-            holding_harness(&plays, Path::new(FAKE), "intake", ":", &hold_until_cut());
+        project.harness = holding_harness(&plays, fake(), "intake", ":", &hold_until_cut());
         project.save(&s.file);
 
         let child_pid = s.tmp.path().join("child.pid");
@@ -1207,8 +1206,9 @@ fn base_wait_harness(dir: &Path) -> PathBuf {
              touch \"$dir/demo2-running\"\n  n=0\n  \
              while [ -e \"$dir/hold\" ] && [ $n -lt 6000 ]; do sleep 0.1; n=$((n+1)); done\n\
              fi\n\
-             exec '{FAKE}' --brief \"$brief\" --reply \"$reply\"\n",
+             exec '{fake}' --brief \"$brief\" --reply \"$reply\"\n",
             dir = dir.display(),
+            fake = fake().display(),
         ),
     )
     .unwrap();

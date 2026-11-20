@@ -1124,7 +1124,7 @@ impl Bench {
         let path = replies.join("reply.toml");
         fs::write(&path, reply.render()).unwrap();
         FakeHarness {
-            program: PathBuf::from(env!("CARGO_BIN_EXE_owlshift-fake-harness")),
+            program: owlshift_testkit::binary!("owlshift-fake-harness").to_path_buf(),
             reply: path,
             readable: Vec::new(),
             sessions: false,

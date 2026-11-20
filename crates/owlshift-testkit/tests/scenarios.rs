@@ -8,7 +8,7 @@ use owlshift_testkit::scenario::{ScenarioError, play, play_str};
 use owlshift_testkit::wait;
 
 fn fake_harness() -> &'static Path {
-    Path::new(env!("CARGO_BIN_EXE_owlshift-fake-harness"))
+    owlshift_testkit::binary!("owlshift-fake-harness")
 }
 
 fn scenarios() -> PathBuf {

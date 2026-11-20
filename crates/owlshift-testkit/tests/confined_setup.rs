@@ -275,7 +275,7 @@ impl Bench {
         };
         fs::write(replies.join("reply.toml"), reply.render()).unwrap();
         let harness = FakeHarness {
-            program: PathBuf::from(env!("CARGO_BIN_EXE_owlshift-fake-harness")),
+            program: owlshift_testkit::binary!("owlshift-fake-harness").to_path_buf(),
             reply: replies.join("reply.toml"),
             readable: self.env.agent_readable(),
             sessions: false,
