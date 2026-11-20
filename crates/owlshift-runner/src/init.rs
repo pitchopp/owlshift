@@ -519,6 +519,10 @@ pub fn write_project_file(root: &Path, text: &str) -> io::Result<Written> {
 pub const MARKDOWN_PAGE: &str =
     "https://github.com/pitchopp/owlshift/blob/main/docs/markdown-tracker.md";
 
+/// Where adopting a project on a team is published (OWL-590): the people
+/// table, the label gesture and claims, which `doctor`'s team lines point to.
+pub const TEAM_PAGE: &str = "https://github.com/pitchopp/owlshift/blob/main/docs/adopt/team.md";
+
 /// The Markdown tracker's limits in one line, which `init` prints.
 pub const MARKDOWN_LIMITS: &str = "The Markdown tracker serves one machine: run `owlshift do` and `owlshift continue` in a \
      checkout. Owlshift commits none of its files, and the daemon does not serve it, so \

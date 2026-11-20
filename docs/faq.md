@@ -40,4 +40,4 @@ What a run sends to the model provider through its CLI (the ticket, the prompts 
 
 ## Can a team use it?
 
-Not yet as a supported setup: release 0.1 serves a project from one operator's runner. Several developers on one project, each with a runner on their own machine and their own subscription, is roadmap step P10, being built on `main` and not finished, its exit gate not yet run ([roadmap](design/roadmap.md#p10--teams)).
+Not yet as a supported setup: release 0.1 serves a project from one operator's runner. Several developers on one project, each with a runner on their own machine and their own subscription, is roadmap step P10, being built on `main` and not finished, its exit gate not yet run ([roadmap](design/roadmap.md#p10--teams)). What it builds so far, and how a developer joins such a project: [Adopt a project on a team](adopt/team.md).

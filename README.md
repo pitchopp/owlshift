@@ -72,6 +72,8 @@ Then follow the page of the tracker your tickets live in. Each takes you from `o
 | GitHub Issues, in the repository itself | [Adopt a project on GitHub Issues](docs/adopt/github-issues.md) |
 | Nowhere yet, or you want to try without an account | [Adopt a project with Markdown tickets](docs/adopt/markdown.md) |
 
+Joining a project that already runs Owlshift, with colleagues who each run their own: [Adopt a project on a team](docs/adopt/team.md).
+
 Questions before you install, on cost, subscription terms, merging, the sandbox or privacy: the [FAQ](docs/faq.md).
 
 Once the first pull request is open, [Configuration recipes](docs/recipes.md) set Owlshift up for your stack and your team.

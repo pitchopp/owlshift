@@ -67,12 +67,12 @@ fn the_served_documentation_keeps_the_sites_rules() {
         out.path(),
     )
     .unwrap_or_else(|errors| panic!("{}", errors.join("\n")));
-    assert_eq!(pages, 10);
+    assert_eq!(pages, 11);
 
     let mut written = Vec::new();
     files(out.path(), "", &mut written);
     let html: Vec<&String> = written.iter().filter(|f| f.ends_with(".html")).collect();
-    assert_eq!(html.len(), 11, "the 10 pages and their index: {written:?}");
+    assert_eq!(html.len(), 12, "the 11 pages and their index: {written:?}");
     let ids_of = |site_path: &str| -> Option<Vec<String>> {
         let text = if site_path.starts_with("docs/") {
             std::fs::read_to_string(join(out.path(), site_path)).ok()?
@@ -138,7 +138,7 @@ fn the_served_documentation_keeps_the_sites_rules() {
         }
     }
     assert!(failures.is_empty(), "{}", failures.join("\n"));
-    // Each page links the 11 of the list, the bar and the foot.
+    // Each page links the 12 of the list, the bar and the foot.
     assert!(links > 200, "{links} links within the site, more expected");
 
     let css = std::fs::read_to_string(out.path().join("docs").join("docs.css")).unwrap();
