@@ -9,6 +9,8 @@ use std::sync::OnceLock;
 
 #[path = "../../owlshift-testkit/src/bin_copy.rs"]
 mod bin_copy;
+#[path = "../../owlshift-testkit/src/stand_in.rs"]
+mod stand_in;
 
 /// Runs `owlshift` in `dir`, with the personal configuration directory and
 /// git's own environment overrides pointed away from the host's.
@@ -630,19 +632,16 @@ fn doctor(args: &[&str]) -> Output {
 /// [`doctor`] with the configuration directory `config_dir`.
 #[cfg(unix)]
 fn doctor_in(config_dir: &Path, args: &[&str]) -> Output {
-    use std::os::unix::fs::PermissionsExt;
-
     let bin = tempfile::tempdir().unwrap();
-    let git = bin.path().join("git");
-    fs::write(
-        &git,
+    // Started once before `doctor` times it with its 10 s probe (OWL-614).
+    stand_in::write(
+        &bin.path().join("git"),
         "#!/bin/sh\n\
          if [ \"$1\" = --version ]; then echo 'git version 2.54.0'; exit 0; fi\n\
          echo 'fatal: not a git repository' >&2\n\
          exit 128\n",
-    )
-    .unwrap();
-    fs::set_permissions(&git, fs::Permissions::from_mode(0o755)).unwrap();
+        &["--version"],
+    );
     let mut all = vec!["doctor"];
     all.extend_from_slice(args);
     command(config_dir, config_dir, &all)
@@ -760,20 +759,19 @@ struct HungProbe {
 impl HungProbe {
     /// Starts `doctor` and waits until the probe and its child run.
     fn start() -> Self {
-        use std::os::unix::fs::PermissionsExt;
         use std::os::unix::process::CommandExt;
         use std::process::Stdio;
 
         // A `git` whose `--version` starts a child that outlives every wait,
         // so that only a stop ends it, records both pids, and waits on the
         // child; anything else answers as git does outside a repository, so
-        // loading the configuration does not hang.
+        // loading the configuration does not hang, and so does its first
+        // start, with no argument, before `doctor` times it (OWL-614).
         let bin = tempfile::tempdir().unwrap();
         let pids = bin.path().join("pids");
-        let git = bin.path().join("git");
-        fs::write(
-            &git,
-            format!(
+        stand_in::write(
+            &bin.path().join("git"),
+            &format!(
                 "#!/bin/sh\n\
                  if [ \"$1\" = --version ]; then\n\
                  \x20 sleep {outlasts} &\n\
@@ -786,9 +784,8 @@ impl HungProbe {
                 pids = pids.display(),
                 outlasts = wait::OUTLASTS.as_secs()
             ),
-        )
-        .unwrap();
-        fs::set_permissions(&git, fs::Permissions::from_mode(0o755)).unwrap();
+            &[],
+        );
 
         let config_dir = tempfile::tempdir().unwrap();
         let report = config_dir.path().join("report");

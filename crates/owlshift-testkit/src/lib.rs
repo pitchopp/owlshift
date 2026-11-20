@@ -19,6 +19,8 @@
 //!   tracker on the bench (OWL-536).
 //! - [`scenario`]: scenario files, their runner, and the stand-in driver that
 //!   runs roles through the executor and plays the writer until it exists.
+//! - [`stand_in`]: executables a test makes, started once before anything
+//!   times them (OWL-614).
 //! - [`step_child`]: a project whose steps run in a real child process, and
 //!   `owlshift-step-child`, the child (OWL-399); the same project served, a
 //!   ticket parked at Build, for `owlshift-cli-bench`, the command line's own
@@ -43,6 +45,7 @@ pub mod issues;
 pub mod release;
 pub mod reply;
 pub mod scenario;
+pub mod stand_in;
 pub mod step_child;
 pub mod system;
 pub mod ui_bench;

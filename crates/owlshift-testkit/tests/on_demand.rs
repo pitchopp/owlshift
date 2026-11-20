@@ -3482,24 +3482,22 @@ fn a_do_whose_agent_cannot_run_is_refused_before_anything() {
 /// before the project's lock (so before its folder exists) and before the
 /// tracker is read. The tracker here reads a folder that does not exist, so
 /// a read would stop with another reason; the stand-in git answers
-/// `--version` and leaves a witness for any other command.
+/// `--version` and leaves a witness for any other command, and is started
+/// once before the floor's 10 s probe times it (OWL-614).
 #[cfg(unix)]
 #[test]
 fn a_git_older_than_the_floor_is_refused_before_the_lock_and_the_tracker() {
-    use std::os::unix::fs::PermissionsExt;
-
     let bench = Bench::new(true);
     let witness = bench.tmp.path().join("other-git-command");
     let script = bench.tmp.path().join("old-git");
-    fs::write(
+    owlshift_testkit::stand_in::write(
         &script,
-        format!(
+        &format!(
             "#!/bin/sh\ncase \"$*\" in\n  *--version*) echo 'git version 2.38.5';;\n  *) : > '{}'; exit 1;;\nesac\n",
             witness.display()
         ),
-    )
-    .unwrap();
-    fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+        &["--version"],
+    );
 
     let executor = on_demand::executor(
         Git::new(&script),

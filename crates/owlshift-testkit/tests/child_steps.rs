@@ -495,11 +495,11 @@ fn two_watches_of_two_projects_share_the_machine_s_slots() {
 /// `dir/release` when it runs out of passes, so a Build still waiting goes
 /// on, and a harness whose `dir` is gone, or that looked 6000 times, exits
 /// with a failure. `typed` is a command the first Build of DEMO-1 runs
-/// once between its two waits, its output in `dir/typed/out`.
+/// once between its two waits, its output in `dir/typed/out`. Started with
+/// no argument, it ends at once, as it does once before the watch times it
+/// with its passes (OWL-614).
 #[cfg(unix)]
 fn playing_harness(dir: &Path, group: &str, builds: usize, typed: Option<&str>) -> PathBuf {
-    use std::os::unix::fs::PermissionsExt;
-
     for sub in [
         "running".to_owned(),
         format!("arrived/{group}"),
@@ -515,10 +515,10 @@ fn playing_harness(dir: &Path, group: &str, builds: usize, typed: Option<&str>) 
     });
     let stay = if builds > 1 { "" } else { "  sleep 2\n" };
     let script = dir.join(format!("harness-{group}.sh"));
-    fs::write(
+    owlshift_testkit::stand_in::write(
         &script,
-        format!(
-            "#!/bin/sh\ndir='{dir}'\nbrief=\"\"\nreply=\"\"\n\
+        &format!(
+            "#!/bin/sh\n[ $# -gt 0 ] || exit 0\ndir='{dir}'\nbrief=\"\"\nreply=\"\"\n\
              while [ $# -gt 0 ]; do\n  case \"$1\" in\n    --brief) brief=\"$2\"; shift 2;;\n    \
              --reply) reply=\"$2\"; shift 2;;\n    *) shift;;\n  esac\ndone\n\
              role=$(sed -n 's/^  \"role\": \"\\([a-z_]*\\)\",$/\\1/p' \"$brief\" | head -n 1)\n\
@@ -540,9 +540,8 @@ fn playing_harness(dir: &Path, group: &str, builds: usize, typed: Option<&str>) 
             dir = dir.display(),
             fake = fake().display(),
         ),
-    )
-    .unwrap();
-    fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+        &[],
+    );
     script
 }
 
