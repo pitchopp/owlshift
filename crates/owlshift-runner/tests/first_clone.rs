@@ -14,6 +14,12 @@ use owlshift_runner::executor::Git;
 use owlshift_runner::project::{ProjectDirs, sync_checkout_within};
 use tempfile::TempDir;
 
+/// The testkit's, which this crate cannot depend on: the testkit depends on
+/// it.
+#[cfg(unix)]
+#[path = "../../owlshift-testkit/src/stand_in.rs"]
+mod stand_in;
+
 /// What the tests clone. Nothing answers at this address: git reaches the
 /// remote through the transport command of [`Bench::git`].
 const REMOTE_URL: &str = "ssh://example.invalid/project";
@@ -197,24 +203,22 @@ fn a_clone_an_earlier_run_did_not_finish_is_cloned_anew() {
 /// OWL-205: a git older than the floor is refused before the project's
 /// folder is created or the checkout touched, in Owlshift's words with the
 /// fix steps `owlshift doctor` gives. The stand-in answers `--version` and
-/// leaves a witness for any other command.
+/// leaves a witness for any other command; it is started once before the
+/// floor's 10 s probe times it (OWL-614).
 #[cfg(unix)]
 #[test]
 fn a_git_older_than_the_floor_is_refused_before_the_checkout_is_touched() {
-    use std::os::unix::fs::PermissionsExt;
-
     let bench = bench();
     let witness = bench.dir.path().join("other-command");
     let script = bench.dir.path().join("old-git");
-    fs::write(
+    stand_in::write(
         &script,
-        format!(
+        &format!(
             "#!/bin/sh\ncase \"$*\" in\n  *--version*) echo 'git version 2.38.5';;\n  *) : > {}; exit 1;;\nesac\n",
             quoted(&witness)
         ),
-    )
-    .unwrap();
-    fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+        &["--version"],
+    );
 
     let error =
         sync_checkout_within(&Git::new(&script), &bench.dirs, REMOTE_URL, secs(60)).unwrap_err();

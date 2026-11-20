@@ -6,7 +6,8 @@
 //! `crates/owlshift-cli/tests/cli.rs` compiles this same file through
 //! `#[path]`, since the testkit depends on the command line and not the
 //! other way round. This file therefore uses the standard library only and
-//! names nothing of either crate.
+//! names nothing of either crate, but `stand_in.rs`, which an includer
+//! includes beside it as `stand_in`.
 //!
 //! `CARGO_BIN_EXE_<name>` is cargo's `target/debug/<name>`, which every cargo
 //! command building its package in the same target directory removes and
@@ -31,8 +32,19 @@
 //! between its creation and its lock.
 //!
 //! Under nextest every test is a process of its own and makes this check
-//! once; only the test that finds no copy takes the lock that makes it, so
-//! the others never wait on one another once the copy is in place.
+//! once; only the test that finds no started copy takes the lock that makes
+//! it, so the others never wait on one another once the copy is in place.
+//!
+//! The test that makes the copy also starts it once, to its end, before it
+//! writes the folder's `started` and lets the others have it (OWL-614): on
+//! macOS the first start of a new executable waits for the system's scan of
+//! it, one file at a time, which took up to 37 s under load, while a step
+//! child's first start was counted against a test's passes. Started with
+//! `--version`, which every binary of the testkit and the CLI answers or
+//! refuses before it reads, writes or locks anything, with an empty
+//! environment. It is started where it stays: a debug binary started once,
+//! then renamed, took 0.38 s again at its next start (2026-11-20, macOS
+//! 26.6.2). See "First starts in tests" in `docs/design/build-plan.md`.
 //!
 //! Checked on 2026-11-20 with cargo 1.98.1 on macOS. A build that compiled
 //! nothing gave `target/debug/owlshift` a new inode, the path missing for 25
@@ -50,6 +62,7 @@
 use std::fs;
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::time::UNIX_EPOCH;
 
 /// The copy of `cargo`, the binary `CARGO_BIN_EXE_<name>` names, in the
@@ -72,15 +85,24 @@ pub fn make(cargo: &str, target_tmpdir: &str) -> (PathBuf, fs::File) {
     let copies = Path::new(target_tmpdir).join("bin-copies").join(name);
     let folder = copies.join(format!("{}-{}", built.len(), since.as_nanos()));
     let copy = folder.join(name);
+    let started = folder.join("started");
     fs::create_dir_all(&folder).unwrap();
     let in_use = lock_file(&folder.join("in-use"));
     in_use.lock_shared().unwrap();
-    if !copy.exists() {
-        // One test copies, the others wait for it: they all start one file,
-        // which macOS scans once. Released when dropped.
+    if !(started.exists() && copy.exists()) {
+        // One test copies and starts the copy, the others wait for it: they
+        // all start one file, which macOS scans once, at its first start.
+        // Released when dropped.
         let copying = lock_file(&folder.join("copying"));
         copying.lock().unwrap();
         if !copy.exists() {
+            // A copy made anew has not been started.
+            match fs::remove_file(&started) {
+                Err(error) if error.kind() != ErrorKind::NotFound => {
+                    panic!("{}: {error}", started.display())
+                }
+                _ => {}
+            }
             let staged = folder.join(format!("staged-{}", std::process::id()));
             fs::copy(cargo, &staged).unwrap();
             fs::rename(&staged, &copy).unwrap();
@@ -90,8 +112,26 @@ pub fn make(cargo: &str, target_tmpdir: &str) -> (PathBuf, fs::File) {
                 }
             }
         }
+        if !started.exists() {
+            start_once(&copy, &folder);
+            fs::write(&started, "").unwrap();
+        }
     }
     (copy, in_use)
+}
+
+/// Starts `copy` once with `--version` in `folder`, to its end (OWL-614).
+/// The environment is emptied, so that no variable a test process has set
+/// makes a binary do more; Windows keeps `SystemRoot`, which a program may
+/// need there to start. Not through the platform's `run_command`: this file
+/// uses the standard library only.
+fn start_once(copy: &Path, folder: &Path) {
+    let mut command = Command::new(copy);
+    command.arg("--version").env_clear().current_dir(folder);
+    if let Some(root) = std::env::var_os("SystemRoot") {
+        command.env("SystemRoot", root);
+    }
+    crate::stand_in::start_once(&mut command);
 }
 
 /// The lock file `path`, opened for reading and writing: Windows locks
