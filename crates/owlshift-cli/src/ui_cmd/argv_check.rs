@@ -49,10 +49,6 @@ pub const OUTPUT: &str = "argv-probe.out";
 /// How often a watching reader scans.
 const EVERY: Duration = Duration::from_millis(20);
 
-/// How long a scan waits for a process it started to be listed with its
-/// arguments, which a loaded machine may delay.
-const SETTLE: Duration = Duration::from_secs(20);
-
 /// What one scan, or the scans of one watch, saw.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Scan {
@@ -143,46 +139,40 @@ impl Drop for Holder {
     }
 }
 
-/// Starts `/bin/sh -c '<script>' <needle>`, the needle its `$0`. The script
-/// is never one simple command, which a shell may exec in its own place,
-/// arguments and all.
+/// Starts `/bin/sh -c 'echo; <script>' <needle>`, the needle its `$0`, and
+/// returns once the shell runs the script: its arguments read from then on.
+/// Not before: macOS's `/bin/sh` execs the shell `/private/var/select/sh`
+/// names, and while it does, `KERN_PROCARGS2` fails on that process
+/// (OWL-612). Only that shell runs the script, so the `echo` it writes on
+/// the pipe is past the exec. The pipe stays open with the holder, which
+/// writes nothing more; a `sleep` it left holds the other end a second at
+/// most. The script is never one simple command, which a shell may exec in
+/// its own place, arguments and all.
 pub fn hold_for(script: &str, needle: &str) -> Holder {
-    Holder(
+    let mut holder = Holder(
         Command::new("/bin/sh")
-            .args(["-c", script, needle])
+            .args(["-c", &format!("echo; {script}"), needle])
             .stdin(Stdio::null())
-            .stdout(Stdio::null())
+            .stdout(Stdio::piped())
             .stderr(Stdio::null())
             .spawn()
             .expect("/bin/sh"),
-    )
+    );
+    let mut ran = [0u8; 1];
+    holder
+        .0
+        .stdout
+        .as_mut()
+        .expect("the holder's piped stdout")
+        .read_exact(&mut ran)
+        .expect("the holder's shell ended before it ran its script");
+    holder
 }
 
 /// [`hold_for`] until dropped: a loop, so killing the shell leaves at most
 /// a one-second `sleep` behind.
 pub fn hold(needle: &str) -> Holder {
     hold_for("while :; do sleep 1; done", needle)
-}
-
-/// Scans until the process holding `needle` shows its arguments, or
-/// [`SETTLE`] ends, and gives everything the scans saw. A process that has
-/// just been spawned is not always listed with its arguments yet.
-fn scan_until_held(needles: &[&str], needle: &str) -> Scan {
-    let end = Instant::now() + SETTLE;
-    let mut seen = scan(needles);
-    while Instant::now() < end && !holds(&seen, needles, needle) {
-        std::thread::sleep(EVERY);
-        merge(&mut seen, scan(needles));
-    }
-    seen
-}
-
-/// Whether `seen` found `needle`, one of `needles`.
-fn holds(seen: &Scan, needles: &[&str], needle: &str) -> bool {
-    needles
-        .iter()
-        .zip(&seen.found)
-        .any(|(candidate, found)| *candidate == needle && *found)
 }
 
 /// Folds `next` into `seen`: the larger counts, every needle found by either.
@@ -236,10 +226,9 @@ fn answer(dir: &Path) {
     needles.push(own);
     let needles: Vec<&str> = needles.iter().map(String::as_str).collect();
     let end = Instant::now() + watch;
-    // The control first: it is held a moment before this scan, and must be
-    // listed for the scan to count.
-    let control = needles.last().copied().expect("the own needle");
-    let mut seen = scan_until_held(&needles, control);
+    // The control is held, its arguments readable, before this scan, which
+    // must find it to count.
+    let mut seen = scan(&needles);
     while Instant::now() < end {
         std::thread::sleep(EVERY);
         merge(&mut seen, scan(&needles));
@@ -268,11 +257,33 @@ fn reader() {
     answer(&std::env::current_dir().expect("a working directory"));
 }
 
+/// A needle reads from the moment [`hold`] hands its holder out: every read
+/// of the holder's arguments in the next 25 ms holds it. macOS's `/bin/sh`
+/// execs the shell it names 1 to 24 ms after the spawn, and while it does a
+/// read fails (OWL-612): a holder handed out before that exec failed this.
+#[test]
+fn a_held_needle_reads_from_the_moment_hold_returns() {
+    let held = needle();
+    let holder = hold(&held);
+    let pid = holder.0.id();
+    let start = Instant::now();
+    let mut reads = 0;
+    while start.elapsed() < Duration::from_millis(25) {
+        let command = test_proc::command(pid);
+        assert!(
+            command.contains(&held),
+            "read {reads}, {:?} after hold returned: {command:?}",
+            start.elapsed()
+        );
+        reads += 1;
+    }
+}
+
 #[test]
 fn the_scan_finds_the_argument_of_a_process_and_no_needle_nobody_holds() {
     let (held, nobody) = (needle(), needle());
     let _holder = hold(&held);
-    let seen = scan_until_held(&[&held, &nobody], &held);
+    let seen = scan(&[&held, &nobody]);
     assert_eq!(seen.found, [true, false], "{seen:?}");
     assert!(seen.read >= 1 && seen.processes >= seen.read, "{seen:?}");
 }
@@ -281,9 +292,6 @@ fn the_scan_finds_the_argument_of_a_process_and_no_needle_nobody_holds() {
 fn the_reader_writes_its_counts_from_a_request_file() {
     let (held, nobody) = (needle(), needle());
     let _holder = hold(&held);
-    // The reader's scan runs in another process: the held one must already
-    // be listed when it starts.
-    scan_until_held(&[&held], &held);
     let seen = Reader::start(None, &[&held, &nobody], 0).finish();
     assert_eq!(value(&seen, "own"), "1", "{seen:?}");
     assert_eq!(value(&seen, "found_0"), "1", "{seen:?}");
