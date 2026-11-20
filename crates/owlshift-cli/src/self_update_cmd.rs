@@ -21,7 +21,8 @@
 //! 6. `<name>/owlshift` alone is extracted, by the system's `tar`, as
 //!    `install.sh` does; it must be a regular file.
 //! 7. It is copied beside the binary as `.owlshift.<pid>`, made executable
-//!    and synced; it must answer `--version` with `owlshift <version>`.
+//!    and synced; it must answer `--version` with `owlshift <version>`
+//!    within [`STAGED_ANSWER_WAIT`].
 //! 8. It replaces the binary by a rename, atomic in that folder: a running
 //!    daemon keeps its old file (build plan, R3).
 //!
@@ -51,6 +52,16 @@ pub const UPDATE_URL: &str = "OWLSHIFT_UPDATE_URL";
 
 /// The repository, for the command that builds from source.
 const REPOSITORY: &str = "https://github.com/pitchopp/owlshift";
+
+/// How long the staged binary has to answer `--version`. Its first start on
+/// macOS waits for the system's scan of a new file, which no one can do ahead
+/// of it, and the system scans new executables one at a time (OWL-608,
+/// OWL-614). Measured on 2026-11-20 (OWL-615, macOS 26.6.2, Apple Silicon) on
+/// release 0.1.1 staged as [`Staged::beside`] does: 0.36 to 0.78 s on an idle
+/// machine, 22.7 s behind 12 new 77 MB executables started at once, 58.1 s
+/// behind 30. The bound only cuts a binary that never answers, so it is the
+/// pin check's 120 s, twice that worst case.
+const STAGED_ANSWER_WAIT: Duration = Duration::from_secs(120);
 
 /// `owlshift self-update`, `--check` only reading the latest version.
 pub fn run(check: bool, release_key: &str) -> ExitCode {
@@ -450,7 +461,7 @@ impl Staged {
             &self.path,
             &["--version"],
             None,
-            Duration::from_secs(30),
+            STAGED_ANSWER_WAIT,
         )
         .map_err(|error| format!("the new binary did not run: {error}; nothing installed"))?;
         let said = String::from_utf8_lossy(&ran.stdout);
@@ -584,6 +595,13 @@ mod tests {
             let refused = expected_checksum(sums.as_bytes(), name).unwrap_err();
             assert!(refused.contains(why), "{sums}: {refused}");
         }
+    }
+
+    #[test]
+    fn the_staged_binary_has_the_pin_check_s_wait_to_answer() {
+        // A first start behind a queue of 30 new executables took 58.1 s on
+        // 2026-11-20 (OWL-615); 30 s would refuse a sound release.
+        assert_eq!(STAGED_ANSWER_WAIT, Duration::from_secs(120));
     }
 
     #[test]
