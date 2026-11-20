@@ -761,7 +761,7 @@ fn colleagues() -> Value {
 }
 
 /// The answer check's verdict on Q1, answered, with the option chosen.
-fn chose(option: Option<&str>, reason: &str) -> String {
+pub(super) fn chose(option: Option<&str>, reason: &str) -> String {
     let mut verdict = json!({ "question": "Q1", "class": "answered", "reason": reason });
     if let Some(option) = option {
         verdict["option"] = json!(option);
@@ -772,7 +772,7 @@ fn chose(option: Option<&str>, reason: &str) -> String {
 
 impl Bench {
     /// The QUESTIONS comments on the ticket.
-    fn questions_posted(&self) -> Vec<String> {
+    pub(super) fn questions_posted(&self) -> Vec<String> {
         self.comments()
             .into_iter()
             .filter(|comment| comment.starts_with("[owlshift] QUESTIONS"))

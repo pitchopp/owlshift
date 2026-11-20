@@ -52,7 +52,7 @@ impl Bench {
     }
 
     /// The commit the bare remote holds as `ticket`'s claim.
-    fn claim_commit(&self, ticket: &TicketId) -> Option<String> {
+    pub(super) fn claim_commit(&self, ticket: &TicketId) -> Option<String> {
         self.env
             .run(
                 &self.remote.bare,
@@ -63,14 +63,14 @@ impl Bench {
     }
 
     /// The claim the bare remote holds of `ticket`.
-    fn remote_claim(&self, ticket: &TicketId) -> Claim {
+    pub(super) fn remote_claim(&self, ticket: &TicketId) -> Claim {
         let file = format!("{}:claim.json", claim_ref(ticket));
         let text = self.env.run(&self.remote.bare, &["show", &file]).unwrap();
         Claim::parse(&String::from_utf8(text).unwrap()).unwrap()
     }
 
     /// Every ref under `refs/owlshift/` of the bare remote.
-    fn owlshift_refs(&self) -> String {
+    pub(super) fn owlshift_refs(&self) -> String {
         let out = self
             .env
             .run(&self.remote.bare, &["for-each-ref", "refs/owlshift/"])
@@ -594,14 +594,18 @@ fn the_sections_read_the_claims_in_a_fixed_number_of_git_commands() {
 
 /// How long a release waits for a watched step it stopped: well past the
 /// watcher's poll.
-const STEP_WAIT: Duration = Duration::from_secs(10);
+pub(super) const STEP_WAIT: Duration = Duration::from_secs(10);
 
 impl Bench {
     /// The bench's project file with `[people]` listing the maintainer and
-    /// lea, by their Markdown tracker names (OWL-588).
+    /// lea, by their Markdown tracker names (OWL-588), unless the file has
+    /// its own table (OWL-589).
     fn people_config(&self) -> ProjectConfig {
         let text = fs::read_to_string(self.remote.checkout.join("owlshift.toml")).unwrap();
         let mut config = ProjectConfig::parse(&text).unwrap();
+        if config.people.is_some() {
+            return config;
+        }
         config.people = Some(
             ["maintainer", "lea"]
                 .map(|name| {
@@ -617,12 +621,14 @@ impl Bench {
     }
 
     /// `owlshift release DEMO-1` from the data directory of `dirs`, as
-    /// `account`, a step under way waited for `step_wait` at most, with
-    /// `between` happening between the release's read and its delete.
-    fn release_from(
+    /// `account`, at the time `clock` reads, a step under way waited for
+    /// `step_wait` at most, with `between` happening between the release's
+    /// read and its delete.
+    pub(super) fn release_from(
         &self,
         dirs: &ProjectDirs,
         account: &str,
+        clock: &dyn Fn() -> Timestamp,
         step_wait: Duration,
         between: &mut dyn FnMut(),
     ) -> Result<release::Released, String> {
@@ -631,7 +637,6 @@ impl Bench {
         let tracker = MarkdownTracker::new(&self.remote.checkout);
         let operator = release::Operator::of(&config, account);
         let remote_url = self.remote.bare.to_string_lossy().into_owned();
-        let clock = Timestamp::now;
         let releasing = release::Release {
             git: &git,
             dirs,
@@ -639,7 +644,7 @@ impl Bench {
             config: &config,
             tracker: &tracker,
             operator: &operator,
-            clock: &clock,
+            clock,
             step_wait,
             from_ui: false,
         };
@@ -670,7 +675,7 @@ impl Bench {
     }
 
     /// The RELEASED comments on the ticket.
-    fn released_comments(&self) -> Vec<String> {
+    pub(super) fn released_comments(&self) -> Vec<String> {
         self.comments()
             .into_iter()
             .filter(|body| body.starts_with("[owlshift] RELEASED"))
@@ -694,7 +699,13 @@ fn a_live_claim_of_another_person_is_refused_and_an_expired_one_released() {
     let stage = bench.stage();
     let live = bench.claim_commit(&ticket());
     let refused = bench
-        .release_from(&bench.dirs(), "maintainer", STEP_WAIT, &mut || {})
+        .release_from(
+            &bench.dirs(),
+            "maintainer",
+            &Timestamp::now,
+            STEP_WAIT,
+            &mut || {},
+        )
         .unwrap_err();
     let holder = format!(
         "DEMO-1 is claimed by lea's runner {} until",
@@ -726,7 +737,13 @@ fn a_live_claim_of_another_person_is_refused_and_an_expired_one_released() {
         )
         .unwrap();
     let released = bench
-        .release_from(&bench.dirs(), "maintainer", STEP_WAIT, &mut || {})
+        .release_from(
+            &bench.dirs(),
+            "maintainer",
+            &Timestamp::now,
+            STEP_WAIT,
+            &mut || {},
+        )
         .unwrap();
     assert!(
         released.lines[0].starts_with("Released DEMO-1's claim on origin, lea's runner"),
@@ -807,15 +824,21 @@ fn the_operators_own_claim_is_released_from_a_second_data_directory_unless_renew
     assert!(matches!(took, Ok(Took::Taken { .. })), "{took:?}");
     let mut renewed = None;
     let refused = bench
-        .release_from(&bench.dirs(), "maintainer", STEP_WAIT, &mut || {
-            let renewal = claims::renew(
-                at,
-                &|_| ClaimHeld::default(),
-                Timestamp::now() + SignedDuration::from_hours(1),
-            );
-            assert_eq!(renewal.renewed, [ticket()], "{renewal:?}");
-            renewed = bench.claim_commit(&ticket());
-        })
+        .release_from(
+            &bench.dirs(),
+            "maintainer",
+            &Timestamp::now,
+            STEP_WAIT,
+            &mut || {
+                let renewal = claims::renew(
+                    at,
+                    &|_| ClaimHeld::default(),
+                    Timestamp::now() + SignedDuration::from_hours(1),
+                );
+                assert_eq!(renewal.renewed, [ticket()], "{renewal:?}");
+                renewed = bench.claim_commit(&ticket());
+            },
+        )
         .unwrap_err();
     assert!(
         refused.contains("moved on origin since it was read"),
@@ -826,7 +849,13 @@ fn the_operators_own_claim_is_released_from_a_second_data_directory_unless_renew
     assert!(bench.released_comments().is_empty());
 
     bench
-        .release_from(&bench.dirs(), "maintainer", STEP_WAIT, &mut || {})
+        .release_from(
+            &bench.dirs(),
+            "maintainer",
+            &Timestamp::now,
+            STEP_WAIT,
+            &mut || {},
+        )
         .unwrap();
     assert_eq!(bench.claim_commit(&ticket()), None);
     assert_eq!(bench.released_comments().len(), 1);
@@ -862,7 +891,7 @@ fn on_the_holders_machine_the_step_under_way_is_stopped_first() {
     });
     started.recv().unwrap();
     let released = bench
-        .release_from(&dirs, "maintainer", STEP_WAIT, &mut || {})
+        .release_from(&dirs, "maintainer", &Timestamp::now, STEP_WAIT, &mut || {})
         .unwrap();
     assert_eq!(step.join().unwrap(), Some(cancel::Cause::ClaimLost));
     assert!(
@@ -882,7 +911,13 @@ fn on_the_holders_machine_the_step_under_way_is_stopped_first() {
     let held = dirs.ticket_lock(&ticket()).unwrap().unwrap();
     let kept = bench.claim_commit(&ticket());
     let refused = bench
-        .release_from(&dirs, "maintainer", Duration::from_secs(1), &mut || {})
+        .release_from(
+            &dirs,
+            "maintainer",
+            &Timestamp::now,
+            Duration::from_secs(1),
+            &mut || {},
+        )
         .unwrap_err();
     assert!(refused.contains("has not ended within 1 s:"), "{refused}");
     assert!(refused.contains("A run typed in a terminal"), "{refused}");
