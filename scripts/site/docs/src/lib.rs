@@ -36,6 +36,7 @@ pub const PAGES: &[Group] = &[
             "adopt/linear.md",
             "adopt/github-issues.md",
             "adopt/markdown.md",
+            "adopt/team.md",
         ],
     },
     Group {

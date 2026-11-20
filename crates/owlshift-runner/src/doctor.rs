@@ -51,6 +51,7 @@ use crate::executor::{
     MINIMUM_GIT_VERSION, git_floor_reason, git_install_advice, git_recheck_note,
 };
 use crate::forge::{AppGrants, GITHUB_TOKEN_HELP};
+use crate::init::TEAM_PAGE;
 use crate::install::ServiceState;
 #[cfg(test)]
 use crate::secrets::TrackerAccounts;
@@ -1448,6 +1449,51 @@ fn personal_operator(personal: &FileState<PersonalConfig>) -> Operator {
     })
 }
 
+/// The project's team as `doctor`'s team lines name it (OWL-590): the
+/// people `[people]` lists in the working tree, or, without the table, the
+/// accounts `[tracker].admitters` lists. The `people`, `team gesture` and
+/// `claims` lines count and name it the same way, so that they read as one
+/// story with the team adoption page they point to ([`TEAM_PAGE`]).
+struct Team {
+    count: usize,
+    table: bool,
+}
+
+impl std::fmt::Display for Team {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let (list, one, many) = if self.table {
+            ("`[people]`", "person", "people")
+        } else {
+            ("`[tracker].admitters`", "account", "accounts")
+        };
+        let noun = if self.count == 1 { one } else { many };
+        write!(f, "{list} lists {} {noun}", self.count)
+    }
+}
+
+/// The team of `config`, as [`Team`] names it.
+fn team_size(config: &ProjectConfig) -> Team {
+    match &config.people {
+        Some(people) => Team {
+            count: people.len(),
+            table: true,
+        },
+        None => Team {
+            count: config.tracker.admitters.as_ref().map_or(0, Vec::len),
+            table: false,
+        },
+    }
+}
+
+/// How each team line's fix ends: the project file changes through a pull
+/// request, and the team adoption page says why.
+fn team_fix(change: &str) -> String {
+    format!(
+        "{DOES_NOT_BLOCK} {change}, through a pull request to the default branch. The team \
+         adoption page says why: {TEAM_PAGE}"
+    )
+}
+
 /// The project's people (OWL-582, build plan "P10 · Teams", "People"):
 /// how many `[people]` lists in the working tree, and whether this
 /// machine's operator, as [`crate::tracker::Kind::operator`] read it, is
@@ -1459,10 +1505,10 @@ fn people_check(config: &Effective, operator: Option<&Operator>) -> Option<Check
     let FileState::Loaded { config, .. } = &config.project else {
         return None;
     };
-    let people = config.people.as_ref()?;
+    config.people.as_ref()?;
     let count = format!(
-        "{} person(s) in `[people]` of the working tree (watch reads the base commit)",
-        people.len()
+        "{} in the working tree (watch reads the base commit)",
+        team_size(config)
     );
     let ok = |detail: String| Check::ok(Section::Project, SUBJECT, detail);
     Some(match operator {
@@ -1480,12 +1526,12 @@ fn people_check(config: &Effective, operator: Option<&Operator>) -> Option<Check
                     "{count}, and this machine's operator, {:?} ({:?}), is not one of them",
                     account.name, account.id
                 ),
-                format!(
-                    "{DOES_NOT_BLOCK} the people of the project file are who admit, decide and \
-                     review. Add this machine's operator as `[people.<handle>]` with `tracker = \
-                     {:?}` through a pull request: `owlshift init` prints the entry.",
+                team_fix(&format!(
+                    "the people of the project file are who admit, decide and review. Add this \
+                     machine's operator as `[people.<handle>]` with `tracker = {:?}`, the entry \
+                     `owlshift init` prints",
                     account.id
-                ),
+                )),
             ),
         },
         Some(Err(reason)) => ok(format!(
@@ -1495,17 +1541,12 @@ fn people_check(config: &Effective, operator: Option<&Operator>) -> Option<Check
     })
 }
 
-/// Whose reviews on Owlshift's pull requests are read (OWL-307, build plan
-/// "P5 · Quality pipeline", "Contracts and formats"): the logins
-/// `[forge].reviewers` lists, read from the working tree here, while watch
-/// reads the base commit. Without `[forge]` no review is read, which blocks
-/// nothing: a warning. None without a project configuration.
 /// A state gesture in a project file that lists several people (OWL-583,
 /// build plan "P10 · Teams", "The gesture on a team"): its account is
 /// whoever moved the ticket to the ready column, often the person who
 /// grooms the backlog, whose runner then takes it. A note pointing to a
 /// label, which each developer puts on their own tickets. Several people:
-/// `[people]` lists two or more, or, without it, `[tracker].admitters` does.
+/// [`team_size`] counts two or more.
 fn team_gesture_check(config: &Effective) -> Option<Check> {
     let FileState::Loaded { config, .. } = &config.project else {
         return None;
@@ -1513,22 +1554,19 @@ fn team_gesture_check(config: &Effective) -> Option<Check> {
     if !matches!(config.tracker.admit, Admit::State(_)) {
         return None;
     }
-    let people = match &config.people {
-        Some(people) => people.len(),
-        None => config.tracker.admitters.as_ref().map_or(0, Vec::len),
-    };
-    (people >= 2).then(|| {
+    let team = team_size(config);
+    (team.count >= 2).then(|| {
         Check::warn(
             Section::Project,
             "team gesture",
             format!(
-                "tickets are admitted by a move to the ready state, and the file lists {people} \
-                 people: a runner takes a ticket whose move is its own operator's, often the \
-                 person who grooms the backlog"
+                "tickets are admitted by a move to the ready state, and {team}: a runner takes \
+                 a ticket whose move is its own operator's, often the person who grooms the \
+                 backlog"
             ),
-            format!(
-                "{DOES_NOT_BLOCK} on a team, admit with a label each developer puts on their own \
-                 tickets: `admit = {{ label = \"agent\" }}` under `[tracker]`."
+            team_fix(
+                "on a team, admit with a label each developer puts on their own tickets: \
+                 `admit = { label = \"agent\" }` under `[tracker]`",
             ),
         )
     })
@@ -1547,21 +1585,18 @@ fn claims_check(config: &Effective) -> Option<Check> {
     if config.policy.claims() != Claims::Local {
         return None;
     }
-    let people = match &config.people {
-        Some(people) => people.len(),
-        None => config.tracker.admitters.as_ref().map_or(0, Vec::len),
-    };
-    (people >= 2).then(|| {
+    let team = team_size(config);
+    (team.count >= 2).then(|| {
         Check::warn(
             Section::Project,
             "claims",
             format!(
-                "claims are local, and the file lists {people} people: two machines can work \
-                 one ticket, each holding only its own ticket locks"
+                "claims are local, and {team}: two machines can work one ticket, each holding \
+                 only its own ticket locks"
             ),
-            format!(
-                "{DOES_NOT_BLOCK} on a team, claim tickets on the git remote: `claims = \"remote\"` \
-                 under `[policy]`, merged to the default branch."
+            team_fix(
+                "on a team, claim tickets on the git remote: `claims = \"remote\"` under \
+                 `[policy]`",
             ),
         )
     })
@@ -1651,6 +1686,12 @@ fn markdown_takes_check(config: &Effective, repo: Option<&Repo>) -> Option<Check
     })
 }
 
+/// Whose reviews on Owlshift's pull requests are read (OWL-307, build plan
+/// "P5 · Quality pipeline", "Contracts and formats"): the logins
+/// `[forge].reviewers` lists, or the people of `[people]` with a forge
+/// login (OWL-582), read from the working tree here, while watch reads the
+/// base commit. When none is listed no review is read, which blocks
+/// nothing: a warning. None without a project configuration.
 fn forge_reviewers_check(config: &Effective) -> Option<Check> {
     const SUBJECT: &str = "forge reviewers";
     let FileState::Loaded { config, .. } = &config.project else {
@@ -4813,7 +4854,9 @@ states = { ready = "Todo", working = "In Progress", needs_input = "Needs Input",
         );
         assert_eq!(listed.status, Status::Ok, "{listed:?}");
         assert!(
-            listed.detail.starts_with("2 person(s) in `[people]`")
+            listed
+                .detail
+                .starts_with("`[people]` lists 2 people in the working tree")
                 && listed.detail.ends_with("this machine's operator is bob"),
             "{listed:?}"
         );
@@ -4918,7 +4961,12 @@ states = { ready = "Todo", working = "Doing", needs_input = "Asked", review = "R
         let (_dir, config) = project_tracked_by(&two);
         let noted = team_gesture_check(&config).unwrap();
         assert_eq!(noted.status, Status::Warn);
-        assert!(noted.detail.contains("lists 2 people"), "{noted:?}");
+        assert!(
+            noted
+                .detail
+                .contains("`[tracker].admitters` lists 2 accounts"),
+            "{noted:?}"
+        );
         assert!(
             noted
                 .why
@@ -4943,11 +4991,70 @@ states = { ready = "Todo", working = "Doing", needs_input = "Asked", review = "R
         let (_dir, config) = project_tracked_by(&two);
         let warned = claims_check(&config).unwrap();
         assert_eq!(warned.status, Status::Warn);
-        assert!(warned.detail.contains("lists 2 people"), "{warned:?}");
+        assert!(
+            warned
+                .detail
+                .contains("`[tracker].admitters` lists 2 accounts"),
+            "{warned:?}"
+        );
         let (_dir, config) = project_tracked_with(&two, "claims = \"remote\"");
         assert!(claims_check(&config).is_none());
         let (_dir, config) = project_tracked_by(LABELLED_TRACKER);
         assert!(claims_check(&config).is_none());
+    }
+
+    /// OWL-590: a team's first mistakes, the operator missing from
+    /// `[people]`, a state gesture and local claims, are told in that order
+    /// and as one story: the same count of the same table, each fix through
+    /// a pull request, each pointing to the team adoption page.
+    #[test]
+    fn the_team_lines_tell_one_story() {
+        let ready = || logged_in(with_harnesses(with_git(FakeSystem::default())));
+        let tracker = LABELLED_TRACKER
+            .replace("admit = { label = \"agent\" }", "admit = \"ready\"")
+            .replace(r#"["u-ann"]"#, r#"["ann", "bob"]"#);
+        let (_dir, config) = project_tracked_with(
+            &tracker,
+            "[people.ann]\ntracker = \"u-ann\"\n[people.bob]\ntracker = \"u-bob\"",
+        );
+        let eve = KeyAccount {
+            id: "u-eve".to_owned(),
+            name: "Eve".to_owned(),
+            app: false,
+            workspace: "owl".to_owned(),
+        };
+        let report = run(&ready().linear_operator_is(Ok(eve)), &config);
+        let subjects: Vec<&str> = report.checks.iter().map(|c| c.subject.as_str()).collect();
+        let at = |subject: &str| subjects.iter().position(|s| *s == subject).unwrap();
+        assert!(
+            at("people") < at("team gesture") && at("team gesture") < at("claims"),
+            "{subjects:?}"
+        );
+        for subject in ["people", "team gesture", "claims"] {
+            let told = line(&report, subject);
+            assert_eq!(told.status, Status::Warn, "{told:?}");
+            assert!(
+                told.detail.contains("`[people]` lists 2 people"),
+                "{told:?}"
+            );
+            let why = told.why.as_deref().unwrap_or_default();
+            assert!(
+                why.contains("through a pull request to the default branch")
+                    && why.ends_with(TEAM_PAGE),
+                "{told:?}"
+            );
+        }
+    }
+
+    /// OWL-590: the team lines' page is a page of the repository.
+    #[test]
+    fn the_team_page_exists() {
+        let path = TEAM_PAGE
+            .split_once("/blob/main/")
+            .map(|(_, path)| path)
+            .unwrap();
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        assert!(root.join(path).is_file(), "{path}");
     }
 
     /// OWL-587: under remote claims, a claim of a later format says to

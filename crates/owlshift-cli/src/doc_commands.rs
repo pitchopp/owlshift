@@ -287,6 +287,7 @@ fn every_command_the_documentation_names_exists_with_its_flags() {
         "docs/adopt/linear.md",
         "docs/adopt/github-issues.md",
         "docs/adopt/markdown.md",
+        "docs/adopt/team.md",
         "docs/markdown-tracker.md",
         "docs/faq.md",
         "docs/troubleshooting.md",
