@@ -140,7 +140,10 @@ pub const SESSION_FORMAT: u32 = 1;
 /// Build's admission does; format 1 is still read, as admitted at its
 /// dispatch. Format 3 adds the overlaps the ticket tolerates under
 /// `policy.overlap = "rebase"` (OWL-449); format 2 is still read, with none.
-pub const HELD_FORMAT: u32 = 3;
+/// Format 4 adds the yield's time, the rebase a re-admission leaves due and
+/// an overlap's named resources (OWL-621); format 3 is still read, not
+/// yielded.
+pub const HELD_FORMAT: u32 = 4;
 /// The format version of a step's envelope, the hidden argument of the
 /// child `owlshift continue` (OWL-399).
 pub const STEP_ENVELOPE_FORMAT: u32 = 1;

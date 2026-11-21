@@ -763,6 +763,7 @@ impl Driver {
             } else {
                 Restart::Do
             },
+            yields: None,
         }
         .render();
         self.post(&body)?;

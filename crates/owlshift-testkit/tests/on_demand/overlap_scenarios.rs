@@ -62,7 +62,7 @@ fn merged_sibling(bench: &Bench, paths: &[&str], theirs: bool) {
     let mut held = TicketHeld::dispatched(at);
     held.admit(paths.clone(), Vec::new(), None, at);
     if theirs {
-        held.record_overlap(&demo1, &paths, at);
+        held.record_overlap(&demo1, &paths, &[], at);
     }
     let sibling = TicketRecord {
         delivery: Some(delivery),
@@ -72,7 +72,7 @@ fn merged_sibling(bench: &Bench, paths: &[&str], theirs: bool) {
     write_through_run_file(&git, &bench.dirs(), &demo2, &sibling, None);
     if !theirs {
         let mut own = record.held.clone().unwrap();
-        own.record_overlap(&demo2, &paths, at);
+        own.record_overlap(&demo2, &paths, &[], at);
         record.held = Some(own);
         bench.write_record(&record);
     }

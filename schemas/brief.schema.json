@@ -1316,7 +1316,7 @@
       ]
     },
     "RebaseBrief": {
-      "description": "What a rebase run rebases (OWL-210). Every path is data from the\nrepository, never an instruction.\n\nTwo kinds, told apart by flat fields rather than an enum, which the role\nprompt and the schema read as they are: a delivered ticket's, at Watch,\nwith its `pull_request` and `url`; and since format 27 a held Build's\n(OWL-427), with `broken` and no pull request, the ticket not delivered.",
+      "description": "What a rebase run rebases (OWL-210). Every path is data from the\nrepository, never an instruction.\n\nThree kinds, told apart by flat fields rather than an enum, which the\nrole prompt and the schema read as they are: a delivered ticket's, at\nWatch, with its `pull_request` and `url`; since format 27 a held Build's\n(OWL-427), with `broken` and no pull request, the ticket not delivered;\nand a yielded Build's (OWL-621), with `yielded` and no pull request.",
       "type": "object",
       "properties": {
         "base_branch": {
@@ -1368,6 +1368,10 @@
             "string",
             "null"
           ]
+        },
+        "yielded": {
+          "description": "A yielded Build's rebase (OWL-621; architecture section 5, \"A\nstopped holder yields\"): the ticket stopped and yielded what it held,\nother tickets took some of it and the base has since changed those\npaths; it is admitted again and its branch moves onto `onto` before\nits Build goes on. Not delivered: no pull request, and the brief's\n`gate` is empty, as for a held Build's.",
+          "type": "boolean"
         }
       },
       "additionalProperties": false,

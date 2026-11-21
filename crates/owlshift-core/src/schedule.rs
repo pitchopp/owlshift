@@ -338,6 +338,7 @@ pub fn admissions<K: Clone + Ord + AsRef<str>>(
             dispatched: Dispatched::Now,
             delivered: false,
             outside: false,
+            yielded: false,
             held: due.added.clone(),
         };
         let found = weigh(&weighed, &holders, overlap).collision;
@@ -1081,6 +1082,7 @@ mod tests {
             dispatched: Dispatched::At(at),
             delivered: false,
             outside: false,
+            yielded: false,
             held: held.to_vec(),
         };
         let due = |id, at, wanted: &[Resource], starts| Due {
@@ -1147,6 +1149,7 @@ mod tests {
                 dispatched: Dispatched::At(at),
                 delivered: false,
                 outside: false,
+                yielded: false,
                 held: vec![file.clone()],
             },
             added: vec![file.clone()],

@@ -479,7 +479,7 @@ fn a_ticket_holding_the_whole_repository_is_widened_by_nothing() {
 /// cannot be read is never free: a widening of it keeps its files, and one
 /// past its bounds or unread admits the whole repository at that time. A
 /// format-1 record reads as admitted at its dispatch, holding what its
-/// dispatch declared, and is written back as format 3; format 1 keeps no
+/// dispatch declared, and is written back as format 4; format 1 keeps no
 /// admission.
 #[test]
 fn a_ticket_held_admits_nothing_at_its_dispatch_and_reads_format_1_as_admitted() {
@@ -490,7 +490,7 @@ fn a_ticket_held_admits_nothing_at_its_dispatch_and_reads_format_1_as_admitted()
     assert!(!nothing.admitted() && !nothing.whole() && nothing.zones.is_empty());
     assert_eq!(TicketHeld::parse(&nothing.render()).unwrap(), nothing);
     let document: Value = serde_json::from_str(&nothing.render()).unwrap();
-    assert_eq!(document["format"], json!(3));
+    assert_eq!(document["format"], json!(4));
     for (field, value) in [
         ("zones", json!(["app"])),
         ("resources", json!(["migrations"])),
@@ -530,7 +530,7 @@ fn a_ticket_held_admits_nothing_at_its_dispatch_and_reads_format_1_as_admitted()
         (&vec!["app".to_owned()], Some(at(0)), None)
     );
     let rendered: Value = serde_json::from_str(&read.render()).unwrap();
-    assert_eq!(rendered["format"], json!(3));
+    assert_eq!(rendered["format"], json!(4));
     assert_eq!(TicketHeld::parse(&read.render()).unwrap(), read);
     // One kept for a ref from before P6, with no dispatch time, holds the
     // whole repository.
@@ -628,20 +628,25 @@ fn a_ticket_held_records_its_overlaps_once_per_sibling() {
     let paths = |names: &[&str]| names.iter().map(|n| (*n).to_owned()).collect::<Vec<_>>();
     let mut held = admitted(&["app/one.rs"], &[], at(0));
     assert_eq!(
-        held.record_overlap(&id("DEMO-9"), &paths(&["app/one.rs"]), at(1)),
-        Some(paths(&["app/one.rs"]))
+        held.record_overlap(&id("DEMO-9"), &paths(&["app/one.rs"]), &[], at(1)),
+        Some((paths(&["app/one.rs"]), Vec::new()))
     );
     assert_eq!(
-        held.record_overlap(&id("DEMO-2"), &paths(&["web/b.rs", "app/one.rs"]), at(2)),
-        Some(paths(&["web/b.rs", "app/one.rs"]))
+        held.record_overlap(
+            &id("DEMO-2"),
+            &paths(&["web/b.rs", "app/one.rs"]),
+            &[],
+            at(2)
+        ),
+        Some((paths(&["web/b.rs", "app/one.rs"]), Vec::new()))
     );
     assert_eq!(
-        held.record_overlap(&id("DEMO-9"), &paths(&["app/one.rs"]), at(3)),
-        Some(Vec::new())
+        held.record_overlap(&id("DEMO-9"), &paths(&["app/one.rs"]), &[], at(3)),
+        Some((Vec::new(), Vec::new()))
     );
     assert_eq!(
-        held.record_overlap(&id("DEMO-9"), &paths(&["app/two.rs"]), at(4)),
-        Some(paths(&["app/two.rs"]))
+        held.record_overlap(&id("DEMO-9"), &paths(&["app/two.rs"]), &[], at(4)),
+        Some((paths(&["app/two.rs"]), Vec::new()))
     );
     let kept: Vec<_> = held
         .overlaps
@@ -690,19 +695,92 @@ fn a_ticket_held_records_its_overlaps_once_per_sibling() {
     for n in 0..owlshift_contracts::refs::MAX_OVERLAPS {
         let sibling = id(&format!("DEMO-{}", 100 + n));
         assert!(
-            full.record_overlap(&sibling, &paths(&["app/one.rs"]), at(1))
+            full.record_overlap(&sibling, &paths(&["app/one.rs"]), &[], at(1))
                 .is_some()
         );
     }
     let before = full.clone();
     assert_eq!(
-        full.record_overlap(&id("DEMO-1"), &paths(&["app/one.rs"]), at(2)),
+        full.record_overlap(&id("DEMO-1"), &paths(&["app/one.rs"]), &[], at(2)),
         None
     );
     assert_eq!(full, before);
     assert_eq!(
-        full.record_overlap(&id("DEMO-100"), &paths(&["app/two.rs"]), at(2)),
-        Some(paths(&["app/two.rs"]))
+        full.record_overlap(&id("DEMO-100"), &paths(&["app/two.rs"]), &[], at(2)),
+        Some((paths(&["app/two.rs"]), Vec::new()))
     );
     assert_eq!(TicketHeld::parse(&full.render()).unwrap(), full);
+}
+
+/// OWL-621: a record yields only what it holds, never the whole repository
+/// nor nothing; a taking keeps a named resource by its name, alone or with
+/// paths; admitted again, it loses the yield and its next Build's rebase is
+/// due unless its pull request is open. Read back and valid against the
+/// schema; a record of format 3 reads as not yielded and refuses a yield.
+#[test]
+fn a_ticket_held_yields_what_it_holds_and_keeps_a_takings_resource() {
+    let at = |minute: i64| -> jiff::Timestamp {
+        jiff::Timestamp::from_second(1_790_000_000 + minute * 60).unwrap()
+    };
+    let id = |name: &str| owlshift_contracts::ids::TicketId::new(name).unwrap();
+    let names = |items: &[&str]| items.iter().map(|n| (*n).to_owned()).collect::<Vec<_>>();
+    assert!(!TicketHeld::dispatched(at(0)).yield_at(at(1)));
+    assert!(
+        !admitted(&[], &[], at(0)).yield_at(at(1)),
+        "the whole repository"
+    );
+    let mut held = admitted(&["db/1.sql"], &["migrations"], at(0));
+    assert!(held.yield_at(at(1)) && held.yielded());
+    assert!(!held.yield_at(at(2)), "yields once");
+    assert_eq!(held.yielded_at, Some(at(1)));
+    assert_eq!(
+        held.record_overlap(&id("DEMO-2"), &[], &names(&["migrations"]), at(3)),
+        Some((Vec::new(), names(&["migrations"])))
+    );
+    assert_eq!(
+        held.record_overlap(
+            &id("DEMO-2"),
+            &names(&["db/1.sql"]),
+            &names(&["migrations"]),
+            at(4)
+        ),
+        Some((names(&["db/1.sql"]), Vec::new()))
+    );
+    let document: Value = serde_json::from_str(&held.render()).unwrap();
+    assert_eq!(document["format"], json!(4));
+    let path =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../schemas/ticket-held.schema.json");
+    let schema: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+    assert!(
+        jsonschema::validator_for(&schema)
+            .unwrap()
+            .is_valid(&document)
+    );
+    assert_eq!(TicketHeld::parse(&held.render()).unwrap(), held);
+    let mut again = held.clone();
+    again.admitted_again(false);
+    assert!(!again.yielded() && again.rebase_due);
+    let mut delivered = held.clone();
+    delivered.admitted_again(true);
+    assert!(!delivered.yielded() && !delivered.rebase_due);
+    assert_eq!(TicketHeld::parse(&again.render()).unwrap(), again);
+    // Refused: a yield of nothing, a resource that is no name.
+    let mut nothing =
+        serde_json::from_str::<Value>(&TicketHeld::dispatched(at(0)).render()).unwrap();
+    nothing["yielded_at"] = json!(at(1).to_string());
+    assert!(TicketHeld::parse(&nothing.to_string()).is_err());
+    let mut unnamed = document.clone();
+    unnamed["overlaps"][0]["resources"] = json!(["no name"]);
+    assert!(TicketHeld::parse(&unnamed.to_string()).is_err());
+    // Format 3: no yield, read as not yielded.
+    let mut older = document.clone();
+    older["format"] = json!(3);
+    assert!(TicketHeld::parse(&older.to_string()).is_err());
+    older.as_object_mut().unwrap().remove("yielded_at");
+    older["overlaps"][0]
+        .as_object_mut()
+        .unwrap()
+        .remove("resources");
+    let read = TicketHeld::parse(&older.to_string()).unwrap();
+    assert!(!read.yielded() && !read.rebase_due && read.overlaps[0].resources.is_empty());
 }

@@ -924,6 +924,10 @@ impl Watch<'_> {
         } else {
             self.overlap_switch(memory)
         };
+        // The stopped holders yield what they hold under `rebase`, before
+        // anything is weighed (OWL-621).
+        let mut read = read;
+        self.yield_stopped(memory, sink, &mut read, overlap);
         let collisions = self.collisions(&read, outside.as_ref(), overlap, &|ticket| {
             memory.holds.stands(ticket, now) || memory.base_held.contains(ticket)
         });
@@ -1875,6 +1879,96 @@ impl Watch<'_> {
         delivery.delivered_at = Some(now);
         self.write_ref(&ticket_lock, ticket, &record, ProposalsFile::Keep, seen)
             .map(|_| ())
+    }
+
+    /// The stopped holders that yield (OWL-621; architecture section 5, "A
+    /// stopped holder yields"): under `rebase`, each ticket ref of `read`
+    /// whose step's child does not run, parked or waiting for its decider
+    /// on an ask posted six hours ago or more, whose record holds something
+    /// it may yield and has not yielded ([`yields_now`]). Its yield's time
+    /// is written under the project's and the ticket's lock while its ref is
+    /// still the one read ([`Self::locked_at`]), decided again from the
+    /// record read there, with a `yield` = `yielded` event; the ref read
+    /// again then replaces it in `read`. A park writes its own yield: this
+    /// one yields a round, and a park made before this binary or while the
+    /// switch was `exclusive`. A project busy or a ref moved leaves it to
+    /// the next pass; a write that fails is warned of once.
+    fn yield_stopped(
+        &self,
+        memory: &mut Memory,
+        sink: &mut EventSink<'_>,
+        read: &mut [RefRead],
+        overlap: Overlap,
+    ) {
+        if overlap != Overlap::Rebase {
+            return;
+        }
+        let now = (self.on_demand.clock)();
+        let running: Vec<TicketId> = memory
+            .running
+            .iter()
+            .map(|running| running.ticket().clone())
+            .collect();
+        for (ticket, stored) in read.iter_mut() {
+            let seen = match stored.as_ref() {
+                Ok(found)
+                    if !running.contains(ticket) && yields_now(found, now, overlap).is_some() =>
+                {
+                    found.commit.clone()
+                }
+                _ => continue,
+            };
+            match self.write_yield(sink, ticket, &seen, now, overlap) {
+                Ok(Some(written)) => *stored = Ok(written),
+                Ok(None) => {}
+                Err(reason) => self.unreadable(memory, sink, ticket, reason),
+            }
+        }
+    }
+
+    /// [`Self::yield_stopped`] for `ticket`, its ref read at `seen`: the
+    /// ref as written, `None` when nothing was.
+    fn write_yield(
+        &self,
+        sink: &mut EventSink<'_>,
+        ticket: &TicketId,
+        seen: &str,
+        now: Timestamp,
+        overlap: Overlap,
+    ) -> Result<Option<Stored>, String> {
+        let Some((_project, ticket_lock)) = self.locked_at(ticket, seen)? else {
+            return Ok(None);
+        };
+        let git = &self.on_demand.executor.git;
+        let checkout = self.on_demand.dirs.checkout();
+        let Some(current) = ticket_ref::read(git, &checkout, ticket)? else {
+            return Ok(None);
+        };
+        let Some(why) = yields_now(&current, now, overlap) else {
+            return Ok(None);
+        };
+        let mut record = current.record;
+        let Some(held) = record.held.as_mut() else {
+            return Ok(None);
+        };
+        if !held.yield_at(now) {
+            return Ok(None);
+        }
+        let named = self
+            .on_demand
+            .config
+            .stack
+            .named_resources()
+            .unwrap_or_default();
+        let (paths, resources) = held::yielding(ticket, held, &named);
+        self.write_ref(&ticket_lock, ticket, &record, ProposalsFile::Keep, seen)?;
+        sink.emit(
+            ticket,
+            None,
+            EventKind::Decision,
+            held::yield_event(why, &paths, &resources),
+        );
+        ticket_ref::read(git, &checkout, ticket)
     }
 
     /// Writes `record` as `ticket`'s ref, from `seen`, through its run file
@@ -3080,12 +3174,18 @@ impl Watch<'_> {
         let now = (on_demand.clock)();
         let mut found = HashMap::new();
         let mut due = Vec::new();
+        // The tickets whose admission due is not a Build's: a yielded
+        // ticket's again at another stage (OWL-621).
+        let mut not_build: Vec<String> = Vec::new();
         for (ticket, stored) in refs {
             if !holds(stored) || delivery_followed(stored) {
                 continue;
             }
             let own = held::by_claim(held::in_flight(ticket, stored, &named), &times);
-            if let Some(collided) = weigh(&own, &in_flight, overlap).collision {
+            // Under `rebase` a yielded ticket is weighed as its admission
+            // again, below; under `exclusive` it holds what it held (OWL-621).
+            let readmits = own.yielded && overlap == Overlap::Rebase;
+            if !readmits && let Some(collided) = weigh(&own, &in_flight, overlap).collision {
                 found.insert(ticket.clone(), (collided, false));
                 continue;
             }
@@ -3105,6 +3205,32 @@ impl Watch<'_> {
                     )
                 })
                 .flatten();
+            // A yielded ticket's step admits it again under `rebase`, with its
+            // whole set, whatever its stage (OWL-621): in its dispatch order among the
+            // admissions due, so it comes before the Builds dispatched after
+            // it.
+            let yielded = stored
+                .record
+                .held
+                .as_ref()
+                .filter(|_| readmits)
+                .map(|held| admitted.clone().unwrap_or_else(|| held.clone()));
+            if let Some(whole) = yielded {
+                if !at_build {
+                    not_build.push(ticket.as_str().to_owned());
+                }
+                let wanted = held::of(ticket, Some(&whole), false, &named).held;
+                due.push(schedule::Due {
+                    ticket: InFlight {
+                        held: wanted.clone(),
+                        yielded: false,
+                        ..own
+                    },
+                    added: wanted,
+                    starts: !held_back(ticket),
+                });
+                continue;
+            }
             if let (Some(admitted), Some(before)) = (admitted, stored.record.held.as_ref()) {
                 due.push(schedule::Due {
                     ticket: InFlight {
@@ -3118,7 +3244,7 @@ impl Watch<'_> {
         }
         for (id, collided) in schedule::admissions(&due, &in_flight, overlap) {
             if let (Some(collided), Ok(ticket)) = (collided, TicketId::new(&id)) {
-                found.insert(ticket, (collided, true));
+                found.insert(ticket, (collided, !not_build.contains(&id)));
             }
         }
         found
@@ -3296,12 +3422,15 @@ impl Watch<'_> {
         self.check_claims(memory, sink, out, at);
         let now = (self.on_demand.clock)();
         if memory.claims_due.is_none_or(|due| now >= due) {
+            // A yielded record holds nothing under `rebase` alone (OWL-621).
+            let overlap = crate::project::overlap_at_origin_head(git, &checkout);
             let held_of = |ticket: &TicketId| {
                 held::claim_held(
                     ticket_ref::read(git, &checkout, ticket)
                         .ok()
                         .flatten()
                         .as_ref(),
+                    overlap,
                 )
             };
             let renewal = claims::renew(at, &held_of, now);
@@ -3343,6 +3472,29 @@ impl Watch<'_> {
 /// here, its ref being read by the next snapshot.
 fn holds(stored: &Stored) -> bool {
     TicketState::try_from(&stored.record.state).is_ok_and(|state| schedule::holds_slot(&state))
+}
+
+/// Why the ticket of `stored` yields what it holds at `now` under
+/// `overlap` (OWL-621, [`owlshift_core::collision::yields`]): parked, or
+/// waiting for its decider on its latest ask, posted six hours ago or
+/// more; its record holding something it may yield and not yielded.
+fn yields_now(
+    stored: &Stored,
+    now: Timestamp,
+    overlap: Overlap,
+) -> Option<owlshift_core::collision::YieldWhy> {
+    let state = TicketState::try_from(&stored.record.state).ok()?;
+    let holds = stored
+        .record
+        .held
+        .as_ref()
+        .is_some_and(owlshift_contracts::refs::TicketHeld::yieldable);
+    let asked = stored
+        .record
+        .questions
+        .latest()
+        .map(|ask| ask.at.as_millisecond());
+    owlshift_core::collision::yields(state.status(), holds, asked, now.as_millisecond(), overlap)
 }
 
 /// What an end of the following adds to the `ended` event, and the words it

@@ -124,6 +124,9 @@ pub struct Summary {
     /// another person decides are left out (OWL-584).
     pub waiting: BTreeSet<TicketId>,
     pub parked: BTreeSet<TicketId>,
+    /// The parked tickets that yielded what they hold under `policy.overlap
+    /// = "rebase"` (OWL-621).
+    pub yielding: BTreeSet<TicketId>,
     /// Whether `<data>/service/pause` stands.
     pub all_paused: bool,
     /// The served projects whose pause file stands.
@@ -190,6 +193,9 @@ pub fn gather(
                     }
                 }
                 Status::Parked { .. } => {
+                    if standing.yielded {
+                        summary.yielding.insert(ticket.clone());
+                    }
                     summary.parked.insert(ticket);
                 }
                 Status::Active(_) => {}
@@ -293,8 +299,13 @@ pub fn line(summary: &Summary, tz: &TimeZone) -> String {
         ));
     }
     if !summary.parked.is_empty() {
+        // OWL-621: those that yielded what they hold block no one.
+        let yielding = match summary.yielding.len() {
+            0 => String::new(),
+            n => format!(", {n} of them yielding what they hold"),
+        };
         parts.push(format!(
-            "{} parked ({})",
+            "{} parked ({}{yielding})",
             summary.parked.len(),
             named(&summary.parked)
         ));
@@ -582,7 +593,8 @@ mod tests {
                 "OWL-1", "OWL-2", "OWL-3", "OWL-4", "OWL-5", "OWL-6", "OWL-7",
             ]),
             waiting: ids(&["OWL-8"]),
-            parked: ids(&["OWL-9"]),
+            parked: ids(&["OWL-9", "OWL-10"]),
+            yielding: ids(&["OWL-10"]),
             all_paused: false,
             paused: vec!["acme/web".to_owned()],
             usage: vec![
@@ -593,8 +605,9 @@ mod tests {
         assert_eq!(
             line(&summary, &paris()),
             "Owlshift digest: 7 delivered (OWL-1, OWL-2, OWL-3, OWL-4, OWL-5 and 2 more); 1 \
-             waiting for a person (OWL-8); 1 parked (OWL-9); paused: acme/web; usage: claude at \
-             its limit until Mon 14:05, codex 42 %. More: `owlshift status`."
+             waiting for a person (OWL-8); 2 parked (OWL-10, OWL-9, 1 of them yielding what \
+             they hold); paused: acme/web; usage: claude at its limit until Mon 14:05, codex \
+             42 %. More: `owlshift status`."
         );
         let quiet = Summary {
             all_paused: true,

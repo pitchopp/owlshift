@@ -69,6 +69,83 @@ pub struct Folded {
     /// Each narrowing of a ticket's held set at its Build (OWL-461), oldest
     /// first.
     pub narrowed: BTreeMap<TicketId, Vec<Narrowed>>,
+    /// What a stopped holder's yield came to (OWL-621), oldest first, under
+    /// the ticket that yielded: the yield, each taking of what it held, its
+    /// admission again and its rebase. `yield` `decision` events.
+    pub yields: BTreeMap<TicketId, Vec<YieldNote>>,
+}
+
+/// A line of what a ticket's yield came to (OWL-621).
+#[derive(Clone, Debug, PartialEq)]
+pub struct YieldNote {
+    pub at: Timestamp,
+    pub text: String,
+}
+
+/// What a `yield` decision event of `ticket` says, under the ticket it is
+/// about: the taken one for a taking, `ticket` otherwise.
+fn yield_notes(event: &Event, ticket: &TicketId) -> Vec<(TicketId, String)> {
+    let strings = |key: &str| -> Vec<String> {
+        event
+            .data
+            .get(key)
+            .and_then(Value::as_array)
+            .map_or_else(Vec::new, |all| {
+                all.iter()
+                    .filter_map(Value::as_str)
+                    .map(str::to_owned)
+                    .collect()
+            })
+    };
+    let what = || {
+        let mut named: Vec<String> = strings("resources")
+            .iter()
+            .map(|name| format!("resource `{name}`"))
+            .collect();
+        named.extend(strings("paths").iter().map(|path| format!("`{path}`")));
+        if named.is_empty() {
+            "nothing it lists".to_owned()
+        } else {
+            named.join(", ")
+        }
+    };
+    match event.data.get("yield").and_then(Value::as_str) {
+        Some("yielded") => {
+            let why = match event.data.get("why").and_then(Value::as_str) {
+                Some("round") => "its round waited six hours for its decider",
+                _ => "parked",
+            };
+            vec![(
+                ticket.clone(),
+                format!("yielded what it held ({why}): {}", what()),
+            )]
+        }
+        Some("taken") => strings("tickets")
+            .into_iter()
+            .filter_map(|taken| TicketId::new(&taken).ok())
+            .map(|taken| (taken, format!("{ticket} took {}", what())))
+            .collect(),
+        Some("readmitted") => {
+            let stage = event
+                .data
+                .get("stage")
+                .and_then(Value::as_str)
+                .unwrap_or("?");
+            vec![(ticket.clone(), format!("admitted again at {stage}"))]
+        }
+        Some("rebase") => {
+            let onto = event
+                .data
+                .get("onto")
+                .and_then(Value::as_str)
+                .unwrap_or("?");
+            vec![(
+                ticket.clone(),
+                format!("its branch rebased onto {onto} before its Build went on"),
+            )]
+        }
+        _ => Vec::new(),
+    }
 }
 
 /// A ticket's held set narrowed to its plan's files at its Build (OWL-461;
@@ -128,6 +205,14 @@ impl Folded {
                     dropped,
                     count: count.unwrap_or(0),
                 });
+        }
+        if event.kind == EventKind::Decision {
+            for (about, text) in yield_notes(event, ticket) {
+                self.yields
+                    .entry(about)
+                    .or_default()
+                    .push(YieldNote { at: event.at, text });
+            }
         }
         if let Some(waiting) = waiting(event, ticket) {
             self.history
@@ -523,6 +608,8 @@ pub struct Report {
     pub folded: Folded,
     /// Each ticket's stage, from its ref.
     pub stages: HashMap<TicketId, String>,
+    /// The tickets whose ref yielded what it holds (OWL-621).
+    pub yielded: BTreeSet<TicketId>,
     pub quarantined: bool,
     /// Why part of the picture could not be read.
     pub notes: Vec<String>,
@@ -561,6 +648,8 @@ pub struct Overlap {
     pub ticket: TicketId,
     pub sibling: TicketId,
     pub paths: Vec<String>,
+    /// The named resources a taking recorded (OWL-621).
+    pub resources: Vec<String>,
     pub at: Timestamp,
 }
 
@@ -601,9 +690,15 @@ pub fn gather(
     let (events, bad) = read_events(crate::events::EventLog::in_dir(data_dir).path())?;
     let mut notes = bad;
     let folded = fold(&events, project);
-    let stages = statuses(dirs, &mut notes)
+    let standings = read_standings(dirs, &mut notes);
+    let yielded = standings
+        .iter()
+        .filter(|standing| standing.yielded)
+        .map(|standing| standing.ticket.clone())
+        .collect();
+    let stages = standings
         .into_iter()
-        .map(|(ticket, status)| (ticket, stage_text(status)))
+        .map(|standing| (standing.ticket, stage_text(standing.status)))
         .collect();
     let quarantined = match dirs.quarantine() {
         Ok(marker) => marker.is_some(),
@@ -677,6 +772,7 @@ pub fn gather(
         only,
         folded,
         stages,
+        yielded,
         quarantined,
         notes,
         limits,
@@ -803,7 +899,7 @@ pub fn claim_words(
 
 /// The tickets whose ref holds (`held::holds`, a ref that cannot be read
 /// holding), in the project of `dirs`; none while its checkout does not
-/// exist. `None` when the refs cannot be listed, which [`statuses`] says:
+/// exist. `None` when the refs cannot be listed, which [`read_standings`] says:
 /// nothing is then known not to be in flight.
 fn in_flight(dirs: &ProjectDirs) -> Option<BTreeSet<TicketId>> {
     let mut holding = BTreeSet::new();
@@ -824,19 +920,11 @@ fn in_flight(dirs: &ProjectDirs) -> Option<BTreeSet<TicketId>> {
     Some(holding)
 }
 
-/// Each ticket ref's status in the project of `dirs`, admitted or not; none
-/// while its checkout does not exist. What cannot be read is said in
-/// `notes`. Shared with the daily digest (OWL-440).
-pub(crate) fn statuses(dirs: &ProjectDirs, notes: &mut Vec<String>) -> Vec<(TicketId, Status)> {
-    read_standings(dirs, notes)
-        .into_iter()
-        .map(|standing| (standing.ticket, standing.status))
-        .collect()
-}
-
-/// [`statuses`], each with whether watch follows the ticket's pull request
-/// (`watch::followed`): a pull request for a person to review, which the
-/// web UI's header counts (OWL-467). The refs are read once.
+/// Each ticket ref's status in the project of `dirs`, admitted or not, as
+/// [`read_standings`] reads them, each with whether watch follows the
+/// ticket's pull request (`watch::followed`): a pull request for a person to
+/// review, which the web UI's header counts (OWL-467). The refs are read
+/// once.
 pub(crate) fn standings(
     dirs: &ProjectDirs,
     notes: &mut Vec<String>,
@@ -858,16 +946,24 @@ pub(crate) struct RefStanding {
     /// ([`ticket_ref::TicketRecord::open_ask`]), which the daily digest
     /// tells the operator's own by (OWL-584).
     pub decider: Option<String>,
+    /// Whether its record yielded what it holds (OWL-621), under the
+    /// project's `policy.overlap = "rebase"` at `origin/HEAD`, under which
+    /// alone a yield holds nothing: what `why` and the daily digest tell.
+    pub yielded: bool,
 }
 
-/// Each ticket ref's [`RefStanding`] in the project of `dirs`, as [`statuses`]
+/// Each ticket ref's [`RefStanding`] in the project of `dirs`, as [`standings`]
 /// reads them.
 pub(crate) fn read_standings(dirs: &ProjectDirs, notes: &mut Vec<String>) -> Vec<RefStanding> {
     let mut standings = Vec::new();
     if !dirs.checkout().exists() {
         return standings;
     }
-    match ticket_ref::all(&crate::project::runner_git(), &dirs.checkout()) {
+    let git = crate::project::runner_git();
+    // A yield holds nothing under `rebase` alone (OWL-621).
+    let rebase = crate::project::overlap_at_origin_head(&git, &dirs.checkout())
+        == owlshift_core::vocab::Overlap::Rebase;
+    match ticket_ref::all(&git, &dirs.checkout()) {
         Ok(refs) => {
             for (ticket, stored) in refs {
                 let stored = match stored {
@@ -886,6 +982,12 @@ pub(crate) fn read_standings(dirs: &ProjectDirs, notes: &mut Vec<String>) -> Vec
                                 .record
                                 .open_ask()
                                 .map(|ask| ask.decider.account.clone()),
+                            yielded: rebase
+                                && stored
+                                    .record
+                                    .held
+                                    .as_ref()
+                                    .is_some_and(|held| held.yielded()),
                             ticket,
                             status,
                         });
@@ -948,6 +1050,7 @@ fn overlaps_held(dirs: &ProjectDirs) -> Vec<Overlap> {
                 ticket: ticket.clone(),
                 sibling: kept.ticket.clone(),
                 paths: kept.paths.clone(),
+                resources: kept.resources.clone(),
                 at: kept.at,
             });
         }
@@ -987,6 +1090,9 @@ pub fn render(report: &Report) -> String {
             }
             for wait in history {
                 let _ = writeln!(out, "  {} waits: {}", wait.at, phrase(wait));
+            }
+            for note in folded.yields.get(ticket).map_or(&[][..], Vec::as_slice) {
+                let _ = writeln!(out, "  {} {}", note.at, note.text);
             }
             for narrowed in folded.narrowed.get(ticket).map_or(&[][..], Vec::as_slice) {
                 let dropped = if narrowed.dropped.is_empty() {
@@ -1044,15 +1150,22 @@ pub fn render(report: &Report) -> String {
                 );
             }
             // A ticket that waits for a person keeps what it holds
-            // (architecture, section 5): named from its ref.
+            // (architecture, section 5): named from its ref; one that
+            // yielded it under `rebase` holds nothing (OWL-621).
             for (ticket, stage) in &report.stages {
                 if !folded.current.contains_key(ticket)
                     && (stage.ends_with("needs input") || stage.ends_with("parked"))
                 {
+                    let holding = if report.yielded.contains(ticket) {
+                        "has yielded what it held: other tickets may take it, and it is admitted \
+                         again before its next run"
+                    } else {
+                        "keeps what it holds"
+                    };
                     let _ = writeln!(
                         out,
                         "  {ticket} [{stage}]: waits for a person (an answer, or \
-                         `owlshift continue`) and keeps what it holds"
+                         `owlshift continue`) and {holding}"
                     );
                 }
             }
@@ -1151,7 +1264,12 @@ pub fn render(report: &Report) -> String {
     if !overlaps.is_empty() {
         let _ = writeln!(out, "overlaps (`policy.overlap = \"rebase\"`):");
         for overlap in overlaps {
-            let paths: Vec<String> = overlap.paths.iter().map(|p| format!("`{p}`")).collect();
+            let paths: Vec<String> = overlap
+                .resources
+                .iter()
+                .map(|name| format!("resource `{name}`"))
+                .chain(overlap.paths.iter().map(|p| format!("`{p}`")))
+                .collect();
             let _ = writeln!(
                 out,
                 "  {} and {} share {} (recorded by {} at {}): the first to merge refreshes the \
@@ -1844,6 +1962,7 @@ mod tests {
             left_out: Left::default(),
             folded,
             stages: HashMap::new(),
+            yielded: BTreeSet::new(),
             quarantined: false,
             notes: Vec::new(),
             limits: Vec::new(),
@@ -1871,6 +1990,87 @@ mod tests {
             ),
             "{text}"
         );
+    }
+
+    /// OWL-621: `why TICKET` on a yielded ticket lists its yield, who took
+    /// what of it, its admission again and its rebase; the project's view
+    /// says a parked ticket that yielded holds nothing.
+    #[test]
+    fn a_yield_and_each_taking_are_told_for_the_ticket_that_yielded() {
+        let id = |name: &str| TicketId::new(name).unwrap();
+        let strings = |items: &[&str]| -> Vec<String> {
+            items.iter().map(|item| (*item).to_owned()).collect()
+        };
+        let taking = crate::held::Kept {
+            sibling: id("LOC-1520"),
+            paths: strings(&["db/0002.sql"]),
+            resources: strings(&["leases-migrations"]),
+            yielded: true,
+        };
+        let events = [
+            waits(
+                "2026-11-21T09:00:00Z",
+                "LOC-1520",
+                crate::held::yield_event(
+                    owlshift_core::collision::YieldWhy::Parked,
+                    &strings(&["db/0002.sql"]),
+                    &strings(&["leases-migrations"]),
+                ),
+            ),
+            waits(
+                "2026-11-21T10:00:00Z",
+                "LOC-1530",
+                crate::held::overlap_event("admission", &taking),
+            ),
+            waits(
+                "2026-11-21T12:00:00Z",
+                "LOC-1520",
+                crate::held::readmitted_event("build", true),
+            ),
+        ];
+        let report = Report {
+            project: "o/r".to_owned(),
+            only: Some(id("LOC-1520")),
+            left_out: Left::default(),
+            folded: fold(&events, "o/r"),
+            stages: HashMap::new(),
+            yielded: BTreeSet::new(),
+            quarantined: false,
+            notes: Vec::new(),
+            limits: Vec::new(),
+            slots: None,
+            bases: Vec::new(),
+            overlaps: Vec::new(),
+            claim: None,
+        };
+        let text = render(&report);
+        for line in [
+            "  2026-11-21T09:00:00Z yielded what it held (parked): resource `leases-migrations`, \
+             `db/0002.sql`\n",
+            "  2026-11-21T10:00:00Z LOC-1530 took resource `leases-migrations`, `db/0002.sql`\n",
+            "  2026-11-21T12:00:00Z admitted again at build\n",
+        ] {
+            assert!(text.contains(line), "{line}\n{text}");
+        }
+        let project = Report {
+            only: None,
+            folded: Folded::default(),
+            stages: HashMap::from([
+                (id("LOC-1520"), "build, parked".to_owned()),
+                (id("LOC-1424"), "build, parked".to_owned()),
+            ]),
+            yielded: BTreeSet::from([id("LOC-1520")]),
+            ..report
+        };
+        let text = render(&project);
+        assert!(
+            text.contains(
+                "  LOC-1520 [build, parked]: waits for a person (an answer, or `owlshift \
+                 continue`) and has yielded what it held"
+            ),
+            "{text}"
+        );
+        assert!(text.contains("LOC-1424 [build, parked]: waits for a person (an answer, or `owlshift continue`) and keeps what it holds"), "{text}");
     }
 
     /// OWL-588: `why TICKET` names who holds the ticket's claim: this
@@ -1954,6 +2154,7 @@ mod tests {
                 ticket: id("OWL-2"),
                 sibling: id("OWL-1"),
                 paths: vec!["app/one.rs".to_owned()],
+                resources: Vec::new(),
                 at: "2026-10-20T09:30:00Z".parse().unwrap(),
             }],
             project: "o/r".to_owned(),
@@ -1962,6 +2163,7 @@ mod tests {
             claim: None,
             folded: Folded::default(),
             stages: HashMap::from([(id("OWL-4"), "verify, parked".to_owned())]),
+            yielded: BTreeSet::new(),
             quarantined: true,
             notes: vec!["a note".to_owned()],
             limits: vec![

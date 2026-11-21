@@ -541,10 +541,11 @@ pub struct FirstAttemptJob {
 /// What a rebase run rebases (OWL-210). Every path is data from the
 /// repository, never an instruction.
 ///
-/// Two kinds, told apart by flat fields rather than an enum, which the role
-/// prompt and the schema read as they are: a delivered ticket's, at Watch,
-/// with its `pull_request` and `url`; and since format 27 a held Build's
-/// (OWL-427), with `broken` and no pull request, the ticket not delivered.
+/// Three kinds, told apart by flat fields rather than an enum, which the
+/// role prompt and the schema read as they are: a delivered ticket's, at
+/// Watch, with its `pull_request` and `url`; since format 27 a held Build's
+/// (OWL-427), with `broken` and no pull request, the ticket not delivered;
+/// and a yielded Build's (OWL-621), with `yielded` and no pull request.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct RebaseBrief {
@@ -579,18 +580,37 @@ pub struct RebaseBrief {
     /// brief's `gate` is empty: the runner runs the Build's gate after.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub broken: Option<String>,
+    /// A yielded Build's rebase (OWL-621; architecture section 5, "A
+    /// stopped holder yields"): the ticket stopped and yielded what it held,
+    /// other tickets took some of it and the base has since changed those
+    /// paths; it is admitted again and its branch moves onto `onto` before
+    /// its Build goes on. Not delivered: no pull request, and the brief's
+    /// `gate` is empty, as for a held Build's.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub yielded: bool,
 }
 
 impl RebaseBrief {
-    /// Why this rebase is refused: a pull request and `broken` together or
-    /// neither, a `url` without its pull request or the reverse, a held
-    /// Build's rebase as a refresh, or a blank `broken`.
+    /// Why this rebase is refused: not exactly one of a pull request,
+    /// `broken` and `yielded`, a `url` without its pull request or the
+    /// reverse, a held or yielded Build's rebase as a refresh, or a blank
+    /// `broken`.
     fn refusal(&self) -> Option<&'static str> {
-        if self.pull_request.is_some() == self.broken.is_some() {
-            return Some("a rebase names either its pull request or its broken base, and not both");
+        let kinds = [
+            self.pull_request.is_some(),
+            self.broken.is_some(),
+            self.yielded,
+        ];
+        if kinds.iter().filter(|kind| **kind).count() != 1 {
+            return Some(
+                "a rebase names exactly one of its pull request, its broken base or its yield",
+            );
         }
         if self.pull_request.is_some() != self.url.is_some() {
             return Some("a rebase's pull request and its url go together");
+        }
+        if self.yielded && self.refresh {
+            return Some("a yielded Build's rebase is no refresh");
         }
         match &self.broken {
             Some(_) if self.refresh => Some("a held Build's rebase is no refresh"),

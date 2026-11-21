@@ -84,6 +84,19 @@ enum Settled {
     Due { command: Option<String> },
 }
 
+/// What a Build's branch is rebased off ([`OnDemand::rebase_held`]).
+#[derive(Clone, Copy, Debug)]
+enum Off<'a> {
+    /// A held commit, which fails its gate at `failed` when known (OWL-427).
+    Held {
+        commit: &'a str,
+        failed: Option<&'a str>,
+    },
+    /// The commit where a yielded ticket's branch parts from the base, which
+    /// has since changed what its overlaps reach (OWL-621).
+    Yielded { from: &'a str },
+}
+
 /// What a held Build does about the default branch's newer head (OWL-427).
 enum Left {
     /// It stays held; `due` when the head's check could not run yet
@@ -123,6 +136,34 @@ impl OnDemand<'_> {
             .map(KeptFailing::failing);
         match self.settle(p, dispatched, failing.as_ref(), sink)? {
             Settled::Go => {
+                // A yielded ticket admitted again is rebased first onto what
+                // the tickets that took its paths merged (OWL-621), a done
+                // Build's result kept at the rebased head, as below.
+                if let Left::Rebased(rebased, followups) =
+                    self.after_yield(p, command, dispatched, state, sink)?
+                {
+                    let done = wait.and_then(|wait| {
+                        let done = wait.done?;
+                        self.keep_wait(
+                            p,
+                            &rebased,
+                            WaitAt::Build,
+                            state.round(),
+                            (wait.failing, Some(done.clone())),
+                            None,
+                            sink,
+                        );
+                        Some(done)
+                    });
+                    if done.is_none() {
+                        self.drop_wait(&p.ticket, sink);
+                    }
+                    return Ok(Resume::Rebased {
+                        dispatched: rebased,
+                        done,
+                        followups,
+                    });
+                }
                 // A done Build's result stays kept until its gate has run
                 // again ([`Self::regate_role`]), so a checked stop before
                 // then leaves it for the next start (OWL-161).
@@ -263,7 +304,10 @@ impl OnDemand<'_> {
         let followups = self.rebase_held(
             p,
             state,
-            (&held, failed),
+            Off::Held {
+                commit: &held,
+                failed,
+            },
             &configured.rules,
             &start,
             dispatched,
@@ -271,7 +315,135 @@ impl OnDemand<'_> {
         )?;
         // Its merge-base with the base is the head now: configured there.
         let rebased = self.dispatch(p, command, sink)?;
+        // Onto the head: what a yield's rebase would have done (OWL-621).
+        self.yield_rebase_decided(p, state)?;
         Ok(Left::Rebased(Box::new(rebased), followups))
+    }
+
+    /// A yielded ticket admitted again whose branch's rebase is due
+    /// ([`TicketHeld::rebase_due`], OWL-621; architecture section 5, "A
+    /// stopped holder yields", "The resume"): decided at this Build step,
+    /// then no longer due. When the base this command fetched changed what
+    /// its overlaps reach ([`held::Reach`]), and under remote claims what it
+    /// holds itself ([`held::resume_reach`]), since its branch parted from
+    /// it, a branch with commits of its own and a clean worktree is rebased
+    /// onto that base by one `rebase` role run, as a held Build's is
+    /// ([`Self::rebase_held`], its brief `yielded`), and one with none is
+    /// fast-forwarded ([`Self::start_from_base`]); either is dispatched again
+    /// there, given back with what the run proposed. A worktree with
+    /// uncommitted paths is not rebased, a `warning` (`yield_not_rebased`)
+    /// naming them; a delivered ticket is Watch's refresh's. A base git
+    /// cannot read leaves it due, for the next Build step.
+    fn after_yield(
+        &self,
+        p: &mut Prepared,
+        command: Command,
+        dispatched: &Dispatched,
+        state: &TicketState,
+        sink: &mut EventSink<'_>,
+    ) -> Result<Left, Stop> {
+        let stay = Left::Stay { due: false };
+        if !p.held.as_ref().is_some_and(|held| held.rebase_due) {
+            return Ok(stay);
+        }
+        let head = p.base.commit.clone();
+        let (branch, start) = self.held_branch(p, &head)?;
+        // Under remote claims its own set too: another runner's taking
+        // records no overlap here (OWL-621).
+        let named = self.config.stack.named_resources().unwrap_or_default();
+        let reach = held::resume_reach(
+            &p.ticket,
+            p.held.as_ref(),
+            &self.sharings(p),
+            &named,
+            p.claims,
+        );
+        let moved = |start: &str| {
+            held::base_moved_on(&self.executor.git, &p.checkout, start, None, &head, &reach)
+        };
+        let rebased = match branch {
+            HeldBranch::Delivered => stay,
+            HeldBranch::NoCommitsOfItsOwn if start.is_empty() => stay,
+            HeldBranch::Uncommitted => {
+                sink.emit(
+                    &p.ticket,
+                    None,
+                    EventKind::Warning,
+                    data([
+                        ("what", json!("yield_not_rebased")),
+                        ("onto", json!(head)),
+                        ("reason", json!(start)),
+                    ]),
+                );
+                stay
+            }
+            HeldBranch::NoCommitsOfItsOwn => match moved(&start) {
+                Err(_) => return Ok(stay),
+                Ok(false) => stay,
+                Ok(true) => {
+                    let section = self.section()?;
+                    self.start_from_base(p)?;
+                    drop(section);
+                    sink.emit(
+                        &p.ticket,
+                        None,
+                        EventKind::Decision,
+                        data([
+                            ("yield", json!("rebase")),
+                            ("from", json!(start)),
+                            ("onto", json!(head)),
+                            ("fast_forward", json!(true)),
+                        ]),
+                    );
+                    Left::Rebased(Box::new(self.dispatch(p, command, sink)?), Vec::new())
+                }
+            },
+            HeldBranch::OwnCommits => match moved(&start) {
+                Err(_) => return Ok(stay),
+                Ok(false) => stay,
+                Ok(true) => {
+                    let from = self.merge_base(p, &start, &head).unwrap_or_default();
+                    let configured = self.dispatch_rules(p, Command::Rebase, sink)?;
+                    let followups = self.rebase_held(
+                        p,
+                        state,
+                        Off::Yielded { from: &from },
+                        &configured.rules,
+                        &start,
+                        dispatched,
+                        sink,
+                    )?;
+                    Left::Rebased(Box::new(self.dispatch(p, command, sink)?), followups)
+                }
+            },
+        };
+        self.yield_rebase_decided(p, state)?;
+        Ok(rebased)
+    }
+
+    /// A yielded ticket's rebase on resume decided (OWL-621): no longer due,
+    /// kept.
+    fn yield_rebase_decided(&self, p: &mut Prepared, state: &TicketState) -> Result<(), Stop> {
+        match p.held.as_mut() {
+            Some(held) if held.rebase_due => held.rebase_due = false,
+            _ => return Ok(()),
+        }
+        self.keep(p, state)
+    }
+
+    /// The commit where `start` and `head` part, in the dedicated
+    /// checkout; `None` when git cannot say.
+    fn merge_base(&self, p: &Prepared, start: &str, head: &str) -> Option<String> {
+        self.executor
+            .git
+            .output(
+                &p.checkout,
+                &["merge-base", "--end-of-options", start, head],
+                None,
+            )
+            .ok()
+            .filter(|out| out.success())
+            .map(|out| String::from_utf8_lossy(&out.stdout).trim().to_owned())
     }
 
     /// The held ticket's branch as [`owlshift_core::base::leave`] reads it,
@@ -337,7 +509,7 @@ impl OnDemand<'_> {
         &self,
         p: &mut Prepared,
         state: &TicketState,
-        (held, failed): (&str, Option<&str>),
+        off: Off<'_>,
         rules: &ProjectRules,
         start: &str,
         dispatched: &Dispatched,
@@ -348,13 +520,18 @@ impl OnDemand<'_> {
         let classified = rebase::classify(git, &p.checkout, &onto, start, false);
         let fast = classified.trivial;
         let harness = self.rebase_harness(fast, dispatched);
+        let (key, from) = match off {
+            Off::Held { commit, .. } => ("base", commit.to_owned()),
+            // OWL-621: from the commit the branch parted from the base.
+            Off::Yielded { from } => ("yield", from.to_owned()),
+        };
         sink.emit(
             &p.ticket,
             None,
             EventKind::Decision,
             data([
-                ("base", json!("rebase")),
-                ("from", json!(held)),
+                (key, json!("rebase")),
+                ("from", json!(from)),
                 ("onto", json!(onto)),
                 ("trivial", json!(classified.trivial)),
                 ("tier", json!(rebase_tier(fast))),
@@ -375,7 +552,11 @@ impl OnDemand<'_> {
             onto: onto.clone(),
             refresh: false,
             conflicting: classified.paths.clone(),
-            broken: Some(held.to_owned()),
+            broken: match off {
+                Off::Held { commit, .. } => Some(commit.to_owned()),
+                Off::Yielded { .. } => None,
+            },
+            yielded: matches!(off, Off::Yielded { .. }),
         });
         let mut gathered = Gathered::default();
         let (ran, event) =
@@ -414,19 +595,35 @@ impl OnDemand<'_> {
             Ok(Transition::Parked { state: parked, .. }) => parked,
             other => return Err(core_error(other)),
         };
-        let failing =
-            failed.map_or_else(|| "its gate".to_owned(), |command| format!("`{command}`"));
-        let detail = format!(
-            "{ticket}'s branch was made from {held_short}, which fails {failing}; {base}'s head \
-             {onto_short} passes, and the rebase onto it was not taken: {why}. The branch is \
-             left at {start_short}. Say on the ticket what the rebase needs, if anything, then \
-             `owlshift continue {ticket}` runs it again.",
-            ticket = p.ticket,
-            held_short = base::short(held),
-            base = p.base.branch,
-            onto_short = base::short(&onto),
-            start_short = base::short(start),
-        );
+        let detail = match off {
+            Off::Held { commit, failed } => {
+                let failing =
+                    failed.map_or_else(|| "its gate".to_owned(), |command| format!("`{command}`"));
+                format!(
+                    "{ticket}'s branch was made from {held_short}, which fails {failing}; \
+                     {base}'s head {onto_short} passes, and the rebase onto it was not taken: \
+                     {why}. The branch is left at {start_short}. Say on the ticket what the \
+                     rebase needs, if anything, then `owlshift continue {ticket}` runs it again.",
+                    ticket = p.ticket,
+                    held_short = base::short(commit),
+                    base = p.base.branch,
+                    onto_short = base::short(&onto),
+                    start_short = base::short(start),
+                )
+            }
+            Off::Yielded { from } => format!(
+                "{ticket} yielded what it held and was admitted again; {base}'s head \
+                 {onto_short} changed what the tickets that took it share with it since its \
+                 branch left {from_short}, and the rebase onto it was not taken: {why}. The \
+                 branch is left at {start_short}. Say on the ticket what the rebase needs, if \
+                 anything, then `owlshift continue {ticket}` runs it again.",
+                ticket = p.ticket,
+                base = p.base.branch,
+                onto_short = base::short(&onto),
+                from_short = base::short(from),
+                start_short = base::short(start),
+            ),
+        };
         Err(self.park_with(
             p,
             &parked,

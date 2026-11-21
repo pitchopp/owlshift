@@ -3800,6 +3800,50 @@ pub struct ParkedComment {
     pub round: Option<NonZeroU32>,
     pub open: Vec<(Question, AnswerVerdict)>,
     pub restart: Restart,
+    /// What it yields under `policy.overlap = "rebase"` (OWL-621), when it
+    /// does.
+    pub yields: Option<Yielding>,
+}
+
+/// What a parked ticket yields (OWL-621; architecture section 5, "A stopped
+/// holder yields"): its zones and files, and its named resources.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Yielding {
+    pub paths: Vec<String>,
+    pub resources: Vec<String>,
+}
+
+/// The most paths and resources a PARKED comment names of what its ticket
+/// yields; it counts the rest.
+const YIELDS_NAMED: usize = 10;
+
+impl Yielding {
+    /// The PARKED comment's line: what the ticket yields, and what its
+    /// restart does.
+    fn line(&self) -> String {
+        let named: Vec<String> = self
+            .resources
+            .iter()
+            .map(|name| format!("resource {}", code(name)))
+            .chain(self.paths.iter().map(|path| code(&flatten(path))))
+            .collect();
+        let mut list = named
+            .iter()
+            .take(YIELDS_NAMED)
+            .cloned()
+            .collect::<Vec<_>>()
+            .join(", ");
+        if named.len() > YIELDS_NAMED {
+            list.push_str(&format!(" and {} more", named.len() - YIELDS_NAMED));
+        }
+        format!(
+            "**It yields what it held** ({}): {list}. Other tickets may take them while it is \
+             parked. Restarted, it is admitted again before its next run, waiting there while \
+             another ticket holds them, and its branch is rebased first when the base changed \
+             what they took.",
+            code("policy.overlap = \"rebase\"")
+        )
+    }
 }
 
 impl ParkedComment {
@@ -3896,6 +3940,9 @@ impl ParkedComment {
                 }
                 sections.push(line);
             }
+        }
+        if let Some(yields) = &self.yields {
+            sections.push(yields.line());
         }
         // OWL-488: the decider's reply `continue` first, read by a running
         // `owlshift watch`, then the command.
@@ -6902,6 +6949,7 @@ Context.
             round: None,
             open: Vec::new(),
             restart,
+            yields: None,
         };
         let continue_it = "**To restart it:** reply `continue` here, in a comment of its own, or \
                            run `owlshift continue OWL-18`.";
@@ -7499,6 +7547,7 @@ Reply `Q1: B`, `ok` to take every recommendation, or in your own words.
                     round: Some(round),
                     open: vec![(question.clone(), verdict.clone())],
                     restart: Restart::Continue,
+                    yields: None,
                 }
                 .render(),
                 DecisionComment {
@@ -7629,6 +7678,7 @@ Reply `Q1: B`, `ok` to take every recommendation, or in your own words.
             round: None,
             open: Vec::new(),
             restart: Restart::Do,
+            yields: None,
         };
         assert_eq!(writer.post_parked(&parked).unwrap().body, parked.render());
         assert_eq!(tracker.posts.get(), 4);
@@ -7850,6 +7900,7 @@ Reply `Q1: B`, `ok` to take every recommendation, or in your own words.
             round: None,
             open: Vec::new(),
             restart: Restart::Do,
+            yields: None,
         };
         let delivery = report(Err(forge::Error::new(ErrorKind::Unauthorized, "not read")));
         assert_eq!(
@@ -8917,6 +8968,39 @@ Reply `Q1: B`, `ok` to take every recommendation, or in your own words.
         };
         assert!(chars(&long.render()) <= MAX_DOCUMENT_CHARS);
     }
+    /// OWL-621: a PARKED comment says what its ticket yields under
+    /// `rebase`, its named resources first, ten named and the rest counted,
+    /// and what its restart does; one that yields nothing says nothing of it.
+    #[test]
+    fn a_parked_comment_says_what_its_ticket_yields() {
+        let mut parked = ParkedComment {
+            ticket: ticket(),
+            reason: ParkReason::FailedRuns,
+            detail: "the gate failed".to_owned(),
+            round: None,
+            open: Vec::new(),
+            restart: Restart::Continue,
+            yields: None,
+        };
+        assert!(!parked.render().contains("yields"));
+        parked.yields = Some(Yielding {
+            paths: (1..=11).map(|n| format!("db/{n:04}.sql")).collect(),
+            resources: vec!["migrations".to_owned()],
+        });
+        let body = parked.render();
+        assert!(
+            body.contains(
+                "**It yields what it held** (`policy.overlap = \"rebase\"`): resource \
+                 `migrations`, `db/0001.sql`,"
+            ),
+            "{body}"
+        );
+        assert!(body.contains("`db/0009.sql` and 2 more. Other tickets may take them"));
+        assert!(body.contains("its branch is rebased first when the base changed what they took"));
+        let restart = body.find("**To restart it:**").unwrap();
+        assert!(body.find("**It yields").unwrap() < restart);
+    }
+
     /// OWL-228: a PARKED comment at the re-ask limit of a round at its
     /// bounds, or with a detail of a whole result, holds in one comment;
     /// the detail is cut to 8,000 characters.
@@ -8929,6 +9013,7 @@ Reply `Q1: B`, `ok` to take every recommendation, or in your own words.
             round: NonZeroU32::new(3),
             open: maximal_open(),
             restart: Restart::Continue,
+            yields: None,
         };
         let blocked = ParkedComment {
             reason: ParkReason::Blocked,
@@ -9773,6 +9858,7 @@ Reply `Q1: B`, `ok` to take every recommendation, or in your own words.
                 round: None,
                 open: Vec::new(),
                 restart: Restart::Do,
+                yields: None,
             }))
         }),
         ("post_quarantine_wait", |w, _| {

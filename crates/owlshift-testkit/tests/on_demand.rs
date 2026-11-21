@@ -12767,6 +12767,10 @@ mod merge_scenarios;
 #[path = "on_demand/overlap_scenarios.rs"]
 mod overlap_scenarios;
 
+/// Scenario S5 when a holder parks or waits for its decider (OWL-621).
+#[path = "on_demand/yield_scenarios.rs"]
+mod yield_scenarios;
+
 /// What each ticket in flight waits on, read by `owlshift status --waits`
 /// from a drain's refs and events (OWL-459).
 #[path = "on_demand/waits_scenarios.rs"]

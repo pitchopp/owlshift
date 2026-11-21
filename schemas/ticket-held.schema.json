@@ -1,7 +1,7 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "Owlshift ticket held",
-  "description": "What a ticket holds against the project's other tickets, in\n[`HELD_FILE`] (OWL-403, architecture section 5, \"What a ticket holds\"):\nwritten at its dispatch with nothing admitted, given what its Build's\nadmission takes (OWL-448, \"Resources admitted at Build\"), widened by the\nfiles its branch changes, and never narrowed while the ticket holds\nanything, until its pull request ends, but once: a record admitted\nwithout a plan is admitted again from its next Build's plan\n([`Self::narrows`], [`Self::readmit`], OWL-461). A ticket dispatched before it was\nkept has none and holds the whole repository. Not in `intake.json`, which\nbelongs to the ticket's text and is replaced by the next intake.\n\nFormat 1, written before OWL-448, held what its dispatch declared: it\nreads as admitted at its dispatch, with no plan admitted. Format 2,\nbefore OWL-449, reads with no overlap.",
+  "description": "What a ticket holds against the project's other tickets, in\n[`HELD_FILE`] (OWL-403, architecture section 5, \"What a ticket holds\"):\nwritten at its dispatch with nothing admitted, given what its Build's\nadmission takes (OWL-448, \"Resources admitted at Build\"), widened by the\nfiles its branch changes, and never narrowed while the ticket holds\nanything, until its pull request ends, but once: a record admitted\nwithout a plan is admitted again from its next Build's plan\n([`Self::narrows`], [`Self::readmit`], OWL-461). A ticket dispatched before it was\nkept has none and holds the whole repository. Not in `intake.json`, which\nbelongs to the ticket's text and is replaced by the next intake.\n\nFormat 1, written before OWL-448, held what its dispatch declared: it\nreads as admitted at its dispatch, with no plan admitted. Format 2,\nbefore OWL-449, reads with no overlap. Format 3, before OWL-621, reads\nas not yielded.",
   "type": "object",
   "properties": {
     "admitted_at": {
@@ -38,7 +38,7 @@
     "format": {
       "description": "The format version of this document.",
       "type": "integer",
-      "const": 3
+      "const": 4
     },
     "overlaps": {
       "description": "The overlaps its Build's admission and its widenings tolerated under\n`policy.overlap = \"rebase\"` (format 3, OWL-449), one per sibling, by\nidentifier. Each is recorded by one side only: the other ticket's\nrecord may name this one.",
@@ -54,6 +54,10 @@
         "null"
       ],
       "pattern": "^[0-9a-f]{64}$"
+    },
+    "rebase_due": {
+      "description": "Admitted again after a yield while not delivered, and its next\nBuild step has not yet decided whether its branch is rebased onto\nwhat the tickets that took its paths merged (format 4, OWL-621).",
+      "type": "boolean"
     },
     "resources": {
       "description": "The named resources admitted, by name: those its files match are not\nkept, each check reaching them from the project's list.",
@@ -78,6 +82,14 @@
         "format": "date-time"
       }
     },
+    "yielded_at": {
+      "description": "When it yielded what it holds under `policy.overlap = \"rebase\"`\n(format 4, OWL-621; architecture section 5, \"A stopped holder\nyields\"): parked, or its round waiting six hours for its decider.\nThe set stays listed, but the in-flight set reads it as holding\nnothing until its next run admits it again, which clears this.",
+      "type": [
+        "string",
+        "null"
+      ],
+      "format": "date-time"
+    },
     "zones": {
       "description": "The zones admitted, as written: the plan's files, each the zone of its\nown path, with the `zone:` labels' zones, or intake's zones with the\nlabels' (format 1: those its dispatch declared). None, once\nadmitted: the whole repository; with nothing admitted, none.",
       "type": "array",
@@ -93,7 +105,7 @@
   ],
   "$defs": {
     "HeldOverlap": {
-      "description": "An overlap a ticket tolerates under `policy.overlap = \"rebase\"`\n(OWL-449; architecture section 5, \"Tolerated overlap\"): another of\nOwlshift's tickets holds what it holds on `paths`, since `at`.",
+      "description": "An overlap a ticket tolerates under `policy.overlap = \"rebase\"`\n(OWL-449; architecture section 5, \"Tolerated overlap\"): another of\nOwlshift's tickets holds what it holds on `paths`, since `at`. Since\nformat 4 (OWL-621, \"A stopped holder yields\"), a taking of what a\nyielded ticket held is recorded so too, a named resource by its name in\n`resources`.",
       "type": "object",
       "properties": {
         "at": {
@@ -102,7 +114,14 @@
           "format": "date-time"
         },
         "paths": {
-          "description": "The shared paths, files or zones, each once, sorted, at least one.",
+          "description": "The shared paths, files or zones, each once, sorted; none only when\n`resources` names one.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "resources": {
+          "description": "The shared named resources, by name, each once, sorted (format 4): a\ntaking of a yielded ticket's named resource. The base changes one by\nchanging any path its pattern reaches.",
           "type": "array",
           "items": {
             "type": "string"

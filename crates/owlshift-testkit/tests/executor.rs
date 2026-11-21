@@ -325,6 +325,7 @@ fn a_rebase_onto_another_base_than_the_runs_is_refused() {
         refresh: false,
         conflicting: Vec::new(),
         broken: None,
+        yielded: false,
     });
     let error = bench.run_from(&bench.worktree, BRANCH, &"3".repeat(40));
     assert!(
@@ -2089,6 +2090,7 @@ mod setup {
             refresh: false,
             conflicting: Vec::new(),
             broken: None,
+            yielded: false,
         });
         let harness = bench.fake(Reply {
             observe: vec![".owlshift/run/count".to_owned()],
