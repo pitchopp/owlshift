@@ -946,8 +946,9 @@ pub(crate) struct RefStanding {
     /// ([`ticket_ref::TicketRecord::open_ask`]), which the daily digest
     /// tells the operator's own by (OWL-584).
     pub decider: Option<String>,
-    /// Whether its record yielded what it holds (OWL-621), which `why` and
-    /// the daily digest tell.
+    /// Whether its record yielded what it holds (OWL-621), under the
+    /// project's `policy.overlap = "rebase"` at `origin/HEAD`, under which
+    /// alone a yield holds nothing: what `why` and the daily digest tell.
     pub yielded: bool,
 }
 
@@ -958,7 +959,11 @@ pub(crate) fn read_standings(dirs: &ProjectDirs, notes: &mut Vec<String>) -> Vec
     if !dirs.checkout().exists() {
         return standings;
     }
-    match ticket_ref::all(&crate::project::runner_git(), &dirs.checkout()) {
+    let git = crate::project::runner_git();
+    // A yield holds nothing under `rebase` alone (OWL-621).
+    let rebase = crate::project::overlap_at_origin_head(&git, &dirs.checkout())
+        == owlshift_core::vocab::Overlap::Rebase;
+    match ticket_ref::all(&git, &dirs.checkout()) {
         Ok(refs) => {
             for (ticket, stored) in refs {
                 let stored = match stored {
@@ -977,11 +982,12 @@ pub(crate) fn read_standings(dirs: &ProjectDirs, notes: &mut Vec<String>) -> Vec
                                 .record
                                 .open_ask()
                                 .map(|ask| ask.decider.account.clone()),
-                            yielded: stored
-                                .record
-                                .held
-                                .as_ref()
-                                .is_some_and(|held| held.yielded()),
+                            yielded: rebase
+                                && stored
+                                    .record
+                                    .held
+                                    .as_ref()
+                                    .is_some_and(|held| held.yielded()),
                             ticket,
                             status,
                         });

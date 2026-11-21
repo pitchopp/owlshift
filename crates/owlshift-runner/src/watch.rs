@@ -3182,10 +3182,10 @@ impl Watch<'_> {
                 continue;
             }
             let own = held::by_claim(held::in_flight(ticket, stored, &named), &times);
-            // A yielded ticket is weighed as its admission again, below.
-            if !own.yielded
-                && let Some(collided) = weigh(&own, &in_flight, overlap).collision
-            {
+            // Under `rebase` a yielded ticket is weighed as its admission
+            // again, below; under `exclusive` it holds what it held (OWL-621).
+            let readmits = own.yielded && overlap == Overlap::Rebase;
+            if !readmits && let Some(collided) = weigh(&own, &in_flight, overlap).collision {
                 found.insert(ticket.clone(), (collided, false));
                 continue;
             }
@@ -3205,15 +3205,15 @@ impl Watch<'_> {
                     )
                 })
                 .flatten();
-            // A yielded ticket's step admits it again, with its whole set,
-            // whatever its stage (OWL-621): in its dispatch order among the
+            // A yielded ticket's step admits it again under `rebase`, with its
+            // whole set, whatever its stage (OWL-621): in its dispatch order among the
             // admissions due, so it comes before the Builds dispatched after
             // it.
             let yielded = stored
                 .record
                 .held
                 .as_ref()
-                .filter(|held| held.yielded())
+                .filter(|_| readmits)
                 .map(|held| admitted.clone().unwrap_or_else(|| held.clone()));
             if let Some(whole) = yielded {
                 if !at_build {
@@ -3422,12 +3422,15 @@ impl Watch<'_> {
         self.check_claims(memory, sink, out, at);
         let now = (self.on_demand.clock)();
         if memory.claims_due.is_none_or(|due| now >= due) {
+            // A yielded record holds nothing under `rebase` alone (OWL-621).
+            let overlap = crate::project::overlap_at_origin_head(git, &checkout);
             let held_of = |ticket: &TicketId| {
                 held::claim_held(
                     ticket_ref::read(git, &checkout, ticket)
                         .ok()
                         .flatten()
                         .as_ref(),
+                    overlap,
                 )
             };
             let renewal = claims::renew(at, &held_of, now);

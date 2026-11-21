@@ -1175,6 +1175,20 @@ pub fn overlap_at(
         .unwrap_or_default())
 }
 
+/// The `policy.overlap` of the project file at `origin/HEAD` of the
+/// checkout at `root`, as its last fetch left it (OWL-621): whether a
+/// yielded record holds nothing, as `owlshift why`, the digest and a
+/// claim's renewal read it. `exclusive` when it cannot be read, so that what
+/// cannot be read never frees what a record holds.
+pub fn overlap_at_origin_head(git: &Git, root: &Path) -> owlshift_core::vocab::Overlap {
+    match project_file_at_origin_head(git, root) {
+        Ok(DefaultBranchFile::Read {
+            file: Some(config), ..
+        }) => config.policy.overlap(),
+        _ => owlshift_core::vocab::Overlap::Exclusive,
+    }
+}
+
 #[cfg(test)]
 mod forge_merge_tests {
     use owlshift_core::vocab::{MergeMethod, MergeSwitch};

@@ -57,11 +57,12 @@ pub struct InFlight<K> {
     /// person's ticket. Never an overlap's sibling under `rebase`
     /// (OWL-449): the runner rebases only its own branches.
     pub outside: bool,
-    /// It yielded what it holds (OWL-621): among the others [`weigh`] weighs
-    /// a ticket against, it holds nothing, counts in no bound and makes no
-    /// ticket wait; what of `held` the ticket takes is told as an overlap.
-    /// Read on the others only: a ticket admitted again after its yield is
-    /// weighed with it false.
+    /// It yielded what it holds (OWL-621): under `rebase`, among the others
+    /// [`weigh`] weighs a ticket against, it holds nothing, counts in no
+    /// bound and makes no ticket wait; what of `held` the ticket takes is
+    /// told as an overlap. Under `exclusive` it holds `held` again. Read on
+    /// the others only: a ticket admitted again after its yield is weighed
+    /// with it false.
     pub yielded: bool,
     /// What it holds, closed with the named resources its zones and files
     /// reach.
@@ -194,12 +195,14 @@ pub fn collision<K: Clone + Ord + AsRef<str>>(
 /// ticket, before or after it, delivered or not: each with the inner path
 /// of each tolerated pair.
 ///
-/// Whatever the switch, a yielded Owlshift ticket ([`InFlight::yielded`],
-/// OWL-621) holds nothing: it holds no ticket back and counts in no bound.
-/// A ticket that goes on is told what it takes of each: the inner path of
-/// each pair of zones that conflict, the ticket holding the whole
-/// repository taking the yielded ticket's own paths, and each named
-/// resource both hold; as an overlap whose [`Shared::yielded`] is set.
+/// Under [`Overlap::Rebase`], a yielded Owlshift ticket
+/// ([`InFlight::yielded`], OWL-621) holds nothing: it holds no ticket back
+/// and counts in no bound. A ticket that goes on is told what it takes of
+/// each: the inner path of each pair of zones that conflict, the ticket
+/// holding the whole repository taking the yielded ticket's own paths, and
+/// each named resource both hold; as an overlap whose [`Shared::yielded`]
+/// is set. Under [`Overlap::Exclusive`], which promises that no sibling's
+/// merge costs a repair, a yielded ticket holds its whole set again.
 pub fn weigh<K: Clone + Ord + AsRef<str>>(
     ticket: &InFlight<K>,
     others: &[InFlight<K>],
@@ -209,7 +212,7 @@ pub fn weigh<K: Clone + Ord + AsRef<str>>(
     others.sort_by(|a, b| natural_cmp(a.id.as_ref(), b.id.as_ref()).then_with(|| a.id.cmp(&b.id)));
     let (yielded, others): (Vec<&InFlight<K>>, Vec<&InFlight<K>>) = others
         .into_iter()
-        .partition(|other| other.yielded && !other.outside);
+        .partition(|other| overlap == Overlap::Rebase && other.yielded && !other.outside);
     let before: Vec<&InFlight<K>> = if ticket.delivered {
         Vec::new()
     } else {
@@ -559,11 +562,11 @@ mod tests {
         flight
     }
 
-    /// OWL-621: a yielded ticket holds nothing, whatever the switch: a
-    /// named resource it holds, a path it shares, a delivered pull request
-    /// hold nothing back and count in no bound; the ticket that goes on is
-    /// told what it takes, paths and names, as an overlap marked yielded,
-    /// and nothing while it waits for another holder.
+    /// OWL-621: under `rebase` a yielded ticket holds nothing: a named
+    /// resource it holds, a path it shares, a delivered pull request hold
+    /// nothing back and count in no bound; the ticket that goes on is told
+    /// what it takes, paths and names, as an overlap marked yielded, and
+    /// nothing while it waits for another holder.
     #[test]
     fn a_yielded_holder_holds_nothing_and_its_taking_is_told() {
         let migrations = Resource::Named("migrations".to_owned());
@@ -579,16 +582,13 @@ mod tests {
             false,
             &[zone("db/2.sql"), zone("app"), migrations.clone()],
         );
-        for switch in [Overlap::Exclusive, Overlap::Rebase] {
-            assert_eq!(
-                weigh(&ticket, std::slice::from_ref(&parked), switch),
-                Weighed {
-                    collision: None,
-                    overlaps: vec![taken("OWL-1", &["app/a.rs"], &["migrations"])],
-                },
-                "{switch:?}"
-            );
-        }
+        assert_eq!(
+            rebase(&ticket, std::slice::from_ref(&parked)),
+            Weighed {
+                collision: None,
+                overlaps: vec![taken("OWL-1", &["app/a.rs"], &["migrations"])],
+            }
+        );
         // Not a holder of the bound: with one live holder of a file, a
         // yielded second leaves room.
         let one = flight("OWL-2", Dispatched::At(2), false, &[zone("app/a.rs")]);
@@ -653,6 +653,40 @@ mod tests {
             crate::schedule::admissions(std::slice::from_ref(&due), &[parked], Overlap::Rebase),
             [("OWL-8", None)]
         );
+    }
+
+    /// OWL-621: under `exclusive`, which promises that no sibling's merge
+    /// costs a repair, a yielded ticket holds its whole set again: a second
+    /// ticket wanting its file or its named resource waits for it, and takes
+    /// nothing of it.
+    #[test]
+    fn under_exclusive_a_yielded_holder_holds_its_whole_set_again() {
+        let migrations = Resource::Named("migrations".to_owned());
+        let parked = yielded(flight(
+            "OWL-1",
+            Dispatched::At(1),
+            false,
+            &[zone("db/1.sql"), migrations.clone()],
+        ));
+        for wanted in [zone("db/1.sql"), migrations.clone()] {
+            let second = flight(
+                "OWL-2",
+                Dispatched::Now,
+                false,
+                std::slice::from_ref(&wanted),
+            );
+            let found = weigh(&second, std::slice::from_ref(&parked), Overlap::Exclusive);
+            assert_eq!(
+                found.collision,
+                Some(Collision {
+                    holder: "OWL-1",
+                    resource: wanted.clone(),
+                    sharing: None,
+                }),
+                "{wanted:?}"
+            );
+            assert!(found.overlaps.is_empty());
+        }
     }
 
     /// OWL-621: who yields, under `rebase` only and for a record that holds

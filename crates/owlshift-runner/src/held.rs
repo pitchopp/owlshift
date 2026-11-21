@@ -25,7 +25,7 @@ use owlshift_core::decider::brief_zones;
 use owlshift_core::pipeline::Pipeline;
 use owlshift_core::resource::{self, Held, NamedResources, Pattern, Resource};
 use owlshift_core::state::TicketState;
-use owlshift_core::vocab::{Stage, Variant};
+use owlshift_core::vocab::{Overlap, Stage, Variant};
 
 use crate::events::{Data, data};
 use crate::executor::Git;
@@ -80,14 +80,15 @@ pub fn dispatched(stored: &Stored) -> Dispatched {
 /// flight ([`holds`]), as [`of`] weighs them: nothing with no ref or out of
 /// flight; the whole repository for a ref from before `held.json` was kept,
 /// or one admitted with no zone; the files a widening added before its
-/// Build's admission.
-pub fn claim_held(stored: Option<&Stored>) -> ClaimHeld {
+/// Build's admission; nothing for a record that yielded under `overlap`
+/// `rebase` (OWL-621).
+pub fn claim_held(stored: Option<&Stored>, overlap: Overlap) -> ClaimHeld {
     let Some(stored) = stored.filter(|stored| holds(stored)) else {
         return ClaimHeld::default();
     };
     match &stored.record.held {
-        // A yielded record holds nothing (OWL-621).
-        Some(held) if held.yielded() => ClaimHeld::default(),
+        // A yielded record holds nothing under `rebase` (OWL-621).
+        Some(held) if held.yielded() && overlap == Overlap::Rebase => ClaimHeld::default(),
         None => ClaimHeld {
             repository: true,
             ..ClaimHeld::default()
@@ -885,26 +886,49 @@ mod tests {
     /// a ref from before `held.json`.
     #[test]
     fn a_claim_holds_what_the_ticket_holds_in_flight() {
-        assert!(claim_held(None).is_empty());
-        assert!(claim_held(Some(&at(Status::Active(Stage::Ready), None))).is_empty());
+        assert!(claim_held(None, Overlap::Exclusive).is_empty());
+        assert!(
+            claim_held(
+                Some(&at(Status::Active(Stage::Ready), None)),
+                Overlap::Exclusive
+            )
+            .is_empty()
+        );
         let mut designing = at(Status::Active(Stage::Design), None);
         designing.record.held = Some(TicketHeld::dispatched(minute(0)));
-        assert!(claim_held(Some(&designing)).is_empty());
+        assert!(claim_held(Some(&designing), Overlap::Exclusive).is_empty());
         let mut building = at(Status::Active(Stage::Build), None);
         let mut admitted = TicketHeld::dispatched(minute(0));
         admitted.admitted_at = Some(minute(1));
         admitted.zones = strings(&["src/lib.rs"]);
         admitted.files = strings(&["Cargo.lock"]);
         building.record.held = Some(admitted.clone());
-        let held = claim_held(Some(&building));
+        let held = claim_held(Some(&building), Overlap::Exclusive);
         assert_eq!(
             (held.repository, held.zones, held.files),
             (false, strings(&["src/lib.rs"]), strings(&["Cargo.lock"]))
         );
+        // OWL-621: a yielded record publishes nothing under `rebase`, its
+        // set under `exclusive`.
+        let mut parked = building.clone();
+        let mut yielded = admitted.clone();
+        assert!(yielded.yield_at(minute(2)));
+        parked.record.held = Some(yielded);
+        assert!(claim_held(Some(&parked), Overlap::Rebase).is_empty());
+        assert_eq!(
+            claim_held(Some(&parked), Overlap::Exclusive).zones,
+            strings(&["src/lib.rs"])
+        );
         admitted.zones.clear();
         building.record.held = Some(admitted);
-        assert!(claim_held(Some(&building)).repository);
-        assert!(claim_held(Some(&at(Status::Active(Stage::Build), None))).repository);
+        assert!(claim_held(Some(&building), Overlap::Exclusive).repository);
+        assert!(
+            claim_held(
+                Some(&at(Status::Active(Stage::Build), None)),
+                Overlap::Exclusive
+            )
+            .repository
+        );
     }
 
     /// OWL-448: a ticket in Design, dispatched and not admitted, holds

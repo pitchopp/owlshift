@@ -2187,12 +2187,14 @@ impl OnDemand<'_> {
         let mut holding = locked.holding.clone();
         holding.push((own.id.clone(), own.dispatched));
         let capacity = u32::from(self.config.policy.max_in_flight());
+        let overlap = self.overlap_policy(p);
         let wait = match schedule::slot_turn(&holding, &locked.unread, capacity) {
             Turn::Holders(holders) if !holders.contains(&own.id) => Some(Wait::Slot(holders)),
             Turn::Unknown(unread) => Some(Wait::Slot(unread)),
-            // A yielded ticket's check is its admission again (OWL-621).
-            Turn::Holders(_) if own.yielded => None,
-            Turn::Holders(_) => collision::weigh(&own, &locked.in_flight, self.overlap_policy(p))
+            // Under `rebase` a yielded ticket's check is its admission again
+            // (OWL-621); under `exclusive` it holds what it held, checked so.
+            Turn::Holders(_) if own.yielded && overlap == Overlap::Rebase => None,
+            Turn::Holders(_) => collision::weigh(&own, &locked.in_flight, overlap)
                 .collision
                 .map(Wait::Collision),
         };
@@ -2417,6 +2419,12 @@ impl OnDemand<'_> {
     /// ([`TicketHeld::admitted_again`]); what it shares or takes is
     /// recorded, the record kept, a `yield` = `readmitted` event emitted
     /// and its claim pushed again (OWL-586).
+    ///
+    /// Under `exclusive` a yielded record holds its whole set again, so it
+    /// was never free: its check is its stage's, by dispatch order, made
+    /// already. Its yield's time is only cleared, as an admission's would be,
+    /// so that the switch turning back to `rebase` frees nothing while it
+    /// runs, and its next Build still decides its rebase.
     fn admit_yielded(
         &self,
         p: &mut Prepared,
@@ -2428,12 +2436,30 @@ impl OnDemand<'_> {
         };
         let named = self.config.stack.named_resources().unwrap_or_default();
         let delivered = p.stored.as_ref().is_some_and(delivery_followed);
+        let overlap = self.overlap_policy(p);
+        let stage = stage_name(state.stage());
+        if overlap == Overlap::Exclusive {
+            let mut next = before;
+            next.admitted_again(delivered);
+            let due = next.rebase_due;
+            {
+                let _section = self.section()?;
+                p.held = Some(next);
+                self.keep(p, state)?;
+            }
+            sink.emit(
+                &p.ticket,
+                None,
+                EventKind::Decision,
+                held::readmitted_event(&stage, due),
+            );
+            self.push_claim_held(p, sink);
+            return Ok(());
+        }
         let outside = match p.outside.take() {
             Some(outside) => outside,
             None => self.outside_now(&p.ticket)?,
         };
-        let overlap = self.overlap_policy(p);
-        let stage = stage_name(state.stage());
         let mut next = before.clone();
         let recorded = {
             let _section = self.section()?;
@@ -3127,7 +3153,7 @@ impl OnDemand<'_> {
             git,
             dirs: self.dirs,
         };
-        let held = held::claim_held(p.stored.as_ref());
+        let held = held::claim_held(p.stored.as_ref(), self.overlap_policy(p));
         let took = claims::take(
             at,
             ticket,
@@ -3246,7 +3272,7 @@ impl OnDemand<'_> {
             git: &self.executor.git,
             dirs: self.dirs,
         };
-        let held = held::claim_held(p.stored.as_ref());
+        let held = held::claim_held(p.stored.as_ref(), self.overlap_policy(p));
         if let Err(why) = claims::update_held(at, &p.ticket, held, (self.clock)()) {
             sink.emit(
                 &p.ticket,
