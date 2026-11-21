@@ -324,7 +324,8 @@ impl OnDemand<'_> {
     /// ([`TicketHeld::rebase_due`], OWL-621; architecture section 5, "A
     /// stopped holder yields", "The resume"): decided at this Build step,
     /// then no longer due. When the base this command fetched changed what
-    /// its overlaps reach ([`held::Reach`]) since its branch parted from
+    /// its overlaps reach ([`held::Reach`]), and under remote claims what it
+    /// holds itself ([`held::resume_reach`]), since its branch parted from
     /// it, a branch with commits of its own and a clean worktree is rebased
     /// onto that base by one `rebase` role run, as a held Build's is
     /// ([`Self::rebase_held`], its brief `yielded`), and one with none is
@@ -347,15 +348,18 @@ impl OnDemand<'_> {
         }
         let head = p.base.commit.clone();
         let (branch, start) = self.held_branch(p, &head)?;
+        // Under remote claims its own set too: another runner's taking
+        // records no overlap here (OWL-621).
+        let named = self.config.stack.named_resources().unwrap_or_default();
+        let reach = held::resume_reach(
+            &p.ticket,
+            p.held.as_ref(),
+            &self.sharings(p),
+            &named,
+            p.claims,
+        );
         let moved = |start: &str| {
-            held::base_moved_on(
-                &self.executor.git,
-                &p.checkout,
-                start,
-                None,
-                &head,
-                &self.overlap_reach(p),
-            )
+            held::base_moved_on(&self.executor.git, &p.checkout, start, None, &head, &reach)
         };
         let rebased = match branch {
             HeldBranch::Delivered => stay,

@@ -16,6 +16,7 @@ use std::path::Path;
 use jiff::Timestamp;
 use serde_json::{Value, json};
 
+use owlshift_contracts::config::Claims;
 use owlshift_contracts::drain::TicketIntake;
 use owlshift_contracts::ids::TicketId;
 use owlshift_contracts::refs::{ClaimHeld, EndedWhy, MAX_HELD_FILES, TicketHeld};
@@ -340,6 +341,44 @@ impl Reach {
                 .iter()
                 .any(|path| self.patterns.iter().any(|pattern| pattern.matches(path)))
     }
+}
+
+/// What a resumed yielded ticket's rebase reads (OWL-621; architecture
+/// section 5, "A stopped holder yields", "The resume"): what its overlaps
+/// `sharings` reach, their named resources read in `named`. Under remote
+/// claims (`claims`), another runner's taking of its paths records no
+/// overlap on this runner, so its own `held` set is read too: its zones and
+/// files, and its named resources by their patterns. At most an extra
+/// rebase, and the combined code is gated whoever took what it held.
+pub fn resume_reach(
+    ticket: &TicketId,
+    held: Option<&TicketHeld>,
+    sharings: &[Sharing],
+    named: &NamedResources,
+    claims: Claims,
+) -> Reach {
+    let mut reach = Reach::of(sharings, named);
+    if claims == Claims::Remote
+        && let Some(held) = held
+    {
+        let (paths, resources) = yielding(ticket, held, named);
+        let own = Reach::of(
+            &[Sharing {
+                ticket: ticket.clone(),
+                paths,
+                resources,
+            }],
+            named,
+        );
+        gather_new(&mut reach.paths, &own.paths);
+        reach.paths.sort();
+        for pattern in own.patterns {
+            if !reach.patterns.contains(&pattern) {
+                reach.patterns.push(pattern);
+            }
+        }
+    }
+    reach
 }
 
 /// What [`record`] made of the overlaps a check found (OWL-449), takings of
@@ -1245,6 +1284,51 @@ mod tests {
         .unwrap();
         let head = git.run(repo, &["rev-parse", "HEAD"]).unwrap();
         String::from_utf8(head).unwrap().trim().to_owned()
+    }
+
+    /// OWL-621: under remote claims, where another runner's taking records
+    /// no overlap here, a resumed yielded ticket's rebase reads its own set:
+    /// with no overlap recorded, a base that changed a file it holds, or a
+    /// path its named resource's pattern reaches, makes the rebase due; under
+    /// local claims, nothing recorded, nothing is due.
+    #[test]
+    fn under_remote_claims_a_resumed_ticket_is_rebased_on_its_own_set() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path();
+        let git = crate::project::runner_git();
+        let commit = |files: &[(&str, &str)]| commit_all(&git, repo, files);
+        git.run(repo, &["init", "-q", "-b", "main"]).unwrap();
+        commit(&[("app/one.rs", "one\n"), ("docs/a.md", "a\n")]);
+        git.run(repo, &["checkout", "-q", "-b", "owl-1"]).unwrap();
+        let start = commit(&[("app/one.rs", "one, mine\n"), ("db/1.sql", "-- 1\n")]);
+        git.run(repo, &["checkout", "-q", "main"]).unwrap();
+        let other = commit(&[("docs/a.md", "b\n")]);
+        let migrated = commit(&[("db/2.sql", "-- 2\n")]);
+        let taken = commit(&[("app/one.rs", "one, theirs\n")]);
+        let named = NamedResources::new([("migrations", "db/*")]).unwrap();
+        let ticket = TicketId::new("DEMO-1").unwrap();
+        let mut held = TicketHeld::dispatched(minute(0));
+        held.admit(
+            strings(&["app/one.rs", "db/1.sql"]),
+            Vec::new(),
+            None,
+            minute(1),
+        );
+        assert!(held.yield_at(minute(2)));
+        let due = |claims: Claims, base: &str| {
+            let reach = resume_reach(&ticket, Some(&held), &[], &named, claims);
+            base_moved_on(&git, repo, &start, None, base, &reach).unwrap()
+        };
+        assert!(due(Claims::Remote, &taken), "a file it holds");
+        assert!(
+            due(Claims::Remote, &migrated),
+            "its named resource's pattern"
+        );
+        assert!(!due(Claims::Remote, &other));
+        assert!(
+            !due(Claims::Local, &taken),
+            "local claims read its overlaps alone"
+        );
     }
 
     /// OWL-449: a base that changes an overlap's path since the pushed head
