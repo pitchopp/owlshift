@@ -166,6 +166,7 @@ states = { ready = "Todo", working = "In Progress", needs_input = "Needs Input",
 gate = ["make lint", "make test"]
 resources = { migrations = "backend/*/migrations/**" }   # named resources: `*` one whole path part, `**` any number; checked at load (P6, OWL-402)
 rules = ["AGENTS.md"]     # files whose text reaches every role that takes rules
+# run_caches = { CARGO_HOME = "cargo" }   # optional: caches of Owlshift's own that this project's runs may write, variable = folder (P5; designed, not built)
 
 [roles.build]
 rules = ["docs/skills/frontend/SKILL.md"]   # added to stack.rules for this role only
@@ -190,6 +191,7 @@ quiet_window_minutes = 10            # optional, 1 to 1440: how long a decider's
 max_open_prs = 3                     # optional, 1 to 20: open pull requests at which the drain starts no new Build
 # max_in_flight = 3                  # optional, 1 to 10, 1 when absent: tickets dispatched and not yet at Watch at once (P6)
 # overlap = "exclusive"              # optional, exclusive | rebase: whether two Owlshift tickets may build on the same file at once (P6)
+# base_repair = true                 # optional, true when absent: a broken base files its repair ticket, dispatched first (P6; designed, not built)
 # claims = "local"                   # optional, local | remote: whether a ticket is claimed on the git remote, for several runners (P10)
 
 [zones."backend/billing"]
