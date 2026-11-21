@@ -208,6 +208,7 @@ mod tests {
             binary: "/bin/owlshift".to_owned(),
             since: ts("2026-11-05T08:00:00Z"),
             build: None,
+            watches: None,
         }
     }
 

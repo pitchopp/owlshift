@@ -354,6 +354,7 @@ mod tests {
             binary: "/bin/owlshift".to_owned(),
             since: jiff::Timestamp::now(),
             build: None,
+            watches: None,
         }
     }
 

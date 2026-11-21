@@ -41,14 +41,15 @@ pub(crate) const ON_WINDOWS: &str = "the background service runs on macOS and Li
 /// How long `owlshift start` waits for the daemon it launched to take its
 /// lock. Once it holds it, start waits for its record while the daemon pins
 /// its binary, up to [`PIN_CHECK_WAIT`] more (OWL-608).
-const LAUNCH_WAIT: Duration = Duration::from_secs(10);
+const LAUNCH_WAIT: Duration = daemon::LAUNCH_WAIT;
 
 /// How often that wait looks.
 const LAUNCH_POLL: Duration = Duration::from_millis(100);
 
 /// `owlshift daemon`: the background service, in the foreground, until a
-/// stop asked of it is done.
-pub fn daemon(system: &dyn System, config: &Effective) -> ExitCode {
+/// stop asked of it is done; with `lock_fd`, on the lock the daemon of an
+/// older binary at the same path handed over (OWL-616).
+pub fn daemon(system: &dyn System, config: &Effective, lock_fd: Option<i32>) -> ExitCode {
     if cfg!(windows) {
         return fail(&format!("`owlshift daemon`: {ON_WINDOWS}"));
     }
@@ -64,6 +65,14 @@ pub fn daemon(system: &dyn System, config: &Effective) -> ExitCode {
             ));
         }
     };
+    // The binary this daemon moves onto once a newer build lies there: the
+    // path it was started from, its stamp read before the pin (OWL-616).
+    let watched = match binary_for_service() {
+        Ok(path) => {
+            daemon::WatchedBinary::at_start(path, OWLSHIFT_VERSION.to_owned(), Some(own_build()))
+        }
+        Err(error) => return fail(&error),
+    };
     let record = DaemonRecord {
         format: Format,
         pid: std::process::id(),
@@ -71,9 +80,10 @@ pub fn daemon(system: &dyn System, config: &Effective) -> ExitCode {
         binary: binary.display().to_string(),
         since: Timestamp::now(),
         build: Some(own_build()),
+        watches: Some(watched.path.display().to_string()),
     };
     let shown = |error: io::Error| format!("{}: {error}", daemon::service_dir(&data).display());
-    let locked = match daemon::instance::lock(&data) {
+    let locked = match daemon::instance::lock_or_adopt(&data, lock_fd) {
         Ok(Ok(locked)) => locked,
         Ok(Err(Held(holder))) => return fail(&already_runs(&data, holder.as_ref())),
         Err(error) => return fail(&shown(error)),
@@ -81,9 +91,15 @@ pub fn daemon(system: &dyn System, config: &Effective) -> ExitCode {
     // The binary every child runs, pinned now that this daemon alone holds
     // the data directory, and before its record says it runs: on macOS a
     // copy in `pinned/`, which an upgrade does not replace (architecture
-    // section 5, "An upgrade", OWL-553).
+    // section 5, "An upgrade", OWL-553). Only the copies of processes that
+    // have ended are swept: the daemon handing its lock to this one keeps
+    // its own until it ends (OWL-616).
     let pinned_dir = daemon::pinned_dir(&data);
-    let pinned = match owlshift_platform::process::pin_own_program(&pinned_dir) {
+    #[cfg(unix)]
+    let pinned = owlshift_platform::process::pin_own_program_among(&pinned_dir);
+    #[cfg(not(unix))]
+    let pinned = owlshift_platform::process::pin_own_program(&pinned_dir);
+    let pinned = match pinned {
         Ok(pinned) => pinned,
         Err(error) => {
             return fail(&format!(
@@ -122,17 +138,15 @@ pub fn daemon(system: &dyn System, config: &Effective) -> ExitCode {
             port: owlshift_runner::ui::port_of(&config.personal),
             command: &ui,
         }),
+        binary: Some(&watched),
     };
-    let ended = daemon.run(&mut io::stdout());
-    // A stop or an upgrade returns once every child has ended, so the copy
-    // goes now, while the lock is held.
+    let ended = daemon.serve(&instance, &record, &mut io::stdout());
+    // A stop, an upgrade or a handover returns once every child has ended,
+    // so the copy goes now, while the lock is held.
     drop(pinned);
     drop(instance);
-    match ended {
-        daemon::Ended::Stopped => ExitCode::SUCCESS,
-        // The service manager starts it again, on the new binary.
-        daemon::Ended::Upgraded => ExitCode::from(daemon::UPGRADE_EXIT),
-    }
+    // 75: the service manager starts it again, on the new binary.
+    ExitCode::from(ended.exit_code())
 }
 
 /// Hands the running daemon over to this binary when it is older and the
@@ -170,7 +184,7 @@ pub fn hand_over(data: &Path, by: &str) -> Option<String> {
 /// bound only cuts a copy that never answers, so it stands well past that
 /// worst case, more than four times it; a terminal watch's pin shares it
 /// (OWL-560).
-const PIN_CHECK_WAIT: Duration = Duration::from_secs(120);
+const PIN_CHECK_WAIT: Duration = daemon::upgrade::VERSION_WAIT;
 
 /// `Ok` when the binary the daemon's children run, `pinned`, is this very
 /// build (OWL-553): a binary replaced between this daemon's start and its
@@ -214,10 +228,9 @@ pub(crate) fn pinned_build_differs(pinned: &OwnProgram, by: &str) -> Option<Stri
 /// Whether `said`, what a binary printed for `--version`, names this
 /// binary's version and build.
 fn names_own_build(said: &str) -> bool {
-    let mut lines = said.lines();
-    let version = lines.next().and_then(|line| line.split_whitespace().last());
-    let build = format!("build: {}", own_build());
-    version == Some(OWLSHIFT_VERSION) && lines.next() == Some(build.as_str())
+    daemon::upgrade::parse_version(said).is_some_and(|probed| {
+        probed.version == OWLSHIFT_VERSION && probed.build == Some(own_build())
+    })
 }
 
 /// The watch of the served project `repo`: `program`, this binary, as
@@ -368,13 +381,12 @@ pub fn start(config: &Effective, at_login: bool) -> ExitCode {
                 Ok(None) => {}
                 Err(error) => return fail(&error),
             }
-            let program = match std::env::current_exe() {
+            // By the path this program was run by when it is the same file,
+            // as the service names it: the daemon watches that path, which a
+            // package manager's upgrade relinks (OWL-616).
+            let program = match binary_for_service() {
                 Ok(program) => program,
-                Err(error) => {
-                    return fail(&format!(
-                        "this program's own path, which runs the daemon: {error}"
-                    ));
-                }
+                Err(error) => return fail(&error),
             };
             let launch = Launch {
                 program: &program,
@@ -418,12 +430,13 @@ fn this_layout() -> Result<Layout, String> {
     ))
 }
 
-/// The binary the service starts: this one, by the path it was run by when
-/// that is the same file, so a package manager's stable link is named
-/// rather than its versioned folder.
+/// The binary the service starts, `start` launches the session's daemon from
+/// and the daemon watches (OWL-616): this one, by the path it was run by when
+/// that is the same file, so a package manager's stable link is named rather
+/// than its versioned folder.
 fn binary_for_service() -> Result<PathBuf, String> {
     let current = std::env::current_exe()
-        .map_err(|e| format!("this program's own path, which the service starts: {e}"))?;
+        .map_err(|e| format!("this program's own path, which the daemon runs: {e}"))?;
     let cwd = std::env::current_dir()
         .map_err(|e| format!("the current directory, against which this program ran: {e}"))?;
     let invoked = std::env::args_os().next();
@@ -1033,6 +1046,7 @@ mod tests {
                 binary: "/bin/owlshift".to_owned(),
                 since,
                 build: None,
+                watches: None,
             }
         }
 

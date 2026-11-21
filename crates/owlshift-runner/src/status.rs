@@ -1142,6 +1142,7 @@ mod tests {
             binary: "/bin/owlshift".to_owned(),
             since,
             build: None,
+            watches: None,
         }
     }
 

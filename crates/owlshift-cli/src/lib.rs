@@ -307,7 +307,13 @@ enum Command {
     /// runs it. One per data directory; a second exits at once. Ctrl-C ends
     /// it once its watches drained, a second (or SIGTERM) stops their steps
     /// checking their runs, a third stops everything now.
-    Daemon,
+    Daemon {
+        /// The daemon's lock, handed over on this descriptor by the daemon of
+        /// an older binary at the same path (OWL-616): this daemon takes it
+        /// over rather than taking the lock anew.
+        #[arg(long, hide = true, value_name = "N")]
+        lock_fd: Option<i32>,
+    },
     /// Update an install made by hand, by install.sh or from an archive, to
     /// the latest release: its signature and checksum verified with the key
     /// built into this binary, then the binary replaced at its own path. An
@@ -526,7 +532,7 @@ pub fn main_with(
             print, new_token, ..
         } => ui_cmd::run(&config, print, new_token),
         Command::Uninstall { purge } => service_cmd::uninstall(purge),
-        Command::Daemon => service_cmd::daemon(&system, &config),
+        Command::Daemon { lock_fd } => service_cmd::daemon(&system, &config, lock_fd),
         Command::SelfUpdate { check } => self_update_cmd::run(check, release_key),
         Command::Logs {
             ticket,
@@ -545,7 +551,7 @@ pub fn main_with(
 fn by_degrees(command: &Command) -> Option<Option<Duration>> {
     match command {
         Command::Watch { .. } => Some(Some(CHECKED_STOP_BOUND)),
-        Command::Continue { step: Some(_), .. } | Command::Daemon => Some(None),
+        Command::Continue { step: Some(_), .. } | Command::Daemon { .. } => Some(None),
         _ => None,
     }
 }

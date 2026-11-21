@@ -1,7 +1,8 @@
 //! Handing a secret to a child on an inherited descriptor, never in its
 //! environment or arguments (OWL-96); and, for the local web UI (OWL-467),
 //! a listening socket on `127.0.0.1` the daemon binds and keeps, handed to
-//! the UI child it starts, with the reading side of both.
+//! the UI child it starts, with the reading side of both; and the daemon's
+//! lock, handed to the daemon of a newer binary (OWL-616).
 //!
 //! The `unsafe` of this module on Unix is two blocks: the `pre_exec`
 //! closure of [`inherit`], which every handover uses, and the
@@ -215,6 +216,44 @@ pub fn adopt_listener(fd: i32) -> io::Result<TcpListener> {
 /// Native Windows runs no daemon (decision D9).
 #[cfg(not(unix))]
 pub fn adopt_listener(fd: i32) -> io::Result<TcpListener> {
+    let _ = fd;
+    Err(unsupported())
+}
+
+/// Makes `command`'s child, and it alone, inherit a copy of `file`, and
+/// returns its number for the caller to name to the child: the daemon's lock
+/// handed to the daemon of a newer binary (OWL-616). The copy shares `file`'s
+/// open file description, so a `flock` that description holds is the child's
+/// too, and stays held while either process keeps a descriptor of it. Drop
+/// `command` right after the spawn.
+#[cfg(unix)]
+pub fn hand_over_file(command: &mut Command, file: &std::fs::File) -> io::Result<i32> {
+    use std::os::fd::AsFd;
+    inherit(command, file.as_fd())
+}
+
+/// Native Windows runs no daemon (decision D9).
+#[cfg(not(unix))]
+pub fn hand_over_file(command: &mut Command, file: &std::fs::File) -> io::Result<i32> {
+    let _ = (command, file);
+    Err(unsupported())
+}
+
+/// The file a parent handed this process on the descriptor `fd`
+/// ([`hand_over_file`]), made close-on-exec again so no process this one
+/// starts inherits it. What it is, the caller checks.
+#[cfg(unix)]
+pub fn adopt_file(fd: i32) -> io::Result<std::fs::File> {
+    use rustix::io::{FdFlags, fcntl_setfd};
+
+    let file = std::fs::File::from(adopt(fd)?);
+    fcntl_setfd(&file, FdFlags::CLOEXEC)?;
+    Ok(file)
+}
+
+/// Native Windows runs no daemon (decision D9).
+#[cfg(not(unix))]
+pub fn adopt_file(fd: i32) -> io::Result<std::fs::File> {
     let _ = fd;
     Err(unsupported())
 }

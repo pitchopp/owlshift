@@ -69,15 +69,21 @@ pub struct DaemonRecord {
     /// record, written before it, which is read as an unknown build.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub build: Option<BuildIdentity>,
+    /// The path of the binary it watches, the one it was started from: once
+    /// a newer build lies there it moves onto it by itself (format 3,
+    /// OWL-616). Absent from an older record, whose daemon watches nothing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub watches: Option<String>,
 }
 
 impl DaemonRecord {
     const CONTRACT: &str = "daemon record";
 
     /// Parses a record; a format-1 one is read as the current format with
-    /// no build.
+    /// no build, and a format-1 or format-2 one as a daemon that watches
+    /// nothing.
     pub fn parse(input: &str) -> Result<Self, ContractError> {
-        let record: Self = match Self::from_format_1(input) {
+        let record: Self = match Self::from_older(input) {
             Some(read) => read?,
             None => format::parse_json(Self::CONTRACT, DAEMON_FORMAT, input)?,
         };
@@ -87,10 +93,20 @@ impl DaemonRecord {
         Ok(record)
     }
 
-    /// A format-1 record read as the current format, or `None` for any
-    /// other: format 1 is format 2 without `build`, refused in it.
-    fn from_format_1(input: &str) -> Option<Result<Self, ContractError>> {
-        format::parse_json_older(Self::CONTRACT, 1, DAEMON_FORMAT, "build", input)
+    /// A format-1 or format-2 record read as the current format, or `None`
+    /// for any other: format 2 is format 3 without `watches`, and format 1
+    /// is format 2 without `build`, each refused where it was never written.
+    fn from_older(input: &str) -> Option<Result<Self, ContractError>> {
+        if let Some(read) = format::parse_json_older::<Self>(Self::CONTRACT, 1, 3, "build", input) {
+            return Some(read.and_then(|record| match record.watches {
+                Some(_) => Err(ContractError::invalid(
+                    Self::CONTRACT,
+                    "format 1 records no watches",
+                )),
+                None => Ok(record),
+            }));
+        }
+        format::parse_json_older(Self::CONTRACT, 2, DAEMON_FORMAT, "watches", input)
     }
 
     pub fn render(&self) -> String {
@@ -159,6 +175,41 @@ impl BuildIdentity {
             .map_or("unknown commit", |commit| &commit[..12]);
         let dirty = if self.dirty { " (dirty)" } else { "" };
         format!("{commit}{dirty}, built {}", self.built_at)
+    }
+
+    /// The identity a binary printed for `--version` on its `build: ` line,
+    /// the rest of that line given: the inverse of [`Display`](std::fmt::Display),
+    /// so a daemon reads what a binary at its path was built from (OWL-616).
+    /// `None` when it does not read so.
+    pub fn parse_shown(shown: &str) -> Option<Self> {
+        let (commit, rest) = match shown.strip_prefix("commit ") {
+            Some(rest) => {
+                let (commit, rest) = rest.split_at(rest.find([' ', ','])?);
+                if !full_commit(commit) {
+                    return None;
+                }
+                (Some(commit.to_owned()), rest)
+            }
+            None => (
+                None,
+                shown.strip_prefix("unknown commit (not built from a git tree of Owlshift)")?,
+            ),
+        };
+        let (dirty, rest) = match rest.strip_prefix(" with uncommitted changes") {
+            Some(rest) => (true, rest),
+            None => (false, rest),
+        };
+        let rest = rest.strip_prefix(", built ")?;
+        let (built_at, source) = match rest.split_once(", from ") {
+            Some((built_at, source)) => (built_at, Some(source.to_owned())),
+            None => (rest, None),
+        };
+        Some(Self {
+            commit,
+            dirty,
+            built_at: built_at.parse().ok()?,
+            source,
+        })
     }
 
     fn validate(&self, contract: &'static str) -> Result<(), ContractError> {
@@ -745,6 +796,8 @@ mod tests {
     /// OWL-462: format 2 records the build and reads back; a format-1
     /// record reads as an unknown build, and one naming a build is refused;
     /// a build whose commit is no commit id leaves the record unread.
+    /// OWL-616: format 3 adds what it watches; a format-2 record reads as a
+    /// daemon that watches nothing, and an older one naming it is refused.
     #[test]
     fn a_daemon_record_reads_back_with_its_build_and_a_format_1_one_without() {
         let record = DaemonRecord {
@@ -754,22 +807,36 @@ mod tests {
             binary: "/opt/homebrew/bin/owlshift".to_owned(),
             since: at("2026-10-25T08:00:00Z"),
             build: Some(build("a", true, "2026-10-25T07:00:00Z")),
+            watches: Some("/opt/homebrew/bin/owlshift".to_owned()),
         };
         let text = record.render();
         assert_eq!(DaemonRecord::parse(&text).unwrap(), record);
-        let newer = text.replace("\"format\": 2", "\"format\": 3");
+        let newer = text.replace("\"format\": 3", "\"format\": 4");
         assert!(matches!(
             DaemonRecord::parse(&newer),
-            Err(ContractError::NewerFormat { found: 3, .. })
+            Err(ContractError::NewerFormat { found: 4, .. })
         ));
+        let unwatched = DaemonRecord {
+            watches: None,
+            ..record.clone()
+        };
+        let format_2 = unwatched.render().replace("\"format\": 3", "\"format\": 2");
+        assert_eq!(DaemonRecord::parse(&format_2).unwrap(), unwatched);
+        assert!(DaemonRecord::parse(&text.replace("\"format\": 3", "\"format\": 2")).is_err());
         let unknown = DaemonRecord {
+            build: None,
+            ..unwatched.clone()
+        };
+        let format_1 = unknown.render().replace("\"format\": 3", "\"format\": 1");
+        assert_eq!(DaemonRecord::parse(&format_1).unwrap(), unknown);
+        let watching = DaemonRecord {
             build: None,
             ..record.clone()
         };
-        let format_1 = unknown.render().replace("\"format\": 2", "\"format\": 1");
-        assert_eq!(DaemonRecord::parse(&format_1).unwrap(), unknown);
-        let format_1_built = text.replace("\"format\": 2", "\"format\": 1");
-        assert!(DaemonRecord::parse(&format_1_built).is_err());
+        for older_named in [&unwatched.render(), &watching.render()] {
+            let format_1 = older_named.replace("\"format\": 3", "\"format\": 1");
+            assert!(DaemonRecord::parse(&format_1).is_err(), "{format_1}");
+        }
         let bad_commit = text.replace(&"a".repeat(40), "main");
         assert!(DaemonRecord::parse(&bad_commit).is_err());
 
@@ -825,8 +892,24 @@ mod tests {
         );
         let unknown = BuildIdentity::from_build("HEAD", "0", "soon", "");
         assert_eq!(unknown.commit, None);
-        assert_eq!((unknown.dirty, unknown.source), (false, None));
+        assert_eq!((unknown.dirty, unknown.source.as_deref()), (false, None));
         assert_eq!(unknown.built_at, Timestamp::UNIX_EPOCH);
+        // OWL-616: what `--version` prints reads back, every shape of it.
+        let clean = BuildIdentity::from_build(&commit, "0", "1761609600", "");
+        for shown in [&read, &unknown, &clean] {
+            assert_eq!(
+                BuildIdentity::parse_shown(&shown.to_string()).as_ref(),
+                Some(shown)
+            );
+        }
+        for garbage in [
+            "",
+            "commit main, built 2025-10-28T00:00:00Z",
+            &format!("commit {commit}, built soon"),
+            &format!("commit {commit} built 2025-10-28T00:00:00Z"),
+        ] {
+            assert_eq!(BuildIdentity::parse_shown(garbage), None, "{garbage}");
+        }
 
         let early = build("a", false, "2026-10-25T07:00:00Z");
         let late = build("a", false, "2026-10-25T08:00:00Z");

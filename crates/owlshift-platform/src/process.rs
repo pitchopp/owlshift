@@ -22,7 +22,8 @@ mod signals;
 mod tree;
 
 pub use handover::{
-    adopt_listener, bind_loopback, hand_over_listener, hand_over_on_descriptor, take_handed_over,
+    adopt_file, adopt_listener, bind_loopback, hand_over_file, hand_over_listener,
+    hand_over_on_descriptor, take_handed_over,
 };
 #[cfg(unix)]
 pub use sentinel::{SentinelProbe, SentinelStatus, probe_sentinel};

@@ -265,6 +265,9 @@ pub struct RunningBuilds {
     pub processes: Vec<Running>,
     /// The upgrade's drain asked of the daemon, when one stands.
     pub drain: Option<Request>,
+    /// Whether the daemon watches this program's very file, so it moves onto
+    /// it by itself (OWL-616, `daemon::upgrade::moves_onto`).
+    pub moves_itself: bool,
 }
 
 /// What runs on the data directory `data`: its daemon (the instant probe
@@ -283,7 +286,12 @@ fn running_builds(data: &Path) -> std::io::Result<RunningBuilds> {
             && std::fs::canonicalize(path).ok() != own
     };
     let mut processes = Vec::new();
+    let mut moves_itself = false;
     if let Some(record) = crate::daemon::running(data)? {
+        moves_itself = match (&record, std::env::current_exe()) {
+            (Some(record), Ok(own)) => crate::daemon::upgrade::moves_onto(record, &own),
+            _ => false,
+        };
         processes.push(Running {
             project: None,
             served: false,
@@ -311,6 +319,7 @@ fn running_builds(data: &Path) -> std::io::Result<RunningBuilds> {
     Ok(RunningBuilds {
         processes,
         drain: crate::daemon::requests::drain_asked(data),
+        moves_itself,
     })
 }
 

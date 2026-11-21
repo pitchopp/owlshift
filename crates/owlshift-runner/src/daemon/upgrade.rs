@@ -9,10 +9,21 @@
 //! handed over ([`managed`]): one the installed service's launcher started,
 //! that service naming this binary. Any other is told, never drained, since
 //! its drain would be a stop nobody asked for.
+//!
+//! And without a command (OWL-616, "Without a command"): the daemon reads a
+//! [`Stamp`] of the binary at the path it was started from at each pass,
+//! asks a changed one its `--version` ([`probe`]), and drains for a newer
+//! build itself; at the drain's end ([`end_of_drain`]) a daemon the
+//! service's launcher started exits 75, any other hands its lock to the new
+//! binary (`daemon::successor`). A newer `start` or `doctor` tells a daemon
+//! that watches this very binary that it moves by itself
+//! ([`Handover::MovesItself`]).
 
 use std::cmp::Ordering;
 use std::fs;
+use std::io;
 use std::path::{Path, PathBuf};
+use std::time::{Duration, SystemTime};
 
 use jiff::Timestamp;
 use owlshift_contracts::service::{BuildIdentity, DaemonRecord, Request};
@@ -21,6 +32,138 @@ use semver::Version;
 use super::instance::{self, service_dir};
 use super::{UPGRADE_EXIT, requests};
 use crate::install;
+
+/// How long a binary has to answer `--version`: its first run on macOS
+/// waits for the system's scan of a new file, one file at a time, so the
+/// daemon's pin check (OWL-553, OWL-608) and a daemon's look at the binary
+/// at its path (OWL-616) share one bound well past the worst scan measured.
+pub const VERSION_WAIT: Duration = Duration::from_secs(120);
+
+/// What a file was when it was looked at (OWL-616): its device, inode, size
+/// and modification time, its link followed. A package manager's relink, a
+/// file renamed over it and a file written in place each change it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Stamp {
+    device: u64,
+    inode: u64,
+    size: u64,
+    modified: Option<SystemTime>,
+}
+
+impl Stamp {
+    /// The stamp of the file at `path`, its link followed.
+    pub fn of(path: &Path) -> io::Result<Self> {
+        let metadata = fs::metadata(path)?;
+        #[cfg(unix)]
+        let (device, inode) = {
+            use std::os::unix::fs::MetadataExt;
+            (metadata.dev(), metadata.ino())
+        };
+        #[cfg(not(unix))]
+        let (device, inode) = (0, 0);
+        Ok(Self {
+            device,
+            inode,
+            size: metadata.len(),
+            modified: metadata.modified().ok(),
+        })
+    }
+}
+
+/// What a binary said of itself for `--version`: its version and, when it
+/// told one that reads, its build.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Probed {
+    pub version: String,
+    pub build: Option<BuildIdentity>,
+}
+
+impl Probed {
+    /// It as [`supersedes`] compares it.
+    pub fn binary(&self) -> Binary<'_> {
+        Binary {
+            version: &self.version,
+            build: self.build.as_ref(),
+        }
+    }
+}
+
+/// What `said`, a binary's `--version`, tells: its first line's last word
+/// is the version, and its second line, `build: ` then the identity, the
+/// build (`long_version` of the `owlshift` binary). `None` when the first
+/// line is missing; a build that does not read is an unknown one.
+pub fn parse_version(said: &str) -> Option<Probed> {
+    let mut lines = said.lines();
+    let version = lines.next()?.split_whitespace().last()?.to_owned();
+    let build = lines
+        .next()
+        .and_then(|line| line.strip_prefix("build: "))
+        .and_then(BuildIdentity::parse_shown);
+    Some(Probed { version, build })
+}
+
+/// Asks the binary at `path` its `--version`, within [`VERSION_WAIT`].
+pub fn probe(path: &Path) -> Result<Probed, String> {
+    let captured = owlshift_platform::process::run(path, &["--version"], None, VERSION_WAIT)
+        .map_err(|error| error.to_string())?;
+    if !captured.success() {
+        return Err(match captured.code {
+            Some(code) => format!("it exited with {code}"),
+            None => "a signal ended it".to_owned(),
+        });
+    }
+    parse_version(&String::from_utf8_lossy(&captured.stdout))
+        .ok_or_else(|| "it printed no version".to_owned())
+}
+
+/// Whether the daemon of pid `pid` was started by the launcher of the
+/// service installed for `data`: the manager then starts the launcher again
+/// at the daemon's end, never a successor of its own (OWL-616).
+pub fn started_by_service(data: &Path, pid: u32) -> bool {
+    matches!(install::installed(data), Ok(Some(_))) && launched_pid(data) == Some(pid)
+}
+
+/// Whether the daemon `record` watches the file at `own` (OWL-616): it then
+/// moves onto it by itself once it finds a newer build there.
+pub fn moves_onto(record: &DaemonRecord, own: &Path) -> bool {
+    record.watches.as_deref().is_some_and(|watched| {
+        matches!(
+            (fs::canonicalize(watched), fs::canonicalize(own)),
+            (Ok(theirs), Ok(ours)) if theirs == ours
+        )
+    })
+}
+
+/// What a daemon does once its upgrade's drain, or its stop, is done
+/// (OWL-616, "At the drain's end").
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum End {
+    /// It ends 0: a stop was asked, or no upgrade was.
+    Stopped,
+    /// It exits 75: the service manager starts the new binary.
+    Upgraded,
+    /// It hands its lock to the newer binary it found at its path.
+    HandOver,
+}
+
+/// The daemon's end, decided from the facts alone: a stop asked meanwhile
+/// wins; a daemon the service's launcher started exits 75; any other hands
+/// over when it found a newer binary at its path, else exits 75 as before
+/// OWL-616.
+pub fn end_of_drain(upgrading: bool, stopped: bool, found: bool, by_service: bool) -> End {
+    match (upgrading && !stopped, found && !by_service) {
+        (false, _) => End::Stopped,
+        (true, true) => End::HandOver,
+        (true, false) => End::Upgraded,
+    }
+}
+
+/// The pid the service's launcher wrote last.
+fn launched_pid(data: &Path) -> Option<u32> {
+    fs::read_to_string(launched_file(data))
+        .ok()
+        .and_then(|text| text.trim().parse::<u32>().ok())
+}
 
 /// The file the service's launcher writes its pid to just before it
 /// executes the daemon, which keeps that pid.
@@ -113,10 +256,7 @@ pub fn managed(data: &Path, running: &DaemonRecord, own: &Path) -> Result<(), Un
     if !same {
         return Err(Unmanaged::OtherBinary(service.binary));
     }
-    let launched = fs::read_to_string(launched_file(data))
-        .ok()
-        .and_then(|text| text.trim().parse::<u32>().ok());
-    if launched != Some(running.pid) {
+    if launched_pid(data) != Some(running.pid) {
         return Err(Unmanaged::NotLaunched);
     }
     Ok(())
@@ -139,6 +279,9 @@ pub enum Handover {
     Unidentified(DaemonRecord),
     /// Its upgrade's drain is asked already.
     AlreadyAsked(DaemonRecord),
+    /// It is older, no manager would start this binary after it, and it
+    /// watches this very binary, so it moves onto it by itself (OWL-616).
+    MovesItself(DaemonRecord),
     /// It is older, but no manager would start this binary after it.
     Unmanaged(DaemonRecord, Unmanaged),
     /// It is older and managed: its drain is to be asked, or was.
@@ -148,12 +291,14 @@ pub enum Handover {
 }
 
 /// What `facts` call for, the binary being `own`: decided without reading
-/// or writing anything.
+/// or writing anything. `moves_itself` says whether the daemon watches this
+/// very binary ([`moves_onto`]).
 pub fn decide(
     running: Option<Option<DaemonRecord>>,
     own: Binary<'_>,
     stop_asked: bool,
     drain_asked: bool,
+    moves_itself: bool,
     managed: impl FnOnce(&DaemonRecord) -> Result<(), Unmanaged>,
 ) -> Handover {
     let record = match running {
@@ -179,6 +324,7 @@ pub fn decide(
     }
     match managed(&record) {
         Ok(()) => Handover::Ask(record),
+        Err(_) if moves_itself => Handover::MovesItself(record),
         Err(why) => Handover::Unmanaged(record, why),
     }
 }
@@ -195,11 +341,13 @@ pub fn hand_over(
 ) -> Result<Handover, String> {
     let shown = |error: std::io::Error| format!("{}: {error}", service_dir(data).display());
     let running = instance::running(data).map_err(shown)?;
+    let moves_itself = matches!(&running, Some(Some(record)) if moves_onto(record, binary));
     let decided = decide(
         running,
         own,
         requests::stop_asked(data).is_some(),
         requests::drain_asked(data).is_some(),
+        moves_itself,
         |record| managed(data, record, binary),
     );
     let Handover::Ask(record) = &decided else {
@@ -247,8 +395,14 @@ impl Handover {
                 who(record)
             )),
             Self::AlreadyAsked(record) => Some(format!(
-                "Upgrade: {} is already draining for a newer version; the service at login starts \
-                 it again once its steps under way finish.",
+                "Upgrade: {} is already draining for a newer version, on which it comes back once \
+                 its steps under way finish.",
+                who(record)
+            )),
+            Self::MovesItself(record) => Some(format!(
+                "Upgrade: {} moves onto this binary ({own}) by itself at its next pass, within a \
+                 minute: its steps under way finish and no new one starts, then it hands its lock \
+                 to this binary's daemon. Its log says so if it does not.",
                 who(record)
             )),
             Self::Unmanaged(record, why) => {
@@ -294,6 +448,7 @@ mod tests {
             binary: "/bin/owlshift".to_owned(),
             since: Timestamp::now(),
             build: None,
+            watches: None,
         }
     }
 
@@ -381,10 +536,16 @@ mod tests {
         let own = of("0.2.0", None);
         let old = record(7, "0.1.0");
         let decide_with = |running, stop, drain, managed: Result<(), Unmanaged>| {
-            decide(running, own, stop, drain, |_| managed)
+            decide(running, own, stop, drain, false, |_| managed)
         };
-        assert_eq!(decide(None, own, false, false, ok), Handover::NoDaemon);
-        assert_eq!(decide(Some(None), own, false, false, ok), Handover::Unknown);
+        assert_eq!(
+            decide(None, own, false, false, false, ok),
+            Handover::NoDaemon
+        );
+        assert_eq!(
+            decide(Some(None), own, false, false, false, ok),
+            Handover::Unknown
+        );
         assert_eq!(
             decide_with(Some(Some(old.clone())), true, false, Ok(())),
             Handover::Stopping
@@ -412,6 +573,21 @@ mod tests {
                 "{line}"
             );
         }
+        // OWL-616: a daemon that watches this binary moves by itself, told
+        // so; a managed one is still asked to drain.
+        let moving = decide(Some(Some(old.clone())), own, false, false, true, |_| {
+            Err(Unmanaged::NotLaunched)
+        });
+        assert_eq!(moving, Handover::MovesItself(old.clone()));
+        let line = moving.line(own).unwrap();
+        assert!(
+            line.contains("by itself") && !line.contains("`owlshift stop`"),
+            "{line}"
+        );
+        assert_eq!(
+            decide(Some(Some(old.clone())), own, false, false, true, ok),
+            Handover::Ask(old.clone())
+        );
         let asked = decide_with(Some(Some(old.clone())), false, false, Ok(()));
         assert_eq!(asked, Handover::Ask(old));
         assert!(asked.line(own).unwrap().contains("exits with 75"));
@@ -420,7 +596,14 @@ mod tests {
         let built = build('a', false, 0);
         let identified = of("0.2.0", Some(&built));
         let same = record(7, "0.2.0");
-        let unidentified = decide(Some(Some(same.clone())), identified, false, false, ok);
+        let unidentified = decide(
+            Some(Some(same.clone())),
+            identified,
+            false,
+            false,
+            false,
+            ok,
+        );
         assert_eq!(unidentified, Handover::Unidentified(same));
         let line = unidentified.line(identified).unwrap();
         assert!(
@@ -527,5 +710,74 @@ mod tests {
         );
         assert!(requests::drain_asked(data).is_none());
         drop(held);
+    }
+
+    /// OWL-616: a file renamed over the binary changes its stamp, a link
+    /// pointed elsewhere too; the same file, by its link or its path, has
+    /// one stamp.
+    #[cfg(unix)]
+    #[test]
+    fn a_binary_replaced_or_relinked_changes_its_stamp() {
+        let root = tempfile::tempdir().unwrap();
+        let (a, b) = (root.path().join("a"), root.path().join("b"));
+        fs::write(&a, "one").unwrap();
+        fs::write(&b, "one").unwrap();
+        let link = root.path().join("owlshift");
+        std::os::unix::fs::symlink(&a, &link).unwrap();
+        let seen = Stamp::of(&link).unwrap();
+        assert_eq!(Stamp::of(&a).unwrap(), seen);
+        let relinked = root.path().join("relinked");
+        std::os::unix::fs::symlink(&b, &relinked).unwrap();
+        fs::rename(&relinked, &link).unwrap();
+        assert_ne!(Stamp::of(&link).unwrap(), seen, "a relink");
+        let renamed = Stamp::of(&a).unwrap();
+        let staged = root.path().join("staged");
+        fs::write(&staged, "one").unwrap();
+        fs::rename(&staged, &a).unwrap();
+        assert_ne!(Stamp::of(&a).unwrap(), renamed, "a file renamed over it");
+    }
+
+    /// OWL-616: `--version` as the `owlshift` binary prints it reads back;
+    /// a build line that does not read is an unknown build; nothing at all
+    /// reads as nothing.
+    #[test]
+    fn a_version_reads_from_what_a_binary_prints() {
+        let built = build('a', true, 0);
+        let said = format!("owlshift 0.3.0\nbuild: {built}\nformats: brief 9\n");
+        assert_eq!(
+            parse_version(&said),
+            Some(Probed {
+                version: "0.3.0".to_owned(),
+                build: Some(built),
+            })
+        );
+        assert_eq!(
+            parse_version("owlshift 0.1.0\n"),
+            Some(Probed {
+                version: "0.1.0".to_owned(),
+                build: None,
+            })
+        );
+        assert_eq!(parse_version(""), None);
+    }
+
+    /// OWL-616: a stop wins; a daemon the service's launcher started exits
+    /// 75; any other hands over once it found a newer binary, else exits 75
+    /// as before.
+    #[test]
+    fn a_drain_ends_by_a_handover_only_outside_the_service() {
+        for (upgrading, stopped, found, by_service, end) in [
+            (false, false, false, false, End::Stopped),
+            (true, true, true, false, End::Stopped),
+            (true, false, true, false, End::HandOver),
+            (true, false, true, true, End::Upgraded),
+            (true, false, false, false, End::Upgraded),
+        ] {
+            assert_eq!(
+                end_of_drain(upgrading, stopped, found, by_service),
+                end,
+                "{upgrading} {stopped} {found} {by_service}"
+            );
+        }
     }
 }

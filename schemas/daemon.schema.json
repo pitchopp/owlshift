@@ -22,7 +22,7 @@
     "format": {
       "description": "The format version of this document.",
       "type": "integer",
-      "const": 2
+      "const": 3
     },
     "pid": {
       "description": "Its process id.",
@@ -38,6 +38,13 @@
     "version": {
       "description": "The version of its binary.",
       "type": "string"
+    },
+    "watches": {
+      "description": "The path of the binary it watches, the one it was started from: once\na newer build lies there it moves onto it by itself (format 3,\nOWL-616). Absent from an older record, whose daemon watches nothing.",
+      "type": [
+        "string",
+        "null"
+      ]
     }
   },
   "additionalProperties": false,
