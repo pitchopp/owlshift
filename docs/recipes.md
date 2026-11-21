@@ -61,48 +61,48 @@ gate = [
     "cargo clippy --workspace --all-targets --locked -- -D warnings",
     "cargo test --workspace --locked",
 ]
+run_caches = { CARGO_HOME = "cargo" }
 ```
 
-Drop `--locked` when the repository has no `Cargo.lock`.
+Drop `--locked` when the repository has no `Cargo.lock`. `run_caches` gives the runs a cargo home of Owlshift's own, which they write: a crate your `~/.cargo` lacks is downloaded there, not refused. rustup and its tool chains stay where you installed them.
 
 **npm**
 
 ```toml
 [stack]
 gate = ["npm run lint", "npm run typecheck", "npm run test"]
-setup = ["npm ci --prefer-offline --cache \"$HOME/.npm\" --logs-dir \"$TMPDIR/npm-logs\""]
-caches = [".npm"]
+setup = ["npm ci"]
+run_caches = { npm_config_cache = "npm" }
 ```
 
-Name your own scripts: `init` writes the ones your `package.json` defines. npm installs from its cache, read-only, so your machine allows that folder:
-
-```toml personal
-allow_caches = [".npm"]
-```
+Name your own scripts: `init` writes the ones your `package.json` defines. The runs install online into npm's cache of Owlshift's own, kept for the next runs.
 
 **pnpm (version 10)**
 
 ```toml
 [stack]
 gate = ["pnpm run lint", "pnpm run test"]
-setup = ["if [ -d \"$HOME/Library/pnpm/store/v10\" ]; then mkdir -p node_modules/.pnpm-overlay/v10/projects && ln -sfn \"$HOME/Library/pnpm/store/v10/files\" node_modules/.pnpm-overlay/v10/files && ln -sfn \"$HOME/Library/pnpm/store/v10/index\" node_modules/.pnpm-overlay/v10/index && pnpm install --offline --frozen-lockfile --store-dir node_modules/.pnpm-overlay; else pnpm install --frozen-lockfile; fi"]
-caches = ["Library/pnpm"]
+setup = ["pnpm install --frozen-lockfile"]
+run_caches = { npm_config_store_dir = "pnpm-store" }
 ```
 
-pnpm cannot install from a read-only store, so the setup links pnpm 10's store on macOS into an overlay inside `node_modules`. The store of Linux (`~/.local/share/pnpm`) has not been checked: there the setup runs pnpm's plain install. That install fails confined on macOS, as pnpm 9 does without pnpm 10's store, and pnpm 12 failed confined whatever its store. A project on another pnpm than 10 keeps `pnpm install --frozen-lockfile` and declares no cache; run `owlshift gate` to see whether it works for you. Allow the folder on your machine:
-
-```toml personal
-allow_caches = ["Library/pnpm"]
-```
+pnpm's store is a cache of Owlshift's own, which the runs write, so a package the lock file gains is downloaded, not refused. A project on another pnpm than 10 keeps the same setup without `run_caches`, since only pnpm 10 was checked; run `owlshift gate` to see whether it works for you.
 
 **Python with uv**
 
 ```toml
 [stack]
 gate = ["uv run ruff check .", "uv run pytest"]
+run_caches = { UV_CACHE_DIR = "uv", UV_PYTHON_INSTALL_DIR = "uv-python" }
 ```
 
-`uv run` syncs the project's environment from `uv.lock` itself, updating the lock when `pyproject.toml` changed, so there is no setup. A project that wants the gate to fail on a stale lock instead writes `uv run --locked ruff check .` and `uv run --locked pytest` (`--locked` asserts that `uv.lock` stays unchanged, as `uv run --help` says). Without `uv.lock`, the tools run bare and the gate needs a `setup` that installs them. `init` guesses `ruff` and `pytest` only from a `[tool.ruff]` and a `[tool.pytest.ini_options]` table in `pyproject.toml`. This was not checked confined: uv keeps a cache in your home, so if `owlshift gate` fails on it, it prints the `caches` and `allow_caches` lines to add.
+`uv run` syncs the project's environment from `uv.lock` itself, updating the lock when `pyproject.toml` changed, so there is no setup. A project that wants the gate to fail on a stale lock instead writes `uv run --locked ruff check .` and `uv run --locked pytest` (`--locked` asserts that `uv.lock` stays unchanged, as `uv run --help` says). Without `uv.lock`, the tools run bare and the gate needs a `setup` that installs them. `init` guesses `ruff` and `pytest` only from a `[tool.ruff]` and a `[tool.pytest.ini_options]` table in `pyproject.toml`. Confined, uv needs both caches of its own: its packages, and the Pythons it installs, since your home's are closed.
+
+**The caches your runs write.** Each `run_caches` entry is a variable a package manager reads for its cache and the name of a folder Owlshift makes for it, under `~/Library/Caches/owlshift/` on macOS and `~/.cache/owlshift/` on Linux, one folder per repository (`OWLSHIFT_CACHE_DIR` moves it, for a machine whose cache folder's path holds a space). `owlshift doctor` shows its size; delete the folder to empty it. Your own caches stay read-only to the runs: declare one in `stack.caches`, and allow it in your personal file with `allow_caches`, only for a tool that must read it, such as yarn 4's global cache:
+
+```toml personal
+allow_caches = [".yarn/berry"]
+```
 
 **A Makefile**
 

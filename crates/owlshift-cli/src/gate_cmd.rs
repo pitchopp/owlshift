@@ -11,7 +11,6 @@ use std::process::ExitCode;
 
 use owlshift_adapters::forge::Repo;
 use owlshift_contracts::config::ProjectConfig;
-use owlshift_runner::agent_env::AgentEnv;
 use owlshift_runner::cache_offer::{self, State};
 use owlshift_runner::config::{Effective, FileState};
 use owlshift_runner::events::printable;
@@ -40,20 +39,7 @@ fn run_checked(
     // Before anything is cloned, as for `do` (OWL-98).
     system.sandbox().map_err(|error| error.to_string())?;
     let data_dir = crate::data_dir()?;
-    // As `do` builds it: the names declared, as far as the operator allows
-    // them for this repository.
-    let allowed = config.allowed_gate_env(Some(&repo)).unwrap_or_default();
-    // The caches declared, as far as the operator allows them for this
-    // repository: the load refused any other (OWL-330).
-    let allowed_caches = config.allowed_caches(Some(&repo)).unwrap_or_default();
-    let caches: Vec<&str> = project
-        .stack
-        .cache_folders()
-        .into_iter()
-        .filter(|cache| allowed_caches.contains(cache))
-        .collect();
-    let agent = AgentEnv::from_runner(&project.stack.gate_env_names(), &allowed, &caches)
-        .map_err(|error| format!("the agent environment: {error}"))?;
+    let agent = do_cmd::agent_env(config, project, &repo)?;
     let executor = on_demand::executor(git, agent);
     let dirs = ProjectDirs::new(&data_dir, &repo);
     let gate = GateOnce::operator(&executor, &dirs, &remote_url, project, at);

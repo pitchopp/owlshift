@@ -140,6 +140,11 @@ impl System for ScriptedSystem {
         Some((self.data.clone(), DataDirSource::Platform))
     }
 
+    /// No cache directory: the bench never walks the machine's (OWL-617).
+    fn run_cache_dir(&self) -> Option<PathBuf> {
+        None
+    }
+
     fn codex_login_file(&self) -> Option<PathBuf> {
         None
     }

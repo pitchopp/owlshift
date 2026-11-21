@@ -50,6 +50,7 @@ use owlshift_platform::process::{Captured, OUTPUT_CAP, find_executable_in, run_c
 use owlshift_platform::sandbox::{self, Policy, SandboxError};
 
 use crate::executor::own_entry;
+use crate::run_caches::RunCaches;
 use crate::system::PROBE_TIMEOUT;
 use crate::ui::token::{ensure_dir, token_dir};
 
@@ -66,6 +67,13 @@ pub struct AgentEnv {
     /// operator allows (`stack.caches`, `allow_caches`, OWL-330), from the
     /// home: opened read-only ([`AgentEnv::policy`]).
     caches: Vec<String>,
+    /// The caches of Owlshift's own the project's runs may write
+    /// (`stack.run_caches`, OWL-617), each a variable and its folder: opened
+    /// read and written, read-only under the read-only profile
+    /// ([`AgentEnv::policy`]), and each variable set on every confined
+    /// command alone, never among [`AgentEnv::vars`], which the runner's own
+    /// git outside the sandbox gets too (`Git::as_agent`).
+    run_caches: RunCaches,
     /// The web UI's token folder, `<data>/service/ui`, hidden from every
     /// command (OWL-467). [`AgentEnv::from_runner`], the constructor every
     /// production run and gate uses, sets it; a production path that built
@@ -137,6 +145,7 @@ impl AgentEnv {
             vars,
             gate_env: declared.iter().map(|name| (*name).to_owned()).collect(),
             caches: Vec::new(),
+            run_caches: RunCaches::default(),
             ui_dir: None,
             confined: true,
         })
@@ -194,6 +203,19 @@ impl AgentEnv {
     /// The cache folders, from the home.
     pub fn caches(&self) -> &[String] {
         &self.caches
+    }
+
+    /// The same environment, with `run_caches`, each a variable and the
+    /// folder of Owlshift's own it names (`stack.run_caches`, OWL-617), as
+    /// `crate::run_caches::prepare` made them.
+    pub fn with_run_caches(mut self, run_caches: RunCaches) -> Self {
+        self.run_caches = run_caches;
+        self
+    }
+
+    /// The run caches, each a variable and its folder.
+    pub fn run_caches(&self) -> &[(String, PathBuf)] {
+        self.run_caches.folders()
     }
 
     /// The same environment, with nothing confined: the test bench's way to
@@ -314,6 +336,15 @@ impl AgentEnv {
             }
         }
         writable.extend(run.writable.iter().cloned());
+        // The project's run caches (OWL-617): written, but read only where
+        // the run writes nothing of its own.
+        for (_, folder) in self.run_caches.folders() {
+            if run.read_only {
+                readable.push(folder.clone());
+            } else {
+                writable.push(folder.clone());
+            }
+        }
 
         // The temporary folders the runner inherited are shared with the
         // user's other processes: closed, never opened. Only the run's own
@@ -444,6 +475,11 @@ impl AgentEnv {
     /// token folder is made first when it is missing, since bwrap hides only
     /// a path that exists; a folder that cannot be made refuses the spawn.
     fn sandboxed(&self, inner: Command, run: &RunPaths) -> Result<Command, SandboxError> {
+        // A run cache the operator deleted to empty it comes back, empty:
+        // bwrap binds only a folder that exists; and each is checked again,
+        // so a link planted since the command began is never opened
+        // (OWL-617).
+        self.run_caches.make().map_err(SandboxError::Refused)?;
         if self.confined {
             if let Some(dir) = &self.ui_dir {
                 ensure_dir(dir).map_err(|_| SandboxError::Path(dir.clone()))?;
@@ -456,10 +492,14 @@ impl AgentEnv {
         }
     }
 
-    /// Gives an agent command exactly the agent's variables, and the run's
-    /// own temporary folder, never the one inherited.
+    /// Gives an agent command exactly the agent's variables, each run cache's
+    /// variable set to its folder, and the run's own temporary folder, never
+    /// the one inherited.
     fn environment(&self, mut command: Command, run: &RunPaths) -> Command {
         self.apply(&mut command);
+        for (name, folder) in self.run_caches.folders() {
+            command.env(name, folder);
+        }
         match &run.temp {
             Some(dir) => {
                 for name in TEMP_VARIABLES {
@@ -1376,6 +1416,64 @@ mod tests {
             "{policy:?}"
         );
         assert_eq!(policy.writable, without.writable);
+    }
+
+    /// OWL-617: a run cache is written, but read only under the read-only
+    /// profile; a declared cache holding it opens nothing; its variable is
+    /// set on the spawned command alone, never among the variables the
+    /// runner's own git gets; a deleted folder is made again at the spawn.
+    #[cfg(unix)]
+    #[test]
+    fn the_run_caches_are_written_and_named_on_the_command_alone() {
+        let base = tempfile::tempdir().unwrap();
+        let base = std::fs::canonicalize(base.path()).unwrap();
+        let home = base.join("home");
+        let cargo = home.join("Library/Caches/owlshift/github.com/o/r/cargo");
+        std::fs::create_dir_all(home.join("wt")).unwrap();
+        std::fs::create_dir_all(&cargo).unwrap();
+        let parent = [
+            ("HOME".into(), home.clone().into_os_string()),
+            ("PATH".into(), OsString::from("/usr/bin:/bin")),
+        ];
+        let agent = AgentEnv::for_project(parent, &[], &[])
+            .unwrap()
+            .with_caches(&["Library/Caches"])
+            .with_run_caches(RunCaches::new(
+                home.join("Library/Caches/owlshift"),
+                vec![("CARGO_HOME".to_owned(), cargo.clone())],
+            ));
+        for read_only in [false, true] {
+            let run = RunPaths {
+                workdir: home.join("wt"),
+                read_only,
+                ..RunPaths::default()
+            };
+            let policy = agent.policy(&run);
+            assert_eq!(policy.writable.contains(&cargo), !read_only, "{policy:?}");
+            assert_eq!(policy.readable.contains(&cargo), read_only, "{policy:?}");
+            // Written, the run cache keeps the person's cache that holds it
+            // closed, as any folder a run writes does.
+            if !read_only {
+                assert!(
+                    !policy.readable.contains(&home.join("Library/Caches")),
+                    "{policy:?}"
+                );
+            }
+        }
+        assert!(agent.var("CARGO_HOME").is_none());
+        let run = RunPaths {
+            workdir: home.join("wt"),
+            ..RunPaths::default()
+        };
+        std::fs::remove_dir(&cargo).unwrap();
+        let command = agent
+            .clone()
+            .without_confinement()
+            .confine(Command::new("true"), &run)
+            .unwrap();
+        let set: Vec<_> = command.get_envs().collect();
+        assert!(set.contains(&(OsStr::new("CARGO_HOME"), Some(cargo.as_os_str()))));
+        assert!(cargo.is_dir());
     }
 
     /// Whether agent runs can be confined here, as `executor::gate`'s tests

@@ -9,7 +9,7 @@ use std::collections::BTreeMap;
 use std::num::{NonZeroU16, NonZeroU32};
 use std::time::Duration;
 
-use owlshift_core::agent_env::{check_declared, check_home_folders, check_names};
+use owlshift_core::agent_env::{check_declared, check_home_folders, check_names, check_run_caches};
 use owlshift_core::decider::ZoneOwners;
 use owlshift_core::gate::{GatePolicy, PassLimit, ResolverPolicy, usd_micros};
 use owlshift_core::reply::DEFAULT_QUIET_WINDOW;
@@ -364,6 +364,20 @@ pub struct Stack {
     /// is, lies in or holds a credential path is refused.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub caches: Vec<String>,
+    /// Caches of Owlshift's own that the setup, the harness and the gate may
+    /// write (OWL-617), as a table from the variable a package manager reads
+    /// for its cache to the name of a folder, such as `CARGO_HOME = "cargo"`.
+    /// The runner makes each folder under the machine's cache directory, one
+    /// tree per project, opens it read and written in the sandbox, and sets
+    /// the variable to it; nothing of the person's is opened, so no line of
+    /// the operator's is needed. The names take `gate_env`'s refusals, and
+    /// neither a name Owlshift passes itself (`PATH`, `HOME`, `TMPDIR`…) nor
+    /// one `gate_env` declares; a folder is one name of ASCII letters, digits,
+    /// `.`, `_` and `-` (`owlshift_core::agent_env::check_run_caches`). A file
+    /// using it requires an Owlshift that reads it.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    #[schemars(extend("maxProperties" = 16))]
+    pub run_caches: BTreeMap<String, String>,
     /// The files whose text reaches agents as the project's rules, paths
     /// from the repository's root with `/` between folders, in order. Each is
     /// read at the base commit, taken whole, and must exist there; a blank
@@ -386,6 +400,32 @@ impl Stack {
     /// The folders of [`Stack::caches`], from the home.
     pub fn cache_folders(&self) -> Vec<&str> {
         names(&self.caches)
+    }
+
+    /// The entries of [`Stack::run_caches`], variable and folder, by name.
+    pub fn run_cache_entries(&self) -> Vec<(&str, &str)> {
+        self.run_caches
+            .iter()
+            .map(|(name, folder)| (name.as_str(), folder.as_str()))
+            .collect()
+    }
+
+    /// Checks [`Stack::run_caches`]: `check_run_caches`'s rule, then no name
+    /// that [`Stack::gate_env`] declares too, in any letter case, since one
+    /// variable cannot take the runner's value and a folder at once.
+    fn check_run_caches(&self) -> Result<(), String> {
+        check_run_caches(&self.run_cache_entries())?;
+        match self.run_caches.keys().find(|name| {
+            self.gate_env
+                .iter()
+                .any(|declared| declared.eq_ignore_ascii_case(name))
+        }) {
+            Some(name) => Err(format!(
+                "{name} is declared in stack.gate_env too: a variable takes its value from the \
+                 runner's environment or names a cache, not both"
+            )),
+            None => Ok(()),
+        }
     }
 
     /// The named resources of [`Stack::resources`], checked; `Err` names
@@ -1299,7 +1339,10 @@ impl ProjectConfig {
             .map_err(|reason| ContractError::invalid(PROJECT, format!("stack.setup: {reason}")))?;
         check_home_folders(&self.stack.cache_folders())
             .map_err(|reason| ContractError::invalid(PROJECT, format!("stack.caches: {reason}")))?;
-        check_names(&self.stack.gate_env_names()).map_err(gate_env_error)
+        check_names(&self.stack.gate_env_names()).map_err(gate_env_error)?;
+        self.stack.check_run_caches().map_err(|reason| {
+            ContractError::invalid(PROJECT, format!("stack.run_caches: {reason}"))
+        })
     }
 
     /// The project's gate policy (architecture section 4): `always_human`,
@@ -2815,6 +2858,44 @@ mod tests {
                 error.starts_with("invalid owlshift.toml: stack.gate_env: ")
                     && error.contains(reason),
                 "{names}: {error}"
+            );
+        }
+    }
+
+    /// OWL-617: `stack.run_caches` round-trips; a credential, a `GIT_` or a
+    /// loader name, or a name `gate_env` declares too, refuses the file at
+    /// load, naming the key. The other refusals are the core's
+    /// (`check_run_caches`).
+    #[test]
+    fn run_caches_load_and_refuse_what_no_run_may_set() {
+        let config =
+            project_with_stack("run_caches = { CARGO_HOME = \"cargo\", UV_CACHE_DIR = \"uv\" }")
+                .unwrap();
+        assert_eq!(
+            config.stack.run_cache_entries(),
+            [("CARGO_HOME", "cargo"), ("UV_CACHE_DIR", "uv")]
+        );
+        assert_eq!(ProjectConfig::parse(&config.render()).unwrap(), config);
+        assert!(
+            !project_with_stack("")
+                .unwrap()
+                .render()
+                .contains("run_caches")
+        );
+        for (lines, says) in [
+            ("run_caches = { GITHUB_TOKEN = \"t\" }", "credentials"),
+            ("run_caches = { GIT_DIR = \"g\" }", "Owlshift sets how git"),
+            ("run_caches = { LD_PRELOAD = \"l\" }", "dynamic loader"),
+            (
+                "gate_env = [\"cargo_home\"]\nrun_caches = { CARGO_HOME = \"cargo\" }",
+                "declared in stack.gate_env too",
+            ),
+        ] {
+            let error = project_with_stack(lines).unwrap_err().to_string();
+            assert!(
+                error.starts_with("invalid owlshift.toml: stack.run_caches: ")
+                    && error.contains(says),
+                "{lines}: {error}"
             );
         }
     }

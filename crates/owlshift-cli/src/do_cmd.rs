@@ -317,20 +317,7 @@ fn run_with(
         .map_err(|error| format!("the built-in arbiter role: {error}"))?;
     let verify_prompt = strip_role_front_matter(Role::Verify, VERIFY_ROLE)
         .map_err(|error| format!("the built-in verify role: {error}"))?;
-    // The personal file is valid here; were it not, no name would be allowed.
-    // The names are those allowed for the repository this run delivers to.
-    let allowed = config.allowed_gate_env(Some(&repo)).unwrap_or_default();
-    // The caches declared, as far as the operator allows them for this
-    // repository: the load refused any other (OWL-330).
-    let allowed_caches = config.allowed_caches(Some(&repo)).unwrap_or_default();
-    let caches: Vec<&str> = project
-        .stack
-        .cache_folders()
-        .into_iter()
-        .filter(|cache| allowed_caches.contains(cache))
-        .collect();
-    let agent = AgentEnv::from_runner(&project.stack.gate_env_names(), &allowed, &caches)
-        .map_err(|error| format!("the agent environment: {error}"))?;
+    let agent = agent_env(config, project, &repo)?;
 
     // From here on, the credentials: the runner's own, never an agent's.
     let dirs = ProjectDirs::new(data_dir, &repo);
@@ -982,6 +969,35 @@ impl Secrets {
             },
         )?)
     }
+}
+
+/// The agent environment of `project`'s runs for the GitHub repository
+/// `repo`, as `do` and `gate` build it: the variables its `stack.gate_env`
+/// declares and the home folders its `stack.caches` declares, as far as the
+/// operator allows them for this repository (the load refused any other,
+/// OWL-330), and its run caches, made (`stack.run_caches`, OWL-617). The
+/// personal file is valid here; were it not, no name would be allowed.
+pub(crate) fn agent_env(
+    config: &Effective,
+    project: &ProjectConfig,
+    repo: &Repo,
+) -> Result<AgentEnv, String> {
+    let allowed = config.allowed_gate_env(Some(repo)).unwrap_or_default();
+    let allowed_caches = config.allowed_caches(Some(repo)).unwrap_or_default();
+    let caches: Vec<&str> = project
+        .stack
+        .cache_folders()
+        .into_iter()
+        .filter(|cache| allowed_caches.contains(cache))
+        .collect();
+    let run_caches = owlshift_runner::run_caches::prepare(
+        owlshift_platform::paths::cache_dir().as_deref(),
+        repo,
+        &project.stack.run_cache_entries(),
+    )?;
+    AgentEnv::from_runner(&project.stack.gate_env_names(), &allowed, &caches)
+        .map(|agent| agent.with_run_caches(run_caches))
+        .map_err(|error| format!("the agent environment: {error}"))
 }
 
 /// The project file `command` works with, and its path, from a valid

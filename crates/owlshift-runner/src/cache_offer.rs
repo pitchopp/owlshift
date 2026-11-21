@@ -227,12 +227,15 @@ impl Lines {
     }
 }
 
-const WRITES: &str = "keep the tool from writing there (as `--prefer-offline` does for npm), \
-                      or move its writable folder into $TMPDIR, the run's own";
+/// Since OWL-617 a tool's writes go to a cache of Owlshift's own, which the
+/// project's runs write (`stack.run_caches`).
+const WRITES: &str = "keep the tool from writing there, give it a cache its runs write in \
+                      `stack.run_caches` (the variable it reads for its cache and a folder's \
+                      name, such as `CARGO_HOME = \"cargo\"`), or move its writable folder into \
+                      $TMPDIR, the run's own";
 
-const NPM: &str = "npm: use the setup `owlshift init` writes, `npm ci --prefer-offline --cache \
-                   \"$HOME/.npm\" --logs-dir \"$TMPDIR/npm-logs\"`, and run `npm ci` once in your \
-                   checkout so that ~/.npm holds every package of the lock file.";
+const NPM: &str = "npm: give it a cache its runs write, `npm_config_cache = \"npm\"` in \
+                   `stack.run_caches`, with the setup `npm ci`, as `owlshift init` writes them.";
 
 /// What `owlshift gate` says after the gate's result: each folder refused,
 /// the lines that open the closed ones (`project`, the project file;
@@ -336,8 +339,8 @@ pub fn reason_note(refused: &[Refused], repo: &str) -> Option<String> {
         parts.push(format!(
             "the sandbox closes the home and refused {}: to open {} read-only, add {} to \
              stack.caches in owlshift.toml and to allow_caches under [repositories.{}] in the \
-             personal file (`owlshift gate` offers to), and keep the tool from writing there or \
-             move its writable folder into $TMPDIR",
+             personal file (`owlshift gate` offers to), and keep the tool from writing there, \
+             give it a cache in stack.run_caches or move its writable folder into $TMPDIR",
             shown(&closed),
             if closed.len() == 1 { "it" } else { "them" },
             quoted.join(", "),
@@ -348,7 +351,8 @@ pub fn reason_note(refused: &[Refused], repo: &str) -> Option<String> {
     if !open.is_empty() {
         parts.push(format!(
             "{} {} open already, read-only, and the tool wrote there: keep it from writing \
-             there, fill it outside the sandbox or move its writable folder into $TMPDIR",
+             there, fill it outside the sandbox, give the tool a cache in stack.run_caches or \
+             move its writable folder into $TMPDIR",
             shown(&open),
             if open.len() == 1 { "is" } else { "are" }
         ));
@@ -755,7 +759,8 @@ always_human = []
             "  in /src/web/owlshift.toml, under [stack]:\n    caches = [\".npm\", \".cache/demo\"]\n",
             "  in /conf/config.toml:\n    [repositories.\"github.com/acme/web\"]\n    allow_caches",
             "$TMPDIR",
-            "npm: use the setup `owlshift init` writes",
+            "npm: give it a cache its runs write, `npm_config_cache = \"npm\"`",
+            "in `stack.run_caches`",
             "`sudo` changes nothing",
         ] {
             assert!(note.contains(said), "{said:?} not in:\n{note}");

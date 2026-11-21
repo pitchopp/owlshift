@@ -128,11 +128,7 @@ impl ProjectDirs {
     pub fn new(data_dir: &Path, repo: &Repo) -> Self {
         Self {
             data: data_dir.to_owned(),
-            root: data_dir
-                .join("projects")
-                .join("github.com")
-                .join(component(repo.owner()))
-                .join(component(repo.name())),
+            root: repo_folder(&data_dir.join("projects"), repo),
             lock_wait: PROJECT_LOCK_WAIT,
         }
     }
@@ -775,6 +771,16 @@ impl TicketHolder {
             since: field("since")?.parse().ok()?,
         })
     }
+}
+
+/// The folder of `repo`, a GitHub repository, under `base`:
+/// `<base>/github.com/<owner>/<name>`, each name made a [`component`]. The
+/// layout of a project's data folder ([`ProjectDirs::new`]) and of its run
+/// cache tree ([`crate::run_caches::tree`], OWL-617).
+pub(crate) fn repo_folder(base: &Path, repo: &Repo) -> PathBuf {
+    base.join("github.com")
+        .join(component(repo.owner()))
+        .join(component(repo.name()))
 }
 
 /// A path component every platform takes as is, and the same whatever the
