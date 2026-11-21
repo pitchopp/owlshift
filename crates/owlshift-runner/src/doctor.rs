@@ -294,6 +294,7 @@ pub fn run(system: &dyn System, config: &Effective, own: &BuildIdentity) -> Repo
     }
     checks.push(project_config_check(system, &config.project, home));
     checks.extend(caches_check(system, config, home));
+    checks.extend(run_caches_check(system, config, home));
     checks.extend(served_check(system, config));
     checks.push(file_check("personal config", &config.personal, home));
     checks.push(tracker_check(config));
@@ -1313,6 +1314,72 @@ fn caches_check(system: &dyn System, config: &Effective, home: Option<&Path>) ->
             &refused,
             &personal,
         ))],
+    ))
+}
+
+/// The caches the project's runs write (OWL-617): the tree's path, what it
+/// holds and that deleting it empties it. A line when the loaded project
+/// file declares run caches or the tree is there; none when the
+/// repository is unknown. A failure where no run could start: no cache
+/// directory, or a tree on a path holding a space.
+fn run_caches_check(system: &dyn System, config: &Effective, home: Option<&Path>) -> Option<Check> {
+    const SUBJECT: &str = "run caches";
+    let FileState::Loaded { path, config, .. } = &config.project else {
+        return None;
+    };
+    let declared = !config.stack.run_caches.is_empty();
+    let repo = system.origin_repo(path.parent().unwrap_or(path)).ok()?;
+    let why = "No run and no gate starts while the caches `stack.run_caches` declares cannot be \
+               made: the setup, the agents and the gate write them.";
+    let fix = || {
+        vec![Step::act(
+            "Set OWLSHIFT_CACHE_DIR to an absolute path without a space",
+        )]
+    };
+    let Some(cache_dir) = system.run_cache_dir() else {
+        return declared.then(|| {
+            Check::fail(
+                Section::Project,
+                SUBJECT,
+                "the project declares `stack.run_caches`, and this system has no cache directory",
+                why,
+                fix(),
+            )
+        });
+    };
+    let tree = crate::run_caches::tree(&cache_dir, &repo);
+    let shown_tree = shown(&tree, home);
+    if declared && let Err(error) = crate::run_caches::check_tree(&tree) {
+        return Some(Check::fail(Section::Project, SUBJECT, error, why, fix()));
+    }
+    if !tree.is_dir() {
+        return declared.then(|| {
+            Check::info(
+                Section::Project,
+                SUBJECT,
+                format!("{shown_tree}, not made yet: the next run makes it"),
+            )
+        });
+    }
+    let size = crate::run_caches::size(&tree, crate::run_caches::SIZE_WALK_LIMIT);
+    let held = format!(
+        "{}{}",
+        if size.complete { "" } else { "at least " },
+        crate::run_caches::shown_size(size.bytes)
+    );
+    Some(Check::info(
+        Section::Project,
+        SUBJECT,
+        if declared {
+            format!(
+                "{shown_tree} holds {held}; deleting it empties it, the next run makes it again"
+            )
+        } else {
+            format!(
+                "{shown_tree} holds {held}, and {PROJECT_FILE} declares no run cache: delete it to \
+                 free the space"
+            )
+        },
     ))
 }
 
@@ -4116,8 +4183,18 @@ mod tests {
     fn a_cache_the_personal_file_does_not_allow_is_named_with_its_lines() {
         let system = logged_in(with_harnesses(with_git(FakeSystem::default())));
         let detected = owlshift_core::stack::detect(&owlshift_core::stack::RootFiles {
-            names: vec!["package-lock.json".into(), "package.json".into()],
-            files: vec![("package.json".into(), "{}".into())],
+            names: vec![
+                "yarn.lock".into(),
+                "package.json".into(),
+                ".yarnrc.yml".into(),
+            ],
+            files: vec![
+                (
+                    "package.json".into(),
+                    r#"{"packageManager":"yarn@4.5.0"}"#.into(),
+                ),
+                (".yarnrc.yml".into(), "nodeLinker: node-modules\n".into()),
+            ],
         });
         let text = crate::init::project_file(&crate::init::InitOptions {
             tracker: TrackerKind::Markdown,
@@ -4134,27 +4211,27 @@ mod tests {
         let refused = Effective {
             project: FileState::Invalid {
                 path: path.clone(),
-                error: "stack.caches: \".npm\" may not be read".into(),
+                error: "stack.caches: \".yarn/berry\" may not be read".into(),
             },
             personal: FileState::Absent(personal.clone()),
         };
         let report = run(&system, &refused);
         let found = line(&report, "caches");
         assert_eq!(found.status, Status::Fail);
-        assert!(found.detail.contains("\".npm\""), "{found:?}");
+        assert!(found.detail.contains("\".yarn/berry\""), "{found:?}");
         assert!(found.detail.contains("github.com/pitchopp/owlshift"));
         let [Step::Do(fix)] = &found.fix[..] else {
             panic!("{found:?}");
         };
         assert!(fix.contains(
-            "[repositories.\"github.com/pitchopp/owlshift\"]\nallow_caches = [\".npm\"]\n"
+            "[repositories.\"github.com/pitchopp/owlshift\"]\nallow_caches = [\".yarn/berry\"]\n"
         ));
         let allowed = Effective {
             personal: FileState::Loaded {
                 path: personal,
                 config: PersonalConfig::parse(&crate::init::allow_caches_lines(
                     None,
-                    &[".npm".to_owned()],
+                    &[".yarn/berry".to_owned()],
                 ))
                 .unwrap(),
                 entries: Vec::new(),
@@ -4162,6 +4239,70 @@ mod tests {
             ..refused
         };
         assert!(caches_check(&system, &allowed, None).is_none());
+    }
+
+    /// OWL-617: the run caches' line gives the tree's path and size, says
+    /// it is not made yet, or that nothing declares it any more; it fails
+    /// where no run could make it; no line when neither the file nor the
+    /// disk has one.
+    #[test]
+    fn the_run_caches_line_gives_the_trees_path_and_size() {
+        let dir = tempfile::tempdir().unwrap();
+        let loaded = |stack: &str| {
+            let path = dir.path().join("owlshift.toml");
+            std::fs::write(
+                &path,
+                format!(
+                    "requires = \">=0.0\"\n[tracker]\nkind = \"markdown\"\nadmit = {{ label = \
+                     \"x\" }}\nstates = {{ ready = \"Todo\", working = \"Doing\", needs_input = \
+                     \"Asked\", review = \"Review\" }}\n[stack]\ngate = [\"make\"]\n{stack}\n\
+                     [pipeline]\ndefault = \"trivial\"\nplan_approval = \"never\"\n[models]\n\
+                     [policy]\nalways_human = []\n"
+                ),
+            )
+            .unwrap();
+            Effective {
+                project: FileState::load(path, owlshift_contracts::config::ProjectConfig::parse),
+                personal: FileState::NotApplicable("no configuration directory".into()),
+            }
+        };
+        let declared = loaded("run_caches = { CARGO_HOME = \"cargo\" }");
+        let bare = loaded("");
+        let caches = dir.path().join("caches");
+        let system = FakeSystem::default().run_cache_dir_is(&caches);
+        let tree = caches.join("github.com").join("pitchopp").join("owlshift");
+        let detail = |config: &Effective| run_caches_check(&system, config, None).map(|c| c.detail);
+
+        assert_eq!(detail(&bare), None);
+        assert!(
+            detail(&declared)
+                .unwrap()
+                .ends_with("not made yet: the next run makes it")
+        );
+        std::fs::create_dir_all(tree.join("cargo")).unwrap();
+        std::fs::write(tree.join("cargo/x"), "12345").unwrap();
+        let held = detail(&declared).unwrap();
+        assert!(
+            held.starts_with(&tree.display().to_string())
+                && held.ends_with("holds 5 B; deleting it empties it, the next run makes it again"),
+            "{held}"
+        );
+        assert!(
+            detail(&bare)
+                .unwrap()
+                .contains("declares no run cache: delete it")
+        );
+        for system in [
+            FakeSystem::default(),
+            FakeSystem::default().run_cache_dir_is(&dir.path().join("with space")),
+        ] {
+            let found = run_caches_check(&system, &declared, None).unwrap();
+            assert_eq!(found.status, Status::Fail, "{found:?}");
+            assert!(found.detail.contains("cache directory") || found.detail.contains("space"));
+            assert!(
+                matches!(&found.fix[..], [Step::Do(fix)] if fix.contains("OWLSHIFT_CACHE_DIR"))
+            );
+        }
     }
 
     /// The next command follows the project file: `owlshift do` with one,

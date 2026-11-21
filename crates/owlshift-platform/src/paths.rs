@@ -56,6 +56,20 @@ pub fn data_dir_and_source() -> Option<(PathBuf, DataDirSource)> {
     )
 }
 
+/// Owlshift's cache directory, which holds the caches a project's runs may
+/// write, one tree per project (OWL-617): `owlshift` in the user's cache
+/// directory, `~/Library/Caches` on macOS, `$XDG_CACHE_HOME` or `~/.cache`
+/// on Linux, `%LOCALAPPDATA%` on Windows.
+///
+/// `OWLSHIFT_CACHE_DIR`, when set to a non-empty absolute path, is used as is
+/// instead, by the same rule as `OWLSHIFT_DATA_DIR`: the way out for a
+/// machine whose cache directory's path holds a space, which the runner
+/// refuses for the tree. `None` when there is no override and the platform
+/// reports no cache directory. Reads the environment only.
+pub fn cache_dir() -> Option<PathBuf> {
+    resolve_cache(std::env::var_os("OWLSHIFT_CACHE_DIR"), dirs::cache_dir())
+}
+
 /// The user's home directory, `None` when the platform reports none.
 pub fn home_dir() -> Option<PathBuf> {
     dirs::home_dir()
@@ -96,6 +110,12 @@ fn resolve_data(
         Some(dir) => Some((dir, DataDirSource::Override)),
         None => data_dir.map(|dir| (dir.join("owlshift"), DataDirSource::Platform)),
     }
+}
+
+/// `override_dir`: `OWLSHIFT_CACHE_DIR`; `cache_dir`: the platform's cache
+/// directory, as `dirs::cache_dir()` reports it.
+fn resolve_cache(override_dir: Option<OsString>, cache_dir: Option<PathBuf>) -> Option<PathBuf> {
+    absolute(override_dir).or_else(|| cache_dir.map(|dir| dir.join("owlshift")))
 }
 
 /// An override that counts: set, non-empty and absolute.
@@ -201,5 +221,27 @@ mod tests {
             );
         }
         assert_eq!(resolve_data(None, None), None);
+    }
+
+    /// OWL-617: the cache directory follows the same override rule.
+    #[test]
+    fn the_cache_directory_follows_the_same_override_rule() {
+        let (over, caches) = if cfg!(windows) {
+            (r"C:\owlshift-cache", r"C:\Users\test\AppData\Local")
+        } else {
+            ("/tmp/owlshift-cache", "/home/test/.cache")
+        };
+        let caches = PathBuf::from(caches);
+        assert_eq!(
+            resolve_cache(Some(over.into()), Some(caches.clone())),
+            Some(PathBuf::from(over))
+        );
+        for ignored in [None, Some(OsString::new()), Some("relative".into())] {
+            assert_eq!(
+                resolve_cache(ignored, Some(caches.clone())),
+                Some(caches.join("owlshift"))
+            );
+        }
+        assert_eq!(resolve_cache(None, None), None);
     }
 }

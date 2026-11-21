@@ -1,7 +1,7 @@
 //! Stack detection for `owlshift init` (P9, OWL-539): the gate, the setup it
-//! needs and the caches of the home that setup reads confined (OWL-593), read
-//! from the names and contents of the repository's root files; pnpm's
-//! setup through an overlay store since OWL-598.
+//! needs, the caches of the home that setup reads confined (OWL-593) and the
+//! caches of Owlshift's own its runs may write (`stack.run_caches`, OWL-617),
+//! read from the names and contents of the repository's root files.
 //!
 //! A pure function: the caller reads the root and passes in the file names and
 //! the contents of the four manifests it recognises (`Cargo.toml`,
@@ -53,12 +53,25 @@ pub struct Found {
     /// The folders of the home the setup reads, as `stack.caches` names
     /// them: each line's `command` is the folder (OWL-593).
     pub caches: Vec<Line>,
+    /// The caches of Owlshift's own the runs may write, as
+    /// `stack.run_caches` declares them (OWL-617).
+    pub run_caches: Vec<RunCache>,
     /// What the person should know about the lines above.
     pub notes: Vec<String>,
     /// What the person should know about the gate lines alone, written only
     /// where the detected gate is used, never above a gate given by hand
     /// (OWL-595).
     pub gate_notes: Vec<String>,
+}
+
+/// One cache a run may write, with what it was read from (OWL-617).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RunCache {
+    /// The variable the package manager reads for its cache.
+    pub variable: String,
+    /// The name of the folder of Owlshift's own the runner sets it to.
+    pub folder: String,
+    pub read_from: String,
 }
 
 /// The result of [`detect`].
@@ -85,6 +98,11 @@ impl Detection {
     /// The detected cache folders, in order; a line's `command` is the folder.
     pub fn caches(&self) -> impl Iterator<Item = &Line> {
         self.found.iter().flat_map(|f| f.caches.iter())
+    }
+
+    /// The detected caches a run may write, in order.
+    pub fn run_caches(&self) -> impl Iterator<Item = &RunCache> {
+        self.found.iter().flat_map(|f| f.run_caches.iter())
     }
 }
 
@@ -129,6 +147,14 @@ fn line(command: impl Into<String>, read_from: impl Into<String>) -> Line {
     }
 }
 
+fn run_cache(variable: &str, folder: &str, read_from: impl Into<String>) -> RunCache {
+    RunCache {
+        variable: variable.to_owned(),
+        folder: folder.to_owned(),
+        read_from: read_from.into(),
+    }
+}
+
 fn cargo(root: &RootFiles, text: &str) -> Result<Option<Found>, String> {
     let table: toml::Table = text
         .parse()
@@ -154,6 +180,9 @@ fn cargo(root: &RootFiles, text: &str) -> Result<Option<Found>, String> {
         ],
         setup: vec![],
         caches: vec![],
+        // Checked live (OWL-617): cargo with `CARGO_HOME` moved, rustup's
+        // proxies and the tool chain left where they are.
+        run_caches: vec![run_cache("CARGO_HOME", "cargo", from)],
         notes: vec![],
         gate_notes: vec![],
     }))
@@ -169,15 +198,15 @@ struct NodeManager {
     /// confined run: its cache, which it cannot do without (OWL-593), with
     /// what it was read from.
     cache: Option<(&'static str, String)>,
+    /// The cache of Owlshift's own the install writes instead (OWL-617): the
+    /// variable the manager reads for it and the folder's name.
+    run_cache: Option<(&'static str, &'static str)>,
     /// What the person should know about the cache, when none is declared.
     note: Option<String>,
 }
 
 /// yarn 2 or later's global cache, `~/.yarn/berry` (OWL-593).
 const YARN_BERRY: &str = ".yarn/berry";
-
-/// pnpm's folder in the home on macOS, which holds its store (OWL-598).
-const PNPM_HOME: &str = "Library/pnpm";
 
 /// The `packageManager` of `package.json` when it names `name`, with its
 /// major version: `("pnpm@10.33.2", 10)`. `None` for another manager, or a
@@ -223,48 +252,23 @@ fn yarn_global_cache(root: &RootFiles, package: &serde_json::Value) -> Option<St
     (major >= 4).then(|| format!("`{manager}`, the `packageManager` of package.json"))
 }
 
-/// npm's install under the sandbox (OWL-593): the home is closed, so npm
-/// reads its cache, `~/.npm`, as a cache the operator allows, read-only.
-/// `--prefer-offline` takes what the cache holds without asking the
-/// registry, and `--logs-dir` writes npm's log in the run's temporary
-/// folder, its default being inside the read-only cache. A package missing
-/// from the cache fails the install: npm cannot write it there.
-pub const NPM_SETUP: &str =
-    "npm ci --prefer-offline --cache \"$HOME/.npm\" --logs-dir \"$TMPDIR/npm-logs\"";
-
-/// pnpm 10's install under the sandbox (OWL-598). pnpm cannot install from
-/// its store read-only, since it registers each project in the store's
-/// `projects` folder, and a closed home makes it put a store of its own in
-/// the worktree, fetching every package. So the setup builds an overlay
-/// store in `node_modules/.pnpm-overlay`, ignored wherever `node_modules`
-/// is: its `files` and `index` link to the store in `~/Library/pnpm`,
-/// opened read-only as a cache, and its `projects` is its own. Its path
-/// does not change between runs, since pnpm records it in `node_modules`
-/// and, finding another, wants to remove `node_modules`. `--offline`
-/// installs from the store alone: a package missing from it fails the
-/// install with `ERR_PNPM_NO_OFFLINE_TARBALL`. Without pnpm 10's store at
-/// that path, on Linux or with pnpm 9, it runs pnpm's plain install.
-pub const PNPM_SETUP: &str = "if [ -d \"$HOME/Library/pnpm/store/v10\" ]; then \
-     mkdir -p node_modules/.pnpm-overlay/v10/projects && \
-     ln -sfn \"$HOME/Library/pnpm/store/v10/files\" node_modules/.pnpm-overlay/v10/files && \
-     ln -sfn \"$HOME/Library/pnpm/store/v10/index\" node_modules/.pnpm-overlay/v10/index && \
-     pnpm install --offline --frozen-lockfile --store-dir node_modules/.pnpm-overlay; \
-     else pnpm install --frozen-lockfile; fi";
-
 /// Which manager the lock file names, its install, and the cache it needs
 /// confined. Checked live (OWL-593): yarn 1 skips a cache it cannot write
 /// and bun falls back to one of its own, both fetching from the registry,
-/// so they need none; npm, and yarn 4 on its global cache, fail with
-/// `EPERM` unless they read theirs ([`yarn_global_cache`]); pnpm 10 needs
-/// an overlay over its store ([`PNPM_SETUP`], OWL-598), and pnpm 12 failed
-/// confined whatever its store, so a `packageManager` naming a pnpm other
-/// than 10 keeps the plain install.
+/// so they need none; yarn 4 on its global cache fails with `EPERM` unless
+/// it reads it ([`yarn_global_cache`]). npm and pnpm 10 install online into
+/// a cache of Owlshift's own their runs write, `npm_config_cache` and
+/// `npm_config_store_dir` moving it (OWL-617, checked live on macOS and
+/// Linux); pnpm 12 failed confined whatever its store (OWL-598), so a
+/// `packageManager` naming a pnpm other than 10 keeps the plain install and
+/// gets no run cache.
 fn node_manager(root: &RootFiles, package: &serde_json::Value) -> Option<NodeManager> {
     let plain = |name, lock, install: String| NodeManager {
         name,
         lock,
         install,
         cache: None,
+        run_cache: None,
         note: None,
     };
     if root.has("pnpm-lock.yaml") {
@@ -276,23 +280,14 @@ fn node_manager(root: &RootFiles, package: &serde_json::Value) -> Option<NodeMan
         Some(match package_manager(package, "pnpm") {
             Some((manager, major)) if major != 10 => NodeManager {
                 note: Some(format!(
-                    "`{manager}`, the `packageManager` of package.json, is not pnpm 10: the \
-                     setup is pnpm's plain install and no store was declared, only pnpm 10 \
-                     having been found to install from a read-only store; `owlshift gate` \
-                     checks it"
+                    "`{manager}`, the `packageManager` of package.json, is not pnpm 10: no run \
+                     cache was declared for its store, only pnpm 10 having been checked to \
+                     install into one; `owlshift gate` checks the setup"
                 )),
                 ..pnpm
             },
             _ => NodeManager {
-                install: PNPM_SETUP.into(),
-                cache: Some((PNPM_HOME, "pnpm-lock.yaml, the lock file of pnpm".into())),
-                note: Some(
-                    "the setup installs through an overlay in `node_modules/.pnpm-overlay` over \
-                     pnpm 10's store on macOS, `~/Library/pnpm/store/v10`; without that folder \
-                     (pnpm 9, or Linux, whose store is `~/.local/share/pnpm`, not checked) it \
-                     runs `pnpm install --frozen-lockfile`, which fails confined on macOS"
-                        .to_owned(),
-                ),
+                run_cache: Some(("npm_config_store_dir", "pnpm-store")),
                 ..pnpm
             },
         })
@@ -332,8 +327,8 @@ fn node_manager(root: &RootFiles, package: &serde_json::Value) -> Option<NodeMan
         ))
     } else if root.has("package-lock.json") {
         Some(NodeManager {
-            cache: Some((".npm", "package-lock.json, the lock file of npm".into())),
-            ..plain("npm", "package-lock.json", NPM_SETUP.into())
+            run_cache: Some(("npm_config_cache", "npm")),
+            ..plain("npm", "package-lock.json", "npm ci".into())
         })
     } else {
         None
@@ -350,6 +345,7 @@ fn package_json(root: &RootFiles, text: &str) -> Result<Option<Found>, String> {
         gate: vec![],
         setup: vec![],
         caches: vec![],
+        run_caches: vec![],
         notes: vec![],
         gate_notes: vec![],
     };
@@ -362,6 +358,13 @@ fn package_json(root: &RootFiles, text: &str) -> Result<Option<Found>, String> {
                 format!("{lock}, the lock file of {name}"),
             ));
             found.notes.extend(manager.note);
+            if let Some((variable, folder)) = manager.run_cache {
+                found.run_caches.push(run_cache(
+                    variable,
+                    folder,
+                    format!("{lock}, the lock file of {name}"),
+                ));
+            }
             if let Some((folder, from)) = manager.cache {
                 found.caches.push(line(folder, from));
                 found.notes.push(format!(
@@ -471,6 +474,7 @@ fn pyproject(root: &RootFiles, text: &str) -> Result<Option<Found>, String> {
         gate: vec![],
         setup: vec![],
         caches: vec![],
+        run_caches: vec![],
         notes: vec![],
         gate_notes: vec![],
     };
@@ -478,6 +482,13 @@ fn pyproject(root: &RootFiles, text: &str) -> Result<Option<Found>, String> {
     // bare tool needs a setup, as does a manager not checked (poetry, pdm).
     let prefix = if root.has("uv.lock") {
         found.source = "pyproject.toml (uv.lock)".to_string();
+        // Checked live (OWL-617): confined, uv needs both on macOS, where
+        // it fails reading the closed `~/.local/share/uv/python` otherwise.
+        let from = "uv.lock, the lock file of uv";
+        found.run_caches.push(run_cache("UV_CACHE_DIR", "uv", from));
+        found
+            .run_caches
+            .push(run_cache("UV_PYTHON_INSTALL_DIR", "uv-python", from));
         "uv run "
     } else {
         let manager = ["poetry", "pdm"]
@@ -544,6 +555,7 @@ fn makefile(text: &str) -> Option<Found> {
         gate,
         setup: vec![],
         caches: vec![],
+        run_caches: vec![],
         notes: vec![],
         gate_notes: vec![],
     })
@@ -573,6 +585,12 @@ mod tests {
         lines.map(|l| l.command.as_str()).collect()
     }
 
+    fn run_caches<'a>(caches: impl Iterator<Item = &'a RunCache>) -> Vec<(&'a str, &'a str)> {
+        caches
+            .map(|c| (c.variable.as_str(), c.folder.as_str()))
+            .collect()
+    }
+
     const CARGO: &str = "[package]\nname = \"x\"\n";
 
     #[test]
@@ -588,6 +606,9 @@ mod tests {
         );
         assert_eq!(with.found[0].source, "Cargo.toml");
         assert!(with.gate().all(|l| l.read_from == "Cargo.toml"));
+        // OWL-617: cargo's registry goes to a cache its runs write.
+        assert_eq!(run_caches(with.run_caches()), [("CARGO_HOME", "cargo")]);
+        assert_eq!(with.found[0].run_caches[0].read_from, "Cargo.toml");
         let without = detect(&root(&[], &[("Cargo.toml", "[workspace]\nmembers = []\n")]));
         assert_eq!(
             commands(without.gate()),
@@ -660,8 +681,14 @@ check::
     #[test]
     fn each_node_manager_gives_its_install_and_its_scripts() {
         let pkg = r#"{"scripts":{"test":"jest","lint":"eslint .","build":"tsc"}}"#;
-        let cases: [(&[&str], &str, &str, &[&str]); 6] = [
-            (&["pnpm-lock.yaml"], PNPM_SETUP, "pnpm", &[PNPM_HOME]),
+        type Case<'a> = (&'a [&'a str], &'a str, &'a str, &'a [(&'a str, &'a str)]);
+        let cases: [Case; 6] = [
+            (
+                &["pnpm-lock.yaml"],
+                "pnpm install --frozen-lockfile",
+                "pnpm",
+                &[("npm_config_store_dir", "pnpm-store")],
+            ),
             (
                 &["yarn.lock"],
                 "yarn install --frozen-lockfile",
@@ -676,12 +703,20 @@ check::
             ),
             (&["bun.lock"], "bun install --frozen-lockfile", "bun", &[]),
             (&["bun.lockb"], "bun install --frozen-lockfile", "bun", &[]),
-            (&["package-lock.json"], NPM_SETUP, "npm", &[".npm"]),
+            (
+                &["package-lock.json"],
+                "npm ci",
+                "npm",
+                &[("npm_config_cache", "npm")],
+            ),
         ];
-        for (names, setup, manager, caches) in cases {
+        for (names, setup, manager, written) in cases {
             let d = detect(&root(names, &[("package.json", pkg)]));
             assert_eq!(commands(d.setup()), [setup], "{names:?}");
-            assert_eq!(commands(d.caches()), caches, "{names:?}");
+            // OWL-617: npm and pnpm install online into a run cache, and
+            // read none of the home's.
+            assert_eq!(commands(d.caches()), Vec::<&str>::new(), "{names:?}");
+            assert_eq!(run_caches(d.run_caches()), written, "{names:?}");
             assert_eq!(
                 commands(d.gate()),
                 [
@@ -691,24 +726,18 @@ check::
                 ],
                 "{names:?}"
             );
-            // A manager reading a cache says what each machine must allow;
-            // yarn 2 or later, its cache unknown, says what to declare;
-            // pnpm also says where its overlay lies; the gate's own note is
-            // a guess (OWL-595).
+            // yarn 2 or later, its cache unknown, says what to declare; the
+            // gate's own note is a guess (OWL-595).
             let notes = &d.found[0].notes;
-            let noted = !caches.is_empty() || names.contains(&".yarnrc.yml");
-            let pnpm = usize::from(manager == "pnpm");
-            assert_eq!(notes.len(), usize::from(noted) + pnpm, "{notes:?}");
-            assert!(notes[pnpm..].iter().all(|n| n.contains("allow_caches")));
+            let noted = names.contains(&".yarnrc.yml");
+            assert_eq!(notes.len(), usize::from(noted), "{notes:?}");
+            assert!(notes.iter().all(|n| n.contains("allow_caches")));
             let gate_notes = &d.found[0].gate_notes;
             assert_eq!(gate_notes.len(), 1, "{gate_notes:?}");
             assert!(gate_notes[0].contains("a guess"), "{gate_notes:?}");
             assert!(d.found[0].source.starts_with("package.json ("));
-            assert!(
-                d.setup()
-                    .chain(d.caches())
-                    .all(|l| l.read_from.contains(manager))
-            );
+            assert!(d.setup().all(|l| l.read_from.contains(manager)));
+            assert!(d.run_caches().all(|c| c.read_from.contains(manager)));
         }
     }
 
@@ -748,11 +777,11 @@ check::
         }
     }
 
-    /// OWL-598: pnpm installs through the overlay over `~/Library/pnpm`,
-    /// unless `packageManager` names a pnpm other than 10, which keeps the
-    /// plain install, declares no store and says why.
+    /// OWL-617: pnpm's store goes to a run cache, unless `packageManager`
+    /// names a pnpm other than 10, which declares none and says why; the
+    /// install is pnpm's plain one either way.
     #[test]
-    fn pnpms_store_is_declared_unless_package_manager_names_another_major() {
+    fn pnpms_store_is_a_run_cache_unless_package_manager_names_another_major() {
         let cases: [(&str, bool); 6] = [
             ("", true),
             ("pnpm@10.33.2", true),
@@ -761,23 +790,25 @@ check::
             ("pnpm@9.15.0", false),
             ("pnpm@12.21.0+sha512.abc", false),
         ];
-        for (manager, overlay) in cases {
+        for (manager, ten) in cases {
             let pkg = format!(r#"{{"packageManager":"{manager}"}}"#);
             let d = detect(&root(&["pnpm-lock.yaml"], &[("package.json", &pkg)]));
             let notes = &d.found[0].notes;
-            if overlay {
-                assert_eq!(commands(d.setup()), [PNPM_SETUP], "{manager}");
-                assert_eq!(commands(d.caches()), [PNPM_HOME], "{manager}");
-                assert_eq!(notes.len(), 2, "{manager} {notes:?}");
-                assert!(notes[0].contains("`node_modules/.pnpm-overlay`"));
-                assert!(notes[0].contains("`~/.local/share/pnpm`, not checked"));
-            } else {
+            assert_eq!(
+                commands(d.setup()),
+                ["pnpm install --frozen-lockfile"],
+                "{manager}"
+            );
+            assert!(d.caches().next().is_none(), "{manager}");
+            if ten {
                 assert_eq!(
-                    commands(d.setup()),
-                    ["pnpm install --frozen-lockfile"],
+                    run_caches(d.run_caches()),
+                    [("npm_config_store_dir", "pnpm-store")],
                     "{manager}"
                 );
-                assert!(d.caches().next().is_none(), "{manager}");
+                assert!(notes.is_empty(), "{manager} {notes:?}");
+            } else {
+                assert!(d.run_caches().next().is_none(), "{manager}");
                 assert_eq!(notes.len(), 1, "{manager} {notes:?}");
                 assert!(notes[0].starts_with(&format!("`{manager}`, the `packageManager`")));
                 assert!(notes[0].contains("is not pnpm 10"));
@@ -844,7 +875,7 @@ check::
     #[test]
     fn a_package_json_without_scripts_gives_the_setup_only() {
         let d = detect(&root(&["package-lock.json"], &[("package.json", "{}")]));
-        assert_eq!(commands(d.setup()), [NPM_SETUP]);
+        assert_eq!(commands(d.setup()), ["npm ci"]);
         assert_eq!(commands(d.gate()), Vec::<&str>::new());
     }
 
@@ -877,6 +908,14 @@ check::
         assert_eq!(d.found[0].source, "pyproject.toml (uv.lock)");
         assert!(d.found[0].notes.is_empty());
         assert!(d.setup().next().is_none());
+        // OWL-617: uv's cache and the Python it installs go to run caches.
+        assert_eq!(
+            run_caches(d.run_caches()),
+            [
+                ("UV_CACHE_DIR", "uv"),
+                ("UV_PYTHON_INSTALL_DIR", "uv-python")
+            ]
+        );
     }
 
     #[test]

@@ -721,9 +721,9 @@ fn cache_advice(config: &Effective, folders: &[String], repo: Option<&Repo>) -> 
     Some(format!(
         "The setup reads {} read-only, and this machine opens a folder of your home only once \
          its personal configuration allows it: until then every run and gate refuses the \
-         project. {}\nThen install the project once in this checkout yourself (`npm ci`, `yarn \
-         install`, `pnpm install`), so the folder holds its packages: the confined setup cannot add a missing \
-         one, and npm then says `EPERM` and \"root-owned files\", which `sudo` does not fix.",
+         project. {}\nThen install the project once in this checkout yourself (`yarn install`), \
+         so the folder holds its packages: the confined setup cannot add a missing one to a \
+         folder of your home.",
         shown.join(", "),
         allow_caches_advice(repo, &missing, &personal)
     ))
@@ -959,8 +959,19 @@ fn report_detection(options: &InitOptions) {
     let detected = &options.detected;
     for found in &detected.found {
         let (gate, setup) = (found.gate.len(), found.setup.len());
+        // The caches its runs write (OWL-617), by variable.
+        let written: Vec<&str> = found
+            .run_caches
+            .iter()
+            .map(|cache| cache.variable.as_str())
+            .collect();
+        let written = if written.is_empty() {
+            String::new()
+        } else {
+            format!(", run caches {}", written.join(", "))
+        };
         println!(
-            "Detected {}: {gate} gate command(s), {setup} setup command(s).",
+            "Detected {}: {gate} gate command(s), {setup} setup command(s){written}.",
             found.source
         );
         // The gate's own notes say nothing true about a gate given by hand.

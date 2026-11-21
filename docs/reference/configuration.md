@@ -270,6 +270,14 @@ Folders of your home, such as a package store, that the setup, the agent and the
 # caches = ["Library/pnpm"]
 ```
 
+#### `stack.run_caches`
+
+Caches of Owlshift's own that the setup, the agent and the gate write, so an install fetches what is missing and keeps it for the next runs: the variable a package manager reads for its cache, and a folder's name. Each machine makes the folder in its cache directory, one tree per project, and deleting the tree empties it. Credential, `GIT_` and loader variables are refused. Default: none.
+
+```toml
+# run_caches = { CARGO_HOME = "cargo" }
+```
+
 #### `stack.rules`
 
 The files agents receive as the project's rules, taken whole from the default branch, at most 32 and 64 KiB together, each required to exist. Left out, the root AGENTS.md when there is one; [] sends no rule.

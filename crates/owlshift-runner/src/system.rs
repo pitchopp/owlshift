@@ -46,6 +46,11 @@ pub trait System {
     fn data_dir(&self) -> Option<(PathBuf, DataDirSource)> {
         owlshift_platform::paths::data_dir_and_source()
     }
+    /// Owlshift's cache directory, which holds the run caches (OWL-617),
+    /// `None` when the system has none. Only the path.
+    fn run_cache_dir(&self) -> Option<PathBuf> {
+        owlshift_platform::paths::cache_dir()
+    }
     /// The file a Codex agent run copies its login from (OWL-299), as
     /// `executor::codex::user_login` resolves it: `auth.json` in
     /// `CODEX_HOME`, or in `~/.codex`.
@@ -465,6 +470,9 @@ pub mod fake {
         running_builds: Option<RunningBuilds>,
         /// Files that are not there; every other one is.
         missing_files: Vec<PathBuf>,
+        /// Owlshift's cache directory (OWL-617); `None`: the system has
+        /// none, so no test walks the real one.
+        run_cache_dir: Option<PathBuf>,
         /// What reading a text file gives; a file not here has no text,
         /// whatever [`Self::missing_files`] says, so no test reads the real
         /// `/etc/codex`.
@@ -521,6 +529,12 @@ pub mod fake {
         /// The data directory is so, or the system has none.
         pub(crate) fn data_dir_is(mut self, dir: Option<(PathBuf, DataDirSource)>) -> Self {
             self.data_dir = Some(dir);
+            self
+        }
+
+        /// Owlshift's cache directory is `dir` (OWL-617).
+        pub(crate) fn run_cache_dir_is(mut self, dir: &Path) -> Self {
+            self.run_cache_dir = Some(dir.to_owned());
             self
         }
 
@@ -723,6 +737,10 @@ pub mod fake {
                     DataDirSource::Platform,
                 ))
             })
+        }
+
+        fn run_cache_dir(&self) -> Option<PathBuf> {
+            self.run_cache_dir.clone()
         }
 
         fn sandbox(&self) -> Result<(), SandboxError> {

@@ -1404,13 +1404,26 @@ fn init_detects_the_stack_and_never_runs_it() {
     let config = project_config(repo.path());
     assert_eq!(config.stack.gate.len(), 4, "{:?}", config.stack.gate);
     assert_eq!(config.stack.gate[3], "pnpm run test");
-    assert_eq!(config.stack.setup, [owlshift_core::stack::PNPM_SETUP]);
-    assert_eq!(config.stack.caches, ["Library/pnpm"]);
-    assert!(out.contains("allow_caches = [\"Library/pnpm\"]"), "{out}");
-    assert!(out.contains("`pnpm install`"), "{out}");
-    assert!(out.contains("Detected Cargo.toml"), "{out}");
+    // OWL-617: pnpm's plain install into a run cache, no folder of the home
+    // to allow.
+    assert_eq!(config.stack.setup, ["pnpm install --frozen-lockfile"]);
+    assert!(config.stack.caches.is_empty());
+    assert_eq!(
+        config.stack.run_cache_entries(),
+        [
+            ("CARGO_HOME", "cargo"),
+            ("npm_config_store_dir", "pnpm-store")
+        ]
+    );
+    assert!(!out.contains("allow_caches"), "{out}");
     assert!(
-        out.contains("Detected package.json (pnpm-lock.yaml)"),
+        out.contains(
+            "Detected Cargo.toml: 3 gate command(s), 0 setup command(s), run caches CARGO_HOME."
+        ),
+        "{out}"
+    );
+    assert!(
+        out.contains("Detected package.json (pnpm-lock.yaml): 1 gate command(s), 1 setup command(s), run caches npm_config_store_dir."),
         "{out}"
     );
     assert!(!out.contains("gate is empty"), "{out}");
@@ -1477,10 +1490,15 @@ fn a_gate_given_with_init_wins_over_the_detected_one() {
     git_init(repo.path());
     fs::write(
         repo.path().join("package.json"),
-        r#"{"scripts":{"test":"jest"}}"#,
+        r#"{"scripts":{"test":"jest"},"packageManager":"yarn@4.5.0"}"#,
     )
     .unwrap();
-    fs::write(repo.path().join("package-lock.json"), "").unwrap();
+    fs::write(repo.path().join("yarn.lock"), "").unwrap();
+    fs::write(
+        repo.path().join(".yarnrc.yml"),
+        "nodeLinker: node-modules\n",
+    )
+    .unwrap();
     git(
         repo.path(),
         &["remote", "add", "origin", "https://github.com/acme/web.git"],
@@ -1488,20 +1506,21 @@ fn a_gate_given_with_init_wins_over_the_detected_one() {
     let out = init_markdown(repo.path(), config_dir.path(), &["--gate", "make ci"]);
     let config = project_config(repo.path());
     assert_eq!(config.stack.gate, ["make ci"]);
-    // OWL-593: npm's install reads its cache, which this machine must allow.
-    assert_eq!(
-        config.stack.setup,
-        ["npm ci --prefer-offline --cache \"$HOME/.npm\" --logs-dir \"$TMPDIR/npm-logs\""]
-    );
-    assert_eq!(config.stack.caches, [".npm"]);
+    // OWL-593: yarn 4's install reads its global cache, which this machine
+    // must allow.
+    assert_eq!(config.stack.setup, ["yarn install --immutable"]);
+    assert_eq!(config.stack.caches, [".yarn/berry"]);
     assert!(out.contains("--gate wins"), "{out}");
     // OWL-595: the notes about the detected gate are not written above a
     // gate given by hand.
     let written = fs::read_to_string(repo.path().join("owlshift.toml")).unwrap();
     assert!(!written.contains("a guess"), "{written}");
     assert!(!out.contains("a guess"), "{out}");
-    let allow = "[repositories.\"github.com/acme/web\"]\nallow_caches = [\".npm\"]\n";
-    assert!(out.contains("The setup reads `~/.npm` read-only"), "{out}");
+    let allow = "[repositories.\"github.com/acme/web\"]\nallow_caches = [\".yarn/berry\"]\n";
+    assert!(
+        out.contains("The setup reads `~/.yarn/berry` read-only"),
+        "{out}"
+    );
     assert!(out.contains(allow), "{out}");
     // Run again, the file is refused until the folder is allowed: it says
     // how once more.

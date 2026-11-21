@@ -510,6 +510,79 @@ pub fn check_home_folders(paths: &[&str]) -> Result<(), String> {
     Ok(())
 }
 
+/// The most caches a project may declare for its runs to write
+/// (`stack.run_caches`, OWL-617).
+pub const MAX_RUN_CACHES: usize = 16;
+
+/// The longest folder name of a run cache, in bytes.
+pub const MAX_RUN_CACHE_FOLDER: usize = 64;
+
+/// Checks the caches a project declares for its runs to write
+/// (`stack.run_caches`, OWL-617), each a variable a package manager reads and
+/// the name of the folder of Owlshift's own the runner sets it to: at most
+/// [`MAX_RUN_CACHES`]; each name a variable name (`[A-Za-z_][A-Za-z0-9_]*`),
+/// none that [`check_names`] refuses for `stack.gate_env` (a credential, a
+/// `GIT_` name or an override, a loader variable, start-up code, a harness's
+/// own), none Owlshift passes to an agent itself (the inherited, locale and
+/// proxy names: `PATH`, `HOME`, `TMPDIR`…), and no two equal in any letter
+/// case; each folder one path part of ASCII letters, digits, `.`, `_` and
+/// `-`, not starting with `.`, at most [`MAX_RUN_CACHE_FOLDER`] bytes, and no
+/// two equal in any letter case, as a case-insensitive volume compares them.
+/// Pure: the runner makes the folders.
+pub fn check_run_caches(entries: &[(&str, &str)]) -> Result<(), String> {
+    if entries.len() > MAX_RUN_CACHES {
+        return Err(format!(
+            "{} caches declared, over the {MAX_RUN_CACHES} a run may write",
+            entries.len()
+        ));
+    }
+    for (i, (name, folder)) in entries.iter().enumerate() {
+        let variable = name.chars().next().is_some_and(|first| {
+            (first.is_ascii_alphabetic() || first == '_')
+                && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+        });
+        if !variable {
+            return Err(format!(
+                "{name:?} is not a variable name: ASCII letters, digits and `_`, not starting \
+                 with a digit"
+            ));
+        }
+        check_names(&[name]).map_err(|error| error.to_string())?;
+        if is_inherited(name) {
+            return Err(format!(
+                "{name} cannot name a cache: Owlshift passes it to every agent itself"
+            ));
+        }
+        if entries[..i]
+            .iter()
+            .any(|(n, _)| n.eq_ignore_ascii_case(name))
+        {
+            return Err(format!("{name} is declared twice, in another letter case"));
+        }
+        let part = !folder.is_empty()
+            && !folder.starts_with('.')
+            && folder.len() <= MAX_RUN_CACHE_FOLDER
+            && folder
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'));
+        if !part {
+            return Err(format!(
+                "{name} = {folder:?}: a folder is one name of ASCII letters, digits, `.`, `_` \
+                 and `-`, not starting with `.`, at most {MAX_RUN_CACHE_FOLDER} bytes"
+            ));
+        }
+        if let Some((other, _)) = entries[..i]
+            .iter()
+            .find(|(_, f)| f.eq_ignore_ascii_case(folder))
+        {
+            return Err(format!(
+                "{other} and {name} name one folder, {folder:?}: each cache has its own"
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// How a folder of the home stands to the credential paths of
 /// [`HIDDEN_IN_HOME`] (OWL-597).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -982,5 +1055,68 @@ mod tests {
             check_home_folders(&[".config/git", ".cargo/registry"]),
             Ok(())
         );
+    }
+
+    /// OWL-617: the caches a run may write refuse what `stack.gate_env`
+    /// refuses, and also every name Owlshift passes itself, in any letter
+    /// case; folders are one name each, never two alike.
+    #[test]
+    fn run_caches_refuse_what_gate_env_refuses_and_what_owlshift_passes() {
+        let ok = [
+            ("CARGO_HOME", "cargo"),
+            ("npm_config_store_dir", "pnpm-store"),
+            ("UV_CACHE_DIR", "uv"),
+            ("UV_PYTHON_INSTALL_DIR", "uv-python"),
+        ];
+        assert_eq!(check_run_caches(&ok), Ok(()));
+        assert_eq!(check_run_caches(&[]), Ok(()));
+        for (name, says) in [
+            ("GITHUB_TOKEN", "credentials"),
+            ("Git_Dir", "Owlshift sets how git and gh authenticate"),
+            ("LD_PRELOAD", "dynamic loader"),
+            ("NODE_OPTIONS", "run code as it starts"),
+            ("ANTHROPIC_BASE_URL", "Claude Code"),
+            ("", "not a variable name"),
+            ("1CACHE", "not a variable name"),
+            ("A-B", "not a variable name"),
+            ("A=B", "not a variable name"),
+        ] {
+            let error = check_run_caches(&[(name, "c")]).unwrap_err();
+            assert!(error.contains(says), "{name:?}: {error}");
+        }
+        // Every name Owlshift passes, as written and in lower case; the
+        // Windows names with `(` are no variable name at all.
+        let passed = INHERITED
+            .iter()
+            .chain(LOCALE_CATEGORIES)
+            .chain(PROXY_VARIABLES);
+        for name in passed {
+            for written in [name.to_string(), name.to_ascii_lowercase()] {
+                let error = check_run_caches(&[(&written, "c")]).unwrap_err();
+                assert!(
+                    error.contains("passes it to every agent itself")
+                        || error.contains("not a variable name")
+                        || error.contains("Codex"),
+                    "{written}: {error}"
+                );
+            }
+        }
+        for (entries, says) in [
+            (&[("A", "a"), ("a", "b")][..], "declared twice"),
+            (&[("A", "cargo"), ("B", "Cargo")], "name one folder"),
+            (&[("A", ".cargo")], "not starting with `.`"),
+            (&[("A", "a/b")], "one name"),
+            (&[("A", "..")], "one name"),
+            (&[("A", "a b")], "one name"),
+            (&[("A", "")], "one name"),
+        ] {
+            let error = check_run_caches(entries).unwrap_err();
+            assert!(error.contains(says), "{entries:?}: {error}");
+        }
+        let long = "f".repeat(MAX_RUN_CACHE_FOLDER + 1);
+        assert!(check_run_caches(&[("A", &long)]).is_err());
+        let names: Vec<String> = (0..=MAX_RUN_CACHES).map(|i| format!("V{i}")).collect();
+        let many: Vec<(&str, &str)> = names.iter().map(|n| (n.as_str(), n.as_str())).collect();
+        assert!(check_run_caches(&many).unwrap_err().contains("over the"));
     }
 }

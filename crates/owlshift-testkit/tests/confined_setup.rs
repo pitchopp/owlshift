@@ -151,6 +151,13 @@ impl Drop for Bench {
 
 impl Bench {
     fn new(fixture: &'static Fixture) -> Self {
+        let bench = Self::unseeded(fixture);
+        bench.seed_cache(&fixtures().join(fixture.name).join("vendor"));
+        bench
+    }
+
+    /// The fixture seeded into its remote, its home's cache left empty.
+    fn unseeded(fixture: &'static Fixture) -> Self {
         let tmp = tempfile::Builder::new()
             .prefix("owlshift-fixture-")
             .tempdir()
@@ -164,7 +171,7 @@ impl Bench {
             ProjectConfig::parse(&fs::read_to_string(folder.join("repo/owlshift.toml")).unwrap())
                 .unwrap();
         assert_eq!(config.stack.caches, [fixture.cache]);
-        let bench = Self {
+        Self {
             tmp,
             env,
             remote,
@@ -172,9 +179,7 @@ impl Bench {
             config,
             fixture,
             locked: false,
-        };
-        bench.seed_cache(&folder.join("vendor"));
-        bench
+        }
     }
 
     fn root(&self) -> PathBuf {
@@ -540,6 +545,44 @@ fn a_node_project_passes_a_confined_gate() {
 #[test]
 fn a_python_project_passes_a_confined_gate() {
     passes_a_confined_gate(&PYTHON);
+}
+
+/// OWL-617's acceptance: a confined setup installs a package the person's
+/// cache lacks (the bench's home holds no store, and none is opened) from
+/// a registry served on the loopback, into a cache of the run's own
+/// (`stack.run_caches`, `npm_config_store_dir`); the setup of another
+/// worktree, a later run, installs it offline from that cache. The gate
+/// passes both times.
+#[test]
+fn a_setup_installs_a_missing_package_into_its_run_cache() {
+    if !runs(&NODE, true) {
+        return;
+    }
+    let bench = Bench::unseeded(&NODE);
+    let lock = fs::read_to_string(bench.remote.checkout.join("pnpm-lock.yaml")).unwrap();
+    let tarball = fs::read(
+        fixtures()
+            .join(NODE.name)
+            .join("vendor/owlshift-fixture-dep-1.0.0.tgz"),
+    )
+    .unwrap();
+    let registry = serve_registry(integrity(&lock), tarball);
+    let store = bench.root().join("run-caches").join("pnpm-store");
+    let agent = || {
+        AgentEnv::new(bench.env.agent_parent())
+            .unwrap()
+            .with_run_caches(vec![("npm_config_store_dir".to_owned(), store.clone())])
+    };
+    let online = [format!(
+        "pnpm install --frozen-lockfile --registry {registry}"
+    )];
+    let first = bench.gate(agent(), "T-1", &online);
+    assert!(first.passed(), "{first:?}");
+    assert!(store.join("v10").is_dir(), "the store is the run cache");
+    assert!(!bench.home.join(NODE.cache).exists());
+    let offline = ["pnpm install --frozen-lockfile --offline".to_owned()];
+    let second = bench.gate(agent(), "T-2", &offline);
+    assert!(second.passed(), "{second:?}");
 }
 
 /// The same recipes unconfined, the cache read-only by its modes: what a

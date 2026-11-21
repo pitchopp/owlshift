@@ -128,6 +128,20 @@ requires = \">={}.{}\"
     } else {
         commands_block("caches", &cache_lines, &quote)
     };
+    // The caches the detected managers write (OWL-617), a dotted key each
+    // under its source, or the example.
+    let mut run_caches = String::new();
+    for cache in options.detected.run_caches() {
+        run_caches.push_str(&format!(
+            "# read from {}\nrun_caches.{} = {}\n",
+            one_line(&cache.read_from),
+            cache.variable,
+            quote(&cache.folder)
+        ));
+    }
+    if run_caches.is_empty() {
+        run_caches.push_str("# run_caches = { CARGO_HOME = \"cargo\" }\n");
+    }
     let admission =
         crate::tracker::of(options.tracker).admission_lines(options.admitter.as_deref());
     text.push_str(&format!(
@@ -147,7 +161,13 @@ requires = \">={}.{}\"
 {setup}# Folders of your home, such as a package store, that the setup, the agent
 # and the gate read, never write; a machine opens only those its personal
 # `allow_caches` lists, never one holding credentials. Default: none.
-{caches}# The files agents receive as the project's rules, taken whole from the
+{caches}# Caches of Owlshift's own that the setup, the agent and the gate write, so
+# an install fetches what is missing and keeps it for the next runs: the
+# variable a package manager reads for its cache, and a folder's name. Each
+# machine makes the folder in its cache directory, one tree per project, and
+# deleting the tree empties it. Credential, `GIT_` and loader variables are
+# refused. Default: none.
+{run_caches}# The files agents receive as the project's rules, taken whole from the
 # default branch, at most 32 and 64 KiB together, each required to exist.
 # Left out, the root AGENTS.md when there is one; [] sends no rule.
 # rules = [\"AGENTS.md\", \".claude/rules/testing.md\"]
@@ -1504,6 +1524,7 @@ mod tests {
                 "\n# setup = [\"pnpm install --frozen-lockfile\"]\n# Folders of your home"
             )
         );
+        assert!(text.contains("\n# run_caches = { CARGO_HOME = \"cargo\" }\n"));
         assert!(!text.contains("read from") && !text.contains("# note:"));
     }
 
@@ -1527,32 +1548,49 @@ mod tests {
                 "npm run test"
             ]
         );
-        assert_eq!(config.stack.setup, [owlshift_core::stack::NPM_SETUP]);
-        assert_eq!(config.stack.caches, [".npm"]);
-        assert_eq!(text.matches("    # read from ").count(), 6, "{text}");
+        // OWL-617: npm installs online into a run cache, as cargo fetches
+        // into its own; no folder of the home is read.
+        assert_eq!(config.stack.setup, ["npm ci"]);
+        assert!(config.stack.caches.is_empty());
+        assert_eq!(
+            config.stack.run_cache_entries(),
+            [("CARGO_HOME", "cargo"), ("npm_config_cache", "npm")]
+        );
+        assert_eq!(text.matches("    # read from ").count(), 5, "{text}");
         assert!(
             text.contains(
                 "    # read from the `test` script of package.json\n    \"npm run test\","
             )
         );
-        assert!(text.contains(
-            "# read from package-lock.json, the lock file of npm\n    'npm ci --prefer-offline \
-             --cache \"$HOME/.npm\" --logs-dir \"$TMPDIR/npm-logs\"',"
-        ));
         assert!(
-            text.contains("caches = [\n    # read from package-lock.json, the lock file of npm\n    \".npm\",\n]\n"),
+            text.contains(
+                "    # read from package-lock.json, the lock file of npm\n    \"npm ci\","
+            )
+        );
+        assert!(
+            text.contains(
+                "# read from Cargo.toml\nrun_caches.CARGO_HOME = \"cargo\"\n# read from \
+                 package-lock.json, the lock file of npm\nrun_caches.npm_config_cache = \"npm\"\n"
+            ),
             "{text}"
         );
-        assert!(!text.contains("# caches = "), "{text}");
-        assert!(text.contains("# note: the setup installs from npm's cache"));
+        assert!(text.contains("# caches = "), "{text}");
+        assert!(!text.contains("# run_caches = "), "{text}");
     }
 
     /// OWL-593: the lines `init` prints and `doctor` gives let a project
-    /// declaring `.npm` load once added to the personal file, with or
-    /// without its repository: the key is the one the loader reads.
+    /// declaring a cache of the home (yarn 4's) load once added to the
+    /// personal file, with or without its repository: the key is the one
+    /// the loader reads.
     #[test]
     fn the_allow_caches_lines_let_the_project_load() {
-        let d = detected(&["package-lock.json"], &[("package.json", "{}")]);
+        let d = detected(
+            &["yarn.lock"],
+            &[
+                ("package.json", r#"{"packageManager":"yarn@4.5.0"}"#),
+                (".yarnrc.yml", "nodeLinker: node-modules\n"),
+            ],
+        );
         let project = project_file(&with(d, &["make"])).unwrap();
         let repo = Repo::parse("acme/web").unwrap();
         let dir = tempfile::tempdir().unwrap();
@@ -1565,9 +1603,9 @@ mod tests {
                 Some(personal.clone()),
             )
         };
-        let wanted = vec![".npm".to_owned()];
-        assert_eq!(caches_to_allow([".npm"], Some(&[])), wanted);
-        assert_eq!(caches_to_allow([".npm"], None), Vec::<String>::new());
+        let wanted = vec![".yarn/berry".to_owned()];
+        assert_eq!(caches_to_allow([".yarn/berry"], Some(&[])), wanted);
+        assert_eq!(caches_to_allow([".yarn/berry"], None), Vec::<String>::new());
         assert!(matches!(
             load().project,
             crate::config::FileState::Invalid { .. }
@@ -1581,12 +1619,15 @@ mod tests {
                 loaded.project
             );
             let allowed = loaded.allowed_caches(Some(&repo)).unwrap();
-            assert!(caches_to_allow([".npm"], Some(&allowed)).is_empty());
+            assert!(caches_to_allow([".yarn/berry"], Some(&allowed)).is_empty());
         }
-        assert!(allow_caches_advice(Some(&repo), &wanted, "~/x.toml").contains(
-            "Add to ~/x.toml (when the file has that table already, add the folders to its \
-             `allow_caches`):\n\n[repositories.\"github.com/acme/web\"]\nallow_caches = [\".npm\"]\n"
-        ));
+        assert!(
+            allow_caches_advice(Some(&repo), &wanted, "~/x.toml").contains(
+                "Add to ~/x.toml (when the file has that table already, add the folders to its \
+             `allow_caches`):\n\n[repositories.\"github.com/acme/web\"]\nallow_caches = \
+             [\".yarn/berry\"]\n"
+            )
+        );
     }
 
     #[test]
@@ -1611,12 +1652,18 @@ mod tests {
         let text = project_file(&with(d, &["make ci"])).unwrap();
         let config = ProjectConfig::parse(&text).unwrap();
         assert_eq!(config.stack.gate, ["make ci"]);
-        // OWL-598: pnpm's overlay setup and its store load as written.
-        assert_eq!(config.stack.setup, [owlshift_core::stack::PNPM_SETUP]);
-        assert_eq!(config.stack.caches, ["Library/pnpm"]);
+        // OWL-617: pnpm's plain install, its store a run cache.
+        assert_eq!(config.stack.setup, ["pnpm install --frozen-lockfile"]);
+        assert!(config.stack.caches.is_empty());
+        assert_eq!(
+            config.stack.run_cache_entries(),
+            [("npm_config_store_dir", "pnpm-store")]
+        );
         assert!(!text.contains("pnpm run test"));
-        assert!(text.contains("# read from pnpm-lock.yaml, the lock file of pnpm\n"));
-        assert!(text.contains("# note: the setup installs through an overlay"));
+        assert!(text.contains(
+            "# read from pnpm-lock.yaml, the lock file of pnpm\nrun_caches.npm_config_store_dir = \
+             \"pnpm-store\"\n"
+        ));
     }
 
     #[test]
