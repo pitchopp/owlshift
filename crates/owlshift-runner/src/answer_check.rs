@@ -829,6 +829,7 @@ mod tests {
                 round: Some(round),
                 open,
                 restart: Restart::Continue,
+                yields: None,
             }
             .render(),
         ];

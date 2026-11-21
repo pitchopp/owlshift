@@ -30,9 +30,10 @@ const SWITCHES_KEPT: usize = 16;
 pub(super) struct Refreshes {
     /// This pass's: the base head each ticket's refresh rebases onto.
     due: HashMap<TicketId, String>,
-    /// Each ticket's last verdict: its pushed head, the base head, and
-    /// whether that base changes a path its overlaps name.
-    checked: HashMap<TicketId, (String, String, bool)>,
+    /// Each ticket's last verdict: its pushed head, the base head, what its
+    /// overlaps reached then, and whether that base changes it. A taking
+    /// recorded since (OWL-621) reaches more on the same heads.
+    checked: HashMap<TicketId, (String, String, held::Reach, bool)>,
     /// `policy.overlap` as the project file reads at a commit, the latest
     /// few: a commit's file never changes.
     switches: Vec<(String, Overlap)>,
@@ -108,6 +109,7 @@ impl Watch<'_> {
         let on_demand = self.on_demand;
         let git = &on_demand.executor.git;
         let checkout = on_demand.dirs.checkout();
+        let named = on_demand.config.stack.named_resources().unwrap_or_default();
         for (ticket, stored) in read
             .iter()
             .filter_map(|(ticket, stored)| stored.as_ref().ok().map(|stored| (ticket, stored)))
@@ -121,12 +123,13 @@ impl Watch<'_> {
             if !delivery_followed(stored) {
                 continue;
             }
-            let paths: Vec<String> =
-                held::overlaps_of(ticket, stored.record.held.as_ref(), read, &claimed)
-                    .into_iter()
-                    .flat_map(|(_, paths)| paths)
-                    .collect();
-            if paths.is_empty() {
+            // The named resources a taking recorded reach their patterns'
+            // paths (OWL-621).
+            let reach = held::Reach::of(
+                &held::sharings_of(ticket, stored.record.held.as_ref(), read, &claimed),
+                &named,
+            );
+            if reach.is_empty() {
                 memory.refreshes.checked.remove(ticket);
                 continue;
             }
@@ -137,8 +140,10 @@ impl Watch<'_> {
                 .refreshes
                 .checked
                 .get(ticket)
-                .filter(|(at_push, at_base, _)| at_push == pushed && *at_base == base)
-                .map(|(_, _, due)| *due);
+                .filter(|(at_push, at_base, reached, _)| {
+                    at_push == pushed && *at_base == base && *reached == reach
+                })
+                .map(|(_, _, _, due)| *due);
             let due = match known {
                 Some(due) => due,
                 None => {
@@ -151,14 +156,14 @@ impl Watch<'_> {
                         pushed,
                         delivery.base_at_push.as_deref(),
                         &base,
-                        &paths,
+                        &reach,
                     ) else {
                         continue;
                     };
-                    memory
-                        .refreshes
-                        .checked
-                        .insert(ticket.clone(), (pushed.to_owned(), base.clone(), due));
+                    memory.refreshes.checked.insert(
+                        ticket.clone(),
+                        (pushed.to_owned(), base.clone(), reach, due),
+                    );
                     due
                 }
             };

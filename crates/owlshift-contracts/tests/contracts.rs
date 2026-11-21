@@ -2014,7 +2014,7 @@ fn brief_rejections() {
         (told.pull_request, told.url, told.broken),
         (None, None, Some("3".repeat(40)))
     );
-    let both = "either its pull request or its broken base, and not both";
+    let both = "exactly one of its pull request, its broken base or its yield";
     rejects(
         "a rebase with both",
         rebase_with(&|r| r["broken"] = json!("3".repeat(40))),
@@ -2027,6 +2027,31 @@ fn brief_rejections() {
             r.as_object_mut().unwrap().remove("broken");
         }),
         both,
+    );
+    // A yielded Build's rebase (OWL-621) names its yield alone, and is no
+    // refresh.
+    let yielded = |r: &mut Value| {
+        held(r);
+        r.as_object_mut().unwrap().remove("broken");
+        r["yielded"] = json!(true);
+    };
+    let told = rebase_with(&yielded).unwrap().rebase.unwrap();
+    assert!(told.yielded && told.pull_request.is_none() && told.broken.is_none());
+    rejects(
+        "a yield with a broken base",
+        rebase_with(&|r| {
+            held(r);
+            r["yielded"] = json!(true);
+        }),
+        both,
+    );
+    rejects(
+        "a yielded Build's refresh",
+        rebase_with(&|r| {
+            yielded(r);
+            r["refresh"] = json!(true);
+        }),
+        "a yielded Build's rebase is no refresh",
     );
     rejects(
         "a url without its pull request",

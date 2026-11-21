@@ -450,6 +450,7 @@ fn claimed(id: String, claimed_at: Timestamp, held: Vec<Resource>) -> InFlight<S
         dispatched: Dispatched::At(claimed_at.as_millisecond()),
         delivered: false,
         outside: false,
+        yielded: false,
         held,
     }
 }
@@ -463,6 +464,7 @@ fn outside(id: String, held: Vec<Resource>) -> InFlight<String> {
         dispatched: Dispatched::Unrecorded,
         delivered: true,
         outside: true,
+        yielded: false,
         held,
     }
 }
@@ -757,6 +759,7 @@ mod tests {
             dispatched: Dispatched::Now,
             delivered: false,
             outside: false,
+            yielded: false,
             held: vec![zone("app/sub")],
         };
         let found = collision(&ready, &in_flight).unwrap();
@@ -869,6 +872,7 @@ mod tests {
             dispatched,
             delivered: false,
             outside: false,
+            yielded: false,
             held: vec![zone("app/f.rs")],
         };
         let times = std::collections::BTreeMap::from([(id("OWL-1"), 30), (id("OWL-2"), 10)]);

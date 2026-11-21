@@ -12,11 +12,17 @@
 //! [`weigh`] lets two Owlshift tickets hold the same file or zone, and
 //! names the overlap: a named resource, a holder of the whole repository,
 //! work outside Owlshift and a third holder of one path still exclude.
+//!
+//! A stopped holder yields (OWL-621, "A stopped holder yields"): under
+//! `rebase`, a parked ticket, or one whose round waited six hours for its
+//! decider ([`yields`]), holds nothing in the in-flight set
+//! ([`InFlight::yielded`]), and [`weigh`] names what of it a ticket takes.
 
 use std::cmp::Ordering;
 
 use crate::resource::{Resource, contains, same_zone, segments};
 use crate::schedule::natural_cmp;
+use crate::state::Status;
 use crate::vocab::Overlap;
 
 /// When an Owlshift ticket was dispatched, which orders two tickets not yet
@@ -51,6 +57,12 @@ pub struct InFlight<K> {
     /// person's ticket. Never an overlap's sibling under `rebase`
     /// (OWL-449): the runner rebases only its own branches.
     pub outside: bool,
+    /// It yielded what it holds (OWL-621): among the others [`weigh`] weighs
+    /// a ticket against, it holds nothing, counts in no bound and makes no
+    /// ticket wait; what of `held` the ticket takes is told as an overlap.
+    /// Read on the others only: a ticket admitted again after its yield is
+    /// weighed with it false.
+    pub yielded: bool,
     /// What it holds, closed with the named resources its zones and files
     /// reach.
     pub held: Vec<Resource>,
@@ -78,11 +90,65 @@ impl<K: Clone> Collision<K> {
 
 /// An overlap a ticket tolerates under `rebase` (OWL-449): `ticket` holds
 /// what it holds on `paths`, the inner path of each conflicting pair (a file
-/// inside a shared zone, or the zone both hold), each once, sorted.
+/// inside a shared zone, or the zone both hold), each once, sorted. With
+/// `yielded` (OWL-621), `ticket` yielded what it holds and the ticket takes
+/// `paths` and the named `resources`, by name, each once, sorted.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct Shared<K> {
     pub ticket: K,
     pub paths: Vec<String>,
+    pub resources: Vec<String>,
+    pub yielded: bool,
+}
+
+/// The shortest a round waits for its decider before its ticket yields
+/// what it holds under `rebase` (OWL-621): nine answers in ten came sooner
+/// on the drains measured on 2026-11-21. Six hours, in milliseconds.
+pub const ROUND_YIELDS_AFTER_MS: i64 = 6 * 60 * 60 * 1000;
+
+/// Why a stopped ticket yields what it holds (OWL-621).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum YieldWhy {
+    /// It is parked: only a person restarts it.
+    Parked,
+    /// Its round waited [`ROUND_YIELDS_AFTER_MS`] for its decider.
+    Round,
+}
+
+impl YieldWhy {
+    /// How events and texts name it.
+    pub fn key(self) -> &'static str {
+        match self {
+            Self::Parked => "parked",
+            Self::Round => "round",
+        }
+    }
+}
+
+/// Whether a ticket in `status` yields what it holds (OWL-621; architecture
+/// section 5, "A stopped holder yields"): only under [`Overlap::Rebase`],
+/// only when it `holds` something it may yield (not the whole repository);
+/// parked, whatever parked it; or waiting for its decider on an ask posted
+/// at `asked_ms`, at least [`ROUND_YIELDS_AFTER_MS`] before `now_ms`. An
+/// active ticket never does: a wait on a broken base, a usage limit or a
+/// collision lifts by itself.
+pub fn yields(
+    status: Status,
+    holds: bool,
+    asked_ms: Option<i64>,
+    now_ms: i64,
+    overlap: Overlap,
+) -> Option<YieldWhy> {
+    if overlap != Overlap::Rebase || !holds {
+        return None;
+    }
+    match status {
+        Status::Parked { .. } => Some(YieldWhy::Parked),
+        Status::NeedsInput { .. } => asked_ms
+            .filter(|asked| now_ms.saturating_sub(*asked) >= ROUND_YIELDS_AFTER_MS)
+            .map(|_| YieldWhy::Round),
+        Status::Active(_) => None,
+    }
 }
 
 /// What [`weigh`] finds: the collision the ticket waits for, or, when it
@@ -127,6 +193,13 @@ pub fn collision<K: Clone + Ord + AsRef<str>>(
 /// ticket that goes on is told its overlaps with every other Owlshift
 /// ticket, before or after it, delivered or not: each with the inner path
 /// of each tolerated pair.
+///
+/// Whatever the switch, a yielded Owlshift ticket ([`InFlight::yielded`],
+/// OWL-621) holds nothing: it holds no ticket back and counts in no bound.
+/// A ticket that goes on is told what it takes of each: the inner path of
+/// each pair of zones that conflict, the ticket holding the whole
+/// repository taking the yielded ticket's own paths, and each named
+/// resource both hold; as an overlap whose [`Shared::yielded`] is set.
 pub fn weigh<K: Clone + Ord + AsRef<str>>(
     ticket: &InFlight<K>,
     others: &[InFlight<K>],
@@ -134,6 +207,9 @@ pub fn weigh<K: Clone + Ord + AsRef<str>>(
 ) -> Weighed<K> {
     let mut others: Vec<&InFlight<K>> = others.iter().filter(|o| o.id != ticket.id).collect();
     others.sort_by(|a, b| natural_cmp(a.id.as_ref(), b.id.as_ref()).then_with(|| a.id.cmp(&b.id)));
+    let (yielded, others): (Vec<&InFlight<K>>, Vec<&InFlight<K>>) = others
+        .into_iter()
+        .partition(|other| other.yielded && !other.outside);
     let before: Vec<&InFlight<K>> = if ticket.delivered {
         Vec::new()
     } else {
@@ -171,50 +247,106 @@ pub fn weigh<K: Clone + Ord + AsRef<str>>(
             .then(|| beyond_bound(ticket, &before))
             .flatten()
     });
-    if found.is_some() || overlap == Overlap::Exclusive {
+    if found.is_some() {
         return Weighed {
             collision: found,
             overlaps: Vec::new(),
         };
     }
-    let overlaps = others
-        .iter()
-        .filter(|other| !other.outside)
-        .filter_map(|other| {
-            let mut paths: Vec<String> = Vec::new();
-            for mine in ticket.held.iter().filter_map(zone_path) {
-                for theirs in other.held.iter().filter_map(zone_path) {
-                    let (m, t) = (segments(mine), segments(theirs));
-                    let inner = if contains(&m, &t) {
-                        theirs
-                    } else if contains(&t, &m) {
-                        mine
-                    } else {
-                        continue;
-                    };
-                    if !paths.iter().any(|kept| same_zone(kept, inner)) {
-                        paths.push(inner.to_owned());
-                    }
-                }
+    let mut overlaps: Vec<Shared<K>> = Vec::new();
+    if overlap == Overlap::Rebase {
+        let mine: Vec<&str> = ticket.held.iter().filter_map(zone_path).collect();
+        for other in others.iter().filter(|other| !other.outside) {
+            let theirs: Vec<&str> = other.held.iter().filter_map(zone_path).collect();
+            let paths = inner_paths(&mine, &theirs);
+            if !paths.is_empty() {
+                overlaps.push(Shared {
+                    ticket: other.id.clone(),
+                    paths,
+                    resources: Vec::new(),
+                    yielded: false,
+                });
             }
-            // A path inside another shared one adds nothing to it.
-            let kept = paths.clone();
-            paths.retain(|path| {
-                !kept.iter().any(|outer| {
-                    !same_zone(outer, path) && contains(&segments(outer), &segments(path))
-                })
-            });
-            paths.sort();
-            (!paths.is_empty()).then(|| Shared {
+        }
+    }
+    // What the ticket takes of each yielded ticket (OWL-621): its zones,
+    // the whole repository included, against the yielded ticket's.
+    let all_zones = |held: &[Resource]| -> Vec<String> {
+        held.iter()
+            .filter_map(|resource| match resource {
+                Resource::Zone(zone) => Some(zone.clone()),
+                _ => None,
+            })
+            .collect()
+    };
+    let mine = all_zones(&ticket.held);
+    let mine: Vec<&str> = mine.iter().map(String::as_str).collect();
+    for other in yielded {
+        let theirs = all_zones(&other.held);
+        let theirs: Vec<&str> = theirs.iter().map(String::as_str).collect();
+        let paths = inner_paths(&mine, &theirs);
+        let mut resources: Vec<String> = Vec::new();
+        for resource in &ticket.held {
+            if let Resource::Named(name) = resource
+                && other.held.contains(resource)
+                && !resources.contains(name)
+            {
+                resources.push(name.clone());
+            }
+        }
+        resources.sort();
+        if !paths.is_empty() || !resources.is_empty() {
+            overlaps.push(Shared {
                 ticket: other.id.clone(),
                 paths,
-            })
-        })
-        .collect();
+                resources,
+                yielded: true,
+            });
+        }
+    }
+    overlaps.sort_by(|a, b| {
+        natural_cmp(a.ticket.as_ref(), b.ticket.as_ref()).then_with(|| a.ticket.cmp(&b.ticket))
+    });
     Weighed {
         collision: None,
         overlaps,
     }
+}
+
+/// The inner path of each pair of `mine` and `theirs` where one zone holds
+/// the other (a file inside a zone, or the zone both hold), each once,
+/// sorted, a path inside another kept one left out; the whole repository is
+/// never an inner path, so the whole repository against a zone gives that
+/// zone.
+fn inner_paths(mine: &[&str], theirs: &[&str]) -> Vec<String> {
+    let mut paths: Vec<String> = Vec::new();
+    for mine in mine {
+        for theirs in theirs {
+            let (m, t) = (segments(mine), segments(theirs));
+            let inner = if contains(&m, &t) {
+                theirs
+            } else if contains(&t, &m) {
+                mine
+            } else {
+                continue;
+            };
+            if segments(inner).is_empty() {
+                continue;
+            }
+            if !paths.iter().any(|kept| same_zone(kept, inner)) {
+                paths.push((*inner).to_owned());
+            }
+        }
+    }
+    // A path inside another shared one adds nothing to it.
+    let kept = paths.clone();
+    paths.retain(|path| {
+        !kept
+            .iter()
+            .any(|outer| !same_zone(outer, path) && contains(&segments(outer), &segments(path)))
+    });
+    paths.sort();
+    paths
 }
 
 /// The path of a zone that is not the whole repository; `None` for the
@@ -309,6 +441,7 @@ mod tests {
             dispatched,
             delivered,
             outside: false,
+            yielded: false,
             held: held.to_vec(),
         }
     }
@@ -407,7 +540,153 @@ mod tests {
         Shared {
             ticket,
             paths: paths.iter().map(|p| (*p).to_owned()).collect(),
+            resources: Vec::new(),
+            yielded: false,
         }
+    }
+
+    /// What a ticket takes of a yielded one (OWL-621).
+    fn taken(ticket: &'static str, paths: &[&str], resources: &[&str]) -> Shared<&'static str> {
+        Shared {
+            resources: resources.iter().map(|r| (*r).to_owned()).collect(),
+            yielded: true,
+            ..shared(ticket, paths)
+        }
+    }
+
+    fn yielded(mut flight: InFlight<&'static str>) -> InFlight<&'static str> {
+        flight.yielded = true;
+        flight
+    }
+
+    /// OWL-621: a yielded ticket holds nothing, whatever the switch: a
+    /// named resource it holds, a path it shares, a delivered pull request
+    /// hold nothing back and count in no bound; the ticket that goes on is
+    /// told what it takes, paths and names, as an overlap marked yielded,
+    /// and nothing while it waits for another holder.
+    #[test]
+    fn a_yielded_holder_holds_nothing_and_its_taking_is_told() {
+        let migrations = Resource::Named("migrations".to_owned());
+        let parked = yielded(flight(
+            "OWL-1",
+            Dispatched::At(1),
+            true,
+            &[zone("db/1.sql"), zone("app/a.rs"), migrations.clone()],
+        ));
+        let ticket = flight(
+            "OWL-5",
+            Dispatched::Now,
+            false,
+            &[zone("db/2.sql"), zone("app"), migrations.clone()],
+        );
+        for switch in [Overlap::Exclusive, Overlap::Rebase] {
+            assert_eq!(
+                weigh(&ticket, std::slice::from_ref(&parked), switch),
+                Weighed {
+                    collision: None,
+                    overlaps: vec![taken("OWL-1", &["app/a.rs"], &["migrations"])],
+                },
+                "{switch:?}"
+            );
+        }
+        // Not a holder of the bound: with one live holder of a file, a
+        // yielded second leaves room.
+        let one = flight("OWL-2", Dispatched::At(2), false, &[zone("app/a.rs")]);
+        let shared_file = yielded(flight(
+            "OWL-3",
+            Dispatched::At(3),
+            false,
+            &[zone("app/a.rs")],
+        ));
+        let third = flight("OWL-4", Dispatched::Now, false, &[zone("app/a.rs")]);
+        let found = rebase(&third, &[one.clone(), shared_file]);
+        assert_eq!(found.collision, None);
+        assert_eq!(
+            found.overlaps,
+            [
+                shared("OWL-2", &["app/a.rs"]),
+                taken("OWL-3", &["app/a.rs"], &[])
+            ]
+        );
+        // A ticket held back by a live holder takes nothing.
+        let live = flight(
+            "OWL-6",
+            Dispatched::At(1),
+            false,
+            std::slice::from_ref(&migrations),
+        );
+        let waits = rebase(&ticket, &[live, parked.clone()]);
+        assert!(waits.collision.is_some() && waits.overlaps.is_empty());
+        // The whole repository takes the yielded ticket's own paths.
+        let whole = flight("OWL-7", Dispatched::Now, false, &[zone("")]);
+        assert_eq!(
+            rebase(&whole, std::slice::from_ref(&parked)).overlaps,
+            [taken("OWL-1", &["app/a.rs", "db/1.sql"], &[])]
+        );
+        // Work outside Owlshift is never yielded.
+        let person = InFlight {
+            outside: true,
+            ..yielded(flight(
+                "#7",
+                Dispatched::Unrecorded,
+                true,
+                &[zone("app/a.rs")],
+            ))
+        };
+        assert!(
+            rebase(&third, std::slice::from_ref(&person))
+                .collision
+                .is_some()
+        );
+        // Admissions (OWL-448) read a yielded holder the same way.
+        let due = crate::schedule::Due {
+            ticket: flight(
+                "OWL-8",
+                Dispatched::At(8),
+                false,
+                std::slice::from_ref(&migrations),
+            ),
+            added: vec![migrations.clone()],
+            starts: true,
+        };
+        assert_eq!(
+            crate::schedule::admissions(std::slice::from_ref(&due), &[parked], Overlap::Rebase),
+            [("OWL-8", None)]
+        );
+    }
+
+    /// OWL-621: who yields, under `rebase` only and for a record that holds
+    /// something: a parked ticket at once, whatever parked it; a round from
+    /// its sixth hour; never an active ticket.
+    #[test]
+    fn a_parked_ticket_or_a_round_six_hours_old_yields() {
+        use crate::vocab::Stage;
+        let parked = Status::Parked {
+            at: Stage::Build,
+            awaiting_input: false,
+        };
+        let asking = Status::NeedsInput {
+            return_to: Stage::Build,
+        };
+        let six = ROUND_YIELDS_AFTER_MS;
+        let rebase = Overlap::Rebase;
+        assert_eq!(
+            yields(parked, true, None, 0, rebase),
+            Some(YieldWhy::Parked)
+        );
+        assert_eq!(yields(parked, false, None, 0, rebase), None);
+        assert_eq!(yields(parked, true, None, 0, Overlap::Exclusive), None);
+        assert_eq!(yields(asking, true, Some(0), six - 1, rebase), None);
+        assert_eq!(
+            yields(asking, true, Some(0), six, rebase),
+            Some(YieldWhy::Round)
+        );
+        assert_eq!(yields(asking, true, None, six, rebase), None);
+        assert_eq!(yields(asking, true, Some(0), six, Overlap::Exclusive), None);
+        assert_eq!(
+            yields(Status::Active(Stage::Build), true, Some(0), six, rebase),
+            None
+        );
     }
 
     fn rebase(

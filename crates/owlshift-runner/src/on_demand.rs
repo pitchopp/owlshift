@@ -101,7 +101,7 @@ use owlshift_contracts::result::{
 };
 use owlshift_contracts::review::{KeptBuild, KeptFinding, TicketPlan, TicketReview};
 use owlshift_contracts::{BasisKind, DelegationLevel, Role, Stage, Variant};
-use owlshift_core::collision::{self, Collision, InFlight};
+use owlshift_core::collision::{self, Collision, InFlight, YieldWhy};
 use owlshift_core::decider::{self, Decider, NoDecider, ZoneOwners, brief_zones, ticket_zones};
 use owlshift_core::gate::{BudgetReached, Chain, ChainCost, GatePolicy, TicketSpend};
 use owlshift_core::pipeline::Pipeline;
@@ -141,7 +141,7 @@ use crate::writer::{
     self, Corrected, Decided, DecidedBy, DecisionComment, DecisionGroup, DeliveryReport, FixPass,
     Gate, MentionDropped, ParkedComment, Posted, QuestionsComment, ReaskComment, Reasoning,
     Rebased, ReopenedChoice, ReplyComment, Reported, Restart, ResumeComment, Reviewed,
-    VisibleStage, WriteError, Writer, park_reason, rebase_cycle_keeps_delivery,
+    VisibleStage, WriteError, Writer, Yielding, park_reason, rebase_cycle_keeps_delivery,
     rebase_keeps_delivery,
 };
 use owlshift_core::follow::{
@@ -1623,6 +1623,33 @@ impl Prepared {
     }
 }
 
+/// Which admission [`OnDemand::weigh_admission`] checks, for its words: a
+/// Build's (OWL-448), or a yielded ticket's again at its stage (OWL-621).
+#[derive(Clone, Copy, Debug)]
+enum Admission {
+    Build,
+    Readmission(Stage),
+}
+
+impl Admission {
+    /// The stage its wait is told at.
+    fn stage(self) -> String {
+        match self {
+            Self::Build => "build".to_owned(),
+            Self::Readmission(stage) => stage_name(stage),
+        }
+    }
+
+    /// What its wait says the ticket would take, and what happens once the
+    /// holder lets it go.
+    fn wording(self) -> (&'static str, &'static str) {
+        match self {
+            Self::Build => ("its Build would take", "its Build is admitted"),
+            Self::Readmission(_) => ("it held before it yielded", "it is admitted again"),
+        }
+    }
+}
+
 /// What a Build needs beyond the preparation, read just before its first
 /// run.
 struct Dispatched {
@@ -1976,6 +2003,9 @@ impl OnDemand<'_> {
         let held = self.held_at_dispatch(p);
         self.admit(p, &state, held)?;
         drop(section);
+        // A parked ticket that yielded is admitted again before this
+        // dispatch's first run (OWL-621).
+        self.admit_yielded(p, &state, sink)?;
         let dispatched = self.dispatched(p, command, opened, configured, sink);
         self.show_after(ticket, None, Event::Dispatched, sink);
         self.drive(p, command, dispatched, state, sink)
@@ -2160,6 +2190,8 @@ impl OnDemand<'_> {
         let wait = match schedule::slot_turn(&holding, &locked.unread, capacity) {
             Turn::Holders(holders) if !holders.contains(&own.id) => Some(Wait::Slot(holders)),
             Turn::Unknown(unread) => Some(Wait::Slot(unread)),
+            // A yielded ticket's check is its admission again (OWL-621).
+            Turn::Holders(_) if own.yielded => None,
             Turn::Holders(_) => collision::weigh(&own, &locked.in_flight, self.overlap_policy(p))
                 .collision
                 .map(Wait::Collision),
@@ -2248,49 +2280,22 @@ impl OnDemand<'_> {
         let _section = self.section()?;
         let mut recorded = held::Recorded::default();
         if let Some(outside) = outside {
-            let locked = self.locked_load(p, Some(&outside), &named)?;
             let weighed = InFlight {
                 id: p.ticket.as_str().to_owned(),
                 dispatched: collision::Dispatched::Now,
                 delivered: false,
                 outside: false,
+                yielded: false,
                 held: added,
             };
-            let weighed = collision::weigh(&weighed, &locked.in_flight, overlap);
-            // What it shares with its siblings, recorded with the admission
-            // in the same section (OWL-449); an overlap its record cannot
-            // take, keeping the most it keeps, no refresh would cover: the
-            // Build waits for that sibling, as past the bound.
-            recorded = held::record(&mut next, &weighed.overlaps, (self.clock)());
-            let unkept = recorded.unkept.first().map(|shared| Collision {
-                holder: shared.ticket.clone(),
-                resource: Resource::Zone(shared.paths.first().cloned().unwrap_or_default()),
-                sharing: None,
-            });
-            if let Some(found) = weighed.collision.or(unkept) {
-                let (holding, who) = in_flight::holding(&locked.kinds, &found);
-                if p.stepping {
-                    let mut event = data([
-                        ("watch", json!("waits")),
-                        ("reason", json!("collision")),
-                        ("stage", json!("build")),
-                        ("resource", held::resource_data(&found.resource)),
-                    ]);
-                    for (key, value) in in_flight::holding_data(&locked.kinds, &found) {
-                        event.insert(key.to_owned(), value);
-                    }
-                    sink.emit(&p.ticket, None, EventKind::Decision, event);
-                }
-                return Err(Stop::Waits {
-                    ticket: p.ticket.clone(),
-                    said: format!(
-                        "{holding} {}, which its Build would take: its Build is admitted once \
-                         {who} no longer holds it",
-                        found.resource
-                    ),
-                    cap: None,
-                });
-            }
+            recorded = self.weigh_admission(
+                p,
+                &weighed,
+                &mut next,
+                (&outside, &named, overlap),
+                Admission::Build,
+                sink,
+            )?;
         }
         let kept = next.files.len();
         p.held = Some(next);
@@ -2303,14 +2308,165 @@ impl OnDemand<'_> {
                 held::narrowed_event(&dropped, kept),
             );
         }
-        for (sibling, paths) in &recorded.kept {
+        self.recorded_events(p, "admission", &recorded, sink);
+        Ok(())
+    }
+
+    /// The check of an admission, in the project's section the caller
+    /// holds (OWL-448; a yielded ticket's admission again since OWL-621):
+    /// `weighed` against the project's other ticket refs read again and
+    /// `outside`, closed with `named`, under the switch `overlap`; what it
+    /// shares with its siblings and takes of a yielded ticket recorded in
+    /// `next` (OWL-449). A collision, or a live sibling's overlap the
+    /// record cannot take, keeping the most it keeps, which no refresh would
+    /// cover, stops with [`Stop::Waits`] worded for `admission`, with the
+    /// `watch` `waits` decision event at its stage when the command steps
+    /// for watch. A yielded sibling's taking the record cannot take holds
+    /// nothing back: it is warned of.
+    fn weigh_admission(
+        &self,
+        p: &Prepared,
+        weighed: &InFlight<String>,
+        next: &mut TicketHeld,
+        (outside, named, overlap): (&Outside, &NamedResources, Overlap),
+        admission: Admission,
+        sink: &mut EventSink<'_>,
+    ) -> Result<held::Recorded, Stop> {
+        let locked = self.locked_load(p, Some(outside), named)?;
+        let weighed = collision::weigh(weighed, &locked.in_flight, overlap);
+        let mut recorded = held::record(next, &weighed.overlaps, (self.clock)());
+        let unkept = recorded
+            .unkept
+            .iter()
+            .find(|shared| !shared.yielded)
+            .map(|shared| Collision {
+                holder: shared.ticket.clone(),
+                resource: Resource::Zone(shared.paths.first().cloned().unwrap_or_default()),
+                sharing: None,
+            });
+        if let Some(found) = weighed.collision.or(unkept) {
+            let (holding, who) = in_flight::holding(&locked.kinds, &found);
+            if p.stepping {
+                let mut event = data([
+                    ("watch", json!("waits")),
+                    ("reason", json!("collision")),
+                    ("stage", json!(admission.stage())),
+                    ("resource", held::resource_data(&found.resource)),
+                ]);
+                for (key, value) in in_flight::holding_data(&locked.kinds, &found) {
+                    event.insert(key.to_owned(), value);
+                }
+                sink.emit(&p.ticket, None, EventKind::Decision, event);
+            }
+            let (takes, once) = admission.wording();
+            return Err(Stop::Waits {
+                ticket: p.ticket.clone(),
+                said: format!(
+                    "{holding} {}, which {takes}: {once} once {who} no longer holds it",
+                    found.resource
+                ),
+                cap: None,
+            });
+        }
+        // A yielded sibling holds nothing: its unkept taking is told only.
+        recorded.unkept.retain(|shared| shared.yielded);
+        Ok(recorded)
+    }
+
+    /// The events of what an admission or a widening `by` recorded
+    /// (OWL-449, OWL-621): one per sibling, and a warning of the overlaps
+    /// its record could not take.
+    fn recorded_events(
+        &self,
+        p: &Prepared,
+        by: &str,
+        recorded: &held::Recorded,
+        sink: &mut EventSink<'_>,
+    ) {
+        for kept in &recorded.kept {
             sink.emit(
                 &p.ticket,
                 None,
                 EventKind::Decision,
-                held::overlap_event("admission", sibling, paths),
+                held::overlap_event(by, kept),
             );
         }
+        if !recorded.unkept.is_empty() {
+            let unkept: Vec<_> = recorded.unkept.iter().collect();
+            sink.emit(
+                &p.ticket,
+                None,
+                EventKind::Warning,
+                held::unkept_warning(&unkept),
+            );
+        }
+    }
+
+    /// A yielded ticket admitted again before its next run (OWL-621;
+    /// architecture section 5, "A stopped holder yields", "The resume"),
+    /// whatever command runs it: nothing to do unless its record yielded. In
+    /// one of the project's sections, its whole set is weighed as a first
+    /// admission is ([`collision::Dispatched::Now`], its pull request taken
+    /// as not open, so that it waits even with one), against the other
+    /// ticket refs read again and the work outside Owlshift (the one kept in
+    /// `p`, or read now), under the switch at the base this command fetched
+    /// ([`Self::weigh_admission`]): a conflict stops with [`Stop::Waits`] at
+    /// its stage, the record still yielded, so nothing waits for it
+    /// meanwhile. Admitted, the yield's time is cleared and, its pull
+    /// request not open, its next Build's rebase made due
+    /// ([`TicketHeld::admitted_again`]); what it shares or takes is
+    /// recorded, the record kept, a `yield` = `readmitted` event emitted
+    /// and its claim pushed again (OWL-586).
+    fn admit_yielded(
+        &self,
+        p: &mut Prepared,
+        state: &TicketState,
+        sink: &mut EventSink<'_>,
+    ) -> Result<(), Stop> {
+        let Some(before) = p.held.clone().filter(TicketHeld::yielded) else {
+            return Ok(());
+        };
+        let named = self.config.stack.named_resources().unwrap_or_default();
+        let delivered = p.stored.as_ref().is_some_and(delivery_followed);
+        let outside = match p.outside.take() {
+            Some(outside) => outside,
+            None => self.outside_now(&p.ticket)?,
+        };
+        let overlap = self.overlap_policy(p);
+        let stage = stage_name(state.stage());
+        let mut next = before.clone();
+        let recorded = {
+            let _section = self.section()?;
+            let weighed = InFlight {
+                dispatched: collision::Dispatched::Now,
+                delivered: false,
+                yielded: false,
+                ..held::of(&p.ticket, Some(&before), false, &named)
+            };
+            let recorded = self.weigh_admission(
+                p,
+                &weighed,
+                &mut next,
+                (&outside, &named, overlap),
+                Admission::Readmission(state.stage()),
+                sink,
+            )?;
+            next.admitted_again(delivered);
+            let due = next.rebase_due;
+            p.held = Some(next);
+            self.keep(p, state)?;
+            sink.emit(
+                &p.ticket,
+                None,
+                EventKind::Decision,
+                held::readmitted_event(&stage, due),
+            );
+            recorded
+        };
+        self.recorded_events(p, "readmission", &recorded, sink);
+        p.outside = Some(outside);
+        // What it holds again, to its claim, out of the section (OWL-586).
+        self.push_claim_held(p, sink);
         Ok(())
     }
 
@@ -2351,18 +2507,13 @@ impl OnDemand<'_> {
     /// tell, the next read asking again.
     fn overlap_base(&self, p: &Prepared, delivery: &TicketDelivery) -> Option<String> {
         let pushed = delivery.pushed.as_deref()?;
-        let paths: Vec<String> = self
-            .overlaps(p)
-            .into_iter()
-            .flat_map(|(_, paths)| paths)
-            .collect();
         held::base_moved_on(
             &self.executor.git,
             &p.checkout,
             pushed,
             delivery.base_at_push.as_deref(),
             &p.base.commit,
-            &paths,
+            &self.overlap_reach(p),
         )
         .unwrap_or(false)
         .then(|| p.base.commit.clone())
@@ -2370,16 +2521,24 @@ impl OnDemand<'_> {
 
     /// The overlaps of `p`'s ticket from both sides, its own record's and
     /// those the project's other ticket refs keep naming it
-    /// ([`held::overlaps_of`], OWL-449); its own alone when the refs cannot
-    /// be listed.
-    fn overlaps(&self, p: &Prepared) -> Vec<(TicketId, Vec<String>)> {
+    /// ([`held::sharings_of`], OWL-449), the named resources a taking
+    /// recorded included (OWL-621); its own alone when the refs cannot be
+    /// listed.
+    fn sharings(&self, p: &Prepared) -> Vec<held::Sharing> {
         let others = self.others(p).unwrap_or_default();
         let claimed: Vec<TicketId> = others
             .claims
             .iter()
             .map(|claim| claim.ticket.clone())
             .collect();
-        held::overlaps_of(&p.ticket, p.held.as_ref(), &others.refs, &claimed)
+        held::sharings_of(&p.ticket, p.held.as_ref(), &others.refs, &claimed)
+    }
+
+    /// What `p`'s ticket's overlaps reach ([`held::Reach`]): their paths and
+    /// their named resources' patterns in the operator's project file.
+    fn overlap_reach(&self, p: &Prepared) -> held::Reach {
+        let named = self.config.stack.named_resources().unwrap_or_default();
+        held::Reach::of(&self.sharings(p), &named)
     }
 
     /// What the ticket holds from this dispatch (OWL-448; architecture
@@ -2630,6 +2789,9 @@ impl OnDemand<'_> {
         if !p.stepping {
             self.admit_stage(&mut p)?;
         }
+        // A yielded ticket is admitted again before its next run, whatever
+        // runs it (OWL-621).
+        self.admit_yielded(&mut p, &state, sink)?;
         // A stage's run may ask a new round, which goes to the decider now.
         p.current()?;
         // Watch's step into Build is the dispatch to Build (OWL-367): the
@@ -5071,6 +5233,12 @@ impl OnDemand<'_> {
         // ref no run made yet, a park before any run or a ref its first run
         // could not write.
         let questions = questions.or_else(|| p.stored.as_ref().map(|_| p.questions()));
+        // Under `rebase` it yields what it holds, kept with the park
+        // (OWL-621).
+        let yields = questions
+            .is_some()
+            .then(|| self.yield_at_park(p, parked))
+            .flatten();
         let kept = match questions {
             Some(questions) => self
                 .store(p, parked, questions)
@@ -5093,6 +5261,7 @@ impl OnDemand<'_> {
             } else {
                 Restart::Do
             },
+            yields: yields.clone(),
         };
         let unposted = match Writer::new(self.tracker).post_parked(&comment) {
             Ok(posted) => {
@@ -5116,6 +5285,16 @@ impl OnDemand<'_> {
                 ("detail", json!(detail)),
             ]),
         );
+        if let Some(yielding) = &yields
+            && kept.is_ok()
+        {
+            sink.emit(
+                &p.ticket,
+                run,
+                EventKind::Decision,
+                held::yield_event(YieldWhy::Parked, &yielding.paths, &yielding.resources),
+            );
+        }
         if let Err(why) = kept {
             let message = |posted: &str| {
                 format!(
@@ -5151,6 +5330,31 @@ impl OnDemand<'_> {
             detail,
             unposted,
         }
+    }
+
+    /// The yield of a park `parked` (OWL-621; architecture section 5, "A
+    /// stopped holder yields"): under `policy.overlap = "rebase"` at the
+    /// base this command fetched, a record that holds something but the
+    /// whole repository yields it now, its yield's time kept with the park;
+    /// what it yields, for the PARKED comment and the event. `None` when it
+    /// yields nothing.
+    fn yield_at_park(&self, p: &mut Prepared, parked: &TicketState) -> Option<Yielding> {
+        let holds = p.held.as_ref().is_some_and(TicketHeld::yieldable);
+        let now = (self.clock)();
+        collision::yields(
+            parked.status(),
+            holds,
+            None,
+            now.as_millisecond(),
+            self.overlap_policy(p),
+        )?;
+        let held = p.held.as_mut()?;
+        if !held.yield_at(now) {
+            return None;
+        }
+        let named = self.config.stack.named_resources().unwrap_or_default();
+        let (paths, resources) = held::yielding(&p.ticket, held, &named);
+        Some(Yielding { paths, resources })
     }
 
     /// Parks the ticket for a `premise_false` that asks no question, which
@@ -6129,33 +6333,19 @@ impl OnDemand<'_> {
                     overlaps: Ok(recorded),
                     ..
                 } => {
-                    for (sibling, paths) in &recorded.kept {
-                        let event = held::overlap_event("widening", sibling, paths);
+                    for kept in &recorded.kept {
+                        let event = held::overlap_event("widening", kept);
                         sink.emit(ticket, Some(&run), EventKind::Decision, event);
                     }
                     // A widening holds no step: an overlap its record cannot
                     // take is told (OWL-449).
                     if !recorded.unkept.is_empty() {
-                        let siblings: Vec<&str> = recorded
-                            .unkept
-                            .iter()
-                            .map(|shared| shared.ticket.as_str())
-                            .collect();
+                        let unkept: Vec<_> = recorded.unkept.iter().collect();
                         sink.emit(
                             ticket,
                             Some(&run),
                             EventKind::Warning,
-                            data([
-                                ("what", json!("overlap_unrecorded")),
-                                ("tickets", json!(siblings)),
-                                (
-                                    "reason",
-                                    json!(format!(
-                                        "its record keeps the most overlaps it can, {}",
-                                        refs::MAX_OVERLAPS
-                                    )),
-                                ),
-                            ]),
+                            held::unkept_warning(&unkept),
                         );
                     }
                 }
@@ -6592,12 +6782,15 @@ impl OnDemand<'_> {
             review: None,
             pull_request_reviews: Vec::new(),
             // The ticket's overlaps, from both sides (OWL-449).
+            // An overlap on named resources alone names no path: left out
+            // (OWL-621).
             overlaps: if build {
-                self.overlaps(p)
+                self.sharings(p)
                     .into_iter()
-                    .map(|(ticket, paths)| BriefOverlap {
-                        ticket: ticket.to_string(),
-                        paths,
+                    .filter(|sharing| !sharing.paths.is_empty())
+                    .map(|sharing| BriefOverlap {
+                        ticket: sharing.ticket.to_string(),
+                        paths: sharing.paths,
                     })
                     .collect()
             } else {
@@ -7262,6 +7455,11 @@ impl OnDemand<'_> {
                 pr.number
             )));
         }
+        // A yielded ticket, restarted, is admitted again before a repair
+        // runs, its pull request open or not (OWL-621).
+        if action != FollowAction::Park {
+            self.admit_yielded(p, &state, sink)?;
+        }
         match action {
             FollowAction::Rebase { cause, .. } => {
                 return self
@@ -7852,13 +8050,8 @@ impl OnDemand<'_> {
         let classified = rebase::classify(git, &checkout, onto.as_str(), pushed, !refresh);
         // A resolution that merges two tickets' intents is code no reviewer
         // read (OWL-449): a non-trivial conflict on an overlap's path.
-        let overlap_paths: Vec<String> = self
-            .overlaps(p)
-            .into_iter()
-            .flat_map(|(_, paths)| paths)
-            .collect();
-        let review =
-            !classified.trivial && collision::on_overlap(&classified.paths, &overlap_paths);
+        // A named resource's taking reaches the paths of its pattern (OWL-621).
+        let review = !classified.trivial && self.overlap_reach(p).touches(&classified.paths);
         let dispatched = self.dispatch(p, Command::Rebase, sink)?;
         let fast = |attempt: u32| classified.trivial && attempt == 1;
         let fast_run = self.rebase_harness(true, &dispatched);
@@ -7921,6 +8114,7 @@ impl OnDemand<'_> {
             refresh,
             conflicting: classified.paths.clone(),
             broken: None,
+            yielded: false,
         };
         let decorate = |brief: &mut Brief, _: &TicketQuestions| {
             brief.rebase = Some(told.clone());

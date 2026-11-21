@@ -575,15 +575,24 @@ pub const MAX_OVERLAPS: usize = 100;
 
 /// An overlap a ticket tolerates under `policy.overlap = "rebase"`
 /// (OWL-449; architecture section 5, "Tolerated overlap"): another of
-/// Owlshift's tickets holds what it holds on `paths`, since `at`.
+/// Owlshift's tickets holds what it holds on `paths`, since `at`. Since
+/// format 4 (OWL-621, "A stopped holder yields"), a taking of what a
+/// yielded ticket held is recorded so too, a named resource by its name in
+/// `resources`.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct HeldOverlap {
     /// The sibling ticket.
     #[schemars(with = "String")]
     pub ticket: TicketId,
-    /// The shared paths, files or zones, each once, sorted, at least one.
+    /// The shared paths, files or zones, each once, sorted; none only when
+    /// `resources` names one.
     pub paths: Vec<String>,
+    /// The shared named resources, by name, each once, sorted (format 4): a
+    /// taking of a yielded ticket's named resource. The base changes one by
+    /// changing any path its pattern reaches.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub resources: Vec<String>,
     /// When the overlap was first recorded.
     pub at: Timestamp,
 }
@@ -601,7 +610,8 @@ pub struct HeldOverlap {
 ///
 /// Format 1, written before OWL-448, held what its dispatch declared: it
 /// reads as admitted at its dispatch, with no plan admitted. Format 2,
-/// before OWL-449, reads with no overlap.
+/// before OWL-449, reads with no overlap. Format 3, before OWL-621, reads
+/// as not yielded.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 #[schemars(title = "Owlshift ticket held")]
@@ -658,6 +668,18 @@ pub struct TicketHeld {
     /// record may name this one.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub overlaps: Vec<HeldOverlap>,
+    /// When it yielded what it holds under `policy.overlap = "rebase"`
+    /// (format 4, OWL-621; architecture section 5, "A stopped holder
+    /// yields"): parked, or its round waiting six hours for its decider.
+    /// The set stays listed, but the in-flight set reads it as holding
+    /// nothing until its next run admits it again, which clears this.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub yielded_at: Option<Timestamp>,
+    /// Admitted again after a yield while not delivered, and its next
+    /// Build step has not yet decided whether its branch is rebased onto
+    /// what the tickets that took its paths merged (format 4, OWL-621).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub rebase_due: bool,
 }
 
 impl TicketHeld {
@@ -678,7 +700,40 @@ impl TicketHeld {
             delivered_at: None,
             verified: None,
             overlaps: Vec::new(),
+            yielded_at: None,
+            rebase_due: false,
         }
+    }
+
+    /// Whether it yielded what it holds (OWL-621): the in-flight set reads
+    /// it as holding nothing.
+    pub fn yielded(&self) -> bool {
+        self.yielded_at.is_some()
+    }
+
+    /// Whether it may yield (OWL-621): it holds something, its Build's
+    /// admission or a widening's files, but not the whole repository, whose
+    /// taking would name no path; and it has not yielded already.
+    pub fn yieldable(&self) -> bool {
+        !self.yielded() && !self.whole() && (self.admitted() || !self.files.is_empty())
+    }
+
+    /// Yields what it holds at `at` (OWL-621), when it may
+    /// ([`Self::yieldable`]): whether it did.
+    pub fn yield_at(&mut self, at: Timestamp) -> bool {
+        if !self.yieldable() {
+            return false;
+        }
+        self.yielded_at = Some(at);
+        true
+    }
+
+    /// Admitted again after its yield (OWL-621): the yield's time cleared,
+    /// and, unless its pull request is open (`delivered`), its next Build
+    /// step decides whether its branch is rebased first ([`Self::rebase_due`]).
+    pub fn admitted_again(&mut self, delivered: bool) {
+        self.yielded_at = None;
+        self.rebase_due |= !delivered;
     }
 
     /// What a ticket of a ref from before P6 holds once a record must be
@@ -802,22 +857,28 @@ impl TicketHeld {
         }
     }
 
-    /// Records that `ticket` holds what this ticket holds on `paths`, at
-    /// `at` (OWL-449): a sibling already recorded gains the paths it lacked,
-    /// keeping its first time; a new one is added in identifier order.
-    /// Gives the paths it added, none when the record already named them
-    /// all; `None`, nothing changed, for a new sibling once [`MAX_OVERLAPS`]
-    /// are kept: the record cannot take it, which the caller must not take
-    /// as recorded.
+    /// Records that `ticket` holds what this ticket holds on `paths` and the
+    /// named `resources`, at `at` (OWL-449; resources since OWL-621, a
+    /// yielded ticket's taken): a sibling already recorded gains the paths
+    /// and resources it lacked, keeping its first time; a new one is added
+    /// in identifier order. Gives the paths and the resources it added, none
+    /// when the record already named them all; `None`, nothing changed, for
+    /// a new sibling once [`MAX_OVERLAPS`] are kept: the record cannot take
+    /// it, which the caller must not take as recorded.
     pub fn record_overlap(
         &mut self,
         ticket: &TicketId,
         paths: &[String],
+        resources: &[String],
         at: Timestamp,
-    ) -> Option<Vec<String>> {
+    ) -> Option<(Vec<String>, Vec<String>)> {
         let keepable: Vec<&String> = paths.iter().filter(|path| keepable_path(path)).collect();
-        if keepable.is_empty() {
-            return Some(Vec::new());
+        let named: Vec<&String> = resources
+            .iter()
+            .filter(|name| owlshift_core::resource::check_resource_name(name).is_ok())
+            .collect();
+        if keepable.is_empty() && named.is_empty() {
+            return Some((Vec::new(), Vec::new()));
         }
         let index = match self.overlaps.iter().position(|kept| kept.ticket == *ticket) {
             Some(index) => index,
@@ -826,6 +887,7 @@ impl TicketHeld {
                 self.overlaps.push(HeldOverlap {
                     ticket: ticket.clone(),
                     paths: Vec::new(),
+                    resources: Vec::new(),
                     at,
                 });
                 self.overlaps.sort_by(|a, b| a.ticket.cmp(&b.ticket));
@@ -836,15 +898,22 @@ impl TicketHeld {
             }
         };
         let kept = &mut self.overlaps[index];
-        let mut added = Vec::new();
-        for path in keepable {
-            if !kept.paths.contains(path) && !added.contains(path) {
-                added.push(path.clone());
+        let fresh = |have: &[String], wanted: Vec<&String>| {
+            let mut added: Vec<String> = Vec::new();
+            for item in wanted {
+                if !have.contains(item) && !added.contains(item) {
+                    added.push(item.clone());
+                }
             }
-        }
+            added
+        };
+        let added = fresh(&kept.paths, keepable);
+        let added_resources = fresh(&kept.resources, named);
         kept.paths.extend(added.iter().cloned());
         kept.paths.sort();
-        Some(added)
+        kept.resources.extend(added_resources.iter().cloned());
+        kept.resources.sort();
+        Some((added, added_resources))
     }
 
     /// [`Self::widen`], without keeping its time among the widenings.
@@ -873,7 +942,8 @@ impl TicketHeld {
     /// OWL-448, is read as the current format admitted at its dispatch, with
     /// no plan admitted: it holds what its dispatch declared until its next
     /// Build narrows it ([`Self::narrows`], OWL-461). A
-    /// format-2 one, kept before OWL-449, is read with no overlap.
+    /// format-2 one, kept before OWL-449, is read with no overlap; a
+    /// format-3 one, kept before OWL-621, as not yielded.
     pub fn parse(input: &str) -> Result<Self, ContractError> {
         let held: Self = match Self::from_older_format(input) {
             Some(read) => read?,
@@ -883,15 +953,39 @@ impl TicketHeld {
         Ok(held)
     }
 
-    /// A format-1 or format-2 document read as the current format, or
-    /// `None` for any other. Format 1 is format 2 without `admitted_at` and
+    /// A format-1, 2 or 3 document read as the current format, or `None`
+    /// for any other. Format 1 is format 2 without `admitted_at` and
     /// `plan_sha256`, which are refused in it; format 2 is format 3 without
-    /// `overlaps`, refused in either.
+    /// `overlaps`, refused in either; format 3 is format 4 without
+    /// `yielded_at`, `rebase_due` and an overlap's `resources`, refused in
+    /// any of them.
     fn from_older_format(input: &str) -> Option<Result<Self, ContractError>> {
         let mut document: serde_json::Value = serde_json::from_str(input).ok()?;
         let format = document.get("format").and_then(serde_json::Value::as_u64);
-        if !matches!(format, Some(1 | 2)) {
+        if !matches!(format, Some(1..=3)) {
             return None;
+        }
+        let names_resources = document
+            .get("overlaps")
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(|overlaps| overlaps.iter().any(|o| o.get("resources").is_some()));
+        if document.get("yielded_at").is_some()
+            || document.get("rebase_due").is_some()
+            || names_resources
+        {
+            return Some(Err(ContractError::invalid(
+                Self::CONTRACT,
+                "formats 1 to 3 keep no yield",
+            )));
+        }
+        if format == Some(3) {
+            document["format"] = HELD_FORMAT.into();
+            return Some(
+                serde_json::from_value(document).map_err(|source| ContractError::Json {
+                    contract: Self::CONTRACT,
+                    source,
+                }),
+            );
         }
         if document.get("overlaps").is_some() {
             return Some(Err(ContractError::invalid(
@@ -1003,8 +1097,10 @@ impl TicketHeld {
         }
         for overlap in &self.overlaps {
             let ticket = &overlap.ticket;
-            if overlap.paths.is_empty() {
-                return invalid(format!("the overlap with {ticket} names no path"));
+            if overlap.paths.is_empty() && overlap.resources.is_empty() {
+                return invalid(format!(
+                    "the overlap with {ticket} names no path and no resource"
+                ));
             }
             if overlap.paths.windows(2).any(|pair| pair[0] >= pair[1]) {
                 return invalid(format!(
@@ -1016,6 +1112,23 @@ impl TicketHeld {
                     "the overlap with {ticket} names {path:?}, not a path it keeps"
                 ));
             }
+            if overlap.resources.windows(2).any(|pair| pair[0] >= pair[1]) {
+                return invalid(format!(
+                    "the resources of the overlap with {ticket} are not sorted, each once"
+                ));
+            }
+            for name in &overlap.resources {
+                if let Err(reason) = owlshift_core::resource::check_resource_name(name) {
+                    return invalid(format!(
+                        "the overlap with {ticket} names the resource {name:?}, which {reason}"
+                    ));
+                }
+            }
+        }
+        // A yield takes what a record holds (OWL-621): a record holding
+        // nothing, or the whole repository, never yields.
+        if self.yielded() && (self.whole() || (!self.admitted() && self.files.is_empty())) {
+            return invalid("yielded while it holds nothing or the whole repository".to_owned());
         }
         Ok(())
     }

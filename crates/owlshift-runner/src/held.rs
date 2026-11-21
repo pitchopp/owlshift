@@ -20,10 +20,10 @@ use owlshift_contracts::drain::TicketIntake;
 use owlshift_contracts::ids::TicketId;
 use owlshift_contracts::refs::{ClaimHeld, EndedWhy, MAX_HELD_FILES, TicketHeld};
 use owlshift_contracts::review::Plan;
-use owlshift_core::collision::{self, Dispatched, InFlight, Shared};
+use owlshift_core::collision::{self, Dispatched, InFlight, Shared, YieldWhy};
 use owlshift_core::decider::brief_zones;
 use owlshift_core::pipeline::Pipeline;
-use owlshift_core::resource::{self, Held, NamedResources, Resource};
+use owlshift_core::resource::{self, Held, NamedResources, Pattern, Resource};
 use owlshift_core::state::TicketState;
 use owlshift_core::vocab::{Stage, Variant};
 
@@ -86,6 +86,8 @@ pub fn claim_held(stored: Option<&Stored>) -> ClaimHeld {
         return ClaimHeld::default();
     };
     match &stored.record.held {
+        // A yielded record holds nothing (OWL-621).
+        Some(held) if held.yielded() => ClaimHeld::default(),
         None => ClaimHeld {
             repository: true,
             ..ClaimHeld::default()
@@ -156,13 +158,15 @@ pub fn unread(ticket: &TicketId, named: &NamedResources) -> InFlight<String> {
 /// none, the whole repository, dispatched before any time kept. A record
 /// with nothing admitted holds only the files a widening added, which no
 /// step makes before the admission, never the whole repository its empty
-/// zones would read as (OWL-448).
+/// zones would read as (OWL-448). A yielded record (OWL-621) is weighed
+/// [`InFlight::yielded`], its set kept for what a ticket takes of it.
 pub fn of(
     ticket: &TicketId,
     held: Option<&TicketHeld>,
     delivered: bool,
     named: &NamedResources,
 ) -> InFlight<String> {
+    let yielded = held.is_some_and(TicketHeld::yielded);
     let (dispatched, held) = match held {
         Some(held) => (
             held.dispatched_at.map_or(Dispatched::Unrecorded, |at| {
@@ -184,6 +188,7 @@ pub fn of(
         dispatched,
         delivered,
         outside: false,
+        yielded,
         held,
     }
 }
@@ -198,13 +203,40 @@ pub fn of(
 /// request was closed unmerged, at Ready, or once its ref is gone. A ref
 /// that cannot be read counts, since nothing tells it does not. A sibling
 /// with no ref here that `claimed`, another runner's claim, names counts
-/// while that claim stands (OWL-587).
+/// while that claim stands (OWL-587). The paths only, as the Build's brief
+/// lists them: an overlap on named resources alone is left out
+/// ([`sharings_of`] gives them).
 pub fn overlaps_of(
     ticket: &TicketId,
     own: Option<&TicketHeld>,
     refs: &[RefRead],
     claimed: &[TicketId],
 ) -> Vec<(TicketId, Vec<String>)> {
+    sharings_of(ticket, own, refs, claimed)
+        .into_iter()
+        .filter(|sharing| !sharing.paths.is_empty())
+        .map(|sharing| (sharing.ticket, sharing.paths))
+        .collect()
+}
+
+/// An overlap of a ticket's as both sides record it ([`sharings_of`]):
+/// the sibling, the shared paths and, a taking of a yielded ticket's
+/// (OWL-621), the shared named resources, each sorted, each once.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Sharing {
+    pub ticket: TicketId,
+    pub paths: Vec<String>,
+    pub resources: Vec<String>,
+}
+
+/// [`overlaps_of`] with the named resources a taking recorded (OWL-621),
+/// an overlap on named resources alone included.
+pub fn sharings_of(
+    ticket: &TicketId,
+    own: Option<&TicketHeld>,
+    refs: &[RefRead],
+    claimed: &[TicketId],
+) -> Vec<Sharing> {
     let counts = |sibling: &TicketId| match refs.iter().find(|(id, _)| id == sibling) {
         None => claimed.contains(sibling),
         Some((_, Err(_))) => true,
@@ -218,27 +250,28 @@ pub fn overlaps_of(
                     .is_some_and(|ended| ended.why != EndedWhy::Closed)
         }
     };
-    let mut found: Vec<(TicketId, Vec<String>)> = Vec::new();
-    let mut add = |sibling: &TicketId, paths: &[String]| {
+    let mut found: Vec<Sharing> = Vec::new();
+    let mut add = |sibling: &TicketId, paths: &[String], resources: &[String]| {
         if sibling == ticket || !counts(sibling) {
             return;
         }
-        let at = match found.iter().position(|(id, _)| id == sibling) {
+        let at = match found.iter().position(|kept| kept.ticket == *sibling) {
             Some(at) => at,
             None => {
-                found.push((sibling.clone(), Vec::new()));
+                found.push(Sharing {
+                    ticket: sibling.clone(),
+                    paths: Vec::new(),
+                    resources: Vec::new(),
+                });
                 found.len() - 1
             }
         };
-        let kept = &mut found[at].1;
-        for path in paths {
-            if !kept.contains(path) {
-                kept.push(path.clone());
-            }
-        }
+        let kept = &mut found[at];
+        gather_new(&mut kept.paths, paths);
+        gather_new(&mut kept.resources, resources);
     };
     for overlap in own.map_or(&[][..], |held| held.overlaps.as_slice()) {
-        add(&overlap.ticket, &overlap.paths);
+        add(&overlap.ticket, &overlap.paths, &overlap.resources);
     }
     for (recorder, read) in refs {
         let Ok(stored) = read else { continue };
@@ -246,33 +279,98 @@ pub fn overlaps_of(
             continue;
         };
         for overlap in held.overlaps.iter().filter(|o| o.ticket == *ticket) {
-            add(recorder, &overlap.paths);
+            add(recorder, &overlap.paths, &overlap.resources);
         }
     }
-    for (_, paths) in &mut found {
-        paths.sort();
+    for kept in &mut found {
+        kept.paths.sort();
+        kept.resources.sort();
     }
-    found.sort_by(|a, b| a.0.cmp(&b.0));
+    found.sort_by(|a, b| a.ticket.cmp(&b.ticket));
     found
 }
 
-/// What [`record`] made of the overlaps a check found (OWL-449).
+/// Adds each of `items` that `into` lacks.
+fn gather_new(into: &mut Vec<String>, items: &[String]) {
+    for item in items {
+        if !into.contains(item) {
+            into.push(item.clone());
+        }
+    }
+}
+
+/// What a ticket's overlaps reach (OWL-449, OWL-621): their paths, compared
+/// as zones are, and the patterns of their named resources in the project's
+/// list, the base changing a named resource by changing any path its
+/// pattern reaches. A name the list lacks reaches nothing.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Reach {
+    pub paths: Vec<String>,
+    pub patterns: Vec<Pattern>,
+}
+
+impl Reach {
+    /// What `sharings` reach, their resources read in `named`.
+    pub fn of(sharings: &[Sharing], named: &NamedResources) -> Self {
+        let mut reach = Self::default();
+        for sharing in sharings {
+            gather_new(&mut reach.paths, &sharing.paths);
+            for name in &sharing.resources {
+                if let Some((_, pattern)) = named.iter().find(|(kept, _)| kept == name)
+                    && !reach.patterns.contains(pattern)
+                {
+                    reach.patterns.push(pattern.clone());
+                }
+            }
+        }
+        reach.paths.sort();
+        reach
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.paths.is_empty() && self.patterns.is_empty()
+    }
+
+    /// Whether one of `changed` is, holds or lies in one of its paths
+    /// ([`collision::on_overlap`]), or one of its patterns matches it.
+    pub fn touches(&self, changed: &[String]) -> bool {
+        collision::on_overlap(changed, &self.paths)
+            || changed
+                .iter()
+                .any(|path| self.patterns.iter().any(|pattern| pattern.matches(path)))
+    }
+}
+
+/// What [`record`] made of the overlaps a check found (OWL-449), takings of
+/// yielded tickets included (OWL-621).
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Recorded {
-    /// Each sibling recorded, with the paths its record gained, for the
-    /// `overlap` events.
-    pub kept: Vec<(TicketId, Vec<String>)>,
+    /// Each sibling recorded, with what its record gained, for the events.
+    pub kept: Vec<Kept>,
     /// The overlaps with new siblings the record could not take, keeping
-    /// [`MAX_OVERLAPS`] already: no refresh would cover them, so an
-    /// admission waits for them and a widening warns of them.
+    /// [`MAX_OVERLAPS`] already. A live sibling's: no refresh would cover
+    /// it, so an admission waits for it and a widening warns of it. A
+    /// yielded sibling's ([`Shared::yielded`]) never makes a ticket wait,
+    /// since that sibling holds nothing: it is warned of.
     ///
     /// [`MAX_OVERLAPS`]: owlshift_contracts::refs::MAX_OVERLAPS
     pub unkept: Vec<Shared<String>>,
 }
 
-/// Records in `held` the overlaps of `found` it lacks, at `at` (OWL-449):
-/// each sibling that is a ticket identifier, with the paths its record
-/// gained, and apart those of new siblings past
+/// One sibling a [`record`] recorded: the paths and named resources its
+/// record gained, and whether the sibling yielded them (a taking).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Kept {
+    pub sibling: TicketId,
+    pub paths: Vec<String>,
+    pub resources: Vec<String>,
+    pub yielded: bool,
+}
+
+/// Records in `held` the overlaps of `found` it lacks, at `at` (OWL-449),
+/// a yielded sibling's taking with its named resources (OWL-621): each
+/// sibling that is a ticket identifier, with what its record gained, and
+/// apart those of new siblings past
 /// [`MAX_OVERLAPS`](owlshift_contracts::refs::MAX_OVERLAPS).
 pub fn record(held: &mut TicketHeld, found: &[Shared<String>], at: Timestamp) -> Recorded {
     let mut recorded = Recorded::default();
@@ -280,50 +378,126 @@ pub fn record(held: &mut TicketHeld, found: &[Shared<String>], at: Timestamp) ->
         let Ok(sibling) = TicketId::new(&shared.ticket) else {
             continue;
         };
-        match held.record_overlap(&sibling, &shared.paths, at) {
-            Some(added) if added.is_empty() => {}
-            Some(added) => recorded.kept.push((sibling, added)),
+        match held.record_overlap(&sibling, &shared.paths, &shared.resources, at) {
+            Some((paths, resources)) if paths.is_empty() && resources.is_empty() => {}
+            Some((paths, resources)) => recorded.kept.push(Kept {
+                sibling,
+                paths,
+                resources,
+                yielded: shared.yielded,
+            }),
             None => recorded.unkept.push(shared.clone()),
         }
     }
     recorded
 }
 
-/// The `decision` event of an overlap recorded by `by`, `admission` or
-/// `widening` (OWL-449): `overlap` = `recorded`, the sibling in `tickets`,
-/// the paths the record gained.
-pub fn overlap_event(by: &str, sibling: &TicketId, paths: &[String]) -> Data {
+/// The `decision` event of what a record recorded by `by`, `admission`,
+/// `widening` or `readmission`: `overlap` = `recorded` (OWL-449), or, for a
+/// yielded sibling, `yield` = `taken` (OWL-621) with the named resources
+/// taken; the sibling in `tickets`, the paths the record gained.
+pub fn overlap_event(by: &str, kept: &Kept) -> Data {
+    let mut event = if kept.yielded {
+        data([("yield", json!("taken"))])
+    } else {
+        data([("overlap", json!("recorded"))])
+    };
+    event.insert("by".to_owned(), json!(by));
+    event.insert("tickets".to_owned(), json!([kept.sibling.as_str()]));
+    event.insert("paths".to_owned(), json!(kept.paths));
+    if kept.yielded {
+        event.insert("resources".to_owned(), json!(kept.resources));
+    }
+    event
+}
+
+/// What `ticket`'s `held` yields (OWL-621), as the events and the PARKED
+/// comment name it: its zones and files, sorted, each once, and the named
+/// resources it holds, those its paths reach in `named` included.
+pub fn yielding(
+    ticket: &TicketId,
+    held: &TicketHeld,
+    named: &NamedResources,
+) -> (Vec<String>, Vec<String>) {
+    let mut paths: Vec<String> = Vec::new();
+    let mut resources: Vec<String> = Vec::new();
+    for resource in of(ticket, Some(held), false, named).held {
+        match resource {
+            Resource::Zone(zone) if !zone.is_empty() => gather_new(&mut paths, &[zone]),
+            Resource::Named(name) => gather_new(&mut resources, &[name]),
+            Resource::Zone(_) | Resource::Browser => {}
+        }
+    }
+    paths.sort();
+    resources.sort();
+    (paths, resources)
+}
+
+/// The `decision` event of a yield (OWL-621): `yield` = `yielded`, why
+/// (`parked` or `round`), what it yields.
+pub fn yield_event(why: YieldWhy, paths: &[String], resources: &[String]) -> Data {
     data([
-        ("overlap", json!("recorded")),
-        ("by", json!(by)),
-        ("tickets", json!([sibling.as_str()])),
+        ("yield", json!("yielded")),
+        ("why", json!(why.key())),
         ("paths", json!(paths)),
+        ("resources", json!(resources)),
     ])
 }
 
-/// Whether `base`, the base branch's head, is a new head that changes a
-/// path of `overlaps` the pull request's head `pushed` does not contain yet
-/// (OWL-449, architecture section 5, "The refresh"): `base` is no ancestor
-/// of `pushed`, and a file it changed since `since`, the base head read at
-/// the push, when `base` descends from it, else since its merge-base with
-/// `pushed` (`git diff --name-only --no-renames -z from...base`), is, holds
-/// or lies in one of the paths, compared as zones are
-/// ([`collision::on_overlap`]). A change the base held at the push needs no
+/// The `decision` event of a yielded ticket admitted again before its next
+/// run (OWL-621): `yield` = `readmitted`, `stage` its stage, and whether
+/// its next Build decides a rebase first (`rebase_due`).
+pub fn readmitted_event(stage: &str, rebase_due: bool) -> Data {
+    data([
+        ("yield", json!("readmitted")),
+        ("stage", json!(stage)),
+        ("rebase_due", json!(rebase_due)),
+    ])
+}
+
+/// The `warning` of the overlaps `unkept` a record could not take (OWL-449,
+/// OWL-621): `overlap_unrecorded`, the siblings in `tickets`.
+pub fn unkept_warning(unkept: &[&Shared<String>]) -> Data {
+    let siblings: Vec<&str> = unkept.iter().map(|shared| shared.ticket.as_str()).collect();
+    data([
+        ("what", json!("overlap_unrecorded")),
+        ("tickets", json!(siblings)),
+        (
+            "reason",
+            json!(format!(
+                "its record keeps the most overlaps it can, {}",
+                owlshift_contracts::refs::MAX_OVERLAPS
+            )),
+        ),
+    ])
+}
+
+/// Whether `base`, the base branch's head, is a new head that changes what
+/// `reach` reaches that the pull request's head `pushed` does not contain
+/// yet (OWL-449, architecture section 5, "The refresh"; named resources'
+/// patterns since OWL-621): `base` is no ancestor of `pushed`, and a file
+/// it changed since `since`, the base head read at the push, when `base`
+/// descends from it, else since its merge-base with `pushed` (`git diff
+/// --name-only --no-renames -z from...base`), is, holds or lies in one of
+/// its paths, compared as zones are, or matches one of its patterns
+/// ([`Reach::touches`]). A change the base held at the push needs no
 /// refresh: GitHub's checks ran on the merge with it. Watch and a repair
-/// read it the same way, so they never disagree.
+/// read it the same way, so they never disagree. With no `since` and
+/// `pushed` a branch's head: whether the base changed what `reach` reaches
+/// since that branch parted from it.
 pub fn base_moved_on(
     git: &Git,
     checkout: &Path,
     pushed: &str,
     since: Option<&str>,
     base: &str,
-    overlaps: &[String],
+    reach: &Reach,
 ) -> Result<bool, String> {
-    if overlaps.is_empty() {
+    if reach.is_empty() {
         return Ok(false);
     }
     let changed = base_changes(git, checkout, pushed, since, base)?;
-    Ok(collision::on_overlap(&changed, overlaps))
+    Ok(reach.touches(&changed))
 }
 
 /// The paths of the delivery `pushed` that the base's move touches (OWL-520,
@@ -861,14 +1035,14 @@ mod tests {
         .unwrap();
         let mut me = TicketHeld::dispatched(minute(0));
         me.admit(strings(&["app/one.rs"]), Vec::new(), None, minute(1));
-        me.record_overlap(&id("DEMO-2"), &strings(&["app/one.rs"]), minute(1));
-        me.record_overlap(&id("DEMO-5"), &strings(&["web/x.rs"]), minute(1));
+        me.record_overlap(&id("DEMO-2"), &strings(&["app/one.rs"]), &[], minute(1));
+        me.record_overlap(&id("DEMO-5"), &strings(&["web/x.rs"]), &[], minute(1));
         let sibling = |status: Status, delivery: Option<TicketDelivery>, names: &[&str]| {
             let mut stored = at(status, delivery);
             let mut held = TicketHeld::dispatched(minute(0));
             held.admit(strings(&["app"]), Vec::new(), None, minute(2));
             for name in names {
-                held.record_overlap(&id("DEMO-1"), &strings(&[name]), minute(2));
+                held.record_overlap(&id("DEMO-1"), &strings(&[name]), &[], minute(2));
             }
             stored.record.held = Some(held);
             stored
@@ -923,7 +1097,7 @@ mod tests {
             3
         );
         let mut unread = me.clone();
-        unread.record_overlap(&id("DEMO-6"), &strings(&["lib/a.rs"]), minute(4));
+        unread.record_overlap(&id("DEMO-6"), &strings(&["lib/a.rs"]), &[], minute(4));
         assert_eq!(
             overlaps_of(&id("DEMO-1"), Some(&unread), &refs, &[]).len(),
             3
@@ -939,6 +1113,15 @@ mod tests {
         let shared = |ticket: &str, paths: &[&str]| Shared {
             ticket: ticket.to_owned(),
             paths: strings(paths),
+            resources: Vec::new(),
+            yielded: false,
+        };
+        let id = |name: &str| TicketId::new(name).unwrap();
+        let kept = |ticket: &str, paths: &[&str]| Kept {
+            sibling: id(ticket),
+            paths: strings(paths),
+            resources: Vec::new(),
+            yielded: false,
         };
         let mut held = TicketHeld::dispatched(minute(0));
         held.admit(strings(&["app/one.rs"]), Vec::new(), None, minute(1));
@@ -947,14 +1130,38 @@ mod tests {
             shared("#7", &["app/one.rs"]),
         ];
         let recorded = record(&mut held, &found, minute(2));
-        let id = |name: &str| TicketId::new(name).unwrap();
-        assert_eq!(recorded.kept, [(id("DEMO-2"), strings(&["app/one.rs"]))]);
+        assert_eq!(recorded.kept, [kept("DEMO-2", &["app/one.rs"])]);
         assert!(recorded.unkept.is_empty());
+        // OWL-621: a taking of a yielded ticket's named resource is kept by
+        // its name, told as a taking.
+        let taking = Shared {
+            resources: strings(&["migrations"]),
+            yielded: true,
+            ..shared("DEMO-8", &[])
+        };
+        let took = record(&mut held, std::slice::from_ref(&taking), minute(2));
+        assert_eq!(
+            took.kept,
+            [Kept {
+                resources: strings(&["migrations"]),
+                yielded: true,
+                ..kept("DEMO-8", &[])
+            }]
+        );
+        let event = overlap_event("admission", &took.kept[0]);
+        assert_eq!(
+            (&event["yield"], &event["tickets"], &event["resources"]),
+            (&json!("taken"), &json!(["DEMO-8"]), &json!(["migrations"]))
+        );
+        assert!(!event.contains_key("overlap"));
+        held.overlaps
+            .retain(|overlap| overlap.ticket != id("DEMO-8"));
         assert_eq!(record(&mut held, &found, minute(3)), Recorded::default());
         for n in 1..owlshift_contracts::refs::MAX_OVERLAPS {
             held.record_overlap(
                 &id(&format!("DEMO-{}", 100 + n)),
                 &strings(&["x"]),
+                &[],
                 minute(3),
             );
         }
@@ -963,8 +1170,28 @@ mod tests {
             shared("DEMO-2", &["app/two.rs"]),
         ];
         let recorded = record(&mut held, &more, minute(4));
-        assert_eq!(recorded.kept, [(id("DEMO-2"), strings(&["app/two.rs"]))]);
+        assert_eq!(recorded.kept, [kept("DEMO-2", &["app/two.rs"])]);
         assert_eq!(recorded.unkept, [more[0].clone()]);
+    }
+
+    /// OWL-621: what a ticket's overlaps reach, a taking's named resource by
+    /// the pattern the project's list gives it; a name the list lacks
+    /// reaches nothing.
+    #[test]
+    fn a_takings_named_resource_reaches_its_patterns_paths() {
+        let named = NamedResources::new([("migrations", "db/*")]).unwrap();
+        let sharing = |paths: &[&str], resources: &[&str]| Sharing {
+            ticket: TicketId::new("DEMO-2").unwrap(),
+            paths: strings(paths),
+            resources: strings(resources),
+        };
+        let reach = Reach::of(&[sharing(&[], &["migrations", "gone"])], &named);
+        assert!(!reach.is_empty() && reach.paths.is_empty());
+        assert!(reach.touches(&strings(&["db/0002.sql"])));
+        assert!(!reach.touches(&strings(&["db/sub/0002.sql", "app/a.rs"])));
+        let reach = Reach::of(&[sharing(&["App"], &[])], &named);
+        assert!(reach.touches(&strings(&["app/a.rs"])) && !reach.touches(&strings(&["db/1.sql"])));
+        assert!(Reach::of(&[sharing(&[], &["gone"])], &named).is_empty());
     }
 
     /// Writes `files` in `repo`, commits everything there, and returns the
@@ -1012,8 +1239,12 @@ mod tests {
         git.run(repo, &["checkout", "-q", "main"]).unwrap();
         let other = commit(&[("docs/a.md", "b\n")]);
         let shared = commit(&[("app/one.rs", "one, theirs\n")]);
+        let reach = |paths: &[&str]| Reach {
+            paths: strings(paths),
+            patterns: Vec::new(),
+        };
         let moved = |base: &str, paths: &[&str]| {
-            base_moved_on(&git, repo, &pushed, None, base, &strings(paths)).unwrap()
+            base_moved_on(&git, repo, &pushed, None, base, &reach(paths)).unwrap()
         };
         assert!(!moved(&other, &["app/one.rs"]));
         assert!(moved(&shared, &["app/one.rs"]));
@@ -1029,7 +1260,7 @@ mod tests {
                 &pushed,
                 Some(since),
                 &shared,
-                &strings(&["app/one.rs"]),
+                &reach(&["app/one.rs"]),
             )
             .unwrap()
         };
@@ -1055,14 +1286,7 @@ mod tests {
         .unwrap();
         let merged = git.run(repo, &["rev-parse", "HEAD"]).unwrap();
         let merged = String::from_utf8(merged).unwrap().trim().to_owned();
-        let contained = base_moved_on(
-            &git,
-            repo,
-            &merged,
-            None,
-            &shared,
-            &strings(&["app/one.rs"]),
-        );
+        let contained = base_moved_on(&git, repo, &merged, None, &shared, &reach(&["app/one.rs"]));
         assert!(!contained.unwrap());
     }
 

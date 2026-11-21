@@ -125,6 +125,9 @@ impl OnDemand<'_> {
                 pr.number
             )));
         }
+        // A yielded ticket, restarted, is admitted again before its run
+        // (OWL-621).
+        self.admit_yielded(p, &state, sink)?;
         let pushed_id =
             CommitId::new(pushed.as_str()).map_err(|e| refused("the pushed commit", e))?;
         let local = self.fix_branch(p, &pushed_id)?;
