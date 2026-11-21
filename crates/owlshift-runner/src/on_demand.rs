@@ -6560,8 +6560,9 @@ impl OnDemand<'_> {
                 } else {
                     PermissionLevel::ReadOnly
                 },
-                // The web tools of the planning and review roles and the
-                // resolver, unless the operator turns them off (OWL-415).
+                // The web tools of the planning and review roles, the
+                // resolver and Build, unless the operator turns them off
+                // (OWL-415, OWL-618).
                 network: self.web_tools && role.takes_web_tools(),
                 browser: false,
             },

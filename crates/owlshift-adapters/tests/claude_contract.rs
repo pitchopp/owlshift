@@ -552,6 +552,49 @@ fn a_read_only_run_with_network_is_allowed_its_web_tools() {
     assert!(run.permission_denials.is_empty(), "{run:?}");
 }
 
+/// A Build's run, writing the worktree with network since OWL-618, is
+/// offered the web tools and allowed them by no rule: `bypassPermissions`
+/// lets every offered tool through (its argv is pinned by
+/// `a_read_only_run_with_network_is_allowed_its_web_tools` and
+/// `tools_reaching_beyond_the_run_are_denied_on_every_launch`).
+/// `write_worktree_web_fetch.jsonl` was recorded by `claude_record.rs` with
+/// that argv unedited, the model asked to fetch https://example.com once:
+/// the fetch gave the page's title. Exit 0, empty stderr.
+#[test]
+fn a_build_run_with_network_fetches_a_page() {
+    let name = "write_worktree_web_fetch.jsonl";
+    let offered = offered_tools(name);
+    for tool in ["WebFetch", "WebSearch"] {
+        assert!(offered.contains(&tool.to_owned()), "{offered:?}");
+    }
+    let events = recorded_events(name);
+    let calls = tool_calls(&events);
+    let fetch = calls
+        .iter()
+        .find(|call| call["name"] == "WebFetch")
+        .expect("a WebFetch call");
+    assert_eq!(fetch["input"]["url"], "https://example.com");
+    let fetched = tool_results(&events)
+        .into_iter()
+        .find(|result| result["tool_use_id"] == fetch["id"])
+        .expect("the WebFetch result");
+    assert_ne!(fetched["is_error"], json!(true), "{fetched}");
+    assert!(
+        fetched["content"]
+            .as_str()
+            .is_some_and(|text| text.contains("Example Domain")),
+        "{fetched}"
+    );
+    let run = replay(name, 0);
+    assert_eq!(
+        run.outcome,
+        Outcome::Completed {
+            text: "Example Domain".into()
+        }
+    );
+    assert!(run.permission_denials.is_empty(), "{run:?}");
+}
+
 /// Where `flag` stands in `args`.
 fn positions(args: &[String], flag: &str) -> Vec<usize> {
     (0..args.len()).filter(|&at| args[at] == flag).collect()

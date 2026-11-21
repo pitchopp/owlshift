@@ -69,6 +69,57 @@ fn a_real_role_runs_through_the_executor() {
     assert!(fs::metadata(&live.report.stdout_log).unwrap().len() > 0);
 }
 
+/// A Build's run, confined under the write profile, fetches a page with its
+/// web tools when its brief has network (OWL-618), and is not offered them
+/// without: the case of `web_tools = false`. Its result's summary is the
+/// fetched page's title.
+#[test]
+#[ignore = "live: runs `claude -p` on your token for agent runs; set OWLSHIFT_LIVE_CLAUDE=1"]
+fn a_confined_build_fetches_a_page_only_with_network() {
+    let role = format!(
+        "You are a test role. Use the WebFetch tool once, if you have it, to fetch \
+         https://example.com and ask it for the page's title; call no other tool for it but \
+         ToolSearch, if you need it to load WebFetch. Then read the brief, a JSON file, and \
+         write the file named by its `result_path`: a JSON object with exactly the fields \
+         `format` (the number {RESULT_FORMAT}), `status` (the string \"done\") and `summary` \
+         (the title alone, or the word none when you have no WebFetch tool). Do nothing else."
+    );
+    for network in [true, false] {
+        let shape = Shape {
+            network,
+            ..Shape::default()
+        };
+        let live = run_live_seeded(
+            &[],
+            |_| role.clone(),
+            shape,
+            Role::Build,
+            PermissionLevel::WriteWorktree,
+            "Fetch a page",
+            None,
+        );
+        let transcript = Transcript::of(&live);
+        let offered = transcript.init()["tools"].clone();
+        let offers = |tool: &str| offered.as_array().unwrap().iter().any(|t| t == tool);
+        assert_eq!(offers("WebFetch"), network, "{offered}");
+        assert_eq!(offers("WebSearch"), network, "{offered}");
+        if network {
+            let (failed, text) = transcript.call("WebFetch", "example.com", |input| {
+                input["url"] == "https://example.com"
+            });
+            assert!(!failed && text.contains("Example Domain"), "{text}");
+            assert_eq!(live.result().summary, "Example Domain");
+        } else {
+            assert!(
+                transcript
+                    .calls("WebFetch", "any page", |_| true)
+                    .is_empty()
+            );
+            assert_eq!(live.result().summary, "none");
+        }
+    }
+}
+
 /// Claude Code's bundled skills do not reach a confined run, read-only or
 /// write (OWL-333). Without `--disable-slash-commands`, both runs listed the
 /// CLI's own skills in `init`, were offered `Skill`, and got `dataviz`'s
