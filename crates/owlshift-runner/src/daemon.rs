@@ -26,6 +26,10 @@
 //!   `<data>/service/drain`, which the daemon relays as a stop does; once
 //!   its watches have ended it exits with [`UPGRADE_EXIT`], so the service
 //!   manager starts it again on the new binary. A stop asked meanwhile wins.
+//!   Without a command (OWL-616): the daemon looks at the binary at the path
+//!   it was started from ([`WatchedBinary`]) at each pass and writes that
+//!   drain itself for a newer build; one the service did not start then
+//!   hands its lock to that binary's daemon ([`successor`]).
 //! - *The digest* ([`digest`]): once a day at the personal file's
 //!   `digest_hour`, one notification, `<data>/service/digest.json` keeping
 //!   when it was made so it is sent once at wake, never twice.
@@ -47,19 +51,31 @@ pub(crate) mod child;
 pub mod digest;
 pub mod instance;
 pub mod requests;
+pub mod successor;
 mod supervise;
 pub mod upgrade;
 
-use std::path::Path;
+use std::cell::Cell;
+use std::io::Write;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
 
 use owlshift_adapters::forge::Repo;
 use owlshift_adapters::notifier::Notifier;
+use owlshift_contracts::service::{BuildIdentity, DaemonRecord};
 use owlshift_core::restart::RestartPolicy;
 
 pub use instance::{Held, Instance, pinned_dir, running, service_dir};
 pub use requests::ask_stop;
+
+use supervise::{Turn, say};
+use upgrade::{Binary, Probed, Stamp, supersedes};
+
+/// How long `owlshift start` waits for a daemon it launched to take its
+/// lock; with [`upgrade::VERSION_WAIT`], how long a daemon waits for its
+/// successor's record (OWL-608, OWL-616).
+pub const LAUNCH_WAIT: Duration = Duration::from_secs(10);
 
 /// The exit code of a served watch that refused to start for a reason no
 /// restart mends (a `Refusal` that is lasting): the daemon pauses its
@@ -108,6 +124,58 @@ pub struct Daemon<'a> {
     pub digest: Option<digest::Settings>,
     /// The web UI to run as a child; `None` runs none.
     pub ui: Option<UiLaunch<'a>>,
+    /// The binary the daemon watches (OWL-616); `None` watches none.
+    pub binary: Option<&'a WatchedBinary>,
+}
+
+/// The binary a daemon watches (OWL-616, architecture section 5, "An
+/// upgrade", "Without a command"): the file at the path it was started
+/// from, its own version and build, and the stamp it last saw there.
+#[derive(Debug)]
+pub struct WatchedBinary {
+    pub path: PathBuf,
+    pub version: String,
+    pub build: Option<BuildIdentity>,
+    /// The stamp seen last: the running file's at the start, then each one
+    /// asked its `--version`, so a file is asked once per change.
+    seen: Cell<Option<Stamp>>,
+}
+
+impl WatchedBinary {
+    /// The binary at `path` as the daemon starts, before it pins: its stamp
+    /// is the running file's, on Linux `/proc/self/exe`, elsewhere the path's,
+    /// the pin's check then catching a file replaced as the daemon starts.
+    pub fn at_start(path: PathBuf, version: String, build: Option<BuildIdentity>) -> Self {
+        let running = Path::new("/proc/self/exe");
+        let seen = if cfg!(target_os = "linux") && running.exists() {
+            Stamp::of(running)
+        } else {
+            Stamp::of(&path)
+        };
+        Self {
+            path,
+            version,
+            build,
+            seen: Cell::new(seen.ok()),
+        }
+    }
+
+    /// The daemon's own binary, as [`supersedes`] compares it.
+    fn own(&self) -> Binary<'_> {
+        Binary {
+            version: &self.version,
+            build: self.build.as_ref(),
+        }
+    }
+}
+
+/// A newer binary a daemon found at its path, whose drain it asked.
+#[derive(Clone, Debug)]
+pub(crate) struct Found {
+    /// What it said for `--version`.
+    probed: Probed,
+    /// Its stamp when it said so.
+    stamp: Stamp,
 }
 
 /// The web UI the daemon runs (OWL-467).
@@ -128,4 +196,102 @@ pub enum Ended {
     /// An upgrade's drain is done, no stop asked meanwhile: its watches
     /// ended, and the daemon exits with [`UPGRADE_EXIT`].
     Upgraded,
+    /// Its lock is handed to the daemon of the newer binary at its path
+    /// (OWL-616), which runs on.
+    Moved,
+}
+
+impl Ended {
+    /// The daemon's exit code: [`UPGRADE_EXIT`] for the service manager to
+    /// start the new binary, 0 otherwise.
+    pub fn exit_code(self) -> u8 {
+        match self {
+            Self::Stopped | Self::Moved => 0,
+            Self::Upgraded => UPGRADE_EXIT,
+        }
+    }
+}
+
+impl Daemon<'_> {
+    /// Serves the listed projects until a stop asked of the daemon is done,
+    /// saying what it does on `out`: the daemon of `instance`, recorded as
+    /// `record`. An upgrade's drain that ends in a handover (OWL-616) hands
+    /// the lock to the successor; one that did not take over leaves this
+    /// daemon serving again, as at a restart.
+    pub fn serve(&self, instance: &Instance, record: &DaemonRecord, out: &mut dyn Write) -> Ended {
+        loop {
+            let found = match self.run(out) {
+                Turn::Ended(ended) => return ended,
+                Turn::HandOver(found) => found,
+            };
+            let Some((binary, found)) = self.binary.zip(self.still_newer(found, out)) else {
+                continue;
+            };
+            let to = successor::To {
+                path: &binary.path,
+                shown: found.probed.binary().shown(),
+            };
+            match successor::hand_over(
+                self.data,
+                instance,
+                record,
+                &to,
+                successor::HANDOVER_WAIT,
+                out,
+            ) {
+                successor::Handed::Done => return Ended::Moved,
+                successor::Handed::Failed => {}
+            }
+        }
+    }
+
+    /// `found`, when the binary at the daemon's path is still that newer
+    /// one: one changed again during the drain is asked its `--version`
+    /// again, and taken only when it still supersedes this daemon.
+    fn still_newer(&self, found: Found, out: &mut dyn Write) -> Option<Found> {
+        let binary = self.binary?;
+        let path = binary.path.display();
+        let now = match Stamp::of(&binary.path) {
+            Ok(now) if now == found.stamp => return Some(found),
+            Ok(now) => now,
+            Err(error) => {
+                say(
+                    out,
+                    &format!(
+                        "warning: the binary at {path} cannot be read any more ({error}): the \
+                         daemon serves on, on its own binary."
+                    ),
+                );
+                return None;
+            }
+        };
+        binary.seen.set(Some(now));
+        match upgrade::probe(&binary.path) {
+            Ok(probed) if supersedes(probed.binary(), binary.own()) => {
+                Some(Found { probed, stamp: now })
+            }
+            Ok(probed) => {
+                say(
+                    out,
+                    &format!(
+                        "The binary at {path} changed again during the drain, to version {}, \
+                         which does not supersede this daemon's {}: it serves on.",
+                        probed.binary().shown(),
+                        binary.own().shown()
+                    ),
+                );
+                None
+            }
+            Err(error) => {
+                say(
+                    out,
+                    &format!(
+                        "warning: the binary at {path} changed again during the drain and did not \
+                         tell its version ({error}): the daemon serves on, on its own binary."
+                    ),
+                );
+                None
+            }
+        }
+    }
 }

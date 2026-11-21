@@ -17,7 +17,8 @@ use serde_json::json;
 
 use super::child::{Ended as ChildEnded, Supervised};
 use super::digest::Digests;
-use super::{Daemon, Ended, UNSERVABLE_EXIT, UPGRADE_EXIT, UiLaunch, requests};
+use super::upgrade::{self, End, Probed, Stamp, supersedes};
+use super::{Daemon, Ended, Found, UNSERVABLE_EXIT, UPGRADE_EXIT, UiLaunch, requests};
 use crate::events::{Data, EventLog, EventSink, data, printable};
 use crate::notify;
 use crate::project::ProjectDirs;
@@ -101,12 +102,25 @@ struct State {
     upgrading: bool,
     next_pass: Instant,
     digests: Digests,
+    /// The look at the binary at the daemon's path under way (OWL-616): the
+    /// stamp it is for and the thread asking its `--version`.
+    probe: Option<(Stamp, thread::JoinHandle<Result<Probed, String>>)>,
+    /// The newer binary found there, whose drain the daemon asked.
+    found: Option<Found>,
+}
+
+/// How one run of the daemon's loop ended (OWL-616).
+pub(super) enum Turn {
+    Ended(Ended),
+    /// Its upgrade's drain is done, for the newer binary it found at its
+    /// path, and the service did not start it: it hands its lock over.
+    HandOver(Found),
 }
 
 impl Daemon<'_> {
     /// Serves the listed projects until a stop asked of the daemon is done,
     /// saying what it does on `out`.
-    pub fn run(&self, out: &mut dyn Write) -> Ended {
+    pub(super) fn run(&self, out: &mut dyn Write) -> Turn {
         if let Some(request) = requests::stop_asked(self.data) {
             say(
                 out,
@@ -117,7 +131,7 @@ impl Daemon<'_> {
                 ),
             );
             self.remove_stop_request(out);
-            return Ended::Stopped;
+            return Turn::Ended(Ended::Stopped);
         }
         // A drain naming this daemon was written once its record stood, by a
         // newer binary: honoured by the loop. Any other was left for the
@@ -156,13 +170,17 @@ impl Daemon<'_> {
             upgrading: false,
             next_pass: Instant::now(),
             digests: Digests::default(),
+            probe: None,
+            found: None,
         };
         loop {
             self.check_stop(&mut state, out);
+            self.probed(&mut state, out);
             let now = Instant::now();
             if !state.stopping && now >= state.next_pass {
                 self.pass(&mut state, out);
                 self.digest(&mut state, out);
+                self.look_at_binary(&mut state, out);
                 state.next_pass = now + self.timing.pass;
             }
             let stopping = state.stopping;
@@ -240,26 +258,165 @@ impl Daemon<'_> {
         // next daemon, which then ends at its start.
         self.remove_drain_request(out);
         let stopped = self.take_stop_request(out) || process::asked().is_some();
-        if state.upgrading && !stopped {
-            say(
+        // A daemon the service's launcher started exits 75 even for a binary
+        // it found itself: the manager starts the launcher again on that
+        // path, and would end a successor with the daemon (OWL-616).
+        let found = state.found.take();
+        let by_service =
+            found.is_some() && upgrade::started_by_service(self.data, std::process::id());
+        match upgrade::end_of_drain(state.upgrading, stopped, found.is_some(), by_service) {
+            End::HandOver => {
+                if let (Some(binary), Some(found)) = (self.binary, found) {
+                    say(
+                        out,
+                        &format!(
+                            "The daemon drained for an upgrade: every watch it ran has ended; it \
+                             hands its lock to the daemon of {}, version {}.",
+                            binary.path.display(),
+                            found.probed.binary().shown()
+                        ),
+                    );
+                    return Turn::HandOver(found);
+                }
+                Turn::Ended(Ended::Stopped)
+            }
+            End::Upgraded => {
+                say(
+                    out,
+                    &format!(
+                        "The daemon drained for an upgrade: every watch it ran has ended; it \
+                         exits with {UPGRADE_EXIT}, so the service manager starts it again on the \
+                         new binary."
+                    ),
+                );
+                Turn::Ended(Ended::Upgraded)
+            }
+            End::Stopped => {
+                if state.upgrading {
+                    say(
+                        out,
+                        "A stop was asked during the upgrade's drain: the daemon ends, not to be \
+                         started again.",
+                    );
+                }
+                say(out, "The daemon stopped: every watch it ran has ended.");
+                Turn::Ended(Ended::Stopped)
+            }
+        }
+    }
+
+    /// Asks the binary at the daemon's path its `--version`, in a thread of
+    /// its own, when its stamp changed since the daemon last saw it; a file
+    /// that cannot be read is no change, as while it is relinked (OWL-616).
+    fn look_at_binary(&self, state: &mut State, out: &mut dyn Write) {
+        let Some(binary) = self.binary else {
+            return;
+        };
+        if state.probe.is_some() || state.found.is_some() {
+            return;
+        }
+        let Ok(now) = Stamp::of(&binary.path) else {
+            return;
+        };
+        if binary.seen.get() == Some(now) {
+            return;
+        }
+        let path = binary.path.clone();
+        match thread::Builder::new()
+            .name("binary".to_owned())
+            .spawn(move || upgrade::probe(&path))
+        {
+            Ok(handle) => state.probe = Some((now, handle)),
+            Err(error) => {
+                binary.seen.set(Some(now));
+                say(
+                    out,
+                    &format!(
+                        "warning: the binary at {} changed, but its version could not be asked \
+                         ({error}): the daemon goes on, on its own binary.",
+                        binary.path.display()
+                    ),
+                );
+            }
+        }
+    }
+
+    /// Acts on what the binary at the daemon's path said, once it has: a
+    /// binary that supersedes the daemon has it write its own drain for the
+    /// upgrade; any other answer is one line (OWL-616).
+    fn probed(&self, state: &mut State, out: &mut dyn Write) {
+        let Some(binary) = self.binary else {
+            return;
+        };
+        if !state
+            .probe
+            .as_ref()
+            .is_some_and(|(_, handle)| handle.is_finished())
+        {
+            return;
+        }
+        let Some((stamp, handle)) = state.probe.take() else {
+            return;
+        };
+        let before = binary.seen.replace(Some(stamp));
+        let said = handle
+            .join()
+            .unwrap_or_else(|_| Err("its look at the binary failed".to_owned()));
+        if state.stopping {
+            return;
+        }
+        let path = binary.path.display();
+        let own = binary.own().shown();
+        match said {
+            Ok(probed) if supersedes(probed.binary(), binary.own()) => {
+                let shown = probed.binary().shown();
+                let request = Request::new(
+                    BY_DAEMON,
+                    Timestamp::now(),
+                    format!("an upgrade from version {own} to {shown}, the binary at {path}"),
+                )
+                .for_pid(std::process::id());
+                match requests::ask_drain(self.data, &request) {
+                    Ok(()) => {
+                        say(
+                            out,
+                            &format!(
+                                "The binary at {path} is now version {shown}, newer than this \
+                                 daemon's {own}: the daemon drains to move onto it."
+                            ),
+                        );
+                        state.found = Some(Found { probed, stamp });
+                    }
+                    Err(error) => {
+                        binary.seen.set(before);
+                        say(
+                            out,
+                            &format!(
+                                "warning: the binary at {path} is now version {shown}, but the \
+                                 drain for the upgrade could not be written ({error}): tried \
+                                 again at the next pass."
+                            ),
+                        );
+                    }
+                }
+            }
+            Ok(probed) => say(
                 out,
                 &format!(
-                    "The daemon drained for an upgrade: every watch it ran has ended; it exits \
-                     with {UPGRADE_EXIT}, so the service manager starts it again on the new \
-                     binary."
+                    "The binary at {path} changed, to version {}, which does not supersede this \
+                     daemon's {own}: the daemon goes on.",
+                    probed.binary().shown()
                 ),
-            );
-            return Ended::Upgraded;
-        }
-        if state.upgrading {
-            say(
+            ),
+            Err(error) => say(
                 out,
-                "A stop was asked during the upgrade's drain: the daemon ends, not to be started \
-                 again.",
-            );
+                &format!(
+                    "warning: the binary at {path} changed but did not tell its version \
+                     ({error}): the daemon goes on, on its own binary, and asks again once the \
+                     file changes."
+                ),
+            ),
         }
-        say(out, "The daemon stopped: every watch it ran has ended.");
-        Ended::Stopped
     }
 
     /// Whether any stop, or an upgrade's drain, is asked of the daemon now.
@@ -293,8 +450,8 @@ impl Daemon<'_> {
                     out,
                     &format!(
                         "Draining for an upgrade ({}: {}): each of the {running} watches under \
-                         way ends once its steps under way finish, then the daemon exits with \
-                         {UPGRADE_EXIT}.",
+                         way ends once its steps under way finish, then the daemon moves onto the \
+                         new binary.",
                         drain.by, drain.why
                     ),
                 );
@@ -907,7 +1064,7 @@ impl Daemon<'_> {
 }
 
 /// Writes `line` on `out`, safe for a terminal, never failing.
-fn say(out: &mut dyn Write, line: &str) {
+pub(super) fn say(out: &mut dyn Write, line: &str) {
     let _ = writeln!(out, "{}", printable(line));
 }
 

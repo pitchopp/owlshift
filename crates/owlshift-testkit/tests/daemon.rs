@@ -85,6 +85,12 @@ struct Bench {
     ui_exits: bool,
     /// Whether the daemon's UI is the real one, on a scripted host (OWL-472).
     ui_real: bool,
+    /// The copy of the bench's binary the daemon is started from, which a
+    /// test replaces (OWL-616); none: the bench's binary itself.
+    program: Option<PathBuf>,
+    /// The service's launcher, run as its manager would run it (OWL-616);
+    /// none: the daemon is started directly.
+    launcher: Option<PathBuf>,
 }
 
 impl Bench {
@@ -97,7 +103,59 @@ impl Bench {
             ui_port: None,
             ui_exits: false,
             ui_real: false,
+            program: None,
+            launcher: None,
         }
+    }
+
+    /// The path the daemon is started from, once [`Bench::install_binary`]
+    /// put a copy there.
+    fn binary_path(&self) -> PathBuf {
+        self.tmp.path().join("bin").join("owlshift-daemon-bench")
+    }
+
+    /// Puts a copy of the bench's binary at [`Bench::binary_path`], a build
+    /// of the commit `commit` repeated made at `built_at` seconds, and starts
+    /// the daemon from it from now on (OWL-616).
+    fn install_binary(&mut self, commit: char, built_at: i64) -> PathBuf {
+        fs::create_dir_all(self.binary_path().parent().unwrap()).unwrap();
+        self.replace(commit, built_at);
+        self.program = Some(self.binary_path());
+        self.binary_path()
+    }
+
+    /// Replaces the binary at [`Bench::binary_path`] as an installer does: a
+    /// new copy, beside its build, renamed over it (OWL-616).
+    fn replace(&self, commit: char, built_at: i64) {
+        let path = self.binary_path();
+        let staged = path.with_file_name("staged");
+        fs::copy(daemon_bench(), &staged).unwrap();
+        let build = path.with_file_name("owlshift-daemon-bench.build");
+        let partial = path.with_file_name("build.partial");
+        fs::write(
+            &partial,
+            format!("{} {built_at}", commit.to_string().repeat(40)),
+        )
+        .unwrap();
+        fs::rename(&partial, &build).unwrap();
+        fs::rename(&staged, &path).unwrap();
+    }
+
+    /// Replaces the binary at [`Bench::binary_path`] by a script that does
+    /// not answer `--version` (OWL-616).
+    fn replace_with_failing_script(&self) {
+        use std::os::unix::fs::PermissionsExt;
+        let path = self.binary_path();
+        let staged = path.with_file_name("staged");
+        fs::write(&staged, "#!/bin/sh\nexit 3\n").unwrap();
+        fs::set_permissions(&staged, fs::Permissions::from_mode(0o755)).unwrap();
+        fs::rename(&staged, &path).unwrap();
+    }
+
+    /// The record of the daemon that runs, when one runs and its record
+    /// reads.
+    fn record(&self) -> Option<owlshift_contracts::service::DaemonRecord> {
+        daemon::running(&self.data()).ok().flatten().flatten()
     }
 
     fn data(&self) -> PathBuf {
@@ -135,9 +193,24 @@ impl Bench {
                 .open(self.tmp.path().join(name))
                 .unwrap()
         };
-        let mut daemon = Command::new(daemon_bench());
+        let mut daemon = match (&self.launcher, &self.program) {
+            (Some(launcher), _) => {
+                let mut command = Command::new("/bin/sh");
+                command.arg(launcher);
+                command
+            }
+            (None, Some(program)) => {
+                let mut command = Command::new(program);
+                command.arg("daemon");
+                command
+            }
+            (None, None) => {
+                let mut command = Command::new(daemon_bench());
+                command.arg("daemon");
+                command
+            }
+        };
         daemon
-            .arg("daemon")
             .env("OWLSHIFT_DATA_DIR", self.data())
             .env("OWLSHIFT_BENCH_TIMING", TIMING)
             .env("OWLSHIFT_BENCH_NOTES", self.notes_file())
@@ -183,10 +256,17 @@ impl Bench {
         fs::metadata(self.bench_dir(REPO).join("passes")).map_or(0, |file| file.len())
     }
 
-    /// The daemon's output so far, for a failure.
+    /// The daemon's output so far, for a failure: the service's launcher
+    /// appends it to the daemon's log (OWL-616).
     fn output(&self) -> String {
-        let read = |name: &str| fs::read_to_string(self.tmp.path().join(name)).unwrap_or_default();
-        format!("--- out\n{}--- err\n{}", read("out"), read("err"))
+        let read = |path: PathBuf| fs::read_to_string(path).unwrap_or_default();
+        let at = |name: &str| read(self.tmp.path().join(name));
+        let log = read(daemon::service_dir(&self.data()).join("daemon.log"));
+        format!(
+            "--- out\n{}--- err\n{}--- daemon.log\n{log}",
+            at("out"),
+            at("err")
+        )
     }
 
     /// Every stand-in watch `repo` had, oldest first: its pid and its step's.
@@ -305,6 +385,12 @@ impl Drop for Bench {
         if let Some(daemon) = &mut self.daemon {
             let _ = daemon.kill();
             let _ = daemon.wait();
+        }
+        // A daemon the test's own handed its lock to (OWL-616).
+        if let Some(record) = self.record() {
+            let _ = Command::new("kill")
+                .args(["-s", "KILL", &record.pid.to_string()])
+                .status();
         }
         if let Some(pid) = self.ui_pid() {
             let _ = Command::new("kill")
@@ -1199,6 +1285,249 @@ fn an_upgrade_drain_ends_75_unless_a_stop_is_asked_meanwhile() {
         "{}",
         bench.output()
     );
+}
+
+/// Polls the daemon's lock of `data` every 10 ms until dropped, counting
+/// the looks that found it free (OWL-616).
+struct Prober {
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    thread: Option<thread::JoinHandle<u32>>,
+}
+
+impl Prober {
+    fn start(data: &Path) -> Self {
+        use std::sync::atomic::Ordering;
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (asked, data) = (stop.clone(), data.to_owned());
+        let thread = thread::spawn(move || {
+            let mut free = 0;
+            while !asked.load(Ordering::Relaxed) {
+                if daemon::running(&data).unwrap().is_none() {
+                    free += 1;
+                }
+                thread::sleep(Duration::from_millis(10));
+            }
+            free
+        });
+        Self {
+            stop,
+            thread: Some(thread),
+        }
+    }
+
+    /// How many looks found the lock free.
+    fn free(mut self) -> u32 {
+        self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        self.thread.take().unwrap().join().unwrap()
+    }
+}
+
+/// The commit `commit` repeated, as the bench's sidecar names it.
+fn commit(commit: char) -> Option<String> {
+    Some(commit.to_string().repeat(40))
+}
+
+/// OWL-616 (architecture section 5, "An upgrade", "Without a command"): a
+/// binary replaced at the daemon's path by the same build, then by a file
+/// that does not answer `--version`, is told once each and changes nothing;
+/// a newer one whose daemon fails at its start leaves this daemon serving,
+/// its record back and its watch started again; a newer one during whose
+/// drain a stop is asked ends the daemon with 0 and no successor.
+#[test]
+fn a_replaced_binary_not_newer_failing_or_stopped_leaves_the_daemon_as_it_was() {
+    let mut bench = Bench::new();
+    bench.serve(WEB);
+    let data = bench.data();
+    bench.install_binary('a', 1_761_600_000);
+    bench.start();
+    let (first, _) = bench.running(WEB);
+    let pid = bench.daemon_pid();
+
+    bench.replace('a', 1_761_600_000);
+    bench.wait_for("the same build told", || {
+        bench.output().contains("which does not supersede")
+    });
+    bench.replace_with_failing_script();
+    bench.wait_for("the failing file told", || {
+        bench.output().contains("did not tell its version")
+    });
+    assert!(requests::drain_asked(&data).is_none(), "{}", bench.output());
+    assert!(alive(first), "{}", bench.output());
+
+    let bench_dir = data.join("bench");
+    fs::write(bench_dir.join("successor-fails"), "").unwrap();
+    bench.replace('b', 1_761_600_600);
+    bench.wait_for("the successor to fail", || {
+        bench.output().contains("without taking over")
+    });
+    bench.wait_for("the daemon recorded again", || {
+        bench.record().is_some_and(|record| record.pid == pid)
+    });
+    bench.wait_for("a new watch of the project", || {
+        bench
+            .watches(WEB)
+            .iter()
+            .any(|(watch, _)| *watch != first && alive(*watch))
+    });
+    fs::remove_file(bench_dir.join("successor-fails")).unwrap();
+
+    let linger = bench.bench_dir(WEB).join("linger");
+    fs::write(&linger, "").unwrap();
+    bench.replace('c', 1_761_601_200);
+    bench.wait_for("the watch to hold its drain", || {
+        bench.output().contains("drains, its step under way")
+    });
+    requests::ask_stop(
+        &data,
+        &Request::new(BY_STOP, Timestamp::now(), "asked by the test"),
+    )
+    .unwrap();
+    fs::remove_file(&linger).unwrap();
+    let status = bench.ended();
+    assert!(status.success(), "{status}\n{}", bench.output());
+    assert!(daemon::running(&data).unwrap().is_none());
+    let output = bench.output();
+    // Each file asked once, though many passes went by; one handover tried.
+    assert_eq!(
+        output.matches("which does not supersede").count(),
+        1,
+        "{output}"
+    );
+    assert_eq!(
+        output.matches("did not tell its version").count(),
+        1,
+        "{output}"
+    );
+    assert_eq!(output.matches("Handing the lock").count(), 1, "{output}");
+    assert!(output.contains("A stop was asked during the upgrade's drain"));
+}
+
+/// OWL-616's acceptance without a service: a newer binary renamed over the
+/// one the daemon was started from, while a step is under way, drains the
+/// daemon, the step finishing; the daemon then hands its lock to that
+/// binary's daemon, the lock never free, and ends 0; the new daemon records
+/// the new build and serves the project. A signal asked of a daemon while
+/// its successor starts is sent on, and both end.
+#[test]
+fn a_session_daemon_moves_onto_a_newer_binary_with_no_gap() {
+    let mut bench = Bench::new();
+    bench.serve(WEB);
+    let data = bench.data();
+    let path = bench.install_binary('a', 1_761_600_000);
+    bench.start();
+    let (watch, step) = bench.running(WEB);
+    let first = bench.daemon_pid();
+    let linger = bench.bench_dir(WEB).join("linger");
+    fs::write(&linger, "").unwrap();
+    let prober = Prober::start(&data);
+
+    bench.replace('b', 1_761_600_600);
+    bench.wait_for("the watch to hold its drain", || {
+        bench.output().contains("drains, its step under way")
+    });
+    assert!(
+        alive(step),
+        "the step under way is not cut\n{}",
+        bench.output()
+    );
+    fs::remove_file(&linger).unwrap();
+    let status = bench.ended();
+    assert!(status.success(), "{status}\n{}", bench.output());
+    let mut moved = None;
+    bench.wait_for("the new daemon's record", || {
+        moved = bench.record().filter(|record| record.pid != first);
+        moved.is_some()
+    });
+    assert_eq!(prober.free(), 0, "the lock was free\n{}", bench.output());
+    let moved = moved.unwrap();
+    assert_eq!(
+        moved.build.as_ref().and_then(|build| build.commit.clone()),
+        commit('b')
+    );
+    assert_eq!(moved.watches, Some(path.display().to_string()));
+    bench.wait_for("the new daemon's watch", || {
+        bench
+            .watches(WEB)
+            .iter()
+            .any(|(pid, _)| *pid != watch && alive(*pid))
+    });
+
+    fs::write(data.join("bench/successor-waits"), "").unwrap();
+    bench.replace('c', 1_761_601_200);
+    bench.wait_for("the second handover to start", || {
+        bench.output().matches("Handing the lock").count() == 2
+    });
+    bench.signal("TERM", moved.pid);
+    bench.wait_for("both daemons to end", || {
+        !alive(moved.pid) && daemon::running(&data).unwrap().is_none()
+    });
+    assert!(
+        bench.output().contains("sent on to the new daemon"),
+        "{}",
+        bench.output()
+    );
+}
+
+/// OWL-616's acceptance with a service: the daemon its launcher started
+/// drains for a newer binary renamed over its own, the step under way
+/// finishing, and exits 75; the launcher, started again as the manager does,
+/// runs the new build.
+#[test]
+fn a_service_daemon_drains_then_exits_75_and_its_launcher_starts_the_new_binary() {
+    let mut bench = Bench::new();
+    bench.serve(WEB);
+    let data = bench.data();
+    let path = bench.install_binary('a', 1_761_600_000);
+    let layout = Layout {
+        kind: Kind::Systemd,
+        dir: bench.tmp.path().join("units"),
+    };
+    install::install(&Install {
+        data: &data,
+        layout: &layout,
+        binary: &path,
+        config_dir: None,
+        path: None,
+    })
+    .unwrap();
+    bench.launcher = Some(layout.launcher());
+    bench.start();
+    let (_, step) = bench.running(WEB);
+    let linger = bench.bench_dir(WEB).join("linger");
+    fs::write(&linger, "").unwrap();
+
+    bench.replace('b', 1_761_600_600);
+    bench.wait_for("the watch to hold its drain", || {
+        bench.output().contains("drains, its step under way")
+    });
+    assert!(
+        alive(step),
+        "the step under way is not cut\n{}",
+        bench.output()
+    );
+    fs::remove_file(&linger).unwrap();
+    let status = bench.ended();
+    assert_eq!(status.code(), Some(75), "{status}\n{}", bench.output());
+    assert!(
+        !bench.output().contains("Handing the lock"),
+        "{}",
+        bench.output()
+    );
+
+    bench.start();
+    bench.wait_for("the new build's record", || {
+        bench
+            .record()
+            .is_some_and(|record| record.build.and_then(|build| build.commit) == commit('b'))
+    });
+    bench.running(WEB);
+    requests::ask_stop(
+        &data,
+        &Request::new(BY_STOP, Timestamp::now(), "asked by the test"),
+    )
+    .unwrap();
+    let status = bench.ended();
+    assert!(status.success(), "{status}\n{}", bench.output());
 }
 
 /// A port of 127.0.0.1 free now.

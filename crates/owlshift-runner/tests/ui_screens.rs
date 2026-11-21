@@ -220,6 +220,7 @@ fn daemon_record(since: Timestamp) -> DaemonRecord {
         binary: "/bin/owlshift".to_owned(),
         since,
         build: None,
+        watches: None,
     }
 }
 

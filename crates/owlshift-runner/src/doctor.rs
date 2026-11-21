@@ -3040,7 +3040,14 @@ fn builds_check(
             current.push(who);
             continue;
         }
-        let todo = what_to_do(process, mine, running.drain.is_some(), behind, home);
+        let todo = what_to_do(
+            process,
+            mine,
+            running.drain.is_some(),
+            running.moves_itself,
+            behind,
+            home,
+        );
         problems.push(format!("{who} {}: {todo}", reasons.join(", ")));
     }
     if problems.is_empty() {
@@ -3093,12 +3100,14 @@ fn who_runs(process: &Running) -> String {
 /// What to do about `process`, a daemon or a watch not on this binary
 /// `mine`'s build: rebuild first when it is `behind` its source; restart it
 /// (a typed watch in its terminal, the daemon and its watches by `owlshift
-/// stop` then `start`), unless its upgrade's drain is `draining` it; and
-/// when it runs a newer build than this binary, this binary is the stale one.
+/// stop` then `start`), unless its upgrade's drain is `draining` it or the
+/// daemon `moves_itself` onto this binary (OWL-616); and when it runs a
+/// newer build than this binary, this binary is the stale one.
 fn what_to_do(
     process: &Running,
     mine: Binary<'_>,
     draining: bool,
+    moves_itself: bool,
     behind: Option<&Behind>,
     home: Option<&Path>,
 ) -> String {
@@ -3111,14 +3120,18 @@ fn what_to_do(
                 this one"
             .to_owned();
     }
-    let restart = match (&process.project, process.served, draining) {
-        (Some(_), false, _) => {
+    let restart = match (&process.project, process.served, draining, moves_itself) {
+        (Some(_), false, _, _) => {
             "stop it in its terminal (a first Ctrl-C ends it once its steps under way finish) and \
              start it again"
         }
-        (_, _, true) => {
-            "let the upgrade's drain asked of the daemon end: the service at login starts it \
-             again once its steps under way finish"
+        (_, _, true, _) => {
+            "let the upgrade's drain asked of the daemon end: the daemon comes back on the new \
+             binary once its steps under way finish"
+        }
+        (_, _, _, true) => {
+            "the daemon moves onto this binary by itself at its next pass, within a minute, once \
+             its steps under way finish (its log says so if it does not)"
         }
         _ => "run `owlshift stop`, then `owlshift start`",
     };
@@ -6153,6 +6166,7 @@ states = { ready = "Todo", working = "Doing", needs_input = "Asked", review = "R
                 binary: "/opt/homebrew/bin/owlshift".to_owned(),
                 since: "2026-10-25T08:00:00Z".parse().unwrap(),
                 build: None,
+                watches: None,
             }))),
             ..nothing.clone()
         };
@@ -6288,6 +6302,7 @@ states = { ready = "Todo", working = "Doing", needs_input = "Asked", review = "R
         let check = builds_line(RunningBuilds {
             processes: vec![daemon.clone(), older, replaced],
             drain: None,
+            moves_itself: false,
         })
         .unwrap();
         assert_eq!(check.status, Status::Warn, "{check:?}");
@@ -6316,6 +6331,7 @@ states = { ready = "Todo", working = "Doing", needs_input = "Asked", review = "R
         let matching = builds_line(RunningBuilds {
             processes: vec![daemon],
             drain: None,
+            moves_itself: false,
         })
         .unwrap();
         assert_eq!(matching.status, Status::Ok, "{matching:?}");
@@ -6330,6 +6346,7 @@ states = { ready = "Todo", working = "Doing", needs_input = "Asked", review = "R
         let unknown = builds_line(RunningBuilds {
             processes: vec![process(None, false, 10, None)],
             drain: None,
+            moves_itself: false,
         })
         .unwrap();
         assert_eq!(unknown.status, Status::Warn);
@@ -6345,6 +6362,7 @@ states = { ready = "Todo", working = "Doing", needs_input = "Asked", review = "R
                 jiff::Timestamp::now(),
                 "an upgrade",
             )),
+            moves_itself: true,
         })
         .unwrap();
         assert!(
@@ -6353,6 +6371,25 @@ states = { ready = "Todo", working = "Doing", needs_input = "Asked", review = "R
                 .unwrap()
                 .contains("let the upgrade's drain asked of the daemon end"),
         );
+        // OWL-616: a daemon that watches this binary moves by itself, its
+        // served watches with it: nothing to type.
+        let moving = builds_line(RunningBuilds {
+            processes: vec![
+                process(None, false, 10, Some(built('c', false, -5))),
+                process(Some("acme/web"), true, 77, Some(built('c', false, -5))),
+            ],
+            drain: None,
+            moves_itself: true,
+        })
+        .unwrap();
+        let why = moving.why.unwrap();
+        assert_eq!(
+            why.matches("the daemon moves onto this binary by itself")
+                .count(),
+            2,
+            "{why}"
+        );
+        assert!(!why.contains("`owlshift stop`"), "{why}");
 
         let newer = builds_line(RunningBuilds {
             processes: vec![process(
@@ -6362,6 +6399,7 @@ states = { ready = "Todo", working = "Doing", needs_input = "Asked", review = "R
                 Some(built('d', false, 9)),
             )],
             drain: None,
+            moves_itself: false,
         })
         .unwrap();
         assert!(newer.why.unwrap().contains("this binary is the older one"));
@@ -6386,6 +6424,7 @@ states = { ready = "Todo", working = "Doing", needs_input = "Asked", review = "R
                 process(Some("acme/web"), true, 77, Some(from_tree.clone())),
             ],
             drain: None,
+            moves_itself: false,
         };
         let head = format!("git rev-list --count {}..origin/HEAD", "a".repeat(40));
         let main = format!("git rev-list --count {}..origin/main", "a".repeat(40));

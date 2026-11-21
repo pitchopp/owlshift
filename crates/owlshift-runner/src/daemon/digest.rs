@@ -891,6 +891,7 @@ mod tests {
             },
             digest: Some(settings()),
             ui: None,
+            binary: None,
         };
         let stop = data.to_owned();
         let asker = std::thread::spawn(move || {

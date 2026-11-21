@@ -46,6 +46,17 @@
 //! standard error. With `OWLSHIFT_BENCH_UI=real` (OWL-472) it serves the real
 //! UI instead, `owlshift_runner::ui::server::serve`, on a scripted host and the
 //! personal file `<data>/bench-personal.toml`.
+//!
+//! Without a command (OWL-616): the daemon watches the file it was started
+//! from and moves onto a newer build there, as `owlshift daemon` does. Its
+//! build is read from `<this binary>.build` (`<commit> <seconds>`) when that
+//! file stands, before the variables above, so a test replaces "the binary"
+//! with a copy beside another build; `owlshift-daemon-bench --version` says
+//! it as the `owlshift` binary does. `owlshift-daemon-bench daemon
+//! --lock-fd <n>` takes over the lock a daemon handed it; while
+//! `<data>/bench/successor-fails` stands it ends at once with 1, saying so,
+//! and while `<data>/bench/successor-waits` stands it waits for its removal
+//! before it takes the lock, a signal ending it with 0.
 
 use std::fs;
 use std::io::Write as _;
@@ -72,13 +83,25 @@ use owlshift_runner::watch::stop::CHECKED_STOP_BOUND;
 use owlshift_testkit::step_child::{self, ChildProject, FileNotifier};
 
 fn main() -> ExitCode {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    if args.as_slice() == ["--version"] {
+        // As `owlshift --version` prints it (OWL-616).
+        let (version, build) = own_build();
+        println!("owlshift-daemon-bench {version}");
+        if let Some(build) = build {
+            println!("build: {build}");
+        }
+        return ExitCode::SUCCESS;
+    }
     process::stop_trees_on_signal().expect("the signal policy");
     #[cfg(unix)]
     process::stop_trees_when_killed().expect("the sentinel");
-    let args: Vec<String> = std::env::args().skip(1).collect();
     let data = PathBuf::from(std::env::var_os("OWLSHIFT_DATA_DIR").expect("OWLSHIFT_DATA_DIR"));
     match args.as_slice() {
-        [command] if command == "daemon" => run_daemon(&data),
+        [command] if command == "daemon" => run_daemon(&data, None),
+        [command, flag, fd] if command == "daemon" && flag == "--lock-fd" => {
+            run_daemon(&data, Some(fd.parse().unwrap()))
+        }
         [command, repo] if command == "watch" => run_watch(&data, &Repo::parse(repo).unwrap()),
         [command, repo] if command == "drain" => run_drain(&data, repo),
         [command, flag, listener, secret_flag, secret]
@@ -88,17 +111,59 @@ fn main() -> ExitCode {
         }
         _ => {
             eprintln!(
-                "usage: owlshift-daemon-bench daemon | watch <OWNER/REPO> | drain <OWNER/REPO> | \
-                 ui --listener-fd <N> --run-secret-fd <M>"
+                "usage: owlshift-daemon-bench --version | daemon [--lock-fd <N>] | watch \
+                 <OWNER/REPO> | drain <OWNER/REPO> | ui --listener-fd <N> --run-secret-fd <M>"
             );
             ExitCode::from(2)
         }
     }
 }
 
-fn run_daemon(data: &Path) -> ExitCode {
+/// This binary's version and build: from `<this binary>.build` when it
+/// stands, else from `OWLSHIFT_BENCH_COMMIT` and `OWLSHIFT_BENCH_BUILT_AT`,
+/// else version "bench" with no build (OWL-462, OWL-616).
+fn own_build() -> (String, Option<BuildIdentity>) {
+    let exe = std::env::current_exe().unwrap();
+    let mut sidecar = exe.into_os_string();
+    sidecar.push(".build");
+    let named = fs::read_to_string(&sidecar)
+        .ok()
+        .and_then(|text| {
+            let (commit, built_at) = text.trim().split_once(' ')?;
+            Some((commit.to_owned(), built_at.to_owned()))
+        })
+        .or_else(|| {
+            let commit = std::env::var("OWLSHIFT_BENCH_COMMIT").ok()?;
+            let built_at =
+                std::env::var("OWLSHIFT_BENCH_BUILT_AT").expect("OWLSHIFT_BENCH_BUILT_AT");
+            Some((commit, built_at))
+        });
+    match named {
+        Some((commit, built_at)) => (
+            OWLSHIFT_VERSION.to_owned(),
+            Some(BuildIdentity::from_build(&commit, "0", &built_at, "")),
+        ),
+        None => ("bench".to_owned(), None),
+    }
+}
+
+fn run_daemon(data: &Path, lock_fd: Option<i32>) -> ExitCode {
     // As `owlshift daemon`: no bound of its own, its watches' applying.
     process::stop_by_degrees(None).expect("the stop by degrees");
+    if lock_fd.is_some() {
+        let bench = data.join("bench");
+        if bench.join("successor-fails").exists() {
+            eprintln!("owlshift: the bench's successor fails at its start, as asked");
+            return ExitCode::FAILURE;
+        }
+        while bench.join("successor-waits").exists() {
+            if process::asked().is_some() {
+                println!("The bench's successor was asked to stop as it waited: it ends.");
+                return ExitCode::SUCCESS;
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
+    }
     let ms: Vec<u64> = std::env::var("OWLSHIFT_BENCH_TIMING")
         .expect("OWLSHIFT_BENCH_TIMING")
         .split(',')
@@ -120,32 +185,34 @@ fn run_daemon(data: &Path) -> ExitCode {
     let exe = std::env::current_exe().unwrap();
     // A build of its own when the test names one (OWL-462): this binary's
     // version, with the commit and build time it gives.
-    let build = std::env::var("OWLSHIFT_BENCH_COMMIT").ok().map(|commit| {
-        let built_at = std::env::var("OWLSHIFT_BENCH_BUILT_AT").expect("OWLSHIFT_BENCH_BUILT_AT");
-        BuildIdentity::from_build(&commit, "0", &built_at, "")
-    });
+    let (version, build) = own_build();
+    // The file it was started from, watched as `owlshift daemon` watches
+    // its own (OWL-616).
+    let watched = daemon::WatchedBinary::at_start(exe.clone(), version.clone(), build.clone());
     let record = DaemonRecord {
         format: Format,
         pid: std::process::id(),
-        version: if build.is_some() {
-            OWLSHIFT_VERSION.to_owned()
-        } else {
-            "bench".to_owned()
-        },
+        version,
         binary: exe.display().to_string(),
         since: Timestamp::now(),
         build,
+        watches: Some(exe.display().to_string()),
     };
-    let instance = match daemon::instance::take(data, &record).unwrap() {
-        Ok(instance) => instance,
-        Err(Held(holder)) => {
+    let locked = match daemon::instance::lock_or_adopt(data, lock_fd) {
+        Ok(Ok(locked)) => locked,
+        Ok(Err(Held(holder))) => {
             eprintln!(
                 "a daemon already runs (pid {:?})",
                 holder.map(|record| record.pid)
             );
             return ExitCode::FAILURE;
         }
+        Err(error) => {
+            eprintln!("owlshift: the daemon's lock: {error}");
+            return ExitCode::FAILURE;
+        }
     };
+    let instance = locked.publish(data, &record).unwrap();
     let notes = FileNotifier(PathBuf::from(
         std::env::var_os("OWLSHIFT_BENCH_NOTES").expect("OWLSHIFT_BENCH_NOTES"),
     ));
@@ -172,14 +239,12 @@ fn run_daemon(data: &Path) -> ExitCode {
         timing,
         digest: None,
         ui: ui_port.map(|port| UiLaunch { port, command: &ui }),
+        binary: Some(&watched),
     };
-    let ended = daemon.run(&mut std::io::stdout());
+    let ended = daemon.serve(&instance, &record, &mut std::io::stdout());
     drop(instance);
     // As `owlshift daemon`.
-    match ended {
-        daemon::Ended::Stopped => ExitCode::SUCCESS,
-        daemon::Ended::Upgraded => ExitCode::from(daemon::UPGRADE_EXIT),
-    }
+    ExitCode::from(ended.exit_code())
 }
 
 /// The real watch of the project `OWLSHIFT_BENCH_PROJECT` names, which must
