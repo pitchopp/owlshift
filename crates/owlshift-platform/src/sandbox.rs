@@ -95,6 +95,10 @@ pub enum SandboxError {
     },
     /// A path that cannot be given to the sandbox as is.
     Path(PathBuf),
+    /// A folder the runner would open that it refuses, with why in words
+    /// that name it: a run cache that is or lies under a symbolic link
+    /// (OWL-617).
+    Refused(String),
 }
 
 impl fmt::Display for SandboxError {
@@ -123,6 +127,7 @@ impl fmt::Display for SandboxError {
                 "{} cannot be given to the sandbox: it is not valid UTF-8",
                 path.display()
             ),
+            Self::Refused(why) => f.write_str(why),
         }
     }
 }

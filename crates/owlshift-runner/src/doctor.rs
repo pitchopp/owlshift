@@ -573,6 +573,8 @@ fn sandbox_fix(error: &SandboxError, home: Option<&Path>) -> (String, Vec<Step>)
                 "Move the project to a folder whose path is valid UTF-8",
             )],
         ),
+        // The trial run opens no run cache: kept for the match.
+        SandboxError::Refused(why) => (why.clone(), vec![Step::act("Do what it says")]),
     }
 }
 

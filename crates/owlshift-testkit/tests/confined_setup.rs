@@ -40,6 +40,7 @@ use owlshift_platform::process::find_executable_in;
 use owlshift_runner::agent_env::AgentEnv;
 use owlshift_runner::config::{Effective, FileState};
 use owlshift_runner::executor::{Executor, GateRun, GateSpec, Git, Outcome, RunReport, RunSpec};
+use owlshift_runner::run_caches::RunCaches;
 use owlshift_runner::system::HostSystem;
 use owlshift_testkit::capability;
 use owlshift_testkit::fixture_gate::{FixtureGate, REQUIRE_FIXTURE_TOOLS, fixture_gate};
@@ -567,11 +568,15 @@ fn a_setup_installs_a_missing_package_into_its_run_cache() {
     )
     .unwrap();
     let registry = serve_registry(integrity(&lock), tarball);
-    let store = bench.root().join("run-caches").join("pnpm-store");
+    let root = bench.root().join("run-caches");
+    let store = root.join("pnpm-store");
     let agent = || {
         AgentEnv::new(bench.env.agent_parent())
             .unwrap()
-            .with_run_caches(vec![("npm_config_store_dir".to_owned(), store.clone())])
+            .with_run_caches(RunCaches::new(
+                root.clone(),
+                vec![("npm_config_store_dir".to_owned(), store.clone())],
+            ))
     };
     let online = [format!(
         "pnpm install --frozen-lockfile --registry {registry}"

@@ -50,6 +50,7 @@ use owlshift_platform::process::{Captured, OUTPUT_CAP, find_executable_in, run_c
 use owlshift_platform::sandbox::{self, Policy, SandboxError};
 
 use crate::executor::own_entry;
+use crate::run_caches::RunCaches;
 use crate::system::PROBE_TIMEOUT;
 use crate::ui::token::{ensure_dir, token_dir};
 
@@ -72,7 +73,7 @@ pub struct AgentEnv {
     /// ([`AgentEnv::policy`]), and each variable set on every confined
     /// command alone, never among [`AgentEnv::vars`], which the runner's own
     /// git outside the sandbox gets too (`Git::as_agent`).
-    run_caches: Vec<(String, PathBuf)>,
+    run_caches: RunCaches,
     /// The web UI's token folder, `<data>/service/ui`, hidden from every
     /// command (OWL-467). [`AgentEnv::from_runner`], the constructor every
     /// production run and gate uses, sets it; a production path that built
@@ -144,7 +145,7 @@ impl AgentEnv {
             vars,
             gate_env: declared.iter().map(|name| (*name).to_owned()).collect(),
             caches: Vec::new(),
-            run_caches: Vec::new(),
+            run_caches: RunCaches::default(),
             ui_dir: None,
             confined: true,
         })
@@ -207,14 +208,14 @@ impl AgentEnv {
     /// The same environment, with `run_caches`, each a variable and the
     /// folder of Owlshift's own it names (`stack.run_caches`, OWL-617), as
     /// `crate::run_caches::prepare` made them.
-    pub fn with_run_caches(mut self, run_caches: Vec<(String, PathBuf)>) -> Self {
+    pub fn with_run_caches(mut self, run_caches: RunCaches) -> Self {
         self.run_caches = run_caches;
         self
     }
 
     /// The run caches, each a variable and its folder.
     pub fn run_caches(&self) -> &[(String, PathBuf)] {
-        &self.run_caches
+        self.run_caches.folders()
     }
 
     /// The same environment, with nothing confined: the test bench's way to
@@ -337,7 +338,7 @@ impl AgentEnv {
         writable.extend(run.writable.iter().cloned());
         // The project's run caches (OWL-617): written, but read only where
         // the run writes nothing of its own.
-        for (_, folder) in &self.run_caches {
+        for (_, folder) in self.run_caches.folders() {
             if run.read_only {
                 readable.push(folder.clone());
             } else {
@@ -475,10 +476,10 @@ impl AgentEnv {
     /// a path that exists; a folder that cannot be made refuses the spawn.
     fn sandboxed(&self, inner: Command, run: &RunPaths) -> Result<Command, SandboxError> {
         // A run cache the operator deleted to empty it comes back, empty:
-        // bwrap binds only a folder that exists (OWL-617).
-        for (_, folder) in &self.run_caches {
-            crate::run_caches::make(folder).map_err(|_| SandboxError::Path(folder.clone()))?;
-        }
+        // bwrap binds only a folder that exists; and each is checked again,
+        // so a link planted since the command began is never opened
+        // (OWL-617).
+        self.run_caches.make().map_err(SandboxError::Refused)?;
         if self.confined {
             if let Some(dir) = &self.ui_dir {
                 ensure_dir(dir).map_err(|_| SandboxError::Path(dir.clone()))?;
@@ -496,7 +497,7 @@ impl AgentEnv {
     /// the one inherited.
     fn environment(&self, mut command: Command, run: &RunPaths) -> Command {
         self.apply(&mut command);
-        for (name, folder) in &self.run_caches {
+        for (name, folder) in self.run_caches.folders() {
             command.env(name, folder);
         }
         match &run.temp {
@@ -1437,7 +1438,10 @@ mod tests {
         let agent = AgentEnv::for_project(parent, &[], &[])
             .unwrap()
             .with_caches(&["Library/Caches"])
-            .with_run_caches(vec![("CARGO_HOME".to_owned(), cargo.clone())]);
+            .with_run_caches(RunCaches::new(
+                home.join("Library/Caches/owlshift"),
+                vec![("CARGO_HOME".to_owned(), cargo.clone())],
+            ));
         for read_only in [false, true] {
             let run = RunPaths {
                 workdir: home.join("wt"),

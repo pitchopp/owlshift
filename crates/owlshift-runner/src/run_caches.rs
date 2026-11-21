@@ -26,19 +26,47 @@ pub fn tree(cache_dir: &Path, repo: &Repo) -> PathBuf {
     repo_folder(cache_dir, repo)
 }
 
+/// One project's run caches: the cache directory their tree lies in, and
+/// each variable with its folder there.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct RunCaches {
+    root: PathBuf,
+    folders: Vec<(String, PathBuf)>,
+}
+
+impl RunCaches {
+    /// `folders`, each a variable and its folder under the cache directory
+    /// `root`. Nothing is made or checked: [`RunCaches::make`] does.
+    pub fn new(root: PathBuf, folders: Vec<(String, PathBuf)>) -> Self {
+        Self { root, folders }
+    }
+
+    /// Each variable and its folder.
+    pub fn folders(&self) -> &[(String, PathBuf)] {
+        &self.folders
+    }
+
+    /// Makes every folder as [`make`] does; the first refusal stops.
+    pub fn make(&self) -> Result<(), String> {
+        self.folders
+            .iter()
+            .try_for_each(|(_, folder)| make(&self.root, folder))
+    }
+}
+
 /// Each variable of `entries` (`stack.run_caches`, as declared) with its
 /// folder in `repo`'s tree under `cache_dir`, every folder made. None
 /// declared: nothing made, nothing asked of `cache_dir`. Refused, naming the
 /// path: no cache directory; a tree whose path holds a space, which some
-/// build tools refuse, `OWLSHIFT_CACHE_DIR` moving it; a folder that cannot
-/// be made.
+/// build tools refuse, `OWLSHIFT_CACHE_DIR` moving it; what [`make`]
+/// refuses.
 pub fn prepare(
     cache_dir: Option<&Path>,
     repo: &Repo,
     entries: &[(&str, &str)],
-) -> Result<Vec<(String, PathBuf)>, String> {
+) -> Result<RunCaches, String> {
     if entries.is_empty() {
-        return Ok(Vec::new());
+        return Ok(RunCaches::default());
     }
     let Some(cache_dir) = cache_dir else {
         return Err(
@@ -49,14 +77,13 @@ pub fn prepare(
     };
     let tree = tree(cache_dir, repo);
     check_tree(&tree)?;
-    entries
+    let folders = entries
         .iter()
-        .map(|(name, folder)| {
-            let path = tree.join(folder);
-            make(&path)?;
-            Ok(((*name).to_owned(), path))
-        })
-        .collect()
+        .map(|(name, folder)| ((*name).to_owned(), tree.join(folder)))
+        .collect();
+    let caches = RunCaches::new(cache_dir.to_owned(), folders);
+    caches.make()?;
+    Ok(caches)
 }
 
 /// Refuses a tree whose path holds a space, which some build tools refuse
@@ -84,20 +111,63 @@ pub fn shown_size(bytes: u64) -> String {
     }
 }
 
-/// Makes the run cache folder `folder` and the folders above it; one that
-/// exists already is kept as it is.
-pub fn make(folder: &Path) -> Result<(), String> {
-    match fs::create_dir_all(folder) {
-        Ok(()) => Ok(()),
-        Err(_) if fs::symlink_metadata(folder).is_ok() && !folder.is_dir() => Err(format!(
-            "the run cache {} exists and is not a folder: remove it",
-            folder.display()
-        )),
-        Err(error) => Err(format!(
-            "the run cache {} cannot be made: {error}",
-            folder.display()
-        )),
+/// Makes the run cache `folder`, which lies under the cache directory
+/// `root`, and the folders between them; one that exists already is kept
+/// as it is. The sandbox opens the folder by its real path, read and
+/// written, so it must stay in Owlshift's tree: every part from `root` down
+/// to the folder, the folder included, is checked before and after it is
+/// made, and one that is a symbolic link or not a folder refuses, naming
+/// it; so does a folder whose real path leaves `root`'s. `root` itself is
+/// the operator's (`OWLSHIFT_CACHE_DIR`) and may be a link.
+pub fn make(root: &Path, folder: &Path) -> Result<(), String> {
+    let Ok(below) = folder.strip_prefix(root) else {
+        return Err(format!(
+            "the run cache {} lies outside {}",
+            folder.display(),
+            root.display()
+        ));
+    };
+    check_parts(root, below)?;
+    fs::create_dir_all(folder)
+        .map_err(|error| format!("the run cache {} cannot be made: {error}", folder.display()))?;
+    check_parts(root, below)?;
+    let real = |path: &Path| {
+        fs::canonicalize(path).map_err(|error| format!("{}: {error}", path.display()))
+    };
+    if !real(folder)?.starts_with(real(root)?) {
+        return Err(format!(
+            "the run cache {} leads out of {}: remove it",
+            folder.display(),
+            root.display()
+        ));
     }
+    Ok(())
+}
+
+/// Refuses a part of `below`, from `root` down, that is a symbolic link or
+/// not a folder; the parts not made yet end the walk.
+fn check_parts(root: &Path, below: &Path) -> Result<(), String> {
+    let mut path = root.to_owned();
+    for part in below.components() {
+        path.push(part);
+        let Ok(meta) = fs::symlink_metadata(&path) else {
+            break;
+        };
+        if meta.file_type().is_symlink() {
+            return Err(format!(
+                "the run cache path {} is a symbolic link, and the sandbox would open where it \
+                 leads, read and written: remove it",
+                path.display()
+            ));
+        }
+        if !meta.is_dir() {
+            return Err(format!(
+                "the run cache path {} exists and is not a folder: remove it",
+                path.display()
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// The most entries [`size`] reads before it stops: about a second's walk.
@@ -164,7 +234,7 @@ mod tests {
         let tree = dir.path().join("github.com").join("acme").join("web");
         assert_eq!(tree, super::tree(dir.path(), &repo()));
         assert_eq!(
-            made,
+            made.folders(),
             [
                 ("CARGO_HOME".to_owned(), tree.join("cargo")),
                 ("UV_CACHE_DIR".to_owned(), tree.join("uv")),
@@ -174,7 +244,51 @@ mod tests {
         assert_eq!(prepare(Some(dir.path()), &repo(), &entries).unwrap(), made);
         assert!(tree.join("cargo").join("kept").is_file());
         // Nothing declared asks nothing, a missing cache directory included.
-        assert_eq!(prepare(None, &repo(), &[]).unwrap(), []);
+        assert_eq!(prepare(None, &repo(), &[]).unwrap(), RunCaches::default());
+    }
+
+    /// OWL-617: a run cache that is, or lies under, a symbolic link in the
+    /// tree is refused, before and after the folders are made, so the
+    /// sandbox never opens where it leads; the link's target is left as it
+    /// was. A link inside a cache folder is the run's own and changes
+    /// nothing.
+    #[cfg(unix)]
+    #[test]
+    fn a_planted_link_in_the_tree_is_refused() {
+        use std::os::unix::fs::symlink;
+        let dir = tempfile::tempdir().unwrap();
+        let elsewhere = dir.path().join("elsewhere");
+        fs::create_dir_all(&elsewhere).unwrap();
+        let caches = dir.path().join("caches");
+        let tree = tree(&caches, &repo());
+        let entries = [("CARGO_HOME", "cargo")];
+        for planted in [tree.join("cargo"), tree.clone(), caches.join("github.com")] {
+            let _ = fs::remove_dir_all(&caches);
+            fs::create_dir_all(planted.parent().unwrap()).unwrap();
+            symlink(&elsewhere, &planted).unwrap();
+            let error = prepare(Some(&caches), &repo(), &entries).unwrap_err();
+            assert!(
+                error.contains(&planted.display().to_string()) && error.contains("symbolic link"),
+                "{error}"
+            );
+            assert_eq!(fs::read_dir(&elsewhere).unwrap().count(), 0);
+            // The spawn's own check refuses it too.
+            let made = RunCaches::new(
+                caches.clone(),
+                vec![("CARGO_HOME".into(), tree.join("cargo"))],
+            );
+            assert!(made.make().unwrap_err().contains("symbolic link"));
+        }
+        fs::remove_dir_all(&caches).unwrap();
+        let made = prepare(Some(&caches), &repo(), &entries).unwrap();
+        symlink(&elsewhere, tree.join("cargo").join("inside")).unwrap();
+        assert_eq!(made.make(), Ok(()));
+        // A cache directory that is itself a link is the operator's choice.
+        let linked = dir.path().join("linked");
+        symlink(&caches, &linked).unwrap();
+        assert!(prepare(Some(&linked), &repo(), &entries).is_ok());
+        let outside = RunCaches::new(caches.clone(), vec![("A".into(), elsewhere.clone())]);
+        assert!(outside.make().unwrap_err().contains("lies outside"));
     }
 
     /// OWL-617: a tree on a path holding a space, or no cache directory,
