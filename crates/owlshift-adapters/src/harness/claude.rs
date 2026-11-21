@@ -337,12 +337,13 @@ impl std::error::Error for CommandError {}
 /// allowed, can still reach the network. With network access, a read-only run
 /// allows the web tools in its `--allowedTools` flag, beside its one rule:
 /// `dontAsk` would deny them otherwise. A run that writes the worktree with
-/// network access is offered them and needs no rule (OWL-618). No settings file is read, so nothing
-/// in the worktree grants a permission or runs a hook (`GUARDRAIL_ARGS`), and
-/// no skill, Claude Code's own included, reaches the model (`SKILL_ARGS`).
-/// Messages from the user's other sessions are refused on every launch
-/// (`PEER_INBOX_ARGS`). A run keeps no session unless the request names one
-/// ([`Request::session`]); every flag above holds on a resumed one too.
+/// network access is offered them and needs no rule (OWL-618). No settings
+/// file is read, so nothing in the worktree grants a permission or runs a
+/// hook (`GUARDRAIL_ARGS`), and no skill, Claude Code's own included, reaches
+/// the model (`SKILL_ARGS`). Messages from the user's other sessions are
+/// refused on every launch (`PEER_INBOX_ARGS`). A run keeps no session unless
+/// the request names one ([`Request::session`]); every flag above holds on a
+/// resumed one too.
 pub fn command(program: &Path, request: &Request) -> Result<Command, CommandError> {
     if request.permissions.browser {
         return Err(CommandError::Unsupported("a browser"));
