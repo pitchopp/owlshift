@@ -119,6 +119,7 @@ fn posts_the_delivery_report_on_a_real_ticket() {
         recommended: Vec::new(),
         merge: owlshift_core::vocab::MergeSwitch::Never,
         merge_held: None,
+        person_steps: Vec::new(),
     };
     let writer = Writer::new(&tracker);
     let posted = writer.post_delivery_report(&report).unwrap();

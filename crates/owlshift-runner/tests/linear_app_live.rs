@@ -597,10 +597,7 @@ fn a_plan_document_reaches_linear_through_the_app() {
             approach: approach.to_owned(),
             alternatives: Vec::new(),
             files: Vec::new(),
-            steps: vec![PlanStep {
-                what: "Publish it.".to_owned(),
-                test: "Read it back.".to_owned(),
-            }],
+            steps: vec![PlanStep::agent("Publish it.", "Read it back.")],
             risks: Vec::new(),
             out_of_scope: Vec::new(),
             forks: Vec::new(),
@@ -656,6 +653,7 @@ fn a_plan_document_reaches_linear_through_the_app() {
         change: PlanChange::First,
         forks: 0,
         open: 0,
+        person: Vec::new(),
         next: PlanNext::Build,
         run: None,
     };

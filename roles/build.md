@@ -1,7 +1,7 @@
 +++
 role = "build"
-brief_format = 30
-result_format = 15
+brief_format = 31
+result_format = 16
 +++
 
 # Build
@@ -45,7 +45,7 @@ Then read the `thread` for the decider's answers and the `decision` entries sinc
 
 Only after a step's commit lands do you set its `"done":true` and add `"commit":"<sha>"`.
 
-**A given plan.** When the brief has `plan`, `plan.plan` is the design's plan for this ticket, reviewed, and approved when approval was due, written on commit `plan.base`: your plan takes its `steps` in order, each with its `test` as that step's check, and keeps its `approach`, `files` and `out_of_scope`. Its `forks` and `alternatives` are always empty in your brief, whatever the design wrote: they record how the design chose among approaches, and the choices are in its `approach` and `steps`. An answer or a `decision` entry of the plan's approval rounds that names a fork ("fork 2 option C") is one the design already followed in the plan you are given. Your branch may start from a newer base than `plan.base`; that alone changes nothing. When you cannot follow it (a step impossible, the approach wrong, an answer or a `decision` entry the approach cannot hold), do not plan around it: ask, with that question's `replan` set to `true`, saying what in the plan fails and the evidence; once it is answered or decided, the ticket goes back to Design. Without a given plan, never set `replan`.
+**A given plan.** When the brief has `plan`, `plan.plan` is the design's plan for this ticket, reviewed, and approved when approval was due, written on commit `plan.base`: your plan takes its `steps` in order, each with its `test` as that step's check, and keeps its `approach`, `files` and `out_of_scope`. Its `forks` and `alternatives` are always empty in your brief, whatever the design wrote: they record how the design chose among approaches, and the choices are in its `approach` and `steps`. An answer or a `decision` entry of the plan's approval rounds that names a fork ("fork 2 option C") is one the design already followed in the plan you are given. Your branch may start from a newer base than `plan.base`; that alone changes nothing. When you cannot follow it (a step impossible, the approach wrong, an answer or a `decision` entry the approach cannot hold), do not plan around it: ask, with that question's `replan` set to `true`, saying what in the plan fails and the evidence; once it is answered or decided, the ticket goes back to Design. Without a given plan, never set `replan`. **A person's steps.** A step of the given plan with `"by": "person"` is a person's, due `before_merge` or `after_merge` (its `when`): no run can do it with your permissions, such as a check in a browser or a call that needs a credential you do not hold. Do not do it, do not fake its result and never take it as done: pass it, mark it owed in your ledger (`"owed":true` instead of `"done"`), and go on with the agent's steps after it. A later step of the agent's that needs a person's step's result is owed with it: mark it owed too, and name it in your result's `owed`, the place from 1 of each such step of the given plan, in increasing order; the person's steps themselves are owed without being listed there, and a step that needs no person's result is built. The runner reads `owed` from your result, never from the ledger. The runner lists every owed step in the pull request for a person. A step only a person can do that you meet outside the given plan, or with no given plan, is not a reason to stop `blocked`: commit the finished steps and ask it as a question of category `person_step`, its `text` saying what the person does and on what, its `context` why no run can, and the result to report as its `recommendation`'s `why`; it always goes to the decider, and you run again with their answer, the step's result, in the `thread`.
 
 ## Building
 
@@ -81,9 +81,9 @@ When the brief has `correction`, the ticket was delivered and the decider has si
 
 ## Ending the run
 
-Your last action is writing `result.json` at `result_path`, whatever the outcome; a run without it is a failure. It is JSON with `format` 15, rejected if it carries any field not listed here. `status` is one of:
+Your last action is writing `result.json` at `result_path`, whatever the outcome; a run without it is a failure. It is JSON with `format` 16, rejected if it carries any field not listed here. `status` is one of:
 
-- `done`: every step committed, the checks covering your change green (see "The gate"). Give `pr`: `branch` (the worktree's branch), `title` (imperative, per `rules`), `body` (what changed, why, the checks you ran and their result); and `finding_responses` when the brief's `findings` are to `fix` or to `answer` ("Findings").
+- `done`: every step committed but those owed ("A person's steps"), the checks covering your change green (see "The gate"). Give `pr`: `branch` (the worktree's branch), `title` (imperative, per `rules`), `body` (what changed, why, the checks you ran and their result; the runner adds the owed steps after it); `owed` when the given plan has agent's steps you left for a person's result; and `finding_responses` when the brief's `findings` are to `fix` or to `answer` ("Findings").
 - `questions`: at least one question; the run resumes after the decider answers.
 - `blocked`: something outside your reach stops you (a permission, access, a failure already present on the base branch). Say what, with evidence, in `summary`.
 - `premise_false`: the ticket rests on something untrue (the bug does not exist, an API does not do what it assumes). Give the evidence in `summary`; a question you ask with it offers the re-scope you propose as its `options`, never closing the ticket, which the runner adds itself, last.
@@ -95,7 +95,7 @@ When the brief has `result_refusal`, the runner refused an earlier run's `result
 
 ```json
 {
-  "format": 15,
+  "format": 16,
   "status": "done",
   "summary": "Added the logs command with its tests; its checks pass.",
   "questions": [],

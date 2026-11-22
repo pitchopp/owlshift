@@ -105,9 +105,93 @@ pub struct Alternative {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct PlanStep {
+    /// What the step does; for a person's step, what the person does and on
+    /// what.
     pub what: String,
-    /// The test that shows the step done.
+    /// The test that shows the step done; for a person's step, the result
+    /// the person reports.
     pub test: String,
+    /// Who does the step (format 2 of `plan.json`, OWL-619): the agent when
+    /// absent, which an agent's step never writes, so a plan of agent steps
+    /// alone keeps the text, and every hash, it had before.
+    #[serde(default, skip_serializing_if = "StepBy::is_agent")]
+    pub by: StepBy,
+    /// For a person's step, and only for one: whether its result is due
+    /// before the merge or acts on what the merge deploys.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub when: Option<StepWhen>,
+}
+
+impl PlanStep {
+    /// An agent's step.
+    pub fn agent(what: impl Into<String>, test: impl Into<String>) -> Self {
+        Self {
+            what: what.into(),
+            test: test.into(),
+            by: StepBy::Agent,
+            when: None,
+        }
+    }
+
+    /// A person's step, due `when`.
+    pub fn person(what: impl Into<String>, test: impl Into<String>, when: StepWhen) -> Self {
+        Self {
+            what: what.into(),
+            test: test.into(),
+            by: StepBy::Person,
+            when: Some(when),
+        }
+    }
+
+    /// Whether the step is a person's (architecture section 4, "A person's
+    /// steps").
+    pub fn is_person(&self) -> bool {
+        self.by == StepBy::Person
+    }
+}
+
+/// Who does a step of the plan (OWL-619, architecture section 4, "A
+/// person's steps").
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum StepBy {
+    /// A run does it: the Build.
+    #[default]
+    Agent,
+    /// Only a person can: no run can do it with the permissions a Build's
+    /// brief gives, such as a check in a browser, a call that needs a
+    /// credential no run holds, or an operation on a deployed environment.
+    Person,
+}
+
+impl StepBy {
+    /// Whether it is [`StepBy::Agent`], which `plan.json` leaves out.
+    pub fn is_agent(&self) -> bool {
+        *self == Self::Agent
+    }
+}
+
+/// When a person's step is due (OWL-619).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum StepWhen {
+    /// Its result says whether the change is right: merge on green waits
+    /// for it.
+    BeforeMerge,
+    /// It acts on what the merge deploys: it holds nothing.
+    AfterMerge,
+}
+
+/// A step a ticket owes a person, or that waits on such a step's result
+/// ([`TicketPlan::owed_steps`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OwedStep {
+    /// Its place in the plan, from 1.
+    pub number: NonZeroU32,
+    pub step: PlanStep,
+    /// A person's step's own; an agent's step that waits on one takes that
+    /// of the nearest person's step before it.
+    pub when: StepWhen,
 }
 
 /// A fork of the plan: its choice, the options it chose among, and why.
@@ -161,6 +245,7 @@ impl Plan {
         if let Some(n) = self.forks.iter().position(|f| f.options.is_empty()) {
             return invalid(format!("fork {} of the plan names no option", n + 1));
         }
+        self.check_people(contract)?;
         let texts = [("goal", &self.goal), ("approach", &self.approach)]
             .into_iter()
             .map(|(field, text)| (field.to_owned(), text))
@@ -202,6 +287,65 @@ impl Plan {
         }
         Ok(())
     }
+
+    /// The rules of a person's steps (OWL-619): a person's step says when
+    /// it is due and an agent's step does not; no step due before the merge
+    /// follows one due after it; and, until a ticket a person does whole is
+    /// handed back (OWL-619's third part), a step at least is the agent's.
+    fn check_people(&self, contract: &'static str) -> Result<(), ContractError> {
+        let invalid = |reason: String| Err(ContractError::invalid(contract, reason));
+        let mut after_merge = None;
+        for (n, step) in self.steps.iter().enumerate() {
+            match (step.by, step.when) {
+                (StepBy::Person, None) => {
+                    return invalid(format!(
+                        "steps[{n}] is a person's but says no `when`: before_merge or \
+                         after_merge"
+                    ));
+                }
+                (StepBy::Agent, Some(_)) => {
+                    return invalid(format!(
+                        "steps[{n}] is the agent's but says a `when`, which only a person's \
+                         step says"
+                    ));
+                }
+                (StepBy::Person, Some(StepWhen::AfterMerge)) => {
+                    after_merge = after_merge.or(Some(n))
+                }
+                (StepBy::Person, Some(StepWhen::BeforeMerge)) => {
+                    if let Some(earlier) = after_merge {
+                        return invalid(format!(
+                            "steps[{n}] is due before the merge but follows steps[{earlier}], \
+                             due after it"
+                        ));
+                    }
+                }
+                (StepBy::Agent, None) => {}
+            }
+        }
+        if self.steps.iter().all(PlanStep::is_person) {
+            return invalid(
+                "every step of the plan is a person's: a ticket whose work is a person's whole \
+                 is not planned; the design run ends `blocked`, saying so"
+                    .to_owned(),
+            );
+        }
+        Ok(())
+    }
+
+    /// The steps that are a person's, with their place from 1.
+    pub fn person_steps(&self) -> impl Iterator<Item = (NonZeroU32, &PlanStep)> {
+        self.steps
+            .iter()
+            .enumerate()
+            .filter(|(_, step)| step.is_person())
+            .map(|(n, step)| (step_number(n), step))
+    }
+}
+
+/// The place from 1 of the step at index `n`.
+fn step_number(n: usize) -> NonZeroU32 {
+    NonZeroU32::new(u32::try_from(n + 1).unwrap_or(u32::MAX)).unwrap_or(NonZeroU32::MIN)
 }
 
 /// Each text of a list, named by its place.
@@ -461,6 +605,13 @@ pub struct TicketPlan {
     /// PLAN comment updates the same document and says what changed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub published: Option<PublishedPlan>,
+    /// The agent's steps of this plan its Build left because they need a
+    /// person's step's result (format 2, OWL-619): the `owed` of its `done`
+    /// results, gathered over the Build runs of this plan, never fewer. Each
+    /// is a step of the plan, the agent's, after a person's step, in
+    /// increasing order. A new plan starts with none.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub owed: Vec<NonZeroU32>,
 }
 
 /// The plan as last published in the ticket's document (OWL-350,
@@ -531,11 +682,67 @@ pub struct KeptApproval {
 impl TicketPlan {
     const CONTRACT: &str = "ticket plan";
 
-    /// Parses and validates a `plan.json`.
+    /// Parses and validates a `plan.json`. A format-1 one, written before a
+    /// plan could hold a person's step (OWL-619), is read with every step
+    /// the agent's and nothing owed, and refused when it says otherwise; the
+    /// next write gives it the current format.
     pub fn parse(input: &str) -> Result<Self, ContractError> {
-        let plan: Self = format::parse_json(Self::CONTRACT, PLAN_FORMAT, input)?;
+        let plan: Self =
+            match format::parse_json_older(Self::CONTRACT, 1, PLAN_FORMAT, "owed", input) {
+                Some(read) => {
+                    let plan: Self = read?;
+                    if let Some(n) = plan
+                        .plan
+                        .steps
+                        .iter()
+                        .position(|step| step.by != StepBy::Agent || step.when.is_some())
+                    {
+                        return Err(ContractError::invalid(
+                            Self::CONTRACT,
+                            format!("format 1 records no person's step, but steps[{n}] says one"),
+                        ));
+                    }
+                    plan
+                }
+                None => format::parse_json(Self::CONTRACT, PLAN_FORMAT, input)?,
+            };
         plan.validate()?;
         Ok(plan)
+    }
+
+    /// The steps the ticket owes a person, in the plan's order (OWL-619,
+    /// architecture section 4, "A person's steps"): every person's step, and
+    /// every agent's step of [`TicketPlan::owed`], which takes the `when` of
+    /// the nearest person's step before it.
+    pub fn owed_steps(&self) -> Vec<OwedStep> {
+        let mut owed = Vec::new();
+        let mut when = None;
+        for (n, step) in self.plan.steps.iter().enumerate() {
+            let number = step_number(n);
+            if step.is_person() {
+                when = step.when;
+            }
+            let Some(due) = when else {
+                continue;
+            };
+            if step.is_person() || self.owed.contains(&number) {
+                owed.push(OwedStep {
+                    number,
+                    step: step.clone(),
+                    when: due,
+                });
+            }
+        }
+        owed
+    }
+
+    /// How many of [`TicketPlan::owed_steps`] are due before the merge:
+    /// merge on green waits while any is owed (OWL-619).
+    pub fn owed_before_merge(&self) -> usize {
+        self.owed_steps()
+            .iter()
+            .filter(|owed| owed.when == StepWhen::BeforeMerge)
+            .count()
     }
 
     pub fn render(&self) -> String {
@@ -573,8 +780,42 @@ impl TicketPlan {
                 ContractError::invalid(Self::CONTRACT, format!("published: {reason}"))
             })?;
         }
-        Ok(())
+        check_owed(&self.plan, &self.owed)
+            .map_err(|reason| ContractError::invalid(Self::CONTRACT, format!("owed: {reason}")))
     }
+}
+
+/// The rules of the agent's steps a Build owes (OWL-619): each a step of
+/// `plan`, in increasing order, each once, the agent's and after a person's
+/// step, since only a person's step's result can hold it back.
+pub(crate) fn check_owed(plan: &Plan, owed: &[NonZeroU32]) -> Result<(), String> {
+    let first_person = plan.steps.iter().position(PlanStep::is_person);
+    let mut previous: Option<NonZeroU32> = None;
+    for &number in owed {
+        if previous.is_some_and(|p| p >= number) {
+            return Err(format!("step {number} is repeated or out of order"));
+        }
+        previous = Some(number);
+        let index = usize::try_from(number.get() - 1).unwrap_or(usize::MAX);
+        let Some(step) = plan.steps.get(index) else {
+            return Err(format!(
+                "step {number} is not a step of the plan, which has {}",
+                plan.steps.len()
+            ));
+        };
+        if step.is_person() {
+            return Err(format!(
+                "step {number} is a person's, owed already: list only the agent's steps left"
+            ));
+        }
+        if first_person.is_none_or(|first| index < first) {
+            return Err(format!(
+                "step {number} comes before any person's step, so no person's result holds it \
+                 back: build it"
+            ));
+        }
+    }
+    Ok(())
 }
 
 impl PublishedPlan {
@@ -1251,10 +1492,23 @@ mod tests {
         })
     }
 
+    /// A `plan.json` whose plan holds a person's step before the merge, the
+    /// agent's step after it owed, and a person's step after the merge
+    /// (OWL-619).
     fn ticket_plan() -> Value {
+        let mut plan = plan();
+        plan["steps"] = json!([
+            { "what": "S1", "test": "T1" },
+            { "what": "Check it in a browser.", "test": "It shows.", "by": "person",
+              "when": "before_merge" },
+            { "what": "S3", "test": "T3" },
+            { "what": "Check it deployed.", "test": "It serves.", "by": "person",
+              "when": "after_merge" }
+        ]);
         json!({
-            "format": 1,
-            "plan": plan(),
+            "format": 2,
+            "owed": [3],
+            "plan": plan,
             "text_sha256": "a".repeat(64),
             "base": "b".repeat(40),
             "approval": { "comment": "c-1", "plan_sha256": "d".repeat(64) },
@@ -1371,7 +1625,50 @@ mod tests {
                     "plan_sha256",
                 ),
                 (&|d| d["plan"]["extra"] = 1.into(), "unknown field"),
-                (&|d| d["format"] = 2.into(), "upgrade Owlshift"),
+                (&|d| d["format"] = 3.into(), "upgrade Owlshift"),
+                // A person's step, its `when`, and the steps owed (OWL-619).
+                (
+                    &|d| d["plan"]["steps"][1]["by"] = "robot".into(),
+                    "unknown variant",
+                ),
+                (
+                    &|d| d["plan"]["steps"][1]["when"] = Value::Null,
+                    "steps[1] is a person's but says no `when`",
+                ),
+                (
+                    &|d| d["plan"]["steps"][0]["when"] = "after_merge".into(),
+                    "steps[0] is the agent's but says a `when`",
+                ),
+                (
+                    &|d| {
+                        d["plan"]["steps"][1]["when"] = "after_merge".into();
+                        d["plan"]["steps"][3]["when"] = "before_merge".into();
+                    },
+                    "steps[3] is due before the merge but follows steps[1]",
+                ),
+                (
+                    &|d| {
+                        for n in [0, 2] {
+                            d["plan"]["steps"][n]["by"] = "person".into();
+                            d["plan"]["steps"][n]["when"] = "before_merge".into();
+                        }
+                        d["owed"] = json!([]);
+                    },
+                    "every step of the plan is a person's",
+                ),
+                (&|d| d["owed"] = json!([3, 3]), "owed: step 3 is repeated"),
+                (&|d| d["owed"] = json!([5]), "owed: step 5 is not a step"),
+                (&|d| d["owed"] = json!([2]), "owed: step 2 is a person's"),
+                (&|d| d["owed"] = json!([1]), "owed: step 1 comes before"),
+                // Format 1 holds no person's step and owes nothing.
+                (&|d| d["format"] = 1.into(), "format 1 records no owed"),
+                (
+                    &|d| {
+                        d["format"] = 1.into();
+                        d.as_object_mut().unwrap().remove("owed");
+                    },
+                    "format 1 records no person's step, but steps[1] says one",
+                ),
                 (&|d| d["published"]["document"] = "".into(), "is blank"),
                 (
                     &|d| d["published"]["parts"] = json!(["f"]),
@@ -1402,6 +1699,46 @@ mod tests {
                 .unwrap()
                 .render()
                 .contains("published")
+        );
+        // The steps owed: the person's two, and step 3, which takes the
+        // `when` of step 2 before it (OWL-619).
+        let owed: Vec<(u32, StepWhen)> = parsed
+            .owed_steps()
+            .iter()
+            .map(|owed| (owed.number.get(), owed.when))
+            .collect();
+        assert_eq!(
+            owed,
+            [
+                (2, StepWhen::BeforeMerge),
+                (3, StepWhen::BeforeMerge),
+                (4, StepWhen::AfterMerge)
+            ]
+        );
+        assert_eq!(parsed.owed_before_merge(), 2);
+    }
+
+    /// A plan of the agent's steps alone renders as it did before a step
+    /// could be a person's, so every hash over it is unchanged; a format-1
+    /// `plan.json` is read as format 2 and written as such (OWL-619).
+    #[test]
+    fn an_agent_s_step_renders_as_before_and_format_1_is_read() {
+        let mut older = ticket_plan();
+        older["format"] = 1.into();
+        older["plan"] = plan();
+        older.as_object_mut().unwrap().remove("owed");
+        let read = TicketPlan::parse(&older.to_string()).unwrap();
+        assert!(read.owed_steps().is_empty());
+        assert_eq!(read.owed_before_merge(), 0);
+        assert!(read.render().contains("\"format\": 2"), "{}", read.render());
+        assert_eq!(
+            read.plan.part_canonical(PlanPart::Steps),
+            r#"[{"what":"S1","test":"T1"}]"#
+        );
+        let person = PlanStep::person("Check it.", "It shows.", StepWhen::BeforeMerge);
+        assert_eq!(
+            serde_json::to_string(&person).unwrap(),
+            r#"{"what":"Check it.","test":"It shows.","by":"person","when":"before_merge"}"#
         );
     }
 

@@ -1,7 +1,7 @@
 +++
 role = "design_review"
-brief_format = 30
-result_format = 15
+brief_format = 31
+result_format = 16
 +++
 
 # Design review
@@ -26,6 +26,8 @@ Your brief's `permissions.network` says whether you have web tools. When it is `
 
 `plan.plan` is the plan, written on commit `plan.base`: its `goal`, `criteria`, `approach`, `alternatives`, `files`, `steps` (each a `what` and its `test`), `risks`, `out_of_scope` and `forks`. Read the code it names before judging it: a premise you can check, you check.
 
+A step marked `"by": "person"` is a person's, due `before_merge` or `after_merge` (its `when`): the Build passes it, and the pull request lists it for a person. A step is a person's only when no run can do it with the permissions a Build's brief gives: a check in a browser, which no run makes yet; a call that needs a credential no run holds; an operation on a deployed environment. Question the split as you question any step: a person's step a run could do, or that the Build's own tests could check, is a finding, as is a step of the agent's that no run can do, and a person's step whose `when` is wrong (a result that says whether the change is right is due `before_merge`).
+
 `review.mandates` lists what you review for, and you keep to it:
 
 - `critic`: what breaks the work. A premise that does not hold (a file, a function or a behaviour the plan relies on that the repository does not have, or has otherwise); a case left out (an error path, an input, a platform, a concurrent run); a step whose `test` would pass with the step undone; a simpler way that delivers the same.
@@ -49,7 +51,7 @@ A doubt you could not check is a `minor` finding at most, and says so. At most 6
 
 ## Ending the run
 
-Your last action is writing `result.json` at `result_path`, whatever the outcome; a run without it is a failure. When you cannot write it, your last message is that JSON, whole, and nothing after it. It is JSON with `format` 15, rejected if it carries any field not listed here. `status` is one of:
+Your last action is writing `result.json` at `result_path`, whatever the outcome; a run without it is a failure. When you cannot write it, your last message is that JSON, whole, and nothing after it. It is JSON with `format` 16, rejected if it carries any field not listed here. `status` is one of:
 
 - `done`: your `findings`, possibly none.
 - `blocked`: something outside your reach stops you (a file you cannot read). Say what in `summary`.
@@ -61,7 +63,7 @@ You ask no question: a point the plan leaves unclear is a finding, saying what i
 
 ```json
 {
-  "format": 15,
+  "format": 16,
   "status": "done",
   "summary": "Two findings: the oldest-first order is not tested, and a helper is duplicated.",
   "findings": [

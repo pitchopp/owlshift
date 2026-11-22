@@ -12,6 +12,14 @@ use crate::pipeline::Pipeline;
 use crate::state::MAX_RESOLVED_PASSES;
 use crate::vocab::{BasisKind, DelegationLevel, PlanApproval, Role, Variant};
 
+/// The category of a step only a person can do, which a Build met outside
+/// its plan (OWL-619, architecture section 4, "A person's steps"): its
+/// answer is the step's result, so it is always the decider's, at every
+/// delegation level, and never the resolver's. It is not one of the floor's
+/// topics ([`FloorCategory`]): no level hands it over, and merge on green
+/// holds it only until its decider answers.
+pub const PERSON_STEP: &str = "person_step";
+
 /// Who settles a question a role raised.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Route {
@@ -421,16 +429,18 @@ impl GatePolicy {
 
     /// Whether a question of this category always goes to a human at the
     /// project's level: one of the level's categories (the floor's at every
-    /// level), or one the project added. A blank category is neither: it
-    /// reaches the resolver (OWL-342).
+    /// level), [`PERSON_STEP`] at every level, or one the project added. A
+    /// blank category is neither: it reaches the resolver (OWL-342).
     pub fn always_human(&self, category: &str) -> bool {
         if is_human_category(category, self.level()) {
             return true;
         }
         let category = normalize(category);
-        self.always_human
-            .iter()
-            .any(|token| matches_token(&category, token))
+        matches_token(&category, PERSON_STEP)
+            || self
+                .always_human
+                .iter()
+                .any(|token| matches_token(&category, token))
     }
 
     /// Who settles a question of this category, as the asking run filed it:
@@ -717,13 +727,15 @@ mod tests {
             "money",
             "legal_wording",
             "naming",
+            // A person's step met outside the plan (OWL-619).
+            "person_step",
         ];
-        let table: [(L, [Route; 11]); 5] = [
-            (L::None, [H, H, H, H, H, H, H, H, H, H, H]),
-            (L::Facts, [H, H, R, H, H, H, H, H, H, H, R]),
-            (L::Discoverable, [H, H, R, H, H, H, H, H, H, H, R]),
-            (L::Ticket, [H, H, R, H, H, R, R, H, H, H, R]),
-            (L::All, [H, H, R, H, H, R, R, R, R, R, R]),
+        let table: [(L, [Route; 12]); 5] = [
+            (L::None, [H, H, H, H, H, H, H, H, H, H, H, H]),
+            (L::Facts, [H, H, R, H, H, H, H, H, H, H, R, H]),
+            (L::Discoverable, [H, H, R, H, H, H, H, H, H, H, R, H]),
+            (L::Ticket, [H, H, R, H, H, R, R, H, H, H, R, H]),
+            (L::All, [H, H, R, H, H, R, R, R, R, R, R, H]),
         ];
         for (level, routes) in table {
             let policy = at(level);
@@ -796,6 +808,10 @@ mod tests {
             (L::All, "naming", "billing", Ticket, Route::Human),
             (L::All, "naming", "Scope", Ticket, Route::Human),
             (L::All, "naming", "naming", Judgment, Route::Resolver),
+            // A person's step is the decider's, raised or labelled so
+            // (OWL-619).
+            (L::All, "naming", "person_step", Judgment, Route::Human),
+            (L::All, "person_step", "naming", Judgment, Route::Human),
             // The runner's recommendation at the bound (OWL-375), labelled
             // with the asking run's category: `all` alone, a token outside
             // the level's set and the project's additions.

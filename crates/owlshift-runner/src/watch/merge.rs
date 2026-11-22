@@ -185,6 +185,9 @@ impl Watch<'_> {
                 .as_ref()
                 .is_some_and(|exclude| labels.contains(exclude)),
             questions: &questions,
+            // The steps the ticket owes a person before the merge, as the
+            // ref read under the lock keeps its plan (OWL-619).
+            person_steps: merge::person_steps(current.record.plan.as_ref()),
             at_review: stage == tracker.states.review,
             // Read below when it is the condition that decides: the pass's
             // own read (`FOLLOW_QUERY`, whose text fixtures recorded live

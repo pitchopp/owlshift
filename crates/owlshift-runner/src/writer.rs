@@ -79,8 +79,8 @@ use owlshift_contracts::result::{
     Verdict as AnswerVerdict, option_index, option_letter,
 };
 use owlshift_contracts::review::{
-    DroppedReviewer, FindingOutcome, KeptFinding, Mandate, Plan, PlanChange, PlanPart, Reviewer,
-    RulingOutcome, Severity,
+    DroppedReviewer, FindingOutcome, KeptFinding, Mandate, OwedStep, Plan, PlanChange, PlanPart,
+    Reviewer, RulingOutcome, Severity, StepWhen,
 };
 use owlshift_contracts::{BasisKind, DelegationLevel};
 use owlshift_core::floor::{
@@ -143,6 +143,10 @@ pub struct DeliveryReport {
     /// Why merge on green will not merge it, when a question of the ticket
     /// keeps it for a person (OWL-464): `None` under `never`.
     pub merge_held: Option<String>,
+    /// The steps the delivered ticket owes a person, in the plan's order
+    /// (OWL-619): listed in what remains for a human. Empty but for a
+    /// delivery whose plan holds a person's step.
+    pub person_steps: Vec<OwedStep>,
 }
 
 /// Who merges a pull request on a project that opted into merge on green
@@ -837,13 +841,84 @@ fn new_placeholder_follows(word: &str, after: &str) -> bool {
         && !tail.starts_with(char::is_alphanumeric)
 }
 
-/// The body of a pull request the runner opens: the agent's text, the
-/// closing keywords and Linear's non-closing magic words a reference may
-/// follow broken ([`neutralise_closing_keywords`]), then the
+/// The body of a pull request the runner opens: the agent's text, then the
+/// steps its ticket owes a person, `owed`, under "For a person" (OWL-619),
+/// the closing keywords and Linear's non-closing magic words a reference may
+/// follow broken in both ([`neutralise_closing_keywords`]), then the
 /// tracker's closing line ([`with_closing_line`]), the only one that closes
 /// an issue (OWL-556).
-pub(crate) fn pull_request_body(agent: &str, line: Option<String>) -> String {
-    with_closing_line(&neutralise_closing_keywords(agent), line)
+pub(crate) fn pull_request_body(agent: &str, owed: &[OwedStep], line: Option<String>) -> String {
+    let text = match for_a_person(owed) {
+        Some(section) => format!("{}\n\n{section}", agent.trim_end()),
+        None => agent.to_owned(),
+    };
+    with_closing_line(&neutralise_closing_keywords(&text), line)
+}
+
+/// The most characters a step's `what` or `test` takes in a line of
+/// [`owed_line`]: the plan's document keeps it whole.
+const OWED_TEXT_CHARS: usize = 600;
+
+/// When a person's step is due, in words (OWL-619).
+fn when_words(when: StepWhen) -> &'static str {
+    match when {
+        StepWhen::BeforeMerge => "before the merge",
+        StepWhen::AfterMerge => "after the merge",
+    }
+}
+
+/// A plan's person's steps listed apart, by their place and when each is
+/// due (OWL-619): "step 2, before the merge; step 4, after the merge".
+fn person_list(steps: &[(NonZeroU32, StepWhen)]) -> String {
+    steps
+        .iter()
+        .map(|(number, when)| format!("step {number}, {}", when_words(*when)))
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
+/// The person's steps of `plan`, by their place and when each is due.
+pub(crate) fn person_steps_of(plan: &Plan) -> Vec<(NonZeroU32, StepWhen)> {
+    plan.person_steps()
+        .filter_map(|(number, step)| step.when.map(|when| (number, when)))
+        .collect()
+}
+
+/// A step the ticket owes, as the pull request's "For a person" section and
+/// the DELIVERY report list it (OWL-619): a person's step with the result
+/// to report, or an agent's step left for such a result.
+fn owed_line(owed: &OwedStep) -> String {
+    let text = |text: &str| clip(&flatten(text), OWED_TEXT_CHARS);
+    let when = when_words(owed.when);
+    if owed.step.is_person() {
+        format!(
+            "**Step {}, {when}, a person's:** {} Result to report: {}",
+            owed.number,
+            text(&owed.step.what),
+            text(&owed.step.test)
+        )
+    } else {
+        format!(
+            "**Step {}, {when}, left for a person's result:** {}",
+            owed.number,
+            text(&owed.step.what)
+        )
+    }
+}
+
+/// The section [`pull_request_body`] adds to the agent's text when the
+/// ticket owes steps a person does (OWL-619, architecture section 4, "A
+/// person's steps"); `None` when it owes none.
+fn for_a_person(owed: &[OwedStep]) -> Option<String> {
+    if owed.is_empty() {
+        return None;
+    }
+    let lines: Vec<String> = owed.iter().map(owed_line).collect();
+    Some(format!(
+        "## For a person\n\nOwlshift built the agent's steps of the plan. These steps are a \
+         person's, or wait on a person's result:\n\n{}",
+        bullets(&lines)
+    ))
 }
 
 /// A correction a DELIVERY report names (OWL-146, architecture section 5, "A
@@ -945,6 +1020,7 @@ impl DeliveryReport {
                 ),
             );
         }
+        remains.extend(self.person_steps.iter().map(owed_line));
         let checks = self.checks_section(&mut remains);
         for proposed in &self.followups {
             remains.push(proposed.line());
@@ -3008,9 +3084,28 @@ fn plan_sections(plan: &Plan, lettered: bool, next: &mut dyn FnMut() -> String) 
         .steps
         .iter()
         .enumerate()
-        .map(|(n, _)| format!("{}. {} Test: {}", n + 1, next(), next()))
+        .map(|(n, step)| {
+            let (what, test) = (next(), next());
+            match step.when.filter(|_| step.is_person()) {
+                Some(when) => format!(
+                    "{}. **A person's, {}:** {what} Result to report: {test}",
+                    n + 1,
+                    when_words(when)
+                ),
+                None => format!("{}. {what} Test: {test}", n + 1),
+            }
+        })
         .collect();
     sections.push(format!("**Steps.**\n{}", steps.join("\n")));
+    // A person's steps, listed apart (OWL-619).
+    let person = person_steps_of(plan);
+    if !person.is_empty() {
+        sections.push(format!(
+            "**For a person:** {}. The Build does the other steps, and the pull request lists \
+             these.",
+            person_list(&person)
+        ));
+    }
     if plan.forks.is_empty() {
         sections.push("**Forks.** None.".to_owned());
     } else {
@@ -3340,6 +3435,9 @@ pub struct PlanPointer {
     /// The findings the pass left: noted, fixed by the last revision, or
     /// kept against by the design (OWL-377).
     pub open: usize,
+    /// The plan's person's steps, by their place and when each is due,
+    /// listed apart (OWL-619).
+    pub person: Vec<(NonZeroU32, StepWhen)>,
     pub next: PlanNext,
     /// The design run that wrote the plan.
     pub run: Option<String>,
@@ -3369,6 +3467,16 @@ impl PlanPointer {
                 bullets(&change_bullets(parts))
             ),
         };
+        let mut counts = format!(
+            "**Forks:** {}. **Findings open:** {}.",
+            self.forks, self.open
+        );
+        if !self.person.is_empty() {
+            counts.push_str(&format!(
+                " **For a person:** {}.",
+                person_list(&self.person)
+            ));
+        }
         [
             header.render(),
             format!(
@@ -3376,10 +3484,7 @@ impl PlanPointer {
                 self.version, self.pass
             ),
             change,
-            format!(
-                "**Forks:** {}. **Findings open:** {}.",
-                self.forks, self.open
-            ),
+            counts,
             self.next.line().to_owned(),
             plan_footer(&self.ticket, &self.run),
         ]
@@ -5457,7 +5562,82 @@ mod tests {
             recommended: Vec::new(),
             merge: MergeSwitch::Never,
             merge_held: None,
+            person_steps: Vec::new(),
         }
+    }
+
+    /// OWL-619: the steps a ticket owes a person follow the agent's text in
+    /// its pull request's body under "For a person", neutralised with it, the
+    /// tracker's closing line last; the DELIVERY report lists them in what
+    /// remains for a human, and the plan's document marks them and lists
+    /// them apart, as the PLAN comment does.
+    #[test]
+    fn the_steps_owed_a_person_are_listed_where_a_person_reads() {
+        use owlshift_contracts::review::{PlanStep, TicketPlan};
+        let mut plan = plan_of("a person");
+        plan.steps = vec![
+            PlanStep::agent("Add GREETING.md.", "The gate's grep."),
+            PlanStep::person(
+                "Open the page on staging, which fixes #12.",
+                "It greets.",
+                StepWhen::BeforeMerge,
+            ),
+            PlanStep::agent("Record the greeting's screenshot.", "The file is there."),
+        ];
+        let kept = TicketPlan {
+            format: Format,
+            plan: plan.clone(),
+            text_sha256: "0".repeat(64),
+            base: "1".repeat(40),
+            approval: None,
+            published: None,
+            owed: vec![NonZeroU32::new(3).unwrap()],
+        };
+        let owed = kept.owed_steps();
+        let body = pull_request_body("Greets.\n", &owed, Some("Closes #12".to_owned()));
+        assert_eq!(
+            body,
+            "Greets.\n\n## For a person\n\nOwlshift built the agent's steps of the plan. These \
+             steps are a person's, or wait on a person's result:\n\n- **Step 2, before the \
+             merge, a person's:** Open the page on staging, which fi\u{200B}xes #12. Result to \
+             report: It greets.\n- **Step 3, before the merge, left for a person's result:** \
+             Record the greeting's screenshot.\n\nCloses #12"
+        );
+        let mut delivered = report(Ok(set(Mergeable::Mergeable, vec![])));
+        delivered.person_steps = owed;
+        let rendered = delivered.render();
+        assert!(
+            rendered
+                .contains("\n- **Step 2, before the merge, a person's:** Open the page on staging")
+                && rendered
+                    .contains("\n- **Step 3, before the merge, left for a person's result:**"),
+            "{rendered}"
+        );
+        let mut next = plan_texts(&plan, false).into_iter().map(|fit| fit.text);
+        let sections = plan_sections(&plan, false, &mut || next.next().unwrap());
+        let steps = sections
+            .iter()
+            .find(|s| s.starts_with("**Steps.**"))
+            .unwrap();
+        assert!(
+            steps.contains(
+                "\n2. **A person's, before the merge:** Open the page on staging, which fixes \
+                 #12. Result to report: It greets.\n3. Record"
+            ),
+            "{steps}"
+        );
+        assert!(
+            sections.contains(
+                &"**For a person:** step 2, before the merge. The Build does the other steps, \
+                  and the pull request lists these."
+                    .to_owned()
+            ),
+            "{sections:?}"
+        );
+        assert_eq!(
+            person_steps_of(&plan),
+            [(NonZeroU32::new(2).unwrap(), StepWhen::BeforeMerge)]
+        );
     }
 
     /// A rebase run's report says the branch was rebased, onto what, and
@@ -6001,7 +6181,7 @@ Merge state reported by the forge: `CLEAN`.
     #[test]
     fn only_the_runners_closing_line_closes_an_issue() {
         let line = || Some("Closes #12".to_owned());
-        let body = pull_request_body("Fixes #5.\n\nCloses #12\n", line());
+        let body = pull_request_body("Fixes #5.\n\nCloses #12\n", &[], line());
         assert_eq!(
             body,
             "Fi\u{200B}xes #5.\n\nCl\u{200B}oses #12\n\nCloses #12"
@@ -6012,11 +6192,11 @@ Merge state reported by the forge: `CLEAN`.
             .collect();
         assert_eq!(live, ["Closes"]);
         assert!(body.ends_with("\n\nCloses #12"));
-        assert_eq!(pull_request_body("Fixes #5", None), "Fi\u{200B}xes #5");
+        assert_eq!(pull_request_body("Fixes #5", &[], None), "Fi\u{200B}xes #5");
         // A keyword ending the agent's text stays whole: the closing line's
         // own keyword stands between it and the reference.
         assert_eq!(
-            pull_request_body("Says what it fixes", line()),
+            pull_request_body("Says what it fixes", &[], line()),
             "Says what it fixes\n\nCloses #12"
         );
     }
@@ -6107,10 +6287,10 @@ Merge state reported by the forge: `CLEAN`.
                 reason: "Nothing runs it.".to_owned(),
             }],
             files: vec!["GREETING.md".to_owned()],
-            steps: vec![PlanStep {
-                what: "Add GREETING.md.\n- injected".to_owned(),
-                test: "The gate's grep.".to_owned(),
-            }],
+            steps: vec![PlanStep::agent(
+                "Add GREETING.md.\n- injected",
+                "The gate's grep.",
+            )],
             risks: Vec::new(),
             out_of_scope: vec!["Other languages.".to_owned()],
             forks: vec![Fork {
@@ -6470,6 +6650,7 @@ Merge state reported by the forge: `CLEAN`.
             },
             forks: usize::MAX,
             open: usize::MAX,
+            person: Vec::new(),
             next: PlanNext::Approval,
             run: Some("20261019T011425Z-4294967295".to_owned()),
         };
@@ -6499,6 +6680,7 @@ Merge state reported by the forge: `CLEAN`.
                 change,
                 forks: 1,
                 open: 2,
+                person: Vec::new(),
                 next: PlanNext::Approval,
                 run: None,
             }
@@ -9559,6 +9741,7 @@ Reply `Q1: B`, `ok` to take every recommendation, or in your own words.
             labeled: true,
             excluded: false,
             questions: &[],
+            person_steps: 0,
             at_review: true,
             draft: false,
             something_due: false,
@@ -9837,6 +10020,7 @@ Reply `Q1: B`, `ok` to take every recommendation, or in your own words.
                 change: PlanChange::First,
                 forks: 0,
                 open: 0,
+                person: Vec::new(),
                 next: PlanNext::Approval,
                 run: None,
             }))
