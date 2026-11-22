@@ -4075,18 +4075,19 @@ impl OnDemand<'_> {
                         drop_last_fix(p);
                     }
                     let built = self.kept_build(p, &ran.report, &gathered, &comments)?;
+                    // The agent's steps this Build left for a person's
+                    // result, kept with the plan they index, never fewer
+                    // (OWL-619): by the next write, a review loop's that
+                    // commits nothing included.
+                    if let (Some(plan), Some(result)) = (p.plan.as_mut(), ran.result()) {
+                        owe(plan, &result.owed);
+                    }
                     // A review loop's Build that committed nothing ends the
                     // loop, with no Verify pass and no push (OWL-307).
                     if loop_base(p).is_some_and(|pushed| pushed.as_str() == built.commit) {
                         return self
                             .review_unchanged(p, state, questions, built, sink)
                             .map(Built::Delivered);
-                    }
-                    // The agent's steps this Build left for a person's
-                    // result, kept with the plan they index, never fewer
-                    // (OWL-619).
-                    if let (Some(plan), Some(result)) = (p.plan.as_mut(), ran.result()) {
-                        owe(plan, &result.owed);
                     }
                     let review = p.review.get_or_insert_with(TicketReview::new);
                     if let (Some(given), Some(result)) = (&brief.findings, ran.result()) {

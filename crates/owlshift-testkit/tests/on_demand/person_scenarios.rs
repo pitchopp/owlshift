@@ -162,3 +162,42 @@ fn a_person_s_step_met_outside_the_plan_is_asked_of_the_decider() {
         "{round}"
     );
 }
+
+/// A review loop's Build that commits nothing still keeps the agent's steps
+/// it names as owed (OWL-619): the loop ends with no push, and `plan.json`
+/// owes them from that write on.
+#[test]
+fn a_review_loop_build_that_changes_nothing_keeps_what_it_owes() {
+    let bench = Bench::with(
+        "maintainer",
+        "assignee = \"maintainer\"\n",
+        super::review_scenarios::FORGE,
+    );
+    bench.add_labels(&["variant:standard"]);
+    let replies = vec![
+        bench.read(&designed(PERSON_PLAN)),
+        bench.read(&reviewed(&[])),
+        bench.read(&reviewed(&[])),
+        bench.reply(Some("Hello"), Some(DONE)),
+    ];
+    let (outcome, printed) = bench.run(replies, None);
+    outcome.unwrap_or_else(|stop| panic!("{stop}\n{printed}"));
+    assert!(bench.record().plan.unwrap().owed.is_empty());
+    let delivered = bench.remote_branch().unwrap();
+    bench.reviews_on_github(vec![super::review_scenarios::review(
+        7_000_000_001,
+        "ann-dev",
+        "Does it say Hello?",
+        &[],
+    )]);
+    let unchanged = r#"{"format":16,"status":"done","summary":"GREETING.md already says Hello: nothing to change; step 3 waits on step 2.",
+"owed":[3],
+"pr":{"branch":"owlshift/demo-1","title":"Add a greeting","body":"Unchanged."}}"#;
+    let (outcome, printed) = bench.continue_ticket(vec![bench.reply(None, Some(unchanged))]);
+    outcome.unwrap_or_else(|stop| panic!("{stop}\n{printed}"));
+    assert_eq!(bench.remote_branch().unwrap(), delivered, "nothing pushed");
+    assert_eq!(
+        bench.record().plan.unwrap().owed,
+        [NonZeroU32::new(3).unwrap()]
+    );
+}
