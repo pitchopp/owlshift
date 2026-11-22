@@ -931,6 +931,9 @@ struct FakeInbox {
     markdown: bool,
     /// The tickets filed or already there: id, title, description.
     tickets: Vec<(TicketId, String, String)>,
+    /// The account each filing asked to assign its ticket to (OWL-625), by
+    /// the ticket's id.
+    assigned: Vec<(TicketId, Option<String>)>,
     /// Every filing is refused with this.
     refuse: Option<&'static str>,
     /// The filings tried, refused or not: a refusal kept again changes
@@ -1012,6 +1015,9 @@ impl Tracker for Clocked<'_> {
             return Err(tracker::Error::new(tracker::ErrorKind::Other, why));
         }
         let id = TicketId::new(format!("DEMO-{}", 100 + inbox.tickets.len())).unwrap();
+        inbox
+            .assigned
+            .push((id.clone(), proposal.assignee.map(str::to_owned)));
         inbox.tickets.push((
             id.clone(),
             proposal.title.to_owned(),

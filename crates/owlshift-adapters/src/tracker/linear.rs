@@ -1046,6 +1046,24 @@ impl Tracker for LinearTracker {
                 created.state.name, state.name
             )));
         }
+        if let Some(account) = proposal.assignee {
+            let what = format!("the assignment of {id} to {account}");
+            let input = json!({ "id": created.id, "assigneeId": account });
+            match self.write::<AssignData>(ASSIGN_MUTATION, input) {
+                Ok(AssignData {
+                    issue_update:
+                        IssueAssigned {
+                            success: true,
+                            issue:
+                                Some(Assigned {
+                                    assignee: Some(user),
+                                }),
+                        },
+                }) if user.id == account => {}
+                Ok(_) => problems.push(invalid(format!("Linear did not write {what}"))),
+                Err(e) => problems.push(Error::new(e.kind, format!("{what} was not written: {e}"))),
+            }
+        }
         let (kind, issue, related) = if proposal.blocked_by_parent {
             ("blocks", &target.id, &created.id)
         } else {
@@ -1522,6 +1540,11 @@ const DOCUMENT_UPDATE_MUTATION: &str = "mutation UpdateDocument($id: String!, \
 /// A comment resolved, so Linear shows it folded (OWL-353).
 const RESOLVE_MUTATION: &str =
     "mutation Resolve($id: String!) { commentResolve(id: $id) { success } }";
+
+/// A filed proposal's assignee, set once the issue exists (OWL-625): a
+/// refused assignee then costs a problem, not the issue.
+const ASSIGN_MUTATION: &str = "mutation Assign($id: String!, $assigneeId: String!) { \
+    issueUpdate(id: $id, input: { assigneeId: $assigneeId }) { success issue { assignee { id } } } }";
 
 const RELATE_MUTATION: &str = "mutation Relate($input: IssueRelationCreateInput!) { \
     issueRelationCreate(input: $input) { success } }";
@@ -2406,6 +2429,28 @@ struct Created {
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
+struct AssignData {
+    issue_update: IssueAssigned,
+}
+
+#[derive(Deserialize)]
+struct IssueAssigned {
+    success: bool,
+    issue: Option<Assigned>,
+}
+
+#[derive(Deserialize)]
+struct Assigned {
+    assignee: Option<AssignedUser>,
+}
+
+#[derive(Deserialize)]
+struct AssignedUser {
+    id: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct RelateData {
     issue_relation_create: Success,
 }
@@ -2711,6 +2756,7 @@ mod tests {
             description: "Why.\n\n[owlshift] PROPOSAL · OWL-252 · fingerprint 0123456789ab",
             blocked_by_parent,
             ready: "Todo",
+            assignee: None,
         }
     }
 
@@ -2812,6 +2858,49 @@ mod tests {
                 sent[3]["input"],
                 json!({ "type": "related", "issueId": "new-id", "relatedIssueId": "parent-id" })
             );
+        }
+    }
+
+    /// A proposal with an assignee is assigned once the issue exists
+    /// (OWL-625): the issue is created unassigned, then updated with the
+    /// account; an assignment refused, failed or answered for another
+    /// account is a problem of the filed proposal, and the relation is still
+    /// written.
+    #[test]
+    fn a_proposal_with_an_assignee_is_assigned_after_its_creation() {
+        let parent = TicketId::new("OWL-252").unwrap();
+        let assigned = |id: &str| json!({ "issueUpdate": { "success": true, "issue": { "assignee": { "id": id } } } });
+        for (answer, problems) in [
+            (assigned("u-ada"), 0),
+            (assigned("u-other"), 1),
+            (
+                json!({ "issueUpdate": { "success": false, "issue": null } }),
+                1,
+            ),
+            (Value::Null, 1),
+        ] {
+            let key = Scripted::new(vec![
+                ("ProposalTarget", target(true, OWL_TYPED)),
+                ("Propose", created("Triage")),
+                ("Assign", answer),
+                ("Relate", related(true)),
+            ]);
+            let (asked, sent) = (key.asked.clone(), key.sent.clone());
+            let filed = LinearTracker::with_transport(key)
+                .propose(&Proposal {
+                    assignee: Some("u-ada"),
+                    ..proposal(&parent, true)
+                })
+                .unwrap();
+            assert_eq!(filed.id.as_str(), "OWL-266");
+            assert_eq!(filed.problems.len(), problems, "{:?}", filed.problems);
+            assert_eq!(
+                *asked.lock().unwrap(),
+                ["ProposalTarget", "Propose", "Assign", "Relate"]
+            );
+            let sent = sent.lock().unwrap();
+            assert!(sent[1]["input"].get("assigneeId").is_none(), "{sent:?}");
+            assert_eq!(sent[2], json!({ "id": "new-id", "assigneeId": "u-ada" }));
         }
     }
 

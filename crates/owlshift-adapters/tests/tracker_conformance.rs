@@ -574,6 +574,7 @@ fn check_proposals(tracker: &dyn Tracker, case: &ProposalsCase) {
         description: &description,
         blocked_by_parent: true,
         ready: case.ready,
+        assignee: None,
     };
     let team = case.team;
     let none = tracker.proposed(team, TITLE, MARKER).unwrap();
@@ -2291,6 +2292,7 @@ mod github {
                 description: &format!("Why.\n\n[owlshift] PROPOSAL · 29 · {PROPOSAL_MARKER}"),
                 blocked_by_parent: true,
                 ready: "agent:ready",
+                assignee: None,
             })
             .unwrap();
         assert_eq!(filed.state, "agent:proposed");

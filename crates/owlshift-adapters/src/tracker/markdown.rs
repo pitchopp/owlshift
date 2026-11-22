@@ -740,7 +740,10 @@ impl shared::Tracker for MarkdownTracker {
     /// ([`MarkdownTracker::propose`]), refusing first a ready state of that
     /// name, which would put it in the queue without a person. A parent
     /// that is not there is [`ErrorKind::NotFound`]. One file is written,
-    /// so a filing that succeeds has no problem to report.
+    /// so a filing that succeeds has no problem to report. The proposal's
+    /// `assignee` is left out: a Markdown ticket's assignee is a name in its
+    /// front matter that no run reads back as an account of this tracker
+    /// (OWL-625), so the follow-up's text names the decider alone.
     fn propose(&self, proposal: &shared::Proposal<'_>) -> Result<shared::Filed, shared::Error> {
         if proposal.ready == Self::TRIAGE {
             return Err(shared::Error::new(
@@ -1765,6 +1768,7 @@ mod tests {
             description,
             blocked_by_parent,
             ready,
+            assignee: None,
         }
     }
 
@@ -1814,9 +1818,13 @@ mod tests {
             )
         );
 
+        // An assignee is left out: this tracker does not assign (OWL-625).
         let blocked = shared::Tracker::propose(
             &tracker,
-            &proposal(&id(), "Ship \"it\"", "\n\nText.\n", true, "Todo"),
+            &shared::Proposal {
+                assignee: Some("maintainer"),
+                ..proposal(&id(), "Ship \"it\"", "\n\nText.\n", true, "Todo")
+            },
         )
         .unwrap();
         assert_eq!(blocked.id.as_str(), "DEMO-9");

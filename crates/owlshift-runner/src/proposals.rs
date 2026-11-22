@@ -110,11 +110,15 @@ pub fn owe<'a>(
 /// "A person's steps"): one for its decider, listing each step, a person's
 /// and an agent's waiting on one. `None` until `delivery` ended merged, and
 /// for a plan that owes no such step. Its title names the ticket, so it is
-/// never another ticket's duplicate.
+/// never another ticket's duplicate. `decider` is the name of the ticket's
+/// decider when the runner knows it, written in the text; the tracker that
+/// can assign assigns the follow-up to them at the filing (OWL-625,
+/// [`Filing::assignee`]), and this text says so.
 pub fn after_merge(
     parent: &TicketId,
     delivery: &TicketDelivery,
     plan: Option<&TicketPlan>,
+    decider: Option<&str>,
 ) -> Option<Followup> {
     if delivery.ended.as_ref().map(|ended| ended.why) != Some(EndedWhy::Merged) {
         return None;
@@ -147,8 +151,10 @@ pub fn after_merge(
         title: format!("After {parent}'s merge: the steps for a person"),
         why: format!(
             "The plan of {parent} leaves these steps to a person once its change is merged: they \
-             act on what the merge deploys. They are for {parent}'s decider, who does them or \
-             hands them on; Owlshift assigns no one."
+             act on what the merge deploys. They are for {parent}'s decider{named}, who does \
+             them or hands them on; where the tracker can assign, this ticket is assigned to \
+             them.",
+            named = decider.map_or_else(String::new, |name| format!(" ({})", name.trim())),
         ),
         evidence: steps,
         source: FollowupSource::Agent,
@@ -166,10 +172,28 @@ pub fn owes_after_merge(
     plan: Option<&TicketPlan>,
     proposals: Option<&TicketProposals>,
 ) -> bool {
-    after_merge(parent, delivery, plan).is_some_and(|followup| {
+    after_merge(parent, delivery, plan, None).is_some_and(|followup| {
         let fingerprint = fingerprint(&followup.title);
         !proposals.is_some_and(|kept| kept.proposals.iter().any(|p| p.fingerprint == fingerprint))
     })
+}
+
+/// Whether the [`after_merge`] follow-up is still to be filed: owed and not
+/// kept yet, or kept owed after a refused filing, whose retry must assign it
+/// as the first did (OWL-625).
+pub fn unfiled_after_merge(
+    parent: &TicketId,
+    delivery: &TicketDelivery,
+    plan: Option<&TicketPlan>,
+    proposals: Option<&TicketProposals>,
+) -> bool {
+    let Some(followup) = after_merge(parent, delivery, plan, None) else {
+        return false;
+    };
+    let fingerprint = fingerprint(&followup.title);
+    proposals
+        .and_then(|kept| kept.proposals.iter().find(|p| p.fingerprint == fingerprint))
+        .is_none_or(|kept| matches!(kept.outcome, ProposalOutcome::Owed { .. }))
 }
 
 /// `current` with `followup`, proposed by the delivery, owed when it does
@@ -256,6 +280,11 @@ pub struct Filing<'a> {
     /// due after the merge ([`after_merge`], OWL-619): a person's steps the
     /// plan holds, which the three a parent files neither limit nor count.
     pub exempt: Option<String>,
+    /// The ticket's decider, as the tracker names the account, to whom the
+    /// [`exempt`](Self::exempt) follow-up is assigned (OWL-625): it waits on
+    /// them. `None` when the ticket has no decider the tracker knows; every
+    /// other proposal is filed unassigned.
+    pub assignee: Option<&'a str>,
 }
 
 /// Files the proposals `proposals` owes, oldest first, and returns whether
@@ -342,7 +371,8 @@ pub fn file_owed(
             followup: kept.proposal.clone(),
             fingerprint: kept.fingerprint.clone(),
         };
-        match writer.propose(&description, filing.ready, filing.admission_label) {
+        let assignee = filing.assignee.filter(|_| exempt(kept));
+        match writer.propose(&description, filing.ready, filing.admission_label, assignee) {
             Ok(done) => {
                 sink.emit(
                     parent,
@@ -514,6 +544,8 @@ mod tests {
         search: Search,
         file: File,
         filed: RefCell<Vec<String>>,
+        /// The assignee each filing asked for, in the order filed.
+        assigned: RefCell<Vec<Option<String>>>,
     }
 
     impl Inbox {
@@ -526,6 +558,7 @@ mod tests {
                 search: Box::new(search),
                 file: Box::new(file),
                 filed: RefCell::new(vec![]),
+                assigned: RefCell::new(vec![]),
             }
         }
     }
@@ -559,6 +592,9 @@ mod tests {
             self.filed
                 .borrow_mut()
                 .push(proposal.description.to_owned());
+            self.assigned
+                .borrow_mut()
+                .push(proposal.assignee.map(str::to_owned));
             (self.file)(proposal.title)
         }
         fn proposed(
@@ -588,7 +624,7 @@ mod tests {
         admission_label: Option<&str>,
         proposals: &mut TicketProposals,
     ) -> (bool, Vec<Event>) {
-        file_exempting(tracker, admission_label, proposals, None)
+        file_exempting(tracker, admission_label, proposals, None, None)
     }
 
     /// [`file`], the proposal of fingerprint `exempt` outside the three per
@@ -598,6 +634,7 @@ mod tests {
         admission_label: Option<&str>,
         proposals: &mut TicketProposals,
         exempt: Option<String>,
+        assignee: Option<&str>,
     ) -> (bool, Vec<Event>) {
         let dir = tempfile::tempdir().unwrap();
         let log = EventLog::in_dir(dir.path());
@@ -615,6 +652,7 @@ mod tests {
             parent: &parent,
             pull_request: Some(&pull_request),
             exempt,
+            assignee,
         };
         let changed = file_owed(
             &filing,
@@ -661,6 +699,25 @@ mod tests {
         assert_eq!(fingerprint("Cap the retries"), "647f4576ff92");
         assert_eq!(fingerprint("  cap-the RETRIES. "), "647f4576ff92");
         assert_ne!(fingerprint("Cap the retry"), "647f4576ff92");
+    }
+
+    /// Only the follow-up that waits on the decider is assigned (OWL-625):
+    /// an ordinary proposal filed in the same pass carries no assignee,
+    /// whoever the filing names.
+    #[test]
+    fn an_ordinary_proposal_is_filed_without_an_assignee() {
+        let mut proposals = owed(&["Cap it", "Log it"]);
+        let tracker = Inbox::new(|_| Ok(vec![]), |_| filed_as("OWL-40"));
+        let exempt = Some(proposals.proposals[1].fingerprint.clone());
+        let (changed, _) = file_exempting(&tracker, None, &mut proposals, exempt, Some("u-ada"));
+        assert!(changed);
+        assert_eq!(*tracker.assigned.borrow(), [None, Some("u-ada".to_owned())]);
+        // With no decider, nothing is assigned.
+        let mut proposals = owed(&["Cap it"]);
+        let exempt = Some(proposals.proposals[0].fingerprint.clone());
+        let tracker = Inbox::new(|_| Ok(vec![]), |_| filed_as("OWL-41"));
+        file_exempting(&tracker, None, &mut proposals, exempt, None);
+        assert_eq!(*tracker.assigned.borrow(), [None]);
     }
 
     #[test]
@@ -943,10 +1000,12 @@ mod tests {
         };
         let merged = ended(EndedWhy::Merged);
         let followed = TicketDelivery::new("owlshift/owl-7", "main");
-        assert!(after_merge(&parent, &followed, Some(&plan)).is_none());
-        assert!(after_merge(&parent, &ended(EndedWhy::Closed), Some(&plan)).is_none());
-        assert!(after_merge(&parent, &merged, None).is_none());
-        let followup = after_merge(&parent, &merged, Some(&plan)).unwrap();
+        assert!(after_merge(&parent, &followed, Some(&plan), None).is_none());
+        assert!(after_merge(&parent, &ended(EndedWhy::Closed), Some(&plan), None).is_none());
+        assert!(after_merge(&parent, &merged, None, None).is_none());
+        let followup = after_merge(&parent, &merged, Some(&plan), Some("Ada")).unwrap();
+        assert!(followup.why.contains("decider (Ada)"), "{}", followup.why);
+        assert!(!followup.why.contains("assigns no one"), "{}", followup.why);
         assert_eq!(
             followup.title,
             "After OWL-7's merge: the steps for a person"
@@ -971,16 +1030,34 @@ mod tests {
             Some(&plan),
             Some(&proposals)
         ));
+        // Kept owed, as a refused filing leaves it, it is still to be filed
+        // (and so assigned) at the retry; once filed it is not.
+        assert!(unfiled_after_merge(
+            &parent,
+            &merged,
+            Some(&plan),
+            Some(&proposals)
+        ));
+        assert!(unfiled_after_merge(&parent, &merged, Some(&plan), None));
         let tracker = Inbox::new(|_| Ok(vec![]), |_| filed_as("OWL-40"));
         let exempt = Some(fingerprint(&followup.title));
-        let (changed, _) = file_exempting(&tracker, None, &mut proposals, exempt);
+        let (changed, _) = file_exempting(&tracker, None, &mut proposals, exempt, Some("u-ada"));
         assert!(changed);
+        // Only the follow-up that waits on the decider is assigned: the
+        // three owed before it, already filed, are not filed again.
+        assert_eq!(*tracker.assigned.borrow(), [Some("u-ada".to_owned())]);
         assert_eq!(
             outcomes(&proposals)[3],
             ProposalOutcome::Filed {
                 ticket: id("OWL-40")
             }
         );
+        assert!(!unfiled_after_merge(
+            &parent,
+            &merged,
+            Some(&plan),
+            Some(&proposals)
+        ));
         let filed = tracker.filed.borrow();
         assert!(filed[0].contains("Tell the team it is live."), "{filed:?}");
     }

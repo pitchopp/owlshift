@@ -422,8 +422,14 @@ fn the_steps_after_the_merge_are_filed_as_one_follow_up_once_merged() {
     assert_eq!(title, "After DEMO-1's merge: the steps for a person");
     assert!(
         description.contains("Step 2, a person's: Tell the team on staging the greeting is live.")
-            && description.contains("DEMO-1's decider"),
+            && description.contains("DEMO-1's decider (maintainer)"),
         "{description}"
+    );
+    // Waiting on the decider, it is assigned to them: the ticket's assignee
+    // by the account the tracker names it (OWL-625).
+    assert_eq!(
+        inbox.assigned,
+        [(inbox.tickets[0].0.clone(), Some("maintainer".to_owned()))]
     );
     let attempts = inbox.attempts;
     drop(inbox);
