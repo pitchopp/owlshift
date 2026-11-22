@@ -66,7 +66,7 @@ fn brief(role: &str) -> Value {
 }
 
 fn base_result(status: &str) -> Value {
-    json!({ "format": 15, "status": status, "summary": "s" })
+    json!({ "format": 16, "status": status, "summary": "s" })
 }
 
 fn question(replan: bool) -> Value {
@@ -600,7 +600,7 @@ fn brief_quality_pipeline_fields_go_to_their_roles_only() {
         ),
         (
             "a newer brief",
-            with(brief("build"), "format", 31.into()),
+            with(brief("build"), "format", 32.into()),
             "upgrade Owlshift",
         ),
     ] {
@@ -903,7 +903,7 @@ fn a_later_pass_is_told_what_changed_and_the_last_fix_is_kept() {
     let mut build = brief("build");
     build["findings"] = notes.clone();
     let parsed = Brief::parse(&build.to_string()).unwrap();
-    let done = json!({ "format": 15, "status": "done", "summary": "s",
+    let done = json!({ "format": 16, "status": "done", "summary": "s",
         "finding_responses": [{ "finding": "F1", "outcome": "fixed", "reason": "r" }] });
     assert!(
         RunResult::parse_against(&done.to_string(), &parsed).is_err(),
@@ -1165,5 +1165,74 @@ fn findings_and_forge_keys_are_read_and_checked() {
         };
         let error = PersonalConfig::parse(&text).unwrap_err().to_string();
         assert!(error.contains("unknown field"), "{table}: {error}");
+    }
+}
+
+/// OWL-619: a Build's `done` names in `owed` the agent's steps of its given
+/// plan that wait on a person's step's result, and nothing else; a design
+/// run's plan may hold a person's step, with its `when`.
+#[test]
+fn a_build_owes_only_the_agent_s_steps_after_a_person_s_step() {
+    let mut steps = plan();
+    steps["steps"] = json!([
+        { "what": "S1", "test": "T1" },
+        { "what": "Check it in a browser.", "test": "It shows.", "by": "person",
+          "when": "before_merge" },
+        { "what": "S3", "test": "T3" }
+    ]);
+    let mut build = brief("build");
+    build["plan"] = json!({ "base": "a".repeat(40), "plan": steps });
+    let owing = |status: &str, owed: Value| {
+        let mut result = base_result(status);
+        result["owed"] = owed;
+        if status == "questions" {
+            result["questions"] = json!([question(false)]);
+        }
+        result
+    };
+    assert_eq!(against(&build, &owing("done", json!([3]))), Ok(()));
+    let mut designed = base_result("done");
+    designed["plan"] = steps.clone();
+    assert_eq!(against(&brief("design"), &designed), Ok(()));
+    let cases = [
+        (
+            &build,
+            owing("questions", json!([3])),
+            "owed is given but status is not done",
+        ),
+        (
+            &brief("build"),
+            owing("done", json!([3])),
+            "the brief gives no plan",
+        ),
+        (
+            &brief("verify"),
+            owing("done", json!([3])),
+            "owed is given but the run's role is verify",
+        ),
+        (
+            &build,
+            owing("done", json!([1])),
+            "owed: step 1 comes before any person's step",
+        ),
+        (
+            &build,
+            owing("done", json!([2])),
+            "owed: step 2 is a person's",
+        ),
+        (
+            &build,
+            owing("done", json!([4])),
+            "owed: step 4 is not a step of the plan",
+        ),
+        (
+            &build,
+            owing("done", json!([3, 3])),
+            "owed: step 3 is repeated",
+        ),
+    ];
+    for (brief, result, reason) in cases {
+        let refused = against(brief, &result).unwrap_err();
+        assert!(refused.contains(reason), "{reason}: {refused}");
     }
 }

@@ -92,7 +92,7 @@
     "format": {
       "description": "The format version of this document.",
       "type": "integer",
-      "const": 30
+      "const": 31
     },
     "gate": {
       "description": "The project's full gate, from `stack.gate` in its configuration: the\ncommands the runner runs, in order, from the worktree root, on the\ncommit a Build delivers; a role runs them, or narrows them to its\nchange, before it delivers. The runner is its only author; an empty\nlist means the project has no gate.",
@@ -1192,12 +1192,28 @@
       "description": "One step of a plan.",
       "type": "object",
       "properties": {
+        "by": {
+          "description": "Who does the step (format 2 of `plan.json`, OWL-619): the agent when\nabsent, which an agent's step never writes, so a plan of agent steps\nalone keeps the text, and every hash, it had before.",
+          "$ref": "#/$defs/StepBy"
+        },
         "test": {
-          "description": "The test that shows the step done.",
+          "description": "The test that shows the step done; for a person's step, the result\nthe person reports.",
           "type": "string"
         },
         "what": {
+          "description": "What the step does; for a person's step, what the person does and on\nwhat.",
           "type": "string"
+        },
+        "when": {
+          "description": "For a person's step, and only for one: whether its result is due\nbefore the merge or acts on what the merge deploys.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/StepWhen"
+            },
+            {
+              "type": "null"
+            }
+          ]
         }
       },
       "additionalProperties": false,
@@ -1838,6 +1854,36 @@
         "completed",
         "canceled",
         "duplicate"
+      ]
+    },
+    "StepBy": {
+      "description": "Who does a step of the plan (OWL-619, architecture section 4, \"A\nperson's steps\").",
+      "oneOf": [
+        {
+          "description": "A run does it: the Build.",
+          "type": "string",
+          "const": "agent"
+        },
+        {
+          "description": "Only a person can: no run can do it with the permissions a Build's\nbrief gives, such as a check in a browser, a call that needs a\ncredential no run holds, or an operation on a deployed environment.",
+          "type": "string",
+          "const": "person"
+        }
+      ]
+    },
+    "StepWhen": {
+      "description": "When a person's step is due (OWL-619).",
+      "oneOf": [
+        {
+          "description": "Its result says whether the change is right: merge on green waits\nfor it.",
+          "type": "string",
+          "const": "before_merge"
+        },
+        {
+          "description": "It acts on what the merge deploys: it holds nothing.",
+          "type": "string",
+          "const": "after_merge"
+        }
       ]
     },
     "ThreadEntry": {

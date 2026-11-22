@@ -16,6 +16,7 @@ use owlshift_contracts::event::EventKind;
 use owlshift_contracts::ids::TicketId;
 use owlshift_contracts::refs::{DeliveredPullRequest, Merging, TicketDelivery, TicketQuestions};
 use owlshift_contracts::result::Question;
+use owlshift_contracts::review::TicketPlan;
 use owlshift_core::follow::{MergeBlocker, MergeQuestion, Settled, held_question};
 use owlshift_core::vocab::{AnswerClass, MergeSwitch};
 
@@ -357,33 +358,46 @@ pub(crate) fn notify_refused(
 }
 
 /// Why merge on green will not merge the ticket's pull request, from its
-/// `questions` alone, as a delivery says it (OWL-464): the question that
-/// keeps it for a person, named, under the project's gate policy. `None`
-/// under `never`, where Owlshift merges nothing anyway, and when no question
-/// holds.
+/// `questions` and its `plan` alone, as a delivery says it (OWL-464): the
+/// question that keeps it for a person, named, under the project's gate
+/// policy, then the steps it owes a person before the merge (OWL-619).
+/// `None` under `never`, where Owlshift merges nothing anyway, and when
+/// nothing holds.
 pub(crate) fn held_at_delivery(
     on_demand: &OnDemand<'_>,
     switch: MergeSwitch,
     questions: &TicketQuestions,
+    plan: Option<&TicketPlan>,
 ) -> Option<String> {
     if switch == MergeSwitch::Never {
         return None;
     }
     let questions = self::questions(questions);
     let gate = on_demand.config.gate_policy();
-    held_question(&gate, &questions).map(|(question, blocker)| hold_words(&blocker, Some(question)))
+    if let Some((question, blocker)) = held_question(&gate, &questions) {
+        return Some(hold_words(&blocker, Some(question)));
+    }
+    let owed = person_steps(plan);
+    (owed > 0).then(|| hold_words(&MergeBlocker::PersonSteps(owed), None))
+}
+
+/// The steps a ticket whose plan is `plan` owes a person before the merge,
+/// merge on green's `person_steps` (OWL-619): none without a plan.
+pub(crate) fn person_steps(plan: Option<&TicketPlan>) -> usize {
+    plan.map_or(0, TicketPlan::owed_before_merge)
 }
 
 /// Who merges the pull request a command just delivered at `base`, as its
 /// line says it: [`switch_at`], and [`held_at_delivery`] on its ticket's
-/// `questions` (OWL-464).
+/// `questions` (OWL-464) and `plan` (OWL-619).
 pub(crate) fn who_merges(
     on_demand: &OnDemand<'_>,
     base: &Base,
     questions: &TicketQuestions,
+    plan: Option<&TicketPlan>,
 ) -> (MergeSwitch, Option<String>) {
     let switch = switch_at(on_demand, base);
-    (switch, held_at_delivery(on_demand, switch, questions))
+    (switch, held_at_delivery(on_demand, switch, questions, plan))
 }
 
 /// The `merge_waits` decision event (OWL-464): the green pull request
@@ -489,6 +503,14 @@ pub(crate) fn hold_words(blocker: &MergeBlocker, question: Option<&MergeQuestion
             "{asked} under `{category}`, a category the project keeps for a person, was decided \
              by the resolver rather than answered by its decider"
         ),
+        MergeBlocker::PersonSteps(steps) => format!(
+            "the ticket owes {} a person checks before the merge, listed under \"For a person\" \
+             in its pull request",
+            match steps {
+                1 => "a step".to_owned(),
+                n => format!("{n} steps"),
+            }
+        ),
         MergeBlocker::Draft => "the pull request is a draft".to_owned(),
         MergeBlocker::SomethingDue => {
             "the ticket owes its DELIVERY report on the tracker first".to_owned()
@@ -593,6 +615,7 @@ pub(crate) fn blocker_wait(blocker: &MergeBlocker) -> Option<(&'static str, Data
         | MergeBlocker::Security(_)
         | MergeBlocker::Unanswered(_)
         | MergeBlocker::ResolverDecided(_)
+        | MergeBlocker::PersonSteps(_)
         | MergeBlocker::ReviewRequired
         | MergeBlocker::ChangesRequested => return None,
     };

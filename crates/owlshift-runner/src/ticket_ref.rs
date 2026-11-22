@@ -2245,10 +2245,7 @@ pub(crate) mod fixtures {
                 files: vec!["src/lib.rs".to_owned()],
                 steps: steps
                     .iter()
-                    .map(|what| PlanStep {
-                        what: (*what).to_owned(),
-                        test: format!("test of {what}"),
-                    })
+                    .map(|what| PlanStep::agent(*what, format!("test of {what}")))
                     .collect(),
                 risks: Vec::new(),
                 out_of_scope: Vec::new(),
@@ -2258,6 +2255,7 @@ pub(crate) mod fixtures {
             base: "1".repeat(40),
             approval: None,
             published: None,
+            owed: Vec::new(),
         }
     }
 }

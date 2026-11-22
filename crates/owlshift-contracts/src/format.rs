@@ -47,8 +47,9 @@ use crate::Role;
 /// `result_refusal` to the design role and the review stages' roles too,
 /// design review, verify and the arbiter (OWL-430); format 29 the build
 /// role's `overlaps` (OWL-449); format 30 `check_failure.rerun`, the
-/// runner's re-run that failed again before the fix run (OWL-513).
-pub const BRIEF_FORMAT: u32 = 30;
+/// runner's re-run that failed again before the fix run (OWL-513); format 31
+/// a plan step's `by` and `when`, a person's step (OWL-619).
+pub const BRIEF_FORMAT: u32 = 31;
 /// The format version of `result.json`. Format 4 added the resolver's
 /// `resolutions` (OWL-138); format 5 the resolver's own `category` on each
 /// decision (OWL-144); format 6 refuses `decisions` from the build role
@@ -64,8 +65,9 @@ pub const BRIEF_FORMAT: u32 = 30;
 /// `finding_responses` to findings to `fix` too, and their `disagreed` and
 /// `deferred` outcomes (OWL-377); format 14 intake's `zones` and
 /// `resources` (OWL-402); format 15 the answer check's chosen `option` on a
-/// verdict (OWL-585).
-pub const RESULT_FORMAT: u32 = 15;
+/// verdict (OWL-585); format 16 a plan step's `by` and `when`, and the build
+/// role's `owed` (OWL-619).
+pub const RESULT_FORMAT: u32 = 16;
 /// The format version of an event. Format 2 added the `warning` kind (OWL-134);
 /// the log is append-only, so [`Event::parse`](crate::event::Event::parse)
 /// still reads the format-1 lines already written.
@@ -122,8 +124,9 @@ pub const INTAKE_FORMAT: u32 = 2;
 /// (OWL-300); format 1 is still read.
 pub const PROPOSALS_FORMAT: u32 = 2;
 /// The format version of a ticket's plan (`plan.json` on a ticket ref,
-/// OWL-300).
-pub const PLAN_FORMAT: u32 = 1;
+/// OWL-300). Format 2 adds a step's `by` and `when` and the Build's `owed`
+/// (OWL-619); format 1 is still read, every step the agent's.
+pub const PLAN_FORMAT: u32 = 2;
 /// The format version of a ticket's review record (`review.json` on a ticket
 /// ref, OWL-300). Format 2 adds the colleagues' reviews `relayed` to the
 /// decider (OWL-585); format 1 is still read.

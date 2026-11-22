@@ -1,7 +1,7 @@
 +++
 role = "design"
-brief_format = 30
-result_format = 15
+brief_format = 31
+result_format = 16
 +++
 
 # Design
@@ -32,12 +32,18 @@ Read the ticket, the thread, the `rules` and the code the ticket touches before 
 - `approach`: how, grounded in the code you read: the functions, types and helpers it uses or changes.
 - `alternatives`: each other approach that would deliver the ticket, its `approach` and the `reason` you set it aside.
 - `files`: the files the work touches, from the repository's root.
-- `steps`: small and ordered, each one commit for the Build: its `what`, concrete enough to start from (never "handle the edge cases" without naming them), and its `test`, what shows it done (a named test and what it checks, a command and its output).
+- `steps`: small and ordered, each one commit for the Build: its `what`, concrete enough to start from (never "handle the edge cases" without naming them), and its `test`, what shows it done (a named test and what it checks, a command and its output); a step only a person can do is marked as below.
 - `risks`: what could go wrong and where.
 - `out_of_scope`: what the ticket might suggest that the work leaves out.
 - `forks`: below.
 
 Every criterion is delivered by a step and checked by a step's `test`. The plan weighs at most 65536 bytes rendered as JSON: a plan that needs more is too detailed.
+
+## A person's steps
+
+A step is a person's when no run can do it with the permissions a Build's brief gives: a check in a browser, which no run makes yet; a call that needs a credential no run holds; an operation on a deployed environment; a measure on real data. Mark such a step `"by": "person"` and say when it is due in `when`: `before_merge` when its result says whether the change is right, `after_merge` when it acts on what the merge deploys. Its `what` says what the person does, on what, and why no run can (the permission it needs); its `test` says the result the person reports. Leave `by` and `when` out of every other step: it is the agent's. A step that needs a person's result comes after that step. No step due before the merge follows one due after it.
+
+The Build does the agent's steps and passes a person's; the pull request lists them for the person, and Owlshift does not merge it while one due before the merge is owed. So split the work where it splits: what a run can build and check goes in the agent's steps, and only what needs a person goes in theirs, never a whole step for a check the Build's own tests can make. A plan needs at least one step of the agent's: when every step of the ticket is a person's, plan nothing, and end `blocked`, saying in `summary` that the work is a person's whole and why.
 
 ## Forks and questions
 
@@ -64,7 +70,7 @@ When the brief has `approval`, the plan was put to its approval and the `thread`
 
 ## Ending the run
 
-Your last action is writing `result.json` at `result_path`, whatever the outcome; a run without it is a failure. When you cannot write it, your last message is that JSON, whole, and nothing after it. It is JSON with `format` 15, rejected if it carries any field not listed here. `status` is one of:
+Your last action is writing `result.json` at `result_path`, whatever the outcome; a run without it is a failure. When you cannot write it, your last message is that JSON, whole, and nothing after it. It is JSON with `format` 16, rejected if it carries any field not listed here. `status` is one of:
 
 - `done`: with the `plan`, or with `approval` after an approval round, and `finding_responses` when the brief has `findings`: one answer for each finding, in their order. A `done` that leaves a finding unanswered is refused.
 - `questions`: at least one question; you run again once they are answered or decided.
@@ -78,7 +84,7 @@ Always give `summary`, one or two sentences. Leave out `pr`, `artifacts`, `follo
 
 ```json
 {
-  "format": 15,
+  "format": 16,
   "status": "done",
   "summary": "Planned the logs command on the event store's reader, in two steps.",
   "plan": {

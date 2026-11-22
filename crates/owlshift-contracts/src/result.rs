@@ -157,6 +157,12 @@ pub struct RunResult {
     /// with `done`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub finding_responses: Vec<FindingResponse>,
+    /// The agent's steps of the given plan the Build left because they need
+    /// a person's step's result, by their place from 1 (format 16, OWL-619):
+    /// only from the build role, with a given plan, and only with `done`.
+    /// The person's steps themselves are owed without being listed.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub owed: Vec<NonZeroU32>,
 }
 
 /// A design run's answer to an approval round (format 9, OWL-300).
@@ -885,6 +891,7 @@ impl RunResult {
             ("findings", !self.findings.is_empty()),
             ("rulings", !self.rulings.is_empty()),
             ("finding_responses", !self.finding_responses.is_empty()),
+            ("owed", !self.owed.is_empty()),
         ];
         if self.status != Status::Done
             && let Some((field, _)) = given.iter().find(|(_, given)| *given)
@@ -1268,6 +1275,20 @@ impl RunResult {
         }
         if !self.findings.is_empty() && !matches!(role, Role::DesignReview | Role::Verify) {
             return refused("findings", "design_review or verify");
+        }
+        if !self.owed.is_empty() {
+            if role != Role::Build {
+                return refused("owed", "build");
+            }
+            let Some(given) = &brief.plan else {
+                return Err(ContractError::invalid(
+                    CONTRACT,
+                    "owed is given but the brief gives no plan: without one, a person's step \
+                     met is asked as a question of category person_step",
+                ));
+            };
+            crate::review::check_owed(&given.plan, &self.owed)
+                .map_err(|reason| ContractError::invalid(CONTRACT, format!("owed: {reason}")))?;
         }
         let given: Vec<_> = brief
             .findings

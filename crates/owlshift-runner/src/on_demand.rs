@@ -4082,6 +4082,12 @@ impl OnDemand<'_> {
                             .review_unchanged(p, state, questions, built, sink)
                             .map(Built::Delivered);
                     }
+                    // The agent's steps this Build left for a person's
+                    // result, kept with the plan they index, never fewer
+                    // (OWL-619).
+                    if let (Some(plan), Some(result)) = (p.plan.as_mut(), ran.result()) {
+                        owe(plan, &result.owed);
+                    }
                     let review = p.review.get_or_insert_with(TicketReview::new);
                     if let (Some(given), Some(result)) = (&brief.findings, ran.result()) {
                         design::mark_answered(review, Stage::Verify, given, result);
@@ -6923,7 +6929,15 @@ impl OnDemand<'_> {
             ),
             None => (p.found.title.clone(), built.summary.clone()),
         };
-        let body = crate::writer::pull_request_body(&body, self.tracker.closing_line(ticket));
+        // The steps the ticket owes a person follow the agent's text
+        // (OWL-619).
+        let owed = p
+            .plan
+            .as_ref()
+            .map(TicketPlan::owed_steps)
+            .unwrap_or_default();
+        let body =
+            crate::writer::pull_request_body(&body, &owed, self.tracker.closing_line(ticket));
         let opened = writer
             .open_pull_request(self.forge, head, base, &title, &body)
             .map_err(|e| delivery("opening the pull request", &e))?;
@@ -7007,7 +7021,8 @@ impl OnDemand<'_> {
         let mut following = Following::default();
         let comment =
             self.post_and_settle(p, &watching, kept, checks, &done, &mut following, sink)?;
-        let (merge, merge_held) = crate::merge::who_merges(self, &p.base, &p.questions());
+        let (merge, merge_held) =
+            crate::merge::who_merges(self, &p.base, &p.questions(), p.plan.as_ref());
         Ok(Delivered {
             pull_request,
             opened: opened.opened,
@@ -8645,7 +8660,8 @@ impl OnDemand<'_> {
         let verdict = checks_read.as_ref().ok().map(CheckSet::verdict);
         let done = format!("the {what} {commit} was pushed and kept");
         let comment = self.post_and_settle(p, &state, kept, checks_read, &done, following, sink)?;
-        let (merge, merge_held) = crate::merge::who_merges(self, &p.base, &p.questions());
+        let (merge, merge_held) =
+            crate::merge::who_merges(self, &p.base, &p.questions(), p.plan.as_ref());
         Ok(Delivered {
             pull_request,
             opened: false,
@@ -8704,6 +8720,7 @@ impl OnDemand<'_> {
                 &ticket,
                 &kept,
                 &p.questions(),
+                p.plan.as_ref(),
                 p.review.as_ref(),
                 proposals.as_ref(),
                 checks,
@@ -8746,6 +8763,7 @@ impl OnDemand<'_> {
         ticket: &TicketId,
         delivery: &TicketDelivery,
         questions: &TicketQuestions,
+        plan: Option<&TicketPlan>,
         review: Option<&TicketReview>,
         proposals: Option<&TicketProposals>,
         checks: Result<CheckSet, forge::Error>,
@@ -8859,10 +8877,18 @@ impl OnDemand<'_> {
                 pushed: !owed.unchanged,
             }),
             // Who merges, as the project file reads at the base of the push
-            // (OWL-445), and the question that keeps it for a person
-            // (OWL-464).
+            // (OWL-445), and the question or the steps owed that keep it for
+            // a person (OWL-464, OWL-619).
             merge,
-            merge_held: crate::merge::held_at_delivery(self, merge, questions),
+            merge_held: crate::merge::held_at_delivery(self, merge, questions, plan),
+            // A delivery's report lists the steps its ticket owes a person
+            // (OWL-619); a repair's does not repeat them.
+            person_steps: match owed.kind {
+                PushKind::Delivery => plan.map(TicketPlan::owed_steps).unwrap_or_default(),
+                PushKind::Review | PushKind::Fix | PushKind::Rebase | PushKind::Correction => {
+                    Vec::new()
+                }
+            },
         };
         match Writer::new(self.tracker).post_repair_report(&report) {
             Ok(Reported { comment, new }) => {
@@ -8994,6 +9020,7 @@ impl OnDemand<'_> {
                 ticket,
                 delivery,
                 &record.questions,
+                record.plan.as_ref(),
                 record.review.as_ref(),
                 proposals,
                 checks,
@@ -9921,6 +9948,15 @@ fn gather<T: Clone + PartialEq>(into: &mut Vec<T>, items: &[T]) {
             into.push(item.clone());
         }
     }
+}
+
+/// `plan` owes the agent's steps `owed` too, which a Build's `done` named
+/// as left for a person's result (OWL-619): those it owed already stay,
+/// in the plan's order, each once. The result was checked against the
+/// plan its brief gave, this one.
+fn owe(plan: &mut TicketPlan, owed: &[NonZeroU32]) {
+    gather(&mut plan.owed, owed);
+    plan.owed.sort_unstable();
 }
 
 /// The summary of the round a late comment after the integrating run opens
@@ -11243,12 +11279,12 @@ mod tests {
     fn a_build_refusal_is_kept_until_heeded() {
         let finished = |status: &str| {
             let result = RunResult::parse(&format!(
-                r#"{{"format":15,"status":"{status}","summary":"s","questions":[{{"id":"Q1",
+                r#"{{"format":16,"status":"{status}","summary":"s","questions":[{{"id":"Q1",
                 "category":"scope","context":"c","text":"t","recommendation":{{"why":"r"}}}}]}}"#
             ))
             .or_else(|_| {
                 RunResult::parse(&format!(
-                    r#"{{"format":15,"status":"{status}","summary":"s"}}"#
+                    r#"{{"format":16,"status":"{status}","summary":"s"}}"#
                 ))
             })
             .unwrap();
@@ -11332,7 +11368,7 @@ mod tests {
         // A `premise_false` with no question asks nothing either (OWL-193).
         let unasked_premise = Outcome::Finished {
             result: Box::new(
-                RunResult::parse(r#"{"format":15,"status":"premise_false","summary":"s"}"#)
+                RunResult::parse(r#"{"format":16,"status":"premise_false","summary":"s"}"#)
                     .unwrap(),
             ),
             artifacts: crate::artifact::ArtifactContents::default(),
@@ -11432,7 +11468,7 @@ mod tests {
                 .map(|c| format!(r#"{{"question":"{c}","decision":"{c}: d","basis":"b"}}"#))
                 .collect();
             format!(
-                r#"{{"format":15,"status":"done","summary":"s","decisions":[{}]}}"#,
+                r#"{{"format":16,"status":"done","summary":"s","decisions":[{}]}}"#,
                 decisions.join(",")
             )
         };
@@ -11469,7 +11505,7 @@ mod tests {
             .map(|n| vec![format!("List {n} first"), format!("List {n} second")])
             .collect();
         let mut results: Vec<String> = lists.iter().map(|l| listing(l)).collect();
-        results.push(r#"{"format":15,"status":"done","summary":"s"}"#.to_owned());
+        results.push(r#"{"format":16,"status":"done","summary":"s"}"#.to_owned());
         let (told, _) = refuse_in_turn(&results);
         assert!(told.decisions_refused);
         assert_eq!(told_questions(&told), lists.concat());
@@ -11557,7 +11593,7 @@ mod tests {
         };
         let asking = |named: &str| {
             format!(
-                r#"{{"format":15,"status":"questions","summary":"s","questions":[{{"id":"Q1",
+                r#"{{"format":16,"status":"questions","summary":"s","questions":[{{"id":"Q1",
                 "category":"scope","context":"c","text":"Which file, and every key?",
                 "recommendation":{{"why":"r"}}}}]{named}}}"#
             )
@@ -11574,7 +11610,7 @@ mod tests {
             (true, 0, Some(held))
         );
         // Its `done` is refused, and the hold kept with the latest reason.
-        let done = validated(r#"{"format":15,"status":"done","summary":"s"}"#, &text_only);
+        let done = validated(r#"{"format":16,"status":"done","summary":"s"}"#, &text_only);
         let refused = done.unwrap_err();
         assert!(
             matches!(
@@ -11595,7 +11631,7 @@ mod tests {
 
         // Mixed with typed choices, a later refusal's: only those have a
         // place, and an ask naming them all clears the text lists too.
-        let listing = r#"{"format":15,"status":"done","summary":"s","decisions":[
+        let listing = r#"{"format":16,"status":"done","summary":"s","decisions":[
             {"question":"Where the README lists it","decision":"d","basis":"b"},
             {"question":"Which default","decision":"d","basis":"b"}]}"#;
         let refused = validated(listing, &text_only).unwrap_err();

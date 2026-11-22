@@ -54,7 +54,7 @@
     "format": {
       "description": "The format version of this document.",
       "type": "integer",
-      "const": 15
+      "const": 16
     },
     "intake": {
       "description": "The intake role's record (format 8, OWL-245): required from it when\nit ends `done` or `questions`, refused with any other status and from\nany other role.",
@@ -66,6 +66,15 @@
           "type": "null"
         }
       ]
+    },
+    "owed": {
+      "description": "The agent's steps of the given plan the Build left because they need\na person's step's result, by their place from 1 (format 16, OWL-619):\nonly from the build role, with a given plan, and only with `done`.\nThe person's steps themselves are owed without being listed.",
+      "type": "array",
+      "items": {
+        "type": "integer",
+        "format": "uint32",
+        "minimum": 1
+      }
     },
     "plan": {
       "description": "The design role's plan (format 9, OWL-300): with `done`, from a\ndesign run not answering an approval round, or beside `approval:\nchanged`; refused from any other role and with any other status.",
@@ -844,12 +853,28 @@
       "description": "One step of a plan.",
       "type": "object",
       "properties": {
+        "by": {
+          "description": "Who does the step (format 2 of `plan.json`, OWL-619): the agent when\nabsent, which an agent's step never writes, so a plan of agent steps\nalone keeps the text, and every hash, it had before.",
+          "$ref": "#/$defs/StepBy"
+        },
         "test": {
-          "description": "The test that shows the step done.",
+          "description": "The test that shows the step done; for a person's step, the result\nthe person reports.",
           "type": "string"
         },
         "what": {
+          "description": "What the step does; for a person's step, what the person does and on\nwhat.",
           "type": "string"
+        },
+        "when": {
+          "description": "For a person's step, and only for one: whether its result is due\nbefore the merge or acts on what the merge deploys.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/StepWhen"
+            },
+            {
+              "type": "null"
+            }
+          ]
         }
       },
       "additionalProperties": false,
@@ -1180,6 +1205,36 @@
         "blocked",
         "premise_false",
         "failed"
+      ]
+    },
+    "StepBy": {
+      "description": "Who does a step of the plan (OWL-619, architecture section 4, \"A\nperson's steps\").",
+      "oneOf": [
+        {
+          "description": "A run does it: the Build.",
+          "type": "string",
+          "const": "agent"
+        },
+        {
+          "description": "Only a person can: no run can do it with the permissions a Build's\nbrief gives, such as a check in a browser, a call that needs a\ncredential no run holds, or an operation on a deployed environment.",
+          "type": "string",
+          "const": "person"
+        }
+      ]
+    },
+    "StepWhen": {
+      "description": "When a person's step is due (OWL-619).",
+      "oneOf": [
+        {
+          "description": "Its result says whether the change is right: merge on green waits\nfor it.",
+          "type": "string",
+          "const": "before_merge"
+        },
+        {
+          "description": "It acts on what the merge deploys: it holds nothing.",
+          "type": "string",
+          "const": "after_merge"
+        }
       ]
     },
     "TicketId": {

@@ -1737,6 +1737,8 @@ impl OnDemand<'_> {
             approval: None,
             // Its document stays the ticket's (OWL-350).
             published: p.plan.as_ref().and_then(|plan| plan.published.clone()),
+            // A new plan owes nothing yet: its Build says what it left.
+            owed: Vec::new(),
         };
         let sha = plan_sha256(&kept.plan);
         let forks = kept.plan.forks.len();
@@ -1798,6 +1800,7 @@ impl OnDemand<'_> {
                 plan_sha256: sha.clone(),
             }),
             published: p.plan.as_ref().and_then(|plan| plan.published.clone()),
+            owed: Vec::new(),
         };
         let pass = NonZeroU32::new(state.review_pass_due()).expect("a pass due counts from 1");
         let mut review = p.review.clone().unwrap_or_default();
@@ -2679,6 +2682,7 @@ impl OnDemand<'_> {
             change,
             forks: comment.plan.forks.len(),
             open: comment.open_findings(),
+            person: crate::writer::person_steps_of(&comment.plan),
             next: comment.next,
             run: comment.run.clone(),
         })
@@ -3353,10 +3357,7 @@ mod tests {
     /// text removed, and the parts whose text changed are named (OWL-356).
     #[test]
     fn a_later_pass_is_told_the_new_steps_and_parts() {
-        let step = |text: &str| PlanStep {
-            what: text.to_owned(),
-            test: format!("{text} tested."),
-        };
+        let step = |text: &str| PlanStep::agent(text, format!("{text} tested."));
         let mut before = plan(Vec::new());
         before.steps = vec![step("A"), step("B")];
         let print = plan_print(&before);
@@ -3379,10 +3380,7 @@ mod tests {
     /// a duplicate added is new (OWL-356).
     #[test]
     fn duplicated_steps_are_matched_one_for_one() {
-        let step = |text: &str| PlanStep {
-            what: text.to_owned(),
-            test: format!("{text} tested."),
-        };
+        let step = |text: &str| PlanStep::agent(text, format!("{text} tested."));
         let mut twice = plan(Vec::new());
         twice.steps = vec![step("A"), step("A"), step("B")];
         let mut once = twice.clone();
@@ -3405,10 +3403,7 @@ mod tests {
                 reason: "R".to_owned(),
             }],
             files: Vec::new(),
-            steps: vec![PlanStep {
-                what: "S".to_owned(),
-                test: "T".to_owned(),
-            }],
+            steps: vec![PlanStep::agent("S", "T")],
             risks: Vec::new(),
             out_of_scope: Vec::new(),
             forks,

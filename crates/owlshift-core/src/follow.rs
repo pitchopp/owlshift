@@ -617,6 +617,10 @@ pub struct MergeFacts<'a> {
     /// category and with the resolver's label kept on its round's ask, then
     /// every decision kept without its decider.
     pub questions: &'a [MergeQuestion],
+    /// How many steps the ticket owes a person before the merge, its plan's
+    /// person's steps due then and the agent's steps waiting on them
+    /// (OWL-619): while any is owed, a person merges.
+    pub person_steps: usize,
     /// Whether the ticket's stage is still one the project maps for review.
     pub at_review: bool,
     /// Whether the pull request is a draft.
@@ -652,6 +656,9 @@ pub enum MergeBlocker {
     /// sends to a human, was settled by a decision kept without its
     /// decider.
     ResolverDecided(String),
+    /// The ticket owes this many steps a person does before the merge, or
+    /// that wait on one's result (OWL-619): a person checks them and merges.
+    PersonSteps(usize),
     /// The pull request is a draft.
     Draft,
     /// Something is due or running first.
@@ -742,6 +749,9 @@ fn blocker(policy: &MergePolicy<'_>, facts: &MergeFacts<'_>, read: &Read) -> Opt
     }
     if let Some((_, blocker)) = held_question(policy.gate, facts.questions) {
         return Some(blocker);
+    }
+    if facts.person_steps > 0 {
+        return Some(MergeBlocker::PersonSteps(facts.person_steps));
     }
     if facts.draft {
         return Some(MergeBlocker::Draft);
@@ -855,6 +865,7 @@ impl MergeBlocker {
             Self::Security(_) => Some("security"),
             Self::Unanswered(_) => Some("unanswered"),
             Self::ResolverDecided(_) => Some("resolver_decided"),
+            Self::PersonSteps(_) => Some("person_steps"),
             Self::Excluded => Some("excluded"),
             Self::Unlabeled => Some("unlabeled"),
             Self::NotGreen
@@ -1598,6 +1609,7 @@ mod tests {
                 labeled: true,
                 excluded: false,
                 questions,
+                person_steps: 0,
                 at_review: true,
                 draft: false,
                 something_due: false,
@@ -1658,6 +1670,10 @@ mod tests {
             let ended = Decision::End(EndReason::Merged);
             let human = [question("Possible security issue", Settled::Decider)];
             let added = [question("billing_change", Settled::Open)];
+            // A person's step asked outside the plan, answered, lifts its own
+            // hold, never that of the steps the plan owes (OWL-619).
+            let stepped = [question("person_step", Settled::Decider)];
+            let unstepped = [question("person_step", Settled::Open)];
             let base = facts(&GREEN, &[]);
             let mut moved_head = green_read();
             moved_head.head = other.to_owned();
@@ -1718,6 +1734,21 @@ mod tests {
                     facts(&GREEN, &added),
                     green_read(),
                     Unanswered(added[0].category.clone()),
+                ),
+                (
+                    MergeSwitch::All,
+                    facts(&GREEN, &unstepped),
+                    green_read(),
+                    Unanswered("person_step".to_owned()),
+                ),
+                (
+                    MergeSwitch::All,
+                    MergeFacts {
+                        person_steps: 2,
+                        ..facts(&GREEN, &stepped)
+                    },
+                    green_read(),
+                    PersonSteps(2),
                 ),
                 (
                     MergeSwitch::All,

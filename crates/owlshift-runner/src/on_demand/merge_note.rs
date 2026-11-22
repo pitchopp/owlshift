@@ -162,6 +162,7 @@ impl OnDemand<'_> {
                 .as_ref()
                 .is_some_and(|exclude| labels.contains(exclude)),
             questions: &asked,
+            person_steps: crate::merge::person_steps(p.plan.as_ref()),
             at_review: stage == tracker.states.review,
             draft,
             something_due: crate::merge::owes_first(delivery),

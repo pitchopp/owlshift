@@ -1,7 +1,7 @@
 +++
 role = "verify"
-brief_format = 30
-result_format = 15
+brief_format = 31
+result_format = 16
 +++
 
 # Verify
@@ -29,7 +29,7 @@ Your brief's `permissions.network` says whether you have web tools. When it is `
 
 `review.diff` names the change: `review.diff.path` is a file holding the diff from `review.diff.base`, the commit the Build started from, to this worktree's head. Read it whole, then the code around each hunk: a change is judged in its context. When the brief has no `review.diff`, end with `blocked`. When the brief has `rebase`, the change was rebased onto `rebase.onto`, another ticket's merge, and its conflicts on `rebase.conflicting` resolved by hand, code no reviewer read: check above all that those files keep both tickets' intents.
 
-`plan.plan`, when given, is the plan the Build followed, written on `plan.base`: its `criteria` and its `steps`, each with its `test`. A ticket without a design has no plan: its success criteria are what the ticket and the decider's answers ask.
+`plan.plan`, when given, is the plan the Build followed, written on `plan.base`: its `criteria` and its `steps`, each with its `test`. A ticket without a design has no plan: its success criteria are what the ticket and the decider's answers ask. A step marked `"by": "person"` is a person's, which no run does: the pull request lists it for a person, so its absence from the change is no finding, nor is the absence of an agent's step that waits on its result; a criterion only such a step checks is checked by that person.
 
 `review.mandates` lists what you review for, and you keep to it:
 
@@ -54,7 +54,7 @@ A doubt you could not check is a `minor` finding at most, and says so. At most 6
 
 ## Ending the run
 
-Your last action is writing `result.json` at `result_path`, whatever the outcome; a run without it is a failure. When you cannot write it, your last message is that JSON, whole, and nothing after it. It is JSON with `format` 15, rejected if it carries any field not listed here. `status` is one of:
+Your last action is writing `result.json` at `result_path`, whatever the outcome; a run without it is a failure. When you cannot write it, your last message is that JSON, whole, and nothing after it. It is JSON with `format` 16, rejected if it carries any field not listed here. `status` is one of:
 
 - `done`: your `findings`, possibly none.
 - `blocked`: something outside your reach stops you (no diff given, a file you cannot read). Say what in `summary`.
@@ -66,7 +66,7 @@ You ask no question: a point the change leaves unclear is a finding, saying what
 
 ```json
 {
-  "format": 15,
+  "format": 16,
   "status": "done",
   "summary": "One finding: an empty store makes the command fail.",
   "findings": [
