@@ -44,6 +44,7 @@ use serde_json::Value;
 use crate::claims::FetchedClaim;
 use crate::daemon::requests;
 use crate::events::printable;
+use crate::handed_back::{self, HandedBack};
 use crate::held;
 use crate::project::ProjectDirs;
 use crate::ready;
@@ -112,7 +113,7 @@ pub struct ProjectRead {
 
 /// What a ticket ref says that the document's rows do not: for the web UI's
 /// "For you" block, which counts every ref as the header does
-/// (`why::standings`), whether or not its ticket has a row.
+/// (`why::read_standings`), whether or not its ticket has a row.
 #[derive(Clone, Debug, PartialEq)]
 pub struct RefDetail {
     /// Its status; `Unread` when the ref's record does not read or the core
@@ -131,11 +132,18 @@ pub struct RefDetail {
     /// ([`ticket_ref::TicketRecord::open_ask`]), which the web UI tells the
     /// operator's asks from other people's by (OWL-584).
     pub decider: Option<String>,
+    /// The ticket as handed back to a person, while it is (OWL-626).
+    pub handed_back: Option<HandedBack>,
 }
 
 /// The detail of the ref `stored`, `state` being what [`ticket_ref::state_of`]
-/// made of it.
-fn detail(stored: &ticket_ref::Stored, state: &RefState) -> RefDetail {
+/// made of it; `gesture` gives the words of the project's admission gesture,
+/// asked only for a ticket handed back.
+fn detail(
+    stored: &ticket_ref::Stored,
+    state: &RefState,
+    gesture: &mut dyn FnMut() -> String,
+) -> RefDetail {
     let state = match state {
         RefState::Read(Some(state)) | RefState::Unadmitted(state) => Some(state),
         RefState::Read(None) | RefState::Unread(_) => None,
@@ -147,6 +155,7 @@ fn detail(stored: &ticket_ref::Stored, state: &RefState) -> RefDetail {
             questions: Vec::new(),
             plan_to_approve: false,
             decider: None,
+            handed_back: None,
         };
     };
     let status = state.status();
@@ -179,6 +188,7 @@ fn detail(stored: &ticket_ref::Stored, state: &RefState) -> RefDetail {
             .record
             .open_ask()
             .map(|ask| ask.decider.account.clone()),
+        handed_back: handed_back::of(&stored.record, gesture),
     }
 }
 
@@ -286,13 +296,20 @@ fn project(
                 // The switch is read only when a parked record yielded: the
                 // web UI polls this (OWL-623).
                 let mut rebase = None;
+                // Read once, and only for a ticket handed back (OWL-626).
+                let mut words: Option<String> = None;
+                let mut gesture = || {
+                    words
+                        .get_or_insert_with(|| handed_back::gesture(&dirs))
+                        .clone()
+                };
                 refs = all
                     .into_iter()
                     .map(|(ticket, stored)| match stored {
                         Ok(stored) => {
                             let holds = held::holds(&stored);
                             let state = ticket_ref::state_of(&stored);
-                            let detail = detail(&stored, &state);
+                            let detail = detail(&stored, &state, &mut gesture);
                             let held = stored.record.held.as_ref();
                             if detail.status == RefStatus::Parked
                                 && held.is_some_and(|held| held.yielded())
@@ -452,6 +469,14 @@ fn build_project(project: &ProjectRead, held: &[HeldSlot], voice: Voice) -> (Pro
                 .as_ref()
                 .is_some_and(|listed| listed.contains(ticket))
     };
+    // A ticket handed back to a person, out of flight and of the ready
+    // column, is shown all the same (OWL-626).
+    let handed_back = |ticket: &TicketId| {
+        project
+            .details
+            .get(ticket)
+            .and_then(|detail| detail.handed_back.as_ref())
+    };
     let mut left_out: BTreeSet<&TicketId> = BTreeSet::new();
     let mut tickets: BTreeMap<TicketId, TicketWaits> = BTreeMap::new();
     let blank = |ticket: &TicketId| TicketWaits {
@@ -463,7 +488,7 @@ fn build_project(project: &ProjectRead, held: &[HeldSlot], voice: Voice) -> (Pro
         waits: None,
     };
     for (ticket, state, holds) in &project.refs {
-        if !holds && !shown(ticket) {
+        if !holds && !shown(ticket) && handed_back(ticket).is_none() {
             left_out.insert(ticket);
             continue;
         }
@@ -512,6 +537,20 @@ fn build_project(project: &ProjectRead, held: &[HeldSlot], voice: Voice) -> (Pro
         });
     }
     for row in tickets.values_mut() {
+        // Handed back: its ref says it, over any wait told before.
+        if let Some(handed_back) = handed_back(&row.ticket) {
+            row.waits = Some(Wait {
+                since: Some(handed_back.at),
+                ..person(
+                    HANDED_BACK,
+                    &format!(
+                        "handed back to a person: {}",
+                        handed_back.words(&row.ticket, voice)
+                    ),
+                )
+            });
+            continue;
+        }
         row.waits = match row.ref_status {
             RefStatus::NeedsInput => Some(person(
                 "needs_input",
@@ -540,11 +579,12 @@ fn build_project(project: &ProjectRead, held: &[HeldSlot], voice: Voice) -> (Pro
         };
     }
     // A parked holder that keeps what it holds says who waits for it
-    // (OWL-623): the tickets shown here that are neither parked nor wait for
-    // an answer, as `why` counts them.
+    // (OWL-623): the tickets shown here that are neither parked, wait for an
+    // answer nor are handed back, as `why` counts them.
     let counted: BTreeSet<TicketId> = tickets
         .values()
         .filter(|row| !matches!(row.ref_status, RefStatus::Parked | RefStatus::NeedsInput))
+        .filter(|row| !handed(row))
         .map(|row| row.ticket.clone())
         .collect();
     for row in tickets.values_mut() {
@@ -591,6 +631,16 @@ fn build_project(project: &ProjectRead, held: &[HeldSlot], voice: Voice) -> (Pro
         tickets,
     };
     (waits, unexplained)
+}
+
+/// The reason of a ticket handed back to a person (OWL-626).
+const HANDED_BACK: &str = "handed_back";
+
+/// Whether `row` is a ticket handed back to a person.
+fn handed(row: &TicketWaits) -> bool {
+    row.waits
+        .as_ref()
+        .is_some_and(|wait| wait.reason == HANDED_BACK)
 }
 
 /// A wait for a person, which the ticket's ref says.
@@ -680,6 +730,9 @@ fn ticket_line(row: &TicketWaits, tz: &TimeZone) -> String {
         (RefStatus::Unread, _) | (_, None) => "its ref cannot be read".to_owned(),
         (RefStatus::NeedsInput, Some(stage)) => format!("{}, needs input", stage_name(stage)),
         (RefStatus::Parked, Some(stage)) => format!("{}, parked", stage_name(stage)),
+        (RefStatus::Active, Some(stage)) if handed(row) => {
+            format!("{}, handed back", stage_name(stage))
+        }
         (RefStatus::Active, Some(stage)) => stage_name(stage),
     };
     let mut line = format!("{} [{stage}]", row.ticket);
@@ -695,7 +748,9 @@ fn ticket_line(row: &TicketWaits, tz: &TimeZone) -> String {
     if let Some(wait) = &row.waits {
         let _ = write!(line, ": {}", wait.text);
         if let Some(since) = wait.since {
-            let _ = write!(line, " (told {})", super::time(since, tz));
+            // A handback is the ref's, not a wait the events told.
+            let word = if handed(row) { "since" } else { "told" };
+            let _ = write!(line, " ({word} {})", super::time(since, tz));
         }
     }
     line
@@ -1458,7 +1513,9 @@ mod tests {
             }),
             ..TicketDelivery::new("owlshift/demo-1", "main")
         };
-        let read = |stored: &ticket_ref::Stored| detail(stored, &ticket_ref::state_of(stored));
+        let read = |stored: &ticket_ref::Stored| {
+            detail(stored, &ticket_ref::state_of(stored), &mut String::new)
+        };
 
         let watching = read(&stored(
             state(Status::Active(Stage::Watch)),
@@ -1509,6 +1566,76 @@ mod tests {
         ));
         assert_eq!(parked.status, RefStatus::Parked);
         assert_eq!(parked.pull_request, None);
+    }
+
+    /// OWL-626: a ticket handed back to a person is shown though it neither
+    /// holds nor is listed, its handback over the wait the events told, with
+    /// its time; it holds no capacity and is not counted as waiting for a
+    /// parked holder.
+    #[test]
+    fn a_handed_back_ticket_is_shown_as_handed_back() {
+        let behind = waits(
+            "2026-11-22T09:00:00Z",
+            "DEMO-2",
+            vec![
+                ("watch", json!("waits")),
+                ("reason", json!("collision")),
+                ("stage", json!("build")),
+                ("resource", json!({"zone": "app/one.rs"})),
+                ("tickets", json!(["DEMO-1"])),
+            ],
+        );
+        let mut project = project(
+            vec![(
+                "DEMO-1",
+                at(Status::Parked {
+                    at: Stage::Build,
+                    awaiting_input: false,
+                }),
+            )],
+            &[behind],
+        );
+        project.ready = Some(BTreeSet::new());
+        project
+            .refs
+            .push((id("DEMO-2"), at(Status::Active(Stage::Ready)), false));
+        let at: Timestamp = "2026-11-22T10:00:00Z".parse().unwrap();
+        project.details.insert(
+            id("DEMO-2"),
+            RefDetail {
+                status: RefStatus::Active,
+                pull_request: None,
+                questions: Vec::new(),
+                plan_to_approve: false,
+                decider: None,
+                handed_back: Some(HandedBack {
+                    at,
+                    read: None,
+                    gesture: "move it back to `Todo`".to_owned(),
+                }),
+            },
+        );
+        let waits = super::build(&read(vec![project], Vec::new()), Voice::Terminal);
+        let handed = row(&waits, "DEMO-2");
+        let wait = handed.waits.as_ref().unwrap();
+        assert_eq!(
+            (wait.reason.as_str(), wait.since),
+            ("handed_back", Some(at))
+        );
+        assert!(!handed.holds_capacity);
+        assert_eq!(
+            row(&waits, "DEMO-1").waits.as_ref().unwrap().text,
+            PARKED_TERMINAL
+        );
+        let text = render(&waits, &TimeZone::UTC);
+        assert!(
+            text.contains(
+                "    DEMO-2 [ready, handed back]: handed back to a person: its HANDBACK comment \
+                 says what was read; to give it back to Owlshift, move it back to `Todo` after its \
+                 HANDBACK comment, or `owlshift do DEMO-2` (since 2026-11-22 10:00)\n"
+            ),
+            "{text}"
+        );
     }
 
     const PARKED_TERMINAL: &str =

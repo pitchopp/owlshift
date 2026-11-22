@@ -2740,6 +2740,20 @@ pub enum HandbackRead {
 /// [`OWED_TEXT_CHARS`].
 const HANDBACK_STEPS: usize = 40;
 
+/// The lines a HANDBACK comment lists a person's plan with, which `owlshift
+/// why` lists too (OWL-626): each step's line, [`HANDBACK_STEPS`] at most,
+/// then how many more there are.
+pub(crate) fn handback_step_lines(steps: &[OwedStep]) -> Vec<String> {
+    let mut lines: Vec<String> = steps.iter().take(HANDBACK_STEPS).map(owed_line).collect();
+    if steps.len() > HANDBACK_STEPS {
+        lines.push(format!(
+            "and {} more steps, each a person's",
+            steps.len() - HANDBACK_STEPS
+        ));
+    }
+    lines
+}
+
 /// The HANDBACK comment (OWL-619; architecture section 4, "A person's
 /// steps", "A ticket with no step for a run"): the ticket's work is a
 /// person's whole. It says what the run read, the ticket's words or the
@@ -2769,21 +2783,11 @@ impl HandbackComment {
                 "**A person's work whole.** Intake read it so in the ticket's own words: {}",
                 code(&flatten(quote))
             ),
-            HandbackRead::Design { steps } => {
-                let mut lines: Vec<String> =
-                    steps.iter().take(HANDBACK_STEPS).map(owed_line).collect();
-                if steps.len() > HANDBACK_STEPS {
-                    lines.push(format!(
-                        "and {} more steps, each a person's",
-                        steps.len() - HANDBACK_STEPS
-                    ));
-                }
-                format!(
-                    "**A person's work whole.** Every step of the plan its design run wrote is a \
-                     person's:\n\n{}",
-                    bullets(&lines)
-                )
-            }
+            HandbackRead::Design { steps } => format!(
+                "**A person's work whole.** Every step of the plan its design run wrote is a \
+                 person's:\n\n{}",
+                bullets(&handback_step_lines(steps))
+            ),
         };
         let ticket = &self.ticket;
         let back = format!(

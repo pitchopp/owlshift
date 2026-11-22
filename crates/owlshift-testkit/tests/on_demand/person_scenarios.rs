@@ -529,6 +529,36 @@ fn handbacks(bench: &Bench) -> Vec<String> {
         .collect()
 }
 
+/// What a person reads of DEMO-1 now (OWL-626), the bench's project served
+/// as `owlshift start` serves it: `owlshift status`, `owlshift why DEMO-1`,
+/// `owlshift why`, `owlshift status --waits` and the web UI's waits card.
+fn shown(bench: &Bench) -> [String; 5] {
+    use owlshift_runner::{status, voice::Voice, why};
+    let repo = Repo::parse(REPO).unwrap();
+    owlshift_runner::served::Registry::in_data_dir(&bench.data)
+        .register(&repo, &bench.remote.checkout)
+        .unwrap();
+    let now = bench.clock.get();
+    let tz = jiff::tz::TimeZone::UTC;
+    let why = |only| {
+        why::render(&why::gather(&bench.data, &bench.dirs(), REPO, only, 2, &[], now).unwrap())
+    };
+    let waits = status::waits::gather(&bench.data, Some(&repo), 2, now);
+    let card = status::waits::build(&waits, Voice::Ui).projects[0]
+        .tickets
+        .iter()
+        .find(|row| row.ticket == ticket())
+        .and_then(|row| row.waits.as_ref())
+        .map_or_else(String::new, |wait| wait.text.clone());
+    [
+        status::render(&status::gather_files(&bench.data, 2, &[], now), &tz),
+        why(Some(ticket())),
+        why(None),
+        status::waits::report(&waits, false, &tz),
+        card,
+    ]
+}
+
 /// OWL-619's third part, its first trigger: a standard ticket whose design
 /// run plans a person's steps alone is handed back right after that run,
 /// with no Design review, arbiter or Build run. The ref is at Ready with its
@@ -571,6 +601,37 @@ fn a_plan_of_a_person_s_steps_alone_is_handed_back_with_no_build() {
         bench.stage_events(EventKind::TrackerWrite),
         ["In Progress", "Parked"]
     );
+    // OWL-626: every surface says it is handed back, what was read and the
+    // gesture that gives it back.
+    let [status, why_one, why_all, waits, card] = shown(&bench);
+    let read = "every step of its plan is a person's (2 steps); to give it back to Owlshift, \
+                make the project's admission gesture again after its HANDBACK comment";
+    for (said, line) in [
+        (
+            &status,
+            format!("  handed back to a person: DEMO-1 at 2026-10-02 09:10: {read}"),
+        ),
+        (
+            &why_one,
+            format!("now: handed back to a person at 2026-10-02T09:10:00Z: {read}"),
+        ),
+        (
+            &why_all,
+            "  DEMO-1 [ready, handed back]: handed back to a person at".to_owned(),
+        ),
+        (
+            &waits,
+            format!("DEMO-1 [ready, handed back]: handed back to a person: {read}"),
+        ),
+    ] {
+        assert!(said.contains(&line), "{line}\n{said}");
+        assert!(said.contains("or `owlshift do DEMO-1`"), "{said}");
+    }
+    assert!(
+        why_one.contains("  - **Step 2, after the merge, a person's:** Tell the team"),
+        "{why_one}"
+    );
+    assert_eq!(card, format!("handed back to a person: {read}"));
 
     let (again, printed) = bench.continue_ticket(Vec::new());
     assert!(
@@ -629,6 +690,12 @@ fn a_ticket_intake_reads_as_a_person_s_is_handed_back_and_admitted_again_after()
                 assert_eq!(kept.quote, quote);
                 handed_back.set(record.handback.map(|handback| handback.at));
                 assert_eq!(bench.stage(), "Parked");
+                // OWL-626: shown handed back on the ticket's own words.
+                let read = format!("intake read it so in the ticket's own words: `{quote}`");
+                for said in shown(&bench) {
+                    assert!(said.contains("handed back to a person"), "{said}");
+                    assert!(said.contains(&read), "{read}\n{said}");
+                }
                 // A person moves it back to the column, the label as it was.
                 move_ticket(&bench, "Todo");
             }
@@ -653,6 +720,9 @@ fn a_ticket_intake_reads_as_a_person_s_is_handed_back_and_admitted_again_after()
     assert_eq!(bench.roles(), [Role::Intake, Role::Design], "{report}");
     let record = bench.record();
     assert_eq!(record.handback, None);
+    for said in shown(&bench) {
+        assert!(!said.contains("handed back"), "{said}");
+    }
     let again = handed_back.get().unwrap() + SignedDuration::from_mins(5);
     assert_eq!(record.intake.unwrap().gesture.at, again);
 

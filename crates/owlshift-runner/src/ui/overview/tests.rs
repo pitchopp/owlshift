@@ -93,6 +93,7 @@ fn detail(status: RefStatus) -> RefDetail {
         questions: Vec::new(),
         plan_to_approve: false,
         decider: None,
+        handed_back: None,
     }
 }
 
@@ -321,7 +322,7 @@ fn for_you_counts_every_ref_as_the_header_does() {
         },
     );
     let you = &overview.for_you;
-    // The header (`why::standings`): needs-input refs, plans included,
+    // The header (`why::read_standings`): needs-input refs, plans included,
     // followed pull requests, parked refs.
     let count = |keep: &dyn Fn(&RefDetail) -> bool| details.values().filter(|d| keep(d)).count();
     assert_eq!(
