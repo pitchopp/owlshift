@@ -204,17 +204,19 @@ pub fn of(
 /// someone's push, whose change may still reach the base; not once its pull
 /// request was closed unmerged, at Ready, or once its ref is gone. A ref
 /// that cannot be read counts, since nothing tells it does not. A sibling
-/// with no ref here that `claimed`, another runner's claim, names counts
-/// while that claim stands (OWL-587). The paths only, as the Build's brief
-/// lists them: an overlap on named resources alone is left out
-/// ([`sharings_of`] gives them).
+/// with no ref here, which only the ticket's own record names, counts
+/// under remote `claims` alone: it is another runner's ticket (OWL-587),
+/// counted whether its claim still stands or not, as a merged sibling of
+/// this runner's is (OWL-613); under `local` it is a ticket forgotten here.
+/// The paths only, as the Build's brief lists them: an overlap on named
+/// resources alone is left out ([`sharings_of`] gives them).
 pub fn overlaps_of(
     ticket: &TicketId,
     own: Option<&TicketHeld>,
     refs: &[RefRead],
-    claimed: &[TicketId],
+    claims: Claims,
 ) -> Vec<(TicketId, Vec<String>)> {
-    sharings_of(ticket, own, refs, claimed)
+    sharings_of(ticket, own, refs, claims)
         .into_iter()
         .filter(|sharing| !sharing.paths.is_empty())
         .map(|sharing| (sharing.ticket, sharing.paths))
@@ -232,15 +234,19 @@ pub struct Sharing {
 }
 
 /// [`overlaps_of`] with the named resources a taking recorded (OWL-621),
-/// an overlap on named resources alone included.
+/// an overlap on named resources alone included: what a refresh, a
+/// repair's read of the base, a resolution's review and a resume reach.
 pub fn sharings_of(
     ticket: &TicketId,
     own: Option<&TicketHeld>,
     refs: &[RefRead],
-    claimed: &[TicketId],
+    claims: Claims,
 ) -> Vec<Sharing> {
     let counts = |sibling: &TicketId| match refs.iter().find(|(id, _)| id == sibling) {
-        None => claimed.contains(sibling),
+        // Only the ticket's own record names a sibling with no ref here:
+        // under remote claims another runner's, its claim gone or not
+        // (OWL-613).
+        None => claims == Claims::Remote,
         Some((_, Err(_))) => true,
         Some((_, Ok(stored))) => {
             holds(stored)
@@ -1147,25 +1153,28 @@ mod tests {
             (id("DEMO-6"), Err("unreadable".to_owned())),
         ];
         assert_eq!(
-            overlaps_of(&id("DEMO-1"), Some(&me), &refs, &[]),
+            overlaps_of(&id("DEMO-1"), Some(&me), &refs, Claims::Local),
             [
                 (id("DEMO-2"), strings(&["app/one.rs", "app/two.rs"])),
                 (id("DEMO-3"), strings(&["app/three.rs"])),
             ]
         );
-        // OWL-587: DEMO-5, with no ref here, counts while another runner's
-        // claim of it stands.
+        // OWL-587, OWL-613: under remote claims DEMO-5, with no ref here,
+        // another runner's ticket, counts whether its claim stands or not.
         assert_eq!(
-            overlaps_of(&id("DEMO-1"), Some(&me), &refs, &[id("DEMO-5")]).len(),
-            3
+            overlaps_of(&id("DEMO-1"), Some(&me), &refs, Claims::Remote)
+                .into_iter()
+                .map(|(sibling, _)| sibling)
+                .collect::<Vec<_>>(),
+            [id("DEMO-2"), id("DEMO-3"), id("DEMO-5")]
         );
         let mut unread = me.clone();
         unread.record_overlap(&id("DEMO-6"), &strings(&["lib/a.rs"]), &[], minute(4));
         assert_eq!(
-            overlaps_of(&id("DEMO-1"), Some(&unread), &refs, &[]).len(),
+            overlaps_of(&id("DEMO-1"), Some(&unread), &refs, Claims::Local).len(),
             3
         );
-        assert!(overlaps_of(&id("DEMO-9"), None, &refs, &[]).is_empty());
+        assert!(overlaps_of(&id("DEMO-9"), None, &refs, Claims::Remote).is_empty());
     }
 
     /// OWL-449: what an admission or a widening records, the siblings it

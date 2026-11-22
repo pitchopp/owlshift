@@ -60,14 +60,6 @@ impl ClaimedMemory {
     pub(super) fn of(&self, ticket: &TicketId) -> Option<&FetchedClaim> {
         self.elsewhere.iter().find(|claim| claim.ticket == *ticket)
     }
-
-    /// The tickets other runners claim.
-    pub(super) fn tickets(&self) -> Vec<TicketId> {
-        self.elsewhere
-            .iter()
-            .map(|claim| claim.ticket.clone())
-            .collect()
-    }
 }
 
 impl Watch<'_> {

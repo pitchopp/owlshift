@@ -2591,15 +2591,12 @@ impl OnDemand<'_> {
     /// those the project's other ticket refs keep naming it
     /// ([`held::sharings_of`], OWL-449), the named resources a taking
     /// recorded included (OWL-621); its own alone when the refs cannot be
-    /// listed.
+    /// listed. Under remote claims, a sibling only its own record names,
+    /// another runner's, counts whether its claim stands or not (OWL-613),
+    /// as watch's refresh reads it.
     fn sharings(&self, p: &Prepared) -> Vec<held::Sharing> {
         let others = self.others(p).unwrap_or_default();
-        let claimed: Vec<TicketId> = others
-            .claims
-            .iter()
-            .map(|claim| claim.ticket.clone())
-            .collect();
-        held::sharings_of(&p.ticket, p.held.as_ref(), &others.refs, &claimed)
+        held::sharings_of(&p.ticket, p.held.as_ref(), &others.refs, p.claims)
     }
 
     /// What `p`'s ticket's overlaps reach ([`held::Reach`]): their paths and
