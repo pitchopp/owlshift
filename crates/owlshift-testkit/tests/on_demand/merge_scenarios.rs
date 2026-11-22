@@ -95,7 +95,7 @@ fn labeled_merges_once_its_label_is_on_and_no_question_is_kept_for_a_person() {
     let mut asked = bench.record();
     let plain = asked.clone();
     asked.questions = TicketQuestions::parse(
-        r#"{"format":17,"asks":[{"kind":"questions","round":1,"at":"2026-10-02T09:00:00Z",
+        r#"{"format":18,"asks":[{"kind":"questions","round":1,"at":"2026-10-02T09:00:00Z",
         "comment":"c1","decider":{"account":"maintainer","by":"assignee"},"questions":[
         {"id":"Q1","category":"billing","context":"The plan charges for it.",
         "text":"Who pays for the greeting?","options":[]}]}]}"#,
@@ -193,7 +193,7 @@ fn waits_for_a_person(bench: &Bench) -> Vec<Value> {
 }
 
 /// A Build round asking one question under `security`.
-const SECURITY_ROUND: &str = r#"{"format":17,"status":"questions",
+const SECURITY_ROUND: &str = r#"{"format":18,"status":"questions",
 "summary":"Who may read the greeting is not given.",
 "questions":[
   {"id":"Q1","category":"security","context":"The greeting file is public.",
@@ -313,7 +313,7 @@ fn continue_at_watch_says_which_questions_still_hold_the_merge() {
         }
     };
     let asked = |category: &str, verdicts: &str| {
-        r#"{"format":17,"asks":[{"kind":"questions","round":1,"at":"2026-10-02T09:00:00Z",
+        r#"{"format":18,"asks":[{"kind":"questions","round":1,"at":"2026-10-02T09:00:00Z",
         "comment":"c1","decider":{"account":"maintainer","by":"assignee"},"questions":[
         {"id":"Q1","category":"CATEGORY","context":"The letter is legally binding.",
         "text":"Send it from the sandbox only, or for real now?","options":[
@@ -351,7 +351,7 @@ fn continue_at_watch_says_which_questions_still_hold_the_merge() {
             ),
         ),
         (
-            r#"{"format":17,"decisions":[{"at":"2026-10-02T09:00:00Z","comment":"c2",
+            r#"{"format":18,"decisions":[{"at":"2026-10-02T09:00:00Z","comment":"c2",
             "question":{"id":"Q1","category":"money","context":"c","text":"t","options":[]},
             "decision":"d","basis":"b"}]}"#
                 .to_owned(),

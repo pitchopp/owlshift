@@ -50,8 +50,9 @@ use crate::Role;
 /// runner's re-run that failed again before the fix run (OWL-513); format 31
 /// a plan step's `by` and `when`, a person's step (OWL-619); format 32
 /// Build's `person_steps`, a person's results its run at Watch follows
-/// (OWL-619).
-pub const BRIEF_FORMAT: u32 = 32;
+/// (OWL-619); format 33 the resolver's `unblock`, a run that stopped
+/// `blocked` (OWL-620).
+pub const BRIEF_FORMAT: u32 = 33;
 /// The format version of `result.json`. Format 4 added the resolver's
 /// `resolutions` (OWL-138); format 5 the resolver's own `category` on each
 /// decision (OWL-144); format 6 refuses `decisions` from the build role
@@ -69,8 +70,9 @@ pub const BRIEF_FORMAT: u32 = 32;
 /// `resources` (OWL-402); format 15 the answer check's chosen `option` on a
 /// verdict (OWL-585); format 16 a plan step's `by` and `when`, and the build
 /// role's `owed` (OWL-619); format 17 intake's `person_only`, the ticket's
-/// words that say a person does all of it (OWL-619).
-pub const RESULT_FORMAT: u32 = 17;
+/// words that say a person does all of it (OWL-619); format 18 the
+/// resolver's `unblock` verdict on a run that stopped `blocked` (OWL-620).
+pub const RESULT_FORMAT: u32 = 18;
 /// The format version of an event. Format 2 added the `warning` kind (OWL-134);
 /// the log is append-only, so [`Event::parse`](crate::event::Event::parse)
 /// still reads the format-1 lines already written.

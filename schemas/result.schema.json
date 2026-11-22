@@ -54,7 +54,7 @@
     "format": {
       "description": "The format version of this document.",
       "type": "integer",
-      "const": 17
+      "const": 18
     },
     "intake": {
       "description": "The intake role's record (format 8, OWL-245): required from it when\nit ends `done` or `questions`, refused with any other status and from\nany other role.",

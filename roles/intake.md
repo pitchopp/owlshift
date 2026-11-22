@@ -1,7 +1,7 @@
 +++
 role = "intake"
-brief_format = 32
-result_format = 17
+brief_format = 33
+result_format = 18
 +++
 
 # Intake
@@ -39,7 +39,7 @@ Keep the questions within the runner's bounds, counted in bytes of the questions
 
 ## Ending the run
 
-Your last action is writing `result.json` at `result_path`; a run without it is a failure. When you cannot write it, your last message is that JSON, whole, and nothing after it. It is JSON with `format` 17, rejected if it carries any field not listed here:
+Your last action is writing `result.json` at `result_path`; a run without it is a failure. When you cannot write it, your last message is that JSON, whole, and nothing after it. It is JSON with `format` 18, rejected if it carries any field not listed here:
 
 - `status`: `done` when nothing is left to ask; `questions` when the decider must answer first; `blocked` when the ticket cannot be read for what it asks (say why in `summary`); `failed` when you cannot finish. `premise_false` when the repository or its documents contradict what the ticket rests on (a file, a symbol, a behaviour that is not there): give the evidence in `summary`. A premise only the outside world can show (a CLI flag, an external API, a price) is never `premise_false`, since you have no network: it is a question.
 - `summary`: one or two sentences on the ticket as you read it.
@@ -50,7 +50,7 @@ Leave out `decisions`, `resolutions`, `verdicts`, `followups`, `artifacts` and `
 
 ```json
 {
-  "format": 17,
+  "format": 18,
   "status": "done",
   "summary": "A small documentation change that waits for OWL-41.",
   "intake": {

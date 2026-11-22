@@ -271,7 +271,7 @@ fn result_rejections() {
     rejects(
         "newer format with unknown fields",
         parse(|v| {
-            v["format"] = json!(18);
+            v["format"] = json!(19);
             v["confidence"] = json!(0.9);
         }),
         "upgrade Owlshift",
@@ -330,20 +330,20 @@ fn result_rejections() {
     );
     rejects(
         "truncated document",
-        RunResult::parse(r#"{"format": 18, "status""#),
+        RunResult::parse(r#"{"format": 19, "status""#),
         "upgrade Owlshift",
     );
     rejects(
         "truncated document",
-        RunResult::parse(r#"{"format": 17, "status""#),
+        RunResult::parse(r#"{"format": 18, "status""#),
         "EOF",
     );
-    let newer = edited("result-sample.json", |v| v["format"] = json!(18));
+    let newer = edited("result-sample.json", |v| v["format"] = json!(19));
     assert!(matches!(
         RunResult::parse(&newer),
         Err(ContractError::NewerFormat {
-            found: 18,
-            supported: 17,
+            found: 19,
+            supported: 18,
             ..
         })
     ));
@@ -1635,7 +1635,7 @@ fn brief_rejections() {
     );
     rejects(
         "newer format",
-        parse(|v| v["format"] = json!(33)),
+        parse(|v| v["format"] = json!(34)),
         "upgrade Owlshift",
     );
     rejects(
@@ -4046,7 +4046,7 @@ fn a_malformed_followup_keeps_the_result() {
     };
     let failed = |followups: Value| {
         json!({
-            "format": 17,
+            "format": 18,
             "status": "failed",
             "summary": "On 8a681af, the gate fails: 5 tests of the leases module fail on the base too.",
             "followups": followups,

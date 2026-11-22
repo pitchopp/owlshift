@@ -1,7 +1,7 @@
 +++
 role = "resolver"
-brief_format = 32
-result_format = 17
+brief_format = 33
+result_format = 18
 +++
 
 # Resolver
@@ -62,7 +62,7 @@ Every question you decide carries your own `category` for it, read from its `tex
 
 ## Ending the run
 
-Your last message is your result: the JSON below, whole, and nothing after it; a run without it is a failure. You write no file, so the brief's `result_path` is not yours to use; the runner takes your last message as the result. It is JSON with `format` 17, rejected if it carries any field not listed here:
+Your last message is your result: the JSON below, whole, and nothing after it; a run without it is a failure. You write no file, so the brief's `result_path` is not yours to use; the runner takes your last message as the result. It is JSON with `format` 18, rejected if it carries any field not listed here:
 
 - `status`: `done` once every question of `resolve` has its resolution; `failed` when you cannot give them. No other status is yours: anything else fails the run, and every question then goes to the decider.
 - `summary`: one or two sentences on what you settled and what you passed on.
@@ -74,7 +74,7 @@ Leave out `questions`, `decisions`, `verdicts`, `followups`, `artifacts` and `pr
 
 ```json
 {
-  "format": 17,
+  "format": 18,
   "status": "done",
   "summary": "The ticket names the greeting's file; nothing says whether it ends with a sign-off.",
   "resolutions": [
