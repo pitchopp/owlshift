@@ -47,6 +47,13 @@ const RESOLVER_ONLY: &[&str] = &[
     "fact",
     "settled",
     "judgment",
+    // The verdict on a run that stopped `blocked` (OWL-620).
+    "unblock",
+    "verdict",
+    "note",
+    "step",
+    "retry",
+    "park",
 ];
 
 /// `result.json` fields the build prompt need not name since Build takes no
@@ -233,6 +240,11 @@ const RESOLVER_BRIEF_FIELDS: &[&str] = &[
     "asked_by.plan",
     "asked_by.findings",
     "asked_by.diff",
+    // A run that stopped `blocked` (OWL-620).
+    "unblock",
+    "unblock.stage",
+    "unblock.verdicts",
+    "unblock.ledger",
 ];
 
 /// The JSON examples of a prompt, in ```json blocks.
@@ -910,6 +922,42 @@ fn resolver_example_result_parses() {
 #[test]
 fn resolver_dotted_fields_exist() {
     dotted_fields_exist("resolver.md", &resolver_prompt());
+}
+
+/// A run that stopped `blocked` (OWL-620): the resolver names the four
+/// verdicts the result schema allows and the fields of its `unblock`.
+#[test]
+fn resolver_prompt_names_the_unblock_verdicts() {
+    let text = resolver_prompt();
+    let result = generated("result");
+    let verdicts: BTreeSet<String> = resolve(&result, &result, &["unblock", "verdict"])
+        .into_iter()
+        .flat_map(|node| allowed_values(&result, node))
+        .collect();
+    let four: BTreeSet<String> = ["retry", "rebase", "person_step", "park"]
+        .map(String::from)
+        .into();
+    assert_eq!(verdicts, four, "the unblock verdicts changed");
+    let missing: Vec<String> = verdicts
+        .into_iter()
+        .chain(
+            [
+                "unblock",
+                "verdict",
+                "note",
+                "step",
+                "when",
+                "before_merge",
+                "after_merge",
+            ]
+            .map(String::from),
+        )
+        .filter(|word| !names(&text, word))
+        .collect();
+    assert!(
+        missing.is_empty(),
+        "roles/resolver.md does not name these of `unblock`: {missing:?}"
+    );
 }
 
 fn intake_prompt() -> String {

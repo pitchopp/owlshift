@@ -535,6 +535,8 @@ fn step_questions(
     pr: &DeliveredPullRequest,
     pushed: &str,
 ) -> Vec<Question> {
+    // A step the resolver handed to a person is one (OWL-620).
+    let effective = plan.effective();
     asked
         .iter()
         .enumerate()
@@ -543,7 +545,7 @@ fn step_questions(
                 .owed
                 .iter()
                 .filter(|owed| {
-                    plan.plan
+                    effective
                         .person_steps()
                         .take_while(|(person, _)| person < *owed)
                         .last()

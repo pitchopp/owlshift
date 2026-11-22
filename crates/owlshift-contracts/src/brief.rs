@@ -17,7 +17,7 @@ use crate::review::{
     Finding, FindingsMode, KeptFinding, MAX_PASS_FINDINGS, Mandate, Plan, PlanPart, check_findings,
     check_mandates,
 };
-use crate::{DelegationLevel, Role};
+use crate::{DelegationLevel, Role, Stage, UnblockVerdict};
 
 const CONTRACT: &str = "brief";
 
@@ -117,6 +117,12 @@ pub struct Brief {
     /// there.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub asked_by: Option<AskedBy>,
+    /// The run of `asked_by` stopped `blocked`, and the resolver gives one
+    /// verdict on it instead of settling questions (format 33, OWL-620;
+    /// architecture section 4, "A `blocked` through the resolver"): in the
+    /// resolver's brief only, then with no `resolve`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unblock: Option<UnblockBrief>,
     /// The runner ran `gate` itself after the ticket's previous Build `done`,
     /// and it failed (OWL-16): what the next Build run fixes first. Absent
     /// when no gate run of the runner has failed since the last green one.
@@ -392,6 +398,41 @@ pub struct AskedBy {
     pub diff: Option<GivenDiff>,
 }
 
+/// A run that stopped `blocked`, as the resolver's brief gives it (format 33,
+/// OWL-620): where it ran, the verdicts open to the resolver, and the run's
+/// ledger. The run itself, its summary, the plan and the diff are in
+/// `asked_by`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct UnblockBrief {
+    /// The stage the run ran at.
+    pub stage: Stage,
+    /// The verdicts the resolver may give, in [`UnblockVerdict::ALL`]'s
+    /// order, each once, `park` always among them; the runner refuses any
+    /// other.
+    #[schemars(length(min = 1, max = 4))]
+    pub verdicts: Vec<UnblockVerdict>,
+    /// The ledger the run left in this worktree, read-only, when it named
+    /// one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ledger: Option<RelativePath>,
+}
+
+impl UnblockBrief {
+    /// Why its verdicts break their rules, if they do: in
+    /// [`UnblockVerdict::ALL`]'s order, each once, with `park`.
+    fn refusal(&self) -> Option<String> {
+        let ordered = self.verdicts.windows(2).all(|pair| pair[0] < pair[1]);
+        if !ordered {
+            return Some("the unblock's verdicts are repeated or out of order".to_owned());
+        }
+        if !self.verdicts.contains(&UnblockVerdict::Park) {
+            return Some("the unblock's verdicts leave out `park`, always open".to_owned());
+        }
+        None
+    }
+}
+
 /// The most bytes one pull request review weighs in a brief, rendered as
 /// JSON.
 pub const MAX_PULL_REQUEST_REVIEW_BYTES: usize = 64 * 1024;
@@ -596,22 +637,32 @@ pub struct RebaseBrief {
     /// `gate` is empty, as for a held Build's.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub yielded: bool,
+    /// A Build's rebase on the resolver's `rebase` verdict (format 33,
+    /// OWL-620; architecture section 4, "A `blocked` through the
+    /// resolver"): the Build stopped `blocked` on what the base gained since
+    /// its branch left it, and its branch moves onto `onto` before it runs
+    /// again. Not delivered: no pull request, and the brief's `gate` is
+    /// empty, as for a held Build's.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub unblocked: bool,
 }
 
 impl RebaseBrief {
     /// Why this rebase is refused: not exactly one of a pull request,
-    /// `broken` and `yielded`, a `url` without its pull request or the
-    /// reverse, a held or yielded Build's rebase as a refresh, or a blank
-    /// `broken`.
+    /// `broken`, `yielded` and `unblocked`, a `url` without its pull request
+    /// or the reverse, a held, yielded or unblocked Build's rebase as a
+    /// refresh, or a blank `broken`.
     fn refusal(&self) -> Option<&'static str> {
         let kinds = [
             self.pull_request.is_some(),
             self.broken.is_some(),
             self.yielded,
+            self.unblocked,
         ];
         if kinds.iter().filter(|kind| **kind).count() != 1 {
             return Some(
-                "a rebase names exactly one of its pull request, its broken base or its yield",
+                "a rebase names exactly one of its pull request, its broken base, its yield or \
+                 its unblock",
             );
         }
         if self.pull_request.is_some() != self.url.is_some() {
@@ -619,6 +670,9 @@ impl RebaseBrief {
         }
         if self.yielded && self.refresh {
             return Some("a yielded Build's rebase is no refresh");
+        }
+        if self.unblocked && self.refresh {
+            return Some("an unblocked Build's rebase is no refresh");
         }
         match &self.broken {
             Some(_) if self.refresh => Some("a held Build's rebase is no refresh"),
@@ -1176,7 +1230,9 @@ impl Brief {
     /// Checks the rules the types alone do not carry: rounds increase through
     /// the thread, a round's questions are Q1..Qn, and a re-ask names, in
     /// order, distinct questions of an earlier round; a resolver's brief has
-    /// questions to `resolve`, in increasing order, a `delegation` level and
+    /// questions to `resolve`, in increasing order, or else a run to
+    /// `unblock` whose verdicts keep [`UnblockBrief`]'s rules (OWL-620), a
+    /// `delegation` level and
     /// the run that asked (`asked_by`, its plan's and diff's bases full
     /// commit ids), and no other brief has any; only the rebase role's
     /// brief has no `result_refusal` (since format 28, OWL-430: Build's, the
@@ -1444,10 +1500,35 @@ impl Brief {
                 ));
             }
         }
+        // A `blocked` through the resolver (format 33, OWL-620): the
+        // resolver's brief gives questions to resolve or a run to unblock,
+        // never both.
+        if let Some(unblock) = &self.unblock {
+            if self.role != Role::Resolver {
+                return Err(ContractError::invalid(
+                    CONTRACT,
+                    format!(
+                        "a run to unblock is given but the role is {}, not {}",
+                        self.role.as_str(),
+                        Role::Resolver.as_str()
+                    ),
+                ));
+            }
+            if !self.resolve.is_empty() {
+                return Err(ContractError::invalid(
+                    CONTRACT,
+                    "a resolver's brief gives questions to resolve and a run to unblock",
+                ));
+            }
+            if let Some(why) = unblock.refusal() {
+                return Err(ContractError::invalid(CONTRACT, why));
+            }
+            return Ok(());
+        }
         match (self.role == Role::Resolver, self.resolve.is_empty()) {
             (true, true) => Err(ContractError::invalid(
                 CONTRACT,
-                "a resolver's brief has no question to resolve",
+                "a resolver's brief has no question to resolve, nor a run to unblock",
             )),
             (false, false) => Err(ContractError::invalid(
                 CONTRACT,

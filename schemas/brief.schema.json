@@ -92,7 +92,7 @@
     "format": {
       "description": "The format version of this document.",
       "type": "integer",
-      "const": 32
+      "const": 33
     },
     "gate": {
       "description": "The project's full gate, from `stack.gate` in its configuration: the\ncommands the runner runs, in order, from the worktree root, on the\ncommit a Build delivers; a role runs them, or narrows them to its\nchange, before it delivers. The runner is its only author; an empty\nlist means the project has no gate.",
@@ -254,6 +254,17 @@
     },
     "ticket": {
       "$ref": "#/$defs/TicketBrief"
+    },
+    "unblock": {
+      "description": "The run of `asked_by` stopped `blocked`, and the resolver gives one\nverdict on it instead of settling questions (format 33, OWL-620;\narchitecture section 4, \"A `blocked` through the resolver\"): in the\nresolver's brief only, then with no `resolve`.",
+      "anyOf": [
+        {
+          "$ref": "#/$defs/UnblockBrief"
+        },
+        {
+          "type": "null"
+        }
+      ]
     },
     "zones": {
       "description": "The code zones the ticket holds (format 24, OWL-402): once intake\nkept its record, the zones it declared and those the ticket's `zone:`\nlabels add, each once, a zone another contains left out, and empty\nwhen intake named none, as the ticket then holds the whole\nrepository; before, and in the answer check's brief, the zones its\n`zone:` labels declare.",
@@ -1470,6 +1481,10 @@
           "description": "No conflict: the checks failed only on the base the head was pushed\nonto, which has passed them since, and the rebase refreshes the\nbranch so CI runs on the base as it is now.",
           "type": "boolean"
         },
+        "unblocked": {
+          "description": "A Build's rebase on the resolver's `rebase` verdict (format 33,\nOWL-620; architecture section 4, \"A `blocked` through the\nresolver\"): the Build stopped `blocked` on what the base gained since\nits branch left it, and its branch moves onto `onto` before it runs\nagain. Not delivered: no pull request, and the brief's `gate` is\nempty, as for a held Build's.",
+          "type": "boolean"
+        },
         "url": {
           "description": "The pull request's address, with `pull_request` only.",
           "type": [
@@ -1935,6 +1950,20 @@
         "text"
       ]
     },
+    "Stage": {
+      "description": "A stage of the pipeline, or `ready` for an admitted ticket not yet started.",
+      "type": "string",
+      "enum": [
+        "intake",
+        "ready",
+        "design",
+        "design_review",
+        "build",
+        "verify",
+        "deliver",
+        "watch"
+      ]
+    },
     "StateKind": {
       "description": "The type of a tracker state, as Linear types its workflow states.",
       "type": "string",
@@ -2259,6 +2288,66 @@
         "id",
         "context",
         "text"
+      ]
+    },
+    "UnblockBrief": {
+      "description": "A run that stopped `blocked`, as the resolver's brief gives it (format 33,\nOWL-620): where it ran, the verdicts open to the resolver, and the run's\nledger. The run itself, its summary, the plan and the diff are in\n`asked_by`.",
+      "type": "object",
+      "properties": {
+        "ledger": {
+          "description": "The ledger the run left in this worktree, read-only, when it named\none.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/RelativePath"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "stage": {
+          "description": "The stage the run ran at.",
+          "$ref": "#/$defs/Stage"
+        },
+        "verdicts": {
+          "description": "The verdicts the resolver may give, in [`UnblockVerdict::ALL`]'s\norder, each once, `park` always among them; the runner refuses any\nother.",
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/UnblockVerdict"
+          },
+          "maxItems": 4,
+          "minItems": 1
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "stage",
+        "verdicts"
+      ]
+    },
+    "UnblockVerdict": {
+      "description": "What the resolver answers on a run that stopped `blocked` (OWL-620,\narchitecture section 4, \"A `blocked` through the resolver\"): one act of\na closed list, each one the runner already makes. Which are open is\n[`crate::unblock::open`]'s.",
+      "oneOf": [
+        {
+          "description": "The stage runs again, the resolver's note in its thread: the\nobstacle is not one, such as a permission misread or a command that\nis there.",
+          "type": "string",
+          "const": "retry"
+        },
+        {
+          "description": "The branch goes to the rebase run: the obstacle is the base.",
+          "type": "string",
+          "const": "rebase"
+        },
+        {
+          "description": "The step is a person's, owed, and the Build goes on: the rest of the\nplan does not need its result.",
+          "type": "string",
+          "const": "person_step"
+        },
+        {
+          "description": "Today's path: the ticket parks, the resolver's sentence on what the\nperson must do first leading its PARKED comment.",
+          "type": "string",
+          "const": "park"
+        }
       ]
     }
   }

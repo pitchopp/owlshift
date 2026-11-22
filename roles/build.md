@@ -1,7 +1,7 @@
 +++
 role = "build"
-brief_format = 32
-result_format = 17
+brief_format = 33
+result_format = 18
 +++
 
 # Build
@@ -81,7 +81,7 @@ When the brief has `correction`, the ticket was delivered and the decider has si
 
 ## Ending the run
 
-Your last action is writing `result.json` at `result_path`, whatever the outcome; a run without it is a failure. It is JSON with `format` 17, rejected if it carries any field not listed here. `status` is one of:
+Your last action is writing `result.json` at `result_path`, whatever the outcome; a run without it is a failure. It is JSON with `format` 18, rejected if it carries any field not listed here. `status` is one of:
 
 - `done`: every step committed but those owed ("A person's steps"), the checks covering your change green (see "The gate"). Give `pr`: `branch` (the worktree's branch), `title` (imperative, per `rules`), `body` (what changed, why, the checks you ran and their result; the runner adds the owed steps after it); `owed` when the given plan has agent's steps you left for a person's result; and `finding_responses` when the brief's `findings` are to `fix` or to `answer` ("Findings").
 - `questions`: at least one question; the run resumes after the decider answers.
@@ -95,7 +95,7 @@ When the brief has `result_refusal`, the runner refused an earlier run's `result
 
 ```json
 {
-  "format": 17,
+  "format": 18,
   "status": "done",
   "summary": "Added the logs command with its tests; its checks pass.",
   "questions": [],

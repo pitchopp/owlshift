@@ -27,6 +27,7 @@
 //! | A broken base: whose a gate failure is, the base checks and holds | [`base`] |
 //! | When the background service starts a served project's watch again | [`restart`] |
 //! | Stack detection for `owlshift init`: the gate read from the root files | [`stack`] |
+//! | A `blocked` through the resolver: the verdicts open on it | [`unblock`] |
 
 pub mod agent_env;
 pub mod base;
@@ -49,5 +50,6 @@ pub mod schedule;
 pub mod stack;
 pub mod state;
 pub mod ticket;
+pub mod unblock;
 pub mod usage;
 pub mod vocab;

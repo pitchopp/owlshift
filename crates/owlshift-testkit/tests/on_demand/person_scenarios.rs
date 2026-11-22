@@ -39,17 +39,17 @@ const AFTER_PLAN: &str = r#"{"goal":"Add GREETING.md saying Hello.",
   "by":"person","when":"after_merge"}]}"#;
 
 /// The Build's `done`, the agent's third step left for the second's result.
-const OWING: &str = r#"{"format":17,"status":"done","summary":"Added GREETING.md; step 3 waits on step 2.",
+const OWING: &str = r#"{"format":18,"status":"done","summary":"Added GREETING.md; step 3 waits on step 2.",
 "owed":[3],
 "pr":{"branch":"owlshift/demo-1","title":"Add a greeting","body":"Says hello. Gate: green."}}"#;
 
 /// The run at Watch's `done` after the round: step 3 built with the
 /// results.
-const NOTED: &str = r#"{"format":17,"status":"done","summary":"Noted the staging check in the README.",
+const NOTED: &str = r#"{"format":18,"status":"done","summary":"Noted the staging check in the README.",
 "pr":{"branch":"owlshift/demo-1","title":"Add a greeting","body":"Noted."}}"#;
 
 /// The run at Watch's `done` after a defect reported on step 2.
-const MENDED: &str = r#"{"format":17,"status":"done","summary":"Fixed the greeting's spelling.",
+const MENDED: &str = r#"{"format":18,"status":"done","summary":"Fixed the greeting's spelling.",
 "pr":{"branch":"owlshift/demo-1","title":"Add a greeting","body":"Mended."}}"#;
 
 /// Two minutes later on the bench's clock.
@@ -76,7 +76,7 @@ fn verdicts(answers: &[(&str, Option<&str>, &str)]) -> String {
             verdict
         })
         .collect();
-    json!({ "format": 17, "status": "done", "summary": "Checked.", "verdicts": verdicts })
+    json!({ "format": 18, "status": "done", "summary": "Checked.", "verdicts": verdicts })
         .to_string()
 }
 
@@ -452,7 +452,7 @@ fn the_steps_after_the_merge_are_filed_as_one_follow_up_once_merged() {
 fn a_person_s_step_met_outside_the_plan_is_asked_of_the_decider() {
     let bench = Bench::new(true);
     bench.policy("resolver_delegation = \"all\"");
-    let asked = r#"{"format":17,"status":"questions",
+    let asked = r#"{"format":18,"status":"questions",
 "summary":"Added GREETING.md; its look on staging needs a person.",
 "questions":[{"id":"Q1","category":"person_step",
  "context":"Staging sits behind a login no run holds.",
@@ -498,7 +498,7 @@ fn a_review_loop_build_that_changes_nothing_keeps_what_it_owes() {
         "Does it say Hello?",
         &[],
     )]);
-    let unchanged = r#"{"format":17,"status":"done","summary":"GREETING.md already says Hello: nothing to change; step 3 waits on step 2.",
+    let unchanged = r#"{"format":18,"status":"done","summary":"GREETING.md already says Hello: nothing to change; step 3 waits on step 2.",
 "owed":[3],
 "pr":{"branch":"owlshift/demo-1","title":"Add a greeting","body":"Unchanged."}}"#;
     let (outcome, printed) = bench.continue_ticket(vec![bench.reply(None, Some(unchanged))]);

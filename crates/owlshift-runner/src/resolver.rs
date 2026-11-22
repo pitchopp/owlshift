@@ -29,18 +29,19 @@
 use std::collections::BTreeMap;
 use std::time::Duration;
 
-use owlshift_contracts::BasisKind;
 use owlshift_contracts::brief::{Brief, Relation, ThreadEntry, ToResolve};
 use owlshift_contracts::ids::QuestionId;
-use owlshift_contracts::refs::KeptDecision;
+use owlshift_contracts::refs::{KeptDecision, TicketQuestions};
 use owlshift_contracts::result::{
-    Decision, Question, QuestionOption, Resolution, Status, option_letter,
+    Decision, Question, QuestionOption, Resolution, Status, UnblockAnswer, option_letter,
 };
+use owlshift_contracts::review::StepWhen;
+use owlshift_contracts::{BasisKind, Role, UnblockVerdict};
 use owlshift_core::floor::{FloorCategory, names_floor_category};
 use owlshift_core::gate::{BudgetReached, ChainEnd, GatePolicy, Route};
 
 use crate::executor::Outcome;
-use crate::writer::{ReopenedChoice, flatten};
+use crate::writer::{ReopenedChoice, clip, flatten};
 
 /// The executor's deadline for a resolver run, the ticket's
 /// `resolver::DEADLINE` (OWL-344): longer than the answer check's, since the
@@ -118,6 +119,83 @@ pub fn with_closure(questions: &[Question]) -> Vec<Question> {
 fn closure_letter(question: &Question) -> Option<String> {
     let last = question.options.len().checked_sub(1)?;
     (question.options[last].label == CLOSURE).then(|| option_letter(last))
+}
+
+/// Whether the decider took a false premise's closure in the latest ask
+/// (architecture section 5, "A false premise"): one of its questions ends
+/// with [`CLOSURE`], and the answer check read the decider as choosing that
+/// option. The role then ends `blocked`, and the ticket parks without a
+/// resolver run (OWL-620), so that no run builds on a premise the decider
+/// rejected.
+pub fn closure_taken(questions: &TicketQuestions) -> bool {
+    let Some(latest) = questions.latest() else {
+        return false;
+    };
+    latest.verdicts.iter().any(|verdict| {
+        latest
+            .questions
+            .iter()
+            .find(|question| question.id == verdict.question)
+            .and_then(closure_letter)
+            .is_some_and(|letter| verdict.option.as_deref() == Some(letter.as_str()))
+    })
+}
+
+/// The category of the runner's own question on a `blocked` (OWL-620): not
+/// an always-human one, so the resolver's label and the basis's kind alone
+/// decide whether its verdict stands ([`settle`]).
+pub const UNBLOCK_CATEGORY: &str = "unblock";
+
+/// The runner's own question on a run of `role` that stopped `blocked`
+/// (OWL-620), as the DECISION comment shows it and the ticket ref keeps it:
+/// one option per verdict of `open`, lettered in their order, no
+/// recommendation. `summary` is the run's own, cut to one line.
+pub fn unblock_question(role: Role, summary: &str, open: &[UnblockVerdict]) -> Question {
+    Question {
+        id: QuestionId::nth(1),
+        category: UNBLOCK_CATEGORY.to_owned(),
+        context: clip(&flatten(summary), UNBLOCK_CONTEXT_CHARS),
+        text: format!(
+            "The {} run stopped blocked: what does the runner do?",
+            role.as_str()
+        ),
+        options: open
+            .iter()
+            .map(|verdict| QuestionOption::new(verdict.label()))
+            .collect(),
+        recommendation: None,
+        replan: false,
+    }
+}
+
+/// The most characters of a blocked run's summary the runner's question
+/// keeps as its context.
+const UNBLOCK_CONTEXT_CHARS: usize = 300;
+
+/// The resolver's verdict on a `blocked` as a decision on the runner's own
+/// question ([`unblock_question`]), for [`settle`] to hold to the level as
+/// any decision (OWL-620): the resolver's label, basis and quote; its act
+/// and note as the decision, a handed step named, which the DECISION
+/// comment's line shows, as it shows no option's label.
+pub fn unblock_resolution(answer: &UnblockAnswer) -> Resolution {
+    let act = match (answer.step, answer.when) {
+        (Some(step), Some(StepWhen::BeforeMerge)) => {
+            format!("Step {step} is a person's, due before the merge")
+        }
+        (Some(step), Some(StepWhen::AfterMerge)) => {
+            format!("Step {step} is a person's, due after the merge")
+        }
+        _ => answer.verdict.label().to_owned(),
+    };
+    Resolution::Decided {
+        question: QuestionId::nth(1),
+        category: answer.category.clone(),
+        decision: format!("{act}: {}", flatten(&answer.note)),
+        basis: answer.basis.clone(),
+        basis_kind: answer.basis_kind,
+        quote: answer.quote.clone(),
+        option: None,
+    }
 }
 
 /// Why the questions meant for the resolver went to the decider; the
@@ -562,6 +640,8 @@ fn recommended_kind(decision: &&KeptDecision) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use std::num::NonZeroU32;
+
     use owlshift_contracts::DelegationLevel;
     use owlshift_contracts::format::{BRIEF_FORMAT, RESULT_FORMAT};
     use owlshift_contracts::result::{Recommendation, RunResult};
@@ -927,6 +1007,157 @@ mod tests {
         );
     }
 
+    /// OWL-620: the runner's own question on a `blocked` offers the open
+    /// verdicts, lettered; the resolver's verdict is a decision on it, its
+    /// option the verdict's letter, its decision the act and the note, a
+    /// handed step named. `settle` holds it to the level as any decision: a
+    /// floor label or a `judgment` below `all` is refused.
+    #[test]
+    fn a_verdict_on_a_blocked_is_held_to_the_level_as_a_decision() {
+        use owlshift_contracts::review::StepWhen;
+        let open = [
+            UnblockVerdict::Retry,
+            UnblockVerdict::PersonStep,
+            UnblockVerdict::Park,
+        ];
+        let asked = unblock_question(Role::Build, "Stopped:\n  network false.", &open);
+        assert_eq!(asked.category, UNBLOCK_CATEGORY);
+        assert_eq!(asked.context, "Stopped: network false.");
+        let labels: Vec<&str> = asked.options.iter().map(|o| o.label.as_str()).collect();
+        assert_eq!(
+            labels,
+            [
+                "Run the stage again",
+                "Owe the step to a person, and go on",
+                "Park the ticket for a person"
+            ]
+        );
+        let answer = |verdict, category: &str, kind| UnblockAnswer {
+            verdict,
+            note: "The shell\nreaches the network.".into(),
+            category: category.into(),
+            basis: "curl reached it.".into(),
+            basis_kind: kind,
+            quote: None,
+            step: (verdict == UnblockVerdict::PersonStep).then(|| NonZeroU32::new(3).unwrap()),
+            when: (verdict == UnblockVerdict::PersonStep).then_some(StepWhen::AfterMerge),
+        };
+        let decided = |verdict, category| match unblock_resolution(&answer(
+            verdict,
+            category,
+            BasisKind::Fact,
+        )) {
+            Resolution::Decided {
+                decision, option, ..
+            } => (decision, option),
+            other @ Resolution::PassedOn { .. } => panic!("{other:?}"),
+        };
+        assert_eq!(
+            decided(UnblockVerdict::Retry, "permissions"),
+            (
+                "Run the stage again: The shell reaches the network.".to_owned(),
+                None
+            )
+        );
+        assert_eq!(
+            decided(UnblockVerdict::PersonStep, "browser"),
+            (
+                "Step 3 is a person's, due after the merge: The shell reaches the network."
+                    .to_owned(),
+                None
+            )
+        );
+        let at = |level| {
+            GatePolicy::new(Vec::<String>::new(), PlanApproval::Never).with_resolver(
+                ResolverPolicy {
+                    level,
+                    ..ResolverPolicy::default()
+                },
+            )
+        };
+        let given = [asked];
+        let stands = |level, category: &str, kind| {
+            let resolutions = [unblock_resolution(&answer(
+                UnblockVerdict::Retry,
+                category,
+                kind,
+            ))];
+            !settle(
+                &at(level),
+                &given,
+                &resolutions,
+                &Quotable::default(),
+                false,
+            )
+            .logged
+            .is_empty()
+        };
+        assert!(stands(
+            DelegationLevel::Discoverable,
+            "permissions",
+            BasisKind::Fact
+        ));
+        assert!(!stands(
+            DelegationLevel::Discoverable,
+            "security",
+            BasisKind::Fact
+        ));
+        assert!(!stands(
+            DelegationLevel::Ticket,
+            "permissions",
+            BasisKind::Judgment
+        ));
+        assert!(stands(
+            DelegationLevel::All,
+            "permissions",
+            BasisKind::Judgment
+        ));
+    }
+
+    /// OWL-620: the decider took a false premise's closure when the latest
+    /// ask's question ends with it and its verdict chose that letter; a
+    /// re-scope, words of their own or another question's letter is not.
+    #[test]
+    fn a_closure_taken_is_read_from_the_latest_asks_verdict() {
+        use owlshift_contracts::refs::{Ask, AskDecider, AskKind};
+        use owlshift_contracts::result::{AnswerClass, Verdict};
+        use owlshift_core::decider::DeciderRule;
+        let mut premise = question("Q1", "premise");
+        premise.options = vec![QuestionOption::new("Re-scope it.")];
+        let ask = |questions: Vec<Question>, option: Option<&str>| {
+            let mut kept = TicketQuestions::new();
+            kept.asks.push(Ask {
+                kind: AskKind::Questions,
+                round: NonZeroU32::MIN,
+                at: "2026-11-22T09:00:00Z".parse().unwrap(),
+                comment: "c".into(),
+                questions,
+                decider: AskDecider {
+                    account: "a".into(),
+                    by: DeciderRule::Assignee,
+                },
+                verdicts: vec![Verdict {
+                    question: QuestionId::new("Q1").unwrap(),
+                    class: AnswerClass::Answered,
+                    reason: "r".into(),
+                    reply: None,
+                    option: option.map(str::to_owned),
+                }],
+                result_refusal: None,
+                labels: BTreeMap::new(),
+            });
+            kept
+        };
+        let closing = with_closure(std::slice::from_ref(&premise));
+        assert!(closure_taken(&ask(closing.clone(), Some("B"))));
+        assert!(!closure_taken(&ask(closing.clone(), Some("A"))));
+        assert!(!closure_taken(&ask(closing, None)));
+        let mut plain = question("Q1", "naming");
+        plain.options = vec![QuestionOption::new("x"), QuestionOption::new("y")];
+        assert!(!closure_taken(&ask(vec![plain], Some("B"))));
+        assert!(!closure_taken(&TicketQuestions::new()));
+    }
+
     /// A chain ended by its pass limit or its ceiling is a `pass_limit`,
     /// the ceiling's saying why.
     #[test]
@@ -1086,6 +1317,7 @@ mod tests {
             basis_kind: kind,
             number: None,
             reversed: None,
+            unblock: None,
         };
         let decisions = [
             kept(1, Some(BasisKind::Settled)),

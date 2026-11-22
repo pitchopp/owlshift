@@ -271,7 +271,7 @@ fn result_rejections() {
     rejects(
         "newer format with unknown fields",
         parse(|v| {
-            v["format"] = json!(18);
+            v["format"] = json!(19);
             v["confidence"] = json!(0.9);
         }),
         "upgrade Owlshift",
@@ -330,20 +330,20 @@ fn result_rejections() {
     );
     rejects(
         "truncated document",
-        RunResult::parse(r#"{"format": 18, "status""#),
+        RunResult::parse(r#"{"format": 19, "status""#),
         "upgrade Owlshift",
     );
     rejects(
         "truncated document",
-        RunResult::parse(r#"{"format": 17, "status""#),
+        RunResult::parse(r#"{"format": 18, "status""#),
         "EOF",
     );
-    let newer = edited("result-sample.json", |v| v["format"] = json!(18));
+    let newer = edited("result-sample.json", |v| v["format"] = json!(19));
     assert!(matches!(
         RunResult::parse(&newer),
         Err(ContractError::NewerFormat {
-            found: 18,
-            supported: 17,
+            found: 19,
+            supported: 18,
             ..
         })
     ));
@@ -1176,6 +1176,218 @@ fn refused_choices_asked_against_the_brief() {
     assert!(at + head.len() < MAX_RESULT_REFUSAL_BYTES, "{at}");
 }
 
+/// A run that stopped `blocked` (OWL-620): the resolver's brief gives the run
+/// to unblock instead of questions, its verdicts in order with `park`, to
+/// the resolver alone; its `done` result gives one open verdict, with its
+/// note, label and basis, a quote on a `ticket` basis only, and a step with
+/// its `when` on `person_step` only, an agent's step of the given plan.
+#[test]
+fn an_unblock_verdict_against_the_brief() {
+    let brief = |verdicts: Value, plan: bool| {
+        Brief::parse(&edited("brief.json", |v| {
+            v["role"] = json!("resolver");
+            v["delegation"] = json!("discoverable");
+            v["asked_by"] = json!({ "role": "build", "run": "r1", "summary": "Blocked." });
+            if plan {
+                v["asked_by"]["plan"] = json!({ "base": "b".repeat(40), "plan": {
+                    "goal": "G", "criteria": ["C"], "approach": "A",
+                    "steps": [
+                        { "what": "S1", "test": "T1" },
+                        { "what": "Read it in a browser.", "test": "It reads.", "by": "person",
+                          "when": "before_merge" },
+                        { "what": "S3", "test": "T3" }
+                    ] } });
+            }
+            v["unblock"] = json!({ "stage": "build", "verdicts": verdicts });
+            v["permissions"]["level"] = json!("read_only");
+            v.as_object_mut().unwrap().remove("result_refusal");
+        }))
+    };
+    let open = brief(json!(["retry", "person_step", "park"]), true).unwrap();
+    rejects(
+        "verdicts without park",
+        brief(json!(["retry"]), false),
+        "leave out `park`",
+    );
+    rejects(
+        "verdicts out of order",
+        brief(json!(["park", "retry"]), false),
+        "repeated or out of order",
+    );
+    rejects(
+        "questions and a run to unblock",
+        Brief::parse(
+            &serde_json::to_string(&{
+                let mut both = serde_json::to_value(&open).unwrap();
+                both["resolve"] =
+                    json!([{ "id": "Q1", "context": "c", "text": "t", "recommendation": { "why": "r" } }]);
+                both
+            })
+            .unwrap(),
+        ),
+        "questions to resolve and a run to unblock",
+    );
+    rejects(
+        "a run to unblock in Build's brief",
+        Brief::parse(&edited("brief.json", |v| {
+            v["unblock"] = json!({ "stage": "build", "verdicts": ["park"] });
+        })),
+        "a run to unblock is given but the role is build",
+    );
+
+    let verdict = |unblock: Value| {
+        json!({ "format": 18, "status": "done", "summary": "s", "unblock": unblock }).to_string()
+    };
+    let retry = json!({ "verdict": "retry", "note": "The shell reaches the network.",
+        "category": "permissions", "basis": "curl reached crates.io.", "basis_kind": "fact" });
+    RunResult::parse_against(&verdict(retry.clone()), &open).unwrap();
+    let mut owed = retry.clone();
+    owed["verdict"] = json!("person_step");
+    owed["step"] = json!(3);
+    owed["when"] = json!("before_merge");
+    RunResult::parse_against(&verdict(owed.clone()), &open).unwrap();
+    let edit = |base: &Value, edit: fn(&mut Value)| {
+        let mut value = base.clone();
+        edit(&mut value);
+        verdict(value)
+    };
+    let refused = |input: String, brief: &Brief| {
+        RunResult::parse_against(&input, brief)
+            .map(|_| ())
+            .map_err(|refused| refused.error)
+    };
+    for (case, input, needle) in [
+        (
+            "a verdict not open",
+            edit(&retry, |v| v["verdict"] = json!("rebase")),
+            "is not open here",
+        ),
+        (
+            "a person's step already",
+            edit(&owed, |v| v["step"] = json!(2)),
+            "already a person's",
+        ),
+        (
+            "a step past the plan",
+            edit(&owed, |v| v["step"] = json!(4)),
+            "not a step of the given plan",
+        ),
+        (
+            "a person_step without its when",
+            edit(&owed, |v| {
+                v.as_object_mut().unwrap().remove("when");
+            }),
+            "without its `step` and `when`",
+        ),
+        (
+            "a step with retry",
+            edit(&retry, |v| v["step"] = json!(1)),
+            "only `person_step` names a step",
+        ),
+        (
+            "a blank note",
+            edit(&retry, |v| v["note"] = json!(" ")),
+            "has a blank note",
+        ),
+        (
+            "a long note",
+            edit(&retry, |v| v["note"] = json!("n".repeat(513))),
+            "past the 512",
+        ),
+        (
+            "a quote on a fact",
+            edit(&retry, |v| v["quote"] = json!("q")),
+            "only a `ticket` basis quotes",
+        ),
+        (
+            "the runner's own kind",
+            edit(&retry, |v| v["basis_kind"] = json!("recommendation")),
+            "the runner's own kind",
+        ),
+        (
+            "a done without its verdict",
+            json!({ "format": 18, "status": "done", "summary": "s" }).to_string(),
+            "without its unblock verdict",
+        ),
+        (
+            "a verdict not done",
+            json!({ "format": 18, "status": "failed", "summary": "s", "unblock": retry })
+                .to_string(),
+            "unblock is given but status is not done",
+        ),
+    ] {
+        rejects(case, refused(input, &open), needle);
+    }
+    // A failed resolver gives none, and needs not; no other brief takes one.
+    refused(
+        json!({ "format": 18, "status": "failed", "summary": "s" }).to_string(),
+        &open,
+    )
+    .unwrap();
+    rejects(
+        "a verdict on questions",
+        refused(
+            verdict(retry),
+            &Brief::parse(&fixture("brief.json")).unwrap(),
+        ),
+        "the brief gives no run to unblock",
+    );
+}
+
+/// A decision keeps the verdict on a `blocked` it posted (questions.json
+/// 20, OWL-620), which bounds the next ones at its stage: never a `park`,
+/// and a step with `person_step` alone; format 19 is read without it and
+/// refused with one.
+#[test]
+fn a_kept_unblock_verdict_bounds_its_stage() {
+    let kept = |unblock: Value| {
+        TicketQuestions::parse(&edited("ticket-questions.json", |v| {
+            v["decisions"][0]["unblock"] = unblock;
+        }))
+    };
+    let retried = kept(json!({ "stage": "build", "verdict": "retry" })).unwrap();
+    assert_eq!(
+        retried.unblocks_at(owlshift_contracts::Stage::Build),
+        [owlshift_contracts::UnblockVerdict::Retry]
+    );
+    assert!(
+        retried
+            .unblocks_at(owlshift_contracts::Stage::Watch)
+            .is_empty()
+    );
+    assert!(retried.render().contains("\"verdict\": \"retry\""));
+    kept(json!({ "stage": "build", "verdict": "person_step", "step": 3 })).unwrap();
+    for (unblock, needle) in [
+        (
+            json!({ "stage": "build", "verdict": "park" }),
+            "posts no DECISION",
+        ),
+        (
+            json!({ "stage": "build", "verdict": "person_step" }),
+            "without its step",
+        ),
+        (
+            json!({ "stage": "watch", "verdict": "retry", "step": 1 }),
+            "other than `person_step`",
+        ),
+    ] {
+        rejects("a kept unblock", kept(unblock), needle);
+    }
+    let nineteen = TicketQuestions::parse(&edited("ticket-questions.json", |v| {
+        v["format"] = json!(19)
+    }))
+    .unwrap();
+    assert!(nineteen.render().starts_with("{\n  \"format\": 20,"));
+    rejects(
+        "a format-19 decision with an unblock verdict",
+        TicketQuestions::parse(&edited("ticket-questions.json", |v| {
+            v["format"] = json!(19);
+            v["decisions"][0]["unblock"] = json!({ "stage": "build", "verdict": "retry" });
+        })),
+        "format 19 keeps no decision's unblock verdict",
+    );
+}
+
 /// The resolver's brief carries the questions it settles, without the
 /// category the raising run gave them (OWL-144), and its result one
 /// resolution for each of them, no more (OWL-138): a decision on a question
@@ -1635,7 +1847,7 @@ fn brief_rejections() {
     );
     rejects(
         "newer format",
-        parse(|v| v["format"] = json!(33)),
+        parse(|v| v["format"] = json!(34)),
         "upgrade Owlshift",
     );
     rejects(
@@ -2034,7 +2246,7 @@ fn brief_rejections() {
         (told.pull_request, told.url, told.broken),
         (None, None, Some("3".repeat(40)))
     );
-    let both = "exactly one of its pull request, its broken base or its yield";
+    let both = "exactly one of its pull request, its broken base, its yield or its unblock";
     rejects(
         "a rebase with both",
         rebase_with(&|r| r["broken"] = json!("3".repeat(40))),
@@ -2358,7 +2570,7 @@ fn event_claim_and_state_rejections() {
         |edit: fn(&mut Value)| TicketQuestions::parse(&edited("ticket-questions.json", edit));
     rejects(
         "newer questions",
-        asked(|v| v["format"] = json!(20)),
+        asked(|v| v["format"] = json!(21)),
         "upgrade Owlshift",
     );
     // A verdict's chosen option (format 19, OWL-585): on an answered
@@ -2376,7 +2588,7 @@ fn event_claim_and_state_rejections() {
         "format 18 keeps no verdict's option",
     );
     let eighteen = asked(|v| v["format"] = json!(18)).unwrap();
-    assert!(eighteen.render().starts_with("{\n  \"format\": 19,"));
+    assert!(eighteen.render().starts_with("{\n  \"format\": 20,"));
     rejects(
         "an option on a partial verdict",
         asked(|v| v["asks"][0]["verdicts"][1]["option"] = json!("A")),
@@ -2440,7 +2652,7 @@ fn event_claim_and_state_rejections() {
     assert!(older.decisions[0].reversed.is_some());
     assert_eq!(older.decisions[0].number, None);
     assert_eq!(older.decisions[0].place().get(), 1);
-    assert!(older.render().starts_with("{\n  \"format\": 19,"));
+    assert!(older.render().starts_with("{\n  \"format\": 20,"));
     assert!(!older.render().contains("asked_by"));
     rejects(
         "a format-14 decision with a number",
@@ -2484,7 +2696,7 @@ fn event_claim_and_state_rejections() {
     assert_eq!(fifteen.decisions[0].basis_kind, Some(BasisKind::Judgment));
     assert!(fifteen.decisions[0].reversed.is_some());
     assert!(fifteen.decisions_document.is_some());
-    assert!(fifteen.render().starts_with("{\n  \"format\": 19,"));
+    assert!(fifteen.render().starts_with("{\n  \"format\": 20,"));
     rejects(
         "a format-15 decision taken on a recommendation",
         asked(|v| {
@@ -2515,7 +2727,7 @@ fn event_claim_and_state_rejections() {
     );
     assert!(sixteen.decisions[0].reversed.is_some());
     let rendered = sixteen.render();
-    assert!(rendered.starts_with("{\n  \"format\": 19,"));
+    assert!(rendered.starts_with("{\n  \"format\": 20,"));
     assert!(!rendered.contains("asked_by"));
     assert_eq!(TicketQuestions::parse(&rendered).unwrap(), sixteen);
     assert_eq!(TicketQuestions::parse(&kept.render()).unwrap(), kept);
@@ -2528,7 +2740,7 @@ fn event_claim_and_state_rejections() {
     // the current format, a role refused in it.
     let older = asked(|v| v["format"] = json!(13)).unwrap();
     assert!(!older.decisions.is_empty());
-    assert!(older.render().starts_with("{\n  \"format\": 19,"));
+    assert!(older.render().starts_with("{\n  \"format\": 20,"));
     rejects(
         "a format-13 decision with an asking role",
         asked(|v| {
@@ -2650,7 +2862,7 @@ fn event_claim_and_state_rejections() {
     let read = TicketQuestions::parse(&format_2).unwrap();
     assert_eq!(read.asks.len(), 2);
     assert!(read.asks.iter().all(|ask| ask.verdicts.is_empty()));
-    assert!(read.render().starts_with("{\n  \"format\": 19,"));
+    assert!(read.render().starts_with("{\n  \"format\": 20,"));
     // A format-3 document, written before the resolver's decisions were
     // kept, is read with none, its verdicts kept.
     let format_3 = edited("ticket-questions.json", |v| {
@@ -2666,7 +2878,7 @@ fn event_claim_and_state_rejections() {
     let read = TicketQuestions::parse(&format_3).unwrap();
     assert!(read.decisions.is_empty());
     assert_eq!(read.asks[0].verdicts.len(), 2);
-    assert!(read.render().starts_with("{\n  \"format\": 19,"));
+    assert!(read.render().starts_with("{\n  \"format\": 20,"));
     // A format-4 document, written before an ask kept its check's refusal,
     // is read with none, its decisions kept.
     let format_4 = edited("ticket-questions.json", |v| {
@@ -2681,7 +2893,7 @@ fn event_claim_and_state_rejections() {
     let read = TicketQuestions::parse(&format_4).unwrap();
     assert!(read.asks.iter().all(|ask| ask.result_refusal.is_none()));
     assert_eq!(read.decisions.len(), 1);
-    assert!(read.render().starts_with("{\n  \"format\": 19,"));
+    assert!(read.render().starts_with("{\n  \"format\": 20,"));
     // A format-5 document, written before Build's refusal was kept
     // (OWL-192), is read with none, its asks' refusals kept.
     let format_5 = edited("ticket-questions.json", |v| {
@@ -2692,7 +2904,7 @@ fn event_claim_and_state_rejections() {
     let read = TicketQuestions::parse(&format_5).unwrap();
     assert_eq!(read.build_refusal, None);
     assert!(read.asks[1].result_refusal.is_some());
-    assert!(read.render().starts_with("{\n  \"format\": 19,"));
+    assert!(read.render().starts_with("{\n  \"format\": 20,"));
     // Formats 6 and 7 kept Build's refusal in their own shape (OWL-192,
     // OWL-194): the hold's first list in `decisions_reason`, the latest
     // reason, of a kind they did not keep, in `reason`. Each is read as
@@ -2711,7 +2923,7 @@ fn event_claim_and_state_rejections() {
     };
     let upgraded = |format: u64, refusal: Value| {
         let read = TicketQuestions::parse(&legacy(format, refusal)).unwrap();
-        assert!(read.render().starts_with("{\n  \"format\": 19,"));
+        assert!(read.render().starts_with("{\n  \"format\": 20,"));
         read.build_refusal.unwrap()
     };
     for format in [6, 7] {
@@ -2790,7 +3002,7 @@ fn event_claim_and_state_rejections() {
     };
     let read =
         TicketQuestions::parse(&format_8(json!({"reason": latest, "lists": [held]}))).unwrap();
-    assert!(read.render().starts_with("{\n  \"format\": 19,"));
+    assert!(read.render().starts_with("{\n  \"format\": 20,"));
     let kept = read.build_refusal.unwrap();
     assert!(kept.holds() && kept.choices.is_empty() && kept.lists == [held]);
     assert_eq!(
@@ -2812,7 +3024,7 @@ fn event_claim_and_state_rejections() {
     // reversal is refused in it. Format 10 keeps one, naming its reply.
     let read = TicketQuestions::parse(&edited("ticket-questions.json", |v| v["format"] = json!(9)))
         .unwrap();
-    assert!(read.render().starts_with("{\n  \"format\": 19,"));
+    assert!(read.render().starts_with("{\n  \"format\": 20,"));
     assert!(read.decisions[0].reversed.is_none());
     let reversal = || json!({"through": "2026-09-28T12:00:00Z", "comment": "c-reply-1"});
     rejects(
@@ -2868,7 +3080,7 @@ fn event_claim_and_state_rejections() {
             v["asks"][0]["questions"][0]["recommendation"] = json!("English, as the code");
         }))
         .unwrap_or_else(|e| panic!("format {format}: {e}"));
-        assert!(read.render().starts_with("{\n  \"format\": 19,"));
+        assert!(read.render().starts_with("{\n  \"format\": 20,"));
         let asked = &read.asks[0].questions[0];
         assert_eq!(
             asked.options,
@@ -4046,7 +4258,7 @@ fn a_malformed_followup_keeps_the_result() {
     };
     let failed = |followups: Value| {
         json!({
-            "format": 17,
+            "format": 18,
             "status": "failed",
             "summary": "On 8a681af, the gate fails: 5 tests of the leases module fail on the base too.",
             "followups": followups,

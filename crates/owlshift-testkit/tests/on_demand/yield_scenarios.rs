@@ -12,10 +12,10 @@ use super::*;
 
 /// A Build that stops for a person, which parks its ticket.
 const BLOCKED: &str =
-    r#"{"format":17,"status":"blocked","summary":"The migration needs a person's decision."}"#;
+    r#"{"format":18,"status":"blocked","summary":"The migration needs a person's decision."}"#;
 
 /// A yielded Build's rebase run's `done`.
-const REBASED_YIELDED: &str = r#"{"format":17,"status":"done","summary":"Rebased onto the taker's merge; nothing conflicted."}"#;
+const REBASED_YIELDED: &str = r#"{"format":18,"status":"done","summary":"Rebased onto the taker's merge; nothing conflicted."}"#;
 
 /// A bench whose project's `[policy]` is given `policy`, and whose DEMO-1's
 /// ref keeps an intake record declaring `zone`, a trivial ticket, which its
@@ -150,7 +150,13 @@ fn scenario_s5_a_parked_build_yields_its_migration_chain_and_is_rebased_onto_the
         "max_in_flight = 2\noverlap = \"rebase\"\n[stack.resources]\nmigrations = \"db/*\"\n",
     );
     let named = NamedResources::new([("migrations", "db/*")]).unwrap();
-    let (parked, printed) = bench.run(vec![committing(&bench, "db/0001.sql", BLOCKED)], None);
+    let (parked, printed) = bench.run(
+        vec![
+            committing(&bench, "db/0001.sql", BLOCKED),
+            bench.reply(None, Some(UNBLOCK_PARK)),
+        ],
+        None,
+    );
     assert!(
         matches!(
             &parked,
@@ -361,7 +367,10 @@ fn under_exclusive_a_parked_holder_keeps_a_second_build_waiting() {
     );
     let (parked, printed) = bench.invoke(
         false,
-        vec![committing(&bench, "app/one.rs", BLOCKED)],
+        vec![
+            committing(&bench, "app/one.rs", BLOCKED),
+            bench.reply(None, Some(UNBLOCK_PARK)),
+        ],
         None,
         vec![told],
     );

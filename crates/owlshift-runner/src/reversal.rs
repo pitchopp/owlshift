@@ -290,6 +290,7 @@ mod tests {
             basis_kind: None,
             number: None,
             reversed: None,
+            unblock: None,
         }
     }
 

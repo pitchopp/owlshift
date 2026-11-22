@@ -217,12 +217,24 @@ pub(super) fn given_plan(p: &Prepared) -> Option<GivenPlan> {
     kept_plan(p).filter(|_| p.pipeline.contains(Stage::Design))
 }
 
-/// The plan a Build follows (OWL-365): [`given_plan`] without its `forks`
-/// and `alternatives`, how the design chose among approaches, whose choices
-/// its approach and steps carry. A copy for the brief: the kept plan, and
-/// the hash its approval binds, are untouched.
-pub(super) fn build_plan(p: &Prepared) -> Option<GivenPlan> {
+/// [`given_plan`] as its steps stand (OWL-620): a step the resolver handed
+/// to a person reads as a person's ([`TicketPlan::effective`]). A copy for
+/// a brief: the kept plan, and the hash its approval binds, are untouched.
+pub(super) fn effective_plan(p: &Prepared) -> Option<GivenPlan> {
     given_plan(p).map(|mut given| {
+        if let Some(kept) = &p.plan {
+            given.plan = kept.effective();
+        }
+        given
+    })
+}
+
+/// The plan a Build follows (OWL-365): [`effective_plan`] without its
+/// `forks` and `alternatives`, how the design chose among approaches, whose
+/// choices its approach and steps carry. A copy for the brief: the kept
+/// plan, and the hash its approval binds, are untouched.
+pub(super) fn build_plan(p: &Prepared) -> Option<GivenPlan> {
+    effective_plan(p).map(|mut given| {
         given.plan.forks.clear();
         given.plan.alternatives.clear();
         given
@@ -1745,6 +1757,7 @@ impl OnDemand<'_> {
             // A new plan owes nothing yet: its Build says what it left.
             owed: Vec::new(),
             checks: Vec::new(),
+            handed: Vec::new(),
         };
         let sha = plan_sha256(&kept.plan);
         let forks = kept.plan.forks.len();
@@ -1809,6 +1822,7 @@ impl OnDemand<'_> {
             published: p.plan.as_ref().and_then(|plan| plan.published.clone()),
             owed: Vec::new(),
             checks: Vec::new(),
+            handed: Vec::new(),
         });
         self.hand_back(p, &next, HandbackRead::Design { steps }, &ran.run, sink)
     }
@@ -1849,6 +1863,7 @@ impl OnDemand<'_> {
             published: p.plan.as_ref().and_then(|plan| plan.published.clone()),
             owed: Vec::new(),
             checks: Vec::new(),
+            handed: Vec::new(),
         };
         let pass = NonZeroU32::new(state.review_pass_due()).expect("a pass due counts from 1");
         let mut review = p.review.clone().unwrap_or_default();
@@ -3173,6 +3188,7 @@ mod tests {
             basis_kind: Some(BasisKind::Judgment),
             number: None,
             reversed: None,
+            unblock: None,
         };
         let questions = |decision: KeptDecision| TicketQuestions {
             decisions: vec![decision],

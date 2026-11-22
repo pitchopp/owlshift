@@ -1,5 +1,5 @@
 {
-  "format": 17,
+  "format": 18,
   "status": "done",
   "summary": "Kept only the required keys in examples/owlshift.toml, listed in the README."
 }

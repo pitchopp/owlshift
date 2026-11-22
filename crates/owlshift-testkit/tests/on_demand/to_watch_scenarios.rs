@@ -35,10 +35,11 @@ fn parked_at_build() -> Bench {
         ("Q1", "answered", "English."),
         ("Q2", "answered", "\"Hello, reader.\", no sign-off."),
     ]);
-    let blocked = r#"{"format":17,"status":"blocked","summary":"The gate needs network."}"#;
+    let blocked = r#"{"format":18,"status":"blocked","summary":"The gate needs network."}"#;
     let (parked, printed) = bench.continue_ticket(vec![
         bench.reply(None, Some(&answered)),
         bench.reply(None, Some(blocked)),
+        bench.reply(None, Some(UNBLOCK_PARK)),
     ]);
     assert!(
         matches!(&parked, Err(Stop::Parked { .. })),

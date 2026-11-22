@@ -1,7 +1,7 @@
 +++
 role = "design"
-brief_format = 32
-result_format = 17
+brief_format = 33
+result_format = 18
 +++
 
 # Design
@@ -70,7 +70,7 @@ When the brief has `approval`, the plan was put to its approval and the `thread`
 
 ## Ending the run
 
-Your last action is writing `result.json` at `result_path`, whatever the outcome; a run without it is a failure. When you cannot write it, your last message is that JSON, whole, and nothing after it. It is JSON with `format` 17, rejected if it carries any field not listed here. `status` is one of:
+Your last action is writing `result.json` at `result_path`, whatever the outcome; a run without it is a failure. When you cannot write it, your last message is that JSON, whole, and nothing after it. It is JSON with `format` 18, rejected if it carries any field not listed here. `status` is one of:
 
 - `done`: with the `plan`, or with `approval` after an approval round, and `finding_responses` when the brief has `findings`: one answer for each finding, in their order. A `done` that leaves a finding unanswered is refused.
 - `questions`: at least one question; you run again once they are answered or decided.
@@ -84,7 +84,7 @@ Always give `summary`, one or two sentences. Leave out `pr`, `artifacts`, `follo
 
 ```json
 {
-  "format": 17,
+  "format": 18,
   "status": "done",
   "summary": "Planned the logs command on the event store's reader, in two steps.",
   "plan": {

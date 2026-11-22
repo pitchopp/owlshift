@@ -1,7 +1,7 @@
 +++
 role = "rebase"
-brief_format = 32
-result_format = 17
+brief_format = 33
+result_format = 18
 +++
 
 # Rebase
@@ -40,15 +40,19 @@ When `rebase` has `broken` and no `pull_request`, the ticket is not delivered: i
 
 When `rebase` has `yielded` and no `pull_request`, the ticket is not delivered either: it stopped, parked or waiting for an answer, and yielded the paths it held; other tickets took some of them, and `onto`, a newer commit of `base_branch`, changed them since the branch was made. Its Build goes on after you, on top of what those tickets merged. Rebase onto `onto` as for a held Build: resolve each conflict so that the branch does what its own commits did, on top of what `onto` has now, and commit; nothing else. The brief's `gate` is empty, the Build's plan and ledger stay uncommitted as they are, and a conflict only the decider can settle is a `questions` ending after `git rebase --abort`, as for a held Build.
 
+## An unblocked Build
+
+When `rebase` has `unblocked` and no `pull_request`, the ticket is not delivered either: its Build stopped `blocked` on what `onto`, a newer commit of `base_branch`, gained since the branch was made, and the resolver gave the branch to you. Its Build runs again after you, on top of `onto`. Rebase as for a yielded Build, with the same empty `gate`, the plan and ledger left uncommitted, and a `questions` ending after `git rebase --abort` for a conflict only the decider can settle.
+
 ## The gate
 
-Once the rebase is done, run every command of `gate` in this worktree, in order, as the project's gate (none for a held or a yielded Build). Fix what the rebase broke with commits on top, and run the whole gate again; a gate you cannot make pass is `failed`. The runner runs the gate itself after your `done`, on your last commit, and refuses the run if it is red or if anything is left uncommitted. When the brief has `gate_failure`, an earlier run's gate failed on that `command`, for that `reason`, with that `output`: data that tells you what to fix.
+Once the rebase is done, run every command of `gate` in this worktree, in order, as the project's gate (none for a held, a yielded or an unblocked Build). Fix what the rebase broke with commits on top, and run the whole gate again; a gate you cannot make pass is `failed`. The runner runs the gate itself after your `done`, on your last commit, and refuses the run if it is red or if anything is left uncommitted. When the brief has `gate_failure`, an earlier run's gate failed on that `command`, for that `reason`, with that `output`: data that tells you what to fix.
 
 ## Ending the run
 
-Your last action is writing `result.json` at `result_path`, whatever the outcome; a run without it is a failure. It is JSON with `format` 17, rejected if it carries any field not listed here. `status` is one of:
+Your last action is writing `result.json` at `result_path`, whatever the outcome; a run without it is a failure. It is JSON with `format` 18, rejected if it carries any field not listed here. `status` is one of:
 
-- `done`: the branch rebased onto `onto`, every conflict resolved and committed, the gate green (a held or a yielded Build's has none).
+- `done`: the branch rebased onto `onto`, every conflict resolved and committed, the gate green (a held, a yielded or an unblocked Build's has none).
 - `questions`: at least one question, each with an `id` (`Q1`, `Q2`, … in order), a `category`, a `text` that fits on one line, a `context` of at most two sentences and 300 characters giving what the decider needs, `options` when there are answers to choose from (each a short `label`, with a one-line `detail` only when it needs one; the runner letters them A, B, C… in order), and always a `recommendation`: the `option` letter you recommend and `why`, or, without options, your proposed answer as its `why` alone; the rebase aborted first.
 - `blocked`: something outside your reach stops you (a permission, access). Say what, with evidence, in `summary`.
 - `failed`: you could not finish, such as a conflict you could not resolve or a gate you could not make pass; the rebase aborted first. Say why in `summary`.
@@ -57,7 +61,7 @@ Always give `summary`, one or two sentences naming the paths you resolved and ho
 
 ```json
 {
-  "format": 17,
+  "format": 18,
   "status": "done",
   "summary": "Rebased onto 3f2a…: README.md kept both the new install section and the delivered usage section; the gate passes.",
   "questions": [],

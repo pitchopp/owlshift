@@ -765,6 +765,7 @@ impl Driver {
             },
             yields: None,
             waiting: None,
+            first: None,
         }
         .render();
         self.post(&body)?;
@@ -1002,6 +1003,7 @@ impl Driver {
                             basis_kind: shown.kind,
                             number: u32::try_from(n + 1).ok().and_then(NonZeroU32::new),
                             reversed: None,
+                            unblock: None,
                         });
                     }
                 }
@@ -1330,6 +1332,7 @@ impl Driver {
             } else {
                 None
             },
+            unblock: None,
             gate_failure: if role == Role::Build {
                 self.gate_failure.clone()
             } else {
