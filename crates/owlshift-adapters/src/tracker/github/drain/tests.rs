@@ -456,6 +456,7 @@ fn proposal<'a>(parent: &'a owlshift_contracts::ids::TicketId, ready: &'a str) -
         description: "Why\n\n[owlshift] PROPOSAL · 7 · fingerprint abc",
         blocked_by_parent: true,
         ready,
+        assignee: None,
     }
 }
 
@@ -517,6 +518,73 @@ fn proposals_are_found_by_title_or_marker_open_or_closed() {
     let ids: Vec<&str> = found.iter().map(|f| f.id.as_str()).collect();
     assert_eq!(ids, ["41", "42"]);
     assert!(tracker(&canned).proposed(None, " ", "x").is_err());
+}
+
+/// A proposal with an assignee, a numeric account id, is opened assigned to
+/// that account's login, which `GET user/<id>` gives first (OWL-625). A login
+/// that cannot be read and an account GitHub does not know open the issue
+/// unassigned; an issue GitHub answers without the assignee (it drops one
+/// that cannot be assigned without a word) too: each is a problem of the
+/// filed proposal, never an error.
+#[test]
+fn a_proposal_with_an_assignee_is_opened_assigned_to_their_login() {
+    let parent = id("7");
+    let mut parent_answer = issue(&[], "open");
+    parent_answer["id"] = json!(1007);
+    let open = |assigned: bool| {
+        let assignees = if assigned {
+            r#""assignees":["bea"],"#
+        } else {
+            ""
+        };
+        format!(
+            r#"POST {ISSUES} {{{assignees}"body":"Why\n\n[owlshift] PROPOSAL · 7 · fingerprint abc","labels":["agent:proposed"],"title":"Say goodbye"}}"#
+        )
+    };
+    let bea = json!({ "login": "bea", "id": 2, "type": "User" });
+    let mut dropped = listed(40, &["agent:proposed"]);
+    dropped["assignees"] = json!([]);
+    let plain = listed(40, &["agent:proposed"]);
+    // (the account read, the issue the creation answers, the problem made)
+    for (status, read, created, says) in [
+        (200, bea.clone(), plain.clone(), None),
+        (200, bea, dropped, Some("without assigning bea")),
+        (
+            404,
+            json!({ "message": "Not Found" }),
+            plain.clone(),
+            Some("no GitHub account has the numeric id"),
+        ),
+        (500, json!({ "message": "x" }), plain, Some("was not read")),
+    ] {
+        let canned = Canned::default()
+            .on(&format!("GET {ISSUE}"), 200, parent_answer.clone())
+            .on("GET user/2", status, read)
+            .on(&open(status == 200), 201, created)
+            .on(
+                &format!(r#"POST {ISSUES}/40/dependencies/blocked_by {{"issue_id":1007}}"#),
+                201,
+                json!({}),
+            );
+        let filed = tracker(&canned)
+            .propose(&Proposal {
+                assignee: Some("2"),
+                ..proposal(&parent, "agent:ready")
+            })
+            .unwrap();
+        assert_eq!(filed.id.as_str(), "40");
+        match says {
+            None => assert!(filed.problems.is_empty(), "{:?}", filed.problems),
+            Some(says) => {
+                assert_eq!(filed.problems.len(), 1, "{:?}", filed.problems);
+                assert!(
+                    filed.problems[0].message.contains(says),
+                    "{}",
+                    filed.problems[0]
+                );
+            }
+        }
+    }
 }
 
 /// The working state's tickets are the open issues with its label.

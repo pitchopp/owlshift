@@ -5017,12 +5017,15 @@ impl<'a> Writer<'a> {
     /// asking the floor: refused when `admission_label`, the project's
     /// `[tracker].admit` label, is the one label a proposal may carry. The
     /// adapter refuses a target state named `ready`, `[tracker].states.ready`,
-    /// before any write.
+    /// before any write. `assignee` is the account the filed ticket is
+    /// assigned to, for the one follow-up that waits on a decider (OWL-625);
+    /// `None` for every other.
     pub fn propose(
         &self,
         proposal: &ProposalDescription,
         ready: &str,
         admission_label: Option<&str>,
+        assignee: Option<&str>,
     ) -> Result<Filed, WriteError> {
         self.check(Action::ProposeFollowup, HumanApproval::Absent)
             .map_err(WriteError::Floor)?;
@@ -5036,6 +5039,7 @@ impl<'a> Writer<'a> {
                 description: &description,
                 blocked_by_parent: proposal.followup.blocked_by_parent,
                 ready,
+                assignee,
             })
             .map_err(WriteError::Tracker)
     }
@@ -10200,6 +10204,7 @@ Reply `Q1: B`, `ok` to take every recommendation, or in your own words.
                     fingerprint: "0123456789ab".to_owned(),
                 },
                 "Todo",
+                None,
                 None,
             ))
         }),

@@ -8906,7 +8906,14 @@ impl OnDemand<'_> {
         // The follow-ups are filed before the report, and kept as filed, so
         // the report names what became of them (OWL-253).
         let stored = p.stored.as_ref().and_then(|s| s.proposals.as_ref());
-        if let Some(filed) = self.file_proposals(&ticket, &kept, p.plan.as_ref(), stored, sink) {
+        let intake = p
+            .stored
+            .as_ref()
+            .and_then(|s| s.record.intake.as_ref())
+            .map_or(&[][..], |intake| intake.zones.as_slice());
+        if let Some(filed) =
+            self.file_proposals(&ticket, &kept, p.plan.as_ref(), intake, stored, sink)
+        {
             let questions = p.questions();
             self.store_proposing(p, state, questions, Some(kept.clone()), Some(&filed))
                 .map_err(|e| {
@@ -9185,8 +9192,18 @@ impl OnDemand<'_> {
         };
         // Filed before the report, even one that is dropped: a follow-up
         // outlives the pull request.
-        done.proposals =
-            self.file_proposals(ticket, delivery, record.plan.as_ref(), proposals, sink);
+        let intake = record
+            .intake
+            .as_ref()
+            .map_or(&[][..], |intake| intake.zones.as_slice());
+        done.proposals = self.file_proposals(
+            ticket,
+            delivery,
+            record.plan.as_ref(),
+            intake,
+            proposals,
+            sink,
+        );
         let proposals = done.proposals.as_ref().or(proposals);
         let Some(owed) = delivery.owed.as_ref() else {
             return done;
@@ -9252,6 +9269,7 @@ impl OnDemand<'_> {
         ticket: &TicketId,
         delivery: &TicketDelivery,
         plan: Option<&TicketPlan>,
+        intake: &[String],
         current: Option<&TicketProposals>,
         sink: &mut EventSink<'_>,
     ) -> Option<TicketProposals> {
@@ -9259,7 +9277,17 @@ impl OnDemand<'_> {
             return None;
         }
         let mut owed = proposals::owe(current, delivery.owed.iter());
-        let after_merge = proposals::after_merge(ticket, delivery, plan);
+        // The follow-up is for the ticket's decider, whom the tracker then
+        // shows it waits on (OWL-625): resolved only while it is not kept.
+        let decider = proposals::unfiled_after_merge(ticket, delivery, plan, current)
+            .then(|| self.after_merge_decider(ticket, intake, sink))
+            .flatten();
+        let after_merge = proposals::after_merge(
+            ticket,
+            delivery,
+            plan,
+            decider.as_ref().map(|person| person.name.as_str()),
+        );
         if let Some(followup) = &after_merge
             && let Some(next) = proposals::owe_one(owed.as_ref().or(current), followup)
         {
@@ -9279,9 +9307,59 @@ impl OnDemand<'_> {
             parent: ticket,
             pull_request: delivery.pull_request.as_ref(),
             exempt: after_merge.map(|followup| proposals::fingerprint(&followup.title)),
+            assignee: decider.as_ref().map(|person| person.id.as_str()),
         };
         let filed = proposals::file_owed(&filing, &mut next, sink);
         (added || filed).then_some(next)
+    }
+
+    /// The decider of `ticket` for the follow-up its steps after the merge
+    /// owe (OWL-625): the assignee, else the one owner of the zones its
+    /// labels and its intake `intake` declare in the project file this
+    /// command loaded (watch reads no file at the base commit, so this is the
+    /// one deviation from "Who decides", recorded in OWL-625). `None` when the ticket has no decider, which
+    /// leaves the follow-up unassigned with no word, and when the ticket
+    /// cannot be read, which is a `warning` (`after_merge_decider`).
+    fn after_merge_decider(
+        &self,
+        ticket: &TicketId,
+        intake: &[String],
+        sink: &mut EventSink<'_>,
+    ) -> Option<Person> {
+        let mut warn = |reason: String| {
+            sink.emit(
+                ticket,
+                None,
+                EventKind::Warning,
+                data([
+                    ("what", json!("after_merge_decider")),
+                    ("reason", json!(reason)),
+                ]),
+            );
+        };
+        let found = match self.tracker.ticket(ticket) {
+            Ok(found) => found,
+            Err(error) => {
+                warn(error.to_string());
+                return None;
+            }
+        };
+        // No decider is no word; a project file whose owners cannot be read
+        // is one.
+        let decided = match pending_decider(&found, intake).ok()? {
+            Pending::Known(decider) => decider,
+            Pending::Owners(declared) => {
+                let owners = match self.config.zone_owners() {
+                    Ok(owners) => owners,
+                    Err(error) => {
+                        warn(format!("the zone owners cannot be read: {error}"));
+                        return None;
+                    }
+                };
+                decide(&found, &declared, &owners).ok()?
+            }
+        };
+        Some(person(&decided, &found))
     }
 
     /// The follow-ups of `owed`, oldest first, owed in the proposals the

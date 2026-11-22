@@ -401,6 +401,14 @@ pub struct Proposal<'a> {
     /// adapter refuses a target state of that exact name before any write:
     /// the floor's check, made where the target is known.
     pub ready: &'a str,
+    /// The account the filed ticket is assigned to (OWL-625): the tracker's
+    /// own identifier for it, as [`Person::id`] gives it (Linear's user id,
+    /// GitHub's numeric account id). Only the follow-up that waits on a
+    /// ticket's decider carries one. A tracker that cannot assign leaves it
+    /// out, the follow-up's text then naming the decider alone; one that can
+    /// assigns after the ticket exists, and a refusal is a [`Filed::problems`]
+    /// entry, never a lost proposal.
+    pub assignee: Option<&'a str>,
 }
 
 /// A proposal the tracker filed.

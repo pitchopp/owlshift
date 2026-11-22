@@ -396,17 +396,45 @@ impl GitHubTracker {
             ));
         }
         let (_, parent) = self.issue(proposal.parent)?;
+        // The assignee is a numeric account id, which GitHub's `assignees`
+        // does not take: its login is read first, and a failure to read it
+        // files the issue unassigned, with a problem (OWL-625).
+        let mut problems = Vec::new();
+        let login = match proposal
+            .assignee
+            .map(|account| (account, self.account_name(account)))
+        {
+            None => None,
+            Some((_, Ok(Some(login)))) => Some(login),
+            Some((account, Ok(None))) => {
+                problems.push(Error::new(
+                    ErrorKind::Other,
+                    format!(
+                        "no GitHub account has the numeric id {account:?} to assign the \
+                         proposal to (a login is not an id)"
+                    ),
+                ));
+                None
+            }
+            Some((account, Err(error))) => {
+                problems.push(Error::new(
+                    error.kind,
+                    format!("the login of account {account:?} was not read: {error}"),
+                ));
+                None
+            }
+        };
+        let mut body = json!({
+            "title": proposal.title,
+            "body": proposal.description,
+            "labels": [PROPOSED_LABEL],
+        });
+        if let Some(login) = &login {
+            body["assignees"] = json!([login]);
+        }
         let text = self
             .forge
-            .rest_write(
-                Verb::Post,
-                &self.issues_path(),
-                &json!({
-                    "title": proposal.title,
-                    "body": proposal.description,
-                    "labels": [PROPOSED_LABEL],
-                }),
-            )
+            .rest_write(Verb::Post, &self.issues_path(), &body)
             .map_err(tracker_error)?;
         let created: Issue = parse(&text, &"the proposal just filed")?;
         let id = issue_id(created.number)?;
@@ -414,7 +442,18 @@ impl GitHubTracker {
             .labels
             .iter()
             .any(|l| l.name.eq_ignore_ascii_case(PROPOSED_LABEL));
-        let mut problems = Vec::new();
+        // GitHub drops, without an error, an assignee that cannot be assigned.
+        if let Some(login) = &login
+            && !created
+                .assignees
+                .iter()
+                .any(|user| user.login.eq_ignore_ascii_case(login))
+        {
+            problems.push(Error::new(
+                ErrorKind::Other,
+                format!("GitHub filed #{} without assigning {login}", created.number),
+            ));
+        }
         if !labelled {
             problems.push(Error::new(
                 ErrorKind::Other,
