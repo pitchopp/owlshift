@@ -4028,6 +4028,35 @@ pub struct ParkedComment {
     /// What it yields under `policy.overlap = "rebase"` (OWL-621), when it
     /// does.
     pub yields: Option<Yielding>,
+    /// The tickets that wait for what it keeps (OWL-623), when it keeps what
+    /// it holds and some do: never with `yields`, a park yields or keeps.
+    pub waiting: Option<Waiters>,
+}
+
+/// The tickets that wait for what a parked ticket keeps (OWL-623;
+/// architecture section 5, "A stopped holder yields", *Shown*), as
+/// `why::kept_words` words them.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Waiters {
+    pub count: usize,
+    /// "DEMO-2 and DEMO-3 for zone `app/one.rs`; DEMO-4 for resource `m`".
+    pub words: String,
+}
+
+impl Waiters {
+    /// The PARKED comment's line.
+    fn line(&self) -> String {
+        let wait = if self.count == 1 {
+            "1 ticket waits".to_owned()
+        } else {
+            format!("{} tickets wait", self.count)
+        };
+        format!(
+            "**{wait} for it**, for what it keeps: {}. It keeps what it holds while it is \
+             parked, so they go on once it no longer holds it.",
+            flatten(&self.words)
+        )
+    }
 }
 
 /// What a parked ticket yields (OWL-621; architecture section 5, "A stopped
@@ -4168,6 +4197,9 @@ impl ParkedComment {
         }
         if let Some(yields) = &self.yields {
             sections.push(yields.line());
+        }
+        if let Some(waiting) = &self.waiting {
+            sections.push(waiting.line());
         }
         // OWL-488: the decider's reply `continue` first, read by a running
         // `owlshift watch`, then the command.
@@ -7311,6 +7343,7 @@ Context.
             open: Vec::new(),
             restart,
             yields: None,
+            waiting: None,
         };
         let continue_it = "**To restart it:** reply `continue` here, in a comment of its own, or \
                            run `owlshift continue OWL-18`.";
@@ -7909,6 +7942,7 @@ Reply `Q1: B`, `ok` to take every recommendation, or in your own words.
                     open: vec![(question.clone(), verdict.clone())],
                     restart: Restart::Continue,
                     yields: None,
+                    waiting: None,
                 }
                 .render(),
                 DecisionComment {
@@ -8040,6 +8074,7 @@ Reply `Q1: B`, `ok` to take every recommendation, or in your own words.
             open: Vec::new(),
             restart: Restart::Do,
             yields: None,
+            waiting: None,
         };
         assert_eq!(writer.post_parked(&parked).unwrap().body, parked.render());
         assert_eq!(tracker.posts.get(), 4);
@@ -8262,6 +8297,7 @@ Reply `Q1: B`, `ok` to take every recommendation, or in your own words.
             open: Vec::new(),
             restart: Restart::Do,
             yields: None,
+            waiting: None,
         };
         let delivery = report(Err(forge::Error::new(ErrorKind::Unauthorized, "not read")));
         assert_eq!(
@@ -9377,6 +9413,7 @@ Reply `Q1: B`, `ok` to take every recommendation, or in your own words.
             open: Vec::new(),
             restart: Restart::Continue,
             yields: None,
+            waiting: None,
         };
         assert!(!parked.render().contains("yields"));
         parked.yields = Some(Yielding {
@@ -9410,6 +9447,7 @@ Reply `Q1: B`, `ok` to take every recommendation, or in your own words.
             open: maximal_open(),
             restart: Restart::Continue,
             yields: None,
+            waiting: None,
         };
         let blocked = ParkedComment {
             reason: ParkReason::Blocked,
@@ -10258,6 +10296,7 @@ Reply `Q1: B`, `ok` to take every recommendation, or in your own words.
                 open: Vec::new(),
                 restart: Restart::Do,
                 yields: None,
+                waiting: None,
             }))
         }),
         ("post_handback", |w, _| {

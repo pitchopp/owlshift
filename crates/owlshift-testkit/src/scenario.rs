@@ -764,6 +764,7 @@ impl Driver {
                 Restart::Do
             },
             yields: None,
+            waiting: None,
         }
         .render();
         self.post(&body)?;

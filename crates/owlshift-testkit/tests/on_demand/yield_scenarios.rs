@@ -310,24 +310,125 @@ fn scenario_s5_a_round_yields_from_its_sixth_hour_and_its_answer_finds_its_file_
     );
 }
 
-/// Under `exclusive` nothing yields: DEMO-1's Build parks keeping
-/// `app/one.rs`, its PARKED comment saying nothing of a yield, and a second
-/// Build wanting that file waits for it.
+/// DEMO-2's ref at Build, holding `file` (in flight), as its Build's
+/// admission leaves it while it waits for another ticket.
+fn waiting_sibling(bench: &Bench, file: &str) {
+    let git = bench_git(bench);
+    let demo2 = TicketId::new("DEMO-2").unwrap();
+    let at = bench.clock.get();
+    let mut record = bench.record();
+    record.state = PersistedState::from(
+        &TicketState::restore(Status::Active(Stage::Build), 1, 0, 0, 0, 0).unwrap(),
+    );
+    record.delivery = None;
+    let mut held = TicketHeld::dispatched(at);
+    held.admit(vec![file.to_owned()], Vec::new(), None, at);
+    record.held = Some(held);
+    write_through_run_file(&git, &bench.dirs(), &demo2, &record, None);
+}
+
+/// Scenario S5 under `exclusive` (OWL-621, OWL-623): nothing yields. While
+/// DEMO-1's Build runs holding `app/one.rs`, DEMO-2's Build admission waits
+/// for it; DEMO-1 parks keeping the file, its PARKED comment saying nothing
+/// of a yield and that DEMO-2 waits for it, as `owlshift why`, the daily
+/// digest and the web UI's card (`status --waits` in the UI's voice) say; a
+/// third Build wanting that file waits for it too.
 #[test]
 fn under_exclusive_a_parked_holder_keeps_a_second_build_waiting() {
     let bench = yielding_bench("app", "max_in_flight = 2\n");
-    let (parked, printed) = bench.run(vec![committing(&bench, "app/one.rs", BLOCKED)], None);
+    waiting_sibling(&bench, "lib/two.rs");
+    let data = bench.data.clone();
+    // DEMO-2's wait, told as its Build's admission tells it, while DEMO-1's
+    // Build (the command's first run) holds the file.
+    let told: During = (
+        1,
+        Box::new(move || {
+            let mut out = io::sink();
+            let mut sink = EventSink::new(REPO, EventLog::in_dir(&data), &mut out);
+            sink.emit(
+                &TicketId::new("DEMO-2").unwrap(),
+                None,
+                EventKind::Decision,
+                owlshift_runner::events::data([
+                    ("watch", json!("waits")),
+                    ("reason", json!("collision")),
+                    ("stage", json!("build")),
+                    ("resource", json!({"zone": "app/one.rs"})),
+                    ("tickets", json!(["DEMO-1"])),
+                ]),
+            );
+        }),
+    );
+    let (parked, printed) = bench.invoke(
+        false,
+        vec![committing(&bench, "app/one.rs", BLOCKED)],
+        None,
+        vec![told],
+    );
     assert!(
         matches!(&parked, Err(Stop::Parked { .. })),
         "{parked:?}\n{printed}"
     );
     assert!(!bench.record().held.unwrap().yielded());
     assert!(yields(&bench).is_empty());
-    assert!(!bench.comments().iter().any(|c| c.contains("It yields")));
+    let comment = bench
+        .comments()
+        .into_iter()
+        .find(|c| c.starts_with("[owlshift] PARKED\n"))
+        .unwrap();
+    assert!(!comment.contains("It yields"), "{comment}");
+    assert!(
+        comment.contains(
+            "**1 ticket waits for it**, for what it keeps: DEMO-2 for zone `app/one.rs`."
+        ),
+        "{comment}"
+    );
     let found = weigh(
         &wanting("app/one.rs"),
         &[demo1_in_flight(&bench, &NamedResources::default())],
         Overlap::Exclusive,
     );
     assert_eq!(found.collision.map(|c| c.holder), Some("DEMO-1".to_owned()));
+
+    // `owlshift why`, the daily digest and the web UI's card say it too.
+    let now = bench.clock.get();
+    let repo = Repo::parse(REPO).unwrap();
+    let report =
+        owlshift_runner::why::gather(&bench.data, &bench.dirs(), REPO, None, 2, &[], now).unwrap();
+    let why = owlshift_runner::why::render(&report);
+    assert!(
+        why.contains(
+            "  DEMO-1 [build, parked]: waits for a person (an answer, or `owlshift continue`) \
+             and keeps what it holds; 1 ticket waits for it: DEMO-2 for zone `app/one.rs`\n"
+        ),
+        "{why}"
+    );
+    let summary = owlshift_runner::daemon::digest::gather(
+        &bench.data,
+        &[(&repo, &bench.dirs())],
+        &[],
+        now,
+        now,
+        &mut io::sink(),
+    );
+    let digest = owlshift_runner::daemon::digest::line(&summary, &TimeZone::UTC);
+    assert!(
+        digest.contains(
+            "1 parked (DEMO-1; DEMO-1 keeps 1 ticket waiting: DEMO-2 for zone `app/one.rs`)"
+        ),
+        "{digest}"
+    );
+    let read = owlshift_runner::status::waits::gather(&bench.data, Some(&repo), 2, now);
+    let waits = owlshift_runner::status::waits::build(&read, owlshift_runner::voice::Voice::Ui);
+    let card = waits.projects[0]
+        .tickets
+        .iter()
+        .find(|row| row.ticket.as_str() == TICKET)
+        .and_then(|row| row.waits.clone())
+        .unwrap();
+    assert_eq!(
+        card.text,
+        "parked: waits for a person's Restart, and keeps what it holds; 1 ticket waits for it: \
+         DEMO-2 for zone `app/one.rs`"
+    );
 }
