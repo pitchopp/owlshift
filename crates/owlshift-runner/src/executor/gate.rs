@@ -1933,6 +1933,45 @@ mod tests {
         }
     }
 
+    /// OWL-637: `mktemp` with no template, as a Maven wrapper calls it,
+    /// writes in the run's own temporary folder. On macOS it asks the system
+    /// for the user's temporary folder before `TMPDIR`, and the sandbox
+    /// leaves that question unanswered; the user's folder stays closed.
+    #[cfg(unix)]
+    #[test]
+    fn mktemp_without_a_template_writes_in_the_runs_own_temporary_folder() {
+        if !sandbox_or_skip() {
+            return;
+        }
+        let base = tempfile::tempdir().unwrap();
+        let worktree = base.path().join("worktree");
+        let run_temp = base.path().join("run-temp");
+        std::fs::create_dir_all(&worktree).unwrap();
+        std::fs::create_dir_all(&run_temp).unwrap();
+        let confined = AgentEnv::new(std::env::vars_os()).unwrap();
+        let paths = RunPaths {
+            temp: Some(run_temp.clone()),
+            ..paths(&worktree)
+        };
+        for make in ["mktemp -d", "mktemp", "mktemp -t owl637"] {
+            let line = format!(
+                "case \"$({make})\" in '{}'/*) ;; *) exit 1;; esac",
+                run_temp.display()
+            );
+            if let Err(failure) = gate_with(&confined, &paths, &line) {
+                panic!("{make}: {}", failure.output);
+            }
+        }
+
+        let shared = std::env::temp_dir().join(format!("owl637-{}", std::process::id()));
+        let _ = std::fs::remove_file(&shared);
+        let _ = gate_with(&confined, &paths, &format!("touch '{}'", shared.display()));
+        assert!(
+            !shared.exists(),
+            "a confined write reached the user's temporary folder"
+        );
+    }
+
     /// The keychain half, on CI only: a throwaway keychain, never on the
     /// search list, created unlocked and without auto-lock, so its reads
     /// cannot prompt; deleted afterwards whatever happens. It stays off the

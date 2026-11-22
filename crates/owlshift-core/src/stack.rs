@@ -806,32 +806,28 @@ fn gradle(root: &RootFiles) -> Result<Option<Found>, String> {
     Ok(Some(found))
 }
 
-/// Maven (OWL-627), from `pom.xml`, read by name, run by the machine's `mvn`:
-/// `verify` runs the tests and the checks the build binds. Maven moves its
-/// local repository with a property only, so the line sets `maven.repo.local`
-/// inside the run cache `MAVEN_USER_HOME`. Checked live, confined: without the
-/// property Maven fails creating `~/.m2/repository`. The wrapper `mvnw` is not
-/// used, a note says why: it makes its download folder with `mktemp -d`,
-/// which on macOS writes to the user's temporary folder, closed to a confined
-/// run whatever its `TMPDIR` (checked live).
+/// Maven (OWL-627), from `pom.xml`, read by name: `verify` runs the tests and
+/// the checks the build binds. Maven moves its local repository with a
+/// property only, so the line sets `maven.repo.local` inside the run cache
+/// `MAVEN_USER_HOME`. Checked live, confined: without the property Maven
+/// fails creating `~/.m2/repository`. With the wrapper `mvnw` at the root the
+/// line runs it, and the Maven it pins goes to `$MAVEN_USER_HOME/wrapper`
+/// (OWL-637, checked live on macOS, whose sandbox sends its `mktemp -d` to
+/// the run's own temporary folder); without it, the machine's `mvn`.
 fn maven(root: &RootFiles) -> Result<Option<Found>, String> {
     if !root.has("pom.xml") {
         return Ok(None);
     }
-    let from = "pom.xml";
-    let mut found = found(from);
+    let (program, from) = if root.has("mvnw") {
+        ("./mvnw", "mvnw, the Maven wrapper")
+    } else {
+        ("mvn", "pom.xml")
+    };
+    let mut found = found("pom.xml");
     found.gate.push(line(
-        "mvn -B -Dmaven.repo.local=\"$MAVEN_USER_HOME/repository\" verify",
+        format!("{program} -B -Dmaven.repo.local=\"$MAVEN_USER_HOME/repository\" verify"),
         from,
     ));
-    if root.has("mvnw") {
-        found.notes.push(
-            "the gate runs the machine's `mvn`, not the wrapper `mvnw`, which fails confined on \
-             macOS making its download folder in the user's temporary folder: Maven must be \
-             installed on each machine, and it runs instead of the version the wrapper pins"
-                .to_string(),
-        );
-    }
     found
         .run_caches
         .push(run_cache("MAVEN_USER_HOME", "maven", from));
@@ -1619,23 +1615,23 @@ check::
         assert!(detect(&root(&["gradlew"], &[])).found.is_empty());
     }
 
-    /// OWL-627: the machine's `mvn`, its local repository inside the run
-    /// cache; a wrapper `mvnw` is named in a note, never run.
+    /// OWL-627, OWL-637: the wrapper `mvnw` when it is there, else the
+    /// machine's `mvn`, the local repository inside the run cache either way.
     #[test]
     fn a_maven_build_runs_verify_with_its_repository_in_a_run_cache() {
-        for names in [&["pom.xml", "mvnw"][..], &["pom.xml"]] {
+        for (names, program) in [(&["pom.xml", "mvnw"][..], "./mvnw"), (&["pom.xml"], "mvn")] {
             let d = detect(&root(names, &[]));
             assert_eq!(d.found[0].source, "pom.xml");
             assert_eq!(
                 commands(d.gate()),
-                ["mvn -B -Dmaven.repo.local=\"$MAVEN_USER_HOME/repository\" verify"]
+                [format!(
+                    "{program} -B -Dmaven.repo.local=\"$MAVEN_USER_HOME/repository\" verify"
+                )]
             );
             assert!(d.setup().next().is_none());
             assert_eq!(run_caches(d.run_caches()), [("MAVEN_USER_HOME", "maven")]);
             assert!(d.found[0].gate_notes[0].contains("MAVEN_USER_HOME=~/.m2"));
-            let notes = &d.found[0].notes;
-            assert_eq!(notes.len(), usize::from(names.contains(&"mvnw")));
-            assert!(notes.iter().all(|n| n.contains("must be installed")));
+            assert!(d.found[0].notes.is_empty(), "{names:?}");
         }
         assert!(detect(&root(&["mvnw"], &[])).found.is_empty());
     }
