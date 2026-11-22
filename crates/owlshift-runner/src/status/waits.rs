@@ -517,17 +517,25 @@ fn build_project(project: &ProjectRead, held: &[HeldSlot], voice: Voice) -> (Pro
                 "needs_input",
                 "waits for its decider's answer, and keeps what it holds",
             )),
-            RefStatus::Parked => Some(person(
-                "parked",
-                match voice {
-                    Voice::Terminal => {
-                        "parked: waits for a person's `owlshift continue`, and keeps what it holds"
-                    }
-                    // The Restart button is offered exactly when the latest
-                    // record is parked (`ui::ticket::actions`).
-                    Voice::Ui => "parked: waits for a person's Restart, and keeps what it holds",
-                },
-            )),
+            RefStatus::Parked => {
+                // The Restart button is offered exactly when the latest
+                // record is parked (`ui::ticket::actions`).
+                let restart = match voice {
+                    Voice::Terminal => "`owlshift continue`",
+                    Voice::Ui => "Restart",
+                };
+                // One that yielded under `rebase` holds nothing (OWL-621),
+                // as `why` words it.
+                let holding = if project.yielded.contains(&row.ticket) {
+                    "has yielded what it held"
+                } else {
+                    "keeps what it holds"
+                };
+                Some(person(
+                    "parked",
+                    &format!("parked: waits for a person's {restart}, and {holding}"),
+                ))
+            }
             _ => project.folded.current.get(&row.ticket).map(told),
         };
     }
@@ -1547,7 +1555,8 @@ mod tests {
         );
 
         // OWL-623: the tickets shown that wait for it, a parked one aside;
-        // none once it yielded under `rebase`.
+        // once it yielded under `rebase`, none, and it no longer claims to
+        // keep what it holds.
         let behind = |ticket: &str| {
             waits(
                 "2026-10-28T09:00:00Z",
@@ -1582,7 +1591,7 @@ mod tests {
         let yielded = super::build(&read(vec![project], Vec::new()), Voice::Ui);
         assert_eq!(
             row(&yielded, "DEMO-1").waits.as_ref().unwrap().text,
-            PARKED_UI
+            "parked: waits for a person's Restart, and has yielded what it held"
         );
     }
 
