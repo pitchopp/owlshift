@@ -234,6 +234,11 @@ pub enum RebaseCause {
     /// Its base now changes a path one of its overlaps names (OWL-449): a
     /// refresh, so its checks run on the combined code.
     Overlap,
+    /// The resolver's `rebase` verdict on a repair run at Watch that stopped
+    /// `blocked` on what the base gained (OWL-634): a refresh, since watch
+    /// starts a fix, a correction or a person's results' run only on a read
+    /// with no conflict.
+    Unblocked,
 }
 
 impl RebaseCause {
@@ -249,6 +254,7 @@ impl RebaseCause {
             Self::BaseFixed => "base_fixed",
             Self::MergeBase => "merge",
             Self::Overlap => "overlap",
+            Self::Unblocked => "unblocked",
         }
     }
 }
@@ -1063,6 +1069,14 @@ mod tests {
     fn unknown_mergeability_waits_before_any_check_counts() {
         let r = read(Mergeable::Unknown, &[("ci", CodeFailure)]);
         assert_eq!(action(&r, None, None), Action::WaitMergeability);
+    }
+
+    /// OWL-634: the resolver's rebase of a blocked repair run at Watch is a
+    /// refresh, named in its `rebase_run` events.
+    #[test]
+    fn an_unblocked_rebase_is_a_refresh() {
+        let cause = RebaseCause::Unblocked;
+        assert_eq!((cause.refresh(), cause.as_str()), (true, "unblocked"));
     }
 
     /// A conflict comes before the checks; a second rebase onto the base

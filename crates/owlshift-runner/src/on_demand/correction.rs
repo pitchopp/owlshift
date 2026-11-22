@@ -169,7 +169,9 @@ impl OnDemand<'_> {
         };
         // A `done` on Owlshift's last push found nothing to change.
         let accept = |_: &CommitId| Ok(());
-        let (done, followups) = self.repair_runs(
+        // A `blocked` on the base goes to the rebase run (OWL-634): the
+        // replies stay unfollowed, so the next pass corrects the rebased head.
+        let ran = self.repair_or_rebase(
             p,
             state,
             &RepairRun {
@@ -182,9 +184,19 @@ impl OnDemand<'_> {
                 decorate: &decorate,
                 accept: &accept,
                 cut: None,
+                rebase: Some(&OnDelivery {
+                    delivery: &delivery,
+                    pr: &pr,
+                    pushed: &pushed,
+                }),
             },
+            following,
             sink,
         )?;
+        let (done, followups) = match ran {
+            Repair::Done(done, followups) => (*done, followups),
+            Repair::Rebased(delivered) => return Ok(delivered),
+        };
         if done.repaired.commit == pushed_id {
             return self.already_follows(
                 p, &delivery, &pushed_id, done, followups, &reversed, following, sink,

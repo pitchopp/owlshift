@@ -7602,6 +7602,55 @@ struct RepairRun<'r> {
     /// whose gate the first attempt runs alone. `None` for the other
     /// repairs, whose cut gate is counted.
     cut: Option<RepairCut<'r>>,
+    /// The delivery, for a run the resolver may give the rebase run when it
+    /// stops `blocked` (OWL-634): a fix's, a correction's or a person's
+    /// results' ([`OnDemand::repair_or_rebase`]). `None` for the rebase run
+    /// and a resolution's last fix.
+    rebase: Option<&'r OnDelivery<'r>>,
+}
+
+/// How a repair's runs ended ([`OnDemand::repair_runs`]).
+enum RepairEnd {
+    /// On a commit to push.
+    Done(Box<RepairDone>, Vec<Followup>),
+    /// A run stopped `blocked`, and the resolver gave the branch to the
+    /// rebase run (OWL-634): the state as the verdict left it.
+    Rebase(TicketState),
+}
+
+impl RepairEnd {
+    /// The commit to push, for a repair whose runs cannot be given the
+    /// rebase run.
+    fn done(self) -> Result<(RepairDone, Vec<Followup>), Stop> {
+        match self {
+            Self::Done(done, followups) => Ok((*done, followups)),
+            Self::Rebase(_) => Err(unrebased()),
+        }
+    }
+}
+
+/// A `rebase` verdict on a repair run with no delivery to rebase: never
+/// open there ([`RepairRun::rebase`]), so the contract refuses it first.
+fn unrebased() -> Stop {
+    Stop::Refused("a rebase verdict on a run that cannot be rebased".to_owned())
+}
+
+/// How a fix's, a correction's or a person's results' runs ended
+/// ([`OnDemand::repair_or_rebase`]).
+enum Repair {
+    /// On a commit to push.
+    Done(Box<RepairDone>, Vec<Followup>),
+    /// The rebase run the resolver gave the branch to ran, and its push
+    /// was made.
+    Rebased(Delivered),
+}
+
+/// The delivery a repair at Watch works on, for the rebase run the
+/// resolver may give its branch to (OWL-634).
+struct OnDelivery<'d> {
+    delivery: &'d TicketDelivery,
+    pr: &'d DeliveredPullRequest,
+    pushed: &'d str,
 }
 
 /// A fix run's or a rebase run's machine cut at Watch (OWL-486, OWL-490;
@@ -8002,7 +8051,12 @@ impl OnDemand<'_> {
                 Ok(())
             }
         };
-        let (fixed, followups) = self.repair_runs(
+        let on = OnDelivery {
+            delivery: &delivery,
+            pr: &pr,
+            pushed: &pushed,
+        };
+        let ran = self.repair_or_rebase(
             p,
             state,
             &RepairRun {
@@ -8019,9 +8073,15 @@ impl OnDemand<'_> {
                     at,
                     kept: kept.as_ref(),
                 }),
+                rebase: Some(&on),
             },
+            following,
             sink,
         )?;
+        let (fixed, followups) = match ran {
+            Repair::Done(fixed, followups) => (*fixed, followups),
+            Repair::Rebased(delivered) => return Ok(delivered),
+        };
         self.push_repair(
             p,
             fixed.state,
@@ -8112,14 +8172,16 @@ impl OnDemand<'_> {
     /// rebase run's red gate the machine cut stops the runs, nothing
     /// counted, its result kept (`run.cut`, OWL-486, OWL-490); given such a
     /// result, the first attempt runs its gate alone
-    /// ([`Self::regate_role`]).
+    /// ([`Self::regate_role`]). A `blocked` goes through the resolver
+    /// (OWL-620); its `rebase`, open with `run.rebase` (OWL-634), ends the
+    /// runs for the caller to rebase.
     fn repair_runs(
         &self,
         p: &mut Prepared,
         mut state: TicketState,
         run: &RepairRun<'_>,
         sink: &mut EventSink<'_>,
-    ) -> Result<(RepairDone, Vec<Followup>), Stop> {
+    ) -> Result<RepairEnd, Stop> {
         let current = person(p.current()?, &p.found);
         let mut gathered = Gathered::default();
         // A repair's result a machine cut kept: its gate alone first, with
@@ -8213,12 +8275,12 @@ impl OnDemand<'_> {
                                         .unwrap_or_default(),
                                 ),
                             };
-                            return Ok((
-                                RepairDone {
+                            return Ok(RepairEnd::Done(
+                                Box::new(RepairDone {
                                     state,
                                     repaired,
                                     result: result.clone(),
-                                },
+                                }),
                                 gathered.followups,
                             ));
                         }
@@ -8278,25 +8340,45 @@ impl OnDemand<'_> {
                 ));
             }
             // A `blocked` goes through the resolver first (OWL-620): at
-            // Watch, the run again or the park. The attempt counts, so a
-            // trivial rebase's second run leaves the fast tier.
+            // Watch, the run again, the delivery to the rebase run (OWL-634)
+            // or the park. A retry's attempt counts, so a trivial rebase's
+            // second run leaves the fast tier.
             let mut first = None;
             if event == Event::Blocked
                 && let Some(result) = ran.result()
             {
+                // Open on a delivery the base's head, as this command fetched
+                // it, is not in, short of the repairs' bound; a delivery git
+                // cannot read is not rebased.
+                let rebase = run.rebase.is_some_and(|on| {
+                    self.executor
+                        .git
+                        .is_ancestor(&p.checkout, &p.base.commit, on.pushed)
+                        .is_ok_and(|holds| !holds)
+                        && matches!(
+                            state.apply(PIPELINE, Event::RebaseDue),
+                            Ok(Transition::To(_))
+                        )
+                });
                 let blocked = Blocked {
                     role: run.role,
                     ran: &ran,
                     result,
                     at: Unblocking {
                         stage: Stage::Watch,
-                        rebase: false,
+                        rebase,
                         person_step: false,
                     },
                 };
                 match self.unblock(p, &state, &blocked, run.rules, &current, sink)? {
                     Unblocked::Park { first: sentence } => first = sentence,
-                    Unblocked::Retry | Unblocked::Rebase | Unblocked::PersonStep => {
+                    // The blocked run's work is left: the rebase run starts
+                    // from Owlshift's last push.
+                    Unblocked::Rebase => {
+                        self.keep(p, &state)?;
+                        return Ok(RepairEnd::Rebase(state));
+                    }
+                    Unblocked::Retry | Unblocked::PersonStep => {
                         self.keep(p, &state)?;
                         continue;
                     }
@@ -8330,6 +8412,37 @@ impl OnDemand<'_> {
                 }
                 other => return Err(core_error(other)),
             }
+        }
+    }
+
+    /// A fix's, a correction's or a person's results' runs at Watch
+    /// ([`Self::repair_runs`]), whose `blocked` the resolver may give to the
+    /// rebase run (OWL-634): the delivery then goes to it as for any rebase
+    /// at Watch ([`Self::repair_rebase`]), its push ending the repair; watch's
+    /// next pass decides again on the rebased head.
+    fn repair_or_rebase(
+        &self,
+        p: &mut Prepared,
+        state: TicketState,
+        run: &RepairRun<'_>,
+        following: &mut Following,
+        sink: &mut EventSink<'_>,
+    ) -> Result<Repair, Stop> {
+        match (self.repair_runs(p, state, run, sink)?, run.rebase) {
+            (RepairEnd::Done(done, followups), _) => Ok(Repair::Done(done, followups)),
+            (RepairEnd::Rebase(_), None) => Err(unrebased()),
+            (RepairEnd::Rebase(state), Some(on)) => self
+                .repair_rebase(
+                    p,
+                    state,
+                    on.delivery,
+                    on.pr,
+                    on.pushed,
+                    RebaseCause::Unblocked,
+                    following,
+                    sink,
+                )
+                .map(Repair::Rebased),
         }
     }
 
@@ -8527,28 +8640,31 @@ impl OnDemand<'_> {
         };
         let accept =
             |commit: &CommitId| rebase_keeps_delivery(git, &checkout, &pushed_id, &onto, commit);
-        let ran = self.repair_runs(
-            p,
-            state,
-            &RepairRun {
-                role: Role::Rebase,
-                what: "rebase",
-                pull_request: pr.number,
-                rules: &dispatched.rules,
-                harness: &harness,
-                before: &before,
-                decorate: &decorate,
-                accept: &accept,
-                // The cut's wait keeps the rebased commit as its head, read
-                // before the stop below moves the branch back to `pushed`.
-                cut: Some(RepairCut {
-                    dispatched: &dispatched,
-                    at,
-                    kept: kept.as_ref(),
-                }),
-            },
-            sink,
-        );
+        let ran = self
+            .repair_runs(
+                p,
+                state,
+                &RepairRun {
+                    role: Role::Rebase,
+                    what: "rebase",
+                    pull_request: pr.number,
+                    rules: &dispatched.rules,
+                    harness: &harness,
+                    before: &before,
+                    decorate: &decorate,
+                    accept: &accept,
+                    // The cut's wait keeps the rebased commit as its head, read
+                    // before the stop below moves the branch back to `pushed`.
+                    cut: Some(RepairCut {
+                        dispatched: &dispatched,
+                        at,
+                        kept: kept.as_ref(),
+                    }),
+                    rebase: None,
+                },
+                sink,
+            )
+            .and_then(RepairEnd::done);
         // Reviewed before its push when its resolution asks it (OWL-449).
         // The rebase run's own commit is kept for the push's delivery check,
         // whatever the last fix adds on top of it (OWL-514).

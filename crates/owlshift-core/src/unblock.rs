@@ -15,7 +15,9 @@ pub struct Unblocking {
     /// The stage the run ran at: the bounds are a ticket's and a stage's.
     pub stage: Stage,
     /// Whether the branch can go to the rebase run: a Build's at Build, its
-    /// branch not delivered, clean, and behind the base.
+    /// branch not delivered, clean, and behind the base; since OWL-634 a
+    /// fix's, a correction's or a person's results' run at Watch, the
+    /// delivery behind the base and short of its repairs' bound.
     pub rebase: bool,
     /// Whether a step of the plan can be owed to a person: a Build's at
     /// Build, with a given plan that holds an agent's step, outside a review
@@ -64,10 +66,16 @@ mod tests {
 
     /// Each verdict is open where its act is, `park` always; once `retry`
     /// or `rebase` was taken at the stage, `park` alone; a `person_step`
-    /// closes nothing.
+    /// closes nothing. At Watch, `rebase` is open where the delivery can be
+    /// rebased (OWL-634), with the same bound.
     #[test]
     fn the_open_verdicts_follow_the_stage_and_what_was_taken() {
-        let cases: [(Unblocking, &[UnblockVerdict], &[UnblockVerdict]); 7] = [
+        const AT_WATCH: Unblocking = Unblocking {
+            stage: Stage::Watch,
+            rebase: true,
+            person_step: false,
+        };
+        let cases: [(Unblocking, &[UnblockVerdict], &[UnblockVerdict]); 10] = [
             (AT_BUILD, &[], &[Retry, Rebase, PersonStep, Park]),
             (
                 Unblocking {
@@ -90,6 +98,9 @@ mod tests {
             (AT_BUILD, &[Rebase], &[Park]),
             (AT_BUILD, &[PersonStep], &[Retry, Rebase, PersonStep, Park]),
             (AT_BUILD, &[Park, PersonStep, Retry], &[Park]),
+            (AT_WATCH, &[], &[Retry, Rebase, Park]),
+            (AT_WATCH, &[Rebase], &[Park]),
+            (AT_WATCH, &[Retry], &[Park]),
         ];
         for (at, taken, expected) in cases {
             assert_eq!(open(at, taken), expected, "{at:?} after {taken:?}");

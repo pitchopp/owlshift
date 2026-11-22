@@ -633,22 +633,25 @@ impl OnDemand<'_> {
         let accept = |commit: &CommitId| {
             rebase_cycle_keeps_delivery(git, &checkout, pushed, onto, &rebased, commit)
         };
-        let (fixed, more) = self.repair_runs(
-            p,
-            state,
-            &RepairRun {
-                role: Role::Build,
-                what: "last fix",
-                pull_request: told.pull_request.unwrap_or_default(),
-                rules: &dispatched.rules,
-                harness: &build,
-                before: &|_, _, _| Ok(()),
-                decorate: &decorate,
-                accept: &accept,
-                cut: None,
-            },
-            sink,
-        )?;
+        let (fixed, more) = self
+            .repair_runs(
+                p,
+                state,
+                &RepairRun {
+                    role: Role::Build,
+                    what: "last fix",
+                    pull_request: told.pull_request.unwrap_or_default(),
+                    rules: &dispatched.rules,
+                    harness: &build,
+                    before: &|_, _, _| Ok(()),
+                    decorate: &decorate,
+                    accept: &accept,
+                    cut: None,
+                    rebase: None,
+                },
+                sink,
+            )?
+            .done()?;
         gather(&mut followups, &more);
         let review = p.review.get_or_insert_with(TicketReview::new);
         design::mark_answered(review, Stage::Verify, &given, &fixed.result);

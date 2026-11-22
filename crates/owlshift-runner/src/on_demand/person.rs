@@ -383,7 +383,9 @@ impl OnDemand<'_> {
                 Ok(())
             }
         };
-        let (done, followups) = self.repair_runs(
+        // A `blocked` on the base goes to the rebase run (OWL-634): the run
+        // stays due, so the next pass runs it on the rebased head.
+        let ran = self.repair_or_rebase(
             p,
             state,
             &RepairRun {
@@ -396,9 +398,19 @@ impl OnDemand<'_> {
                 decorate: &decorate,
                 accept: &accept,
                 cut: None,
+                rebase: Some(&OnDelivery {
+                    delivery,
+                    pr,
+                    pushed,
+                }),
             },
+            following,
             sink,
         )?;
+        let (done, followups) = match ran {
+            Repair::Done(done, followups) => (*done, followups),
+            Repair::Rebased(delivered) => return Ok(delivered),
+        };
         if done.repaired.commit == pushed_id {
             return self.steps_unchanged(
                 p, delivery, &pushed_id, done, steps, followups, following, sink,

@@ -345,6 +345,10 @@ fn describe(action: &Action) -> &'static str {
             "its base now changes a path it shares with another ticket: a refresh rebase is due, \
              so its checks run on the combined code"
         }
+        Action::Rebase {
+            cause: RebaseCause::Unblocked,
+            ..
+        } => "a repair run stopped on what its base gained: a refresh rebase is due",
         Action::RebaseFailed { .. } => {
             "it still conflicts with the base head its last rebase used: that rebase failed"
         }
