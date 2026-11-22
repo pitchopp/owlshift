@@ -109,6 +109,17 @@ run_caches = { POETRY_CACHE_DIR = "poetry" }
 
 poetry installs the locked environment into a virtualenv of its cache, one per worktree, which the runs write. poetry 2 looks for a Python in pyenv's folder too: when pyenv lives in your home, `owlshift gate` fails on it and prints the `caches` and `allow_caches` lines that open `.pyenv` read-only.
 
+**Python with pdm**
+
+```toml
+[stack]
+gate = ["pdm run ruff check .", "pdm run pytest"]
+setup = ["pdm install"]
+run_caches = { PDM_CACHE_DIR = "pdm", PDM_LOG_DIR = "pdm-log" }
+```
+
+pdm installs into the worktree's `.venv`, which ignores itself, and writes its cache and its logs, both outside the home. Ignore `.pdm-python`, the interpreter pdm saves at the root, as `pdm init` does: the gate fails on a file the setup leaves that git sees.
+
 **Python with pip**
 
 ```toml
@@ -153,6 +164,37 @@ run_caches = { GRADLE_USER_HOME = "gradle" }
 ```
 
 Gradle's home holds the Gradle the wrapper downloads, the dependencies and the JDKs Gradle provisions. Ignore `.gradle/` and `build/` in `.gitignore`, as `gradle init` does: the gate fails on a file it leaves that git sees.
+
+**Maven**
+
+```toml
+[stack]
+gate = ['mvn -B -Dmaven.repo.local="$MAVEN_USER_HOME/repository" verify']
+run_caches = { MAVEN_USER_HOME = "maven" }
+```
+
+Maven moves its local repository with a property only, so the line puts it in the folder the runs write; to run the line yourself, set `MAVEN_USER_HOME`, such as `MAVEN_USER_HOME=~/.m2`. The gate runs the machine's Maven even when the project has a wrapper: on macOS `./mvnw` fails confined, making its download folder in a temporary folder the runs cannot write. Ignore `target/`.
+
+**PHP with Composer**
+
+```toml
+[stack]
+gate = ["vendor/bin/phpunit"]
+setup = ["composer install --no-interaction"]
+```
+
+Composer turns off a cache it cannot write and installs anyway, so `init` declares none; `run_caches = { COMPOSER_CACHE_DIR = "composer" }` keeps its downloads for the next runs. `init` writes PHPUnit's line when its settings file is at the root. Ignore `vendor/`.
+
+**.NET**
+
+```toml
+[stack]
+gate = ["DOTNET_SYSTEM_NET_SECURITY_USENETWORKFRAMEWORK=1 dotnet test -m:1 -nodeReuse:false App.sln"]
+setup = ["DOTNET_SYSTEM_NET_SECURITY_USENETWORKFRAMEWORK=1 dotnet restore -m:1 -nodeReuse:false App.sln"]
+run_caches = { DOTNET_CLI_HOME = "dotnet" }
+```
+
+`DOTNET_CLI_HOME` holds the SDK's first-run files and NuGet's packages. The lines build in one process, since MSBuild's worker nodes cannot reach each other in the sandbox, and on macOS reach NuGet through Network.framework, since .NET's TLS there reads the keychain the runs cannot: that switch needs .NET 10 or later, and other systems ignore it. Ignore `bin/` and `obj/`.
 
 **The caches your runs write.** Each `run_caches` entry is a variable a package manager reads for its cache and the name of a folder Owlshift makes for it, under `~/Library/Caches/owlshift/` on macOS and `~/.cache/owlshift/` on Linux, one folder per repository (`OWLSHIFT_CACHE_DIR` moves it, for a machine whose cache folder's path holds a space). `owlshift doctor` shows its size; delete the folder to empty it. Your own caches stay read-only to the runs: declare one in `stack.caches`, and allow it in your personal file with `allow_caches`, only for a tool that must read it, such as yarn 4's global cache:
 

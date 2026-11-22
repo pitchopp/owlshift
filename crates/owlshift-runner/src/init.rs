@@ -1694,6 +1694,50 @@ mod tests {
         assert!(by_hand.contains("# note: Gemfile has no lock file"));
     }
 
+    /// OWL-627: Maven's line, which holds quotes and `$MAVEN_USER_HOME`,
+    /// loads back as written, with its note; Composer and .NET give their
+    /// setup and gate in the fixed order.
+    #[test]
+    fn a_maven_composer_and_dotnet_root_is_written_and_loads() {
+        let d = detected(
+            &[
+                "pom.xml",
+                "composer.json",
+                "composer.lock",
+                "phpunit.xml.dist",
+                "Probe.slnx",
+            ],
+            &[],
+        );
+        let text = project_file(&with(d, &[])).unwrap();
+        let config = ProjectConfig::parse(&text).unwrap();
+        assert_eq!(
+            config.stack.gate,
+            [
+                "mvn -B -Dmaven.repo.local=\"$MAVEN_USER_HOME/repository\" verify",
+                "vendor/bin/phpunit",
+                "DOTNET_SYSTEM_NET_SECURITY_USENETWORKFRAMEWORK=1 dotnet test -m:1 \
+                 -nodeReuse:false Probe.slnx"
+            ]
+        );
+        assert_eq!(
+            config.stack.setup,
+            [
+                "composer install --no-interaction",
+                "DOTNET_SYSTEM_NET_SECURITY_USENETWORKFRAMEWORK=1 dotnet restore -m:1 \
+                 -nodeReuse:false Probe.slnx"
+            ]
+        );
+        assert_eq!(
+            config.stack.run_cache_entries(),
+            [("DOTNET_CLI_HOME", "dotnet"), ("MAVEN_USER_HOME", "maven")]
+        );
+        assert!(
+            text.contains("# note: the Maven line reads `$MAVEN_USER_HOME`"),
+            "{text}"
+        );
+    }
+
     #[test]
     fn a_gate_given_by_hand_wins_and_the_detected_setup_stays() {
         let d = detected(
