@@ -98,6 +98,62 @@ run_caches = { UV_CACHE_DIR = "uv", UV_PYTHON_INSTALL_DIR = "uv-python" }
 
 `uv run` syncs the project's environment from `uv.lock` itself, updating the lock when `pyproject.toml` changed, so there is no setup. A project that wants the gate to fail on a stale lock instead writes `uv run --locked ruff check .` and `uv run --locked pytest` (`--locked` asserts that `uv.lock` stays unchanged, as `uv run --help` says). Without `uv.lock`, the tools run bare and the gate needs a `setup` that installs them. `init` guesses `ruff` and `pytest` only from a `[tool.ruff]` and a `[tool.pytest.ini_options]` table in `pyproject.toml`. Confined, uv needs both caches of its own: its packages, and the Pythons it installs, since your home's are closed.
 
+**Python with poetry**
+
+```toml
+[stack]
+gate = ["poetry run ruff check .", "poetry run pytest"]
+setup = ["poetry install"]
+run_caches = { POETRY_CACHE_DIR = "poetry" }
+```
+
+poetry installs the locked environment into a virtualenv of its cache, one per worktree, which the runs write. poetry 2 looks for a Python in pyenv's folder too: when pyenv lives in your home, `owlshift gate` fails on it and prints the `caches` and `allow_caches` lines that open `.pyenv` read-only.
+
+**Python with pip**
+
+```toml
+[stack]
+gate = [".venv/bin/ruff check .", ".venv/bin/pytest"]
+setup = [
+    "python3 -m venv .venv && echo '*' > .venv/.gitignore",
+    ".venv/bin/pip install -r requirements.txt -r requirements-dev.txt",
+]
+```
+
+The virtualenv lies in the worktree and ignores itself. pip turns off a cache it cannot write and installs anyway, so `init` declares none; `run_caches = { PIP_CACHE_DIR = "pip" }` keeps its downloads for the next runs.
+
+**Go**
+
+```toml
+[stack]
+gate = ["! gofmt -l . | grep .", "go vet ./...", "go test ./..."]
+setup = ["go mod download"]
+run_caches = { GOMODCACHE = "go-mod", GOCACHE = "go-build" }
+```
+
+`gofmt -l` lists the files it would change and always succeeds: the first line fails when it lists one, and names it. Go keeps its modules read-only: run `chmod -R u+w` on the cache folder before you delete it.
+
+**Ruby with bundler**
+
+```toml
+[stack]
+gate = ["bundle exec rspec"]
+setup = ["bundle install"]
+run_caches = { BUNDLE_PATH = "bundle" }
+```
+
+The gems go to a folder of Owlshift's own, which the runs write. A setup that changes `Gemfile.lock` fails the gate, as any setup that changes a file git sees. `init` writes RSpec's line when there is a `.rspec`; a Rails application writes `bin/rails test` instead.
+
+**Gradle**
+
+```toml
+[stack]
+gate = ["./gradlew check --no-daemon"]
+run_caches = { GRADLE_USER_HOME = "gradle" }
+```
+
+Gradle's home holds the Gradle the wrapper downloads, the dependencies and the JDKs Gradle provisions. Ignore `.gradle/` and `build/` in `.gitignore`, as `gradle init` does: the gate fails on a file it leaves that git sees.
+
 **The caches your runs write.** Each `run_caches` entry is a variable a package manager reads for its cache and the name of a folder Owlshift makes for it, under `~/Library/Caches/owlshift/` on macOS and `~/.cache/owlshift/` on Linux, one folder per repository (`OWLSHIFT_CACHE_DIR` moves it, for a machine whose cache folder's path holds a space). `owlshift doctor` shows its size; delete the folder to empty it. Your own caches stay read-only to the runs: declare one in `stack.caches`, and allow it in your personal file with `allow_caches`, only for a tool that must read it, such as yarn 4's global cache:
 
 ```toml personal
