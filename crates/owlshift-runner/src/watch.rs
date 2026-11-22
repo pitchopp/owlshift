@@ -928,6 +928,10 @@ impl Watch<'_> {
         // anything is weighed (OWL-621).
         let mut read = read;
         self.yield_stopped(memory, sink, &mut read, overlap);
+        // An overlap with another runner's ticket admitted after one of this
+        // runner's, recorded by that runner alone, is recorded here too
+        // (OWL-636).
+        self.record_claims_overlaps(memory, sink, &mut read, overlap);
         let collisions = self.collisions(&read, outside.as_ref(), overlap, &|ticket| {
             memory.holds.stands(ticket, now) || memory.base_held.contains(ticket)
         });
