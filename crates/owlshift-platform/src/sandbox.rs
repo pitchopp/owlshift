@@ -22,7 +22,9 @@
 //! the writable folders, the temporary folders and the devices; the system
 //! credential store is closed (the Keychain on macOS, the Secret Service's
 //! socket under `/run/user` on Linux). Each rule rests on a live check
-//! recorded in the build plan (results, "OWL-41").
+//! recorded in the build plan (results, "OWL-41"). On macOS the services that
+//! name the user's own temporary folder are closed too, so that `mktemp`
+//! without a template finds `TMPDIR`, the run's own folder (OWL-637).
 //!
 //! The network is left open: the harness needs it. Other limits are listed
 //! in the build plan and in architecture section 8.
@@ -234,8 +236,9 @@ const READ: &str = "file-read-data file-read-xattr";
 /// allowed, then no write anywhere but the devices, then the home and the
 /// closed folders shut, then the readable, writable and temporary folders
 /// opened again, then the protected paths closed, the reopened ones written
-/// again inside them, and the hidden paths and the Keychain closed whatever
-/// came before.
+/// again inside them, and the hidden paths, the Keychain and the services
+/// that name the user's own folders (`USER_FOLDER_SERVICES`) closed
+/// whatever came before.
 ///
 /// Every read rule names `READ` rather than the wildcard `file-read*`: an
 /// operation named outranks the wildcard whatever the order, so a wildcard
@@ -299,8 +302,27 @@ pub fn seatbelt_profile(policy: &Policy) -> Result<(String, Vec<(String, String)
         "(deny mach-lookup (global-name \"com.apple.SecurityServer\") \
          (global-name \"com.apple.securityd.xpc\"))\n",
     );
+    let services: Vec<String> = USER_FOLDER_SERVICES
+        .iter()
+        .map(|name| format!("(global-name \"{name}\")"))
+        .collect();
+    profile.push_str(&format!("(deny mach-lookup {})\n", services.join(" ")));
     Ok((profile, params))
 }
+
+/// The system services macOS asks for the user's own folders under
+/// `/var/folders` (`confstr(_CS_DARWIN_USER_TEMP_DIR)` and its kin), closed
+/// to every confined program (OWL-637). Unanswered, `mktemp` without a
+/// template, Java and the tools that ask that folder fall back to `TMPDIR`,
+/// the run's own, rather than fail on the user's temporary folder, which
+/// stays closed. Both are needed, as either one alone still answers; found
+/// live on macOS 26.6.2, the order being undocumented: should it change,
+/// the folder is answered and refused again, as before, never opened.
+/// Membership checks (`mbr_check_membership`) then answer "not a member".
+const USER_FOLDER_SERVICES: [&str; 2] = [
+    "com.apple.bsd.dirhelper",
+    "com.apple.system.opendirectoryd.membership",
+];
 
 /// The folders above the opened ones (readable, writable, temporary, and the
 /// working directory) that lie in the home or a closed folder, each once,
@@ -700,7 +722,9 @@ mod tests {
              (deny file-read-data file-read-xattr file-read-metadata file-write* (subpath (param \"H9\")))\n\
              (deny file-read-data file-read-xattr file-read-metadata file-write* (subpath (param \"H10\")))\n\
              (deny mach-lookup (global-name \"com.apple.SecurityServer\") \
-             (global-name \"com.apple.securityd.xpc\"))\n"
+             (global-name \"com.apple.securityd.xpc\"))\n\
+             (deny mach-lookup (global-name \"com.apple.bsd.dirhelper\") \
+             (global-name \"com.apple.system.opendirectoryd.membership\"))\n"
         );
         let values: Vec<&str> = params.iter().map(|(_, value)| value.as_str()).collect();
         assert_eq!(
