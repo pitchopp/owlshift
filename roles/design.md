@@ -1,6 +1,6 @@
 +++
 role = "design"
-brief_format = 31
+brief_format = 32
 result_format = 16
 +++
 

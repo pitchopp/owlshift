@@ -2397,6 +2397,12 @@ pub struct KeptReport {
     /// its report's lead line names (format 5, OWL-300).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub reviews: Vec<AnsweredReview>,
+    /// For the run at Watch after a person's steps were answered, a
+    /// correction's push that names no question (format 9, OWL-619): the
+    /// steps of the plan it followed, the person's steps whose defects it
+    /// fixed and the agent's steps it built, in increasing order.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub steps: Vec<NonZeroU32>,
 }
 
 /// A pull request review a review loop's run answers (OWL-300).
@@ -2442,7 +2448,9 @@ pub enum PushKind {
     Fix,
     Rebase,
     /// A correction run's, after the decider reversed a decision (format 3,
-    /// OWL-146).
+    /// OWL-146), or, its report naming steps instead of questions (format 9,
+    /// OWL-619), the run at Watch after the decider answered a person's
+    /// steps: both follow the decider's word, and count as a correction.
     Correction,
     /// A review loop's run, after reviews on the pull request (format 5,
     /// OWL-300).
@@ -2505,7 +2513,9 @@ impl TicketDelivery {
     /// merge under way or a retry, and a format-6 one, written before the
     /// automatic re-run (OWL-513), without one, and a format-7 one, written
     /// before a rebase's push kept its rebase run's commit (OWL-514),
-    /// without one; the next write gives it the current format.
+    /// without one, and a format-8 one, written before a correction's report
+    /// could name a person's steps (OWL-619), without them; the next write
+    /// gives it the current format.
     pub fn parse(input: &str) -> Result<Self, ContractError> {
         let delivery: Self = match Self::from_older_format(input) {
             Some(read) => read?,
@@ -2515,7 +2525,7 @@ impl TicketDelivery {
         Ok(delivery)
     }
 
-    /// A format-1 to 7 document read as the current format, or `None` for
+    /// A format-1 to 8 document read as the current format, or `None` for
     /// any other. Format 1 is format 2 without `owed` and `pushing.report`,
     /// format 2 is format 3 without a correction's push or report, format 3
     /// is format 4 without an owed delivery report, a report's `notes` or an
@@ -2523,17 +2533,18 @@ impl TicketDelivery {
     /// loop's push, a report's `reviews` or `delivered_at` (OWL-307), and
     /// format 5 is format 6 without `merging` or `merge_retry` (OWL-445), and
     /// format 6 is format 7 without `rerun` (OWL-513), and format 7 is
-    /// format 8 without `pushing.rebased` (OWL-514), so each is refused in
-    /// an older format.
+    /// format 8 without `pushing.rebased` (OWL-514), and format 8 is format
+    /// 9 without a report's `steps` (OWL-619), so each is refused in an
+    /// older format.
     fn from_older_format(input: &str) -> Option<Result<Self, ContractError>> {
         let mut document: serde_json::Value = serde_json::from_str(input).ok()?;
         let fields = document.as_object_mut()?;
         let format = fields.get("format").and_then(serde_json::Value::as_u64)?;
-        if !(1..=7).contains(&format) {
+        if !(1..=8).contains(&format) {
             return None;
         }
         let pushing = fields.get("pushing").and_then(serde_json::Value::as_object);
-        let rebased = pushing.is_some_and(|pushing| pushing.contains_key("rebased"));
+        let rebased = format <= 7 && pushing.is_some_and(|pushing| pushing.contains_key("rebased"));
         let owed = fields.get("owed").and_then(serde_json::Value::as_object);
         let report = pushing.is_some_and(|pushing| pushing.contains_key("report"));
         let reports = || {
@@ -2559,6 +2570,7 @@ impl TicketDelivery {
         .flatten()
         .any(|kind| kind == "review");
         let reviews = reports().any(|report| report.get("reviews").is_some());
+        let steps = reports().any(|report| report.get("steps").is_some());
         let questions = reports().any(|report| report.get("questions").is_some());
         let notes = reports().any(|report| report.get("notes").is_some());
         let owed_delivery = owed
@@ -2584,6 +2596,7 @@ impl TicketDelivery {
             ("merge_retry", format <= 5 && merge_retry),
             ("rerun", format <= 6 && rerun),
             ("pushing.rebased", rebased),
+            ("report's steps", steps),
         ] {
             if kept {
                 return Some(Err(ContractError::invalid(
@@ -2618,7 +2631,8 @@ impl TicketDelivery {
     /// from 1 (exactly 1 for a delivery or a review loop), of a pushed commit
     /// with its pull request (and for a rebase its base), and is unchanged
     /// only for a correction or a review loop that kept its report (OWL-307),
-    /// that a report names questions exactly when it is a correction's and
+    /// that a report names questions or steps (OWL-619), one of the two,
+    /// exactly when it is a correction's, its steps in increasing order, and
     /// keeps notes only for a delivery or a review loop, that an ended
     /// delivery pushes nothing, and that a re-run is of a full commit, with
     /// a workflow run and a job, each job's run among its runs, links of a
@@ -2707,14 +2721,33 @@ impl TicketDelivery {
                 .as_ref()
                 .and_then(|o| o.report.as_ref().map(|r| (o.kind, r))),
         ];
-        if reports
+        // Or, since format 9, the steps of a person's its run followed
+        // (OWL-619): a correction's report names one of the two.
+        if reports.into_iter().flatten().any(|(kind, report)| {
+            let named =
+                usize::from(!report.questions.is_empty()) + usize::from(!report.steps.is_empty());
+            if kind == PushKind::Correction {
+                named != 1
+            } else {
+                named != 0
+            }
+        }) {
+            return invalid(
+                "a report names questions or steps, one of the two, if and only if it is a \
+                 correction's"
+                    .to_owned(),
+            );
+        }
+        if let Some(report) = reports
             .into_iter()
             .flatten()
-            .any(|(kind, report)| (kind == PushKind::Correction) == report.questions.is_empty())
+            .map(|(_, r)| r)
+            .find(|report| report.steps.windows(2).any(|pair| pair[0] >= pair[1]))
         {
-            return invalid(
-                "a report names questions if and only if it is a correction's".to_owned(),
-            );
+            return invalid(format!(
+                "a report names its steps out of order: {:?}",
+                report.steps
+            ));
         }
         // The runner's notes are those of a Build's delivery: the first one
         // (OWL-236), or a review loop's (OWL-307).

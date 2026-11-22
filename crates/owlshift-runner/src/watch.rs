@@ -959,7 +959,7 @@ impl Watch<'_> {
             }
             // Its follow-ups still owed once its following ended (OWL-501).
             if let Ok((stored, _)) = &state
-                && ended::owes_after_end(stored)
+                && ended::owes_after_end(&ticket, stored)
             {
                 owing.push((ticket.clone(), stored.clone()));
             }
@@ -1462,18 +1462,29 @@ impl Watch<'_> {
                 } else {
                     self.review(memory, sink, out, continued, ticket, stored, at.clone())
                 };
+                // Then a person's steps due before the merge: their round,
+                // or the run after their answers (OWL-619).
+                let stepped = if Due::Ran == corrected || Due::Ran == reviewed {
+                    Due::Ran
+                } else {
+                    self.person_steps(memory, sink, out, continued, ticket, stored, at.clone())
+                };
                 let green = seen.decision
                     == (Decision::Follow {
                         adopt: false,
                         action: Action::Green,
                     });
-                if green && (corrected, reviewed) == (Due::Nothing, Due::Nothing) {
+                if green && [corrected, reviewed, stepped] == [Due::Nothing; 3] {
                     self.merge(memory, sink, out, continued, ticket, stored, at, &seen);
                 } else if green
                     && let Some(pr) = &delivery.pull_request
-                    && let Some(due) = [(corrected, "correction"), (reviewed, "review")]
-                        .into_iter()
-                        .find_map(|(found, due)| (found == Due::Pending).then_some(due))
+                    && let Some(due) = [
+                        (corrected, "correction"),
+                        (reviewed, "review"),
+                        (stepped, "person_steps"),
+                    ]
+                    .into_iter()
+                    .find_map(|(found, due)| (found == Due::Pending).then_some(due))
                 {
                     // Merge on green waits for it, which is told (OWL-499).
                     let wait = ("merge_due_first", data([("due", json!(due))]));
@@ -2297,6 +2308,45 @@ impl Watch<'_> {
             ticket,
             held,
             (StepKind::Correct, Some(Role::Build)),
+            None,
+        );
+        if started(&run) {
+            Due::Ran
+        } else {
+            Due::Pending
+        }
+    }
+
+    /// A followed pull request whose ticket owes a person's steps before
+    /// the merge (OWL-619; architecture section 4, "A person's steps"): the
+    /// round that asks its decider, or the run after their answers, as the
+    /// ticket ref read at `at` says ([`on_demand::person::steps_due`]),
+    /// through [`OnDemand::person_steps_seen`], held as a continue is. The
+    /// round runs no model, so no usage limit holds it. Returns what it
+    /// found due: nothing when the ref owes neither.
+    #[allow(clippy::too_many_arguments)]
+    fn person_steps(
+        &self,
+        memory: &mut Memory,
+        sink: &mut EventSink<'_>,
+        out: &mut dyn Write,
+        continued: &mut Continued<'_>,
+        ticket: &TicketId,
+        stored: &Stored,
+        at: RefAt,
+    ) -> Due {
+        let Some(due) = on_demand::steps_due(&stored.record) else {
+            return Due::Nothing;
+        };
+        let first = (due == on_demand::StepsDue::Run).then_some(Role::Build);
+        let run = self.held_run(
+            memory,
+            sink,
+            out,
+            continued,
+            ticket,
+            Seen::at(at, None),
+            (StepKind::PersonSteps, first),
             None,
         );
         if started(&run) {

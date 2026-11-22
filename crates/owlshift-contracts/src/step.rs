@@ -94,6 +94,9 @@ pub enum StepKind {
     Correct,
     /// A review loop's start at Watch.
     Review,
+    /// A person's steps at Watch (OWL-619): the round that asks them, or the
+    /// run that follows their answers, as the ticket ref says which.
+    PersonSteps,
     /// A parked ticket's restart its decider typed on the ticket (OWL-488):
     /// `comment`, the newest `continue` comment watch read; the step reads
     /// the thread again and decides with the ticket's decider.

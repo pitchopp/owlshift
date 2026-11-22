@@ -1739,6 +1739,7 @@ impl OnDemand<'_> {
             published: p.plan.as_ref().and_then(|plan| plan.published.clone()),
             // A new plan owes nothing yet: its Build says what it left.
             owed: Vec::new(),
+            checks: Vec::new(),
         };
         let sha = plan_sha256(&kept.plan);
         let forks = kept.plan.forks.len();
@@ -1801,6 +1802,7 @@ impl OnDemand<'_> {
             }),
             published: p.plan.as_ref().and_then(|plan| plan.published.clone()),
             owed: Vec::new(),
+            checks: Vec::new(),
         };
         let pass = NonZeroU32::new(state.review_pass_due()).expect("a pass due counts from 1");
         let mut review = p.review.clone().unwrap_or_default();

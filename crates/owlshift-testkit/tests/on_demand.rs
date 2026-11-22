@@ -9072,6 +9072,7 @@ fn a_crashed_fix_push(bench: &Bench, owed: Option<owlshift_contracts::refs::Owed
             notes: Vec::new(),
             followups: Vec::new(),
             reviews: Vec::new(),
+            steps: Vec::new(),
         }),
     });
     bench.write_record(&record);
@@ -9173,6 +9174,7 @@ fn a_crashed_rebase_push(rebased: bool) -> (Bench, String, String, String) {
             notes: Vec::new(),
             followups: Vec::new(),
             reviews: Vec::new(),
+            steps: Vec::new(),
         }),
     });
     bench.write_record(&record);

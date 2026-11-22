@@ -206,7 +206,7 @@
           ]
         },
         {
-          "description": "A correction run's, after the decider reversed a decision (format 3,\nOWL-146).",
+          "description": "A correction run's, after the decider reversed a decision (format 3,\nOWL-146), or, its report naming steps instead of questions (format 9,\nOWL-619), the run at Watch after the decider answered a person's\nsteps: both follow the decider's word, and count as a correction.",
           "type": "string",
           "const": "correction"
         },

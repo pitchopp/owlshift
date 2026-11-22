@@ -19,10 +19,17 @@
       "description": "The base commit the plan was written on, a full commit id.",
       "type": "string"
     },
+    "checks": {
+      "description": "The person's steps due before the merge that a round at Watch asked\nits decider (format 3, OWL-619; architecture section 4, \"A person's\nsteps\"): one at most a step, in the plan's order, with how its\ndecider answered once the round was. A check answered a defect is\ndropped once the run after it lands, so its step is asked again; one\nanswered `passed` stays, and its step is never asked again. A new\nplan starts with none.",
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/StepCheck"
+      }
+    },
     "format": {
       "description": "The format version of this document.",
       "type": "integer",
-      "const": 2
+      "const": 3
     },
     "owed": {
       "description": "The agent's steps of this plan its Build left because they need a\nperson's step's result (format 2, OWL-619): the `owed` of its `done`\nresults, gathered over the Build runs of this plan, never fewer. Each\nis a step of the plan, the agent's, after a person's step, in\nincreasing order. A new plan starts with none.",
@@ -368,6 +375,26 @@
         "change"
       ]
     },
+    "QuestionId": {
+      "description": "A question's identifier within a round: Q1, Q2, and so on.",
+      "type": "string",
+      "pattern": "^Q[1-9][0-9]*$"
+    },
+    "StepAnswer": {
+      "description": "How a person's step was answered (OWL-619).",
+      "oneOf": [
+        {
+          "description": "The step gave the result it names: the option the runner\nrecommends.",
+          "type": "string",
+          "const": "passed"
+        },
+        {
+          "description": "Anything else: the other option, or the decider's own words, which\nthe next run at Watch follows.",
+          "type": "string",
+          "const": "defect"
+        }
+      ]
+    },
     "StepBy": {
       "description": "Who does a step of the plan (OWL-619, architecture section 4, \"A\nperson's steps\").",
       "oneOf": [
@@ -381,6 +408,45 @@
           "type": "string",
           "const": "person"
         }
+      ]
+    },
+    "StepCheck": {
+      "description": "A person's step a round at Watch asked its decider (OWL-619).",
+      "type": "object",
+      "properties": {
+        "answer": {
+          "description": "How its decider answered, once the round was answered.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/StepAnswer"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "question": {
+          "description": "Its question's id in that round.",
+          "$ref": "#/$defs/QuestionId"
+        },
+        "round": {
+          "description": "The round that asked it.",
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 1
+        },
+        "step": {
+          "description": "The step's place in the plan, from 1: a person's step due before\nthe merge.",
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 1
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "step",
+        "round",
+        "question"
       ]
     },
     "StepWhen": {

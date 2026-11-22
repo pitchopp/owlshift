@@ -193,6 +193,7 @@ fn step(
             sink,
         )),
         StepKind::Correct => ran(on_demand.correct_seen(ticket, commit, following, sink)),
+        StepKind::PersonSteps => ran(on_demand.person_steps_seen(ticket, commit, following, sink)),
         StepKind::Restart { comment } => {
             ran(on_demand.restart_typed(ticket, commit, comment, sink))
         }

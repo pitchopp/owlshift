@@ -1344,14 +1344,23 @@ pub fn changed(
                             _ => state,
                         };
                         next.state = (&state).into();
+                        // The run after a person's steps settles what it
+                        // followed, as its command would have (OWL-619).
+                        let steps = pushing.report.as_ref().map_or(0, |kept| kept.steps.len());
+                        if steps > 0
+                            && let Some(plan) = next.plan.as_mut()
+                        {
+                            plan.settle_steps_run();
+                        }
                         let count = match pushing.kind {
                             PushKind::Rebase => state.repairs(),
                             // A correction counts no fix pass: its report
-                            // counts the decisions it follows the replies to.
+                            // counts the decisions it follows the replies to,
+                            // or the steps (OWL-619).
                             PushKind::Correction => pushing
                                 .report
                                 .as_ref()
-                                .map_or(1, |kept| kept.questions.len() as u32),
+                                .map_or(1, |kept| kept.questions.len().max(steps).max(1) as u32),
                             PushKind::Fix | PushKind::Delivery | PushKind::Review => {
                                 state.fix_passes()
                             }
@@ -2046,6 +2055,7 @@ mod tests {
             notes: vec![],
             followups: vec![],
             reviews: Vec::new(),
+            steps: Vec::new(),
         };
         assert_eq!(
             next.owed,
@@ -2393,6 +2403,7 @@ mod tests {
                     id: 9,
                     author: "ann-dev".to_owned(),
                 }],
+                steps: Vec::new(),
             }),
         });
         let mut looping = record(d, verifying);

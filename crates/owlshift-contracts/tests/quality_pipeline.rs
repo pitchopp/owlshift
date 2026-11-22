@@ -435,6 +435,60 @@ fn brief_quality_pipeline_fields_go_to_their_roles_only() {
         ))
         .unwrap_or_else(|e| panic!("{role}: {e}"));
     }
+    // A person's steps answered, which Build's run at Watch follows
+    // (OWL-619): Build's alone, with a defect to fix or a step to build.
+    let person_steps = |defect: bool, build: Value| {
+        json!({
+            "pull_request": 1, "url": "https://github.com/o/r/pull/1", "head": "c".repeat(40),
+            "answered": [{
+                "step": 2, "round": 1, "defect": defect, "reading": "It reads Helo.",
+                "question": { "id": "Q1", "category": "person_step", "context": "c",
+                              "text": "What did it give?" }
+            }],
+            "build": build
+        })
+    };
+    parse(&with(
+        brief("build"),
+        "person_steps",
+        person_steps(true, json!([])),
+    ))
+    .unwrap();
+    parse(&with(
+        brief("build"),
+        "person_steps",
+        person_steps(false, json!([3])),
+    ))
+    .unwrap();
+    for (document, reason) in [
+        (
+            with(
+                brief("verify"),
+                "person_steps",
+                person_steps(true, json!([])),
+            ),
+            "a person's steps are given but the role is verify",
+        ),
+        (
+            with(
+                brief("build"),
+                "person_steps",
+                person_steps(false, json!([])),
+            ),
+            "no defect to fix and no step to build",
+        ),
+        (
+            with(
+                brief("build"),
+                "person_steps",
+                person_steps(false, json!([5, 3])),
+            ),
+            "given out of order",
+        ),
+    ] {
+        let error = parse(&document).unwrap_err();
+        assert!(error.contains(reason), "{reason}: {error}");
+    }
     // The diff of a Verify pass (OWL-302): in verify's review, and with the
     // arbiter's findings to rule on.
     let diff = json!({ "base": "b".repeat(40), "path": ".owlshift/run/diff.patch" });
@@ -600,7 +654,7 @@ fn brief_quality_pipeline_fields_go_to_their_roles_only() {
         ),
         (
             "a newer brief",
-            with(brief("build"), "format", 32.into()),
+            with(brief("build"), "format", 33.into()),
             "upgrade Owlshift",
         ),
     ] {
@@ -701,7 +755,7 @@ fn bumped_ticket_ref_formats_read_older_ones_and_refuse_newer_ones() {
         ),
         (
             "a newer delivery",
-            &|d| d["format"] = 9.into(),
+            &|d| d["format"] = 10.into(),
             "upgrade Owlshift",
         ),
     ] {
@@ -718,7 +772,7 @@ fn bumped_ticket_ref_formats_read_older_ones_and_refuse_newer_ones() {
         TicketDelivery::parse(&format_4.to_string())
             .unwrap()
             .render()
-            .starts_with("{\n  \"format\": 8,")
+            .starts_with("{\n  \"format\": 9,")
     );
     let mut reviews_in_4 = format_4;
     reviews_in_4["pushing"]["report"]["reviews"] = json!([{ "id": 7, "author": "ada" }]);

@@ -358,46 +358,44 @@ pub(crate) fn notify_refused(
 }
 
 /// Why merge on green will not merge the ticket's pull request, from its
-/// `questions` and its `plan` alone, as a delivery says it (OWL-464): the
-/// question that keeps it for a person, named, under the project's gate
-/// policy, then the steps it owes a person before the merge (OWL-619).
-/// `None` under `never`, where Owlshift merges nothing anyway, and when
-/// nothing holds.
+/// `questions` alone, as a delivery says it (OWL-464): the question that
+/// keeps it for a person, named, under the project's gate policy. `None`
+/// under `never`, where Owlshift merges nothing anyway, and when no
+/// question holds. The steps a ticket owes a person before the merge are
+/// not said here: their round at Watch asks its decider, and Owlshift
+/// merges once they are answered and the run after them landed (OWL-619).
 pub(crate) fn held_at_delivery(
     on_demand: &OnDemand<'_>,
     switch: MergeSwitch,
     questions: &TicketQuestions,
-    plan: Option<&TicketPlan>,
 ) -> Option<String> {
     if switch == MergeSwitch::Never {
         return None;
     }
     let questions = self::questions(questions);
     let gate = on_demand.config.gate_policy();
-    if let Some((question, blocker)) = held_question(&gate, &questions) {
-        return Some(hold_words(&blocker, Some(question)));
-    }
-    let owed = person_steps(plan);
-    (owed > 0).then(|| hold_words(&MergeBlocker::PersonSteps(owed), None))
+    held_question(&gate, &questions).map(|(question, blocker)| hold_words(&blocker, Some(question)))
 }
 
-/// The steps a ticket whose plan is `plan` owes a person before the merge,
-/// merge on green's `person_steps` (OWL-619): none without a plan.
+/// The steps a ticket whose plan is `plan` still owes before the merge,
+/// merge on green's `person_steps` (OWL-619): none without a plan. Watch
+/// asks them, and runs the run after their answers, before it reads the
+/// merge's facts, so a merge that waits on them waits on what neither can
+/// settle, which only a person lifts.
 pub(crate) fn person_steps(plan: Option<&TicketPlan>) -> usize {
     plan.map_or(0, TicketPlan::owed_before_merge)
 }
 
 /// Who merges the pull request a command just delivered at `base`, as its
 /// line says it: [`switch_at`], and [`held_at_delivery`] on its ticket's
-/// `questions` (OWL-464) and `plan` (OWL-619).
+/// `questions` (OWL-464).
 pub(crate) fn who_merges(
     on_demand: &OnDemand<'_>,
     base: &Base,
     questions: &TicketQuestions,
-    plan: Option<&TicketPlan>,
 ) -> (MergeSwitch, Option<String>) {
     let switch = switch_at(on_demand, base);
-    (switch, held_at_delivery(on_demand, switch, questions, plan))
+    (switch, held_at_delivery(on_demand, switch, questions))
 }
 
 /// The `merge_waits` decision event (OWL-464): the green pull request
