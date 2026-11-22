@@ -1745,6 +1745,53 @@ mod tests {
         );
     }
 
+    /// OWL-628: Elixir and Deno lines load back from the file, with their
+    /// run caches; Swift's note is written above nothing.
+    #[test]
+    fn an_elixir_and_deno_root_is_written_and_loads() {
+        let d = detected(
+            &[
+                "mix.exs",
+                "mix.lock",
+                ".formatter.exs",
+                "deno.json",
+                "deno.lock",
+                "Package.swift",
+            ],
+            &[],
+        );
+        let text = project_file(&with(d, &[])).unwrap();
+        let config = ProjectConfig::parse(&text).unwrap();
+        assert_eq!(
+            config.stack.gate,
+            [
+                "mix format --check-formatted",
+                "mix test",
+                "deno fmt --check",
+                "deno lint",
+                "deno test --frozen --permit-no-files"
+            ]
+        );
+        assert_eq!(
+            config.stack.setup,
+            [
+                "[ ! -f /etc/ssl/cert.pem ] || export HEX_CACERTS_PATH=/etc/ssl/cert.pem; mix \
+                 local.hex --force --if-missing && mix local.rebar --force --if-missing",
+                "mix deps.get --check-locked",
+                "deno install --frozen"
+            ]
+        );
+        assert_eq!(
+            config.stack.run_cache_entries(),
+            [
+                ("DENO_DIR", "deno"),
+                ("HEX_HOME", "hex"),
+                ("MIX_HOME", "mix")
+            ]
+        );
+        assert!(text.contains("# note: Swift was not written"), "{text}");
+    }
+
     #[test]
     fn a_gate_given_by_hand_wins_and_the_detected_setup_stays() {
         let d = detected(
