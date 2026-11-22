@@ -111,6 +111,11 @@
           "description": "The ticket's work is a person's whole (OWL-619): what the run read,\nand the gesture that gives the ticket back to Owlshift.",
           "type": "string",
           "const": "HANDBACK"
+        },
+        {
+          "description": "The broken base a repair ticket was filed for passes before the\nrepair merged (OWL-622): the ticket is left to its decider.",
+          "type": "string",
+          "const": "LIFTED"
         }
       ]
     },

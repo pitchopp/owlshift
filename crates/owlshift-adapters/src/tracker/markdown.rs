@@ -298,22 +298,6 @@ impl MarkdownTracker {
         description: &str,
         blocked_by_parent: bool,
     ) -> Result<TicketId, TrackerError> {
-        let parent_file = self.ticket_file(parent);
-        if !parent_file.is_file() {
-            return Err(error(&parent_file, "no such ticket"));
-        }
-        if title.trim().is_empty() || title.contains(['\n', '\r']) {
-            return Err(error(
-                &parent_file,
-                "a proposal's title must be one line, not blank",
-            ));
-        }
-        let Some((key, _)) = numbered(parent) else {
-            return Err(error(
-                &parent_file,
-                format!("{parent} ends in no number to file a proposal after"),
-            ));
-        };
         let front = FrontMatter {
             title: title.to_owned(),
             author: Self::AGENT.to_owned(),
@@ -328,15 +312,70 @@ impl MarkdownTracker {
             },
             related: vec![parent.clone()],
         };
+        self.file_after(parent, &front, description, "proposal")
+    }
+
+    /// Files the repair of a broken base (OWL-622) after `held`, the ticket
+    /// whose failure opened the hold, as a proposal is filed after its
+    /// parent: a new folder of `held`'s key, authored [`Self::AGENT`], at the
+    /// stage `ready`, priority `urgent`, with `assignee`, the decider, and
+    /// `label`, the admission label under a label gesture; no relation.
+    pub fn file_repair(
+        &self,
+        held: &TicketId,
+        title: &str,
+        description: &str,
+        (ready, label, assignee): (&str, Option<&str>, Option<&str>),
+    ) -> Result<TicketId, TrackerError> {
+        let front = FrontMatter {
+            title: title.to_owned(),
+            author: Self::AGENT.to_owned(),
+            stage: ready.to_owned(),
+            priority: Priority::Urgent,
+            assignee: assignee.map(str::to_owned),
+            labels: label.map(str::to_owned).into_iter().collect(),
+            blocked_by: Vec::new(),
+            related: Vec::new(),
+        };
+        self.file_after(held, &front, description, "repair")
+    }
+
+    /// Writes a new ticket `front` with `description` in a folder of
+    /// `after`'s key, one past that key's highest number, claimed by creating
+    /// it ([`Self::propose`]); `what` names it in a refusal.
+    fn file_after(
+        &self,
+        after: &TicketId,
+        front: &FrontMatter,
+        description: &str,
+        what: &str,
+    ) -> Result<TicketId, TrackerError> {
+        let parent_file = self.ticket_file(after);
+        if !parent_file.is_file() {
+            return Err(error(&parent_file, "no such ticket"));
+        }
+        let title = &front.title;
+        if title.trim().is_empty() || title.contains(['\n', '\r']) {
+            return Err(error(
+                &parent_file,
+                format!("a {what}'s title must be one line, not blank"),
+            ));
+        }
+        let Some((key, _)) = numbered(after) else {
+            return Err(error(
+                &parent_file,
+                format!("{after} ends in no number to file a {what} after"),
+            ));
+        };
         let description = description.trim_start_matches(['\r', '\n']);
         let text = format!(
             "+++\n{}+++\n\n{description}",
-            render_front(&front).map_err(|e| error(&parent_file, e))?
+            render_front(front).map_err(|e| error(&parent_file, e))?
         );
-        if !matches!(parse(&text), Ok((read, rest)) if read == front && rest == description) {
+        if !matches!(parse(&text), Ok((read, rest)) if read == *front && rest == description) {
             return Err(error(
                 &parent_file,
-                "the proposal does not read back as written",
+                format!("the {what} does not read back as written"),
             ));
         }
         let highest = self
@@ -767,6 +806,28 @@ impl shared::Tracker for MarkdownTracker {
         Ok(shared::Filed {
             id,
             state: Self::TRIAGE.to_owned(),
+            problems: Vec::new(),
+        })
+    }
+
+    /// A new ticket folder after the held ticket's key's highest number
+    /// ([`MarkdownTracker::file_repair`]): at the ready stage, urgent, with
+    /// the admission label and the assignee, a Markdown ticket's decider,
+    /// which this tracker names and does not check. A held ticket that is
+    /// not there is [`ErrorKind::NotFound`]; one file is written.
+    fn file_repair(&self, repair: &shared::Repair<'_>) -> Result<shared::Filed, shared::Error> {
+        self.require_ticket(repair.held)?;
+        let id = MarkdownTracker::file_repair(
+            self,
+            repair.held,
+            repair.title,
+            repair.description,
+            (repair.ready, repair.label, repair.assignee),
+        )
+        .map_err(other)?;
+        Ok(shared::Filed {
+            id,
+            state: repair.ready.to_owned(),
             problems: Vec::new(),
         })
     }
@@ -1778,6 +1839,43 @@ mod tests {
     /// highest number, other keys and unnumbered folders aside, written at
     /// `Triage` by `owlshift`, related to its parent and blocked by it only
     /// when asked; the two searches find it until it is done.
+    /// OWL-622: a base's repair is a new ticket after the held one, at the
+    /// ready stage, urgent, labelled and assigned, with no relation; a held
+    /// ticket that is not there files nothing.
+    #[test]
+    fn a_repair_is_filed_ready_urgent_labelled_and_assigned() {
+        let (root, tracker, _) = repository(TICKET);
+        let repair = |held| shared::Repair {
+            held,
+            title: "Repair the base: `make test` fails at 0123456789ab",
+            description: "The gate fails.\n",
+            ready: "Todo",
+            label: Some("agent"),
+            assignee: Some("maintainer"),
+        };
+        let held = id();
+        let filed = shared::Tracker::file_repair(&tracker, &repair(&held)).unwrap();
+        assert_eq!(
+            (filed.id.as_str(), filed.state.as_str()),
+            ("DEMO-2", "Todo")
+        );
+        let read = tracker.ticket(&filed.id).unwrap();
+        assert_eq!(
+            (read.author.as_str(), read.stage.as_str(), read.priority),
+            ("owlshift", "Todo", Priority::Urgent)
+        );
+        assert_eq!(
+            (read.assignee.as_deref(), read.labels),
+            (Some("maintainer"), vec!["agent".to_owned()])
+        );
+        assert!(read.related.is_empty() && read.blocked_by.is_empty());
+        assert_eq!(read.description, "The gate fails.\n");
+        let gone = TicketId::new("DEMO-40").unwrap();
+        let error = shared::Tracker::file_repair(&tracker, &repair(&gone)).unwrap_err();
+        assert_eq!(error.kind, ErrorKind::NotFound);
+        assert!(!root.path().join("tickets/DEMO-41").exists());
+    }
+
     #[test]
     fn a_proposal_is_filed_after_the_highest_number_and_found_again() {
         use shared::Tracker as _;

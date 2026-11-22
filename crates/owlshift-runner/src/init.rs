@@ -228,6 +228,10 @@ always_human = []
 # \"exclusive\" (the later one waits) or \"rebase\" (both build, the later one
 # refreshed onto the first's merge). Default: `\"exclusive\"`.
 # overlap = \"exclusive\"
+# Whether a default branch that breaks the gate files one repair ticket,
+# which Owlshift admits itself and runs before the others: true or false.
+# Default: `true`.
+# base_repair = true
 # Where a ticket is claimed, so that one runner alone works it: \"local\" (the
 # ticket locks of each machine alone; nothing is pushed) or \"remote\" (a claim
 # ref on origin, for a team's runners or one person's two machines; the
@@ -1404,6 +1408,7 @@ mod tests {
                 policy.max_in_flight(),
                 policy.max_open_prs(),
                 policy.overlap(),
+                policy.base_repair(),
                 policy.claims(),
                 policy.resolver(),
                 pipeline.findings(),
@@ -1416,6 +1421,7 @@ mod tests {
         policy.max_in_flight = None;
         policy.max_open_prs = None;
         policy.overlap = None;
+        policy.base_repair = None;
         policy.claims = None;
         policy.resolver_delegation = None;
         policy.resolver_passes = None;
@@ -1440,6 +1446,7 @@ mod tests {
                     "max_in_flight",
                     "max_open_prs",
                     "overlap",
+                    "base_repair",
                     "claims",
                     "resolver_delegation",
                     "resolver_passes",

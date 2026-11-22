@@ -301,6 +301,7 @@ impl Bench {
                     run_dir: &run_dir,
                     brief: &brief,
                     setup: &self.config.stack.setup,
+                    repairs_setup: None,
                     session: None,
                     siblings: None,
                 },

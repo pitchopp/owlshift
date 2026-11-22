@@ -286,6 +286,9 @@ struct Row {
     state: Option<TicketState>,
     /// The hash of its current text.
     text: String,
+    /// The repair of a broken base the runner admits (OWL-622): taken in
+    /// and dispatched first.
+    repair: bool,
 }
 
 impl Row {
@@ -300,6 +303,7 @@ impl Row {
             stored,
             state,
             text,
+            repair: false,
         }
     }
 
@@ -349,14 +353,19 @@ impl Row {
         due && !self.excluded(exclude) && on_demand::has_decider(&self.listed.ticket, &[])
     }
 
-    /// The core's order: priority, then the first created, then the
-    /// identifier.
+    /// The core's order: a base's repair first (OWL-622), then priority,
+    /// then the first created, then the identifier.
     fn order(&self, other: &Row) -> std::cmp::Ordering {
         let created = |row: &Row| row.listed.created_at.map_or(0, Timestamp::as_millisecond);
-        self.listed
-            .ticket
-            .priority
-            .cmp(&other.listed.ticket.priority)
+        other
+            .repair
+            .cmp(&self.repair)
+            .then(
+                self.listed
+                    .ticket
+                    .priority
+                    .cmp(&other.listed.ticket.priority),
+            )
             .then(created(self).cmp(&created(other)))
             .then_with(|| natural_cmp(self.id().as_str(), other.id().as_str()))
     }
@@ -470,14 +479,18 @@ impl Watch<'_> {
             memory.drain.unread = unread.clone();
         }
         // A ticket whose ref cannot be read is weighed by nothing: the ready
-        // snapshot alone keeps it (OWL-468).
+        // snapshot alone keeps it (OWL-468). The repairs of a broken base the
+        // runner admits, read once a pass (OWL-622).
+        let repairs = crate::base::repairs(on_demand.dirs);
         let (mut rows, mut unread_rows) = (Vec::new(), Vec::new());
         for listed in listed {
             if unread.contains(&listed.ticket.id) {
                 unread_rows.push(Row::unread(listed));
             } else {
                 let stored = refs.get(&listed.ticket.id).cloned();
-                rows.push(Row::new(listed, stored));
+                let mut row = Row::new(listed, stored);
+                row.repair = crate::base::admits(&repairs, row.id(), &row.text);
+                rows.push(row);
             }
         }
         rows.sort_by(Row::order);
@@ -1249,13 +1262,15 @@ impl Watch<'_> {
             .warned
             .get(row.id())
             .is_some_and(|warned| now < warned.retry);
+        // A base's repair is the runner's own admission (OWL-622): no
+        // gesture to warn of, no one else's to rest.
         let admission = if row.excluded(exclude) {
             Admission::Excluded
         } else if memory.claimed.of(row.id()).is_some() {
             Admission::Claimed
-        } else if warned {
+        } else if warned && !row.repair {
             Admission::NotAdmitted
-        } else if memory.drain.resting.contains_key(row.id()) {
+        } else if memory.drain.resting.contains_key(row.id()) && !row.repair {
             Admission::NotMine
         } else {
             Admission::Admitted
@@ -1288,6 +1303,7 @@ impl Watch<'_> {
             variant: record.map_or(Variant::Standard, |record| record.variant),
             state: row.state.unwrap_or_else(TicketState::admitted),
             delivery_followed: row.followed(),
+            repair: row.repair,
         }
     }
 

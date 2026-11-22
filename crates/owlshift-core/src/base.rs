@@ -22,6 +22,11 @@
 //! - *Leaving a broken commit* (OWL-427). A held Build whose branch has
 //!   commits of its own is rebased onto a newer default-branch head once
 //!   that head passes its own check ([`leave`]).
+//! - *The repair ticket* (OWL-622). A checked entry keeps the ticket the
+//!   runner filed for its hold ([`Repair`]), kept across its checks, a lift
+//!   included: the runner admits a repair while an entry naming it holds
+//!   ([`Checks::repairs`]), and a hold that opens again, or another on the
+//!   same command, takes an open one again ([`Checks::reusable`]).
 
 /// The most entries kept; past it the oldest without a hold goes first.
 pub const MAX_CHECKS: usize = 16;
@@ -147,6 +152,29 @@ pub struct Hold {
     pub told: bool,
 }
 
+/// The ticket the runner filed for a hold (OWL-622; architecture section 5,
+/// "The repair ticket"): tried once per hold opened.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Repair {
+    /// The tracker refused it, or no operator could be named: the hold is
+    /// told as before, and no ticket is filed until a hold opens again.
+    Unfiled,
+    /// Filed, or an open one taken again: its identifier, and the hash of
+    /// its title and description as the tracker answered them, which its
+    /// admission by the runner requires unchanged.
+    Filed { ticket: String, text_sha256: String },
+}
+
+impl Repair {
+    /// The ticket filed, if any.
+    pub fn ticket(&self) -> Option<&str> {
+        match self {
+            Repair::Filed { ticket, .. } => Some(ticket),
+            Repair::Unfiled => None,
+        }
+    }
+}
+
 /// What is known of one commit and its commands.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Entry {
@@ -158,6 +186,9 @@ pub enum Entry {
         checked_ms: i64,
         verdict: Verdict,
         hold: Option<Hold>,
+        /// The repair ticket filed for a hold on it (OWL-622): `None` while
+        /// none was tried. Kept by the checks that follow, a lift included.
+        repair: Option<Repair>,
     },
 }
 
@@ -335,10 +366,11 @@ impl Checks {
             .position(commit, commands)
             .map(|at| self.checks.remove(at));
         let before = previous.as_ref().and_then(|check| check.entry.hold());
-        let pending = previous.as_ref().and_then(|check| match &check.entry {
-            Entry::Pending { failing, .. } => Some(failing.clone()),
-            Entry::Checked { .. } => None,
-        });
+        let (pending, repair) = match previous.map(|check| check.entry) {
+            Some(Entry::Pending { failing, .. }) => (Some(failing), None),
+            Some(Entry::Checked { repair, .. }) => (None, repair),
+            None => (None, None),
+        };
         let initiating = initiating.or(pending.as_ref());
         let failed = matches!(verdict, Verdict::Failed(_));
         let matched = initiating.is_some_and(|failing| whose(failing, &verdict) == Whose::Base);
@@ -356,6 +388,7 @@ impl Checks {
                 checked_ms: now_ms,
                 verdict,
                 hold: after,
+                repair,
             },
         });
         self.trim();
@@ -445,6 +478,115 @@ impl Checks {
     /// The entries that hold their Builds: holds and pending checks.
     pub fn standing(&self) -> impl Iterator<Item = &Check> {
         self.checks.iter().filter(|check| check.entry.holds())
+    }
+
+    /// The repair ticket kept on the entry of `commit` and `commands`
+    /// (OWL-622): `None` when none was tried, or the entry is pending.
+    pub fn repair(&self, commit: &str, commands: &str) -> Option<&Repair> {
+        match &self.get(commit, commands)?.entry {
+            Entry::Checked { repair, .. } => repair.as_ref(),
+            Entry::Pending { .. } => None,
+        }
+    }
+
+    /// Keeps `repair` on the entry of `commit` and `commands`, a checked one:
+    /// whether there was one to keep it on.
+    pub fn set_repair(&mut self, commit: &str, commands: &str, repair: Repair) -> bool {
+        let Some(at) = self.position(commit, commands) else {
+            return false;
+        };
+        match &mut self.checks[at].entry {
+            Entry::Checked { repair: kept, .. } => {
+                *kept = Some(repair);
+                true
+            }
+            Entry::Pending { .. } => false,
+        }
+    }
+
+    /// The repair tickets the runner admits (OWL-622): each filed for an
+    /// entry that holds now, with the hash of its text when filed, once
+    /// each, in the entries' order. A repair whose hold lifted is its
+    /// decider's.
+    pub fn repairs(&self) -> Vec<(&str, &str)> {
+        let mut found: Vec<(&str, &str)> = Vec::new();
+        for check in &self.checks {
+            if let Entry::Checked {
+                hold: Some(_),
+                repair:
+                    Some(Repair::Filed {
+                        ticket,
+                        text_sha256,
+                    }),
+                ..
+            } = &check.entry
+                && !found.iter().any(|(id, _)| id == ticket)
+            {
+                found.push((ticket, text_sha256));
+            }
+        }
+        found
+    }
+
+    /// The holds that name `ticket` as their repair (OWL-622): what its own
+    /// Build is not held by, whatever commit it is configured at.
+    pub fn held_for(&self, ticket: &str) -> impl Iterator<Item = &Check> {
+        self.checks.iter().filter(move |check| {
+            matches!(
+                &check.entry,
+                Entry::Checked {
+                    hold: Some(_),
+                    repair: Some(Repair::Filed { ticket: named, .. }),
+                    ..
+                } if named == ticket
+            )
+        })
+    }
+
+    /// The repair tickets a hold on `commit` and `commands` that fails at
+    /// `failing` may take again rather than file one (OWL-622): its own
+    /// entry's first, then those of every entry whose verdict failed at the
+    /// same step and command, held or lifted, once each. The caller keeps
+    /// only one still open on the tracker.
+    pub fn reusable(&self, commit: &str, commands: &str, failing: &Failing) -> Vec<String> {
+        let own = self
+            .repair(commit, commands)
+            .and_then(Repair::ticket)
+            .map(str::to_owned);
+        let mut found: Vec<String> = own.into_iter().collect();
+        for check in &self.checks {
+            if let Entry::Checked {
+                verdict: Verdict::Failed(failure),
+                repair: Some(Repair::Filed { ticket, .. }),
+                ..
+            } = &check.entry
+                && failure.failing == *failing
+                && !found.contains(ticket)
+            {
+                found.push(ticket.clone());
+            }
+        }
+        found
+    }
+
+    /// The last commit whose check of `commands` passed, by the time it was
+    /// checked: where a repair's description counts the default branch's
+    /// commits from (OWL-622).
+    pub fn last_passed(&self, commands: &str) -> Option<&str> {
+        self.checks
+            .iter()
+            .filter(|check| {
+                check.commands == commands
+                    && matches!(
+                        check.entry,
+                        Entry::Checked {
+                            verdict: Verdict::Passed,
+                            ..
+                        }
+                    )
+            })
+            .max_by_key(|check| check.entry.at_ms())
+            .map(|check| check.commit.as_str())
     }
 
     /// Drops the oldest entries past [`MAX_CHECKS`], those that hold nothing
@@ -681,6 +823,55 @@ mod tests {
                 "{head} {has_held} {verdict:?} {branch:?}"
             );
         }
+    }
+
+    /// OWL-622: a hold's repair is kept by every check of its entry, a lift
+    /// included; the runner admits it only while the entry holds; a head
+    /// that moves and still fails at the same command offers it again, and
+    /// another command does not.
+    #[test]
+    fn a_holds_repair_is_kept_and_offered_again_on_the_same_command() {
+        let install = setup("install");
+        let filed = |ticket: &str| Repair::Filed {
+            ticket: ticket.to_owned(),
+            text_sha256: "t".to_owned(),
+        };
+        let mut checks = Checks::default();
+        assert_eq!(
+            record(&mut checks, "h1", 10, failed(&install), Some(&install)),
+            Recorded::Opened
+        );
+        assert_eq!(checks.repair(X, KEY), None);
+        assert!(checks.set_repair(X, KEY, filed("DEMO-7")));
+        assert!(!checks.set_repair("unknown", KEY, filed("DEMO-8")));
+        assert_eq!(checks.repairs(), [("DEMO-7", "t")]);
+        assert_eq!(checks.held_for("DEMO-7").count(), 1);
+        // The head moves, still failing: the same hold, the same repair.
+        assert_eq!(
+            record(&mut checks, "h2", 20, failed(&install), None),
+            Recorded::StillHeld
+        );
+        assert_eq!(checks.repair(X, KEY), Some(&filed("DEMO-7")));
+        // A newer commit failing the same command offers it; another
+        // command does not.
+        checks.record_check(("y", KEY, "h2"), 21, failed(&install), Some(&install));
+        assert_eq!(checks.reusable("y", KEY, &install), ["DEMO-7"]);
+        assert!(checks.reusable("y", KEY, &setup("other")).is_empty());
+        // Lifted: kept on the entry, no longer the runner's to admit, and
+        // still offered to a hold that opens again.
+        assert_eq!(
+            record(&mut checks, "h3", 30, Verdict::Passed, None),
+            Recorded::Lifted
+        );
+        assert_eq!(checks.repair(X, KEY), Some(&filed("DEMO-7")));
+        assert!(checks.repairs().is_empty());
+        assert_eq!(checks.held_for("DEMO-7").count(), 0);
+        assert_eq!(checks.reusable(X, KEY, &install), ["DEMO-7"]);
+        assert_eq!(checks.last_passed(KEY), Some(X));
+        assert_eq!(checks.last_passed("other"), None);
+        // A refusal keeps no ticket.
+        assert!(checks.set_repair("y", KEY, Repair::Unfiled));
+        assert_eq!(checks.repair("y", KEY).and_then(Repair::ticket), None);
     }
 
     #[test]

@@ -1264,6 +1264,7 @@ impl Rig {
             run_dir: &self.paths.root.join(run_dir),
             brief,
             setup: &[],
+            repairs_setup: None,
             session,
             siblings: None,
         };

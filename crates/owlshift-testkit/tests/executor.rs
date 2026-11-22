@@ -163,6 +163,7 @@ impl Bench {
             run_dir: &self.tmp.path().join("run"),
             brief,
             setup: &[],
+            repairs_setup: None,
             session: None,
             siblings: None,
         };
@@ -184,6 +185,7 @@ impl Bench {
             run_dir: &self.tmp.path().join("run"),
             brief: &self.brief,
             setup: &[],
+            repairs_setup: None,
             session: None,
             siblings: None,
         };
@@ -1204,6 +1206,7 @@ fn a_done_builds_gate_runs_again_alone_on_its_kept_result() {
         run_dir: &bench.tmp.path().join("regate"),
         brief: &brief,
         setup: &[],
+        repairs_setup: None,
         session: None,
         siblings: None,
     };
@@ -1258,6 +1261,7 @@ fn a_resume_without_its_transcript_starts_the_runs_own_session() {
             run_dir: &bench.tmp.path().join("run"),
             brief: &bench.brief,
             setup: &[],
+            repairs_setup: None,
             session: Some(&plan),
             siblings: None,
         };
@@ -1344,6 +1348,7 @@ fn a_read_only_profile_harness_keeps_its_session() {
             run_dir: &bench.tmp.path().join("run"),
             brief: &brief,
             setup: &[],
+            repairs_setup: None,
             session: Some(&plan),
             siblings: None,
         };
@@ -1670,6 +1675,7 @@ mod setup {
                 run_dir: &self.tmp.path().join("run"),
                 brief,
                 setup: &setup,
+                repairs_setup: None,
                 session: None,
                 siblings: None,
             };
@@ -2284,6 +2290,7 @@ mod among {
                 run_dir: &run_dir,
                 brief: &self.bench.brief,
                 setup: &[],
+                repairs_setup: None,
                 session: None,
                 siblings: Some(&siblings),
             };

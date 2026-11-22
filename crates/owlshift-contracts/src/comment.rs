@@ -70,10 +70,13 @@ pub enum MarkerKind {
     /// The ticket's work is a person's whole (OWL-619): what the run read,
     /// and the gesture that gives the ticket back to Owlshift.
     Handback,
+    /// The broken base a repair ticket was filed for passes before the
+    /// repair merged (OWL-622): the ticket is left to its decider.
+    Lifted,
 }
 
 impl MarkerKind {
-    const ALL: [Self; 14] = [
+    const ALL: [Self; 15] = [
         Self::Questions,
         Self::ReAsk,
         Self::Resume,
@@ -88,6 +91,7 @@ impl MarkerKind {
         Self::Rerun,
         Self::Released,
         Self::Handback,
+        Self::Lifted,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -106,6 +110,7 @@ impl MarkerKind {
             Self::Rerun => "RERUN",
             Self::Released => "RELEASED",
             Self::Handback => "HANDBACK",
+            Self::Lifted => "LIFTED",
         }
     }
 

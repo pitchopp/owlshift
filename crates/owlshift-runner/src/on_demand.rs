@@ -1641,6 +1641,11 @@ struct Prepared {
     /// keeps what it carries in `carry.json` ([`OnDemand::stepped`],
     /// OWL-399).
     started: Option<ticket_ref::Progress>,
+    /// The ticket is the repair of a broken base (OWL-622), read at its
+    /// Build step: the failing command of a hold that names it, which its
+    /// own Build is not held by and its setup may start through. Unrelated
+    /// to `repairing`, a repair at Watch.
+    repair_hold: Option<owlshift_core::base::Failing>,
 }
 
 impl Prepared {
@@ -2210,7 +2215,11 @@ impl OnDemand<'_> {
         let named = self.config.stack.named_resources().unwrap_or_default();
         let locked = self.locked_load(p, None, &named)?;
         let ticket = p.ticket.as_str().to_owned();
-        if let Some(wait) = schedule::admission(&ticket, self.admission_caps(), &locked.load) {
+        // A base's repair is not held back by the project's capacity
+        // (OWL-622).
+        let caps =
+            schedule::repair_caps(self.admission_caps(), self.repair_of(&p.ticket).is_some());
+        if let Some(wait) = schedule::admission(&ticket, caps, &locked.load) {
             return Err(self.waits(&p.ticket, &wait, &locked));
         }
         p.held = Some(held);
@@ -2251,13 +2260,22 @@ impl OnDemand<'_> {
         holding.push((own.id.clone(), own.dispatched));
         let capacity = u32::from(self.config.policy.max_in_flight());
         let overlap = self.overlap_policy(p);
+        // A base's repair takes the turn whatever the capacity counts, and
+        // waits for nothing the tickets its base holds hold (OWL-622).
+        let repair = self.repair_of(&p.ticket).is_some();
+        let mut in_flight = locked.in_flight.clone();
+        if repair {
+            self.leave_base_held(p, &mut in_flight, overlap);
+        }
         let wait = match schedule::slot_turn(&holding, &locked.unread, capacity) {
-            Turn::Holders(holders) if !holders.contains(&own.id) => Some(Wait::Slot(holders)),
+            Turn::Holders(holders) if !holders.contains(&own.id) && !repair => {
+                Some(Wait::Slot(holders))
+            }
             Turn::Unknown(unread) => Some(Wait::Slot(unread)),
             // Under `rebase` a yielded ticket's check is its admission again
             // (OWL-621); under `exclusive` it holds what it held, checked so.
             Turn::Holders(_) if own.yielded && overlap == Overlap::Rebase => None,
-            Turn::Holders(_) => collision::weigh(&own, &locked.in_flight, overlap)
+            Turn::Holders(_) => collision::weigh(&own, &in_flight, overlap)
                 .collision
                 .map(Wait::Collision),
         };
@@ -2397,7 +2415,12 @@ impl OnDemand<'_> {
         admission: Admission,
         sink: &mut EventSink<'_>,
     ) -> Result<held::Recorded, Stop> {
-        let locked = self.locked_load(p, Some(outside), named)?;
+        let mut locked = self.locked_load(p, Some(outside), named)?;
+        // A base's repair's Build takes what the tickets its base holds hold
+        // rather than waiting for them (OWL-622, "First, and not held").
+        if matches!(admission, Admission::Build) && self.repair_of(&p.ticket).is_some() {
+            self.leave_base_held(p, &mut locked.in_flight, overlap);
+        }
         let weighed = collision::weigh(weighed, &locked.in_flight, overlap);
         let mut recorded = held::record(next, &weighed.overlaps, (self.clock)());
         let unkept = recorded
@@ -3166,6 +3189,7 @@ impl OnDemand<'_> {
             integrated: false,
             slot_held_by: None,
             claims,
+            repair_hold: None,
         };
         // The claim (OWL-586), outside every section, before anything is
         // written: the drain's commands take it after their gesture's checks.
@@ -4367,7 +4391,13 @@ impl OnDemand<'_> {
             .collect();
         outside.join(&mut in_flight, named);
         let own = held::by_claim(held::of(&p.ticket, p.held.as_ref(), false, named), times);
-        Ok(collision::weigh(&own, &in_flight, self.overlap_policy(p)).collision)
+        let overlap = self.overlap_policy(p);
+        // A base's repair delivers over what the tickets its base holds
+        // hold, as its Build was admitted (OWL-622).
+        if self.repair_of(&p.ticket).is_some() {
+            self.leave_base_held(p, &mut in_flight, overlap);
+        }
+        Ok(collision::weigh(&own, &in_flight, overlap).collision)
     }
 
     /// A delivery held back for `why`, the `decision` event's fields
@@ -6547,6 +6577,15 @@ impl OnDemand<'_> {
             run_dir: &run_dir,
             brief,
             setup,
+            // The repair's own Build-role runs start through the setup
+            // failure its hold was filed for (OWL-622); no other run does.
+            repairs_setup: p
+                .repair_hold
+                .as_ref()
+                .filter(|failing| {
+                    brief.role == Role::Build && failing.step == owlshift_core::base::Step::Setup
+                })
+                .map(|failing| failing.command.as_str()),
             session: plan.as_ref().map(|(plan, _)| plan),
             siblings: Some(&siblings),
         };
@@ -10089,7 +10128,8 @@ fn brief_body(comment: &Comment) -> String {
         | MarkerKind::Merged
         | MarkerKind::Rerun
         | MarkerKind::Released
-        | MarkerKind::Handback => {
+        | MarkerKind::Handback
+        | MarkerKind::Lifted => {
             let note = format!(
                 "\n\n(Cut to {MAX_THREAD_COMMENT_BYTES} bytes in this brief: the whole comment \
                  is on the ticket, tracker comment `{}`.)",

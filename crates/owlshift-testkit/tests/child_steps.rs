@@ -1215,6 +1215,31 @@ fn base_wait_harness(dir: &Path) -> PathBuf {
     script
 }
 
+/// Adds `line` to the `[policy]` of the project file on `main`, the last
+/// table the seed writes, from a clone of its own (OWL-622).
+#[cfg(unix)]
+fn commit_policy(project: &ChildProject, root: &Path, line: &str) {
+    let env = project.env();
+    let clone = root.join("policy");
+    let bare = project.bare.to_str().unwrap();
+    env.run(root, &["clone", "--quiet", bare, clone.to_str().unwrap()])
+        .unwrap();
+    let file = clone.join("owlshift.toml");
+    let text = fs::read_to_string(&file).unwrap();
+    assert!(text.contains("[policy]"), "{text}");
+    fs::write(&file, format!("{text}{line}\n")).unwrap();
+    env.run(
+        &clone,
+        &["commit", "--quiet", "--all", "-m", "Set the policy"],
+    )
+    .unwrap();
+    env.run(
+        &clone,
+        &["push", "--quiet", "origin", "HEAD:refs/heads/main"],
+    )
+    .unwrap();
+}
+
 /// A commit on `project`'s `main` writing `news` to `NEWS.md`, from a
 /// clone of its own under `root`: returns the new head.
 #[cfg(unix)]
@@ -1299,6 +1324,9 @@ fn a_base_wait_keeps_its_comment_while_another_step_runs() {
     let harness = base_wait_harness(&plays);
     // DEMO-1 alone at first, the seed's, blocked by nothing.
     let s = parallel_setup(&harness, 0, 2, (&machine, 2));
+    // The hold files no repair ticket (OWL-622), which would take the
+    // drain's turns this test counts: the switch off at the base's head.
+    commit_policy(&s.project, tmp.path(), "base_repair = false");
     let counted = children(&s.file).with_slots(MachineSlots::new(&machine, 2));
     let dirs = s.project.dirs();
     let one = TicketId::new("DEMO-1").unwrap();

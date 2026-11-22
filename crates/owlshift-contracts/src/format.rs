@@ -197,8 +197,9 @@ pub const OUTSIDE_FORMAT: u32 = 1;
 /// (`<data>/usage/<harness>.json`, OWL-404).
 pub const USAGE_FORMAT: u32 = 1;
 /// The format version of a project's checks of its bases (`base.json` in a
-/// project's folder, OWL-418).
-pub const BASE_FORMAT: u32 = 1;
+/// project's folder, OWL-418). Format 2 adds a hold's repair ticket
+/// (OWL-622); format 1 is still read, with none.
+pub const BASE_FORMAT: u32 = 2;
 /// The format version of a ticket's failure waiting for its base
 /// (`base_wait.json` in a ticket's folder, OWL-418).
 pub const BASE_WAIT_FORMAT: u32 = 1;

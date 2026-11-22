@@ -291,6 +291,21 @@ pub fn admission<K: Clone + Ord + AsRef<str>>(
     None
 }
 
+/// The caps a dispatch of a ticket is checked against: for the repair of a
+/// broken base (OWL-622; architecture section 5, "The repair ticket"), the
+/// project's capacity lifted, whatever it counts; the open pull requests'
+/// cap and this machine's runs still apply.
+pub fn repair_caps(caps: Caps, repair: bool) -> Caps {
+    if repair {
+        Caps {
+            max_in_flight: u32::MAX,
+            ..caps
+        }
+    } else {
+        caps
+    }
+}
+
 /// A ticket whose Build's admission is due (OWL-448; architecture section
 /// 5, "Resources admitted at Build").
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -444,7 +459,9 @@ fn dispatchable<K>(ticket: &Ticket<K>) -> bool {
 
 /// Computes the ready set over the admitted tickets of the ready column.
 ///
-/// Every ticket given is either dispatched or waits with one reason. They
+/// Every ticket given is either dispatched or waits with one reason. A
+/// repair of a broken base comes first and is not held back by the project's
+/// capacity ([`repair_caps`], OWL-622); then they
 /// are taken by priority, most urgent first and none last, then the first
 /// created, then the lower identifier ([`natural_cmp`]); with equal ids, the
 /// first in this order is the one kept. A ticket is dispatched when it is
@@ -463,8 +480,9 @@ pub fn ready_set<K: Clone + Ord + AsRef<str>>(
 ) -> ReadySet<K> {
     let mut candidates: Vec<&Ticket<K>> = tickets.iter().collect();
     candidates.sort_by(|a, b| {
-        a.priority
-            .cmp(&b.priority)
+        b.repair
+            .cmp(&a.repair)
+            .then(a.priority.cmp(&b.priority))
             .then(a.created_ms.cmp(&b.created_ms))
             .then_with(|| natural_cmp(a.id.as_ref(), b.id.as_ref()))
     });
@@ -512,7 +530,9 @@ pub fn ready_set<K: Clone + Ord + AsRef<str>>(
                 Some(Wait::BlockerUnknown(held.unknown))
             } else if !held.open.is_empty() {
                 Some(Wait::BlockedBy(held.open))
-            } else if let Some(wait) = admission(&ticket.id, caps, &load) {
+            } else if let Some(wait) =
+                admission(&ticket.id, repair_caps(caps, ticket.repair), &load)
+            {
                 Some(wait)
             } else if load.runs >= caps.concurrent_runs {
                 Some(Wait::RunCap)
@@ -567,6 +587,7 @@ mod tests {
             variant: Variant::Standard,
             state: restore(Status::Active(Stage::Ready), 0),
             delivery_followed: false,
+            repair: false,
         }
     }
 
@@ -1001,6 +1022,44 @@ mod tests {
             ..full
         };
         assert_eq!(admission(&"A-1", caps, &capped), Some(Wait::PrCap));
+    }
+
+    /// OWL-622: a base's repair goes before a more urgent ticket and past the
+    /// capacity two held Builds take, which still holds the others; the open
+    /// pull requests' cap and this machine's runs still hold it.
+    #[test]
+    fn a_repair_goes_first_whatever_the_capacity_counts() {
+        let mut repair = ticket("A-9", Priority::Low);
+        repair.repair = true;
+        let tickets = [ticket("A-1", Priority::Urgent), repair];
+        let caps = Caps {
+            concurrent_runs: 5,
+            open_prs: Some(3),
+            max_in_flight: 2,
+        };
+        let held = Load {
+            slot_held_by: vec!["H-1", "H-2"],
+            ..IDLE
+        };
+        let ready = ready_set(&tickets, caps, held.clone());
+        assert_eq!(ready.dispatch, ["A-9"]);
+        assert_eq!(
+            ready.waiting,
+            [("A-1", Wait::Slot(vec!["A-9", "H-1", "H-2"]))]
+        );
+        let capped = Load {
+            open_prs: 3,
+            ..held.clone()
+        };
+        assert_eq!(
+            ready_set(&tickets, caps, capped).waiting[0],
+            ("A-9", Wait::PrCap)
+        );
+        let busy = Load { runs: 5, ..held };
+        assert_eq!(
+            ready_set(&tickets, caps, busy).waiting[0],
+            ("A-9", Wait::RunCap)
+        );
     }
 
     #[test]

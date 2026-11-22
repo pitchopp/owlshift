@@ -752,6 +752,13 @@ pub struct Policy {
     /// requires an Owlshift that reads it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub overlap: Option<Overlap>,
+    /// Whether a broken base files its repair ticket (OWL-622; architecture
+    /// section 5, "The repair ticket"): the runner files one ticket a hold,
+    /// admits it itself and dispatches it first. Absent: `true`; `false`
+    /// keeps the hold told and nothing more. Read at the base branch's head,
+    /// as `overlap` is. A file using it requires an Owlshift that reads it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_repair: Option<bool>,
     /// Whether a ticket is claimed on the git remote (P10, OWL-586;
     /// architecture section 7, "Claims"): `local`, the default, keeps the
     /// ticket locks of one machine alone and pushes nothing; `remote` takes a
@@ -949,6 +956,11 @@ impl Policy {
     /// The project's `claims` (OWL-586), `local` when absent.
     pub fn claims(&self) -> Claims {
         self.claims.unwrap_or_default()
+    }
+
+    /// The project's `base_repair` (OWL-622), `true` when absent.
+    pub fn base_repair(&self) -> bool {
+        self.base_repair.unwrap_or(true)
     }
 
     /// The project's capacity (OWL-401): the project's `max_in_flight`, or
@@ -2265,6 +2277,20 @@ mod tests {
         assert!(error.contains("overlap"), "{error}");
     }
 
+    /// OWL-622: `policy.base_repair`, `true` when absent, `false` read back,
+    /// anything but a boolean refused naming the key.
+    #[test]
+    fn the_base_repair_is_a_policy_key_on_by_default() {
+        let absent = project("", "").unwrap();
+        assert!(absent.policy.base_repair());
+        assert!(!absent.render().contains("base_repair"));
+        let off = project("", "base_repair = false").unwrap();
+        assert!(!off.policy.base_repair());
+        assert_eq!(ProjectConfig::parse(&off.render()).unwrap(), off);
+        let error = project("", "base_repair = \"no\"").unwrap_err().to_string();
+        assert!(error.contains("base_repair"), "{error}");
+    }
+
     #[test]
     fn the_quiet_window_is_a_policy_key_with_a_default_and_a_range() {
         let absent = project("", "").unwrap();
@@ -2286,6 +2312,7 @@ mod tests {
             resolver_budget_usd: None,
             ticket_budget_usd: None,
             overlap: None,
+            base_repair: None,
             claims: None,
         };
         assert_eq!(built.quiet_window(), Duration::from_secs(60));

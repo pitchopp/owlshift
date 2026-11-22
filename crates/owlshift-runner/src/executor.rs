@@ -236,6 +236,13 @@ pub struct RunSpec<'a> {
     /// harness and before the gate after a Build or a rebase `done`; empty
     /// for none, and for the other roles.
     pub setup: &'a [String],
+    /// The setup command a base's repair ticket was filed for (OWL-622;
+    /// architecture section 5, "The repair ticket", decided on 2026-11-22):
+    /// a Build-role run whose setup fails at exactly this command, the
+    /// command's own failure, starts its harness told of it, as a resumed
+    /// worktree's does. `None` for every other run, the repair's own Build
+    /// being the one given it.
+    pub repairs_setup: Option<&'a str>,
     /// The session the run starts or resumes (OWL-394), on a harness that
     /// keeps sessions ([`Harness::session_key`]); `None` keeps none.
     pub session: Option<&'a SessionPlan>,
@@ -706,8 +713,12 @@ impl Executor {
             // A folder of the home the sandbox refused is named at the end of
             // the reason, never in the brief (OWL-597): the next run's brief
             // takes the setup's own report, not this copy.
+            // The repair of a broken base starts through the setup failure
+            // it was filed for (OWL-622); every other Build keeps OWL-330's
+            // rule.
+            let starts = ran.recoverable() || ran.repairs(spec.repairs_setup);
             let stopped = after_check(&ran.report, check, |mut failure| {
-                (!ran.recoverable()).then(|| {
+                (!starts).then(|| {
                     if let Some(note) = self.refused_note(&failure.output, &brief.project, spec) {
                         failure.reason = format!("{}; {note}", failure.reason);
                     }
