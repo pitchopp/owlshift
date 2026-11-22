@@ -538,7 +538,7 @@ keep_awake = true
 
 ### `web_tools`
 
-Whether the read-only planning and review roles and the resolver (design, design review, verify, arbiter, resolver) get their web tools, WebFetch and WebSearch, on this machine: `true` or `false`. Their shell keeps the network either way. Intake, the answer check, Build and rebase never get them from this key. Default: `true`.
+Whether the read-only planning and review roles, the resolver and Build (design, design review, verify, arbiter, resolver, build) get their web tools, WebFetch and WebSearch, on this machine: `true` or `false`. Their shell keeps the network either way. Intake, the answer check and rebase never get them from this key. Default: `true`.
 
 ```toml
 web_tools = false

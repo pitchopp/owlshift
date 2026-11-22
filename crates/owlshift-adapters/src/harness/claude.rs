@@ -174,7 +174,10 @@ const BEYOND_RUN_TOOLS: &[&str] = &[
 /// allowed by name to a read-only run that has it, since `dontAsk` denies a
 /// call to one that is offered but not allowed. Checked live with Claude
 /// Code 2.1.302 on 2026-10-22 (OWL-415, recorded under the adapter's
-/// "Permissions" in `docs/design/build-plan.md`).
+/// "Permissions" in `docs/design/build-plan.md`). A run that writes the
+/// worktree, a Build's since OWL-618, needs no such rule: under
+/// `bypassPermissions` an offered WebFetch went through, checked live with
+/// 2.1.302 and 2.1.318 on 2026-11-21 (`docs/design/records/OWL-618.md`).
 const NETWORK_TOOLS: &[&str] = &["WebFetch", "WebSearch"];
 
 /// How hard the model thinks, as `claude --effort` names it: the contracts'
@@ -333,12 +336,14 @@ impl std::error::Error for CommandError {}
 /// access, the web tools too, all in one `--disallowedTools` flag; Bash, when
 /// allowed, can still reach the network. With network access, a read-only run
 /// allows the web tools in its `--allowedTools` flag, beside its one rule:
-/// `dontAsk` would deny them otherwise. No settings file is read, so nothing
-/// in the worktree grants a permission or runs a hook (`GUARDRAIL_ARGS`), and
-/// no skill, Claude Code's own included, reaches the model (`SKILL_ARGS`).
-/// Messages from the user's other sessions are refused on every launch
-/// (`PEER_INBOX_ARGS`). A run keeps no session unless the request names one
-/// ([`Request::session`]); every flag above holds on a resumed one too.
+/// `dontAsk` would deny them otherwise. A run that writes the worktree with
+/// network access is offered them and needs no rule (OWL-618). No settings
+/// file is read, so nothing in the worktree grants a permission or runs a
+/// hook (`GUARDRAIL_ARGS`), and no skill, Claude Code's own included, reaches
+/// the model (`SKILL_ARGS`). Messages from the user's other sessions are
+/// refused on every launch (`PEER_INBOX_ARGS`). A run keeps no session unless
+/// the request names one ([`Request::session`]); every flag above holds on a
+/// resumed one too.
 pub fn command(program: &Path, request: &Request) -> Result<Command, CommandError> {
     if request.permissions.browser {
         return Err(CommandError::Unsupported("a browser"));

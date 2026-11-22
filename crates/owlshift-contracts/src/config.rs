@@ -1478,11 +1478,12 @@ pub struct PersonalConfig {
     /// is, lies in or holds a credential path cannot be listed.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub allow_caches: Vec<String>,
-    /// Whether the read-only planning and review roles and the resolver
-    /// (design, design review, verify, arbiter, resolver) get their web
-    /// tools, WebFetch and WebSearch, on this machine: on unless set to
-    /// `false` (OWL-415). Their shell keeps the network either way; intake,
-    /// the answer check, Build and rebase never get them from this key.
+    /// Whether the read-only planning and review roles, the resolver and
+    /// Build (design, design review, verify, arbiter, resolver, build) get
+    /// their web tools, WebFetch and WebSearch, on this machine: on unless
+    /// set to `false` (OWL-415, OWL-618). Their shell keeps the network
+    /// either way; intake, the answer check and rebase never get them from
+    /// this key.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub web_tools: Option<bool>,
     /// Which admitted tickets `owlshift watch --drain` takes on this machine

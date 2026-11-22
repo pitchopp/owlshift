@@ -616,6 +616,32 @@ fn beyond_run_tools_denied() {
     scrub_and_write("beyond_run_tools_denied.jsonl", dir.path(), &recorded);
 }
 
+/// The write-in-worktree argv with network, a Build's since OWL-618: the
+/// web tools are offered and allowed by no rule, and one WebFetch of a public
+/// page goes through under `bypassPermissions`.
+#[test]
+#[ignore = "records a fixture: set OWLSHIFT_RECORD_CLAUDE=1"]
+fn write_worktree_web_fetch() {
+    recording_allowed();
+    let dir = tempfile::tempdir().unwrap();
+    let request = request(dir.path(), PermissionLevel::WriteWorktree, true, RESULT);
+    let recorded = record(
+        adapter(&request, |_| {}),
+        "Use the WebFetch tool once to fetch https://example.com and ask it for the page's \
+         title. Call no other tool but ToolSearch, if you need it to load WebFetch. Then \
+         reply with the title alone.",
+    );
+    recorded.expect(0, true);
+    assert!(recorded.run.permission_denials.is_empty());
+    assert_eq!(
+        recorded.run.outcome,
+        Outcome::Completed {
+            text: "Example Domain".into()
+        }
+    );
+    scrub_and_write("write_worktree_web_fetch.jsonl", dir.path(), &recorded);
+}
+
 /// Two runs at once. The receiver has the write-in-worktree argv with
 /// network, plus `--max-turns 6`, and waits in a 60 s Bash loop. The sender
 /// plays one of the user's other sessions: offered `SendMessage` alone, with

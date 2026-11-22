@@ -98,11 +98,11 @@ impl<T> FileState<T> {
     }
 }
 
-/// Whether the personal file gives the read-only planning and review roles
-/// and the resolver their web tools (OWL-415): yes unless `web_tools =
-/// false`, and yes on a machine without a personal file. An unknown or
-/// invalid file never reaches a run, since `owlshift do` refuses it; it
-/// gives none all the same.
+/// Whether the personal file gives the read-only planning and review roles,
+/// the resolver (OWL-415) and Build (OWL-618) their web tools: yes unless
+/// `web_tools = false`, and yes on a machine without a personal file. An
+/// unknown or invalid file never reaches a run, since `owlshift do` refuses
+/// it; it gives none all the same.
 pub fn web_tools_enabled(personal: &FileState<PersonalConfig>) -> bool {
     match personal {
         FileState::Loaded { config, .. } => config.web_tools != Some(false),

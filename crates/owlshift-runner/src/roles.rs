@@ -182,10 +182,11 @@ mod tests {
         }
         assert!(!rebase.contains("ran it"), "{rebase}");
 
-        // OWL-415: the roles that take the web tools say what their brief's
-        // `permissions.network` gives them, either way; no prompt but
-        // intake's says the run has no network.
+        // OWL-415, and OWL-618 for Build: the roles that take the web tools
+        // say what their brief's `permissions.network` gives them, either
+        // way; no prompt but intake's says the run has no network.
         for (role, text) in [
+            (Role::Build, BUILD_ROLE),
             (Role::Design, DESIGN_ROLE),
             (Role::DesignReview, DESIGN_REVIEW_ROLE),
             (Role::Verify, VERIFY_ROLE),
