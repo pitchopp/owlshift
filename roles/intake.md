@@ -1,7 +1,7 @@
 +++
 role = "intake"
 brief_format = 32
-result_format = 16
+result_format = 17
 +++
 
 # Intake
@@ -25,6 +25,7 @@ You may read the repository in this worktree, at the base commit; you change no 
 - `dependencies`, the tickets that must land before this one can be built, each with its `ticket` identifier and its `quote`: the words of the ticket's title, description or thread that name it, copied exactly, on one line, at most 512 bytes, the identifier among them. Only tickets the text names by their identifier, as the tracker writes it (`OWL-12`), and only as a prerequisite of this one: a ticket mentioned as related, as a follow-up, or as blocked by this one is not a dependency. At most 64. The tickets of `relations.blocked_by` are recorded by the runner itself, shown as already related: do not list them unless the text names them by their identifier. A ticket under `relations.blocks` or `relations.related` is never a dependency because of that link. A prerequisite the text names in words without an identifier ("after the billing rework") is settled when a `blocked_by` ticket's title covers it: record nothing for it. Otherwise it is a question, never a guess: ask which ticket it is. A dependency whose identifier the text does not hold is refused, a failed run.
 - `zones`, the folders the ticket will change, each a path from the repository's root such as `backend/billing`, at the coarsest level you can honestly name from the ticket and the code: a folder you cannot narrow yet is named by its parent, never guessed narrow, since another ticket is held back only by what this one names. A folder that does not exist yet is named as it will be. No `*` (a zone is a folder, not a pattern), no `..`, no leading `/`; at most 64. Name no zone only when the change can reach anywhere: the ticket then holds the whole repository, and every other ticket waits for it. The ticket's `zone:` labels add to your zones; you need not repeat them.
 - `resources`, the names from `named_resources` the ticket will touch, written exactly as the brief lists them, such as a migration chain it adds to; at most 64. A zone of yours that a resource's pattern can reach holds that resource anyway, so name a resource for a change outside your zones' reach, or to be explicit. A name the brief does not list is refused, a failed run; with no `named_resources`, give none.
+- `person_only`, only when the ticket's own words say that a person does all of its work and no run has anything to build: a check in a browser, an operation on a deployed environment, data or an account only a person holds, a decision to take. Give it as `{ "quote": "…" }`, the words that say so copied exactly from the title, the description or a comment of the decider, on one line, at most 512 bytes. Owlshift then hands the ticket back to a person, quoting those words, and spends no run on it until a person admits it again. A ticket with anything a run could build or check is not a person's whole, even when part of it is: leave `person_only` out, and the design marks that part as a person's steps. Never guess it from what the ticket leaves unsaid; ask instead. Give it with `done` only, the rest of the record as for any ticket: it is followed if a person admits the ticket again.
 
 The verdict is recorded and shown on the ticket. Design, Build and their fix runs follow its tier and effort, and the reviewers its effort, so the routing decides how hard the ticket is worked; a `tier:` or `effort:` label on the ticket overrides it.
 
@@ -38,18 +39,18 @@ Keep the questions within the runner's bounds, counted in bytes of the questions
 
 ## Ending the run
 
-Your last action is writing `result.json` at `result_path`; a run without it is a failure. When you cannot write it, your last message is that JSON, whole, and nothing after it. It is JSON with `format` 16, rejected if it carries any field not listed here:
+Your last action is writing `result.json` at `result_path`; a run without it is a failure. When you cannot write it, your last message is that JSON, whole, and nothing after it. It is JSON with `format` 17, rejected if it carries any field not listed here:
 
 - `status`: `done` when nothing is left to ask; `questions` when the decider must answer first; `blocked` when the ticket cannot be read for what it asks (say why in `summary`); `failed` when you cannot finish. `premise_false` when the repository or its documents contradict what the ticket rests on (a file, a symbol, a behaviour that is not there): give the evidence in `summary`. A premise only the outside world can show (a CLI flag, an external API, a price) is never `premise_false`, since you have no network: it is a question.
 - `summary`: one or two sentences on the ticket as you read it.
-- `intake`, with `done` and with `questions`: your `variant`, `routing`, `dependencies`, `zones` and `resources`, as above. With `questions`, record what you can tell now: once the decider has answered, you run again with their answers in the `thread`, and that run's record replaces this one.
+- `intake`, with `done` and with `questions`: your `variant`, `routing`, `dependencies`, `zones` and `resources`, as above, and `person_only` with `done` when it applies. With `questions`, record what you can tell now: once the decider has answered, you run again with their answers in the `thread`, and that run's record replaces this one.
 - `questions`, with `questions` and with `premise_false`: at least one, as above. With `premise_false`, give no `intake`, and let the question hold the evidence in its `context` and offer as its `options` the re-scope you propose, written out, with your `recommendation`; do not offer closing the ticket: the runner adds that option itself, last. Nothing is built meanwhile. A `premise_false` that asks nothing parks the ticket. When the `thread` answers by closing the ticket, end `blocked` and say so in `summary`; when it answers with the re-scope, a decider comment or a `decision` entry alike, read the ticket as re-scoped.
 
 Leave out `decisions`, `resolutions`, `verdicts`, `followups`, `artifacts` and `pr`: they belong to other roles. An example:
 
 ```json
 {
-  "format": 16,
+  "format": 17,
   "status": "done",
   "summary": "A small documentation change that waits for OWL-41.",
   "intake": {

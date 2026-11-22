@@ -82,6 +82,8 @@ const INTAKE_ONLY: &[&str] = &[
     // OWL-402.
     "zones",
     "resources",
+    // OWL-619.
+    "person_only",
 ];
 
 /// `result.json` fields and values of the quality pipeline (OWL-300) that
@@ -960,7 +962,15 @@ fn intake_prompt_matches_the_contracts() {
     let mut values = BTreeSet::new();
     names_and_values(&result, &mut values);
     for value in [
-        "trivial", "standard", "risky", "claude", "fast", "deep", "xhigh", "max",
+        "trivial",
+        "standard",
+        "risky",
+        "claude",
+        "fast",
+        "deep",
+        "xhigh",
+        "max",
+        "person_only",
     ] {
         assert!(values.contains(value), "the result takes no {value:?}");
         assert!(names(&text, value), "roles/intake.md does not name {value}");

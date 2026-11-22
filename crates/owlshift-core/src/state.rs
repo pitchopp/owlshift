@@ -164,6 +164,7 @@ impl Status {
 /// | At Watch, a read calls for a rebase run, before it runs | `RebaseDue` |
 /// | At Watch, a red no run fixes, or a push the forge refused | `ForgeBlocked` |
 /// | While a round waits at Watch, or the ticket is parked there, its pull request was merged, closed, or pushed to by someone else; likewise while a review loop's ticket is at Build or Verify, working, waiting or parked there (OWL-307) | `FollowingEnded` |
+/// | An intake run read in the ticket's own words that a person does all of it, or a design run's plan holds a person's steps alone: the ticket is handed back (OWL-619) | `HandedBack` |
 /// | A human restarted a parked ticket | `Restarted` |
 /// | A human merged the pull request | `Merged` |
 /// | A human canceled, closed or excluded the ticket | `Withdrawn` |
@@ -325,6 +326,14 @@ pub enum Event {
     /// while waiting with Watch or Build as the return stage, parked at
     /// Watch, Build or Verify, or working at Build or Verify.
     FollowingEnded,
+    /// The ticket's work is a person's whole (OWL-619, architecture section
+    /// 4, "A person's steps"): an intake run read so in the ticket's own
+    /// words, or a design run's plan holds a person's steps alone. The
+    /// ticket goes back to Ready, its round kept and its counts cleared,
+    /// and the runner leaves it out of the queue until a person admits it
+    /// again. Valid only at Intake and at Design, the stages whose run
+    /// finds it.
+    HandedBack,
     Restarted,
     Merged,
     Withdrawn,
@@ -332,7 +341,7 @@ pub enum Event {
 
 impl Event {
     /// Every event.
-    pub const ALL: [Self; 34] = [
+    pub const ALL: [Self; 35] = [
         Self::Dispatched,
         Self::Completed,
         Self::LoopBack,
@@ -364,6 +373,7 @@ impl Event {
         Self::RebaseDue,
         Self::ForgeBlocked,
         Self::FollowingEnded,
+        Self::HandedBack,
         Self::Restarted,
         Self::Merged,
         Self::Withdrawn,
@@ -784,6 +794,11 @@ impl TicketState {
             }
             (Status::Active(stage), Event::Blocked) if stage != Stage::Ready => {
                 self.park(ParkReason::Blocked, self.failed_runs)
+            }
+            // The work is a person's whole (OWL-619): back to Ready, which
+            // holds no slot, the round kept.
+            (Status::Active(Stage::Intake | Stage::Design), Event::HandedBack) => {
+                Transition::To(self.enter(Status::Active(Stage::Ready)))
             }
 
             (Status::NeedsInput { return_to }, Event::Answered) => Transition::To(Self {
@@ -1225,6 +1240,9 @@ mod tests {
             }
             (Status::Active(stage), Event::Blocked) if stage != Ready => {
                 Expect::Parked(parked(stage, false), ParkReason::Blocked)
+            }
+            (Status::Active(Intake | Design), Event::HandedBack) => {
+                Expect::To(Status::Active(Ready))
             }
             (Status::Active(stage), Event::RunFailed | Event::Interrupted) if stage != Ready => {
                 Expect::To(status)

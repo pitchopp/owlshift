@@ -1397,6 +1397,7 @@ mod tests {
                     cost: None,
                     session: None,
                     held: None,
+                    handback: None,
                 },
                 commit: "0".repeat(40),
                 proposals: None,

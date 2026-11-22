@@ -34,7 +34,7 @@ use owlshift_core::floor::same_account;
 
 use super::*;
 use crate::ticket_ref::text_sha256;
-use crate::writer::IntakeComment;
+use crate::writer::{HandbackRead, IntakeComment, flatten, readmit_words};
 
 /// The admission gesture of `ticket` as the drain records it (architecture
 /// section 5, "By whom"): the account the tracker reads as having made
@@ -184,6 +184,59 @@ fn unfounded(verdict: &IntakeVerdict, found: &Ticket, comments: &[Comment]) -> O
     })
 }
 
+/// Why a verdict's `person_only` is refused (OWL-619): its quote must be the
+/// ticket's own words, found in its title, its description or a comment of
+/// its `decider`, whitespace aside. A reading that the work is a person's
+/// whole takes the ticket out of the queue, so it rests on what the ticket
+/// or its decider says, never on another commenter's words nor on the
+/// model's. `None` when it is founded, or when there is none.
+fn person_only_unfounded(
+    verdict: &IntakeVerdict,
+    found: &Ticket,
+    comments: &[Comment],
+    decider: &Person,
+) -> Option<String> {
+    let quote = flatten(&verdict.person_only.as_ref()?.quote);
+    let holds = |text: &str| flatten(text).contains(&quote);
+    let by_decider = |comment: &&Comment| match &comment.author {
+        TrackerAuthor::Account(author) => same_account(&author.id, &decider.id),
+        _ => false,
+    };
+    let founded = holds(&found.title)
+        || holds(&found.description)
+        || comments.iter().filter(by_decider).any(|c| holds(&c.body));
+    (!founded).then(|| {
+        "the quote of person_only is not in the ticket's title, its description or a comment of \
+         its decider: quote their words exactly"
+            .to_owned()
+    })
+}
+
+/// The gesture that admits a handed-back ticket again, in words (OWL-619).
+pub(crate) fn readmit(config: &ProjectConfig) -> String {
+    readmit_words(&config.tracker.admit, &config.tracker.states.ready)
+}
+
+/// Why `gesture` does not admit a ticket handed back at `handed_back`
+/// (OWL-619; architecture section 4, "A ticket with no step for a run"):
+/// one made at or before the handback, the same second counting as before,
+/// was made before the HANDBACK comment, so it does not give the ticket
+/// back; `readmit` says the gesture that does. `None` when it admits.
+pub(crate) fn before_handback(
+    ticket: &TicketId,
+    gesture: &Gesture,
+    handed_back: Timestamp,
+    readmit: &str,
+) -> Option<String> {
+    (gesture.at <= handed_back).then(|| {
+        format!(
+            "{ticket} was handed back to a person at {handed_back}, and its admission gesture \
+             {:?} at {} was made before: to give it back to Owlshift, {readmit}",
+            gesture.name, gesture.at
+        )
+    })
+}
+
 impl OnDemand<'_> {
     /// Runs intake on `ticket` for the drain, `gesture` being the admission
     /// the drain checked ([`admission`]). The ticket ref must be absent, at
@@ -212,6 +265,9 @@ impl OnDemand<'_> {
         sink: &mut EventSink<'_>,
     ) -> Result<TicketIntake, Stop> {
         let ticket = &p.ticket.clone();
+        // Its gesture admitted it, a handed-back ticket's made after the
+        // handback (OWL-619): the next write drops the handback.
+        p.handback = None;
         let round = match &p.stored {
             None => 0,
             Some(stored) => {
@@ -248,7 +304,11 @@ impl OnDemand<'_> {
     /// one while the intake record holds the ticket's current text and its
     /// account is still listed, else the gesture read again, which must be a
     /// listed account's (build plan, "P4 · The drain", part E). `continue` at
-    /// Intake and the drain (OWL-250) both take it.
+    /// Intake and the drain (OWL-250) both take it. A ticket handed back to
+    /// a person (OWL-619) has its gesture read again, and one made at or
+    /// before the handback does not admit it ([`before_handback`]); a
+    /// tracker that keeps no gesture time reads it as made now, the ticket
+    /// being back in the column the hand-back moved it out of.
     pub(super) fn gesture_for(
         &self,
         p: &Prepared,
@@ -256,22 +316,32 @@ impl OnDemand<'_> {
     ) -> Result<Gesture, Unadmitted> {
         let text = text_sha256(&p.found.title, &p.found.description);
         let kept = p.intake.as_ref().filter(|record| {
-            record.text_sha256 == text
+            p.handback.is_none()
+                && record.text_sha256 == text
                 && admitters.is_some_and(|listed| {
                     listed
                         .iter()
                         .any(|admitter| same_account(&record.gesture.account, admitter))
                 })
         });
-        match kept {
-            Some(record) => Ok(record.gesture.clone()),
+        let gesture = match kept {
+            Some(record) => return Ok(record.gesture.clone()),
             None => read_admission(
                 self.tracker,
                 &self.config.tracker.admit,
                 admitters,
                 &p.ticket,
                 (self.clock)(),
-            ),
+            )?,
+        };
+        match p.handback.as_ref().and_then(|handback| {
+            before_handback(&p.ticket, &gesture, handback.at, &readmit(self.config))
+        }) {
+            Some(reason) => Err(Unadmitted {
+                account: Some(gesture.account),
+                reason,
+            }),
+            None => Ok(gesture),
         }
     }
 
@@ -361,12 +431,13 @@ impl OnDemand<'_> {
             told = result_refusal(&ran.report.outcome);
             let mut result = ran.result();
             if let Some(found) = result {
-                // A dependency the ticket's text does not name is refused: a
-                // failed run.
-                let refusal = found
-                    .intake
-                    .as_ref()
-                    .and_then(|verdict| unfounded(verdict, &p.found, &comments));
+                // A dependency the ticket's text does not name, or a
+                // person's whole the ticket does not say (OWL-619), is
+                // refused: a failed run.
+                let refusal = found.intake.as_ref().and_then(|verdict| {
+                    unfounded(verdict, &p.found, &comments)
+                        .or_else(|| person_only_unfounded(verdict, &p.found, &comments, &current))
+                });
                 if let Some(reason) = refusal {
                     told = Some(reason.clone());
                     sink.emit(
@@ -468,6 +539,11 @@ impl OnDemand<'_> {
                     Ok(related) => dependencies = Some(related),
                     Err(()) => event = Event::RunFailed,
                 }
+                // The ticket's own words say a person does all of it
+                // (OWL-619): handed back, its record kept as any.
+                if event == Event::Completed && verdict.person_only.is_some() {
+                    event = Event::HandedBack;
+                }
             }
             match state.apply(PIPELINE, event) {
                 Ok(Transition::To(next)) => state = next,
@@ -503,6 +579,24 @@ impl OnDemand<'_> {
                             "an intake run done without its record".to_owned(),
                         ));
                     };
+                    // A person's work whole (OWL-619): its record is kept
+                    // with the handback, and the HANDBACK takes the INTAKE
+                    // comment's place.
+                    if let Some(person_only) = &verdict.person_only {
+                        let record = self.intake_record(
+                            p,
+                            (&text, &gesture),
+                            verdict,
+                            dependencies,
+                            &ran,
+                            sink,
+                        )?;
+                        p.intake = Some(record);
+                        let read = HandbackRead::Intake {
+                            quote: person_only.quote.clone(),
+                        };
+                        return Err(self.hand_back(p, &state, read, &ran.run, sink));
+                    }
                     let record = self.keep_intake(
                         p,
                         (&text, &gesture),
@@ -545,38 +639,15 @@ impl OnDemand<'_> {
     fn keep_intake(
         &self,
         p: &Prepared,
-        (text, gesture): (&str, &Gesture),
+        text_and_gesture: (&str, &Gesture),
         verdict: &IntakeVerdict,
         dependencies: Vec<KeptDependency>,
         rules: &ProjectRules,
         ran: &Ran,
         sink: &mut EventSink<'_>,
     ) -> Result<TicketIntake, Stop> {
-        let record = TicketIntake {
-            format: Format,
-            text_sha256: text.to_owned(),
-            gesture: gesture.clone(),
-            variant: verdict.variant,
-            routing: verdict.routing,
-            dependencies,
-            zones: verdict.zones.clone(),
-            resources: verdict.resources.clone(),
-        };
+        let record = self.intake_record(p, text_and_gesture, verdict, dependencies, ran, sink)?;
         let holds = held_for(&p.found, &record.zones, &record.resources, rules);
-        record
-            .validate()
-            .map_err(|e| refused("the intake record", e))?;
-        sink.emit(
-            &p.ticket,
-            Some(&ran.run),
-            EventKind::Gate,
-            data([
-                ("intake", json!("recorded")),
-                ("variant", json!(record.variant)),
-                ("routing", json!(record.routing)),
-                ("dependencies", json!(record.dependencies.len())),
-            ]),
-        );
         let comment = IntakeComment {
             ticket: p.ticket.clone(),
             variant: record.variant,
@@ -594,6 +665,48 @@ impl OnDemand<'_> {
             Some(&ran.run),
             EventKind::TrackerWrite,
             comment_written("INTAKE", &posted),
+        );
+        Ok(record)
+    }
+
+    /// The record of an intake run whose `verdict` is accepted, under the
+    /// ticket's `text` hash and the admission `gesture`, with its
+    /// `dependencies` as [`Self::relate_dependencies`] left them, checked,
+    /// with its `gate` event (`intake` = `recorded`); the caller posts it or
+    /// hands the ticket back (OWL-619), and keeps it.
+    fn intake_record(
+        &self,
+        p: &Prepared,
+        (text, gesture): (&str, &Gesture),
+        verdict: &IntakeVerdict,
+        dependencies: Vec<KeptDependency>,
+        ran: &Ran,
+        sink: &mut EventSink<'_>,
+    ) -> Result<TicketIntake, Stop> {
+        let record = TicketIntake {
+            format: Format,
+            text_sha256: text.to_owned(),
+            gesture: gesture.clone(),
+            variant: verdict.variant,
+            routing: verdict.routing,
+            dependencies,
+            zones: verdict.zones.clone(),
+            resources: verdict.resources.clone(),
+            person_only: verdict.person_only.clone(),
+        };
+        record
+            .validate()
+            .map_err(|e| refused("the intake record", e))?;
+        sink.emit(
+            &p.ticket,
+            Some(&ran.run),
+            EventKind::Gate,
+            data([
+                ("intake", json!("recorded")),
+                ("variant", json!(record.variant)),
+                ("routing", json!(record.routing)),
+                ("dependencies", json!(record.dependencies.len())),
+            ]),
         );
         Ok(record)
     }
@@ -1082,6 +1195,104 @@ mod tests {
         }
         let gesture = read("2026-11-14T10:33:44Z").unwrap();
         assert_eq!((gesture.account.as_str(), gesture.at), ("7", at));
+    }
+
+    /// OWL-619: once a ticket is handed back, a gesture made at or before
+    /// the handback, the same second included, does not admit it, and one
+    /// after it does, by the time alone, for a label as for a state; the
+    /// reason names the handback and the gesture to make again.
+    #[test]
+    fn only_a_gesture_after_the_handback_admits_the_ticket_again() {
+        let ticket = TicketId::new("OWL-1").unwrap();
+        let handed_back: Timestamp = "2026-11-22T10:00:00Z".parse().unwrap();
+        for (kind, admit) in [
+            (GestureKind::Label, Admit::Label("agent".to_owned())),
+            (GestureKind::State, Admit::State("Todo".to_owned())),
+        ] {
+            let words = readmit_words(&admit, "Todo");
+            let gesture = |at: &str| Gesture {
+                kind,
+                name: "agent".to_owned(),
+                account: "u-ann".to_owned(),
+                at: at.parse().unwrap(),
+            };
+            for before in ["2026-11-22T09:59:59Z", "2026-11-22T10:00:00Z"] {
+                let reason = before_handback(&ticket, &gesture(before), handed_back, &words)
+                    .unwrap_or_else(|| panic!("{kind:?} at {before}"));
+                for part in [
+                    "OWL-1 was handed back to a person at 2026-11-22T10:00:00Z",
+                    &format!("at {before} was made before"),
+                    &words,
+                ] {
+                    assert!(reason.contains(part), "{part}: {reason}");
+                }
+            }
+            let after = gesture("2026-11-22T10:00:01Z");
+            assert_eq!(before_handback(&ticket, &after, handed_back, &words), None);
+        }
+        assert_eq!(
+            readmit_words(&Admit::State("Todo".to_owned()), "Todo"),
+            "move it back to `Todo`"
+        );
+    }
+
+    /// OWL-619: intake's `person_only` rests on the ticket's own words, its
+    /// title, its description, whitespace aside, or its decider's comment;
+    /// another commenter's words or the model's own are refused.
+    #[test]
+    fn a_person_s_whole_rests_on_the_ticket_s_or_its_decider_s_words() {
+        let found = Ticket {
+            id: TicketId::new("OWL-1").unwrap(),
+            title: "Check the banner on staging".to_owned(),
+            description: "I will check it\non staging myself.".to_owned(),
+            priority: owlshift_contracts::Priority::Unset,
+            assignee: None,
+            labels: Vec::new(),
+            author: TrackerAuthor::unknown(),
+        };
+        let decider = Person {
+            id: "u-ann".to_owned(),
+            name: "Ann".to_owned(),
+        };
+        let comment = |by: &str, body: &str| Comment {
+            id: format!("c-{by}"),
+            author: account(by, by),
+            created_at: "2026-11-22T10:00:00Z".parse().unwrap(),
+            edited_at: None,
+            body: body.to_owned(),
+            parent: None,
+            reactions: Vec::new(),
+        };
+        let comments = [
+            comment("u-ann", "Leave it to me, I do it."),
+            comment("u-bob", "Nobody but a person can do this."),
+        ];
+        let verdict = |quote: Option<&str>| -> IntakeVerdict {
+            let mut verdict = json!({
+                "variant": "standard",
+                "routing": { "harness": "claude", "tier": "standard", "effort": "low" },
+            });
+            if let Some(quote) = quote {
+                verdict["person_only"] = json!({ "quote": quote });
+            }
+            serde_json::from_value(verdict).unwrap()
+        };
+        let read = |quote| person_only_unfounded(&verdict(quote), &found, &comments, &decider);
+        for founded in [
+            None,
+            Some("Check the banner"),
+            Some("I will check it on staging myself."),
+            Some("Leave it to me"),
+        ] {
+            assert_eq!(read(founded), None, "{founded:?}");
+        }
+        for unfounded in [
+            "Nobody but a person can do this.",
+            "A person must do it all.",
+        ] {
+            let refusal = read(Some(unfounded)).unwrap();
+            assert!(refusal.contains("quote their words exactly"), "{refusal}");
+        }
     }
 
     /// A tracker read in full that shows no gesture (OWL-568) does not

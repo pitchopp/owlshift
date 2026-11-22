@@ -1941,6 +1941,7 @@ mod tests {
             cost: None,
             session: None,
             held: None,
+            handback: None,
         }
     }
 

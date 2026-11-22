@@ -67,10 +67,13 @@ pub enum MarkerKind {
     /// A person released the ticket's claim on the git remote (OWL-588):
     /// who released it, who held it, and how to have it worked again.
     Released,
+    /// The ticket's work is a person's whole (OWL-619): what the run read,
+    /// and the gesture that gives the ticket back to Owlshift.
+    Handback,
 }
 
 impl MarkerKind {
-    const ALL: [Self; 13] = [
+    const ALL: [Self; 14] = [
         Self::Questions,
         Self::ReAsk,
         Self::Resume,
@@ -84,6 +87,7 @@ impl MarkerKind {
         Self::Merged,
         Self::Rerun,
         Self::Released,
+        Self::Handback,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -101,6 +105,7 @@ impl MarkerKind {
             Self::Merged => "MERGED",
             Self::Rerun => "RERUN",
             Self::Released => "RELEASED",
+            Self::Handback => "HANDBACK",
         }
     }
 

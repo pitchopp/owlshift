@@ -16,15 +16,15 @@ pub(super) const FORGE: &str = "[forge]\nreviewers = { ann-dev = \"maintainer\",
 const AFTER: &str = "2026-10-03T09:00:00Z";
 
 /// A loop Build's `done` on a new commit.
-pub(super) const RENAMED: &str = r#"{"format":16,"status":"done","summary":"Says hello in capitals, as the review asks.",
+pub(super) const RENAMED: &str = r#"{"format":17,"status":"done","summary":"Says hello in capitals, as the review asks.",
 "pr":{"branch":"owlshift/demo-1","title":"Add a greeting","body":"Capitals."}}"#;
 
 /// A loop Build's `done` with nothing to change.
-const NOTHING_TO_CHANGE: &str = r#"{"format":16,"status":"done","summary":"GREETING.md already says Hello in the words the review asks for: nothing to change.",
+const NOTHING_TO_CHANGE: &str = r#"{"format":17,"status":"done","summary":"GREETING.md already says Hello in the words the review asks for: nothing to change.",
 "pr":{"branch":"owlshift/demo-1","title":"Add a greeting","body":"Unchanged."}}"#;
 
 /// A loop Build that asks what the review leaves open.
-pub(super) const ASKS_WHICH_CASE: &str = r#"{"format":16,"status":"questions",
+pub(super) const ASKS_WHICH_CASE: &str = r#"{"format":17,"status":"questions",
 "summary":"The review asks for capitals without saying which words.",
 "questions":[
   {"id":"Q1","category":"scope","context":"The review on the pull request asks for capitals.",
@@ -340,7 +340,7 @@ fn a_review_loops_verify_reviewer_and_arbiter_are_given_the_reviews() {
         bench.reviewing(&super::verify_scenarios::found(&[("major", grouped)])),
         bench.reviewing(
             &json!({
-                "format": 16,
+                "format": 17,
                 "status": "done",
                 "summary": "Rejected.",
                 "rulings": [{
@@ -766,7 +766,7 @@ pub(super) fn chose(option: Option<&str>, reason: &str) -> String {
     if let Some(option) = option {
         verdict["option"] = json!(option);
     }
-    json!({ "format": 16, "status": "done", "summary": "Checked.", "verdicts": [verdict] })
+    json!({ "format": 17, "status": "done", "summary": "Checked.", "verdicts": [verdict] })
         .to_string()
 }
 

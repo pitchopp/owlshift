@@ -62,9 +62,9 @@ use owlshift_contracts::result::{
 };
 use owlshift_contracts::review::{
     DroppedReviewer, Finding, FindingOutcome, FindingsMode, KeptApproval, KeptFinding,
-    KeptResponse, KeptRuling, MAX_PASS_FINDINGS, Mandate, Plan, PlanChange, PlanPart, PlanPrint,
-    PublishedPlan, ResponseOutcome, ReviewPass, Reviewer, RulingOutcome, Severity, TicketPlan,
-    TicketReview,
+    KeptResponse, KeptRuling, MAX_PASS_FINDINGS, Mandate, OwedStep, Plan, PlanChange, PlanPart,
+    PlanPrint, PublishedPlan, ResponseOutcome, ReviewPass, Reviewer, RulingOutcome, Severity,
+    TicketPlan, TicketReview,
 };
 use owlshift_core::review::{
     Carried, Fate, PassOutcome, PassVerdict, Standing, resolver_change_reviewed, settle,
@@ -1675,6 +1675,11 @@ impl OnDemand<'_> {
             .plan
             .clone()
             .ok_or_else(|| Stop::Refused("a design run done without a plan".to_owned()))?;
+        // A plan of a person's steps alone, first or revised, hands the
+        // ticket back: no review or Build follows (OWL-619).
+        if !plan.has_agent_step() {
+            return Err(self.handed_back_plan(p, state, plan, ran, sink));
+        }
         let revision = p
             .review
             .as_ref()
@@ -1765,6 +1770,47 @@ impl OnDemand<'_> {
             ]),
         );
         Ok(next)
+    }
+
+    /// A design run's `plan` of a person's steps alone (OWL-619;
+    /// architecture section 4, "A ticket with no step for a run"): kept,
+    /// unapproved and owing nothing, as the ticket's latest plan, and the
+    /// ticket handed back from Design to Ready with its steps in the
+    /// HANDBACK comment ([`OnDemand::hand_back`]).
+    fn handed_back_plan(
+        &self,
+        p: &mut Prepared,
+        state: TicketState,
+        plan: Plan,
+        ran: &Ran,
+        sink: &mut EventSink<'_>,
+    ) -> Stop {
+        let next = match state.apply(p.pipeline, Event::HandedBack) {
+            Ok(Transition::To(next)) => next,
+            other => return core_error(other),
+        };
+        let steps = plan
+            .person_steps()
+            .filter_map(|(number, step)| {
+                step.when.map(|when| OwedStep {
+                    number,
+                    step: step.clone(),
+                    when,
+                })
+            })
+            .collect();
+        let base = self.branch_head(p).unwrap_or_else(|| p.base.commit.clone());
+        p.plan = Some(TicketPlan {
+            format: Format,
+            plan,
+            text_sha256: text_sha256(&p.found.title, &p.found.description),
+            base,
+            approval: None,
+            published: p.plan.as_ref().and_then(|plan| plan.published.clone()),
+            owed: Vec::new(),
+            checks: Vec::new(),
+        });
+        self.hand_back(p, &next, HandbackRead::Design { steps }, &ran.run, sink)
     }
 
     /// The revision a design run wrote on a resolver's change to the plan,

@@ -86,7 +86,7 @@ use owlshift_contracts::brief::{
 };
 use owlshift_contracts::comment::{MarkedComment, MarkerKind};
 use owlshift_contracts::config::{Admit, Claims, ProjectConfig, States};
-use owlshift_contracts::drain::{TicketIntake, TicketProposals};
+use owlshift_contracts::drain::{TicketHandback, TicketIntake, TicketProposals};
 use owlshift_contracts::event::EventKind;
 use owlshift_contracts::format::Format;
 use owlshift_contracts::ids::{QuestionId, RelativePath, TicketId};
@@ -139,10 +139,10 @@ use crate::ticket_run::{self, RunFault, Siblings};
 use crate::usage::{self as machine_usage, UsageStore};
 use crate::writer::{
     self, Corrected, Decided, DecidedBy, DecisionComment, DecisionGroup, DeliveryReport, FixPass,
-    Gate, MentionDropped, ParkedComment, Posted, QuestionsComment, ReaskComment, Reasoning,
-    Rebased, ReopenedChoice, ReplyComment, Reported, Restart, ResumeComment, Reviewed,
-    VisibleStage, WriteError, Writer, Yielding, park_reason, rebase_cycle_keeps_delivery,
-    rebase_keeps_delivery,
+    Gate, HandbackComment, HandbackRead, MentionDropped, ParkedComment, Posted, QuestionsComment,
+    ReaskComment, Reasoning, Rebased, ReopenedChoice, ReplyComment, Reported, Restart,
+    ResumeComment, Reviewed, VisibleStage, WriteError, Writer, Yielding, park_reason,
+    rebase_cycle_keeps_delivery, rebase_keeps_delivery,
 };
 use owlshift_core::follow::{
     Action as FollowAction, Decision as FollowDecision, EndReason as FollowEnd, RebaseCause,
@@ -797,6 +797,18 @@ pub enum Stop {
     /// an intake that ends at Ready under `continue` (OWL-248): the drain
     /// dispatches it. Nobody is the blocker.
     Ready { ticket: TicketId },
+    /// The ticket's work is a person's whole (OWL-619; architecture section
+    /// 4, "A person's steps", "A ticket with no step for a run"): its intake
+    /// read so in its own words, or its design run's plan holds a person's
+    /// steps alone. It is at Ready, its handback kept, shown parked and out
+    /// of the queue until a person admits it again by `readmit`, words of
+    /// the gesture, after its HANDBACK comment; `unposted` says why that
+    /// comment is not on the ticket, when it is not.
+    HandedBack {
+        ticket: TicketId,
+        readmit: String,
+        unposted: Option<String>,
+    },
     /// The harness reached its usage limit.
     UsageLimit { resets_at: Option<Timestamp> },
     /// A checked stop of `owlshift watch` or of its step stopped the run
@@ -1052,6 +1064,25 @@ impl fmt::Display for Stop {
                     write!(
                         f,
                         "\nThe PARKED comment could not be posted on the ticket: {why}."
+                    )?;
+                }
+                Ok(())
+            }
+            Self::HandedBack {
+                ticket,
+                readmit,
+                unposted,
+            } => {
+                write!(
+                    f,
+                    "Handed back: {ticket}'s work is a person's whole. Owlshift runs nothing more \
+                     on it until a person admits it again: {readmit}, after its HANDBACK comment, \
+                     or `owlshift do {ticket}`."
+                )?;
+                if let Some(why) = unposted {
+                    write!(
+                        f,
+                        "\nThe HANDBACK comment could not be posted on the ticket: {why}."
                     )?;
                 }
                 Ok(())
@@ -1575,6 +1606,11 @@ struct Prepared {
     /// carries it, as `intake`. `None` for a ticket dispatched before it was
     /// kept, which holds the whole repository.
     held: Option<TicketHeld>,
+    /// When the ticket was handed back to a person (OWL-619), as the ticket
+    /// ref keeps it or as this command's hand-back made it: every write of
+    /// the ref carries it, as `intake`, until a dispatch or an intake of the
+    /// ticket drops it ([`OnDemand::run_prepared`], [`OnDemand::intake`]).
+    handback: Option<TicketHandback>,
     /// The work in flight outside Owlshift a pass handed a dispatch's step,
     /// or a person's `continue` read for its check, kept for the Build's
     /// admission so it is read once (OWL-448); taken by it.
@@ -1983,6 +2019,10 @@ impl OnDemand<'_> {
             Ok(Transition::To(state)) => state,
             other => return Err(core_error(other)),
         };
+        // A handed-back ticket is taken again (OWL-619): the drain's gesture
+        // was made after the handback, or a person typed `do`. The admission
+        // writes the ref without it.
+        p.handback = None;
         // A new delivery: what an earlier one's Build gave Verify goes, kept
         // with the next write (OWL-304), and its last fix (OWL-356).
         if let Some(review) = p.review.as_mut() {
@@ -2782,6 +2822,17 @@ impl OnDemand<'_> {
         if state.status() == Status::Active(Stage::Intake) {
             return Err(self.intake_again(&mut p, state, sink));
         }
+        // Handed back to a person (OWL-619): no move back to the ready
+        // column, which a state gesture could read as the admission; a
+        // person's gesture after the HANDBACK, or `do`, takes it again.
+        if state.status() == Status::Active(Stage::Ready) && p.handback.is_some() {
+            return Err(Stop::Refused(format!(
+                "nothing to continue: {ticket} was handed back to a person, its work being a \
+                 person's whole; to give it back to Owlshift, {} after its HANDBACK comment, or \
+                 run `owlshift do {ticket}`",
+                intake::readmit(self.config)
+            )));
+        }
         // At Ready with its intake record: a move back to the ready column
         // did not land, or an intake round asked before OWL-269, which
         // returned to Ready, was answered. The move again, then the ticket
@@ -3080,6 +3131,9 @@ impl OnDemand<'_> {
             held: stored
                 .as_ref()
                 .and_then(|stored| stored.record.held.clone()),
+            handback: stored
+                .as_ref()
+                .and_then(|stored| stored.record.handback.clone()),
             outside: None,
             started: stored.as_ref().map(Stored::progress),
             stored,
@@ -5265,6 +5319,72 @@ impl OnDemand<'_> {
         )
     }
 
+    /// Hands the ticket back to a person (OWL-619; architecture section 4,
+    /// "A person's steps", "A ticket with no step for a run"): `next`, the
+    /// state [`Event::HandedBack`] led to, is kept with the handback and
+    /// what the caller left in `p` (the intake record or the plan) in one
+    /// write, as a park keeps its state first; then the HANDBACK comment
+    /// says what `run` read, and the visible stage moves to parked, out of
+    /// the ready column, as a park's does. The handback's time is this
+    /// machine's, or the kept gesture's when later, so that a clock behind
+    /// the tracker's never lets that gesture admit the ticket again. A write
+    /// that fails is a refusal, nothing posted; a comment that cannot be
+    /// posted is said by the stop, the ticket handed back all the same.
+    fn hand_back(
+        &self,
+        p: &mut Prepared,
+        next: &TicketState,
+        read: HandbackRead,
+        run: &str,
+        sink: &mut EventSink<'_>,
+    ) -> Stop {
+        let now = (self.clock)();
+        let at = p
+            .intake
+            .as_ref()
+            .map_or(now, |record| now.max(record.gesture.at));
+        p.handback = Some(TicketHandback { format: Format, at });
+        let questions = p.questions();
+        if let Err(e) = self.store(p, next, questions) {
+            return refused("keeping the handback in the ticket's ref", e);
+        }
+        let trigger = match &read {
+            HandbackRead::Intake { .. } => "intake",
+            HandbackRead::Design { .. } => "design",
+        };
+        let readmit = intake::readmit(self.config);
+        let comment = HandbackComment {
+            ticket: p.ticket.clone(),
+            read,
+            readmit: readmit.clone(),
+            run: Some(run.to_owned()),
+        };
+        let unposted = match Writer::new(self.tracker).post_handback(&comment) {
+            Ok(posted) => {
+                sink.emit(
+                    &p.ticket,
+                    Some(run),
+                    EventKind::TrackerWrite,
+                    comment_written("HANDBACK", &posted),
+                );
+                None
+            }
+            Err(error) => Some(error.to_string()),
+        };
+        self.show(&p.ticket, Some(run), VisibleStage::Parked, sink);
+        sink.emit(
+            &p.ticket,
+            Some(run),
+            EventKind::Decision,
+            data([("handback", json!(trigger)), ("at", json!(at.to_string()))]),
+        );
+        Stop::HandedBack {
+            ticket: p.ticket.clone(),
+            readmit,
+            unposted,
+        }
+    }
+
     /// [`Self::park`] with its `detail` given, after `run` or after none: a
     /// repair parks before any run on a bound or on a red no run fixes
     /// (OWL-112).
@@ -5684,6 +5804,7 @@ impl OnDemand<'_> {
             cost: Some(TicketCost::from(p.cost)),
             session: p.session.clone(),
             held: p.held.clone(),
+            handback: p.handback.clone(),
         };
         let kept = p
             .stored
@@ -6631,7 +6752,7 @@ impl OnDemand<'_> {
         let moved_itself = match outcome {
             Ok(_) => false,
             Err(stop) => match stop {
-                Stop::Parked { .. } | Stop::NotKept { .. } => true,
+                Stop::Parked { .. } | Stop::NotKept { .. } | Stop::HandedBack { .. } => true,
                 Stop::NeedsInput { posted, .. } => posted.is_ok(),
                 Stop::Busy(_)
                 | Stop::TicketBusy(_)
@@ -9565,7 +9686,8 @@ fn brief_body(comment: &Comment) -> String {
         | MarkerKind::Waiting
         | MarkerKind::Merged
         | MarkerKind::Rerun
-        | MarkerKind::Released => {
+        | MarkerKind::Released
+        | MarkerKind::Handback => {
             let note = format!(
                 "\n\n(Cut to {MAX_THREAD_COMMENT_BYTES} bytes in this brief: the whole comment \
                  is on the ticket, tracker comment `{}`.)",
@@ -10335,6 +10457,7 @@ mod tests {
                 cost: None,
                 session: None,
                 held: None,
+                handback: None,
             },
             commit: "c".repeat(40),
             proposals: None,
@@ -11344,12 +11467,12 @@ mod tests {
     fn a_build_refusal_is_kept_until_heeded() {
         let finished = |status: &str| {
             let result = RunResult::parse(&format!(
-                r#"{{"format":16,"status":"{status}","summary":"s","questions":[{{"id":"Q1",
+                r#"{{"format":17,"status":"{status}","summary":"s","questions":[{{"id":"Q1",
                 "category":"scope","context":"c","text":"t","recommendation":{{"why":"r"}}}}]}}"#
             ))
             .or_else(|_| {
                 RunResult::parse(&format!(
-                    r#"{{"format":16,"status":"{status}","summary":"s"}}"#
+                    r#"{{"format":17,"status":"{status}","summary":"s"}}"#
                 ))
             })
             .unwrap();
@@ -11433,7 +11556,7 @@ mod tests {
         // A `premise_false` with no question asks nothing either (OWL-193).
         let unasked_premise = Outcome::Finished {
             result: Box::new(
-                RunResult::parse(r#"{"format":16,"status":"premise_false","summary":"s"}"#)
+                RunResult::parse(r#"{"format":17,"status":"premise_false","summary":"s"}"#)
                     .unwrap(),
             ),
             artifacts: crate::artifact::ArtifactContents::default(),
@@ -11533,7 +11656,7 @@ mod tests {
                 .map(|c| format!(r#"{{"question":"{c}","decision":"{c}: d","basis":"b"}}"#))
                 .collect();
             format!(
-                r#"{{"format":16,"status":"done","summary":"s","decisions":[{}]}}"#,
+                r#"{{"format":17,"status":"done","summary":"s","decisions":[{}]}}"#,
                 decisions.join(",")
             )
         };
@@ -11570,7 +11693,7 @@ mod tests {
             .map(|n| vec![format!("List {n} first"), format!("List {n} second")])
             .collect();
         let mut results: Vec<String> = lists.iter().map(|l| listing(l)).collect();
-        results.push(r#"{"format":16,"status":"done","summary":"s"}"#.to_owned());
+        results.push(r#"{"format":17,"status":"done","summary":"s"}"#.to_owned());
         let (told, _) = refuse_in_turn(&results);
         assert!(told.decisions_refused);
         assert_eq!(told_questions(&told), lists.concat());
@@ -11658,7 +11781,7 @@ mod tests {
         };
         let asking = |named: &str| {
             format!(
-                r#"{{"format":16,"status":"questions","summary":"s","questions":[{{"id":"Q1",
+                r#"{{"format":17,"status":"questions","summary":"s","questions":[{{"id":"Q1",
                 "category":"scope","context":"c","text":"Which file, and every key?",
                 "recommendation":{{"why":"r"}}}}]{named}}}"#
             )
@@ -11675,7 +11798,7 @@ mod tests {
             (true, 0, Some(held))
         );
         // Its `done` is refused, and the hold kept with the latest reason.
-        let done = validated(r#"{"format":16,"status":"done","summary":"s"}"#, &text_only);
+        let done = validated(r#"{"format":17,"status":"done","summary":"s"}"#, &text_only);
         let refused = done.unwrap_err();
         assert!(
             matches!(
@@ -11696,7 +11819,7 @@ mod tests {
 
         // Mixed with typed choices, a later refusal's: only those have a
         // place, and an ask naming them all clears the text lists too.
-        let listing = r#"{"format":16,"status":"done","summary":"s","decisions":[
+        let listing = r#"{"format":17,"status":"done","summary":"s","decisions":[
             {"question":"Where the README lists it","decision":"d","basis":"b"},
             {"question":"Which default","decision":"d","basis":"b"}]}"#;
         let refused = validated(listing, &text_only).unwrap_err();

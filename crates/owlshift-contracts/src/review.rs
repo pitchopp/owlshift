@@ -290,8 +290,8 @@ impl Plan {
 
     /// The rules of a person's steps (OWL-619): a person's step says when
     /// it is due and an agent's step does not; no step due before the merge
-    /// follows one due after it; and, until a ticket a person does whole is
-    /// handed back (OWL-619's third part), a step at least is the agent's.
+    /// follows one due after it. A plan of a person's steps alone is one:
+    /// the runner hands its ticket back to a person ([`Plan::has_agent_step`]).
     fn check_people(&self, contract: &'static str) -> Result<(), ContractError> {
         let invalid = |reason: String| Err(ContractError::invalid(contract, reason));
         let mut after_merge = None;
@@ -323,14 +323,14 @@ impl Plan {
                 (StepBy::Agent, None) => {}
             }
         }
-        if self.steps.iter().all(PlanStep::is_person) {
-            return invalid(
-                "every step of the plan is a person's: a ticket whose work is a person's whole \
-                 is not planned; the design run ends `blocked`, saying so"
-                    .to_owned(),
-            );
-        }
         Ok(())
+    }
+
+    /// Whether a step of the plan is the agent's: a plan without one is a
+    /// person's work whole, whose ticket the runner hands back (OWL-619,
+    /// architecture section 4, "A ticket with no step for a run").
+    pub fn has_agent_step(&self) -> bool {
+        self.steps.iter().any(|step| !step.is_person())
     }
 
     /// The steps that are a person's, with their place from 1.
@@ -1813,6 +1813,17 @@ mod tests {
                 .canonical()
                 .starts_with(r#"{"goal":"G","criteria":["C1"]"#)
         );
+        assert!(parsed.plan.has_agent_step());
+        // A plan of a person's steps alone is kept: its ticket is handed
+        // back, not refused (OWL-619's third part).
+        let mut whole = ticket_plan();
+        for n in [0, 2] {
+            whole["plan"]["steps"][n]["by"] = "person".into();
+            whole["plan"]["steps"][n]["when"] = "before_merge".into();
+        }
+        whole["owed"] = json!([]);
+        let whole = TicketPlan::parse(&whole.to_string()).unwrap();
+        assert!(!whole.plan.has_agent_step());
         refuses(
             ticket_plan,
             TicketPlan::parse,
@@ -1863,16 +1874,6 @@ mod tests {
                         d["plan"]["steps"][3]["when"] = "before_merge".into();
                     },
                     "steps[3] is due before the merge but follows steps[1]",
-                ),
-                (
-                    &|d| {
-                        for n in [0, 2] {
-                            d["plan"]["steps"][n]["by"] = "person".into();
-                            d["plan"]["steps"][n]["when"] = "before_merge".into();
-                        }
-                        d["owed"] = json!([]);
-                    },
-                    "every step of the plan is a person's",
                 ),
                 (&|d| d["owed"] = json!([3, 3]), "owed: step 3 is repeated"),
                 (&|d| d["owed"] = json!([5]), "owed: step 5 is not a step"),

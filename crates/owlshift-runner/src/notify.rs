@@ -84,7 +84,9 @@ pub fn desktop_enabled(personal: &FileState<PersonalConfig>) -> bool {
 /// Build did not resume and only a person's act resumes it, which makes the
 /// operator the blocker. So does an INTAKE comment whose record was not kept
 /// ([`Landed::Intake`], OWL-248): the drain cannot dispatch the ticket until
-/// a person makes its ref writable. A ticket back in the ready column
+/// a person makes its ref writable. So does a ticket handed back to a person
+/// ([`Stop::HandedBack`], OWL-619), its HANDBACK comment posted or not: its
+/// work is a person's now. A ticket back in the ready column
 /// ([`Stop::Ready`]) waits for the drain, not a person. The decision comment
 /// asks nothing of anyone, so a failure to keep its state stays a refusal,
 /// as does a RESUME the tracker refused, since nothing reached the ticket.
@@ -129,6 +131,14 @@ pub fn blocker_line(ticket: &TicketId, stop: &Stop) -> Option<String> {
             format!("{ticket}: the decider's question has a reply on the ticket; answers wait")
         }
         Stop::Parked { .. } => format!("{ticket} is parked: a person must look"),
+        // A person's work whole (OWL-619): handed back, a person's to do.
+        Stop::HandedBack { unposted, .. } => match unposted {
+            None => format!("{ticket} was handed back: its work is a person's"),
+            Some(_) => format!(
+                "{ticket} was handed back: its work is a person's, but its HANDBACK comment was \
+                 not posted; see the terminal"
+            ),
+        },
         Stop::NotKept { landed, .. } => {
             const NOT_KEPT: &str = "Owlshift's state was not kept";
             let (what, lost) = match landed {

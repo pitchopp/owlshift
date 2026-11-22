@@ -1,7 +1,7 @@
 +++
 role = "design"
 brief_format = 32
-result_format = 16
+result_format = 17
 +++
 
 # Design
@@ -43,7 +43,7 @@ Every criterion is delivered by a step and checked by a step's `test`. The plan 
 
 A step is a person's when no run can do it with the permissions a Build's brief gives: a check in a browser, which no run makes yet; a call that needs a credential no run holds; an operation on a deployed environment; a measure on real data. Mark such a step `"by": "person"` and say when it is due in `when`: `before_merge` when its result says whether the change is right, `after_merge` when it acts on what the merge deploys. Its `what` says what the person does, on what, and why no run can (the permission it needs); its `test` says the result the person reports. Leave `by` and `when` out of every other step: it is the agent's. A step that needs a person's result comes after that step. No step due before the merge follows one due after it.
 
-The Build does the agent's steps and passes a person's; the pull request lists them for the person, and Owlshift does not merge it while one due before the merge is owed. So split the work where it splits: what a run can build and check goes in the agent's steps, and only what needs a person goes in theirs, never a whole step for a check the Build's own tests can make. A plan needs at least one step of the agent's: when every step of the ticket is a person's, plan nothing, and end `blocked`, saying in `summary` that the work is a person's whole and why.
+The Build does the agent's steps and passes a person's; the pull request lists them for the person, and Owlshift does not merge it while one due before the merge is owed. So split the work where it splits: what a run can build and check goes in the agent's steps, and only what needs a person goes in theirs, never a whole step for a check the Build's own tests can make. When every step of the ticket is a person's, plan them all as a person's and end `done`, saying in `summary` that the work is a person's whole and why: Owlshift posts your steps for a person and runs nothing more on the ticket until a person admits it again.
 
 ## Forks and questions
 
@@ -70,7 +70,7 @@ When the brief has `approval`, the plan was put to its approval and the `thread`
 
 ## Ending the run
 
-Your last action is writing `result.json` at `result_path`, whatever the outcome; a run without it is a failure. When you cannot write it, your last message is that JSON, whole, and nothing after it. It is JSON with `format` 16, rejected if it carries any field not listed here. `status` is one of:
+Your last action is writing `result.json` at `result_path`, whatever the outcome; a run without it is a failure. When you cannot write it, your last message is that JSON, whole, and nothing after it. It is JSON with `format` 17, rejected if it carries any field not listed here. `status` is one of:
 
 - `done`: with the `plan`, or with `approval` after an approval round, and `finding_responses` when the brief has `findings`: one answer for each finding, in their order. A `done` that leaves a finding unanswered is refused.
 - `questions`: at least one question; you run again once they are answered or decided.
@@ -84,7 +84,7 @@ Always give `summary`, one or two sentences. Leave out `pr`, `artifacts`, `follo
 
 ```json
 {
-  "format": 16,
+  "format": 17,
   "status": "done",
   "summary": "Planned the logs command on the event store's reader, in two steps.",
   "plan": {

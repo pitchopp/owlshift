@@ -6,7 +6,7 @@ use crate::base::{BaseWait, ProjectBase};
 use crate::brief::Brief;
 use crate::comment::Footer;
 use crate::config::{PersonalConfig, ProjectConfig};
-use crate::drain::{TicketIntake, TicketProposals};
+use crate::drain::{TicketHandback, TicketIntake, TicketProposals};
 use crate::event::Event;
 use crate::ready::ReadySnapshot;
 use crate::refs::{
@@ -45,6 +45,7 @@ pub fn all() -> Vec<(&'static str, Schema)> {
         ("ticket-cost", schema::<TicketCost>()),
         ("ticket-session", schema::<TicketSession>()),
         ("ticket-held", schema::<TicketHeld>()),
+        ("ticket-handback", schema::<TicketHandback>()),
         ("comment-footer", schema::<Footer>()),
         ("step-envelope", schema::<StepEnvelope>()),
         ("step-outcome", schema::<StepOutcome>()),

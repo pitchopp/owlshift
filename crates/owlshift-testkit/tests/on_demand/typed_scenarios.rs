@@ -36,7 +36,7 @@ fn parked_at_build_on(bench: Bench) -> Bench {
 }
 
 /// What a blocked Build run says.
-const BLOCKED: &str = r#"{"format":16,"status":"blocked","summary":"The gate needs network."}"#;
+const BLOCKED: &str = r#"{"format":17,"status":"blocked","summary":"The gate needs network."}"#;
 
 /// The restarts recorded since `from`.
 fn restarts(bench: &Bench, from: usize) -> Vec<Value> {
@@ -150,7 +150,7 @@ fn the_deciders_continue_restarts_a_park_and_watch_drives_it() {
 #[test]
 fn a_park_at_intake_runs_intake_as_a_step_of_watch() {
     let bench = Bench::drained();
-    let premise = r#"{"format":16,"status":"premise_false","summary":"The section is not there."}"#;
+    let premise = r#"{"format":17,"status":"premise_false","summary":"The section is not there."}"#;
     let stop = bench
         .intake(
             vec![bench.reply(None, Some(premise))],
