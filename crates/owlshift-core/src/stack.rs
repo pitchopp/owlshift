@@ -5,10 +5,13 @@
 //!
 //! A pure function: the caller reads the root and passes in the file names and
 //! the contents of the four manifests it recognises (`Cargo.toml`,
-//! `package.json`, `pyproject.toml`, `Makefile`); lock files are read by name
-//! only. Nothing detected here is ever run. The commands were checked with real
-//! calls, recorded in `docs/design/runtime-and-operations.md`, "Stack detection
-//! (P9)"; a tool that could not be checked is not detected.
+//! `package.json`, `pyproject.toml`, `Makefile`); lock files, and the files of
+//! Go, pip, bundler and Gradle (OWL-624), are read by name only. Nothing
+//! detected here is ever run. The commands were checked with real calls,
+//! recorded in `docs/design/runtime-and-operations.md`, "Stack detection
+//! (P9)", and in the records of OWL-617 and OWL-624; a tool that could not be
+//! checked is not detected, and a run cache whose live check did not show it
+//! needed is not written, only named in a note.
 
 use serde::{Deserialize, Serialize};
 
@@ -77,8 +80,8 @@ pub struct RunCache {
 /// The result of [`detect`].
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Detection {
-    /// In the fixed order `Cargo.toml`, `package.json`, `pyproject.toml`,
-    /// `Makefile`.
+    /// In the fixed order `Cargo.toml`, `go.mod`, `package.json`, Python
+    /// (`pyproject.toml`, `requirements.txt`), `Gemfile`, Gradle, `Makefile`.
     pub found: Vec<Found>,
     /// A manifest that could not be read or parsed, with why. Never an error.
     pub skipped: Vec<String>,
@@ -114,30 +117,56 @@ pub const MANIFESTS: [&str; 4] = ["Cargo.toml", "package.json", "pyproject.toml"
 /// or unread counts as empty.
 pub const SETTINGS: [&str; 1] = [".yarnrc.yml"];
 
+/// One source of [`detect`]: what it found in the root, `None` when the root
+/// holds nothing of it, or why its manifest was skipped.
+type Source = fn(&RootFiles) -> Result<Option<Found>, String>;
+
 /// Detect the stack of a root.
 pub fn detect(root: &RootFiles) -> Detection {
+    // Each with the name it is skipped under: only a source that reads a
+    // manifest's text, of `MANIFESTS`, can be skipped.
+    let sources: [(&str, Source); 7] = [
+        ("Cargo.toml", cargo),
+        ("go.mod", go),
+        ("package.json", package_json),
+        ("pyproject.toml", python),
+        ("Gemfile", ruby),
+        ("gradlew", gradle),
+        ("Makefile", makefile),
+    ];
     let mut out = Detection::default();
-    for name in MANIFESTS {
-        if !root.has(name) {
-            continue;
-        }
-        let Some(text) = root.content(name) else {
-            out.skipped.push(format!("{name}: it could not be read"));
-            continue;
-        };
-        let result = match name {
-            "Cargo.toml" => cargo(root, text),
-            "package.json" => package_json(root, text),
-            "pyproject.toml" => pyproject(root, text),
-            _ => Ok(makefile(text)),
-        };
-        match result {
+    for (name, source) in sources {
+        match source(root) {
             Ok(Some(found)) => out.found.push(found),
             Ok(None) => {}
             Err(why) => out.skipped.push(format!("{name}: {why}")),
         }
     }
     out
+}
+
+/// The text of the manifest `name`, `None` when the root has no such file; an
+/// error when it has one the runner could not read.
+fn manifest<'a>(root: &'a RootFiles, name: &str) -> Result<Option<&'a str>, String> {
+    if !root.has(name) {
+        return Ok(None);
+    }
+    root.content(name)
+        .map(Some)
+        .ok_or_else(|| "it could not be read".to_string())
+}
+
+/// What `source` gave, with no line yet.
+fn found(source: impl Into<String>) -> Found {
+    Found {
+        source: source.into(),
+        gate: vec![],
+        setup: vec![],
+        caches: vec![],
+        run_caches: vec![],
+        notes: vec![],
+        gate_notes: vec![],
+    }
 }
 
 fn line(command: impl Into<String>, read_from: impl Into<String>) -> Line {
@@ -155,7 +184,10 @@ fn run_cache(variable: &str, folder: &str, read_from: impl Into<String>) -> RunC
     }
 }
 
-fn cargo(root: &RootFiles, text: &str) -> Result<Option<Found>, String> {
+fn cargo(root: &RootFiles) -> Result<Option<Found>, String> {
+    let Some(text) = manifest(root, "Cargo.toml")? else {
+        return Ok(None);
+    };
     let table: toml::Table = text
         .parse()
         .map_err(|_| "it is not valid TOML".to_string())?;
@@ -186,6 +218,39 @@ fn cargo(root: &RootFiles, text: &str) -> Result<Option<Found>, String> {
         notes: vec![],
         gate_notes: vec![],
     }))
+}
+
+/// A Go module, from `go.mod`, read by name (OWL-624): its modules fetched
+/// by the setup, then `gofmt`, `go vet` and `go test` over every package.
+/// Checked live, confined: the setup fails creating `~/go/pkg/mod` unless
+/// `GOMODCACHE` is moved, and `go vet` its build cache unless `GOCACHE` is;
+/// with both moved the gate passes, and the `gofmt` line fails naming a file
+/// it would change. A `go.mod` that pins a newer Go than the machine's makes
+/// Go download that tool chain as a module, into `GOMODCACHE`.
+fn go(root: &RootFiles) -> Result<Option<Found>, String> {
+    if !root.has("go.mod") {
+        return Ok(None);
+    }
+    let from = "go.mod";
+    let mut found = found(from);
+    found.setup.push(line("go mod download", from));
+    found.gate = vec![
+        // `gofmt -l` lists the files it would change and exits 0 whatever it
+        // finds: the line fails when it lists one, and names it.
+        line("! gofmt -l . | grep .", from),
+        line("go vet ./...", from),
+        line("go test ./...", from),
+    ];
+    found.run_caches = vec![
+        run_cache("GOMODCACHE", "go-mod", from),
+        run_cache("GOCACHE", "go-build", from),
+    ];
+    found.notes.push(
+        "Go keeps the modules it downloads read-only: to empty the run caches, make their folder \
+         writable (`chmod -R u+w`) before deleting it"
+            .to_string(),
+    );
+    Ok(Some(found))
 }
 
 /// A Node package manager, as the lock file at the root names it.
@@ -335,7 +400,10 @@ fn node_manager(root: &RootFiles, package: &serde_json::Value) -> Option<NodeMan
     }
 }
 
-fn package_json(root: &RootFiles, text: &str) -> Result<Option<Found>, String> {
+fn package_json(root: &RootFiles) -> Result<Option<Found>, String> {
+    let Some(text) = manifest(root, "package.json")? else {
+        return Ok(None);
+    };
     let value: serde_json::Value =
         serde_json::from_str(text).map_err(|_| "it is not valid JSON".to_string())?;
     let scripts = value.get("scripts").and_then(|s| s.as_object());
@@ -449,7 +517,152 @@ fn package_json(root: &RootFiles, text: &str) -> Result<Option<Found>, String> {
     Ok(Some(found))
 }
 
-fn pyproject(root: &RootFiles, text: &str) -> Result<Option<Found>, String> {
+/// A Python tool the gate runs: its command, and what it was read from.
+type Tool = (&'static str, &'static str);
+
+/// Python, from the tools `pyproject.toml` configures and the file that names
+/// its manager, first found in the order `uv.lock`, `poetry.lock`,
+/// `pdm.lock` (each beside `pyproject.toml`), then pip's `requirements.txt`
+/// (OWL-624). A manager's lock gives its setup and run caches even when no
+/// tool is configured, with a note that no gate was written.
+fn python(root: &RootFiles) -> Result<Option<Found>, String> {
+    let tools = match manifest(root, "pyproject.toml")? {
+        Some(text) => python_tools(text)?,
+        None => vec![],
+    };
+    let locked = |lock: &str| root.has("pyproject.toml") && root.has(lock);
+    if locked("uv.lock") {
+        return Ok(Some(uv(&tools)));
+    }
+    if locked("poetry.lock") {
+        return Ok(Some(poetry(&tools)));
+    }
+    let pdm = locked("pdm.lock");
+    if !pdm && root.has("requirements.txt") {
+        return Ok(Some(pip(root, &tools)));
+    }
+    if tools.is_empty() {
+        return Ok(None);
+    }
+    // A bare tool needs a setup, as does pdm, which was not checked.
+    let mut found = found("pyproject.toml");
+    found.notes.push(if pdm {
+        "pyproject.toml's tools are run bare and no setup was written, but pdm.lock names pdm: \
+         the gate needs `pdm run` in front of them and a setup that installs the project (not \
+         checked here)"
+            .to_string()
+    } else {
+        "pyproject.toml's tools are run bare and no setup was written: the gate needs a setup \
+         that installs them"
+            .to_string()
+    });
+    found.gate = tool_lines("", &tools);
+    Ok(Some(found))
+}
+
+/// The gate lines of `tools`, each run through `prefix`.
+fn tool_lines(prefix: &str, tools: &[Tool]) -> Vec<Line> {
+    tools
+        .iter()
+        .map(|(command, from)| line(format!("{prefix}{command}"), *from))
+        .collect()
+}
+
+/// The note of a manager whose `pyproject.toml` configures no tool this
+/// detection knows.
+fn no_tool_note(prefix: &str) -> String {
+    format!(
+        "pyproject.toml configures neither `[tool.ruff]` nor `[tool.pytest.ini_options]`, so no \
+         gate was written: add the project's lint and test commands, each run through `{prefix}`"
+    )
+}
+
+/// uv: `uv run` installs the locked environment itself, so there is no setup
+/// (OWL-539). Checked live (OWL-617): confined, uv needs both run caches on
+/// macOS, where it fails reading the closed `~/.local/share/uv/python`
+/// otherwise.
+fn uv(tools: &[Tool]) -> Found {
+    let mut found = found("pyproject.toml (uv.lock)");
+    let from = "uv.lock, the lock file of uv";
+    found.run_caches = vec![
+        run_cache("UV_CACHE_DIR", "uv", from),
+        run_cache("UV_PYTHON_INSTALL_DIR", "uv-python", from),
+    ];
+    found.gate = tool_lines("uv run ", tools);
+    if tools.is_empty() {
+        found.notes.push(no_tool_note("uv run"));
+    }
+    found
+}
+
+/// poetry (OWL-624): `poetry install` installs the locked environment into a
+/// virtualenv in poetry's cache, one per worktree, which `POETRY_CACHE_DIR`
+/// moves into a run cache. Checked live, confined: without it, poetry fails
+/// writing its closed cache (`~/Library/Caches/pypoetry` on macOS).
+fn poetry(tools: &[Tool]) -> Found {
+    let mut found = found("pyproject.toml (poetry.lock)");
+    let from = "poetry.lock, the lock file of poetry";
+    found.setup.push(line("poetry install", from));
+    found
+        .run_caches
+        .push(run_cache("POETRY_CACHE_DIR", "poetry", from));
+    found.gate = tool_lines("poetry run ", tools);
+    if tools.is_empty() {
+        found.notes.push(no_tool_note("poetry run"));
+    }
+    found
+}
+
+/// The first line of pip's setup: a virtualenv in the worktree that ignores
+/// itself, as Python 3.13 and later make it, so that the setup changes no
+/// file git sees whatever the Python and the project's `.gitignore`.
+const PIP_VENV: &str = "python3 -m venv .venv && echo '*' > .venv/.gitignore";
+
+/// pip (OWL-624), from `requirements.txt` with no other lock, and
+/// `requirements-dev.txt` beside it: a virtualenv in the worktree, the gate's
+/// tools run from it. Only with a tool `pyproject.toml` configures, since a
+/// `requirements.txt` at the root may serve something else, such as a
+/// documentation build: otherwise a note says what to write. Checked live,
+/// confined: pip turns off a cache it cannot write and installs anyway, so
+/// `PIP_CACHE_DIR` is not declared, only named in a note.
+fn pip(root: &RootFiles, tools: &[Tool]) -> Found {
+    let (files, install) = if root.has("requirements-dev.txt") {
+        (
+            "requirements.txt and requirements-dev.txt",
+            ".venv/bin/pip install -r requirements.txt -r requirements-dev.txt",
+        )
+    } else {
+        (
+            "requirements.txt",
+            ".venv/bin/pip install -r requirements.txt",
+        )
+    };
+    if tools.is_empty() {
+        let mut found = found("requirements.txt");
+        found.notes.push(format!(
+            "pip's requirements are in {files}, but pyproject.toml configures neither \
+             `[tool.ruff]` nor `[tool.pytest.ini_options]`, so nothing was written: a Python \
+             project's setup is `{PIP_VENV}` then `{install}`, and its gate runs its tools from \
+             `.venv/bin/`"
+        ));
+        return found;
+    }
+    let from = format!("{files}, the requirements of pip");
+    let mut found = found("pyproject.toml (requirements.txt)");
+    found.setup = vec![line(PIP_VENV, from.clone()), line(install, from)];
+    found.gate = tool_lines(".venv/bin/", tools);
+    found.notes.push(
+        "no run cache was declared for pip, which turns off a cache it cannot write and installs \
+         anyway: `run_caches.PIP_CACHE_DIR = \"pip\"` keeps its downloads for the next runs"
+            .to_string(),
+    );
+    found
+}
+
+/// The tools `pyproject.toml` configures, in the order the gate runs them:
+/// `ruff check .` for `[tool.ruff]`, `pytest` for `[tool.pytest.ini_options]`
+/// (`[tool.pytest]` alone was not checked, OWL-539).
+fn python_tools(text: &str) -> Result<Vec<Tool>, String> {
     let table: toml::Table = text
         .parse()
         .map_err(|_| "it is not valid TOML".to_string())?;
@@ -466,56 +679,96 @@ fn pyproject(root: &RootFiles, text: &str) -> Result<Option<Found>, String> {
     if pytest {
         tools.push(("pytest", "[tool.pytest.ini_options] in pyproject.toml"));
     }
-    if tools.is_empty() {
+    Ok(tools)
+}
+
+/// Ruby, from `Gemfile` (OWL-624), read by name with `Gemfile.lock` and
+/// `.rspec`: bundler installs the locked gems into `BUNDLE_PATH`, a run cache,
+/// and the gate is RSpec's when `.rspec` is there. The install is bundler's
+/// plain one: a setup that rewrote `Gemfile.lock` fails the gate, which
+/// allows it to change ignored files only, and bundler 1.17 given
+/// `BUNDLE_FROZEN` writes it into `.bundle/config` (checked live). Checked
+/// live, confined: without `BUNDLE_PATH`, bundler fails writing the gems where
+/// the machine's Ruby keeps them.
+fn ruby(root: &RootFiles) -> Result<Option<Found>, String> {
+    if !root.has("Gemfile") {
         return Ok(None);
     }
-    let mut found = Found {
-        source: "pyproject.toml".to_string(),
-        gate: vec![],
-        setup: vec![],
-        caches: vec![],
-        run_caches: vec![],
-        notes: vec![],
-        gate_notes: vec![],
-    };
-    // Only `uv run` was checked to install the locked environment itself; a
-    // bare tool needs a setup, as does a manager not checked (poetry, pdm).
-    let prefix = if root.has("uv.lock") {
-        found.source = "pyproject.toml (uv.lock)".to_string();
-        // Checked live (OWL-617): confined, uv needs both on macOS, where
-        // it fails reading the closed `~/.local/share/uv/python` otherwise.
-        let from = "uv.lock, the lock file of uv";
-        found.run_caches.push(run_cache("UV_CACHE_DIR", "uv", from));
+    let mut found = found("Gemfile");
+    if root.has("Gemfile.lock") {
+        found.source = "Gemfile (Gemfile.lock)".to_string();
+        let from = "Gemfile.lock, the lock file of bundler";
+        found.setup.push(line("bundle install", from));
         found
             .run_caches
-            .push(run_cache("UV_PYTHON_INSTALL_DIR", "uv-python", from));
-        "uv run "
+            .push(run_cache("BUNDLE_PATH", "bundle", from));
     } else {
-        let manager = ["poetry", "pdm"]
-            .into_iter()
-            .find(|m| root.has(&format!("{m}.lock")));
-        found.notes.push(match manager {
-            Some(m) => format!(
-                "pyproject.toml's tools are run bare and no setup was written, but {m}.lock \
-                 names {m}: the gate needs `{m} run` in front of them and a setup that \
-                 installs the project (not checked here)"
-            ),
-            None => "pyproject.toml's tools are run bare and no setup was written: the gate \
-                     needs a setup that installs them"
+        // An install here would write a lock file into the repository.
+        found.notes.push(
+            "Gemfile has no lock file, so no setup was written: the gate needs a setup that \
+             installs the gems"
                 .to_string(),
-        });
-        ""
-    };
-    for (command, from) in tools {
+        );
+    }
+    if root.has(".rspec") {
         found
             .gate
-            .push(line(format!("{prefix}{command}"), from.to_string()));
+            .push(line("bundle exec rspec", ".rspec, the settings of RSpec"));
+    } else {
+        found.notes.push(
+            "no Ruby gate was written, only `.rspec` being read for one: add the project's tests, \
+             such as `bundle exec rake` or `bin/rails test`"
+                .to_string(),
+        );
     }
     Ok(Some(found))
 }
 
+/// The build files that make a root a Gradle project (OWL-624).
+const GRADLE_BUILDS: [&str; 4] = [
+    "build.gradle.kts",
+    "build.gradle",
+    "settings.gradle.kts",
+    "settings.gradle",
+];
+
+/// Gradle (OWL-624), from its wrapper `gradlew` beside a build file, read by
+/// name: `check` runs the tests and the checks the build configures, without
+/// the daemon, which would outlive the command. `GRADLE_USER_HOME` holds the
+/// wrapper's Gradle, the dependencies and the tool chains Gradle downloads.
+/// Checked live, confined: without it, the wrapper fails writing
+/// `~/.gradle`. With no wrapper, the machine's Gradle was not checked: a note
+/// says what to write.
+fn gradle(root: &RootFiles) -> Result<Option<Found>, String> {
+    let Some(build) = GRADLE_BUILDS.into_iter().find(|name| root.has(name)) else {
+        return Ok(None);
+    };
+    if !root.has("gradlew") {
+        let mut found = found(build);
+        found.notes.push(
+            "no Gradle wrapper (`gradlew`) at the root, so nothing was written: the gate runs the \
+             project's Gradle, such as `gradle check --no-daemon`, with \
+             `run_caches.GRADLE_USER_HOME = \"gradle\"` for the caches it writes"
+                .to_string(),
+        );
+        return Ok(Some(found));
+    }
+    let from = "gradlew, the Gradle wrapper";
+    let mut found = found("gradlew");
+    found.gate.push(line("./gradlew check --no-daemon", from));
+    found
+        .run_caches
+        .push(run_cache("GRADLE_USER_HOME", "gradle", from));
+    Ok(Some(found))
+}
+
 /// The `lint`, `test` and `check` targets a Makefile defines, in that order.
-fn makefile(text: &str) -> Option<Found> {
+fn makefile(root: &RootFiles) -> Result<Option<Found>, String> {
+    Ok(manifest(root, "Makefile")?.and_then(makefile_targets))
+}
+
+/// The Found of a Makefile's text.
+fn makefile_targets(text: &str) -> Option<Found> {
     let mut defined = [false; 3];
     for raw in text.lines() {
         if raw.starts_with([' ', '\t', '#', '.']) {
@@ -919,50 +1172,260 @@ check::
     }
 
     #[test]
-    fn a_python_root_without_uv_runs_bare_and_says_a_setup_is_needed() {
-        for names in [&[][..], &["poetry.lock"], &["pdm.lock"]] {
+    fn a_python_root_without_a_checked_manager_runs_bare_and_says_a_setup_is_needed() {
+        for names in [&[][..], &["pdm.lock"]] {
             let d = detect(&root(names, &[("pyproject.toml", PY)]));
             assert_eq!(commands(d.gate()), ["ruff check .", "pytest"], "{names:?}");
             assert_eq!(d.found[0].notes.len(), 1);
             assert!(d.found[0].notes[0].contains("setup"));
+            assert!(d.setup().next().is_none() && d.run_caches().next().is_none());
+        }
+        let pdm = detect(&root(&["pdm.lock"], &[("pyproject.toml", PY)]));
+        assert!(pdm.found[0].notes[0].contains("`pdm run`"));
+    }
+
+    /// No tool `[tool.pytest]` alone names; a manager's lock still gives its
+    /// setup and run caches, with a note that no gate was written (OWL-624).
+    #[test]
+    fn a_pyproject_without_a_known_tool_gives_its_managers_lines_only() {
+        let text = "[project]\nname = \"x\"\n[tool.pytest]\nx = 1\n";
+        let bare = detect(&root(&["pdm.lock"], &[("pyproject.toml", text)]));
+        assert!(bare.found.is_empty() && bare.skipped.is_empty());
+        for (lock, prefix, written) in [
+            (
+                "uv.lock",
+                "uv run",
+                &[
+                    ("UV_CACHE_DIR", "uv"),
+                    ("UV_PYTHON_INSTALL_DIR", "uv-python"),
+                ][..],
+            ),
+            (
+                "poetry.lock",
+                "poetry run",
+                &[("POETRY_CACHE_DIR", "poetry")],
+            ),
+        ] {
+            let d = detect(&root(&[lock], &[("pyproject.toml", text)]));
+            assert!(d.gate().next().is_none(), "{lock}");
+            assert_eq!(run_caches(d.run_caches()), written, "{lock}");
+            let notes = &d.found[0].notes;
+            assert_eq!(notes.len(), 1, "{lock} {notes:?}");
+            assert!(
+                notes[0].contains(&format!("run through `{prefix}`")),
+                "{notes:?}"
+            );
         }
     }
 
+    /// OWL-624: poetry installs the lock into a virtualenv of its cache, which
+    /// a run cache holds, and runs the tools through `poetry run`.
     #[test]
-    fn a_poetry_or_pdm_root_names_the_manager_in_its_note() {
-        for m in ["poetry", "pdm"] {
-            let lock = format!("{m}.lock");
-            let d = detect(&root(&[lock.as_str()], &[("pyproject.toml", PY)]));
-            assert!(d.found[0].notes[0].contains(&format!("`{m} run`")), "{m}");
-        }
+    fn a_poetry_root_installs_into_its_run_cache() {
+        let d = detect(&root(&["poetry.lock"], &[("pyproject.toml", PY)]));
+        assert_eq!(d.found[0].source, "pyproject.toml (poetry.lock)");
+        assert_eq!(commands(d.setup()), ["poetry install"]);
+        assert_eq!(
+            commands(d.gate()),
+            ["poetry run ruff check .", "poetry run pytest"]
+        );
+        assert_eq!(run_caches(d.run_caches()), [("POETRY_CACHE_DIR", "poetry")]);
+        assert!(d.found[0].notes.is_empty());
+        assert!(d.setup().all(|l| l.read_from.contains("poetry.lock")));
     }
 
+    /// OWL-624: pip runs the tools from a virtualenv that ignores itself; its
+    /// cache, which it turns off confined and installs without, is named in a
+    /// note, never declared (criterion: an unchecked run cache is not written).
     #[test]
-    fn a_pyproject_without_a_known_tool_gives_nothing() {
-        let d = detect(&root(
-            &["uv.lock"],
-            &[(
-                "pyproject.toml",
-                "[project]\nname = \"x\"\n[tool.pytest]\nx = 1\n",
-            )],
+    fn pip_installs_into_a_self_ignoring_venv_and_only_names_its_cache() {
+        let d = detect(&root(&["requirements.txt"], &[("pyproject.toml", PY)]));
+        assert_eq!(d.found[0].source, "pyproject.toml (requirements.txt)");
+        assert_eq!(
+            commands(d.setup()),
+            [PIP_VENV, ".venv/bin/pip install -r requirements.txt"]
+        );
+        assert!(PIP_VENV.ends_with("echo '*' > .venv/.gitignore"));
+        assert_eq!(
+            commands(d.gate()),
+            [".venv/bin/ruff check .", ".venv/bin/pytest"]
+        );
+        assert!(d.run_caches().next().is_none());
+        let notes = &d.found[0].notes;
+        assert_eq!(notes.len(), 1, "{notes:?}");
+        assert!(notes[0].contains("`run_caches.PIP_CACHE_DIR = \"pip\"`"));
+        let dev = detect(&root(
+            &["requirements.txt", "requirements-dev.txt"],
+            &[("pyproject.toml", PY)],
         ));
-        assert!(d.found.is_empty() && d.skipped.is_empty());
+        assert_eq!(
+            commands(dev.setup()).last().unwrap(),
+            &".venv/bin/pip install -r requirements.txt -r requirements-dev.txt"
+        );
+        assert!(
+            dev.setup()
+                .all(|l| l.read_from.contains("requirements-dev.txt"))
+        );
+        // Without a configured tool, a root `requirements.txt` may serve
+        // something else: only a note.
+        for files in [&[][..], &[("pyproject.toml", "[project]\n")]] {
+            let d = detect(&root(&["requirements.txt"], files));
+            assert_eq!(d.found[0].source, "requirements.txt");
+            assert!(d.gate().next().is_none() && d.setup().next().is_none());
+            assert!(d.found[0].notes[0].contains(PIP_VENV));
+        }
     }
 
     #[test]
-    fn a_root_holding_two_ecosystems_lists_both_in_the_fixed_order() {
+    fn the_first_python_lock_found_chooses_the_manager() {
+        let cases: [(&[&str], &str); 4] = [
+            (
+                &["uv.lock", "poetry.lock", "requirements.txt"],
+                "uv run pytest",
+            ),
+            (
+                &["poetry.lock", "pdm.lock", "requirements.txt"],
+                "poetry run pytest",
+            ),
+            (&["pdm.lock", "requirements.txt"], "pytest"),
+            (&["requirements.txt"], ".venv/bin/pytest"),
+        ];
+        let py = "[tool.pytest.ini_options]\n";
+        for (names, gate) in cases {
+            let d = detect(&root(names, &[("pyproject.toml", py)]));
+            assert_eq!(commands(d.gate()), [gate], "{names:?}");
+        }
+        // A lock without `pyproject.toml` names no manager.
+        let d = detect(&root(&["poetry.lock", "requirements.txt"], &[]));
+        assert_eq!(d.found[0].source, "requirements.txt");
+    }
+
+    /// OWL-624: a Go module's modules and build cache go to run caches.
+    #[test]
+    fn a_go_module_gives_its_setup_gate_and_run_caches() {
+        let d = detect(&root(&["go.mod", "go.sum"], &[]));
+        assert_eq!(d.found[0].source, "go.mod");
+        assert_eq!(commands(d.setup()), ["go mod download"]);
+        assert_eq!(
+            commands(d.gate()),
+            ["! gofmt -l . | grep .", "go vet ./...", "go test ./..."]
+        );
+        assert_eq!(
+            run_caches(d.run_caches()),
+            [("GOMODCACHE", "go-mod"), ("GOCACHE", "go-build")]
+        );
+        assert!(d.found[0].notes[0].contains("chmod -R u+w"));
+        assert!(d.gate().chain(d.setup()).all(|l| l.read_from == "go.mod"));
+    }
+
+    /// OWL-624: bundler installs the locked gems, frozen, into a run cache;
+    /// RSpec is the gate when `.rspec` is there.
+    #[test]
+    fn a_ruby_root_installs_its_locked_gems_into_a_run_cache() {
+        let d = detect(&root(&["Gemfile", "Gemfile.lock", ".rspec"], &[]));
+        assert_eq!(d.found[0].source, "Gemfile (Gemfile.lock)");
+        assert_eq!(commands(d.setup()), ["bundle install"]);
+        assert_eq!(commands(d.gate()), ["bundle exec rspec"]);
+        assert_eq!(run_caches(d.run_caches()), [("BUNDLE_PATH", "bundle")]);
+        assert!(d.found[0].notes.is_empty());
+        // No lock: no setup and no run cache; no `.rspec`: no gate. Each
+        // says so.
+        let d = detect(&root(&["Gemfile"], &[]));
+        assert!(d.setup().next().is_none() && d.gate().next().is_none());
+        assert!(d.run_caches().next().is_none());
+        let notes = &d.found[0].notes;
+        assert!(notes[0].contains("no lock file") && notes[1].contains("bin/rails test"));
+        assert!(detect(&root(&["Gemfile.lock"], &[])).found.is_empty());
+    }
+
+    /// OWL-624: Gradle through its wrapper, its user home a run cache; a
+    /// build with no wrapper gets a note naming both.
+    #[test]
+    fn a_gradle_build_is_run_through_its_wrapper() {
+        for build in GRADLE_BUILDS {
+            let d = detect(&root(&["gradlew", build], &[]));
+            assert_eq!(d.found[0].source, "gradlew", "{build}");
+            assert_eq!(commands(d.gate()), ["./gradlew check --no-daemon"]);
+            assert!(d.setup().next().is_none());
+            assert_eq!(run_caches(d.run_caches()), [("GRADLE_USER_HOME", "gradle")]);
+        }
+        let d = detect(&root(&["build.gradle"], &[]));
+        assert_eq!(d.found[0].source, "build.gradle");
+        assert!(d.gate().next().is_none() && d.run_caches().next().is_none());
+        assert!(d.found[0].notes[0].contains("run_caches.GRADLE_USER_HOME"));
+        assert!(detect(&root(&["gradlew"], &[])).found.is_empty());
+    }
+
+    /// Every run cache `init` can write passes the check the project file's
+    /// loader makes (OWL-624, criterion 4), together with the others a root
+    /// can hold beside it.
+    #[test]
+    fn every_run_cache_detected_passes_the_names_check() {
+        let all = &[
+            "Cargo.lock",
+            "go.mod",
+            "pnpm-lock.yaml",
+            "poetry.lock",
+            "Gemfile",
+            "Gemfile.lock",
+            "gradlew",
+            "build.gradle.kts",
+        ][..];
+        let roots = [
+            root(
+                all,
+                &[
+                    ("Cargo.toml", CARGO),
+                    ("package.json", "{}"),
+                    ("pyproject.toml", PY),
+                ],
+            ),
+            root(
+                &["package-lock.json", "uv.lock"],
+                &[("package.json", "{}"), ("pyproject.toml", PY)],
+            ),
+        ];
+        let mut seen = 0;
+        for r in &roots {
+            let d = detect(r);
+            let entries = run_caches(d.run_caches());
+            seen += entries.len();
+            crate::agent_env::check_run_caches(&entries).unwrap();
+        }
+        assert_eq!(seen, 10);
+    }
+
+    #[test]
+    fn a_root_holding_several_ecosystems_lists_them_in_the_fixed_order() {
         let d = detect(&root(
-            &["pnpm-lock.yaml", "Cargo.lock"],
+            &[
+                "pnpm-lock.yaml",
+                "Cargo.lock",
+                "gradlew",
+                "settings.gradle",
+                "Gemfile",
+                "go.mod",
+                "requirements.txt",
+            ],
             &[
                 ("package.json", r#"{"scripts":{"test":"vitest"}}"#),
                 ("Cargo.toml", CARGO),
                 ("Makefile", "lint:\n"),
+                ("pyproject.toml", PY),
             ],
         ));
         let sources: Vec<&str> = d.found.iter().map(|f| f.source.as_str()).collect();
         assert_eq!(
             sources,
-            ["Cargo.toml", "package.json (pnpm-lock.yaml)", "Makefile"]
+            [
+                "Cargo.toml",
+                "go.mod",
+                "package.json (pnpm-lock.yaml)",
+                "pyproject.toml (requirements.txt)",
+                "Gemfile",
+                "gradlew",
+                "Makefile"
+            ]
         );
         assert_eq!(
             commands(d.gate()),
@@ -970,10 +1433,17 @@ check::
                 "cargo fmt --all -- --check",
                 "cargo clippy --workspace --all-targets --locked -- -D warnings",
                 "cargo test --workspace --locked",
+                "! gofmt -l . | grep .",
+                "go vet ./...",
+                "go test ./...",
                 "pnpm run test",
+                ".venv/bin/ruff check .",
+                ".venv/bin/pytest",
+                "./gradlew check --no-daemon",
                 "make lint"
             ]
         );
         assert!(d.gate().all(|l| !l.read_from.is_empty()));
+        assert!(d.setup().all(|l| !l.read_from.is_empty()));
     }
 }

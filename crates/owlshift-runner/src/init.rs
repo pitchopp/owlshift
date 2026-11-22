@@ -90,7 +90,13 @@ requires = \">={}.{}\"
     let by_hand = !options.gate.is_empty();
     let mut gate = String::new();
     for found in &options.detected.found {
-        if (!by_hand && !found.gate.is_empty()) || !found.setup.is_empty() {
+        // A source's notes are written above what it gives the file, and
+        // above nothing when it gives no line, since they say what to add
+        // (OWL-624); not above a gate `--gate` replaced, the only line given.
+        let kept =
+            !found.setup.is_empty() || !found.caches.is_empty() || !found.run_caches.is_empty();
+        let none = !kept && found.gate.is_empty();
+        if (!by_hand && !found.gate.is_empty()) || kept || none {
             let own = (!by_hand && !found.gate.is_empty()).then_some(&found.gate_notes);
             for note in found.notes.iter().chain(own.into_iter().flatten()) {
                 gate.push_str(&format!("# note: {}\n", one_line(note)));
@@ -1641,6 +1647,51 @@ mod tests {
         let config = ProjectConfig::parse(&text).unwrap();
         assert_eq!(config.stack.gate, ["ruff check ."]);
         assert!(config.stack.setup.is_empty());
+    }
+
+    /// OWL-624: a Go module and a Gradle build are written with their
+    /// sources and load; a source that gives no line, a Gemfile with neither
+    /// lock nor `.rspec`, still has its notes written, as does Gradle's own
+    /// line under a gate given by hand.
+    #[test]
+    fn a_go_and_gradle_root_is_written_and_a_lineless_source_keeps_its_notes() {
+        let d = detected(&["go.mod", "gradlew", "build.gradle.kts", "Gemfile"], &[]);
+        let text = project_file(&with(d.clone(), &[])).unwrap();
+        let config = ProjectConfig::parse(&text).unwrap();
+        assert_eq!(
+            config.stack.gate,
+            [
+                "! gofmt -l . | grep .",
+                "go vet ./...",
+                "go test ./...",
+                "./gradlew check --no-daemon"
+            ]
+        );
+        assert_eq!(config.stack.setup, ["go mod download"]);
+        assert_eq!(
+            config.stack.run_cache_entries(),
+            [
+                ("GOCACHE", "go-build"),
+                ("GOMODCACHE", "go-mod"),
+                ("GRADLE_USER_HOME", "gradle")
+            ]
+        );
+        assert!(text.contains(
+            "# read from go.mod\nrun_caches.GOMODCACHE = \"go-mod\"\n# read from go.mod\n\
+             run_caches.GOCACHE = \"go-build\"\n# read from gradlew, the Gradle wrapper\n\
+             run_caches.GRADLE_USER_HOME = \"gradle\"\n"
+        ));
+        assert!(text.contains("    # read from go.mod\n    \"! gofmt -l . | grep .\","));
+        assert!(text.contains("# note: Go keeps the modules it downloads read-only"));
+        assert!(text.contains("# note: Gemfile has no lock file"), "{text}");
+        assert!(text.contains("# note: no Ruby gate was written"), "{text}");
+        let by_hand = project_file(&with(d, &["make ci"])).unwrap();
+        assert_eq!(
+            ProjectConfig::parse(&by_hand).unwrap().stack.gate,
+            ["make ci"]
+        );
+        assert!(by_hand.contains("run_caches.GRADLE_USER_HOME = \"gradle\""));
+        assert!(by_hand.contains("# note: Gemfile has no lock file"));
     }
 
     #[test]
