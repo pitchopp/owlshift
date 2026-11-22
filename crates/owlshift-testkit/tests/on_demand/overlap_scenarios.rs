@@ -233,6 +233,96 @@ fn under_local_claims_a_sibling_without_a_ref_refreshes_nothing() {
     assert!(runs.is_empty(), "{runs:?}\n{report}");
 }
 
+/// The `decision` events of the overlaps this runner recorded from another
+/// runner's claim (OWL-636).
+fn recorded_from_claims(bench: &Bench) -> Vec<Value> {
+    data_of(&bench.events(), EventKind::Decision, "overlap")
+        .into_iter()
+        .filter(|data| data["overlap"] == "recorded" && data["by"] == "claim")
+        .collect()
+}
+
+/// OWL-636: DEMO-1, delivered, holds `AGENTS.md` and its record names no
+/// sibling; DEMO-2, which another runner claims later holding that file,
+/// has its overlap recorded by that runner alone. Watch's passes, the claim
+/// standing, record it in DEMO-1's own record, once. Then DEMO-2's change
+/// merges and its claim is deleted: the next watch, its own fetch pruning
+/// the claim, refreshes DEMO-1's pull request onto the merge, its cause the
+/// overlap, though GitHub reports no conflict, and records nothing more.
+#[test]
+fn a_colleagues_later_overlap_is_recorded_here_and_refreshes_at_its_merge() {
+    let bench = Bench::with(
+        "maintainer",
+        "assignee = \"maintainer\"\n",
+        "overlap = \"rebase\"\n",
+    );
+    bench.claims_on_remote();
+    let mut reply = bench.reply(Some("Hello"), Some(DONE));
+    reply.files.insert(
+        RelativePath::new("AGENTS.md").unwrap(),
+        AGENTS_APPENDED.to_owned(),
+    );
+    let (outcome, printed) = bench.run(vec![reply], None);
+    outcome.unwrap_or_else(|stop| panic!("{stop}\n{printed}"));
+    // The bench's ticket names no zone, so its Build holds the whole
+    // repository, which overlaps nothing: it holds `AGENTS.md` instead.
+    let mut record = bench.record();
+    let at = bench.clock.get();
+    let mut held = TicketHeld::dispatched(at);
+    held.admit(vec!["AGENTS.md".to_owned()], Vec::new(), None, at);
+    record.held = Some(held);
+    bench.write_record(&record);
+    // DEMO-1 is delivered, so it waits for no claim: the colleague's claim
+    // time, read on another clock than the bench's, orders nothing here.
+    let colleague = bench.colleague();
+    bench.claimed_by(&colleague, "DEMO-2", &["AGENTS.md"]);
+    // Each watch's first pass fetches the claims itself.
+    let mut pass = 0;
+    let (outcomes, lines, printed) = bench.watch(Vec::new(), &mut |_| {
+        pass += 1;
+        pass < 3
+    });
+    let report = format!("{outcomes:?}\n{lines}\n{printed}");
+    assert!(outcomes.iter().all(Result::is_ok), "{report}");
+    let recorded = recorded_from_claims(&bench);
+    assert_eq!(recorded.len(), 1, "{recorded:?}\n{report}");
+    assert_eq!(
+        (&recorded[0]["tickets"], &recorded[0]["paths"]),
+        (&json!(["DEMO-2"]), &json!(["AGENTS.md"]))
+    );
+    let overlaps = bench.record().held.unwrap().overlaps;
+    assert_eq!(overlaps.len(), 1, "{overlaps:?}");
+    assert_eq!(
+        (overlaps[0].ticket.as_str(), &overlaps[0].paths[..]),
+        ("DEMO-2", &["AGENTS.md".to_owned()][..])
+    );
+    assert!(rebase_runs(&bench).is_empty(), "{report}");
+    let main = bench.merge_into_main(&[("AGENTS.md", AGENTS_PREPENDED)]);
+    bench.unclaimed("DEMO-2");
+    let refresh = replayed_onto(&bench, main.clone());
+    let mut pass = 0;
+    let (outcomes, lines, printed) = bench.watch_during(
+        vec![bench.reply(None, Some(REBASED))],
+        vec![refresh],
+        &mut |_| {
+            pass += 1;
+            pass < 3
+        },
+    );
+    let report = format!("{outcomes:?}\n{lines}\n{printed}");
+    assert!(outcomes.iter().all(Result::is_ok), "{report}");
+    let runs = rebase_runs(&bench);
+    assert_eq!(runs.len(), 1, "{runs:?}\n{report}");
+    assert_eq!(
+        (&runs[0]["cause"], &runs[0]["onto"]),
+        (&json!("overlap"), &json!(main)),
+        "{report}"
+    );
+    let head = bench.remote_branch().unwrap();
+    assert!(is_ancestor(&bench, &main, &head), "{report}");
+    assert_eq!(recorded_from_claims(&bench).len(), 1, "{report}");
+}
+
 /// A review after a resolution: DEMO-1's own record shares `GREETING.md`
 /// with DEMO-2, whose merge adds that file too, a conflict GitHub reports
 /// and that is not trivial (both sides add it). The rebase run, on the

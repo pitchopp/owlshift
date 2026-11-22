@@ -14,6 +14,14 @@
 //! one line per ticket, told again when its commit changes. A fetch that
 //! fails is one `warning` (`claims_unfetched`) and one line, told again when
 //! its reason changes.
+//!
+//! Under `policy.overlap = "rebase"`, an overlap of one of this runner's
+//! tickets with another runner's ticket admitted after it is recorded by
+//! that runner alone, in a ticket ref this one never reads. Each pass weighs
+//! this runner's tickets against the claims, by what each publishes it
+//! holds, and records such an overlap in its own ticket's record (OWL-636;
+//! build plan "Other runners' tickets", "Overlaps"), which keeps counting it
+//! once that claim is deleted after its merge (OWL-613).
 
 use std::collections::{BTreeMap, HashMap};
 use std::fs;
@@ -26,11 +34,18 @@ use serde_json::json;
 use owlshift_contracts::config::Claims;
 use owlshift_contracts::event::EventKind;
 use owlshift_contracts::ids::TicketId;
+use owlshift_contracts::refs::TicketHeld;
+use owlshift_core::collision::{self, InFlight, Shared};
+use owlshift_core::resource::NamedResources;
+use owlshift_core::vocab::Overlap;
 
 use super::{Memory, Watch};
 use crate::claims::{self, FetchedClaim};
 use crate::events::{EventSink, data};
+use crate::held;
+use crate::in_flight;
 use crate::project::{self, DefaultBranchFile};
+use crate::ticket_ref::{self, ProposalsFile, RefRead, Stored};
 
 /// What watch keeps of the claims of `origin`.
 #[derive(Debug, Default)]
@@ -245,5 +260,237 @@ impl Watch<'_> {
             );
         }
         memory.claimed.unread = unread;
+    }
+
+    /// Records the overlaps of this runner's tickets with other runners'
+    /// tickets that only those runners recorded (OWL-636; build plan "Other
+    /// runners' tickets", "Overlaps"): under `rebase` and remote claims, each
+    /// ticket ref of `read` whose step's child does not run is weighed
+    /// against the claims of other runners that read ([`claims_overlaps`]).
+    /// An overlap its record lacks is written under the project's and the
+    /// ticket's lock while its ref is still the one read
+    /// ([`Self::locked_at`]), decided again from the record read there, with
+    /// a `decision` event (`overlap` = `recorded`, `by` = `claim`); the ref
+    /// read again then replaces it in `read`, so the pass's collisions and
+    /// refreshes read it. A project busy or a ref moved leaves it to the next
+    /// pass; a write that fails is warned of once.
+    pub(super) fn record_claims_overlaps(
+        &self,
+        memory: &mut Memory,
+        sink: &mut EventSink<'_>,
+        read: &mut [RefRead],
+        overlap: Overlap,
+    ) {
+        if overlap != Overlap::Rebase || !memory.claimed.remote {
+            return;
+        }
+        let on_demand = self.on_demand;
+        let named = on_demand.config.stack.named_resources().unwrap_or_default();
+        // Other runners' tickets alone, by their claims. Pull requests and
+        // people's tickets are never an overlap's sibling, and could only
+        // hold the ticket back, which hides its overlaps.
+        let refs = read
+            .iter()
+            .map(|(ticket, stored)| (ticket, stored.as_ref().ok()));
+        let colleagues = in_flight::Outside::default()
+            .holders(refs, &memory.claimed.elsewhere, &named)
+            .others;
+        if colleagues.is_empty() {
+            return;
+        }
+        let times = claims::claimed_times(on_demand.dirs);
+        let now = (on_demand.clock)();
+        let overlaps_of = |ticket: &TicketId, stored: &Stored| {
+            claims_overlaps(ticket, stored, &colleagues, &times, &named)
+        };
+        let running: Vec<TicketId> = memory
+            .running
+            .iter()
+            .map(|running| running.ticket().clone())
+            .collect();
+        for (ticket, stored) in read.iter_mut() {
+            let seen = match stored.as_ref() {
+                Ok(found) if !running.contains(ticket) => {
+                    // Weighed on a copy first: a pass that finds nothing new
+                    // takes no lock.
+                    let overlaps = overlaps_of(ticket, found);
+                    let new = found.record.held.clone().is_some_and(|mut held| {
+                        !held::record(&mut held, &overlaps, now).kept.is_empty()
+                    });
+                    if !new {
+                        continue;
+                    }
+                    found.commit.clone()
+                }
+                _ => continue,
+            };
+            match self.write_claims_overlaps(sink, ticket, &seen, &overlaps_of, now) {
+                Ok(Some(written)) => *stored = Ok(written),
+                Ok(None) => {}
+                Err(reason) => self.unreadable(memory, sink, ticket, reason),
+            }
+        }
+    }
+
+    /// [`Self::record_claims_overlaps`] for `ticket`, its ref read at
+    /// `seen`, its overlaps found by `overlaps_of`: the ref as written,
+    /// `None` when nothing was.
+    fn write_claims_overlaps(
+        &self,
+        sink: &mut EventSink<'_>,
+        ticket: &TicketId,
+        seen: &str,
+        overlaps_of: &dyn Fn(&TicketId, &Stored) -> Vec<Shared<String>>,
+        now: Timestamp,
+    ) -> Result<Option<Stored>, String> {
+        let Some((_project, ticket_lock)) = self.locked_at(ticket, seen)? else {
+            return Ok(None);
+        };
+        let git = &self.on_demand.executor.git;
+        let checkout = self.on_demand.dirs.checkout();
+        let Some(current) = ticket_ref::read(git, &checkout, ticket)? else {
+            return Ok(None);
+        };
+        let overlaps = overlaps_of(ticket, &current);
+        let mut record = current.record;
+        let Some(held) = record.held.as_mut() else {
+            return Ok(None);
+        };
+        let recorded = held::record(held, &overlaps, now);
+        if recorded.kept.is_empty() {
+            return Ok(None);
+        }
+        self.write_ref(&ticket_lock, ticket, &record, ProposalsFile::Keep, seen)?;
+        for kept in &recorded.kept {
+            sink.emit(
+                ticket,
+                None,
+                EventKind::Decision,
+                held::overlap_event("claim", kept),
+            );
+        }
+        ticket_ref::read(git, &checkout, ticket)
+    }
+}
+
+/// The overlaps `ticket`'s ref `stored` has with `colleagues`, other
+/// runners' tickets by their claims (OWL-636): none when it does not hold
+/// ([`held::holds`]), keeps no record of what it holds, or yielded it, its
+/// resume reading its own set (OWL-621); else those [`collision::weigh`]
+/// tells it under `rebase`, as a widening weighs it, at its own claim's time
+/// when `times`, this runner's claims, has one ([`held::by_claim`]), as
+/// watch's collisions order it. None either while a colleague holds it
+/// back: its next step waits, and a later pass records them.
+fn claims_overlaps(
+    ticket: &TicketId,
+    stored: &Stored,
+    colleagues: &[InFlight<String>],
+    times: &BTreeMap<TicketId, i64>,
+    named: &NamedResources,
+) -> Vec<Shared<String>> {
+    let yielded = stored.record.held.as_ref().is_none_or(TicketHeld::yielded);
+    if yielded || !held::holds(stored) {
+        return Vec::new();
+    }
+    let own = held::by_claim(held::in_flight(ticket, stored, named), times);
+    collision::weigh(&own, colleagues, Overlap::Rebase).overlaps
+}
+
+#[cfg(test)]
+mod tests {
+    use owlshift_contracts::refs::{PersistedState, TicketDelivery};
+    use owlshift_core::collision::Dispatched;
+    use owlshift_core::resource::Resource;
+    use owlshift_core::state::{Status, TicketState};
+    use owlshift_core::vocab::Stage;
+
+    use super::*;
+    use crate::ticket_ref::blank;
+
+    /// DEMO-1's ref at `stage`, its pull request open when `delivered`,
+    /// dispatched two minutes after the epoch and holding `app/one.rs` since
+    /// its Build's admission.
+    fn admitted(stage: Stage, delivered: bool) -> Stored {
+        let round = u32::from(stage != Stage::Ready);
+        let state = TicketState::restore(Status::Active(stage), round, 0, 0, 0, 0).unwrap();
+        let mut record = blank(None);
+        record.state = PersistedState::from(&state);
+        record.delivery = delivered.then(|| {
+            TicketDelivery::parse(include_str!(
+                "../../../owlshift-contracts/tests/fixtures/ticket-delivery.json"
+            ))
+            .unwrap()
+        });
+        let at = Timestamp::from_millisecond(120_000).unwrap();
+        let mut held = TicketHeld::dispatched(at);
+        held.admit(vec!["app/one.rs".to_owned()], Vec::new(), None, at);
+        record.held = Some(held);
+        Stored {
+            record,
+            commit: "c".repeat(40),
+            proposals: None,
+        }
+    }
+
+    /// Another runner's ticket, claimed a minute after the epoch, holding
+    /// `held`.
+    fn colleague(held: Vec<Resource>) -> InFlight<String> {
+        InFlight {
+            id: "DEMO-2".to_owned(),
+            dispatched: Dispatched::At(60_000),
+            delivered: false,
+            outside: false,
+            yielded: false,
+            held,
+        }
+    }
+
+    fn shared(path: &str) -> Shared<String> {
+        Shared {
+            ticket: "DEMO-2".to_owned(),
+            paths: vec![path.to_owned()],
+            resources: Vec::new(),
+            yielded: false,
+        }
+    }
+
+    /// OWL-636: a ticket followed here overlaps a colleague's ticket whose
+    /// claim holds its file; not once it yielded, nor once it no longer
+    /// holds. A ticket not delivered is weighed at its own claim's time: one
+    /// claimed before the colleague's goes on, and is told the overlap,
+    /// where its dispatch time, after that claim, has it wait for the named
+    /// resource both hold.
+    #[test]
+    fn a_ticket_here_overlaps_a_colleagues_claim_while_it_holds() {
+        let demo1 = TicketId::new("DEMO-1").unwrap();
+        let file = colleague(vec![Resource::Zone("app/one.rs".to_owned())]);
+        let none = NamedResources::default();
+        let (unclaimed, claimed) = (BTreeMap::new(), BTreeMap::from([(demo1.clone(), 0)]));
+        let found = |stored: &Stored, against: &InFlight<String>, times, named| {
+            claims_overlaps(&demo1, stored, std::slice::from_ref(against), times, named)
+        };
+        let followed = admitted(Stage::Watch, true);
+        assert_eq!(
+            found(&followed, &file, &unclaimed, &none),
+            [shared("app/one.rs")]
+        );
+        let mut yielded = followed;
+        let at = Timestamp::UNIX_EPOCH;
+        assert!(yielded.record.held.as_mut().unwrap().yield_at(at));
+        assert!(found(&yielded, &file, &unclaimed, &none).is_empty());
+        let ready = admitted(Stage::Ready, true);
+        assert!(found(&ready, &file, &unclaimed, &none).is_empty());
+
+        let named = NamedResources::new([("migrations", "app/**")]).unwrap();
+        let both = colleague(vec![
+            Resource::Zone("app/one.rs".to_owned()),
+            Resource::Named("migrations".to_owned()),
+        ]);
+        let verifying = admitted(Stage::Verify, false);
+        assert!(found(&verifying, &both, &unclaimed, &named).is_empty());
+        assert_eq!(
+            found(&verifying, &both, &claimed, &named),
+            [shared("app/one.rs")]
+        );
     }
 }
