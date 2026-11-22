@@ -24,7 +24,7 @@ pub(super) fn found(findings: &[(&str, &str)]) -> String {
             })
         })
         .collect();
-    json!({ "format": 16, "status": "done", "summary": "Reviewed.", "findings": findings })
+    json!({ "format": 17, "status": "done", "summary": "Reviewed.", "findings": findings })
         .to_string()
 }
 
@@ -41,7 +41,7 @@ pub(super) fn ruled(outcomes: &[&str]) -> String {
             })
         })
         .collect();
-    json!({ "format": 16, "status": "done", "summary": "Ruled.", "rulings": rulings }).to_string()
+    json!({ "format": 17, "status": "done", "summary": "Ruled.", "rulings": rulings }).to_string()
 }
 
 /// A Build's `done` answering the findings to fix of its brief, one per
@@ -53,7 +53,7 @@ pub(super) fn fixed_build(given: &[(&str, &str)]) -> String {
 }
 
 pub(super) const FAILED_REVIEW: &str =
-    r#"{"format":16,"status":"failed","summary":"Could not read the diff."}"#;
+    r#"{"format":17,"status":"failed","summary":"Could not read the diff."}"#;
 
 impl Bench {
     /// A bench whose verify seats play from its reply queue.

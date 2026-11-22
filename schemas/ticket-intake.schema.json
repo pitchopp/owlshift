@@ -16,10 +16,21 @@
     "format": {
       "description": "The format version of this document.",
       "type": "integer",
-      "const": 2
+      "const": 3
     },
     "gesture": {
       "$ref": "#/$defs/Gesture"
+    },
+    "person_only": {
+      "description": "The ticket's words that say a person does all of its work (format 3,\nOWL-619): the ticket was handed back on them. Kept with the record,\nso that a person's re-admission dispatches the ticket with no intake\nthat would hand it back again.",
+      "anyOf": [
+        {
+          "$ref": "#/$defs/PersonOnly"
+        },
+        {
+          "type": "null"
+        }
+      ]
     },
     "resources": {
       "description": "The named resources intake declared (format 2, OWL-402): at most\n[`MAX_DECLARED`].",
@@ -177,6 +188,20 @@
         "ticket",
         "quote",
         "outcome"
+      ]
+    },
+    "PersonOnly": {
+      "description": "What shows a ticket's work is a person's whole (OWL-619): the words of\nthe ticket's title, its description or its decider's comment, copied\nexactly on one line and at most [`MAX_QUOTE_BYTES`].",
+      "type": "object",
+      "properties": {
+        "quote": {
+          "type": "string",
+          "pattern": "\\S"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "quote"
       ]
     },
     "Routing": {

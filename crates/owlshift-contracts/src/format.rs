@@ -68,8 +68,9 @@ pub const BRIEF_FORMAT: u32 = 32;
 /// `deferred` outcomes (OWL-377); format 14 intake's `zones` and
 /// `resources` (OWL-402); format 15 the answer check's chosen `option` on a
 /// verdict (OWL-585); format 16 a plan step's `by` and `when`, and the build
-/// role's `owed` (OWL-619).
-pub const RESULT_FORMAT: u32 = 16;
+/// role's `owed` (OWL-619); format 17 intake's `person_only`, the ticket's
+/// words that say a person does all of it (OWL-619).
+pub const RESULT_FORMAT: u32 = 17;
 /// The format version of an event. Format 2 added the `warning` kind (OWL-134);
 /// the log is append-only, so [`Event::parse`](crate::event::Event::parse)
 /// still reads the format-1 lines already written.
@@ -121,8 +122,14 @@ pub const QUESTIONS_FORMAT: u32 = 19;
 pub const DELIVERY_FORMAT: u32 = 9;
 /// The format version of a ticket's intake record (`intake.json` on a ticket
 /// ref, OWL-245). Format 2 adds the `zones` and `resources` intake declared
-/// (OWL-402); format 1 is still read, as holding the whole repository.
-pub const INTAKE_FORMAT: u32 = 2;
+/// (OWL-402); format 3 intake's `person_only` (OWL-619); format 1 is still
+/// read, as holding the whole repository, and format 2 as a ticket intake
+/// did not read as a person's.
+pub const INTAKE_FORMAT: u32 = 3;
+/// The format version of a ticket's handback (`handback.json` on a ticket
+/// ref, OWL-619): the ticket was handed back to a person, and no gesture
+/// made at or before its time admits it again.
+pub const HANDBACK_FORMAT: u32 = 1;
 /// The format version of a ticket's proposed follow-ups (`proposals.json` on
 /// a ticket ref, OWL-245). Format 2 lets a review loop's run propose
 /// (OWL-300); format 1 is still read.

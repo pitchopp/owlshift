@@ -14,11 +14,14 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::Variant;
-use crate::format::{self, ContractError, Format, INTAKE_FORMAT, PROPOSALS_FORMAT};
+use crate::format::{
+    self, ContractError, Format, HANDBACK_FORMAT, INTAKE_FORMAT, PROPOSALS_FORMAT,
+};
 use crate::ids::{TicketId, check_name, is_lower_hex};
 use crate::refs::PushKind;
 use crate::result::{
-    Followup, MAX_DECLARED, MAX_DEPENDENCIES, Routing, check_declaration, check_dependencies,
+    Followup, MAX_DECLARED, MAX_DEPENDENCIES, PersonOnly, Routing, check_declaration,
+    check_dependencies, check_person_only,
 };
 
 /// The intake record of a ticket: the text intake read, the gesture that
@@ -53,6 +56,12 @@ pub struct TicketIntake {
     #[serde(default)]
     #[schemars(length(max = MAX_DECLARED))]
     pub resources: Vec<String>,
+    /// The ticket's words that say a person does all of its work (format 3,
+    /// OWL-619): the ticket was handed back on them. Kept with the record,
+    /// so that a person's re-admission dispatches the ticket with no intake
+    /// that would hand it back again.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub person_only: Option<PersonOnly>,
 }
 
 /// The admission gesture, read just before the ticket's first intake: the
@@ -129,7 +138,9 @@ impl TicketIntake {
     /// Parses and validates an `intake.json`. A format-1 one, kept before
     /// intake declared zones (OWL-402), is read as the current format with
     /// no zone and no resource: its ticket holds the whole repository until
-    /// intake runs again, after an edit of its text or `owlshift forget`.
+    /// intake runs again, after an edit of its text or `owlshift forget`. A
+    /// format-2 one, kept before intake could read a ticket as a person's
+    /// (OWL-619), is read with no `person_only`.
     pub fn parse(input: &str) -> Result<Self, ContractError> {
         let intake: Self = match Self::from_older_format(input) {
             Some(read) => read?,
@@ -139,18 +150,26 @@ impl TicketIntake {
         Ok(intake)
     }
 
-    /// A format-1 document read as the current format, or `None` for any
-    /// other. Format 1 is format 2 without `zones` and `resources`, which
-    /// are refused in it.
+    /// A format-1 or format-2 document read as the current format, or
+    /// `None` for any other. Format 1 is format 2 without `zones` and
+    /// `resources`, and format 2 is format 3 without `person_only`, each
+    /// refused in the formats before it.
     fn from_older_format(input: &str) -> Option<Result<Self, ContractError>> {
         let mut document: serde_json::Value = serde_json::from_str(input).ok()?;
-        if document.get("format").and_then(serde_json::Value::as_u64) != Some(1) {
+        let format = document.get("format").and_then(serde_json::Value::as_u64)?;
+        if !matches!(format, 1 | 2) {
             return None;
         }
-        if document.get("zones").is_some() || document.get("resources").is_some() {
+        if format == 1 && (document.get("zones").is_some() || document.get("resources").is_some()) {
             return Some(Err(ContractError::invalid(
                 Self::CONTRACT,
                 "format 1 keeps no zones or resources",
+            )));
+        }
+        if document.get("person_only").is_some() {
+            return Some(Err(ContractError::invalid(
+                Self::CONTRACT,
+                "formats before 3 keep no person_only",
             )));
         }
         document["format"] = INTAKE_FORMAT.into();
@@ -192,7 +211,41 @@ impl TicketIntake {
                 .iter()
                 .map(|d| (&d.ticket, d.quote.as_str())),
         )?;
-        check_declaration(Self::CONTRACT, &self.zones, &self.resources)
+        check_declaration(Self::CONTRACT, &self.zones, &self.resources)?;
+        check_person_only(Self::CONTRACT, self.person_only.as_ref())
+    }
+}
+
+/// A ticket handed back to a person (OWL-619; architecture section 4, "A
+/// person's steps", "A ticket with no step for a run"): its intake read in
+/// its own words that a person does all of it, or its design run's plan
+/// held a person's steps alone. The runner posted a HANDBACK comment and
+/// leaves the ticket out of its queue: no admission gesture made at or
+/// before `at` admits it again. Kept until the next dispatch or intake of
+/// the ticket, which only a later gesture or a person's `owlshift do`
+/// starts; `owlshift forget` drops it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+#[schemars(title = "Owlshift ticket handback")]
+pub struct TicketHandback {
+    pub format: Format<HANDBACK_FORMAT>,
+    /// When the ticket was handed back: the runner's time as it kept the
+    /// record, just before the HANDBACK was posted, or the time of the
+    /// admission gesture it held then when that is later, so that a clock
+    /// behind the tracker's never lets that gesture admit the ticket again.
+    pub at: Timestamp,
+}
+
+impl TicketHandback {
+    const CONTRACT: &str = "ticket handback";
+
+    /// Parses a `handback.json`.
+    pub fn parse(input: &str) -> Result<Self, ContractError> {
+        format::parse_json(Self::CONTRACT, HANDBACK_FORMAT, input)
+    }
+
+    pub fn render(&self) -> String {
+        format::render_json(self)
     }
 }
 
@@ -328,7 +381,7 @@ mod tests {
 
     fn intake() -> serde_json::Value {
         json!({
-            "format": 2,
+            "format": 3,
             "text_sha256": "a".repeat(64),
             "gesture": { "kind": "label", "name": "agent", "account": "u-ann", "at": "2026-10-13T08:00:00Z" },
             "variant": "standard",
@@ -351,13 +404,49 @@ mod tests {
         fields.remove("resources");
         let read = TicketIntake::parse(&older.to_string()).unwrap();
         assert!(read.zones.is_empty() && read.resources.is_empty());
-        assert!(read.render().contains("\"format\": 2"), "{}", read.render());
+        assert!(read.render().contains("\"format\": 3"), "{}", read.render());
         older["zones"] = json!(["docs"]);
         let error = TicketIntake::parse(&older.to_string()).unwrap_err();
         assert!(
             error.to_string().contains("format 1 keeps no zones"),
             "{error}"
         );
+    }
+
+    /// OWL-619: a format-2 record is read with no `person_only`, and one
+    /// that holds it is refused; format 3 keeps the quote, whose rules are
+    /// a quote's.
+    #[test]
+    fn a_format_two_intake_record_is_read_as_no_person_s_whole() {
+        let mut older = intake();
+        older["format"] = 2.into();
+        let read = TicketIntake::parse(&older.to_string()).unwrap();
+        assert_eq!((read.person_only, read.zones.len()), (None, 2));
+        older["person_only"] = json!({ "quote": "I will run it on staging myself." });
+        let error = TicketIntake::parse(&older.to_string()).unwrap_err();
+        assert!(error.to_string().contains("keep no person_only"), "{error}");
+
+        let mut current = intake();
+        current["person_only"] = json!({ "quote": "I will run it on staging myself." });
+        let kept = TicketIntake::parse(&current.to_string()).unwrap();
+        assert_eq!(TicketIntake::parse(&kept.render()).unwrap(), kept);
+        current["person_only"]["quote"] = "a\nb".into();
+        let error = TicketIntake::parse(&current.to_string()).unwrap_err();
+        assert!(
+            error.to_string().contains("person_only holds a control"),
+            "{error}"
+        );
+    }
+
+    /// OWL-619: a handback keeps its time alone.
+    #[test]
+    fn a_handback_round_trips_and_refuses_an_unknown_field() {
+        let text = r#"{"format":1,"at":"2026-11-22T10:00:00Z"}"#;
+        let read = TicketHandback::parse(text).unwrap();
+        assert_eq!(TicketHandback::parse(&read.render()).unwrap(), read);
+        let error = TicketHandback::parse(r#"{"format":1,"at":"2026-11-22T10:00:00Z","run":"r"}"#)
+            .unwrap_err();
+        assert!(error.to_string().contains("unknown field"), "{error}");
     }
 
     fn proposals() -> serde_json::Value {
@@ -415,7 +504,7 @@ mod tests {
                 &|d| d["dependencies"][0]["outcome"] = "owed".into(),
                 "unknown variant",
             ),
-            (&|d| d["format"] = 3.into(), "upgrade Owlshift"),
+            (&|d| d["format"] = 4.into(), "upgrade Owlshift"),
             (
                 &|d| d["zones"][1] = "../x".into(),
                 "the zone \"../x\" is not a folder's path",

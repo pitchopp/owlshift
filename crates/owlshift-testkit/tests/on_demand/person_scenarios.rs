@@ -39,17 +39,17 @@ const AFTER_PLAN: &str = r#"{"goal":"Add GREETING.md saying Hello.",
   "by":"person","when":"after_merge"}]}"#;
 
 /// The Build's `done`, the agent's third step left for the second's result.
-const OWING: &str = r#"{"format":16,"status":"done","summary":"Added GREETING.md; step 3 waits on step 2.",
+const OWING: &str = r#"{"format":17,"status":"done","summary":"Added GREETING.md; step 3 waits on step 2.",
 "owed":[3],
 "pr":{"branch":"owlshift/demo-1","title":"Add a greeting","body":"Says hello. Gate: green."}}"#;
 
 /// The run at Watch's `done` after the round: step 3 built with the
 /// results.
-const NOTED: &str = r#"{"format":16,"status":"done","summary":"Noted the staging check in the README.",
+const NOTED: &str = r#"{"format":17,"status":"done","summary":"Noted the staging check in the README.",
 "pr":{"branch":"owlshift/demo-1","title":"Add a greeting","body":"Noted."}}"#;
 
 /// The run at Watch's `done` after a defect reported on step 2.
-const MENDED: &str = r#"{"format":16,"status":"done","summary":"Fixed the greeting's spelling.",
+const MENDED: &str = r#"{"format":17,"status":"done","summary":"Fixed the greeting's spelling.",
 "pr":{"branch":"owlshift/demo-1","title":"Add a greeting","body":"Mended."}}"#;
 
 /// Two minutes later on the bench's clock.
@@ -76,7 +76,7 @@ fn verdicts(answers: &[(&str, Option<&str>, &str)]) -> String {
             verdict
         })
         .collect();
-    json!({ "format": 16, "status": "done", "summary": "Checked.", "verdicts": verdicts })
+    json!({ "format": 17, "status": "done", "summary": "Checked.", "verdicts": verdicts })
         .to_string()
 }
 
@@ -446,7 +446,7 @@ fn the_steps_after_the_merge_are_filed_as_one_follow_up_once_merged() {
 fn a_person_s_step_met_outside_the_plan_is_asked_of_the_decider() {
     let bench = Bench::new(true);
     bench.policy("resolver_delegation = \"all\"");
-    let asked = r#"{"format":16,"status":"questions",
+    let asked = r#"{"format":17,"status":"questions",
 "summary":"Added GREETING.md; its look on staging needs a person.",
 "questions":[{"id":"Q1","category":"person_step",
  "context":"Staging sits behind a login no run holds.",
@@ -492,7 +492,7 @@ fn a_review_loop_build_that_changes_nothing_keeps_what_it_owes() {
         "Does it say Hello?",
         &[],
     )]);
-    let unchanged = r#"{"format":16,"status":"done","summary":"GREETING.md already says Hello: nothing to change; step 3 waits on step 2.",
+    let unchanged = r#"{"format":17,"status":"done","summary":"GREETING.md already says Hello: nothing to change; step 3 waits on step 2.",
 "owed":[3],
 "pr":{"branch":"owlshift/demo-1","title":"Add a greeting","body":"Unchanged."}}"#;
     let (outcome, printed) = bench.continue_ticket(vec![bench.reply(None, Some(unchanged))]);
@@ -501,5 +501,189 @@ fn a_review_loop_build_that_changes_nothing_keeps_what_it_owes() {
     assert_eq!(
         bench.record().plan.unwrap().owed,
         [NonZeroU32::new(3).unwrap()]
+    );
+}
+
+/// A plan of a person's steps alone: one due before the merge, one after.
+const PERSON_ONLY_PLAN: &str = r#"{"goal":"Check the greeting on staging.",
+"criteria":["The greeting reads well on staging."],
+"approach":"A person reads the deployed greeting; nothing in the repository changes.",
+"steps":[
+ {"what":"Open GREETING.md on staging in a browser, which no run can reach.",
+  "test":"It reads Hello.","by":"person","when":"before_merge"},
+ {"what":"Tell the team on staging the greeting is live.","test":"They saw it.",
+  "by":"person","when":"after_merge"}]}"#;
+
+/// The HANDBACK comments on DEMO-1, oldest first.
+fn handbacks(bench: &Bench) -> Vec<String> {
+    bench
+        .comments()
+        .into_iter()
+        .filter(|body| body.starts_with("[owlshift] HANDBACK"))
+        .collect()
+}
+
+/// OWL-619's third part, its first trigger: a standard ticket whose design
+/// run plans a person's steps alone is handed back right after that run,
+/// with no Design review, arbiter or Build run. The ref is at Ready with its
+/// handback and the plan; one HANDBACK comment lists both steps and the
+/// gesture that gives the ticket back; the ticket shows parked, which
+/// notifies as a park does. `continue` then refuses it and moves nothing
+/// back to the ready column.
+#[test]
+fn a_plan_of_a_person_s_steps_alone_is_handed_back_with_no_build() {
+    let bench = Bench::parking();
+    bench.add_labels(&["variant:standard"]);
+    let (outcome, printed) = bench.run(vec![bench.read(&designed(PERSON_ONLY_PLAN))], None);
+    let stop = outcome.unwrap_err();
+    assert!(
+        matches!(&stop, Stop::HandedBack { unposted: None, .. }),
+        "{stop}\n{printed}"
+    );
+    assert_eq!(
+        owlshift_runner::notify::blocker_line(&ticket(), &stop).as_deref(),
+        Some("DEMO-1 was handed back: its work is a person's")
+    );
+    assert_eq!(bench.roles(), [Role::Design]);
+    let record = bench.record();
+    assert_eq!(state_of(&bench).status(), Status::Active(Stage::Ready));
+    assert!(record.handback.is_some());
+    assert!(!record.plan.unwrap().plan.has_agent_step());
+    let handbacks = handbacks(&bench);
+    assert_eq!(handbacks.len(), 1, "{handbacks:?}");
+    for part in [
+        "Every step of the plan its design run wrote is a person's",
+        "- **Step 1, before the merge, a person's:** Open GREETING.md on staging in a browser, \
+         which no run can reach. Result to report: It reads Hello.",
+        "- **Step 2, after the merge, a person's:** Tell the team",
+        "or run `owlshift do DEMO-1`",
+    ] {
+        assert!(handbacks[0].contains(part), "{part}\n{}", handbacks[0]);
+    }
+    assert_eq!(bench.stage(), "Parked");
+    assert_eq!(
+        bench.stage_events(EventKind::TrackerWrite),
+        ["In Progress", "Parked"]
+    );
+
+    let (again, printed) = bench.continue_ticket(Vec::new());
+    assert!(
+        matches!(&again, Err(Stop::Refused(why)) if why.contains("was handed back to a person")),
+        "{again:?}\n{printed}"
+    );
+    assert_eq!(bench.stage(), "Parked");
+    assert_eq!(bench.roles(), [Role::Design]);
+}
+
+/// An intake `done` that reads DEMO-1 as a person's work whole, in the words
+/// of its description.
+fn person_only_intake(quote: &str) -> String {
+    let mut result: Value = serde_json::from_str(&intake_result("done", None, "")).unwrap();
+    result["intake"]["variant"] = json!("standard");
+    result["intake"]["person_only"] = json!({ "quote": quote });
+    result.to_string()
+}
+
+/// OWL-619's third part under `watch --drain`, its second trigger and the
+/// way back: intake reads DEMO-1, labelled `agent`, as a person's work
+/// whole in its description's words. It is handed back with no Design run:
+/// its record kept with the quote, a HANDBACK comment and no INTAKE one,
+/// the ticket shown parked, out of the column. A person moves it back to
+/// the ready column, its label left as it was put on before the HANDBACK:
+/// the drain dispatches nothing and warns once that the gesture was made
+/// before the handback, naming the gesture to make again. The label put on
+/// again after the HANDBACK admits it: the next pass dispatches it to
+/// Design, the handback dropped and the record naming that gesture. No
+/// write of the runner ever moved the ticket to the ready column.
+#[test]
+fn a_ticket_intake_reads_as_a_person_s_is_handed_back_and_admitted_again_after() {
+    let bench = Bench::draining("maintainer");
+    let quote = "I will check the banner on staging myself.";
+    bench.describe(quote);
+    let at = |time: &str| -> Timestamp { time.parse().unwrap() };
+    // The label, put on before anything ran, after the text's last edit.
+    bench.edits.borrow_mut().push((
+        ticket(),
+        at("2026-10-01T08:00:00Z"),
+        at("2026-10-01T07:00:00Z"),
+    ));
+    let replies = vec![
+        bench.reply(None, Some(&person_only_intake(quote))),
+        bench.read(&designed(PERSON_PLAN)),
+    ];
+    let handed_back = Cell::new(None);
+    let (outcomes, lines, printed) = bench.drain_passes(replies, 3, |pass, _| {
+        match pass {
+            1 => {
+                // Handed back: no Design run, the record kept, parked.
+                assert_eq!(bench.roles(), [Role::Intake]);
+                assert_eq!(state_of(&bench).status(), Status::Active(Stage::Ready));
+                let record = bench.record();
+                let kept = record.intake.unwrap().person_only.unwrap();
+                assert_eq!(kept.quote, quote);
+                handed_back.set(record.handback.map(|handback| handback.at));
+                assert_eq!(bench.stage(), "Parked");
+                // A person moves it back to the column, the label as it was.
+                move_ticket(&bench, "Todo");
+            }
+            2 => {
+                // Nothing taken in or dispatched; then the label put on
+                // again after the HANDBACK, once the hold is over.
+                assert_eq!(bench.roles(), [Role::Intake]);
+                let again = handed_back.get().unwrap() + SignedDuration::from_mins(5);
+                bench.edits.borrow_mut()[0].1 = again;
+            }
+            _ => {}
+        }
+        let later = bench.clock.get().checked_add(SignedDuration::from_mins(11));
+        bench.clock.set(later.unwrap());
+    });
+    let report = format!("{outcomes:?}\n{lines}\n{printed}");
+    assert!(
+        matches!(&outcomes[0], Err(Stop::HandedBack { unposted: None, .. })),
+        "{report}"
+    );
+    // Dispatched once the label was put on again: its first stage, Design.
+    assert_eq!(bench.roles(), [Role::Intake, Role::Design], "{report}");
+    let record = bench.record();
+    assert_eq!(record.handback, None);
+    let again = handed_back.get().unwrap() + SignedDuration::from_mins(5);
+    assert_eq!(record.intake.unwrap().gesture.at, again);
+
+    let comments = bench.comments();
+    assert!(
+        !comments.iter().any(|c| c.starts_with("[owlshift] INTAKE")),
+        "{comments:?}"
+    );
+    let handbacks = handbacks(&bench);
+    assert_eq!(handbacks.len(), 1, "{handbacks:?}");
+    for part in [
+        format!("Intake read it so in the ticket's own words: `{quote}`"),
+        "take the label `agent` off and put it on again after this comment".to_owned(),
+    ] {
+        assert!(handbacks[0].contains(&part), "{part}\n{}", handbacks[0]);
+    }
+    // One warning for the gesture made before the handback.
+    let warned: Vec<String> = bench
+        .events()
+        .iter()
+        .filter(|e| e.kind == EventKind::Warning && e.data["what"] == json!("not_admitted"))
+        .map(|e| e.data["reason"].as_str().unwrap().to_owned())
+        .collect();
+    assert_eq!(warned.len(), 1, "{report}");
+    for part in [
+        "DEMO-1 was handed back to a person at",
+        "its admission gesture \"agent\" at 2026-10-01T08:00:00Z was made before",
+        "take the label `agent` off and put it on again",
+    ] {
+        assert!(warned[0].contains(part), "{part}\n{}", warned[0]);
+    }
+    // The runner moved the ticket to parked, then to working at its
+    // dispatch: never to the ready column, the one move a state gesture
+    // could read as an admission.
+    assert_eq!(
+        bench.stage_events(EventKind::TrackerWrite),
+        ["Parked", "In Progress"],
+        "{report}"
     );
 }

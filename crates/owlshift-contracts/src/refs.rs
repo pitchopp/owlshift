@@ -78,6 +78,9 @@ pub const SESSION_FILE: &str = "session.json";
 /// What the ticket holds against the project's other tickets, in a ticket
 /// ref's tree from its dispatch (OWL-403, [`TicketHeld`]).
 pub const HELD_FILE: &str = "held.json";
+/// The ticket's handback, in a ticket ref's tree while the ticket is handed
+/// back to a person (OWL-619, [`crate::drain::TicketHandback`]).
+pub const HANDBACK_FILE: &str = "handback.json";
 
 /// The claim ref of a ticket: `refs/owlshift/claims/<ticket>`.
 pub fn claim_ref(ticket: &TicketId) -> String {

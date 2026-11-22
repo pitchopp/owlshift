@@ -389,6 +389,7 @@ pub fn end(stepped: &Stepped) -> StepEnd {
         | Stop::CounterQuestion { .. }
         | Stop::CheckFailed { .. }
         | Stop::Parked { .. }
+        | Stop::HandedBack { .. }
         | Stop::Ready { .. }
         // Its ticket ref as it was, watch tries it again after its retry
         // delay (OWL-480).

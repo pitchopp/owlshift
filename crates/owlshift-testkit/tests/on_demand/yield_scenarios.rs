@@ -12,10 +12,10 @@ use super::*;
 
 /// A Build that stops for a person, which parks its ticket.
 const BLOCKED: &str =
-    r#"{"format":16,"status":"blocked","summary":"The migration needs a person's decision."}"#;
+    r#"{"format":17,"status":"blocked","summary":"The migration needs a person's decision."}"#;
 
 /// A yielded Build's rebase run's `done`.
-const REBASED_YIELDED: &str = r#"{"format":16,"status":"done","summary":"Rebased onto the taker's merge; nothing conflicted."}"#;
+const REBASED_YIELDED: &str = r#"{"format":17,"status":"done","summary":"Rebased onto the taker's merge; nothing conflicted."}"#;
 
 /// A bench whose project's `[policy]` is given `policy`, and whose DEMO-1's
 /// ref keeps an intake record declaring `zone`, a trivial ticket, which its

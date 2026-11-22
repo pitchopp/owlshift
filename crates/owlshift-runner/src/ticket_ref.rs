@@ -13,7 +13,9 @@
 //! ([`SESSION_FILE`], OWL-394, which [`Progress`] leaves out too and
 //! [`forget`] drops); from its dispatch, what it holds against the
 //! project's other tickets ([`HELD_FILE`], OWL-403, which [`Progress`] leaves
-//! out and [`forget`] drops); and once a run proposed a follow-up, the
+//! out and [`forget`] drops); while the ticket is handed back to a person,
+//! when ([`HANDBACK_FILE`], OWL-619, which [`forget`] drops); and once a run
+//! proposed a follow-up, the
 //! proposals and what became of them ([`PROPOSALS_FILE`], OWL-253), which no
 //! write drops but [`forget`]'s of an invalid one.
 //!
@@ -44,14 +46,14 @@ use std::path::Path;
 
 use sha2::{Digest, Sha256};
 
-use owlshift_contracts::drain::{TicketIntake, TicketProposals};
+use owlshift_contracts::drain::{TicketHandback, TicketIntake, TicketProposals};
 use owlshift_contracts::format::ContractError;
 use owlshift_contracts::ids::TicketId;
 use owlshift_contracts::refs::{
-    Ask, CLAIM_FILE, COST_FILE, Claim, DELIVERY_FILE, HELD_FILE, INTAKE_FILE, MAX_CLAIM_BYTES,
-    PLAN_FILE, PROPOSALS_FILE, PersistedState, QUESTIONS_FILE, REVIEW_FILE, SESSION_FILE,
-    STATE_FILE, TICKETS_PREFIX, TicketCost, TicketDelivery, TicketHeld, TicketQuestions,
-    TicketSession, Waiting, ticket_ref,
+    Ask, CLAIM_FILE, COST_FILE, Claim, DELIVERY_FILE, HANDBACK_FILE, HELD_FILE, INTAKE_FILE,
+    MAX_CLAIM_BYTES, PLAN_FILE, PROPOSALS_FILE, PersistedState, QUESTIONS_FILE, REVIEW_FILE,
+    SESSION_FILE, STATE_FILE, TICKETS_PREFIX, TicketCost, TicketDelivery, TicketHeld,
+    TicketQuestions, TicketSession, Waiting, ticket_ref,
 };
 use owlshift_contracts::review::{TicketPlan, TicketReview};
 use owlshift_core::state::{Status, TicketState};
@@ -94,6 +96,10 @@ pub struct TicketRecord {
     /// dispatch: `None` when the tree holds no [`HELD_FILE`] (OWL-403), as
     /// for a ticket dispatched before it was kept.
     pub held: Option<TicketHeld>,
+    /// When the ticket was handed back to a person, while it is (OWL-619):
+    /// `None` when the tree holds no [`HANDBACK_FILE`]. No admission
+    /// gesture made at or before it admits the ticket again.
+    pub handback: Option<TicketHandback>,
 }
 
 impl TicketRecord {
@@ -202,6 +208,7 @@ pub fn progress(record: &TicketRecord, proposals: Option<&TicketProposals>) -> P
         (PLAN_FILE, record.plan.as_ref().map(|p| p.render())),
         (REVIEW_FILE, record.review.as_ref().map(|r| r.render())),
         (PROPOSALS_FILE, proposals.map(|p| p.render())),
+        (HANDBACK_FILE, record.handback.as_ref().map(|h| h.render())),
     ];
     let mut hash = Sha256::new();
     for (name, text) in files {
@@ -250,9 +257,9 @@ pub enum ProposalsFile<'a> {
 /// that does not parse, or asks that do not match the state (a ticket
 /// waiting for answers to a round the asks do not end with) is an error.
 /// [`DELIVERY_FILE`], [`INTAKE_FILE`], [`PLAN_FILE`], [`REVIEW_FILE`],
-/// [`COST_FILE`], [`SESSION_FILE`], [`HELD_FILE`] and [`PROPOSALS_FILE`] are optional, checked like the two
-/// others when present.
-/// Other entries of the tree are left alone.
+/// [`COST_FILE`], [`SESSION_FILE`], [`HELD_FILE`], [`HANDBACK_FILE`] and
+/// [`PROPOSALS_FILE`] are optional, checked like the two others when
+/// present. Other entries of the tree are left alone.
 pub fn read(git: &Git, checkout: &Path, ticket: &TicketId) -> Result<Option<Stored>, String> {
     let name = ticket_ref(ticket);
     let Some(listed) = listed(git, checkout, &name)? else {
@@ -545,6 +552,7 @@ fn wanted(entries: &[Entry]) -> Vec<&'static str> {
         COST_FILE,
         SESSION_FILE,
         HELD_FILE,
+        HANDBACK_FILE,
         PROPOSALS_FILE,
     ]
     .into_iter()
@@ -643,6 +651,15 @@ fn parse_record(
     } else {
         None
     };
+    let handback = if has(HANDBACK_FILE) {
+        let text = next(HANDBACK_FILE)?;
+        Some(
+            TicketHandback::parse(&text)
+                .map_err(|e| broken(format!("holds an invalid {HANDBACK_FILE}: {e}")))?,
+        )
+    } else {
+        None
+    };
     let proposals = if has(PROPOSALS_FILE) {
         let text = next(PROPOSALS_FILE)?;
         Some(
@@ -664,6 +681,7 @@ fn parse_record(
             cost,
             session,
             held,
+            handback,
         },
         commit: commit.to_owned(),
         proposals,
@@ -1483,8 +1501,8 @@ pub fn history(
 /// it did not exist: the ref moves only from there, and the new commit has
 /// it as its parent and keeps every other entry of its tree but
 /// [`DELIVERY_FILE`], [`INTAKE_FILE`], [`PLAN_FILE`], [`REVIEW_FILE`],
-/// [`COST_FILE`], [`SESSION_FILE`] and [`HELD_FILE`], each written when the
-/// record has it and left out when it has none.
+/// [`COST_FILE`], [`SESSION_FILE`], [`HELD_FILE`] and [`HANDBACK_FILE`],
+/// each written when the record has it and left out when it has none.
 /// [`PROPOSALS_FILE`] is kept as it is:
 /// [`write_proposals`] writes it.
 ///
@@ -1562,6 +1580,9 @@ pub fn write_proposals_guarded(
     if let Some(held) = &record.held {
         files.push((HELD_FILE, held.render()));
     }
+    if let Some(handback) = &record.handback {
+        files.push((HANDBACK_FILE, handback.render()));
+    }
     if let ProposalsFile::Write(proposals) = proposals {
         files.push((PROPOSALS_FILE, proposals.render()));
     }
@@ -1597,6 +1618,7 @@ pub fn write_proposals_guarded(
                     COST_FILE,
                     SESSION_FILE,
                     HELD_FILE,
+                    HANDBACK_FILE,
                 ]
                 .contains(&entry.name.as_str())
             {
@@ -1682,7 +1704,8 @@ pub enum Previous {
 /// `intake.json`: the drain runs intake again (OWL-245). So do `plan.json`
 /// and `review.json`: the next dispatch designs anew (OWL-303). So does
 /// `held.json` (OWL-403): a ticket at Ready holds nothing, and its next
-/// dispatch writes what it holds afresh. `cost.json`
+/// dispatch writes what it holds afresh. So does `handback.json` (OWL-619):
+/// forgetting is a person's act on the ticket. `cost.json`
 /// stays when it reads (OWL-378): the runs were paid for, and a ticket past
 /// its budget still parks at its next run, until a person's `owlshift
 /// continue` counts the budget afresh. The asks, their verdicts, what
@@ -1796,6 +1819,7 @@ fn kept(
         cost,
         session: None,
         held: None,
+        handback: None,
     })
 }
 

@@ -54,7 +54,7 @@
     "format": {
       "description": "The format version of this document.",
       "type": "integer",
-      "const": 16
+      "const": 17
     },
     "intake": {
       "description": "The intake role's record (format 8, OWL-245): required from it when\nit ends `done` or `questions`, refused with any other status and from\nany other role.",
@@ -743,6 +743,17 @@
           },
           "maxItems": 64
         },
+        "person_only": {
+          "description": "The ticket's own words that say a person does all of its work\n(format 17, OWL-619; architecture section 4, \"A person's steps\"):\nthe runner hands the ticket back to a person instead of designing\nit. Given with `done` only; the rest of the record still holds,\nfollowed if a person admits the ticket again.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/PersonOnly"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "resources": {
           "description": "The named resources the ticket will touch, from those the brief's\n`named_resources` lists (format 14, OWL-402): at most\n[`MAX_DECLARED`].",
           "type": "array",
@@ -772,6 +783,20 @@
       "required": [
         "variant",
         "routing"
+      ]
+    },
+    "PersonOnly": {
+      "description": "What shows a ticket's work is a person's whole (OWL-619): the words of\nthe ticket's title, its description or its decider's comment, copied\nexactly on one line and at most [`MAX_QUOTE_BYTES`].",
+      "type": "object",
+      "properties": {
+        "quote": {
+          "type": "string",
+          "pattern": "\\S"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "quote"
       ]
     },
     "Plan": {

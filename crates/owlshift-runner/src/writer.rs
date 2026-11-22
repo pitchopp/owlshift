@@ -335,6 +335,25 @@ pub struct ReleasedComment {
     pub branch: Option<String>,
 }
 
+/// The gesture by which a person admits a ticket again once it left the
+/// ready column, `ready` its state, in words a comment ends a sentence with
+/// (OWL-588, OWL-619): `admit`, the project's gesture, made anew, so that
+/// its time and account are the person's.
+pub fn readmit_words(admit: &Admit, ready: &str) -> String {
+    match admit {
+        Admit::Label(label) => format!(
+            "move it back to {} and take the label {} off and put it on again",
+            code(ready),
+            code(label)
+        ),
+        Admit::State(_) => format!("move it back to {}", code(ready)),
+        Admit::Delegation => format!(
+            "move it back to {} and delegate it to Owlshift again",
+            code(ready)
+        ),
+    }
+}
+
 /// `operator` as a comment shows it: as code when it holds only letters,
 /// digits and `.`, `_`, `@`, `+`, `-`, 64 at most, which a handle and every
 /// tracker's account identifier do; otherwise not shown, since a claim's
@@ -381,18 +400,7 @@ impl ReleasedComment {
         } else {
             format!("which held it until {held}")
         };
-        let again = match &self.admit {
-            Admit::Label(label) => format!(
-                "move it back to {} and take the label {} off and put it on again",
-                code(&self.ready),
-                code(label)
-            ),
-            Admit::State(_) => format!("move it back to {}", code(&self.ready)),
-            Admit::Delegation => format!(
-                "move it back to {} and delegate it to Owlshift again",
-                code(&self.ready)
-            ),
-        };
+        let again = readmit_words(&self.admit, &self.ready);
         let mut all = vec![
             header.render(),
             format!(
@@ -2714,6 +2722,84 @@ impl IntakeComment {
             .render(),
         );
         sections.join("\n\n")
+    }
+}
+
+/// What a HANDBACK comment says the ticket's run read (OWL-619).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum HandbackRead {
+    /// Intake read in the ticket's own words that a person does all of it.
+    Intake { quote: String },
+    /// The design run's plan holds a person's steps alone, each with its
+    /// place and when it is due.
+    Design { steps: Vec<OwedStep> },
+}
+
+/// The most steps of a person's plan a HANDBACK comment lists: a plan of
+/// 64 KiB may hold many short steps, and each line takes up to two of
+/// [`OWED_TEXT_CHARS`].
+const HANDBACK_STEPS: usize = 40;
+
+/// The HANDBACK comment (OWL-619; architecture section 4, "A person's
+/// steps", "A ticket with no step for a run"): the ticket's work is a
+/// person's whole. It says what the run read, the ticket's words or the
+/// plan's person's steps, that Owlshift runs nothing more on the ticket,
+/// and the gesture that gives it back. Text from the ticket or a plan comes
+/// through a model: a quote is flattened into a code span, as the INTAKE
+/// comment's are, and a step's line is flattened and clipped, as the
+/// DELIVERY report's "For a person" lines are.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HandbackComment {
+    pub ticket: TicketId,
+    pub read: HandbackRead,
+    /// The gesture that admits the ticket again ([`readmit_words`]).
+    pub readmit: String,
+    /// The run that found it.
+    pub run: Option<String>,
+}
+
+impl HandbackComment {
+    pub fn render(&self) -> String {
+        let header = Header {
+            kind: MarkerKind::Handback,
+            round: None,
+        };
+        let read = match &self.read {
+            HandbackRead::Intake { quote } => format!(
+                "**A person's work whole.** Intake read it so in the ticket's own words: {}",
+                code(&flatten(quote))
+            ),
+            HandbackRead::Design { steps } => {
+                let mut lines: Vec<String> =
+                    steps.iter().take(HANDBACK_STEPS).map(owed_line).collect();
+                if steps.len() > HANDBACK_STEPS {
+                    lines.push(format!(
+                        "and {} more steps, each a person's",
+                        steps.len() - HANDBACK_STEPS
+                    ));
+                }
+                format!(
+                    "**A person's work whole.** Every step of the plan its design run wrote is a \
+                     person's:\n\n{}",
+                    bullets(&lines)
+                )
+            }
+        };
+        let ticket = &self.ticket;
+        let back = format!(
+            "Owlshift runs nothing more on {ticket} and leaves it out of its queue. **To give it \
+             back to Owlshift,** {} after this comment, or run `owlshift do {ticket}`. Its next run \
+             reads this thread: say there what a run can do.",
+            self.readmit
+        );
+        let footer = Footer {
+            format: Format,
+            kind: MarkerKind::Handback,
+            ticket: ticket.clone(),
+            round: None,
+            run: self.run.clone(),
+        };
+        [header.render(), read, back, footer.render()].join("\n\n")
     }
 }
 
@@ -5133,6 +5219,12 @@ impl<'a> Writer<'a> {
         self.post(&comment.ticket, &comment.render())
     }
 
+    /// Posts a HANDBACK comment and returns it as the tracker recorded it
+    /// (OWL-619).
+    pub fn post_handback(&self, comment: &HandbackComment) -> Result<Comment, WriteError> {
+        self.post(&comment.ticket, &comment.render())
+    }
+
     /// Posts the WAITING comment of a ticket a quarantine holds up and
     /// returns it as the tracker recorded it (OWL-368).
     pub fn post_quarantine_wait(
@@ -5598,6 +5690,56 @@ mod tests {
             merge_held: None,
             person_steps: Vec::new(),
         }
+    }
+
+    /// OWL-619: a HANDBACK says what the run read, the ticket's words in a
+    /// code span on one line or each person's step of the plan, up to its
+    /// bound, and the gesture that gives the ticket back; it parses as a
+    /// marked comment of its kind, with its run.
+    #[test]
+    fn a_handback_says_what_was_read_and_how_to_give_the_ticket_back() {
+        use owlshift_contracts::review::PlanStep;
+        let ticket = TicketId::new("OWL-7").unwrap();
+        let readmit = readmit_words(&Admit::Label("agent".to_owned()), "Todo");
+        let handback = |read: HandbackRead| {
+            HandbackComment {
+                ticket: ticket.clone(),
+                read,
+                readmit: readmit.clone(),
+                run: Some("r1".to_owned()),
+            }
+            .render()
+        };
+        let quoted = handback(HandbackRead::Intake {
+            quote: "I do it\n@bob on `staging`".to_owned(),
+        });
+        assert!(
+            quoted.contains("own words: `I do it @bob on 'staging'`")
+                && quoted.contains(
+                    "move it back to `Todo` and take the label `agent` off and put it on again \
+                     after this comment, or run `owlshift do OWL-7`"
+                ),
+            "{quoted}"
+        );
+        let marked = MarkedComment::parse(&quoted).unwrap().unwrap();
+        assert_eq!(marked.header.kind, MarkerKind::Handback);
+        assert_eq!(marked.footer.unwrap().run.as_deref(), Some("r1"));
+        let step = |n: u32| OwedStep {
+            number: NonZeroU32::new(n).unwrap(),
+            step: PlanStep::person("Open it\non staging.", "It greets.", StepWhen::BeforeMerge),
+            when: StepWhen::BeforeMerge,
+        };
+        let listed = handback(HandbackRead::Design {
+            steps: (1..=HANDBACK_STEPS as u32 + 2).map(step).collect(),
+        });
+        assert!(
+            listed.contains(
+                "- **Step 1, before the merge, a person's:** Open it on staging. Result to \
+                 report: It greets."
+            ) && listed.contains("- and 2 more steps, each a person's")
+                && !listed.contains(&format!("**Step {},", HANDBACK_STEPS + 1)),
+            "{listed}"
+        );
     }
 
     /// OWL-619: the steps a ticket owes a person follow the agent's text in
@@ -10118,6 +10260,16 @@ Reply `Q1: B`, `ok` to take every recommendation, or in your own words.
                 yields: None,
             }))
         }),
+        ("post_handback", |w, _| {
+            came(w.post_handback(&HandbackComment {
+                ticket: ticket(),
+                read: HandbackRead::Intake {
+                    quote: "q".to_owned(),
+                },
+                readmit: String::new(),
+                run: None,
+            }))
+        }),
         ("post_quarantine_wait", |w, _| {
             came(w.post_quarantine_wait(&crate::quarantine::QuarantineWait {
                 ticket: ticket(),
@@ -10144,7 +10296,7 @@ Reply `Q1: B`, `ok` to take every recommendation, or in your own words.
     /// `fold`, which is never an error, says so in its one failure.
     #[test]
     fn a_ui_writer_refuses_every_other_write() {
-        assert_eq!(UI_REFUSED_WRITES.len(), 30);
+        assert_eq!(UI_REFUSED_WRITES.len(), 31);
         for (name, write) in UI_REFUSED_WRITES {
             let tracker = Counting::default();
             tracker.accepts_posts.set(true);

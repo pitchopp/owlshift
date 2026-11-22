@@ -152,7 +152,16 @@ impl OnDemand<'_> {
             return None;
         }
         match self.drain_checks(&p) {
-            Some(Ok(_)) => {}
+            // A handed-back ticket's record names the gesture that admitted
+            // it again, made after the handback (OWL-619): the dispatch's
+            // write keeps it.
+            Some(Ok(gesture)) => {
+                if p.handback.is_some()
+                    && let Some(record) = p.intake.as_mut()
+                {
+                    record.gesture = gesture;
+                }
+            }
             Some(Err(taken)) => return Some(DispatchSeen::Taken(taken)),
             None => return None,
         }

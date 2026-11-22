@@ -271,7 +271,7 @@ fn result_rejections() {
     rejects(
         "newer format with unknown fields",
         parse(|v| {
-            v["format"] = json!(17);
+            v["format"] = json!(18);
             v["confidence"] = json!(0.9);
         }),
         "upgrade Owlshift",
@@ -330,20 +330,20 @@ fn result_rejections() {
     );
     rejects(
         "truncated document",
-        RunResult::parse(r#"{"format": 17, "status""#),
+        RunResult::parse(r#"{"format": 18, "status""#),
         "upgrade Owlshift",
     );
     rejects(
         "truncated document",
-        RunResult::parse(r#"{"format": 16, "status""#),
+        RunResult::parse(r#"{"format": 17, "status""#),
         "EOF",
     );
-    let newer = edited("result-sample.json", |v| v["format"] = json!(17));
+    let newer = edited("result-sample.json", |v| v["format"] = json!(18));
     assert!(matches!(
         RunResult::parse(&newer),
         Err(ContractError::NewerFormat {
-            found: 17,
-            supported: 16,
+            found: 18,
+            supported: 17,
             ..
         })
     ));
@@ -720,6 +720,26 @@ fn intake_comes_from_the_intake_role_only() {
         "an unknown effort",
         result(|v| v["intake"]["routing"]["effort"] = json!("minimal")),
         "unknown variant `minimal`",
+    );
+    // OWL-619: the ticket's words that its work is a person's whole, with
+    // `done` only, and a quote's rules.
+    let whole =
+        result(|v| v["intake"]["person_only"] = json!({ "quote": "I do it on staging." })).unwrap();
+    whole.validate_against(&intake).unwrap();
+    assert!(whole.intake.unwrap().person_only.is_some());
+    rejects(
+        "person_only with questions",
+        result(|v| {
+            v["intake"]["person_only"] = json!({ "quote": "I do it on staging." });
+            v["status"] = json!("questions");
+            v["questions"] = json!([{ "id": "Q1", "category": "scope", "context": "c", "text": "t", "recommendation": { "why": "r" } }]);
+        }),
+        "person_only is given but status is not done",
+    );
+    rejects(
+        "a blank person_only quote",
+        result(|v| v["intake"]["person_only"] = json!({ "quote": " " })),
+        "the quote of person_only is blank",
     );
     // OWL-402: zones are folders, resources the brief's names.
     rejects(
@@ -4026,7 +4046,7 @@ fn a_malformed_followup_keeps_the_result() {
     };
     let failed = |followups: Value| {
         json!({
-            "format": 16,
+            "format": 17,
             "status": "failed",
             "summary": "On 8a681af, the gate fails: 5 tests of the leases module fail on the base too.",
             "followups": followups,

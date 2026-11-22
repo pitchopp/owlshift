@@ -119,6 +119,7 @@ fn record(state: &str, round: u32) -> TicketRecord {
         cost: None,
         session: None,
         held: None,
+        handback: None,
     }
 }
 
@@ -438,6 +439,7 @@ fn record_of(len: usize) -> TicketRecord {
             cost: None,
             session: None,
             held: None,
+            handback: None,
         }
     };
     let base = with(1).questions.render().len();
@@ -461,7 +463,7 @@ fn a_maximal_round_with_its_re_asks_fits_the_read_cap() {
         .map(|n| json!({ "id": format!("Q{n}"), "category": "scope", "context": context, "text": "t", "recommendation": { "why": "r" } }))
         .collect();
     let result =
-        json!({ "format": 16, "status": "questions", "summary": "s", "questions": questions });
+        json!({ "format": 17, "status": "questions", "summary": "s", "questions": questions });
     RunResult::parse(&result.to_string()).expect("the round is within the bound");
 
     let ask = |kind: &str, n: u32| {
@@ -553,6 +555,7 @@ fn kept_everything() -> TicketRecord {
         cost: Some(ticket_cost()),
         session: Some(ticket_session()),
         held: Some(ticket_held()),
+        handback: None,
     }
 }
 
@@ -587,6 +590,7 @@ fn forgotten(round: u32, questions: &TicketQuestions, cost: Option<TicketCost>) 
         cost,
         session: None,
         held: None,
+        handback: None,
     }
 }
 

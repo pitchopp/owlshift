@@ -212,6 +212,39 @@ pub struct IntakeVerdict {
     #[serde(default)]
     #[schemars(length(max = MAX_DECLARED))]
     pub resources: Vec<String>,
+    /// The ticket's own words that say a person does all of its work
+    /// (format 17, OWL-619; architecture section 4, "A person's steps"):
+    /// the runner hands the ticket back to a person instead of designing
+    /// it. Given with `done` only; the rest of the record still holds,
+    /// followed if a person admits the ticket again.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub person_only: Option<PersonOnly>,
+}
+
+/// What shows a ticket's work is a person's whole (OWL-619): the words of
+/// the ticket's title, its description or its decider's comment, copied
+/// exactly on one line and at most [`MAX_QUOTE_BYTES`].
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct PersonOnly {
+    #[schemars(regex(pattern = r"\S"))]
+    pub quote: String,
+}
+
+/// The rules of a [`PersonOnly`] quote, in `result.json` and in
+/// `intake.json` alike: a quote's (not blank, on one line, at most
+/// [`MAX_QUOTE_BYTES`]).
+pub(crate) fn check_person_only(
+    contract: &'static str,
+    person_only: Option<&PersonOnly>,
+) -> Result<(), ContractError> {
+    match person_only.map(|p| check_quote(&p.quote, "say the work is a person's")) {
+        Some(Err(broken)) => Err(ContractError::invalid(
+            contract,
+            format!("the quote of person_only {broken}"),
+        )),
+        _ => Ok(()),
+    }
 }
 
 /// The most zones, and the most named resources, one intake record declares
@@ -873,6 +906,15 @@ impl RunResult {
                     .map(|d| (&d.ticket, d.quote.as_str())),
             )?;
             check_declaration(CONTRACT, &intake.zones, &intake.resources)?;
+            check_person_only(CONTRACT, intake.person_only.as_ref())?;
+            // A reading that the work is a person's whole ends the intake:
+            // nothing is left to ask (OWL-619).
+            if intake.person_only.is_some() && self.status != Status::Done {
+                return Err(ContractError::invalid(
+                    CONTRACT,
+                    "intake's person_only is given but status is not done",
+                ));
+            }
         }
         self.check_quality_pipeline()?;
         check_verdicts(CONTRACT, &self.verdicts)?;

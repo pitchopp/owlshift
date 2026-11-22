@@ -1,0 +1,23 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Owlshift ticket handback",
+  "description": "A ticket handed back to a person (OWL-619; architecture section 4, \"A\nperson's steps\", \"A ticket with no step for a run\"): its intake read in\nits own words that a person does all of it, or its design run's plan\nheld a person's steps alone. The runner posted a HANDBACK comment and\nleaves the ticket out of its queue: no admission gesture made at or\nbefore `at` admits it again. Kept until the next dispatch or intake of\nthe ticket, which only a later gesture or a person's `owlshift do`\nstarts; `owlshift forget` drops it.",
+  "type": "object",
+  "properties": {
+    "at": {
+      "description": "When the ticket was handed back: the runner's time as it kept the\nrecord, just before the HANDBACK was posted, or the time of the\nadmission gesture it held then when that is later, so that a clock\nbehind the tracker's never lets that gesture admit the ticket again.",
+      "type": "string",
+      "format": "date-time"
+    },
+    "format": {
+      "description": "The format version of this document.",
+      "type": "integer",
+      "const": 1
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "format",
+    "at"
+  ]
+}
