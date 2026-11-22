@@ -22,7 +22,7 @@ use super::*;
 
 /// Another runner of the bench's remote (OWL-587): its own data directory,
 /// dedicated checkout and identifier.
-struct Colleague {
+pub(super) struct Colleague {
     dirs: ProjectDirs,
     runner: RunnerId,
 }
@@ -33,7 +33,7 @@ const ANSWERS: &str = "Q1: English.\nQ2: \"Hello, reader.\", no sign-off.\ngo";
 impl Bench {
     /// `claims = "remote"` merged to the default branch, where the runner
     /// reads it.
-    fn claims_on_remote(&self) {
+    pub(super) fn claims_on_remote(&self) {
         self.policy("claims = \"remote\"");
         let checkout = &self.remote.checkout;
         self.env.run(checkout, &["add", "owlshift.toml"]).unwrap();
@@ -130,13 +130,13 @@ impl Bench {
         runner.as_str().to_owned()
     }
 
-    fn git(&self) -> Git {
+    pub(super) fn git(&self) -> Git {
         let env = self.env.clone();
         Git::with_setup("git", move |command| env.apply(command))
     }
 
     /// Another runner on the bench's remote, its checkout cloned now.
-    fn colleague(&self) -> Colleague {
+    pub(super) fn colleague(&self) -> Colleague {
         let data = self.tmp.path().join("colleague");
         let dirs = ProjectDirs::new(&data, &Repo::parse(REPO).unwrap());
         project::sync_checkout(&self.git(), &dirs, &self.remote.bare.to_string_lossy()).unwrap();
@@ -145,7 +145,7 @@ impl Bench {
     }
 
     /// `colleague` claims `id` for lea, holding `files`.
-    fn claimed_by(&self, colleague: &Colleague, id: &str, files: &[&str]) {
+    pub(super) fn claimed_by(&self, colleague: &Colleague, id: &str, files: &[&str]) {
         let git = self.git();
         let held = ClaimHeld {
             files: files.iter().map(|f| (*f).to_owned()).collect(),
@@ -187,7 +187,7 @@ impl Bench {
 
     /// Deletes `id`'s claim on the bench's remote, as its holder's sweep
     /// or a release does.
-    fn unclaimed(&self, id: &str) {
+    pub(super) fn unclaimed(&self, id: &str) {
         let name = claim_ref(&TicketId::new(id).unwrap());
         self.env
             .run(&self.remote.bare, &["update-ref", "-d", &name])

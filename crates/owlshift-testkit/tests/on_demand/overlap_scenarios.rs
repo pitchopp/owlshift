@@ -157,6 +157,82 @@ fn a_siblings_merge_on_a_shared_file_refreshes_the_pull_request() {
     assert_eq!(roles.last(), Some(&Role::Rebase), "{report}");
 }
 
+/// OWL-613: DEMO-1, delivered, its own record sharing `AGENTS.md` with
+/// DEMO-2, which another runner claims and this one has no ref of; the
+/// project claiming on the remote when `remote`. This runner fetches the
+/// claim, then DEMO-2's change to that file merges and its holder deletes
+/// the claim, as its sweep does a pass after reading the merge, before
+/// this runner's watch passes. The rebase runs those passes start.
+fn after_a_colleagues_merge(remote: bool) -> (Bench, String, Vec<Value>, String) {
+    let bench = Bench::with(
+        "maintainer",
+        "assignee = \"maintainer\"\n",
+        "overlap = \"rebase\"\n",
+    );
+    if remote {
+        bench.claims_on_remote();
+    }
+    let mut reply = bench.reply(Some("Hello"), Some(DONE));
+    reply.files.insert(
+        RelativePath::new("AGENTS.md").unwrap(),
+        AGENTS_APPENDED.to_owned(),
+    );
+    let (outcome, printed) = bench.run(vec![reply], None);
+    outcome.unwrap_or_else(|stop| panic!("{stop}\n{printed}"));
+    let demo2 = TicketId::new("DEMO-2").unwrap();
+    let colleague = bench.colleague();
+    bench.claimed_by(&colleague, "DEMO-2", &["AGENTS.md"]);
+    claims::fetch(&bench.git(), &bench.dirs().checkout()).unwrap();
+    let mut record = bench.record();
+    let mut own = record.held.clone().unwrap();
+    own.record_overlap(&demo2, &["AGENTS.md".to_owned()], &[], bench.clock.get());
+    record.held = Some(own);
+    bench.write_record(&record);
+    let main = bench.merge_into_main(&[("AGENTS.md", AGENTS_PREPENDED)]);
+    bench.unclaimed("DEMO-2");
+    assert!(bench.claim_commit(&demo2).is_none());
+    let mut pass = 0;
+    let (replies, during) = if remote {
+        let refresh = replayed_onto(&bench, main.clone());
+        (vec![bench.reply(None, Some(REBASED))], vec![refresh])
+    } else {
+        (Vec::new(), Vec::new())
+    };
+    let (outcomes, lines, printed) = bench.watch_during(replies, during, &mut |_| {
+        pass += 1;
+        pass < 4
+    });
+    let report = format!("{outcomes:?}\n{lines}\n{printed}");
+    assert!(outcomes.iter().all(Result::is_ok), "{report}");
+    let runs = rebase_runs(&bench);
+    (bench, main, runs, report)
+}
+
+/// OWL-613: under remote claims, the overlap with DEMO-2 still counts once
+/// its claim is gone: watch's next pass refreshes DEMO-1's pull request
+/// onto DEMO-2's merge, its cause the overlap, though GitHub reports no
+/// conflict.
+#[test]
+fn a_colleagues_merge_refreshes_the_pull_request_once_its_claim_is_gone() {
+    let (bench, main, runs, report) = after_a_colleagues_merge(true);
+    assert_eq!(runs.len(), 1, "{runs:?}\n{report}");
+    assert_eq!(
+        (&runs[0]["cause"], &runs[0]["onto"]),
+        (&json!("overlap"), &json!(main)),
+        "{report}"
+    );
+    let head = bench.remote_branch().unwrap();
+    assert!(is_ancestor(&bench, &main, &head), "{report}");
+}
+
+/// Under local claims the same sibling with no ref here is a ticket
+/// forgotten here: it counts no more, and the merge refreshes nothing.
+#[test]
+fn under_local_claims_a_sibling_without_a_ref_refreshes_nothing() {
+    let (_, _, runs, report) = after_a_colleagues_merge(false);
+    assert!(runs.is_empty(), "{runs:?}\n{report}");
+}
+
 /// A review after a resolution: DEMO-1's own record shares `GREETING.md`
 /// with DEMO-2, whose merge adds that file too, a conflict GitHub reports
 /// and that is not trivial (both sides add it). The rebase run, on the

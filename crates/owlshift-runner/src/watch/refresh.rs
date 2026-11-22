@@ -13,6 +13,7 @@
 
 use std::collections::HashMap;
 
+use owlshift_contracts::config::Claims;
 use owlshift_contracts::ids::TicketId;
 use owlshift_core::vocab::Overlap;
 
@@ -103,9 +104,15 @@ impl Watch<'_> {
     /// pass reads it again.
     pub(super) fn overlap_refreshes(&self, memory: &mut Memory, read: &[RefRead]) {
         memory.refreshes.due.clear();
-        // A sibling another runner claims counts while its claim stands
-        // (OWL-587).
-        let claimed = memory.claimed.tickets();
+        // Under remote claims a sibling only the ticket's own record names,
+        // another runner's (OWL-587), counts whether its claim still stands
+        // or not: its holder deletes it a pass after reading its merge,
+        // which a runner asleep then would never see (OWL-613).
+        let claims = if memory.claimed.remote {
+            Claims::Remote
+        } else {
+            Claims::Local
+        };
         let on_demand = self.on_demand;
         let git = &on_demand.executor.git;
         let checkout = on_demand.dirs.checkout();
@@ -126,7 +133,7 @@ impl Watch<'_> {
             // The named resources a taking recorded reach their patterns'
             // paths (OWL-621).
             let reach = held::Reach::of(
-                &held::sharings_of(ticket, stored.record.held.as_ref(), read, &claimed),
+                &held::sharings_of(ticket, stored.record.held.as_ref(), read, claims),
                 &named,
             );
             if reach.is_empty() {
