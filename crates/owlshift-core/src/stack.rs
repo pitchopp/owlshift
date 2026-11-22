@@ -6,10 +6,11 @@
 //! A pure function: the caller reads the root and passes in the file names and
 //! the contents of the four manifests it recognises (`Cargo.toml`,
 //! `package.json`, `pyproject.toml`, `Makefile`); lock files, and the files of
-//! Go, pip, bundler and Gradle (OWL-624), are read by name only. Nothing
-//! detected here is ever run. The commands were checked with real calls,
-//! recorded in `docs/design/runtime-and-operations.md`, "Stack detection
-//! (P9)", and in the records of OWL-617 and OWL-624; a tool that could not be
+//! Go, pip, bundler and Gradle (OWL-624), of pdm, Maven, Composer and .NET
+//! (OWL-627), are read by name only. Nothing detected here is ever run. The
+//! commands were checked with real calls, recorded in
+//! `docs/design/runtime-and-operations.md`, "Stack detection (P9)", and in the
+//! records of OWL-617, OWL-624 and OWL-627; a tool that could not be
 //! checked is not detected, and a run cache whose live check did not show it
 //! needed is not written, only named in a note.
 
@@ -81,7 +82,8 @@ pub struct RunCache {
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Detection {
     /// In the fixed order `Cargo.toml`, `go.mod`, `package.json`, Python
-    /// (`pyproject.toml`, `requirements.txt`), `Gemfile`, Gradle, `Makefile`.
+    /// (`pyproject.toml`, `requirements.txt`), `Gemfile`, Gradle, Maven,
+    /// Composer, .NET, `Makefile`.
     pub found: Vec<Found>,
     /// A manifest that could not be read or parsed, with why. Never an error.
     pub skipped: Vec<String>,
@@ -123,15 +125,19 @@ type Source = fn(&RootFiles) -> Result<Option<Found>, String>;
 
 /// Detect the stack of a root.
 pub fn detect(root: &RootFiles) -> Detection {
-    // Each with the name it is skipped under: only a source that reads a
-    // manifest's text, of `MANIFESTS`, can be skipped.
-    let sources: [(&str, Source); 7] = [
+    // Each with the name it is skipped under. Only a source that reads a
+    // manifest's text, of `MANIFESTS`, can be skipped; the others read names
+    // and keep a name here for the list's sake.
+    let sources: [(&str, Source); 10] = [
         ("Cargo.toml", cargo),
         ("go.mod", go),
         ("package.json", package_json),
         ("pyproject.toml", python),
         ("Gemfile", ruby),
         ("gradlew", gradle),
+        ("pom.xml", maven),
+        ("composer.json", composer),
+        (".NET", dotnet),
         ("Makefile", makefile),
     ];
     let mut out = Detection::default();
@@ -530,32 +536,24 @@ fn python(root: &RootFiles) -> Result<Option<Found>, String> {
         Some(text) => python_tools(text)?,
         None => vec![],
     };
-    let locked = |lock: &str| root.has("pyproject.toml") && root.has(lock);
-    if locked("uv.lock") {
-        return Ok(Some(uv(&tools)));
+    if root.has("pyproject.toml")
+        && let Some(manager) = PYTHON_MANAGERS.iter().find(|m| root.has(m.lock))
+    {
+        return Ok(Some(locked_manager(manager, &tools)));
     }
-    if locked("poetry.lock") {
-        return Ok(Some(poetry(&tools)));
-    }
-    let pdm = locked("pdm.lock");
-    if !pdm && root.has("requirements.txt") {
+    if root.has("requirements.txt") {
         return Ok(Some(pip(root, &tools)));
     }
     if tools.is_empty() {
         return Ok(None);
     }
-    // A bare tool needs a setup, as does pdm, which was not checked.
+    // A bare tool needs a setup.
     let mut found = found("pyproject.toml");
-    found.notes.push(if pdm {
-        "pyproject.toml's tools are run bare and no setup was written, but pdm.lock names pdm: \
-         the gate needs `pdm run` in front of them and a setup that installs the project (not \
-         checked here)"
-            .to_string()
-    } else {
+    found.notes.push(
         "pyproject.toml's tools are run bare and no setup was written: the gate needs a setup \
          that installs them"
-            .to_string()
-    });
+            .to_string(),
+    );
     found.gate = tool_lines("", &tools);
     Ok(Some(found))
 }
@@ -577,38 +575,84 @@ fn no_tool_note(prefix: &str) -> String {
     )
 }
 
-/// uv: `uv run` installs the locked environment itself, so there is no setup
-/// (OWL-539). Checked live (OWL-617): confined, uv needs both run caches on
-/// macOS, where it fails reading the closed `~/.local/share/uv/python`
-/// otherwise.
-fn uv(tools: &[Tool]) -> Found {
-    let mut found = found("pyproject.toml (uv.lock)");
-    let from = "uv.lock, the lock file of uv";
-    found.run_caches = vec![
-        run_cache("UV_CACHE_DIR", "uv", from),
-        run_cache("UV_PYTHON_INSTALL_DIR", "uv-python", from),
-    ];
-    found.gate = tool_lines("uv run ", tools);
-    if tools.is_empty() {
-        found.notes.push(no_tool_note("uv run"));
-    }
-    found
+/// A Python manager a lock file beside `pyproject.toml` names: its setup,
+/// the run caches it writes, and the tools run through it.
+struct PythonManager {
+    name: &'static str,
+    lock: &'static str,
+    setup: Option<&'static str>,
+    /// The variable and folder of each run cache.
+    run_caches: &'static [(&'static str, &'static str)],
+    notes: &'static [&'static str],
 }
 
-/// poetry (OWL-624): `poetry install` installs the locked environment into a
-/// virtualenv in poetry's cache, one per worktree, which `POETRY_CACHE_DIR`
-/// moves into a run cache. Checked live, confined: without it, poetry fails
-/// writing its closed cache (`~/Library/Caches/pypoetry` on macOS).
-fn poetry(tools: &[Tool]) -> Found {
-    let mut found = found("pyproject.toml (poetry.lock)");
-    let from = "poetry.lock, the lock file of poetry";
-    found.setup.push(line("poetry install", from));
+/// The Python managers, in the order their lock files are looked for.
+///
+/// - uv: `uv run` installs the locked environment itself, so there is no
+///   setup (OWL-539). Checked live (OWL-617): confined, uv needs both run
+///   caches on macOS, where it fails reading the closed
+///   `~/.local/share/uv/python` otherwise.
+/// - poetry (OWL-624): `poetry install` installs the locked environment into
+///   a virtualenv in poetry's cache, one per worktree, which
+///   `POETRY_CACHE_DIR` moves into a run cache. Checked live, confined:
+///   without it, poetry fails writing its closed cache
+///   (`~/Library/Caches/pypoetry` on macOS).
+/// - pdm (OWL-627): `pdm install` installs the locked environment into the
+///   worktree's `.venv`, which ignores itself. Checked live, confined: pdm
+///   fails writing its closed cache (`~/Library/Caches/pdm`) unless
+///   `PDM_CACHE_DIR` moves it, and its closed log folder
+///   (`~/Library/Logs/pdm`) unless `PDM_LOG_DIR` does.
+const PYTHON_MANAGERS: [PythonManager; 3] = [
+    PythonManager {
+        name: "uv",
+        lock: "uv.lock",
+        setup: None,
+        run_caches: &[
+            ("UV_CACHE_DIR", "uv"),
+            ("UV_PYTHON_INSTALL_DIR", "uv-python"),
+        ],
+        notes: &[],
+    },
+    PythonManager {
+        name: "poetry",
+        lock: "poetry.lock",
+        setup: Some("poetry install"),
+        run_caches: &[("POETRY_CACHE_DIR", "poetry")],
+        notes: &[],
+    },
+    PythonManager {
+        name: "pdm",
+        lock: "pdm.lock",
+        setup: Some("pdm install"),
+        run_caches: &[("PDM_CACHE_DIR", "pdm"), ("PDM_LOG_DIR", "pdm-log")],
+        notes: &[
+            "pdm saves the Python it chose in `.pdm-python` at the root: ignore it in \
+                  `.gitignore`, as `pdm init` does, since a setup that leaves a file git sees \
+                  fails the gate",
+        ],
+    },
+];
+
+/// What a Python manager's lock gives: its setup and run caches, and the
+/// tools run through it, or a note when there is none.
+fn locked_manager(manager: &PythonManager, tools: &[Tool]) -> Found {
+    let PythonManager { name, lock, .. } = manager;
+    let mut found = found(format!("pyproject.toml ({lock})"));
+    let from = format!("{lock}, the lock file of {name}");
     found
+        .setup
+        .extend(manager.setup.map(|setup| line(setup, from.clone())));
+    found.run_caches = manager
         .run_caches
-        .push(run_cache("POETRY_CACHE_DIR", "poetry", from));
-    found.gate = tool_lines("poetry run ", tools);
+        .iter()
+        .map(|(variable, folder)| run_cache(variable, folder, from.clone()))
+        .collect();
+    found.gate = tool_lines(&format!("{name} run "), tools);
+    found
+        .notes
+        .extend(manager.notes.iter().map(|n| n.to_string()));
     if tools.is_empty() {
-        found.notes.push(no_tool_note("poetry run"));
+        found.notes.push(no_tool_note(&format!("{name} run")));
     }
     found
 }
@@ -759,6 +803,204 @@ fn gradle(root: &RootFiles) -> Result<Option<Found>, String> {
     found
         .run_caches
         .push(run_cache("GRADLE_USER_HOME", "gradle", from));
+    Ok(Some(found))
+}
+
+/// Maven (OWL-627), from `pom.xml`, read by name, run by the machine's `mvn`:
+/// `verify` runs the tests and the checks the build binds. Maven moves its
+/// local repository with a property only, so the line sets `maven.repo.local`
+/// inside the run cache `MAVEN_USER_HOME`. Checked live, confined: without the
+/// property Maven fails creating `~/.m2/repository`. The wrapper `mvnw` is not
+/// used, a note says why: it makes its download folder with `mktemp -d`,
+/// which on macOS writes to the user's temporary folder, closed to a confined
+/// run whatever its `TMPDIR` (checked live).
+fn maven(root: &RootFiles) -> Result<Option<Found>, String> {
+    if !root.has("pom.xml") {
+        return Ok(None);
+    }
+    let from = "pom.xml";
+    let mut found = found(from);
+    found.gate.push(line(
+        "mvn -B -Dmaven.repo.local=\"$MAVEN_USER_HOME/repository\" verify",
+        from,
+    ));
+    if root.has("mvnw") {
+        found.notes.push(
+            "the gate runs the machine's `mvn`, not the wrapper `mvnw`, which fails confined on \
+             macOS making its download folder in the user's temporary folder: Maven must be \
+             installed on each machine, and it runs instead of the version the wrapper pins"
+                .to_string(),
+        );
+    }
+    found
+        .run_caches
+        .push(run_cache("MAVEN_USER_HOME", "maven", from));
+    found.gate_notes.push(
+        "the Maven line reads `$MAVEN_USER_HOME`, the run cache Owlshift sets: to run it by hand, \
+         set it first, such as `MAVEN_USER_HOME=~/.m2`"
+            .to_string(),
+    );
+    Ok(Some(found))
+}
+
+/// The settings files of PHPUnit, in the order PHPUnit reads them.
+const PHPUNIT_SETTINGS: [&str; 3] = ["phpunit.xml", "phpunit.dist.xml", "phpunit.xml.dist"];
+
+/// Composer (OWL-627), from `composer.json`, read by name with
+/// `composer.lock` and PHPUnit's settings: Composer installs the locked
+/// packages into `vendor/`, and the gate is PHPUnit's when its settings are
+/// at the root. Checked live, confined: Composer turns off a cache it cannot
+/// write and installs anyway, and reads no file of its home it needs, so
+/// neither `COMPOSER_CACHE_DIR` nor `COMPOSER_HOME` is declared, the first
+/// named in a note.
+fn composer(root: &RootFiles) -> Result<Option<Found>, String> {
+    if !root.has("composer.json") {
+        return Ok(None);
+    }
+    let mut found = found("composer.json");
+    if root.has("composer.lock") {
+        found.source = "composer.json (composer.lock)".to_string();
+        let from = "composer.lock, the lock file of Composer";
+        found
+            .setup
+            .push(line("composer install --no-interaction", from));
+        found.notes.push(
+            "no run cache was declared for Composer, which turns off a cache it cannot write and \
+             installs anyway: `run_caches.COMPOSER_CACHE_DIR = \"composer\"` keeps its downloads \
+             for the next runs"
+                .to_string(),
+        );
+    } else {
+        // An install here would write a lock file into the repository.
+        found.notes.push(
+            "composer.json has no lock file, so no setup was written: the gate needs a setup \
+             that installs the packages"
+                .to_string(),
+        );
+    }
+    match PHPUNIT_SETTINGS.into_iter().find(|name| root.has(name)) {
+        Some(settings) => found.gate.push(line(
+            "vendor/bin/phpunit",
+            format!("{settings}, the settings of PHPUnit"),
+        )),
+        None => found.notes.push(
+            "no PHP gate was written, only PHPUnit's settings (`phpunit.xml`) being read for one: \
+             add the project's tests, such as `composer test` or `vendor/bin/phpunit`"
+                .to_string(),
+        ),
+    }
+    Ok(Some(found))
+}
+
+/// The files `dotnet` builds: solutions first, then projects.
+const DOTNET_SOLUTIONS: [&str; 2] = [".sln", ".slnx"];
+const DOTNET_PROJECTS: [&str; 3] = [".csproj", ".fsproj", ".vbproj"];
+
+/// `name` as one word of `sh`: as it is when it holds no character the
+/// shell reads, single-quoted otherwise.
+fn shell_word(name: &str) -> String {
+    if name
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-' | '+'))
+    {
+        name.to_owned()
+    } else {
+        format!("'{}'", name.replace('\'', r"'\''"))
+    }
+}
+
+/// What every `dotnet` line runs with, checked live on macOS, confined
+/// (OWL-627): MSBuild's worker nodes cannot reach each other in the sandbox,
+/// so a build stalls five minutes and fails unless it stays in one process
+/// (`-m:1`, `-nodeReuse:false`); and .NET's TLS on macOS goes through the
+/// keychain, closed with the home, so NuGet cannot reach its feed unless it
+/// uses Network.framework instead, a switch of .NET 10 and later that other
+/// systems ignore.
+const DOTNET: &str = "DOTNET_SYSTEM_NET_SECURITY_USENETWORKFRAMEWORK=1 dotnet";
+const DOTNET_FLAGS: &str = "-m:1 -nodeReuse:false";
+
+/// .NET (OWL-627), from the one solution at the root, or, with none, the one
+/// project there, read by name: `dotnet restore` fetches its packages, then
+/// `dotnet test` builds it and runs its tests, each as [`DOTNET`] says.
+/// Several solutions, or several projects and no solution, leave `dotnet` to
+/// be told which, and a `global.json` with neither says the projects lie below
+/// the root: each gets a note. Checked live, confined: `DOTNET_CLI_HOME`
+/// holds the SDK's first-run files and NuGet's home, its packages included,
+/// and without it `dotnet` fails at once; `NUGET_PACKAGES` is not needed.
+fn dotnet(root: &RootFiles) -> Result<Option<Found>, String> {
+    let lines = |file: &str| {
+        format!(
+            "the setup is `{DOTNET} restore {DOTNET_FLAGS} {file}` and the gate `{DOTNET} test \
+             {DOTNET_FLAGS} {file}`, with `run_caches.DOTNET_CLI_HOME = \"dotnet\"`"
+        )
+    };
+    let with = |extensions: &[&str]| -> Vec<&str> {
+        root.names
+            .iter()
+            .map(String::as_str)
+            .filter(|n| {
+                extensions
+                    .iter()
+                    .any(|e| n.len() > e.len() && n.ends_with(e))
+            })
+            .collect()
+    };
+    let solutions = with(&DOTNET_SOLUTIONS);
+    let files = if solutions.is_empty() {
+        with(&DOTNET_PROJECTS)
+    } else {
+        solutions
+    };
+    let file = match files[..] {
+        [file] => file,
+        [] if root.has("global.json") => {
+            let mut found = found("global.json");
+            found.notes.push(format!(
+                "global.json names a .NET SDK, but no solution or project is at the root, so \
+                 nothing was written: {}",
+                lines("<solution>")
+            ));
+            return Ok(Some(found));
+        }
+        [] => return Ok(None),
+        _ => {
+            let mut found = found(files.join(", "));
+            found.notes.push(format!(
+                "{} are at the root, so nothing was written: for the one that builds the rest, \
+                 {}",
+                files.join(", "),
+                lines("<file>")
+            ));
+            return Ok(Some(found));
+        }
+    };
+    let word = shell_word(file);
+    let from = format!("{file}, the file dotnet builds");
+    let mut found = found(file);
+    found.setup.push(line(
+        format!("{DOTNET} restore {DOTNET_FLAGS} {word}"),
+        from.clone(),
+    ));
+    found.gate.push(line(
+        format!("{DOTNET} test {DOTNET_FLAGS} {word}"),
+        from.clone(),
+    ));
+    found
+        .run_caches
+        .push(run_cache("DOTNET_CLI_HOME", "dotnet", from));
+    found.notes.push(
+        "the dotnet lines build in one process and, on macOS, reach NuGet through \
+         Network.framework, since the sandbox closes MSBuild's worker nodes and the keychain .NET's \
+         TLS reads otherwise"
+            .to_string(),
+    );
+    if root.has("global.json") {
+        found.notes.push(
+            "global.json pins the .NET SDK: the Network.framework switch needs .NET 10 or later, \
+             and with an earlier SDK the setup fails on macOS reaching NuGet"
+                .to_string(),
+        );
+    }
     Ok(Some(found))
 }
 
@@ -1172,16 +1414,12 @@ check::
     }
 
     #[test]
-    fn a_python_root_without_a_checked_manager_runs_bare_and_says_a_setup_is_needed() {
-        for names in [&[][..], &["pdm.lock"]] {
-            let d = detect(&root(names, &[("pyproject.toml", PY)]));
-            assert_eq!(commands(d.gate()), ["ruff check .", "pytest"], "{names:?}");
-            assert_eq!(d.found[0].notes.len(), 1);
-            assert!(d.found[0].notes[0].contains("setup"));
-            assert!(d.setup().next().is_none() && d.run_caches().next().is_none());
-        }
-        let pdm = detect(&root(&["pdm.lock"], &[("pyproject.toml", PY)]));
-        assert!(pdm.found[0].notes[0].contains("`pdm run`"));
+    fn a_python_root_without_a_manager_runs_bare_and_says_a_setup_is_needed() {
+        let d = detect(&root(&[], &[("pyproject.toml", PY)]));
+        assert_eq!(commands(d.gate()), ["ruff check .", "pytest"]);
+        assert_eq!(d.found[0].notes.len(), 1);
+        assert!(d.found[0].notes[0].contains("setup"));
+        assert!(d.setup().next().is_none() && d.run_caches().next().is_none());
     }
 
     /// No tool `[tool.pytest]` alone names; a manager's lock still gives its
@@ -1189,7 +1427,7 @@ check::
     #[test]
     fn a_pyproject_without_a_known_tool_gives_its_managers_lines_only() {
         let text = "[project]\nname = \"x\"\n[tool.pytest]\nx = 1\n";
-        let bare = detect(&root(&["pdm.lock"], &[("pyproject.toml", text)]));
+        let bare = detect(&root(&[], &[("pyproject.toml", text)]));
         assert!(bare.found.is_empty() && bare.skipped.is_empty());
         for (lock, prefix, written) in [
             (
@@ -1205,33 +1443,52 @@ check::
                 "poetry run",
                 &[("POETRY_CACHE_DIR", "poetry")],
             ),
+            (
+                "pdm.lock",
+                "pdm run",
+                &[("PDM_CACHE_DIR", "pdm"), ("PDM_LOG_DIR", "pdm-log")],
+            ),
         ] {
             let d = detect(&root(&[lock], &[("pyproject.toml", text)]));
             assert!(d.gate().next().is_none(), "{lock}");
             assert_eq!(run_caches(d.run_caches()), written, "{lock}");
             let notes = &d.found[0].notes;
-            assert_eq!(notes.len(), 1, "{lock} {notes:?}");
             assert!(
-                notes[0].contains(&format!("run through `{prefix}`")),
+                notes
+                    .last()
+                    .unwrap()
+                    .contains(&format!("run through `{prefix}`")),
                 "{notes:?}"
             );
         }
     }
 
-    /// OWL-624: poetry installs the lock into a virtualenv of its cache, which
-    /// a run cache holds, and runs the tools through `poetry run`.
+    /// OWL-624, OWL-627: poetry and pdm install the lock, each writing its
+    /// run caches, and run the tools through `poetry run` and `pdm run`; pdm
+    /// says to ignore the interpreter it saves.
     #[test]
-    fn a_poetry_root_installs_into_its_run_cache() {
-        let d = detect(&root(&["poetry.lock"], &[("pyproject.toml", PY)]));
-        assert_eq!(d.found[0].source, "pyproject.toml (poetry.lock)");
-        assert_eq!(commands(d.setup()), ["poetry install"]);
-        assert_eq!(
-            commands(d.gate()),
-            ["poetry run ruff check .", "poetry run pytest"]
+    fn a_poetry_or_pdm_root_installs_its_lock_and_runs_through_it() {
+        let (poetry, pdm): (&[_], &[_]) = (
+            &[("POETRY_CACHE_DIR", "poetry")],
+            &[("PDM_CACHE_DIR", "pdm"), ("PDM_LOG_DIR", "pdm-log")],
         );
-        assert_eq!(run_caches(d.run_caches()), [("POETRY_CACHE_DIR", "poetry")]);
-        assert!(d.found[0].notes.is_empty());
-        assert!(d.setup().all(|l| l.read_from.contains("poetry.lock")));
+        for (name, lock, caches) in [("poetry", "poetry.lock", poetry), ("pdm", "pdm.lock", pdm)] {
+            let d = detect(&root(&[lock], &[("pyproject.toml", PY)]));
+            assert_eq!(d.found[0].source, format!("pyproject.toml ({lock})"));
+            assert_eq!(commands(d.setup()), [format!("{name} install")]);
+            assert_eq!(
+                commands(d.gate()),
+                [
+                    format!("{name} run ruff check ."),
+                    format!("{name} run pytest")
+                ]
+            );
+            assert_eq!(run_caches(d.run_caches()), caches);
+            let notes = &d.found[0].notes;
+            assert_eq!(notes.len(), usize::from(name == "pdm"), "{notes:?}");
+            assert!(notes.iter().all(|n| n.contains("`.pdm-python`")));
+            assert!(d.setup().all(|l| l.read_from.contains(lock)));
+        }
     }
 
     /// OWL-624: pip runs the tools from a virtualenv that ignores itself; its
@@ -1287,7 +1544,7 @@ check::
                 &["poetry.lock", "pdm.lock", "requirements.txt"],
                 "poetry run pytest",
             ),
-            (&["pdm.lock", "requirements.txt"], "pytest"),
+            (&["pdm.lock", "requirements.txt"], "pdm run pytest"),
             (&["requirements.txt"], ".venv/bin/pytest"),
         ];
         let py = "[tool.pytest.ini_options]\n";
@@ -1356,6 +1613,101 @@ check::
         assert!(detect(&root(&["gradlew"], &[])).found.is_empty());
     }
 
+    /// OWL-627: the machine's `mvn`, its local repository inside the run
+    /// cache; a wrapper `mvnw` is named in a note, never run.
+    #[test]
+    fn a_maven_build_runs_verify_with_its_repository_in_a_run_cache() {
+        for names in [&["pom.xml", "mvnw"][..], &["pom.xml"]] {
+            let d = detect(&root(names, &[]));
+            assert_eq!(d.found[0].source, "pom.xml");
+            assert_eq!(
+                commands(d.gate()),
+                ["mvn -B -Dmaven.repo.local=\"$MAVEN_USER_HOME/repository\" verify"]
+            );
+            assert!(d.setup().next().is_none());
+            assert_eq!(run_caches(d.run_caches()), [("MAVEN_USER_HOME", "maven")]);
+            assert!(d.found[0].gate_notes[0].contains("MAVEN_USER_HOME=~/.m2"));
+            let notes = &d.found[0].notes;
+            assert_eq!(notes.len(), usize::from(names.contains(&"mvnw")));
+            assert!(notes.iter().all(|n| n.contains("must be installed")));
+        }
+        assert!(detect(&root(&["mvnw"], &[])).found.is_empty());
+    }
+
+    /// OWL-627: Composer installs the lock; PHPUnit is the gate when its
+    /// settings are at the root. A missing lock or settings file says so.
+    #[test]
+    fn a_composer_root_installs_its_lock_and_runs_phpunit() {
+        let d = detect(&root(
+            &["composer.json", "composer.lock", "phpunit.xml.dist"],
+            &[],
+        ));
+        assert_eq!(d.found[0].source, "composer.json (composer.lock)");
+        assert_eq!(commands(d.setup()), ["composer install --no-interaction"]);
+        assert_eq!(commands(d.gate()), ["vendor/bin/phpunit"]);
+        assert_eq!(
+            d.gate().next().unwrap().read_from,
+            "phpunit.xml.dist, the settings of PHPUnit"
+        );
+        // Checked live: Composer installs without a cache it cannot write.
+        assert!(d.run_caches().next().is_none());
+        let notes = &d.found[0].notes;
+        assert_eq!(notes.len(), 1, "{notes:?}");
+        assert!(notes[0].contains("`run_caches.COMPOSER_CACHE_DIR = \"composer\"`"));
+        let d = detect(&root(&["composer.json"], &[]));
+        assert!(d.setup().next().is_none() && d.gate().next().is_none());
+        assert!(d.run_caches().next().is_none());
+        let notes = &d.found[0].notes;
+        assert!(notes[0].contains("no lock file") && notes[1].contains("composer test"));
+    }
+
+    /// OWL-627: .NET builds the one solution at the root, or the one project
+    /// when there is no solution, in one process and through Network.framework
+    /// on macOS; otherwise a note says what to write. A `global.json` adds the
+    /// switch's minimum SDK.
+    #[test]
+    fn a_dotnet_root_restores_and_tests_its_one_solution_or_project() {
+        let cases: [(&[&str], &str); 4] = [
+            (&["App.sln", "App.csproj", "global.json"], "App.sln"),
+            (&["App.slnx"], "App.slnx"),
+            (&["Lib.fsproj", "README.md"], "Lib.fsproj"),
+            (&["My App.csproj"], "'My App.csproj'"),
+        ];
+        for (names, word) in cases {
+            let d = detect(&root(names, &[]));
+            let dotnet = "DOTNET_SYSTEM_NET_SECURITY_USENETWORKFRAMEWORK=1 dotnet";
+            assert_eq!(
+                commands(d.setup()),
+                [format!("{dotnet} restore -m:1 -nodeReuse:false {word}")]
+            );
+            assert_eq!(
+                commands(d.gate()),
+                [format!("{dotnet} test -m:1 -nodeReuse:false {word}")]
+            );
+            assert_eq!(run_caches(d.run_caches()), [("DOTNET_CLI_HOME", "dotnet")]);
+            let notes = &d.found[0].notes;
+            assert!(notes[0].contains("Network.framework"), "{notes:?}");
+            let pinned = names.contains(&"global.json");
+            assert_eq!(notes.len(), 1 + usize::from(pinned), "{notes:?}");
+            assert!(notes.iter().skip(1).all(|n| n.contains(".NET 10")));
+        }
+        for (names, source) in [
+            (&["A.sln", "B.sln", "A.csproj"][..], "A.sln, B.sln"),
+            (&["A.csproj", "B.fsproj"], "A.csproj, B.fsproj"),
+            (&["global.json"], "global.json"),
+        ] {
+            let d = detect(&root(names, &[]));
+            assert_eq!(d.found[0].source, source);
+            assert!(d.setup().next().is_none() && d.gate().next().is_none());
+            assert!(d.run_caches().next().is_none());
+            assert!(
+                d.found[0].notes[0].contains("run_caches.DOTNET_CLI_HOME"),
+                "{names:?}"
+            );
+        }
+        assert!(detect(&root(&[".sln", "csproj"], &[])).found.is_empty());
+    }
+
     /// Every run cache `init` can write passes the check the project file's
     /// loader makes (OWL-624, criterion 4), together with the others a root
     /// can hold beside it.
@@ -1384,6 +1736,16 @@ check::
                 &["package-lock.json", "uv.lock"],
                 &[("package.json", "{}"), ("pyproject.toml", PY)],
             ),
+            root(
+                &[
+                    "pdm.lock",
+                    "pom.xml",
+                    "composer.json",
+                    "composer.lock",
+                    "App.sln",
+                ],
+                &[("pyproject.toml", PY)],
+            ),
         ];
         let mut seen = 0;
         for r in &roots {
@@ -1392,7 +1754,7 @@ check::
             seen += entries.len();
             crate::agent_env::check_run_caches(&entries).unwrap();
         }
-        assert_eq!(seen, 10);
+        assert_eq!(seen, 14);
     }
 
     #[test]
@@ -1406,6 +1768,9 @@ check::
                 "Gemfile",
                 "go.mod",
                 "requirements.txt",
+                "App.csproj",
+                "composer.json",
+                "pom.xml",
             ],
             &[
                 ("package.json", r#"{"scripts":{"test":"vitest"}}"#),
@@ -1424,6 +1789,9 @@ check::
                 "pyproject.toml (requirements.txt)",
                 "Gemfile",
                 "gradlew",
+                "pom.xml",
+                "composer.json",
+                "App.csproj",
                 "Makefile"
             ]
         );
@@ -1440,6 +1808,9 @@ check::
                 ".venv/bin/ruff check .",
                 ".venv/bin/pytest",
                 "./gradlew check --no-daemon",
+                "mvn -B -Dmaven.repo.local=\"$MAVEN_USER_HOME/repository\" verify",
+                "DOTNET_SYSTEM_NET_SECURITY_USENETWORKFRAMEWORK=1 dotnet test -m:1 -nodeReuse:false \
+                 App.csproj",
                 "make lint"
             ]
         );
