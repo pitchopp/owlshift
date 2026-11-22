@@ -31,7 +31,7 @@
 //! - `for_you`: `{"questions", "plans", "reviews", "parked", "others"}`,
 //!   entries `{"ticket", "project", "title", "kind", "pull_request",
 //!   "questions", "card", "decider"}` built from every ticket ref the way the
-//!   header counts them (`why::standings`), whether or not the ticket has a
+//!   header counts them (`why::read_standings`), whether or not the ticket has a
 //!   card. `decider` is `{"account", "name"}` of a question's or a plan's
 //!   ask, `name` the account itself when no name was read, else null.
 //!   `others` holds the questions and plans another person than the

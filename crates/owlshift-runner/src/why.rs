@@ -42,10 +42,13 @@ use serde_json::Value;
 use crate::base;
 use crate::claims::{self, FetchedClaim};
 use crate::events::{Data, printable};
+use crate::handed_back::{self, HandedBack};
 use crate::project::ProjectDirs;
 use crate::slots::{HeldSlot, MachineSlots};
 use crate::ticket_ref::{self, RefState};
 use crate::usage::{self as machine_usage, UsageStore};
+use crate::voice::Voice;
+use crate::writer::{HandbackRead, handback_step_lines};
 
 /// One time a ticket was told to wait: a `decision` event.
 #[derive(Clone, Debug, PartialEq)]
@@ -815,6 +818,8 @@ pub struct Report {
     pub stages: HashMap<TicketId, String>,
     /// The tickets whose ref yielded what it holds (OWL-621).
     pub yielded: BTreeSet<TicketId>,
+    /// The tickets handed back to a person (OWL-626).
+    pub handed_back: BTreeMap<TicketId, HandedBack>,
     pub quarantined: bool,
     /// Why part of the picture could not be read.
     pub notes: Vec<String>,
@@ -901,9 +906,17 @@ pub fn gather(
         .filter(|standing| standing.yielded)
         .map(|standing| standing.ticket.clone())
         .collect();
+    let mut handed_back = BTreeMap::new();
     let stages = standings
         .into_iter()
-        .map(|standing| (standing.ticket, stage_text(standing.status)))
+        .map(|standing| {
+            let mut stage = stage_text(standing.status);
+            if let Some(back) = standing.handed_back {
+                stage.push_str(", handed back");
+                handed_back.insert(standing.ticket.clone(), back);
+            }
+            (standing.ticket, stage)
+        })
         .collect();
     let quarantined = match dirs.quarantine() {
         Ok(marker) => marker.is_some(),
@@ -971,6 +984,7 @@ pub fn gather(
         folded,
         stages,
         yielded,
+        handed_back,
         quarantined,
         notes,
         limits,
@@ -1118,21 +1132,6 @@ fn in_flight(dirs: &ProjectDirs) -> Option<BTreeSet<TicketId>> {
     Some(holding)
 }
 
-/// Each ticket ref's status in the project of `dirs`, admitted or not, as
-/// [`read_standings`] reads them, each with whether watch follows the
-/// ticket's pull request (`watch::followed`): a pull request for a person to
-/// review, which the web UI's header counts (OWL-467). The refs are read
-/// once.
-pub(crate) fn standings(
-    dirs: &ProjectDirs,
-    notes: &mut Vec<String>,
-) -> Vec<(TicketId, Status, bool)> {
-    read_standings(dirs, notes)
-        .into_iter()
-        .map(|standing| (standing.ticket, standing.status, standing.followed))
-        .collect()
-}
-
 /// A ticket ref's standing, as [`read_standings`] reads it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct RefStanding {
@@ -1148,10 +1147,14 @@ pub(crate) struct RefStanding {
     /// project's `policy.overlap = "rebase"` at `origin/HEAD`, under which
     /// alone a yield holds nothing: what `why` and the daily digest tell.
     pub yielded: bool,
+    /// The ticket as handed back to a person, while it is (OWL-626).
+    pub handed_back: Option<HandedBack>,
 }
 
-/// Each ticket ref's [`RefStanding`] in the project of `dirs`, as [`standings`]
-/// reads them.
+/// Each ticket ref's [`RefStanding`] in the project of `dirs`, admitted or
+/// not; the refs are read once. Whether watch follows a ticket's pull
+/// request is a pull request for a person to review, which the web UI's
+/// header counts (OWL-467).
 pub(crate) fn read_standings(dirs: &ProjectDirs, notes: &mut Vec<String>) -> Vec<RefStanding> {
     let mut standings = Vec::new();
     if !dirs.checkout().exists() {
@@ -1161,6 +1164,13 @@ pub(crate) fn read_standings(dirs: &ProjectDirs, notes: &mut Vec<String>) -> Vec
     // A yield holds nothing under `rebase` alone (OWL-621).
     let rebase = crate::project::overlap_at_origin_head(&git, &dirs.checkout())
         == owlshift_core::vocab::Overlap::Rebase;
+    // Read once, and only for a ticket handed back (OWL-626).
+    let mut words: Option<String> = None;
+    let mut gesture = || {
+        words
+            .get_or_insert_with(|| handed_back::gesture(dirs))
+            .clone()
+    };
     match ticket_ref::all(&git, &dirs.checkout()) {
         Ok(refs) => {
             for (ticket, stored) in refs {
@@ -1181,6 +1191,7 @@ pub(crate) fn read_standings(dirs: &ProjectDirs, notes: &mut Vec<String>) -> Vec
                                 .open_ask()
                                 .map(|ask| ask.decider.account.clone()),
                             yielded: keeps_nothing(stored.record.held.as_ref(), rebase),
+                            handed_back: handed_back::of(&stored.record, &mut gesture),
                             ticket,
                             status,
                         });
@@ -1274,11 +1285,20 @@ pub fn render(report: &Report) -> String {
             .get(ticket)
             .map_or_else(String::new, |stage| format!(" [{stage}]"))
     };
+    // A ticket handed back to a person waits on nothing else (OWL-626).
     let stopped = |ticket: &TicketId| {
-        report
-            .stages
-            .get(ticket)
-            .is_some_and(|stage| stage.ends_with("parked") || stage.ends_with("needs input"))
+        report.handed_back.contains_key(ticket)
+            || report
+                .stages
+                .get(ticket)
+                .is_some_and(|stage| stage.ends_with("parked") || stage.ends_with("needs input"))
+    };
+    let handed_back = |ticket: &TicketId, back: &HandedBack| {
+        format!(
+            "handed back to a person at {}: {}",
+            back.at,
+            back.words(ticket, Voice::Terminal)
+        )
     };
     // The tickets a parked holder that keeps what it holds makes wait
     // (OWL-623), counted as the daily digest and the PARKED comment count.
@@ -1318,7 +1338,17 @@ pub fn render(report: &Report) -> String {
                     narrowed.at, narrowed.count
                 );
             }
+            // Its handback, which its ref says, over any wait told before.
             match folded.current.get(ticket) {
+                _ if report.handed_back.contains_key(ticket) => {
+                    let back = &report.handed_back[ticket];
+                    let _ = writeln!(out, "now: {}", handed_back(ticket, back));
+                    if let Some(HandbackRead::Design { steps }) = &back.read {
+                        for line in handback_step_lines(steps) {
+                            let _ = writeln!(out, "  - {line}");
+                        }
+                    }
+                }
                 Some(wait) => {
                     let _ = writeln!(out, "now: {}", phrase(wait));
                 }
@@ -1349,16 +1379,30 @@ pub fn render(report: &Report) -> String {
         }
         None => {
             let _ = writeln!(out, "{}", report.project);
-            if folded.current.is_empty() && report.left_out.tickets.is_empty() {
+            if folded.current.is_empty()
+                && report.left_out.tickets.is_empty()
+                && report.handed_back.is_empty()
+            {
                 let _ = writeln!(out, "  no admitted ticket waits");
             }
             for (ticket, wait) in &folded.current {
+                if report.handed_back.contains_key(ticket) {
+                    continue;
+                }
                 let _ = writeln!(
                     out,
                     "  {ticket}{} last told {}: {}",
                     stage(ticket),
                     wait.at,
                     phrase(wait)
+                );
+            }
+            for (ticket, back) in &report.handed_back {
+                let _ = writeln!(
+                    out,
+                    "  {ticket}{}: {}",
+                    stage(ticket),
+                    handed_back(ticket, back)
                 );
             }
             if !report.left_out.tickets.is_empty() {
@@ -2193,6 +2237,7 @@ mod tests {
             folded,
             stages: HashMap::new(),
             yielded: BTreeSet::new(),
+            handed_back: BTreeMap::new(),
             quarantined: false,
             notes: Vec::new(),
             limits: Vec::new(),
@@ -2220,6 +2265,72 @@ mod tests {
             ),
             "{text}"
         );
+    }
+
+    /// OWL-626: a ticket handed back to a person is said so on its `now:`
+    /// line, with its time, what was read, each person's step of a plan, and
+    /// the gesture, over the wait told before; the project's view gives it a
+    /// line of its own instead of that wait.
+    #[test]
+    fn a_handed_back_ticket_is_told_over_its_last_wait() {
+        use owlshift_contracts::review::{OwedStep, PlanStep, StepWhen};
+        let id = TicketId::new("OWL-1").unwrap();
+        let events = [waits(
+            "2026-11-22T09:00:00Z",
+            "OWL-1",
+            data([("watch", json!("waits")), ("reason", json!("slot"))]),
+        )];
+        let step = PlanStep::person("Open it.", "It opens.", StepWhen::BeforeMerge);
+        let report = Report {
+            project: "o/r".to_owned(),
+            only: Some(id.clone()),
+            left_out: Left::default(),
+            folded: fold(&events, "o/r"),
+            stages: HashMap::from([(id.clone(), "ready, handed back".to_owned())]),
+            yielded: BTreeSet::new(),
+            handed_back: BTreeMap::from([(
+                id.clone(),
+                HandedBack {
+                    at: "2026-11-22T10:00:00Z".parse().unwrap(),
+                    read: Some(HandbackRead::Design {
+                        steps: vec![OwedStep {
+                            number: std::num::NonZeroU32::MIN,
+                            step,
+                            when: StepWhen::BeforeMerge,
+                        }],
+                    }),
+                    gesture: "move it back to `Todo`".to_owned(),
+                },
+            )]),
+            quarantined: false,
+            notes: Vec::new(),
+            limits: Vec::new(),
+            slots: None,
+            bases: Vec::new(),
+            overlaps: Vec::new(),
+            claim: None,
+        };
+        let said = "handed back to a person at 2026-11-22T10:00:00Z: every step of its plan is a \
+                    person's (1 step); to give it back to Owlshift, move it back to `Todo` after \
+                    its HANDBACK comment, or `owlshift do OWL-1`\n";
+        let one = render(&report);
+        assert!(one.contains(&format!("\nnow: {said}")), "{one}");
+        assert!(
+            one.contains(
+                "  - **Step 1, before the merge, a person's:** Open it. Result to report: It \
+                 opens.\n"
+            ),
+            "{one}"
+        );
+        let all = render(&Report {
+            only: None,
+            ..report
+        });
+        assert!(
+            all.contains(&format!("  OWL-1 [ready, handed back]: {said}")),
+            "{all}"
+        );
+        assert!(!all.contains("last told"), "{all}");
     }
 
     /// OWL-621: `why TICKET` on a yielded ticket lists its yield, who took
@@ -2265,6 +2376,7 @@ mod tests {
             folded: fold(&events, "o/r"),
             stages: HashMap::new(),
             yielded: BTreeSet::new(),
+            handed_back: BTreeMap::new(),
             quarantined: false,
             notes: Vec::new(),
             limits: Vec::new(),
@@ -2290,6 +2402,7 @@ mod tests {
                 (id("LOC-1424"), "build, parked".to_owned()),
             ]),
             yielded: BTreeSet::from([id("LOC-1520")]),
+            handed_back: BTreeMap::new(),
             ..report
         };
         let text = render(&project);
@@ -2382,6 +2495,7 @@ mod tests {
                 (id("DEMO-10"), "build, needs input".to_owned()),
             ]),
             yielded: BTreeSet::new(),
+            handed_back: BTreeMap::new(),
             quarantined: false,
             notes: Vec::new(),
             limits: Vec::new(),
@@ -2521,6 +2635,7 @@ mod tests {
             folded: Folded::default(),
             stages: HashMap::from([(id("OWL-4"), "verify, parked".to_owned())]),
             yielded: BTreeSet::new(),
+            handed_back: BTreeMap::new(),
             quarantined: true,
             notes: vec!["a note".to_owned()],
             limits: vec![

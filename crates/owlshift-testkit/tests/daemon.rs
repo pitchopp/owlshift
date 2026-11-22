@@ -2089,6 +2089,7 @@ fn the_real_ui_answers_what_the_commands_print_for_the_bench() {
         serde_json::json!([
             "waiting",
             "parked",
+            "handed_back",
             "merges",
             "claims",
             "drain_steps",

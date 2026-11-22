@@ -777,6 +777,7 @@ mod tests {
             ("not_ready", "other"),
             ("needs_input", "decider"),
             ("parked", "other"),
+            ("handed_back", "other"),
             ("a reason of tomorrow", "other"),
         ];
         for (reason, state) in table {

@@ -52,6 +52,7 @@ use crate::claims::{self, FetchedClaim};
 use crate::daemon::digest::{self, HarnessUsage};
 use crate::daemon::{self, requests};
 use crate::events::{EventLog, printable};
+use crate::handed_back::HandedBack;
 use crate::project::{ProjectDirs, TicketHolder};
 use crate::served::{self, Registry};
 use crate::slots::{HeldSlot, MachineSlots};
@@ -148,6 +149,9 @@ pub struct Project {
     /// The tickets whose questions wait for a person, and the parked ones.
     pub waiting: Vec<TicketId>,
     pub parked: Vec<TicketId>,
+    /// The tickets handed back to a person, each with its handback
+    /// (OWL-626).
+    pub handed_back: Vec<(TicketId, HandedBack)>,
     /// The tickets at Watch whose pull request watch follows: for a person
     /// to review (OWL-467). The web UI's header counts them; `render` does
     /// not show them.
@@ -452,7 +456,12 @@ pub fn gather_files(
             Daemon::Running(_) => Watch::NotRead,
             _ => Watch::NoDaemon,
         };
-        let (waiting, parked, in_review) = sorted(why::standings(&dirs, &mut notes));
+        let Sorted {
+            waiting,
+            parked,
+            handed_back,
+            in_review,
+        } = sorted(why::read_standings(&dirs, &mut notes));
         projects.push(Project {
             repository: entry.repository,
             checkout: entry.checkout,
@@ -463,6 +472,7 @@ pub fn gather_files(
             quarantine: quarantine_line(&dirs),
             waiting,
             parked,
+            handed_back,
             in_review,
             merges_waiting: Vec::new(),
             own_claims: Vec::new(),
@@ -508,21 +518,40 @@ pub fn gather_files(
     }
 }
 
-/// The tickets of `standings` whose questions wait for a person, the parked
-/// ones, and those whose pull request watch follows, for a person to review.
-fn sorted(
-    standings: Vec<(TicketId, Status, bool)>,
-) -> (Vec<TicketId>, Vec<TicketId>, Vec<TicketId>) {
-    let (mut waiting, mut parked, mut in_review) = (Vec::new(), Vec::new(), Vec::new());
-    for (ticket, status, followed) in standings {
-        match status {
-            Status::NeedsInput { .. } => waiting.push(ticket),
-            Status::Parked { .. } => parked.push(ticket),
-            Status::Active(_) if followed => in_review.push(ticket),
-            Status::Active(_) => {}
+/// The tickets of a project by what they wait for, as [`sorted`] reads
+/// them.
+#[derive(Debug, Default, PartialEq)]
+struct Sorted {
+    /// The tickets whose questions wait for a person.
+    waiting: Vec<TicketId>,
+    parked: Vec<TicketId>,
+    /// The tickets handed back to a person (OWL-626).
+    handed_back: Vec<(TicketId, HandedBack)>,
+    /// The tickets whose pull request watch follows, for a person to
+    /// review.
+    in_review: Vec<TicketId>,
+}
+
+/// The tickets of `standings` by what they wait for.
+fn sorted(standings: Vec<why::RefStanding>) -> Sorted {
+    let mut sorted = Sorted::default();
+    for standing in standings {
+        let why::RefStanding {
+            ticket,
+            status,
+            followed,
+            handed_back,
+            ..
+        } = standing;
+        match (status, handed_back) {
+            (Status::NeedsInput { .. }, _) => sorted.waiting.push(ticket),
+            (Status::Parked { .. }, _) => sorted.parked.push(ticket),
+            (Status::Active(_), Some(back)) => sorted.handed_back.push((ticket, back)),
+            (Status::Active(_), None) if followed => sorted.in_review.push(ticket),
+            (Status::Active(_), None) => {}
         }
     }
-    (waiting, parked, in_review)
+    sorted
 }
 
 /// The steps a draining daemon waits on: the holders of the slots `held`,
@@ -685,6 +714,8 @@ pub enum Part {
     /// The tickets that wait for a person.
     Waiting,
     Parked,
+    /// The tickets handed back to a person (OWL-626).
+    HandedBack,
     /// The green pull requests that wait for a person to merge.
     Merges,
     /// The claims on the git remote: this runner's and the others'
@@ -701,7 +732,7 @@ pub enum Part {
 
 impl Part {
     /// Every kind, in the order [`render`] prints them.
-    pub const ALL: [Part; 18] = [
+    pub const ALL: [Part; 19] = [
         Part::Daemon,
         Part::MachinePause,
         Part::NoProject,
@@ -713,6 +744,7 @@ impl Part {
         Part::Draining,
         Part::Waiting,
         Part::Parked,
+        Part::HandedBack,
         Part::Merges,
         Part::Claims,
         Part::DrainSteps,
@@ -731,6 +763,7 @@ impl Part {
             self,
             Part::Waiting
                 | Part::Parked
+                | Part::HandedBack
                 | Part::Merges
                 | Part::Claims
                 | Part::DrainSteps
@@ -753,6 +786,7 @@ impl Part {
             Part::Draining => "draining",
             Part::Waiting => "waiting",
             Part::Parked => "parked",
+            Part::HandedBack => "handed_back",
             Part::Merges => "merges",
             Part::Claims => "claims",
             Part::DrainSteps => "drain_steps",
@@ -970,6 +1004,16 @@ pub fn parts(report: &Report, tz: &TimeZone, voice: Voice) -> Vec<(Part, String)
             line(
                 Part::Parked,
                 format!("  parked: {}", tickets(&project.parked)),
+            );
+        }
+        for (ticket, back) in &project.handed_back {
+            line(
+                Part::HandedBack,
+                format!(
+                    "  handed back to a person: {ticket} at {}: {}",
+                    time(back.at, tz),
+                    back.words(ticket, voice)
+                ),
             );
         }
         if !project.merges_waiting.is_empty() {
@@ -1202,29 +1246,52 @@ mod tests {
     #[test]
     fn a_followed_pull_request_at_watch_is_in_review() {
         let id = |id: &str| TicketId::new(id).unwrap();
-        let (waiting, parked, in_review) = sorted(vec![
-            (id("OWL-1"), Status::Active(Stage::Watch), true),
-            (id("OWL-2"), Status::Active(Stage::Watch), false),
-            (
-                id("OWL-3"),
+        let standing = |ticket: &str, status: Status, followed: bool| why::RefStanding {
+            ticket: id(ticket),
+            status,
+            followed,
+            decider: None,
+            yielded: false,
+            handed_back: None,
+        };
+        let back = HandedBack {
+            at: "2026-11-22T10:00:00Z".parse().unwrap(),
+            read: None,
+            gesture: "G".to_owned(),
+        };
+        let sorted = sorted(vec![
+            standing("OWL-1", Status::Active(Stage::Watch), true),
+            standing("OWL-2", Status::Active(Stage::Watch), false),
+            standing(
+                "OWL-3",
                 Status::NeedsInput {
                     return_to: Stage::Design,
                 },
                 false,
             ),
-            (
-                id("OWL-4"),
+            standing(
+                "OWL-4",
                 Status::Parked {
                     at: Stage::Build,
                     awaiting_input: false,
                 },
                 false,
             ),
-            (id("OWL-5"), Status::Active(Stage::Build), false),
+            standing("OWL-5", Status::Active(Stage::Build), false),
+            why::RefStanding {
+                handed_back: Some(back.clone()),
+                ..standing("OWL-6", Status::Active(Stage::Ready), false)
+            },
         ]);
-        assert_eq!(in_review, [id("OWL-1")]);
-        assert_eq!(waiting, [id("OWL-3")]);
-        assert_eq!(parked, [id("OWL-4")]);
+        assert_eq!(
+            sorted,
+            Sorted {
+                waiting: vec![id("OWL-3")],
+                parked: vec![id("OWL-4")],
+                handed_back: vec![(id("OWL-6"), back)],
+                in_review: vec![id("OWL-1")],
+            }
+        );
     }
 
     /// The acceptance: a running daemon serving two projects, one whose
@@ -1713,6 +1780,14 @@ mod tests {
             quarantine: Some(Ok("a run changed the checkout".to_owned())),
             waiting: vec![TicketId::new("OWL-1").unwrap()],
             parked: vec![TicketId::new("OWL-2").unwrap()],
+            handed_back: vec![(
+                TicketId::new("OWL-11").unwrap(),
+                HandedBack {
+                    at: at("2026-11-05T09:30:00Z"),
+                    read: None,
+                    gesture: "move it back to `Todo`".to_owned(),
+                },
+            )],
             in_review: Vec::new(),
             merges_waiting: vec![MergeWait {
                 ticket: TicketId::new("OWL-3").unwrap(),
@@ -1835,6 +1910,10 @@ mod tests {
             "  claimed by lea's runner 0123456789abcdef (as last fetched): OWL-9, expired \
              2026-11-04 09:00: `owlshift release OWL-9` releases it\n",
             "  OWL-10's claim on origin does not read: not JSON\n",
+            // OWL-626: a ticket handed back, when, and how to give it back.
+            "  handed back to a person: OWL-11 at 2026-11-05 09:30: its HANDBACK comment says \
+             what was read; to give it back to Owlshift, move it back to `Todo` after its \
+             HANDBACK comment, or `owlshift do OWL-11`\n",
         ] {
             assert!(text.contains(says), "{says}\n{text}");
         }

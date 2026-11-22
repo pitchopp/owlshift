@@ -1427,6 +1427,34 @@ mod tests {
         );
     }
 
+    /// OWL-626: a ticket handed back to a person, out of flight, has its
+    /// waits card all the same: handed back, when, and the gesture that
+    /// gives it back, with no command the terminal types.
+    #[test]
+    fn a_handed_back_tickets_wait_names_the_gesture() {
+        let bench = Bench::new(Some(BUDGET_FILE));
+        let mut handed_back = record(Stage::Ready);
+        handed_back.state = PersistedState::from(
+            &TicketState::restore(Status::Active(Stage::Ready), 1, 0, 0, 0, 0).unwrap(),
+        );
+        handed_back.handback = Some(owlshift_contracts::drain::TicketHandback {
+            format: owlshift_contracts::format::Format,
+            at: "2026-11-22T10:00:00Z".parse().unwrap(),
+        });
+        bench.write("OWL-1", &handed_back, None);
+        let snap = bench.snapshot("OWL-1");
+        let wait = &snap["waits"]["ticket"]["waits"];
+        assert_eq!(wait["reason"], "handed_back");
+        assert_eq!(wait["since"], "2026-11-22T10:00:00Z");
+        // The gesture of the project file its `served.json` keeps.
+        assert_eq!(
+            wait["text"],
+            "handed back to a person: its HANDBACK comment says what was read; to give it back \
+             to Owlshift, move it back to `Todo` and take the label `owlshift` off and put it on \
+             again after its HANDBACK comment"
+        );
+    }
+
     #[test]
     fn a_ref_with_a_corrupt_file_errors_in_its_sections_only() {
         let bench = busy();
