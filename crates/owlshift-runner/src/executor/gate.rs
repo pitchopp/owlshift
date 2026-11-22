@@ -1953,7 +1953,8 @@ mod tests {
             temp: Some(run_temp.clone()),
             ..paths(&worktree)
         };
-        for make in ["mktemp -d", "mktemp", "mktemp -t owl637"] {
+        // GNU's `-t` takes a template, which needs its X's; macOS's a prefix.
+        for make in ["mktemp -d", "mktemp", "mktemp -t owl637.XXXXXX"] {
             let line = format!(
                 "case \"$({make})\" in '{}'/*) ;; *) exit 1;; esac",
                 run_temp.display()
