@@ -879,8 +879,14 @@ fn composer(root: &RootFiles) -> Result<Option<Found>, String> {
         );
     }
     match PHPUNIT_SETTINGS.into_iter().find(|name| root.has(name)) {
+        // PHPUnit 9 and earlier look for `phpunit.xml` and
+        // `phpunit.xml.dist` only, and run without settings otherwise.
         Some(settings) => found.gate.push(line(
-            "vendor/bin/phpunit",
+            if settings == "phpunit.dist.xml" {
+                "vendor/bin/phpunit --configuration phpunit.dist.xml"
+            } else {
+                "vendor/bin/phpunit"
+            },
             format!("{settings}, the settings of PHPUnit"),
         )),
         None => found.notes.push(
@@ -1654,6 +1660,15 @@ check::
         let notes = &d.found[0].notes;
         assert_eq!(notes.len(), 1, "{notes:?}");
         assert!(notes[0].contains("`run_caches.COMPOSER_CACHE_DIR = \"composer\"`"));
+        // PHPUnit 9 does not find `phpunit.dist.xml` itself.
+        let dist = detect(&root(
+            &["composer.json", "composer.lock", "phpunit.dist.xml"],
+            &[],
+        ));
+        assert_eq!(
+            commands(dist.gate()),
+            ["vendor/bin/phpunit --configuration phpunit.dist.xml"]
+        );
         let d = detect(&root(&["composer.json"], &[]));
         assert!(d.setup().next().is_none() && d.gate().next().is_none());
         assert!(d.run_caches().next().is_none());
