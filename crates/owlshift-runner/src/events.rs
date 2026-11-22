@@ -130,6 +130,11 @@ impl<'a> EventSink<'a> {
         &self.project
     }
 
+    /// The log it appends to.
+    pub fn log(&self) -> &EventLog {
+        &self.log
+    }
+
     /// Records one event about `ticket`, now, and returns it.
     pub fn emit(
         &mut self,

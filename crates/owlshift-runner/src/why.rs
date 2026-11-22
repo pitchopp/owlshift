@@ -30,8 +30,10 @@ use jiff::Timestamp;
 use owlshift_contracts::event::{Event, EventKind};
 use owlshift_contracts::ids::TicketId;
 use owlshift_contracts::ready::{Outcome, ReadySnapshot};
+use owlshift_contracts::refs::TicketHeld;
 use owlshift_contracts::service::BY_UI;
 use owlshift_core::base::{Check, Entry, Verdict};
+use owlshift_core::schedule::natural_cmp;
 use owlshift_core::state::Status;
 use owlshift_core::usage::Standing;
 use owlshift_core::vocab::{Harness, Stage};
@@ -568,6 +570,209 @@ fn resource_text(value: &Value) -> String {
     }
 }
 
+/// A ticket that waits for what a stopped holder keeps (OWL-623;
+/// architecture section 5, "A stopped holder yields", *Shown*): its told
+/// collision wait's resource, in `why`'s words.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Waiter {
+    pub ticket: TicketId,
+    /// "zone `app/one.rs`", "resource `migrations`", "the whole
+    /// repository" or "the browser".
+    pub resource: String,
+}
+
+/// The most tickets [`kept_words`] names for one resource, and the most
+/// resources it names.
+const KEPT_TICKETS: usize = 5;
+const KEPT_RESOURCES: usize = 10;
+
+/// The tickets a collision wait names as its holder when the holder is one
+/// of this runner's tickets: not a person's ticket, a pull request or another
+/// runner's claim (`in_flight::Named::data`). `None` otherwise.
+fn own_holders(data: &Data) -> Option<Vec<&str>> {
+    let outside = data.contains_key("pull_request")
+        || data.contains_key("operator")
+        || data.get("person").and_then(Value::as_bool) == Some(true);
+    if outside {
+        return None;
+    }
+    Some(
+        data.get("tickets")?
+            .as_array()?
+            .iter()
+            .filter_map(Value::as_str)
+            .collect(),
+    )
+}
+
+/// The tickets among `current` whose told wait is a collision behind
+/// `holder`, one of this runner's tickets, and that `counts` keeps, in
+/// ticket order (OWL-623). A wait names the first holder its check found,
+/// both when two tickets share a path (OWL-449): a ticket that a second
+/// holder also keeps back is counted for the one its wait names.
+pub fn waiting_for<'a>(
+    current: impl IntoIterator<Item = &'a Waiting>,
+    holder: &TicketId,
+    counts: &dyn Fn(&TicketId) -> bool,
+) -> Vec<Waiter> {
+    let mut kept: Vec<Waiter> = current
+        .into_iter()
+        .filter(|wait| wait.reason == "collision" && wait.ticket != *holder && counts(&wait.ticket))
+        .filter(|wait| {
+            own_holders(&wait.data).is_some_and(|holders| holders.contains(&holder.as_str()))
+        })
+        .map(|wait| Waiter {
+            ticket: wait.ticket.clone(),
+            resource: wait
+                .data
+                .get("resource")
+                .map_or_else(|| "a resource".to_owned(), resource_text),
+        })
+        .collect();
+    kept.sort_by(|a, b| natural_cmp(a.ticket.as_str(), b.ticket.as_str()));
+    kept
+}
+
+/// "1 ticket waits" or "N tickets wait".
+pub fn tickets_wait(count: usize) -> String {
+    if count == 1 {
+        "1 ticket waits".to_owned()
+    } else {
+        format!("{count} tickets wait")
+    }
+}
+
+/// `kept` in words, grouped by resource: "DEMO-2 and DEMO-3 for zone `a`;
+/// DEMO-4 for resource `m`", at most five tickets named for a resource and
+/// ten resources, the rest counted.
+pub fn kept_words(kept: &[Waiter]) -> String {
+    let mut by_resource: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
+    for one in kept {
+        by_resource
+            .entry(one.resource.as_str())
+            .or_default()
+            .push(one.ticket.as_str());
+    }
+    let mut groups: Vec<String> = by_resource
+        .iter()
+        .take(KEPT_RESOURCES)
+        .map(|(resource, tickets)| {
+            let mut named = tickets
+                .iter()
+                .take(KEPT_TICKETS)
+                .copied()
+                .collect::<Vec<_>>();
+            let more = tickets.len().saturating_sub(KEPT_TICKETS);
+            let last = if more > 0 {
+                format!("{more} more")
+            } else {
+                named.pop().unwrap_or_default().to_owned()
+            };
+            let list = if named.is_empty() {
+                last
+            } else {
+                format!("{} and {last}", named.join(", "))
+            };
+            format!("{list} for {resource}")
+        })
+        .collect();
+    if by_resource.len() > KEPT_RESOURCES {
+        groups.push(format!(
+            "and {} more resources",
+            by_resource.len() - KEPT_RESOURCES
+        ));
+    }
+    groups.join("; ")
+}
+
+/// Whether the drain still reads a ticket, its run slots aside (OWL-484, the
+/// rule of `owlshift status --waits`, OWL-477): it is in flight, or the
+/// latest ready snapshot lists it.
+pub(crate) struct DrainReads {
+    /// The tickets whose ref holds; `None` when the refs cannot be listed,
+    /// and then every ticket is read.
+    in_flight: Option<BTreeSet<TicketId>>,
+    /// The latest ready snapshot's tickets; `None` without one that reads.
+    pub listed: Option<BTreeSet<TicketId>>,
+}
+
+impl DrainReads {
+    /// Reads it for the project of `dirs`, `snapshot` being its ready
+    /// snapshot as read.
+    pub(crate) fn read(
+        dirs: &ProjectDirs,
+        snapshot: &Result<Option<ReadySnapshot>, String>,
+        now: Timestamp,
+        notes: &mut Vec<String>,
+    ) -> Self {
+        Self {
+            in_flight: in_flight(dirs),
+            listed: crate::ready::listed_of(snapshot, now, "", notes),
+        }
+    }
+
+    pub(crate) fn reads(&self, ticket: &TicketId) -> bool {
+        self.in_flight
+            .as_ref()
+            .is_none_or(|holding| holding.contains(ticket))
+            || self
+                .listed
+                .as_ref()
+                .is_some_and(|listed| listed.contains(ticket))
+    }
+}
+
+/// The tickets that wait for each of `holders` in the project of `dirs`, as
+/// its events `events` tell under the spelling `project` (OWL-623): those the
+/// drain still reads and whose ref is neither parked nor waiting for an
+/// answer. A holder nothing waits for is left out.
+pub(crate) fn kept_waiting(
+    dirs: &ProjectDirs,
+    events: &[Event],
+    project: &str,
+    holders: &[TicketId],
+    now: Timestamp,
+    notes: &mut Vec<String>,
+) -> BTreeMap<TicketId, Vec<Waiter>> {
+    let folded = fold(events, project);
+    let reads = DrainReads::read(dirs, &crate::ready::read(dirs), now, notes);
+    let stopped: BTreeSet<TicketId> = read_standings(dirs, notes)
+        .into_iter()
+        .filter(|standing| !matches!(standing.status, Status::Active(_)))
+        .map(|standing| standing.ticket)
+        .collect();
+    let counts = |ticket: &TicketId| reads.reads(ticket) && !stopped.contains(ticket);
+    holders
+        .iter()
+        .map(|holder| {
+            (
+                holder.clone(),
+                waiting_for(folded.current.values(), holder, &counts),
+            )
+        })
+        .filter(|(_, kept)| !kept.is_empty())
+        .collect()
+}
+
+/// `name` as the event log spells it: the project of its latest event that
+/// is `name` in any ASCII case, or `name` when none is. A project's folder
+/// is the same whatever the case (`project::component`); its events are
+/// folded by their exact spelling.
+pub(crate) fn spelled(events: &[Event], name: &str) -> String {
+    events
+        .iter()
+        .rev()
+        .find(|event| event.project.eq_ignore_ascii_case(name))
+        .map_or_else(|| name.to_owned(), |event| event.project.clone())
+}
+
+/// Whether the record `held` holds nothing because it yielded, which it does
+/// under `policy.overlap = "rebase"` alone (OWL-621): under `exclusive` a
+/// yielded record holds its whole set again.
+pub(crate) fn keeps_nothing(held: Option<&TicketHeld>, rebase: bool) -> bool {
+    rebase && held.is_some_and(TicketHeld::yielded)
+}
+
 /// A harness's standing, as the report says it.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Limit {
@@ -720,9 +925,8 @@ pub fn gather(
     // A wait is current only while the drain reads its ticket: it is in
     // flight, holds a run slot, or the latest ready snapshot lists it
     // (OWL-484, as `status --waits`, OWL-477).
-    let in_flight = in_flight(dirs);
     let snapshot = crate::ready::read(dirs);
-    let listed = crate::ready::listed_of(&snapshot, now, "", &mut notes);
+    let reads = DrainReads::read(dirs, &snapshot, now, &mut notes);
     if let Ok(Some(snapshot)) = &snapshot {
         folded.absorb_ready(snapshot);
     }
@@ -735,16 +939,10 @@ pub fn gather(
     };
     let mut left_out = Left {
         tickets: BTreeSet::new(),
-        no_snapshot: listed.is_none(),
+        no_snapshot: reads.listed.is_none(),
     };
     folded.current.retain(|ticket, _| {
-        let read = in_flight
-            .as_ref()
-            .is_none_or(|holding| holding.contains(ticket))
-            || running(ticket)
-            || listed
-                .as_ref()
-                .is_some_and(|listed| listed.contains(ticket));
+        let read = reads.reads(ticket) || running(ticket);
         if !read {
             left_out.tickets.insert(ticket.clone());
         }
@@ -982,12 +1180,7 @@ pub(crate) fn read_standings(dirs: &ProjectDirs, notes: &mut Vec<String>) -> Vec
                                 .record
                                 .open_ask()
                                 .map(|ask| ask.decider.account.clone()),
-                            yielded: rebase
-                                && stored
-                                    .record
-                                    .held
-                                    .as_ref()
-                                    .is_some_and(|held| held.yielded()),
+                            yielded: keeps_nothing(stored.record.held.as_ref(), rebase),
                             ticket,
                             status,
                         });
@@ -1081,6 +1274,24 @@ pub fn render(report: &Report) -> String {
             .get(ticket)
             .map_or_else(String::new, |stage| format!(" [{stage}]"))
     };
+    let stopped = |ticket: &TicketId| {
+        report
+            .stages
+            .get(ticket)
+            .is_some_and(|stage| stage.ends_with("parked") || stage.ends_with("needs input"))
+    };
+    // The tickets a parked holder that keeps what it holds makes wait
+    // (OWL-623), counted as the daily digest and the PARKED comment count.
+    let kept_back = |ticket: &TicketId| -> Vec<Waiter> {
+        let parked = report
+            .stages
+            .get(ticket)
+            .is_some_and(|stage| stage.ends_with("parked"));
+        if !parked || report.yielded.contains(ticket) {
+            return Vec::new();
+        }
+        waiting_for(folded.current.values(), ticket, &|waiter| !stopped(waiter))
+    };
     match &report.only {
         Some(ticket) => {
             let history = folded.history.get(ticket).map(Vec::as_slice).unwrap_or(&[]);
@@ -1123,6 +1334,15 @@ pub fn render(report: &Report) -> String {
                 }
                 None => {}
             }
+            let kept = kept_back(ticket);
+            if !kept.is_empty() {
+                let _ = writeln!(
+                    out,
+                    "{} for what it keeps while parked: {}",
+                    tickets_wait(kept.len()),
+                    kept_words(&kept)
+                );
+            }
             if let Some(claim) = &report.claim {
                 let _ = writeln!(out, "claim: {claim}");
             }
@@ -1162,10 +1382,20 @@ pub fn render(report: &Report) -> String {
                     } else {
                         "keeps what it holds"
                     };
+                    let kept = kept_back(ticket);
+                    let waiting = if kept.is_empty() {
+                        String::new()
+                    } else {
+                        format!(
+                            "; {} for it: {}",
+                            tickets_wait(kept.len()),
+                            kept_words(&kept)
+                        )
+                    };
                     let _ = writeln!(
                         out,
                         "  {ticket} [{stage}]: waits for a person (an answer, or \
-                         `owlshift continue`) and {holding}"
+                         `owlshift continue`) and {holding}{waiting}"
                     );
                 }
             }
@@ -2071,6 +2301,133 @@ mod tests {
             "{text}"
         );
         assert!(text.contains("LOC-1424 [build, parked]: waits for a person (an answer, or `owlshift continue`) and keeps what it holds"), "{text}");
+    }
+
+    /// OWL-623: the tickets told to wait behind a holder, one of this
+    /// runner's tickets, are counted and grouped by resource, the rest
+    /// counted past the caps; `why` tells them on a parked holder that keeps
+    /// what it holds, a stopped waiter aside, and the drain reads a ticket
+    /// with no ref that its snapshot lists.
+    #[test]
+    fn the_tickets_waiting_for_a_holder_are_counted_and_grouped_by_resource() {
+        let id = |name: &str| TicketId::new(name).unwrap();
+        let behind = |ticket: &str, holders: &[&str], resource: Value, extra: &[(&str, Value)]| {
+            let mut details = crate::events::data([
+                ("watch", json!("waits")),
+                ("reason", json!("collision")),
+                ("resource", resource),
+                ("tickets", json!(holders)),
+            ]);
+            for (key, value) in extra {
+                details.insert((*key).to_owned(), value.clone());
+            }
+            waits("2026-11-22T09:00:00Z", ticket, details)
+        };
+        let zone = || json!({"zone": "app/a.rs"});
+        let events = [
+            behind("DEMO-2", &["DEMO-1"], zone(), &[]),
+            behind("DEMO-3", &["DEMO-1"], json!({"named": "migrations"}), &[]),
+            behind("DEMO-4", &["DEMO-1"], zone(), &[("person", json!(true))]),
+            behind("DEMO-5", &[], zone(), &[("pull_request", json!(12))]),
+            behind("DEMO-6", &["DEMO-1"], zone(), &[("operator", json!("ana"))]),
+            behind("DEMO-7", &["DEMO-9"], zone(), &[]),
+            behind("DEMO-10", &["DEMO-9", "DEMO-1"], zone(), &[]),
+            waits(
+                "2026-11-22T09:00:00Z",
+                "DEMO-11",
+                crate::events::data([
+                    ("drain", json!("waits")),
+                    ("reason", json!("slot")),
+                    ("tickets", json!(["DEMO-1"])),
+                ]),
+            ),
+        ];
+        let folded = fold(&events, "o/r");
+        let holder = id("DEMO-1");
+        let all = waiting_for(folded.current.values(), &holder, &|_| true);
+        assert_eq!(
+            kept_words(&all),
+            "DEMO-3 for resource `migrations`; DEMO-2 and DEMO-10 for zone `app/a.rs`"
+        );
+        let counted = waiting_for(folded.current.values(), &holder, &|t| *t != id("DEMO-10"));
+        assert_eq!(counted.len(), 2);
+
+        let many = |tickets: usize, resources: usize| -> Vec<Waiter> {
+            (1..=resources)
+                .flat_map(|r| {
+                    (1..=tickets).map(move |t| Waiter {
+                        ticket: TicketId::new(format!("T-{r}{t:02}")).unwrap(),
+                        resource: format!("zone `r{r:02}`"),
+                    })
+                })
+                .collect()
+        };
+        assert_eq!(
+            kept_words(&many(7, 1)),
+            "T-101, T-102, T-103, T-104, T-105 and 2 more for zone `r01`"
+        );
+        assert!(
+            kept_words(&many(1, 12)).ends_with("T-1001 for zone `r10`; and 2 more resources"),
+            "{}",
+            kept_words(&many(1, 12))
+        );
+
+        let report = Report {
+            project: "o/r".to_owned(),
+            only: None,
+            left_out: Left::default(),
+            folded,
+            stages: HashMap::from([
+                (id("DEMO-1"), "build, parked".to_owned()),
+                (id("DEMO-10"), "build, needs input".to_owned()),
+            ]),
+            yielded: BTreeSet::new(),
+            quarantined: false,
+            notes: Vec::new(),
+            limits: Vec::new(),
+            slots: None,
+            bases: Vec::new(),
+            overlaps: Vec::new(),
+            claim: None,
+        };
+        let text = render(&report);
+        assert!(
+            text.contains(
+                "  DEMO-1 [build, parked]: waits for a person (an answer, or `owlshift continue`) \
+                 and keeps what it holds; 2 tickets wait for it: DEMO-3 for resource \
+                 `migrations`; DEMO-2 for zone `app/a.rs`\n"
+            ),
+            "{text}"
+        );
+        let one = render(&Report {
+            only: Some(id("DEMO-1")),
+            ..report.clone()
+        });
+        assert!(
+            one.contains(
+                "2 tickets wait for what it keeps while parked: DEMO-3 for resource `migrations`; \
+                 DEMO-2 for zone `app/a.rs`\n"
+            ),
+            "{one}"
+        );
+        let yielded = render(&Report {
+            yielded: BTreeSet::from([id("DEMO-1")]),
+            ..report
+        });
+        assert!(!yielded.contains("wait for it"), "{yielded}");
+
+        // A ticket with no ref yet waits through the ready snapshot.
+        let reads = DrainReads {
+            in_flight: Some(BTreeSet::from([id("DEMO-2")])),
+            listed: Some(BTreeSet::from([id("DEMO-12")])),
+        };
+        assert!(reads.reads(&id("DEMO-2")) && reads.reads(&id("DEMO-12")));
+        assert!(!reads.reads(&id("DEMO-13")));
+        let unlisted = DrainReads {
+            in_flight: None,
+            listed: None,
+        };
+        assert!(unlisted.reads(&id("DEMO-13")));
     }
 
     /// OWL-588: `why TICKET` names who holds the ticket's claim: this

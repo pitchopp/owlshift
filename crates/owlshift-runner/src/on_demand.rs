@@ -5410,6 +5410,10 @@ impl OnDemand<'_> {
             .is_some()
             .then(|| self.yield_at_park(p, parked))
             .flatten();
+        // Otherwise it keeps what it holds: who waits for it (OWL-623).
+        let waiting = (questions.is_some() && yields.is_none())
+            .then(|| self.kept_waiting(p, sink))
+            .flatten();
         let kept = match questions {
             Some(questions) => self
                 .store(p, parked, questions)
@@ -5433,6 +5437,7 @@ impl OnDemand<'_> {
                 Restart::Do
             },
             yields: yields.clone(),
+            waiting,
         };
         let unposted = match Writer::new(self.tracker).post_parked(&comment) {
             Ok(posted) => {
@@ -5509,6 +5514,34 @@ impl OnDemand<'_> {
     /// whole repository yields it now, its yield's time kept with the park;
     /// what it yields, for the PARKED comment and the event. `None` when it
     /// yields nothing.
+    /// The tickets that wait for what a parked ticket keeps, as the events
+    /// tell it at the park (OWL-623; architecture section 5, "A stopped
+    /// holder yields", *Shown*): `None` when it holds nothing, yielded it
+    /// under `rebase`, or nothing waits. Display only: a log or refs that do
+    /// not read give a line less, never a failed park.
+    fn kept_waiting(&self, p: &Prepared, sink: &EventSink<'_>) -> Option<writer::Waiters> {
+        let held = p.held.as_ref()?;
+        let rebase = self.overlap_policy(p) == Overlap::Rebase;
+        if crate::why::keeps_nothing(Some(held), rebase) {
+            return None;
+        }
+        let (events, _) = crate::why::read_events(sink.log().path()).ok()?;
+        let kept = crate::why::kept_waiting(
+            self.dirs,
+            &events,
+            sink.project(),
+            std::slice::from_ref(&p.ticket),
+            (self.clock)(),
+            &mut Vec::new(),
+        )
+        .into_values()
+        .next()?;
+        Some(writer::Waiters {
+            count: kept.len(),
+            words: crate::why::kept_words(&kept),
+        })
+    }
+
     fn yield_at_park(&self, p: &mut Prepared, parked: &TicketState) -> Option<Yielding> {
         let holds = p.held.as_ref().is_some_and(TicketHeld::yieldable);
         let now = (self.clock)();

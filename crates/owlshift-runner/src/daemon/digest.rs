@@ -31,6 +31,7 @@ use owlshift_contracts::format::{ContractError, Format};
 use owlshift_contracts::ids::TicketId;
 use owlshift_contracts::service::{BY_DAEMON, DigestRecord};
 use owlshift_core::floor::same_account;
+use owlshift_core::schedule::natural_cmp;
 use owlshift_core::state::Status;
 use owlshift_core::vocab::Harness;
 use serde_json::{Value, json};
@@ -42,7 +43,7 @@ use crate::events::{EventLog, EventSink, data as event_data, printable};
 use crate::project::ProjectDirs;
 use crate::usage::{self as machine_usage, UsageStore};
 use crate::watch::presence;
-use crate::why::{self, Limit};
+use crate::why::{self, Limit, Waiter};
 use crate::{notify, step};
 
 /// The most tickets a digest names in one list; the rest are counted.
@@ -127,6 +128,9 @@ pub struct Summary {
     /// The parked tickets that yielded what they hold under `policy.overlap
     /// = "rebase"` (OWL-621).
     pub yielding: BTreeSet<TicketId>,
+    /// The parked tickets that keep what they hold and that other tickets
+    /// wait for, each with those tickets, in ticket order (OWL-623).
+    pub kept: Vec<(TicketId, Vec<Waiter>)>,
     /// Whether `<data>/service/pause` stands.
     pub all_paused: bool,
     /// The served projects whose pause file stands.
@@ -152,12 +156,14 @@ pub fn gather(
             .iter()
             .any(|(repo, _)| repo.to_string().eq_ignore_ascii_case(project))
     };
+    let mut events = Vec::new();
     match why::read_events(EventLog::in_dir(data).path()) {
-        Ok((events, bad)) => {
+        Ok((read, bad)) => {
+            events = read;
             // A delivery on a line that is not an event is not counted:
             // said, as `why` says it.
             notes.extend(bad.into_iter().map(|why| format!("the event log's {why}")));
-            for event in events {
+            for event in &events {
                 let says = |key: &str, value: &str| {
                     event.data.get(key).and_then(Value::as_str) == Some(value)
                 };
@@ -167,9 +173,9 @@ pub fn gather(
                     && says("target", "forge")
                     && says("action", "pull_request")
                     && served(&event.project)
-                    && let Some(ticket) = event.ticket
+                    && let Some(ticket) = &event.ticket
                 {
-                    summary.delivered.insert(ticket);
+                    summary.delivered.insert(ticket.clone());
                 }
             }
         }
@@ -180,6 +186,7 @@ pub fn gather(
         // whose open ask another person decides is not counted; with no
         // operator told, every waiting ticket is, as before P10.
         let operator = presence::operator(dirs);
+        let mut keeping = Vec::new();
         for standing in why::read_standings(dirs, &mut notes) {
             let ticket = standing.ticket;
             match standing.status {
@@ -195,16 +202,29 @@ pub fn gather(
                 Status::Parked { .. } => {
                     if standing.yielded {
                         summary.yielding.insert(ticket.clone());
+                    } else {
+                        keeping.push(ticket.clone());
                     }
                     summary.parked.insert(ticket);
                 }
                 Status::Active(_) => {}
             }
         }
+        // OWL-623: who waits for a parked ticket that keeps what it holds.
+        // What the refs or the snapshot leave unread is said above or is not
+        // a failure (a snapshot older than two passes): a line less.
+        if !keeping.is_empty() {
+            let project = why::spelled(&events, &repo.to_string());
+            let kept = why::kept_waiting(dirs, &events, &project, &keeping, now, &mut Vec::new());
+            summary.kept.extend(kept);
+        }
         if requests::pause(dirs).is_some() {
             summary.paused.push(repo.to_string());
         }
     }
+    summary
+        .kept
+        .sort_by(|a, b| natural_cmp(a.0.as_str(), b.0.as_str()));
     summary.all_paused = requests::machine_pause(data).is_some();
     summary.usage = usage(data, caps, now, &mut notes)
         .into_iter()
@@ -304,10 +324,31 @@ pub fn line(summary: &Summary, tz: &TimeZone) -> String {
             0 => String::new(),
             n => format!(", {n} of them yielding what they hold"),
         };
+        // OWL-623: who a parked ticket that keeps what it holds makes wait.
+        let mut kept: Vec<String> = summary
+            .kept
+            .iter()
+            .take(NAMED)
+            .map(|(holder, waiting)| {
+                let count = waiting.len();
+                let tickets = if count == 1 { "ticket" } else { "tickets" };
+                format!(
+                    "; {holder} keeps {count} {tickets} waiting: {}",
+                    why::kept_words(waiting)
+                )
+            })
+            .collect();
+        if summary.kept.len() > NAMED {
+            kept.push(format!(
+                "; {} more keep tickets waiting",
+                summary.kept.len() - NAMED
+            ));
+        }
         parts.push(format!(
-            "{} parked ({}{yielding})",
+            "{} parked ({}{yielding}{})",
             summary.parked.len(),
-            named(&summary.parked)
+            named(&summary.parked),
+            kept.concat()
         ));
     }
     if summary.all_paused {
@@ -595,6 +636,16 @@ mod tests {
             waiting: ids(&["OWL-8"]),
             parked: ids(&["OWL-9", "OWL-10"]),
             yielding: ids(&["OWL-10"]),
+            kept: vec![(
+                TicketId::new("OWL-9").unwrap(),
+                ["OWL-11", "OWL-12"]
+                    .into_iter()
+                    .map(|ticket| Waiter {
+                        ticket: TicketId::new(ticket).unwrap(),
+                        resource: "zone `app/one.rs`".to_owned(),
+                    })
+                    .collect(),
+            )],
             all_paused: false,
             paused: vec!["acme/web".to_owned()],
             usage: vec![
@@ -606,7 +657,8 @@ mod tests {
             line(&summary, &paris()),
             "Owlshift digest: 7 delivered (OWL-1, OWL-2, OWL-3, OWL-4, OWL-5 and 2 more); 1 \
              waiting for a person (OWL-8); 2 parked (OWL-10, OWL-9, 1 of them yielding what \
-             they hold); paused: acme/web; usage: claude at its limit until Mon 14:05, codex \
+             they hold; OWL-9 keeps 2 tickets waiting: OWL-11 and OWL-12 for zone \
+             `app/one.rs`); paused: acme/web; usage: claude at its limit until Mon 14:05, codex \
              42 %. More: `owlshift status`."
         );
         let quiet = Summary {

@@ -830,6 +830,7 @@ mod tests {
                 open,
                 restart: Restart::Continue,
                 yields: None,
+                waiting: None,
             }
             .render(),
         ];

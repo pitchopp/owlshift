@@ -51,7 +51,7 @@ use crate::served;
 use crate::slots::{HeldSlot, MachineSlots};
 use crate::ticket_ref::{self, RefState};
 use crate::voice::Voice;
-use crate::why::{self, Folded, Waiting};
+use crate::why::{self, Folded, Waiting, spelled};
 
 /// The reasons the drain tells a ticket of the ready column that is not
 /// admitted: such a ticket is neither admitted nor in flight, so it is not
@@ -104,6 +104,10 @@ pub struct ProjectRead {
     /// dedicated checkout last fetched them, which the web UI's overview
     /// shows as held (OWL-588): read with the refs, nothing fetched.
     pub claims: Vec<FetchedClaim>,
+    /// The tickets whose record yielded what it holds under the project's
+    /// `policy.overlap = "rebase"` (OWL-621): no ticket is told to wait for
+    /// them (OWL-623).
+    pub yielded: BTreeSet<TicketId>,
 }
 
 /// What a ticket ref says that the document's rows do not: for the web UI's
@@ -256,18 +260,6 @@ pub fn gather_folded(
     }
 }
 
-/// `name` as the event log spells it: the project of its latest event that
-/// is `name` in any ASCII case, or `name` when none is. A project's folder
-/// is the same whatever the case (`project::component`); its events are
-/// folded by their exact spelling.
-fn spelled(events: &[owlshift_contracts::event::Event], name: &str) -> String {
-    events
-        .iter()
-        .rev()
-        .find(|event| event.project.eq_ignore_ascii_case(name))
-        .map_or_else(|| name.to_owned(), |event| event.project.clone())
-}
-
 fn project(
     data: &Path,
     mut folded: Folded,
@@ -281,6 +273,7 @@ fn project(
     let mut refs = Vec::new();
     let mut details = BTreeMap::new();
     let mut claims = Vec::new();
+    let mut yielded = BTreeSet::new();
     if dirs.checkout().exists() {
         let git = crate::project::runner_git();
         match ticket_ref::read_all_with(&git, &dirs.checkout(), None, true) {
@@ -290,13 +283,32 @@ fn project(
                     .into_iter()
                     .filter(|claim| runner.as_ref().is_none_or(|runner| !claim.is_of(runner)))
                     .collect();
+                // The switch is read only when a parked record yielded: the
+                // web UI polls this (OWL-623).
+                let mut rebase = None;
                 refs = all
                     .into_iter()
                     .map(|(ticket, stored)| match stored {
                         Ok(stored) => {
                             let holds = held::holds(&stored);
                             let state = ticket_ref::state_of(&stored);
-                            details.insert(ticket.clone(), detail(&stored, &state));
+                            let detail = detail(&stored, &state);
+                            let held = stored.record.held.as_ref();
+                            if detail.status == RefStatus::Parked
+                                && held.is_some_and(|held| held.yielded())
+                                && why::keeps_nothing(
+                                    held,
+                                    *rebase.get_or_insert_with(|| {
+                                        crate::project::overlap_at_origin_head(
+                                            &git,
+                                            &dirs.checkout(),
+                                        ) == owlshift_core::vocab::Overlap::Rebase
+                                    }),
+                                )
+                            {
+                                yielded.insert(ticket.clone());
+                            }
+                            details.insert(ticket.clone(), detail);
                             (ticket, state, holds)
                         }
                         Err(why) => (ticket, RefState::Unread(why), true),
@@ -364,6 +376,7 @@ fn project(
         details,
         snapshot,
         claims,
+        yielded,
     }
 }
 
@@ -504,19 +517,50 @@ fn build_project(project: &ProjectRead, held: &[HeldSlot], voice: Voice) -> (Pro
                 "needs_input",
                 "waits for its decider's answer, and keeps what it holds",
             )),
-            RefStatus::Parked => Some(person(
-                "parked",
-                match voice {
-                    Voice::Terminal => {
-                        "parked: waits for a person's `owlshift continue`, and keeps what it holds"
-                    }
-                    // The Restart button is offered exactly when the latest
-                    // record is parked (`ui::ticket::actions`).
-                    Voice::Ui => "parked: waits for a person's Restart, and keeps what it holds",
-                },
-            )),
+            RefStatus::Parked => {
+                // The Restart button is offered exactly when the latest
+                // record is parked (`ui::ticket::actions`).
+                let restart = match voice {
+                    Voice::Terminal => "`owlshift continue`",
+                    Voice::Ui => "Restart",
+                };
+                // One that yielded under `rebase` holds nothing (OWL-621),
+                // as `why` words it.
+                let holding = if project.yielded.contains(&row.ticket) {
+                    "has yielded what it held"
+                } else {
+                    "keeps what it holds"
+                };
+                Some(person(
+                    "parked",
+                    &format!("parked: waits for a person's {restart}, and {holding}"),
+                ))
+            }
             _ => project.folded.current.get(&row.ticket).map(told),
         };
+    }
+    // A parked holder that keeps what it holds says who waits for it
+    // (OWL-623): the tickets shown here that are neither parked nor wait for
+    // an answer, as `why` counts them.
+    let counted: BTreeSet<TicketId> = tickets
+        .values()
+        .filter(|row| !matches!(row.ref_status, RefStatus::Parked | RefStatus::NeedsInput))
+        .map(|row| row.ticket.clone())
+        .collect();
+    for row in tickets.values_mut() {
+        if row.ref_status != RefStatus::Parked || project.yielded.contains(&row.ticket) {
+            continue;
+        }
+        let kept = why::waiting_for(project.folded.current.values(), &row.ticket, &|waiter| {
+            counted.contains(waiter)
+        });
+        if let (false, Some(wait)) = (kept.is_empty(), row.waits.as_mut()) {
+            wait.text.push_str(&format!(
+                "; {} for it: {}",
+                why::tickets_wait(kept.len()),
+                why::kept_words(&kept)
+            ));
+        }
     }
     let mut tickets: Vec<TicketWaits> = tickets.into_values().collect();
     tickets.sort_by(|a, b| natural_cmp(a.ticket.as_str(), b.ticket.as_str()));
@@ -950,6 +994,7 @@ mod tests {
             details: BTreeMap::new(),
             snapshot: Ok(None),
             claims: Vec::new(),
+            yielded: BTreeSet::new(),
         }
     }
 
@@ -1490,9 +1535,9 @@ mod tests {
     /// the Restart button in the UI's, and nothing else of the wait differs.
     #[test]
     fn a_parked_wait_is_worded_by_voice() {
-        let read = parked_read();
-        let terminal = super::build(&read, Voice::Terminal);
-        let ui = super::build(&read, Voice::Ui);
+        let alone = parked_read();
+        let terminal = super::build(&alone, Voice::Terminal);
+        let ui = super::build(&alone, Voice::Ui);
         let in_terminal = row(&terminal, "DEMO-1").waits.clone().unwrap();
         let in_ui = row(&ui, "DEMO-1").waits.clone().unwrap();
         assert_eq!(in_terminal.text, PARKED_TERMINAL);
@@ -1507,6 +1552,46 @@ mod tests {
                 text: String::new(),
                 ..in_ui
             }
+        );
+
+        // OWL-623: the tickets shown that wait for it, a parked one aside;
+        // once it yielded under `rebase`, none, and it no longer claims to
+        // keep what it holds.
+        let behind = |ticket: &str| {
+            waits(
+                "2026-10-28T09:00:00Z",
+                ticket,
+                vec![
+                    ("watch", json!("waits")),
+                    ("reason", json!("collision")),
+                    ("stage", json!("build")),
+                    ("resource", json!({"zone": "app/one.rs"})),
+                    ("tickets", json!(["DEMO-1"])),
+                ],
+            )
+        };
+        let parked = at(Status::Parked {
+            at: Stage::Build,
+            awaiting_input: false,
+        });
+        let mut project = project(
+            vec![
+                ("DEMO-1", parked.clone()),
+                ("DEMO-2", at(Status::Active(Stage::Build))),
+                ("DEMO-3", parked),
+            ],
+            &[behind("DEMO-2"), behind("DEMO-3")],
+        );
+        let keeping = super::build(&read(vec![project.clone()], Vec::new()), Voice::Ui);
+        assert_eq!(
+            row(&keeping, "DEMO-1").waits.as_ref().unwrap().text,
+            format!("{PARKED_UI}; 1 ticket waits for it: DEMO-2 for zone `app/one.rs`")
+        );
+        project.yielded.insert(id("DEMO-1"));
+        let yielded = super::build(&read(vec![project], Vec::new()), Voice::Ui);
+        assert_eq!(
+            row(&yielded, "DEMO-1").waits.as_ref().unwrap().text,
+            "parked: waits for a person's Restart, and has yielded what it held"
         );
     }
 
