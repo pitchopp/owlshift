@@ -41,7 +41,7 @@
     "format": {
       "description": "The format version of this document.",
       "type": "integer",
-      "const": 8
+      "const": 9
     },
     "merge_retry": {
       "description": "When a person's `owlshift continue` at Watch last asked for the\nmerge to be tried again (format 6, OWL-445): watch tries again a head\nwhose merge GitHub refused for good before then. Not a refusal: those\nlive in watch's memory only.",
@@ -332,6 +332,15 @@
             "$ref": "#/$defs/AnsweredReview"
           }
         },
+        "steps": {
+          "description": "For the run at Watch after a person's steps were answered, a\ncorrection's push that names no question (format 9, OWL-619): the\nsteps of the plan it followed, the person's steps whose defects it\nfixed and the agent's steps it built, in increasing order.",
+          "type": "array",
+          "items": {
+            "type": "integer",
+            "format": "uint32",
+            "minimum": 1
+          }
+        },
         "summary": {
           "description": "The run's `summary`.",
           "type": "string"
@@ -429,7 +438,7 @@
           ]
         },
         {
-          "description": "A correction run's, after the decider reversed a decision (format 3,\nOWL-146).",
+          "description": "A correction run's, after the decider reversed a decision (format 3,\nOWL-146), or, its report naming steps instead of questions (format 9,\nOWL-619), the run at Watch after the decider answered a person's\nsteps: both follow the decider's word, and count as a correction.",
           "type": "string",
           "const": "correction"
         },

@@ -22,8 +22,11 @@ use owlshift_contracts::drain::{KeptProposal, ProposalOutcome, ProposingRun, Tic
 use owlshift_contracts::event::EventKind;
 use owlshift_contracts::format::Format;
 use owlshift_contracts::ids::TicketId;
-use owlshift_contracts::refs::{DeliveredPullRequest, OwedReport};
-use owlshift_contracts::result::Followup;
+use owlshift_contracts::refs::{
+    DeliveredPullRequest, EndedWhy, KeptReport, OwedReport, PushKind, TicketDelivery,
+};
+use owlshift_contracts::result::{Followup, FollowupSource};
+use owlshift_contracts::review::{StepWhen, TicketPlan};
 use owlshift_core::proposal::normalize_title;
 
 use crate::events::{EventSink, data};
@@ -102,6 +105,94 @@ pub fn owe<'a>(
     added.then_some(next)
 }
 
+/// The follow-up a ticket owes once its pull request is merged, for the
+/// steps of its plan due after the merge (OWL-619; architecture section 4,
+/// "A person's steps"): one for its decider, listing each step, a person's
+/// and an agent's waiting on one. `None` until `delivery` ended merged, and
+/// for a plan that owes no such step. Its title names the ticket, so it is
+/// never another ticket's duplicate.
+pub fn after_merge(
+    parent: &TicketId,
+    delivery: &TicketDelivery,
+    plan: Option<&TicketPlan>,
+) -> Option<Followup> {
+    if delivery.ended.as_ref().map(|ended| ended.why) != Some(EndedWhy::Merged) {
+        return None;
+    }
+    let steps: Vec<String> = plan?
+        .owed_steps()
+        .into_iter()
+        .filter(|owed| owed.when == StepWhen::AfterMerge)
+        .map(|owed| {
+            if owed.step.is_person() {
+                format!(
+                    "Step {}, a person's: {} Result to report: {}",
+                    owed.number,
+                    owed.step.what.trim(),
+                    owed.step.test.trim()
+                )
+            } else {
+                format!(
+                    "Step {}, left for a person's result: {}",
+                    owed.number,
+                    owed.step.what.trim()
+                )
+            }
+        })
+        .collect();
+    if steps.is_empty() {
+        return None;
+    }
+    Some(Followup {
+        title: format!("After {parent}'s merge: the steps for a person"),
+        why: format!(
+            "The plan of {parent} leaves these steps to a person once its change is merged: they \
+             act on what the merge deploys. They are for {parent}'s decider, who does them or \
+             hands them on; Owlshift assigns no one."
+        ),
+        evidence: steps,
+        source: FollowupSource::Agent,
+        done_when: "Each step listed is done and its result reported on this ticket.".to_owned(),
+        blocked_by_parent: false,
+    })
+}
+
+/// Whether the ticket whose ref keeps `delivery`, `plan` and `proposals`
+/// owes its [`after_merge`] follow-up and does not keep it yet: the
+/// filing after the end files it then (OWL-619).
+pub fn owes_after_merge(
+    parent: &TicketId,
+    delivery: &TicketDelivery,
+    plan: Option<&TicketPlan>,
+    proposals: Option<&TicketProposals>,
+) -> bool {
+    after_merge(parent, delivery, plan).is_some_and(|followup| {
+        let fingerprint = fingerprint(&followup.title);
+        !proposals.is_some_and(|kept| kept.proposals.iter().any(|p| p.fingerprint == fingerprint))
+    })
+}
+
+/// `current` with `followup`, proposed by the delivery, owed when it does
+/// not keep it yet ([`owe`]'s rules); `None` when that adds nothing.
+pub fn owe_one(current: Option<&TicketProposals>, followup: &Followup) -> Option<TicketProposals> {
+    let report = OwedReport {
+        kind: PushKind::Delivery,
+        count: 1,
+        report: Some(KeptReport {
+            summary: String::new(),
+            gate: None,
+            checks: Vec::new(),
+            questions: Vec::new(),
+            notes: Vec::new(),
+            followups: vec![followup.clone()],
+            reviews: Vec::new(),
+            steps: Vec::new(),
+        }),
+        unchanged: false,
+    };
+    owe(current, [&report])
+}
+
 /// The follow-ups of a report, each with what `proposals` keeps of it.
 pub fn reported(followups: &[Followup], proposals: Option<&TicketProposals>) -> Vec<Proposed> {
     followups
@@ -161,6 +252,10 @@ pub struct Filing<'a> {
     pub admission_label: Option<&'a str>,
     pub parent: &'a TicketId,
     pub pull_request: Option<&'a DeliveredPullRequest>,
+    /// The fingerprint of the follow-up a merged ticket owes for its steps
+    /// due after the merge ([`after_merge`], OWL-619): a person's steps the
+    /// plan holds, which the three a parent files neither limit nor count.
+    pub exempt: Option<String>,
 }
 
 /// Files the proposals `proposals` owes, oldest first, and returns whether
@@ -224,19 +319,20 @@ pub fn file_owed(
         }
     }
     let writer = Writer::new(filing.tracker);
+    let exempt = |kept: &KeptProposal| filing.exempt.as_deref() == Some(kept.fingerprint.as_str());
     for i in unfiled {
         let filed = proposals
             .proposals
             .iter()
-            .filter(|p| matches!(p.outcome, ProposalOutcome::Filed { .. }))
+            .filter(|p| matches!(p.outcome, ProposalOutcome::Filed { .. }) && !exempt(p))
             .count();
         let kept = &mut proposals.proposals[i];
-        if filed >= MAX_PER_PARENT {
+        if !exempt(kept) && filed >= MAX_PER_PARENT {
             settled(parent, kept, ProposalOutcome::OverLimit, sink);
             changed = true;
             continue;
         }
-        if filed + unsure >= MAX_PER_PARENT {
+        if !exempt(kept) && filed + unsure >= MAX_PER_PARENT {
             continue;
         }
         let description = ProposalDescription {
@@ -391,6 +487,7 @@ mod tests {
                 notes: vec![],
                 followups: titles.iter().map(|t| followup(t)).collect(),
                 reviews: Vec::new(),
+                steps: Vec::new(),
             }),
             unchanged: false,
         }
@@ -491,6 +588,17 @@ mod tests {
         admission_label: Option<&str>,
         proposals: &mut TicketProposals,
     ) -> (bool, Vec<Event>) {
+        file_exempting(tracker, admission_label, proposals, None)
+    }
+
+    /// [`file`], the proposal of fingerprint `exempt` outside the three per
+    /// parent (OWL-619).
+    fn file_exempting(
+        tracker: &dyn Tracker,
+        admission_label: Option<&str>,
+        proposals: &mut TicketProposals,
+        exempt: Option<String>,
+    ) -> (bool, Vec<Event>) {
         let dir = tempfile::tempdir().unwrap();
         let log = EventLog::in_dir(dir.path());
         let mut out = Vec::new();
@@ -506,6 +614,7 @@ mod tests {
             admission_label,
             parent: &parent,
             pull_request: Some(&pull_request),
+            exempt,
         };
         let changed = file_owed(
             &filing,
@@ -795,6 +904,85 @@ mod tests {
         };
         assert!(refusal.contains("refused by the policy floor"), "{refusal}");
         assert!(tracker.filed.borrow().is_empty());
+    }
+
+    /// OWL-619: a merged ticket owes one follow-up for the steps of its plan
+    /// due after the merge, each listed; a followed or a closed one owes
+    /// none; it is owed once, and filed past the three its parent filed.
+    #[test]
+    fn a_merged_ticket_owes_one_follow_up_for_its_steps_after_the_merge() {
+        use owlshift_contracts::refs::Ended;
+        use owlshift_contracts::review::PlanStep;
+
+        let parent = id("OWL-7");
+        let mut plan = TicketPlan::parse(include_str!(
+            "../../owlshift-contracts/tests/fixtures/ticket-plan.json"
+        ))
+        .unwrap();
+        plan.plan.steps = vec![
+            PlanStep::agent("Add GREETING.md.", "It says Hello."),
+            PlanStep::person(
+                "Open it on staging.",
+                "It reads Hello.",
+                StepWhen::BeforeMerge,
+            ),
+            PlanStep::person(
+                "Tell the team it is live.",
+                "They saw it.",
+                StepWhen::AfterMerge,
+            ),
+        ];
+        let ended = |why| {
+            let mut delivery = TicketDelivery::new("owlshift/owl-7", "main");
+            delivery.ended = Some(Ended {
+                why,
+                at: jiff::Timestamp::UNIX_EPOCH,
+                head: None,
+            });
+            delivery
+        };
+        let merged = ended(EndedWhy::Merged);
+        let followed = TicketDelivery::new("owlshift/owl-7", "main");
+        assert!(after_merge(&parent, &followed, Some(&plan)).is_none());
+        assert!(after_merge(&parent, &ended(EndedWhy::Closed), Some(&plan)).is_none());
+        assert!(after_merge(&parent, &merged, None).is_none());
+        let followup = after_merge(&parent, &merged, Some(&plan)).unwrap();
+        assert_eq!(
+            followup.title,
+            "After OWL-7's merge: the steps for a person"
+        );
+        assert_eq!(
+            followup.evidence,
+            ["Step 3, a person's: Tell the team it is live. Result to report: They saw it."]
+        );
+        assert!(owes_after_merge(&parent, &merged, Some(&plan), None));
+
+        let mut three = owed(&["A", "B", "C"]);
+        for (n, kept) in three.proposals.iter_mut().enumerate() {
+            kept.outcome = ProposalOutcome::Filed {
+                ticket: id(&format!("OWL-{}", 30 + n)),
+            };
+        }
+        let mut proposals = owe_one(Some(&three), &followup).unwrap();
+        assert!(owe_one(Some(&proposals), &followup).is_none(), "owed once");
+        assert!(!owes_after_merge(
+            &parent,
+            &merged,
+            Some(&plan),
+            Some(&proposals)
+        ));
+        let tracker = Inbox::new(|_| Ok(vec![]), |_| filed_as("OWL-40"));
+        let exempt = Some(fingerprint(&followup.title));
+        let (changed, _) = file_exempting(&tracker, None, &mut proposals, exempt);
+        assert!(changed);
+        assert_eq!(
+            outcomes(&proposals)[3],
+            ProposalOutcome::Filed {
+                ticket: id("OWL-40")
+            }
+        );
+        let filed = tracker.filed.borrow();
+        assert!(filed[0].contains("Tell the team it is live."), "{filed:?}");
     }
 
     #[test]

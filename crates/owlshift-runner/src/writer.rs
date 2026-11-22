@@ -916,7 +916,9 @@ fn for_a_person(owed: &[OwedStep]) -> Option<String> {
     let lines: Vec<String> = owed.iter().map(owed_line).collect();
     Some(format!(
         "## For a person\n\nOwlshift built the agent's steps of the plan. These steps are a \
-         person's, or wait on a person's result:\n\n{}",
+         person's, or wait on a person's result:\n\n{}\n\nOwlshift asks the ticket's decider \
+         for each result due before the merge, then builds the steps that wait on them; the \
+         steps due after the merge are filed as one follow-up once it is merged.",
         bullets(&lines)
     ))
 }
@@ -927,8 +929,12 @@ fn for_a_person(owed: &[OwedStep]) -> Option<String> {
 pub struct Corrected {
     /// The questions of the decisions the decider's replies reversed.
     pub questions: Vec<String>,
+    /// For the run after a person's steps were answered, instead of
+    /// questions (OWL-619): the steps of the plan it followed, the person's
+    /// steps whose defects it fixed and the agent's steps it built.
+    pub steps: Vec<NonZeroU32>,
     /// Whether the run pushed a commit; `false` when the pull request
-    /// already followed the replies.
+    /// already followed the replies, or the run found nothing to change.
     pub pushed: bool,
 }
 
@@ -974,13 +980,18 @@ const CORRECTED_LEAD: &str = "**Corrected after delivery,**";
 const UNCORRECTED_LEAD: &str = "**No correction needed after delivery:**";
 const REVIEWED_LEAD: &str = "**Changed after reviews on the pull request,**";
 const UNREVIEWED_LEAD: &str = "**No change after reviews on the pull request:**";
-const LEADS: [&str; 6] = [
+/// The run after a person's steps were answered (OWL-619).
+const STEPPED_LEAD: &str = "**Changed after a person's steps,**";
+const UNSTEPPED_LEAD: &str = "**No change after a person's steps:**";
+const LEADS: [&str; 8] = [
     FIX_PASS_LEAD,
     REBASE_LEAD,
     CORRECTED_LEAD,
     UNCORRECTED_LEAD,
     REVIEWED_LEAD,
     UNREVIEWED_LEAD,
+    STEPPED_LEAD,
+    UNSTEPPED_LEAD,
 ];
 
 /// The most characters a list of a lead line takes (OWL-228): the red
@@ -1140,6 +1151,29 @@ impl DeliveryReport {
                 format!(
                     "{UNREVIEWED_LEAD} the Build run found nothing to change for {listed}, and \
                      nothing was pushed."
+                )
+            })
+        } else if let Some(stepped) = self
+            .correction
+            .as_ref()
+            .filter(|correction| !correction.steps.is_empty())
+        {
+            // The run after a person's steps (OWL-619), its steps named.
+            let steps: Vec<String> = stepped
+                .steps
+                .iter()
+                .map(|step| format!("step {step}"))
+                .collect();
+            let steps = listed(&steps, LEAD_LIST_CHARS);
+            Some(if stepped.pushed {
+                format!(
+                    "{STEPPED_LEAD} to follow the decider's results on {steps}; a step \
+                     answered as a defect is asked again."
+                )
+            } else {
+                format!(
+                    "{UNSTEPPED_LEAD} the run found nothing to change for {steps}, and nothing \
+                     was pushed; a step answered as a defect is asked again."
                 )
             })
         } else {
@@ -5592,6 +5626,7 @@ mod tests {
             approval: None,
             published: None,
             owed: vec![NonZeroU32::new(3).unwrap()],
+            checks: Vec::new(),
         };
         let owed = kept.owed_steps();
         let body = pull_request_body("Greets.\n", &owed, Some("Closes #12".to_owned()));
@@ -5601,7 +5636,9 @@ mod tests {
              steps are a person's, or wait on a person's result:\n\n- **Step 2, before the \
              merge, a person's:** Open the page on staging, which fi\u{200B}xes #12. Result to \
              report: It greets.\n- **Step 3, before the merge, left for a person's result:** \
-             Record the greeting's screenshot.\n\nCloses #12"
+             Record the greeting's screenshot.\n\nOwlshift asks the ticket's decider for each \
+             result due before the merge, then builds the steps that wait on them; the steps \
+             due after the merge are filed as one follow-up once it is merged.\n\nCloses #12"
         );
         let mut delivered = report(Ok(set(Mergeable::Mergeable, vec![])));
         delivered.person_steps = owed;
@@ -8396,6 +8433,7 @@ Reply `Q1: B`, `ok` to take every recommendation, or in your own words.
         };
         let corrected = |pushed| Corrected {
             questions: vec!["Which greeting?".to_owned()],
+            steps: Vec::new(),
             pushed,
         };
         vec![
@@ -8422,7 +8460,40 @@ Reply `Q1: B`, `ok` to take every recommendation, or in your own words.
             with(&|r| r.correction = Some(corrected(false))),
             with(&|r| r.reviewed = Some(reviewed(true))),
             with(&|r| r.reviewed = Some(reviewed(false))),
+            // The run after a person's steps (OWL-619).
+            with(&|r| r.correction = Some(stepped(true))),
+            with(&|r| r.correction = Some(stepped(false))),
         ]
+    }
+
+    /// The run after a person's steps, on steps 2 and 3 (OWL-619).
+    fn stepped(pushed: bool) -> Corrected {
+        Corrected {
+            questions: Vec::new(),
+            steps: [2, 3].map(|n| NonZeroU32::new(n).unwrap()).to_vec(),
+            pushed,
+        }
+    }
+
+    /// The run after a person's steps names the steps it followed, and says
+    /// when it found nothing to change (OWL-619).
+    #[test]
+    fn the_run_after_a_person_s_steps_names_them_in_its_lead() {
+        let mut changed = report(Ok(set(Mergeable::Mergeable, vec![])));
+        changed.correction = Some(stepped(true));
+        assert_eq!(
+            changed.second_line(),
+            "**Changed after a person's steps,** to follow the decider's results on step 2, \
+             step 3; a step answered as a defect is asked again."
+        );
+        changed.correction = Some(stepped(false));
+        assert!(
+            changed
+                .second_line()
+                .starts_with("**No change after a person's steps:** the run found nothing"),
+            "{}",
+            changed.second_line()
+        );
     }
 
     /// A review loop answering two reviews (OWL-307).
@@ -8491,6 +8562,7 @@ Reply `Q1: B`, `ok` to take every recommendation, or in your own words.
         let unchanged = |mut report: DeliveryReport, question: &str| {
             report.correction = Some(Corrected {
                 questions: vec![question.to_owned()],
+                steps: Vec::new(),
                 pushed: false,
             });
             report
@@ -9300,6 +9372,7 @@ Reply `Q1: B`, `ok` to take every recommendation, or in your own words.
             questions: (0..64)
                 .map(|n| format!("{n} {}", "q".repeat(2_000)))
                 .collect(),
+            steps: Vec::new(),
             pushed: true,
         });
         let mut odd = first.clone();

@@ -48,8 +48,10 @@ use crate::Role;
 /// design review, verify and the arbiter (OWL-430); format 29 the build
 /// role's `overlaps` (OWL-449); format 30 `check_failure.rerun`, the
 /// runner's re-run that failed again before the fix run (OWL-513); format 31
-/// a plan step's `by` and `when`, a person's step (OWL-619).
-pub const BRIEF_FORMAT: u32 = 31;
+/// a plan step's `by` and `when`, a person's step (OWL-619); format 32
+/// Build's `person_steps`, a person's results its run at Watch follows
+/// (OWL-619).
+pub const BRIEF_FORMAT: u32 = 32;
 /// The format version of `result.json`. Format 4 added the resolver's
 /// `resolutions` (OWL-138); format 5 the resolver's own `category` on each
 /// decision (OWL-144); format 6 refuses `decisions` from the build role
@@ -113,8 +115,10 @@ pub const QUESTIONS_FORMAT: u32 = 19;
 /// loop's push and its report's answered `reviews` (OWL-300); format 6 merge
 /// on green's `merging` and `merge_retry` (OWL-445); format 7 the automatic
 /// re-run's `rerun` (OWL-513); format 8 the rebase run's commit,
-/// `pushing.rebased` (OWL-514); formats 1 to 7 are still read.
-pub const DELIVERY_FORMAT: u32 = 8;
+/// `pushing.rebased` (OWL-514); format 9 a correction's report naming the
+/// person's `steps` its run followed (OWL-619); formats 1 to 8 are still
+/// read.
+pub const DELIVERY_FORMAT: u32 = 9;
 /// The format version of a ticket's intake record (`intake.json` on a ticket
 /// ref, OWL-245). Format 2 adds the `zones` and `resources` intake declared
 /// (OWL-402); format 1 is still read, as holding the whole repository.
@@ -125,8 +129,10 @@ pub const INTAKE_FORMAT: u32 = 2;
 pub const PROPOSALS_FORMAT: u32 = 2;
 /// The format version of a ticket's plan (`plan.json` on a ticket ref,
 /// OWL-300). Format 2 adds a step's `by` and `when` and the Build's `owed`
-/// (OWL-619); format 1 is still read, every step the agent's.
-pub const PLAN_FORMAT: u32 = 2;
+/// (OWL-619); format 3 the `checks` of a person's steps asked at Watch
+/// (OWL-619); format 1 is still read, every step the agent's, and format 2
+/// with no check.
+pub const PLAN_FORMAT: u32 = 3;
 /// The format version of a ticket's review record (`review.json` on a ticket
 /// ref, OWL-300). Format 2 adds the colleagues' reviews `relayed` to the
 /// decider (OWL-585); format 1 is still read.

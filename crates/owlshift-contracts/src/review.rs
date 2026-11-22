@@ -612,6 +612,57 @@ pub struct TicketPlan {
     /// increasing order. A new plan starts with none.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub owed: Vec<NonZeroU32>,
+    /// The person's steps due before the merge that a round at Watch asked
+    /// its decider (format 3, OWL-619; architecture section 4, "A person's
+    /// steps"): one at most a step, in the plan's order, with how its
+    /// decider answered once the round was. A check answered a defect is
+    /// dropped once the run after it lands, so its step is asked again; one
+    /// answered `passed` stays, and its step is never asked again. A new
+    /// plan starts with none.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub checks: Vec<StepCheck>,
+}
+
+/// A person's step a round at Watch asked its decider (OWL-619).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct StepCheck {
+    /// The step's place in the plan, from 1: a person's step due before
+    /// the merge.
+    pub step: NonZeroU32,
+    /// The round that asked it.
+    pub round: NonZeroU32,
+    /// Its question's id in that round.
+    pub question: QuestionId,
+    /// How its decider answered, once the round was answered.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub answer: Option<StepAnswer>,
+}
+
+/// How a person's step was answered (OWL-619).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum StepAnswer {
+    /// The step gave the result it names: the option the runner
+    /// recommends.
+    Passed,
+    /// Anything else: the other option, or the decider's own words, which
+    /// the next run at Watch follows.
+    Defect,
+}
+
+/// What the run at Watch after a person's steps were answered follows
+/// ([`TicketPlan::steps_run`], OWL-619).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StepsRun {
+    /// Every answered check, in the plan's order: the results the run
+    /// reads.
+    pub answered: Vec<StepCheck>,
+    /// The steps answered a defect, which the run fixes.
+    pub defects: Vec<NonZeroU32>,
+    /// The agent's steps owed before the merge whose person's steps before
+    /// them all passed, which the run builds.
+    pub build: Vec<NonZeroU32>,
 }
 
 /// The plan as last published in the ticket's document (OWL-350,
@@ -684,28 +735,42 @@ impl TicketPlan {
 
     /// Parses and validates a `plan.json`. A format-1 one, written before a
     /// plan could hold a person's step (OWL-619), is read with every step
-    /// the agent's and nothing owed, and refused when it says otherwise; the
-    /// next write gives it the current format.
+    /// the agent's and nothing owed, and refused when it says otherwise; a
+    /// format-2 one, written before a round at Watch asked a person's steps,
+    /// is read with no check, and refused when it keeps one; the next write
+    /// gives either the current format.
     pub fn parse(input: &str) -> Result<Self, ContractError> {
-        let plan: Self =
-            match format::parse_json_older(Self::CONTRACT, 1, PLAN_FORMAT, "owed", input) {
-                Some(read) => {
-                    let plan: Self = read?;
-                    if let Some(n) = plan
+        let older = format::parse_json_older(Self::CONTRACT, 1, PLAN_FORMAT, "owed", input)
+            .map(|read| (1, read))
+            .or_else(|| {
+                format::parse_json_older(Self::CONTRACT, 2, PLAN_FORMAT, "checks", input)
+                    .map(|read| (2, read))
+            });
+        let plan: Self = match older {
+            Some((older, read)) => {
+                let plan: Self = read?;
+                if older == 1
+                    && let Some(n) = plan
                         .plan
                         .steps
                         .iter()
                         .position(|step| step.by != StepBy::Agent || step.when.is_some())
-                    {
-                        return Err(ContractError::invalid(
-                            Self::CONTRACT,
-                            format!("format 1 records no person's step, but steps[{n}] says one"),
-                        ));
-                    }
-                    plan
+                {
+                    return Err(ContractError::invalid(
+                        Self::CONTRACT,
+                        format!("format 1 records no person's step, but steps[{n}] says one"),
+                    ));
                 }
-                None => format::parse_json(Self::CONTRACT, PLAN_FORMAT, input)?,
-            };
+                if !plan.checks.is_empty() {
+                    return Err(ContractError::invalid(
+                        Self::CONTRACT,
+                        format!("format {older} records no checks"),
+                    ));
+                }
+                plan
+            }
+            None => format::parse_json(Self::CONTRACT, PLAN_FORMAT, input)?,
+        };
         plan.validate()?;
         Ok(plan)
     }
@@ -736,13 +801,129 @@ impl TicketPlan {
         owed
     }
 
-    /// How many of [`TicketPlan::owed_steps`] are due before the merge:
-    /// merge on green waits while any is owed (OWL-619).
+    /// How many of [`TicketPlan::owed_steps`] due before the merge are still
+    /// owed (OWL-619): a person's step its decider has not answered as
+    /// passed, and an agent's step no run at Watch has built yet. Merge on
+    /// green waits while any is.
     pub fn owed_before_merge(&self) -> usize {
         self.owed_steps()
             .iter()
             .filter(|owed| owed.when == StepWhen::BeforeMerge)
+            .filter(|owed| !owed.step.is_person() || !self.passed(owed.number))
             .count()
+    }
+
+    /// The check kept for step `number`, if one is.
+    fn check(&self, number: NonZeroU32) -> Option<&StepCheck> {
+        self.checks.iter().find(|check| check.step == number)
+    }
+
+    /// Whether step `number`'s decider answered it as passed.
+    fn passed(&self, number: NonZeroU32) -> bool {
+        self.check(number)
+            .is_some_and(|check| check.answer == Some(StepAnswer::Passed))
+    }
+
+    /// The person's steps due before the merge that a round at Watch asks
+    /// next (OWL-619), in the plan's order: those with no check, or a check
+    /// no answer settled (an ask a round no longer waits on). Never one
+    /// answered as passed, nor one answered a defect, whose run comes
+    /// first.
+    pub fn steps_to_ask(&self) -> Vec<(NonZeroU32, PlanStep)> {
+        self.plan
+            .person_steps()
+            .filter(|(_, step)| step.when == Some(StepWhen::BeforeMerge))
+            .filter(|(number, _)| self.check(*number).is_none_or(|c| c.answer.is_none()))
+            .map(|(number, step)| (number, step.clone()))
+            .collect()
+    }
+
+    /// What the run at Watch after a round of a person's steps follows
+    /// (OWL-619), `None` when no run is due: the steps answered a defect,
+    /// which it fixes, and the agent's steps owed before the merge whose
+    /// person's steps before them all passed, which it builds. A defect
+    /// never releases an agent's step: its own step is asked again first.
+    pub fn steps_run(&self) -> Option<StepsRun> {
+        let answered: Vec<StepCheck> = self
+            .plan
+            .person_steps()
+            .filter_map(|(number, _)| self.check(number))
+            .filter(|check| check.answer.is_some())
+            .cloned()
+            .collect();
+        let defects: Vec<NonZeroU32> = answered
+            .iter()
+            .filter(|check| check.answer == Some(StepAnswer::Defect))
+            .map(|check| check.step)
+            .collect();
+        let build: Vec<NonZeroU32> = self
+            .owed_steps()
+            .into_iter()
+            .filter(|owed| owed.when == StepWhen::BeforeMerge && !owed.step.is_person())
+            .filter(|owed| {
+                self.plan
+                    .person_steps()
+                    .take_while(|(number, _)| *number < owed.number)
+                    .all(|(number, _)| self.passed(number))
+            })
+            .map(|owed| owed.number)
+            .collect();
+        (!defects.is_empty() || !build.is_empty()).then_some(StepsRun {
+            answered,
+            defects,
+            build,
+        })
+    }
+
+    /// What the run [`TicketPlan::steps_run`] gives settles once it lands,
+    /// or ends with nothing to change (OWL-619): its defects' checks are
+    /// dropped, so those steps are asked again, and the agent's steps it
+    /// built leave `owed`. Read from the plan alone, so the push's adoption
+    /// after a crash settles what its run was given.
+    pub fn settle_steps_run(&mut self) {
+        let Some(run) = self.steps_run() else {
+            return;
+        };
+        self.checks
+            .retain(|check| check.answer != Some(StepAnswer::Defect));
+        self.owed.retain(|number| !run.build.contains(number));
+    }
+
+    /// Keeps how the checks asked in `round` were answered, `answer` giving
+    /// each by its question's id; a check with no answer given stays as it
+    /// is. Whether any changed.
+    pub fn answer_round(
+        &mut self,
+        round: NonZeroU32,
+        answer: impl Fn(&QuestionId) -> Option<StepAnswer>,
+    ) -> bool {
+        let mut changed = false;
+        for check in self
+            .checks
+            .iter_mut()
+            .filter(|check| check.round == round && check.answer.is_none())
+        {
+            if let Some(given) = answer(&check.question) {
+                check.answer = Some(given);
+                changed = true;
+            }
+        }
+        changed
+    }
+
+    /// Keeps that `round` asks `asked`, each step with its question's id,
+    /// in place of any check of those steps an earlier ask left unanswered.
+    pub fn ask_steps(&mut self, round: NonZeroU32, asked: &[(NonZeroU32, QuestionId)]) {
+        self.checks
+            .retain(|check| !asked.iter().any(|(step, _)| *step == check.step));
+        self.checks
+            .extend(asked.iter().map(|(step, question)| StepCheck {
+                step: *step,
+                round,
+                question: question.clone(),
+                answer: None,
+            }));
+        self.checks.sort_by_key(|check| check.step);
     }
 
     pub fn render(&self) -> String {
@@ -781,8 +962,44 @@ impl TicketPlan {
             })?;
         }
         check_owed(&self.plan, &self.owed)
-            .map_err(|reason| ContractError::invalid(Self::CONTRACT, format!("owed: {reason}")))
+            .map_err(|reason| ContractError::invalid(Self::CONTRACT, format!("owed: {reason}")))?;
+        check_checks(&self.plan, &self.checks)
+            .map_err(|reason| ContractError::invalid(Self::CONTRACT, format!("checks: {reason}")))
     }
+}
+
+/// The rules of the checks of a person's steps (OWL-619): each of a person's
+/// step of `plan` due before the merge, in increasing order, each once, and
+/// no two of one round under one question.
+fn check_checks(plan: &Plan, checks: &[StepCheck]) -> Result<(), String> {
+    let mut previous: Option<NonZeroU32> = None;
+    for (n, check) in checks.iter().enumerate() {
+        if previous.is_some_and(|p| p >= check.step) {
+            return Err(format!("step {} is repeated or out of order", check.step));
+        }
+        previous = Some(check.step);
+        let index = usize::try_from(check.step.get() - 1).unwrap_or(usize::MAX);
+        let due_before = plan
+            .steps
+            .get(index)
+            .is_some_and(|step| step.is_person() && step.when == Some(StepWhen::BeforeMerge));
+        if !due_before {
+            return Err(format!(
+                "step {} is not a person's step due before the merge",
+                check.step
+            ));
+        }
+        if checks[..n]
+            .iter()
+            .any(|other| other.round == check.round && other.question == check.question)
+        {
+            return Err(format!(
+                "round {} asks {} for two steps",
+                check.round, check.question
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// The rules of the agent's steps a Build owes (OWL-619): each a step of
@@ -1506,8 +1723,9 @@ mod tests {
               "when": "after_merge" }
         ]);
         json!({
-            "format": 2,
+            "format": 3,
             "owed": [3],
+            "checks": [{ "step": 2, "round": 1, "question": "Q1" }],
             "plan": plan,
             "text_sha256": "a".repeat(64),
             "base": "b".repeat(40),
@@ -1625,7 +1843,7 @@ mod tests {
                     "plan_sha256",
                 ),
                 (&|d| d["plan"]["extra"] = 1.into(), "unknown field"),
-                (&|d| d["format"] = 3.into(), "upgrade Owlshift"),
+                (&|d| d["format"] = 4.into(), "upgrade Owlshift"),
                 // A person's step, its `when`, and the steps owed (OWL-619).
                 (
                     &|d| d["plan"]["steps"][1]["by"] = "robot".into(),
@@ -1660,12 +1878,35 @@ mod tests {
                 (&|d| d["owed"] = json!([5]), "owed: step 5 is not a step"),
                 (&|d| d["owed"] = json!([2]), "owed: step 2 is a person's"),
                 (&|d| d["owed"] = json!([1]), "owed: step 1 comes before"),
-                // Format 1 holds no person's step and owes nothing.
+                // The checks of a person's steps asked at Watch.
+                (
+                    &|d| d["checks"][0]["step"] = 4.into(),
+                    "checks: step 4 is not a person's step due before the merge",
+                ),
+                (
+                    &|d| d["checks"][0]["step"] = 3.into(),
+                    "checks: step 3 is not a person's step",
+                ),
+                (
+                    &|d| d["checks"][0]["answer"] = "maybe".into(),
+                    "unknown variant",
+                ),
+                (
+                    &|d| {
+                        let check = d["checks"][0].clone();
+                        d["checks"].as_array_mut().unwrap().push(check);
+                    },
+                    "checks: step 2 is repeated",
+                ),
+                // Format 2 keeps no check; format 1 holds no person's step
+                // and owes nothing.
+                (&|d| d["format"] = 2.into(), "format 2 records no checks"),
                 (&|d| d["format"] = 1.into(), "format 1 records no owed"),
                 (
                     &|d| {
                         d["format"] = 1.into();
                         d.as_object_mut().unwrap().remove("owed");
+                        d.as_object_mut().unwrap().remove("checks");
                     },
                     "format 1 records no person's step, but steps[1] says one",
                 ),
@@ -1727,10 +1968,19 @@ mod tests {
         older["format"] = 1.into();
         older["plan"] = plan();
         older.as_object_mut().unwrap().remove("owed");
+        older.as_object_mut().unwrap().remove("checks");
         let read = TicketPlan::parse(&older.to_string()).unwrap();
         assert!(read.owed_steps().is_empty());
         assert_eq!(read.owed_before_merge(), 0);
-        assert!(read.render().contains("\"format\": 2"), "{}", read.render());
+        assert!(read.render().contains("\"format\": 3"), "{}", read.render());
+        // Format 2, written before a round asked a person's steps, is read
+        // with no check.
+        let mut second = ticket_plan();
+        second["format"] = 2.into();
+        second.as_object_mut().unwrap().remove("checks");
+        let unchecked = TicketPlan::parse(&second.to_string()).unwrap();
+        assert!(unchecked.checks.is_empty());
+        assert_eq!(unchecked.owed_before_merge(), 2);
         assert_eq!(
             read.plan.part_canonical(PlanPart::Steps),
             r#"[{"what":"S1","test":"T1"}]"#
@@ -1740,6 +1990,85 @@ mod tests {
             serde_json::to_string(&person).unwrap(),
             r#"{"what":"Check it.","test":"It shows.","by":"person","when":"before_merge"}"#
         );
+    }
+
+    /// The life of a person's steps due before the merge (OWL-619): asked,
+    /// answered, the run that follows the answers, and the hold it lifts. A
+    /// defect never releases the agent's step after it, and a step answered
+    /// as passed is never asked again. Whatever is still owed, a round or a
+    /// run is due.
+    #[test]
+    fn a_person_s_steps_are_asked_answered_and_settled_by_their_run() {
+        let n = |n: u32| NonZeroU32::new(n).unwrap();
+        let mut document = ticket_plan();
+        document["plan"]["steps"] = json!([
+            { "what": "S1", "test": "T1" },
+            { "what": "Check it.", "test": "It shows.", "by": "person", "when": "before_merge" },
+            { "what": "S3", "test": "T3" },
+            { "what": "Check more.", "test": "It holds.", "by": "person", "when": "before_merge" },
+            { "what": "S5", "test": "T5" },
+            { "what": "Check it deployed.", "test": "It serves.", "by": "person",
+              "when": "after_merge" }
+        ]);
+        document["owed"] = json!([3, 5]);
+        document.as_object_mut().unwrap().remove("checks");
+        let mut plan = TicketPlan::parse(&document.to_string()).unwrap();
+        // Something is due whenever something is owed before the merge.
+        let due = |plan: &TicketPlan| !plan.steps_to_ask().is_empty() || plan.steps_run().is_some();
+        let asked = |plan: &TicketPlan| -> Vec<u32> {
+            plan.steps_to_ask().iter().map(|(n, _)| n.get()).collect()
+        };
+        assert_eq!((asked(&plan), plan.owed_before_merge()), (vec![2, 4], 4));
+        assert!(plan.steps_run().is_none());
+
+        let round = n(1);
+        plan.ask_steps(
+            round,
+            &[(n(2), QuestionId::nth(1)), (n(4), QuestionId::nth(2))],
+        );
+        TicketPlan::parse(&plan.render()).unwrap();
+        // Step 2 passes, step 4 reports a defect: the run fixes 4 and builds
+        // 3, whose person's step passed, not 5, which waits on 4.
+        let answers = |id: &QuestionId| match id.as_str() {
+            "Q1" => Some(StepAnswer::Passed),
+            _ => Some(StepAnswer::Defect),
+        };
+        assert!(plan.answer_round(round, answers));
+        assert!(!plan.answer_round(round, answers), "answered once");
+        let run = plan.steps_run().unwrap();
+        assert_eq!((run.defects, run.build), (vec![n(4)], vec![n(3)]));
+        assert_eq!(run.answered.len(), 2);
+        assert_eq!(plan.owed_before_merge(), 3);
+        assert!(asked(&plan).is_empty(), "a defect's run comes first");
+        plan.settle_steps_run();
+        assert_eq!(plan.owed, [n(5)]);
+        assert_eq!((asked(&plan), plan.owed_before_merge()), (vec![4], 2));
+        assert!(plan.steps_run().is_none());
+        assert!(due(&plan));
+
+        // Asked again, step 4 passes: the run builds step 5, and nothing is
+        // owed once it lands; step 2 was never asked again.
+        let round = n(2);
+        plan.ask_steps(round, &[(n(4), QuestionId::nth(1))]);
+        plan.answer_round(round, |_| Some(StepAnswer::Passed));
+        let run = plan.steps_run().unwrap();
+        assert_eq!((run.defects, run.build), (vec![], vec![n(5)]));
+        plan.settle_steps_run();
+        assert_eq!(
+            (plan.owed_before_merge(), plan.owed.as_slice()),
+            (0, &[][..])
+        );
+        assert!(!due(&plan));
+        let rounds: Vec<(u32, u32)> = plan
+            .checks
+            .iter()
+            .map(|check| (check.step.get(), check.round.get()))
+            .collect();
+        assert_eq!(rounds, [(2, 1), (4, 2)]);
+        // A check an ask left unanswered is asked again, in its place.
+        plan.checks[1].answer = None;
+        assert_eq!(asked(&plan), [4]);
+        TicketPlan::parse(&plan.render()).unwrap();
     }
 
     #[test]

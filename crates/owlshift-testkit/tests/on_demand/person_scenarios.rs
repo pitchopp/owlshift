@@ -1,13 +1,16 @@
 //! A person's steps (OWL-619; architecture section 4, "A person's steps"),
 //! on the bench of `on_demand.rs`: the Markdown tracker, the fake harness
-//! playing every role, the fake GitHub. Part 1 of the ticket: the plan
-//! holds a person's steps, the Build passes them, the delivery lists them,
-//! and merge on green leaves the pull request to a person while one due
-//! before the merge is owed.
+//! playing every role, the fake GitHub. The plan holds a person's steps,
+//! the Build passes them, the delivery lists them; at Watch a round asks
+//! the decider those due before the merge, merge on green waiting for it;
+//! the run after the answers fixes a defect and builds the agent's steps
+//! that waited on them; at the merge, the steps due after it are filed as
+//! one follow-up.
 
 use std::num::NonZeroU32;
 
-use owlshift_contracts::review::StepBy;
+use owlshift_contracts::drain::ProposalOutcome;
+use owlshift_contracts::review::{StepAnswer, StepBy};
 
 use super::design_scenarios::{designed, reviewed};
 use super::*;
@@ -25,10 +28,29 @@ const PERSON_PLAN: &str = r#"{"goal":"Add GREETING.md saying Hello.",
  {"what":"Ask the team on staging whether the tone fits.","test":"They say yes.",
   "by":"person","when":"before_merge"}]}"#;
 
+/// A plan whose last step is a person's, due after the merge: it acts on
+/// what the merge deploys.
+const AFTER_PLAN: &str = r#"{"goal":"Add GREETING.md saying Hello.",
+"criteria":["GREETING.md says Hello.","The team knows it is live."],
+"approach":"Write GREETING.md with the line the gate greps; once merged, a person tells the team.",
+"steps":[
+ {"what":"Add GREETING.md.","test":"The gate's grep for Hello."},
+ {"what":"Tell the team on staging the greeting is live.","test":"They saw it.",
+  "by":"person","when":"after_merge"}]}"#;
+
 /// The Build's `done`, the agent's third step left for the second's result.
 const OWING: &str = r#"{"format":16,"status":"done","summary":"Added GREETING.md; step 3 waits on step 2.",
 "owed":[3],
 "pr":{"branch":"owlshift/demo-1","title":"Add a greeting","body":"Says hello. Gate: green."}}"#;
+
+/// The run at Watch's `done` after the round: step 3 built with the
+/// results.
+const NOTED: &str = r#"{"format":16,"status":"done","summary":"Noted the staging check in the README.",
+"pr":{"branch":"owlshift/demo-1","title":"Add a greeting","body":"Noted."}}"#;
+
+/// The run at Watch's `done` after a defect reported on step 2.
+const MENDED: &str = r#"{"format":16,"status":"done","summary":"Fixed the greeting's spelling.",
+"pr":{"branch":"owlshift/demo-1","title":"Add a greeting","body":"Mended."}}"#;
 
 /// Two minutes later on the bench's clock.
 fn later(clock: &Cell<Timestamp>) {
@@ -40,12 +62,74 @@ fn later(clock: &Cell<Timestamp>) {
     );
 }
 
-/// OWL-619's first acceptance, the part before Watch's round: a standard
-/// ticket whose plan's last step is a person's is designed, reviewed and
-/// built, its Build given the person's steps and passing them; it is
-/// delivered with its owed steps under "For a person" in the pull request
-/// and in the DELIVERY report; under `[forge] merge = "all"`, watch reads
-/// it green and leaves it to a person, told once, and merges nothing.
+/// An answer check's verdicts, each answered: its question, the option the
+/// decider chose (none for words of their own) and the check's reading.
+fn verdicts(answers: &[(&str, Option<&str>, &str)]) -> String {
+    let verdicts: Vec<Value> = answers
+        .iter()
+        .map(|(question, option, reason)| {
+            let mut verdict =
+                json!({ "question": question, "class": "answered", "reason": reason });
+            if let Some(option) = option {
+                verdict["option"] = json!(option);
+            }
+            verdict
+        })
+        .collect();
+    json!({ "format": 16, "status": "done", "summary": "Checked.", "verdicts": verdicts })
+        .to_string()
+}
+
+/// A standard ticket whose plan is `plan`, designed, reviewed and built by
+/// `build`, its pull request open; merge on green under `switch`.
+fn delivered(plan: &str, build: &str, switch: &str) -> Bench {
+    let bench = Bench::with(
+        "maintainer",
+        "assignee = \"maintainer\"\n",
+        &format!("[forge]\nmerge = \"{switch}\"\n"),
+    );
+    bench.add_labels(&["variant:standard"]);
+    let replies = vec![
+        bench.read(&designed(plan)),
+        bench.read(&reviewed(&[])),
+        bench.read(&reviewed(&[])),
+        bench.reply(Some("Hello"), Some(build)),
+    ];
+    let (outcome, printed) = bench.run(replies, None);
+    outcome.unwrap_or_else(|stop| panic!("{stop}\n{printed}"));
+    bench
+}
+
+/// The plan's checks the ticket ref keeps: each step, its round and how it
+/// was answered.
+fn checks(bench: &Bench) -> Vec<(u32, u32, Option<StepAnswer>)> {
+    bench
+        .record()
+        .plan
+        .unwrap()
+        .checks
+        .iter()
+        .map(|check| (check.step.get(), check.round.get(), check.answer))
+        .collect()
+}
+
+/// The `merge_waits` events naming the person's steps.
+fn person_waits(bench: &Bench) -> Vec<Value> {
+    data_of(&bench.events(), EventKind::Decision, "watch")
+        .into_iter()
+        .filter(|data| data["watch"] == "merge_waits" && data["blocker"] == "person_steps")
+        .collect()
+}
+
+/// OWL-619's first acceptance: a standard ticket whose plan's last step is
+/// a person's is designed, reviewed and built, its Build given the person's
+/// steps and passing them; it is delivered with its owed steps under "For a
+/// person" in the pull request and in the DELIVERY report. Under `[forge]
+/// merge = "all"`, watch's first read asks the decider steps 2 and 4 in one
+/// round at Watch, through no resolver, and merges nothing while it waits.
+/// Answered as the plan names, the run at Watch builds step 3 with the
+/// results and pushes it, and watch merges the pull request, no hold of the
+/// person's steps ever told.
 #[test]
 fn a_plan_whose_last_step_is_a_person_s_is_built_delivered_and_held_from_merging() {
     let bench = Bench::with(
@@ -62,12 +146,9 @@ fn a_plan_whose_last_step_is_a_person_s_is_built_delivered_and_held_from_merging
     ];
     let (outcome, printed) = bench.run(replies, None);
     let line = outcome.unwrap_or_else(|stop| panic!("{stop}\n{printed}"));
-    let held = "the ticket owes 3 steps a person checks before the merge, listed under \"For a \
-                person\" in its pull request";
     assert!(
-        line.to_string().ends_with(&format!(
-            "Owlshift will not merge it: {held}. Review and merge it yourself."
-        )),
+        line.to_string()
+            .contains("Owlshift merges it once it is green, unless a person must judge it first"),
         "{line}"
     );
     // The Build was given the person's steps, and its owed step is kept
@@ -109,32 +190,253 @@ fn a_plan_whose_last_step_is_a_person_s_is_built_delivered_and_held_from_merging
         .rfind(|body| body.starts_with("[owlshift] DELIVERY"))
         .unwrap();
     assert!(
-        report.contains(&format!(
-            "Owlshift will not merge [#1](https://github.com/demo/project/pull/1): {held}."
-        )) && report.contains("\n- **Step 4, before the merge, a person's:** Ask the team"),
+        !report.contains("Owlshift will not merge")
+            && report.contains("\n- **Step 4, before the merge, a person's:** Ask the team"),
         "{report}"
     );
 
+    // Watch's first read asks steps 2 and 4, the runner's own round at
+    // Watch, its checks kept with the plan; nothing runs or merges.
+    let briefs = bench.briefs().len();
     let clock = bench.clock.clone();
+    let mut pass = 0;
+    let (outcomes, lines, printed) = bench.watch(Vec::new(), &mut |_| {
+        pass += 1;
+        later(&clock);
+        pass < 4
+    });
+    assert!(
+        matches!(&outcomes[..], [Err(Stop::NeedsInput { posted: Ok(round), .. })] if round.get() == 1),
+        "{outcomes:?}\n{lines}\n{printed}"
+    );
+    assert_eq!(
+        bench.briefs().len(),
+        briefs,
+        "no run: no Build, no resolver"
+    );
+    assert!(bench.github.merges.lock().unwrap().is_empty());
+    assert_eq!(
+        bench.state(),
+        (
+            Status::NeedsInput {
+                return_to: Stage::Watch
+            },
+            1
+        )
+    );
+    let asked = bench.questions_posted();
+    assert_eq!(asked.len(), 1, "{asked:?}");
+    assert!(
+        asked[0].contains("Step 2: Open GREETING.md on staging in a browser")
+            && asked[0].contains("Step 4: Ask the team on staging")
+            && asked[0].contains("The agent's step 3 waits on it"),
+        "{}",
+        asked[0]
+    );
+    let record = bench.record();
+    let categories: Vec<&str> = record.questions.asks[record.questions.asks.len() - 1]
+        .questions
+        .iter()
+        .map(|question| question.category.as_str())
+        .collect();
+    assert_eq!(categories, ["person_step", "person_step"]);
+    assert_eq!(checks(&bench), [(2, 1, None), (4, 1, None)]);
+
+    // Answered as the plan names (option A): the RESUME keeps both passed,
+    // and the same `continue` runs the build role at Watch on step 3, which
+    // waited on step 2's result, then pushes it.
+    bench.answer("Q1: A. Q2: A.\n");
+    let (outcome, printed) = bench.continue_ticket(vec![
+        bench.reply(
+            None,
+            Some(&verdicts(&[
+                ("Q1", Some("A"), "Step 2 reads Hello on staging."),
+                ("Q2", Some("A"), "The team says the tone fits."),
+            ])),
+        ),
+        bench.reply(Some("Hello from staging"), Some(NOTED)),
+    ]);
+    outcome.unwrap_or_else(|stop| panic!("{stop}\n{printed}"));
+    let given = bench.last_of(Role::Build).person_steps.unwrap();
+    let answered: Vec<(u32, bool)> = given
+        .answered
+        .iter()
+        .map(|step| (step.step.get(), step.defect))
+        .collect();
+    assert_eq!(answered, [(2, false), (4, false)]);
+    assert_eq!(given.build, [NonZeroU32::new(3).unwrap()]);
+    assert_eq!(given.answered[0].reading, "Step 2 reads Hello on staging.");
+    let plan = bench.record().plan.unwrap();
+    assert!(plan.owed.is_empty(), "step 3 is built: {:?}", plan.owed);
+    assert_eq!(plan.owed_before_merge(), 0);
+    assert_eq!(
+        checks(&bench),
+        [
+            (2, 1, Some(StepAnswer::Passed)),
+            (4, 1, Some(StepAnswer::Passed))
+        ]
+    );
+    let changed = bench.marked("[owlshift] DELIVERY");
+    assert!(
+        changed.contains(
+            "**Changed after a person's steps,** to follow the decider's results on step 3"
+        ),
+        "{changed}"
+    );
+
+    // Watch merges it once it reads it green twice; nothing is asked again.
+    let pushed = bench.remote_branch().unwrap();
     let mut pass = 0;
     let (_, lines, printed) = bench.watch(Vec::new(), &mut |_| {
         pass += 1;
         later(&clock);
         pass < 4
     });
-    assert!(
-        bench.github.merges.lock().unwrap().is_empty(),
+    assert_eq!(
+        bench.github.merges.lock().unwrap().clone(),
+        [json!({ "sha": pushed, "merge_method": "squash" })],
         "{lines}\n{printed}"
     );
-    let waits: Vec<Value> = data_of(&bench.events(), EventKind::Decision, "watch")
-        .into_iter()
-        .filter(|data| data["watch"] == "merge_waits")
-        .collect();
-    assert_eq!(waits.len(), 1, "{waits:?}");
-    assert_eq!(
-        (&waits[0]["blocker"], &waits[0]["reason"]),
-        (&json!("person_steps"), &json!(held))
+    assert_eq!(bench.questions_posted().len(), 1);
+    assert!(
+        person_waits(&bench).is_empty(),
+        "{:?}",
+        person_waits(&bench)
     );
+}
+
+/// OWL-619's second acceptance: a defect reported in the round starts a run
+/// at Watch, its brief carrying the step and what was reported, and not the
+/// agent's step that waits on it; once its push lands, that step alone is
+/// asked again, in a new round, the step answered as passed never again;
+/// answered as the plan names, the next run builds the agent's step.
+#[test]
+fn a_defect_reported_in_the_round_starts_a_run_and_its_step_is_asked_again() {
+    let bench = delivered(PERSON_PLAN, OWING, "never");
+    let (asked, printed) = bench.continue_ticket(Vec::new());
+    assert!(
+        matches!(&asked, Err(Stop::NeedsInput { posted: Ok(round), .. }) if round.get() == 1),
+        "{asked:?}\n{printed}"
+    );
+    let first_push = bench.remote_branch().unwrap();
+
+    bench.answer("Q1: B, it reads Helo on staging. Q2: A.\n");
+    let (outcome, printed) = bench.continue_ticket(vec![
+        bench.reply(
+            None,
+            Some(&verdicts(&[
+                ("Q1", Some("B"), "Step 2 reads Helo on staging, not Hello."),
+                ("Q2", Some("A"), "The team says the tone fits."),
+            ])),
+        ),
+        bench.reply(Some("Hello again"), Some(MENDED)),
+    ]);
+    outcome.unwrap_or_else(|stop| panic!("{stop}\n{printed}"));
+    let brief = bench.last_of(Role::Build);
+    let given = brief.person_steps.unwrap();
+    assert_eq!(given.head, first_push);
+    let answered: Vec<(u32, bool, &str)> = given
+        .answered
+        .iter()
+        .map(|step| (step.step.get(), step.defect, step.reading.as_str()))
+        .collect();
+    assert_eq!(
+        answered,
+        [
+            (2, true, "Step 2 reads Helo on staging, not Hello."),
+            (4, false, "The team says the tone fits.")
+        ]
+    );
+    assert!(given.build.is_empty(), "step 3 waits on step 2");
+    let thread = serde_json::to_string(&brief.thread).unwrap();
+    assert!(thread.contains("it reads Helo on staging"), "{thread}");
+    assert_ne!(bench.remote_branch().unwrap(), first_push, "pushed");
+    assert_eq!(checks(&bench), [(4, 1, Some(StepAnswer::Passed))]);
+    assert_eq!(bench.record().plan.unwrap().owed_before_merge(), 2);
+    assert!(
+        bench.marked("[owlshift] DELIVERY").contains(
+            "**Changed after a person's steps,** to follow the decider's results on step 2;"
+        ),
+        "{}",
+        bench.marked("[owlshift] DELIVERY")
+    );
+
+    // Step 2 alone is asked again, in round 2.
+    let (asked, printed) = bench.continue_ticket(Vec::new());
+    assert!(
+        matches!(&asked, Err(Stop::NeedsInput { posted: Ok(round), .. }) if round.get() == 2),
+        "{asked:?}\n{printed}"
+    );
+    let again = bench.questions_posted().pop().unwrap();
+    assert!(
+        again.contains("Step 2: Open GREETING.md") && !again.contains("Step 4:"),
+        "{again}"
+    );
+    assert_eq!(
+        checks(&bench),
+        [(2, 2, None), (4, 1, Some(StepAnswer::Passed))]
+    );
+
+    // Answered as the plan names, the next run builds step 3.
+    bench.answer("A.\n");
+    let (outcome, printed) = bench.continue_ticket(vec![
+        bench.reply(
+            None,
+            Some(&verdicts(&[("Q1", Some("A"), "Step 2 reads Hello now.")])),
+        ),
+        bench.reply(Some("Hello, noted"), Some(NOTED)),
+    ]);
+    outcome.unwrap_or_else(|stop| panic!("{stop}\n{printed}"));
+    let given = bench.last_of(Role::Build).person_steps.unwrap();
+    assert_eq!(given.build, [NonZeroU32::new(3).unwrap()]);
+    let plan = bench.record().plan.unwrap();
+    assert_eq!((plan.owed_before_merge(), plan.owed.len()), (0, 0));
+    assert_eq!(bench.questions_posted().len(), 2);
+}
+
+/// The steps due after the merge hold nothing: under merge on green, the
+/// runner merges, and the pass after the merge files them as one follow-up
+/// for the decider, outside the three a parent files; later passes file
+/// nothing more (OWL-619).
+#[test]
+fn the_steps_after_the_merge_are_filed_as_one_follow_up_once_merged() {
+    let bench = delivered(AFTER_PLAN, DONE, "all");
+    bench.inbox.borrow_mut().on = true;
+    assert!(bench.questions_posted().is_empty());
+    let clock = bench.clock.clone();
+    let mut pass = 0;
+    let (_, lines, printed) = bench.watch(Vec::new(), &mut |_| {
+        pass += 1;
+        later(&clock);
+        pass < 6
+    });
+    assert_eq!(
+        bench.github.merges.lock().unwrap().len(),
+        1,
+        "{lines}\n{printed}"
+    );
+    assert!(bench.questions_posted().is_empty(), "nothing asked");
+    let inbox = bench.inbox.borrow();
+    assert_eq!(inbox.tickets.len(), 1, "{:?}", inbox.tickets);
+    let (_, title, description) = &inbox.tickets[0];
+    assert_eq!(title, "After DEMO-1's merge: the steps for a person");
+    assert!(
+        description.contains("Step 2, a person's: Tell the team on staging the greeting is live.")
+            && description.contains("DEMO-1's decider"),
+        "{description}"
+    );
+    let attempts = inbox.attempts;
+    drop(inbox);
+    assert!(matches!(
+        &proposal_outcomes(&bench)[..],
+        [ProposalOutcome::Filed { .. }]
+    ));
+    let (_, _, _) = bench.watch(Vec::new(), &mut |_| {
+        pass += 1;
+        later(&clock);
+        pass < 8
+    });
+    assert_eq!(bench.inbox.borrow().attempts, attempts, "filed once");
 }
 
 /// A Build that meets a step only a person can do outside any plan asks it

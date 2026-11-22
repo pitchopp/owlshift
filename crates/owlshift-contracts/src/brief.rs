@@ -191,6 +191,14 @@ pub struct Brief {
     /// Build's brief only, at Watch; absent otherwise.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub correction: Option<Correction>,
+    /// The ticket's decider answered the person's steps of its plan a round
+    /// at Watch asked, and this run follows the results (format 32,
+    /// OWL-619; architecture section 4, "A person's steps"): it fixes what
+    /// an answer reports as a defect, and builds the agent's steps that
+    /// waited on the results. In Build's brief only, at Watch; absent
+    /// otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub person_steps: Option<PersonStepsBrief>,
     /// The ticket's plan and the base commit it was written on (format 15,
     /// OWL-300): what Build follows, the review roles and the arbiter read,
     /// and a design run revises or puts to the decider. Required in the
@@ -637,6 +645,81 @@ pub struct Correction {
     /// Each reversed decision, oldest first.
     #[schemars(length(min = 1))]
     pub reversed: Vec<ReversedDecision>,
+}
+
+/// The person's steps a run at Watch follows (OWL-619): the results its
+/// decider gave and the agent's steps they release. The decider's words
+/// are in the thread, under the round that asked; `reading` is the answer
+/// check's, data.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct PersonStepsBrief {
+    pub pull_request: u64,
+    pub url: String,
+    /// The branch's head: Owlshift's last push.
+    pub head: String,
+    /// Each person's step its decider answered, in the plan's order.
+    #[schemars(length(min = 1))]
+    pub answered: Vec<AnsweredStep>,
+    /// The agent's steps of the plan, owed until now, that this run builds
+    /// with the results, in increasing order.
+    #[serde(default)]
+    pub build: Vec<NonZeroU32>,
+}
+
+/// A person's step its decider answered (OWL-619).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct AnsweredStep {
+    /// The step's place in the plan, from 1.
+    pub step: NonZeroU32,
+    /// The round that asked it.
+    pub round: NonZeroU32,
+    /// The question asked, under its id in that round.
+    pub question: Question,
+    /// Whether the answer reports a defect, which this run fixes: the step
+    /// is asked again once its push lands. A step answered as passed gave
+    /// the result it names.
+    pub defect: bool,
+    /// The answer check's reading of the decider's answer, at most
+    /// [`MAX_REPLY_BYTES`].
+    pub reading: String,
+}
+
+impl PersonStepsBrief {
+    /// Checks there is an answered step, steps in increasing order, a
+    /// defect to fix or a step to build, and readings not blank and within
+    /// [`MAX_REPLY_BYTES`].
+    pub fn validate(&self) -> Result<(), ContractError> {
+        let invalid = |reason: String| Err(ContractError::invalid(CONTRACT, reason));
+        if self.answered.is_empty() {
+            return invalid("a person's steps are given with no answered step".to_owned());
+        }
+        if self
+            .answered
+            .windows(2)
+            .any(|pair| pair[0].step >= pair[1].step)
+            || self.build.windows(2).any(|pair| pair[0] >= pair[1])
+        {
+            return invalid("a person's steps are given out of order".to_owned());
+        }
+        if self.build.is_empty() && !self.answered.iter().any(|step| step.defect) {
+            return invalid(
+                "a person's steps are given with no defect to fix and no step to build".to_owned(),
+            );
+        }
+        if let Some(step) = self
+            .answered
+            .iter()
+            .find(|step| step.reading.trim().is_empty() || step.reading.len() > MAX_REPLY_BYTES)
+        {
+            return invalid(format!(
+                "answered step {} has a blank reading or one over {MAX_REPLY_BYTES} bytes",
+                step.step
+            ));
+        }
+        Ok(())
+    }
 }
 
 /// One decision a [`Correction`] reverses.
@@ -1104,7 +1187,8 @@ impl Brief {
     /// [`MAX_CHOICE_BYTES`]; the rebase role's brief, and only it, has a
     /// `rebase`; only Build's has a `setup_failure`, and a `correction`,
     /// which reverses at least one decision, each with a reply of at most
-    /// [`MAX_REPLY_BYTES`]; only intake's has `named_resources`, and
+    /// [`MAX_REPLY_BYTES`], and `person_steps`
+    /// ([`PersonStepsBrief::validate`]); only intake's has `named_resources`, and
     /// `relations`, which keep [`TicketRelations`]' bounds.
     pub fn validate(&self) -> Result<(), ContractError> {
         validate_thread(CONTRACT, &self.thread)?;
@@ -1182,6 +1266,19 @@ impl Brief {
                     ),
                 ));
             }
+        }
+        if let Some(steps) = &self.person_steps {
+            if self.role != Role::Build {
+                return Err(ContractError::invalid(
+                    CONTRACT,
+                    format!(
+                        "a person's steps are given but the role is {}, not {}",
+                        self.role.as_str(),
+                        Role::Build.as_str()
+                    ),
+                ));
+            }
+            steps.validate()?;
         }
         // The ticket's overlaps are the build role's alone (format 29,
         // OWL-449).

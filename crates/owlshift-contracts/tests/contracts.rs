@@ -1615,7 +1615,7 @@ fn brief_rejections() {
     );
     rejects(
         "newer format",
-        parse(|v| v["format"] = json!(32)),
+        parse(|v| v["format"] = json!(33)),
         "upgrade Owlshift",
     );
     rejects(
@@ -3646,7 +3646,7 @@ fn a_ticket_delivery_round_trips_and_is_checked() {
     .unwrap();
     assert!(older.owed.is_none() && older.pushing.as_ref().unwrap().report.is_none());
     assert!(
-        older.render().contains("\"format\": 8"),
+        older.render().contains("\"format\": 9"),
         "{}",
         older.render()
     );
@@ -3678,7 +3678,7 @@ fn a_ticket_delivery_round_trips_and_is_checked() {
     // in format 1. Format 3 keeps one, whose report names its questions,
     // and only a correction's report does.
     let older = parse(|v| v["format"] = json!(2)).unwrap();
-    assert!(older.render().starts_with("{\n  \"format\": 8,"));
+    assert!(older.render().starts_with("{\n  \"format\": 9,"));
     let refused: [(&str, Edit); 3] = [
         ("correction's push", |v| {
             v["format"] = json!(2);
@@ -3703,19 +3703,58 @@ fn a_ticket_delivery_round_trips_and_is_checked() {
     })
     .unwrap();
     assert_eq!(correction.pushing.unwrap().kind, PushKind::Correction);
-    let unnamed: [(&str, Edit); 2] = [
+    // OWL-619: format 9's correction may name, instead of questions, the
+    // steps of a person's its run followed; format 8 names none.
+    let stepped = parse(|v| {
+        v["pushing"]["kind"] = json!("correction");
+        v["pushing"]["report"]["checks"] = json!([]);
+        v["pushing"]["report"]["steps"] = json!([2, 3]);
+    })
+    .unwrap();
+    let kept = stepped.pushing.as_ref().unwrap().report.as_ref().unwrap();
+    assert_eq!(kept.steps.len(), 2);
+    rejects(
+        "a format-8 report's steps",
+        parse(|v| {
+            v["format"] = json!(8);
+            v["pushing"]["kind"] = json!("correction");
+            v["pushing"]["report"]["checks"] = json!([]);
+            v["pushing"]["report"]["steps"] = json!([2]);
+        }),
+        "format 8 keeps no report's steps",
+    );
+    rejects(
+        "a report's steps out of order",
+        parse(|v| {
+            v["pushing"]["kind"] = json!("correction");
+            v["pushing"]["report"]["checks"] = json!([]);
+            v["pushing"]["report"]["steps"] = json!([3, 2]);
+        }),
+        "names its steps out of order",
+    );
+    let unnamed: [(&str, Edit); 4] = [
         ("a correction's report without questions", |v| {
             v["pushing"]["kind"] = json!("correction");
         }),
         ("a fix's report with questions", |v| {
             v["pushing"]["report"]["questions"] = json!(["Which file?"]);
         }),
+        ("a fix's report with steps", |v| {
+            v["pushing"]["report"]["steps"] = json!([2]);
+        }),
+        ("a correction's report with questions and steps", |v| {
+            v["pushing"]["kind"] = json!("correction");
+            v["pushing"]["report"]["checks"] = json!([]);
+            v["pushing"]["report"]["questions"] = json!(["Which file?"]);
+            v["pushing"]["report"]["steps"] = json!([2]);
+        }),
     ];
     for (case, edit) in unnamed {
         rejects(
             case,
             parse(edit),
-            "a report names questions if and only if it is a correction's",
+            "a report names questions or steps, one of the two, if and only if it is a \
+             correction's",
         );
     }
     // OWL-236: format 4 owes the first delivery's report, with the
@@ -3938,7 +3977,7 @@ fn a_ticket_delivery_round_trips_and_is_checked() {
     })
     .unwrap();
     assert!(older.pushing.as_ref().unwrap().rebased.is_none());
-    assert!(older.render().starts_with("{\n  \"format\": 8,"));
+    assert!(older.render().starts_with("{\n  \"format\": 9,"));
     let refused: [(&str, Edit, &str); 3] = [
         (
             "a format-7 rebase run's commit",

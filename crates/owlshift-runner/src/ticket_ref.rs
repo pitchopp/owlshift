@@ -2256,6 +2256,7 @@ pub(crate) mod fixtures {
             approval: None,
             published: None,
             owed: Vec::new(),
+            checks: Vec::new(),
         }
     }
 }

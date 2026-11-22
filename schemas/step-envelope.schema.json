@@ -294,6 +294,20 @@
           ]
         },
         {
+          "description": "A person's steps at Watch (OWL-619): the round that asks them, or the\nrun that follows their answers, as the ticket ref says which.",
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "person_steps"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "kind"
+          ]
+        },
+        {
           "description": "A parked ticket's restart its decider typed on the ticket (OWL-488):\n`comment`, the newest `continue` comment watch read; the step reads\nthe thread again and decides with the ticket's decider.",
           "type": "object",
           "properties": {

@@ -92,7 +92,7 @@
     "format": {
       "description": "The format version of this document.",
       "type": "integer",
-      "const": 31
+      "const": 32
     },
     "gate": {
       "description": "The project's full gate, from `stack.gate` in its configuration: the\ncommands the runner runs, in order, from the worktree root, on the\ncommit a Build delivers; a role runs them, or narrows them to its\nchange, before it delivers. The runner is its only author; an empty\nlist means the project has no gate.",
@@ -128,6 +128,17 @@
     },
     "permissions": {
       "$ref": "#/$defs/Permissions"
+    },
+    "person_steps": {
+      "description": "The ticket's decider answered the person's steps of its plan a round\nat Watch asked, and this run follows the results (format 32,\nOWL-619; architecture section 4, \"A person's steps\"): it fixes what\nan answer reports as a defect, and builds the agent's steps that\nwaited on the results. In Build's brief only, at Watch; absent\notherwise.",
+      "anyOf": [
+        {
+          "$ref": "#/$defs/PersonStepsBrief"
+        },
+        {
+          "type": "null"
+        }
+      ]
     },
     "plan": {
       "description": "The ticket's plan and the base commit it was written on (format 15,\nOWL-300): what Build follows, the review roles and the arbiter read,\nand a design run revises or puts to the decider. Required in the\ndesign review role's brief; given to the design, design review,\nbuild, verify and arbiter roles, and since OWL-357 to the answer\ncheck, whose approval question points to it, only. Build's has empty\n`forks` and `alternatives` since format 20 (OWL-365): the choices are\nin its approach and steps, and the other roles read it whole.",
@@ -306,6 +317,44 @@
         "id",
         "text",
         "understood"
+      ]
+    },
+    "AnsweredStep": {
+      "description": "A person's step its decider answered (OWL-619).",
+      "type": "object",
+      "properties": {
+        "defect": {
+          "description": "Whether the answer reports a defect, which this run fixes: the step\nis asked again once its push lands. A step answered as passed gave\nthe result it names.",
+          "type": "boolean"
+        },
+        "question": {
+          "description": "The question asked, under its id in that round.",
+          "$ref": "#/$defs/Question"
+        },
+        "reading": {
+          "description": "The answer check's reading of the decider's answer, at most\n[`MAX_REPLY_BYTES`].",
+          "type": "string"
+        },
+        "round": {
+          "description": "The round that asked it.",
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 1
+        },
+        "step": {
+          "description": "The step's place in the plan, from 1.",
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 1
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "step",
+        "round",
+        "question",
+        "defect",
+        "reading"
       ]
     },
     "AskedBy": {
@@ -1096,6 +1145,49 @@
         "level",
         "network",
         "browser"
+      ]
+    },
+    "PersonStepsBrief": {
+      "description": "The person's steps a run at Watch follows (OWL-619): the results its\ndecider gave and the agent's steps they release. The decider's words\nare in the thread, under the round that asked; `reading` is the answer\ncheck's, data.",
+      "type": "object",
+      "properties": {
+        "answered": {
+          "description": "Each person's step its decider answered, in the plan's order.",
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/AnsweredStep"
+          },
+          "minItems": 1
+        },
+        "build": {
+          "description": "The agent's steps of the plan, owed until now, that this run builds\nwith the results, in increasing order.",
+          "type": "array",
+          "default": [],
+          "items": {
+            "type": "integer",
+            "format": "uint32",
+            "minimum": 1
+          }
+        },
+        "head": {
+          "description": "The branch's head: Owlshift's last push.",
+          "type": "string"
+        },
+        "pull_request": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "url": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "pull_request",
+        "url",
+        "head",
+        "answered"
       ]
     },
     "Plan": {

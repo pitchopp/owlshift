@@ -172,6 +172,7 @@ mod intake;
 mod limits;
 mod merge_note;
 mod neutral_push;
+mod person;
 mod relay;
 mod rerun;
 mod review_loop;
@@ -191,6 +192,7 @@ pub(crate) use design::{PlanLink, approval_question};
 pub(crate) use drain::delivery_followed;
 pub use drain::{DispatchSeen, Taken, still_ready};
 pub use intake::admission;
+pub(crate) use person::{StepsDue, steps_due};
 pub(crate) use verify::delivers_without_pass;
 
 /// The pipeline of the paths at Watch and of intake: their moves are the
@@ -3439,20 +3441,33 @@ impl OnDemand<'_> {
                 outcome => return outcome,
             }
         }
+        let unrepaired = matches!(
+            seen.decision,
+            FollowDecision::Follow {
+                adopt: false,
+                action: FollowAction::Green | FollowAction::WaitChecks | FollowAction::WaitBaseRed,
+            }
+        );
         // The reviews on the pull request, which may loop back to Build
         // (OWL-307), when the read asks for no repair.
-        if self.config.forge.is_some()
-            && matches!(
-                seen.decision,
-                FollowDecision::Follow {
-                    adopt: false,
-                    action: FollowAction::Green
-                        | FollowAction::WaitChecks
-                        | FollowAction::WaitBaseRed,
-                }
-            )
+        if self.config.forge.is_some() && unrepaired {
+            match self.review_loop(p, None, sink) {
+                // Nothing to loop on: a person's steps may be due.
+                Err(Stop::Watched { .. }) => {}
+                outcome => return outcome,
+            }
+        }
+        // A person's steps due before the merge: their round, or the run
+        // after their answers (OWL-619).
+        if unrepaired
+            && p.stored
+                .as_ref()
+                .is_some_and(|stored| person::steps_due(&stored.record).is_some())
         {
-            return self.review_loop(p, None, sink);
+            match self.person_steps(p, &mut following, sink) {
+                Err(Stop::Watched { .. }) => {}
+                outcome => return outcome,
+            }
         }
         Err(Stop::Watched {
             ticket,
@@ -5182,6 +5197,9 @@ impl OnDemand<'_> {
         // A colleague's reviews relayed in this round (OWL-585): what the
         // decider answered about each, kept in the same write.
         self.settle_relayed(p, round, &questions, sink);
+        // A person's steps asked in this round (OWL-619): how the decider
+        // answered each, kept in the same write.
+        self.settle_person_steps(p, round, &questions, sink);
         // The ref still waits for answers: nothing resumes Build but
         // a person, so the stop says the RESUME landed (OWL-169).
         self.store(p, &next, questions).map_err(|e| Stop::NotKept {
@@ -6809,6 +6827,7 @@ impl OnDemand<'_> {
             check_failure: None,
             rebase: None,
             correction: None,
+            person_steps: None,
             result_path: RelativePath::new(RESULT_PATH).expect("RESULT_PATH is a relative path"),
             plan: None,
             approval: false,
@@ -6991,6 +7010,7 @@ impl OnDemand<'_> {
                 notes: built.notes,
                 followups: built.followups,
                 reviews: Vec::new(),
+                steps: Vec::new(),
             }),
             unchanged: false,
         });
@@ -7022,8 +7042,7 @@ impl OnDemand<'_> {
         let mut following = Following::default();
         let comment =
             self.post_and_settle(p, &watching, kept, checks, &done, &mut following, sink)?;
-        let (merge, merge_held) =
-            crate::merge::who_merges(self, &p.base, &p.questions(), p.plan.as_ref());
+        let (merge, merge_held) = crate::merge::who_merges(self, &p.base, &p.questions());
         Ok(Delivered {
             pull_request,
             opened: opened.opened,
@@ -7167,26 +7186,37 @@ impl Repaired {
                 RepairKind::Fix { checks } => checks.clone(),
                 RepairKind::Rebase { .. }
                 | RepairKind::Correction { .. }
-                | RepairKind::Review { .. } => Vec::new(),
+                | RepairKind::Review { .. }
+                | RepairKind::Steps { .. } => Vec::new(),
             },
             questions: match kind {
                 RepairKind::Correction { questions } => questions.clone(),
-                RepairKind::Fix { .. } | RepairKind::Rebase { .. } | RepairKind::Review { .. } => {
-                    Vec::new()
-                }
+                RepairKind::Fix { .. }
+                | RepairKind::Rebase { .. }
+                | RepairKind::Review { .. }
+                | RepairKind::Steps { .. } => Vec::new(),
             },
             notes: match kind {
                 RepairKind::Review { notes, .. } => notes.clone(),
                 RepairKind::Fix { .. }
                 | RepairKind::Rebase { .. }
-                | RepairKind::Correction { .. } => Vec::new(),
+                | RepairKind::Correction { .. }
+                | RepairKind::Steps { .. } => Vec::new(),
             },
             followups: followups.to_vec(),
             reviews: match kind {
                 RepairKind::Review { reviews, .. } => reviews.clone(),
                 RepairKind::Fix { .. }
                 | RepairKind::Rebase { .. }
-                | RepairKind::Correction { .. } => Vec::new(),
+                | RepairKind::Correction { .. }
+                | RepairKind::Steps { .. } => Vec::new(),
+            },
+            steps: match kind {
+                RepairKind::Steps { steps } => steps.clone(),
+                RepairKind::Fix { .. }
+                | RepairKind::Rebase { .. }
+                | RepairKind::Correction { .. }
+                | RepairKind::Review { .. } => Vec::new(),
             },
         }
     }
@@ -7231,6 +7261,10 @@ enum RepairKind {
         reviews: Vec<AnsweredReview>,
         notes: Vec<Decision>,
     },
+    /// The run's after a person's steps were answered, following them on
+    /// these steps of the plan (OWL-619): a fast-forward, pushed and counted
+    /// as a correction's, its report naming the steps.
+    Steps { steps: Vec<NonZeroU32> },
 }
 
 impl RepairKind {
@@ -7238,7 +7272,7 @@ impl RepairKind {
         match self {
             Self::Fix { .. } => "fix",
             Self::Rebase { .. } => "rebase",
-            Self::Correction { .. } => "correction",
+            Self::Correction { .. } | Self::Steps { .. } => "correction",
             Self::Review { .. } => "review",
         }
     }
@@ -8474,21 +8508,23 @@ impl OnDemand<'_> {
             kind: match kind {
                 RepairKind::Fix { .. } => PushKind::Fix,
                 RepairKind::Rebase { .. } => PushKind::Rebase,
-                RepairKind::Correction { .. } => PushKind::Correction,
+                RepairKind::Correction { .. } | RepairKind::Steps { .. } => PushKind::Correction,
                 RepairKind::Review { .. } => PushKind::Review,
             },
             base: base_at_push.clone(),
             onto: match &kind {
                 RepairKind::Fix { .. }
                 | RepairKind::Correction { .. }
-                | RepairKind::Review { .. } => None,
+                | RepairKind::Review { .. }
+                | RepairKind::Steps { .. } => None,
                 RepairKind::Rebase { onto, .. } => Some(onto.to_string()),
             },
             rebased: match &kind {
                 RepairKind::Rebase { rebased, .. } => rebased.as_ref().map(ToString::to_string),
                 RepairKind::Fix { .. }
                 | RepairKind::Correction { .. }
-                | RepairKind::Review { .. } => None,
+                | RepairKind::Review { .. }
+                | RepairKind::Steps { .. } => None,
             },
             report: Some(report),
         });
@@ -8498,7 +8534,10 @@ impl OnDemand<'_> {
         let writer = Writer::new(self.tracker);
         let git = &self.executor.git;
         let landed = match &kind {
-            RepairKind::Fix { .. } | RepairKind::Correction { .. } | RepairKind::Review { .. } => {
+            RepairKind::Fix { .. }
+            | RepairKind::Correction { .. }
+            | RepairKind::Review { .. }
+            | RepairKind::Steps { .. } => {
                 writer.push_leased(git, &p.checkout, "origin", &neutral.head, &head, pushed)
             }
             RepairKind::Rebase { onto, rebased } => writer.push_rebased(
@@ -8617,7 +8656,7 @@ impl OnDemand<'_> {
         let events: &[Event] = match kind {
             RepairKind::Fix { .. } => &[Event::FixPushed],
             RepairKind::Rebase { .. } => &[Event::RebasePushed],
-            RepairKind::Correction { .. } => &[Event::Corrected],
+            RepairKind::Correction { .. } | RepairKind::Steps { .. } => &[Event::Corrected],
             RepairKind::Review { .. } => &[Event::Completed, Event::Completed],
         };
         for event in events {
@@ -8637,6 +8676,9 @@ impl OnDemand<'_> {
                 // A correction counts no fix pass: its report counts the
                 // decisions it follows the replies to (OWL-146).
                 RepairKind::Correction { questions } => questions.len() as u32,
+                // Nor the run after a person's steps: its report counts the
+                // steps it followed (OWL-619).
+                RepairKind::Steps { steps } => steps.len().max(1) as u32,
                 // A review loop's report counts 1, as a delivery's.
                 RepairKind::Review { .. } => 1,
             };
@@ -8645,6 +8687,12 @@ impl OnDemand<'_> {
         // The reviews answered, in the write that keeps the push landed.
         if matches!(kind, RepairKind::Review { .. }) {
             review_loop::answer_reviews(p);
+        }
+        // What a person's steps owed settled, in the same write (OWL-619).
+        if matches!(kind, RepairKind::Steps { .. })
+            && let Some(plan) = p.plan.as_mut()
+        {
+            plan.settle_steps_run();
         }
         // Its follow-ups are owed in the same write, and those of the report
         // it replaces, which is never posted (OWL-253).
@@ -8661,8 +8709,7 @@ impl OnDemand<'_> {
         let verdict = checks_read.as_ref().ok().map(CheckSet::verdict);
         let done = format!("the {what} {commit} was pushed and kept");
         let comment = self.post_and_settle(p, &state, kept, checks_read, &done, following, sink)?;
-        let (merge, merge_held) =
-            crate::merge::who_merges(self, &p.base, &p.questions(), p.plan.as_ref());
+        let (merge, merge_held) = crate::merge::who_merges(self, &p.base, &p.questions());
         Ok(Delivered {
             pull_request,
             opened: false,
@@ -8705,7 +8752,7 @@ impl OnDemand<'_> {
         // The follow-ups are filed before the report, and kept as filed, so
         // the report names what became of them (OWL-253).
         let stored = p.stored.as_ref().and_then(|s| s.proposals.as_ref());
-        if let Some(filed) = self.file_proposals(&ticket, &kept, stored, sink) {
+        if let Some(filed) = self.file_proposals(&ticket, &kept, p.plan.as_ref(), stored, sink) {
             let questions = p.questions();
             self.store_proposing(p, state, questions, Some(kept.clone()), Some(&filed))
                 .map_err(|e| {
@@ -8798,6 +8845,12 @@ impl OnDemand<'_> {
                         .as_ref()
                         .map(|kept| kept.questions.clone())
                         .unwrap_or_default(),
+                    // Or the steps of a person's it followed (OWL-619).
+                    steps: owed
+                        .report
+                        .as_ref()
+                        .map(|kept| kept.steps.clone())
+                        .unwrap_or_default(),
                     pushed: !owed.unchanged,
                 };
                 (None, None, Some(corrected), Some("corrected"))
@@ -8881,7 +8934,7 @@ impl OnDemand<'_> {
             // (OWL-445), and the question or the steps owed that keep it for
             // a person (OWL-464, OWL-619).
             merge,
-            merge_held: crate::merge::held_at_delivery(self, merge, questions, plan),
+            merge_held: crate::merge::held_at_delivery(self, merge, questions),
             // A delivery's report lists the steps its ticket owes a person
             // (OWL-619); a repair's does not repeat them.
             person_steps: match owed.kind {
@@ -8978,7 +9031,8 @@ impl OnDemand<'_> {
         };
         // Filed before the report, even one that is dropped: a follow-up
         // outlives the pull request.
-        done.proposals = self.file_proposals(ticket, delivery, proposals, sink);
+        done.proposals =
+            self.file_proposals(ticket, delivery, record.plan.as_ref(), proposals, sink);
         let proposals = done.proposals.as_ref().or(proposals);
         let Some(owed) = delivery.owed.as_ref() else {
             return done;
@@ -9036,18 +9090,27 @@ impl OnDemand<'_> {
     /// The follow-ups `delivery`'s owed report proposed that `current` does
     /// not keep yet, owed, then every owed one filed (OWL-253): the
     /// proposals to keep when that changed them, `None` otherwise and on a
-    /// tracker without a proposals inbox.
+    /// tracker without a proposals inbox. Once `delivery` ended merged, the
+    /// follow-up for the steps of `plan` due after the merge is owed too,
+    /// outside the three per parent (OWL-619, [`proposals::after_merge`]).
     fn file_proposals(
         &self,
         ticket: &TicketId,
         delivery: &TicketDelivery,
+        plan: Option<&TicketPlan>,
         current: Option<&TicketProposals>,
         sink: &mut EventSink<'_>,
     ) -> Option<TicketProposals> {
         if !proposals::has_inbox(self.tracker) {
             return None;
         }
-        let owed = proposals::owe(current, delivery.owed.iter());
+        let mut owed = proposals::owe(current, delivery.owed.iter());
+        let after_merge = proposals::after_merge(ticket, delivery, plan);
+        if let Some(followup) = &after_merge
+            && let Some(next) = proposals::owe_one(owed.as_ref().or(current), followup)
+        {
+            owed = Some(next);
+        }
         let added = owed.is_some();
         let mut next = owed.or_else(|| current.cloned())?;
         let tracker = &self.config.tracker;
@@ -9061,6 +9124,7 @@ impl OnDemand<'_> {
             },
             parent: ticket,
             pull_request: delivery.pull_request.as_ref(),
+            exempt: after_merge.map(|followup| proposals::fingerprint(&followup.title)),
         };
         let filed = proposals::file_owed(&filing, &mut next, sink);
         (added || filed).then_some(next)

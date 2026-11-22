@@ -40,15 +40,27 @@ impl EndedFilings {
     }
 }
 
-/// Whether the ticket whose ref keeps `stored` still owes a follow-up after
-/// its following ended, whatever ended it.
-pub(super) fn owes_after_end(stored: &Stored) -> bool {
-    stored
+/// Whether the ticket `ticket` whose ref keeps `stored` still owes a
+/// follow-up after its following ended, whatever ended it: one its
+/// proposals keep owed, or, once merged, the one for the steps of its plan
+/// due after the merge, not kept yet (OWL-619), which every pass after the
+/// merge finds so, whichever read ended the following.
+pub(super) fn owes_after_end(ticket: &TicketId, stored: &Stored) -> bool {
+    let Some(delivery) = stored
         .record
         .delivery
         .as_ref()
-        .is_some_and(|delivery| delivery.pull_request.is_some() && delivery.ended.is_some())
-        && proposals::owes(stored.proposals.as_ref())
+        .filter(|delivery| delivery.pull_request.is_some() && delivery.ended.is_some())
+    else {
+        return false;
+    };
+    proposals::owes(stored.proposals.as_ref())
+        || proposals::owes_after_merge(
+            ticket,
+            delivery,
+            stored.record.plan.as_ref(),
+            stored.proposals.as_ref(),
+        )
 }
 
 impl Watch<'_> {

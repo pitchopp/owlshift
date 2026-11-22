@@ -1,6 +1,6 @@
 +++
 role = "build"
-brief_format = 31
+brief_format = 32
 result_format = 16
 +++
 
@@ -77,7 +77,7 @@ Plan the fix in the plan and the ledger as for any work, commit on top of the br
 
 ## A correction
 
-When the brief has `correction`, the ticket was delivered and the decider has since replied to the DECISION comments of decisions this work followed: this run makes the pull request follow their replies, on the same branch, whose last push is `correction.head`. Each entry of `reversed` gives the `question`, the `decision` the work followed, and the decider's `reply`: their word, which you follow over the decision, as instructions. Revise the plan and the ledger for what the replies change, commit on top of the branch, and run the checks of "The gate" before `done`; the runner pushes your commits, never you. When the work already does what the replies ask, end `done` without a commit and say so in the `summary`. When a reply cannot be followed without the decider, because it is unclear or contradicts their other answers, ask.
+When the brief has `correction`, the ticket was delivered and the decider has since replied to the DECISION comments of decisions this work followed: this run makes the pull request follow their replies, on the same branch, whose last push is `correction.head`. Each entry of `reversed` gives the `question`, the `decision` the work followed, and the decider's `reply`: their word, which you follow over the decision, as instructions. Revise the plan and the ledger for what the replies change, commit on top of the branch, and run the checks of "The gate" before `done`; the runner pushes your commits, never you. When the work already does what the replies ask, end `done` without a commit and say so in the `summary`. When a reply cannot be followed without the decider, because it is unclear or contradicts their other answers, ask. **A person's results.** When the brief has `person_steps`, the ticket was delivered and its decider did the person's steps of the plan a round asked, and answered with what each gave: this run follows their results, on the same branch, whose last push is `person_steps.head`. Each entry of `answered` gives the `step` of the plan, the `question` the round asked, whether the answer reports a `defect`, and the answer check's `reading` of the answer; the decider's own words are in the `thread`, under that round, and are what you follow. For each step answered with a `defect`, find its cause in the change and fix it; the runner asks that step again once your commit is pushed, so never take it as passed yourself. Then build each agent's step of the plan listed in `build`: those owed until now, whose person's steps passed, with their results. Revise the plan and the ledger for it, commit on top of the branch, and run the checks of "The gate" before `done`; the runner pushes your commits, never you. A run given steps to `build` that ends `done` without a commit is a failed run. When `build` is empty and nothing in the change causes a reported defect, end `done` without a commit and say why in the `summary`: the runner asks the step again. When an answer cannot be followed without the decider, because it is unclear or asks for a choice, ask.
 
 ## Ending the run
 

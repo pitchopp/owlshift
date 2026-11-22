@@ -1353,6 +1353,7 @@ impl Driver {
             check_failure: None,
             rebase: None,
             correction: None,
+            person_steps: None,
             result_path: RelativePath::new(RESULT_PATH)
                 .expect("RESULT_PATH is a valid relative path"),
             plan: None,
