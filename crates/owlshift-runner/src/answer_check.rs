@@ -831,6 +831,7 @@ mod tests {
                 restart: Restart::Continue,
                 yields: None,
                 waiting: None,
+                first: None,
             }
             .render(),
         ];

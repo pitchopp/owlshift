@@ -27,5 +27,5 @@ pub mod waits;
 pub use format::ContractError;
 pub use owlshift_core::vocab::{
     BasisKind, DelegationLevel, Harness, MergeMethod, PlanApproval, Priority, Role, Stage, Tier,
-    Variant,
+    UnblockVerdict, Variant,
 };

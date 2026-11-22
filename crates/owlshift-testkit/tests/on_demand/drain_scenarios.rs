@@ -358,7 +358,13 @@ fn a_kept_branch_with_commits_of_its_own_is_dispatched_as_it_is() {
     let blocked = r#"{"format":18,"status":"blocked","summary":"Waiting."}"#;
     // The run leaves a commit of its own, then blocks: since OWL-400 a
     // commit made outside a run is a breach at the ticket's next start.
-    let (outcome, printed) = bench.run(vec![bench.reply(Some("Hi"), Some(blocked))], None);
+    let (outcome, printed) = bench.run(
+        vec![
+            bench.reply(Some("Hi"), Some(blocked)),
+            bench.reply(None, Some(UNBLOCK_PARK)),
+        ],
+        None,
+    );
     assert!(
         matches!(outcome, Err(Stop::Parked { .. })),
         "{outcome:?}\n{printed}"

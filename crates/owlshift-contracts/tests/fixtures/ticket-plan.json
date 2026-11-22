@@ -1,5 +1,5 @@
 {
-  "format": 3,
+  "format": 4,
   "plan": {
     "goal": "Add the logs command, printing one ticket's events oldest first.",
     "criteria": [

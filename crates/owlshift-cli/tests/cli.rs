@@ -114,7 +114,7 @@ fn version_lists_the_format_versions() {
     assert_eq!(
         lines[2..],
         [
-            "formats: brief 32, result 17, event 2, claim 2, ticket state 4, ticket questions 19, \
+            "formats: brief 33, result 18, event 2, claim 2, ticket state 4, ticket questions 20, \
              comment footer 1"
         ],
         "{text}"

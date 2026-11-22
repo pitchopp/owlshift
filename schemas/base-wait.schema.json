@@ -1059,6 +1059,17 @@
           "description": "One or two sentences on what the run did.",
           "type": "string"
         },
+        "unblock": {
+          "description": "The resolver's verdict on a run that stopped `blocked` (format 18,\nOWL-620): from the resolver only, whose brief gives `unblock`, and\nthen required with `done`.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/UnblockAnswer"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "verdicts": {
           "description": "The answer check's verdict on each question of the latest ask, in\nquestion order; only from the answer check, and only with `status:\ndone`.",
           "type": "array",
@@ -1343,6 +1354,91 @@
               ]
             }
           }
+        },
+        {
+          "if": {
+            "properties": {
+              "unblock": {
+                "type": "object"
+              }
+            },
+            "required": [
+              "unblock"
+            ]
+          },
+          "then": {
+            "properties": {
+              "status": {
+                "const": "done"
+              }
+            }
+          }
+        },
+        {
+          "properties": {
+            "unblock": {
+              "allOf": [
+                {
+                  "else": {
+                    "not": {
+                      "required": [
+                        "quote"
+                      ]
+                    }
+                  },
+                  "if": {
+                    "properties": {
+                      "basis_kind": {
+                        "const": "ticket"
+                      }
+                    },
+                    "required": [
+                      "basis_kind"
+                    ]
+                  },
+                  "then": {
+                    "required": [
+                      "quote"
+                    ]
+                  }
+                },
+                {
+                  "else": {
+                    "not": {
+                      "anyOf": [
+                        {
+                          "required": [
+                            "step"
+                          ]
+                        },
+                        {
+                          "required": [
+                            "when"
+                          ]
+                        }
+                      ]
+                    }
+                  },
+                  "if": {
+                    "properties": {
+                      "verdict": {
+                        "const": "person_step"
+                      }
+                    },
+                    "required": [
+                      "verdict"
+                    ]
+                  },
+                  "then": {
+                    "required": [
+                      "step",
+                      "when"
+                    ]
+                  }
+                }
+              ]
+            }
+          }
         }
       ],
       "required": [
@@ -1413,6 +1509,97 @@
         "deep",
         "standard",
         "fast"
+      ]
+    },
+    "UnblockAnswer": {
+      "description": "The resolver's verdict on a run that stopped `blocked` (format 18,\nOWL-620; architecture section 4, \"A `blocked` through the resolver\"):\none of its brief's open verdicts, the sentence that goes with it, and\nthe label and basis a decision carries, which the runner holds to the\nproject's level as any decision's.",
+      "type": "object",
+      "properties": {
+        "basis": {
+          "description": "What settles the verdict, precise enough to check.",
+          "type": "string",
+          "pattern": "\\S"
+        },
+        "basis_kind": {
+          "type": "string",
+          "enum": [
+            "fact",
+            "settled",
+            "ticket",
+            "judgment"
+          ]
+        },
+        "category": {
+          "description": "The resolver's own label for the obstacle, a token, as on a decision.",
+          "type": "string",
+          "pattern": "\\S"
+        },
+        "note": {
+          "description": "One sentence, at most [`MAX_NOTE_BYTES`]: for `retry`, what the run\nmisread or missed, which its next run reads in its thread; for\n`rebase`, what of the base it lacks; for `person_step`, what the\nperson does; for `park`, what the person must do first.",
+          "type": "string",
+          "pattern": "\\S"
+        },
+        "quote": {
+          "description": "With a `ticket` basis only, and then required, as on a decision.",
+          "type": "string",
+          "pattern": "\\S"
+        },
+        "step": {
+          "description": "With `person_step` only, and then required: the agent's step of the\ngiven plan that becomes a person's, by its place from 1.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 1
+        },
+        "verdict": {
+          "$ref": "#/$defs/UnblockVerdict"
+        },
+        "when": {
+          "description": "With `person_step` only, and then required: when that step is due.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/StepWhen"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "verdict",
+        "note",
+        "category",
+        "basis",
+        "basis_kind"
+      ]
+    },
+    "UnblockVerdict": {
+      "description": "What the resolver answers on a run that stopped `blocked` (OWL-620,\narchitecture section 4, \"A `blocked` through the resolver\"): one act of\na closed list, each one the runner already makes. Which are open is\n[`crate::unblock::open`]'s.",
+      "oneOf": [
+        {
+          "description": "The stage runs again, the resolver's note in its thread: the\nobstacle is not one, such as a permission misread or a command that\nis there.",
+          "type": "string",
+          "const": "retry"
+        },
+        {
+          "description": "The branch goes to the rebase run: the obstacle is the base.",
+          "type": "string",
+          "const": "rebase"
+        },
+        {
+          "description": "The step is a person's, owed, and the Build goes on: the rest of the\nplan does not need its result.",
+          "type": "string",
+          "const": "person_step"
+        },
+        {
+          "description": "Today's path: the ticket parks, the resolver's sentence on what the\nperson must do first leading its PARKED comment.",
+          "type": "string",
+          "const": "park"
+        }
       ]
     },
     "Variant": {

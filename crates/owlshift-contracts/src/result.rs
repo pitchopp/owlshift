@@ -11,10 +11,10 @@ use crate::format::{self, ContractError, Format, RESULT_FORMAT};
 use crate::ids::{QuestionId, RelativePath, TicketId};
 use crate::refs::cut_to;
 use crate::review::{
-    Finding, FindingResponse, FindingsMode, MAX_FINDINGS, Plan, Ruling, check_answers,
+    Finding, FindingResponse, FindingsMode, MAX_FINDINGS, Plan, Ruling, StepWhen, check_answers,
     check_findings,
 };
-use crate::{BasisKind, Role, Variant};
+use crate::{BasisKind, Role, UnblockVerdict, Variant};
 
 /// The answer check's classes live in the core, which folds them into one
 /// state-machine event.
@@ -163,6 +163,112 @@ pub struct RunResult {
     /// The person's steps themselves are owed without being listed.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub owed: Vec<NonZeroU32>,
+    /// The resolver's verdict on a run that stopped `blocked` (format 18,
+    /// OWL-620): from the resolver only, whose brief gives `unblock`, and
+    /// then required with `done`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unblock: Option<UnblockAnswer>,
+}
+
+/// The most bytes of an [`UnblockAnswer`]'s `note` (OWL-620): one sentence,
+/// which leads a PARKED comment or follows a DECISION's verdict.
+pub const MAX_NOTE_BYTES: usize = 512;
+
+/// The resolver's verdict on a run that stopped `blocked` (format 18,
+/// OWL-620; architecture section 4, "A `blocked` through the resolver"):
+/// one of its brief's open verdicts, the sentence that goes with it, and
+/// the label and basis a decision carries, which the runner holds to the
+/// project's level as any decision's.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct UnblockAnswer {
+    pub verdict: UnblockVerdict,
+    /// One sentence, at most [`MAX_NOTE_BYTES`]: for `retry`, what the run
+    /// misread or missed, which its next run reads in its thread; for
+    /// `rebase`, what of the base it lacks; for `person_step`, what the
+    /// person does; for `park`, what the person must do first.
+    #[schemars(regex(pattern = r"\S"))]
+    pub note: String,
+    /// The resolver's own label for the obstacle, a token, as on a decision.
+    #[schemars(regex(pattern = r"\S"))]
+    pub category: String,
+    /// What settles the verdict, precise enough to check.
+    #[schemars(regex(pattern = r"\S"))]
+    pub basis: String,
+    #[schemars(schema_with = "resolver_basis_kind")]
+    pub basis_kind: BasisKind,
+    /// With a `ticket` basis only, and then required, as on a decision.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "present_string"
+    )]
+    #[schemars(with = "String", regex(pattern = r"\S"))]
+    pub quote: Option<String>,
+    /// With `person_step` only, and then required: the agent's step of the
+    /// given plan that becomes a person's, by its place from 1.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub step: Option<NonZeroU32>,
+    /// With `person_step` only, and then required: when that step is due.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub when: Option<StepWhen>,
+}
+
+impl UnblockAnswer {
+    /// The rules that need no brief: texts not blank, the note within
+    /// [`MAX_NOTE_BYTES`], no `recommendation` basis, a quote with a `ticket`
+    /// basis and only then, and a step with its `when` on `person_step` and
+    /// only there.
+    fn check(&self) -> Result<(), String> {
+        let blank = [
+            ("note", &self.note),
+            ("category", &self.category),
+            ("basis", &self.basis),
+        ]
+        .into_iter()
+        .find(|(_, text)| text.trim().is_empty());
+        if let Some((field, _)) = blank {
+            return Err(format!("has a blank {field}"));
+        }
+        if self.note.len() > MAX_NOTE_BYTES {
+            return Err(format!(
+                "has a note of {} bytes, past the {MAX_NOTE_BYTES} of one sentence",
+                self.note.len()
+            ));
+        }
+        if self.basis_kind == BasisKind::Recommendation {
+            return Err(
+                "has a `recommendation` basis, the runner's own kind: give `fact`, `settled`, \
+                 `ticket` or `judgment`"
+                    .to_owned(),
+            );
+        }
+        match (self.basis_kind, &self.quote) {
+            (BasisKind::Ticket, None) => {
+                return Err("has a `ticket` basis but no quote".to_owned());
+            }
+            (BasisKind::Ticket, Some(quote)) => {
+                check_quote(quote, "settle it")
+                    .map_err(|broken| format!("has a quote that {broken}"))?;
+            }
+            (kind, Some(_)) => {
+                return Err(format!(
+                    "has a quote but a `{}` basis: only a `ticket` basis quotes",
+                    kind.as_str()
+                ));
+            }
+            (_, None) => {}
+        }
+        let person = self.verdict == UnblockVerdict::PersonStep;
+        match (person, self.step.is_some(), self.when.is_some()) {
+            (true, true, true) | (false, false, false) => Ok(()),
+            (true, _, _) => Err("is `person_step` without its `step` and `when`".to_owned()),
+            (false, _, _) => Err(format!(
+                "gives a `step` or `when` with `{}`: only `person_step` names a step",
+                self.verdict.as_str()
+            )),
+        }
+    }
 }
 
 /// A design run's answer to an approval round (format 9, OWL-300).
@@ -918,7 +1024,19 @@ impl RunResult {
         }
         self.check_quality_pipeline()?;
         check_verdicts(CONTRACT, &self.verdicts)?;
-        check_resolutions(&self.resolutions)
+        check_resolutions(&self.resolutions)?;
+        if let Some(unblock) = &self.unblock {
+            if self.status != Status::Done {
+                return Err(ContractError::invalid(
+                    CONTRACT,
+                    "unblock is given but status is not done",
+                ));
+            }
+            unblock.check().map_err(|broken| {
+                ContractError::invalid(CONTRACT, format!("the unblock {broken}"))
+            })?;
+        }
+        Ok(())
     }
 
     /// The rules of the quality pipeline's fields (format 9) that need no
@@ -1410,6 +1528,7 @@ impl RunResult {
     /// a question it was not given, such as one of an always-human category,
     /// is refused.
     fn resolutions_against(&self, brief: &Brief) -> Result<(), ContractError> {
+        self.unblock_against(brief)?;
         if brief.role != Role::Resolver {
             if self.resolutions.is_empty() {
                 return Ok(());
@@ -1469,6 +1588,59 @@ impl RunResult {
                         resolution.question()
                     ),
                 ));
+            }
+        }
+        Ok(())
+    }
+}
+
+impl RunResult {
+    /// The resolver's verdict on a `blocked` (OWL-620): given only by a
+    /// resolver whose brief gives `unblock`, and by one that ends `done`
+    /// there, always; one of the brief's open verdicts; a `person_step`'s
+    /// step an agent's step of the plan `asked_by` gives.
+    fn unblock_against(&self, brief: &Brief) -> Result<(), ContractError> {
+        let invalid = |reason: String| Err(ContractError::invalid(CONTRACT, reason));
+        let Some(given) = &brief.unblock else {
+            return match &self.unblock {
+                None => Ok(()),
+                Some(_) => invalid(
+                    "an unblock verdict is given but the brief gives no run to unblock".to_owned(),
+                ),
+            };
+        };
+        let Some(answer) = &self.unblock else {
+            return match self.status {
+                Status::Done => {
+                    invalid("the resolver ended done without its unblock verdict".to_owned())
+                }
+                _ => Ok(()),
+            };
+        };
+        if !given.verdicts.contains(&answer.verdict) {
+            let open: Vec<&str> = given.verdicts.iter().map(|v| v.as_str()).collect();
+            return invalid(format!(
+                "the unblock verdict `{}` is not open here: give one of {}",
+                answer.verdict.as_str(),
+                open.join(", ")
+            ));
+        }
+        if let Some(step) = answer.step {
+            let plan = brief
+                .asked_by
+                .as_ref()
+                .and_then(|asked| asked.plan.as_ref());
+            let index = usize::try_from(step.get() - 1).unwrap_or(usize::MAX);
+            match plan.and_then(|given| given.plan.steps.get(index)) {
+                None => {
+                    return invalid(format!(
+                        "the unblock names step {step}, which is not a step of the given plan"
+                    ));
+                }
+                Some(planned) if planned.is_person() => {
+                    return invalid(format!("the unblock names step {step}, already a person's"));
+                }
+                Some(_) => {}
             }
         }
         Ok(())
@@ -1790,7 +1962,7 @@ pub(crate) fn check_question_order(
     Ok(())
 }
 
-/// Adds to the schema the ten rules of [`RunResult::validate`] that JSON
+/// Adds to the schema the rules of [`RunResult::validate`] that JSON
 /// Schema can express.
 fn result_invariants(schema: &mut Schema) {
     let rules = json!([
@@ -1864,6 +2036,28 @@ fn result_invariants(schema: &mut Schema) {
         {
             "if": { "properties": { "approval": { "const": "approved" } }, "required": ["approval"] },
             "then": { "not": { "required": ["plan"] } }
+        },
+        {
+            "if": { "properties": { "unblock": { "type": "object" } }, "required": ["unblock"] },
+            "then": { "properties": { "status": { "const": "done" } } }
+        },
+        {
+            "properties": {
+                "unblock": {
+                    "allOf": [
+                        {
+                            "if": { "properties": { "basis_kind": { "const": "ticket" } }, "required": ["basis_kind"] },
+                            "then": { "required": ["quote"] },
+                            "else": { "not": { "required": ["quote"] } }
+                        },
+                        {
+                            "if": { "properties": { "verdict": { "const": "person_step" } }, "required": ["verdict"] },
+                            "then": { "required": ["step", "when"] },
+                            "else": { "not": { "anyOf": [{ "required": ["step"] }, { "required": ["when"] }] } }
+                        }
+                    ]
+                }
+            }
         }
     ]);
     schema.insert("allOf".to_owned(), rules);

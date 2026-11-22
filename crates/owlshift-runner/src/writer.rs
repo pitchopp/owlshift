@@ -3524,7 +3524,7 @@ fn titled_link(what: &str, url: Option<&str>, title: &str) -> String {
 /// word boundary, when one is in its second half, and ended with `…`
 /// (OWL-351). For a DECISION comment's line, whose whole text is in the
 /// decisions document or the comment's fold.
-fn clip(text: &str, room: usize) -> String {
+pub(crate) fn clip(text: &str, room: usize) -> String {
     if chars(text) <= room {
         return text.to_owned();
     }
@@ -4031,7 +4031,18 @@ pub struct ParkedComment {
     /// The tickets that wait for what it keeps (OWL-623), when it keeps what
     /// it holds and some do: never with `yields`, a park yields or keeps.
     pub waiting: Option<Waiters>,
+    /// The resolver's sentence on what the person must do first, when its
+    /// verdict on a `blocked` was `park` (OWL-620): the comment's first
+    /// line.
+    pub first: Option<String>,
 }
+
+/// The most characters of a PARKED comment's first line, the resolver's
+/// sentence (OWL-620): one sentence, which [`MAX_NOTE_BYTES`] already bounds
+/// in bytes.
+///
+/// [`MAX_NOTE_BYTES`]: owlshift_contracts::result::MAX_NOTE_BYTES
+const PARKED_FIRST_CHARS: usize = 600;
 
 /// The tickets that wait for what a parked ticket keeps (OWL-623;
 /// architecture section 5, "A stopped holder yields", *Shown*), as
@@ -4109,9 +4120,10 @@ impl ParkedComment {
     /// hold whole has its texts cut, visibly: the detail to 8,000
     /// characters, the open questions' texts first, which the round's
     /// QUESTIONS comment shows whole, then the longest. Every open question
-    /// keeps its id and its verdict's class.
+    /// keeps its id and its verdict's class. The resolver's sentence, when
+    /// given, comes first, under the header (OWL-620).
     pub fn render(&self) -> String {
-        let texts = match self.reason {
+        let mut texts: Vec<Fit> = match self.reason {
             ParkReason::Reasks => self
                 .open
                 .iter()
@@ -4135,6 +4147,11 @@ impl ParkedComment {
                 PARKED_DETAIL_CHARS,
             )],
         };
+        // The resolver's sentence, after the reason's texts, so that their
+        // places stay as each reason reads them.
+        if let Some(first) = &self.first {
+            texts.push(Fit::capped(flatten(first), LONGER, PARKED_FIRST_CHARS));
+        }
         fitted(MAX_COMMENT_CHARS, texts, |texts| self.body(texts))
     }
 
@@ -4146,6 +4163,13 @@ impl ParkedComment {
             round: None,
         };
         let mut sections = vec![header.render()];
+        let texts = match (&self.first, texts.split_last()) {
+            (Some(_), Some((first, rest))) => {
+                sections.push(format!("**First, for a person:** {first}"));
+                rest
+            }
+            _ => texts,
+        };
         match self.reason {
             ParkReason::Reasks => {
                 let round = self
@@ -5805,6 +5829,7 @@ mod tests {
             published: None,
             owed: vec![NonZeroU32::new(3).unwrap()],
             checks: Vec::new(),
+            handed: Vec::new(),
         };
         let owed = kept.owed_steps();
         let body = pull_request_body("Greets.\n", &owed, Some("Closes #12".to_owned()));
@@ -7348,6 +7373,7 @@ Context.
             restart,
             yields: None,
             waiting: None,
+            first: None,
         };
         let continue_it = "**To restart it:** reply `continue` here, in a comment of its own, or \
                            run `owlshift continue OWL-18`.";
@@ -7947,6 +7973,7 @@ Reply `Q1: B`, `ok` to take every recommendation, or in your own words.
                     restart: Restart::Continue,
                     yields: None,
                     waiting: None,
+                    first: None,
                 }
                 .render(),
                 DecisionComment {
@@ -8079,6 +8106,7 @@ Reply `Q1: B`, `ok` to take every recommendation, or in your own words.
             restart: Restart::Do,
             yields: None,
             waiting: None,
+            first: None,
         };
         assert_eq!(writer.post_parked(&parked).unwrap().body, parked.render());
         assert_eq!(tracker.posts.get(), 4);
@@ -8302,6 +8330,7 @@ Reply `Q1: B`, `ok` to take every recommendation, or in your own words.
             restart: Restart::Do,
             yields: None,
             waiting: None,
+            first: None,
         };
         let delivery = report(Err(forge::Error::new(ErrorKind::Unauthorized, "not read")));
         assert_eq!(
@@ -9418,6 +9447,7 @@ Reply `Q1: B`, `ok` to take every recommendation, or in your own words.
             restart: Restart::Continue,
             yields: None,
             waiting: None,
+            first: None,
         };
         assert!(!parked.render().contains("yields"));
         parked.yields = Some(Yielding {
@@ -9438,6 +9468,36 @@ Reply `Q1: B`, `ok` to take every recommendation, or in your own words.
         assert!(body.find("**It yields").unwrap() < restart);
     }
 
+    /// OWL-620: the resolver's sentence on what the person must do first
+    /// leads a PARKED comment, under its header, flattened, the reason and
+    /// what the run said after it; a long one is cut, the comment holding.
+    #[test]
+    fn a_parked_comment_leads_with_the_resolvers_sentence() {
+        let mut parked = ParkedComment {
+            ticket: ticket(),
+            reason: ParkReason::Blocked,
+            detail: "The staging key is missing.".to_owned(),
+            round: None,
+            open: Vec::new(),
+            restart: Restart::Continue,
+            yields: None,
+            waiting: None,
+            first: Some("Add the staging key\nto the keychain.".to_owned()),
+        };
+        let body = parked.render();
+        let first = "[owlshift] PARKED\n\n**First, for a person:** Add the staging key to the \
+                     keychain.\n\nParked: the run is blocked. The run said: The staging key is \
+                     missing.";
+        assert!(body.starts_with(first), "{body}");
+        parked.first = Some("x ".repeat(2_000));
+        let body = parked.render();
+        assert!(chars(&body) <= MAX_COMMENT_CHARS);
+        assert!(
+            body.contains("The run said: The staging key is missing."),
+            "{body}"
+        );
+    }
+
     /// OWL-228: a PARKED comment at the re-ask limit of a round at its
     /// bounds, or with a detail of a whole result, holds in one comment;
     /// the detail is cut to 8,000 characters.
@@ -9452,6 +9512,7 @@ Reply `Q1: B`, `ok` to take every recommendation, or in your own words.
             restart: Restart::Continue,
             yields: None,
             waiting: None,
+            first: None,
         };
         let blocked = ParkedComment {
             reason: ParkReason::Blocked,
@@ -10302,6 +10363,7 @@ Reply `Q1: B`, `ok` to take every recommendation, or in your own words.
                 restart: Restart::Do,
                 yields: None,
                 waiting: None,
+                first: None,
             }))
         }),
         ("post_handback", |w, _| {

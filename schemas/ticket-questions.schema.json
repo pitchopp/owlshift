@@ -52,7 +52,7 @@
     "format": {
       "description": "The format version of this document.",
       "type": "integer",
-      "const": 19
+      "const": 20
     },
     "resolver_refusal": {
       "description": "Why the runner refused the latest resolver result (format 7,\nOWL-191): what the next resolver run is told, whatever command runs\nit. Its questions went to the decider in a fallback round; it is kept\nfor the case where that round's post or keeping failed, and a later\ncommand's Build asks them again. A later refusal replaces it; an\naccepted resolver result, or any round kept, clears it; at most\n[`MAX_RESULT_REFUSAL_BYTES`].",
@@ -358,6 +358,17 @@
               "type": "null"
             }
           ]
+        },
+        "unblock": {
+          "description": "The resolver's verdict on a run that stopped `blocked`, when this\ndecision is one (format 20, OWL-620): the act the runner made, which\nbounds the next verdicts at that stage\n([`TicketQuestions::unblocks_at`]).",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/KeptUnblock"
+            },
+            {
+              "type": "null"
+            }
+          ]
         }
       },
       "additionalProperties": false,
@@ -367,6 +378,34 @@
         "question",
         "decision",
         "basis"
+      ]
+    },
+    "KeptUnblock": {
+      "description": "A verdict the runner took on a run that stopped `blocked` (OWL-620),\nkept with its decision.",
+      "type": "object",
+      "properties": {
+        "stage": {
+          "description": "The stage the blocked run ran at.",
+          "$ref": "#/$defs/Stage"
+        },
+        "step": {
+          "description": "A `person_step`'s step of the plan, by its place from 1.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 1
+        },
+        "verdict": {
+          "description": "`retry`, `rebase` or `person_step`: a `park` posts no DECISION.",
+          "$ref": "#/$defs/UnblockVerdict"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "stage",
+        "verdict"
       ]
     },
     "Question": {
@@ -507,6 +546,45 @@
       "required": [
         "through",
         "comment"
+      ]
+    },
+    "Stage": {
+      "description": "A stage of the pipeline, or `ready` for an admitted ticket not yet started.",
+      "type": "string",
+      "enum": [
+        "intake",
+        "ready",
+        "design",
+        "design_review",
+        "build",
+        "verify",
+        "deliver",
+        "watch"
+      ]
+    },
+    "UnblockVerdict": {
+      "description": "What the resolver answers on a run that stopped `blocked` (OWL-620,\narchitecture section 4, \"A `blocked` through the resolver\"): one act of\na closed list, each one the runner already makes. Which are open is\n[`crate::unblock::open`]'s.",
+      "oneOf": [
+        {
+          "description": "The stage runs again, the resolver's note in its thread: the\nobstacle is not one, such as a permission misread or a command that\nis there.",
+          "type": "string",
+          "const": "retry"
+        },
+        {
+          "description": "The branch goes to the rebase run: the obstacle is the base.",
+          "type": "string",
+          "const": "rebase"
+        },
+        {
+          "description": "The step is a person's, owed, and the Build goes on: the rest of the\nplan does not need its result.",
+          "type": "string",
+          "const": "person_step"
+        },
+        {
+          "description": "Today's path: the ticket parks, the resolver's sentence on what the\nperson must do first leading its PARKED comment.",
+          "type": "string",
+          "const": "park"
+        }
       ]
     },
     "Verdict": {

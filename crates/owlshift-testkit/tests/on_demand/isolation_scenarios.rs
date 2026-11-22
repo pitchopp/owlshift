@@ -37,7 +37,13 @@ impl Bench {
 #[test]
 fn a_run_cut_off_quarantines_the_project_until_a_clear_for_good() {
     let bench = Bench::new(true);
-    let (outcome, printed) = bench.run(vec![bench.reply(Some("Hi"), Some(BLOCKED))], None);
+    let (outcome, printed) = bench.run(
+        vec![
+            bench.reply(Some("Hi"), Some(BLOCKED)),
+            bench.reply(None, Some(UNBLOCK_PARK)),
+        ],
+        None,
+    );
     assert!(
         matches!(outcome, Err(Stop::Parked { .. })),
         "{outcome:?}\n{printed}"
@@ -97,7 +103,13 @@ fn a_run_cut_off_quarantines_the_project_until_a_clear_for_good() {
 #[test]
 fn a_ticket_changed_outside_its_runs_is_caught_at_its_next_start() {
     let bench = Bench::new(true);
-    let (outcome, printed) = bench.run(vec![bench.reply(Some("Hi"), Some(BLOCKED))], None);
+    let (outcome, printed) = bench.run(
+        vec![
+            bench.reply(Some("Hi"), Some(BLOCKED)),
+            bench.reply(None, Some(UNBLOCK_PARK)),
+        ],
+        None,
+    );
     assert!(
         matches!(outcome, Err(Stop::Parked { .. })),
         "{outcome:?}\n{printed}"
@@ -132,7 +144,13 @@ fn a_ticket_changed_outside_its_runs_is_caught_at_its_next_start() {
 #[test]
 fn a_write_cut_between_the_ref_and_the_run_file_is_finished_by_the_next_command() {
     let bench = Bench::new(true);
-    let (outcome, printed) = bench.run(vec![bench.reply(Some("Hi"), Some(BLOCKED))], None);
+    let (outcome, printed) = bench.run(
+        vec![
+            bench.reply(Some("Hi"), Some(BLOCKED)),
+            bench.reply(None, Some(UNBLOCK_PARK)),
+        ],
+        None,
+    );
     assert!(
         matches!(outcome, Err(Stop::Parked { .. })),
         "{outcome:?}\n{printed}"

@@ -1319,6 +1319,7 @@ fn live_brief(
         always_human: Vec::new(),
         delegation: None,
         asked_by: None,
+        unblock: None,
         gate_failure: None,
         setup_failure: None,
         result_refusal: None,

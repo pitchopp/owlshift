@@ -348,6 +348,54 @@ impl BasisKind {
     }
 }
 
+/// What the resolver answers on a run that stopped `blocked` (OWL-620,
+/// architecture section 4, "A `blocked` through the resolver"): one act of
+/// a closed list, each one the runner already makes. Which are open is
+/// [`crate::unblock::open`]'s.
+#[derive(
+    Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize, JsonSchema,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum UnblockVerdict {
+    /// The stage runs again, the resolver's note in its thread: the
+    /// obstacle is not one, such as a permission misread or a command that
+    /// is there.
+    Retry,
+    /// The branch goes to the rebase run: the obstacle is the base.
+    Rebase,
+    /// The step is a person's, owed, and the Build goes on: the rest of the
+    /// plan does not need its result.
+    PersonStep,
+    /// Today's path: the ticket parks, the resolver's sentence on what the
+    /// person must do first leading its PARKED comment.
+    Park,
+}
+
+impl UnblockVerdict {
+    /// Every verdict, in the order a brief lists the open ones.
+    pub const ALL: [Self; 4] = [Self::Retry, Self::Rebase, Self::PersonStep, Self::Park];
+
+    /// The name `result.json`, the brief and the events write.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Retry => "retry",
+            Self::Rebase => "rebase",
+            Self::PersonStep => "person_step",
+            Self::Park => "park",
+        }
+    }
+
+    /// The act, as the DECISION comment's question offers it.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Retry => "Run the stage again",
+            Self::Rebase => "Give the branch to the rebase run",
+            Self::PersonStep => "Owe the step to a person, and go on",
+            Self::Park => "Park the ticket for a person",
+        }
+    }
+}
+
 /// How the decider's answers left one question.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]

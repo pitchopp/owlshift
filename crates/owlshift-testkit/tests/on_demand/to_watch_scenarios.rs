@@ -39,6 +39,7 @@ fn parked_at_build() -> Bench {
     let (parked, printed) = bench.continue_ticket(vec![
         bench.reply(None, Some(&answered)),
         bench.reply(None, Some(blocked)),
+        bench.reply(None, Some(UNBLOCK_PARK)),
     ]);
     assert!(
         matches!(&parked, Err(Stop::Parked { .. })),

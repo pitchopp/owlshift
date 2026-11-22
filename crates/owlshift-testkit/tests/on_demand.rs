@@ -1388,6 +1388,12 @@ impl Notifier for Notified {
 const DONE: &str = r#"{"format":18,"status":"done","summary":"Added GREETING.md; the gate passes.",
 "pr":{"branch":"owlshift/demo-1","title":"Add a greeting","body":"Says hello. Gate: green."}}"#;
 
+/// The resolver's `park` on a run that stopped `blocked` (OWL-620): the
+/// ticket parks as before, this sentence leading its PARKED comment.
+const UNBLOCK_PARK: &str = r#"{"format":18,"status":"done","summary":"Read the stop.",
+"unblock":{"verdict":"park","note":"Read what the run said, then continue.","category":"environment",
+"basis":"The run's summary names what it lacks.","basis_kind":"fact"}}"#;
+
 /// The project's rules, which every brief carries (OWL-61).
 const AGENTS: &str = "Sign off every commit (`git commit -s`).\n";
 
@@ -3012,7 +3018,13 @@ fn every_stop_before_delivery_leaves_the_ticket_untouched() {
     let cases: Vec<(&str, Setup, Check, Option<EventKind>)> = vec![
         (
             "blocked",
-            Box::new(move |b| vec![b.reply(None, Some(blocked))]),
+            // The resolver's run first (OWL-620), which parks it.
+            Box::new(move |b| {
+                vec![
+                    b.reply(None, Some(blocked)),
+                    b.reply(None, Some(UNBLOCK_PARK)),
+                ]
+            }),
             |s| {
                 matches!(
                     s,
@@ -3367,7 +3379,13 @@ fn a_run_that_moves_origin_main_does_not_choose_the_next_base() {
         *planted.borrow_mut() = commit;
     });
     let blocked = r#"{"format":18,"status":"blocked","summary":"Waiting."}"#;
-    let (outcome, printed) = bench.run(vec![bench.reply(None, Some(blocked))], Some(agent));
+    let (outcome, printed) = bench.run(
+        vec![
+            bench.reply(None, Some(blocked)),
+            bench.reply(None, Some(UNBLOCK_PARK)),
+        ],
+        Some(agent),
+    );
     assert!(
         matches!(
             outcome,
@@ -5412,7 +5430,13 @@ fn a_resume_or_parked_comment_the_tracker_refuses() {
     bench.refuse.set(Some("[owlshift] PARKED"));
     bench.refuse_stage.set(true);
     let blocked = r#"{"format":18,"status":"blocked","summary":"The gate needs network."}"#;
-    let (outcome, _) = bench.run(vec![bench.reply(None, Some(blocked))], None);
+    let (outcome, _) = bench.run(
+        vec![
+            bench.reply(None, Some(blocked)),
+            bench.reply(None, Some(UNBLOCK_PARK)),
+        ],
+        None,
+    );
     let Err(
         stop @ Stop::Parked {
             unposted: Some(_), ..
@@ -5453,6 +5477,7 @@ fn a_restart_at_build_shows_the_ticket_working_again() {
     let (parked, printed) = bench.continue_ticket(vec![
         bench.reply(None, Some(&answered)),
         bench.reply(None, Some(blocked)),
+        bench.reply(None, Some(UNBLOCK_PARK)),
     ]);
     assert!(
         matches!(
@@ -12782,6 +12807,10 @@ mod overlap_scenarios;
 /// Scenario S5 when a holder parks or waits for its decider (OWL-621).
 #[path = "on_demand/yield_scenarios.rs"]
 mod yield_scenarios;
+
+/// A `blocked` through the resolver before a person is asked (OWL-620).
+#[path = "on_demand/unblock_scenarios.rs"]
+mod unblock_scenarios;
 
 /// What each ticket in flight waits on, read by `owlshift status --waits`
 /// from a drain's refs and events (OWL-459).

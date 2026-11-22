@@ -107,9 +107,10 @@ pub const TICKET_STATE_FORMAT: u32 = 4;
 /// `decisions_document` (OWL-351); format 16 a decision's `recommendation`
 /// basis kind (OWL-375); format 17 drops a decision's `asked_by`
 /// (OWL-379); format 18 an ask's resolver `labels` (OWL-482); format 19 a
-/// verdict's chosen `option` (OWL-585); formats 2 to 18 are still read,
-/// formats 14 to 16 without a decision's `asked_by`.
-pub const QUESTIONS_FORMAT: u32 = 19;
+/// verdict's chosen `option` (OWL-585); format 20 a decision's `unblock`,
+/// the verdict on a run that stopped `blocked` (OWL-620); formats 2 to 19
+/// are still read, formats 14 to 16 without a decision's `asked_by`.
+pub const QUESTIONS_FORMAT: u32 = 20;
 /// The format version of a ticket's delivery (`delivery.json` on a ticket
 /// ref, OWL-209). Format 2 adds the `owed` report and the push's kept
 /// `report` (OWL-218); format 3 a correction run's push (OWL-146); format 4
@@ -139,9 +140,10 @@ pub const PROPOSALS_FORMAT: u32 = 2;
 /// The format version of a ticket's plan (`plan.json` on a ticket ref,
 /// OWL-300). Format 2 adds a step's `by` and `when` and the Build's `owed`
 /// (OWL-619); format 3 the `checks` of a person's steps asked at Watch
-/// (OWL-619); format 1 is still read, every step the agent's, and format 2
-/// with no check.
-pub const PLAN_FORMAT: u32 = 3;
+/// (OWL-619); format 4 the steps the resolver `handed` to a person
+/// (OWL-620); format 1 is still read, every step the agent's, format 2 with
+/// no check, and format 3 with no step handed.
+pub const PLAN_FORMAT: u32 = 4;
 /// The format version of a ticket's review record (`review.json` on a ticket
 /// ref, OWL-300). Format 2 adds the colleagues' reviews `relayed` to the
 /// decider (OWL-585); format 1 is still read.

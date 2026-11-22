@@ -621,6 +621,25 @@ pub struct TicketPlan {
     /// plan starts with none.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub checks: Vec<StepCheck>,
+    /// The agent's steps of this plan the resolver handed to a person, the
+    /// verdict `person_step` on a Build that stopped `blocked` there (format
+    /// 4, OWL-620; architecture section 4, "A `blocked` through the
+    /// resolver"): each read as a person's step due as it says
+    /// ([`TicketPlan::effective`]), the plan's own text, and every hash, left
+    /// as written. In increasing order, each once. A new plan starts with
+    /// none.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub handed: Vec<HandedStep>,
+}
+
+/// An agent's step of the plan the resolver handed to a person (OWL-620).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct HandedStep {
+    /// Its place in the plan, from 1: an agent's step there.
+    pub step: NonZeroU32,
+    /// When its result is due.
+    pub when: StepWhen,
 }
 
 /// A person's step a round at Watch asked its decider (OWL-619).
@@ -737,18 +756,30 @@ impl TicketPlan {
     /// plan could hold a person's step (OWL-619), is read with every step
     /// the agent's and nothing owed, and refused when it says otherwise; a
     /// format-2 one, written before a round at Watch asked a person's steps,
-    /// is read with no check, and refused when it keeps one; the next write
-    /// gives either the current format.
+    /// is read with no check, and refused when it keeps one; a format-3 one,
+    /// written before the resolver handed a step to a person (OWL-620), is
+    /// read with none handed, and refused when it keeps one; the next write
+    /// gives each the current format.
     pub fn parse(input: &str) -> Result<Self, ContractError> {
         let older = format::parse_json_older(Self::CONTRACT, 1, PLAN_FORMAT, "owed", input)
             .map(|read| (1, read))
             .or_else(|| {
                 format::parse_json_older(Self::CONTRACT, 2, PLAN_FORMAT, "checks", input)
                     .map(|read| (2, read))
+            })
+            .or_else(|| {
+                format::parse_json_older(Self::CONTRACT, 3, PLAN_FORMAT, "handed", input)
+                    .map(|read| (3, read))
             });
         let plan: Self = match older {
             Some((older, read)) => {
                 let plan: Self = read?;
+                if !plan.handed.is_empty() {
+                    return Err(ContractError::invalid(
+                        Self::CONTRACT,
+                        format!("format {older} records no step handed to a person"),
+                    ));
+                }
                 if older == 1
                     && let Some(n) = plan
                         .plan
@@ -761,7 +792,7 @@ impl TicketPlan {
                         format!("format 1 records no person's step, but steps[{n}] says one"),
                     ));
                 }
-                if !plan.checks.is_empty() {
+                if older < 3 && !plan.checks.is_empty() {
                     return Err(ContractError::invalid(
                         Self::CONTRACT,
                         format!("format {older} records no checks"),
@@ -775,14 +806,44 @@ impl TicketPlan {
         Ok(plan)
     }
 
+    /// The plan as its steps stand (OWL-620): the steps of
+    /// [`TicketPlan::handed`] a person's, due as handed; the plan's own text
+    /// otherwise. What the Build follows and what is owed read it; the
+    /// approval and every hash bind [`TicketPlan::plan`] as written.
+    pub fn effective(&self) -> Plan {
+        let mut plan = self.plan.clone();
+        for handed in &self.handed {
+            let index = usize::try_from(handed.step.get() - 1).unwrap_or(usize::MAX);
+            if let Some(step) = plan.steps.get_mut(index) {
+                step.by = StepBy::Person;
+                step.when = Some(handed.when);
+            }
+        }
+        plan
+    }
+
+    /// Hands the agent's step `step` to a person, due `when` (OWL-620): kept
+    /// in [`TicketPlan::handed`], in order, and no longer among the agent's
+    /// steps it owes, being a person's now. A step already handed keeps its
+    /// first `when`.
+    pub fn hand(&mut self, step: NonZeroU32, when: StepWhen) {
+        if self.handed.iter().any(|handed| handed.step == step) {
+            return;
+        }
+        self.handed.push(HandedStep { step, when });
+        self.handed.sort_by_key(|handed| handed.step);
+        self.owed.retain(|number| *number != step);
+    }
+
     /// The steps the ticket owes a person, in the plan's order (OWL-619,
-    /// architecture section 4, "A person's steps"): every person's step, and
-    /// every agent's step of [`TicketPlan::owed`], which takes the `when` of
-    /// the nearest person's step before it.
+    /// architecture section 4, "A person's steps"): every person's step, one
+    /// the resolver handed included (OWL-620), and every agent's step of
+    /// [`TicketPlan::owed`], which takes the `when` of the nearest person's
+    /// step before it.
     pub fn owed_steps(&self) -> Vec<OwedStep> {
         let mut owed = Vec::new();
         let mut when = None;
-        for (n, step) in self.plan.steps.iter().enumerate() {
+        for (n, step) in self.effective().steps.iter().enumerate() {
             let number = step_number(n);
             if step.is_person() {
                 when = step.when;
@@ -830,7 +891,7 @@ impl TicketPlan {
     /// answered as passed, nor one answered a defect, whose run comes
     /// first.
     pub fn steps_to_ask(&self) -> Vec<(NonZeroU32, PlanStep)> {
-        self.plan
+        self.effective()
             .person_steps()
             .filter(|(_, step)| step.when == Some(StepWhen::BeforeMerge))
             .filter(|(number, _)| self.check(*number).is_none_or(|c| c.answer.is_none()))
@@ -844,8 +905,8 @@ impl TicketPlan {
     /// person's steps before them all passed, which it builds. A defect
     /// never releases an agent's step: its own step is asked again first.
     pub fn steps_run(&self) -> Option<StepsRun> {
-        let answered: Vec<StepCheck> = self
-            .plan
+        let plan = self.effective();
+        let answered: Vec<StepCheck> = plan
             .person_steps()
             .filter_map(|(number, _)| self.check(number))
             .filter(|check| check.answer.is_some())
@@ -861,8 +922,7 @@ impl TicketPlan {
             .into_iter()
             .filter(|owed| owed.when == StepWhen::BeforeMerge && !owed.step.is_person())
             .filter(|owed| {
-                self.plan
-                    .person_steps()
+                plan.person_steps()
                     .take_while(|(number, _)| *number < owed.number)
                     .all(|(number, _)| self.passed(number))
             })
@@ -961,11 +1021,43 @@ impl TicketPlan {
                 ContractError::invalid(Self::CONTRACT, format!("published: {reason}"))
             })?;
         }
-        check_owed(&self.plan, &self.owed)
+        check_handed(&self.plan, &self.handed).map_err(|reason| {
+            ContractError::invalid(Self::CONTRACT, format!("handed: {reason}"))
+        })?;
+        // A handed step is a person's: what is owed and checked reads it so.
+        let effective = self.effective();
+        check_owed(&effective, &self.owed)
             .map_err(|reason| ContractError::invalid(Self::CONTRACT, format!("owed: {reason}")))?;
-        check_checks(&self.plan, &self.checks)
+        check_checks(&effective, &self.checks)
             .map_err(|reason| ContractError::invalid(Self::CONTRACT, format!("checks: {reason}")))
     }
+}
+
+/// The rules of the steps the resolver handed to a person (OWL-620): each
+/// an agent's step of `plan` as written, in increasing order, each once.
+fn check_handed(plan: &Plan, handed: &[HandedStep]) -> Result<(), String> {
+    let mut previous: Option<NonZeroU32> = None;
+    for handed in handed {
+        let number = handed.step;
+        if previous.is_some_and(|p| p >= number) {
+            return Err(format!("step {number} is repeated or out of order"));
+        }
+        previous = Some(number);
+        let index = usize::try_from(number.get() - 1).unwrap_or(usize::MAX);
+        match plan.steps.get(index) {
+            None => {
+                return Err(format!(
+                    "step {number} is not a step of the plan, which has {}",
+                    plan.steps.len()
+                ));
+            }
+            Some(step) if step.is_person() => {
+                return Err(format!("step {number} is a person's already"));
+            }
+            Some(_) => {}
+        }
+    }
+    Ok(())
 }
 
 /// The rules of the checks of a person's steps (OWL-619): each of a person's
@@ -1854,7 +1946,7 @@ mod tests {
                     "plan_sha256",
                 ),
                 (&|d| d["plan"]["extra"] = 1.into(), "unknown field"),
-                (&|d| d["format"] = 4.into(), "upgrade Owlshift"),
+                (&|d| d["format"] = 5.into(), "upgrade Owlshift"),
                 // A person's step, its `when`, and the steps owed (OWL-619).
                 (
                     &|d| d["plan"]["steps"][1]["by"] = "robot".into(),
@@ -1973,7 +2065,7 @@ mod tests {
         let read = TicketPlan::parse(&older.to_string()).unwrap();
         assert!(read.owed_steps().is_empty());
         assert_eq!(read.owed_before_merge(), 0);
-        assert!(read.render().contains("\"format\": 3"), "{}", read.render());
+        assert!(read.render().contains("\"format\": 4"), "{}", read.render());
         // Format 2, written before a round asked a person's steps, is read
         // with no check.
         let mut second = ticket_plan();
@@ -2425,5 +2517,77 @@ mod tests {
         heavy["claim"] = "c".repeat(MAX_FINDING_BYTES).into();
         let error = check_findings("t", &parse(json!([heavy])), MAX_FINDINGS, true).unwrap_err();
         assert!(error.to_string().contains("past the 8192"), "{error}");
+    }
+
+    /// OWL-620: a step the resolver handed to a person reads as a person's,
+    /// due as handed, in what is owed and asked, the plan's text left as
+    /// written; `hand` drops it from the agent's steps owed; a handed step
+    /// is an agent's of the plan, once, in order; format 3 is read with none
+    /// handed and refused with one.
+    #[test]
+    fn a_step_handed_to_a_person_is_one_and_the_plan_stays_as_written() {
+        let mut plan = TicketPlan::parse(&ticket_plan().to_string()).unwrap();
+        let written = plan.plan.clone();
+        let step = |n: u32| NonZeroU32::new(n).unwrap();
+        plan.hand(step(3), StepWhen::BeforeMerge);
+        assert_eq!(plan.plan, written, "the text stays as written");
+        assert!(plan.owed.is_empty(), "no longer the agent's to owe");
+        let owed: Vec<(u32, bool)> = plan
+            .owed_steps()
+            .iter()
+            .map(|owed| (owed.number.get(), owed.step.is_person()))
+            .collect();
+        assert_eq!(owed, [(2, true), (3, true), (4, true)]);
+        let asked: Vec<u32> = plan.steps_to_ask().iter().map(|(n, _)| n.get()).collect();
+        assert_eq!(asked, [2, 3], "the handed step is asked as a person's");
+        // Handed again, it keeps its first `when`.
+        plan.hand(step(3), StepWhen::AfterMerge);
+        assert_eq!(
+            plan.handed,
+            [HandedStep {
+                step: step(3),
+                when: StepWhen::BeforeMerge
+            }]
+        );
+        let rendered = plan.render();
+        assert!(rendered.starts_with("{\n  \"format\": 4,"), "{rendered}");
+        assert_eq!(TicketPlan::parse(&rendered).unwrap(), plan);
+
+        let current = || {
+            let mut plan = ticket_plan();
+            plan["format"] = 4.into();
+            plan
+        };
+        refuses(
+            current,
+            TicketPlan::parse,
+            &[
+                (
+                    &|d| d["handed"] = json!([{ "step": 2, "when": "after_merge" }]),
+                    "a person's already",
+                ),
+                (
+                    &|d| d["handed"] = json!([{ "step": 9, "when": "after_merge" }]),
+                    "not a step",
+                ),
+                (
+                    &|d| {
+                        d["handed"] = json!([
+                            { "step": 3, "when": "after_merge" },
+                            { "step": 1, "when": "after_merge" }
+                        ]);
+                    },
+                    "repeated or out of order",
+                ),
+            ],
+        );
+        refuses(
+            ticket_plan,
+            TicketPlan::parse,
+            &[(
+                &|d| d["handed"] = json!([{ "step": 3, "when": "after_merge" }]),
+                "format 3 records no handed",
+            )],
+        );
     }
 }

@@ -35,7 +35,7 @@ use crate::ids::{QuestionId, SessionId, TicketId, check_name, is_commit_id, is_l
 use crate::result::{
     self, DECISIONS_ADVICE, Decision, Followup, Question, RefusedChoice, Verdict, check_verdicts,
 };
-use crate::{BasisKind, Role, Stage};
+use crate::{BasisKind, Role, Stage, UnblockVerdict};
 
 /// The namespace of every Owlshift ref.
 pub const REF_NAMESPACE: &str = "refs/owlshift/";
@@ -1611,6 +1611,41 @@ pub struct KeptDecision {
     /// [`Reversal::through`]. A newer reply is one no run has followed yet.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reversed: Option<Reversal>,
+    /// The resolver's verdict on a run that stopped `blocked`, when this
+    /// decision is one (format 20, OWL-620): the act the runner made, which
+    /// bounds the next verdicts at that stage
+    /// ([`TicketQuestions::unblocks_at`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unblock: Option<KeptUnblock>,
+}
+
+/// A verdict the runner took on a run that stopped `blocked` (OWL-620),
+/// kept with its decision.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct KeptUnblock {
+    /// The stage the blocked run ran at.
+    pub stage: Stage,
+    /// `retry`, `rebase` or `person_step`: a `park` posts no DECISION.
+    pub verdict: UnblockVerdict,
+    /// A `person_step`'s step of the plan, by its place from 1.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub step: Option<NonZeroU32>,
+}
+
+impl KeptUnblock {
+    /// What breaks its rules, if anything: a `park` posts no DECISION, and
+    /// a step goes with `person_step` alone, which needs one.
+    fn flaw(self) -> Option<&'static str> {
+        match (self.verdict, self.step) {
+            (UnblockVerdict::Park, _) => Some("keeps a `park` verdict, which posts no DECISION"),
+            (UnblockVerdict::PersonStep, None) => Some("keeps a `person_step` without its step"),
+            (UnblockVerdict::Retry | UnblockVerdict::Rebase, Some(_)) => {
+                Some("keeps a step with a verdict other than `person_step`")
+            }
+            _ => None,
+        }
+    }
 }
 
 /// The decider's replies to a DECISION comment that a run followed: the
@@ -1741,6 +1776,17 @@ impl Ask {
 impl TicketQuestions {
     const CONTRACT: &str = "ticket questions";
 
+    /// The verdicts the runner took on runs that stopped `blocked` at
+    /// `stage` (OWL-620), oldest first: what bounds the next ones there.
+    pub fn unblocks_at(&self, stage: Stage) -> Vec<UnblockVerdict> {
+        self.decisions
+            .iter()
+            .filter_map(|decision| decision.unblock)
+            .filter(|unblock| unblock.stage == stage)
+            .map(|unblock| unblock.verdict)
+            .collect()
+    }
+
     /// No ask yet.
     pub fn new() -> Self {
         Self {
@@ -1770,8 +1816,9 @@ impl TicketQuestions {
     /// (OWL-343), and a format-13 one, written before it kept its asking
     /// role (OWL-345), and a format-14 one, written before it kept its
     /// number and the decisions document (OWL-351), and those of formats 15
-    /// to 18, written before a verdict kept its chosen option (OWL-585), are
-    /// read as the
+    /// to 18, written before a verdict kept its chosen option (OWL-585), and
+    /// a format-19 one, written before a decision kept its unblock verdict
+    /// (OWL-620), are read as the
     /// current format with what they lack empty, a format-6 or 7
     /// Build refusal upgraded (`LegacyBuildRefusal::upgrade`), a format-8
     /// one's lists kept as text, and every question's options and
@@ -1800,12 +1847,32 @@ impl TicketQuestions {
     /// document, format 16 the runner's `recommendation` basis kind
     /// (OWL-375); format 17 drops the asking role, which formats 14 to 16
     /// are read without (OWL-379); format 18 adds an ask's resolver labels
-    /// (OWL-482), format 19 a verdict's chosen option (OWL-585).
+    /// (OWL-482), format 19 a verdict's chosen option (OWL-585), format 20 a
+    /// decision's unblock verdict (OWL-620).
     fn from_older_format(input: &str) -> Option<Result<Self, ContractError>> {
         let mut document: serde_json::Value = serde_json::from_str(input).ok()?;
         let format = document.get("format").and_then(serde_json::Value::as_u64)?;
-        if !(2..=18).contains(&format) {
+        if !(2..=19).contains(&format) {
             return None;
+        }
+        // Format 20 added a decision's unblock verdict (OWL-620).
+        let unblocked = document["decisions"]
+            .as_array()
+            .is_some_and(|decisions| decisions.iter().any(|d| d.get("unblock").is_some()));
+        if unblocked {
+            return Some(Err(ContractError::invalid(
+                Self::CONTRACT,
+                format!("format {format} keeps no decision's unblock verdict"),
+            )));
+        }
+        if format == 19 {
+            document["format"] = QUESTIONS_FORMAT.into();
+            return Some(
+                serde_json::from_value(document).map_err(|source| ContractError::Json {
+                    contract: Self::CONTRACT,
+                    source,
+                }),
+            );
         }
         // Format 19 added a verdict's chosen option (OWL-585).
         let chose = document["asks"]
@@ -2046,6 +2113,11 @@ impl TicketQuestions {
                 return Err(ContractError::invalid(
                     Self::CONTRACT,
                     format!("decision {} is older than the one before it", n + 1),
+                ));
+            } else if let Some(flaw) = kept.unblock.and_then(|unblock| unblock.flaw()) {
+                return Err(ContractError::invalid(
+                    Self::CONTRACT,
+                    format!("decision {} {flaw}", n + 1),
                 ));
             } else {
                 continue;

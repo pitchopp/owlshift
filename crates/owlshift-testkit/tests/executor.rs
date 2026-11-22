@@ -116,6 +116,7 @@ impl Bench {
             always_human: Vec::new(),
             delegation: None,
             asked_by: None,
+            unblock: None,
             gate_failure: None,
             setup_failure: None,
             result_refusal: None,
@@ -327,6 +328,7 @@ fn a_rebase_onto_another_base_than_the_runs_is_refused() {
         conflicting: Vec::new(),
         broken: None,
         yielded: false,
+        unblocked: false,
     });
     let error = bench.run_from(&bench.worktree, BRANCH, &"3".repeat(40));
     assert!(
@@ -1089,7 +1091,7 @@ fn a_run_that_redirects_its_git_link_is_quarantined_before_any_git() {
             }),
             ..bench.executor.clone()
         };
-        let done = r#"{"format":17,"status":"done","summary":"s","pr":{"branch":"owlshift/T-1","title":"t","body":"b"}}"#;
+        let done = r#"{"format":18,"status":"done","summary":"s","pr":{"branch":"owlshift/T-1","title":"t","body":"b"}}"#;
         let write_result = format!("printf '%s' '{done}' > .owlshift/run/result.json");
         let mut brief = bench.brief.clone();
         let script = if case == "the harness" {
@@ -1113,7 +1115,7 @@ fn a_run_that_redirects_its_git_link_is_quarantined_before_any_git() {
 }
 
 /// The build role's `done`, as a prepared result.
-const DONE: &str = r#"{"format":17,"status":"done","summary":"s","pr":{"branch":"owlshift/T-1","title":"t","body":"b"}}"#;
+const DONE: &str = r#"{"format":18,"status":"done","summary":"s","pr":{"branch":"owlshift/T-1","title":"t","body":"b"}}"#;
 
 impl Bench {
     /// The fake harness playing `reply`, its prepared result `DONE`.
@@ -1380,7 +1382,7 @@ fn a_run_that_rewrites_its_start_is_quarantined_and_named() {
         .run(&bench.worktree, &["commit", "--quiet", "-m", "Mine"])
         .unwrap();
     let start = bench.head_of(&bench.worktree);
-    let done = r#"{"format":17,"status":"done","summary":"s","pr":{"branch":"owlshift/T-1","title":"t","body":"b"}}"#;
+    let done = r#"{"format":18,"status":"done","summary":"s","pr":{"branch":"owlshift/T-1","title":"t","body":"b"}}"#;
     let script = format!(
         "git commit --quiet --amend -m 'Mine, again' && printf '%s' '{done}' > .owlshift/run/result.json"
     );
@@ -2092,6 +2094,7 @@ mod setup {
             conflicting: Vec::new(),
             broken: None,
             yielded: false,
+            unblocked: false,
         });
         let harness = bench.fake(Reply {
             observe: vec![".owlshift/run/count".to_owned()],

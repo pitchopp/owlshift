@@ -27,6 +27,7 @@ fn parked_at_build_on(bench: Bench) -> Bench {
     let (parked, printed) = bench.continue_ticket(vec![
         bench.reply(None, Some(&answered)),
         bench.reply(None, Some(BLOCKED)),
+        bench.reply(None, Some(UNBLOCK_PARK)),
     ]);
     assert!(
         matches!(&parked, Err(Stop::Parked { .. })),
@@ -100,7 +101,13 @@ fn the_deciders_continue_restarts_a_park_and_watch_drives_it() {
     // The decider's reply: restarted, handed to watch, which runs the Build
     // in the same watch; blocked again, it parks again.
     bench.answer("  Continue\n");
-    let (outcomes, lines) = one_pass(&bench, vec![bench.reply(None, Some(BLOCKED))]);
+    let (outcomes, lines) = one_pass(
+        &bench,
+        vec![
+            bench.reply(None, Some(BLOCKED)),
+            bench.reply(None, Some(UNBLOCK_PARK)),
+        ],
+    );
     let restart = restarts(&bench, events);
     assert_eq!(restart.len(), 1, "{restart:?}\n{lines}");
     assert_eq!(restart[0]["by"], json!("tracker"));
@@ -119,7 +126,11 @@ fn the_deciders_continue_restarts_a_park_and_watch_drives_it() {
         )),
         "{outcomes:?}"
     );
-    assert_eq!(bench.briefs()[briefs..].len(), 1, "one Build ran");
+    assert_eq!(
+        bench.briefs()[briefs..].len(),
+        2,
+        "one Build ran, then its resolver"
+    );
     assert!(matches!(state_of(&bench).status(), Status::Parked { .. }));
 
     // The comment that restarted the first park restarts nothing more.
@@ -236,7 +247,13 @@ fn a_refusal_is_replied_once_and_a_failed_write_is_tried_again() {
         "{warned:?}"
     );
     bench.refuse_stage.set(false);
-    one_pass(&bench, vec![bench.reply(None, Some(BLOCKED))]);
+    one_pass(
+        &bench,
+        vec![
+            bench.reply(None, Some(BLOCKED)),
+            bench.reply(None, Some(UNBLOCK_PARK)),
+        ],
+    );
     assert_eq!(restarts(&bench, events).len(), 1);
 
     // Parked, then its gate emptied, the base keeping no project file:
@@ -284,7 +301,17 @@ fn a_dark_wake_restarts_no_parked_ticket_until_the_full_wake() {
         );
     }
     bench.wake.set(Wake::Full);
-    one_pass(&bench, vec![bench.reply(None, Some(BLOCKED))]);
+    one_pass(
+        &bench,
+        vec![
+            bench.reply(None, Some(BLOCKED)),
+            bench.reply(None, Some(UNBLOCK_PARK)),
+        ],
+    );
     assert_eq!(restarts(&bench, events).len(), 1);
-    assert_eq!(bench.briefs().len(), briefs + 1, "the Build ran");
+    assert_eq!(
+        bench.briefs().len(),
+        briefs + 2,
+        "the Build ran, then its resolver"
+    );
 }

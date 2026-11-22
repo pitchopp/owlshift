@@ -80,7 +80,7 @@ const PYTHON: Fixture = Fixture {
     missing: ".venv/bin/python",
 };
 
-const DONE: &str = r#"{"format":17,"status":"done","summary":"s","pr":{"branch":"owlshift/T-1","title":"t","body":"b"}}"#;
+const DONE: &str = r#"{"format":18,"status":"done","summary":"s","pr":{"branch":"owlshift/T-1","title":"t","body":"b"}}"#;
 
 fn fixtures() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures")
@@ -423,6 +423,7 @@ fn brief() -> Brief {
         always_human: Vec::new(),
         delegation: None,
         asked_by: None,
+        unblock: None,
         gate_failure: None,
         setup_failure: None,
         result_refusal: None,

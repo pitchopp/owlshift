@@ -29,7 +29,14 @@
     "format": {
       "description": "The format version of this document.",
       "type": "integer",
-      "const": 3
+      "const": 4
+    },
+    "handed": {
+      "description": "The agent's steps of this plan the resolver handed to a person, the\nverdict `person_step` on a Build that stopped `blocked` there (format\n4, OWL-620; architecture section 4, \"A `blocked` through the\nresolver\"): each read as a person's step due as it says\n([`TicketPlan::effective`]), the plan's own text, and every hash, left\nas written. In increasing order, each once. A new plan starts with\nnone.",
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/HandedStep"
+      }
     },
     "owed": {
       "description": "The agent's steps of this plan its Build left because they need a\nperson's step's result (format 2, OWL-619): the `owed` of its `done`\nresults, gathered over the Build runs of this plan, never fewer. Each\nis a step of the plan, the agent's, after a person's step, in\nincreasing order. A new plan starts with none.",
@@ -109,6 +116,27 @@
         "choice",
         "options",
         "reason"
+      ]
+    },
+    "HandedStep": {
+      "description": "An agent's step of the plan the resolver handed to a person (OWL-620).",
+      "type": "object",
+      "properties": {
+        "step": {
+          "description": "Its place in the plan, from 1: an agent's step there.",
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 1
+        },
+        "when": {
+          "description": "When its result is due.",
+          "$ref": "#/$defs/StepWhen"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "step",
+        "when"
       ]
     },
     "KeptApproval": {
