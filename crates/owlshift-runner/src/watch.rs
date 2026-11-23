@@ -583,6 +583,11 @@ struct Memory<'c> {
     /// Those a drain's dispatch gave a turn: each one's retry hold is
     /// lifted until a step of its own starts (OWL-431).
     base_turn: BTreeSet<TicketId>,
+    /// The repairs of a broken base the runner filed whose hold stands, read
+    /// once a pass (OWL-622): each takes the slot's turn whatever the
+    /// capacity counts, and no collision is predicted for it, its step's
+    /// own admission deciding.
+    repairs: Vec<TicketId>,
     /// The strongest stop told, once one is asked (OWL-161).
     stop_told: Option<owlshift_platform::process::Degree>,
     /// The operator's pause last told, while one stands (OWL-438).
@@ -932,9 +937,19 @@ impl Watch<'_> {
         // runner's, recorded by that runner alone, is recorded here too
         // (OWL-636).
         self.record_claims_overlaps(memory, sink, &mut read, overlap);
-        let collisions = self.collisions(&read, outside.as_ref(), overlap, &|ticket| {
-            memory.holds.stands(ticket, now) || memory.base_held.contains(ticket)
-        });
+        // The repairs of a broken base the runner admits (OWL-622): their
+        // steps' own admission decides what they wait for.
+        memory.repairs = base::repairs(self.on_demand.dirs)
+            .into_iter()
+            .map(|(ticket, _)| ticket)
+            .collect();
+        let collisions = self.collisions(
+            &read,
+            outside.as_ref(),
+            overlap,
+            &|ticket| memory.holds.stands(ticket, now) || memory.base_held.contains(ticket),
+            &memory.repairs,
+        );
         memory.collisions = collisions;
         // Which followed pull requests an overlap's base refreshes (OWL-449).
         self.overlap_refreshes(memory, &read);
@@ -1075,7 +1090,17 @@ impl Watch<'_> {
             .filter(|(ticket, _)| !memory.collisions.contains_key(ticket))
             .cloned()
             .collect();
-        memory.turn = Some(schedule::slot_turn(&free, &unread, self.capacity()));
+        let mut turn = schedule::slot_turn(&free, &unread, self.capacity());
+        // A base's repair holding the slot takes the turn beside them
+        // (OWL-622).
+        if let Turn::Holders(holders) = &mut turn {
+            for (ticket, _) in &free {
+                if memory.repairs.contains(ticket) && !holders.contains(ticket) {
+                    holders.push(ticket.clone());
+                }
+            }
+        }
+        memory.turn = Some(turn);
         memory.holding = (free, unread.clone());
         let holding: Vec<TicketId> = holding.into_iter().map(|(ticket, _)| ticket).collect();
         memory.resumed.retain(|ticket, _| holding.contains(ticket));
@@ -2541,7 +2566,12 @@ impl Watch<'_> {
             let mut with = holding.clone();
             with.push((ticket.clone(), held::dispatched(stored)));
             match schedule::slot_turn(&with, unread, self.capacity()) {
-                Turn::Holders(holders) if !holders.contains(ticket) => holders.first().cloned(),
+                // A base's repair takes the turn anyway (OWL-622).
+                Turn::Holders(holders)
+                    if !holders.contains(ticket) && !memory.repairs.contains(ticket) =>
+                {
+                    holders.first().cloned()
+                }
                 _ => None,
             }
         };
@@ -2916,7 +2946,7 @@ impl Watch<'_> {
                 }
             }
             Turn::Holders(mut holders) if holds_now => {
-                if holders.len() < self.capacity() as usize {
+                if holders.len() < self.capacity() as usize || memory.repairs.contains(ticket) {
                     holders.push(ticket.clone());
                     memory.turn = Some(Turn::Holders(holders));
                     if !base_held {
@@ -3202,12 +3232,17 @@ impl Watch<'_> {
     /// waiting for anything held whatever the holder's dispatch time
     /// ([`schedule::admissions`]); one `held_back` this pass holds nothing
     /// for those after it. Each wait says whether it is a Build's.
+    ///
+    /// No wait is predicted for one of `repairs`, a broken base's repair
+    /// (OWL-622), which takes what the tickets its base holds hold: its
+    /// step's own admission decides.
     fn collisions(
         &self,
         read: &[RefRead],
         outside: Option<&in_flight::Holders>,
         overlap: Overlap,
         held_back: &dyn Fn(&TicketId) -> bool,
+        repairs: &[TicketId],
     ) -> HashMap<TicketId, (Collision<String>, bool)> {
         let on_demand = self.on_demand;
         let named = on_demand.config.stack.named_resources().unwrap_or_default();
@@ -3232,7 +3267,7 @@ impl Watch<'_> {
         // ticket's again at another stage (OWL-621).
         let mut not_build: Vec<String> = Vec::new();
         for (ticket, stored) in refs {
-            if !holds(stored) || delivery_followed(stored) {
+            if !holds(stored) || delivery_followed(stored) || repairs.contains(ticket) {
                 continue;
             }
             let own = held::by_claim(held::in_flight(ticket, stored, &named), &times);

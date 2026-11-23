@@ -12,14 +12,14 @@ use owlshift_runner::base;
 use super::*;
 
 /// The base's setup: red while `marker` is missing.
-fn setup_line(marker: &Path) -> String {
+pub(super) fn setup_line(marker: &Path) -> String {
     format!("test -f '{}'", marker.display())
 }
 
 /// `main` given `setup` as its project file's `stack.setup`, and `gate`
 /// as its gate when given; returns the new head, the commit the ticket's
 /// Build is configured at.
-fn with_setup(bench: &Bench, setup: &str, gate: Option<&str>) -> String {
+pub(super) fn with_setup(bench: &Bench, setup: &str, gate: Option<&str>) -> String {
     let config = fs::read_to_string(bench.remote.checkout.join("owlshift.toml")).unwrap();
     let gate_line = gate.map_or_else(|| GATE_LINE.to_owned(), str::to_owned);
     let config = config.replace(GATE_LINE, &format!("{gate_line}\nsetup = [{setup:?}]"));
@@ -27,7 +27,7 @@ fn with_setup(bench: &Bench, setup: &str, gate: Option<&str>) -> String {
 }
 
 /// The Build runs started, each with whether it ran the gate alone.
-fn builds(bench: &Bench) -> Vec<bool> {
+pub(super) fn builds(bench: &Bench) -> Vec<bool> {
     data_of(&bench.events(), EventKind::RunStarted, "role")
         .into_iter()
         .filter(|data| data["role"] == json!("build"))
@@ -60,12 +60,12 @@ fn state_of(bench: &Bench) -> (Status, u32) {
 
 /// OWL-427's base setup: red while `marker`, the environment, is missing,
 /// unless the code carries `FIXED`, the fix a later commit on `main` brings.
-fn fixable_setup(marker: &Path) -> String {
+pub(super) fn fixable_setup(marker: &Path) -> String {
     format!("{} || test -f FIXED", setup_line(marker))
 }
 
 /// A held Build's rebase run's `done`.
-const REBASED_HELD: &str =
+pub(super) const REBASED_HELD: &str =
     r#"{"format":18,"status":"done","summary":"Rebased onto the fix; nothing conflicted."}"#;
 
 /// What the agent of the `run`th run does in the ticket's worktree: `git`
@@ -91,7 +91,7 @@ fn worktree_head(bench: &Bench) -> String {
 }
 
 /// The `decision` events of the rebases off a held commit.
-fn held_rebases(bench: &Bench) -> Vec<Value> {
+pub(super) fn held_rebases(bench: &Bench) -> Vec<Value> {
     data_of(&bench.events(), EventKind::Decision, "base")
         .into_iter()
         .filter(|data| data["base"] == json!("rebase"))
@@ -99,7 +99,7 @@ fn held_rebases(bench: &Bench) -> Vec<Value> {
 }
 
 /// Each base check's commit, change and verdict, in order.
-fn checks_made(bench: &Bench) -> Vec<(String, String, String)> {
+pub(super) fn checks_made(bench: &Bench) -> Vec<(String, String, String)> {
     data_of(&bench.events(), EventKind::Decision, "base")
         .into_iter()
         .filter(|data| data["base"] == json!("checked"))
@@ -329,6 +329,7 @@ fn a_held_build_with_commits_of_its_own_runs_on_the_rebased_branch() {
                     since_ms: 0,
                     told: true,
                 }),
+                repair: None,
             },
         }],
     };
@@ -1332,10 +1333,12 @@ fn base_waits(events: &[Event], id: &str) -> usize {
 fn a_held_ticket_goes_on_within_one_dispatch_of_a_fix_in_a_busy_drain() {
     use super::drain_scenarios::{done_for, intake_declaring};
 
+    // No repair ticket (OWL-622): the hold's would take the identifier
+    // DEMO-2 this bench writes, and the drain's turns it counts.
     let bench = Bench::build_admitting(
         "maintainer",
         "assignee = \"maintainer\"\nlabels = [\"agent\"]\n",
-        "max_in_flight = 3\n",
+        "max_in_flight = 3\nbase_repair = false\n",
         ", parked = \"Parked\"",
         "admit = { label = \"agent\" }\nadmitters = [\"maintainer\"]",
     );

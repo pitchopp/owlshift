@@ -237,7 +237,7 @@ pub use crate::tracker::KeyAccount;
 use crate::tracker::{
     Author, Blocker, Capability, Column, Comment, Document, Error, ErrorKind, Filed, Found,
     Gesture, Linked, LinkedState, Links, Listed, MAX_DOCUMENT_CHARS, PROPOSED_LABEL, Person,
-    Proposal, Reaction, Relations, StateType, Ticket, Tracker, no_delegation,
+    Proposal, Reaction, Relations, Repair, StateType, Ticket, Tracker, no_delegation,
 };
 
 /// Linear's GraphQL endpoint.
@@ -1047,22 +1047,7 @@ impl Tracker for LinearTracker {
             )));
         }
         if let Some(account) = proposal.assignee {
-            let what = format!("the assignment of {id} to {account}");
-            let input = json!({ "id": created.id, "assigneeId": account });
-            match self.write::<AssignData>(ASSIGN_MUTATION, input) {
-                Ok(AssignData {
-                    issue_update:
-                        IssueAssigned {
-                            success: true,
-                            issue:
-                                Some(Assigned {
-                                    assignee: Some(user),
-                                }),
-                        },
-                }) if user.id == account => {}
-                Ok(_) => problems.push(invalid(format!("Linear did not write {what}"))),
-                Err(e) => problems.push(Error::new(e.kind, format!("{what} was not written: {e}"))),
-            }
+            problems.extend(self.assign(&id, &created.id, account));
         }
         let (kind, issue, related) = if proposal.blocked_by_parent {
             ("blocks", &target.id, &created.id)
@@ -1077,6 +1062,79 @@ impl Tracker for LinearTracker {
             }) => {}
             Ok(_) => problems.push(invalid(format!("Linear did not write {what}"))),
             Err(e) => problems.push(Error::new(e.kind, format!("{what} was not written: {e}"))),
+        }
+        Ok(Filed {
+            id,
+            state: created.state.name,
+            problems,
+        })
+    }
+
+    /// The held ticket's team and project read through the key, as a
+    /// proposal's parent's; the issue created through the app when one is
+    /// set, in the team's state named [`Repair::ready`] exactly, at priority
+    /// `1`, Urgent, with the admission label, the team's before the
+    /// workspace's; then assigned, as a proposal is (OWL-625). No relation
+    /// is written: the design files the repair alone. A ready state or a
+    /// label the team does not have is refused before anything is written.
+    fn file_repair(&self, repair: &Repair<'_>) -> Result<Filed, Error> {
+        let data: TargetData = self.call(TARGET_QUERY, json!({ "id": repair.held.as_str() }))?;
+        let target = data.issue;
+        let TargetTeam {
+            id: team_id, team, ..
+        } = target.team;
+        one_page(&team)?;
+        let Some(state) = team
+            .states
+            .nodes
+            .iter()
+            .find(|state| state.name == repair.ready)
+        else {
+            return Err(invalid(format!(
+                "team {} has no state named {:?} to file the base's repair in",
+                team.key, repair.ready
+            )));
+        };
+        let mut input = json!({
+            "teamId": team_id,
+            "stateId": state.id,
+            "title": repair.title,
+            "description": repair.description,
+            "priority": URGENT,
+        });
+        if let Some(project) = target.project {
+            input["projectId"] = json!(project.id);
+        }
+        if let Some(label) = repair.label {
+            let Some(id) = self.label_named(&team_id, label)? else {
+                return Err(invalid(format!(
+                    "neither team {} nor the workspace has the admission label {label:?}",
+                    team.key
+                )));
+            };
+            input["labelIds"] = json!([id]);
+        }
+        let data: CreateData = self.write(PROPOSE_MUTATION, json!({ "input": input }))?;
+        let IssueCreate {
+            success: true,
+            issue: Some(created),
+        } = data.issue_create
+        else {
+            return Err(invalid(format!(
+                "Linear did not file the base's repair from {}",
+                repair.held
+            )));
+        };
+        let id = TicketId::new(created.identifier).map_err(|e| invalid(e.to_string()))?;
+        let mut problems = Vec::new();
+        if created.state.id != state.id {
+            problems.push(invalid(format!(
+                "Linear filed {id} in {:?}, not in {:?}",
+                created.state.name, state.name
+            )));
+        }
+        if let Some(account) = repair.assignee {
+            problems.extend(self.assign(&id, &created.id, account));
         }
         Ok(Filed {
             id,
@@ -1287,21 +1345,55 @@ impl LinearTracker {
     /// workspace's. Names match exactly, case included, as Linear's `eq`
     /// does (checked 2026-10-13, above).
     fn proposed_label(&self, team: &str, key: &str) -> Result<String, Error> {
-        let data: LabelsData = self.call(LABEL_QUERY, json!({ "name": PROPOSED_LABEL }))?;
+        self.label_named(team, PROPOSED_LABEL)?.ok_or_else(|| {
+            invalid(format!(
+                "team {key} has no triage inbox, and neither it nor the workspace has the \
+                 label {PROPOSED_LABEL:?} that marks a proposal in its backlog"
+            ))
+        })
+    }
+
+    /// The id of the label named `name` for the team whose id is `team`:
+    /// the team's own, else the workspace's, never another team's; `None`
+    /// when neither has one.
+    fn label_named(&self, team: &str, name: &str) -> Result<Option<String>, Error> {
+        let data: LabelsData = self.call(LABEL_QUERY, json!({ "name": name }))?;
         let labels = data.issue_labels.nodes;
         let ours = labels
             .iter()
             .find(|label| label.team.as_ref().is_some_and(|t| t.id == team));
-        ours.or_else(|| labels.iter().find(|label| label.team.is_none()))
-            .map(|label| label.id.clone())
-            .ok_or_else(|| {
-                invalid(format!(
-                    "team {key} has no triage inbox, and neither it nor the workspace has the \
-                     label {PROPOSED_LABEL:?} that marks a proposal in its backlog"
-                ))
-            })
+        Ok(ours
+            .or_else(|| labels.iter().find(|label| label.team.is_none()))
+            .map(|label| label.id.clone()))
+    }
+
+    /// Assigns the issue `issue`, filed as `id`, to `account` once it exists
+    /// (OWL-625): a refused, failed or misread assignment is the problem
+    /// returned, never the filing's failure.
+    fn assign(&self, id: &TicketId, issue: &str, account: &str) -> Option<Error> {
+        let what = format!("the assignment of {id} to {account}");
+        let input = json!({ "id": issue, "assigneeId": account });
+        match self.write::<AssignData>(ASSIGN_MUTATION, input) {
+            Ok(AssignData {
+                issue_update:
+                    IssueAssigned {
+                        success: true,
+                        issue:
+                            Some(Assigned {
+                                assignee: Some(user),
+                            }),
+                    },
+            }) if user.id == account => None,
+            Ok(_) => Some(invalid(format!("Linear did not write {what}"))),
+            Err(e) => Some(Error::new(e.kind, format!("{what} was not written: {e}"))),
+        }
     }
 }
+
+/// Linear's most urgent priority, `1` (checked on 2026-11-22 by an
+/// introspection of `IssueCreateInput.priority`: "0 = No priority, 1 =
+/// Urgent", OWL-622).
+const URGENT: u8 = 1;
 
 /// Where a proposal goes in a team: the first `triage` state by position
 /// when the team has triage on, else its first `backlog` state, which then
@@ -1505,6 +1597,8 @@ const TARGET_QUERY: &str = "query ProposalTarget($id: String!) { issue(id: $id) 
     project { id } team { id key triageEnabled states(first: 50) { \
     nodes { id name type position } pageInfo { hasNextPage } } } } }";
 
+/// A label by name: a proposal's (OWL-252) or the admission label a base's
+/// repair carries (OWL-622).
 const LABEL_QUERY: &str = "query ProposedLabel($name: String!) { \
     issueLabels(first: 50, filter: { name: { eq: $name } }) { nodes { id team { id } } } }";
 
@@ -2949,6 +3043,118 @@ mod tests {
                 .unwrap_err();
             assert!(error.message.contains(says), "{error}");
             assert!(!asked.lock().unwrap().iter().any(|n| n == "Relate"));
+        }
+    }
+
+    fn repair<'a>(held: &'a TicketId, label: Option<&'static str>) -> Repair<'a> {
+        Repair {
+            held,
+            title: "Repair the base: `pnpm install` fails at 0123456789ab",
+            description: "The setup command fails.",
+            ready: "Todo",
+            label,
+            assignee: Some("u-ada"),
+        }
+    }
+
+    /// OWL-622: a base's repair goes to the ready state by its exact name,
+    /// urgent, in the held ticket's team and project, with the team's
+    /// admission label, then is assigned; no relation is written. An
+    /// assignment that fails is a problem, never the filing's failure.
+    #[test]
+    fn a_repair_goes_to_the_ready_state_urgent_labelled_and_assigned() {
+        let held = TicketId::new("OWL-252").unwrap();
+        let assigned = json!({ "issueUpdate": { "success": true,
+            "issue": { "assignee": { "id": "u-ada" } } } });
+        let labels = json!({ "issueLabels": { "nodes": [
+            { "id": "ws", "team": null }, { "id": "ours", "team": { "id": "team-owl" } } ] } });
+        for (answer, problems) in [(assigned, 0), (Value::Null, 1)] {
+            let key = Scripted::new(vec![
+                ("ProposalTarget", target(true, OWL_TYPED)),
+                ("ProposedLabel", labels.clone()),
+                ("Propose", created("Todo")),
+                ("Assign", answer),
+            ]);
+            let (asked, sent) = (key.asked.clone(), key.sent.clone());
+            let filed = LinearTracker::with_transport(key)
+                .file_repair(&repair(&held, Some("agent")))
+                .unwrap();
+            assert_eq!(
+                (filed.id.as_str(), filed.state.as_str()),
+                ("OWL-266", "Todo")
+            );
+            assert_eq!(filed.problems.len(), problems, "{:?}", filed.problems);
+            assert_eq!(
+                *asked.lock().unwrap(),
+                ["ProposalTarget", "ProposedLabel", "Propose", "Assign"]
+            );
+            let sent = sent.lock().unwrap();
+            assert_eq!(sent[1], json!({ "name": "agent" }));
+            let r = repair(&held, Some("agent"));
+            assert_eq!(
+                sent[2]["input"],
+                json!({ "teamId": "team-owl", "stateId": "s-Todo", "projectId": "p4",
+                    "title": r.title, "description": r.description, "priority": 1,
+                    "labelIds": ["ours"] })
+            );
+            assert_eq!(sent[3], json!({ "id": "new-id", "assigneeId": "u-ada" }));
+        }
+        // A state gesture carries no label.
+        let key = Scripted::new(vec![
+            ("ProposalTarget", target(true, OWL_TYPED)),
+            ("Propose", created("Todo")),
+            (
+                "Assign",
+                json!({ "issueUpdate": { "success": true,
+                    "issue": { "assignee": { "id": "u-ada" } } } }),
+            ),
+        ]);
+        let sent = key.sent.clone();
+        LinearTracker::with_transport(key)
+            .file_repair(&repair(&held, None))
+            .unwrap();
+        assert!(sent.lock().unwrap()[1]["input"].get("labelIds").is_none());
+    }
+
+    /// OWL-622: a ready state or an admission label the team does not have
+    /// is refused before anything is written, as is a refused creation.
+    #[test]
+    fn a_repair_that_cannot_be_filed_as_designed_is_refused_unwritten() {
+        let held = TicketId::new("OWL-252").unwrap();
+        let other_team =
+            json!({ "issueLabels": { "nodes": [{ "id": "x", "team": { "id": "team-x" } }] } });
+        let refused = json!({ "issueCreate": { "success": false, "issue": null } });
+        for (answers, label, says) in [
+            (
+                vec![(
+                    "ProposalTarget",
+                    target(true, &[("Backlog", "backlog", 0.0)]),
+                )],
+                None,
+                "no state named \"Todo\"",
+            ),
+            (
+                vec![
+                    ("ProposalTarget", target(true, OWL_TYPED)),
+                    ("ProposedLabel", other_team),
+                ],
+                Some("agent"),
+                "admission label \"agent\"",
+            ),
+            (
+                vec![
+                    ("ProposalTarget", target(true, OWL_TYPED)),
+                    ("Propose", refused),
+                ],
+                None,
+                "did not file",
+            ),
+        ] {
+            let key = Scripted::new(answers);
+            let error = LinearTracker::with_transport(key)
+                .file_repair(&repair(&held, label))
+                .unwrap_err();
+            assert!(error.message.contains(says), "{error}");
         }
     }
 

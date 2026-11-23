@@ -123,7 +123,7 @@ impl Bench {
     }
 
     /// [`Self::drain_passes`], with what happens while given runs work.
-    fn drain_during(
+    pub(super) fn drain_during(
         &self,
         replies: Vec<Reply>,
         during: Vec<During>,

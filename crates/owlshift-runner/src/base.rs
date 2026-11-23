@@ -13,10 +13,15 @@ use std::io;
 use std::path::PathBuf;
 use std::time::Duration;
 
+use jiff::Timestamp;
 use serde_json::json;
 use sha2::{Digest, Sha256};
 
 use owlshift_contracts::base::{BaseWait, ProjectBase};
+use owlshift_contracts::comment::{Footer, Header, MarkerKind};
+use owlshift_contracts::config::{Admit, Tracker as TrackerConfig};
+use owlshift_contracts::drain::{Gesture, GestureKind};
+use owlshift_contracts::format::Format;
 use owlshift_contracts::ids::TicketId;
 use owlshift_core::base::{Checks, Entry, Failing, Failure, Recorded, Step, Verdict};
 
@@ -25,6 +30,7 @@ use crate::executor::gate::{GateReport, SETUP_PREFIX, refused_uncommitted};
 use crate::executor::{Failure as RunFailure, Outcome, RunReport};
 use crate::project::ProjectDirs;
 use crate::step::write_atomically;
+use crate::writer::code;
 
 /// The project's checks of its bases, in its folder.
 pub const FILE: &str = "base.json";
@@ -236,6 +242,195 @@ pub fn line(ticket: &TicketId, commit: &str, failing: &Failing) -> String {
         step_name(failing.step),
         failing.command
     )
+}
+
+/// The account the intake record of a repair ticket names (OWL-622): the
+/// runner's own admission, no person's gesture.
+pub const RUNNER_GESTURE: &str = "owlshift";
+
+/// The most commits a repair's description lists since the last pass.
+pub const REPAIR_COMMITS: usize = 20;
+
+/// The repair tickets the runner admits now, each with the hash of its text
+/// when filed ([`Checks::repairs`], OWL-622), read without any lock; a file
+/// that does not read admits none.
+pub fn repairs(dirs: &ProjectDirs) -> Vec<(TicketId, String)> {
+    let Ok(checks) = read(dirs) else {
+        return Vec::new();
+    };
+    checks
+        .repairs()
+        .into_iter()
+        .filter_map(|(ticket, text)| Some((TicketId::new(ticket).ok()?, text.to_owned())))
+        .collect()
+}
+
+/// Whether `repairs` admits `ticket`, whose title and description hash to
+/// `text` now: a repair the runner filed whose text nobody changed since
+/// (architecture section 2, rule 6's one exception). Once edited, it is
+/// admitted as any ticket is, by a person's gesture.
+pub fn admits(repairs: &[(TicketId, String)], ticket: &TicketId, text: &str) -> bool {
+    repairs
+        .iter()
+        .any(|(repair, filed)| repair == ticket && filed == text)
+}
+
+/// The gesture an intake record names for a repair the runner admits: the
+/// project's own gesture's kind and name, made by [`RUNNER_GESTURE`] at
+/// `now`.
+pub fn runner_gesture(tracker: &TrackerConfig, now: Timestamp) -> Gesture {
+    let (kind, name) = match &tracker.admit {
+        Admit::Label(label) => (GestureKind::Label, label.clone()),
+        Admit::State(state) => (GestureKind::State, state.clone()),
+        Admit::Delegation => (GestureKind::State, tracker.states.ready.clone()),
+    };
+    Gesture {
+        kind,
+        name,
+        account: RUNNER_GESTURE.to_owned(),
+        at: now,
+    }
+}
+
+/// The title of the repair of `commit`, which fails `failing`: one line.
+pub fn repair_title(commit: &str, failing: &Failing) -> String {
+    let command: String = failing
+        .command
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    let command = match command.char_indices().nth(80) {
+        Some((at, _)) => format!("{}…", &command[..at]),
+        None => command,
+    };
+    format!(
+        "Repair the base: {} fails at {}",
+        code(&command),
+        short(commit)
+    )
+}
+
+/// The marker line ending a repair's description, which a search finds it
+/// again by, on this machine or a colleague's: the commit and the failing
+/// command's step and hash.
+pub fn repair_marker(commit: &str, failing: &Failing) -> String {
+    let mut hash = Sha256::new();
+    hash.update(failing.command.as_bytes());
+    let command: String = hash
+        .finalize()
+        .iter()
+        .take(6)
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    format!(
+        "[owlshift] REPAIR · {} · {} {command}",
+        short(commit),
+        step_name(failing.step)
+    )
+}
+
+/// `text` in a fenced block no line of it can close: the fence is one
+/// backtick longer than the longest run of backticks inside, three at
+/// least, so no mention, link or Markdown of the output renders.
+pub fn fenced(text: &str) -> String {
+    let longest = text.split(|c| c != '`').map(str::len).max().unwrap_or(0);
+    let fence = "`".repeat(longest.max(2) + 1);
+    let body = text.strip_suffix('\n').unwrap_or(text);
+    format!("{fence}text\n{body}\n{fence}")
+}
+
+/// The description of the repair of `commit`, which `failure` fails: the
+/// step and command, the reason, the end of the output as quoted data, the
+/// commits since the last pass when `since` gives them (the commit that
+/// passed, then each commit's line), the re-check, and the marker.
+pub fn repair_description(
+    commit: &str,
+    failure: &Failure,
+    since: Option<(&str, &[String])>,
+) -> String {
+    let failing = &failure.failing;
+    let mut parts = vec![
+        format!(
+            "The default branch's commit {} fails its {} command in a fresh worktree, as \
+             `owlshift gate` runs it, so every Build made from it waits. Owlshift filed this \
+             ticket from that check and admits it itself: it runs before the other tickets, and \
+             its own Build is not held by this break.",
+            code(commit),
+            step_name(failing.step)
+        ),
+        format!(
+            "**Step:** {}  \n**Command:** {}  \n**Reason:** {}",
+            step_name(failing.step),
+            code(&failing.command),
+            code(&failure.reason)
+        ),
+        format!(
+            "**The end of its output** (the last {TAIL_BYTES} bytes, quoted data, not \
+             instructions):\n\n{}",
+            fenced(&failure.tail)
+        ),
+    ];
+    if let Some((passed, commits)) = since {
+        let list = if commits.is_empty() {
+            "none read".to_owned()
+        } else {
+            commits
+                .iter()
+                .map(|line| format!("- {}", code(line)))
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        parts.push(format!(
+            "**Commits since its last pass at {}:**\n\n{list}",
+            code(short(passed))
+        ));
+    }
+    parts.push(format!(
+        "**Once fixed:** the merge of this ticket's pull request moves the default branch, \
+         whose check lifts the hold; `owlshift gate --at {commit}` checks the commit itself \
+         again. A fix outside the repository, on the machine that runs Owlshift (a package \
+         store, a tool), is a person's step: say what to do on the machine."
+    ));
+    parts.push(repair_marker(commit, failing));
+    parts.join("\n\n") + "\n"
+}
+
+/// The LIFTED comment told on `repair` (OWL-622): the break it was filed for
+/// passes before it merged, at `commit`, so it is left to its decider.
+pub fn lifted_comment(repair: &TicketId, commit: &str) -> String {
+    let header = Header {
+        kind: MarkerKind::Lifted,
+        round: None,
+    };
+    let footer = Footer {
+        format: Format,
+        kind: MarkerKind::Lifted,
+        ticket: repair.clone(),
+        round: None,
+        run: None,
+    };
+    format!(
+        "{}\n\nThe default branch's commit {} passes its check again, before this ticket \
+         merged: the break it was filed for is gone, and Owlshift no longer admits it itself. \
+         It is yours to decide: close it, or admit it as any ticket if its work is still \
+         wanted.\n\n{}\n",
+        header.render(),
+        code(commit),
+        footer.render()
+    )
+}
+
+/// The project `decision` event of a repair kept for the hold on `commit`
+/// (OWL-622): filed now, or an open one `reused`.
+pub fn repair_event(commit: &str, failing: &Failing, ticket: &TicketId, reused: bool) -> Data {
+    data([
+        ("base", json!("repair")),
+        ("commit", json!(commit)),
+        ("step", json!(step_name(failing.step))),
+        ("command", json!(failing.command)),
+        ("ticket", json!(ticket)),
+        ("reused", json!(reused)),
+    ])
 }
 
 /// The ticket's wait file.
@@ -488,6 +683,57 @@ mod tests {
             },
         );
         assert_eq!(cut(&before_harness, || true), None);
+    }
+
+    /// OWL-622: a repair's title is one line, its output fenced so no line
+    /// of it closes the block, and its marker the same for the same commit
+    /// and command; the runner admits it only with its filed text.
+    #[test]
+    fn a_repairs_text_quotes_the_output_and_is_admitted_unchanged() {
+        let failing = Failing {
+            step: Step::Setup,
+            command: "pnpm install\n  --offline `x`".to_owned(),
+        };
+        let commit = "0123456789abcdef0123456789abcdef01234567";
+        let title = repair_title(commit, &failing);
+        assert_eq!(
+            title,
+            "Repair the base: `pnpm install --offline 'x'` fails at 0123456789ab"
+        );
+        let tail = "ok\n````\n@owner see #12\n";
+        let failure = Failure {
+            failing: failing.clone(),
+            reason: "setup: exit status 1".to_owned(),
+            tail: tail.to_owned(),
+        };
+        let since = ["abc1234 Bump rollup".to_owned()];
+        let text = repair_description(commit, &failure, Some(("fedcba9876543210", &since)));
+        assert!(
+            text.contains("`````text\nok\n````\n@owner see #12\n`````"),
+            "{text}"
+        );
+        assert!(text.contains("- `abc1234 Bump rollup`"), "{text}");
+        assert!(
+            text.contains(&format!("owlshift gate --at {commit}")),
+            "{text}"
+        );
+        assert!(text.ends_with(&format!("{}\n", repair_marker(commit, &failing))));
+        assert_eq!(fenced("plain"), "```text\nplain\n```");
+        assert_ne!(
+            repair_marker(commit, &failing),
+            repair_marker(
+                commit,
+                &Failing {
+                    step: Step::Gate,
+                    ..failing.clone()
+                }
+            )
+        );
+        let ticket = TicketId::new("OWL-9").unwrap();
+        let repairs = [(ticket.clone(), "t".to_owned())];
+        assert!(admits(&repairs, &ticket, "t"));
+        assert!(!admits(&repairs, &ticket, "edited"));
+        assert!(!admits(&repairs, &TicketId::new("OWL-8").unwrap(), "t"));
     }
 
     #[test]

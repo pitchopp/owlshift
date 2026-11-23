@@ -1210,6 +1210,7 @@ impl Driver {
             run_dir: &dir,
             brief: &brief,
             setup: &self.setup,
+            repairs_setup: None,
             session: None,
             siblings: None,
         };

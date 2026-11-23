@@ -206,6 +206,13 @@ impl OnDemand<'_> {
         if still_ready(&p.found, &shown, &self.config.tracker).is_err() {
             return None;
         }
+        // The repair of a broken base enters the queue by the runner's own
+        // admission, its text unchanged since it was filed: no gesture, no
+        // admitter and no operator read (OWL-622; architecture section 2,
+        // rule 6).
+        if let Some(gesture) = self.runner_gesture(p) {
+            return Some(Ok(gesture));
+        }
         let admitters = match project::admitters_at(&self.executor.git, &p.checkout, &p.base) {
             Ok(admitters) => admitters,
             Err(why) => return Some(Err(Taken::Ran(Err(Stop::Refused(why))))),

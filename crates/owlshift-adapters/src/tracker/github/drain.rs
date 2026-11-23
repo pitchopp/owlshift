@@ -15,7 +15,7 @@ use super::{GitHubTracker, Issue, Label, User, encode, number, parse, timestamp,
 use crate::forge::github::{REST_API, Verb};
 use crate::tracker::{
     Author, Blocker, Column, Error, ErrorKind, Filed, Found, Gesture, Linked, LinkedState, Links,
-    Listed, PROPOSED_LABEL, Proposal, Relations, StateType, Ticket, no_delegation,
+    Listed, PROPOSED_LABEL, Proposal, Relations, Repair, StateType, Ticket, no_delegation,
 };
 
 /// The type of the state an issue's answer shows (G4). Open is no type: it
@@ -380,6 +380,103 @@ impl GitHubTracker {
         }
     }
 
+    /// The login of `account`, a numeric account id, which GitHub's
+    /// `assignees` takes instead (OWL-625): read first, a failure to read it
+    /// leaving the `what` unassigned, with a problem.
+    fn assignee_login(
+        &self,
+        account: Option<&str>,
+        what: &str,
+        problems: &mut Vec<Error>,
+    ) -> Option<String> {
+        let account = account?;
+        match self.account_name(account) {
+            Ok(Some(login)) => Some(login),
+            Ok(None) => {
+                problems.push(Error::new(
+                    ErrorKind::Other,
+                    format!(
+                        "no GitHub account has the numeric id {account:?} to assign the {what} \
+                         to (a login is not an id)"
+                    ),
+                ));
+                None
+            }
+            Err(error) => {
+                problems.push(Error::new(
+                    error.kind,
+                    format!("the login of account {account:?} was not read: {error}"),
+                ));
+                None
+            }
+        }
+    }
+
+    /// Opens the repair of a broken base (OWL-622) as an issue with the
+    /// ready stage's label, the admission label under a label gesture and
+    /// the most urgent priority's label `[tracker.priorities]` names, if any,
+    /// assigned as a proposal is. The held issue must be this repository's.
+    /// Once the issue exists, a label or an assignee GitHub dropped is a
+    /// problem of [`Filed`].
+    pub(super) fn open_repair(&self, repair: &Repair<'_>) -> Result<Filed, Error> {
+        self.issue(repair.held)?;
+        let mut problems = Vec::new();
+        let login = self.assignee_login(repair.assignee, "repair", &mut problems);
+        let mut labels: Vec<String> = vec![repair.ready.to_owned()];
+        labels.extend(repair.label.map(str::to_owned));
+        labels.extend(
+            self.priorities
+                .as_ref()
+                .and_then(|priorities| priorities.labels().into_iter().next())
+                .map(|(_, label)| label.to_owned()),
+        );
+        let mut body = json!({
+            "title": repair.title,
+            "body": repair.description,
+            "labels": labels,
+        });
+        if let Some(login) = &login {
+            body["assignees"] = json!([login]);
+        }
+        let text = self
+            .forge
+            .rest_write(Verb::Post, &self.issues_path(), &body)
+            .map_err(tracker_error)?;
+        let created: Issue = parse(&text, &"the base's repair just filed")?;
+        let id = issue_id(created.number)?;
+        for label in &labels {
+            if !created
+                .labels
+                .iter()
+                .any(|l| l.name.eq_ignore_ascii_case(label))
+            {
+                problems.push(Error::new(
+                    ErrorKind::Other,
+                    format!(
+                        "GitHub filed #{} without the label {label:?}",
+                        created.number
+                    ),
+                ));
+            }
+        }
+        if let Some(login) = &login
+            && !created
+                .assignees
+                .iter()
+                .any(|user| user.login.eq_ignore_ascii_case(login))
+        {
+            problems.push(Error::new(
+                ErrorKind::Other,
+                format!("GitHub filed #{} without assigning {login}", created.number),
+            ));
+        }
+        Ok(Filed {
+            id,
+            state: repair.ready.to_owned(),
+            problems,
+        })
+    }
+
     /// Opens the follow-up as an issue with the [`PROPOSED_LABEL`] (section
     /// 6's fallback), then, when it needs the parent's code, writes that the
     /// parent blocks it (G4). A ready label that is the proposals' label is
@@ -396,34 +493,8 @@ impl GitHubTracker {
             ));
         }
         let (_, parent) = self.issue(proposal.parent)?;
-        // The assignee is a numeric account id, which GitHub's `assignees`
-        // does not take: its login is read first, and a failure to read it
-        // files the issue unassigned, with a problem (OWL-625).
         let mut problems = Vec::new();
-        let login = match proposal
-            .assignee
-            .map(|account| (account, self.account_name(account)))
-        {
-            None => None,
-            Some((_, Ok(Some(login)))) => Some(login),
-            Some((account, Ok(None))) => {
-                problems.push(Error::new(
-                    ErrorKind::Other,
-                    format!(
-                        "no GitHub account has the numeric id {account:?} to assign the \
-                         proposal to (a login is not an id)"
-                    ),
-                ));
-                None
-            }
-            Some((account, Err(error))) => {
-                problems.push(Error::new(
-                    error.kind,
-                    format!("the login of account {account:?} was not read: {error}"),
-                ));
-                None
-            }
-        };
+        let login = self.assignee_login(proposal.assignee, "proposal", &mut problems);
         let mut body = json!({
             "title": proposal.title,
             "body": proposal.description,

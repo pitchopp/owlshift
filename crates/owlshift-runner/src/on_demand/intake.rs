@@ -33,6 +33,7 @@ use owlshift_core::dependency::{self, Node};
 use owlshift_core::floor::same_account;
 
 use super::*;
+use crate::base;
 use crate::ticket_ref::text_sha256;
 use crate::writer::{HandbackRead, IntakeComment, flatten, readmit_words};
 
@@ -314,6 +315,9 @@ impl OnDemand<'_> {
         p: &Prepared,
         admitters: Option<&[String]>,
     ) -> Result<Gesture, Unadmitted> {
+        if let Some(gesture) = self.runner_gesture(p) {
+            return Ok(gesture);
+        }
         let text = text_sha256(&p.found.title, &p.found.description);
         let kept = p.intake.as_ref().filter(|record| {
             p.handback.is_none()
@@ -343,6 +347,17 @@ impl OnDemand<'_> {
             }),
             None => Ok(gesture),
         }
+    }
+
+    /// The runner's own gesture for `p`'s ticket when it is the repair of a
+    /// broken base the runner admits (OWL-622; architecture section 2, rule
+    /// 6's one exception): filed by this runner for a hold that stands, its
+    /// title and description as they were filed. `None` for every other
+    /// ticket, which a person's gesture admits.
+    pub(super) fn runner_gesture(&self, p: &Prepared) -> Option<Gesture> {
+        let text = text_sha256(&p.found.title, &p.found.description);
+        base::admits(&base::repairs(self.dirs), &p.ticket, &text)
+            .then(|| base::runner_gesture(&self.config.tracker, (self.clock)()))
     }
 
     /// `continue` on a ticket at Intake: intake runs again, under the kept
@@ -385,14 +400,18 @@ impl OnDemand<'_> {
         sink: &mut EventSink<'_>,
     ) -> Result<TicketIntake, Stop> {
         // The drain checked the gesture; the record names who admitted, so
-        // the account is checked again against the base's admitters.
+        // the account is checked again against the base's admitters, but for
+        // the runner's own admission of a base's repair (OWL-622).
         let admitters = project::admitters_at(&self.executor.git, &p.checkout, &p.base)
             .map_err(Stop::Refused)?;
-        if !admitters.as_deref().is_some_and(|admitters| {
-            admitters
-                .iter()
-                .any(|admitter| same_account(&gesture.account, admitter))
-        }) {
+        let runner = gesture.account == base::RUNNER_GESTURE && self.runner_gesture(p).is_some();
+        if !runner
+            && !admitters.as_deref().is_some_and(|admitters| {
+                admitters
+                    .iter()
+                    .any(|admitter| same_account(&gesture.account, admitter))
+            })
+        {
             return Err(Stop::Refused(format!(
                 "the admission gesture of {} names {:?}, whom `[tracker].admitters` on {} does \
                  not list",

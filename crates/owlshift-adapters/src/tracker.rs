@@ -11,7 +11,8 @@
 //! publishing a ticket's document with P5 (OWL-350), resolving a comment
 //! with P5 too (OWL-353), a comment's reactions with P5 too (OWL-371), a
 //! ticket's links for intake's brief (OWL-416), how text names a ticket and
-//! the closing line of a pull request with P9 (OWL-536).
+//! the closing line of a pull request with P9 (OWL-536), filing the repair
+//! of a broken base with P6 (OWL-622).
 
 pub mod github;
 pub mod linear;
@@ -182,6 +183,24 @@ pub trait Tracker {
         Err(Error::new(
             ErrorKind::Other,
             "this tracker does not file proposals",
+        ))
+    }
+
+    /// Files the repair of a broken base (OWL-622; architecture section 5,
+    /// "The repair ticket"): the one ticket the runner puts in the queue
+    /// itself, so in the ready state [`Repair::ready`], with the admission
+    /// label [`Repair::label`] under a label gesture, the tracker's highest
+    /// priority and [`Repair::assignee`], in the team and project of
+    /// [`Repair::held`]. The ready state must exist by that exact name.
+    ///
+    /// An error means nothing was filed. Once the ticket exists, an
+    /// assignment, a label or a state the tracker did not keep is a
+    /// [`Filed::problems`] entry and the call still succeeds, as for a
+    /// proposal. An error by default.
+    fn file_repair(&self, _repair: &Repair<'_>) -> Result<Filed, Error> {
+        Err(Error::new(
+            ErrorKind::Other,
+            "this tracker does not file a base repair",
         ))
     }
 
@@ -408,6 +427,26 @@ pub struct Proposal<'a> {
     /// out, the follow-up's text then naming the decider alone; one that can
     /// assigns after the ticket exists, and a refusal is a [`Filed::problems`]
     /// entry, never a lost proposal.
+    pub assignee: Option<&'a str>,
+}
+
+/// The repair of a broken base to file, as the runner rendered it (OWL-622).
+#[derive(Clone, Copy, Debug)]
+pub struct Repair<'a> {
+    /// The ticket whose failure opened the hold: the team and project the
+    /// repair is filed in, where the tracker has them.
+    pub held: &'a TicketId,
+    /// One line.
+    pub title: &'a str,
+    /// Markdown.
+    pub description: &'a str,
+    /// The ready state's name, `[tracker].states.ready`, where it is filed.
+    pub ready: &'a str,
+    /// The admission label under a label gesture, `[tracker].admit`; none
+    /// under a state gesture, which the ready state is.
+    pub label: Option<&'a str>,
+    /// The operator's account, as [`Person::id`] gives it: its assignee and
+    /// so its decider. A tracker whose assignee is a name takes it as one.
     pub assignee: Option<&'a str>,
 }
 

@@ -1030,6 +1030,15 @@ impl Tracker for Clocked<'_> {
         })
     }
 
+    /// The Markdown tracker's own filing of a base's repair (OWL-622), unless
+    /// the inbox refuses every filing.
+    fn file_repair(&self, repair: &tracker::Repair<'_>) -> Result<tracker::Filed, tracker::Error> {
+        if let Some(why) = self.inbox.borrow().refuse {
+            return Err(tracker::Error::new(tracker::ErrorKind::Other, why));
+        }
+        Tracker::file_repair(&self.inner, repair)
+    }
+
     fn proposed(
         &self,
         team: Option<&str>,
@@ -12391,6 +12400,10 @@ mod typed_scenarios;
 /// A base that breaks the gate holds the project once (OWL-418).
 #[path = "on_demand/base_scenarios.rs"]
 mod base_scenarios;
+
+/// A broken base files its repair ticket, run first (OWL-622).
+#[path = "on_demand/repair_scenarios.rs"]
+mod repair_scenarios;
 
 /// A ticket's cancel parked, refused, withdrawn or dropped (OWL-474).
 #[path = "on_demand/cancel_scenarios.rs"]

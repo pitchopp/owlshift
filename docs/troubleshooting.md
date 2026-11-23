@@ -88,6 +88,8 @@ At a terminal it asks whether to add them; answer `y` and it writes both files, 
 
 If a Build's gate fails the same way on the default branch, `owlshift why` says so (`base <commit>: fails its <step> command ...`) and, once it is fixed, `owlshift gate --at <commit>` checks it again.
 
+Owlshift also files one repair ticket for that break, "Repair the base: ...", urgent, assigned to you and already admitted: the drain runs it before any other ticket, even with `policy.max_in_flight` reached, and its merge lets the held Builds go on. When the fix is outside the repository, on your machine, the ticket asks you what to do there. Set `policy.base_repair = false` in `owlshift.toml` to be told only. A tracker that refuses the ticket leaves a `repair_unfiled` warning in the log.
+
 ## A ticket does not start
 
 **What you see.** You put the `agent` label on a ticket, or ran `owlshift start`, and nothing runs. **The commands that say why:**

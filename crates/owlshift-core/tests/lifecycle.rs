@@ -47,6 +47,7 @@ fn a_standard_ticket_from_admission_to_merge() {
         variant: Variant::Standard,
         state: TicketState::admitted(),
         delivery_followed: false,
+        repair: false,
     };
     let policy = GatePolicy::new(["billing"], PlanApproval::OnFork);
 

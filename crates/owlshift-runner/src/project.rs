@@ -1181,6 +1181,13 @@ pub fn overlap_at(
         .unwrap_or_default())
 }
 
+/// The `policy.base_repair` of the project file at `base` (OWL-622): read at
+/// the base's head as `overlap_at` reads `policy.overlap`, so a ticket's own
+/// branch cannot turn it off; `true` with no file.
+pub fn base_repair_at(git: &Git, checkout: &Path, base: &Base) -> Result<bool, String> {
+    Ok(project_file_at(git, checkout, base)?.is_none_or(|config| config.policy.base_repair()))
+}
+
 /// The `policy.overlap` of the project file at `origin/HEAD` of the
 /// checkout at `root`, as its last fetch left it (OWL-621): whether a
 /// yielded record holds nothing, as `owlshift why`, the digest and a

@@ -649,6 +649,21 @@ impl SetupRun {
     pub(crate) fn recoverable(&self) -> bool {
         self.resumed && self.fault == Some(Fault::Command)
     }
+
+    /// Whether a red setup lets the repair of a broken base start its
+    /// harness (OWL-622, decided on 2026-11-22): the command's own failure,
+    /// the work left as it was, at exactly `repairs`, the setup command the
+    /// repair was filed for, whatever the worktree holds.
+    pub(crate) fn repairs(&self, repairs: Option<&str>) -> bool {
+        self.fault == Some(Fault::Command)
+            && repairs.is_some_and(|command| {
+                self.report
+                    .failure
+                    .as_ref()
+                    .and_then(|failure| failure.command.as_deref())
+                    == Some(command)
+            })
+    }
 }
 
 /// Why the setup before a harness stopped short of passing.
@@ -2424,6 +2439,33 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// OWL-622: a red setup lets a base's repair start its harness only at
+    /// the command it was filed for, and only for that command's own fault,
+    /// whatever the worktree holds; no repair command, none.
+    #[test]
+    fn a_repair_starts_through_its_own_setup_command_only() {
+        let run = |command: &str, fault| {
+            let mut report = empty_report(&[], Path::new(SETUP_LOG));
+            report.failure = Some(GateFailure {
+                command: Some(command.to_owned()),
+                reason: "setup: exit status 1".to_owned(),
+                output: String::new(),
+                truncated: false,
+            });
+            SetupRun {
+                report,
+                resumed: false,
+                fault,
+            }
+        };
+        let held = "pnpm install --offline";
+        assert!(run(held, Some(Fault::Command)).repairs(Some(held)));
+        assert!(!run(held, Some(Fault::Command)).repairs(None));
+        assert!(!run("uv sync", Some(Fault::Command)).repairs(Some(held)));
+        assert!(!run(held, Some(Fault::Runner)).repairs(Some(held)));
+        assert!(!run(held, None).repairs(Some(held)));
     }
 
     /// Runs `commands` as setup commands, unconfined, under `timeout`: the

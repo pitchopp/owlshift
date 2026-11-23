@@ -376,6 +376,13 @@
             "type": "string"
           }
         },
+        "base_repair": {
+          "description": "Whether a broken base files its repair ticket (OWL-622; architecture\nsection 5, \"The repair ticket\"): the runner files one ticket a hold,\nadmits it itself and dispatches it first. Absent: `true`; `false`\nkeeps the hold told and nothing more. Read at the base branch's head,\nas `overlap` is. A file using it requires an Owlshift that reads it.",
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
         "claims": {
           "description": "Whether a ticket is claimed on the git remote (P10, OWL-586;\narchitecture section 7, \"Claims\"): `local`, the default, keeps the\nticket locks of one machine alone and pushes nothing; `remote` takes a\nclaim ref on `origin` before a command works a ticket, so that one\nrunner alone works it across machines. Read at the base commit. A\nfile using it requires an Owlshift that reads it.",
           "anyOf": [

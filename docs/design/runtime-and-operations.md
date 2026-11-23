@@ -192,7 +192,7 @@ quiet_window_minutes = 10            # optional, 1 to 1440: how long a decider's
 max_open_prs = 3                     # optional, 1 to 20: open pull requests at which the drain starts no new Build
 # max_in_flight = 3                  # optional, 1 to 10, 1 when absent: tickets dispatched and not yet at Watch at once (P6)
 # overlap = "exclusive"              # optional, exclusive | rebase: whether two Owlshift tickets may build on the same file at once (P6)
-# base_repair = true                 # optional, true when absent: a broken base files its repair ticket, dispatched first (P6; designed, not built)
+# base_repair = true                 # optional, true when absent: a broken base files its repair ticket, dispatched first (P6)
 # claims = "local"                   # optional, local | remote: whether a ticket is claimed on the git remote, for several runners (P10)
 
 [zones."backend/billing"]

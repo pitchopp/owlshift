@@ -38,6 +38,10 @@ pub struct Ticket<K> {
     /// Whether Owlshift still follows the pull request it delivered for the
     /// ticket.
     pub delivery_followed: bool,
+    /// Whether it is the repair of a broken base the runner filed and admits
+    /// (OWL-622; architecture section 5, "The repair ticket"): dispatched
+    /// before the others, whatever the project's capacity counts.
+    pub repair: bool,
 }
 
 impl<K> Ticket<K> {

@@ -147,6 +147,7 @@ impl Live {
             run_dir: &self.tmp.path().join(format!("run-{id}")),
             brief: &brief,
             setup: &[],
+            repairs_setup: None,
             session: None,
             siblings: None,
         };

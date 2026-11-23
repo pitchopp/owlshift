@@ -66,7 +66,7 @@ use owlshift_contracts::config::Admit;
 
 use super::{
     Author, Capability, Column, Comment, Error, ErrorKind, Filed, Found, Gesture, KeyAccount,
-    Links, Listed, Person, Proposal, Reaction, Relations, StateType, Ticket, Tracker,
+    Links, Listed, Person, Proposal, Reaction, Relations, Repair, StateType, Ticket, Tracker,
 };
 use crate::forge;
 use crate::forge::github::{GitHubForge, Verb};
@@ -451,6 +451,10 @@ impl Tracker for GitHubTracker {
 
     fn propose(&self, proposal: &Proposal<'_>) -> Result<Filed, Error> {
         self.open_proposal(proposal)
+    }
+
+    fn file_repair(&self, repair: &Repair<'_>) -> Result<Filed, Error> {
+        self.open_repair(repair)
     }
 
     fn proposed(
@@ -1065,6 +1069,54 @@ mod tests {
             .ticket(&id("7"))
             .unwrap();
         assert_eq!(ticket.priority, Priority::High);
+    }
+
+    /// OWL-622: a base's repair is an issue with the ready stage's label,
+    /// the admission label and the most urgent priority's label, assigned
+    /// to the operator's login; a label GitHub did not keep is a problem.
+    #[test]
+    fn a_repair_is_an_issue_ready_admitted_urgent_and_assigned() {
+        let priorities = Priorities {
+            urgent: None,
+            high: Some("P1".to_owned()),
+            medium: None,
+            low: None,
+        };
+        let open = r#"POST repos/demo/project/issues {"assignees":["bea"],"body":"Why","labels":["agent:ready","agent","P1"],"title":"Repair the base"}"#;
+        let created = |labels: &[&str]| {
+            let mut created = issue(labels, "open");
+            created["number"] = json!(40);
+            created
+        };
+        for (labels, problems) in [
+            (&["agent:ready", "agent", "p1"][..], 0),
+            (&["agent"][..], 2),
+        ] {
+            let canned = Canned::default()
+                .on(&format!("GET {ISSUE}"), 200, issue(&[], "open"))
+                .on(
+                    "GET user/2",
+                    200,
+                    json!({ "login": "bea", "id": 2, "type": "User" }),
+                )
+                .on(open, 201, created(labels));
+            let held = id("7");
+            let filed = tracker_with(&canned, Some(priorities.clone()))
+                .file_repair(&Repair {
+                    held: &held,
+                    title: "Repair the base",
+                    description: "Why",
+                    ready: "agent:ready",
+                    label: Some("agent"),
+                    assignee: Some("2"),
+                })
+                .unwrap();
+            assert_eq!(
+                (filed.id.as_str(), filed.state.as_str()),
+                ("40", "agent:ready")
+            );
+            assert_eq!(filed.problems.len(), problems, "{:?}", filed.problems);
+        }
     }
 
     #[test]
