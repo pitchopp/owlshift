@@ -1003,7 +1003,7 @@ const DOTNET_FLAGS: &str = "-m:1 -nodeReuse:false";
 /// each run's own `TMPDIR` otherwise: two restores at once into one
 /// `DOTNET_CLI_HOME` did not see each other's lock and failed in most pairs,
 /// and never with the folder shared, a lock folder the project's runs share
-/// on purpose (OWL-632, OWL-641: checked on Linux, macOS pending).
+/// on purpose (OWL-632, OWL-641 on Linux, OWL-644 on macOS).
 fn dotnet(root: &RootFiles) -> Result<Option<Found>, String> {
     let lines = |file: &str| {
         format!(
@@ -1078,7 +1078,7 @@ fn dotnet(root: &RootFiles) -> Result<Option<Found>, String> {
     found.notes.push(
         "`NUGET_SCRATCH` is the folder NuGet takes its extraction lock in, each run's own \
          temporary folder otherwise, so that restores running at once share one lock (checked on \
-         Linux)"
+         Linux and macOS)"
             .to_string(),
     );
     if root.has("global.json") {
