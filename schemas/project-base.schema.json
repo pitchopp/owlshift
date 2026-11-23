@@ -4,6 +4,13 @@
   "description": "A project's checks of its bases.",
   "type": "object",
   "properties": {
+    "breaks": {
+      "description": "The breaks standing (OWL-639, format 3): what each told and the repair\ntickets it filed.",
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/KeptBreak"
+      }
+    },
     "checks": {
       "type": "array",
       "items": {
@@ -13,7 +20,7 @@
     "format": {
       "description": "The format version of this document.",
       "type": "integer",
-      "const": 2
+      "const": 3
     }
   },
   "additionalProperties": false,
@@ -21,6 +28,36 @@
     "format"
   ],
   "$defs": {
+    "KeptBreak": {
+      "description": "A break of the base (OWL-639): the holds on one step and command since a\ncheck of the default branch's head last passed.",
+      "type": "object",
+      "properties": {
+        "failing": {
+          "$ref": "#/$defs/KeptFailing"
+        },
+        "repairs": {
+          "description": "The repair tickets it filed or took again, in order.",
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/TicketId"
+          }
+        },
+        "told": {
+          "description": "The operator was told of it.",
+          "type": "boolean",
+          "default": false
+        },
+        "told_spent": {
+          "description": "The operator was told that it filed its last repair.",
+          "type": "boolean",
+          "default": false
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "failing"
+      ]
+    },
     "KeptCheck": {
       "description": "What is known of one commit and its commands.",
       "type": "object",

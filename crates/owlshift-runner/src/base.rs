@@ -23,7 +23,9 @@ use owlshift_contracts::config::{Admit, Tracker as TrackerConfig};
 use owlshift_contracts::drain::{Gesture, GestureKind};
 use owlshift_contracts::format::Format;
 use owlshift_contracts::ids::TicketId;
-use owlshift_core::base::{Checks, Entry, Failing, Failure, Recorded, Step, Verdict};
+use owlshift_core::base::{
+    Checks, Entry, Failing, Failure, MAX_BREAK_REPAIRS, Recorded, Step, Verdict,
+};
 
 use crate::events::{Data, data};
 use crate::executor::gate::{GateReport, SETUP_PREFIX, refused_uncommitted};
@@ -244,6 +246,21 @@ pub fn line(ticket: &TicketId, commit: &str, failing: &Failing) -> String {
     )
 }
 
+/// What the operator, or the `repair_unfiled` warning, is told once a break
+/// filed its last repair (OWL-639): the repairs it filed, and that none
+/// follows. Fixed words and ticket identifiers.
+pub fn repairs_spent(repairs: &[String]) -> String {
+    let named = match repairs {
+        [] => "its repairs".to_owned(),
+        [one] => one.clone(),
+        [first @ .., last] => format!("{} and {last}", first.join(", ")),
+    };
+    format!(
+        "Owlshift filed {named} for this break, and it still fails: it files no more repair until \
+         a check of the default branch's head passes, so a person takes it from here."
+    )
+}
+
 /// The account the intake record of a repair ticket names (OWL-622): the
 /// runner's own admission, no person's gesture.
 pub const RUNNER_GESTURE: &str = "owlshift";
@@ -342,11 +359,13 @@ pub fn fenced(text: &str) -> String {
 /// The description of the repair of `commit`, which `failure` fails: the
 /// step and command, the reason, the end of the output as quoted data, the
 /// commits since the last pass when `since` gives them (the commit that
-/// passed, then each commit's line), the re-check, and the marker.
+/// passed, then each commit's line), the repairs its break filed `before`
+/// it (OWL-639), the re-check, and the marker.
 pub fn repair_description(
     commit: &str,
     failure: &Failure,
     since: Option<(&str, &[String])>,
+    before: &[String],
 ) -> String {
     let failing = &failure.failing;
     let mut parts = vec![
@@ -385,6 +404,20 @@ pub fn repair_description(
             code(short(passed))
         ));
     }
+    if !before.is_empty() {
+        let were = if before.len() == 1 { "was" } else { "were" };
+        let last = if before.len() + 1 >= MAX_BREAK_REPAIRS {
+            " Owlshift files no repair after this one for this break."
+        } else {
+            ""
+        };
+        parts.push(format!(
+            "**Repairs before this one:** {} {were} filed for this break and closed, and the \
+             command still fails at this commit. Read what they changed before trying the same \
+             fix again.{last}",
+            before.join(", ")
+        ));
+    }
     parts.push(format!(
         "**Once fixed:** the merge of this ticket's pull request moves the default branch, \
          whose check lifts the hold; `owlshift gate --at {commit}` checks the commit itself \
@@ -421,8 +454,15 @@ pub fn lifted_comment(repair: &TicketId, commit: &str) -> String {
 }
 
 /// The project `decision` event of a repair kept for the hold on `commit`
-/// (OWL-622): filed now, or an open one `reused`.
-pub fn repair_event(commit: &str, failing: &Failing, ticket: &TicketId, reused: bool) -> Data {
+/// (OWL-622): filed now, or an open one `reused`; `attempt` is its place in
+/// its break, 1 for the first (OWL-639).
+pub fn repair_event(
+    commit: &str,
+    failing: &Failing,
+    ticket: &TicketId,
+    reused: bool,
+    attempt: usize,
+) -> Data {
     data([
         ("base", json!("repair")),
         ("commit", json!(commit)),
@@ -430,6 +470,7 @@ pub fn repair_event(commit: &str, failing: &Failing, ticket: &TicketId, reused: 
         ("command", json!(failing.command)),
         ("ticket", json!(ticket)),
         ("reused", json!(reused)),
+        ("attempt", json!(attempt)),
     ])
 }
 
@@ -707,12 +748,24 @@ mod tests {
             tail: tail.to_owned(),
         };
         let since = ["abc1234 Bump rollup".to_owned()];
-        let text = repair_description(commit, &failure, Some(("fedcba9876543210", &since)));
+        let text = repair_description(commit, &failure, Some(("fedcba9876543210", &since)), &[]);
         assert!(
             text.contains("`````text\nok\n````\n@owner see #12\n`````"),
             "{text}"
         );
         assert!(text.contains("- `abc1234 Bump rollup`"), "{text}");
+        assert!(!text.contains("Repairs before"), "{text}");
+        // OWL-639: a break's second repair names the first, and is its last.
+        let second = repair_description(commit, &failure, None, &["OWL-7".to_owned()]);
+        assert!(
+            second.contains("**Repairs before this one:** OWL-7 was filed for this break")
+                && second.contains("files no repair after this one"),
+            "{second}"
+        );
+        assert!(
+            repairs_spent(&["OWL-7".to_owned(), "OWL-8".to_owned()])
+                .starts_with("Owlshift filed OWL-7 and OWL-8 for this break"),
+        );
         assert!(
             text.contains(&format!("owlshift gate --at {commit}")),
             "{text}"

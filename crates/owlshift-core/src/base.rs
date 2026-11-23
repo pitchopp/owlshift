@@ -21,15 +21,24 @@
 //!   Build configured there waits until the check runs.
 //! - *Leaving a broken commit* (OWL-427). A held Build whose branch has
 //!   commits of its own is rebased onto a newer default-branch head once
-//!   that head passes its own check ([`leave`]).
+//!   that head passes its own check ([`leave`]). Whatever its branch, a held
+//!   Build checks that head, matched with its held commit's command, so a
+//!   head that still fails there is held too (OWL-639).
 //! - *The repair ticket* (OWL-622). A checked entry keeps the ticket the
 //!   runner filed for its hold ([`Repair`]), kept across its checks, a lift
 //!   included: the runner admits a repair while an entry naming it holds
 //!   ([`Checks::repairs`]), and a hold that opens again, or another on the
 //!   same command, takes an open one again ([`Checks::reusable`]).
+//! - *A break* (OWL-639). The holds on one step and command since a check of
+//!   the default branch's head last passed are one break ([`Break`]), told
+//!   once, which files at most [`MAX_BREAK_REPAIRS`] repair tickets.
 
 /// The most entries kept; past it the oldest without a hold goes first.
 pub const MAX_CHECKS: usize = 16;
+
+/// The most repair tickets one break files (OWL-639): a repair that merged
+/// with the base still failing is followed by one more; past it, a person.
+pub const MAX_BREAK_REPAIRS: usize = 2;
 
 /// The part of a gate run a command belongs to.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -114,33 +123,43 @@ pub enum HeldBranch {
 pub enum Leave {
     /// It stays held, as before.
     Stay,
-    /// The head is checked first.
+    /// The head is checked first, matched with the held commit's failing
+    /// command: or its kept verdict is, when it fails there and no hold
+    /// stands on it yet (OWL-639).
     CheckHead,
     /// Its branch is rebased onto the head.
     Rebase,
 }
 
-/// What a Build held at `held`, whose check still fails, does about `head`,
-/// the default branch's head: a branch with commits of its own and a clean
-/// worktree is rebased onto a head that contains `held` (`head_has_held`)
-/// and passes its own check (`head_verdict`), and the head is checked when
-/// no verdict of it is kept. Anything else stays held: an environment fix
-/// lifts the hold through `held`'s own check, and a head that does not
-/// contain `held` was rewritten, so a rebase onto it would replay `held`'s
-/// own commits.
+/// What a Build held at `held`, which still fails `held_failing`, does about
+/// `head`, the default branch's head. A head that contains `held`
+/// (`head_has_held`) is checked when no verdict of it is kept, whatever the
+/// branch (OWL-639), and again matched when its kept verdict fails at
+/// `held_failing` with no hold on it (`head_held`), which holds it. A branch
+/// with commits of its own and a clean worktree is rebased onto such a head
+/// that passes its own check (`head_verdict`, OWL-427). Anything else stays
+/// held: an environment fix lifts the hold through `held`'s own check, and a
+/// head that does not contain `held` was rewritten, so a rebase onto it
+/// would replay `held`'s own commits.
 pub fn leave(
     held: &str,
+    held_failing: &Failing,
     head: &str,
-    head_has_held: bool,
     head_verdict: Option<&Verdict>,
+    head_has_held: bool,
+    head_held: bool,
     branch: HeldBranch,
 ) -> Leave {
-    if branch != HeldBranch::OwnCommits || head == held || !head_has_held {
+    if head == held || !head_has_held {
         return Leave::Stay;
     }
     match head_verdict {
         None => Leave::CheckHead,
-        Some(Verdict::Passed) => Leave::Rebase,
+        Some(Verdict::Passed) if branch == HeldBranch::OwnCommits => Leave::Rebase,
+        Some(Verdict::Passed) => Leave::Stay,
+        Some(verdict) if !head_held && whose(held_failing, verdict) == Whose::Base => {
+            Leave::CheckHead
+        }
         Some(Verdict::Failed(_)) => Leave::Stay,
     }
 }
@@ -257,10 +276,28 @@ pub enum Recorded {
     Cached,
 }
 
+/// A break of the base (OWL-639): the holds on one step and command since a
+/// check of the default branch's head last passed, kept apart from the
+/// entries, so that neither a dropped entry nor a hold's repair taken again
+/// resets what it filed.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Break {
+    pub failing: Failing,
+    /// The operator was told of it, at its first hold.
+    pub told: bool,
+    /// The operator was told that it filed its last repair.
+    pub told_spent: bool,
+    /// The repair tickets filed or taken again for it, in order.
+    pub repairs: Vec<String>,
+}
+
 /// A project's checks of its bases.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Checks {
     pub checks: Vec<Check>,
+    /// The breaks standing, one a step and command (OWL-639), at most
+    /// [`MAX_CHECKS`], the oldest dropped first.
+    pub breaks: Vec<Break>,
 }
 
 impl Checks {
@@ -354,7 +391,8 @@ impl Checks {
     /// a pending entry's failure counts as one. A failed verdict holds the
     /// commit when a hold stood, a re-check that fails at another command
     /// included, or when the failure it is matched with is the base's;
-    /// a passing one lifts a hold.
+    /// a passing one lifts a hold. A pass of the default branch's head itself
+    /// ends every break (OWL-639).
     pub fn record_check(
         &mut self,
         (commit, commands, head): (&str, &str, &str),
@@ -362,6 +400,9 @@ impl Checks {
         verdict: Verdict,
         initiating: Option<&Failing>,
     ) -> Recorded {
+        if verdict == Verdict::Passed && commit == head {
+            self.breaks.clear();
+        }
         let previous = self
             .position(commit, commands)
             .map(|at| self.checks.remove(at));
@@ -589,6 +630,73 @@ impl Checks {
             .map(|check| check.commit.as_str())
     }
 
+    /// The repair tickets the break of `failing` filed or took again
+    /// (OWL-639), in order: none when no break of it stands.
+    pub fn break_repairs(&self, failing: &Failing) -> &[String] {
+        self.breaks
+            .iter()
+            .find(|standing| standing.failing == *failing)
+            .map_or(&[], |standing| standing.repairs.as_slice())
+    }
+
+    /// Whether the break of `failing` filed its last repair (OWL-639): a hold
+    /// in it files none.
+    pub fn break_spent(&self, failing: &Failing) -> bool {
+        self.break_repairs(failing).len() >= MAX_BREAK_REPAIRS
+    }
+
+    /// Keeps `ticket` among the repairs of the break of `failing`, once:
+    /// its place in the break, 1 for its first.
+    pub fn keep_break_repair(&mut self, failing: &Failing, ticket: &str) -> usize {
+        let repairs = &mut self.break_of(failing).repairs;
+        match repairs.iter().position(|kept| kept == ticket) {
+            Some(at) => at + 1,
+            None => {
+                repairs.push(ticket.to_owned());
+                repairs.len()
+            }
+        }
+    }
+
+    /// Marks the break of `failing` told: `true` the first time only, so the
+    /// operator is told once a break (OWL-639).
+    pub fn claim_break_told(&mut self, failing: &Failing) -> bool {
+        !std::mem::replace(&mut self.break_of(failing).told, true)
+    }
+
+    /// Marks the break of `failing` told that it filed its last repair:
+    /// `true` the first time only.
+    pub fn claim_spent_told(&mut self, failing: &Failing) -> bool {
+        let standing = self.break_of(failing);
+        standing.told = true;
+        !std::mem::replace(&mut standing.told_spent, true)
+    }
+
+    /// The break of `failing`, begun when none stands; past [`MAX_CHECKS`]
+    /// breaks the oldest goes.
+    fn break_of(&mut self, failing: &Failing) -> &mut Break {
+        let at = match self
+            .breaks
+            .iter()
+            .position(|standing| standing.failing == *failing)
+        {
+            Some(at) => at,
+            None => {
+                if self.breaks.len() >= MAX_CHECKS {
+                    self.breaks.remove(0);
+                }
+                self.breaks.push(Break {
+                    failing: failing.clone(),
+                    told: false,
+                    told_spent: false,
+                    repairs: Vec::new(),
+                });
+                self.breaks.len() - 1
+            }
+        };
+        &mut self.breaks[at]
+    }
+
     /// Drops the oldest entries past [`MAX_CHECKS`], those that hold nothing
     /// first.
     fn trim(&mut self) {
@@ -783,45 +891,50 @@ mod tests {
     }
 
     /// OWL-427: only a branch with commits of its own and a clean worktree
-    /// leaves a held commit, onto a head that contains it and passes; a
-    /// head with no verdict is checked first.
+    /// leaves a held commit, onto a head that contains it and passes. OWL-639:
+    /// whatever the branch, a head with no verdict is checked first, and one
+    /// failing at the held command with no hold on it is matched.
     #[test]
     fn a_held_branch_with_commits_of_its_own_leaves_for_a_head_that_passes() {
+        use HeldBranch::{Delivered, NoCommitsOfItsOwn, OwnCommits, Uncommitted};
         let install = setup("install");
         let broken = failed(&install);
+        let elsewhere = failed(&setup("lint"));
         let passed = Verdict::Passed;
-        let own = HeldBranch::OwnCommits;
         let cases = [
-            ("h", true, Some(&passed), own, Leave::Rebase),
-            ("h", true, None, own, Leave::CheckHead),
-            ("h", true, Some(&broken), own, Leave::Stay),
+            ("h", true, Some(&passed), false, OwnCommits, Leave::Rebase),
+            ("h", true, None, false, OwnCommits, Leave::CheckHead),
+            (
+                "h",
+                true,
+                Some(&broken),
+                false,
+                OwnCommits,
+                Leave::CheckHead,
+            ),
+            ("h", true, Some(&broken), true, OwnCommits, Leave::Stay),
+            ("h", true, Some(&elsewhere), false, OwnCommits, Leave::Stay),
             // The head is the held commit: nothing newer to rebase onto.
-            (X, true, Some(&passed), own, Leave::Stay),
+            (X, true, Some(&passed), false, OwnCommits, Leave::Stay),
+            (X, true, None, false, OwnCommits, Leave::Stay),
             // A rewritten default branch, the held commit not in it.
-            ("h", false, Some(&passed), own, Leave::Stay),
-            (
-                "h",
-                true,
-                Some(&passed),
-                HeldBranch::NoCommitsOfItsOwn,
-                Leave::Stay,
-            ),
-            (
-                "h",
-                true,
-                Some(&passed),
-                HeldBranch::Uncommitted,
-                Leave::Stay,
-            ),
-            ("h", true, Some(&passed), HeldBranch::Delivered, Leave::Stay),
-            ("h", true, None, HeldBranch::Delivered, Leave::Stay),
+            ("h", false, Some(&passed), false, OwnCommits, Leave::Stay),
+            ("h", false, None, false, Delivered, Leave::Stay),
         ];
-        for (head, has_held, verdict, branch, expected) in cases {
+        for (head, has_held, verdict, held, branch, expected) in cases {
             assert_eq!(
-                leave(X, head, has_held, verdict, branch),
+                leave(X, &install, head, verdict, has_held, held, branch),
                 expected,
-                "{head} {has_held} {verdict:?} {branch:?}"
+                "{head} {has_held} {verdict:?} {held} {branch:?}"
             );
+        }
+        // Any other branch is checked and held alike, never rebased.
+        for branch in [NoCommitsOfItsOwn, Uncommitted, Delivered] {
+            let read = |verdict, held| leave(X, &install, "h", verdict, true, held, branch);
+            assert_eq!(read(None, false), Leave::CheckHead, "{branch:?}");
+            assert_eq!(read(Some(&broken), false), Leave::CheckHead, "{branch:?}");
+            assert_eq!(read(Some(&broken), true), Leave::Stay, "{branch:?}");
+            assert_eq!(read(Some(&passed), false), Leave::Stay, "{branch:?}");
         }
     }
 
@@ -872,6 +985,42 @@ mod tests {
         // A refusal keeps no ticket.
         assert!(checks.set_repair("y", KEY, Repair::Unfiled));
         assert_eq!(checks.repair("y", KEY).and_then(Repair::ticket), None);
+    }
+
+    /// OWL-639: a break keeps its repairs apart from its entries, files two
+    /// and then none, is told once and once more when spent, and ends only
+    /// when a check of the default branch's head itself passes.
+    #[test]
+    fn a_break_files_two_repairs_then_none_until_the_head_passes() {
+        let install = setup("install");
+        let lint = setup("lint");
+        let mut checks = Checks::default();
+        assert!(checks.break_repairs(&install).is_empty());
+        assert!(checks.claim_break_told(&install));
+        assert!(!checks.claim_break_told(&install), "told once a break");
+        assert_eq!(checks.keep_break_repair(&install, "DEMO-2"), 1);
+        assert_eq!(
+            checks.keep_break_repair(&install, "DEMO-2"),
+            1,
+            "taken again"
+        );
+        assert!(!checks.break_spent(&install));
+        assert_eq!(checks.keep_break_repair(&install, "DEMO-3"), 2);
+        assert!(checks.break_spent(&install));
+        assert!(!checks.break_spent(&lint), "another command, another break");
+        assert!(checks.claim_spent_told(&install));
+        assert!(!checks.claim_spent_told(&install));
+        // Neither a pass at an older commit nor dropped entries end it.
+        checks.record_check(("old", KEY, "h1"), 1, Verdict::Passed, None);
+        for n in 0..=MAX_CHECKS {
+            let commit = format!("c{n}");
+            checks.record_check((&commit, KEY, "h1"), 2, failed(&install), Some(&install));
+        }
+        assert_eq!(checks.break_repairs(&install), ["DEMO-2", "DEMO-3"]);
+        // A pass at the head it fetched ends every break.
+        checks.record_check(("h2", KEY, "h2"), 3, Verdict::Passed, None);
+        assert!(checks.breaks.is_empty());
+        assert!(checks.claim_break_told(&install), "a new break is told");
     }
 
     #[test]

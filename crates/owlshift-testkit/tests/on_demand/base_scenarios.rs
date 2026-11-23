@@ -70,7 +70,7 @@ pub(super) const REBASED_HELD: &str =
 
 /// What the agent of the `run`th run does in the ticket's worktree: `git`
 /// with `args`, which must succeed.
-fn agent_git(bench: &Bench, run: usize, args: Vec<String>) -> During {
+pub(super) fn agent_git(bench: &Bench, run: usize, args: Vec<String>) -> During {
     let (env, worktree) = (bench.env.clone(), bench.worktree());
     (
         run,
@@ -113,7 +113,7 @@ pub(super) fn checks_made(bench: &Bench) -> Vec<(String, String, String)> {
 /// A done Build held at its base: the store loses its version while the
 /// Build works, so its gate's setup breaks after its `done`, on the base
 /// too. Returns the held commit and the branch's head.
-fn held_done_build(bench: &Bench, marker: &Path) -> (String, String) {
+pub(super) fn held_done_build(bench: &Bench, marker: &Path) -> (String, String) {
     fs::write(marker, "").unwrap();
     let base = with_setup(bench, &fixable_setup(marker), None);
     let lost = marker.to_owned();
@@ -332,6 +332,7 @@ fn a_held_build_with_commits_of_its_own_runs_on_the_rebased_branch() {
                 repair: None,
             },
         }],
+        breaks: Vec::new(),
     };
     base::write(&bench.dirs(), &checks).unwrap();
     let fixed = bench.merge_into_main(&[("FIXED", "fixed\n")]);
