@@ -388,7 +388,7 @@ Whether two Owlshift tickets may build on the same file at once: "exclusive" (th
 
 #### `policy.base_repair`
 
-Whether a default branch that breaks the gate files one repair ticket, which Owlshift admits itself and runs before the others: true or false. Default: `true`.
+Whether a default branch that breaks the gate files repair tickets, up to two per break, which Owlshift admits itself and runs before the others: true or false. Default: `true`.
 
 ```toml
 # base_repair = true

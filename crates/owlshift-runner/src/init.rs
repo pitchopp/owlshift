@@ -218,9 +218,9 @@ always_human = []
 # \"exclusive\" (the later one waits) or \"rebase\" (both build, the later one
 # refreshed onto the first's merge). Default: `\"exclusive\"`.
 # overlap = \"exclusive\"
-# Whether a default branch that breaks the gate files one repair ticket,
-# which Owlshift admits itself and runs before the others: true or false.
-# Default: `true`.
+# Whether a default branch that breaks the gate files repair tickets, up to
+# two per break, which Owlshift admits itself and runs before the others:
+# true or false. Default: `true`.
 # base_repair = true
 # Where a ticket is claimed, so that one runner alone works it: \"local\" (the
 # ticket locks of each machine alone; nothing is pushed) or \"remote\" (a claim
