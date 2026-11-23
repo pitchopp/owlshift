@@ -13,16 +13,17 @@
 //! its GitHub repository; the Claude Code token is one per machine (OWL-308,
 //! [`crate::secrets`]).
 
+use std::ffi::OsString;
 use std::fmt;
 use std::fs::OpenOptions;
 use std::io::{self, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use semver::Version;
 
 use owlshift_adapters::forge::Repo;
 use owlshift_contracts::config::{ProjectConfig, TrackerKind};
-use owlshift_core::stack::{Detection, MANIFESTS, RootFiles};
+use owlshift_core::stack::{Detection, HomeManager, MANIFESTS, RootFiles};
 use owlshift_platform::keychain::{Keychain, KeychainError, SERVICE, Secret};
 
 use crate::config::{OWLSHIFT_VERSION, PROJECT_FILE};
@@ -506,7 +507,101 @@ pub fn read_root_files(root: &Path) -> io::Result<RootFiles> {
             files.push((name.to_owned(), text));
         }
     }
-    Ok(RootFiles { names, files })
+    Ok(RootFiles {
+        names,
+        files,
+        home_managers: vec![],
+    })
+}
+
+/// A version manager [`home_managers`] looks for (OWL-631).
+struct ManagerSpec {
+    /// Its executable on `PATH`, one of [`owlshift_core::stack::HOME_MANAGERS`].
+    name: &'static str,
+    /// The variable that moves its installs folder.
+    variable: &'static str,
+    /// Its installs folder without the variable, relative to the home: the
+    /// first that exists.
+    defaults: &'static [&'static str],
+}
+
+/// The version managers whose installs may lie in the home. pipx's folders
+/// are read from its `paths.py` (1.18): `PIPX_HOME`, then the legacy
+/// `~/.local/pipx` when it exists, then platformdirs' data folder, checked
+/// live on Linux; the others are their documented defaults.
+const MANAGER_SPECS: [ManagerSpec; 4] = [
+    ManagerSpec {
+        name: "pyenv",
+        variable: "PYENV_ROOT",
+        defaults: &[".pyenv"],
+    },
+    ManagerSpec {
+        name: "rbenv",
+        variable: "RBENV_ROOT",
+        defaults: &[".rbenv"],
+    },
+    ManagerSpec {
+        name: "asdf",
+        variable: "ASDF_DATA_DIR",
+        defaults: &[".asdf"],
+    },
+    ManagerSpec {
+        name: "pipx",
+        variable: "PIPX_HOME",
+        defaults: &[
+            ".local/pipx",
+            ".local/share/pipx",
+            "Library/Application Support/pipx",
+        ],
+    },
+];
+
+/// The version managers on `PATH` whose installs folder lies in the home
+/// (OWL-631), read through `var` from the environment: an executable of
+/// that name in a `PATH` folder, and its folder, from its variable when set
+/// or else its first default that exists, a folder under `HOME`. Homebrew's
+/// pyenv lives outside the home and installs into `~/.pyenv`, so the
+/// installs folder decides, not where the executable lies.
+pub fn home_managers(var: impl Fn(&str) -> Option<OsString>) -> Vec<HomeManager> {
+    let Some(home) = var("HOME").filter(|h| !h.is_empty()).map(PathBuf::from) else {
+        return vec![];
+    };
+    let Ok(home) = home.canonicalize() else {
+        return vec![];
+    };
+    let path: Vec<PathBuf> = var("PATH")
+        .map(|p| std::env::split_paths(&p).collect())
+        .unwrap_or_default();
+    let mut found = vec![];
+    for spec in &MANAGER_SPECS {
+        if !path.iter().any(|dir| dir.join(spec.name).is_file()) {
+            continue;
+        }
+        let folder = match var(spec.variable).filter(|v| !v.is_empty()) {
+            Some(set) => Some(PathBuf::from(set)),
+            None => spec
+                .defaults
+                .iter()
+                .map(|d| home.join(d))
+                .find(|f| f.is_dir()),
+        };
+        let Some(Ok(folder)) = folder.filter(|f| f.is_dir()).map(|f| f.canonicalize()) else {
+            continue;
+        };
+        let Some(relative) = folder
+            .strip_prefix(&home)
+            .ok()
+            .and_then(|r| r.to_str())
+            .filter(|r| !r.is_empty())
+        else {
+            continue;
+        };
+        found.push(HomeManager {
+            name: spec.name.to_owned(),
+            folder: relative.to_owned(),
+        });
+    }
+    found
 }
 
 /// What [`write_project_file`] did.
@@ -1499,6 +1594,7 @@ mod tests {
                 .iter()
                 .map(|(n, c)| ((*n).to_owned(), (*c).to_owned()))
                 .collect(),
+            ..RootFiles::default()
         })
     }
 
@@ -1527,6 +1623,84 @@ mod tests {
         );
         assert!(text.contains("\n# run_caches = { CARGO_HOME = \"cargo\" }\n"));
         assert!(!text.contains("read from") && !text.contains("# note:"));
+    }
+
+    /// OWL-631: a pinned tool chain's note is written above the gate, and
+    /// the file still loads.
+    #[test]
+    fn a_pinned_python_writes_its_note_above_the_gate() {
+        let text = project_file(&with(detected(&[".python-version"], &[]), &[])).unwrap();
+        assert!(
+            text.contains("\n# note: `.python-version` names a Python: installed by"),
+            "{text}"
+        );
+        ProjectConfig::parse(&text).unwrap();
+    }
+
+    /// OWL-631: a manager counts when it is on `PATH` and its installs
+    /// folder, from its variable or its first default that exists, lies in
+    /// the home.
+    #[test]
+    fn a_manager_on_path_counts_with_its_installs_in_the_home() {
+        let home = tempfile::tempdir().unwrap();
+        let bin = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        for name in ["pyenv", "rbenv", "pipx"] {
+            std::fs::write(bin.path().join(name), "").unwrap();
+        }
+        // A folder named like a manager is not its executable.
+        std::fs::create_dir(bin.path().join("asdf")).unwrap();
+        for folder in [".pyenv", ".asdf", ".local/pipx", ".local/share/pipx"] {
+            std::fs::create_dir_all(home.path().join(folder)).unwrap();
+        }
+        let found = |vars: &[(&str, &std::path::Path)]| {
+            let vars: Vec<(String, OsString)> = [("HOME", home.path()), ("PATH", bin.path())]
+                .iter()
+                .chain(vars)
+                .map(|(k, v)| (k.to_string(), v.as_os_str().to_owned()))
+                .collect();
+            home_managers(|name| {
+                vars.iter()
+                    .rev()
+                    .find(|(k, _)| k == name)
+                    .map(|(_, v)| v.clone())
+            })
+            .into_iter()
+            .map(|m| (m.name, m.folder))
+            .collect::<Vec<_>>()
+        };
+        let pair = |n: &str, f: &str| (n.to_owned(), f.to_owned());
+        // rbenv has no folder; asdf is no executable; pipx's legacy folder
+        // wins over the platform's.
+        assert_eq!(
+            found(&[]),
+            [pair("pyenv", ".pyenv"), pair("pipx", ".local/pipx")]
+        );
+        // A variable outside the home, or the home itself, gives nothing.
+        assert_eq!(
+            found(&[("PYENV_ROOT", outside.path()), ("PIPX_HOME", home.path())]),
+            []
+        );
+        let rubies = home.path().join("rubies");
+        std::fs::create_dir(&rubies).unwrap();
+        // Off `PATH`, no manager counts.
+        assert_eq!(
+            found(&[("RBENV_ROOT", &rubies), ("PATH", outside.path())]),
+            []
+        );
+        assert_eq!(
+            found(&[("RBENV_ROOT", &rubies)]),
+            [
+                pair("pyenv", ".pyenv"),
+                pair("rbenv", "rubies"),
+                pair("pipx", ".local/pipx")
+            ]
+        );
+        assert!(home_managers(|_| None).is_empty());
+        assert_eq!(
+            MANAGER_SPECS.map(|s| s.name),
+            owlshift_core::stack::HOME_MANAGERS
+        );
     }
 
     #[test]
