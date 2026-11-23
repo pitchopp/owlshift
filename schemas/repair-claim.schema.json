@@ -19,10 +19,10 @@
       "type": "string"
     },
     "repairs": {
-      "description": "The repairs the break filed, as the filing runner counted them, this\none included: what bounds a break's repairs across runners.",
+      "description": "The repairs the break filed, as the filing runner counted them, this\none included, so at least 1: what bounds a break's repairs across\nrunners.",
       "type": "integer",
       "format": "uint32",
-      "minimum": 0
+      "minimum": 1
     },
     "runner": {
       "description": "The filing runner's identifier: 16 lowercase hexadecimal digits.",

@@ -2539,12 +2539,23 @@ fn event_claim_and_state_rejections() {
     assert_eq!(RepairClaim::parse(&filed.render()).unwrap(), filed);
     let host = RepairClaim {
         runner: "ada-laptop".to_owned(),
-        ..filing
+        ..filing.clone()
     };
     rejects(
         "repair claim's runner is a host name",
         RepairClaim::parse(&host.render()),
         "16 lowercase hexadecimal digits",
+    );
+    // It counts the repair it names or files, so never 0: a claim of 0 would
+    // let a break file past its bound.
+    let none = RepairClaim {
+        repairs: 0,
+        ..filing
+    };
+    rejects(
+        "repair claim counting no repair",
+        RepairClaim::parse(&none.render()),
+        "repairs is 0",
     );
     assert_eq!(
         repair_claim_ref("setup-0123456789ab"),

@@ -375,7 +375,9 @@ pub struct RepairClaim {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ticket: Option<TicketId>,
     /// The repairs the break filed, as the filing runner counted them, this
-    /// one included: what bounds a break's repairs across runners.
+    /// one included, so at least 1: what bounds a break's repairs across
+    /// runners.
+    #[schemars(range(min = 1))]
     pub repairs: u32,
 }
 
@@ -403,14 +405,20 @@ impl RepairClaim {
         format::render_json(self)
     }
 
-    /// The rules beyond its shape: a runner's identifier and an operator a
-    /// person can read.
+    /// The rules beyond its shape: a runner's identifier, an operator a
+    /// person can read, and a count that includes the repair it names or
+    /// files.
     pub fn check(&self) -> Result<(), String> {
         if !is_lower_hex(&self.runner, 16) {
             return Err(format!(
                 "runner {:?} is not 16 lowercase hexadecimal digits",
                 self.runner
             ));
+        }
+        if self.repairs == 0 {
+            return Err(
+                "repairs is 0, though it counts the repair the claim names or files".to_owned(),
+            );
         }
         if let Err(broken) = check_name(&self.operator) {
             return Err(format!("operator {:?} {broken}", self.operator));
