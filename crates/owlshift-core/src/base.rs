@@ -697,6 +697,24 @@ impl Checks {
         &mut self.breaks[at]
     }
 
+    /// Whether a check of `commands` at the default branch's head it fetched
+    /// passed after `since_ms` (OWL-642): such a pass ends every break, so a
+    /// repair claim taken before it counts an earlier break's repairs.
+    pub fn passed_after(&self, commands: &str, since_ms: i64) -> bool {
+        self.checks.iter().any(|check| {
+            check.commands == commands
+                && matches!(
+                    &check.entry,
+                    Entry::Checked {
+                        head,
+                        checked_ms,
+                        verdict: Verdict::Passed,
+                        ..
+                    } if *head == check.commit && *checked_ms > since_ms
+                )
+        })
+    }
+
     /// Drops the oldest entries past [`MAX_CHECKS`], those that hold nothing
     /// first.
     fn trim(&mut self) {
@@ -714,6 +732,77 @@ impl Checks {
             };
             self.checks.remove(at);
         }
+    }
+}
+
+/// How long a break's repair claim naming no repair is a filing under way
+/// (OWL-642), by its holder's clock against the reader's: past it, or dated
+/// further than it ahead, the claim is taken over.
+pub const REPAIR_CLAIM_LEASE_MS: i64 = 15 * 60 * 1000;
+
+/// A break's repair claim as a runner read it on the remote (OWL-642), the
+/// tracker asked whether the repair it names is still open.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ClaimSeen {
+    /// The repair it names and whether it is open; none while it is filed.
+    pub ticket: Option<(String, bool)>,
+    /// When it was taken, by its holder's clock.
+    pub claimed_ms: i64,
+    /// The repairs it says the break filed, the one it names or is filing
+    /// included.
+    pub repairs: u32,
+}
+
+/// What a filing does about its break's repair claim (OWL-642).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ClaimMove {
+    /// The claim names an open repair: it is taken again.
+    TakeAgain(String),
+    /// A repair is being filed under it: none is filed now.
+    Wait,
+    /// The claim is taken, or replaced, and a repair filed, `before` having
+    /// been filed for the break.
+    File { before: usize },
+    /// The break filed its last repair, `before` in all: none is filed.
+    Spent { before: usize },
+}
+
+/// What a filing does about `seen`, its break's repair claim on the remote,
+/// `None` when there is none, at `now_ms` (OWL-642; architecture section 5,
+/// "The repair ticket", "Not twice"). `local` is the repairs this runner's
+/// break of the same command filed or took again; `passed_since` whether
+/// this runner recorded a pass of the head after the claim was taken, which
+/// ended the break the claim counts. A claim naming an open repair is taken
+/// again; one naming none is a filing under way within
+/// [`REPAIR_CLAIM_LEASE_MS`], whoever holds it; anything else is replaced,
+/// and the break's repairs counted on both sides bound the filing, so that
+/// [`MAX_BREAK_REPAIRS`] holds across runners.
+pub fn claim_move(
+    seen: Option<&ClaimSeen>,
+    now_ms: i64,
+    local: usize,
+    passed_since: bool,
+) -> ClaimMove {
+    let before = match seen {
+        None => local,
+        Some(ClaimSeen {
+            ticket: Some((ticket, true)),
+            ..
+        }) => return ClaimMove::TakeAgain(ticket.clone()),
+        Some(seen)
+            if seen.ticket.is_none()
+                && now_ms < seen.claimed_ms.saturating_add(REPAIR_CLAIM_LEASE_MS)
+                && seen.claimed_ms <= now_ms.saturating_add(REPAIR_CLAIM_LEASE_MS) =>
+        {
+            return ClaimMove::Wait;
+        }
+        Some(_) if passed_since => local,
+        Some(seen) => local.max(usize::try_from(seen.repairs).unwrap_or(usize::MAX)),
+    };
+    if before >= MAX_BREAK_REPAIRS {
+        ClaimMove::Spent { before }
+    } else {
+        ClaimMove::File { before }
     }
 }
 
@@ -1045,5 +1134,77 @@ mod tests {
         assert!(checks.get("c1", KEY).is_none());
         assert!(checks.get("c2", KEY).is_some());
         assert_eq!(checks.standing().count(), 1);
+    }
+
+    /// OWL-642: a break's repair claim names the repair every runner takes
+    /// again while it is open; one naming none holds the filing for its
+    /// lease, whoever took it, and is taken over after it or when dated past
+    /// it ahead; a closed one is replaced, the repairs counted on both sides
+    /// bounding the break, unless a pass since ended the break it counts.
+    #[test]
+    fn a_repair_claim_is_taken_again_waited_on_or_replaced_within_the_bound() {
+        const NOW: i64 = 100 * REPAIR_CLAIM_LEASE_MS;
+        let seen = |ticket: Option<(&str, bool)>, claimed_ms: i64, repairs: u32| ClaimSeen {
+            ticket: ticket.map(|(id, open)| (id.to_owned(), open)),
+            claimed_ms,
+            repairs,
+        };
+        assert_eq!(
+            claim_move(None, NOW, 0, false),
+            ClaimMove::File { before: 0 }
+        );
+        assert_eq!(
+            claim_move(None, NOW, 2, false),
+            ClaimMove::Spent { before: 2 }
+        );
+        let open = seen(Some(("DEMO-3", true)), 0, 2);
+        assert_eq!(
+            claim_move(Some(&open), NOW, 0, true),
+            ClaimMove::TakeAgain("DEMO-3".to_owned())
+        );
+        // A filing under way, within its lease either side of the clock.
+        for claimed in [
+            NOW,
+            NOW - REPAIR_CLAIM_LEASE_MS + 1,
+            NOW + REPAIR_CLAIM_LEASE_MS,
+        ] {
+            let filing = seen(None, claimed, 1);
+            assert_eq!(claim_move(Some(&filing), NOW, 0, true), ClaimMove::Wait);
+        }
+        // Stale, or dated too far ahead: taken over, its repair counted.
+        for claimed in [NOW - REPAIR_CLAIM_LEASE_MS, NOW + REPAIR_CLAIM_LEASE_MS + 1] {
+            let stale = seen(None, claimed, 1);
+            assert_eq!(
+                claim_move(Some(&stale), NOW, 0, false),
+                ClaimMove::File { before: 1 }
+            );
+        }
+        // A closed repair: the break's count is the larger side's.
+        let closed = seen(Some(("DEMO-3", false)), 0, 1);
+        assert_eq!(
+            claim_move(Some(&closed), NOW, 0, false),
+            ClaimMove::File { before: 1 }
+        );
+        let spent = seen(Some(("DEMO-4", false)), 0, 2);
+        assert_eq!(
+            claim_move(Some(&spent), NOW, 0, false),
+            ClaimMove::Spent { before: 2 }
+        );
+        assert_eq!(
+            claim_move(Some(&closed), NOW, 2, false),
+            ClaimMove::Spent { before: 2 }
+        );
+        // A pass recorded since the claim ended the break it counts.
+        assert_eq!(
+            claim_move(Some(&spent), NOW, 0, true),
+            ClaimMove::File { before: 0 }
+        );
+        let mut checks = Checks::default();
+        checks.record_check(("c", KEY, "h"), 5, Verdict::Passed, None);
+        assert!(!checks.passed_after(KEY, 4), "not the head it fetched");
+        checks.record_check(("h", KEY, "h"), 5, Verdict::Passed, None);
+        assert!(checks.passed_after(KEY, 4));
+        assert!(!checks.passed_after(KEY, 5));
+        assert!(!checks.passed_after("other", 4));
     }
 }

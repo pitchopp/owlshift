@@ -10,7 +10,9 @@
 //! [`SESSION_FILE`] (OWL-394), and, later, the ticket's
 //! artifacts. Since OWL-122 the runner keeps the ticket ref in its dedicated
 //! checkout only. Since OWL-586 the claim ref is on `origin` alone, under
-//! `[policy] claims = "remote"`; the ticket ref is still never pushed.
+//! `[policy] claims = "remote"`; the ticket ref is still never pushed. Since
+//! OWL-642 a break of the base has a repair claim there too,
+//! `refs/owlshift/repairs/<key>`, whose tree holds [`REPAIR_CLAIM_FILE`].
 
 use std::collections::BTreeMap;
 use std::num::NonZeroU32;
@@ -29,7 +31,8 @@ use crate::brief::{
 };
 use crate::format::{
     self, CLAIM_FORMAT, CLAIM_LOST_FORMAT, CLAIMED_FORMAT, COST_FORMAT, ContractError,
-    DELIVERY_FORMAT, Format, HELD_FORMAT, QUESTIONS_FORMAT, SESSION_FORMAT, TICKET_STATE_FORMAT,
+    DELIVERY_FORMAT, Format, HELD_FORMAT, QUESTIONS_FORMAT, REPAIR_CLAIM_FORMAT, SESSION_FORMAT,
+    TICKET_STATE_FORMAT,
 };
 use crate::ids::{QuestionId, SessionId, TicketId, check_name, is_commit_id, is_lower_hex};
 use crate::result::{
@@ -43,9 +46,14 @@ pub const REF_NAMESPACE: &str = "refs/owlshift/";
 pub const CLAIMS_PREFIX: &str = "refs/owlshift/claims/";
 /// The prefix of ticket refs.
 pub const TICKETS_PREFIX: &str = "refs/owlshift/tickets/";
+/// The prefix of the repair claim refs of a broken base (OWL-642).
+pub const REPAIRS_PREFIX: &str = "refs/owlshift/repairs/";
 
 /// The lease, in a claim ref's tree.
 pub const CLAIM_FILE: &str = "claim.json";
+/// A break's repair claim, in a repair claim ref's tree (OWL-642,
+/// [`RepairClaim`]).
+pub const REPAIR_CLAIM_FILE: &str = "repair.json";
 /// The ticket's state, in a ticket ref's tree.
 pub const STATE_FILE: &str = "state.json";
 /// The plan, in a ticket ref's tree once a design run returned one
@@ -333,6 +341,94 @@ impl TicketClaimLost {
 
     pub fn render(&self) -> String {
         format::render_json(self)
+    }
+}
+
+/// The repair claim ref of a break of the base (OWL-642):
+/// `refs/owlshift/repairs/<key>`, `key` being the runner's name of the
+/// failing step and command.
+pub fn repair_claim_ref(key: &str) -> String {
+    format!("{REPAIRS_PREFIX}{key}")
+}
+
+/// Which runner files the repair of a break of the base, and which repair it
+/// filed (OWL-642; architecture section 5, "The repair ticket", "Not
+/// twice"): the content of `repair.json` on the break's repair claim ref,
+/// [`repair_claim_ref`], a commit without a parent on `origin`, under
+/// `[policy] claims = "remote"`. It publishes the runner's identifier, its
+/// operator, a time, a ticket identifier and a count; never the failing
+/// command or its output.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+#[schemars(title = "Owlshift repair claim")]
+pub struct RepairClaim {
+    pub format: Format<REPAIR_CLAIM_FORMAT>,
+    /// The filing runner's identifier: 16 lowercase hexadecimal digits.
+    #[schemars(regex(pattern = r"^[0-9a-f]{16}$"))]
+    pub runner: String,
+    /// The filing runner's operator: their handle in the project's
+    /// `[people]`, else their tracker account.
+    pub operator: String,
+    /// When the runner took the claim to file.
+    pub claimed_at: Timestamp,
+    /// The repair filed; none while it is being filed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ticket: Option<TicketId>,
+    /// The repairs the break filed, as the filing runner counted them, this
+    /// one included, so at least 1: what bounds a break's repairs across
+    /// runners.
+    #[schemars(range(min = 1))]
+    pub repairs: u32,
+}
+
+impl RepairClaim {
+    const CONTRACT: &str = "repair claim";
+
+    pub fn parse(input: &str) -> Result<Self, ContractError> {
+        if input.len() > MAX_CLAIM_BYTES {
+            return Err(ContractError::invalid(
+                Self::CONTRACT,
+                format!(
+                    "holds {} bytes, past the {MAX_CLAIM_BYTES} a claim may hold",
+                    input.len()
+                ),
+            ));
+        }
+        let claim: Self = format::parse_json(Self::CONTRACT, REPAIR_CLAIM_FORMAT, input)?;
+        claim
+            .check()
+            .map_err(|reason| ContractError::invalid(Self::CONTRACT, reason))?;
+        Ok(claim)
+    }
+
+    pub fn render(&self) -> String {
+        format::render_json(self)
+    }
+
+    /// The rules beyond its shape: a runner's identifier, an operator a
+    /// person can read, and a count that includes the repair it names or
+    /// files.
+    pub fn check(&self) -> Result<(), String> {
+        if !is_lower_hex(&self.runner, 16) {
+            return Err(format!(
+                "runner {:?} is not 16 lowercase hexadecimal digits",
+                self.runner
+            ));
+        }
+        if self.repairs == 0 {
+            return Err(
+                "repairs is 0, though it counts the repair the claim names or files".to_owned(),
+            );
+        }
+        if let Err(broken) = check_name(&self.operator) {
+            return Err(format!("operator {:?} {broken}", self.operator));
+        }
+        if self.operator.chars().count() > MAX_OPERATOR_CHARS {
+            return Err(format!(
+                "operator holds more than {MAX_OPERATOR_CHARS} characters"
+            ));
+        }
+        Ok(())
     }
 }
 

@@ -23,8 +23,8 @@ const TEAM: &str = "claims = \"remote\"\n\
                     [people.lea]\ntracker = \"lea\"\nforge = \"lea-martin\"\n";
 
 /// One runner of the team: what differs between two machines.
-struct Runner {
-    data: PathBuf,
+pub(super) struct Runner {
+    pub(super) data: PathBuf,
     operator: String,
     takes: Taking,
     notified: Notified,
@@ -35,7 +35,7 @@ impl Bench {
     /// The team's project: `[people]` lists the maintainer and lea, either
     /// of whom admits with the label `agent`, and tickets are claimed on the
     /// remote, seeded so a runner reads both at its base.
-    fn team() -> Self {
+    pub(super) fn team() -> Self {
         Bench::build_admitting(
             "maintainer",
             "assignee = \"maintainer\"\nlabels = [\"agent\"]\n",
@@ -47,7 +47,7 @@ impl Bench {
 
     /// `operator`'s runner, taking `takes`, with a data directory of its
     /// own.
-    fn seat(&self, operator: &str, takes: Taking) -> Runner {
+    pub(super) fn seat(&self, operator: &str, takes: Taking) -> Runner {
         let data = self.tmp.path().join(format!("{operator}-machine"));
         Runner {
             usage: data.join("usage"),
@@ -61,7 +61,7 @@ impl Bench {
     /// `act` on this bench as `seat`'s runner: its commands read and write
     /// that runner's data directory, as its operator. `act` must use the
     /// bench it is given.
-    fn playing<R>(&mut self, seat: &mut Runner, act: impl FnOnce(&Self) -> R) -> R {
+    pub(super) fn playing<R>(&mut self, seat: &mut Runner, act: impl FnOnce(&Self) -> R) -> R {
         self.swap_seat(seat);
         let acted = act(self);
         self.swap_seat(seat);
@@ -79,7 +79,7 @@ impl Bench {
     /// The ticket `id`, labelled `agent` in the ready column, admitted by
     /// `admitter` (the Markdown tracker's gesture is its author's) and
     /// decided by `assignee`.
-    fn team_ticket(&self, id: &str, admitter: &str, assignee: &str) {
+    pub(super) fn team_ticket(&self, id: &str, admitter: &str, assignee: &str) {
         self.put_ticket(id, admitter, "Todo", &["agent"], "", "Add a greeting.");
         let file = self
             .remote

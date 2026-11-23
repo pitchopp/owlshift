@@ -10,8 +10,8 @@ use crate::drain::{TicketHandback, TicketIntake, TicketProposals};
 use crate::event::Event;
 use crate::ready::ReadySnapshot;
 use crate::refs::{
-    Claim, PersistedState, TicketClaimLost, TicketClaimed, TicketCost, TicketDelivery, TicketHeld,
-    TicketQuestions, TicketSession,
+    Claim, PersistedState, RepairClaim, TicketClaimLost, TicketClaimed, TicketCost, TicketDelivery,
+    TicketHeld, TicketQuestions, TicketSession,
 };
 use crate::result::RunResult;
 use crate::review::{TicketPlan, TicketReview};
@@ -54,6 +54,7 @@ pub fn all() -> Vec<(&'static str, Schema)> {
         ("ticket-not-mine", schema::<TicketNotMine>()),
         ("ticket-claimed", schema::<TicketClaimed>()),
         ("ticket-claim-lost", schema::<TicketClaimLost>()),
+        ("repair-claim", schema::<RepairClaim>()),
         ("ticket-run", schema::<TicketRun>()),
         ("run-obligation", schema::<RunObligation>()),
         ("step-outside", schema::<StepOutside>()),

@@ -331,19 +331,30 @@ pub fn repair_title(commit: &str, failing: &Failing) -> String {
 /// again by, on this machine or a colleague's: the commit and the failing
 /// command's step and hash.
 pub fn repair_marker(commit: &str, failing: &Failing) -> String {
+    format!(
+        "[owlshift] REPAIR · {} · {} {}",
+        short(commit),
+        step_name(failing.step),
+        command_hash(failing)
+    )
+}
+
+/// The name of the break of `failing` among its project's repair claims
+/// (OWL-642): its step and the marker's hash of its command, as
+/// `setup-0123456789ab`, whatever commit it fails at.
+pub fn repair_key(failing: &Failing) -> String {
+    format!("{}-{}", step_name(failing.step), command_hash(failing))
+}
+
+/// The first 6 bytes of the SHA-256 of the failing command, in hexadecimal.
+fn command_hash(failing: &Failing) -> String {
     let mut hash = Sha256::new();
     hash.update(failing.command.as_bytes());
-    let command: String = hash
-        .finalize()
+    hash.finalize()
         .iter()
         .take(6)
         .map(|byte| format!("{byte:02x}"))
-        .collect();
-    format!(
-        "[owlshift] REPAIR · {} · {} {command}",
-        short(commit),
-        step_name(failing.step)
-    )
+        .collect()
 }
 
 /// `text` in a fenced block no line of it can close: the fence is one
