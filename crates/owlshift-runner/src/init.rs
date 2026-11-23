@@ -588,17 +588,24 @@ pub fn home_managers(var: impl Fn(&str) -> Option<OsString>) -> Vec<HomeManager>
         let Some(Ok(folder)) = folder.filter(|f| f.is_dir()).map(|f| f.canonicalize()) else {
             continue;
         };
+        // Joined with `/` whatever the platform, as `caches` and
+        // `allow_caches` write folders.
         let Some(relative) = folder
             .strip_prefix(&home)
             .ok()
-            .and_then(|r| r.to_str())
+            .and_then(|r| {
+                r.components()
+                    .map(|c| c.as_os_str().to_str())
+                    .collect::<Option<Vec<_>>>()
+            })
+            .map(|parts| parts.join("/"))
             .filter(|r| !r.is_empty())
         else {
             continue;
         };
         found.push(HomeManager {
             name: spec.name.to_owned(),
-            folder: relative.to_owned(),
+            folder: relative,
         });
     }
     found
