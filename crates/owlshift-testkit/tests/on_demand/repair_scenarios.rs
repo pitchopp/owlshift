@@ -6,8 +6,10 @@
 //! is told on the ticket. OWL-639's: a repair merged with the base still
 //! failing is followed by one more, then by a person.
 
+use owlshift_contracts::refs::{REPAIRS_PREFIX, RepairClaim, repair_claim_ref};
 use owlshift_core::base::{Failing, Repair, Step};
 use owlshift_runner::base;
+use owlshift_runner::operator::Taking;
 
 use super::base_scenarios::{
     REBASED_HELD, agent_git, builds, checks_made, fixable_setup, held_done_build, held_rebases,
@@ -297,6 +299,12 @@ fn a_broken_base_files_its_repair_which_runs_first_and_frees_the_held_builds() {
             .iter()
             .any(|(commit, _, verdict)| *commit == merged && verdict == "passed"),
         "{checks:?}"
+    );
+    // Claims local: no break's repair claim pushed (OWL-642).
+    assert!(
+        !bench.owlshift_refs().contains(REPAIRS_PREFIX),
+        "{}",
+        bench.owlshift_refs()
     );
     let rebased: Vec<(Value, Value)> = held_rebases(&bench)
         .into_iter()
@@ -635,4 +643,240 @@ fn a_continued_ticket_with_no_commits_of_its_own_checks_the_head_and_holds_it() 
         Some(Repair::Filed { ticket, .. }) if ticket == "DEMO-7"
     ));
     assert_eq!(bench.briefs().len(), runs, "no run while held");
+}
+
+/// The setup command a broken store fails, as a hold names it.
+fn store_failing(marker: &Path) -> Failing {
+    Failing {
+        step: Step::Setup,
+        command: setup_line(marker),
+    }
+}
+
+/// The repair claim the bare remote holds for the break of `failing`
+/// (OWL-642), if any.
+fn repair_claim(bench: &Bench, failing: &Failing) -> Option<RepairClaim> {
+    let file = format!(
+        "{}:repair.json",
+        repair_claim_ref(&base::repair_key(failing))
+    );
+    let text = bench.env.run(&bench.remote.bare, &["show", &file]).ok()?;
+    Some(RepairClaim::parse(&String::from_utf8(text).unwrap()).unwrap())
+}
+
+/// `claim` pushed to the bare remote as the break of `failing`'s repair
+/// claim, as a colleague's runner left it (OWL-642).
+fn colleagues_claim(bench: &Bench, failing: &Failing, claim: &RepairClaim) {
+    let dir = bench.tmp.path().join("colleague");
+    fs::create_dir(&dir).unwrap();
+    fs::write(dir.join("repair.json"), claim.render()).unwrap();
+    for args in [
+        &["init", "--quiet"][..],
+        &["add", "repair.json"],
+        &["commit", "--quiet", "-m", "A colleague's repair claim"],
+    ] {
+        bench.env.run(&dir, args).unwrap();
+    }
+    let target = format!("HEAD:{}", repair_claim_ref(&base::repair_key(failing)));
+    let bare = bench.remote.bare.to_string_lossy().into_owned();
+    bench
+        .env
+        .run(&dir, &["push", "--quiet", &bare, &target])
+        .unwrap();
+}
+
+/// The repair tickets the Markdown tracker holds.
+fn repairs_filed(bench: &Bench) -> Vec<String> {
+    let mut filed: Vec<String> = fs::read_dir(bench.remote.checkout.join("tickets"))
+        .unwrap()
+        .filter_map(|entry| {
+            let folder = entry.unwrap().path();
+            let text = fs::read_to_string(folder.join("ticket.md")).ok()?;
+            text.contains("Repair the base:")
+                .then(|| folder.file_name().unwrap().to_string_lossy().into_owned())
+        })
+        .collect();
+    filed.sort();
+    filed
+}
+
+/// OWL-642's acceptance: two runners of a team (`claims = "remote"`),
+/// each holding a ticket of its own at one broken commit, file within the
+/// tracker's lag: the bench's search never shows a Markdown repair, as
+/// GitHub's lists and search do not for 6 to 8 s after a filing. The
+/// maintainer's runner files the repair and names it in the break's claim
+/// on origin; lea's, whose search finds nothing, reads the claim and takes
+/// that repair again. One repair; one claim, naming it. DEMO-1's ticket
+/// claim, which holds the whole repository (`do` runs no intake), is
+/// released between the two, as `owlshift release` does, so that lea's
+/// Build reaches its gate.
+#[test]
+fn two_runners_holding_one_break_within_the_lag_file_one_repair() {
+    let mut bench = Bench::team();
+    bench.team_ticket("DEMO-2", "lea", "lea");
+    let marker = bench.tmp.path().join("store-has-rollup");
+    let held = with_setup(&bench, &setup_line(&marker), None);
+    let mut maintainer = bench.seat("maintainer", Taking::All);
+    let mut lea = bench.seat("lea", Taking::All);
+    bench.playing(&mut maintainer, |b| {
+        let (outcome, printed) = b.run(Vec::new(), None);
+        assert!(held_at(&outcome, &held), "{outcome:?}\n{printed}");
+        let kept = repairs_kept(b);
+        assert_eq!((kept.len(), &kept[0]["reused"]), (1, &json!(false)));
+    });
+    let demo_1 = owlshift_contracts::refs::claim_ref(&ticket());
+    bench
+        .env
+        .run(&bench.remote.bare, &["update-ref", "-d", &demo_1])
+        .unwrap();
+    bench.playing(&mut lea, |b| {
+        let demo_2 = TicketId::new("DEMO-2").unwrap();
+        let (outcome, printed) =
+            b.with_on_demand(Vec::new(), None, Vec::new(), |on_demand, sink| {
+                on_demand.run(&demo_2, sink)
+            });
+        assert!(held_at(&outcome, &held), "{outcome:?}\n{printed}");
+        let kept = repairs_kept(b);
+        assert_eq!(
+            (kept.len(), &kept[0]["ticket"], &kept[0]["reused"]),
+            (1, &json!(REPAIR), &json!(true)),
+            "{printed}"
+        );
+        assert!(matches!(
+            kept_repair(b, &held),
+            Some(Repair::Filed { ticket, .. }) if ticket == REPAIR
+        ));
+    });
+    assert_eq!(repairs_filed(&bench), [REPAIR]);
+    let claim = repair_claim(&bench, &store_failing(&marker)).unwrap();
+    assert_eq!(
+        (
+            claim.ticket.as_ref().map(TicketId::as_str),
+            claim.repairs,
+            claim.operator.as_str()
+        ),
+        (Some(REPAIR), 1, "maintainer")
+    );
+    assert_eq!(
+        claim.runner,
+        claims::runner_id(&maintainer.data).unwrap().as_str()
+    );
+}
+
+/// OWL-642: a colleague's repair claim naming no repair yet is a filing
+/// under way. The hold files nothing, stays untried and says so in a
+/// `repair_claimed` decision; once the claim's lease has run, the next step
+/// takes it over, files the repair and names it there, counting the
+/// colleague's filing among the break's repairs.
+#[test]
+fn a_colleagues_claim_naming_no_repair_holds_the_filing_until_its_lease_ends() {
+    let bench = Bench::team();
+    let marker = bench.tmp.path().join("store-has-rollup");
+    let held = with_setup(&bench, &setup_line(&marker), None);
+    let failing = store_failing(&marker);
+    let theirs = RepairClaim {
+        format: owlshift_contracts::format::Format,
+        runner: "0123456789abcdef".to_owned(),
+        operator: "lea".to_owned(),
+        claimed_at: bench.clock.get(),
+        ticket: None,
+        repairs: 1,
+    };
+    colleagues_claim(&bench, &failing, &theirs);
+    let (outcome, printed) = bench.run(Vec::new(), None);
+    assert!(held_at(&outcome, &held), "{outcome:?}\n{printed}");
+    assert_eq!(kept_repair(&bench, &held), None, "untried");
+    assert!(repairs_kept(&bench).is_empty());
+    assert!(repairs_filed(&bench).is_empty());
+    assert!(warned(&bench, "repair_unfiled").is_empty());
+    let claimed: Vec<Value> = data_of(&bench.events(), EventKind::Decision, "base")
+        .into_iter()
+        .filter(|data| data["base"] == json!("repair_claimed"))
+        .collect();
+    assert_eq!(
+        (claimed.len(), &claimed[0]["operator"]),
+        (1, &json!("lea")),
+        "{claimed:?}"
+    );
+    assert_eq!(repair_claim(&bench, &failing), Some(theirs));
+
+    let later = bench.clock.get().checked_add(SignedDuration::from_mins(16));
+    bench.clock.set(later.unwrap());
+    let (again, printed) = bench.continue_ticket(Vec::new());
+    assert!(held_at(&again, &held), "{again:?}\n{printed}");
+    let filed = repairs_filed(&bench);
+    assert_eq!(filed.len(), 1, "{printed}");
+    assert!(matches!(
+        kept_repair(&bench, &held),
+        Some(Repair::Filed { ticket, .. }) if ticket == filed[0]
+    ));
+    let ours = repair_claim(&bench, &failing).unwrap();
+    assert_eq!(
+        (ours.ticket.as_ref().map(TicketId::as_str), ours.repairs),
+        (Some(filed[0].as_str()), 2)
+    );
+    assert_eq!(
+        ours.runner,
+        claims::runner_id(&bench.data).unwrap().as_str()
+    );
+}
+
+/// OWL-642: a repair is filed only once none is known to stand. A search
+/// that fails files nothing, nor does a break's repair claim that origin
+/// refuses (a ref under its name holds the place); each leaves the hold
+/// untried with a `repair_unfiled` warning, and the step after them files.
+#[test]
+fn a_failed_search_or_claim_files_nothing_until_both_answer() {
+    let bench = Bench::team();
+    bench.inbox.borrow_mut().fail_search = Some("search rate limit exceeded");
+    let marker = bench.tmp.path().join("store-has-rollup");
+    let held = with_setup(&bench, &setup_line(&marker), None);
+    let (outcome, printed) = bench.run(Vec::new(), None);
+    assert!(held_at(&outcome, &held), "{outcome:?}\n{printed}");
+    assert_eq!(kept_repair(&bench, &held), None, "untried");
+    assert!(repairs_filed(&bench).is_empty());
+    let unfiled = warned(&bench, "repair_unfiled");
+    assert!(
+        unfiled.len() == 1
+            && unfiled[0]["reason"]
+                .as_str()
+                .unwrap()
+                .contains("search rate limit exceeded"),
+        "{unfiled:?}"
+    );
+
+    bench.inbox.borrow_mut().fail_search = None;
+    let in_the_way = format!(
+        "{}/x",
+        repair_claim_ref(&base::repair_key(&store_failing(&marker)))
+    );
+    bench
+        .env
+        .run(&bench.remote.bare, &["update-ref", &in_the_way, &held])
+        .unwrap();
+    let (again, printed) = bench.continue_ticket(Vec::new());
+    assert!(held_at(&again, &held), "{again:?}\n{printed}");
+    assert_eq!(kept_repair(&bench, &held), None, "untried");
+    assert!(repairs_filed(&bench).is_empty());
+    let unfiled = warned(&bench, "repair_unfiled");
+    assert!(
+        unfiled.len() == 2
+            && unfiled[1]["reason"]
+                .as_str()
+                .unwrap()
+                .contains("so no repair is filed"),
+        "{unfiled:?}"
+    );
+
+    bench
+        .env
+        .run(&bench.remote.bare, &["update-ref", "-d", &in_the_way])
+        .unwrap();
+    let (last, printed) = bench.continue_ticket(Vec::new());
+    assert!(held_at(&last, &held), "{last:?}\n{printed}");
+    assert_eq!(repairs_filed(&bench).len(), 1, "{printed}");
+    assert!(matches!(
+        kept_repair(&bench, &held),
+        Some(Repair::Filed { .. })
+    ));
 }

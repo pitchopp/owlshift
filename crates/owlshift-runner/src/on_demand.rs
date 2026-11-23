@@ -3207,6 +3207,21 @@ impl OnDemand<'_> {
         self.take_claim(p, sink)
     }
 
+    /// Who this machine claims as, and the name a claim gives its operator:
+    /// their handle in `file`'s `[people]`, else their tracker account
+    /// (OWL-586); a break's repair claim names them the same (OWL-642).
+    fn claim_identity(
+        &self,
+        file: Option<&ProjectConfig>,
+    ) -> Result<(ClaimIdentity, String), String> {
+        let identity = (self.claimant)()?;
+        let operator = file
+            .and_then(|file| file.handle_of(&identity.account))
+            .unwrap_or(&identity.account)
+            .to_owned();
+        Ok((identity, operator))
+    }
+
     /// Takes the claim of `p`'s ticket on the git remote under
     /// `policy.claims = "remote"`, read at the base the command fetched
     /// (OWL-586; build plan "Claims", "Who holds it works the ticket"):
@@ -3228,18 +3243,13 @@ impl OnDemand<'_> {
         {
             return Ok(());
         }
-        let identity = (self.claimant)().map_err(|why| {
+        let (identity, operator) = self.claim_identity(file.as_ref()).map_err(|why| {
             Stop::Refused(format!(
                 "this project claims its tickets on the git remote (`policy.claims = \"remote\"` \
                  at {}), and a claim names this machine's operator, who cannot be read: {why}",
                 p.base.remote_ref
             ))
         })?;
-        let operator = file
-            .as_ref()
-            .and_then(|file| file.handle_of(&identity.account))
-            .unwrap_or(&identity.account)
-            .to_owned();
         // The branch refuses a new take only when this runner never pushed
         // it: its ticket ref keeps no delivery.
         let pushed = p

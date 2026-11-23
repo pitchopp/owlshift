@@ -54,6 +54,8 @@ use crate::executor::Git;
 use crate::project::{self, ProjectDirs};
 use crate::step::write_atomically;
 
+pub mod repair;
+
 /// This install's runner identifier, at the data directory's root.
 pub const RUNNER_FILE: &str = "runner";
 /// The record of a ticket's claim this runner last pushed, in its folder.
@@ -1180,14 +1182,33 @@ fn make_commit(
     ticket: &TicketId,
     claim: &Claim,
 ) -> Result<CommitId, String> {
-    let blob = crate::ticket_ref::blob(git, checkout, claim.render().as_bytes())?;
+    let message = format!("{ticket}: claimed by runner {}", claim.runner);
+    commit_file(
+        git,
+        checkout,
+        CLAIM_FILE,
+        claim.render().as_bytes(),
+        &message,
+    )
+}
+
+/// A commit without a parent whose tree holds `file` alone, with `bytes`,
+/// made in `checkout` and moving no ref there: a claim's, a ticket's or a
+/// break's repair's (OWL-642).
+fn commit_file(
+    git: &Git,
+    checkout: &Path,
+    file: &str,
+    bytes: &[u8],
+    message: &str,
+) -> Result<CommitId, String> {
+    let blob = crate::ticket_ref::blob(git, checkout, bytes)?;
     let tree = crate::ticket_ref::with_input(
         git,
         checkout,
         &["mktree", "-z"],
-        format!("100644 blob {blob}\t{CLAIM_FILE}\0").as_bytes(),
+        format!("100644 blob {blob}\t{file}\0").as_bytes(),
     )?;
-    let message = format!("{ticket}: claimed by runner {}", claim.runner);
     let commit = git
         .run(
             checkout,
@@ -1200,7 +1221,7 @@ fn make_commit(
                 "--no-gpg-sign",
                 &tree,
                 "-m",
-                &message,
+                message,
             ],
         )
         .map_err(|e| e.to_string())?;
@@ -1250,7 +1271,39 @@ fn fetch_claim(
     ticket: &TicketId,
 ) -> Result<(String, Result<Claim, ClaimUnread>), String> {
     let fetched = format!("{FETCHED_PREFIX}{ticket}");
-    let refspec = format!("+{}:{fetched}", claim_ref(ticket));
+    let (commit, text) = fetch_file(
+        git,
+        checkout,
+        (&claim_ref(ticket), &fetched),
+        CLAIM_FILE,
+        &format!("{ticket}'s claim"),
+    )?;
+    let claim = text.and_then(|text| Claim::parse(&text).map_err(unread_claim));
+    Ok((commit, claim))
+}
+
+/// Why a claim's text does not read as its contract: a later format among
+/// the reasons, which an upgrade reads.
+fn unread_claim(error: ContractError) -> ClaimUnread {
+    ClaimUnread {
+        newer: matches!(error, ContractError::NewerFormat { .. }),
+        reason: error.to_string(),
+    }
+}
+
+/// Fetches `remote` of `origin` to `local`, a ref under `refs/remotes/`,
+/// and reads `file` in the commit the fetch left there: that commit, and
+/// the file's text or why it holds none to read (past [`MAX_CLAIM_BYTES`]
+/// among the reasons). `what` names the claim in an error. A fetch that
+/// failed tells nothing: an error.
+fn fetch_file(
+    git: &Git,
+    checkout: &Path,
+    (remote, local): (&str, &str),
+    file: &str,
+    what: &str,
+) -> Result<(String, Result<String, ClaimUnread>), String> {
+    let refspec = format!("+{remote}:{local}");
     let out = git
         .output(
             checkout,
@@ -1264,47 +1317,44 @@ fn fetch_claim(
             ],
             None,
         )
-        .map_err(|e| format!("reading {ticket}'s claim on {REMOTE}: {e}"))?;
+        .map_err(|e| format!("reading {what} on {REMOTE}: {e}"))?;
     if !out.success() {
         let stderr = String::from_utf8_lossy(&out.stderr);
         let last = stderr.lines().rev().find(|line| !line.trim().is_empty());
         return Err(format!(
-            "reading {ticket}'s claim on {REMOTE}: git fetch failed: {}",
+            "reading {what} on {REMOTE}: git fetch failed: {}",
             last.unwrap_or("no error output").trim()
         ));
     }
     let commit = git
         .run(
             checkout,
-            &["rev-parse", "--verify", &format!("{fetched}^{{commit}}")],
+            &["rev-parse", "--verify", &format!("{local}^{{commit}}")],
         )
-        .map_err(|e| format!("reading {ticket}'s claim on {REMOTE}: {e}"))?;
+        .map_err(|e| format!("reading {what} on {REMOTE}: {e}"))?;
     let commit = String::from_utf8_lossy(&commit).trim().to_owned();
-    let file = format!("{commit}:{CLAIM_FILE}");
+    let path = format!("{commit}:{file}");
     let unread = |reason: String| ClaimUnread {
         reason,
         newer: false,
     };
     let size = git
-        .run(checkout, &["cat-file", "-s", &file])
+        .run(checkout, &["cat-file", "-s", &path])
         .ok()
         .and_then(|size| String::from_utf8_lossy(&size).trim().parse::<usize>().ok());
-    let claim = match size {
-        None => Err(unread(format!("its commit holds no {CLAIM_FILE}"))),
+    let text = match size {
+        None => Err(unread(format!("its commit holds no {file}"))),
         Some(size) if size > MAX_CLAIM_BYTES => Err(unread(format!(
-            "its {CLAIM_FILE} holds {size} bytes, past the {MAX_CLAIM_BYTES} a claim may hold"
+            "its {file} holds {size} bytes, past the {MAX_CLAIM_BYTES} a claim may hold"
         ))),
         Some(_) => {
             let text = git
-                .run(checkout, &["cat-file", "blob", &file])
+                .run(checkout, &["cat-file", "blob", &path])
                 .map_err(|e| e.to_string())?;
-            Claim::parse(&String::from_utf8_lossy(&text)).map_err(|error| ClaimUnread {
-                newer: matches!(error, ContractError::NewerFormat { .. }),
-                reason: error.to_string(),
-            })
+            Ok(String::from_utf8_lossy(&text).into_owned())
         }
     };
-    Ok((commit, claim))
+    Ok((commit, text))
 }
 
 /// Who holds the claim of `ticket` on `origin` now, when it reads.

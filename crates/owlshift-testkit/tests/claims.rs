@@ -11,8 +11,10 @@ use std::time::SystemTime;
 use jiff::Timestamp;
 
 use owlshift_adapters::forge::Repo;
+use owlshift_contracts::format::Format;
 use owlshift_contracts::ids::TicketId;
-use owlshift_contracts::refs::{Claim, ClaimHeld, claim_ref};
+use owlshift_contracts::refs::{Claim, ClaimHeld, RepairClaim, claim_ref, repair_claim_ref};
+use owlshift_runner::claims::repair::{self, Pushed};
 use owlshift_runner::claims::{self, Checked, ClaimsAt, Deleted, NotTaken, RunnerId, Took};
 use owlshift_runner::executor::Git;
 use owlshift_runner::project::{self, ProjectDirs};
@@ -424,4 +426,104 @@ fn a_take_reads_back_what_a_crash_or_another_machine_left() {
         })
     );
     assert_eq!(bench.remote_ref(&claim_ref(&one)), None);
+}
+
+/// OWL-642: a break's repair claim, as two runners push it. A take creates
+/// it only while it is absent; a replacement and a naming land only on the
+/// commit read; a give-back deletes it, leased on the take; a claim of a
+/// later format reads as one to upgrade for. No local ref moves.
+#[test]
+fn a_repair_claim_is_created_once_and_moved_only_from_the_commit_read() {
+    let bench = Bench::new();
+    let ann = bench.runner("ann", "ann");
+    let bob = bench.runner("bob", "bob");
+    const KEY: &str = "setup-0123456789ab";
+    let before = ann.local_refs();
+    let filing = |runner: &Runner| RepairClaim {
+        format: Format,
+        runner: runner.id.as_str().to_owned(),
+        operator: runner.operator.to_owned(),
+        claimed_at: Timestamp::now(),
+        ticket: None,
+        repairs: 1,
+    };
+    assert_eq!(repair::read(ann.at(), KEY), Ok(None));
+    let Ok(Pushed::Landed(taken)) = repair::push_claim(ann.at(), KEY, &filing(&ann), None) else {
+        panic!("the first take lands");
+    };
+    assert_eq!(
+        repair::push_claim(bob.at(), KEY, &filing(&bob), None),
+        Ok(Pushed::Refused),
+        "a second take is refused"
+    );
+    let read = repair::read(bob.at(), KEY).unwrap().unwrap();
+    assert_eq!(read.commit, taken.as_str());
+    assert_eq!(read.claim.unwrap().runner, ann.id.as_str());
+
+    // Named, leased on the take; a replacement from the take is then stale.
+    let named = RepairClaim {
+        ticket: Some(ticket("OWL-9")),
+        ..filing(&ann)
+    };
+    let Ok(Pushed::Landed(naming)) =
+        repair::push_claim(ann.at(), KEY, &named, Some(taken.as_str()))
+    else {
+        panic!("the naming lands");
+    };
+    assert_eq!(
+        repair::push_claim(bob.at(), KEY, &filing(&bob), Some(taken.as_str())),
+        Ok(Pushed::Refused)
+    );
+    let read = repair::read(bob.at(), KEY).unwrap().unwrap();
+    assert_eq!(read.claim.unwrap().ticket, Some(ticket("OWL-9")));
+
+    // Replaced from the commit read, then given back as it was.
+    let Ok(Pushed::Landed(replaced)) =
+        repair::push_claim(bob.at(), KEY, &filing(&bob), Some(naming.as_str()))
+    else {
+        panic!("the replacement lands");
+    };
+    assert_eq!(
+        repair::give_back(bob.at(), KEY, &replaced, Some(naming.as_str())),
+        Ok(())
+    );
+    assert_eq!(
+        bench.remote_ref(&repair_claim_ref(KEY)).as_deref(),
+        Some(naming.as_str())
+    );
+    assert!(repair::give_back(ann.at(), KEY, &taken, None).is_err());
+    assert_eq!(repair::give_back(ann.at(), KEY, &naming, None), Ok(()));
+    assert_eq!(bench.remote_ref(&repair_claim_ref(KEY)), None);
+
+    // Of a later format: read, and said to need an upgrade.
+    let newer = filing(&ann)
+        .render()
+        .replacen("\"format\": 1", "\"format\": 2", 1);
+    assert!(newer.contains("\"format\": 2"), "{newer}");
+    let dir = bench.root.path().join("newer");
+    fs::create_dir(&dir).unwrap();
+    fs::write(dir.join("repair.json"), newer).unwrap();
+    for args in [
+        &["init", "--quiet"][..],
+        &["add", "repair.json"],
+        &["commit", "--quiet", "-m", "A newer claim"],
+    ] {
+        bench.env.run(&dir, args).unwrap();
+    }
+    let target = format!("HEAD:{}", repair_claim_ref(KEY));
+    bench
+        .env
+        .run(
+            &dir,
+            &[
+                "push",
+                "--quiet",
+                &bench.remote.bare.to_string_lossy(),
+                &target,
+            ],
+        )
+        .unwrap();
+    let read = repair::read(ann.at(), KEY).unwrap().unwrap();
+    assert!(read.claim.is_err_and(|unread| unread.newer));
+    assert_eq!(ann.local_refs(), before, "no local ref moved");
 }

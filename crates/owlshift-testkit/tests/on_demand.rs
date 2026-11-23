@@ -936,6 +936,9 @@ struct FakeInbox {
     assigned: Vec<(TicketId, Option<String>)>,
     /// Every filing is refused with this.
     refuse: Option<&'static str>,
+    /// Every search for a proposal or a repair already filed fails with
+    /// this, the Markdown tracker's own included (OWL-642).
+    fail_search: Option<&'static str>,
     /// The filings tried, refused or not: a refusal kept again changes
     /// neither the ref nor the events (OWL-501).
     attempts: usize,
@@ -1045,6 +1048,9 @@ impl Tracker for Clocked<'_> {
         title: &str,
         marker: &str,
     ) -> Result<Vec<tracker::Found>, tracker::Error> {
+        if let Some(why) = self.inbox.borrow().fail_search {
+            return Err(tracker::Error::new(tracker::ErrorKind::Other, why));
+        }
         if self.inbox.borrow().markdown {
             return Tracker::proposed(&self.inner, team, title, marker);
         }

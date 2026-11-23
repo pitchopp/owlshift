@@ -29,14 +29,18 @@
 //! next rebase onto the same base to gate that commit alone (OWL-490,
 //! [`WaitAt::Rebase`]). Watch runs no base check.
 
+use owlshift_adapters::forge::CommitId;
 use owlshift_contracts::base::{BaseWait, KeptDone, KeptFailing};
 use owlshift_contracts::config::Admit;
+use owlshift_contracts::refs::{RepairClaim, repair_claim_ref};
 use owlshift_core::base::{
-    After, Before, Entry, Failing, HeldBranch, Leave, Recorded, Repair, Verdict,
+    After, Before, ClaimMove, ClaimSeen, Entry, Failing, HeldBranch, Leave, Recorded, Repair,
+    Verdict, claim_move,
 };
 
 use super::*;
 use crate::base::{self, WaitAt};
+use crate::claims::repair::{self as repair_claim, Pushed};
 use crate::gate_once::{self, GateOnce, Place};
 use crate::notify;
 use crate::ticket_ref::text_sha256;
@@ -134,9 +138,46 @@ impl Onto {
 enum NotKept {
     /// None was filed: tried for this hold, not again until it opens again.
     Unfiled(String),
-    /// An open one was found whose text could not be read: the hold stays
-    /// untried, and its next step tries again.
+    /// Nothing could be known for sure, an open repair found whose text
+    /// does not read, a search, or a repair claim read or pushed, that
+    /// failed: the hold stays untried, and its next step tries again.
     Unread(String),
+    /// The break's repair claim on `origin` names no repair yet, taken
+    /// `since` by `operator`'s runner: a filing under way (OWL-642). The
+    /// hold stays untried, and its next step reads the claim again.
+    Elsewhere { operator: String, since: Timestamp },
+}
+
+/// The break's repair claim a filing took on `origin`, to name the repair
+/// in once filed (OWL-642): leased on `commit`, the one it pushed.
+struct Naming {
+    key: String,
+    commit: CommitId,
+    claim: RepairClaim,
+}
+
+/// What a filing under `policy.claims = "remote"` found in its break's
+/// repair claim (OWL-642).
+enum BreakClaim {
+    /// An open repair it names, taken again.
+    Again(Kept),
+    /// A repair is filed under it, taken or replaced first.
+    Free(Taking),
+}
+
+/// How a filing takes its break's repair claim (OWL-642).
+struct Taking {
+    key: String,
+    /// The commit `origin` holds, which the take is leased on; none when it
+    /// holds no claim, which the take creates.
+    read: Option<String>,
+    /// The repairs the break filed before, counted on both sides.
+    before: usize,
+    /// A closed repair the claim names that this runner's break lacks,
+    /// counted among those before.
+    earlier: Option<String>,
+    runner: String,
+    operator: String,
 }
 
 /// Why a hold's repair is filed ([`OnDemand::file_repair`]).
@@ -161,7 +202,27 @@ struct Kept {
     /// An open one taken again, not filed now.
     reused: bool,
     /// What went wrong once it was filed.
-    problems: Vec<tracker::Error>,
+    problems: Vec<String>,
+    /// A closed repair of the break that its repair claim named and this
+    /// runner's break lacked (OWL-642): kept in the break before this one.
+    earlier: Option<String>,
+    /// The break's repair claim taken to file it, which names it once the
+    /// project's lock is let go (OWL-642).
+    naming: Option<Naming>,
+}
+
+impl Kept {
+    /// `ticket`, an open repair taken again, whose text hashes to `text`.
+    fn again(ticket: TicketId, text: String) -> Self {
+        Self {
+            ticket,
+            text,
+            reused: true,
+            problems: Vec::new(),
+            earlier: None,
+            naming: None,
+        }
+    }
 }
 
 /// What a held Build does about the default branch's newer head (OWL-427).
@@ -1512,16 +1573,21 @@ impl OnDemand<'_> {
         };
         let kept = self.repair_for(p, commit, key, &checks, &failure);
         let (repair, attempt) = match &kept {
-            Ok(kept) => (
-                Some(Repair::Filed {
-                    ticket: kept.ticket.as_str().to_owned(),
-                    text_sha256: kept.text.clone(),
-                }),
-                checks.keep_break_repair(&failure.failing, kept.ticket.as_str()),
-            ),
+            Ok(kept) => {
+                if let Some(earlier) = &kept.earlier {
+                    checks.keep_break_repair(&failure.failing, earlier);
+                }
+                (
+                    Some(Repair::Filed {
+                        ticket: kept.ticket.as_str().to_owned(),
+                        text_sha256: kept.text.clone(),
+                    }),
+                    checks.keep_break_repair(&failure.failing, kept.ticket.as_str()),
+                )
+            }
             Err(NotKept::Unfiled(_)) => (Some(Repair::Unfiled), 0),
             // Kept as never tried: the hold's next step tries again.
-            Err(NotKept::Unread(_)) => (None, 0),
+            Err(NotKept::Unread(_) | NotKept::Elsewhere { .. }) => (None, 0),
         };
         let written = match repair {
             Some(repair) => {
@@ -1535,9 +1601,13 @@ impl OnDemand<'_> {
             Ok(Kept {
                 ticket,
                 reused,
-                problems,
+                mut problems,
+                naming,
                 ..
             }) => {
+                if let Some(naming) = naming {
+                    problems.extend(self.name_repair(&naming, &ticket));
+                }
                 sink.emit_project(
                     None,
                     EventKind::Decision,
@@ -1551,7 +1621,7 @@ impl OnDemand<'_> {
                         data([
                             ("what", json!("repair_problem")),
                             ("ticket", json!(ticket)),
-                            ("reason", json!(problem.message)),
+                            ("reason", json!(problem)),
                         ]),
                     );
                 }
@@ -1563,6 +1633,46 @@ impl OnDemand<'_> {
             Err(NotKept::Unfiled(why) | NotKept::Unread(why)) => {
                 self.repair_unfiled(p, commit, &why, sink);
             }
+            Err(NotKept::Elsewhere { operator, since }) => {
+                sink.emit_project(
+                    None,
+                    EventKind::Decision,
+                    data([
+                        ("base", json!("repair_claimed")),
+                        ("commit", json!(commit)),
+                        ("step", json!(base::step_name(failure.failing.step))),
+                        ("command", json!(failure.failing.command)),
+                        ("operator", json!(operator)),
+                        ("since", json!(since)),
+                    ]),
+                );
+            }
+        }
+    }
+
+    /// Names `ticket`, just filed, in the break's repair claim this filing
+    /// took (OWL-642), leased on the commit it pushed, once the project's
+    /// lock is let go: what a colleague's runner takes again. A claim that
+    /// cannot be named is a problem of the filing, never its undoing: the
+    /// claim then names none, a filing under way to every runner for its
+    /// lease.
+    fn name_repair(&self, naming: &Naming, ticket: &TicketId) -> Option<String> {
+        let at = ClaimsAt {
+            git: &self.executor.git,
+            dirs: self.dirs,
+        };
+        let claim = RepairClaim {
+            ticket: Some(ticket.clone()),
+            ..naming.claim.clone()
+        };
+        let name = repair_claim_ref(&naming.key);
+        match repair_claim::push_claim(at, &naming.key, &claim, Some(naming.commit.as_str())) {
+            Ok(Pushed::Landed(_)) => None,
+            Ok(Pushed::Refused) => Some(format!(
+                "{name} on origin moved before it named {ticket}, another runner having taken it \
+                 over"
+            )),
+            Err(why) => Some(format!("{name} on origin does not name {ticket}: {why}")),
         }
     }
 
@@ -1617,12 +1727,7 @@ impl OnDemand<'_> {
                 Err(error) if error.kind == tracker::ErrorKind::NotFound => continue,
                 _ => {
                     let text = text_of(&ticket, kept_text(&ticket))?;
-                    return Ok(Kept {
-                        ticket,
-                        text,
-                        reused: true,
-                        problems: Vec::new(),
-                    });
+                    return Ok(Kept::again(ticket, text));
                 }
             }
         }
@@ -1630,24 +1735,37 @@ impl OnDemand<'_> {
         let marker = base::repair_marker(commit, failing);
         // One a colleague's runner filed for the same break, or this one
         // before its file kept it: found by its title or marker, which a
-        // completed ticket is not.
-        if let Ok(found) =
-            self.tracker
-                .proposed(self.config.tracker.team.as_deref(), &title, &marker)
-            && let Some(found) = found.into_iter().next()
-        {
+        // completed ticket is not. A search that fails files nothing
+        // (OWL-642): what it would have found is not known.
+        let found = self
+            .tracker
+            .proposed(self.config.tracker.team.as_deref(), &title, &marker)
+            .map_err(|error| {
+                NotKept::Unread(format!(
+                    "the search for a repair already filed failed, so none is filed until it \
+                     answers, at the hold's next step: {error}"
+                ))
+            })?;
+        if let Some(found) = found.into_iter().next() {
             let text = text_of(&found.id, None)?;
-            return Ok(Kept {
-                ticket: found.id,
-                text,
-                reused: true,
-                problems: Vec::new(),
-            });
+            return Ok(Kept::again(found.id, text));
         }
+        // Under remote claims, the break's claim on origin says whether a
+        // colleague's runner filed or files it (OWL-642).
+        let mut before = checks.break_repairs(failing).to_vec();
+        let taking = match p.claims {
+            Claims::Remote => match self.break_claim(p, key, failing, checks)? {
+                BreakClaim::Again(kept) => return Ok(kept),
+                BreakClaim::Free(taking) => {
+                    before.extend(taking.earlier.clone());
+                    Some(taking)
+                }
+            },
+            Claims::Local => None,
+        };
         // A break that filed its last repair files none (OWL-639).
-        let before = checks.break_repairs(failing);
-        if checks.break_spent(failing) {
-            return Err(NotKept::Unfiled(base::repairs_spent(before)));
+        if taking.is_none() && checks.break_spent(failing) {
+            return Err(NotKept::Unfiled(base::repairs_spent(&before)));
         }
         let assignee = self.repair_assignee(p).ok_or_else(|| {
             NotKept::Unfiled(
@@ -1665,11 +1783,18 @@ impl OnDemand<'_> {
             since
                 .as_ref()
                 .map(|(passed, commits)| (passed.as_str(), commits.as_slice())),
-            before,
+            &before,
         );
         let label = match &self.config.tracker.admit {
             Admit::Label(label) => Some(label.as_str()),
             Admit::State(_) | Admit::Delegation => None,
+        };
+        let (naming, earlier) = match taking {
+            Some(taking) => {
+                let earlier = taking.earlier.clone();
+                (Some(self.take_break_claim(taking)?), earlier)
+            }
+            None => (None, None),
         };
         let filed = self
             .tracker
@@ -1681,15 +1806,212 @@ impl OnDemand<'_> {
                 label,
                 assignee: Some(&assignee),
             })
-            .map_err(|error| NotKept::Unfiled(format!("the tracker did not file it: {error}")))?;
+            .map_err(|error| {
+                let gave = naming
+                    .as_ref()
+                    .and_then(|(naming, read)| self.give_back_claim(naming, read.as_deref()));
+                NotKept::Unfiled(format!(
+                    "the tracker did not file it: {error}{}",
+                    gave.unwrap_or_default()
+                ))
+            })?;
         // Just filed: what was sent stands for what a failed read cannot give.
         let text = text_of(&filed.id, Some(text_sha256(&title, &description)))?;
         Ok(Kept {
             ticket: filed.id,
             text,
             reused: false,
-            problems: filed.problems,
+            problems: filed
+                .problems
+                .into_iter()
+                .map(|problem| problem.message)
+                .collect(),
+            earlier,
+            naming: naming.map(|(naming, _)| naming),
         })
+    }
+
+    /// What the break of `failing` held at `key`'s commands finds in its
+    /// repair claim on `origin` (OWL-642; architecture section 5, "The repair
+    /// ticket", "Not twice"), the search having found no repair: an open
+    /// repair it names, taken again; a filing under way, which files
+    /// nothing; or the claim to take, created or replaced, with the repairs
+    /// the break filed before. A read that fails, or a claim that does not
+    /// read, files nothing.
+    fn break_claim(
+        &self,
+        p: &Prepared,
+        key: &str,
+        failing: &Failing,
+        checks: &owlshift_core::base::Checks,
+    ) -> Result<BreakClaim, NotKept> {
+        let git = &self.executor.git;
+        let file = project::project_file_at(git, &p.checkout, &p.base).map_err(NotKept::Unread)?;
+        let (identity, operator) = self.claim_identity(file.as_ref()).map_err(|why| {
+            NotKept::Unread(format!(
+                "a repair claim names this machine's operator, who cannot be read: {why}"
+            ))
+        })?;
+        let claim_key = base::repair_key(failing);
+        let name = repair_claim_ref(&claim_key);
+        let at = ClaimsAt {
+            git,
+            dirs: self.dirs,
+        };
+        let read = repair_claim::read(at, &claim_key).map_err(|why| {
+            NotKept::Unread(format!(
+                "{name} could not be read on origin, so no repair is filed until it reads: {why}"
+            ))
+        })?;
+        let claim = match &read {
+            None => None,
+            Some(read) => Some(read.claim.as_ref().map_err(|unread| {
+                let upgrade = if unread.newer {
+                    ", written by a newer Owlshift: upgrade this one"
+                } else {
+                    ""
+                };
+                NotKept::Unread(format!(
+                    "{name} on origin does not read{upgrade}, so no repair is filed: {}",
+                    unread.reason
+                ))
+            })?),
+        };
+        let local = checks.break_repairs(failing);
+        let named = claim.and_then(|claim| claim.ticket.as_ref());
+        // Open as `reusable` reads it: a state the tracker cannot say leaves
+        // it open, and its text's read decides.
+        let open = named.map(|ticket| match self.tracker.state_type(ticket) {
+            Ok(Some(
+                tracker::StateType::Completed
+                | tracker::StateType::Canceled
+                | tracker::StateType::Duplicate,
+            )) => false,
+            Err(error) => error.kind != tracker::ErrorKind::NotFound,
+            Ok(_) => true,
+        });
+        let passed_since =
+            claim.is_some_and(|claim| checks.passed_after(key, claim.claimed_at.as_millisecond()));
+        let seen = claim.map(|claim| ClaimSeen {
+            ticket: named.map(|ticket| (ticket.as_str().to_owned(), open == Some(true))),
+            claimed_ms: claim.claimed_at.as_millisecond(),
+            repairs: claim.repairs,
+        });
+        let now = (self.clock)();
+        // A closed repair the claim counts past this runner's break, which
+        // lacks it: the break's count then comes from the claim.
+        let counted_there = claim.is_some_and(|claim| {
+            !passed_since && usize::try_from(claim.repairs).is_ok_and(|n| n > local.len())
+        });
+        let earlier = named
+            .filter(|ticket| counted_there && !local.iter().any(|kept| kept == ticket.as_str()))
+            .map(|ticket| ticket.as_str().to_owned());
+        match claim_move(
+            seen.as_ref(),
+            now.as_millisecond(),
+            local.len(),
+            passed_since,
+        ) {
+            ClaimMove::TakeAgain(_) => {
+                let ticket = named.cloned().expect("a repair taken again is named");
+                let text = self
+                    .tracker
+                    .ticket(&ticket)
+                    .map(|read| text_sha256(&read.title, &read.description))
+                    .map_err(|error| {
+                        NotKept::Unread(format!(
+                            "{ticket}, the repair {name} names, could not be read: {error}"
+                        ))
+                    })?;
+                Ok(BreakClaim::Again(Kept::again(ticket, text)))
+            }
+            ClaimMove::Wait => {
+                let claim = claim.expect("a filing under way is a claim");
+                Err(NotKept::Elsewhere {
+                    operator: claim.operator.clone(),
+                    since: claim.claimed_at,
+                })
+            }
+            ClaimMove::Spent { .. } => {
+                let mut repairs = local.to_vec();
+                repairs.extend(earlier);
+                Err(NotKept::Unfiled(base::repairs_spent(&repairs)))
+            }
+            ClaimMove::File { before } => Ok(BreakClaim::Free(Taking {
+                key: claim_key,
+                read: read.map(|read| read.commit),
+                before,
+                earlier,
+                runner: identity.runner.as_str().to_owned(),
+                operator,
+            })),
+        }
+    }
+
+    /// Takes the break's repair claim as `taking` found it (OWL-642): created,
+    /// or in place of the commit read, naming no repair yet and counting the
+    /// one about to be filed. The claim to name the repair in once filed,
+    /// with the commit it replaced; a take `origin` refuses is another
+    /// runner's filing under way, or nothing known, and files nothing.
+    fn take_break_claim(&self, taking: Taking) -> Result<(Naming, Option<String>), NotKept> {
+        let at = ClaimsAt {
+            git: &self.executor.git,
+            dirs: self.dirs,
+        };
+        let name = repair_claim_ref(&taking.key);
+        let claim = RepairClaim {
+            format: Format,
+            runner: taking.runner,
+            operator: taking.operator,
+            claimed_at: (self.clock)(),
+            ticket: None,
+            repairs: u32::try_from(taking.before + 1).unwrap_or(u32::MAX),
+        };
+        match repair_claim::push_claim(at, &taking.key, &claim, taking.read.as_deref()) {
+            Ok(Pushed::Landed(commit)) => Ok((
+                Naming {
+                    key: taking.key,
+                    commit,
+                    claim,
+                },
+                taking.read,
+            )),
+            Ok(Pushed::Refused) => match repair_claim::read(at, &taking.key) {
+                Ok(Some(repair_claim::Read {
+                    claim: Ok(theirs), ..
+                })) => Err(NotKept::Elsewhere {
+                    operator: theirs.operator,
+                    since: theirs.claimed_at,
+                }),
+                _ => Err(NotKept::Unread(format!(
+                    "origin refused {name}, and holds no claim there that reads, so no repair is \
+                     filed until it takes one"
+                ))),
+            },
+            Err(why) => Err(NotKept::Unread(format!(
+                "{name} could not be pushed to origin, so no repair is filed until it is: {why}"
+            ))),
+        }
+    }
+
+    /// Gives the break's repair claim back as it was before `naming`'s take,
+    /// `read` being the commit it replaced (OWL-642): what a filing the
+    /// tracker refused does, so that another runner may file at once. What
+    /// a give-back that fails adds to the refusal's reason; the claim then
+    /// names none for its lease.
+    fn give_back_claim(&self, naming: &Naming, read: Option<&str>) -> Option<String> {
+        let at = ClaimsAt {
+            git: &self.executor.git,
+            dirs: self.dirs,
+        };
+        repair_claim::give_back(at, &naming.key, &naming.commit, read)
+            .err()
+            .map(|why| {
+                format!(
+                    "; {} on origin could not be given back: {why}",
+                    repair_claim_ref(&naming.key)
+                )
+            })
     }
 
     /// A standing hold on `commit` that `p`'s step finds (OWL-622, OWL-639):

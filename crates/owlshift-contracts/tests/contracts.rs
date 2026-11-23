@@ -17,8 +17,8 @@ use owlshift_contracts::event::Event;
 use owlshift_contracts::format::Format;
 use owlshift_contracts::ids::TicketId;
 use owlshift_contracts::refs::{
-    AskKind, BuildRefusal, Claim, EndedWhy, PersistedState, PushKind, TicketClaimLost,
-    TicketClaimed, TicketDelivery, TicketQuestions, claim_ref, ticket_ref,
+    AskKind, BuildRefusal, Claim, EndedWhy, PersistedState, PushKind, RepairClaim, TicketClaimLost,
+    TicketClaimed, TicketDelivery, TicketQuestions, claim_ref, repair_claim_ref, ticket_ref,
 };
 use owlshift_contracts::result::{
     AnswerClass, DecisionsRefusal, MAX_QUESTION_BYTES, MAX_QUESTIONS, MAX_QUESTIONS_BYTES,
@@ -2519,6 +2519,37 @@ fn event_claim_and_state_rejections() {
         holder: Some(claim.holder()),
     };
     assert_eq!(TicketClaimLost::parse(&lost.render()).unwrap(), lost);
+
+    // A break's repair claim (OWL-642): no ticket while it is filed, then the
+    // one filed; its runner is an identifier, as a ticket claim's.
+    let filing = RepairClaim {
+        format: Format,
+        runner: claim.runner.clone(),
+        operator: "lea".to_owned(),
+        claimed_at: "2026-11-23T10:00:00Z".parse().unwrap(),
+        ticket: None,
+        repairs: 1,
+    };
+    assert_eq!(RepairClaim::parse(&filing.render()).unwrap(), filing);
+    assert!(!filing.render().contains("ticket"), "{}", filing.render());
+    let filed = RepairClaim {
+        ticket: Some(TicketId::new("OWL-13").unwrap()),
+        ..filing.clone()
+    };
+    assert_eq!(RepairClaim::parse(&filed.render()).unwrap(), filed);
+    let host = RepairClaim {
+        runner: "ada-laptop".to_owned(),
+        ..filing
+    };
+    rejects(
+        "repair claim's runner is a host name",
+        RepairClaim::parse(&host.render()),
+        "16 lowercase hexadecimal digits",
+    );
+    assert_eq!(
+        repair_claim_ref("setup-0123456789ab"),
+        "refs/owlshift/repairs/setup-0123456789ab"
+    );
 
     let state = |edit: fn(&mut Value)| PersistedState::parse(&edited("ticket-state.json", edit));
     rejects(

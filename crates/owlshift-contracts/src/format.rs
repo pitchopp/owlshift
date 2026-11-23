@@ -88,6 +88,9 @@ pub const CLAIMED_FORMAT: u32 = 1;
 /// The format version of the record of a ticket whose claim this runner
 /// lost (`claim_lost.json` in a ticket's folder, OWL-586).
 pub const CLAIM_LOST_FORMAT: u32 = 1;
+/// The format version of a break's repair claim (`repair.json` on a repair
+/// claim ref, OWL-642).
+pub const REPAIR_CLAIM_FORMAT: u32 = 1;
 /// The format version of a ticket's state (`state.json` on a ticket ref).
 /// Format 3 adds the fix passes and repairs at Watch (OWL-55); format 4 the
 /// review passes of the current stage (OWL-300); formats 2 and 3 are still
