@@ -1434,6 +1434,29 @@ fn init_detects_the_stack_and_never_runs_it() {
     assert!(!repo.path().join("ran-by-init").exists());
 }
 
+/// OWL-631: a pinned Ruby is noted in the report and in the file, since a
+/// version manager in the home installs it out of a confined run's reach.
+#[test]
+fn init_notes_a_tool_chain_a_version_manager_may_install_in_the_home() {
+    let config_dir = tempfile::tempdir().unwrap();
+    let repo = tempfile::tempdir().unwrap();
+    git_init(repo.path());
+    fs::write(repo.path().join(".ruby-version"), "3.3.0\n").unwrap();
+    let out = init_markdown(repo.path(), config_dir.path(), &[]);
+    assert!(
+        out.contains("Detected tool chains in the home: 0 gate command(s), 0 setup command(s)."),
+        "{out}"
+    );
+    // The machine running the test may hold rbenv in its home.
+    let noted = [
+        "  Note: `.ruby-version` names a Ruby",
+        "  Note: rbenv keeps its Rubies",
+    ];
+    assert!(noted.iter().any(|n| out.contains(n)), "{out}");
+    let written = fs::read_to_string(repo.path().join("owlshift.toml")).unwrap();
+    assert!(written.contains("\n# note: "), "{written}");
+}
+
 #[test]
 fn init_offers_the_typecheck_and_build_scripts_and_says_the_gate_is_a_guess() {
     let config_dir = tempfile::tempdir().unwrap();

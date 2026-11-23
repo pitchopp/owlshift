@@ -8,7 +8,8 @@
 //! `package.json`, `pyproject.toml`, `Makefile`); lock files, yarn's
 //! `.yarnrc.yml`, and the files of Go, pip, bundler and Gradle (OWL-624), of
 //! pdm, Maven, Composer and .NET (OWL-627), of Elixir, Dart, Swift and Deno
-//! (OWL-628), are read by name only. Nothing detected here is ever run. The
+//! (OWL-628), are read by name only; asdf's `.tool-versions` is read for the
+//! tools it names (OWL-631). Nothing detected here is ever run. The
 //! commands were checked with real calls, recorded in
 //! `docs/design/runtime-and-operations.md`, "Stack detection (P9)", and in the
 //! records of OWL-617, OWL-624, OWL-627, OWL-628 and OWL-629; a tool that
@@ -25,7 +26,26 @@ pub struct RootFiles {
     /// The contents of the manifests the runner read, by name. A manifest in
     /// `names` with no entry here could not be read.
     pub files: Vec<(String, String)>,
+    /// The version managers of the machine whose installs lie in the home
+    /// (OWL-631), as the runner found them: not of the root, but read with it
+    /// so that detection stays a function of what the runner read.
+    #[serde(default)]
+    pub home_managers: Vec<HomeManager>,
 }
+
+/// A version manager on the machine's `PATH` whose installs folder lies in
+/// the home, which a confined run cannot read (OWL-631).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HomeManager {
+    /// One of [`HOME_MANAGERS`].
+    pub name: String,
+    /// Its installs folder, relative to the home: `.pyenv`.
+    pub folder: String,
+}
+
+/// The version managers the runner looks for (OWL-631): pyenv's Pythons,
+/// rbenv's Rubies, asdf's tool chains, and the tools pipx installs.
+pub const HOME_MANAGERS: [&str; 4] = ["pyenv", "rbenv", "asdf", "pipx"];
 
 impl RootFiles {
     fn has(&self, name: &str) -> bool {
@@ -80,7 +100,8 @@ pub struct RunCache {
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Detection {
     /// In the fixed order `Cargo.toml`, `go.mod`, `package.json`, Python
-    /// (`pyproject.toml`, `requirements.txt`), `Gemfile`, Gradle, Maven,
+    /// (`pyproject.toml`, `requirements.txt`), `Gemfile`, the tool chains in
+    /// the home (OWL-631), Gradle, Maven,
     /// Composer, .NET, Elixir, Dart, Swift, Deno, `Makefile`.
     pub found: Vec<Found>,
     /// A manifest that could not be read or parsed, with why. Never an error.
@@ -104,8 +125,15 @@ impl Detection {
     }
 }
 
-/// The manifests [`detect`] reads, which the runner must read.
-pub const MANIFESTS: [&str; 4] = ["Cargo.toml", "package.json", "pyproject.toml", "Makefile"];
+/// The manifests [`detect`] reads, which the runner must read: asdf's
+/// `.tool-versions` included, for the tools it names (OWL-631).
+pub const MANIFESTS: [&str; 5] = [
+    "Cargo.toml",
+    "package.json",
+    "pyproject.toml",
+    "Makefile",
+    ".tool-versions",
+];
 
 /// One source of [`detect`]: what it found in the root, `None` when the root
 /// holds nothing of it, or why its manifest was skipped.
@@ -116,12 +144,13 @@ pub fn detect(root: &RootFiles) -> Detection {
     // Each with the name it is skipped under. Only a source that reads a
     // manifest's text, of `MANIFESTS`, can be skipped; the others read names
     // and keep a name here for the list's sake.
-    let sources: [(&str, Source); 14] = [
+    let sources: [(&str, Source); 15] = [
         ("Cargo.toml", cargo),
         ("go.mod", go),
         ("package.json", package_json),
         ("pyproject.toml", python),
         ("Gemfile", ruby),
+        (".tool-versions", home_toolchains),
         ("gradlew", gradle),
         ("pom.xml", maven),
         ("composer.json", composer),
@@ -697,6 +726,118 @@ fn ruby(root: &RootFiles) -> Result<Option<Found>, String> {
     Ok(Some(found))
 }
 
+/// What declaring a folder of the home takes, as `owlshift gate` proposes it.
+fn declare(folder: &str) -> String {
+    format!(
+        "declare `caches = [\"{folder}\"]` under `[stack]` and allow `{folder}` in your personal \
+         `allow_caches`"
+    )
+}
+
+/// The tool chains a version manager installs in the home (OWL-631), which a
+/// confined run cannot read (architecture section 8, "Tool chains"): a note
+/// each, nothing written, since the folder is the machine's, not the
+/// project's. A manager the runner found on `PATH` with its installs in the
+/// home gives the folder to declare, for the languages the root holds; the
+/// files that pin a version (`.python-version`, `.ruby-version`,
+/// `.tool-versions`) give a note naming the managers that install it, unless
+/// a manager found reads that file. Only poetry was seen to fail on pyenv's
+/// folder (OWL-624), so a manager's note says when it applies.
+fn home_toolchains(root: &RootFiles) -> Result<Option<Found>, String> {
+    let tools: Vec<&str> = match manifest(root, ".tool-versions")? {
+        Some(text) => text
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.starts_with('#'))
+            .filter_map(|l| l.split_whitespace().next())
+            .collect(),
+        None => vec![],
+    };
+    let python = ["pyproject.toml", "requirements.txt", ".python-version"]
+        .iter()
+        .any(|n| root.has(n))
+        || tools.contains(&"python");
+    let ruby = ["Gemfile", ".ruby-version"].iter().any(|n| root.has(n)) || tools.contains(&"ruby");
+    let python_manager =
+        root.has("pyproject.toml") && (root.has("poetry.lock") || root.has("pdm.lock"));
+    let found_manager = |name: &str| {
+        root.home_managers
+            .iter()
+            .find(|m| m.name == name)
+            .map(|m| m.folder.as_str())
+    };
+    let mut notes = vec![];
+    if python && let Some(folder) = found_manager("pyenv") {
+        notes.push(format!(
+            "pyenv keeps its Pythons in `~/{folder}`, which a confined run cannot read: when the \
+             gate's Python, or poetry looking for one, goes through pyenv, {}, or install the \
+             project's Python outside the home",
+            declare(folder)
+        ));
+    }
+    if ruby && let Some(folder) = found_manager("rbenv") {
+        notes.push(format!(
+            "rbenv keeps its Rubies in `~/{folder}`, which a confined run cannot read: when the \
+             gate's Ruby goes through rbenv, {}, or install the project's Ruby outside the home",
+            declare(folder)
+        ));
+    }
+    if !tools.is_empty()
+        && let Some(folder) = found_manager("asdf")
+    {
+        notes.push(format!(
+            "asdf keeps the tool chains `.tool-versions` names ({}) in `~/{folder}`, which a \
+             confined run cannot read: when the gate runs them through asdf, {}, or install them \
+             outside the home",
+            tools.join(", "),
+            declare(folder)
+        ));
+    }
+    if python_manager && let Some(folder) = found_manager("pipx") {
+        notes.push(format!(
+            "pipx keeps the tools it installs in `~/{folder}`, which a confined run cannot read: \
+             when the project's poetry or pdm is a pipx install, {}, or install it outside the \
+             home",
+            declare(folder)
+        ));
+    }
+    let uv = root.has("pyproject.toml") && root.has("uv.lock");
+    if root.has(".python-version") && !uv && found_manager("pyenv").is_none() {
+        notes.push(
+            "`.python-version` names a Python: installed by a version manager in your home (pyenv \
+             in `~/.pyenv`, asdf in `~/.asdf`, mise in `~/.local/share/mise`), a confined run \
+             cannot read it, so declare that folder in `stack.caches` and allow it in your \
+             personal `allow_caches`, or install that Python outside the home"
+                .to_string(),
+        );
+    }
+    if root.has(".ruby-version") && found_manager("rbenv").is_none() {
+        notes.push(
+            "`.ruby-version` names a Ruby: installed by a version manager in your home (rbenv in \
+             `~/.rbenv`, rvm in `~/.rvm`, chruby's `~/.rubies`, asdf in `~/.asdf`, mise in \
+             `~/.local/share/mise`), a confined run cannot read it, so declare that folder in \
+             `stack.caches` and allow it in your personal `allow_caches`, or install that Ruby \
+             outside the home"
+                .to_string(),
+        );
+    }
+    if !tools.is_empty() && found_manager("asdf").is_none() {
+        notes.push(format!(
+            "`.tool-versions` names {}: installed by asdf in `~/.asdf` or mise in \
+             `~/.local/share/mise`, a confined run cannot read them, so declare that folder in \
+             `stack.caches` and allow it in your personal `allow_caches`, or install them outside \
+             the home",
+            tools.join(", ")
+        ));
+    }
+    if notes.is_empty() {
+        return Ok(None);
+    }
+    let mut found = found("tool chains in the home");
+    found.notes = notes;
+    Ok(Some(found))
+}
+
 /// The build files that make a root a Gradle project (OWL-624).
 const GRADLE_BUILDS: [&str; 4] = [
     "build.gradle.kts",
@@ -1147,6 +1288,7 @@ mod tests {
                 .iter()
                 .map(|(n, c)| (n.to_string(), c.to_string()))
                 .collect(),
+            home_managers: vec![],
         }
     }
 
@@ -1835,6 +1977,121 @@ check::
         }
     }
 
+    /// The notes of the tool chains in the home, `None` when there is none.
+    fn toolchain_notes(root: &RootFiles) -> Option<Vec<String>> {
+        let d = detect(root);
+        let found = d
+            .found
+            .iter()
+            .find(|f| f.source == "tool chains in the home")?;
+        assert!(found.gate.is_empty() && found.setup.is_empty() && found.run_caches.is_empty());
+        Some(found.notes.clone())
+    }
+
+    fn with_managers(mut root: RootFiles, managers: &[(&str, &str)]) -> RootFiles {
+        root.home_managers = managers
+            .iter()
+            .map(|(name, folder)| HomeManager {
+                name: name.to_string(),
+                folder: folder.to_string(),
+            })
+            .collect();
+        root
+    }
+
+    /// OWL-631: each file that pins a tool chain gives a note naming the
+    /// managers that install it in the home; uv installs a pinned Python
+    /// into its own run cache, and a `.tool-versions` naming nothing says
+    /// nothing.
+    #[test]
+    fn a_pinned_tool_chain_names_the_managers_that_install_it_in_the_home() {
+        let notes = toolchain_notes(&root(&[".python-version"], &[])).unwrap();
+        assert_eq!(notes.len(), 1);
+        assert!(
+            notes[0].starts_with("`.python-version` names a Python"),
+            "{notes:?}"
+        );
+        assert!(notes[0].contains("`~/.pyenv`") && notes[0].contains("`allow_caches`"));
+
+        let uv = root(&[".python-version", "uv.lock"], &[("pyproject.toml", "")]);
+        assert_eq!(toolchain_notes(&uv), None);
+
+        let notes = toolchain_notes(&root(&[".ruby-version", "Gemfile"], &[])).unwrap();
+        assert_eq!(notes.len(), 1);
+        assert!(
+            notes[0].starts_with("`.ruby-version` names a Ruby"),
+            "{notes:?}"
+        );
+        assert!(notes[0].contains("`~/.rbenv`"));
+
+        let versions = "# pinned\npython 3.12.4\n\nnodejs 22.1.0 system\n";
+        let notes = toolchain_notes(&root(&[], &[(".tool-versions", versions)])).unwrap();
+        assert_eq!(notes.len(), 1);
+        assert!(
+            notes[0].starts_with("`.tool-versions` names python, nodejs:"),
+            "{notes:?}"
+        );
+        assert!(notes[0].contains("`~/.asdf`"));
+
+        let empty = root(&[], &[(".tool-versions", "# none yet\n\n")]);
+        assert_eq!(toolchain_notes(&empty), None);
+    }
+
+    /// OWL-631: an unreadable `.tool-versions` is skipped under its name.
+    #[test]
+    fn an_unread_tool_versions_is_skipped() {
+        let d = detect(&root(&[".tool-versions"], &[]));
+        assert_eq!(d.skipped, [".tool-versions: it could not be read"]);
+    }
+
+    /// OWL-631: a manager found with its installs in the home names the
+    /// folder to declare, for a root of its language only, and replaces the
+    /// note of the file it reads.
+    #[test]
+    fn a_manager_in_the_home_names_its_folder_for_its_language_only() {
+        let python = with_managers(
+            root(&[".python-version", "requirements.txt"], &[]),
+            &[("pyenv", ".pyenv"), ("rbenv", ".rbenv")],
+        );
+        let notes = toolchain_notes(&python).unwrap();
+        assert_eq!(notes.len(), 1, "{notes:?}");
+        assert!(notes[0].starts_with("pyenv keeps its Pythons in `~/.pyenv`"));
+        assert!(notes[0].contains("declare `caches = [\".pyenv\"]` under `[stack]`"));
+
+        let rust = with_managers(
+            root(&["Cargo.lock"], &[("Cargo.toml", CARGO)]),
+            &[("pyenv", ".pyenv"), ("rbenv", ".rbenv"), ("asdf", ".asdf")],
+        );
+        assert_eq!(toolchain_notes(&rust), None);
+
+        let ruby = with_managers(
+            root(&["Gemfile", ".ruby-version"], &[]),
+            &[("rbenv", "rubies/rbenv")],
+        );
+        let notes = toolchain_notes(&ruby).unwrap();
+        assert_eq!(notes.len(), 1, "{notes:?}");
+        assert!(notes[0].contains("`~/rubies/rbenv`") && notes[0].contains("\"rubies/rbenv\""));
+
+        // asdf only with a `.tool-versions`, whose note it replaces.
+        let asdf = &[("asdf", ".asdf")];
+        assert_eq!(
+            toolchain_notes(&with_managers(root(&["Gemfile"], &[]), asdf)),
+            None
+        );
+        let pinned = root(&[], &[(".tool-versions", "ruby 3.3.0\n")]);
+        let notes = toolchain_notes(&with_managers(pinned, asdf)).unwrap();
+        assert_eq!(notes.len(), 1, "{notes:?}");
+        assert!(notes[0].starts_with("asdf keeps the tool chains `.tool-versions` names (ruby)"));
+
+        // pipx only beside the lock of poetry or pdm.
+        let pipx = &[("pipx", ".local/pipx")];
+        let pip = root(&["requirements.txt"], &[("pyproject.toml", "")]);
+        assert_eq!(toolchain_notes(&with_managers(pip, pipx)), None);
+        let poetry = root(&["poetry.lock"], &[("pyproject.toml", "")]);
+        let notes = toolchain_notes(&with_managers(poetry, pipx)).unwrap();
+        assert!(notes[0].starts_with("pipx keeps the tools it installs in `~/.local/pipx`"));
+    }
+
     /// OWL-628: Deno installs its lock, checks, lints and tests with its
     /// cache in a run cache; without the lock the tests write none.
     #[test]
@@ -1933,6 +2190,7 @@ check::
                 "Package.swift",
                 "pubspec.yaml",
                 "mix.exs",
+                ".ruby-version",
             ],
             &[
                 ("package.json", r#"{"scripts":{"test":"vitest"}}"#),
@@ -1950,6 +2208,7 @@ check::
                 "package.json (pnpm-lock.yaml)",
                 "pyproject.toml (requirements.txt)",
                 "Gemfile",
+                "tool chains in the home",
                 "gradlew",
                 "pom.xml",
                 "composer.json",

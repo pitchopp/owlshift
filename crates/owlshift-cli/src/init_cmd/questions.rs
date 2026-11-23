@@ -289,6 +289,7 @@ mod tests {
                 "Cargo.toml".to_owned(),
                 "[package]\nname = \"x\"\n".to_owned(),
             )],
+            ..RootFiles::default()
         });
         let detected: Vec<String> = cargo.gate().map(|l| l.command.clone()).collect();
         assert!(!detected.is_empty());

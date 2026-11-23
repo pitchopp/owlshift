@@ -35,9 +35,9 @@ use owlshift_runner::github_sign_in::{self, Ask, GitHub, Outcome, SystemWait};
 use owlshift_runner::init::{
     AppStored, CLAUDE_TOKEN, EXAMPLE_ASSIGNEE, EXAMPLE_TICKET, GITHUB_TOKEN, InitOptions,
     MARKDOWN_LIMITS, MARKDOWN_PAGE, PeopleEntry, SecretsReport, Wanted, Written,
-    allow_caches_advice, caches_to_allow, people_entry, project_file, read_root_files,
-    required_secrets, store_app_credentials, store_secrets, wanted_secrets, write_example_ticket,
-    write_once_connected, write_project_file,
+    allow_caches_advice, caches_to_allow, home_managers, people_entry, project_file,
+    read_root_files, required_secrets, store_app_credentials, store_secrets, wanted_secrets,
+    write_example_ticket, write_once_connected, write_project_file,
 };
 use owlshift_runner::install::Manifests;
 use owlshift_runner::project::ProjectDirs;
@@ -138,7 +138,11 @@ pub fn run(args: &Args, config: &Effective) -> ExitCode {
             // Detection only reads the root's file names and manifests: what
             // it finds is written, never run.
             let detected = match read_root_files(root) {
-                Ok(files) => detect(&files),
+                Ok(mut files) => {
+                    // The machine's version managers in the home (OWL-631).
+                    files.home_managers = home_managers(|name| std::env::var_os(name));
+                    detect(&files)
+                }
                 Err(error) => {
                     println!("The stack was not detected: {}: {error}", root.display());
                     Detection::default()
