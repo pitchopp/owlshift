@@ -22,6 +22,7 @@
 #   CACHE_SEED: a folder holding, per ecosystem, run cache folders an earlier run filled, copied in before the first
 #   gate (a retry when the network stopped a setup at its deadline).
 #   STACK_EDIT: a sed script applied to the `owlshift.toml` `init` wrote, for an experiment the results say.
+#   CONCURRENT=1: after each ecosystem's runs, two gates at once on its emptied run caches, then a third (`pair`).
 # It writes only under a temporary folder, removed at the end, unless KEEP=1. It prints results only, the home shown
 # as `~`.
 set -u
@@ -123,6 +124,28 @@ gate() {
   fi
 }
 
+# pair LABEL DIR (CONCURRENT=1, OWL-632): two `owlshift gate` at once on one empty run cache tree, as two steps of one
+# project install at once: each with its own data folder, since a gate holds the project's lock in it, both with the
+# one cache folder; then a third gate alone, on what the two left. Skipped when the `[stack]` has no run cache.
+pair() {
+  local label=$1 dir=$2 tree=$work/cache/github.com/owl628/$eco side pids="" rc secs
+  grep -q '^run_caches\.' "$dir/owlshift.toml" || return 0
+  (cd "$dir" && git add -A && git commit -q -m "$label" && git push -q origin main) >/dev/null 2>&1
+  chmod -R u+w "$tree" 2>/dev/null; rm -rf "$tree"
+  for side in a b; do
+    (cd "$dir" && start=$(date +%s) && OWLSHIFT_DATA_DIR=$work/data-$side "$bin" gate </dev/null >"$work/pair-$side" 2>&1
+      echo "$? $(($(date +%s) - start))" >"$work/pair-$side.rc") &
+    pids="$pids $!"
+  done
+  wait $pids
+  for side in a b; do
+    read -r rc secs <"$work/pair-$side.rc"
+    say "$label, gate $side of two at once: owlshift gate exit $rc in $secs s"
+    grep -B"${TAIL:-6}" '^Gate red' "$work/pair-$side" | clean
+  done
+  gate "$label, a third gate alone after them" "$dir"
+}
+
 for eco in $ecosystems; do
   say "--- $eco"
   dir=$work/src/$eco
@@ -159,6 +182,7 @@ for eco in $ecosystems; do
     gate "$eco, without run_caches.$variable" "$dir"
   done
   cp "$work/owlshift.toml.$eco" "$dir/owlshift.toml"
+  [ -n "${CONCURRENT:-}" ] && pair "$eco, as written" "$dir"
 done
 
 if [ -n "${KEEP:-}" ]; then say "kept the scratch folder $work"; exit 0; fi

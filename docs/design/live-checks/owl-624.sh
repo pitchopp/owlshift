@@ -15,11 +15,12 @@
 # `poetry-pyenv`, on macOS, is `poetry` with `caches = [".pyenv"]` declared and allowed, as `owlshift gate` proposes
 # on a machine whose pyenv, in the home, poetry 2 lists while it looks for a Python.
 #
-# Usage: [CACHE_SEED=DIR] bash owl-624.sh OWLSHIFT_BINARY [hand|init] [ECOSYSTEM...]   (network needed)
+# Usage: [CACHE_SEED=DIR] [CONCURRENT=1] bash owl-624.sh OWLSHIFT_BINARY [hand|init] [ECOSYSTEM...]   (network needed)
 #   CACHE_SEED: a folder holding, per ecosystem, run cache folders an earlier run filled, copied in before the first
 #   gate (a retry when the network stopped a setup at its deadline).
 #   hand: the `[stack]` this script holds for each ecosystem replaces the detected one (the check before the code);
 #   init: `init`'s own lines, unedited (the default).
+#   CONCURRENT=1: after each ecosystem's runs, two gates at once on its emptied run caches, then a third (`pair`).
 # It writes only under a temporary folder, removed at the end. It prints results only, the home shown as `~`.
 set -u
 bin=$(cd "$(dirname "$1")" && pwd -P)/$(basename "$1"); shift
@@ -197,6 +198,29 @@ gate() {
   fi
 }
 
+# pair LABEL DIR (CONCURRENT=1, OWL-632): two `owlshift gate` at once on one empty run cache tree, as two steps of one
+# project install at once: each with its own data folder, since a gate holds the project's lock in it, both with the
+# one cache folder; then a third gate alone, on what the two left. Skipped when the `[stack]` has no run cache.
+pair() {
+  local label=$1 dir=$2 tree=$work/cache/github.com/owl624/$eco side pids="" rc secs
+  grep -q '^run_caches\.' "$dir/owlshift.toml" || return 0
+  (cd "$dir" && git add -A && git commit -q -m "$label" && git push -q origin main) >/dev/null 2>&1
+  chmod -R u+w "$tree" 2>/dev/null; rm -rf "$tree"
+  for side in a b; do
+    (cd "$dir" && start=$(date +%s) && OWLSHIFT_DATA_DIR=$work/data-$side "$bin" gate </dev/null >"$work/pair-$side" 2>&1
+      echo "$? $(($(date +%s) - start))" >"$work/pair-$side.rc") &
+    pids="$pids $!"
+  done
+  # Those two only: the loopback servers are this shell's children too.
+  wait $pids
+  for side in a b; do
+    read -r rc secs <"$work/pair-$side.rc"
+    say "$label, gate $side of two at once: owlshift gate exit $rc in $secs s"
+    grep -B"${TAIL:-6}" '^Gate red' "$work/pair-$side" | clean
+  done
+  gate "$label, a third gate alone after them" "$dir"
+}
+
 for eco in $ecosystems; do
   say "--- $eco"
   dir=$work/src/$eco
@@ -238,12 +262,18 @@ for eco in $ecosystems; do
   gate "$eco, as written" "$dir"
   say "the run caches: $(cd "$work/cache/github.com/owl624/$eco" 2>/dev/null && du -sk -- * 2>/dev/null \
     | awk '{ printf "%s %s, ", $2, ($1 < 1024 ? $1 " kB" : sprintf("%.0f MB", $1 / 1024)) }')"
+  case $eco in bundler*)
+    # Where the bundler a lock pins went (OWL-632): in the run cache, or else into the lost home.
+    say "bundler in the run cache: $(cd "$work/cache/github.com/owl624/$eco" 2>/dev/null \
+      && find . -maxdepth 5 -type d -name 'bundler-[0-9]*' | tr '\n' ' ')" ;;
+  esac
   # Each run cache removed alone: the others stay, filled by the run above.
   for variable in $(sed -n 's/^run_caches\.\([A-Za-z_0-9]*\) = .*/\1/p' "$work/owlshift.toml.$eco"); do
     awk -v v="$variable" 'index($0, "run_caches." v " = ") != 1' "$work/owlshift.toml.$eco" >"$dir/owlshift.toml"
     gate "$eco, without run_caches.$variable" "$dir"
   done
   cp "$work/owlshift.toml.$eco" "$dir/owlshift.toml"
+  [ -n "${CONCURRENT:-}" ] && pair "$eco, as written" "$dir"
   if [ "$eco" = go ]; then
     # The gate's shell runs `! gofmt -l . | grep .`: red, naming the file, on a file gofmt would change.
     printf 'package main\n\nfunc  unformatted() {}\n' >"$dir/unformatted.go"
