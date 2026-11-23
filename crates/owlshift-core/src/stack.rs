@@ -858,11 +858,17 @@ const DOTNET_FLAGS: &str = "-m:1 -nodeReuse:false";
 /// the root: each gets a note. Checked live, confined: `DOTNET_CLI_HOME`
 /// holds the SDK's first-run files and NuGet's home, its packages included,
 /// and without it `dotnet` fails at once; `NUGET_PACKAGES` is not needed.
+/// `NUGET_SCRATCH` is the folder NuGet takes its extraction lock in, under
+/// each run's own `TMPDIR` otherwise: two restores at once into one
+/// `DOTNET_CLI_HOME` did not see each other's lock and failed in most pairs,
+/// and never with the folder shared, a lock folder the project's runs share
+/// on purpose (OWL-632, OWL-641: checked on Linux, macOS pending).
 fn dotnet(root: &RootFiles) -> Result<Option<Found>, String> {
     let lines = |file: &str| {
         format!(
             "the setup is `{DOTNET} restore {DOTNET_FLAGS} {file}` and the gate `{DOTNET} test \
-             {DOTNET_FLAGS} {file}`, with `run_caches.DOTNET_CLI_HOME = \"dotnet\"`"
+             {DOTNET_FLAGS} {file}`, with `run_caches.DOTNET_CLI_HOME = \"dotnet\"` and \
+             `run_caches.NUGET_SCRATCH = \"nuget-scratch\"`"
         )
     };
     let with = |extensions: &[&str]| -> Vec<&str> {
@@ -918,11 +924,20 @@ fn dotnet(root: &RootFiles) -> Result<Option<Found>, String> {
     ));
     found
         .run_caches
-        .push(run_cache("DOTNET_CLI_HOME", "dotnet", from));
+        .push(run_cache("DOTNET_CLI_HOME", "dotnet", from.clone()));
+    found
+        .run_caches
+        .push(run_cache("NUGET_SCRATCH", "nuget-scratch", from));
     found.notes.push(
         "the dotnet lines build in one process and, on macOS, reach NuGet through \
          Network.framework, since the sandbox closes MSBuild's worker nodes and the keychain .NET's \
          TLS reads otherwise"
+            .to_string(),
+    );
+    found.notes.push(
+        "`NUGET_SCRATCH` is the folder NuGet takes its extraction lock in, each run's own \
+         temporary folder otherwise, so that restores running at once share one lock (checked on \
+         Linux)"
             .to_string(),
     );
     if root.has("global.json") {
@@ -1740,7 +1755,7 @@ check::
     /// OWL-627: .NET builds the one solution at the root, or the one project
     /// when there is no solution, in one process and through Network.framework
     /// on macOS; otherwise a note says what to write. A `global.json` adds the
-    /// switch's minimum SDK.
+    /// switch's minimum SDK. OWL-641: restores share NuGet's lock folder.
     #[test]
     fn a_dotnet_root_restores_and_tests_its_one_solution_or_project() {
         let cases: [(&[&str], &str); 4] = [
@@ -1760,12 +1775,19 @@ check::
                 commands(d.gate()),
                 [format!("{dotnet} test -m:1 -nodeReuse:false {word}")]
             );
-            assert_eq!(run_caches(d.run_caches()), [("DOTNET_CLI_HOME", "dotnet")]);
+            assert_eq!(
+                run_caches(d.run_caches()),
+                [
+                    ("DOTNET_CLI_HOME", "dotnet"),
+                    ("NUGET_SCRATCH", "nuget-scratch")
+                ]
+            );
             let notes = &d.found[0].notes;
             assert!(notes[0].contains("Network.framework"), "{notes:?}");
+            assert!(notes[1].contains("`NUGET_SCRATCH`"), "{notes:?}");
             let pinned = names.contains(&"global.json");
-            assert_eq!(notes.len(), 1 + usize::from(pinned), "{notes:?}");
-            assert!(notes.iter().skip(1).all(|n| n.contains(".NET 10")));
+            assert_eq!(notes.len(), 2 + usize::from(pinned), "{notes:?}");
+            assert!(notes.iter().skip(2).all(|n| n.contains(".NET 10")));
         }
         for (names, source) in [
             (&["A.sln", "B.sln", "A.csproj"][..], "A.sln, B.sln"),
@@ -1776,8 +1798,10 @@ check::
             assert_eq!(d.found[0].source, source);
             assert!(d.setup().next().is_none() && d.gate().next().is_none());
             assert!(d.run_caches().next().is_none());
+            let note = &d.found[0].notes[0];
             assert!(
-                d.found[0].notes[0].contains("run_caches.DOTNET_CLI_HOME"),
+                note.contains("run_caches.DOTNET_CLI_HOME")
+                    && note.contains("run_caches.NUGET_SCRATCH"),
                 "{names:?}"
             );
         }
@@ -1912,7 +1936,7 @@ check::
             seen += entries.len();
             crate::agent_env::check_run_caches(&entries).unwrap();
         }
-        assert_eq!(seen, 21);
+        assert_eq!(seen, 22);
     }
 
     #[test]

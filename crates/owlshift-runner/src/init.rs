@@ -1720,7 +1720,11 @@ mod tests {
         );
         assert_eq!(
             config.stack.run_cache_entries(),
-            [("DOTNET_CLI_HOME", "dotnet"), ("MAVEN_USER_HOME", "maven")]
+            [
+                ("DOTNET_CLI_HOME", "dotnet"),
+                ("MAVEN_USER_HOME", "maven"),
+                ("NUGET_SCRATCH", "nuget-scratch")
+            ]
         );
         assert!(
             text.contains("# note: the Maven line reads `$MAVEN_USER_HOME`"),
