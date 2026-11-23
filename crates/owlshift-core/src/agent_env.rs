@@ -39,7 +39,9 @@ pub const NO_CREDENTIAL: &str = "owlshift-agent-has-no-credential";
 ///
 /// Left out on purpose, among others: every token variable, `SSH_AUTH_SOCK`,
 /// every `GIT_*` variable, `XDG_RUNTIME_DIR`, `DBUS_SESSION_BUS_ADDRESS` and
-/// `DISPLAY` (they locate the Secret Service), and every variable of Claude
+/// `DISPLAY` (they locate the Secret Service; a project's `stack.run_caches`
+/// may still set `XDG_RUNTIME_DIR` to an empty folder of Owlshift's own,
+/// where pnpm 12 takes its locks, OWL-629), and every variable of Claude
 /// Code (`CLAUDECODE`, `ANTHROPIC_*`, `CLAUDE_*`): a confined Claude Code run
 /// gets its login and a configuration folder of its own from the runner, on
 /// the harness command alone (OWL-94). Of Codex's own variables (`CODEX_*`,
