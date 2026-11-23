@@ -1173,23 +1173,30 @@ fn dart(root: &RootFiles) -> Result<Option<Found>, String> {
     Ok(Some(found))
 }
 
-/// Swift (OWL-628), from `Package.swift`, read by name: a note only. Checked
-/// live, confined, on macOS, before OWL-637: SwiftPM compiles the manifest
-/// inside a `sandbox-exec` of its own, which cannot run inside Owlshift's
-/// (`--disable-sandbox` turns it off), and even so the build failed writing
-/// to the user's temporary folder, then closed to a confined run.
-/// SwiftPM needs no run cache: it turns its caches off when it cannot write
-/// them, and goes on.
+/// Swift (OWL-628, OWL-638), from `Package.swift`, read by name: a note only.
+/// Checked live, confined, on macOS (OWL-638, Swift 6.4 of the Command Line
+/// Tools): SwiftPM compiles the manifest inside a `sandbox-exec` of its own,
+/// which cannot run inside Owlshift's (`--disable-sandbox` turns it off);
+/// swiftc then needs a writable clang module cache, which
+/// `CLANG_MODULE_CACHE_PATH` moves into a run cache, and with it the setup
+/// and `swift build` pass; `swift test` of a swift-testing target does not,
+/// the `TestingMacros` plugin not being found. Linux is unchecked.
 fn swift(root: &RootFiles) -> Result<Option<Found>, String> {
     if !root.has("Package.swift") {
         return Ok(None);
     }
     let mut found = found("Package.swift");
     found.notes.push(
-        "Swift was not written, its lines not having been shown to pass confined: the setup \
-         `swift package --disable-sandbox resolve` and the gate `swift build --disable-sandbox` \
-         and `swift test --disable-sandbox`, SwiftPM's own sandbox not running inside Owlshift's; \
-         on macOS before OWL-637, `swift build` failed writing to the user's temporary folder"
+        "Swift was not written, its gate not having passed confined (macOS; Linux unchecked): \
+         the setup `swift package --disable-sandbox resolve` and the gate `swift build \
+         --disable-sandbox` and `swift test --disable-sandbox` (SwiftPM's own sandbox cannot run \
+         inside Owlshift's) need, on macOS, `run_caches.CLANG_MODULE_CACHE_PATH = \"clang-modules\"` \
+         for the module cache swiftc writes; with it the setup and the build passed"
+            .to_string(),
+    );
+    found.notes.push(
+        "on macOS, `swift test` of a swift-testing target failed confined even so, its \
+         `TestingMacros` plugin not being found"
             .to_string(),
     );
     Ok(Some(found))
@@ -1990,7 +1997,7 @@ check::
     fn dart_and_swift_roots_get_a_note_only() {
         for (name, says) in [
             ("pubspec.yaml", "run_caches.PUB_CACHE"),
-            ("Package.swift", "OWL-637"),
+            ("Package.swift", "CLANG_MODULE_CACHE_PATH"),
         ] {
             let d = detect(&root(&[name, "pubspec.lock", "Package.resolved"], &[]));
             assert_eq!(d.found.len(), 1, "{name}");
@@ -1998,6 +2005,18 @@ check::
             assert!(d.gate().next().is_none() && d.setup().next().is_none());
             assert!(d.run_caches().next().is_none());
             assert!(d.found[0].notes[0].contains(says), "{name}");
+        }
+        // OWL-638: Swift's note keeps its three commands and its two caveats.
+        let d = detect(&root(&["Package.swift"], &[]));
+        let notes = d.found[0].notes.join(" ");
+        for part in [
+            "swift package --disable-sandbox resolve",
+            "swift build --disable-sandbox",
+            "swift test --disable-sandbox",
+            "TestingMacros",
+            "Linux unchecked",
+        ] {
+            assert!(notes.contains(part), "{part}: {notes}");
         }
     }
 
