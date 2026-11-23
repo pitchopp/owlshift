@@ -1404,15 +1404,17 @@ fn init_detects_the_stack_and_never_runs_it() {
     let config = project_config(repo.path());
     assert_eq!(config.stack.gate.len(), 4, "{:?}", config.stack.gate);
     assert_eq!(config.stack.gate[3], "pnpm run test");
-    // OWL-617: pnpm's plain install into a run cache, no folder of the home
-    // to allow.
+    // OWL-617, OWL-629: pnpm's plain install into run caches, no folder of
+    // the home to allow.
     assert_eq!(config.stack.setup, ["pnpm install --frozen-lockfile"]);
     assert!(config.stack.caches.is_empty());
     assert_eq!(
         config.stack.run_cache_entries(),
         [
             ("CARGO_HOME", "cargo"),
-            ("npm_config_store_dir", "pnpm-store")
+            ("COREPACK_HOME", "corepack"),
+            ("PNPM_HOME", "pnpm"),
+            ("XDG_RUNTIME_DIR", "pnpm-locks")
         ]
     );
     assert!(!out.contains("allow_caches"), "{out}");
@@ -1423,7 +1425,7 @@ fn init_detects_the_stack_and_never_runs_it() {
         "{out}"
     );
     assert!(
-        out.contains("Detected package.json (pnpm-lock.yaml): 1 gate command(s), 1 setup command(s), run caches npm_config_store_dir."),
+        out.contains("Detected package.json (pnpm-lock.yaml): 1 gate command(s), 1 setup command(s), run caches PNPM_HOME, XDG_RUNTIME_DIR, COREPACK_HOME."),
         "{out}"
     );
     assert!(!out.contains("gate is empty"), "{out}");
@@ -1506,27 +1508,41 @@ fn a_gate_given_with_init_wins_over_the_detected_one() {
     let out = init_markdown(repo.path(), config_dir.path(), &["--gate", "make ci"]);
     let config = project_config(repo.path());
     assert_eq!(config.stack.gate, ["make ci"]);
-    // OWL-593: yarn 4's install reads its global cache, which this machine
-    // must allow.
+    // OWL-629: yarn 4 installs into run caches, no folder of the home to
+    // allow.
     assert_eq!(config.stack.setup, ["yarn install --immutable"]);
-    assert_eq!(config.stack.caches, [".yarn/berry"]);
+    assert!(config.stack.caches.is_empty());
+    assert_eq!(
+        config.stack.run_cache_entries(),
+        [
+            ("COREPACK_HOME", "corepack"),
+            ("YARN_GLOBAL_FOLDER", "yarn")
+        ]
+    );
     assert!(out.contains("--gate wins"), "{out}");
+    assert!(!out.contains("allow_caches"), "{out}");
     // OWL-595: the notes about the detected gate are not written above a
     // gate given by hand.
     let written = fs::read_to_string(repo.path().join("owlshift.toml")).unwrap();
     assert!(!written.contains("a guess"), "{written}");
     assert!(!out.contains("a guess"), "{out}");
+    // OWL-593: a kept file declaring a cache of the home, as `init` wrote
+    // yarn 4's before OWL-629, is refused until the folder is allowed, and
+    // `init` says how.
+    fs::write(
+        repo.path().join("owlshift.toml"),
+        written.replace("# caches = [\".pyenv\"]\n", "caches = [\".yarn/berry\"]\n"),
+    )
+    .unwrap();
     let allow = "[repositories.\"github.com/acme/web\"]\nallow_caches = [\".yarn/berry\"]\n";
-    assert!(
-        out.contains("The setup reads `~/.yarn/berry` read-only"),
-        "{out}"
-    );
-    assert!(out.contains(allow), "{out}");
-    // Run again, the file is refused until the folder is allowed: it says
-    // how once more.
     let again = owlshift(repo.path(), config_dir.path(), &["init", "--skip-secrets"]);
     assert!(!again.status.success());
     assert!(stderr(&again).contains(allow), "{}", stderr(&again));
+    assert!(
+        stderr(&again).contains("The setup reads `~/.yarn/berry` read-only"),
+        "{}",
+        stderr(&again)
+    );
     fs::write(config_dir.path().join("config.toml"), allow).unwrap();
     let allowed = owlshift(repo.path(), config_dir.path(), &["init", "--skip-secrets"]);
     assert!(allowed.status.success(), "{}", stderr(&allowed));

@@ -264,10 +264,10 @@ Commands that install the gate's dependencies, run in order with the network ope
 
 #### `stack.caches`
 
-Folders of your home, such as a package store, that the setup, the agent and the gate read, never write; a machine opens only those its personal `allow_caches` lists, never one holding credentials. Default: none.
+Folders of your home, such as pyenv's Pythons, that the setup, the agent and the gate read, never write; a machine opens only those its personal `allow_caches` lists, never one holding credentials. Default: none.
 
 ```toml
-# caches = ["Library/pnpm"]
+# caches = [".pyenv"]
 ```
 
 #### `stack.run_caches`

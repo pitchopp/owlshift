@@ -199,7 +199,7 @@ pub fn run(args: &Args, config: &Effective) -> ExitCode {
     let repo = origin_repo(path.parent().unwrap_or(path));
     if args.skip_secrets {
         if let File::New(path, options) = &file
-            && let Err(error) = write(path, options, config, repo.as_ref().ok())
+            && let Err(error) = write(path, options)
         {
             return error;
         }
@@ -376,7 +376,7 @@ pub fn run(args: &Args, config: &Effective) -> ExitCode {
                 keychain: &keychain,
                 access: &access,
             };
-            match connect_and_write(&file, &setup, config, repo.as_ref().ok()) {
+            match connect_and_write(&file, &setup, config) {
                 Ok(answered) => answered,
                 Err(code) => return code,
             }
@@ -493,7 +493,6 @@ fn connect_and_write(
     file: &File<'_>,
     setup: &Setup<'_>,
     config: &Effective,
-    repo: Option<&Repo>,
 ) -> Result<bool, ExitCode> {
     let tracker = setup.tracker.kind;
     let connected = tracker::of(tracker).connect(setup);
@@ -542,7 +541,7 @@ fn connect_and_write(
     if let File::New(path, options) = file {
         let root = path.parent().unwrap_or(path);
         match write_once_connected(root, options, connected.as_ref().map_err(String::as_str)) {
-            Ok(Written::Created) => said_written(path, options, config, repo),
+            Ok(Written::Created) => said_written(path, options),
             Ok(Written::Kept) => {
                 return Err(fail(&format!(
                     "{} appeared while `owlshift init` ran: run it again",
@@ -560,17 +559,12 @@ fn connect_and_write(
 
 /// Writes the project file of `options` at `path` without asking the
 /// tracker (`--skip-secrets`), and says so; the error is `init`'s exit.
-fn write(
-    path: &Path,
-    options: &InitOptions,
-    config: &Effective,
-    repo: Option<&Repo>,
-) -> Result<(), ExitCode> {
+fn write(path: &Path, options: &InitOptions) -> Result<(), ExitCode> {
     let text = project_file(options).map_err(|error| fail(&error))?;
     let root = path.parent().unwrap_or(path);
     match write_project_file(root, &text) {
         Ok(Written::Created) => {
-            said_written(path, options, config, repo);
+            said_written(path, options);
             Ok(())
         }
         Ok(Written::Kept) => Err(fail(&format!(
@@ -661,9 +655,8 @@ fn read_hidden(one: &Wanted) -> Option<Secret> {
     }
 }
 
-/// What `init` says once it wrote the project file at `path`; `config` and
-/// `repo` say which of its caches this machine allows already.
-fn said_written(path: &Path, options: &InitOptions, config: &Effective, repo: Option<&Repo>) {
+/// What `init` says once it wrote the project file at `path`.
+fn said_written(path: &Path, options: &InitOptions) {
     let has_gate = !options.gate.is_empty() || options.detected.gate().next().is_some();
     println!(
         "Wrote {}: review it, then commit it.{}",
@@ -676,15 +669,6 @@ fn said_written(path: &Path, options: &InitOptions, config: &Effective, repo: Op
         }
     );
     report_detection(options);
-    let folders: Vec<String> = options
-        .detected
-        .caches()
-        .map(|line| line.command.clone())
-        .collect();
-    if let Some(advice) = cache_advice(config, &folders, repo) {
-        println!("{advice}");
-        offer_allow(config, &folders, repo);
-    }
     if options.tracker == TrackerKind::Markdown {
         report_example(path.parent().unwrap_or(path));
     }

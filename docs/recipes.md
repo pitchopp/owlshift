@@ -77,16 +77,27 @@ run_caches = { npm_config_cache = "npm" }
 
 Name your own scripts: `init` writes the ones your `package.json` defines. The runs install online into npm's cache of Owlshift's own, kept for the next runs.
 
-**pnpm (version 10)**
+**pnpm**
 
 ```toml
 [stack]
 gate = ["pnpm run lint", "pnpm run test"]
 setup = ["pnpm install --frozen-lockfile"]
-run_caches = { npm_config_store_dir = "pnpm-store" }
+run_caches = { PNPM_HOME = "pnpm", XDG_RUNTIME_DIR = "pnpm-locks", COREPACK_HOME = "corepack" }
 ```
 
-pnpm's store is a cache of Owlshift's own, which the runs write, so a package the lock file gains is downloaded, not refused. A project on another pnpm than 10 keeps the same setup without `run_caches`, since only pnpm 10 was checked; run `owlshift gate` to see whether it works for you.
+`PNPM_HOME` holds pnpm's store, which the runs write, so a package the lock file gains is downloaded, not refused; pnpm 10 and later also download there the version your `packageManager` pins when it is not the one installed. pnpm 12 takes its store's locks in `XDG_RUNTIME_DIR`, the shared `/tmp` otherwise, which the runs cannot write; with a `packageManager` pinning pnpm 9, 10 or 11, `init` leaves that line out. `COREPACK_HOME` holds the pnpm corepack installs when your `pnpm` is corepack's. The same lines serve every pnpm from 9 to 12.
+
+**yarn 2 and later**
+
+```toml
+[stack]
+gate = ["yarn run lint", "yarn run test"]
+setup = ["yarn install --immutable"]
+run_caches = { YARN_GLOBAL_FOLDER = "yarn", COREPACK_HOME = "corepack" }
+```
+
+yarn makes its global folder at every install, whatever your `.yarnrc.yml` says of its cache, and keeps its cache there by default since yarn 4. Ignore `.yarn/*` but the folders you commit, and `.pnp.*`, as yarn's own `.gitignore` does. yarn 1 needs no run cache: `yarn install --frozen-lockfile` falls back to a cache in the run's own folder.
 
 **Python with uv**
 
@@ -196,10 +207,10 @@ run_caches = { DOTNET_CLI_HOME = "dotnet" }
 
 `DOTNET_CLI_HOME` holds the SDK's first-run files and NuGet's packages. The lines build in one process, since MSBuild's worker nodes cannot reach each other in the sandbox, and on macOS reach NuGet through Network.framework, since .NET's TLS there reads the keychain the runs cannot: that switch needs .NET 10 or later, and other systems ignore it. Ignore `bin/` and `obj/`.
 
-**The caches your runs write.** Each `run_caches` entry is a variable a package manager reads for its cache and the name of a folder Owlshift makes for it, under `~/Library/Caches/owlshift/` on macOS and `~/.cache/owlshift/` on Linux, one folder per repository (`OWLSHIFT_CACHE_DIR` moves it, for a machine whose cache folder's path holds a space). `owlshift doctor` shows its size; delete the folder to empty it. Your own caches stay read-only to the runs: declare one in `stack.caches`, and allow it in your personal file with `allow_caches`, only for a tool that must read it, such as yarn 4's global cache:
+**The caches your runs write.** Each `run_caches` entry is a variable a package manager reads for its cache and the name of a folder Owlshift makes for it, under `~/Library/Caches/owlshift/` on macOS and `~/.cache/owlshift/` on Linux, one folder per repository (`OWLSHIFT_CACHE_DIR` moves it, for a machine whose cache folder's path holds a space). `owlshift doctor` shows its size; delete the folder to empty it. Your own caches stay read-only to the runs: declare one in `stack.caches`, and allow it in your personal file with `allow_caches`, only for a tool that must read it, such as the Pythons pyenv installed in your home, which poetry lists:
 
 ```toml personal
-allow_caches = [".yarn/berry"]
+allow_caches = [".pyenv"]
 ```
 
 **A Makefile**

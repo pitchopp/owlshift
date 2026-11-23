@@ -4193,32 +4193,21 @@ mod tests {
 
     /// OWL-593: a cache folder the project file lists and the personal file
     /// does not allow fails a line of its own, whose fix holds the lines to
-    /// add for the checkout's repository; once allowed, there is no line.
+    /// add for the checkout's repository; once allowed, there is no line. The
+    /// project file declares yarn 4's cache, as `init` wrote it before
+    /// OWL-629.
     #[test]
     fn a_cache_the_personal_file_does_not_allow_is_named_with_its_lines() {
         let system = logged_in(with_harnesses(with_git(FakeSystem::default())));
-        let detected = owlshift_core::stack::detect(&owlshift_core::stack::RootFiles {
-            names: vec![
-                "yarn.lock".into(),
-                "package.json".into(),
-                ".yarnrc.yml".into(),
-            ],
-            files: vec![
-                (
-                    "package.json".into(),
-                    r#"{"packageManager":"yarn@4.5.0"}"#.into(),
-                ),
-                (".yarnrc.yml".into(), "nodeLinker: node-modules\n".into()),
-            ],
-        });
         let text = crate::init::project_file(&crate::init::InitOptions {
             tracker: TrackerKind::Markdown,
             team: None,
             gate: vec!["make".into()],
-            detected,
+            detected: Default::default(),
             admitter: None,
         })
-        .unwrap();
+        .unwrap()
+        .replace("# caches = [\".pyenv\"]\n", "caches = [\".yarn/berry\"]\n");
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("owlshift.toml");
         std::fs::write(&path, &text).unwrap();

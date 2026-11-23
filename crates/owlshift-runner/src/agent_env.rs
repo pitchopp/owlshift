@@ -1422,6 +1422,8 @@ mod tests {
     /// profile; a declared cache holding it opens nothing; its variable is
     /// set on the spawned command alone, never among the variables the
     /// runner's own git gets; a deleted folder is made again at the spawn.
+    /// OWL-629: a run cache named `XDG_RUNTIME_DIR` gets its folder, never
+    /// the runner's own value, which no agent inherits.
     #[cfg(unix)]
     #[test]
     fn the_run_caches_are_written_and_named_on_the_command_alone() {
@@ -1429,19 +1431,25 @@ mod tests {
         let base = std::fs::canonicalize(base.path()).unwrap();
         let home = base.join("home");
         let cargo = home.join("Library/Caches/owlshift/github.com/o/r/cargo");
+        let locks = home.join("Library/Caches/owlshift/github.com/o/r/pnpm-locks");
         std::fs::create_dir_all(home.join("wt")).unwrap();
         std::fs::create_dir_all(&cargo).unwrap();
         let parent = [
             ("HOME".into(), home.clone().into_os_string()),
             ("PATH".into(), OsString::from("/usr/bin:/bin")),
+            ("XDG_RUNTIME_DIR".into(), OsString::from("/run/user/1000")),
         ];
         let agent = AgentEnv::for_project(parent, &[], &[])
             .unwrap()
             .with_caches(&["Library/Caches"])
             .with_run_caches(RunCaches::new(
                 home.join("Library/Caches/owlshift"),
-                vec![("CARGO_HOME".to_owned(), cargo.clone())],
+                vec![
+                    ("CARGO_HOME".to_owned(), cargo.clone()),
+                    ("XDG_RUNTIME_DIR".to_owned(), locks.clone()),
+                ],
             ));
+        assert!(agent.var("XDG_RUNTIME_DIR").is_none());
         for read_only in [false, true] {
             let run = RunPaths {
                 workdir: home.join("wt"),
@@ -1473,7 +1481,15 @@ mod tests {
             .unwrap();
         let set: Vec<_> = command.get_envs().collect();
         assert!(set.contains(&(OsStr::new("CARGO_HOME"), Some(cargo.as_os_str()))));
-        assert!(cargo.is_dir());
+        let runtime: Vec<_> = set
+            .iter()
+            .filter(|(name, _)| *name == OsStr::new("XDG_RUNTIME_DIR"))
+            .collect();
+        assert_eq!(
+            runtime,
+            [&(OsStr::new("XDG_RUNTIME_DIR"), Some(locks.as_os_str()))]
+        );
+        assert!(cargo.is_dir() && locks.is_dir());
     }
 
     /// Whether agent runs can be confined here, as `executor::gate`'s tests

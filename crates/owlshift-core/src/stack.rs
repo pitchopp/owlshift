@@ -1,19 +1,19 @@
 //! Stack detection for `owlshift init` (P9, OWL-539): the gate, the setup it
-//! needs, the caches of the home that setup reads confined (OWL-593) and the
-//! caches of Owlshift's own its runs may write (`stack.run_caches`, OWL-617),
-//! read from the names and contents of the repository's root files.
+//! needs and the caches of Owlshift's own its runs may write
+//! (`stack.run_caches`, OWL-617), read from the names and contents of the
+//! repository's root files.
 //!
 //! A pure function: the caller reads the root and passes in the file names and
 //! the contents of the four manifests it recognises (`Cargo.toml`,
-//! `package.json`, `pyproject.toml`, `Makefile`); lock files, and the files of
-//! Go, pip, bundler and Gradle (OWL-624), of pdm, Maven, Composer and .NET
-//! (OWL-627), of Elixir, Dart, Swift and Deno (OWL-628), are read by name
-//! only. Nothing detected here is ever run. The
+//! `package.json`, `pyproject.toml`, `Makefile`); lock files, yarn's
+//! `.yarnrc.yml`, and the files of Go, pip, bundler and Gradle (OWL-624), of
+//! pdm, Maven, Composer and .NET (OWL-627), of Elixir, Dart, Swift and Deno
+//! (OWL-628), are read by name only. Nothing detected here is ever run. The
 //! commands were checked with real calls, recorded in
 //! `docs/design/runtime-and-operations.md`, "Stack detection (P9)", and in the
-//! records of OWL-617, OWL-624, OWL-627 and OWL-628; a tool that could not be
-//! checked is not detected, and a run cache whose live check did not show it
-//! needed is not written, only named in a note.
+//! records of OWL-617, OWL-624, OWL-627, OWL-628 and OWL-629; a tool that
+//! could not be checked is not detected, and a run cache whose live check did
+//! not show it needed is not written, only named in a note.
 
 use serde::{Deserialize, Serialize};
 
@@ -55,9 +55,6 @@ pub struct Found {
     pub source: String,
     pub gate: Vec<Line>,
     pub setup: Vec<Line>,
-    /// The folders of the home the setup reads, as `stack.caches` names
-    /// them: each line's `command` is the folder (OWL-593).
-    pub caches: Vec<Line>,
     /// The caches of Owlshift's own the runs may write, as
     /// `stack.run_caches` declares them (OWL-617).
     pub run_caches: Vec<RunCache>,
@@ -101,11 +98,6 @@ impl Detection {
         self.found.iter().flat_map(|f| f.setup.iter())
     }
 
-    /// The detected cache folders, in order; a line's `command` is the folder.
-    pub fn caches(&self) -> impl Iterator<Item = &Line> {
-        self.found.iter().flat_map(|f| f.caches.iter())
-    }
-
     /// The detected caches a run may write, in order.
     pub fn run_caches(&self) -> impl Iterator<Item = &RunCache> {
         self.found.iter().flat_map(|f| f.run_caches.iter())
@@ -114,11 +106,6 @@ impl Detection {
 
 /// The manifests [`detect`] reads, which the runner must read.
 pub const MANIFESTS: [&str; 4] = ["Cargo.toml", "package.json", "pyproject.toml", "Makefile"];
-
-/// The other root files [`detect`] reads when the runner could, for what
-/// they say of a manifest's setup: yarn's settings (OWL-593). One missing
-/// or unread counts as empty.
-pub const SETTINGS: [&str; 1] = [".yarnrc.yml"];
 
 /// One source of [`detect`]: what it found in the root, `None` when the root
 /// holds nothing of it, or why its manifest was skipped.
@@ -173,7 +160,6 @@ fn found(source: impl Into<String>) -> Found {
         source: source.into(),
         gate: vec![],
         setup: vec![],
-        caches: vec![],
         run_caches: vec![],
         notes: vec![],
         gate_notes: vec![],
@@ -222,7 +208,6 @@ fn cargo(root: &RootFiles) -> Result<Option<Found>, String> {
             line(format!("cargo test --workspace{locked}"), from),
         ],
         setup: vec![],
-        caches: vec![],
         // Checked live (OWL-617): cargo with `CARGO_HOME` moved, rustup's
         // proxies and the tool chain left where they are.
         run_caches: vec![run_cache("CARGO_HOME", "cargo", from)],
@@ -269,20 +254,35 @@ struct NodeManager {
     name: &'static str,
     lock: &'static str,
     /// The setup's install command.
-    install: String,
-    /// The folder of the home the install must read, read-only, in a
-    /// confined run: its cache, which it cannot do without (OWL-593), with
-    /// what it was read from.
-    cache: Option<(&'static str, String)>,
-    /// The cache of Owlshift's own the install writes instead (OWL-617): the
-    /// variable the manager reads for it and the folder's name.
-    run_cache: Option<(&'static str, &'static str)>,
-    /// What the person should know about the cache, when none is declared.
-    note: Option<String>,
+    install: &'static str,
+    /// The caches of Owlshift's own the install writes (OWL-617, OWL-629):
+    /// the variable the manager reads for each and the folder's name.
+    run_caches: &'static [(&'static str, &'static str)],
+    /// What the person should know about the run caches.
+    note: Option<&'static str>,
 }
 
-/// yarn 2 or later's global cache, `~/.yarn/berry` (OWL-593).
-const YARN_BERRY: &str = ".yarn/berry";
+/// corepack's own folder, where it installs the pnpm or yarn a
+/// `packageManager` pins when the machine's `pnpm` or `yarn` is its shim
+/// (OWL-629).
+const COREPACK: (&str, &str) = ("COREPACK_HOME", "corepack");
+
+/// pnpm's run caches (OWL-629): its home, which holds the store and the
+/// versions pnpm 10 and later switch to when `packageManager` pins another;
+/// the folder pnpm 12 takes the store's locks in; corepack's.
+const PNPM: [(&str, &str); 3] = [
+    ("PNPM_HOME", "pnpm"),
+    ("XDG_RUNTIME_DIR", "pnpm-locks"),
+    COREPACK,
+];
+
+/// pnpm's run caches when `packageManager` pins a pnpm below 12, which takes
+/// no lock there.
+const PNPM_BELOW_12: [(&str, &str); 2] = [PNPM[0], COREPACK];
+
+/// yarn 2 or later's run caches (OWL-629): its global folder, which it makes
+/// whatever its cache settings, and corepack's.
+const YARN_BERRY: [(&str, &str); 2] = [("YARN_GLOBAL_FOLDER", "yarn"), COREPACK];
 
 /// The `packageManager` of `package.json` when it names `name`, with its
 /// major version: `("pnpm@10.33.2", 10)`. `None` for another manager, or a
@@ -299,112 +299,56 @@ fn package_manager<'a>(package: &'a serde_json::Value, name: &str) -> Option<(&'
     Some((manager, major))
 }
 
-/// Whether a yarn 2 or later project installs from yarn's global cache in
-/// the home (OWL-593): only when that is established, since a project file
-/// declaring a cache no machine needs is refused until each operator allows
-/// it. It is when the root's `.yarnrc.yml` sets `enableGlobalCache: true`,
-/// or when `package.json`'s `packageManager` names yarn 4 or later, whose
-/// default it is; and in neither case when `.yarnrc.yml` sets
-/// `enableGlobalCache: false`, a `cacheFolder` or a `globalFolder`, which
-/// move it. Only the top-level keys of `.yarnrc.yml` are read, line by line.
-fn yarn_global_cache(root: &RootFiles, package: &serde_json::Value) -> Option<String> {
-    let rc = root.content(".yarnrc.yml").unwrap_or_default();
-    let setting = |key: &str| {
-        rc.lines().find_map(|raw| {
-            let value = raw.strip_prefix(key)?.strip_prefix(':')?;
-            let value = value.split('#').next().unwrap_or_default().trim();
-            Some(value.trim_matches(['"', '\'']).to_owned())
-        })
-    };
-    if setting("cacheFolder").is_some() || setting("globalFolder").is_some() {
-        return None;
-    }
-    match setting("enableGlobalCache").as_deref() {
-        Some("false") => return None,
-        Some("true") => return Some("`enableGlobalCache: true` in .yarnrc.yml".to_owned()),
-        _ => {}
-    }
-    let (manager, major) = package_manager(package, "yarn")?;
-    (major >= 4).then(|| format!("`{manager}`, the `packageManager` of package.json"))
-}
-
-/// Which manager the lock file names, its install, and the cache it needs
-/// confined. Checked live (OWL-593): yarn 1 skips a cache it cannot write
-/// and bun falls back to one of its own, both fetching from the registry,
-/// so they need none; yarn 4 on its global cache fails with `EPERM` unless
-/// it reads it ([`yarn_global_cache`]). npm and pnpm 10 install online into
-/// a cache of Owlshift's own their runs write, `npm_config_cache` and
-/// `npm_config_store_dir` moving it (OWL-617, checked live on macOS and
-/// Linux); pnpm 12 failed confined whatever its store (OWL-598), so a
-/// `packageManager` naming a pnpm other than 10 keeps the plain install and
-/// gets no run cache.
+/// Which manager the lock file names, its install, and the caches of
+/// Owlshift's own its runs write. Each was checked live, confined (OWL-593,
+/// OWL-617, OWL-629): yarn 1 skips a cache it cannot write and bun falls
+/// back to one of its own, both fetching from the registry, so they need
+/// none; npm writes `npm_config_cache`. pnpm of every major keeps its store
+/// in `PNPM_HOME`, and pnpm 10 and later download there the version
+/// `packageManager` pins when it is not theirs; pnpm 12 takes the store's
+/// locks in `XDG_RUNTIME_DIR`, otherwise in the shared `/tmp`, which the
+/// sandbox closes, so only a pin below 12 goes without it. yarn 2 and
+/// later, named by `.yarnrc.yml` or by a `packageManager` pinning it, make
+/// their global folder whatever their cache settings. A pnpm or a yarn the
+/// machine reaches through corepack is installed into `COREPACK_HOME`.
 fn node_manager(root: &RootFiles, package: &serde_json::Value) -> Option<NodeManager> {
-    let plain = |name, lock, install: String| NodeManager {
+    let plain = |name, lock, install| NodeManager {
         name,
         lock,
         install,
-        cache: None,
-        run_cache: None,
+        run_caches: &[],
         note: None,
     };
     if root.has("pnpm-lock.yaml") {
-        let pnpm = plain(
-            "pnpm",
-            "pnpm-lock.yaml",
-            "pnpm install --frozen-lockfile".into(),
-        );
-        Some(match package_manager(package, "pnpm") {
-            Some((manager, major)) if major != 10 => NodeManager {
-                note: Some(format!(
-                    "`{manager}`, the `packageManager` of package.json, is not pnpm 10: no run \
-                     cache was declared for its store, only pnpm 10 having been checked to \
-                     install into one; `owlshift gate` checks the setup"
-                )),
-                ..pnpm
-            },
-            _ => NodeManager {
-                run_cache: Some(("npm_config_store_dir", "pnpm-store")),
-                ..pnpm
-            },
+        let below_12 = package_manager(package, "pnpm").is_some_and(|(_, major)| major < 12);
+        Some(NodeManager {
+            run_caches: if below_12 { &PNPM_BELOW_12 } else { &PNPM },
+            note: (!below_12).then_some(
+                "`XDG_RUNTIME_DIR` is the folder pnpm 12 takes its store's locks in, the shared \
+                 `/tmp` otherwise, which confined runs cannot write; pnpm 11 and earlier leave it \
+                 empty",
+            ),
+            ..plain("pnpm", "pnpm-lock.yaml", "pnpm install --frozen-lockfile")
         })
     } else if root.has("yarn.lock") {
-        // `.yarnrc.yml` is yarn 2 or later.
-        Some(if root.has(".yarnrc.yml") {
-            let berry = plain("yarn", "yarn.lock", "yarn install --immutable".into());
-            match yarn_global_cache(root, package) {
-                Some(from) => NodeManager {
-                    cache: Some((YARN_BERRY, from)),
-                    ..berry
-                },
-                None => NodeManager {
-                    note: Some(format!(
-                        "no yarn cache was declared, yarn's global cache not being established \
-                         here: when the setup installs from `~/{YARN_BERRY}`, add \
-                         `caches = [\"{YARN_BERRY}\"]`, which each machine allows in \
-                         `allow_caches`"
-                    )),
-                    ..berry
-                },
+        let berry = root.has(".yarnrc.yml")
+            || package_manager(package, "yarn").is_some_and(|(_, major)| major >= 2);
+        Some(if berry {
+            NodeManager {
+                run_caches: &YARN_BERRY,
+                ..plain("yarn", "yarn.lock", "yarn install --immutable")
             }
         } else {
-            plain("yarn", "yarn.lock", "yarn install --frozen-lockfile".into())
+            plain("yarn", "yarn.lock", "yarn install --frozen-lockfile")
         })
     } else if root.has("bun.lock") {
-        Some(plain(
-            "bun",
-            "bun.lock",
-            "bun install --frozen-lockfile".into(),
-        ))
+        Some(plain("bun", "bun.lock", "bun install --frozen-lockfile"))
     } else if root.has("bun.lockb") {
-        Some(plain(
-            "bun",
-            "bun.lockb",
-            "bun install --frozen-lockfile".into(),
-        ))
+        Some(plain("bun", "bun.lockb", "bun install --frozen-lockfile"))
     } else if root.has("package-lock.json") {
         Some(NodeManager {
-            run_cache: Some(("npm_config_cache", "npm")),
-            ..plain("npm", "package-lock.json", "npm ci".into())
+            run_caches: &[("npm_config_cache", "npm")],
+            ..plain("npm", "package-lock.json", "npm ci")
         })
     } else {
         None
@@ -419,39 +363,19 @@ fn package_json(root: &RootFiles) -> Result<Option<Found>, String> {
         serde_json::from_str(text).map_err(|_| "it is not valid JSON".to_string())?;
     let scripts = value.get("scripts").and_then(|s| s.as_object());
     let script = |key: &str| scripts.and_then(|s| s.get(key)).and_then(|v| v.as_str());
-    let mut found = Found {
-        source: "package.json".to_string(),
-        gate: vec![],
-        setup: vec![],
-        caches: vec![],
-        run_caches: vec![],
-        notes: vec![],
-        gate_notes: vec![],
-    };
+    let mut found = found("package.json");
     let manager = match node_manager(root, &value) {
         Some(manager) => {
             let (name, lock) = (manager.name, manager.lock);
+            let from = format!("{lock}, the lock file of {name}");
             found.source = format!("package.json ({lock})");
-            found.setup.push(line(
-                manager.install,
-                format!("{lock}, the lock file of {name}"),
-            ));
-            found.notes.extend(manager.note);
-            if let Some((variable, folder)) = manager.run_cache {
-                found.run_caches.push(run_cache(
-                    variable,
-                    folder,
-                    format!("{lock}, the lock file of {name}"),
-                ));
-            }
-            if let Some((folder, from)) = manager.cache {
-                found.caches.push(line(folder, from));
-                found.notes.push(format!(
-                    "the setup installs from {name}'s cache, `~/{folder}`, read-only: each \
-                     machine allows `{folder}` in `allow_caches` of its personal configuration, \
-                     and its cache must hold the project's packages"
-                ));
-            }
+            found.setup.push(line(manager.install, from.clone()));
+            found.notes.extend(manager.note.map(str::to_owned));
+            found.run_caches = manager
+                .run_caches
+                .iter()
+                .map(|(variable, folder)| run_cache(variable, folder, from.clone()))
+                .collect();
             name
         }
         None => {
@@ -1200,7 +1124,6 @@ fn makefile_targets(text: &str) -> Option<Found> {
         source: "Makefile".to_string(),
         gate,
         setup: vec![],
-        caches: vec![],
         run_caches: vec![],
         notes: vec![],
         gate_notes: vec![],
@@ -1333,7 +1256,7 @@ check::
                 &["pnpm-lock.yaml"],
                 "pnpm install --frozen-lockfile",
                 "pnpm",
-                &[("npm_config_store_dir", "pnpm-store")],
+                &PNPM,
             ),
             (
                 &["yarn.lock"],
@@ -1345,7 +1268,7 @@ check::
                 &["yarn.lock", ".yarnrc.yml"],
                 "yarn install --immutable",
                 "yarn",
-                &[],
+                &YARN_BERRY,
             ),
             (&["bun.lock"], "bun install --frozen-lockfile", "bun", &[]),
             (&["bun.lockb"], "bun install --frozen-lockfile", "bun", &[]),
@@ -1359,9 +1282,8 @@ check::
         for (names, setup, manager, written) in cases {
             let d = detect(&root(names, &[("package.json", pkg)]));
             assert_eq!(commands(d.setup()), [setup], "{names:?}");
-            // OWL-617: npm and pnpm install online into a run cache, and
-            // read none of the home's.
-            assert_eq!(commands(d.caches()), Vec::<&str>::new(), "{names:?}");
+            // OWL-617, OWL-629: each manager installs online into caches of
+            // Owlshift's own.
             assert_eq!(run_caches(d.run_caches()), written, "{names:?}");
             assert_eq!(
                 commands(d.gate()),
@@ -1372,12 +1294,11 @@ check::
                 ],
                 "{names:?}"
             );
-            // yarn 2 or later, its cache unknown, says what to declare; the
-            // gate's own note is a guess (OWL-595).
+            // pnpm says why it writes `XDG_RUNTIME_DIR`; the gate's own note
+            // is a guess (OWL-595).
             let notes = &d.found[0].notes;
-            let noted = names.contains(&".yarnrc.yml");
-            assert_eq!(notes.len(), usize::from(noted), "{notes:?}");
-            assert!(notes.iter().all(|n| n.contains("allow_caches")));
+            assert_eq!(notes.len(), usize::from(manager == "pnpm"), "{notes:?}");
+            assert!(notes.iter().all(|n| n.contains("`XDG_RUNTIME_DIR`")));
             let gate_notes = &d.found[0].gate_notes;
             assert_eq!(gate_notes.len(), 1, "{gate_notes:?}");
             assert!(gate_notes[0].contains("a guess"), "{gate_notes:?}");
@@ -1387,79 +1308,74 @@ check::
         }
     }
 
-    /// OWL-593: yarn 2 or later declares `~/.yarn/berry` only when its
-    /// global cache is established: yarn 4 by `packageManager`, or
-    /// `enableGlobalCache: true`, unless `.yarnrc.yml` turns it off or moves
-    /// it; otherwise a note says what to declare.
+    /// OWL-629: pnpm's home and corepack's are run caches whatever the pin;
+    /// the folder pnpm 12 takes its locks in is one unless `packageManager`
+    /// pins a pnpm below 12. A pin that names another manager or a version
+    /// that does not start with a number counts as no pin.
     #[test]
-    fn yarns_global_cache_is_declared_only_when_established() {
-        let cases: [(&str, &str, bool); 7] = [
-            ("yarn@4.5.0", "nodeLinker: node-modules\n", true),
-            ("", "enableGlobalCache: true # on\n", true),
-            ("yarn@3.6.4", "nodeLinker: node-modules\n", false),
-            ("", "nodeLinker: node-modules\n", false),
-            ("yarn@4.5.0", "enableGlobalCache: false\n", false),
-            ("yarn@4.5.0", "cacheFolder: ./.yarn/cache\n", false),
-            ("yarn@4.5.0", "globalFolder: /opt/yarn\n", false),
-        ];
-        for (manager, rc, global) in cases {
-            let pkg = if manager.is_empty() {
-                "{}".to_owned()
-            } else {
-                format!(r#"{{"packageManager":"{manager}"}}"#)
-            };
-            let d = detect(&root(
-                &["yarn.lock"],
-                &[("package.json", pkg.as_str()), (".yarnrc.yml", rc)],
-            ));
-            let caches = if global { &[YARN_BERRY][..] } else { &[] };
-            assert_eq!(commands(d.caches()), caches, "{manager} {rc:?}");
-            assert_eq!(d.found[0].notes.len(), 1, "{manager} {rc:?}");
-            assert_eq!(
-                d.found[0].notes[0].starts_with("no yarn cache"),
-                !global,
-                "{manager} {rc:?}"
-            );
-        }
-    }
-
-    /// OWL-617: pnpm's store goes to a run cache, unless `packageManager`
-    /// names a pnpm other than 10, which declares none and says why; the
-    /// install is pnpm's plain one either way.
-    #[test]
-    fn pnpms_store_is_a_run_cache_unless_package_manager_names_another_major() {
+    fn pnpm_writes_its_lock_folder_unless_pinned_below_12() {
         let cases: [(&str, bool); 6] = [
             ("", true),
-            ("pnpm@10.33.2", true),
-            ("pnpm@10", true),
-            ("pnpm@^10", true),
-            ("pnpm@9.15.0", false),
-            ("pnpm@12.21.0+sha512.abc", false),
+            ("yarn@4.19.0", true),
+            ("pnpm@9.15.9+sha512.abc", false),
+            ("pnpm@11.28.13", false),
+            ("pnpm@12.0.0-rc.1", true),
+            ("pnpm@latest", true),
         ];
-        for (manager, ten) in cases {
+        for (manager, locks) in cases {
             let pkg = format!(r#"{{"packageManager":"{manager}"}}"#);
             let d = detect(&root(&["pnpm-lock.yaml"], &[("package.json", &pkg)]));
-            let notes = &d.found[0].notes;
             assert_eq!(
                 commands(d.setup()),
                 ["pnpm install --frozen-lockfile"],
                 "{manager}"
             );
-            assert!(d.caches().next().is_none(), "{manager}");
-            if ten {
-                assert_eq!(
-                    run_caches(d.run_caches()),
-                    [("npm_config_store_dir", "pnpm-store")],
-                    "{manager}"
-                );
-                assert!(notes.is_empty(), "{manager} {notes:?}");
-            } else {
-                assert!(d.run_caches().next().is_none(), "{manager}");
-                assert_eq!(notes.len(), 1, "{manager} {notes:?}");
-                assert!(notes[0].starts_with(&format!("`{manager}`, the `packageManager`")));
-                assert!(notes[0].contains("is not pnpm 10"));
-            }
+            let written = if locks { &PNPM[..] } else { &PNPM_BELOW_12[..] };
+            assert_eq!(run_caches(d.run_caches()), written, "{manager}");
+            assert_eq!(d.found[0].notes.len(), usize::from(locks), "{manager}");
         }
+    }
+
+    /// OWL-629: yarn 2 or later, named by `.yarnrc.yml` or by a
+    /// `packageManager` pinning it, installs `--immutable` into its global
+    /// folder, which a `globalFolder` setting does not move: the variable
+    /// wins. yarn 1 keeps its plain install and no run cache.
+    #[test]
+    fn yarn_2_or_later_writes_its_global_folder() {
+        let cases: [(&str, Option<&str>, bool); 5] = [
+            ("", Some("globalFolder: /opt/yarn\n"), true),
+            ("yarn@4.19.0", None, true),
+            ("yarn@2.4.2", None, true),
+            ("yarn@1.22.22", None, false),
+            ("", None, false),
+        ];
+        for (manager, rc, berry) in cases {
+            let pkg = format!(r#"{{"packageManager":"{manager}"}}"#);
+            let mut files = vec![("package.json", pkg.as_str())];
+            files.extend(rc.map(|rc| (".yarnrc.yml", rc)));
+            let d = detect(&root(&["yarn.lock"], &files));
+            let (setup, written) = if berry {
+                ("yarn install --immutable", &YARN_BERRY[..])
+            } else {
+                ("yarn install --frozen-lockfile", &[][..])
+            };
+            assert_eq!(commands(d.setup()), [setup], "{manager} {rc:?}");
+            assert_eq!(run_caches(d.run_caches()), written, "{manager} {rc:?}");
+            assert!(d.found[0].notes.is_empty(), "{manager} {rc:?}");
+        }
+    }
+
+    /// OWL-629: `XDG_RUNTIME_DIR` may name a run cache because a run never
+    /// gets the person's: it locates the Secret Service, so no agent inherits
+    /// it, and the run cache sets it to an empty folder of Owlshift's own.
+    #[test]
+    fn the_lock_folder_is_a_run_cache_and_the_real_one_is_never_inherited() {
+        assert!(
+            !crate::agent_env::INHERITED
+                .iter()
+                .any(|name| name.eq_ignore_ascii_case("XDG_RUNTIME_DIR"))
+        );
+        crate::agent_env::check_run_caches(&[PNPM[1]]).unwrap();
     }
 
     #[test]
@@ -1987,6 +1903,7 @@ check::
                 &[("pyproject.toml", PY)],
             ),
             root(&["mix.exs", "mix.lock", "deno.json"], &[]),
+            root(&["yarn.lock", ".yarnrc.yml"], &[("package.json", "{}")]),
         ];
         let mut seen = 0;
         for r in &roots {
@@ -1995,7 +1912,7 @@ check::
             seen += entries.len();
             crate::agent_env::check_run_caches(&entries).unwrap();
         }
-        assert_eq!(seen, 17);
+        assert_eq!(seen, 21);
     }
 
     #[test]

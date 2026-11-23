@@ -22,7 +22,7 @@ use semver::Version;
 
 use owlshift_adapters::forge::Repo;
 use owlshift_contracts::config::{ProjectConfig, TrackerKind};
-use owlshift_core::stack::{Detection, MANIFESTS, RootFiles, SETTINGS};
+use owlshift_core::stack::{Detection, MANIFESTS, RootFiles};
 use owlshift_platform::keychain::{Keychain, KeychainError, SERVICE, Secret};
 
 use crate::config::{OWLSHIFT_VERSION, PROJECT_FILE};
@@ -93,8 +93,7 @@ requires = \">={}.{}\"
         // A source's notes are written above what it gives the file, and
         // above nothing when it gives no line, since they say what to add
         // (OWL-624); not above a gate `--gate` replaced, the only line given.
-        let kept =
-            !found.setup.is_empty() || !found.caches.is_empty() || !found.run_caches.is_empty();
+        let kept = !found.setup.is_empty() || !found.run_caches.is_empty();
         let none = !kept && found.gate.is_empty();
         if (!by_hand && !found.gate.is_empty()) || kept || none {
             let own = (!by_hand && !found.gate.is_empty()).then_some(&found.gate_notes);
@@ -122,17 +121,6 @@ requires = \">={}.{}\"
         "# setup = [\"pnpm install --frozen-lockfile\"]\n".to_owned()
     } else {
         commands_block("setup", &setup_lines, &quote)
-    };
-    // The caches the detected setup reads confined (OWL-593), or the example.
-    let cache_lines: Vec<(Option<&str>, &str)> = options
-        .detected
-        .caches()
-        .map(|l| (Some(l.read_from.as_str()), l.command.as_str()))
-        .collect();
-    let caches = if cache_lines.is_empty() {
-        "# caches = [\"Library/pnpm\"]\n".to_owned()
-    } else {
-        commands_block("caches", &cache_lines, &quote)
     };
     // The caches the detected managers write (OWL-617), a dotted key each
     // under its source, or the example.
@@ -164,10 +152,11 @@ requires = \">={}.{}\"
 # Commands that install the gate's dependencies, run in order with the
 # network open before a Build's agent and before the gate; they may change
 # only ignored files, so install from a frozen lockfile. Default: none.
-{setup}# Folders of your home, such as a package store, that the setup, the agent
+{setup}# Folders of your home, such as pyenv's Pythons, that the setup, the agent
 # and the gate read, never write; a machine opens only those its personal
 # `allow_caches` lists, never one holding credentials. Default: none.
-{caches}# Caches of Owlshift's own that the setup, the agent and the gate write, so
+# caches = [\".pyenv\"]
+# Caches of Owlshift's own that the setup, the agent and the gate write, so
 # an install fetches what is missing and keeps it for the next runs: the
 # variable a package manager reads for its cache, and a folder's name. Each
 # machine makes the folder in its cache directory, one tree per project, and
@@ -489,10 +478,9 @@ fn one_line(text: &str) -> String {
 const MANIFEST_LIMIT: u64 = 1 << 20;
 
 /// Reads the root of a repository for [`owlshift_core::stack::detect`]: the
-/// names of its files, and the contents of the manifests it recognises and
-/// of the settings files it reads beside them ([`SETTINGS`]). A file over
-/// 1 MiB or not UTF-8 is left unread, which detection reports as skipped for
-/// a manifest; only a root that cannot be listed is an error.
+/// names of its files, and the contents of the manifests it recognises. A
+/// file over 1 MiB or not UTF-8 is left unread, which detection reports as
+/// skipped; only a root that cannot be listed is an error.
 pub fn read_root_files(root: &Path) -> io::Result<RootFiles> {
     let mut names = Vec::new();
     for entry in std::fs::read_dir(root)? {
@@ -503,7 +491,7 @@ pub fn read_root_files(root: &Path) -> io::Result<RootFiles> {
     }
     names.sort();
     let mut files = Vec::new();
-    for name in MANIFESTS.into_iter().chain(SETTINGS) {
+    for name in MANIFESTS {
         if !names.iter().any(|n| n == name) {
             continue;
         }
@@ -1171,7 +1159,7 @@ mod tests {
             .replace("# caches = ", "caches = ");
         let config = ProjectConfig::parse(&uncommented).unwrap();
         assert_eq!(config.stack.setup, ["pnpm install --frozen-lockfile"]);
-        assert_eq!(config.stack.caches, ["Library/pnpm"]);
+        assert_eq!(config.stack.caches, [".pyenv"]);
 
         let markdown = project_file(&options(TrackerKind::Markdown, None, &[])).unwrap();
         let config = ProjectConfig::parse(&markdown).unwrap();
@@ -1592,19 +1580,14 @@ mod tests {
     }
 
     /// OWL-593: the lines `init` prints and `doctor` gives let a project
-    /// declaring a cache of the home (yarn 4's) load once added to the
-    /// personal file, with or without its repository: the key is the one
-    /// the loader reads.
+    /// declaring a cache of the home (yarn 4's, as `init` wrote it before
+    /// OWL-629) load once added to the personal file, with or without its
+    /// repository: the key is the one the loader reads.
     #[test]
     fn the_allow_caches_lines_let_the_project_load() {
-        let d = detected(
-            &["yarn.lock"],
-            &[
-                ("package.json", r#"{"packageManager":"yarn@4.5.0"}"#),
-                (".yarnrc.yml", "nodeLinker: node-modules\n"),
-            ],
-        );
-        let project = project_file(&with(d, &["make"])).unwrap();
+        let project = project_file(&with(Detection::default(), &["make"]))
+            .unwrap()
+            .replace("# caches = [\".pyenv\"]\n", "caches = [\".yarn/berry\"]\n");
         let repo = Repo::parse("acme/web").unwrap();
         let dir = tempfile::tempdir().unwrap();
         let personal = dir.path().join("config.toml");
@@ -1801,18 +1784,26 @@ mod tests {
         let text = project_file(&with(d, &["make ci"])).unwrap();
         let config = ProjectConfig::parse(&text).unwrap();
         assert_eq!(config.stack.gate, ["make ci"]);
-        // OWL-617: pnpm's plain install, its store a run cache.
+        // OWL-617, OWL-629: pnpm's plain install, its home, its lock folder
+        // and corepack's run caches, which load back from the file.
         assert_eq!(config.stack.setup, ["pnpm install --frozen-lockfile"]);
         assert!(config.stack.caches.is_empty());
         assert_eq!(
             config.stack.run_cache_entries(),
-            [("npm_config_store_dir", "pnpm-store")]
+            [
+                ("COREPACK_HOME", "corepack"),
+                ("PNPM_HOME", "pnpm"),
+                ("XDG_RUNTIME_DIR", "pnpm-locks")
+            ]
         );
         assert!(!text.contains("pnpm run test"));
         assert!(text.contains(
-            "# read from pnpm-lock.yaml, the lock file of pnpm\nrun_caches.npm_config_store_dir = \
-             \"pnpm-store\"\n"
+            "# read from pnpm-lock.yaml, the lock file of pnpm\nrun_caches.PNPM_HOME = \"pnpm\"\n"
         ));
+        assert!(
+            text.contains("# note: `XDG_RUNTIME_DIR` is the folder pnpm 12"),
+            "{text}"
+        );
     }
 
     #[test]
