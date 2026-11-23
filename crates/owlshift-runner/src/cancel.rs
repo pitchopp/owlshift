@@ -609,10 +609,23 @@ mod tests {
     }
 
     /// A step's watcher asks the step's stop once the file appears, and its
-    /// drop ends it. The stop is the process's: nextest runs each test in a
-    /// process of its own.
+    /// drop ends it. The stop is the process's: it stops every run tree the
+    /// process starts until it ends, a gate command another test runs
+    /// included, so the test runs alone in a fresh copy of this test binary
+    /// (`alone::run_alone`, OWL-645).
     #[test]
     fn a_watcher_stops_the_step_once_the_file_appears() {
+        crate::alone::run_alone(
+            "cancel::tests::helper_a_watcher_stops_the_step_once_the_file_appears",
+        );
+    }
+
+    #[test]
+    #[ignore = "helper, run by the test above"]
+    fn helper_a_watcher_stops_the_step_once_the_file_appears() {
+        if !crate::alone::running_alone() {
+            return;
+        }
         let data = tempfile::tempdir().unwrap();
         let dirs = ProjectDirs::new(data.path(), &Repo::parse("acme/web").unwrap());
         let ticket = TicketId::new("WEB-1").unwrap();
@@ -648,9 +661,20 @@ mod tests {
     }
 
     /// OWL-586: a lost claim's record stops the step as a cancel does, and
-    /// says so.
+    /// says so. Run alone, as the test above is.
     #[test]
     fn a_watcher_stops_the_step_once_its_claim_is_lost() {
+        crate::alone::run_alone(
+            "cancel::tests::helper_a_watcher_stops_the_step_once_its_claim_is_lost",
+        );
+    }
+
+    #[test]
+    #[ignore = "helper, run by the test above"]
+    fn helper_a_watcher_stops_the_step_once_its_claim_is_lost() {
+        if !crate::alone::running_alone() {
+            return;
+        }
         let data = tempfile::tempdir().unwrap();
         let dirs = ProjectDirs::new(data.path(), &Repo::parse("acme/web").unwrap());
         let ticket = TicketId::new("WEB-1").unwrap();

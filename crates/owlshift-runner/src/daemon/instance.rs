@@ -227,11 +227,26 @@ mod tests {
     /// OWL-616: a daemon adopts the very lock it was handed, the first's
     /// record going, and the lock stays held once the first lets go; a fresh
     /// open of the lock, another open file description, and another file are
-    /// refused.
+    /// refused. Run alone (`alone::run_alone`, OWL-645): the lock is let go
+    /// and read free again, which a child another test forked meanwhile would
+    /// make look held.
     #[cfg(unix)]
     #[test]
     fn a_daemon_adopts_only_the_lock_it_was_handed() {
+        crate::alone::run_alone(
+            "daemon::instance::tests::helper_a_daemon_adopts_only_the_lock_it_was_handed",
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[ignore = "helper, run by the test above"]
+    fn helper_a_daemon_adopts_only_the_lock_it_was_handed() {
         use std::os::fd::IntoRawFd;
+
+        if !crate::alone::running_alone() {
+            return;
+        }
 
         let data = tempfile::tempdir().unwrap();
         let data = data.path();
@@ -257,8 +272,20 @@ mod tests {
         assert!(running(data).unwrap().is_none());
     }
 
+    /// Run alone, as the test above is.
     #[test]
     fn one_daemon_holds_the_data_directory_until_it_ends() {
+        crate::alone::run_alone(
+            "daemon::instance::tests::helper_one_daemon_holds_the_data_directory_until_it_ends",
+        );
+    }
+
+    #[test]
+    #[ignore = "helper, run by the test above"]
+    fn helper_one_daemon_holds_the_data_directory_until_it_ends() {
+        if !crate::alone::running_alone() {
+            return;
+        }
         let data = tempfile::tempdir().unwrap();
         let data = data.path();
         assert!(running(data).unwrap().is_none(), "no daemon yet");

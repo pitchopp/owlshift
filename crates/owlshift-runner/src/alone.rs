@@ -5,7 +5,10 @@
 //! opened until it execs: a lock a test releases and takes again, or that the
 //! code under test takes again, can then look held. A test that does so runs
 //! its body as an ignored helper, alone in a fresh process where nothing else
-//! spawns (build plan, check (e), "Rechecked on 2026-10-20"). Under nextest,
+//! spawns (build plan, check (e), "Rechecked on 2026-10-20"). So does a test
+//! that asks the process-wide step stop
+//! (`owlshift_platform::process::stop_step`): it stops the run trees the
+//! other tests start, their gate commands included (OWL-645). Under nextest,
 //! every test is a process of its own already; the copy costs one process.
 
 use std::process::Command;
