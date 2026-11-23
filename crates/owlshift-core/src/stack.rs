@@ -7,10 +7,11 @@
 //! the contents of the four manifests it recognises (`Cargo.toml`,
 //! `package.json`, `pyproject.toml`, `Makefile`); lock files, and the files of
 //! Go, pip, bundler and Gradle (OWL-624), of pdm, Maven, Composer and .NET
-//! (OWL-627), are read by name only. Nothing detected here is ever run. The
+//! (OWL-627), of Elixir, Dart, Swift and Deno (OWL-628), are read by name
+//! only. Nothing detected here is ever run. The
 //! commands were checked with real calls, recorded in
 //! `docs/design/runtime-and-operations.md`, "Stack detection (P9)", and in the
-//! records of OWL-617, OWL-624 and OWL-627; a tool that could not be
+//! records of OWL-617, OWL-624, OWL-627 and OWL-628; a tool that could not be
 //! checked is not detected, and a run cache whose live check did not show it
 //! needed is not written, only named in a note.
 
@@ -83,7 +84,7 @@ pub struct RunCache {
 pub struct Detection {
     /// In the fixed order `Cargo.toml`, `go.mod`, `package.json`, Python
     /// (`pyproject.toml`, `requirements.txt`), `Gemfile`, Gradle, Maven,
-    /// Composer, .NET, `Makefile`.
+    /// Composer, .NET, Elixir, Dart, Swift, Deno, `Makefile`.
     pub found: Vec<Found>,
     /// A manifest that could not be read or parsed, with why. Never an error.
     pub skipped: Vec<String>,
@@ -128,7 +129,7 @@ pub fn detect(root: &RootFiles) -> Detection {
     // Each with the name it is skipped under. Only a source that reads a
     // manifest's text, of `MANIFESTS`, can be skipped; the others read names
     // and keep a name here for the list's sake.
-    let sources: [(&str, Source); 10] = [
+    let sources: [(&str, Source); 14] = [
         ("Cargo.toml", cargo),
         ("go.mod", go),
         ("package.json", package_json),
@@ -138,6 +139,10 @@ pub fn detect(root: &RootFiles) -> Detection {
         ("pom.xml", maven),
         ("composer.json", composer),
         (".NET", dotnet),
+        ("mix.exs", elixir),
+        ("pubspec.yaml", dart),
+        ("Package.swift", swift),
+        ("deno.json", deno),
         ("Makefile", makefile),
     ];
     let mut out = Detection::default();
@@ -1006,6 +1011,150 @@ fn dotnet(root: &RootFiles) -> Result<Option<Found>, String> {
     Ok(Some(found))
 }
 
+/// Mix's install of Hex and rebar into its home, when they are missing, with
+/// the certificates of `/etc/ssl/cert.pem` where that file is, macOS's bundle
+/// of the system's roots (checked live on macOS, confined, OWL-628). Elsewhere
+/// Mix reads the system's certificates itself.
+const MIX_INSTALL: &str = "[ ! -f /etc/ssl/cert.pem ] || export HEX_CACERTS_PATH=/etc/ssl/cert.pem; \
+                           mix local.hex --force --if-missing && mix local.rebar --force --if-missing";
+
+/// Elixir (OWL-628), from `mix.exs`, read by name with `mix.lock` and
+/// `.formatter.exs`: the setup installs Hex and rebar into Mix's home when
+/// they are missing, then fetches the locked dependencies, refusing a lock
+/// that would change; the gate checks the formatting when the formatter has
+/// its settings, then runs the tests. Checked live, confined: Mix fails
+/// writing its home and Hex its cache unless `MIX_HOME` and `HEX_HOME` are
+/// moved; and on macOS Mix reads the system's certificates through the
+/// keychain, closed to a confined run, so its download of Hex and rebar
+/// fails unless `HEX_CACERTS_PATH` names macOS's own bundle,
+/// `/etc/ssl/cert.pem` ([`MIX_INSTALL`]).
+fn elixir(root: &RootFiles) -> Result<Option<Found>, String> {
+    if !root.has("mix.exs") {
+        return Ok(None);
+    }
+    let mut found = found("mix.exs");
+    if root.has("mix.lock") {
+        found.source = "mix.exs (mix.lock)".to_string();
+        let from = "mix.lock, the lock file of Mix";
+        found.setup = vec![
+            line(MIX_INSTALL, from),
+            line("mix deps.get --check-locked", from),
+        ];
+        found.run_caches = vec![
+            run_cache("MIX_HOME", "mix", from),
+            run_cache("HEX_HOME", "hex", from),
+        ];
+        found.notes.push(
+            "the Mix setup gives Mix the certificates of `/etc/ssl/cert.pem` where that file is, \
+             since on macOS Mix reads them through the keychain, which the sandbox closes"
+                .to_string(),
+        );
+    } else {
+        // An install here would write a lock file into the repository.
+        found.notes.push(
+            "mix.exs has no lock file, so no setup was written: the gate needs a setup that \
+             fetches the dependencies, such as `mix deps.get`, with `run_caches.MIX_HOME = \"mix\"` \
+             and `run_caches.HEX_HOME = \"hex\"`"
+                .to_string(),
+        );
+    }
+    if root.has(".formatter.exs") {
+        found.gate.push(line(
+            "mix format --check-formatted",
+            ".formatter.exs, the settings of mix format",
+        ));
+    } else {
+        found.notes.push(
+            "no `.formatter.exs` at the root, so the formatting is not checked: with one, the gate \
+             can run `mix format --check-formatted`"
+                .to_string(),
+        );
+    }
+    found.gate.push(line("mix test", "mix.exs"));
+    Ok(Some(found))
+}
+
+/// Dart and Flutter (OWL-628), from `pubspec.yaml`, read by name: a note
+/// only. Neither was checked confined, the Dart SDK being too large to fetch
+/// at the network's rate the day of the check and Flutter's larger still, so
+/// the note gives the lines and the variable to check by hand.
+fn dart(root: &RootFiles) -> Result<Option<Found>, String> {
+    if !root.has("pubspec.yaml") {
+        return Ok(None);
+    }
+    let mut found = found("pubspec.yaml");
+    found.notes.push(
+        "Dart and Flutter were not checked confined, so nothing was written: for Dart, the setup \
+         `dart pub get --enforce-lockfile` and the gate `dart analyze` and `dart test`; for \
+         Flutter, the same with `flutter` in place of `dart`; each with \
+         `run_caches.PUB_CACHE = \"pub\"` for the packages pub downloads"
+            .to_string(),
+    );
+    Ok(Some(found))
+}
+
+/// Swift (OWL-628), from `Package.swift`, read by name: a note only. Checked
+/// live, confined, on macOS, before OWL-637: SwiftPM compiles the manifest
+/// inside a `sandbox-exec` of its own, which cannot run inside Owlshift's
+/// (`--disable-sandbox` turns it off), and even so the build failed writing
+/// to the user's temporary folder, then closed to a confined run.
+/// SwiftPM needs no run cache: it turns its caches off when it cannot write
+/// them, and goes on.
+fn swift(root: &RootFiles) -> Result<Option<Found>, String> {
+    if !root.has("Package.swift") {
+        return Ok(None);
+    }
+    let mut found = found("Package.swift");
+    found.notes.push(
+        "Swift was not written, its lines not having been shown to pass confined: the setup \
+         `swift package --disable-sandbox resolve` and the gate `swift build --disable-sandbox` \
+         and `swift test --disable-sandbox`, SwiftPM's own sandbox not running inside Owlshift's; \
+         on macOS before OWL-637, `swift build` failed writing to the user's temporary folder"
+            .to_string(),
+    );
+    Ok(Some(found))
+}
+
+/// The settings files of Deno, in the order Deno reads them.
+const DENO_SETTINGS: [&str; 2] = ["deno.json", "deno.jsonc"];
+
+/// Deno (OWL-628), from `deno.json` or `deno.jsonc`, read by name with
+/// `deno.lock`: the setup installs the locked dependencies, the gate checks
+/// the formatting and the lint, then runs the tests, a root without any
+/// passing (`--permit-no-files`). Checked live, confined: without `DENO_DIR`
+/// moved, the tests fail caching the modules they import. `deno install` of
+/// the settings' imports and `--frozen` need Deno 2.
+fn deno(root: &RootFiles) -> Result<Option<Found>, String> {
+    let Some(settings) = DENO_SETTINGS.into_iter().find(|name| root.has(name)) else {
+        return Ok(None);
+    };
+    let mut found = found(settings);
+    let from = format!("{settings}, the settings of Deno");
+    let lock = if root.has("deno.lock") {
+        found.source = format!("{settings} (deno.lock)");
+        found.setup.push(line(
+            "deno install --frozen",
+            "deno.lock, the lock file of Deno",
+        ));
+        "--frozen"
+    } else {
+        // Deno writes a `deno.lock` beside its settings otherwise, a file
+        // the gate refuses to see changed.
+        found.notes.push(format!(
+            "{settings} has no lock file, so no setup was written and the tests run with \
+             `--no-lock`: Deno fetches the imports as they run"
+        ));
+        "--no-lock"
+    };
+    found.gate = vec![
+        line("deno fmt --check", from.clone()),
+        line("deno lint", from.clone()),
+        line(format!("deno test {lock} --permit-no-files"), from.clone()),
+    ];
+    found.run_caches.push(run_cache("DENO_DIR", "deno", from));
+    Ok(Some(found))
+}
+
 /// The `lint`, `test` and `check` targets a Makefile defines, in that order.
 fn makefile(root: &RootFiles) -> Result<Option<Found>, String> {
     Ok(manifest(root, "Makefile")?.and_then(makefile_targets))
@@ -1719,6 +1868,86 @@ check::
         assert!(detect(&root(&[".sln", "csproj"], &[])).found.is_empty());
     }
 
+    /// OWL-628: Mix installs Hex and rebar, then the locked dependencies,
+    /// into its run caches; the formatting is checked only with its
+    /// settings. A missing lock or settings file says so.
+    #[test]
+    fn an_elixir_root_fetches_its_lock_and_runs_its_tests() {
+        let d = detect(&root(&["mix.exs", "mix.lock", ".formatter.exs"], &[]));
+        assert_eq!(d.found[0].source, "mix.exs (mix.lock)");
+        assert_eq!(
+            commands(d.setup()),
+            [
+                "[ ! -f /etc/ssl/cert.pem ] || export HEX_CACERTS_PATH=/etc/ssl/cert.pem; mix \
+                 local.hex --force --if-missing && mix local.rebar --force --if-missing",
+                "mix deps.get --check-locked"
+            ]
+        );
+        assert_eq!(
+            commands(d.gate()),
+            ["mix format --check-formatted", "mix test"]
+        );
+        assert_eq!(
+            run_caches(d.run_caches()),
+            [("MIX_HOME", "mix"), ("HEX_HOME", "hex")]
+        );
+        let notes = &d.found[0].notes;
+        assert_eq!(notes.len(), 1, "{notes:?}");
+        assert!(notes[0].contains("keychain"));
+        let d = detect(&root(&["mix.exs"], &[]));
+        assert!(d.setup().next().is_none() && d.run_caches().next().is_none());
+        assert_eq!(commands(d.gate()), ["mix test"]);
+        let notes = &d.found[0].notes;
+        assert!(notes[0].contains("run_caches.HEX_HOME") && notes[1].contains(".formatter.exs"));
+        assert!(detect(&root(&["mix.lock"], &[])).found.is_empty());
+    }
+
+    /// OWL-628: Dart, Flutter and Swift were not shown to pass confined: a
+    /// note each, naming the lines, and nothing written.
+    #[test]
+    fn dart_and_swift_roots_get_a_note_only() {
+        for (name, says) in [
+            ("pubspec.yaml", "run_caches.PUB_CACHE"),
+            ("Package.swift", "OWL-637"),
+        ] {
+            let d = detect(&root(&[name, "pubspec.lock", "Package.resolved"], &[]));
+            assert_eq!(d.found.len(), 1, "{name}");
+            assert_eq!(d.found[0].source, name);
+            assert!(d.gate().next().is_none() && d.setup().next().is_none());
+            assert!(d.run_caches().next().is_none());
+            assert!(d.found[0].notes[0].contains(says), "{name}");
+        }
+    }
+
+    /// OWL-628: Deno installs its lock, checks, lints and tests with its
+    /// cache in a run cache; without the lock the tests write none.
+    #[test]
+    fn a_deno_root_installs_its_lock_and_runs_fmt_lint_and_test() {
+        let d = detect(&root(&["deno.json", "deno.lock"], &[]));
+        assert_eq!(d.found[0].source, "deno.json (deno.lock)");
+        assert_eq!(commands(d.setup()), ["deno install --frozen"]);
+        assert_eq!(
+            commands(d.gate()),
+            [
+                "deno fmt --check",
+                "deno lint",
+                "deno test --frozen --permit-no-files"
+            ]
+        );
+        assert_eq!(run_caches(d.run_caches()), [("DENO_DIR", "deno")]);
+        assert!(d.found[0].notes.is_empty());
+        let d = detect(&root(&["deno.jsonc"], &[]));
+        assert_eq!(d.found[0].source, "deno.jsonc");
+        assert!(d.setup().next().is_none());
+        assert_eq!(
+            d.gate().last().unwrap().command,
+            "deno test --no-lock --permit-no-files"
+        );
+        assert_eq!(run_caches(d.run_caches()), [("DENO_DIR", "deno")]);
+        assert!(d.found[0].notes[0].contains("no lock file"));
+        assert!(detect(&root(&["deno.lock"], &[])).found.is_empty());
+    }
+
     /// Every run cache `init` can write passes the check the project file's
     /// loader makes (OWL-624, criterion 4), together with the others a root
     /// can hold beside it.
@@ -1757,6 +1986,7 @@ check::
                 ],
                 &[("pyproject.toml", PY)],
             ),
+            root(&["mix.exs", "mix.lock", "deno.json"], &[]),
         ];
         let mut seen = 0;
         for r in &roots {
@@ -1765,7 +1995,7 @@ check::
             seen += entries.len();
             crate::agent_env::check_run_caches(&entries).unwrap();
         }
-        assert_eq!(seen, 14);
+        assert_eq!(seen, 17);
     }
 
     #[test]
@@ -1782,6 +2012,10 @@ check::
                 "App.csproj",
                 "composer.json",
                 "pom.xml",
+                "deno.json",
+                "Package.swift",
+                "pubspec.yaml",
+                "mix.exs",
             ],
             &[
                 ("package.json", r#"{"scripts":{"test":"vitest"}}"#),
@@ -1803,6 +2037,10 @@ check::
                 "pom.xml",
                 "composer.json",
                 "App.csproj",
+                "mix.exs",
+                "pubspec.yaml",
+                "Package.swift",
+                "deno.json",
                 "Makefile"
             ]
         );
@@ -1822,6 +2060,10 @@ check::
                 "mvn -B -Dmaven.repo.local=\"$MAVEN_USER_HOME/repository\" verify",
                 "DOTNET_SYSTEM_NET_SECURITY_USENETWORKFRAMEWORK=1 dotnet test -m:1 -nodeReuse:false \
                  App.csproj",
+                "mix test",
+                "deno fmt --check",
+                "deno lint",
+                "deno test --no-lock --permit-no-files",
                 "make lint"
             ]
         );
