@@ -6,7 +6,11 @@
 # rustup's own installer, build `owlshift` from this checkout, mounted read-only, into a volume of its own. The two
 # options bwrap needs inside Docker: `--security-opt seccomp=unconfined --security-opt systempaths=unconfined`.
 #
-# Usage, Docker running: sh docs/design/live-checks/owl-624-linux.sh [hand|init] [ECOSYSTEM...]   (network needed)
+# Run on 2026-11-23: see docs/design/records/OWL-632.md. The harness runs from the home, not from `/src`, whose `.git`
+# names a host path when the checkout is a git worktree, which would fail its `git config --global`.
+#
+# Usage, Docker running: [TAIL=N] [CONCURRENT=1] [PY_TOOLS=pytest] sh docs/design/live-checks/owl-624-linux.sh
+#   [hand|init] [ECOSYSTEM...]   (network needed; the variables are owl-624.sh's, passed into the container)
 # It prints results only. The volumes `owl624-cargo` and `owl624-target` keep the build between runs: remove them
 # with `docker volume rm owl624-cargo owl624-target`.
 set -eu
@@ -28,6 +32,7 @@ RUN curl -fsSL https://sh.rustup.rs | sh -s -- -y -q --profile minimal --default
     && mkdir -p /home/owl/.cargo/registry /home/owl/target
 EOF
 docker run --rm -i --security-opt seccomp=unconfined --security-opt systempaths=unconfined \
+  -e TAIL -e CONCURRENT -e PY_TOOLS \
   -v "$repo:/src:ro" -v owl624-cargo:/home/owl/.cargo/registry -v owl624-target:/home/owl/target "$image" \
   bash -c 'cd /src && CARGO_TARGET_DIR=/home/owl/target /home/owl/.cargo/bin/cargo build -q -p owlshift-cli --locked \
-    2>&1 | tail -5 && bash /src/docs/design/live-checks/owl-624.sh /home/owl/target/debug/owlshift "$@"' owl624 "$@"
+    2>&1 | tail -5 && cd && bash /src/docs/design/live-checks/owl-624.sh /home/owl/target/debug/owlshift "$@"' owl624 "$@"
