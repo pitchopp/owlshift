@@ -1,5 +1,5 @@
 {
-  "recorded": "2026-11-12 on pitchopp/owlshift-live-sandbox, recorded live, read-only: one list amended and the writes made up (see `synthesized`); the GraphQL read of #31's last edit recorded on 2026-11-14 (OWL-557), live through the maintainer's gh login, read-only",
+  "recorded": "2026-11-12 on pitchopp/owlshift-live-sandbox, recorded live, read-only: one list amended and the writes made up (see `synthesized`); the GraphQL read of #31's last edit recorded on 2026-11-14 (OWL-557), live through the maintainer's gh login, read-only; the proposals' search's four stage lists added on 2026-11-23 (OWL-640), read live, read-only, the ready stage's amended as the recorder now amends it",
   "exchanges": [
     {
       "request": {
@@ -2195,6 +2195,43 @@
         "remaining": 4861,
         "reset": 1794522925
       }
+    },
+    {
+      "request": {
+        "body": null,
+        "method": "GET",
+        "path": "repos/pitchopp/owlshift-live-sandbox/issues?state=open&labels=agent%3Aready&per_page=100&page=1"
+      },
+      "status": 200,
+      "response": [],
+      "synthesized": "recorded, then emptied: the sandbox's own issues there are no proposal's"
+    },
+    {
+      "request": {
+        "body": null,
+        "method": "GET",
+        "path": "repos/pitchopp/owlshift-live-sandbox/issues?state=open&labels=agent%3Ain-progress&per_page=100&page=1"
+      },
+      "status": 200,
+      "response": []
+    },
+    {
+      "request": {
+        "body": null,
+        "method": "GET",
+        "path": "repos/pitchopp/owlshift-live-sandbox/issues?state=open&labels=agent%3Aneeds-input&per_page=100&page=1"
+      },
+      "status": 200,
+      "response": []
+    },
+    {
+      "request": {
+        "body": null,
+        "method": "GET",
+        "path": "repos/pitchopp/owlshift-live-sandbox/issues?state=open&labels=agent%3Areview&per_page=100&page=1"
+      },
+      "status": 200,
+      "response": []
     },
     {
       "request": {

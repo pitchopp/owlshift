@@ -4,7 +4,7 @@ use owlshift_contracts::config::Admit;
 
 use super::super::tests::{Canned, ISSUE, comment, id, issue, tracker};
 use crate::tracker::{
-    Author, Blocker, Column, ErrorKind, PROPOSED_LABEL, Proposal, StateType, Tracker,
+    Author, Blocker, Column, ErrorKind, PROPOSED_LABEL, Proposal, Repair, StateType, Tracker,
 };
 
 const ISSUES: &str = "repos/demo/project/issues";
@@ -496,8 +496,27 @@ fn a_proposal_is_an_issue_with_its_label_blocked_by_its_parent() {
     }
 }
 
+/// The proposals' listing, open and closed.
+const PROPOSALS: &str =
+    "repos/demo/project/issues?state=all&labels=agent%3Aproposed&per_page=100&page=1";
+
+/// The open issues carrying stage label `encoded`.
+fn stage(encoded: &str) -> String {
+    format!("GET {ISSUES}?state=open&labels={encoded}&per_page=100&page=1")
+}
+
+/// The stage labels of the test configuration, encoded, in its order.
+const STAGES: [&str; 4] = [
+    "agent%3Aready",
+    "agent%3Aworking",
+    "agent%3Aneeds%20input",
+    "agent%3Areview",
+];
+
 /// Proposals are found among the issues carrying the label, open or
-/// closed, by title in any case or by marker; pull requests are not.
+/// closed, and among the open issues carrying a stage label (OWL-640), a
+/// proposal a person promoted, by title in any case or by marker, each
+/// once; pull requests are not.
 #[test]
 fn proposals_are_found_by_title_or_marker_open_or_closed() {
     let mut by_title = closed(41, json!("completed"));
@@ -507,17 +526,88 @@ fn proposals_are_found_by_title_or_marker_open_or_closed() {
     let mut pull = listed(43, &[]);
     pull["title"] = json!("Say goodbye");
     pull["pull_request"] = json!({ "merged_at": null });
-    let canned = Canned::default().on(
-        &format!("GET {ISSUES}?state=all&labels=agent%3Aproposed&per_page=100&page=1"),
-        200,
-        json!([by_title, by_marker, pull, listed(44, &[])]),
-    );
+    let mut promoted = listed(45, &["agent:working"]);
+    promoted["body"] = json!("Why\n\n[owlshift] PROPOSAL · 7 · fingerprint abc");
+    let mut ready = listed(46, &["agent:ready"]);
+    ready["title"] = json!("say goodbye");
+    let mut ready_pull = pull.clone();
+    ready_pull["labels"] = json!([{ "name": "agent:ready" }]);
+    let canned = Canned::default()
+        .on(
+            &format!("GET {PROPOSALS}"),
+            200,
+            json!([by_title, by_marker.clone(), pull, listed(44, &[])]),
+        )
+        .on(
+            &stage(STAGES[0]),
+            200,
+            json!([ready, ready_pull, by_marker]),
+        )
+        .on(&stage(STAGES[1]), 200, json!([promoted]))
+        .on(
+            &stage(STAGES[2]),
+            200,
+            json!([listed(47, &["agent:needs input"])]),
+        )
+        .on(&stage(STAGES[3]), 200, json!([]));
     let found = tracker(&canned)
         .proposed(None, "Say goodbye", "fingerprint abc")
         .unwrap();
     let ids: Vec<&str> = found.iter().map(|f| f.id.as_str()).collect();
-    assert_eq!(ids, ["41", "42"]);
+    assert_eq!(ids, ["41", "42", "46", "45"]);
     assert!(tracker(&canned).proposed(None, " ", "x").is_err());
+}
+
+/// OWL-640: a base's repair carries the ready stage's label, never the
+/// proposals', and a second runner of the team searching before it files
+/// finds the repair the first one filed, so one repair is filed, not two.
+#[test]
+fn a_second_runner_finds_the_first_ones_repair_and_files_nothing() {
+    let title = "Repair the base: `cargo test` fails at abc1234";
+    let marker = "[owlshift] REPAIR · abc1234 · gate 0123456789ab";
+    let description = format!("The gate fails.\n\n{marker}");
+    let held = id("7");
+    let repair = Repair {
+        held: &held,
+        title,
+        description: &description,
+        ready: "agent:ready",
+        label: None,
+        assignee: None,
+    };
+    let mut filed = listed(50, &["agent:ready"]);
+    filed["title"] = json!(title);
+    filed["body"] = json!(description);
+    let open = json!({ "body": description, "labels": ["agent:ready"], "title": title });
+    let mut canned = Canned::default()
+        .on(&format!("GET {PROPOSALS}"), 200, json!([]))
+        // The ready column before the filing, then after it.
+        .on(&stage(STAGES[0]), 200, json!([]))
+        .on(&stage(STAGES[0]), 200, json!([filed.clone()]));
+    for encoded in &STAGES[1..] {
+        canned = canned.on(&stage(encoded), 200, json!([]));
+    }
+    let canned = canned
+        .on(&format!("GET {ISSUE}"), 200, issue(&[], "open"))
+        .on(&format!("POST {ISSUES} {open}"), 201, filed);
+    // The runner's rule: file only when the search finds none.
+    let runner =
+        |tracker: &dyn Tracker| match tracker.proposed(None, title, marker).unwrap().first() {
+            Some(found) => (found.id.clone(), false),
+            None => (tracker.file_repair(&repair).unwrap().id, true),
+        };
+    let first = runner(&tracker(&canned));
+    let second = runner(&tracker(&canned));
+    assert_eq!(
+        (first.0.as_str(), first.1, second.0.as_str(), second.1),
+        ("50", true, "50", false)
+    );
+    let posts = canned
+        .calls()
+        .iter()
+        .filter(|call| call.starts_with("POST"))
+        .count();
+    assert_eq!(posts, 1, "{:?}", canned.calls());
 }
 
 /// A proposal with an assignee, a numeric account id, is opened assigned to
