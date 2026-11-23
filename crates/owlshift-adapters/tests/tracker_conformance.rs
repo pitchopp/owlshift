@@ -2158,7 +2158,7 @@ mod github {
     /// then the working list, the proposals and the writes they make. The
     /// lengths sum to the fixture's, which a re-recording that moves a
     /// request between parts fails to match (see [`drain_block`]).
-    const DRAIN_BLOCKS: [usize; 5] = [7, 7, 3, 3, 8];
+    const DRAIN_BLOCKS: [usize; 5] = [7, 7, 3, 3, 12];
 
     /// A replay of one part of the drain: its slice of the fixture.
     fn drain_block(block: usize) -> Replay {
@@ -2310,7 +2310,9 @@ mod github {
     /// The recorder of the drain's reads, which only reads the sandbox:
     /// the list of the gesture's label shows #31 open with its label, as
     /// when its gesture was made (it is closed since, its labels removed),
-    /// and the writes, an issue and two relations, are made up.
+    /// the ready stage's list, which the proposals' search reads (OWL-640),
+    /// shows none of the sandbox's own issues, and the writes, an issue and
+    /// two relations, are made up.
     fn drain_recorder() -> Recorder {
         let live = Recorder::over(HttpTransport::new(support::github_token()), dir())
             .pseudonymizing_github_users();
@@ -2322,6 +2324,7 @@ mod github {
         opened["labels"] = labels(&[GESTURE_LABEL.to_owned()]);
         let shape = live.live_get(&format!("{repo}/issues/29"));
         let list = format!("{repo}/issues?state=open&labels={GESTURE_LABEL}&");
+        let ready = format!("{repo}/issues?state=open&labels=agent%3Aready&");
         let issues = format!("{repo}/issues");
         live.making_up(move |request| {
             let method = request["method"].as_str()?;
@@ -2352,6 +2355,13 @@ mod github {
             }
         })
         .amending(move |at, response| {
+            if at.starts_with(&ready) {
+                *response = json!([]);
+                return Some(
+                    "recorded, then emptied: the sandbox's own issues there are no proposal's"
+                        .to_owned(),
+                );
+            }
             at.starts_with(&list).then(|| {
                 *response = json!([opened.clone()]);
                 "recorded, then #31 shown open with its label, as when its gesture was made"
@@ -2370,7 +2380,7 @@ mod github {
         recorder.write(
             DRAIN,
             &format!(
-                "{} on {SANDBOX}, recorded live, read-only: one list amended and the writes made \
+                "{} on {SANDBOX}, recorded live, read-only: two lists amended and the writes made \
                  up (see `synthesized`)",
                 today()
             ),

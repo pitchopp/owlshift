@@ -552,11 +552,19 @@ impl GitHubTracker {
         })
     }
 
-    /// The issues carrying the [`PROPOSED_LABEL`], open or closed, whose
-    /// title is `title` in any case or whose body holds `marker`, each once.
-    /// Unlike Linear's search, a closed one counts whatever its reason:
-    /// GitHub's default close is `completed`, so a proposal a person
-    /// declined with it would otherwise be filed again.
+    /// The issues a proposal or a base's repair is found again by, whose
+    /// title is `title` in any case or whose body holds `marker`, each once:
+    /// those carrying the [`PROPOSED_LABEL`], open or closed, and the open
+    /// ones carrying a stage label (OWL-640). A repair never carries the
+    /// proposals' label but carries a stage's from its filing until it
+    /// closes, so a colleague's runner finds it; so does a proposal a person
+    /// promoted to a stage. Unlike Linear's search, a closed proposal counts
+    /// whatever its reason: GitHub's default close is `completed`, so a
+    /// proposal a person declined with it would otherwise be filed again. A
+    /// closed issue without the proposals' label, and an open one with no
+    /// stage label, are not read. A stage label holding a comma, which
+    /// GitHub's list cannot ask for, is not listed; any listing that fails
+    /// fails the search.
     pub(super) fn find_proposals(&self, title: &str, marker: &str) -> Result<Vec<Found>, Error> {
         if title.trim().is_empty() || marker.trim().is_empty() {
             return Err(Error::new(
@@ -569,7 +577,13 @@ impl GitHubTracker {
             self.issues_path(),
             encode(PROPOSED_LABEL)
         );
-        let issues: Vec<Issue> = self.every(&path, "the proposals")?;
+        let mut issues: Vec<Issue> = self.every(&path, "the proposals")?;
+        for stage in self.stages.iter().filter(|stage| !stage.contains(',')) {
+            issues.extend(self.open_labelled(
+                &[stage.as_str()],
+                &format!("the open issues labelled {stage:?}"),
+            )?);
+        }
         let mut found: Vec<Found> = Vec::new();
         for issue in issues {
             if issue.pull_request.is_some() {
