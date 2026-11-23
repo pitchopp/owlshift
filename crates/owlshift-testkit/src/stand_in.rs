@@ -16,6 +16,7 @@
 //! The standard library only: the CLI's and the runner's tests include this
 //! file with `#[path]`, as they do `bin_copy.rs`.
 
+use std::io;
 use std::path::Path;
 use std::process::{Command, Stdio};
 use std::thread;
@@ -24,6 +25,11 @@ use std::time::{Duration, Instant};
 /// How long a first start may take: as long as the gh a test binary starts
 /// first (`gh::warm_up`), far past the longest scan measured.
 const FIRST_START: Duration = Duration::from_secs(120);
+
+/// How long a new executable may be refused as busy at its first start
+/// ([`start_once`]): the moment a process forked by another thread holds a
+/// descriptor that wrote it, until it starts its own program.
+const BUSY: Duration = Duration::from_secs(10);
 
 /// Writes `script` to `path` as an executable stand-in, then starts it once
 /// with `start_with` ([`start_once`], in `path`'s folder). Use it, rather than
@@ -53,6 +59,13 @@ pub fn write(path: &Path, script: &str, start_with: &[&str]) {
 /// of a new executable waits for the system's scan of it, and the starts
 /// after it do not.
 ///
+/// A start refused because the file is busy is tried again, `BUSY` at most
+/// (OWL-645). Under `cargo test` the tests of a binary share its process,
+/// and a process another test forks while this file is open for writing
+/// holds that descriptor until it starts its own program: Linux refuses to
+/// run a file open for writing (`ETXTBSY`). Once a start went through, no
+/// such descriptor is left, so the starts after it are not refused.
+///
 /// # Panics
 ///
 /// When it cannot be started, or has not ended within `FIRST_START`, after
@@ -60,12 +73,23 @@ pub fn write(path: &Path, script: &str, start_with: &[&str]) {
 pub fn start_once(command: &mut Command) {
     let program = command.get_program().to_owned();
     let named = || Path::new(&program).display().to_string();
-    let mut child = command
+    command
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .unwrap_or_else(|error| panic!("{}: {error}, at its first start (OWL-614)", named()));
+        .stderr(Stdio::null());
+    let busy_until = Instant::now() + BUSY;
+    let mut child = loop {
+        match command.spawn() {
+            Ok(child) => break child,
+            Err(error)
+                if error.kind() == io::ErrorKind::ExecutableFileBusy
+                    && Instant::now() < busy_until =>
+            {
+                thread::sleep(Duration::from_millis(10));
+            }
+            Err(error) => panic!("{}: {error}, at its first start (OWL-614)", named()),
+        }
+    };
     let deadline = Instant::now() + FIRST_START;
     while child.try_wait().unwrap().is_none() {
         if Instant::now() >= deadline {
