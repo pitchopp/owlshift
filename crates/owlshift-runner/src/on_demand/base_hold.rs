@@ -139,6 +139,31 @@ enum NotKept {
     Unread(String),
 }
 
+/// Why a hold's repair is filed ([`OnDemand::file_repair`]).
+enum Filing {
+    /// The hold opened now.
+    Opened,
+    /// No repair was tried for it yet: its first try found the project's
+    /// lock taken, or an open repair it could not read.
+    Untried,
+    /// It stands on the default branch's head, and the repair it holds, this
+    /// ticket, is completed on the tracker: a repair merged with the base
+    /// still failing, whose completion came after the hold took it again
+    /// (OWL-639).
+    Outlived(String),
+}
+
+/// A repair kept for a hold ([`OnDemand::repair_for`]).
+struct Kept {
+    ticket: TicketId,
+    /// The hash of its title and description as the tracker answers them.
+    text: String,
+    /// An open one taken again, not filed now.
+    reused: bool,
+    /// What went wrong once it was filed.
+    problems: Vec<tracker::Error>,
+}
+
 /// What a held Build does about the default branch's newer head (OWL-427).
 enum Left {
     /// It stays held; `due` when the head's check could not run yet
@@ -177,13 +202,15 @@ impl OnDemand<'_> {
             self.drop_wait(&p.ticket, sink);
             return Ok(Resume::Go(None));
         }
+        let moved = self.moved_off_hold(p, dispatched, state);
         let wait = self.valid_wait(p, dispatched, state, WaitAt::Build);
         // A wait the machine's cut left has no failure: no check is owed it
         // (OWL-480), only the holds standing on the commit.
         let failing = wait
             .as_ref()
             .and_then(|wait| wait.failing.as_ref())
-            .map(KeptFailing::failing);
+            .map(KeptFailing::failing)
+            .or(moved);
         match self.settle(p, dispatched, failing.as_ref(), sink)? {
             Settled::Go => {
                 // A yielded ticket admitted again is rebased first onto what
@@ -266,12 +293,40 @@ impl OnDemand<'_> {
         }
     }
 
+    /// The failing command a Build moved off its held commit brings to the
+    /// commit it is configured at now (OWL-639): watch's step into Build
+    /// fast-forwards a branch with no commits of its own (OWL-274), and the
+    /// ticket's wait, kept at the held commit, says what it waited for.
+    /// Settled there as the ticket's failure, that commit is checked before
+    /// the Build starts: a pass of the head ends the break, a failure at the
+    /// same command holds it. `None` for any other wait.
+    fn moved_off_hold(
+        &self,
+        p: &Prepared,
+        dispatched: &Dispatched,
+        state: &TicketState,
+    ) -> Option<Failing> {
+        let wait = base::read_wait(self.dirs, &p.ticket)?;
+        let at = dispatched.configured_at.commit.as_str();
+        if wait.round != state.round() || wait.pushed.is_some() || wait.configured_at == at {
+            return None;
+        }
+        let failing = wait.failing.as_ref()?.failing();
+        let held = base::read(self.dirs)
+            .ok()?
+            .holds_commit(&wait.configured_at);
+        (held && self.is_ancestor(p, &wait.configured_at, at)).then_some(failing)
+    }
+
     /// A Build held at the commit `dispatched` is configured at, whose
-    /// check still fails at the default branch's head (OWL-427): when its
-    /// branch has commits of its own and a clean worktree, no pull request
-    /// is open, and the head contains that commit and passes its own check,
-    /// one `rebase` role run moves the branch onto the head
-    /// ([`Self::rebase_held`]), and the ticket is dispatched again for
+    /// check still fails at the default branch's head (OWL-427): the head,
+    /// when it contains that commit, is checked whatever the branch, matched
+    /// with the held commit's failing command, so that a head still failing
+    /// there is held and files its repair (OWL-639); a hold standing on it is
+    /// followed ([`Self::follow_hold`]). When the branch has commits of its
+    /// own and a clean worktree, no pull request is open, and the head
+    /// passes its own check, one `rebase` role run moves the branch onto the
+    /// head ([`Self::rebase_held`]), and the ticket is dispatched again for
     /// `command`, configured there. [`Left::Stay`] when it stays held, `due`
     /// when the head's check could not run beside the other steps; `failed`
     /// is the command the held commit fails, for a park's reason.
@@ -284,72 +339,78 @@ impl OnDemand<'_> {
         failed: Option<&str>,
         sink: &mut EventSink<'_>,
     ) -> Result<Left, Stop> {
+        let stay = || Ok(Left::Stay { due: false });
         let held = dispatched.configured_at.commit.clone();
         let head = p.base.commit.clone();
+        if head == held || !self.is_ancestor(p, &held, &head) {
+            return stay();
+        }
         let (branch, start) = self.held_branch(p, &head)?;
-        let head_has_held = head != held && self.is_ancestor(p, &held, &head);
-        // Whether a head that passes would move it at all, before anything
-        // is read at the head.
-        if owlshift_core::base::leave(&held, &head, head_has_held, Some(&Verdict::Passed), branch)
-            != Leave::Rebase
-        {
-            if branch == HeldBranch::Uncommitted && head_has_held {
-                sink.emit(
-                    &p.ticket,
-                    None,
-                    EventKind::Warning,
-                    data([
-                        ("what", json!("base_not_rebased")),
-                        ("commit", json!(held)),
-                        ("onto", json!(head)),
-                        ("reason", json!(start)),
-                    ]),
-                );
-            }
-            return Ok(Left::Stay { due: false });
+        if branch == HeldBranch::Uncommitted {
+            sink.emit(
+                &p.ticket,
+                None,
+                EventKind::Warning,
+                data([
+                    ("what", json!("base_not_rebased")),
+                    ("commit", json!(held)),
+                    ("onto", json!(head)),
+                    ("reason", json!(start)),
+                ]),
+            );
         }
         let checks = match base::read(self.dirs) {
             Ok(checks) => checks,
             Err(why) => {
                 self.base_unchecked(&p.ticket, &why, sink);
-                return Ok(Left::Stay { due: false });
+                return stay();
             }
         };
         // The held commit checked again at this head first, still failing:
         // a check that could not run yet leaves an environment fix possible,
         // which lifts the hold with no rebase.
-        if !matches!(
-            checks.verdict_at(&held, &commands_key(dispatched), &head),
-            Some(Verdict::Failed(_))
-        ) {
-            return Ok(Left::Stay { due: false });
-        }
+        let Some(Verdict::Failed(failure)) =
+            checks.verdict_at(&held, &commands_key(dispatched), &head)
+        else {
+            return stay();
+        };
+        let failing = failure.failing.clone();
         // The head's own setup and gate, which its check runs and the
         // rebase run is briefed with (OWL-331: a rebase takes the base it
         // rebases onto).
         let configured = self.dispatch_rules(p, Command::Rebase, sink)?;
         let key = base::commands_key(configured.rules.setup(), configured.rules.gate());
         let kept = checks.verdict_at(&head, &key, &head).cloned();
-        let verdict =
-            match owlshift_core::base::leave(&held, &head, head_has_held, kept.as_ref(), branch) {
-                Leave::Stay => return Ok(Left::Stay { due: false }),
-                Leave::Rebase => Verdict::Passed,
-                Leave::CheckHead => match self.run_check(p, &head, None, sink)? {
-                    CheckRun::Ran {
-                        verdict: Some(verdict),
-                        ..
-                    } => verdict,
-                    // Given the priority a first check gets (OWL-431).
-                    CheckRun::Busy => return Ok(Left::Stay { due: true }),
-                    CheckRun::Ran { verdict: None, .. }
-                    | CheckRun::Unchecked
-                    | CheckRun::NoGate => return Ok(Left::Stay { due: false }),
-                },
-            };
-        if owlshift_core::base::leave(&held, &head, head_has_held, Some(&verdict), branch)
-            != Leave::Rebase
-        {
-            return Ok(Left::Stay { due: false });
+        let head_held = checks.holds(&head, &key);
+        let decide = |verdict: Option<&Verdict>, head_held: bool| {
+            owlshift_core::base::leave(&held, &failing, &head, verdict, true, head_held, branch)
+        };
+        let verdict = match decide(kept.as_ref(), head_held) {
+            Leave::Stay => {
+                if head_held {
+                    self.follow_hold(p, &head, &key, sink);
+                }
+                return stay();
+            }
+            Leave::Rebase => Verdict::Passed,
+            Leave::CheckHead => match self.run_check(p, &head, Some(&failing), sink)? {
+                CheckRun::Ran {
+                    verdict: Some(verdict),
+                    ..
+                } => {
+                    self.not_followed(p, (&held, &head), &failing, &verdict, sink);
+                    verdict
+                }
+                // Given the priority a first check gets (OWL-431).
+                CheckRun::Busy => return Ok(Left::Stay { due: true }),
+                CheckRun::Ran { verdict: None, .. } | CheckRun::Unchecked | CheckRun::NoGate => {
+                    return stay();
+                }
+            },
+        };
+        // A failed verdict never rebases: matched, the check held the head.
+        if decide(Some(&verdict), true) != Leave::Rebase {
+            return stay();
         }
         let followups = self.rebase_held(
             p,
@@ -1173,22 +1234,7 @@ impl OnDemand<'_> {
         let held_command = held_command(&checks, commit, &key);
         match checks.before_build(commit, &key, head) {
             Before::Held => {
-                // A hold not told yet, its first telling having found the
-                // project's lock taken, is told now.
-                if let Some(Entry::Checked {
-                    verdict: Verdict::Failed(failure),
-                    hold: Some(hold),
-                    ..
-                }) = checks.get(commit, &key).map(|check| &check.entry)
-                    && !hold.told
-                {
-                    self.tell_hold(p, commit, &key, &failure.failing, sink);
-                }
-                // A repair never tried, its first try having found the
-                // project's lock taken, is tried now (OWL-622).
-                if checks.repair(commit, &key).is_none() {
-                    self.file_repair(p, commit, &key, false, sink);
-                }
+                self.follow_hold(p, commit, &key, sink);
                 return Ok(Settled::Held {
                     command: held_command,
                 });
@@ -1223,8 +1269,8 @@ impl OnDemand<'_> {
         match after {
             After::Matched(recorded) => {
                 if recorded == Recorded::Opened {
+                    self.file_repair(p, commit, &key, &Filing::Opened, sink);
                     self.tell_hold(p, commit, &key, failing, sink);
-                    self.file_repair(p, commit, &key, true, sink);
                 }
                 Ok(Settled::Held {
                     command: Some(failing.command.clone()),
@@ -1340,8 +1386,8 @@ impl OnDemand<'_> {
             );
             match (recorded, verdict) {
                 (Recorded::Opened, Verdict::Failed(failure)) => {
+                    self.file_repair(p, commit, &kept.commands, &Filing::Opened, sink);
                     self.tell_hold(p, commit, &kept.commands, &failure.failing, sink);
-                    self.file_repair(p, commit, &kept.commands, true, sink);
                 }
                 (Recorded::Lifted, _) => self.tell_lifted(p, commit, &kept.commands, sink),
                 _ => {}
@@ -1416,21 +1462,23 @@ impl OnDemand<'_> {
 
     /// Files the repair ticket of the hold on `commit` and `key` (OWL-622;
     /// architecture section 5, "The repair ticket"), as `p`'s step found it
-    /// `opened` now, or held with no repair tried yet: unless
-    /// `policy.base_repair` at the base this command fetched is `false`.
-    /// One section of the project's lock holds the whole filing, the
-    /// tracker's calls included, so two steps never file twice; a section
-    /// that cannot be had leaves the hold untried, for its next held step.
-    /// An open repair kept for this hold or one on the same command is taken
-    /// again, else one found by its title or marker, else one filed; what
-    /// the tracker refuses is a `repair_unfiled` warning, the hold told as
-    /// before, and nothing is filed for it until it opens again.
+    /// ([`Filing`]): unless `policy.base_repair` at the base this command
+    /// fetched is `false`. One section of the project's lock holds the whole
+    /// filing, the tracker's calls included, so two steps never file twice; a
+    /// section that cannot be had leaves the hold untried, for its next held
+    /// step. An open repair kept for this hold or one on the same command is
+    /// taken again, else one found by its title or marker, else one filed
+    /// while its break filed fewer than
+    /// [`owlshift_core::base::MAX_BREAK_REPAIRS`] (OWL-639); what
+    /// the tracker refuses, or a break whose repairs are spent, is a
+    /// `repair_unfiled` warning, the hold told as before, and nothing is
+    /// filed for it until it opens again. The repair kept joins its break.
     fn file_repair(
         &self,
         p: &Prepared,
         commit: &str,
         key: &str,
-        opened: bool,
+        filing: &Filing,
         sink: &mut EventSink<'_>,
     ) {
         match project::base_repair_at(&self.executor.git, &p.checkout, &p.base) {
@@ -1450,18 +1498,30 @@ impl OnDemand<'_> {
                 hold: Some(_),
                 repair,
                 ..
-            }) if opened || repair.is_none() => failure.clone(),
+            }) if match filing {
+                Filing::Opened => true,
+                Filing::Untried => repair.is_none(),
+                Filing::Outlived(ticket) => {
+                    repair.as_ref().and_then(Repair::ticket) == Some(ticket.as_str())
+                }
+            } =>
+            {
+                failure.clone()
+            }
             _ => return,
         };
         let kept = self.repair_for(p, commit, key, &checks, &failure);
-        let repair = match &kept {
-            Ok((ticket, text, ..)) => Some(Repair::Filed {
-                ticket: ticket.as_str().to_owned(),
-                text_sha256: text.clone(),
-            }),
-            Err(NotKept::Unfiled(_)) => Some(Repair::Unfiled),
+        let (repair, attempt) = match &kept {
+            Ok(kept) => (
+                Some(Repair::Filed {
+                    ticket: kept.ticket.as_str().to_owned(),
+                    text_sha256: kept.text.clone(),
+                }),
+                checks.keep_break_repair(&failure.failing, kept.ticket.as_str()),
+            ),
+            Err(NotKept::Unfiled(_)) => (Some(Repair::Unfiled), 0),
             // Kept as never tried: the hold's next step tries again.
-            Err(NotKept::Unread(_)) => None,
+            Err(NotKept::Unread(_)) => (None, 0),
         };
         let written = match repair {
             Some(repair) => {
@@ -1472,11 +1532,16 @@ impl OnDemand<'_> {
         };
         drop(section);
         match kept {
-            Ok((ticket, _, reused, problems)) => {
+            Ok(Kept {
+                ticket,
+                reused,
+                problems,
+                ..
+            }) => {
                 sink.emit_project(
                     None,
                     EventKind::Decision,
-                    base::repair_event(commit, &failure.failing, &ticket, reused),
+                    base::repair_event(commit, &failure.failing, &ticket, reused, attempt),
                 );
                 for problem in problems {
                     sink.emit(
@@ -1502,11 +1567,11 @@ impl OnDemand<'_> {
     }
 
     /// The repair kept for the hold on `commit` and `key`, which `failure`
-    /// fails, under the project's lock the caller holds: the ticket, the
-    /// hash of its text as the tracker answers it, whether it was taken
-    /// again, and what went wrong once it was filed; or why none was kept.
-    /// An open ticket taken again whose text cannot be read now, nor was
-    /// kept, is [`NotKept::Unread`]: an empty hash would never admit it.
+    /// fails, under the project's lock the caller holds; or why none was
+    /// kept. An open ticket taken again whose text cannot be read now, nor
+    /// was kept, is [`NotKept::Unread`]: an empty hash would never admit it.
+    /// None is filed once the break of `failure`'s command filed its last
+    /// (OWL-639); a new one is told the repairs its break filed before it.
     fn repair_for(
         &self,
         p: &Prepared,
@@ -1514,7 +1579,7 @@ impl OnDemand<'_> {
         key: &str,
         checks: &owlshift_core::base::Checks,
         failure: &owlshift_core::base::Failure,
-    ) -> Result<(TicketId, String, bool, Vec<tracker::Error>), NotKept> {
+    ) -> Result<Kept, NotKept> {
         let failing = &failure.failing;
         // The text kept with a repair, for one the tracker cannot read now.
         let kept_text = |ticket: &TicketId| {
@@ -1552,7 +1617,12 @@ impl OnDemand<'_> {
                 Err(error) if error.kind == tracker::ErrorKind::NotFound => continue,
                 _ => {
                     let text = text_of(&ticket, kept_text(&ticket))?;
-                    return Ok((ticket, text, true, Vec::new()));
+                    return Ok(Kept {
+                        ticket,
+                        text,
+                        reused: true,
+                        problems: Vec::new(),
+                    });
                 }
             }
         }
@@ -1567,7 +1637,17 @@ impl OnDemand<'_> {
             && let Some(found) = found.into_iter().next()
         {
             let text = text_of(&found.id, None)?;
-            return Ok((found.id, text, true, Vec::new()));
+            return Ok(Kept {
+                ticket: found.id,
+                text,
+                reused: true,
+                problems: Vec::new(),
+            });
+        }
+        // A break that filed its last repair files none (OWL-639).
+        let before = checks.break_repairs(failing);
+        if checks.break_spent(failing) {
+            return Err(NotKept::Unfiled(base::repairs_spent(before)));
         }
         let assignee = self.repair_assignee(p).ok_or_else(|| {
             NotKept::Unfiled(
@@ -1585,6 +1665,7 @@ impl OnDemand<'_> {
             since
                 .as_ref()
                 .map(|(passed, commits)| (passed.as_str(), commits.as_slice())),
+            before,
         );
         let label = match &self.config.tracker.admit {
             Admit::Label(label) => Some(label.as_str()),
@@ -1603,7 +1684,82 @@ impl OnDemand<'_> {
             .map_err(|error| NotKept::Unfiled(format!("the tracker did not file it: {error}")))?;
         // Just filed: what was sent stands for what a failed read cannot give.
         let text = text_of(&filed.id, Some(text_sha256(&title, &description)))?;
-        Ok((filed.id, text, false, filed.problems))
+        Ok(Kept {
+            ticket: filed.id,
+            text,
+            reused: false,
+            problems: filed.problems,
+        })
+    }
+
+    /// A standing hold on `commit` that `p`'s step finds (OWL-622, OWL-639):
+    /// its repair filed when none was tried yet, its first try having found
+    /// the project's lock taken or an open repair it could not read; on the
+    /// default branch's head this step fetched, the next one filed once the
+    /// repair it holds is completed on the tracker, the head still failing;
+    /// then told when it was not yet.
+    fn follow_hold(&self, p: &Prepared, commit: &str, key: &str, sink: &mut EventSink<'_>) {
+        let Ok(checks) = base::read(self.dirs) else {
+            return;
+        };
+        let Some(Entry::Checked {
+            verdict: Verdict::Failed(failure),
+            hold: Some(hold),
+            repair,
+            ..
+        }) = checks.get(commit, key).map(|check| &check.entry)
+        else {
+            return;
+        };
+        match repair {
+            None => self.file_repair(p, commit, key, &Filing::Untried, sink),
+            Some(Repair::Filed { ticket, .. }) if commit == p.base.commit => {
+                if let Ok(id) = TicketId::new(ticket)
+                    && matches!(
+                        self.tracker.state_type(&id),
+                        Ok(Some(tracker::StateType::Completed))
+                    )
+                {
+                    self.file_repair(p, commit, key, &Filing::Outlived(ticket.clone()), sink);
+                }
+            }
+            Some(_) => {}
+        }
+        if !hold.told {
+            self.tell_hold(p, commit, key, &failure.failing, sink);
+        }
+    }
+
+    /// The `warning` event of a held commit's command that the default
+    /// branch's head, checked for it, does not fail, though it fails another
+    /// (OWL-639): no hold follows the head, whose own failure waits for a
+    /// Build there to match it.
+    fn not_followed(
+        &self,
+        p: &Prepared,
+        (held, head): (&str, &str),
+        failing: &Failing,
+        verdict: &Verdict,
+        sink: &mut EventSink<'_>,
+    ) {
+        let Verdict::Failed(failure) = verdict else {
+            return;
+        };
+        if failure.failing == *failing {
+            return;
+        }
+        sink.emit(
+            &p.ticket,
+            None,
+            EventKind::Warning,
+            data([
+                ("what", json!("base_not_followed")),
+                ("commit", json!(held)),
+                ("command", json!(failing.command)),
+                ("head", json!(head)),
+                ("head_command", json!(failure.failing.command)),
+            ]),
+        );
     }
 
     /// Who a repair is assigned to, its decider (OWL-622): the operator this
@@ -1739,8 +1895,12 @@ impl OnDemand<'_> {
         });
     }
 
-    /// Tells the operator of a hold on `commit` once (its told mark taken
-    /// under the project's lock), with the ticket's link.
+    /// Tells the operator of a hold on `commit`, with the ticket's link: its
+    /// told mark taken under the project's lock once a hold, the line shown
+    /// once a break, at its first hold, and once more at a hold that finds
+    /// its repairs spent, saying so (OWL-639); any other hold of a break is
+    /// marked told with nothing shown, its repair reaching the operator as
+    /// an assigned ticket.
     fn tell_hold(
         &self,
         p: &Prepared,
@@ -1756,12 +1916,23 @@ impl OnDemand<'_> {
             return;
         };
         let mut checks = base::read(self.dirs).unwrap_or_default();
-        let claimed = checks.claim_told(commit, key) && base::write(self.dirs, &checks).is_ok();
-        drop(section);
-        if !claimed {
+        if !checks.claim_told(commit, key) {
             return;
         }
-        let line = base::line(&p.ticket, commit, failing);
+        let spent = matches!(checks.repair(commit, key), Some(Repair::Unfiled))
+            && checks.break_spent(failing);
+        let first = checks.claim_break_told(failing);
+        let shown = (spent && checks.claim_spent_told(failing)) || first;
+        let claimed = base::write(self.dirs, &checks).is_ok();
+        drop(section);
+        if !claimed || !shown {
+            return;
+        }
+        let mut line = base::line(&p.ticket, commit, failing);
+        if spent {
+            line.push(' ');
+            line.push_str(&base::repairs_spent(checks.break_repairs(failing)));
+        }
         if let Err(error) = notifier.notify(&notify::with_link(line, self.tracker, &p.ticket)) {
             sink.emit(
                 &p.ticket,

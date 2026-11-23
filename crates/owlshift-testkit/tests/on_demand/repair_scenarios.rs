@@ -3,13 +3,15 @@
 //! which the runner admits itself, dispatches first whatever the project's
 //! capacity counts and builds while the hold stands; the switch turns it
 //! off; a tracker that refuses leaves the hold told; a hold that lifts first
-//! is told on the ticket.
+//! is told on the ticket. OWL-639's: a repair merged with the base still
+//! failing is followed by one more, then by a person.
 
-use owlshift_core::base::Repair;
+use owlshift_core::base::{Failing, Repair, Step};
 use owlshift_runner::base;
 
 use super::base_scenarios::{
-    REBASED_HELD, builds, checks_made, fixable_setup, held_rebases, setup_line, with_setup,
+    REBASED_HELD, agent_git, builds, checks_made, fixable_setup, held_done_build, held_rebases,
+    setup_line, with_setup,
 };
 use super::drain_scenarios::intake_declaring;
 use super::*;
@@ -448,4 +450,189 @@ fn a_hold_that_lifts_first_is_told_on_its_repair() {
     assert_eq!(told.len(), 1, "{:?}", bench.comments_on(repair));
     assert!(told[0].contains(&format!("`{held}`")), "{}", told[0]);
     assert!(base::repairs(&bench.dirs()).is_empty());
+}
+
+/// Moves `id` to the tracker's `Done` stage, as its merge does there.
+fn finish(bench: &Bench, id: &str) {
+    let path = bench
+        .remote
+        .checkout
+        .join("tickets")
+        .join(id)
+        .join("ticket.md");
+    let text = fs::read_to_string(&path).unwrap();
+    let stage = text
+        .lines()
+        .find(|line| line.starts_with("stage = "))
+        .unwrap()
+        .to_owned();
+    fs::write(&path, text.replacen(&stage, "stage = \"Done\"", 1)).unwrap();
+}
+
+/// `outcome`, a stop held at `commit`.
+fn held_at(outcome: &Result<Delivered, Stop>, commit: &str) -> bool {
+    matches!(outcome, Err(Stop::BaseHeld { commit: at, .. }) if at == commit)
+}
+
+/// OWL-639's acceptance: DEMO-1's done Build is held at its base and DEMO-2
+/// filed. DEMO-2 merges without fixing the base before the tracker shows it
+/// done: DEMO-1's next step checks the merge, holds it and takes DEMO-2
+/// again, telling nothing new. Once DEMO-2 shows done, the next step at the
+/// same head files DEMO-3, which names DEMO-2. DEMO-3 merges without fixing
+/// it either: the new head is held, no third repair is filed, the warning
+/// names both, and the operator is told that a person takes it from here.
+/// No step of those runs anything or counts a failure. A real fix then
+/// passes, and DEMO-1 is rebased onto it and delivered.
+#[test]
+fn a_repair_merged_on_a_base_still_broken_files_one_more_then_waits_for_a_person() {
+    let bench = repairing_bench("");
+    let marker = bench.tmp.path().join("store-has-rollup");
+    let (held, _) = held_done_build(&bench, &marker);
+    let failing = Failing {
+        step: Step::Setup,
+        command: fixable_setup(&marker),
+    };
+    let runs = bench.briefs().len();
+    assert_eq!(bench.notified.0.borrow().len(), 1, "the break told");
+
+    let first = bench.merge_into_main(&[("REPAIR-1.md", "tried\n")]);
+    let (outcome, printed) = bench.continue_ticket(Vec::new());
+    assert!(held_at(&outcome, &held), "{outcome:?}\n{printed}");
+    let opened = |head: &str| (head.to_owned(), "opened".to_owned(), "failed".to_owned());
+    assert!(checks_made(&bench).contains(&opened(&first)), "{printed}");
+    assert!(matches!(
+        kept_repair(&bench, &first),
+        Some(Repair::Filed { ticket, .. }) if ticket == "DEMO-2"
+    ));
+    assert_eq!(bench.notified.0.borrow().len(), 1, "the break told once");
+
+    finish(&bench, "DEMO-2");
+    let (outcome, printed) = bench.continue_ticket(Vec::new());
+    assert!(held_at(&outcome, &held), "{outcome:?}\n{printed}");
+    assert!(matches!(
+        kept_repair(&bench, &first),
+        Some(Repair::Filed { ticket, .. }) if ticket == "DEMO-3"
+    ));
+    let kept: Vec<(Value, Value, Value)> = repairs_kept(&bench)
+        .into_iter()
+        .map(|data| {
+            (
+                data["ticket"].clone(),
+                data["reused"].clone(),
+                data["attempt"].clone(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        kept,
+        [
+            (json!("DEMO-2"), json!(false), json!(1)),
+            (json!("DEMO-2"), json!(true), json!(1)),
+            (json!("DEMO-3"), json!(false), json!(2)),
+        ]
+    );
+    let second_repair = bench.shown("DEMO-3");
+    assert!(
+        second_repair
+            .description
+            .contains("**Repairs before this one:** DEMO-2 was filed for this break"),
+        "{}",
+        second_repair.description
+    );
+
+    finish(&bench, "DEMO-3");
+    let second = bench.merge_into_main(&[("REPAIR-2.md", "tried again\n")]);
+    let (outcome, printed) = bench.continue_ticket(Vec::new());
+    assert!(held_at(&outcome, &held), "{outcome:?}\n{printed}");
+    assert!(checks_made(&bench).contains(&opened(&second)), "{printed}");
+    assert_eq!(kept_repair(&bench, &second), Some(Repair::Unfiled));
+    assert!(!bench.remote.checkout.join("tickets/DEMO-4").exists());
+    assert_eq!(repairs_kept(&bench).len(), 3);
+    let unfiled = warned(&bench, "repair_unfiled");
+    assert!(
+        unfiled.len() == 1
+            && unfiled[0]["reason"]
+                .as_str()
+                .unwrap()
+                .contains("Owlshift filed DEMO-2 and DEMO-3 for this break"),
+        "{unfiled:?}"
+    );
+    let notified = bench.notified.0.borrow().clone();
+    assert_eq!(notified.len(), 2, "{notified:?}");
+    assert!(notified[1].contains("files no more repair"), "{notified:?}");
+    assert_eq!(bench.briefs().len(), runs, "no run while held");
+    let state = TicketState::try_from(&bench.record().state).unwrap();
+    assert_eq!(state.failed_runs(), 0);
+    assert_eq!(
+        base::read(&bench.dirs()).unwrap().break_repairs(&failing),
+        ["DEMO-2", "DEMO-3"]
+    );
+
+    let fixed = bench.merge_into_main(&[("FIXED", "fixed\n")]);
+    let rebase = agent_git(
+        &bench,
+        1,
+        vec!["rebase".to_owned(), "--quiet".to_owned(), fixed.clone()],
+    );
+    let (delivered, printed) =
+        bench.continue_during(vec![bench.reply(None, Some(REBASED_HELD))], vec![rebase]);
+    delivered.unwrap_or_else(|stop| panic!("{stop}\n{printed}"));
+    let rebased = held_rebases(&bench);
+    assert_eq!(
+        (&rebased[0]["from"], &rebased[0]["onto"]),
+        (&json!(held), &json!(fixed))
+    );
+}
+
+/// OWL-639, a held ticket with no commits of its own under a person's
+/// `continue`, which does not move it: its step checks the merge of a repair
+/// that fixed nothing and holds it. The next repair, found by its title but
+/// not readable yet, is not kept; the next `continue` follows the hold and
+/// keeps it. Neither step runs anything.
+#[test]
+fn a_continued_ticket_with_no_commits_of_its_own_checks_the_head_and_holds_it() {
+    let bench = repairing_bench("");
+    let marker = bench.tmp.path().join("store-has-rollup");
+    let held = with_setup(&bench, &setup_line(&marker), None);
+    let (outcome, printed) = bench.run(Vec::new(), None);
+    assert!(held_at(&outcome, &held), "{outcome:?}\n{printed}");
+    let runs = bench.briefs().len();
+    finish(&bench, "DEMO-2");
+    let head = bench.merge_into_main(&[("REPAIR-1.md", "tried\n")]);
+    let failing = Failing {
+        step: Step::Setup,
+        command: setup_line(&marker),
+    };
+    let found = TicketId::new("DEMO-7").unwrap();
+    bench.inbox.borrow_mut().tickets.push((
+        found.clone(),
+        base::repair_title(&head, &failing),
+        String::new(),
+    ));
+
+    let (outcome, printed) = bench.continue_ticket(Vec::new());
+    assert!(held_at(&outcome, &held), "{outcome:?}\n{printed}");
+    let checked = checks_made(&bench);
+    assert!(
+        checked.contains(&(head.clone(), "opened".to_owned(), "failed".to_owned())),
+        "{checked:?}"
+    );
+    assert_eq!(kept_repair(&bench, &head), None, "not kept: tried again");
+    assert_eq!(warned(&bench, "repair_unfiled").len(), 1);
+
+    bench.put_ticket(
+        "DEMO-7",
+        "maintainer",
+        "Todo",
+        &["agent"],
+        "",
+        "The repair.",
+    );
+    let (outcome, printed) = bench.continue_ticket(Vec::new());
+    assert!(held_at(&outcome, &held), "{outcome:?}\n{printed}");
+    assert!(matches!(
+        kept_repair(&bench, &head),
+        Some(Repair::Filed { ticket, .. }) if ticket == "DEMO-7"
+    ));
+    assert_eq!(bench.briefs().len(), runs, "no run while held");
 }

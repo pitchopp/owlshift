@@ -11,7 +11,9 @@ use jiff::Timestamp;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-use owlshift_core::base::{Check, Checks, Entry, Failing, Failure, Hold, Repair, Step, Verdict};
+use owlshift_core::base::{
+    Break, Check, Checks, Entry, Failing, Failure, Hold, Repair, Step, Verdict,
+};
 
 use crate::format::{self, BASE_FORMAT, BASE_WAIT_FORMAT, ContractError, Format};
 use crate::ids::TicketId;
@@ -25,6 +27,27 @@ pub struct ProjectBase {
     pub format: Format<BASE_FORMAT>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub checks: Vec<KeptCheck>,
+    /// The breaks standing (OWL-639, format 3): what each told and the repair
+    /// tickets it filed.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub breaks: Vec<KeptBreak>,
+}
+
+/// A break of the base (OWL-639): the holds on one step and command since a
+/// check of the default branch's head last passed.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct KeptBreak {
+    pub failing: KeptFailing,
+    /// The operator was told of it.
+    #[serde(default)]
+    pub told: bool,
+    /// The operator was told that it filed its last repair.
+    #[serde(default)]
+    pub told_spent: bool,
+    /// The repair tickets it filed or took again, in order.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub repairs: Vec<TicketId>,
 }
 
 /// What is known of one commit and its commands.
@@ -120,11 +143,13 @@ pub struct KeptHold {
 impl ProjectBase {
     const CONTRACT: &str = "project base checks";
 
-    /// Parses the file; format 1, from before OWL-622, reads as format 2 with
-    /// no repair, and one naming a repair is refused.
+    /// Parses the file; format 1, from before OWL-622, reads with no repair,
+    /// and one naming a repair is refused; format 2, from before OWL-639,
+    /// reads with no break, and one naming a break is refused.
     pub fn parse(input: &str) -> Result<Self, ContractError> {
         if let Ok(mut document) = serde_json::from_str::<serde_json::Value>(input)
-            && document.get("format").and_then(serde_json::Value::as_u64) == Some(1)
+            && let Some(older @ (1 | 2)) =
+                document.get("format").and_then(serde_json::Value::as_u64)
         {
             let repaired = document
                 .get("checks")
@@ -134,10 +159,16 @@ impl ProjectBase {
                         .iter()
                         .any(|check| check.pointer("/entry/repair").is_some())
                 });
-            if repaired {
+            if older == 1 && repaired {
                 return Err(ContractError::invalid(
                     Self::CONTRACT,
                     "format 1 records no repair",
+                ));
+            }
+            if document.get("breaks").is_some() {
+                return Err(ContractError::invalid(
+                    Self::CONTRACT,
+                    format!("format {older} records no break"),
                 ));
             }
             document["format"] = BASE_FORMAT.into();
@@ -205,6 +236,20 @@ impl ProjectBase {
                     },
                 })
                 .collect(),
+            breaks: checks
+                .breaks
+                .iter()
+                .map(|standing| KeptBreak {
+                    failing: KeptFailing::from(&standing.failing),
+                    told: standing.told,
+                    told_spent: standing.told_spent,
+                    repairs: standing
+                        .repairs
+                        .iter()
+                        .filter_map(|ticket| TicketId::new(ticket).ok())
+                        .collect(),
+                })
+                .collect(),
         }
     }
 
@@ -263,6 +308,20 @@ impl ProjectBase {
                             }),
                         },
                     },
+                })
+                .collect(),
+            breaks: self
+                .breaks
+                .iter()
+                .map(|kept| Break {
+                    failing: kept.failing.failing(),
+                    told: kept.told,
+                    told_spent: kept.told_spent,
+                    repairs: kept
+                        .repairs
+                        .iter()
+                        .map(|ticket| ticket.as_str().to_owned())
+                        .collect(),
                 })
                 .collect(),
         }
@@ -484,8 +543,37 @@ mod tests {
 
     #[test]
     fn a_newer_format_is_refused() {
-        assert!(ProjectBase::parse(r#"{"format":3}"#).is_err());
+        assert!(ProjectBase::parse(r#"{"format":4}"#).is_err());
         assert!(BaseWait::parse(r#"{"format":2}"#).is_err());
+    }
+
+    /// OWL-639: format 3 keeps the breaks, what each told and its repairs;
+    /// format 2 reads with none, and one naming a break is refused.
+    #[test]
+    fn a_break_survives_its_file_and_format_2_reads_without_one() {
+        let install = Failing {
+            step: Step::Setup,
+            command: "sh ci/owlshift/setup.sh".to_owned(),
+        };
+        let mut checks = Checks::default();
+        checks.claim_break_told(&install);
+        checks.keep_break_repair(&install, "OWL-9");
+        checks.keep_break_repair(&install, "OWL-12");
+        let text = ProjectBase::from_checks(&checks).render();
+        assert!(text.contains("\"format\": 3"), "{text}");
+        assert_eq!(ProjectBase::parse(&text).unwrap().checks(), checks);
+        let format_2 = r#"{"format": 2, "checks": [{"commit": "c", "commands": "k",
+            "entry": {"state": "checked", "head": "h", "checked": "2026-11-22T09:00:00Z",
+            "verdict": {"verdict": "passed"}, "repair": {"state": "unfiled"}}}]}"#;
+        let read = ProjectBase::parse(format_2).unwrap().checks();
+        assert!(read.breaks.is_empty());
+        assert_eq!(read.repair("c", "k"), Some(&Repair::Unfiled));
+        let named = format_2.replacen(
+            r#"{"format": 2,"#,
+            r#"{"format": 2, "breaks": [{"failing": {"step": "setup", "command": "x"}}],"#,
+            1,
+        );
+        assert!(ProjectBase::parse(&named).is_err());
     }
 
     /// OWL-622: format 2 keeps a hold's repair, filed or not, and a lifted
@@ -517,7 +605,7 @@ mod tests {
         checks.set_repair("b", "k", Repair::Unfiled);
         checks.record_check(("a", "k", "h2"), 3_000, Verdict::Passed, None);
         let text = ProjectBase::from_checks(&checks).render();
-        assert!(text.contains("\"format\": 2"), "{text}");
+        assert!(text.contains("\"format\": 3"), "{text}");
         assert!(text.contains("\"state\": \"filed\""), "{text}");
         assert!(text.contains("\"state\": \"unfiled\""), "{text}");
         assert_eq!(ProjectBase::parse(&text).unwrap().checks(), checks);

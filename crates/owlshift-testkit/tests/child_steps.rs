@@ -1244,12 +1244,24 @@ fn commit_policy(project: &ChildProject, root: &Path, line: &str) {
 /// clone of its own under `root`: returns the new head.
 #[cfg(unix)]
 fn move_main(project: &ChildProject, root: &Path, news: &str) -> String {
+    move_main_with(project, root, news, |_| {})
+}
+
+/// [`move_main`], `edit` changing the clone before the commit.
+#[cfg(unix)]
+fn move_main_with(
+    project: &ChildProject,
+    root: &Path,
+    news: &str,
+    edit: impl FnOnce(&Path),
+) -> String {
     let env = project.env();
     let clone = root.join(format!("merger-{news}"));
     let bare = project.bare.to_str().unwrap();
     env.run(root, &["clone", "--quiet", bare, clone.to_str().unwrap()])
         .unwrap();
     fs::write(clone.join("NEWS.md"), format!("{news}\n")).unwrap();
+    edit(&clone);
     env.run(&clone, &["add", "--all"]).unwrap();
     env.run(&clone, &["commit", "--quiet", "-m", "Another merge"])
         .unwrap();
@@ -1267,7 +1279,9 @@ fn move_main(project: &ChildProject, root: &Path, news: &str) -> String {
 /// A base wait's WAITING comment stays shown while the base still holds the
 /// Build (OWL-418, OWL-419, OWL-431), as LOC-1458 found on 2026-10-25.
 /// DEMO-1's Build, drained alone, fails a gate its base fails too: its
-/// commit is held. Then `main` moves and DEMO-2's Build runs, a long step.
+/// commit is held. Then `main` moves, its gate reworded so that the hold
+/// does not follow the new head (OWL-639), and DEMO-2's Build runs there, a
+/// long step.
 /// Past the retry delay, DEMO-1 is resumed: its commit's check again is due
 /// at the new head and waits for DEMO-2's step, and watch shows DEMO-1's
 /// WAITING comment. Past the delay again, DEMO-1's step is held back for
@@ -1381,7 +1395,19 @@ fn a_base_wait_keeps_its_comment_while_another_step_runs() {
                         0 if base::read(&dirs)
                             .is_ok_and(|checks| checks.holds_commit(&base_at)) =>
                         {
-                            move_main(&s.project, tmp.path(), "one");
+                            // The gate reworded: the new head fails the same
+                            // check under other words, which DEMO-1's hold does
+                            // not follow (OWL-639), so DEMO-2's Build runs there.
+                            move_main_with(&s.project, tmp.path(), "one", |clone| {
+                                let file = clone.join("owlshift.toml");
+                                let text = fs::read_to_string(&file).unwrap();
+                                let reworded = text.replace(
+                                    "git grep -q Hello -- GREETING.md",
+                                    "git grep -q -e Hello -- GREETING.md",
+                                );
+                                assert_ne!(reworded, text);
+                                fs::write(&file, reworded).unwrap();
+                            });
                             s.project.add_ticket("DEMO-2", &["agent"], "");
                             phase = 1;
                         }
