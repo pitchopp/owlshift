@@ -242,6 +242,7 @@ mod tests {
         let data = tempfile::tempdir().unwrap();
         let dir = token_dir(data.path());
         fs::create_dir_all(&dir).unwrap();
+        // Not an executable a test writes (OWL-646): a folder's mode.
         fs::set_permissions(&dir, fs::Permissions::from_mode(0o755)).unwrap();
         ensure_dir(&dir).unwrap();
         assert_eq!(mode(&dir), 0o700);

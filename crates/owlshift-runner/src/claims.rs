@@ -1169,7 +1169,11 @@ fn adopt(dirs: &ProjectDirs, ticket: &TicketId, commit: &str, claim: Claim) -> R
 }
 
 /// The claim's lock of `ticket`, waited for `wait` at most.
-fn lock(dirs: &ProjectDirs, ticket: &TicketId, wait: Duration) -> io::Result<Option<fs::File>> {
+fn lock(
+    dirs: &ProjectDirs,
+    ticket: &TicketId,
+    wait: Duration,
+) -> io::Result<Option<project::FileLock>> {
     fs::create_dir_all(dirs.ticket_dir(ticket))?;
     project::lock_file_within(&dirs.ticket_dir(ticket).join(LOCK_FILE), wait, LOCK_POLL)
 }

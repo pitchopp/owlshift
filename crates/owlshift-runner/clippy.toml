@@ -1,0 +1,10 @@
+# OWL-646: every file lock this crate takes goes through `project::FileLock`,
+# which lets it go explicitly before its descriptor closes. A lock released
+# by the close alone stays held while a child forked meanwhile keeps a copy
+# of the descriptor, until that child starts its own program.
+disallowed-methods = [
+    { path = "std::fs::File::lock", reason = "take it through project::FileLock (OWL-646)" },
+    { path = "std::fs::File::lock_shared", reason = "take it through project::FileLock (OWL-646)" },
+    { path = "std::fs::File::try_lock", reason = "take it through project::FileLock (OWL-646)" },
+    { path = "std::fs::File::try_lock_shared", reason = "take it through project::FileLock (OWL-646)" },
+]

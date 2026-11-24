@@ -221,7 +221,7 @@ pub fn served_lock_file(dirs: &ProjectDirs) -> PathBuf {
 /// A hold on a project's served lock, alone or shared, let go when dropped.
 #[derive(Debug)]
 pub struct ServedLock {
-    _file: fs::File,
+    _file: project::FileLock,
 }
 
 /// Takes the served lock of `dirs`'s project for the daemon alone, creating

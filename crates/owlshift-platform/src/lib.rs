@@ -10,6 +10,13 @@ pub mod paths;
 pub mod process;
 pub mod sandbox;
 pub mod service;
+/// The testkit's, which this crate cannot depend on (the testkit depends on
+/// it): the executables the unit tests write, and their first start
+/// (OWL-646).
+#[cfg(all(test, unix))]
+#[allow(dead_code, reason = "the unit tests use part of it")]
+#[path = "../../owlshift-testkit/src/stand_in.rs"]
+mod stand_in;
 pub mod terminal;
 #[cfg(all(test, unix))]
 mod test_proc;

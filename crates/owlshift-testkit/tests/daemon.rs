@@ -129,7 +129,7 @@ impl Bench {
     fn replace(&self, commit: char, built_at: i64) {
         let path = self.binary_path();
         let staged = path.with_file_name("staged");
-        fs::copy(daemon_bench(), &staged).unwrap();
+        owlshift_testkit::stand_in::copy_executable(daemon_bench(), &staged);
         let build = path.with_file_name("owlshift-daemon-bench.build");
         let partial = path.with_file_name("build.partial");
         fs::write(
@@ -144,11 +144,9 @@ impl Bench {
     /// Replaces the binary at [`Bench::binary_path`] by a script that does
     /// not answer `--version` (OWL-616).
     fn replace_with_failing_script(&self) {
-        use std::os::unix::fs::PermissionsExt;
         let path = self.binary_path();
         let staged = path.with_file_name("staged");
-        fs::write(&staged, "#!/bin/sh\nexit 3\n").unwrap();
-        fs::set_permissions(&staged, fs::Permissions::from_mode(0o755)).unwrap();
+        owlshift_testkit::stand_in::write_executable(&staged, "#!/bin/sh\nexit 3\n");
         fs::rename(&staged, &path).unwrap();
     }
 

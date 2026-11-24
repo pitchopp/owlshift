@@ -419,19 +419,13 @@ pub fn served_parked_at_build(root: &Path, harness: PathBuf) -> ChildProject {
     #[cfg(unix)]
     std::os::unix::fs::symlink(&project.bare, ssh.join("demo/project.git")).unwrap();
     let command = root.join("local-ssh");
-    fs::write(
+    crate::stand_in::write_executable(
         &command,
         format!(
             "#!/bin/sh\n# The git command an ssh host would run, run here.\ncd '{}' && exec sh -c \"$2\"\n",
             ssh.display()
         ),
-    )
-    .unwrap();
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt as _;
-        fs::set_permissions(&command, fs::Permissions::from_mode(0o755)).unwrap();
-    }
+    );
     let command = command.to_str().expect("a UTF-8 bench path");
     for (key, value) in [("core.sshCommand", command), ("ssh.variant", "simple")] {
         env.run(&project.checkout, &["config", "--global", key, value])
@@ -542,10 +536,8 @@ pub fn reply_for(dir: &Path, role: &str, ticket: Option<&str>, result: &str) {
 /// with the reply [`reply_for`] wrote in `dir`, or the bench's.
 #[cfg(unix)]
 pub fn holding_harness(dir: &Path, fake: &Path, role: &str, before: &str, hold: &str) -> PathBuf {
-    use std::os::unix::fs::PermissionsExt;
-
     let script = dir.join(format!("harness-{role}.sh"));
-    fs::write(
+    crate::stand_in::write_executable(
         &script,
         format!(
             "#!/bin/sh\ndir='{dir}'\nbrief=\"\"\nreply=\"\"\n\
@@ -562,9 +554,7 @@ pub fn holding_harness(dir: &Path, fake: &Path, role: &str, before: &str, hold: 
             dir = dir.display(),
             fake = fake.display(),
         ),
-    )
-    .unwrap();
-    fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+    );
     script
 }
 

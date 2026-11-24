@@ -204,7 +204,7 @@ fn install(folder: &Path) -> PathBuf {
     fs::create_dir_all(folder).unwrap();
     let at = folder.join("owlshift");
     if fs::hard_link(bin(), &at).is_err() {
-        fs::copy(bin(), &at).unwrap();
+        owlshift_testkit::stand_in::copy_executable(bin(), &at);
     }
     at
 }

@@ -273,7 +273,7 @@ impl<E: Entries, R: Refresh> AppToken<E, R> {
     }
 
     /// The account lock, waited for at most `lock_wait`.
-    fn account_lock(&self) -> Result<fs::File, Error> {
+    fn account_lock(&self) -> Result<crate::project::FileLock, Error> {
         let failed = |error: std::io::Error| {
             Error::new(
                 ErrorKind::Other,

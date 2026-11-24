@@ -361,9 +361,9 @@ impl ProjectDirs {
 
     /// Whether the lock of the ticket whose folder is `dir` (one of
     /// [`ProjectDirs::tickets`]) is held elsewhere: one try, let go at once,
-    /// a look that never waits (OWL-400). A lock just released can look
-    /// held a moment longer (see [`ProjectDirs::lock`]), which reads the
-    /// ticket as running for that moment.
+    /// a look that never waits (OWL-400). A holder that ended without its
+    /// release can look held a moment longer (see [`ProjectDirs::lock`]),
+    /// which reads the ticket as running for that moment.
     pub fn ticket_lock_held_in(&self, dir: &Path) -> io::Result<bool> {
         Ok(try_lock_file(&dir.join("lock"))?.is_none())
     }
@@ -397,17 +397,16 @@ impl ProjectDirs {
     /// take in the process that holds it waits too: no section is taken
     /// inside another.
     ///
-    /// A child spawned while it is held shares it until it execs, and on
-    /// macOS a moment longer: a child the standard library starts through
-    /// `posix_spawn` can keep the parent's close-on-exec descriptors for
-    /// some milliseconds after the spawn returned, even once it ended
-    /// (OWL-414; architecture section 5, "A lock just released"), which the
-    /// wait outlasts. Watch's own takes never wait
+    /// A child spawned while it is held shares its descriptor until it
+    /// execs, and on macOS a moment longer: a child the standard library
+    /// starts through `posix_spawn` can keep the parent's close-on-exec
+    /// descriptors for some milliseconds after the spawn returned, even once
+    /// it ended (OWL-414; architecture section 5, "A lock just released").
+    /// So does a child another thread of this process forks. The release
+    /// lets the lock go explicitly (`FileLock`, OWL-646), so such a copy
+    /// no longer keeps it held; the wait still outlasts a holder that ended
+    /// without its release. Watch's own takes never wait
     /// ([`ProjectDirs::try_lock`]).
-    ///
-    /// A child forked by another thread of this process holds it until it
-    /// execs too; only the tests spawn beside a thread that locks, so a test
-    /// that takes a lock again runs alone (`alone::run_alone`).
     pub fn lock(&self) -> io::Result<Option<ProjectLock>> {
         self.lock_within(self.lock_wait)
     }
@@ -542,13 +541,81 @@ thread_local! {
     static TRIES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
+/// A file whose lock this process took (`flock` on Unix, `LockFileEx` on
+/// Windows), let go explicitly when dropped, before its descriptor closes
+/// (OWL-646). Every lock this crate takes goes through it (the crate's
+/// `clippy.toml` refuses the standard library's lock methods elsewhere),
+/// probes included: a try that succeeds holds the lock until its value is
+/// dropped, so a probe's explicit release matters as much as a holder's.
+///
+/// A `flock` belongs to the open file description, which a child forked
+/// meanwhile shares through its copy of the descriptor until it starts its
+/// own program (a child of `posix_spawn` on macOS keeps it some milliseconds
+/// longer, OWL-414). A lock released by the close alone stays held for that
+/// moment; an explicit unlock releases it for every copy at once. A failed
+/// unlock leaves the release to the close that follows, as before.
+#[derive(Debug)]
+pub(crate) struct FileLock {
+    /// `None` once [`FileLock::into_file`] took it.
+    file: Option<File>,
+}
+
+#[allow(
+    clippy::disallowed_methods,
+    reason = "the one place this crate takes a file lock (OWL-646)"
+)]
+impl FileLock {
+    /// `file`'s lock taken alone, without waiting: `None` while another open
+    /// file description holds it.
+    pub(crate) fn try_exclusive(file: File) -> io::Result<Option<Self>> {
+        Self::held(file.try_lock(), file)
+    }
+
+    /// `file`'s lock shared, without waiting: `None` while another open file
+    /// description holds it alone.
+    pub(crate) fn try_shared(file: File) -> io::Result<Option<Self>> {
+        Self::held(file.try_lock_shared(), file)
+    }
+
+    /// `file`'s lock taken alone, waited for as long as another holds it.
+    pub(crate) fn exclusive(file: File) -> io::Result<Self> {
+        file.lock()?;
+        Ok(Self { file: Some(file) })
+    }
+
+    fn held(tried: Result<(), TryLockError>, file: File) -> io::Result<Option<Self>> {
+        match tried {
+            Ok(()) => Ok(Some(Self { file: Some(file) })),
+            Err(TryLockError::WouldBlock) => Ok(None),
+            Err(TryLockError::Error(error)) => Err(error),
+        }
+    }
+
+    /// The file, still locked, its lock left to the close of every
+    /// descriptor of its open file description: the daemon's, which it
+    /// hands to the daemon of a newer binary (OWL-616), and which an
+    /// explicit unlock would take from that daemon too.
+    pub(crate) fn into_file(mut self) -> File {
+        self.file
+            .take()
+            .expect("a FileLock holds its file until it is dropped")
+    }
+}
+
+impl Drop for FileLock {
+    fn drop(&mut self) {
+        if let Some(file) = &self.file {
+            let _ = file.unlock();
+        }
+    }
+}
+
 /// Opens the lock file at `path`, creating it, and takes its lock without
-/// waiting: the file while it is held, `None` when another open file
-/// description holds it (`flock` on Unix, `LockFileEx` on Windows). The
-/// locks of the project, the tickets, the account and the run slots share
-/// it; see [`ProjectDirs::lock`] for the moment a lock just released can
-/// still look held.
-pub(crate) fn try_lock_file(path: &Path) -> io::Result<Option<File>> {
+/// waiting: the lock while it is held, `None` when another open file
+/// description holds it. The locks of the project, the tickets, the account
+/// and the run slots share it; see [`ProjectDirs::lock`] for the moment a
+/// lock just released can still look held.
+pub(crate) fn try_lock_file(path: &Path) -> io::Result<Option<FileLock>> {
     #[cfg(test)]
     TRIES.with(|tries| tries.set(tries.get() + 1));
     let file = OpenOptions::new()
@@ -556,11 +623,7 @@ pub(crate) fn try_lock_file(path: &Path) -> io::Result<Option<File>> {
         .write(true)
         .truncate(false)
         .open(path)?;
-    match file.try_lock() {
-        Ok(()) => Ok(Some(file)),
-        Err(TryLockError::WouldBlock) => Ok(None),
-        Err(TryLockError::Error(error)) => Err(error),
-    }
+    FileLock::try_exclusive(file)
 }
 
 /// [`try_lock_file`], tried again every `poll` until `wait` has passed: a
@@ -573,7 +636,7 @@ pub(crate) fn lock_file_within(
     path: &Path,
     wait: Duration,
     poll: Duration,
-) -> io::Result<Option<File>> {
+) -> io::Result<Option<FileLock>> {
     retry_within(wait, poll, || try_lock_file(path))
 }
 
@@ -612,31 +675,21 @@ pub(crate) fn lock_file_shared_within(
     path: &Path,
     wait: Duration,
     poll: Duration,
-) -> io::Result<Option<File>> {
-    retry_within(wait, poll, || {
-        let file = open_lock_file(path)?;
-        match file.try_lock_shared() {
-            Ok(()) => Ok(Some(file)),
-            Err(TryLockError::WouldBlock) => Ok(None),
-            Err(TryLockError::Error(error)) => Err(error),
-        }
-    })
+) -> io::Result<Option<FileLock>> {
+    retry_within(wait, poll, || FileLock::try_shared(open_lock_file(path)?))
 }
 
 /// Whether a holder has the lock of the file at `path` to itself now
 /// (OWL-435): one shared try, let go at once, which a shared holder does not
-/// fail. No file is no holder.
+/// fail. The try's own lock is let go explicitly ([`FileLock`]), so the
+/// look never keeps a holder out. No file is no holder.
 pub(crate) fn held_alone(path: &Path) -> io::Result<bool> {
     let file = match OpenOptions::new().write(true).open(path) {
         Ok(file) => file,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
         Err(error) => return Err(error),
     };
-    match file.try_lock_shared() {
-        Ok(()) => Ok(false),
-        Err(TryLockError::WouldBlock) => Ok(true),
-        Err(TryLockError::Error(error)) => Err(error),
-    }
+    Ok(FileLock::try_shared(file)?.is_none())
 }
 
 /// The folders in `dir`, by name; none when `dir` is not there.
@@ -674,8 +727,8 @@ fn open_lock_file(path: &Path) -> io::Result<File> {
 fn retry_within(
     wait: Duration,
     poll: Duration,
-    mut try_once: impl FnMut() -> io::Result<Option<File>>,
-) -> io::Result<Option<File>> {
+    mut try_once: impl FnMut() -> io::Result<Option<FileLock>>,
+) -> io::Result<Option<FileLock>> {
     let started = Instant::now();
     loop {
         if let Some(file) = try_once()? {
@@ -710,7 +763,7 @@ fn exists(path: &Path) -> io::Result<bool> {
 /// The project's lock: see [`ProjectDirs::lock`].
 #[derive(Debug)]
 pub struct ProjectLock {
-    _file: File,
+    _file: FileLock,
 }
 
 /// A ticket's lock: see [`ProjectDirs::ticket_lock`].
@@ -719,13 +772,13 @@ pub struct TicketLock {
     /// What a command's take wrote beside the lock, its holder record and
     /// the busy mark it cleared: removed before the lock is let go.
     left: Vec<PathBuf>,
-    _file: File,
+    _file: FileLock,
 }
 
 impl Drop for TicketLock {
     /// Removes the holder record and the busy mark while the lock is still
     /// held, so it never removes the next holder's; the lock goes after,
-    /// with the file.
+    /// when `_file` is dropped, once this has run.
     fn drop(&mut self) {
         for path in &self.left {
             let _ = fs::remove_file(path);
@@ -1428,6 +1481,52 @@ mod tests {
         assert!(other.exists());
     }
 
+    /// OWL-646: a lock released while a child holds a copy of its descriptor
+    /// reads free at once. Under `cargo test` a child that another test
+    /// forks shares every descriptor open at that moment until it execs; the
+    /// release lets the lock go explicitly ([`FileLock`]), for every copy.
+    /// The same child keeps a lock released by the close alone, as the
+    /// daemon's is ([`FileLock::into_file`]), for as long as it runs.
+    #[cfg(unix)]
+    #[test]
+    fn a_released_lock_is_free_while_a_child_holds_its_descriptor() {
+        use owlshift_platform::process::hand_over_file;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let (released, closed) = (tmp.path().join("released"), tmp.path().join("closed"));
+        // A lock taken, and a copy of its descriptor for the child.
+        let take = |path: &Path| {
+            let file = OpenOptions::new()
+                .create(true)
+                .write(true)
+                .truncate(false)
+                .open(path)
+                .unwrap();
+            let copy = file.try_clone().unwrap();
+            (FileLock::try_exclusive(file).unwrap().expect("free"), copy)
+        };
+        let (released_lock, released_copy) = take(&released);
+        let (closed_lock, closed_copy) = take(&closed);
+        let mut command = Command::new("sleep");
+        command.arg("30");
+        hand_over_file(&mut command, &released_copy).unwrap();
+        hand_over_file(&mut command, &closed_copy).unwrap();
+        let mut child = command.spawn().unwrap();
+        drop(command);
+        drop((released_copy, closed_copy));
+        drop(released_lock);
+        drop(closed_lock.into_file());
+
+        let free = try_lock_file(&released).unwrap().is_some();
+        let kept = try_lock_file(&closed).unwrap().is_none();
+        let running = child.try_wait().unwrap().is_none();
+        let _ = child.kill();
+        let _ = child.wait();
+        assert!(running, "the child ended before the check");
+        assert!(free, "a released lock read held while a child kept a copy");
+        assert!(kept, "the child's copy keeps a lock released by the close");
+    }
+
     /// The lock is checked alone, in a fresh copy of this test binary
     /// (`alone::run_alone`): in this process, other tests spawn children
     /// (`git`, `sh`), and a child spawned while a lock is held keeps it until
@@ -1533,16 +1632,22 @@ mod tests {
         assert!(dirs.lock_for_write(&new).unwrap().is_some(), "made");
 
         // Close-on-exec (architecture section 5, "Locks", check (e)): a
-        // child that execs while the lock is held does not keep it. On macOS
-        // a child `posix_spawn` started can keep it a moment after the spawn
-        // returned (OWL-414), so the release is waited for, while the child
-        // still runs: one that inherited the file would hold it to its end.
+        // child that execs while the lock is held does not keep it. The lock
+        // is released by the close alone, as a holder killed outright
+        // releases it: an explicit release (OWL-646) would free it even from
+        // a child that inherited the file. On macOS a child `posix_spawn`
+        // started can keep it a moment after the spawn returned (OWL-414),
+        // so the release is waited for, while the child still runs: one that
+        // inherited the file would hold it to its end.
         #[cfg(unix)]
         {
-            let held = dirs.ticket_lock(&ticket).unwrap().expect("free again");
+            let file = dirs.ticket_lock_file(&ticket);
+            let held = try_lock_file(&file)
+                .unwrap()
+                .expect("free again")
+                .into_file();
             let mut child = Command::new("sleep").arg("30").spawn().unwrap();
             drop(held);
-            let file = dirs.ticket_lock_file(&ticket);
             let free = lock_file_within(&file, Duration::from_secs(5), poll)
                 .unwrap()
                 .is_some();

@@ -74,9 +74,11 @@ pub fn make(cargo: &str, target_tmpdir: &str) -> (PathBuf, fs::File) {
     let name = cargo.file_name().unwrap();
     let lock = cargo.parent().unwrap().join(".cargo-artifact-lock");
     // Released when dropped, once the copies are in order.
-    let _cargo = fs::File::open(&lock)
-        .and_then(|file| file.lock_shared().map(|()| file))
-        .unwrap_or_else(|error| panic!("{}: {error}, cargo's lock (OWL-610)", lock.display()));
+    let _cargo = Unlocking(
+        fs::File::open(&lock)
+            .and_then(|file| file.lock_shared().map(|()| file))
+            .unwrap_or_else(|error| panic!("{}: {error}, cargo's lock (OWL-610)", lock.display())),
+    );
     let built = fs::metadata(cargo).unwrap();
     let modified = built.modified().unwrap();
     let since = modified.duration_since(UNIX_EPOCH).unwrap();
@@ -95,6 +97,7 @@ pub fn make(cargo: &str, target_tmpdir: &str) -> (PathBuf, fs::File) {
         // Released when dropped.
         let copying = lock_file(&folder.join("copying"));
         copying.lock().unwrap();
+        let _copying = Unlocking(copying);
         if !copy.exists() {
             // A copy made anew has not been started.
             match fs::remove_file(&started) {
@@ -104,7 +107,7 @@ pub fn make(cargo: &str, target_tmpdir: &str) -> (PathBuf, fs::File) {
                 _ => {}
             }
             let staged = folder.join(format!("staged-{}", std::process::id()));
-            fs::copy(cargo, &staged).unwrap();
+            crate::stand_in::copy_executable(cargo, &staged);
             fs::rename(&staged, &copy).unwrap();
             for entry in fs::read_dir(&copies).unwrap().flatten() {
                 if entry.path() != folder && unused(&entry.path()) {
@@ -134,6 +137,21 @@ fn start_once(copy: &Path, folder: &Path) {
     crate::stand_in::start_once(&mut command);
 }
 
+/// A file whose lock this process holds, let go explicitly when dropped,
+/// before its descriptor closes (OWL-646): a child forked meanwhile by
+/// another test of this process keeps a copy of the descriptor until it
+/// starts its own program, and with it a lock released by the close alone.
+/// The runner's `project::FileLock` does the same; this file uses the
+/// standard library only.
+struct Unlocking(fs::File);
+
+impl Drop for Unlocking {
+    fn drop(&mut self) {
+        // A failed unlock leaves the release to the close that follows.
+        let _ = self.0.unlock();
+    }
+}
+
 /// The lock file `path`, opened for reading and writing: Windows locks
 /// nothing through a handle with neither.
 fn lock_file(path: &Path) -> fs::File {
@@ -155,7 +173,7 @@ fn unused(folder: &Path) -> bool {
         .write(true)
         .open(folder.join("in-use"))
     {
-        Ok(file) => file.try_lock().is_ok(),
+        Ok(file) => file.try_lock().map(|()| Unlocking(file)).is_ok(),
         Err(error) => error.kind() == ErrorKind::NotFound,
     }
 }

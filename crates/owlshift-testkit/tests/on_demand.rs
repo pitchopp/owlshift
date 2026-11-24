@@ -3265,12 +3265,10 @@ fn redirect_git_link(evil: PathBuf, fired: PathBuf) -> Agent {
         fs::create_dir_all(&hooks).unwrap();
         let hook = hooks.join("pre-push");
         let fired = fired.to_string_lossy().replace('\\', "/");
-        fs::write(&hook, format!("#!/bin/sh\necho ran > '{fired}'\n")).unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            fs::set_permissions(&hook, fs::Permissions::from_mode(0o755)).unwrap();
-        }
+        owlshift_testkit::stand_in::write_executable(
+            &hook,
+            format!("#!/bin/sh\necho ran > '{fired}'\n"),
+        );
         let hooks_path = hooks.to_string_lossy().replace('\\', "/");
         let mut config = fs::read_to_string(evil_common.join("config")).unwrap();
         config.push_str(&format!("[core]\n\thooksPath = {hooks_path}\n"));
@@ -6037,6 +6035,7 @@ fn a_session_the_resolver_settled_outlives_a_build_that_cannot_start() {
         None,
         vec![refuse],
     );
+    // Not an executable a test writes (OWL-646): a folder's mode.
     fs::set_permissions(&runs, fs::Permissions::from_mode(0o755)).unwrap();
     assert!(
         matches!(&stopped, Err(Stop::Refused(why)) if why.contains("run directory")),

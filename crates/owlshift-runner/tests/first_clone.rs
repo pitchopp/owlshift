@@ -17,6 +17,7 @@ use tempfile::TempDir;
 /// The testkit's, which this crate cannot depend on: the testkit depends on
 /// it.
 #[cfg(unix)]
+#[allow(dead_code, reason = "these tests use part of it")]
 #[path = "../../owlshift-testkit/src/stand_in.rs"]
 mod stand_in;
 

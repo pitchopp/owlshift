@@ -77,8 +77,8 @@ impl EventLog {
             .write(true)
             .truncate(false)
             .open(&self.lock)?;
-        // Released when `lock` is dropped, or when the process ends.
-        lock.lock()?;
+        // Released when `_lock` is dropped, or when the process ends.
+        let _lock = crate::project::FileLock::exclusive(lock)?;
         let mut file = OpenOptions::new()
             .create(true)
             .read(true)

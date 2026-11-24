@@ -55,6 +55,12 @@ pub mod run_caches;
 pub mod secrets;
 pub mod served;
 pub mod slots;
+/// The testkit's, which this crate cannot depend on (the testkit depends on
+/// it): the executables the unit tests write (OWL-646).
+#[cfg(all(test, unix))]
+#[allow(dead_code, reason = "the unit tests use part of it")]
+#[path = "../../owlshift-testkit/src/stand_in.rs"]
+mod stand_in;
 pub mod status;
 pub mod step;
 pub mod system;

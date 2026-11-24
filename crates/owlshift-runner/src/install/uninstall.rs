@@ -2,7 +2,7 @@
 //! then exactly what the install manifest lists removed, then, with
 //! `--purge`, Owlshift's entries of the data directory and the personal file.
 
-use std::fs::{self, OpenOptions, TryLockError};
+use std::fs::{self, OpenOptions};
 use std::io;
 use std::path::{Path, PathBuf};
 use std::thread;
@@ -242,11 +242,10 @@ fn is_held(path: &Path) -> Result<bool, String> {
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
         Err(error) => return Err(format!("{}: {error}", path.display())),
     };
-    match file.try_lock() {
-        Ok(()) => Ok(false),
-        Err(TryLockError::WouldBlock) => Ok(true),
-        Err(TryLockError::Error(error)) => Err(format!("{}: {error}", path.display())),
-    }
+    // The try's own lock is let go explicitly (OWL-646).
+    crate::project::FileLock::try_exclusive(file)
+        .map(|free| free.is_none())
+        .map_err(|error| format!("{}: {error}", path.display()))
 }
 
 /// What [`purge`] did.
