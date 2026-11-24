@@ -222,6 +222,17 @@ gate = ["make lint", "make test"]
 
 `init` reads the `lint`, `test` and `check` targets your Makefile defines.
 
+**Several projects in one repository**
+
+```toml
+[stack]
+gate = ["cd backend && uv run pytest", "cd frontend && pnpm run test"]
+setup = ["cd frontend && pnpm install --frozen-lockfile"]
+run_caches = { UV_CACHE_DIR = "uv", UV_PYTHON_INSTALL_DIR = "uv-python", PNPM_HOME = "pnpm", COREPACK_HOME = "corepack" }
+```
+
+`init` also reads each folder of the root, and each folder of `apps/` and `services/`. A project there gets the lines its files would give at the root, run in its folder, and a cache two projects need is declared once, for both. A folder of a workspace the root manages, which has no lock of its own, is left to the root's lines, as is a folder's Makefile below a root Makefile. A folder outside your build, such as `docs/` or `e2e/`, gets lines too: delete those you do not want.
+
 **Check it:** `owlshift gate` runs the gate in a fresh worktree of your default branch (`--at origin/<branch>` tries a branch that is not merged yet) and names each command, its status and its time. Run it after you commit and push the file. When it fails for a folder of your home, it prints the `caches` and `allow_caches` lines that open it. `owlshift doctor` ends with `Ready` when nothing blocks `owlshift do`.
 
 ## Codex beside Claude Code
