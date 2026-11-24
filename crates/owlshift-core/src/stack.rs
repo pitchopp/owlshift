@@ -1,7 +1,8 @@
 //! Stack detection for `owlshift init` (P9, OWL-539): the gate, the setup it
 //! needs and the caches of Owlshift's own its runs may write
 //! (`stack.run_caches`, OWL-617), read from the names and contents of the
-//! repository's root files.
+//! repository's root files, and of the folders below the root that hold a
+//! project of their own (OWL-630, [`reads_folder`], [`CONTAINERS`]).
 //!
 //! A pure function: the caller reads the root and passes in the file names and
 //! the contents of the four manifests it recognises (`Cargo.toml`,
@@ -31,6 +32,47 @@ pub struct RootFiles {
     /// so that detection stays a function of what the runner read.
     #[serde(default)]
     pub home_managers: Vec<HomeManager>,
+    /// The folders below the root the runner read (OWL-630): each folder of
+    /// the root that [`reads_folder`] allows, and each such folder of the
+    /// [`CONTAINERS`], in name order, a container before its folders.
+    #[serde(default)]
+    pub folders: Vec<Folder>,
+}
+
+/// A folder below the root, as the runner read it (OWL-630): its names and
+/// manifests, as [`RootFiles`] holds the root's.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Folder {
+    /// Its path from the root, its parts joined with `/`: `backend`,
+    /// `apps/web`.
+    pub path: String,
+    /// The names of the files in it.
+    pub names: Vec<String>,
+    /// The contents of its manifests the runner read, by name.
+    pub files: Vec<(String, String)>,
+    /// The runner could not list it, so nothing of it is known: reported as
+    /// skipped, never taken for an empty folder.
+    #[serde(default)]
+    pub unlisted: bool,
+}
+
+/// The folders of the root whose own folders are read too (OWL-630): they
+/// gather projects, one folder each.
+pub const CONTAINERS: [&str; 2] = ["apps", "services"];
+
+/// The folders below the root never read (OWL-630): what package managers
+/// and builds write, not a project.
+const NOT_READ: [&str; 5] = ["node_modules", "vendor", "target", "dist", "build"];
+
+/// Whether the runner reads the folder `name` below the root (OWL-630): not
+/// a hidden folder, not `node_modules`, `vendor`, `target`, `dist` or
+/// `build`, not a name holding a control character, which no `cd` line
+/// should carry.
+pub fn reads_folder(name: &str) -> bool {
+    !name.is_empty()
+        && !name.starts_with('.')
+        && !name.chars().any(char::is_control)
+        && !NOT_READ.contains(&name)
 }
 
 /// A version manager on the machine's `PATH` whose installs folder lies in
@@ -102,9 +144,12 @@ pub struct Detection {
     /// In the fixed order `Cargo.toml`, `go.mod`, `package.json`, Python
     /// (`pyproject.toml`, `requirements.txt`), `Gemfile`, the tool chains in
     /// the home (OWL-631), Gradle, Maven,
-    /// Composer, .NET, Elixir, Dart, Swift, Deno, `Makefile`.
+    /// Composer, .NET, Elixir, Dart, Swift, Deno, `Makefile`; then each
+    /// folder below the root in the order the runner read them, its sources
+    /// in the same order (OWL-630).
     pub found: Vec<Found>,
-    /// A manifest that could not be read or parsed, with why. Never an error.
+    /// A manifest that could not be read or parsed, or a folder that could
+    /// not be listed, with why. Never an error.
     pub skipped: Vec<String>,
 }
 
@@ -119,9 +164,30 @@ impl Detection {
         self.found.iter().flat_map(|f| f.setup.iter())
     }
 
-    /// The detected caches a run may write, in order.
+    /// The detected caches a run may write, in order, one per source: a
+    /// variable two sources name comes twice.
     pub fn run_caches(&self) -> impl Iterator<Item = &RunCache> {
         self.found.iter().flat_map(|f| f.run_caches.iter())
+    }
+
+    /// The detected caches a run may write, one per variable (OWL-630): the
+    /// project file names a variable once, and its folder serves every
+    /// source that names it, as it serves every run of the project. A
+    /// variable keeps its first folder, every source naming one variable
+    /// with one folder, and says what each source read it from.
+    pub fn merged_run_caches(&self) -> Vec<RunCache> {
+        let mut merged: Vec<RunCache> = vec![];
+        for cache in self.run_caches() {
+            match merged.iter_mut().find(|m| m.variable == cache.variable) {
+                Some(kept) => {
+                    if !kept.read_from.split("; ").any(|r| r == cache.read_from) {
+                        kept.read_from = format!("{}; {}", kept.read_from, cache.read_from);
+                    }
+                }
+                None => merged.push(cache.clone()),
+            }
+        }
+        merged
     }
 }
 
@@ -139,37 +205,228 @@ pub const MANIFESTS: [&str; 5] = [
 /// holds nothing of it, or why its manifest was skipped.
 type Source = fn(&RootFiles) -> Result<Option<Found>, String>;
 
-/// Detect the stack of a root.
+/// The name the tool chains in the home are skipped under (OWL-631).
+const TOOL_VERSIONS: &str = ".tool-versions";
+
+/// The source the tool chains in the home are found under (OWL-631).
+const HOME_TOOLCHAINS: &str = "tool chains in the home";
+
+/// The sources of [`detect`], in their fixed order, each with the name it is
+/// skipped under, which also names its kind, and the files that make a
+/// folder a project of its own beside a root of the same kind (OWL-630). A
+/// member of the root's workspace has none of them: the root's lock or
+/// wrapper serves it, and the root's lines cover it. Only a source that reads
+/// a manifest's text, of `MANIFESTS`, can be skipped; the others read names
+/// and keep a name here for the list's sake. A Go module is always its own,
+/// since `./...` stops at a nested `go.mod`; a .NET project or a Makefile
+/// beside a root of its kind is the root's.
+const SOURCES: [(&str, Source, &[&str]); 15] = [
+    ("Cargo.toml", cargo, &["Cargo.lock"]),
+    ("go.mod", go, &["go.mod"]),
+    (
+        "package.json",
+        package_json,
+        &[
+            "pnpm-lock.yaml",
+            "yarn.lock",
+            "bun.lock",
+            "bun.lockb",
+            "package-lock.json",
+        ],
+    ),
+    (
+        "pyproject.toml",
+        python,
+        &["uv.lock", "poetry.lock", "pdm.lock", "requirements.txt"],
+    ),
+    ("Gemfile", ruby, &["Gemfile.lock"]),
+    // Never the root's: see `fresh_toolchain_notes`.
+    (TOOL_VERSIONS, home_toolchains, &[]),
+    ("gradlew", gradle, &["gradlew"]),
+    ("pom.xml", maven, &["mvnw"]),
+    ("composer.json", composer, &["composer.lock"]),
+    (".NET", dotnet, &[]),
+    ("mix.exs", elixir, &["mix.lock"]),
+    ("pubspec.yaml", dart, &["pubspec.lock"]),
+    ("Package.swift", swift, &["Package.resolved"]),
+    ("deno.json", deno, &["deno.lock"]),
+    ("Makefile", makefile, &[]),
+];
+
+/// Detect the stack of a root, then of the folders below it (OWL-630): a
+/// folder's sources are those of a root, its lines run in it, and a source
+/// whose kind the root found, or the folder's container (`apps/web`'s
+/// `apps`), is left to them unless the folder holds its own lock or
+/// wrapper, which makes it a project of its own.
 pub fn detect(root: &RootFiles) -> Detection {
-    // Each with the name it is skipped under. Only a source that reads a
-    // manifest's text, of `MANIFESTS`, can be skipped; the others read names
-    // and keep a name here for the list's sake.
-    let sources: [(&str, Source); 15] = [
-        ("Cargo.toml", cargo),
-        ("go.mod", go),
-        ("package.json", package_json),
-        ("pyproject.toml", python),
-        ("Gemfile", ruby),
-        (".tool-versions", home_toolchains),
-        ("gradlew", gradle),
-        ("pom.xml", maven),
-        ("composer.json", composer),
-        (".NET", dotnet),
-        ("mix.exs", elixir),
-        ("pubspec.yaml", dart),
-        ("Package.swift", swift),
-        ("deno.json", deno),
-        ("Makefile", makefile),
-    ];
     let mut out = Detection::default();
-    for (name, source) in sources {
-        match source(root) {
-            Ok(Some(found)) => out.found.push(found),
-            Ok(None) => {}
-            Err(why) => out.skipped.push(format!("{name}: {why}")),
+    let mut toolchain_notes = vec![];
+    let root_kinds = run_sources(root, None, &[], &mut out, &mut toolchain_notes);
+    for folder in &root.folders {
+        if folder.unlisted {
+            out.skipped
+                .push(format!("{}/: it could not be listed", folder.path));
+            continue;
         }
+        let mut covered = root_kinds.clone();
+        if let Some((container, _)) = folder.path.split_once('/')
+            && let Some(parent) = root.folders.iter().find(|f| f.path == container)
+        {
+            covered.extend(kinds(&folder_files(parent, root)));
+        }
+        run_sources(
+            &folder_files(folder, root),
+            Some(&folder.path),
+            &covered,
+            &mut out,
+            &mut toolchain_notes,
+        );
     }
     out
+}
+
+/// The files of `folder`, read as a root's, with the machine's version
+/// managers the runner found for the root.
+fn folder_files(folder: &Folder, root: &RootFiles) -> RootFiles {
+    RootFiles {
+        names: folder.names.clone(),
+        files: folder.files.clone(),
+        home_managers: root.home_managers.clone(),
+        folders: vec![],
+    }
+}
+
+/// The kinds of [`SOURCES`] that found something in `files`.
+fn kinds(files: &RootFiles) -> Vec<&'static str> {
+    SOURCES
+        .iter()
+        .filter(|(_, source, _)| matches!(source(files), Ok(Some(_))))
+        .map(|(name, _, _)| *name)
+        .collect()
+}
+
+/// Runs every source on `files` and adds to `out` what it found: the root's
+/// as it is (`at` is `None`), a folder's run in it, unless `covered` holds
+/// its kind and the folder none of its own files. Returns the kinds found.
+fn run_sources(
+    files: &RootFiles,
+    at: Option<&str>,
+    covered: &[&str],
+    out: &mut Detection,
+    toolchain_notes: &mut Vec<String>,
+) -> Vec<&'static str> {
+    let mut found_kinds = vec![];
+    for (name, source, own) in SOURCES {
+        let result = source(files);
+        if matches!(result, Ok(Some(_))) {
+            found_kinds.push(name);
+        }
+        // A member of the root's workspace, served by the root's lines.
+        let rootward = name != TOOL_VERSIONS
+            && covered.contains(&name)
+            && !own.iter().any(|file| files.has(file));
+        if at.is_some() && rootward {
+            continue;
+        }
+        match result {
+            Ok(Some(found)) => {
+                let found = if name == TOOL_VERSIONS {
+                    match fresh_toolchain_notes(found, toolchain_notes) {
+                        Some(found) => found,
+                        None => continue,
+                    }
+                } else {
+                    found
+                };
+                out.found.push(match at {
+                    Some(path) => in_folder(found, path),
+                    None => found,
+                });
+            }
+            Ok(None) => {}
+            Err(why) => out.skipped.push(match at {
+                Some(path) => format!("{path}/{name}: {why}"),
+                None => format!("{name}: {why}"),
+            }),
+        }
+    }
+    found_kinds
+}
+
+/// The tool chains in the home, less the notes already written (OWL-630):
+/// they speak of the machine, so a root and its folders, or two folders,
+/// would repeat them word for word. `None` when every note was.
+fn fresh_toolchain_notes(mut found: Found, written: &mut Vec<String>) -> Option<Found> {
+    found.notes.retain(|note| !written.contains(note));
+    written.extend(found.notes.iter().cloned());
+    (!found.notes.is_empty()).then_some(found)
+}
+
+/// What a folder's source found, made true from the root (OWL-630): its
+/// lines run in the folder, and what they were read from, its notes and its
+/// source name the folder. Every field is named, so a field added to
+/// [`Found`] is placed here before it compiles.
+fn in_folder(found: Found, path: &str) -> Found {
+    let Found {
+        source,
+        gate,
+        setup,
+        run_caches,
+        notes,
+        gate_notes,
+    } = found;
+    let from = |read_from: String| format!("{read_from}, in {path}/");
+    let lines = |lines: Vec<Line>| -> Vec<Line> {
+        lines
+            .into_iter()
+            .map(|l| Line {
+                command: run_in(path, &l.command),
+                read_from: from(l.read_from),
+            })
+            .collect()
+    };
+    let note = |note: String| format!("in `{path}/`: {note}");
+    Found {
+        source: if source == HOME_TOOLCHAINS {
+            format!("{source}, for {path}/")
+        } else {
+            format!("{path}/{source}")
+        },
+        gate: lines(gate),
+        setup: lines(setup),
+        run_caches: run_caches
+            .into_iter()
+            .map(|cache| RunCache {
+                read_from: from(cache.read_from),
+                ..cache
+            })
+            .collect(),
+        notes: notes.into_iter().map(note).collect(),
+        gate_notes: gate_notes.into_iter().map(note).collect(),
+    }
+}
+
+/// `command` run in the folder `path` from the root, where every line of
+/// the gate and the setup starts (OWL-630). `&&` binds tighter than `;`,
+/// `||`, `&` and a line break, so a command holding one is put in braces,
+/// lest the `cd` cover its first part alone; braces never change what a
+/// command does, so a match inside quotes costs only the braces. A path
+/// starting with `-` gets `./`, which `cd` would read as an option.
+fn run_in(path: &str, command: &str) -> String {
+    let dir = if path.starts_with('-') {
+        shell_word(&format!("./{path}"))
+    } else {
+        shell_word(path)
+    };
+    let looser = command.contains(';')
+        || command.contains("||")
+        || command.contains('\n')
+        || command.replace("&&", "").contains('&');
+    if looser {
+        format!("cd {dir} && {{ {command}; }}")
+    } else {
+        format!("cd {dir} && {command}")
+    }
 }
 
 /// The text of the manifest `name`, `None` when the root has no such file; an
@@ -584,7 +841,7 @@ const PYTHON_MANAGERS: [PythonManager; 3] = [
         setup: Some("pdm install"),
         run_caches: &[("PDM_CACHE_DIR", "pdm"), ("PDM_LOG_DIR", "pdm-log")],
         notes: &[
-            "pdm saves the Python it chose in `.pdm-python` at the root: ignore it in \
+            "pdm saves the Python it chose in `.pdm-python`, beside `pyproject.toml`: ignore it in \
                   `.gitignore`, as `pdm init` does, since a setup that leaves a file git sees \
                   fails the gate",
         ],
@@ -833,7 +1090,7 @@ fn home_toolchains(root: &RootFiles) -> Result<Option<Found>, String> {
     if notes.is_empty() {
         return Ok(None);
     }
-    let mut found = found("tool chains in the home");
+    let mut found = found(HOME_TOOLCHAINS);
     found.notes = notes;
     Ok(Some(found))
 }
@@ -860,7 +1117,7 @@ fn gradle(root: &RootFiles) -> Result<Option<Found>, String> {
     if !root.has("gradlew") {
         let mut found = found(build);
         found.notes.push(
-            "no Gradle wrapper (`gradlew`) at the root, so nothing was written: the gate runs the \
+            "no Gradle wrapper (`gradlew`) beside the build file, so nothing was written: the gate runs the \
              project's Gradle, such as `gradle check --no-daemon`, with \
              `run_caches.GRADLE_USER_HOME = \"gradle\"` for the caches it writes"
                 .to_string(),
@@ -973,7 +1230,7 @@ const DOTNET_PROJECTS: [&str; 3] = [".csproj", ".fsproj", ".vbproj"];
 fn shell_word(name: &str) -> String {
     if name
         .chars()
-        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-' | '+'))
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-' | '+' | '/'))
     {
         name.to_owned()
     } else {
@@ -1034,7 +1291,7 @@ fn dotnet(root: &RootFiles) -> Result<Option<Found>, String> {
         [] if root.has("global.json") => {
             let mut found = found("global.json");
             found.notes.push(format!(
-                "global.json names a .NET SDK, but no solution or project is at the root, so \
+                "global.json names a .NET SDK, but no solution or project is beside it, so \
                  nothing was written: {}",
                 lines("<solution>")
             ));
@@ -1044,7 +1301,7 @@ fn dotnet(root: &RootFiles) -> Result<Option<Found>, String> {
         _ => {
             let mut found = found(files.join(", "));
             found.notes.push(format!(
-                "{} are at the root, so nothing was written: for the one that builds the rest, \
+                "{} are side by side, so nothing was written: for the one that builds the rest, \
                  {}",
                 files.join(", "),
                 lines("<file>")
@@ -1145,7 +1402,7 @@ fn elixir(root: &RootFiles) -> Result<Option<Found>, String> {
         ));
     } else {
         found.notes.push(
-            "no `.formatter.exs` at the root, so the formatting is not checked: with one, the gate \
+            "no `.formatter.exs` beside `mix.exs`, so the formatting is not checked: with one, the gate \
              can run `mix format --check-formatted`"
                 .to_string(),
         );
@@ -1310,8 +1567,25 @@ mod tests {
                 .iter()
                 .map(|(n, c)| (n.to_string(), c.to_string()))
                 .collect(),
-            home_managers: vec![],
+            ..RootFiles::default()
         }
+    }
+
+    /// The folder `path` below a root, read as [`root`] reads one.
+    fn folder(path: &str, names: &[&str], files: &[(&str, &str)]) -> Folder {
+        let RootFiles { names, files, .. } = root(names, files);
+        Folder {
+            path: path.to_owned(),
+            names,
+            files,
+            unlisted: false,
+        }
+    }
+
+    /// `root` with `folders` below it.
+    fn with_folders(mut root: RootFiles, folders: Vec<Folder>) -> RootFiles {
+        root.folders = folders;
+        root
     }
 
     fn commands<'a>(lines: impl Iterator<Item = &'a Line>) -> Vec<&'a str> {
@@ -2206,13 +2480,29 @@ check::
             root(&["yarn.lock", ".yarnrc.yml"], &[("package.json", "{}")]),
         ];
         let mut seen = 0;
+        let mut pairs = vec![];
         for r in &roots {
             let d = detect(r);
             let entries = run_caches(d.run_caches());
             seen += entries.len();
             crate::agent_env::check_run_caches(&entries).unwrap();
+            pairs.extend(
+                entries
+                    .iter()
+                    .map(|(v, f)| (v.to_ascii_lowercase(), f.to_ascii_lowercase())),
+            );
         }
         assert_eq!(seen, 22);
+        // OWL-630: one variable is one folder whatever its source, and one
+        // folder one variable, ignoring case as the loader does, so the
+        // project file can name a variable once for every folder below the
+        // root that needs it.
+        for (variable, folder) in &pairs {
+            assert!(
+                pairs.iter().all(|(v, f)| (v == variable) == (f == folder)),
+                "{variable} = {folder}"
+            );
+        }
     }
 
     #[test]
@@ -2288,5 +2578,283 @@ check::
         );
         assert!(d.gate().all(|l| !l.read_from.is_empty()));
         assert!(d.setup().all(|l| !l.read_from.is_empty()));
+    }
+
+    const SCRIPTS: &str = r#"{"scripts":{"lint":"eslint .","test":"jest"}}"#;
+
+    fn sources(d: &Detection) -> Vec<&str> {
+        d.found.iter().map(|f| f.source.as_str()).collect()
+    }
+
+    /// OWL-630: Locary's shape. A root Makefile delegates to `backend/` (uv)
+    /// and `frontend/` (pnpm), each with a Makefile of its own, which the
+    /// root's covers; the folders' lines run in them and their run caches
+    /// are named once.
+    #[test]
+    fn a_repository_of_folders_is_detected_one_folder_down() {
+        let d = detect(&with_folders(
+            root(&[], &[("Makefile", "lint:\ntest:\n")]),
+            vec![
+                folder(
+                    "backend",
+                    &["uv.lock"],
+                    &[
+                        ("pyproject.toml", "[tool.ruff]\n[tool.pytest.ini_options]\n"),
+                        ("Makefile", "lint:\n"),
+                    ],
+                ),
+                folder(
+                    "frontend",
+                    &["pnpm-lock.yaml"],
+                    &[("package.json", SCRIPTS), ("Makefile", "test:\n")],
+                ),
+            ],
+        ));
+        assert_eq!(
+            sources(&d),
+            [
+                "Makefile",
+                "backend/pyproject.toml (uv.lock)",
+                "frontend/package.json (pnpm-lock.yaml)"
+            ]
+        );
+        assert_eq!(
+            commands(d.gate()),
+            [
+                "make lint",
+                "make test",
+                "cd backend && uv run ruff check .",
+                "cd backend && uv run pytest",
+                "cd frontend && pnpm run lint",
+                "cd frontend && pnpm run test"
+            ]
+        );
+        assert_eq!(
+            commands(d.setup()),
+            ["cd frontend && pnpm install --frozen-lockfile"]
+        );
+        assert_eq!(
+            d.setup().next().unwrap().read_from,
+            "pnpm-lock.yaml, the lock file of pnpm, in frontend/"
+        );
+        assert_eq!(
+            run_caches(d.merged_run_caches().iter()),
+            [
+                ("UV_CACHE_DIR", "uv"),
+                ("UV_PYTHON_INSTALL_DIR", "uv-python"),
+                ("PNPM_HOME", "pnpm"),
+                ("XDG_RUNTIME_DIR", "pnpm-locks"),
+                ("COREPACK_HOME", "corepack")
+            ]
+        );
+        let frontend = &d.found[2];
+        assert!(!frontend.notes.is_empty() && !frontend.gate_notes.is_empty());
+        assert!(
+            frontend
+                .notes
+                .iter()
+                .chain(&frontend.gate_notes)
+                .all(|n| n.starts_with("in `frontend/`: ")),
+            "{frontend:?}"
+        );
+        assert!(d.skipped.is_empty(), "{:?}", d.skipped);
+    }
+
+    /// OWL-630: a folder of a kind the root found is a member of the root's
+    /// workspace, which the root's lines cover, unless it holds a lock of
+    /// its own. A Go module is its own wherever it lies; a Makefile below a
+    /// root Makefile is the root's.
+    #[test]
+    fn the_roots_workspace_covers_its_members_unless_they_hold_their_own_lock() {
+        let pytest = "[tool.pytest.ini_options]\n";
+        let cases = [
+            (
+                root(
+                    &["Cargo.lock"],
+                    &[("Cargo.toml", "[workspace]\nmembers = [\"member\"]\n")],
+                ),
+                ("Cargo.toml", CARGO),
+                "Cargo.lock",
+                "member/Cargo.toml",
+            ),
+            (
+                root(
+                    &["pnpm-lock.yaml", "pnpm-workspace.yaml"],
+                    &[("package.json", SCRIPTS)],
+                ),
+                ("package.json", SCRIPTS),
+                "pnpm-lock.yaml",
+                "member/package.json (pnpm-lock.yaml)",
+            ),
+            (
+                root(&["uv.lock"], &[("pyproject.toml", pytest)]),
+                ("pyproject.toml", pytest),
+                "uv.lock",
+                "member/pyproject.toml (uv.lock)",
+            ),
+        ];
+        for (top, manifest, lock, source) in cases {
+            let member = detect(&with_folders(
+                top.clone(),
+                vec![
+                    folder("member", &[], &[manifest]),
+                    // A member's manifest is the root's to read.
+                    folder("broken", &[], &[(manifest.0, "{[")]),
+                ],
+            ));
+            assert_eq!(member.found.len(), 1, "{member:?}");
+            assert!(member.skipped.is_empty(), "{:?}", member.skipped);
+            let own = detect(&with_folders(
+                top,
+                vec![folder("member", &[lock], &[manifest])],
+            ));
+            assert_eq!(sources(&own)[1..], [source]);
+        }
+        let d = detect(&with_folders(
+            root(&["go.mod"], &[("Makefile", "test:\n")]),
+            vec![folder("tools", &["go.mod"], &[("Makefile", "lint:\n")])],
+        ));
+        assert_eq!(sources(&d), ["go.mod", "Makefile", "tools/go.mod"]);
+    }
+
+    /// OWL-630: a variable two folders need is written once, one folder
+    /// serving both, its comment naming each source.
+    #[test]
+    fn a_variable_two_folders_need_is_written_once() {
+        let d = detect(&with_folders(
+            RootFiles::default(),
+            vec![
+                folder("admin", &["pnpm-lock.yaml"], &[("package.json", SCRIPTS)]),
+                folder("web", &["pnpm-lock.yaml"], &[("package.json", SCRIPTS)]),
+            ],
+        ));
+        assert_eq!(d.run_caches().count(), 6);
+        let merged = d.merged_run_caches();
+        let entries = run_caches(merged.iter());
+        assert_eq!(
+            entries,
+            [
+                ("PNPM_HOME", "pnpm"),
+                ("XDG_RUNTIME_DIR", "pnpm-locks"),
+                ("COREPACK_HOME", "corepack")
+            ]
+        );
+        assert_eq!(
+            merged[0].read_from,
+            "pnpm-lock.yaml, the lock file of pnpm, in admin/; pnpm-lock.yaml, the lock file of \
+             pnpm, in web/"
+        );
+        crate::agent_env::check_run_caches(&entries).unwrap();
+    }
+
+    /// OWL-630: whatever its name and its command, a folder's line runs in
+    /// it; what could not be read or listed is named by its folder.
+    #[test]
+    fn a_folders_lines_run_in_it_whatever_its_name_or_its_command() {
+        let d = detect(&with_folders(
+            RootFiles::default(),
+            vec![
+                folder("-web", &["go.mod"], &[]),
+                folder("my app", &["go.mod"], &[]),
+                folder("services/api", &["mix.exs", "mix.lock"], &[]),
+                folder("site", &[], &[("package.json", "{")]),
+                Folder {
+                    path: "locked".to_owned(),
+                    unlisted: true,
+                    ..Folder::default()
+                },
+            ],
+        ));
+        let setup = commands(d.setup());
+        assert_eq!(
+            setup[..2],
+            [
+                "cd ./-web && go mod download",
+                "cd 'my app' && go mod download"
+            ]
+        );
+        // Mix's install holds `;` and `||`, which bind looser than `&&`.
+        assert_eq!(setup[2], format!("cd services/api && {{ {MIX_INSTALL}; }}"));
+        assert_eq!(setup[3], "cd services/api && mix deps.get --check-locked");
+        assert!(commands(d.gate()).contains(&"cd ./-web && ! gofmt -l . | grep ."));
+        assert_eq!(
+            d.found[0].notes,
+            [
+                "in `-web/`: Go keeps the modules it downloads read-only: to empty the run caches, \
+              make their folder writable (`chmod -R u+w`) before deleting it"
+            ]
+        );
+        assert_eq!(
+            d.skipped,
+            [
+                "site/package.json: it is not valid JSON",
+                "locked/: it could not be listed"
+            ]
+        );
+    }
+
+    /// OWL-630: the folders of `apps/` and `services/` are projects too,
+    /// unless the container's own workspace covers them.
+    #[test]
+    fn a_containers_folders_are_projects_unless_its_workspace_covers_them() {
+        let d = detect(&with_folders(
+            RootFiles::default(),
+            vec![
+                folder("apps", &["pnpm-lock.yaml"], &[("package.json", SCRIPTS)]),
+                folder("apps/web", &[], &[("package.json", SCRIPTS)]),
+                folder("services/api", &["go.mod"], &[]),
+            ],
+        ));
+        assert_eq!(
+            sources(&d),
+            ["apps/package.json (pnpm-lock.yaml)", "services/api/go.mod"]
+        );
+    }
+
+    #[test]
+    fn the_folders_below_the_root_that_are_read() {
+        for (name, read) in [
+            ("backend", true),
+            ("apps", true),
+            ("my app", true),
+            ("-web", true),
+            (".github", false),
+            (".venv", false),
+            ("node_modules", false),
+            ("vendor", false),
+            ("target", false),
+            ("dist", false),
+            ("build", false),
+            ("a\nb", false),
+            ("", false),
+        ] {
+            assert_eq!(reads_folder(name), read, "{name:?}");
+        }
+    }
+
+    /// OWL-630: the tool chains in the home are the machine's, so a note the
+    /// root or a folder wrote is not written again.
+    #[test]
+    fn a_tool_chain_note_is_written_once_for_the_root_and_its_folders() {
+        let d = detect(&with_folders(
+            root(&[".python-version"], &[]),
+            vec![
+                folder("backend", &[".python-version", ".ruby-version"], &[]),
+                folder("worker", &[".python-version"], &[]),
+            ],
+        ));
+        assert_eq!(
+            sources(&d),
+            [
+                "tool chains in the home",
+                "tool chains in the home, for backend/"
+            ]
+        );
+        assert_eq!(d.found[1].notes.len(), 1);
+        assert!(
+            d.found[1].notes[0].starts_with("in `backend/`: `.ruby-version` names a Ruby"),
+            "{:?}",
+            d.found[1].notes
+        );
     }
 }

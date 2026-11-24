@@ -23,7 +23,8 @@ use semver::Version;
 
 use owlshift_adapters::forge::Repo;
 use owlshift_contracts::config::{ProjectConfig, TrackerKind};
-use owlshift_core::stack::{Detection, HomeManager, MANIFESTS, RootFiles};
+use owlshift_core::agent_env::MAX_RUN_CACHES;
+use owlshift_core::stack::{self, Detection, Folder, HomeManager, MANIFESTS, RootFiles};
 use owlshift_platform::keychain::{Keychain, KeychainError, SERVICE, Secret};
 
 use crate::config::{OWLSHIFT_VERSION, PROJECT_FILE};
@@ -124,12 +125,31 @@ requires = \">={}.{}\"
         commands_block("setup", &setup_lines, &quote)
     };
     // The caches the detected managers write (OWL-617), a dotted key each
-    // under its source, or the example.
+    // under its sources, once per variable however many folders name it
+    // (OWL-630), or the example.
+    let caches = options.detected.merged_run_caches();
     let mut run_caches = String::new();
-    for cache in options.detected.run_caches() {
+    if caches.len() > MAX_RUN_CACHES {
+        // The loader refuses more: those past it are written commented out,
+        // for the person to choose.
+        let past: Vec<&str> = caches[MAX_RUN_CACHES..]
+            .iter()
+            .map(|cache| cache.variable.as_str())
+            .collect();
         run_caches.push_str(&format!(
-            "# read from {}\nrun_caches.{} = {}\n",
+            "# note: a run writes at most {MAX_RUN_CACHES} run caches, so {} {} commented out \
+             below: the lines that need {} fail confined until you keep the {MAX_RUN_CACHES} the \
+             gate needs\n",
+            past.join(", "),
+            if past.len() == 1 { "is" } else { "are" },
+            if past.len() == 1 { "it" } else { "them" },
+        ));
+    }
+    for (i, cache) in caches.iter().enumerate() {
+        run_caches.push_str(&format!(
+            "# read from {}\n{}run_caches.{} = {}\n",
             one_line(&cache.read_from),
+            if i < MAX_RUN_CACHES { "" } else { "# " },
             cache.variable,
             quote(&cache.folder)
         ));
@@ -480,12 +500,65 @@ fn one_line(text: &str) -> String {
 const MANIFEST_LIMIT: u64 = 1 << 20;
 
 /// Reads the root of a repository for [`owlshift_core::stack::detect`]: the
-/// names of its files, and the contents of the manifests it recognises. A
-/// file over 1 MiB or not UTF-8 is left unread, which detection reports as
-/// skipped; only a root that cannot be listed is an error.
+/// names of its files, and the contents of the manifests it recognises; then
+/// the same of each folder below it that detection reads (OWL-630): every
+/// folder of the root [`stack::reads_folder`] allows, a link not followed,
+/// and each such folder of the [`stack::CONTAINERS`]. A file over 1 MiB or
+/// not UTF-8 is left unread, which detection reports as skipped, as it does a
+/// folder that cannot be listed; only a root that cannot be listed is an
+/// error.
 pub fn read_root_files(root: &Path) -> io::Result<RootFiles> {
+    let Folder { names, files, .. } = read_folder(root)?;
+    let mut folders = Vec::new();
+    for name in &names {
+        let Some(folder) = read_below(root, name) else {
+            continue;
+        };
+        let inner = if stack::CONTAINERS.contains(&name.as_str()) {
+            folder.names.clone()
+        } else {
+            vec![]
+        };
+        folders.push(folder);
+        for sub in &inner {
+            if let Some(mut folder) = read_below(&root.join(name), sub) {
+                folder.path = format!("{name}/{sub}");
+                folders.push(folder);
+            }
+        }
+    }
+    Ok(RootFiles {
+        names,
+        files,
+        home_managers: vec![],
+        folders,
+    })
+}
+
+/// The folder `name` of `dir`, read as a root is, when detection reads it:
+/// a folder, not a link to one, that [`stack::reads_folder`] allows. `None`
+/// otherwise; one that cannot be listed comes back `unlisted`.
+fn read_below(dir: &Path, name: &str) -> Option<Folder> {
+    let path = dir.join(name);
+    let is_folder = std::fs::symlink_metadata(&path).is_ok_and(|meta| meta.is_dir());
+    if !is_folder || !stack::reads_folder(name) {
+        return None;
+    }
+    let read = read_folder(&path).unwrap_or_else(|_| Folder {
+        unlisted: true,
+        ..Folder::default()
+    });
+    Some(Folder {
+        path: name.to_owned(),
+        ..read
+    })
+}
+
+/// The names in `dir`, sorted, and the contents of the manifests among them
+/// that detection reads, as a [`Folder`] whose path is left to the caller.
+fn read_folder(dir: &Path) -> io::Result<Folder> {
     let mut names = Vec::new();
-    for entry in std::fs::read_dir(root)? {
+    for entry in std::fs::read_dir(dir)? {
         let entry = entry?;
         if let Some(name) = entry.file_name().to_str() {
             names.push(name.to_owned());
@@ -497,7 +570,7 @@ pub fn read_root_files(root: &Path) -> io::Result<RootFiles> {
         if !names.iter().any(|n| n == name) {
             continue;
         }
-        let path = root.join(name);
+        let path = dir.join(name);
         let Ok(meta) = std::fs::metadata(&path) else {
             continue;
         };
@@ -508,10 +581,10 @@ pub fn read_root_files(root: &Path) -> io::Result<RootFiles> {
             files.push((name.to_owned(), text));
         }
     }
-    Ok(RootFiles {
+    Ok(Folder {
         names,
         files,
-        home_managers: vec![],
+        ..Folder::default()
     })
 }
 
@@ -2063,6 +2136,132 @@ mod tests {
         let d = owlshift_core::stack::detect(&root);
         assert_eq!(d.skipped.len(), 3, "{:?}", d.skipped);
         assert_eq!(d.found.len(), 1);
+    }
+
+    /// OWL-630: the folders below the root are read as the root is: each of
+    /// the root's, and each of `apps/` and `services/`, but no hidden,
+    /// dependency or linked folder, and nothing deeper.
+    #[test]
+    fn the_folders_below_the_root_are_read_as_the_root_is() {
+        let dir = tempfile::tempdir().unwrap();
+        let write = |path: &str, text: &str| {
+            let path = dir.path().join(path);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, text).unwrap();
+        };
+        write("backend/pyproject.toml", "[tool.pytest.ini_options]\n");
+        write("backend/uv.lock", "");
+        write("node_modules/x/package.json", "{}");
+        write(".hidden/package.json", "{}");
+        write("apps/README.md", "");
+        write("apps/web/package.json", "{}");
+        write("apps/web/deep/package.json", "{}");
+        write("notes.txt", "");
+        std::fs::create_dir(dir.path().join("services")).unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(dir.path().join("backend"), dir.path().join("link")).unwrap();
+        let root = read_root_files(dir.path()).unwrap();
+        let paths: Vec<&str> = root.folders.iter().map(|f| f.path.as_str()).collect();
+        assert_eq!(paths, ["apps", "apps/web", "backend", "services"]);
+        let web = &root.folders[1];
+        assert_eq!(web.names, ["deep", "package.json"]);
+        assert_eq!(web.files, [("package.json".to_owned(), "{}".to_owned())]);
+        assert!(root.folders.iter().all(|f| !f.unlisted));
+        let d = owlshift_core::stack::detect(&root);
+        assert!(
+            d.gate().any(|l| l.command == "cd backend && uv run pytest"),
+            "{d:?}"
+        );
+    }
+
+    /// OWL-630: two folders of one manager are written with their lines run
+    /// in them and each run cache once, and the file loads.
+    #[test]
+    fn a_repository_of_folders_is_written_once_per_variable_and_loads() {
+        let folder = |path: &str| Folder {
+            path: path.to_owned(),
+            names: vec!["package.json".to_owned(), "pnpm-lock.yaml".to_owned()],
+            files: vec![(
+                "package.json".to_owned(),
+                r#"{"scripts":{"test":"jest"}}"#.to_owned(),
+            )],
+            unlisted: false,
+        };
+        let d = owlshift_core::stack::detect(&RootFiles {
+            folders: vec![folder("admin"), folder("web")],
+            ..RootFiles::default()
+        });
+        let text = project_file(&with(d, &[])).unwrap();
+        let config = ProjectConfig::parse(&text).unwrap();
+        assert_eq!(
+            config.stack.gate,
+            ["cd admin && pnpm run test", "cd web && pnpm run test"]
+        );
+        assert_eq!(
+            config.stack.setup,
+            [
+                "cd admin && pnpm install --frozen-lockfile",
+                "cd web && pnpm install --frozen-lockfile"
+            ]
+        );
+        assert_eq!(
+            config.stack.run_cache_entries(),
+            [
+                ("COREPACK_HOME", "corepack"),
+                ("PNPM_HOME", "pnpm"),
+                ("XDG_RUNTIME_DIR", "pnpm-locks")
+            ]
+        );
+        assert!(
+            text.contains(
+                "# read from pnpm-lock.yaml, the lock file of pnpm, in admin/; pnpm-lock.yaml, \
+                 the lock file of pnpm, in web/\nrun_caches.PNPM_HOME = \"pnpm\"\n"
+            ),
+            "{text}"
+        );
+        assert!(
+            text.contains("# note: in `admin/`: this gate is a guess"),
+            "{text}"
+        );
+    }
+
+    /// OWL-630: past the run caches a run may write, the rest are written
+    /// commented out under a note naming them, so the file still loads.
+    #[test]
+    fn run_caches_past_the_limit_are_left_commented_out() {
+        let found = owlshift_core::stack::Found {
+            source: "x".to_owned(),
+            gate: vec![],
+            setup: vec![],
+            run_caches: (0..=MAX_RUN_CACHES)
+                .map(|i| owlshift_core::stack::RunCache {
+                    variable: format!("CACHE_{i}"),
+                    folder: format!("c{i}"),
+                    read_from: "x".to_owned(),
+                })
+                .collect(),
+            notes: vec![],
+            gate_notes: vec![],
+        };
+        let d = Detection {
+            found: vec![found],
+            skipped: vec![],
+        };
+        let text = project_file(&with(d, &[])).unwrap();
+        let config = ProjectConfig::parse(&text).unwrap();
+        assert_eq!(config.stack.run_cache_entries().len(), MAX_RUN_CACHES);
+        let last = format!("CACHE_{MAX_RUN_CACHES}");
+        assert!(
+            text.contains(&format!(
+                "# note: a run writes at most {MAX_RUN_CACHES} run caches, so {last} is \
+                 commented out below"
+            )),
+            "{text}"
+        );
+        assert!(
+            text.contains(&format!("\n# run_caches.{last} = ")),
+            "{text}"
+        );
     }
 
     #[test]
