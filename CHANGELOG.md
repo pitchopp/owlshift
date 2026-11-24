@@ -2,6 +2,45 @@
 
 What changes in each release of Owlshift, newest first. Versions follow [Semantic Versioning](https://semver.org/). A release's notes on GitHub are its section below, and the release workflow refuses a tag whose version has none.
 
+## 0.3.0
+
+A ticket stuck behind another that has stopped no longer waits for it, a broken base is repaired before anything else, a plan can hold a person's steps, and `init` sets up many more stacks. Designed from a measure of 178 delivered tickets, where waiting on a collision was half of a ticket's time in flight (#593).
+
+### Upgrading
+
+Three defaults change what a runner does after the upgrade:
+
+- A broken base files an urgent repair ticket, assigned and admitted by the runner itself, which runs first (`[policy] base_repair`, true when absent). Set it to `false` to keep only the hold (OWL-622).
+- A Build run gets its web tools, as the review roles have: its brief says `network: true` unless the personal `web_tools = false` (OWL-618).
+- A daemon started by `owlshift start` moves onto a newer binary at its own path by itself, once its running tickets are drained: no `stop` and `start` after `brew upgrade` or `self-update` (OWL-616).
+
+### Tickets that wait less
+
+- Under `[policy] overlap = "rebase"`, a parked ticket, or one whose round has waited six hours, yields what it holds: another ticket may take its files, and it is admitted again and rebased onto what was merged before its next run. Under `exclusive` nothing is yielded (OWL-621). A parked ticket that keeps what it holds says who waits for it, in its PARKED comment, `why`, the digest and the UI (OWL-623).
+- With remote claims, a colleague's later overlap is recorded from its claim, so the ticket admitted first is refreshed when the colleague's change merges, and an overlap still counts once the colleague's claim is gone (OWL-636, OWL-613).
+- A Build or Watch run that ends blocked is read once by the resolver, whose verdict is retry, rebase, a person's step or park, before a person is asked (OWL-620). A Watch repair run that stops blocked on a stale base is rebased (OWL-634).
+
+### A broken base
+
+- The repair ticket is filed on Linear, GitHub Issues or Markdown; a second one is filed if a merged repair leaves the base still broken, two a break at most, then a person is told (OWL-622, OWL-639, OWL-643).
+- Several runners file one repair per break: a repair claim on `origin` decides who files, and the search for an existing repair also reads GitHub Issues' open issues (OWL-642, OWL-640).
+
+### A person's steps
+
+- A plan step may be a person's, before or after the merge. The Build passes it, the pull request lists it under "For a person", the before-merge steps are asked of the decider at Watch and merge on green waits for their answer, and the after-merge steps are filed as one follow-up assigned to the decider (OWL-619, OWL-625).
+- A ticket that is a person's whole is handed back at intake or plan: HANDBACK on the ticket, shown as handed back in `status`, `why` and the UI, taken again only by a gesture made after it or `owlshift do` (OWL-619, OWL-626).
+
+### `init` and the sandbox
+
+- `stack.run_caches` gives a project's confined runs caches they may write, one tree per project under the machine's cache directory, shown by `doctor` (OWL-617).
+- `init` detects Go, poetry, pip, bundler, Gradle, pdm, Maven, Composer, .NET, Elixir and Deno, with their gates and run caches, and gives every pnpm and yarn 2 or later setup the caches it needs; Dart, Flutter and Swift get a note with their lines (OWL-624, OWL-627, OWL-628, OWL-629, OWL-638, OWL-647). It also reads the projects one folder down, and those under `apps/` and `services/` (OWL-630).
+- `init` notes a tool chain a version manager installs in the home (pyenv, rbenv, asdf, pipx) and which folder to declare (OWL-631). Concurrent .NET restores share one NuGet lock (OWL-644).
+- Confined runs on macOS can run `mktemp` without a template, and Java finds a temporary folder (OWL-637).
+
+### Fixes
+
+- File locks are released explicitly, so a child process another thread forks no longer keeps one held (OWL-646, OWL-645).
+
 ## 0.2.0
 
 Several developers can share one project, each with their own runner (roadmap step P10). Built and played on the bench; its exit gate, two runners on one project for 72 hours, runs on this release.
