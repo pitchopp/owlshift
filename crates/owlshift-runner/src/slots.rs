@@ -18,7 +18,7 @@
 //! record under a free lock is a dead holder's: it is never read, and the
 //! next probe that finds the slot free removes it while it holds the slot.
 
-use std::fs::{self, File, OpenOptions, TryLockError};
+use std::fs::{self, OpenOptions};
 use std::io;
 use std::path::{Path, PathBuf};
 use std::thread;
@@ -29,7 +29,7 @@ use owlshift_contracts::config::MAX_CONCURRENT_RUNS;
 use owlshift_contracts::ids::TicketId;
 use serde_json::{Value, json};
 
-use crate::project::try_lock_file;
+use crate::project::{FileLock, try_lock_file};
 use crate::step::write_atomically;
 
 /// How many times a child tries every slot before it ends with no slot:
@@ -104,7 +104,7 @@ pub struct HeldSlot {
 pub struct Slot {
     /// Its holder record, removed before the lock is let go.
     record: PathBuf,
-    _file: File,
+    _file: FileLock,
 }
 
 impl Drop for Slot {
@@ -152,11 +152,11 @@ impl MachineSlots {
                 Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
                 Err(error) => return Err(error),
             };
-            match file.try_lock() {
-                // Held by this try, so no taker is writing the record.
-                Ok(()) => remove_stale(&self.record(n)),
-                Err(TryLockError::WouldBlock) => held.push(n),
-                Err(TryLockError::Error(error)) => return Err(error),
+            match FileLock::try_exclusive(file)? {
+                // Held by this try, so no taker is writing the record; let
+                // go explicitly when `_free` is dropped (OWL-646).
+                Some(_free) => remove_stale(&self.record(n)),
+                None => held.push(n),
             }
         }
         Ok(held)

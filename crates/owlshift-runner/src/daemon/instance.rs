@@ -72,6 +72,11 @@ pub fn take(data: &Path, record: &DaemonRecord) -> io::Result<Result<Instance, H
 
 /// Takes the lock of `data` for this process, removing the record a daemon
 /// killed outright left: [`Held`] when another daemon holds the lock.
+///
+/// The one lock of the crate released by the close alone, not explicitly
+/// (`project::FileLock::into_file`, OWL-646): the daemon hands it to the
+/// daemon of a newer binary on a copy of its descriptor (OWL-616), and an
+/// explicit unlock would take it from that daemon too.
 pub fn lock(data: &Path) -> io::Result<Result<Locked, Held>> {
     fs::create_dir_all(service_dir(data))?;
     let Some(lock) = project::lock_file_within(&lock_file(data), TAKE_WAIT, TAKE_POLL)? else {
@@ -81,7 +86,9 @@ pub fn lock(data: &Path) -> io::Result<Result<Locked, Held>> {
         Err(error) if error.kind() != io::ErrorKind::NotFound => return Err(error),
         _ => {}
     }
-    Ok(Ok(Locked { lock }))
+    Ok(Ok(Locked {
+        lock: lock.into_file(),
+    }))
 }
 
 /// Makes this process the daemon of `data` on the lock a daemon handed it
@@ -92,7 +99,6 @@ pub fn lock(data: &Path) -> io::Result<Result<Locked, Held>> {
 /// already holds the lock.
 #[cfg(unix)]
 pub fn adopt(data: &Path, fd: i32) -> io::Result<Locked> {
-    use std::fs::TryLockError;
     use std::os::unix::fs::MetadataExt;
 
     let lock = owlshift_platform::process::adopt_file(fd)?;
@@ -104,19 +110,17 @@ pub fn adopt(data: &Path, fd: i32) -> io::Result<Locked> {
             format!("descriptor {fd} is not {}", path.display()),
         ));
     }
-    match lock.try_lock() {
-        Ok(()) => {}
-        Err(TryLockError::WouldBlock) => {
-            return Err(io::Error::new(
-                io::ErrorKind::WouldBlock,
-                format!(
-                    "descriptor {fd} does not hold {}: another daemon holds it",
-                    path.display()
-                ),
-            ));
-        }
-        Err(TryLockError::Error(error)) => return Err(error),
-    }
+    // Released by the close alone, as [`lock`]'s.
+    let Some(lock) = project::FileLock::try_exclusive(lock)? else {
+        return Err(io::Error::new(
+            io::ErrorKind::WouldBlock,
+            format!(
+                "descriptor {fd} does not hold {}: another daemon holds it",
+                path.display()
+            ),
+        ));
+    };
+    let lock = lock.into_file();
     match fs::remove_file(record_file(data)) {
         Err(error) if error.kind() != io::ErrorKind::NotFound => return Err(error),
         _ => {}

@@ -1442,8 +1442,6 @@ fn a_kept_worktree_with_a_redirected_link_refuses_the_run() {
 #[cfg(unix)]
 #[test]
 fn the_runners_git_runs_no_hook_and_no_monitor() {
-    use std::os::unix::fs::PermissionsExt;
-
     let bench = Bench::new();
     let fired = bench.tmp.path().join("fired");
     fs::create_dir_all(&fired).unwrap();
@@ -1451,12 +1449,10 @@ fn the_runners_git_runs_no_hook_and_no_monitor() {
     fs::create_dir_all(&hooks).unwrap();
     let script = |path: &Path, name: &str| {
         let sentinel = fired.join(name);
-        fs::write(
+        owlshift_testkit::stand_in::write_executable(
             path,
             format!("#!/bin/sh\necho ran > '{}'\n", sentinel.display()),
-        )
-        .unwrap();
-        fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
+        );
         sentinel
     };
     let checkout_hook = script(&hooks.join("post-checkout"), "post-checkout");

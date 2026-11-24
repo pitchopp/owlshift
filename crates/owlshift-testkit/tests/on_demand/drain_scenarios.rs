@@ -2101,12 +2101,10 @@ fn a_cut_off_run_is_notified_once_and_the_ready_ticket_told_once() {
     let (outcomes, lines, printed) = bench.drain(replies, 3, |pass| {
         if pass == 1 {
             let monitor = bench.tmp.path().join("fsmonitor.sh");
-            fs::write(&monitor, format!("#!/bin/sh\n: > '{}'\n", fired.display())).unwrap();
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                fs::set_permissions(&monitor, fs::Permissions::from_mode(0o755)).unwrap();
-            }
+            owlshift_testkit::stand_in::write_executable(
+                &monitor,
+                format!("#!/bin/sh\n: > '{}'\n", fired.display()),
+            );
             let monitor = monitor.to_string_lossy().into_owned();
             bench
                 .env

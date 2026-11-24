@@ -1517,7 +1517,7 @@ mod tests {
 
         let dir = tempfile::tempdir().unwrap();
         let shell = dir.path().join("sh");
-        std::fs::copy("/bin/sh", &shell).unwrap();
+        crate::stand_in::copy_executable(Path::new("/bin/sh"), &shell);
         let output = Command::new(&shell)
             .arg("-c")
             .arg(r#"rm -- "$0" && cp /bin/true "$0" && exec /proc/self/exe -c 'echo pinned'"#)
@@ -1545,12 +1545,9 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn a_pinned_copy_keeps_the_build_it_was_made_from() {
-        use std::os::unix::fs::PermissionsExt;
-
         let root = tempfile::tempdir().unwrap();
         let script = |path: &Path, says: &str| {
-            fs::write(path, format!("#!/bin/sh\necho {says}\n")).unwrap();
-            fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
+            crate::stand_in::write_executable(path, format!("#!/bin/sh\necho {says}\n"));
         };
         let said = |program: &Path| {
             let output = Command::new(program).output().unwrap();
@@ -1572,6 +1569,9 @@ mod tests {
             .map(|e| e.unwrap().path())
             .collect();
         assert_eq!(left, [dir.join("42")]);
+        // The pin's copy, written in this process: its first start may be
+        // refused a moment (OWL-646, `stand_in::start_once`).
+        crate::stand_in::start_once(&mut Command::new(&pinned.program.spawn));
         assert_eq!(said(&pinned.program.spawn), "old\n");
 
         let staged = installed.join(".prog.new");
@@ -1594,12 +1594,9 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn a_pin_among_others_keeps_the_copies_of_running_processes() {
-        use std::os::unix::fs::PermissionsExt;
-
         let root = tempfile::tempdir().unwrap();
         let binary = root.path().join("prog");
-        fs::write(&binary, "#!/bin/sh\necho old\n").unwrap();
-        fs::set_permissions(&binary, fs::Permissions::from_mode(0o755)).unwrap();
+        crate::stand_in::write_executable(&binary, "#!/bin/sh\necho old\n");
         let mut ended = Command::new("true").spawn().unwrap();
         let ended_pid = ended.id();
         ended.wait().unwrap();
@@ -1633,9 +1630,10 @@ mod tests {
         );
 
         let staged = root.path().join(".prog.new");
-        fs::write(&staged, "#!/bin/sh\necho new\n").unwrap();
-        fs::set_permissions(&staged, fs::Permissions::from_mode(0o755)).unwrap();
+        crate::stand_in::write_executable(&staged, "#!/bin/sh\necho new\n");
         fs::rename(&staged, &binary).unwrap();
+        // The pin's copy, written in this process (OWL-646).
+        crate::stand_in::start_once(&mut Command::new(&pinned.program.spawn));
         let output = Command::new(&pinned.program.spawn).output().unwrap();
         assert_eq!(String::from_utf8_lossy(&output.stdout), "old\n");
 

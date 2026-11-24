@@ -7,6 +7,13 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
+/// The testkit's, which this crate cannot depend on: the testkit depends on
+/// it.
+#[cfg(unix)]
+#[allow(dead_code, reason = "these tests use part of it")]
+#[path = "../../owlshift-testkit/src/stand_in.rs"]
+mod stand_in;
+
 fn root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../..")
 }
@@ -371,8 +378,6 @@ fn the_notices_cover_every_target_the_release_builds() {
 #[cfg(unix)]
 #[test]
 fn the_notices_hold_the_crates_and_the_fonts_or_nothing() {
-    use std::os::unix::fs::PermissionsExt;
-
     let script = root().join("scripts/release/notices.sh");
     let dir = tempfile::tempdir().unwrap();
     let bin = dir.path().join("bin");
@@ -380,7 +385,7 @@ fn the_notices_hold_the_crates_and_the_fonts_or_nothing() {
     // Records its arguments, then writes the file `-o` names, or fails when
     // FAKE_FAIL is set.
     let cargo = bin.join("cargo");
-    fs::write(
+    stand_in::write_executable(
         &cargo,
         "#!/bin/sh\n\
          printf '%s\\n' \"$@\" > \"$FAKE_ARGS\"\n\
@@ -389,13 +394,11 @@ fn the_notices_hold_the_crates_and_the_fonts_or_nothing() {
          \x20   if [ \"$1\" = -o ]; then echo 'crate notices' > \"$2\"; fi\n\
          \x20   shift\n\
          done\n",
-    )
-    .unwrap();
-    fs::set_permissions(&cargo, fs::Permissions::from_mode(0o755)).unwrap();
+    );
     // OWL-551: answers `--print sysroot` with FAKE_SYSROOT, `--version`, and
     // fails when FAKE_RUSTC_FAIL is set.
     let rustc = bin.join("rustc");
-    fs::write(
+    stand_in::write_executable(
         &rustc,
         "#!/bin/sh\n\
          [ -z \"${FAKE_RUSTC_FAIL:-}\" ] || exit 1\n\
@@ -403,9 +406,7 @@ fn the_notices_hold_the_crates_and_the_fonts_or_nothing() {
          --version) echo 'rustc 9.9.9 (stand-in)' ;;\n\
          --print) echo \"$FAKE_SYSROOT\" ;;\n\
          esac\n",
-    )
-    .unwrap();
-    fs::set_permissions(&rustc, fs::Permissions::from_mode(0o755)).unwrap();
+    );
     let sysroot = dir.path().join("sysroot");
     let doc = sysroot.join("share/doc/rust");
     fs::create_dir_all(&doc).unwrap();
@@ -619,11 +620,7 @@ fn the_formula_workflow_keeps_its_guards() {
 /// Writes an executable stand-in for a command into `bin`.
 #[cfg(unix)]
 fn stand_in(bin: &Path, name: &str, body: &str) {
-    use std::os::unix::fs::PermissionsExt;
-
-    let file = bin.join(name);
-    fs::write(&file, format!("#!/bin/sh\n{body}")).unwrap();
-    fs::set_permissions(&file, fs::Permissions::from_mode(0o755)).unwrap();
+    stand_in::write_executable(&bin.join(name), format!("#!/bin/sh\n{body}"));
 }
 
 /// `formula-verify.sh` on a copy of a release served from files, with a

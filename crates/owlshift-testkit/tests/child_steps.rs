@@ -426,7 +426,6 @@ impl<'a> SlotBound<'a> {
 #[cfg(unix)]
 #[test]
 fn two_watches_of_two_projects_share_the_machine_s_slots() {
-    use std::os::unix::fs::PermissionsExt;
     use std::thread;
 
     let tmp = tempfile::tempdir().unwrap();
@@ -435,7 +434,7 @@ fn two_watches_of_two_projects_share_the_machine_s_slots() {
     let counts = tmp.path().join("counts");
     fs::create_dir_all(&running).unwrap();
     let script = tmp.path().join("harness.sh");
-    fs::write(
+    owlshift_testkit::stand_in::write_executable(
         &script,
         format!(
             "#!/bin/sh\nmkdir '{running}/'$$\nls '{running}' | wc -l >> '{counts}'\nsleep 1\n\
@@ -444,9 +443,7 @@ fn two_watches_of_two_projects_share_the_machine_s_slots() {
             counts = counts.display(),
             fake = fake().display(),
         ),
-    )
-    .unwrap();
-    fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+    );
     let projects: Vec<Setup> = (0..2)
         .map(|_| {
             let s = setup(Some(script.clone()));
@@ -1188,10 +1185,8 @@ fn sigquit_and_sigkill_of_watch_stop_now_leaving_the_obligation() {
 /// `dir/reply-<role>-<ticket>.toml`, or `<role>`'s.
 #[cfg(unix)]
 fn base_wait_harness(dir: &Path) -> PathBuf {
-    use std::os::unix::fs::PermissionsExt;
-
     let script = dir.join("harness-base-wait.sh");
-    fs::write(
+    owlshift_testkit::stand_in::write_executable(
         &script,
         format!(
             "#!/bin/sh\ndir='{dir}'\nbrief=\"\"\nreply=\"\"\n\
@@ -1209,9 +1204,7 @@ fn base_wait_harness(dir: &Path) -> PathBuf {
             dir = dir.display(),
             fake = fake().display(),
         ),
-    )
-    .unwrap();
-    fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+    );
     script
 }
 

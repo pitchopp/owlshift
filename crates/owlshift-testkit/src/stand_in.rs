@@ -13,8 +13,20 @@
 //! was timed in that queue, not on its answer. See "First starts in tests"
 //! under "The test bench" in `docs/design/build-plan.md`.
 //!
-//! The standard library only: the CLI's and the runner's tests include this
-//! file with `#[path]`, as they do `bin_copy.rs`.
+//! Every executable a test writes or copies goes through [`write_executable`]
+//! or [`copy_executable`] (OWL-646), which write it through a child process:
+//! under `cargo test` the tests of a binary share its process, a child that
+//! another test forks holds a copy of every descriptor open at that moment
+//! until it starts its own program, and Linux refuses to run a file that a
+//! descriptor still holds open for writing (`ETXTBSY`). Written by a child,
+//! the file never has such a descriptor in the test process. Close-on-exec,
+//! which the standard library sets on every descriptor, does not help: the
+//! copy lives from the fork to the exec. A guard in this crate's tests
+//! refuses an executable mode written anywhere else.
+//!
+//! The standard library only: the CLI's and the runner's tests, and the
+//! platform's and the runner's unit tests, include this file with `#[path]`,
+//! as the CLI's do `bin_copy.rs`.
 
 use std::io;
 use std::path::Path;
@@ -46,12 +58,82 @@ const BUSY: Duration = Duration::from_secs(10);
 /// `FIRST_START`.
 #[cfg(unix)]
 pub fn write(path: &Path, script: &str, start_with: &[&str]) {
-    use std::os::unix::fs::PermissionsExt;
-
-    std::fs::write(path, script).unwrap();
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    write_executable(path, script);
     let folder = path.parent().expect("a stand-in in a folder");
     start_once(Command::new(path).args(start_with).current_dir(folder));
+}
+
+/// Writes `contents` to `path`, replacing what is there, as an executable:
+/// mode 0o755 on Unix, where a child, `cat`, writes the bytes, so that no
+/// descriptor of this process ever holds the file open for writing (see the
+/// module's comment). Elsewhere a plain write.
+///
+/// # Panics
+///
+/// When the file cannot be written: the child's failure is reported with
+/// the path, and the mode is not set.
+pub fn write_executable(path: &Path, contents: impl AsRef<[u8]>) {
+    #[cfg(unix)]
+    {
+        use std::io::Write as _;
+
+        let mut child = Command::new("/bin/sh")
+            .args(["-c", "exec cat > \"$0\""])
+            .arg(path)
+            .stdin(Stdio::piped())
+            .spawn()
+            .unwrap_or_else(|error| panic!("writing {}: {error}", path.display()));
+        let written = child
+            .stdin
+            .take()
+            .expect("a piped input")
+            .write_all(contents.as_ref());
+        let ended = child.wait();
+        match (written, ended) {
+            (Ok(()), Ok(status)) if status.success() => {}
+            (written, ended) => panic!("writing {}: {written:?}, {ended:?}", path.display()),
+        }
+        make_executable(path);
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::write(path, contents)
+            .unwrap_or_else(|error| panic!("writing {}: {error}", path.display()));
+    }
+}
+
+/// Copies the file `from` to `to`, replacing what is there, as an
+/// executable: on Unix through a child, `cp`, then mode 0o755, as
+/// [`write_executable`] writes one. Elsewhere a plain copy.
+///
+/// # Panics
+///
+/// When the copy fails: the child's failure is reported with both paths,
+/// and the mode is not set.
+pub fn copy_executable(from: &Path, to: &Path) {
+    #[cfg(unix)]
+    {
+        let copied = Command::new("/bin/cp").arg("--").args([from, to]).status();
+        if !copied.as_ref().is_ok_and(|status| status.success()) {
+            panic!("copying {} to {}: {copied:?}", from.display(), to.display());
+        }
+        make_executable(to);
+    }
+    #[cfg(not(unix))]
+    {
+        if let Err(error) = std::fs::copy(from, to) {
+            panic!("copying {} to {}: {error}", from.display(), to.display());
+        }
+    }
+}
+
+/// Gives the file at `path` mode 0o755, by its path: no descriptor opens it.
+#[cfg(unix)]
+fn make_executable(path: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755))
+        .unwrap_or_else(|error| panic!("making {} executable: {error}", path.display()));
 }
 
 /// Starts `command` with no input and its output dropped, and waits for its
@@ -64,7 +146,10 @@ pub fn write(path: &Path, script: &str, start_with: &[&str]) {
 /// and a process another test forks while this file is open for writing
 /// holds that descriptor until it starts its own program: Linux refuses to
 /// run a file open for writing (`ETXTBSY`). Once a start went through, no
-/// such descriptor is left, so the starts after it are not refused.
+/// such descriptor is left, so the starts after it are not refused. What
+/// [`write_executable`] and [`copy_executable`] write is never refused so
+/// (OWL-646); an executable production code writes in the test's process,
+/// such as the platform's pinned copy of a binary, can be.
 ///
 /// # Panics
 ///

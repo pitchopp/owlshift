@@ -9,6 +9,7 @@ use std::sync::OnceLock;
 
 #[path = "../../owlshift-testkit/src/bin_copy.rs"]
 mod bin_copy;
+#[allow(dead_code, reason = "these tests use part of it")]
 #[path = "../../owlshift-testkit/src/stand_in.rs"]
 mod stand_in;
 

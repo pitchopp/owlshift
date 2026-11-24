@@ -1237,7 +1237,6 @@ const CRITIC_MESSAGE: &str =
 /// beside it, and ends its stream with `CRITIC_MESSAGE`.
 #[cfg(unix)]
 fn fake_codex(bench: &Bench, script: &str) -> owlshift_runner::executor::CodexHarness {
-    use std::os::unix::fs::PermissionsExt;
     let message = CRITIC_MESSAGE.replace('"', "\\\"");
     let body = format!(
         r#"#!/bin/sh
@@ -1256,8 +1255,7 @@ echo '{{"type":"turn.completed","usage":{{"input_tokens":10,"cached_input_tokens
     let bin = bench.tmp.path().join("bin");
     fs::create_dir_all(&bin).unwrap();
     let program = bin.join("codex");
-    fs::write(&program, body).unwrap();
-    fs::set_permissions(&program, fs::Permissions::from_mode(0o755)).unwrap();
+    owlshift_testkit::stand_in::write_executable(&program, body);
     let agent = bench.agent();
     let login = owlshift_runner::executor::codex::user_login(&agent).unwrap();
     fs::create_dir_all(login.parent().unwrap()).unwrap();

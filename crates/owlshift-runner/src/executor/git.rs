@@ -579,7 +579,6 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn git_started_for_the_agent_runs_no_shell_start_up_file() {
-        use std::os::unix::fs::PermissionsExt;
         use std::process::Stdio;
 
         let tmp = tempfile::tempdir().unwrap();
@@ -591,8 +590,7 @@ mod tests {
         // pyenv shim, Nix's `makeWrapper`).
         let wrapper = |name: &str, shebang: &str| {
             let path = dir.join(name);
-            fs::write(&path, format!("#!{shebang}\nexec git \"$@\"\n")).unwrap();
-            fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+            crate::stand_in::write_executable(&path, format!("#!{shebang}\nexec git \"$@\"\n"));
             path
         };
         let sh_wrapper = wrapper("git-sh", "/bin/sh");

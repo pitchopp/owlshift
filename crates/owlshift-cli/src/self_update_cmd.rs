@@ -447,6 +447,7 @@ impl Staged {
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
+            // Not an executable a test writes (OWL-646): the release's.
             file.set_permissions(fs::Permissions::from_mode(0o755))
                 .map_err(cannot)?;
         }

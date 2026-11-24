@@ -5,7 +5,6 @@
 //! Its twin, the same command without `--from-ui`, is the typed restart.
 
 use std::collections::BTreeMap;
-use std::os::unix::fs::PermissionsExt as _;
 
 use super::to_watch_scenarios::strip_times;
 use super::*;
@@ -76,8 +75,7 @@ fn restart_on(root: &Path, from_ui: bool) -> Restarted {
     let bin = root.join("bin");
     fs::create_dir_all(&bin).unwrap();
     let claude = bin.join("claude");
-    fs::write(&claude, "#!/bin/sh\nexit 1\n").unwrap();
-    fs::set_permissions(&claude, fs::Permissions::from_mode(0o755)).unwrap();
+    owlshift_testkit::stand_in::write_executable(&claude, "#!/bin/sh\nexit 1\n");
     let config = root.join("config");
     fs::create_dir_all(&config).unwrap();
 

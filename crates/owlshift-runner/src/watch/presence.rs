@@ -14,7 +14,7 @@
 //! a dead watch's: never read ([`running`]), and removed by the next watch
 //! of the project.
 
-use std::fs::{self, File, OpenOptions, TryLockError};
+use std::fs::{self, OpenOptions};
 use std::io;
 use std::path::{Path, PathBuf};
 use std::thread;
@@ -22,7 +22,7 @@ use std::time::Duration;
 
 use owlshift_contracts::service::WatchRecord;
 
-use crate::project::{ProjectDirs, held_alone, try_lock_file};
+use crate::project::{FileLock, ProjectDirs, held_alone, try_lock_file};
 use crate::slots::write_record;
 
 /// How many times watch tries to take its shared lock: a probe holds the
@@ -35,7 +35,7 @@ const HOLD_PAUSE: Duration = Duration::from_millis(50);
 /// A watch's hold on its project, kept for as long as the watch runs.
 #[derive(Debug)]
 pub struct Presence {
-    _file: File,
+    _file: FileLock,
 }
 
 /// The lock file of `dirs`'s project.
@@ -51,20 +51,17 @@ pub fn hold(dirs: &ProjectDirs) -> io::Result<Option<Presence>> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
-    let file = OpenOptions::new()
-        .create(true)
-        .write(true)
-        .truncate(false)
-        .open(&path)?;
     for attempt in 0..HOLD_TRIES {
-        match file.try_lock_shared() {
-            Ok(()) => return Ok(Some(Presence { _file: file })),
-            Err(TryLockError::WouldBlock) => {
-                if attempt + 1 < HOLD_TRIES {
-                    thread::sleep(HOLD_PAUSE);
-                }
-            }
-            Err(TryLockError::Error(error)) => return Err(error),
+        let file = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(false)
+            .open(&path)?;
+        if let Some(held) = FileLock::try_shared(file)? {
+            return Ok(Some(Presence { _file: held }));
+        }
+        if attempt + 1 < HOLD_TRIES {
+            thread::sleep(HOLD_PAUSE);
         }
     }
     Ok(None)
@@ -83,17 +80,15 @@ pub fn watching(dirs: &ProjectDirs) -> io::Result<bool> {
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
         Err(error) => return Err(error),
     };
-    match file.try_lock() {
-        Ok(()) => Ok(false),
-        Err(TryLockError::WouldBlock) => Ok(true),
-        Err(TryLockError::Error(error)) => Err(error),
-    }
+    // The try's own lock is let go explicitly (OWL-646), so the look never
+    // keeps a watch out.
+    Ok(FileLock::try_exclusive(file)?.is_none())
 }
 
 /// A watch's holder record (OWL-462), kept for as long as the watch runs.
 #[derive(Debug)]
 pub struct Recorded {
-    _lock: File,
+    _lock: FileLock,
     lock: PathBuf,
     record: PathBuf,
 }

@@ -395,7 +395,6 @@ pub(crate) mod tests {
     /// manifest's service line, keeps the keychain entries, and exits 0.
     #[test]
     fn the_launcher_starts_the_daemon_and_removes_the_service_once_its_binary_is_gone() {
-        use std::os::unix::fs::PermissionsExt;
         use std::process::Command;
 
         let root = tempfile::tempdir().unwrap();
@@ -408,10 +407,7 @@ pub(crate) mod tests {
         fs::create_dir_all(binary.parent().unwrap()).unwrap();
         let stub = "#!/bin/sh\nprintf '%s\\n' \"$@\" \"$OWLSHIFT_DATA_DIR\" \"$OWLSHIFT_CONFIG_DIR\" \
                     \"$PATH\" \"$(pwd)\" >ran\necho $$ >pid\necho said\n";
-        let put_binary = || {
-            fs::write(&binary, stub).unwrap();
-            fs::set_permissions(&binary, fs::Permissions::from_mode(0o755)).unwrap();
-        };
+        let put_binary = || crate::stand_in::write_executable(&binary, stub);
         put_binary();
         let entry = KeychainEntry {
             service: "owlshift".to_owned(),
