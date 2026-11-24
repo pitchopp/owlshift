@@ -1430,30 +1430,49 @@ fn dart(root: &RootFiles) -> Result<Option<Found>, String> {
     Ok(Some(found))
 }
 
-/// Swift (OWL-628, OWL-638), from `Package.swift`, read by name: a note only.
-/// Checked live, confined, on macOS (OWL-638, Swift 6.4 of the Command Line
-/// Tools): SwiftPM compiles the manifest inside a `sandbox-exec` of its own,
-/// which cannot run inside Owlshift's (`--disable-sandbox` turns it off);
-/// swiftc then needs a writable clang module cache, which
-/// `CLANG_MODULE_CACHE_PATH` moves into a run cache, and with it the setup
-/// and `swift build` pass; `swift test` of a swift-testing target does not,
-/// the `TestingMacros` plugin not being found. Linux is unchecked.
+/// The test line of Swift's note (OWL-647): `swift test` given the folder of
+/// swift-testing's macros, `host/plugins/testing` under the tool chain's
+/// `runtimeResourcePath`, which SwiftPM 6.4 of the Command Line Tools leaves
+/// out of about half the builds from an empty `.build`, confined or not, in
+/// the OWL-647 check. Where the macros sit in the default folder, as on Linux,
+/// the path does not exist and is ignored.
+const SWIFT_TEST: &str = "swift test --disable-sandbox -Xswiftc -plugin-path -Xswiftc \
+     \"$(swift -print-target-info | sed -n 's/.*\"runtimeResourcePath\": \"\\(.*\\)\".*/\\1/p')\
+     /host/plugins/testing\"";
+
+/// Swift (OWL-628, OWL-638, OWL-647), from `Package.swift`, read by name: a
+/// note only, decided under OWL-647. SwiftPM compiles the manifest inside a
+/// `sandbox-exec` of its own, which cannot run inside Owlshift's
+/// (`--disable-sandbox` turns it off); on macOS swiftc then needs a writable
+/// clang module cache, which `CLANG_MODULE_CACHE_PATH` moves into a run cache
+/// (OWL-638). The lines passed confined on Linux (Swift 6.4.3). On macOS
+/// `swift test` cannot: Swift Build links the test bundle through a `swiftc`
+/// it starts without `TMPDIR`, which then finds no temporary folder it may
+/// write, the user's being unanswered and `/tmp` closed; opening the names it
+/// makes in `/tmp`, which every confined run shares, was refused.
 fn swift(root: &RootFiles) -> Result<Option<Found>, String> {
     if !root.has("Package.swift") {
         return Ok(None);
     }
     let mut found = found("Package.swift");
+    found.notes.push(format!(
+        "Swift was not written, its gate not passing confined on macOS: the setup \
+         `swift package --disable-sandbox resolve` and the gate `swift build --disable-sandbox` \
+         and `{SWIFT_TEST}`, with `run_caches.CLANG_MODULE_CACHE_PATH = \"clang-modules\"`, passed \
+         confined on Linux; on macOS the setup needs that run cache for the module cache swiftc \
+         writes, and `--disable-sandbox` turns off SwiftPM's own sandbox, which cannot run inside \
+         Owlshift's"
+    ));
     found.notes.push(
-        "Swift was not written, its gate not having passed confined (macOS; Linux unchecked): \
-         the setup `swift package --disable-sandbox resolve` and the gate `swift build \
-         --disable-sandbox` and `swift test --disable-sandbox` (SwiftPM's own sandbox cannot run \
-         inside Owlshift's) need, on macOS, `run_caches.CLANG_MODULE_CACHE_PATH = \"clang-modules\"` \
-         for the module cache swiftc writes; with it the setup and the build passed"
+        "on macOS `swift test` fails confined: Swift Build links the test bundle through a \
+         `swiftc` it starts without `TMPDIR`, which finds no temporary folder the sandbox lets \
+         it write"
             .to_string(),
     );
     found.notes.push(
-        "on macOS, `swift test` of a swift-testing target failed confined even so, its \
-         `TestingMacros` plugin not being found"
+        "the plugin path lets `swift test` find swift-testing's macros, which SwiftPM 6.4 of the \
+         Command Line Tools left out of about half the builds from an empty `.build` in the \
+         OWL-647 check, confined or not; on Linux the path does not exist and is ignored"
             .to_string(),
     );
     Ok(Some(found))
@@ -2266,7 +2285,8 @@ check::
     }
 
     /// OWL-628: Dart, Flutter and Swift were not shown to pass confined: a
-    /// note each, naming the lines, and nothing written.
+    /// note each, naming the lines, and nothing written. Swift's gate passed
+    /// confined on Linux only (OWL-647), so it stays a note.
     #[test]
     fn dart_and_swift_roots_get_a_note_only() {
         for (name, says) in [
@@ -2280,15 +2300,18 @@ check::
             assert!(d.run_caches().next().is_none());
             assert!(d.found[0].notes[0].contains(says), "{name}");
         }
-        // OWL-638: Swift's note keeps its three commands and its two caveats.
+        // OWL-638, OWL-647: Swift's note keeps its three commands, the test
+        // line with swift-testing's plugin folder, and why macOS fails.
         let d = detect(&root(&["Package.swift"], &[]));
         let notes = d.found[0].notes.join(" ");
         for part in [
             "swift package --disable-sandbox resolve",
             "swift build --disable-sandbox",
-            "swift test --disable-sandbox",
-            "TestingMacros",
-            "Linux unchecked",
+            "swift test --disable-sandbox -Xswiftc -plugin-path -Xswiftc \"$(swift \
+             -print-target-info",
+            "')/host/plugins/testing\"`",
+            "passed confined on Linux",
+            "without `TMPDIR`",
         ] {
             assert!(notes.contains(part), "{part}: {notes}");
         }
