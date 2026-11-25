@@ -234,11 +234,12 @@ pub enum TokenTryError {
     Credential(String),
     /// The GitHub App's token only a new sign-in mends (OWL-650): its entry
     /// does not read, or its access token expired with no refresh token
-    /// alive. The technical words of [`sign_in_again`].
+    /// alive. Its technical words, which name the keychain entry.
     SignIn(String),
     /// The GitHub App's access token is past its stored expiry and its
     /// refresh token alive: the refresh, which doctor does not make, would
-    /// renew it (OWL-650). The technical words of [`sign_in_again`].
+    /// renew it (OWL-650). Its technical words, which name the keychain
+    /// entry.
     Expired(String),
     /// GitHub's answer, or no answer.
     Forge(Error),
