@@ -12858,3 +12858,9 @@ mod init_example_scenarios;
 #[cfg(unix)]
 #[path = "on_demand/cli_restart_scenarios.rs"]
 mod cli_restart_scenarios;
+
+/// A refused GitHub sign-in at a watch's start, said end to end through the
+/// command line's own code on a served bench (OWL-650).
+#[cfg(unix)]
+#[path = "on_demand/cli_sign_in_scenarios.rs"]
+mod cli_sign_in_scenarios;
