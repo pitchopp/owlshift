@@ -2295,9 +2295,11 @@ fn forge_access_check(
                  Contents to Read-only.{shared}"
             ),
         ),
-        Err(TokenTryError::Credential(reason)) => {
-            fail(format!("not checked: {reason}"), KEYCHAIN_FIX.to_owned())
-        }
+        Err(
+            TokenTryError::Credential(reason)
+            | TokenTryError::SignIn(reason)
+            | TokenTryError::Expired(reason),
+        ) => fail(format!("not checked: {reason}"), KEYCHAIN_FIX.to_owned()),
         Err(TokenTryError::Forge(error)) => match error.kind {
             ForgeErrorKind::Unauthorized => fail(
                 format!("GitHub refused {place}: {error}"),
@@ -2410,9 +2412,11 @@ fn merge_permission_check(
             "not checked: GitHub does not say what a personal token may do; its merge needs \
              Contents (read and write), and a merge GitHub refuses is notified",
         ),
-        Err(TokenTryError::Credential(reason)) => {
-            Check::info(Section::Project, SUBJECT, format!("not checked: {reason}"))
-        }
+        Err(
+            TokenTryError::Credential(reason)
+            | TokenTryError::SignIn(reason)
+            | TokenTryError::Expired(reason),
+        ) => Check::info(Section::Project, SUBJECT, format!("not checked: {reason}")),
         Err(TokenTryError::Forge(error)) => Check::warn(
             Section::Project,
             SUBJECT,
@@ -2519,9 +2523,11 @@ fn rerun_permission_check(
             "not checked: GitHub does not say what a personal token may do; a re-run needs \
              Actions (read and write), and a red check gets a fix run when GitHub refuses it",
         ),
-        Err(TokenTryError::Credential(reason)) => {
-            Check::info(Section::Project, SUBJECT, format!("not checked: {reason}"))
-        }
+        Err(
+            TokenTryError::Credential(reason)
+            | TokenTryError::SignIn(reason)
+            | TokenTryError::Expired(reason),
+        ) => Check::info(Section::Project, SUBJECT, format!("not checked: {reason}")),
         Err(TokenTryError::Forge(error)) => Check::warn(
             Section::Project,
             SUBJECT,
