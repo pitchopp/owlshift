@@ -5,7 +5,7 @@
 //! (architecture section 8). Pushing uses the user's own git credentials,
 //! as in their terminal.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use jiff::Timestamp;
@@ -14,6 +14,7 @@ use owlshift_adapters::forge::github_app::{self, DeviceFlow, HttpLogin, UserToke
 use owlshift_adapters::forge::{DefaultBranch, Error, ErrorKind, Repo};
 use owlshift_contracts::config::PersonalConfig;
 use owlshift_platform::keychain::{Keychain, SERVICE, Secret};
+use owlshift_platform::service::sh_quote;
 
 use crate::github_token::AppToken;
 use crate::refusal::Refusal;
@@ -132,11 +133,14 @@ pub fn github(
 /// The refusal of a GitHub App token that could not be had: waiting for the
 /// network when GitHub gave no answer at all (OWL-479), passing when it
 /// answered with an error a retry may clear or its budget is spent, lasting
-/// otherwise.
+/// otherwise; lasting until a new sign-in when GitHub refused the token or
+/// its entry no longer reads (OWL-650), which its command words with
+/// [`sign_in_notice`] through [`Refusal::in_checkout`].
 fn refusal(error: Error) -> Refusal {
     match error.kind {
         ErrorKind::Unreachable => Refusal::unreachable(error.message),
         ErrorKind::Other | ErrorKind::RateLimited => Refusal::passing(error.message),
+        ErrorKind::SignInAgain => Refusal::sign_in_to_github(error.message),
         _ => error.message.into(),
     }
 }
@@ -161,13 +165,35 @@ pub(crate) fn token_at(found: &ForgeSecret<Secret>, now: Timestamp) -> Result<To
     }
 }
 
-/// The words of the refresh-failure rule (architecture section 8) for the
-/// app token under `account`, which `what` happened to.
+/// The technical words of the refresh-failure rule (architecture section 8)
+/// for the app token under `account`, which `what` happened to: they name
+/// the keychain entry, for daemon.log and the terminal, on the line before
+/// the [`sign_in_notice`] a person reads (OWL-650).
 pub(crate) fn sign_in_again(account: &str, what: &str) -> String {
     format!(
         "the GitHub App's token under service `{SERVICE}`, account `{account}`, {what}: run \
          `owlshift init` in a terminal to sign in again"
     )
+}
+
+/// What a person reads when only a new sign-in to GitHub lets the project
+/// of `repo` move again (OWL-650): what happened, what it stops, the command
+/// and the folder to run it in, `checkout` shell-quoted, and what it keeps.
+/// `owlshift init` keeps an existing project file and the secrets already
+/// stored, and signs in again when the stored app token no longer works.
+/// When `resumes`, the daemon tries the project again by itself, and the
+/// notice says so; a command typed in a terminal does not.
+pub fn sign_in_notice(repo: &Repo, checkout: &Path, resumes: bool) -> String {
+    let mut notice = format!(
+        "Owlshift can no longer reach GitHub for {repo}, so none of its tickets move. Sign in \
+         again: `cd {}` then `owlshift init`. It shows a code to enter on github.com; your \
+         owlshift.toml, your other stored keys and your tickets are kept.",
+        sh_quote(&checkout.display().to_string())
+    );
+    if resumes {
+        notice.push_str(" Owlshift picks the project up again within a minute.");
+    }
+    notice
 }
 
 fn no_token(found: &ForgeSecret<Secret>) -> String {
@@ -406,6 +432,61 @@ mod tests {
             GitHubApp::from_personal(Some(&slug_only)).client_id,
             "Iv23li5EhBqiuljIPbiK"
         );
+    }
+
+    /// OWL-650: the notice names the repository, the folder quoted for a
+    /// shell, the command and what it keeps; only the daemon's watch adds
+    /// that the project is picked up again.
+    #[test]
+    fn the_sign_in_notice_names_the_folder_quoted_and_what_is_kept() {
+        let repo = Repo::parse("acme/web").unwrap();
+        let folder = Path::new("/Users/ada/My Projects/web");
+        assert_eq!(
+            sign_in_notice(&repo, folder, true),
+            "Owlshift can no longer reach GitHub for acme/web, so none of its tickets move. Sign \
+             in again: `cd '/Users/ada/My Projects/web'` then `owlshift init`. It shows a code \
+             to enter on github.com; your owlshift.toml, your other stored keys and your \
+             tickets are kept. Owlshift picks the project up again within a minute."
+        );
+        let typed = sign_in_notice(&repo, folder, false);
+        assert!(
+            !typed.contains("Owlshift picks the project up again within a minute."),
+            "{typed}"
+        );
+        assert!(typed.ends_with("your tickets are kept."), "{typed}");
+
+        let quoted = sign_in_notice(&repo, Path::new("/tmp/ada's web"), false);
+        assert!(quoted.contains(r"`cd '/tmp/ada'\''s web'`"), "{quoted}");
+    }
+
+    /// OWL-650: a refused sign-in is lasting and, said in a checkout, reads
+    /// as the notice with its technical words kept as the detail; any other
+    /// refusal is said as it was.
+    #[test]
+    fn only_a_refused_sign_in_is_reworded_in_its_checkout() {
+        let repo = Repo::parse("acme/web").unwrap();
+        let folder = Path::new("/work/web");
+        let technical = sign_in_again("github.com/acme/web/github-app", "does not read");
+        let refused = refusal(Error::new(ErrorKind::SignInAgain, technical.clone()));
+        assert!(refused.lasting(), "{refused}");
+        let said = refused.in_checkout(&repo, folder, true);
+        assert!(said.lasting(), "{said}");
+        assert_eq!(said.message, sign_in_notice(&repo, folder, true));
+        assert_eq!(said.detail.as_deref(), Some(technical.as_str()));
+        assert_eq!(
+            said.clone().in_checkout(&repo, folder, false),
+            said,
+            "said once"
+        );
+
+        for other in [
+            refusal(Error::new(ErrorKind::Unauthorized, "bad credentials")),
+            Refusal::from("no Linear API key"),
+        ] {
+            let kept = other.clone().in_checkout(&repo, folder, true);
+            assert_eq!(kept, other);
+            assert_eq!(kept.detail, None);
+        }
     }
 
     /// OWL-334: no token stored is said before any request.
