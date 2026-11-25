@@ -15,7 +15,7 @@ use owlshift_contracts::event::{Event, EventKind};
 use owlshift_contracts::format::Format;
 use owlshift_contracts::ids::TicketId;
 use owlshift_contracts::ready::{Outcome, ReadySnapshot, ReadyTicket};
-use owlshift_contracts::service::{BY_PAUSE, Request};
+use owlshift_contracts::service::{BY_DAEMON, BY_PAUSE, Request};
 use owlshift_runner::daemon::requests;
 use owlshift_runner::events::EventLog;
 use owlshift_runner::project::ProjectDirs;
@@ -621,6 +621,81 @@ fn no_asset_holds_the_token_and_the_page_sends_only_the_code_and_the_session() {
     // their fields and nothing else.
     assert_eq!(APP_JS.matches("body:").count(), 3);
     assert!(APP_JS.contains("options.body = init.body;"));
+}
+
+/// OWL-650: every place the UI shows a pause says "waiting for you" for the
+/// daemon's own, through one helper tied to the contracts' `BY_DAEMON`,
+/// and keeps a person's pause as "paused".
+#[test]
+fn every_pause_the_ui_shows_says_waiting_for_you_for_the_daemons() {
+    let app = lf(APP_JS);
+    let ops = lf(OPS_JS);
+    let waits_for_you = block(&app, "function waitsForYou(paused) {", "");
+    assert!(
+        waits_for_you.contains(&format!("paused.by === \"{BY_DAEMON}\"")),
+        "{waits_for_you}"
+    );
+    let pause_text = block(&app, "function pauseText(paused, missing) {", "");
+    for said in [
+        "\"waiting for you: \"",
+        "\"paused: \"",
+        "waitsForYou(paused)",
+    ] {
+        assert!(pause_text.contains(said), "{said}: {pause_text}");
+    }
+    for opening in [
+        "function renderProjects(header) {",
+        "function renderView(overview) {",
+        "function drawProject(project, layerName) {",
+    ] {
+        let drawn = block(&app, opening, "");
+        assert!(drawn.contains("pauseText(project.paused"), "{opening}");
+        assert!(!drawn.contains("\"paused: \""), "{opening}");
+    }
+    let waits = block(&app, "function renderWaits(handle, body, waits) {", "");
+    assert!(waits.contains("waitsForYou(project.paused)"), "{waits}");
+    assert!(waits.contains("\"waiting for you\""), "{waits}");
+    let words = block(&ops, "function pauseWords(pause) {", "  ");
+    for said in [
+        "waitsForYou(pause)",
+        "\"waiting for you since \"",
+        "\"paused by \"",
+    ] {
+        assert!(words.contains(said), "{said}: {words}");
+    }
+
+    // The two helpers, run as the page's own source.
+    use boa_engine::{Context, Source};
+    let run = |expression: &str| {
+        let code = format!(
+            "function waitsForYou(paused) {{{waits_for_you}\n}}\n\
+             function pauseText(paused, missing) {{{pause_text}\n}}\n{expression}"
+        );
+        let mut context = Context::default();
+        context
+            .eval(Source::from_bytes(code.as_bytes()))
+            .unwrap_or_else(|e| panic!("{e}\n{code}"))
+            .to_string(&mut context)
+            .unwrap()
+            .to_std_string_escaped()
+    };
+    assert_eq!(
+        run(&format!(
+            "pauseText({{ by: \"{BY_DAEMON}\", why: \"Sign in again.\" }}, \"\")"
+        )),
+        "waiting for you: Sign in again."
+    );
+    assert_eq!(
+        run(&format!(
+            "pauseText({{ by: \"{BY_PAUSE}\", why: \"lunch\" }}, \"\")"
+        )),
+        "paused: lunch"
+    );
+    assert_eq!(
+        run("pauseText({ by: null, why: null }, \"by a person\")"),
+        "paused: by a person"
+    );
+    assert_eq!(run("waitsForYou(null)"), "false");
 }
 
 /// OWL-475: the reply form is drawn by one function, in the questions

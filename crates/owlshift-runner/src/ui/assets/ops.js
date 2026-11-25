@@ -351,6 +351,10 @@
     if (pause.unreadable) {
       return "paused by a pause file that does not read";
     }
+    // The daemon's own pause waits for you (OWL-650, app.js).
+    if (waitsForYou(pause)) {
+      return "waiting for you since " + clock(pause.at) + ": " + pause.why;
+    }
     return "paused by " + pause.by + " at " + clock(pause.at) + ": " + pause.why;
   }
 
