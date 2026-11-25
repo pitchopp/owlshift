@@ -646,6 +646,67 @@ fn a_watch_that_cannot_serve_pauses_its_project_until_one_serves() {
     assert!(bench.ended().success(), "{}", bench.output());
 }
 
+/// A paused project whose watch, tried again, cannot serve it for another
+/// reason (OWL-650): the daemon writes its pause file again with the new
+/// reason, says the pause once more with it and the retried watch's line,
+/// then stays quiet while the new reason holds; the operator was notified
+/// once, at the first pause.
+#[test]
+fn a_paused_project_whose_reason_changes_is_paused_again_with_it() {
+    const FIRST: &str = "acme/web cannot be served on the bench";
+    const NEXT: &str = "acme/web cannot reach GitHub on the bench";
+    let mut bench = Bench::new();
+    bench.serve(WEB);
+    fs::create_dir_all(bench.bench_dir(WEB)).unwrap();
+    fs::write(
+        bench.bench_dir(WEB).join("exit"),
+        daemon::UNSERVABLE_EXIT.to_string(),
+    )
+    .unwrap();
+    bench.start();
+    let dirs = bench.dirs(WEB);
+    let tries = |reason: &str| {
+        events(&bench.data())
+            .iter()
+            .filter(|event| {
+                event.data.get("service").and_then(|s| s.as_str()) == Some("watch_ended")
+                    && event.data.get("unservable").and_then(|s| s.as_str()) == Some(reason)
+            })
+            .count()
+    };
+    bench.wait_for("the first pause, tried again", || tries(FIRST) >= 2);
+    let pause = requests::pause(&dirs).unwrap().unwrap();
+    assert_eq!((pause.by.as_str(), pause.why.as_str()), (BY_DAEMON, FIRST));
+
+    fs::write(bench.bench_dir(WEB).join("why"), NEXT).unwrap();
+    bench.wait_for("the new reason, tried again", || tries(NEXT) >= 3);
+    let pause = requests::pause(&dirs).unwrap().unwrap();
+    assert_eq!((pause.by.as_str(), pause.why.as_str()), (BY_DAEMON, NEXT));
+    let output = bench.output();
+    for (line, said) in [
+        ("Paused acme/web, waiting for you: ", 2),
+        (&format!("Paused acme/web, waiting for you: {FIRST}."), 1),
+        (&format!("Paused acme/web, waiting for you: {NEXT}."), 1),
+        // The retried watch's held line, on the standard error, once per
+        // reason, and the pause that says it.
+        (&format!("acme/web: owlshift: {FIRST}"), 1),
+        (&format!("acme/web: owlshift: {NEXT}"), 1),
+        (FIRST, 2),
+        (NEXT, 2),
+        ("Tried again", 0),
+    ] {
+        assert_eq!(output.matches(line).count(), said, "{line}: {output}");
+    }
+    let notes = bench.notes();
+    assert_eq!(notes.len(), 1, "{notes:?}");
+    assert!(
+        notes[0].starts_with(&format!("Owlshift: acme/web waits for you: {FIRST}")),
+        "{notes:?}"
+    );
+    bench.signal("TERM", bench.daemon_pid());
+    assert!(bench.ended().success(), "{}", bench.output());
+}
+
 /// A real watch of [`REPO`] under the daemon (OWL-479), on a project whose
 /// drain admits nothing: what its start does, not its steps.
 fn real_watch(bench: &mut Bench) {
