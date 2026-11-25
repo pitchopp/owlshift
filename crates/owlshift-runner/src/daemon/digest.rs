@@ -1,8 +1,10 @@
 //! The daily digest (OWL-440, architecture section 5, "The digest"): once a
 //! day, at `[service] digest_hour` of the personal file, local time, one
 //! notification by the daemon's notifier saying what was delivered, what
-//! waits for a person, what is parked, which projects are paused and how
-//! the harnesses' usage stands, ending with `owlshift status`.
+//! waits for a person, what is parked, which projects are paused and why,
+//! a project the daemon paused said to wait for you with its reason, which
+//! names what to do (OWL-650), and how the harnesses' usage stands, ending
+//! with `owlshift status`.
 //!
 //! `<data>/service/digest.json` ([`DigestRecord`]) keeps when the latest
 //! digest was made. A digest is due once a digest hour has passed since
@@ -29,7 +31,7 @@ use owlshift_contracts::config::{DEFAULT_DIGEST_HOUR, PersonalConfig};
 use owlshift_contracts::event::EventKind;
 use owlshift_contracts::format::{ContractError, Format};
 use owlshift_contracts::ids::TicketId;
-use owlshift_contracts::service::{BY_DAEMON, DigestRecord};
+use owlshift_contracts::service::{BY_DAEMON, DigestRecord, Request};
 use owlshift_core::floor::same_account;
 use owlshift_core::schedule::natural_cmp;
 use owlshift_core::state::Status;
@@ -133,8 +135,9 @@ pub struct Summary {
     pub kept: Vec<(TicketId, Vec<Waiter>)>,
     /// Whether `<data>/service/pause` stands.
     pub all_paused: bool,
-    /// The served projects whose pause file stands.
-    pub paused: Vec<String>,
+    /// The served projects whose pause file stands, each with its pause:
+    /// `None` for a file that does not read.
+    pub paused: Vec<(String, Option<Request>)>,
     pub usage: Vec<(Harness, Usage)>,
 }
 
@@ -218,8 +221,8 @@ pub fn gather(
             let kept = why::kept_waiting(dirs, &events, &project, &keeping, now, &mut Vec::new());
             summary.kept.extend(kept);
         }
-        if requests::pause(dirs).is_some() {
-            summary.paused.push(repo.to_string());
+        if let Some(pause) = requests::pause(dirs) {
+            summary.paused.push((repo.to_string(), pause));
         }
     }
     summary
@@ -353,8 +356,13 @@ pub fn line(summary: &Summary, tz: &TimeZone) -> String {
     }
     if summary.all_paused {
         parts.push("every project paused".to_owned());
-    } else if !summary.paused.is_empty() {
-        parts.push(format!("paused: {}", summary.paused.join(", ")));
+    } else {
+        parts.extend(
+            summary
+                .paused
+                .iter()
+                .map(|(repo, pause)| paused_part(repo, pause.as_ref())),
+        );
     }
     if !summary.usage.is_empty() {
         let usage: Vec<String> = summary
@@ -562,6 +570,24 @@ fn say(out: &mut dyn Write, line: &str) {
     let _ = writeln!(out, "{}", printable(line));
 }
 
+/// What the digest says of `repo`, paused by `pause`: the daemon's pause
+/// waits for you, its reason saying what to do (OWL-650); a person's gives
+/// its reason in brackets; a pause file that does not read, only that it
+/// stands. A reason's final period is left to the digest's own.
+fn paused_part(repo: &str, pause: Option<&Request>) -> String {
+    match pause {
+        Some(request) => {
+            let why = request.why.strip_suffix('.').unwrap_or(&request.why);
+            if request.by == BY_DAEMON {
+                format!("{repo} waits for you: {why}")
+            } else {
+                format!("{repo} paused ({why})")
+            }
+        }
+        None => format!("{repo} paused"),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::cell::RefCell;
@@ -647,7 +673,10 @@ mod tests {
                     .collect(),
             )],
             all_paused: false,
-            paused: vec!["acme/web".to_owned()],
+            paused: vec![(
+                "acme/web".to_owned(),
+                Some(Request::new("owlshift pause", until, "lunch.")),
+            )],
             usage: vec![
                 (Harness::Claude, Usage::Limited(Some(until))),
                 (Harness::Codex, Usage::Share(0.424)),
@@ -658,7 +687,7 @@ mod tests {
             "Owlshift digest: 7 delivered (OWL-1, OWL-2, OWL-3, OWL-4, OWL-5 and 2 more); 1 \
              waiting for a person (OWL-8); 2 parked (OWL-10, OWL-9, 1 of them yielding what \
              they hold; OWL-9 keeps 2 tickets waiting: OWL-11 and OWL-12 for zone \
-             `app/one.rs`); paused: acme/web; usage: claude at its limit until Mon 14:05, codex \
+             `app/one.rs`); acme/web paused (lunch); usage: claude at its limit until Mon 14:05, codex \
              42 %. More: `owlshift status`."
         );
         let quiet = Summary {
@@ -669,6 +698,49 @@ mod tests {
             line(&quiet, &paris()),
             "Owlshift digest: nothing delivered; every project paused. More: `owlshift status`."
         );
+    }
+
+    /// OWL-650: a project the daemon paused waits for you, its whole reason
+    /// said; a person's pause gives its reason in brackets; a pause file
+    /// that does not read says only that it stands.
+    #[test]
+    fn each_paused_project_is_said_with_its_reason() {
+        let at = ts("2026-10-26T08:00:00");
+        let api = Repo::parse("acme/api").unwrap();
+        let notice = crate::forge::sign_in_notice(&api, Path::new("/home/ada/api"), true);
+        let summary = Summary {
+            paused: vec![
+                (
+                    "acme/api".to_owned(),
+                    Some(Request::new(BY_DAEMON, at, &notice)),
+                ),
+                (
+                    "acme/web".to_owned(),
+                    Some(Request::new("owlshift pause", at, "lunch")),
+                ),
+                ("acme/old".to_owned(), None),
+            ],
+            ..Summary::default()
+        };
+        let said = line(&summary, &paris());
+        let whole = notice.strip_suffix('.').unwrap();
+        assert!(
+            said.contains(&format!("; acme/api waits for you: {whole}; ")),
+            "{said}"
+        );
+        assert!(
+            said.contains(
+                "acme/api waits for you: Owlshift can no longer reach GitHub for acme/api, so \
+                 none of its tickets move. Sign in again: `cd '/home/ada/api'` then `owlshift \
+                 init`."
+            ),
+            "{said}"
+        );
+        assert!(
+            said.contains("; acme/web paused (lunch); acme/old paused. More: "),
+            "{said}"
+        );
+        assert!(!said.contains(".."), "{said}");
     }
 
     fn event(project: &str, ticket: &str, at: Timestamp, action: &str) -> Event {
@@ -745,7 +817,13 @@ mod tests {
         let projects = [(&web, &web_dirs), (&api, &api_dirs)];
         let summary = gather(data, &projects, &[], since, now, &mut out);
         assert_eq!(summary.delivered, ids(&["OWL-1"]));
-        assert_eq!(summary.paused, vec!["acme/api".to_owned()]);
+        assert_eq!(summary.paused.len(), 1, "{:?}", summary.paused);
+        let (repo, pause) = &summary.paused[0];
+        assert_eq!(repo, "acme/api");
+        assert_eq!(
+            pause.as_ref().map(|pause| pause.why.as_str()),
+            Some("keychain locked")
+        );
         assert!(!summary.all_paused);
         assert_eq!(summary.usage, vec![(Harness::Codex, Usage::Share(0.6))]);
 
