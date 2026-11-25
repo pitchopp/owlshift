@@ -24,6 +24,7 @@ use std::time::{Duration, Instant};
 
 use jiff::Timestamp;
 use owlshift_adapters::forge::Repo;
+use owlshift_adapters::forge::github::GitHubForge;
 use owlshift_adapters::notifier::Notifier;
 use owlshift_adapters::tracker::{Capability, Tracker};
 use owlshift_contracts::config::{PersonalConfig, ProjectConfig};
@@ -128,9 +129,23 @@ pub fn run(
         Some(repo) => run_served(system, config, mode, repo, open_keychain),
     };
     ran.unwrap_or_else(|refusal| {
-        fail(&refusal.message);
+        for line in refusal_lines(&refusal) {
+            fail(&line);
+        }
         refused_code(&refusal, mode, served.is_some())
     })
+}
+
+/// The lines `refusal` is said in, each printed after `owlshift: `: its
+/// technical detail first, when it has one, then its message, last, which
+/// the daemon keeps as the pause's reason (OWL-650).
+fn refusal_lines(refusal: &Refusal) -> Vec<String> {
+    refusal
+        .detail
+        .iter()
+        .chain(std::iter::once(&refusal.message))
+        .cloned()
+        .collect()
 }
 
 /// The exit code of `refusal` (OWL-435): [`UNSERVABLE_EXIT`] for a served
@@ -340,19 +355,26 @@ fn run_with(
     // "mine"`, the account of the tracker key, read once here, a key that
     // cannot be read refusing the drain's start; a step's child takes what
     // its watch read, from its envelope; any other command reads no gesture.
-    let mut open = || -> Result<(Box<dyn Tracker>, _, Taking), Refusal> {
-        let tracker = opener.open()?;
-        let forge = forge::github(&secrets.forge, repo.clone(), &secrets.access)?;
-        let takes = match (mode, &envelope) {
-            (Mode::Drain, _) => config.taking(tracker.as_ref(), project.tracker.kind, &repo)?,
-            (_, Some(envelope)) => Taking::of_envelope(envelope.operator.as_deref()),
-            _ => Taking::All,
+    // A refused GitHub sign-in is said in a person's words, naming this
+    // folder (OWL-650): the daemon's watch adds that it picks the project
+    // up again, which no other command does.
+    let resumes = waits_for_network(served.is_some(), mode);
+    let mut open = || -> Result<(Box<dyn Tracker>, GitHubForge, Taking), Refusal> {
+        let opened = || -> Result<(Box<dyn Tracker>, GitHubForge, Taking), Refusal> {
+            let tracker = opener.open()?;
+            let forge = forge::github(&secrets.forge, repo.clone(), &secrets.access)?;
+            let takes = match (mode, &envelope) {
+                (Mode::Drain, _) => config.taking(tracker.as_ref(), project.tracker.kind, &repo)?,
+                (_, Some(envelope)) => Taking::of_envelope(envelope.operator.as_deref()),
+                _ => Taking::All,
+            };
+            Ok((tracker, forge, takes))
         };
-        Ok((tracker, forge, takes))
+        opened().map_err(|refusal| refusal.in_checkout(&repo, root, resumes))
     };
     // A watch the daemon starts waits for the network rather than end while
     // neither answers at all (OWL-479); any other command refuses at once.
-    let (tracker, forge, takes) = if waits_for_network(served.is_some(), mode) {
+    let (tracker, forge, takes) = if resumes {
         let mut out = io::stdout();
         let mut sink = EventSink::new(repo.to_string(), EventLog::in_dir(data_dir), &mut out);
         match offline::open(
@@ -1460,6 +1482,59 @@ mod refusals {
                 "{mode:?}"
             );
         }
+
+        // OWL-650: a refused sign-in, said in its checkout, still pauses a
+        // served watch's project.
+        let repo = Repo::parse("acme/web").unwrap();
+        let signed_out = Refusal::sign_in_to_github("refused").in_checkout(
+            &repo,
+            Path::new("/work/web"),
+            waits_for_network(true, Mode::Drain),
+        );
+        assert_eq!(
+            refused_code(&signed_out, Mode::Drain, true),
+            ExitCode::from(UNSERVABLE_EXIT)
+        );
+    }
+
+    /// OWL-650: a refused GitHub sign-in is said on two lines, the technical
+    /// one first and the notice last, which the daemon keeps as the pause's
+    /// reason; only the daemon's watch says it picks the project up again.
+    #[test]
+    fn a_refused_sign_in_ends_with_the_notice_for_its_folder() {
+        let repo = Repo::parse("acme/web").unwrap();
+        let folder = Path::new("/work/my web");
+        let technical = "the GitHub App's token under service `owlshift`, account \
+                         `github.com/acme/web/github-app`, does not read: run `owlshift init` \
+                         in a terminal to sign in again";
+        let said = |served: bool, mode: Mode<'_>| {
+            Refusal::sign_in_to_github(technical).in_checkout(
+                &repo,
+                folder,
+                waits_for_network(served, mode),
+            )
+        };
+
+        let served = said(true, Mode::Drain);
+        assert_eq!(
+            refusal_lines(&served),
+            [
+                technical.to_owned(),
+                forge::sign_in_notice(&repo, folder, true)
+            ]
+        );
+        assert!(
+            served
+                .message
+                .ends_with("Owlshift picks the project up again within a minute."),
+            "{served}"
+        );
+        let typed = said(false, Mode::Watch);
+        assert_eq!(typed.message, forge::sign_in_notice(&repo, folder, false));
+        assert!(!typed.message.contains("within a minute"), "{typed}");
+
+        let plain = Refusal::from("no Linear API key");
+        assert_eq!(refusal_lines(&plain), ["no Linear API key".to_owned()]);
     }
 
     /// An intake's envelope for `ticket`.
