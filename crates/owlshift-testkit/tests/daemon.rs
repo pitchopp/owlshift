@@ -575,9 +575,10 @@ fn a_stop_drains_every_watch_and_a_sigterm_checks_them() {
 }
 
 /// A watch that cannot serve its project pauses it: the daemon's pause file
-/// with the reason, one notification however often it is tried again at
-/// each pass; once a watch so tried still runs a pass later, the pause is
-/// lifted.
+/// with the reason, one notification that it waits for you however often
+/// it is tried again at each pass, and the pause said once (OWL-650): the
+/// quiet retries add nothing to the output while the reason stays the same.
+/// Once a watch so tried still runs a pass later, the pause is lifted.
 #[test]
 fn a_watch_that_cannot_serve_pauses_its_project_until_one_serves() {
     let mut bench = Bench::new();
@@ -594,16 +595,35 @@ fn a_watch_that_cannot_serve_pauses_its_project_until_one_serves() {
     let pause = requests::pause(&dirs).unwrap().unwrap();
     assert_eq!(pause.by, BY_DAEMON);
     assert_eq!(pause.why, "acme/web cannot be served on the bench");
-    // Tried again at the next passes, told once.
-    bench.wait_for("two more tries", || {
-        bench.output().matches("Paused acme/web").count() >= 3
-    });
+    // Tried again at the next passes, quietly, told once.
+    let unservable = || {
+        events(&bench.data())
+            .iter()
+            .filter(|event| {
+                event.data.get("service").and_then(|s| s.as_str()) == Some("watch_ended")
+                    && event.data.get("unservable").is_some()
+            })
+            .count()
+    };
+    bench.wait_for("two more tries", || unservable() >= 3);
+    let output = bench.output();
+    for (line, said) in [
+        ("Paused acme/web, waiting for you: ", 1),
+        ("acme/web cannot be served on the bench", 2),
+        ("Started the watch of acme/web", 1),
+        ("Tried again", 0),
+    ] {
+        assert_eq!(output.matches(line).count(), said, "{line}: {output}");
+    }
     let notes = bench.notes();
     assert_eq!(notes.len(), 1, "{notes:?}");
     assert!(
-        notes[0].starts_with("Owlshift: acme/web is paused: acme/web cannot be served"),
+        notes[0].starts_with(
+            "Owlshift: acme/web waits for you: acme/web cannot be served on the bench"
+        ),
         "{notes:?}"
     );
+    assert!(!notes[0].contains("again"), "{notes:?}");
 
     fs::remove_file(bench.bench_dir(WEB).join("exit")).unwrap();
     let (watch, _) = bench.running(WEB);
@@ -615,6 +635,13 @@ fn a_watch_that_cannot_serve_pauses_its_project_until_one_serves() {
     bench.wait_for("the served-again line", || {
         bench.output().contains("acme/web is served again")
     });
+    // The lifted watch's held line is said, before the served-again one.
+    let output = bench.output();
+    let watching = output.find("watching acme/web").expect(&output);
+    assert!(
+        watching < output.find("acme/web is served again").unwrap(),
+        "{output}"
+    );
     bench.signal("TERM", bench.daemon_pid());
     assert!(bench.ended().success(), "{}", bench.output());
 }

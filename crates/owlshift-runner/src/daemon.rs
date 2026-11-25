@@ -13,9 +13,10 @@
 //!   asked starts again after a delay doubling from 10 seconds to an hour,
 //!   and the operator is told once at the third end in a row. A watch that
 //!   ends with [`UNSERVABLE_EXIT`], a refusal no restart mends, pauses its
-//!   project instead: `<project data>/pause` written with the reason, told
-//!   once, tried again at each pass, and lifted once a watch tried so still
-//!   runs a pass later.
+//!   project instead: it waits for you (OWL-650). `<project data>/pause` is
+//!   written with the reason, said once and notified once, and the project
+//!   tried again quietly at each pass, its watch's lines held until it ends
+//!   for another reason or still runs a pass later, when the pause is lifted.
 //! - *Stops* ([`requests`]): `owlshift stop` writes `<data>/service/stop`,
 //!   which the daemon relays as the stop file of every watch it runs (a
 //!   drain), then exits once they have ended; a Ctrl-C does the same. A
