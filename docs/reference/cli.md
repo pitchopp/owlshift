@@ -67,7 +67,7 @@ owlshift config show
 
 ## `owlshift init`
 
-Write a commented owlshift.toml for this repository, then store its tracker and forge secrets and the agent runs' Claude Code token `owlshift do` needs in the system keychain.
+Write a commented owlshift.toml for this repository, or keep the one it has, then store its tracker and forge secrets and the agent runs' Claude Code token `owlshift do` needs in the system keychain, keeping those already stored, and sign in to GitHub again when its token no longer works.
 
 ```text
 owlshift init [OPTIONS]
