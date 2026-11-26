@@ -113,6 +113,9 @@ struct FakeGitHub {
     /// The repository's other open pull requests, a person's (OWL-410):
     /// each number with its head branch and the files it changes.
     others: Mutex<Vec<(u64, String, Vec<String>)>>,
+    /// The files Owlshift's own open pull request lists (OWL-653), none
+    /// unless a scenario sets them.
+    own_files: Mutex<Vec<String>>,
     /// How many of the next listings of the open pull requests, and of the
     /// next reads of a pull request's files, fail as a network that is
     /// down.
@@ -501,7 +504,8 @@ impl FakeGitHub {
             } } })
         } else if query.starts_with("query RepositoryPulls") {
             // The open pull requests (OWL-410): Owlshift's own while it is
-            // open, which changes no file the bench names, then the others.
+            // open, listing the files of `own_files`, none unless a scenario
+            // sets them, then the others.
             let base = self
                 .env
                 .run(&self.bare, &["rev-parse", "refs/heads/main"])
@@ -515,7 +519,8 @@ impl FakeGitHub {
             let mut nodes = Vec::new();
             if let Some(number) = *self.open.lock().unwrap() {
                 let head = self.head.lock().unwrap().clone();
-                nodes.push(node(number, &head, self.tip(), 0));
+                let files = self.own_files.lock().unwrap().len();
+                nodes.push(node(number, &head, self.tip(), files));
             }
             for (number, branch, files) in self.others.lock().unwrap().iter() {
                 nodes.push(node(*number, branch, "e".repeat(40), files.len()));
@@ -531,8 +536,13 @@ impl FakeGitHub {
     }
 
     /// The files of pull request `number`, as REST's first page lists them
-    /// (OWL-410).
+    /// (OWL-410): Owlshift's own open one lists `own_files` (OWL-653).
     fn files(&self, number: u64) -> String {
+        if *self.open.lock().unwrap() == Some(number) {
+            let own = self.own_files.lock().unwrap();
+            let files: Vec<Value> = own.iter().map(|file| json!({ "filename": file })).collect();
+            return Value::Array(files).to_string();
+        }
         let others = self.others.lock().unwrap();
         let files: Vec<Value> = others
             .iter()
@@ -1529,6 +1539,7 @@ impl Bench {
             refuse_open: Mutex::new(0),
             open_reads: Mutex::new(0),
             others: Mutex::new(Vec::new()),
+            own_files: Mutex::new(Vec::new()),
             fail_pulls: Mutex::new(0),
             fail_files: Mutex::new(0),
             branch_head_reads: Mutex::new(0),

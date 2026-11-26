@@ -1583,6 +1583,10 @@ struct Prepared {
     /// architecture section 5, "One step a pass"): it stops with
     /// [`Stop::Stepped`] at the next change of stage, its state kept.
     stepping: bool,
+    /// Watch runs this command at Watch (a repair, a correction, the person
+    /// steps, a review loop): its admission waits are told as a step's are,
+    /// so that `owlshift why` shows them (OWL-653).
+    for_watch: bool,
     /// `owlshift continue --to-watch` (OWL-420): the command restarts a
     /// park and leaves the ticket to watch, running nothing.
     to_watch: bool,
@@ -2103,7 +2107,9 @@ impl OnDemand<'_> {
     /// and what each ticket holds from its dispatch until its pull request
     /// ends, an unreadable ref the whole repository, with the outside
     /// holders joined when `outside` is given (the caps read none), all
-    /// closed with `named`.
+    /// closed with `named`. The ticket's own open pull request is never one
+    /// of them (OWL-653): its ref, when it holds, delivered it, so it is
+    /// Owlshift's own and holds nothing against the ticket.
     fn locked_load(
         &self,
         p: &Prepared,
@@ -2155,10 +2161,15 @@ impl OnDemand<'_> {
             }
         }
         if let Some(outside) = outside {
+            // The ticket's own ref, when it holds, so that its own open pull
+            // request joins it rather than holding it back (OWL-653): its
+            // files go to an entry `in_flight` does not have, and are
+            // dropped.
+            let own = p.stored.as_ref().filter(|stored| held::holds(stored));
             let refs = others
                 .iter()
                 .map(|(ticket, read)| (ticket, read.as_ref().ok()))
-                .chain([(&p.ticket, None)]);
+                .chain([(&p.ticket, own)]);
             let holders = outside.holders(refs, &elsewhere, named);
             holders.join(&mut locked.in_flight, named);
             locked.kinds = holders.kinds;
@@ -2404,7 +2415,9 @@ impl OnDemand<'_> {
     /// record cannot take, keeping the most it keeps, which no refresh would
     /// cover, stops with [`Stop::Waits`] worded for `admission`, with the
     /// `watch` `waits` decision event at its stage when the command steps
-    /// for watch. A yielded sibling's taking the record cannot take holds
+    /// for watch, or when watch runs it at Watch ([`Prepared::for_watch`],
+    /// OWL-653).
+    /// A yielded sibling's taking the record cannot take holds
     /// nothing back: it is warned of.
     fn weigh_admission(
         &self,
@@ -2434,7 +2447,7 @@ impl OnDemand<'_> {
             });
         if let Some(found) = weighed.collision.or(unkept) {
             let (holding, who) = in_flight::holding(&locked.kinds, &found);
-            if p.stepping {
+            if p.stepping || p.for_watch {
                 let mut event = data([
                     ("watch", json!("waits")),
                     ("reason", json!("collision")),
@@ -2500,8 +2513,11 @@ impl OnDemand<'_> {
     /// `p`, or read now), under the switch at the base this command fetched
     /// ([`Self::weigh_admission`]): a conflict stops with [`Stop::Waits`] at
     /// its stage, the record still yielded, so nothing waits for it
-    /// meanwhile. Admitted, the yield's time is cleared and, its pull
-    /// request not open, its next Build's rebase made due
+    /// meanwhile. Its own open pull request is never a holder it waits for
+    /// (OWL-653): only that pull request's merge would free it, and the
+    /// merge waits for the run this admission starts. Admitted, the yield's
+    /// time is cleared and, its pull request not open, its next Build's
+    /// rebase made due
     /// ([`TicketHeld::admitted_again`]); what it shares or takes is
     /// recorded, the record kept, a `yield` = `readmitted` event emitted
     /// and its claim pushed again (OWL-586).
@@ -3183,6 +3199,7 @@ impl OnDemand<'_> {
             // The person's project file, as every `[policy]` key (OWL-331).
             policy: self.config.gate_policy(),
             stepping: false,
+            for_watch: false,
             to_watch: false,
             restart_by: None,
             typed: None,
@@ -7768,7 +7785,7 @@ impl OnDemand<'_> {
         command: Command,
         sink: &mut EventSink<'_>,
     ) -> Option<Result<Prepared, Stop>> {
-        let p = match self.prepare(ticket, command, sink) {
+        let mut p = match self.prepare(ticket, command, sink) {
             Ok(p) => p,
             Err(stop) if stop.is_busy() => return None,
             Err(stop) => return Some(Err(stop)),
@@ -7780,6 +7797,7 @@ impl OnDemand<'_> {
         {
             return None;
         }
+        p.for_watch = true;
         Some(Ok(p))
     }
 
