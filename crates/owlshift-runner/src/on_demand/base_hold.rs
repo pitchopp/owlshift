@@ -4,10 +4,11 @@
 //! or setup fails on a command the base fails too counts nothing and holds
 //! that commit ([`OnDemand::base_broken`]); and a done Build whose gate was
 //! held runs that gate again alone once the base passes, no harness spawned
-//! ([`OnDemand::regate_role`]). The base is checked alone, as `owlshift
-//! gate` runs, through [`GateOnce`] at its base place, which keeps the
-//! verdict under the project's lock; a check that cannot run yet, another
-//! ticket's step being in flight, leaves the failure pending. A failure a
+//! ([`OnDemand::regate_role`]). The base is checked as `owlshift gate` runs,
+//! through [`GateOnce`] at its base place, beside the other steps since
+//! OWL-660, which keeps the verdict under the project's lock; a check that
+//! cannot run yet, another base check holding the base lock, leaves the
+//! failure pending. A failure a
 //! check says nothing of, a runner's fault or one around the commands, takes
 //! today's path with a `warning` event (`base_unchecked`).
 //!
@@ -69,7 +70,8 @@ enum CheckRun {
         verdict: Option<Verdict>,
         head: String,
     },
-    /// Another ticket's step is in flight.
+    /// Another base check holds the base lock, or the project's lock was
+    /// busy past its bound (OWL-660).
     Busy,
     /// It could not run, said in a `base_unchecked` warning.
     Unchecked,
@@ -462,7 +464,7 @@ impl OnDemand<'_> {
                     self.not_followed(p, (&held, &head), &failing, &verdict, sink);
                     verdict
                 }
-                // Given the priority a first check gets (OWL-431).
+                // Waits as a first check does (OWL-431, OWL-660).
                 CheckRun::Busy => return Ok(Left::Stay { due: true }),
                 CheckRun::Ran { verdict: None, .. } | CheckRun::Unchecked | CheckRun::NoGate => {
                     return stay();
@@ -1342,8 +1344,9 @@ impl OnDemand<'_> {
         }
     }
 
-    /// Checks the commit `dispatched` is configured at, alone, as `owlshift
-    /// gate` runs, for `failing`: the verdict is kept by the check itself,
+    /// Checks the commit `dispatched` is configured at, as `owlshift gate`
+    /// runs, beside the other steps, for `failing`: the verdict is kept by
+    /// the check itself,
     /// under the project's lock. `held` is the command of a hold standing on
     /// it, which a check that cannot run keeps holding.
     fn check_base(
@@ -1383,7 +1386,8 @@ impl OnDemand<'_> {
         })
     }
 
-    /// Checks `commit` alone, as `owlshift gate` runs, for `failing` when a
+    /// Checks `commit` as `owlshift gate` runs, beside the other steps
+    /// (OWL-660), for `failing` when a
     /// ticket's failure is behind it, from `p`'s step: the verdict is kept
     /// by the check itself, under the project's lock, and told, a hold it
     /// opens notified. A breach stops the command as a quarantine.
@@ -1460,7 +1464,7 @@ impl OnDemand<'_> {
         })
     }
 
-    /// A check that could not run yet, another ticket's step in flight: a
+    /// A check that could not run yet, another base check running: a
     /// hold standing goes on holding, its check again due (OWL-431); a
     /// failure waits for it, pending, as does every Build configured there;
     /// with neither, nothing holds.

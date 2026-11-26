@@ -93,9 +93,6 @@ impl Watch<'_> {
                 );
             }
         }
-        if dark {
-            memory.dark_wake_held = true;
-        }
         dark
     }
 }

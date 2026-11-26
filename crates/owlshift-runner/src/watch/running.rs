@@ -17,7 +17,6 @@ use owlshift_adapters::forge::ReviewsRead;
 use owlshift_contracts::event::EventKind;
 use owlshift_contracts::ids::TicketId;
 use owlshift_contracts::step::{StepEnd, StepEnvelope};
-use owlshift_core::state::{Status, TicketState};
 use owlshift_core::vocab::Stage;
 
 use super::{Continued, Memory, Seen, Watch};
@@ -29,9 +28,8 @@ use crate::step::{self, Running};
 /// two passes.
 const CHILD_POLL: Duration = Duration::from_millis(100);
 
-/// Whether a step that ended `end` ran: neither another command nor watch's
-/// own priority held it back, a run slot was free, and its ref had not
-/// moved.
+/// Whether a step that ended `end` ran: no other command held it back, a run
+/// slot was free, and its ref had not moved.
 pub(super) fn ran(end: &StepEnd) -> bool {
     !matches!(end, StepEnd::Busy | StepEnd::NoSlot | StepEnd::Stale)
 }
@@ -126,13 +124,6 @@ impl Watch<'_> {
         if self.held_back(memory, sink, out, true) {
             return Some(StepEnd::Busy);
         }
-        // A base check due runs alone (OWL-418): no other step starts, nor
-        // its own while another is in flight.
-        if self.base_due_holds(memory, &ticket) {
-            let end = StepEnd::Busy;
-            self.finish(memory, sink, out, &ticket, then, &end);
-            return Some(end);
-        }
         // A step of its own starts: a turn a dispatch gave it is taken
         // (OWL-431), unless no run slot is free below.
         let turn = memory.base_turn.remove(&ticket);
@@ -217,28 +208,6 @@ impl Watch<'_> {
         );
     }
 
-    /// Whether a base check due holds `ticket`'s step back (OWL-418): another
-    /// ticket's is due, or its own while another step is in flight. A due
-    /// check whose ticket is no longer at Build, or past
-    /// [`super::BASE_DUE_AT_MOST`], is forgotten.
-    fn base_due_holds(&self, memory: &mut Memory, ticket: &TicketId) -> bool {
-        let Some((due, since)) = memory.base_due.clone() else {
-            return false;
-        };
-        let now = (self.on_demand.clock)();
-        let expired = now.duration_since(since).unsigned_abs() > super::BASE_DUE_AT_MOST;
-        let at_build = self.read_after(&due).is_some_and(|stored| {
-            TicketState::try_from(&stored.record.state)
-                .is_ok_and(|state| state.status() == Status::Active(Stage::Build))
-        });
-        if expired || !at_build {
-            memory.base_due = None;
-            memory.base_due_given_up.insert(due);
-            return false;
-        }
-        due != *ticket || !memory.running.is_empty()
-    }
-
     /// Applies what follows the end of `ticket`'s step.
     fn finish(
         &self,
@@ -255,27 +224,14 @@ impl Watch<'_> {
         if matches!(end, StepEnd::Stopped) && crate::cancel::stands(self.on_demand.dirs, ticket) {
             memory.stepped = true;
         }
-        // A check due that could not run beside other steps holds them back
-        // until this ticket's next step has run (OWL-418).
+        // A check due that could not run yet: this ticket's step comes once
+        // no base check runs; one that ran otherwise no longer waits for it
+        // (OWL-418, OWL-660). No other step waits for either.
         let ran = ran(end);
-        if ran {
-            memory.base_due_given_up.remove(ticket);
-        }
-        // Since when this ticket's check has been due, kept across its steps
-        // that find it due still, so that the priority ends after
-        // [`super::BASE_DUE_AT_MOST`] (OWL-431).
-        let since = memory
-            .base_due
-            .as_ref()
-            .filter(|(due, _)| due == ticket)
-            .map(|(_, since)| *since);
-        if ran && since.is_some() {
-            memory.base_due_ran += 1;
-            memory.base_due = None;
-        }
         if let StepEnd::BaseHeld { pending: true, .. } = end {
-            let since = since.unwrap_or_else(|| (self.on_demand.clock)());
-            memory.base_due = Some((ticket.clone(), since));
+            memory.base_due.insert(ticket.clone());
+        } else if ran {
+            memory.base_due.remove(ticket);
         }
         // Which tickets a drain's dispatch gives a turn (OWL-431).
         if matches!(end, StepEnd::BaseHeld { .. }) {

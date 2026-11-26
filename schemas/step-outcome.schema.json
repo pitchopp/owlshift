@@ -360,7 +360,7 @@
           ]
         },
         {
-          "description": "A Build held for its base (OWL-418): `commit`, the commit it is\nconfigured at, fails `command` in a fresh worktree too, or a check is\n`pending`, waiting for the other steps in flight: its first check, its\ncheck again, or the default branch's newer head's (OWL-431), each of\nwhich watch gives its priority. Format 4.",
+          "description": "A Build held for its base (OWL-418): `commit`, the commit it is\nconfigured at, fails `command` in a fresh worktree too, or a check is\n`pending`, waiting for the base check running now: its first check,\nits check again, or the default branch's newer head's (OWL-431), each\nof which watch gives a step once no base check runs (OWL-660). Format\n4.",
           "type": "object",
           "properties": {
             "command": {

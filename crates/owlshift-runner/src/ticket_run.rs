@@ -26,7 +26,8 @@
 //!   before P6 its run file from its refs as they are.
 //! - **The check among steps.** [`Siblings`] gives a run's check the other
 //!   tickets in flight or ended since its snapshot, from their run files and
-//!   their locks ([`Concurrent`]).
+//!   their locks ([`Concurrent`]); since OWL-660 a step's base check too, from
+//!   the base lock and its record ([`BaseRun`], [`write_base_run`]).
 //!
 //! Since OWL-401 the project's lock is held for short sections only, so
 //! several tickets' runs overlap and the check among steps is what keeps
@@ -42,13 +43,14 @@ use jiff::Timestamp;
 use owlshift_contracts::format::Format;
 use owlshift_contracts::ids::TicketId;
 use owlshift_contracts::refs::ticket_ref;
-use owlshift_contracts::step::{RunObligation, RunTarget, TicketRun, is_run_id};
+use owlshift_contracts::step::{BaseRun, RunObligation, RunTarget, TicketRun, is_run_id};
 use owlshift_platform::files;
 
 use crate::executor::Git;
 use crate::executor::isolation::Concurrent;
+use crate::gate_once::BASE_BRANCH;
 use crate::on_demand::branch_for;
-use crate::project::{ProjectDirs, TicketLock, component};
+use crate::project::{BaseLock, ProjectDirs, TicketLock, component};
 use crate::ticket_ref::{self, Forgot, ProposalsFile, RefGuard, TicketRecord};
 
 /// The most bytes an obligation or a run file is read up to.
@@ -230,19 +232,10 @@ fn in_flight(dirs: &ProjectDirs, found: &Found, own: Option<&TicketId>) -> io::R
 /// `owlshift gate`, which holds the project's lock for its whole length and
 /// keeps the check of a run alone, answers busy to, so that its run and a
 /// step's never overlap: every step holds its ticket's lock for its whole
-/// length and starts with one of the project's sections. One try each, let
-/// go at once; a folder with no lock file was never locked.
+/// length and starts with one of the project's sections, a step's base check
+/// included since it runs beside the steps (OWL-660). One try each, let go
+/// at once; a folder with no lock file was never locked.
 pub fn ticket_in_flight(dirs: &ProjectDirs) -> io::Result<Option<PathBuf>> {
-    ticket_in_flight_except(dirs, None)
-}
-
-/// [`ticket_in_flight`], `except`'s folder left out: the ticket whose step
-/// runs a base check holds its own lock (OWL-418).
-pub fn ticket_in_flight_except(
-    dirs: &ProjectDirs,
-    except: Option<&TicketId>,
-) -> io::Result<Option<PathBuf>> {
-    let own = except.map(|ticket| dirs.ticket_dir(ticket));
     let listing = match fs::read_dir(dirs.tickets()) {
         Ok(listing) => listing,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
@@ -257,9 +250,6 @@ pub fn ticket_in_flight_except(
     }
     folders.sort();
     for folder in folders {
-        if own.as_ref() == Some(&folder) {
-            continue;
-        }
         if dirs.ticket_lock_held_in(&folder)? {
             return Ok(Some(folder));
         }
@@ -397,17 +387,27 @@ fn read_run_at(path: &Path) -> Result<Option<TicketRun>, String> {
 /// synced on Unix. The caller holds the ticket's lock.
 fn save(dirs: &ProjectDirs, run: &mut TicketRun) -> io::Result<()> {
     run.generation += 1;
-    let path = dirs.run_file(&run.ticket);
-    let folder = dirs.ticket_dir(&run.ticket);
-    fs::create_dir_all(&folder)?;
-    let partial = folder.join("run.json.partial");
+    write_whole(&dirs.run_file(&run.ticket), &run.render())
+}
+
+/// Writes `text` as the file at `path`, whole: through `<name>.partial`
+/// beside it, synced then renamed over it, and the folder synced on Unix. A
+/// run file's write and the base check's record's.
+fn write_whole(path: &Path, text: &str) -> io::Result<()> {
+    let (Some(folder), Some(name)) = (path.parent(), path.file_name()) else {
+        return Err(io::Error::other(format!("{}: no folder", path.display())));
+    };
+    fs::create_dir_all(folder)?;
+    let mut partial = name.to_os_string();
+    partial.push(".partial");
+    let partial = folder.join(partial);
     let mut file = File::create(&partial)?;
-    file.write_all(run.render().as_bytes())?;
+    file.write_all(text.as_bytes())?;
     file.sync_all()?;
     drop(file);
-    rename_over(&partial, &path)?;
+    rename_over(&partial, path)?;
     #[cfg(unix)]
-    File::open(&folder)?.sync_all()?;
+    File::open(folder)?.sync_all()?;
     Ok(())
 }
 
@@ -487,6 +487,12 @@ fn branch_head(git: &Git, checkout: &Path, branch: &str) -> Result<Option<String
             String::from_utf8_lossy(&out.stderr).trim()
         )),
     }
+}
+
+/// The commit `refs/heads/<branch>` is at in `checkout`, `None` when there is
+/// no such branch: the base branch's, for a base check's record (OWL-660).
+pub fn branch_tip(git: &Git, checkout: &Path, branch: &str) -> Result<Option<String>, String> {
+    branch_head(git, checkout, branch)
 }
 
 fn actual(git: &Git, checkout: &Path, ticket: &TicketId) -> Result<Actual, String> {
@@ -730,6 +736,88 @@ pub fn remove_entry(checkout: &Path, name: &str) -> io::Result<()> {
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
         Err(error) => Err(error),
     }
+}
+
+/// The names of the entries of `checkout`'s common git folder that belong to
+/// the worktree at `worktree` (OWL-660): those whose `gitdir` file, which git
+/// writes when it adds a worktree, names a `.git` in a folder of the same
+/// name as `worktree`, inside the same folder as `worktree` once both are
+/// resolved by the file system. Git writes that path in its own form, its
+/// links resolved on macOS (`/private/var`), long names where the runner may
+/// hold a short one on Windows (`RUNNER~1`), so the folders are compared
+/// resolved, never as texts. A scan of those small files, read and never
+/// followed through a link, so a base check finds what an earlier one left
+/// without `git worktree prune`, even when no record names its entry or its
+/// folder is gone; an entry whose `gitdir` names any other worktree is never
+/// one of them. A folder of entries that cannot be listed, or a `worktree`
+/// whose folder cannot be resolved, gives none.
+pub fn entries_of(checkout: &Path, worktree: &Path) -> Vec<String> {
+    let (Some(folder), Some(name)) = (worktree.parent(), worktree.file_name()) else {
+        return Vec::new();
+    };
+    let Ok(folder) = fs::canonicalize(folder) else {
+        return Vec::new();
+    };
+    let Ok(listing) = fs::read_dir(checkout.join(".git").join("worktrees")) else {
+        return Vec::new();
+    };
+    let ours = |named: &Path| {
+        let worktree = named
+            .parent()
+            .filter(|_| named.file_name() == Some(std::ffi::OsStr::new(".git")));
+        worktree.and_then(Path::file_name) == Some(name)
+            && worktree
+                .and_then(Path::parent)
+                .and_then(|parent| fs::canonicalize(parent).ok())
+                .is_some_and(|parent| parent == folder)
+    };
+    let mut found: Vec<String> = listing
+        .filter_map(Result::ok)
+        .filter_map(|entry| {
+            let name = entry.file_name().to_str()?.to_owned();
+            let named = read_capped(&entry.path().join("gitdir")).ok()?;
+            let named = PathBuf::from(named.trim_end_matches(['\n', '\r']));
+            ours(&named).then_some(name)
+        })
+        .collect();
+    found.sort();
+    found
+}
+
+/// The base check's record (OWL-660; architecture section 5, "A broken
+/// base", "Its record"): `None` when it has none, or when it cannot be read
+/// or does not parse. Unlike a run file's, a record lost reads as none: it
+/// only leaves out less of a sibling's check, since the base lock alone
+/// tells a check running, and the next base check writes it anew.
+pub fn read_base_run(dirs: &ProjectDirs) -> Option<BaseRun> {
+    let path = dirs.base_run_file();
+    let text = read_capped(&path).ok()?;
+    BaseRun::parse(&text).ok()
+}
+
+/// Writes the base check's record, under the base lock its caller holds:
+/// the base branch at `tip` (none once deleted) and the worktree's entry
+/// `entry`, its generation raised past the one read, so a sibling whose
+/// snapshot is older reads the check as ended since.
+pub fn write_base_run(
+    dirs: &ProjectDirs,
+    _lock: &BaseLock,
+    tip: Option<String>,
+    entry: Option<String>,
+) -> io::Result<()> {
+    // Past the one read and the clock's milliseconds: a record that could not
+    // be read never comes back at a generation a sibling marked.
+    let now = u64::try_from(Timestamp::now().as_millisecond()).unwrap_or(0);
+    let generation = read_base_run(dirs)
+        .map_or(0, |run| run.generation + 1)
+        .max(now);
+    let run = BaseRun {
+        generation,
+        tip,
+        entry,
+        ..BaseRun::default()
+    };
+    write_whole(&dirs.base_run_file(), &run.render())
 }
 
 /// The guard of a write of a ticket's ref through its run file
@@ -1017,16 +1105,36 @@ pub struct Marks(BTreeMap<PathBuf, u64>);
 /// What a run of `own` is told of the project's other tickets for its check
 /// (architecture section 8, "The check among steps"): [`Siblings::marks`]
 /// just before its snapshot, [`Siblings::concurrent`] at each of the check's
-/// two reads.
+/// two reads. Since OWL-660 a step's base check is one more of them, read
+/// from the base lock and its record.
 #[derive(Clone, Copy, Debug)]
 pub struct Siblings<'a> {
     dirs: &'a ProjectDirs,
     own: &'a TicketId,
+    /// Whether the base check is one of them: not for the base check's own
+    /// check ([`Siblings::for_base_check`]).
+    base: bool,
 }
 
 impl<'a> Siblings<'a> {
     pub fn new(dirs: &'a ProjectDirs, own: &'a TicketId) -> Self {
-        Self { dirs, own }
+        Self {
+            dirs,
+            own,
+            base: true,
+        }
+    }
+
+    /// What the base check run from `ticket`'s step is told (OWL-660): every
+    /// other ticket, not the base check itself. `ticket`'s branch, ref and
+    /// entry are compared whole: its step is in the check, and every other
+    /// write of them takes its lock, which that step holds.
+    pub fn for_base_check(dirs: &'a ProjectDirs, ticket: &'a TicketId) -> Self {
+        Self {
+            dirs,
+            own: ticket,
+            base: false,
+        }
     }
 
     /// The other tickets' run files, `own`'s left out; one that cannot be
@@ -1041,14 +1149,20 @@ impl<'a> Siblings<'a> {
             .collect()
     }
 
-    /// Each other ticket's generation, read just before the snapshot.
+    /// Each other ticket's generation, read just before the snapshot, and
+    /// the base check's record's when it reads.
     pub fn marks(&self) -> Result<Marks, String> {
-        Ok(Marks(
-            self.others()?
-                .into_iter()
-                .map(|(dir, run)| (dir, run.generation))
-                .collect(),
-        ))
+        let mut marks: BTreeMap<PathBuf, u64> = self
+            .others()?
+            .into_iter()
+            .map(|(dir, run)| (dir, run.generation))
+            .collect();
+        if self.base
+            && let Some(run) = read_base_run(self.dirs)
+        {
+            marks.insert(self.dirs.base_dir(), run.generation);
+        }
+        Ok(Marks(marks))
     }
 
     /// One read of the other tickets: one whose lock is held is in flight,
@@ -1090,7 +1204,38 @@ impl<'a> Siblings<'a> {
                 .ended
                 .insert(reference, values(&run.ticket_ref, &run.writing.ticket_ref));
         }
+        if self.base {
+            self.base_check(marks, &mut known)?;
+        }
         Ok(known)
+    }
+
+    /// One read of the base check (OWL-660; architecture section 5, "A
+    /// broken base", "Its record"), as of a ticket: while the base lock is
+    /// held, the base branch is in flight and the entry its record names is
+    /// left out; once it is free and the record's generation moved since
+    /// `marks`, the branch must be at the recorded commit or gone, deleting
+    /// it being a check's end, and the entry is left out. A record that
+    /// does not read gives no entry and no commit: less is left out.
+    fn base_check(&self, marks: &Marks, known: &mut Concurrent) -> Result<(), String> {
+        let held = self
+            .dirs
+            .base_lock_held()
+            .map_err(|e| format!("the base lock: {e}"))?;
+        let run = read_base_run(self.dirs);
+        let moved = marks.0.get(&self.dirs.base_dir()) != run.as_ref().map(|run| &run.generation);
+        if !held && !moved {
+            return Ok(());
+        }
+        let branch = format!("refs/heads/{BASE_BRANCH}");
+        let (tip, entry) = run.map_or((None, None), |run| (run.tip, run.entry));
+        known.entries.extend(entry);
+        if held {
+            known.running.insert(branch);
+        } else {
+            known.ended.insert(branch, BTreeSet::from([tip, None]));
+        }
+        Ok(())
     }
 }
 

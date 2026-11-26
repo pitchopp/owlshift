@@ -791,16 +791,12 @@ impl Watch<'_> {
                 ]),
             ),
             Ok(Some(StepEnd::NoSlot)) => ("refresh_run_cap", Data::new()),
+            // No refresh waits for a base check since OWL-660: the
+            // `refresh_base_check` wait is no longer told.
             Ok(Some(StepEnd::Busy))
                 if self.stopping().is_none() && memory.operator_pause.is_none() =>
             {
-                match &memory.base_due {
-                    Some((due, _)) => (
-                        "refresh_base_check",
-                        data([("tickets", json!([due.as_str()]))]),
-                    ),
-                    None => ("refresh_busy", Data::new()),
-                }
+                ("refresh_busy", Data::new())
             }
             Ok(_) => return,
         };

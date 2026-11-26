@@ -193,6 +193,9 @@ pub const RUN_FORMAT: u32 = 1;
 /// The format version of a run's obligation (`unverified/<ticket>-<run>` in
 /// a project's folder, OWL-400).
 pub const OBLIGATION_FORMAT: u32 = 1;
+/// The format version of what the runner knows of a base check's branch and
+/// worktree entry (`base/run.json` in a project's folder, OWL-660).
+pub const BASE_RUN_FORMAT: u32 = 1;
 /// The format version of the work outside Owlshift a pass read, handed to a
 /// dispatch's step (`outside-<attempt>.json` in a ticket's folder, OWL-401).
 pub const OUTSIDE_FORMAT: u32 = 1;

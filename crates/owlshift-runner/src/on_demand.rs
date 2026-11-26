@@ -824,10 +824,10 @@ pub enum Stop {
     /// The Build is held for its base (OWL-418): `commit`, the commit it is
     /// configured at, fails `command` in a fresh worktree too, so the
     /// failure is the base's and nothing was counted; or, `pending`, its
-    /// check waits for the other tickets' steps in flight. It goes on once
+    /// check waits for the base check running now (OWL-660). It goes on once
     /// that commit passes. `due`, never with `pending`: the commit is held
-    /// and its check again, or the default branch's newer head's, waits for
-    /// those steps (OWL-431); watch gives both the same priority.
+    /// and its check again, or the default branch's newer head's, waits the
+    /// same way (OWL-431); watch gives both a step once no base check runs.
     BaseHeld {
         ticket: TicketId,
         commit: String,
@@ -1140,8 +1140,8 @@ impl fmt::Display for Stop {
                 write!(
                     f,
                     "Held: {ticket}'s gate failed{failing}, and whether its base {} fails it too \
-                     is checked once no other ticket's step runs; nothing was counted. `owlshift \
-                     watch` checks it then, or run `owlshift continue {ticket}` again.",
+                     is checked once the base check running now ends; nothing was counted. \
+                     `owlshift watch` checks it then, or run `owlshift continue {ticket}` again.",
                     crate::base::short(commit)
                 )
             }

@@ -1274,10 +1274,29 @@ impl Executor {
     /// a credential finding, the snapshot) is an [`ExecutorError`]; the
     /// worktree may then exist.
     pub fn run_gate(&self, spec: &GateSpec<'_>) -> Result<GateRun, ExecutorError> {
+        self.make_gate_worktree(spec)?;
+        self.gate_in(spec, None)
+    }
+
+    /// The fresh worktree of [`Executor::run_gate`], made alone: a base
+    /// check makes it in a section of the project's lock, then runs
+    /// [`Executor::gate_in`] outside it (OWL-660).
+    pub fn make_gate_worktree(&self, spec: &GateSpec<'_>) -> Result<(), ExecutorError> {
         self.agent
             .sandbox_ready()
             .map_err(|e| ExecutorError::Spawn(io::Error::other(e)))?;
-        worktree::create(&self.git, spec.main, spec.worktree, spec.branch, spec.base)?;
+        worktree::create(&self.git, spec.main, spec.worktree, spec.branch, spec.base)
+    }
+
+    /// The gate of [`Executor::run_gate`] in the worktree already made: its
+    /// isolation checked as a run alone's, or, told of `siblings`, among the
+    /// steps in flight, their generations read just before the snapshot
+    /// (OWL-660, a base check beside the steps).
+    pub fn gate_in(
+        &self,
+        spec: &GateSpec<'_>,
+        siblings: Option<&Siblings<'_>>,
+    ) -> Result<GateRun, ExecutorError> {
         let mut paths = self.run_paths(spec.worktree, spec.run_dir)?;
         let temp = run_temp()?;
         paths.temp = Some(temp.path().to_owned());
@@ -1290,6 +1309,7 @@ impl Executor {
         if !findings.is_empty() {
             return Err(ExecutorError::Credentials(findings));
         }
+        let marks = siblings.map(Siblings::marks);
         let before = isolation::Snapshot::take(&self.git, spec.main, spec.worktree, spec.branch)
             .map_err(|e| ExecutorError::Snapshot(e.to_string()))?;
         let report = self.project_gate(
@@ -1299,8 +1319,19 @@ impl Executor {
             (spec.setup, spec.commands),
             spec.run_dir,
         );
-        let violations = gate_violations(&report, || {
-            before.check(&self.git, spec.main, spec.worktree, spec.branch)
+        let violations = gate_violations(&report, || match (siblings, &marks) {
+            (Some(siblings), Some(marks)) => {
+                let read = || {
+                    marks
+                        .as_ref()
+                        .map_err(Clone::clone)
+                        .and_then(|marks| siblings.concurrent(marks))
+                };
+                before
+                    .check_among(&self.git, spec.main, spec.worktree, spec.branch, &read)
+                    .violations
+            }
+            _ => before.check(&self.git, spec.main, spec.worktree, spec.branch),
         });
         Ok(GateRun { report, violations })
     }
@@ -1334,7 +1365,25 @@ impl Executor {
         worktree: &Path,
         branch: &str,
     ) -> Result<(), ExecutorError> {
-        worktree::discard(&self.git, main, worktree, branch)
+        worktree::discard(&self.git, main, worktree, branch, worktree::Forget::Prune)
+    }
+
+    /// [`Executor::discard_worktree`] without `git worktree prune`: the
+    /// entries that name `worktree` are removed by name, so steps in flight
+    /// keep the entries their checks read (OWL-660, a base check's).
+    pub fn discard_own_worktree(
+        &self,
+        main: &Path,
+        worktree: &Path,
+        branch: &str,
+    ) -> Result<(), ExecutorError> {
+        worktree::discard(
+            &self.git,
+            main,
+            worktree,
+            branch,
+            worktree::Forget::OwnEntries,
+        )
     }
 
     /// The commit `base` names in `main`, read as a run's base is: a full
