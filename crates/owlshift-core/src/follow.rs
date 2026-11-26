@@ -144,18 +144,12 @@ pub struct Read {
     pub checks: Vec<CheckRead>,
 }
 
-/// What `delivery.json` says of Owlshift's pushes, and what the runner read
-/// of the ticket's overlaps (OWL-449).
+/// What `delivery.json` says of Owlshift's pushes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Followed<'a> {
     pub pushed: &'a str,
     pub pushing: Option<&'a str>,
     pub rebased_onto: Option<&'a str>,
-    /// The base branch's head, when it changes a path one of the ticket's
-    /// overlaps names and the pushed head does not contain it (architecture
-    /// section 5, "Tolerated overlap", "The refresh"): the runner's reading,
-    /// from git. `None` otherwise.
-    pub overlap: Option<&'a str>,
     /// The runner's re-run kept in `delivery.json` (OWL-513), of whatever
     /// head: only one of the read's head counts.
     pub rerun: Option<RerunMark<'a>>,
@@ -328,16 +322,6 @@ fn act(
             };
         }
         Mergeable::Mergeable => {}
-    }
-    // A base that changes a path an overlap names, before the checks: a
-    // merge git makes cleanly does not prove two changes agree (OWL-449).
-    if let Some(onto) = followed.overlap
-        && followed.rebased_onto != Some(onto)
-    {
-        return Action::Rebase {
-            onto: onto.to_owned(),
-            cause: RebaseCause::Overlap,
-        };
     }
     // The runner's re-run of this head: its jobs' first attempts give way
     // to their newer ones, and read as running until those show.
@@ -708,6 +692,13 @@ pub struct MergeFacts<'a> {
     /// reply, a human review comment. Never a follow-up the ticket owes on
     /// the tracker (OWL-501), which is filed after the merge if need be.
     pub something_due: bool,
+    /// The base head an owed overlap refresh would rebase onto (OWL-654;
+    /// architecture section 5, "Tolerated overlap", "The refresh"): the base
+    /// changes a path one of the ticket's overlaps names since the push, as
+    /// the runner read it from git. `None` when no refresh is owed. Read by
+    /// [`overlap_refresh`], and by [`merge_due`], which waits on
+    /// [`MergeBlocker::OverlapOwed`] while it is set.
+    pub overlap: Option<&'a str>,
 }
 
 /// Why [`merge_due`] does not merge at this pass.
@@ -741,6 +732,9 @@ pub enum MergeBlocker {
     Draft,
     /// Something is due or running first.
     SomethingDue,
+    /// An overlap refresh is owed ([`MergeFacts::overlap`], OWL-654): it
+    /// runs first, and its rebased head is read green twice again.
+    OverlapOwed,
     /// The base Owlshift pushed onto is not known: no merge, and nothing
     /// more is known about the base.
     BaseUnknown,
@@ -817,50 +811,22 @@ pub fn merge_due(policy: &MergePolicy<'_>, facts: &MergeFacts<'_>, read: &Read) 
 /// The first condition of [`merge_due`] that does not hold, in the design's
 /// order.
 fn blocker(policy: &MergePolicy<'_>, facts: &MergeFacts<'_>, read: &Read) -> Option<MergeBlocker> {
-    let (green, no_checks) = match facts.decision {
-        Decision::Follow {
-            adopt: false,
-            action: Action::Green,
-        } => (true, false),
-        Decision::Follow {
-            adopt: false,
-            action: Action::NoChecks,
-        } => (false, true),
-        _ => (false, false),
-    };
-    if !(green || no_checks) || read.state != PrState::Open || read.head != facts.pushed {
-        return Some(MergeBlocker::NotGreen);
+    if let Some(blocker) = not_green(facts, read) {
+        return Some(blocker);
     }
-    // A head with no check counts as green only once none came for
-    // `NO_CHECKS_AFTER` (OWL-657): until then its checks may register.
-    let first_read = |after: Duration| {
-        facts
-            .first_green
-            .is_some_and(|first| first.head == facts.pushed && first.ago >= after)
-    };
-    if no_checks && !first_read(NO_CHECKS_AFTER) {
-        return Some(MergeBlocker::NoChecksYet);
-    }
+    let (green, no_checks) = green_or_no_checks(facts);
+    let first_read = |after: Duration| first_read(facts, after);
     match policy.switch {
         MergeSwitch::Never => return Some(MergeBlocker::SwitchOff),
         _ if facts.excluded => return Some(MergeBlocker::Excluded),
         MergeSwitch::Labeled if !facts.labeled => return Some(MergeBlocker::Unlabeled),
         MergeSwitch::Labeled | MergeSwitch::All => {}
     }
-    if !facts.at_review {
-        return Some(MergeBlocker::StageMoved);
-    }
-    if let Some((_, blocker)) = held_question(policy.gate, facts.questions) {
+    if let Some(blocker) = otherwise_ready(policy.gate, facts, QuestionHold::Merge) {
         return Some(blocker);
     }
-    if facts.person_steps > 0 {
-        return Some(MergeBlocker::PersonSteps(facts.person_steps));
-    }
-    if facts.draft {
-        return Some(MergeBlocker::Draft);
-    }
-    if facts.something_due {
-        return Some(MergeBlocker::SomethingDue);
+    if facts.overlap.is_some() {
+        return Some(MergeBlocker::OverlapOwed);
     }
     match facts.base_at_push {
         None => return Some(MergeBlocker::BaseUnknown),
@@ -886,6 +852,126 @@ fn blocker(policy: &MergePolicy<'_>, facts: &MergeFacts<'_>, read: &Read) -> Opt
         return base_hold(facts.base_head, facts.base_checks, &read.checks);
     }
     None
+}
+
+/// Whether the read decided [`Action::Green`], or [`Action::NoChecks`]
+/// (OWL-657), on a head Owlshift did not adopt.
+fn green_or_no_checks(facts: &MergeFacts<'_>) -> (bool, bool) {
+    match facts.decision {
+        Decision::Follow {
+            adopt: false,
+            action: Action::Green,
+        } => (true, false),
+        Decision::Follow {
+            adopt: false,
+            action: Action::NoChecks,
+        } => (false, true),
+        _ => (false, false),
+    }
+}
+
+/// Whether Owlshift's pushed head was first read green at least `after` ago.
+fn first_read(facts: &MergeFacts<'_>, after: Duration) -> bool {
+    facts
+        .first_green
+        .is_some_and(|first| first.head == facts.pushed && first.ago >= after)
+}
+
+/// [`MergeBlocker::NotGreen`] unless the read decided [`Action::Green`], or
+/// [`Action::NoChecks`] (OWL-657), on Owlshift's pushed head of an open pull
+/// request; [`MergeBlocker::NoChecksYet`] while a head with no check has not
+/// been read so for [`NO_CHECKS_AFTER`], since its checks may still register
+/// (OWL-657): merge on green's first condition, and an owed refresh's
+/// (OWL-654).
+fn not_green(facts: &MergeFacts<'_>, read: &Read) -> Option<MergeBlocker> {
+    let (green, no_checks) = green_or_no_checks(facts);
+    if !(green || no_checks) || read.state != PrState::Open || read.head != facts.pushed {
+        return Some(MergeBlocker::NotGreen);
+    }
+    if no_checks && !first_read(facts, NO_CHECKS_AFTER) {
+        return Some(MergeBlocker::NoChecksYet);
+    }
+    None
+}
+
+/// Which questions hold in [`otherwise_ready`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum QuestionHold {
+    /// The runner's merge: every question [`held_question`] keeps for a
+    /// person, whoever settled it.
+    Merge,
+    /// An owed refresh (OWL-654): only a question still waiting for its
+    /// decider. One its decider answered, or the resolver decided, holds no
+    /// refresh: a person merges then, and the refresh runs once the pull
+    /// request is ready for that person.
+    Refresh,
+}
+
+/// The first of merge on green's conditions after the switch that does not
+/// hold, in the design's order: the stage, a question, a person's steps, a
+/// draft, something due first. Shared by [`merge_due`] and
+/// [`overlap_refresh`], which differ in the questions that hold (`hold`).
+fn otherwise_ready(
+    gate: &GatePolicy,
+    facts: &MergeFacts<'_>,
+    hold: QuestionHold,
+) -> Option<MergeBlocker> {
+    if !facts.at_review {
+        return Some(MergeBlocker::StageMoved);
+    }
+    let held = match hold {
+        QuestionHold::Merge => held_question(gate, facts.questions).map(|(_, blocker)| blocker),
+        QuestionHold::Refresh => {
+            let open: Vec<MergeQuestion> = facts
+                .questions
+                .iter()
+                .filter(|question| question.settled == Settled::Open)
+                .cloned()
+                .collect();
+            held_question(gate, &open).map(|(_, blocker)| blocker)
+        }
+    };
+    if let Some(blocker) = held {
+        return Some(blocker);
+    }
+    if facts.person_steps > 0 {
+        return Some(MergeBlocker::PersonSteps(facts.person_steps));
+    }
+    if facts.draft {
+        return Some(MergeBlocker::Draft);
+    }
+    if facts.something_due {
+        return Some(MergeBlocker::SomethingDue);
+    }
+    None
+}
+
+/// An overlap refresh owed at this pass ([`overlap_refresh`]): the base head
+/// it rebases onto, and what it waits for, `None` when it runs now.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RefreshOwed<'a> {
+    pub onto: &'a str,
+    pub wait: Option<MergeBlocker>,
+}
+
+/// Whether the overlap refresh `facts.overlap` names runs at this pass
+/// (OWL-654; architecture section 5, "Tolerated overlap", "The refresh"):
+/// `None` when none is owed; else the refresh, which waits for the first
+/// condition that does not hold, as merge on green's order reads them: a
+/// green read of Owlshift's push, the review stage, a question still
+/// waiting for its decider, a person's steps, a draft, something due first.
+/// The switch, the merge label and the exclusion label are never read:
+/// whoever merges, the refresh runs once the pull request is otherwise
+/// ready (decided on 2026-11-26, Q1), at its first green read (Q2).
+pub fn overlap_refresh<'a>(
+    gate: &GatePolicy,
+    facts: &MergeFacts<'a>,
+    read: &Read,
+) -> Option<RefreshOwed<'a>> {
+    let onto = facts.overlap?;
+    let wait =
+        not_green(facts, read).or_else(|| otherwise_ready(gate, facts, QuestionHold::Refresh));
+    Some(RefreshOwed { onto, wait })
 }
 
 /// What the base head's own checks hold (OWL-521; architecture section 5,
@@ -987,6 +1073,7 @@ impl MergeBlocker {
             | Self::StageMoved
             | Self::Draft
             | Self::SomethingDue
+            | Self::OverlapOwed
             | Self::BaseUnknown
             | Self::BaseMoved
             | Self::GreenOnce
@@ -1097,7 +1184,6 @@ mod tests {
             pushed: PUSHED,
             pushing: None,
             rebased_onto: None,
-            overlap: None,
             rerun: None,
         }
     }
@@ -1191,60 +1277,28 @@ mod tests {
 
     /// A conflict comes before the checks; a second rebase onto the base
     /// head the last one used is a failed run of that rebase.
-    /// OWL-449: a base that changes a path an overlap names gets a refresh
-    /// rebase before the checks are read, red or green, once per base head;
-    /// a conflict still comes first.
+    /// OWL-654: the table no longer refreshes an overlap before the checks
+    /// are read; a mergeable read waits for its checks or is green, and the
+    /// owed refresh is merge on green's to decide (`overlap_refresh`).
     #[test]
-    fn a_base_changing_an_overlap_path_is_a_refresh_rebase() {
-        let moved = Followed {
-            overlap: Some("b3"),
-            ..followed()
-        };
-        let refresh = Action::Rebase {
-            onto: "b3".to_owned(),
-            cause: RebaseCause::Overlap,
-        };
-        for checks in [
-            &[("ci", Passed)][..],
-            &[("ci", CodeFailure)],
-            &[("ci", Pending)],
-            &[],
-        ] {
-            let r = read(Mergeable::Mergeable, checks);
-            assert_eq!(
-                decide(&r, moved, None, None),
-                Decision::Follow {
-                    adopt: false,
-                    action: refresh.clone()
-                },
-                "{checks:?}"
-            );
-        }
-        assert!(RebaseCause::Overlap.refresh() && !RebaseCause::Conflict.refresh());
-        let conflicting = read(Mergeable::Conflicting, &[("ci", Passed)]);
+    fn a_base_changing_an_overlap_path_no_longer_rebases_before_the_checks() {
+        let pending = read(Mergeable::Mergeable, &[("ci", Pending)]);
         assert_eq!(
-            decide(&conflicting, moved, None, None),
+            decide(&pending, followed(), None, None),
             Decision::Follow {
                 adopt: false,
-                action: Action::NeedsBase
+                action: Action::WaitChecks
             }
         );
-        let used = Followed {
-            rebased_onto: Some("b3"),
-            ..moved
-        };
+        let green = read(Mergeable::Mergeable, &[("ci", Passed)]);
         assert_eq!(
-            decide(
-                &read(Mergeable::Mergeable, &[("ci", Passed)]),
-                used,
-                None,
-                None
-            ),
+            decide(&green, followed(), None, None),
             Decision::Follow {
                 adopt: false,
                 action: Action::Green
             }
         );
+        assert!(RebaseCause::Overlap.refresh() && !RebaseCause::Conflict.refresh());
     }
 
     #[test]
@@ -1783,6 +1837,7 @@ mod tests {
                 at_review: true,
                 draft: false,
                 something_due: false,
+                overlap: None,
             }
         }
 
@@ -1937,6 +1992,27 @@ mod tests {
                     },
                     green_read(),
                     SomethingDue,
+                ),
+                // OWL-654: an owed refresh, before the base's conditions.
+                (
+                    MergeSwitch::All,
+                    MergeFacts {
+                        overlap: Some(other),
+                        base_at_push: None,
+                        ..base
+                    },
+                    green_read(),
+                    OverlapOwed,
+                ),
+                (
+                    MergeSwitch::All,
+                    MergeFacts {
+                        overlap: Some(other),
+                        base_at_push: Some(other),
+                        ..base
+                    },
+                    green_read(),
+                    OverlapOwed,
                 ),
                 (
                     MergeSwitch::All,
@@ -2330,7 +2406,6 @@ mod tests {
                 pushed: HEAD,
                 pushing: None,
                 rebased_onto: None,
-                overlap: None,
                 rerun: None,
             };
             let base = BaseRead {
@@ -2647,6 +2722,182 @@ mod tests {
                     }
                 }
             }
+        }
+
+        const ONTO: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+
+        /// What [`overlap_refresh`] decides on `facts`, with a refresh owed
+        /// onto [`ONTO`].
+        fn refresh<'a>(gate: &GatePolicy, facts: MergeFacts<'a>, read: &Read) -> RefreshOwed<'a> {
+            let owed = MergeFacts {
+                overlap: Some(ONTO),
+                ..facts
+            };
+            overlap_refresh(gate, &owed, read).expect("owed")
+        }
+
+        /// OWL-654: none is owed without `overlap`; one owed runs at a green
+        /// read with nothing pending, onto the head it names, whatever the
+        /// base conditions merge on green reads after it.
+        #[test]
+        fn overlap_refresh_runs_on_a_green_read_with_nothing_pending() {
+            let gate = gate(DelegationLevel::Discoverable);
+            assert_eq!(
+                overlap_refresh(&gate, &facts(&GREEN, &[]), &green_read()),
+                None
+            );
+            let unknown = MergeFacts {
+                base_at_push: None,
+                first_green: None,
+                ..facts(&GREEN, &[])
+            };
+            assert_eq!(
+                refresh(&gate, unknown, &green_read()),
+                RefreshOwed {
+                    onto: ONTO,
+                    wait: None
+                }
+            );
+        }
+
+        /// OWL-654: an owed refresh waits for running or red checks, then
+        /// for the conditions merge on green reads after the switch, in its
+        /// order, which `merge_due`'s table pins.
+        #[test]
+        fn overlap_refresh_waits_for_each_condition_in_order() {
+            use MergeBlocker::*;
+            let gate = gate(DelegationLevel::Discoverable);
+            let running = Decision::Follow {
+                adopt: false,
+                action: Action::WaitChecks,
+            };
+            let red = Decision::Follow {
+                adopt: false,
+                action: Action::Fix {
+                    overdue: Vec::new(),
+                },
+            };
+            let open = [question("billing", Settled::Open)];
+            let secure = [question("security", Settled::Open)];
+            let cases: Vec<(MergeFacts<'_>, MergeBlocker)> = vec![
+                (facts(&running, &open), NotGreen),
+                (facts(&red, &[]), NotGreen),
+                (
+                    MergeFacts {
+                        at_review: false,
+                        ..facts(&GREEN, &open)
+                    },
+                    StageMoved,
+                ),
+                (
+                    MergeFacts {
+                        person_steps: 1,
+                        ..facts(&GREEN, &open)
+                    },
+                    Unanswered("billing".to_owned()),
+                ),
+                (facts(&GREEN, &secure), Security("security".to_owned())),
+                (
+                    MergeFacts {
+                        person_steps: 1,
+                        draft: true,
+                        ..facts(&GREEN, &[])
+                    },
+                    PersonSteps(1),
+                ),
+                (
+                    MergeFacts {
+                        draft: true,
+                        something_due: true,
+                        ..facts(&GREEN, &[])
+                    },
+                    Draft,
+                ),
+                (
+                    MergeFacts {
+                        something_due: true,
+                        ..facts(&GREEN, &[])
+                    },
+                    SomethingDue,
+                ),
+            ];
+            for (facts, blocker) in cases {
+                assert_eq!(
+                    refresh(&gate, facts, &green_read()).wait,
+                    Some(blocker.clone()),
+                    "{blocker:?}"
+                );
+            }
+        }
+
+        /// OWL-654, decided Q1: whoever merges, the refresh runs once the
+        /// pull request is otherwise ready; the switch is no input, and the
+        /// labels hold merge on green alone.
+        #[test]
+        fn overlap_refresh_ignores_the_switch_the_label_and_exclusion() {
+            let gate = gate(DelegationLevel::Discoverable);
+            for facts in [
+                MergeFacts {
+                    labeled: false,
+                    ..facts(&GREEN, &[])
+                },
+                MergeFacts {
+                    excluded: true,
+                    ..facts(&GREEN, &[])
+                },
+            ] {
+                assert_eq!(refresh(&gate, facts, &green_read()).wait, None);
+                // Merge on green still holds on the label or the exclusion.
+                assert_eq!(
+                    due(MergeSwitch::Labeled, &gate, &facts, &green_read()),
+                    MergeDue::Wait(if facts.excluded {
+                        MergeBlocker::Excluded
+                    } else {
+                        MergeBlocker::Unlabeled
+                    })
+                );
+            }
+        }
+
+        /// OWL-654: a question its decider answered, a `security` one
+        /// included, or one the resolver decided, holds no refresh, while
+        /// merge on green still holds on it.
+        #[test]
+        fn a_question_settled_by_its_decider_or_the_resolver_holds_no_refresh() {
+            let gate = gate(DelegationLevel::Discoverable);
+            for asked in [
+                [question("security", Settled::Decider)],
+                [question("billing", Settled::Resolver)],
+            ] {
+                let facts = facts(&GREEN, &asked);
+                assert_eq!(refresh(&gate, facts, &green_read()).wait, None);
+                assert!(
+                    matches!(
+                        due(MergeSwitch::All, &gate, &facts, &green_read()),
+                        MergeDue::Wait(
+                            MergeBlocker::Security(_) | MergeBlocker::ResolverDecided(_)
+                        )
+                    ),
+                    "{asked:?}"
+                );
+            }
+        }
+
+        /// OWL-654: merge on green waits on an owed refresh before a moved
+        /// base's own reading, and no person lifts that wait.
+        #[test]
+        fn merge_due_waits_on_an_owed_refresh_before_the_moved_base() {
+            let gate = gate(DelegationLevel::Discoverable);
+            let moved = MergeFacts {
+                base_head: ONTO,
+                overlap: Some(ONTO),
+                ..facts(&GREEN, &[])
+            };
+            assert_eq!(
+                due(MergeSwitch::All, &gate, &moved, &green_read()),
+                MergeDue::Wait(MergeBlocker::OverlapOwed)
+            );
+            assert_eq!(MergeBlocker::OverlapOwed.kept_for_a_person(), None);
         }
     }
 }

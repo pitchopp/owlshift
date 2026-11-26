@@ -167,6 +167,7 @@ impl Watch<'_> {
         let Some(pushed) = delivery.pushed.as_deref() else {
             return;
         };
+        let owed = memory.refreshes.due(ticket);
         let mut facts = MergeFacts {
             decision: &seen.decision,
             pushed,
@@ -196,6 +197,8 @@ impl Watch<'_> {
             // pin) does not say it.
             draft: false,
             something_due: merge::owes_first(delivery),
+            // An owed overlap refresh (OWL-654), read at this pass.
+            overlap: owed.as_deref(),
         };
         let read = seen.merge_read();
         let mut due = core::merge_due(&policy, &facts, &read);

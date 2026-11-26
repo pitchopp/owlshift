@@ -1342,11 +1342,9 @@ impl Watch<'_> {
             return;
         };
         let now = (on_demand.clock)();
-        let overlap = memory.refreshes.due(ticket);
-        let (look, warnings) =
-            memory
-                .following
-                .look(on_demand.forge, ticket, delivery, now, overlap.as_deref());
+        let (look, warnings) = memory
+            .following
+            .look(on_demand.forge, ticket, delivery, now);
         for warning in warnings {
             sink.emit(ticket, None, EventKind::Warning, warning);
         }

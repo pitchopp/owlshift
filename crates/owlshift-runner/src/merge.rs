@@ -556,6 +556,8 @@ pub(crate) fn hold_words(blocker: &MergeBlocker, question: Option<&MergeQuestion
         MergeBlocker::SomethingDue => {
             "the ticket owes its DELIVERY report on the tracker first".to_owned()
         }
+        MergeBlocker::OverlapOwed => "its base changed a path it shares with another ticket since                                       the push, so a refresh rebase onto the base comes first,                                       then two green reads of the rebased head"
+            .to_owned(),
         MergeBlocker::BaseUnknown => "the base of Owlshift's last push is not known".to_owned(),
         MergeBlocker::BaseMoved => "its base moved since the push on a path it changes, or in a \
                                     way that could not be read, so a refresh rebase comes first"
@@ -636,7 +638,8 @@ pub(crate) fn wait_data(number: u64, head: &str, reason: &str, fields: Data) -> 
 /// The wait merge on green tells for `blocker`, one no person needs to lift
 /// and no refusal tells (OWL-499): its reason and fields, `merge_owes_first`
 /// the DELIVERY report owed ([`owes_first`], OWL-501). `None` for a hold
-/// kept for a person, a review the last read refuses, and the switch off.
+/// kept for a person, a review the last read refuses, the switch off, and
+/// an owed overlap refresh, whose own wait is told (`refresh_owed`, OWL-654).
 pub(crate) fn blocker_wait(blocker: &MergeBlocker) -> Option<(&'static str, Data)> {
     let reason = match blocker {
         MergeBlocker::SomethingDue => {
@@ -671,6 +674,7 @@ pub(crate) fn blocker_wait(blocker: &MergeBlocker) -> Option<(&'static str, Data
         | MergeBlocker::ResolverDecided(_)
         | MergeBlocker::PersonSteps(_)
         | MergeBlocker::CiSkipped
+        | MergeBlocker::OverlapOwed
         | MergeBlocker::ReviewRequired
         | MergeBlocker::ChangesRequested => return None,
     };
@@ -870,6 +874,7 @@ mod tests {
             MergeBlocker::ResolverDecided("money".to_owned()),
             MergeBlocker::CommitsUnread,
             MergeBlocker::CiSkipped,
+            MergeBlocker::OverlapOwed,
             MergeBlocker::ReviewRequired,
             MergeBlocker::ChangesRequested,
         ] {

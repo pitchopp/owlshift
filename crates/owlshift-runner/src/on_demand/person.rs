@@ -137,7 +137,6 @@ impl OnDemand<'_> {
             pr.number,
             &pushed,
             |_| None,
-            None,
             (self.clock)(),
         )
         .map_err(|e| refused("reading the pull request again", e))?;

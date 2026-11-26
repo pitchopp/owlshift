@@ -130,6 +130,7 @@ impl OnDemand<'_> {
                 )
                 .disjoint()
             });
+        let overlap = self.overlap_base(p, delivery);
         // The base head's own checks decide last on a base that moved apart
         // (OWL-521), read as watch reads them.
         let moved_apart =
@@ -169,6 +170,9 @@ impl OnDemand<'_> {
             at_review: stage == tracker.states.review,
             draft,
             something_due: crate::merge::owes_first(delivery),
+            // An owed overlap refresh, as this command's fetch reads it
+            // (OWL-654): `continue` names it, and watch's next pass runs it.
+            overlap: overlap.as_deref(),
         };
         // Green, so open: the read watch's merge pass takes too.
         let read = seen.merge_read();
