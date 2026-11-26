@@ -162,7 +162,7 @@ impl Git {
     }
 
     /// Runs git in `dir` and returns its standard output; a non-zero exit is
-    /// an error carrying the end of its standard error.
+    /// an error carrying the cause from its standard error.
     pub(crate) fn run<S: AsRef<OsStr>>(&self, dir: &Path, args: &[S]) -> Result<Vec<u8>, GitError> {
         self.run_within(dir, args, self.timeout)
     }
@@ -239,7 +239,9 @@ impl Git {
                 format!(
                     "failed with {}: {}",
                     exit_text(code),
-                    tail(&String::from_utf8_lossy(&answer.stderr))
+                    owlshift_adapters::git_stderr::summary(&String::from_utf8_lossy(
+                        &answer.stderr
+                    ))
                 ),
             )),
         }
@@ -281,7 +283,9 @@ impl Git {
                 format!(
                     "failed with {}: {}",
                     exit_text(output.code),
-                    tail(&String::from_utf8_lossy(&output.stderr))
+                    owlshift_adapters::git_stderr::summary(&String::from_utf8_lossy(
+                        &output.stderr
+                    ))
                 ),
             ))
         }
@@ -339,13 +343,6 @@ fn hooks_nowhere() -> String {
         folder = PathBuf::from(format!("{}-{n}", base.display()));
     }
     format!("core.hooksPath={}", folder.display())
-}
-
-/// The last lines of a command's standard error, enough to say why it
-/// failed.
-fn tail(stderr: &str) -> String {
-    let lines: Vec<&str> = stderr.trim().lines().collect();
-    lines[lines.len().saturating_sub(3)..].join(" / ")
 }
 
 /// A git command of the executor's that failed.
@@ -432,6 +429,34 @@ mod tests {
             .find_map(|setting| setting.strip_prefix("core.hooksPath="))
             .unwrap();
         assert!(fs::symlink_metadata(folder).is_err(), "{folder} exists");
+    }
+
+    /// OWL-652: a refused remote's error names its cause, not git's
+    /// boilerplate (live check: `git ls-remote <missing path>`, git 2.54).
+    #[test]
+    fn a_failed_fetch_says_why_and_not_what_git_always_adds() {
+        let tmp = tempfile::tempdir().unwrap();
+        let hermetic = hermetic(tmp.path());
+        let repo = tmp.path().join("repo");
+        fs::create_dir(&repo).unwrap();
+        plain_git(&hermetic, &repo, &["init", "--quiet"], &[]);
+        let missing = tmp.path().join("missing").display().to_string();
+        let error = Git::with_setup("git", hermetic)
+            .run(&repo, &["fetch", "--quiet", &missing])
+            .unwrap_err();
+        assert!(
+            error
+                .detail
+                .contains("does not appear to be a git repository"),
+            "{}",
+            error.detail
+        );
+        assert!(
+            !error.detail.contains("and the repository exists"),
+            "{}",
+            error.detail
+        );
+        assert!(!error.detail.contains('\n'), "{}", error.detail);
     }
 
     /// OWL-197: git's own housekeeping, started by a command of the runner's
