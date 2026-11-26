@@ -17,7 +17,7 @@ use owlshift_contracts::ids::TicketId;
 use owlshift_contracts::refs::{DeliveredPullRequest, Merging, TicketDelivery, TicketQuestions};
 use owlshift_contracts::result::Question;
 use owlshift_contracts::review::TicketPlan;
-use owlshift_core::follow::{MergeBlocker, MergeQuestion, Settled, held_question};
+use owlshift_core::follow::{MergeBlocker, MergeQuestion, Settled, asks_ci_to_skip, held_question};
 use owlshift_core::vocab::{AnswerClass, MergeSwitch};
 
 use crate::answer_check;
@@ -142,13 +142,15 @@ pub(crate) fn switch_at_push(on_demand: &OnDemand<'_>, delivery: &TicketDelivery
 /// Posts the MERGED comment of the runner's merge of `pull_request`,
 /// `merging` saying which head and method, once
 /// ([`Writer::post_merged`]): with `commit`, the merge's own, when GitHub's
-/// answer gave it. A post is a `tracker_write` event.
+/// answer gave it, and `no_checks`, whether no check ran on that head
+/// (OWL-657), `None` for a merge a later read found. A post is a
+/// `tracker_write` event.
 pub(crate) fn tell_merged(
     on_demand: &OnDemand<'_>,
     ticket: &TicketId,
     pull_request: &DeliveredPullRequest,
     merging: &Merging,
-    commit: Option<CommitId>,
+    (commit, no_checks): (Option<CommitId>, Option<bool>),
     sink: &mut EventSink<'_>,
 ) -> Result<(), String> {
     let head = CommitId::new(merging.commit.as_str()).map_err(|e| e.to_string())?;
@@ -158,6 +160,7 @@ pub(crate) fn tell_merged(
         head,
         method: merging.method,
         commit,
+        no_checks,
     };
     let reported = Writer::new(on_demand.tracker)
         .post_merged(&comment)
@@ -181,12 +184,14 @@ pub(crate) fn tell_merged(
 /// The `pr_merged` event of the runner's merge: which pull request, head
 /// and method, and the merge's commit when GitHub's answer gave it; with
 /// `bases`, `base_at_push` and the base head the merge was decided on,
-/// which differ for a merge on a moved base (OWL-520).
+/// which differ for a merge on a moved base (OWL-520); with `no_checks`,
+/// whether no check ran on that head (OWL-657), unknown for a merge a later
+/// read found.
 pub(crate) fn merged_event(
     ticket: &TicketId,
     number: u64,
     merging: &Merging,
-    commit: Option<&CommitId>,
+    (commit, no_checks): (Option<&CommitId>, Option<bool>),
     bases: Option<(&str, &str)>,
     sink: &mut EventSink<'_>,
 ) {
@@ -198,6 +203,9 @@ pub(crate) fn merged_event(
     ]);
     if let Some(commit) = commit {
         event.insert("commit".to_owned(), json!(commit.as_str()));
+    }
+    if let Some(no_checks) = no_checks {
+        event.insert("no_checks".to_owned(), json!(no_checks));
     }
     if let Some((at_push, base)) = bases {
         event.insert("base_at_push".to_owned(), json!(at_push));
@@ -386,6 +394,23 @@ pub(crate) fn person_steps(plan: Option<&TicketPlan>) -> usize {
     plan.map_or(0, TicketPlan::owed_before_merge)
 }
 
+/// Whether a commit `pushed` holds and `base` does not asks CI to skip it
+/// (OWL-657, `owlshift_core::follow::asks_ci_to_skip`), read from every
+/// message of `git log <base>..<pushed>` in `checkout`, which holds both:
+/// merge on green's `ci_skipped` for a head no check ran on.
+pub(crate) fn ci_skipped(
+    git: &Git,
+    checkout: &Path,
+    base: &str,
+    pushed: &str,
+) -> Result<bool, String> {
+    let range = format!("{base}..{pushed}");
+    let messages = git
+        .run(checkout, &["log", "--format=%B", &range, "--"])
+        .map_err(|e| format!("reading the messages of {range}: {e}"))?;
+    Ok(asks_ci_to_skip(&String::from_utf8_lossy(&messages)))
+}
+
 /// Who merges the pull request a command just delivered at `base`, as its
 /// line says it: [`switch_at`], and [`held_at_delivery`] on its ticket's
 /// `questions` (OWL-464).
@@ -401,12 +426,14 @@ pub(crate) fn who_merges(
 /// The `merge_waits` decision event (OWL-464): the green pull request
 /// `number` at `head` waits for a person, for `blocker`, named by its key,
 /// with the question that holds, if one does, and the reason in a person's
-/// words.
+/// words; `no_checks` when no check ran on that head for ten minutes rather
+/// than every one passing (OWL-657).
 pub(crate) fn waits_data(
     number: u64,
     head: &str,
     blocker: &MergeBlocker,
     question: Option<&MergeQuestion>,
+    no_checks: bool,
 ) -> Data {
     let category = match blocker {
         MergeBlocker::Security(category)
@@ -414,7 +441,7 @@ pub(crate) fn waits_data(
         | MergeBlocker::ResolverDecided(category) => Some(category.as_str()),
         _ => None,
     };
-    data([
+    let mut event = data([
         ("watch", json!("merge_waits")),
         ("pull_request", json!(number)),
         ("head", json!(head)),
@@ -423,17 +450,32 @@ pub(crate) fn waits_data(
         ("question", json!(question.map(|question| &question.id))),
         ("round", json!(question.and_then(|question| question.round))),
         ("reason", json!(hold_words(blocker, question))),
-    ])
+    ]);
+    if no_checks {
+        event.insert("no_checks".to_owned(), json!(true));
+    }
+    event
 }
 
-/// Tells the operator that `ticket`'s green pull request `number` waits for
-/// a person, Owlshift not merging it for `reason` (runtime and operations,
-/// "Notifications", OWL-464), then the ticket's link. A line that cannot be
-/// shown is a warning.
+/// How a pull request merge on green would merge stands, in a person's
+/// words: every check passed, or none ran for ten minutes (OWL-657).
+pub(crate) fn standing_words(no_checks: bool) -> &'static str {
+    if no_checks {
+        "has had no check for 10 minutes"
+    } else {
+        "is green"
+    }
+}
+
+/// Tells the operator that `ticket`'s green pull request `number`, or one
+/// no check ran on (`no_checks`, OWL-657), waits for a person, Owlshift not
+/// merging it for `reason` (runtime and operations, "Notifications",
+/// OWL-464), then the ticket's link. A line that cannot be shown is a
+/// warning.
 pub(crate) fn notify_waits(
     on_demand: &OnDemand<'_>,
     ticket: &TicketId,
-    number: u64,
+    (number, no_checks): (u64, bool),
     reason: &str,
     sink: &mut EventSink<'_>,
 ) {
@@ -441,8 +483,9 @@ pub(crate) fn notify_waits(
         return;
     };
     let line = format!(
-        "{ticket}: pull request #{number} is green and waits for a person: Owlshift will not \
-         merge it, as {reason}"
+        "{ticket}: pull request #{number} {} and waits for a person: Owlshift will not merge \
+         it, as {reason}",
+        standing_words(no_checks)
     );
     let line = notify::with_link(line, on_demand.tracker, ticket);
     if let Err(error) = notifier.notify(&line) {
@@ -518,6 +561,15 @@ pub(crate) fn hold_words(blocker: &MergeBlocker, question: Option<&MergeQuestion
                                     way that could not be read, so a refresh rebase comes first"
             .to_owned(),
         MergeBlocker::GreenOnce => "it was read green only once on this head".to_owned(),
+        MergeBlocker::NoChecksYet => {
+            "no check has reported on its head, for less than 10 minutes yet".to_owned()
+        }
+        MergeBlocker::CommitsUnread => {
+            "no check ran on its head, and its commits' messages are not read yet".to_owned()
+        }
+        MergeBlocker::CiSkipped => "no check ran on its head, and a commit of it asks CI to skip \
+                                    it (`[skip ci]` or the like), so nothing tested it"
+            .to_owned(),
         MergeBlocker::BaseUnchecked => {
             "its base moved since the push, and the base head's own checks are not read yet"
                 .to_owned()
@@ -596,6 +648,10 @@ pub(crate) fn blocker_wait(blocker: &MergeBlocker) -> Option<(&'static str, Data
         MergeBlocker::BaseUnknown => "merge_base_unknown",
         MergeBlocker::BaseMoved => "merge_base_moved",
         MergeBlocker::GreenOnce => "merge_green_once",
+        // Told by watch before any read of the merge's facts, with when the
+        // window ends (OWL-657); unread commits are warned of.
+        MergeBlocker::NoChecksYet => "merge_no_checks",
+        MergeBlocker::CommitsUnread => return None,
         // Unchecked after the read: the base moved again meanwhile.
         MergeBlocker::BaseUnchecked => "merge_base_moved",
         MergeBlocker::BaseRed(checks) => {
@@ -614,6 +670,7 @@ pub(crate) fn blocker_wait(blocker: &MergeBlocker) -> Option<(&'static str, Data
         | MergeBlocker::Unanswered(_)
         | MergeBlocker::ResolverDecided(_)
         | MergeBlocker::PersonSteps(_)
+        | MergeBlocker::CiSkipped
         | MergeBlocker::ReviewRequired
         | MergeBlocker::ChangesRequested => return None,
     };
@@ -658,6 +715,11 @@ pub(crate) fn wait_words(reason: &str, data: &Data) -> Option<String> {
              merges it",
         ),
         "merge_not_green" => merge("the head it was read green at is not Owlshift's last push"),
+        "merge_no_checks" => format!(
+            "no check has reported on {pr}'s head yet: if none has by {}, merge on green takes \
+             it as a change no check runs on",
+            text("until").unwrap_or("ten minutes after watch first read it")
+        ),
         "merge_stage_moved" => merge(
             "the ticket is no longer in the project's review state on the tracker; moved back \
              there, it is merged",
@@ -806,11 +868,36 @@ mod tests {
             MergeBlocker::Security("security".to_owned()),
             MergeBlocker::Unanswered("money".to_owned()),
             MergeBlocker::ResolverDecided("money".to_owned()),
+            MergeBlocker::CommitsUnread,
+            MergeBlocker::CiSkipped,
             MergeBlocker::ReviewRequired,
             MergeBlocker::ChangesRequested,
         ] {
             assert_eq!(blocker_wait(&blocker), None, "{blocker:?}");
         }
+        // OWL-657: a head with no check yet is not said to be green, and
+        // the end of its ten minutes is said when watch kept it.
+        let (reason, _) = blocker_wait(&MergeBlocker::NoChecksYet).unwrap();
+        let until = data([("until", json!("2026-11-26T12:17:29Z"))]);
+        assert_eq!(
+            wait_words(reason, &wait_data(7, "p", reason, until)).unwrap(),
+            "no check has reported on pull request #7's head yet: if none has by \
+             2026-11-26T12:17:29Z, merge on green takes it as a change no check runs on"
+        );
+        let held = waits_data(7, "p", &MergeBlocker::CiSkipped, None, true);
+        assert_eq!(
+            (&held["blocker"], &held["no_checks"]),
+            (&json!("skip_ci"), &json!(true))
+        );
+        assert!(
+            held["reason"]
+                .as_str()
+                .unwrap()
+                .contains("a commit of it asks CI to skip it"),
+            "{held:?}"
+        );
+        let green = waits_data(7, "p", &MergeBlocker::Unlabeled, None, false);
+        assert_eq!(green.get("no_checks"), None);
         let (reason, fields) = blocker_wait(&MergeBlocker::SomethingDue).unwrap();
         assert_eq!(
             wait_words(reason, &wait_data(7, "p", reason, fields)).unwrap(),

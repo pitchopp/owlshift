@@ -51,8 +51,9 @@ impl OnDemand<'_> {
             });
         if !green {
             return Some(format!(
-                "{NEVER}: `owlshift watch` merges it once it reads it green twice a minute apart \
-                 and nothing is left for a person (merge on green)."
+                "{NEVER}: `owlshift watch` merges it once it reads it green twice a minute apart, \
+                 or reads no check on it for 10 minutes, and nothing is left for a person (merge \
+                 on green)."
             ));
         }
         let would = self.would_merge(p, seen, &delivery, (switch, method));
@@ -156,6 +157,8 @@ impl OnDemand<'_> {
             base_at_push: delivery.base_at_push.as_deref(),
             disjoint,
             base_checks: base_checks.as_ref(),
+            // Green: the commits are read for a head no check ran on alone.
+            ci_skipped: None,
             labeled: labels.iter().any(|label| label == core::MERGE_LABEL),
             excluded: tracker
                 .exclude

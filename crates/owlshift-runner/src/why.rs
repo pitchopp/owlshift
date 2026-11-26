@@ -444,9 +444,12 @@ pub fn phrase(wait: &Waiting) -> String {
                 .and_then(Value::as_u64)
                 .unwrap_or(0);
             let reason = data.get("reason").and_then(Value::as_str).unwrap_or("");
+            // A head no check ran on is not said to be green (OWL-657).
+            let no_checks = data.get("no_checks").and_then(Value::as_bool) == Some(true);
             format!(
-                "pull request #{pr} is green and waits for a person: Owlshift will not merge it, \
-                 as {reason}"
+                "pull request #{pr} {} and waits for a person: Owlshift will not merge it, as \
+                 {reason}",
+                crate::merge::standing_words(no_checks)
             )
         }
         "merge_refused" => {

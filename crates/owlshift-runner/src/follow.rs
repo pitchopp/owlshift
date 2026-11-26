@@ -320,9 +320,13 @@ fn describe(action: &Action) -> &'static str {
     match action {
         Action::WaitMergeability => "GitHub has not computed whether it merges yet",
         Action::NeedsBase => "its base branch is still to be read",
-        Action::WaitChecks => "its checks are still running, or none has reported yet",
+        Action::WaitChecks => "its checks are still running",
         Action::WaitBaseRed => "its failed checks fail on its base branch too: nothing to fix here",
         Action::Green => "every check passed",
+        Action::NoChecks => {
+            "no check has reported on its head: none may run on this change (merge on green takes \
+             it so once none has for 10 minutes)"
+        }
         Action::Rebase {
             cause: RebaseCause::Conflict,
             ..
@@ -370,6 +374,7 @@ pub(crate) fn action_name(decision: &Decision) -> &'static str {
             Action::WaitChecks => "wait_checks",
             Action::WaitBaseRed => "wait_base_red",
             Action::Green => "green",
+            Action::NoChecks => "no_checks",
             Action::Rebase { cause, .. } if !cause.refresh() => "rebase",
             Action::Rebase { .. } => "refresh_rebase",
             Action::RebaseFailed { .. } => "rebase_failed",
@@ -443,8 +448,12 @@ pub struct Following {
     reviews_unread: HashMap<TicketId, &'static str>,
     /// When a green read of the head was first made, per ticket, for merge
     /// on green's two green reads (OWL-445): forgotten at the first read
-    /// that is not green, or of another head.
-    green_since: HashMap<TicketId, (String, Timestamp)>,
+    /// that is not green, or of another head. Or, `true` beside the head,
+    /// when its first read that listed no check at all was made, for merge
+    /// on green's window (OWL-657): kept across a read of that head that
+    /// lists none while GitHub computes its mergeability, forgotten at a
+    /// read that lists a check, of another head, or green.
+    green_since: HashMap<TicketId, (String, bool, Timestamp)>,
     /// What merge on green keeps of each ticket (OWL-445).
     merge: HashMap<TicketId, MergeMemory>,
     /// `[forge] merge` and `merge_method` as the project file reads at a
@@ -837,35 +846,80 @@ impl Following {
 
     /// Keeps when `seen`, a read of `ticket`'s pull request at `now`, is
     /// the first green read of its head, and forgets it at a read that is
-    /// not green (OWL-445).
+    /// not green (OWL-445); likewise the first read of its head that listed
+    /// no check at all, kept while GitHub computes its mergeability and
+    /// forgotten once a read lists a check (OWL-657). A read that fails
+    /// changes nothing.
     fn green(&mut self, ticket: &TicketId, seen: &Seen, now: Timestamp) {
-        let green = matches!(
-            seen.decision,
+        let no_checks = match &seen.decision {
             Decision::Follow {
                 adopt: false,
-                action: Action::Green
+                action: Action::Green,
+            } => false,
+            Decision::Follow {
+                adopt: false,
+                action: Action::NoChecks,
+            } => true,
+            Decision::Follow {
+                adopt: false,
+                action: Action::WaitMergeability,
+            } if seen.checks.is_empty() => {
+                let kept = self
+                    .green_since
+                    .get(ticket)
+                    .is_some_and(|(head, none, _)| *none && *head == seen.head);
+                if !kept {
+                    self.green_since.remove(ticket);
+                }
+                return;
             }
-        );
-        if !green {
-            self.green_since.remove(ticket);
-            return;
-        }
+            _ => {
+                self.green_since.remove(ticket);
+                return;
+            }
+        };
         match self.green_since.get(ticket) {
-            Some((head, _)) if *head == seen.head => {}
+            Some((head, none, _)) if *head == seen.head && *none == no_checks => {}
             _ => {
                 self.green_since
-                    .insert(ticket.clone(), (seen.head.clone(), now));
+                    .insert(ticket.clone(), (seen.head.clone(), no_checks, now));
             }
         }
     }
 
-    /// The head of `ticket` first read green and how long before `now`,
-    /// for [`follow::merge_due`]'s two green reads (OWL-445).
+    /// The head of `ticket` first read green, or first read with no check
+    /// at all, and how long before `now`, for [`follow::merge_due`]'s two
+    /// green reads (OWL-445) or its window (OWL-657): of the kind of the
+    /// latest read, which made it.
     pub fn first_green(&self, ticket: &TicketId, now: Timestamp) -> Option<(String, Duration)> {
-        self.green_since.get(ticket).map(|(head, since)| {
+        self.green_since.get(ticket).map(|(head, _, since)| {
             let ago = Duration::try_from(now.duration_since(*since)).unwrap_or_default();
             (head.clone(), ago)
         })
+    }
+
+    /// Whether `ticket`'s head `head`, read with no check at all, has been
+    /// so since a read at least [`follow::NO_CHECKS_AFTER`] before `now`
+    /// (OWL-657): merge on green then weighs it as it weighs a green one.
+    pub fn no_checks_settled(&self, ticket: &TicketId, head: &str, now: Timestamp) -> bool {
+        self.green_since
+            .get(ticket)
+            .is_some_and(|(kept, none, since)| {
+                *none
+                    && kept == head
+                    && Duration::try_from(now.duration_since(*since))
+                        .is_ok_and(|ago| ago >= follow::NO_CHECKS_AFTER)
+            })
+    }
+
+    /// When `ticket`'s head `head`, read with no check at all, would have
+    /// been so for [`follow::NO_CHECKS_AFTER`] (OWL-657): `None` unless the
+    /// latest read of it listed none.
+    pub fn no_checks_until(&self, ticket: &TicketId, head: &str) -> Option<Timestamp> {
+        self.green_since
+            .get(ticket)
+            .filter(|(kept, none, _)| *none && kept == head)
+            .and_then(|(_, _, since)| since.checked_add(follow::NO_CHECKS_AFTER).ok())
     }
 
     /// Whether a refusal that will not pass holds `ticket`'s merge of `head`
@@ -1373,6 +1427,8 @@ pub fn changed(
                     }
                 }
             }
+            // A head no check ran on clears nothing (OWL-657): no check says
+            // the failure a fix pass answered is gone.
             if *action == Action::Green {
                 let state = TicketState::try_from(&next.state).map_err(|e| e.to_string())?;
                 if state.fix_passes() > 0 || state.failed_runs() > 0 {
@@ -1934,6 +1990,54 @@ mod tests {
         assert!(following.merge_unread(&ticket(), "base"));
     }
 
+    /// OWL-657: the first read of a head that listed no check is kept while
+    /// later reads of it list none, a read whose mergeability GitHub is
+    /// computing included, and settles it after ten minutes; a read that
+    /// lists a check, one of another head, or a green one starts again,
+    /// green twice then counting from that green read.
+    #[test]
+    fn a_head_with_no_check_settles_after_ten_minutes_of_reads_listing_none() {
+        let mut following = Following::default();
+        let read = |action: Action, head: &str| {
+            seen_with(
+                Decision::Follow {
+                    adopt: false,
+                    action,
+                },
+                head,
+            )
+        };
+        let none = read(Action::NoChecks, PUSHED);
+        following.green(&ticket(), &none, at(0));
+        following.green(&ticket(), &read(Action::WaitMergeability, PUSHED), at(4));
+        following.green(&ticket(), &none, at(9));
+        assert!(!following.no_checks_settled(&ticket(), PUSHED, at(9)));
+        assert!(following.no_checks_settled(&ticket(), PUSHED, at(10)));
+        assert!(!following.no_checks_settled(&ticket(), PUSHING, at(10)));
+        assert_eq!(following.no_checks_until(&ticket(), PUSHED), Some(at(10)));
+        // A check listed, then none again: the ten minutes start over.
+        let mut listing = read(Action::WaitChecks, PUSHED);
+        listing.checks = vec![CheckRead::named("ci", CheckOutcome::Pending)];
+        following.green(&ticket(), &listing, at(11));
+        assert_eq!(following.no_checks_until(&ticket(), PUSHED), None);
+        following.green(&ticket(), &none, at(12));
+        assert!(!following.no_checks_settled(&ticket(), PUSHED, at(21)));
+        // Another head starts over too.
+        following.green(&ticket(), &read(Action::NoChecks, PUSHING), at(13));
+        assert_eq!(following.no_checks_until(&ticket(), PUSHED), None);
+        assert_eq!(following.no_checks_until(&ticket(), PUSHING), Some(at(23)));
+        // Green on that head: its first green read, not the window's.
+        following.green(&ticket(), &read(Action::Green, PUSHING), at(14));
+        assert_eq!(following.no_checks_until(&ticket(), PUSHING), None);
+        assert_eq!(
+            following.first_green(&ticket(), at(15)),
+            Some((PUSHING.to_owned(), Duration::from_secs(60)))
+        );
+        // A mergeability read keeps no green read.
+        following.green(&ticket(), &read(Action::WaitMergeability, PUSHING), at(16));
+        assert_eq!(following.first_green(&ticket(), at(16)), None);
+    }
+
     fn record(delivery: TicketDelivery, state: TicketState) -> TicketRecord {
         TicketRecord {
             state: PersistedState::from(&state),
@@ -1994,6 +2098,16 @@ mod tests {
             .unwrap()
             .record;
         assert_eq!(cleared.state.failed_runs, 0);
+        // OWL-657: a head no check ran on clears nothing.
+        let none = seen_with(
+            Decision::Follow {
+                adopt: false,
+                action: Action::NoChecks,
+            },
+            PUSHED,
+        );
+        let failed = record(delivery(), watching(1));
+        assert_eq!(changed(&failed, pipeline, &none, at(0)).unwrap(), None);
         // OWL-445: a merge under way of the head read stays (a merge with
         // no verdict may still land); one of another head is cleared, and
         // so is any at an end.

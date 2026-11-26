@@ -264,6 +264,9 @@ struct Followed {
     /// GitHub's review decision, `None` when none is required.
     draft: bool,
     review: Option<&'static str>,
+    /// Watch's read lists no check at all on the head (OWL-657): no
+    /// workflow runs on the change.
+    no_checks: bool,
 }
 
 impl Default for Followed {
@@ -277,6 +280,7 @@ impl Default for Followed {
             at_push_conclusion: None,
             draft: false,
             review: None,
+            no_checks: false,
         }
     }
 }
@@ -384,6 +388,7 @@ impl FakeGitHub {
             let head = self.tip();
             let mut jobs = self.jobs.lock().unwrap();
             let nodes: Vec<Value> = match jobs.run {
+                _ if followed.no_checks => Vec::new(),
                 None => vec![json!({
                     "__typename": "CheckRun", "databaseId": 2, "name": "ci",
                     "status": status, "conclusion": conclusion,

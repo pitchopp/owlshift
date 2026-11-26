@@ -179,6 +179,8 @@ impl Watch<'_> {
             disjoint: false,
             // Read below when it is the condition that decides (OWL-521).
             base_checks: None,
+            // Read below when it is the condition that decides (OWL-657).
+            ci_skipped: None,
             labeled: labels.iter().any(|label| label == core::MERGE_LABEL),
             excluded: tracker
                 .exclude
@@ -231,6 +233,17 @@ impl Watch<'_> {
                 &moved,
             );
         }
+        // A head no check ran on, every other condition held but the base's
+        // checks, which count none for it: its delivery's commit messages,
+        // read in the dedicated checkout, may not ask CI to skip it
+        // (OWL-657). A failed read is no merge, retried at the next pass.
+        if due == MergeDue::Wait(MergeBlocker::CommitsUnread) {
+            match self.ci_skipped(&base_head, pushed) {
+                Ok(skipped) => facts.ci_skipped = Some(skipped),
+                Err(reason) => return self.merge_unread(memory, sink, ticket, "commits", reason),
+            }
+            due = core::merge_due(&policy, &facts, &read);
+        }
         // A base that moved apart from the delivery, every other condition
         // held: its head's own checks decide last (OWL-521; architecture
         // section 5, "The base's own checks").
@@ -275,7 +288,8 @@ impl Watch<'_> {
                         .filter(|(_, held)| *held == blocker)
                         .map(|(question, _)| question);
                     let waits = (pushed.as_str(), &blocker, key, question);
-                    self.waits_for_person(memory, sink, out, ticket, pr, waits);
+                    let no_checks = no_checks(seen);
+                    self.waits_for_person(memory, sink, out, (ticket, pr, no_checks), waits);
                 } else if let Some(wait) = merge::blocker_wait(&blocker) {
                     self.tell_wait(memory, sink, out, ticket, pr, &pushed, wait);
                 }
@@ -424,7 +438,11 @@ impl Watch<'_> {
                     ),
                 );
             }
-            Ok(MergeAnswer::Refused(refusal)) if refusal.may_pass => {
+            // On the base its checks ran on, a head no check ran on takes any
+            // refusal as final (OWL-657): GitHub's words for a check its
+            // branch protection requires and no workflow runs were not
+            // observed, and one read as passing would be tried every pass.
+            Ok(MergeAnswer::Refused(refusal)) if refusal.may_pass && !no_checks(seen) => {
                 let _ =
                     self.keep_merge_at(memory, sink, ticket, &locked, &unmerged(&record), &commit);
                 let event = merge::refused_data(
@@ -508,9 +526,15 @@ impl Watch<'_> {
         now: Timestamp,
     ) {
         let on_demand = self.on_demand;
-        if let Err(reason) =
-            merge::tell_merged(on_demand, ticket, pr, merging, Some(merged.clone()), sink)
-        {
+        let no_checks = no_checks(seen);
+        if let Err(reason) = merge::tell_merged(
+            on_demand,
+            ticket,
+            pr,
+            merging,
+            (Some(merged.clone()), Some(no_checks)),
+            sink,
+        ) {
             return self.merge_warning(memory, sink, ticket, "merged_unposted", "merged", reason);
         }
         let ended = follow::Seen {
@@ -540,14 +564,21 @@ impl Watch<'_> {
             .base_at_push
             .as_deref()
             .map(|at_push| (at_push, locked.base_head.as_str()));
-        merge::merged_event(ticket, pr.number, merging, Some(&merged), bases, sink);
+        let told = (Some(&merged), Some(no_checks));
+        merge::merged_event(ticket, pr.number, merging, told, bases, sink);
         if let Some(event) = memory.following.events(ticket, &ended) {
             sink.emit(ticket, None, EventKind::Decision, event);
         }
+        let unchecked = if no_checks {
+            ", no check having run on it"
+        } else {
+            ""
+        };
         self.line(
             out,
             &format!(
-                "{ticket}: pull request #{} {}: merged by Owlshift ({}) at {}, under merge on green",
+                "{ticket}: pull request #{} {}: merged by Owlshift ({}) at {}{unchecked}, under \
+                 merge on green",
                 pr.number,
                 pr.url,
                 merging.method.as_str(),
@@ -599,25 +630,32 @@ impl Watch<'_> {
         memory: &mut Memory,
         sink: &mut EventSink<'_>,
         out: &mut dyn Write,
-        ticket: &TicketId,
-        pr: &DeliveredPullRequest,
+        (ticket, pr, no_checks): (&TicketId, &DeliveredPullRequest, bool),
         (head, blocker, key, question): (&str, &MergeBlocker, &'static str, Option<&MergeQuestion>),
     ) {
         if !memory.following.merge_waits(ticket, head, key) {
             return;
         }
         let reason = merge::hold_words(blocker, question);
-        let event = merge::waits_data(pr.number, head, blocker, question);
+        let event = merge::waits_data(pr.number, head, blocker, question, no_checks);
         sink.emit(ticket, None, EventKind::Decision, event);
         self.line(
             out,
             &format!(
-                "{ticket}: pull request #{} {} is green and waits for a person: Owlshift will not \
+                "{ticket}: pull request #{} {} {} and waits for a person: Owlshift will not \
                  merge it, as {reason}. Merge it yourself once you have read it",
-                pr.number, pr.url
+                pr.number,
+                pr.url,
+                merge::standing_words(no_checks)
             ),
         );
-        merge::notify_waits(self.on_demand, ticket, pr.number, &reason, sink);
+        merge::notify_waits(
+            self.on_demand,
+            ticket,
+            (pr.number, no_checks),
+            &reason,
+            sink,
+        );
     }
 
     /// What merge on green reads of the base's move from `at_push` to
@@ -638,20 +676,47 @@ impl Watch<'_> {
         if memory.following.moved_refused(ticket, pushed) {
             return MovedBase::Refused;
         }
+        if let Err(why) = self.fetch_lacking(&[pushed, at_push, base_head]) {
+            return MovedBase::Unread(why);
+        }
+        let on_demand = self.on_demand;
+        let checkout = on_demand.dirs.checkout();
+        MovedBase::read(
+            &on_demand.executor.git,
+            &checkout,
+            pushed,
+            at_push,
+            base_head,
+        )
+    }
+
+    /// Whether a commit of `ticket`'s delivery between `base_head` and
+    /// `pushed` asks CI to skip it (OWL-657; [`merge::ci_skipped`]), read in
+    /// the dedicated checkout under the project's lock the caller holds,
+    /// fetched first when it lacks either commit.
+    fn ci_skipped(&self, base_head: &str, pushed: &str) -> Result<bool, String> {
+        self.fetch_lacking(&[pushed, base_head])?;
+        let on_demand = self.on_demand;
+        let checkout = on_demand.dirs.checkout();
+        merge::ci_skipped(&on_demand.executor.git, &checkout, base_head, pushed)
+    }
+
+    /// Fetches the dedicated checkout when it lacks one of `commits`.
+    fn fetch_lacking(&self, commits: &[&str]) -> Result<(), String> {
         let on_demand = self.on_demand;
         let git = &on_demand.executor.git;
         let checkout = on_demand.dirs.checkout();
-        let held = |commit: &str| {
+        let held = |commit: &&str| {
             let object = format!("{commit}^{{commit}}");
             git.output(&checkout, &["cat-file", "-e", &object], None)
                 .is_ok_and(|out| out.success())
         };
-        if ![pushed, at_push, base_head].into_iter().all(held)
-            && let Err(why) = project::sync_checkout(git, on_demand.dirs, on_demand.remote_url)
-        {
-            return MovedBase::Unread(format!("fetching the dedicated checkout: {why}"));
+        if commits.iter().all(held) {
+            return Ok(());
         }
-        MovedBase::read(git, &checkout, pushed, at_push, base_head)
+        project::sync_checkout(git, on_demand.dirs, on_demand.remote_url)
+            .map(drop)
+            .map_err(|why| format!("fetching the dedicated checkout: {why}"))
     }
 
     /// Tells `moved`, what merge on green read of the base of `ticket`'s
@@ -742,13 +807,53 @@ impl Watch<'_> {
         self.tell_wait(memory, sink, out, ticket, pr, head, wait);
     }
 
+    /// A followed pull request whose head `head` lists no check at all,
+    /// none for less than ten minutes (OWL-657; architecture section 5,
+    /// "Merge on green", "A pull request no check runs on"): merge on green
+    /// reads nothing more for it yet, its holds included, since a check may
+    /// still register. On a project whose `[forge] merge`, read at the base
+    /// branch's head, is not `never`, the wait is told as the others are
+    /// (OWL-499), with when the ten minutes end; a read that fails, a busy
+    /// project or an operator's pause tells nothing, the merge step telling
+    /// them once the window ends.
+    pub(super) fn no_checks_yet(
+        &self,
+        memory: &mut Memory,
+        sink: &mut EventSink<'_>,
+        out: &mut dyn Write,
+        ticket: &TicketId,
+        delivery: &TicketDelivery,
+        head: &str,
+    ) {
+        let (Some(pr), Some(until)) = (
+            &delivery.pull_request,
+            memory.following.no_checks_until(ticket, head),
+        ) else {
+            return;
+        };
+        if delivery.pushed.as_deref() != Some(head) || self.operator_paused(memory, sink, out) {
+            return;
+        }
+        let Ok(base_head) = self.base_head(memory, &delivery.base_branch) else {
+            return;
+        };
+        match self.switch(memory, &delivery.base_branch, &base_head) {
+            Ok(Some((switch, _))) if switch != MergeSwitch::Never => {
+                let wait = ("merge_no_checks", data([("until", json!(until))]));
+                self.tell_wait(memory, sink, out, ticket, pr, head, wait);
+            }
+            _ => {}
+        }
+    }
+
     /// Tells `wait`, a reason and its fields, for which `ticket`'s pull
-    /// request `pr`, read green at `head`, is neither merged nor refreshed
-    /// at this pass (OWL-499; architecture section 5, "Merge on green",
-    /// "Waits told"): at the second pass that finds it on that head, once,
-    /// one `decision` event (`watch` `waits`) and one line, in the words
-    /// `owlshift why` shows it with. No notification: it lifts by itself,
-    /// or the person who caused it knows.
+    /// request `pr`, read green at `head`, or with no check at all
+    /// (OWL-657), is neither merged nor refreshed at this pass (OWL-499;
+    /// architecture section 5, "Merge on green", "Waits told"): at the
+    /// second pass that finds it on that head, once, one `decision` event
+    /// (`watch` `waits`) and one line, in the words `owlshift why` shows it
+    /// with. No notification: it lifts by itself, or the person who caused
+    /// it knows.
     #[allow(clippy::too_many_arguments)]
     pub(super) fn tell_wait(
         &self,
@@ -1001,7 +1106,9 @@ impl Watch<'_> {
         let Some(pr) = delivery.and_then(|delivery| delivery.pull_request.as_ref()) else {
             return Ok(None);
         };
-        if let Err(reason) = merge::tell_merged(self.on_demand, ticket, pr, merging, None, sink) {
+        if let Err(reason) =
+            merge::tell_merged(self.on_demand, ticket, pr, merging, (None, None), sink)
+        {
             self.merge_warning(memory, sink, ticket, "merged_unposted", "merged", reason);
             return Ok(None);
         }
@@ -1031,8 +1138,19 @@ fn needs_draft(due: &MergeDue) -> bool {
                     | MergeBlocker::BaseUnknown
                     | MergeBlocker::BaseMoved
                     | MergeBlocker::GreenOnce
+                    | MergeBlocker::CommitsUnread
             )
     )
+}
+
+/// Whether `seen` read the pull request with no check at all (OWL-657):
+/// the merge it leads to is said to be one no check ran on.
+fn no_checks(seen: &follow::Seen) -> bool {
+    seen.decision
+        == (Decision::Follow {
+            adopt: false,
+            action: core::Action::NoChecks,
+        })
 }
 
 fn core_state(state: forge::PrState) -> core::PrState {

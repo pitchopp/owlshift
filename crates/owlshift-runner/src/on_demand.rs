@@ -3499,15 +3499,14 @@ impl OnDemand<'_> {
                     Err(e) => return Err(core_error(e)),
                 };
                 if let (Some(merging), Some(pr)) = (&runner_merged, &delivery.pull_request) {
-                    crate::merge::tell_merged(self, &ticket, pr, merging, None, sink).map_err(
-                        |e| {
+                    crate::merge::tell_merged(self, &ticket, pr, merging, (None, None), sink)
+                        .map_err(|e| {
                             refused(
                                 "telling Owlshift's merge of the pull request on the ticket \
                                  before keeping its end; the next read tells it",
                                 e,
                             )
-                        },
-                    )?;
+                        })?;
                 }
                 if let Err(e) = self.store_delivery(p, &state, record.questions, record.delivery) {
                     return Err(refused(
@@ -3527,7 +3526,14 @@ impl OnDemand<'_> {
                     self.review_after_working(&ticket, sink);
                 }
                 if let (Some(merging), Some(pr)) = (&runner_merged, &delivery.pull_request) {
-                    crate::merge::merged_event(&ticket, pr.number, merging, None, None, sink);
+                    crate::merge::merged_event(
+                        &ticket,
+                        pr.number,
+                        merging,
+                        (None, None),
+                        None,
+                        sink,
+                    );
                 }
             }
             Ok(None) => {}
@@ -3564,13 +3570,7 @@ impl OnDemand<'_> {
                 outcome => return outcome,
             }
         }
-        let unrepaired = matches!(
-            seen.decision,
-            FollowDecision::Follow {
-                adopt: false,
-                action: FollowAction::Green | FollowAction::WaitChecks | FollowAction::WaitBaseRed,
-            }
-        );
+        let unrepaired = seen.decision.asks_no_repair();
         // The reviews on the pull request, which may loop back to Build
         // (OWL-307), when the read asks for no repair.
         if self.config.forge.is_some() && unrepaired {
@@ -7879,13 +7879,13 @@ impl OnDemand<'_> {
                     | FollowAction::Rebase { .. }
                     | FollowAction::RebaseFailed { .. }),
             } => action.clone(),
-            // Merge on green's refresh (OWL-445): green, on a base that moved
-            // since the push, which this command's fetch read. Watch decided
-            // the merge due but for the base; its checks ran on a merge with
-            // the old base.
+            // Merge on green's refresh (OWL-445): green, or with no check at
+            // all (OWL-657), on a base that moved since the push, which this
+            // command's fetch read. Watch decided the merge due but for the
+            // base; its checks ran on a merge with the old base.
             FollowDecision::Follow {
                 adopt: false,
-                action: FollowAction::Green,
+                action: FollowAction::Green | FollowAction::NoChecks,
             } if merge_refresh
                 && delivery.base_at_push.as_deref() != Some(p.base.commit.as_str()) =>
             {
