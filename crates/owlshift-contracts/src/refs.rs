@@ -2574,6 +2574,11 @@ pub struct KeptReport {
     /// fixed and the agent's steps it built, in increasing order.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub steps: Vec<NonZeroU32>,
+    /// For a rebase, whether it is a clean refresh the runner merged
+    /// itself, with no agent run and no gate (format 10, OWL-655): its
+    /// report's lead line says so.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub refreshed: bool,
 }
 
 /// A pull request review a review loop's run answers (OWL-300).
@@ -2705,13 +2710,14 @@ impl TicketDelivery {
     /// format 5 is format 6 without `merging` or `merge_retry` (OWL-445), and
     /// format 6 is format 7 without `rerun` (OWL-513), and format 7 is
     /// format 8 without `pushing.rebased` (OWL-514), and format 8 is format
-    /// 9 without a report's `steps` (OWL-619), so each is refused in an
+    /// 9 without a report's `steps` (OWL-619), and format 9 is format 10
+    /// without a report's `refreshed` (OWL-655), so each is refused in an
     /// older format.
     fn from_older_format(input: &str) -> Option<Result<Self, ContractError>> {
         let mut document: serde_json::Value = serde_json::from_str(input).ok()?;
         let fields = document.as_object_mut()?;
         let format = fields.get("format").and_then(serde_json::Value::as_u64)?;
-        if !(1..=8).contains(&format) {
+        if !(1..=9).contains(&format) {
             return None;
         }
         let pushing = fields.get("pushing").and_then(serde_json::Value::as_object);
@@ -2742,6 +2748,7 @@ impl TicketDelivery {
         .any(|kind| kind == "review");
         let reviews = reports().any(|report| report.get("reviews").is_some());
         let steps = reports().any(|report| report.get("steps").is_some());
+        let refreshed = reports().any(|report| report.get("refreshed").is_some());
         let questions = reports().any(|report| report.get("questions").is_some());
         let notes = reports().any(|report| report.get("notes").is_some());
         let owed_delivery = owed
@@ -2767,7 +2774,8 @@ impl TicketDelivery {
             ("merge_retry", format <= 5 && merge_retry),
             ("rerun", format <= 6 && rerun),
             ("pushing.rebased", rebased),
-            ("report's steps", steps),
+            ("report's steps", format <= 8 && steps),
+            ("report's refreshed", refreshed),
         ] {
             if kept {
                 return Some(Err(ContractError::invalid(
@@ -2804,7 +2812,8 @@ impl TicketDelivery {
     /// only for a correction or a review loop that kept its report (OWL-307),
     /// that a report names questions or steps (OWL-619), one of the two,
     /// exactly when it is a correction's, its steps in increasing order, and
-    /// keeps notes only for a delivery or a review loop, that an ended
+    /// keeps notes only for a delivery or a review loop, is refreshed only
+    /// for a rebase (OWL-655), that an ended
     /// delivery pushes nothing, and that a re-run is of a full commit, with
     /// a workflow run and a job, each job's run among its runs, links of a
     /// newer attempt only with an outcome, a reason only when refused, and
@@ -2919,6 +2928,14 @@ impl TicketDelivery {
                 "a report names its steps out of order: {:?}",
                 report.steps
             ));
+        }
+        // Only a rebase is a refresh the runner merged itself (OWL-655).
+        if reports
+            .into_iter()
+            .flatten()
+            .any(|(kind, report)| kind != PushKind::Rebase && report.refreshed)
+        {
+            return invalid("a report is refreshed only if it is a rebase's".to_owned());
         }
         // The runner's notes are those of a Build's delivery: the first one
         // (OWL-236), or a review loop's (OWL-307).

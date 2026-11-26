@@ -41,7 +41,7 @@
     "format": {
       "description": "The format version of this document.",
       "type": "integer",
-      "const": 9
+      "const": 10
     },
     "merge_retry": {
       "description": "When a person's `owlshift continue` at Watch last asked for the\nmerge to be tried again (format 6, OWL-445): watch tries again a head\nwhose merge GitHub refused for good before then. Not a refusal: those\nlive in watch's memory only.",
@@ -324,6 +324,10 @@
           "items": {
             "type": "string"
           }
+        },
+        "refreshed": {
+          "description": "For a rebase, whether it is a clean refresh the runner merged\nitself, with no agent run and no gate (format 10, OWL-655): its\nreport's lead line says so.",
+          "type": "boolean"
         },
         "reviews": {
           "description": "For a review loop's run, the pull request reviews it answers, what\nits report's lead line names (format 5, OWL-300).",

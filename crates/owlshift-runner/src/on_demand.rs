@@ -7380,6 +7380,7 @@ impl OnDemand<'_> {
                 followups: built.followups,
                 reviews: Vec::new(),
                 steps: Vec::new(),
+                refreshed: false,
             }),
             unchanged: false,
         });
@@ -7587,6 +7588,7 @@ impl Repaired {
                 | RepairKind::Correction { .. }
                 | RepairKind::Review { .. } => Vec::new(),
             },
+            refreshed: false,
         }
     }
 }

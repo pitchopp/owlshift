@@ -434,6 +434,7 @@ impl OnDemand<'_> {
                 followups: built.followups,
                 reviews: reviews.clone(),
                 steps: Vec::new(),
+                refreshed: false,
             }),
             unchanged: true,
         };
