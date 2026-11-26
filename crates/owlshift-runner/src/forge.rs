@@ -17,7 +17,7 @@ use owlshift_platform::keychain::{Keychain, SERVICE, Secret};
 use owlshift_platform::service::sh_quote;
 
 use crate::github_token::AppToken;
-use crate::refusal::Refusal;
+use crate::refusal::{PICKED_UP_AGAIN, Refusal, resumed};
 use crate::secrets::{self, ForgeKind, ForgeSecret};
 
 /// The keychain account, under [`SERVICE`], that every project of a machine
@@ -126,7 +126,7 @@ pub fn github(
         (Some(token), ForgeKind::Personal) => {
             Ok(GitHubForge::new(Token::new(token.expose()), repo))
         }
-        (None, _) => Err(no_token(found).into()),
+        (None, _) => Err(Refusal::no_github_token(no_token(found))),
     }
 }
 
@@ -205,18 +205,33 @@ pub(crate) fn sign_in_again(account: &str, what: &str) -> String {
 /// When `resumes`, the daemon tries the project again by itself, and the
 /// notice says so; a command typed in a terminal does not.
 pub fn sign_in_notice(repo: &Repo, checkout: &Path, resumes: bool) -> String {
-    let mut notice = format!(
+    let notice = format!(
         "Owlshift can no longer reach GitHub for {repo}, so none of its tickets move. Sign in \
          again: `cd {}` then `owlshift init`. It shows a code to enter on github.com; your \
          owlshift.toml, your other stored keys and your tickets are kept.",
         sh_quote(&checkout.display().to_string())
     );
-    if resumes {
-        notice.push_str(" Owlshift picks the project up again within a minute.");
-    }
-    notice
+    resumed(notice, resumes, PICKED_UP_AGAIN)
 }
 
+/// What a person reads when no GitHub token is stored for the project of
+/// `repo` (OWL-658), as [`sign_in_notice`] says it: `owlshift init`, in
+/// `checkout`, signs in through the GitHub App when no app token is stored
+/// (`--github-token` is the expert's personal token, never advised here),
+/// and keeps an existing project file and the secrets already stored.
+pub fn no_token_notice(repo: &Repo, checkout: &Path, resumes: bool) -> String {
+    let notice = format!(
+        "Owlshift has no GitHub sign-in for {repo}, so none of its tickets move. Sign in: `cd \
+         {}` then `owlshift init`. It shows a code to enter on github.com; your owlshift.toml, \
+         your other stored keys and your tickets are kept.",
+        sh_quote(&checkout.display().to_string())
+    );
+    resumed(notice, resumes, PICKED_UP_AGAIN)
+}
+
+/// The technical words of no GitHub token stored for `found`: they name
+/// the keychain entry, for daemon.log and the terminal, on the line before
+/// the [`no_token_notice`] a person reads (OWL-658).
 fn no_token(found: &ForgeSecret<Secret>) -> String {
     format!(
         "no GitHub token in the system keychain: run `owlshift init` in a terminal, or store \
@@ -563,6 +578,49 @@ mod tests {
             assert_eq!(kept, other);
             assert_eq!(kept.detail, None);
         }
+    }
+
+    /// OWL-658: no GitHub token stored is lasting and, said in a checkout,
+    /// reads as the notice that signs in from that folder, its technical
+    /// words, which name the keychain entry, kept as the detail; the notice
+    /// names no keychain service or account.
+    #[test]
+    fn no_token_stored_is_said_as_a_sign_in_from_its_folder() {
+        let repo = Repo::parse("acme/web").unwrap();
+        let folder = Path::new("/Users/ada/My Projects/web");
+        assert_eq!(
+            no_token_notice(&repo, folder, true),
+            "Owlshift has no GitHub sign-in for acme/web, so none of its tickets move. Sign in: \
+             `cd '/Users/ada/My Projects/web'` then `owlshift init`. It shows a code to enter on \
+             github.com; your owlshift.toml, your other stored keys and your tickets are kept. \
+             Owlshift picks the project up again within a minute."
+        );
+        let typed = no_token_notice(&repo, Path::new("/tmp/ada's web"), false);
+        assert!(typed.contains(r"`cd '/tmp/ada'\''s web'`"), "{typed}");
+        assert!(typed.ends_with("your tickets are kept."), "{typed}");
+
+        let dir = tempfile::tempdir().unwrap();
+        let found = ForgeSecret {
+            account: ForgeAccount::project(&repo),
+            token: None,
+        };
+        let Err(refused) = github(
+            &found,
+            repo.clone(),
+            &access(Keychain::in_memory(), dir.path()),
+        ) else {
+            panic!("a forge opened without a token");
+        };
+        assert!(refused.lasting(), "{refused}");
+        let technical = refused.message.clone();
+        assert!(
+            technical.contains("`github.com/acme/web/github`"),
+            "{technical}"
+        );
+        let said = refused.in_checkout(&repo, folder, true);
+        assert_eq!(said.message, no_token_notice(&repo, folder, true));
+        assert_eq!(said.detail, Some(technical));
+        assert!(!said.message.contains("service `"), "{said}");
     }
 
     /// OWL-334: no token stored is said before any request.

@@ -19,6 +19,13 @@
 //! daemon's pause, `owlshift status`, the UI, the digest and `owlshift
 //! doctor` show. The technical words, which name the keychain entry and
 //! GitHub's error, stay as its [`detail`](Refusal::detail).
+//!
+//! OWL-658 words the other lasting refusals of a credential or a secret the
+//! same way: no GitHub token stored, a keychain that does not read, no
+//! Linear API key, and a Linear app stored by half, refused or blind to the
+//! team. Each says what stops, the fix in plain words with the folder to run
+//! it in, and what the fix keeps; none tells to edit the keychain by service
+//! and account but the choice of writing through the Linear API key.
 
 use std::fmt;
 use std::path::Path;
@@ -39,11 +46,33 @@ enum Mend {
 
 /// What a person does to mend a lasting refusal, when its command words it
 /// for them.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 enum Need {
     /// Sign in to GitHub again: GitHub refused the GitHub App's token, or
     /// its keychain entry no longer reads (OWL-650).
     GitHubSignIn,
+    /// Sign in to GitHub: no GitHub token is stored (OWL-658).
+    GitHubToken,
+    /// Unlock the system keychain: it does not open, or an entry does not
+    /// read (OWL-658).
+    Keychain,
+    /// Give a Linear API key: none is stored (OWL-658).
+    LinearKey,
+    /// Store the Linear app again, or write through the key (OWL-658).
+    LinearApp(crate::tracker::AppFault),
+}
+
+/// The sentence a notice ends with when the daemon tries its project again
+/// by itself (OWL-650): a command typed in a terminal drops it.
+pub(crate) const PICKED_UP_AGAIN: &str = "Owlshift picks the project up again within a minute.";
+
+/// `notice`, with `last` after it when `resumes`.
+pub(crate) fn resumed(mut notice: String, resumes: bool, last: &str) -> String {
+    if resumes {
+        notice.push(' ');
+        notice.push_str(last);
+    }
+    notice
 }
 
 /// A refusal, with what may mend it.
@@ -87,27 +116,64 @@ impl Refusal {
     /// entry does not read or is gone. `message` holds the technical words,
     /// until [`in_checkout`](Self::in_checkout) words it for a person.
     pub fn sign_in_to_github(message: impl Into<String>) -> Self {
+        Self::needing(message, Need::GitHubSignIn)
+    }
+
+    /// A lasting refusal for no GitHub token stored (OWL-658), worded with
+    /// [`no_token_notice`](crate::forge::no_token_notice).
+    pub fn no_github_token(message: impl Into<String>) -> Self {
+        Self::needing(message, Need::GitHubToken)
+    }
+
+    /// A lasting refusal for a system keychain that does not open, or one of
+    /// whose entries does not read (OWL-658), worded with
+    /// [`keychain_notice`](crate::secrets::keychain_notice).
+    pub fn keychain(message: impl Into<String>) -> Self {
+        Self::needing(message, Need::Keychain)
+    }
+
+    /// A lasting refusal for no Linear API key stored (OWL-658), worded with
+    /// [`linear_key_notice`](crate::tracker::linear_key_notice).
+    pub fn no_linear_key(message: impl Into<String>) -> Self {
+        Self::needing(message, Need::LinearKey)
+    }
+
+    /// A lasting refusal of the Linear app for `fault` (OWL-658), worded
+    /// with [`AppFault::notice`](crate::tracker::AppFault::notice).
+    pub fn linear_app(message: impl Into<String>, fault: crate::tracker::AppFault) -> Self {
+        Self::needing(message, Need::LinearApp(fault))
+    }
+
+    /// A lasting refusal `need` mends, `message` its technical words.
+    fn needing(message: impl Into<String>, need: Need) -> Self {
         Self {
-            need: Some(Need::GitHubSignIn),
+            need: Some(need),
             ..Self::from(message.into())
         }
     }
 
-    /// This refusal said for the project of `repo` whose command signs in
-    /// from `checkout`: a refusal only a new sign-in mends takes
-    /// [`sign_in_notice`](crate::forge::sign_in_notice) as its message, with
-    /// the last sentence when `resumes`, as for the daemon's watch, and
-    /// keeps its technical words as its [`detail`](Self::detail). Any other
-    /// refusal is returned as it is.
+    /// This refusal said for the project of `repo` whose command runs from
+    /// `checkout`: a refusal a person mends takes its notice as its message,
+    /// with its last sentence when `resumes`, as for the daemon's watch, and
+    /// keeps its technical words as its [`detail`](Self::detail). A refusal
+    /// already worded, and any other refusal, is returned as it is.
     #[must_use]
     pub fn in_checkout(self, repo: &Repo, checkout: &Path, resumes: bool) -> Self {
-        match self.need {
-            Some(Need::GitHubSignIn) if self.detail.is_none() => Self {
-                message: crate::forge::sign_in_notice(repo, checkout, resumes),
-                detail: Some(self.message),
-                ..self
-            },
-            _ => self,
+        if self.detail.is_some() {
+            return self;
+        }
+        let notice = match &self.need {
+            None => return self,
+            Some(Need::GitHubSignIn) => crate::forge::sign_in_notice(repo, checkout, resumes),
+            Some(Need::GitHubToken) => crate::forge::no_token_notice(repo, checkout, resumes),
+            Some(Need::Keychain) => crate::secrets::keychain_notice(repo, resumes),
+            Some(Need::LinearKey) => crate::tracker::linear_key_notice(repo, checkout, resumes),
+            Some(Need::LinearApp(fault)) => fault.notice(repo, checkout, resumes),
+        };
+        Self {
+            detail: Some(self.message),
+            message: notice,
+            ..self
         }
     }
 
@@ -144,5 +210,63 @@ impl From<&str> for Refusal {
 impl fmt::Display for Refusal {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(&self.message)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::secrets::TrackerAccounts;
+    use crate::tracker::{AppFault, AppFaultKind, LINEAR_SECRETS};
+
+    /// OWL-658: each refusal a person mends is said, in its checkout, with
+    /// its own notice, lasting, its technical words kept as the detail, and
+    /// once only; a refusal no person mends is returned as it is.
+    #[test]
+    fn each_need_is_said_with_its_notice_once() {
+        let repo = Repo::parse("acme/web").unwrap();
+        let folder = Path::new("/work/web");
+        let fault = AppFault {
+            kind: AppFaultKind::Half,
+            accounts: TrackerAccounts::project(&repo, &LINEAR_SECRETS),
+        };
+        for (refusal, notice) in [
+            (
+                Refusal::sign_in_to_github("t"),
+                crate::forge::sign_in_notice(&repo, folder, true),
+            ),
+            (
+                Refusal::no_github_token("t"),
+                crate::forge::no_token_notice(&repo, folder, true),
+            ),
+            (
+                Refusal::keychain("t"),
+                crate::secrets::keychain_notice(&repo, true),
+            ),
+            (
+                Refusal::no_linear_key("t"),
+                crate::tracker::linear_key_notice(&repo, folder, true),
+            ),
+            (
+                Refusal::linear_app("t", fault.clone()),
+                fault.notice(&repo, folder, true),
+            ),
+        ] {
+            assert!(refusal.lasting(), "{refusal}");
+            let said = refusal.in_checkout(&repo, folder, true);
+            assert_eq!(said.message, notice);
+            assert_eq!(said.detail.as_deref(), Some("t"));
+            assert!(said.lasting(), "{said}");
+            assert_eq!(said.clone().in_checkout(&repo, folder, false), said);
+            assert!(said.message.ends_with("within a minute."), "{said}");
+        }
+
+        for other in [
+            Refusal::from("no project file"),
+            Refusal::passing("Linear answered 500"),
+            Refusal::unreachable("no answer"),
+        ] {
+            assert_eq!(other.clone().in_checkout(&repo, folder, true), other);
+        }
     }
 }

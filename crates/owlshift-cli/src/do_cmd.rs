@@ -335,8 +335,13 @@ fn run_with(
     let agent = agent_env(config, project, &repo)?;
 
     // From here on, the credentials: the runner's own, never an agent's.
+    // A refusal a person mends is said in their words, naming this folder
+    // (OWL-650, OWL-658): the daemon's watch adds that it picks the project
+    // up again, which no other command does.
+    let resumes = waits_for_network(served.is_some(), mode);
     let dirs = ProjectDirs::new(data_dir, &repo);
-    let secrets = Secrets::read(open_keychain, project, &repo, &dirs, &config.personal)?;
+    let secrets = Secrets::read(open_keychain, project, &repo, &dirs, &config.personal)
+        .map_err(|refusal| refusal.in_checkout(&repo, root, resumes))?;
     // A step's child does not say again what its watch said at its start.
     if let Some(notice) = secrets::shared_notice(
         &repo,
@@ -355,10 +360,7 @@ fn run_with(
     // "mine"`, the account of the tracker key, read once here, a key that
     // cannot be read refusing the drain's start; a step's child takes what
     // its watch read, from its envelope; any other command reads no gesture.
-    // A refused GitHub sign-in is said in a person's words, naming this
-    // folder (OWL-650): the daemon's watch adds that it picks the project
-    // up again, which no other command does.
-    let resumes = waits_for_network(served.is_some(), mode);
+    // A refusal a person mends is said in their words, as above.
     let mut open = || -> Result<(Box<dyn Tracker>, GitHubForge, Taking), Refusal> {
         let opened = || -> Result<(Box<dyn Tracker>, GitHubForge, Taking), Refusal> {
             let tracker = opener.open()?;
@@ -946,6 +948,9 @@ impl Secrets {
     /// Opens the keychain with `open_keychain` and reads `project`'s
     /// secrets for `repo`, the App's token refreshed under the account lock
     /// of `dirs`, with the App's settings of the personal file `personal`.
+    /// A keychain that does not open, and an entry of the tracker's set or
+    /// the forge's that does not read, refuse as [`Refusal::keychain`],
+    /// which a person mends by unlocking it (OWL-658).
     pub(crate) fn read(
         open_keychain: fn() -> Result<Keychain, KeychainError>,
         project: &ProjectConfig,
@@ -953,10 +958,16 @@ impl Secrets {
         dirs: &ProjectDirs,
         personal: &FileState<PersonalConfig>,
     ) -> Result<Self, Refusal> {
-        let keychain = Arc::new(open_keychain().map_err(|error| error.to_string())?);
+        let keychain =
+            Arc::new(open_keychain().map_err(|error| Refusal::keychain(error.to_string()))?);
         let mut read = |account: &str| keychain.read(account).map_err(|error| error.to_string());
-        let tracker = tracker::keychain_set(project, repo, &mut read)?;
-        let forge = secrets::forge(repo, &mut read)?;
+        let (tracker, forge) = (|| {
+            Ok::<_, String>((
+                tracker::keychain_set(project, repo, &mut read)?,
+                secrets::forge(repo, &mut read)?,
+            ))
+        })()
+        .map_err(Refusal::keychain)?;
         let access = forge::AppAccess {
             keychain: keychain.clone(),
             lock: dirs.account_lock_file(),
@@ -1535,6 +1546,55 @@ mod refusals {
 
         let plain = Refusal::from("no Linear API key");
         assert_eq!(refusal_lines(&plain), ["no Linear API key".to_owned()]);
+    }
+
+    /// OWL-658: each other refusal of a credential or a secret ends with its
+    /// notice, the technical words, which name the keychain entry, on the
+    /// line before; it still pauses a served watch's project, and only the
+    /// daemon's watch says it is picked up again.
+    #[test]
+    fn each_credential_refusal_ends_with_its_notice() {
+        use owlshift_runner::secrets::TrackerAccounts;
+        use owlshift_runner::tracker::{AppFault, AppFaultKind, LINEAR_SECRETS};
+
+        let repo = Repo::parse("acme/web").unwrap();
+        let folder = Path::new("/work/my web");
+        let fault = AppFault {
+            kind: AppFaultKind::Refused,
+            accounts: TrackerAccounts::project(&repo, &LINEAR_SECRETS),
+        };
+        let technical = "the technical words, account `github.com/acme/web/linear`";
+        for (refused, notice) in [
+            (
+                Refusal::no_github_token(technical),
+                forge::no_token_notice(&repo, folder, true),
+            ),
+            (
+                Refusal::keychain(technical),
+                owlshift_runner::secrets::keychain_notice(&repo, true),
+            ),
+            (
+                Refusal::no_linear_key(technical),
+                owlshift_runner::tracker::linear_key_notice(&repo, folder, true),
+            ),
+            (
+                Refusal::linear_app(technical, fault.clone()),
+                fault.notice(&repo, folder, true),
+            ),
+        ] {
+            let served =
+                refused
+                    .clone()
+                    .in_checkout(&repo, folder, waits_for_network(true, Mode::Drain));
+            assert_eq!(refusal_lines(&served), [technical.to_owned(), notice]);
+            assert_eq!(
+                refused_code(&served, Mode::Drain, true),
+                ExitCode::from(UNSERVABLE_EXIT)
+            );
+            let typed = refused.in_checkout(&repo, folder, waits_for_network(false, Mode::Watch));
+            assert!(!typed.message.contains("within a minute"), "{typed}");
+            assert!(!typed.message.contains("by itself"), "{typed}");
+        }
     }
 
     /// An intake's envelope for `ticket`.

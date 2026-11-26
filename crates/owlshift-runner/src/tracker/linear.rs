@@ -15,8 +15,9 @@ use owlshift_contracts::ids::TicketId;
 use owlshift_platform::keychain::{Keychain, SERVICE, Secret};
 
 use super::{
-    AppError, Connected, Doctored, ForgeCredential, Kind, LINEAR_ACCOUNT, LINEAR_APP_ID_ACCOUNT,
-    LINEAR_APP_SECRET_ACCOUNT, LINEAR_SECRETS, Opener, Probe, Probed, Setup, StatesError,
+    AppError, AppFault, AppFaultKind, Connected, Doctored, ForgeCredential, Kind, LINEAR_ACCOUNT,
+    LINEAR_APP_ID_ACCOUNT, LINEAR_APP_SECRET_ACCOUNT, LINEAR_SECRETS, Opener, Probe, Probed, Setup,
+    StatesError,
 };
 use crate::config::FileState;
 use crate::doctor::{Check, DOES_NOT_BLOCK, KEYCHAIN_FIX, Section, Step, configured_states};
@@ -140,10 +141,11 @@ team = {}
         config: &ProjectConfig,
         accounts: Option<&TrackerAccounts>,
         _repo: Option<&Repo>,
+        folder: &Path,
     ) -> Doctored {
-        let lines = tracker_states_check(system, config, accounts)
+        let lines = tracker_states_check(system, config, accounts, folder)
             .into_iter()
-            .chain(tracker_identity_check(system, config, accounts))
+            .chain(tracker_identity_check(system, config, accounts, folder))
             .collect();
         Doctored {
             lines,
@@ -318,6 +320,7 @@ fn tracker_states_check(
     system: &dyn System,
     config: &ProjectConfig,
     accounts: Option<&TrackerAccounts>,
+    folder: &Path,
 ) -> Option<Check> {
     const SUBJECT: &str = "tracker states";
     let Some(team) = &config.tracker.team else {
@@ -339,10 +342,7 @@ fn tracker_states_check(
                 format!("not checked: no Linear API key {place}"),
                 "`owlshift do` reads the ticket with the Linear API key Owlshift keeps in the \
                  system keychain, and doctor reads the team's workflow states with it.",
-                vec![Step::run_noting(
-                    "owlshift init",
-                    "paste the key when asked",
-                )],
+                vec![super::linear_key_step(folder)],
             );
         }
         Err(StatesError::Keychain(reason)) => {
@@ -537,6 +537,7 @@ fn tracker_identity_check(
     system: &dyn System,
     config: &ProjectConfig,
     accounts: Option<&TrackerAccounts>,
+    folder: &Path,
 ) -> Option<Check> {
     const SUBJECT: &str = "tracker identity";
     let Some(team) = &config.tracker.team else {
@@ -552,16 +553,14 @@ fn tracker_identity_check(
     let why = "With the Linear app stored, `owlshift do` writes as its app user, checked before \
                any work, and refuses rather than write through the API key.";
     let shared = accounts.source == Source::Shared;
-    let store_both = || {
-        vec![Step::run_noting(
-            "owlshift init --replace-secrets",
-            if shared {
-                "give this project a Linear key of its own, then its Linear app's client ID and \
-                 secret, when asked"
-            } else {
-                "give the Linear app's client ID and secret when asked"
-            },
-        )]
+    // The fixes the service's pause names for the same fault, in the same
+    // folder (OWL-658).
+    let fixed = |kind| {
+        AppFault {
+            kind,
+            accounts: accounts.clone(),
+        }
+        .steps(folder)
     };
     let fail =
         |detail: String, fix: Vec<Step>| Check::fail(Section::Project, SUBJECT, detail, why, fix);
@@ -597,7 +596,7 @@ fn tracker_identity_check(
                 "half of the Linear app is stored: nothing under service `{SERVICE}`, account \
                  `{missing}`"
             ),
-            store_both(),
+            fixed(AppFaultKind::Half),
         ),
         Err(AppError::Tracker { error, .. }) => fail(
             format!("the Linear app stored {place} cannot be used: {error}"),
@@ -615,7 +614,8 @@ fn tracker_identity_check(
                      through the API key",
                     )]
                 }
-                ErrorKind::Unauthorized | ErrorKind::NotFound => store_both(),
+                ErrorKind::Unauthorized => fixed(AppFaultKind::Refused),
+                ErrorKind::NotFound => fixed(AppFaultKind::NoTeam(team.to_ascii_uppercase())),
             },
         ),
     })

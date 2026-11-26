@@ -104,6 +104,7 @@ kind = \"github\"
         config: &ProjectConfig,
         _accounts: Option<&TrackerAccounts>,
         repo: Option<&Repo>,
+        _folder: &Path,
     ) -> Doctored {
         let Some(repo) = repo else {
             return Doctored::default();
