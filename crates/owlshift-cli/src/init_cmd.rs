@@ -32,7 +32,6 @@ use owlshift_runner::config::{Effective, FileState};
 use owlshift_runner::events::printable;
 use owlshift_runner::forge::{AppAccess, GitHubApp};
 use owlshift_runner::github_sign_in::{self, Ask, GitHub, Outcome, SystemWait};
-use owlshift_runner::github_token::TokenEvents;
 use owlshift_runner::init::{
     AppStored, CLAUDE_TOKEN, EXAMPLE_ASSIGNEE, EXAMPLE_TICKET, GITHUB_TOKEN, InitOptions,
     MARKDOWN_LIMITS, MARKDOWN_PAGE, PeopleEntry, SecretsReport, Wanted, Written,
@@ -332,12 +331,7 @@ pub fn run(args: &Args, config: &Effective) -> ExitCode {
         app.clone(),
     );
     let github_ready = match &repo {
-        Ok(repo) if args.github_token => personal_token_chosen(
-            &keychain,
-            repo,
-            &report,
-            access.events(&repo.to_string()).as_ref(),
-        ),
+        Ok(repo) if args.github_token => personal_token_chosen(&access, repo, &report),
         Ok(repo) => {
             let flow = DeviceFlow::new(HttpLogin::new(), &app.client_id);
             let github = GitHub::live(flow, repo, access.clone());
@@ -807,18 +801,15 @@ fn app_access(
 /// own, stored or kept, removes its GitHub App token, which would otherwise
 /// be used first, and says so; `false` when that removal fails. With no
 /// personal token of its own, nothing is removed, and the token's absence is
-/// in `report` already.
-fn personal_token_chosen(
-    keychain: &Keychain,
-    repo: &Repo,
-    report: &SecretsReport,
-    events: Option<&TokenEvents>,
-) -> bool {
+/// in `report` already. The removal is made in the keychain of `access` and
+/// recorded in its event log, when it has one, as the project's (OWL-649).
+fn personal_token_chosen(access: &AppAccess, repo: &Repo, report: &SecretsReport) -> bool {
     let own = |found: &[Wanted]| found.iter().any(|one| one.spec == GITHUB_TOKEN);
     if !(own(&report.stored) || own(&report.kept)) {
         return true;
     }
-    match github_sign_in::remove_app_token(keychain, repo, events) {
+    let events = access.events(&repo.to_string());
+    match github_sign_in::remove_app_token(access.keychain(), repo, events.as_ref()) {
         Ok(true) => {
             println!(
                 "Removed the GitHub App's token this project had stored (account `{}`): the \
@@ -1169,11 +1160,27 @@ mod tests {
 
     /// Criterion 6 (OWL-383): `--github-token` stores the personal token under
     /// the project's own account and removes the app token, which would be
-    /// used first; with no personal token given, the app token stays.
+    /// used first; with no personal token given, the app token stays. The
+    /// removal is recorded in the log of init's access, the project's data
+    /// directory's (OWL-649).
     #[test]
     fn a_personal_token_with_github_token_removes_the_app_token() {
+        let data = tempfile::tempdir().unwrap();
         let repo = Repo::parse("pitchopp/owlshift").unwrap();
-        let keychain = Keychain::in_memory();
+        let keychain = Arc::new(Keychain::in_memory());
+        let access = app_access(
+            keychain.clone(),
+            Some(&repo),
+            Ok(data.path().to_owned()),
+            GitHubApp::from_personal(None),
+        );
+        let printed = || {
+            let mut out = Vec::new();
+            let log = owlshift_runner::events::EventLog::in_dir(data.path());
+            owlshift_runner::events::print(log.path(), None, &mut out, &mut Vec::new(), None, None)
+                .unwrap();
+            String::from_utf8(out).unwrap()
+        };
         let app = ForgeAccount::project_app(&repo).token;
         keychain
             .store(&app, &Secret::new("{\"v\":1,\"access_token\":\"ghu_x\"}"))
@@ -1184,15 +1191,28 @@ mod tests {
 
         let report = store_secrets(&keychain, &wanted, false, &mut |_| None).unwrap();
         assert_eq!(report.missing.len(), 1);
-        assert!(personal_token_chosen(&keychain, &repo, &report, None));
+        assert!(personal_token_chosen(&access, &repo, &report));
         assert!(keychain.contains(&app).unwrap());
+        assert_eq!(printed(), "");
 
         let report = store_secrets(&keychain, &wanted, false, &mut |_| {
             Some(Secret::new("github_pat_x"))
         })
         .unwrap();
-        assert!(personal_token_chosen(&keychain, &repo, &report, None));
+        assert!(personal_token_chosen(&access, &repo, &report));
         assert!(!keychain.contains(&app).unwrap());
+        let printed = printed();
+        let lines: Vec<&str> = printed.lines().collect();
+        assert_eq!(lines.len(), 1, "{printed}");
+        for detail in [
+            " github_app=keychain_write ",
+            " by=removal ",
+            " outcome=removed ",
+            " project=pitchopp/owlshift ",
+        ] {
+            assert!(lines[0].contains(detail), "{detail}: {printed}");
+        }
+        assert!(!printed.contains("ghu_"), "{printed}");
         assert_eq!(
             keychain
                 .read(&ForgeAccount::project(&repo).token)
