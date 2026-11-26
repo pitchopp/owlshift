@@ -27,6 +27,34 @@ use owlshift_adapters::forge::Repo;
 use owlshift_platform::keychain::SERVICE;
 
 use crate::forge::{GITHUB_ACCOUNT, GITHUB_APP_ACCOUNT};
+use crate::refusal::resumed;
+
+/// What mends a system keychain that does not open or whose entry does not
+/// read (OWL-658): the person unlocks it and allows Owlshift's read, and
+/// stores nothing again. The words [`keychain_notice`] and `owlshift
+/// doctor`'s keychain fix share. Owlshift's runs are confined on macOS and
+/// Linux only, so the Windows store is not named.
+pub const UNLOCK_KEYCHAIN: &str = "Unlock the system keychain and let Owlshift read it: the \
+     login keychain on macOS, the Secret Service on Linux, which must be running; nothing needs \
+     storing again";
+
+/// What a person reads when the system keychain did not open or an entry of
+/// the project of `repo` did not read (OWL-658): what stops and
+/// [`UNLOCK_KEYCHAIN`], with no command and no folder, since `owlshift init`
+/// would store nothing new. When `resumes`, the daemon tries the project
+/// again by itself, and the notice says so; a command typed in a terminal
+/// does not.
+pub fn keychain_notice(repo: &Repo, resumes: bool) -> String {
+    let notice = format!(
+        "Owlshift cannot read the system keychain for {repo}, so none of its tickets move. \
+         {UNLOCK_KEYCHAIN}."
+    );
+    resumed(
+        notice,
+        resumes,
+        "Owlshift tries again by itself and picks the project up again within a minute.",
+    )
+}
 
 /// Where a set of secrets is read from.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -557,5 +585,23 @@ mod tests {
         let (none, _) = found(&[]);
         assert_eq!(none.accounts, own);
         assert!(!none.any());
+    }
+
+    /// OWL-658: a keychain that does not read is said with what stops and
+    /// how to unlock it, no command, no folder and no keychain entry; only
+    /// the daemon's watch says it tries again by itself.
+    #[test]
+    fn the_keychain_notice_says_to_unlock_it_and_nothing_else() {
+        let repo = Repo::parse("acme/web").unwrap();
+        assert_eq!(
+            keychain_notice(&repo, true),
+            "Owlshift cannot read the system keychain for acme/web, so none of its tickets move. \
+             Unlock the system keychain and let Owlshift read it: the login keychain on macOS, \
+             the Secret Service on Linux, which must be running; nothing needs storing again. \
+             Owlshift tries again by itself and picks the project up again within a minute."
+        );
+        let typed = keychain_notice(&repo, false);
+        assert!(typed.ends_with("nothing needs storing again."), "{typed}");
+        assert!(!typed.contains("owlshift init"), "{typed}");
     }
 }

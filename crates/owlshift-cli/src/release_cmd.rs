@@ -17,6 +17,7 @@ use owlshift_runner::events::{EventLog, EventSink, printable};
 use owlshift_runner::on_demand;
 use owlshift_runner::operator;
 use owlshift_runner::project::{self, ProjectDirs};
+use owlshift_runner::refusal::Refusal;
 use owlshift_runner::release::{self, Operator, Release};
 use owlshift_runner::served::{self, Served};
 
@@ -85,12 +86,15 @@ fn release(
     let (_, project) = crate::do_cmd::loaded_project(config, "`owlshift release`")?;
     on_demand::check_team(project, &ticket)?;
     let dirs = ProjectDirs::new(&data_dir, &repo);
-    let secrets = Secrets::read(open_keychain, project, &repo, &dirs, &config.personal)
-        .map_err(|refusal| refusal.message)?;
+    // A refusal a person mends is said in their words, naming this folder,
+    // its technical words dropped as for any refusal of `release` (OWL-658).
+    let worded = |refusal: Refusal| refusal.in_checkout(&repo, root, false).message;
+    let secrets =
+        Secrets::read(open_keychain, project, &repo, &dirs, &config.personal).map_err(worded)?;
     let tracker = secrets
         .opener(project, root, &repo)
         .and_then(|opener| opener.open())
-        .map_err(|refusal| refusal.message)?;
+        .map_err(worded)?;
     let personal = match &config.personal {
         FileState::Loaded { config, .. } => Some(config),
         _ => None,

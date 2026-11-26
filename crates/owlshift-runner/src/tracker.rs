@@ -39,11 +39,12 @@ use owlshift_adapters::tracker::{AccountFact, Capability, ErrorKind};
 use owlshift_contracts::config::{self, PersonalConfig, ProjectConfig, TrackerKind};
 use owlshift_contracts::ids::TicketId;
 use owlshift_platform::keychain::{Keychain, SERVICE, Secret};
+use owlshift_platform::service::sh_quote;
 
 use crate::config::FileState;
-use crate::doctor::Check;
+use crate::doctor::{Check, Step};
 use crate::init::SecretSpec;
-use crate::refusal::Refusal;
+use crate::refusal::{PICKED_UP_AGAIN, Refusal, resumed};
 use crate::secrets::{ForgeSecret, Lookup, SecretSet, Source, TrackerAccounts, TrackerSecrets};
 use crate::system::System;
 
@@ -101,13 +102,15 @@ pub trait Kind: Sync {
     /// (`None` when `origin` names none): its own lines, and what it says of
     /// the project's admission and proposals setup (OWL-155), read once for
     /// doctor's `drain admission` and `proposals inbox` lines (`None` when
-    /// the tracker is not asked).
+    /// the tracker is not asked). A fix that runs `owlshift init` names
+    /// `folder`, the one the service's pause names (OWL-658).
     fn doctor(
         &self,
         system: &dyn System,
         config: &ProjectConfig,
         accounts: Option<&TrackerAccounts>,
         repo: Option<&Repo>,
+        folder: &Path,
     ) -> Doctored;
 
     /// Doctor's `proposals inbox` line (OWL-155): whether a follow-up
@@ -452,34 +455,247 @@ pub static LINEAR_SECRETS: SecretSet = SecretSet {
 /// request, which a restart may mend (OWL-435, [`Refusal`]).
 pub fn linear(secrets: &TrackerSecrets<Secret>, team: &str) -> Result<LinearTracker, Refusal> {
     let Some(key) = secrets.get(LINEAR_ACCOUNT) else {
-        return Err(format!(
+        return Err(Refusal::no_linear_key(format!(
             "no Linear API key in the system keychain: run `owlshift init` in a terminal, or \
              store one under service `{SERVICE}`, account `{}`",
             secrets.accounts.of(LINEAR_ACCOUNT)
-        )
-        .into());
+        )));
     };
     let tracker = LinearTracker::new(ApiKey::new(key.expose()));
-    match app_credentials(secrets).map_err(|e| e.to_string())? {
+    let accounts = &secrets.accounts;
+    match app_credentials(secrets).map_err(|error| app_refusal(error, accounts, team))? {
         None => Ok(tracker),
-        Some(credentials) => open_app(tracker, credentials, &secrets.accounts, team)
+        Some(credentials) => open_app(tracker, credentials, accounts, team)
             .map(|(tracker, _)| tracker)
-            .map_err(app_refusal),
+            .map_err(|error| app_refusal(error, accounts, team)),
     }
 }
 
-/// The refusal of a Linear app that could not be used: waiting for the
-/// network when Linear gave no answer at all (OWL-479), passing when it
-/// answered with an error a retry may clear, lasting otherwise.
-fn app_refusal(error: AppError) -> Refusal {
+/// What a person reads when no Linear API key is stored for the project of
+/// `repo` (OWL-658): what stops, the command and the folder to run it in,
+/// `checkout` shell-quoted, where to make the key, and what the command
+/// keeps. `owlshift init` asks for a secret it does not find, keeps those
+/// already stored and an existing project file. When `resumes`, the daemon
+/// tries the project again by itself, and the notice says so.
+pub fn linear_key_notice(repo: &Repo, checkout: &Path, resumes: bool) -> String {
+    let notice = format!(
+        "Owlshift has no Linear API key for {repo}, so none of its tickets move. Give it one: \
+         `cd {}` then `owlshift init`, and paste {MAKE_A_KEY}; your owlshift.toml, your other \
+         stored keys and your tickets are kept.",
+        sh_quote(&checkout.display().to_string())
+    );
+    resumed(notice, resumes, PICKED_UP_AGAIN)
+}
+
+/// The step of `owlshift doctor`'s `tracker states` line for no Linear API
+/// key: the [`linear_key_notice`]'s fix, in `folder` (OWL-658).
+pub(crate) fn linear_key_step(folder: &Path) -> Step {
+    Step::run_noting(
+        "owlshift init",
+        &format!(
+            "in {}: paste {MAKE_A_KEY}; your owlshift.toml, your other stored keys and your \
+             tickets are kept",
+            folder.display()
+        ),
+    )
+}
+
+/// Where a person makes the Linear API key `owlshift init` asks for, as its
+/// own question says ([`crate::init::LINEAR_KEY`]).
+const MAKE_A_KEY: &str = "a personal API key you create in Linear's settings under Security & \
+     access";
+
+/// The refusal of the Linear app stored under `accounts` that could not be
+/// used for team `team`: waiting for the network when Linear gave no answer
+/// at all (OWL-479), passing when it answered with an error a retry may
+/// clear, lasting otherwise. A lasting one a person mends is worded by its
+/// [`AppFault`] once its command knows its folder (OWL-658).
+fn app_refusal(error: AppError, accounts: &TrackerAccounts, team: &str) -> Refusal {
+    let lasting = |kind| {
+        Refusal::linear_app(
+            error.to_string(),
+            AppFault {
+                kind,
+                accounts: accounts.clone(),
+            },
+        )
+    };
     match &error {
         AppError::Tracker { error: answer, .. } => match answer.kind {
             ErrorKind::Unreachable => Refusal::unreachable(error.to_string()),
             ErrorKind::Other | ErrorKind::NoGesture => Refusal::passing(error.to_string()),
-            ErrorKind::Unauthorized | ErrorKind::NotFound => error.to_string().into(),
+            ErrorKind::Unauthorized => lasting(AppFaultKind::Refused),
+            ErrorKind::NotFound => lasting(AppFaultKind::NoTeam(team.to_ascii_uppercase())),
         },
-        _ => error.to_string().into(),
+        AppError::Incomplete { .. } => lasting(AppFaultKind::Half),
+        AppError::Keychain(_) => Refusal::keychain(error.to_string()),
+        AppError::NoKey { .. } => Refusal::no_linear_key(error.to_string()),
     }
+}
+
+/// Why the Linear app a project stores keeps its tickets from moving, and
+/// under which accounts, for the notice a person reads (OWL-658).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AppFault {
+    pub kind: AppFaultKind,
+    pub accounts: TrackerAccounts,
+}
+
+/// What is wrong with the Linear app: each kind has its own fix.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum AppFaultKind {
+    /// One of its two entries is stored without the other.
+    Half,
+    /// Linear refused it: its token's request, or the API key the app is
+    /// checked against (both answer `Unauthorized`).
+    Refused,
+    /// It does not see the team of this key: an app reaches the
+    /// workspace's public teams only.
+    NoTeam(String),
+}
+
+impl AppFault {
+    /// What a person reads for the project of `repo` whose command runs from
+    /// `checkout`: what stops, then each fix with what it keeps. A whole
+    /// pair of the project's own that Linear refused is stored again with
+    /// `owlshift init --replace-secrets`, which asks again for each stored
+    /// secret and signs in to GitHub again; half a pair and a shared set are
+    /// mended by `owlshift init`, which asks for what is missing. The
+    /// project's own entries may be deleted to write through the API key;
+    /// shared ones never are (OWL-308). When `resumes`, the notice says the
+    /// daemon picks the project up again.
+    pub fn notice(&self, repo: &Repo, checkout: &Path, resumes: bool) -> String {
+        let cd = format!("`cd {}`", sh_quote(&checkout.display().to_string()));
+        let shared = self.accounts.source == Source::Shared;
+        let from = if shared {
+            ", from the keychain entries every project of this machine shares"
+        } else {
+            ""
+        };
+        let head = match &self.kind {
+            AppFaultKind::Half => format!(
+                "Only half of the Linear app Owlshift writes as is stored for {repo}{from}, so \
+                 none of its tickets move."
+            ),
+            AppFaultKind::Refused => format!(
+                "Linear refused the app Owlshift writes as for {repo}, or the API key it checks \
+                 the app with{from}, so none of its tickets move."
+            ),
+            AppFaultKind::NoTeam(team) => format!(
+                "The Linear app Owlshift writes as for {repo}{from} does not see team {team}, as \
+                 an app reaches the workspace's public teams only, so none of its tickets move."
+            ),
+        };
+        let fixes = match (&self.kind, shared) {
+            (AppFaultKind::NoTeam(team), true) => format!(
+                "Either {}. Or give the project a Linear key and app of its own: {cd} then \
+                 `owlshift init`, {}.",
+                public_team(team),
+                OWN_SET_GIVEN
+            ),
+            (_, true) => format!(
+                "Give the project a Linear key and app of its own: {cd} then `owlshift init`, \
+                 {OWN_SET_GIVEN}."
+            ),
+            (AppFaultKind::Half, false) => format!(
+                "Either store it whole: {cd} then `owlshift init`, {HALF_GIVEN}. Or {}.",
+                self.write_through_key()
+            ),
+            (AppFaultKind::Refused, false) => format!(
+                "Either store them again: {cd} then `owlshift init --replace-secrets`, \
+                 {REFUSED_GIVEN}. Or, {}.",
+                self.write_through_key()
+            ),
+            (AppFaultKind::NoTeam(team), false) => format!(
+                "Either {}. Or {}.",
+                public_team(team),
+                self.write_through_key()
+            ),
+        };
+        resumed(format!("{head} {fixes}"), resumes, PICKED_UP_AGAIN)
+    }
+
+    /// The steps of `owlshift doctor`'s `tracker identity` line for this
+    /// fault, in `folder`: the notice's fixes, in the same words.
+    pub(crate) fn steps(&self, folder: &Path) -> Vec<Step> {
+        let shared = self.accounts.source == Source::Shared;
+        let in_folder = |words: &str| format!("in {}: {words}", folder.display());
+        let mut steps = Vec::new();
+        if let AppFaultKind::NoTeam(team) = &self.kind {
+            steps.push(Step::act(capitalized(&public_team(team))));
+        }
+        if shared {
+            steps.push(Step::run_noting(
+                "owlshift init",
+                &in_folder(&format!(
+                    "give the project a Linear key and app of its own: {OWN_SET_GIVEN}"
+                )),
+            ));
+            return steps;
+        }
+        match &self.kind {
+            AppFaultKind::Half => {
+                steps.push(Step::run_noting("owlshift init", &in_folder(HALF_GIVEN)));
+            }
+            AppFaultKind::Refused => steps.push(Step::run_noting(
+                "owlshift init --replace-secrets",
+                &in_folder(REFUSED_GIVEN),
+            )),
+            AppFaultKind::NoTeam(_) => {}
+        }
+        steps.push(Step::act(format!("Or {}", self.write_through_key())));
+        steps
+    }
+
+    /// The choice of writing through the API key: the project's own two
+    /// entries to delete, and what it costs.
+    fn write_through_key(&self) -> String {
+        let (id, secret) = (
+            self.accounts.of(LINEAR_APP_ID_ACCOUNT),
+            self.accounts.of(LINEAR_APP_SECRET_ACCOUNT),
+        );
+        let (lead, which) = match self.kind {
+            AppFaultKind::Half => ("write through the Linear API key", ", whichever is there"),
+            AppFaultKind::Refused => ("if the API key still works, write through it", ""),
+            AppFaultKind::NoTeam(_) => ("write through the Linear API key", ""),
+        };
+        format!(
+            "{lead}: delete the keychain entries `{id}` and `{secret}` (service \
+             `{SERVICE}`){which}; everything else is kept, but Linear then does not notify the \
+             key's holder of Owlshift's questions"
+        )
+    }
+}
+
+/// What `owlshift init` asks once half the app's pair is stored, and what it
+/// keeps.
+const HALF_GIVEN: &str = "and give the app's client ID and secret; your owlshift.toml, your \
+     other stored keys and your tickets are kept";
+
+/// What `owlshift init --replace-secrets` asks for a refused app, and what
+/// it keeps: it asks again for every stored secret and signs in to GitHub
+/// again.
+const REFUSED_GIVEN: &str = "and give the app's client ID and secret, and a new API key if \
+     Linear revoked it; it asks again for each stored key, where Enter keeps it, and signs in \
+     to GitHub again; your owlshift.toml and your tickets are kept";
+
+/// What `owlshift init` asks of a project that reads the shared set: its
+/// own key, the shared one kept by an empty answer, then its own app.
+const OWN_SET_GIVEN: &str = "paste this project's Linear API key, then its app's client ID and \
+     secret, or leave those empty to write through the key; the shared entries stay for the \
+     other projects, and your owlshift.toml and your tickets are kept";
+
+/// The fix of an app that does not see team `team`.
+fn public_team(team: &str) -> String {
+    format!("make team {team} a public team in Linear; nothing needs storing again")
+}
+
+/// `text` with its first letter in upper case.
+fn capitalized(text: &str) -> String {
+    let mut chars = text.chars();
+    chars.next().map_or_else(String::new, |first| {
+        first.to_uppercase().chain(chars).collect()
+    })
 }
 
 /// Why the Linear app could not be used.
@@ -514,8 +730,7 @@ impl fmt::Display for AppError {
                  `{SERVICE}`, account `{missing}`. {}",
                 match source {
                     Source::Project =>
-                        "Run `owlshift init --replace-secrets` to store its \
-                                        client ID and secret together",
+                        "Run `owlshift init` to store its client ID and secret together",
                     Source::Shared => SHARED_FIX,
                 }
             ),
@@ -548,10 +763,11 @@ impl fmt::Display for AppError {
 }
 
 /// The fix for the shared tracker set, whose entries other projects of the
-/// machine may use and which Owlshift never tells anyone to delete.
-const SHARED_FIX: &str = "run `owlshift init --replace-secrets` in this repository to give the \
-     project a Linear key and app of its own: the shared entries serve every project of this \
-     machine";
+/// machine may use and which Owlshift never tells anyone to delete. `owlshift
+/// init` asks for the project's own key, which the shared one does not
+/// count as, then its own app (OWL-658: `--replace-secrets` is not needed).
+const SHARED_FIX: &str = "run `owlshift init` in this repository to give the project a Linear \
+     key and app of its own: the shared entries serve every project of this machine";
 
 /// The Linear app's client ID and secret of `secrets`: `None` when neither
 /// is stored, [`AppError::Incomplete`] when only one is.
@@ -907,21 +1123,167 @@ mod tests {
     #[test]
     fn an_app_that_could_not_be_used_is_refused_by_what_mends_it() {
         let of = |kind| {
-            app_refusal(AppError::Tracker {
-                error: tracker::Error::new(kind, "Linear's token endpoint: io: x"),
-                accounts: own(),
-            })
+            app_refusal(
+                AppError::Tracker {
+                    error: tracker::Error::new(kind, "Linear's token endpoint: io: x"),
+                    accounts: own(),
+                },
+                &own(),
+                "owl",
+            )
         };
         assert!(of(ErrorKind::Unreachable).unanswered());
         let passing = of(ErrorKind::Other);
         assert!(!passing.lasting() && !passing.unanswered());
         assert!(of(ErrorKind::Unauthorized).lasting());
+        assert!(of(ErrorKind::NotFound).lasting());
         assert!(
-            app_refusal(AppError::NoKey {
-                account: "k".into()
-            })
+            app_refusal(
+                AppError::NoKey {
+                    account: "k".into()
+                },
+                &own(),
+                "owl"
+            )
             .lasting()
         );
+
+        // OWL-658: only a lasting refusal is worded for a person; a passing
+        // one, and one waiting for the network, keep their words.
+        let repo = Repo::parse("pitchopp/owlshift").unwrap();
+        let folder = Path::new("/work/owlshift");
+        let fault = |kind| AppFault {
+            kind,
+            accounts: own(),
+        };
+        for (kind, fault_kind) in [
+            (ErrorKind::Unauthorized, AppFaultKind::Refused),
+            (ErrorKind::NotFound, AppFaultKind::NoTeam("OWL".into())),
+        ] {
+            let said = of(kind).in_checkout(&repo, folder, true);
+            assert_eq!(said.message, fault(fault_kind).notice(&repo, folder, true));
+            assert!(said.detail.unwrap().contains("cannot be used"));
+        }
+        for kind in [ErrorKind::Unreachable, ErrorKind::Other] {
+            let said = of(kind).in_checkout(&repo, folder, true);
+            assert_eq!(said.detail, None, "{said}");
+            assert!(said.message.contains("cannot be used"), "{said}");
+        }
+    }
+
+    /// OWL-658: no Linear API key is said with the folder quoted, where to
+    /// make the key, and what `owlshift init` keeps; never the keychain
+    /// entry, which the technical words before it keep.
+    #[test]
+    fn no_linear_key_is_said_with_the_command_and_its_folder() {
+        let repo = Repo::parse("acme/web").unwrap();
+        let folder = Path::new("/Users/ada/My Projects/web");
+        assert_eq!(
+            linear_key_notice(&repo, folder, true),
+            "Owlshift has no Linear API key for acme/web, so none of its tickets move. Give it \
+             one: `cd '/Users/ada/My Projects/web'` then `owlshift init`, and paste a personal \
+             API key you create in Linear's settings under Security & access; your \
+             owlshift.toml, your other stored keys and your tickets are kept. Owlshift picks the \
+             project up again within a minute."
+        );
+        let typed = linear_key_notice(&repo, Path::new("/tmp/ada's web"), false);
+        assert!(typed.contains(r"`cd '/tmp/ada'\''s web'`"), "{typed}");
+        assert!(typed.ends_with("your tickets are kept."), "{typed}");
+
+        let keychain = Keychain::in_memory();
+        let accounts = TrackerAccounts::project(&repo, &LINEAR_SECRETS);
+        let refused = linear(&read(&keychain, &accounts).unwrap(), "WEB").unwrap_err();
+        assert!(refused.lasting(), "{refused}");
+        let technical = refused.message.clone();
+        let said = refused.in_checkout(&repo, folder, false);
+        assert_eq!(said.message, linear_key_notice(&repo, folder, false));
+        assert_eq!(said.detail, Some(technical));
+        assert!(!said.message.contains("service `"), "{said}");
+    }
+
+    /// OWL-658: the Linear app's notices, one per fault and source. The
+    /// project's own pair: half of it is stored by `owlshift init`, a whole
+    /// one Linear refused by `--replace-secrets`, which says it asks again
+    /// and signs in again; both may be deleted to write through the key. A
+    /// shared set is never told to be deleted.
+    #[test]
+    fn each_app_fault_is_said_with_its_fixes() {
+        let repo = Repo::parse("acme/web").unwrap();
+        let folder = Path::new("/work/web");
+        let own = TrackerAccounts::project(&repo, &LINEAR_SECRETS);
+        let shared = TrackerAccounts::shared(&LINEAR_SECRETS);
+        let notice = |kind, accounts: &TrackerAccounts, resumes| {
+            AppFault {
+                kind,
+                accounts: accounts.clone(),
+            }
+            .notice(&repo, folder, resumes)
+        };
+        let delete = "delete the keychain entries `github.com/acme/web/linear-app-client-id` and \
+                      `github.com/acme/web/linear-app-client-secret` (service `owlshift`)";
+        let costs = "everything else is kept, but Linear then does not notify the key's holder \
+                     of Owlshift's questions.";
+
+        assert_eq!(
+            notice(AppFaultKind::Half, &own, true),
+            format!(
+                "Only half of the Linear app Owlshift writes as is stored for acme/web, so none \
+                 of its tickets move. Either store it whole: `cd '/work/web'` then `owlshift \
+                 init`, and give the app's client ID and secret; your owlshift.toml, your other \
+                 stored keys and your tickets are kept. Or write through the Linear API key: \
+                 {delete}, whichever is there; {costs} Owlshift picks the project up again \
+                 within a minute."
+            )
+        );
+        assert_eq!(
+            notice(AppFaultKind::Refused, &own, false),
+            format!(
+                "Linear refused the app Owlshift writes as for acme/web, or the API key it \
+                 checks the app with, so none of its tickets move. Either store them again: `cd \
+                 '/work/web'` then `owlshift init --replace-secrets`, and give the app's client \
+                 ID and secret, and a new API key if Linear revoked it; it asks again for each \
+                 stored key, where Enter keeps it, and signs in to GitHub again; your \
+                 owlshift.toml and your tickets are kept. Or, if the API key still works, write \
+                 through it: {delete}; {costs}"
+            )
+        );
+        assert_eq!(
+            notice(AppFaultKind::NoTeam("WEB".into()), &own, false),
+            format!(
+                "The Linear app Owlshift writes as for acme/web does not see team WEB, as an \
+                 app reaches the workspace's public teams only, so none of its tickets move. \
+                 Either make team WEB a public team in Linear; nothing needs storing again. Or \
+                 write through the Linear API key: {delete}; {costs}"
+            )
+        );
+
+        let own_set = "Give the project a Linear key and app of its own: `cd '/work/web'` then \
+                       `owlshift init`, paste this project's Linear API key, then its app's \
+                       client ID and secret, or leave those empty to write through the key; the \
+                       shared entries stay for the other projects, and your owlshift.toml and \
+                       your tickets are kept.";
+        assert_eq!(
+            notice(AppFaultKind::Refused, &shared, false),
+            format!(
+                "Linear refused the app Owlshift writes as for acme/web, or the API key it \
+                 checks the app with, from the keychain entries every project of this machine \
+                 shares, so none of its tickets move. {own_set}"
+            )
+        );
+        for kind in [
+            AppFaultKind::Half,
+            AppFaultKind::Refused,
+            AppFaultKind::NoTeam("WEB".into()),
+        ] {
+            let said = notice(kind, &shared, true);
+            assert!(!said.contains("delete"), "{said}");
+            assert!(!said.contains("--replace-secrets"), "{said}");
+            assert!(said.contains("`owlshift init`"), "{said}");
+            assert!(
+                said.ends_with("Owlshift picks the project up again within a minute."),
+                "{said}"
+            );
+        }
     }
 
     #[test]
@@ -1042,8 +1404,10 @@ mod tests {
         ] {
             let text = shared.to_string();
             assert!(!text.contains("delete"), "{text}");
+            // OWL-658: `owlshift init` asks for the project's own key and
+            // app; `--replace-secrets` is not needed.
             assert!(
-                text.contains("`owlshift init --replace-secrets` in this repository"),
+                text.contains("`owlshift init` in this repository"),
                 "{text}"
             );
         }

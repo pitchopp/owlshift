@@ -302,7 +302,10 @@ pub fn run(system: &dyn System, config: &Effective, own: &BuildIdentity) -> Repo
     checks.push(file_check("personal config", &config.personal, home));
     checks.push(tracker_check(config));
     let stored = project_secrets(system, config);
-    checks.extend(stored.as_ref().map(secrets_check));
+    // The folder a fix that runs `owlshift init` names, the one the
+    // service's pause names (OWL-650, OWL-658).
+    let folder = init_folder(system, config, stored.as_ref());
+    checks.extend(stored.as_ref().map(|found| secrets_check(found, &folder)));
     checks.extend(
         stored
             .as_ref()
@@ -340,7 +343,8 @@ pub fn run(system: &dyn System, config: &Effective, own: &BuildIdentity) -> Repo
         Some(Ok(found)) => Some(&found.repo),
         _ => None,
     };
-    let doctored = tracker.map(|(kind, project)| kind.doctor(system, project, accounts, repo));
+    let doctored =
+        tracker.map(|(kind, project)| kind.doctor(system, project, accounts, repo, &folder));
     let facts = doctored.and_then(|doctored| {
         checks.extend(doctored.lines);
         doctored.facts
@@ -897,9 +901,9 @@ fn codex_requirements_check(system: &dyn System) -> Option<Check> {
     })
 }
 
-/// The step that fixes a keychain doctor cannot read.
-pub(crate) const KEYCHAIN_FIX: &str = "Make the system keychain available: unlock it on macOS; on Linux, \
-                            start a Secret Service such as GNOME Keyring";
+/// The step that fixes a keychain doctor cannot read: the words the
+/// service's pause gives for one its watch cannot read (OWL-658).
+pub(crate) const KEYCHAIN_FIX: &str = secrets::UNLOCK_KEYCHAIN;
 
 /// The harnesses doctor checks (scenario S15): Claude Code, which runs every
 /// role, and Codex only when the personal file declares it (OWL-347) or the
@@ -1470,19 +1474,33 @@ fn sign_in_folder(system: &dyn System, config: &Effective, repo: &Repo) -> (Path
     });
     match registered {
         Some(entry) => (PathBuf::from(entry.checkout), true),
-        None => {
-            let (FileState::Loaded { path, .. }
-            | FileState::Invalid { path, .. }
-            | FileState::Absent(path)) = &config.project
-            else {
-                return (PathBuf::from("."), false);
-            };
-            (
-                path.parent()
-                    .map_or_else(|| PathBuf::from("."), Path::to_path_buf),
-                false,
-            )
-        }
+        None => (project_folder(config), false),
+    }
+}
+
+/// The project file's folder, or `.` when there is none.
+fn project_folder(config: &Effective) -> PathBuf {
+    let (FileState::Loaded { path, .. }
+    | FileState::Invalid { path, .. }
+    | FileState::Absent(path)) = &config.project
+    else {
+        return PathBuf::from(".");
+    };
+    path.parent()
+        .map_or_else(|| PathBuf::from("."), Path::to_path_buf)
+}
+
+/// The folder the fixes that run `owlshift init` name (OWL-658): the
+/// [`sign_in_folder`] of the project's repository when its secrets were
+/// resolved, the project file's folder otherwise.
+fn init_folder(
+    system: &dyn System,
+    config: &Effective,
+    stored: Option<&Result<ProjectSecrets, Unresolved>>,
+) -> PathBuf {
+    match stored {
+        Some(Ok(found)) => sign_in_folder(system, config, &found.repo).0,
+        _ => project_folder(config),
     }
 }
 
@@ -2676,8 +2694,9 @@ fn rerun_permission_check(
 /// read from (OWL-308). A secret read from an account every project of the
 /// machine shares is a warning: the project works, on a key or token that
 /// may be another project's. No GitHub token fails, as `owlshift do`
-/// refuses then; a missing Linear key is the `tracker states` line's.
-fn secrets_check(found: &Result<ProjectSecrets, Unresolved>) -> Check {
+/// refuses then, and its fix runs `owlshift init` in `folder`; a missing
+/// Linear key is the `tracker states` line's.
+fn secrets_check(found: &Result<ProjectSecrets, Unresolved>, folder: &Path) -> Check {
     const SUBJECT: &str = "secrets";
     let found = match found {
         Ok(found) => found,
@@ -2735,9 +2754,15 @@ fn secrets_check(found: &Result<ProjectSecrets, Unresolved>) -> Check {
             detail,
             "`owlshift do` opens the pull request with the project's GitHub token, kept in the \
              system keychain, and refuses to start without it.",
+            // The sign-in the service's pause names, in the same folder
+            // (OWL-658).
             vec![Step::run_noting(
                 "owlshift init",
-                "paste the token when asked",
+                &format!(
+                    "in {}: it signs in to GitHub with a code to enter on github.com; your \
+                     owlshift.toml, your other stored keys and your tickets are kept",
+                    folder.display()
+                ),
             )],
         );
     }
@@ -4908,7 +4933,7 @@ states = { ready = "Todo", working = "Doing", needs_input = "Needs Input", revie
                 ready()
                     .linear_app_is(Ok("owlshiftbot"))
                     .unstored(own().of(LINEAR_APP_SECRET_ACCOUNT)),
-                &["owlshift init --replace-secrets"],
+                &["owlshift init"],
             ),
             (
                 ready().linear_app_is(Err(refused)),
@@ -4922,6 +4947,112 @@ states = { ready = "Todo", working = "Doing", needs_input = "Needs Input", revie
             assert_eq!(commands(&failed.fix), expected, "{failed:?}");
             assert!(!ready_to_run);
         }
+    }
+
+    /// OWL-658: each line that finds a credential the service's pause would
+    /// name gives the pause's fix, in the folder the pause names: the
+    /// registered checkout when the service serves the project.
+    #[test]
+    fn the_credential_lines_give_the_pauses_fix_in_its_folder() {
+        use crate::tracker::{AppFault, AppFaultKind};
+        use owlshift_adapters::tracker::Error;
+
+        let (dir, owl) = linear_project();
+        let repo = Repo::parse("pitchopp/owlshift").unwrap();
+        let data = tempfile::tempdir().unwrap();
+        let checkout = dir.path().join("my checkout");
+        served::Registry::in_data_dir(data.path())
+            .register(&repo, &checkout)
+            .unwrap();
+        let ready = || {
+            logged_in(with_harnesses(with_git(FakeSystem::default())))
+                .data_dir_is(Some((data.path().to_owned(), DataDirSource::Platform)))
+        };
+        let fix_of = |system: &FakeSystem, subject: &str| {
+            let report = run(system, &owl);
+            let check = line(&report, subject).clone();
+            assert_eq!(check.status, Status::Fail, "{check:?}");
+            check.fix
+        };
+        let in_checkout = format!("in {}: ", checkout.display());
+
+        // No GitHub token: `owlshift init` signs in from the checkout.
+        let no_token = ready()
+            .unstored(&secrets::ForgeAccount::project(&repo).token)
+            .unstored(&secrets::ForgeAccount::shared().token);
+        let [Step::Run { command, note }] = &fix_of(&no_token, "secrets")[..] else {
+            panic!("one command");
+        };
+        assert_eq!(command, "owlshift init");
+        let note = note.as_deref().unwrap();
+        assert!(note.starts_with(&in_checkout), "{note}");
+        assert!(
+            note.contains("signs in to GitHub") && note.contains("your owlshift.toml"),
+            "{note}"
+        );
+
+        // No Linear API key: the key the notice asks for, from the checkout.
+        let no_key = ready().unstored(own().of(LINEAR_ACCOUNT));
+        assert_eq!(
+            fix_of(&no_key, "tracker states"),
+            [crate::tracker::linear_key_step(&checkout)]
+        );
+
+        // The Linear app: the notice's choices, in the same folder.
+        let fault = |kind| AppFault {
+            kind,
+            accounts: own(),
+        };
+        let half = ready()
+            .linear_app_is(Ok("owlshiftbot"))
+            .unstored(own().of(LINEAR_APP_SECRET_ACCOUNT));
+        let refused = Error::new(ErrorKind::Unauthorized, "refused");
+        let blind = Error::new(ErrorKind::NotFound, "the app does not see team \"OWL\"");
+        for (system, kind, commands_given) in [
+            (half, AppFaultKind::Half, &["owlshift init"][..]),
+            (
+                ready().linear_app_is(Err(refused.clone())),
+                AppFaultKind::Refused,
+                &["owlshift init --replace-secrets"],
+            ),
+            (
+                ready().linear_app_is(Err(blind)),
+                AppFaultKind::NoTeam("OWL".into()),
+                &[],
+            ),
+        ] {
+            let fix = fix_of(&system, "tracker identity");
+            assert_eq!(fix, fault(kind).steps(&checkout));
+            assert_eq!(commands(&fix), commands_given, "{fix:?}");
+            let Some(Step::Do(last)) = fix.last() else {
+                panic!("{fix:?}");
+            };
+            assert!(
+                last.contains("delete the keychain entries")
+                    && last.contains("github.com/pitchopp/owlshift/linear-app-client-id"),
+                "{last}"
+            );
+            for step in &fix {
+                if let Step::Run { note, .. } = step {
+                    assert!(
+                        note.as_deref().unwrap().starts_with(&in_checkout),
+                        "{fix:?}"
+                    );
+                }
+            }
+        }
+
+        // A shared set: this project's own key and app, never a deletion.
+        let shared = fix_of(
+            &ready().only_shared().linear_app_is(Err(refused)),
+            "tracker identity",
+        );
+        assert_eq!(commands(&shared), ["owlshift init"], "{shared:?}");
+        assert!(!format!("{shared:?}").contains("delete"), "{shared:?}");
+
+        // A keychain doctor cannot read: the words the pause gives.
+        assert_eq!(KEYCHAIN_FIX, crate::secrets::UNLOCK_KEYCHAIN);
+        assert!(crate::secrets::keychain_notice(&repo, true).contains(KEYCHAIN_FIX));
     }
 
     /// A Markdown project names states the adapter writes as they are: no

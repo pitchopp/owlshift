@@ -81,6 +81,7 @@ kind = \"markdown\"
         _config: &ProjectConfig,
         _accounts: Option<&TrackerAccounts>,
         _repo: Option<&Repo>,
+        _folder: &Path,
     ) -> Doctored {
         Doctored::default()
     }
