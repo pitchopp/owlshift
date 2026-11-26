@@ -1,10 +1,11 @@
 //! An operator's pause (OWL-438, architecture section 5, "Pause"):
 //! `<data>/service/pause` for every project of the machine, `<project
-//! data>/pause` for one, written by `owlshift pause` or, for a project whose
-//! watch could not start, by the daemon. While one stands a watch
-//! dispatches nothing and starts no step, Owlshift's own merge on green
+//! data>/pause` for one, written by `owlshift pause`. While one stands a
+//! watch dispatches nothing and starts no step, Owlshift's own merge on green
 //! included; the steps under way finish, and its passes go on reading
-//! answers, pull requests and stages. Removed, the next pass goes on.
+//! answers, pull requests and stages. Removed, the next pass goes on. The
+//! daemon's own pause of a project whose watch could not start is the same
+//! file but holds no watch (OWL-651): a watch that reads it has started.
 //!
 //! The pause is read at each pass and before each step, so one written in
 //! the middle of a pass starts no further step. Each pause, told apart by

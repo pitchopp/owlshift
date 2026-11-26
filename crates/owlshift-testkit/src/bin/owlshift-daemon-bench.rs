@@ -23,7 +23,9 @@
 //! (OWL-479), through `owlshift_runner::watch::offline` with delays of
 //! 100 ms doubling up to 400 ms: while the file `offline` stands there, the
 //! tracker gives no answer and the watch waits; while `refused` stands, the
-//! tracker refuses its credentials and the watch ends as unservable.
+//! tracker refuses its credentials and the watch ends as unservable. Once
+//! its tracker is open it writes its watch record, as `owlshift watch` does
+//! past its start (OWL-651); the stand-in writes none.
 //!
 //! The stand-in stops as a watch does: by degrees, its checked stop bounded
 //! by 2 seconds, its process trees stopping with it however it ends. It runs
@@ -69,7 +71,7 @@ use std::time::Duration;
 use jiff::Timestamp;
 use owlshift_adapters::forge::Repo;
 use owlshift_contracts::format::Format;
-use owlshift_contracts::service::{BuildIdentity, DaemonRecord};
+use owlshift_contracts::service::{BuildIdentity, DaemonRecord, WatchRecord};
 use owlshift_core::restart::RestartPolicy;
 use owlshift_platform::process::{self, AtCheckedStop, ProcessTree};
 use owlshift_runner::config::OWLSHIFT_VERSION;
@@ -308,6 +310,23 @@ fn run_drain(data: &Path, repo: &str) -> ExitCode {
             };
         }
     }
+    // Its record, as `owlshift watch` writes it once past its start, which
+    // the daemon reads to lift its pause (OWL-651).
+    let (version, build) = own_build();
+    let record = WatchRecord {
+        format: Format,
+        pid: std::process::id(),
+        project: repo.to_owned(),
+        served: true,
+        since: Timestamp::now(),
+        binary: std::env::current_exe()
+            .map(|binary| binary.display().to_string())
+            .unwrap_or_default(),
+        version,
+        build: build.unwrap_or_else(|| BuildIdentity::from_build("", "0", "0", "")),
+        operator: None,
+    };
+    let _recorded = watch::presence::record(&dirs, &record).unwrap();
     // A byte for each pass, so a test knows the watch passed since it looked.
     let passes = bench.join("passes");
     let mut between = || {
