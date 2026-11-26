@@ -119,6 +119,7 @@ owlshift why ENG-12
   The release posts a `[owlshift] RELEASED` comment on the ticket saying how to have it worked again: the person whose runner should take it admits it again, after the branch the earlier runner pushed is closed and deleted. A live claim of another person's is refused; ask them.
 - **A pause, a quarantine or a usage limit.** See the sections below: `owlshift why` prints ``the project is quarantined (`owlshift unquarantine`)``, and `<harness> is at its usage limit until <time>`.
 - **A dark wake, on macOS.** The service prints `the machine is in a dark wake (macOS keeps it up without graphics): no ticket is dispatched and no step starts; ...`. Nothing is wrong: it lifts at the next full wake, and `the machine is in a full wake again` follows in the log.
+  - *The GitHub App's token.* Once the token is past its 8 hours, its refresh waits for the full wake too, by every process (OWL-649), so the service's log may show GitHub reads, a merge on green's included, failing with `the GitHub App's token was not refreshed: the machine is in a dark wake (macOS keeps it up without graphics) and may sleep again before GitHub answers, which would lose the rotation; it is refreshed at the next full wake`, and `owlshift logs` a line with `github_app=refresh`, `outcome=not_sent` and `reason=dark_wake`. Nothing is wrong: the refresh is sent at the next full wake.
 
 ## A ticket is parked
 

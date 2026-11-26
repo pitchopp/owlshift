@@ -29,6 +29,13 @@
 //!   data directory's log ([`TokenEvents`], OWL-649): `sending` before the
 //!   request and its outcome, or why none was sent, so a rotation lost can
 //!   be traced (`docs/design/records/OWL-649.md`).
+//! - No refresh is sent while macOS is in a dark wake (OWL-649, OWL-485's
+//!   probe): a dark wake sleeps again within seconds, and an answer lost
+//!   after GitHub rotated spends the refresh token, which the next refresh
+//!   then sends and GitHub refuses. The call fails as one GitHub did not
+//!   answer ([`ErrorKind::Unreachable`]), the refresh token unspent, and
+//!   the first call in a full wake refreshes. A reading the probe cannot
+//!   make holds nothing.
 //!
 //! No token reaches an error, an event or `Debug` output.
 
@@ -47,6 +54,7 @@ use owlshift_adapters::forge::{Error, ErrorKind};
 use owlshift_contracts::event::{Event, EventKind};
 use owlshift_contracts::format::Format;
 use owlshift_platform::keychain::{Keychain, Secret};
+use owlshift_platform::wake::{self, Wake};
 use serde_json::json;
 
 use crate::config::OWLSHIFT_VERSION;
@@ -301,7 +309,15 @@ pub struct AppToken<E: Entries, R: Refresh> {
     /// while it repeats, so a watch whose token died adds one event, not one
     /// per request; a token handed out or a refresh sent starts over.
     told: Option<&'static str>,
+    /// The machine's power state, read just before a refresh is sent.
+    wake: fn() -> Wake,
 }
+
+/// Why a refresh is held in a dark wake, as the call that needed it fails.
+pub const DARK_WAKE_HOLD: &str = "the GitHub App's token was \
+     not refreshed: the machine is in a dark wake (macOS keeps it up without graphics) and may \
+     sleep again before GitHub answers, which would lose the rotation; it is refreshed at the \
+     next full wake";
 
 impl<E: Entries, R: Refresh> fmt::Debug for AppToken<E, R> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -341,7 +357,14 @@ impl<E: Entries, R: Refresh> AppToken<E, R> {
             now: Timestamp::now,
             events: None,
             told: None,
+            wake: wake::read,
         })
+    }
+
+    /// The same source reading the machine's power state with `wake`, which
+    /// tests set so that none reads the machine it runs on.
+    pub fn with_wake(self, wake: fn() -> Wake) -> Self {
+        Self { wake, ..self }
     }
 
     /// The same source on the clock `now`, which [`TokenSource`] reads.
@@ -378,7 +401,7 @@ impl<E: Entries, R: Refresh> AppToken<E, R> {
     /// one in place of `stale`, else a refresh of the stored pair, written
     /// before it is used; `None` when the stored pair has no refresh token.
     /// Each call leaves its events: `sending` and the refresh's outcome, or
-    /// why none was sent.
+    /// why none was sent. Nothing is sent in a dark wake ([`DARK_WAKE_HOLD`]).
     fn renew(
         &mut self,
         stale: &Token,
@@ -442,8 +465,22 @@ impl<E: Entries, R: Refresh> AppToken<E, R> {
             let error = self.sign_in_again("has a refresh token past its life");
             return Err(self.not_sent(trigger, "past_its_life", Some(&stored), error));
         }
+        // The last check before the request, under the lock and after the
+        // keychain's read, so a pair a peer stored is still used in a dark
+        // wake. A dark wake may sleep before GitHub answers, and an answer
+        // lost after it rotated spends the refresh token (OWL-649's record):
+        // nothing is sent, and the token is kept for the full wake.
+        let wake = match (self.wake)() {
+            Wake::Dark => {
+                self.tell(trigger, "dark_wake", Some(&stored), None);
+                return Err(Error::new(ErrorKind::Unreachable, DARK_WAKE_HOLD));
+            }
+            Wake::Full => "full",
+            Wake::Unknown => "unknown",
+        };
         self.told = None;
-        self.refresh_event("sending", trigger, Some(&stored), None, Data::new());
+        let more = events::data([("wake", json!(wake))]);
+        self.refresh_event("sending", trigger, Some(&stored), None, more);
         // Spent from here on: GitHub may rotate even if its answer is lost.
         self.dead = Some(refresh.clone());
         let new = match self.flow.refresh(&refresh) {
@@ -800,6 +837,7 @@ pub(crate) mod testing {
 mod tests {
     use std::collections::VecDeque;
     use std::sync::Mutex;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::mpsc;
 
     use owlshift_adapters::forge::Repo;
@@ -908,6 +946,7 @@ mod tests {
             &stored,
         )
         .unwrap()
+        .with_wake(|| Wake::Full)
     }
 
     fn stored_access(keychain: &Keychain) -> String {
@@ -970,7 +1009,8 @@ mod tests {
             &stored,
         )
         .unwrap()
-        .with_clock(now);
+        .with_clock(now)
+        .with_wake(|| Wake::Full);
         let sent_with = Arc::new(Mutex::new(Vec::new()));
         let seen = sent_with.clone();
         let connect: Connect = Box::new(move |token: Token| {
@@ -1159,7 +1199,8 @@ mod tests {
         let flow = DeviceFlow::new(&script, "Iv1.test").with_clock(now);
         let mut token = AppToken::new(&entries, ACCOUNT, dir.path().join("lock"), flow, &stored)
             .unwrap()
-            .with_events(recorder(dir.path()));
+            .with_events(recorder(dir.path()))
+            .with_wake(|| Wake::Full);
         let error = token.token_at(now()).unwrap_err();
         assert_eq!(error.kind, ErrorKind::SignInAgain);
         assert!(error.message.contains("the rotation is lost"), "{error}");
@@ -1379,7 +1420,8 @@ mod tests {
             let flow = DeviceFlow::new(&script, "Iv1.test").with_clock(now);
             let mut token = AppToken::new(&entries, ACCOUNT, lock, flow, &held)
                 .unwrap()
-                .with_events(recorder(dir.path()));
+                .with_events(recorder(dir.path()))
+                .with_wake(|| Wake::Full);
             for _ in 0..2 {
                 assert!(token.token_at(now()).is_err(), "{reason}");
             }
@@ -1418,7 +1460,8 @@ mod tests {
         let flow = DeviceFlow::new(&github, "Iv1.test").with_clock(now);
         let mut token = AppToken::new(&keychain, ACCOUNT, dir.path().join("lock"), flow, &stored)
             .unwrap()
-            .with_events(recorder(dir.path()));
+            .with_events(recorder(dir.path()))
+            .with_wake(|| Wake::Full);
 
         let error = token.token_at(now()).unwrap_err();
         assert_eq!(error.kind, ErrorKind::Unreachable, "{error}");
@@ -1447,6 +1490,132 @@ mod tests {
             events[0].data["stored_expires_at"],
             events[2].data["stored_expires_at"]
         );
+    }
+
+    /// A source on the GitHub `github`, recording in the log of `data`, in
+    /// a full wake.
+    fn rotating_source<'a>(
+        keychain: &'a Keychain,
+        github: &'a Rotating,
+        data: &std::path::Path,
+    ) -> AppToken<&'a Keychain, DeviceFlow<&'a Rotating>> {
+        let stored = keychain.read(ACCOUNT).unwrap().unwrap();
+        let flow = DeviceFlow::new(github, "Iv1.test").with_clock(now);
+        AppToken::new(keychain, ACCOUNT, data.join("lock"), flow, &stored)
+            .unwrap()
+            .with_events(recorder(data))
+            .with_wake(|| Wake::Full)
+    }
+
+    /// OWL-649, criterion 3: in a dark wake no refresh is sent, each call
+    /// failing as one GitHub did not answer, in words that name the dark
+    /// wake, and the hold told once; the first call in a full wake sends it.
+    #[test]
+    fn a_dark_wake_sends_no_refresh_until_the_full_wake() {
+        static DARK: AtomicBool = AtomicBool::new(true);
+        fn probe() -> Wake {
+            if DARK.load(Ordering::SeqCst) {
+                Wake::Dark
+            } else {
+                Wake::Full
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let keychain = Keychain::in_memory();
+        keychain
+            .store(ACCOUNT, &entry("ghu_old", Some("ghr_old"), 0))
+            .unwrap();
+        let github = Rotating::new("ghr_old", &[]);
+        let mut token = rotating_source(&keychain, &github, dir.path()).with_wake(probe);
+        for _ in 0..2 {
+            let error = token.token_at(now()).unwrap_err();
+            assert_eq!(error.kind, ErrorKind::Unreachable, "{error}");
+            assert!(
+                error
+                    .message
+                    .contains("not refreshed: the machine is in a dark wake"),
+                "{error}"
+            );
+        }
+        assert!(github.sent().is_empty());
+        assert_eq!(stored_access(&keychain), "ghu_old");
+        let events = logged(dir.path());
+        assert_eq!(told(&events), ["refresh not_sent dark_wake"]);
+        assert_eq!(events[0].kind, EventKind::Decision);
+        assert_eq!(events[0].data["stored_expires_at"], at(0).to_string());
+
+        DARK.store(false, Ordering::SeqCst);
+        assert_eq!(token.token_at(now()).unwrap(), Token::new("ghu_1"));
+        assert_eq!(github.sent(), ["ghr_old"]);
+        assert_eq!(stored_access(&keychain), "ghu_1");
+        let events = logged(dir.path());
+        assert_eq!(
+            told(&events),
+            [
+                "refresh not_sent dark_wake",
+                "refresh sending",
+                "refresh rotated",
+                "keychain_write stored"
+            ]
+        );
+        assert_eq!(events[1].data["wake"], "full");
+    }
+
+    /// In a dark wake a pair a peer stored is still used, nothing sent;
+    /// using it ends the stretch, so the next hold is told again.
+    #[test]
+    fn a_dark_wake_still_uses_a_peers_pair_and_tells_each_hold() {
+        let dir = tempfile::tempdir().unwrap();
+        let keychain = Keychain::in_memory();
+        keychain
+            .store(ACCOUNT, &entry("ghu_old", Some("ghr_old"), 0))
+            .unwrap();
+        let github = Rotating::new("ghr_old", &[]);
+        let mut token = rotating_source(&keychain, &github, dir.path()).with_wake(|| Wake::Dark);
+        assert!(token.token_at(now()).is_err());
+        keychain
+            .store(ACCOUNT, &entry("ghu_peer", Some("ghr_peer"), 28_800))
+            .unwrap();
+        assert_eq!(token.token_at(now()).unwrap(), Token::new("ghu_peer"));
+        // The peer's pair past its expiry, the machine still dark.
+        let error = token.token_at(at(28_800)).unwrap_err();
+        assert_eq!(error.kind, ErrorKind::Unreachable, "{error}");
+        assert!(github.sent().is_empty());
+        assert_eq!(
+            told(&logged(dir.path())),
+            [
+                "refresh not_sent dark_wake",
+                "refresh stored_pair_used",
+                "refresh not_sent dark_wake"
+            ]
+        );
+    }
+
+    /// The troubleshooting page quotes the hold's words as the code writes
+    /// them.
+    #[test]
+    fn the_troubleshooting_page_quotes_the_dark_wake_hold() {
+        let page =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/troubleshooting.md");
+        let page = fs::read_to_string(page).unwrap();
+        assert!(page.contains(DARK_WAKE_HOLD), "{DARK_WAKE_HOLD}");
+    }
+
+    /// A reading the probe cannot make holds nothing, as OWL-485's does.
+    #[test]
+    fn an_unknown_wake_holds_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let keychain = Keychain::in_memory();
+        keychain
+            .store(ACCOUNT, &entry("ghu_old", Some("ghr_old"), 0))
+            .unwrap();
+        let github = Rotating::new("ghr_old", &[]);
+        let mut token = rotating_source(&keychain, &github, dir.path()).with_wake(|| Wake::Unknown);
+        assert_eq!(token.token_at(now()).unwrap(), Token::new("ghu_1"));
+        assert_eq!(github.sent(), ["ghr_old"]);
+        let events = logged(dir.path());
+        assert_eq!(events[0].data["outcome"], "sending");
+        assert_eq!(events[0].data["wake"], "unknown");
     }
 
     #[test]
