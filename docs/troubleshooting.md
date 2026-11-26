@@ -31,8 +31,9 @@ On macOS the line is `agent runs are confined with sandbox-exec`; `sandbox-exec 
 **The `secrets` line, on Linux and WSL2.** Owlshift keeps its secrets in a Secret Service such as GNOME Keyring, as macOS keeps them in the Keychain. A server or WSL2 without a desktop session runs none. The line reads `not checked: could not read the system keychain: <reason>`, and the block ends with:
 
 ```text
-Fix   1) Make the system keychain available: unlock it on macOS; on Linux,
-         start a Secret Service such as GNOME Keyring
+Fix   1) Unlock the system keychain and let Owlshift read it: the login
+         keychain on macOS, the Secret Service on Linux, which must be
+         running; nothing needs storing again
       2) owlshift doctor    (to check)
 ```
 

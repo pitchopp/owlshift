@@ -61,8 +61,9 @@ Each line is marked `✓` (fine), `!` (a warning, which never blocks `owlshift d
 2. Secrets
    Why   `owlshift do` reads the project's tracker and forge secrets in the
          system keychain before each run.
-   Fix   1) Make the system keychain available: unlock it on macOS; on Linux,
-            start a Secret Service such as GNOME Keyring
+   Fix   1) Unlock the system keychain and let Owlshift read it: the login
+            keychain on macOS, the Secret Service on Linux, which must be
+            running; nothing needs storing again
          2) owlshift doctor    (to check)
 ```
 
