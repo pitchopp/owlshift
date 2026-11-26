@@ -9667,6 +9667,78 @@ fn is_ancestor(bench: &Bench, ancestor: &str, of: &str) -> bool {
         .is_ok()
 }
 
+/// What the runner's merge of a clean refresh leaves (OWL-655): no run
+/// started since there were `runs` (no harness, so no gate), no
+/// `rebase_run`, one `rebase` dispatch and one `refresh_merged` decision of
+/// `cause` onto `onto`, a merge commit on the remote whose parents are
+/// `first_push` then `onto`, and a DELIVERY report that leads with the
+/// refresh as the delivery's first repair and says no gate ran. Returns the
+/// merge commit.
+/// The data of the runner's merges of a clean refresh (`watch`
+/// `refresh_merged`, OWL-655).
+fn refreshes_merged(bench: &Bench) -> Vec<Value> {
+    data_of(&bench.events(), EventKind::Decision, "watch")
+        .into_iter()
+        .filter(|data| data["watch"] == "refresh_merged")
+        .collect()
+}
+
+fn assert_runner_merged(
+    bench: &Bench,
+    runs: usize,
+    first_push: &str,
+    onto: &str,
+    cause: &str,
+) -> String {
+    let events = bench.events();
+    assert_eq!(bench.briefs().len(), runs, "a run started");
+    let watched = data_of(&events, EventKind::Decision, "watch");
+    assert!(
+        watched.iter().all(|data| data["watch"] != "rebase_run"),
+        "{watched:?}"
+    );
+    let rebases: Vec<Value> = data_of(&events, EventKind::Dispatch, "command")
+        .into_iter()
+        .filter(|data| data["command"] == "rebase")
+        .collect();
+    assert_eq!(rebases.len(), 1, "{rebases:?}");
+    let merged = refreshes_merged(bench);
+    assert_eq!(merged.len(), 1, "{watched:?}");
+    assert_eq!(
+        (&merged[0]["cause"], &merged[0]["onto"]),
+        (&json!(cause), &json!(onto))
+    );
+    let merge = merged[0]["commit"].as_str().unwrap().to_owned();
+    let parents = bench
+        .env
+        .run(
+            &bench.remote.bare,
+            &["rev-list", "--parents", "-n", "1", &merge],
+        )
+        .unwrap();
+    assert_eq!(
+        String::from_utf8(parents).unwrap().trim(),
+        format!("{merge} {first_push} {onto}")
+    );
+    let lead = format!(
+        "**Refreshed onto `main` at `{}` after delivery,** repair 1 of 6: Owlshift merged the \
+         base itself, git finding no conflict; no agent ran.",
+        &onto[..7]
+    );
+    let reports: Vec<String> = bench
+        .comments()
+        .into_iter()
+        .filter(|comment| comment.starts_with("[owlshift] DELIVERY") && comment.contains(&lead))
+        .collect();
+    assert_eq!(reports.len(), 1, "{:?}", bench.comments());
+    assert!(
+        reports[0].contains("**Project gate:** not run by Owlshift for this delivery."),
+        "{}",
+        reports[0]
+    );
+    merge
+}
+
 /// The messages of the remote's commits from `base` to `head`, newest
 /// first, each without its last line break; a check that none holds a live
 /// closing keyword (OWL-558).

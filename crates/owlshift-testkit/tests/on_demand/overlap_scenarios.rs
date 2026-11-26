@@ -87,23 +87,12 @@ fn rebase_runs(bench: &Bench) -> Vec<Value> {
         .collect()
 }
 
-/// The rebase run of a refresh: the delivered branch replayed onto `onto`,
-/// with no conflict.
-fn replayed_onto(bench: &Bench, onto: String) -> During {
-    let (env, worktree) = (bench.env.clone(), bench.worktree());
-    (
-        1,
-        Box::new(move || {
-            env.run(&worktree, &["rebase", "--quiet", &onto]).unwrap();
-        }),
-    )
-}
-
 /// The refresh: DEMO-2, merged, shared `AGENTS.md` with DEMO-1, by DEMO-2's
 /// record. Its merge changes that file without a conflict, which GitHub
-/// reports mergeable: DEMO-1's pull request gets one refresh rebase on the
-/// fast tier, its cause the overlap, no Verify pass after it, and its
-/// rebased head, pushed, is the one GitHub's checks are read on again. A
+/// reports mergeable and git merges cleanly: DEMO-1's pull request gets one
+/// refresh, the runner's own merge with no run (OWL-655), its cause the
+/// overlap, and its merged head, pushed, is the one GitHub's checks are
+/// read on again. A
 /// later move of the base on another path refreshes nothing.
 #[test]
 fn a_siblings_merge_on_a_shared_file_refreshes_the_pull_request() {
@@ -111,51 +100,25 @@ fn a_siblings_merge_on_a_shared_file_refreshes_the_pull_request() {
     merged_sibling(&bench, &["AGENTS.md"], true);
     let first_push = bench.remote_branch().unwrap();
     let main = bench.merge_into_main(&[("AGENTS.md", AGENTS_PREPENDED)]);
-    let refresh = replayed_onto(&bench, main.clone());
+    let runs = bench.briefs().len();
     let mut pass = 0;
-    let (outcomes, lines, printed) = bench.watch_during(
-        vec![bench.reply(None, Some(REBASED))],
-        vec![refresh],
-        &mut |_| {
-            pass += 1;
-            if pass == 3 {
-                bench.merge_into_main(&[("OTHER.md", "Another ticket's file.\n")]);
-            }
-            pass < 6
-        },
-    );
+    let (outcomes, lines, printed) = bench.watch_during(Vec::new(), Vec::new(), &mut |_| {
+        pass += 1;
+        if pass == 3 {
+            bench.merge_into_main(&[("OTHER.md", "Another ticket's file.\n")]);
+        }
+        pass < 6
+    });
     let report = format!("{outcomes:?}\n{lines}\n{printed}");
     assert!(outcomes.iter().all(Result::is_ok), "{report}");
-    let runs = rebase_runs(&bench);
-    assert_eq!(runs.len(), 1, "{runs:?}\n{report}");
-    assert_eq!(
-        (
-            &runs[0]["cause"],
-            &runs[0]["refresh"],
-            &runs[0]["trivial"],
-            &runs[0]["tier"],
-            &runs[0]["review"],
-            &runs[0]["onto"]
-        ),
-        (
-            &json!("overlap"),
-            &json!(true),
-            &json!(true),
-            &json!("fast"),
-            &json!(false),
-            &json!(main)
-        )
-    );
+    let merge = assert_runner_merged(&bench, runs, &first_push, &main, "overlap");
     let head = bench.remote_branch().unwrap();
-    assert_ne!(head, first_push);
-    assert!(is_ancestor(&bench, &main, &head), "{report}");
-    // GitHub's checks are read again on the rebased head.
+    assert_eq!(head, merge, "{report}");
+    // GitHub's checks are read again on the merged head.
     let read_at_head = data_of(&bench.events(), EventKind::Decision, "watch")
         .into_iter()
         .any(|data| data["head"] == json!(head) && data["verdict"] == json!("green"));
     assert!(read_at_head, "{report}");
-    let roles: Vec<Role> = bench.briefs().iter().map(|brief| brief.role).collect();
-    assert_eq!(roles.last(), Some(&Role::Rebase), "{report}");
 }
 
 /// OWL-653: DEMO-1, delivered under merge on green, holds `AGENTS.md`
@@ -228,21 +191,16 @@ fn readmissions(bench: &Bench) -> Vec<Value> {
 #[test]
 fn a_yielded_delivered_ticket_is_refreshed_past_its_own_pull_request_and_merges_on_green() {
     let (bench, main) = yielded_and_refreshed();
-    let refresh = replayed_onto(&bench, main.clone());
     let mut pass = 0;
-    let (outcomes, lines, printed) = bench.watch_during(
-        vec![bench.reply(None, Some(REBASED))],
-        vec![refresh],
-        &mut |_| {
-            pass += 1;
-            two_minutes_later(&bench);
-            pass < 6
-        },
-    );
+    let (outcomes, lines, printed) = bench.watch_during(Vec::new(), Vec::new(), &mut |_| {
+        pass += 1;
+        two_minutes_later(&bench);
+        pass < 6
+    });
     let report = format!("{outcomes:?}\n{lines}\n{printed}");
     assert!(outcomes.iter().all(Result::is_ok), "{report}");
     assert!(!report.contains("pull request #1 holds"), "{report}");
-    let runs = rebase_runs(&bench);
+    let runs = refreshes_merged(&bench);
     assert_eq!(runs.len(), 1, "{runs:?}\n{report}");
     assert_eq!(
         (&runs[0]["cause"], &runs[0]["onto"]),
@@ -297,7 +255,6 @@ fn a_yielded_ticket_held_back_at_its_readmission_is_shown_waiting_by_why() {
         "person/agents".to_owned(),
         vec!["AGENTS.md".to_owned()],
     ));
-    let refresh = replayed_onto(&bench, main.clone());
     let why = || {
         let now = bench.clock.get();
         owlshift_runner::why::render(
@@ -315,24 +272,20 @@ fn a_yielded_ticket_held_back_at_its_readmission_is_shown_waiting_by_why() {
     };
     let (mut shown, mut told) = (String::new(), Vec::new());
     let mut pass = 0;
-    let (outcomes, lines, printed) = bench.watch_during(
-        vec![bench.reply(None, Some(REBASED))],
-        vec![refresh],
-        &mut |_| {
-            pass += 1;
-            match pass {
-                1 => shown = why(),
-                // Two passes held back: the wait is told at each.
-                2 => {
-                    told = watch_waits(&bench);
-                    bench.github.others.lock().unwrap().clear();
-                }
-                _ => {}
+    let (outcomes, lines, printed) = bench.watch_during(Vec::new(), Vec::new(), &mut |_| {
+        pass += 1;
+        match pass {
+            1 => shown = why(),
+            // Two passes held back: the wait is told at each.
+            2 => {
+                told = watch_waits(&bench);
+                bench.github.others.lock().unwrap().clear();
             }
-            past_the_retry(&bench);
-            pass < 5
-        },
-    );
+            _ => {}
+        }
+        past_the_retry(&bench);
+        pass < 5
+    });
     let report = format!("{outcomes:?}\n{lines}\n{printed}");
     let waits = "pull request #7 holds zone `AGENTS.md`, which it held before it yielded: it is \
                  admitted again once pull request #7 no longer holds it";
@@ -355,7 +308,7 @@ fn a_yielded_ticket_held_back_at_its_readmission_is_shown_waiting_by_why() {
             "{report}"
         );
     }
-    let runs = rebase_runs(&bench);
+    let runs = refreshes_merged(&bench);
     assert_eq!(runs.len(), 1, "{runs:?}\n{report}");
     assert_eq!(
         (&runs[0]["cause"], &runs[0]["onto"]),
@@ -400,19 +353,13 @@ fn after_a_colleagues_merge(remote: bool) -> (Bench, String, Vec<Value>, String)
     bench.unclaimed("DEMO-2");
     assert!(bench.claim_commit(&demo2).is_none());
     let mut pass = 0;
-    let (replies, during) = if remote {
-        let refresh = replayed_onto(&bench, main.clone());
-        (vec![bench.reply(None, Some(REBASED))], vec![refresh])
-    } else {
-        (Vec::new(), Vec::new())
-    };
-    let (outcomes, lines, printed) = bench.watch_during(replies, during, &mut |_| {
+    let (outcomes, lines, printed) = bench.watch_during(Vec::new(), Vec::new(), &mut |_| {
         pass += 1;
         pass < 4
     });
     let report = format!("{outcomes:?}\n{lines}\n{printed}");
     assert!(outcomes.iter().all(Result::is_ok), "{report}");
-    let runs = rebase_runs(&bench);
+    let runs = refreshes_merged(&bench);
     (bench, main, runs, report)
 }
 
@@ -507,19 +454,14 @@ fn a_colleagues_later_overlap_is_recorded_here_and_refreshes_at_its_merge() {
     assert!(rebase_runs(&bench).is_empty(), "{report}");
     let main = bench.merge_into_main(&[("AGENTS.md", AGENTS_PREPENDED)]);
     bench.unclaimed("DEMO-2");
-    let refresh = replayed_onto(&bench, main.clone());
     let mut pass = 0;
-    let (outcomes, lines, printed) = bench.watch_during(
-        vec![bench.reply(None, Some(REBASED))],
-        vec![refresh],
-        &mut |_| {
-            pass += 1;
-            pass < 3
-        },
-    );
+    let (outcomes, lines, printed) = bench.watch_during(Vec::new(), Vec::new(), &mut |_| {
+        pass += 1;
+        pass < 3
+    });
     let report = format!("{outcomes:?}\n{lines}\n{printed}");
     assert!(outcomes.iter().all(Result::is_ok), "{report}");
-    let runs = rebase_runs(&bench);
+    let runs = refreshes_merged(&bench);
     assert_eq!(runs.len(), 1, "{runs:?}\n{report}");
     assert_eq!(
         (&runs[0]["cause"], &runs[0]["onto"]),
