@@ -25,9 +25,14 @@
 //!   [`ErrorKind::SignInAgain`], naming `owlshift init`; a refresh token
 //!   spent or refused is never sent again by this source. No personal token
 //!   is ever tried in its place.
+//! - Each refresh and each keychain write of the pair is an event of the
+//!   data directory's log ([`TokenEvents`], OWL-649): `sending` before the
+//!   request and its outcome, or why none was sent, so a rotation lost can
+//!   be traced (`docs/design/records/OWL-649.md`).
 //!
-//! No token reaches an error or `Debug` output.
+//! No token reaches an error, an event or `Debug` output.
 
+use std::ffi::OsString;
 use std::fmt;
 use std::fs;
 use std::path::PathBuf;
@@ -39,8 +44,13 @@ use jiff::Timestamp;
 use owlshift_adapters::forge::github::{Token, TokenSource};
 use owlshift_adapters::forge::github_app::{AppError, DeviceFlow, Login, UserToken};
 use owlshift_adapters::forge::{Error, ErrorKind};
+use owlshift_contracts::event::{Event, EventKind};
+use owlshift_contracts::format::Format;
 use owlshift_platform::keychain::{Keychain, Secret};
+use serde_json::json;
 
+use crate::config::OWLSHIFT_VERSION;
+use crate::events::{self, Data, EventLog};
 use crate::forge::sign_in_again;
 use crate::project::lock_file_within;
 
@@ -114,6 +124,162 @@ impl<R: Refresh + ?Sized> Refresh for &R {
     }
 }
 
+/// The events of one project's GitHub App token (OWL-649, architecture
+/// section 8, "Its events"), appended to a data directory's log, which
+/// `owlshift logs` prints: each refresh, and each keychain write or removal
+/// of the pair. They are project events, of no ticket and no run, keyed
+/// `github_app` (`refresh` or `keychain_write`): a `decision` when it went as
+/// meant, a `warning` saying `why` otherwise. Each holds its `outcome` and
+/// the process (`pid`, `command`, `version`), with expiries in RFC 3339;
+/// never a token. A failed append is said on standard error and never fails
+/// what it records.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TokenEvents {
+    log: EventLog,
+    /// The project's name, `owner/repo`, as `owlshift do`'s events name it.
+    project: String,
+}
+
+/// How a keychain write or removal of the GitHub App's pair ended.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Written {
+    /// The pair was stored.
+    Stored,
+    /// The pair was removed.
+    Removed,
+    /// No pair was stored to remove.
+    NoneStored,
+    /// The write or the removal failed, for this reason in Owlshift's
+    /// words, which hold no stored value.
+    Failed(String),
+}
+
+impl TokenEvents {
+    /// The events of `project`'s token, in `log`.
+    pub fn new(log: EventLog, project: impl Into<String>) -> Self {
+        Self {
+            log,
+            project: project.into(),
+        }
+    }
+
+    /// The log they are appended to.
+    pub fn log(&self) -> &EventLog {
+        &self.log
+    }
+
+    /// Records a keychain write or removal of the pair, `written`, by `by`
+    /// (`refresh`, `sign_in`, `removal` or `uninstall`), with the expiries
+    /// of `pair` when one was written and the details `more`.
+    pub fn keychain_write(
+        &self,
+        by: &str,
+        written: &Written,
+        pair: Option<&UserToken>,
+        mut more: Data,
+    ) {
+        more.insert("by".to_owned(), json!(by));
+        if let Some(pair) = pair {
+            more.extend(expiries(pair));
+        }
+        let (outcome, why) = match written {
+            Written::Stored => ("stored", None),
+            Written::Removed => ("removed", None),
+            Written::NoneStored => ("none_stored", None),
+            Written::Failed(why) => ("failed", Some(why.as_str())),
+        };
+        self.record("keychain_write", outcome, why, more);
+    }
+
+    /// Records a refresh's `outcome`.
+    fn refresh(&self, outcome: &str, why: Option<&str>, more: Data) {
+        self.record("refresh", outcome, why, more);
+    }
+
+    /// Appends one event of `what`, `github_app`, with `outcome`, the
+    /// process and `data`: a `decision`, or a `warning` when there is `why`.
+    fn record(&self, what: &str, outcome: &str, why: Option<&str>, mut data: Data) {
+        data.insert("github_app".to_owned(), json!(what));
+        data.insert("outcome".to_owned(), json!(outcome));
+        data.insert("pid".to_owned(), json!(std::process::id()));
+        data.insert(
+            "command".to_owned(),
+            json!(command_name(std::env::args_os().nth(1))),
+        );
+        data.insert("version".to_owned(), json!(OWLSHIFT_VERSION));
+        let kind = match why {
+            None => EventKind::Decision,
+            Some(why) => {
+                data.insert("what".to_owned(), json!("github_app_token"));
+                data.insert("why".to_owned(), json!(why));
+                EventKind::Warning
+            }
+        };
+        let event = Event {
+            format: Format,
+            at: Timestamp::now(),
+            project: self.project.clone(),
+            ticket: None,
+            run: None,
+            kind,
+            data,
+        };
+        if let Err(error) = self.log.append(&event) {
+            eprintln!(
+                "{}",
+                events::printable(&format!(
+                    "owlshift: warning: an event of the GitHub App's token was not recorded in \
+                     {}: {error}",
+                    self.log.path().display()
+                ))
+            );
+        }
+    }
+}
+
+/// The expiries of `pair`, as an event holds them.
+fn expiries(pair: &UserToken) -> Data {
+    let mut data = Data::new();
+    if let Some(at) = pair.expires_at() {
+        data.insert("expires_at".to_owned(), json!(at.to_string()));
+    }
+    if let Some(at) = pair.refresh_expires_at() {
+        data.insert("refresh_expires_at".to_owned(), json!(at.to_string()));
+    }
+    data
+}
+
+/// The process's command as an event names it: `first`, its first
+/// argument, when it is a lowercase word of letters and `-` of at most 24
+/// characters, such as `watch` or `continue`; `owlshift` otherwise.
+fn command_name(first: Option<OsString>) -> String {
+    first
+        .and_then(|first| first.into_string().ok())
+        .filter(|first| {
+            first.len() <= 24
+                && first.starts_with(|c: char| c.is_ascii_lowercase())
+                && first.chars().all(|c| c.is_ascii_lowercase() || c == '-')
+        })
+        .unwrap_or_else(|| "owlshift".to_owned())
+}
+
+/// What a refresh was asked on: a token past its stored expiry, or one
+/// GitHub answered HTTP 401.
+#[derive(Clone, Copy)]
+enum Trigger {
+    Expired,
+    Http401,
+}
+
+impl Trigger {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Expired => "expired",
+            Self::Http401 => "http_401",
+        }
+    }
+}
+
 /// The GitHub App's token of one project, as the runner holds it: the pair
 /// last read or written, refreshed through `flow` under the account lock.
 pub struct AppToken<E: Entries, R: Refresh> {
@@ -129,6 +295,12 @@ pub struct AppToken<E: Entries, R: Refresh> {
     dead: Option<String>,
     lock_wait: Duration,
     now: fn() -> Timestamp,
+    /// Where each refresh and write is recorded, when anywhere.
+    events: Option<TokenEvents>,
+    /// The reason of the last `not_sent` event recorded: not recorded again
+    /// while it repeats, so a watch whose token died adds one event, not one
+    /// per request; a token handed out or a refresh sent starts over.
+    told: Option<&'static str>,
 }
 
 impl<E: Entries, R: Refresh> fmt::Debug for AppToken<E, R> {
@@ -167,12 +339,22 @@ impl<E: Entries, R: Refresh> AppToken<E, R> {
             dead: None,
             lock_wait: ACCOUNT_LOCK_WAIT,
             now: Timestamp::now,
+            events: None,
+            told: None,
         })
     }
 
     /// The same source on the clock `now`, which [`TokenSource`] reads.
     pub fn with_clock(self, now: fn() -> Timestamp) -> Self {
         Self { now, ..self }
+    }
+
+    /// The same source, recording each refresh and write in `events`.
+    pub fn with_events(self, events: TokenEvents) -> Self {
+        Self {
+            events: Some(events),
+            ..self
+        }
     }
 
     /// The token to send at `now`: the one held, refreshed first when it is
@@ -182,86 +364,211 @@ impl<E: Entries, R: Refresh> AppToken<E, R> {
             return Ok(Token::new(self.held.access()));
         }
         let stale = Token::new(self.held.access());
-        self.renew(&stale, now)?
+        self.renew(&stale, now, Trigger::Expired)?
             .ok_or_else(|| self.sign_in_again("has expired and holds no refresh token"))
     }
 
     /// GitHub answered HTTP 401 to `refused` at `now`: the token to send
     /// once more, or `None` when no refresh token is stored.
     pub fn refused_at(&mut self, refused: &Token, now: Timestamp) -> Result<Option<Token>, Error> {
-        self.renew(refused, now)
+        self.renew(refused, now, Trigger::Http401)
     }
 
     /// Under the account lock: the stored pair when another process stored
     /// one in place of `stale`, else a refresh of the stored pair, written
     /// before it is used; `None` when the stored pair has no refresh token.
-    fn renew(&mut self, stale: &Token, now: Timestamp) -> Result<Option<Token>, Error> {
-        let _lock = self.account_lock()?;
+    /// Each call leaves its events: `sending` and the refresh's outcome, or
+    /// why none was sent.
+    fn renew(
+        &mut self,
+        stale: &Token,
+        now: Timestamp,
+        trigger: Trigger,
+    ) -> Result<Option<Token>, Error> {
+        let _lock = match self.account_lock() {
+            Ok(lock) => lock,
+            Err((reason, error)) => return Err(self.not_sent(trigger, reason, None, error)),
+        };
         let stored = match self.entries.read(&self.account) {
-            Ok(Some(entry)) => UserToken::from_entry(entry.expose())
-                .map_err(|_| self.sign_in_again("does not read"))?,
-            Ok(None) => return Err(self.sign_in_again("is no longer stored")),
+            Ok(Some(entry)) => match UserToken::from_entry(entry.expose()) {
+                Ok(stored) => stored,
+                Err(_) => {
+                    let error = self.sign_in_again("does not read");
+                    return Err(self.not_sent(trigger, "unreadable", None, error));
+                }
+            },
+            Ok(None) => {
+                let error = self.sign_in_again("is no longer stored");
+                return Err(self.not_sent(trigger, "not_stored", None, error));
+            }
             Err(error) => {
-                return Err(Error::new(
+                let error = Error::new(
                     ErrorKind::Other,
                     format!(
                         "the GitHub App's token could not be read from the system keychain: \
                          {error}"
                     ),
-                ));
+                );
+                return Err(self.not_sent(trigger, "keychain_unreadable", None, error));
             }
         };
         if Token::new(stored.access()) != *stale && !stored.expired(now) {
+            self.refresh_event(
+                "stored_pair_used",
+                trigger,
+                Some(&stored),
+                None,
+                Data::new(),
+            );
+            self.told = None;
             self.held = stored;
             return Ok(Some(Token::new(self.held.access())));
         }
         let Some(refresh) = stored.refresh().map(str::to_owned) else {
+            self.tell(
+                trigger,
+                "no_refresh_token",
+                Some(&stored),
+                Some("the stored pair holds no refresh token"),
+            );
             self.held = stored;
             return Ok(None);
         };
         if self.dead.as_deref() == Some(refresh.as_str()) {
-            return Err(self.sign_in_again("was refused its refresh"));
+            let error = self.sign_in_again("was refused its refresh");
+            return Err(self.not_sent(trigger, "refused_before", Some(&stored), error));
         }
         if stored.refresh_expires_at().is_some_and(|at| now >= at) {
-            return Err(self.sign_in_again("has a refresh token past its life"));
+            let error = self.sign_in_again("has a refresh token past its life");
+            return Err(self.not_sent(trigger, "past_its_life", Some(&stored), error));
         }
+        self.told = None;
+        self.refresh_event("sending", trigger, Some(&stored), None, Data::new());
         // Spent from here on: GitHub may rotate even if its answer is lost.
         self.dead = Some(refresh.clone());
         let new = match self.flow.refresh(&refresh) {
             Ok(new) => new,
             Err(refused @ AppError::Refused(_)) => {
-                return Err(self.sign_in_again(&format!("could not be refreshed: {refused}")));
+                let error = self.sign_in_again(&format!("could not be refreshed: {refused}"));
+                self.refresh_event(
+                    "refused",
+                    trigger,
+                    Some(&stored),
+                    Some(&error.message),
+                    Data::new(),
+                );
+                return Err(error);
             }
             Err(other) => {
                 // No answer, or one a retry may clear: the token is tried
                 // again next time; a rotation GitHub made meanwhile shows as
-                // a refused refresh then. No answer at all is its own kind,
-                // which a watch starting waits on (OWL-479).
+                // a refused refresh then (OWL-649's record). No answer at all
+                // is its own kind, which a watch starting waits on (OWL-479).
                 self.dead = None;
-                let kind = match other {
-                    AppError::Unreachable(_) => ErrorKind::Unreachable,
-                    _ => ErrorKind::Other,
+                let (kind, outcome) = match other {
+                    AppError::Unreachable(_) => (ErrorKind::Unreachable, "no_answer"),
+                    _ => (ErrorKind::Other, "failed"),
                 };
-                return Err(Error::new(
+                let error = Error::new(
                     kind,
                     format!("the GitHub App's token could not be refreshed: {other}"),
-                ));
+                );
+                self.refresh_event(
+                    outcome,
+                    trigger,
+                    Some(&stored),
+                    Some(&error.message),
+                    Data::new(),
+                );
+                return Err(error);
             }
         };
+        // Before the write: a `rotated` with no write after it is a process
+        // that ended between GitHub's answer and the keychain.
+        self.refresh_event("rotated", trigger, Some(&stored), None, expiries(&new));
         self.write(&new)?;
         self.held = new;
         Ok(Some(Token::new(self.held.access())))
     }
 
-    /// Writes `new` under the account, tried [`STORE_TRIES`] times.
+    /// Records a refresh event of `outcome`, with the trigger, the expiry
+    /// of the pair held and of the one `stored`, once read.
+    fn refresh_event(
+        &self,
+        outcome: &str,
+        trigger: Trigger,
+        stored: Option<&UserToken>,
+        why: Option<&str>,
+        mut more: Data,
+    ) {
+        let Some(events) = &self.events else {
+            return;
+        };
+        more.insert("trigger".to_owned(), json!(trigger.name()));
+        if let Some(at) = self.held.expires_at() {
+            more.insert("held_expires_at".to_owned(), json!(at.to_string()));
+        }
+        if let Some(at) = stored.and_then(UserToken::expires_at) {
+            more.insert("stored_expires_at".to_owned(), json!(at.to_string()));
+        }
+        events.refresh(outcome, why, more);
+    }
+
+    /// Records that no refresh was sent, for `reason`, and gives `error`
+    /// back.
+    fn not_sent(
+        &mut self,
+        trigger: Trigger,
+        reason: &'static str,
+        stored: Option<&UserToken>,
+        error: Error,
+    ) -> Error {
+        self.tell(trigger, reason, stored, Some(&error.message));
+        error
+    }
+
+    /// Records a `not_sent` event for `reason`, a warning saying `why` when
+    /// given, unless the last one recorded gave the same reason.
+    fn tell(
+        &mut self,
+        trigger: Trigger,
+        reason: &'static str,
+        stored: Option<&UserToken>,
+        why: Option<&str>,
+    ) {
+        if self.told == Some(reason) {
+            return;
+        }
+        self.told = Some(reason);
+        let more = events::data([("reason", json!(reason))]);
+        self.refresh_event("not_sent", trigger, stored, why, more);
+    }
+
+    /// Writes `new` under the account, tried [`STORE_TRIES`] times, each try
+    /// recorded.
     fn write(&self, new: &UserToken) -> Result<(), Error> {
         let entry = Secret::new(new.to_entry());
         let mut tries = 0;
         loop {
             tries += 1;
-            match self.entries.store(&self.account, &entry) {
+            let stored = self.entries.store(&self.account, &entry);
+            let last = tries >= STORE_TRIES;
+            if let Some(events) = &self.events {
+                let mut more = events::data([("try", json!(tries)), ("tries", json!(STORE_TRIES))]);
+                let written = match &stored {
+                    Ok(()) => Written::Stored,
+                    Err(why) => {
+                        if last {
+                            more.insert("rotation_lost".to_owned(), json!(true));
+                        }
+                        Written::Failed(why.clone())
+                    }
+                };
+                events.keychain_write("refresh", &written, Some(new), more);
+            }
+            match stored {
                 Ok(()) => return Ok(()),
-                Err(error) if tries >= STORE_TRIES => {
+                Err(error) if last => {
                     return Err(self.sign_in_again(&format!(
                         "was rotated by GitHub, but storing the new one failed ({error}), so the \
                          rotation is lost"
@@ -272,14 +579,18 @@ impl<E: Entries, R: Refresh> AppToken<E, R> {
         }
     }
 
-    /// The account lock, waited for at most `lock_wait`.
-    fn account_lock(&self) -> Result<crate::project::FileLock, Error> {
+    /// The account lock, waited for at most `lock_wait`; else why not, as
+    /// a `not_sent` reason (`lock_failed` or `lock_held`) and an error.
+    fn account_lock(&self) -> Result<crate::project::FileLock, (&'static str, Error)> {
         let failed = |error: std::io::Error| {
-            Error::new(
-                ErrorKind::Other,
-                format!(
-                    "the GitHub App's account lock {} could not be taken: {error}",
-                    self.lock.display()
+            (
+                "lock_failed",
+                Error::new(
+                    ErrorKind::Other,
+                    format!(
+                        "the GitHub App's account lock {} could not be taken: {error}",
+                        self.lock.display()
+                    ),
                 ),
             )
         };
@@ -289,13 +600,16 @@ impl<E: Entries, R: Refresh> AppToken<E, R> {
         lock_file_within(&self.lock, self.lock_wait, ACCOUNT_LOCK_POLL)
             .map_err(failed)?
             .ok_or_else(|| {
-                Error::new(
-                    ErrorKind::Other,
-                    format!(
-                        "another Owlshift process held the GitHub App's account lock {} for \
-                         more than {} s, refreshing its token: try again",
-                        self.lock.display(),
-                        self.lock_wait.as_secs()
+                (
+                    "lock_held",
+                    Error::new(
+                        ErrorKind::Other,
+                        format!(
+                            "another Owlshift process held the GitHub App's account lock {} for \
+                             more than {} s, refreshing its token: try again",
+                            self.lock.display(),
+                            self.lock_wait.as_secs()
+                        ),
                     ),
                 )
             })
@@ -316,6 +630,172 @@ impl<E: Entries + Send, R: Refresh + Send> TokenSource for AppToken<E, R> {
     }
 }
 
+/// Fakes the tests of the refresh and of its callers share: keychain
+/// entries that fail as asked, and a GitHub that rotates.
+#[cfg(test)]
+pub(crate) mod testing {
+    use std::collections::VecDeque;
+    use std::path::Path;
+    use std::sync::Mutex;
+
+    use owlshift_adapters::forge::github_app::LoginAnswer;
+    use owlshift_contracts::event::Event;
+
+    use super::*;
+
+    /// How [`Faulty`] fails.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub(crate) enum Fault {
+        /// Every read fails.
+        ReadFails,
+        /// Every store fails.
+        StoreFails,
+    }
+
+    /// Keychain entries over an in-memory keychain that fail as `fault`
+    /// says, counting the stores tried.
+    pub(crate) struct Faulty<'a> {
+        pub(crate) keychain: &'a Keychain,
+        pub(crate) fault: Fault,
+        pub(crate) stores: Mutex<u32>,
+    }
+
+    impl<'a> Faulty<'a> {
+        pub(crate) fn new(keychain: &'a Keychain, fault: Fault) -> Self {
+            Self {
+                keychain,
+                fault,
+                stores: Mutex::new(0),
+            }
+        }
+
+        pub(crate) fn stores(&self) -> u32 {
+            *self.stores.lock().unwrap()
+        }
+    }
+
+    impl Entries for Faulty<'_> {
+        fn read(&self, account: &str) -> Result<Option<Secret>, String> {
+            match self.fault {
+                Fault::ReadFails => Err("the keychain is locked".to_owned()),
+                _ => Entries::read(self.keychain, account),
+            }
+        }
+
+        fn store(&self, account: &str, secret: &Secret) -> Result<(), String> {
+            *self.stores.lock().unwrap() += 1;
+            match self.fault {
+                Fault::StoreFails => Err("the keychain is locked".to_owned()),
+                _ => Entries::store(self.keychain, account, secret),
+            }
+        }
+    }
+
+    /// What [`Rotating`] does with a refresh it accepts.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub(crate) enum Answer {
+        /// Rotates and answers the new pair.
+        Given,
+        /// Rotates, and its answer is lost: the caller sees no answer.
+        Lost,
+    }
+
+    /// GitHub's token endpoint as C13 found it: it accepts only the refresh
+    /// token it issued last, rotates it (`ghr_1`, `ghr_2`, …, with
+    /// `ghu_1`, `ghu_2`, …), and answers any other with HTTP 200 and
+    /// `incorrect_client_credentials`. Each accepted refresh takes the next
+    /// of its answers, [`Answer::Given`] once they run out.
+    pub(crate) struct Rotating {
+        state: Mutex<RotatingState>,
+    }
+
+    struct RotatingState {
+        current: String,
+        issued: u32,
+        answers: VecDeque<Answer>,
+        sent: Vec<String>,
+    }
+
+    impl Rotating {
+        /// GitHub holding `current` as the refresh token it issued last.
+        pub(crate) fn new(current: &str, answers: &[Answer]) -> Self {
+            Self {
+                state: Mutex::new(RotatingState {
+                    current: current.to_owned(),
+                    issued: 0,
+                    answers: answers.iter().copied().collect(),
+                    sent: Vec::new(),
+                }),
+            }
+        }
+
+        /// The refresh tokens sent, in order.
+        pub(crate) fn sent(&self) -> Vec<String> {
+            self.state.lock().unwrap().sent.clone()
+        }
+    }
+
+    impl Login for &Rotating {
+        fn post_form(&self, _: &str, form: &[(&str, &str)]) -> Result<LoginAnswer, String> {
+            let refresh = form
+                .iter()
+                .find(|(key, _)| *key == "refresh_token")
+                .map(|(_, value)| (*value).to_owned())
+                .expect("a refresh");
+            let mut state = self.state.lock().unwrap();
+            state.sent.push(refresh.clone());
+            if refresh != state.current {
+                return Ok(LoginAnswer::new(
+                    200,
+                    r#"{"error":"incorrect_client_credentials"}"#,
+                ));
+            }
+            state.issued += 1;
+            let issued = state.issued;
+            state.current = format!("ghr_{issued}");
+            match state.answers.pop_front().unwrap_or(Answer::Given) {
+                Answer::Lost => Err("GitHub's login endpoint could not be reached".to_owned()),
+                Answer::Given => Ok(LoginAnswer::new(
+                    200,
+                    format!(
+                        r#"{{"access_token":"ghu_{issued}","expires_in":28800,"refresh_token":"ghr_{issued}","refresh_token_expires_in":15724800,"token_type":"bearer"}}"#
+                    ),
+                )),
+            }
+        }
+    }
+
+    /// The events of the log in `data`, oldest first; none when it does
+    /// not exist. It panics when the log holds a token.
+    pub(crate) fn logged(data: &Path) -> Vec<Event> {
+        let text = fs::read_to_string(EventLog::in_dir(data).path()).unwrap_or_default();
+        assert!(
+            !text.contains("ghu_") && !text.contains("ghr_"),
+            "a token in the log: {text}"
+        );
+        text.lines()
+            .map(|line| Event::parse(line).unwrap())
+            .collect()
+    }
+
+    /// Each token event's `github_app` and `outcome`, with its `reason` when
+    /// it has one, as `refresh not_sent dark_wake`.
+    pub(crate) fn told(events: &[Event]) -> Vec<String> {
+        events
+            .iter()
+            .filter_map(|event| {
+                let text = |key: &str| event.data.get(key).and_then(|v| v.as_str());
+                let mut line = format!("{} {}", text("github_app")?, text("outcome")?);
+                if let Some(reason) = text("reason") {
+                    line.push(' ');
+                    line.push_str(reason);
+                }
+                Some(line)
+            })
+            .collect()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::VecDeque;
@@ -327,6 +807,7 @@ mod tests {
     use owlshift_adapters::forge::github_app::LoginAnswer;
     use serde_json::Value;
 
+    use super::testing::{Answer, Fault, Faulty, Rotating, logged, told};
     use super::*;
 
     const ACCOUNT: &str = "github.com/owner/repo/github-app";
@@ -663,23 +1144,10 @@ mod tests {
         assert!(script.sent().is_empty());
     }
 
-    /// Entries whose writes always fail.
-    struct Unwritable<'a>(&'a Keychain, Mutex<u32>);
-
-    impl Entries for Unwritable<'_> {
-        fn read(&self, account: &str) -> Result<Option<Secret>, String> {
-            Entries::read(self.0, account)
-        }
-
-        fn store(&self, _: &str, _: &Secret) -> Result<(), String> {
-            *self.1.lock().unwrap() += 1;
-            Err("the keychain is locked".to_owned())
-        }
-    }
-
     /// Criterion 4: GitHub rotated the pair but the keychain write failed
     /// every try: the rotation is lost, the new token never handed out, and
-    /// the spent refresh token not sent again.
+    /// the spent refresh token not sent again. OWL-649: each try is an
+    /// event, the last saying the rotation is lost.
     #[test]
     fn a_lost_rotation_says_sign_in_again() {
         let dir = tempfile::tempdir().unwrap();
@@ -687,21 +1155,317 @@ mod tests {
         let stored = entry("ghu_old", Some("ghr_old"), 0);
         keychain.store(ACCOUNT, &stored).unwrap();
         let script = Script::answering(&[&granted("ghu_new", "ghr_new")]);
-        let entries = Unwritable(&keychain, Mutex::new(0));
+        let entries = Faulty::new(&keychain, Fault::StoreFails);
         let flow = DeviceFlow::new(&script, "Iv1.test").with_clock(now);
-        let mut token =
-            AppToken::new(&entries, ACCOUNT, dir.path().join("lock"), flow, &stored).unwrap();
+        let mut token = AppToken::new(&entries, ACCOUNT, dir.path().join("lock"), flow, &stored)
+            .unwrap()
+            .with_events(recorder(dir.path()));
         let error = token.token_at(now()).unwrap_err();
         assert_eq!(error.kind, ErrorKind::SignInAgain);
         assert!(error.message.contains("the rotation is lost"), "{error}");
         assert!(error.message.contains("`owlshift init`"), "{error}");
-        assert_eq!(*entries.1.lock().unwrap(), STORE_TRIES);
+        assert_eq!(entries.stores(), STORE_TRIES);
         assert_eq!(
             token.token_at(now()).unwrap_err().kind,
             ErrorKind::SignInAgain
         );
         assert_eq!(script.sent(), ["ghr_old"]);
         assert_eq!(stored_access(&keychain), "ghu_old");
+
+        let events = logged(dir.path());
+        assert_eq!(
+            told(&events),
+            [
+                "refresh sending",
+                "refresh rotated",
+                "keychain_write failed",
+                "keychain_write failed",
+                "keychain_write failed",
+                "refresh not_sent refused_before",
+            ]
+        );
+        let writes: Vec<&Event> = events
+            .iter()
+            .filter(|e| e.data["github_app"] == "keychain_write")
+            .collect();
+        for (n, write) in writes.iter().enumerate() {
+            assert_eq!(write.kind, EventKind::Warning);
+            assert_eq!(write.data["by"], "refresh");
+            assert_eq!(write.data["try"], n + 1);
+            assert_eq!(write.data["tries"], STORE_TRIES);
+            assert_eq!(write.data["why"], "the keychain is locked");
+            assert_eq!(write.data["expires_at"], at(28_800).to_string());
+            assert_eq!(write.data.get("rotation_lost").is_some(), n == 2, "{n}");
+        }
+    }
+
+    /// The events of a refresh in the log of `data`, for the project
+    /// `owner/repo`.
+    fn recorder(data: &std::path::Path) -> TokenEvents {
+        TokenEvents::new(EventLog::in_dir(data), "owner/repo")
+    }
+
+    /// OWL-649, criterion 1: a refresh records `sending`, then `rotated`,
+    /// then the write, each a decision of this process holding the stored
+    /// pair's expiry; `owlshift logs` prints them.
+    #[test]
+    fn every_refresh_records_its_outcome_and_the_stored_expiry() {
+        let dir = tempfile::tempdir().unwrap();
+        let keychain = Keychain::in_memory();
+        keychain
+            .store(ACCOUNT, &entry("ghu_old", Some("ghr_old"), 0))
+            .unwrap();
+        let script = Script::answering(&[&granted("ghu_new", "ghr_new")]);
+        let mut token =
+            source(&keychain, &script, dir.path().join("lock")).with_events(recorder(dir.path()));
+        assert_eq!(token.token_at(now()).unwrap(), Token::new("ghu_new"));
+
+        let events = logged(dir.path());
+        assert_eq!(
+            told(&events),
+            [
+                "refresh sending",
+                "refresh rotated",
+                "keychain_write stored"
+            ]
+        );
+        for event in &events {
+            assert_eq!(event.kind, EventKind::Decision, "{event:?}");
+            assert_eq!(event.project, "owner/repo");
+            assert_eq!((event.ticket.as_ref(), event.run.as_ref()), (None, None));
+            assert_eq!(event.data["pid"], std::process::id());
+            assert_eq!(event.data["version"], OWLSHIFT_VERSION);
+            assert!(event.data["command"].is_string(), "{event:?}");
+        }
+        let stored = at(0).to_string();
+        for refresh in &events[..2] {
+            assert_eq!(refresh.data["trigger"], "expired");
+            assert_eq!(refresh.data["stored_expires_at"], stored);
+            assert_eq!(refresh.data["held_expires_at"], stored);
+        }
+        assert_eq!(events[1].data["expires_at"], at(28_800).to_string());
+        assert_eq!(
+            events[1].data["refresh_expires_at"],
+            at(15_724_800).to_string()
+        );
+        assert_eq!(events[2].data["by"], "refresh");
+        assert_eq!(events[2].data["expires_at"], at(28_800).to_string());
+
+        let mut printed = Vec::new();
+        let log = EventLog::in_dir(dir.path());
+        events::print(log.path(), None, &mut printed, &mut Vec::new(), None, None).unwrap();
+        let printed = String::from_utf8(printed).unwrap();
+        assert!(
+            printed.contains("github_app=refresh") && printed.contains("outcome=rotated"),
+            "{printed}"
+        );
+    }
+
+    /// OWL-649: a pair a peer stored, a refusal, no answer and a refresh
+    /// token past its life each leave their events; a refusal is told once
+    /// more, as `refused_before`, however many calls follow it.
+    #[test]
+    fn each_refresh_says_how_it_ended_or_why_none_was_sent() {
+        let run = |stored: Secret, answers: &[&str], calls: usize, at: Timestamp| {
+            let dir = tempfile::tempdir().unwrap();
+            let keychain = Keychain::in_memory();
+            keychain.store(ACCOUNT, &stored).unwrap();
+            let script = Script::answering(answers);
+            let mut token = source(&keychain, &script, dir.path().join("lock"))
+                .with_events(recorder(dir.path()));
+            for _ in 0..calls {
+                let _ = token.token_at(at);
+            }
+            logged(dir.path())
+        };
+        let expired = || entry("ghu_old", Some("ghr_old"), 0);
+
+        let events = run(expired(), &[REFUSED], 3, now());
+        assert_eq!(
+            told(&events),
+            [
+                "refresh sending",
+                "refresh refused",
+                "refresh not_sent refused_before"
+            ]
+        );
+        assert_eq!(events[1].kind, EventKind::Warning);
+        assert_eq!(events[1].data["what"], "github_app_token");
+        assert!(
+            events[1].data["why"]
+                .as_str()
+                .unwrap()
+                .contains("GitHub refused the GitHub App's refresh token (bad_refresh_token)"),
+            "{:?}",
+            events[1]
+        );
+
+        let events = run(expired(), &[NO_ANSWER], 1, now());
+        assert_eq!(told(&events), ["refresh sending", "refresh no_answer"]);
+        assert_eq!(events[1].kind, EventKind::Warning);
+
+        let events = run(expired(), &[], 1, at(15_724_800));
+        assert_eq!(told(&events), ["refresh not_sent past_its_life"]);
+
+        // A peer's pair, stored while this source held the old one.
+        let dir = tempfile::tempdir().unwrap();
+        let keychain = Keychain::in_memory();
+        keychain.store(ACCOUNT, &expired()).unwrap();
+        let script = Script::default();
+        let mut token =
+            source(&keychain, &script, dir.path().join("lock")).with_events(recorder(dir.path()));
+        keychain
+            .store(ACCOUNT, &entry("ghu_peer", Some("ghr_peer"), 28_800))
+            .unwrap();
+        assert_eq!(token.token_at(now()).unwrap(), Token::new("ghu_peer"));
+        let events = logged(dir.path());
+        assert_eq!(told(&events), ["refresh stored_pair_used"]);
+        assert_eq!(events[0].kind, EventKind::Decision);
+        assert_eq!(events[0].data["stored_expires_at"], at(28_800).to_string());
+        assert!(script.sent().is_empty());
+    }
+
+    /// OWL-649 (F11, F14 of its plan's review): each call that stops before a
+    /// refresh, for want of the lock or of a stored pair it can read,
+    /// records its reason once, with the expiry of the pair the process
+    /// holds and, having read none, no stored expiry.
+    #[test]
+    fn a_refresh_stopped_before_the_request_records_why() {
+        /// The reason, what changes the keychain after the source read it,
+        /// how its entries fail, and whether a stored pair is read.
+        type Case<'a> = (&'a str, &'a dyn Fn(&Keychain), Option<Fault>, bool);
+        let held = entry("ghu_old", Some("ghr_old"), 0);
+        let cases: [Case; 5] = [
+            (
+                "not_stored",
+                &|k| k.delete(ACCOUNT).map(|_| ()).unwrap(),
+                None,
+                false,
+            ),
+            (
+                "unreadable",
+                &|k| k.store(ACCOUNT, &Secret::new("garbage")).unwrap(),
+                None,
+                false,
+            ),
+            (
+                "keychain_unreadable",
+                &|_| {},
+                Some(Fault::ReadFails),
+                false,
+            ),
+            (
+                "no_refresh_token",
+                &|k| k.store(ACCOUNT, &entry("ghu_old", None, 0)).unwrap(),
+                None,
+                true,
+            ),
+            ("lock_failed", &|_| {}, None, false),
+        ];
+        for (reason, change, fault, read) in cases {
+            let dir = tempfile::tempdir().unwrap();
+            let keychain = Keychain::in_memory();
+            keychain.store(ACCOUNT, &held).unwrap();
+            change(&keychain);
+            let entries = Faulty::new(&keychain, fault.unwrap_or(Fault::StoreFails));
+            let lock = if reason == "lock_failed" {
+                // A lock whose folder is a file cannot be taken.
+                fs::write(dir.path().join("file"), "").unwrap();
+                dir.path().join("file").join("lock")
+            } else {
+                dir.path().join("lock")
+            };
+            let script = Script::default();
+            let flow = DeviceFlow::new(&script, "Iv1.test").with_clock(now);
+            let mut token = AppToken::new(&entries, ACCOUNT, lock, flow, &held)
+                .unwrap()
+                .with_events(recorder(dir.path()));
+            for _ in 0..2 {
+                assert!(token.token_at(now()).is_err(), "{reason}");
+            }
+            assert!(script.sent().is_empty(), "{reason}");
+            let events = logged(dir.path());
+            assert_eq!(
+                told(&events),
+                [format!("refresh not_sent {reason}")],
+                "{reason}"
+            );
+            let event = &events[0];
+            assert_eq!(event.kind, EventKind::Warning, "{reason}");
+            assert!(event.data["why"].is_string(), "{reason}");
+            assert_eq!(event.data["held_expires_at"], at(0).to_string(), "{reason}");
+            assert_eq!(
+                event.data.get("stored_expires_at").is_some(),
+                read,
+                "{reason}"
+            );
+        }
+    }
+
+    /// OWL-649's reproduction of the incident: GitHub rotated the pair, and
+    /// its answer was lost. The source keeps the spent refresh token, sends
+    /// it at the next call, and GitHub refuses it as the incident's log
+    /// says; the two `sending` events hold the same stored expiry.
+    #[test]
+    fn an_answer_lost_after_github_rotated_is_refused_at_the_next_refresh() {
+        let dir = tempfile::tempdir().unwrap();
+        let keychain = Keychain::in_memory();
+        keychain
+            .store(ACCOUNT, &entry("ghu_old", Some("ghr_old"), 0))
+            .unwrap();
+        let github = Rotating::new("ghr_old", &[Answer::Lost]);
+        let stored = keychain.read(ACCOUNT).unwrap().unwrap();
+        let flow = DeviceFlow::new(&github, "Iv1.test").with_clock(now);
+        let mut token = AppToken::new(&keychain, ACCOUNT, dir.path().join("lock"), flow, &stored)
+            .unwrap()
+            .with_events(recorder(dir.path()));
+
+        let error = token.token_at(now()).unwrap_err();
+        assert_eq!(error.kind, ErrorKind::Unreachable, "{error}");
+        assert_eq!(stored_access(&keychain), "ghu_old");
+        let error = token.token_at(now()).unwrap_err();
+        assert_eq!(error.kind, ErrorKind::SignInAgain, "{error}");
+        assert!(
+            error.message.contains(
+                "GitHub refused the GitHub App's refresh token (incorrect_client_credentials)"
+            ),
+            "{error}"
+        );
+        assert_eq!(github.sent(), ["ghr_old", "ghr_old"]);
+
+        let events = logged(dir.path());
+        assert_eq!(
+            told(&events),
+            [
+                "refresh sending",
+                "refresh no_answer",
+                "refresh sending",
+                "refresh refused"
+            ]
+        );
+        assert_eq!(
+            events[0].data["stored_expires_at"],
+            events[2].data["stored_expires_at"]
+        );
+    }
+
+    #[test]
+    fn the_command_is_a_plain_word_or_owlshift() {
+        let of = |arg: Option<&str>| command_name(arg.map(OsString::from));
+        assert_eq!(of(Some("watch")), "watch");
+        assert_eq!(of(Some("continue")), "continue");
+        assert_eq!(of(Some("doctor-x")), "doctor-x");
+        for odd in [
+            None,
+            Some(""),
+            Some("--envelope"),
+            Some("Watch"),
+            Some("github_token"),
+            Some("ghu_secret"),
+            Some("a-very-long-word-past-the-limit"),
+        ] {
+            assert_eq!(of(odd), "owlshift", "{odd:?}");
+        }
     }
 
     /// A refresh with no usable answer may be tried again: it is no
@@ -741,7 +1505,7 @@ mod tests {
             .store(ACCOUNT, &entry("ghu_old", Some("ghr_old"), 0))
             .unwrap();
         let script = Script::default();
-        let mut token = source(&keychain, &script, lock.clone());
+        let mut token = source(&keychain, &script, lock.clone()).with_events(recorder(dir.path()));
         token.lock_wait = Duration::from_millis(50);
         let _held = lock_file_within(&lock, Duration::ZERO, ACCOUNT_LOCK_POLL)
             .unwrap()
@@ -750,6 +1514,7 @@ mod tests {
         assert_eq!(error.kind, ErrorKind::Other);
         assert!(error.message.contains("account lock"), "{error}");
         assert!(script.sent().is_empty());
+        assert_eq!(told(&logged(dir.path())), ["refresh not_sent lock_held"]);
     }
 
     /// A refresh GitHub gave no answer to is its own kind (OWL-479), and
