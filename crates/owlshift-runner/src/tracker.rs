@@ -1085,11 +1085,11 @@ mod tests {
         let repo = Repo::parse("pitchopp/owlshift").unwrap();
         let keychain = Keychain::in_memory();
         let dir = tempfile::tempdir().unwrap();
-        let access = crate::forge::AppAccess {
-            keychain: std::sync::Arc::new(Keychain::in_memory()),
-            lock: dir.path().join("lock"),
-            app: crate::forge::GitHubApp::from_personal(None),
-        };
+        let access = crate::forge::AppAccess::unrecorded(
+            std::sync::Arc::new(Keychain::in_memory()),
+            dir.path().join("lock"),
+            crate::forge::GitHubApp::from_personal(None),
+        );
         let linear = project("linear", "team = \"OWL\"\n");
         let setup = |tracker, repo| Setup {
             tracker,

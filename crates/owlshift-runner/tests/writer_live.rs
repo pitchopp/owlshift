@@ -81,11 +81,11 @@ fn posts_the_delivery_report_on_a_real_ticket() {
     .unwrap();
     // A personal token: the app's account lock is never taken.
     let dir = tempfile::tempdir().unwrap();
-    let access = AppAccess {
-        keychain: keychain.clone(),
-        lock: dir.path().join("github-app.lock"),
-        app: GitHubApp::from_personal(None),
-    };
+    let access = AppAccess::unrecorded(
+        keychain.clone(),
+        dir.path().join("github-app.lock"),
+        GitHubApp::from_personal(None),
+    );
     let forge = github(&secrets::forge(&repo, &mut look).unwrap(), repo, &access).unwrap();
 
     assert_eq!(tracker.ticket(&ticket).unwrap().id, ticket);

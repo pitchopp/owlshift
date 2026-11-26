@@ -15,6 +15,8 @@ use owlshift_platform::service::Manager;
 use super::manifest::Manifests;
 use super::remove_service_files;
 use crate::events;
+use crate::forge::app_account_project;
+use crate::github_token::{TokenEvents, Written};
 
 /// How long `owlshift uninstall` waits for the daemon to end once it was sent
 /// SIGTERM: past launchd's grace of 60 seconds and systemd's of 90, after
@@ -145,6 +147,9 @@ pub fn remove_listed(
                     Err(error) => Err(error.clone()),
                     Ok(keychain) => keychain.delete(&entry.account).map_err(|e| e.to_string()),
                 };
+                if entry.service == SERVICE {
+                    app_entry_removed(data, &entry.account, &outcome);
+                }
                 match outcome {
                     Ok(_) => report.removed.push(named),
                     Err(why) => {
@@ -158,6 +163,27 @@ pub fn remove_listed(
         write(manifest)?;
         Ok(report)
     })
+}
+
+/// Records the removal of `account`, when it holds a project's GitHub App
+/// pair, in the event log of `data` (OWL-649), as the project the account
+/// names, lowercase ([`app_account_project`]); `outcome` says whether the
+/// keychain had one to remove.
+fn app_entry_removed(data: &Path, account: &str, outcome: &Result<bool, String>) {
+    let Some(project) = app_account_project(account) else {
+        return;
+    };
+    let written = match outcome {
+        Ok(true) => Written::Removed,
+        Ok(false) => Written::NoneStored,
+        Err(why) => Written::Failed(why.clone()),
+    };
+    TokenEvents::new(events::EventLog::in_dir(data), project).keychain_write(
+        "uninstall",
+        &written,
+        None,
+        events::Data::new(),
+    );
 }
 
 /// Why `data` cannot be purged, before anything is removed: it is the
@@ -341,6 +367,7 @@ mod tests {
     use owlshift_platform::keychain::Secret;
 
     use super::*;
+    use crate::github_token::testing::{logged, told};
     use crate::install::tests::FakeManager;
     use crate::project::ProjectDirs;
     use crate::served::Registry;
@@ -449,6 +476,37 @@ mod tests {
         assert_eq!(report.left.len(), 2, "{report:?}");
         assert!(report.left[1].ends_with("keychain: locked"), "{report:?}");
         assert_eq!(manifests.read().unwrap().keychain.len(), 2);
+    }
+
+    /// OWL-649: the removal of a project's GitHub App pair is recorded in
+    /// the data directory's log, as the project its account names,
+    /// lowercase; another entry's is not.
+    #[test]
+    fn an_app_entrys_removal_is_recorded() {
+        let data = tempfile::tempdir().unwrap();
+        let data = data.path();
+        let repo = Repo::parse("Owner/Repo").unwrap();
+        let app = crate::secrets::ForgeAccount::project_app(&repo).token;
+        let listed = |account: &str| KeychainEntry {
+            service: SERVICE.to_owned(),
+            account: account.to_owned(),
+        };
+        Manifests::in_data_dir(data)
+            .record_keychain(&[listed(&app), listed("claude-agent")])
+            .unwrap();
+        let keychain = || {
+            let keychain = Keychain::in_memory();
+            for account in [app.as_str(), "claude-agent"] {
+                keychain.store(account, &Secret::new("token")).unwrap();
+            }
+            Ok(keychain)
+        };
+        let report = remove_listed(data, &FakeManager::default(), &keychain).unwrap();
+        assert_eq!(report.removed.len(), 2, "{report:?}");
+        let events = logged(data);
+        assert_eq!(told(&events), ["keychain_write removed"]);
+        assert_eq!(events[0].project, "owner/repo");
+        assert_eq!(events[0].data["by"], "uninstall");
     }
 
     /// Owlshift's entries go, a person's file stays and is named, and a

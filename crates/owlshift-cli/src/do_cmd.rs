@@ -968,14 +968,14 @@ impl Secrets {
             ))
         })()
         .map_err(Refusal::keychain)?;
-        let access = forge::AppAccess {
-            keychain: keychain.clone(),
-            lock: dirs.account_lock_file(),
-            app: forge::GitHubApp::from_personal(match personal {
+        let access = forge::AppAccess::for_project(
+            keychain.clone(),
+            dirs,
+            forge::GitHubApp::from_personal(match personal {
                 FileState::Loaded { config, .. } => Some(config),
                 _ => None,
             }),
-        };
+        );
         Ok(Self {
             keychain,
             tracker,
@@ -1689,5 +1689,43 @@ mod step_programs {
         );
         assert!(step._pinned.is_none());
         assert!(!typed_pinned_dir(data.path()).exists());
+    }
+}
+
+#[cfg(test)]
+mod app_access {
+    use owlshift_runner::events::EventLog;
+
+    use super::*;
+
+    /// OWL-649: the secrets `do`, `continue`, watch and its steps read
+    /// refresh the GitHub App's token under the project's account lock,
+    /// recorded in its data directory's log.
+    #[test]
+    fn the_app_access_is_the_projects() {
+        let data = tempfile::tempdir().unwrap();
+        let repo = Repo::parse("owner/repo").unwrap();
+        let dirs = ProjectDirs::new(data.path(), &repo);
+        let project = ProjectConfig::parse(
+            "requires = \">=0.1\"\n[tracker]\nkind = \"markdown\"\n\
+             admit = { label = \"owlshift\" }\n\
+             states = { ready = \"Todo\", working = \"Doing\", needs_input = \"Asked\", \
+             review = \"Review\" }\n[stack]\ngate = [\"make test\"]\n[pipeline]\n\
+             default = \"trivial\"\nplan_approval = \"never\"\n[models]\n[policy]\n\
+             always_human = []\n",
+        )
+        .unwrap();
+        let personal = FileState::Absent(data.path().join("config.toml"));
+        let Ok(secrets) = Secrets::read(
+            || Ok(Keychain::in_memory()),
+            &project,
+            &repo,
+            &dirs,
+            &personal,
+        ) else {
+            panic!("the secrets were not read");
+        };
+        assert_eq!(secrets.access.lock(), dirs.account_lock_file());
+        assert_eq!(secrets.access.log(), Some(&EventLog::in_dir(data.path())));
     }
 }
