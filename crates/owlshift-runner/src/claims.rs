@@ -121,7 +121,7 @@ pub struct ClaimUnread {
 /// Fetches every claim of `origin` alone into [`FETCHED_PREFIX`], the
 /// claims deleted there pruned, nothing else touched (live check T2): what
 /// watch makes once a minute under `remote` (OWL-587), within the runner
-/// git's deadline. A failed fetch says why, in git's last line.
+/// git's deadline. A failed fetch says why, in the cause line of git's error.
 pub fn fetch(git: &Git, checkout: &Path) -> Result<(), String> {
     fetch_within(git, checkout, None)
 }
@@ -147,10 +147,9 @@ pub fn fetch_within(git: &Git, checkout: &Path, deadline: Option<Duration>) -> R
         return Ok(());
     }
     let stderr = String::from_utf8_lossy(&out.stderr);
-    let last = stderr.lines().rev().find(|line| !line.trim().is_empty());
     Err(format!(
         "fetching {REMOTE}'s claims: git fetch failed: {}",
-        last.unwrap_or("no error output").trim()
+        owlshift_adapters::git_stderr::summary(&stderr)
     ))
 }
 
@@ -1324,10 +1323,9 @@ fn fetch_file(
         .map_err(|e| format!("reading {what} on {REMOTE}: {e}"))?;
     if !out.success() {
         let stderr = String::from_utf8_lossy(&out.stderr);
-        let last = stderr.lines().rev().find(|line| !line.trim().is_empty());
         return Err(format!(
             "reading {what} on {REMOTE}: git fetch failed: {}",
-            last.unwrap_or("no error output").trim()
+            owlshift_adapters::git_stderr::summary(&stderr)
         ));
     }
     let commit = git
@@ -1419,6 +1417,30 @@ fn push(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// OWL-652: a refused fetch of the claims says why, not what git always
+    /// adds (it said "and the repository exists." alone before).
+    #[test]
+    fn a_failed_claims_fetch_names_its_cause() {
+        let tmp = tempfile::tempdir().unwrap();
+        let run = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .args(args)
+                .current_dir(tmp.path())
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "git {args:?}: {out:?}");
+        };
+        run(&["init", "--quiet"]);
+        let missing = tmp.path().join("missing").display().to_string();
+        run(&["remote", "add", REMOTE, &missing]);
+        let error = fetch(&Git::new("git"), tmp.path()).unwrap_err();
+        assert!(
+            error.contains("does not appear to be a git repository"),
+            "{error}"
+        );
+        assert!(!error.contains("and the repository exists"), "{error}");
+    }
 
     #[test]
     fn a_runner_id_is_made_once_and_read_back() {

@@ -193,13 +193,13 @@ fn porcelain_line<'a>(stdout: &'a str, target: &str) -> Option<(&'a str, &'a str
         })
 }
 
-/// A push that gave no verdict for a ref: how git ended, with the end of
-/// its standard error.
+/// A push that gave no verdict for a ref: how git ended, with what its
+/// standard error says (the cause, without git's boilerplate or credentials).
 fn no_verdict(ended: &str, stderr: &[u8]) -> PushError {
     PushError::Failed {
         message: format!(
             "git push exited with {ended}: {}",
-            tail(&String::from_utf8_lossy(stderr))
+            crate::git_stderr::summary(&String::from_utf8_lossy(stderr))
         ),
     }
 }
@@ -340,43 +340,6 @@ fn check_remote(remote: &str) -> Result<(), PushError> {
         });
     }
     Ok(())
-}
-
-/// The last lines of git's standard error, without credentials.
-fn tail(stderr: &str) -> String {
-    let lines: Vec<&str> = stderr
-        .lines()
-        .map(|l| l.trim_end_matches('\r'))
-        .filter(|l| !l.trim().is_empty())
-        .collect();
-    let start = lines.len().saturating_sub(3);
-    let text = lines[start..].join(" / ");
-    if text.is_empty() {
-        "no error output".to_owned()
-    } else {
-        redact_userinfo(&text)
-    }
-}
-
-/// Removes the `user:password@` part of every URL in `text`.
-fn redact_userinfo(text: &str) -> String {
-    let mut out = String::with_capacity(text.len());
-    let mut rest = text;
-    while let Some(at) = rest.find("://") {
-        let (before, after) = rest.split_at(at + 3);
-        out.push_str(before);
-        let authority_end = after
-            .find(|c: char| c == '/' || c.is_whitespace())
-            .unwrap_or(after.len());
-        let authority = &after[..authority_end];
-        match authority.rfind('@') {
-            Some(i) => out.push_str(&authority[i + 1..]),
-            None => out.push_str(authority),
-        }
-        rest = &after[authority_end..];
-    }
-    out.push_str(rest);
-    out
 }
 
 #[cfg(test)]
@@ -616,14 +579,6 @@ mod tests {
         assert!(
             !text.contains("ghp_secret") && !text.contains("user:"),
             "{text}"
-        );
-    }
-
-    #[test]
-    fn userinfo_is_removed_from_every_url() {
-        assert_eq!(
-            redact_userinfo("a https://x@h/p and ssh://git@h:22/p, http://h/q"),
-            "a https://h/p and ssh://h:22/p, http://h/q"
         );
     }
 

@@ -6,6 +6,7 @@
 //! then each adapter is a concrete type or a set of functions.
 
 pub mod forge;
+pub mod git_stderr;
 pub mod graphql;
 pub mod harness;
 pub mod notifier;
