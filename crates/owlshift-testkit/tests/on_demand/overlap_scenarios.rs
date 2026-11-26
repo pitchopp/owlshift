@@ -1291,3 +1291,54 @@ fn continue_names_an_owed_refresh_and_runs_none() {
     );
     assert!(rebase_runs(&bench).is_empty(), "{report}");
 }
+
+/// OWL-654: a red read after a sibling's merge on the shared path gets its
+/// fix run as before, with no refresh first. Its push records the base it
+/// went onto, which holds the sibling's change, so no refresh is owed any
+/// more, and under merge on green the fixed head merges once read green
+/// twice.
+#[test]
+fn a_fix_push_onto_a_base_holding_the_siblings_change_clears_the_owed_refresh() {
+    let bench = overlapping_with(
+        &[("AGENTS.md", AGENTS_APPENDED)],
+        false,
+        &rebase_and_merge("all"),
+    );
+    merged_sibling(&bench, &["AGENTS.md"], true);
+    let main = bench.merge_into_main(&[("AGENTS.md", AGENTS_PREPENDED)]);
+    bench.github.followed.lock().unwrap().conclusion = "FAILURE";
+    let github = bench.github.clone();
+    let mut pass = 0;
+    let (outcomes, lines, printed) = bench.watch(
+        vec![bench.reply(Some("Hello again"), Some(FIXED))],
+        &mut |_| {
+            pass += 1;
+            if pass == 1 {
+                github.followed.lock().unwrap().conclusion = "SUCCESS";
+            }
+            later(&bench.clock);
+            pass < 6 && github_merges(&bench).is_empty()
+        },
+    );
+    let report = format!("{outcomes:?}\n{lines}\n{printed}");
+    let roles: Vec<Role> = bench.briefs().iter().map(|brief| brief.role).collect();
+    assert_eq!(
+        roles.iter().filter(|role| **role == Role::Build).count(),
+        2,
+        "{roles:?}\n{report}"
+    );
+    assert!(rebase_runs(&bench).is_empty(), "{report}");
+    let delivery = bench.record().delivery.unwrap();
+    assert_eq!(
+        delivery.base_at_push.as_deref(),
+        Some(main.as_str()),
+        "{report}"
+    );
+    let merges = github_merges(&bench);
+    assert_eq!(merges.len(), 1, "{merges:?}\n{report}");
+    assert_eq!(
+        merges[0]["sha"],
+        json!(bench.remote_branch().unwrap()),
+        "{report}"
+    );
+}
