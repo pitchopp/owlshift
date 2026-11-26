@@ -1171,6 +1171,69 @@ fn two_siblings_merging_while_the_decider_is_asked_get_one_refresh_after_the_ans
     assert_eq!(merged_comments(&bench).len(), 1, "{report}");
 }
 
+/// OWL-654, the saving the ticket measured: DEMO-1, delivered under merge
+/// on green, is followed at Watch while its checks run, and DEMO-2 then
+/// DEMO-3, which share `AGENTS.md` with it, merge one after the other,
+/// each changing that file cleanly. Before OWL-654 each merge ran its own
+/// refresh at the next read; now no rebase runs while the checks run, the
+/// owed refresh told onto each new base head as waiting for them. Once
+/// they read green, exactly one refresh runs, onto `main`'s latest head,
+/// and the rebased head merges on green.
+#[test]
+fn two_siblings_merging_while_the_checks_run_get_one_refresh_onto_the_latest_base() {
+    let bench = overlapping_with(
+        &[("AGENTS.md", AGENTS_APPENDED)],
+        false,
+        &rebase_and_merge("all"),
+    );
+    merged_sibling_as(&bench, "DEMO-2", &["AGENTS.md"], true);
+    merged_sibling_as(&bench, "DEMO-3", &["AGENTS.md"], true);
+    bench.github.followed.lock().unwrap().conclusion = "SUCCESS";
+    *bench.github.pending_follow_reads.lock().unwrap() = 0..u32::MAX;
+    let first = bench.merge_into_main(&[("AGENTS.md", AGENTS_PREPENDED)]);
+    let (mut second, mut held) = (None, None);
+    let mut pass = 0;
+    let (outcomes, lines, printed) = bench.watch_during(
+        vec![bench.reply(None, Some(REBASED))],
+        vec![replayed_onto_main(&bench, 1)],
+        &mut |_| {
+            pass += 1;
+            match pass {
+                1 => second = Some(bench.merge_into_main(&[("AGENTS.md", AGENTS_PREPENDED_TWICE)])),
+                3 => {
+                    held = Some((rebase_runs(&bench).len(), refresh_waits(&bench)));
+                    *bench.github.pending_follow_reads.lock().unwrap() = 0..0;
+                }
+                _ => {}
+            }
+            later(&bench.clock);
+            pass < 12 && merged_comments(&bench).is_empty()
+        },
+    );
+    let report = format!("{outcomes:?}\n{lines}\n{printed}");
+    let second = second.unwrap();
+    let (ran, told) = held.unwrap();
+    assert_eq!(ran, 0, "{report}");
+    // Told once per base head, waiting for the checks.
+    let onto: Vec<&Value> = told.iter().map(|wait| &wait["onto"]).collect();
+    assert_eq!(onto, [&json!(first), &json!(second)], "{told:?}\n{report}");
+    for wait in &told {
+        assert_eq!(wait["until"], "checks", "{report}");
+    }
+    let runs = rebase_runs(&bench);
+    assert_eq!(runs.len(), 1, "{runs:?}\n{report}");
+    assert_eq!(
+        (&runs[0]["cause"], &runs[0]["onto"]),
+        (&json!("overlap"), &json!(second)),
+        "{report}"
+    );
+    let head = bench.remote_branch().unwrap();
+    assert!(is_ancestor(&bench, &second, &head), "{report}");
+    let merges = github_merges(&bench);
+    assert_eq!(merges.len(), 1, "{merges:?}\n{report}");
+    assert_eq!(merges[0]["sha"], json!(head), "{report}");
+}
+
 /// OWL-654, decided Q1 and Q2: under `[forge] merge = "never"` a refresh
 /// owed while the pull request's checks still run waits for them, told as
 /// such; once they read green, one refresh runs onto the sibling's head. A
