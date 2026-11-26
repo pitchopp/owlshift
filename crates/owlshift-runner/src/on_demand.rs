@@ -3469,9 +3469,7 @@ impl OnDemand<'_> {
         };
         let mut following = Following::default();
         let now = (self.clock)();
-        let overlap = self.overlap_base(p, delivery);
-        let (look, warnings) =
-            following.look(self.forge, &ticket, delivery, now, overlap.as_deref());
+        let (look, warnings) = following.look(self.forge, &ticket, delivery, now);
         for warning in warnings {
             sink.emit(&ticket, None, EventKind::Warning, warning);
         }
@@ -7872,16 +7870,12 @@ impl OnDemand<'_> {
             )));
         };
         let mut state = TicketState::try_from(&stored.record.state).map_err(core_error)?;
-        // A base that changes a path an overlap names, as this command's
-        // fetch read it (OWL-449): watch read the same.
-        let overlap = self.overlap_base(p, &delivery);
         let fresh = follow::read(
             self.forge,
             &delivery,
             pr.number,
             &pushed,
             |_| failing_for,
-            overlap.as_deref(),
             (self.clock)(),
         )
         .map_err(|e| refused("reading the pull request again", e))?;
@@ -7898,16 +7892,25 @@ impl OnDemand<'_> {
             // Merge on green's refresh (OWL-445): green, or with no check at
             // all (OWL-657), on a base that moved since the push, which this
             // command's fetch read. Watch decided the merge due but for the
-            // base; its checks ran on a merge with the old base.
+            // base; its checks ran on a merge with the old base. An overlap's
+            // refresh comes the same way, once the pull request could
+            // otherwise merge (OWL-654): its cause is the overlap when this
+            // command's fetch reads the base changing a path an overlap
+            // names, as watch read it.
             FollowDecision::Follow {
                 adopt: false,
                 action: FollowAction::Green | FollowAction::NoChecks,
             } if merge_refresh
                 && delivery.base_at_push.as_deref() != Some(p.base.commit.as_str()) =>
             {
+                let cause = if self.overlap_base(p, &delivery).is_some() {
+                    RebaseCause::Overlap
+                } else {
+                    RebaseCause::MergeBase
+                };
                 FollowAction::Rebase {
                     onto: p.base.commit.clone(),
-                    cause: RebaseCause::MergeBase,
+                    cause,
                 }
             }
             // Anything else is a look's: the next one keeps it. A refresh
