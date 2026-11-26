@@ -24,7 +24,7 @@ use owlshift_platform::keychain::{Keychain, SERVICE, Secret};
 
 use crate::events::Data;
 use crate::forge::{AppAccess, GitHubApp};
-use crate::github_token::{TokenEvents, Written};
+use crate::github_token::{Entries, TokenEvents, Written, store_checked};
 use crate::secrets::ForgeAccount;
 
 /// How often the installation is looked up again once the install link is
@@ -120,9 +120,10 @@ pub struct Ask {
 /// Makes sure the project of `repo` holds a working app token under its
 /// account `github-app`, a stored one refreshed under `github`'s account
 /// lock, signing in through `app` on `github` when it does not; `say` is
-/// told each step a person must act on or wait for.
-pub fn step<L: Login>(
-    keychain: &Keychain,
+/// told each step a person must act on or wait for. A new token's store is
+/// read back (OWL-649): one the keychain does not give back failed.
+pub fn step<K: Entries, L: Login>(
+    keychain: &K,
     repo: &Repo,
     app: &GitHubApp,
     github: &GitHub<L>,
@@ -134,7 +135,7 @@ pub fn step<L: Login>(
     if !ask.replace {
         let stored = match keychain.read(&account.token) {
             Ok(stored) => stored,
-            Err(error) => return Outcome::Failed(error.to_string()),
+            Err(error) => return Outcome::Failed(error),
         };
         if let Some(entry) = stored {
             match stored_installation(keychain, repo, &account.token, &entry, app, github, wait) {
@@ -174,16 +175,16 @@ pub fn step<L: Login>(
         }
         Err(error) => return Outcome::Failed(words(&error)),
     }
-    let stored = keychain.store(&account.token, &Secret::new(token.to_entry()));
+    let stored = store_checked(keychain, &account.token, &Secret::new(token.to_entry()));
     if let Some(events) = github.access.events(&repo.to_string()) {
-        let written = match &stored {
-            Ok(()) => Written::Stored,
-            Err(error) => Written::Failed(error.to_string()),
+        let (written, more) = match &stored {
+            Ok(read_back) => (Written::Stored, read_back.details()),
+            Err(error) => (Written::Failed(error.clone()), Data::new()),
         };
-        events.keychain_write("sign_in", &written, Some(&token), Data::new());
+        events.keychain_write("sign_in", &written, Some(&token), more);
     }
     match stored {
-        Ok(()) => Outcome::Stored,
+        Ok(_) => Outcome::Stored,
         Err(error) => Outcome::Failed(format!(
             "signed in, but storing the GitHub App's token under service `{SERVICE}`, account \
              `{}` failed: {error}",
@@ -199,8 +200,8 @@ pub fn step<L: Login>(
 /// when GitHub refuses it (`forge::Error` does not tell a 401 from a 403
 /// here, so either gets the one refresh). The forge it was made with, for
 /// the install wait.
-fn stored_installation<L: Login>(
-    keychain: &Keychain,
+fn stored_installation<K: Entries, L: Login>(
+    keychain: &K,
     repo: &Repo,
     account: &str,
     entry: &Secret,
@@ -375,7 +376,7 @@ mod tests {
 
     use super::*;
     use crate::forge::GITHUB_ACCOUNT;
-    use crate::github_token::testing::{logged, told};
+    use crate::github_token::testing::{Fault, Faulty, logged, told};
     use crate::project::ProjectDirs;
     use crate::secrets::project_account;
 
@@ -498,6 +499,11 @@ mod tests {
         }
 
         fn step(&mut self, ask: Ask) -> Outcome {
+            self.step_with(ask, None)
+        }
+
+        /// The step, on the run's keychain failing as `fault` says.
+        fn step_with(&mut self, ask: Ask, fault: Option<Fault>) -> Outcome {
             let rest = Arc::clone(&self.rest);
             let github = GitHub {
                 flow: DeviceFlow::new(&self.logins, "Iv23li5EhBqiuljIPbiK").with_clock(start),
@@ -506,16 +512,22 @@ mod tests {
                 }),
                 access: self.access(),
             };
+            let app = GitHubApp::from_personal(None);
             let said = &mut self.said;
-            let outcome = step(
-                &self.keychain,
-                &repo(),
-                &GitHubApp::from_personal(None),
-                &github,
-                &self.wait,
-                ask,
-                &mut |line| said.push(line.to_owned()),
-            );
+            let mut say = |line: &str| said.push(line.to_owned());
+            let faulty = fault.map(|fault| Faulty::new(&self.keychain, fault));
+            let outcome = match &faulty {
+                Some(entries) => step(entries, &repo(), &app, &github, &self.wait, ask, &mut say),
+                None => step(
+                    &self.keychain,
+                    &repo(),
+                    &app,
+                    &github,
+                    &self.wait,
+                    ask,
+                    &mut say,
+                ),
+            };
             let shown = format!("{outcome:?} {}", self.said.join("\n"));
             assert!(!shown.contains(SENTINEL), "{shown}");
             outcome
@@ -812,8 +824,27 @@ mod tests {
         assert_eq!(told(&events), ["keychain_write stored"]);
         assert_eq!(events[0].project, "Owner/Repo");
         assert_eq!(events[0].data["by"], "sign_in");
+        assert_eq!(events[0].data["read_back"], "matches");
         let expires = Timestamp::from_second(start().as_second() + 28_800).unwrap();
         assert_eq!(events[0].data["expires_at"], expires.to_string());
+    }
+
+    /// OWL-649: a sign-in's store the keychain does not give back failed,
+    /// naming the account, and is recorded so.
+    #[test]
+    fn a_sign_in_the_keychain_does_not_give_back_failed() {
+        let mut run = Run::new(&[CODE, GRANTED], &[INSTALLED]);
+        let outcome = run.step_with(ON_A_TERMINAL, Some(Fault::StoreDropped));
+        let Outcome::Failed(reason) = outcome else {
+            panic!("{outcome:?}");
+        };
+        assert!(
+            reason.contains("account `github.com/owner/repo/github-app`")
+                && reason.contains("may shadow it"),
+            "{reason}"
+        );
+        assert_eq!(run.app_entry(), None);
+        assert_eq!(told(&logged(run.dir.path())), ["keychain_write failed"]);
     }
 
     /// OWL-649: init's check of a stored token past its expiry refreshes it

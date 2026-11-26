@@ -53,7 +53,7 @@ use owlshift_adapters::forge::github_app::{AppError, DeviceFlow, Login, UserToke
 use owlshift_adapters::forge::{Error, ErrorKind};
 use owlshift_contracts::event::{Event, EventKind};
 use owlshift_contracts::format::Format;
-use owlshift_platform::keychain::{Keychain, Secret};
+use owlshift_platform::keychain::{Keychain, SERVICE, Secret};
 use owlshift_platform::wake::{self, Wake};
 use serde_json::json;
 
@@ -112,6 +112,52 @@ impl<E: Entries + ?Sized> Entries for Arc<E> {
 
     fn store(&self, account: &str, secret: &Secret) -> Result<(), String> {
         (**self).store(account, secret)
+    }
+}
+
+/// What reading back a value just stored gave ([`store_checked`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ReadBack {
+    /// The keychain gives back the value written.
+    Matches,
+    /// The read failed, for this reason in Owlshift's words: the write
+    /// counts as done, as the store said.
+    Unreadable(String),
+}
+
+impl ReadBack {
+    /// How an event of the write tells it: `read_back`, and the read's
+    /// error as `read_back_why` when it failed.
+    pub fn details(&self) -> Data {
+        match self {
+            Self::Matches => events::data([("read_back", json!("matches"))]),
+            Self::Unreadable(why) => events::data([
+                ("read_back", json!("unreadable")),
+                ("read_back_why", json!(why)),
+            ]),
+        }
+    }
+}
+
+/// Stores `secret` under `account` of `entries`, then reads it back
+/// (OWL-649, architecture section 8, *The read-back*). Another value, or
+/// none, is an error, as a failed store is: the write landed elsewhere, or
+/// another item the keychain gives first shadows it. A read that fails
+/// counts the write as done, as the store said, so a passing read error
+/// never turns a write that landed into a lost rotation.
+pub fn store_checked(
+    entries: &impl Entries,
+    account: &str,
+    secret: &Secret,
+) -> Result<ReadBack, String> {
+    entries.store(account, secret)?;
+    match entries.read(account) {
+        Ok(Some(read)) if read.expose() == secret.expose() => Ok(ReadBack::Matches),
+        Ok(_) => Err(format!(
+            "the keychain gives back another value after the write: another item under service \
+             `{SERVICE}` may shadow it"
+        )),
+        Err(why) => Ok(ReadBack::Unreadable(why)),
     }
 }
 
@@ -581,19 +627,22 @@ impl<E: Entries, R: Refresh> AppToken<E, R> {
         self.refresh_event("not_sent", trigger, stored, why, more);
     }
 
-    /// Writes `new` under the account, tried [`STORE_TRIES`] times, each try
-    /// recorded.
+    /// Writes `new` under the account, read back ([`store_checked`]), tried
+    /// [`STORE_TRIES`] times, each try recorded.
     fn write(&self, new: &UserToken) -> Result<(), Error> {
         let entry = Secret::new(new.to_entry());
         let mut tries = 0;
         loop {
             tries += 1;
-            let stored = self.entries.store(&self.account, &entry);
+            let stored = store_checked(&self.entries, &self.account, &entry);
             let last = tries >= STORE_TRIES;
             if let Some(events) = &self.events {
                 let mut more = events::data([("try", json!(tries)), ("tries", json!(STORE_TRIES))]);
                 let written = match &stored {
-                    Ok(()) => Written::Stored,
+                    Ok(read_back) => {
+                        more.extend(read_back.details());
+                        Written::Stored
+                    }
                     Err(why) => {
                         if last {
                             more.insert("rotation_lost".to_owned(), json!(true));
@@ -604,7 +653,7 @@ impl<E: Entries, R: Refresh> AppToken<E, R> {
                 events.keychain_write("refresh", &written, Some(new), more);
             }
             match stored {
-                Ok(()) => return Ok(()),
+                Ok(_) => return Ok(()),
                 Err(error) if last => {
                     return Err(self.sign_in_again(&format!(
                         "was rotated by GitHub, but storing the new one failed ({error}), so the \
@@ -687,6 +736,11 @@ pub(crate) mod testing {
         ReadFails,
         /// Every store fails.
         StoreFails,
+        /// Every store answers it is done and keeps nothing: a write that
+        /// lands elsewhere, or that another item shadows.
+        StoreDropped,
+        /// Every read fails once a store was made.
+        ReadFailsAfterStore,
     }
 
     /// Keychain entries over an in-memory keychain that fail as `fault`
@@ -715,6 +769,9 @@ pub(crate) mod testing {
         fn read(&self, account: &str) -> Result<Option<Secret>, String> {
             match self.fault {
                 Fault::ReadFails => Err("the keychain is locked".to_owned()),
+                Fault::ReadFailsAfterStore if self.stores() > 0 => {
+                    Err("the keychain is locked".to_owned())
+                }
                 _ => Entries::read(self.keychain, account),
             }
         }
@@ -723,6 +780,7 @@ pub(crate) mod testing {
             *self.stores.lock().unwrap() += 1;
             match self.fault {
                 Fault::StoreFails => Err("the keychain is locked".to_owned()),
+                Fault::StoreDropped => Ok(()),
                 _ => Entries::store(self.keychain, account, secret),
             }
         }
@@ -1240,6 +1298,65 @@ mod tests {
         }
     }
 
+    /// OWL-649: a write the keychain says is done but does not give back
+    /// is a failed try; past the tries, the rotation is lost, the new token
+    /// never handed out.
+    #[test]
+    fn a_write_the_keychain_does_not_give_back_is_a_lost_rotation() {
+        let dir = tempfile::tempdir().unwrap();
+        let keychain = Keychain::in_memory();
+        let stored = entry("ghu_old", Some("ghr_old"), 0);
+        keychain.store(ACCOUNT, &stored).unwrap();
+        let script = Script::answering(&[&granted("ghu_new", "ghr_new")]);
+        let entries = Faulty::new(&keychain, Fault::StoreDropped);
+        let flow = DeviceFlow::new(&script, "Iv1.test").with_clock(now);
+        let mut token = AppToken::new(&entries, ACCOUNT, dir.path().join("lock"), flow, &stored)
+            .unwrap()
+            .with_events(recorder(dir.path()))
+            .with_wake(|| Wake::Full);
+        let error = token.token_at(now()).unwrap_err();
+        assert_eq!(error.kind, ErrorKind::SignInAgain);
+        assert!(error.message.contains("the rotation is lost"), "{error}");
+        assert!(error.message.contains("may shadow it"), "{error}");
+        assert_eq!(entries.stores(), STORE_TRIES);
+        assert_eq!(stored_access(&keychain), "ghu_old");
+        let events = logged(dir.path());
+        let writes: Vec<&Event> = events
+            .iter()
+            .filter(|e| e.data["github_app"] == "keychain_write")
+            .collect();
+        assert_eq!(writes.len(), 3);
+        for (n, write) in writes.iter().enumerate() {
+            assert_eq!(write.data["outcome"], "failed");
+            assert_eq!(write.data.get("rotation_lost").is_some(), n == 2, "{n}");
+        }
+    }
+
+    /// OWL-649: a read-back that fails counts the write as done, and its
+    /// event says so.
+    #[test]
+    fn a_write_whose_read_back_fails_counts_as_done() {
+        let dir = tempfile::tempdir().unwrap();
+        let keychain = Keychain::in_memory();
+        let stored = entry("ghu_old", Some("ghr_old"), 0);
+        keychain.store(ACCOUNT, &stored).unwrap();
+        let script = Script::answering(&[&granted("ghu_new", "ghr_new")]);
+        let entries = Faulty::new(&keychain, Fault::ReadFailsAfterStore);
+        let flow = DeviceFlow::new(&script, "Iv1.test").with_clock(now);
+        let mut token = AppToken::new(&entries, ACCOUNT, dir.path().join("lock"), flow, &stored)
+            .unwrap()
+            .with_events(recorder(dir.path()))
+            .with_wake(|| Wake::Full);
+        assert_eq!(token.token_at(now()).unwrap(), Token::new("ghu_new"));
+        assert_eq!(entries.stores(), 1);
+        assert_eq!(stored_access(&keychain), "ghu_new");
+        let events = logged(dir.path());
+        let write = events.last().unwrap();
+        assert_eq!(write.data["outcome"], "stored");
+        assert_eq!(write.data["read_back"], "unreadable");
+        assert_eq!(write.data["read_back_why"], "the keychain is locked");
+    }
+
     /// The events of a refresh in the log of `data`, for the project
     /// `owner/repo`.
     fn recorder(data: &std::path::Path) -> TokenEvents {
@@ -1290,6 +1407,7 @@ mod tests {
             at(15_724_800).to_string()
         );
         assert_eq!(events[2].data["by"], "refresh");
+        assert_eq!(events[2].data["read_back"], "matches");
         assert_eq!(events[2].data["expires_at"], at(28_800).to_string());
 
         let mut printed = Vec::new();
