@@ -533,7 +533,7 @@ pub fn phrase(wait: &Waiting) -> String {
             if data.get("pending").and_then(Value::as_bool) == Some(true) {
                 format!(
                     "whether the base its branch was made from, {}, fails {failing} too is \
-                     checked once no other ticket's step runs",
+                     checked once the base check running now ends",
                     base::short(commit)
                 )
             } else {
@@ -1573,8 +1573,8 @@ fn render_base(out: &mut String, check: &Check) {
         Entry::Pending { failing, .. } => {
             let _ = writeln!(
                 out,
-                "base {short}: a check of its {} command `{}` is due, once no other ticket's \
-                 step runs; the Builds made from it wait",
+                "base {short}: a check of its {} command `{}` is due, once the base check \
+                 running now ends; the Builds made from it wait",
                 base::step_name(failing.step),
                 failing.command
             );
@@ -2136,7 +2136,7 @@ mod tests {
         );
         let folded = fold(&[held(true)], "o/r");
         let wait = &folded.current[&TicketId::new("OWL-1").unwrap()];
-        assert!(phrase(wait).contains("is checked once no other ticket's step runs"));
+        assert!(phrase(wait).contains("is checked once the base check running now ends"));
         // OWL-480: a red gate the machine cut is a wait of its own.
         let cut = waits(
             "2026-10-29T08:01:22Z",

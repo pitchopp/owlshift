@@ -1476,3 +1476,136 @@ fn helper_watch_until_stopped() {
     let ends = Instant::now() + wait::OUTLASTS;
     project.watch_until_stopped(children, &mut || Instant::now() < ends);
 }
+
+/// OWL-660's acceptance, criterion 1, with steps in real children: DEMO-1's
+/// Build fails its setup, which the base fails too, so its step checks the
+/// base, and that check's setup is kept running until the test lets it go.
+/// Meanwhile DEMO-2, whose Build asked, gets its decider's answer: a pass
+/// runs its answer check in a child of its own and posts its RESUME while
+/// DEMO-1's check still runs, the project's lock free and the base lock
+/// held. Then the check ends, failing at the same command: DEMO-1 is held,
+/// with no quarantine and no obligation left.
+#[cfg(unix)]
+#[test]
+fn an_answered_ticket_goes_on_while_another_tickets_base_check_runs() {
+    use owlshift_contracts::format::RESULT_FORMAT;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let plays = tmp.path().join("plays");
+    let hold = tmp.path().join("hold");
+    let machine = tmp.path().join("machine");
+    fs::create_dir_all(&plays).unwrap();
+    fs::create_dir_all(&hold).unwrap();
+    let (one, two) = ("DEMO-1", "DEMO-2");
+    reply_for(&plays, "intake", Some(one), &intake_declaring(&["a"]));
+    reply_for(&plays, "intake", Some(two), &intake_declaring(&["b"]));
+    reply_for(&plays, "build", Some(two), &build_asks());
+    let answered = serde_json::json!({
+        "format": RESULT_FORMAT,
+        "status": "done",
+        "summary": "Answered.",
+        "verdicts": [{ "question": "Q1", "class": "answered", "reason": "English." }],
+    });
+    reply_for(&plays, "answer_check", Some(two), &answered.to_string());
+    let harness = holding_harness(&plays, fake(), "none", "", "");
+    let s = parallel_setup(&harness, 2, 2, (&machine, 3));
+    // DEMO-1's setup fails at once in its worktree and, in the base check's,
+    // once the test lets it go; DEMO-2's passes. No repair is filed.
+    let (started, go) = (hold.join("started"), hold.join("go"));
+    let setup = format!(
+        "case \"$PWD\" in */worktrees/demo-1) exit 1;; */base/worktree) touch '{}'; \
+         while [ ! -e '{}' ]; do sleep 0.1; done; exit 1;; esac",
+        started.display(),
+        go.display()
+    );
+    let file = s.project.checkout.join("owlshift.toml");
+    let gate = "gate = [\"git grep -q Hello -- GREETING.md\"]";
+    let text = fs::read_to_string(&file).unwrap().replace(
+        gate,
+        &format!("{gate}\nsetup = [{}]", toml::Value::String(setup)),
+    );
+    fs::write(&file, format!("{text}base_repair = false\n")).unwrap();
+    let env = s.project.env();
+    env.run(&s.project.checkout, &["add", "owlshift.toml"])
+        .unwrap();
+    env.run(
+        &s.project.checkout,
+        &["commit", "--quiet", "-m", "A setup the base breaks"],
+    )
+    .unwrap();
+    env.run(
+        &s.project.checkout,
+        &["push", "--quiet", "origin", "HEAD:refs/heads/main"],
+    )
+    .unwrap();
+
+    let dirs = s.project.dirs();
+    let tracker = MarkdownTracker::new(&s.project.checkout);
+    let demo2 = TicketId::new(two).unwrap();
+    let resumed = || {
+        tracker
+            .comments(&demo2)
+            .unwrap()
+            .iter()
+            .any(|comment| comment.body.starts_with("[owlshift] RESUME"))
+    };
+    let held = || {
+        owlshift_runner::base::read(&dirs).is_ok_and(|checks| {
+            checks.standing().any(|check| {
+                matches!(
+                    check.entry,
+                    owlshift_core::base::Entry::Checked {
+                        verdict: owlshift_core::base::Verdict::Failed(_),
+                        ..
+                    }
+                )
+            })
+        })
+    };
+    let (mut answered_at, mut went_on) = (false, None);
+    let counted = children(&s.file).with_slots(MachineSlots::new(&machine, 3));
+    let interval = std::time::Duration::from_millis(200);
+    let lines = drain_every(&s.project, &counted, interval, |pass| {
+        if record_of(&s.project, two).is_some_and(|record| record.intake.is_some()) {
+            s.project.move_ticket("DEMO-9", "Done");
+        }
+        if !answered_at && started.exists() && asks(&s.project, two) {
+            tracker
+                .post_comment(&demo2, "maintainer", Timestamp::now(), "English. go")
+                .unwrap();
+            answered_at = true;
+        }
+        if went_on.is_none() && resumed() {
+            // DEMO-1's check still runs: the project's lock is free.
+            went_on = Some((
+                go.exists(),
+                dirs.base_lock_held().unwrap(),
+                dirs.try_lock().unwrap().is_some(),
+            ));
+            fs::write(&go, "").unwrap();
+        }
+        if pass >= 600 {
+            // Out of passes: the check goes on, so watch's wait for its
+            // children ends and the test fails below.
+            fs::write(&go, "").unwrap();
+        }
+        pass < 600 && !(went_on.is_some() && held())
+    });
+    assert_eq!(dirs.quarantine().unwrap(), None, "{lines}");
+    assert!(
+        answered_at,
+        "DEMO-2 never asked while the check ran\n{lines}"
+    );
+    assert_eq!(
+        went_on,
+        Some((false, true, true)),
+        "DEMO-2 went on while DEMO-1's check ran (let go, base lock held, project's lock \
+         free)\n{lines}"
+    );
+    assert!(
+        held(),
+        "DEMO-1's check ended, failing at its setup\n{lines}"
+    );
+    assert!(!dirs.obligations_stand(), "{lines}");
+    assert!(step::leftovers(&dirs).is_empty());
+}

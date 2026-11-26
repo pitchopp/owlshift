@@ -20,7 +20,7 @@ use crate::service::{
     WatchRecord,
 };
 use crate::step::{
-    RunObligation, StepEnvelope, StepOutcome, StepOutside, TicketCarry, TicketNotMine,
+    BaseRun, RunObligation, StepEnvelope, StepOutcome, StepOutside, TicketCarry, TicketNotMine,
     TicketRestart, TicketRun,
 };
 use crate::usage::HarnessUsage;
@@ -57,6 +57,7 @@ pub fn all() -> Vec<(&'static str, Schema)> {
         ("repair-claim", schema::<RepairClaim>()),
         ("ticket-run", schema::<TicketRun>()),
         ("run-obligation", schema::<RunObligation>()),
+        ("base-run", schema::<BaseRun>()),
         ("step-outside", schema::<StepOutside>()),
         ("harness-usage", schema::<HarnessUsage>()),
         ("project-base", schema::<ProjectBase>()),

@@ -502,6 +502,46 @@ impl ProjectDirs {
         self.root.join("quarantine-comments.json")
     }
 
+    /// The folder of the project's base checks (OWL-418): the check's
+    /// worktree and log, and since OWL-660 its lock and record.
+    pub fn base_dir(&self) -> PathBuf {
+        self.root.join("base")
+    }
+
+    /// The base check's record (OWL-660, [`crate::ticket_run`]): what a
+    /// sibling's check holds its branch and worktree entry to.
+    pub fn base_run_file(&self) -> PathBuf {
+        self.base_dir().join("run.json")
+    }
+
+    /// Takes the base lock for a base check (OWL-660; architecture section
+    /// 5, "A broken base", "Its locks"): one base check of the project at a
+    /// time, and what a sibling's check reads as one running. Waited for as a
+    /// ticket's lock is, [`LOCK_GRACE`] at most, so a probe's moment is
+    /// outlasted; `None` while another check holds it. Taken by a step that
+    /// holds its ticket's lock, before any section of the project's lock.
+    pub fn base_lock(&self) -> io::Result<Option<BaseLock>> {
+        fs::create_dir_all(self.base_dir())?;
+        Ok(
+            lock_file_within(&self.base_dir().join("lock"), LOCK_GRACE, LOCK_POLL)?
+                .map(|file| BaseLock { _file: file }),
+        )
+    }
+
+    /// Whether a base check holds the base lock now (OWL-660): one try, let
+    /// go at once, as [`ProjectDirs::ticket_lock_held_in`]. A project whose
+    /// base folder is missing, or is not a folder, has no check running.
+    pub fn base_lock_held(&self) -> io::Result<bool> {
+        let dir = self.base_dir();
+        match fs::symlink_metadata(&dir) {
+            Ok(meta) if meta.is_dir() => {}
+            Ok(_) => return Ok(false),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+            Err(error) => return Err(error),
+        }
+        Ok(try_lock_file(&dir.join("lock"))?.is_none())
+    }
+
     /// Whether any obligation stands (OWL-400): any entry in
     /// [`ProjectDirs::obligations_dir`]. A folder that cannot be listed
     /// counts as one standing, so the shared checkout's rules for runs in
@@ -763,6 +803,12 @@ fn exists(path: &Path) -> io::Result<bool> {
 /// The project's lock: see [`ProjectDirs::lock`].
 #[derive(Debug)]
 pub struct ProjectLock {
+    _file: FileLock,
+}
+
+/// The base lock: see [`ProjectDirs::base_lock`].
+#[derive(Debug)]
+pub struct BaseLock {
     _file: FileLock,
 }
 

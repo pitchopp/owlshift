@@ -18,15 +18,24 @@
 //! The same run checks a Build's base (OWL-418, [`Place::Base`]): from the
 //! step of the ticket whose gate or setup failed, at the commit its run was
 //! configured at, in a worktree and on a branch of its own. Either place
-//! keeps its verdict in the project's base checks ([`crate::base`]) before
-//! it lets the project's lock go: a base check always, `owlshift gate` only
-//! on a commit whose check holds or is due, so a pass lifts a hold and the
-//! operator's gate never opens one. A base check finds its verdict kept at
-//! the default branch's head already, read under the lock, and runs nothing.
+//! keeps its verdict in the project's base checks ([`crate::base`]) under the
+//! project's lock: a base check always, `owlshift gate` only on a commit
+//! whose check holds or is due, so a pass lifts a hold and the operator's
+//! gate never opens one. A base check finds its verdict kept at the default
+//! branch's head already, read under the lock, and runs nothing.
+//!
+//! `owlshift gate` runs alone, under the project's lock for its whole
+//! length. A base check runs beside the project's other steps (OWL-660;
+//! architecture section 5, "A broken base", "The check, beside the steps"):
+//! the project's lock for short sections only, the base lock for its length,
+//! one base check of the project at a time; its record (`base/run.json`,
+//! [`ticket_run::write_base_run`]) tells siblings' isolation checks what to
+//! leave out, its own check is told of every other ticket, and its
+//! obligation names its ticket, whose lock its step holds.
 
 use std::fmt;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use jiff::Timestamp;
@@ -38,8 +47,8 @@ use owlshift_contracts::config::ProjectConfig;
 use owlshift_contracts::ids::TicketId;
 use owlshift_core::base::{After, Failing, Recorded, Verdict};
 
-use crate::project::{self, Base, ProjectDirs};
-use crate::ticket_run::{self, Look};
+use crate::project::{self, Base, BaseLock, ProjectDirs, ProjectLock};
+use crate::ticket_run::{self, Look, Siblings};
 
 /// The branch of `owlshift gate`'s worktree: no ticket's branch
 /// (`owlshift/<id>`) can take it.
@@ -48,13 +57,16 @@ pub const GATE_BRANCH: &str = "owlshift-gate/check";
 /// The branch of a base check's worktree (OWL-418).
 pub const BASE_BRANCH: &str = "owlshift-gate/base";
 
-/// Where a run of the gate alone works, and what it keeps of its verdict.
+/// Where a run of the gate works, beside what, and what it keeps of its
+/// verdict.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Place {
-    /// `owlshift gate`: its verdict replaces a base check's that holds or
-    /// is due, and is kept nowhere else.
+    /// `owlshift gate`: alone, refused while any ticket's step is in
+    /// flight; its verdict replaces a base check's that holds or is due, and
+    /// is kept nowhere else.
     Gate,
-    /// A Build's base check (OWL-418): its verdict is always kept.
+    /// A Build's base check (OWL-418): beside the project's other steps
+    /// (OWL-660); its verdict is always kept.
     Base,
 }
 
@@ -82,6 +94,20 @@ impl Place {
     }
 }
 
+/// How many times a base check waits the project lock's bound for its last
+/// section (OWL-660): its verdict, after a gate of half an hour, is worth
+/// minutes more than one holder's moment.
+const LAST_SECTION_TRIES: usize = 5;
+
+/// How a base check that held the base lock ended: its gate's run, the
+/// quarantine a breach wrote, warnings, and what became of its verdict.
+type Beside = (
+    Option<GateRun>,
+    Option<PathBuf>,
+    Vec<String>,
+    Option<BaseKept>,
+);
+
 /// The most lines of each command's output [`render`] prints; the gate log
 /// has them all.
 pub const TAIL_LINES: usize = 20;
@@ -105,7 +131,8 @@ pub struct GateOnce<'a> {
     /// Where it works (OWL-418).
     pub place: Place,
     /// The ticket whose step runs a base check, which holds its own lock:
-    /// not taken for a ticket in flight.
+    /// its obligation names it, and its own check compares that ticket's
+    /// refs whole. `None` for `owlshift gate`.
     pub except: Option<&'a TicketId>,
     /// The failure a base check runs for: matched with its verdict.
     pub initiating: Option<&'a Failing>,
@@ -326,33 +353,30 @@ impl GateOnce<'_> {
     /// Runs the gate; see the module documentation. `starting` is told what
     /// runs just before it does.
     pub fn run(&self, starting: &mut dyn FnMut(&Plan)) -> Result<Checked, Stop> {
+        match self.place {
+            Place::Gate => self.run_alone(starting),
+            Place::Base => self.run_beside(starting),
+        }
+    }
+
+    /// `owlshift gate`: alone, under the project's lock for its whole length.
+    fn run_alone(&self, starting: &mut dyn FnMut(&Plan)) -> Result<Checked, Stop> {
         let started = Instant::now();
         let executor = self.executor;
-        let git = &executor.git;
         let dirs = self.dirs;
         // As a Build's preparation: the version, the lock, then the marker,
         // then the confinement (`on_demand`'s `prepare`).
-        git.require_minimum_version().map_err(Stop::Refused)?;
-        let _lock = match dirs.lock() {
-            Ok(Some(lock)) => lock,
-            Ok(None) => return Err(Stop::Busy(dirs.root().to_owned())),
-            Err(error) => return Err(Stop::Refused(format!("the project's lock: {error}"))),
-        };
-        // The quarantine, or a run left behind, which becomes it (OWL-400).
-        match ticket_run::look(dirs, self.except) {
-            Ok(Look::Clear { .. }) => {}
-            Ok(Look::Quarantined { path, text }) => {
-                return Err(Stop::Unverified { marker: path, text });
-            }
-            Err(error) => {
-                return Err(Stop::Refused(format!("the project's quarantine: {error}")));
-            }
-        }
+        executor
+            .git
+            .require_minimum_version()
+            .map_err(Stop::Refused)?;
+        let _lock = self.section()?;
+        self.look()?;
         // Alone (OWL-401): a step in flight holds its ticket's lock and not
         // the project's, and this gate's check is a run's alone, so it waits
         // for none to stand; no step starts meanwhile, every one starting
         // with the project's lock this gate holds.
-        match ticket_run::ticket_in_flight_except(dirs, self.except) {
+        match ticket_run::ticket_in_flight(dirs) {
             Ok(None) => {}
             Ok(Some(_)) => return Err(Stop::Busy(dirs.root().to_owned())),
             Err(error) => {
@@ -376,6 +400,316 @@ impl GateOnce<'_> {
                     ))
                 })?;
         }
+        let plan = self.plan()?;
+        let checked = |run, marker, warnings, base| Checked {
+            plan: plan.clone(),
+            run,
+            elapsed: started.elapsed(),
+            marker,
+            warnings,
+            base,
+        };
+        if plan.commands.is_empty() {
+            return Ok(checked(None, None, Vec::new(), None));
+        }
+        let key = base::commands_key(&plan.setup, &plan.commands);
+        // A checked stop of the step (OWL-161) runs no check, as it starts
+        // no run.
+        if crate::executor::checked_stop_asked() {
+            return Err(Stop::Stopped);
+        }
+        let obligation = self.obligation(&plan, None, &worktree)?;
+        starting(&plan);
+        let run_dir = run_dir_at(dirs, self.place);
+        let spec = self.spec(&plan, (&checkout, &worktree, &run_dir));
+        let discard = || executor.discard_worktree(&checkout, &worktree, branch);
+        let run = match executor.run_gate(&spec) {
+            Ok(run) => run,
+            Err(error) => {
+                // No gate command ran: nothing to verify, as for a run.
+                let mut reason = format!("the gate could not start: {error}");
+                if let Err(e) = discard() {
+                    reason.push_str(&format!("; its worktree could not be removed: {e}"));
+                }
+                if let Err(e) = ticket_run::remove_obligation(dirs, &obligation) {
+                    reason.push_str(&format!("; the gate's obligation: {e}"));
+                }
+                return Err(Stop::Refused(reason));
+            }
+        };
+        let mut warnings = Vec::new();
+        if !run.violations.is_empty() {
+            let marker = Some(self.breached(&plan, &run, &worktree, &mut warnings));
+            return Ok(checked(Some(run), marker, warnings, None));
+        }
+        if let Err(e) = discard() {
+            warnings.push(format!("the gate's worktree could not be removed: {e}"));
+        }
+        if let Err(e) = ticket_run::remove_obligation(dirs, &obligation) {
+            warnings.push(format!("the gate's obligation could not be removed: {e}"));
+        }
+        // A failure while a checked stop is asked may be the stop's, which
+        // cuts the gate's commands (OWL-161): no verdict is kept.
+        if !run.report.passed() && crate::executor::checked_stop_asked() {
+            return Err(Stop::Stopped);
+        }
+        // Kept before the project's lock goes (OWL-418).
+        let kept = self.keep(&plan, &key, &run);
+        Ok(checked(Some(run), None, warnings, kept))
+    }
+
+    /// A step's base check (OWL-418), beside the project's other steps
+    /// (OWL-660; architecture section 5, "A broken base", "The check, beside
+    /// the steps"): the project's lock for sections only, the base lock from
+    /// the moment the check is known to run until its end, and its record
+    /// written whatever the end, before that lock goes.
+    fn run_beside(&self, starting: &mut dyn FnMut(&Plan)) -> Result<Checked, Stop> {
+        let started = Instant::now();
+        let executor = self.executor;
+        let dirs = self.dirs;
+        executor
+            .git
+            .require_minimum_version()
+            .map_err(Stop::Refused)?;
+        let Some(ticket) = self.except else {
+            return Err(Stop::Refused(
+                "a base check runs from a ticket's step".to_owned(),
+            ));
+        };
+        // The first section: the quarantine, the fetch, the commit and its
+        // project file, and a verdict kept at this head, used with no base
+        // lock taken, so a Build on a commit already checked never waits for
+        // another check.
+        let section = self.section()?;
+        self.look()?;
+        executor
+            .agent
+            .sandbox_ready()
+            .map_err(|e| Stop::Refused(e.to_string()))?;
+        let plan = self.plan()?;
+        let checked = |run, marker, warnings, base| Checked {
+            plan: plan.clone(),
+            run,
+            elapsed: started.elapsed(),
+            marker,
+            warnings,
+            base,
+        };
+        if plan.commands.is_empty() {
+            return Ok(checked(None, None, Vec::new(), None));
+        }
+        let key = base::commands_key(&plan.setup, &plan.commands);
+        // A base check another ticket's step made at this head is used,
+        // under the lock, nothing run (OWL-418).
+        if let Some(kept) = self.reuse(&plan, &key) {
+            return Ok(checked(None, None, Vec::new(), Some(kept)));
+        }
+        drop(section);
+        // One base check of the project at a time: a second waits for the
+        // first (OWL-660).
+        let lock = match dirs.base_lock() {
+            Ok(Some(lock)) => lock,
+            Ok(None) => return Err(Stop::Busy(dirs.base_dir())),
+            Err(error) => return Err(Stop::Refused(format!("the base lock: {error}"))),
+        };
+        let mut record =
+            ticket_run::read_base_run(dirs).map_or((None, None), |run| (run.tip, run.entry));
+        let ended = self.beside_locked(&lock, ticket, (&plan, &key), &mut record, starting);
+        // Whatever the end, the record says where the base branch was left
+        // before the base lock goes, so a sibling's check holds it to that
+        // or to none.
+        let checkout = dirs.checkout();
+        if let Ok(tip) = ticket_run::branch_tip(&executor.git, &checkout, BASE_BRANCH) {
+            record.0 = tip;
+        }
+        let unrecorded = ticket_run::write_base_run(dirs, &lock, record.0, record.1)
+            .err()
+            .map(|e| format!("the base check's record could not be written: {e}"));
+        drop(lock);
+        ended.map(|(run, marker, mut warnings, kept)| {
+            warnings.extend(unrecorded);
+            checked(run, marker, warnings, kept)
+        })
+    }
+
+    /// The part of [`Self::run_beside`] that holds the base lock: what an
+    /// earlier check left removed, the worktree made, the gate run outside
+    /// the project's lock, told of the other tickets' steps, then the verdict
+    /// kept in a last section. `record`, the base branch's commit and the
+    /// worktree's entry, is kept up to date for the caller's last write.
+    fn beside_locked(
+        &self,
+        lock: &BaseLock,
+        ticket: &TicketId,
+        (plan, key): (&Plan, &str),
+        record: &mut (Option<String>, Option<String>),
+        starting: &mut dyn FnMut(&Plan),
+    ) -> Result<Beside, Stop> {
+        let executor = self.executor;
+        let dirs = self.dirs;
+        let checkout = dirs.checkout();
+        let worktree = worktree_at(dirs, self.place);
+        let discard = || executor.discard_own_worktree(&checkout, &worktree, BASE_BRANCH);
+        let section = self.section()?;
+        // A sibling's breach may have written the quarantine since.
+        self.look()?;
+        // A checked stop of the step (OWL-161) runs no check, as it starts
+        // no run.
+        if crate::executor::checked_stop_asked() {
+            return Err(Stop::Stopped);
+        }
+        // What a stopped check left: its entries found by their `gitdir`,
+        // never by `git worktree prune`, which would remove entries a
+        // sibling's check reads.
+        discard()
+            .map_err(|e| Stop::Refused(format!("removing what an earlier base check left: {e}")))?;
+        let obligation = self.obligation(plan, Some(ticket), &worktree)?;
+        starting(plan);
+        let run_dir = run_dir_at(dirs, self.place);
+        let spec = self.spec(plan, (&checkout, &worktree, &run_dir));
+        let made = executor
+            .make_gate_worktree(&spec)
+            .map_err(|e| e.to_string())
+            .and_then(|()| {
+                *record = (
+                    Some(plan.commit.clone()),
+                    ticket_run::entry_of(&checkout, &worktree),
+                );
+                ticket_run::write_base_run(dirs, lock, record.0.clone(), record.1.clone())
+                    .map_err(|e| format!("its record could not be written: {e}"))
+            });
+        if let Err(error) = made {
+            let mut reason = format!("the gate could not start: {error}");
+            if let Err(e) = discard() {
+                reason.push_str(&format!("; its worktree could not be removed: {e}"));
+            }
+            if let Err(e) = ticket_run::remove_obligation(dirs, &obligation) {
+                reason.push_str(&format!("; the gate's obligation: {e}"));
+            }
+            return Err(Stop::Refused(reason));
+        }
+        drop(section);
+        // The gate and its isolation check, outside the project's lock: told
+        // of every other ticket's step, its own ticket's refs compared whole.
+        let siblings = Siblings::for_base_check(dirs, ticket);
+        let run = match executor.gate_in(&spec, Some(&siblings)) {
+            Ok(run) => run,
+            Err(error) => {
+                let mut reason = format!("the gate could not start: {error}");
+                match self.last_section() {
+                    Some(_section) => {
+                        if let Err(e) = discard() {
+                            reason.push_str(&format!("; its worktree could not be removed: {e}"));
+                        }
+                    }
+                    None => reason.push_str(
+                        "; its worktree is left for the next base check, the project's lock \
+                         staying held",
+                    ),
+                }
+                if let Err(e) = ticket_run::remove_obligation(dirs, &obligation) {
+                    reason.push_str(&format!("; the gate's obligation: {e}"));
+                }
+                return Err(Stop::Refused(reason));
+            }
+        };
+        let mut warnings = Vec::new();
+        if !run.violations.is_empty() {
+            let marker = Some(self.breached(plan, &run, &worktree, &mut warnings));
+            return Ok((Some(run), marker, warnings, None));
+        }
+        // The check passed: its obligation goes at once, so no wait below
+        // can leave it behind.
+        if let Err(e) = ticket_run::remove_obligation(dirs, &obligation) {
+            warnings.push(format!("the gate's obligation could not be removed: {e}"));
+        }
+        let unkept = |why: String| {
+            Some(BaseKept {
+                verdict: base::verdict(&run.report).ok(),
+                recorded: None,
+                reused: false,
+                commands: key.to_owned(),
+                unkept: Some(why),
+            })
+        };
+        let Some(section) = self.last_section() else {
+            warnings.push(
+                "the base check's worktree is left for the next one, the project's lock staying \
+                 held"
+                    .to_owned(),
+            );
+            if !run.report.passed() && crate::executor::checked_stop_asked() {
+                return Err(Stop::Stopped);
+            }
+            let kept = unkept("the project's lock stayed held once the check ended".to_owned());
+            return Ok((Some(run), None, warnings, kept));
+        };
+        // Before the branch and the entry go, the record says the branch's
+        // commit, so a sibling whose check spans their removal finds it
+        // there or gone; a record not written leaves them in place.
+        if let Ok(tip) = ticket_run::branch_tip(&executor.git, &checkout, BASE_BRANCH) {
+            record.0 = tip;
+        }
+        match ticket_run::write_base_run(dirs, lock, record.0.clone(), record.1.clone()) {
+            Ok(()) => {
+                if let Err(e) = discard() {
+                    warnings.push(format!("the gate's worktree could not be removed: {e}"));
+                }
+            }
+            Err(e) => warnings.push(format!(
+                "the base check's worktree is left for the next one, its record not written: {e}"
+            )),
+        }
+        // A failure while a checked stop is asked may be the stop's, which
+        // cuts the gate's commands (OWL-161): no verdict is kept.
+        if !run.report.passed() && crate::executor::checked_stop_asked() {
+            return Err(Stop::Stopped);
+        }
+        // A quarantine written while the check ran: the checkout may hold
+        // what a breaching run changed, so the verdict is not kept.
+        let kept = match dirs.quarantine_at() {
+            Ok(None) => self.keep(plan, key, &run),
+            Ok(Some(_)) => unkept("the project was quarantined while the check ran".to_owned()),
+            Err(e) => unkept(format!("the project's quarantine: {e}")),
+        };
+        drop(section);
+        Ok((Some(run), None, warnings, kept))
+    }
+
+    /// The project's lock for one of a check's sections: busy once its bound
+    /// is spent.
+    fn section(&self) -> Result<ProjectLock, Stop> {
+        match self.dirs.lock() {
+            Ok(Some(lock)) => Ok(lock),
+            Ok(None) => Err(Stop::Busy(self.dirs.root().to_owned())),
+            Err(error) => Err(Stop::Refused(format!("the project's lock: {error}"))),
+        }
+    }
+
+    /// A base check's last section, once a gate that may have run for half
+    /// an hour ended: waited for up to [`LAST_SECTION_TRIES`] times the
+    /// lock's bound rather than lose its verdict to one holder's moment.
+    fn last_section(&self) -> Option<ProjectLock> {
+        (0..LAST_SECTION_TRIES).find_map(|_| self.dirs.lock().ok().flatten())
+    }
+
+    /// The quarantine, or a run left behind, which becomes it (OWL-400).
+    fn look(&self) -> Result<(), Stop> {
+        match ticket_run::look(self.dirs, self.except) {
+            Ok(Look::Clear { .. }) => Ok(()),
+            Ok(Look::Quarantined { path, text }) => Err(Stop::Unverified { marker: path, text }),
+            Err(error) => Err(Stop::Refused(format!("the project's quarantine: {error}"))),
+        }
+    }
+
+    /// Brings the dedicated checkout up to date and says what runs: the
+    /// commit, the gate and setup of its project file, and the default
+    /// branch's head. The caller holds the project's lock.
+    fn plan(&self) -> Result<Plan, Stop> {
+        let executor = self.executor;
+        let git = &executor.git;
+        let dirs = self.dirs;
+        let checkout = dirs.checkout();
         let base = project::sync_checkout(git, dirs, self.remote_url).map_err(Stop::Refused)?;
         let head = base.commit.clone();
         let (commit, name) = match self.at {
@@ -409,51 +743,38 @@ impl GateOnce<'_> {
             config.stack.cache_folders(),
             self.local.stack.cache_folders(),
         );
-        let commands = config.stack.gate.clone();
-        let setup = config.stack.setup.clone();
-        let run_dir = run_dir_at(dirs, self.place);
-        let plan = Plan {
+        Ok(Plan {
             commit,
             name,
             source,
             head,
-            commands,
-            setup,
-            log: run_dir.join(GATE_LOG),
+            commands: config.stack.gate.clone(),
+            setup: config.stack.setup.clone(),
+            log: run_dir_at(dirs, self.place).join(GATE_LOG),
             gate_env_differs,
             caches_differ,
-        };
-        let checked = |run, marker, warnings, base| Checked {
-            plan: plan.clone(),
-            run,
-            elapsed: started.elapsed(),
-            marker,
-            warnings,
-            base,
-        };
-        if plan.commands.is_empty() {
-            return Ok(checked(None, None, Vec::new(), None));
-        }
-        let key = base::commands_key(&plan.setup, &plan.commands);
-        // A base check another ticket's step just made at this head is
-        // used, under the lock, nothing run (OWL-418).
-        if self.place == Place::Base
-            && let Some(kept) = self.reuse(&plan, &key)
-        {
-            return Ok(checked(None, None, Vec::new(), Some(kept)));
-        }
+        })
+    }
 
-        // A checked stop of the step (OWL-161) runs no check, as it starts
-        // no run.
-        if crate::executor::checked_stop_asked() {
-            return Err(Stop::Stopped);
-        }
-        // As for a run: from here until the isolation check passes, a stop
-        // leaves its obligation, which refuses the project (OWL-400).
-        let run = Timestamp::now().strftime("%Y%m%dT%H%M%SZ").to_string();
-        let obligation = ticket_run::write_obligation(
-            dirs,
-            None,
+    /// Writes the obligation of the run about to start (OWL-400): naming
+    /// `ticket`, the one whose step runs a base check and holds its lock
+    /// (OWL-660), none for `owlshift gate`. From here until the isolation
+    /// check passes, a stop leaves it, which refuses the project.
+    fn obligation(
+        &self,
+        plan: &Plan,
+        ticket: Option<&TicketId>,
+        worktree: &Path,
+    ) -> Result<String, Stop> {
+        let stamp = Timestamp::now().strftime("%Y%m%dT%H%M%SZ").to_string();
+        // A base check's run id is never one of its ticket's runs'.
+        let run = match ticket {
+            Some(_) => format!("{stamp}-base"),
+            None => stamp,
+        };
+        ticket_run::write_obligation(
+            self.dirs,
+            ticket,
             &run,
             &format!(
                 "{} on {}, its worktree at {}",
@@ -462,52 +783,40 @@ impl GateOnce<'_> {
                 worktree.display()
             ),
         )
-        .map_err(|e| Stop::Refused(format!("the gate's obligation: {e}")))?;
-        starting(&plan);
-        let spec = GateSpec {
-            main: &checkout,
-            worktree: &worktree,
-            branch,
+        .map_err(|e| Stop::Refused(format!("the gate's obligation: {e}")))
+    }
+
+    /// The run of the gate at this place, in `worktree` of `checkout`, its
+    /// log in `run_dir`.
+    fn spec<'s>(
+        &self,
+        plan: &'s Plan,
+        (checkout, worktree, run_dir): (&'s Path, &'s Path, &'s Path),
+    ) -> GateSpec<'s> {
+        GateSpec {
+            main: checkout,
+            worktree,
+            branch: self.place.branch(),
             base: &plan.commit,
-            run_dir: &run_dir,
+            run_dir,
             commands: &plan.commands,
             setup: &plan.setup,
-        };
-        let discard = || executor.discard_worktree(&checkout, &worktree, branch);
-        let run = match executor.run_gate(&spec) {
-            Ok(run) => run,
-            Err(error) => {
-                // No gate command ran: nothing to verify, as for a run.
-                let mut reason = format!("the gate could not start: {error}");
-                if let Err(e) = discard() {
-                    reason.push_str(&format!("; its worktree could not be removed: {e}"));
-                }
-                if let Err(e) = ticket_run::remove_obligation(dirs, &obligation) {
-                    reason.push_str(&format!("; the gate's obligation: {e}"));
-                }
-                return Err(Stop::Refused(reason));
-            }
-        };
-        let mut warnings = Vec::new();
-        if run.violations.is_empty() {
-            if let Err(e) = discard() {
-                warnings.push(format!("the gate's worktree could not be removed: {e}"));
-            }
-            if let Err(e) = ticket_run::remove_obligation(dirs, &obligation) {
-                warnings.push(format!("the gate's obligation could not be removed: {e}"));
-            }
-            // A failure while a checked stop is asked may be the stop's, which
-            // cuts the gate's commands (OWL-161): no verdict is kept.
-            if !run.report.passed() && crate::executor::checked_stop_asked() {
-                return Err(Stop::Stopped);
-            }
-            // Kept before the project's lock goes (OWL-418).
-            let kept = self.keep(&plan, &key, &run);
-            return Ok(checked(Some(run), None, warnings, kept));
         }
-        // The worktree stays for the person who looks; no more git runs.
+    }
+
+    /// A breach of the gate's run: the worktree stays for the person who
+    /// looks, its obligation stays until `owlshift unquarantine` (OWL-400),
+    /// and the quarantine is written, its time making the text unique, as a
+    /// run's is (OWL-368). Returns the quarantine's file, or `None` with a
+    /// warning when it could not be written.
+    fn breached(
+        &self,
+        plan: &Plan,
+        run: &GateRun,
+        worktree: &Path,
+        warnings: &mut Vec<String>,
+    ) -> PathBuf {
         let lines: Vec<String> = run.violations.iter().map(|v| format!("- {v}")).collect();
-        // Its time makes the marker unique, as a run's are (OWL-368).
         let text = format!(
             "{} on {} broke isolation at {}; its worktree is kept at {}:\n{}\n",
             self.place.what(),
@@ -516,16 +825,10 @@ impl GateOnce<'_> {
             worktree.display(),
             lines.join("\n")
         );
-        // Its obligation stays until `owlshift unquarantine` (OWL-400).
-        if let Err(e) = dirs.write_quarantine(&text) {
+        if let Err(e) = self.dirs.write_quarantine(&text) {
             warnings.push(format!("the breach could not be recorded: {e}"));
         }
-        Ok(checked(
-            Some(run),
-            Some(dirs.quarantine_file()),
-            warnings,
-            None,
-        ))
+        self.dirs.quarantine_file()
     }
 
     /// The verdict of a base check kept at `plan`'s head already, matched
@@ -1245,10 +1548,11 @@ mod tests {
     }
 
     /// OWL-418: a base check keeps its verdict, matched with the failure it
-    /// ran for, and is used again at the same head with nothing run; it is
-    /// refused while another ticket's step is in flight, never for its own;
-    /// the operator's gate keeps nothing on a commit nothing holds, and its
-    /// pass lifts a hold.
+    /// ran for, and is used again at the same head with nothing run; since
+    /// OWL-660 it is busy while another base check holds the base lock, and
+    /// runs while another ticket's step is in flight, its record left with
+    /// the base branch gone; the operator's gate keeps nothing on a commit
+    /// nothing holds, and its pass lifts a hold.
     #[test]
     fn a_base_check_is_kept_once_and_the_operators_gate_lifts_a_hold() {
         use owlshift_core::base::{Checks, Failure, Step};
@@ -1278,13 +1582,18 @@ mod tests {
             .run(&mut |_| {})
         };
         let own_lock = bench.dirs.ticket_lock(&own).unwrap().unwrap();
+        let other_check = bench.dirs.base_lock().unwrap().unwrap();
+        assert!(matches!(base_check(), Err(Stop::Busy(_))));
+        drop(other_check);
         let other = TicketId::new("OWL-2").unwrap();
         let sibling = bench.dirs.ticket_lock(&other).unwrap().unwrap();
-        assert!(matches!(base_check(), Err(Stop::Busy(_))));
-        drop(sibling);
 
         let checked = base_check().unwrap();
-        assert!(checked.run.is_some());
+        drop(sibling);
+        assert!(checked.run.is_some(), "{checked:?}");
+        let record = ticket_run::read_base_run(&bench.dirs).unwrap();
+        assert_eq!(record.tip, None, "the base branch is gone");
+        assert!(record.entry.is_some());
         let kept = checked.base.unwrap();
         assert_eq!(
             (kept.recorded, kept.reused),
@@ -1331,6 +1640,313 @@ mod tests {
         let checks: Checks = base::read(&bench.dirs).unwrap();
         assert!(!checks.holds_commit(&fixed));
         assert!(checks.holds_commit(&main));
+    }
+
+    /// A gate command that writes `started` in `dir`, then waits there for
+    /// `go` before it fails: a base check held under way as long as a test
+    /// needs (OWL-660).
+    #[cfg(unix)]
+    fn held_gate(dir: &Path) -> String {
+        let (started, go) = (dir.join("started"), dir.join("go"));
+        format!(
+            "touch '{}'; while [ ! -e '{}' ]; do sleep 0.05; done; exit 3",
+            started.display(),
+            go.display()
+        )
+    }
+
+    /// Writes the `go` file of [`held_gate`] when dropped, so a held gate
+    /// ends even when an assertion fails before the test lets it go.
+    #[cfg(unix)]
+    struct Release(PathBuf);
+
+    #[cfg(unix)]
+    impl Drop for Release {
+        fn drop(&mut self) {
+            let _ = fs::write(&self.0, "");
+        }
+    }
+
+    /// Waits for `file` to be written, a minute at most.
+    #[cfg(unix)]
+    fn wait_for(file: &Path) {
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while !file.exists() {
+            assert!(Instant::now() < deadline, "{} never came", file.display());
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    /// A ticket whose step stands for one in flight: its run file, as a
+    /// step's start leaves it, and its lock, held until dropped.
+    fn in_flight(dirs: &ProjectDirs, ticket: &TicketId) -> crate::project::TicketLock {
+        let run = owlshift_contracts::step::TicketRun::new(ticket.clone());
+        fs::create_dir_all(dirs.ticket_dir(ticket)).unwrap();
+        fs::write(dirs.run_file(ticket), run.render()).unwrap();
+        dirs.ticket_lock(ticket).unwrap().unwrap()
+    }
+
+    /// The refs a list of violations names.
+    fn refs_named(violations: &[crate::executor::isolation::Violation]) -> Vec<String> {
+        violations
+            .iter()
+            .flat_map(|violation| match violation {
+                crate::executor::isolation::Violation::Refs(refs) => refs.clone(),
+                _ => Vec::new(),
+            })
+            .collect()
+    }
+
+    /// OWL-660, criteria 2 and 3: a base check runs beside another ticket's
+    /// step. While its gate runs, the project's lock is free, the base lock
+    /// is held and its obligation, named for its ticket, reads as in flight.
+    /// The sibling's branch and worktree, made meanwhile under its lock, are
+    /// no breach of the check; the base branch and entry, removed once it
+    /// ended, are none of the sibling's. A real breach during a second check,
+    /// a tag planted and the checking ticket's own branch made, is caught by
+    /// both: the base check names both, the sibling's check the tag alone.
+    #[cfg(unix)]
+    #[test]
+    fn a_base_check_runs_beside_the_steps_and_a_breach_is_caught_on_both_sides() {
+        use crate::executor::isolation::{Snapshot, Violation};
+
+        let bench = Bench::new();
+        let hold = bench.root.join("hold");
+        fs::create_dir_all(&hold).unwrap();
+        let gate = held_gate(&hold);
+        let main = bench.push(
+            "main",
+            Some(&project_file(
+                &toml::Value::String(gate.clone()).to_string(),
+            )),
+        );
+        let executor = bench.executor(bench.agent().without_confinement());
+        let git = executor.git.clone();
+        let origin = bench.origin.to_string_lossy().into_owned();
+        let local = local_config(&["true"]);
+        let own = TicketId::new("OWL-1").unwrap();
+        let other = TicketId::new("OWL-2").unwrap();
+        let failing = Failing {
+            step: owlshift_core::base::Step::Gate,
+            command: gate,
+        };
+        let _own = in_flight(&bench.dirs, &own);
+        let _other = in_flight(&bench.dirs, &other);
+        let checkout = bench.dirs.checkout();
+        let theirs = bench.root.join("theirs");
+        let theirs_path = theirs.to_string_lossy().into_owned();
+        let own_branch = crate::on_demand::branch_for(&own);
+        let base_check = || {
+            GateOnce {
+                executor: &executor,
+                dirs: &bench.dirs,
+                remote_url: &origin,
+                local: &local,
+                at: Some(main.as_str()),
+                place: Place::Base,
+                except: Some(&own),
+                initiating: Some(&failing),
+                now: Timestamp::now(),
+            }
+            .run(&mut |_| {})
+        };
+        let siblings = Siblings::new(&bench.dirs, &other);
+
+        // The first check, clean.
+        let (checked, before, marks) = std::thread::scope(|scope| {
+            let check = scope.spawn(base_check);
+            let release = Release(hold.join("go"));
+            wait_for(&hold.join("started"));
+            assert!(
+                bench.dirs.try_lock().unwrap().is_some(),
+                "the project's lock is free"
+            );
+            assert!(bench.dirs.base_lock_held().unwrap());
+            let names: Vec<String> = ticket_run::obligations(&bench.dirs)
+                .unwrap()
+                .into_iter()
+                .map(|found| found.name)
+                .collect();
+            assert!(
+                matches!(names.as_slice(), [name] if name.starts_with("owl-1-") && name.ends_with("-base")),
+                "{names:?}"
+            );
+            assert_eq!(
+                ticket_run::look(&bench.dirs, None).unwrap(),
+                Look::Clear { running: true }
+            );
+            // The sibling makes its branch and worktree, its lock held, and
+            // takes its snapshot while the base branch and entry stand.
+            bench.git(
+                &checkout,
+                &[
+                    "worktree",
+                    "add",
+                    "--quiet",
+                    "-b",
+                    "owlshift/owl-2",
+                    &theirs_path,
+                    &main,
+                ],
+            );
+            let marks = siblings.marks().unwrap();
+            let before = Snapshot::take(&git, &checkout, &theirs, "owlshift/owl-2").unwrap();
+            drop(release);
+            (check.join().unwrap(), before, marks)
+        });
+        let checked = checked.unwrap();
+        assert!(checked.marker.is_none(), "{checked:?}");
+        assert!(
+            checked.run.as_ref().unwrap().violations.is_empty(),
+            "{checked:?}"
+        );
+        assert_eq!(
+            checked.base.as_ref().unwrap().recorded,
+            Some(Recorded::Opened)
+        );
+        assert!(!worktree_at(&bench.dirs, Place::Base).exists());
+        assert!(!bench.dirs.obligations_stand());
+        let read = || siblings.concurrent(&marks);
+        let theirs_checked = before.check_among(&git, &checkout, &theirs, "owlshift/owl-2", &read);
+        assert!(
+            theirs_checked.violations.is_empty(),
+            "{:?}",
+            theirs_checked.violations
+        );
+
+        // The second check, at a new head so nothing is reused: a breach.
+        fs::remove_file(hold.join("started")).unwrap();
+        fs::remove_file(hold.join("go")).unwrap();
+        bench.push("main", Some(&project_file("\"true\"")));
+        let (checked, before, marks) = std::thread::scope(|scope| {
+            let check = scope.spawn(base_check);
+            let release = Release(hold.join("go"));
+            wait_for(&hold.join("started"));
+            let marks = siblings.marks().unwrap();
+            let before = Snapshot::take(&git, &checkout, &theirs, "owlshift/owl-2").unwrap();
+            // The sibling commits on its branch, its lock held.
+            bench.git(
+                &theirs,
+                &["commit", "--quiet", "--allow-empty", "-m", "theirs"],
+            );
+            bench.git(&checkout, &["tag", "planted", &main]);
+            bench.git(&checkout, &["branch", &own_branch, &main]);
+            drop(release);
+            (check.join().unwrap(), before, marks)
+        });
+        let checked = checked.unwrap();
+        assert!(checked.marker.is_some(), "{checked:?}");
+        let violations = &checked.run.as_ref().unwrap().violations;
+        assert_eq!(
+            refs_named(violations),
+            [
+                format!("refs/heads/{own_branch}"),
+                "refs/tags/planted".to_owned()
+            ],
+            "{violations:?}"
+        );
+        assert!(
+            !violations
+                .iter()
+                .any(|v| matches!(v, Violation::WorktreeEntries(_))),
+            "{violations:?}"
+        );
+        let read = || siblings.concurrent(&marks);
+        let theirs_checked = before.check_among(&git, &checkout, &theirs, "owlshift/owl-2", &read);
+        assert_eq!(
+            refs_named(&theirs_checked.violations),
+            ["refs/tags/planted"],
+            "{:?}",
+            theirs_checked.violations
+        );
+        assert!(bench.dirs.quarantine().unwrap().is_some());
+    }
+
+    /// OWL-660: a base check whose last section cannot be had, the project's
+    /// lock held past its bound once its gate ended, leaves no obligation and
+    /// no quarantine, keeps no verdict and leaves its worktree and branch,
+    /// which its record names; the next check finds them by their entry's
+    /// `gitdir`, though no record names it any more, removes them and runs.
+    #[cfg(unix)]
+    #[test]
+    fn a_base_check_whose_last_section_is_refused_keeps_nothing_and_leaves_its_worktree() {
+        let bench = Bench::new();
+        let hold = bench.root.join("hold");
+        fs::create_dir_all(&hold).unwrap();
+        let gate = held_gate(&hold);
+        let main = bench.push(
+            "main",
+            Some(&project_file(
+                &toml::Value::String(gate.clone()).to_string(),
+            )),
+        );
+        let executor = bench.executor(bench.agent().without_confinement());
+        let origin = bench.origin.to_string_lossy().into_owned();
+        let local = local_config(&["true"]);
+        let own = TicketId::new("OWL-1").unwrap();
+        let failing = Failing {
+            step: owlshift_core::base::Step::Gate,
+            command: gate,
+        };
+        let _own = in_flight(&bench.dirs, &own);
+        let base_check = || {
+            GateOnce {
+                executor: &executor,
+                dirs: &bench.dirs,
+                remote_url: &origin,
+                local: &local,
+                at: Some(main.as_str()),
+                place: Place::Base,
+                except: Some(&own),
+                initiating: Some(&failing),
+                now: Timestamp::now(),
+            }
+            .run(&mut |_| {})
+        };
+        let checked = std::thread::scope(|scope| {
+            let check = scope.spawn(base_check);
+            let release = Release(hold.join("go"));
+            wait_for(&hold.join("started"));
+            let held = bench.dirs.lock().unwrap().unwrap();
+            drop(release);
+            let checked = check.join().unwrap();
+            drop(held);
+            checked
+        });
+        let checked = checked.unwrap();
+        assert!(checked.marker.is_none(), "{checked:?}");
+        let kept = checked.base.as_ref().unwrap();
+        assert_eq!(kept.recorded, None);
+        assert!(
+            kept.unkept.as_ref().unwrap().contains("lock stayed held"),
+            "{kept:?}"
+        );
+        assert!(!bench.dirs.obligations_stand());
+        assert_eq!(bench.dirs.quarantine().unwrap(), None);
+        assert!(
+            base::read(&bench.dirs)
+                .unwrap()
+                .get(&main, &kept.commands)
+                .is_none()
+        );
+        let worktree = worktree_at(&bench.dirs, Place::Base);
+        assert!(worktree.exists());
+        let record = ticket_run::read_base_run(&bench.dirs).unwrap();
+        assert_eq!(record.tip.as_deref(), Some(main.as_str()));
+
+        // No record names the entry any more: its `gitdir` does.
+        fs::remove_file(bench.dirs.base_run_file()).unwrap();
+        let entries = ticket_run::entries_of(&bench.dirs.checkout(), &worktree);
+        assert_eq!(entries.len(), 1, "{entries:?}");
+        let again = base_check().unwrap();
+        assert!(again.run.is_some(), "{again:?}");
+        assert_eq!(
+            again.base.as_ref().unwrap().recorded,
+            Some(Recorded::Opened),
+            "{again:?}"
+        );
+        assert!(!worktree.exists());
+        assert!(ticket_run::entries_of(&bench.dirs.checkout(), &worktree).is_empty());
     }
 
     /// Native Windows has no sandbox (D9): refused before anything is made.

@@ -1,0 +1,40 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Owlshift base check run",
+  "description": "What the runner knows of a base check's branch (`owlshift-gate/base`)\nand worktree entry (OWL-660; architecture section 5, \"A broken base\",\n\"Its record\"), kept in `base/run.json` of the project's folder, written\nonly under the base lock: what a sibling's isolation check holds a base\ncheck to once it ended, as a ticket's [`TicketRun`] does for a ticket.",
+  "type": "object",
+  "properties": {
+    "entry": {
+      "description": "The name of the base worktree's entry in `worktrees/` of the common\ngit folder, once a check made one.",
+      "type": [
+        "string",
+        "null"
+      ],
+      "default": null
+    },
+    "format": {
+      "description": "The format version of this document.",
+      "type": "integer",
+      "const": 1
+    },
+    "generation": {
+      "description": "Raised at every write of the file, so that a sibling's check sees\nthat a base check ran since its snapshot.",
+      "type": "integer",
+      "format": "uint64",
+      "minimum": 0
+    },
+    "tip": {
+      "description": "The commit the base branch is at when the file was written; none once\nit is deleted. A check that ended may also have deleted it since.",
+      "type": [
+        "string",
+        "null"
+      ],
+      "default": null
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "format",
+    "generation"
+  ]
+}

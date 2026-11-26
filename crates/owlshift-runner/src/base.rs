@@ -568,20 +568,16 @@ pub fn waits(dirs: &ProjectDirs) -> Vec<BaseWait> {
         .collect()
 }
 
-/// The ticket whose failure waits for a pending check of `checks`, its
-/// wait matching the entry's commit and commands, the first of `waits` that
-/// `skip` leaves: the ticket a watch gives the check's priority to, one
-/// started again included (OWL-418). A wait the machine's cut left
+/// The tickets whose failure waits for a pending check of `checks`, each
+/// one's wait matching the entry's commit and commands, in the order of
+/// `waits`: those a watch, one started again included, gives a step once no
+/// base check runs (OWL-418, OWL-660). A wait the machine's cut left
 /// (OWL-480) has no failure, and no check waits for it.
-pub fn pending_ticket(
-    checks: &Checks,
-    waits: &[BaseWait],
-    skip: impl Fn(&TicketId) -> bool,
-) -> Option<TicketId> {
+pub fn pending_tickets(checks: &Checks, waits: &[BaseWait]) -> Vec<TicketId> {
     waits
         .iter()
-        .filter(|wait| wait.failing.is_some() && !skip(&wait.ticket))
-        .find(|wait| {
+        .filter(|wait| wait.failing.is_some())
+        .filter(|wait| {
             checks.standing().any(|check| {
                 matches!(check.entry, Entry::Pending { .. })
                     && check.commit == wait.configured_at
@@ -589,6 +585,7 @@ pub fn pending_ticket(
             })
         })
         .map(|wait| wait.ticket.clone())
+        .collect()
 }
 
 /// Removes the ticket's wait file, if any.
@@ -837,9 +834,9 @@ mod tests {
         assert!(!wait_file(&dirs, &ticket).exists());
     }
 
-    /// The ticket a pending check's priority goes to: one whose wait matches
-    /// the entry, and not one skipped, nor one the machine's cut left
-    /// (OWL-480); none for a check that ran.
+    /// The tickets a pending check waits for: those whose wait matches the
+    /// entry, not one the machine's cut left (OWL-480); none for a check
+    /// that ran.
     #[test]
     fn a_pending_check_is_matched_to_its_waiting_ticket() {
         use owlshift_contracts::base::KeptFailing;
@@ -871,19 +868,17 @@ mod tests {
             wait("OWL-3", "base"),
         ];
         let mut checks = Checks::default();
-        assert_eq!(pending_ticket(&checks, &waits, |_| false), None);
+        assert!(pending_tickets(&checks, &waits).is_empty());
         checks.mark_pending("base", "k", &failing, 1);
-        let two = TicketId::new("OWL-2").unwrap();
         assert_eq!(
-            pending_ticket(&checks, &waits, |_| false),
-            Some(two.clone())
-        );
-        assert_eq!(
-            pending_ticket(&checks, &waits, |ticket| *ticket == two),
-            Some(TicketId::new("OWL-3").unwrap())
+            pending_tickets(&checks, &waits),
+            [
+                TicketId::new("OWL-2").unwrap(),
+                TicketId::new("OWL-3").unwrap()
+            ]
         );
         checks.record_check(("base", "k", "h"), 2, Verdict::Passed, None);
-        assert_eq!(pending_ticket(&checks, &waits, |_| false), None);
+        assert!(pending_tickets(&checks, &waits).is_empty());
     }
 
     /// OWL-486: a wait holds only at its own stage, a fix run's only on the

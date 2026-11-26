@@ -13,8 +13,8 @@ use serde::{Deserialize, Serialize};
 use owlshift_core::gate::{Chain, ChainCost};
 
 use crate::format::{
-    self, CARRY_FORMAT, ContractError, Format, NOT_MINE_FORMAT, OBLIGATION_FORMAT, OUTSIDE_FORMAT,
-    RUN_FORMAT, STEP_ENVELOPE_FORMAT, STEP_OUTCOME_FORMAT, TICKET_RESTART_FORMAT,
+    self, BASE_RUN_FORMAT, CARRY_FORMAT, ContractError, Format, NOT_MINE_FORMAT, OBLIGATION_FORMAT,
+    OUTSIDE_FORMAT, RUN_FORMAT, STEP_ENVELOPE_FORMAT, STEP_OUTCOME_FORMAT, TICKET_RESTART_FORMAT,
 };
 use crate::ids::TicketId;
 use crate::{Role, Stage};
@@ -227,9 +227,10 @@ pub enum StepEnd {
     },
     /// A Build held for its base (OWL-418): `commit`, the commit it is
     /// configured at, fails `command` in a fresh worktree too, or a check is
-    /// `pending`, waiting for the other steps in flight: its first check, its
-    /// check again, or the default branch's newer head's (OWL-431), each of
-    /// which watch gives its priority. Format 4.
+    /// `pending`, waiting for the base check running now: its first check,
+    /// its check again, or the default branch's newer head's (OWL-431), each
+    /// of which watch gives a step once no base check runs (OWL-660). Format
+    /// 4.
     BaseHeld {
         commit: String,
         #[serde(default)]
@@ -611,6 +612,56 @@ impl TicketRun {
             run.writing.tip.as_ref().and_then(|t| t.to.as_deref()),
         ];
         if let Some(bad) = commits.into_iter().flatten().find(|id| !is_commit_id(id)) {
+            return Err(ContractError::invalid(
+                Self::CONTRACT,
+                format!("{bad:?} is not a full commit id"),
+            ));
+        }
+        if let Some(entry) = &run.entry
+            && !is_component(entry, MAX_ENTRY)
+        {
+            return Err(ContractError::invalid(
+                Self::CONTRACT,
+                format!("the worktree entry {entry:?} is not one plain name"),
+            ));
+        }
+        Ok(run)
+    }
+
+    pub fn render(&self) -> String {
+        format::render_json(self)
+    }
+}
+
+/// What the runner knows of a base check's branch (`owlshift-gate/base`)
+/// and worktree entry (OWL-660; architecture section 5, "A broken base",
+/// "Its record"), kept in `base/run.json` of the project's folder, written
+/// only under the base lock: what a sibling's isolation check holds a base
+/// check to once it ended, as a ticket's [`TicketRun`] does for a ticket.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+#[schemars(title = "Owlshift base check run")]
+pub struct BaseRun {
+    pub format: Format<BASE_RUN_FORMAT>,
+    /// Raised at every write of the file, so that a sibling's check sees
+    /// that a base check ran since its snapshot.
+    pub generation: u64,
+    /// The commit the base branch is at when the file was written; none once
+    /// it is deleted. A check that ended may also have deleted it since.
+    #[serde(default)]
+    pub tip: Option<String>,
+    /// The name of the base worktree's entry in `worktrees/` of the common
+    /// git folder, once a check made one.
+    #[serde(default)]
+    pub entry: Option<String>,
+}
+
+impl BaseRun {
+    const CONTRACT: &str = "base run";
+
+    pub fn parse(input: &str) -> Result<Self, ContractError> {
+        let run: Self = format::parse_json(Self::CONTRACT, BASE_RUN_FORMAT, input)?;
+        if let Some(bad) = run.tip.as_deref().filter(|id| !is_commit_id(id)) {
             return Err(ContractError::invalid(
                 Self::CONTRACT,
                 format!("{bad:?} is not a full commit id"),
@@ -1101,6 +1152,23 @@ mod tests {
             RunObligation::parse(&obligation.render()).unwrap(),
             obligation
         );
+        // OWL-660: a base check's record, refused as a run file is.
+        let base = BaseRun {
+            generation: 3,
+            tip: Some("d".repeat(40)),
+            entry: Some("worktree".to_owned()),
+            ..BaseRun::default()
+        };
+        assert_eq!(BaseRun::parse(&base.render()).unwrap(), base);
+        assert_eq!(
+            BaseRun::parse(&BaseRun::default().render()).unwrap(),
+            BaseRun::default()
+        );
+        for (key, value) in [("tip", "abc123"), ("entry", "../x"), ("format", "2")] {
+            let mut document: serde_json::Value = serde_json::from_str(&base.render()).unwrap();
+            document[key] = serde_json::from_str(value).unwrap_or_else(|_| value.into());
+            assert!(BaseRun::parse(&document.to_string()).is_err(), "{key}");
+        }
         let gate = RunObligation {
             ticket: None,
             ..obligation.clone()

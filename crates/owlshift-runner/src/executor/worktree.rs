@@ -10,6 +10,7 @@ use owlshift_contracts::brief::Brief;
 
 use super::git::{Git, GitError};
 use super::{BRIEF_PATH, ExecutorError, RUN_DIR, RunSpec};
+use crate::ticket_run;
 
 /// Creates the ticket's worktree on its branch, or checks that the one
 /// found is: the root of a linked worktree of the main checkout's
@@ -98,17 +99,30 @@ fn add_new_branch(
     Ok(())
 }
 
+/// How [`discard`] makes git forget a removed worktree.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Forget {
+    /// `git worktree prune`, which forgets every entry whose folder is gone:
+    /// `owlshift gate`'s, which runs alone.
+    Prune,
+    /// Only the entries that name this worktree ([`ticket_run::entries_of`]),
+    /// removed by name: a base check's, which runs beside steps whose
+    /// isolation checks read the other entries (OWL-660).
+    OwnEntries,
+}
+
 /// Removes the worktree at `worktree` and its `branch` from `main`'s
 /// repository, whatever is left of either, without running git in the
 /// worktree, whose files a run wrote: the folder goes from the file system
-/// (a link there is removed, never followed), then `git worktree prune`
-/// forgets it and the branch is deleted. For `owlshift gate`'s throwaway
-/// worktree (OWL-329).
+/// (a link there is removed, never followed), then git forgets it as
+/// `forget` says and the branch is deleted. For the throwaway worktree of
+/// `owlshift gate` (OWL-329) and of a base check (OWL-418, OWL-660).
 pub(super) fn discard(
     git: &Git,
     main: &Path,
     worktree: &Path,
     branch: &str,
+    forget: Forget,
 ) -> Result<(), ExecutorError> {
     let removed = match fs::symlink_metadata(worktree) {
         Ok(meta) if meta.is_dir() => fs::remove_dir_all(worktree),
@@ -117,8 +131,18 @@ pub(super) fn discard(
         Err(error) => Err(error),
     };
     removed.map_err(|e| ExecutorError::Worktree(format!("{}: {e}", worktree.display())))?;
-    git.run(main, &["worktree", "prune"])
-        .map_err(worktree_error)?;
+    match forget {
+        Forget::Prune => {
+            git.run(main, &["worktree", "prune"])
+                .map_err(worktree_error)?;
+        }
+        Forget::OwnEntries => {
+            for name in ticket_run::entries_of(main, worktree) {
+                ticket_run::remove_entry(main, &name)
+                    .map_err(|e| ExecutorError::Worktree(format!("the entry {name}: {e}")))?;
+            }
+        }
+    }
     if branch_exists(git, main, &format!("refs/heads/{branch}"))? {
         git.run(
             main,

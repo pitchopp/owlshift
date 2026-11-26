@@ -195,10 +195,6 @@ pub const POLL_INTERVAL: Duration = Duration::from_secs(60);
 /// that stopped with [`Stop::NotKept`] is held until then, with no end.
 pub const RETRY_AFTER: Duration = Duration::from_secs(10 * 60);
 
-/// How long a base check due holds every other step back at most (OWL-418):
-/// longer than any step a run can make, its deadline and its gate's.
-pub const BASE_DUE_AT_MOST: Duration = Duration::from_secs(3 * 60 * 60);
-
 /// Whether watch continues a ticket in `status`: one whose questions wait
 /// for its decider. A parked ticket waits for a person's `continue`, which
 /// alone restarts it (watch only ends a park at Watch whose pull request
@@ -567,17 +563,11 @@ struct Memory<'c> {
     /// The quarantine's WAITING comments, folded once it is cleared
     /// (OWL-423).
     quarantine_comments: waiting::QuarantineComments,
-    /// The ticket whose base check is due and could not run beside other
-    /// steps (OWL-418), since when: no other step starts until those in
-    /// flight end and that ticket's step has run, for at most
-    /// [`BASE_DUE_AT_MOST`].
-    base_due: Option<(TicketId, Timestamp)>,
-    /// How many steps of a ticket whose check was due have ended.
-    base_due_ran: u64,
-    /// The tickets whose check's priority was given up, their step unable
-    /// to start or past [`BASE_DUE_AT_MOST`]: not given it again from
-    /// `base.json` until a step of theirs has run.
-    base_due_given_up: BTreeSet<TicketId>,
+    /// The tickets whose last step ended with a base check due that could
+    /// not run yet, another base check holding the base lock (OWL-418,
+    /// OWL-660): each one's retry hold is lifted at the first pass that finds
+    /// no base check running. No other step waits for them.
+    base_due: BTreeSet<TicketId>,
     /// The tickets whose last step ended held for their base (OWL-431).
     base_held: BTreeSet<TicketId>,
     /// Those a drain's dispatch gave a turn: each one's retry hold is
@@ -602,9 +592,6 @@ struct Memory<'c> {
     /// told: a reading that could not be made neither holds nor changes it
     /// (OWL-485).
     dark_wake: bool,
-    /// A step or a pass was held back for a dark wake since the loop's
-    /// iteration began, so a check due keeps its priority (OWL-485).
-    dark_wake_held: bool,
     /// The base heads merge on green read at this pass (OWL-445).
     base_heads: merge::BaseHeads,
     /// The refreshes the overlaps make due (OWL-449).
@@ -807,23 +794,14 @@ impl Watch<'_> {
             memory.stepped = false;
             // The machine's state is read again for this iteration (OWL-485).
             memory.wake_read = None;
-            memory.dark_wake_held = false;
-            // A check left pending in `base.json`, by a watch before this one
-            // or by a person's command, gets its priority too (OWL-418).
-            if memory.base_due.is_none() {
-                memory.base_due = self.pending_due(&memory);
+            // A check left waiting in `base.json`, by a watch before this one
+            // or by a person's command, gets its step too (OWL-418).
+            if memory.base_due.is_empty() {
+                memory.base_due.extend(self.pending_due());
             }
-            // A check due whose ticket's step did not start in a pass with
-            // nothing else in flight, held back for another reason, gives
-            // up its priority, so it never holds the project (OWL-418).
-            let due = memory
-                .base_due
-                .clone()
-                .filter(|_| memory.running.is_empty())
-                .map(|(ticket, _)| (ticket, memory.base_due_ran));
             // An operator's pause, told as the pass starts (OWL-438), or a
             // dark wake (OWL-485): the pass reads on, and no step starts.
-            let paused = self.held_back(&mut memory, sink, out, false);
+            self.held_back(&mut memory, sink, out, false);
             self.pass(&mut memory, sink, out, continued);
             if let Some(asked) = self.stopping() {
                 self.stop(&mut memory, sink, out, asked);
@@ -831,17 +809,6 @@ impl Watch<'_> {
             }
             if draining {
                 self.drain(&mut memory, sink, out, continued);
-            }
-            // A pause, or a dark wake that held its step, keeps a check due
-            // its priority: no step ran for it.
-            if let Some((ticket, ran)) = due
-                && !paused
-                && !memory.dark_wake_held
-                && memory.base_due_ran == ran
-                && !memory.running.iter().any(|step| *step.ticket() == ticket)
-            {
-                memory.base_due = None;
-                memory.base_due_given_up.insert(ticket);
             }
             // The interval is only between idle passes (OWL-367): after a
             // step, the next stage step is due at once. While steps'
@@ -2735,19 +2702,9 @@ impl Watch<'_> {
             }
         }
         let seen = Seen::at(at, None);
-        // Another ticket's check holds the priority: one held for its base
-        // waits for it as it is, its turn kept (OWL-431).
-        if memory.base_held.contains(ticket)
-            && memory
-                .base_due
-                .as_ref()
-                .is_some_and(|(due, _)| due != ticket)
-        {
-            return;
-        }
-        // A hold on its base lifted, or its check due with no other step in
-        // flight, or a turn a drain's dispatch gave it: the ticket goes at
-        // once (OWL-418, OWL-431).
+        // A hold on its base lifted, or its check due with no base check
+        // running, or a turn a drain's dispatch gave it: the ticket goes at
+        // once (OWL-418, OWL-431, OWL-660).
         if self.base_released(memory, ticket) {
             memory.holds.release(ticket);
         }
@@ -3110,34 +3067,30 @@ impl Watch<'_> {
         memory.waits.insert(ticket.clone(), told);
     }
 
-    /// The ticket a check pending in `base.json` gives its priority to, from
-    /// now, when one waits and its priority was not given up (OWL-418).
-    fn pending_due(&self, memory: &Memory) -> Option<(TicketId, Timestamp)> {
+    /// The tickets whose check waits in `base.json` (OWL-418): each one's
+    /// step comes once no base check runs.
+    fn pending_due(&self) -> Vec<TicketId> {
         let dirs = self.on_demand.dirs;
-        let checks = base::read(dirs).ok()?;
+        let Ok(checks) = base::read(dirs) else {
+            return Vec::new();
+        };
         // The tickets' folders are read only while a check is pending.
         if !checks
             .standing()
             .any(|check| matches!(check.entry, owlshift_core::base::Entry::Pending { .. }))
         {
-            return None;
+            return Vec::new();
         }
-        let ticket = base::pending_ticket(&checks, &base::waits(dirs), |ticket| {
-            memory.base_due_given_up.contains(ticket)
-        })?;
-        Some((ticket, (self.on_demand.clock)()))
+        base::pending_tickets(&checks, &base::waits(dirs))
     }
 
     /// Whether `ticket`'s hold is to be lifted for its base (OWL-418): the
     /// commit its Build waited for no longer holds it, or its check is due
-    /// and no other step is in flight, or a drain's dispatch gave it a turn
-    /// (OWL-431).
+    /// and no base check runs (OWL-660), or a drain's dispatch gave it a turn
+    /// (OWL-431). A base lock that cannot be looked at lifts nothing.
     fn base_released(&self, memory: &Memory, ticket: &TicketId) -> bool {
-        if memory
-            .base_due
-            .as_ref()
-            .is_some_and(|(due, _)| due == ticket)
-            && memory.running.is_empty()
+        if memory.base_due.contains(ticket)
+            && self.on_demand.dirs.base_lock_held().is_ok_and(|held| !held)
         {
             return true;
         }

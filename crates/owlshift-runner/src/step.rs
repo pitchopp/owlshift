@@ -368,8 +368,8 @@ pub fn end(stepped: &Stepped) -> StepEnd {
         } => StepEnd::BaseHeld {
             commit: commit.clone(),
             command: command.clone(),
-            // Any check that waits for the other steps gets watch's
-            // priority (OWL-431).
+            // Any check that waits for the base check running now gets its
+            // step once none runs (OWL-431, OWL-660).
             pending: *pending || *due,
         },
         Stop::NotKept { landed, .. } => StepEnd::NotKept {

@@ -507,6 +507,74 @@ fn helper_siblings_are_read_from_their_run_files_and_locks() {
     assert!(siblings.marks().is_err());
 }
 
+/// OWL-660: a step's base check is one more sibling, read from the base
+/// lock and its record: while the lock is held, the base branch is in flight
+/// and the recorded entry left out; once it is free and the record's
+/// generation moved since the marks, the branch is held to the recorded
+/// commit or none; unchanged, nothing. A record that does not read, and a
+/// `base` that is no folder, read as none, never an error. The base check's
+/// own check is told of neither itself nor its ticket. Run alone: locks are
+/// probed free.
+#[test]
+fn the_base_check_is_one_more_sibling() {
+    crate::alone::run_alone("ticket_run::tests::helper_the_base_check_is_one_more_sibling");
+}
+
+#[test]
+#[ignore = "helper, run by the test above"]
+fn helper_the_base_check_is_one_more_sibling() {
+    if !crate::alone::running_alone() {
+        return;
+    }
+    let bench = Bench::new();
+    let dirs = &bench.dirs;
+    let own = ticket("OWL-1");
+    let mut run = TicketRun::new(own.clone());
+    save(dirs, &mut run).unwrap();
+    let branch = format!("refs/heads/{BASE_BRANCH}");
+    let tip = "a".repeat(40);
+    let siblings = Siblings::new(dirs, &own);
+    let none = siblings.marks().unwrap();
+    assert!(siblings.concurrent(&none).unwrap().is_empty());
+
+    let lock = dirs.base_lock().unwrap().unwrap();
+    let known = siblings.concurrent(&none).unwrap();
+    assert_eq!(known.running, BTreeSet::from([branch.clone()]));
+    assert!(known.entries.is_empty() && known.ended.is_empty());
+    write_base_run(dirs, &lock, Some(tip.clone()), Some("worktree".to_owned())).unwrap();
+    let known = siblings.concurrent(&none).unwrap();
+    assert_eq!(known.running, BTreeSet::from([branch.clone()]));
+    assert_eq!(known.entries, BTreeSet::from(["worktree".to_owned()]));
+    // The base check's own check: neither itself nor its ticket.
+    let own_check = Siblings::for_base_check(dirs, &own);
+    let own_marks = own_check.marks().unwrap();
+    assert!(own_check.concurrent(&own_marks).unwrap().is_empty());
+    drop(lock);
+
+    let known = siblings.concurrent(&none).unwrap();
+    assert!(known.running.is_empty());
+    assert_eq!(
+        known.ended,
+        BTreeMap::from([(branch.clone(), BTreeSet::from([Some(tip), None]))])
+    );
+    assert_eq!(known.entries, BTreeSet::from(["worktree".to_owned()]));
+    let since = siblings.marks().unwrap();
+    assert!(siblings.concurrent(&since).unwrap().is_empty());
+
+    fs::write(dirs.base_run_file(), "{").unwrap();
+    assert!(siblings.marks().is_ok());
+    let known = siblings.concurrent(&since).unwrap();
+    assert_eq!(
+        known.ended,
+        BTreeMap::from([(branch, BTreeSet::from([None]))])
+    );
+    assert!(known.entries.is_empty());
+
+    fs::remove_dir_all(dirs.base_dir()).unwrap();
+    fs::write(dirs.base_dir(), "not a folder").unwrap();
+    assert!(siblings.concurrent(&none).unwrap().is_empty());
+}
+
 /// `owlshift unquarantine`'s fresh start of the run files: each from its
 /// refs as they are, an unreadable one replaced, one whose lock is held left
 /// as it is; with no checkout, they go. Run alone: locks are taken again.

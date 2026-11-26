@@ -933,11 +933,13 @@ fn a_base_check_that_breaks_isolation_quarantines_the_project() {
     assert!(checked(&bench).is_empty());
 }
 
-/// Criterion 2 and the busy path: DEMO-2's step in flight, DEMO-1's check
-/// cannot run and is left pending, kept per commit, which holds every Build
-/// configured there before it starts: DEMO-1's next Build is held with no
-/// run while the sibling works, and checks the base once it is alone, one
-/// notification.
+/// Criterion 2 and the busy path: another base check of the project running
+/// (the base lock held), DEMO-1's check cannot run and is left pending, kept
+/// per commit, which holds every Build configured there before it starts:
+/// DEMO-1's next Build is held with no run while that check runs. Once it
+/// ended, DEMO-1's check runs beside DEMO-2's step in flight (OWL-660), one
+/// notification; and while another check runs again, the verdict kept at
+/// this head is used, nothing waiting for the base lock.
 #[test]
 fn a_check_that_must_wait_holds_the_builds_on_its_base_until_it_runs() {
     let bench = Bench::new(true);
@@ -945,14 +947,17 @@ fn a_check_that_must_wait_holds_the_builds_on_its_base_until_it_runs() {
     let base = with_setup(&bench, &setup_line(&marker), None);
     let two = TicketId::new("DEMO-2").unwrap();
 
-    let sibling = bench.dirs().ticket_lock(&two).unwrap().unwrap();
+    let other_check = bench.dirs().base_lock().unwrap().unwrap();
     let (pending, printed) = bench.run(Vec::new(), None);
     assert!(
         matches!(pending, Err(Stop::BaseHeld { pending: true, .. })),
         "{pending:?}\n{printed}"
     );
     let text = pending.unwrap_err().to_string();
-    assert!(text.contains("once no other ticket's step runs"), "{text}");
+    assert!(
+        text.contains("once the base check running now ends"),
+        "{text}"
+    );
     assert!(base::read(&bench.dirs()).unwrap().holds_commit(&base));
     assert_eq!(state_of(&bench), (Status::Active(Stage::Build), 0));
     let (still, printed) = bench.continue_ticket(Vec::new());
@@ -967,8 +972,9 @@ fn a_check_that_must_wait_holds_the_builds_on_its_base_until_it_runs() {
     );
     assert!(checked(&bench).is_empty());
     assert!(bench.notified.0.borrow().is_empty());
-    drop(sibling);
+    drop(other_check);
 
+    let sibling = bench.dirs().ticket_lock(&two).unwrap().unwrap();
     let (held, printed) = bench.continue_ticket(Vec::new());
     assert!(
         matches!(held, Err(Stop::BaseHeld { pending: false, .. })),
@@ -978,6 +984,17 @@ fn a_check_that_must_wait_holds_the_builds_on_its_base_until_it_runs() {
     assert_eq!(checked(&bench), ["opened"]);
     assert_eq!(bench.notified.0.borrow().len(), 1);
     assert_eq!(state_of(&bench), (Status::Active(Stage::Build), 0));
+    drop(sibling);
+
+    let other_check = bench.dirs().base_lock().unwrap().unwrap();
+    let (still, printed) = bench.continue_ticket(Vec::new());
+    assert!(
+        matches!(still, Err(Stop::BaseHeld { pending: false, .. })),
+        "the kept verdict, not a wait: {still:?}\n{printed}"
+    );
+    assert_eq!(checked(&bench), ["opened"], "no check ran");
+    assert_eq!(builds(&bench), [false]);
+    drop(other_check);
 }
 
 /// Criterion 3 with no person: watch resumes the held ticket at each retry,
@@ -1051,11 +1068,11 @@ fn watch_reruns_a_held_gate_once_the_base_passes_with_no_continue() {
 }
 
 /// A watch started again while a check waits in `base.json` gives it its
-/// priority back: the retry hold its predecessor's step left, adopted from
-/// that step's record, is lifted, and the check runs in the first pass with
-/// no clock moving.
+/// step once no base check runs (OWL-660): the retry hold its predecessor's
+/// step left, adopted from that step's record, is lifted, and the check runs
+/// in the first pass with no clock moving.
 #[test]
-fn a_watch_started_again_gives_a_waiting_check_its_priority() {
+fn a_watch_started_again_runs_a_waiting_check_once_no_base_check_runs() {
     use owlshift_contracts::format::Format;
     use owlshift_contracts::step::{KeptFollowing, RefAfter, StepEnd, StepHold, StepOutcome};
     use owlshift_runner::step;
@@ -1064,14 +1081,13 @@ fn a_watch_started_again_gives_a_waiting_check_its_priority() {
     let bench = Bench::new(true);
     let marker = bench.tmp.path().join("store-has-rollup");
     let base = with_setup(&bench, &setup_line(&marker), None);
-    let two = TicketId::new("DEMO-2").unwrap();
-    let sibling = bench.dirs().ticket_lock(&two).unwrap().unwrap();
+    let other_check = bench.dirs().base_lock().unwrap().unwrap();
     let (pending, printed) = bench.run(Vec::new(), None);
     assert!(
         matches!(pending, Err(Stop::BaseHeld { pending: true, .. })),
         "{pending:?}\n{printed}"
     );
-    drop(sibling);
+    drop(other_check);
     // What the step of the watch before left: held for the retry delay.
     let env = bench.env.clone();
     let git = Git::with_setup("git", move |command| env.apply(command));
@@ -1115,16 +1131,16 @@ fn a_watch_started_again_gives_a_waiting_check_its_priority() {
     assert_eq!(checked(&bench), ["opened"]);
 }
 
-/// The busy path under watch: a check that must wait, DEMO-2's step in
-/// flight, is tried again at the next pass once nothing else runs, not
-/// after the retry delay: no clock moves between the two passes.
+/// The busy path under watch: a check that must wait, another base check
+/// running, is tried again at the next pass once that check ended (the base
+/// lock free), not after the retry delay: no clock moves between the two
+/// passes (OWL-660).
 #[test]
-fn watch_tries_a_check_that_waited_again_once_nothing_else_runs() {
+fn watch_tries_a_check_that_waited_again_once_the_other_check_ends() {
     let bench = Bench::new(true);
     let marker = bench.tmp.path().join("store-has-rollup");
     with_setup(&bench, &setup_line(&marker), None);
-    let two = TicketId::new("DEMO-2").unwrap();
-    let mut sibling = Some(bench.dirs().ticket_lock(&two).unwrap().unwrap());
+    let mut other_check = Some(bench.dirs().base_lock().unwrap().unwrap());
     let (pending, printed) = bench.run(Vec::new(), None);
     assert!(
         matches!(pending, Err(Stop::BaseHeld { pending: true, .. })),
@@ -1134,8 +1150,8 @@ fn watch_tries_a_check_that_waited_again_once_nothing_else_runs() {
     let mut passes = 0;
     let (outcomes, lines, printed) = bench.watch(Vec::new(), &mut |_| {
         passes += 1;
-        // DEMO-2's step ends after the first pass.
-        drop(sibling.take());
+        // The other check ends after the first pass.
+        drop(other_check.take());
         passes < 2
     });
     assert!(
@@ -1160,14 +1176,13 @@ fn a_dark_wake_that_begins_mid_pass_holds_a_check_due_until_the_full_wake() {
     let bench = Bench::new(true);
     let marker = bench.tmp.path().join("store-has-rollup");
     with_setup(&bench, &setup_line(&marker), None);
-    let two = TicketId::new("DEMO-2").unwrap();
-    let sibling = bench.dirs().ticket_lock(&two).unwrap().unwrap();
+    let other_check = bench.dirs().base_lock().unwrap().unwrap();
     let (pending, printed) = bench.run(Vec::new(), None);
     assert!(
         matches!(pending, Err(Stop::BaseHeld { pending: true, .. })),
         "{pending:?}\n{printed}"
     );
-    drop(sibling);
+    drop(other_check);
 
     // The pass start reads the machine awake and the step's own read finds
     // the dark wake.
@@ -1194,12 +1209,12 @@ fn a_dark_wake_that_begins_mid_pass_holds_a_check_due_until_the_full_wake() {
 
 /// OWL-431, the head's check that must wait: a done Build held at its base,
 /// whose commit was checked again at the fix's head and fails still, finds
-/// that head's own check due while DEMO-2's step runs. It stays held, that
-/// check due (watch's priority), its text the hold's, no check made and its
-/// branch where it was; once DEMO-2's step ends, `continue` checks the head
-/// alone, rebases onto it and delivers.
+/// that head's own check due while another base check runs (OWL-660). It
+/// stays held, that check due, its text the hold's, no check made and its
+/// branch where it was; once that check ended, `continue` checks the head,
+/// rebases onto it and delivers.
 #[test]
-fn a_head_check_that_must_wait_is_due_then_runs_alone() {
+fn a_head_check_that_must_wait_is_due_then_runs_once_the_other_check_ends() {
     use owlshift_core::base::Entry;
 
     let bench = Bench::new(true);
@@ -1216,8 +1231,7 @@ fn a_head_check_that_must_wait_is_due_then_runs_alone() {
         }
     }
     base::write(&bench.dirs(), &checks).unwrap();
-    let two = TicketId::new("DEMO-2").unwrap();
-    let sibling = bench.dirs().ticket_lock(&two).unwrap().unwrap();
+    let other_check = bench.dirs().base_lock().unwrap().unwrap();
 
     let (due, printed) = bench.continue_ticket(Vec::new());
     assert!(
@@ -1232,11 +1246,11 @@ fn a_head_check_that_must_wait_is_due_then_runs_alone() {
     assert_eq!(
         checks_made(&bench).len(),
         1,
-        "no check beside DEMO-2's step"
+        "no check while another base check runs"
     );
     assert!(held_rebases(&bench).is_empty());
     assert_eq!(worktree_head(&bench), start);
-    drop(sibling);
+    drop(other_check);
 
     let rebase = agent_git(
         &bench,
@@ -1326,10 +1340,9 @@ fn base_waits(events: &[Event], id: &str) -> usize {
 /// DEMO-2 and DEMO-3 are taken in, blocked. The store is fixed and `main`
 /// moves; the blocker is done. The drain dispatches DEMO-2, which gives
 /// DEMO-1 a turn before any other dispatch, with no clock moved by the test.
-/// Its check again finds another ticket's step in flight (a lock held for
-/// that pass): it is due, and its priority holds DEMO-3's dispatch back.
-/// Once that step ends, DEMO-1's check runs alone and lifts the hold before
-/// the second dispatch after the fix.
+/// Another ticket's step is in flight from then on (its lock held): since
+/// OWL-660 DEMO-1's check runs beside it, never due, and lifts the hold
+/// before the second dispatch after the fix.
 #[test]
 fn a_held_ticket_goes_on_within_one_dispatch_of_a_fix_in_a_busy_drain() {
     use super::drain_scenarios::{done_for, intake_declaring};
@@ -1366,7 +1379,7 @@ fn a_held_ticket_goes_on_within_one_dispatch_of_a_fix_in_a_busy_drain() {
         bench.put_ticket(id, "maintainer", "Todo", &["agent"], blocked, text);
     }
     let start = bench.events().len();
-    let (mut fix_at, mut lock_at) = (None, None);
+    let mut fix_at = None;
     let mut lock = None;
     let eight = TicketId::new("DEMO-8").unwrap();
     let (outcomes, printed) = drain_until(
@@ -1383,23 +1396,18 @@ fn a_held_ticket_goes_on_within_one_dispatch_of_a_fix_in_a_busy_drain() {
             let taken_in = bench
                 .record_of("DEMO-3")
                 .is_some_and(|record| record.intake.is_some());
-            match (fix_at, lock_at) {
+            match fix_at {
                 // DEMO-1 held again in this watch, both others taken in.
-                (None, _) if taken_in && base_waits(&events[start..], TICKET) > 0 => {
+                None if taken_in && base_waits(&events[start..], TICKET) > 0 => {
                     fs::write(&marker, "").unwrap();
                     bench.merge_into_main(&[("NEWS.md", "news\n")]);
                     bench.put_ticket("DEMO-9", "maintainer", "Done", &[], "", "A blocker.");
                     fix_at = Some(events.len());
                 }
                 // The first dispatch after the fix: another step is in
-                // flight for the next pass.
-                (Some(fix), None) if !drained(&events[fix..]).is_empty() => {
+                // flight from the next pass on.
+                Some(fix) if lock.is_none() && !drained(&events[fix..]).is_empty() => {
                     lock = Some(bench.dirs().ticket_lock(&eight).unwrap().unwrap());
-                    lock_at = Some(events.len());
-                }
-                // DEMO-1's check found that step in flight: it ends.
-                (Some(_), Some(at)) if lock.is_some() && base_waits(&events[at..], TICKET) > 0 => {
-                    lock = None;
                 }
                 _ => {}
             }
@@ -1432,6 +1440,90 @@ fn a_held_ticket_goes_on_within_one_dispatch_of_a_fix_in_a_busy_drain() {
             id == TICKET && matches!(outcome, Err(Stop::BaseHeld { due: true, .. }))
         })
         .count();
-    assert_eq!(due, 1, "its check found a step in flight once\n{printed}");
-    assert!(lock.is_none());
+    assert_eq!(due, 0, "its check ran beside the step in flight\n{printed}");
+    assert!(lock.is_some(), "a step was in flight\n{printed}");
+}
+
+/// OWL-660, criterion 4 in a drain, under `policy.max_in_flight = 3`: while
+/// another base check runs (the base lock held), DEMO-1's done Build fails
+/// its gate on a setup the base fails too, and its check waits, pending. No
+/// other step waits for it: DEMO-2, put in the ready column then, is taken
+/// in and dispatched while DEMO-1's check still waits. Once
+/// the other check ended, the next pass runs DEMO-1's check, no clock moved
+/// by the test.
+#[test]
+fn a_pending_check_holds_no_other_step() {
+    use super::drain_scenarios::intake_declaring;
+
+    let bench = Bench::build_admitting(
+        "maintainer",
+        "assignee = \"maintainer\"\nlabels = [\"agent\"]\n",
+        "max_in_flight = 3\nbase_repair = false\n",
+        ", parked = \"Parked\"",
+        "admit = { label = \"agent\" }\nadmitters = [\"maintainer\"]",
+    );
+    let marker = bench.tmp.path().join("store-has-rollup");
+    fs::write(&marker, "").unwrap();
+    let held = with_setup(&bench, &setup_line(&marker), None);
+    let lost = marker.clone();
+    let lose: During = (2, Box::new(move || fs::remove_file(&lost).unwrap()));
+    let pending = |bench: &Bench| {
+        base::read(&bench.dirs()).is_ok_and(|checks| {
+            checks.standing().any(|check| {
+                check.commit == held
+                    && matches!(check.entry, owlshift_core::base::Entry::Pending { .. })
+            })
+        })
+    };
+    let other_check = bench.dirs().base_lock().unwrap().unwrap();
+    let (_, printed) = drain_until(
+        &bench,
+        vec![
+            bench.reply(None, Some(&intake_declaring(&["app"], &[]))),
+            bench.reply(Some("Hello"), Some(DONE)),
+        ],
+        vec![lose],
+        &mut |_| !pending(&bench),
+    );
+    assert!(pending(&bench), "{printed}");
+
+    bench.put_ticket(
+        "DEMO-2",
+        "maintainer",
+        "Todo",
+        &["agent"],
+        "",
+        "Document it.",
+    );
+    let start = bench.events().len();
+    let (_, printed) = drain_until(
+        &bench,
+        // Its Build's setup fails before any harness, the marker gone: its
+        // own check waits too.
+        vec![bench.reply(None, Some(&intake_declaring(&["docs"], &[])))],
+        Vec::new(),
+        &mut |_| drained(&bench.events()[start..]).is_empty(),
+    );
+    let events = bench.events();
+    assert_eq!(
+        drained(&events[start..])
+            .into_iter()
+            .map(|(_, id)| id)
+            .collect::<Vec<_>>(),
+        ["DEMO-2"],
+        "{printed}"
+    );
+    assert!(pending(&bench), "DEMO-1's check still waits\n{printed}");
+    assert!(checks_made(&bench).is_empty(), "{printed}");
+    drop(other_check);
+
+    let (_, printed) = drain_until(&bench, Vec::new(), Vec::new(), &mut |_| {
+        checks_made(&bench).is_empty()
+    });
+    assert!(
+        checks_made(&bench)
+            .iter()
+            .any(|(commit, change, _)| *commit == held && change == "opened"),
+        "{printed}"
+    );
 }
