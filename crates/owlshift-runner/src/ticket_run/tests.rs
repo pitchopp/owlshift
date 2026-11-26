@@ -575,6 +575,44 @@ fn helper_the_base_check_is_one_more_sibling() {
     assert!(siblings.concurrent(&none).unwrap().is_empty());
 }
 
+/// OWL-660: a worktree's entries are found by their `gitdir`, which git
+/// writes in its own form of the path: the worktree named through a link
+/// or as resolved, its folder there or gone; another worktree's never.
+#[cfg(unix)]
+#[test]
+fn a_worktrees_entries_are_found_whatever_form_its_path_takes() {
+    let bench = Bench::new();
+    let real = bench.root.join("real");
+    fs::create_dir_all(&real).unwrap();
+    let link = bench.root.join("link");
+    std::os::unix::fs::symlink(&real, &link).unwrap();
+    let through = link.join("worktree");
+    bench.run(&[
+        "worktree",
+        "add",
+        "--quiet",
+        "-b",
+        "base",
+        &through.to_string_lossy(),
+    ]);
+    let other = real.join("other");
+    bench.run(&[
+        "worktree",
+        "add",
+        "--quiet",
+        "-b",
+        "other",
+        &other.to_string_lossy(),
+    ]);
+    let checkout = bench.dirs.checkout();
+    let found = entries_of(&checkout, &through);
+    assert_eq!(found.len(), 1, "{found:?}");
+    assert_eq!(entries_of(&checkout, &real.join("worktree")), found);
+    fs::remove_dir_all(real.join("worktree")).unwrap();
+    assert_eq!(entries_of(&checkout, &through), found, "its folder gone");
+    assert!(entries_of(&checkout, &real.join("nothing")).is_empty());
+}
+
 /// `owlshift unquarantine`'s fresh start of the run files: each from its
 /// refs as they are, an unreadable one replaced, one whose lock is held left
 /// as it is; with no checkout, they go. Run alone: locks are taken again.

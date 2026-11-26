@@ -740,21 +740,36 @@ pub fn remove_entry(checkout: &Path, name: &str) -> io::Result<()> {
 
 /// The names of the entries of `checkout`'s common git folder that belong to
 /// the worktree at `worktree` (OWL-660): those whose `gitdir` file, which git
-/// writes when it adds a worktree, names `worktree`'s `.git`, the path as
-/// given or with its folder resolved. A scan of those small files, read and
-/// never followed through a link, so a base check finds what an earlier one
-/// left without `git worktree prune`, even when no record names its entry or
-/// its folder is gone; an entry whose `gitdir` names any other worktree is
-/// never one of them. A folder of entries that cannot be listed gives none.
+/// writes when it adds a worktree, names a `.git` in a folder of the same
+/// name as `worktree`, inside the same folder as `worktree` once both are
+/// resolved by the file system. Git writes that path in its own form, its
+/// links resolved on macOS (`/private/var`), long names where the runner may
+/// hold a short one on Windows (`RUNNER~1`), so the folders are compared
+/// resolved, never as texts. A scan of those small files, read and never
+/// followed through a link, so a base check finds what an earlier one left
+/// without `git worktree prune`, even when no record names its entry or its
+/// folder is gone; an entry whose `gitdir` names any other worktree is never
+/// one of them. A folder of entries that cannot be listed, or a `worktree`
+/// whose folder cannot be resolved, gives none.
 pub fn entries_of(checkout: &Path, worktree: &Path) -> Vec<String> {
-    let mut wanted = vec![worktree.join(".git")];
-    if let (Some(folder), Some(name)) = (worktree.parent(), worktree.file_name())
-        && let Ok(resolved) = fs::canonicalize(folder)
-    {
-        wanted.push(resolved.join(name).join(".git"));
-    }
+    let (Some(folder), Some(name)) = (worktree.parent(), worktree.file_name()) else {
+        return Vec::new();
+    };
+    let Ok(folder) = fs::canonicalize(folder) else {
+        return Vec::new();
+    };
     let Ok(listing) = fs::read_dir(checkout.join(".git").join("worktrees")) else {
         return Vec::new();
+    };
+    let ours = |named: &Path| {
+        let worktree = named
+            .parent()
+            .filter(|_| named.file_name() == Some(std::ffi::OsStr::new(".git")));
+        worktree.and_then(Path::file_name) == Some(name)
+            && worktree
+                .and_then(Path::parent)
+                .and_then(|parent| fs::canonicalize(parent).ok())
+                .is_some_and(|parent| parent == folder)
     };
     let mut found: Vec<String> = listing
         .filter_map(Result::ok)
@@ -762,7 +777,7 @@ pub fn entries_of(checkout: &Path, worktree: &Path) -> Vec<String> {
             let name = entry.file_name().to_str()?.to_owned();
             let named = read_capped(&entry.path().join("gitdir")).ok()?;
             let named = PathBuf::from(named.trim_end_matches(['\n', '\r']));
-            wanted.contains(&named).then_some(name)
+            ours(&named).then_some(name)
         })
         .collect();
     found.sort();

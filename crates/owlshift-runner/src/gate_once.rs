@@ -1592,7 +1592,11 @@ mod tests {
         drop(sibling);
         assert!(checked.run.is_some(), "{checked:?}");
         let record = ticket_run::read_base_run(&bench.dirs).unwrap();
-        assert_eq!(record.tip, None, "the base branch is gone");
+        assert_eq!(
+            record.tip, None,
+            "the base branch is gone: {:?}",
+            checked.warnings
+        );
         assert!(record.entry.is_some());
         let kept = checked.base.unwrap();
         assert_eq!(
