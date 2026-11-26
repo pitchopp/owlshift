@@ -7588,7 +7588,13 @@ impl Repaired {
                 | RepairKind::Correction { .. }
                 | RepairKind::Review { .. } => Vec::new(),
             },
-            refreshed: false,
+            refreshed: matches!(
+                kind,
+                RepairKind::Rebase {
+                    refreshed: true,
+                    ..
+                }
+            ),
         }
     }
 }
@@ -7618,9 +7624,12 @@ enum RepairKind {
     /// made, which the delivery check reads, the pushed head being it or a
     /// last fix on top of it (OWL-514); `None` only for a push kept under
     /// way by an older binary, whose head is checked instead.
+    /// `refreshed` when it is a clean refresh the runner merged itself,
+    /// with no run (OWL-655): its report says so.
     Rebase {
         onto: CommitId,
         rebased: Option<CommitId>,
+        refreshed: bool,
     },
     /// A correction run's, following the decider's replies to the DECISION
     /// comments of these questions (OWL-146): a fast-forward.
@@ -8604,6 +8613,8 @@ impl OnDemand<'_> {
                 RepairKind::Rebase {
                     onto: kept_onto,
                     rebased,
+                    // A clean refresh the runner merged keeps saying so (OWL-655).
+                    refreshed: pushing.report.as_ref().is_some_and(|kept| kept.refreshed),
                 },
                 followups,
                 following,
@@ -8785,6 +8796,7 @@ impl OnDemand<'_> {
             RepairKind::Rebase {
                 onto,
                 rebased: Some(rebased),
+                refreshed: false,
             },
             followups,
             following,
@@ -9010,9 +9022,14 @@ impl OnDemand<'_> {
         let neutral = self.neutral_push(p, &repaired.commit, &bases, sink)?;
         let commit = neutral.head.commit().clone();
         let kind = match kind {
-            RepairKind::Rebase { onto, rebased } => RepairKind::Rebase {
+            RepairKind::Rebase {
+                onto,
+                rebased,
+                refreshed,
+            } => RepairKind::Rebase {
                 onto,
                 rebased: rebased.map(|rebased| neutral.image(&rebased)),
+                refreshed,
             },
             other => other,
         };
@@ -9054,7 +9071,7 @@ impl OnDemand<'_> {
             | RepairKind::Steps { .. } => {
                 writer.push_leased(git, &p.checkout, "origin", &neutral.head, &head, pushed)
             }
-            RepairKind::Rebase { onto, rebased } => writer.push_rebased(
+            RepairKind::Rebase { onto, rebased, .. } => writer.push_rebased(
                 git,
                 &p.checkout,
                 "origin",
@@ -9388,6 +9405,7 @@ impl OnDemand<'_> {
                     base_branch: delivery.base_branch.clone(),
                     onto,
                     repair: owed.count,
+                    refreshed: owed.report.as_ref().is_some_and(|kept| kept.refreshed),
                 };
                 (None, Some(rebased), None, Some("repair"))
             }
