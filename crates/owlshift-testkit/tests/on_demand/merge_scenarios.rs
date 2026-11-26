@@ -21,7 +21,7 @@ fn merging(switch: &str) -> Bench {
 
 /// Two minutes later on the bench's clock: a green read now is at least a
 /// minute after one made before.
-fn later(clock: &Cell<Timestamp>) {
+pub(super) fn later(clock: &Cell<Timestamp>) {
     clock.set(
         clock
             .get()
@@ -31,7 +31,7 @@ fn later(clock: &Cell<Timestamp>) {
 }
 
 /// The MERGED comments on the ticket.
-fn merged_comments(bench: &Bench) -> Vec<String> {
+pub(super) fn merged_comments(bench: &Bench) -> Vec<String> {
     bench
         .comments()
         .into_iter()
@@ -1121,7 +1121,7 @@ fn refusals_are_retried_notified_once_or_held_and_a_merge_with_no_verdict_is_tol
 }
 
 /// The merge calls the fake GitHub received.
-fn github_merges(bench: &Bench) -> Vec<Value> {
+pub(super) fn github_merges(bench: &Bench) -> Vec<Value> {
     bench.github.merges.lock().unwrap().clone()
 }
 
@@ -1361,7 +1361,8 @@ fn a_refresh_that_ran_nothing_is_held_and_told() {
     // Watch's first read is green; the refresh's own read, the next one,
     // finds the check running.
     let reads = *bench.github.follow_reads.lock().unwrap();
-    *bench.github.pending_follow_read.lock().unwrap() = Some(reads + 2);
+    *bench.github.pending_follow_reads.lock().unwrap() = reads + 2..reads + 3;
+    let refresh = refresh_in(&bench);
     let clock = bench.clock.clone();
     let mut pass = 0;
     let (outcomes, lines, printed) = bench.watch_during(Vec::new(), Vec::new(), &mut |_| {
