@@ -1679,6 +1679,7 @@ mod tests {
 
     /// A ticket whose step stands for one in flight: its run file, as a
     /// step's start leaves it, and its lock, held until dropped.
+    #[cfg(unix)]
     fn in_flight(dirs: &ProjectDirs, ticket: &TicketId) -> crate::project::TicketLock {
         let run = owlshift_contracts::step::TicketRun::new(ticket.clone());
         fs::create_dir_all(dirs.ticket_dir(ticket)).unwrap();
@@ -1687,6 +1688,7 @@ mod tests {
     }
 
     /// The refs a list of violations names.
+    #[cfg(unix)]
     fn refs_named(violations: &[crate::executor::isolation::Violation]) -> Vec<String> {
         violations
             .iter()
