@@ -9683,6 +9683,21 @@ fn refreshes_merged(bench: &Bench) -> Vec<Value> {
         .collect()
 }
 
+/// A refresh's rebase run, played: the delivered branch rebased onto
+/// `onto`, a conflict resolved on the delivery's side. A refresh reaches
+/// the rebase run only when git finds its base change conflicting, the
+/// fake GitHub still reporting the pull request mergeable (OWL-655).
+fn rebased_keeping_delivery(bench: &Bench, onto: &str) -> During {
+    let (env, worktree, onto) = (bench.env.clone(), bench.worktree(), onto.to_owned());
+    (
+        1,
+        Box::new(move || {
+            env.run(&worktree, &["rebase", "--quiet", "-X", "theirs", &onto])
+                .unwrap();
+        }),
+    )
+}
+
 fn assert_runner_merged(
     bench: &Bench,
     runs: usize,

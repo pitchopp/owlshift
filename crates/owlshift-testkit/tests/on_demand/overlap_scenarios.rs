@@ -772,3 +772,252 @@ fn a_rebase_run_that_drops_delivered_work_is_refused_before_any_review() {
         "{parked}"
     );
 }
+
+/// `AGENTS.md` with a line DEMO-2's merge adds at its end, where DEMO-1's
+/// delivery adds its own: git finds the two conflicting (OWL-655).
+const AGENTS_CONFLICTING: &str =
+    "Sign off every commit (`git commit -s`).\nWrite the test first.\n";
+
+/// DEMO-1 delivered with [`AGENTS_APPENDED`], DEMO-2 merged sharing
+/// `AGENTS.md`, under `policy`, and `main` moved by DEMO-2's merge of
+/// `files`: the bench, its first push and the `main` it moved to.
+fn refreshed_by(policy: &str, files: &[(&str, &str)]) -> (Bench, String, String) {
+    let bench = overlapping_with(&[("AGENTS.md", AGENTS_APPENDED)], false, policy);
+    merged_sibling(&bench, &["AGENTS.md"], true);
+    let first_push = bench.remote_branch().unwrap();
+    let main = bench.merge_into_main(files);
+    (bench, first_push, main)
+}
+
+/// The data of the warnings `what`.
+fn warned(bench: &Bench, what: &str) -> Vec<Value> {
+    data_of(&bench.events(), EventKind::Warning, "what")
+        .into_iter()
+        .filter(|data| data["what"] == what)
+        .collect()
+}
+
+/// OWL-655 (a): a refresh whose base change git finds conflicting, the
+/// forge still reporting the pull request mergeable, keeps the rebase run:
+/// on the fast tier, the conflicting path named, and no merge of the
+/// runner's.
+#[test]
+fn a_refresh_git_finds_conflicting_keeps_the_rebase_run() {
+    let (bench, first_push, main) = refreshed_by(
+        "overlap = \"rebase\"\n",
+        &[("AGENTS.md", AGENTS_CONFLICTING)],
+    );
+    let refresh = rebased_keeping_delivery(&bench, &main);
+    let (outcomes, lines, printed) = bench.watch_during(
+        vec![bench.reply(None, Some(REBASED))],
+        vec![refresh],
+        &mut |_| false,
+    );
+    let report = format!("{outcomes:?}\n{lines}\n{printed}");
+    assert!(outcomes.iter().all(Result::is_ok), "{report}");
+    let runs = rebase_runs(&bench);
+    assert_eq!(runs.len(), 1, "{runs:?}\n{report}");
+    assert_eq!(
+        (
+            &runs[0]["refresh"],
+            &runs[0]["tier"],
+            &runs[0]["conflicting"],
+            &runs[0]["cause"]
+        ),
+        (
+            &json!(true),
+            &json!("fast"),
+            &json!(["AGENTS.md"]),
+            &json!("overlap")
+        )
+    );
+    assert!(refreshes_merged(&bench).is_empty(), "{report}");
+    let head = bench.remote_branch().unwrap();
+    assert_ne!(head, first_push);
+    assert!(is_ancestor(&bench, &main, &head), "{report}");
+}
+
+/// OWL-655 (b): a remote that refuses the push of the runner's merge, as a
+/// rule requiring a linear history or signed commits would: the ticket
+/// parks, the forge's answer quoted, and no run is started for it. The
+/// refusal is played by a lock held on the branch's ref in the bare remote:
+/// the bench, as the runner, runs git with hooks off, so no `pre-receive`
+/// hook could refuse it.
+#[test]
+fn a_forge_that_refuses_the_runner_s_merge_parks_the_ticket() {
+    let (bench, first_push, _) =
+        refreshed_by("overlap = \"rebase\"\n", &[("AGENTS.md", AGENTS_PREPENDED)]);
+    let lock = bench
+        .remote
+        .bare
+        .join("refs/heads")
+        .join(format!("{BRANCH}.lock"));
+    fs::create_dir_all(lock.parent().unwrap()).unwrap();
+    fs::write(&lock, "").unwrap();
+    let runs = bench.briefs().len();
+    let (outcomes, lines, printed) = bench.watch(Vec::new(), &mut |_| false);
+    let report = format!("{outcomes:?}\n{lines}\n{printed}");
+    assert_eq!(bench.briefs().len(), runs, "a run started\n{report}");
+    assert_eq!(refreshes_merged(&bench).len(), 1, "{report}");
+    assert_eq!(bench.remote_branch().unwrap(), first_push, "{report}");
+    assert!(
+        matches!(state_of(&bench).status(), Status::Parked { .. }),
+        "{report}"
+    );
+    let parked = bench
+        .comments()
+        .into_iter()
+        .rfind(|c| c.starts_with("[owlshift] PARKED"))
+        .unwrap_or_else(|| panic!("a PARKED comment\n{report}"));
+    assert!(parked.contains("[remote rejected]"), "{parked}");
+}
+
+/// OWL-655 (c): the runner's merge whose push a crash cut short is pushed
+/// again with no run, and its report still says the runner merged it.
+#[test]
+fn a_runner_s_merge_cut_short_is_pushed_again_and_told_as_a_refresh() {
+    let (bench, first_push, main) =
+        refreshed_by("overlap = \"rebase\"\n", &[("AGENTS.md", AGENTS_PREPENDED)]);
+    let (env, worktree) = (bench.env.clone(), bench.worktree());
+    env.run(&worktree, &["fetch", "--quiet", "origin", "main"])
+        .unwrap();
+    env.run(
+        &worktree,
+        &["merge", "--quiet", "--no-ff", "--no-edit", &main],
+    )
+    .unwrap();
+    let out = env.run(&worktree, &["rev-parse", "HEAD"]).unwrap();
+    let merge = String::from_utf8(out).unwrap().trim().to_owned();
+    // The merge moved the branch: its run file says so.
+    let file = bench.dirs().run_file(&ticket());
+    let mut run =
+        owlshift_contracts::step::TicketRun::parse(&fs::read_to_string(&file).unwrap()).unwrap();
+    run.tip = Some(merge.clone());
+    run.generation += 1;
+    fs::write(&file, run.render()).unwrap();
+    let mut record = bench.record();
+    record.delivery.as_mut().unwrap().pushing = Some(owlshift_contracts::refs::Pushing {
+        commit: merge.clone(),
+        kind: owlshift_contracts::refs::PushKind::Rebase,
+        base: main.clone(),
+        onto: Some(main.clone()),
+        rebased: Some(merge.clone()),
+        report: Some(owlshift_contracts::refs::KeptReport {
+            summary: "Owlshift merged `main` into the branch itself.".to_owned(),
+            gate: None,
+            checks: Vec::new(),
+            questions: Vec::new(),
+            notes: Vec::new(),
+            followups: Vec::new(),
+            reviews: Vec::new(),
+            steps: Vec::new(),
+            refreshed: true,
+        }),
+    });
+    bench.write_record(&record);
+    bench.github.followed.lock().unwrap().mergeable = "CONFLICTING";
+    let runs = bench.briefs().len();
+    let (outcomes, lines, printed) = bench.watch(Vec::new(), &mut |_| false);
+    let report = format!("{outcomes:?}\n{lines}\n{printed}");
+    assert_eq!(bench.briefs().len(), runs, "a run started\n{report}");
+    assert_ne!(merge, first_push);
+    assert_eq!(bench.remote_branch().unwrap(), merge, "{report}");
+    let lead = format!(
+        "**Refreshed onto `main` at `{}` after delivery,**",
+        &main[..7]
+    );
+    assert!(
+        bench
+            .comments()
+            .iter()
+            .any(|c| c.starts_with("[owlshift] DELIVERY") && c.contains(&lead)),
+        "{report}"
+    );
+}
+
+/// OWL-655 (d): a base that already carries a delivered path as the
+/// delivery wrote it leaves the runner's merge without that change: the
+/// push guard refuses it, a warning says so, and the rebase run follows,
+/// dispatched once, the ticket's branch still at the first push when it
+/// starts.
+#[test]
+fn a_merge_the_push_guard_refuses_falls_back_to_the_rebase_run() {
+    let (bench, first_push, _) =
+        refreshed_by("overlap = \"rebase\"\n", &[("AGENTS.md", AGENTS_APPENDED)]);
+    let (env, worktree) = (bench.env.clone(), bench.worktree());
+    let at_start = first_push.clone();
+    let check: During = (
+        1,
+        Box::new(move || {
+            let out = env.run(&worktree, &["rev-parse", "HEAD"]).unwrap();
+            assert_eq!(String::from_utf8(out).unwrap().trim(), at_start);
+        }),
+    );
+    let (outcomes, lines, printed) = bench.watch_during(
+        vec![
+            bench.reply(None, Some(NOT_REBASED)),
+            bench.reply(None, Some(NOT_REBASED)),
+        ],
+        vec![check],
+        &mut |_| false,
+    );
+    let report = format!("{outcomes:?}\n{lines}\n{printed}");
+    let refused = warned(&bench, "refresh_merge_refused");
+    assert_eq!(refused.len(), 1, "{refused:?}\n{report}");
+    assert!(
+        refused[0]["reason"]
+            .as_str()
+            .unwrap()
+            .contains("no longer changes AGENTS.md"),
+        "{refused:?}"
+    );
+    assert!(refreshes_merged(&bench).is_empty(), "{report}");
+    let rebases: Vec<Value> = data_of(&bench.events(), EventKind::Dispatch, "command")
+        .into_iter()
+        .filter(|data| data["command"] == "rebase")
+        .collect();
+    assert_eq!(rebases.len(), 1, "{rebases:?}\n{report}");
+    let runs = rebase_runs(&bench);
+    assert!(!runs.is_empty(), "{report}");
+    assert_eq!(runs[0]["refresh"], json!(true));
+    assert_eq!(bench.remote_branch().unwrap(), first_push, "{report}");
+}
+
+/// OWL-655 (e): a sibling's merge that changes the shared path and sets the
+/// project's gate to a failing command. The runner's merge runs no gate, so
+/// the refresh is pushed and the pull request merges on green, which a
+/// gate run would have stopped: the pull request's checks are its guard.
+#[test]
+fn a_clean_refresh_runs_no_gate_and_merges_on_green() {
+    let config = |bench: &Bench| {
+        fs::read_to_string(bench.remote.checkout.join("owlshift.toml"))
+            .unwrap()
+            .replace(GATE_LINE, "gate = [\"false\"]")
+    };
+    let bench = overlapping_with(
+        &[("AGENTS.md", AGENTS_APPENDED)],
+        false,
+        "overlap = \"rebase\"\n[forge]\nmerge = \"all\"\n",
+    );
+    merged_sibling(&bench, &["AGENTS.md"], true);
+    let first_push = bench.remote_branch().unwrap();
+    let gated = config(&bench);
+    assert!(gated.contains("gate = [\"false\"]"), "{gated}");
+    let main = bench.merge_into_main(&[("AGENTS.md", AGENTS_PREPENDED), ("owlshift.toml", &gated)]);
+    let runs = bench.briefs().len();
+    let mut pass = 0;
+    let (outcomes, lines, printed) = bench.watch_during(Vec::new(), Vec::new(), &mut |_| {
+        pass += 1;
+        two_minutes_later(&bench);
+        pass < 6
+    });
+    let report = format!("{outcomes:?}\n{lines}\n{printed}");
+    assert!(outcomes.iter().all(Result::is_ok), "{report}");
+    let merge = assert_runner_merged(&bench, runs, &first_push, &main, "overlap");
+    let merges = bench.github.merges.lock().unwrap().clone();
+    assert_eq!(
+        merges,
+        [json!({ "sha": merge, "merge_method": "squash" })],
+        "{report}"
+    );
+}
