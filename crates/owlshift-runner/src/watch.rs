@@ -1444,7 +1444,7 @@ impl Watch<'_> {
             on_demand.review_after_working(ticket, sink);
         }
         if let (Some(merging), Some(pr)) = (&runner_merged, &delivery.pull_request) {
-            crate::merge::merged_event(ticket, pr.number, merging, None, None, sink);
+            crate::merge::merged_event(ticket, pr.number, merging, (None, None), None, sink);
         }
         if let Some(event) = memory.following.events(ticket, &seen) {
             sink.emit(ticket, None, EventKind::Decision, event);
@@ -1476,14 +1476,9 @@ impl Watch<'_> {
             // A read that asks for no repair leaves room for a correction
             // (OWL-146), then for the reviews on the pull request (OWL-307),
             // read once the pass ran no correction; then, on a green read
-            // with neither due, for merge on green (OWL-445).
-            if matches!(
-                seen.decision,
-                Decision::Follow {
-                    adopt: false,
-                    action: Action::Green | Action::WaitChecks | Action::WaitBaseRed,
-                }
-            ) {
+            // with neither due, for merge on green (OWL-445), and on a read
+            // with no check at all once none came for ten minutes (OWL-657).
+            if seen.decision.asks_no_repair() {
                 let corrected =
                     self.correct(memory, sink, out, continued, ticket, stored, at.clone());
                 let reviewed = if corrected == Due::Ran {
@@ -1498,12 +1493,24 @@ impl Watch<'_> {
                 } else {
                     self.person_steps(memory, sink, out, continued, ticket, stored, at.clone())
                 };
-                let green = seen.decision
+                let no_checks = seen.decision
                     == (Decision::Follow {
                         adopt: false,
-                        action: Action::Green,
+                        action: Action::NoChecks,
                     });
-                if green && [corrected, reviewed, stepped] == [Due::Nothing; 3] {
+                let settled =
+                    no_checks && memory.following.no_checks_settled(ticket, &seen.head, now);
+                let green = settled
+                    || seen.decision
+                        == (Decision::Follow {
+                            adopt: false,
+                            action: Action::Green,
+                        });
+                if no_checks && !settled {
+                    // A check may still register: told, merge on green's
+                    // holds and reads wait for the window's end (OWL-657).
+                    self.no_checks_yet(memory, sink, out, ticket, delivery, &seen.head);
+                } else if green && [corrected, reviewed, stepped] == [Due::Nothing; 3] {
                     self.merge(memory, sink, out, continued, ticket, stored, at, &seen);
                 } else if green
                     && let Some(pr) = &delivery.pull_request

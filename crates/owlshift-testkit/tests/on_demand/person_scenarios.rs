@@ -147,8 +147,10 @@ fn a_plan_whose_last_step_is_a_person_s_is_built_delivered_and_held_from_merging
     let (outcome, printed) = bench.run(replies, None);
     let line = outcome.unwrap_or_else(|stop| panic!("{stop}\n{printed}"));
     assert!(
-        line.to_string()
-            .contains("Owlshift merges it once it is green, unless a person must judge it first"),
+        line.to_string().contains(
+            "Owlshift merges it once it is green, or once no check has run on it for 10 \
+                 minutes, unless a person must judge it first",
+        ),
         "{line}"
     );
     // The Build was given the person's steps, and its owed step is kept

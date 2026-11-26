@@ -190,6 +190,23 @@ pub enum Decision {
     Follow { adopt: bool, action: Action },
 }
 
+impl Decision {
+    /// Whether the read leaves room for the pull request's other work, a
+    /// correction, a review loop, a person's steps and merge on green: kept
+    /// following at Owlshift's pushed head, no repair due, and mergeability
+    /// known. Green, no check at all (OWL-657), checks still running, or a
+    /// red that is the base's.
+    pub fn asks_no_repair(&self) -> bool {
+        matches!(
+            self,
+            Self::Follow {
+                adopt: false,
+                action: Action::Green | Action::NoChecks | Action::WaitChecks | Action::WaitBaseRed,
+            }
+        )
+    }
+}
+
 /// What watch does about a pull request it follows.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Action {
@@ -197,12 +214,17 @@ pub enum Action {
     WaitMergeability,
     /// The decision depends on the base branch: read it, then decide again.
     NeedsBase,
-    /// Checks still run, or there are none yet.
+    /// Checks still run, none failed.
     WaitChecks,
     /// The red is the base's: nothing is run or counted.
     WaitBaseRed,
     /// Every check passed with no conflict: the fix passes are cleared.
     Green,
+    /// Mergeable, and the head lists no check at all (OWL-657): its checks
+    /// may not have registered yet, or none runs on this change. Merge on
+    /// green takes it as green once watch has read none on that head for
+    /// [`NO_CHECKS_AFTER`]; the fix passes are kept.
+    NoChecks,
     /// A rebase run onto `onto`, for `cause`.
     Rebase { onto: String, cause: RebaseCause },
     /// The pull request conflicts with the base head the last rebase run
@@ -332,10 +354,12 @@ fn act(
         .map(|c| c.name.clone())
         .collect();
     if failed.is_empty() {
-        return if pending.is_empty() && !checks.is_empty() {
-            Action::Green
-        } else {
+        return if !pending.is_empty() {
             Action::WaitChecks
+        } else if checks.is_empty() {
+            Action::NoChecks
+        } else {
+            Action::Green
         };
     }
     let overdue = if pending.is_empty() {
@@ -526,6 +550,45 @@ pub const MERGE_LABEL: &str = "owlshift:merge";
 /// of it may merge: two green reads at least a minute apart (D14).
 pub const GREEN_TWICE_AFTER: Duration = Duration::from_secs(60);
 
+/// How old the first read of a head that listed no check must be before
+/// merge on green takes a read of it with none as green (OWL-657): no check
+/// will come. Measured on 2026-11-26 over 250 pushes, a check registered a
+/// median 7 seconds after its push, 75 seconds at the slowest watch read.
+pub const NO_CHECKS_AFTER: Duration = Duration::from_secs(10 * 60);
+
+/// What a commit message holds to make GitHub skip the workflows a push or
+/// a pull request would run (GitHub's documentation, "Skipping workflow
+/// runs"), compared in any case: merge on green never merges a head no
+/// check ran on whose delivery says one of them (OWL-657). The trailer
+/// `skip-checks: true` is [`SKIP_CHECKS_TRAILER`].
+pub const CI_SKIP_STRINGS: [&str; 5] = [
+    "[skip ci]",
+    "[ci skip]",
+    "[no ci]",
+    "[skip actions]",
+    "[actions skip]",
+];
+
+/// The trailer that skips a commit's checks, with or without the space
+/// after its colon, compared in any case on a line of its own.
+pub const SKIP_CHECKS_TRAILER: &str = "skip-checks:";
+
+/// Whether `message`, one or more commit messages, asks CI to skip: one of
+/// [`CI_SKIP_STRINGS`] anywhere, or a line `skip-checks: true` or
+/// `skip-checks:true`. Read wider than GitHub, which reads the strings in
+/// the head commit only for a pull request's workflows: every commit of
+/// the delivery reaches the base's own push in a squash merge's message,
+/// where any one of them skips the base's workflows.
+pub fn asks_ci_to_skip(message: &str) -> bool {
+    let lower = message.to_ascii_lowercase();
+    CI_SKIP_STRINGS.iter().any(|skip| lower.contains(skip))
+        || lower.lines().any(|line| {
+            line.trim()
+                .strip_prefix(SKIP_CHECKS_TRAILER)
+                .is_some_and(|value| value.trim() == "true")
+        })
+}
+
 /// What the project lets the runner merge, read at the base branch's head:
 /// `[forge] merge` and `merge_method`, and the gate policy that says which
 /// question categories the project sends to a human.
@@ -591,7 +654,9 @@ pub struct MergeFacts<'a> {
     /// The commit Owlshift last pushed (`delivery.json`'s `pushed`): the head
     /// the merge expects.
     pub pushed: &'a str,
-    /// The first green read of a head, `None` when this read is the first.
+    /// The first read of a head of the decision's kind, `None` when this
+    /// read is the first: green, or, for [`Action::NoChecks`], one that
+    /// listed no check (OWL-657).
     pub first_green: Option<FirstGreen<'a>>,
     /// The base branch's head read at this pass.
     pub base_head: &'a str,
@@ -614,6 +679,13 @@ pub struct MergeFacts<'a> {
     /// [`Read`] given to [`merge_due`] (OWL-526); the runner reads it once
     /// [`merge_due`] waits on [`MergeBlocker::BaseUnchecked`].
     pub base_checks: Option<&'a BaseRead>,
+    /// Whether a commit message of the delivery asks CI to skip it
+    /// ([`asks_ci_to_skip`], OWL-657), as the runner read the commits
+    /// between the base head and the pushed head: `None` until read.
+    /// Consulted only for a head no check ran on, once every other
+    /// condition but the base's own checks holds; the runner reads it once
+    /// [`merge_due`] waits on [`MergeBlocker::CommitsUnread`].
+    pub ci_skipped: Option<bool>,
     /// Whether the ticket carries [`MERGE_LABEL`].
     pub labeled: bool,
     /// Whether the ticket carries the project's `[tracker].exclude` label: a
@@ -680,6 +752,16 @@ pub enum MergeBlocker {
     /// The head was not read green twice at least [`GREEN_TWICE_AFTER`]
     /// apart.
     GreenOnce,
+    /// The head lists no check, and watch's first read of it that listed
+    /// none is not [`NO_CHECKS_AFTER`] old (OWL-657): a check may still
+    /// register.
+    NoChecksYet,
+    /// The head lists no check, and the delivery's commit messages were
+    /// not read for an instruction to skip CI (OWL-657).
+    CommitsUnread,
+    /// The head lists no check, and a commit message of the delivery asks
+    /// CI to skip it (OWL-657): nothing tested it, and a person merges it.
+    CiSkipped,
     /// The base moved apart from the delivery and its own checks were not
     /// read, or were read at another head than the one decided on (OWL-521).
     BaseUnchecked,
@@ -718,11 +800,12 @@ pub enum MergeDue {
 
 /// Whether the runner merges the pull request at this pass (D14,
 /// architecture section 5, "Merge on green"): only when `facts.decision` is
-/// [`Action::Green`] on the head `read` shows, that head is Owlshift's pushed
-/// commit and every condition of the design holds. `Green` keeps its
-/// meaning; this decides on top of it. The grant carries the pushed head as
-/// the merge's expected head. `read.checks` must be the head's checks the
-/// decision read: on a moved base they name the base checks that count
+/// [`Action::Green`], or [`Action::NoChecks`] read so for
+/// [`NO_CHECKS_AFTER`] (OWL-657), on the head `read` shows, that head is
+/// Owlshift's pushed commit and every condition of the design holds. `Green`
+/// keeps its meaning; this decides on top of it. The grant carries the pushed
+/// head as the merge's expected head. `read.checks` must be the head's checks
+/// the decision read: on a moved base they name the base checks that count
 /// (OWL-526), and a read without them counts none.
 pub fn merge_due(policy: &MergePolicy<'_>, facts: &MergeFacts<'_>, read: &Read) -> MergeDue {
     match blocker(policy, facts, read) {
@@ -734,15 +817,29 @@ pub fn merge_due(policy: &MergePolicy<'_>, facts: &MergeFacts<'_>, read: &Read) 
 /// The first condition of [`merge_due`] that does not hold, in the design's
 /// order.
 fn blocker(policy: &MergePolicy<'_>, facts: &MergeFacts<'_>, read: &Read) -> Option<MergeBlocker> {
-    let green = matches!(
-        facts.decision,
+    let (green, no_checks) = match facts.decision {
         Decision::Follow {
             adopt: false,
-            action: Action::Green
-        }
-    );
-    if !green || read.state != PrState::Open || read.head != facts.pushed {
+            action: Action::Green,
+        } => (true, false),
+        Decision::Follow {
+            adopt: false,
+            action: Action::NoChecks,
+        } => (false, true),
+        _ => (false, false),
+    };
+    if !(green || no_checks) || read.state != PrState::Open || read.head != facts.pushed {
         return Some(MergeBlocker::NotGreen);
+    }
+    // A head with no check counts as green only once none came for
+    // `NO_CHECKS_AFTER` (OWL-657): until then its checks may register.
+    let first_read = |after: Duration| {
+        facts
+            .first_green
+            .is_some_and(|first| first.head == facts.pushed && first.ago >= after)
+    };
+    if no_checks && !first_read(NO_CHECKS_AFTER) {
+        return Some(MergeBlocker::NoChecksYet);
     }
     match policy.switch {
         MergeSwitch::Never => return Some(MergeBlocker::SwitchOff),
@@ -772,11 +869,17 @@ fn blocker(policy: &MergePolicy<'_>, facts: &MergeFacts<'_>, read: &Read) -> Opt
         }
         Some(_) => {}
     }
-    let green_twice = facts
-        .first_green
-        .is_some_and(|first| first.head == facts.pushed && first.ago >= GREEN_TWICE_AFTER);
-    if !green_twice {
+    if green && !first_read(GREEN_TWICE_AFTER) {
         return Some(MergeBlocker::GreenOnce);
+    }
+    // A head no check ran on: no commit of the delivery may have asked CI to
+    // skip it (OWL-657), a hold only a person lifts.
+    if no_checks {
+        match facts.ci_skipped {
+            None => return Some(MergeBlocker::CommitsUnread),
+            Some(true) => return Some(MergeBlocker::CiSkipped),
+            Some(false) => {}
+        }
     }
     // Reaching here with a moved base means a move apart from the delivery.
     if facts.base_at_push != Some(facts.base_head) {
@@ -792,8 +895,12 @@ fn blocker(policy: &MergePolicy<'_>, facts: &MergeFacts<'_>, read: &Read) -> Opt
 /// running. Only a check under a name the pull request's head carries, in
 /// `carried`, counts (OWL-526): one it does not run says nothing of its
 /// code. Checks are taken by name, as [`decide`] takes them, names compared
-/// exactly. A head with no counted check holds nothing.
+/// exactly. A head with no counted check holds nothing, and a pull request
+/// that carries no check at all (OWL-657) needs no read of them.
 fn base_hold(head: &str, base: Option<&BaseRead>, carried: &[CheckRead]) -> Option<MergeBlocker> {
+    if carried.is_empty() {
+        return None;
+    }
     let Some(base) = base.filter(|base| base.head == head) else {
         return Some(MergeBlocker::BaseUnchecked);
     };
@@ -874,6 +981,7 @@ impl MergeBlocker {
             Self::PersonSteps(_) => Some("person_steps"),
             Self::Excluded => Some("excluded"),
             Self::Unlabeled => Some("unlabeled"),
+            Self::CiSkipped => Some("skip_ci"),
             Self::NotGreen
             | Self::SwitchOff
             | Self::StageMoved
@@ -882,6 +990,8 @@ impl MergeBlocker {
             | Self::BaseUnknown
             | Self::BaseMoved
             | Self::GreenOnce
+            | Self::NoChecksYet
+            | Self::CommitsUnread
             | Self::BaseUnchecked
             | Self::BaseRed(_)
             | Self::BasePending(_)
@@ -1248,14 +1358,59 @@ mod tests {
         );
     }
 
+    /// OWL-657: a mergeable head with no check at all is its own read, not
+    /// one whose checks run; mergeability comes first, as for any read.
     #[test]
-    fn running_checks_or_none_wait_and_every_check_passed_is_green() {
+    fn running_checks_wait_none_at_all_is_no_checks_and_every_check_passed_is_green() {
         let running = read(Mergeable::Mergeable, &[("ci", Passed), ("t", Pending)]);
         assert_eq!(action(&running, None, None), Action::WaitChecks);
         let none = read(Mergeable::Mergeable, &[]);
-        assert_eq!(action(&none, None, None), Action::WaitChecks);
+        assert_eq!(action(&none, None, None), Action::NoChecks);
+        let unknown = read(Mergeable::Unknown, &[]);
+        assert_eq!(action(&unknown, None, None), Action::WaitMergeability);
         let green = read(Mergeable::Mergeable, &[("ci", Passed), ("t", Passed)]);
         assert_eq!(action(&green, None, None), Action::Green);
+        let no_repair =
+            |action: Action, adopt: bool| Decision::Follow { adopt, action }.asks_no_repair();
+        for action in [
+            Action::Green,
+            Action::NoChecks,
+            Action::WaitChecks,
+            Action::WaitBaseRed,
+        ] {
+            assert!(no_repair(action.clone(), false), "{action:?}");
+            assert!(!no_repair(action, true));
+        }
+        assert!(!no_repair(Action::WaitMergeability, false));
+        assert!(!no_repair(Action::Park, false));
+    }
+
+    /// OWL-657: GitHub's strings in any case, and the trailer with or
+    /// without its space, ask CI to skip; what only looks like them does not.
+    #[test]
+    fn a_message_asks_ci_to_skip_by_github_s_strings_or_its_trailer() {
+        for message in [
+            "Add the guide [skip ci]",
+            "[CI SKIP] Add the guide",
+            "Add the guide [no ci]",
+            "[skip actions] Add the guide",
+            "Add the guide\n\n[Actions Skip]",
+            "Add the guide\n\n\nskip-checks: true",
+            "Add the guide\n\n\nskip-checks:true\n",
+            "Add the guide\n\n\nSkip-Checks: TRUE",
+        ] {
+            assert!(asks_ci_to_skip(message), "{message}");
+        }
+        for message in [
+            "Add the guide",
+            "Skip ci for docs",
+            "[skip-ci] Add the guide",
+            "[skip  ci] Add the guide",
+            "Add the guide\n\n\nskip-checks: false",
+            "Explain the skip-checks: true trailer",
+        ] {
+            assert!(!asks_ci_to_skip(message), "{message}");
+        }
     }
 
     /// Checks of one name count as their worst, on the pull request and on
@@ -1620,6 +1775,7 @@ mod tests {
                 base_at_push: Some(BASE),
                 disjoint: false,
                 base_checks: None,
+                ci_skipped: None,
                 labeled: true,
                 excluded: false,
                 questions,
@@ -2000,6 +2156,94 @@ mod tests {
                 ..facts(&GREEN, &[])
             };
             assert_eq!(wait(&unmoved), merge);
+        }
+
+        /// OWL-657: a head no check ran on merges once watch's first read of
+        /// it listing none is `NO_CHECKS_AFTER` old and no commit of its
+        /// delivery asks CI to skip; before that it waits, ahead of the
+        /// switch and every hold for a person. A green read is never weighed
+        /// for skips. On a base moved apart no base check counts for it, so
+        /// none is read.
+        #[test]
+        fn a_head_no_check_ran_on_merges_after_the_window_unless_a_commit_skips_ci() {
+            use MergeBlocker::*;
+            let gate = gate(DelegationLevel::Discoverable);
+            let no_checks = Decision::Follow {
+                adopt: false,
+                action: Action::NoChecks,
+            };
+            let empty = Read {
+                checks: Vec::new(),
+                ..green_read()
+            };
+            let wait = |facts: &MergeFacts<'_>, switch| due(switch, &gate, facts, &empty);
+            let merge = MergeDue::Merge(MergeGrant::new(HEAD, MergeMethod::Rebase));
+            let first = |head, ago| Some(FirstGreen { head, ago });
+            let settled = MergeFacts {
+                first_green: first(HEAD, NO_CHECKS_AFTER),
+                ci_skipped: Some(false),
+                ..facts(&no_checks, &[])
+            };
+            assert_eq!(wait(&settled, MergeSwitch::All), merge);
+            // Green twice's minute is not the window, nor is another head's
+            // read, nor none.
+            for first_green in [
+                first(HEAD, GREEN_TWICE_AFTER),
+                first(HEAD, NO_CHECKS_AFTER - Duration::from_secs(1)),
+                first(BASE, NO_CHECKS_AFTER),
+                None,
+            ] {
+                let young = MergeFacts {
+                    first_green,
+                    ..settled
+                };
+                assert_eq!(wait(&young, MergeSwitch::All), MergeDue::Wait(NoChecksYet));
+                let unlabeled = MergeFacts {
+                    labeled: false,
+                    ..young
+                };
+                for switch in [MergeSwitch::Never, MergeSwitch::Labeled] {
+                    assert_eq!(wait(&unlabeled, switch), MergeDue::Wait(NoChecksYet));
+                }
+            }
+            let unlabeled = MergeFacts {
+                labeled: false,
+                ..settled
+            };
+            assert_eq!(
+                wait(&unlabeled, MergeSwitch::Labeled),
+                MergeDue::Wait(Unlabeled)
+            );
+            // The commits: unread, then a skip, which only a person lifts.
+            let unread = MergeFacts {
+                ci_skipped: None,
+                ..settled
+            };
+            assert_eq!(
+                wait(&unread, MergeSwitch::All),
+                MergeDue::Wait(CommitsUnread)
+            );
+            let skipped = MergeFacts {
+                ci_skipped: Some(true),
+                ..settled
+            };
+            assert_eq!(wait(&skipped, MergeSwitch::All), MergeDue::Wait(CiSkipped));
+            assert_eq!(CiSkipped.kept_for_a_person(), Some("skip_ci"));
+            assert_eq!(
+                due(MergeSwitch::All, &gate, &facts(&GREEN, &[]), &green_read()),
+                merge
+            );
+            // A base moved apart: unread or red, its checks hold nothing.
+            let red = base_read(&[("ci", CheckOutcome::CodeFailure)], None);
+            for base_checks in [None, Some(&red)] {
+                let apart = MergeFacts {
+                    base_at_push: Some("fedcba9876543210fedcba9876543210fedcba98"),
+                    disjoint: true,
+                    base_checks,
+                    ..settled
+                };
+                assert_eq!(wait(&apart, MergeSwitch::All), merge);
+            }
         }
 
         /// OWL-526: on a moved-apart base only the checks under a name the

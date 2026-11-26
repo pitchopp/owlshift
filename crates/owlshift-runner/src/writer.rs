@@ -161,12 +161,13 @@ pub fn merges_on_green(switch: MergeSwitch, held: Option<&str>, it: &str) -> Opt
             "Owlshift will not merge {it}: {held}. Review and merge it yourself."
         )),
         (MergeSwitch::All, None) => Some(format!(
-            "Owlshift merges {it} once it is green, unless a person must judge it first \
-             (merge on green)."
+            "Owlshift merges {it} once it is green, or once no check has run on it for 10 \
+             minutes, unless a person must judge it first (merge on green)."
         )),
         (MergeSwitch::Labeled, None) => Some(format!(
-            "Owlshift merges {it} once it is green only if the ticket carries the label \
-             `{MERGE_LABEL}` (merge on green); otherwise review and merge it."
+            "Owlshift merges {it} once it is green, or once no check has run on it for 10 \
+             minutes, only if the ticket carries the label `{MERGE_LABEL}` (merge on green); \
+             otherwise review and merge it."
         )),
     }
 }
@@ -185,6 +186,10 @@ pub struct MergedComment {
     /// read; `None` when the merge was found by a later read of the pull
     /// request.
     pub commit: Option<CommitId>,
+    /// Whether no check ran on the head merged (OWL-657), merged once watch
+    /// had read none on it for ten minutes; `None` when the merge was found
+    /// by a later read, which says nothing of its checks.
+    pub no_checks: Option<bool>,
 }
 
 impl MergedComment {
@@ -210,12 +215,19 @@ impl MergedComment {
             round: None,
             run: None,
         };
+        let checks = match self.no_checks {
+            Some(false) => "its checks were green twice on this head and base, and ",
+            Some(true) => {
+                "**no check ran on this head**: none had reported on it 10 minutes after watch \
+                 first read it, so no CI workflow runs on this change, and "
+            }
+            None => "",
+        };
         let mut all = vec![
             header.render(),
             format!(
-                "**Merged by Owlshift** under the project's merge on green, by {}: its checks \
-                 were green twice on this head and base, and nothing on the ticket was left \
-                 for a person to judge.",
+                "**Merged by Owlshift** under the project's merge on green, by {}: {checks}nothing \
+                 on the ticket was left for a person to judge.",
                 code(self.method.as_str())
             ),
             self.pull_request_line(),
@@ -8859,15 +8871,16 @@ Reply `Q1: B`, `ok` to take every recommendation, or in your own words.
             (
                 MergeSwitch::All,
                 format!(
-                    "Owlshift merges {pr_link} once it is green, unless a person must judge it \
-                     first (merge on green)."
+                    "Owlshift merges {pr_link} once it is green, or once no check has run on it \
+                     for 10 minutes, unless a person must judge it first (merge on green)."
                 ),
             ),
             (
                 MergeSwitch::Labeled,
                 format!(
-                    "Owlshift merges {pr_link} once it is green only if the ticket carries the \
-                     label `owlshift:merge` (merge on green); otherwise review and merge it."
+                    "Owlshift merges {pr_link} once it is green, or once no check has run on it \
+                     for 10 minutes, only if the ticket carries the label `owlshift:merge` \
+                     (merge on green); otherwise review and merge it."
                 ),
             ),
         ] {
@@ -8903,6 +8916,7 @@ Reply `Q1: B`, `ok` to take every recommendation, or in your own words.
             head: CommitId::new("a".repeat(40)).unwrap(),
             method: MergeMethod::Squash,
             commit: Some(CommitId::new("c".repeat(40)).unwrap()),
+            no_checks: Some(false),
         };
         let body = merged.render();
         assert!(body.starts_with("[owlshift] MERGED\n\n"), "{body}");
@@ -8913,6 +8927,31 @@ Reply `Q1: B`, `ok` to take every recommendation, or in your own words.
         assert!(
             body.contains("by `squash`") && body.contains("`ccccccc`"),
             "{body}"
+        );
+        assert!(body.contains("its checks were green twice"), "{body}");
+        // OWL-657: a head no check ran on is said so; a merge a later read
+        // found says nothing of its checks.
+        let said = |no_checks| {
+            MergedComment {
+                no_checks,
+                ..merged.clone()
+            }
+            .render()
+        };
+        let none = said(Some(true));
+        assert!(
+            none.contains(
+                "**no check ran on this head**: none had reported on it 10 minutes after watch \
+                 first read it"
+            ) && !none.contains("green twice"),
+            "{none}"
+        );
+        let unknown = said(None);
+        assert!(
+            unknown.contains("by `squash`: nothing on the ticket was left")
+                && !unknown.contains("green twice")
+                && !unknown.contains("no check"),
+            "{unknown}"
         );
         let first = writer.post_merged(&merged).unwrap();
         // Found again after a crash, even without the merge commit, which a
@@ -10060,6 +10099,7 @@ Reply `Q1: B`, `ok` to take every recommendation, or in your own words.
             base_at_push: Some(HEAD),
             disjoint: false,
             base_checks: None,
+            ci_skipped: None,
             labeled: true,
             excluded: false,
             questions: &[],
@@ -10254,6 +10294,7 @@ Reply `Q1: B`, `ok` to take every recommendation, or in your own words.
                 head: head(),
                 method: MergeMethod::Squash,
                 commit: None,
+                no_checks: None,
             }))
         }),
         ("propose", |w, _| {

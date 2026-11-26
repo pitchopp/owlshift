@@ -149,15 +149,7 @@ impl OnDemand<'_> {
         let due = steps_due(&stored.record);
         if due.is_none()
             || state.status() != Status::Active(Stage::Watch)
-            || !matches!(
-                fresh.decision,
-                FollowDecision::Follow {
-                    adopt: false,
-                    action: FollowAction::Green
-                        | FollowAction::WaitChecks
-                        | FollowAction::WaitBaseRed,
-                }
-            )
+            || !fresh.decision.asks_no_repair()
         {
             return Err(look());
         }

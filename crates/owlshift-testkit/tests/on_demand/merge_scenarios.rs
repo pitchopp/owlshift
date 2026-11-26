@@ -77,9 +77,9 @@ fn labeled_merges_once_its_label_is_on_and_no_question_is_kept_for_a_person() {
     let report = bench.comments().into_iter().next().unwrap();
     assert!(
         report.contains(
-            "Owlshift merges [#1](https://github.com/demo/project/pull/1) once it is green only \
-             if the ticket carries the label `owlshift:merge` (merge on green); otherwise \
-             review and merge it."
+            "Owlshift merges [#1](https://github.com/demo/project/pull/1) once it is green, or \
+             once no check has run on it for 10 minutes, only if the ticket carries the label \
+             `owlshift:merge` (merge on green); otherwise review and merge it."
         ),
         "{report}"
     );
@@ -446,6 +446,122 @@ fn waits_told(bench: &Bench) -> Vec<Value> {
         .into_iter()
         .filter(|data| data["watch"] == "waits")
         .collect()
+}
+
+/// OWL-657: a pull request no check runs on, on a project under `all`:
+/// told as a wait with the end of its ten minutes, no merge before then;
+/// at their end a refusal GitHub words as one that may pass is final for
+/// it, notified once and not tried again until a person's `continue`
+/// asks; then merged, the MERGED comment, the `pr_merged` event and the
+/// line saying that no check ran.
+#[test]
+fn a_pull_request_no_check_runs_on_merges_once_none_has_run_for_ten_minutes() {
+    let bench = merging("all");
+    let pushed = bench.remote_branch().unwrap();
+    let github = bench.github.clone();
+    github.followed.lock().unwrap().no_checks = true;
+    github
+        .merge_answers
+        .lock()
+        .unwrap()
+        .push_back(MergeAnswer::Refused(
+            405,
+            "Base branch was modified. Review and try the merge again.",
+        ));
+    let clock = bench.clock.clone();
+    let waited = bench.waited.get();
+    let mut pass = 0;
+    let (_, lines, printed) = bench.watch(Vec::new(), &mut |_| {
+        pass += 1;
+        let merges = github.merges.lock().unwrap().len();
+        match pass {
+            // Passes 1 to 5, two minutes apart: within the ten minutes.
+            1..=5 => assert_eq!(merges, 0, "pass {pass}"),
+            // The refusal at pass 6, then nothing tried at pass 7.
+            7 => {
+                assert_eq!(merges, 1);
+                let mut record = bench.record();
+                record.delivery.as_mut().unwrap().merge_retry =
+                    Some(clock.get().checked_add(waited).unwrap());
+                bench.write_record(&record);
+            }
+            _ => {}
+        }
+        later(&clock);
+        pass < 8
+    });
+    let merges = github_merges(&bench);
+    let merge = json!({ "sha": pushed, "merge_method": "squash" });
+    assert_eq!(merges, [merge.clone(), merge], "{lines}\n{printed}");
+    let told: Vec<(Value, Value)> = waits_told(&bench)
+        .into_iter()
+        .map(|data| (data["reason"].clone(), data["head"].clone()))
+        .collect();
+    assert_eq!(told, [(json!("merge_no_checks"), json!(pushed))]);
+    assert!(
+        lines.contains("no check has reported on pull request #1's head yet: if none has by"),
+        "{lines}"
+    );
+    let refused: Vec<Value> = data_of(&bench.events(), EventKind::Decision, "watch")
+        .into_iter()
+        .filter(|data| data["watch"] == "merge_refused")
+        .map(|data| data["final"].clone())
+        .collect();
+    assert_eq!(refused, [json!(true)]);
+    let notified = bench.notified.0.borrow().clone();
+    assert_eq!(notified.len(), 1, "{notified:?}");
+    let merged = merged_comments(&bench);
+    assert_eq!(merged.len(), 1, "{merged:?}");
+    assert!(
+        merged[0].contains("**no check ran on this head**") && !merged[0].contains("green twice"),
+        "{}",
+        merged[0]
+    );
+    let events = merged_events(&bench);
+    assert_eq!(events.len(), 1, "{events:?}");
+    assert_eq!(
+        (&events[0]["head"], &events[0]["no_checks"]),
+        (&json!(pushed), &json!(true))
+    );
+    assert!(lines.contains("no check having run on it"), "{lines}");
+    assert_ended_merged(&bench);
+}
+
+/// OWL-657: a pull request no check runs on whose delivered commit asks CI
+/// to skip it is never merged: once its ten minutes end it is told once
+/// as waiting for a person, a `merge_waits` event of blocker `skip_ci` and
+/// one notification, and no later pass merges it.
+#[test]
+fn a_head_no_check_ran_on_whose_commit_skips_ci_is_kept_for_a_person() {
+    let bench = Bench::with(
+        "maintainer",
+        "assignee = \"maintainer\"\n",
+        "[forge]\nmerge = \"all\"\n",
+    );
+    let mut build = bench.reply(Some("Hello"), Some(DONE));
+    build.commit = Some("Add a greeting [skip ci]".to_owned());
+    let (outcome, printed) = bench.run(vec![build], None);
+    outcome.unwrap_or_else(|stop| panic!("{stop}\n{printed}"));
+    let github = bench.github.clone();
+    github.followed.lock().unwrap().no_checks = true;
+    let clock = bench.clock.clone();
+    let mut pass = 0;
+    let (_, lines, printed) = bench.watch(Vec::new(), &mut |_| {
+        pass += 1;
+        later(&clock);
+        pass < 9
+    });
+    assert!(github_merges(&bench).is_empty(), "{lines}\n{printed}");
+    assert_eq!(waits_for_a_person(&bench), [json!("skip_ci")]);
+    let notified = bench.notified.0.borrow().clone();
+    assert_eq!(notified.len(), 1, "{notified:?}");
+    assert!(
+        notified[0].contains(
+            "pull request #1 has had no check for 10 minutes and waits for a person: Owlshift \
+             will not merge it, as no check ran on its head, and a commit of it asks CI to skip it"
+        ),
+        "{notified:?}"
+    );
 }
 
 /// S18, a base that moved since the push on a path the delivery changed:

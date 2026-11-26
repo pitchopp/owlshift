@@ -94,13 +94,7 @@ impl OnDemand<'_> {
             seen: Box::new(fresh.seen(pr.number, &pr.url)),
             merge: None,
         };
-        if !matches!(
-            fresh.decision,
-            FollowDecision::Follow {
-                adopt: false,
-                action: FollowAction::Green | FollowAction::WaitChecks | FollowAction::WaitBaseRed,
-            }
-        ) {
+        if !fresh.decision.asks_no_repair() {
             return Err(look());
         }
         let comments = self.comments(&ticket)?;

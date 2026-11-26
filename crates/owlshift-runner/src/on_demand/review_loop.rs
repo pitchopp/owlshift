@@ -137,14 +137,7 @@ impl OnDemand<'_> {
             seen: Box::new(fresh.seen(pr.number, &pr.url)),
             merge: None,
         };
-        if !matches!(
-            fresh.decision,
-            FollowDecision::Follow {
-                adopt: false,
-                action: FollowAction::Green | FollowAction::WaitChecks | FollowAction::WaitBaseRed,
-            }
-        ) || state.status() != Status::Active(Stage::Watch)
-        {
+        if !fresh.decision.asks_no_repair() || state.status() != Status::Active(Stage::Watch) {
             return Err(look());
         }
         // A delivery made before OWL-307 is dated now: the reviews already
