@@ -2103,7 +2103,9 @@ impl OnDemand<'_> {
     /// and what each ticket holds from its dispatch until its pull request
     /// ends, an unreadable ref the whole repository, with the outside
     /// holders joined when `outside` is given (the caps read none), all
-    /// closed with `named`.
+    /// closed with `named`. The ticket's own open pull request is never one
+    /// of them (OWL-653): its ref, when it holds, delivered it, so it is
+    /// Owlshift's own and holds nothing against the ticket.
     fn locked_load(
         &self,
         p: &Prepared,
@@ -2155,10 +2157,15 @@ impl OnDemand<'_> {
             }
         }
         if let Some(outside) = outside {
+            // The ticket's own ref, when it holds, so that its own open pull
+            // request joins it rather than holding it back (OWL-653): its
+            // files go to an entry `in_flight` does not have, and are
+            // dropped.
+            let own = p.stored.as_ref().filter(|stored| held::holds(stored));
             let refs = others
                 .iter()
                 .map(|(ticket, read)| (ticket, read.as_ref().ok()))
-                .chain([(&p.ticket, None)]);
+                .chain([(&p.ticket, own)]);
             let holders = outside.holders(refs, &elsewhere, named);
             holders.join(&mut locked.in_flight, named);
             locked.kinds = holders.kinds;
@@ -2500,8 +2507,11 @@ impl OnDemand<'_> {
     /// `p`, or read now), under the switch at the base this command fetched
     /// ([`Self::weigh_admission`]): a conflict stops with [`Stop::Waits`] at
     /// its stage, the record still yielded, so nothing waits for it
-    /// meanwhile. Admitted, the yield's time is cleared and, its pull
-    /// request not open, its next Build's rebase made due
+    /// meanwhile. Its own open pull request is never a holder it waits for
+    /// (OWL-653): only that pull request's merge would free it, and the
+    /// merge waits for the run this admission starts. Admitted, the yield's
+    /// time is cleared and, its pull request not open, its next Build's
+    /// rebase made due
     /// ([`TicketHeld::admitted_again`]); what it shares or takes is
     /// recorded, the record kept, a `yield` = `readmitted` event emitted
     /// and its claim pushed again (OWL-586).

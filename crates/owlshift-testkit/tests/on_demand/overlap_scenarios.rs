@@ -22,11 +22,12 @@ const AGENTS_PREPENDED: &str = "Read the design first.\nSign off every commit (`
 /// `files` beside its greeting; its verify seats play from the queue when
 /// `verifying`, a clean pass first.
 fn overlapping(files: &[(&str, &str)], verifying: bool) -> Bench {
-    let bench = Bench::with(
-        "maintainer",
-        "assignee = \"maintainer\"\n",
-        "overlap = \"rebase\"\n",
-    );
+    overlapping_with(files, verifying, "overlap = \"rebase\"\n")
+}
+
+/// [`overlapping`] with the project's `policy` instead (OWL-653).
+fn overlapping_with(files: &[(&str, &str)], verifying: bool, policy: &str) -> Bench {
+    let bench = Bench::with("maintainer", "assignee = \"maintainer\"\n", policy);
     bench.verify_plays.set(verifying);
     let mut reply = bench.reply(Some("Hello"), Some(DONE));
     for (path, text) in files {
@@ -155,6 +156,110 @@ fn a_siblings_merge_on_a_shared_file_refreshes_the_pull_request() {
     assert!(read_at_head, "{report}");
     let roles: Vec<Role> = bench.briefs().iter().map(|brief| brief.role).collect();
     assert_eq!(roles.last(), Some(&Role::Rebase), "{report}");
+}
+
+/// OWL-653: DEMO-1, delivered under merge on green, holds `AGENTS.md`
+/// rather than the whole repository, which cannot yield, and its record
+/// yielded, as watch writes it after a long round; its own open pull request
+/// lists the files its branch changes, `AGENTS.md` among them. DEMO-2,
+/// merged, shared that file, and its merge moves `main`: the bench and the
+/// `main` it moved to.
+fn yielded_and_refreshed() -> (Bench, String) {
+    let bench = overlapping_with(
+        &[("AGENTS.md", AGENTS_APPENDED)],
+        false,
+        "overlap = \"rebase\"\n[forge]\nmerge = \"all\"\n",
+    );
+    let mut record = bench.record();
+    let at = bench.clock.get();
+    let mut held = TicketHeld::dispatched(at);
+    held.admit(vec!["AGENTS.md".to_owned()], Vec::new(), None, at);
+    assert!(held.yield_at(at));
+    record.held = Some(held);
+    bench.write_record(&record);
+    let changed = bench
+        .env
+        .run(
+            &bench.remote.bare,
+            &["diff", "--name-only", &format!("main...{BRANCH}")],
+        )
+        .unwrap();
+    let changed: Vec<String> = String::from_utf8(changed)
+        .unwrap()
+        .lines()
+        .map(str::to_owned)
+        .collect();
+    assert!(
+        changed.iter().any(|file| file == "AGENTS.md"),
+        "{changed:?}"
+    );
+    *bench.github.own_files.lock().unwrap() = changed;
+    merged_sibling(&bench, &["AGENTS.md"], true);
+    let main = bench.merge_into_main(&[("AGENTS.md", AGENTS_PREPENDED)]);
+    (bench, main)
+}
+
+/// Two minutes later on `bench`'s clock, so that merge on green's next
+/// green read is at least a minute after the one before.
+fn two_minutes_later(bench: &Bench) {
+    let clock = &bench.clock;
+    clock.set(
+        clock
+            .get()
+            .checked_add(SignedDuration::from_mins(2))
+            .unwrap(),
+    );
+}
+
+/// The ticket's `yield` = `readmitted` decision events.
+fn readmissions(bench: &Bench) -> Vec<Value> {
+    data_of(&bench.events(), EventKind::Decision, "yield")
+        .into_iter()
+        .filter(|data| data["yield"] == "readmitted")
+        .collect()
+}
+
+/// OWL-653, the shape seen on LOC-2200: a ticket that yielded, then
+/// delivered, its base moving on a path its overlap names, is admitted
+/// again past its own pull request, which it never waits for: its refresh
+/// rebase runs, its cause the overlap, and merge on green then merges the
+/// pull request. Before the fix, every pass stopped with "DEMO-1 waits:
+/// pull request #1 holds zone `AGENTS.md`".
+#[test]
+fn a_yielded_delivered_ticket_is_refreshed_past_its_own_pull_request_and_merges_on_green() {
+    let (bench, main) = yielded_and_refreshed();
+    let refresh = replayed_onto(&bench, main.clone());
+    let mut pass = 0;
+    let (outcomes, lines, printed) = bench.watch_during(
+        vec![bench.reply(None, Some(REBASED))],
+        vec![refresh],
+        &mut |_| {
+            pass += 1;
+            two_minutes_later(&bench);
+            pass < 6
+        },
+    );
+    let report = format!("{outcomes:?}\n{lines}\n{printed}");
+    assert!(outcomes.iter().all(Result::is_ok), "{report}");
+    assert!(!report.contains("pull request #1 holds"), "{report}");
+    let runs = rebase_runs(&bench);
+    assert_eq!(runs.len(), 1, "{runs:?}\n{report}");
+    assert_eq!(
+        (&runs[0]["cause"], &runs[0]["onto"]),
+        (&json!("overlap"), &json!(main)),
+        "{report}"
+    );
+    assert_eq!(readmissions(&bench).len(), 1, "{report}");
+    let record = bench.record();
+    assert!(!record.held.unwrap().yielded(), "{report}");
+    let delivery = record.delivery.unwrap();
+    assert_eq!(
+        delivery.ended.as_ref().map(|ended| ended.why),
+        Some(EndedWhy::Merged),
+        "{report}"
+    );
+    let merged = data_of(&bench.events(), EventKind::PrMerged, "watch");
+    assert_eq!(merged.len(), 1, "{report}");
 }
 
 /// OWL-613: DEMO-1, delivered, its own record sharing `AGENTS.md` with
