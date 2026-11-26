@@ -693,8 +693,8 @@ pub fn github_facts(
 ) -> Result<GithubFacts, StatesError> {
     let mut read = |account: &str| keychain.read(account).map_err(|error| error.to_string());
     let found = crate::secrets::forge(repo, &mut read).map_err(StatesError::Keychain)?;
-    let token =
-        crate::forge::token_at(&found, jiff::Timestamp::now()).map_err(StatesError::Keychain)?;
+    let token = crate::forge::token_at(&found, jiff::Timestamp::now())
+        .map_err(|error| StatesError::Keychain(error.into()))?;
     let issues = GitHubTracker::new(GitHubForge::new(token, repo.clone()), tracker);
     let access = issues.issues_access().map_err(StatesError::Tracker)?;
     if access != IssuesAccess::Granted {

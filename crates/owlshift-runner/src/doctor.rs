@@ -20,7 +20,7 @@
 
 pub mod render;
 
-use std::path::{MAIN_SEPARATOR, Path};
+use std::path::{MAIN_SEPARATOR, Path, PathBuf};
 
 use owlshift_adapters::forge::{ErrorKind as ForgeErrorKind, Repo};
 use owlshift_adapters::harness::{self, Login, tested};
@@ -32,7 +32,7 @@ use owlshift_contracts::config::{
     Admit, Claims, PersonalConfig, ProjectConfig, States, Takes, Tracker, TrackerKind,
 };
 use owlshift_contracts::ids::TicketId;
-use owlshift_contracts::service::BuildIdentity;
+use owlshift_contracts::service::{BY_DAEMON, BuildIdentity};
 use owlshift_contracts::{DelegationLevel, Harness};
 use owlshift_core::floor::same_account;
 use owlshift_core::gate::PassLimit;
@@ -45,14 +45,16 @@ use serde_json::Value;
 
 use crate::codex_machine::{self, Declared, FULL_ACCESS};
 use crate::config::{Effective, FileState, OWLSHIFT_VERSION, PROJECT_FILE, exit_text};
+use crate::daemon::requests;
 use crate::daemon::upgrade::{Binary, supersedes};
 use crate::executor::harness::CLAUDE_AGENT_ACCOUNT;
 use crate::executor::{
     MINIMUM_GIT_VERSION, git_floor_reason, git_install_advice, git_recheck_note,
 };
-use crate::forge::{AppGrants, GITHUB_TOKEN_HELP};
+use crate::forge::{AppGrants, GITHUB_TOKEN_HELP, sign_in_notice};
 use crate::init::TEAM_PAGE;
 use crate::install::ServiceState;
+use crate::project::ProjectDirs;
 #[cfg(test)]
 use crate::secrets::TrackerAccounts;
 use crate::secrets::{self, ForgeSecret, Source, TrackerSecrets};
@@ -296,6 +298,7 @@ pub fn run(system: &dyn System, config: &Effective, own: &BuildIdentity) -> Repo
     checks.extend(caches_check(system, config, home));
     checks.extend(run_caches_check(system, config, home));
     checks.extend(served_check(system, config));
+    checks.extend(service_pause_check(system, config));
     checks.push(file_check("personal config", &config.personal, home));
     checks.push(tracker_check(config));
     let stored = project_secrets(system, config);
@@ -303,7 +306,7 @@ pub fn run(system: &dyn System, config: &Effective, own: &BuildIdentity) -> Repo
     checks.extend(
         stored
             .as_ref()
-            .and_then(|found| forge_access_check(system, found)),
+            .and_then(|found| forge_access_check(system, config, found)),
     );
     // The GitHub App's grants, read once for the lines that need them
     // (OWL-445, OWL-513).
@@ -1453,6 +1456,82 @@ fn served_check(system: &dyn System, config: &Effective) -> Option<Check> {
     })
 }
 
+/// The folder `owlshift init` signs in to GitHub again from for the project
+/// of `repo` (OWL-650), as its watch picks it: the checkout the list of
+/// served projects registers, and `true`, when the service serves it; the
+/// project file's folder otherwise, and `false`. The `true` is the notice's
+/// last sentence: the service picks the project up again by itself.
+fn sign_in_folder(system: &dyn System, config: &Effective, repo: &Repo) -> (PathBuf, bool) {
+    let registered = system.data_dir().and_then(|(data, _)| {
+        served::Registry::in_data_dir(&data)
+            .find(repo)
+            .ok()
+            .flatten()
+    });
+    match registered {
+        Some(entry) => (PathBuf::from(entry.checkout), true),
+        None => {
+            let (FileState::Loaded { path, .. }
+            | FileState::Invalid { path, .. }
+            | FileState::Absent(path)) = &config.project
+            else {
+                return (PathBuf::from("."), false);
+            };
+            (
+                path.parent()
+                    .map_or_else(|| PathBuf::from("."), Path::to_path_buf),
+                false,
+            )
+        }
+    }
+}
+
+/// The step that signs in to GitHub again from `folder` (OWL-650).
+fn sign_in_step(folder: &Path) -> Step {
+    Step::run_noting(
+        "owlshift init",
+        &format!("in {}, the folder the reason names", folder.display()),
+    )
+}
+
+/// The pause the service wrote on this checkout's project because its watch
+/// could not start (OWL-650): the project waits for you, and its reason says
+/// what to do. A failure, since none of its tickets moves until a person
+/// acts. No line without the daemon's pause: a person's is theirs.
+fn service_pause_check(system: &dyn System, config: &Effective) -> Option<Check> {
+    const SUBJECT: &str = "service pause";
+    let (FileState::Loaded { path, .. }
+    | FileState::Invalid { path, .. }
+    | FileState::Absent(path)) = &config.project
+    else {
+        return None;
+    };
+    let repo = system.origin_repo(path.parent()?).ok()?;
+    let (data, _) = system.data_dir()?;
+    let pause = requests::pause(&ProjectDirs::new(&data, &repo))??;
+    if pause.by != BY_DAEMON {
+        return None;
+    }
+    let (folder, resumes) = sign_in_folder(system, config, &repo);
+    let fix = if pause.why == sign_in_notice(&repo, &folder, resumes) {
+        sign_in_step(&folder)
+    } else {
+        Step::act(
+            "Fix what the reason names; the service tries the project every minute and lifts \
+             its pause once its watch runs",
+        )
+    };
+    Some(Check::fail(
+        Section::Project,
+        SUBJECT,
+        pause.why,
+        "The service starts none of this project's tickets while it waits. Once the reason \
+         is fixed, it tries the project again within a minute, and lifts the pause once that \
+         watch has run a minute more.",
+        vec![fix],
+    ))
+}
+
 /// The configured tracker's adapter and the capabilities it declares
 /// (architecture section 6). A required capability this build does not
 /// implement yet is a warning, not a failure: `owlshift do` needs only to
@@ -2241,6 +2320,7 @@ fn project_secrets(
 /// unresolved or no token is stored: the `secrets` line says so.
 fn forge_access_check(
     system: &dyn System,
+    config: &Effective,
     found: &Result<ProjectSecrets, Unresolved>,
 ) -> Option<Check> {
     const SUBJECT: &str = "forge access";
@@ -2271,6 +2351,18 @@ fn forge_access_check(
             vec![Step::act(fix)],
         ))
     };
+    // A token only a new sign-in mends names the notice the service shows,
+    // its folder and its command (OWL-650), never the keychain.
+    let sign_in = |found: &str| {
+        let (folder, resumes) = sign_in_folder(system, config, repo);
+        Some(Check::fail(
+            Section::Project,
+            SUBJECT,
+            sign_in_notice(repo, &folder, resumes),
+            &format!("{why} What doctor found: {found}."),
+            vec![sign_in_step(&folder)],
+        ))
+    };
     match system.github_default_branch(repo) {
         Ok(DefaultBranch::Readable(branch)) => Some(Check::ok(
             Section::Project,
@@ -2298,6 +2390,30 @@ fn forge_access_check(
         Err(TokenTryError::Credential(reason)) => {
             fail(format!("not checked: {reason}"), KEYCHAIN_FIX.to_owned())
         }
+        Err(TokenTryError::SignIn(found)) => sign_in(&found),
+        // The refresh doctor does not make would renew it (GA4): the same
+        // command does, from the same folder.
+        Err(TokenTryError::Expired(found)) => {
+            let (folder, _) = sign_in_folder(system, config, repo);
+            Some(Check::fail(
+                Section::Project,
+                SUBJECT,
+                format!(
+                    "not checked: the GitHub App's token for {repo} is past its expiry, and \
+                     doctor does not renew it"
+                ),
+                &format!("{why} What doctor found: {found}."),
+                vec![Step::run_noting(
+                    "owlshift init",
+                    &format!(
+                        "in {}: it renews the token, or shows a code to enter on github.com \
+                         when GitHub refuses it, and keeps your owlshift.toml, your other stored \
+                         keys and your tickets",
+                        folder.display()
+                    ),
+                )],
+            ))
+        }
         Err(TokenTryError::Forge(error)) => match error.kind {
             ForgeErrorKind::Unauthorized => fail(
                 format!("GitHub refused {place}: {error}"),
@@ -2306,11 +2422,8 @@ fn forge_access_check(
                      {GITHUB_TOKEN_HELP}"
                 ),
             ),
-            // The refresh-failure rule (OWL-384): its error names the fix.
-            ForgeErrorKind::SignInAgain => fail(
-                format!("GitHub refused {place}: {error}"),
-                "Run `owlshift init` in a terminal to sign in again.".to_owned(),
-            ),
+            // The refresh-failure rule (OWL-384, OWL-650).
+            ForgeErrorKind::SignInAgain => sign_in(&error.to_string()),
             ForgeErrorKind::NotFound => fail(
                 format!("{place} does not see github.com/{repo}: {error}"),
                 format!(
@@ -2413,6 +2526,18 @@ fn merge_permission_check(
         Err(TokenTryError::Credential(reason)) => {
             Check::info(Section::Project, SUBJECT, format!("not checked: {reason}"))
         }
+        Err(TokenTryError::SignIn(_)) => Check::info(
+            Section::Project,
+            SUBJECT,
+            "not checked: the GitHub App's token needs a new sign-in; the forge access line \
+             says how",
+        ),
+        Err(TokenTryError::Expired(_)) => Check::info(
+            Section::Project,
+            SUBJECT,
+            "not checked: the GitHub App's token is past its expiry; the forge access line \
+             says how",
+        ),
         Err(TokenTryError::Forge(error)) => Check::warn(
             Section::Project,
             SUBJECT,
@@ -2522,6 +2647,18 @@ fn rerun_permission_check(
         Err(TokenTryError::Credential(reason)) => {
             Check::info(Section::Project, SUBJECT, format!("not checked: {reason}"))
         }
+        Err(TokenTryError::SignIn(_)) => Check::info(
+            Section::Project,
+            SUBJECT,
+            "not checked: the GitHub App's token needs a new sign-in; the forge access line \
+             says how",
+        ),
+        Err(TokenTryError::Expired(_)) => Check::info(
+            Section::Project,
+            SUBJECT,
+            "not checked: the GitHub App's token is past its expiry; the forge access line \
+             says how",
+        ),
         Err(TokenTryError::Forge(error)) => Check::warn(
             Section::Project,
             SUBJECT,
@@ -6172,6 +6309,171 @@ states = { ready = "Todo", working = "Doing", needs_input = "Asked", review = "R
             "github.com/pitchopp/owlshift (service `owlshift`): GitHub token under \
              `github.com/pitchopp/owlshift/github`"
         );
+    }
+
+    /// OWL-650: the daemon's pause on this checkout's project fails a
+    /// `service pause` line with its reason whole; a sign-in notice for the
+    /// registered checkout gets the command and its folder, any other reason
+    /// a step to do. A person's pause, or none, gives no line.
+    #[test]
+    fn the_daemons_pause_says_what_to_do() {
+        use jiff::Timestamp;
+        use owlshift_contracts::service::{BY_PAUSE, Request};
+
+        let data = tempfile::tempdir().unwrap();
+        let system = FakeSystem::default()
+            .data_dir_is(Some((data.path().to_owned(), DataDirSource::Platform)));
+        let config = Effective {
+            project: FileState::Absent(PathBuf::from("/home/ada/p/owlshift.toml")),
+            personal: FileState::NotApplicable("none".to_owned()),
+        };
+        let repo = Repo::parse("pitchopp/owlshift").unwrap();
+        let checkout = data.path().join("my checkout");
+        served::Registry::in_data_dir(data.path())
+            .register(&repo, &checkout)
+            .unwrap();
+        let dirs = ProjectDirs::new(data.path(), &repo);
+        assert_eq!(service_pause_check(&system, &config), None);
+
+        let pause = |by: &str, why: &str| {
+            requests::remove_own_pause(&dirs).unwrap();
+            let _ = std::fs::remove_file(requests::pause_file(&dirs));
+            requests::write_pause(&dirs, &Request::new(by, Timestamp::now(), why)).unwrap();
+            service_pause_check(&system, &config)
+        };
+        let notice = sign_in_notice(&repo, &checkout, true);
+        let check = pause(BY_DAEMON, &notice).unwrap();
+        assert_eq!(check.status, Status::Fail);
+        assert_eq!(check.detail, notice);
+        assert_eq!(check.fix, [sign_in_step(&checkout)]);
+        let Step::Run { command, note } = &check.fix[0] else {
+            panic!("{check:?}");
+        };
+        assert_eq!(command, "owlshift init");
+        assert!(
+            note.as_deref()
+                .unwrap()
+                .contains(&checkout.display().to_string()),
+            "{note:?}"
+        );
+        assert_well_formed(&check);
+
+        let check = pause(BY_DAEMON, "the keychain refused").unwrap();
+        assert_eq!(check.detail, "the keychain refused");
+        assert!(matches!(&check.fix[..], [Step::Do(_)]), "{check:?}");
+        assert_well_formed(&check);
+
+        assert_eq!(pause(BY_PAUSE, "lunch"), None);
+    }
+
+    /// OWL-650: doctor's forge access line, for a GitHub App token only a
+    /// new sign-in mends, gives the notice the service shows, for the
+    /// registered checkout or else the project file's folder, and the
+    /// command from there; an access token past its expiry names the same
+    /// command. Neither gives the keychain's fix.
+    #[test]
+    fn a_needed_sign_in_names_the_notice_and_its_folder() {
+        let ready = || logged_in(with_harnesses(with_git(FakeSystem::default())));
+        let (dir, owl) = markdown_project();
+        let folder = match &owl.project {
+            FileState::Loaded { path, .. } => path.parent().unwrap().to_owned(),
+            other => panic!("{other:?}"),
+        };
+        let repo = Repo::parse("pitchopp/owlshift").unwrap();
+        let technical =
+            crate::forge::sign_in_again("github.com/pitchopp/owlshift/github-app", "does not read");
+        let access = |system: &FakeSystem| {
+            let report = run(system, &owl);
+            (line(&report, "forge access").clone(), report.ready())
+        };
+        let no_keychain_fix = |check: &Check| {
+            for step in &check.fix {
+                let (Step::Run { command: text, .. } | Step::Do(text)) = step;
+                assert!(!text.contains(KEYCHAIN_FIX), "{check:?}");
+            }
+        };
+
+        // Served: the registered checkout, and the notice's last sentence.
+        let data = tempfile::tempdir().unwrap();
+        let checkout = dir.path().join("registered");
+        served::Registry::in_data_dir(data.path())
+            .register(&repo, &checkout)
+            .unwrap();
+        let served =
+            || ready().data_dir_is(Some((data.path().to_owned(), DataDirSource::Platform)));
+        for answer in [
+            Err(TokenTryError::SignIn(technical.clone())),
+            Err(TokenTryError::Forge(owlshift_adapters::forge::Error::new(
+                ForgeErrorKind::SignInAgain,
+                technical.clone(),
+            ))),
+        ] {
+            let (check, ready_to_run) = access(&served().github_default_branch_is(answer));
+            assert_eq!(check.status, Status::Fail, "{check:?}");
+            assert!(!ready_to_run);
+            assert_eq!(check.detail, sign_in_notice(&repo, &checkout, true));
+            assert_eq!(check.fix, [sign_in_step(&checkout)]);
+            let why = check.why.as_deref().unwrap();
+            assert!(
+                why.contains(&format!("What doctor found: {technical}.")),
+                "{why}"
+            );
+            no_keychain_fix(&check);
+        }
+
+        // Not served: the project file's folder, without the service's
+        // sentence.
+        let (check, _) =
+            access(&ready().github_default_branch_is(Err(TokenTryError::SignIn(technical))));
+        assert_eq!(check.detail, sign_in_notice(&repo, &folder, false));
+        assert!(!check.detail.contains("within a minute"), "{check:?}");
+        assert_eq!(check.fix, [sign_in_step(&folder)]);
+
+        // Past its expiry: the same command, in plain words.
+        let expired =
+            crate::forge::sign_in_again("github.com/pitchopp/owlshift/github-app", "has expired");
+        let (check, ready_to_run) =
+            access(&ready().github_default_branch_is(Err(TokenTryError::Expired(expired))));
+        assert_eq!(check.status, Status::Fail, "{check:?}");
+        assert!(!ready_to_run);
+        assert!(check.detail.contains("past its expiry"), "{check:?}");
+        let [Step::Run { command, note }] = &check.fix[..] else {
+            panic!("{check:?}");
+        };
+        assert_eq!(command, "owlshift init");
+        let note = note.as_deref().unwrap();
+        assert!(note.contains(&folder.display().to_string()), "{note}");
+        assert!(note.contains("keeps your owlshift.toml"), "{note}");
+        no_keychain_fix(&check);
+    }
+
+    /// OWL-650: the lines that read the app's grants point at the forge
+    /// access line for a token that needs a new sign-in or is past its
+    /// expiry, without its technical words.
+    #[test]
+    fn the_grants_lines_point_at_the_forge_access_line() {
+        let system = || logged_in(with_harnesses(with_git(FakeSystem::default())));
+        let tracker = r#"kind = "markdown"
+admit = "delegation"
+states = { ready = "Todo", working = "Doing", needs_input = "Asked", review = "Review" }"#;
+        let (_dir, all) = project_tracked_by(&format!("{tracker}\n[forge]\nmerge = \"all\""));
+        for (error, says) in [
+            (
+                TokenTryError::SignIn("SENTINEL".to_owned()),
+                "not checked: the GitHub App's token needs a new sign-in; the forge access line \
+                 says how",
+            ),
+            (
+                TokenTryError::Expired("SENTINEL".to_owned()),
+                "not checked: the GitHub App's token is past its expiry; the forge access line \
+                 says how",
+            ),
+        ] {
+            let report = run(&system().github_app_grants_are(Err(error)), &all);
+            let found = line(&report, "merge on green");
+            assert_eq!(found.status, Status::Info, "{found:?}");
+            assert_eq!(found.detail, says);
+        }
     }
 
     /// OWL-434: doctor names the file the service runs a served project on,

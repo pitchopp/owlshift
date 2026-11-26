@@ -30,7 +30,8 @@
 //! one step, `sleep 600` in a tree of its own, and writes its pid and the
 //! step's to `<data>/bench/<owner>-<repo>/<pid>`. It ends with the exit code
 //! the file `exit` there holds, saying why on its standard error, when that
-//! file stands; otherwise it ends, its step stopped, once its project's stop
+//! file stands: the text of the file `why` there when it stands, that it
+//! cannot be served on the bench otherwise; otherwise it ends, its step stopped, once its project's stop
 //! file stands (removing it) or a stop is asked of it, unless the file
 //! `hang` stands, when only its bound ends it. While the file `linger`
 //! stands, a drain on its stop file waits, as for a step under way, until
@@ -396,7 +397,10 @@ fn run_watch(data: &Path, repo: &Repo) -> ExitCode {
     let bench = bench_dir(data, repo);
     fs::create_dir_all(&bench).unwrap();
     if let Ok(code) = fs::read_to_string(bench.join("exit")) {
-        eprintln!("owlshift: {repo} cannot be served on the bench");
+        let why = fs::read_to_string(bench.join("why"))
+            .map(|why| why.trim().to_owned())
+            .unwrap_or_else(|_| format!("{repo} cannot be served on the bench"));
+        eprintln!("owlshift: {why}");
         return ExitCode::from(code.trim().parse::<u8>().unwrap());
     }
     let mut sleep = Command::new("sleep");

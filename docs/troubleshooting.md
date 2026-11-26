@@ -174,7 +174,7 @@ owlshift resume
 owlshift resume acme/web
 ```
 
-`owlshift resume` lifts the machine's pause, the one `owlshift pause` with no project sets; `owlshift resume acme/web` lifts that project's own. Each lifts only its own: run the one that `status` names. The service pauses a project itself when its watch cannot start (`; the daemon tries it again at each of its passes`), and `owlshift status` then says why.
+`owlshift resume` lifts the machine's pause, the one `owlshift pause` with no project sets; `owlshift resume acme/web` lifts that project's own. Each lifts only its own: run the one that `status` names. The service pauses a project itself when its watch cannot start: `owlshift status` then shows it as `waiting for you`, with a reason that says what to do, and the service lifts that pause by itself once its watch starts again.
 
 **Quarantined.** A run whose isolation check did not pass leaves a marker, and every command refuses the project until a person has looked at what the run changed. A desktop notification says `<project> is quarantined: run <run> of <ticket> broke isolation (<what>). No ticket of the project runs until a person clears it with owlshift unquarantine`, or `<project> is quarantined: a run's isolation check did not pass or did not finish. ...`; without a desktop session, `owlshift status` and `owlshift doctor` show it. Each held ticket gets a comment (`Your answer counts, but Owlshift continues no ticket of this project for now`, `This ticket is ready, but Owlshift builds no ticket of this project for now`, or `This ticket's work has started, but Owlshift runs no ticket of this project for now`) that says it goes on by itself once the quarantine is cleared. In the project's repository, on the machine that ran it:
 

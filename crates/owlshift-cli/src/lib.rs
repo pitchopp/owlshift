@@ -71,9 +71,11 @@ enum Command {
     /// Read the configuration.
     #[command(subcommand)]
     Config(ConfigCommand),
-    /// Write a commented owlshift.toml for this repository, then store its
-    /// tracker and forge secrets and the agent runs' Claude Code token
-    /// `owlshift do` needs in the system keychain.
+    /// Write a commented owlshift.toml for this repository, or keep the one
+    /// it has, then store its tracker and forge secrets and the agent runs'
+    /// Claude Code token `owlshift do` needs in the system keychain, keeping
+    /// those already stored, and sign in to GitHub again when its token no
+    /// longer works.
     Init(init_cmd::Args),
     /// Run one ticket to a verified pull request, in the foreground. Its
     /// questions are posted on the ticket.

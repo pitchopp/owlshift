@@ -1,6 +1,11 @@
 //! The daemon's loop: a pass every [`Timing::pass`](super::Timing) reads the
 //! served projects, and a look every tick polls the watches and the web UI,
 //! the stop asked and the starts due.
+//!
+//! A project the daemon paused waits for you (OWL-650): its pause is said
+//! once and notified once, and its watch is tried again quietly at each
+//! pass, its lines held, so daemon.log grows only when something changes: a
+//! new reason, another end, or the pause lifted.
 
 use std::io::{self, Write};
 use std::net::TcpListener;
@@ -606,15 +611,21 @@ impl Daemon<'_> {
         }
         let command = (self.watch)(&slot.repo);
         match Supervised::start(command, &slot.repo.to_string(), AtCheckedStop::Told) {
-            Ok(child) => {
+            Ok(mut child) => {
                 let pid = child.pid();
-                slot.child = Some(child);
                 slot.due = None;
                 slot.lift_at = slot.paused.as_ref().map(|_| now + self.timing.pass);
-                say(
-                    out,
-                    &format!("Started the watch of {} (pid {pid}).", slot.repo),
-                );
+                // A paused project's retry is quiet (OWL-650): its lines
+                // are held until its end or its pause's lift says them.
+                if slot.paused.is_some() {
+                    child.hold();
+                } else {
+                    say(
+                        out,
+                        &format!("Started the watch of {} (pid {pid}).", slot.repo),
+                    );
+                }
+                slot.child = Some(child);
                 self.event(
                     &slot.repo,
                     EventKind::Decision,
@@ -630,8 +641,10 @@ impl Daemon<'_> {
         }
     }
 
-    /// Acts on the end of `slot`'s watch.
-    fn ended(&self, slot: &mut Slot, ended: ChildEnded, stopping: bool, out: &mut dyn Write) {
+    /// Acts on the end of `slot`'s watch. The lines of a quiet retry are
+    /// dropped when it ends unservable for the reason its pause already
+    /// says, and printed first otherwise.
+    fn ended(&self, slot: &mut Slot, mut ended: ChildEnded, stopping: bool, out: &mut dyn Write) {
         let asked = slot.stop_written || stopping;
         self.remove_own_stop(slot, out);
         slot.lift_at = None;
@@ -640,6 +653,7 @@ impl Daemon<'_> {
             Err(error) => error.clone(),
         };
         if asked {
+            ended.write_held(out);
             say(
                 out,
                 &format!("The watch of {} ended ({end}), as asked.", slot.repo),
@@ -663,6 +677,9 @@ impl Daemon<'_> {
                 .as_deref()
                 .map(|line| line.strip_prefix("owlshift: ").unwrap_or(line).to_owned())
                 .unwrap_or_else(|| "its watch could not start".to_owned());
+            if slot.paused.as_deref() != Some(reason.as_str()) {
+                ended.write_held(out);
+            }
             // Recorded, so `owlshift status` never reads the watch as
             // running (OWL-438).
             self.event(
@@ -678,6 +695,7 @@ impl Daemon<'_> {
             self.pause(slot, &reason, out);
             return;
         }
+        ended.write_held(out);
         let end = match &ended.last_error {
             Some(line) if code != Some(0) => format!("{end}: {line}"),
             _ => end,
@@ -887,20 +905,36 @@ impl Daemon<'_> {
     }
 
     /// Pauses `slot`'s project, whose watch could not start for `reason`,
-    /// which no restart mends: its pause file written unless one stands,
-    /// the operator told once, tried again at each pass.
+    /// which no restart mends: it waits for you (OWL-650). Its pause file is
+    /// written unless one stands, and the daemon's own is written again
+    /// when the reason changed, so every place that shows it gives the
+    /// latest; the pause is said when it starts or its reason changes, the
+    /// operator notified once, and the project tried again quietly at each
+    /// pass.
     fn pause(&self, slot: &mut Slot, reason: &str, out: &mut dyn Write) {
         let first = slot.paused.is_none();
+        let changed = slot.paused.as_deref() != Some(reason);
         slot.paused = Some(reason.to_owned());
         slot.due = None;
         let standing = requests::pause(&slot.dirs);
         let own = matches!(&standing, Some(Some(request)) if request.by == BY_DAEMON);
-        if standing.is_none()
-            && let Err(error) = requests::write_pause(
+        let stale = matches!(&standing, Some(Some(request)) if request.by == BY_DAEMON && request.why != reason);
+        let written = if stale {
+            requests::remove_own_pause(&slot.dirs).and_then(|_| {
+                requests::write_pause(
+                    &slot.dirs,
+                    &Request::new(BY_DAEMON, Timestamp::now(), reason),
+                )
+            })
+        } else if standing.is_none() {
+            requests::write_pause(
                 &slot.dirs,
                 &Request::new(BY_DAEMON, Timestamp::now(), reason),
             )
-        {
+        } else {
+            Ok(false)
+        };
+        if let Err(error) = written {
             say(
                 out,
                 &format!(
@@ -909,31 +943,32 @@ impl Daemon<'_> {
                 ),
             );
         }
-        say(
-            out,
-            &format!(
-                "Paused {}: {reason}. Tried again every {} seconds.",
-                slot.repo,
-                self.timing.pass.as_secs()
-            ),
-        );
+        if changed {
+            say(
+                out,
+                &format!(
+                    "Paused {}, waiting for you: {}.",
+                    slot.repo,
+                    reason.strip_suffix('.').unwrap_or(reason)
+                ),
+            );
+        }
         if first && !own {
             self.tell(
                 &slot.repo,
-                &format!(
-                    "{} is paused: {reason}. Owlshift tries it again every {} seconds.",
-                    slot.repo,
-                    self.timing.pass.as_secs()
-                ),
+                &format!("{} waits for you: {reason}", slot.repo),
                 data([("what", json!("project_paused")), ("reason", json!(reason))]),
             );
         }
     }
 
     /// Lifts `slot`'s pause: a watch started while it stood paused still
-    /// runs a pass later.
+    /// runs a pass later. What that watch held is said first.
     fn lift(&self, slot: &mut Slot, out: &mut dyn Write) {
         slot.lift_at = None;
+        if let Some(child) = &mut slot.child {
+            child.release(out);
+        }
         if slot.paused.take().is_none() {
             return;
         }

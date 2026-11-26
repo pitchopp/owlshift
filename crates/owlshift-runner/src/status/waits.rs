@@ -31,7 +31,7 @@ use owlshift_contracts::format::Format;
 use owlshift_contracts::ids::TicketId;
 use owlshift_contracts::ready::ReadySnapshot;
 use owlshift_contracts::result::Question;
-use owlshift_contracts::service::Request;
+use owlshift_contracts::service::{BY_DAEMON, Request};
 use owlshift_contracts::waits::{
     Behind, HeldRun, Paused, ProjectWaits, RefStatus, RunSlots, StatusWaits, TicketWaits, Wait,
     WaitResource,
@@ -818,12 +818,29 @@ fn render_project(
         project.in_flight,
         if project.served { "" } else { ", not served" }
     );
-    if let Some(paused) = &project.paused {
-        let _ = writeln!(
-            out,
-            "  paused {}: nothing is dispatched and no step starts",
-            asked(paused, tz)
-        );
+    match &project.paused {
+        // The daemon's pause waits for you, its reason saying what to do
+        // (OWL-650).
+        Some(Paused {
+            by: Some(by),
+            at: Some(at),
+            why: Some(why),
+            ..
+        }) if by == BY_DAEMON => {
+            let _ = writeln!(
+                out,
+                "  waiting for you since {}, so nothing is dispatched and no step starts: {why}",
+                super::time(*at, tz)
+            );
+        }
+        Some(paused) => {
+            let _ = writeln!(
+                out,
+                "  paused {}: nothing is dispatched and no step starts",
+                asked(paused, tz)
+            );
+        }
+        None => {}
     }
     if project.quarantined {
         let _ = writeln!(
@@ -1353,6 +1370,21 @@ mod tests {
              (`policy.max_in_flight`), not served\n",
         );
         has("  paused by owlshift pause at 2026-10-28 08:00: lunch: nothing is dispatched");
+        // OWL-650: the daemon's pause waits for you.
+        let mut daemons = built.clone();
+        daemons.projects[0].paused = Some(Paused {
+            by: Some(BY_DAEMON.to_owned()),
+            ..daemons.projects[0].paused.clone().unwrap()
+        });
+        let theirs = render(&daemons, &TimeZone::UTC);
+        assert!(
+            theirs.contains(
+                "  waiting for you since 2026-10-28 08:00, so nothing is dispatched and no step \
+                 starts: lunch\n"
+            ),
+            "{theirs}"
+        );
+        assert!(!theirs.contains("paused by"), "{theirs}");
         has("  quarantined: every command refuses the project");
         has(
             "    pull request #12\n      DEMO-1 [not dispatched]: pull request #12 holds resource \

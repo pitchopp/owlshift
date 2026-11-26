@@ -5,7 +5,7 @@
 //! (architecture section 8). Pushing uses the user's own git credentials,
 //! as in their terminal.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use jiff::Timestamp;
@@ -14,6 +14,7 @@ use owlshift_adapters::forge::github_app::{self, DeviceFlow, HttpLogin, UserToke
 use owlshift_adapters::forge::{DefaultBranch, Error, ErrorKind, Repo};
 use owlshift_contracts::config::PersonalConfig;
 use owlshift_platform::keychain::{Keychain, SERVICE, Secret};
+use owlshift_platform::service::sh_quote;
 
 use crate::github_token::AppToken;
 use crate::refusal::Refusal;
@@ -132,42 +133,88 @@ pub fn github(
 /// The refusal of a GitHub App token that could not be had: waiting for the
 /// network when GitHub gave no answer at all (OWL-479), passing when it
 /// answered with an error a retry may clear or its budget is spent, lasting
-/// otherwise.
+/// otherwise; lasting until a new sign-in when GitHub refused the token or
+/// its entry no longer reads (OWL-650), which its command words with
+/// [`sign_in_notice`] through [`Refusal::in_checkout`].
 fn refusal(error: Error) -> Refusal {
     match error.kind {
         ErrorKind::Unreachable => Refusal::unreachable(error.message),
         ErrorKind::Other | ErrorKind::RateLimited => Refusal::passing(error.message),
+        ErrorKind::SignInAgain => Refusal::sign_in_to_github(error.message),
         _ => error.message.into(),
     }
 }
 
-/// The token sent for `found` at the instant `now`, without the refresh:
-/// a GitHub App token past its stored expiry is refused, naming `owlshift
-/// init`. Only doctor's forge probes read it ([`default_branch`], and the
-/// GitHub Issues facts, OWL-537), until GA4 puts them on the Writer's refresh.
-pub(crate) fn token_at(found: &ForgeSecret<Secret>, now: Timestamp) -> Result<Token, String> {
+/// The token sent for `found` at the instant `now`, without the refresh.
+/// Only doctor's forge probes read it ([`default_branch`], and the GitHub
+/// Issues facts, OWL-537), until GA4 puts them on the Writer's refresh, so
+/// it tells a GitHub App token only a new sign-in mends
+/// ([`TokenTryError::SignIn`]: its entry does not read, or its access token
+/// expired with no refresh token alive) from one the refresh it does not
+/// make would renew ([`TokenTryError::Expired`], OWL-650).
+pub(crate) fn token_at(
+    found: &ForgeSecret<Secret>,
+    now: Timestamp,
+) -> Result<Token, TokenTryError> {
     let account = &found.account.token;
     match (&found.token, found.account.kind) {
         (Some(entry), ForgeKind::App) => {
             let token = UserToken::from_entry(entry.expose())
-                .map_err(|_| sign_in_again(account, "does not read"))?;
+                .map_err(|_| TokenTryError::SignIn(sign_in_again(account, "does not read")))?;
             if token.expired(now) {
-                return Err(sign_in_again(account, "has expired"));
+                if token.refresh().is_none() {
+                    return Err(TokenTryError::SignIn(sign_in_again(
+                        account,
+                        "has expired and holds no refresh token",
+                    )));
+                }
+                if token.refresh_expires_at().is_some_and(|at| now >= at) {
+                    return Err(TokenTryError::SignIn(sign_in_again(
+                        account,
+                        "has a refresh token past its life",
+                    )));
+                }
+                return Err(TokenTryError::Expired(sign_in_again(
+                    account,
+                    "has expired",
+                )));
             }
             Ok(Token::new(token.access()))
         }
         (Some(token), ForgeKind::Personal) => Ok(Token::new(token.expose())),
-        (None, _) => Err(no_token(found)),
+        (None, _) => Err(TokenTryError::Credential(no_token(found))),
     }
 }
 
-/// The words of the refresh-failure rule (architecture section 8) for the
-/// app token under `account`, which `what` happened to.
+/// The technical words of the refresh-failure rule (architecture section 8)
+/// for the app token under `account`, which `what` happened to: they name
+/// the keychain entry, for daemon.log and the terminal, on the line before
+/// the [`sign_in_notice`] a person reads (OWL-650).
 pub(crate) fn sign_in_again(account: &str, what: &str) -> String {
     format!(
         "the GitHub App's token under service `{SERVICE}`, account `{account}`, {what}: run \
          `owlshift init` in a terminal to sign in again"
     )
+}
+
+/// What a person reads when only a new sign-in to GitHub lets the project
+/// of `repo` move again (OWL-650): what happened, what it stops, the command
+/// and the folder to run it in, `checkout` shell-quoted, and what it keeps.
+/// `owlshift init` keeps an existing project file and the secrets already
+/// stored, and signs in again when the stored app token no longer works.
+/// When `resumes`, the daemon tries the project again by itself, and the
+/// notice says so; a command typed in a terminal does not.
+pub fn sign_in_notice(repo: &Repo, checkout: &Path, resumes: bool) -> String {
+    let mut notice = format!(
+        "Owlshift can no longer reach GitHub for {repo}, so none of its tickets move. Sign in \
+         again: `cd {}` then `owlshift init`. It shows a code to enter on github.com; your \
+         owlshift.toml, your other stored keys and your tickets are kept.",
+        sh_quote(&checkout.display().to_string())
+    );
+    if resumes {
+        notice.push_str(" Owlshift picks the project up again within a minute.");
+    }
+    notice
 }
 
 fn no_token(found: &ForgeSecret<Secret>) -> String {
@@ -185,8 +232,35 @@ pub enum TokenTryError {
     /// The keychain could not be read, or holds no token, in Owlshift's
     /// words.
     Credential(String),
+    /// The GitHub App's token only a new sign-in mends (OWL-650): its entry
+    /// does not read, or its access token expired with no refresh token
+    /// alive. Its technical words, which name the keychain entry.
+    SignIn(String),
+    /// The GitHub App's access token is past its stored expiry and its
+    /// refresh token alive: the refresh, which doctor does not make, would
+    /// renew it (OWL-650). Its technical words, which name the keychain
+    /// entry.
+    Expired(String),
     /// GitHub's answer, or no answer.
     Forge(Error),
+}
+
+impl std::fmt::Display for TokenTryError {
+    /// Its words: Owlshift's, or GitHub's.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Credential(words) | Self::SignIn(words) | Self::Expired(words) => {
+                f.write_str(words)
+            }
+            Self::Forge(error) => write!(f, "{error}"),
+        }
+    }
+}
+
+impl From<TokenTryError> for String {
+    fn from(error: TokenTryError) -> Self {
+        error.to_string()
+    }
 }
 
 /// What the GitHub token of the project of `repo`, resolved and read from
@@ -195,7 +269,7 @@ pub enum TokenTryError {
 pub fn default_branch(keychain: &Keychain, repo: &Repo) -> Result<DefaultBranch, TokenTryError> {
     let mut read = |account: &str| keychain.read(account).map_err(|error| error.to_string());
     let found = secrets::forge(repo, &mut read).map_err(TokenTryError::Credential)?;
-    let token = token_at(&found, Timestamp::now()).map_err(TokenTryError::Credential)?;
+    let token = token_at(&found, Timestamp::now())?;
     GitHubForge::new(token, repo.clone())
         .default_branch()
         .map_err(TokenTryError::Forge)
@@ -234,7 +308,7 @@ pub fn app_grants(
     if found.account.kind == ForgeKind::Personal {
         return Ok(AppGrants::PersonalToken);
     }
-    let token = token_at(&found, Timestamp::now()).map_err(TokenTryError::Credential)?;
+    let token = token_at(&found, Timestamp::now())?;
     let installation = GitHubForge::new(token, repo.clone())
         .app_installation(slug)
         .map_err(TokenTryError::Forge)?;
@@ -338,18 +412,22 @@ mod tests {
     }
 
     /// The doctor probe's read, until GA4: an app entry gives its access
-    /// token until its stored expiry; one expired or unreadable names
-    /// `owlshift init`, never repeats the entry.
+    /// token until its stored expiry. Past it, only a new sign-in mends an
+    /// entry that does not read or whose refresh token is past its life, or
+    /// gone; one whose refresh token is alive, or has no stored life, would
+    /// be renewed by the refresh doctor does not make (OWL-650). Each names
+    /// its keychain entry and never repeats it.
     #[test]
     fn the_probes_token_is_sent_until_its_expiry_and_never_replaced() {
         let repo = Repo::parse("pitchopp/owlshift").unwrap();
         let now = Timestamp::from_second(1_760_000_000).unwrap();
-        let entry = |expires_at: i64| {
+        let at = |second: i64| Timestamp::from_second(second).unwrap();
+        let entry = |expires_at: i64, refresh: Option<&str>, refresh_expires_at: Option<i64>| {
             UserToken::new(
                 "ghu_SENTINEL",
-                Some("ghr_SENTINEL".to_owned()),
-                Some(Timestamp::from_second(expires_at).unwrap()),
-                None,
+                refresh.map(str::to_owned),
+                Some(at(expires_at)),
+                refresh_expires_at.map(at),
             )
             .to_entry()
         };
@@ -357,23 +435,47 @@ mod tests {
             account: ForgeAccount::project_app(&repo),
             token: Some(Secret::new(entry)),
         };
+        let past = now.as_second();
+        let ahead = now.as_second() + 1;
+        let refresh = Some("ghr_SENTINEL");
 
-        let live = found(entry(now.as_second() + 1));
+        let live = found(entry(ahead, refresh, Some(past)));
         assert_eq!(token_at(&live, now).unwrap(), Token::new("ghu_SENTINEL"));
 
-        for (dead, what) in [
-            (found(entry(now.as_second())), "has expired"),
-            (found("ghu_SENTINEL".to_owned()), "does not read"),
+        for (dead, what, sign_in) in [
+            (found("ghu_SENTINEL".to_owned()), "does not read", true),
+            (
+                found(entry(past, refresh, Some(past))),
+                "has a refresh token past its life",
+                true,
+            ),
+            (
+                found(entry(past, None, None)),
+                "has expired and holds no refresh token",
+                true,
+            ),
+            (
+                found(entry(past, refresh, Some(ahead))),
+                "has expired",
+                false,
+            ),
+            (found(entry(past, refresh, None)), "has expired", false),
         ] {
             let error = token_at(&dead, now).unwrap_err();
+            let words = match (&error, sign_in) {
+                (TokenTryError::SignIn(words), true) | (TokenTryError::Expired(words), false) => {
+                    words
+                }
+                _ => panic!("{what}: {error:?}"),
+            };
             assert!(
-                error.contains(&format!(
-                    "account `github.com/pitchopp/owlshift/github-app`, {what}"
+                words.contains(&format!(
+                    "account `github.com/pitchopp/owlshift/github-app`, {what}:"
                 )),
-                "{error}"
+                "{words}"
             );
-            assert!(error.contains("`owlshift init`"), "{error}");
-            assert!(!error.contains("SENTINEL"), "{error}");
+            assert!(words.contains("`owlshift init`"), "{words}");
+            assert!(!words.contains("SENTINEL"), "{words}");
         }
     }
 
@@ -406,6 +508,61 @@ mod tests {
             GitHubApp::from_personal(Some(&slug_only)).client_id,
             "Iv23li5EhBqiuljIPbiK"
         );
+    }
+
+    /// OWL-650: the notice names the repository, the folder quoted for a
+    /// shell, the command and what it keeps; only the daemon's watch adds
+    /// that the project is picked up again.
+    #[test]
+    fn the_sign_in_notice_names_the_folder_quoted_and_what_is_kept() {
+        let repo = Repo::parse("acme/web").unwrap();
+        let folder = Path::new("/Users/ada/My Projects/web");
+        assert_eq!(
+            sign_in_notice(&repo, folder, true),
+            "Owlshift can no longer reach GitHub for acme/web, so none of its tickets move. Sign \
+             in again: `cd '/Users/ada/My Projects/web'` then `owlshift init`. It shows a code \
+             to enter on github.com; your owlshift.toml, your other stored keys and your \
+             tickets are kept. Owlshift picks the project up again within a minute."
+        );
+        let typed = sign_in_notice(&repo, folder, false);
+        assert!(
+            !typed.contains("Owlshift picks the project up again within a minute."),
+            "{typed}"
+        );
+        assert!(typed.ends_with("your tickets are kept."), "{typed}");
+
+        let quoted = sign_in_notice(&repo, Path::new("/tmp/ada's web"), false);
+        assert!(quoted.contains(r"`cd '/tmp/ada'\''s web'`"), "{quoted}");
+    }
+
+    /// OWL-650: a refused sign-in is lasting and, said in a checkout, reads
+    /// as the notice with its technical words kept as the detail; any other
+    /// refusal is said as it was.
+    #[test]
+    fn only_a_refused_sign_in_is_reworded_in_its_checkout() {
+        let repo = Repo::parse("acme/web").unwrap();
+        let folder = Path::new("/work/web");
+        let technical = sign_in_again("github.com/acme/web/github-app", "does not read");
+        let refused = refusal(Error::new(ErrorKind::SignInAgain, technical.clone()));
+        assert!(refused.lasting(), "{refused}");
+        let said = refused.in_checkout(&repo, folder, true);
+        assert!(said.lasting(), "{said}");
+        assert_eq!(said.message, sign_in_notice(&repo, folder, true));
+        assert_eq!(said.detail.as_deref(), Some(technical.as_str()));
+        assert_eq!(
+            said.clone().in_checkout(&repo, folder, false),
+            said,
+            "said once"
+        );
+
+        for other in [
+            refusal(Error::new(ErrorKind::Unauthorized, "bad credentials")),
+            Refusal::from("no Linear API key"),
+        ] {
+            let kept = other.clone().in_checkout(&repo, folder, true);
+            assert_eq!(kept, other);
+            assert_eq!(kept.detail, None);
+        }
     }
 
     /// OWL-334: no token stored is said before any request.

@@ -25,6 +25,10 @@
 //! runners' as the dedicated checkout last fetched them, each with its
 //! operator and its expiry. Nothing is fetched.
 //!
+//! Since OWL-650 a project the daemon paused shows as waiting for you: its
+//! watch line says so, whatever the daemon's quiet retries recorded, and
+//! its pause line gives the reason once, which names what to do.
+//!
 //! [`gather`] does the reading; [`watch_state`] and [`render`] are pure.
 //! [`gather_files`] reads all of it but the event log, for the web UI's
 //! header (OWL-467), which reads no event log.
@@ -273,7 +277,8 @@ pub enum Watch {
         in_a_row: Option<u64>,
     },
     /// It ended at `at` on a refusal no restart mends: the daemon paused
-    /// the project, and tries it again at each of its passes.
+    /// the project, which waits for you; while that pause stands, the
+    /// project's lines say so in its place (OWL-650).
     Unservable { at: Timestamp, why: String },
     /// It ended as asked, at `at`.
     Ended { at: Timestamp },
@@ -922,11 +927,21 @@ pub fn parts(report: &Report, tz: &TimeZone, voice: Voice) -> Vec<(Part, String)
                 format!("  its served record cannot be read: {why}"),
             ),
         }
+        // The daemon's pause waits for you, whatever its quiet retries
+        // recorded last (OWL-650).
+        let waits_since = match (&project.pause, &project.watch) {
+            (_, Watch::NoDaemon) => None,
+            (Some(Some(request)), _) if request.by == BY_DAEMON => Some(request.at),
+            _ => None,
+        };
         line(
             Part::Watch,
             format!(
                 "  watch: {}",
                 match &project.watch {
+                    _ if let Some(since) = waits_since => {
+                        format!("waiting for you since {}", time(since, tz))
+                    }
                     Watch::NoDaemon => "none, no daemon runs".to_owned(),
                     Watch::NotRead => "not read".to_owned(),
                     Watch::NotStarted => "not started yet".to_owned(),
@@ -962,10 +977,10 @@ pub fn parts(report: &Report, tz: &TimeZone, voice: Voice) -> Vec<(Part, String)
             ),
         );
         if let Some(request) = &project.pause {
+            // The daemon's reason says what to do, and its pause lifts
+            // itself once that is done.
             let more = match request {
-                Some(request) if request.by == BY_DAEMON => {
-                    "; the daemon tries it again at each of its passes"
-                }
+                Some(request) if request.by == BY_DAEMON => "",
                 _ => match voice {
                     Voice::Terminal => "; `owlshift resume <owner/repo>` lifts it",
                     Voice::Ui => "; its Resume button lifts it",
@@ -1441,6 +1456,78 @@ mod tests {
                 .map(|(_, line)| format!("{line}\n"))
                 .collect::<String>()
         );
+    }
+
+    /// OWL-650: a project the daemon paused waits for you, even while a
+    /// quiet retry's watch has just started; its reason, the sign-in
+    /// notice, is shown whole, once, with no retry clause, in both voices.
+    #[test]
+    fn a_project_the_daemon_paused_waits_for_you() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path();
+        let since = Timestamp::now()
+            .checked_sub(jiff::SignedDuration::from_mins(5))
+            .unwrap();
+        let _daemon = daemon::instance::take(data_dir, &record(since))
+            .unwrap()
+            .unwrap();
+        let served = ServedProjects {
+            format: Format,
+            projects: vec![ServedProject {
+                repository: "acme/web".to_owned(),
+                checkout: "/home/ada/acme/web".to_owned(),
+            }],
+        };
+        crate::step::write_atomically(&Registry::in_data_dir(data_dir).file(), &served.render())
+            .unwrap();
+        let repo = Repo::parse("acme/web").unwrap();
+        let notice = crate::forge::sign_in_notice(&repo, Path::new("/home/ada/acme/web"), true);
+        let web = ProjectDirs::new(data_dir, &repo);
+        requests::write_pause(&web, &Request::new(BY_DAEMON, since, &notice)).unwrap();
+        service(
+            data_dir,
+            "acme/web",
+            vec![("service", json!("watch_started")), ("pid", json!(77))],
+        );
+
+        let report = gather(data_dir, 2, &[], Timestamp::now());
+        assert!(matches!(report.projects[0].watch, Watch::Running { .. }));
+        let tz = TimeZone::UTC;
+        for voice in [Voice::Terminal, Voice::Ui] {
+            let lines: Vec<String> = parts(&report, &tz, voice)
+                .into_iter()
+                .map(|(_, line)| line)
+                .collect();
+            let text = lines.join("\n");
+            assert!(
+                lines.contains(&format!(
+                    "  watch: waiting for you since {}",
+                    time(since, &tz)
+                )),
+                "{text}"
+            );
+            assert!(
+                lines.contains(&format!(
+                    "  paused by owlshift daemon at {}: {notice}",
+                    time(since, &tz)
+                )),
+                "{text}"
+            );
+            assert_eq!(text.matches(notice.as_str()).count(), 1, "{text}");
+            assert!(!text.contains("tries it again"), "{text}");
+            assert!(!text.contains("watch: running"), "{text}");
+        }
+
+        // A person's pause keeps its own words.
+        requests::remove_own_pause(&web).unwrap();
+        let lunch = Request::new(BY_PAUSE, since, "lunch break");
+        requests::ask_pause(data_dir, Some(&web), &lunch).unwrap();
+        let text = render(&gather(data_dir, 2, &[], Timestamp::now()), &tz);
+        assert!(
+            text.contains(": lunch break; `owlshift resume <owner/repo>` lifts it"),
+            "{text}"
+        );
+        assert!(text.contains("  watch: running since "), "{text}");
     }
 
     /// OWL-478: a ticket lock a command holds with no run slot is a step

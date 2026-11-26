@@ -14,6 +14,11 @@
 //!
 //! `owlshift self-update` trusts the bench's release key,
 //! [`BENCH_RELEASE_KEY`], not Owlshift's (OWL-541).
+//!
+//! With [`APP_ENTRY_VAR`] set, the keychain also holds its value as the
+//! bench project's GitHub App entry, which is read before the personal
+//! token (OWL-650): an entry that does not parse is GitHub's refused
+//! sign-in, met with no network.
 
 use std::process::ExitCode;
 
@@ -27,12 +32,23 @@ use owlshift_testkit::step_child::REPO;
 /// What each entry holds: plainly not a token.
 const FAKE: &str = "test-token-not-real";
 
-/// A keychain held in memory with the bench project's two entries.
+/// The variable whose value, when set, is stored as the bench project's
+/// GitHub App entry. Test only.
+const APP_ENTRY_VAR: &str = "OWLSHIFT_BENCH_GITHUB_APP_ENTRY";
+
+/// A keychain held in memory with the bench project's two entries, and its
+/// GitHub App entry when [`APP_ENTRY_VAR`] is set.
 fn bench_keychain() -> Result<Keychain, KeychainError> {
     let keychain = Keychain::in_memory();
     let repo = Repo::parse(REPO).expect("the bench's repository");
     keychain.store(&ForgeAccount::project(&repo).token, &Secret::new(FAKE))?;
     keychain.store(CLAUDE_AGENT_ACCOUNT, &Secret::new(FAKE))?;
+    if let Some(entry) = std::env::var_os(APP_ENTRY_VAR) {
+        keychain.store(
+            &ForgeAccount::project_app(&repo).token,
+            &Secret::new(entry.to_string_lossy()),
+        )?;
+    }
     Ok(keychain)
 }
 

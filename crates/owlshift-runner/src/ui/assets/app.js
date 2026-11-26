@@ -32,6 +32,18 @@ function make(tag, className, value) {
   return el;
 }
 
+// Whether a pause is the daemon's own, which waits for you (OWL-650): its
+// reason says what to do, and the daemon lifts it once that is done. "owlshift
+// daemon" is the contracts' `BY_DAEMON`.
+function waitsForYou(paused) {
+  return Boolean(paused) && paused.by === "owlshift daemon";
+}
+
+// A pause in a few words, then its reason, or `missing` when it gives none.
+function pauseText(paused, missing) {
+  return (waitsForYou(paused) ? "waiting for you: " : "paused: ") + (paused.why || missing);
+}
+
 function clear(el) {
   while (el.firstChild) {
     el.removeChild(el.firstChild);
@@ -391,7 +403,7 @@ function renderProjects(header) {
   const entries = [{ name: "", label: "All projects", lines: [] }].concat(header.projects.map((project) => {
     const lines = [["project-slots amount", slotsText(project)]];
     if (project.paused) {
-      lines.push(["project-state state-warning", "paused: " + project.paused.why]);
+      lines.push(["project-state state-warning", pauseText(project.paused, "")]);
     }
     if (project.quarantined) {
       lines.push(["project-state state-danger", "quarantined: " + project.quarantined]);
@@ -1790,7 +1802,7 @@ function renderWaits(handle, body, waits) {
       facts.push("quarantined");
     }
     if (project.paused) {
-      facts.push("paused");
+      facts.push(waitsForYou(project.paused) ? "waiting for you" : "paused");
     }
     body.appendChild(make("p", "notice", "The project: " + facts.join(" · ")));
   }
@@ -2684,7 +2696,7 @@ function renderView(overview) {
     const block = make("div", "project-block");
     const head = make("h3", "project-head", project.repository);
     if (project.paused) {
-      head.appendChild(make("span", "state-warning small", "paused: " + (project.paused.why || "")));
+      head.appendChild(make("span", "state-warning small", pauseText(project.paused, "")));
     }
     if (project.quarantined) {
       head.appendChild(make("span", "state-danger small", "quarantined"));
@@ -3056,7 +3068,7 @@ function drawProject(project, layerName) {
     project.repository + " · " + project.in_flight + " of " + cap + " in flight" +
     (project.served ? "" : " · not served")));
   if (project.paused) {
-    section.appendChild(make("p", "state-warning", "paused: " + (project.paused.why || "by a person")));
+    section.appendChild(make("p", "state-warning", pauseText(project.paused, "by a person")));
   }
   if (project.quarantined) {
     section.appendChild(make("p", "state-danger", "quarantined"));

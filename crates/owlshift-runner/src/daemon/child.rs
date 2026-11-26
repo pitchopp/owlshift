@@ -12,6 +12,11 @@
 //! its end is seen without reaping it, what it left in its group is stopped,
 //! then it is withdrawn and reaped. What its owner reads once it has ended,
 //! a step's outcome record, is the owner's.
+//!
+//! A child may be held ([`Supervised::hold`], OWL-650): its lines are kept
+//! rather than printed, until its owner releases them or drops them with its
+//! end, as the daemon does for the quiet retry of a project that waits for a
+//! person.
 
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::process::{Child, Command, ExitStatus, Stdio};
@@ -28,7 +33,7 @@ use crate::events::printable;
 const GRACE: Duration = Duration::from_secs(2);
 
 /// Which of the child's streams a line came from.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 enum Stream {
     Out,
     Err,
@@ -55,6 +60,9 @@ pub(crate) struct Supervised {
     ended: Option<Instant>,
     /// The last line it wrote on its standard error.
     last_error: Option<String>,
+    /// While it is held: the lines it wrote, each with its stream, kept
+    /// rather than printed.
+    held: Option<Vec<(Stream, String)>>,
 }
 
 /// How a child ended.
@@ -68,6 +76,9 @@ pub(crate) struct Ended {
     pub last_error: Option<String>,
     /// How long it ran.
     pub ran_for: Duration,
+    /// The lines it wrote while held and that were not released, each with
+    /// its stream, as they would have been printed.
+    held: Vec<(Stream, String)>,
 }
 
 impl Ended {
@@ -80,6 +91,13 @@ impl Ended {
             )),
             None => self.reaped.clone(),
         }
+    }
+
+    /// Prints the lines it wrote while held, as [`Supervised::poll`] would
+    /// have: its standard output's on `out`, its standard error's on the
+    /// process's own. Once only: they are gone after.
+    pub fn write_held(&mut self, out: &mut dyn Write) {
+        write_lines(std::mem::take(&mut self.held), out);
     }
 }
 
@@ -108,7 +126,22 @@ impl Supervised {
             started: Instant::now(),
             ended: None,
             last_error: None,
+            held: None,
         })
+    }
+
+    /// Keeps the lines the child writes from now on rather than print them,
+    /// until [`release`](Self::release); its end carries those still kept.
+    pub fn hold(&mut self) {
+        self.held.get_or_insert_with(Vec::new);
+    }
+
+    /// Prints the lines kept while it was held, in order, then prints each
+    /// new line as it comes again.
+    pub fn release(&mut self, out: &mut dyn Write) {
+        if let Some(held) = self.held.take() {
+            write_lines(held, out);
+        }
     }
 
     /// Its process id.
@@ -137,17 +170,13 @@ impl Supervised {
             match self.lines.try_recv() {
                 Ok(Output::Line(stream, line)) => {
                     let shown = printable(&format!("{}: {line}", self.label));
-                    // Never a panic: the output may be gone, a closed terminal being a
-                    // checked stop (OWL-161) whose children still end through here.
-                    let _ = match stream {
-                        Stream::Out => writeln!(out, "{shown}"),
-                        Stream::Err => {
-                            if !line.trim().is_empty() {
-                                self.last_error = Some(line);
-                            }
-                            writeln!(io::stderr(), "{shown}")
-                        }
-                    };
+                    if matches!(stream, Stream::Err) && !line.trim().is_empty() {
+                        self.last_error = Some(line);
+                    }
+                    match &mut self.held {
+                        Some(held) => held.push((stream, shown)),
+                        None => write_lines([(stream, shown)], out),
+                    }
                 }
                 Ok(Output::Closed) => self.open -= 1,
                 Err(TryRecvError::Empty) => break,
@@ -194,7 +223,21 @@ impl Supervised {
             watch_error,
             last_error: self.last_error.take(),
             ran_for,
+            held: self.held.take().unwrap_or_default(),
         }
+    }
+}
+
+/// Prints each of `lines`, already shown after its label: standard
+/// output's on `out`, standard error's on the process's own.
+fn write_lines(lines: impl IntoIterator<Item = (Stream, String)>, out: &mut dyn Write) {
+    for (stream, shown) in lines {
+        // Never a panic: the output may be gone, a closed terminal being a
+        // checked stop (OWL-161) whose children still end through here.
+        let _ = match stream {
+            Stream::Out => writeln!(out, "{shown}"),
+            Stream::Err => writeln!(io::stderr(), "{shown}"),
+        };
     }
 }
 
@@ -223,4 +266,80 @@ fn read_lines(stream: Option<impl Read + Send + 'static>, from: Stream, to: Send
         }
         let _ = to.send(Output::Closed);
     });
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+
+    /// `script` run by `sh` as a child labelled `t`, polled until it ends,
+    /// held from its start when `held`; what was printed on `out` meanwhile,
+    /// and how it ended.
+    fn polled(script: &str, held: bool) -> (String, Ended) {
+        let mut command = Command::new("sh");
+        command.args(["-c", script]);
+        let mut child = Supervised::start(command, "t", AtCheckedStop::Left).unwrap();
+        if held {
+            child.hold();
+        }
+        let mut out = Vec::new();
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            if let Some(ended) = child.poll(&mut out) {
+                return (String::from_utf8(out).unwrap(), ended);
+            }
+            assert!(Instant::now() < deadline, "the child never ended");
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    /// OWL-650: a held child prints nothing; its end carries its lines and
+    /// its last error, printed once, when its owner writes them.
+    #[test]
+    fn a_held_childs_lines_are_carried_by_its_end() {
+        let (printed, mut ended) = polled("echo one; echo two; echo why >&2", true);
+        assert_eq!(printed, "");
+        assert_eq!(ended.last_error.as_deref(), Some("why"));
+        assert!(!ended.held.is_empty());
+        let mut out = Vec::new();
+        ended.write_held(&mut out);
+        assert_eq!(String::from_utf8(out).unwrap(), "t: one\nt: two\n");
+        assert!(ended.held.is_empty());
+
+        let (printed, ended) = polled("echo one", false);
+        assert_eq!(printed, "t: one\n");
+        assert!(ended.held.is_empty());
+    }
+
+    /// OWL-650: a released child prints what it held, in order, then each
+    /// new line as it comes.
+    #[test]
+    fn a_released_child_prints_what_it_held_then_the_rest() {
+        let mut command = Command::new("sh");
+        command.args(["-c", "echo one; sleep 1; echo two"]);
+        let mut child = Supervised::start(command, "t", AtCheckedStop::Left).unwrap();
+        child.hold();
+        let mut out = Vec::new();
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while child.held.as_ref().is_some_and(Vec::is_empty) {
+            assert!(
+                child.poll(&mut out).is_none(),
+                "ended before its first line"
+            );
+            assert!(Instant::now() < deadline, "no first line");
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(String::from_utf8_lossy(&out), "");
+        child.release(&mut out);
+        assert_eq!(String::from_utf8_lossy(&out), "t: one\n");
+        let ended = loop {
+            if let Some(ended) = child.poll(&mut out) {
+                break ended;
+            }
+            assert!(Instant::now() < deadline, "the child never ended");
+            thread::sleep(Duration::from_millis(10));
+        };
+        assert_eq!(String::from_utf8(out).unwrap(), "t: one\nt: two\n");
+        assert!(ended.held.is_empty());
+    }
 }
