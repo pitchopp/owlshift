@@ -20,7 +20,8 @@
 //! `owlshift pause` and `owlshift resume` (OWL-438) write and remove both
 //! pauses ([`ask_pause`], [`lift_pause`]), and every watch reads them at each
 //! pass and before each step ([`operator_pause`]): while one stands it
-//! dispatches nothing and starts no step.
+//! dispatches nothing and starts no step. The daemon's own pause of a
+//! project holds no watch (OWL-651): it says the watch cannot start.
 
 use std::fs;
 use std::io;
@@ -169,12 +170,20 @@ impl PauseScope {
     }
 }
 
-/// The pause that stands on `dirs`'s project, the machine's first: what it
-/// covers and what it holds, `None` within for a file that does not read.
+/// The pause that holds a watch of `dirs`'s project, the machine's first:
+/// what it covers and what it holds, `None` within for a file that does not
+/// read. The daemon's own pause of the project holds none (OWL-651): it says
+/// that the project's watch cannot start, and a watch that reads it has
+/// started, so it is read as no pause; the daemon lifts it once that watch
+/// is past its start.
 pub fn operator_pause(dirs: &ProjectDirs) -> Option<(PauseScope, Option<Request>)> {
     machine_pause(data_of(dirs))
         .map(|request| (PauseScope::Machine, request))
-        .or_else(|| pause(dirs).map(|request| (PauseScope::Project, request)))
+        .or_else(|| {
+            pause(dirs)
+                .filter(|request| !request.as_ref().is_some_and(|r| r.by == BY_DAEMON))
+                .map(|request| (PauseScope::Project, request))
+        })
 }
 
 /// The pause file of `dirs`'s project, or the machine's of `data` when
@@ -361,7 +370,7 @@ mod tests {
 
     /// OWL-438: a person's pause replaces a daemon's own, which the daemon
     /// then never lifts; the machine's stands over a project's; a lift says
-    /// what it removed.
+    /// what it removed. OWL-651: only the daemon's own holds no watch.
     #[test]
     fn a_persons_pause_replaces_the_daemons_and_the_machines_stands_first() {
         let data = tempfile::tempdir().unwrap();
@@ -372,6 +381,9 @@ mod tests {
 
         let own = Request::new(BY_DAEMON, Timestamp::now(), "keychain locked");
         assert!(write_pause(&dirs, &own).unwrap());
+        // OWL-651: the daemon's own pause stands, and holds no watch.
+        assert_eq!(pause(&dirs), Some(Some(own.clone())));
+        assert_eq!(operator_pause(&dirs), None);
         let person = Request::new(BY_PAUSE, Timestamp::now(), "lunch");
         let replaced = ask_pause(data, Some(&dirs), &person).unwrap();
         assert_eq!(replaced, Some(Some(own.clone())));

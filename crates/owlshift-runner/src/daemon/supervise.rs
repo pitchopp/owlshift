@@ -5,7 +5,9 @@
 //! A project the daemon paused waits for you (OWL-650): its pause is said
 //! once and notified once, and its watch is tried again quietly at each
 //! pass, its lines held, so daemon.log grows only when something changes: a
-//! new reason, another end, or the pause lifted.
+//! new reason, another end, or the pause lifted. The pause holds no watch
+//! (OWL-651): a watch so tried dispatches at its first pass, and the pause
+//! is lifted once it is past its start.
 
 use std::io::{self, Write};
 use std::net::TcpListener;
@@ -47,7 +49,8 @@ struct Slot {
     due: Option<Instant>,
     /// Why the daemon paused it, while it stands paused.
     paused: Option<String>,
-    /// When a watch started while it stood paused counts as serving.
+    /// While a watch started as it stood paused runs: when that watch counts
+    /// as serving at the latest, its record saying so first (OWL-651).
     lift_at: Option<Instant>,
     /// Whether the last pass listed it.
     listed: bool,
@@ -58,15 +61,24 @@ struct Slot {
 }
 
 impl Slot {
+    /// A slot due now. A daemon's own pause that stands on the project,
+    /// from a daemon before this one, is taken up as it stands, already said
+    /// and notified (OWL-651): its watch is tried quietly and lifts it once
+    /// it serves.
     fn new(repo: Repo, data: &std::path::Path, now: Instant) -> Self {
+        let dirs = ProjectDirs::new(data, &repo);
+        let paused = match requests::pause(&dirs) {
+            Some(Some(request)) if request.by == BY_DAEMON => Some(request.why),
+            _ => None,
+        };
         Self {
-            dirs: ProjectDirs::new(data, &repo),
+            dirs,
             repo,
             lock: None,
             child: None,
             restarts: Restarts::default(),
             due: Some(now),
-            paused: None,
+            paused,
             lift_at: None,
             listed: true,
             stop_written: false,
@@ -233,7 +245,11 @@ impl Daemon<'_> {
                         }
                         self.start(slot, out);
                     }
-                    if slot.child.is_some() && slot.lift_at.is_some_and(|at| now >= at) {
+                    if slot.child.is_some()
+                        && slot
+                            .lift_at
+                            .is_some_and(|at| now >= at || self.past_start(slot))
+                    {
                         self.lift(slot, out);
                     }
                 }
@@ -962,8 +978,21 @@ impl Daemon<'_> {
         }
     }
 
-    /// Lifts `slot`'s pause: a watch started while it stood paused still
-    /// runs a pass later. What that watch held is said first.
+    /// Whether `slot`'s watch is past its start (OWL-651): its watch record
+    /// stands, which a served watch writes once every check that can refuse
+    /// it has passed, just before its first pass. Read only while a paused
+    /// project's watch runs; one that cannot be read is not past it.
+    fn past_start(&self, slot: &Slot) -> bool {
+        let Some(pid) = slot.child.as_ref().map(Supervised::pid) else {
+            return false;
+        };
+        watch::presence::running(self.data)
+            .is_ok_and(|running| running.iter().any(|watch| watch.pid == pid))
+    }
+
+    /// Lifts `slot`'s pause: a watch started while it stood paused is past
+    /// its start, its record standing, or still runs a pass later, as while
+    /// it waits for the network. What that watch held is said first.
     fn lift(&self, slot: &mut Slot, out: &mut dyn Write) {
         slot.lift_at = None;
         if let Some(child) = &mut slot.child {
@@ -1114,4 +1143,31 @@ fn duration_text(duration: Duration) -> String {
 
 fn millis(duration: Duration) -> u64 {
     u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
+}
+
+#[cfg(test)]
+mod tests {
+    use owlshift_contracts::service::BY_PAUSE;
+
+    use super::*;
+
+    /// OWL-651: a daemon started while its own pause stands on a project
+    /// takes it up, so it lifts it once the project serves again; a
+    /// person's pause, or none, is not the daemon's to take up.
+    #[test]
+    fn a_new_slot_takes_up_the_daemons_own_pause_alone() {
+        let data = tempfile::tempdir().unwrap();
+        let repo = Repo::parse("acme/web").unwrap();
+        let dirs = ProjectDirs::new(data.path(), &repo);
+        let slot = || Slot::new(repo.clone(), data.path(), Instant::now());
+        assert_eq!(slot().paused, None);
+
+        let own = Request::new(BY_DAEMON, Timestamp::now(), "Sign in again.");
+        assert!(requests::write_pause(&dirs, &own).unwrap());
+        assert_eq!(slot().paused.as_deref(), Some("Sign in again."));
+
+        let person = Request::new(BY_PAUSE, Timestamp::now(), "lunch");
+        requests::ask_pause(data.path(), Some(&dirs), &person).unwrap();
+        assert_eq!(slot().paused, None);
+    }
 }

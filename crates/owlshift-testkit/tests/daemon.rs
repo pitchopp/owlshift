@@ -779,11 +779,17 @@ fn a_watch_started_offline_waits_then_starts_once_its_tracker_answers() {
 
 /// OWL-479: a tracker that refuses its credentials still ends the watch as
 /// unservable, and the daemon pauses the project.
+///
+/// OWL-651: once the credentials are mended, the watch tried again is never
+/// held by the daemon's pause, so it dispatches at its first pass, and the
+/// pause is lifted once its record says it is past its start, well within
+/// the pass after which it would be lifted otherwise.
 #[test]
 fn a_refused_token_at_a_watchs_start_still_pauses_its_project() {
     let mut bench = Bench::new();
     real_watch(&mut bench);
-    fs::write(bench.bench_dir(REPO).join("refused"), "").unwrap();
+    let refused = bench.bench_dir(REPO).join("refused");
+    fs::write(&refused, "").unwrap();
     bench.start();
     let dirs = bench.dirs(REPO);
     bench.wait_for("the pause", || requests::pause(&dirs).is_some());
@@ -791,6 +797,36 @@ fn a_refused_token_at_a_watchs_start_still_pauses_its_project() {
     assert_eq!(pause.by, BY_DAEMON);
     assert!(pause.why.contains("invalid_client"), "{}", pause.why);
     assert!(!bench.output().contains("waits for the network"));
+
+    fs::remove_file(&refused).unwrap();
+    bench.wait_for("the pause lifted and said", || {
+        requests::pause(&dirs).is_none() && bench.output().contains("is served again")
+    });
+    bench.wait_for("a pass of the watch and its lines", || {
+        bench.passes() > 0 && bench.output().contains("watching demo/project")
+    });
+    let output = bench.output();
+    assert!(!output.contains("this project is paused"), "{output}");
+    let at = |service: &str| {
+        events(&bench.data())
+            .iter()
+            .rev()
+            .find(|event| event.data.get("service").and_then(|s| s.as_str()) == Some(service))
+            .map(|event| event.at)
+            .unwrap_or_else(|| panic!("no {service} event: {output}"))
+    };
+    // A pass of the bench is 1000 ms (`TIMING`): the lift came before it.
+    let lifted_after = at("pause_lifted").duration_since(at("watch_started"));
+    assert!(
+        lifted_after < jiff::SignedDuration::from_millis(1000),
+        "lifted {lifted_after:?} after the start: {output}"
+    );
+    let waits = bench
+        .notes()
+        .iter()
+        .filter(|note| note.contains("waits for you"))
+        .count();
+    assert_eq!(waits, 1, "{:?}", bench.notes());
     bench.signal("TERM", bench.daemon_pid());
     assert!(bench.ended().success(), "{}", bench.output());
 }

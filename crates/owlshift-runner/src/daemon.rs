@@ -16,7 +16,10 @@
 //!   project instead: it waits for you (OWL-650). `<project data>/pause` is
 //!   written with the reason, said once and notified once, and the project
 //!   tried again quietly at each pass, its watch's lines held until it ends
-//!   for another reason or still runs a pass later, when the pause is lifted.
+//!   for another reason or is past its start, when the pause is lifted: its
+//!   watch record stands, or it still runs a pass later (OWL-651). The pause
+//!   says the watch cannot start and holds none, so a watch so tried
+//!   dispatches at its first pass.
 //! - *Stops* ([`requests`]): `owlshift stop` writes `<data>/service/stop`,
 //!   which the daemon relays as the stop file of every watch it runs (a
 //!   drain), then exits once they have ended; a Ctrl-C does the same. A
