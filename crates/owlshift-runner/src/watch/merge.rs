@@ -115,14 +115,19 @@ impl Watch<'_> {
             }
             Err(reason) => return self.merge_unread(memory, sink, ticket, "switch", reason),
         };
-        if switch == MergeSwitch::Never {
+        // An owed overlap refresh reads on whoever merges (OWL-654; decided
+        // Q1): the stage, the questions, the person's steps and the draft
+        // say when it runs.
+        let owed = memory.refreshes.due(ticket);
+        if switch == MergeSwitch::Never && owed.is_none() {
             return;
         }
         // A refusal that will not pass holds this head and base back, until
-        // a person's `continue` asks again.
-        if memory
-            .following
-            .merge_held(ticket, pushed, &base_head, delivery.merge_retry)
+        // a person's `continue` asks again; it holds no owed refresh.
+        if owed.is_none()
+            && memory
+                .following
+                .merge_held(ticket, pushed, &base_head, delivery.merge_retry)
         {
             return;
         }
@@ -167,7 +172,6 @@ impl Watch<'_> {
         let Some(pushed) = delivery.pushed.as_deref() else {
             return;
         };
-        let owed = memory.refreshes.due(ticket);
         let mut facts = MergeFacts {
             decision: &seen.decision,
             pushed,
@@ -201,8 +205,41 @@ impl Watch<'_> {
             overlap: owed.as_deref(),
         };
         let read = seen.merge_read();
+        // An owed overlap refresh runs once the pull request could otherwise
+        // merge, onto the base head of this pass (OWL-654; architecture
+        // section 5, "Tolerated overlap", "The refresh"); until then its
+        // wait is told, and nothing merges.
+        if let Some(refresh) = core::overlap_refresh(&gate, &facts, &read) {
+            let onto = refresh.onto.to_owned();
+            let mut wait = refresh.wait;
+            if needs_draft(wait.as_ref()) {
+                match on_demand.forge.merge_read(pr.number) {
+                    Ok(read) => facts.draft = read.draft,
+                    Err(error) => {
+                        return self.merge_read_failed(
+                            memory,
+                            sink,
+                            ticket,
+                            ("pull_request", &error),
+                            now,
+                        );
+                    }
+                }
+                wait = core::overlap_refresh(&gate, &facts, &read).and_then(|owed| owed.wait);
+            }
+            let pushed = pushed.to_owned();
+            drop(locked);
+            match wait {
+                None => self.refresh(memory, sink, out, continued, (ticket, pr, &pushed), at),
+                Some(blocker) => {
+                    let wait = merge::refresh_wait(&onto, &blocker);
+                    self.tell_refresh(memory, sink, out, ticket, pr, &pushed, wait);
+                }
+            }
+            return;
+        }
         let mut due = core::merge_due(&policy, &facts, &read);
-        if needs_draft(&due) {
+        if needs_draft(waits_on(&due)) {
             let draft = match on_demand.forge.merge_read(pr.number) {
                 Ok(read) => read.draft,
                 Err(error) => {
@@ -1125,21 +1162,31 @@ impl Watch<'_> {
     }
 }
 
-/// Whether the merge's draft condition is the one that decides: every
-/// condition before it held (architecture section 5, "When", in its
-/// order), so a read says whether the pull request is a draft.
-fn needs_draft(due: &MergeDue) -> bool {
+/// Whether the draft condition is the one that decides, `blocker` being
+/// what merge on green or an owed overlap refresh (OWL-654) waits on with
+/// the draft taken as not one, `None` when it would go on: every condition
+/// before it held (architecture section 5, "When", in its order), so a
+/// read says whether the pull request is a draft.
+fn needs_draft(blocker: Option<&MergeBlocker>) -> bool {
     matches!(
-        due,
-        MergeDue::Merge(_)
-            | MergeDue::Wait(
-                MergeBlocker::SomethingDue
-                    | MergeBlocker::BaseUnknown
-                    | MergeBlocker::BaseMoved
-                    | MergeBlocker::GreenOnce
-                    | MergeBlocker::CommitsUnread
-            )
+        blocker,
+        None | Some(
+            MergeBlocker::SomethingDue
+                | MergeBlocker::OverlapOwed
+                | MergeBlocker::BaseUnknown
+                | MergeBlocker::BaseMoved
+                | MergeBlocker::GreenOnce
+                | MergeBlocker::CommitsUnread
+        )
     )
+}
+
+/// What `due` waits on, `None` for a merge: [`needs_draft`]'s reading.
+fn waits_on(due: &MergeDue) -> Option<&MergeBlocker> {
+    match due {
+        MergeDue::Merge(_) => None,
+        MergeDue::Wait(blocker) => Some(blocker),
+    }
 }
 
 /// Whether `seen` read the pull request with no check at all (OWL-657):

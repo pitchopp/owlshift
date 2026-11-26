@@ -18,7 +18,8 @@ use owlshift_contracts::refs::{DeliveredPullRequest, Merging, TicketDelivery, Ti
 use owlshift_contracts::result::Question;
 use owlshift_contracts::review::TicketPlan;
 use owlshift_core::follow::{MergeBlocker, MergeQuestion, Settled, asks_ci_to_skip, held_question};
-use owlshift_core::vocab::{AnswerClass, MergeSwitch};
+use owlshift_core::state::Status;
+use owlshift_core::vocab::{AnswerClass, MergeSwitch, Stage};
 
 use crate::answer_check;
 use crate::events::{Data, EventSink, data};
@@ -556,8 +557,11 @@ pub(crate) fn hold_words(blocker: &MergeBlocker, question: Option<&MergeQuestion
         MergeBlocker::SomethingDue => {
             "the ticket owes its DELIVERY report on the tracker first".to_owned()
         }
-        MergeBlocker::OverlapOwed => "its base changed a path it shares with another ticket since                                       the push, so a refresh rebase onto the base comes first,                                       then two green reads of the rebased head"
-            .to_owned(),
+        MergeBlocker::OverlapOwed => {
+            "its base changed a path it shares with another ticket since the push, so a refresh \
+             rebase onto the base comes first, then two green reads of the rebased head"
+                .to_owned()
+        }
         MergeBlocker::BaseUnknown => "the base of Owlshift's last push is not known".to_owned(),
         MergeBlocker::BaseMoved => "its base moved since the push on a path it changes, or in a \
                                     way that could not be read, so a refresh rebase comes first"
@@ -681,6 +685,76 @@ pub(crate) fn blocker_wait(blocker: &MergeBlocker) -> Option<(&'static str, Data
     Some((reason, Data::new()))
 }
 
+/// The wait of an owed overlap refresh (OWL-654; architecture section 5,
+/// "Tolerated overlap", "The refresh"): reason `refresh_owed`, the base
+/// head `onto` it would rebase onto, what it waits for, `until`, and the
+/// category of the question it waits on, if one.
+pub(crate) fn refresh_owed(
+    onto: &str,
+    until: &str,
+    category: Option<&str>,
+) -> (&'static str, Data) {
+    let mut fields = data([("onto", json!(onto)), ("until", json!(until))]);
+    if let Some(category) = category {
+        fields.insert("category".to_owned(), json!(category));
+    }
+    ("refresh_owed", fields)
+}
+
+/// [`refresh_owed`] for what `owlshift_core::follow::overlap_refresh` says
+/// the refresh waits for: its checks, the stage, a question waiting for its
+/// decider, a person's steps, a draft, the DELIVERY report.
+pub(crate) fn refresh_wait(onto: &str, blocker: &MergeBlocker) -> (&'static str, Data) {
+    match blocker {
+        MergeBlocker::Unanswered(category)
+        | MergeBlocker::Security(category)
+        | MergeBlocker::ResolverDecided(category) => refresh_owed(onto, "question", Some(category)),
+        MergeBlocker::StageMoved => refresh_owed(onto, "stage", None),
+        MergeBlocker::PersonSteps(_) => refresh_owed(onto, "person_steps", None),
+        MergeBlocker::Draft => refresh_owed(onto, "draft", None),
+        MergeBlocker::SomethingDue => refresh_owed(onto, "report", None),
+        // `overlap_refresh` gives no other wait than the read's.
+        _ => refresh_owed(onto, "checks", None),
+    }
+}
+
+/// What an owed refresh of a ticket in `status`, which watch reads only for
+/// an end, waits for (OWL-654): its decider's answer, a person's
+/// `continue`, or its review loop. `None` for any other status.
+pub(crate) fn held_until(status: Status) -> Option<&'static str> {
+    match status {
+        Status::NeedsInput { .. } => Some("question"),
+        Status::Parked { .. } => Some("park"),
+        Status::Active(Stage::Build | Stage::Verify) => Some("review"),
+        Status::Active(_) => None,
+    }
+}
+
+/// What an owed refresh waits for, `until` in its event, in a person's
+/// words.
+fn until_words(data: &Data) -> String {
+    let text = |key: &str| data.get(key).and_then(Value::as_str);
+    match text("until") {
+        Some("checks") => "its checks read green".to_owned(),
+        Some("stage") => {
+            "the ticket is back in the project's review state on the tracker".to_owned()
+        }
+        Some("question") => match text("category") {
+            Some(category) => format!("its decider answers its question under `{category}`"),
+            None => "its decider answers its question".to_owned(),
+        },
+        Some("person_steps") => {
+            "the steps it owes a person before the merge are done and their run ends".to_owned()
+        }
+        Some("draft") => "it is marked ready for review".to_owned(),
+        Some("report") => "its DELIVERY report is posted on the tracker".to_owned(),
+        Some("correction") => "the correction a decider's reply asks for ends".to_owned(),
+        Some("review") => "its review loop ends".to_owned(),
+        Some("park") => "a person continues it".to_owned(),
+        _ => "it could otherwise merge".to_owned(),
+    }
+}
+
 /// A wait merge on green told, in a person's words (OWL-499), from its
 /// event's `reason` and fields, for watch's line, `owlshift why` and
 /// `owlshift status --waits`: `None` for a reason it does not tell.
@@ -701,6 +775,18 @@ pub(crate) fn wait_words(reason: &str, data: &Data) -> Option<String> {
         )
     };
     let words = match reason {
+        "refresh_owed" => {
+            let onto = text("onto").map_or_else(
+                || "its base".to_owned(),
+                |onto| format!("`{}`", onto.chars().take(7).collect::<String>()),
+            );
+            format!(
+                "{pr} owes a refresh rebase onto {onto}, whose base changed a path it shares with \
+                 another ticket: it waits until {}, then rebases once onto the base head of that \
+                 moment",
+                until_words(data)
+            )
+        }
         "merge_owes_first" => merge(&owes_words(data)),
         "merge_due_first" if text("due") == Some("correction") => merge(
             "a correction a decider's reply asks for comes first, then the merge at the pass \
@@ -1070,5 +1156,110 @@ mod tests {
             "question Q2 of round 1, asked under `naming`, was labelled `security` by the \
              resolver, and a person merges a security question whatever the answer"
         );
+    }
+
+    /// OWL-654: each wait `overlap_refresh` gives maps to its `until`, and
+    /// the wait is worded with the short base head it would rebase onto.
+    #[test]
+    fn refresh_owed_is_worded_with_its_base_and_what_it_waits_for() {
+        let onto = "84072d47aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let cases = [
+            (MergeBlocker::NotGreen, "checks", "its checks read green"),
+            (
+                MergeBlocker::StageMoved,
+                "stage",
+                "the ticket is back in the project's review state on the tracker",
+            ),
+            (
+                MergeBlocker::Unanswered("billing".to_owned()),
+                "question",
+                "its decider answers its question under `billing`",
+            ),
+            (
+                MergeBlocker::Security("security".to_owned()),
+                "question",
+                "its decider answers its question under `security`",
+            ),
+            (
+                MergeBlocker::PersonSteps(1),
+                "person_steps",
+                "the steps it owes a person before the merge are done and their run ends",
+            ),
+            (
+                MergeBlocker::Draft,
+                "draft",
+                "it is marked ready for review",
+            ),
+            (
+                MergeBlocker::SomethingDue,
+                "report",
+                "its DELIVERY report is posted on the tracker",
+            ),
+        ];
+        for (blocker, until, words) in cases {
+            let (reason, fields) = refresh_wait(onto, &blocker);
+            assert_eq!((reason, &fields["until"]), ("refresh_owed", &json!(until)));
+            let event = wait_data(7, "p", reason, fields);
+            assert_eq!(
+                wait_words(reason, &event).unwrap(),
+                format!(
+                    "pull request #7 owes a refresh rebase onto `84072d4`, whose base changed a \
+                     path it shares with another ticket: it waits until {words}, then rebases \
+                     once onto the base head of that moment"
+                ),
+                "{blocker:?}"
+            );
+        }
+        for (until, words) in [
+            (
+                "correction",
+                "the correction a decider's reply asks for ends",
+            ),
+            ("review", "its review loop ends"),
+        ] {
+            let (reason, fields) = refresh_owed(onto, until, None);
+            let words_told = wait_words(reason, &wait_data(7, "p", reason, fields)).unwrap();
+            assert!(words_told.contains(words), "{words_told}");
+        }
+    }
+
+    /// OWL-654: a ticket watch reads only for an end waits for its
+    /// decider's answer, a person's `continue`, or its review loop; one it
+    /// follows is told otherwise.
+    #[test]
+    fn held_until_names_what_a_ticket_read_for_an_end_waits_for() {
+        let parked = Status::Parked {
+            at: Stage::Watch,
+            awaiting_input: false,
+        };
+        let cases = [
+            (
+                Status::NeedsInput {
+                    return_to: Stage::Watch,
+                },
+                Some(("question", "its decider answers its question")),
+            ),
+            (
+                Status::NeedsInput {
+                    return_to: Stage::Build,
+                },
+                Some(("question", "its decider answers its question")),
+            ),
+            (parked, Some(("park", "a person continues it"))),
+            (
+                Status::Active(Stage::Build),
+                Some(("review", "its review loop ends")),
+            ),
+            (Status::Active(Stage::Watch), None),
+        ];
+        for (status, want) in cases {
+            let got = held_until(status);
+            assert_eq!(got, want.map(|(until, _)| until), "{status:?}");
+            if let Some((until, words)) = want {
+                let (reason, fields) = refresh_owed("b1", until, None);
+                let told = wait_words(reason, &wait_data(7, "p", reason, fields)).unwrap();
+                assert!(told.contains(words), "{told}");
+            }
+        }
     }
 }

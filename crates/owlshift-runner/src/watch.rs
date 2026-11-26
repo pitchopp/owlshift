@@ -1129,6 +1129,11 @@ impl Watch<'_> {
             if outlived && self.close_outlived(memory, sink, out, &ticket, &stored, status) {
                 continue;
             }
+            // A refresh owed meanwhile is told, with what it waits for
+            // (OWL-654).
+            if outlived && let Some(delivery) = &stored.record.delivery {
+                self.tell_held_refresh(memory, sink, out, &ticket, delivery, status);
+            }
             // A park at Watch its pull request did not end may be restarted
             // from the ticket (OWL-488), after the resumes.
             if matches!(status, Status::Parked { .. }) {
@@ -1471,6 +1476,10 @@ impl Watch<'_> {
                             adopt: false,
                             action: Action::Green,
                         });
+                // An owed overlap refresh waits for what merge on green
+                // waits for (OWL-654), which is told.
+                let owed = memory.refreshes.due(ticket);
+                let ran = [corrected, reviewed, stepped].contains(&Due::Ran);
                 if no_checks && !settled {
                     // A check may still register: told, merge on green's
                     // holds and reads wait for the window's end (OWL-657).
@@ -1487,9 +1496,21 @@ impl Watch<'_> {
                     .into_iter()
                     .find_map(|(found, due)| (found == Due::Pending).then_some(due))
                 {
-                    // Merge on green waits for it, which is told (OWL-499).
-                    let wait = ("merge_due_first", data([("due", json!(due))]));
-                    self.tell_wait(memory, sink, out, ticket, pr, &seen.head, wait);
+                    if let Some(onto) = &owed {
+                        let wait = crate::merge::refresh_owed(onto, due, None);
+                        self.tell_refresh(memory, sink, out, ticket, pr, &seen.head, wait);
+                    } else {
+                        // Merge on green waits for it, which is told (OWL-499).
+                        let wait = ("merge_due_first", data([("due", json!(due))]));
+                        self.tell_wait(memory, sink, out, ticket, pr, &seen.head, wait);
+                    }
+                } else if !green
+                    && !ran
+                    && let (Some(onto), Some(pr)) = (&owed, &delivery.pull_request)
+                {
+                    // Its checks still run, or fail on the base too.
+                    let wait = crate::merge::refresh_owed(onto, "checks", None);
+                    self.tell_refresh(memory, sink, out, ticket, pr, &seen.head, wait);
                 }
             }
             return;

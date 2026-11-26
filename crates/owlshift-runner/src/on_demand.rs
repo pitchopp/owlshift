@@ -2632,9 +2632,13 @@ impl OnDemand<'_> {
     /// the ticket's overlaps names since `delivery`'s push and its pushed
     /// head does not contain it ([`held::base_moved_on`], OWL-449): what a
     /// refresh rebases onto, as watch reads it. `None` too when git cannot
-    /// tell, the next read asking again.
+    /// tell, the next read asking again. None onto the base head its last
+    /// rebase was pushed onto, as watch reads it (OWL-654).
     fn overlap_base(&self, p: &Prepared, delivery: &TicketDelivery) -> Option<String> {
         let pushed = delivery.pushed.as_deref()?;
+        if delivery.rebased_onto.as_deref() == Some(p.base.commit.as_str()) {
+            return None;
+        }
         held::base_moved_on(
             &self.executor.git,
             &p.checkout,
