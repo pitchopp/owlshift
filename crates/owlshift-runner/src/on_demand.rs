@@ -475,20 +475,6 @@ pub fn decisions_kind(outcome: &Outcome) -> Option<&DecisionsRefusal> {
     }
 }
 
-/// Whether `ticket`'s current wait, as `owlshift why` folds the project's
-/// events, is the `decision` event `event` already (OWL-653): watch meets a
-/// Watch-stage admission's wait at each pass, and tells it once. A log that
-/// does not read tells it again.
-fn told_already(ticket: &TicketId, event: &Data, sink: &EventSink<'_>) -> bool {
-    let Ok((events, _)) = crate::why::read_events(sink.log().path()) else {
-        return false;
-    };
-    crate::why::fold(&events, sink.project())
-        .current
-        .get(ticket)
-        .is_some_and(|wait| wait.data == *event)
-}
-
 /// This machine's clock, the one [`OnDemand::clock`] reads outside tests.
 pub fn system_clock() -> Timestamp {
     Timestamp::now()
@@ -1599,7 +1585,7 @@ struct Prepared {
     stepping: bool,
     /// Watch runs this command at Watch (a repair, a correction, the person
     /// steps, a review loop): its admission waits are told as a step's are,
-    /// once each, so that `owlshift why` shows them (OWL-653).
+    /// so that `owlshift why` shows them (OWL-653).
     for_watch: bool,
     /// `owlshift continue --to-watch` (OWL-420): the command restarts a
     /// park and leaves the ticket to watch, running nothing.
@@ -2430,8 +2416,7 @@ impl OnDemand<'_> {
     /// cover, stops with [`Stop::Waits`] worded for `admission`, with the
     /// `watch` `waits` decision event at its stage when the command steps
     /// for watch, or when watch runs it at Watch ([`Prepared::for_watch`],
-    /// OWL-653) and the ticket's current wait is not that one already
-    /// ([`told_already`]), so that a wait every pass meets is told once.
+    /// OWL-653).
     /// A yielded sibling's taking the record cannot take holds
     /// nothing back: it is warned of.
     fn weigh_admission(
@@ -2472,9 +2457,7 @@ impl OnDemand<'_> {
                 for (key, value) in in_flight::holding_data(&locked.kinds, &found) {
                     event.insert(key.to_owned(), value);
                 }
-                if p.stepping || !told_already(&p.ticket, &event, sink) {
-                    sink.emit(&p.ticket, None, EventKind::Decision, event);
-                }
+                sink.emit(&p.ticket, None, EventKind::Decision, event);
             }
             let (takes, once) = admission.wording();
             return Err(Stop::Waits {

@@ -287,7 +287,7 @@ fn watch_waits(bench: &Bench) -> Vec<Value> {
 /// OWL-653: the same yielded, delivered DEMO-1, its refresh held back at
 /// its re-admission by a person's open pull request, #7, that changes
 /// `AGENTS.md`, the zone DEMO-1 held before it yielded. Watch's passes stop
-/// with the wait, told once in two passes, and `owlshift why DEMO-1` shows
+/// with the wait, told at each pass, and `owlshift why DEMO-1` shows
 /// it as DEMO-1's wait now, naming #7. Once #7 is closed, the refresh runs.
 #[test]
 fn a_yielded_ticket_held_back_at_its_readmission_is_shown_waiting_by_why() {
@@ -322,7 +322,7 @@ fn a_yielded_ticket_held_back_at_its_readmission_is_shown_waiting_by_why() {
             pass += 1;
             match pass {
                 1 => shown = why(),
-                // Two passes held back: the wait is told once.
+                // Two passes held back: the wait is told at each.
                 2 => {
                     told = watch_waits(&bench);
                     bench.github.others.lock().unwrap().clear();
@@ -347,12 +347,14 @@ fn a_yielded_ticket_held_back_at_its_readmission_is_shown_waiting_by_why() {
         "{shown}\n{report}"
     );
     assert!(!shown.contains("not waiting"), "{shown}");
-    assert_eq!(told.len(), 1, "{told:?}\n{report}");
-    assert_eq!(
-        (&told[0]["pull_request"], &told[0]["reason"]),
-        (&json!(7), &json!("collision")),
-        "{report}"
-    );
+    assert_eq!(told.len(), 2, "{told:?}\n{report}");
+    for wait in &told {
+        assert_eq!(
+            (&wait["pull_request"], &wait["reason"]),
+            (&json!(7), &json!("collision")),
+            "{report}"
+        );
+    }
     let runs = rebase_runs(&bench);
     assert_eq!(runs.len(), 1, "{runs:?}\n{report}");
     assert_eq!(
