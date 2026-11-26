@@ -475,6 +475,20 @@ pub fn decisions_kind(outcome: &Outcome) -> Option<&DecisionsRefusal> {
     }
 }
 
+/// Whether `ticket`'s current wait, as `owlshift why` folds the project's
+/// events, is the `decision` event `event` already (OWL-653): watch meets a
+/// Watch-stage admission's wait at each pass, and tells it once. A log that
+/// does not read tells it again.
+fn told_already(ticket: &TicketId, event: &Data, sink: &EventSink<'_>) -> bool {
+    let Ok((events, _)) = crate::why::read_events(sink.log().path()) else {
+        return false;
+    };
+    crate::why::fold(&events, sink.project())
+        .current
+        .get(ticket)
+        .is_some_and(|wait| wait.data == *event)
+}
+
 /// This machine's clock, the one [`OnDemand::clock`] reads outside tests.
 pub fn system_clock() -> Timestamp {
     Timestamp::now()
@@ -1583,6 +1597,10 @@ struct Prepared {
     /// architecture section 5, "One step a pass"): it stops with
     /// [`Stop::Stepped`] at the next change of stage, its state kept.
     stepping: bool,
+    /// Watch runs this command at Watch (a repair, a correction, the person
+    /// steps, a review loop): its admission waits are told as a step's are,
+    /// once each, so that `owlshift why` shows them (OWL-653).
+    for_watch: bool,
     /// `owlshift continue --to-watch` (OWL-420): the command restarts a
     /// park and leaves the ticket to watch, running nothing.
     to_watch: bool,
@@ -2411,7 +2429,10 @@ impl OnDemand<'_> {
     /// record cannot take, keeping the most it keeps, which no refresh would
     /// cover, stops with [`Stop::Waits`] worded for `admission`, with the
     /// `watch` `waits` decision event at its stage when the command steps
-    /// for watch. A yielded sibling's taking the record cannot take holds
+    /// for watch, or when watch runs it at Watch ([`Prepared::for_watch`],
+    /// OWL-653) and the ticket's current wait is not that one already
+    /// ([`told_already`]), so that a wait every pass meets is told once.
+    /// A yielded sibling's taking the record cannot take holds
     /// nothing back: it is warned of.
     fn weigh_admission(
         &self,
@@ -2441,7 +2462,7 @@ impl OnDemand<'_> {
             });
         if let Some(found) = weighed.collision.or(unkept) {
             let (holding, who) = in_flight::holding(&locked.kinds, &found);
-            if p.stepping {
+            if p.stepping || p.for_watch {
                 let mut event = data([
                     ("watch", json!("waits")),
                     ("reason", json!("collision")),
@@ -2451,7 +2472,9 @@ impl OnDemand<'_> {
                 for (key, value) in in_flight::holding_data(&locked.kinds, &found) {
                     event.insert(key.to_owned(), value);
                 }
-                sink.emit(&p.ticket, None, EventKind::Decision, event);
+                if p.stepping || !told_already(&p.ticket, &event, sink) {
+                    sink.emit(&p.ticket, None, EventKind::Decision, event);
+                }
             }
             let (takes, once) = admission.wording();
             return Err(Stop::Waits {
@@ -3193,6 +3216,7 @@ impl OnDemand<'_> {
             // The person's project file, as every `[policy]` key (OWL-331).
             policy: self.config.gate_policy(),
             stepping: false,
+            for_watch: false,
             to_watch: false,
             restart_by: None,
             typed: None,
@@ -7778,7 +7802,7 @@ impl OnDemand<'_> {
         command: Command,
         sink: &mut EventSink<'_>,
     ) -> Option<Result<Prepared, Stop>> {
-        let p = match self.prepare(ticket, command, sink) {
+        let mut p = match self.prepare(ticket, command, sink) {
             Ok(p) => p,
             Err(stop) if stop.is_busy() => return None,
             Err(stop) => return Some(Err(stop)),
@@ -7790,6 +7814,7 @@ impl OnDemand<'_> {
         {
             return None;
         }
+        p.for_watch = true;
         Some(Ok(p))
     }
 

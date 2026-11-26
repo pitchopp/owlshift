@@ -262,6 +262,107 @@ fn a_yielded_delivered_ticket_is_refreshed_past_its_own_pull_request_and_merges_
     assert_eq!(merged.len(), 1, "{report}");
 }
 
+/// Past watch's hold of a step that stopped with its ticket ref as it
+/// was ([`owlshift_runner::watch::RETRY_AFTER`]) on `bench`'s clock, so
+/// that the next pass tries it again.
+fn past_the_retry(bench: &Bench) {
+    let clock = &bench.clock;
+    let retry = SignedDuration::try_from(owlshift_runner::watch::RETRY_AFTER).unwrap();
+    clock.set(
+        clock
+            .get()
+            .checked_add(retry + SignedDuration::from_mins(1))
+            .unwrap(),
+    );
+}
+
+/// The ticket's `watch` = `waits` decision events.
+fn watch_waits(bench: &Bench) -> Vec<Value> {
+    data_of(&bench.events(), EventKind::Decision, "watch")
+        .into_iter()
+        .filter(|data| data["watch"] == "waits")
+        .collect()
+}
+
+/// OWL-653: the same yielded, delivered DEMO-1, its refresh held back at
+/// its re-admission by a person's open pull request, #7, that changes
+/// `AGENTS.md`, the zone DEMO-1 held before it yielded. Watch's passes stop
+/// with the wait, told once in two passes, and `owlshift why DEMO-1` shows
+/// it as DEMO-1's wait now, naming #7. Once #7 is closed, the refresh runs.
+#[test]
+fn a_yielded_ticket_held_back_at_its_readmission_is_shown_waiting_by_why() {
+    let (bench, main) = yielded_and_refreshed();
+    bench.github.others.lock().unwrap().push((
+        7,
+        "person/agents".to_owned(),
+        vec!["AGENTS.md".to_owned()],
+    ));
+    let refresh = replayed_onto(&bench, main.clone());
+    let why = || {
+        let now = bench.clock.get();
+        owlshift_runner::why::render(
+            &owlshift_runner::why::gather(
+                &bench.data,
+                &bench.dirs(),
+                REPO,
+                Some(ticket()),
+                2,
+                &[],
+                now,
+            )
+            .unwrap(),
+        )
+    };
+    let (mut shown, mut told) = (String::new(), Vec::new());
+    let mut pass = 0;
+    let (outcomes, lines, printed) = bench.watch_during(
+        vec![bench.reply(None, Some(REBASED))],
+        vec![refresh],
+        &mut |_| {
+            pass += 1;
+            match pass {
+                1 => shown = why(),
+                // Two passes held back: the wait is told once.
+                2 => {
+                    told = watch_waits(&bench);
+                    bench.github.others.lock().unwrap().clear();
+                }
+                _ => {}
+            }
+            past_the_retry(&bench);
+            pass < 5
+        },
+    );
+    let report = format!("{outcomes:?}\n{lines}\n{printed}");
+    let waits = "pull request #7 holds zone `AGENTS.md`, which it held before it yielded: it is \
+                 admitted again once pull request #7 no longer holds it";
+    for outcome in &outcomes[..2] {
+        assert!(
+            matches!(outcome, Err(Stop::Waits { said, .. }) if said == waits),
+            "{report}"
+        );
+    }
+    assert!(
+        shown.contains("now: pull request #7 holds zone `AGENTS.md`, which it would touch\n"),
+        "{shown}\n{report}"
+    );
+    assert!(!shown.contains("not waiting"), "{shown}");
+    assert_eq!(told.len(), 1, "{told:?}\n{report}");
+    assert_eq!(
+        (&told[0]["pull_request"], &told[0]["reason"]),
+        (&json!(7), &json!("collision")),
+        "{report}"
+    );
+    let runs = rebase_runs(&bench);
+    assert_eq!(runs.len(), 1, "{runs:?}\n{report}");
+    assert_eq!(
+        (&runs[0]["cause"], &runs[0]["onto"]),
+        (&json!("overlap"), &json!(main)),
+        "{report}"
+    );
+    assert_eq!(readmissions(&bench).len(), 1, "{report}");
+}
+
 /// OWL-613: DEMO-1, delivered, its own record sharing `AGENTS.md` with
 /// DEMO-2, which another runner claims and this one has no ref of; the
 /// project claiming on the remote when `remote`. This runner fetches the
