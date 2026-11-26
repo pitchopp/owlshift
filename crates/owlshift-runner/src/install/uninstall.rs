@@ -485,28 +485,56 @@ mod tests {
     fn an_app_entrys_removal_is_recorded() {
         let data = tempfile::tempdir().unwrap();
         let data = data.path();
-        let repo = Repo::parse("Owner/Repo").unwrap();
-        let app = crate::secrets::ForgeAccount::project_app(&repo).token;
+        let app = |repo: &str| {
+            crate::secrets::ForgeAccount::project_app(&Repo::parse(repo).unwrap()).token
+        };
+        let (app, other) = (app("Owner/Repo"), app("acme/web"));
         let listed = |account: &str| KeychainEntry {
             service: SERVICE.to_owned(),
             account: account.to_owned(),
         };
         Manifests::in_data_dir(data)
-            .record_keychain(&[listed(&app), listed("claude-agent")])
+            .record_keychain(&[listed(&app), listed("claude-agent"), listed(&other)])
             .unwrap();
         let keychain = || {
             let keychain = Keychain::in_memory();
-            for account in [app.as_str(), "claude-agent"] {
+            for account in [app.as_str(), "claude-agent", other.as_str()] {
                 keychain.store(account, &Secret::new("token")).unwrap();
             }
             Ok(keychain)
         };
         let report = remove_listed(data, &FakeManager::default(), &keychain).unwrap();
-        assert_eq!(report.removed.len(), 2, "{report:?}");
+        assert_eq!(report.removed.len(), 3, "{report:?}");
         let events = logged(data);
-        assert_eq!(told(&events), ["keychain_write removed"]);
-        assert_eq!(events[0].project, "owner/repo");
-        assert_eq!(events[0].data["by"], "uninstall");
+        assert_eq!(
+            told(&events),
+            ["keychain_write removed", "keychain_write removed"]
+        );
+        assert_eq!(
+            events
+                .iter()
+                .map(|e| e.project.as_str())
+                .collect::<Vec<_>>(),
+            ["owner/repo", "acme/web"]
+        );
+        assert!(events.iter().all(|e| e.data["by"] == "uninstall"));
+
+        // The line `owlshift logs` prints names each project (F2).
+        let mut printed = Vec::new();
+        events::print(
+            events::EventLog::in_dir(data).path(),
+            None,
+            &mut printed,
+            &mut Vec::new(),
+            None,
+            None,
+        )
+        .unwrap();
+        let printed = String::from_utf8(printed).unwrap();
+        let lines: Vec<&str> = printed.lines().collect();
+        assert_eq!(lines.len(), 2, "{printed}");
+        assert!(lines[0].contains(" project=owner/repo "), "{printed}");
+        assert!(lines[1].contains(" project=acme/web "), "{printed}");
     }
 
     /// Owlshift's entries go, a person's file stays and is named, and a

@@ -183,8 +183,9 @@ impl<R: Refresh + ?Sized> Refresh for &R {
 /// `owlshift logs` prints: each refresh, and each keychain write or removal
 /// of the pair. They are project events, of no ticket and no run, keyed
 /// `github_app` (`refresh` or `keychain_write`): a `decision` when it went as
-/// meant, a `warning` saying `why` otherwise. Each holds its `outcome` and
-/// the process (`pid`, `command`, `version`), with expiries in RFC 3339;
+/// meant, a `warning` saying `why` otherwise. Each holds its `outcome`, its
+/// `project` (which the printed line shows) and the process (`pid`,
+/// `command`, `version`), with expiries in RFC 3339;
 /// never a token. A failed append is said on standard error and never fails
 /// what it records.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -251,10 +252,14 @@ impl TokenEvents {
     }
 
     /// Appends one event of `what`, `github_app`, with `outcome`, the
-    /// process and `data`: a `decision`, or a `warning` when there is `why`.
+    /// project, the process and `data`: a `decision`, or a `warning` when
+    /// there is `why`. The project is in the data as well as in the event,
+    /// since `owlshift logs` prints the data alone and one data directory's
+    /// log serves several projects.
     fn record(&self, what: &str, outcome: &str, why: Option<&str>, mut data: Data) {
         data.insert("github_app".to_owned(), json!(what));
         data.insert("outcome".to_owned(), json!(outcome));
+        data.insert("project".to_owned(), json!(self.project));
         data.insert("pid".to_owned(), json!(std::process::id()));
         data.insert(
             "command".to_owned(),
@@ -1390,6 +1395,7 @@ mod tests {
         for event in &events {
             assert_eq!(event.kind, EventKind::Decision, "{event:?}");
             assert_eq!(event.project, "owner/repo");
+            assert_eq!(event.data["project"], "owner/repo");
             assert_eq!((event.ticket.as_ref(), event.run.as_ref()), (None, None));
             assert_eq!(event.data["pid"], std::process::id());
             assert_eq!(event.data["version"], OWLSHIFT_VERSION);
@@ -1418,6 +1424,12 @@ mod tests {
             printed.contains("github_app=refresh") && printed.contains("outcome=rotated"),
             "{printed}"
         );
+        // Each line names the project, which a log of several projects needs
+        // to tell whose token it was (OWL-649, F2).
+        assert_eq!(printed.lines().count(), 3, "{printed}");
+        for line in printed.lines() {
+            assert!(line.contains(" project=owner/repo "), "{line}");
+        }
     }
 
     /// OWL-649: a pair a peer stored, a refusal, no answer and a refresh
