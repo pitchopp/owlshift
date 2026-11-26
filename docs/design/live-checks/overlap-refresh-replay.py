@@ -15,7 +15,10 @@
 # `merge_due_first` or `merge_owes_first` wait told. Ready at the moment a refresh ran, it runs then. The newest
 # `onto` owed is the one it rebases onto.
 # Approximations: the history after a refresh that ran is the old rule's, so the reads that follow it are of the
-# rebased head, whose CI ran again; a read's readiness is taken from the events of its pass, not from the ref.
+# rebased head, whose CI ran again; a read's readiness is taken from the events of its pass, not from the ref. A
+# refresh the new rule runs at a read where the old rule ran none replaces the head read then: later reads of that
+# same head are of a head the new rule no longer has, and count as not read, so a refresh owed after it waits for a
+# read of another head.
 # Prints `overlap refreshes run: N` and `under the new rule: M`, each with its base heads.
 import datetime, json, sys
 
@@ -96,6 +99,8 @@ def short(commit):
 
 stage, verdict, head, read_at, holds = None, None, None, None, []
 owed, owed_since = None, None
+# The head a refresh the new rule ran at a read replaced: its later reads are not the new rule's.
+replaced = None
 old, new = [], []
 for i, (at, event) in enumerate(events):
     d = data(event)
@@ -103,7 +108,13 @@ for i, (at, event) in enumerate(events):
     if is_read(event):
         verdict, head, read_at = d.get("verdict"), d.get("head"), at
         holds = pass_holds(i)
-        print(f"  {stamp} read {verdict} at {short(head)}" + (f" ({'; '.join(holds)})" if holds else ""))
+        line = f"  {stamp} read {verdict} at {short(head)}" + (f" ({'; '.join(holds)})" if holds else "")
+        if head and head == replaced:
+            verdict, holds = None, []
+            line += "; under the new rule this head was replaced by its refresh: not read"
+        else:
+            replaced = None
+        print(line)
     elif event.get("kind") == "run_started":
         print(f"  {stamp} run started: {d.get('role')}")
     elif stage_of(event):
@@ -135,6 +146,8 @@ for i, (at, event) in enumerate(events):
               f"{owed_since.strftime('%Y-%m-%d %H:%M:%SZ')} runs now, onto {short(owed)}")
         new.append((at, owed))
         owed, owed_since = None, None
+        # Its push follows under the new rule: the next read to count is of the rebased head.
+        verdict, holds, replaced = None, [], head
 
 print(f"overlap refreshes run: {len(old)}" + (f" ({', '.join(short(onto) for _, onto in old)})" if old else ""))
 print(f"under the new rule: {len(new)}" + (f" ({', '.join(short(onto) for _, onto in new)})" if new else ""))
