@@ -136,7 +136,7 @@ pub struct HttpLogin {
 impl HttpLogin {
     pub fn new() -> Self {
         Self {
-            agent: super::github::agent(Duration::from_secs(30)),
+            agent: super::github::login_agent(),
         }
     }
 }
@@ -154,9 +154,19 @@ impl fmt::Debug for HttpLogin {
 }
 
 impl Login for HttpLogin {
+    /// No answer says whether the request surely never left, or may have
+    /// reached GitHub, which for a refresh may have rotated the pair
+    /// (OWL-649).
     fn post_form(&self, url: &str, form: &[(&str, &str)]) -> Result<LoginAnswer, String> {
         // A ureq error may name the request; it is not repeated.
-        let unreachable = |_| format!("GitHub's login endpoint {url} could not be reached");
+        let unreachable = |error: ureq::Error| {
+            let what = if nothing_sent(&error) {
+                "no connection was made, nothing was sent"
+            } else {
+                "no answer came, and the request may have reached it"
+            };
+            format!("GitHub's login endpoint {url} could not be reached ({what})")
+        };
         let mut response = self
             .agent
             .post(url)
@@ -169,8 +179,33 @@ impl Login for HttpLogin {
             .with_config()
             .limit(MAX_ANSWER_BYTES)
             .read_to_string()
-            .map_err(|_| format!("GitHub's answer from {url} could not be read"))?;
+            .map_err(|_| {
+                format!(
+                    "GitHub's answer from {url} could not be read: the request may have reached it"
+                )
+            })?;
         Ok(LoginAnswer { status, body })
+    }
+}
+
+/// Whether `error` came before any byte of the request was written: the
+/// name not resolved, or no connection made within the login agent's
+/// bounds. The `Io` kinds are those ureq 3.4.2's connect gives for one
+/// address (`is_addr_specific_error`, transport/tcp.rs, read on
+/// 2026-11-26). Any other error, a TLS one included, may come after the
+/// request was sent.
+fn nothing_sent(error: &ureq::Error) -> bool {
+    match error {
+        ureq::Error::HostNotFound | ureq::Error::ConnectionFailed => true,
+        ureq::Error::Timeout(ureq::Timeout::Resolve | ureq::Timeout::Connect) => true,
+        ureq::Error::Io(io) => matches!(
+            io.kind(),
+            std::io::ErrorKind::ConnectionRefused
+                | std::io::ErrorKind::HostUnreachable
+                | std::io::ErrorKind::NetworkUnreachable
+                | std::io::ErrorKind::AddrNotAvailable
+        ),
+        _ => false,
     }
 }
 
@@ -922,8 +957,76 @@ mod tests {
         let refused = HttpLogin::new().post_form(&url, &[("grant_type", "refresh_token")]);
         assert_eq!(
             refused.unwrap_err(),
-            format!("GitHub's login endpoint {url} could not be reached")
+            format!(
+                "GitHub's login endpoint {url} could not be reached (no connection was made, \
+                 nothing was sent)"
+            )
         );
+    }
+
+    /// OWL-649: an endpoint that takes the request and closes without an
+    /// answer may have acted on it, and the words say so.
+    #[test]
+    fn a_request_taken_and_unanswered_may_have_reached_github() {
+        use std::io::Read;
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let taker = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0u8; 4096];
+            let _ = stream.read(&mut request);
+        });
+        let url = format!("http://127.0.0.1:{port}/login/oauth/access_token");
+        let error = HttpLogin::new()
+            .post_form(&url, &[("grant_type", "refresh_token")])
+            .unwrap_err();
+        taker.join().unwrap();
+        assert_eq!(
+            error,
+            format!(
+                "GitHub's login endpoint {url} could not be reached (no answer came, and the \
+                 request may have reached it)"
+            )
+        );
+    }
+
+    /// OWL-649: the login agent bounds the resolve and the connect, inside
+    /// the whole request's 30 s.
+    #[test]
+    fn the_login_agent_bounds_resolve_and_connect() {
+        let timeouts = HttpLogin::new().agent.config().timeouts();
+        assert_eq!(timeouts.resolve, Some(Duration::from_secs(10)));
+        assert_eq!(timeouts.connect, Some(Duration::from_secs(10)));
+        assert_eq!(timeouts.global, Some(Duration::from_secs(30)));
+    }
+
+    /// OWL-649: what is sure to have sent nothing, and what may have.
+    #[test]
+    fn nothing_sent_is_said_of_a_resolve_or_a_connect_alone() {
+        use std::io::{Error as Io, ErrorKind};
+        use ureq::{Error, Timeout};
+
+        for unsent in [
+            Error::HostNotFound,
+            Error::ConnectionFailed,
+            Error::Timeout(Timeout::Resolve),
+            Error::Timeout(Timeout::Connect),
+            Error::Io(Io::from(ErrorKind::ConnectionRefused)),
+            Error::Io(Io::from(ErrorKind::NetworkUnreachable)),
+        ] {
+            assert!(nothing_sent(&unsent), "{unsent:?}");
+        }
+        for maybe in [
+            Error::Timeout(Timeout::Global),
+            Error::Timeout(Timeout::RecvResponse),
+            Error::Timeout(Timeout::SendBody),
+            Error::Io(Io::from(ErrorKind::ConnectionReset)),
+            Error::Io(Io::from(ErrorKind::UnexpectedEof)),
+            Error::Tls("handshake"),
+        ] {
+            assert!(!nothing_sent(&maybe), "{maybe:?}");
+        }
     }
 
     #[test]
