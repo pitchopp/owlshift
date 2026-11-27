@@ -15,6 +15,8 @@ use owlshift_platform::service::Manager;
 use super::manifest::Manifests;
 use super::remove_service_files;
 use crate::events;
+use crate::forge::app_account_project;
+use crate::github_token::{TokenEvents, Written};
 
 /// How long `owlshift uninstall` waits for the daemon to end once it was sent
 /// SIGTERM: past launchd's grace of 60 seconds and systemd's of 90, after
@@ -145,6 +147,9 @@ pub fn remove_listed(
                     Err(error) => Err(error.clone()),
                     Ok(keychain) => keychain.delete(&entry.account).map_err(|e| e.to_string()),
                 };
+                if entry.service == SERVICE {
+                    app_entry_removed(data, &entry.account, &outcome);
+                }
                 match outcome {
                     Ok(_) => report.removed.push(named),
                     Err(why) => {
@@ -158,6 +163,27 @@ pub fn remove_listed(
         write(manifest)?;
         Ok(report)
     })
+}
+
+/// Records the removal of `account`, when it holds a project's GitHub App
+/// pair, in the event log of `data` (OWL-649), as the project the account
+/// names, lowercase ([`app_account_project`]); `outcome` says whether the
+/// keychain had one to remove.
+fn app_entry_removed(data: &Path, account: &str, outcome: &Result<bool, String>) {
+    let Some(project) = app_account_project(account) else {
+        return;
+    };
+    let written = match outcome {
+        Ok(true) => Written::Removed,
+        Ok(false) => Written::NoneStored,
+        Err(why) => Written::Failed(why.clone()),
+    };
+    TokenEvents::new(events::EventLog::in_dir(data), project).keychain_write(
+        "uninstall",
+        &written,
+        None,
+        events::Data::new(),
+    );
 }
 
 /// Why `data` cannot be purged, before anything is removed: it is the
@@ -341,6 +367,7 @@ mod tests {
     use owlshift_platform::keychain::Secret;
 
     use super::*;
+    use crate::github_token::testing::{logged, told};
     use crate::install::tests::FakeManager;
     use crate::project::ProjectDirs;
     use crate::served::Registry;
@@ -449,6 +476,65 @@ mod tests {
         assert_eq!(report.left.len(), 2, "{report:?}");
         assert!(report.left[1].ends_with("keychain: locked"), "{report:?}");
         assert_eq!(manifests.read().unwrap().keychain.len(), 2);
+    }
+
+    /// OWL-649: the removal of a project's GitHub App pair is recorded in
+    /// the data directory's log, as the project its account names,
+    /// lowercase; another entry's is not.
+    #[test]
+    fn an_app_entrys_removal_is_recorded() {
+        let data = tempfile::tempdir().unwrap();
+        let data = data.path();
+        let app = |repo: &str| {
+            crate::secrets::ForgeAccount::project_app(&Repo::parse(repo).unwrap()).token
+        };
+        let (app, other) = (app("Owner/Repo"), app("acme/web"));
+        let listed = |account: &str| KeychainEntry {
+            service: SERVICE.to_owned(),
+            account: account.to_owned(),
+        };
+        Manifests::in_data_dir(data)
+            .record_keychain(&[listed(&app), listed("claude-agent"), listed(&other)])
+            .unwrap();
+        let keychain = || {
+            let keychain = Keychain::in_memory();
+            for account in [app.as_str(), "claude-agent", other.as_str()] {
+                keychain.store(account, &Secret::new("token")).unwrap();
+            }
+            Ok(keychain)
+        };
+        let report = remove_listed(data, &FakeManager::default(), &keychain).unwrap();
+        assert_eq!(report.removed.len(), 3, "{report:?}");
+        let events = logged(data);
+        assert_eq!(
+            told(&events),
+            ["keychain_write removed", "keychain_write removed"]
+        );
+        assert_eq!(
+            events
+                .iter()
+                .map(|e| e.project.as_str())
+                .collect::<Vec<_>>(),
+            ["owner/repo", "acme/web"]
+        );
+        assert!(events.iter().all(|e| e.data["by"] == "uninstall"));
+
+        // The line `owlshift logs` prints names each project (F2).
+        let mut printed = Vec::new();
+        events::print(
+            events::EventLog::in_dir(data).path(),
+            None,
+            &mut printed,
+            &mut Vec::new(),
+            None,
+            None,
+        )
+        .unwrap();
+        let printed = String::from_utf8(printed).unwrap();
+        let lines: Vec<&str> = printed.lines().collect();
+        assert_eq!(lines.len(), 2, "{printed}");
+        assert!(lines[0].contains(" project=owner/repo "), "{printed}");
+        assert!(lines[1].contains(" project=acme/web "), "{printed}");
     }
 
     /// Owlshift's entries go, a person's file stays and is named, and a

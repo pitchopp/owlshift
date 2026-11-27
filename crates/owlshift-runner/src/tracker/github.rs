@@ -194,14 +194,7 @@ kind = \"github\"
             Arc::new(Keychain::system().map_err(|e| format!("the keychain cannot be read: {e}"))?);
         let mut look = |account: &str| keychain.read(account).map_err(|e| e.to_string());
         let found = crate::secrets::forge(repo, &mut look)?;
-        let access = AppAccess {
-            keychain: keychain.clone(),
-            lock: ProjectDirs::new(data, repo).account_lock_file(),
-            app: crate::forge::GitHubApp::from_personal(match personal {
-                FileState::Loaded { config, .. } => Some(config),
-                _ => None,
-            }),
-        };
+        let access = reply_access(keychain.clone(), data, repo, personal);
         let open = || {
             crate::forge::github(&found, repo.clone(), &access)
                 .map_err(|refusal| refusal.to_string())
@@ -321,6 +314,25 @@ const GITHUB_WORDS: AdmissionWords = AdmissionWords {
                      `[tracker]` to `\"ready\"` or `{ label = … }`.",
     checked: "labels and admitters exist on GitHub",
 };
+
+/// The GitHub App's access a reply of the UI refreshes through, as
+/// `owlshift do`'s: the project of `repo`'s account lock and its data
+/// directory `data`'s event log (OWL-649), and the app of `personal`.
+fn reply_access(
+    keychain: Arc<Keychain>,
+    data: &Path,
+    repo: &Repo,
+    personal: &FileState<PersonalConfig>,
+) -> AppAccess {
+    AppAccess::for_project(
+        keychain,
+        &ProjectDirs::new(data, repo),
+        crate::forge::GitHubApp::from_personal(match personal {
+            FileState::Loaded { config, .. } => Some(config),
+            _ => None,
+        }),
+    )
+}
 
 /// The labels `init` creates when missing (OWL-537): the stage labels, the
 /// admission and exclusion labels, and [`PROPOSED_LABEL`].
@@ -899,5 +911,26 @@ mod tests {
             let error = check(refused).unwrap_err();
             assert!(error.contains("not an issue number"), "{refused}: {error}");
         }
+    }
+
+    /// OWL-649: a reply's refresh takes the project's account lock and is
+    /// recorded in its data directory's log, as `owlshift do`'s.
+    #[test]
+    fn a_replys_access_is_the_projects() {
+        let data = tempfile::tempdir().unwrap();
+        let repo = Repo::parse("owner/repo").unwrap();
+        let personal = FileState::Absent(data.path().join("personal.toml"));
+        let access = reply_access(
+            Arc::new(Keychain::in_memory()),
+            data.path(),
+            &repo,
+            &personal,
+        );
+        let dirs = ProjectDirs::new(data.path(), &repo);
+        assert_eq!(access.lock(), dirs.account_lock_file());
+        assert_eq!(
+            access.log(),
+            Some(&crate::events::EventLog::in_dir(data.path()))
+        );
     }
 }

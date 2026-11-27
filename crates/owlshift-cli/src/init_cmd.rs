@@ -321,18 +321,20 @@ pub fn run(args: &Args, config: &Effective) -> ExitCode {
         FileState::Loaded { config, .. } => Some(config),
         _ => None,
     });
-    // A stored token is refreshed under the project's account lock, as
-    // `owlshift do` refreshes it (OWL-384). Without a data directory no `do`
-    // runs to share it with, so any lock file does.
-    let lock = match (&repo, crate::data_dir()) {
-        (Ok(repo), Ok(dir)) => ProjectDirs::new(&dir, repo).account_lock_file(),
-        _ => std::env::temp_dir().join("owlshift-github-app.lock"),
-    };
+    // A stored token is refreshed under the project's account lock and
+    // recorded in its data directory's log, as `owlshift do` refreshes it
+    // (OWL-384, OWL-649).
+    let access = app_access(
+        keychain.clone(),
+        repo.as_ref().ok(),
+        crate::data_dir(),
+        app.clone(),
+    );
     let github_ready = match &repo {
-        Ok(repo) if args.github_token => personal_token_chosen(&keychain, repo, &report),
+        Ok(repo) if args.github_token => personal_token_chosen(&access, repo, &report),
         Ok(repo) => {
             let flow = DeviceFlow::new(HttpLogin::new(), &app.client_id);
-            let github = GitHub::live(flow, repo, lock.clone());
+            let github = GitHub::live(flow, repo, access.clone());
             let ask = Ask {
                 replace: args.replace_secrets,
                 terminal,
@@ -357,12 +359,7 @@ pub fn run(args: &Args, config: &Effective) -> ExitCode {
     };
     record_in_manifest(crate::data_dir(), &stored);
     // The tracker is asked before the project file is written, with what
-    // was just stored (OWL-537).
-    let access = AppAccess {
-        keychain: keychain.clone(),
-        lock,
-        app,
-    };
+    // was just stored (OWL-537), through the same access.
     // A Linear team left to pick is picked now, among the teams the key just
     // stored reads (OWL-596).
     let project = match &mut file {
@@ -777,17 +774,42 @@ fn record_in_manifest(data: Result<std::path::PathBuf, String>, stored: &[String
     }
 }
 
+/// The GitHub App's access `init` refreshes a stored token through, with
+/// the keychain `keychain` and the app `app`: the project's account lock and
+/// data directory's event log, as `owlshift do`'s (OWL-649), when `repo` is
+/// known and `data` is found. Otherwise no `do` runs to share the lock with,
+/// so a lock in the temporary folder does, and nothing is recorded.
+fn app_access(
+    keychain: Arc<Keychain>,
+    repo: Option<&Repo>,
+    data: Result<std::path::PathBuf, String>,
+    app: GitHubApp,
+) -> AppAccess {
+    match (repo, data) {
+        (Some(repo), Ok(data)) => {
+            AppAccess::for_project(keychain, &ProjectDirs::new(&data, repo), app)
+        }
+        _ => AppAccess::unrecorded(
+            keychain,
+            std::env::temp_dir().join("owlshift-github-app.lock"),
+            app,
+        ),
+    }
+}
+
 /// With `--github-token`: once the project holds a personal token of its
 /// own, stored or kept, removes its GitHub App token, which would otherwise
 /// be used first, and says so; `false` when that removal fails. With no
 /// personal token of its own, nothing is removed, and the token's absence is
-/// in `report` already.
-fn personal_token_chosen(keychain: &Keychain, repo: &Repo, report: &SecretsReport) -> bool {
+/// in `report` already. The removal is made in the keychain of `access` and
+/// recorded in its event log, when it has one, as the project's (OWL-649).
+fn personal_token_chosen(access: &AppAccess, repo: &Repo, report: &SecretsReport) -> bool {
     let own = |found: &[Wanted]| found.iter().any(|one| one.spec == GITHUB_TOKEN);
     if !(own(&report.stored) || own(&report.kept)) {
         return true;
     }
-    match github_sign_in::remove_app_token(keychain, repo) {
+    let events = access.events(&repo.to_string());
+    match github_sign_in::remove_app_token(access.keychain(), repo, events.as_ref()) {
         Ok(true) => {
             println!(
                 "Removed the GitHub App's token this project had stored (account `{}`): the \
@@ -1138,11 +1160,27 @@ mod tests {
 
     /// Criterion 6 (OWL-383): `--github-token` stores the personal token under
     /// the project's own account and removes the app token, which would be
-    /// used first; with no personal token given, the app token stays.
+    /// used first; with no personal token given, the app token stays. The
+    /// removal is recorded in the log of init's access, the project's data
+    /// directory's (OWL-649).
     #[test]
     fn a_personal_token_with_github_token_removes_the_app_token() {
+        let data = tempfile::tempdir().unwrap();
         let repo = Repo::parse("pitchopp/owlshift").unwrap();
-        let keychain = Keychain::in_memory();
+        let keychain = Arc::new(Keychain::in_memory());
+        let access = app_access(
+            keychain.clone(),
+            Some(&repo),
+            Ok(data.path().to_owned()),
+            GitHubApp::from_personal(None),
+        );
+        let printed = || {
+            let mut out = Vec::new();
+            let log = owlshift_runner::events::EventLog::in_dir(data.path());
+            owlshift_runner::events::print(log.path(), None, &mut out, &mut Vec::new(), None, None)
+                .unwrap();
+            String::from_utf8(out).unwrap()
+        };
         let app = ForgeAccount::project_app(&repo).token;
         keychain
             .store(&app, &Secret::new("{\"v\":1,\"access_token\":\"ghu_x\"}"))
@@ -1153,15 +1191,28 @@ mod tests {
 
         let report = store_secrets(&keychain, &wanted, false, &mut |_| None).unwrap();
         assert_eq!(report.missing.len(), 1);
-        assert!(personal_token_chosen(&keychain, &repo, &report));
+        assert!(personal_token_chosen(&access, &repo, &report));
         assert!(keychain.contains(&app).unwrap());
+        assert_eq!(printed(), "");
 
         let report = store_secrets(&keychain, &wanted, false, &mut |_| {
             Some(Secret::new("github_pat_x"))
         })
         .unwrap();
-        assert!(personal_token_chosen(&keychain, &repo, &report));
+        assert!(personal_token_chosen(&access, &repo, &report));
         assert!(!keychain.contains(&app).unwrap());
+        let printed = printed();
+        let lines: Vec<&str> = printed.lines().collect();
+        assert_eq!(lines.len(), 1, "{printed}");
+        for detail in [
+            " github_app=keychain_write ",
+            " by=removal ",
+            " outcome=removed ",
+            " project=pitchopp/owlshift ",
+        ] {
+            assert!(lines[0].contains(detail), "{detail}: {printed}");
+        }
+        assert!(!printed.contains("ghu_"), "{printed}");
         assert_eq!(
             keychain
                 .read(&ForgeAccount::project(&repo).token)
@@ -1170,5 +1221,36 @@ mod tests {
                 .expose(),
             "github_pat_x"
         );
+    }
+
+    /// OWL-649: with a repository and a data directory, init's access is
+    /// the project's, its lock and its log; otherwise it records nothing.
+    #[test]
+    fn inits_access_is_the_projects_when_it_has_one() {
+        let data = tempfile::tempdir().unwrap();
+        let repo = Repo::parse("owner/repo").unwrap();
+        let keychain = Arc::new(Keychain::in_memory());
+        let app = GitHubApp::from_personal(None);
+        let access = app_access(
+            keychain.clone(),
+            Some(&repo),
+            Ok(data.path().to_owned()),
+            app.clone(),
+        );
+        let dirs = ProjectDirs::new(data.path(), &repo);
+        assert_eq!(access.lock(), dirs.account_lock_file());
+        assert_eq!(
+            access.log(),
+            Some(&owlshift_runner::events::EventLog::in_dir(data.path()))
+        );
+
+        let temp = std::env::temp_dir().join("owlshift-github-app.lock");
+        for (repo, data) in [
+            (None, Ok(data.path().to_owned())),
+            (Some(&repo), Err("no data directory".to_owned())),
+        ] {
+            let access = app_access(keychain.clone(), repo, data, app.clone());
+            assert_eq!((access.lock(), access.log()), (temp.as_path(), None));
+        }
     }
 }

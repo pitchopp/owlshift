@@ -31,8 +31,7 @@ use owlshift_adapters::forge::github::{HttpTransport, TokenSource};
 use owlshift_adapters::forge::github_app::{DeviceFlow, HttpLogin};
 use owlshift_adapters::graphql::Transport;
 use owlshift_platform::keychain::Keychain;
-use owlshift_runner::forge::GitHubApp;
-use owlshift_runner::github_token::AppToken;
+use owlshift_runner::forge::{AppAccess, GitHubApp};
 use owlshift_runner::project::ProjectDirs;
 use owlshift_runner::secrets::{self, ForgeKind};
 use serde_json::{Value, json};
@@ -69,20 +68,23 @@ fn transport(keychain: &Arc<Keychain>, repo: &Repo) -> Result<HttpTransport, Str
         ));
     };
     let data = owlshift_platform::paths::data_dir().ok_or("no data directory")?;
-    let lock = ProjectDirs::new(&data, repo).account_lock_file();
-    if let Some(dir) = lock.parent() {
-        std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
-    }
-    let app = GitHubApp::from_personal(None);
-    let flow = DeviceFlow::new(HttpLogin::new(), &app.client_id);
-    let mut source = AppToken::new(
+    // As a watch's: under the project's account lock, recorded in its data
+    // directory's log, and held in a dark wake (OWL-649).
+    let access = AppAccess::for_project(
         keychain.clone(),
-        found.account.token.clone(),
-        lock,
-        flow,
-        entry,
-    )
-    .map_err(|e| e.message)?;
+        &ProjectDirs::new(&data, repo),
+        GitHubApp::from_personal(None),
+    );
+    let flow = DeviceFlow::new(HttpLogin::new(), &access.app().client_id);
+    let mut source = access
+        .token(
+            keychain.clone(),
+            found.account.token.clone(),
+            flow,
+            entry,
+            &repo.to_string(),
+        )
+        .map_err(|e| e.message)?;
     let token = source.token().map_err(|e| e.message)?;
     Ok(HttpTransport::new(token))
 }

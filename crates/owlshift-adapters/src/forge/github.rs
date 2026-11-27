@@ -132,16 +132,46 @@ impl HttpTransport {
 
 /// An agent that follows no redirect: [`HttpTransport::get`] follows the
 /// one a log answers itself, without the token. The GitHub App's sign-in
-/// ([`crate::forge::github_app`]) posts through one too, and
-/// [`crate::release`] reads where a release redirects with one.
+/// ([`crate::forge::github_app`]) posts through one too ([`login_agent`]),
+/// and [`crate::release`] reads where a release redirects with one.
 pub(crate) fn agent(timeout: Duration) -> ureq::Agent {
-    let config = ureq::Agent::config_builder()
+    ureq::Agent::new_with_config(agent_config(timeout).build())
+}
+
+/// [`agent`]'s settings, `timeout` the whole request's.
+fn agent_config(timeout: Duration) -> ureq::config::ConfigBuilder<ureq::typestate::AgentScope> {
+    ureq::Agent::config_builder()
         .timeout_global(Some(timeout))
         // A 401 or 403 carries a body worth reading.
         .http_status_as_error(false)
         .max_redirects(0)
         // GitHub refuses requests without a user agent.
         .user_agent(concat!("owlshift/", env!("CARGO_PKG_VERSION")))
+}
+
+/// The longest a GitHub login request may take, as [`agent`]'s timeout.
+pub(crate) const LOGIN_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// The longest the login agent resolves GitHub's name.
+pub(crate) const LOGIN_RESOLVE: Duration = Duration::from_secs(10);
+
+/// The longest the login agent opens its connection, TLS handshake
+/// included.
+pub(crate) const LOGIN_CONNECT: Duration = Duration::from_secs(10);
+
+/// The agent of GitHub's login endpoints ([`crate::forge::github_app`]):
+/// [`agent`]'s, its resolve and connect bounded too (OWL-649), so that a
+/// request that never left is told apart from one that may have reached
+/// GitHub. ureq 3.4.2 (its source, read on 2026-11-26) reports the earliest
+/// configured deadline of a phase (`Timings::next_timeout`, timings.rs), so
+/// a resolve or a connect that runs out is `Timeout::Resolve` or
+/// `Timeout::Connect`, where under the global timeout alone every timeout
+/// was `Timeout::Global`; the request is written only once the connection,
+/// TLS handshake included (config.rs, `timeout_connect`), is made.
+pub(crate) fn login_agent() -> ureq::Agent {
+    let config = agent_config(LOGIN_TIMEOUT)
+        .timeout_resolve(Some(LOGIN_RESOLVE))
+        .timeout_connect(Some(LOGIN_CONNECT))
         .build();
     ureq::Agent::new_with_config(config)
 }

@@ -10,13 +10,16 @@ use std::sync::Arc;
 
 use jiff::Timestamp;
 use owlshift_adapters::forge::github::{Connect, GitHubForge, HttpTransport, Token, TokenSource};
-use owlshift_adapters::forge::github_app::{self, DeviceFlow, HttpLogin, UserToken};
+use owlshift_adapters::forge::github_app::{self, DeviceFlow, HttpLogin, Login, UserToken};
 use owlshift_adapters::forge::{DefaultBranch, Error, ErrorKind, Repo};
 use owlshift_contracts::config::PersonalConfig;
 use owlshift_platform::keychain::{Keychain, SERVICE, Secret};
 use owlshift_platform::service::sh_quote;
+use owlshift_platform::wake::{self, Wake};
 
-use crate::github_token::AppToken;
+use crate::events::EventLog;
+use crate::github_token::{AppToken, Entries, Refresh, TokenEvents};
+use crate::project::ProjectDirs;
 use crate::refusal::{PICKED_UP_AGAIN, Refusal, resumed};
 use crate::secrets::{self, ForgeKind, ForgeSecret};
 
@@ -32,6 +35,18 @@ pub const GITHUB_ACCOUNT: &str = "github";
 /// `github.com/<owner>/<repo>/github-app` ([`crate::secrets`]). No shared
 /// account of this name is read.
 pub const GITHUB_APP_ACCOUNT: &str = "github-app";
+
+/// The project, `owner/repo`, whose GitHub App account is `account`, as
+/// [`secrets::project_account`] names it: lowercase, since that account
+/// is; `None` for any other account.
+pub fn app_account_project(account: &str) -> Option<&str> {
+    let project = account
+        .strip_prefix("github.com/")?
+        .strip_suffix(GITHUB_APP_ACCOUNT)?
+        .strip_suffix('/')?;
+    let (owner, name) = project.split_once('/')?;
+    (!owner.is_empty() && !name.is_empty() && !name.contains('/')).then_some(project)
+}
 
 /// The GitHub App `owlshift init` signs in through: Owlshift's own (D13),
 /// or the one the personal file names for a fork or a private app.
@@ -80,13 +95,97 @@ pub const GITHUB_TOKEN_HELP: &str = "a fine-grained token with pull requests (wr
 
 /// What the GitHub App's token is refreshed with (OWL-384): the keychain it
 /// is stored in, the project's account lock file
-/// ([`ProjectDirs::account_lock_file`](crate::project::ProjectDirs::account_lock_file))
-/// and the app whose client ID the refresh sends.
+/// ([`ProjectDirs::account_lock_file`]), the app whose client ID the
+/// refresh sends, and since OWL-649 the event log each refresh and write is
+/// recorded in and the probe that holds a refresh in a dark wake. Its
+/// fields are private, so that a token is built through [`AppAccess::token`]
+/// alone, which hands it all of them.
 #[derive(Clone, Debug)]
 pub struct AppAccess {
-    pub keychain: Arc<Keychain>,
-    pub lock: PathBuf,
-    pub app: GitHubApp,
+    keychain: Arc<Keychain>,
+    lock: PathBuf,
+    app: GitHubApp,
+    log: Option<EventLog>,
+    wake: fn() -> Wake,
+}
+
+impl AppAccess {
+    /// The access of the project of `dirs`: its account lock, and the event
+    /// log of its data directory.
+    pub fn for_project(keychain: Arc<Keychain>, dirs: &ProjectDirs, app: GitHubApp) -> Self {
+        Self {
+            keychain,
+            lock: dirs.account_lock_file(),
+            app,
+            log: Some(EventLog::in_dir(dirs.data_dir())),
+            wake: wake::read,
+        }
+    }
+
+    /// An access that records nothing, refreshing under the lock file
+    /// `lock`: `owlshift init` without a data directory, and tests.
+    pub fn unrecorded(keychain: Arc<Keychain>, lock: PathBuf, app: GitHubApp) -> Self {
+        Self {
+            keychain,
+            lock,
+            app,
+            log: None,
+            wake: wake::read,
+        }
+    }
+
+    /// The same access reading the machine's power state with `wake`
+    /// ([`owlshift_platform::wake::read`] otherwise), which tests set.
+    pub fn with_wake(self, wake: fn() -> Wake) -> Self {
+        Self { wake, ..self }
+    }
+
+    pub fn keychain(&self) -> &Arc<Keychain> {
+        &self.keychain
+    }
+
+    pub fn app(&self) -> &GitHubApp {
+        &self.app
+    }
+
+    /// The account lock's file.
+    pub fn lock(&self) -> &Path {
+        &self.lock
+    }
+
+    /// The event log the token's refreshes and writes are recorded in.
+    pub fn log(&self) -> Option<&EventLog> {
+        self.log.as_ref()
+    }
+
+    /// The events of the token of `project`, `owner/repo`, when this access
+    /// records them.
+    pub fn events(&self, project: &str) -> Option<TokenEvents> {
+        self.log
+            .as_ref()
+            .map(|log| TokenEvents::new(log.clone(), project))
+    }
+
+    /// The token stored as `entry` under `account` of `entries`, refreshed
+    /// through `flow` under this access's account lock, its refreshes and
+    /// writes recorded as `project`'s and held in a dark wake by this
+    /// access's probe: the one way a token is built outside
+    /// [`crate::github_token`]'s tests.
+    pub fn token<E: Entries, R: Refresh>(
+        &self,
+        entries: E,
+        account: impl Into<String>,
+        flow: R,
+        entry: &Secret,
+        project: &str,
+    ) -> Result<AppToken<E, R>, Error> {
+        let token =
+            AppToken::new(entries, account, self.lock.clone(), flow, entry)?.with_wake(self.wake);
+        Ok(match self.events(project) {
+            Some(events) => token.with_events(events),
+            None => token,
+        })
+    }
 }
 
 /// The GitHub adapter for `repo`, with the credential `found`: `owlshift
@@ -108,17 +207,28 @@ pub fn github(
     repo: Repo,
     access: &AppAccess,
 ) -> Result<GitHubForge, Refusal> {
+    github_with(found, repo, access, HttpLogin::new())
+}
+
+/// [`github`], the app's login endpoints reached through `login`.
+pub(crate) fn github_with<L: Login + Send + 'static>(
+    found: &ForgeSecret<Secret>,
+    repo: Repo,
+    access: &AppAccess,
+    login: L,
+) -> Result<GitHubForge, Refusal> {
     match (&found.token, found.account.kind) {
         (Some(entry), ForgeKind::App) => {
-            let flow = DeviceFlow::new(HttpLogin::new(), &access.app.client_id);
-            let mut source = AppToken::new(
-                access.keychain.clone(),
-                found.account.token.clone(),
-                access.lock.clone(),
-                flow,
-                entry,
-            )
-            .map_err(refusal)?;
+            let flow = DeviceFlow::new(login, &access.app.client_id);
+            let mut source = access
+                .token(
+                    access.keychain.clone(),
+                    found.account.token.clone(),
+                    flow,
+                    entry,
+                    &repo.to_string(),
+                )
+                .map_err(refusal)?;
             source.token().map_err(refusal)?;
             let connect: Connect = Box::new(|token| Box::new(HttpTransport::new(token)));
             Ok(GitHubForge::with_app(source, connect, repo))
@@ -339,15 +449,146 @@ pub fn app_grants(
 
 #[cfg(test)]
 mod tests {
+    use crate::github_token::testing::{Rotating, logged, told};
     use crate::secrets::ForgeAccount;
 
     use super::*;
 
     fn access(keychain: Keychain, dir: &std::path::Path) -> AppAccess {
-        AppAccess {
-            keychain: Arc::new(keychain),
-            lock: dir.join("github-app.lock"),
-            app: GitHubApp::from_personal(None),
+        AppAccess::unrecorded(
+            Arc::new(keychain),
+            dir.join("github-app.lock"),
+            GitHubApp::from_personal(None),
+        )
+        .with_wake(|| Wake::Full)
+    }
+
+    /// OWL-649: a project's access refreshes under its account lock and
+    /// records in its data directory's log; an unrecorded one records
+    /// nothing.
+    #[test]
+    fn a_projects_access_holds_its_lock_and_its_log() {
+        let data = tempfile::tempdir().unwrap();
+        let repo = Repo::parse("Owner/Repo").unwrap();
+        let dirs = ProjectDirs::new(data.path(), &repo);
+        let keychain = Arc::new(Keychain::in_memory());
+        let app = GitHubApp::from_personal(None);
+        let access = AppAccess::for_project(keychain.clone(), &dirs, app.clone());
+        assert_eq!(access.lock(), dirs.account_lock_file());
+        assert_eq!(access.log(), Some(&EventLog::in_dir(data.path())));
+        assert_eq!(
+            access.events("Owner/Repo"),
+            Some(TokenEvents::new(
+                EventLog::in_dir(data.path()),
+                "Owner/Repo"
+            ))
+        );
+
+        let lock = data.path().join("elsewhere.lock");
+        let access = AppAccess::unrecorded(keychain, lock.clone(), app);
+        assert_eq!((access.lock(), access.log()), (lock.as_path(), None));
+        assert_eq!(access.events("Owner/Repo"), None);
+    }
+
+    /// The forge of `repo` on an expired app entry, refreshed through
+    /// `github`, the project's events in `data`.
+    fn app_forge_of(
+        data: &std::path::Path,
+        repo: &Repo,
+        keychain: &Arc<Keychain>,
+        github: &'static Rotating,
+        wake: fn() -> Wake,
+    ) -> Result<GitHubForge, Refusal> {
+        let account = ForgeAccount::project_app(repo);
+        let expired = UserToken::new(
+            "ghu_old",
+            Some("ghr_old".to_owned()),
+            Some(Timestamp::now()),
+            None,
+        );
+        keychain
+            .store(&account.token, &Secret::new(expired.to_entry()))
+            .unwrap();
+        let found = ForgeSecret {
+            token: keychain.read(&account.token).unwrap(),
+            account,
+        };
+        let access = AppAccess::for_project(
+            keychain.clone(),
+            &ProjectDirs::new(data, repo),
+            GitHubApp::from_personal(None),
+        )
+        .with_wake(wake);
+        github_with(&found, repo.clone(), &access, github)
+    }
+
+    fn leaked(github: Rotating) -> &'static Rotating {
+        Box::leak(Box::new(github))
+    }
+
+    /// OWL-649: the production path records a refresh in the data
+    /// directory's log, as the repository's project.
+    #[test]
+    fn the_forges_refresh_is_recorded_in_the_data_directorys_log() {
+        let data = tempfile::tempdir().unwrap();
+        let repo = Repo::parse("Owner/Repo").unwrap();
+        let keychain = Arc::new(Keychain::in_memory());
+        let github = leaked(Rotating::new("ghr_old", &[]));
+        let forge = app_forge_of(data.path(), &repo, &keychain, github, || Wake::Full).unwrap();
+        assert_eq!(forge.repo(), &repo);
+        assert_eq!(github.sent(), ["ghr_old"]);
+        let events = logged(data.path());
+        assert!(
+            events
+                .iter()
+                .any(|e| e.project == "Owner/Repo" && e.data["github_app"] == "refresh"),
+            "{events:?}"
+        );
+    }
+
+    /// OWL-649: the access hands its probe to the token, so a dark wake
+    /// holds the refresh on the production path: refused as unanswered,
+    /// naming the dark wake, nothing sent and the old pair kept.
+    #[test]
+    fn a_dark_wake_holds_the_refresh_on_the_production_path() {
+        let data = tempfile::tempdir().unwrap();
+        let repo = Repo::parse("owner/repo").unwrap();
+        let keychain = Arc::new(Keychain::in_memory());
+        let github = leaked(Rotating::new("ghr_old", &[]));
+        let refused =
+            app_forge_of(data.path(), &repo, &keychain, github, || Wake::Dark).unwrap_err();
+        assert!(refused.unanswered(), "{refused}");
+        assert!(refused.message.contains("dark wake"), "{refused}");
+        assert!(github.sent().is_empty());
+        let stored = keychain
+            .read(&ForgeAccount::project_app(&repo).token)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            UserToken::from_entry(stored.expose()).unwrap().access(),
+            "ghu_old"
+        );
+        assert_eq!(told(&logged(data.path())), ["refresh not_sent dark_wake"]);
+    }
+
+    /// OWL-649: an app account gives back its project, lowercase as the
+    /// account is; any other account gives none.
+    #[test]
+    fn an_app_account_names_its_project() {
+        let repo = Repo::parse("Owner/Repo").unwrap();
+        let account = ForgeAccount::project_app(&repo).token;
+        assert_eq!(app_account_project(&account), Some("owner/repo"));
+        for other in [
+            "github.com/owner/repo/github",
+            "github.com/owner/repo/linear",
+            "claude-agent",
+            "github-app",
+            "github.com/owner/github-app",
+            "github.com//repo/github-app",
+            "github.com/a/b/c/github-app",
+            "example.com/owner/repo/github-app",
+        ] {
+            assert_eq!(app_account_project(other), None, "{other}");
         }
     }
 
