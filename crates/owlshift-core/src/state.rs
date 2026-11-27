@@ -153,6 +153,8 @@ impl Status {
 /// | A Build run's (at Build, or a fix run's at Watch) gate was refused for uncommitted changes before any command ran, and the run had not been told of such a refusal: the next run will be | `UncommittedGate` |
 /// | A Build run's at Build (a Verify fix run included) gate or setup failed on a command that the commit it was configured at fails too, or that commit's check is due; or a Build run at Build was held before it started for such a commit (OWL-418, [`crate::base`]) | `BaseBroken` |
 /// | A rebase run off a held commit, at Build, ended without a rebase the runner accepts (OWL-427, [`crate::base::leave`]) | `RebaseFailed` |
+/// | A first delivery failed before its pull request was kept (OWL-662): counted at Verify as a failed run | `RunFailed` |
+/// | The Build's gated commit, to be reviewed or delivered, is the base's head or one of its ancestors: nothing to deliver (OWL-662) | `NothingToDeliver` |
 /// | A run was cut off by a harness usage limit; it resumes after the reset. A Build run's at Build (OWL-480), or a fix run's (OWL-486) or a rebase run's (OWL-490) at Watch, gate failed on a command while the machine slept through it, or the tracker gave no answer right after it: the machine cut it, and its gate alone runs again | `Interrupted` |
 /// | A run broke isolation (main checkout touched, diff outside the worktree, wrong branch) | `Quarantined` |
 /// | A run is due while the ticket's runs since its last restart cost its budget or more (`policy.ticket_budget_usd`, OWL-378): none starts | `BudgetReached` |
@@ -269,6 +271,13 @@ pub enum Event {
     /// worktree is never made anew for a second attempt. Valid only at
     /// Build, where a Build is held.
     RebaseFailed,
+    /// The Build Verify was to review or deliver adds nothing to the base
+    /// (OWL-662): its gated commit is the base's head or one of its
+    /// ancestors, so no pull request can open. The ticket parks at Build
+    /// ([`ParkReason::NothingToDeliver`]), so that a restart runs the Build
+    /// again, on a ticket a person may have changed. Valid only at Verify,
+    /// which the runner reaches once the Build's gate passed.
+    NothingToDeliver,
     Interrupted,
     Quarantined,
     /// A run was due, but what the ticket's runs cost since its last
@@ -341,7 +350,7 @@ pub enum Event {
 
 impl Event {
     /// Every event.
-    pub const ALL: [Self; 35] = [
+    pub const ALL: [Self; 36] = [
         Self::Dispatched,
         Self::Completed,
         Self::LoopBack,
@@ -361,6 +370,7 @@ impl Event {
         Self::UncommittedGate,
         Self::BaseBroken,
         Self::RebaseFailed,
+        Self::NothingToDeliver,
         Self::Interrupted,
         Self::Quarantined,
         Self::BudgetReached,
@@ -442,6 +452,9 @@ pub enum ParkReason {
     /// A person canceled the ticket's work ([`Event::Canceled`], OWL-474):
     /// its step under way was stopped and its runs checked.
     Stopped,
+    /// The base already holds the Build's commit (OWL-662,
+    /// [`Event::NothingToDeliver`]): nothing is left to deliver.
+    NothingToDeliver,
 }
 
 /// How a ticket left the machine.
@@ -895,6 +908,11 @@ impl TicketState {
             (Status::Active(Stage::Build), Event::RebaseFailed) => {
                 self.park(ParkReason::Rebase, self.failed_runs)
             }
+            // Parked at Build, whose restart builds again (OWL-662).
+            (Status::Active(Stage::Verify), Event::NothingToDeliver) => {
+                let at_build = self.enter(Status::Active(Stage::Build));
+                at_build.park(ParkReason::NothingToDeliver, at_build.failed_runs)
+            }
             (status, Event::Quarantined) if status.runs() => {
                 self.park(ParkReason::IsolationBreach, self.failed_runs)
             }
@@ -1257,6 +1275,9 @@ mod tests {
             (Status::Active(Build), Event::RebaseFailed) => {
                 Expect::Parked(parked(Build, false), ParkReason::Rebase)
             }
+            (Status::Active(Verify), Event::NothingToDeliver) => {
+                Expect::Parked(parked(Build, false), ParkReason::NothingToDeliver)
+            }
             // With every count at zero, nothing is at a bound.
             (
                 Status::Active(Watch),
@@ -1520,6 +1541,47 @@ mod tests {
                 awaiting_input: false
             }
         );
+    }
+
+    /// OWL-662: a Build that adds nothing to the base parks at Build, its
+    /// Verify passes kept and its failed runs cleared, so that a restart
+    /// builds again; a failed delivery at Verify counts, and the delivery
+    /// that keeps its pull request clears that count.
+    #[test]
+    fn nothing_to_deliver_parks_at_build_and_a_delivery_clears_the_failed_runs() {
+        let verify = state(Status::Active(Stage::Verify), 1, 0, 1)
+            .with_review_passes(1)
+            .expect("a pass at Verify");
+        let Ok(Transition::Parked {
+            state: parked,
+            reason,
+        }) = verify.apply(STANDARD, Event::NothingToDeliver)
+        else {
+            panic!("nothing to deliver must park the ticket");
+        };
+        assert_eq!(reason, ParkReason::NothingToDeliver);
+        assert_eq!(
+            parked.status(),
+            Status::Parked {
+                at: Stage::Build,
+                awaiting_input: false
+            }
+        );
+        assert_eq!((parked.failed_runs(), parked.review_passes()), (0, 1));
+        let restarted = to(parked.apply(STANDARD, Event::Restarted));
+        assert_eq!(restarted.status(), Status::Active(Stage::Build));
+        let build = state(Status::Active(Stage::Build), 1, 0, 0);
+        assert!(build.apply(STANDARD, Event::NothingToDeliver).is_err());
+
+        let failed = to(verify.apply(STANDARD, Event::Completed));
+        assert_eq!(failed.status(), Status::Active(Stage::Deliver));
+        let watching = to(failed.apply(STANDARD, Event::Completed));
+        assert_eq!(watching.status(), Status::Active(Stage::Watch));
+        assert_eq!(watching.failed_runs(), 0);
+        let Ok(Transition::Parked { reason, .. }) = verify.apply(STANDARD, Event::RunFailed) else {
+            panic!("a second failed run at Verify parks");
+        };
+        assert_eq!(reason, ParkReason::FailedRuns);
     }
 
     #[test]

@@ -110,6 +110,11 @@ struct FakeGitHub {
     /// (OWL-340), and how many such reads were made, refused or not.
     refuse_open: Mutex<u32>,
     open_reads: Mutex<u32>,
+    /// How many of the next calls to open a pull request GitHub refuses as
+    /// it refused LOC-2233's on 2026-11-26 (OWL-662), and how many such
+    /// calls were made, refused or not.
+    refuse_create: Mutex<u32>,
+    create_calls: Mutex<u32>,
     /// The repository's other open pull requests, a person's (OWL-410):
     /// each number with its head branch and the files it changes.
     others: Mutex<Vec<(u64, String, Vec<String>)>>,
@@ -571,6 +576,23 @@ impl Transport for Shared {
                 return Ok(Response {
                     status: 401,
                     body: json!({ "message": "Bad credentials" }).to_string(),
+                    ..Default::default()
+                });
+            }
+        }
+        if query.starts_with("mutation OpenPullRequest") {
+            *self.0.create_calls.lock().unwrap() += 1;
+            let mut refuse = self.0.refuse_create.lock().unwrap();
+            if *refuse > 0 {
+                *refuse -= 1;
+                let message = format!("No commits between main and {BRANCH}");
+                return Ok(Response {
+                    status: 200,
+                    body: json!({
+                        "data": { "createPullRequest": null },
+                        "errors": [{ "type": "UNPROCESSABLE", "message": message }],
+                    })
+                    .to_string(),
                     ..Default::default()
                 });
             }
@@ -1543,6 +1565,8 @@ impl Bench {
             reviews_reads: Mutex::new(0),
             refuse_open: Mutex::new(0),
             open_reads: Mutex::new(0),
+            refuse_create: Mutex::new(0),
+            create_calls: Mutex::new(0),
             others: Mutex::new(Vec::new()),
             own_files: Mutex::new(Vec::new()),
             fail_pulls: Mutex::new(0),

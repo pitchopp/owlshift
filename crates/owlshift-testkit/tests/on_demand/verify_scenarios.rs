@@ -1010,3 +1010,205 @@ fn a_continue_alone_is_no_late_comment_for_verify() {
     outcome.unwrap_or_else(|stop| panic!("{stop}\n{printed}"));
     assert_eq!(bench.remote_branch(), Some(commit));
 }
+
+impl Bench {
+    /// The PARKED comments on the ticket.
+    fn parked_comments(&self) -> Vec<String> {
+        self.comments()
+            .into_iter()
+            .filter(|comment| comment.starts_with("[owlshift] PARKED"))
+            .collect()
+    }
+
+    /// The calls to open a pull request so far, refused or not (OWL-662).
+    fn create_calls(&self) -> u32 {
+        *self.github.create_calls.lock().unwrap()
+    }
+}
+
+/// OWL-662, LOC-2233's case: the base already holds the change, so the Build
+/// makes no commit and its gate passes on the base itself. The ticket parks
+/// at Build before any Verify pass: no push, no pull request asked for, one
+/// PARKED comment naming the base's commit and quoting the Build. Changed by
+/// a person, `continue` runs the Build again, which delivers.
+#[test]
+fn a_build_that_leaves_nothing_to_deliver_parks_before_verify() {
+    let bench = Bench::verifying();
+    let main = bench.remote_main();
+    let (outcome, printed) = bench.run(vec![bench.reply(None, Some(DONE))], None);
+    assert!(
+        matches!(
+            &outcome,
+            Err(Stop::Parked {
+                reason: ParkReason::NothingToDeliver,
+                ..
+            })
+        ),
+        "{outcome:?}\n{printed}"
+    );
+    assert_eq!(bench.run_roles(), [Role::Build]);
+    assert_eq!((bench.remote_branch(), bench.create_calls()), (None, 0));
+    assert_eq!(
+        bench.state().0,
+        Status::Parked {
+            at: Stage::Build,
+            awaiting_input: false
+        }
+    );
+    assert!(
+        bench
+            .record()
+            .review
+            .is_none_or(|review| review.build.is_none())
+    );
+    let parked = bench.parked_comments();
+    assert_eq!(parked.len(), 1, "{parked:?}");
+    for text in [
+        "Parked: the base already holds this ticket's change.",
+        &format!("`main` is at `{}`", &main[..7]),
+        "The Build said: Added GREETING.md; the gate passes.",
+        "close the ticket",
+        "`owlshift continue DEMO-1`: its Build runs again.",
+    ] {
+        assert!(parked[0].contains(text), "{text}\n{}", parked[0]);
+    }
+    // A park shows needs input on a tracker that maps no parked state.
+    assert_eq!(bench.stage(), "Needs Input");
+
+    let ran = bench.briefs().len();
+    let (outcome, printed) = bench.continue_ticket(vec![
+        bench.reply(Some("Hello"), Some(DONE)),
+        bench.reviewing(&found(&[])),
+    ]);
+    outcome.unwrap_or_else(|stop| panic!("{stop}\n{printed}"));
+    assert_eq!(bench.run_roles()[ran..], [Role::Build, Role::Verify]);
+    assert!(bench.remote_branch().is_some());
+}
+
+/// OWL-662: the base comes to hold the Build's commit while Verify reviews
+/// it (another merge of the same change). The delivery reads the base's head
+/// for its push and parks the ticket instead: nothing pushed, no pull
+/// request asked for, the PARKED comment naming that head.
+#[test]
+fn a_base_that_takes_the_build_during_verify_leaves_nothing_to_deliver() {
+    let bench = Bench::verifying();
+    let (checkout, bare, env) = (
+        bench.dirs().checkout(),
+        bench.remote.bare.clone(),
+        bench.env.clone(),
+    );
+    let merged: During = (
+        2,
+        Box::new(move || {
+            let to_main = format!("refs/heads/{BRANCH}:refs/heads/main");
+            env.run(
+                &checkout,
+                &["push", "--quiet", bare.to_str().unwrap(), &to_main],
+            )
+            .unwrap();
+        }),
+    );
+    let (outcome, printed) = bench.invoke(
+        false,
+        vec![
+            bench.reply(Some("Hello"), Some(DONE)),
+            bench.reviewing(&found(&[])),
+        ],
+        None,
+        vec![merged],
+    );
+    assert!(
+        matches!(
+            &outcome,
+            Err(Stop::Parked {
+                reason: ParkReason::NothingToDeliver,
+                ..
+            })
+        ),
+        "{outcome:?}\n{printed}"
+    );
+    assert_eq!(bench.run_roles(), [Role::Build, Role::Verify]);
+    assert_eq!((bench.remote_branch(), bench.create_calls()), (None, 0));
+    let main = bench.remote_main();
+    let parked = bench.parked_comments();
+    assert_eq!(parked.len(), 1, "{parked:?}");
+    assert!(
+        parked[0].contains(&format!("`main` is at `{}`", &main[..7])),
+        "{}",
+        parked[0]
+    );
+    assert_eq!(
+        bench.state().0,
+        Status::Parked {
+            at: Stage::Build,
+            awaiting_input: false
+        }
+    );
+}
+
+/// OWL-662, LOC-2233's loop: GitHub refuses the pull request at every call.
+/// The first refusal is a failed run at Verify, kept; watch's next try runs
+/// the Verify pass again, meets the same refusal and parks the ticket with
+/// GitHub's words; the pass after that resumes nothing.
+#[test]
+fn a_pull_request_the_forge_keeps_refusing_parks_after_one_more_try() {
+    let bench = Bench::verifying();
+    *bench.github.refuse_create.lock().unwrap() = 100;
+    let (outcome, printed) = bench.run(
+        vec![
+            bench.reply(Some("Hello"), Some(DONE)),
+            bench.reviewing(&found(&[])),
+        ],
+        None,
+    );
+    assert!(
+        matches!(&outcome, Err(Stop::Delivery(why)) if why.contains("No commits between")
+            && why.contains("a delivery that fails again parks the ticket")),
+        "{outcome:?}\n{printed}"
+    );
+    let kept = TicketState::try_from(&bench.record().state).unwrap();
+    assert_eq!(
+        (kept.status(), kept.failed_runs()),
+        (Status::Active(Stage::Verify), 1)
+    );
+    assert_eq!(bench.create_calls(), 1);
+
+    let mut pass = 0;
+    let ran = Cell::new(0);
+    let (outcomes, lines, printed) = bench.watch(vec![bench.reviewing(&found(&[]))], &mut |_| {
+        pass += 1;
+        match pass {
+            1 => {
+                ran.set(bench.briefs().len());
+                bench.wait(11);
+                true
+            }
+            _ => false,
+        }
+    });
+    assert!(
+        matches!(
+            &outcomes[..],
+            [Err(Stop::Parked {
+                reason: ParkReason::FailedRuns,
+                detail,
+                ..
+            })] if detail.contains("No commits between")
+        ),
+        "{outcomes:?}\n{lines}\n{printed}"
+    );
+    assert_eq!(
+        bench.briefs().len(),
+        ran.get(),
+        "nothing resumed after the park"
+    );
+    assert_eq!(bench.create_calls(), 2);
+    assert_eq!(
+        bench.state().0,
+        Status::Parked {
+            at: Stage::Verify,
+            awaiting_input: false
+        }
+    );
+    assert_eq!(bench.parked_comments().len(), 1);
+}
