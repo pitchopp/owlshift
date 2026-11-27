@@ -618,9 +618,22 @@ pub struct Forge {
     /// How the runner merges: `squash`, the default, `merge` or `rebase`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub merge_method: Option<MergeMethod>,
+    /// Whether the runner sets the commit status `owlshift/gate` on each
+    /// commit it pushes once its own gate passed on that tree, for the
+    /// project's CI to read (OWL-665, architecture section 5, "The gate's
+    /// status"): off when absent. Read at the base branch's head, as
+    /// `merge` is.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub publish_gate_status: Option<bool>,
 }
 
 impl Forge {
+    /// Whether the runner sets the gate's status: the project's choice, or
+    /// off.
+    pub fn publish_gate_status(&self) -> bool {
+        self.publish_gate_status.unwrap_or(false)
+    }
+
     /// Which pull requests the runner merges once green: the project's
     /// choice, or `never`.
     pub fn merge(&self) -> MergeSwitch {
@@ -632,15 +645,21 @@ impl Forge {
         self.merge_method.unwrap_or_default()
     }
 
-    /// Checks the table: it sets the reviewers or the merge, unless the file
-    /// lists `[people]` (`people`), whose forge logins are the reviewers;
-    /// each login and account a name written exactly, no login twice
-    /// ignoring case (forge logins are compared without case).
+    /// Checks the table: it sets the reviewers, the merge or the gate's
+    /// status, unless the file lists `[people]` (`people`), whose forge
+    /// logins are the reviewers; each login and account a name written
+    /// exactly, no login twice ignoring case (forge logins are compared
+    /// without case).
     fn check_reviewers(&self, people: bool) -> Result<(), String> {
-        if self.reviewers.is_empty() && self.merge.is_none() && !people {
+        if self.reviewers.is_empty()
+            && self.merge.is_none()
+            && self.publish_gate_status.is_none()
+            && !people
+        {
             return Err(
-                "forge.reviewers lists no reviewer and forge.merge is not set: list at least \
-                 one reviewer, set merge, or leave [forge] out"
+                "forge.reviewers lists no reviewer and neither forge.merge nor \
+                 forge.publish_gate_status is set: list at least one reviewer, set one of them, \
+                 or leave [forge] out"
                     .to_owned(),
             );
         }

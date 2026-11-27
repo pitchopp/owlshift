@@ -280,6 +280,7 @@ impl OnDemand<'_> {
             summary: result.summary.clone(),
             pr: result.pr.clone(),
             gate: gate.commands.clone(),
+            gate_elapsed_s: Some(gate.elapsed().as_secs()),
             notes: gathered.decisions.clone(),
             followups: gathered.followups.clone(),
             seen,

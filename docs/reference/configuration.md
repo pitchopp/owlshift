@@ -466,6 +466,14 @@ How the runner merges: "squash", "merge" or "rebase". Default: `"squash"`.
 # merge_method = "squash"
 ```
 
+#### `forge.publish_gate_status`
+
+Whether the runner sets the commit status `owlshift/gate` (`success`) on each commit it pushes once its own gate passed on that tree, for your CI to skip the suite already run; the GitHub App or token then needs commit statuses (write). Default: `false`.
+
+```toml
+# publish_gate_status = false
+```
+
 #### `forge.reviewers.<name>`
 
 The forge logins whose reviews on Owlshift's pull requests are read, each mapped to its tracker account: the decider's sends the ticket back to Build. Default: none, no review is read. Refused beside [people].

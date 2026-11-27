@@ -912,6 +912,7 @@ fn a_runner_s_merge_cut_short_is_pushed_again_and_told_as_a_refresh() {
             reviews: Vec::new(),
             steps: Vec::new(),
             refreshed: true,
+            gate_elapsed_s: None,
         }),
     });
     bench.write_record(&record);

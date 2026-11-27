@@ -169,6 +169,7 @@ mod cancel;
 mod correction;
 mod design;
 mod drain;
+mod gate_status;
 mod intake;
 mod limits;
 mod merge_note;
@@ -7362,6 +7363,16 @@ impl OnDemand<'_> {
         ]);
         neutral_push::tell(&mut event, &built_commit, &neutral);
         sink.emit(ticket, None, EventKind::TrackerWrite, event);
+        // The gate's status, before the pull request whose opening starts
+        // the project's CI (OWL-665): the gate passed on the kept Build's
+        // commit, whose tree the neutral image keeps.
+        self.publish_gate_status(
+            p,
+            &commit,
+            &Gate::Passed(built.gate.clone()),
+            built.gate_elapsed_s,
+            sink,
+        );
 
         // The agent's text closes no issue: its closing keywords are broken,
         // in the title too, which a squash merge makes the commit's subject;
@@ -7437,6 +7448,7 @@ impl OnDemand<'_> {
                 reviews: Vec::new(),
                 steps: Vec::new(),
                 refreshed: false,
+                gate_elapsed_s: built.gate_elapsed_s,
             }),
             unchanged: false,
         });
@@ -7698,7 +7710,12 @@ pub fn repairs_in(stage: &str, states: &States) -> bool {
 struct Repaired {
     commit: CommitId,
     summary: String,
+    /// The gate that passed on `commit`'s tree, by the run that made it, or
+    /// kept with `commit` in one `pushing` record ([`Self::again`]): what
+    /// the gate's status attests (OWL-665).
     gate: Gate,
+    /// How long that gate ran, in whole seconds, when known (OWL-665).
+    gate_elapsed: Option<u64>,
 }
 
 impl Repaired {
@@ -7706,7 +7723,7 @@ impl Repaired {
     /// run: what the run kept for its report when the push under way kept
     /// it (OWL-218), with its follow-ups, or a placeholder.
     fn again(commit: CommitId, pushing: &Pushing, what: &str) -> (Self, Vec<Followup>) {
-        let (summary, gate, followups) = told(pushing.report.as_ref(), || {
+        let (summary, gate, gate_elapsed, followups) = told(pushing.report.as_ref(), || {
             format!("The {what} run's commit, whose push had no answer, pushed again.")
         });
         (
@@ -7714,6 +7731,7 @@ impl Repaired {
                 commit,
                 summary,
                 gate,
+                gate_elapsed,
             },
             followups,
         )
@@ -7770,23 +7788,29 @@ impl Repaired {
                     ..
                 }
             ),
+            gate_elapsed_s: match self.gate {
+                Gate::Passed(_) => self.gate_elapsed,
+                Gate::NotRecorded => None,
+            },
         }
     }
 }
 
-/// The summary, gate and follow-ups a kept report gives a DELIVERY report,
-/// or `placeholder`'s summary with no gate recorded when none was kept.
+/// What a kept report gives a DELIVERY report and the gate's status: the
+/// summary, the gate with its time and the follow-ups, or `placeholder`'s
+/// summary with no gate recorded when none was kept.
 fn told(
     kept: Option<&KeptReport>,
     placeholder: impl FnOnce() -> String,
-) -> (String, Gate, Vec<Followup>) {
+) -> (String, Gate, Option<u64>, Vec<Followup>) {
     match kept {
         Some(kept) => (
             kept.summary.clone(),
             kept.gate.clone().map_or(Gate::NotRecorded, Gate::Passed),
+            kept.gate.as_ref().and(kept.gate_elapsed_s),
             kept.followups.clone(),
         ),
-        None => (placeholder(), Gate::NotRecorded, Vec::new()),
+        None => (placeholder(), Gate::NotRecorded, None, Vec::new()),
     }
 }
 
@@ -8538,6 +8562,11 @@ impl OnDemand<'_> {
                                         .map(|g| g.commands.clone())
                                         .unwrap_or_default(),
                                 ),
+                                gate_elapsed: ran
+                                    .report
+                                    .gate
+                                    .as_ref()
+                                    .map(|g| g.elapsed().as_secs()),
                             };
                             return Ok(RepairEnd::Done(
                                 Box::new(RepairDone {
@@ -9169,6 +9198,7 @@ impl OnDemand<'_> {
                 commit: merge.clone(),
                 summary,
                 gate: Gate::NotRecorded,
+                gate_elapsed: None,
             },
             RepairKind::Rebase {
                 onto,
@@ -9471,6 +9501,10 @@ impl OnDemand<'_> {
                 ]);
                 neutral_push::tell(&mut event, &repaired.commit, &neutral);
                 sink.emit(&ticket, None, EventKind::TrackerWrite, event);
+                // The gate's status, before the pull request's head is read
+                // (OWL-665): the repair's gate passed on its commit, whose
+                // tree the neutral image keeps.
+                self.publish_gate_status(p, &commit, &repaired.gate, repaired.gate_elapsed, sink);
             }
             Err(WriteError::Push(PushError::Rejected { reason })) => {
                 kept.pushing = None;
@@ -9756,7 +9790,7 @@ impl OnDemand<'_> {
         };
         let what = push_what(owed.kind);
         let head = CommitId::new(pushed.as_str()).map_err(|e| e.to_string())?;
-        let (summary, gate, followups) = told(owed.report.as_ref(), || {
+        let (summary, gate, _, followups) = told(owed.report.as_ref(), || {
             format!(
                 "The {what} run's commit, adopted after its command was cut short: its summary \
                  was not kept."

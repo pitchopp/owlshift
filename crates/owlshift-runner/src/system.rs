@@ -848,6 +848,7 @@ pub mod fake {
                     installation: 9,
                     contents_write: true,
                     actions_write: true,
+                    statuses_write: true,
                 }))
         }
 

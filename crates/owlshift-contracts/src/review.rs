@@ -1338,6 +1338,11 @@ pub struct KeptBuild {
     /// The project gate's commands, all passed.
     #[serde(default)]
     pub gate: Vec<String>,
+    /// How long that gate ran, its setup included, in whole seconds awake
+    /// (format 3, OWL-665): what the gate's status on the pushed commit says.
+    /// Absent from a Build kept before it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gate_elapsed_s: Option<u64>,
     /// The runner's own notes the report lists, such as the late comments a
     /// Build run was given (OWL-139).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -1507,14 +1512,36 @@ impl TicketReview {
     }
 
     /// Parses and validates a `review.json`. A format-1 one, written before
-    /// a colleague's review was relayed (OWL-585), is read as the current
-    /// format.
+    /// a colleague's review was relayed (OWL-585), and a format-2 one,
+    /// written before a kept Build's gate kept its time (OWL-665), are read
+    /// as the current format, each refused when it holds what its format
+    /// never wrote.
     pub fn parse(input: &str) -> Result<Self, ContractError> {
-        let review: Self =
-            match format::parse_json_older(Self::CONTRACT, 1, REVIEW_FORMAT, "relayed", input) {
-                Some(read) => read?,
-                None => format::parse_json(Self::CONTRACT, REVIEW_FORMAT, input)?,
-            };
+        let older = format::parse_json_older(Self::CONTRACT, 1, REVIEW_FORMAT, "relayed", input)
+            .map(|read| (1, read))
+            .or_else(|| {
+                // Format 2 adds no top-level field: the time is the kept
+                // Build's, checked below.
+                format::parse_json_older(Self::CONTRACT, 2, REVIEW_FORMAT, "format 3", input)
+                    .map(|read| (2, read))
+            });
+        let review: Self = match older {
+            Some((older, read)) => {
+                let review: Self = read?;
+                if review
+                    .build
+                    .as_ref()
+                    .is_some_and(|build| build.gate_elapsed_s.is_some())
+                {
+                    return Err(ContractError::invalid(
+                        Self::CONTRACT,
+                        format!("format {older} records no build.gate_elapsed_s"),
+                    ));
+                }
+                review
+            }
+            None => format::parse_json(Self::CONTRACT, REVIEW_FORMAT, input)?,
+        };
         review.validate()?;
         Ok(review)
     }
@@ -1840,7 +1867,7 @@ mod tests {
 
     fn ticket_review() -> Value {
         json!({
-            "format": 2,
+            "format": 3,
             "relayed": [{
                 "round": 2, "question": "Q1", "answer": "apply",
                 "review": { "id": 11, "author": { "name": "bob", "relation": "other" }, "body": "Rename it." }
@@ -2267,7 +2294,7 @@ mod tests {
                 ),
                 (&|d| d["build"]["extra"] = 1.into(), "unknown field"),
                 (&|d| d["passes"][0]["pass"] = 0.into(), "nonzero"),
-                (&|d| d["format"] = 3.into(), "upgrade Owlshift"),
+                (&|d| d["format"] = 4.into(), "upgrade Owlshift"),
                 // A colleague's review relayed (OWL-585).
                 (
                     &|d| {
@@ -2303,13 +2330,13 @@ mod tests {
                 (&|d| d["format"] = 1.into(), "format 1 records no relayed"),
             ],
         );
-        // Format 1, before a review was relayed (OWL-585): read as format 2.
+        // Format 1, before a review was relayed (OWL-585): read as format 3.
         let mut older = ticket_review();
         older["format"] = 1.into();
         older.as_object_mut().unwrap().remove("relayed");
         let read = TicketReview::parse(&older.to_string()).unwrap();
         assert!(read.relayed.is_empty());
-        assert!(read.render().starts_with("{\n  \"format\": 2,"));
+        assert!(read.render().starts_with("{\n  \"format\": 3,"));
         assert_eq!(parsed.relayed[0].answer, Some(RelayAnswer::Apply));
     }
 

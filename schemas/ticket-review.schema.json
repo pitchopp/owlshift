@@ -35,7 +35,7 @@
     "format": {
       "description": "The format version of this document.",
       "type": "integer",
-      "const": 2
+      "const": 3
     },
     "last_fix": {
       "description": "The Verify pass, the record's last, whose `minor` findings one last\nBuild fixes (OWL-356): that Build is delivered with no Verify pass\nafter it. Kept with the pass; dropped when that Build asks, takes\nlate comments or follows a decider's reply to a DECISION comment,\nwhen another pass is kept, and at the delivery.",
@@ -291,6 +291,15 @@
           "items": {
             "type": "string"
           }
+        },
+        "gate_elapsed_s": {
+          "description": "How long that gate ran, its setup included, in whole seconds awake\n(format 3, OWL-665): what the gate's status on the pushed commit says.\nAbsent from a Build kept before it.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
         },
         "notes": {
           "description": "The runner's own notes the report lists, such as the late comments a\nBuild run was given (OWL-139).",

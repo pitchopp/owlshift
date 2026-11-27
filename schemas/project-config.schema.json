@@ -200,6 +200,13 @@
             }
           ]
         },
+        "publish_gate_status": {
+          "description": "Whether the runner sets the commit status `owlshift/gate` on each\ncommit it pushes once its own gate passed on that tree, for the\nproject's CI to read (OWL-665, architecture section 5, \"The gate's\nstatus\"): off when absent. Read at the base branch's head, as\n`merge` is.",
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
         "reviewers": {
           "description": "The forge logins whose reviews on Owlshift's pull requests are read,\neach written exactly and mapped to its tracker account's identifier,\nwritten as a zone's owner is. A review is an instruction when that\naccount is the ticket's decider, and context otherwise; anyone\nelse's review is ignored. No login listed twice, even in another\ncase. Absent or empty, no review is read; a `[forge]` table sets it\nor `merge`. Refused beside `[people]`, which replaces it: there,\nevery person with a `forge` login is a reviewer, and a parsed\nconfiguration holds them here (OWL-582).",
           "type": "object",

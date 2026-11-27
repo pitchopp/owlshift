@@ -138,6 +138,11 @@ struct FakeGitHub {
     /// The automatic re-run (OWL-513): GitHub Actions jobs of one workflow
     /// run, their re-runs and the job logs read.
     jobs: Mutex<Jobs>,
+    /// The gate's status (OWL-665): each commit status set, by its commit
+    /// and body, and how many of the next ones GitHub refuses as an
+    /// installation without Commit statuses (write).
+    statuses: Mutex<Vec<(String, Value)>>,
+    refuse_statuses: Mutex<u32>,
 }
 
 /// One GitHub Actions job's first attempt, as watch's read lists it
@@ -626,8 +631,31 @@ impl Transport for Shared {
     }
 
     /// A re-run of a workflow run's failed jobs (OWL-513), answered as
-    /// scripted: a 2xx starts the new attempts.
+    /// scripted: a 2xx starts the new attempts. Or a commit status, the
+    /// gate's (OWL-665): set with 201, or refused with 403 as scripted.
     fn post(&self, path: &str, body: &Value) -> Result<Response, String> {
+        if let Some(commit) = path.strip_prefix("repos/demo/project/statuses/") {
+            let mut refuse = self.0.refuse_statuses.lock().unwrap();
+            if *refuse > 0 {
+                *refuse -= 1;
+                return Ok(Response {
+                    status: 403,
+                    body: json!({ "message": "Resource not accessible by integration" })
+                        .to_string(),
+                    ..Default::default()
+                });
+            }
+            self.0
+                .statuses
+                .lock()
+                .unwrap()
+                .push((commit.to_owned(), body.clone()));
+            return Ok(Response {
+                status: 201,
+                body: json!({ "id": 1 }).to_string(),
+                ..Default::default()
+            });
+        }
         let run = path
             .strip_prefix("repos/demo/project/actions/runs/")
             .and_then(|rest| rest.strip_suffix("/rerun-failed-jobs"))
@@ -1577,6 +1605,8 @@ impl Bench {
             merge_answers: Mutex::new(VecDeque::new()),
             during_merge: Mutex::new(None),
             jobs: Mutex::default(),
+            statuses: Mutex::new(Vec::new()),
+            refuse_statuses: Mutex::new(0),
         });
         let tmp_data = tmp.path().join("data");
         Self {
@@ -8012,6 +8042,94 @@ fn a_red_pull_request_gets_fix_runs_until_the_bound_parks_it() {
     assert_eq!(bench.stage(), "Needs Input");
 }
 
+/// OWL-665 (architecture section 5, "The gate's status"): on a project
+/// whose base sets `[forge] publish_gate_status`, the delivery's push gets
+/// `owlshift/gate` `success` on the pushed commit, named with the gate's
+/// time and command, before the pull request is opened; so does each fix's
+/// push. A status GitHub refuses is a warning, and the fix is pushed and
+/// reported all the same. Every other bench test, the switch off, panics
+/// on a status it was not set up for.
+#[test]
+fn each_gated_push_gets_the_gate_status_on_its_commit() {
+    let bench = deliver(Bench::with(
+        "maintainer",
+        "assignee = \"maintainer\"\n",
+        "[forge]\npublish_gate_status = true\n",
+    ));
+    let github = bench.github.clone();
+    let delivered_head = bench.remote_branch().unwrap();
+    {
+        let statuses = github.statuses.lock().unwrap();
+        assert_eq!(statuses.len(), 1, "{statuses:?}");
+        let (commit, body) = &statuses[0];
+        assert_eq!(commit, &delivered_head);
+        assert_eq!(
+            (&body["state"], &body["context"]),
+            (&json!("success"), &json!("owlshift/gate"))
+        );
+        let description = body["description"].as_str().unwrap();
+        assert!(
+            description.starts_with("Owlshift's gate passed in ")
+                && description.ends_with("git grep -q Hello -- GREETING.md"),
+            "{description}"
+        );
+    }
+    let events = bench.events();
+    let actions: Vec<Value> = data_of(&events, EventKind::TrackerWrite, "action")
+        .into_iter()
+        .map(|write| write["action"].clone())
+        .collect();
+    let at = |action: &str| actions.iter().position(|a| a == action).unwrap();
+    assert!(
+        at("push") < at("gate_status") && at("gate_status") < at("pull_request"),
+        "{actions:?}"
+    );
+
+    // Two red reads, two fixes: the first's status refused, the second's
+    // set on its own pushed commit.
+    *github.refuse_statuses.lock().unwrap() = 1;
+    github.followed.lock().unwrap().conclusion = "FAILURE";
+    let replies = vec![
+        bench.reply(Some("Hello again"), Some(FIXED)),
+        bench.reply(Some("Hello, again and again"), Some(FIXED)),
+    ];
+    let mut pass = 0;
+    let mut heads = Vec::new();
+    let (outcomes, lines, printed) = bench.watch(replies, &mut |_| {
+        pass += 1;
+        heads.push(bench.remote_branch().unwrap());
+        pass < 2
+    });
+    assert_eq!(outcomes.len(), 2, "{outcomes:?}\n{lines}\n{printed}");
+    for outcome in &outcomes {
+        outcome
+            .as_ref()
+            .unwrap_or_else(|stop| panic!("{stop}\n{printed}"));
+    }
+    assert!(
+        heads[0] != delivered_head && heads[1] != heads[0],
+        "{heads:?}"
+    );
+    let fix_events = &bench.events()[events.len()..];
+    let unset = data_of(fix_events, EventKind::Warning, "what");
+    let unset: Vec<&Value> = unset
+        .iter()
+        .filter(|w| w["what"] == "gate_status_unset")
+        .collect();
+    assert_eq!(unset.len(), 1, "{unset:?}");
+    assert_eq!(unset[0]["commit"], json!(heads[0]));
+    assert!(
+        unset[0]["reason"]
+            .as_str()
+            .unwrap()
+            .contains("Resource not accessible by integration"),
+        "{unset:?}"
+    );
+    let statuses = github.statuses.lock().unwrap();
+    assert_eq!(statuses.len(), 2, "{statuses:?}");
+    assert_eq!(statuses[1].0, heads[1]);
+}
+
 /// A ticket a person moved out of Owlshift's states gets no fix run while
 /// it stays there, and one once it is back (architecture section 5, "A
 /// ticket a person moved").
@@ -9159,6 +9277,7 @@ fn a_crashed_fix_push(bench: &Bench, owed: Option<owlshift_contracts::refs::Owed
             reviews: Vec::new(),
             steps: Vec::new(),
             refreshed: false,
+            gate_elapsed_s: None,
         }),
     });
     bench.write_record(&record);
@@ -9262,6 +9381,7 @@ fn a_crashed_rebase_push(rebased: bool) -> (Bench, String, String, String) {
             reviews: Vec::new(),
             steps: Vec::new(),
             refreshed: false,
+            gate_elapsed_s: None,
         }),
     });
     bench.write_record(&record);

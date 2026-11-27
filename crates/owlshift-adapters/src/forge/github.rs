@@ -43,9 +43,9 @@ use owlshift_contracts::brief::MAX_EXCERPT_BYTES;
 
 use crate::forge::{
     BaseChecks, Branch, Capability, Check, CheckKind, CheckSet, CheckState, CommitId,
-    DefaultBranch, Error, ErrorKind, InlineComment, MergeAnswer, MergeMethod, MergeRead, Mergeable,
-    PrState, PullRequest, PullRequestRead, RateLimit, Refusal, Repo, RerunAnswer, Review,
-    ReviewDecision, ReviewsRead,
+    DefaultBranch, Error, ErrorKind, GATE_STATUS_CONTEXT, InlineComment, MergeAnswer, MergeMethod,
+    MergeRead, Mergeable, PrState, PullRequest, PullRequestRead, RateLimit, Refusal, Repo,
+    RerunAnswer, Review, ReviewDecision, ReviewsRead,
 };
 pub use crate::graphql::{RateHeaders, Response, RestAnswer, Transport};
 
@@ -88,6 +88,9 @@ pub struct Installation {
     /// re-run of a red check needs (OWL-513): its `permissions` reading
     /// `actions` `write`.
     pub actions_write: bool,
+    /// Whether it granted Commit statuses (read and write), which the gate's
+    /// status needs (OWL-665): its `permissions` reading `statuses` `write`.
+    pub statuses_write: bool,
 }
 
 /// A GitHub token: a fine-grained or classic personal access token, or the
@@ -973,6 +976,36 @@ impl GitHubForge {
         }
     }
 
+    /// Sets the commit status [`GATE_STATUS_CONTEXT`] `success` on `commit`,
+    /// with `description` (OWL-665, architecture section 5, "The gate's
+    /// status"): `POST repos/<owner>/<name>/statuses/<commit>`, which GitHub
+    /// answers 201, and refuses with 422 for a commit it does not have or a
+    /// description past 140 characters (both observed on 2026-11-27). On
+    /// the app's token, a 401 refreshes the token and the call is made once
+    /// more. `Err` for any other answer ([`gate_status_answer`]), or none
+    /// ([`ErrorKind::Unreachable`]).
+    pub fn set_gate_status(&self, commit: &CommitId, description: &str) -> Result<(), Error> {
+        let path = format!(
+            "repos/{}/{}/statuses/{}",
+            self.repo.owner(),
+            self.repo.name(),
+            commit.as_str()
+        );
+        let body = json!({
+            "state": "success",
+            "context": GATE_STATUS_CONTEXT,
+            "description": description,
+        });
+        match self.channel.write(Verb::Post, &path, &body) {
+            Ok(response) => gate_status_answer(&response),
+            Err(Unanswered::Source(error)) => Err(error),
+            Err(Unanswered::Transport(e)) => Err(Error::new(
+                ErrorKind::Unreachable,
+                format!("GitHub gave no answer: {}", redact(&e)),
+            )),
+        }
+    }
+
     /// The installation of the GitHub App `slug` that lists this repository,
     /// as the user of this adapter's token sees it (C12, 2026-10-19):
     /// `user/installations`, each installation's `app_slug` against `slug`,
@@ -1031,6 +1064,10 @@ impl GitHubForge {
                     actions_write: installation
                         .permissions
                         .get("actions")
+                        .is_some_and(|level| level == "write"),
+                    statuses_write: installation
+                        .permissions
+                        .get("statuses")
                         .is_some_and(|level| level == "write"),
                 }));
             }
@@ -1304,6 +1341,14 @@ impl RestHold {
     }
 }
 
+/// `checks` without Owlshift's own gate status ([`Check::is_gate_status`],
+/// OWL-665): left out once they were counted against GitHub's total, so a
+/// head holding it alone has no checks.
+fn without_gate_status(mut checks: Vec<Check>) -> Vec<Check> {
+    checks.retain(|check| !check.is_gate_status());
+    checks
+}
+
 /// The `message` of an error answer's `body`, or nothing.
 fn said(body: &str) -> String {
     serde_json::from_str::<Envelope>(body)
@@ -1396,7 +1441,7 @@ impl GitHubForge {
                 checks.len()
             )));
         }
-        Ok(checks)
+        Ok(without_gate_status(checks))
     }
 
     /// The check set of pull request `number` through `query`, at
@@ -1503,7 +1548,7 @@ impl GitHubForge {
                     state: pr_state(&pr.state)?,
                     mergeable: mergeable(pr.mergeable.as_deref().unwrap_or_default()),
                     merge_state: pr.merge_state_status,
-                    checks,
+                    checks: without_gate_status(checks),
                 };
                 return Ok((set, rate.get()));
             }
@@ -1989,6 +2034,22 @@ pub fn rerun_answer(response: &Response) -> Result<RerunAnswer, Error> {
             reason: format!("GitHub answered HTTP {status} {message}"),
         },
     })
+}
+
+/// What GitHub's answer to a commit status says (OWL-665): set on a 2xx
+/// (GitHub documents 201), otherwise the error of its status, its body
+/// redacted.
+pub fn gate_status_answer(response: &Response) -> Result<(), Error> {
+    if (200..=299).contains(&response.status) {
+        return Ok(());
+    }
+    let body = redact(&response.body);
+    Err(status_error(
+        response.status,
+        &body,
+        response.rate,
+        "commit",
+    ))
 }
 
 /// A spent budget's error, with when it resets.
@@ -2763,6 +2824,32 @@ mod tests {
         assert_eq!(set.verdict(), crate::forge::Verdict::Pending);
     }
 
+    /// OWL-665: the gate's own status is counted against GitHub's total,
+    /// then left out, on any page: a head holding it alone has no checks,
+    /// never green; another context, or a check run of that name, stays.
+    #[test]
+    fn the_gate_status_is_no_check() {
+        let gate = r#"{"__typename":"StatusContext","context":"owlshift/gate","state":"SUCCESS","isRequired":false,"targetUrl":null}"#;
+        let alone = forge(vec![page(HEAD, HEAD, 1, gate, None)]).0;
+        let set = alone.checks(7, &head()).unwrap();
+        assert!(set.checks.is_empty(), "{set:?}");
+        assert_eq!(set.verdict(), crate::forge::Verdict::NoChecks);
+
+        let paged = forge(vec![
+            page(HEAD, HEAD, 3, RUN, Some("c1")),
+            page(HEAD, HEAD, 3, gate, Some("c2")),
+            page(HEAD, HEAD, 3, STATUS, None),
+        ])
+        .0;
+        let set = paged.with_check_page(1).checks(7, &head()).unwrap();
+        let names: Vec<_> = set.checks.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(names, ["ci", "deploy"]);
+
+        let run = RUN.replace(r#""name":"ci""#, r#""name":"owlshift/gate""#);
+        let named = forge(vec![page(HEAD, HEAD, 1, &run, None)]).0;
+        assert_eq!(named.checks(7, &head()).unwrap().checks.len(), 1);
+    }
+
     #[test]
     fn a_partial_or_moving_check_set_is_refused() {
         let check = |bodies: Vec<String>| forge(bodies).0.with_check_page(1).checks(7, &head());
@@ -3244,7 +3331,28 @@ mod tests {
                 suspended: false,
                 contents_write: true,
                 actions_write: true,
+                statuses_write: false,
             })
+        );
+        // One that accepted Commit statuses (write), as OWL-665 asks.
+        let statuses = two.replace(
+            r#""metadata":"read""#,
+            r#""metadata":"read","statuses":"write""#,
+        );
+        let forge = paths(&[
+            (INSTALLATIONS, 200, statuses.as_str()),
+            (
+                "user/installations/9/repositories?per_page=100&page=1",
+                200,
+                r#"{"total_count":1,"repositories":[{"full_name":"owner/repo"}]}"#,
+            ),
+        ]);
+        assert!(
+            forge
+                .app_installation("owl-shift")
+                .unwrap()
+                .unwrap()
+                .statuses_write
         );
         // An installation that has not accepted Contents (write) yet.
         let read_only = two.replace(r#""contents":"write""#, r#""contents":"read""#);
@@ -3754,6 +3862,50 @@ mod tests {
             forge.rerun_failed_jobs(7).unwrap_err().kind,
             ErrorKind::Unauthorized
         );
+    }
+
+    /// OWL-665: one post to the commit's statuses, `success` under the
+    /// gate's context with the description; GitHub's 201 sets it, any
+    /// refusal or no answer is an error, its words redacted.
+    #[test]
+    fn the_gate_status_is_posted_on_the_commit() {
+        let (forge, sent) = posts(vec![Ok(answer(201, r#"{"id":1}"#))]);
+        forge.set_gate_status(&head(), "Gate passed").unwrap();
+        assert_eq!(
+            *sent.posted.lock().unwrap(),
+            [(
+                format!("repos/Owner/Repo/statuses/{HEAD}"),
+                json!({
+                    "state": "success",
+                    "context": "owlshift/gate",
+                    "description": "Gate passed",
+                })
+            )]
+        );
+
+        let error = |answer: Result<Response, String>| {
+            let (forge, _) = posts(vec![answer]);
+            forge.set_gate_status(&head(), "d").unwrap_err()
+        };
+        let refused = error(Ok(answer(
+            403,
+            r#"{"message":"Resource not accessible by integration"}"#,
+        )));
+        assert_eq!(refused.kind, ErrorKind::Unauthorized, "{refused}");
+        assert!(
+            refused.message.contains("Resource not accessible"),
+            "{refused}"
+        );
+        let unknown = error(Ok(answer(
+            422,
+            r#"{"message":"No commit found for SHA: 0000000000000000000000000000000000000001"}"#,
+        )));
+        assert_eq!(unknown.kind, ErrorKind::Other, "{unknown}");
+        let none = error(Err(
+            "timeout at https://api.github.com/x?sig=SENTINEL".to_owned()
+        ));
+        assert_eq!(none.kind, ErrorKind::Unreachable);
+        assert!(!none.message.contains("SENTINEL"), "{none}");
     }
 
     /// Watch's read keeps each check run's workflow run (OWL-513); a node

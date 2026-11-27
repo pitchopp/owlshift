@@ -88,10 +88,13 @@ impl GitHubApp {
 /// (OWL-334): without it, `createPullRequest` answers "not all refs are
 /// readable". Actions (read) lets watch read a red check's job log for its
 /// fix run (OWL-112): GitHub documents it, and live check (c) of the build
-/// plan is still to confirm it with a stored token.
+/// plan is still to confirm it with a stored token. Commit statuses (write)
+/// lets the runner set the gate's status on a project that sets
+/// `forge.publish_gate_status` (OWL-665).
 pub const GITHUB_TOKEN_HELP: &str = "a fine-grained token with pull requests (write), contents, \
-     checks, commit statuses, actions and metadata (read) on the project's repository, and \
-     actions (write) for watch to re-run a red check once";
+     checks, commit statuses, actions and metadata (read) on the project's repository, \
+     actions (write) for watch to re-run a red check once, and commit statuses (write) when \
+     the project sets forge.publish_gate_status";
 
 /// What the GitHub App's token is refreshed with (OWL-384): the keychain it
 /// is stored in, the project's account lock file
@@ -403,7 +406,8 @@ pub fn default_branch(keychain: &Keychain, repo: &Repo) -> Result<DefaultBranch,
 /// What the project's GitHub credential was granted, read from the GitHub
 /// App installation's permissions, which a personal token has none of:
 /// Contents (read and write) for merge on green's merge (D14, OWL-445),
-/// Actions (read and write) for watch's re-run of a red check (OWL-513).
+/// Actions (read and write) for watch's re-run of a red check (OWL-513),
+/// Commit statuses (read and write) for the gate's status (OWL-665).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AppGrants {
     /// The installation, of this id, and what it granted.
@@ -411,6 +415,7 @@ pub enum AppGrants {
         installation: u64,
         contents_write: bool,
         actions_write: bool,
+        statuses_write: bool,
     },
     /// No installation of the app lists the repository.
     NotInstalled,
@@ -443,6 +448,7 @@ pub fn app_grants(
             installation: installation.id,
             contents_write: installation.contents_write,
             actions_write: installation.actions_write,
+            statuses_write: installation.statuses_write,
         },
     })
 }

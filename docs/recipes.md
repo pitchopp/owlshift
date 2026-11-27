@@ -357,6 +357,68 @@ merge_method = "squash"
 
 **Check it:** `owlshift config show` prints the `[forge]` values; `owlshift doctor` reports the forge and its credential. A pull request left unmerged has its reason in watch's output, in the notification and in `owlshift why TICKET`, such as a missing `owlshift:merge` label; the delivery comment says who merges. `doctor` also checks that the GitHub App may merge.
 
+## Skip the suite Owlshift already ran
+
+**Goal:** your CI skips the tests Owlshift's gate already passed on the commit it pushed, instead of running the same suite twice per ticket.
+
+```toml
+[forge]
+publish_gate_status = true
+```
+
+Each time Owlshift pushes a commit whose tree its own gate passed (the delivery, a fix, a rebase run, a correction), it sets the commit status `owlshift/gate` to `success` on that commit, its description the gate's commands and time. It sets none on a commit it did not gate, such as a merge of the base it made itself, nor for a gate with no command, and never a failure. The setting is read at the default branch's head, like `merge`.
+
+The GitHub App needs Commit statuses (read and write): accept the app's new permission in the installation's settings (Settings > Applications > Installed GitHub Apps > owl-shift > Configure). A personal token needs commit statuses (write). Without it no status is set, a warning tells you so, and your CI runs its suite as before.
+
+Trust a status only from the account Owlshift writes with: the GitHub account that ran `owlshift init` (the App's token acts as that account), or the owner of the personal token. Anyone with write access can set a status of the same name, a workflow's `GITHUB_TOKEN` included (its creator is `github-actions[bot]`), so the check below keeps only the logins you list. Store them as a repository variable, `OWLSHIFT_GATE_CREATORS`, comma-separated, then gate the suite on one step:
+
+```yaml
+jobs:
+  tests:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      statuses: read
+    steps:
+      - name: Owlshift's gate on this commit
+        id: owlshift
+        if: github.event_name == 'pull_request'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SHA: ${{ github.event.pull_request.head.sha }}
+          AUTHOR: ${{ github.event.pull_request.user.login }}
+          TRUSTED: ${{ vars.OWLSHIFT_GATE_CREATORS }}
+        run: |
+          # On Owlshift's own pull requests, wait up to 30 s: after a fix's
+          # push, CI may start before the status is set.
+          tries=1
+          case ",$TRUSTED," in *",$AUTHOR,"*) tries=6 ;; esac
+          state=none
+          for i in $(seq "$tries"); do
+            state=$(gh api --paginate "repos/$GITHUB_REPOSITORY/commits/$SHA/statuses" \
+              | jq -rs --arg trusted "$TRUSTED" '
+                  ($trusted | split(",")) as $who
+                  | [.[][] | select(.context == "owlshift/gate")
+                           | select(.creator.login as $l | any($who[]; . == $l))]
+                  | sort_by(.created_at) | last | .state // "none"')
+            [ "$state" = success ] && break
+            [ "$i" -lt "$tries" ] && sleep 5
+          done
+          echo "Owlshift's gate on $SHA: $state"
+          echo "passed=$([ "$state" = success ] && echo true || echo false)" >> "$GITHUB_OUTPUT"
+      - uses: actions/checkout@v4
+        if: steps.owlshift.outputs.passed != 'true'
+      - name: Tests
+        if: steps.owlshift.outputs.passed != 'true'
+        run: make test
+```
+
+The job still runs and reports, so a branch protection that requires it is satisfied either way.
+
+**What it does not cover.** The status says the gate passed on the commit's own tree, not on its merge with a default branch that moved since, which is what a `pull_request` run tests; keep at least one job that always runs if that matters to you. A status set after the job read it means the suite runs, which costs time, not safety. An agent can change a workflow on its branch, this step included: review changes to `.github/workflows/` as you review any change to your CI. Owlshift itself never counts `owlshift/gate` as a check, so merge on green still waits for your CI.
+
+**Check it:** `owlshift doctor` prints a `gate status` line saying whether the GitHub App's installation grants Commit statuses (read and write). After a delivery, the pull request's checks list `owlshift/gate`, and `owlshift logs TICKET` shows the status set (`action` `gate_status`), or the warning `gate_status_unset` with GitHub's reason.
+
 ## Caps: concurrent runs, usage and cost
 
 **Goal:** bound how much runs at once and how much it costs. The caps live in both files.

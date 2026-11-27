@@ -2177,6 +2177,7 @@ mod tests {
             reviews: Vec::new(),
             steps: Vec::new(),
             refreshed: false,
+            gate_elapsed_s: None,
         };
         assert_eq!(
             next.owed,
@@ -2410,6 +2411,7 @@ mod tests {
                 summary: "Renamed it.".to_owned(),
                 pr: None,
                 gate: Vec::new(),
+                gate_elapsed_s: None,
                 notes: Vec::new(),
                 followups: Vec::new(),
                 seen: None,
@@ -2526,6 +2528,7 @@ mod tests {
                 }],
                 steps: Vec::new(),
                 refreshed: false,
+                gate_elapsed_s: None,
             }),
         });
         let mut looping = record(d, verifying);

@@ -126,8 +126,9 @@ pub const QUESTIONS_FORMAT: u32 = 20;
 /// `pushing.rebased` (OWL-514); format 9 a correction's report naming the
 /// person's `steps` its run followed (OWL-619); format 10 a rebase's report
 /// saying it is a clean refresh the runner merged itself, `refreshed`
-/// (OWL-655); formats 1 to 9 are still read.
-pub const DELIVERY_FORMAT: u32 = 10;
+/// (OWL-655); format 11 a report's `gate_elapsed_s`, what the gate's status
+/// says (OWL-665); formats 1 to 10 are still read.
+pub const DELIVERY_FORMAT: u32 = 11;
 /// The format version of a ticket's intake record (`intake.json` on a ticket
 /// ref, OWL-245). Format 2 adds the `zones` and `resources` intake declared
 /// (OWL-402); format 3 intake's `person_only` (OWL-619); format 1 is still
@@ -151,8 +152,9 @@ pub const PROPOSALS_FORMAT: u32 = 2;
 pub const PLAN_FORMAT: u32 = 4;
 /// The format version of a ticket's review record (`review.json` on a ticket
 /// ref, OWL-300). Format 2 adds the colleagues' reviews `relayed` to the
-/// decider (OWL-585); format 1 is still read.
-pub const REVIEW_FORMAT: u32 = 2;
+/// decider (OWL-585); format 3 the kept Build's `gate_elapsed_s`, what the
+/// gate's status says (OWL-665); formats 1 and 2 are still read.
+pub const REVIEW_FORMAT: u32 = 3;
 /// The format version of what a ticket's runs cost (`cost.json` on a ticket
 /// ref, OWL-378).
 pub const COST_FORMAT: u32 = 1;

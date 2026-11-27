@@ -755,7 +755,7 @@ fn bumped_ticket_ref_formats_read_older_ones_and_refuse_newer_ones() {
         ),
         (
             "a newer delivery",
-            &|d| d["format"] = 11.into(),
+            &|d| d["format"] = 12.into(),
             "upgrade Owlshift",
         ),
     ] {
@@ -772,7 +772,7 @@ fn bumped_ticket_ref_formats_read_older_ones_and_refuse_newer_ones() {
         TicketDelivery::parse(&format_4.to_string())
             .unwrap()
             .render()
-            .starts_with("{\n  \"format\": 10,")
+            .starts_with("{\n  \"format\": 11,")
     );
     let mut reviews_in_4 = format_4;
     reviews_in_4["pushing"]["report"]["reviews"] = json!([{ "id": 7, "author": "ada" }]);
@@ -928,6 +928,38 @@ fn a_review_loop_keeps_its_start_its_report_and_its_reviews() {
             .to_string();
         assert!(error.contains(reason), "{case}: {error}");
     }
+
+    // OWL-665: format 3's kept Build keeps its gate's time; a format-2
+    // record is read without it, and refused with one; format 4 is newer.
+    let mut timed = review.clone();
+    timed["build"] = json!({
+        "commit": "a".repeat(40),
+        "summary": "Renamed it.",
+        "gate": ["cargo test"],
+        "gate_elapsed_s": 263
+    });
+    let read = TicketReview::parse(&timed.to_string()).unwrap();
+    assert_eq!(read.build.as_ref().unwrap().gate_elapsed_s, Some(263));
+    assert_eq!(TicketReview::parse(&read.render()).unwrap(), read);
+    let mut format_2 = timed.clone();
+    format_2["format"] = 2.into();
+    let error = TicketReview::parse(&format_2.to_string())
+        .unwrap_err()
+        .to_string();
+    assert!(
+        error.contains("format 2 records no build.gate_elapsed_s"),
+        "{error}"
+    );
+    format_2["build"]
+        .as_object_mut()
+        .unwrap()
+        .remove("gate_elapsed_s");
+    let read = TicketReview::parse(&format_2.to_string()).unwrap();
+    assert_eq!(read.build.as_ref().unwrap().gate_elapsed_s, None);
+    assert_eq!(read.format, TicketReview::new().format);
+    let mut format_4 = review.clone();
+    format_4["format"] = 4.into();
+    assert!(TicketReview::parse(&format_4.to_string()).is_err());
 }
 
 /// A pass after a revision (OWL-356): the brief tells it what changed and
@@ -1157,12 +1189,12 @@ fn findings_and_forge_keys_are_read_and_checked() {
         (
             "an empty forge table",
             with("", "\n[forge]\n"),
-            "lists no reviewer and forge.merge is not set",
+            "lists no reviewer and neither forge.merge nor forge.publish_gate_status is set",
         ),
         (
             "a merge method alone",
             with("", "\n[forge]\nmerge_method = \"merge\"\n"),
-            "lists no reviewer and forge.merge is not set",
+            "lists no reviewer and neither forge.merge nor forge.publish_gate_status is set",
         ),
         (
             "an unknown merge switch",

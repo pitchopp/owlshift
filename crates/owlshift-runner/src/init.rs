@@ -282,6 +282,11 @@ always_human = []
 # merge = \"never\"
 # How the runner merges: \"squash\", \"merge\" or \"rebase\". Default: `\"squash\"`.
 # merge_method = \"squash\"
+# Whether the runner sets the commit status `owlshift/gate` (`success`) on
+# each commit it pushes once its own gate passed on that tree, for your CI
+# to skip the suite already run; the GitHub App or token then needs commit
+# statuses (write). Default: `false`.
+# publish_gate_status = false
 # The forge logins whose reviews on Owlshift's pull requests are read, each
 # mapped to its tracker account: the decider's sends the ticket back to
 # Build. Default: none, no review is read. Refused beside [people].
@@ -1566,7 +1571,7 @@ mod tests {
 
     /// What `config` decides: the values its keys with a default take, read
     /// through their accessors, and the rest of it with those keys left out.
-    /// A `[forge]` decides only its merge, method and reviewers.
+    /// A `[forge]` decides only its merge, method, gate status and reviewers.
     fn effective(mut config: ProjectConfig) -> (String, ProjectConfig) {
         let forge = config.forge.take().unwrap_or_default();
         let (policy, pipeline) = (&config.policy, &config.pipeline);
@@ -1583,7 +1588,12 @@ mod tests {
                 policy.security_merge(),
                 pipeline.findings(),
                 pipeline.codex_reviewer(),
-                (forge.merge(), forge.merge_method(), forge.reviewers),
+                (
+                    forge.merge(),
+                    forge.merge_method(),
+                    forge.publish_gate_status(),
+                    forge.reviewers,
+                ),
             )
         );
         let policy = &mut config.policy;
@@ -1624,6 +1634,7 @@ mod tests {
                     "security_merge",
                     "merge",
                     "merge_method",
+                    "publish_gate_status",
                 ],
                 "{kind:?}"
             );

@@ -212,6 +212,7 @@ pub fn owe_one(current: Option<&TicketProposals>, followup: &Followup) -> Option
             reviews: Vec::new(),
             steps: Vec::new(),
             refreshed: false,
+            gate_elapsed_s: None,
         }),
         unchanged: false,
     };
@@ -520,6 +521,7 @@ mod tests {
                 reviews: Vec::new(),
                 steps: Vec::new(),
                 refreshed: false,
+                gate_elapsed_s: None,
             }),
             unchanged: false,
         }

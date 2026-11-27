@@ -1293,6 +1293,16 @@ pub fn overlap_at(
         .unwrap_or_default())
 }
 
+/// The `[forge] publish_gate_status` of the project file at `base` (OWL-665,
+/// architecture section 5, "The gate's status"): read at the base's head as
+/// [`forge_merge_at`] reads the merge switch, so a ticket's own branch cannot
+/// turn it on; off when the file, its table or the key is absent.
+pub fn gate_status_at(git: &Git, checkout: &Path, base: &Base) -> Result<bool, String> {
+    Ok(project_file_at(git, checkout, base)?
+        .and_then(|config| config.forge)
+        .is_some_and(|forge| forge.publish_gate_status()))
+}
+
 /// The `policy.base_repair` of the project file at `base` (OWL-622): read at
 /// the base's head as `overlap_at` reads `policy.overlap`, so a ticket's own
 /// branch cannot turn it off; `true` with no file.
