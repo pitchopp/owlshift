@@ -35,7 +35,7 @@ use owlshift_core::follow::{
 };
 use owlshift_core::pipeline::Pipeline;
 use owlshift_core::state::{Event, Status, TicketState, Transition};
-use owlshift_core::vocab::{MergeMethod, MergeSwitch, Stage};
+use owlshift_core::vocab::Stage;
 
 use crate::events::{Data, data};
 use crate::ticket_ref::TicketRecord;
@@ -468,8 +468,9 @@ pub struct Following {
     rerun_refused: HashMap<TicketId, String>,
 }
 
-/// `[forge] merge` and `merge_method` as read at a commit (OWL-445).
-pub type Switch = (MergeSwitch, MergeMethod);
+/// `[forge] merge` and `merge_method` as read at a commit (OWL-445), with
+/// `policy.security_merge` (OWL-664).
+pub type Switch = crate::project::MergeSettings;
 
 /// How many commits' switches [`Following`] keeps.
 const SWITCHES_KEPT: usize = 16;
@@ -2114,7 +2115,7 @@ mod tests {
         let mut merging = delivery();
         merging.merging = Some(owlshift_contracts::refs::Merging {
             commit: PUSHED.to_owned(),
-            method: MergeMethod::Squash,
+            method: owlshift_core::vocab::MergeMethod::Squash,
         });
         let merging = record(merging, watching(0));
         assert_eq!(changed(&merging, pipeline, &green, at(0)).unwrap(), None);

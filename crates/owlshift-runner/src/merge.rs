@@ -12,13 +12,17 @@ use std::path::Path;
 use serde_json::{Value, json};
 
 use owlshift_adapters::forge::CommitId;
+use owlshift_contracts::drain::TicketIntake;
 use owlshift_contracts::event::EventKind;
 use owlshift_contracts::ids::TicketId;
 use owlshift_contracts::refs::{DeliveredPullRequest, Merging, TicketDelivery, TicketQuestions};
 use owlshift_contracts::result::Question;
 use owlshift_contracts::review::TicketPlan;
-use owlshift_core::follow::{MergeBlocker, MergeQuestion, Settled, asks_ci_to_skip, held_question};
-use owlshift_core::vocab::{AnswerClass, MergeSwitch};
+use owlshift_core::follow::{
+    MergeBlocker, MergeQuestion, SecurityRule, Settled, asks_ci_to_skip, held_question,
+    security_lifted,
+};
+use owlshift_core::vocab::{AnswerClass, MergeSwitch, SecurityMerge, Variant};
 
 use crate::answer_check;
 use crate::events::{Data, EventSink, data};
@@ -28,7 +32,8 @@ use crate::held;
 use crate::notify;
 use crate::on_demand::OnDemand;
 use crate::project::{self, Base};
-use crate::writer::{MergedComment, Writer};
+use crate::routing;
+use crate::writer::{MergeSaid, MergedComment, Writer};
 
 /// The ticket's questions as merge on green reads them (OWL-465): every
 /// round's, in order, under the category it was asked under, settled by its
@@ -117,26 +122,68 @@ pub(crate) fn switch_in_checkout(
     project::forge_merge_at(git, &checkout, &base_at(branch, commit)).map(Some)
 }
 
-/// The project's `[forge] merge` at `base`, a commit the dedicated checkout
-/// fetched, for the texts that say who merges: `never` when it cannot be
-/// read, so a text never says Owlshift merges when it may not.
-pub(crate) fn switch_at(on_demand: &OnDemand<'_>, base: &Base) -> MergeSwitch {
+/// The project's `[forge] merge` and `policy.security_merge` at `base`, a
+/// commit the dedicated checkout fetched, for the texts that say who
+/// merges: `never` and `person` when they cannot be read, so a text never
+/// says Owlshift merges when it may not.
+pub(crate) fn switch_at(on_demand: &OnDemand<'_>, base: &Base) -> Switch {
     let checkout = on_demand.dirs.checkout();
-    project::forge_merge_at(&on_demand.executor.git, &checkout, base)
-        .map(|(switch, _)| switch)
-        .unwrap_or_default()
+    project::forge_merge_at(&on_demand.executor.git, &checkout, base).unwrap_or_default()
 }
 
 /// [`switch_at`] at the base of `delivery`'s last push, which the
 /// dedicated checkout fetched before it.
-pub(crate) fn switch_at_push(on_demand: &OnDemand<'_>, delivery: &TicketDelivery) -> MergeSwitch {
+pub(crate) fn switch_at_push(on_demand: &OnDemand<'_>, delivery: &TicketDelivery) -> Switch {
     let Some(commit) = &delivery.base_at_push else {
-        return MergeSwitch::Never;
+        return Switch::default();
     };
     switch_in_checkout(on_demand, &delivery.base_branch, commit)
         .ok()
         .flatten()
-        .map_or(MergeSwitch::Never, |(switch, _)| switch)
+        .unwrap_or_default()
+}
+
+/// The ticket's variant as merge on green reads it (OWL-664; architecture
+/// section 5, "A project's choice for `security`"): as dispatch reads it,
+/// its `variant:` label, else intake's verdict, else the project's default,
+/// except that any `variant:risky` label counts, even beside another
+/// `variant:` label, which dispatch reads as no label: a stray label never
+/// lifts the hold `risky` keeps.
+pub(crate) fn merge_variant(
+    labels: &[String],
+    intake: Option<&TicketIntake>,
+    default: Variant,
+) -> Variant {
+    // Read as `routing::route_labels` reads one: the prefix in any case,
+    // the value trimmed and in any case.
+    let prefix = routing::VARIANT_LABEL_PREFIX;
+    let risky = labels.iter().any(|label| {
+        label
+            .get(..prefix.len())
+            .is_some_and(|head| head.eq_ignore_ascii_case(prefix))
+            && label[prefix.len()..].trim().eq_ignore_ascii_case("risky")
+    });
+    if risky {
+        return Variant::Risky;
+    }
+    routing::ticket_variant(
+        routing::route_labels(labels.iter().map(String::as_str)).variant,
+        intake.map(|intake| intake.variant),
+        default,
+    )
+}
+
+/// Who lifts a `security` question's hold for a ticket under the project's
+/// `setting` (OWL-664): its variant, from `variant`, is read only under
+/// `answered`, where a `risky` ticket keeps it for a person.
+pub(crate) fn security_rule(
+    setting: SecurityMerge,
+    variant: impl FnOnce() -> Variant,
+) -> SecurityRule {
+    match setting {
+        SecurityMerge::Person => SecurityRule::Person,
+        SecurityMerge::Answered => SecurityRule::of(setting, variant()),
+    }
 }
 
 /// Posts the MERGED comment of the runner's merge of `pull_request`,
@@ -186,6 +233,8 @@ pub(crate) fn tell_merged(
 /// `bases`, `base_at_push` and the base head the merge was decided on,
 /// which differ for a merge on a moved base (OWL-520); with `no_checks`,
 /// whether no check ran on that head (OWL-657), unknown for a merge a later
+/// read found; then `security`, what the runner's own merge records of the
+/// `security` rule ([`security_data`], OWL-664), empty for a merge a later
 /// read found.
 pub(crate) fn merged_event(
     ticket: &TicketId,
@@ -193,6 +242,7 @@ pub(crate) fn merged_event(
     merging: &Merging,
     (commit, no_checks): (Option<&CommitId>, Option<bool>),
     bases: Option<(&str, &str)>,
+    security: Data,
     sink: &mut EventSink<'_>,
 ) {
     let mut event = data([
@@ -211,6 +261,7 @@ pub(crate) fn merged_event(
         event.insert("base_at_push".to_owned(), json!(at_push));
         event.insert("base".to_owned(), json!(base));
     }
+    event.extend(security);
     sink.emit(ticket, None, EventKind::PrMerged, event);
 }
 
@@ -365,24 +416,88 @@ pub(crate) fn notify_refused(
     }
 }
 
-/// Why merge on green will not merge the ticket's pull request, from its
-/// `questions` alone, as a delivery says it (OWL-464): the question that
-/// keeps it for a person, named, under the project's gate policy. `None`
-/// under `never`, where Owlshift merges nothing anyway, and when no
-/// question holds. The steps a ticket owes a person before the merge are
-/// not said here: their round at Watch asks its decider, and Owlshift
-/// merges once they are answered and the run after them landed (OWL-619).
+/// What merge on green makes of the ticket's `questions`, as a delivery
+/// says it (OWL-464): the question that keeps it for a person, named, under
+/// the project's gate policy and, read at the base with the switch,
+/// `policy.security_merge`, the ticket's variant read from `variant` under
+/// `answered` alone (OWL-664); else the `security` questions whose hold an
+/// answer lifted. Nothing under `never`, where Owlshift merges nothing
+/// anyway. The steps a ticket owes a person before the merge are not said
+/// here: their round at Watch asks its decider, and Owlshift merges once
+/// they are answered and the run after them landed (OWL-619).
 pub(crate) fn held_at_delivery(
     on_demand: &OnDemand<'_>,
-    switch: MergeSwitch,
+    switch: Switch,
+    variant: impl FnOnce() -> Variant,
     questions: &TicketQuestions,
-) -> Option<String> {
-    if switch == MergeSwitch::Never {
-        return None;
+) -> MergeSaid {
+    if switch.switch == MergeSwitch::Never {
+        return MergeSaid::default();
     }
     let questions = self::questions(questions);
     let gate = on_demand.config.gate_policy();
-    held_question(&gate, &questions).map(|(question, blocker)| hold_words(&blocker, Some(question)))
+    let security = security_rule(switch.security, variant);
+    match held_question(&gate, security, &questions) {
+        Some((question, blocker)) => MergeSaid {
+            held: Some(hold_words(&blocker, Some(question))),
+            lifted: None,
+        },
+        None => MergeSaid {
+            held: None,
+            lifted: lifted_words(&security_lifted(security, &questions)),
+        },
+    }
+}
+
+/// The `security` questions `lifted` names ([`security_lifted`]), in a
+/// person's words, one sentence: `None` for none (OWL-664).
+pub(crate) fn lifted_words(lifted: &[(&MergeQuestion, String)]) -> Option<String> {
+    let named: Vec<String> = lifted
+        .iter()
+        .map(|(question, category)| {
+            let how = if question.category == *category {
+                format!("asked under `{category}`")
+            } else {
+                format!("labelled `{category}` by the resolver")
+            };
+            format!("{} ({how})", question_name(question))
+        })
+        .collect();
+    let (last, rest) = named.split_last()?;
+    let (answers, holds, list) = if rest.is_empty() {
+        ("its decider's answer", "the hold", last.clone())
+    } else {
+        (
+            "their decider's answers",
+            "the holds",
+            format!("{} and {last}", rest.join(", ")),
+        )
+    };
+    Some(format!(
+        "Under the project's `policy.security_merge = \"answered\"`, {answers} lifted {holds} of \
+         {list}."
+    ))
+}
+
+/// The fields the runner's own merge records of `security`'s rule on its
+/// `pr_merged` event (OWL-664): under `answered`, `security_merge` and the
+/// `security` questions whose hold an answer lifted, each with its round
+/// and the category it counted under; nothing under any other rule, where
+/// no answer lifts one.
+pub(crate) fn security_data(security: SecurityRule, questions: &[MergeQuestion]) -> Data {
+    if security != SecurityRule::Answered {
+        return Data::new();
+    }
+    let lifted: Vec<Value> = security_lifted(security, questions)
+        .into_iter()
+        .map(|(question, category)| {
+            json!({"question": question.id, "round": question.round, "category": category})
+        })
+        .collect();
+    data([
+        ("security_merge", json!(security.as_str())),
+        ("security_lifted", json!(lifted)),
+    ])
 }
 
 /// The steps a ticket whose plan is `plan` still owes before the merge,
@@ -413,14 +528,16 @@ pub(crate) fn ci_skipped(
 
 /// Who merges the pull request a command just delivered at `base`, as its
 /// line says it: [`switch_at`], and [`held_at_delivery`] on its ticket's
-/// `questions` (OWL-464).
+/// `questions` (OWL-464), the ticket being of `variant` (OWL-664).
 pub(crate) fn who_merges(
     on_demand: &OnDemand<'_>,
     base: &Base,
     questions: &TicketQuestions,
-) -> (MergeSwitch, Option<String>) {
+    variant: Variant,
+) -> (MergeSwitch, MergeSaid) {
     let switch = switch_at(on_demand, base);
-    (switch, held_at_delivery(on_demand, switch, questions))
+    let said = held_at_delivery(on_demand, switch, || variant, questions);
+    (switch.switch, said)
 }
 
 /// The `merge_waits` decision event (OWL-464): the green pull request
@@ -436,7 +553,7 @@ pub(crate) fn waits_data(
     no_checks: bool,
 ) -> Data {
     let category = match blocker {
-        MergeBlocker::Security(category)
+        MergeBlocker::Security(category, _)
         | MergeBlocker::Unanswered(category)
         | MergeBlocker::ResolverDecided(category) => Some(category.as_str()),
         _ => None,
@@ -453,6 +570,10 @@ pub(crate) fn waits_data(
     ]);
     if no_checks {
         event.insert("no_checks".to_owned(), json!(true));
+    }
+    // Which rule kept a `security` question (OWL-664).
+    if let MergeBlocker::Security(_, rule) = blocker {
+        event.insert("security_merge".to_owned(), json!(rule.as_str()));
     }
     event
 }
@@ -507,21 +628,53 @@ fn question_name(question: &MergeQuestion) -> String {
     }
 }
 
+/// The words of a `security` hold of `asked`, `question` when it is known,
+/// under `category`, the asking run's or the resolver's label (OWL-482),
+/// saying which rule kept it (OWL-664).
+fn security_words(
+    asked: &str,
+    category: &str,
+    rule: SecurityRule,
+    question: Option<&MergeQuestion>,
+) -> String {
+    // The resolver's label, not the category it was asked under.
+    let subject = match question {
+        Some(question) if question.category != category => format!(
+            "{asked}, asked under `{}`, was labelled `{category}` by the resolver",
+            question.category
+        ),
+        _ => format!("{asked} was asked under `{category}`"),
+    };
+    match rule {
+        SecurityRule::Person => format!(
+            "{subject}, and a person merges a security question whatever the answer (the \
+             project's `policy.security_merge` is `person`)"
+        ),
+        SecurityRule::Risky => format!(
+            "{subject}, and a person merges a security question of a `risky` ticket whatever \
+             the answer, though the project's `policy.security_merge` is `answered`"
+        ),
+        SecurityRule::Answered => {
+            let unsettled =
+                if question.is_some_and(|question| question.settled == Settled::Resolver) {
+                    "was decided without its decider"
+                } else {
+                    "has no answer of its decider on record"
+                };
+            format!(
+                "{subject} and {unsettled}, and a person merges a security question its decider \
+                 did not answer, even under the project's `policy.security_merge = \"answered\"`"
+            )
+        }
+    }
+}
+
 /// [`blocker_words`], naming `question` when it is the one that holds
 /// ([`owlshift_core::follow::held_question`], OWL-464).
 pub(crate) fn hold_words(blocker: &MergeBlocker, question: Option<&MergeQuestion>) -> String {
     let asked = question.map_or_else(|| "a question of the ticket".to_owned(), question_name);
     match blocker {
-        // The resolver's label, not the category it was asked under.
-        MergeBlocker::Security(category)
-            if question.is_some_and(|question| question.category != *category) =>
-        {
-            let under = question.map_or("", |question| question.category.as_str());
-            format!(
-                "{asked}, asked under `{under}`, was labelled `{category}` by the resolver, and \
-                 a person merges a security question whatever the answer"
-            )
-        }
+        MergeBlocker::Security(category, rule) => security_words(&asked, category, *rule, question),
         MergeBlocker::NotGreen => "it is not green on Owlshift's last push".to_owned(),
         MergeBlocker::SwitchOff => "the project's `[forge] merge` is `never`".to_owned(),
         MergeBlocker::Excluded => "the ticket carries the project's exclusion label".to_owned(),
@@ -532,10 +685,6 @@ pub(crate) fn hold_words(blocker: &MergeBlocker, question: Option<&MergeQuestion
         MergeBlocker::StageMoved => {
             "the ticket is no longer in the project's review state on the tracker".to_owned()
         }
-        MergeBlocker::Security(category) => format!(
-            "{asked} was asked under `{category}`, and a person merges a security question \
-             whatever the answer"
-        ),
         MergeBlocker::Unanswered(category) => format!(
             "{asked} under `{category}`, a category the project keeps for a person, has no \
              answer of its decider on record"
@@ -666,7 +815,7 @@ pub(crate) fn blocker_wait(blocker: &MergeBlocker) -> Option<(&'static str, Data
         MergeBlocker::SwitchOff
         | MergeBlocker::Excluded
         | MergeBlocker::Unlabeled
-        | MergeBlocker::Security(_)
+        | MergeBlocker::Security(..)
         | MergeBlocker::Unanswered(_)
         | MergeBlocker::ResolverDecided(_)
         | MergeBlocker::PersonSteps(_)
@@ -865,7 +1014,7 @@ mod tests {
             MergeBlocker::SwitchOff,
             MergeBlocker::Excluded,
             MergeBlocker::Unlabeled,
-            MergeBlocker::Security("security".to_owned()),
+            MergeBlocker::Security("security".to_owned(), SecurityRule::Person),
             MergeBlocker::Unanswered("money".to_owned()),
             MergeBlocker::ResolverDecided("money".to_owned()),
             MergeBlocker::CommitsUnread,
@@ -1057,13 +1206,113 @@ mod tests {
             "question Q2 under `money`, a category the project keeps for a person, was decided \
              by the resolver rather than answered by its decider"
         );
+        let security = |rule| MergeBlocker::Security("security".to_owned(), rule);
         assert_eq!(
             hold_words(
-                &MergeBlocker::Security("security".to_owned()),
+                &security(SecurityRule::Person),
                 Some(&question(Some(1), "naming"))
             ),
             "question Q2 of round 1, asked under `naming`, was labelled `security` by the \
-             resolver, and a person merges a security question whatever the answer"
+             resolver, and a person merges a security question whatever the answer (the \
+             project's `policy.security_merge` is `person`)"
+        );
+        // OWL-664: the rule that kept it is said.
+        assert_eq!(
+            hold_words(
+                &security(SecurityRule::Risky),
+                Some(&question(Some(1), "security"))
+            ),
+            "question Q2 of round 1 was asked under `security`, and a person merges a security \
+             question of a `risky` ticket whatever the answer, though the project's \
+             `policy.security_merge` is `answered`"
+        );
+        assert_eq!(
+            hold_words(
+                &security(SecurityRule::Answered),
+                Some(&question(Some(1), "security"))
+            ),
+            "question Q2 of round 1 was asked under `security` and has no answer of its decider \
+             on record, and a person merges a security question its decider did not answer, \
+             even under the project's `policy.security_merge = \"answered\"`"
+        );
+        let decided = MergeQuestion {
+            settled: Settled::Resolver,
+            ..question(None, "security")
+        };
+        assert!(
+            hold_words(&security(SecurityRule::Answered), Some(&decided)).starts_with(
+                "question Q2 was asked under `security` and was decided without its decider"
+            ),
+        );
+        let held = waits_data(7, "p", &security(SecurityRule::Risky), None, false);
+        assert_eq!(
+            (&held["blocker"], &held["security_merge"]),
+            (&json!("security"), &json!("risky"))
+        );
+    }
+
+    /// OWL-664: the `security` questions an answer lifted are named in one
+    /// sentence and recorded under `answered` alone; any `variant:risky`
+    /// label makes the ticket `risky` for the merge.
+    #[test]
+    fn a_lifted_security_hold_is_said_and_a_risky_label_always_counts() {
+        let question = |id: &str, category: &str, labelled: Option<&str>| MergeQuestion {
+            id: id.to_owned(),
+            round: Some(1),
+            category: category.to_owned(),
+            labelled: labelled.map(str::to_owned),
+            settled: Settled::Decider,
+        };
+        let asked = [
+            question("Q1", "security", None),
+            question("Q2", "naming", Some("security")),
+        ];
+        let lifted = security_lifted(SecurityRule::Answered, &asked);
+        assert_eq!(
+            lifted_words(&lifted[..1]).unwrap(),
+            "Under the project's `policy.security_merge = \"answered\"`, its decider's answer \
+             lifted the hold of question Q1 of round 1 (asked under `security`)."
+        );
+        assert_eq!(
+            lifted_words(&lifted).unwrap(),
+            "Under the project's `policy.security_merge = \"answered\"`, their decider's answers \
+             lifted the holds of question Q1 of round 1 (asked under `security`) and question \
+             Q2 of round 1 (labelled `security` by the resolver)."
+        );
+        assert_eq!(lifted_words(&[]), None);
+        let recorded = security_data(SecurityRule::Answered, &asked);
+        assert_eq!(recorded["security_merge"], json!("answered"));
+        assert_eq!(
+            recorded["security_lifted"][1],
+            json!({"question": "Q2", "round": 1, "category": "security"})
+        );
+        assert!(security_data(SecurityRule::Person, &asked).is_empty());
+
+        let labels = |names: &[&str]| names.iter().map(|&n| n.to_owned()).collect::<Vec<_>>();
+        let default = Variant::Standard;
+        // Two `variant:` labels that disagree: dispatch reads none, the
+        // merge reads `risky`.
+        assert_eq!(
+            merge_variant(
+                &labels(&["Variant: Risky ", "variant:standard"]),
+                None,
+                default
+            ),
+            Variant::Risky
+        );
+        assert_eq!(
+            merge_variant(&labels(&["variant:trivial"]), None, default),
+            Variant::Trivial
+        );
+        assert_eq!(merge_variant(&labels(&["risky"]), None, default), default);
+        // The variant is read under `answered` alone.
+        assert_eq!(
+            security_rule(SecurityMerge::Person, || unreachable!()),
+            SecurityRule::Person
+        );
+        assert_eq!(
+            security_rule(SecurityMerge::Answered, || Variant::Risky),
+            SecurityRule::Risky
         );
     }
 }

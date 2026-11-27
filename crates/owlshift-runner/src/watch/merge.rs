@@ -106,8 +106,8 @@ impl Watch<'_> {
                 return self.merge_read_failed(memory, sink, ticket, ("base", &error), now);
             }
         };
-        let (switch, method) = match self.switch(memory, &delivery.base_branch, &base_head) {
-            Ok(Some(switch)) => switch,
+        let settings = match self.switch(memory, &delivery.base_branch, &base_head) {
+            Ok(Some(settings)) => settings,
             // The project is busy: the next pass reads it.
             Ok(None) => {
                 let wait = ("merge_busy", Data::new());
@@ -115,7 +115,7 @@ impl Watch<'_> {
             }
             Err(reason) => return self.merge_unread(memory, sink, ticket, "switch", reason),
         };
-        if switch == MergeSwitch::Never {
+        if settings.switch == MergeSwitch::Never {
             return;
         }
         // A refusal that will not pass holds this head and base back, until
@@ -156,10 +156,21 @@ impl Watch<'_> {
         memory.following.merge_read(ticket);
         let questions = merge::questions(&current.record.questions);
         let gate = on_demand.config.gate_policy();
+        // Who lifts a `security` hold: the base's `policy.security_merge`,
+        // the ticket's variant from the labels just read and the ref read
+        // under the lock (OWL-664).
+        let security = merge::security_rule(settings.security, || {
+            merge::merge_variant(
+                &labels,
+                current.record.intake.as_ref(),
+                on_demand.config.pipeline.default,
+            )
+        });
         let policy = MergePolicy {
-            switch,
-            method,
+            switch: settings.switch,
+            method: settings.method,
             gate: &gate,
+            security,
         };
         let first = memory.following.first_green(ticket, now);
         let delivery = &locked.delivery;
@@ -284,7 +295,7 @@ impl Watch<'_> {
                 let pushed = pushed.to_owned();
                 drop(locked);
                 if let Some(key) = blocker.kept_for_a_person() {
-                    let question = core::held_question(&gate, &questions)
+                    let question = core::held_question(&gate, security, &questions)
                         .filter(|(_, held)| *held == blocker)
                         .map(|(question, _)| question);
                     let waits = (pushed.as_str(), &blocker, key, question);
@@ -343,12 +354,25 @@ impl Watch<'_> {
             }
         };
         memory.following.review_cleared(ticket);
-        self.merge_now(memory, sink, out, ticket, pr, locked, grant, seen, now);
+        // What its `pr_merged` event records of the `security` rule (OWL-664).
+        let recorded = merge::security_data(security, &questions);
+        self.merge_now(
+            memory,
+            sink,
+            out,
+            ticket,
+            pr,
+            (locked, recorded),
+            grant,
+            seen,
+            now,
+        );
     }
 
     /// The merge granted and confirmed: `merging` kept in the ref, the
     /// Writer's merge, and its answer (architecture section 5, "Its
-    /// answers").
+    /// answers"), `recorded` what its `pr_merged` event records of the
+    /// `security` rule (OWL-664).
     #[allow(clippy::too_many_arguments)]
     fn merge_now(
         &self,
@@ -357,7 +381,7 @@ impl Watch<'_> {
         out: &mut dyn Write,
         ticket: &TicketId,
         pr: &DeliveredPullRequest,
-        locked: Locked,
+        (locked, recorded): (Locked, Data),
         grant: MergeGrant,
         seen: &follow::Seen,
         now: Timestamp,
@@ -399,7 +423,7 @@ impl Watch<'_> {
                     pr,
                     &locked,
                     (&record, &commit),
-                    &merging,
+                    (&merging, recorded),
                     merged,
                     seen,
                     now,
@@ -520,7 +544,7 @@ impl Watch<'_> {
         pr: &DeliveredPullRequest,
         locked: &Locked,
         (record, commit): (&TicketRecord, &str),
-        merging: &Merging,
+        (merging, recorded): (&Merging, Data),
         merged: CommitId,
         seen: &follow::Seen,
         now: Timestamp,
@@ -565,7 +589,7 @@ impl Watch<'_> {
             .as_deref()
             .map(|at_push| (at_push, locked.base_head.as_str()));
         let told = (Some(&merged), Some(no_checks));
-        merge::merged_event(ticket, pr.number, merging, told, bases, sink);
+        merge::merged_event(ticket, pr.number, merging, told, bases, recorded, sink);
         if let Some(event) = memory.following.events(ticket, &ended) {
             sink.emit(ticket, None, EventKind::Decision, event);
         }
@@ -834,7 +858,7 @@ impl Watch<'_> {
             return;
         };
         match self.switch(memory, &delivery.base_branch, &base_head) {
-            Ok(Some((switch, _))) if switch != MergeSwitch::Never => {
+            Ok(Some(settings)) if settings.switch != MergeSwitch::Never => {
                 let wait = ("merge_no_checks", data([("until", json!(until))]));
                 self.tell_wait(memory, sink, out, ticket, pr, head, wait);
             }

@@ -11,7 +11,7 @@ use std::time::Duration;
 
 use crate::floor::{FloorCategory, MergeGrant, names_floor_category};
 use crate::gate::{GatePolicy, Route};
-use crate::vocab::{MergeMethod, MergeSwitch};
+use crate::vocab::{MergeMethod, MergeSwitch, SecurityMerge, Variant};
 
 /// How long watch waits on a failed check beside one still unfinished before
 /// it decides on the failures it has: one hour since it first read a failure
@@ -591,12 +591,51 @@ pub fn asks_ci_to_skip(message: &str) -> bool {
 
 /// What the project lets the runner merge, read at the base branch's head:
 /// `[forge] merge` and `merge_method`, and the gate policy that says which
-/// question categories the project sends to a human.
+/// question categories the project sends to a human, and who lifts a
+/// `security` question's hold for this ticket (OWL-664).
 #[derive(Clone, Copy, Debug)]
 pub struct MergePolicy<'a> {
     pub switch: MergeSwitch,
     pub method: MergeMethod,
     pub gate: &'a GatePolicy,
+    pub security: SecurityRule,
+}
+
+/// Who lifts the merge hold of a ticket's question under `security`
+/// (OWL-664; architecture section 5, "Merge on green", "A project's choice
+/// for `security`"): the project's `policy.security_merge`, a `risky`
+/// ticket kept for a person under `answered`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum SecurityRule {
+    /// `person`: a person merges, whatever the answer.
+    Person,
+    /// `answered`, on a `risky` ticket: a person merges, whatever the
+    /// answer.
+    Risky,
+    /// `answered`: its decider's answer lifts it.
+    Answered,
+}
+
+impl SecurityRule {
+    /// The rule for a ticket of `variant` under the project's `setting`:
+    /// `risky` matters under `answered` alone, `person` keeping every ticket
+    /// for a person already.
+    pub fn of(setting: SecurityMerge, variant: Variant) -> Self {
+        match (setting, variant) {
+            (SecurityMerge::Person, _) => Self::Person,
+            (SecurityMerge::Answered, Variant::Risky) => Self::Risky,
+            (SecurityMerge::Answered, _) => Self::Answered,
+        }
+    }
+
+    /// Its name in events: the setting's, or `risky`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Person => SecurityMerge::Person.as_str(),
+            Self::Risky => "risky",
+            Self::Answered => SecurityMerge::Answered.as_str(),
+        }
+    }
 }
 
 /// The first green read watch keeps for a followed pull request
@@ -725,8 +764,10 @@ pub enum MergeBlocker {
     StageMoved,
     /// A question of the ticket was asked under this category, which names
     /// `security`, or the resolver labelled it so, the token `security` then
-    /// given: a person merges it, whatever the answer.
-    Security(String),
+    /// given, and the rule says a person merges it: whatever the answer, or,
+    /// under [`SecurityRule::Answered`], since no answer of its decider
+    /// settled it (OWL-664).
+    Security(String, SecurityRule),
     /// A question of the ticket under this category, which the project
     /// sends to a human, has no answer of its decider on record.
     Unanswered(String),
@@ -850,7 +891,7 @@ fn blocker(policy: &MergePolicy<'_>, facts: &MergeFacts<'_>, read: &Read) -> Opt
     if !facts.at_review {
         return Some(MergeBlocker::StageMoved);
     }
-    if let Some((_, blocker)) = held_question(policy.gate, facts.questions) {
+    if let Some((_, blocker)) = held_question(policy.gate, policy.security, facts.questions) {
         return Some(blocker);
     }
     if facts.person_steps > 0 {
@@ -927,30 +968,44 @@ fn base_hold(head: &str, base: Option<&BaseRead>, carried: &[CheckRead]) -> Opti
     (!running.is_empty()).then_some(MergeBlocker::BasePending(running))
 }
 
+/// The category under which `question` counts as a `security` one for the
+/// merge: its own when it names `security`, else the token `security` when
+/// the resolver labelled it so (OWL-482); `None` for any other.
+fn security_category(question: &MergeQuestion) -> Option<String> {
+    let security = |category: &str| names_floor_category(category, FloorCategory::Security);
+    if security(&question.category) {
+        Some(question.category.clone())
+    } else {
+        question
+            .labelled
+            .as_deref()
+            .is_some_and(security)
+            .then(|| FloorCategory::Security.token().to_owned())
+    }
+}
+
 /// The question that keeps the ticket for a person, if one does (OWL-465):
-/// one under `security` first, whatever the answer, since no answer lifts it,
-/// or one the resolver labelled `security` (OWL-482); else, among those under
-/// a category the project sends to a human, the first, in the order given,
-/// that its decider did not answer. A question its decider answered holds
-/// nothing. With the question, which names it to a person (OWL-464).
+/// one under `security` first, the category's or the resolver's label
+/// (OWL-482), whatever the answer under `security`'s rule [`SecurityRule::Person`]
+/// or [`SecurityRule::Risky`], and under [`SecurityRule::Answered`] unless
+/// its decider answered it (OWL-664); else, among those under a category
+/// the project sends to a human, the first, in the order given, that its
+/// decider did not answer. A question its decider answered holds nothing
+/// else. With the question, which names it to a person (OWL-464).
 pub fn held_question<'q>(
     gate: &GatePolicy,
+    security: SecurityRule,
     questions: &'q [MergeQuestion],
 ) -> Option<(&'q MergeQuestion, MergeBlocker)> {
-    let security = |category: &str| names_floor_category(category, FloorCategory::Security);
-    if let Some(held) = questions.iter().find_map(|question| {
-        if security(&question.category) {
-            Some((question, question.category.clone()))
-        } else {
-            question
-                .labelled
-                .as_deref()
-                .is_some_and(security)
-                .then(|| (question, FloorCategory::Security.token().to_owned()))
-        }
+    let lifted = |question: &MergeQuestion| {
+        security == SecurityRule::Answered && question.settled == Settled::Decider
+    };
+    if let Some((question, category)) = questions.iter().find_map(|question| {
+        security_category(question)
+            .filter(|_| !lifted(question))
+            .map(|category| (question, category))
     }) {
-        let (question, category) = held;
-        return Some((question, MergeBlocker::Security(category)));
+        return Some((question, MergeBlocker::Security(category, security)));
     }
     let mut human = questions
         .iter()
@@ -968,6 +1023,25 @@ pub fn held_question<'q>(
     })
 }
 
+/// The questions under `security`, the category's or the resolver's label,
+/// whose hold their decider's answer lifted (OWL-664): under
+/// [`SecurityRule::Answered`] alone, those its decider answered, in the
+/// order given, each with the category it counts under; none under any
+/// other rule, where no answer lifts one.
+pub fn security_lifted(
+    security: SecurityRule,
+    questions: &[MergeQuestion],
+) -> Vec<(&MergeQuestion, String)> {
+    if security != SecurityRule::Answered {
+        return Vec::new();
+    }
+    questions
+        .iter()
+        .filter(|question| question.settled == Settled::Decider)
+        .filter_map(|question| security_category(question).map(|category| (question, category)))
+        .collect()
+}
+
 impl MergeBlocker {
     /// The hold's key when only a person lifts it, so that the pull request
     /// waits for one rather than for a later pass (OWL-464): a question kept
@@ -975,7 +1049,7 @@ impl MergeBlocker {
     /// `None` for a wait the next pass settles and for the last read's.
     pub fn kept_for_a_person(&self) -> Option<&'static str> {
         match self {
-            Self::Security(_) => Some("security"),
+            Self::Security(..) => Some("security"),
             Self::Unanswered(_) => Some("unanswered"),
             Self::ResolverDecided(_) => Some("resolver_decided"),
             Self::PersonSteps(_) => Some("person_steps"),
@@ -1792,10 +1866,22 @@ mod tests {
             facts: &MergeFacts<'_>,
             read: &Read,
         ) -> MergeDue {
+            due_under(SecurityRule::Person, switch, gate, facts, read)
+        }
+
+        /// [`due`] under `security`'s rule (OWL-664).
+        fn due_under(
+            security: SecurityRule,
+            switch: MergeSwitch,
+            gate: &GatePolicy,
+            facts: &MergeFacts<'_>,
+            read: &Read,
+        ) -> MergeDue {
             let policy = MergePolicy {
                 switch,
                 method: MergeMethod::Rebase,
                 gate,
+                security,
             };
             merge_due(&policy, facts, read)
         }
@@ -1897,7 +1983,7 @@ mod tests {
                     MergeSwitch::All,
                     facts(&GREEN, &human),
                     green_read(),
-                    Security(human[0].category.clone()),
+                    Security(human[0].category.clone(), SecurityRule::Person),
                 ),
                 (
                     MergeSwitch::All,
@@ -2529,11 +2615,9 @@ mod tests {
             use Settled::*;
             let gate = gate(DelegationLevel::Discoverable);
             let held = |category: &str| {
-                [
-                    Some(Security(category.to_owned())),
-                    Some(Security(category.to_owned())),
-                    Some(Security(category.to_owned())),
-                ]
+                std::array::from_fn::<_, 3, _>(|_| {
+                    Some(Security(category.to_owned(), SecurityRule::Person))
+                })
             };
             let lifted_once_answered = |category: &str| {
                 [
@@ -2589,11 +2673,11 @@ mod tests {
                     &facts(&GREEN, &both),
                     &green_read()
                 ),
-                MergeDue::Wait(Security("security".to_owned()))
+                MergeDue::Wait(Security("security".to_owned(), SecurityRule::Person))
             );
             // With the question that holds, which names it to a person
             // (OWL-464).
-            let held = held_question(&gate, &both).unwrap();
+            let held = held_question(&gate, SecurityRule::Person, &both).unwrap();
             assert!(std::ptr::eq(held.0, &both[1]), "{held:?}");
             assert_eq!(held.1.kept_for_a_person(), Some("security"));
             assert_eq!(MergeBlocker::GreenOnce.kept_for_a_person(), None);
@@ -2610,7 +2694,7 @@ mod tests {
                 labelled: Some(label.to_owned()),
                 ..question(category, settled)
             };
-            let held = Some(Security("security".to_owned()));
+            let held = Some(Security("security".to_owned(), SecurityRule::Person));
             let cases = [
                 ("naming", "security", held.clone()),
                 ("naming", "auth_security", held.clone()),
@@ -2619,7 +2703,7 @@ mod tests {
                 (
                     "Security",
                     "security",
-                    Some(Security("Security".to_owned())),
+                    Some(Security("Security".to_owned(), SecurityRule::Person)),
                 ),
                 ("naming", "irreversible", None),
                 ("naming", "naming", None),
@@ -2647,6 +2731,86 @@ mod tests {
                     }
                 }
             }
+        }
+
+        /// OWL-664: under `policy.security_merge = "answered"`, a question
+        /// under `security`, the category's or the resolver's label, holds
+        /// until its decider answers it; a decision kept without its decider
+        /// holds whatever the setting; a `risky` ticket keeps the `person`
+        /// rule; `irreversible` is unchanged.
+        #[test]
+        fn answered_lets_the_decider_s_answer_lift_a_security_hold() {
+            use MergeBlocker::*;
+            use Settled::*;
+            let gate = gate(DelegationLevel::Discoverable);
+            let labelled = MergeQuestion {
+                labelled: Some("security".to_owned()),
+                ..question("naming", Decider)
+            };
+            let merged = MergeDue::Merge(MergeGrant::new(HEAD, MergeMethod::Rebase));
+            let under = |security, questions: &[MergeQuestion]| {
+                due_under(
+                    security,
+                    MergeSwitch::All,
+                    &gate,
+                    &facts(&GREEN, questions),
+                    &green_read(),
+                )
+            };
+            let answered = SecurityRule::Answered;
+            let wait = |category: &str, rule| MergeDue::Wait(Security(category.to_owned(), rule));
+            let cases = [
+                (question("security", Decider), merged.clone()),
+                (labelled.clone(), merged.clone()),
+                (question("security", Open), wait("security", answered)),
+                (
+                    MergeQuestion {
+                        settled: Open,
+                        ..labelled.clone()
+                    },
+                    wait("security", answered),
+                ),
+                // A resolver's decision or a recommendation the runner took.
+                (question("security", Resolver), wait("security", answered)),
+                (
+                    question("irreversible", Open),
+                    MergeDue::Wait(Unanswered("irreversible".to_owned())),
+                ),
+            ];
+            for (asked, want) in cases {
+                assert_eq!(
+                    under(answered, std::slice::from_ref(&asked)),
+                    want,
+                    "{asked:?}"
+                );
+            }
+            // Answered, it falls through to the human categories' pass.
+            let both = [question("security", Decider), question("money", Open)];
+            assert_eq!(
+                under(answered, &both),
+                MergeDue::Wait(Unanswered("money".to_owned()))
+            );
+            let asked = [labelled.clone(), question("money", Decider)];
+            let lifted = security_lifted(answered, &asked);
+            assert_eq!(lifted, [(&labelled, "security".to_owned())]);
+            // `risky` matters under `answered` alone, and holds as `person`.
+            assert_eq!(
+                SecurityRule::of(SecurityMerge::Person, Variant::Risky),
+                SecurityRule::Person
+            );
+            assert_eq!(
+                SecurityRule::of(SecurityMerge::Answered, Variant::Standard),
+                answered
+            );
+            let risky = SecurityRule::of(SecurityMerge::Answered, Variant::Risky);
+            assert_eq!(
+                under(risky, &[question("security", Decider)]),
+                wait("security", SecurityRule::Risky)
+            );
+            assert!(security_lifted(risky, &[question("security", Decider)]).is_empty());
+            assert!(
+                security_lifted(SecurityRule::Person, &[question("security", Decider)]).is_empty()
+            );
         }
     }
 }

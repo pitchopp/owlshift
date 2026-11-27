@@ -225,7 +225,8 @@ fn a_question_kept_for_a_person_is_said_at_delivery_and_once_at_watch() {
     ]);
     let line = delivered.unwrap_or_else(|stop| panic!("{stop}\n{printed}"));
     let held = "question Q1 of round 1 was asked under `security`, and a person merges a security \
-                question whatever the answer. Review and merge it yourself.";
+                question whatever the answer (the project's `policy.security_merge` is \
+                `person`). Review and merge it yourself.";
     assert!(
         line.to_string()
             .ends_with(&format!("Owlshift will not merge it: {held}")),
@@ -292,6 +293,90 @@ fn a_question_kept_for_a_person_is_said_at_delivery_and_once_at_watch() {
     );
 }
 
+/// OWL-664: under `policy.security_merge = "answered"`, a `security`
+/// question its decider answered is said lifted at delivery, in the
+/// DELIVERY report and the delivery line. A `variant:risky` label put on
+/// the ticket keeps it for a person, told once with the rule; the label
+/// taken off, watch merges it, and its `pr_merged` event records the
+/// question lifted.
+#[test]
+fn answered_lifts_an_answered_security_question_but_not_a_risky_ticket_s() {
+    let bench = Bench::with(
+        "maintainer",
+        "assignee = \"maintainer\"\n",
+        "security_merge = \"answered\"\n[forge]\nmerge = \"all\"\n",
+    );
+    let (asked, printed) = bench.run(vec![bench.reply(None, Some(SECURITY_ROUND))], None);
+    assert!(
+        matches!(&asked, Err(Stop::NeedsInput { posted: Ok(round), .. }) if round.get() == 1),
+        "{asked:?}\n{printed}"
+    );
+    bench.answer("Q1: A");
+    let answered = check(&[("Q1", "answered", "A, anyone.")]);
+    let (delivered, printed) = bench.continue_ticket(vec![
+        bench.reply(None, Some(&answered)),
+        bench.reply(Some("Hello"), Some(DONE)),
+    ]);
+    let line = delivered
+        .unwrap_or_else(|stop| panic!("{stop}\n{printed}"))
+        .to_string();
+    let lifted = "Under the project's `policy.security_merge = \"answered\"`, its decider's answer \
+                  lifted the hold of question Q1 of round 1 (asked under `security`).";
+    assert!(
+        line.ends_with(&format!("(merge on green). {lifted}")),
+        "{line}"
+    );
+    let report = bench
+        .comments()
+        .into_iter()
+        .rfind(|body| body.starts_with("[owlshift] DELIVERY"))
+        .unwrap();
+    assert!(report.contains(lifted), "{report}");
+
+    let file = bench.ticket_file();
+    let ticket_text = fs::read_to_string(&file).unwrap();
+    let risky = ticket_text.replacen("\n+++\n", "\nlabels = [\"variant:risky\"]\n+++\n", 1);
+    fs::write(&file, risky).unwrap();
+    let clock = bench.clock.clone();
+    let mut pass = 0;
+    let (_, lines, printed) = bench.watch(Vec::new(), &mut |_| {
+        pass += 1;
+        later(&clock);
+        // `risky` at passes 1 to 3, then not.
+        if pass == 3 {
+            assert!(github_merges(&bench).is_empty());
+            fs::write(&file, &ticket_text).unwrap();
+        }
+        pass < 7
+    });
+    let waits: Vec<Value> = data_of(&bench.events(), EventKind::Decision, "watch")
+        .into_iter()
+        .filter(|data| data["watch"] == "merge_waits")
+        .collect();
+    assert_eq!(waits.len(), 1, "{waits:?}\n{lines}\n{printed}");
+    assert_eq!(
+        (&waits[0]["blocker"], &waits[0]["security_merge"]),
+        (&json!("security"), &json!("risky"))
+    );
+    let notified = bench.notified.0.borrow().clone();
+    assert!(
+        notified.iter().any(|line| line.contains(
+            "and a person merges a security question of a `risky` ticket whatever the answer"
+        )),
+        "{notified:?}"
+    );
+    assert_eq!(github_merges(&bench).len(), 1, "{lines}\n{printed}");
+    let events = merged_events(&bench);
+    assert_eq!(events.len(), 1, "{events:?}");
+    assert_eq!(
+        (&events[0]["security_merge"], &events[0]["security_lifted"]),
+        (
+            &json!("answered"),
+            &json!([{"question": "Q1", "round": 1, "category": "security"}])
+        )
+    );
+}
+
 /// `continue` at Watch says what merge on green makes of the ticket's
 /// questions (OWL-465). LOC-1037's shape, an `irreversible` question its
 /// decider answered, lets watch's next pass merge; a `security` question
@@ -340,7 +425,7 @@ fn continue_at_watch_says_which_questions_still_hold_the_merge() {
             asked("security", answered),
             held(
                 "was asked under `security`, and a person merges a security question whatever \
-                 the answer",
+                 the answer (the project's `policy.security_merge` is `person`)",
             ),
         ),
         (

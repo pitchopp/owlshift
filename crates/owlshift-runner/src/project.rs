@@ -1243,25 +1243,38 @@ pub fn forge_reviewers_at(
         .filter(|reviewers| !reviewers.is_empty()))
 }
 
+/// What the project file says of merge on green at a base commit
+/// ([`forge_merge_at`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct MergeSettings {
+    /// `[forge] merge`.
+    pub switch: owlshift_core::vocab::MergeSwitch,
+    /// `[forge] merge_method`.
+    pub method: owlshift_core::vocab::MergeMethod,
+    /// `policy.security_merge` (OWL-664).
+    pub security: owlshift_core::vocab::SecurityMerge,
+}
+
 /// The `[forge] merge` and `merge_method` of the project file as the base
 /// commit holds it (D14, architecture section 5, "Merge on green"), read as
 /// [`forge_reviewers_at`] reads the reviewers, for the same reason: a
-/// ticket's own branch cannot turn merge on green on. `never` and `squash`
-/// when the file, its `[forge]` table or the keys are absent.
-pub fn forge_merge_at(
-    git: &Git,
-    checkout: &Path,
-    base: &Base,
-) -> Result<
-    (
-        owlshift_core::vocab::MergeSwitch,
-        owlshift_core::vocab::MergeMethod,
-    ),
-    String,
-> {
+/// ticket's own branch cannot turn merge on green on; with its
+/// `policy.security_merge` (OWL-664), which a ticket's own branch cannot
+/// loosen either. `never`, `squash` and `person` when the file, its table
+/// or the keys are absent.
+pub fn forge_merge_at(git: &Git, checkout: &Path, base: &Base) -> Result<MergeSettings, String> {
     Ok(project_file_at(git, checkout, base)?
-        .and_then(|config| config.forge)
-        .map(|forge| (forge.merge(), forge.merge_method()))
+        .map(|config| {
+            let (switch, method) = config
+                .forge
+                .map(|forge| (forge.merge(), forge.merge_method()))
+                .unwrap_or_default();
+            MergeSettings {
+                switch,
+                method,
+                security: config.policy.security_merge(),
+            }
+        })
         .unwrap_or_default())
 }
 
@@ -1303,7 +1316,7 @@ pub fn overlap_at_origin_head(git: &Git, root: &Path) -> owlshift_core::vocab::O
 
 #[cfg(test)]
 mod forge_merge_tests {
-    use owlshift_core::vocab::{MergeMethod, MergeSwitch};
+    use owlshift_core::vocab::{MergeMethod, MergeSwitch, SecurityMerge};
 
     use super::*;
 
@@ -1350,10 +1363,15 @@ mod forge_merge_tests {
             &project_file("reviewers = { ada = \"u-ann\" }\n"),
         );
         git.run(repo, &["checkout", "-q", "-b", "owl-1"]).unwrap();
+        // Nor loosen who merges a `security` question (OWL-664).
         let branch_commit = commit(
             &git,
             repo,
-            &project_file("merge = \"all\"\nmerge_method = \"rebase\"\n"),
+            &project_file("merge = \"all\"\nmerge_method = \"rebase\"\n").replacen(
+                "always_human = []",
+                "always_human = []\nsecurity_merge = \"answered\"",
+                1,
+            ),
         );
         let at = |commit: &str| Base {
             remote_ref: "origin/main".to_owned(),
@@ -1362,11 +1380,15 @@ mod forge_merge_tests {
         };
         assert_eq!(
             forge_merge_at(&git, repo, &at(&base_commit)),
-            Ok((MergeSwitch::Never, MergeMethod::Squash))
+            Ok(MergeSettings::default())
         );
         assert_eq!(
             forge_merge_at(&git, repo, &at(&branch_commit)),
-            Ok((MergeSwitch::All, MergeMethod::Rebase))
+            Ok(MergeSettings {
+                switch: MergeSwitch::All,
+                method: MergeMethod::Rebase,
+                security: SecurityMerge::Answered,
+            })
         );
         // A table that sets only the merge lists no reviewer.
         assert_eq!(

@@ -20,6 +20,7 @@ use owlshift_contracts::config::{
 };
 use owlshift_core::floor::{FloorCategory, is_human_category};
 use owlshift_core::gate::{PassLimit, ResolverPolicy, normalized_categories};
+use owlshift_core::vocab::SecurityMerge;
 use semver::Version;
 
 use crate::operator::{self, Taking};
@@ -559,6 +560,19 @@ impl Effective {
                 lines.push(format!("  {category}  ({}){note}", path.display()));
             }
         }
+        // Who lifts a `security` question's merge hold (OWL-664), as this
+        // file says it: merge on green reads it at the base branch's head.
+        let (security, source) = match project {
+            Some((path, policy)) if policy.security_merge.is_some() => {
+                (policy.security_merge(), path.display().to_string())
+            }
+            _ => (SecurityMerge::Person, "default".to_owned()),
+        };
+        lines.push(format!(
+            "  security_merge = \"{}\"  ({source}; merge on green reads it at the base branch's \
+             head)",
+            security.as_str()
+        ));
         lines
     }
 
@@ -699,19 +713,27 @@ mod tests {
             "  scope  (delegation level discoverable)".to_owned(),
             "  money  (delegation level discoverable)".to_owned(),
             "  security  (floor)".to_owned(),
+            "  security_merge = \"person\"  (default; merge on green reads it at the base \
+             branch's head)"
+                .to_owned(),
         ] {
             assert!(default.contains(&line), "{line}\n---\n{default}");
         }
 
         let all = shown(
             "always_human = [\"money\"]\nresolver_delegation = \"all\"\n\
-             resolver_passes = \"unlimited\"\nresolver_budget_usd = 2.5\nticket_budget_usd = 100",
+             resolver_passes = \"unlimited\"\nresolver_budget_usd = 2.5\nticket_budget_usd = 100\n\
+             security_merge = \"answered\"",
         );
         for line in [
             format!("  resolver_delegation = \"all\"  ({path})"),
             format!("  resolver_passes = \"unlimited\"  ({path})"),
             format!("  resolver_budget_usd = 2.5  ({path})"),
             format!("  ticket_budget_usd = 100  ({path})"),
+            format!(
+                "  security_merge = \"answered\"  ({path}; merge on green reads it at the base \
+                 branch's head)"
+            ),
             "  security  (floor)".to_owned(),
             "  irreversible  (floor)".to_owned(),
             format!("  money  ({path})"),

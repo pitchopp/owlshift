@@ -25,9 +25,9 @@ impl OnDemand<'_> {
             .clone()
             .filter(TicketDelivery::followed)?;
         let checkout = self.dirs.checkout();
-        let (switch, method) =
+        let settings =
             project::forge_merge_at(&self.executor.git, &checkout, &p.base).unwrap_or_default();
-        if switch == MergeSwitch::Never {
+        if settings.switch == MergeSwitch::Never {
             return None;
         }
         const NEVER: &str = "`continue` never merges";
@@ -56,7 +56,7 @@ impl OnDemand<'_> {
                  on green)."
             ));
         }
-        let would = self.would_merge(p, seen, &delivery, (switch, method));
+        let would = self.would_merge(p, seen, &delivery, settings);
         Some(match would {
             Ok(MergeDue::Merge(_)) => format!(
                 "{NEVER}: the next pass of `owlshift watch` would merge it, once its read is \
@@ -82,7 +82,7 @@ impl OnDemand<'_> {
         p: &Prepared,
         seen: &Seen,
         delivery: &TicketDelivery,
-        (switch, method): (MergeSwitch, owlshift_core::vocab::MergeMethod),
+        settings: project::MergeSettings,
     ) -> Result<MergeDue, String> {
         let pushed = delivery
             .pushed
@@ -172,10 +172,16 @@ impl OnDemand<'_> {
         };
         // Green, so open: the read watch's merge pass takes too.
         let read = seen.merge_read();
+        // Who lifts a `security` hold, the ticket's variant as this command
+        // read it (OWL-664).
+        let security = crate::merge::security_rule(settings.security, || {
+            crate::merge::merge_variant(labels, p.intake.as_ref(), self.config.pipeline.default)
+        });
         let policy = MergePolicy {
-            switch,
-            method,
+            switch: settings.switch,
+            method: settings.method,
             gate: &gate,
+            security,
         };
         Ok(core::merge_due(&policy, &facts, &read))
     }

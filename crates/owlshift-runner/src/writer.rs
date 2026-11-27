@@ -143,18 +143,49 @@ pub struct DeliveryReport {
     /// Why merge on green will not merge it, when a question of the ticket
     /// keeps it for a person (OWL-464): `None` under `never`.
     pub merge_held: Option<String>,
+    /// The `security` questions whose hold their decider's answer lifted,
+    /// in a sentence, when none holds (OWL-664): `None` under `never`.
+    pub merge_lifted: Option<String>,
     /// The steps the delivered ticket owes a person, in the plan's order
     /// (OWL-619): listed in what remains for a human. Empty but for a
     /// delivery whose plan holds a person's step.
     pub person_steps: Vec<OwedStep>,
 }
 
+/// What a delivery says of merge on green beside who merges, from the
+/// ticket's questions alone (`merge::held_at_delivery`).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct MergeSaid {
+    /// Why merge on green will not merge it, when a question of the ticket
+    /// keeps it for a person (OWL-464).
+    pub held: Option<String>,
+    /// The `security` questions whose hold their decider's answer lifted
+    /// under `policy.security_merge = "answered"`, when none holds
+    /// (OWL-664).
+    pub lifted: Option<String>,
+}
+
 /// Who merges a pull request on a project that opted into merge on green
 /// (D14, OWL-445), `it` being how the sentence names it; `None` under
 /// `never`, where each text keeps its own words that Owlshift never merges.
 /// `held`, why a question of the ticket keeps it for a person, says that
-/// Owlshift will not merge it (OWL-464).
-pub fn merges_on_green(switch: MergeSwitch, held: Option<&str>, it: &str) -> Option<String> {
+/// Owlshift will not merge it (OWL-464); else `lifted`, the `security`
+/// questions whose hold their decider's answer lifted, follows (OWL-664).
+pub fn merges_on_green(
+    switch: MergeSwitch,
+    held: Option<&str>,
+    lifted: Option<&str>,
+    it: &str,
+) -> Option<String> {
+    let merges = merges_unheld(switch, held, it)?;
+    Some(match lifted.filter(|_| held.is_none()) {
+        Some(lifted) => format!("{merges} {lifted}"),
+        None => merges,
+    })
+}
+
+/// [`merges_on_green`] without what an answer lifted.
+fn merges_unheld(switch: MergeSwitch, held: Option<&str>, it: &str) -> Option<String> {
     match (switch, held) {
         (MergeSwitch::Never, _) => None,
         (_, Some(held)) => Some(format!(
@@ -1053,9 +1084,13 @@ impl DeliveryReport {
         let mut remains = Vec::new();
         if pr.state == PrState::Open {
             remains.push(
-                merges_on_green(self.merge, self.merge_held.as_deref(), &pr_link).unwrap_or_else(
-                    || format!("Review and merge {pr_link}: Owlshift never merges."),
-                ),
+                merges_on_green(
+                    self.merge,
+                    self.merge_held.as_deref(),
+                    self.merge_lifted.as_deref(),
+                    &pr_link,
+                )
+                .unwrap_or_else(|| format!("Review and merge {pr_link}: Owlshift never merges.")),
             );
         }
         remains.extend(self.person_steps.iter().map(owed_line));
@@ -5790,6 +5825,7 @@ mod tests {
             recommended: Vec::new(),
             merge: MergeSwitch::Never,
             merge_held: None,
+            merge_lifted: None,
             person_steps: Vec::new(),
         }
     }
@@ -8984,7 +9020,27 @@ Reply `Q1: B`, `ok` to take every recommendation, or in your own words.
             );
             assert!(body.contains(&says), "{switch:?}: {body}");
         }
-        assert_eq!(merges_on_green(MergeSwitch::Never, Some(held), "it"), None);
+        assert_eq!(
+            merges_on_green(MergeSwitch::Never, Some(held), None, "it"),
+            None
+        );
+        // OWL-664: what an answer lifted follows who merges, and a hold
+        // says nothing of it.
+        let lifted = "Under the project's `policy.security_merge = \"answered\"`, its decider's \
+                      answer lifted the hold of question Q1 of round 1 (asked under `security`).";
+        let mut report = report(Ok(set(Mergeable::Mergeable, vec![])));
+        report.merge = MergeSwitch::All;
+        report.merge_lifted = Some(lifted.to_owned());
+        let body = report.render();
+        assert!(
+            body.contains(&format!("(merge on green). {lifted}\n")),
+            "{body}"
+        );
+        assert!(
+            !merges_on_green(MergeSwitch::All, Some(held), Some(lifted), "it")
+                .unwrap()
+                .contains("lifted"),
+        );
 
         let tracker = FakeTracker::default();
         let writer = Writer::new(&tracker);
@@ -10168,6 +10224,7 @@ Reply `Q1: B`, `ok` to take every recommendation, or in your own words.
             switch: MergeSwitch::All,
             method: MergeMethod::Squash,
             gate: &gate,
+            security: owlshift_core::follow::SecurityRule::Person,
         };
         let facts = MergeFacts {
             decision: &decision,

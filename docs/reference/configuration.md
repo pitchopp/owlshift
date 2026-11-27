@@ -434,6 +434,14 @@ What one ticket's runs may cost in all, in dollars, every run counted across its
 # ticket_budget_usd = 100.0
 ```
 
+#### `policy.security_merge`
+
+Who lifts the merge hold of a question asked under `security`: "person" (a person merges, whatever the answer) or "answered" (merge on green merges once its decider answered it; a `risky` ticket's still waits for a person). Read at the default branch's head. Default: `"person"`.
+
+```toml
+# security_merge = "person"
+```
+
 ### `[forge]`
 
 The forge. Merge on green: the runner merges a pull request it follows, once green, into the default branch; read at that branch's head, never from a ticket's branch or the personal file.
