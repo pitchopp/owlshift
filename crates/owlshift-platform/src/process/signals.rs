@@ -227,7 +227,10 @@ static INSTALLED: Mutex<bool> = Mutex::new(false);
 /// It is a best effort, not a guarantee:
 ///
 /// - a kill that lands between a tree's start and the moment the sentinel is
-///   told of it, well under a millisecond, leaves that tree running;
+///   told of it leaves that tree running: well under a millisecond on a
+///   machine at rest, but as long as this process waits to run again after
+///   the spawn on a loaded one, where a web UI the daemon started had begun
+///   to serve before the daemon told its sentinel (OWL-671);
 /// - once the sentinel is killed it protects nothing more, and it is not
 ///   restarted; [`sentinel_status`] tells whether it still runs, or is
 ///   stopped, without waiting on it;

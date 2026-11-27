@@ -20,4 +20,10 @@ mod stand_in;
 pub mod terminal;
 #[cfg(all(test, unix))]
 mod test_proc;
+/// The testkit's, which this crate cannot depend on: how long a unit test
+/// waits for a state (OWL-493, build plan "Waits in tests").
+#[cfg(all(test, unix))]
+#[allow(dead_code, reason = "the unit tests use part of it")]
+#[path = "../../owlshift-testkit/src/wait.rs"]
+mod wait;
 pub mod wake;
