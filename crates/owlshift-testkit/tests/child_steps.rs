@@ -367,51 +367,83 @@ mod test_proc;
 /// one naming a process gone, is a lock that outlived its step, a slot leak:
 /// passes count, and the test fails at the bound once the steps under way
 /// end. A probe that fails counts too. A holder that never ends would keep
-/// the bound from counting: past [`WEDGED`] the test fails anyway.
+/// the bound from counting: once the same live holders have held the slots
+/// [`WEDGED`], the test fails anyway. Steps started one after another
+/// forever would keep a live holder changing: past [`wait::REACHED`] for each
+/// of the `steps` the test's drains run on the machine, it fails too
+/// (OWL-667).
 #[cfg(unix)]
 struct SlotBound<'a> {
     slots: MachineSlots,
     machine: &'a Path,
     limit: u32,
     counted: u32,
-    since: std::time::Instant,
+    /// The pids of the live holders at the last pass, and since when they
+    /// have held the slots unchanged.
+    holders: Vec<u32>,
+    held_since: std::time::Instant,
+    /// When the drains must have ended.
+    ends: std::time::Instant,
 }
 
-/// How long a [`SlotBound`] waits on live holders before the test fails:
-/// far past any step of these tests, however loaded the machine.
+/// How long the same live holders may hold the machine's slots before the
+/// test fails: far past any one step of these tests, however loaded the
+/// machine. Counted from the drain's start until OWL-667, it failed a slow
+/// drain that passed alone, at 328 and 340 s in OWL-655's runs of 2026-11-26
+/// and 2026-11-27.
 #[cfg(unix)]
 const WEDGED: std::time::Duration = std::time::Duration::from_secs(300);
 
 #[cfg(unix)]
 impl<'a> SlotBound<'a> {
-    fn new(machine: &'a Path, count: u32, limit: u32) -> Self {
+    fn new(machine: &'a Path, count: u32, limit: u32, steps: u32) -> Self {
+        let now = std::time::Instant::now();
         Self {
             slots: MachineSlots::new(machine, count),
             machine,
             limit,
             counted: 0,
-            since: std::time::Instant::now(),
+            holders: Vec::new(),
+            held_since: now,
+            ends: now + wait::REACHED * steps,
         }
     }
 
     /// Counts the pass that just ended unless a live process holds a slot:
     /// whether the test has passes left.
     fn more(&mut self) -> bool {
-        let live = self.slots.holders().is_ok_and(|held| {
-            held.iter().any(|slot| {
-                slot.holder
-                    .as_ref()
-                    .is_some_and(|holder| test_proc::is_alive(holder.pid))
+        let mut live: Vec<u32> = self
+            .slots
+            .holders()
+            .map(|held| {
+                held.iter()
+                    .filter_map(|slot| slot.holder.as_ref().map(|holder| holder.pid))
+                    .filter(|pid| test_proc::is_alive(*pid))
+                    .collect()
             })
-        });
-        if !live {
+            .unwrap_or_default();
+        live.sort_unstable();
+        if live.is_empty() {
             self.counted += 1;
         }
+        if live != self.holders {
+            self.holders = live;
+            self.held_since = std::time::Instant::now();
+        }
         assert!(
-            self.since.elapsed() < WEDGED,
-            "{WEDGED:?} of passes, {} of them counted, the slots of {} held meanwhile",
+            self.holders.is_empty() || self.held_since.elapsed() < WEDGED,
+            "the slots of {} held by {:?} for {WEDGED:?}, {} passes counted",
+            self.machine.display(),
+            self.holders,
+            self.counted
+        );
+        assert!(
+            std::time::Instant::now() < self.ends,
+            "the drains still ran past their bound, {} passes counted, the slots of {} held by \
+             {:?}",
             self.counted,
-            self.machine.display()
+            self.machine.display(),
+            self.holders
         );
         self.counted < self.limit
     }
@@ -462,7 +494,8 @@ fn two_watches_of_two_projects_share_the_machine_s_slots() {
             scope.spawn(move || {
                 let counted = children(&s.file).with_slots(MachineSlots::new(machine, 1));
                 let ran = || s.project.dirs().runs(&ticket()).exists();
-                let mut bound = SlotBound::new(machine, 1, 100);
+                // Two watches' starts and two intakes.
+                let mut bound = SlotBound::new(machine, 1, 100, 4);
                 let lines = drain_passes(&s.project, &counted, |_| {
                     thread::sleep(std::time::Duration::from_millis(100));
                     bound.more() && !ran()
@@ -686,7 +719,9 @@ fn two_projects_two_in_flight_each_share_two_slots() {
             scope.spawn(move || {
                 let counted = children(&s.file).with_slots(MachineSlots::new(machine, 2));
                 let interval = std::time::Duration::from_millis(200);
-                let mut bound = SlotBound::new(machine, 2, 300);
+                // Each of the two projects: its watch's start, two intakes
+                // and two Builds.
+                let mut bound = SlotBound::new(machine, 2, 300, 10);
                 let lines = drain_every(&s.project, &counted, interval, |_| {
                     if record_of(&s.project, "DEMO-2").is_some_and(|r| r.intake.is_some()) {
                         s.project.move_ticket("DEMO-9", "Done");
@@ -970,7 +1005,9 @@ fn a_sigterm_during_two_builds_checks_both_and_both_resume() {
         plays.join("build-DEMO-1.pid"),
         plays.join("build-DEMO-2.pid"),
     ];
-    wait::until_with(
+    // The watch's start, two intakes and two Builds' starts (OWL-667).
+    wait::through(
+        5,
         "both Builds under way",
         || log_text(&log),
         || builds.iter().all(|pid| pid.exists()),
@@ -979,7 +1016,9 @@ fn a_sigterm_during_two_builds_checks_both_and_both_resume() {
     running.pids.extend(&runs);
 
     signal(&watch, "TERM");
-    wait::until_with(
+    // Two Builds stopped and checked, then the watch's end.
+    wait::through(
+        3,
         "watch to end",
         || log_text(&log),
         || watch.try_wait().unwrap().is_some(),
@@ -1008,7 +1047,10 @@ fn a_sigterm_during_two_builds_checks_both_and_both_resume() {
     let counted = children(&s.file).with_slots(MachineSlots::new(&machine, 2));
     let interval = std::time::Duration::from_millis(200);
     let both = || asks(&s.project, "DEMO-1") && asks(&s.project, "DEMO-2");
-    let lines = drain_every(&s.project, &counted, interval, |pass| pass < 200 && !both());
+    // Its passes counted only while no Build holds a slot (OWL-667): the
+    // watch's start, two Builds resumed and their ends.
+    let mut bound = SlotBound::new(&machine, 2, 200, 5);
+    let lines = drain_every(&s.project, &counted, interval, |_| bound.more() && !both());
     assert!(both(), "{lines}");
     assert_eq!(dirs.quarantine().unwrap(), None, "{lines}");
 }
@@ -1041,7 +1083,8 @@ fn a_build_canceled_in_watch_s_own_process_stops_and_parks_the_watch_going_on() 
         pids: vec![watch.id()],
     };
     let pid = plays.join(format!("build-{TICKET}.pid"));
-    wait::until_with("the Build under way", || log_text(&log), || pid.exists());
+    // The watch's start, the intake and the Build's start (OWL-667).
+    wait::through(3, "the Build under way", || log_text(&log), || pid.exists());
     let run = pid_in(&pid);
     running.pids.push(run);
 

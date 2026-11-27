@@ -42,7 +42,8 @@ pub fn reached(within: Duration, mut done: impl FnMut() -> bool) -> bool {
 }
 
 /// Waits until `done` holds, [`REACHED`] at most; panics naming `what`
-/// otherwise.
+/// otherwise. A state reached only through several steps waits through
+/// [`through`].
 #[track_caller]
 pub fn until(what: &str, done: impl FnMut() -> bool) {
     until_with(what, String::new, done);
@@ -53,6 +54,22 @@ pub fn until(what: &str, done: impl FnMut() -> bool) {
 #[track_caller]
 pub fn until_with(what: &str, context: impl FnOnce() -> String, done: impl FnMut() -> bool) {
     within(REACHED, what, context, done);
+}
+
+/// Waits until `done` holds, [`REACHED`] for each of `steps`, the steps the
+/// test waits through one after the other, such as a watch's start, each
+/// intake and each Build's start before both Builds are under way (OWL-667):
+/// load slows each of them as much as it slows one state, so a single
+/// [`REACHED`] is short for a run of them. Panics naming `what`, with
+/// `context`, otherwise.
+#[track_caller]
+pub fn through(
+    steps: u32,
+    what: &str,
+    context: impl FnOnce() -> String,
+    done: impl FnMut() -> bool,
+) {
+    within(REACHED * steps, what, context, done);
 }
 
 /// Waits until `done` holds within `bound`, which only a bound the design
