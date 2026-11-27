@@ -71,8 +71,10 @@ use super::watch;
 use crate::agent_env::{AgentEnv, RunPaths};
 use crate::config::exit_text;
 
-/// A gate deadline for callers without a reason to pick another.
-pub const DEFAULT_GATE_TIMEOUT: Duration = Duration::from_secs(30 * 60);
+/// A gate deadline for callers without a reason to pick another: an hour,
+/// sized for a gate run while other runs share the host (OWL-666, in
+/// `docs/design/records/OWL-666.md`).
+pub const DEFAULT_GATE_TIMEOUT: Duration = Duration::from_secs(60 * 60);
 
 /// The file of the caller's run directory the gate's output goes to.
 pub const GATE_LOG: &str = "gate.log";
