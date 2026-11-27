@@ -491,30 +491,58 @@ fn a_killed_watch_starts_again_with_a_doubling_delay_told_at_the_third_end() {
     let mut bench = Bench::new();
     bench.serve(WEB);
     bench.start();
-    let mut delays = Vec::new();
     for _ in 0..3 {
         let (watch, _) = bench.running(WEB);
         let started = bench.watches(WEB).len();
-        // Timed from before the signal, not from `kill`'s end: a loaded
-        // machine once let the next start come 139 ms after `kill` ended,
-        // its delay 600 ms (OWL-667).
-        let killed = Instant::now();
         bench.signal("KILL", watch);
         bench.wait_for("the watch to start again", || {
             bench.watches(WEB).len() > started
         });
-        delays.push(killed.elapsed());
     }
-    // 300 ms, 600 ms, 1.2 s: each at least its delay, each longer than the
-    // one before less the bench's slack.
-    for (delay, least) in delays.iter().zip([300, 600, 1200]) {
+    // Each restart timed by the daemon's own events (OWL-667): from its
+    // record of the end, written once it found the watch dead and chose the
+    // delay, to its record of the next start. A clock in the test counts
+    // `kill`'s own time, which load stretches: from `kill`'s end, a next start
+    // came 139 ms after it on a 600 ms delay; from before the signal, a
+    // daemon that started again at once could pass.
+    let gaps = || {
+        let mut ended: Option<(Timestamp, u64)> = None;
+        let mut gaps = Vec::new();
+        for event in events(&bench.data()) {
+            match event.data.get("service").and_then(|s| s.as_str()) {
+                Some("watch_ended") => {
+                    let delay = event.data.get("restart_in_ms").and_then(|d| d.as_u64());
+                    ended = delay.map(|delay| (event.at, delay));
+                }
+                Some("watch_started") => {
+                    if let Some((at, delay)) = ended.take() {
+                        gaps.push((event.at.duration_since(at), delay));
+                    }
+                }
+                _ => {}
+            }
+        }
+        gaps
+    };
+    bench.wait_for("the daemon's records of the three starts again", || {
+        gaps().len() == 3
+    });
+    let gaps = gaps();
+    // 300 ms, 600 ms, 1.2 s, each chosen and each waited at least.
+    assert_eq!(
+        gaps.iter().map(|(_, delay)| *delay).collect::<Vec<_>>(),
+        [300, 600, 1200],
+        "{gaps:?}\n{}",
+        bench.output()
+    );
+    for (gap, delay) in &gaps {
         assert!(
-            *delay >= Duration::from_millis(least),
-            "{delays:?}\n{}",
+            *gap >= jiff::SignedDuration::from_millis(i64::try_from(*delay).unwrap()),
+            "{gaps:?}\n{}",
             bench.output()
         );
     }
-    assert!(delays[2] > delays[0], "{delays:?}");
+    assert!(gaps[2].0 > gaps[0].0, "{gaps:?}");
     let notes = bench.notes();
     assert_eq!(notes.len(), 1, "{notes:?}");
     assert!(
