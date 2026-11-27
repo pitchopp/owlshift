@@ -8,7 +8,10 @@
 //! The sentinel is `/bin/sh` running [`SCRIPT`], in a process group of its
 //! own, so nothing that ends Owlshift's group reaches it. Its standard input
 //! is a pipe whose write end only Owlshift holds: std creates it
-//! close-on-exec, so no process Owlshift starts inherits it. Owlshift writes
+//! close-on-exec, so no process Owlshift starts inherits it. Nor does it
+//! inherit any other descriptor Owlshift has open when it starts (OWL-671):
+//! one Owlshift was handed and has not adopted yet, as the web UI's socket,
+//! would stay open in the sentinel until the sentinel ends. Owlshift writes
 //! one line per event, `+ <group>` when a tree becomes live and `- <group>`
 //! when it no longer is. When Owlshift ends, the system closes the write end,
 //! the sentinel reads the end of its input, kills every group still live,
@@ -109,7 +112,8 @@ pub enum SentinelStatus {
 }
 
 /// `/bin/sh` running `script` as `name`, with an empty environment, its
-/// input piped and its outputs dropped.
+/// input piped, its outputs dropped, and no other descriptor of this
+/// process ([`inherit_none`]).
 fn sh(script: &str, name: &str) -> Command {
     let mut command = Command::new("/bin/sh");
     command
@@ -119,7 +123,49 @@ fn sh(script: &str, name: &str) -> Command {
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
+    inherit_none(&mut command);
     command
+}
+
+/// Makes `command`'s child inherit none of this process's descriptors but
+/// its standard streams (OWL-671). A descriptor handed to this process stays
+/// inheritable until the process adopts it, and every process starts its
+/// sentinel first: the web UI's sentinel held the UI's socket, so the port
+/// stayed bound until that sentinel had ended too.
+///
+/// Each descriptor above the standard streams open now, as `/dev/fd` lists
+/// them, is made close-on-exec in the child just before it executes, never
+/// in this process, whose later children may need one. One opened after the
+/// listing, by another thread and not close-on-exec, is still inherited;
+/// std opens its own close-on-exec. When `/dev/fd` cannot be read, as in a
+/// container with no `/proc`, nothing is listed and the child inherits as
+/// before: a sentinel that starts matters more than one that holds nothing.
+fn inherit_none(command: &mut Command) {
+    use rustix::io::{FdFlags, fcntl_setfd};
+    use std::os::fd::BorrowedFd;
+
+    let open: Vec<i32> = std::fs::read_dir("/dev/fd")
+        .map(|entries| {
+            entries
+                .filter_map(|entry| entry.ok()?.file_name().to_str()?.parse().ok())
+                .filter(|fd| *fd > 2)
+                .collect()
+        })
+        .unwrap_or_default();
+    // SAFETY: the closure runs in the child between fork and exec, after
+    // std has set its standard streams, where only async-signal-safe calls
+    // are allowed: one `fcntl` for each number of a list made before the
+    // fork, neither allocating nor locking. A number no longer open there,
+    // as `/dev/fd`'s own, fails alone and is skipped: borrowing it closes
+    // nothing.
+    unsafe {
+        command.pre_exec(move || {
+            for &fd in &open {
+                let _ = fcntl_setfd(BorrowedFd::borrow_raw(fd), FdFlags::CLOEXEC);
+            }
+            Ok(())
+        });
+    }
 }
 
 impl Sentinel {
@@ -385,27 +431,43 @@ mod tests {
     }
 
     /// Runs `probe` in this helper process, checks it left no child, running
-    /// or unreaped, and writes its verdict to `verdict`. The helper runs
-    /// alone, on one thread, so no other test's process is a child here, and
-    /// none can inherit the test sentinel's input: on macOS std makes a pipe
+    /// or unreaped, and writes its verdict to `verdict`, then on a line of
+    /// its own how many milliseconds the probe took. The helper runs alone,
+    /// on one thread, so no other test's process is a child here, and none
+    /// can inherit the test sentinel's input: on macOS std makes a pipe
     /// close-on-exec only after creating it.
     fn probe_alone(probe: impl FnOnce() -> SentinelProbe) {
         if helper_requested() {
+            let started = Instant::now();
             let verdict = probe();
+            let took = started.elapsed().as_millis();
             let left = wait(WaitOptions::NOHANG);
             assert!(matches!(left, Err(Errno::CHILD)), "left: {left:?}");
-            std::fs::write("verdict", format!("{verdict:?}")).unwrap();
+            std::fs::write("verdict", format!("{verdict:?}\n{took}")).unwrap();
         }
     }
 
-    /// The verdict of the helper `name`, run in a process of its own.
-    fn verdict_of(name: &str) -> String {
+    /// The variable that gives a helper its probe's bound, in milliseconds.
+    const BOUND: &str = "OWLSHIFT_TEST_PROBE_BOUND_MS";
+
+    /// The probe's bound the test gave this helper.
+    fn bound_given() -> Duration {
+        let ms = std::env::var(BOUND).expect(BOUND);
+        Duration::from_millis(ms.parse().unwrap())
+    }
+
+    /// The verdict of the helper `name`, run in a process of its own, with
+    /// the probe's bound `bound` if it has one.
+    fn verdict_of(name: &str, bound: Option<Duration>) -> String {
         let dir = tempfile::tempdir().unwrap();
-        let output = Command::new(std::env::current_exe().unwrap())
+        let mut helper = Command::new(std::env::current_exe().unwrap());
+        helper
             .args(["--exact", name, "--ignored", "--test-threads=1"])
-            .current_dir(dir.path())
-            .output()
-            .unwrap();
+            .current_dir(dir.path());
+        if let Some(bound) = bound {
+            helper.env(BOUND, bound.as_millis().to_string());
+        }
+        let output = helper.output().unwrap();
         std::fs::read_to_string(dir.path().join("verdict")).unwrap_or_else(|_| {
             panic!(
                 "no verdict from {name}: {}\n{}",
@@ -418,41 +480,108 @@ mod tests {
     #[test]
     #[ignore = "helper, run by the tests below"]
     fn helper_probe_the_sentinel() {
-        probe_alone(|| probe_sentinel(Duration::from_secs(5)));
+        probe_alone(|| probe_sentinel(bound_given()));
     }
 
     #[test]
     #[ignore = "helper, run by the tests below"]
     fn helper_probe_a_sentinel_that_stops_nothing() {
-        probe_alone(|| {
-            probe_with(
-                "while read -r sign group; do :; done",
-                Duration::from_millis(300),
-            )
-        });
+        probe_alone(|| probe_with("while read -r sign group; do :; done", bound_given()));
     }
 
     /// OWL-90: this host's `/bin/sh`, running the sentinel's script, stops a
     /// group it was told of when its input ends, and the probe leaves nothing
-    /// behind.
+    /// behind. The probe's bound is not what it checks: `wait::REACHED`
+    /// (OWL-672), which a working sentinel never waits out.
     #[test]
     fn the_sentinel_stops_a_group_when_its_input_ends() {
-        let verdict = verdict_of("process::sentinel::tests::helper_probe_the_sentinel");
+        let verdict = verdict_of(
+            "process::sentinel::tests::helper_probe_the_sentinel",
+            Some(crate::wait::REACHED),
+        );
         assert!(verdict.starts_with("Works"), "{verdict}");
     }
 
-    /// A sentinel that stops nothing fails the probe within its bound, and
-    /// the probe still stops and reaps the group itself.
+    #[test]
+    #[ignore = "helper, run by the tests below"]
+    fn helper_start_a_sentinel_beside_a_handed_over_descriptor() {
+        use rustix::io::{FdFlags, fcntl_setfd};
+        use std::io::Read;
+
+        if !helper_requested() {
+            return;
+        }
+        let (mut reader, writer) = io::pipe().unwrap();
+        // Inheritable, as a descriptor handed to this process that it has
+        // not adopted yet.
+        fcntl_setfd(&writer, FdFlags::empty()).unwrap();
+        let reaped = Reaped(Sentinel::start().unwrap());
+        drop(writer);
+        // Its end is read at once when no other process holds the write end.
+        let flags = fcntl_getfl(&reader).unwrap();
+        fcntl_setfl(&reader, flags | OFlags::NONBLOCK).unwrap();
+        let verdict = match reader.read(&mut [0]) {
+            Ok(0) => "held by none".to_owned(),
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                "the sentinel holds the write end".to_owned()
+            }
+            other => format!("{other:?}"),
+        };
+        drop(reaped);
+        std::fs::write("verdict", verdict).unwrap();
+    }
+
+    /// OWL-671: a sentinel holds no descriptor of the process that started
+    /// it but its input: one that process was handed and has not made
+    /// close-on-exec yet, as the web UI's socket, is not kept open by it.
+    #[test]
+    fn a_sentinel_keeps_no_descriptor_handed_to_its_starter() {
+        let verdict = verdict_of(
+            "process::sentinel::tests::helper_start_a_sentinel_beside_a_handed_over_descriptor",
+            None,
+        );
+        assert_eq!(verdict, "held by none");
+    }
+
+    /// A sentinel that stops nothing fails the probe at its bound, and the
+    /// probe still stops and reaps the group itself.
+    ///
+    /// The bound is the case, and the verdict on the group comes only once
+    /// the test sentinel has ended, which load delayed past 300 ms in 12 of
+    /// 1307 runs (OWL-672): a probe cut before then runs again with twice the
+    /// bound, `wait::REACHED` at most (build plan, "Waits in tests"), so a
+    /// probe that is always cut early fails after about four minutes.
     #[test]
     fn a_sentinel_that_stops_nothing_fails_and_leaves_nothing() {
-        let started = Instant::now();
-        let verdict =
-            verdict_of("process::sentinel::tests::helper_probe_a_sentinel_that_stops_nothing");
+        let mut bound = Duration::from_millis(300);
+        let (verdict, took) = loop {
+            let written = verdict_of(
+                "process::sentinel::tests::helper_probe_a_sentinel_that_stops_nothing",
+                Some(bound),
+            );
+            let (verdict, took) = written.split_once('\n').unwrap();
+            let cut_early = verdict.starts_with("Fails(\"the test sentinel still ran");
+            if cut_early && bound < crate::wait::REACHED {
+                eprintln!("{verdict}: run again with twice the bound");
+                bound = (bound * 2).min(crate::wait::REACHED);
+                continue;
+            }
+            break (
+                verdict.to_owned(),
+                Duration::from_millis(took.parse().unwrap()),
+            );
+        };
+        let expected = format!("Fails(\"the test group still ran {} ms", bound.as_millis());
+        assert!(verdict.starts_with(&expected), "{verdict}");
+        // It waited on the group its whole bound, and gave its verdict then,
+        // not waiting past it: the rest is the probe's own stops and reaps,
+        // which load stretches (its 5 s ceiling before OWL-672 was one more
+        // deadline the passing path had to beat).
+        assert!(took >= bound, "{verdict} after {took:?}");
         assert!(
-            verdict.starts_with("Fails(\"the test group still ran 300 ms"),
-            "{verdict}"
+            took < bound + crate::wait::REACHED,
+            "{verdict} after {took:?}"
         );
-        assert!(started.elapsed() < Duration::from_secs(5), "{verdict}");
     }
 
     /// A sentinel killed and reaped when dropped, however the test ends.
@@ -467,9 +596,10 @@ mod tests {
         }
     }
 
-    /// Its status once `done` holds, or the last one read within 5 s.
+    /// Its status once `done` holds, or the last one read within
+    /// `wait::REACHED`, a state the test only needs reached (OWL-672).
     fn status_once(sentinel: &mut Sentinel, done: fn(&SentinelStatus) -> bool) -> SentinelStatus {
-        let deadline = Instant::now() + Duration::from_secs(5);
+        let deadline = Instant::now() + crate::wait::REACHED;
         loop {
             let status = sentinel.status();
             if done(&status) || Instant::now() >= deadline {
