@@ -386,7 +386,7 @@ impl OnDemand<'_> {
                 pull_request: pr.number,
                 rules: &dispatched.rules,
                 harness: &build,
-                before: &|_, _, _| Ok(()),
+                before: &|_, _, _, _| Ok(()),
                 decorate: &decorate,
                 accept: &accept,
                 cut: None,

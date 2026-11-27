@@ -1847,7 +1847,7 @@ fn brief_rejections() {
     );
     rejects(
         "newer format",
-        parse(|v| v["format"] = json!(34)),
+        parse(|v| v["format"] = json!(35)),
         "upgrade Owlshift",
     );
     rejects(
@@ -1962,17 +1962,14 @@ fn brief_rejections() {
     );
     // The refusal of the previous result: Build's (OWL-180), the answer
     // check's (OWL-184), the resolver's (OWL-191), intake's (OWL-402), and
-    // since format 28 the design and review roles' (OWL-430); never the
-    // rebase role's, within its cap.
-    rejects(
-        "a refused result in a rebase's brief",
-        parse(|v| {
-            v["role"] = json!("rebase");
-            v["rebase"] = json!({ "pull_request": 7, "url": "u", "branch": "b",
-                "head": "h", "base_branch": "main", "onto": "o" });
-        }),
-        "a refused result is given but the role is rebase, which is never told one",
-    );
+    // since format 28 the design and review roles' (OWL-430), and since
+    // format 34 the rebase role's (OWL-669), within its cap.
+    Brief::parse(&edited("brief.json", |v| {
+        v["role"] = json!("rebase");
+        v["rebase"] = json!({ "pull_request": 7, "url": "u", "branch": "b",
+            "head": "h", "base_branch": "main", "onto": "o" });
+    }))
+    .unwrap();
     // The review roles' briefs need their plan and review: the runner's
     // bench (`design_scenarios`) gives them a refusal.
     Brief::parse(&edited("brief.json", |v| {

@@ -1202,6 +1202,8 @@ impl OnDemand<'_> {
         if let Some(gate) = &ran.report.gate {
             gathered.gate_failure = gate.failure.clone();
         }
+        // A kept result is judged by its gate alone, never refused.
+        gathered.refused = None;
         let event = if ran.breaches.is_empty() {
             stage_event(&ran.report.outcome, brief).0
         } else {

@@ -643,7 +643,7 @@ impl OnDemand<'_> {
                     pull_request: told.pull_request.unwrap_or_default(),
                     rules: &dispatched.rules,
                     harness: &build,
-                    before: &|_, _, _| Ok(()),
+                    before: &|_, _, _, _| Ok(()),
                     decorate: &decorate,
                     accept: &accept,
                     cut: None,

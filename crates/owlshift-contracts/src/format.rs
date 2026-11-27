@@ -51,8 +51,9 @@ use crate::Role;
 /// a plan step's `by` and `when`, a person's step (OWL-619); format 32
 /// Build's `person_steps`, a person's results its run at Watch follows
 /// (OWL-619); format 33 the resolver's `unblock`, a run that stopped
-/// `blocked` (OWL-620).
-pub const BRIEF_FORMAT: u32 = 33;
+/// `blocked` (OWL-620); format 34 gives `result_refusal` to the rebase role
+/// too, its retry starting from the refused run's rebased commit (OWL-669).
+pub const BRIEF_FORMAT: u32 = 34;
 /// The format version of `result.json`. Format 4 added the resolver's
 /// `resolutions` (OWL-138); format 5 the resolver's own `category` on each
 /// decision (OWL-144); format 6 refuses `decisions` from the build role
