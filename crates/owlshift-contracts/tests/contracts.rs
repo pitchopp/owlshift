@@ -3920,7 +3920,7 @@ fn a_ticket_delivery_round_trips_and_is_checked() {
     .unwrap();
     assert!(older.owed.is_none() && older.pushing.as_ref().unwrap().report.is_none());
     assert!(
-        older.render().contains("\"format\": 9"),
+        older.render().contains("\"format\": 10"),
         "{}",
         older.render()
     );
@@ -3952,7 +3952,7 @@ fn a_ticket_delivery_round_trips_and_is_checked() {
     // in format 1. Format 3 keeps one, whose report names its questions,
     // and only a correction's report does.
     let older = parse(|v| v["format"] = json!(2)).unwrap();
-    assert!(older.render().starts_with("{\n  \"format\": 9,"));
+    assert!(older.render().starts_with("{\n  \"format\": 10,"));
     let refused: [(&str, Edit); 3] = [
         ("correction's push", |v| {
             v["format"] = json!(2);
@@ -4029,6 +4029,85 @@ fn a_ticket_delivery_round_trips_and_is_checked() {
             parse(edit),
             "a report names questions or steps, one of the two, if and only if it is a \
              correction's",
+        );
+    }
+    // OWL-655: format 10's rebase report may say it is a clean refresh the
+    // runner merged itself, kept or owed; format 9 says none, and is read
+    // without it; no other kind is refreshed.
+    let owed_merge = parse(|v| v["owed"]["report"]["refreshed"] = json!(true)).unwrap();
+    assert!(
+        owed_merge
+            .owed
+            .as_ref()
+            .unwrap()
+            .report
+            .as_ref()
+            .unwrap()
+            .refreshed
+    );
+    assert_eq!(
+        TicketDelivery::parse(&owed_merge.render()).unwrap(),
+        owed_merge
+    );
+    assert!(
+        !delivery
+            .owed
+            .as_ref()
+            .unwrap()
+            .report
+            .as_ref()
+            .unwrap()
+            .refreshed
+    );
+    let merged = parse(|v| {
+        v["pushing"]["kind"] = json!("rebase");
+        v["pushing"]["onto"] = json!("c0c0867c0c0867c0c0867c0c0867c0c0867c0c08");
+        v["pushing"]["report"]["checks"] = json!([]);
+        v["pushing"]["report"]["refreshed"] = json!(true);
+    })
+    .unwrap();
+    assert!(
+        merged
+            .pushing
+            .as_ref()
+            .unwrap()
+            .report
+            .as_ref()
+            .unwrap()
+            .refreshed
+    );
+    assert_eq!(TicketDelivery::parse(&merged.render()).unwrap(), merged);
+    let older = parse(|v| v["format"] = json!(9)).unwrap();
+    assert!(!older.render().contains("refreshed"));
+    assert!(!older.owed.unwrap().report.unwrap().refreshed);
+    rejects(
+        "a format-9 report's refreshed",
+        parse(|v| {
+            v["format"] = json!(9);
+            v["owed"]["report"]["refreshed"] = json!(true);
+        }),
+        "format 9 keeps no report's refreshed",
+    );
+    rejects(
+        "format 11",
+        parse(|v| v["format"] = json!(11)),
+        "upgrade Owlshift",
+    );
+    let not_rebases: [(&str, Edit); 2] = [
+        ("a fix's report refreshed", |v| {
+            v["pushing"]["report"]["refreshed"] = json!(true);
+        }),
+        ("a correction's owed report refreshed", |v| {
+            v["owed"]["kind"] = json!("correction");
+            v["owed"]["report"]["refreshed"] = json!(true);
+            v["owed"]["report"]["questions"] = json!(["Which file?"]);
+        }),
+    ];
+    for (case, edit) in not_rebases {
+        rejects(
+            case,
+            parse(edit),
+            "a report is refreshed only if it is a rebase's",
         );
     }
     // OWL-236: format 4 owes the first delivery's report, with the
@@ -4251,7 +4330,7 @@ fn a_ticket_delivery_round_trips_and_is_checked() {
     })
     .unwrap();
     assert!(older.pushing.as_ref().unwrap().rebased.is_none());
-    assert!(older.render().starts_with("{\n  \"format\": 9,"));
+    assert!(older.render().starts_with("{\n  \"format\": 10,"));
     let refused: [(&str, Edit, &str); 3] = [
         (
             "a format-7 rebase run's commit",

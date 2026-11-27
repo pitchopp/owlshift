@@ -7380,6 +7380,7 @@ impl OnDemand<'_> {
                 followups: built.followups,
                 reviews: Vec::new(),
                 steps: Vec::new(),
+                refreshed: false,
             }),
             unchanged: false,
         });
@@ -7587,6 +7588,13 @@ impl Repaired {
                 | RepairKind::Correction { .. }
                 | RepairKind::Review { .. } => Vec::new(),
             },
+            refreshed: matches!(
+                kind,
+                RepairKind::Rebase {
+                    refreshed: true,
+                    ..
+                }
+            ),
         }
     }
 }
@@ -7607,6 +7615,11 @@ fn told(
     }
 }
 
+/// A commit's first 7 characters, as a DELIVERY report shows it.
+fn short_commit(commit: &CommitId) -> &str {
+    commit.as_str().get(..7).unwrap_or(commit.as_str())
+}
+
 /// Which repair a push carries (OWL-112, OWL-210).
 enum RepairKind {
     /// A fix run's, answering these failed checks: a fast-forward.
@@ -7616,9 +7629,12 @@ enum RepairKind {
     /// made, which the delivery check reads, the pushed head being it or a
     /// last fix on top of it (OWL-514); `None` only for a push kept under
     /// way by an older binary, whose head is checked instead.
+    /// `refreshed` when it is a clean refresh the runner merged itself,
+    /// with no run (OWL-655): its report says so.
     Rebase {
         onto: CommitId,
         rebased: Option<CommitId>,
+        refreshed: bool,
     },
     /// A correction run's, following the decider's replies to the DECISION
     /// comments of these questions (OWL-146): a fast-forward.
@@ -8519,7 +8535,11 @@ impl OnDemand<'_> {
     /// push had no verdict is pushed again without a run. Otherwise the
     /// conflict is classified ([`rebase::classify`]) between `pushed` and
     /// the base commit resolved after the fetch, which the run rebases
-    /// onto: a trivial one's first run is on the fast tier, any other run
+    /// onto. A refresh git merges cleanly gets no run: the runner merges the
+    /// base itself and pushes that merge ([`Self::refresh_merge`],
+    /// [`Self::push_refresh`], OWL-655), unless the push guard refuses it,
+    /// which leaves it to a run. Otherwise a trivial one's first run is on
+    /// the fast tier, any other run
     /// on the Build routing, and a failed run gets one more before the
     /// ticket parks. Each attempt starts from a fresh worktree at `pushed`
     /// ([`Self::reset_worktree`]), but for a gate the machine cut: the
@@ -8602,6 +8622,8 @@ impl OnDemand<'_> {
                 RepairKind::Rebase {
                     onto: kept_onto,
                     rebased,
+                    // A clean refresh the runner merged keeps saying so (OWL-655).
+                    refreshed: pushing.report.as_ref().is_some_and(|kept| kept.refreshed),
                 },
                 followups,
                 following,
@@ -8633,6 +8655,16 @@ impl OnDemand<'_> {
             )));
         }
         let classified = rebase::classify(git, &checkout, onto.as_str(), pushed, !refresh);
+        // A refresh git merges cleanly gets no run: the runner merges the
+        // base itself, once the push guard takes the merge (OWL-655).
+        if refresh
+            && let Some(tree) = classified.tree.as_deref()
+            && let Some(merge) = self.refresh_merge(p, delivery, pr, &pushed_id, &onto, tree, sink)
+        {
+            return self.push_refresh(
+                p, state, delivery, pr, &pushed_id, onto, tree, merge, cause, following, sink,
+            );
+        }
         // A resolution that merges two tickets' intents is code no reviewer
         // read (OWL-449): a non-trivial conflict on an overlap's path.
         // A named resource's taking reaches the paths of its pattern (OWL-621).
@@ -8783,8 +8815,157 @@ impl OnDemand<'_> {
             RepairKind::Rebase {
                 onto,
                 rebased: Some(rebased),
+                refreshed: false,
             },
             followups,
+            following,
+            sink,
+        )
+    }
+
+    /// The runner's own merge of a clean refresh (OWL-655, architecture
+    /// section 5, "Conflicts and the rebase run", "A clean refresh"): a
+    /// commit of `tree`, the one `git merge-tree` wrote for `onto` and
+    /// `pushed`, whose parents are `pushed` then `onto`, written as Owlshift
+    /// by `commit-tree`, which runs no hook and signs nothing; then checked
+    /// by the push guard ([`rebase_keeps_delivery`]). Nothing else is done
+    /// here: no dispatch, no wait dropped, no branch moved. `None` when git
+    /// cannot write it or the guard refuses it, with a `warning` event
+    /// (`refresh_merge_refused`) saying why: the refresh then takes the
+    /// rebase run, and an unreferenced object is all the merge leaves.
+    #[allow(clippy::too_many_arguments)]
+    fn refresh_merge(
+        &self,
+        p: &Prepared,
+        delivery: &TicketDelivery,
+        pr: &DeliveredPullRequest,
+        pushed: &CommitId,
+        onto: &CommitId,
+        tree: &str,
+        sink: &mut EventSink<'_>,
+    ) -> Option<CommitId> {
+        let git = &self.executor.git;
+        let subject = format!(
+            "Merge {} at {} into {}",
+            delivery.base_branch,
+            short_commit(onto),
+            p.branch
+        );
+        let body = format!(
+            "Owlshift refreshed pull request #{} onto its base with no agent run: git merged \
+             the two with no conflict.",
+            pr.number
+        );
+        let merge = git
+            .run(
+                &p.checkout,
+                &[
+                    "-c",
+                    "user.name=Owlshift",
+                    "-c",
+                    "user.email=owlshift@localhost",
+                    "commit-tree",
+                    "--no-gpg-sign",
+                    tree,
+                    "-p",
+                    pushed.as_str(),
+                    "-p",
+                    onto.as_str(),
+                    "-m",
+                    &subject,
+                    "-m",
+                    &body,
+                ],
+            )
+            .map_err(|e| format!("writing the merge commit: {e}"))
+            .and_then(|out| {
+                CommitId::new(String::from_utf8_lossy(&out).trim())
+                    .map_err(|e| format!("reading the merge commit: {e}"))
+            })
+            .and_then(|merge| {
+                rebase_keeps_delivery(git, &p.checkout, pushed, onto, &merge).map(|()| merge)
+            });
+        match merge {
+            Ok(merge) => Some(merge),
+            Err(reason) => {
+                sink.emit(
+                    &p.ticket,
+                    None,
+                    EventKind::Warning,
+                    data([
+                        ("what", json!("refresh_merge_refused")),
+                        ("pull_request", json!(pr.number)),
+                        ("onto", json!(onto.as_str())),
+                        ("reason", json!(reason)),
+                    ]),
+                );
+                None
+            }
+        }
+    }
+
+    /// Pushes the runner's merge of a clean refresh, `merge`, which the push
+    /// guard took ([`Self::refresh_merge`], OWL-655): the step's one
+    /// dispatch, a rebase wait a machine cut kept dropped (the merge
+    /// replaces the rebased commit it gates), the ticket's branch moved to
+    /// the merge as before a rebase run ([`Self::reset_worktree`]), a
+    /// `decision` event (`watch` = `refresh_merged`), then the push of a
+    /// rebase ([`Self::push_repair`]): leased on `pushed`, a fast-forward,
+    /// counted as a repair, its report saying no agent and no gate ran.
+    #[allow(clippy::too_many_arguments)]
+    fn push_refresh(
+        &self,
+        p: &mut Prepared,
+        state: TicketState,
+        delivery: &TicketDelivery,
+        pr: &DeliveredPullRequest,
+        pushed: &CommitId,
+        onto: CommitId,
+        tree: &str,
+        merge: CommitId,
+        cause: RebaseCause,
+        following: &mut Following,
+        sink: &mut EventSink<'_>,
+    ) -> Result<Delivered, Stop> {
+        self.dispatch(p, Command::Rebase, sink)?;
+        let _ = crate::base::remove_wait(self.dirs, &p.ticket);
+        self.reset_worktree(p, &merge)?;
+        sink.emit(
+            &p.ticket,
+            None,
+            EventKind::Decision,
+            data([
+                ("watch", json!("refresh_merged")),
+                ("pull_request", json!(pr.number)),
+                ("cause", json!(cause.as_str())),
+                ("onto", json!(onto.as_str())),
+                ("tree", json!(tree)),
+                ("commit", json!(merge.as_str())),
+            ]),
+        );
+        let summary = format!(
+            "Owlshift merged `{}` at `{}` into the branch itself: git found no conflict, so no \
+             agent ran and no gate ran; the pull request's checks run on the combined code.",
+            delivery.base_branch,
+            short_commit(&onto)
+        );
+        p.repairing = true;
+        self.push_repair(
+            p,
+            state,
+            delivery,
+            pushed,
+            Repaired {
+                commit: merge.clone(),
+                summary,
+                gate: Gate::NotRecorded,
+            },
+            RepairKind::Rebase {
+                onto,
+                rebased: Some(merge),
+                refreshed: true,
+            },
+            Vec::new(),
             following,
             sink,
         )
@@ -9008,9 +9189,14 @@ impl OnDemand<'_> {
         let neutral = self.neutral_push(p, &repaired.commit, &bases, sink)?;
         let commit = neutral.head.commit().clone();
         let kind = match kind {
-            RepairKind::Rebase { onto, rebased } => RepairKind::Rebase {
+            RepairKind::Rebase {
+                onto,
+                rebased,
+                refreshed,
+            } => RepairKind::Rebase {
                 onto,
                 rebased: rebased.map(|rebased| neutral.image(&rebased)),
+                refreshed,
             },
             other => other,
         };
@@ -9052,7 +9238,7 @@ impl OnDemand<'_> {
             | RepairKind::Steps { .. } => {
                 writer.push_leased(git, &p.checkout, "origin", &neutral.head, &head, pushed)
             }
-            RepairKind::Rebase { onto, rebased } => writer.push_rebased(
+            RepairKind::Rebase { onto, rebased, .. } => writer.push_rebased(
                 git,
                 &p.checkout,
                 "origin",
@@ -9386,6 +9572,7 @@ impl OnDemand<'_> {
                     base_branch: delivery.base_branch.clone(),
                     onto,
                     repair: owed.count,
+                    refreshed: owed.report.as_ref().is_some_and(|kept| kept.refreshed),
                 };
                 (None, Some(rebased), None, Some("repair"))
             }

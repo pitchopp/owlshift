@@ -15,8 +15,14 @@
 //! adding the same path is typed `CONFLICT (contents)` too (only its message
 //! says add/add), but its path has no stage 1, the merge base's version:
 //! add/add is not trivial (OWL-230).
+//!
+//! A clean merge's output is its tree's id alone, then a NUL: checked
+//! live with git 2.54.0 on 2026-11-26 (OWL-655, `live-checks/owl-655.sh`),
+//! whose tree the runner commits when it merges a clean refresh itself.
 
 use std::path::Path;
+
+use owlshift_adapters::forge::CommitId;
 
 use crate::executor::Git;
 
@@ -31,6 +37,10 @@ pub struct Classified {
     /// The conflicted paths, in git's order; empty on a clean merge or when
     /// the output could not be read.
     pub paths: Vec<String>,
+    /// The merged tree, on a clean merge alone (exit status 0, its first
+    /// field a full object id): what the runner commits for a clean
+    /// refresh (OWL-655). `None` on a conflict or output it cannot read.
+    pub tree: Option<String>,
 }
 
 /// Classifies the merge of `head` into `onto`, both commits the checkout
@@ -61,11 +71,13 @@ pub fn classify(
         Err(_) => Classified {
             trivial: false,
             paths: Vec::new(),
+            tree: None,
         },
     }
 }
 
-/// [`classify`] from git's exit status and standard output: trivial when
+/// [`classify`] from git's exit status and standard output, the tree of a
+/// clean merge kept (OWL-655): trivial when
 /// every record other than `Auto-merging` is `CONFLICT (contents)`, every
 /// conflicted path has a stage-1 entry (an add/add has none), and at most
 /// [`TRIVIAL_PATHS`] paths conflict. Any other exit status, or output that
@@ -74,12 +86,21 @@ pub fn parse(code: Option<i32>, stdout: &[u8], conflicting: bool) -> Classified 
     let non_trivial = |paths| Classified {
         trivial: false,
         paths,
+        tree: None,
     };
     match code {
         Some(0) => {
+            // The tree alone, then a NUL; a full object id, as a commit's.
+            let tree = stdout
+                .split(|b| *b == 0)
+                .next()
+                .map(String::from_utf8_lossy)
+                .filter(|tree| CommitId::new(tree.as_ref()).is_ok())
+                .map(|tree| tree.into_owned());
             return Classified {
                 trivial: !conflicting,
                 paths: Vec::new(),
+                tree,
             };
         }
         Some(1) => {}
@@ -144,6 +165,7 @@ pub fn parse(code: Option<i32>, stdout: &[u8], conflicting: bool) -> Classified 
             && !paths.is_empty()
             && paths.len() <= TRIVIAL_PATHS,
         paths,
+        tree: None,
     }
 }
 
@@ -170,7 +192,10 @@ fn stage_entry(entry: &str) -> Option<(u8, &str)> {
 mod tests {
     use super::*;
 
-    const TREE: &str = "4602d8d66c7dec5be06ff4c1c70a608116d76ec";
+    /// The tree `git merge-tree --write-tree -z` wrote in live check R1 of
+    /// OWL-655 (git 2.54.0, 2026-11-26): its whole output was this id, then a
+    /// NUL, 41 bytes.
+    const TREE: &str = "f79423259340914c6146bc0723f34368544ce4b0";
 
     /// Output in git 2.43.0's shape: the tree, stages 1 to 3 of each path,
     /// then records of one path each.
@@ -198,7 +223,8 @@ mod tests {
             parse(Some(1), &one, true),
             Classified {
                 trivial: true,
-                paths: vec!["f".to_owned()]
+                paths: vec!["f".to_owned()],
+                tree: None,
             }
         );
         let three: Vec<(&str, &str)> = ["a", "b", "c"]
@@ -249,7 +275,8 @@ mod tests {
             parse(Some(1), ADD_ADD, true),
             Classified {
                 trivial: false,
-                paths: vec!["mod.txt".to_owned(), "new.txt".to_owned()]
+                paths: vec!["mod.txt".to_owned(), "new.txt".to_owned()],
+                tree: None,
             }
         );
         // The same output with a base version of `new.txt` is a contents
@@ -268,6 +295,35 @@ mod tests {
         assert!(parse(Some(0), &clean, false).trivial);
         // The forge reports a conflict git does not find.
         assert!(!parse(Some(0), &clean, true).trivial);
+        // Either way, the merged tree is kept.
+        assert_eq!(parse(Some(0), &clean, false).tree.as_deref(), Some(TREE));
+        assert_eq!(parse(Some(0), &clean, true).tree.as_deref(), Some(TREE));
+    }
+
+    #[test]
+    fn a_clean_merge_names_its_tree_only_when_it_reads_as_one() {
+        // No output, an empty first field, a short id, upper case, a name
+        // that is not hex.
+        for out in [
+            &b""[..],
+            b"\0",
+            b"f79423259340914c6146bc0723f34368544ce4b\0",
+            b"F79423259340914C6146BC0723F34368544CE4B0\0",
+            b"f79423259340914c6146bc0723f34368544ce4bz\0",
+        ] {
+            let read = parse(Some(0), out, false);
+            assert_eq!(read.tree, None, "{}", String::from_utf8_lossy(out));
+            assert!(read.trivial);
+        }
+        // A conflict, trivial or not, and any other exit name no tree, even
+        // with a tree first.
+        let conflict = output(&["f"], &[("f", "CONFLICT (contents)")]);
+        assert!(parse(Some(1), &conflict, false).trivial);
+        assert_eq!(parse(Some(1), &conflict, false).tree, None);
+        assert_eq!(parse(Some(1), ADD_ADD, false).tree, None);
+        let clean = format!("{TREE}\0").into_bytes();
+        assert_eq!(parse(Some(128), &clean, false).tree, None);
+        assert_eq!(parse(None, &clean, false).tree, None);
     }
 
     #[test]

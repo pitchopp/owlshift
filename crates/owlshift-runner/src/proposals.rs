@@ -211,6 +211,7 @@ pub fn owe_one(current: Option<&TicketProposals>, followup: &Followup) -> Option
             followups: vec![followup.clone()],
             reviews: Vec::new(),
             steps: Vec::new(),
+            refreshed: false,
         }),
         unchanged: false,
     };
@@ -518,6 +519,7 @@ mod tests {
                 followups: titles.iter().map(|t| followup(t)).collect(),
                 reviews: Vec::new(),
                 steps: Vec::new(),
+                refreshed: false,
             }),
             unchanged: false,
         }

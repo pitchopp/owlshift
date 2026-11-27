@@ -755,7 +755,7 @@ fn bumped_ticket_ref_formats_read_older_ones_and_refuse_newer_ones() {
         ),
         (
             "a newer delivery",
-            &|d| d["format"] = 10.into(),
+            &|d| d["format"] = 11.into(),
             "upgrade Owlshift",
         ),
     ] {
@@ -772,7 +772,7 @@ fn bumped_ticket_ref_formats_read_older_ones_and_refuse_newer_ones() {
         TicketDelivery::parse(&format_4.to_string())
             .unwrap()
             .render()
-            .starts_with("{\n  \"format\": 9,")
+            .starts_with("{\n  \"format\": 10,")
     );
     let mut reviews_in_4 = format_4;
     reviews_in_4["pushing"]["report"]["reviews"] = json!([{ "id": 7, "author": "ada" }]);

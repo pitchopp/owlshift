@@ -438,30 +438,22 @@ fn a_fix_run_blocked_at_watch_runs_again_and_its_push_lands() {
 }
 
 /// OWL-634: a fix run at Watch that stops `blocked` on what its base gained
-/// gets `rebase` open; the resolver's `rebase` gives the delivery to the
-/// rebase run, a refresh whose cause is the verdict, and its push lands on
-/// the base's head: one repair, no fix pass, the ticket staying at Watch.
+/// gets `rebase` open; the resolver's `rebase` gives the delivery a refresh
+/// whose cause is the verdict, which git merges cleanly, so the runner
+/// merges the base itself with no rebase run (OWL-655), and its push lands
+/// on the base's head: one repair, no fix pass, the ticket staying at Watch.
 #[test]
 fn a_fix_run_blocked_at_watch_on_its_base_is_rebased_and_its_push_lands() {
     let bench = delivered();
     let first_push = bench.remote_branch().unwrap();
     bench.github.followed.lock().unwrap().conclusion = "FAILURE";
     let main = bench.merge_into_main(&[("TWO.md", "// two\n")]);
-    let (env, worktree) = (bench.env.clone(), bench.worktree());
-    let onto = main.clone();
-    let rebase: During = (
-        3,
-        Box::new(move || {
-            env.run(&worktree, &["rebase", "--quiet", &onto]).unwrap();
-        }),
-    );
     let (rebased, printed) = bench.continue_during(
         vec![
             bench.reply(None, Some(BEHIND)),
             bench.read(&verdict("rebase", "The base now holds TWO.md.")),
-            bench.reply(None, Some(REBASED)),
         ],
-        vec![rebase],
+        Vec::new(),
     );
     rebased.unwrap_or_else(|stop| panic!("{stop}\n{printed}"));
     let unblock = bench.last_of(Role::Resolver).unblock.unwrap();
@@ -475,10 +467,7 @@ fn a_fix_run_blocked_at_watch_on_its_base_is_rebased_and_its_push_lands() {
         ]
     );
     let roles: Vec<Role> = bench.briefs().iter().map(|b| b.role).collect();
-    assert_eq!(
-        roles[roles.len() - 3..],
-        [Role::Build, Role::Resolver, Role::Rebase]
-    );
+    assert_eq!(roles[roles.len() - 2..], [Role::Build, Role::Resolver]);
     assert_eq!(verdicts(&bench), ["rebase"]);
     assert_eq!(
         bench.record().questions.unblocks_at(Stage::Watch),
@@ -491,14 +480,11 @@ fn a_fix_run_blocked_at_watch_on_its_base_is_rebased_and_its_push_lands() {
             .any(|c| c.starts_with("[owlshift] DECISION")),
         "{printed}"
     );
-    let runs: Vec<Value> = data_of(&bench.events(), EventKind::Decision, "watch")
-        .into_iter()
-        .filter(|data| data["watch"] == "rebase_run")
-        .collect();
+    let merged = refreshes_merged(&bench);
     assert_eq!(
-        (&runs[0]["cause"], &runs[0]["refresh"], &runs[0]["onto"]),
-        (&json!("unblocked"), &json!(true), &json!(main)),
-        "{runs:?}"
+        (merged.len(), &merged[0]["cause"], &merged[0]["onto"]),
+        (1, &json!("unblocked"), &json!(main)),
+        "{merged:?}"
     );
     let head = bench.remote_branch().unwrap();
     assert_ne!(head, first_push);

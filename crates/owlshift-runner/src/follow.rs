@@ -2175,6 +2175,7 @@ mod tests {
             followups: vec![],
             reviews: Vec::new(),
             steps: Vec::new(),
+            refreshed: false,
         };
         assert_eq!(
             next.owed,
@@ -2523,6 +2524,7 @@ mod tests {
                     author: "ann-dev".to_owned(),
                 }],
                 steps: Vec::new(),
+                refreshed: false,
             }),
         });
         let mut looping = record(d, verifying);

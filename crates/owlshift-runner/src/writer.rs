@@ -959,13 +959,17 @@ pub struct Corrected {
 }
 
 /// A rebase a DELIVERY report names (OWL-210, architecture section 5,
-/// "Conflicts and the rebase run"): the branch's history was replaced.
+/// "Conflicts and the rebase run"): the branch's history was replaced, or,
+/// for a clean refresh, the runner merged the base itself (OWL-655).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Rebased {
     pub base_branch: String,
     pub onto: forge::CommitId,
     /// From 1, the repairs of the delivery so far, this one included.
     pub repair: u32,
+    /// A clean refresh the runner merged itself, with no agent run and no
+    /// gate (OWL-655, "A clean refresh").
+    pub refreshed: bool,
 }
 
 /// A fix pass a DELIVERY report names (OWL-112, architecture section 5,
@@ -996,6 +1000,8 @@ pub enum Gate {
 /// A first delivery's report has none.
 const FIX_PASS_LEAD: &str = "**Fix pass ";
 const REBASE_LEAD: &str = "**Rebased onto ";
+/// A clean refresh the runner merged itself (OWL-655).
+const REFRESHED_LEAD: &str = "**Refreshed onto ";
 const CORRECTED_LEAD: &str = "**Corrected after delivery,**";
 const UNCORRECTED_LEAD: &str = "**No correction needed after delivery:**";
 const REVIEWED_LEAD: &str = "**Changed after reviews on the pull request,**";
@@ -1003,9 +1009,10 @@ const UNREVIEWED_LEAD: &str = "**No change after reviews on the pull request:**"
 /// The run after a person's steps were answered (OWL-619).
 const STEPPED_LEAD: &str = "**Changed after a person's steps,**";
 const UNSTEPPED_LEAD: &str = "**No change after a person's steps:**";
-const LEADS: [&str; 8] = [
+const LEADS: [&str; 9] = [
     FIX_PASS_LEAD,
     REBASE_LEAD,
+    REFRESHED_LEAD,
     CORRECTED_LEAD,
     UNCORRECTED_LEAD,
     REVIEWED_LEAD,
@@ -1142,6 +1149,16 @@ impl DeliveryReport {
                     listed(&checks, LEAD_LIST_CHARS)
                 )
             })
+        } else if let Some(rebase) = &self.rebase
+            && rebase.refreshed
+        {
+            Some(format!(
+                "{REFRESHED_LEAD}{} at {} after delivery,** repair {} of {MAX_REPAIRS}: \
+                 Owlshift merged the base itself, git finding no conflict; no agent ran.",
+                code(&flatten(&rebase.base_branch)),
+                code(short(&rebase.onto)),
+                rebase.repair
+            ))
         } else if let Some(rebase) = &self.rebase {
             Some(format!(
                 "{REBASE_LEAD}{} at {} after delivery,** repair {} of {MAX_REPAIRS}: the \
@@ -5905,6 +5922,7 @@ mod tests {
             base_branch: "main".to_owned(),
             onto: forge::CommitId::new("0123456789abcdef0123456789abcdef01234567").unwrap(),
             repair: 1,
+            refreshed: false,
         });
         let body = report.render();
         assert!(
@@ -5913,6 +5931,33 @@ mod tests {
                  repair 1 of 6: the branch's history was replaced, leased on Owlshift's last \
                  push.\n\nPosts the delivery report"
             ),
+            "{body}"
+        );
+    }
+
+    /// A clean refresh the runner merged itself says so, and that no gate
+    /// ran (OWL-655).
+    #[test]
+    fn a_refresh_the_runner_merged_says_no_agent_ran() {
+        let mut report = report(Ok(set(Mergeable::Mergeable, vec![])));
+        report.gate = Gate::NotRecorded;
+        report.rebase = Some(Rebased {
+            base_branch: "main".to_owned(),
+            onto: forge::CommitId::new("0123456789abcdef0123456789abcdef01234567").unwrap(),
+            repair: 1,
+            refreshed: true,
+        });
+        let body = report.render();
+        assert!(
+            body.starts_with(
+                "[owlshift] DELIVERY\n\n**Refreshed onto `main` at `0123456` after delivery,** \
+                 repair 1 of 6: Owlshift merged the base itself, git finding no conflict; no \
+                 agent ran.\n\n"
+            ),
+            "{body}"
+        );
+        assert!(
+            body.contains("**Project gate:** not run by Owlshift for this delivery."),
             "{body}"
         );
     }
@@ -8681,6 +8726,16 @@ Reply `Q1: B`, `ok` to take every recommendation, or in your own words.
                     base_branch: "main".to_owned(),
                     onto: CommitId::new("c".repeat(40)).unwrap(),
                     repair: 1,
+                    refreshed: false,
+                })
+            }),
+            // A clean refresh the runner merged itself (OWL-655).
+            with(&|r| {
+                r.rebase = Some(Rebased {
+                    base_branch: "main".to_owned(),
+                    onto: CommitId::new("c".repeat(40)).unwrap(),
+                    repair: 1,
+                    refreshed: true,
                 })
             }),
             with(&|r| r.correction = Some(corrected(true))),

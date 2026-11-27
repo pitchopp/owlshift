@@ -283,46 +283,35 @@ fn an_untold_rerun_still_refused_is_dropped_when_the_next_heads_rerun_is_claimed
 }
 
 /// A red the base shares waits, with no re-run and no run; once the base
-/// passes, its checks having failed at the push, a refresh rebase runs.
+/// passes, its checks having failed at the push, the base is refreshed into
+/// it, the runner's own merge (OWL-655).
 #[test]
 fn a_red_the_base_shares_waits_then_refreshes_once_the_base_passes() {
     let bench = red_jobs(vec![job("ci", 10, "FAILURE")]);
     bench.github.followed.lock().unwrap().base_conclusion = "FAILURE";
     let first_push = bench.remote_branch().unwrap();
-    let (env, worktree) = (bench.env.clone(), bench.worktree());
-    let rebase: During = (
-        1,
-        Box::new(move || {
-            env.run(&worktree, &["rebase", "--quiet", "origin/main"])
-                .unwrap();
-        }),
-    );
     let github = bench.github.clone();
     let mut pass = 0;
-    let (outcomes, lines, printed) = bench.watch_passes_during(
-        vec![bench.reply(None, Some(REBASED))],
-        vec![rebase],
-        &mut |_| {
-            pass += 1;
-            if pass == 2 {
-                // Red on the base: nothing was re-run or run.
-                assert!(github.jobs.lock().unwrap().calls.is_empty());
-                assert_eq!(bench.briefs().len(), 2);
-                // The base's fix lands: its head passes, the push's base
-                // still failed.
-                bench.merge_into_main(&[("FIXED.md", "fixed\n")]);
-                let mut followed = github.followed.lock().unwrap();
-                followed.base_conclusion = "SUCCESS";
-                followed.at_push_conclusion = Some("FAILURE");
-            }
-            if bench.remote_branch().as_deref() != Some(first_push.as_str()) {
-                // CI ran again on the refreshed head, green.
-                github.jobs.lock().unwrap().first = vec![job("ci", 20, "SUCCESS")];
-                github.followed.lock().unwrap().at_push_conclusion = None;
-            }
-            pass < 5
-        },
-    );
+    let (outcomes, lines, printed) = bench.watch_passes_during(Vec::new(), Vec::new(), &mut |_| {
+        pass += 1;
+        if pass == 2 {
+            // Red on the base: nothing was re-run or run.
+            assert!(github.jobs.lock().unwrap().calls.is_empty());
+            assert_eq!(bench.briefs().len(), 2);
+            // The base's fix lands: its head passes, the push's base
+            // still failed.
+            bench.merge_into_main(&[("FIXED.md", "fixed\n")]);
+            let mut followed = github.followed.lock().unwrap();
+            followed.base_conclusion = "SUCCESS";
+            followed.at_push_conclusion = Some("FAILURE");
+        }
+        if bench.remote_branch().as_deref() != Some(first_push.as_str()) {
+            // CI ran again on the refreshed head, green.
+            github.jobs.lock().unwrap().first = vec![job("ci", 20, "SUCCESS")];
+            github.followed.lock().unwrap().at_push_conclusion = None;
+        }
+        pass < 5
+    });
     assert_eq!(
         github.jobs.lock().unwrap().calls,
         Vec::<u64>::new(),
@@ -339,11 +328,11 @@ fn a_red_the_base_shares_waits_then_refreshes_once_the_base_passes() {
             .any(|d| d["action"] == "refresh_rebase" && d["cause"] == "base_fixed"),
         "{decided:?}\n{lines}\n{printed}"
     );
-    let rebases: Vec<&Value> = decided
-        .iter()
-        .filter(|d| d["watch"] == "rebase_run")
-        .collect();
-    assert_eq!(rebases.len(), 1, "{decided:?}\n{lines}\n{printed}");
+    // The base's fix merges cleanly: the runner merges it (OWL-655).
+    let merged = refreshes_merged(&bench);
+    assert_eq!(merged.len(), 1, "{decided:?}\n{lines}\n{printed}");
+    assert_eq!(merged[0]["cause"], "base_fixed");
+    assert!(decided.iter().all(|d| d["watch"] != "rebase_run"));
     assert_ne!(bench.remote_branch().unwrap(), first_push);
 }
 
