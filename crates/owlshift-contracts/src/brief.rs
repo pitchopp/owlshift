@@ -94,9 +94,12 @@ pub struct Brief {
     pub permissions: Permissions,
     /// The project's full gate, from `stack.gate` in its configuration: the
     /// commands the runner runs, in order, from the worktree root, on the
-    /// commit a Build delivers; a role runs them, or narrows them to its
-    /// change, before it delivers. The runner is its only author; an empty
-    /// list means the project has no gate.
+    /// commit a Build or a rebase run delivers; the build role runs them, or
+    /// narrows them to its change, before it delivers, and the rebase role
+    /// runs none of them, the runner's gate after its `done` being the
+    /// check (OWL-659). The runner is its only author; an empty list means
+    /// the project has no gate, or, in a rebase of a Build not delivered
+    /// yet, that the Build's gate judges the branch after it.
     pub gate: Vec<String>,
     /// The always-human categories the project adds to those of its
     /// delegation level (`policy.always_human`, OWL-151): normalized
