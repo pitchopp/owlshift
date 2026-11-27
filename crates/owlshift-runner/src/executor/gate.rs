@@ -217,6 +217,16 @@ impl GateReport {
         self.failure.is_none() && self.breach.is_empty()
     }
 
+    /// How long its commands ran, its setup's included, by [`Instant`]: the
+    /// time the gate's status says (OWL-665).
+    pub fn elapsed(&self) -> Duration {
+        self.setup
+            .iter()
+            .chain(&self.steps)
+            .map(|step| step.elapsed)
+            .sum()
+    }
+
     /// Whether the machine slept longer than [`SLEEP_BOUND`] while the gate
     /// ran: a red gate then is the machine's (OWL-480).
     pub fn slept_through(&self) -> bool {

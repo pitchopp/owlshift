@@ -312,7 +312,7 @@ pub fn run(system: &dyn System, config: &Effective, own: &BuildIdentity) -> Repo
             .and_then(|found| forge_access_check(system, config, found)),
     );
     // The GitHub App's grants, read once for the lines that need them
-    // (OWL-445, OWL-513).
+    // (OWL-445, OWL-513, OWL-665).
     let grants = stored
         .as_ref()
         .and_then(|found| app_grants(system, config, found));
@@ -327,6 +327,12 @@ pub fn run(system: &dyn System, config: &Effective, own: &BuildIdentity) -> Repo
             .as_ref()
             .zip(grants.as_ref())
             .and_then(|(found, grants)| rerun_permission_check(config, found, grants)),
+    );
+    checks.extend(
+        stored
+            .as_ref()
+            .zip(grants.as_ref())
+            .and_then(|(found, grants)| gate_status_permission_check(config, found, grants)),
     );
     let accounts = match &stored {
         Some(Ok(found)) => found.tracker.as_ref().map(|tracker| &tracker.accounts),
@@ -2578,7 +2584,8 @@ fn github_app(config: &Effective) -> crate::forge::GitHubApp {
 }
 
 /// What the project's GitHub credential was granted, for the lines that
-/// read it ([`merge_permission_check`], [`rerun_permission_check`]): read
+/// read it ([`merge_permission_check`], [`rerun_permission_check`],
+/// [`gate_status_permission_check`]): read
 /// once, only when a project file is loaded and a token is stored.
 fn app_grants(
     system: &dyn System,
@@ -2685,6 +2692,115 @@ fn rerun_permission_check(
                 "{DOES_NOT_BLOCK} doctor could not read the GitHub App's installation on \
                  github.com/{repo}. Watch's re-run of a red check needs Actions (read and \
                  write)."
+            ),
+        ),
+    })
+}
+
+/// The `gate status` line (OWL-665; architecture section 5, "The gate's
+/// status"), for a project whose `[forge] publish_gate_status`, read from
+/// the working tree here while the runner reads the base's, is on: the
+/// runner sets the commit status through the GitHub App's token, which
+/// needs Commit statuses (read and write). Without it no status is set and
+/// the project's CI runs its suite, so a missing grant is a warning that
+/// blocks nothing. A personal token's cannot be read, nor an installation
+/// not found: information. None when the switch is off, or when the secrets
+/// are unresolved or no token is stored: the `secrets` line says so.
+fn gate_status_permission_check(
+    config: &Effective,
+    found: &Result<ProjectSecrets, Unresolved>,
+    grants: &Result<AppGrants, TokenTryError>,
+) -> Option<Check> {
+    const SUBJECT: &str = "gate status";
+    let FileState::Loaded {
+        config: project, ..
+    } = &config.project
+    else {
+        return None;
+    };
+    if !project
+        .forge
+        .as_ref()
+        .is_some_and(|forge| forge.publish_gate_status())
+    {
+        return None;
+    }
+    let Ok(found) = found else {
+        return None;
+    };
+    let app = github_app(config);
+    let repo = &found.repo;
+    Some(match grants {
+        Ok(AppGrants::Installed {
+            statuses_write: true,
+            ..
+        }) => Check::ok(
+            Section::Project,
+            SUBJECT,
+            format!(
+                "the GitHub App's installation on github.com/{repo} grants Commit statuses \
+                 (read and write), which the gate's status needs"
+            ),
+        ),
+        Ok(AppGrants::Installed { installation, .. }) => Check {
+            fix: vec![Step::act(format!(
+                "Accept the app's permissions on GitHub, in the installation's settings \
+                 (Settings > Applications > Installed GitHub Apps > {} > Configure), then run \
+                 `owlshift doctor` again",
+                app.slug
+            ))],
+            ..Check::warn(
+                Section::Project,
+                SUBJECT,
+                format!(
+                    "the GitHub App's installation {installation} on github.com/{repo} has not \
+                     granted Commit statuses (read and write): no gate status is set, and the \
+                     project's CI runs its whole suite"
+                ),
+                format!(
+                    "{DOES_NOT_BLOCK} forge.publish_gate_status has the runner set the commit \
+                     status `owlshift/gate` on each commit it pushes once its gate passed, which \
+                     needs Commit statuses (read and write); GitHub refuses it otherwise."
+                ),
+            )
+        },
+        Ok(AppGrants::NotInstalled) => Check::info(
+            Section::Project,
+            SUBJECT,
+            format!(
+                "not checked: no installation of the GitHub App lists github.com/{repo}; \
+                 install it from {}",
+                app.install_link()
+            ),
+        ),
+        Ok(AppGrants::PersonalToken) => Check::info(
+            Section::Project,
+            SUBJECT,
+            "not checked: GitHub does not say what a personal token may do; the gate's status \
+             needs commit statuses (write), and a status GitHub refuses is a warning",
+        ),
+        Err(TokenTryError::Credential(reason)) => {
+            Check::info(Section::Project, SUBJECT, format!("not checked: {reason}"))
+        }
+        Err(TokenTryError::SignIn(_)) => Check::info(
+            Section::Project,
+            SUBJECT,
+            "not checked: the GitHub App's token needs a new sign-in; the forge access line \
+             says how",
+        ),
+        Err(TokenTryError::Expired(_)) => Check::info(
+            Section::Project,
+            SUBJECT,
+            "not checked: the GitHub App's token is past its expiry; the forge access line \
+             says how",
+        ),
+        Err(TokenTryError::Forge(error)) => Check::warn(
+            Section::Project,
+            SUBJECT,
+            format!("not checked: {error}"),
+            format!(
+                "{DOES_NOT_BLOCK} doctor could not read the GitHub App's installation on \
+                 github.com/{repo}. The gate's status needs Commit statuses (read and write)."
             ),
         ),
     })
@@ -5583,6 +5699,7 @@ states = { ready = "Todo", working = "Doing", needs_input = "Asked", review = "R
             installation: 9,
             contents_write,
             actions_write: true,
+            statuses_write: false,
         };
 
         let system = || logged_in(with_harnesses(with_git(FakeSystem::default())));
@@ -5635,6 +5752,7 @@ states = { ready = "Todo", working = "Doing", needs_input = "Asked", review = "R
             installation: 9,
             contents_write: false,
             actions_write,
+            statuses_write: false,
         };
         for (grants, status, says) in [
             (
@@ -5666,6 +5784,61 @@ states = { ready = "Todo", working = "Doing", needs_input = "Asked", review = "R
                         .why
                         .as_deref()
                         .is_some_and(|why| why.contains("Actions (read and write)")),
+                    "{found:?}"
+                );
+                assert!(report.ready(), "{report:?}");
+            }
+        }
+    }
+
+    /// OWL-665: a project whose `[forge] publish_gate_status` is on gets a
+    /// `gate status` line from the GitHub App's installation: ok when it
+    /// granted Commit statuses (read and write), a warning that blocks
+    /// nothing otherwise, naming the installation's settings, information
+    /// for a personal token or no installation; none with the switch off.
+    #[test]
+    fn the_gate_status_line_names_a_missing_statuses_write() {
+        let system = || logged_in(with_harnesses(with_git(FakeSystem::default())));
+        let tracker = r#"kind = "markdown"
+admit = "delegation"
+states = { ready = "Todo", working = "Doing", needs_input = "Asked", review = "Review" }"#;
+        let (_dir, off) =
+            project_tracked_by(&format!("{tracker}\n[forge]\npublish_gate_status = false"));
+        let report = run(&system(), &off);
+        assert!(
+            !report.checks.iter().any(|c| c.subject == "gate status"),
+            "{report:?}"
+        );
+        let (_dir, on) =
+            project_tracked_by(&format!("{tracker}\n[forge]\npublish_gate_status = true"));
+        let installed = |statuses_write| AppGrants::Installed {
+            installation: 9,
+            contents_write: false,
+            actions_write: true,
+            statuses_write,
+        };
+        for (grants, status, says) in [
+            (
+                installed(true),
+                Status::Ok,
+                "grants Commit statuses (read and write), which the gate's status needs",
+            ),
+            (
+                installed(false),
+                Status::Warn,
+                "installation 9 on github.com/pitchopp/owlshift has not granted Commit statuses \
+                 (read and write): no gate status is set",
+            ),
+            (AppGrants::NotInstalled, Status::Info, "no installation"),
+            (AppGrants::PersonalToken, Status::Info, "personal token"),
+        ] {
+            let report = run(&system().github_app_grants_are(Ok(grants)), &on);
+            let found = line(&report, "gate status");
+            assert_eq!(found.status, status, "{found:?}");
+            assert!(found.detail.contains(says), "{found:?}");
+            if status == Status::Warn {
+                assert!(
+                    matches!(&found.fix[..], [Step::Do(step)] if step.contains("Installed GitHub Apps")),
                     "{found:?}"
                 );
                 assert!(report.ready(), "{report:?}");

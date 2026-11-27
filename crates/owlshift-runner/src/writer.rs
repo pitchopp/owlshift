@@ -5049,6 +5049,23 @@ impl<'a> Writer<'a> {
         forge.rerun_failed_jobs(run).map_err(WriteError::Forge)
     }
 
+    /// Sets the gate's status, `success` with `description`, on `commit`,
+    /// a commit the runner pushed once its own gate passed on that tree
+    /// (OWL-665, architecture section 5, "The gate's status"), after asking
+    /// the floor (`Action::SetGateStatus`).
+    pub fn set_gate_status(
+        &self,
+        forge: &GitHubForge,
+        commit: &CommitId,
+        description: &str,
+    ) -> Result<(), WriteError> {
+        self.check(Action::SetGateStatus, HumanApproval::Absent)
+            .map_err(WriteError::Floor)?;
+        forge
+            .set_gate_status(commit, description)
+            .map_err(WriteError::Forge)
+    }
+
     /// Posts a MERGED comment once (OWL-445): when a MERGED comment on the
     /// ticket already names the same pull request and head, that comment is
     /// returned and nothing is posted, so a merge told before a crash is
@@ -10419,6 +10436,9 @@ Reply `Q1: B`, `ok` to take every recommendation, or in your own words.
         ("rerun_failed_jobs", |w, f| {
             came(w.rerun_failed_jobs(&f.forge, 42_378_288_167))
         }),
+        ("set_gate_status", |w, f| {
+            came(w.set_gate_status(&f.forge, &head(), "Gate passed"))
+        }),
         ("post_rerun", |w, _| {
             came(w.post_rerun(&rerun_comment(RerunOutcomeKind::Passed, None)))
         }),
@@ -10585,7 +10605,7 @@ Reply `Q1: B`, `ok` to take every recommendation, or in your own words.
     /// `fold`, which is never an error, says so in its one failure.
     #[test]
     fn a_ui_writer_refuses_every_other_write() {
-        assert_eq!(UI_REFUSED_WRITES.len(), 31);
+        assert_eq!(UI_REFUSED_WRITES.len(), 32);
         for (name, write) in UI_REFUSED_WRITES {
             let tracker = Counting::default();
             tracker.accepts_posts.set(true);

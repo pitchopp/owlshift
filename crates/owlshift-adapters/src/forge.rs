@@ -308,6 +308,12 @@ pub struct Refusal {
     pub message: String,
 }
 
+/// The context of the commit status the runner sets on a commit it pushed
+/// once its own gate passed on that tree (OWL-665, architecture section 5,
+/// "The gate's status"): what a project's CI reads, and what no read of a
+/// commit's checks counts ([`Check::is_gate_status`]).
+pub const GATE_STATUS_CONTEXT: &str = "owlshift/gate";
+
 /// One check of a commit: a check run or a commit status.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Check {
@@ -331,6 +337,15 @@ pub struct Check {
     /// read (OWL-513), absent from every other. A re-run's new attempt of a
     /// job keeps it, with a greater `id`.
     pub run: Option<u64>,
+}
+
+impl Check {
+    /// Whether it is a commit status of context [`GATE_STATUS_CONTEXT`],
+    /// whoever set it: Owlshift's own verdict, never a check of the
+    /// project's CI, so the forge's reads leave it out of every check set.
+    pub fn is_gate_status(&self) -> bool {
+        self.kind == CheckKind::Status && self.name == GATE_STATUS_CONTEXT
+    }
 }
 
 /// What the forge answered a re-run of a workflow run's failed jobs

@@ -2579,6 +2579,11 @@ pub struct KeptReport {
     /// report's lead line says so.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub refreshed: bool,
+    /// How long the gate of `gate` ran, its setup included, in whole seconds
+    /// awake (format 11, OWL-665): what the gate's status on the pushed
+    /// commit says. Absent with no gate, and from a report kept before it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gate_elapsed_s: Option<u64>,
 }
 
 /// A pull request review a review loop's run answers (OWL-300).
@@ -2690,8 +2695,9 @@ impl TicketDelivery {
     /// automatic re-run (OWL-513), without one, and a format-7 one, written
     /// before a rebase's push kept its rebase run's commit (OWL-514),
     /// without one, and a format-8 one, written before a correction's report
-    /// could name a person's steps (OWL-619), without them; the next write
-    /// gives it the current format.
+    /// could name a person's steps (OWL-619), without them, and a format-10
+    /// one, written before a report kept its gate's time (OWL-665), without
+    /// it; the next write gives it the current format.
     pub fn parse(input: &str) -> Result<Self, ContractError> {
         let delivery: Self = match Self::from_older_format(input) {
             Some(read) => read?,
@@ -2701,7 +2707,7 @@ impl TicketDelivery {
         Ok(delivery)
     }
 
-    /// A format-1 to 8 document read as the current format, or `None` for
+    /// A format-1 to 10 document read as the current format, or `None` for
     /// any other. Format 1 is format 2 without `owed` and `pushing.report`,
     /// format 2 is format 3 without a correction's push or report, format 3
     /// is format 4 without an owed delivery report, a report's `notes` or an
@@ -2711,13 +2717,14 @@ impl TicketDelivery {
     /// format 6 is format 7 without `rerun` (OWL-513), and format 7 is
     /// format 8 without `pushing.rebased` (OWL-514), and format 8 is format
     /// 9 without a report's `steps` (OWL-619), and format 9 is format 10
-    /// without a report's `refreshed` (OWL-655), so each is refused in an
-    /// older format.
+    /// without a report's `refreshed` (OWL-655), and format 10 is format 11
+    /// without a report's `gate_elapsed_s` (OWL-665), so each is refused in
+    /// an older format.
     fn from_older_format(input: &str) -> Option<Result<Self, ContractError>> {
         let mut document: serde_json::Value = serde_json::from_str(input).ok()?;
         let fields = document.as_object_mut()?;
         let format = fields.get("format").and_then(serde_json::Value::as_u64)?;
-        if !(1..=9).contains(&format) {
+        if !(1..=10).contains(&format) {
             return None;
         }
         let pushing = fields.get("pushing").and_then(serde_json::Value::as_object);
@@ -2749,6 +2756,7 @@ impl TicketDelivery {
         let reviews = reports().any(|report| report.get("reviews").is_some());
         let steps = reports().any(|report| report.get("steps").is_some());
         let refreshed = reports().any(|report| report.get("refreshed").is_some());
+        let gate_elapsed = reports().any(|report| report.get("gate_elapsed_s").is_some());
         let questions = reports().any(|report| report.get("questions").is_some());
         let notes = reports().any(|report| report.get("notes").is_some());
         let owed_delivery = owed
@@ -2775,7 +2783,8 @@ impl TicketDelivery {
             ("rerun", format <= 6 && rerun),
             ("pushing.rebased", rebased),
             ("report's steps", format <= 8 && steps),
-            ("report's refreshed", refreshed),
+            ("report's refreshed", format <= 9 && refreshed),
+            ("report's gate_elapsed_s", gate_elapsed),
         ] {
             if kept {
                 return Some(Err(ContractError::invalid(

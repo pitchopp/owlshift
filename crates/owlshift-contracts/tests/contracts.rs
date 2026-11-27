@@ -3917,7 +3917,7 @@ fn a_ticket_delivery_round_trips_and_is_checked() {
     .unwrap();
     assert!(older.owed.is_none() && older.pushing.as_ref().unwrap().report.is_none());
     assert!(
-        older.render().contains("\"format\": 10"),
+        older.render().contains("\"format\": 11"),
         "{}",
         older.render()
     );
@@ -3949,7 +3949,7 @@ fn a_ticket_delivery_round_trips_and_is_checked() {
     // in format 1. Format 3 keeps one, whose report names its questions,
     // and only a correction's report does.
     let older = parse(|v| v["format"] = json!(2)).unwrap();
-    assert!(older.render().starts_with("{\n  \"format\": 10,"));
+    assert!(older.render().starts_with("{\n  \"format\": 11,"));
     let refused: [(&str, Edit); 3] = [
         ("correction's push", |v| {
             v["format"] = json!(2);
@@ -4085,9 +4085,34 @@ fn a_ticket_delivery_round_trips_and_is_checked() {
         }),
         "format 9 keeps no report's refreshed",
     );
+    // OWL-665: format 11's report may keep its gate's time; format 10 keeps
+    // none, and is read without it.
+    let timed = parse(|v| v["pushing"]["report"]["gate_elapsed_s"] = json!(263)).unwrap();
+    assert_eq!(
+        timed
+            .pushing
+            .as_ref()
+            .unwrap()
+            .report
+            .as_ref()
+            .unwrap()
+            .gate_elapsed_s,
+        Some(263)
+    );
+    assert_eq!(TicketDelivery::parse(&timed.render()).unwrap(), timed);
+    let older = parse(|v| v["format"] = json!(10)).unwrap();
+    assert_eq!(older.format, delivery.format);
     rejects(
-        "format 11",
-        parse(|v| v["format"] = json!(11)),
+        "a format-10 report's gate_elapsed_s",
+        parse(|v| {
+            v["format"] = json!(10);
+            v["owed"]["report"]["gate_elapsed_s"] = json!(263);
+        }),
+        "format 10 keeps no report's gate_elapsed_s",
+    );
+    rejects(
+        "format 12",
+        parse(|v| v["format"] = json!(12)),
         "upgrade Owlshift",
     );
     let not_rebases: [(&str, Edit); 2] = [
@@ -4327,7 +4352,7 @@ fn a_ticket_delivery_round_trips_and_is_checked() {
     })
     .unwrap();
     assert!(older.pushing.as_ref().unwrap().rebased.is_none());
-    assert!(older.render().starts_with("{\n  \"format\": 10,"));
+    assert!(older.render().starts_with("{\n  \"format\": 11,"));
     let refused: [(&str, Edit, &str); 3] = [
         (
             "a format-7 rebase run's commit",

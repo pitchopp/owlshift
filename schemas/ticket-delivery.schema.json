@@ -41,7 +41,7 @@
     "format": {
       "description": "The format version of this document.",
       "type": "integer",
-      "const": 10
+      "const": 11
     },
     "merge_retry": {
       "description": "When a person's `owlshift continue` at Watch last asked for the\nmerge to be tried again (format 6, OWL-445): watch tries again a head\nwhose merge GitHub refused for good before then. Not a refusal: those\nlive in watch's memory only.",
@@ -310,6 +310,15 @@
           "items": {
             "type": "string"
           }
+        },
+        "gate_elapsed_s": {
+          "description": "How long the gate of `gate` ran, its setup included, in whole seconds\nawake (format 11, OWL-665): what the gate's status on the pushed\ncommit says. Absent with no gate, and from a report kept before it.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
         },
         "notes": {
           "description": "For the first delivery, the runner's own notes the report lists after\nthe resolver's decisions, which `questions.json` keeps: the late\ncomments a Build run was given (OWL-139). Never a resolver's decision.\nA newer report that replaces this one unposted lists none of them\n(format 4, OWL-236).",

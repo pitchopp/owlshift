@@ -374,6 +374,7 @@ impl OnDemand<'_> {
             commit,
             summary: built.summary,
             gate: Gate::Passed(built.gate),
+            gate_elapsed: built.gate_elapsed_s,
         };
         let kind = RepairKind::Review {
             reviews: pr_reviews::answered(&loop_reviews(p)),
@@ -435,6 +436,7 @@ impl OnDemand<'_> {
                 reviews: reviews.clone(),
                 steps: Vec::new(),
                 refreshed: false,
+                gate_elapsed_s: built.gate_elapsed_s,
             }),
             unchanged: true,
         };

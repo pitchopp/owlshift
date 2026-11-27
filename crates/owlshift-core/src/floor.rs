@@ -76,6 +76,11 @@ pub enum Action {
     /// architecture section 5, "The automatic re-run"): the one CI action
     /// the runner takes, never at an agent's request.
     RerunCheck,
+    /// Set the commit status `owlshift/gate` on a commit the runner pushed
+    /// after its own gate passed on that tree, for a project that opted in
+    /// (OWL-665, architecture section 5, "The gate's status"): never at an
+    /// agent's request.
+    SetGateStatus,
     /// Write a `blocks` relation between two tickets: a dependency intake
     /// found (architecture section 5, "Dependencies to relations").
     Relate,
@@ -175,7 +180,7 @@ pub fn check_from(
             | Action::PushBranch
             | Action::PushRef
             | Action::OpenPullRequest => Ok(()),
-            Action::Relate | Action::RerunCheck => Ok(()),
+            Action::Relate | Action::RerunCheck | Action::SetGateStatus => Ok(()),
             Action::Reply(_) => Err(FloorViolation::ReplyNotFromUi),
         },
         Origin::Ui => match action {
@@ -191,6 +196,7 @@ pub fn check_from(
             | Action::Deploy
             | Action::ChangeInfrastructure
             | Action::RerunCheck
+            | Action::SetGateStatus
             | Action::Relate) => Err(FloorViolation::FromUi(other)),
         },
     }
@@ -556,6 +562,7 @@ mod tests {
             Action::PushRef,
             Action::OpenPullRequest,
             Action::RerunCheck,
+            Action::SetGateStatus,
         ];
         for action in actions {
             assert_eq!(check_action(action.clone(), HumanApproval::Absent), Ok(()));
