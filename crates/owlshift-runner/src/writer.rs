@@ -4174,7 +4174,8 @@ impl ParkedComment {
             | ParkReason::Forge
             | ParkReason::TicketBudget
             | ParkReason::Rebase
-            | ParkReason::Stopped => vec![Fit::capped(
+            | ParkReason::Stopped
+            | ParkReason::NothingToDeliver => vec![Fit::capped(
                 flatten(&self.detail),
                 LONGER,
                 PARKED_DETAIL_CHARS,
@@ -4230,8 +4231,9 @@ impl ParkedComment {
                  on that machine: no other ticket of it is continued, taken in or built either.",
                 park_reason(self.reason)
             )),
-            // OWL-474: the detail says who canceled, when and why.
-            ParkReason::TicketBudget | ParkReason::Stopped => {
+            // OWL-474: the detail says who canceled, when and why; OWL-662:
+            // which base commit holds the Build, and what the Build said.
+            ParkReason::TicketBudget | ParkReason::Stopped | ParkReason::NothingToDeliver => {
                 sections.push(format!(
                     "Parked: {}. {}",
                     park_reason(self.reason),
@@ -4285,6 +4287,12 @@ impl ParkedComment {
             (ParkReason::Stopped, Restart::Continue) => {
                 format!("**To restart it:** {continue_cmd}: it goes on from where it was stopped.")
             }
+            // OWL-662: never moved to done by Owlshift.
+            (ParkReason::NothingToDeliver, Restart::Continue) => format!(
+                "**What next:** if the base's change is what this ticket asked for, close the \
+                 ticket. Otherwise change the ticket to say what is still missing, then \
+                 {continue_cmd}: its Build runs again."
+            ),
             (_, Restart::Continue) => format!("**To restart it:** {continue_cmd}."),
             (_, Restart::Do) => format!(
                 "**To restart it:** run {} to run it again.",
@@ -4497,6 +4505,7 @@ pub fn park_reason(reason: ParkReason) -> &'static str {
             "its branch could not be rebased off a broken base onto one that passes"
         }
         ParkReason::Stopped => "its work was stopped by a cancel",
+        ParkReason::NothingToDeliver => "the base already holds this ticket's change",
     }
 }
 
@@ -7451,6 +7460,23 @@ Context.
                     continue_it,
                 ],
                 vec![],
+            ),
+            // OWL-662: never "restart" alone, close first.
+            (
+                parked(
+                    ParkReason::NothingToDeliver,
+                    "`main` at `abc1234` already holds the Build's commit.",
+                    Restart::Continue,
+                ),
+                vec![
+                    "Parked: the base already holds this ticket's change. `main` at `abc1234` \
+                     already holds the Build's commit.",
+                    "**What next:** if the base's change is what this ticket asked for, close \
+                     the ticket. Otherwise change the ticket to say what is still missing, then \
+                     reply `continue` here, in a comment of its own, or run `owlshift continue \
+                     OWL-18`: its Build runs again.",
+                ],
+                vec!["To restart it"],
             ),
             (
                 parked(ParkReason::Blocked, "The gate needs network.", Restart::Do),

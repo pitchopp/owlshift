@@ -4271,6 +4271,24 @@ impl OnDemand<'_> {
                             .review_unchanged(p, state, questions, built, sink)
                             .map(Built::Delivered);
                     }
+                    // A Build the base already holds, most often one that
+                    // made no commit, parks before any Verify pass is paid
+                    // (OWL-662). The decider's replies stay unfollowed, for
+                    // the Build a restart runs.
+                    if !in_review_loop(p)
+                        && let Some(holder) =
+                            self.nothing_to_deliver(p, &built.commit, &[p.base.commit.as_str()])
+                    {
+                        return Err(self.park_nothing_to_deliver(
+                            p,
+                            &state,
+                            &dispatched.base_branch,
+                            &holder,
+                            &built,
+                            Some(&ran.run),
+                            sink,
+                        ));
+                    }
                     let review = p.review.get_or_insert_with(TicketReview::new);
                     if let (Some(given), Some(result)) = (&brief.findings, ran.result()) {
                         design::mark_answered(review, Stage::Verify, given, result);
@@ -4333,7 +4351,11 @@ impl OnDemand<'_> {
         {
             return Err(self.hold_delivery(p, state, why, sink));
         }
-        self.deliver(p, dispatched, state, sink)
+        // A failed first delivery is a failed run (OWL-662).
+        match self.deliver(p, dispatched, state, sink) {
+            Err(Stop::Delivery(why)) => Err(self.delivery_failed(p, why, sink)),
+            delivered => delivered,
+        }
     }
 
     /// Why a delivery of `p`'s ticket waits, as the `decision` event's
@@ -7261,6 +7283,17 @@ impl OnDemand<'_> {
         // The base head at the push, `base_at_push` once the push lands:
         // what CI merges the head with.
         let base_at_push = self.base_head(p, base, ticket, sink);
+        // A base that came to hold the Build while Verify ran leaves nothing
+        // to push (OWL-662): parked, no push and no call to the forge. The
+        // neutral image never rewrites a commit on the base, so the gated
+        // commit is what would be pushed.
+        if let Some(holder) = self.nothing_to_deliver(
+            p,
+            built.commit.as_str(),
+            &[base_at_push.as_str(), p.base.commit.as_str()],
+        ) {
+            return Err(self.park_nothing_to_deliver(p, state, base, &holder, &built, None, sink));
+        }
         // No agent commit message closes an issue (OWL-558): from here on
         // `commit` is the gated commit's neutral image, the branch moved there.
         let neutral = self.neutral_push(p, &commit, &[base_at_push.as_str()], sink)?;
@@ -7421,6 +7454,125 @@ impl OnDemand<'_> {
             merge,
             merge_held,
         })
+    }
+
+    /// The first of `bases` that already holds `commit`, the Build's gated
+    /// commit, being that commit or descending from it in the dedicated
+    /// checkout (OWL-662): GitHub opens no pull request for a branch with no
+    /// commit its base lacks. `None` when none does, or when git cannot say,
+    /// a base missing from the checkout: the delivery then goes on, and a
+    /// refusal of the forge counts as a failed run.
+    fn nothing_to_deliver(&self, p: &Prepared, commit: &str, bases: &[&str]) -> Option<String> {
+        bases
+            .iter()
+            .find(|base| self.is_ancestor(p, commit, base))
+            .map(|base| (*base).to_owned())
+    }
+
+    /// Parks a ticket whose Build adds nothing to `base` at `holder`
+    /// (OWL-662, [`Event::NothingToDeliver`]), from `state` at Verify: at
+    /// Build, so that a restart builds again. The kept Build is dropped,
+    /// with its last fix, the delivery's held mark (OWL-403) and a delivery
+    /// record no pull request was kept for (an earlier refused attempt's
+    /// push), all in the park's one write; then the PARKED comment names the
+    /// base's commit and quotes the Build's summary. Never moved to done.
+    #[allow(clippy::too_many_arguments)]
+    fn park_nothing_to_deliver(
+        &self,
+        p: &mut Prepared,
+        state: &TicketState,
+        base: &Branch,
+        holder: &str,
+        built: &KeptBuild,
+        run: Option<&str>,
+        sink: &mut EventSink<'_>,
+    ) -> Stop {
+        let parked = match state.apply(p.pipeline, Event::NothingToDeliver) {
+            Ok(Transition::Parked { state: parked, .. }) => parked,
+            other => return core_error(other),
+        };
+        if let Some(review) = p.review.as_mut() {
+            review.build = None;
+            review.last_fix = None;
+        }
+        if let Some(held) = p.held.as_mut() {
+            held.verified = None;
+        }
+        // Dropped from what the park's write carries forward: the state
+        // changes, so that write is made.
+        if let Some(stored) = p.stored.as_mut()
+            && stored
+                .record
+                .delivery
+                .as_ref()
+                .is_some_and(|delivery| delivery.pull_request.is_none())
+        {
+            stored.record.delivery = None;
+        }
+        let short = |commit: &str| commit.get(..7).unwrap_or(commit).to_owned();
+        let held_by = if built.commit == holder {
+            format!(
+                "`{base}` is at `{}`, the very commit the Build's gate passed on",
+                short(holder)
+            )
+        } else {
+            format!(
+                "`{base}` at `{}` already holds `{}`, the commit the Build's gate passed on",
+                short(holder),
+                short(&built.commit)
+            )
+        };
+        let detail = format!(
+            "{held_by}: the ticket's branch has no commit the base lacks, so no pull request can \
+             open. The Build said: {}",
+            built.summary
+        );
+        self.park_with(
+            p,
+            &parked,
+            ParkReason::NothingToDeliver,
+            run,
+            detail,
+            None,
+            Vec::new(),
+            sink,
+        )
+    }
+
+    /// A first delivery that stopped on `why` (OWL-662; architecture section
+    /// 5, "Failures inside a pass"): a failed run at Verify, counted on the
+    /// state the ticket's ref keeps, so one more try is left, then a park
+    /// with the delivery's reason, which watch does not resume. Only a ref
+    /// at Verify counts it: one that keeps Watch already holds the pull
+    /// request, and watch's bounds take it from there. A count the ref
+    /// cannot keep is said in the stop.
+    fn delivery_failed(&self, p: &mut Prepared, why: String, sink: &mut EventSink<'_>) -> Stop {
+        let Some(kept) = p
+            .stored
+            .as_ref()
+            .and_then(|stored| TicketState::try_from(&stored.record.state).ok())
+            .filter(|kept| kept.status() == Status::Active(Stage::Verify))
+        else {
+            return Stop::Delivery(why);
+        };
+        match kept.apply(p.pipeline, Event::RunFailed) {
+            Ok(Transition::To(next)) => {
+                let questions = p.questions();
+                match self.store(p, &next, questions) {
+                    Ok(()) => Stop::Delivery(format!(
+                        "{why}; counted as a failed run, so a delivery that fails again parks \
+                         the ticket"
+                    )),
+                    Err(e) => Stop::Delivery(format!(
+                        "{why}; keeping it as a failed run in the ticket's ref failed: {e}"
+                    )),
+                }
+            }
+            Ok(Transition::Parked { state, reason }) => {
+                self.park_with(p, &state, reason, None, why, None, Vec::new(), sink)
+            }
+            other => core_error(other),
+        }
     }
 
     /// The base branch's head on the remote, read just before a push; the

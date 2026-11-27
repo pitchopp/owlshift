@@ -741,7 +741,7 @@ impl OnDemand<'_> {
 
     /// Whether `ancestor` is `of` or an ancestor of it, in the dedicated
     /// checkout; `false` when git cannot say.
-    fn is_ancestor(&self, p: &Prepared, ancestor: &str, of: &str) -> bool {
+    pub(super) fn is_ancestor(&self, p: &Prepared, ancestor: &str, of: &str) -> bool {
         self.executor
             .git
             .output(
