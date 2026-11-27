@@ -95,7 +95,7 @@
       "const": 33
     },
     "gate": {
-      "description": "The project's full gate, from `stack.gate` in its configuration: the\ncommands the runner runs, in order, from the worktree root, on the\ncommit a Build delivers; a role runs them, or narrows them to its\nchange, before it delivers. The runner is its only author; an empty\nlist means the project has no gate.",
+      "description": "The project's full gate, from `stack.gate` in its configuration: the\ncommands the runner runs, in order, from the worktree root, on the\ncommit a Build or a rebase run delivers; the build role runs them, or\nnarrows them to its change, before it delivers, and the rebase role\nruns none of them, the runner's gate after its `done` being the\ncheck (OWL-659). The runner is its only author; an empty list means\nthe project has no gate, or, in a rebase of a Build not delivered\nyet, that the Build's gate judges the branch after it.",
       "type": "array",
       "items": {
         "type": "string"

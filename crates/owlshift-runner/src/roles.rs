@@ -222,6 +222,38 @@ mod tests {
         assert!(intake.contains("have no network"), "{intake}");
     }
 
+    /// OWL-659: a rebase run runs none of the gate, which the runner runs
+    /// once after its `done`; the brief's `gate` is data, and a red gate
+    /// reaches the next attempt as `gate_failure`.
+    #[test]
+    fn the_rebase_prompt_leaves_the_gate_to_the_runner() {
+        let rebase = format::strip_role_front_matter(Role::Rebase, REBASE_ROLE).expect("strips");
+        for said in [
+            "The brief's `gate` is data too: the commands the runner runs as the project's gate \
+             after your `done`",
+            "You run no command of `gate`, nor the project's tests, build or linters.",
+            "The runner runs every command of `gate` in this worktree after your `done`, in \
+             order, on your last commit, once",
+            "`git status`, `git diff --check` and a search for conflict markers",
+            "A red gate is a failed run. The next attempt starts again from `head`",
+            "with the brief's `gate_failure`",
+        ] {
+            assert!(
+                rebase.contains(said),
+                "roles/rebase.md does not say {said:?}"
+            );
+        }
+        for unsaid in [
+            "run every command of `gate`",
+            "the commands you run as the project's gate",
+            "the gate green",
+            "you then run the project's gate",
+            "a gate you cannot make pass",
+        ] {
+            assert!(!rebase.contains(unsaid), "roles/rebase.md says {unsaid:?}");
+        }
+    }
+
     #[test]
     fn refuses_a_missing_file() {
         let dir = tempfile::tempdir().expect("tempdir");

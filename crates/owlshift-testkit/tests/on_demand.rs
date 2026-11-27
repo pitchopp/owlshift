@@ -9920,6 +9920,79 @@ fn a_trivial_conflict_is_rebased_on_the_fast_tier_and_pushed_by_the_runner() {
     assert_eq!(bench.remote_branch().unwrap(), rebased);
 }
 
+/// OWL-659: a delivered pull request's rebase run runs no gate; the runner
+/// runs it once after each attempt's `done`, on that attempt's commit. The
+/// fast run resolves the conflict without what the new base's gate checks,
+/// and its agent runs nothing: the runner's gate is red, a failed run. The
+/// retry, on the Build routing, starts again from the last push, told the
+/// gate's failure; its resolution passes the runner's gate, and is pushed.
+#[test]
+fn a_rebase_run_runs_no_gate_and_the_runners_red_gate_tells_the_next_attempt() {
+    let bench = delivered_with_rules();
+    let delivered_events = bench.events().len();
+    let delivered_runs = bench.briefs().len();
+    let first_push = bench.remote_branch().unwrap();
+    let command = "git grep -q short -- AGENTS.md";
+    let config = fs::read_to_string(bench.remote.checkout.join("owlshift.toml")).unwrap();
+    let gated = config.replace(GATE_LINE, &format!("gate = [\"{command}\"]"));
+    let main = bench.merge_into_main(&[("AGENTS.md", AGENTS_MERGED), ("owlshift.toml", &gated)]);
+    bench.github.followed.lock().unwrap().mergeable = "CONFLICTING";
+    // Both agents rebase and commit, nothing more: neither runs the gate.
+    let first = rebase_in(&bench, main.clone(), vec![("AGENTS.md", AGENTS_DELIVERED)]);
+    let (_, second) = rebase_in(&bench, main.clone(), vec![("AGENTS.md", AGENTS_RESOLVED)]);
+    let (outcome, printed) = bench.continue_during(
+        vec![
+            bench.reply(None, Some(REBASED)),
+            bench.reply(None, Some(REBASED)),
+        ],
+        vec![first, (2, second)],
+    );
+    outcome.unwrap_or_else(|stop| panic!("{stop}\n{printed}"));
+
+    let briefs = &bench.briefs()[delivered_runs..];
+    let roles: Vec<Role> = briefs.iter().map(|brief| brief.role).collect();
+    assert_eq!(roles, [Role::Rebase, Role::Rebase], "{printed}");
+    assert!(briefs[0].gate_failure.is_none(), "{printed}");
+    let told = briefs[1]
+        .gate_failure
+        .as_ref()
+        .expect("told the gate's failure");
+    assert_eq!(told.command.as_deref(), Some(command));
+    assert_eq!(briefs[1].gate, [command]);
+    let events = &bench.events()[delivered_events..];
+    let tiers: Vec<Value> = data_of(events, EventKind::Decision, "trivial")
+        .iter()
+        .map(|run| run["tier"].clone())
+        .collect();
+    assert_eq!(tiers, [json!("fast"), json!("build")]);
+    // The runner's gate, once per attempt, each on its own run's commit:
+    // red, then green.
+    let gates: Vec<(Value, Value)> = events
+        .iter()
+        .filter(|e| e.kind == EventKind::RunEnded)
+        .map(|e| (e.data["gate"].clone(), e.data["gate_commit"].clone()))
+        .collect();
+    assert_eq!(gates.len(), 2, "{gates:?}\n{printed}");
+    assert_eq!(
+        (&gates[0].0, &gates[1].0),
+        (&json!("failed"), &json!("passed"))
+    );
+    assert_ne!(gates[0].1, gates[1].1, "{gates:?}");
+    let rebased = bench.remote_branch().unwrap();
+    assert_ne!(rebased, first_push);
+    assert_eq!(gates[1].1, json!(rebased));
+    assert!(is_ancestor(&bench, &main, &rebased));
+    let pushed = bench
+        .env
+        .run(
+            &bench.remote.bare,
+            &["show", &format!("{rebased}:AGENTS.md")],
+        )
+        .unwrap();
+    assert_eq!(String::from_utf8(pushed).unwrap(), AGENTS_RESOLVED);
+    assert_eq!(state_of(&bench).repairs(), 1);
+}
+
 /// A rebase pass whose worktree reset stops before its first run moves no
 /// stage and starts no run (OWL-457). A `.lock` beside the ticket's branch
 /// in Owlshift's checkout makes the reset's branch move refuse. It stands
