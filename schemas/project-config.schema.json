@@ -468,6 +468,17 @@
             }
           ]
         },
+        "security_merge": {
+          "description": "Who lifts the merge hold of a question under `security` (OWL-664;\narchitecture section 5, \"Merge on green\", \"A project's choice for\n`security`\"): `person`, the default, a person merges whatever the\nanswer; `answered`, its decider's answer lifts it, a `risky`\nticket's excepted. Read at the base branch's head, as `[forge]\nmerge` is. A file using it requires an Owlshift that reads it.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/SecurityMerge"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "ticket_budget_usd": {
           "description": "A budget, in dollars, on what one ticket's runs cost (OWL-378,\narchitecture section 4, \"Ticket budget\"): every run counted once,\nacross every command and stop, since the ticket's first run or a\nperson's last restart of it; reached, no run of the ticket starts and\nit parks. A positive number. Absent: no budget. Independent of\n`resolver_budget_usd`. A file using it requires an Owlshift that\nreads it.",
           "anyOf": [
@@ -544,6 +555,21 @@
       "additionalProperties": false,
       "required": [
         "rules"
+      ]
+    },
+    "SecurityMerge": {
+      "description": "Who lifts the merge hold of a question under `security`\n(`policy.security_merge`, OWL-664; architecture section 5, \"Merge on\ngreen\", \"A project's choice for `security`\"), read at the base branch's\nhead.",
+      "oneOf": [
+        {
+          "description": "A person merges, whatever the answer. The default.",
+          "type": "string",
+          "const": "person"
+        },
+        {
+          "description": "Its decider's answer lifts it, as it lifts any other floor\nquestion's; a `risky` ticket's excepted.",
+          "type": "string",
+          "const": "answered"
+        }
       ]
     },
     "Stack": {

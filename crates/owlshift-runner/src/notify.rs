@@ -627,6 +627,7 @@ mod tests {
             comment: "c".to_owned(),
             merge: owlshift_core::vocab::MergeSwitch::Never,
             merge_held: None,
+            merge_lifted: None,
         };
         let outcomes = [
             Ok(delivered),

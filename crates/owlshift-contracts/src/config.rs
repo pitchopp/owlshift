@@ -14,7 +14,7 @@ use owlshift_core::decider::ZoneOwners;
 use owlshift_core::gate::{GatePolicy, PassLimit, ResolverPolicy, usd_micros};
 use owlshift_core::reply::DEFAULT_QUIET_WINDOW;
 use owlshift_core::resource::NamedResources;
-use owlshift_core::vocab::{DelegationLevel, MergeMethod, MergeSwitch, Overlap};
+use owlshift_core::vocab::{DelegationLevel, MergeMethod, MergeSwitch, Overlap, SecurityMerge};
 use schemars::JsonSchema;
 use semver::{Version, VersionReq};
 use serde::{Deserialize, Serialize};
@@ -767,6 +767,14 @@ pub struct Policy {
     /// file using it requires an Owlshift that reads it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub claims: Option<Claims>,
+    /// Who lifts the merge hold of a question under `security` (OWL-664;
+    /// architecture section 5, "Merge on green", "A project's choice for
+    /// `security`"): `person`, the default, a person merges whatever the
+    /// answer; `answered`, its decider's answer lifts it, a `risky`
+    /// ticket's excepted. Read at the base branch's head, as `[forge]
+    /// merge` is. A file using it requires an Owlshift that reads it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub security_merge: Option<SecurityMerge>,
 }
 
 /// `policy.claims` (OWL-586): where a ticket's claim lives.
@@ -961,6 +969,11 @@ impl Policy {
     /// The project's `base_repair` (OWL-622), `true` when absent.
     pub fn base_repair(&self) -> bool {
         self.base_repair.unwrap_or(true)
+    }
+
+    /// The project's `security_merge` (OWL-664), `person` when absent.
+    pub fn security_merge(&self) -> SecurityMerge {
+        self.security_merge.unwrap_or_default()
     }
 
     /// The project's capacity (OWL-401): the project's `max_in_flight`, or
@@ -2291,6 +2304,22 @@ mod tests {
         assert!(error.contains("base_repair"), "{error}");
     }
 
+    /// OWL-664: `policy.security_merge`, `person` when absent, `answered`
+    /// read back, any other word refused naming the key.
+    #[test]
+    fn the_security_merge_is_a_policy_key_person_by_default() {
+        let absent = project("", "").unwrap();
+        assert_eq!(absent.policy.security_merge(), SecurityMerge::Person);
+        assert!(!absent.render().contains("security_merge"));
+        let answered = project("", "security_merge = \"answered\"").unwrap();
+        assert_eq!(answered.policy.security_merge(), SecurityMerge::Answered);
+        assert_eq!(ProjectConfig::parse(&answered.render()).unwrap(), answered);
+        let error = project("", "security_merge = \"always\"")
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("security_merge"), "{error}");
+    }
+
     #[test]
     fn the_quiet_window_is_a_policy_key_with_a_default_and_a_range() {
         let absent = project("", "").unwrap();
@@ -2314,6 +2343,7 @@ mod tests {
             overlap: None,
             base_repair: None,
             claims: None,
+            security_merge: None,
         };
         assert_eq!(built.quiet_window(), Duration::from_secs(60));
         // `claims` (OWL-586): local when absent, remote when set.

@@ -616,6 +616,9 @@ pub struct Delivered {
     /// Why merge on green will not merge it, when a question of the ticket
     /// keeps it for a person (OWL-464): `None` under `never`.
     pub merge_held: Option<String>,
+    /// The `security` questions whose hold their decider's answer lifted,
+    /// when none holds (OWL-664): `None` under `never`.
+    pub merge_lifted: Option<String>,
 }
 
 impl fmt::Display for Delivered {
@@ -629,8 +632,13 @@ impl fmt::Display for Delivered {
             Some(Verdict::NotOpen) => "the pull request is not open",
             None => "could not be read",
         };
-        let merges = crate::writer::merges_on_green(self.merge, self.merge_held.as_deref(), "it")
-            .unwrap_or_else(|| "Owlshift never merges: review and merge it.".to_owned());
+        let merges = crate::writer::merges_on_green(
+            self.merge,
+            self.merge_held.as_deref(),
+            self.merge_lifted.as_deref(),
+            "it",
+        )
+        .unwrap_or_else(|| "Owlshift never merges: review and merge it.".to_owned());
         write!(
             f,
             "Delivered: pull request #{} {} ({}), checks {verdict}; the delivery report is on \
@@ -3532,6 +3540,7 @@ impl OnDemand<'_> {
                         merging,
                         (None, None),
                         None,
+                        Data::new(),
                         sink,
                     );
                 }
@@ -7412,14 +7421,15 @@ impl OnDemand<'_> {
         let mut following = Following::default();
         let comment =
             self.post_and_settle(p, &watching, kept, checks, &done, &mut following, sink)?;
-        let (merge, merge_held) = crate::merge::who_merges(self, &p.base, &p.questions());
+        let (merge, said) = self.who_merges(p);
         Ok(Delivered {
             pull_request,
             opened: opened.opened,
             verdict,
             comment: comment.id,
             merge,
-            merge_held,
+            merge_held: said.held,
+            merge_lifted: said.lifted,
         })
     }
 
@@ -9407,15 +9417,28 @@ impl OnDemand<'_> {
         let verdict = checks_read.as_ref().ok().map(CheckSet::verdict);
         let done = format!("the {what} {commit} was pushed and kept");
         let comment = self.post_and_settle(p, &state, kept, checks_read, &done, following, sink)?;
-        let (merge, merge_held) = crate::merge::who_merges(self, &p.base, &p.questions());
+        let (merge, said) = self.who_merges(p);
         Ok(Delivered {
             pull_request,
             opened: false,
             verdict,
             comment: comment.id,
             merge,
-            merge_held,
+            merge_held: said.held,
+            merge_lifted: said.lifted,
         })
+    }
+
+    /// Who merges the pull request this command delivered, as its line says
+    /// it (OWL-464), the ticket's variant read as merge on green reads it,
+    /// from the labels and the intake record this command read (OWL-664).
+    fn who_merges(&self, p: &Prepared) -> (MergeSwitch, crate::merge::MergeSaid) {
+        let variant = crate::merge::merge_variant(
+            &p.found.labels,
+            p.intake.as_ref(),
+            self.config.pipeline.default,
+        );
+        crate::merge::who_merges(self, &p.base, &p.questions(), variant)
     }
 
     /// Posts the DELIVERY report `kept` owes, the delivery the ticket ref
@@ -9473,6 +9496,7 @@ impl OnDemand<'_> {
                 &ticket,
                 &kept,
                 &p.questions(),
+                (Some(&p.found.labels), p.intake.as_ref()),
                 p.plan.as_ref(),
                 p.review.as_ref(),
                 proposals.as_ref(),
@@ -9509,13 +9533,16 @@ impl OnDemand<'_> {
     /// was not kept. Every DELIVERY report is posted here, the first
     /// delivery's and a correction's that pushed nothing included (OWL-236),
     /// so a post retried renders as the first try did. A delivery's report
-    /// names the Verify passes `review` keeps of it (OWL-304).
+    /// names the Verify passes `review` keeps of it (OWL-304). What it says
+    /// of a `security` hold reads the ticket's variant from `labels`, read
+    /// from the tracker when not given, and its `intake` record (OWL-664).
     #[allow(clippy::too_many_arguments)]
     fn post_owed(
         &self,
         ticket: &TicketId,
         delivery: &TicketDelivery,
         questions: &TicketQuestions,
+        (labels, intake): (Option<&[String]>, Option<&TicketIntake>),
         plan: Option<&TicketPlan>,
         review: Option<&TicketReview>,
         proposals: Option<&TicketProposals>,
@@ -9597,6 +9624,26 @@ impl OnDemand<'_> {
             gather(&mut decisions, &kept.notes);
         }
         let merge = crate::merge::switch_at_push(self, delivery);
+        // The variant matters under `policy.security_merge = "answered"`
+        // alone, where the labels, when not given, are read now; a read
+        // that fails reads none, for these words only: watch's merge pass
+        // reads them itself (OWL-664).
+        let variant = || {
+            let read;
+            let labels = match labels {
+                Some(labels) => labels,
+                None => {
+                    read = self
+                        .tracker
+                        .ticket(ticket)
+                        .map(|found| found.labels)
+                        .unwrap_or_default();
+                    &read
+                }
+            };
+            crate::merge::merge_variant(labels, intake, self.config.pipeline.default)
+        };
+        let said = crate::merge::held_at_delivery(self, merge, variant, questions);
         let report = DeliveryReport {
             ticket: ticket.clone(),
             summary,
@@ -9638,9 +9685,11 @@ impl OnDemand<'_> {
             }),
             // Who merges, as the project file reads at the base of the push
             // (OWL-445), and the question or the steps owed that keep it for
-            // a person (OWL-464, OWL-619).
-            merge,
-            merge_held: crate::merge::held_at_delivery(self, merge, questions),
+            // a person (OWL-464, OWL-619), or the `security` holds an answer
+            // lifted (OWL-664).
+            merge: merge.switch,
+            merge_held: said.held,
+            merge_lifted: said.lifted,
             // A delivery's report lists the steps its ticket owes a person
             // (OWL-619); a repair's does not repeat them.
             person_steps: match owed.kind {
@@ -9791,6 +9840,7 @@ impl OnDemand<'_> {
                 ticket,
                 delivery,
                 &record.questions,
+                (None, record.intake.as_ref()),
                 record.plan.as_ref(),
                 record.review.as_ref(),
                 proposals,

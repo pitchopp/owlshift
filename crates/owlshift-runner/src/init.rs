@@ -267,6 +267,11 @@ always_human = []
 # across its commands; reached, the ticket parks until a person restarts it.
 # A positive number. Default: none, no budget.
 # ticket_budget_usd = 100.0
+# Who lifts the merge hold of a question asked under `security`: \"person\" (a
+# person merges, whatever the answer) or \"answered\" (merge on green merges
+# once its decider answered it; a `risky` ticket's still waits for a person).
+# Read at the default branch's head. Default: `\"person\"`.
+# security_merge = \"person\"
 
 # The forge. Merge on green: the runner merges a pull request it follows,
 # once green, into the default branch; read at that branch's head, never
@@ -1575,6 +1580,7 @@ mod tests {
                 policy.base_repair(),
                 policy.claims(),
                 policy.resolver(),
+                policy.security_merge(),
                 pipeline.findings(),
                 pipeline.codex_reviewer(),
                 (forge.merge(), forge.merge_method(), forge.reviewers),
@@ -1589,6 +1595,7 @@ mod tests {
         policy.claims = None;
         policy.resolver_delegation = None;
         policy.resolver_passes = None;
+        policy.security_merge = None;
         config.pipeline.findings = None;
         config.pipeline.codex_reviewer = None;
         (decided, config)
@@ -1614,6 +1621,7 @@ mod tests {
                     "claims",
                     "resolver_delegation",
                     "resolver_passes",
+                    "security_merge",
                     "merge",
                     "merge_method",
                 ],

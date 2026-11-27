@@ -449,6 +449,31 @@ impl MergeMethod {
     }
 }
 
+/// Who lifts the merge hold of a question under `security`
+/// (`policy.security_merge`, OWL-664; architecture section 5, "Merge on
+/// green", "A project's choice for `security`"), read at the base branch's
+/// head.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum SecurityMerge {
+    /// A person merges, whatever the answer. The default.
+    #[default]
+    Person,
+    /// Its decider's answer lifts it, as it lifts any other floor
+    /// question's; a `risky` ticket's excepted.
+    Answered,
+}
+
+impl SecurityMerge {
+    /// The name the project file writes.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Person => "person",
+            Self::Answered => "answered",
+        }
+    }
+}
+
 /// Whether two of the project's tickets may hold the same file
 /// (`policy.overlap`, OWL-449; architecture section 5, "Tolerated
 /// overlap"), read at the base branch's head.
