@@ -10162,6 +10162,7 @@ Reply `Q1: B`, `ok` to take every recommendation, or in your own words.
             at_review: true,
             draft: false,
             something_due: false,
+            overlap: None,
         };
         let read = Read {
             state: CorePrState::Open,

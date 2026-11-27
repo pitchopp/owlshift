@@ -91,9 +91,10 @@ struct FakeGitHub {
     followed: Mutex<Followed>,
     /// Watch's reads of the pull request so far.
     follow_reads: Mutex<u32>,
-    /// The read of the pull request, by its count, that finds its check
-    /// still running, once (OWL-499).
-    pending_follow_read: Mutex<Option<u32>>,
+    /// The reads of the pull request, by their count, that find its check
+    /// still running (OWL-499): one read, or every read from one on until a
+    /// scenario clears it (OWL-654).
+    pending_follow_reads: Mutex<std::ops::Range<u32>>,
     /// Reads of the base branch's checks so far.
     base_reads: Mutex<u32>,
     /// The status the red job's log answers (OWL-112), and how many times
@@ -378,7 +379,7 @@ impl FakeGitHub {
                 *reads += 1;
                 *reads
             };
-            let pending = *self.pending_follow_read.lock().unwrap() == Some(reads);
+            let pending = self.pending_follow_reads.lock().unwrap().contains(&reads);
             let (status, conclusion) = if pending {
                 ("IN_PROGRESS", Value::Null)
             } else {
@@ -1535,7 +1536,7 @@ impl Bench {
             stale_reads: Mutex::new(0),
             followed: Mutex::default(),
             follow_reads: Mutex::new(0),
-            pending_follow_read: Mutex::new(None),
+            pending_follow_reads: Mutex::new(0..0),
             base_reads: Mutex::new(0),
             log: Mutex::new((200, 0)),
             at_checks: Mutex::new(None),

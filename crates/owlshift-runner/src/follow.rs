@@ -184,9 +184,7 @@ impl Fresh {
 /// Reads pull request `number` of `delivery`, whose last push is `pushed`,
 /// and decides on it by the core's table, reading the base branch when the
 /// table needs it. `failing_for` gives how long ago a failure was first read
-/// on the head read. `overlap` is the base head that changes a path one of
-/// the ticket's overlaps names, when the caller found one
-/// ([`crate::held::base_moved_on`], OWL-449). The re-run the ref keeps of
+/// on the head read. The re-run the ref keeps of
 /// the head read counts from `now` (OWL-513). Watch's look and a repair's
 /// read under the lock (OWL-112) both read through it.
 pub fn read(
@@ -195,7 +193,6 @@ pub fn read(
     number: u64,
     pushed: &str,
     mut failing_for: impl FnMut(&Read) -> Option<Duration>,
-    overlap: Option<&str>,
     now: Timestamp,
 ) -> Result<Fresh, owlshift_adapters::forge::Error> {
     let PullRequestRead { checks, .. } = forge.follow(number)?;
@@ -203,7 +200,7 @@ pub fn read(
     let kept = rerun_mark(delivery, &core.head, now);
     let followed = Followed {
         rerun: kept.as_ref().map(KeptRerun::mark),
-        ..followed_of(delivery, pushed, overlap)
+        ..followed_of(delivery, pushed)
     };
     let failing_for = failing_for(&core);
     let mut decision = follow::decide(&core, followed, None, failing_for);
@@ -233,17 +230,12 @@ pub fn read(
 }
 
 /// What the core's table follows of `delivery`, whose last push is
-/// `pushed`, with the base head an overlap refreshes onto (OWL-449).
-fn followed_of<'d>(
-    delivery: &'d TicketDelivery,
-    pushed: &'d str,
-    overlap: Option<&'d str>,
-) -> Followed<'d> {
+/// `pushed`.
+fn followed_of<'d>(delivery: &'d TicketDelivery, pushed: &'d str) -> Followed<'d> {
     Followed {
         pushed,
         pushing: delivery.pushing.as_ref().map(|p| p.commit.as_str()),
         rebased_onto: delivery.rebased_onto.as_deref(),
-        overlap,
         rerun: None,
     }
 }
@@ -521,15 +513,12 @@ impl Following {
     /// Returns the look, and the warnings to record now, each once: a spent
     /// budget once per pause, a forge failure once per kind until a read
     /// succeeds, overdue checks once per head.
-    /// `overlap` is the base head an overlap of the ticket refreshes onto,
-    /// when watch found one (OWL-449).
     pub fn look(
         &mut self,
         forge: &GitHubForge,
         ticket: &TicketId,
         delivery: &TicketDelivery,
         now: Timestamp,
-        overlap: Option<&str>,
     ) -> (Look, Vec<Warning>) {
         let mut warnings = Vec::new();
         let (pr, pushed) = match self.readable(delivery, now) {
@@ -537,7 +526,7 @@ impl Following {
             Err(look) => return (*look, warnings),
         };
         let failing = |core: &Read| self.failing_for(ticket, core, now);
-        let fresh = match read(forge, delivery, pr.number, pushed, failing, overlap, now) {
+        let fresh = match read(forge, delivery, pr.number, pushed, failing, now) {
             Ok(fresh) => fresh,
             Err(error) => return self.failed(ticket, &error, now, warnings),
         };
@@ -591,12 +580,7 @@ impl Following {
             Ok(PullRequestRead { checks, .. }) => checks,
             Err(error) => return self.failed(ticket, &error, now, warnings),
         };
-        let decision = follow::decide(
-            &read_of(&checks),
-            followed_of(delivery, pushed, None),
-            None,
-            None,
-        );
+        let decision = follow::decide(&read_of(&checks), followed_of(delivery, pushed), None, None);
         let fresh = Fresh {
             checks,
             base: None,
@@ -1735,18 +1719,18 @@ mod tests {
         let mut following = Following::default();
         let d = delivery();
         canned.push(pr("OPEN", PUSHED, "MERGEABLE", &[("ci", "SUCCESS")]));
-        let green = seen(following.look(&forge, &ticket(), &d, at(0), None));
+        let green = seen(following.look(&forge, &ticket(), &d, at(0)));
         assert_eq!(
             following.events(&ticket(), &green).unwrap()["watch"],
             "read"
         );
         canned.push(pr("OPEN", PUSHED, "MERGEABLE", &[("ci", "SUCCESS")]));
-        let again = seen(following.look(&forge, &ticket(), &d, at(1), None));
+        let again = seen(following.look(&forge, &ticket(), &d, at(1)));
         assert_eq!(following.events(&ticket(), &again), None);
 
         canned.push(pr("OPEN", PUSHED, "MERGEABLE", &[("ci", "FAILURE")]));
         canned.push(base(&[("ci", "SUCCESS")]));
-        let red = seen(following.look(&forge, &ticket(), &d, at(2), None));
+        let red = seen(following.look(&forge, &ticket(), &d, at(2)));
         let event = following.events(&ticket(), &red).unwrap();
         assert_eq!(
             (&event["watch"], &event["verdict"], &event["action"]),
@@ -1754,14 +1738,14 @@ mod tests {
         );
         canned.push(pr("OPEN", PUSHED, "CONFLICTING", &[("ci", "FAILURE")]));
         canned.push(base(&[("ci", "SUCCESS")]));
-        let conflicting = seen(following.look(&forge, &ticket(), &d, at(3), None));
+        let conflicting = seen(following.look(&forge, &ticket(), &d, at(3)));
         let event = following.events(&ticket(), &conflicting).unwrap();
         assert_eq!(
             (&event["watch"], &event["action"]),
             (&json!("mergeable"), &json!("rebase"))
         );
         canned.push(pr("MERGED", PUSHED, "UNKNOWN", &[]));
-        let merged = seen(following.look(&forge, &ticket(), &d, at(4), None));
+        let merged = seen(following.look(&forge, &ticket(), &d, at(4)));
         let event = following.events(&ticket(), &merged).unwrap();
         assert_eq!(
             (&event["watch"], &event["reason"]),
@@ -1787,10 +1771,10 @@ mod tests {
             reset: Some(at(30).as_second()),
             retry_after: None,
         }));
-        let (look, warnings) = following.look(&forge, &ticket(), &delivery(), at(0), None);
+        let (look, warnings) = following.look(&forge, &ticket(), &delivery(), at(0));
         assert_eq!(look, Look::Paused { until: at(30) });
         assert_eq!(warnings[0]["what"], "forge_rate_limited");
-        let (look, warnings) = following.look(&forge, &ticket(), &delivery(), at(29), None);
+        let (look, warnings) = following.look(&forge, &ticket(), &delivery(), at(29));
         assert_eq!(look, Look::Paused { until: at(30) });
         assert!(warnings.is_empty());
         assert_eq!(canned.sent(), 1);
@@ -1799,7 +1783,7 @@ mod tests {
             200,
             r#"{"data":null,"errors":[{"type":"RATE_LIMITED","message":"spent"}]}"#,
         ));
-        let (look, _) = following.look(&forge, &ticket(), &delivery(), at(30), None);
+        let (look, _) = following.look(&forge, &ticket(), &delivery(), at(30));
         assert_eq!(look, Look::Paused { until: at(35) });
     }
 
@@ -1811,15 +1795,15 @@ mod tests {
         for _ in 0..2 {
             canned.push(Response::new(502, "<html>"));
         }
-        let (_, first) = following.look(&forge, &ticket(), &delivery(), at(0), None);
-        let (look, second) = following.look(&forge, &ticket(), &delivery(), at(1), None);
+        let (_, first) = following.look(&forge, &ticket(), &delivery(), at(0));
+        let (look, second) = following.look(&forge, &ticket(), &delivery(), at(1));
         assert_eq!(first.len(), 1);
         assert!(second.is_empty());
         assert!(matches!(look, Look::Unread { kind: "other", .. }));
         canned.push(pr("OPEN", PUSHED, "MERGEABLE", &[]));
-        following.look(&forge, &ticket(), &delivery(), at(2), None);
+        following.look(&forge, &ticket(), &delivery(), at(2));
         canned.push(Response::new(502, "<html>"));
-        let (_, third) = following.look(&forge, &ticket(), &delivery(), at(3), None);
+        let (_, third) = following.look(&forge, &ticket(), &delivery(), at(3));
         assert_eq!(third.len(), 1);
     }
 

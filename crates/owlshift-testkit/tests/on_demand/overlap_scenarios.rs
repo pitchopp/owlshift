@@ -7,6 +7,7 @@
 
 use owlshift_contracts::refs::{Ended, EndedWhy, TicketHeld};
 
+use super::merge_scenarios::{github_merges, later, merged_comments};
 use super::verify_scenarios::{fixed_build, found, ruled};
 use super::*;
 
@@ -48,9 +49,14 @@ fn overlapping_with(files: &[(&str, &str)], verifying: bool, policy: &str) -> Be
 /// overlap recorded by DEMO-2's admission when `theirs`, else by DEMO-1's
 /// own record, which the refresh reads all the same.
 fn merged_sibling(bench: &Bench, paths: &[&str], theirs: bool) {
+    merged_sibling_as(bench, "DEMO-2", paths, theirs);
+}
+
+/// [`merged_sibling`] for the sibling `sibling` (OWL-654).
+fn merged_sibling_as(bench: &Bench, sibling: &str, paths: &[&str], theirs: bool) {
     let env = bench.env.clone();
     let git = Git::with_setup("git", move |command| env.apply(command));
-    let (demo1, demo2) = (ticket(), TicketId::new("DEMO-2").unwrap());
+    let (demo1, demo2) = (ticket(), TicketId::new(sibling).unwrap());
     let paths: Vec<String> = paths.iter().map(|path| (*path).to_owned()).collect();
     let at = bench.clock.get();
     let mut record = bench.record();
@@ -1018,6 +1024,349 @@ fn a_clean_refresh_runs_no_gate_and_merges_on_green() {
     assert_eq!(
         merges,
         [json!({ "sha": merge, "merge_method": "squash" })],
+        "{report}"
+    );
+}
+
+/// A second change to `AGENTS.md` after [`AGENTS_PREPENDED`], which merges
+/// with DEMO-1's line cleanly too (OWL-654).
+const AGENTS_PREPENDED_TWICE: &str =
+    "Read the design first.\nRead the records too.\nSign off every commit (`git commit -s`).\n";
+
+/// The project files of OWL-654's scenarios: overlaps tolerated, and
+/// `[forge] merge` set to `switch`.
+fn rebase_and_merge(switch: &str) -> String {
+    format!("overlap = \"rebase\"\n[forge]\nmerge = \"{switch}\"\n")
+}
+
+/// The `refresh_owed` waits told (OWL-654).
+fn refresh_waits(bench: &Bench) -> Vec<Value> {
+    watch_waits(bench)
+        .into_iter()
+        .filter(|wait| wait["reason"] == "refresh_owed")
+        .collect()
+}
+
+/// `owlshift why DEMO-1` now.
+fn why_now(bench: &Bench) -> String {
+    owlshift_runner::why::render(
+        &owlshift_runner::why::gather(
+            &bench.data,
+            &bench.dirs(),
+            REPO,
+            Some(ticket()),
+            2,
+            &[],
+            bench.clock.get(),
+        )
+        .unwrap(),
+    )
+}
+
+/// OWL-654, the ticket's acceptance: DEMO-1, delivered under merge on
+/// green, waits for its decider, a red fix run having asked
+/// (`NeedsInput { return_to: Watch }`), while DEMO-2 and DEMO-3, which
+/// share `AGENTS.md` with it, merge one after the other, each changing that
+/// file cleanly. Watch reads DEMO-1 only for an end then, and runs no
+/// refresh: it tells the owed refresh, onto each new base head, as waiting
+/// for the decider's answer, and `owlshift why` shows it. Before OWL-654
+/// the decider's wait ran no refresh either, watch not following a ticket
+/// whose round waits; the refreshes it saved were those of each sibling
+/// merge while the pull request is followed (below). After the answer,
+/// exactly one refresh runs, onto `main`'s latest head, and the rebased
+/// head merges on green after two green reads.
+#[test]
+fn two_siblings_merging_while_the_decider_is_asked_get_one_refresh_after_the_answer() {
+    let bench = overlapping_with(
+        &[("AGENTS.md", AGENTS_APPENDED)],
+        false,
+        &rebase_and_merge("all"),
+    );
+    asked_at_watch(&bench);
+    merged_sibling_as(&bench, "DEMO-2", &["AGENTS.md"], true);
+    merged_sibling_as(&bench, "DEMO-3", &["AGENTS.md"], true);
+    bench.github.followed.lock().unwrap().conclusion = "SUCCESS";
+    let first = bench.merge_into_main(&[("AGENTS.md", AGENTS_PREPENDED)]);
+    let (mut second, mut told, mut shown, mut status) = (None, Vec::new(), String::new(), None);
+    let mut pass = 0;
+    let (outcomes, lines, printed) = bench.watch_during(
+        vec![bench.reply(
+            None,
+            Some(&check(&[("Q1", "answered", "The variable is set.")])),
+        )],
+        Vec::new(),
+        &mut |_| {
+            pass += 1;
+            match pass {
+                1 => second = Some(bench.merge_into_main(&[("AGENTS.md", AGENTS_PREPENDED_TWICE)])),
+                2 => {
+                    told = refresh_waits(&bench);
+                    shown = why_now(&bench);
+                    status = Some(state_of(&bench).status());
+                    assert!(rebase_runs(&bench).is_empty());
+                    bench.answer("Q1: Set, and the check re-run. Go.\n");
+                }
+                _ => later(&bench.clock),
+            }
+            pass < 12 && merged_comments(&bench).is_empty()
+        },
+    );
+    let report = format!("{outcomes:?}\n{lines}\n{printed}");
+    let second = second.unwrap();
+    assert_eq!(
+        status,
+        Some(Status::NeedsInput {
+            return_to: Stage::Watch
+        }),
+        "{report}"
+    );
+    // Told once per base head, waiting for the decider's answer.
+    let onto: Vec<&Value> = told.iter().map(|wait| &wait["onto"]).collect();
+    assert_eq!(onto, [&json!(first), &json!(second)], "{told:?}\n{report}");
+    for wait in &told {
+        assert_eq!(wait["until"], "question", "{report}");
+    }
+    let short = &second[..7];
+    assert!(
+        shown.contains(&format!(
+            "pull request #1 owes a refresh rebase onto `{short}`, whose base changed a path it \
+             shares with another ticket: it waits until its decider answers its question, then \
+             rebases once onto the base head of that moment"
+        )),
+        "{shown}\n{report}"
+    );
+    // The clean refresh is the runner's merge, one, onto `main`'s latest head (OWL-655).
+    let runs = refreshes_merged(&bench);
+    assert_eq!(runs.len(), 1, "{runs:?}\n{report}");
+    assert_eq!(
+        (&runs[0]["cause"], &runs[0]["onto"]),
+        (&json!("overlap"), &json!(second)),
+        "{report}"
+    );
+    let head = bench.remote_branch().unwrap();
+    assert!(is_ancestor(&bench, &second, &head), "{report}");
+    let merges = github_merges(&bench);
+    assert_eq!(merges.len(), 1, "{merges:?}\n{report}");
+    assert_eq!(merges[0]["sha"], json!(head), "{report}");
+    assert_eq!(merged_comments(&bench).len(), 1, "{report}");
+}
+
+/// OWL-654, the saving the ticket measured: DEMO-1, delivered under merge
+/// on green, is followed at Watch while its checks run, and DEMO-2 then
+/// DEMO-3, which share `AGENTS.md` with it, merge one after the other,
+/// each changing that file cleanly. Before OWL-654 each merge ran its own
+/// refresh at the next read; now no rebase runs while the checks run, the
+/// owed refresh told onto each new base head as waiting for them. Once
+/// they read green, exactly one refresh runs, onto `main`'s latest head,
+/// and the rebased head merges on green.
+#[test]
+fn two_siblings_merging_while_the_checks_run_get_one_refresh_onto_the_latest_base() {
+    let bench = overlapping_with(
+        &[("AGENTS.md", AGENTS_APPENDED)],
+        false,
+        &rebase_and_merge("all"),
+    );
+    merged_sibling_as(&bench, "DEMO-2", &["AGENTS.md"], true);
+    merged_sibling_as(&bench, "DEMO-3", &["AGENTS.md"], true);
+    bench.github.followed.lock().unwrap().conclusion = "SUCCESS";
+    *bench.github.pending_follow_reads.lock().unwrap() = 0..u32::MAX;
+    let first = bench.merge_into_main(&[("AGENTS.md", AGENTS_PREPENDED)]);
+    let (mut second, mut held) = (None, None);
+    let mut pass = 0;
+    let (outcomes, lines, printed) = bench.watch_during(Vec::new(), Vec::new(), &mut |_| {
+        pass += 1;
+        match pass {
+            1 => second = Some(bench.merge_into_main(&[("AGENTS.md", AGENTS_PREPENDED_TWICE)])),
+            3 => {
+                held = Some((refreshes_merged(&bench).len(), refresh_waits(&bench)));
+                *bench.github.pending_follow_reads.lock().unwrap() = 0..0;
+            }
+            _ => {}
+        }
+        later(&bench.clock);
+        pass < 12 && merged_comments(&bench).is_empty()
+    });
+    let report = format!("{outcomes:?}\n{lines}\n{printed}");
+    let second = second.unwrap();
+    let (ran, told) = held.unwrap();
+    assert_eq!(ran, 0, "{report}");
+    // Told once per base head, waiting for the checks.
+    let onto: Vec<&Value> = told.iter().map(|wait| &wait["onto"]).collect();
+    assert_eq!(onto, [&json!(first), &json!(second)], "{told:?}\n{report}");
+    for wait in &told {
+        assert_eq!(wait["until"], "checks", "{report}");
+    }
+    // The clean refresh is the runner's merge, one, onto the latest base (OWL-655).
+    let refreshed = refreshes_merged(&bench);
+    assert_eq!(refreshed.len(), 1, "{refreshed:?}\n{report}");
+    assert_eq!(
+        (&refreshed[0]["cause"], &refreshed[0]["onto"]),
+        (&json!("overlap"), &json!(second)),
+        "{report}"
+    );
+    let head = bench.remote_branch().unwrap();
+    assert!(is_ancestor(&bench, &second, &head), "{report}");
+    let merges = github_merges(&bench);
+    assert_eq!(merges.len(), 1, "{merges:?}\n{report}");
+    assert_eq!(merges[0]["sha"], json!(head), "{report}");
+}
+
+/// OWL-654, decided Q1 and Q2: under `[forge] merge = "never"` a refresh
+/// owed while the pull request's checks still run waits for them, told as
+/// such; once they read green, one refresh runs onto the sibling's head. A
+/// later sibling merge on the shared path, the pull request waiting for the
+/// person, makes it owed again: a second refresh. Nothing is merged.
+#[test]
+fn under_never_an_owed_refresh_waits_for_the_checks_and_is_owed_again_after_a_later_sibling() {
+    let bench = overlapping(&[("AGENTS.md", AGENTS_APPENDED)], false);
+    merged_sibling(&bench, &["AGENTS.md"], true);
+    *bench.github.pending_follow_reads.lock().unwrap() = 0..u32::MAX;
+    let first = bench.merge_into_main(&[("AGENTS.md", AGENTS_PREPENDED)]);
+    let (mut held, mut second) = (None, None);
+    let mut pass = 0;
+    let (outcomes, lines, printed) = bench.watch_during(Vec::new(), Vec::new(), &mut |_| {
+        pass += 1;
+        match pass {
+            2 => {
+                held = Some((refreshes_merged(&bench).len(), refresh_waits(&bench)));
+                *bench.github.pending_follow_reads.lock().unwrap() = 0..0;
+            }
+            // The refresh ran and its head was read green.
+            5 => second = Some(bench.merge_into_main(&[("AGENTS.md", AGENTS_PREPENDED_TWICE)])),
+            _ => {}
+        }
+        later(&bench.clock);
+        pass < 9
+    });
+    let report = format!("{outcomes:?}\n{lines}\n{printed}");
+    let (ran, told) = held.unwrap();
+    assert_eq!(ran, 0, "{report}");
+    assert_eq!(told.len(), 1, "{told:?}\n{report}");
+    assert_eq!(
+        (&told[0]["onto"], &told[0]["until"]),
+        (&json!(first), &json!("checks")),
+        "{report}"
+    );
+    // Each refresh is the runner's merge, onto each base head (OWL-655).
+    let runs = refreshes_merged(&bench);
+    let onto: Vec<(&Value, &Value)> = runs
+        .iter()
+        .map(|run| (&run["cause"], &run["onto"]))
+        .collect();
+    let second = second.unwrap();
+    assert_eq!(
+        onto,
+        [
+            (&json!("overlap"), &json!(first)),
+            (&json!("overlap"), &json!(second))
+        ],
+        "{report}"
+    );
+    assert!(github_merges(&bench).is_empty(), "{report}");
+}
+
+/// OWL-654, decided Q1: under `[forge] merge = "labeled"`, the ticket
+/// without the label, a sibling's merge on the shared path gets one refresh
+/// once the pull request reads green, then nothing more: no merge, and
+/// `continue` says the next pass would not merge it for the label.
+#[test]
+fn labeled_without_its_label_gets_one_refresh_once_ready() {
+    let bench = overlapping_with(
+        &[("AGENTS.md", AGENTS_APPENDED)],
+        false,
+        &rebase_and_merge("labeled"),
+    );
+    merged_sibling(&bench, &["AGENTS.md"], true);
+    let main = bench.merge_into_main(&[("AGENTS.md", AGENTS_PREPENDED)]);
+    let mut pass = 0;
+    let (outcomes, lines, printed) = bench.watch_during(Vec::new(), Vec::new(), &mut |_| {
+        pass += 1;
+        later(&bench.clock);
+        pass < 5
+    });
+    let report = format!("{outcomes:?}\n{lines}\n{printed}");
+    // The base change is clean, so the refresh is the runner's merge, not a run (OWL-655).
+    let refreshed = refreshes_merged(&bench);
+    assert_eq!(refreshed.len(), 1, "{refreshed:?}\n{report}");
+    assert_eq!(refreshed[0]["onto"], json!(main), "{report}");
+    assert!(rebase_runs(&bench).is_empty(), "{report}");
+    let read_green_first = data_of(&bench.events(), EventKind::Decision, "watch")
+        .into_iter()
+        .take_while(|data| data["watch"] != "refresh_merged")
+        .any(|data| data["verdict"] == json!("green"));
+    assert!(read_green_first, "{report}");
+    assert!(github_merges(&bench).is_empty(), "{report}");
+}
+
+/// OWL-654: `owlshift continue` on a green pull request that owes a refresh
+/// runs none: its merge note says the refresh comes first, and watch's next
+/// pass runs it.
+#[test]
+fn continue_names_an_owed_refresh_and_runs_none() {
+    let bench = overlapping_with(
+        &[("AGENTS.md", AGENTS_APPENDED)],
+        false,
+        &rebase_and_merge("all"),
+    );
+    merged_sibling(&bench, &["AGENTS.md"], true);
+    bench.merge_into_main(&[("AGENTS.md", AGENTS_PREPENDED)]);
+    let (outcome, printed) = bench.continue_ticket(Vec::new());
+    let report = format!("{outcome:?}\n{printed}");
+    assert!(
+        matches!(&outcome, Err(Stop::Watched { merge: Some(note), .. })
+            if note.contains("a refresh rebase onto the base comes first")),
+        "{report}"
+    );
+    assert!(rebase_runs(&bench).is_empty(), "{report}");
+}
+
+/// OWL-654: a red read after a sibling's merge on the shared path gets its
+/// fix run as before, with no refresh first. Its push records the base it
+/// went onto, which holds the sibling's change, so no refresh is owed any
+/// more, and under merge on green the fixed head merges once read green
+/// twice.
+#[test]
+fn a_fix_push_onto_a_base_holding_the_siblings_change_clears_the_owed_refresh() {
+    let bench = overlapping_with(
+        &[("AGENTS.md", AGENTS_APPENDED)],
+        false,
+        &rebase_and_merge("all"),
+    );
+    merged_sibling(&bench, &["AGENTS.md"], true);
+    let main = bench.merge_into_main(&[("AGENTS.md", AGENTS_PREPENDED)]);
+    bench.github.followed.lock().unwrap().conclusion = "FAILURE";
+    let github = bench.github.clone();
+    let mut pass = 0;
+    let (outcomes, lines, printed) = bench.watch(
+        vec![bench.reply(Some("Hello again"), Some(FIXED))],
+        &mut |_| {
+            pass += 1;
+            if pass == 1 {
+                github.followed.lock().unwrap().conclusion = "SUCCESS";
+            }
+            later(&bench.clock);
+            pass < 6 && github_merges(&bench).is_empty()
+        },
+    );
+    let report = format!("{outcomes:?}\n{lines}\n{printed}");
+    let roles: Vec<Role> = bench.briefs().iter().map(|brief| brief.role).collect();
+    assert_eq!(
+        roles.iter().filter(|role| **role == Role::Build).count(),
+        2,
+        "{roles:?}\n{report}"
+    );
+    assert!(rebase_runs(&bench).is_empty(), "{report}");
+    let delivery = bench.record().delivery.unwrap();
+    assert_eq!(
+        delivery.base_at_push.as_deref(),
+        Some(main.as_str()),
+        "{report}"
+    );
+    let merges = github_merges(&bench);
+    assert_eq!(merges.len(), 1, "{merges:?}\n{report}");
+    assert_eq!(
+        merges[0]["sha"],
+        json!(bench.remote_branch().unwrap()),
         "{report}"
     );
 }
