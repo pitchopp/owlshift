@@ -156,7 +156,11 @@ pub struct Brief {
     /// or a dependency it named, kept nowhere else; in the design role's,
     /// a design review's, a verifier's and the arbiter's (format 28,
     /// OWL-430), why the previous run of the same role, stage and seat in
-    /// the same command was refused, kept nowhere else. The runner's message, at most
+    /// the same command was refused, kept nowhere else; in the rebase
+    /// role's at Watch (format 34, OWL-669), why the previous attempt of the
+    /// same rebase in the same command was refused, given only when this
+    /// attempt starts from that attempt's rebased commit, kept nowhere else.
+    /// The runner's message, at most
     /// [`MAX_RESULT_REFUSAL_BYTES`]; what it quotes from the refused result
     /// is data. Absent when no such refusal is kept. Since OWL-198 it quotes
     /// no choice kept typed: those are in `refused_choices`.
@@ -1237,10 +1241,9 @@ impl Brief {
     /// `unblock` whose verdicts keep [`UnblockBrief`]'s rules (OWL-620), a
     /// `delegation` level and
     /// the run that asked (`asked_by`, its plan's and diff's bases full
-    /// commit ids), and no other brief has any; only the rebase role's
-    /// brief has no `result_refusal` (since format 28, OWL-430: Build's, the
-    /// answer check's and the resolver's, intake's since format 24, and
-    /// now the design and review roles' have one), of at most [`MAX_RESULT_REFUSAL_BYTES`], and only
+    /// commit ids), and no other brief has any; every role's brief may have
+    /// a `result_refusal` (the rebase role's since format 34, OWL-669), of
+    /// at most [`MAX_RESULT_REFUSAL_BYTES`], and only
     /// Build's, with one, has `decisions_refused`, which `refused_choices`
     /// needs, at most [`MAX_REFUSED_CHOICES`] of them, each text of at most
     /// [`MAX_CHOICE_BYTES`]; the rebase role's brief, and only it, has a
@@ -1417,34 +1420,14 @@ impl Brief {
                 ));
             }
         }
-        if let Some(reason) = &self.result_refusal {
-            // Every role listed, so that a new one takes a side.
-            let told = match self.role {
-                Role::Build
-                | Role::AnswerCheck
-                | Role::Resolver
-                | Role::Intake
-                | Role::Design
-                | Role::DesignReview
-                | Role::Verify
-                | Role::Arbiter => true,
-                Role::Rebase => false,
-            };
-            if !told {
-                return Err(ContractError::invalid(
-                    CONTRACT,
-                    format!(
-                        "a refused result is given but the role is {}, which is never told one",
-                        self.role.as_str()
-                    ),
-                ));
-            }
-            if reason.len() > MAX_RESULT_REFUSAL_BYTES {
-                return Err(ContractError::invalid(
-                    CONTRACT,
-                    format!("the refused result's reason exceeds {MAX_RESULT_REFUSAL_BYTES} bytes"),
-                ));
-            }
+        // Every role may be told, the rebase role since format 34 (OWL-669).
+        if let Some(reason) = &self.result_refusal
+            && reason.len() > MAX_RESULT_REFUSAL_BYTES
+        {
+            return Err(ContractError::invalid(
+                CONTRACT,
+                format!("the refused result's reason exceeds {MAX_RESULT_REFUSAL_BYTES} bytes"),
+            ));
         }
         self.check_quality_pipeline()?;
         if self.delegation.is_some() != (self.role == Role::Resolver) {

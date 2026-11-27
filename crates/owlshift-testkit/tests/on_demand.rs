@@ -10017,6 +10017,128 @@ fn a_rebase_run_runs_no_gate_and_the_runners_red_gate_tells_the_next_attempt() {
     assert_eq!(state_of(&bench).repairs(), 1);
 }
 
+/// A rebase run's `done` with a comma missing after `summary`, as
+/// LOC-2204's fast run wrote on 2026-11-26: the runner refuses it.
+const REBASED_UNPARSABLE: &str = r#"{"format":18,"status":"done","summary":"Rebased onto the base; the conflict kept both sides." "questions":[]}"#;
+
+/// The commit a worktree's `HEAD` names.
+fn worktree_head(env: &GitEnv, worktree: &Path) -> String {
+    let out = env.run(worktree, &["rev-parse", "HEAD"]).unwrap();
+    String::from_utf8(out).unwrap().trim().to_owned()
+}
+
+/// The `refused_retry` of each `rebase_run` decision since `from`
+/// (OWL-669), with its tier.
+fn rebase_attempts(bench: &Bench, from: usize) -> Vec<(Value, Value)> {
+    data_of(&bench.events()[from..], EventKind::Decision, "trivial")
+        .iter()
+        .map(|run| (run["tier"].clone(), run["refused_retry"].clone()))
+        .collect()
+}
+
+/// OWL-669: the fast run rebases and commits, but its `result.json` is
+/// refused. The retry, on the Build routing and counted as one, starts from
+/// that run's rebased commit, told why in `result_refusal`, and does not
+/// rebase again: the runner gates and pushes the refused run's commit.
+#[test]
+fn a_refused_rebase_result_is_retried_from_its_rebased_commit() {
+    let bench = delivered_with_rules();
+    let delivered_events = bench.events().len();
+    let delivered_runs = bench.briefs().len();
+    let first_push = bench.remote_branch().unwrap();
+    let main = bench.merge_into_main(&[("AGENTS.md", AGENTS_MERGED)]);
+    bench.github.followed.lock().unwrap().mergeable = "CONFLICTING";
+    let (_, rebase) = rebase_in(&bench, main.clone(), vec![("AGENTS.md", AGENTS_RESOLVED)]);
+    let kept = Rc::new(RefCell::new(String::new()));
+    let (env, worktree, left) = (bench.env.clone(), bench.worktree(), kept.clone());
+    let first: During = (
+        1,
+        Box::new(move || {
+            rebase();
+            *left.borrow_mut() = worktree_head(&env, &worktree);
+        }),
+    );
+    // The told run finds the rebase done and only writes its result.
+    let (env, worktree, found) = (bench.env.clone(), bench.worktree(), kept.clone());
+    let second: During = (
+        2,
+        Box::new(move || {
+            assert_eq!(worktree_head(&env, &worktree), *found.borrow());
+        }),
+    );
+    let (outcome, printed) = bench.continue_during(
+        vec![
+            bench.reply(None, Some(REBASED_UNPARSABLE)),
+            bench.reply(None, Some(REBASED)),
+        ],
+        vec![first, second],
+    );
+    outcome.unwrap_or_else(|stop| panic!("{stop}\n{printed}"));
+
+    let briefs = &bench.briefs()[delivered_runs..];
+    assert_eq!(briefs.len(), 2, "{printed}");
+    assert!(briefs[0].result_refusal.is_none());
+    let told = briefs[1].result_refusal.as_deref().expect("told why");
+    assert!(told.contains("line 1"), "{told}");
+    assert_eq!(
+        rebase_attempts(&bench, delivered_events),
+        [(json!("fast"), json!(false)), (json!("build"), json!(true))]
+    );
+    // One gate, the told run's, on the refused run's commit, which is pushed.
+    let kept = kept.borrow().clone();
+    let gates: Vec<Value> = bench.events()[delivered_events..]
+        .iter()
+        .filter(|e| e.kind == EventKind::RunEnded && e.data.get("gate") == Some(&json!("passed")))
+        .map(|e| e.data["gate_commit"].clone())
+        .collect();
+    assert_eq!(gates, [json!(kept)], "{printed}");
+    assert_eq!(bench.remote_branch().unwrap(), kept);
+    assert_ne!(kept, first_push);
+    assert!(is_ancestor(&bench, &main, &kept));
+    let state = state_of(&bench);
+    assert_eq!((state.repairs(), state.failed_runs()), (1, 0));
+}
+
+/// OWL-669: a refused rebase result whose run left no rebase keeps today's
+/// retry: from Owlshift's last push, untold, which rebases.
+#[test]
+fn a_refused_rebase_result_without_a_rebase_is_retried_from_the_last_push() {
+    let bench = delivered_with_rules();
+    let delivered_events = bench.events().len();
+    let delivered_runs = bench.briefs().len();
+    let first_push = bench.remote_branch().unwrap();
+    let main = bench.merge_into_main(&[("AGENTS.md", AGENTS_MERGED)]);
+    bench.github.followed.lock().unwrap().mergeable = "CONFLICTING";
+    let (_, rebase) = rebase_in(&bench, main.clone(), vec![("AGENTS.md", AGENTS_RESOLVED)]);
+    let (env, worktree, pushed) = (bench.env.clone(), bench.worktree(), first_push.clone());
+    let second: During = (
+        2,
+        Box::new(move || {
+            assert_eq!(worktree_head(&env, &worktree), pushed);
+            rebase();
+        }),
+    );
+    let (outcome, printed) = bench.continue_during(
+        vec![
+            bench.reply(None, Some(REBASED_UNPARSABLE)),
+            bench.reply(None, Some(REBASED)),
+        ],
+        vec![second],
+    );
+    outcome.unwrap_or_else(|stop| panic!("{stop}\n{printed}"));
+    let briefs = &bench.briefs()[delivered_runs..];
+    assert_eq!(briefs.len(), 2, "{printed}");
+    assert!(briefs.iter().all(|brief| brief.result_refusal.is_none()));
+    assert_eq!(
+        rebase_attempts(&bench, delivered_events),
+        [
+            (json!("fast"), json!(false)),
+            (json!("build"), json!(false))
+        ]
+    );
+    assert!(is_ancestor(&bench, &main, &bench.remote_branch().unwrap()));
+}
+
 /// A rebase pass whose worktree reset stops before its first run moves no
 /// stage and starts no run (OWL-457). A `.lock` beside the ticket's branch
 /// in Owlshift's checkout makes the reset's branch move refuse. It stands

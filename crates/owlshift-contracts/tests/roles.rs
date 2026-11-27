@@ -479,6 +479,29 @@ fn rebase_example_result_parses() {
     example_followups_need_no_repair("rebase.md", blocks[0], &result);
 }
 
+/// OWL-669: the rebase role names the brief fields it reads, a refused
+/// result's reason among them, and says a told attempt does not rebase
+/// again.
+#[test]
+fn rebase_brief_fields_exist() {
+    let text = prompt("rebase.md");
+    brief_fields_exist(
+        "rebase.md",
+        &text,
+        &[
+            "gate",
+            "gate_failure",
+            "result_refusal",
+            "rebase.onto",
+            "rebase.head",
+        ],
+    );
+    assert!(
+        text.contains("Do not rebase again."),
+        "roles/rebase.md tells a told attempt not to rebase again"
+    );
+}
+
 /// A role's example shows its follow-ups in the contract's own shape: none
 /// is dropped by the lenient read, and every `evidence` is a list (OWL-500).
 fn example_followups_need_no_repair(file: &str, example: &str, result: &RunResult) {

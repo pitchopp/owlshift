@@ -349,7 +349,9 @@ pub fn freed_refusal(outcome: &Outcome, brief: &Brief) -> bool {
 /// its own ([`crate::answer_check::event`]); the resolver's refusal is a
 /// fallback, never retried as such (OWL-191); intake's next run is told
 /// (OWL-402) but not freed, its stage being outside the core's
-/// [`Event::ResultRefused`]; the rebase role is told nothing.
+/// [`Event::ResultRefused`]; the rebase role's next attempt at Watch is told
+/// when it starts from the refused run's rebased commit (OWL-669), but not
+/// freed: its retry is the one a rebase's tiers bound.
 pub fn told_retry(role: Role) -> bool {
     match role {
         Role::Build | Role::Design | Role::DesignReview | Role::Verify | Role::Arbiter => true,
@@ -367,7 +369,9 @@ pub fn told_retry(role: Role) -> bool {
 /// check on the same ask, from the ticket ref too (OWL-184); the next
 /// resolver run, likewise ([`resolver::refusal_after`], OWL-191); the next
 /// intake run of the command (OWL-402), and the next design run or review
-/// seat's run of the same retry loop (OWL-430), from the command's memory. A result or an
+/// seat's run of the same retry loop (OWL-430), and the next attempt of a
+/// rebase at Watch that starts from the refused run's rebased commit
+/// (OWL-669), from the command's memory. A result or an
 /// artifact holding the harness's login is a credential failure, never a
 /// refusal, so the reason never quotes it.
 pub fn result_refusal(outcome: &Outcome) -> Option<String> {
@@ -1282,6 +1286,11 @@ fn awaits_input(state: &TicketState) -> bool {
 #[derive(Default)]
 struct Gathered {
     gate_failure: Option<GateFailure>,
+    /// Why the last run's result was refused ([`result_refusal`]), that run
+    /// having broken no isolation; `None` after any other outcome. A rebase
+    /// run's next attempt at Watch starts from its rebased commit, told
+    /// this (OWL-669, [`OnDemand::repair_rebase`]).
+    refused: Option<String>,
     /// The runner's note of late comments given to a run ([`late_decision`]).
     decisions: Vec<Decision>,
     followups: Vec<Followup>,
@@ -4494,7 +4503,9 @@ impl OnDemand<'_> {
     /// too (OWL-210): the run, what it keeps of Build's refused results, the
     /// gate's failure and the follow-ups it gathers for the next brief and
     /// the report, and its core event ([`stage_event`], a quarantine for a
-    /// breach). Only a Build run keeps a refused result for the next one.
+    /// breach). Only a Build run keeps a refused result in the ticket ref;
+    /// any run's is gathered for the next attempt of the same runs
+    /// (`Gathered::refused`, OWL-669).
     /// `setup` is the project's (OWL-330), from the rules the brief was
     /// made with. A Design run at Design and a Build run at Build, but a
     /// repair's, keep a session (OWL-394, [`Self::execute`]).
@@ -4531,6 +4542,11 @@ impl OnDemand<'_> {
         if let Some(gate) = &ran.report.gate {
             gathered.gate_failure = gate.failure.clone();
         }
+        gathered.refused = ran
+            .breaches
+            .is_empty()
+            .then(|| result_refusal(&ran.report.outcome))
+            .flatten();
         let event = if ran.breaches.is_empty() {
             if brief.role == Role::Build {
                 self.keep_build_refusal(p, state, &ran.report.outcome)?;
@@ -7822,6 +7838,10 @@ impl RepairKind {
     }
 }
 
+/// What a repair does before each of its attempts ([`RepairRun::before`]).
+type BeforeAttempt<'r> =
+    dyn Fn(&Prepared, u32, &Gathered, &mut EventSink<'_>) -> Result<(), Stop> + 'r;
+
 /// What a repair's runs need of their kind ([`OnDemand::repair_runs`]).
 struct RepairRun<'r> {
     role: Role,
@@ -7831,8 +7851,10 @@ struct RepairRun<'r> {
     rules: &'r ProjectRules,
     /// The harness of each attempt, from 1.
     harness: &'r dyn Fn(u32) -> &'r dyn Harness,
-    /// Done before each attempt, from 1, before its brief is built.
-    before: &'r dyn Fn(&Prepared, u32, &mut EventSink<'_>) -> Result<(), Stop>,
+    /// Done before each attempt, from 1, before its brief is built, given
+    /// what the runs gathered so far: a rebase run's reads why the last
+    /// attempt's result was refused (`refused`, OWL-669).
+    before: &'r BeforeAttempt<'r>,
     /// What the kind adds to each brief.
     decorate: &'r dyn Fn(&mut Brief, &TicketQuestions),
     /// Whether a `done`'s gated commit is one to push, or why not: a failed
@@ -8307,7 +8329,7 @@ impl OnDemand<'_> {
                 pull_request: pr.number,
                 rules: &dispatched.rules,
                 harness: &build,
-                before: &|_, _, _| Ok(()),
+                before: &|_, _, _, _| Ok(()),
                 decorate: &decorate,
                 accept: &accept,
                 cut: Some(RepairCut {
@@ -8437,7 +8459,7 @@ impl OnDemand<'_> {
         let mut shown = false;
         loop {
             attempt += 1;
-            (run.before)(p, attempt, sink)?;
+            (run.before)(p, attempt, &gathered, sink)?;
             // Working from the runs' start, once the first attempt's `before`
             // was made, so a pass that starts no run leaves the stage as it
             // is (OWL-457); until the repair's end moves it back (OWL-259).
@@ -8704,7 +8726,10 @@ impl OnDemand<'_> {
     /// ([`Self::reset_worktree`]), but for a gate the machine cut: the
     /// rebased commit is kept, nothing counted, the branch back at `pushed`,
     /// and the next rebase onto the same base's first attempt starts from
-    /// that commit and runs its gate alone (OWL-490). A `done` is pushed
+    /// that commit and runs its gate alone (OWL-490). The other exception is
+    /// a refused result whose run left a commit [`rebase_keeps_delivery`]
+    /// takes: the next attempt, counted as any, starts from that commit,
+    /// told why in `result_refusal` (OWL-669). A `done` is pushed
     /// only when its gated commit is a rebase of the delivery onto the base
     /// that keeps its change ([`rebase_keeps_delivery`]); the runner pushes
     /// it, leased on `pushed`, never the agent. A non-trivial conflict on a
@@ -8855,11 +8880,35 @@ impl OnDemand<'_> {
         // Whether the last attempt's reset was made: a reset that failed is
         // not made again once the runs stop (OWL-457).
         let reset = std::cell::Cell::new(false);
-        let before = |p: &Prepared, attempt: u32, sink: &mut EventSink<'_>| {
+        // Why the last attempt's result was refused, for the next one's
+        // brief, when that attempt starts from the refused run's rebase
+        // (OWL-669).
+        let retold = std::cell::Cell::new(None::<String>);
+        let before = |p: &Prepared, attempt: u32, gathered: &Gathered, sink: &mut EventSink<'_>| {
             reset.set(false);
             let rebased = restore.take();
-            self.reset_worktree(p, rebased.as_ref().unwrap_or(&pushed_id))?;
+            // A refused result whose run left a rebase that keeps the
+            // delivery: the next attempt starts from that commit, told why,
+            // rather than rebasing again (OWL-669). Any other refused run's
+            // retry starts from `pushed`, untold, as every other attempt.
+            let refused = match (&rebased, &gathered.refused) {
+                (None, Some(reason)) => self
+                    .branch_head(p)
+                    .and_then(|head| CommitId::new(&head).ok())
+                    .filter(|head| {
+                        rebase_keeps_delivery(git, &checkout, &pushed_id, &onto, head).is_ok()
+                    })
+                    .map(|head| (head, reason.clone())),
+                _ => None,
+            };
+            let from = rebased
+                .as_ref()
+                .or(refused.as_ref().map(|(head, _)| head))
+                .unwrap_or(&pushed_id);
+            self.reset_worktree(p, from)?;
             reset.set(true);
+            let refused_retry = refused.is_some();
+            retold.set(refused.map(|(_, reason)| reason));
             sink.emit(
                 &p.ticket,
                 None,
@@ -8869,6 +8918,7 @@ impl OnDemand<'_> {
                     ("pull_request", json!(pr.number)),
                     ("attempt", json!(attempt)),
                     ("gate_only", json!(rebased.is_some())),
+                    ("refused_retry", json!(refused_retry)),
                     ("tier", json!(rebase_tier(fast(attempt)))),
                     ("trivial", json!(classified.trivial)),
                     ("refresh", json!(refresh)),
@@ -8895,6 +8945,7 @@ impl OnDemand<'_> {
         };
         let decorate = |brief: &mut Brief, _: &TicketQuestions| {
             brief.rebase = Some(told.clone());
+            brief.result_refusal = retold.take();
         };
         let accept =
             |commit: &CommitId| rebase_keeps_delivery(git, &checkout, &pushed_id, &onto, commit);
