@@ -9,7 +9,8 @@
 #
 # The second argument names the kind of token, for the report only: `app` (the GitHub App's user token, once the app
 # asks Commit statuses (read and write) and the installation on the repository accepted it), `fine-grained` (a
-# fine-grained personal token with Commit statuses (write) on the repository), or `oauth`. The App's user token is
+# fine-grained personal token with Commit statuses (write) and Contents (read) on the repository: the check reads the
+# default branch's head), or `oauth`. The App's user token is
 # the `access_token` of the keychain entry `owlshift init` wrote, under service `owlshift`, account
 # `github.com/<owner>/<repo>/github-app` of any project signed in through the app:
 #
@@ -109,7 +110,12 @@ echo "  x-accepted-github-permissions: $(header x-accepted-github-permissions)"
 [ "$status" = 201 ] || exit 1
 id=$(jq -r .id "$WORK/body")
 
-status=$(call GET "repos/$REPO/commits/$sha/statuses?per_page=100")
+# GitHub's read can lag its write: a status just set was missing from the first read-back on 2026-11-27 (R3).
+for attempt in 1 2 3 4 5; do
+    status=$(call GET "repos/$REPO/commits/$sha/statuses?per_page=100")
+    [ "$status" = 200 ] && jq -e --argjson id "$id" 'any(.[]; .id == $id)' "$WORK/body" >/dev/null && break
+    [ "$attempt" = 5 ] || sleep 2
+done
 echo "GET /repos/{repo}/commits/{sha}/statuses: HTTP $status"
 jq -r --argjson id "$id" --arg me "$me" '
     [.[] | select(.id == $id)] | first
