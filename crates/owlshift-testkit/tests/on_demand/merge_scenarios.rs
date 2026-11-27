@@ -1362,7 +1362,6 @@ fn a_refresh_that_ran_nothing_is_held_and_told() {
     // finds the check running.
     let reads = *bench.github.follow_reads.lock().unwrap();
     *bench.github.pending_follow_reads.lock().unwrap() = reads + 2..reads + 3;
-    let refresh = refresh_in(&bench);
     let clock = bench.clock.clone();
     let mut pass = 0;
     let (outcomes, lines, printed) = bench.watch_during(Vec::new(), Vec::new(), &mut |_| {

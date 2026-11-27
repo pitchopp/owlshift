@@ -1063,24 +1063,6 @@ fn why_now(bench: &Bench) -> String {
     )
 }
 
-/// The rebase run of a refresh, the `run`th of the command: the delivered
-/// branch replayed onto the remote's `main` as it is when the run works.
-fn replayed_onto_main(bench: &Bench, run: usize) -> During {
-    let (env, worktree, bare) = (
-        bench.env.clone(),
-        bench.worktree(),
-        bench.remote.bare.clone(),
-    );
-    (
-        run,
-        Box::new(move || {
-            let out = env.run(&bare, &["rev-parse", "main"]).unwrap();
-            let main = String::from_utf8(out).unwrap().trim().to_owned();
-            env.run(&worktree, &["rebase", "--quiet", &main]).unwrap();
-        }),
-    )
-}
-
 /// OWL-654, the ticket's acceptance: DEMO-1, delivered under merge on
 /// green, waits for its decider, a red fix run having asked
 /// (`NeedsInput { return_to: Watch }`), while DEMO-2 and DEMO-3, which
@@ -1108,14 +1090,11 @@ fn two_siblings_merging_while_the_decider_is_asked_get_one_refresh_after_the_ans
     let (mut second, mut told, mut shown, mut status) = (None, Vec::new(), String::new(), None);
     let mut pass = 0;
     let (outcomes, lines, printed) = bench.watch_during(
-        vec![
-            bench.reply(
-                None,
-                Some(&check(&[("Q1", "answered", "The variable is set.")])),
-            ),
-            bench.reply(None, Some(REBASED)),
-        ],
-        vec![replayed_onto_main(&bench, 2)],
+        vec![bench.reply(
+            None,
+            Some(&check(&[("Q1", "answered", "The variable is set.")])),
+        )],
+        Vec::new(),
         &mut |_| {
             pass += 1;
             match pass {
@@ -1156,7 +1135,8 @@ fn two_siblings_merging_while_the_decider_is_asked_get_one_refresh_after_the_ans
         )),
         "{shown}\n{report}"
     );
-    let runs = rebase_runs(&bench);
+    // The clean refresh is the runner's merge, one, onto `main`'s latest head (OWL-655).
+    let runs = refreshes_merged(&bench);
     assert_eq!(runs.len(), 1, "{runs:?}\n{report}");
     assert_eq!(
         (&runs[0]["cause"], &runs[0]["onto"]),
@@ -1193,23 +1173,19 @@ fn two_siblings_merging_while_the_checks_run_get_one_refresh_onto_the_latest_bas
     let first = bench.merge_into_main(&[("AGENTS.md", AGENTS_PREPENDED)]);
     let (mut second, mut held) = (None, None);
     let mut pass = 0;
-    let (outcomes, lines, printed) = bench.watch_during(
-        vec![bench.reply(None, Some(REBASED))],
-        vec![replayed_onto_main(&bench, 1)],
-        &mut |_| {
-            pass += 1;
-            match pass {
-                1 => second = Some(bench.merge_into_main(&[("AGENTS.md", AGENTS_PREPENDED_TWICE)])),
-                3 => {
-                    held = Some((rebase_runs(&bench).len(), refresh_waits(&bench)));
-                    *bench.github.pending_follow_reads.lock().unwrap() = 0..0;
-                }
-                _ => {}
+    let (outcomes, lines, printed) = bench.watch_during(Vec::new(), Vec::new(), &mut |_| {
+        pass += 1;
+        match pass {
+            1 => second = Some(bench.merge_into_main(&[("AGENTS.md", AGENTS_PREPENDED_TWICE)])),
+            3 => {
+                held = Some((refreshes_merged(&bench).len(), refresh_waits(&bench)));
+                *bench.github.pending_follow_reads.lock().unwrap() = 0..0;
             }
-            later(&bench.clock);
-            pass < 12 && merged_comments(&bench).is_empty()
-        },
-    );
+            _ => {}
+        }
+        later(&bench.clock);
+        pass < 12 && merged_comments(&bench).is_empty()
+    });
     let report = format!("{outcomes:?}\n{lines}\n{printed}");
     let second = second.unwrap();
     let (ran, told) = held.unwrap();
@@ -1220,10 +1196,11 @@ fn two_siblings_merging_while_the_checks_run_get_one_refresh_onto_the_latest_bas
     for wait in &told {
         assert_eq!(wait["until"], "checks", "{report}");
     }
-    let runs = rebase_runs(&bench);
-    assert_eq!(runs.len(), 1, "{runs:?}\n{report}");
+    // The clean refresh is the runner's merge, one, onto the latest base (OWL-655).
+    let refreshed = refreshes_merged(&bench);
+    assert_eq!(refreshed.len(), 1, "{refreshed:?}\n{report}");
     assert_eq!(
-        (&runs[0]["cause"], &runs[0]["onto"]),
+        (&refreshed[0]["cause"], &refreshed[0]["onto"]),
         (&json!("overlap"), &json!(second)),
         "{report}"
     );
@@ -1247,27 +1224,20 @@ fn under_never_an_owed_refresh_waits_for_the_checks_and_is_owed_again_after_a_la
     let first = bench.merge_into_main(&[("AGENTS.md", AGENTS_PREPENDED)]);
     let (mut held, mut second) = (None, None);
     let mut pass = 0;
-    let (outcomes, lines, printed) = bench.watch_during(
-        vec![
-            bench.reply(None, Some(REBASED)),
-            bench.reply(None, Some(REBASED)),
-        ],
-        vec![replayed_onto_main(&bench, 1), replayed_onto_main(&bench, 2)],
-        &mut |_| {
-            pass += 1;
-            match pass {
-                2 => {
-                    held = Some((rebase_runs(&bench).len(), refresh_waits(&bench)));
-                    *bench.github.pending_follow_reads.lock().unwrap() = 0..0;
-                }
-                // The refresh ran and its head was read green.
-                5 => second = Some(bench.merge_into_main(&[("AGENTS.md", AGENTS_PREPENDED_TWICE)])),
-                _ => {}
+    let (outcomes, lines, printed) = bench.watch_during(Vec::new(), Vec::new(), &mut |_| {
+        pass += 1;
+        match pass {
+            2 => {
+                held = Some((refreshes_merged(&bench).len(), refresh_waits(&bench)));
+                *bench.github.pending_follow_reads.lock().unwrap() = 0..0;
             }
-            later(&bench.clock);
-            pass < 9
-        },
-    );
+            // The refresh ran and its head was read green.
+            5 => second = Some(bench.merge_into_main(&[("AGENTS.md", AGENTS_PREPENDED_TWICE)])),
+            _ => {}
+        }
+        later(&bench.clock);
+        pass < 9
+    });
     let report = format!("{outcomes:?}\n{lines}\n{printed}");
     let (ran, told) = held.unwrap();
     assert_eq!(ran, 0, "{report}");
@@ -1277,7 +1247,8 @@ fn under_never_an_owed_refresh_waits_for_the_checks_and_is_owed_again_after_a_la
         (&json!(first), &json!("checks")),
         "{report}"
     );
-    let runs = rebase_runs(&bench);
+    // Each refresh is the runner's merge, onto each base head (OWL-655).
+    let runs = refreshes_merged(&bench);
     let onto: Vec<(&Value, &Value)> = runs
         .iter()
         .map(|run| (&run["cause"], &run["onto"]))
@@ -1308,26 +1279,20 @@ fn labeled_without_its_label_gets_one_refresh_once_ready() {
     merged_sibling(&bench, &["AGENTS.md"], true);
     let main = bench.merge_into_main(&[("AGENTS.md", AGENTS_PREPENDED)]);
     let mut pass = 0;
-    let (outcomes, lines, printed) = bench.watch_during(
-        vec![bench.reply(None, Some(REBASED))],
-        vec![replayed_onto_main(&bench, 1)],
-        &mut |_| {
-            pass += 1;
-            later(&bench.clock);
-            pass < 5
-        },
-    );
+    let (outcomes, lines, printed) = bench.watch_during(Vec::new(), Vec::new(), &mut |_| {
+        pass += 1;
+        later(&bench.clock);
+        pass < 5
+    });
     let report = format!("{outcomes:?}\n{lines}\n{printed}");
-    let runs = rebase_runs(&bench);
-    assert_eq!(runs.len(), 1, "{runs:?}\n{report}");
-    assert_eq!(
-        (&runs[0]["cause"], &runs[0]["onto"]),
-        (&json!("overlap"), &json!(main)),
-        "{report}"
-    );
+    // The base change is clean, so the refresh is the runner's merge, not a run (OWL-655).
+    let refreshed = refreshes_merged(&bench);
+    assert_eq!(refreshed.len(), 1, "{refreshed:?}\n{report}");
+    assert_eq!(refreshed[0]["onto"], json!(main), "{report}");
+    assert!(rebase_runs(&bench).is_empty(), "{report}");
     let read_green_first = data_of(&bench.events(), EventKind::Decision, "watch")
         .into_iter()
-        .take_while(|data| data["watch"] != "rebase_run")
+        .take_while(|data| data["watch"] != "refresh_merged")
         .any(|data| data["verdict"] == json!("green"));
     assert!(read_green_first, "{report}");
     assert!(github_merges(&bench).is_empty(), "{report}");
