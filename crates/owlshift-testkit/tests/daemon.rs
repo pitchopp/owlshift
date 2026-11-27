@@ -338,6 +338,21 @@ impl Bench {
         wait::within(bound, what, || self.output(), done);
     }
 
+    /// Waits until the daemon says it started `pid`, a watch or the web UI,
+    /// which it says once its sentinel was told of it (OWL-671). A hard kill
+    /// before then leaves that process running, the sentinel's window
+    /// between a start and its line (`stop_trees_when_killed`): load once
+    /// held the daemon there while its UI started and answered, and the UI
+    /// outlived the kill.
+    fn told_its_sentinel_of(&self, pid: u32) {
+        let said = format!("(pid {pid}).");
+        self.wait_for(&format!("the daemon to say it started {pid}"), || {
+            self.output()
+                .lines()
+                .any(|line| line.starts_with("Started the ") && line.ends_with(&said))
+        });
+    }
+
     /// The daemon's end.
     fn ended(&mut self) -> ExitStatus {
         self.ended_through(1)
@@ -389,12 +404,65 @@ impl Bench {
         seen.unwrap()
     }
 
-    /// Waits until the port is free and the UI `pid` gone.
+    /// Waits until the UI `pid` is gone and its port free. The UI is gone
+    /// once no process runs at its pid as the UI's stand-in ([`ui_runs`]),
+    /// not once `kill -0` fails: that finds a zombie, and a pid another
+    /// process took meanwhile (OWL-671). A timeout says which half is
+    /// missing, what runs at the pid and who listens on the port.
     fn ui_gone(&self, port: u16, pid: u32) {
-        self.wait_for("the web UI to be gone and its port free", || {
-            !alive(pid) && TcpListener::bind(("127.0.0.1", port)).is_ok()
-        });
+        wait::until_with(
+            "the web UI to be gone and its port free",
+            || format!("{}\n{}", ui_diagnosis(port, pid), self.output()),
+            || !ui_runs(pid) && TcpListener::bind(("127.0.0.1", port)).is_ok(),
+        );
     }
+}
+
+/// Whether the UI's stand-in runs at `pid`: `ps` shows a process there that
+/// is not a zombie, whose command is the stand-in's (`ui --listener-fd`). On
+/// macOS `kill -0` finds a zombie until launchd reads its end, and under load
+/// the pid space went round every 20 s, so a pid can be another process's
+/// (OWL-671). A `ps` that fails otherwise than by finding no process tells
+/// nothing: the UI counts as running, and the wait goes on.
+fn ui_runs(pid: u32) -> bool {
+    let output = Command::new("ps")
+        .args(["-ww", "-o", "stat=,command=", "-p", &pid.to_string()])
+        .output()
+        .unwrap();
+    let row = String::from_utf8_lossy(&output.stdout);
+    let row = row.trim();
+    if row.is_empty() {
+        return !output.stderr.is_empty();
+    }
+    !row.starts_with('Z') && row.contains(" ui --listener-fd ")
+}
+
+/// For a wait on the UI's end that timed out (OWL-671): which half is
+/// missing, what `ps` says of `pid`, and who listens on `port` as `lsof`
+/// says, or why it could not.
+fn ui_diagnosis(port: u16, pid: u32) -> String {
+    let run = |program: &str, args: &[&str]| match Command::new(program).args(args).output() {
+        Ok(output) => format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        ),
+        Err(error) => format!("{program}: {error}\n"),
+    };
+    let bind = match TcpListener::bind(("127.0.0.1", port)) {
+        Ok(_) => "free".to_owned(),
+        Err(error) => format!("not free: {error}"),
+    };
+    let runs = ui_runs(pid);
+    let pid = pid.to_string();
+    format!(
+        "the UI runs: {runs}; port {port}: {bind}\n--- ps, pid {pid}\n{}--- lsof, port {port}\n{}",
+        run(
+            "ps",
+            &["-ww", "-o", "pid,ppid,stat,lstart,command", "-p", &pid]
+        ),
+        run("lsof", &["-nP", &format!("-iTCP:{port}"), "-sTCP:LISTEN"]),
+    )
 }
 
 /// Stops, on a test's way out, what it left running: on a failure only,
@@ -562,6 +630,9 @@ fn a_hard_kill_of_the_daemon_leaves_no_watch_or_step() {
     bench.serve(API);
     bench.start();
     let started = [bench.running(WEB), bench.running(API)];
+    for (watch, _) in started {
+        bench.told_its_sentinel_of(watch);
+    }
     bench.signal("KILL", bench.daemon_pid());
     let _ = bench.ended();
     let pids: Vec<u32> = started
@@ -1768,8 +1839,14 @@ fn the_ui_starts_with_the_daemon_and_starts_again_after_a_kill() {
     assert!(token::token_file(&data).exists());
     let mut delays = Vec::new();
     for _ in 0..2 {
-        bench.signal("KILL", last);
+        // The clock starts before the signal (OWL-672): after `kill` ended,
+        // it missed what load added to `kill`'s own time, and a next start
+        // on a 300 ms delay came 270 ms after it. From before, a correct
+        // daemon is never measured short; one that started again at once
+        // is caught where `kill` and a start take less than the delay, as
+        // on a machine at rest.
         let killed = Instant::now();
+        bench.signal("KILL", last);
         let mut answered = None;
         bench.wait_for("the web UI to start again", || {
             answered = ui_answer(port).filter(|(pid, _)| *pid != last);
@@ -1945,6 +2022,7 @@ fn a_sigterm_and_a_hard_kill_leave_no_ui() {
     bench.ui_gone(port, first);
     bench.start();
     let (second, _) = bench.ui(port, Some(first));
+    bench.told_its_sentinel_of(second);
     bench.signal("KILL", bench.daemon_pid());
     let _ = bench.ended();
     bench.ui_gone(port, second);
@@ -1979,9 +2057,21 @@ fn holds_socket(pid: u32, port: u16) -> Option<bool> {
     }))
 }
 
+/// The processes whose parent is `pid`, as `pgrep -P` lists them.
+fn children(pid: u32) -> Vec<u32> {
+    let output = Command::new("pgrep")
+        .args(["-P", &pid.to_string()])
+        .output()
+        .unwrap();
+    String::from_utf8_lossy(&output.stdout)
+        .split_whitespace()
+        .map(|child| child.parse().unwrap())
+        .collect()
+}
+
 /// OWL-467: the daemon's copies of the UI's socket are close-on-exec: a
 /// watch started while it holds the socket, and its step, hold none; the
-/// UI does.
+/// UI does, and the sentinel the UI started does not (OWL-671).
 #[test]
 fn a_watch_holds_no_socket_of_the_ui() {
     let mut bench = Bench::new();
@@ -2003,6 +2093,17 @@ fn a_watch_holds_no_socket_of_the_ui() {
         assert!(held, "the UI holds its socket");
         assert_eq!(holds_socket(watch, port), Some(false), "the watch");
         assert_eq!(holds_socket(step, port), Some(false), "its step");
+        // Nor the UI's sentinel, which it starts before it adopts the socket
+        // (OWL-671): it held it, and the port stayed bound until it ended.
+        let children = children(ui);
+        assert!(!children.is_empty(), "the UI's sentinel runs");
+        for child in children {
+            assert_eq!(
+                holds_socket(child, port),
+                Some(false),
+                "the UI's child {child}"
+            );
+        }
     }
     bench.signal("TERM", bench.daemon_pid());
     assert!(bench.ended().success(), "{}", bench.output());
