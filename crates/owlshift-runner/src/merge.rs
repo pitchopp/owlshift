@@ -33,7 +33,7 @@ use crate::notify;
 use crate::on_demand::OnDemand;
 use crate::project::{self, Base};
 use crate::routing;
-use crate::writer::{MergedComment, Writer};
+use crate::writer::{MergeSaid, MergedComment, Writer};
 
 /// The ticket's questions as merge on green reads them (OWL-465): every
 /// round's, in order, under the category it was asked under, settled by its
@@ -414,19 +414,6 @@ pub(crate) fn notify_refused(
     if let Err(error) = notifier.notify(&line) {
         sink.emit(ticket, None, EventKind::Warning, notify::not_shown(&error));
     }
-}
-
-/// What a delivery says of merge on green beside who merges, from the
-/// ticket's questions alone ([`held_at_delivery`]).
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub(crate) struct MergeSaid {
-    /// Why merge on green will not merge it, when a question of the ticket
-    /// keeps it for a person (OWL-464).
-    pub held: Option<String>,
-    /// The `security` questions whose hold their decider's answer lifted
-    /// under `policy.security_merge = "answered"`, when none holds
-    /// (OWL-664).
-    pub lifted: Option<String>,
 }
 
 /// What merge on green makes of the ticket's `questions`, as a delivery

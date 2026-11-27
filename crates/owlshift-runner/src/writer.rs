@@ -152,6 +152,19 @@ pub struct DeliveryReport {
     pub person_steps: Vec<OwedStep>,
 }
 
+/// What a delivery says of merge on green beside who merges, from the
+/// ticket's questions alone (`merge::held_at_delivery`).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct MergeSaid {
+    /// Why merge on green will not merge it, when a question of the ticket
+    /// keeps it for a person (OWL-464).
+    pub held: Option<String>,
+    /// The `security` questions whose hold their decider's answer lifted
+    /// under `policy.security_merge = "answered"`, when none holds
+    /// (OWL-664).
+    pub lifted: Option<String>,
+}
+
 /// Who merges a pull request on a project that opted into merge on green
 /// (D14, OWL-445), `it` being how the sentence names it; `None` under
 /// `never`, where each text keeps its own words that Owlshift never merges.

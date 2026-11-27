@@ -626,8 +626,7 @@ mod tests {
             verdict: None,
             comment: "c".to_owned(),
             merge: owlshift_core::vocab::MergeSwitch::Never,
-            merge_held: None,
-            merge_lifted: None,
+            merge_said: Box::default(),
         };
         let outcomes = [
             Ok(delivered),

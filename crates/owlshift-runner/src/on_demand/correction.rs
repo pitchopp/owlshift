@@ -381,8 +381,7 @@ impl OnDemand<'_> {
             verdict,
             comment: comment.id,
             merge,
-            merge_held: said.held,
-            merge_lifted: said.lifted,
+            merge_said: Box::new(said),
         })
     }
 

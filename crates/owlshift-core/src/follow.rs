@@ -2778,7 +2778,11 @@ mod tests {
                 ),
             ];
             for (asked, want) in cases {
-                assert_eq!(under(answered, &[asked.clone()]), want, "{asked:?}");
+                assert_eq!(
+                    under(answered, std::slice::from_ref(&asked)),
+                    want,
+                    "{asked:?}"
+                );
             }
             // Answered, it falls through to the human categories' pass.
             let both = [question("security", Decider), question("money", Open)];

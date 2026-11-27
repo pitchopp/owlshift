@@ -140,9 +140,9 @@ use crate::ticket_run::{self, RunFault, Siblings};
 use crate::usage::{self as machine_usage, UsageStore};
 use crate::writer::{
     self, Corrected, Decided, DecidedBy, DecisionComment, DecisionGroup, DeliveryReport, FixPass,
-    Gate, HandbackComment, HandbackRead, MentionDropped, ParkedComment, Posted, QuestionsComment,
-    ReaskComment, Reasoning, Rebased, ReopenedChoice, ReplyComment, Reported, Restart,
-    ResumeComment, Reviewed, VisibleStage, WriteError, Writer, Yielding, park_reason,
+    Gate, HandbackComment, HandbackRead, MentionDropped, MergeSaid, ParkedComment, Posted,
+    QuestionsComment, ReaskComment, Reasoning, Rebased, ReopenedChoice, ReplyComment, Reported,
+    Restart, ResumeComment, Reviewed, VisibleStage, WriteError, Writer, Yielding, park_reason,
     rebase_cycle_keeps_delivery, rebase_keeps_delivery,
 };
 use owlshift_core::follow::{
@@ -613,12 +613,10 @@ pub struct Delivered {
     /// The project's `[forge] merge` at the base the command fetched, which
     /// says who merges (D14, OWL-445).
     pub merge: MergeSwitch,
-    /// Why merge on green will not merge it, when a question of the ticket
-    /// keeps it for a person (OWL-464): `None` under `never`.
-    pub merge_held: Option<String>,
-    /// The `security` questions whose hold their decider's answer lifted,
-    /// when none holds (OWL-664): `None` under `never`.
-    pub merge_lifted: Option<String>,
+    /// What merge on green makes of the ticket's questions (OWL-464,
+    /// OWL-664): nothing under `never`. Boxed: a `Delivered` travels in
+    /// the step's results, which stay small.
+    pub merge_said: Box<MergeSaid>,
 }
 
 impl fmt::Display for Delivered {
@@ -634,8 +632,8 @@ impl fmt::Display for Delivered {
         };
         let merges = crate::writer::merges_on_green(
             self.merge,
-            self.merge_held.as_deref(),
-            self.merge_lifted.as_deref(),
+            self.merge_said.held.as_deref(),
+            self.merge_said.lifted.as_deref(),
             "it",
         )
         .unwrap_or_else(|| "Owlshift never merges: review and merge it.".to_owned());
@@ -7428,8 +7426,7 @@ impl OnDemand<'_> {
             verdict,
             comment: comment.id,
             merge,
-            merge_held: said.held,
-            merge_lifted: said.lifted,
+            merge_said: Box::new(said),
         })
     }
 
@@ -9424,15 +9421,14 @@ impl OnDemand<'_> {
             verdict,
             comment: comment.id,
             merge,
-            merge_held: said.held,
-            merge_lifted: said.lifted,
+            merge_said: Box::new(said),
         })
     }
 
     /// Who merges the pull request this command delivered, as its line says
     /// it (OWL-464), the ticket's variant read as merge on green reads it,
     /// from the labels and the intake record this command read (OWL-664).
-    fn who_merges(&self, p: &Prepared) -> (MergeSwitch, crate::merge::MergeSaid) {
+    fn who_merges(&self, p: &Prepared) -> (MergeSwitch, MergeSaid) {
         let variant = crate::merge::merge_variant(
             &p.found.labels,
             p.intake.as_ref(),
