@@ -534,13 +534,18 @@ pub fn reply_for(dir: &Path, role: &str, ticket: Option<&str>, result: &str) {
 /// (shell text), such as `exec sleep 30`, a run under way until a stop cuts
 /// it; past it, and for any other run, it plays `fake`, the fake harness,
 /// with the reply [`reply_for`] wrote in `dir`, or the bench's.
+///
+/// Started once here with no argument, which ends it at once (OWL-667): the
+/// first start of a new script waits for macOS's scan of it, up to 25 s
+/// measured under three full test runs at once, and a test's wait for its
+/// Builds under way would otherwise count it ("First starts in tests").
 #[cfg(unix)]
 pub fn holding_harness(dir: &Path, fake: &Path, role: &str, before: &str, hold: &str) -> PathBuf {
     let script = dir.join(format!("harness-{role}.sh"));
-    crate::stand_in::write_executable(
+    crate::stand_in::write(
         &script,
-        format!(
-            "#!/bin/sh\ndir='{dir}'\nbrief=\"\"\nreply=\"\"\n\
+        &format!(
+            "#!/bin/sh\n[ $# -gt 0 ] || exit 0\ndir='{dir}'\nbrief=\"\"\nreply=\"\"\n\
              while [ $# -gt 0 ]; do\n  case \"$1\" in\n    --brief) brief=\"$2\"; shift 2;;\n    \
              --reply) reply=\"$2\"; shift 2;;\n    *) shift;;\n  esac\ndone\n\
              role=$(sed -n 's/^  \"role\": \"\\([a-z_]*\\)\",$/\\1/p' \"$brief\" | head -n 1)\n\
@@ -554,6 +559,7 @@ pub fn holding_harness(dir: &Path, fake: &Path, role: &str, before: &str, hold: 
             dir = dir.display(),
             fake = fake.display(),
         ),
+        &[],
     );
     script
 }

@@ -673,24 +673,47 @@ const OUTSIDE: &str = ".owlshift/run/outside";
 /// its harness started in a process group of its own, as Claude Code runs
 /// each Bash call, nor the job it left as a returned Bash call does
 /// (OWL-452).
+///
+/// The cut must come after the helper has started both and written their
+/// pids, which a loaded machine delays past any fixed deadline: a cut that
+/// came first, a pid file missing, is run again on a new bench with twice
+/// the deadline, [`wait::REACHED`] at most (OWL-667). Every pid written is
+/// checked gone at each run, so a process left by a cut is never retried.
 #[cfg(unix)]
 #[test]
 fn a_run_cut_at_its_deadline_leaves_nothing_running() {
-    let bench = Bench::new();
-    let executor = Executor {
-        timeout: Duration::from_secs(3),
-        ..bench.executor.clone()
-    };
-    let report = bench
-        .run_with(&executor, &Helper("helper_escape_the_group"), &bench.brief)
-        .unwrap();
-    assert!(
-        matches!(report.outcome, Outcome::Failed(Failure::TimedOut)),
-        "{:?}",
-        report.outcome
-    );
-    assert_gone(read_pid(&bench.worktree.join(ESCAPED)));
-    assert_gone(read_pid(&bench.worktree.join(JOB)));
+    let mut timeout = Duration::from_secs(3);
+    loop {
+        let bench = Bench::new();
+        let executor = Executor {
+            timeout,
+            ..bench.executor.clone()
+        };
+        let report = bench
+            .run_with(&executor, &Helper("helper_escape_the_group"), &bench.brief)
+            .unwrap();
+        assert!(
+            matches!(report.outcome, Outcome::Failed(Failure::TimedOut)),
+            "{:?}",
+            report.outcome
+        );
+        let written: Vec<PathBuf> = [ESCAPED, JOB]
+            .iter()
+            .map(|file| bench.worktree.join(file))
+            .filter(|file| file.exists())
+            .collect();
+        for file in &written {
+            assert_gone(read_pid(file));
+        }
+        if written.len() == 2 {
+            return;
+        }
+        assert!(
+            timeout < wait::REACHED,
+            "the helper had not started what it leaves {timeout:?} after its start"
+        );
+        timeout = (timeout * 2).min(wait::REACHED);
+    }
 }
 
 /// OWL-452: a run that ends by itself leaves no job it left in its worktree
@@ -1974,13 +1997,20 @@ mod setup {
     /// brief, repairs it and passes the gate; a script stopped at the
     /// setup's deadline, a third of the gate's and not of the run's, is
     /// told the same way.
+    ///
+    /// The repaired setup and the gate run under the same deadlines, which
+    /// a loaded machine must not reach (OWL-667): the bench's gate deadline
+    /// where the deadline is not the case, and 30 s, a 10 s setup, where it
+    /// is, the broken script outlasting it.
     #[test]
     fn a_build_that_broke_its_setup_repairs_it() {
-        for (script, said) in [
-            ("exit 1\n", "setup: exit status 1"),
+        let outlasts = format!("sleep {}\n", wait::OUTLASTS.as_secs());
+        for (script, gate_timeout, said) in [
+            ("exit 1\n", None, "setup: exit status 1"),
             (
-                "sleep 20\n",
-                "setup: stopped at the setup's deadline, a third of the gate's, 1 s",
+                outlasts.as_str(),
+                Some(Duration::from_secs(30)),
+                "setup: stopped at the setup's deadline, a third of the gate's, 10 s",
             ),
         ] {
             let bench = Bench::new();
@@ -1988,7 +2018,7 @@ mod setup {
             bench.kept();
             bench.own_commit(&[("setup.sh", script)]);
             let executor = Executor {
-                gate_timeout: Duration::from_secs(3),
+                gate_timeout: gate_timeout.unwrap_or(bench.executor.gate_timeout),
                 ..bench.executor.clone()
             };
             let mut files = std::collections::BTreeMap::new();
@@ -2021,8 +2051,11 @@ mod setup {
     /// A setup that fails for something other than its command's own
     /// failure fails a resumed Build too: one that changes the work, one
     /// whose log cannot be written, one whose process kept the output open
-    /// past the setup's deadline, a third of the gate's 6 s. The last leaves
-    /// its process group with `setpgrp`, which Windows has not.
+    /// past the setup's deadline, a third of the gate's 30 s. The last leaves
+    /// its process group with `setpgrp`, which Windows has not. The first two
+    /// run under the bench's gate deadline, which is not their case: a
+    /// loaded machine must not reach a deadline before their failure
+    /// (OWL-667).
     #[test]
     fn a_setup_failure_a_build_cannot_repair_fails_the_run() {
         let cases: &[&str] = if cfg!(unix) {
@@ -2050,11 +2083,15 @@ mod setup {
                 _ => concat!(
                     "perl -e 'pipe(my $r, my $w) or die; defined(my $pid = fork) or die; ",
                     "if ($pid) { close $w; <$r>; exit 1 } ",
-                    "close $r; setpgrp(0, 0); close $w; sleep 8'",
+                    "close $r; setpgrp(0, 0); close $w; sleep 30'",
                 ),
             };
             let executor = Executor {
-                gate_timeout: Duration::from_secs(6),
+                gate_timeout: if case == "holds" {
+                    Duration::from_secs(30)
+                } else {
+                    bench.executor.gate_timeout
+                },
                 ..bench.executor.clone()
             };
             let harness = Script(MARKS.to_owned());
