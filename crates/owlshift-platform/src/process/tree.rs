@@ -148,7 +148,7 @@ mod imp {
         command.process_group(0);
         let tied = worktree.is_some();
         let before = std::cell::Cell::new(None);
-        let spawn = || {
+        let spawn = |command: &mut Command| {
             if tied {
                 before.set(descendants::before_spawn());
             }
@@ -168,7 +168,7 @@ mod imp {
             made = Some(stopper.clone());
             stopper
         };
-        let (child, live) = signals::register(spawn, stopper, at)?;
+        let (child, live) = signals::register(command, spawn, stopper, at)?;
         let stopper = made.expect("a registered tree has its stopper");
         Ok((
             child,
@@ -349,7 +349,7 @@ mod imp {
         let job = Arc::new(unsafe { OwnedHandle::from_raw_handle(raw) });
 
         command.creation_flags(CREATE_SUSPENDED);
-        let spawn = || {
+        let spawn = |command: &mut Command| {
             let mut child = command.spawn()?;
             if let Err(error) = contain(&job, &child) {
                 // The child never ran; best effort, the error to report is
@@ -360,7 +360,7 @@ mod imp {
             }
             Ok(child)
         };
-        let (child, live) = signals::register(spawn, |_| Arc::clone(&job), at)?;
+        let (child, live) = signals::register(command, spawn, |_| Arc::clone(&job), at)?;
         Ok((child, ProcessTree { job, _live: live }))
     }
 

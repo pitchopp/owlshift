@@ -11,11 +11,19 @@
 //! close-on-exec, so no process Owlshift starts inherits it. Nor does it
 //! inherit any other descriptor Owlshift has open when it starts (OWL-671):
 //! one Owlshift was handed and has not adopted yet, as the web UI's socket,
-//! would stay open in the sentinel until the sentinel ends. Owlshift writes
-//! one line per event, `+ <group>` when a tree becomes live and `- <group>`
-//! when it no longer is. When Owlshift ends, the system closes the write end,
-//! the sentinel reads the end of its input, kills every group still live,
-//! and ends.
+//! would stay open in the sentinel until the sentinel ends. One line per
+//! event: `+ <group>` when a tree becomes live and `- <group>` when it no
+//! longer is. When Owlshift ends, the system closes the write end, the
+//! sentinel reads the end of its input, kills every group still live, and
+//! ends.
+//!
+//! A tree's start has no window a kill could slip through (OWL-673): its
+//! root writes `? <group>` itself, between fork and exec ([`Sentinel::arm`]),
+//! and Owlshift then confirms it with `+ <group>`, or writes `!` when the
+//! start failed, which forgets the group of that unconfirmed `?`. Until it
+//! executes its program, the root holds the write end too, so a kill of
+//! Owlshift at any moment of the start leaves the sentinel reading that `?`
+//! before the end of its input.
 //!
 //! The writes never block: a line that finds the pipe full is lost. A
 //! sentinel that lost a line holds a list that may miss a `-`, so Owlshift
@@ -31,19 +39,28 @@
 //! [`stop_trees_when_killed`]: super::stop_trees_when_killed
 
 use std::io::{self, Write};
+use std::os::fd::{AsRawFd, RawFd};
 use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::process::{Child, ChildStdin, Command, ExitStatus, Stdio};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use rustix::fs::{OFlags, fcntl_getfl, fcntl_setfl};
 use rustix::process::{Pid, Signal, WaitId, WaitIdOptions, waitid};
 
-/// What the sentinel runs: it keeps the groups of the `+` lines less those
-/// of the `-` lines, and at the end of its input kills each group left, as
-/// `ProcessTree::kill` does, without its search for what left the group
-/// (OWL-451). POSIX sh, builtins only, since it runs with an empty
+/// What the sentinel runs: it keeps the groups of the `?` and `+` lines less
+/// those of the `-` lines, and at the end of its input kills each group
+/// left, as `ProcessTree::kill` does, without its search for what left the
+/// group (OWL-451). POSIX sh, builtins only, since it runs with an empty
 /// environment: dash on Debian and Ubuntu, bash on macOS.
+///
+/// A `?` is a start not yet confirmed (OWL-673): its group is kept as a live
+/// one, and pending until the next line, Owlshift's about that start. A `+`
+/// of the same group confirms it, kept once; a `!` forgets it. Every line
+/// but a `?` ends the pending. The `?` and `!` patterns are quoted:
+/// unquoted, `?` matches any one character.
 ///
 /// It first ignores SIGHUP (OWL-93): when Owlshift's end orphans the
 /// sentinel's process group while the sentinel is stopped, the system sends
@@ -53,20 +70,74 @@ use rustix::process::{Pid, Signal, WaitId, WaitIdOptions, waitid};
 const SCRIPT: &str = r#"trap '' HUP
 exec >&-
 trees=
+started=
+forget() {
+  left=
+  for tree in $trees; do
+    [ "$tree" = "$1" ] || left="$left $tree"
+  done
+  trees=$left
+}
 while read -r sign group; do
   case $sign in
-    +) trees="$trees $group" ;;
-    -) left=
-       for tree in $trees; do
-         [ "$tree" = "$group" ] || left="$left $tree"
-       done
-       trees=$left ;;
+    '?') trees="$trees $group"; started=$group ;;
+    +) [ "$group" = "$started" ] || trees="$trees $group"; started= ;;
+    -) forget "$group"; started= ;;
+    '!') [ -z "$started" ] || forget "$started"; started= ;;
   esac
 done
 for tree in $trees; do
   kill -s KILL -- "-$tree" 2>/dev/null
 done
 "#;
+
+/// The longest line to the sentinel: a sign, a space, the 10 digits of the
+/// largest pid, a newline.
+const LINE: usize = 13;
+
+/// One line to the sentinel, `<sign> <group>` or a sign alone, built on the
+/// stack: a tree's root writes its own between fork and exec, where nothing
+/// may allocate, lock or panic (OWL-673). No step here has a panic path: the
+/// bytes are filled from the end through an iterator, and read back with
+/// `get`. Owlshift's own lines are built the same way, so that a root's
+/// `?` and Owlshift's `+` name its group in the same bytes.
+pub(super) struct Line {
+    bytes: [u8; LINE],
+    start: usize,
+}
+
+impl Line {
+    pub(super) fn new(sign: u8, group: Option<Pid>) -> Self {
+        const DIGITS: &[u8; 10] = b"0123456789";
+        let mut bytes = [0; LINE];
+        let mut slots = bytes.iter_mut().rev();
+        let mut put = |byte| {
+            if let Some(slot) = slots.next() {
+                *slot = byte;
+            }
+        };
+        put(b'\n');
+        if let Some(group) = group {
+            // A pid is positive: 10 digits at most.
+            let mut number = group.as_raw_nonzero().get().unsigned_abs();
+            loop {
+                put(DIGITS.get((number % 10) as usize).copied().unwrap_or(b'0'));
+                number /= 10;
+                if number == 0 {
+                    break;
+                }
+            }
+            put(b' ');
+        }
+        put(sign);
+        let start = slots.len();
+        Self { bytes, start }
+    }
+
+    pub(super) fn as_bytes(&self) -> &[u8] {
+        self.bytes.get(self.start..).unwrap_or_default()
+    }
+}
 
 /// A running sentinel: the write end of its input, and the process, so
 /// that its end can be seen (OWL-88).
@@ -243,12 +314,53 @@ impl Sentinel {
 
     /// Tells the sentinel a tree is live.
     pub(super) fn announce(&mut self, group: Pid) {
-        self.send('+', group);
+        self.send(&Line::new(b'+', Some(group)));
     }
 
     /// Tells the sentinel a tree is no longer live.
     pub(super) fn withdraw(&mut self, group: Pid) {
-        self.send('-', group);
+        self.send(&Line::new(b'-', Some(group)));
+    }
+
+    /// Makes the next start of `command`, a tree's root in a process group
+    /// of its own, announce itself to the sentinel between fork and exec:
+    /// `? <group>`, written by the root, which holds the sentinel's input
+    /// until it executes its program (OWL-673). The start is then Owlshift's
+    /// to confirm ([`Start::confirm`]) or, dropped unconfirmed, to withdraw.
+    /// `None` once a line to the sentinel was lost: it is killed and told
+    /// nothing more.
+    ///
+    /// The root writes its line only for the start armed here: once that
+    /// start is confirmed or withdrawn, the closure left on `command` writes
+    /// nothing, should `command` be started again, by this or any other way.
+    /// Adding a closure makes std fork the root instead of using
+    /// `posix_spawn`, about half a millisecond more per start on macOS.
+    pub(super) fn arm(&mut self, command: &mut Command) -> Option<Start<'_>> {
+        if self.lost {
+            return None;
+        }
+        let armed = Arc::new(AtomicBool::new(true));
+        let in_root = Arc::clone(&armed);
+        let input = self.input.as_raw_fd();
+        // SAFETY: the closure runs in the root between fork and exec, after
+        // std has made it a group leader and reset SIGPIPE, where only
+        // async-signal-safe calls are allowed: an atomic load through a
+        // pointer made before the fork, then `announce_self`, which says
+        // what it calls. The descriptor is the sentinel's input, open until
+        // this process ends: the sentinel is never dropped once it runs.
+        unsafe {
+            command.pre_exec(move || {
+                if in_root.load(Ordering::SeqCst) {
+                    announce_self(input);
+                }
+                Ok(())
+            });
+        }
+        Some(Start {
+            sentinel: self,
+            armed,
+            confirmed: false,
+        })
     }
 
     /// Best effort: a line that cannot be written is lost, whether the
@@ -262,17 +374,77 @@ impl Sentinel {
     /// hard kill of Owlshift before then ends it while that tree is still
     /// live. The kill, by its pid, which stays its own until it is reaped,
     /// fails only for a sentinel that ended already.
-    fn send(&mut self, sign: char, group: Pid) {
+    fn send(&mut self, line: &Line) {
         if self.lost {
             return;
         }
-        let line = format!("{sign} {}\n", group.as_raw_nonzero());
         if let Err(error) = self.input.write_all(line.as_bytes())
             && error.kind() == io::ErrorKind::WouldBlock
         {
             self.lost = true;
             let _ = self.process.kill();
         }
+    }
+}
+
+/// A start [`Sentinel::arm`] armed, under the lock of the live trees: its
+/// root may have announced itself. Dropped unconfirmed, as when the spawn
+/// failed, it writes `!`, which forgets that root's group: std reaped the
+/// root of a failed start before the spawn returned, so its pid may be
+/// another's by the time the sentinel acts.
+pub(super) struct Start<'a> {
+    sentinel: &'a mut Sentinel,
+    armed: Arc<AtomicBool>,
+    confirmed: bool,
+}
+
+impl Start<'_> {
+    /// Confirms the start, its root's group `group`: `+ <group>`, which also
+    /// announces the tree should the root's own line have been lost.
+    pub(super) fn confirm(mut self, group: Pid) {
+        self.armed.store(false, Ordering::SeqCst);
+        self.sentinel.announce(group);
+        self.confirmed = true;
+    }
+}
+
+impl Drop for Start<'_> {
+    fn drop(&mut self) {
+        self.armed.store(false, Ordering::SeqCst);
+        if !self.confirmed {
+            self.sentinel.send(&Line::new(b'!', None));
+        }
+    }
+}
+
+/// What an armed root runs between fork and exec: writes `? <its pid>`,
+/// its group, to the sentinel's input `input`, a non-blocking pipe, so a
+/// full one loses the line rather than block (Owlshift's `+` then tells the
+/// sentinel instead, or is lost too and has it killed). SIGPIPE, which std
+/// set back to its default before the closures, is ignored around the
+/// write: a sentinel gone would otherwise kill the root before its program
+/// runs, and std would report a start. Without that, the line is not
+/// written.
+///
+/// Async-signal-safe calls only, nothing allocated, locked or able to panic:
+/// `getpid`, `sigaction` twice, `write`, on a [`Line`] built on the stack.
+/// A zeroed `sigaction` has an empty mask and no flags, on macOS and Linux.
+fn announce_self(input: RawFd) {
+    use std::os::fd::BorrowedFd;
+
+    let line = Line::new(b'?', Some(rustix::process::getpid()));
+    // SAFETY: each call is async-signal-safe and given valid pointers to
+    // locals; `input` is the sentinel's input, open in this process until
+    // it executes its program.
+    unsafe {
+        let mut ignore: libc::sigaction = std::mem::zeroed();
+        ignore.sa_sigaction = libc::SIG_IGN;
+        let mut before: libc::sigaction = std::mem::zeroed();
+        if libc::sigaction(libc::SIGPIPE, &ignore, &mut before) != 0 {
+            return;
+        }
+        let _ = rustix::io::write(BorrowedFd::borrow_raw(input), line.as_bytes());
+        libc::sigaction(libc::SIGPIPE, &before, std::ptr::null_mut());
     }
 }
 
@@ -664,6 +836,117 @@ mod tests {
         assert_eq!(
             ended,
             SentinelStatus::Ended(format!("{LOST} (signal: 9 (SIGKILL))"))
+        );
+    }
+
+    /// OWL-673: a line built on the stack, for the shortest and the longest
+    /// group, and a sign alone.
+    #[test]
+    fn a_line_names_its_group_in_full() {
+        let line = |sign, group: Option<i32>| {
+            let line = Line::new(sign, group.map(|raw| Pid::from_raw(raw).unwrap()));
+            String::from_utf8(line.as_bytes().to_vec()).unwrap()
+        };
+        assert_eq!(line(b'?', Some(1)), "? 1\n");
+        assert_eq!(line(b'+', Some(10)), "+ 10\n");
+        assert_eq!(line(b'-', Some(i32::MAX)), "- 2147483647\n");
+        assert_eq!(line(b'!', None), "!\n");
+    }
+
+    /// OWL-673: the script keeps a tree whose start was confirmed, or never
+    /// answered, as when Owlshift died during it, once in its list; it
+    /// forgets a start Owlshift said failed, and a `!` with no start pending
+    /// forgets nothing. Its list at the end of its input is written to a
+    /// file after its kills: the groups are above any pid (99,999 on macOS,
+    /// 4,194,304 at most on Linux), so each kill fails and reaches no one.
+    #[test]
+    fn the_script_keeps_a_started_tree_and_forgets_a_failed_start() {
+        let dir = tempfile::tempdir().unwrap();
+        let list = dir.path().join("trees");
+        let script = format!("{SCRIPT}echo $trees > '{}'\n", list.display());
+        let Sentinel {
+            process, mut input, ..
+        } = Sentinel::start_running(&script, "owlshift-test-sentinel").unwrap();
+        let _started = Started {
+            sentinel: Some(process),
+            members: Vec::new(),
+        };
+        let group = |raw| Some(Pid::from_raw(raw).unwrap());
+        for line in [
+            Line::new(b'?', group(9_000_001)),
+            Line::new(b'!', None),
+            Line::new(b'?', group(9_000_002)),
+            Line::new(b'+', group(9_000_002)),
+            Line::new(b'+', group(9_000_003)),
+            Line::new(b'-', group(9_000_003)),
+            Line::new(b'+', group(9_000_005)),
+            Line::new(b'!', None),
+            Line::new(b'?', group(9_000_006)),
+            Line::new(b'+', group(9_000_006)),
+            Line::new(b'!', None),
+            Line::new(b'?', group(9_000_004)),
+        ] {
+            input.write_all(line.as_bytes()).unwrap();
+        }
+        drop(input);
+        let mut written = String::new();
+        crate::wait::until("the sentinel to write its list", || {
+            written = std::fs::read_to_string(&list).unwrap_or_default();
+            written.ends_with('\n')
+        });
+        assert_eq!(written, "9000002 9000005 9000006 9000004\n");
+    }
+
+    /// OWL-673: what a start writes to the sentinel. A root announces itself
+    /// before its program runs, then Owlshift withdraws it, its program not
+    /// found, or confirms it; a command started again once its start ended
+    /// writes nothing more. The sentinel here logs each line it reads.
+    #[test]
+    fn a_start_is_announced_by_its_root_then_confirmed_or_withdrawn() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("lines");
+        let script = format!(
+            "while read -r line; do echo \"$line\" >> '{}'; done",
+            log.display()
+        );
+        let mut reaped =
+            Reaped(Sentinel::start_running(&script, "owlshift-test-sentinel").unwrap());
+        let sentinel = &mut reaped.0;
+
+        let mut missing = Command::new("owlshift-test-no-such-program");
+        missing.process_group(0);
+        let start = sentinel.arm(&mut missing).unwrap();
+        assert!(missing.spawn().is_err());
+        drop(start);
+
+        let mut runs = Command::new("true");
+        runs.process_group(0);
+        let start = sentinel.arm(&mut runs).unwrap();
+        let mut child = runs.spawn().unwrap();
+        let group = Pid::from_child(&child);
+        start.confirm(group);
+        child.wait().unwrap();
+        // Its closure stays on the command, disarmed.
+        runs.spawn().unwrap().wait().unwrap();
+        sentinel.withdraw(group);
+
+        let mut lines = Vec::new();
+        crate::wait::until("the sentinel to log the last line", || {
+            let logged = std::fs::read_to_string(&log).unwrap_or_default();
+            lines = logged.lines().map(str::to_owned).collect();
+            lines.last().is_some_and(|line| line.starts_with('-'))
+        });
+        let failed = lines[0].strip_prefix("? ").map(str::parse::<u32>);
+        assert!(matches!(failed, Some(Ok(_))), "{lines:?}");
+        assert_eq!(
+            lines[1..],
+            [
+                "!".to_owned(),
+                format!("? {group}"),
+                format!("+ {group}"),
+                format!("- {group}"),
+            ],
+            "{lines:?}"
         );
     }
 }
