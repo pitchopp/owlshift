@@ -242,7 +242,7 @@ pub fn check_origin(url: &str) -> Result<Repo, String> {
         );
     }
     Repo::from_github_remote(url).map_err(|_| {
-        "the remote `origin` is not a github.com repository: `owlshift do` delivers to GitHub only"
+        "the remote `origin` is not a github.com repository: Owlshift delivers to GitHub only"
             .to_owned()
     })
 }
@@ -11525,6 +11525,7 @@ mod tests {
         ] {
             let error = check_origin(url).unwrap_err();
             assert!(error.contains(says), "{url}: {error}");
+            assert!(!error.contains("owlshift do"), "{url}: {error}");
             assert!(
                 !error.contains("SECRET") && !error.contains("pass"),
                 "{error}"
@@ -11605,7 +11606,15 @@ mod tests {
                 error.contains("not a ticket of team OWL"),
                 "{other}: {error}"
             );
+            // No command is named: do, forget, cancel and release share it.
+            assert!(!error.contains("owlshift do"), "{other}: {error}");
+            assert!(
+                error.contains("checkout of the project"),
+                "{other}: {error}"
+            );
         }
+        let error = check_team(&owl, &ticket("LOC-12")).unwrap_err();
+        assert!(error.contains("`tracker.team` is LOC"), "{error}");
         // The Markdown tracker's tickets live in the project itself.
         assert_eq!(
             check_team(&config("markdown", ""), &ticket("LOC-12")),

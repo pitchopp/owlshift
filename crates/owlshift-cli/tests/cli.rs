@@ -1985,6 +1985,20 @@ fn do_refuses_a_project_it_cannot_deliver_before_any_credential() {
         "{}",
         stderr(&output)
     );
+    // The refusal names no command and says where to run it, whichever
+    // command was run (OWL-675).
+    let output = owlshift(linear.path(), config_dir.path(), &["forget", "LOC-12"]);
+    assert!(!output.status.success());
+    let said = stderr(&output);
+    assert!(
+        said.contains("LOC-12 is not a ticket of team OWL"),
+        "{said}"
+    );
+    assert!(!said.contains("owlshift do"), "{said}");
+    assert!(
+        said.contains("checkout of the project whose `tracker.team` is LOC"),
+        "{said}"
+    );
     assert!(!config_dir.path().join("data").exists());
 }
 
