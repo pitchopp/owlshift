@@ -105,13 +105,20 @@ team = {}
         };
         let key = ticket.as_str().rsplit_once('-').map(|(key, _)| key);
         if key.is_some_and(|key| key.eq_ignore_ascii_case(team)) {
-            Ok(())
-        } else {
-            Err(format!(
-                "{ticket} is not a ticket of team {team}, the project's `tracker.team`: \
-                 `owlshift do` runs this project's tickets only"
-            ))
+            return Ok(());
         }
+        // Owlshift picks the project from the working directory, so the way
+        // out is the other project's checkout. No command is named: this
+        // check serves `do`, `forget`, `cancel`, `release` and the UI.
+        let elsewhere = key.map_or_else(
+            || "the project that owns it".to_owned(),
+            |key| format!("the project whose `tracker.team` is {key}"),
+        );
+        Err(format!(
+            "{ticket} is not a ticket of team {team}, the project's `tracker.team`: Owlshift \
+             works on the project of the current directory, so run this from the checkout of \
+             {elsewhere}"
+        ))
     }
 
     /// Opens [`super::linear()`] with the project's team, which a Linear
