@@ -26,7 +26,7 @@
 //! [`ProcessTree::spawn`]: super::ProcessTree::spawn
 
 use std::io;
-use std::process::Child;
+use std::process::{Child, Command};
 use std::sync::{Condvar, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
@@ -224,13 +224,18 @@ static INSTALLED: Mutex<bool> = Mutex::new(false);
 /// handle was dropped is left running, as dropping it promises, and so is a
 /// tree the handler of [`stop_trees_on_signal`] already stopped.
 ///
+/// No start escapes it (OWL-673): a tree's root tells the sentinel of itself
+/// between fork and exec, and holds the sentinel's pipe open until it
+/// executes its program, so a kill at any moment after the fork, even before
+/// [`ProcessTree::spawn`] returned, has the sentinel stop that tree.
+///
 /// It is a best effort, not a guarantee:
 ///
-/// - a kill that lands between a tree's start and the moment the sentinel is
-///   told of it leaves that tree running: well under a millisecond on a
-///   machine at rest, but as long as this process waits to run again after
-///   the spawn on a loaded one, where a web UI the daemon started had begun
-///   to serve before the daemon told its sentinel (OWL-671);
+/// - a start that fails after its root told the sentinel of itself, its
+///   program not executed, is withdrawn once the spawn returned: a kill
+///   between std's reap of that root and the withdrawal leaves its freed
+///   group id in the sentinel's list, which it kills at the end should
+///   another group have taken that id meanwhile;
 /// - once the sentinel is killed it protects nothing more, and it is not
 ///   restarted; [`sentinel_status`] tells whether it still runs, or is
 ///   stopped, without waiting on it;
@@ -257,6 +262,7 @@ static INSTALLED: Mutex<bool> = Mutex::new(false);
 ///
 /// [`ProcessTree`]: super::ProcessTree
 /// [`ProcessTree::kill`]: super::ProcessTree::kill
+/// [`ProcessTree::spawn`]: super::ProcessTree::spawn
 #[cfg(unix)]
 pub fn stop_trees_when_killed() -> io::Result<()> {
     let mut guard = live();
@@ -375,12 +381,19 @@ impl Drop for Registration {
 /// tree [`AtCheckedStop::Told`] is not spawned once any stop is asked, and
 /// one [`AtCheckedStop::Stopped`] spawned after a checked stop, or while
 /// the step is stopped ([`stop_step`], OWL-474), is stopped at once.
+///
+/// On Unix, while a sentinel runs, the root announces itself to it before
+/// it executes its program, and the spawn's result then confirms or
+/// withdraws it (OWL-673): `command` gets the closure that does so, last,
+/// and `spawn` must start `command`.
 pub(super) fn register(
-    spawn: impl FnOnce() -> io::Result<Child>,
+    command: &mut Command,
+    spawn: impl FnOnce(&mut Command) -> io::Result<Child>,
     stopper: impl FnOnce(&Child) -> Stopper,
     at: AtCheckedStop,
 ) -> io::Result<(Child, Registration)> {
     let mut guard = live();
+    let live = &mut *guard;
     let (asked, step_stopped) = {
         let degrees = degrees();
         (degrees.asked, degrees.step_stopped)
@@ -392,14 +405,19 @@ pub(super) fn register(
             "this process is asked to stop: no step starts",
         ));
     }
-    let child = spawn()?;
-    let live = &mut *guard;
+    // Dropped unconfirmed, on a failed spawn, it withdraws the root.
+    #[cfg(unix)]
+    let start = live
+        .sentinel
+        .as_mut()
+        .and_then(|sentinel| sentinel.arm(command));
+    let child = spawn(command)?;
     let id = live.next;
     live.next += 1;
     let stopper = stopper(&child);
     #[cfg(unix)]
-    if let Some(sentinel) = &mut live.sentinel {
-        sentinel.announce(stopper.group);
+    if let Some(start) = start {
+        start.confirm(stopper.group);
     }
     #[cfg(unix)]
     if at == AtCheckedStop::Stopped && (asked == Some(Degree::Checked) || step_stopped) {

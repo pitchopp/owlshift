@@ -21,11 +21,11 @@ which.workspace = true
 # `termios`: the terminal's width, for `owlshift doctor`'s report (OWL-99).
 rustix = { workspace = true, features = ["termios"] }
 signal-hook.workspace = true
-
-# The process table, searched for what left a process tree's group when the
-# tree is stopped (OWL-451); the tests read a process's state with it too,
-# with no `ps` (OWL-110).
-[target.'cfg(target_os = "macos")'.dependencies]
+# `sigaction`, which rustix does not offer on macOS: a tree's root ignores
+# SIGPIPE around its line to the sentinel (OWL-673); rustix does the rest.
+# On macOS also the process table, searched for what left a process tree's
+# group when the tree is stopped (OWL-451); the tests read a process's
+# state with it too, with no `ps` (OWL-110).
 libc.workspace = true
 
 [target.'cfg(all(unix, not(target_os = "macos")))'.dependencies]

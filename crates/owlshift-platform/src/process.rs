@@ -1160,6 +1160,133 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&hup).unwrap(), "hup\n");
     }
 
+    /// The name of the shell [`window_root`] starts.
+    #[cfg(unix)]
+    const WINDOW: &str = "owlshift-test-window";
+
+    /// A shell that waits on its input, which it inherits, and ends at its
+    /// end: it lives on until the test closes that input, unless something
+    /// stops it.
+    #[cfg(unix)]
+    fn window_root() -> Command {
+        let mut root = Command::new("/bin/sh");
+        root.args(["-c", "read -r line", WINDOW])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        root
+    }
+
+    /// Starts the sentinel, then a tree whose root, between fork and exec,
+    /// writes its pid to `root` and kills this process outright, before
+    /// `ProcessTree::spawn` returns. The root inherits this process's input.
+    ///
+    /// The kill does not always land at once: on a loaded machine the
+    /// thread that takes it may not be the one in the spawn, which may then
+    /// return and confirm the start before the process ends (OWL-673). The
+    /// tree's handle is kept meanwhile: dropped, it would withdraw the tree,
+    /// which the sentinel then rightly spares.
+    #[cfg(unix)]
+    #[test]
+    #[ignore = "helper, run by the tests below"]
+    fn helper_start_a_tree_that_kills_this_process() {
+        if helper_requested() {
+            use rustix::process::{Signal, getpid, getppid, kill_process};
+            use std::os::unix::process::CommandExt;
+
+            stop_trees_when_killed().unwrap();
+            let record = std::fs::File::create("root").unwrap();
+            let mut root = window_root();
+            // SAFETY: the closure runs in the root between fork and exec,
+            // before the one that announces it to the sentinel, which
+            // `ProcessTree::spawn` adds last. Async-signal-safe calls only,
+            // on a line built on the stack: getpid, write, getppid, kill.
+            unsafe {
+                root.pre_exec(move || {
+                    let line = sentinel::Line::new(b'?', Some(getpid()));
+                    let _ = rustix::io::write(&record, line.as_bytes());
+                    if let Some(owner) = getppid() {
+                        let _ = kill_process(owner, Signal::KILL);
+                    }
+                    Ok(())
+                });
+            }
+            let _started = ProcessTree::spawn(&mut root);
+            // Ended by the kill meanwhile; the test fails should it not land.
+            thread::sleep(crate::wait::OUTLASTS);
+        }
+    }
+
+    /// A helper of this test binary whose input the test holds; on the way
+    /// out its input is closed, which ends a tree that waits on it, and it
+    /// is killed and reaped.
+    #[cfg(unix)]
+    struct Holding(Child);
+
+    #[cfg(unix)]
+    impl Drop for Holding {
+        fn drop(&mut self) {
+            drop(self.0.stdin.take());
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    /// OWL-673: a hard kill of the process that owns the trees while it
+    /// starts one, before it could tell its sentinel, still has the
+    /// sentinel stop that tree: the root announced itself before its
+    /// program ran, and held the sentinel's input open until then. The kill
+    /// is sent from the root's side, before the root announces itself, so it
+    /// lands during the start whatever the load, and most often before the
+    /// owner confirmed it. Before OWL-673 the tree outlived its owner.
+    #[cfg(unix)]
+    #[test]
+    fn a_hard_kill_during_a_start_leaves_no_tree() {
+        use std::os::unix::process::ExitStatusExt;
+
+        // The root's command runs here: a tree found gone below is not one
+        // that never started.
+        let mut control = window_root().stdin(Stdio::piped()).spawn().unwrap();
+        crate::wait::until("the control root to run", || {
+            command(control.id()).contains(WINDOW)
+        });
+        drop(control.stdin.take());
+        control.wait().unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut owner = Holding(
+            Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "process::tests::helper_start_a_tree_that_kills_this_process",
+                    "--ignored",
+                    "--nocapture",
+                    "--test-threads=1",
+                ])
+                .current_dir(dir.path())
+                .stdin(Stdio::piped())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .unwrap(),
+        );
+        let mut status = None;
+        crate::wait::until("the owner of the tree to end", || {
+            status = owner.0.try_wait().unwrap();
+            status.is_some()
+        });
+        let status = status.unwrap();
+        assert_eq!(status.signal(), Some(9), "{status}: the start did not kill");
+        let written = std::fs::read_to_string(dir.path().join("root")).unwrap();
+        let root: u32 = written
+            .strip_prefix("? ")
+            .and_then(|pid| pid.trim_end().parse().ok())
+            .unwrap_or_else(|| panic!("root: {written:?}"));
+        crate::wait::until(
+            "the tree started during its owner's kill to be stopped",
+            || !(is_alive(root) && command(root).contains(WINDOW)),
+        );
+    }
+
     /// Writes `text` to `name` in the working directory, whole or not at all.
     #[cfg(unix)]
     fn write_whole(name: &str, text: &str) {

@@ -338,21 +338,6 @@ impl Bench {
         wait::within(bound, what, || self.output(), done);
     }
 
-    /// Waits until the daemon says it started `pid`, a watch or the web UI,
-    /// which it says once its sentinel was told of it (OWL-671). A hard kill
-    /// before then leaves that process running, the sentinel's window
-    /// between a start and its line (`stop_trees_when_killed`): load once
-    /// held the daemon there while its UI started and answered, and the UI
-    /// outlived the kill.
-    fn told_its_sentinel_of(&self, pid: u32) {
-        let said = format!("(pid {pid}).");
-        self.wait_for(&format!("the daemon to say it started {pid}"), || {
-            self.output()
-                .lines()
-                .any(|line| line.starts_with("Started the ") && line.ends_with(&said))
-        });
-    }
-
     /// The daemon's end.
     fn ended(&mut self) -> ExitStatus {
         self.ended_through(1)
@@ -622,7 +607,9 @@ fn a_killed_watch_starts_again_with_a_doubling_delay_told_at_the_third_end() {
 }
 
 /// A hard kill of the daemon leaves no watch and no step running: its
-/// sentinel stops the watches, theirs their steps.
+/// sentinel stops the watches, theirs their steps. The kill comes as soon
+/// as they run, the daemon perhaps not yet back from starting them: each
+/// announced itself to its sentinel before it ran (OWL-673).
 #[test]
 fn a_hard_kill_of_the_daemon_leaves_no_watch_or_step() {
     let mut bench = Bench::new();
@@ -630,9 +617,6 @@ fn a_hard_kill_of_the_daemon_leaves_no_watch_or_step() {
     bench.serve(API);
     bench.start();
     let started = [bench.running(WEB), bench.running(API)];
-    for (watch, _) in started {
-        bench.told_its_sentinel_of(watch);
-    }
     bench.signal("KILL", bench.daemon_pid());
     let _ = bench.ended();
     let pids: Vec<u32> = started
@@ -2009,7 +1993,10 @@ fn a_stop_and_an_upgrade_end_the_ui_after_the_watches() {
 }
 
 /// OWL-467: a SIGTERM stops the UI with the daemon, and a hard kill of the
-/// daemon leaves no UI: its sentinel stops it.
+/// daemon leaves no UI: its sentinel stops it. The kill comes as soon as the
+/// UI answers, which load once let it do before the daemon told its
+/// sentinel of it (OWL-671): the UI now announced itself before it ran
+/// (OWL-673).
 #[test]
 fn a_sigterm_and_a_hard_kill_leave_no_ui() {
     let mut bench = Bench::new();
@@ -2022,7 +2009,6 @@ fn a_sigterm_and_a_hard_kill_leave_no_ui() {
     bench.ui_gone(port, first);
     bench.start();
     let (second, _) = bench.ui(port, Some(first));
-    bench.told_its_sentinel_of(second);
     bench.signal("KILL", bench.daemon_pid());
     let _ = bench.ended();
     bench.ui_gone(port, second);
